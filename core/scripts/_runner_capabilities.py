@@ -80,7 +80,25 @@ def _probe_default_capabilities():
     # Product runtime: the sibling product repo (AGENT_WRITE_PATH) present + a dir.
     try:
         awp = os.environ.get("AGENT_WRITE_PATH")
-        if awp and Path(awp).is_dir():
+        # AGENT_WRITE_PATH may name SEVERAL roots separated by ';' (g-321-05
+        # multi-root, 2026-06-07); local-paths.conf documents it as
+        # ';'-separated and REQUIRED-quoted. This probe was written for the
+        # single-root form and never updated, so Path() was called on the WHOLE
+        # separated string, is_dir() was False, and 'product-runtime' was never
+        # added on exactly the boxes that DO have the product repo. The failure
+        # was silent AND INVERTED: the capability filter hid product goals from
+        # the runners best able to run them, presenting as a mysterious
+        # not_my_lane rather than a probe bug (g-115-3078; observed on alpha's
+        # multi-root host, which reported product-runtime ABSENT while holding
+        # two product roots).
+        # Split semantics deliberately mirror _path_roots.compute_allowed_roots
+        # (split ';', strip, skip empties) so the two readers of this variable
+        # cannot drift; ANY root being a dir is sufficient, since the capability
+        # asserts the product runtime is reachable, not that every root exists.
+        if awp and any(
+            part.strip() and Path(part.strip()).is_dir()
+            for part in awp.split(";")
+        ):
             caps.add("product-runtime")
     except Exception:
         pass

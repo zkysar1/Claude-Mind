@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.23",
+    "previous_version": "2.12.22",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "DependencyFunnelProbe: the watchdog measures the claimable frontier every reducer tick and, on frontier 0 with >=3 gated goals, files one Investigate goal into the root's aspiration prescribing the interface-contract relaxation (exact commands), posts to coordination, and retires the goal when the frontier reopens. New _frontier.py census (selector-SSOT dependency resolution, archive folded, body census) shared with the frontier-check.sh CLI. Measured 2026-08-29: 15 goals gated on one in-progress goal idled 5 of 8 Bodies.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.22",
     "previous_version": "2.12.21",
     "date": "2026-08-29",

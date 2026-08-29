@@ -5,6 +5,7 @@ goal-selector capability gate safe: derive_runner_capabilities (probe + provides
 + lacks), goal_required_capabilities (explicit-only, conservative), and
 goal_is_locally_executable (subset test, empty-requirement = always executable).
 """
+import pytest
 import _runner_capabilities as rc
 
 
@@ -284,3 +285,63 @@ def test_studio_session_only_reachable_via_box_declaration():
     plain = rc.merge_capability_config({}, rc.box_config_from_conf({"WORLD_PATH": "/w"}))
     assert "studio-session" not in rc.derive_runner_capabilities(
         plain, probe_fn=lambda: {"git-push"})
+
+
+# ---------------------------------------------------------------------------
+# product-runtime vs a MULTI-ROOT AGENT_WRITE_PATH ()
+#
+# This module was already covered by the 38 tests above, including a probe call
+# and a product-runtime assertion — but nothing exercised the ';'-separated
+# form, so the probe called Path() on the WHOLE string, is_dir() was False, and
+# the capability was never added on exactly the boxes that DO hold the product
+# repo. Silent and INVERTED: goals tagged requires_capability:[product-runtime]
+# read as not-my-lane there. File-level coverage was not path-level coverage.
+# ---------------------------------------------------------------------------
+
+def _probe_awp(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("AGENT_WRITE_PATH", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_WRITE_PATH", value)
+    return "product-runtime" in rc._probe_default_capabilities()
+
+
+def test_multiroot_pre_fix_predicate_reproduces_the_bug(tmp_path):
+    """POSITIVE CONTROL — pins the DIFFERENCE, so a revert reddens here first.
+
+    Every other case below passes against a probe that never regressed; only
+    this one distinguishes a working fix from a deleted one (guard-5501).
+    """
+    from pathlib import Path as _P
+    a = tmp_path / "a"; b = tmp_path / "b"; a.mkdir(); b.mkdir()
+    multi = f"{a};{b}"
+    assert _P(multi).is_dir() is False, "old whole-string predicate must be False"
+    assert any(p.strip() and _P(p.strip()).is_dir() for p in multi.split(";")) is True
+
+
+def test_multiroot_grants_product_runtime(monkeypatch, tmp_path):
+    a = tmp_path / "a"; b = tmp_path / "b"; a.mkdir(); b.mkdir()
+    assert _probe_awp(monkeypatch, f"{a};{b}") is True
+
+
+def test_multiroot_single_root_still_works(monkeypatch, tmp_path):
+    a = tmp_path / "a"; a.mkdir()
+    assert _probe_awp(monkeypatch, str(a)) is True
+
+
+def test_multiroot_any_existing_root_suffices(monkeypatch, tmp_path):
+    """The capability asserts the runtime is REACHABLE, not that every root exists."""
+    b = tmp_path / "b"; b.mkdir()
+    assert _probe_awp(monkeypatch, f"/nonexistent/xyz;{b}") is True
+
+
+@pytest.mark.parametrize("tmpl", [" {a} ; {b} ", "{a};", ";{a}"])
+def test_multiroot_whitespace_and_empty_parts_tolerated(monkeypatch, tmp_path, tmpl):
+    """Mirrors _path_roots.compute_allowed_roots: split ';', strip, skip empties."""
+    a = tmp_path / "a"; b = tmp_path / "b"; a.mkdir(); b.mkdir()
+    assert _probe_awp(monkeypatch, tmpl.format(a=a, b=b)) is True
+
+
+@pytest.mark.parametrize("value", ["", "/nonexistent/a;/nonexistent/b", ";", None])
+def test_multiroot_absent_when_no_root_resolves(monkeypatch, value):
+    assert _probe_awp(monkeypatch, value) is False

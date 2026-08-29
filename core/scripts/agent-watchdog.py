@@ -3250,6 +3250,349 @@ class GitDriftProbe(Probe):
                 self.last_fetch_ts = 0.0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DependencyFunnelProbe — the claimable frontier against the fleet
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dependency_funnel_config() -> dict:
+    """Read the `dependency_funnel` block from aspirations.yaml.
+
+    guard-308: the literals below are a last-resort floor for a missing or
+    corrupt config file, never a second copy of the policy — the YAML carries
+    the same values and is what documents WHY.
+    """
+    cfg: dict = {}
+    try:
+        cfg_path = Path(__file__).resolve().parent.parent / "config" / "aspirations.yaml"
+        with cfg_path.open(encoding="utf-8") as f:
+            cfg = ((yaml.safe_load(f) or {}).get("dependency_funnel") or {})
+    except Exception:  # noqa: BLE001 — a config read must never kill the tick
+        cfg = {}
+    out = {
+        "min_gated": 3,
+        "ticks_to_file": 1,
+        "ticks_to_revalidate": 50,
+        "lookback_hours": 6,
+    }
+    for key in out:
+        val = cfg.get(key)
+        if isinstance(val, (int, float)) and val >= 0:
+            out[key] = val
+    return out
+
+
+class DependencyFunnelProbe(Probe):
+    """The claimable frontier is ZERO while pending goals wait on a live goal.
+
+    A fleet of N Bodies is at most as parallel as its frontier is wide, and
+    until this probe nothing measured the width. Measured 2026-08-29 on a live
+    8-Body deployment: 15 pending goals, every one gated (directly or through
+    a chain) on ONE in-progress goal — five of eight Bodies closed for lack of
+    work while one Body wrote the gate's module, and each worker's own close
+    message ("all goals dependency-blocked") was the only trace. The
+    dependencies were over-specified: the consumers needed the module's
+    INTERFACE (its public names, already on disk), not its completion.
+
+    Fires on `claimable_count == 0 and gated_count >= min_gated`. Files ONE
+    Investigate goal into the root's own aspiration — the goal prescribes the
+    interface-contract relaxation with exact commands, so an idle Body can do
+    it — posts a coordination alert, and RETIRES the goal itself once the
+    frontier is non-zero again (guard-3419: a dedup keyed on open-goal
+    existence with no release path disables the detector permanently).
+    Reducer-only: the reducer owns the queue and runs this tick every
+    iteration close; a worker never calls iteration-close.
+
+    The census is `_frontier.frontier_census` — the same implementation the
+    `frontier-check.sh` CLI prints, so what a reader re-measures is what fired.
+    """
+    name = "dependency-funnel"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.consecutive = 0
+        self.fired = False
+
+    # ---- measurement -----------------------------------------------------
+
+    def _census(self, cfg: dict) -> dict:
+        from _paths import WORLD_DIR, agents_root
+        import _frontier
+        return _frontier.frontier_census(
+            WORLD_DIR, agents_root(),
+            lookback_hours=float(cfg["lookback_hours"]))
+
+    # ---- probe -----------------------------------------------------------
+
+    def check(self) -> list[Event]:
+        cfg = _dependency_funnel_config()
+        try:
+            census = self._census(cfg)
+        except Exception as e:  # noqa: BLE001 — a census failure is not a funnel
+            return [Event(
+                probe=self.name, event="dependency_funnel_unmeasured",
+                severity="info",
+                payload={"agent": self.ctx.agent_name,
+                         "error": f"{type(e).__name__}: {e}"},
+                summary=f"{self.name}: census failed — {type(e).__name__}: {e}",
+            )]
+
+        funnel = (census["claimable_count"] == 0
+                  and census["gated_count"] >= cfg["min_gated"])
+        roots = census.get("roots") or []
+        payload = {
+            "agent": self.ctx.agent_name,
+            "claimable_count": census["claimable_count"],
+            "gated_count": census["gated_count"],
+            "gated": census["gated"],
+            "roots": roots[:5],
+            "unknown_blockers": census["unknown_blockers"][:10],
+            "in_progress": census["in_progress"],
+            "deferred": census["deferred"],
+            "blocked": census["blocked"],
+            "bodies": census["bodies"],
+            "parse_skipped": census["parse_skipped"],
+            "thresholds": cfg,
+            "consecutive": self.consecutive,
+        }
+
+        if funnel:
+            self.consecutive += 1
+            payload["consecutive"] = self.consecutive
+            if not roots:
+                # Gated on ids no queue holds: a dangling-reference defect, not
+                # a funnel a relaxation can open. Say so rather than filing a
+                # goal that names no root (guard-1955).
+                return [Event(
+                    probe=self.name, event="dependency_funnel_unresolvable",
+                    severity="info", payload=payload,
+                    summary=(f"{self.name}: {census['gated_count']} pending goals "
+                             f"gated only on ids absent from every queue — "
+                             f"{payload['unknown_blockers'][:3]}"),
+                )]
+            root = roots[0]
+            _revalidate = cfg.get("ticks_to_revalidate") or 0
+            if self.consecutive >= cfg["ticks_to_file"] and (
+                    not self.fired
+                    or (_revalidate and self.consecutive % _revalidate == 0)
+            ):
+                goal = self._file_funnel_goal(census, root, cfg)
+                if goal.get("filed") or goal.get("dedup"):
+                    self.fired = True
+                payload["goal"] = goal
+                payload["board"] = self._post_board_alert(census, root, goal)
+                # A goal filed for an EARLIER root is stale the moment the
+                # funnel moves; retire it in the same tick (keep only this root).
+                payload["retired_other_roots"] = self._retire_funnel_goals(
+                    keep_roots={root["id"]})
+                return [Event(
+                    probe=self.name, event="dependency_funnel", severity="critical",
+                    payload=payload,
+                    summary=(f"{self.name}: frontier 0 — {census['gated_count']} pending "
+                             f"goals gated on {root['id']} ({root['status']}"
+                             f"{', claimed by ' + str(root['claimed_by']) if root.get('claimed_by') else ''}); "
+                             f"bodies active={census['bodies']['active']} "
+                             f"closed-recent={census['bodies']['closed_recent']} "
+                             f"({goal.get('goal_id') or goal.get('error')})"),
+                )]
+            return []
+
+        cleared = self._retire_funnel_goals(keep_roots=set())
+        self.consecutive = 0
+        was_fired = self.fired
+        self.fired = False
+        if was_fired or cleared.get("closed"):
+            payload["closed"] = cleared
+            return [Event(
+                probe=self.name, event="dependency_funnel_cleared", severity="info",
+                payload=payload,
+                summary=(f"dependency funnel cleared — frontier "
+                         f"{census['claimable_count']} claimable"
+                         + (f" ({cleared.get('detail')})" if cleared.get("detail") else "")),
+            )]
+        return []
+
+    # ---- escalation ------------------------------------------------------
+
+    @staticmethod
+    def _origin_signal(root_id: str) -> str:
+        # ROOT-scoped: the funnel is a property of the gate goal, not of a box
+        # or an agent, so any Body on any box may open it and the same root
+        # must never carry two open goals.
+        import _frontier
+        return f"{_frontier.FUNNEL_SIGNAL_PREFIX}{root_id}"
+
+    def _file_funnel_goal(self, census: dict, root: dict, cfg: dict) -> dict:
+        """File one deduped Investigate goal into the ROOT's aspiration.
+        Fail-open ({filed: False, error})."""
+        origin_signal = self._origin_signal(root["id"])
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            if pf.open_goal_exists(origin_signal, WORLD_DIR, self.ctx.agent_dir):
+                return {"filed": False, "dedup": True, "goal_id": None,
+                        "error": "open goal exists (dedup)"}
+            gated = census["gated"]
+            gated_txt = ", ".join(gated[:12]) + (" …" if census["gated_count"] > 12 else "")
+            bodies = census["bodies"]
+            body = {
+                "title": (f"Investigate: dependency funnel — {census['gated_count']} pending "
+                          f"goals gated on {root['id']} ({root['title'][:60]}); "
+                          f"claimable frontier is 0"),
+                "priority": "HIGH",
+                "participants": ["agent"],
+                "category": "framework-coordination",
+                "origin_signal": origin_signal,
+                "description": (
+                    f"agent-watchdog DependencyFunnelProbe measured the claimable frontier "
+                    f"at 0: {census['pending_total']} pending goals, {census['gated_count']} "
+                    f"of them gated (directly or through a chain) on {root['id']} "
+                    f"\"{root['title']}\" (status {root['status']}"
+                    f"{', claimed by ' + str(root['claimed_by']) if root.get('claimed_by') else ''}), "
+                    f"with {bodies['active']} Bodies active and {bodies['closed_recent']} "
+                    f"closed for lack of work in the last {cfg['lookback_hours']}h. "
+                    f"A fleet is at most as parallel as its frontier is wide: every Body "
+                    f"beyond the frontier idles. Gated goals: {gated_txt}. "
+                    f"REMEDY — relax each consumer to the root's INTERFACE, not its "
+                    f"completion (rb-4003 pattern). For each gated goal: "
+                    f"(1) read the root goal's description and name the artifact it "
+                    f"produces (a module, script or file) and the public names it promises; "
+                    f"(2) probe the artifact ON DISK — `ls <path>` and "
+                    f"`grep -n '^def \\|^class ' <path>`; if the promised names exist the "
+                    f"consumer needs only the interface: clear the dependency with "
+                    f"`bash core/scripts/aspirations-update-goal.sh <consumer-id> blocked_by '[]'` "
+                    f"and append a coordination note to its description via "
+                    f"`aspirations-update-goal.sh <consumer-id> description \"<existing text> "
+                    f"COORDINATION: build against <artifact>'s interface as it exists on disk; "
+                    f"do NOT edit <artifact> — another Body owns it; work around locally and "
+                    f"file an Idea goal for anything missing\"`; "
+                    f"(3) if the artifact does not exist yet, split the root instead: file a "
+                    f"small `Build: <artifact> interface stub + fixtures` goal (the promised "
+                    f"names with docstrings and NotImplementedError bodies, plus the fixtures "
+                    f"the consumers test against) and re-point the consumers' blocked_by at "
+                    f"that stub goal; "
+                    f"(4) never edit the root's artifact from a consumer goal and never mark "
+                    f"the root completed to unblock — the status field is the queue's state "
+                    f"(guard-2852). Re-measure with `bash core/scripts/frontier-check.sh`. "
+                    f"This goal is a SNAPSHOT: the probe retires it automatically once the "
+                    f"frontier is non-zero. Auto-filed by DependencyFunnelProbe."
+                ),
+            }
+            from _runtime_bash import BASH as _bash
+            _override_reason = (
+                "DependencyFunnelProbe owns exact root-scoped dedup via "
+                "open_goal_exists(origin_signal) plus a retire path; the "
+                "goal-dup-gate's structural check false-positives on the goal ids "
+                "and file paths this goal must quote to be actionable.")
+            proc = subprocess.run(
+                [_bash, "core/scripts/aspirations-add-goal.sh", root["asp_id"],
+                 "--source", root.get("source") or "world",
+                 "--override-duplication", _override_reason],
+                input=json.dumps(body, ensure_ascii=True),
+                capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"filed": False, "goal_id": None,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:200]}
+            try:
+                goal_id = json.loads(proc.stdout).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                goal_id = None
+            return {"filed": True, "goal_id": goal_id, "error": None}
+        except Exception as e:  # noqa: BLE001 — filing must not kill the event
+            return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
+
+    def _post_board_alert(self, census: dict, root: dict, goal: dict) -> dict:
+        """One coordination post per episode — the FLEET-visible half. Every
+        Body reads the coordination channel, and the Bodies that closed for
+        lack of work are exactly the audience."""
+        try:
+            from _runtime_bash import BASH as _bash
+            bodies = census["bodies"]
+            text = (f"DependencyFunnelProbe: claimable frontier is 0 — "
+                    f"{census['gated_count']} pending goals gated on {root['id']} "
+                    f"({root['status']}); bodies active={bodies['active']} "
+                    f"closed-recent={bodies['closed_recent']}. "
+                    f"Goal: {goal.get('goal_id') or goal.get('error')}. "
+                    f"Remedy: relax consumers to the root's interface (see the goal).")
+            proc = subprocess.run(
+                [_bash, "core/scripts/board-post.sh", "--channel", "coordination",
+                 "--type", "blocked",
+                 "--tags", f"dependency-funnel,{root['id']},auto-probe"],
+                input=text, capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"posted": False,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:160]}
+            return {"posted": True, "msg_id": (proc.stdout or "").strip()[:64]}
+        except Exception as e:  # noqa: BLE001
+            return {"posted": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _retire_funnel_goals(self, keep_roots: set) -> dict:
+        """Retire every open, unclaimed funnel goal whose root is not in
+        `keep_roots` (guard-3419 release path). Closed as `skipped`, never
+        `completed`: no investigation happened, the frontier reopened.
+
+        Reads the queues directly rather than trusting `self.fired`: the flag
+        lives in box-local, ephemeral tick state, and a goal filed by an
+        earlier episode (or another box) must still be retirable here.
+        Pending-and-unclaimed only — work someone has started is never yanked
+        out from under them (guard-1007).
+        """
+        try:
+            from _paths import WORLD_DIR, agents_root
+            import _frontier
+            goal_index, _asps, _stats = _frontier.load_goal_index(WORLD_DIR, agents_root())
+            candidates = [g for g in _frontier.open_funnel_goals(goal_index)
+                          if g["root"] not in keep_roots]
+            if not candidates:
+                return {"attempted": False, "detail": None}
+            from _runtime_bash import BASH as _bash
+            closed, held = [], []
+            for g in candidates:
+                gid = g["id"]
+                note = ("agent-watchdog DependencyFunnelProbe re-measured the queues and the "
+                        "claimable frontier is no longer 0 for this root, so the funnel this "
+                        "goal was filed for is gone. No investigation was performed — the "
+                        "condition resolved. The probe is retiring this goal as `skipped`; "
+                        "if the status still reads open, that write did not land and the "
+                        "goal is safe to close by hand.")
+                ok = True
+                for field, value in (("outcome_note", note), ("status", "skipped")):
+                    proc = subprocess.run(
+                        [_bash, "core/scripts/aspirations-update-goal.sh", gid,
+                         field, value, "--source", g.get("source") or "world"],
+                        capture_output=True, text=True,
+                        cwd=str(self.ctx.project_root_path), timeout=60,
+                    )
+                    if proc.returncode != 0:
+                        held.append(f"{gid}:close-failed")
+                        ok = False
+                        break
+                if ok:
+                    closed.append(gid)
+            parts = []
+            if closed:
+                parts.append("closed " + ",".join(closed))
+            if held:
+                parts.append("held " + ",".join(held))
+            return {"attempted": True, "closed": closed, "held": held,
+                    "detail": "; ".join(parts) or None}
+        except Exception as e:  # noqa: BLE001 — a close failure must not kill the tick
+            return {"attempted": True, "closed": [], "held": [],
+                    "detail": f"error: {type(e).__name__}: {e}"}
+
+    def to_dict(self) -> dict:
+        return {"consecutive": self.consecutive, "fired": self.fired}
+
+    def from_dict(self, state: dict) -> None:
+        if isinstance(state, dict):
+            self.consecutive = int(state.get("consecutive") or 0)
+            self.fired = bool(state.get("fired"))
+
+
 def _watchdog_infra_components() -> list[dict]:
     """Components this box should poll, from the WORLD overlay
     `world/config/watchdog-infra-components.yaml`. Empty list on any failure.
@@ -3710,6 +4053,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         MemoryHeadroomProbe(ctx),
         GitDriftProbe(ctx),
         InfraComponentProbe(ctx),
+        DependencyFunnelProbe(ctx),
     ]
     if ctx.body_role == "worker":
         return [p for p in probes if p.name in WORKER_SAFE_PROBES]
