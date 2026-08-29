@@ -589,3 +589,67 @@ def test_record_refusal_writes_a_row_the_next_run_can_join_on(tmp_path, monkeypa
     # Round-trip: the row it wrote must actually suppress on the next run.
     verdicts = [{"goal_id": "g-16", "verdict": "grant-covered", "reason": "o"}]
     assert MOD._apply_refusals(verdicts, led) == 1
+
+
+# ── _retired_scopes: the explicit "Retires ... user_leg_scope tokens" clause ──
+# . `_scope_head` cuts a grant's scope cell at the first period, so a
+# grant that names the tokens it retires -- the machine-findable form
+# `reclaim-routed-work.md` rule 4 asks authors for -- was landing in `unkeyed`
+# and every goal it covered read "matches no standing grant". Measured on the
+# live table: grant-013 and grant-014 both carry the clause, and 3 goals were
+# reported as ungranted against it.
+
+def test_retired_scopes_reads_the_declared_clause_past_the_head():
+    cell = ("**Standing approval of fleet recommendations.** "
+            "**Retires, as valid routing reasons, the `user_leg_scope` tokens** "
+            "`approve-and-merge-pr`, `architecture-decision`, and "
+            "`product-fork-decision`.")
+    # Only the canonical token survives -- a grant may retire vocabulary no
+    # goal can carry, and only canonical tokens can ever join a goal.
+    assert MOD._retired_scopes(cell) == ["architecture-decision"]
+
+
+def test_retired_scopes_stops_at_the_end_of_the_declared_run():
+    # A later backticked token in DIFFERENT prose must not be absorbed --
+    # this is what keeps the predicate role-aware rather than `text CONTAINS`
+    # (guard-4883). `commit` here belongs to a defer_reason clause, not the
+    # retired-scope list.
+    cell = ("Head. Retires, as valid routing reasons, the `user_leg_scope` "
+            "tokens `architecture-decision`, and these `defer_reason` texts: "
+            "`commit`.")
+    assert MOD._retired_scopes(cell) == ["architecture-decision"]
+
+
+def test_retired_scopes_ignores_prose_that_merely_mentions_scope_words():
+    # The two shapes `_scope_head` exists to refuse must stay refused: a
+    # precondition and an explicit carve-out both name scope tokens while
+    # granting nothing.
+    assert MOD._retired_scopes("Grants X. PROVIDED the `commit` is verified") == []
+    assert MOD._retired_scopes(
+        "Grants X. Anything needing a NEW `credential-grant` still routes to user") == []
+    assert MOD._retired_scopes("No declaration here at all.") == []
+
+
+def test_declaration_keyed_grant_is_qualified_so_it_never_auto_drops(tmp_path):
+    # The asymmetry guard-5470 protects: keying a grant this way must SURFACE
+    # it for review, never recommend removing the human leg. These grants
+    # continue past their head, so they are QUALIFIED and `_assess_user_leg`
+    # returns `grant-qualified`.
+    conv = tmp_path / "conventions"
+    conv.mkdir()
+    (conv / "capability-routing.md").write_text(
+        "## Standing User Grants\n"
+        "| grant-099 | **Approval of recommendations.** Retires, as valid routing "
+        "reasons, the `user_leg_scope` tokens `architecture-decision`. Still routes: "
+        "credentials. | 2026-08-27 | src | q | never |\n",
+        encoding="utf-8")
+    grants = MOD._parse_standing_grants(tmp_path)
+    assert grants["by_scope"].get("architecture-decision") == ["grant-099"]
+    assert "grant-099" in grants["qualified"]
+
+    verdict = MOD._assess_user_leg(
+        {"goal": {"id": "g-1", "title": "t", "participants": ["agent", "user"],
+                  "user_leg_scope": "architecture-decision"},
+         "aspiration_id": "asp-1", "source": "world"}, grants)
+    assert verdict["verdict"] == "grant-qualified"
+    assert verdict["grants"] == ["grant-099"]

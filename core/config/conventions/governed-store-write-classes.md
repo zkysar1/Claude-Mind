@@ -458,13 +458,73 @@ loser-first overlay — `out = dict(lose)` then `out.update(win)` — so every k
 the winner carries still wins (including an explicit `None`) while a key absent
 from the winner survives from the loser. The writer half stamps
 `strategic_focus.set_at` inside `team-state.py`'s `strategic_focus` branch
-whenever any `strategic_focus.*` field is written and the write does not set
-`set_at` itself. Fixing only the merge leaves a real amendment losing to a stale
+when a `strategic_focus.*` field is written and the write does not set `set_at`
+itself. Fixing only the merge leaves a real amendment losing to a stale
 peer, because nothing bumped the field the ordering reads; fixing only the writer
 makes the winner correct and still discards the loser's one-sided keys. Neither
 half is sufficient, which is why they share one suite
-(`core/scripts/tests/test_strategic_focus_merge_and_stamp.py`, 11 tests) and one
+(`core/scripts/tests/test_strategic_focus_merge_and_stamp.py`) and one
 coupling assertion that fails if EITHER is reverted.
+
+**The bump must cover the LWW-RESOLVED fields and NO OTHERS (g-115-8292,
+2026-08-29).** This clause read "whenever ANY `strategic_focus.*` field is
+written" until then, and that breadth was itself a defect, because one of the
+five schema keys is not LWW-resolved at all: `_merge_strategic_focus` UNIONS
+`acknowledged_by` after the winner overlay, so its value never depends on which
+side won the `set_at` pick. Acknowledging a directive is therefore not an
+amendment, and bumping on it falsified the very ordering the g-115-5294 cure
+installed — measured first-person 2026-08-29T14:32:34 (`history.py diff`): one
+`--field strategic_focus.acknowledged_by --operation append` moved `set_at`
+02:50:03 → 14:32:34 while `set_by` stayed `zachary`, erasing 11.7h of directive
+age and handing the ACKER a stamp newer than the OWNER's real one. Since the
+merge resolves `primary` by that stamp, an ack from any box could then overwrite
+a peer's genuinely newer owner directive — and acking is the correct, expected
+response to a directive, so the field was corrupted by agents doing exactly the
+right thing (three peers had already bumped it before the defect was seen).
+
+The generalisation for any store adopting this pattern: **a same-mutation
+timestamp bump belongs on exactly the fields whose merge outcome READS that
+timestamp.** Enumerate the handler's per-key rules first — a key resolved by
+union, by max, or by any rule independent of the ordering stamp must be exempt,
+or normal writes to it silently forge the ordering for every other key.
+
+**Write it as an ALLOWLIST, never a denylist**, and this is the half worth
+carrying to any other store, because both shapes pass every test you would
+think to write today. The landed form names the content subfields that DO bump
+(`primary` / `rationale` / `set_by`, plus a whole-map `strategic_focus` write)
+and bumps on nothing else. A denylist — bump everything EXCEPT
+`acknowledged_by` — is behaviourally identical **on today's five-key schema**
+and silently wrong on tomorrow's: a future subfield that the handler unions,
+maxes, or otherwise resolves independently of the stamp would default to
+BUMPING and reintroduce this exact defect, with no test failing. Under the
+allowlist a new subfield defaults to NOT bumping, and the asymmetry decides it:
+the cost of not bumping is a fall back to the `_canon` content tiebreak (mild),
+while the cost of bumping is directive loss.
+
+This was settled by measurement, not preference. Two Bodies of one agent fixed
+g-115-8292 concurrently on 2026-08-29 (a claim-overwrite collision) and landed
+the two shapes independently — denylist and allowlist. The allowlist was kept
+for the reason above and the denylist discarded.
+
+A whole-map `--field strategic_focus` write bumps under both shapes, and should:
+`_set_nested` REPLACES the sub-document, so even a payload carrying nothing but
+`acknowledged_by` DELETES `primary`/`rationale`/`set_by`/`set_at`. A draft that
+exempted it by key-set was caught by a regression test failing with a bare
+`KeyError: 'set_at'` — worth knowing before anyone "simplifies" the whole-map
+branch back out.
+
+**Both writer copies carry the predicate, and BOTH must be under test.**
+`core/scripts/team-state.py` is the mirror; `mind_api/src/world/team_state_write.py`
+is the LIVE path, because `team-state-update.sh` is daemon-only. guard-2323 is
+recorded against this very block for exactly that reason — the g-115-5294 bump
+originally landed CLI-side only and was inert for as long as nobody looked. The
+CLI arm alone is NOT sufficient coverage: measured 2026-08-29, reverting only
+the daemon copy to the unconditional bump left every CLI test GREEN. The suite
+therefore carries a daemon arm and a CLI/daemon parity matrix that asserts both
+copies return the same verdict per field AND that the expected verdict is still
+what the matrix claims (so it cannot go vacuous by both copies ceasing to bump).
+Note `test_daemon_cli_mirror_parity.py` does not cover this: it asserts
+`EMPTY_STATE` field-sets, not writer behaviour.
 
 **The general test is NOT "does the handler union one-sided keys".** Two cure
 shapes are both valid, and demanding the wrong one produces false findings:

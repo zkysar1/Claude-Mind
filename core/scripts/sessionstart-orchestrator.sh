@@ -167,6 +167,28 @@ bash "$SCRIPT_DIR/local-backend-staleness-check.sh" || true
   python3 "$_hk" --tick --source session-start
 ) >/dev/null 2>&1 || true
 
+# ─── Step 2.75: history-store vacuum tick () ─────────────────────
+# Per-box .history GC cadence. history-vacuum-tick.sh had EXACTLY ONE caller in
+# the tree — iteration-close.sh, inside the reducer-only productivity-check sink
+# — and .history is machine-local BY DESIGN (the tick's own header: "every box
+# vacuums ITS OWN store"), so no reducer and no partner can ever GC a worker
+# box's store. Same structural class as Step 2.7 above,  and :
+# a maintenance capability wired only into the reducer's close path.
+# MEASURED 2026-08-29 from the zakbox1 LXD host: 231 GB of world/.history across
+# 10 Ayoai containers — >=43% of their total container space, a quarter of the
+# physical NVMe — while cc-08, the one box the vacuum had ever run on, was the
+# SMALLEST at 15 GB. The mechanism works; it did not reach the other nine boxes.
+# Session start is the right surface for the same reason Step 2.7 gives, and it
+# fires on SOURCE=compact too, so a long-running worker session keeps ticking at
+# every autocompact instead of only at startup.
+# Scoped CALL to the shared tick (guard-2676), never a reimplementation: the
+# tick owns its 24h gate, per-box lock, archive-before-delete receipt and its own
+# backgrounding, so the inline cost here is one config probe. It writes its
+# verdicts to core/logs/history-vacuum-tick.log, which is why the console output
+# is sunk like its sibling. Fail-open + the chain's `|| true` contract: advisory
+# hygiene must never perturb session start.
+bash "$SCRIPT_DIR/history-vacuum-tick.sh" >/dev/null 2>&1 || true
+
 # ─── Steps 3+4: source=compact only ────────────────────────────────────────
 if [ "$SOURCE" = "compact" ]; then
     # ─── Step 2.9: clear the context-reads manifest () ───────────

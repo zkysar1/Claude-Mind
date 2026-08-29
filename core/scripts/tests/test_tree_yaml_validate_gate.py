@@ -285,3 +285,116 @@ def test_summary_only_edit_adds_no_key_is_approved():
         r = _run(payload)
         assert r.returncode == 0
         assert r.stdout.strip() == "", f"summary-only edit must approve, got {r.stdout!r}"
+
+
+# ── : duplicate-key gate ────────────────────────────────────────────
+# A duplicate key is NOT a parse error, so every test above it here passes while
+# the value silently vanishes: yaml.safe_load accepts the document, raises
+# nothing, and keeps only the LAST occurrence (guard-2388). Measured 2026-08-29
+# across 2,940 live tree nodes: 19 had accumulated repeated front-matter keys,
+# worst `.../arc-agi-3/arc-environment-models/ls20-class.md` with `prior_source`
+# SEVEN times. No script produces that shape -- a dict cannot hold two identical
+# keys -- so the producer is hand-editing, which is exactly the concurrent-
+# authorship hazard guard-2388 describes.
+
+def _node_md(tmp, content, name="example.md"):
+    d = Path(tmp) / "world" / "knowledge" / "tree" / "system"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+_CLEAN_NODE = (
+    "---\n"
+    "key: system/example\n"
+    "summary: a clean node summary\n"
+    "last_update_trigger:\n"
+    "  type: fresh-eyes\n"
+    "  source: 'pass A (2026-08-27)'\n"
+    "---\n"
+    "# Body\n\nline.\n"
+)
+
+
+def test_edit_introducing_a_duplicate_front_matter_key_is_denied():
+    """THE defining property. RED before ."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _node_md(tmp, _CLEAN_NODE)
+        r = _run({"tool_name": "Edit", "tool_input": {
+            "file_path": str(p),
+            "old_string": "  source: 'pass A (2026-08-27)'",
+            "new_string": ("  source: 'pass A (2026-08-27)'\n"
+                           "  source: 'pass B (2026-08-29)'"),
+        }})
+        assert r.returncode == 0
+        assert _is_deny(r), (
+            "adding a second `source:` to the same mapping must be denied — it "
+            f"parses clean and destroys pass A silently. got: {r.stdout!r}")
+        assert "source" in r.stdout, "the deny must name the offending key"
+
+
+def test_duplicate_nested_deeper_than_top_level_is_caught():
+    """The production shape. Every real instance measured was NESTED (under
+    `last_update_trigger:`), not a top-level key, so a checker that only walked
+    the outermost mapping would have reported all 2,940 nodes clean."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _node_md(tmp, _CLEAN_NODE)
+        r = _run({"tool_name": "Edit", "tool_input": {
+            "file_path": str(p),
+            "old_string": "  type: fresh-eyes",
+            "new_string": "  type: fresh-eyes\n  prior_source: x\n  prior_source: y",
+        }})
+        assert _is_deny(r), f"nested duplicate must be denied, got {r.stdout!r}"
+        assert "prior_source" in r.stdout
+
+
+def test_going_from_two_to_three_occurrences_is_denied():
+    """Counter semantics, not set semantics. A set-based check would see
+    'prior_source is already duplicated' and wave the edit through, which is how
+    ls20-class.md reached SEVEN copies one edit at a time."""
+    already_dup = _CLEAN_NODE.replace(
+        "  type: fresh-eyes",
+        "  type: fresh-eyes\n  prior_source: one\n  prior_source: two")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _node_md(tmp, already_dup)
+        r = _run({"tool_name": "Edit", "tool_input": {
+            "file_path": str(p),
+            "old_string": "  prior_source: two",
+            "new_string": "  prior_source: two\n  prior_source: three",
+        }})
+        assert _is_deny(r), f"2 -> 3 occurrences must be denied, got {r.stdout!r}"
+
+
+def test_an_edit_that_REPAIRS_an_existing_duplicate_is_approved():
+    """The gate denies only what an edit INTRODUCES — the same 'current must be
+    clean' rule the parse gate uses. Without this the 19 already-affected nodes
+    would be unfixable: the repair itself would be blocked."""
+    already_dup = _CLEAN_NODE.replace(
+        "  type: fresh-eyes",
+        "  type: fresh-eyes\n  prior_source: one\n  prior_source: two")
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _node_md(tmp, already_dup)
+        r = _run({"tool_name": "Edit", "tool_input": {
+            "file_path": str(p),
+            "old_string": "  prior_source: one\n  prior_source: two",
+            "new_string": "  prior_source: two",
+        }})
+        assert r.returncode == 0
+        assert r.stdout.strip() == "", (
+            f"repairing a duplicate must be allowed through, got {r.stdout!r}")
+
+
+def test_adding_a_DISTINCT_key_is_still_approved():
+    """Anti-vacuity twin (guard-1220). A gate that denied every front-matter
+    addition would pass all four tests above while making the tree uneditable."""
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _node_md(tmp, _CLEAN_NODE)
+        r = _run({"tool_name": "Edit", "tool_input": {
+            "file_path": str(p),
+            "old_string": "  type: fresh-eyes",
+            "new_string": "  type: fresh-eyes\n  prior_source: 'pass A (2026-08-27)'",
+        }})
+        assert r.returncode == 0
+        assert r.stdout.strip() == "", (
+            f"a distinct new key must still be approved, got {r.stdout!r}")

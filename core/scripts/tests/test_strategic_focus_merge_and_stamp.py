@@ -351,3 +351,111 @@ def test_an_ack_cannot_outrank_the_owner_directive_in_the_merge(world: Path):
     assert m["set_at"] == "2026-08-01T00:00:00"
     assert sorted(m["acknowledged_by"]) == ["alpha", "bravo"], \
         "and every acknowledgement must still survive the union"
+
+
+# --- the DAEMON arm of the same predicate (, carried) -------------
+#
+# Everything above drives `core/scripts/team-state.py`. That is the MIRROR, not
+# the live path: `team-state-update.sh` is daemon-only (`rt_call POST
+# /v1/team-state/update`), so `mind_api/src/world/team_state_write.py` is what
+# actually runs in the fleet. The  fix correctly edited BOTH copies —
+# but with the CLI arm alone under test, a revert of the daemon copy would ship
+# green. That is not hypothetical for this exact code block: guard-2323 is
+# recorded against it because the  bump ORIGINALLY landed CLI-side
+# only and was inert in a daemon-only deployment for as long as nobody looked.
+#
+# `test_daemon_cli_mirror_parity.py` does not close this: it asserts EMPTY_STATE
+# field-sets, not writer behaviour, so the predicate can diverge under a green
+# parity suite.
+
+def _daemon_update(world: Path, field: str, value: str, operation: str = "set"):
+    """Drive the daemon writer in-process against a tmp world (the `_FakeCtx`
+    shape used by mind_api/tests/test_runtime_team_state_write.py)."""
+    sys.path.insert(0, str(CORE_SCRIPTS.parents[0]))
+    from mind_api.src.world import team_state_write
+
+    class _P:
+        def __init__(self, w):
+            self.world = self.meta = self.agent = w
+
+    class _C:
+        def __init__(self, w):
+            self.paths = _P(w)
+            self.query = {"field": field, "value": value, "operation": operation}
+            self.body = b""
+            self.headers = {"x-mind-agent": "alpha"}
+
+    return team_state_write.update(_C(world))
+
+
+def _daemon_focus(world: Path) -> dict:
+    return (yaml.safe_load((world / "team-state.yaml").read_text(encoding="utf-8"))
+            or {}).get("strategic_focus") or {}
+
+
+def test_daemon_writer_does_not_bump_set_at_on_an_ack(tmp_path: Path):
+    """THE defining property, on the path that actually runs."""
+    w = tmp_path / "dae"
+    w.mkdir()
+    _daemon_update(w, "strategic_focus.set_at", "2026-07-04T13:45:00")
+    _daemon_update(w, "strategic_focus.acknowledged_by", '"alpha"', "append")
+    f = _daemon_focus(w)
+    assert f["acknowledged_by"] == ["alpha"], "the ack itself must still land"
+    assert f["set_at"] == "2026-07-04T13:45:00", \
+        "daemon copy must not re-stamp the directive's provenance on an ack"
+
+
+def test_daemon_writer_still_bumps_on_directive_content(tmp_path: Path):
+    """Anti-vacuity twin for the daemon arm — the positive control that must NOT
+    flip (guard-4166). Without it, a daemon copy that stopped stamping entirely
+    would satisfy the test above while reintroducing g-115-5294."""
+    w = tmp_path / "dae2"
+    w.mkdir()
+    _daemon_update(w, "strategic_focus.set_at", "2026-07-04T13:45:00")
+    _daemon_update(w, "strategic_focus.primary", "amended directive")
+    assert _daemon_focus(w)["set_at"] > "2026-07-04T13:45:00", \
+        "daemon copy must still bump on directive content"
+
+
+@pytest.mark.parametrize("field,value,operation,should_bump", [
+    ("strategic_focus.acknowledged_by", '"alpha"', "append", False),
+    ("strategic_focus.primary", "amended", "set", True),
+    ("strategic_focus.rationale", "because", "set", True),
+    ("strategic_focus.set_by", "zachary", "set", True),
+    ("strategic_focus", '{"primary": "whole map"}', "set", True),
+])
+def test_daemon_and_cli_agree_on_the_bump_predicate(
+        tmp_path: Path, field: str, value: str, operation: str, should_bump: bool):
+    """The DRIFT class, pinned directly (guard-742 / guard-547 / guard-2323).
+
+    Two hand-maintained copies of one predicate diverge silently, and nothing
+    fails when they do — which is why this is asserted rather than trusted. Both
+    arms are driven with the SAME field/operation matrix and must return the
+    same verdict; `should_bump` is carried so the matrix cannot degrade into
+    "they agree because neither ever bumps".
+    """
+    stale = "2026-07-04T13:45:00"
+    cli_w = tmp_path / "cli"
+    cli_w.mkdir()
+    assert _run(cli_w, "init").returncode == 0
+    assert _run(cli_w, "update", "--field", "strategic_focus.set_at",
+                "--value", stale).returncode == 0
+    args = ["update", "--field", field, "--value", value]
+    if operation != "set":
+        args += ["--operation", operation]
+    assert _run(cli_w, *args).returncode == 0
+    cli_bumped = _read_focus(cli_w).get("set_at", "") > stale
+
+    dae_w = tmp_path / "dae"
+    dae_w.mkdir()
+    _daemon_update(dae_w, "strategic_focus.set_at", stale)
+    _daemon_update(dae_w, field, value, operation)
+    dae_bumped = _daemon_focus(dae_w).get("set_at", "") > stale
+
+    assert cli_bumped == dae_bumped, (
+        f"CLI/daemon predicate DRIFT on {field!r} ({operation}): "
+        f"cli bumped={cli_bumped}, daemon bumped={dae_bumped}")
+    assert cli_bumped is should_bump, (
+        f"{field!r} ({operation}) should_bump={should_bump} but both copies "
+        f"returned {cli_bumped} — the matrix has gone vacuous or the "
+        f"predicate changed meaning")

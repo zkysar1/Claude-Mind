@@ -488,7 +488,9 @@ def render_show(g: Dict[str, Any], *, note_from: int = 0, note_chars: int = 3500
 
     Fixed fields first (status/holder/source/asp/recurring/outcome_class/
     completed_by, title, key_finding, defer_reason, blocked_by, description
-    head, verification outcomes+checks), then the outcome_note from `note_from`
+    head, verification outcomes+checks), then progress_note (if any — a
+    SEPARATE, often NEWER field that can retract outcome_note), then the
+    outcome_note from `note_from`
     for `note_chars` chars with a "re-run with --note-from N" tail. Never the
     raw record: 10k+ chars per goal, three per iteration, twice each, is what
     thrashed a triage agent's context on 2026-08-16.
@@ -523,6 +525,32 @@ def render_show(g: Dict[str, Any], *, note_from: int = 0, note_chars: int = 3500
                 lines.append(f"verification.{k} ({len(items)}):")
                 for i, it in enumerate(items, 1):
                     lines.append(f"  {i}. " + t(it if isinstance(it, str) else json.dumps(it), 220))
+    # progress_note is a SEPARATE field that this reader was blind to until
+    # 2026-08-29, and it is frequently NEWER than outcome_note — so a complete,
+    # correctly-paged read of outcome_note could still be a read of the stale
+    # half. Measured that day (zeta, cc-02): 's outcome_note (echo,
+    # 08-25) argued "NOT RESOLVED, AND DELIBERATELY SO" while its progress_note
+    # (foxtrot, 08-27) recorded the measurement as DONE and the verdict as
+    # CONFIRMED with full numbers. Disposing on the note this reader showed
+    # produced a 25-day defer on finished work; it was caught only because
+    # update-goal echoed the whole record back. guard-4635/guard-5224 already
+    # said "read the note in FULL" and did not help — the reader was complete
+    # about the wrong field. Fixing the instrument, per guard-1984 (a guardrail
+    # cannot outvote the instrument it guards) and guard-4933 (a superseding
+    # field must reach every READER of the old one).
+    pnote = g.get("progress_note") or ""
+    if pnote:
+        lines.append(
+            f"\u26a0 progress_note PRESENT ({len(pnote)} chars) — a DIFFERENT field from "
+            "outcome_note and often NEWER. It can retract the outcome_note outright. "
+            "Read it BEFORE disposing; when the two disagree, the newer one governs."
+        )
+        phi = max(0, note_chars)
+        lines.append(f"progress_note: showing [0:{phi}]")
+        lines.append(pnote[:phi])
+        if len(pnote) > phi:
+            lines.append(f"… ({len(pnote) - phi} more progress_note chars — "
+                         f"re-run with --note-chars {phi * 2})")
     note = g.get("outcome_note") or ""
     lo, hi = max(0, note_from), max(0, note_from) + max(0, note_chars)
     lines.append(f"outcome_note: total {len(note)} chars; showing [{lo}:{hi}]")

@@ -86,8 +86,8 @@ defer-routing`).
    The obligation runs in BOTH directions: a routing that never declares WHY
    the user is attached (`user_leg_scope`) cannot be re-derived by anything,
    and a grant whose scope head avoids the shared vocabulary can never be
-   applied. Measured 2026-07-29: 20 of 28 `[agent,user]` unscoped, 4 of
-   5 grants unkeyable. 2026-08-19: 8 of 36 - better, not fixed.
+   applied. Goal side 20/28 (07-29) -> 8/36 -> 0/10 (08-29): DONE.
+   Grant side is now the gap: 7 of 10 unkeyable (guard-5518).
 
 5. **Escalate what genuinely remains.** Items that survive both axes are the
    real human-only residue. Batch them into a digest for the next user

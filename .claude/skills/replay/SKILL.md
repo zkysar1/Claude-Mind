@@ -581,10 +581,16 @@ BEFORE you measure, not after* — landing on the one decision point
 not a write and no dedup check can refund the hour.
 
 Controls replicated a fourth time: date-free `id[11:]` **−0.71pp** (vs −1.00 / −2.04), balanced
-p95 **6.35pp** (vs 7.57 / 7.80 / 7.19), store base **42.9%** (vs 42.6%). Also note the
-pool-vs-store base gap has WIDENED to **16.4pp** (26.5% pool vs 42.9% store) against the
-12.1pp recorded 2026-08-22 — the chronic drain the block above describes is still running, so
-re-measure the gap rather than inheriting it, and keep naming the population on every rate.
+p95 **6.35pp** (vs 7.57 / 7.80 / 7.19), store base **42.9%**. FIFTH 2026-08-29 (zeta, cc-02,
+n=942): `id[11:]` −1.40pp, p95 6.55pp, base **43.6%**, `title` contamination **0.5%**. Trust
+these; do not re-derive.
+
+⚠ **THE GAP IS NOT WIDENING — that was a direction off TWO points.** Third point 15.3pp;
+series 12.1 → 16.4 → 15.3 oscillates ~15pp. The DRAIN half IS real (68 records at
+`replay_count >= 3`, **ZERO** CORRECTED — a Step 3.6 zero is the mechanism working).
+Re-measure the gap, never inherit it, and name the population on every rate. Detail:
+tree `performance/agent-performance/replay-instrument-populations.md` § SIXTH occurrence. Detail: tree node
+`performance/agent-performance/replay-instrument-populations.md` § SIXTH occurrence.
 
 ```
 1. SHARED CONDITIONS in corrected hypotheses:

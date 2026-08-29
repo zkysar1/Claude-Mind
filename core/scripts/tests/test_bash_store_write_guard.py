@@ -194,7 +194,16 @@ def test_running_agents_reads_the_state_files():
         "grep -c exp-encode-session agents/alpha/experience.jsonl",
         "wc -l world/aspirations.jsonl; tail -1 world/aspirations.jsonl",
         "grep g-005 world/aspirations.jsonl > /tmp/out.txt",
-        "python3 - <<'EOF'\nimport json\nfor l in open('agents/alpha/aspirations.jsonl'):\n    print(json.loads(l)['id'])\nEOF",
+        "grep -c exp-encode-session-2026 agents/alpha/experience.jsonl",
+        "cat world/aspirations.jsonl | wc -l",
+        "grep -q g-005-06 world/aspirations.jsonl && echo present",
+        # angle-bracket placeholders in quoted prose are not redirects (three
+        # false denies in one session, 2026-08-29: commit messages + JSON payloads)
+        'git commit -q -m "docs: skills grep -c <id> experience.jsonl to confirm a write landed"',
+        "printf '%s' '{\"content\":\"a presence check is fine: grep -c <id> experience.jsonl\"}' | bash core/scripts/reasoning-bank-add.sh",
+        "bash core/scripts/aspirations-read.sh --source <world|agent> --id asp-1 > /tmp/x.json",
+        "python3 -c \"import json; print(json.load(open('/tmp/fixture/world/aspirations.jsonl')))\"",
+        "grep g-1 agents/alpha/temp/aspirations.jsonl | python3 -c 'import sys,json; print(sys.stdin.read())'",
         "bash core/scripts/aspirations-update-goal.sh --source agent g-005-06 status in-progress",
         "bash core/scripts/iteration-close.sh --phase verify --goal g-005-06 --status completed --source agent --outcome deep --summary x",
         "cp world/aspirations.jsonl /root/backup-aspirations.jsonl",
@@ -208,6 +217,52 @@ def test_running_agents_reads_the_state_files():
 def test_reads_scripts_and_temp_paths_pass(command):
     decision, _ = run(command)
     assert decision == "allow", command
+
+
+# ---- the parse shape (): a hand parser over a store is refused, a
+# shell presence check is not. Measured 2026-08-29 on an 8-Body downstream
+# fleet: 79 hand parsers in 12 h against 4 wrapper calls; every one below is a
+# literal shape from those session files (goal ids normalised).
+PARSE_SHAPES = [
+    "python3 - <<'EOF'\nimport json\nfor l in open('agents/alpha/aspirations.jsonl'):\n    print(json.loads(l)['id'])\nEOF",
+    "grep '\"id\": \"g-006-08\"' /opt/mind/.mind-data/world/aspirations.jsonl | head -1 | python3 -c \"import sys,json; print(json.load(sys.stdin).get('aspiration_id',''))\"",
+    "cd /opt/mind && cat world/pipeline.jsonl 2>/dev/null | python3 -c \"\nimport sys, json\nfor line in sys.stdin:\n    print(json.loads(line)['id'])\n\"",
+    "cd /opt/mind && python3 -c \"\nimport json\nwith open('.mind-data/world/aspirations.jsonl') as f:\n    for line in f:\n        d = json.loads(line)\n\"",
+    "cd /opt/mind && grep -m1 \"g-006-24\" agents/coach/aspirations.jsonl | python3 -c \"import sys,json; d=json.loads(sys.stdin.read()); print(d['aspiration_id'])\"",
+    "py -3 -c \"import yaml; print(yaml.safe_load(open('agents/alpha/session/working-memory.yaml'))['current_goal'])\"",
+    "tail -3 agents/alpha/session/execution-diary.jsonl | jq -r .content",
+]
+
+
+@pytest.mark.parametrize("command", PARSE_SHAPES)
+def test_hand_parsers_over_a_store_are_refused(command):
+    decision, reason = run(command)
+    assert decision == "deny", command
+    assert "direct store parse refused" in reason
+    assert "STORE_WRITE_GUARD_OVERRIDE" not in reason
+
+
+def test_the_parse_deny_names_the_single_goal_reader():
+    _, reason = run(PARSE_SHAPES[1])
+    assert "aspirations-query.sh --goal-field id <goal-id> --full" in reason
+    assert "grep -c <id> aspirations.jsonl" in reason, "the presence-check carve-out must be stated"
+
+
+def test_the_parse_deny_names_the_reader_per_store():
+    for cmd, reader in (
+        (PARSE_SHAPES[2], "pipeline-read.sh"),
+        (PARSE_SHAPES[5], "wm-read.sh <slot> --json"),
+        (PARSE_SHAPES[6], "execution-diary.sh read"),
+    ):
+        decision, reason = run(cmd)
+        assert decision == "deny" and reader in reason, (cmd, reason[-200:])
+
+
+def test_a_parse_of_the_worker_prefix_store_is_not_a_parse():
+    """The prefix names working-memory.yaml; the program reads a fixture."""
+    cmd = WORKER_PREFIX + "python3 -c \"import json; print(json.load(open('tests/fixtures/x.json')))\""
+    assert _mod.direct_store_parses(cmd) == []
+    assert run(cmd)[0] == "allow"
 
 
 # The framework prefixes EVERY worker command with its own env exports, one of

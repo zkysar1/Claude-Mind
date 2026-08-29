@@ -54,7 +54,10 @@ WM_READ_SH = CORE_SCRIPTS / "wm-read.sh"
 WM_SET_SH = CORE_SCRIPTS / "wm-set.sh"
 
 PROJECT_TMP = SCRIPT_DIR / "_tmp_daemon_dispatch_test"
-AGENT = "zeta"
+# OFF-ROSTER by construction: must never appear in the live team-state
+# agent_status roster ( outcome 1). Was "zeta" -- a LIVE fleet
+# member -- copied here from mode_only during  (guard-1699).
+AGENT = "testagent"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from _bash_helpers import BASH as GIT_BASH  # noqa: E402
@@ -128,38 +131,28 @@ def _commit_files(repo: Path, rels, body: str, msg: str) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _preserve_agent_wm():
-    """Save, neutralize (null), then restore the test agent's fresh_eyes_last_fire
-    so the firing cases below are not suppressed by live cooldown state. Mirrors
-    test_post_state_update_gate_mode_only.py::_preserve_zeta_wm."""
-    saved = "null"
-    try:
-        r = subprocess.run(
-            [GIT_BASH, _to_bash_path(WM_READ_SH), "fresh_eyes_last_fire", "--json"],
-            capture_output=True, text=True, timeout=30,
-            env={**os.environ, "MIND_AGENT": AGENT},
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            saved = r.stdout.strip()
-    except Exception:
-        pass
-    try:
-        subprocess.run(
-            [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
-            input="null", capture_output=True, text=True, timeout=30,
-            env={**os.environ, "MIND_AGENT": AGENT},
-        )
-    except Exception:
-        pass
+def _isolate_wm_cooldown():
+    """Point the gate's cooldown read at an OFF-ROSTER test agent, so the suite
+    never touches a live fleet member's working memory (g-115-4887).
+
+    This file INHERITED the hazard by copying the fixture out of
+    test_post_state_update_gate_mode_only.py during g-306-149 -- live agent name
+    included. That is the mechanism worth remembering: the pattern spread by
+    example, from a file that looked correct. See _isolate_wm_cooldown there for
+    the full rationale, the measurement that retired the guard-672 constraint,
+    and why the save/restore half was deleted rather than hardened.
+    """
+    r = subprocess.run(
+        [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
+        input="null", capture_output=True, text=True, timeout=30,
+        env={**os.environ, "MIND_AGENT": AGENT},
+    )
+    assert r.returncode == 0, (
+        f"could not neutralize {AGENT} fresh_eyes_last_fire "
+        f"(rc={r.returncode} stderr={r.stderr!r}) -- the firing cases below would "
+        f"be non-deterministic, so fail loudly rather than flake"
+    )
     yield
-    try:
-        subprocess.run(
-            [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
-            input=saved, capture_output=True, text=True, timeout=30,
-            env={**os.environ, "MIND_AGENT": AGENT},
-        )
-    except Exception:
-        pass
 
 
 DAEMON_REL = "mind_api/src/endpoints/aspirations_write.py"
