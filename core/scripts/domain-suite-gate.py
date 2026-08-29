@@ -198,7 +198,13 @@ def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], s
 
 
 _PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)")
-_RUNNER_FAIL = re.compile(r"^\s*\[\d+/\d+\]\s+FAIL\s+(\S+)|^\s*FAIL\s+(\S+)")
+# The runner's per-unit verdict: `[N/M] FAIL test_x.sh (rc=1)`, `[6/77] FAIL pytest batch (rc=1)`.
+_RUNNER_UNIT_FAIL = re.compile(r"^\s*\[\d+/\d+\]\s+FAIL\s+(.+?)(?:\s+\(rc=\d+\))?\s*$")
+# A bare `FAIL <unit>` only when <unit> looks like a file or a node id. A shell test's
+# INNER assertion lines (`  FAIL the tag alone decides whether it retries`) must not
+# become ids: measured on the first seed, they produced "the" — and a baseline entry
+# "the" would have laundered every future inner failure that starts with that word.
+_RUNNER_BARE_FAIL = re.compile(r"^\s*FAIL\s+(\S+(?:\.sh|\.py|\.bash)|\S+::\S+|\S+/\S+)\s*$")
 
 
 def failing_ids(lines: list[str]) -> set[str]:
@@ -206,9 +212,10 @@ def failing_ids(lines: list[str]) -> set[str]:
 
     Two shapes are recognised, both stable: pytest's short summary
     (`FAILED path::test - msg`, `ERROR path::test`) and the domain runner's
-    per-file lines (`[N/M] FAIL file.sh (rc=1)`, `FAIL name`). Everything else
-    is ignored, so an unrecognised runner yields an EMPTY set — and an empty
-    set on a red run is treated as "cannot prove pre-existing", which blocks.
+    per-unit lines (`[N/M] FAIL file.sh (rc=1)`, or a bare `FAIL file.sh`).
+    Everything else — including a shell test's inner `FAIL <sentence>` lines —
+    is ignored, so an unrecognised runner yields an EMPTY set, and an empty set
+    on a red run is treated as "cannot prove pre-existing", which blocks.
     """
     ids: set[str] = set()
     for ln in lines:
@@ -216,9 +223,9 @@ def failing_ids(lines: list[str]) -> set[str]:
         if m:
             ids.add(m.group(1))
             continue
-        m = _RUNNER_FAIL.match(ln)
+        m = _RUNNER_UNIT_FAIL.match(ln) or _RUNNER_BARE_FAIL.match(ln)
         if m:
-            ids.add(m.group(1) or m.group(2))
+            ids.add(m.group(1).strip())
     return ids
 
 
