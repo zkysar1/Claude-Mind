@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.22",
+    "previous_version": "2.12.21",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "worker-loop: the park-step wake-up is marked as a TOOL call (Bodies typed it into bash); byte-neutral",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.21",
     "previous_version": "2.12.20",
     "date": "2026-08-29",

@@ -408,7 +408,7 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #   Bash: python3 core/scripts/stop-reason-record.py --path worker-body-parked \
 #           --reason "<the poll's reason field>" --agent "$MIND_AGENT"
 # then arm an hourly re-poll and STOP:
-#   ScheduleWakeup(prompt=<the park-resume prompt>, delaySeconds=3600)   # 3600 is the tool's clamp
+#   Tool (not Bash): ScheduleWakeup(prompt=<the park-resume prompt>, delaySeconds=3600) # clamp
 # The JSON on stdout carries {verdict, reason, rc, consecutive_errors} — quote
 # `reason` in the stop message so the wind-down cause is legible.
 #
