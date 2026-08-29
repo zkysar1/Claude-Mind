@@ -266,3 +266,45 @@ def test_ambiguous_sabotage_form_is_refused(bed):
         capture_output=True, text=True, timeout=120)
     assert proc.returncode == 2
     assert "exactly one" in proc.stderr
+
+
+# --- multi-line sabotage is refused, not silently flattened (rb-6196, ) ---
+
+def _run_raw(bed, plan):
+    """Refusals exit 2 with stderr only, so run_plan's JSON assertion cannot see them."""
+    plan_path = bed / "plan_raw.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    return subprocess.run(
+        [BASH, str(SCRIPT), "--plan", str(plan_path), "--quiet"],
+        capture_output=True, text=True, timeout=300,
+    )
+
+
+@pytest.mark.parametrize("field", ["sabotage_old", "sabotage_new", "sabotage_sed"])
+def test_multiline_sabotage_field_is_refused(bed, field):
+    """The plan is flattened into a newline-separated TSV, so a newline cannot survive.
+
+    Before this refusal it failed LATER as "sabotage-old string not found in
+    target" -- honest about the outcome, misleading about the cause. Measured
+    (zeta, cc-02): a 7-mutation plan returned 4 survivors split perfectly on line
+    count. That message reads as "your anchor is stale", so the next move is
+    re-deriving an anchor that was never wrong -- or worse, "fixing" correct tests.
+    """
+    mut = {"name": "m1", "case": "c1", "test_cmd": "bash check.sh", field: "line one\nline two"}
+    if field != "sabotage_sed":
+        mut.setdefault("sabotage_old", "GUARDED_TOKEN")
+    proc = _run_raw(bed, base(bed, mutations=[mut]))
+    assert proc.returncode == 2, f"not refused: rc={proc.returncode} out={proc.stdout[:300]}"
+    assert "contains a newline" in proc.stderr
+    # The refusal must POINT AT THE FIX, not just say no -- sabotage_sed keeps the
+    # expression single-line while sed does the multi-line work.
+    assert "sabotage_sed" in proc.stderr
+
+
+def test_single_line_sabotage_is_still_accepted(bed):
+    """POSITIVE CONTROL -- a refusal that rejected every plan would satisfy the test above."""
+    rc, r = run_plan(bed, base(bed, mutations=[
+        {"name": "m1", "case": "c1", "test_cmd": "bash check.sh", **SINGLE_SITE},
+    ]))
+    assert rc == 0, f"a valid single-line plan was refused: {r}"
+    assert r["mutations"] == 1   # field is "mutations"; read from the report, not guessed

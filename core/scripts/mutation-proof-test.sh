@@ -247,6 +247,7 @@ emit() {
   RT="${RED_TESTS:-null}" RC="${RED_COUNT:-null}" RPE="${RED_PARSE_ERRORS:-null}" \
   SS="${SAB_SITES:-null}" SSB="${SAB_SITES_BASIS:-unmeasured}" \
   RCK="${RESIDUE_CHECK:-unavailable}" \
+  MSC="${MUTANT_SYNTAX_CHECKED:-unchecked}" \
   BKP="${BACKUP:-}" BKPR="$( [[ -n "${BACKUP:-}" && -e "${BACKUP:-}" ]] && echo true || echo false )" \
   $PY -c '
 import os, json
@@ -311,10 +312,18 @@ print(json.dumps({
   # "occurrences" (--sabotage-old, exact) | "changed-lines" (--sabotage-sed,
   # the only mode-independent measure) | "unmeasured" (sabotage never applied).
   "sabotage_sites": sites, "sabotage_sites_basis": os.environ["SSB"],
+  # Was the MUTANT proven to still parse before the suite judged it? ()
+  # "true" python|shell checked and valid | "unchecked" no validator for this
+  # extension. NEVER omitted: "we did not look" and "we looked and it was fine"
+  # must not render identically -- the same absent-vs-empty posture red_tests and
+  # sabotage_sites_basis already take. An invalid mutant never reaches emit() with
+  # a PASS: it exits 1 at Step 2b.
+  "mutant_syntax_checked": os.environ["MSC"],
 }))'
 }
 
 BASELINE_GREEN="skipped"; SAB_APPLIED="false"; SAB_RED="n/a"; RESTORE_GREEN="n/a"; TEST_RAN="unchecked"
+MUTANT_SYNTAX_CHECKED="unchecked"
 # null (the JSON literal), not [] — see the emit() comment. Absent-vs-empty is
 # load-bearing here: [] would claim a measurement that never happened.
 RED_TESTS="null"; RED_COUNT="null"; RED_PARSE_ERRORS="null"
@@ -377,6 +386,66 @@ if cmp -s "$BACKUP" "$TARGET"; then
   exit 1
 fi
 SAB_APPLIED="true"
+
+# --- Step 2b: the mutant must still PARSE (, guard-1631) ---
+# A mutation that leaves the file syntactically invalid reddens the WHOLE suite
+# before any assertion runs, and the verdict then credits a worthless test with
+# discriminating power -- silent self-congratulation, the one failure mode here
+# that looks like success. Measured (): deleting `merged = merged[:limit]`
+# orphaned the `if limit > 0:` above it (IndentationError) and reddened all 8 merge
+# tests; replacing that line with `pass` instead reddened exactly 1. BOTH runs
+# reported 5/5 detected -- only the second run's attribution was real.
+#
+# THIRD CAUSE, NOT THE ONLY ONE. A broad uniform red has three distinct causes and
+# they take opposite remedies, so this guard is deliberately narrow -- it fires ONLY
+# on a mutant that does not parse:
+#   * mutant does not parse            -> THIS guard: refuse, nothing was proven
+#   * the TARGET's own internal guard raised -> guard-4384: faithful mutation, the
+#     wide red is legitimate; build a COMPOUND mutation and read red_tests[].message
+#   * the harness never ran the code   -> guard-2546: repair the harness
+# Refusing on breadth alone would reject guard-4384's legitimate proofs outright.
+#
+# COMPILE IN MEMORY, NEVER py_compile (guard-3028). py_compile WRITES a .pyc, and
+# CPython invalidates bytecode on mtime-seconds+size only -- so a stale mutant .pyc
+# survives a correct restore and keeps executing the mutant against restored source,
+# presenting as `diff` clean WHILE the test still fails. Writing no bytecode at all
+# is strictly cheaper than remembering to clear it.
+#
+# An extension with no validator is reported as unchecked rather than assumed good:
+# "we did not look" and "we looked and it was fine" must not render identically.
+case "$TARGET" in
+  *.py)
+    # Record WHICH validator ran BEFORE running it. The refusal path emits and
+    # exits without reaching any trailing assignment, so setting this after the
+    # check made the one verdict where the check definitely fired report
+    # "unchecked" -- the field contradicting its own reason string. Caught by
+    # running the guard against the pre-change script rather than by the tests.
+    MUTANT_SYNTAX_CHECKED="python"
+    if ! MUTANT_ERR="$(TARGET="$TARGET" $PY -c '
+import os, sys
+t = os.environ["TARGET"]
+src = open(t, encoding="utf-8").read()
+try:
+    compile(src, t, "exec")   # in memory: writes no .pyc (guard-3028)
+except SyntaxError as e:
+    sys.stderr.write("%s: %s (line %s)" % (type(e).__name__, e.msg, e.lineno))
+    sys.exit(1)
+' 2>&1 >/dev/null)"; then
+      emit "FAIL" "mutant is not valid Python — $MUTANT_ERR. The mutation left the target unparseable, so the suite would redden before any assertion ran and the RED would prove nothing about the test. Refusing rather than reporting a red (guard-1631). Fix the sabotage so the mutant still parses (e.g. replace a line with a no-op such as \`pass\` instead of deleting it)."
+      exit 1
+    fi
+    ;;
+  *.sh|*.bash)
+    MUTANT_SYNTAX_CHECKED="shell"
+    if ! MUTANT_ERR="$(bash -n "$TARGET" 2>&1)"; then
+      emit "FAIL" "mutant is not valid shell — $MUTANT_ERR. The mutation left the target unparseable, so the suite would redden before any assertion ran and the RED would prove nothing about the test. Refusing rather than reporting a red (guard-1631)."
+      exit 1
+    fi
+    ;;
+  *)
+    MUTANT_SYNTAX_CHECKED="unchecked"
+    ;;
+esac
 
 # --- Step 3: sabotaged code must be RED ---
 if run_test; then

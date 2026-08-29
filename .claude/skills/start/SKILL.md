@@ -104,6 +104,8 @@ Preconditions (all must hold, else fail loud — do NOT change any state):
    and exit without state changes.
 
    **IF exit code 1 AND `force = true`**: print "FORCING recovery despite live
+   signals (--force):" followed by the helper's stderr per-condition list, then
+   append the JSON audit record with the race-safe locked append below:
 
    ```bash
    AGENT_NAME="<agent-name>" \
@@ -187,6 +189,9 @@ Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-get.sh`
 
 
 **Step 1.5: UNINITIALIZED Drift-Warning Probe** — Defensive check for the
+inlined-helper drift class: when Step 1 returns `UNINITIALIZED`, the agent dir
+might genuinely not exist OR `session-state-get.sh` might carry a stale inlined
+`_APD` constant relative to `_paths.sh`. Probe before trusting the verdict:
 
 ```bash
 IF state == "UNINITIALIZED":
@@ -231,6 +236,10 @@ Branch on the **requested mode** (parsed in Step 0.5):
 
 #### RUNNING + requested mode is `autonomous` (or no `--mode` flag)
 
+Two scenarios produce RUNNING-on-disk:
+  1. **Live runner** — another terminal is actively running the loop. This
+     second terminal JOINS it as a Worker Body; it never ends at a refusal.
+  2. **Zombie** — the previous session crashed without `/stop`; no live runner.
 
 Distinguish them via the 6-condition zombie gate.
 # Rationale (WHY inline instead of calling helper + WHY each condition): core/config/rationale/start-recovery-ceremony.md
@@ -243,6 +252,11 @@ Probe condition 2 (heartbeat):
 Bash: `MIND_AGENT=<agent-name> bash core/scripts/heartbeat-stale.sh`
 
 **IF output is `fresh`** → live reducer runner detected (scenario 1). This second
+terminal activates as a **Worker Body** (asp-306 / g-306-73 one-mind-two-bodies):
+do NOT stop here, do NOT print a refusal, and DO NOT auto-recover the reducer —
+that would clobber the active loop. Proceed to the **Worker Body Activation
+Sequence** below. The two commands next are alternatives a HUMAN may type
+instead; neither is this session's next step.
 
 **To take over the reducer role instead** (reducer genuinely wedged despite fresh
 heartbeat): `/start <agent-name> --recover --force`
@@ -253,9 +267,10 @@ or `/start <agent-name> --mode assistant`
 **Worker Body Activation Sequence:**
 
 W-pre. **Ex-Worker Same-Terminal Guard** (g-306-210 — the RUNNING-branch half of
-
+    Step 0-pre2 below, which sits in the IDLE branch and so never reached this path).
 
     **This step must run BEFORE W0** — not at W1 as first proposed. A refusal is
+    only side-effect-free when it fires before the destructive write (guard-1813).
 
     Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
 
@@ -390,6 +405,8 @@ DONE.
 # Rationale: core/config/rationale/start-observer-and-worker-activation.md — The observer session coexists with the autonomous
 
 0-pre. **Ex-Worker Same-Terminal Guard** (g-306-210 — the observer half of Step
+   0-pre2 below, which sits in the IDLE branch and so never reached a reader/
+   assistant bind taken while the agent is RUNNING).
 
    "Observers never fork a WM" is true of what an observer WRITES and says
    nothing about what it INHERITS. `bash-agent-inject.py` keys `BODY_ROLE=worker`
@@ -742,6 +759,8 @@ DONE.
      Bash: `bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent <agent-name> --mode autonomous --retire-legacy`
      Bash: `bash core/scripts/sid-collision-check.sh <agent-name> "$MIND_SID"; echo "SIDCOL_RC=$?"`
      **HALT on an empty `$MIND_SID`, on `SIDCOL_RC=2` (collision — either
+     `ERROR:SID_COLLISION` cross-agent or `ERROR:SID_COLLISION_SAME_AGENT`), and on
+     `SIDCOL_RC=1` (script/usage error).** Only rc=0 continues.
 
      **CW1a — force-fresh the canonical WM from the shared store.** The fork must
      start from the reducer's LATEST push, not this box's read-through cache:
@@ -769,6 +788,8 @@ DONE.
      (`|| true` — telemetry must never abort an activation.)
 
      **CW3** — `Skill(worker-loop)`. Do NOT set `agent-state` RUNNING, do NOT write
+     `running-session-id`/`runner-token`, do NOT touch the runner claim, and do NOT
+     run `/boot`. State after CW3: `agent-state` IDLE, no reducer-shaped files here.
 
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/team-state-update.sh --field "agent_status.<agent-name>.current_focus" --value "\"\"" || true`
      (Clear stale current_focus from the previous session's shutdown — without this,
@@ -882,5 +903,7 @@ DONE.
 
 
 **Read `core/config/start-phase-c.md` and follow the section matching the mode
+confirmed above** (Reader / Assistant / Autonomous) — it holds the full first-boot
+sequence for all three modes.
 
 ## Chaining

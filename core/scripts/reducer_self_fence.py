@@ -378,6 +378,36 @@ def _machine_id_from_env_file(env_path):
     return found
 
 
+def resolve_self_machine(env_path, environ=None):
+    """The machine id THIS box compares against the claim holder's.
+
+    MACHINE_ID from the environment, then from .env.local (own-cloud boxes always
+    carry it — owncloud_backend.from_env fail-closes without it), then the SAME
+    default the local-backend claim WRITER uses: git_ref_claim._default_machine_id
+    (MIND_MACHINE_ID, else the hostname). The third rung is the one that makes
+    the comparison discriminating on the local backend at all. Measured
+    2026-08-28 on a local-backend box (coach, zc-03): .env.local carried no
+    MACHINE_ID, the claim read `RUNNING on 'zc-03'` (the writer's hostname
+    default), and every tick reported `holder-unreadable` — inert by design, but
+    inert on exactly the backend class that never sets the variable, so a lost
+    claim would have gone undetected there. Importing the writer's default rather
+    than re-deriving it keeps the two arms from drifting to different ids.
+
+    Still not a guess: a self id is only ever the value the claim writer on this
+    box would have written. Returns None when even the hostname is unreadable.
+    """
+    env = os.environ if environ is None else environ
+    val = (env.get("MACHINE_ID") or "").strip()
+    if val:
+        return val
+    val = _machine_id_from_env_file(env_path)
+    if val:
+        return val
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from git_ref_claim import _default_machine_id
+    return (_default_machine_id() or "").strip() or None
+
+
 def load_stepdown_seconds(config_path):
     """runner_heartbeat.stepdown_seconds from aspirations.yaml.
 
@@ -471,11 +501,10 @@ def main(argv):
     # self id the holder comparison is non-discriminating, so decide() HOLDS and
     # the fence is inert on that box — the safe direction, but inert is not
     # covered (guard-1760), and a fence that does nothing on some boxes does not
-    # fix a fleet-wide split-brain.
-    self_machine = os.environ.get("MACHINE_ID", "").strip() or None
-    if not self_machine:
-        self_machine = _machine_id_from_env_file(
-            Path(__file__).resolve().parents[2] / ".env.local")
+    # fix a fleet-wide split-brain. The third rung — the local claim writer's own
+    # default — is what makes the fence discriminating on local-backend boxes,
+    # which never set MACHINE_ID at all (coach/zc-03, 2026-08-28).
+    self_machine = resolve_self_machine(Path(__file__).resolve().parents[2] / ".env.local")
 
     t_stepdown = load_stepdown_seconds(scripts_dir.parent / "config" / "aspirations.yaml")
     if t_stepdown is None:

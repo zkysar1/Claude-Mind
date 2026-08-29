@@ -291,6 +291,36 @@ def test_machine_id_missing_file_is_none(tmp_path):
     assert rd(tmp_path / "nope") is None
 
 
+# ── The self id must be what the claim WRITER on this box would have written.
+#    Measured 2026-08-28 (coach, zc-03, local backend): no MACHINE_ID anywhere,
+#    claim said `RUNNING on 'zc-03'` (git_ref_claim's hostname default), and the
+#    fence answered holder-unreadable on every tick — inert on exactly the backend
+#    class that never sets the variable. ──────────────────────────────────────
+
+def test_self_machine_falls_back_to_the_local_claim_writers_default(tmp_path, monkeypatch):
+    from reducer_self_fence import resolve_self_machine
+    from git_ref_claim import _default_machine_id
+    monkeypatch.delenv("MACHINE_ID", raising=False)
+    monkeypatch.setenv("MIND_MACHINE_ID", "box-from-writer-env")
+    (tmp_path / ".env.local").write_text("ENVIRONMENT_ID=coach\n", encoding="utf-8")
+    got = resolve_self_machine(tmp_path / ".env.local")
+    assert got == _default_machine_id() == "box-from-writer-env"
+    # And with nothing set at all, both arms agree on the hostname.
+    monkeypatch.delenv("MIND_MACHINE_ID", raising=False)
+    assert resolve_self_machine(tmp_path / ".env.local") == _default_machine_id()
+    assert resolve_self_machine(tmp_path / ".env.local") is not None
+
+
+def test_self_machine_prefers_machine_id_env_then_env_file(tmp_path, monkeypatch):
+    from reducer_self_fence import resolve_self_machine
+    (tmp_path / ".env.local").write_text("MACHINE_ID=cc-from-file\n", encoding="utf-8")
+    monkeypatch.setenv("MIND_MACHINE_ID", "writer-env")
+    monkeypatch.delenv("MACHINE_ID", raising=False)
+    assert resolve_self_machine(tmp_path / ".env.local") == "cc-from-file"
+    monkeypatch.setenv("MACHINE_ID", "cc-from-env")
+    assert resolve_self_machine(tmp_path / ".env.local") == "cc-from-env"
+
+
 def test_an_unknown_self_id_leaves_the_fence_inert_not_dangerous():
     """The coverage gap must fail SAFE. A box that cannot say who it is holds."""
     r = decide(0, "cc-05", None, 0, T)

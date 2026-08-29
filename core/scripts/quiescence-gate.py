@@ -83,6 +83,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR, CONFIG_DIR, CORE_ROOT  # noqa: E402
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse — guard-4372)
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 import _reflectable  # : reflectable-vs-backlog split for --unreflected
 
@@ -633,7 +634,9 @@ def _hours_since(iso_str):
     if not iso_str:
         return None
     try:
-        dt = datetime.fromisoformat(str(iso_str))
+        dt = parse_naive_iso(iso_str)
+        if dt is None:
+            return None
         return (datetime.now() - dt).total_seconds() / 3600.0
     except (ValueError, TypeError):
         return None
@@ -1002,7 +1005,10 @@ def cmd_check(args, cfg):
             })
         else:
             try:
-                if datetime.fromisoformat(str(exp)) <= now:
+                _exp_dt = parse_naive_iso(exp)
+                if _exp_dt is None:
+                    raise ValueError("unparseable expires_at")
+                if _exp_dt <= now:
                     expired_ref.append({
                         "goal_id": e.get("goal_id"),
                         "external_id": ref.get("external_id"),
@@ -1027,18 +1033,34 @@ def cmd_check(args, cfg):
         # action differs (a past TTL means re-probe the blocker; an absent one
         # means the ref was written through the unvalidated field path and needs
         # normalizing). .
+        # THREE disqualifying shapes, not two (, folding in
+        # bravo-fec-parse-error-lumped-into-past). n_past was computed by
+        # SUBTRACTION — len(expired_ref) - n_missing — which swept every
+        # parse_error ref into "expires_at in the past". That detail was false
+        # by construction: a value that failed to parse was never compared to
+        # anything, so nothing is known about whether it is past. It also sent
+        # the reader to the wrong next action, which is the same reason the two
+        # shapes above were split in : a past TTL means re-probe the
+        # blocker, an absent one means normalize the ref, and an UNPARSEABLE one
+        # means fix the value (commonly a tz-aware stamp from the unvalidated
+        # direct-field write path). Counted directly now, never by subtraction.
         n_missing = sum(1 for r in expired_ref if r.get("missing_expires_at"))
-        n_past = len(expired_ref) - n_missing
+        n_parse_error = sum(1 for r in expired_ref if r.get("parse_error"))
+        n_past = len(expired_ref) - n_missing - n_parse_error
         parts = []
         if n_past:
             parts.append(f"{n_past} with expires_at in the past")
         if n_missing:
             parts.append(f"{n_missing} with NO expires_at (absent != unexpired)")
+        if n_parse_error:
+            parts.append(f"{n_parse_error} with UNPARSEABLE expires_at "
+                         f"(never compared — not known to be past)")
         reasons.append({
             "condition": "C3_blocker_ref_future_expiry",
             "detail": f"{len(expired_ref)} blocker_ref(s) disqualify: " + ", ".join(parts),
             "missing_expires_at_count": n_missing,
             "past_expiry_count": n_past,
+            "parse_error_count": n_parse_error,
             "sample": expired_ref[:5],
         })
 
@@ -1157,7 +1179,13 @@ def cmd_check(args, cfg):
             pass
         if _wt_earliest is not None:
             try:
-                _wt_dt = datetime.fromisoformat(str(_wt_earliest).rstrip("Z"))
+                # parse_naive_iso handles BOTH the trailing Z and a numeric
+                # +00:00 offset; the old .rstrip("Z") silently missed the latter,
+                # so a tz-suffixed timer raised TypeError and this whole floor
+                # was skipped by the except below (guard-4372).
+                _wt_dt = parse_naive_iso(_wt_earliest)
+                if _wt_dt is None:
+                    raise ValueError("unparseable wake-timer timestamp")
                 _wt_secs = int((_wt_dt - now).total_seconds())
                 if _wt_secs < _TIMER_FLOOR:
                     _wt_secs = _TIMER_FLOOR
@@ -1343,8 +1371,10 @@ def cmd_verify_wake(args, cfg):
     actual_sleep_s = None
     if entered_at:
         try:
-            actual_sleep_s = int((now - datetime.fromisoformat(str(entered_at)))
-                                  .total_seconds())
+            _entered_dt = parse_naive_iso(entered_at)
+            if _entered_dt is None:
+                raise ValueError("unparseable entered_at")
+            actual_sleep_s = int((now - _entered_dt).total_seconds())
         except (ValueError, TypeError):
             pass
 

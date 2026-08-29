@@ -904,5 +904,248 @@ def test_cli_check_unknown_producer_keeps_bounded_behavior():
         assert out == "fire", f"producer={prod!r} must keep the bounded behavior"
 
 
+# ---------------------------------------------------------------------------
+# : an ABSENT spark_fired_session record is not evidence the spark
+# never fired. The record is written by aspirations-spark Step 0.5 — one bash
+# line at the top of a long LLM-executed skill (compliance measured 3 of 4 on
+# the observed session) — so "Phase 6 never ran" and "Phase 6 ran and did not
+# record it" look identical at `check` and demand OPPOSITE actions. No window
+# can separate them: with no key present, every bound returns 'fire'. The
+# execution diary is an INDEPENDENT signal with a DIFFERENT (script) writer,
+# keyed by goal_id, and decides it.
+#
+# Measured incident (echo, cc-03, 2026-08-05): sentinel for  consumed
+# at 05:31 with spark_fired_session holding only  /  /
+# ; the diary carried ` | phase-6-spark` phase_start AND
+# phase_end at 04:53, ~28 min before the sentinel's 05:21:32 set_at. One full
+# redundant Phase-6 re-fire, which would have double-counted times_asked across
+# all 20 active spark questions into the yield_rate denominators that drive the
+# retire/promote review.
+# ---------------------------------------------------------------------------
+
+# The exact spark_fired_session contents measured at the incident — no key for
+# the goal under test, which is the whole point.
+ECHO_MAP = json.dumps({
+    "g-250-293": "2026-08-05T02:18:31",
+    "g-335-710": "2026-08-05T02:47:34",
+    "g-335-713": "2026-08-05T03:37:11",
+})
+ECHO_SET_AT = "2026-08-05T05:21:32"
+ECHO_GOAL = "g-335-717"
+
+
+def _diary(tmp_path, rows, name="execution-diary.jsonl"):
+    """Write JSONL rows to a temp diary and return its path as a string."""
+    p = tmp_path / name
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return str(p)
+
+
+def _spark_row(goal_id, ts, kind="phase_start", phase="phase-6-spark"):
+    return {"entry_type": kind, "phase": phase, "timestamp": ts,
+            "content": f"{kind} {phase}", "goal_id": goal_id}
+
+
+def test_diary_fired_at_finds_the_marker():
+    """The pure core takes LINES, never a path, so it is testable with no
+    filesystem — the same contract every other helper in the module keeps."""
+    lines = [json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:00"))]
+    got = spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL)
+    assert got == datetime(2026, 8, 5, 4, 53, 0)
+
+
+def test_diary_fired_at_returns_the_LATEST_of_several():
+    """A recurring goal accumulates markers across closes; only the most recent
+    can be THIS close's, and the consumption window judges it from there."""
+    lines = [
+        json.dumps(_spark_row(ECHO_GOAL, "2026-08-04T01:00:00")),
+        json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:00")),
+        json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:40", kind="phase_end")),
+    ]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) == datetime(2026, 8, 5, 4, 53, 40)
+
+
+def test_diary_fired_at_ignores_another_goals_marker():
+    lines = [json.dumps(_spark_row("g-OTHER-999", "2026-08-05T04:53:00"))]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
+
+
+def test_diary_fired_at_ignores_another_phase_for_the_same_goal():
+    """phase-4-execute rows for the same goal are abundant; only a spark row
+    is evidence a spark fired."""
+    lines = [json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:00",
+                                   phase="phase-4-execute"))]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
+
+
+def test_diary_fired_at_ignores_a_row_that_only_MENTIONS_the_phase_in_its_content():
+    """The `phase` FIELD decides, not the presence of the string anywhere in the
+    row. This is the case the cheap substring prefilter structurally cannot
+    catch — diary rows carry a `content` field, and the incident's own spark
+    rows had content "phase_start phase-6-spark", so a row of a DIFFERENT phase
+    whose content mentions the spark phase passes the prefilter and reaches the
+    explicit field check.
+
+    Written after mutation testing: deleting `row.get("phase") != phase` flipped
+    NOTHING, because the sibling test above uses a phase-4-execute row that the
+    prefilter rejects before the field check is ever reached. That test pins the
+    PREFILTER; this one pins the FILTER."""
+    lines = [json.dumps({
+        "entry_type": "phase_end",
+        "phase": "phase-4-execute",
+        "timestamp": "2026-08-05T04:53:00",
+        "content": "phase_end phase-4-execute — deferred phase-6-spark to next turn",
+        "goal_id": ECHO_GOAL,
+    })]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
+
+
+def test_diary_fired_at_survives_garbage_and_returns_none():
+    """Fail-open at every layer: unparseable lines, non-dict rows, a missing
+    timestamp and a non-string entry are all skipped, and nothing usable
+    returns None -> no corroboration -> 'fire'."""
+    lines = [
+        "not json at all — phase-6-spark " + ECHO_GOAL,
+        json.dumps(["phase-6-spark", ECHO_GOAL]),
+        json.dumps({"phase": "phase-6-spark", "goal_id": ECHO_GOAL}),
+        json.dumps({"phase": "phase-6-spark", "goal_id": ECHO_GOAL, "timestamp": "not-a-time"}),
+        None,
+        "",
+    ]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
+    assert spark_fire_dedup.diary_fired_at([], ECHO_GOAL) is None
+    assert spark_fire_dedup.diary_fired_at(None, ECHO_GOAL) is None
+
+
+def test_cli_absent_record_without_diary_still_fires_UNCHANGED(tmp_path):
+    """Backward compatibility AND the positive control for the next test: with
+    no --diary-file the incident reproduces exactly as measured. If this ever
+    returns 'skip', the next test proves nothing — it would be passing on
+    behavior that was already there."""
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER], ECHO_MAP)
+    assert out == "fire"
+    assert rc == 0
+
+
+def test_cli_absent_record_IS_corroborated_by_the_diary(tmp_path):
+    """The fix, on the incident's own numbers: same map, same set_at, same
+    producer — only the diary is added, and the verdict flips."""
+    diary = _diary(tmp_path, [
+        _spark_row(ECHO_GOAL, "2026-08-05T04:10:00", phase="phase-4-execute"),
+        _spark_row(ECHO_GOAL, "2026-08-05T04:53:00"),
+        _spark_row(ECHO_GOAL, "2026-08-05T04:53:40", kind="phase_end"),
+    ])
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER,
+         "--diary-file", diary], ECHO_MAP)
+    assert out == "skip", "an absent record with a diary marker must dedup (g-115-4201)"
+    assert rc == 1
+
+
+def test_cli_diary_with_no_marker_for_this_goal_still_fires(tmp_path):
+    """FAIL-OPEN PRESERVED, and this is the assertion that keeps the fix from
+    becoming a suppressor: a diary that exists and is readable but carries no
+    spark row for THIS goal must not dedup. Absent record AND absent marker
+    still fires — unchanged from before this feature."""
+    diary = _diary(tmp_path, [
+        _spark_row("g-OTHER-999", "2026-08-05T04:53:00"),
+        _spark_row(ECHO_GOAL, "2026-08-05T04:53:00", phase="phase-4-execute"),
+    ])
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER,
+         "--diary-file", diary], ECHO_MAP)
+    assert out == "fire"
+    assert rc == 0
+
+
+def test_cli_unreadable_diary_path_still_fires(tmp_path):
+    """A missing or unreadable diary is a plumbing fault, and a plumbing fault
+    must never suppress a spark."""
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER,
+         "--diary-file", str(tmp_path / "does-not-exist.jsonl")], ECHO_MAP)
+    assert out == "fire"
+    assert rc == 0
+
+
+def test_cli_a_PRESENT_record_stays_authoritative_over_the_diary(tmp_path):
+    """The diary is consulted ONLY when the record is absent, and it earns no
+    privilege the record lacks.
+
+    THE TIMESTAMPS ARE CHOSEN TO DISCRIMINATE, and an earlier draft of this test
+    did not: it put BOTH the stale record and the diary marker outside the
+    window, so 'fire' came out either way and the assertion passed identically
+    whether the absent-record guard existed or had been deleted (caught by
+    mutating the guard to `if True:` — all 83 tests stayed green). Here the
+    diary marker is INSIDE the bounded window (set_at - 15 min = 05:06:32) while
+    the record is a day old and outside it, so the two signals disagree: correct
+    code follows the RECORD and fires; a version that let the diary override
+    would skip."""
+    diary = _diary(tmp_path, [_spark_row(ECHO_GOAL, "2026-08-05T05:10:00")])
+    stale_record = json.dumps({ECHO_GOAL: "2026-08-04T01:00:00"})
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--diary-file", diary], stale_record)
+    assert out == "fire", "a present record must decide, even when the diary would match"
+    assert rc == 0
+
+
+def test_cli_diary_marker_from_a_PREVIOUS_close_does_not_dedup(tmp_path):
+    """A substituted diary timestamp runs through the SAME consumption window a
+    real record does, so a marker from a genuine earlier close of a RECURRING
+    goal (bounded lookback — no producer field) falls outside it and still
+    fires. This is what stops the corroboration becoming a blanket 'ever fired'
+    test."""
+    diary = _diary(tmp_path, [_spark_row(ECHO_GOAL, "2026-08-04T01:00:00")])
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--diary-file", diary], ECHO_MAP)
+    assert out == "fire"
+    assert rc == 0
+
+
+def test_omni_19_minute_gap_dedups_under_the_current_producer(tmp_path):
+    """REGRESSION PIN for the half of  that  ALREADY FIXED,
+    on omni's own measured numbers (g-029-84, ZDS prod, 2026-07-30): fire
+    recorded 00:35:29, sentinel set_at 00:54:30 — a 19m01s gap, past the
+    15-minute lower bound, which returned 'fire' at the time.
+
+    It dedups now because the NON-recurring producer drops the lower bound
+    entirely. Pinned so that fix cannot silently regress, and pinned WITH its
+    control below: the same input without the producer field still fires, which
+    is correct — recurring-close.sh's lookback models a bounded script runtime,
+    and a pre-g-115-3351 sentinel (which is the shape omni actually observed)
+    carries no producer at all."""
+    omni_map = json.dumps({"g-001-216": "2026-07-29T23:07:53",
+                           "g-029-84": "2026-07-30T00:35:29"})
+    _, with_producer = _run_dedup_cli(
+        ["check", "g-029-84", "--sentinel-set-at", "2026-07-30T00:54:30",
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER], omni_map)
+    _, without_producer = _run_dedup_cli(
+        ["check", "g-029-84", "--sentinel-set-at", "2026-07-30T00:54:30"], omni_map)
+    assert with_producer == "skip", "g-115-3351's unbounded lookback must still hold"
+    assert without_producer == "fire", "the bounded recurring path must be unchanged"
+
+
+def test_phase_0_5c_2_passes_diary_file_to_the_check():
+    """WIRING (guard-3448 /  class: a gate is only as broad as its
+    entry points). The corroboration is inert unless the one live consumer
+    actually passes the flag, and a passing unit test says nothing about that."""
+    body = (Path(__file__).resolve().parents[3]
+            / ".claude" / "skills" / "aspirations" / "SKILL.md").read_text(encoding="utf-8")
+    idx = body.find("spark-fire-dedup.py check")
+    assert idx != -1, "Phase -0.5c.2 must call spark-fire-dedup.py check"
+    invocation = body[idx:idx + 400]
+    assert "--diary-file" in invocation, \
+        "Phase -0.5c.2 must pass --diary-file so an ABSENT record can be corroborated (g-115-4201)"
+    assert "execution-diary.jsonl" in invocation, \
+        "the --diary-file argument must name the execution diary"
+
+
 if __name__ == "__main__":
     sys.exit(0 if not subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]) else 1)

@@ -2202,3 +2202,107 @@ def test_conflict_streaks_surface_after_threshold(tmp_path, monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---  ITEM B: pull_continuity(only=) CONFINEMENT --------------------
+# The security-shaped half. `only` must NEVER widen the pull beyond the
+# continuity tier, and a happy-path test cannot see a widening bug: it would
+# pull MORE and still look like a successful pull.
+#
+# guard-3134 / guard-4166 govern the shape of these tests. Asserting scanned==0
+# is an ABSENCE assertion, and an absence assertion over a structurally-empty
+# collection passes identically whether confinement works or the whole tier was
+# deleted — that guardrail's canonical incident is in THIS file. So each case
+# below is paired with a POSITIVE CONTROL proving the same fixture DOES select
+# when a real continuity name is requested. The control is what makes the zero
+# mean something.
+#
+# The mutation expectation is stated per-test, per guard-4166: under a mutant
+# that drops the `n in wanted` intersection, the two confinement tests go RED
+# and the positive control STAYS GREEN. A control that flips with them would be
+# a third copy of the same assertion, not a control.
+
+def _only_fixture(tmp_path, monkeypatch):
+    """An agent whose session dir has a REAL continuity file seeded on S3.
+
+    Shared by the confinement cases and their positive control so all three run
+    against an identically-populated backend — otherwise the zeros could come
+    from the fixture rather than from the filter.
+    """
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")   # guard-955
+    monkeypatch.setattr(_mod, "_SESSION_TIERS_LOADED", False)
+    monkeypatch.setattr(_mod, "_SESSION_TIERS", None)
+    agents_root = tmp_path / "agents"
+    be = FakeBackend([(agents_root, "agents")])
+    sess = agents_root / "alpha" / "session"
+    sess.mkdir(parents=True)
+    be.s3[str(sess / "handoff.yaml")] = b"handoff-from-m1"
+    return be, sess
+
+
+def test_only_positive_control_a_real_continuity_name_does_select(tmp_path, monkeypatch):
+    """THE CONTROL (guard-3134): this fixture CAN select, so a zero elsewhere is real.
+
+    Under the confinement mutant this test must stay GREEN — that asymmetry is
+    the evidence the two tests below are measuring the filter (guard-4166).
+    """
+    be, sess = _only_fixture(tmp_path, monkeypatch)
+    stats = _mod.pull_continuity(be, "alpha", only={"handoff.yaml"})
+    # DELIBERATELY NOT asserting scanned == 1 here. That couples the control to
+    # the very property the cases below test, so a widening mutant flips it too
+    # — and a control that goes red with its cases is a third copy of the same
+    # assertion, not a control (guard-4166). Measured: under the intersection
+    # mutant this scanned 21. What the control must show is that the FIXTURE can
+    # produce a pull at all, which is true whether or not the filter confines.
+    assert stats["pulled"] == 1, (
+        "the positive control must PULL — if this is 0 the fixture is empty and "
+        f"every absence assertion below is vacuous: {stats!r}")
+    assert stats["pulled_files"] == ["handoff.yaml"], stats
+    assert "requested_missing" not in stats, (
+        f"a real continuity name must not be reported missing: {stats!r}")
+
+
+def test_only_a_machine_tier_name_selects_nothing_and_reports_missing(tmp_path, monkeypatch):
+    """A machine-tier name must not escape the continuity tier."""
+    be, sess = _only_fixture(tmp_path, monkeypatch)
+    exact, _globs = _mod._load_session_tiers()
+    # The tier is "machine_local" in session-manifest.yaml, NOT "machine". The
+    # first draft of this test used "machine" and the anti-vacuity assertion
+    # below caught it — without that assertion the empty list would have made
+    # only={} select nothing for the WRONG reason and the test would have gone
+    # green on a fixture that proved nothing (guard-3134, exactly).
+    machine = sorted(n for n, t in exact.items() if t == "machine_local")
+    assert machine, "no machine_local names in the manifest — this test would be vacuous"
+    target = machine[0]
+    stats = _mod.pull_continuity(be, "alpha", only={target})
+    assert stats["scanned"] == 0, (
+        f"only={target!r} is machine-tier and must select NOTHING; a nonzero "
+        f"scan means `only` widened past the continuity tier: {stats!r}")
+    assert stats["pulled"] == 0
+    assert stats.get("requested_missing") == [target], (
+        "the caller must get a VISIBLE signal rather than a silent empty pull: "
+        f"{stats!r}")
+
+
+def test_only_an_unknown_name_selects_nothing_and_reports_missing(tmp_path, monkeypatch):
+    """An unknown name selects nothing — the same confinement, no manifest help."""
+    be, sess = _only_fixture(tmp_path, monkeypatch)
+    stats = _mod.pull_continuity(be, "alpha", only={"no-such-file.yaml"})
+    assert stats["scanned"] == 0, (
+        f"an unknown name must select NOTHING, not fall through: {stats!r}")
+    assert stats["pulled"] == 0
+    assert stats.get("requested_missing") == ["no-such-file.yaml"], stats
+
+
+def test_only_mixing_a_valid_and_an_invalid_name_confines_to_the_valid_one(tmp_path, monkeypatch):
+    """The mixed case is where a widening bug hides: the valid name makes the
+    pull look successful while the invalid one silently rides along."""
+    be, sess = _only_fixture(tmp_path, monkeypatch)
+    stats = _mod.pull_continuity(be, "alpha", only={"handoff.yaml", "no-such-file.yaml"})
+    assert stats["scanned"] == 1, (
+        f"exactly the ONE valid name may be scanned: {stats!r}")
+    assert stats.get("requested_missing") == ["no-such-file.yaml"], stats
+    assert sorted(stats["only"]) == ["handoff.yaml", "no-such-file.yaml"], (
+        "`only` echoes what was REQUESTED (not what was selected) so the caller "
+        f"can diff the two: {stats!r}")

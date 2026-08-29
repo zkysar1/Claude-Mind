@@ -19,6 +19,21 @@ runs, two forced verdicts, 126 flagged files triaged to zero unexplained).
 2. Read the LAST promotion's force ledger / receipts if any exist (scratchpad
    or commit messages). The prior run's dest-only analysis is this run's
    baseline for "what changed since".
+3. Target-clone freshness, and the disjointness proof that makes it safe.
+   The clone you are about to plant into is dirtied continuously by the agents
+   living in it, so neither "just `git pull`" nor a blanket dirty-tree refusal
+   is right: what makes a fast-forward safe is that the DIRTY set and the
+   INCOMING set do not intersect. One command (guard-399):
+
+   ```bash
+   bash core/scripts/promotion-git-state.sh freshness --target <target-clone> [--apply]
+   ```
+
+   `SAFE` (rc 0) — disjoint; `--apply` fast-forwards. `UNSAFE` (rc 2) — it
+   names the colliding paths; commit those as a `chore:` (never discard) and
+   re-run. `DIVERGED` (rc 2) — the target is ahead as well as behind, which is
+   a Phase 1 reconcile-UP question, not a freshness one. `UNREADABLE` (rc 3) —
+   no verdict is available; a wrong `--target` must never read as clean.
 
 ## Phase 1 — Reconcile UP before anything ships (guard-119)
 
@@ -244,6 +259,69 @@ Run every item; each is a one-liner and each has caught a real defect:
    platform (exec-bit class, path semantics, CRLF) is the expected shape
    here — platform is part of production shape.
 
+## Phase 7 — Postflight: the git state the hop leaves behind
+
+`promote-to-upstream.sh` creates and pushes a `promote/*` branch and tears down
+its own worktree. Nothing deletes the branch, confirms the merge actually
+landed, or resolves a pre-promotion stash — so those survive the run, silently,
+and two promotion stashes were measured stranded on dev and prod before this
+phase existed.
+
+One command, not a checklist (guard-399 — a hook whose invocation is prose does
+not fire):
+
+```bash
+bash core/scripts/promotion-git-state.sh postflight \
+  --target <target-clone> --branch promote/vX.Y.Z --pr <url|number> \
+  --tag vX.Y.Z [--plant-clone <path>] [--also-confirm <repo>]...
+```
+
+Read-only by default; `--apply` performs the branch deletion and nothing else.
+Exit `0` clean · `2` action needed · `3` unreadable.
+
+**(a) What the script does or checks for you.** Merge-landed verdict, the
+push-triggered main run, branch deletion local + remote, a stale-worktree scan,
+tag reachability, and a final fetch-and-confirm across every repo you name.
+
+Three of those are counter-intuitive enough to state, because a naive check
+inverts each one:
+
+- **The merge verdict is the PR's `state`, never ancestry.** A squash merge
+  lands the content under a NEW sha, so the branch tip can never become an
+  ancestor of main — not "not yet", permanently (guard-4463). The script also
+  never trusts a local `remotes/origin/*` ref: `git fetch` does not prune
+  deleted branches, so a stale ref keeps an orphaned tip alive and an
+  "unlanded commit" scan reports commits that shipped weeks ago. Every fetch
+  here is `--prune`.
+- **The main workflow run is matched by `headSha`, never by recency**
+  (guard-5017). `gh pr checks` green proves the PR gate only; the merge commit
+  is a new commit with its own run, and main-only jobs (publish, deploy legs)
+  exist ONLY there. Right after a merge that run is queued and unlisted, so
+  `--limit 1` grabs the PREVIOUS push's run — already complete, reading as an
+  instant green for a commit it never touched. `NO_RUN_YET` is a real state
+  and is NOT a green.
+- **Branch deletion is gated on `MERGED`, and refuses without it.** Going
+  forward also pass `--delete-branch` at `gh pr merge` time — prevention beats
+  sweeping — but then fetch and ff explicitly afterwards: gh switches and
+  fast-forwards the LOCAL checkout, and a diverged local leaves STALE
+  working-tree content behind (rb-240).
+
+**(b) What the script only DETECTS — you still have to do these.** They are
+printed under their own `LLM OBLIGATIONS` heading precisely so they cannot be
+read as done (guard-365):
+
+- **A pre-promotion stash: apply or archive, NEVER silent-drop.**
+  `git stash show -p stash@{N}` then pop, or record the patch somewhere
+  durable first — `archive-before-delete.md` governs a drop.
+- **A plant clone: sweep, then delete.** Run
+  `core/scripts/daemon-orphan-sweep.sh` FIRST (rb-7489) and confirm the ledger
+  is archived. The script never deletes a clone.
+
+**(c) What it deliberately does NOT re-implement.** `git worktree remove` +
+`prune` already run inside `promote-to-upstream.sh` (its `_wt_teardown` site
+calls `worktree-teardown.sh`); postflight only verifies none survived. The
+`--auto-merge` status-check parse is owned by g-115-5645 and is untouched here.
+
 ## Cross-references
 
 - `core/config/conventions/pull-promotion.md` — the PULL side: how a
@@ -255,5 +333,7 @@ Run every item; each is a one-liner and each has caught a real defect:
 - `seed-publication-methodology` (tree) — source-stays-dirty transform model
 - `core/scripts/promotion-plan-triage.py` — mechanical triage of plan verdicts
 - `core/scripts/promotion-preflight.py` — reconcile-UP work-list generator
+- `core/scripts/promotion-git-state.py` — Phase 0 freshness + Phase 7
+  postflight (git STATE; the preflight sibling audits content DRIFT)
 - g-115-4389 — auto-excusal of DEST-FROZEN/SEED-MOTION inside the plan itself
 - g-115-4391 / g-115-4392 — the two known dest-suite red classes, tracked

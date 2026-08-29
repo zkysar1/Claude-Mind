@@ -77,124 +77,83 @@ re-reading.
 # ⚠ `tree-read.sh --node` RETURNS METADATA ONLY — summary, child_count,
 # retrieval_count, poignancy. NO BODY, at any depth. Running it and reading its
 # output IS NOT reading the series: this step is satisfiable exactly as written
-# while leaving you with no prior series at all. That is `guard-3312`, and it has
-# now caught FOUR consecutive passes (N=57, N=62, N=64, N=65) — including two that
-# followed the instruction. A guardrail cannot outvote the instrument it guards
-# (guard-1984), so the paths are named HERE.
+# while leaving you with no prior series at all (`guard-3312`, which has caught
+# FOUR consecutive passes — including two that followed the instruction). A
+# guardrail cannot outvote the instrument it guards (guard-1984), so the paths
+# are named HERE.
 #
 # Read the FILES, in this order. `world/` is external and bare Bash path args are
-# NOT hook-rewritten (path-resolution.md), so $WORLD_PATH must be resolved — and
-# resolved INSIDE EACH INVOCATION. Shell state does NOT persist between Bash
-# calls: a `source _paths.sh` standing on its own line leaves $WORLD_PATH EMPTY in
-# the next one, so (a) degrades to `sed /knowledge/tree/...` → "No such file or
-# directory" and delivers nothing — the same empty-handed outcome as the
-# metadata-only defect above, just louder. That split shape shipped HERE on
-# 2026-08-11 (in the very edit that fixed the metadata-only half) and was measured
-# broken the same day; /fresh-eyes-tree's Phase 2.0 carries the correct
-# self-contained form. It can also read rc=0 when piped (guard-1150) — judge by
+# NOT hook-rewritten (path-resolution.md), so $WORLD_PATH must be resolved INSIDE
+# EACH INVOCATION — shell state does NOT persist between Bash calls, and a
+# `source _paths.sh` on its own line leaves $WORLD_PATH EMPTY in the next one,
+# delivering nothing. It can also read rc=0 when piped (guard-1150) — judge by
 # the OUTPUT, never the exit status.
   # (a) YOUR OWN SERIES ROW — two levels down, and the ONLY place the readings live.
   #     ⚠ NO FLEET-WIDE "TOP" OR "TAIL" — THE SHARDS DIVERGED AND GET RESTRUCTURED
-  #     WITHOUT ANNOUNCEMENT. Measured twice, 12 days apart, all five shards:
-  #     `sed '1,140p'` returns one agent's NEWEST row and another's OLDEST, and
-  #     both look like a series. One shard is now NEITHER — an off-by-SEVEN that
-  #     overwrote six successors' slots — and an ordering classifier passes
-  #     VACUOUSLY on the shards with zero `## N=` headings (guard-1922). Yours may
-  #     describe only yours (guard-3487). "Read the TOP" and "read the TAIL" have
-  #     EACH been wrong for some agent at some date. Dated readings, verbatim:
-  #     `core/config/fresh-eyes-shard-readings.md` — APPEND THERE, never here
-  #     (this file is over its injection ceiling; g-115-6690).
+  #     WITHOUT ANNOUNCEMENT. "Read the TOP" and "read the TAIL" have EACH been wrong
+  #     for some agent at some date; one shard is now NEITHER (an off-by-SEVEN that
+  #     overwrote six successors' slots), and an ordering classifier passes VACUOUSLY
+  #     on shards with zero `## N=` headings (guard-1922). Yours may describe only
+  #     yours (guard-3487). Dated readings, verbatim:
+  #     `core/config/fresh-eyes-shard-readings.md` — APPEND THERE, never here (this
+  #     file is over its injection ceiling; g-115-6690).
   #     DERIVE N AS THE MAX OVER SECTION HEADINGS — order-independent, so it is
   #     correct under every layout above. Exclude forward-reference headings
   #     ("Handoff to N=k"): those name an entry that does not exist yet (guard-2653).
-  #     ⚠ THE EXCLUSION MUST BE CASE-INSENSITIVE (`-vi`), and it was `-v` until
-  #     2026-08-16. Fleet agents write the pre-registration heading in more than one
-  #     casing: bravo writes `### HANDOFF to N=k` in caps, which the case-SENSITIVE
-  #     `Handoff to N=` filter does not match, so the forward reference leaks into the
-  #     MAX and the probe returns the NEXT pass's number. Measured that day on bravo's
-  #     shard, same file, same run, only the flag differing: `-v` -> 57, `-vi` -> 56,
-  #     against a true newest entry of `## N=56`. The failure is silent and off-by-one
-  #     in the direction that makes the briefing overwrite its own successor's slot.
-  #     Note this is the SAME case lesson Phase 2.3b's (a-pre) block measured at length
-  #     one screen below ("MATCH THESE CASE-INSENSITIVELY... 287 lowercase vs 40
-  #     capital") — learned there, never propagated to this sibling filter in the same
-  #     file. When you fix a casing assumption in one filter, grep the file for the
-  #     others (guard-2653 is about WHAT to exclude; this is about the MATCH surviving
-  #     how five different agents actually type it).
+  #     ⚠ THE EXCLUSION MUST BE CASE-INSENSITIVE (`-vi`). Fleet agents write the
+  #     pre-registration heading in more than one casing (bravo writes `### HANDOFF
+  #     to N=k`), and a case-SENSITIVE filter leaks the forward reference into the
+  #     MAX — measured -v -> 57 vs -vi -> 56 against a true `## N=56`. Silent, and
+  #     off-by-one in the direction that overwrites your successor's slot. When you
+  #     fix a casing assumption in one filter, grep the file for the others
+  #     (guard-2653 is WHAT to exclude; this is the MATCH surviving how five
+  #     different agents actually type it).
   #     ⚠ THE PROBE TAKES THE MAX OVER **THREE** SHAPES — headings, `| **N=`-leading
-  #     rows, and the FIRST `N=` token of any other table row.
-  #     Heading-only was wrong for echo by THREE on 2026-08-17 (returned 15 against a
-  #     true 71) because echo writes rows as TABLE ROWS (`| **N=68** …`), which no
-  #     heading grep can see at any casing. Do NOT "simplify" this to a single union
-  #     regex: the obvious form `^(#{1,4} |\| \*\*)N=[0-9]+` requires N= IMMEDIATELY
-  #     after the prefix and so returns EMPTY for alpha and zeta, whose headings carry
-  #     other text first. Measured that day across all five shards, both forms — the
-  #     union regressed 2 of 5 to nothing while the max-of-both regressed none.
+  #     rows, and the FIRST `N=` token of any other table row. Heading-only was wrong
+  #     for echo by THREE (its rows are TABLE ROWS, which no heading grep sees at any
+  #     casing). Do NOT "simplify" to a single union regex: the obvious form
+  #     `^(#{1,4} |\| \*\*)N=[0-9]+` requires N= IMMEDIATELY after the prefix and so
+  #     returns EMPTY for alpha and zeta, whose headings carry other text first —
+  #     measured all five shards, the union regressed 2 of 5 to nothing, max-of-both
+  #     regressed none.
   #     ⚠ THE THIRD BRANCH TAKES THE **FIRST** `N=` PER ROW, NOT THE MAX WITHIN IT,
-  #     AND THAT DISTINCTION IS THE WHOLE BRANCH. A row's own index appears FIRST (in
-  #     its date cell or at the head of its verdict cell); any other `N=` later in the
-  #     same row is prose referring to a DIFFERENT point — including a FORWARD one.
-  #     Measured 2026-08-18 (zeta, `hostname` cc-02, `uname -r` 6.8.0-137-generic):
-  #     a max-within-row variant read echo as **74** when echo's newest row is **73**,
-  #     because echo's own N=73 row names N=74 in its body. guard-2653's `handoff to
-  #     N=` filter does not catch that phrasing and cannot be widened to (the forms
-  #     are unbounded prose) — position is the reliable discriminator, not wording.
+  #     AND THAT DISTINCTION IS THE WHOLE BRANCH. A row's own index appears FIRST;
+  #     any later `N=` in the same row is prose naming a DIFFERENT — possibly FORWARD
+  #     — point. A max-within-row variant read echo as 74 against a true 73.
+  #     guard-2653's `handoff to N=` filter cannot be widened to catch that (the
+  #     forms are unbounded prose): position is the discriminator, not wording.
   #     ⚠ READ THE AUTHORITATIVE STORE COPY, NOT $WORLD_PATH — AND RE-RUN THIS
-  #     PROBE IMMEDIATELY BEFORE THE PHASE-8 WRITE (g-115-8055). This line read
-  #     the local mirror until 2026-08-27. Two independent defects, and fixing
-  #     only the first leaves the collision intact:
-  #       (1) SOURCE. Under own-cloud $WORLD_PATH is a read-through cache, so the
-  #           allocation could be computed from stale bytes (guard-157: default NO
-  #           mirror, read the single authoritative source). backend-cat.sh cat is
-  #           a pure to-memory authoritative read.
-  #       (2) SHELF LIFE — the load-bearing half. N is a value DERIVED from a read,
-  #           and the write happens many minutes later at Phase 8. owncloud_backend
-  #           fences every PUT with PutObject(IfMatch), which proves no LOST UPDATE
-  #           and says NOTHING about whether the allocated VALUE is unique: box A
-  #           reads 88 -> mints 89 -> writes (fence passes); box B read 88 before
-  #           A's write, mints 89, and B's write ALSO passes because locked_rmw
-  #           re-reads and B's ETag is current at B's OWN write. Two N=89 sections
-  #           in a file that stayed internally consistent throughout — so every
-  #           drift and integrity probe reports [match] and nothing sees it. That
-  #           is exactly how the 89a/89b collision was minted. (guard-5322,
-  #           guard-1876: a measured verdict about mutable data has a shelf life.)
+  #     PROBE IMMEDIATELY BEFORE THE PHASE-8 WRITE (g-115-8055). Two independent
+  #     defects; fixing only the first leaves the collision intact. (1) SOURCE —
+  #     under own-cloud $WORLD_PATH is a read-through cache, so N could be minted
+  #     from stale bytes (guard-157); `backend-cat.sh cat` is a pure authoritative
+  #     read. (2) SHELF LIFE, the load-bearing half — the PUT fence proves no LOST
+  #     UPDATE and says NOTHING about whether the allocated VALUE is unique, so two
+  #     boxes can mint the SAME N while every drift and integrity probe still
+  #     reports [match] (guard-5322, guard-1876). That minted the 89a/89b collision.
   #     SO: allocate at WRITE time, not at read time. Re-run this probe as the last
   #     step before writing the section heading and use THAT max+1. If the value
   #     moved between the two runs, a peer allocated in the gap — take the new max,
   #     do not keep your earlier number.
-  #     ⚠ FAIL LOUD, NEVER FALL BACK TO THE MIRROR. An authoritative read that
-  #     fails means N is unallocatable this pass; silently re-reading $WORLD_PATH
-  #     restores defect (1) at precisely the moment it is most likely to bite.
-  #     The three branches below are UNCHANGED and must stay byte-identical — the
-  #     shape is correct and hard-won (verified all five shards; zeta corrected by
-  #     45). Only the SOURCE of $S and the TIMING of the run are the fix.
+  #     ⚠ FAIL LOUD, NEVER FALL BACK TO THE MIRROR. A failed authoritative read
+  #     means N is unallocatable this pass; silently re-reading $WORLD_PATH restores
+  #     defect (1) at precisely the moment it is most likely to bite. The three
+  #     branches below are UNCHANGED and must stay byte-identical — the shape is
+  #     correct and hard-won. Only the SOURCE of $S and the TIMING are the fix.
   Bash: source core/scripts/_paths.sh && P="world/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; S="$(mktemp)"; bash core/scripts/backend-cat.sh cat "$P" > "$S" 2>/dev/null || { echo "FATAL: authoritative read of $P failed — N is UNALLOCATABLE this pass. Do NOT fall back to \$WORLD_PATH (g-115-8055)."; rm -f "$S"; exit 1; }; test -s "$S" || { echo "FATAL: authoritative read returned 0 bytes — refusing to allocate N from an empty file."; rm -f "$S"; exit 1; }; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | awk '/^\|/ { if (match($0, /N=[0-9]+/)) print substr($0, RSTART, RLENGTH) }'; } | grep -oE '[0-9]+' | sort -n | tail -1; rm -f "$S"
-  #     VERIFIED against ground truth 2026-08-18 (zeta, cc-02, 6.8.0-137-generic), all
-  #     five shards, old two-branch vs new three-branch, same run:
-  #       alpha 83→83 · bravo 61→61 · echo 73→73 · foxtrot 57→57 · **zeta 34→79**
-  #     Zero regressions, zero over-matches, and zeta corrected by **45**.
-  #     ⛔ THE PRIOR NOTE HERE WAS WRONG ABOUT WHY, AND THE WRONG REASON IS WHAT MADE
-  #     IT UNFIXABLE. It read "zeta has 0 table rows, so its shape is a third one
-  #     neither branch reads" and left the probe alone. zeta has **111** table rows.
-  #     Its index is an INLINE token inside a cell — `| 2026-08-17 21:01 | … | **N=79
-  #     — THE N=77 RECOVERY…** |`, and in older rows `… ** N=74, fresh-eyes, …` — so
-  #     the cell does not START with `N=`, which is the only thing branch 2 can see.
-  #     "No rows" pointed at a missing shape (nothing to do); "rows whose N= is not at
-  #     the cell head" points at a missing MATCH (one awk). A correct diagnosis was
-  #     available from `grep -cE '^\|'`, one command, and the note stood for a day.
-  #     The 34 it returned is a stray prose token, which is why it reads as plausible
-  #     rather than as an error — a wrong-but-well-formed N is the dangerous shape.
-  #     Whatever this probe returns, guard-2421 still applies: positive-control it
-  #     against a shard whose N you have confirmed from the rows before trusting it.
-  #     ⚠ AND WHEN YOU DO, THE SHARD-INDEX TABLE IS NOT THAT ANCHOR. It is a
-  #     hand-maintained prose cell with no writer and no check. echo's read
-  #     `| *(this node)* | 68– | (empty — next row lands here) |` for three consecutive
-  #     fires while N=68/69/70 sat in the tail directly below it — so the fallback this
-  #     line used to prescribe is precisely what produced the off-by-three. The
-  #     trustworthy anchor is the ROWS THEMSELVES (the second half of the probe above,
-  #     or a targeted `grep -n 'N=' | tail`). A wrong index is embarrassing; the real
-  #     cost is the wrong PRIOR POINT it carries into Rule 11 — a wrong drift score and
-  #     therefore a wrong verdict. Then read the section around that heading/row.
+  #     VERIFIED 2026-08-18 across all five shards, two-branch vs three-branch,
+  #     same run: zero regressions, zero over-matches, zeta corrected by **45**.
+  #     ⚠ POSITIVE-CONTROL WHATEVER THIS PROBE RETURNS (guard-2421) against a
+  #     shard whose N you have confirmed FROM THE ROWS — a wrong-but-well-formed
+  #     N reads as plausible, not as an error.
+  #     ⚠ AND THE SHARD-INDEX TABLE IS NOT THAT ANCHOR. It is a hand-maintained
+  #     prose cell with no writer and no check, and it produced a live off-by-three
+  #     (it read `68–` for three consecutive fires while N=68/69/70 sat in the tail
+  #     directly below it). The trustworthy anchor is the ROWS THEMSELVES (the
+  #     probe's second half, or a targeted `grep -n 'N=' | tail`). A wrong index is
+  #     embarrassing; the real cost is the wrong PRIOR POINT it carries into
+  #     Decision Rule 11 — a wrong drift score and therefore a wrong verdict.
+  #     Then read the section around that heading/row.
   # (b) The parent's Decision Rules + measurement recipe (load-bearing — see 2.2b
   #     SOURCE below). The parent is over the Read cap, so grep its headers and
   #     sed the ranges you need; do NOT Read it whole.
@@ -216,15 +175,10 @@ re-reading.
   → carry these into Phase 3. Append this pass's point to the series table in
     (a) at Phase 5.6 rather than leaving it only in the temp/ briefing.
 
-# WHY 2.0 EXISTS AND WHY IT IS FIRST. Both sibling rituals learned this the hard
-# way and wrote it into their own Phase 2.0 (fresh-eyes-program reads
-# program-alignment-health; fresh-eyes-tree reads l1-taxonomy-health) — a series
-# node read only at encode time catches a re-derivation AFTER its full cost is
-# already paid. fresh-eyes-review had NO series node at all until 2026-07-29, so
-# its Self-mandated series lived only in the temp/ briefing that Phase 8 archives
-# to temp/drained/ — re-derived from scratch every pass, or carried in volatile
-# session context. Retrieval must precede synthesis
-# (.claude/rules/retrieve-before-deciding.md).
+# WHY 2.0 EXISTS AND WHY IT IS FIRST: a series node read only at encode time
+# catches a re-derivation AFTER its full cost is already paid. Retrieval must
+# precede synthesis (.claude/rules/retrieve-before-deciding.md). Rationale:
+# core/config/rationale/fresh-eyes-series-index-probe.md
 
 # 2.1 Self — current identity
 Read agents/<agent>/self.md
@@ -239,26 +193,19 @@ Extract for each active aspiration:
   - goals: (completed / total) — READ `progress.completed_goals` /
     `progress.total_goals`, the aspiration-level field already in this file.
     **Do NOT count `status == "completed"` in the record's `goals` array.** That
-    array holds ONLY NON-TERMINAL goals: measured 2026-08-11 (alpha, `hostname`
-    cc-04, `uname -r` 6.8.0-136-generic) its status histogram is
-    `{pending, skipped, in-progress, blocked, decomposed}` — the `completed`
-    bucket is absent ENTIRELY, across all 22 active aspirations. So the count is
-    a structural ZERO for every aspiration, every lane, every fire, and the
-    `completion_health` derived from it is **0.0000** — maximally unhealthy,
-    which is the direction that forces act_now/act_later. Positive control, same
-    file, same run: asp-335 reads **0/122** from the goals array and **989/1106**
-    from `progress`, against 989 completed of 1111 in the full store. Same defect
-    class as 2.2b/2.3/2.4 below (a step reading a field its store does not
-    carry), one phase earlier — and, like those, it fails as a plausible SIGNAL
-    rather than as an error.
-    `guard-3410` already carried this rule and did not prevent it: it was created
-    **2h53m before this fire** (foxtrot, g-335-804, 10:21) with
-    `retrieval_count: 0`, and the next agent to run the ritual reproduced the
-    defect anyway — a guardrail cannot outvote the instrument it guards
-    (`guard-1984`), which is why this correction is written HERE and not left in
-    the guardrail. Note its `action_hint` routes you to a SECOND store
-    (`precheck-eval.sh` or `aspirations-read.sh --source world`); `progress` is
-    cheaper, needs no extra read, and reconciles exactly on `completed_goals`.
+    array holds ONLY NON-TERMINAL goals — measured across all 22 active
+    aspirations, the `completed` bucket is absent ENTIRELY from its status
+    histogram. So the count is a structural ZERO for every aspiration, every
+    lane, every fire, and the `completion_health` derived from it is **0.0000**
+    — maximally unhealthy, the direction that forces act_now/act_later. Positive
+    control, same file, same run: asp-335 reads **0/122** from the goals array
+    and **989/1106** from `progress`. Same defect class as 2.2b/2.3/2.4 below (a
+    step reading a field its store does not carry), and it fails as a plausible
+    SIGNAL rather than as an error. `guard-3410` carried this rule and did not
+    prevent it — a guardrail cannot outvote the instrument it guards
+    (`guard-1984`), which is why the correction is written HERE. `progress` is
+    also cheaper than the second store its `action_hint` routes you to, and
+    reconciles exactly on `completed_goals`.
   - top 3 goal titles with status
 
 # 2.2b STANDING USER DIRECTIVE — read BEFORE assessing alignment (g-115-3136)
@@ -355,29 +302,20 @@ Bash: team-state-read.sh --field strategic_focus --json
     Say so explicitly rather than silently omitting the check.
 
 # 2.3 Self-evolution signals in pending-questions
-# ⚠ THE OLD FILTER HERE WAS STRUCTURALLY DEAD, FLEET-WIDE, ON EVERY PASS. It read
-# "id starts with 'sq-012' OR tags include 'self_evolution'". Measured 2026-07-31
-# (bravo, cc-05) across all five agents' files — 99 records: `tags` is absent from
-# the UNION of keys on every agent, and ZERO ids begin with `sq-`. No skill writes
-# `tags:` into this store (0 matches across every SKILL.md). Neither disjunct could
-# ever match, so pq_signals was 0 for every agent on every review — and that zero
-# read as "no self-evolution signal" rather than "this step queries a retired
-# surface." Same class as the Phase 2.4 defect fixed 2026-07-30 (three fields read
-# from a store that never had them); found forty lines below it and missed then.
-# ROOT CAUSE — not a schema mismatch, a RETIRED PROTOCOL. sq-012 used to gate Self
-# edits through a pending-questions PRE-APPROVAL entry. `.claude/rules/self.md`
-# records that gate as SUPERSEDED on 2026-04-22 ("the user explicitly traded 'ask
-# first' for 'notify after, revert if wrong'"), enforced by guard-380. sq-012 signal
-# moved to the board and to journal/self.md revisions. This step was never updated.
-# WHY IT SURVIVED ~15 MONTHS OF PASSES: rb-1279 (2026-05-24) OBSERVED the symptom
-# ("the count silently 0") and fixed it by ADDING 2.3b's board channel as a second
-# source. That was the right adaptation — the signal genuinely had moved — but it
-# made the total non-zero, which removed all pressure to ask why the FIRST source
-# was still zero. A compensating second source masks a broken first one indefinitely.
-# guard-1922 names the general shape: a condition whose signal is not durably
-# readable retires itself silently, always as a pass. guard-1419 names the reading
-# duty: a zero with two candidate explanations that imply OPPOSITE actions must be
-# disambiguated before it is believed.
+# ⚠ THE OLD FILTER HERE WAS STRUCTURALLY DEAD, FLEET-WIDE, ON EVERY PASS — it read
+# "id starts with 'sq-012' OR tags include 'self_evolution'", and measured across all
+# five agents (99 records) NEITHER disjunct can ever match: no `tags` key exists in the
+# store and zero ids begin with `sq-`. The zero read as "no signal" rather than "this
+# step queries a retired surface". ROOT CAUSE is a RETIRED PROTOCOL, not a schema
+# mismatch: sq-012's pending-questions PRE-APPROVAL gate was SUPERSEDED 2026-04-22
+# (.claude/rules/self.md, guard-380 — "ask first" traded for "notify after, revert if
+# wrong"); the signal moved to the board and to journal/self.md revisions, and this step
+# was never updated.
+# WHY IT SURVIVED ~15 MONTHS: rb-1279 fixed the SYMPTOM by adding 2.3b's board
+# channel as a second source, which made the total non-zero and removed all pressure
+# to ask why the FIRST source was still zero — a compensating second source masks a
+# broken first one indefinitely. Shape: guard-1922 (a signal that is not durably
+# readable retires itself silently, always as a pass); reading duty: guard-1419.
 Read agents/<agent>/session/pending-questions.yaml
   → SCHEMA (measured, all five agents): every record carries `id, question, status,
     created`; most carry `type` (43 distinct free-text values, ~35% null) and
@@ -387,12 +325,21 @@ Read agents/<agent>/session/pending-questions.yaml
     ALREADY EXECUTED, logged as "I decided X because Y — override if you disagree."
     So a self-evolution signal here is a DECISION ABOUT THIS AGENT'S OWN purpose,
     role, lane, or scope — a judgment on the text, not a key match.
+  → ⚠ BUT "a judgment on the text" IS NOT "a judgment on the SUBJECT MATTER".
+    Classify on the record's `type` FIELD and the ACTION IT PROPOSES, BEFORE any
+    subject-matter judgment: `type: scope-decision`, or text proposing an edit to
+    `agents/<agent>/self.md`, IS a pq_signal — it does not stop being an identity
+    signal because a product repo/goal/PR occasioned it, since a scope question only
+    ever arises WHILE DOING WORK. Reading it the other way produced 23 consecutive
+    false P=0 readings (measurement + direction-of-defect: guard-5433).
   → capture such entries created within the last 30 days (any status)
   → call these pq_signals
   → EXPECT ZERO and say so explicitly. Since the 2026-04-22 supersession the
     primary sq-012 surfaces are 2.3b (board) and 2.6b (partner beliefs); an empty
     pq_signals is now the NORMAL reading, not a missing signal. What would make it
     non-empty is a logged decision that narrows or redirects this agent's purpose.
+    ⚠ "NORMAL" is a PRIOR, not a finding: run the type-field test above and name the
+    records you rejected before recording a zero.
 
 # 2.3b Self-evolution signals on the findings board (g-115-1214)
 # pending-questions.yaml is not the only self-evolution surface. A self-drift
@@ -416,18 +363,14 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
     object per LINE, not a JSON array; `json.load` on the whole stream raises
     "Extra data". Keys are exactly:
     `author, channel, id, reply_to, session_id, tags, text, timestamp, type`.
-    **The body field is `text`.** This is stated because every rule below says
-    "whose text opens with" and none of them names the key: a first implementation
-    that reads `content` / `body` / `message` gets `""` for every record, which
-    makes `(a-pre)` — the exclusion the next 40 lines argue is the most
-    consequential filter in this step — match NOTHING and drop silently out of the
-    pipeline. Measured on the same corpus, same run, only the key differing:
-    **0 receipts dropped of 39 findings on the wrong key, 28 on `text`.** There is
-    no error and no empty result to notice; the count simply comes back inflated by
-    28, which is the direction that forces a false `act_later` forever. Same class
-    as the Phase 2.3 / Phase 2.4 defects above — a step reading a field its store
-    does not have — and it survived for the same reason: the failure looks like a
-    signal, not like a bug.
+    **The body field is `text`.** Every rule below says "whose text opens with"
+    and none names the key, so an implementation reading `content` / `body` /
+    `message` gets `""` for every record — `(a-pre)`, the most consequential
+    filter in this step, then matches NOTHING and drops silently out of the
+    pipeline. Measured same corpus, same run, only the key differing: **0 receipts
+    dropped on the wrong key, 28 on `text`.** No error and no empty result to
+    notice; the count just comes back inflated by 28, which forces a false
+    `act_later` forever.
   → filter to findings WHERE ('self_evolution' in tags OR 'self-drift' in tags)
     AND directed at this agent. **EVALUATE THE TESTS IN THIS ORDER — an
     explicit agent ROUTING TAG outranks a loose prose mention** (the same
@@ -500,23 +443,15 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
            every escaped receipt INFLATES `self_evolution_signals_count`, and
            Phase 5.5 reads that count as change-pressure — so the failure always
            pushes toward a false `act_later`, never toward a missed one.
-           **Why this had to move ABOVE (a0) rather than live only in (b):** (b)
-           already carried this shape test, but (a0) short-circuits on the agent
-           tag before (b) is ever reached — and the tag on a receipt is the
-           AUTHOR'S OWN name. So for exactly the agent that posted them, the test
-           that would catch them was unreachable. The ritual then reads its own
-           output as input and the tally grows by one per fire, converging on a
-           permanent act_later. Measured 2026-08-01 (echo, N=19): of 29 unread
-           self_evolution/self-drift findings in 30d the filter kept 4 as
-           directed-at-echo and **all 4 were echo's own ritual output** — 2
-           literal cadence receipts, plus one sq-012 self-signal counted twice
-           because its own 10-minute correction is a separate post. Honest
-           partner-authored count 0; honest novel-signal count 1; filter said 4.
-           Every prior fix in this family (guard-1877; the N=15 `agent:`-prefix
-           fix) tightened the PARTNER side — the self side had no shape test at
-           all. Line 91's intent is preserved: a genuine own-authored FOLLOWUP
-           finding does not match these shapes and still counts. Owned by
-           `g-115-4087`.
+           **Why this shape test sits ABOVE (a0):** (a0) short-circuits on the
+           agent tag, and the tag on a receipt is the AUTHOR'S OWN name — so for
+           exactly the agent that posted them, the test that would catch them was
+           unreachable, and the ritual reads its own output as input, converging
+           on a permanent act_later. Measured echo N=19: filter kept 4, all 4
+           echo's own ritual output; honest partner-authored count 0. Line 91's
+           intent is preserved — a genuine own-authored FOLLOWUP still counts.
+           Owned by `g-115-4087`. Rationale:
+           core/config/rationale/fresh-eyes-board-signal-attribution.md
       (a0) tags carry ANY agent name → that tag DECIDES. MIND_AGENT among them
            → directed. Another agent's name and not MIND_AGENT → it is THAT
            agent's own signal → EXCLUDE, and do not consult the text at all.
@@ -580,29 +515,14 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
           tag-form hole fixed at N=15): each one inflates
           self_evolution_signals_count in the direction that forces act_later
           forever.
-  # SECOND REGRESSION, and the reason the ORDER above is now explicit
-  # (guard-1877, alpha 2026-07-29; independently replicated by bravo
-  # 2026-07-30, one day later, on a different agent). This ritual's own board
-  # posts now @-broadcast to every agent and carry cross-agent comparison
-  # tables, so the "text names this agent" disjunct — written as a rare
-  # fallback — matches essentially EVERY peer's routine cadence post. Measured
-  # alpha: loose test kept 10 of 18; honest count ZERO. Measured bravo: loose
-  # test kept 15 of 29; honest count ONE (27 of 29 were tagged to another
-  # agent). Left unordered, this inflates self_evolution_signals_count enough
-  # to force act_later on every review forever, and it GROWS — every new
-  # comparison table adds another false match. guard-1877 already carried the
-  # rule; the pseudocode still invited the error, which is why alpha's
-  # measurement did not prevent bravo's near-miss the next day. A guardrail
-  # cannot outvote the instrument it guards.
-  # FIRST REGRESSION (g-115-2922, zeta review 2026-07-22): before this exclusion,
-  # two echo self-signals (echo-3542, echo-3840) — echo's own untagged sq-012s
-  # — were counted toward zeta's review via the "applies to all" disjunct,
-  # inflating self_evolution_signals_count 5->7 and net-divergent 1.0->3.0,
-  # flipping zeta's self-assess from no_change to a FALSE act_later (caught by
-  # a manual authorship check, corrected by hand). The author!=MIND_AGENT +
-  # names-own-purpose test is the fix; a genuinely agent-agnostic untagged
-  # finding is unaffected. Verify-learning guard: a partner-authored untagged
-  # sq-012 MUST NOT count toward another agent's Phase 2.3b board_signals.
+  # ⚠ THE ORDER IS LOAD-BEARING. Unordered, the prose-mention disjunct matched
+  # essentially EVERY peer cadence post (alpha: kept 10 of 18, honest count 0;
+  # bravo, next day, different agent: 15 of 29, honest 1), and a partner's
+  # untagged sq-012 flipped zeta's verdict to a FALSE act_later. Both inflate
+  # self_evolution_signals_count toward a permanent act_later, and both GROW
+  # with every new comparison table. guard-1877 (order), g-115-2922 (authorship).
+  # Rationale (WHY the order is explicit + both regression traces):
+  #   core/config/rationale/fresh-eyes-board-signal-attribution.md
   → call these board_signals
   → surface board_signals to Phase 3 "Recent self-evolution signals" bullets
     so the briefing names the unread finding(s), not just pending-questions
@@ -809,9 +729,9 @@ noted) and pass to the helper:
 # Build signals JSON from Phase 3 briefing content
 SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree the portfolio has drifted from Self emphasis since last review},
-  "completion_health":              {0..1 — mean completion ratio across active aspirations, EXCLUDING single-goal `asp-xw-` cross-world imports (guard-2829, guard-2804). Each such import is one goal wearing an aspiration's clothes: it contributes a hard 0.0 carrying the same weight as an 897-goal aspiration, so it does not measure portfolio health, it dilutes it. Measured 2026-08-06 (bravo, cc-05): 27 active world aspirations, 9 of them single-goal `asp-xw-` -> raw mean 0.5025 vs filtered 0.7537, a 0.25 swing from records that represent no completable work. WHY THIS EXCLUSION IS WRITTEN HERE AND NOT LEFT TO THE GUARDRAIL (guard-1984): guard-2829 names this exact field verbatim and is retrievable, and two consecutive bravo passes (N=20, N=21) still passed the RAW figure, each catching it only afterwards by reading the prior pass's handoff. A guardrail cannot outvote the instrument it guards -- it fires when a reader happens to retrieve it, while this line is read by everyone who runs the ritual. Same shape guard-1877/Phase 2.3b already demonstrated one phase up},
-  "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214) + len(belief_signals from Phase 2.6b, g-306-28). A partner's belief ABOUT this agent (e.g. bravo's "cross-domain stretch" read of alpha) is an external self-evolution signal even when pending-questions.yaml AND the findings board are both empty — it was invisible before g-306-28},
-  "confirming_signal_fraction":     {0..1 — fraction of the counted self_evolution signals that CONFIRM the current lane, so the act_later gate fires on NET-DIVERGENT signal not gross volume (this PULLS the g-115-1680 lever self-assess-and-decide.sh already has but that Phase 5.5 was leaving at the 0.0 default). Compute = confirming_beliefs / self_evolution_signals_count, where a belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14 — an aged partner read is not current drift-pressure) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND its claim suggests drift/contradiction from current Self. pq_signals + board_signals are genuine change-indicators (never confirming). Emit 0.0 only when self_evolution_signals_count == 0. WHY (g-115-1742, alpha 2026-07-03): an affirming partner-belief — a correct external read of a stable, in-lane Self — is STABILITY evidence, not change-pressure; counting it toward act_later was a false-positive treadmill (evo=5 = 3 fresh-affirming + 2 stale, self 2d fresh, portfolio in-lane → wrongly returned act_later, re-filing a follow-up Idea every review that partners correctly read this agent)},
+  "completion_health":              {0..1 — mean completion ratio across active aspirations, EXCLUDING single-goal `asp-xw-` cross-world imports (guard-2829, guard-2804). Each such import is one goal wearing an aspiration's clothes: a hard 0.0 weighted like an 897-goal aspiration, so it dilutes portfolio health rather than measuring it. Measured swing 0.5025 raw -> 0.7537 filtered; two consecutive passes still shipped the RAW figure. Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
+  "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214) + len(belief_signals from Phase 2.6b, g-306-28). A partner's belief ABOUT this agent is an external self-evolution signal even when pending-questions.yaml AND the findings board are both empty},
+  "confirming_signal_fraction":     {0..1 — = confirming_beliefs / self_evolution_signals_count. A belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND suggesting drift/contradiction. pq_signals + board_signals are genuine change-indicators, NEVER confirming. Emit 0.0 only when self_evolution_signals_count == 0. An affirming partner-belief is STABILITY evidence, not change-pressure — counting it toward act_later was a measured false-positive treadmill (g-115-1742). Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
   "self_last_updated_days":         {int — days_since_self_updated from Phase 2.1},
   "explicit_user_directive":        {true|false — outstanding /respond about purpose or portfolio},
   "signal_actionable_score":        {0..1 — how clearly the signals map to a specific Self edit}
@@ -820,120 +740,38 @@ Bash: echo "$SIGNALS_JSON" | bash core/scripts/self-assess-and-decide.sh --revie
   → capture decision, rationale, recommended_action from JSON output
 ```
 
-**IF YOU SWEEP AN AXIS TO TEST WHETHER THE DECISION IS ROBUST, NEUTRALIZE THE
-OTHER AXES FIRST — otherwise the sweep is vacuous** (guard-3295, measured
-2026-08-10, zeta N=54, cc-02 / Linux 6.8.0-136-generic). Several agents adopted a
-practice of sweeping `confirming_signal_fraction` and reporting "ROBUST — returns
-the same verdict at EVERY value" as evidence the belief-classification judgment
-does not move the outcome. Measured on this helper, that report is true and
-carries no information: `drift >= 0.40` and `net-divergent >= 2.0` are each
-SUFFICIENT ALONE, so sweeping `confirming_signal_fraction` (0.00–1.00),
-`portfolio_drift_score` (0.10–0.70), AND `self_evolution_signals_count` (0–8) each
-returned `act_later` at every point — three constant sweeps, because in each one
-the OTHER axis was independently carrying the verdict. Only neutralizing both at
-once returned `no_change`.
+**NEUTRALIZE ALL THREE SUFFICIENT AXES BEFORE SWEEPING ANY ONE OF THEM**
+(guard-3295). `drift >= 0.40`, `net_divergent >= 2.0`, and
+`signal_actionable_score >= 0.40` EACH fire `act_later` ALONE, so a sweep that
+leaves the others at firing values returns a constant and measures the HELD axes,
+not the swept one — three prior fires (N=44/45/47) each booked exactly that as
+"robustness". Neutralize to `drift = 0.05`, `confirming = 1.00`,
+`actionable <= 0.35`, sweep, and report the flip point rather than the constancy.
 
-A sweep whose output never changes is measuring the HELD axes, not the swept one,
-and the constancy is what makes it look like a strong result — which is why three
-prior fires (N=44/45/47) each booked it as robustness and none re-examined it.
-The valid form: hold every other axis at a value that CANNOT produce the verdict,
-then sweep, and report the neutralized flip point rather than the constancy. On
-this helper those boundaries are `drift` flips at **0.40** with
-`confirming = 1.00`, and `confirming` flips to `no_change` at **0.75** with
-`drift = 0.05`. This paragraph lives here rather than only in guard-3295 because a
-guardrail cannot outvote the instrument it guards (guard-1984) — the same reason
-the `completion_health` exclusion two screens up is written inline.
+Boundaries, all measured: `drift` flips at **0.40** · `signal_actionable_score`
+flips in **(0.35, 0.40]** · `confirming` flips where **`N·(1−confirming) < 2.0`**
+— an inequality in `N`, NOT a fixed fraction (0.50 at N=4, 5/7=0.7143 at N=7).
+Quote the inequality.
 
 **COMPUTE `P = len(pq_signals) + len(board_signals)` BEFORE YOU READ THE BELIEFS,
-AND SAY WHAT IT WAS. When `P >= 2` the belief classification cannot change the
-verdict** (guard-3390, measured 2026-08-11, zeta N=57, cc-02 / Linux
-6.8.0-136-generic). The `confirming_signal_fraction` spec above declares
-`pq_signals + board_signals` **never confirming**, so the confirming count can
-never exceed the belief count `B`. With `N = P + B`, that makes
+AND SAY WHAT IT WAS** (guard-3390). `pq_signals + board_signals` are spec'd
+never-confirming, so `net_divergent >= P` for EVERY possible classification of
+EVERY belief: `P >= 3` forces `act_later` before a belief is read, and `P <= 1`
+is the only regime where Phase 2.6b decides anything. The step is usually inert,
+not usually decisive — but keep reading beliefs to full length when you will ACT
+on their content (guard-1421/2043 still bind); just do not report the
+classification as having determined a verdict it could not reach.
 
-> `net_divergent = N − confirming_count >= N − B = P`, for **every** possible
-> classification of **every** belief.
+⚠ **NEVER QUOTE A PRINTED `net` AS THE MARGIN — IT IS ROUNDED, AT ANY `N`.**
+`net=2.0` prints across true_net ∈ **[1.95, 2.05]**, spanning BOTH verdicts, and
+`confirming` is rounded too — so two runs with OPPOSITE decisions emit
+byte-identical `net=2.0 @50%conf`. Recompute `N·(1−confirming)` yourself before
+believing any `net`, including one this helper just printed. At `P == 2` (`net`
+exactly 2.0) the typed decimal precision of `confirming` IS the verdict: pass
+full float precision, or declare the boundary explicitly.
 
-The helper fires `act_later` at `net >= 2.0`. So `P >= 3` forces `act_later`
-before a single belief is read, and `P <= 1` is the only regime where Phase 2.6b
-decides anything (and then only while `drift < 0.40`, which is independently
-sufficient). Verified across the full `(P, B)` grid at max-honest
-`confirming = B/N` with drift neutralized: `P=0,1` → `no_change` at every `B`;
-`P=2,3` → `act_later`, with one boundary cell (below). This **supersedes** the
-single-instance form N=56 recorded ("`no_change` was unreachable this fire").
-
-⚠ **`P == 2` is a knife-edge: `net` is then EXACTLY 2.0, so the verdict is
-decided by the decimal precision you type.** Measured at `P=2, B=4, N=6`, the
-same true quotient 4/6: `0.6666` → `act_later`; `0.6667` → `no_change`;
-`0.666667` → `no_change`; `0.6666666666666666` → `act_later`. **The rationale
-string prints `net=2.0 @67%conf` in all four cases** — byte-identical across a
-verdict flip, so a reader auditing the decision from its own stated rationale
-cannot see which way it went, or that precision decided it. The spec gives the
-quotient and never the precision; at `P == 2` that unstated choice *is* the
-verdict. Pass it at full float precision, or declare the boundary explicitly.
-
-⚠ **The printed `net` is ROUNDED, so `net=2.0` in a rationale does NOT mean the
-`>= 2.0` threshold was met — at ANY `N`, not only at `P == 2`.** Measured 2026-08-12
-(echo, N=54, cc-03 / Linux 6.8.0-137-generic) at `P=0, B=4, N=4`, drift neutralized
-to 0.05: `confirming=0.50` → `act_later`; `confirming=0.51` → **`no_change` with the
-rationale reading `net=2.0@51%conf`**. True net is 4·0.49 = 1.96, displayed as 2.0.
-So a reader auditing a decision from its own stated rationale can see the firing
-threshold printed on a run that did not fire. The knife-edge paragraph above frames
-this as a `P == 2` property; it is a property of the DISPLAY, and `P == 2` is only
-where it also happens to decide the verdict. Recompute `N·(1−confirming)` yourself
-before believing any `net` you read — including one this helper printed.
-REPLICATED on a second box 2026-08-12 (bravo, N=43, cc-05 / Linux 6.8.0-137-generic):
-same `P=0, B=4, N=4`, same 0.50 → `act_later` / 0.51 → `no_change` pair, byte-identical
-`net=2.0@51%conf`. Same parameters, not a second parameter point — it rules out a
-one-box parse artifact and says nothing about other `N`. **The band is SYMMETRIC —
-measured, same run:** `net=2.0` is printed across true_net ∈ **[1.95, 2.05]**, i.e. for
-`confirming` 0.4875→`act_later` through 0.5125→`no_change`. So the printed `net` spans
-BOTH verdicts and cannot discriminate at all. The confirming % is rounded too (0.4875
-prints `49%`, 0.505 prints `50%`), so `confirming=0.50` (fires) and `confirming=0.505`
-(does not) emit **byte-identical numbers** — `net=2.0`, `50%conf` — for opposite
-decisions. The `decision` field still tells you WHAT was decided; what the rationale
-cannot tell you is that the margin was ±0.05 rather than exact. Never quote a printed
-`net` as the margin.
-
-That same run confirms the boundary FORM two paragraphs down: at `N = 4` the flip is
-at `confirming > 0.50` (4·0.50 = 2.0 fires, 4·0.49 = 1.96 does not), which is
-`N·(1−confirming) < 2.0` and neither 0.75 nor 5/7. Quote the inequality, never a
-fraction. `drift` re-verified at 0.40 the same run (0.39 → `no_change`, 0.40 →
-`act_later`) with `confirming` held at 1.00.
-
-Sharpening line 611 while here: `confirming` flips at **`> 5/7 = 0.7143`** when
-`N = 7` (0.714 → `act_later`, 0.72 → `no_change`), not at 0.75 — the boundary is
-`N·(1−confirming) < 2.0`, which depends on `N`, so quote it as that inequality
-rather than as a fixed fraction. `drift` flips at 0.40 as recorded (0.39 →
-`no_change`, 0.40 → `act_later`).
-
-⚠ **THERE IS A THIRD SUFFICIENT AXIS, AND EVERY PARAGRAPH ABOVE NAMES ONLY TWO.
-`signal_actionable_score >= 0.40` fires `act_later` ON ITS OWN**, boundary in
-(0.35, 0.40]. Measured 2026-08-12 (alpha, N=69, `hostname` cc-04, `uname -r`
-6.8.0-137-generic) with `drift` neutralized to 0.05 and `confirming` held at 1.00:
-0.20 / 0.30 / **0.35 → `no_change`**, **0.40** / 0.49 / 0.50 / 0.55 →
-`act_later`, the rationale reading `weak-but-present signal: actionable=<v>` with
-no other axis named. It went unrecorded for 69 fires because this field is scored
-by hand from "how clearly do the signals map to a specific Self edit", and a
-review that finds diffuse signal scores it ~0.20 — so it had never crossed.
-
-**It also MASKS the drift boundary the paragraph above tells you to verify.** At
-`actionable = 0.55` the documented 0.39/0.40 drift sweep returns `act_later` at
-BOTH points, so a reader running that control on a high-actionable pass sees a
-constant sweep and books it as robustness — the exact vacuity guard-3295 exists to
-prevent, reached through an axis guard-3295 does not name. So when neutralizing
-for ANY sweep, neutralize `signal_actionable_score` to <= 0.35 as well, not just
-`drift` and `confirming`. Three axes, not two.
-
-This is a **recipe** constraint, not a helper bug — the helper accepts
-`confirming = 1.00` happily; the never-confirming rule two screens up is what
-makes `net >= P` unavoidable, so that is where a fix would go. Keep reading the
-beliefs to full length when you will ACT on their content (guard-1421/2043 still
-bind) — just do not report the classification as having determined a verdict it
-could not reach. With a 5-agent fleet `B` is capped near 4 (one belief per
-partner, supersede-not-grow) while `P >= 2` is the ordinary case, since board
-counts own-authored ritual output (line 91) and pq counts any own-scope decision
-in 30d. The step is usually inert, not usually decisive.
+# Rationale (WHY three sufficient axes, the P>=2 derivation, the rounding band,
+# and the per-box replications): core/config/rationale/fresh-eyes-self-assess-axes.md
 
 Branch on decision:
 

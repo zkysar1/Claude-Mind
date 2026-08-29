@@ -93,7 +93,6 @@ from wm import read_wm  # noqa: E402
 from peer_surface import (parse_routing_tag,  # noqa: E402
                           routing_tag_targets_agent)
 from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gated cadence)
-from pull_signal_producer import is_live as pull_signal_is_live  # noqa: E402  ( eligibility bypass)
 # Single source of truth for terminal goal statuses — see aspirations.py.
 # Derived sets below (SKIP_STATUSES, ABANDONED_STATUSES) stay consistent if a new
 # status is added to TERMINAL_GOAL_STATUSES.
@@ -1099,6 +1098,102 @@ def load_pull_boost_config():
 
 
 PULL_CONFIG = load_pull_boost_config()
+
+
+_FAN_IN_DEFAULTS = {
+    "enabled": True,
+    "per_dependent": 1.2,
+    "cap": 4.0,
+    "priority_weights": {"HIGH": 1.0, "MEDIUM": 0.5, "LOW": 0.25},
+}
+
+
+def load_fan_in_config():
+    """Load fan-in (dependency-inversion) boost params from aspirations.yaml.
+
+    g-115-6590 item (2), 2026-08-28. Same overlay/type-coerce shape as the
+    sibling config loaders. See ``apply_fan_in_boost`` for why the defaults are
+    the values they are.
+    """
+    defaults = dict(_FAN_IN_DEFAULTS)
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        fb = asp_config.get("fan_in_boost", {})
+        if isinstance(fb, dict):
+            for k, default in defaults.items():
+                v = fb.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+FAN_IN_CONFIG = load_fan_in_config()
+
+
+_PULL_SKEW_TOLERANCE_H = 1.0
+
+
+def pull_signal_live_age_hours(sig, config, now=None):
+    """SINGLE SOURCE OF TRUTH for "is this ``pull_signal`` live?".
+
+    Returns the signal's age in hours (clamped at 0.0) when it is LIVE, or
+    ``None`` when it is absent, malformed, aged out, or implausibly far in the
+    future. Two callers consume it and they must never disagree:
+
+      * ``apply_pull_boost`` — converts a live signal into RANK.
+      * the recurring hour gate — converts a live signal into ELIGIBILITY.
+
+    WHY THIS IS ONE FUNCTION AND NOT TWO COPIES (g-115-6590, 2026-08-28). The
+    boost shipped 2026-08-17 reading this predicate inline, and the eligibility
+    half did not exist at all -- so a not-yet-due recurring consumer carrying a
+    live signal was dropped by the hour gate BEFORE ``apply_pull_boost`` ran over
+    the already-scored list, and the boost could never see it. Measured on this
+    queue 2026-08-28: g-306-284 held a live signal (set 14:14:34, 22 min old)
+    while ZERO of 1375 returned candidates carried the field, i.e. the boost was
+    operating on an empty set. Re-implementing the liveness test at the second
+    call site would let the two halves drift into disagreeing about which signals
+    are live -- a goal admitted by one and ignored by the other -- so both call
+    this.
+
+    THE SKEW TOLERANCE IS LOAD-BEARING, NOT DEFENSIVE PADDING, and it is why this
+    does not use ``hours_since``: that helper folds ANY future timestamp into
+    "corrupt" and returns None. Correct for its own callers, wrong here -- the
+    signal is written on the PRODUCER's box and read on the CONSUMER's, so a
+    producer even seconds ahead stamps a ``set_at`` in the reader's future and
+    inheriting ``hours_since`` would silently drop the pull (guard-3221, the exact
+    consumer-does-not-receive-what-the-producer-sent failure this mechanism lives
+    inside). So: a SIGNED age with a bounded skew tolerance treated as live, and
+    anything further ahead treated as bogus rather than clamped -- clamping would
+    let a far-future stamp hold the lift for as long as the skew, the unbounded
+    case ``max_age_hours`` exists to prevent.
+
+    Respects ``enabled``: a disabled pull_boost config yields no lift on EITHER
+    axis, so one flag still turns the whole mechanism off.
+    """
+    if not config.get("enabled"):
+        return None
+    if not isinstance(sig, dict):
+        return None
+    raw_set_at = sig.get("set_at")
+    if not raw_set_at or not isinstance(raw_set_at, str):
+        return None
+    try:
+        set_at = datetime.fromisoformat(raw_set_at)
+    except (ValueError, TypeError):
+        return None
+    max_age = float(config.get("max_age_hours", 24.0))
+    age_h = ((now or datetime.now()) - set_at).total_seconds() / 3600.0
+    if age_h > max_age or age_h < -_PULL_SKEW_TOLERANCE_H:
+        return None
+    return max(0.0, age_h)
 
 
 def load_user_signal_boost_config():
@@ -2463,13 +2558,24 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                         # PULL_CONFIG["enabled"] so disabling the mechanism
                         # disables the bypass too, matching apply_pull_boost's
                         # own early return.
+                        #
+                        # PREDICATE CHOICE, settled at the cc-05/cc-07 merge
+                        # (2026-08-28): this calls goal-selector's own
+                        # pull_signal_live_age_hours, NOT pull_signal_producer's
+                        # is_live. Both were written for this gate and they agree
+                        # across the whole age range (verified 0.5/12/23.9/25/100h
+                        # plus the absent-signal case) — but is_live re-implements
+                        # the skew/age arithmetic in the producer module, and
+                        # apply_pull_boost needs the AGE (it records
+                        # pull_signal_age_hours), so it cannot use a bool. Reading
+                        # is_live here would therefore leave the gate and the boost
+                        # on two SEPARATE copies of one rule, which is precisely
+                        # the drift the paragraph above argues against. One
+                        # predicate, two consumers — literally, not by intent.
                         if not (
                             PULL_CONFIG.get("enabled")
-                            and pull_signal_is_live(
-                                goal.get("pull_signal"),
-                                datetime.now(),
-                                float(PULL_CONFIG.get("max_age_hours", 24.0)),
-                            )
+                            and pull_signal_live_age_hours(
+                                goal.get("pull_signal"), PULL_CONFIG) is not None
                         ):
                             continue
 
@@ -3708,9 +3814,23 @@ def emit_strategic_focus_banner(scored, agent_name):
         return []  # top eligible pick is not a sweep -- directive says nothing
     if top.get("aspiration_id") in lanes:
         return []  # the sweep IS lane work -- already honoring the directive
-    lane = next((s for s in mine if s.get("aspiration_id") in lanes), None)
+    # Clause (ii) of the directive: recurring lane goals are NOT eligible
+    # nominees (). The directive excludes them from what counts as
+    # lane work remaining -- "both re-supply continuously from the lane's own
+    # cadence and neither is unbuilt product work" -- so nominating one swaps
+    # a routine sweep for a routine sweep, and the "product outranks sweeps"
+    # premise cannot discriminate between them. The top-pick side above already
+    # tests `recurring`; this is the same field test on the other side of the
+    # comparison, which is what the directive calls clause (ii) (a FIELD test,
+    # recurring:true, not a title heuristic -- so unlike clause (i) it carries
+    # no under-count). Left unfiltered, an agent that complied literally would
+    # file a meta-tiebreaker deviation for work the directive excludes, which
+    # is what pollutes the Layer-C deviation audit.
+    lane = next((s for s in mine
+                 if s.get("aspiration_id") in lanes and not s.get("recurring")),
+                None)
     if lane is None:
-        return []  # no lane candidate is available to this agent right now
+        return []  # no NON-RECURRING lane candidate available to this agent now
     try:
         gap = round(float(top.get("score") or 0.0) - float(lane.get("score") or 0.0), 2)
     except (TypeError, ValueError):
@@ -4817,29 +4937,112 @@ def apply_pull_boost(scored, config):
     if not config.get("enabled"):
         return scored
     boost = float(config.get("boost", 4.0))
-    max_age = float(config.get("max_age_hours", 24.0))
-    skew_tolerance_h = 1.0
     if boost <= 0:
         return scored
     now = datetime.now()
     for s in scored:
-        sig = s.get("pull_signal")
-        if not isinstance(sig, dict):
+        # Liveness (parse + max_age + clock-skew) lives in ONE predicate shared
+        # with the recurring hour gate, so rank and eligibility cannot disagree
+        # about which signals are live. See pull_signal_live_age_hours.
+        age_h = pull_signal_live_age_hours(s.get("pull_signal"), config, now)
+        if age_h is None:
             continue
-        raw_set_at = sig.get("set_at")
-        if not raw_set_at or not isinstance(raw_set_at, str):
-            continue
-        try:
-            set_at = datetime.fromisoformat(raw_set_at)
-        except (ValueError, TypeError):
-            continue
-        age_h = (now - set_at).total_seconds() / 3600.0
-        if age_h > max_age or age_h < -skew_tolerance_h:
-            continue
-        age_h = max(0.0, age_h)
         s["score"] = round(s["score"] + boost, 2)
         s.setdefault("breakdown", {})["pull_boost"] = boost
         s.setdefault("raw", {})["pull_signal_age_hours"] = round(age_h, 2)
+    return scored
+
+
+def apply_fan_in_boost(scored, all_aspirations, config):
+    """GRAPH-keyed lift for a goal that other LIVE goals are waiting on.
+
+    g-115-6590 item (2), 2026-08-28. Third sibling of apply_starvation_boost
+    (TIME-keyed: a goal rises because it has waited) and apply_pull_boost
+    (EVENT-keyed: a goal rises because what it consumes has ARRIVED). This one is
+    GRAPH-keyed: a goal rises because other goals cannot start until it lands.
+
+    Nothing in scoring read that before. ``blocked_by`` was consulted only to
+    SUPPRESS the dependent (collect_candidates / collect_blocked), never to LIFT
+    the blocker, so a READY root holding up five downstream goals competed on its
+    own unaided merit and lost. The inverse map already existed but in the WRONG
+    COMMAND -- cmd_blocked builds root_groups[...]["downstream_ids"] from
+    trace_root_bottleneck, and cmd_select never sees it. That split is the whole
+    defect, not a missing computation.
+
+    BLOCKED_BY ONLY, NEVER depends_on (guard-4554). blocked_by is the SEQUENCING
+    field and a list of id STRINGS; depends_on is the {goal_id, expects}
+    output-passing annotation whose values are DICTS. Teaching any part of this
+    selector to read depends_on is explicitly forbidden there: done_ids is a set,
+    so a dict union raises TypeError and crashes the fleet's mandatory selection
+    entry point. A goal sequenced with depends_on alone LOOKS sequenced and is
+    not -- it will not be suppressed and it will not lift its blocker here.
+
+    DECAY IS STRUCTURAL, NOT SCHEDULED. Only NON-TERMINAL dependents are counted,
+    so the lift falls as dependents close and is gone when the last one does.
+    There is no signal to clear and therefore no lost-clear failure mode -- the
+    property apply_pull_boost needs its max_age_hours valve to simulate, obtained
+    here for free because the graph IS the state.
+
+    THE DEFAULT IS MEASURED, NOT PICKED (guard-1895 (2): sizing a scorer fix
+    against the deterministic deficit rather than the NOISE WIDTH is what makes
+    an intervention look like a fix while changing almost nothing). Measured live
+    on this queue 2026-08-28 (cc-07, 1368 candidates): weighted exploration_noise
+    is ~U(0, 1.220) on 100% of candidates. The acceptance bar is a goal with 3
+    HIGH dependents outranking a SAME-PRIORITY lane goal, whose deterministic
+    deficit is ~0, so the boost need only clear the noise width -- 3 x 1.2 = 3.6
+    clears 1.220 about threefold. The cap holds the total BELOW directive_boost's
+    4.5 raw ceiling, so a fresh USER directive still outranks a machine-derived
+    fan-in: the same ordering argument both sibling passes make for their own 4.0.
+
+    NO-REGRESSION BY CONSTRUCTION: a goal nothing depends on gets no map entry
+    and is scored byte-identically, which on this queue is the overwhelming
+    majority of candidates.
+
+    Mutates and returns ``scored`` in place, recording the lift in breakdown and
+    the dependent census in raw. Same in-place + no-op-when-disabled contract as
+    the sibling passes.
+    """
+    if not config.get("enabled"):
+        return scored
+    per_dependent = float(config.get("per_dependent", 1.2))
+    cap = float(config.get("cap", 4.0))
+    if per_dependent <= 0 or cap <= 0:
+        return scored
+    pri_w = config.get("priority_weights") or {}
+
+    # Weighted census of LIVE dependents, keyed by the id each one waits on.
+    # Active aspirations only, mirroring cmd_select's global_live_ids loop.
+    weight_by_blocker = {}
+    count_by_blocker = {}
+    for asp in all_aspirations or []:
+        if asp.get("status") != "active":
+            continue
+        for g in asp.get("goals", []) or []:
+            if g.get("status") in TERMINAL_GOAL_STATUSES:
+                continue
+            gid = g.get("id")
+            w = float(pri_w.get(str(g.get("priority") or "").upper(), 0.0) or 0.0)
+            if w <= 0:
+                continue
+            for bid in _ensure_list(g.get("blocked_by")):
+                bid = str(bid)
+                if not bid or bid == gid:
+                    continue
+                weight_by_blocker[bid] = weight_by_blocker.get(bid, 0.0) + w
+                count_by_blocker[bid] = count_by_blocker.get(bid, 0) + 1
+
+    if not weight_by_blocker:
+        return scored
+    for s in scored:
+        gid = s.get("goal_id")
+        w = weight_by_blocker.get(gid)
+        if not w:
+            continue
+        boost = min(cap, round(per_dependent * w, 2))
+        s["score"] = round(s["score"] + boost, 2)
+        s.setdefault("breakdown", {})["fan_in_boost"] = boost
+        s.setdefault("raw", {})["fan_in_dependents"] = count_by_blocker.get(gid, 0)
+        s.setdefault("raw", {})["fan_in_weight"] = round(w, 2)
     return scored
 
 
@@ -5086,21 +5289,55 @@ def apply_drain_lane(scored, config, agent_dir):
         since = 0
     since += 1
 
+    #  outcome (a): a live pull_signal is an INDEPENDENT admission to
+    # this lane, ORed with the time-keyed exemption above it. This is the
+    # design's FIRST option ("treat a recurring goal with a live pull_signal as
+    # fully overdue-exempt"), and it belongs HERE rather than in
+    # overdue_exemption_level: that helper takes (ratio, interval_hours, config)
+    # and never sees the goal, which is why the exemption was previously read as
+    # unshippable. The CALL SITE has the row, so no signature change is needed.
+    #
+    # WHY NOT A BIGGER / RELATIVE SCORE BOOST, the spec's other option. Measured
+    # on this queue 2026-08-28 (1372 candidates): exploration noise spans
+    # 0.010-1.220, so score-side lift is a max-of-N lottery (guard-1895), and
+    # sizing a boost against `top_sub` inherits ONE noise draw into a bound that
+    # is then ASSIGNED to a whole cohort — the same shape guard-1895 measured as
+    # strictly worse than leaving it noisy, plus the  collapse where
+    # every lifted row lands on one value and intra-cohort order degenerates to
+    # alphabetical. This lane REORDERS and never writes `score`, so it bypasses
+    # the lottery and both clamps entirely, which is guard-1895's own prescribed
+    # remedy: remove the item from the competition rather than try to win it.
+    def _pull_live(s):
+        return pull_signal_live_age_hours(
+            s.get("pull_signal"), PULL_CONFIG) is not None
+
     eligible = [
         s for s in scored
         if s.get("recurring")
-        and overdue_exemption_level(
-            float(s.get("recurring_overdue_ratio") or 0.0),
-            float(s.get("recurring_interval_hours") or 0.0),
-            config,
-        ) >= 1.0
+        and (
+            overdue_exemption_level(
+                float(s.get("recurring_overdue_ratio") or 0.0),
+                float(s.get("recurring_interval_hours") or 0.0),
+                config,
+            ) >= 1.0
+            or _pull_live(s)
+        )
     ]
 
     picked = None
     if eligible and since >= k:
         # MOST overdue first; deterministic tiebreak mirrors the main sort so a
         # tie can never reorder run-to-run.
+        # PULLED FIRST, then most-overdue. A pull says the dependency this goal
+        # exists to consume has ARRIVED; an overdue ratio says only that time has
+        # passed. A pulled goal is typically NOT overdue (ratio 0.0), so without
+        # this key it would sort LAST among eligible rows and never take the slot
+        # it was just admitted to — admission without ordering is a no-op.
+        # The cadence bound (`since >= k`) is deliberately NOT bypassed: it is
+        # the anti-flood guarantee, and one lane pick per K invocations still
+        # bounds a producer that sets many signals.
         eligible.sort(key=lambda s: (
+            0 if _pull_live(s) else 1,
             -float(s.get("recurring_overdue_ratio") or 0.0),
             str(s.get("aspiration_id") or ""),
             str(s.get("goal_id") or ""),
@@ -5557,6 +5794,7 @@ def cmd_select(args):
     # is ~all of them) gets zero boost, so selection is byte-identical outside the
     # pulled set. See apply_pull_boost.
     apply_pull_boost(scored, PULL_CONFIG)
+    apply_fan_in_boost(scored, all_aspirations, FAN_IN_CONFIG)
 
     # Sort: highest score first, then MOST OVERDUE first among equal scores, then
     # lower aspiration id, then lower goal id. See candidate_sort_key for why

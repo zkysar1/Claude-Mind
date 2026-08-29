@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.8",
+    "previous_version": "2.12.7",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "start skill: restore nine sentences the 64 KB trim cut mid-clause (worker-join instruction), with a fragment regression test",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.7",
     "previous_version": "2.12.6",
     "date": "2026-08-28",

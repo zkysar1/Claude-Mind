@@ -25,6 +25,7 @@ import importlib
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -258,3 +259,97 @@ def test_lane_knobs_survive_the_recurring_config_allowlist():
     assert "drain_lane_enabled" in c
     assert "drain_lane_interval_iterations" in c
     assert int(c["drain_lane_interval_iterations"]) >= 1
+
+
+# --------------------------------------------------------------------------
+# Event-keyed admission: a live pull_signal ( outcome (a))
+#
+# The lane was purely TIME-keyed -- eligibility came only from
+# overdue_exemption_level, so a consumer goal whose dependency had JUST
+# materialized could not reach the one mechanism that bypasses both the urgency
+# clamp and the noise lottery. These pin the OR-admission and its ordering.
+# --------------------------------------------------------------------------
+
+def _pulled(gid, score, ratio=0.0, age_h=0.5, **kw):
+    """A row carrying a pull_signal stamped `age_h` hours ago."""
+    r = row(gid, score, ratio=ratio, **kw)
+    stamp = datetime.now() - timedelta(hours=age_h)
+    r["pull_signal"] = {
+        "set_at": stamp.strftime("%Y-%m-%dT%H:%M:%S"),
+        "by": "alpha/test",
+        "reason": "carrier ref deadbeef, 1 framework file(s)",
+    }
+    return r
+
+
+def test_live_pull_signal_admits_a_not_overdue_recurring_goal(tmp_path):
+    """The whole point: ratio 0.0 is NOT overdue, so the time-keyed exemption
+    refuses it. The live signal admits it anyway, and it takes the top slot
+    despite having the LOWEST score in the list."""
+    scored = [
+        row("g-top", 16.0, recurring=False),
+        row("g-other", 12.0, ratio=0.0),
+        _pulled("g-pulled", 8.0, ratio=0.0),
+    ]
+    picked = gs.apply_drain_lane(scored, cfg(), primed(tmp_path))
+    assert picked is not None, "a live pull_signal must admit an un-overdue goal"
+    assert picked["goal_id"] == "g-pulled"
+    assert scored[0]["goal_id"] == "g-pulled"
+    assert scored[0].get("drain_lane_pick") is True
+
+
+def test_pulled_goal_sorts_ahead_of_a_more_overdue_one(tmp_path):
+    """Admission without ordering would be a no-op: a pulled goal is typically
+    ratio 0.0, so under the old key it sorted LAST among eligible rows."""
+    scored = [
+        row("g-starved", 9.0, ratio=10.63),
+        _pulled("g-pulled", 8.0, ratio=0.0),
+    ]
+    picked = gs.apply_drain_lane(scored, cfg(), primed(tmp_path))
+    assert picked["goal_id"] == "g-pulled", (
+        "an EVENT (the dependency arrived) outranks elapsed time in this lane"
+    )
+
+
+def test_stale_pull_signal_does_not_admit(tmp_path):
+    """NEGATIVE CONTROL. A signal past max_age_hours is not live, so the goal
+    falls back to the time-keyed test and stays ineligible -- this is what keeps
+    a lost CLEAR from pinning a goal in the lane forever."""
+    stale = gs.PULL_CONFIG.get("max_age_hours", 24.0) + 5.0
+    scored = [
+        row("g-other", 12.0, ratio=0.0),
+        _pulled("g-stale", 8.0, ratio=0.0, age_h=stale),
+    ]
+    assert gs.apply_drain_lane(scored, cfg(), primed(tmp_path)) is None
+
+
+def test_no_pull_signal_leaves_the_lane_byte_identical(tmp_path):
+    """NO-REGRESSION. ~no goal carries the field, so the common path must be
+    unchanged: an ineligible list stays ineligible and is not mutated."""
+    scored = [row("g-a", 12.0, ratio=0.0), row("g-b", 9.0, ratio=0.0)]
+    snapshot = json.dumps(scored, sort_keys=True)
+    assert gs.apply_drain_lane(scored, cfg(), primed(tmp_path)) is None
+    assert json.dumps(scored, sort_keys=True) == snapshot
+
+
+def test_pull_does_not_bypass_the_k_cadence(tmp_path):
+    """The cadence is the anti-flood guarantee and a pull must NOT escape it:
+    a producer setting many signals is still bounded to one lane pick per K."""
+    d = tmp_path / "agent"
+    (d / "session").mkdir(parents=True, exist_ok=True)
+    gs.write_drain_lane_state(d, {"invocations_since_pick": 0})
+    picks = []
+    for _ in range(5):
+        scored = [row("g-top", 16.0, recurring=False),
+                  _pulled("g-pulled", 8.0, ratio=0.0)]
+        picks.append(gs.apply_drain_lane(scored, cfg(), d) is not None)
+    assert picks == [False, False, False, False, True], picks
+
+
+def test_pull_admission_is_ored_not_substituted(tmp_path):
+    """The time-keyed arm must still work on its own -- the new clause is an OR,
+    not a replacement. Without this, swapping the condition would pass every
+    pull test above while silently deleting the lane's original purpose."""
+    scored = [row("g-starved", 9.0, ratio=10.63)]
+    picked = gs.apply_drain_lane(scored, cfg(), primed(tmp_path))
+    assert picked is not None and picked["goal_id"] == "g-starved"

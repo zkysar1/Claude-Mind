@@ -3507,6 +3507,35 @@ def _load_streak_mult_config(project_root: Path) -> float:
         return 2.0
 
 
+def _qualifies_as_intent_evidence(g):
+    """Single source of truth for "may this goal serve as intent-satisfaction evidence".
+
+    THE COUPLING CONTRACT (g-115-4189). This predicate builds the qualifying POOL
+    that caps the evidence threshold. The quality loop in
+    _validate_intent_satisfaction re-tests the SAME membership conditions ~15 lines
+    below, deliberately NOT by calling this function: it must emit a distinct,
+    goal-naming message per condition, and collapsing it into one boolean would
+    trade real diagnostic quality for a cosmetic dedup.
+
+    So the two halves are kept in agreement by a TEST, not by shared control flow --
+    `test_qualifying_pool_agrees_with_quality_loop` drives both halves over a common
+    corpus and fails on any per-goal disagreement. rb-6012's advice is that the
+    halves must AGREE, not that they must share code (cf. rb-1915: pin both sides to
+    a shared fixture).
+
+    ADDING A CONDITION? Add it HERE and to the quality loop in the SAME change, or
+    the pool over-counts and the gate becomes unsatisfiable for records failing only
+    the new condition -- which is exactly the g-115-4164 defect this file already
+    carries a fix for, reproduced one level down. The test is what makes forgetting
+    loud. And this function is MIRRORED in mind_api/src/endpoints/aspirations_write.py
+    (guard-547 / guard-2078): change both copies or the daemon -- the LIVE path --
+    keeps the old behaviour.
+    """
+    return (not g.get("recurring")
+            and g.get("status") == "completed"
+            and bool((g.get("verification") or {}).get("outcomes") or []))
+
+
 def _validate_intent_satisfaction(
     asp: Dict[str, Any],
     intent_block: Dict[str, Any],
@@ -3550,11 +3579,7 @@ def _validate_intent_satisfaction(
     # under 50%. THIS copy is the one that produced the measured refusals — the
     # daemon serves aspirations-complete-intent.sh, and the incident's quoted error
     # matched this function's wording, not the CLI's.
-    qualifying = [
-        g for g in non_recurring
-        if g.get("status") == "completed"
-        and ((g.get("verification") or {}).get("outcomes") or [])
-    ]
+    qualifying = [g for g in non_recurring if _qualifies_as_intent_evidence(g)]
     required = max(scope_min, min(math.ceil(0.5 * len(non_recurring)), len(qualifying)))
     if len(ev_ids) < required:
         if len(qualifying) < scope_min:
