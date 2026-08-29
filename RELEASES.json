@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.9",
+    "previous_version": "2.12.8",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "worker-loop claim line passes --source from SELECT (agent-queue claims were refused without it)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.8",
     "previous_version": "2.12.7",
     "date": "2026-08-29",

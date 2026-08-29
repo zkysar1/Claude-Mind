@@ -79,7 +79,7 @@ from __future__ import annotations
 # Fields whose prose accumulates across sessions and whose loss is expensive.
 # Deliberately NOT every string field: a `title` or `defer_reason` is meant to
 # be rewritten wholesale, and gating those would refuse ordinary work.
-GUARDED_FIELDS = ("description", "outcome_note")
+GUARDED_FIELDS = ("description", "outcome_note", "progress_note")
 
 # Below this, wholesale rewrites are normal. Measured: no legitimate shrink
 # below the ratio threshold exists above this floor in the live corpus.

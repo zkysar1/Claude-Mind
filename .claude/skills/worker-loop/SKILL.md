@@ -617,9 +617,9 @@ IF no goal: this is a GENUINE close — the worker has exhausted its work. Write
    goal?" below. Do NOT file here regardless; SELECT finding nothing is the close
    edge, not a moment to manufacture work.)
 
-# Phase 2 — CLAIM (claimed_by stays the mindKey/agent-name — same claim contract)
-Bash: aspirations-claim.sh <goal-id> <agent>
-IF claim conflict: abort this goal, loop to SELECT.
+# Phase 2 — CLAIM (claimed_by = the agent name; <source> = the queue SELECT printed)
+Bash: aspirations-claim.sh <goal-id> <agent> --source <source>
+IF claim conflict or goal_id_collision: abort this goal, loop to SELECT.
 
 # Phase 2.9 — READ THE RECORD YOU WERE JUST HANDED (g-115-6695). The claim
 # response IS the full goal record. The loop's only OTHER prompt to touch
