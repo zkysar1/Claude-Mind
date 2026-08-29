@@ -93,21 +93,61 @@ def _baseline(world: Path) -> dict:
     return json.loads((world / "domain-suite-baseline.json").read_text(encoding="utf-8"))
 
 
+def _age_all(world: Path, days: int = 7) -> None:
+    old = time.time() - days * 24 * 3600
+    for p in (world / "scripts").rglob("*"):
+        if p.is_file():
+            os.utime(p, (old, old))
+
+
+def _since_1h() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+
+
+def _seed(tmp_path: Path, world: Path):
+    """Seed the baseline the way a real close does: the reds sit in OLD files,
+    and the unit touched only a module (pkg/config.py), never the red tests."""
+    _age_all(world)
+    (world / "scripts" / "pkg" / "config.py").write_text("VALUE = 2\n", encoding="utf-8")
+    return _run(tmp_path, world, "--since", _since_1h())
+
+
 def test_the_first_red_run_seeds_the_baseline_and_passes(tmp_path):
     # A world can be red before the gate exists (the dev world was: 2 reds
     # nobody had seen). The first run records what is red and passes, so the
     # gate never refuses a close for a red that predates it.
     world = _world(tmp_path, {"test_red.py": RED_TEST})
-    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    rc, doc, _ = _seed(tmp_path, world)
     assert rc == 0
     assert doc["decision"] == "pass"
     assert "seeded baseline: 1 pre-existing red(s)" in doc["reason"]
     assert _baseline(world)["failing"] == ["tests/test_red.py::test_red"]
 
 
+def test_seeding_never_launders_a_red_in_a_file_this_unit_touched(tmp_path):
+    # Measured on the first live seed of a deployment (2026-08-29): 63 reds
+    # recorded, 2 of them in a test file the closing unit had written 20 min
+    # earlier. A red in a touched file is the unit's own, baseline or not.
+    world = _world(tmp_path, {"test_red.py": RED_TEST, "test_old_red.py": "def test_old():\n    assert 0\n"})
+    _age_all(world)
+    (world / "scripts" / "tests" / "test_red.py").write_text(RED_TEST, encoding="utf-8")  # touched now
+    rc, doc, err = _run(tmp_path, world, "--since", _since_1h())
+    assert rc == 1
+    assert doc["decision"] == "block"
+    assert "cannot be called pre-existing" in doc["reason"]
+    assert "tests/test_red.py::test_red" in doc["reason"]
+    assert "1 other red(s) will be recorded" in doc["reason"]
+    assert not (world / "domain-suite-baseline.json").exists()
+    # Control: fix the touched red and the seed records the untouched one.
+    (world / "scripts" / "tests" / "test_red.py").write_text(GREEN_TEST, encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", _since_1h())
+    assert rc == 0 and "seeded baseline: 1 pre-existing red(s)" in doc["reason"]
+    assert _baseline(world)["failing"] == ["tests/test_old_red.py::test_old"]
+
+
 def test_a_new_red_after_the_seed_refuses_the_close(tmp_path):
     world = _world(tmp_path, {"test_red.py": RED_TEST})
-    _run(tmp_path, world, "--since", OLD)  # seeds
+    _seed(tmp_path, world)
     (world / "scripts" / "tests" / "test_red2.py").write_text("def test_red2():\n    assert 0\n", encoding="utf-8")
     rc, doc, err = _run(tmp_path, world, "--since", OLD)
     assert rc == 1
@@ -120,7 +160,7 @@ def test_a_new_red_after_the_seed_refuses_the_close(tmp_path):
 
 def test_pre_existing_reds_pass_and_the_baseline_ratchets_down(tmp_path):
     world = _world(tmp_path, {"test_red.py": RED_TEST, "test_red2.py": "def test_red2():\n    assert 0\n"})
-    _run(tmp_path, world, "--since", OLD)  # seeds with two reds
+    _seed(tmp_path, world)  # seeds with two reds
     assert len(_baseline(world)["failing"]) == 2
     # Same reds again: pass. Fix one: pass, and the baseline shrinks to what still fails.
     rc, doc, _ = _run(tmp_path, world, "--since", OLD)
@@ -141,7 +181,7 @@ def test_pre_existing_reds_pass_and_the_baseline_ratchets_down(tmp_path):
 
 def test_a_collection_error_blocks_even_with_a_baseline(tmp_path):
     world = _world(tmp_path, {"test_red.py": RED_TEST})
-    _run(tmp_path, world, "--since", OLD)  # seeds
+    _seed(tmp_path, world)
     (world / "scripts" / "tests" / "test_broken.py").write_text(BROKEN_IMPORT_TEST, encoding="utf-8")
     rc, doc, _ = _run(tmp_path, world, "--since", OLD)
     assert rc == 1 and doc["decision"] == "block" and doc["rc"] == 2

@@ -335,13 +335,25 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         why = ("domain suite could not COLLECT (rc=2: an import or syntax error in a test module)"
                if rc == 2 else f"domain suite RED (rc={rc}) and no failing unit could be identified from its output")
     elif baseline is None:
-        # First run on this box: what is red now predates this gate. Record it
-        # and pass, saying so — the ratchet starts here, not at green.
-        save_baseline(world_dir, failing, rc, runner_label)
-        _emit("pass", goal_id, override, reason=f"seeded baseline: {len(failing)} pre-existing red(s) recorded, "
-              "later closes block only on NEW reds", runner=runner_label, rc=rc, touched=touched,
-              failing=sorted(failing))
-        return 0
+        # First run on this box: what is red now predates this gate — EXCEPT a
+        # red sitting in a file THIS unit touched, which the seed must not
+        # launder. Measured on the first live seed of a deployment (2026-08-29):
+        # 63 reds recorded, 2 of them in a test file the closing unit had
+        # written 20 minutes earlier. Those block; the rest are recorded and
+        # the ratchet starts here, not at green.
+        touched_files = {t[0] for t in touched}
+        touched_names = {Path(t[0]).name for t in touched}
+        own = sorted(f for f in failing
+                     if f.split("::")[0] in touched_files or Path(f.split("::")[0]).name in touched_names)
+        if not own:
+            save_baseline(world_dir, failing, rc, runner_label)
+            _emit("pass", goal_id, override, reason=f"seeded baseline: {len(failing)} pre-existing red(s) recorded, "
+                  "later closes block only on NEW reds", runner=runner_label, rc=rc, touched=touched,
+                  failing=sorted(failing))
+            return 0
+        why = (f"no baseline yet, and {len(own)} red(s) sit in files THIS unit touched, so they cannot be "
+               "called pre-existing: " + ", ".join(own[:6]) + (" ..." if len(own) > 6 else "")
+               + f" ({len(failing) - len(own)} other red(s) will be recorded once these are fixed)")
     else:
         new_reds = sorted(failing - set(baseline["failing"]))
         if not new_reds:
