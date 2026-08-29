@@ -147,6 +147,25 @@ def test_a_write_idiom_outside_the_program_does_not_count():
     assert direct_store_writes(cmd) == []
 
 
+def test_the_log_drops_the_framework_env_prefix_so_the_write_is_visible(tmp_path):
+    cmd = WORKER_PREFIX + "cat >> agents/alpha/sessions/cb47721d/execution-diary.jsonl << 'DIARY'\n{}\nDIARY"
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}
+    env = dict(os.environ, PROJECT_ROOT=str(tmp_path))
+    proc = subprocess.run(
+        [sys.executable, str(GUARD)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0 and json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    log = tmp_path / "core" / "logs" / "hook-fires" / "store-write-guard.jsonl"
+    rec = json.loads(log.read_text().splitlines()[-1])
+    assert rec["command"].startswith("cat >> agents/alpha/sessions/cb47721d/execution-diary.jsonl")
+    assert "BODY_WM_PATH" not in rec["command"]
+
+
 def test_override_token_passes_and_is_logged(tmp_path):
     cmd = "STORE_WRITE_GUARD_OVERRIDE=restore-from-history cp snap.jsonl world/guardrails.jsonl"
     payload = {"tool_name": "Bash", "tool_input": {"command": cmd}}

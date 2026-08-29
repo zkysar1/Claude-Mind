@@ -264,6 +264,17 @@ def build_reason(hits) -> str:
     )
 
 
+_ENV_PREFIX_RE = re.compile(r"^(?:\s*(?:export\s+)?[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|\S*)\s*;?\s*)+")
+
+
+def _without_env_prefix(cmd: str) -> str:
+    """`cmd` minus the leading env-assignment chain the framework prepends to a worker
+    Body's every command -- five `export`s that ate the whole 400-char log window and
+    hid the write itself (measured 2026-08-29 03:55: five identical denies logged with
+    the payload cut off)."""
+    return _ENV_PREFIX_RE.sub("", cmd, count=1)
+
+
 def _log(kind: str, cmd: str, hits) -> None:
     try:
         root = Path(os.environ.get("PROJECT_ROOT") or SCRIPT_DIR.parent.parent)
@@ -275,7 +286,7 @@ def _log(kind: str, cmd: str, hits) -> None:
             "agent": os.environ.get("MIND_AGENT") or os.environ.get("MIND_AGENT"),
             "sid": os.environ.get("MIND_SID") or os.environ.get("MIND_SID"),
             "hits": [list(h) for h in hits][:5],
-            "command": cmd[:400],
+            "command": _without_env_prefix(cmd)[:400],
         }
         with (log_dir / "store-write-guard.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
