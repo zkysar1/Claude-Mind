@@ -6340,3 +6340,86 @@ recorded as a gap in this reading, not as health.
 
 **S5 verdict: zero signals routed.** The scan's product is this row plus the
 ceiling_ratio observation above.
+
+---
+
+## 2026-08-29T05:0x — zeta, hostname cc-02, uname -r 6.8.0-137-generic, own-cloud
+
+### S3 concentration axes (full store)
+
+**37.2% / 62.7% (30 `framework-*` labels) / 84.6%** at n=2206, 27 active
+aspirations, 216 distinct categories. Verdicts UNCHANGED — axis 2 still the only
+fire, threshold read from config at run time. Full-store, verified by GOAL COUNT
+(2972, not 220) and `goals_omitted` key-presence **0/27** per the ambiguity
+warning (the sum test cannot fail on the full file; key-presence separates 220
+from 2972 unambiguously).
+
+**axis 2 at 84.6% is the highest reading in this roster** (prior max 83.7%,
+zeta 08-17T16:2x). Top-5 aspirations: asp-115 1866, asp-326 93, asp-335 33,
+asp-353 23, asp-250 22.
+
+SAME-BOX LONGITUDINAL — the only comparison the cross-box `n` trap permits.
+Against cc-02's own 2026-08-17T16:2x row (40.5 / 63.5 / 83.7, n=1903, asp-115
+absolute 1592), over ~12 days:
+
+| term | 08-17 | 08-29 | delta |
+|---|---|---|---|
+| asp-115 absolute | 1592 | 1866 | **+274 (+17.2%)** |
+| non-115 (same-box subtraction) | 311 | 340 | +29 (**+9.3%**) |
+| denominator n | 1903 | 2206 | +303 (+15.9%) |
+| axis-2 share | 83.7% | 84.6% | +0.9pp |
+
+**asp-115 grew ~1.8x faster proportionally than the rest of the portfolio.** Every
+prior row in this roster showed the share moving while the reader was warned not to
+read it as remediation; this row is the first where BOTH the absolute AND the
+proportional growth rate point the same way — concentration accelerating, not
+diluting. Quote both terms per the standing rule; the +0.9pp share move on its own
+would understate this badly.
+
+Also: `framework-*` label count rose 22 -> **30** and distinct categories 178 ->
+216 over the same interval, so the lane is fragmenting across more labels while
+axis 1b held roughly flat (63.5 -> 62.7). That is the axis-1 blindness this block
+documents, widening.
+
+NOT ROUTED TO S5 — the marker is explicit that an axis-2 fire is a STANDING
+property and a fresh fire is CONFIRMATION, not a new finding.
+
+### S4.6 reconsolidation — `ceiling_ratio` 0.0865, and the zero HELD a second time
+
+`reconsolidation --min-failures 2` -> **0 candidates**; positive control
+`--min-failures 1` -> **0**; distinct failing-goal members **0**;
+`--failing-invocations --json` `failing_count: 1`.
+
+`diary_coverage.ceiling_ratio` = **0.0865** (2368 classifiable of 27375
+invocations) — at the TOP of the ~0.0026-0.087 band, ~10x the historical
+0.003-0.009 readings. Mechanism unchanged from the 2026-08-28 reading (0.0873):
+alpha's diary span is **25 days wide** (`08-01T23:29 .. 08-27T08:53`, 2231 of
+5332 invocations in span = 41.8%) while every peer sits on an ~8h slice —
+bravo 49/5813, echo 39/5104, foxtrot 29/5127, zeta (resident) 20/5999, i.e.
+0.3-0.9% each.
+
+**THIS IS THE SECOND CONSECUTIVE READING WHERE THE ZERO SURVIVED THE WIDENED
+COVERAGE.** The 2026-08-28 row called it "the first reading in that series where
+a zero is evidence about skill *quality* rather than about diary coverage,
+because the standing coverage objection got 10x weaker and the verdict held."
+It has now held again ~25h later at the same widened coverage, so that claim
+rests on two points rather than one.
+
+BOUNDED, unchanged from the prior row: **2231 of the 2368 ceiling (94.2%) is
+alpha's span** — 94% of this coverage rests on a single peer's pull, so it is
+one box's view of one peer's history, not a fleet verdict. And note the ratio
+FELL 0.0873 -> 0.0865 while `invocations` grew — the denominator-growth term the
+2026-08-18 falsification identified, visible here with the spans held still.
+
+### S2a NOT MEASURED THIS PASS — recorded rather than silently skipped
+
+The stale-EXPLORE-node prior (2 members: `solver-v0-audits` distill,
+`infrastructure-performance` decompose, per the 08-20 reading) was NOT
+re-measured on this pass. Reason: this scan ran late in an iteration that had
+already spent heavily on a full precheck-tail disposition, and the S2a
+measurement requires a tree summary plus front-matter reads of ~30 node files.
+Recording the omission because this block's own discipline says a prior that
+drifts stale makes the NEXT correct pass read as a contradiction — so the next
+reader should know the prior is now older than it looks, not that it was
+confirmed. S1 / S2b / S4a / S4b were skipped per their own "route nothing"
+markers, which is their designed behaviour and not an omission.

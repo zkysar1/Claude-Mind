@@ -85,6 +85,7 @@ Cross-references:
 """
 
 import argparse
+import json
 import sys
 import time
 from datetime import datetime
@@ -183,6 +184,69 @@ _VERIFY_READ_RETRIES = 4
 _VERIFY_READ_BACKOFF_S = 0.05
 
 
+def _read_wm_with_retry(wm_path):
+    """The bounded retry-read shared by --verify-counted and --verify-counted-many.
+
+    Extracted (g-115-8219) so a BATCH membership query costs ONE read instead of
+    one process per goal. Behaviour is byte-identical to the loop it replaces --
+    same retry count, same backoff, same "any non-dict parse is a torn read"
+    predicate -- and test_verify_counted_torn_read_retry.py pins all four of its
+    outcomes through the single-goal caller.
+
+    Returns the parsed WM dict, or None when it is still unreadable after every
+    retry (genuinely indeterminate, not empty).
+    """
+    for _attempt in range(_VERIFY_READ_RETRIES):
+        try:
+            parsed = yaml.safe_load(wm_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            return parsed
+        if _attempt < _VERIFY_READ_RETRIES - 1:
+            time.sleep(_VERIFY_READ_BACKOFF_S)
+    return None
+
+
+def _verify_counted_many(wm_path, goal_ids):
+    """Answer N membership questions from ONE read. Prints JSON, returns 0.
+
+    WHY THIS MODE EXISTS: the single-goal --verify-counted is correct and stays
+    the contract for iteration-close.sh's per-close self-heal. But an entry-time
+    SWEEP asks the same question about every goal a session closed, and paying a
+    process spawn per goal made that sweep cost 27.7s for 25 goals (measured,
+    cc-08 2026-08-29) -- disproportionate for a list-membership test, and enough
+    to get a battery lane quietly dropped. One read, N answers: ~1.1s total.
+
+    Added HERE rather than reimplemented in the caller because the retry
+    semantics, the torn-read conservatism and the shape of loop_state are this
+    module's to own (guard-2676: a scoped call into the shared component, never
+    a transcription of it -- a second copy drifts silently and nothing fails
+    when it does).
+
+    Output: {"indeterminate": bool, "counted": [...], "absent": [...]}
+    `indeterminate` true means the WM was unreadable, so BOTH lists are empty and
+    the caller has learned nothing -- deliberately distinct from "counted: [] and
+    absent: [...]", which is a real answer. Collapsing them would let an
+    unreadable WM render as a clean sweep, which is the exact failure this whole
+    check exists to catch, one level up.
+    """
+    wm = _read_wm_with_retry(wm_path)
+    if not isinstance(wm, dict):
+        print(json.dumps({"indeterminate": True, "counted": [], "absent": []}))
+        return 0
+    loop_state = (wm.get("slots") or {}).get("loop_state")
+    counted_raw = loop_state.get("counted_goals_this_session") if isinstance(loop_state, dict) else None
+    # A missing loop_state or a missing/!list counted field means NOTHING is
+    # counted -- the same verdict the single-goal path returns 1 for. It is a
+    # real answer, not an indeterminate one.
+    counted = set(counted_raw) if isinstance(counted_raw, list) else set()
+    hit = [g for g in goal_ids if g in counted]
+    miss = [g for g in goal_ids if g not in counted]
+    print(json.dumps({"indeterminate": False, "counted": hit, "absent": miss}))
+    return 0
+
+
 def _verify_counted(wm_path, goal_id):
     """Return the exit code for --verify-counted ( +  retry).
 
@@ -211,17 +275,7 @@ def _verify_counted(wm_path, goal_id):
     # retry; only a genuinely-unreadable state after all retries falls through to
     # the conservative 0. The 1 (absent) triggers an idempotent re-fire (),
     # consistent with iteration-close.sh's "spurious re-fire is a harmless no-op".
-    wm = None
-    for _attempt in range(_VERIFY_READ_RETRIES):
-        try:
-            parsed = yaml.safe_load(wm_path.read_text(encoding="utf-8")) or {}
-        except Exception:
-            parsed = None
-        if isinstance(parsed, dict):
-            wm = parsed
-            break
-        if _attempt < _VERIFY_READ_RETRIES - 1:
-            time.sleep(_VERIFY_READ_BACKOFF_S)
+    wm = _read_wm_with_retry(wm_path)
     if not isinstance(wm, dict):
         return 0  # still unreadable after retries -> genuinely indeterminate
     loop_state = (wm.get("slots") or {}).get("loop_state")
@@ -346,6 +400,20 @@ def main():
             "indeterminate. Does not take the lock or mutate WM."
         ),
     )
+    # : batch twin of --verify-counted for an entry-time sweep. Same
+    # predicate, same retry-read, ONE process instead of N. Read-only.
+    parser.add_argument(
+        "--verify-counted-many",
+        nargs="+",
+        default=None,
+        metavar="GOAL_ID",
+        help=(
+            "Read-only. Print JSON {indeterminate, counted[], absent[]} for every "
+            "GOAL_ID against loop_state.counted_goals_this_session, from a single "
+            "read. Always exits 0 — the verdict is in the JSON, not the rc, "
+            "because N goals have N answers. Does not take the lock or mutate WM."
+        ),
+    )
     # : LLM-context accumulator events (separate from the --outcome bump).
     parser.add_argument(
         "--reset-alignment",
@@ -378,6 +446,9 @@ def main():
     if args.verify_counted is not None:
         sys.exit(_verify_counted(wm_path, args.verify_counted))
 
+    if args.verify_counted_many is not None:
+        sys.exit(_verify_counted_many(wm_path, args.verify_counted_many))
+
     # : single-field accumulator ops (mutually exclusive with the bump).
     if args.reset_alignment:
         sys.exit(_run_field_op(wm_path, "reset-alignment"))
@@ -386,7 +457,8 @@ def main():
 
     if not args.outcome:
         parser.error(
-            "--outcome is required unless --verify-counted / --reset-alignment / "
+            "--outcome is required unless --verify-counted / --verify-counted-many / "
+            "--reset-alignment / "
             "--evolution-fired is given"
         )
 

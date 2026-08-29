@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 from datetime import date
 
+from .. import file_locks  # noqa: F401 — installs core/scripts on sys.path at module load (rb-3868); explicit, NOT transitive
 from ..jsonl_cache import cache
 from ..endpoints._jsonl_common import (
     find_by_id, flag, json_response_pretty, missing_flag_error, plain_lines,
@@ -306,6 +307,25 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         unreflected = [r for r in _by_id.values()
                        if r.get("stage") in ("resolved", "archived")
                        and not r.get("reflected", False)]
+        # : FLAG test-fixture residue on the way out; never filter it
+        # (guard-1072 — mark residue in place, never remove from a union-by-id
+        # merged store). This queue's prescribed action is a full ABC chain, and
+        # it could not tell a fixture from a finding: following one literally
+        # MANUFACTURES learning that is indistinguishable from real learning
+        # afterward. Stamps `fixture_suspect` on EVERY row (empty list when
+        # clean) so a consumer can tell "nothing suspect" from "old build".
+        # Signals + the measured false-predicate history: core/scripts/_reflectable.py.
+        # sys.path was installed at module load by the `file_locks` import at the
+        # top of this file — NOT by agent_paths, which this module never imports.
+        # That original claim was FALSIFIED in a fresh process ():
+        # importing this module alone left core/scripts off sys.path entirely and
+        # `import _reflectable` raised ModuleNotFoundError. It only ever worked in
+        # the live daemon because some OTHER module had imported agent_paths first
+        # — a latent import-order dependency the pytest conftest also hides, since
+        # it puts core/scripts on the path for every test. Same defect rb-3868
+        # names on the sibling world/ modules; same explicit remedy.
+        import _reflectable
+        _reflectable.annotate_fixture_suspects(unreflected)
         return json_response_pretty(unreflected)
 
     if flag(q, "replay_candidates"):

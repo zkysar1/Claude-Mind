@@ -142,6 +142,10 @@ STAGES = (
             # `--dry-run` printed it unwired and not_yet_wired_count was inflated
             # by one. Now pinned by test_iteration_open_stage_registry_parity.
             "world-script-crlf-check",
+            # . Added HERE in the same change that registered it in
+            # precheck-always-run-battery.LANES -- the two must not drift, and
+            # test_iteration_open_stage_registry_parity fails if they do.
+            "close-phase-skip-check",
         ),
         # Count re-derived from the tuple, never re-typed: the sibling battery's
         # own docstring records seven stale "five lanes" claims from doing that.

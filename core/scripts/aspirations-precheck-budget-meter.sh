@@ -144,7 +144,7 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|completed-not-closed-drain|world-script-crlf-check)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|completed-not-closed-drain|world-script-crlf-check|close-phase-skip-check)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;

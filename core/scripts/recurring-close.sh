@@ -344,7 +344,18 @@ run_phase() {
     local phase_name="$1"; shift
     FAILED_PHASE="$phase_name"  # updated before call; trap reports this if we abort
     local rc=0
-    bash "$SCRIPT_DIR/iteration-close.sh" "$@" || rc=$?
+    # RECURRING_TALLY_OWNER (): this script writes the five tally
+    # counters itself, in its post-phase heredoc below. do_verify grew a
+    # worker-only branch that writes the SAME counters -- correct for a worker
+    # closing through iteration-close.sh directly, and a DOUBLE-COUNT if it
+    # also fired here, because this call is that very do_verify. BODY_ROLE
+    # alone does not separate the two: guard-1591 actively instructs agents to
+    # close recurring goals with THIS script, so a worker Body following it
+    # would arrive here with BODY_ROLE=worker set by the bash hook. Declaring
+    # ownership makes the condition exact -- "advance the tally only when
+    # nobody else is going to" -- instead of relying on which role happens to
+    # be running.
+    RECURRING_TALLY_OWNER="recurring-close" bash "$SCRIPT_DIR/iteration-close.sh" "$@" || rc=$?
     if [[ $rc -ne 0 ]]; then
         echo "[recurring-close] PHASE FAILED: $phase_name (rc=$rc) — continuing to next phase" >&2
         PHASE_RESULTS+="${phase_name}=fail(${rc}) "

@@ -176,6 +176,26 @@ LANES = (
         "apply_flag": False,
         "finds": {"counts": (), "lists": ("offenders",), "false": ()},
     },
+    {
+        "name": "close-phase-skip-check",
+        "phase": "0.5g.9",
+        # Explicit, per the meter-name trap above: sweep_tier()'s always-run arm
+        # knows this exact string, and a stem-derived name would WARN-default to
+        # `medium` and make an always-run lane droppable.
+        "meter_name": "close-phase-skip-check",
+        "script": "close-phase-skip-check.sh",
+        # Report-only by contract: there is no --apply and there must never be
+        # one. The remedy for a detected skip is a judgment call, and an
+        # automatic re-fire would write loop_state off a heuristic population.
+        "apply_flag": False,
+        "extra_args": ("--json",),
+        # `skipped` ONLY. `bump_noop` is deliberately NOT a finding: it is the
+        # already-self-healed cause (iteration-close.sh detects it, ledgers it and
+        # re-fires), so alarming on it would re-raise something handled. And
+        # `indeterminate` is not a finding either -- it means the lane was BLIND,
+        # which the payload reports through `completeness`, never through status.
+        "finds": {"counts": (), "lists": ("skipped",), "false": ()},
+    },
 )
 
 # The always-run rows this battery deliberately does NOT run, because they have no

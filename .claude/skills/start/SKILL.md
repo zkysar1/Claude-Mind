@@ -871,7 +871,7 @@ DONE.
      (rc=4) above, this heartbeat never runs — a failed acquire leaves no
      heartbeat side-effect, which is the point.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
-     (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment.)
+     (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment. Script-enforced since 2026-08-29 (rb-9643): `session.py` REFUSES `RUNNING` — exit 1, `REJECTED: … running-session-id` — when `running-session-id` is missing/empty or names another session than `$MIND_SID`; a refusal means the triple-write above was skipped, so go back and run it, never write `agent-state` by hand.)
 
      **HALT ON NON-ZERO EXIT (F1, 2026-05-20)** — if the script exits non-zero
      (write permission error, _paths.sh resolution failure, daemon endpoint

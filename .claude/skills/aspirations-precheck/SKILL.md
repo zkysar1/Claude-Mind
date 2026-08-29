@@ -132,6 +132,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5g.6 | completed-not-closed-cadence | deferrable | `bash core/scripts/completed-not-closed-triage.sh --cadence --post-board` |
 | 0.5g.7 | completed-not-closed-drain | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e; named in full because the nearest preceding rows are the CADENCE battery's) → Phase 0.5g.7, which RE-RUNS `bash core/scripts/completed-not-closed-slate.sh` for the ROWS — the battery reports `slate=N`, a count. Sweep name ≠ script name |
 | 0.5g.8 | world-script-crlf-check | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e); standalone fallback `bash core/scripts/world-script-crlf-check.sh`. Report-only, no --apply. WHY in the script docstring (g-115-7288) |
+| 0.5g.9 | close-phase-skip-check | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e); standalone fallback `bash core/scripts/close-phase-skip-check.sh`. Report-only, no --apply. n/a on a worker (state-update is reducer-only). WHY in the script docstring (g-115-8219) |
 | 0.5h | health-regression-cadence | deferrable | `bash core/scripts/health-regression-check.sh --json` (then Phase 0.5h verify/revert steps on a trip) |
 | 0.5i | curriculum-cadence | deferrable | same cadence battery |
 | 0.5j | evolution-cadence | deferrable | same cadence battery |
