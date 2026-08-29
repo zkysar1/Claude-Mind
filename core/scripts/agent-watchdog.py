@@ -3273,6 +3273,7 @@ def _dependency_funnel_config() -> dict:
         "ticks_to_file": 1,
         "ticks_to_revalidate": 50,
         "lookback_hours": 6,
+        "liveness_hours": 1,
     }
     for key in out:
         val = cfg.get(key)
@@ -3319,7 +3320,8 @@ class DependencyFunnelProbe(Probe):
         import _frontier
         return _frontier.frontier_census(
             WORLD_DIR, agents_root(),
-            lookback_hours=float(cfg["lookback_hours"]))
+            lookback_hours=float(cfg["lookback_hours"]),
+            liveness_hours=float(cfg["liveness_hours"]))
 
     # ---- probe -----------------------------------------------------------
 
