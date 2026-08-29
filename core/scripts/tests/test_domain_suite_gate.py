@@ -176,14 +176,19 @@ def test_failing_ids_reads_both_output_shapes():
         "FAILED tests/test_a.py::test_x - AssertionError: boom",
         "ERROR tests/test_b.py - ImportError",
         "[57/77] FAIL test_ssm_run_send_deny_backoff.sh (rc=1)",
-        "  FAIL the tag alone decides whether it retries (A=3, B=3)",
-        "FAIL pytest-batch",
+        "[6/77] FAIL pytest batch (rc=1)",
+        "  FAIL the tag alone decides whether it retries (A=3, B=3)",  # inner assertion: NOT an id
+        "FAIL tests/test_x.sh",
+        "  pytest-batch",  # the runner's trailing list has no FAIL prefix: not an id
         "74 passed in 1.0s",
     ]
     assert mod.failing_ids(lines) == {
         "tests/test_a.py::test_x", "tests/test_b.py", "test_ssm_run_send_deny_backoff.sh",
-        "the", "pytest-batch",
+        "pytest batch", "tests/test_x.sh",
     }
+    # Measured on the first live seed (2026-08-29): the inner line produced the id "the",
+    # which would have laundered every later inner failure starting with that word.
+    assert "the" not in mod.failing_ids(lines)
 
 
 # ─── the trigger ──────────────────────────────────────────────────────────

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.33",
+    "previous_version": "2.12.32",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "domain-suite gate parser: only per-unit runner lines and file-like bare FAIL tokens become baseline ids (measured: inner assertion line produced the id 'the')",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.32",
     "previous_version": "2.12.31",
     "date": "2026-08-29",
