@@ -24,10 +24,18 @@ same escalation silent-zero-gate.py and bare-bash-authoring-gate.py took).
 DENY, NOT ADVISORY -- the same trade silent-zero-gate documents: an `allow`
 payload short-circuits the sibling deny gates on the Bash matcher.
 
-Scope is deliberately WRITES ONLY. Direct reads of a store are also against the
-rules, but skills legitimately `grep -c <id> agents/<a>/experience.jsonl` to
-confirm a write landed, and refusing reads would refuse those. Writes into a
-temp path (/tmp, $TMPDIR, agents/<a>/temp/) are not governed stores and pass.
+Scope: every direct WRITE, plus one READ shape -- a HAND PARSER over the raw
+file (inline Python that opens a store, or a shell read of a store piped into
+inline Python / jq). Plain shell reads stay allowed: skills legitimately
+`grep -c <id> agents/<a>/experience.jsonl` to confirm a write landed, and
+`wc -l` / `tail -1` / `grep ... > /tmp/x` are presence checks, not parsers.
+The parser is refused because it is what fails: measured 2026-08-29 on an
+8-Body downstream fleet, 79 hand parsers in 12 h against 4 calls to the
+sanctioned reader, and the parsers are the tracebacks in every Body log
+(`JSONDecodeError` on a banner line, `NameError` in a one-liner, `No such
+file` on a store that lives at an external path the model guessed). The deny
+names the reader, so the fix is one copy away (g-353-71). Writes into a temp
+path (/tmp, $TMPDIR, agents/<a>/temp/) are not governed stores and pass.
 
 Fail-open contract (CRITICAL): any parse/IO/logic error -> approve. A broken
 gate is recoverable; a fail-closed one stalls every autonomous loop.
@@ -119,6 +127,30 @@ WRITER_FOR = {
     "working-memory.yaml": "wm-set.sh / wm-append.sh / wm-prune.sh",
     "team-state.yaml": "team-state-update.sh",
     "_tree.yaml": "tree-update.sh (Edit the node .md; the hook syncs the index)",
+}
+
+# The sanctioned READER, named in the parse deny. The single-record forms come
+# first because that is what a hand parser is almost always after (measured:
+# `grep '"id": "g-N-N"' aspirations.jsonl | python3 -c ...` to learn an asp_id).
+READER_FOR = {
+    "aspirations.jsonl": (
+        "`aspirations-query.sh --goal-field id <goal-id> --full` (ONE goal: id, "
+        "asp_id, status, description, verification) / `aspirations-read.sh "
+        "--source <world|agent> --id <asp-id>` (one aspiration) / "
+        "`aspirations-query.sh --goal-status <status>` / `--title-contains <s>`"
+    ),
+    "aspirations-archive.jsonl": "`aspirations-read.sh --archive`",
+    "pipeline.jsonl": "`pipeline-read.sh` (see --help for --status / --id)",
+    "experience.jsonl": "`experience-read.sh --goal <goal-id>` / `experience-read.sh --id <exp-id>`",
+    "journal.jsonl": "`journal-read.sh`",
+    "reasoning-bank.jsonl": "`reasoning-bank-read.sh --id <rb-id>` / `--category <cat>` / `retrieve.sh --category <q>`",
+    "guardrails.jsonl": "`guardrails-read.sh --id <guard-id>` / `--category <cat>` / `retrieve.sh --category <q>`",
+    "pattern-signatures.jsonl": "`pattern-signatures-read.sh --active`",
+    "spark-questions.jsonl": "`spark-questions-read.sh`",
+    "execution-diary.jsonl": "`execution-diary.sh read --limit <N> [--goal <goal-id>] [--json]`",
+    "working-memory.yaml": "`wm-read.sh <slot> --json` (the slot name, e.g. current_goal, goals_completed_this_session)",
+    "team-state.yaml": "`team-state-read.sh --field <dotted.path> --json`",
+    "_tree.yaml": "`tree-find-node.sh --text <q>` / `retrieve.sh --category <q> --depth shallow`",
 }
 
 _BASENAME_ALT = "(?:" + "|".join(re.escape(b) for b in GOVERNED_BASENAMES) + ")"
@@ -235,16 +267,25 @@ def _copy_move_targets(cmd: str):
     return hits
 
 
+# `<id>` / `<goal-id>` / `<world|agent>`: a documentation placeholder. Bash would
+# read `<id>` as two redirects, so `grep -c <id> experience.jsonl` inside a commit
+# message or a JSON payload matched the redirect scan three times in one session
+# (2026-08-29). An LLM-composed command that REALLY means `<in >out` never writes
+# it without spaces; the placeholder reading wins, for the write scan only.
+_PLACEHOLDER_RE = re.compile(r"<[\w.|\-]+>")
+
+
 def direct_store_writes(cmd: str):
     """Return [(idiom, path)] for every direct write the command would perform."""
     hits = []
+    scan = _PLACEHOLDER_RE.sub("PLACEHOLDER", cmd)
     for rx, label in (
         (_REDIRECT_RE, "shell redirect into"),
         (_TEE_RE, "tee into"),
         (_INPLACE_RE, "in-place edit of"),
         (_DESTROY_RE, "rm/truncate of"),
     ):
-        for m in rx.finditer(cmd):
+        for m in rx.finditer(scan):
             tok = m.group(1)
             if _governed(tok):
                 hits.append((label, tok))
@@ -258,6 +299,79 @@ def direct_store_writes(cmd: str):
                 hits.append(("inline Python writing", tok))
                 break
     return hits
+
+
+# A statement is a `;` / `&&` / `||` / newline-separated unit; a PIPE chain is the
+# `|` split inside one statement. The parse shape is "a read tool touches the
+# store in one pipe segment and inline Python / jq sits in a LATER segment".
+_STATEMENT_SPLIT = re.compile(r"\|\||&&|[;\n]")
+_READ_TOOL_RE = re.compile(r"(?:^|\s)(?:grep|egrep|fgrep|rg|cat|head|tail|tac|awk|sed|cut|zcat|xargs|jq)\b")
+_PIPE_PARSER_RE = re.compile(r"(?:^|\s)(?:python3?|py)\b|(?:^|\s)jq\b")
+# A program that OPENS or LOADS a file. A store merely NAMED in a string
+# (`print('guardrails.jsonl has rows')`) is not a parse.
+_PY_READ_RE = re.compile(
+    r"\bopen\(|\.read_text\(|\.read_bytes\(|\.open\(|\.readlines\(|"
+    r"json\.load\(|yaml\.(?:safe_)?load\(|\bfileinput\b"
+)
+
+
+def direct_store_parses(cmd: str):
+    """Return [(idiom, path)] for every HAND PARSE of a governed store.
+
+    Two shapes, both measured on a downstream Body fleet 2026-08-29:
+      * inline Python whose PROGRAM mentions a store path -- `json.load(open(
+        'world/aspirations.jsonl'))`, a heredoc looping over its lines;
+      * a shell read of the store piped into inline Python / jq --
+        `grep '"id": "g-N-N"' .../aspirations.jsonl | head -1 | python3 -c ...`.
+    Reads the program, not the shell around it (the same rule as the write
+    branch: a worker's env prefix names its working-memory.yaml). A plain
+    `grep -c` / `wc -l` / `tail -1` / redirect to a temp file is not a parse.
+    """
+    hits = []
+    for body in _python_bodies(cmd):
+        if _PY_WRITE_RE.search(body):
+            continue  # the write branch owns it
+        if not _PY_READ_RE.search(body):
+            continue  # a store NAMED in a string is not a store OPENED
+        for m in _MENTION_RE.finditer(body):
+            tok = m.group(0)
+            if _governed(tok):
+                hits.append(("inline Python parsing", tok))
+                break
+    for stmt in _STATEMENT_SPLIT.split(cmd):
+        segs = stmt.split("|")
+        for i, seg in enumerate(segs[:-1]):
+            if not _READ_TOOL_RE.search(seg):
+                continue
+            mention = next((m.group(0) for m in _MENTION_RE.finditer(seg) if _governed(m.group(0))), None)
+            if mention is None:
+                continue
+            if any(_PIPE_PARSER_RE.search(later) for later in segs[i + 1 :]):
+                hits.append(("shell read piped into an inline parser:", mention))
+                break
+    return hits
+
+
+def build_parse_reason(hits) -> str:
+    idiom, path = hits[0]
+    base = _basename_of(path)
+    reader = READER_FOR.get(base, "the store's *-read.sh wrapper (ls core/scripts/*-read.sh)")
+    return (
+        f"direct store parse refused: {idiom} `{path}`.\n\n"
+        "A store is READ through its framework script, exactly as it is written "
+        "(CLAUDE.md 'the LLM never reads/edits JSONL files directly'). The script "
+        "knows the schema, the store-of-record path and the daemon's cache; a hand "
+        "parser over the raw file guesses all three -- measured 2026-08-29 on an "
+        "8-Body fleet: 79 hand parsers in 12 h against 4 wrapper calls, and the "
+        "parsers are the tracebacks in the Body logs (JSONDecodeError on a banner "
+        "line, NameError in a one-liner, 'No such file' on a store that lives at "
+        "an external path).\n\n"
+        f"Use instead ({base}): {reader}.\n"
+        f"A presence check is fine (`grep -c <id> {base}`, `wc -l`); it is the "
+        "parse that is refused. If no wrapper can answer the question, file it -- "
+        f"`aspirations-add-goal.sh` with title `Investigate: {base} read not "
+        "expressible via its script: <what>` -- and continue with the goal."
+    )
 
 
 def build_reason(hits) -> str:
@@ -368,7 +482,13 @@ def main() -> None:
             approve_no_mutation()
         hits = direct_store_writes(cmd)
         if not hits:
-            approve_no_mutation()
+            parses = direct_store_parses(cmd)
+            if not parses:
+                approve_no_mutation()
+            # No override for a parse: the reader wrapper always exists for a
+            # governed store, so there is no snapshot-restore case to carve out.
+            _log("deny-parse", cmd, parses)
+            emit_deny(build_parse_reason(parses))
         if OVERRIDE_TOKEN in cmd:
             root = Path(os.environ.get("PROJECT_ROOT") or SCRIPT_DIR.parent.parent)
             running = running_agents(root)

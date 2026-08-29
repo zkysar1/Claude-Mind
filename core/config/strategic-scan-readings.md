@@ -7053,3 +7053,32 @@ unclassifiable — but a zero at 6.7% coverage is materially stronger evidence t
 a zero at 0.3%, and the marker's standing advice ("a 0 at both thresholds
 distinguishes nothing") was written against the blind regime. **Report the ratio
 WITH the zero**; the two readings are not interchangeable. Routed nothing.
+
+## S4.6 reading — 2026-08-29T17:2x (zeta, hostname cc-02, uname -r 6.8.0-137-generic, own-cloud, read-only)
+
+**0 candidates at BOTH `--min-failures 2` and `1`, distinct members 0** — the
+undecidable case by the letter of the marker. But `ceiling_ratio` is
+**0.0863 (2380 of 27565)**, the TOP of the recorded ~0.0026–0.087 band and ~33x its
+floor, so the standard "this is a coverage measurement, not a skill-quality one"
+reading does not straightforwardly apply. `--failing-invocations` reported
+`failing_count: 4` against 0 surfaced candidates; read that gap as coverage as usual.
+
+**The new shape: the ceiling is supplied almost entirely by ONE peer, not by the
+resident.** alpha's diary span is **25.4 days** (`08-01T23:29..08-27T08:53`, 24
+windows, **2231 of 5368 in-span = 41.6%**) and contributes **2231 of the 2380
+classifiable = 93.7%**. Every other agent is at the familiar ~0.5–1%: bravo 49/5850,
+echo 39/5115, foxtrot 29/5184, and zeta (resident, live) 32/6048. So the usual
+"resident live slice + stale peer seeds" picture is inverted here — the resident
+contributes 1.3% of the ceiling and a single peer's unusually wide pull carries it.
+
+Two consequences. (1) A high `ceiling_ratio` does NOT mean broad fleet coverage: it can
+mean one peer is well-covered and four are not, which is not the same evidence and does
+not license a fleet-wide verdict. Read the `per_agent` table, never the ratio alone —
+this is the same "read the members, not the count" discipline the marker already applies
+to failing-goal sets, one level up. (2) Even at the band's top, with 41.6% coverage of
+one agent, min-failures 1 surfaced nothing — which is weak positive evidence that the
+21-candidate confound population really has cleared rather than merely gone unseen,
+because the box holding the widest peer window is the one best placed to see it.
+
+Still routed nothing: 91.4% of invocations remain unclassifiable, and one well-covered
+peer is not a fleet.

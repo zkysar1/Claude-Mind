@@ -18,6 +18,7 @@ Fail-open at every degraded condition:
 
 Run: py -3 core/scripts/tests/test_execution_diary_observer_gate.py
 """
+import json
 import os
 import shutil
 import subprocess
@@ -191,6 +192,86 @@ def test_observer_phase_end_dropped(sandbox, agent_dir):
     assert after == baseline, f"diary grew {baseline}→{after} despite observer phase_end"
 
 
+def fork_body_wm(agent_dir, sid):
+    """Materialise the worker-Body activation signal for `sid` — the forked
+    per-session working-memory.yaml that `_paths.body_state_path` keys on
+    (g-306-136). Also pre-touch claim-renewal-last so the shared heartbeat
+    tick never reaches the real heartbeat-tick.sh from a sandbox (g-115-5310)."""
+    body_dir = agent_dir / "sessions" / sid
+    body_dir.mkdir(parents=True, exist_ok=True)
+    (body_dir / "working-memory.yaml").write_text("slots: {}\n", encoding="utf-8")
+    (agent_dir / "session" / "claim-renewal-last").touch()
+
+
+def diary_last_entry(agent_dir):
+    f = agent_dir / "session" / "execution-diary.jsonl"
+    lines = [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return json.loads(lines[-1]) if lines else None
+
+
+def run_append(agent_dir, sid, content):
+    env = os.environ.copy()
+    env["MIND_SID"] = sid
+    return subprocess.run(
+        [sys.executable, str(DIARY_SCRIPT), "append"],
+        input=json.dumps({"entry_type": "finding", "goal_id": "g-test", "content": content}),
+        capture_output=True, text=True, encoding="utf-8",
+        env=env,
+    )
+
+
+@with_sandbox
+def test_worker_body_append_lands_with_body_sid(sandbox, agent_dir):
+    """: a forked worker Body — SID differs from the runner's BY
+    CONSTRUCTION, forked WM present — is a co-runner, not an observer. Its
+    append LANDS in the agent-wide stream, stamped `body_sid`, and the
+    runner-heartbeat is NOT touched (that file is the reducer's liveness)."""
+    write_runner_sid(agent_dir, "runner-sid-A")
+    fork_body_wm(agent_dir, "worker-sid-B")
+    (agent_dir / "session" / "agent-state").write_text("RUNNING", encoding="utf-8")
+    hb = agent_dir / "session" / "runner-heartbeat"
+    hb.write_text("", encoding="utf-8")
+    old = 1_000_000_000.0
+    os.utime(hb, (old, old))
+    baseline = diary_line_count(agent_dir)
+    r = run_append(agent_dir, "worker-sid-B", "worker write")
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}: {r.stderr}"
+    assert r.stdout.startswith("ok: finding"), f"expected ok output, got: {r.stdout!r}"
+    after = diary_line_count(agent_dir)
+    assert after == baseline + 1, f"worker append did not land: {baseline}→{after}"
+    entry = diary_last_entry(agent_dir)
+    assert entry.get("body_sid") == "worker-sid-B", f"missing body_sid stamp: {entry}"
+    assert hb.stat().st_mtime == old, "a worker Body must not refresh the reducer's runner-heartbeat"
+
+
+@with_sandbox
+def test_same_sid_without_forked_wm_is_still_an_observer(sandbox, agent_dir):
+    """Positive control for the exemption: the SAME foreign SID with no forked
+    WM is an observer and stays dropped — the exemption is keyed on the Body
+    activation signal, not on the SID differing."""
+    write_runner_sid(agent_dir, "runner-sid-A")
+    baseline = diary_line_count(agent_dir)
+    r = run_append(agent_dir, "worker-sid-B", "observer write")
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}: {r.stderr}"
+    assert r.stdout == "", f"expected empty stdout, got: {r.stdout!r}"
+    after = diary_line_count(agent_dir)
+    assert after == baseline, f"diary grew {baseline}→{after} for an observer SID"
+
+
+@with_sandbox
+def test_worker_body_phase_marker_lands_with_body_sid(sandbox, agent_dir):
+    """The phase-marker path takes the same exemption and the same stamp."""
+    write_runner_sid(agent_dir, "runner-sid-A")
+    fork_body_wm(agent_dir, "worker-sid-B")
+    baseline = diary_line_count(agent_dir)
+    r = run_diary("phase-start", "phase-4-execute", "--goal", "g-test", sid="worker-sid-B")
+    assert r.returncode == 0, f"expected exit 0, got {r.returncode}: {r.stderr}"
+    assert "ok: phase_start" in r.stdout, f"expected ok output, got: {r.stdout!r}"
+    after = diary_line_count(agent_dir)
+    assert after == baseline + 1, f"worker phase marker did not land: {baseline}→{after}"
+    assert diary_last_entry(agent_dir).get("body_sid") == "worker-sid-B"
+
+
 def main():
     print("g-115-633: execution-diary observer-session gate")
     tests = [
@@ -200,6 +281,9 @@ def main():
         test_empty_sid_falls_through,
         test_no_runner_file_falls_through,
         test_observer_phase_end_dropped,
+        test_worker_body_append_lands_with_body_sid,
+        test_same_sid_without_forked_wm_is_still_an_observer,
+        test_worker_body_phase_marker_lands_with_body_sid,
     ]
     results = [t() for t in tests]
     passed = sum(results)

@@ -33,8 +33,9 @@ REAL gate by absolute path with cwd=<temp repo> so its siblings (_paths.sh,
 helpers) resolve against the real repo while `git` operates on the fixture.
 Mirrors test_iteration_commit_untracked_filter.py. World/meta are redirected to
 empty temp dirs (MIND_WORLD/MIND_META, honored by _paths.sh) so the gate's
-cooldown peer-read + attribution filter are deterministic. A save/restore
-fixture leaves zeta's real fresh_eyes_last_fire WM slot untouched after the run.
+cooldown peer-read + attribution filter are deterministic. The autouse
+fixture targets an OFF-ROSTER test agent, so no live fleet member's
+fresh_eyes_last_fire WM slot is read or written at all (g-115-4887).
 """
 
 from __future__ import annotations
@@ -73,6 +74,12 @@ PARTNER_UNCOMMITTED = [
     "core/scripts/cfo-partner-y.py",
     "core/scripts/cfo-partner-z.py",
 ]
+
+
+# OFF-ROSTER by construction: must never appear in the live team-state
+# agent_status roster ( outcome 1). Was "zeta", a LIVE fleet
+# member used as a stand-in for "some agent" (guard-1699).
+AGENT = "testagent"
 
 
 def _to_bash_path(p) -> str:
@@ -123,7 +130,7 @@ def _run_gate(repo: Path, world: Path, meta: Path, commit_sha: str | None,
               goal_id: str | None = None) -> dict:
     """Run the REAL gate with cwd=repo; return parsed JSON output."""
     env = dict(os.environ)
-    env["MIND_AGENT"] = "zeta"           # self — WM write (if any) goes to own slot
+    env["MIND_AGENT"] = AGENT            # off-roster test agent — never a live member
     env["MIND_WORLD"] = _to_bash_path(world)  # empty temp world → deterministic filter/peer-read
     env["MIND_META"] = _to_bash_path(meta)
     env.pop("COMMIT_SHA", None)
@@ -158,58 +165,42 @@ def _run_gate(repo: Path, world: Path, meta: Path, commit_sha: str | None,
 
 
 @pytest.fixture(autouse=True)
-def _preserve_zeta_wm():
-    """Save, NEUTRALIZE, then restore zeta's fresh_eyes_last_fire ().
+def _isolate_wm_cooldown():
+    """Point the gate's cooldown read at an OFF-ROSTER test agent, so the suite
+    never touches a live fleet member's working memory (g-115-4887).
 
-    Root cause of the historical flake (g-115-1178): the gate's cooldown reads
-    agents/zeta/session/working-memory.yaml via the daemon-routed wm-read. That
-    path is NOT neutralized by the MIND_WORLD/MIND_META redirect (those cover
-    world/meta, not the per-agent WM), and the daemon does NOT honor
-    MIND_AGENT_DIR — it refuses to resolve a non-existent test agent
-    ("WORLD_PATH unresolved"), so a dedicated-test-agent isolation is infeasible
-    with the live daemon (guard-672). Consequently, when zeta's live WM carries a
-    recent fresh_eyes_last_fire whose file set matches the test's detected set,
-    the content-aware cooldown suppresses the gate (fired:false) and the
-    working-tree cases below fail non-deterministically.
+    THIS FILE IS THE ORIGIN OF THE PATTERN -- mode_only and daemon_dispatch each
+    copied the fixture from here, live agent name and all. g-115-4887 named only
+    those two; this third instance was found by grepping the fixture shape, which
+    is exactly what that goal's own SCOPE section told the executor to do.
 
-    Fix (the goal's fix-direction #2 — the one that works through the live
-    daemon): save the real slot, SET IT TO null (no recent review -> cooldown
-    inactive -> the gate fires deterministically regardless of live self/partner
-    fresh-eyes activity), run the test, then restore the real slot. The seed is
-    test correctness (rb-659: fresh fixture state per call); the restore is
-    best-effort WM hygiene and never fails the test on a save/restore error."""
-    saved = "null"
-    try:
-        r = subprocess.run(
-            [GIT_BASH, _to_bash_path(WM_READ_SH), "fresh_eyes_last_fire", "--json"],
-            capture_output=True, text=True, timeout=30,
-            env={**os.environ, "MIND_AGENT": "zeta"},
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            saved = r.stdout.strip()
-    except Exception:
-        pass
-    # Neutralize the cooldown BEFORE the gate run so the own-fresh read is
-    # deterministic. wm-set with "null" empties the slot (same path the restore
-    # below exercises when saved=="null"). Best-effort: a seed failure leaves the
-    # pre-existing flake but never aborts the test.
-    try:
-        subprocess.run(
-            [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
-            input="null", capture_output=True, text=True, timeout=30,
-            env={**os.environ, "MIND_AGENT": "zeta"},
-        )
-    except Exception:
-        pass
+    The old rationale for using a LIVE agent was that "the daemon does NOT honor
+    MIND_AGENT_DIR -- it refuses to resolve a non-existent test agent
+    ('WORLD_PATH unresolved'), so a dedicated-test-agent isolation is infeasible
+    with the live daemon (guard-672)". MEASURED 2026-08-29 (alpha, cc-08): that
+    constraint is retired. _paths.sh falls through to the first available conf
+    for WORLD/META while AGENT_DIR still points at the NAMED agent (g-115-960 /
+    g-115-6417), so `MIND_AGENT=testagent wm-read.sh fresh_eyes_last_fire
+    --json` returns `{}` on a real, off-roster agent dir. Positive control: the
+    same call for `alpha` returns live records, so the `{}` is a genuine empty.
+
+    The save/restore is DELETED rather than hardened -- a test agent's scratch
+    slot has nothing worth preserving, and the old shape swallowed every failure
+    (`except Exception: pass`, no `finally`), so a crash between neutralize and
+    restore destroyed the real list permanently and silently. The neutralize is
+    kept for determinism and now ASSERTS rather than swallowing.
+    """
+    r = subprocess.run(
+        [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
+        input="null", capture_output=True, text=True, timeout=30,
+        env={**os.environ, "MIND_AGENT": AGENT},
+    )
+    assert r.returncode == 0, (
+        f"could not neutralize {AGENT} fresh_eyes_last_fire "
+        f"(rc={r.returncode} stderr={r.stderr!r}) -- the firing cases below would "
+        f"be non-deterministic, so fail loudly rather than flake"
+    )
     yield
-    try:
-        subprocess.run(
-            [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
-            input=saved, capture_output=True, text=True, timeout=30,
-            env={**os.environ, "MIND_AGENT": "zeta"},
-        )
-    except Exception:
-        pass
 
 
 def test_committed_scope_detects_only_committed_files():

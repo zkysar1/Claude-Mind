@@ -35,7 +35,7 @@ from pathlib import Path
 from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
-from _paths import AGENT_DIR, assert_agent_dir
+from _paths import AGENT_DIR, SESSIONS_DIRNAME, assert_agent_dir
 from _runtime_bash import bash_cmd  # guard-580: never a bare "bash" argv[0]
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
@@ -82,9 +82,13 @@ def _advance_heartbeat():
         state_file = AGENT_DIR / "session" / "agent-state"
         if state_file.exists():
             state = state_file.read_text(encoding="utf-8").strip()
-        if state != "IDLE":
+        if state != "IDLE" and not _is_worker_body():
             # The agent-WIDE heartbeat stays gated — a fresh runner-heartbeat
             # against agent-state=IDLE is the 2026-05-13 desync class (guard-543).
+            # A worker Body never touches it either: that file is the REDUCER's
+            # liveness, and a worker refreshing it would mask a dead reducer
+            # (the Body-writes-while-the-Mind-is-dead class, guard-3604). The
+            # shared tick below writes the per-Body heartbeat instead.
             (AGENT_DIR / "session" / "runner-heartbeat").touch()
         # The shared tick fires on BOTH roles, deliberately OUTSIDE the gate
         # above. It carries its own gate and splits the two signals correctly:
@@ -245,6 +249,24 @@ VALID_ENTRY_TYPES = {
 }
 
 
+def _is_worker_body(sid=None):
+    """True when THIS session is a forked worker Body of the agent (g-306).
+
+    Keyed on the same activation signal `_paths.body_state_path` uses: the
+    per-session dir `sessions/<sid>/` holds a forked `working-memory.yaml`.
+    Only a non-reducer Body ever forks one, so the reducer, an observer session
+    (assistant/reader beside the runner) and a no-SID caller all read False.
+    DIR-based — composed from AGENT_DIR, never rebuilt from the agent NAME —
+    so the `MIND_AGENT_DIR` test seam is honoured, for the reason
+    `_paths.retrieval_session_path` gives.
+    """
+    if sid is None:
+        sid = (os.environ.get("MIND_SID") or "").strip()
+    if not sid:
+        return False
+    return (AGENT_DIR / SESSIONS_DIRNAME / sid / "working-memory.yaml").exists()
+
+
 def _is_observer_session():
     """Return True if MIND_SID is set and differs from running-session-id.
 
@@ -258,9 +280,24 @@ def _is_observer_session():
     Fail-open at every degraded condition (MIND_SID empty, file absent,
     file unreadable) to match stop-hook.sh Gate 0 / session-save-id.sh
     witness fallbacks. Bootstrap (no runner yet) is fall-through.
+
+    A forked worker Body is a CO-RUNNER, not an observer (g-353-71). Its SID
+    differs from running-session-id by construction — that file names the
+    reducer — so the comparison below read every worker as an observer and
+    dropped its writes SILENTLY (exit 0, no "ok:" line). Measured 2026-08-29
+    on an 8-Body fleet: the agent-wide diary stalled 6h while seven workers
+    closed goals through iteration-close.sh, whose `|| true` hid it;
+    recovery-gate Condition 2.7 and the watchdog read the same file as
+    "diary stale", and stranded-claim-sweep's keep-signal
+    (`_diary_has_entry_after`) could never see a worker's claim-time
+    breadcrumb. Workers emit findings and breadcrumbs, never phase markers,
+    so the dangling-pair hazard that motivated the gate does not apply; a
+    Body's entries carry `body_sid` for attribution.
     """
     sid = os.environ.get("MIND_SID", "")
     if not sid:
+        return False
+    if _is_worker_body(sid):
         return False
     runner_file = AGENT_DIR / "session" / "running-session-id"
     if not runner_file.exists():
@@ -329,6 +366,12 @@ def cmd_append(args):
     # Auto-add timestamp if missing
     if "timestamp" not in entry:
         entry["timestamp"] = now_iso()
+
+    # A worker Body's entry names its session: seven Bodies share one stream,
+    # and a reader pairing an entry with a claim needs the identity at the
+    # granularity the claim carries (guard-2474), not just the agent name.
+    if _is_worker_body():
+        entry.setdefault("body_sid", os.environ.get("MIND_SID", "").strip())
 
     # Ensure required fields
     if "content" not in entry:
@@ -525,6 +568,8 @@ def _emit_phase_marker(kind, phase, iteration, goal_id, note):
         entry["iteration"] = iteration
     if goal_id:
         entry["goal_id"] = goal_id
+    if _is_worker_body():
+        entry["body_sid"] = os.environ.get("MIND_SID", "").strip()
     DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(DIARY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")

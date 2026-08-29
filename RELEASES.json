@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.28",
+    "previous_version": "2.12.27",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Re-cut of v2.12.27 with the seed-preflight domain-leak fixed (closed_against_own_note.py docstring): worker-Body diary writes land; the store guard refuses hand parsers over governed stores, names the reader, and masks placeholders before the redirect scan (g-353-71)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.27",
+    "previous_version": "2.12.26",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Worker Bodies' execution-diary writes land (a forked Body is a co-runner, not an observer; body_sid tagged); the store guard refuses hand parsers over governed stores and names the sanctioned reader per store, and masks angle-bracket placeholders before the redirect scan (g-353-71)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.26",
     "previous_version": "2.12.25",
     "date": "2026-08-29",

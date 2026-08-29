@@ -208,6 +208,53 @@ def _scope_head(cell: str) -> str:
     return cell.split(".", 1)[0]
 
 
+_RETIRES_ANCHOR = re.compile(
+    r"retires\b[^.\n]{0,80}?`?user_leg_scope`?\s*\**\s*tokens\**", re.I)
+_RETIRES_TOKEN = re.compile(r"(?:\s|,|\*|and\b|the\b)*`([a-z0-9-]+)`")
+
+
+def _retired_scopes(cell: str) -> list:
+    """Canonical scope tokens a grant DECLARES it retires, anywhere in its cell.
+
+    `.claude/rules/reclaim-routed-work.md` rule 4 asks grant authors to name the
+    specific `user_leg_scope` token a grant invalidates, in machine-findable
+    terms. Authors did exactly that -- and `_scope_head` could not see it,
+    because the clause sits past the first period. So grants written to spec
+    landed in `unkeyed` and every goal they covered reported "matches no
+    standing grant". Measured 2026-08-29 on the live table (g-115-349):
+    grant-013 and grant-014 both carry the clause; g-368-12, g-115-6477 and
+    g-335-1233 were being reported as ungranted against it.
+
+    This is NOT the whole-cell token scan `_scope_head` rightly refuses. The
+    match is anchored on an explicit labeled declaration, and only the run of
+    backticked tokens IMMEDIATELY following that anchor is consumed -- a
+    carve-out sentence elsewhere in the cell cannot key the grant. That is
+    guard-4883's requirement (role-aware predicate, never `text CONTAINS
+    token`) applied to the grants table.
+
+    Non-canonical tokens are dropped: a grant may retire vocabulary that is not
+    in VALID_USER_LEG_SCOPES (grant-014 retires `approve-and-merge-pr`, which no
+    goal can carry), and only canonical tokens can ever join a goal.
+
+    Keying a grant here does NOT recommend dropping the human leg. These grants
+    continue past their head, so `_parse_standing_grants` records them as
+    QUALIFIED and `_assess_user_leg` returns `grant-qualified` -- surface and
+    review, never auto-drop (guard-5470).
+    """
+    a = _RETIRES_ANCHOR.search(cell)
+    if not a:
+        return []
+    out, pos = [], a.end()
+    while True:
+        m = _RETIRES_TOKEN.match(cell, pos)
+        if not m:
+            break
+        if m.group(1) in VALID_USER_LEG_SCOPES:
+            out.append(m.group(1))
+        pos = m.end()
+    return sorted(set(out))
+
+
 def _parse_standing_grants(world_dir: Path) -> dict:
     """Parse `## Standing User Grants` into {scope_token: [grant_id, ...]}.
 
@@ -264,6 +311,9 @@ def _parse_standing_grants(world_dir: Path) -> dict:
             out["qualified"][grant_id] = tail[:220]
         hits = [s for s in sorted(VALID_USER_LEG_SCOPES)
                 if re.search(rf"(?<![\w-]){re.escape(s)}(?![\w-])", head, re.I)]
+        # : ALSO honour an explicit "Retires ... the `user_leg_scope`
+        # tokens `x`, `y`" declaration anywhere in the cell -- see _retired_scopes.
+        hits = sorted(set(hits) | set(_retired_scopes(cells[0])))
         if hits:
             for s in hits:
                 out["by_scope"].setdefault(s, []).append(grant_id)
@@ -483,8 +533,10 @@ def _assess_user_leg(cand: dict, grants: dict) -> dict:
         if not unqualified:
             return {**base, "verdict": "grant-qualified", "grants": covering,
                     "grant_qualifiers": {gid: qualified[gid] for gid in covering},
-                    "reason": f"user_leg_scope={scope!r} matches the head of "
-                              f"{', '.join(covering)}, but every one of those grants is "
+                    "reason": f"user_leg_scope={scope!r} matches "
+                              f"{', '.join(covering)} (by scope head or by an explicit "
+                              f"'Retires ... user_leg_scope tokens' declaration), but "
+                              "every one of those grants is "
                               "QUALIFIED past its head, and a scope-label match cannot "
                               "evaluate a carve-out. Read the qualifier and decide; this "
                               "is NOT a recommendation to drop 'user'."}

@@ -38,6 +38,7 @@ from hook_helpers import (  # noqa: E402
 )
 
 TREE_DIR_MARKER = "knowledge/tree/"
+TREE_INDEX_BASENAME = "_tree.yaml"
 
 
 def _norm(p):
@@ -94,6 +95,63 @@ def _parses(path, content):
         return True
     except yaml.YAMLError:
         return False
+
+
+def _duplicate_keys(path, content):
+    """Return a Counter of keys appearing MORE THAN ONCE inside the SAME YAML
+    mapping, anywhere in the validated blob (nested mappings included).
+
+    WHY _parses CANNOT SEE THIS (g-115-8294). A duplicate key is not a parse
+    error: yaml.safe_load accepts it, raises nothing, and silently keeps only
+    the LAST occurrence (guard-2388). The file stays valid, every downstream
+    read succeeds, and the earlier value is simply gone -- no error, no warning,
+    no changelog signal. This gate asked "does it parse", so it was structurally
+    blind to the whole class.
+
+    MEASURED 2026-08-29 across 2,940 tree nodes: 19 carried literally repeated
+    front-matter keys, worst .../arc-agi-3/arc-environment-models/ls20-class.md
+    with `prior_source` SEVEN times. A dict-based writer cannot emit two
+    identical keys, so the producer is hand-editing -- exactly the
+    CONCURRENT-AUTHORSHIP hazard guard-2388 names: shared front matter
+    accumulates keys from multiple agents, and the key you add may already exist
+    from a peer edit you never saw.
+
+    Counter rather than a set, so a key going 2 -> 3 still counts as INTRODUCED.
+    Fail-open (empty Counter) on any error, matching every other helper here.
+    """
+    import collections
+    import yaml
+    base = _norm(path).rsplit("/", 1)[-1]
+    if base == TREE_INDEX_BASENAME:
+        blob = content
+    else:
+        blob = _front_matter(content)
+        if blob is None:
+            return collections.Counter()
+    found = []
+
+    class _DupRecordingLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _value_node in node.value:
+                try:
+                    k = self.construct_object(key_node, deep=deep)
+                except Exception:
+                    continue
+                try:
+                    if k in seen:
+                        found.append(str(k))
+                    else:
+                        seen.add(k)
+                except TypeError:
+                    continue  # unhashable key -> not our concern
+            return super().construct_mapping(node, deep)
+
+    try:
+        yaml.load(blob, Loader=_DupRecordingLoader)
+    except Exception:
+        return collections.Counter()
+    return collections.Counter(found)
 
 
 def _proposed_content(tool_name, tool_input, current):
@@ -231,6 +289,39 @@ def main():
                 f"Fix: WRITE each node .md body FIRST (with its YAML front matter), THEN add the "
                 f"_tree.yaml index entry — or use tree.py add-child which couples both writes. "
                 f"Re-run this edit once each new node's .md exists."
+            )
+
+    # : duplicate-key gate. Runs ONLY when the proposed content parses
+    # (an unparseable proposal is handled by the DENY below), and denies ONLY a
+    # duplication this edit INTRODUCES -- the same "current must be clean" rule
+    # the parse gate uses, so an edit REPAIRING an already-duplicated file is
+    # always allowed through.
+    if _parses(file_path, proposed):
+        import collections as _c
+        prop_dups = _duplicate_keys(file_path, proposed)
+        cur_dups = (_duplicate_keys(file_path, current)
+                    if (file_exists and current) else _c.Counter())
+        introduced = {k: n - cur_dups.get(k, 0) for k, n in prop_dups.items()
+                      if n > cur_dups.get(k, 0)}
+        if introduced:
+            listing = "\n".join(
+                f"    - {k!r}: this edit adds {n} more occurrence(s); "
+                f"the key would appear {prop_dups[k] + 1} times in one mapping"
+                for k, n in sorted(introduced.items())[:20])
+            emit_deny(
+                f"tree-yaml-validate-gate (Layer B, duplicate-key) blocked {tool_name} to:\n"
+                f"  {file_path}\n"
+                f"This edit would put the SAME key twice in one YAML mapping:\n"
+                f"{listing}\n"
+                f"That is NOT a parse error -- yaml.safe_load accepts it, raises nothing, and "
+                f"silently keeps only the LAST occurrence, so the other value is lost with no "
+                f"error, no warning and no changelog signal (guard-2388).\n"
+                f"Measured 2026-08-29: 19 of 2,940 tree nodes had already accumulated repeated "
+                f"front-matter keys exactly this way, the worst carrying `prior_source` seven "
+                f"times.\n"
+                f"Fix: grep the block for the key FIRST. To REPLACE the existing value, edit "
+                f"that line instead of adding a second one; to keep both, use a distinct key "
+                f"or a list value."
             )
 
     if _parses(file_path, proposed):
