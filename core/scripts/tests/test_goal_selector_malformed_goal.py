@@ -73,6 +73,34 @@ def test_a_record_without_an_id_is_skipped_with_one_warning(capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_collect_candidates_skips_a_string_ref_and_an_id_less_stub(capsys):
+    """Back-port of a downstream Body's own patch (2026-08-28, 'skip string-ref goals in raw
+    JSONL'): a string ref used to raise AttributeError in collect_candidates, and a PENDING
+    stub without an id would have become a candidate with goal_id None."""
+    gs._MALFORMED_GOALS_WARNED.clear()
+    asp = _asp("asp-007", [
+        "g-007-01",
+        {"goal_id": "g-007-02", "status": "pending"},
+        {"id": "g-007-03", "title": "the real one", "status": "pending",
+         "participants": ["agent"]},
+    ])
+    candidates = gs.collect_candidates([asp])
+    assert [c["goal"]["id"] for c in candidates] == ["g-007-03"]
+    err = capsys.readouterr().err
+    assert err.count("[goal-selector] WARN") == 2
+
+
+def test_census_effective_counts_ignores_a_non_record():
+    census = importlib.import_module("_goal_census")
+    asp = _asp("asp-008", [
+        "g-008-01",
+        {"id": "g-008-02", "title": "done", "status": "completed"},
+        {"id": "g-008-03", "title": "open", "status": "pending"},
+    ])
+    total, completed = census.effective_counts(asp)
+    assert (total, completed) == (2, 1)
+
+
 def test_goal_record_id_never_raises():
     assert gs.goal_record_id({"id": "asp-x"}, {"id": "g-001-01"}) == "g-001-01"
     assert gs.goal_record_id({"id": "asp-x"}, {"goal_id": "g-001-01"}) is None

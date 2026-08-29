@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.17",
+    "previous_version": "2.12.16",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Back-port the downstream string-ref guards: collect_candidates, the blocked-diagnostic loop and _goal_census.effective_counts skip a non-record goal instead of crashing (subsumes coach commit 9405360)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.16",
     "previous_version": "2.12.15",
     "date": "2026-08-29",
