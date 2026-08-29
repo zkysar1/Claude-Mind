@@ -192,10 +192,29 @@ All data comes from framework scripts — no direct JSONL reads.
    Bash: bash core/scripts/tree-read.sh --stats
 
 7. Guardrails / reasoning bank / pattern signatures counts
-   Bash: bash core/scripts/guardrails-read.sh --summary
-   Bash: bash core/scripts/reasoning-bank-read.sh --summary
-   Bash: bash core/scripts/pattern-signatures-read.sh --summary
-   → Count lines from each
+   Bash: bash core/scripts/guardrails-read.sh --count
+   Bash: bash core/scripts/reasoning-bank-read.sh --count
+   Bash: bash core/scripts/pattern-signatures-read.sh --count
+   → Each returns {"count": N} — a RECORD count. 56 bytes for all three.
+     They feed exactly one line of the report (## Knowledge); the CONTENT
+     of these stores is never used here.
+   # WAS `--summary` + "Count lines from each" until 2026-08-29 (g-115-6742):
+   # 2,106,400 bytes loaded at EVERY /stop to produce three integers, two of
+   # them WRONG. Counting summary LINES is not a record count, and it errs in
+   # BOTH directions at once — which is why it read as a small single-store
+   # defect for ten days instead of a defect in all three:
+   #   +N  a field carrying an embedded newline emits a continuation line
+   #       (3 guardrails today; `rule[:80]` in reasoning_bank.py truncates
+   #       but does not strip \n — corroborated by guardrail-manifest.sh
+   #       --stats, which independently reports "3 wrapped-text ... folded")
+   #   -1  NONE of the three outputs ends with a trailing newline, and
+   #       `wc -l` counts NEWLINES — so every store undercounts by 1
+   # Measured 2026-08-29 (alpha, cc-07): guardrails 5194 real lines / 5191
+   # records, where wc -l said 5193 because the two errors partially
+   # cancelled; reasoning-bank and pattern-signatures were BOTH off by -1,
+   # though the goal that filed this had recorded them as delta 0.
+   # Do NOT reintroduce a line count. --summary still exists if the CONTENT
+   # is ever genuinely needed; this section has never needed it.
 
 8. Pending questions + user goals
    Bash: bash core/scripts/pending-questions-read.sh --status pending

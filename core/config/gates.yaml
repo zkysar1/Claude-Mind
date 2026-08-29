@@ -949,10 +949,10 @@ gates:
     dominant_risk: FN
     asymmetry_magnitude: extreme
     keyword_bias: strict
-    override_flag: "STORE_WRITE_GUARD_OVERRIDE anywhere in the command"
+    override_flag: "STORE_WRITE_GUARD_OVERRIDE anywhere in the command -- honored ONLY while no agent in the deployment is RUNNING (agents/*/session/agent-state); refused with kind=override-refused otherwise. The deny text deliberately never names the token: measured 2026-08-29 on a downstream deployment, 6 of 42 firings became overrides within minutes of a deny that advertised it."
     fp_cost: low
     fn_cost: high
-    fp_description: "A legitimate hand restore of a store (operator, post archive-before-delete) is refused once; the token clears it and the bypass is logged to core/logs/hook-fires/store-write-guard.jsonl."
+    fp_description: "A legitimate hand restore of a store (operator, post archive-before-delete, deployment stopped) is refused once; the token clears it and the bypass is logged to core/logs/hook-fires/store-write-guard.jsonl. Under a live loop the operator path is `history.py restore` (a script call, never guarded)."
     fn_description: "An ad-hoc redirect / sed -i / python heredoc writes a governed JSONL or YAML store directly: no lock, no .history snapshot, no changelog, no schema check. Measured 2026-08-29 (a downstream worker Body): a goal parked at status 'done' -- a value no reader knows -- so it never completed, never posted, and never released in_flight."
     rb_evidence: ["guard-996", "guard-1052"]
     tuning_notes: "Writes only, by design: reads of a store are also against the rules but skills grep stores to confirm their own writes landed. Temp paths (/tmp, $TMPDIR, agents/<a>/temp/, sessions/<sid>/scratch/) are exempt -- hand-built fixtures are not governed stores. Denies and overrides are logged locally (not to gate-firings) so the hot path stays free of daemon hops. RETIREMENT CRITERION: override/(deny+override) > 0.5 over 20+ firings, or a daemon-side write fence makes the file unwritable by anything but the scripts."

@@ -50,6 +50,11 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
 
 
+# Basename of the knowledge-tree index. Named once so the fixtures below and the
+# assertions that check a degraded entry's `path` cannot drift apart.
+TREE_INDEX_BASENAME = "_tree.yaml"
+
+
 def _build_world(root: Path, *, write_bodies: bool = False) -> Path:
     """Create a minimal but realistic world/ tree + three JSONL stores under root.
 
@@ -806,6 +811,109 @@ def test_self_key_is_always_present_in_the_json_payload(tmp_path: Path, monkeypa
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert "self" in payload, sorted(payload)
     assert "self" in payload["counts"], sorted(payload["counts"])
+
+
+def test_healthy_export_omits_the_degraded_key_from_the_written_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The half that runs on every healthy sidecar, on every hourly timer fire.
+
+    The three existing `degraded` assertions (read_tree_nodes / build_bundle) test the
+    ``status`` dict — the FUNCTION's out-parameter. Nothing asserted the key as it
+    appears in the BUNDLE ON DISK, so a refactor of main()'s payload assembly could
+    start emitting ``degraded: null`` on healthy exports with every test still green.
+    That is a false alarm shipped to every environment, on the path taken when nothing
+    is wrong — strictly worse than missing the degraded case, which only fires on an
+    already-broken index.
+
+    ABSENCE is the contract, not falsiness: the emit site's own comment says a consumer
+    tests ``"degraded" in bundle``, so a present-but-empty key breaks that reader.
+    """
+    world = _build_world(tmp_path)
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "degraded" not in payload, sorted(payload)
+    # POSITIVE CONTROL: a bundle that failed to export would also lack the key.
+    assert payload["counts"]["tree"] > 0, "fixture did not produce a real export"
+
+
+def test_malformed_index_refuses_to_write_and_names_the_cause(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A malformed index REFUSES the write (rc=2). It does not emit a degraded bundle.
+
+    This is not the assertion g-368-54 asked for, and the difference is the finding.
+    That goal asked for a test pinning ``degraded`` in main()'s WRITTEN payload. Writing
+    it revealed that the branch at the emit site is UNREACHABLE, measured three ways:
+
+      1. A broken index does not degrade the tree alone — it zeroes EVERY knowledge
+         count. Measured on this fixture: healthy {tree:1, hypotheses:1, guardrails:1,
+         lessons:1} -> broken {0, 0, 0, 0}. The non-tree stores are gated on the tree.
+      2. ``world_store_evidence`` counts ``tree_index_bytes``, and ``_degrade`` can only
+         fire when the index EXISTS and is unreadable — which means non-zero bytes. So
+         evidence is ALWAYS truthy exactly when the tree degraded.
+      3. All-zero counts + truthy evidence is precisely the g-368-34 refusal condition,
+         so main() returns 2 before the payload dict is built.
+
+    The two features are individually correct and were landed by the same goal; together
+    they make the degraded PAYLOAD dead code. It went unnoticed because g-368-53's
+    two-arm probe verified the marker at the ``status``/``build_bundle`` level, never
+    end-to-end through main() to a file — which is the gap g-368-54 exists to close.
+
+    So this pins what actually happens, and the operator-visible contract that survives:
+    the refusal NAMES the cause on stderr, which is g-368-53's real delivery.
+    """
+    world = _build_world(tmp_path)
+    # a stray backtick at line 4 — the yaml.YAMLError shape measured on a live index
+    index = world / "knowledge" / "tree" / TREE_INDEX_BASENAME
+    index.write_bytes(b"nodes:\n  a:\n    summary: x\n  `bad: [\n")
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    out = tmp_path / "bundle.json"
+
+    assert M.main(["-o", str(out)]) == 2
+    assert not out.exists(), "the refusal must leave the previous bundle in place"
+
+    err = capsys.readouterr().err
+    assert "REFUSING to write an all-zero bundle" in err
+    #  threaded tree_status into main so the refusal names WHY, not just THAT.
+    # Without this the operator sees a hollow-bundle refusal with no cause and cannot
+    # tell a malformed index from a genuinely empty world.
+    assert "CAUSE:" in err and "ScannerError" in err, err
+    assert TREE_INDEX_BASENAME in err, err
+
+
+def test_degraded_payload_branch_is_currently_unreachable(tmp_path: Path) -> None:
+    """Pins the reachability gap itself, so making it reachable is a DELIBERATE act.
+
+    If a future change exempts a degraded export from the all-zero refusal (or lets the
+    non-tree stores project independently of the tree), this test fails and points the
+    author at ``test_malformed_index_refuses_to_write_and_names_the_cause`` — which will
+    then need to become the payload assertion g-368-54 originally asked for.
+
+    Asserted on the PRECONDITION, not by grepping the source: the branch is unreachable
+    because degradation implies all-zero counts AND non-empty evidence, and that is a
+    property of behaviour, not of text.
+    """
+    import knowledge_projection as K
+
+    world = _build_world(tmp_path)
+    (world / "knowledge" / "tree" / TREE_INDEX_BASENAME).write_bytes(b"- not a mapping\n")
+    status: dict[str, object] = {}
+    bundle = M.build_bundle(world, tmp_path, env={}, tree_status=status)
+
+    assert status.get("degraded") is True, "fixture must actually degrade"
+    assert not any(bundle.counts()[k] for k in K.KNOWLEDGE_COUNT_KEYS), (
+        "a degraded tree no longer zeroes every knowledge count — the refusal may no "
+        "longer pre-empt the payload, so the degraded key may now be REACHABLE"
+    )
+    assert M.world_store_evidence(world), (
+        "a degraded index no longer yields store evidence — the refusal may no longer "
+        "fire, so the degraded key may now be REACHABLE"
+    )
 
 
 def test_self_count_cannot_satisfy_the_broken_export_refusal(tmp_path: Path) -> None:

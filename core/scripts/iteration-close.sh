@@ -2524,7 +2524,7 @@ print(sha)
     # advisory-with-banner. Fail-open on every path — a probe error must never
     # affect goal closure.
     if [[ -n "${GOAL_ID:-}" ]]; then
-        local _landed_json _stranded_n
+        local _landed_json _stranded_n _benign_n _held_n _held_detail _unclassified
         _landed_json=$(python3 "$SCRIPT_DIR/completed-not-committed-sweep.py" \
             --goal "$GOAL_ID" --min-age-minutes 0 --no-fetch --output json \
             2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{}')
@@ -2558,6 +2558,35 @@ print(sha)
         # in this comment: the parity test strips comments precisely so a
         # documented-but-unread key cannot pass for a handled one.
         _benign_n=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('benign_squash_merged') or []))" 2>/dev/null || echo 0)
+        # FOURTH partition, g-115-7881. stranded_deploy_held was not referenced
+        # here at all, so work parked behind an ACTIVE deploy hold produced an
+        # advisory byte-identical to the one a genuinely clean queue produces —
+        # the same guard-1802 subset blindness this block already records being
+        # introduced, and fixed, twice before.
+        #
+        # IT IS BENIGN, AND THE PRODUCER SAYS SO TWICE: classify_stranded reads
+        # "held is True -> DECISIVE hold. Reclassify benign; never swallow a
+        # decisive signal into the flagged verdict", and the producer's own
+        # reporter prints "parked behind an ACTIVE deploy hold ... Not stranded
+        # — no Investigate filed". So it is NOTED with its holders and kept OUT
+        # of _stranded_n, exactly like benign_squash_merged. Summing it in would
+        # tell the closer to LAND work whose entire point is that merging it
+        # fires the deploy the hold exists to prevent — a false positive that
+        # actively instructs the harmful action.
+        #
+        # (The analysis deposited on this goal argued the opposite — union it in,
+        # since the advisory already sums the report-only stranded_no_pr. That
+        # conflates two axes: report-only means "do not FILE a goal"; benign
+        # means "nothing is wrong". stranded_no_pr is real-but-weak, deploy-held
+        # is not stranded at all.)
+        _held_n=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('stranded_deploy_held') or []))" 2>/dev/null || echo 0)
+        _held_detail=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print('; '.join('%s PR #%s held by %s' % (e.get('goal_id','?'), (e.get('pull_request') or {}).get('number'), ', '.join(e.get('deploy_holders') or []) or 'unnamed') for e in (d.get('stranded_deploy_held') or [])))" 2>/dev/null || echo '')
+        # DERIVED, not a hardcoded subset: cross-check the four keys classified
+        # above against the producer's own stranded_all_partitions list, so a
+        # FIFTH partition surfaces at runtime instead of silently dropping out.
+        # Empty when the producer predates that field — the coupling test stays
+        # the primary guarantee; this is defence in depth.
+        _unclassified=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); known={'stranded','stranded_no_pr','benign_squash_merged','stranded_deploy_held'}; print(','.join(k for k in (d.get('stranded_all_partitions') or []) if k not in known))" 2>/dev/null || echo '')
         _stranded_n=$(echo "$_landed_json" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('stranded') or []) + len(d.get('stranded_no_pr') or []))" 2>/dev/null || echo 0)
         if [[ "${_benign_n:-0}" != "0" ]]; then
             echo "[iteration-close] NOTE: ${GOAL_ID} has ${_benign_n} commit(s) that landed via squash-merge — off the default branch by sha, on it by content. Not stranded; no action needed (g-115-6060)." >&2
@@ -2573,6 +2602,13 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
     print('[iteration-close]   %s: %s (%s)' % (e.get('goal_id','?'), e.get('reason','?'), loc))
 " 2>/dev/null >&2 || true
             echo "[iteration-close]   Land it, or record why it is intentionally unlanded. Advisory only — closure is unaffected (guard-1548, g-115-3838)." >&2
+        fi
+        if [[ "${_held_n:-0}" != "0" ]]; then
+            echo "[iteration-close] NOTE: ${GOAL_ID} has ${_held_n} commit(s) on a pull request parked behind an ACTIVE deploy hold — parked, not stranded. Do NOT land it: merging would fire the deploy the hold exists to prevent (g-115-7881)." >&2
+            [[ -n "${_held_detail:-}" ]] && echo "[iteration-close]   ${_held_detail}" >&2
+        fi
+        if [[ -n "${_unclassified:-}" ]]; then
+            echo "[iteration-close] NOTE: completed-not-committed-sweep.py partitions stranded_all into key(s) this advisory does not classify: ${_unclassified}. Classify each as warn or benign in Step 8.79a — an unclassified partition is invisible here (guard-1802, g-115-7881)." >&2
         fi
     fi
 

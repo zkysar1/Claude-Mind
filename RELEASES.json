@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.18",
+    "previous_version": "2.12.17",
+    "date": "2026-08-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "store-write guard: the deny never names its bypass token; STORE_WRITE_GUARD_OVERRIDE is refused while any agent is RUNNING (measured: 6 of 42 firings on a downstream deployment became overrides within minutes of a deny that advertised it)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.17",
     "previous_version": "2.12.16",
     "date": "2026-08-29",

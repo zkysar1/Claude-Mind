@@ -616,7 +616,30 @@ def main(argv: list[str] | None = None) -> int:
     _counts = bundle.counts()
     if not any(_counts[k] for k in KNOWLEDGE_COUNT_KEYS):
         evidence = world_store_evidence(world)
-        if evidence:
+        # WHEN THE REFUSAL EARNS ITS KEEP, AND WHEN IT ONLY SILENCES (g-368-57).
+        # The refusal and the `degraded` marker below serve DIFFERENT consumers: the
+        # refusal protects the PUBLISHED artifact (knowledge-export.sh only ``mv``s on
+        # rc=0, so a non-zero rc leaves the last good bundle standing), while the marker
+        # tells a reader OF a hollow bundle why it is hollow. Refusing unconditionally
+        # made the marker unreachable — a malformed tree index zeroes every count (the
+        # non-tree stores are gated on the tree walk) and store-evidence counts that same
+        # index's bytes, so evidence was truthy on exactly the inputs that set `degraded`
+        # and this `return 2` fired ~30 lines above the emit, every time.
+        # So refuse on either of two conditions, and only those:
+        #   prior_exists — refusing PRESERVES a real previous bundle. Keep doing it; the
+        #                  stale `generated_at` on that surviving bundle is itself the
+        #                  staleness signal, and replacing good content with a hollow
+        #                  marker would trade one detector for another, not add one.
+        #   not degraded — we cannot say WHY it is hollow. That unexplained all-zero is
+        #                  the silent-corruption case the refusal was built for (17 envs)
+        #                  and it must keep refusing whether or not a prior bundle exists.
+        # The remaining cell — hollow, cause KNOWN, and nothing to preserve — is where
+        # refusing publishes NOTHING and the consumer cannot even tell an export was
+        # attempted. There a bundle that names its cause is strictly better than absence,
+        # so fall through and let the `degraded` emit below do its job. That is the only
+        # behaviour change: a hollow export with a known cause is not an unexplained one.
+        prior_exists = bool(out_path) and Path(out_path).exists()
+        if evidence and (prior_exists or not tree_status.get("degraded")):
             cause = (
                 f" CAUSE: {tree_status.get('error')} (at {tree_status.get('path')})."
                 if tree_status.get("degraded")

@@ -204,6 +204,25 @@ operational lane said `>= 2` and the null-key lane below existed only in
 the skill — the exact drift this digest exists to prevent):
 
 ```
+0. NORMALIZE ON READ (g-115-4021). An element may be a BARE STRING, not an
+   object. Every step below indexes sub-fields (debt.created, debt.node_key,
+   debt.reason, debt.priority, debt.sessions_deferred), and all of those miss
+   on a string — so such an entry can never auto-resolve, never age, never
+   reach the ceiling that retires it. It lives forever while BOTH sweeps
+   report success: the rb-5650 / guard-1802 looks-like-coverage-delivers-none
+   shape. Measured across three boxes: 1 string (cc-01 2026-07-30), 2 (cc-02
+   07-31), 4 of 14 (cc-05 08-08) — it grows, it is not a one-off slip.
+   Coerce before anything else:
+       IF isinstance(entry, str):
+           entry = {node_key: null, reason: entry, priority: "medium",
+                    created: null, sessions_deferred: 0}
+   It then flows the normal path: step 2's null-key lane can still mine a
+   goal id out of `reason`, and failing that it ages to the step-4 ceiling.
+   created:null must NOT auto-resolve at step 1 — a missing date is not a
+   node-update date, and treating it as one would resolve debt nobody paid.
+   Coercing on READ (rather than rewriting the stored element) is deliberate:
+   the sweep's RMW is lock-free between read and write-back, so the fewer
+   writes racing a concurrent wm-append, the better.
 1. AUTO-RESOLVE on node update: node.last_updated >= debt.created —
    date-only [:10] compare on BOTH sides (node stores date-only; >= not >
    so a same-day node edit counts) → resolution_method:
@@ -231,6 +250,22 @@ the skill — the exact drift this digest exists to prevent):
    knowledge_debt is NOT in item_stale_minutes, so wm-prune's
    array-item gate is unreachable for this slot — resolved entries
    otherwise live forever.
+6. DEDUP BY node_key ON WRITE-BACK (g-115-4021, measured cc-05 2026-08-08).
+   Exact-record dedup does NOT bound this slot and reads as clean while
+   failing: 10 of 14 entries there were FIVE node_keys each appearing TWICE,
+   identical except for embedded counters that only ever RISE
+   (retrieval_count 237/242, 230/236, 222/226, 211/216, 207/209;
+   total_stale_at_scan 838/837). A re-scanned node therefore never matches
+   its own earlier row and always appends a fresh one. An exact-string
+   comparison over the slot finds 0 duplicates — only a node_key-keyed one
+   surfaces them, which is why this half stayed invisible while the string
+   half was being investigated.
+   So when writing back, collapse non-null node_key duplicates to ONE entry:
+   keep the OLDEST (it carries the real `created` and the accumulated
+   sessions_deferred, so ageing is preserved) and take the HIGHEST counter
+   values seen. Never key on the whole record. Entries with node_key null
+   are NOT deduped — null is the designed majority shape (step 2) and
+   collapsing them would merge unrelated debts.
 ```
 
 RMW caveat: the sweep is wm-read → mutate → wm-set across separate calls;

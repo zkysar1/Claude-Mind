@@ -183,3 +183,68 @@ def test_main_still_publishes_an_honestly_empty_world(
     assert rc == 0, rc
     assert out.is_file()
     assert json.loads(out.read_text(encoding="utf-8")).get("counts") is not None
+
+
+def _plant_malformed_tree(world: Path) -> None:
+    """A tree index that EXISTS but cannot be parsed — the only input that sets
+    ``degraded``. Distinct from ``_plant_stores``' deliberately ABSENT index, which is
+    not a degrade at all: absent is an honestly-empty tree, unreadable is a broken one.
+    That distinction is what keeps the two refusal tests above untouched by g-368-57."""
+    tree = world / "knowledge" / "tree"
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / "_tree.yaml").write_text("{[ this: is: not: valid: yaml", encoding="utf-8")
+
+
+def test_known_cause_hollow_bundle_publishes_when_there_is_nothing_to_preserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cell that made ``degraded`` reachable at all ().
+
+    This is the CONVERSION of the precondition that pinned the emit as dead: it used to
+    be true that no input could reach the marker, because the refusal returned ~30 lines
+    above it on every input that set ``degraded``. That is now false by construction for
+    exactly one cell — hollow, cause KNOWN, and no prior bundle to preserve — and this
+    test is what makes the inversion visible in the diff rather than deleted from it.
+
+    Refusing HERE publishes nothing at all: with no previous bundle, rc=2 means the
+    consumer cannot tell an export was even attempted. A bundle that names its cause is
+    strictly better than absence, so this cell falls through and emits.
+    """
+    world = tmp_path / "world"
+    world.mkdir()
+    _plant_malformed_tree(world)
+    _plant_stores(world)
+
+    out = tmp_path / "bundle.json"
+    assert not out.exists(), "precondition: nothing to preserve"
+
+    rc = _run_main(monkeypatch, world, out)
+
+    assert rc == 0, rc
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "degraded" in payload, f"the marker must fire here; got keys {list(payload)}"
+    assert payload["degraded"][0].get("degraded") is True
+    assert payload["degraded"][0].get("error"), "a hollow bundle must NAME its cause"
+
+
+def test_known_cause_hollow_bundle_still_refuses_when_a_prior_bundle_would_be_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same degraded input as above, one difference: a previous bundle exists.
+
+    The pair is the whole design. Preserving real content outranks publishing a marker,
+    because the surviving bundle's stale ``generated_at`` is already a staleness signal —
+    so emitting here would trade one detector for another instead of adding one.
+    """
+    world = tmp_path / "world"
+    world.mkdir()
+    _plant_malformed_tree(world)
+    _plant_stores(world)
+
+    out = tmp_path / "bundle.json"
+    out.write_text('{"previous": "good"}', encoding="utf-8")
+
+    rc = _run_main(monkeypatch, world, out)
+
+    assert rc == 2, rc
+    assert json.loads(out.read_text(encoding="utf-8")) == {"previous": "good"}
