@@ -82,7 +82,7 @@ ALL_REDUCER_PROBES = {
     "worker-stall", "running-sid", "heartbeat", "stalled", "background-job",
     "stop-hook-block", "daemon-health", "clock-skew", "freshness",
     "mirror-wedge", "memory-headroom", "claim-heartbeat", "git-drift",
-    "infra-component",
+    "infra-component", "dependency-funnel",
 }
 
 # Excluded from workers because they read REDUCER-SHAPED STATE a worker
@@ -116,6 +116,17 @@ EXCLUDED_PEER_SIDE = {"worker-stall"}
 # always present. The cost of the exclusion is bounded and known: on a box
 # running only a worker, external components go unpolled until a reducer ticks.
 EXCLUDED_DUPLICATE_SUPPRESSED = {"infra-component"}
+
+# The FOURTH bucket. dependency-funnel reads the shared QUEUES (world + agent
+# aspirations), which a worker holds a copy of, so it is not reducer-shaped
+# state (bucket 1); it watches goals, not peer boxes (not bucket 2); and it
+# would not merely alert twice — it FILES and RETIRES goals, and two Bodies
+# racing that lease is a correctness problem, not a trust one (not bucket 3).
+# It is excluded because the queue has one owner: the reducer runs
+# iteration-close, which is the only caller of the tick, and files the goals
+# every Body then claims. A worker never reaches this tick at all; registering
+# the probe there would be coverage in appearance only (the  shape).
+EXCLUDED_QUEUE_OWNER = {"dependency-funnel"}
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +214,7 @@ def test_excluded_probes_are_accounted_for_by_reason(tmp_path):
     all_names = {p.name for p in wd.build_probes(_ctx("reducer", tmp_path))}
     excluded = all_names - set(wd.WORKER_SAFE_PROBES)
     buckets = (EXCLUDED_REDUCER_SHAPED, EXCLUDED_PEER_SIDE,
-               EXCLUDED_DUPLICATE_SUPPRESSED)
+               EXCLUDED_DUPLICATE_SUPPRESSED, EXCLUDED_QUEUE_OWNER)
     assert excluded == set().union(*buckets)
     # The buckets are genuinely disjoint — a probe excluded for two reasons
     # would mean one of the rationales is wrong about it.

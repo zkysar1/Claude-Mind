@@ -2402,6 +2402,35 @@ git_drift:
   ticks_to_revalidate: 50
 
 # ------------------------------------------------------------------
+# Dependency-funnel detection (agent-watchdog DependencyFunnelProbe)
+# ------------------------------------------------------------------
+# A fleet of N Bodies is at most as parallel as its CLAIMABLE FRONTIER is
+# wide: pending goals whose every blocked_by dependency is satisfied. Measured
+# 2026-08-29 on a live 8-Body deployment: 15 pending goals, frontier 0, all
+# gated on ONE in-progress goal — five Bodies closed for lack of work while one
+# wrote the gate's module. The consumers needed the module's INTERFACE (names
+# already on disk), not its completion. The probe fires on frontier 0, files
+# one Investigate goal into the root's aspiration prescribing the relaxation,
+# and retires it when the frontier reopens. Read by _dependency_funnel_config();
+# `bash core/scripts/frontier-check.sh` prints the same census.
+dependency_funnel:
+  # Pending goals that must be gated before frontier 0 is a FUNNEL rather than
+  # a queue that is simply nearly empty (two goals waiting on one is the normal
+  # tail of an aspiration). 3 is the smallest population where a Body beyond
+  # the gate is idling on plan structure rather than on genuine scarcity.
+  min_gated: 3
+  # Consecutive reducer ticks at frontier 0 before filing. 1: the retire path
+  # makes a false start cheap (the goal closes itself the tick the frontier
+  # reopens), while every extra tick is an iteration of idle Bodies.
+  ticks_to_file: 1
+  # Re-file cadence while a funnel persists after the covering goal was closed
+  # or never landed — the same latch-release GitDriftProbe carries.
+  ticks_to_revalidate: 50
+  # How far back a Body's closed manifest counts as "closed recently" in the
+  # payload's body census (context for the reader, not a trigger input).
+  lookback_hours: 6
+
+# ------------------------------------------------------------------
 # Infra-health failing-streak alerting ( — asp-249)
 # ------------------------------------------------------------------
 # When infra-health.py records repeated probe failures for the same component,
