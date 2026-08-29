@@ -79,9 +79,9 @@ sentinel/cadence/always-run battery rows are dispatched by their battery, not
 standalone scripts. The always-run rows also name a standalone fallback — those
 scripts DO exist independently and are what a blind battery falls back to; the
 column half is not a duplicate. Phase bodies below remain the authority on flags (--apply forms);
-this column mirrors them. rc convention: several sweeps exit 1 to signal
-ACTIONABLE FINDINGS (measured: precheck-eval run-all exits 1 whenever any
-sub-eval flags), so a non-zero rc is a read-the-output signal, not an error.
+this column mirrors them. rc convention: rc=1 is AMBIGUOUS. precheck-eval
+run-all exits 1 on ACTIONABLE FINDINGS; l1-skew-check --cadence exits 1 with
+ZERO output as a documented silent noop. Judge by OUTPUT, not rc alone.
 Every invocation below was run 2026-08-14 with rc recorded (report forms).
 
 **always-run** and **medium** rows are DISPATCHED by `iteration-open.sh`; their

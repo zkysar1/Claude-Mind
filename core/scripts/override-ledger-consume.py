@@ -121,6 +121,18 @@ def _load_ledger(path: Path, since: datetime):
         except Exception:
             skipped += 1
             continue
+        # A line can PARSE and still not be a record: a bare int/list/str is
+        # valid JSON, so json.loads does not raise and the next .get() dies with
+        # AttributeError, taking the whole consumer down over one bad row.
+        # Measured 2026-08-29: meta/gate-firings-2026-08-19.jsonl line 1 is `7`
+        # (1 bad row in 242,740) and it hard-crashed this script, and with it
+        # 's weekly sweep. guard-5469 is the write-side twin (a list
+        # passed to locked_append_jsonl crashed the fleet merge the same way);
+        # this is the read-side defence, because a governed append-only store
+        # must never be one malformed row away from breaking its readers.
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             skipped += 1
@@ -154,6 +166,10 @@ def _load_firings_override_counts(path: Path, since: datetime):
         try:
             rec = json.loads(line)
         except Exception:
+            continue
+        # Parsed-but-not-a-record: see the note in _load_ledger. This is the
+        # site that actually crashed (line 158) on the `7` in the 08-19 segment.
+        if not isinstance(rec, dict):
             continue
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):

@@ -132,6 +132,51 @@ PathLike = Union[str, os.PathLike]
 # overturn a measurement whose event is a periodic retention sweep. Its cost
 # case has also decayed: the goal cites 15.6% of GET egress from 2026-08-09
 # when the object was ~40 MB, and head-object now reads 3.82 MB.
+# g-115-7153 added the thermal store, the single biggest range-tail win on the
+# bill: 7.411 GB/24h of version bytes across 686 versions, which is MORE than the
+# entire pre-existing allowlist combined (5.59 GB/24h). It was missing for the
+# reason guard-1969 names — a hand-maintained enumeration ages behind its
+# population — not because anyone assessed and excluded it: it simply POSTDATES
+# the class table.
+#
+# EVIDENCE IS THE DIRECT BYTE-PREFIX TEST, not the size-monotonicity proxy the
+# three entries above rest on. Measured 2026-08-29 (alpha, cc-07) with
+# s3:GetObjectVersion + Range: the OLDEST retained version (2,289 B,
+# 2026-08-14T15:30:15Z) is an EXACT byte-prefix of the NEWEST (29,705,405 B,
+# 2026-08-29T07:51:15Z) — md5 1810fe91630177a9e17410d4c1cc99dd on both sides —
+# across 9,879 retained versions spanning 15 days with ZERO shrink events. That
+# is a strictly stronger proof than the 40-version window above, and it closes
+# the honest gap that window left ("40 versions need not span a retention sweep").
+#
+# NOTE for anyone re-deriving this: the goal recorded the reporting box as DENIED
+# version-level object reads, which is why it could only offer size-monotonicity.
+# That is FALSE on cc-07 as of 2026-08-29 — get-object --version-id --range
+# returns rc=0. Probe the capability before assuming the proxy is all you have.
+#
+# world/script-evolution.jsonl is TESTED AND EXCLUDED — do not re-derive it.
+# It is the cautionary case that justifies insisting on the direct test: ZERO
+# shrink events across 3,496 versions / 15 days (so it PASSES size-monotonicity
+# and looks exactly like the thermal store), yet the prefix test FAILS. Oldest
+# version 9,534,318 B vs the newest's first 9,534,318 B: md5 e3e845d0… vs
+# 0852774e…, 83,826 differing bytes. First divergence at 99.08% of the file, and
+# the content names the cause — records are edited IN PLACE as
+# "status": "awaiting_completion" -> "expired" with expired_at/expired_by ADDED
+# to the existing object. An in-place edit that only ADDS fields grows the file
+# monotonically, so it mimics an append-only store perfectly under the size proxy
+# while being a lifecycle store. Correctness would still have held here (the md5
+# equality below is exact either way); what it would have cost is a wasted range
+# GET before the full GET on most pulls, since the rewritten region is the tail.
+#
+# The retrieval trace (2.995 GB/24h) is deliberately NOT considered here: it was
+# already classified CLASS B by a prior DIRECT byte-prefix pass, and where that
+# instrument disagrees with a size-monotonicity reading, it wins.
+#
+# MEASURED SAVING (cc-07, 2026-08-29, direct list-object-versions): thermal
+# wrote 606 versions / 17.282 GB of version bytes in 24h while the content
+# actually appended was 2.322 MB -- 7,443x. This EXCEEDS the 7.4 GB/24h in
+# the goal headline because each write costs the FULL current size and the
+# object grows monotonically, so the saving GROWS with the file. Zero shrink
+# events across all 9,885 listed versions. Changes TRANSFER, not retention.
 _RANGE_TAIL_STORES = (
     "world/board/",
     "world/changelog.jsonl",
@@ -139,6 +184,7 @@ _RANGE_TAIL_STORES = (
     "world/productivity-snapshots.jsonl",
     "world/goal-duplication-overrides.jsonl",
     "meta/trigger-firings.jsonl",
+    "world/telemetry/zakpod1-thermal.jsonl",
 )
 
 # S3/DDB error codes that mean "object/item absent" across boto3 surfaces.

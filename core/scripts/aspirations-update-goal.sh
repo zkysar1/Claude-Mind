@@ -166,6 +166,19 @@ if [ -z "$GOAL_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
     exit 1
 fi
 
+# --source takes a STORE name, and the daemon reads it as "agent or not-agent"
+# (aspirations_write.py: `if source == "agent" … else world`) — so any other
+# token silently becomes a world lookup. Measured 2026-08-29 (coach reducer):
+# `--source aspirations-execute` (a skill name) → `goal_not_found … (world)`
+# three times over, an error that named the wrong cause. Refuse here, name the
+# two values, exit 2 like the unknown-flag arm.
+case "$SOURCE_VAL" in
+    world|agent) ;;
+    *)
+        echo "Error: --source takes 'world' or 'agent' (the store the goal lives in), got '${SOURCE_VAL}'." >&2
+        exit 2;;
+esac
+
 # --- Daemon path ---------------------------------------------------------
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"

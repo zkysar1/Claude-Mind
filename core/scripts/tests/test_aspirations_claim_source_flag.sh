@@ -19,6 +19,32 @@
 # Grep the trace for `QUERY=id=<id>&agent=<agent>` and assert the
 # agent portion is the expected value (not 'world').
 #
+# THAT PREMISE HAS ONE EXCEPTION, and it is why this file went red
+# (). Scorer Sovereignty Layer B () added a gate
+# that runs BEFORE QUERY is assembled: aspirations-claim.sh calls
+# scorer-verdict-gate.py and `exit 2`s when the agent has a FRESH
+# scorer verdict (<10 min) whose top pick is not the claimed id. A
+# fake goal id can never BE the top pick, so whenever the probe agent
+# has recently run the selector the wrapper dies before QUERY exists.
+# The gate is correct; the probe was coupled to live state.
+#
+# Measured 2026-08-29 (bravo, cc-05), both directions, same wrapper:
+#   fresh verdict, other top pick -> 0 QUERY lines in an 8,155-byte
+#                                    trace, `scorer-sovereignty` deny,
+#                                    GATE_RC=2, exit 2
+#   stale verdict                 -> 3 QUERY lines, 33,188-byte trace
+# So extract_query() now passes --verdict-file at a deliberately STALE
+# fixture (below), taking the gate's documented fail-open branch. This
+# does NOT loosen the gate for production — --verdict-file exists for
+# exactly this ("explicit verdict path (tests)", scorer-verdict-gate.py)
+# and is already accepted by aspirations-claim.sh.
+#
+# It also explains why this red was intermittent and un-chaseable: the
+# coupling is to whether THE PROBE'S HARDCODED AGENT (zeta, below) ran
+# the selector in the last 10 minutes on the reading box — not the
+# agent running the suite. One box read 111/111 at 15:41 and 109/111 at
+# 22:49 with no code change between, and a solo re-run 'fixed' it.
+#
 # Run: bash core/scripts/tests/test_aspirations_claim_source_flag.sh
 
 set -euo pipefail
@@ -39,16 +65,43 @@ fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 # Capture the QUERY string by tracing the wrapper. The fake goal id ensures
 # the daemon will return goal_not_found regardless of what's claimed, so the
 # wrapper never mutates real state.
+# A deliberately STALE scorer verdict, so scorer-verdict-gate.py takes its
+# documented fail-open branch ("stale or unparseable -> fail-open") on every
+# probe. Without this the gate's verdict — and therefore whether this file
+# passes — depends on when the probe agent last ran the selector. Written once
+# per run, removed on exit.
+VERDICT_FIXTURE="$(mktemp -t claim-source-verdict.XXXXXX)"
+trap 'rm -f "$VERDICT_FIXTURE"' EXIT
+printf '{"top_goal_id":"g-fixture-not-a-real-goal","ts":"2000-01-01T00:00:00"}\n' \
+  > "$VERDICT_FIXTURE"
+
 extract_query() {
   local args=("$@")
-  local trace
+  local trace query
   # bash -x writes to stderr; redirect 2>&1 so we can grep both streams.
-  trace=$(MIND_AGENT=zeta bash -x "$WRAPPER" "${args[@]}" 2>&1 || true)
+  trace=$(MIND_AGENT=zeta bash -x "$WRAPPER" "${args[@]}" \
+            --verdict-file "$VERDICT_FIXTURE" 2>&1 || true)
   # The wrapper sets QUERY="id=...&agent=..." on a single line. Match a `+`
   # trace line so we don't accidentally pick up the daemon's own response.
   # bash -x quotes the value with single-quotes if it contains shell-special
   # characters (& is special); strip the outer quotes for clean comparison.
-  printf '%s\n' "$trace" | grep -E '^\+ QUERY=' | tail -1 | sed "s/^+ QUERY=//; s/^'//; s/'$//"
+  #
+  # `|| true` on the grep is LOAD-BEARING, and its absence is the whole
+  # reported symptom of : under `set -euo pipefail` a grep that
+  # matches nothing fails the pipeline and kills this script instantly — no
+  # PASS, no FAIL, no message, just a header line and rc=1. A test that can
+  # die without saying anything is a detector that reports clean forever. Any
+  # future short-circuit before QUERY assembly must now surface as a LOUD,
+  # nameable failure instead.
+  query=$(printf '%s\n' "$trace" | { grep -E '^\+ QUERY=' || true; } \
+            | tail -1 | sed "s/^+ QUERY=//; s/^'//; s/'$//")
+  if [[ -z "$query" ]]; then
+    echo "  FAIL: wrapper produced NO QUERY line for args: ${args[*]}" >&2
+    echo "        It short-circuited before QUERY assembly. Last 5 trace lines:" >&2
+    printf '%s\n' "$trace" | tail -5 | sed 's/^/          /' >&2
+    return 0   # emit empty on stdout; the caller's assertion reports the FAIL
+  fi
+  printf '%s\n' "$query"
 }
 
 # The wrapper appends `&sid=<MIND_SID>` when a session id is present — ADDITIVE,

@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import fnmatch
 from datetime import datetime
 from pathlib import Path
 
@@ -34,6 +35,7 @@ PROJECT_ROOT = _HERE.parent.parent
 sys.path.insert(0, str(_HERE))
 from _paths import agent_dir as _agent_dir, agents_root as _agents_root, WORLD_DIR  # noqa: E402
 from _fileops import acquire_lock, release_lock  # noqa: E402
+from _runtime_bash import bash_cmd  # noqa: E402
 
 # Mind framework areas (relative to PROJECT_ROOT)
 #
@@ -187,6 +189,61 @@ MIND_DAEMON_SUITE_CMD = (
 )
 
 
+DAEMON_SURFACE_SCRIPT = "core/scripts/mind-api-code-changed.sh"
+
+
+def _daemon_surface_pathspec() -> tuple[list[str], str]:
+    """The daemon-code boundary, SOURCED from its single source of truth.
+
+    Returns (entries, why_unreadable). Exactly one is truthy. The list is NOT
+    duplicated here: mind-api-code-changed.sh's own header declares that
+    pathspec "IS the daemon-code boundary and the single source of truth for
+    it", and re-listing it is what this function exists to avoid (g-115-3587).
+
+    stdout is captured ALONE -- stderr must not be folded into a payload
+    another program parses (guard-1963).
+    """
+    try:
+        proc = subprocess.run(
+            bash_cmd(DAEMON_SURFACE_SCRIPT, "--print-pathspec"),
+            capture_output=True, text=True, timeout=20,
+        )
+    except Exception as exc:  # noqa: BLE001 - advisory tool, never raise
+        return [], f"daemon surface unreadable: {type(exc).__name__}"
+    if proc.returncode != 0:
+        return [], f"daemon surface unreadable: {DAEMON_SURFACE_SCRIPT} rc={proc.returncode}"
+    entries = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    if not entries:
+        # An empty list would silently disable the advisory forever, which is
+        # the failure mode this whole goal is about. Treat it as unreadable.
+        return [], f"daemon surface unreadable: {DAEMON_SURFACE_SCRIPT} printed 0 entries"
+    return entries, ""
+
+
+def _daemon_surface_hits(paths: list[str]) -> tuple[list[str], str]:
+    """Which changed paths fall inside the daemon's import surface.
+
+    Returns (hits, why_warn_anyway). When the surface cannot be read we return
+    a reason instead of silently falling back to a narrower literal -- a silent
+    fallback to a stale source is exactly what communication-clarity rule 5
+    forbids, and mind-api-code-changed.sh itself fails TOWARD restart.
+    """
+    entries, why = _daemon_surface_pathspec()
+    if why:
+        return [], why
+    hits = []
+    for p in paths:
+        for e in entries:
+            if "*" in e:
+                if fnmatch.fnmatch(p, e):
+                    hits.append(p)
+                    break
+            elif p == e or p.startswith(e + "/"):
+                hits.append(p)
+                break
+    return hits, ""
+
+
 def _mind_recommendations(buckets: dict) -> list[str]:
     """Build the recommendation list from Mind buckets."""
     recs: list[str] = []
@@ -216,6 +273,33 @@ def _mind_recommendations(buckets: dict) -> list[str]:
         recs.append("[manual] Re-read .claude/rules/*.md and confirm wording matches intent (no automated check)")
     if buckets["config"]:
         recs.append("[manual] Re-parse touched config via affected consumer scripts; YAML lint if applicable")
+    # : the long-lived daemon serves the modules it imported at ITS
+    # STARTUP (guard-4804, guard-3373), so an uncommitted daemon-surface edit is
+    # live on disk and stale in the daemon. pytest imports fresh from disk and
+    # goes green while an end-to-end check through a daemon-routed wrapper
+    # silently exercises the OLD module.
+    #
+    # The surface is SOURCED, never re-listed. MIND_DAEMON_PY_PREFIX above is
+    # `mind_api/src/` and covers ONE of the boundary's 19 entries; the other 18
+    # are core/scripts modules the daemon imports (aspirations.py, retrieve.py,
+    # storage_backend.py, gates/, _*.py, ...). Keying this advisory on that
+    # prefix left an edit to any of them silently un-warned -- the exact drift
+    # mind-api-code-changed.sh's own header forbids ("do NOT inline this list").
+    #
+    # No mtime comparison: these paths are uncommitted-or-staged BY CONSTRUCTION
+    # (_git_changed_paths diffs against HEAD), which is content evidence.
+    # Ordering the edit against daemon start would add an mtime dependency
+    # (guard-1504, rb-190) to warn one case less.
+    changed = [p for v in buckets.values() for p in v]
+    hits, why = _daemon_surface_hits(changed)
+    if hits or why:
+        detail = ", ".join(sorted(hits)[:3]) if hits else why
+        recs.append(
+            "bash core/scripts/mind-api-start.sh --restart"
+            "   # daemon serves code from ITS startup -- restart before"
+            " trusting any end-to-end result through a daemon-routed wrapper"
+            f" [{detail}]"
+        )
     return recs
 
 
@@ -429,8 +513,19 @@ def _emit_skip_banner(goal_id: str, info: dict) -> None:
 
 
 # --- Entrypoint -------------------------------------------------------------
+USAGE = (
+    "usage: full-suite-recommender.py [GOAL_ID] [--outcome-class deep|routine]\n"
+    "  GOAL_ID is POSITIONAL, not an env var -- `GOAL_ID=x ...` leaves it unset\n"
+    "  and every line below prints goal=? (g-115-3587)."
+)
+
+
 def main() -> int:
     # Args: [goal_id] [--outcome-class deep|routine|...]
+    # goal_id is POSITIONAL. A GOAL_ID env var is NOT read ().
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(USAGE)
+        return 0
     goal_id = "?"
     outcome_class = "deep"  # default — gate is most useful for deep closures
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
@@ -459,7 +554,16 @@ def main() -> int:
     # Emit banner if anything detected; otherwise quiet skip
     any_changes = sum(len(v) for v in mind_buckets.values()) > 0 or len(product_results) > 0
     if not any_changes:
-        print(f"[full-suite-recommender] no code changes detected (goal={goal_id}); skipping banner")
+        #  (foxtrot addendum): this scan sees only what git sees, and
+        # .gitignore excludes /.mind-data/ -- so world/ and meta/ edits are
+        # STRUCTURALLY INVISIBLE here. Say so, or the line reads as an all-clear
+        # and an agent closes a domain-script goal having run nothing (guard-3097).
+        print(
+            f"[full-suite-recommender] no GIT-VISIBLE code changes (goal={goal_id}); "
+            "world/ and meta/ are gitignored and were NOT scanned, so this is not an "
+            "all-clear -- if this goal edited domain scripts under world/, run the "
+            "domain suite yourself (STORAGE_BACKEND=local per guard-955); skipping banner"
+        )
         return 0
 
     # Cross-session pytest-suite mutex. Acquire only when we'd actually emit

@@ -318,16 +318,36 @@ _PREFIX = {
 }
 
 
-def make_revision_id(file_kind, commit_ts_iso, agent, sha):
+def make_revision_id(file_kind, commit_ts_iso, agent, sha, file_path=None):
     """Build a deterministic revision_id for a git-sweep entry.
 
-    Format: <prefix>-<YYYYMMDDTHHMMSS>-<agent>-<sha[:4]>
-    Same shape as runtime IDs from evolution-record.py — the chain reads uniformly.
+    Format: <prefix>-<YYYYMMDDTHHMMSS>-<agent>-<sha[:4]>-<fp[:4]>
+    Same shape as runtime IDs from evolution-record.py plus one trailing
+    file-path segment — the chain reads uniformly and the id stays opaque
+    (nothing in the tree parses it structurally; verified g-115-4429).
+
+    The file segment is REQUIRED for correctness, not cosmetic. Without it any
+    two files of the SAME KIND touched by ONE commit produce a byte-identical
+    id, and coordination_merge.merge_evolution_stream keys records by
+    revision_id — so a cross-box merge collapses the whole family to one row
+    and silently destroys the rest. Measured 2026-08-29 (g-115-4429):
+    rule-evolution.jsonl fell 634,133 -> 489,612 bytes between 2026-08-20 and
+    2026-08-24, and rule-20260510T015221-framework-2c51 went from four rows
+    (code-review-protocol, stop-hook-compliance, user-interaction,
+    path-resolution) to one.
+
+    Still DETERMINISTIC, which is what idempotency rests on (L33): the same
+    (commit, file) always yields the same id. Re-runs continue to skip.
+    file_path=None preserves the pre-fix id for any caller that has no path.
     """
     # Parse 2026-04-22T13:30:22+00:00 → 20260422T133022
     ts_compact = re.sub(r"[-:]", "", commit_ts_iso.split("+")[0].replace("Z", ""))[:15]
     prefix = _PREFIX[file_kind]
-    return f"{prefix}-{ts_compact}-{agent}-{sha[:4]}"
+    base = f"{prefix}-{ts_compact}-{agent}-{sha[:4]}"
+    if file_path is None:
+        return base
+    fp = hashlib.sha1(file_path.encode("utf-8")).hexdigest()[:4]
+    return f"{base}-{fp}"
 
 
 def commit_ts_to_entry_ts(commit_ts_iso):
@@ -467,7 +487,7 @@ def build_entry(commit, rel_path, file_kind, key, parent_sha, before_blob, after
         if m:
             diff_excerpt = diff_text[m.start():m.start() + 500]
 
-    revision_id = make_revision_id(file_kind, commit["ts"], agent, commit["hash"])
+    revision_id = make_revision_id(file_kind, commit["ts"], agent, commit["hash"], rel_path)
     entry_ts = commit_ts_to_entry_ts(commit["ts"])
     sha8 = commit["hash"][:8]
 
@@ -565,7 +585,7 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
         prev_rid_for_this_file = None
         for commit, key in commit_list:
             agent = derive_agent(commit, file_kind, key)
-            revision_id = make_revision_id(file_kind, commit["ts"], agent, commit["hash"])
+            revision_id = make_revision_id(file_kind, commit["ts"], agent, commit["hash"], rel_path)
 
             if revision_id in existing_ids:
                 if verbose:
