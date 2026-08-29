@@ -108,9 +108,7 @@ Preconditions (all must hold, else fail loud — do NOT change any state):
    append the JSON audit record with the race-safe locked append below:
 
    ```bash
-   AGENT_NAME="<agent-name>" \
-   HELPER_JSON='<full stdout JSON from runner-dead-check.sh>' \
-   py -3 -c "
+   AGENT_NAME="<agent-name>" HELPER_JSON='<full stdout JSON from runner-dead-check.sh>' py -3 -c "
    import json, os, sys, datetime
    sys.path.insert(0, 'core/scripts')
    from _fileops import locked_append_jsonl
