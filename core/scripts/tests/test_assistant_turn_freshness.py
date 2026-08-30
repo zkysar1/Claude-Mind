@@ -309,3 +309,103 @@ def test_default_transcripts_dir_dashifies_project_root():
     d = atf.default_transcripts_dir(Path("/opt/ayoai-mind"))
     assert d.name == "-opt-ayoai-mind"
     assert d.parent == Path(os.path.expanduser("~/.claude/projects"))
+
+
+# --- zakcode runner: a different transcript store on THIS box (2026-08-30) ------
+# Measured on coach@zc-03: the reducer's running-session-id IS its zakcode session id,
+# the Claude Code transcript is absent by construction, the probe said no_transcript,
+# and Path D recovered a live reducer (heartbeat fresh, mid-select) to IDLE.
+
+ZSID = "ed651c6e2b6f4d428a962269ce5fee63"
+
+
+def _zmsg(role, created_at):
+    return {"role": role, "created_at": created_at, "blocks": [{"type": "text", "text": "x"}]}
+
+
+def _mkzakcode(tmp_path, messages, sid=ZSID, home="zakcode-home"):
+    zh = tmp_path / home
+    (zh / "sessions").mkdir(parents=True)
+    (zh / "sessions" / ("%s.json" % sid)).write_text(
+        json.dumps({"id": sid, "build": "bbd620e67969", "messages": messages}), encoding="utf-8")
+    return zh
+
+
+def _zcheck(tmp_path, messages, now=NOW, threshold=60.0, sid=ZSID):
+    ad = _mkagent(tmp_path, sid=sid)
+    td = tmp_path / "projects" / "-opt-ayoai-mind"   # no Claude Code transcript here
+    td.mkdir(parents=True)
+    zh = _mkzakcode(tmp_path, messages, sid=sid) if messages is not None else tmp_path / "no-zakcode"
+    return atf.check(agent_dir=ad, transcripts_dir=td, now=now, threshold=threshold,
+                     zakcode_home=str(zh))
+
+
+def test_zakcode_recent_assistant_message_suppresses(tmp_path):
+    """The incident's shape: no Claude Code transcript, a live zakcode session."""
+    v, rc = _zcheck(tmp_path, [_zmsg("user", "2026-08-15T11:50:00+00:00"),
+                               _zmsg("assistant", "2026-08-15T11:57:00.123456+00:00"),
+                               _zmsg("tool", "2026-08-15T11:58:00+00:00")])
+    assert rc == 0 and v["suppress"] is True
+    assert v["verdict"] == "recent_assistant_turn"
+    assert v["transcript_kind"] == "zakcode" and v["transcript"].endswith("%s.json" % ZSID)
+    assert v["age_minutes"] == pytest.approx(3.0, abs=0.01)
+
+
+def test_zakcode_old_assistant_message_does_not_suppress(tmp_path):
+    v, rc = _zcheck(tmp_path, [_zmsg("assistant", "2026-08-15T10:00:00+00:00"),
+                               _zmsg("tool", "2026-08-15T11:59:00+00:00")])  # tool rows are not turns
+    assert rc == 1 and v["suppress"] is False
+    assert v["verdict"] == "no_recent_assistant_turn"
+    assert v["age_minutes"] == pytest.approx(120.0)
+
+
+def test_zakcode_newest_wins_regardless_of_order_and_future_rows_ignored(tmp_path):
+    v, rc = _zcheck(tmp_path, [_zmsg("assistant", "2026-08-15T11:58:00+00:00"),
+                               _zmsg("assistant", "2026-08-15T09:00:00+00:00"),
+                               _zmsg("assistant", "2026-08-15T13:00:00+00:00")])
+    assert rc == 0 and v["age_minutes"] == pytest.approx(2.0)
+
+
+def test_zakcode_doc_without_assistant_rows_does_not_suppress(tmp_path):
+    v, rc = _zcheck(tmp_path, [_zmsg("user", "2026-08-15T11:59:00+00:00")])
+    assert rc == 1 and v["verdict"] == "no_assistant_turn_in_tail"
+
+
+def test_zakcode_unreadable_doc_suppresses_like_an_unreadable_transcript(tmp_path):
+    ad = _mkagent(tmp_path, sid=ZSID)
+    td = tmp_path / "projects" / "-opt-ayoai-mind"
+    td.mkdir(parents=True)
+    zh = tmp_path / "zakcode-home"
+    (zh / "sessions").mkdir(parents=True)
+    (zh / "sessions" / ("%s.json" % ZSID)).write_text("{not json", encoding="utf-8")
+    v, rc = atf.check(agent_dir=ad, transcripts_dir=td, now=NOW, zakcode_home=str(zh))
+    assert rc == 2 and v["verdict"] == "unreadable"
+
+
+def test_no_transcript_in_either_store_still_does_not_suppress(tmp_path):
+    """The off-box case survives the fallback: absence in BOTH stores is still absence."""
+    v, rc = _zcheck(tmp_path, None)
+    assert rc == 1 and v["suppress"] is False and v["verdict"] == "no_transcript"
+
+
+def test_claude_code_transcript_wins_over_a_zakcode_doc(tmp_path):
+    ad = _mkagent(tmp_path, sid=ZSID)
+    td = _mktranscript(tmp_path, [_row("assistant", "2026-08-15T11:55:00.000Z")], sid=ZSID)
+    zh = _mkzakcode(tmp_path, [_zmsg("assistant", "2026-08-15T09:00:00+00:00")])
+    v, rc = atf.check(agent_dir=ad, transcripts_dir=td, now=NOW, zakcode_home=str(zh))
+    assert rc == 0 and "transcript_kind" not in v
+
+
+def test_zakcode_home_resolution_order(tmp_path, monkeypatch):
+    """$ZAKCODE_HOME, then ~/.zakcode, then <project>/.zakcode — the served-workspace store."""
+    monkeypatch.delenv("ZAKCODE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert atf.zakcode_session_doc(ZSID, tmp_path / "proj") is None
+    served = tmp_path / "proj" / ".zakcode" / "sessions"
+    served.mkdir(parents=True)
+    (served / ("%s.json" % ZSID)).write_text("{}", encoding="utf-8")
+    assert atf.zakcode_session_doc(ZSID, tmp_path / "proj") == served / ("%s.json" % ZSID)
+    monkeypatch.setenv("ZAKCODE_HOME", str(tmp_path / "etc-zakcode"))
+    (tmp_path / "etc-zakcode" / "sessions").mkdir(parents=True)
+    (tmp_path / "etc-zakcode" / "sessions" / ("%s.json" % ZSID)).write_text("{}", encoding="utf-8")
+    assert atf.zakcode_session_doc(ZSID, tmp_path / "proj").parent.parent == tmp_path / "etc-zakcode"

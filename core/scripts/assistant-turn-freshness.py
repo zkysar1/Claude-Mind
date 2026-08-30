@@ -4,7 +4,10 @@
 
 Reports whether the bound agent's runner session emitted an assistant turn
 recently, read from the Claude Code session transcript at
-``~/.claude/projects/<dashified-project-root>/<sid>.jsonl``.
+``~/.claude/projects/<dashified-project-root>/<sid>.jsonl`` — or, when that is
+absent and the runner is a zakcode session, from the zakcode session document
+``<zakcode-home>/sessions/<sid>.json`` (see ``zakcode_session_doc``; the sid is
+the same in both stores). Absence in BOTH is the off-box case below.
 
 WHY THIS SIGNAL AND NOT ANOTHER (evidence: board msg-20260814-154537-alpha-5088,
 investigation g-115-6242 -- do not re-derive). Path D has false-fired 5 times
@@ -138,6 +141,58 @@ def default_transcripts_dir(project_root):
     return Path(os.path.expanduser("~/.claude/projects")) / dashified
 
 
+def zakcode_session_doc(sid, project_root, zakcode_home=None):
+    """The zakcode session document for ``sid`` when the runner is a zakcode session, else None.
+
+    zakcode keeps ONE JSON document per session (not JSONL) under
+    ``$ZAKCODE_HOME/sessions`` (``~/.zakcode/sessions`` when unset) or, for a served
+    workspace, ``<workspace>/.zakcode/sessions`` (ADR-0032); its id IS the Mind's
+    ``running-session-id``. Measured 2026-08-30 on a zakcode box (coach@zc-03): the
+    Claude Code transcript is absent there BY CONSTRUCTION, so this probe said
+    ``no_transcript`` for a reducer that was mid-select with a fresh heartbeat, and
+    Path D recovered it to IDLE — the "absent is not liveness" rule, correct for a
+    runner on ANOTHER box, read a resident runner's different store as absence. The
+    zakcode document is the same kind of evidence the transcript is: independent of
+    the diary and of the heartbeat, written by the runner itself.
+    """
+    homes = []
+    override = (zakcode_home or os.environ.get("ZAKCODE_HOME", "")).strip()
+    if override:
+        homes.append(Path(override))
+    homes.append(Path(os.path.expanduser("~/.zakcode")))
+    homes.append(Path(project_root) / ".zakcode")
+    for home in homes:
+        doc = home / "sessions" / ("%s.json" % sid)
+        if doc.is_file():
+            return doc
+    return None
+
+
+def newest_assistant_timestamp_zakcode(doc_path, now):
+    """Newest CREDIBLE assistant-message ``created_at`` in a zakcode session document, or None.
+
+    The document is one JSON object (``messages[].role`` / ``created_at``), so it is
+    parsed whole — zakcode compacts it in place, which keeps it small (measured on the
+    box above: 100 KB–2 MB with eight sessions live). Credibility rules match the
+    transcript scan: non-dict rows skipped, unparseable or future-dated stamps ignored,
+    tz-aware stamps normalised by ``parse_naive_iso``. Raises on an unreadable file so
+    the caller's present-but-unreadable branch (rc=2, suppress) applies unchanged.
+    """
+    with open(doc_path, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    newest = None
+    messages = doc.get("messages") if isinstance(doc, dict) else None
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        ts = parse_naive_iso(m.get("created_at"))
+        if ts is None or ts > now:
+            continue
+        if newest is None or ts > newest:
+            newest = ts
+    return newest
+
+
 def newest_assistant_timestamp(transcript_path, now, tail_bytes=TAIL_BYTES):
     """Newest CREDIBLE assistant-turn timestamp in the tail, or None.
 
@@ -192,7 +247,7 @@ def newest_assistant_timestamp(transcript_path, now, tail_bytes=TAIL_BYTES):
     return None
 
 
-def check(agent_dir=None, transcripts_dir=None, now=None, threshold=None):
+def check(agent_dir=None, transcripts_dir=None, now=None, threshold=None, zakcode_home=None):
     """Return (verdict_dict, exit_code). Never raises."""
     agent_dir = Path(agent_dir) if agent_dir else Path(AGENT_DIR)
     now = now or datetime.now()
@@ -213,16 +268,24 @@ def check(agent_dir=None, transcripts_dir=None, now=None, threshold=None):
 
     tdir = Path(transcripts_dir) if transcripts_dir else default_transcripts_dir(PROJECT_ROOT)
     transcript = tdir / ("%s.jsonl" % sid)
+    reader = newest_assistant_timestamp
     if not transcript.is_file():
-        # The common cross-box case: this agent's runner is not on this machine.
-        # Absence is not liveness -- do NOT suppress (see module docstring).
-        out["verdict"] = "no_transcript"
-        out["transcript"] = str(transcript)
-        return out, 1
+        # A zakcode runner keeps its transcript in a different store on THIS box;
+        # only when that is absent too is the runner not here.
+        zdoc = zakcode_session_doc(sid, PROJECT_ROOT, zakcode_home)
+        if zdoc is None:
+            # The common cross-box case: this agent's runner is not on this machine.
+            # Absence is not liveness -- do NOT suppress (see module docstring).
+            out["verdict"] = "no_transcript"
+            out["transcript"] = str(transcript)
+            return out, 1
+        transcript = zdoc
+        reader = newest_assistant_timestamp_zakcode
+        out["transcript_kind"] = "zakcode"
     out["transcript"] = str(transcript)
 
     try:
-        ts = newest_assistant_timestamp(transcript, now)
+        ts = reader(transcript, now)
     except Exception as exc:
         # Present but unreadable -> guard-487 fail-closed-as-suppressed.
         out["verdict"] = "unreadable"
@@ -250,12 +313,15 @@ def main():
     ap.add_argument("--transcripts-dir", default=None, help="override projects dir (tests)")
     ap.add_argument("--now", default=None, help="override now, naive ISO (tests)")
     ap.add_argument("--threshold-minutes", default=None, type=float)
+    ap.add_argument("--zakcode-home", default=None,
+                    help="override $ZAKCODE_HOME for the zakcode session store (tests)")
     args = ap.parse_args()
     now = parse_naive_iso(args.now) if args.now else None
     try:
         verdict, rc = check(agent_dir=args.agent_dir,
                             transcripts_dir=args.transcripts_dir,
-                            now=now, threshold=args.threshold_minutes)
+                            now=now, threshold=args.threshold_minutes,
+                            zakcode_home=args.zakcode_home)
     except Exception as exc:   # belt-and-braces: this probe must never traceback
         verdict, rc = {"verdict": "unreadable", "suppress": False,
                        "error": "%s: %s" % (type(exc).__name__, exc)}, 2

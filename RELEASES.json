@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.41",
+    "previous_version": "2.12.40",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "recovery-gate assistant-turn probe reads the zakcode session document (false zombie recovery of a live zakcode reducer)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.40",
     "previous_version": "2.12.39",
     "date": "2026-08-30",
