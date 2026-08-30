@@ -7195,6 +7195,50 @@ Strengthened guard-3690 rather than filing a duplicate.
   Recency, not transferability, exactly as g-115-3853's title states.
 - **S4.5** silent-gap audit: 0 NEW, 2 dedup-suppressed, 0 rb-245-suppressed, 0 filed.
 
+### S4.6 — WHY this box's ratio jumped 8x: ONE peer supplies 91.7% of the ceiling
+
+Re-read 2026-08-29T23:2x (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r`
+6.18.33.2-microsoft-standard-WSL2, own-cloud, read-only). Confirms the 15:0x row
+above to three decimals — 0 candidates at BOTH thresholds, `ceiling_ratio`
+**0.067 (1849 of 27617)** vs 0.0671 (1847 of 27517) eight hours earlier — so the
+high-coverage regime is STABLE on this box, not a momentary artifact. That is the
+repeat-on-one-box discriminator this marker relies on, and it holds.
+
+**Its one addition is the mechanism the 15:0x row reported without explaining.**
+The `per_agent` map attributes the ceiling almost entirely to a single peer:
+
+| agent | diary span | in-span / total invocations |
+|---|---|---|
+| **alpha** | `08-05T18:05 .. 08-26T06:30` (**21 days**) | **1696** / 5381 |
+| bravo | `08-05T18:16 .. 08-06T02:12` (8h) | 43 / 5863 |
+| echo | `08-05T17:48 .. 08-06T02:09` (8h) | 46 / 5115 |
+| zeta | `08-05T17:35 .. 08-06T02:1x` (8h) | ~44 / ~5100 |
+| foxtrot (resident) | `08-29T13:57 .. 23:11` (9h) | 17 / 5196 |
+
+**1696 of 1849 classifiable = 91.7% is alpha alone.** So the 8x jump is not this
+box seeing the fleet better — it is ONE peer's diary having been pulled with a
+21-day span while the other three sit unchanged on the 08-05/08-06 batched seed.
+
+Two consequences. **(1) `ceiling_ratio` is not a fleet-coverage figure even
+box-locally — it is dominated by whichever single peer last got a wide pull.** A
+6.7% ratio that is 91.7% one agent tells you about alpha, not about the fleet, so
+a zero under it is NOT ~8x stronger evidence about the other four; for bravo/echo/
+zeta/foxtrot the coverage is still ~0.8%, squarely in the blind regime. The 15:0x
+row's "materially stronger evidence than a zero at 0.3%" is true of the aggregate
+and false per-peer — read the per-agent table before crediting the aggregate.
+**(2) The batched seed is now 24 DAYS unchanged on this box** (`08-05T17:35..18:16`
+starts, `08-06T02:09..02:13` ends — the same four timestamps this box recorded on
+08-17 at 10:4x and 16:1x, and again on 08-19). The earlier rows claimed stability
+"across hours" and then "across two calendar days"; it has now held 12x longer than
+the strongest prior claim. Peer slices on this box are effectively frozen, not
+refreshed opportunistically — which is what makes same-box repeats trustworthy and
+cross-box comparisons meaningless.
+
+S3 same run: **36.8% / 62.1% (30 `framework-*` labels) / 84.1%** at n=2206, 28
+active, 222 categories, full-store (GOAL COUNT 2854, `goals_omitted` 0/28).
+asp-115 1855, non-115 351. Flat against the 15:0x row (every axis within 0.2pp);
+verdicts unchanged, axis 2 the only fire. No mechanism added — one line per the
+folding practice. Nothing routed from any phase.
 ## 2026-08-29T22:5x — bravo, `hostname` cc-05, `uname -r` 6.8.0-137-generic (own-cloud)
 
 **S3, full corpus** (verified by GOAL COUNT 2860 and `goals_omitted` key-presence

@@ -365,6 +365,54 @@ def main():
                             f"Path Resolution\" section."
                         )
                         emit_deny(virtual_cruft_reason)
+            # Framework files are promotion-delivered on a deployment whose
+            # registry entry names a `framework_origin` (2026-08-30, coach@
+            # zc-03: a small-model Body wrote its step RESULTS into a SKILL.md
+            # under the step headings — the skill file as a worksheet; nothing
+            # refused it because framework paths are agent-editable on the dev
+            # origin and "downstream refuses dev work" was honor-system). The
+            # policy, the path set and the fail-open live in
+            # _framework_origin.py; pre-commit Gate 15 is the Bash backstop.
+            # A deployment without the field (every framework origin) never
+            # reaches emit_deny here.
+            if label == "PROJECT_ROOT":
+                fw_origin = None
+                try:
+                    from _framework_origin import (
+                        framework_origin as _fw_origin,
+                        is_framework_path as _is_fw_path,
+                        self_env_id as _self_env,
+                    )
+                    fw_rel = target[len(pr_norm) + 1:] if target.startswith(pr_norm + "/") else ""
+                    if fw_rel and _is_fw_path(fw_rel):
+                        fw_origin = _fw_origin(project_root)
+                except Exception:
+                    fw_origin = None
+                if fw_origin:
+                    fw_env = _self_env() or "this deployment"
+                    fw_world = paths.get("WORLD_PATH") or "$WORLD_PATH"
+                    emit_deny(
+                        f"Path-resolution hook (L1) blocked {tool_name} to:\n"
+                        f"  {file_path}\n"
+                        f"Framework files are READ-ONLY on this deployment: {fw_env} "
+                        f"takes core/, .claude/, mind_api/ and CLAUDE.md from "
+                        f"{fw_origin} through the promotion train "
+                        f"(`framework_origin: {fw_origin}` in "
+                        f"core/config/environments/{fw_env}.yaml), so nothing under "
+                        f"them is edited here — not even to record step results. A "
+                        f"SKILL.md is instructions, never a worksheet: progress and "
+                        f"results belong in update_plan / working memory "
+                        f"(wm-set.sh), not in the skill file.\n"
+                        f"Do this instead:\n"
+                        f"  - a framework defect or improvement -> bash "
+                        f"core/scripts/cross-world-inject-goal.sh --target {fw_origin} "
+                        f"--title \"Idea: ...\" --description \"...\" --reason \"...\" "
+                        f"--shared  (lands in the origin's queue; a person reviews it there)\n"
+                        f"  - domain code, conventions, forged skills -> the world "
+                        f"({fw_world}/scripts, {fw_world}/conventions), which IS writable here\n"
+                        f"  - a change already made with a shell command -> revert it: "
+                        f"git checkout HEAD -- <path>"
+                    )
             # Cruft prevention for PROJECT_ROOT new top-level entries
             # OUTSIDE the bound agent dir (plan v1 step 0.9, 2026-05-19).
             # The repo root should contain only the canonical entries

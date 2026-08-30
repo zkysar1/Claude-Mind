@@ -41,6 +41,17 @@
 # `claims` convention is live on the box). Single box, so one arbiter is exact.
 environment_id: coach-mind
 backend: local
+# framework_origin (OPTIONAL, 2026-08-30): the env-id this deployment takes its
+# framework FROM. When set, LOCAL writes to core/, .claude/, mind_api/ and
+# CLAUDE.md are refused — by the L1 path-resolution hook at write time and by
+# pre-commit Gate 15 at commit time (core/scripts/_framework_origin.py is the
+# policy; pull-promotion.md § g the convention). Framework arrives by the
+# promotion train; improvements go UP with cross-world-inject-goal.sh
+# --target <origin>. Absent = the deployment is itself a framework origin and
+# edits locally, git-audited (every other entry today — unchanged). Set here
+# because on 2026-08-30 a small-model Body wrote its step results INTO
+# .claude/skills/curriculum-gates/SKILL.md, treating the skill as a worksheet.
+framework_origin: ayoai-mind
 # known_agents (OPTIONAL, ): feeds the cross-deployment addressing
 # collision set -- a BARE requires_action_by:<name> present in both the local
 # roster and a peer's known_agents is ambiguous and FAILS LOUD in

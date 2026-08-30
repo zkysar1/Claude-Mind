@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.38",
+    "previous_version": "2.12.37",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "framework_origin: a downstream deployment refuses LOCAL framework writes — registry field, L1 path-resolution deny with routing, pre-commit Gate 15 backstop, seed-transplant override; coach-mind opts in (a small-model Body wrote its step results into a SKILL.md)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.37",
     "previous_version": "2.12.36",
     "date": "2026-08-30",
