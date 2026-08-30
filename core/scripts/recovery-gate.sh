@@ -645,7 +645,10 @@ _check_hung_autocompact() {
 #     coupling that whole invariant rests on.
 #   - the assistant-turn liveness veto () suppresses when the runner
 #     session emitted an assistant turn within assistant_turn_fresh_minutes,
-#     read from the Claude Code transcript. This is the ONLY gate here not
+#     read from the Claude Code transcript — or from the zakcode session document
+#     when the runner is a zakcode session (2026-08-30: with only the transcript
+#     consulted, a live zakcode reducer read as "no_transcript" and this path
+#     recovered it to IDLE mid-select). This is the ONLY gate here not
 #     derived from the execution diary, and it exists because no diary-derived
 #     gate CAN reach the remaining false-fire class: a live user conversation
 #     writes nothing to the diary, so an alive-but-off-loop agent and a wedged
