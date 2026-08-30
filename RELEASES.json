@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.43",
+    "previous_version": "2.12.42",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "stranded-claim-sweep: claim-time breadcrumb no longer counts as liveness; holders judged by body carrier, own transcript on this box, and in_flight -- a dead session's in-progress goal is released again",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.42",
     "previous_version": "2.12.41",
     "date": "2026-08-30",

@@ -458,6 +458,9 @@ except Exception:
     #
     # FAIL-OPEN like its three siblings: a breadcrumb failure must never fail a
     # claim that already committed in the daemon.
+    # The content literal is CLAIM_BREADCRUMB_MARKER in stranded-claim-sweep.py,
+    # which skips it when judging execution activity (2026-08-30: counting it
+    # made every claim look live forever). Reword both ends together.
     printf '{"entry_type":"observation","goal_id":"%s","content":"claim-time liveness breadcrumb for %s (source=%s) - g-115-6677"}' \
         "$goal_id" "$goal_id" "${SOURCE:-world}" \
         | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/execution-diary.sh" append \
