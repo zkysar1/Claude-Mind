@@ -383,7 +383,7 @@ rt_spawn() {
     # Not spawning is sufficient — rt_wait_for_ready is the single source of
     # truth for readiness and the caller surfaces a loud daemon-down error.
     if [ -n "${PYTEST_CURRENT_TEST:-}" ] \
-       && [ "$RT_DIR" = "$PROJECT_ROOT/mind_api/state" ] \
+       && [ "$(canon_dir "$RT_DIR")" = "$(canon_dir "$PROJECT_ROOT/mind_api/state")" ] \
        && [ "${MIND_ALLOW_SHARED_DAEMON_FROM_TEST:-}" != "1" ]; then
         echo "[$stamp] rt_spawn — REFUSED: pytest parent (${PYTEST_CURRENT_TEST}) would claim the SHARED $RT_DIR and kill the live daemon. Set RT_DIR (or RUNTIME_DIR) to a tmp dir in the test env, or MIND_ALLOW_SHARED_DAEMON_FROM_TEST=1. Daemon NOT started. (g-115-3329)" >> "$RT_SPAWN_LOG"
         return 0
@@ -1161,7 +1161,19 @@ rt_try_autospawn() {
     if [ ! -x "$spawn_script" ] && [ ! -f "$spawn_script" ]; then
         return 1
     fi
-    bash "$spawn_script" >/dev/null 2>&1 || return 1
+    # Capture the launcher's stderr and RE-EMIT it on failure ().
+    # `>/dev/null 2>&1` discarded it, so the shared-runtime claim REFUSAL --
+    # 542 bytes naming the cause AND the two fixes -- reached nobody: the
+    # caller saw only rt_no_daemon_error's generic "daemon is unreachable".
+    # Safe as a command substitution: mind-api-start.sh redirects the daemon's
+    # own fds to $SPAWN_LOG inside a `>/dev/null 2>&1` subshell, so no child
+    # holds this pipe open. Declared before assignment -- `local x="$(...)"`
+    # would mask the exit status behind local's own rc.
+    local spawn_err
+    spawn_err="$(bash "$spawn_script" 2>&1 >/dev/null)" || {
+        [ -n "$spawn_err" ] && printf '%s\n' "$spawn_err" >&2
+        return 1
+    }
     rt_wait_for_ready
 }
 

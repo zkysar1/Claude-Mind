@@ -182,7 +182,7 @@ IF retrieval_manifest exists AND retrieval_manifest.sufficient == false:
 IF goals_completed_this_session % 20 == 0:
     Bash: export MIND_AGENT=<agent>; source core/scripts/_paths.sh
     FOR store in (reasoning-bank, guardrails):
-        Bash: py -3 core/scripts/retrieval_utility_report.py --store "$WORLD_DIR/{store}.jsonl"
+        Bash: source core/scripts/_paths.sh && py -3 core/scripts/retrieval_utility_report.py --store "$WORLD_DIR/{store}.jsonl"
     # From each report: zero_hit_high_exposure (retrieved >=5x, never helpful —
     # noise) + never_retrieved (dead weight). Write counts + a capped sample
     # (first 25 ids each, per store) to the memory_curation_candidates WM slot

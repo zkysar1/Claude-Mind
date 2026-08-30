@@ -184,7 +184,59 @@ def compute_skew(by_l1, threshold, dominance_threshold=0.90,
             "mature capability mass (EXPLOIT+MASTER)",
             "matured nodes", cap_values, dominance_threshold, prev_shares,
             creep_pp, l1_count, allow_empty_flag=False))
+    _annotate_structural_echo(findings, real_buckets)
     return findings
+
+
+def _annotate_structural_echo(findings, real_buckets):
+    """Mark metrics whose dominance is a mechanical echo of structural mass.
+
+    MEASURED 2026-08-30 (bravo, cc-05, live tree, 4 L1s, 1526 nodes /
+    157,534 retrievals): the structural-mass share and the retrieval-volume
+    share CO-MOVE at Pearson r = 0.986, and the same L1 (`intelligence`)
+    tops both — 76.0% of nodes and 62.7% of retrievals. A big L1 accumulates
+    the nodes AND the retrievals, so two `dominance` findings naming the same
+    L1 are ONE underlying fact, not two corroborating ones (g-115-4648; same
+    class as rb-6425, which established per-node density for the S7 sibling).
+
+    THE RAW TOTAL IS DELIBERATE AND IS NOT REPLACED, because normalizing it
+    would make the metric structurally unable to fire: per-node density on
+    that same tree is near-even (13.5 / 23.3 / 32.5 / 30.6%, max 32.5%)
+    against a 0.90 dominance ceiling, so a normalized metric could never
+    reach the threshold. Swapping it would convert a visibly-redundant
+    detector into an apparently-fixed inert one (guard-2499).
+
+    So the echo is surfaced as EVIDENCE instead, in the payload a consumer
+    actually reads — a source comment alone would not reduce firings or reach
+    anything downstream (guard-4649). Evidence-only: this never sets
+    `flagged`, matching the existing ratio-field contract.
+
+    Density is carried alongside because it is the genuinely independent
+    signal, and it INVERTS the raw ranking: `intelligence` leads raw
+    retrievals while holding the LOWEST density (85.2/node) against
+    execution's 204.9. A reader comparing L1s wants that number, not the
+    total.
+    """
+    base = next((f for f in findings if f["metric"] == "total_nodes"), None)
+    if not base:
+        return
+    nodes_by_l1 = {l1: int(b.get("total_nodes", 0))
+                   for l1, b in real_buckets.items()}
+    for f in findings:
+        if f["metric"] == "total_nodes":
+            continue
+        f["echoes_structural_mass"] = (f["max_l1"] == base["max_l1"])
+        if f["metric"] == "total_retrieval_count":
+            n = nodes_by_l1.get(f["max_l1"], 0)
+            f["max_l1_per_node"] = round(f["max_value"] / n, 2) if n else None
+            densities = {
+                l1: (int(b.get("total_retrieval_count", 0)) / nodes_by_l1[l1])
+                for l1, b in real_buckets.items() if nodes_by_l1.get(l1)
+            }
+            if densities:
+                top = max(densities, key=densities.get)
+                f["densest_l1"] = top
+                f["densest_l1_per_node"] = round(densities[top], 2)
 
 
 def render_markdown(verdict):

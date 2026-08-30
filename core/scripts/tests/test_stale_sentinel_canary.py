@@ -68,6 +68,7 @@ TRACKED = [
 _FRAMEWORK_ENV_PREFIXES = (
     "MIND_", "WORLD_", "META_", "STORAGE_", "FILEOPS_", "RT_",
     "RUNTIME_", "AGENTS_", "MACHINE_", "OWNERSHIP_", "ENVIRONMENT_", "MIND_",
+    "BODY_",  # : BODY_WM_PATH is the FIRST branch of wm_path()
 )
 
 

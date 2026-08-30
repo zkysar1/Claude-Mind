@@ -48,6 +48,28 @@ CONTINUE. That gap is now closed (g-306-224), but NOT the way the filing asked.
                 to runner-claim.sh's LIVE line, and consumed here. It changes on
                 a re-mint, so it catches the same-box restart machine_id cannot.
 
+THE TWO AXES ARE NOT SYMMETRIC IN WHAT THEY DO AFTER FIRING, and that is load-
+bearing rather than an oversight:
+
+  machine axis (cross-box)  LATCHES — the expected machine is re-asserted, so
+                            every later poll winds down again. Correct: a reducer
+                            on another box may never see this Body's locally-
+                            staged WM, so it must stay down until an operator
+                            relaunches it.
+  token-fp axis (same-box)  ONE-SHOT — the wind-down fires, then the observed fp
+                            is ADOPTED, so the next poll rejoins under the new
+                            runner. Correct because the merge path is by DISK,
+                            not by fork lineage: the same-box runner adopts the
+                            staged work exactly as the old one would have.
+
+Adopting was not the original behaviour, and the difference was catastrophic
+rather than cosmetic. Measured 2026-08-30 on zc-03 (coach, 8 Bodies): a reducer
+relaunch re-minted the token, and because the fp branch re-asserted the STALE
+baseline, all 7 workers wound down and could never rejoin — 41 session state
+files, not one of which had learned the live fp, each rewritten on every poll
+with the value frozen. The fleet ran on its reducer alone for ~5 h. A fail-safe
+with no reset path is not a fail-safe; it is an off switch on a timer.
+
 THE RAW TOKEN IS DELIBERATELY NOT EXPOSED, and this module must never ask for
 it. `runner_token` is the ConditionExpression bearer credential for the backend's
 `heartbeat` and `release_runner`: anything holding it can forge a heartbeat for
@@ -209,11 +231,48 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
                 "reason": (f"reducer restart: claim is still LIVE on "
                            f"{observed_machine or 'unknown-machine'!r}, but the "
                            f"runner token was re-minted (fp "
-                           f"{expected_token_fp} -> {observed_token_fp}) — a new "
-                           f"runner holds the claim and did not fork this Body"),
+                           f"{expected_token_fp} -> {observed_token_fp}) — "
+                           f"winding down THIS unit so its work is staged for "
+                           f"the runner now holding the claim; the new fp is "
+                           f"ADOPTED below, so the next poll rejoins under it"),
                 "consecutive_errors": 0,
                 "expected_machine": expected_machine,
-                "expected_token_fp": expected_token_fp,
+                # ADOPT, do not re-assert the stale baseline. This one word is
+                # the difference between a fail-safe that fires and one that
+                # LATCHES, and it cost the coach fleet its entire worker
+                # population (measured 2026-08-30, zc-03 — see below).
+                #
+                # Persisting `expected_token_fp` here made the verdict permanent
+                # for the life of the session dir: every subsequent poll re-read
+                # the stale baseline, re-compared it against the same live fp,
+                # and wound down again. The state file was rewritten on EVERY
+                # poll (fresh mtimes prove the polls ran) while the value never
+                # advanced — a latch by VALUE rather than by write, which is why
+                # it survived a reviewer looking for an unwritten store
+                # (guard-4870 names the write-side twin).
+                #
+                # WHY ADOPTING IS NOT A WEAKENING. The wind-down's purpose is
+                # discharged by its FIRST firing: the Body closes its unit and
+                # stages its WM. A Body that has already wound down has nothing
+                # left to orphan, so every later firing is pure cost. Adoption
+                # keeps the fire and drops the repeat.
+                #
+                # AND THE PREMISE ONLY HOLDS CROSS-BOX. The old reason claimed
+                # "a new runner ... did not fork this Body, so nobody will merge
+                # its work" — a LINEAGE argument the merge path does not use.
+                # The reducer adopts staged work by reading the session dirs on
+                # DISK (stranded-claim-sweep, generalize-down), judging bodies by
+                # carrier/transcript/in-flight, never by who forked them.
+                # Measured the same day: a freshly-relaunched reducer released
+                # , a claim held by a Body it had never forked. On one
+                # box the new runner therefore merges exactly what the old one
+                # would have.
+                #
+                # Hence the deliberate asymmetry with the machine axis above,
+                # which stays LATCHED: a reducer on another box may never see
+                # this Body's locally-staged WM, so there the premise is true and
+                # a Body must stay down until an operator relaunches it.
+                "expected_token_fp": observed_token_fp,
             }
         return {
             "verdict": VERDICT_CONTINUE,

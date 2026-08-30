@@ -608,6 +608,76 @@ def test_poll_persists_the_fp_and_winds_down_on_a_same_box_restart(tmp_path):
     assert "restart" in second["reason"]
 
 
+def test_a_same_box_restart_ADOPTS_the_new_fp_so_the_wind_down_is_one_shot():
+    """The fp axis fires ONCE. It must not re-assert the stale baseline.
+
+    Persisting `expected_token_fp` on this branch made the verdict permanent for
+    the life of the session dir — every later poll re-compared the same stale
+    baseline against the same live fp and wound down again, with no path back.
+    Measured 2026-08-30 on zc-03: a reducer relaunch re-minted the token and all
+    7 worker Bodies latched, 41 state files none of which had learned the live
+    fp. The wind-down's purpose is discharged by its first firing (the Body
+    closes its unit and stages its WM); a Body that has already wound down has
+    nothing left to orphan.
+    """
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_B, expected_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_WIND_DOWN          # it still FIRES...
+    assert r["expected_token_fp"] == FP_B             # ...and it adopts
+
+    # The consequence, which is the whole point: feed the persisted state back in
+    # (what the next poll does) and the Body rejoins under the new runner.
+    again = decide(0, "cc-02", r["expected_machine"], r["consecutive_errors"],
+                   observed_token_fp=FP_B, expected_token_fp=r["expected_token_fp"])
+    assert again["verdict"] == VERDICT_CONTINUE
+
+
+def test_a_cross_box_takeover_stays_LATCHED_unlike_the_same_box_restart():
+    """The other half of the asymmetry, and the control that keeps the adoption
+    above from being read as 'expected values are always adopted'.
+
+    Cross-box, the premise the fp branch cannot claim IS true: a reducer on
+    another box may never see this Body's locally-staged WM, so the Body must
+    stay down until an operator relaunches it. Re-asserting `expected_machine`
+    is what makes that stick, and it must keep sticking.
+    """
+    r = decide(0, "cc-05", "cc-02", 0, observed_token_fp=FP_B, expected_token_fp=FP_A)
+    assert r["verdict"] == VERDICT_WIND_DOWN
+    assert r["expected_machine"] == "cc-02"           # NOT adopted
+
+    again = decide(0, "cc-05", r["expected_machine"], r["consecutive_errors"],
+                   observed_token_fp=FP_B, expected_token_fp=r["expected_token_fp"])
+    assert again["verdict"] == VERDICT_WIND_DOWN      # still down, by design
+
+
+def test_poll_rejoins_under_the_new_runner_on_the_poll_after_a_restart(tmp_path):
+    """The fleet-recovery proof, end to end through the state file.
+
+    Three separate poll() calls, because the only channel between them is the
+    persisted baseline — which is exactly what was frozen. Poll 3 is the one
+    that could never happen before this fix: on zc-03 it was poll 3, 4, 5 ...
+    each re-reading fp A against a live fp B, for five hours.
+    """
+    agent_dir = tmp_path / "alpha"
+    live_with = lambda fp: "echo \"%s\"\nexit 0\n" % (LIVE_LINE + ", token-fp " + fp)
+
+    scripts = _claim_stub(tmp_path, live_with(FP_A))
+    assert poll("alpha", agent_dir, "SID1", scripts)["verdict"] == VERDICT_CONTINUE
+
+    # The reducer is relaunched on the SAME box: token re-minted, machine identical.
+    _claim_stub(tmp_path, live_with(FP_B))
+    second = poll("alpha", agent_dir, "SID1", scripts)
+    assert second["verdict"] == VERDICT_WIND_DOWN
+    assert "restart" in second["reason"]
+
+    state = json.loads((agent_dir / "sessions" / "SID1" /
+                        "reducer-liveness-state.json").read_text(encoding="utf-8"))
+    assert state["expected_token_fp"] == FP_B, "the baseline never advanced — latched"
+
+    third = poll("alpha", agent_dir, "SID1", scripts)
+    assert third["verdict"] == VERDICT_CONTINUE, (
+        "a worker that wound down on a same-box restart could never rejoin")
+
+
 def test_poll_against_a_pre_upgrade_emitter_continues_and_learns_nothing(tmp_path):
     """The mixed-version fleet, end to end: an old wrapper emits no fp clause,
     so two polls in a row stay CONTINUE with a null baseline. A regression that

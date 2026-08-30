@@ -292,7 +292,7 @@ produce `verdict="unknown"` and a no-op — never a false block on real work.
 ```
 Bash: load-conventions.sh pre-execution → IF path returned: Read it
 # Procedural convention — gate on file EXISTENCE, not load status.
-Bash: test -f "$WORLD_DIR/conventions/pre-execution.md"
+Bash: source core/scripts/_paths.sh && test -f "$WORLD_DIR/conventions/pre-execution.md"
 IF exists AND NOT trivial_mode: follow each step; any step returning SKIP → mark goal skipped, GOTO Phase 7.
 IF exists AND trivial_mode: run ONLY the repo-sync step (pre-execution.md
   "Pull Latest") when the goal touches a shared git checkout; skip the rest.

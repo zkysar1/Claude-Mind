@@ -39,6 +39,21 @@ from typing import Dict, List, Optional
 _LINE_COUNT_TARGETS = {
     "orchestrator_lines": ".claude/skills/aspirations/SKILL.md",
     "aspirations_yaml_lines": "core/config/aspirations.yaml",
+    # g-115-4928: the two entries above measured the surface already under
+    # deliberate DOWNWARD pressure (the orchestrator is small precisely because
+    # the loop-digest extraction slimmed it), so the instrument read healthy
+    # while the growth went somewhere it could not see. Measured on three dates,
+    # same `wc -l`, by three agents on three boxes:
+    #     aspirations/SKILL.md            819 -> 869 -> 873   (+54,  +6.6%)
+    #     aspirations-precheck/SKILL.md  2216 -> 2792 -> 2867  (+651, +29.4%)
+    #     (2026-08-04 echo/cc-03 · 08-23 echo/cc-03 · 08-30 bravo/cc-05)
+    # The untracked file added 12x more lines at 4.5x the rate; the ratio went
+    # 2.7x -> 3.2x -> 3.28x. NOT redundant with hot-path-size-gate.sh, which
+    # also sees this file: that gate is a commit-time PASS/FAIL on a CORPUS
+    # total (currently red), so it cannot say WHICH of 131 skills grew. This is
+    # a per-metric trend across the ledger's rows, consumed by the scar-tissue
+    # cadence. Different question, different consumer.
+    "precheck_lines": ".claude/skills/aspirations-precheck/SKILL.md",
 }
 
 

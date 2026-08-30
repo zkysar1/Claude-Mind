@@ -710,7 +710,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    is that the error path rendered identically to success, so no amount of
    reading the output could ever have found it.
 
-   Bash: for _PRES in "$WORLD_DIR"/presence/*.jsonl; do [ -f "$_PRES" ] || continue; CORE_ROOT="$CORE_ROOT" PRES="$_PRES" py -3 -c 'import sys,os,pathlib; sys.path.insert(0, os.environ["CORE_ROOT"]+"/scripts"); from _fileops import locked_modify_jsonl; locked_modify_jsonl(pathlib.Path(os.environ["PRES"]), lambda recs: recs[-1000:])' || echo "[consolidate] WARN: presence truncation FAILED for $_PRES — file left unbounded"; done; unset _PRES
+   Bash: source core/scripts/_paths.sh && for _PRES in "$WORLD_DIR"/presence/*.jsonl; do [ -f "$_PRES" ] || continue; CORE_ROOT="$CORE_ROOT" PRES="$_PRES" py -3 -c 'import sys,os,pathlib; sys.path.insert(0, os.environ["CORE_ROOT"]+"/scripts"); from _fileops import locked_modify_jsonl; locked_modify_jsonl(pathlib.Path(os.environ["PRES"]), lambda recs: recs[-1000:])' || echo "[consolidate] WARN: presence truncation FAILED for $_PRES — file left unbounded"; done; unset _PRES
 
 6. Tree Rebalancing — runs always, including stop_mode. Symmetric with the
    FAST consolidation path in `core/config/consolidation-housekeeping.md`

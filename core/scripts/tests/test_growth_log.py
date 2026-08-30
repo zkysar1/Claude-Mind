@@ -251,8 +251,28 @@ def test_growth_log_call_precedes_serialization_in_both_paths():
         for i, ln in enumerate(lines):
             if re.search(r"\b_growth_record_(batch|reparent)\s*\(", ln) \
                     and "import" not in ln:
-                after = "\n".join(lines[i:i + 25])
-                assert writer in after, (
+                # Window measured in CODE lines, not raw lines. The contract
+                # being pinned is "the call precedes the write, closely" — and
+                # comments are not distance. A raw-line window conflates a
+                # genuine drift past serialization with an explanatory comment
+                # block landing between the two, which is a LEGITIMATE addition
+                # (guard-4223: restate the contract in its true unit; do not
+                # relax the threshold to accommodate one). Measured 2026-08-30:
+                # tree_write.py:1656 -> writer at 1705 is 49 RAW lines but only
+                # 21 CODE lines, because 29 of the 50 (58%) are comment/blank
+                # explaining the list.remove() FATAL CATCH. The invariant held
+                # the whole time; only the ruler was wrong.
+                budget, after = 25, []
+                for ln2 in lines[i:]:
+                    after.append(ln2)
+                    if writer in ln2:
+                        break
+                    st = ln2.strip()
+                    if st and not st.startswith("#"):
+                        budget -= 1
+                        if budget <= 0:
+                            break
+                assert writer in "\n".join(after), (
                     "%s:%d — growth-log call is not followed by a %s within "
-                    "25 lines; it may have drifted past serialization"
+                    "25 CODE lines; it may have drifted past serialization"
                     % (path.name, i + 1, writer))

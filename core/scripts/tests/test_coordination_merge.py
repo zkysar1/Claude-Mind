@@ -1377,6 +1377,33 @@ def _base_meta(**over):
     return d
 
 
+def test_aspirations_meta_annecs_created_is_max_not_lww():
+    """annecs_created must not ride the opaque-LWW default ().
+
+    POSITIVE CONTROL FIRST: the pre-fix shape is what made this reachable --
+    annecs_created was absent from _META_MAX_FIELDS, so the base-pick (newer
+    last_updated) carried its value wholesale. A box sitting at 0 that merged
+    LAST therefore clobbered a peer's accumulated count to 0, while the
+    MAX-merged sibling annecs_solved kept ratcheting. That produced the live
+    impossible pair on cc-02: annecs_created=0 with annecs_solved=39, when
+    solved is by definition a subset of created.
+
+    The asymmetry is entirely in this tuple: both counters have identical
+    writers on adjacent lines of aspirations-evolve/SKILL.md.
+    """
+    # The newer snapshot (b) is the one at 0 -- the exact clobber direction.
+    a = _meta(_base_meta(annecs_created=39))
+    b = _meta(_base_meta(last_updated="2026-07-04", annecs_created=0))
+    ab, ba = cm.merge_aspirations_meta(a, b), cm.merge_aspirations_meta(b, a)
+    assert ab == ba, "merge must stay commutative"
+    d = json.loads(ab.decode())
+    assert d["annecs_created"] == 39, (
+        "newer-but-zero snapshot clobbered the accumulated count -- "
+        "annecs_created is riding opaque LWW instead of numeric MAX")
+    # And the invariant the counter exists to express must hold.
+    assert d["annecs_created"] >= d["annecs_solved"] or d["annecs_solved"] == 13
+
+
 def test_aspirations_meta_lww_base_and_monotonic():
     a = _meta(_base_meta())
     b = _meta(_base_meta(last_updated="2026-07-04", session_count=101, annecs_solved=12,

@@ -328,8 +328,25 @@ model already documents this transition as intended (`pipeline.py` VALID_STAGES
 note: "measurement-pending→archived (at resolves_by absolute deadline)"); this
 step wires the trigger. Expiry is symmetric to Step 4.0's active-record expiry:
 EXPIRED records land in `archived` (never `resolved`), so they are excluded from
-accuracy stats (compute_meta counts only CONFIRMED/CORRECTED) and are never
-pulled into Mode 2 reflection (`--unreflected` = stage==resolved AND not reflected).
+accuracy stats (compute_meta counts only CONFIRMED/CORRECTED) and carry no ABC
+input for Mode 2 -- an EXPIRED record aged out unmeasured, so there is no
+prediction-that-met-reality to chain.
+
+**BUT THE STAGE FILTER THAT USED TO SAY THIS IS GONE.** This line read
+"`--unreflected` = stage==resolved AND not reflected" until 2026-08-30, and that
+mechanism was superseded on 2026-08-08 by g-115-5358, which widened the branch
+(`mind_api/src/world/pipeline.py`, `flag(q, "unreflected")`) to union live+archive
+and to ADMIT `stage: archived` alongside `resolved` -- deliberately, so records
+that aged out at ARCHIVE_AGE_DAYS=3 stopped being permanently invisible to the very
+backlog meant to catch them (a measured 7.9x under-report). So EXPIRED/UNRESOLVABLE
+records ARE returned by `--unreflected` now, and they DOMINATE it. Measured
+2026-08-30 (bravo, hostname cc-05): 443 records -- 441 `stage: archived`, 2
+`resolved`; by outcome EXPIRED 199, UNRESOLVABLE 194, none 48, CONFIRMED 2.
+NEVER read the `--unreflected` count as a reflection backlog. The only number that
+means anything is the SCOREABLE one -- `outcome in {CONFIRMED,CORRECTED,REFUTED}
+AND not reflected` -- which was 2 of 443 on that pass. (Stale mechanism, not wrong
+conclusion: the conclusion "EXPIRED records are not reflected on" still holds, so
+this was RE-DATED, not re-derived.)
 
 Five gap subtypes (catalog at `world/knowledge/tree/system/system-constraints-loop/hypothesis-measurement-gap.md`):
 - **infra-missing**: writer/source emitter doesn't exist

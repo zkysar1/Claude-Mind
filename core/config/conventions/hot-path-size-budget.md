@@ -120,7 +120,7 @@ no `slots_filled`; `context.files[]` carries path/head/staged/delta, and
 `context.net_bytes` the total). Count them:
 
 ```bash
-grep -c '"gate": "hot-path-size-gate"' "$WORLD_PATH/override-bypass-ledger.jsonl"
+source core/scripts/_paths.sh && grep -c '"gate": "hot-path-size-gate"' "$WORLD_PATH/override-bypass-ledger.jsonl"
 ```
 
 An override moves HEAD, so it permanently loosens that file's cap by the bytes

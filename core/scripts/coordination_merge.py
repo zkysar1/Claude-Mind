@@ -2501,7 +2501,18 @@ def merge_skill_relations(local: bytes, remote: bytes) -> bytes:
     return _dump_yaml_default(_commutative_key_order(a, b, out))
 
 
-_META_MAX_FIELDS = ("session_count", "annecs_solved")
+_META_MAX_FIELDS = ("session_count", "annecs_solved", "annecs_created")
+# annecs_created joined 2026-08-30 (). It is the monotonic twin of
+# annecs_solved (ANNECS = Accumulated Novel Aspirations Created AND Solved) and
+# was riding the opaque-LWW default below, so every merge whose base-pick came
+# from a box sitting at 0 clobbered it back to 0 while its MAX-merged sibling
+# ratcheted up. Live symptom on cc-02: annecs_created=0 with annecs_solved=39,
+# an impossible pair (solved is by definition a subset of created), which left
+# aspirations-evolve Step 6 dividing by zero for the counter's whole lifetime.
+# Both counters have IDENTICAL writers (adjacent lines in aspirations-evolve
+# SKILL.md), so a missing writer never explained the asymmetry -- only this
+# tuple did. guard-1153: a COUNTER must get explicit merge semantics, and max
+# is the correct shape for a genuinely monotonic never-repaired counter.
 # Monotonic timestamps in aspirations-meta.json -- only advance -> strictly-newer
 # wins (independent of the LWW base so a stale-base write can never roll one back).
 _META_NEWER_FIELDS = ("last_updated", "last_evolution", "tree.last_maintain_at",
@@ -2513,7 +2524,7 @@ def merge_aspirations_meta(local: bytes, remote: bytes) -> bytes:
     newer top-level 'last_updated' snapshot (LWW for the opaque string fields --
     calibration_finding, confidence_calibration_bias, ...), then the fields with a
     natural merge override it:
-      - session_count / annecs_solved : numeric MAX (only ever grow)
+      - session_count / annecs_solved / annecs_created : numeric MAX (only ever grow)
       - last_updated / last_evolution / tree.last_maintain_at /
         last_calibration_check : strictly-newer wins (monotonic -- only advance)
       - readiness_gates : per-key union (content-larger on a same-key clash)
