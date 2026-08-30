@@ -181,6 +181,43 @@ def compute_category_distribution(aspirations):
     return dist
 
 
+def recurring_ratio_of(ranked_goals_json, aspirations):
+    """Fraction of the ranked goals that are recurring, or None when it cannot be computed.
+
+    ``--ranked-goals`` is goal-selector's ranked array (entries carry ``goal_id`` +
+    ``recurring``), or that whole selector document. A Body that has lost the selector
+    output to compaction passes the ids it remembers instead -- ``'["g-006-21"]'``
+    (coach reducer, 2026-08-30) -- and ``str.get`` raised an AttributeError the except
+    clause below did not name, so the check died with a traceback instead of degrading.
+    Ids resolve against the active aspirations; an element that is neither a goal object
+    nor a known id is left out of the ratio, and nothing here raises.
+    """
+    if not ranked_goals_json:
+        return None
+    try:
+        ranked = json.loads(ranked_goals_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(ranked, dict):
+        ranked = ranked.get("ranked_goals")
+    if not isinstance(ranked, list):
+        return None
+    by_id = {}
+    for asp in aspirations:
+        for goal in asp.get("goals", []) or []:
+            if isinstance(goal, dict) and goal.get("id"):
+                by_id[goal["id"]] = goal
+    goals = []
+    for entry in ranked:
+        if isinstance(entry, dict):
+            goals.append(entry)
+        elif isinstance(entry, str) and entry in by_id:
+            goals.append(by_id[entry])
+    if not goals:
+        return None
+    return round(sum(1 for g in goals if g.get("recurring", False)) / len(goals), 2)
+
+
 def cmd_check(args):
     """Run alignment check and output JSON metrics."""
     # Read Self
@@ -211,17 +248,8 @@ def cmd_check(args):
     # Compute hours since novel goal
     hours_since_novel = compute_hours_since_novel(active, archive)
 
-    # Compute recurring ratio from ranked goals (if provided via stdin)
-    recurring_ratio = None
-    ranked_goals_json = args.ranked_goals
-    if ranked_goals_json:
-        try:
-            ranked = json.loads(ranked_goals_json)
-            if ranked:
-                recurring_count = sum(1 for g in ranked if g.get("recurring", False))
-                recurring_ratio = round(recurring_count / len(ranked), 2)
-        except (json.JSONDecodeError, TypeError):
-            pass
+    # Compute recurring ratio from ranked goals (if provided via --ranked-goals)
+    recurring_ratio = recurring_ratio_of(args.ranked_goals, active)
 
     # Category distribution
     category_dist = compute_category_distribution(active)
@@ -258,7 +286,7 @@ def main():
 
     p_check = subparsers.add_parser("check", help="Run alignment check")
     p_check.add_argument("--ranked-goals", type=str, default=None,
-                         help="JSON string of ranked goals from goal-selector")
+                         help="JSON from goal-selector: its ranked array, the whole document, or a list of goal ids")
 
     args = parser.parse_args()
 

@@ -944,3 +944,15 @@ filed **g-115-8300**. The 2 `test_agent_watchdog_worker_role.py` reds are the pr
 half 114/115 with `FAIL(rc=1) test_capability_gate_narrative.py`; domain half red
 `test_email_send_outreach_gate.py::test_first_send_records_then_same_topic_from_other_agent_is_refused_rc4` —
 ownership of those two NOT established in this session (item 13: pre-existing is not tracked).
+
+**2026-08-30 (alpha, `hostname` cc-14, `uname -r` 6.8.0-137-generic, local backend, pinned worktree at
+ae417b9d0 — the v2.12.38 `framework_origin` release — default rung → 4 chunks of ~313 files, launched 01:52,
+VERDICT 02:38):** `TOTAL: 18663 passed, 47 failed, 12 errors` / `VERDICT: GENUINE`, spread 20 / 18 / 4+12err / 5
+across the four chunks (not tail-loaded, not one-chunk-confined). `--triage`: **6 environmental | 16
+genuine-owned | 1 genuine-UNOWNED** — `test_precommit_gate_coverage.py::test_gate_argv_shape_is_pinned`, the
+argv pin lacking the two gates this window added (14 `check-repo-root-entries`, 15
+`check-framework-origin-writes`) → fixed in 8d4097a78 instead of filed, since the drift was this session's own.
+Outside the triage's scope: invisible half 114/115 with `FAIL(rc=1) test_capability_gate_narrative.py`
+(g-115-148); domain half 76/76 + 1 skipped. A second run on 2bbac6343 (the pin fix + gates) was chained
+behind the triage in the same out dir — the chunk logs there are overwritten per run, so read a chunk log's
+mtime against the run you mean before quoting it.
