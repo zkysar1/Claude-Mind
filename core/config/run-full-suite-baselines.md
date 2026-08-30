@@ -956,3 +956,12 @@ Outside the triage's scope: invisible half 114/115 with `FAIL(rc=1) test_capabil
 (g-115-148); domain half 76/76 + 1 skipped. A second run on 2bbac6343 (the pin fix + gates) was chained
 behind the triage in the same out dir — the chunk logs there are overwritten per run, so read a chunk log's
 mtime against the run you mean before quoting it.
+
+**2026-08-30 (alpha, `hostname` cc-14, `uname -r` 6.8.0-137-generic, local backend, pinned worktree at
+2bbac6343 — the gate-coverage pin fix on top of v2.12.38 — default rung → 4 chunks of ~313 files, launched
+02:43 chained behind the triage above, VERDICT 03:33):** `TOTAL: 18681 passed, 46 failed, 12 errors` /
+`VERDICT: GENUINE`, spread 20 / 18 / 3+12err / 5 — the run above minus exactly the pin red in chunk 02 (4 → 3),
+everything else count-for-count identical, so no fresh `--triage` was run: the ownership map is the one
+measured 50 minutes earlier. Invisible half 114/115 (the same `test_capability_gate_narrative.py`); domain half
+76/76 + 1 skipped. The chained command's exit was 1 (SUITE_EXIT=1) — that is the runner reporting genuine reds,
+not a run failure; read the VERDICT, not the task's exit code (item 8).

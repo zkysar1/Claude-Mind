@@ -21,7 +21,9 @@ appends the rejected edit to meta/skill-rejected-edits.jsonl (negative memory).
 CLI:
   python core/scripts/skill_edit_gate.py gate --new-judgments '{...}' [--old-judgments '{...}'] \
       [--policy strict_improve|no_regression] [--epsilon 0.0] [--skill-name X] [--caller Y]
-    exit 0 = PASS (register), exit 1 = BLOCK (skip registration; buffered).
+    exit 0 = PASS (register), exit 1 = BLOCK (skip registration; buffered),
+    exit 2 = malformed call (bad JSON / a judgment outside good|average|poor) --
+             not a verdict, nothing logged; fix the call and re-run.
   python core/scripts/skill_edit_gate.py            -> runs the self-test (exit 0 on PASS).
 """
 from __future__ import annotations
@@ -118,7 +120,8 @@ def _cli_gate(argv):
     p = argparse.ArgumentParser(
         prog="skill_edit_gate.py gate",
         description="Gate a skill forge/edit on the 5-dim eval_harness check. "
-                    "exit 0 = PASS (register), exit 1 = BLOCK (skip + buffer).")
+                    "exit 0 = PASS (register), exit 1 = BLOCK (skip + buffer), "
+                    "exit 2 = malformed call (not a verdict; nothing logged).")
     p.add_argument("--new-judgments", required=True,
                    help="JSON {dim: good|average|poor} for the candidate skill.")
     p.add_argument("--old-judgments", default=None,
@@ -130,10 +133,24 @@ def _cli_gate(argv):
     p.add_argument("--skill-name", default=None, help="Skill name (for telemetry + buffer).")
     p.add_argument("--caller", default=None, help="Callsite label for telemetry.")
     args = p.parse_args(argv)
-    new_j = json.loads(args.new_judgments)
-    old_j = json.loads(args.old_judgments) if args.old_judgments else BASELINE_JUDGMENT
-    verdict = run_gate(old_j, new_j, policy=args.policy, epsilon=args.epsilon,
-                       caller=args.caller, skill_name=args.skill_name)
+    # A malformed call is NOT a verdict. It used to surface as a traceback with
+    # exit 1 -- the BLOCK code -- so a caller that abbreviated the vocabulary
+    # ("g" for good, copied from a SKILL.md placeholder; measured 2026-08-30)
+    # read its own typo as a quality rejection and skipped registration. Refuse
+    # legibly on exit 2, before anything is logged or buffered.
+    try:
+        new_j = json.loads(args.new_judgments)
+        old_j = json.loads(args.old_judgments) if args.old_judgments else BASELINE_JUDGMENT
+        if not isinstance(new_j, dict) or not isinstance(old_j, dict):
+            raise ValueError("judgments must be a JSON object {dimension: judgment}")
+        verdict = run_gate(old_j, new_j, policy=args.policy, epsilon=args.epsilon,
+                           caller=args.caller, skill_name=args.skill_name)
+    except (ValueError, TypeError) as exc:  # JSONDecodeError is a ValueError
+        print(f"skill_edit_gate: malformed call, not a verdict -- {exc}. "
+              f"Judgments are the full words good|average|poor (not g|a|p) for each of "
+              f"{', '.join(DIMS)}; nothing was logged or buffered. Fix the call and re-run.",
+              file=sys.stderr)
+        sys.exit(2)
     print(json.dumps(verdict.as_dict()))
     sys.exit(0 if verdict.passed else 1)
 
