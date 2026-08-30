@@ -291,24 +291,68 @@ def test_append_heals_int_in_goals_completed_list_slot(running_daemon):
         ["g-999-01", "g-999-02"]
 
 
+def test_append_heals_a_string_in_goals_completed_list_slot(running_daemon):
+    """2026-08-28, live deployment: `wm-set.sh goals_completed_this_session
+    '<timestamp>'` left a STRING in the agent-wide WM; 36 of 51 sessions cloned
+    from it inherited the string and every worker close's Phase 4b append was
+    refused for 39 hours, because the heal above was int-only. A string there
+    carries no rows either — same heal, same loud report."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    wm_path = agent_dir / "session" / "working-memory.yaml"
+    data = _read_wm(agent_dir)
+    data["goals_completed_this_session"] = "2026-08-28T08:52:00"
+    wm_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    status, body = _post(port, "/v1/wm/append", {"slot": "goals_completed_this_session"},
+                         json.dumps({"goal_id": "g-999-03", "aspiration_id": "asp-999",
+                                     "recurring": False}))
+    assert status == 200, body
+    out = json.loads(body)
+    assert out["healed_from"] == "str:2026-08-28T08:52:00", out
+    assert "stamp" in out["warning"], out
+    rows = _read_wm(agent_dir)["goals_completed_this_session"]
+    assert isinstance(rows, list) and len(rows) == 1 and rows[0]["goal_id"] == "g-999-03", rows
+
+
+def test_set_refuses_a_scalar_into_the_hand_off_list_slot(running_daemon):
+    """The set side of the same incident: the scalar that started it is refused
+    with the two commands that express the intent, and a JSON array still lands."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    for raw in ('"2026-08-28T08:42:11"', "2026-08-28T08:42:11", "7"):
+        try:
+            _post(port, "/v1/wm/set", {"slot": "goals_completed_this_session"}, raw)
+        except urllib.error.HTTPError as e:
+            assert e.code == 400
+            err = json.loads(e.read())
+            assert err["error"] == "not_a_list_value", err
+            assert "wm-append.sh goals_completed_this_session" in err["detail"], err
+            assert "'[]' | wm-set.sh goals_completed_this_session" in err["detail"], err
+        else:
+            raise AssertionError(f"expected not_a_list_value 400 for {raw!r}")
+    status, body = _post(port, "/v1/wm/set", {"slot": "goals_completed_this_session"}, "[]")
+    assert status == 200, body
+    assert _read_wm(agent_dir)["goals_completed_this_session"] == []
+    status, body = _post(port, "/v1/wm/set", {"slot": "goals_completed_this_session"}, "null")
+    assert status == 200, body  # null is "absent", which append already turns into []
+
+
 def test_append_other_type_mismatch_still_refused(running_daemon):
-    """The heal is scoped to the ONE colliding slot: an int in any other array
-    slot, and a non-numeric scalar in this one, still refuse `not_a_list`."""
+    """The heal is scoped to the ONE hand-off slot: an int in any other array
+    slot still refuses `not_a_list`."""
     project_root, port = running_daemon
     agent_dir = project_root / "agents" / "alpha"
     wm_path = agent_dir / "session" / "working-memory.yaml"
     data = _read_wm(agent_dir)
     data["slots"]["known_blockers"] = 3
-    data["goals_completed_this_session"] = "seven"
     wm_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    for slot in ("known_blockers", "goals_completed_this_session"):
-        try:
-            _post(port, "/v1/wm/append", {"slot": slot}, json.dumps({"id": "x"}))
-        except urllib.error.HTTPError as e:
-            assert e.code == 400
-            assert json.loads(e.read())["error"] == "not_a_list", slot
-        else:
-            raise AssertionError(f"expected not_a_list 400 for {slot}")
+    try:
+        _post(port, "/v1/wm/append", {"slot": "known_blockers"}, json.dumps({"id": "x"}))
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        assert json.loads(e.read())["error"] == "not_a_list"
+    else:
+        raise AssertionError("expected not_a_list 400 for known_blockers")
 
 
 def test_append_not_initialized_400(running_daemon):

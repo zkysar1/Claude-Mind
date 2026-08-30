@@ -35,6 +35,12 @@ WHAT IT DOES, in order (each step is cheap until the last):
      `python3 -m pytest -q` with cwd=scripts so `from <pkg> import ...`
      resolves the way the rule's own command runs it. STORAGE_BACKEND=local is
      pinned (guard-955). Bounded at 900 s.
+  3b. Credential tripwire (g-353-79): the credential-NAMED files directly under
+     the world, its parent and the project root (.env* / *token* / *secret* /
+     *credential* / *.pem / *.key / *.p12 / id_*) are snapshotted by size+mtime
+     around the run; if any was rewritten the close is BLOCKED whatever the
+     suite's rc, and no override lifts it (a live deployment lost its token to
+     a mocked-refresh test on 2026-08-29).
   4. rc 0 → pass. rc 5 (pytest: nothing collected) → pass, noted. A timeout
      or a pytest internal/usage error (3/4) is a gate fault → fail-open with a
      warning. rc 2 (collection error) → BLOCK, always. rc 1 (red) → the
@@ -68,6 +74,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -76,7 +83,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import WORLD_DIR  # noqa: E402
+from _paths import PROJECT_ROOT, WORLD_DIR  # noqa: E402
 from _gate_log import log as _gate_log  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402  guard-580/581: never a bare "bash", never str(Path)
 
@@ -90,6 +97,62 @@ FALLBACK_WINDOW = timedelta(hours=6)
 SLACK_SECONDS = 60
 DEFAULT_TIMEOUT = 900
 TAIL_LINES = 25
+
+# ─── credential tripwire () ────────────────────────────────────────
+# The suite this gate demands as the price of a close is also a process running
+# with the Body's full environment. Measured 2026-08-29 23:46Z on a live
+# deployment: the green re-run a close was waiting on persisted a MOCKED
+# token-refresh response over the real token file (a save helper defaulting to a
+# hardcoded absolute path), and the close then passed on that green. The gate
+# cannot know a domain's credential paths, but it can know their SHAPE: a file
+# directly under a governed root whose NAME says what it holds. Those are
+# snapshotted (size, mtime) before the run and compared after; a rewrite is a
+# BLOCK no override lifts — restoring the file and isolating the persistence
+# path (guard-5541) is the only way through. Name only, not mode: measured on the
+# deployment that motivated this, every bland-named 0600 file under the roots
+# was a peer-written store or doc (forged-skills.yaml, program.md,
+# requirements.txt) — under eight concurrent Bodies a mode heuristic blocks
+# closes for writes no test made, and caught nothing a name does not. Stores
+# and docs (.jsonl/.md) are skipped for the same reason even when named.
+PRIVATE_NAME_RE = re.compile(r"(?i)^\.env|token|secret|credential|\.pem$|\.key$|\.p12$|^id_(rsa|ed25519|ecdsa)")
+PRIVATE_SKIP_SUFFIXES = {".lock", ".pid", ".port", ".sock", ".log", ".tmp", ".bak", ".jsonl", ".md"}
+
+
+def private_roots(world_dir: Path | None) -> list[Path]:
+    """The world, its parent (where a deployment keeps .env.local beside .mind-data),
+    and the project root — deduplicated, in that order."""
+    roots: list[Path] = []
+    candidates = ([Path(world_dir), Path(world_dir).parent] if world_dir else []) + [Path(PROJECT_ROOT)]
+    for r in candidates:
+        if r not in roots:
+            roots.append(r)
+    return roots
+
+
+def private_files(roots: list[Path]) -> dict[str, tuple[int, int]]:
+    """{path: (size, mtime_ns)} of the credential-shaped files DIRECTLY under each
+    root. Shape only — the contents are never read."""
+    out: dict[str, tuple[int, int]] = {}
+    for root in roots:
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or p.suffix.lower() in PRIVATE_SKIP_SUFFIXES:
+                continue
+            if PRIVATE_NAME_RE.search(p.name):
+                out[str(p)] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def rewritten_private_files(before: dict, after: dict) -> list[str]:
+    """Paths whose size or mtime changed, or that vanished, across the suite run."""
+    return sorted(p for p, sig in before.items() if after.get(p) != sig)
 
 
 # ─── discovery ────────────────────────────────────────────────────────────
@@ -313,7 +376,24 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         return 0
 
     _, runner_label = runner_command(scripts_dir)
+    roots = private_roots(world_dir)
+    before = private_files(roots)
     rc, tail, failing = run_suite(scripts_dir, timeout)
+    clobbered = rewritten_private_files(before, private_files(roots))
+    if clobbered:
+        why = (f"the domain suite REWROTE {len(clobbered)} credential-shaped file(s) outside its own tree: "
+               + ", ".join(clobbered[:4]) + (" ..." if len(clobbered) > 4 else "")
+               + " — a test wrote through to a live credential path")
+        _emit("block", goal_id, override, reason=why, runner=runner_label, rc=rc, touched=touched,
+              clobbered=clobbered, tail=tail)
+        print("", file=sys.stderr)
+        print(f"[domain-suite-gate] ✖ REFUSED status=completed for {goal_id}: {why}.", file=sys.stderr)
+        print("  Restore each file from its backup or upstream source of truth FIRST (the run may have", file=sys.stderr)
+        print("  replaced a live token with a fixture), then make the persistence path overridable and", file=sys.stderr)
+        print("  point the tests at a tmp path (guard-5541). --override-domain-suite does not apply here:", file=sys.stderr)
+        print("  a rewritten credential is never pre-existing. (If another process legitimately", file=sys.stderr)
+        print("  refreshed the file during the run, the file is intact — just re-run the close.)", file=sys.stderr)
+        return 1
     if rc in (0, 5):
         note = "" if rc == 0 else " (pytest collected no tests)"
         save_baseline(world_dir, set(), rc, runner_label)

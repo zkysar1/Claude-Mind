@@ -218,11 +218,30 @@ def test_no_hardcoded_world_source_in_escalation_filing():
 
 # --- Behavioural proof: the resolver actually diverges --------------------
 
-def _write_queue(path, asp_ids):
+def _write_queue(path, asp_ids, titles=None, statuses=None):
     path.parent.mkdir(parents=True, exist_ok=True)
+    titles = titles or {}
+    statuses = statuses or {}
     path.write_text(
-        "".join('{"id": "%s", "title": "t", "status": "active", "goals": []}\n' % a
+        "".join('{"id": "%s", "title": "%s", "status": "%s", "goals": []}\n'
+                % (a, titles.get(a, "t"), statuses.get(a, "active"))
                 for a in asp_ids),
+        encoding="utf-8")
+
+
+def _write_routing(world, asp_id, source="world"):
+    """A deployment-routing.md in the documented two-table shape: this world's
+    own row first, then the sibling-deployments table that must NOT be read."""
+    conv = world / "conventions"
+    conv.mkdir(parents=True, exist_ok=True)
+    (conv / "deployment-routing.md").write_text(
+        "# Deployment Routing\n\n## This world\n\n"
+        "| Purpose | Target | `--source` |\n|---|---|---|\n"
+        "| Framework-hygiene / maintenance catch-all | **%s** | `%s` |\n\n"
+        "## Known sibling mappings\n\n"
+        "| Deployment | Catch-all | `--source` | Note |\n|---|---|---|---|\n"
+        "| Other-Mind | agent `asp-777` \"Maintain Agent Health\" | `agent` | n/a |\n"
+        % (asp_id, source),
         encoding="utf-8")
 
 
@@ -257,6 +276,110 @@ def test_resolver_returns_loud_default_when_nothing_exists(tmp_path):
     asp, via = resolve(tmp_path / "core", world, agent)
     assert asp == "asp-115"
     assert via == "fallback:none-exist"
+
+
+# --- 2026-08-30: the third deployment (coach@zc-03) ------------------------
+#
+# Neither candidate existed there, no convention file, so every watchdog
+# escalation failed aspiration_not_found on every tick — 28 GitDriftProbe posts
+# in 5 h and never a goal. Three doors close it: the deployment-routing.md the
+# skills already route through, a liveness filter on candidates (the upstream
+# world's RETIRED asp-001 must never be targeted), and a title heuristic for a
+# world that carries neither.
+
+def test_resolver_reads_this_worlds_deployment_routing_convention(tmp_path):
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-042", "asp-007"])
+    _write_queue(agent / "aspirations.jsonl", ["asp-001"])
+    _write_routing(world, "asp-042")
+    asp, via = resolve(tmp_path / "core", world, agent)
+    assert asp == "asp-042", "the convention names this world's catch-all"
+    assert via == "resolved:deployment-routing.md"
+    assert source_flag(asp, world, agent) == "world"
+
+
+def test_convention_outranks_the_candidate_list_but_not_the_config_override(tmp_path):
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-115", "asp-042"])
+    _write_routing(world, "asp-042")
+    assert resolve(tmp_path / "core", world, agent)[0] == "asp-042"
+    core = tmp_path / "core"
+    (core / "config").mkdir(parents=True)
+    (core / "config" / "aspirations.yaml").write_text(
+        "stale_cadence:\n  escalation_aspiration: asp-115\n", encoding="utf-8")
+    asp, via = resolve(core, world, agent)
+    assert asp == "asp-115" and via.startswith("config:")
+
+
+def test_convention_naming_a_dead_or_absent_id_falls_through(tmp_path):
+    """A stale convention must not reintroduce the bug through a new door."""
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-042", "asp-007"],
+                 statuses={"asp-042": "retired"})
+    _write_queue(agent / "aspirations.jsonl", ["asp-001"])
+    _write_routing(world, "asp-042")
+    asp, via = resolve(tmp_path / "core", world, agent)
+    assert asp == "asp-001" and via == "resolved:exists-in-queue"
+    _write_routing(world, "asp-555")  # absent entirely
+    assert resolve(tmp_path / "core", world, agent)[0] == "asp-001"
+
+
+def test_sibling_deployment_rows_are_never_read_as_this_worlds_mapping(tmp_path):
+    """The convention's second table lists OTHER deployments' catch-alls."""
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-777", "asp-042"])
+    conv = world / "conventions"
+    conv.mkdir(parents=True)
+    (conv / "deployment-routing.md").write_text(
+        "| Deployment | Catch-all | `--source` | Note |\n|---|---|---|---|\n"
+        "| Other-Mind | agent `asp-777` | `agent` | n/a |\n", encoding="utf-8")
+    asp, via = resolve(tmp_path / "core", world, agent)
+    assert asp != "asp-777"
+
+
+def test_retired_candidate_is_not_a_filing_target(tmp_path):
+    """The upstream world carries a RETIRED asp-001 (archived: true). A record
+    in that state is as absent as a missing id — targeting it lands a goal in a
+    queue nothing selects from."""
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-001", "asp-007"],
+                 statuses={"asp-001": "retired"})
+    _write_queue(agent / "aspirations.jsonl", ["asp-002"],
+                 titles={"asp-002": "Maintain Agent Health"})
+    asp, via = resolve(tmp_path / "core", world, agent)
+    assert asp == "asp-002", "must skip the retired candidate"
+    assert via.startswith("resolved:title-heuristic")
+    assert source_flag(asp, world, agent) == "agent"
+
+
+def test_title_heuristic_finds_the_operating_rhythm_home(tmp_path):
+    """The coach@zc-03 queue, verbatim shape: no candidate, no convention."""
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-006", "asp-002", "asp-003", "asp-007"],
+                 titles={"asp-002": "Operating Rhythm",
+                         "asp-003": "Memory Hygiene: retirement, dedup, and a live usefulness signal",
+                         "asp-006": "Yahoo Fantasy Sports API: OAuth, client, resource scripts",
+                         "asp-007": "Coaching intelligence: long-horizon decision skills"})
+    asp, via = resolve(tmp_path / "core", world, agent)
+    assert asp == "asp-002", "Operating Rhythm outranks the hygiene aspiration"
+    assert via.startswith("resolved:title-heuristic")
+    assert source_flag(asp, world, agent) == "world"
+
+
+def test_title_heuristic_prefers_world_over_agent_and_ignores_domain_titles(tmp_path):
+    world, agent = tmp_path / "world", tmp_path / "agent"
+    _write_queue(world / "aspirations.jsonl", ["asp-009"],
+                 titles={"asp-009": "Ship the widget-service maintenance UI"})
+    _write_queue(agent / "aspirations.jsonl", ["asp-004"],
+                 titles={"asp-004": "Operating Rhythm"})
+    asp, via = resolve(tmp_path / "core", world, agent)
+    # "maintenance" is the weakest pattern; the specific one wins across queues
+    # only within a queue — world is consulted first, and its only match is the
+    # generic word, so it resolves there. This pins the documented order.
+    assert asp == "asp-009"
+    _write_queue(world / "aspirations.jsonl", ["asp-009"],
+                 titles={"asp-009": "Ship the widget-service UI"})
+    assert resolve(tmp_path / "core", world, agent)[0] == "asp-004"
 
 
 # --- Shell wrapper contract ----------------------------------------------

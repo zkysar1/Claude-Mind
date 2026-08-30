@@ -231,6 +231,77 @@ def test_failing_ids_reads_both_output_shapes():
     assert "the" not in mod.failing_ids(lines)
 
 
+# ─── the credential tripwire (), and its controls ─────────────────
+
+def _private_file(tmp_path: Path) -> Path:
+    """A deployment's .env.local beside its world: mode 0600, credential-shaped name."""
+    p = tmp_path / ".env.local"
+    p.write_text("TOKEN=real\n", encoding="utf-8")
+    p.chmod(0o600)
+    return p
+
+
+def _clobbering_hook(secret: Path) -> str:
+    return f"#!/usr/bin/env bash\nprintf 'TOKEN=placeholder\\n' > {secret}\nexit 0\n"
+
+
+def test_a_green_suite_that_rewrites_a_credential_file_refuses_the_close(tmp_path):
+    """The 2026-08-29 clobber: the hook exits GREEN, but a mocked refresh persisted
+    over the live token file. Green is exactly the point — rc alone passes."""
+    secret = _private_file(tmp_path)
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=_clobbering_hook(secret))
+    rc, doc, err = _run(tmp_path, world, "--since", OLD)
+    assert rc == 1
+    assert doc["decision"] == "block"
+    assert doc["rc"] == 0
+    assert doc["clobbered"] == [str(secret)]
+    assert "REWROTE" in doc["reason"]
+    assert "guard-5541" in err and "does not apply" in err
+
+
+def test_the_credential_tripwire_is_not_lifted_by_an_override(tmp_path):
+    secret = _private_file(tmp_path)
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=_clobbering_hook(secret))
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD, "--override", "g-999-02: pre-existing")
+    assert rc == 1 and doc["decision"] == "block"
+    assert not (world / "domain-suite-overrides.jsonl").exists()
+
+
+def test_a_suite_that_only_reads_a_credential_file_passes(tmp_path):
+    secret = _private_file(tmp_path)
+    hook = f"#!/usr/bin/env bash\ncat {secret} > /dev/null\nexit 0\n"
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=hook)
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0 and doc["decision"] == "pass"
+    assert "clobbered" not in doc
+
+
+def test_private_files_keys_on_name_not_mode_and_skips_stores(tmp_path):
+    """Measured on the motivating deployment: every bland-named 0600 file under the
+    roots was a peer-written store or doc (forged-skills.yaml, program.md), so mode is
+    a false-block source under concurrent Bodies and names are the signal."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("domain_suite_gate_t2", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(CORE_SCRIPTS))
+    spec.loader.exec_module(mod)
+    (tmp_path / "forged-skills.yaml").write_text("x", encoding="utf-8")  # 0600, bland name: no
+    (tmp_path / "forged-skills.yaml").chmod(0o600)
+    (tmp_path / "api-token.json").write_text("x", encoding="utf-8")      # readable, named: yes
+    (tmp_path / "api-token.json").chmod(0o644)
+    (tmp_path / ".env.local").write_text("x", encoding="utf-8")          # named: yes
+    (tmp_path / "server.pem").write_text("x", encoding="utf-8")          # named by suffix: yes
+    (tmp_path / "token.lock").write_text("x", encoding="utf-8")          # lock: never
+    (tmp_path / "credential-recheck-metrics.jsonl").write_text("x", encoding="utf-8")  # a store: never
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / ".env").write_text("x", encoding="utf-8")        # not DIRECTLY under a root
+    got = mod.private_files([tmp_path])
+    assert set(got) == {str(tmp_path / "api-token.json"), str(tmp_path / ".env.local"), str(tmp_path / "server.pem")}
+    before = dict(got)
+    (tmp_path / "api-token.json").write_text("xy", encoding="utf-8")
+    assert mod.rewritten_private_files(before, mod.private_files([tmp_path])) == [str(tmp_path / "api-token.json")]
+
+
 # ─── the trigger ──────────────────────────────────────────────────────────
 
 def test_an_untouched_suite_is_a_noop_without_running_anything(tmp_path):

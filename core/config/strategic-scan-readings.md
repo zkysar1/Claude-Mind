@@ -7194,3 +7194,46 @@ Strengthened guard-3690 rather than filing a duplicate.
   created span is `18:56..21:03` THE SAME DAY, i.e. every one is under three hours old.
   Recency, not transferability, exactly as g-115-3853's title states.
 - **S4.5** silent-gap audit: 0 NEW, 2 dedup-suppressed, 0 rb-245-suppressed, 0 filed.
+
+## 2026-08-29T22:5x — bravo, `hostname` cc-05, `uname -r` 6.8.0-137-generic (own-cloud)
+
+**S3, full corpus** (verified by GOAL COUNT 2860 and `goals_omitted` key-presence
+**0/28**, per the ambiguity warning — the summary would read ~220 goals with the key
+on all): 2214 pending/in-progress across 28 active aspirations, 222 categories.
+
+    axis1  framework-architecture  811/2214 = 36.6%   PASSES
+    axis1b framework-* (30 labels) 1371/2214 = 61.9%  PASSES
+    axis2  asp-115                1856/2214 = 83.8%   FIRES   <- ABSOLUTE 1856
+
+Verdicts unchanged — axis 2 still the only fire. Routed nothing (standing property).
+
+**Its addition is a same-box longitudinal in the unambiguous worsening direction,
+which this roster has not cleanly shown before.** Against THIS box's own 08-16T22:0x
+row (40.0 / 63.0 / 82.0, asp-115 1547, n=1886) — the only comparison the cross-box
+trap permits: asp-115 absolute **1547 -> 1856 (+309, +20.0%)** while the share rose
+**82.0% -> 83.8% (+1.8pp)** on a denominator that rose 1886 -> 2214 (+328). Non-115
+on one box is a legitimate subtraction: **339 -> 358 (+19, +5.6%)**, so asp-115 grew
+**~3.6x faster proportionally** than everything else.
+
+Why that matters against the standing caveat: nearly every prior row is either a
+falling share by DILUTION (both terms up, asp-115 growing slower than its own share)
+or a rising share on a SHRINKING base. This is neither — both terms up AND asp-115
+growing faster, which is the one combination that is genuinely concentration
+tightening rather than denominator arithmetic. The file's rule still holds in both
+directions; this row is the case where quoting the absolute and the ratio together
+finally agrees on a direction.
+
+**S4.6 reconsolidation** (read-only, positive control run): 8 candidates at
+`--min-failures 2`, **14** at `--min-failures 1` — the control DISCRIMINATED, so this
+is not the undecidable 0-at-both case. **Distinct failing-goal members = 1 at BOTH
+thresholds -> `{g-335-816}`**, the same sole member every run in the marker has found
+since 08-12. Routed nothing.
+
+Its addition is a coverage data point that cuts AGAINST the coverage explanation:
+`ceiling_ratio` **0.0692 (1911 classifiable of 27622 invocations)**, `failing_count`
+645 — roughly **8-27x above** the ~0.0026-0.009 band every prior row measured, and
+near the recorded 0.087 top. **Coverage improved by an order of magnitude and the
+member set did not widen at all** — still exactly one goal, still `g-335-816`. Prior
+rows could not separate "one goal's window" from "we can only see one goal"; this one
+can, and it favours the window confound. A member set that stays at 1 while the
+ceiling grows 8x is not a visibility limit.

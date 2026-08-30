@@ -247,6 +247,84 @@ def test_discrimination_same_repo_under_threshold_is_silent(monkeypatch, tmp_pat
     assert p.check() == []
 
 
+# ── 3b. the push destination (coach@zc-03, 2026-08-30) ───────────────────────
+#
+# `ahead` asks "is this box's work reaching everyone else?", and the answer
+# lives at the URL the box PUSHES to. A deployment whose origin is a read-only
+# upstream sets `remote.origin.pushurl` to where its commits really land; HEAD
+# was 0 ahead of that tip and 52 ahead of the fetch ref, so the probe fired on
+# 28 consecutive ticks against work that had been delivered on every one.
+
+def _add_push_destination(tmp_path: Path, repo: Path) -> Path:
+    push = tmp_path / "push.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(push)],
+                   capture_output=True, text=True, timeout=60, check=True)
+    _run(repo, "config", "remote.origin.pushurl", str(push))
+    _run(repo, "push", "-q", "origin", "main")  # goes to the pushurl now
+    return push
+
+
+def test_ahead_is_measured_against_the_push_destination(monkeypatch, tmp_path):
+    """Delivered-to-pushurl commits are not drift, however far the fetch ref lags."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_AHEAD", "3")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "1")
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "100")
+    repo = _seed_repo(tmp_path, ahead=5)          # 5 ahead of the FETCH ref
+    _add_push_destination(tmp_path, repo)          # ...and all 5 delivered
+    p = _probe(monkeypatch, repo)
+    assert p.check() == [], "delivered work must not read as drift"
+    ab = p._ahead_behind(repo)
+    assert ab["ahead"] == 0 and ab["behind"] == 0
+    assert ab["ahead_basis"].startswith("pushurl:"), ab
+    assert ab["error"] is None
+
+    # DISCRIMINATION: commits not yet pushed to the destination ARE drift.
+    for i in range(4):
+        (repo / f"u{i}.txt").write_text(f"{i}\n", encoding="utf-8")
+        _run(repo, "add", f"u{i}.txt")
+        _run(repo, *_GIT_ID, "commit", "-m", f"unpushed {i}")
+    p.last_fetch_ts = 0.0                          # let the basis refresh
+    events = p.check()
+    assert len(events) == 1 and events[0].payload["ahead"] == 4
+    assert events[0].payload["ahead_basis"].startswith("pushurl:")
+
+
+def test_unreachable_pushurl_falls_back_to_the_fetch_ref_and_says_so(monkeypatch, tmp_path):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("GIT_DRIFT_AHEAD", "3")
+    monkeypatch.setenv("GIT_DRIFT_TICKS_TO_FILE", "1")
+    monkeypatch.setenv("GIT_DRIFT_DISK_PCT", "100")
+    repo = _seed_repo(tmp_path, ahead=5)
+    _run(repo, "config", "remote.origin.pushurl", str(tmp_path / "missing.git"))
+    p = _probe(monkeypatch, repo)
+    events = p.check()
+    assert len(events) == 1 and events[0].payload["ahead"] == 5
+    assert events[0].payload["ahead_basis"] == "origin/main"
+    assert "unreachable" in (events[0].payload["ahead_behind_error"] or "")
+
+
+def test_pushurl_credentials_never_reach_the_payload(monkeypatch, tmp_path):
+    _clear_env(monkeypatch)
+    repo = _seed_repo(tmp_path)
+    _run(repo, "config", "remote.origin.pushurl",
+         "https://user:s3cret-token@example.invalid/org/repo.git")
+    p = _probe(monkeypatch, repo)
+    basis = p._resolve_push_basis(repo)
+    assert basis is not None and "s3cret" not in basis["url"]
+    assert basis["url"].startswith("https://***@example.invalid/")
+
+
+def test_push_basis_round_trips_with_state(tmp_path):
+    p = WD.GitDriftProbe(_Ctx(tmp_path))
+    p.push_basis = {"url": "/x/push.git", "tip": "abc123", "error": None}
+    q = WD.GitDriftProbe(_Ctx(tmp_path))
+    q.from_dict(p.to_dict())
+    assert q.push_basis == p.push_basis
+    q.from_dict({"push_basis": "garbage"})
+    assert q.push_basis is None
+
+
 # ── 4. POSITIVE CONTROL: behind (the cc-03 dormant-box shape) ────────────────
 
 def test_positive_control_seeded_behind_fires(monkeypatch, tmp_path):

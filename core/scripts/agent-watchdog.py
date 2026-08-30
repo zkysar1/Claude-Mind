@@ -109,6 +109,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2849,6 +2850,10 @@ class GitDriftProbe(Probe):
         self.consecutive_breach = 0
         self.fired = False
         self.last_fetch_ts = 0.0
+        # Where this box's commits actually GO when `remote.origin.pushurl`
+        # points somewhere other than the fetch URL: {"url": masked, "tip": sha}
+        # resolved on the fetch cadence, or None when pushes go to origin itself.
+        self.push_basis: Optional[dict] = None
 
     # ---- measurement -----------------------------------------------------
 
@@ -2868,19 +2873,61 @@ class GitDriftProbe(Probe):
         _git(root, "fetch", "--quiet", "origin", "main", timeout=30.0)
         _git(root, "fetch", "--quiet", "--prune", "origin",
              "+refs/workers/*:refs/workers/*", timeout=45.0)
+        self.push_basis = self._resolve_push_basis(root)
         return True
+
+    def _resolve_push_basis(self, root: Path) -> Optional[dict]:
+        """The tip of `main` at `remote.origin.pushurl`, when one is configured.
+
+        `ahead` answers "is this box's work reaching everyone else?", and the
+        answer lives at the URL the box PUSHES to. A deployment whose origin is
+        a read-only upstream pushes elsewhere (measured 2026-08-30, coach@zc-03:
+        `url` = the staging repo it pulls from, `pushurl` = the box-local bare
+        repo every commit lands in — HEAD was 0 ahead of that tip and 52 ahead
+        of the fetch ref, so the probe fired on 28 consecutive ticks against
+        work that had been delivered on every one of them). Same cadence as the
+        fetch, so it adds no per-tick I/O. None = pushes go to the fetch URL.
+        An unreachable pushurl is recorded, not guessed around: the caller
+        falls back to the fetch ref and says so in the payload.
+        """
+        rc, pushurl, _ = _git(root, "config", "--get", "remote.origin.pushurl")
+        pushurl = pushurl.strip()
+        if rc != 0 or not pushurl:
+            return None
+        masked = re.sub(r"://[^/@]+@", "://***@", pushurl)
+        rc, out, err = _git(root, "ls-remote", "--quiet", "--heads", pushurl, "main",
+                            timeout=30.0)
+        tip = out.split()[0] if rc == 0 and out.split() else None
+        return {"url": masked, "tip": tip,
+                "error": None if tip else (err[:160] or f"ls-remote rc={rc}")}
 
     def _ahead_behind(self, root: Path) -> dict:
         rc, out, err = _git(root, "rev-list", "--left-right", "--count",
                             "origin/main...HEAD")
         if rc != 0:
-            return {"ahead": None, "behind": None, "error": err[:160] or f"rc={rc}"}
+            return {"ahead": None, "behind": None, "ahead_basis": "origin/main",
+                    "error": err[:160] or f"rc={rc}"}
         try:
             behind, ahead = (int(x) for x in out.split())
         except (ValueError, TypeError):
-            return {"ahead": None, "behind": None,
+            return {"ahead": None, "behind": None, "ahead_basis": "origin/main",
                     "error": f"unparseable rev-list output: {out!r}"}
-        return {"ahead": ahead, "behind": behind, "error": None}
+        basis = "origin/main"
+        note = None
+        pb = self.push_basis
+        if pb:
+            if pb.get("tip"):
+                rc2, cnt, err2 = _git(root, "rev-list", "--count", f"{pb['tip']}..HEAD")
+                if rc2 == 0 and cnt.isdigit():
+                    ahead, basis = int(cnt), f"pushurl:{pb['url']}"
+                else:
+                    note = (f"pushurl tip {pb['tip'][:12]} not usable locally "
+                            f"({err2[:80] or f'rc={rc2}'}); ahead measured against origin/main")
+            else:
+                note = (f"pushurl {pb['url']} unreachable ({pb.get('error')}); "
+                        f"ahead measured against origin/main")
+        return {"ahead": ahead, "behind": behind, "ahead_basis": basis,
+                "error": note}
 
     def _carrier_depths(self, root: Path) -> dict:
         # Local import, matching MirrorWedgeProbe: WORLD_DIR's module-level bind
@@ -2984,6 +3031,7 @@ class GitDriftProbe(Probe):
             "agent": self.ctx.agent_name,
             "branch": _git(root, "rev-parse", "--abbrev-ref", "HEAD")[1] or None,
             "ahead": ab["ahead"], "behind": ab["behind"],
+            "ahead_basis": ab.get("ahead_basis"),
             "ahead_behind_error": ab["error"],
             "carrier_refs": carrier["refs"],
             "carrier_max_unconsumed": carrier["max_unconsumed"],
@@ -3238,7 +3286,8 @@ class GitDriftProbe(Probe):
     def to_dict(self) -> dict:
         return {"consecutive_breach": self.consecutive_breach,
                 "fired": self.fired,
-                "last_fetch_ts": self.last_fetch_ts}
+                "last_fetch_ts": self.last_fetch_ts,
+                "push_basis": self.push_basis}
 
     def from_dict(self, state: dict) -> None:
         if isinstance(state, dict):
@@ -3248,6 +3297,8 @@ class GitDriftProbe(Probe):
                 self.last_fetch_ts = float(state.get("last_fetch_ts") or 0.0)
             except (TypeError, ValueError):
                 self.last_fetch_ts = 0.0
+            pb = state.get("push_basis")
+            self.push_basis = pb if isinstance(pb, dict) and pb.get("url") else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
