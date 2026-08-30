@@ -407,9 +407,58 @@ and the preflight run — instead of relying on the operator to hand-carry it.
 G4's 3-per-24h ceiling is the natural batch bound: inject ONE goal enumerating
 the drifted files, never one goal per file.
 
+## g — `framework_origin`: a downstream deployment refuses LOCAL framework writes (normative)
+
+The chain says a downstream Mind does not develop the framework — "Omni refuses
+dev work" — and until 2026-08-30 that sentence was the whole enforcement. It
+does not survive a small model. Measured that day on coach-mind (zc-03): a Body
+executing `/curriculum-gates` used its edit tool three times on
+`.claude/skills/curriculum-gates/SKILL.md` to write its step RESULTS under the
+step headings ("Gates evaluated: configured=false, all_passed=false, gates=[]
+(15.2 complete)") — the skill file as a worksheet. Nothing refused it, the loop
+would have committed it, and the next `git merge` of that file from upstream
+would have collided.
+
+**The opt-in is one registry field.** `core/config/environments/<env>.yaml`
+may carry `framework_origin: <env-id>` — the deployment this one takes its
+framework FROM. When present (and not naming the deployment itself):
+
+| layer | mechanism | what it catches |
+|---|---|---|
+| L1 write-time | `path-resolution-hook.py` (PreToolUse Write/Edit/MultiEdit) denies any target under `core/`, `.claude/`, `mind_api/` or `CLAUDE.md`, naming the origin and the three routes below | the edit-tool shape (the measured one) |
+| commit-time | pre-commit **Gate 15** `check-framework-origin-writes.py` refuses a commit with ANY staged change (add/modify/delete/rename) to those paths | `cat >`, `sed -i`, `cp`, heredocs — the shell shapes L1 cannot see |
+
+Policy, path set and fail-open are one module, `core/scripts/_framework_origin.py`
+(the path set mirrors `promotion-preflight.py` FRAMEWORK_PATHS at the top level;
+`core/logs/`, `mind_api/state/` and the other runtime dirs are exempt). Absent
+field = the deployment is a framework origin: local framework edits stay
+allowed and git-audited, so **no existing entry changes behaviour** until it
+opts in. Every failure resolves to "origin" (no refusal) — blocking the dev
+loop is the dangerous error, one edit slipping through is not.
+
+The refusal ROUTES rather than merely blocks — the same three lines both layers
+print:
+
+1. a framework defect or improvement → `cross-world-inject-goal.sh --target
+   <origin> ...` (§ f's transport; G3 makes it land as `[agent,user]` in the
+   origin's queue, reviewed there);
+2. domain code, conventions, forged skills → the world (`$WORLD_PATH/scripts`,
+   `$WORLD_PATH/conventions`), which stays writable;
+3. a change already made by a shell command → `git checkout HEAD -- <path>`, so
+   the tree stays mergeable.
+
+**The one sanctioned local framework writer is the promotion plant.**
+`seed-transplant.sh` sets `FRAMEWORK_WRITE_OVERRIDE` on its own commit (logged as
+an `override` gate firing, never silent). `git merge` of an upstream tag runs no
+pre-commit hook, so C3's pull is unaffected. Which deployments opt in is a
+deployment decision, not a framework default: coach-mind (small-model test bed)
+does; the production Mind, whose self-evolution has produced real target-ahead
+improvements that § f carries up, is left to its operator.
+
 ## Cross-references
 
 - `.claude/rules/promotion-cycle.md` — the chain and the push/pull split
+- `core/scripts/_framework_origin.py`, `core/scripts/check-framework-origin-writes.py` — § g's policy module and Gate 15
 - `core/config/conventions/promotion-runbook.md` — the PUSH side
 - `core/config/conventions/fleet-secret-provisioning.md` — the fleet token (C6)
 - `core/config/conventions/cross-deployment-channel.md` — peer registry (C7)

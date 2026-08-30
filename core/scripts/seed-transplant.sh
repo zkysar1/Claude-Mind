@@ -523,8 +523,13 @@ if [ $DO_COMMIT -eq 1 ] && [ -e "$DEST/.git" ]; then
     # destination's own core/githooks/commit-msg would refuse the plant. The
     # SUBJECT line above is unchanged, so the `^chore: sync framework` grep
     # still finds this commit.
+    # FRAMEWORK_WRITE_OVERRIDE: on a destination whose registry entry names a
+    # `framework_origin`, pre-commit Gate 15 refuses every local framework
+    # commit — this plant IS the sanctioned framework writer, so it carries the
+    # override (logged as an override firing, never silent).
     set +e
-    COMMIT_OUT="$(git -C "$DEST" commit -m "chore: sync framework ($TS)" \
+    COMMIT_OUT="$(FRAMEWORK_WRITE_OVERRIDE="seed-transplant plant — the promotion train is the sanctioned framework writer" \
+        git -C "$DEST" commit -m "chore: sync framework ($TS)" \
         -m "size-budget-override: framework seed plant — hot-path files track the upstream versions" -q 2>&1)"
     COMMIT_RC=$?
     set -e

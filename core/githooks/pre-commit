@@ -210,3 +210,13 @@ _gate check-sh-exec-bits bash "$REPO/core/scripts/check-sh-exec-bits.sh" --stage
 # chokepoint Bash cannot skip. Override for a genuine framework extension:
 # REPO_ROOT_ENTRY_OVERRIDE="<why>" (logged as an override firing).
 _gate check-repo-root-entries $PY "$REPO/core/scripts/check-repo-root-entries.py" "$REPO"
+
+# Gate 15: no LOCAL framework write on a deployment that takes its framework
+# from a `framework_origin` (2026-08-30, coach@zc-03). The registry entry
+# core/config/environments/<ENVIRONMENT_ID>.yaml opts a deployment in; every
+# origin (no field) exits 0 before git is touched. The L1 hook refuses the
+# Write/Edit; this is the backstop for `cat >` / `sed -i` / heredocs. Measured
+# trigger: a small-model Body wrote its step results INTO a SKILL.md under the
+# step headings. The promotion plant (seed-transplant.sh) is the sanctioned
+# writer and sets FRAMEWORK_WRITE_OVERRIDE itself (logged as an override).
+_gate check-framework-origin-writes $PY "$REPO/core/scripts/check-framework-origin-writes.py" "$REPO"
