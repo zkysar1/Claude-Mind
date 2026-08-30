@@ -379,6 +379,29 @@ unset _AGENT_DIR_OVERRIDE
 # subprocess invokes it directly (no PATH lookup) and the MSYS/Git-Bash
 # binary parses `C:/...` script args correctly. See
 # world/conventions/windows-shell-config.md.
+# --- canon_dir — comparable spelling of a directory path () -------
+# Emits $1 with trailing slashes stripped and, when the directory EXISTS, fully
+# resolved via `cd -P` (symlinks and `..` collapsed). Pure bash on purpose:
+# `realpath` is absent from some Git Bash installs and this runs inside the
+# shared-runtime claim gate on every box.
+#
+# A NONEXISTENT path is returned trailing-slash-stripped and otherwise as-is.
+# That fallback is safe for a gate that compares against a directory it expects
+# to exist: any alternate spelling of an EXISTING directory is itself an
+# existing path, so a path that fails to resolve cannot be a spelling of one
+# that does. Callers comparing two possibly-absent paths get plain string
+# equality, i.e. today's behavior, never a false match.
+canon_dir() {
+    local d="${1:-}"
+    [ -z "$d" ] && return 0
+    while [ "$d" != "/" ] && [ "$d" != "${d%/}" ]; do d="${d%/}"; done
+    if [ -d "$d" ]; then
+        (cd -P "$d" 2>/dev/null && pwd) || printf '%s\n' "$d"
+    else
+        printf '%s\n' "$d"
+    fi
+}
+
 # --- git_available — cached probe (Phase 2.2 packaging cleanup) -------------
 # Returns 0 if git is installed AND PROJECT_ROOT is a git work tree; 1 else.
 # Cached per-process via MIND_GIT_AVAILABLE so repeat callers don't re-fork

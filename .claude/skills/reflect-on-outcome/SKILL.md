@@ -412,7 +412,7 @@ proposed_step = {
 
 IF recurrence_count >= 2:
     # Auto-apply: multiple guardrails cover the same lesson → promote to convention
-    Bash: bash core/scripts/history-save.sh "$WORLD_DIR/conventions/{target_convention}.md" {agent_name} "Convention learning: adding step from hypothesis {hypothesis.id}"
+    Bash: source core/scripts/_paths.sh && bash core/scripts/history-save.sh "$WORLD_DIR/conventions/{target_convention}.md" {agent_name} "Convention learning: adding step from hypothesis {hypothesis.id}"
     Edit $WORLD_DIR/conventions/{target_convention}.md:
         Append new step at appropriate position (before session-boundary sweep if post-execution)
     # Retire subsumed guardrails

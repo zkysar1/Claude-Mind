@@ -223,6 +223,17 @@ def prior_decision_block(asp: dict, dedup_title: str,
             continue
         if not (g.get("outcome_note") or "").strip():
             continue
+        # ORDERING consumer of completed_at (, 2026-08-30). This is a
+        # MAX-SELECTION, not a window: a completed_at rewritten by the backfill
+        # (mind_api/src/endpoints/aspirations_write.py:2759-2761 and
+        # core/scripts/aspirations.py:84-98 stamp datetime.now() on any terminal
+        # goal missing it) makes a STALE goal win this comparison, and the caller
+        # then quotes it as "PRIOR DECISION -- this exact question already has a
+        # recorded answer". guard-2613 prescribes filtering on completed_by; that
+        # remedy is for WINDOW consumers and does NOT help here -- constraining WHO
+        # closed a goal cannot repair a comparator reading a rewritten timestamp.
+        # An ordering fix needs a stable order field or an explicit tiebreak.
+        # Do not "fix" this by adding a completed_by check. See guard-2613.
         when = g.get("completed_at") or g.get("completed_date") or ""
         if best is None or when >= best_when:
             best_when, best = when, g

@@ -558,6 +558,83 @@ The allowlist gate lives in `core/scripts/path-resolution-hook.py`
 the allowlist — the same mechanism that denies any future invented
 directory.
 
+## Script-owned session files (the Write/Edit fence, g-306-376)
+
+The allowlist above admits the whole `session` dir, and the sessions/<sid>
+branch admits anything under a bound SID dir as sanctioned scratch. So both
+surfaces admitted a HAND-AUTHORED write of a file a script owns — right name,
+wrong shape, and every later reader trusts it.
+
+Measured 2026-08-30 (coach, zc-03): after `session-state-set` correctly refused
+RUNNING for a missing liveness carrier, the reducer used the **Write tool** to
+create `agents/coach/session/body-heartbeat-<sid>.json` by hand, with
+`session_id`/`timestamp`/`phase` keys and a 2025 timestamp. Bash was already
+fenced (`bash-store-write-guard` refuses cp/mv/redirect into governed stores);
+the Write/Edit lane was not.
+
+**Decision (2026-08-30): deny at the L1 hook, not the honor system.** The blast
+radius is zero BY CONSTRUCTION rather than by measurement — the hook is
+`PreToolUse[Write|Edit|MultiEdit]` only, and every sanctioned writer below is a
+bash/python script that never passes through a tool hook. No second allowlist
+was added; the fence is a deny-list of basenames layered under the existing
+allowlist, because these are specific known artifacts rather than a location
+class.
+
+This table is the SSOT for that deny-list. `core/scripts/path-resolution-hook.py`
+carries the same names in `_SCRIPT_OWNED_SESSION_FILES` /
+`_SCRIPT_OWNED_SESSION_PREFIXES`, and
+`core/scripts/tests/test_path_resolution_hook_script_owned_session.py` fails if
+a name here and a name there disagree. That test exists because the list is a
+PRODUCER/CONSUMER sync point (guard-3408): a producer that renames one of these
+files escapes the fence silently, and nothing else would notice.
+
+| File (direct child of `session/` or `sessions/<sid>/`) | Only sanctioned writer |
+|---|---|
+| `body-heartbeat-<sid>.json` (prefix `body-heartbeat-`) | `heartbeat-tick.sh` / the Body liveness carrier writer |
+| `binding.yaml` | `session-binding-write.sh` (via `/start`) |
+| `session-summary.yaml` | aspirations-graceful-stop D6.5 |
+| `running-session-id` | `/start` (`session-save-id.sh`) |
+| `latest-session-id` | `/start` (`session-save-id.sh`) |
+| `runner-token` | `/start` (IDLE Step 3 / UNINITIALIZED C8) |
+| `agent-state` | `session-state-set.sh` — `/start` and `/stop` only |
+| `agent-mode` | `session-mode-set.sh` — `/start` and `/stop` only |
+| `persona-active` | `session-persona-set.sh` |
+| `stop-loop` | `session-signal-set.sh` — `/stop` only |
+| `stop-requested` | `session-signal-set.sh` — `/stop`, `productivity-stop-gate.sh`, `reducer-self-fence.sh` |
+| `claim-renewal-last` | the claim-renewal path in `aspirations-claim.sh` |
+| `execute-in-flight` | aspirations-execute |
+
+Scope is deliberately narrow in two directions, and both are pinned by tests:
+
+- **DIRECT CHILDREN ONLY.** `sessions/<sid>/scratch/agent-state` is scratch and
+  still lands. Widening to any-depth would swallow the L1-sanctioned scratch
+  home (`path-resolution.md`).
+- **ONLY THE ENUMERATED SET.** `handoff.yaml`, the working-memory store, and the
+  rest of `session/` are untouched. This is not a claim that they are safe to
+  hand-write — it is scope discipline. Add a row (and the hook constant) if one
+  of them is ever hand-authored in anger; do not pre-emptively broaden.
+
+The three files beyond this goal's original enumeration — `persona-active`,
+`stop-loop`, `stop-requested` — are here because
+`.claude/rules/user-interaction.md` already forbids Claude to write them by any
+means. Leaving out the ones the framework forbids most strongly would have
+fenced the mild half of the class and left the dangerous half open.
+
+**A script refusing to write one of these is a real precondition failure.** The
+deny text says so and names the owning script, because the failure mode this
+whole fence exists to stop is an agent reading a refusal as an obstacle and
+producing the artifact by hand. Fix the precondition, never the artifact.
+
+### A note on the sibling Bash guard's opposite failure
+
+Writing this section tripped `bash-store-write-guard`, which refused an inline
+Python heredoc because the PROSE contained a store filename — no store write was
+attempted. That is the exact mirror of the defect above: the Bash lane matches
+on a filename appearing anywhere in the command TEXT (over-matches), while the
+Write lane matched on location only (under-matched). Both lanes now guard the
+same class from opposite directions, and each still errs its own way. Recorded
+here so the next reader of either guard sees both halves at once.
+
 ## Migration (reports/ → temp/ → removed)
 
 `agents/<agent>/reports/` no longer exists. It was the legacy slush pile for

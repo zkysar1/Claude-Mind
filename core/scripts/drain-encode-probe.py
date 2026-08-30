@@ -225,6 +225,25 @@ def probe_goal(payload):
     # --title-contains is a substring filter; a long title can drift after
     # filing (reword-to-clear-duplication-gate), so match on a stable prefix.
     needle = title[:60]
+    # A SHORT needle is a SUBSTRING OF EVERYTHING, and this probe's verdict can
+    # authorise a delete -- so refuse to assert instead of matching loosely.
+    # Measured 2026-08-30 (, bravo/cc-05) as the guard-1432 negative
+    # control on this classifier: the SAME payload, title truncated to the 8
+    # generic chars 'Resolve ', returned encoded against  -- a
+    # DIFFERENT goal than the  the untruncated payload matched. So the
+    # loose branch does not merely over-match; it silently re-attributes the
+    # payload to an unrelated record and still calls it consumed.
+    # Non-regressive on the live population: all 24 goal-shape `encoded`
+    # verdicts across 471 temp payloads carry titles of 66-303 chars (min 66),
+    # so this floor changes no live verdict -- it closes the branch before a
+    # short-titled payload ever reaches it. `unknown`, never `absent`: no claim
+    # was established either way, and guard-3616 forbids handing a definite
+    # verdict to the no-information case.
+    if len(needle) < 30:
+        return "unknown", (
+            "title prefix %r is too short (<30 chars) to discriminate -- a "
+            "substring match here can name an unrelated goal" % needle
+        )
     rows = _run(
         _sh("aspirations-query.sh", "--title-contains", needle)
     )

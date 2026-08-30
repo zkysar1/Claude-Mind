@@ -60,6 +60,14 @@ def _count_anomalies(aspirations):
                 or g.get("blocker_ref") is not None
                 or g.get("blocked_since") is not None
             )
+            # PRESENCE consumer of completed_at (, 2026-08-30), and the
+            # exposure runs OPPOSITE to every other consumer. This sweep exists to
+            # find terminal goals MISSING a completed_at stamp; the 2026-08-08
+            # backfill STAMPED precisely those rows, so backfill does not inflate
+            # this check -- it SILENCES it, and a silenced defect-finder reports
+            # clean, which is indistinguishable from a healthy corpus. guard-2613
+            # prescribes a completed_by filter for at-risk consumers; it does
+            # nothing here. Judge this sweep's zero against the backfill date.
             completed_at_missing = g.get("completed_at") is None
             if defer_state or completed_at_missing:
                 count += 1

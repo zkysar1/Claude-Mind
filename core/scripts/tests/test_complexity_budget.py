@@ -130,3 +130,22 @@ def test_cli_measure_only(tmp_path, capsys):
     rc = cb.main(["--root", str(tmp_path)])
     out = json.loads(capsys.readouterr().out)
     assert rc == 0 and out["metrics"]["gate_scripts"] == 2 and out["metrics"]["rules"] == 3
+
+
+def test_precheck_skill_is_a_tracked_line_count_target():
+    """: precheck_lines must stay in _LINE_COUNT_TARGETS.
+
+    The two original entries measured the surface already under deliberate
+    DOWNWARD pressure (the orchestrator is small because the loop-digest
+    extraction slimmed it), so the instrument read healthy for 26 days while
+    aspirations-precheck/SKILL.md grew +651 lines (+29.4%) against the
+    orchestrator's +54 (+6.6%) — 12x the lines at 4.5x the rate.
+
+    Nothing else pins this. hot-path-size-gate.sh also sees the file, but by
+    BYTES and as a commit-time PASS/FAIL on a CORPUS total, so it cannot say
+    which of 131 skills grew. Removing this key would silently restore the
+    blind spot that took three agents on three boxes to notice.
+    """
+    assert cb._LINE_COUNT_TARGETS.get("precheck_lines") == (
+        ".claude/skills/aspirations-precheck/SKILL.md"
+    )

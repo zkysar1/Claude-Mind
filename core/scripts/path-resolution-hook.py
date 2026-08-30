@@ -90,6 +90,119 @@ _AGENT_DIR_ALLOWLIST_FILES = frozenset({
     "COMPLETION-REPORT.md",
 })
 
+# --- Script-owned session files () --------------------------------
+# These live INSIDE allowlisted dirs (session/, sessions/<sid>/), so every
+# check above approves them: the agent-dir allowlist admits the whole
+# `session` dir, and the sessions/<sid> branch below approves any path under a
+# bound SID dir as sanctioned scratch. Measured 2026-08-30 (coach, zc-03): a
+# reducer hand-authored agents/coach/session/body-heartbeat-<sid>.json with the
+# Write tool, in the wrong shape, after a script correctly refused. Bash was
+# already fenced (bash-store-write-guard refuses cp/mv/redirect into governed
+# stores); the Write/Edit lane was not.
+#
+# BLAST RADIUS IS ZERO BY CONSTRUCTION, not by measurement (rb-8987 asks that a
+# fence be proven to ADMIT): this hook is PreToolUse[Write|Edit|MultiEdit] only,
+# and every legitimate writer of these files is a bash/python script that never
+# passes through a tool hook. So the deny cannot reach heartbeat-tick.sh,
+# session-state-set.sh, session-binding-write.py, wm-*.sh or any sibling.
+#
+# The list is a PRODUCER/CONSUMER sync point (guard-3408): a producer that
+# renames one of these files silently escapes the fence. SSOT is
+# core/config/conventions/temp-store.md ("Script-owned session files"); the
+# owning script is named per entry there and in the deny text below.
+# Enumeration source: this goal's list, plus the three files
+# .claude/rules/user-interaction.md already forbids Claude to write directly
+# (persona-active, stop-loop, stop-requested) — omitting the ones the framework
+# forbids most strongly would have left the worst half of the class open.
+_SCRIPT_OWNED_SESSION_FILES = frozenset({
+    "binding.yaml", "session-summary.yaml",
+    "running-session-id", "latest-session-id", "runner-token",
+    "agent-state", "agent-mode", "persona-active",
+    "stop-loop", "stop-requested",
+    "claim-renewal-last", "execute-in-flight",
+})
+# Carrier files are SID-suffixed, so they need a prefix rule, not a basename.
+_SCRIPT_OWNED_SESSION_PREFIXES = ("body-heartbeat-",)
+# basename -> the ONLY sanctioned writer, quoted in the deny so the reader is
+# handed the fix instead of a wall.
+_SCRIPT_OWNED_SESSION_OWNERS = {
+    # Prefix-matched entries are keyed by the PREFIX (see owner_for_script_owned
+    # below). The carrier is the file from the originating incident, so a generic
+    # "the script that owns it" here would degrade exactly the message that
+    # matters most — measured by a live production-shape probe, after a
+    # basename-only lookup passed its unit test on `agent-state`.
+    "body-heartbeat-": "heartbeat-tick.sh / the Body liveness carrier writer",
+    "binding.yaml": "session-binding-write.sh (via /start)",
+    "session-summary.yaml": "aspirations-graceful-stop D6.5",
+    "running-session-id": "/start (session-save-id.sh)",
+    "latest-session-id": "/start (session-save-id.sh)",
+    "runner-token": "/start (IDLE Step 3 / UNINITIALIZED C8)",
+    "agent-state": "session-state-set.sh — /start and /stop only",
+    "agent-mode": "session-mode-set.sh — /start and /stop only",
+    "persona-active": "session-persona-set.sh",
+    "stop-loop": "session-signal-set.sh — /stop only",
+    "stop-requested": "session-signal-set.sh — /stop, productivity-stop-gate.sh, reducer-self-fence.sh",
+    "claim-renewal-last": "the claim-renewal path in aspirations-claim.sh",
+    "execute-in-flight": "aspirations-execute",
+}
+
+
+def script_owned_session_basename(target, agent_dir_norm):
+    """Return the basename if `target` is a script-owned session file.
+
+    Fires ONLY for a DIRECT child of <agent>/session/ or of
+    <agent>/sessions/<sid>/ — a nested path such as
+    sessions/<sid>/scratch/notes.md stays the sanctioned scratch home it is
+    (path-resolution.md L1). Returns None when nothing matches, so every
+    caller falls through to today's behavior.
+    """
+    if not agent_dir_norm:
+        return None
+    # NORMALIZE FIRST. Measured 2026-08-30 by adversarial probe against this very
+    # function: `session/./agent-state` and `sessions/../session/agent-state` both
+    # reached APPROVE, because a raw split sees "." / ".." as ordinary segments and
+    # the depth test then fails. Those are not exotic — a constructed path hits them
+    # by accident, and an agent that has just been refused hits them on purpose.
+    target = os.path.normpath(target).replace("\\", "/")
+    if not is_under(target, agent_dir_norm):
+        return None
+    rel = target[len(agent_dir_norm) + 1:]
+    parts = rel.split("/")
+    if len(parts) == 2 and parts[0] == SESSION_DIRNAME:
+        name = parts[1]
+    elif len(parts) == 3 and parts[0] == SESSIONS_DIRNAME:
+        name = parts[2]
+    else:
+        return None
+    # Compare on a folded key, and fold the way the FILESYSTEM does, not the way
+    # POSIX does. Windows and macOS match names case-insensitively and Windows
+    # additionally strips trailing dots and spaces, so `Agent-State` and
+    # `"agent-state "` are THE SAME FILE there — both probed APPROVE before this.
+    # Folding on every platform is deliberate: a fence must fail closed, and on
+    # Linux the cost is refusing a write to `Agent-State`, a file no sanctioned
+    # writer produces, with a deny message that explains itself.
+    key = name.strip().rstrip(". ").lower()
+    if key in {b.lower() for b in _SCRIPT_OWNED_SESSION_FILES}:
+        return name
+    if any(key.startswith(pfx.lower()) for pfx in _SCRIPT_OWNED_SESSION_PREFIXES):
+        return name
+    return None
+
+
+def owner_for_script_owned(name):
+    """Sanctioned writer for a script-owned session file.
+
+    Exact basenames first, then the prefix rule — a carrier file is
+    `body-heartbeat-<sid>.json`, so it can never hit an exact-basename key and
+    a basename-only lookup silently falls back to the generic string.
+    """
+    if name in _SCRIPT_OWNED_SESSION_OWNERS:
+        return _SCRIPT_OWNED_SESSION_OWNERS[name]
+    for pfx in _SCRIPT_OWNED_SESSION_PREFIXES:
+        if name.startswith(pfx) and pfx in _SCRIPT_OWNED_SESSION_OWNERS:
+            return _SCRIPT_OWNED_SESSION_OWNERS[pfx]
+    return "the framework script that owns it"
+
 
 def _resolve_agent_dir(project_root, agent):
     """Compute agent dir path. Mirrors agent_dir() in _paths.py."""
@@ -478,6 +591,29 @@ def main():
                 and agent_dir_norm
                 and is_under(target, agent_dir_norm)
             ):
+                owned = script_owned_session_basename(target, agent_dir_norm)
+                if owned is not None:
+                    writer = owner_for_script_owned(owned)
+                    emit_deny(
+                        f"Path-resolution hook (L1) blocked {tool_name} to:\n"
+                        f"  {file_path}\n"
+                        f"'{owned}' is a SCRIPT-OWNED session file. Its only "
+                        f"sanctioned writer is: {writer}.\n"
+                        f"Hand-authoring it produces a file of the right NAME "
+                        f"and the wrong SHAPE, which every reader then trusts "
+                        f"(measured 2026-08-30, coach/zc-03: a hand-written "
+                        f"body-heartbeat carrier carried the wrong keys and a "
+                        f"2025 timestamp).\n"
+                        f"A script REFUSING to write this file is a real "
+                        f"precondition failure — fix the precondition, never "
+                        f"the artifact.\n"
+                        f"Options:\n"
+                        f"  (a) Run the owning script above and read its error.\n"
+                        f"  (b) If it refuses, satisfy what it names (that "
+                        f"refusal is the diagnostic).\n"
+                        f"  (c) For scratch, write under "
+                        f"{agent}/sessions/$MIND_SID/scratch/ — still allowed."
+                    )
                 sessions_root = agent_dir_norm + "/sessions"
                 if is_under(target, sessions_root) and target != sessions_root:
                     rel = target[len(sessions_root) + 1:]

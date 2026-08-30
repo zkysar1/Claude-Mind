@@ -259,11 +259,42 @@ class TestMindRecommendations(unittest.TestCase):
                     self.assertIn("STORAGE_BACKEND=local", r,
                                   f"unpinned pytest command for {paths}: {r}")
 
-    def test_skill_md_recommends_skill_evaluate(self):
+    def test_skill_md_emits_the_rule_prescription_not_skill_evaluate(self):
+        """ / guard-4123 — this test previously PINNED the defect.
+
+        The banner cites run-full-suite-after-deep-code.md by path on the line
+        above its recommendations, and that rule's per-path row singles out
+        skill-evaluate.sh as WRONG for this path class: the bare form errors
+        `unknown subcommand`, and `score` rates RUNTIME skill-on-goal
+        performance, not a static SKILL.md edit.
+
+        The headline assertion is ABSENCE-shaped, and an absence is exactly what
+        a dead arm also produces — an arm that emitted nothing, or that stopped
+        classifying SKILL.md at all, would satisfy it perfectly. So it runs
+        beside positive controls that fail under those mutants (guard-4166).
+        """
         recs = self.mod._mind_recommendations(
             self.mod._classify_mind([".claude/skills/aspirations-execute/SKILL.md"])
         )
-        self.assertTrue(any("skill-evaluate.sh aspirations-execute" in r for r in recs))
+        # ── the assertion under test ──────────────────────────────────────
+        self.assertFalse(
+            any("skill-evaluate.sh" in r for r in recs),
+            f"recommender emits the one command its own cited rule forbids: {recs}",
+        )
+        # ── positive controls: the arm still fires, and still prescribes ──
+        self.assertTrue(recs, "skill_md arm emitted nothing at all")
+        self.assertTrue(
+            any("domain-leak-check.sh" in r for r in recs),
+            f"rule's prescribed check absent: {recs}",
+        )
+        self.assertTrue(
+            any("verify-learning" in r for r in recs),
+            f"behaviour-change check absent: {recs}",
+        )
+        self.assertTrue(
+            any(".claude/skills/aspirations-execute/SKILL.md" in r for r in recs),
+            f"the touched path is named in no recommendation: {recs}",
+        )
 
     def test_pure_rule_change_no_pytest(self):
         # Pure rule edits should NOT trigger pytest — only manual review note

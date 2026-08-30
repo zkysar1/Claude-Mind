@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.46",
+    "previous_version": "2.12.45",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "re-cut of v2.12.45 from the merged frontier so the tagged tree contains every skill the shared forged-skills registry lists; payload is the worker reducer-liveness fp-adoption fix plus the peer's call-shape-census skill",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.45",
+    "previous_version": "2.12.44",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "worker reducer-liveness: a same-box reducer restart winds a worker down once and then adopts the new runner-token fingerprint, instead of latching the stale baseline and stranding every worker in the fleet",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.44",
     "previous_version": "2.12.43",
     "date": "2026-08-30",

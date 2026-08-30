@@ -762,21 +762,23 @@ DONE.
 
      **CW1a — force-fresh the canonical WM from the shared store.** The fork must
      start from the reducer's LATEST push, not this box's read-through cache:
-     Bash: `bash core/scripts/backend-cat.sh cat agents/<agent-name>/session/working-memory.yaml > agents/<agent-name>/session/working-memory.yaml.fresh && mv agents/<agent-name>/session/working-memory.yaml.fresh agents/<agent-name>/session/working-memory.yaml && echo "CW1A_FRESH_OK"`
-     (The `cat` SUBCOMMAND is required — `backend-cat.sh <path>` with no subcommand
-     exits 2 (usage). Verified live on this box: the subcommand form returns rc=0 and
-     74020 bytes; the bare form returns rc=2 and zero. Under own-cloud `cat` routes to
-     `read_authoritative_bytes`, a PURE to-memory read of the shared store that never
-     mutates the local mirror — which is exactly why the redirect+`mv` in the command
-     above is what actually refreshes the mirror; `cat` alone would print fresh bytes
-     and leave the stale file in place.
-     Under own-cloud the local tree is a read-through CACHE — a file this box has
-     never read does not materialize locally, and one it read hours ago is stale
-     (guard-980). Forking a stale mirror would hand the reducer a merge baseline that
-     never existed on either box, silently mis-attributing every counter delta.
-     Write-to-temp-then-`mv` so a failed fetch cannot truncate the local WM. If this
-     step fails, HALT — proceeding would fork from the stale cache, which is the one
-     outcome this step exists to prevent.)
+     Bash: `bash core/scripts/owncloud-pull.sh --agent <agent-name> --only working-memory.yaml; echo "CW1A_FRESH_RC=$?"`
+     (Same sanctioned path the `/start` IDLE branch already uses, narrowed by `--only`
+     (g-115-3074) — no new writer. It REPLACES a redirect-plus-rename shell copy that
+     `bash-store-write-guard` correctly refuses (guard-996: a temp-file-then-rename IS
+     an authored raw write). Do NOT restore the copy; do NOT override the guard
+     (g-306-375). Under `STORAGE_BACKEND=local` it is a no-op by construction — the
+     local tree IS the store. Under own-cloud the local tree is a read-through CACHE
+     (guard-980), and forking a stale mirror hands the reducer a merge baseline that
+     existed on neither box; `pull_continuity` records the new baseline so the file
+     ends in-sync, not diverged (guard-4681).
+     ⚠ KNOWN LIMIT: the pull is conflict-guarded and will NOT clobber unpushed local
+     writes, so a box left dirty by a prior reducer life can report `pulled=0` and
+     stay stale — the safer failure. **g-306-378** tracks the deeper defect: the
+     both-diverged LOCAL-WINS branch pushes a stale mirror over live reducer state,
+     its single-writer premise being false under a cross-box fork. Read
+     `CW1A_FRESH_RC` and the `pulled=` / `in_sync=` counters; non-zero rc HALTS —
+     proceeding forks from the stale cache.)
 
      **CW1b — write the worker body manifest** (forces the fork):
      Bash: `bash core/scripts/body-manifest.sh write --sid "$MIND_SID" --agent <agent-name> --role worker --reducer-sid remote`

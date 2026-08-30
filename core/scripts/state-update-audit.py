@@ -152,6 +152,14 @@ def _close_key(goal_id):
                 and goal_id in (r.get("id"), r.get("goal_id"))), None)
     if rec is None:
         return ""
+    # KEY consumer of completed_at (, 2026-08-30). This stamp feeds a
+    # {goal_id}:{stamp} dedup key, so a completed_at rewritten by the 2026-08-08
+    # backfill CHANGES THE KEY and prior dedup state stops matching -- the row
+    # re-surfaces as if new. guard-2613 prescribes filtering on completed_by for
+    # at-risk consumers; that is a WINDOW remedy and is actively wrong here --
+    # adding a field to a dedup key perturbs the key exactly as the backfill did.
+    # The docstring above correctly distinguishes lastAchievedAt from completed_at;
+    # the exposure is not the field CHOICE, it is that the chosen stamp is mutable.
     stamp = str(rec.get("lastAchievedAt") or rec.get("completed_at") or "").strip()
     return f"{goal_id}:{stamp}" if stamp else ""
 

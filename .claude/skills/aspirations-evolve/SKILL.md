@@ -711,7 +711,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
                    Update change.status = "rejected" in convention-changes.jsonl
                    Log: "CONVENTION HEALTH: proposal '{change.proposed_step.title}' overlaps existing — rejected"
                ELSE:
-                   Bash: bash core/scripts/history-save.sh "$WORLD_DIR/conventions/{change.target}.md" {agent_name} "Evolve: auto-applying convention step"
+                   Bash: source core/scripts/_paths.sh && bash core/scripts/history-save.sh "$WORLD_DIR/conventions/{change.target}.md" {agent_name} "Evolve: auto-applying convention step"
                    Edit $WORLD_DIR/conventions/{change.target}.md:
                        Append step at appropriate position
                    Update change.status = "applied" in convention-changes.jsonl

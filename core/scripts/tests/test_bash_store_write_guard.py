@@ -357,6 +357,50 @@ def test_predicate_reports_the_first_governed_path():
     assert hits == [("shell redirect into", "world/aspirations.jsonl")]
 
 
+def test_start_cw1a_prescribed_shape_is_not_refused():
+    """: /start CW1a must prescribe a command the guard ADMITS.
+
+    The step force-freshes the canonical WM before a worker fork. It used to
+    prescribe a `backend-cat.sh` redirect into a temp file followed by a rename
+    over working-memory.yaml -- which this guard refuses, correctly (guard-996:
+    a temp-file-then-rename IS authoring a raw write to a governed store). The
+    step was therefore unexecutable as written, and the ex-worker->worker path
+    could not complete.
+
+    Both directions are pinned deliberately (rb-8987: prove a fence ADMITS, not
+    only that it REFUSES). Without the positive control below, this test would
+    still pass if the guard stopped refusing anything at all.
+    """
+    prescribed = (
+        "bash core/scripts/owncloud-pull.sh --agent zeta "
+        "--only working-memory.yaml; echo \"CW1A_FRESH_RC=$?\""
+    )
+    decision, reason = run(prescribed)
+    assert decision == "allow", (
+        "the shape /start CW1a prescribes must not be refused; "
+        f"guard said {decision}: {reason}"
+    )
+    assert direct_store_writes(prescribed) == []
+
+
+def test_start_cw1a_old_copy_shape_is_still_refused():
+    """Positive control for the test above -- the guard must still refuse the
+    copy shape CW1a used to prescribe, or that test proves nothing."""
+    wm = "agents/zeta/session/working-memory.yaml"
+    old_shape = f"bash core/scripts/backend-cat.sh cat {wm} > {wm}.fresh && mv {wm}.fresh {wm}"
+    assert direct_store_writes(old_shape), (
+        "guard no longer refuses the rename-over-a-governed-store shape; "
+        "the CW1a admit test above is now vacuous"
+    )
+
+
+def test_start_cw1a_step_does_not_reference_the_retired_copy():
+    """The SKILL.md step itself must not carry the retired temp-file name."""
+    skill = (ROOT / ".claude" / "skills" / "start" / "SKILL.md").read_text(encoding="utf-8")
+    assert "working-memory.yaml.fresh" not in skill
+    assert "owncloud-pull.sh --agent <agent-name> --only working-memory.yaml" in skill
+
+
 def test_hook_is_registered_on_the_bash_matcher():
     settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
     bash_hooks = [

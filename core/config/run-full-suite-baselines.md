@@ -965,3 +965,42 @@ everything else count-for-count identical, so no fresh `--triage` was run: the o
 measured 50 minutes earlier. Invisible half 114/115 (the same `test_capability_gate_narrative.py`); domain half
 76/76 + 1 skipped. The chained command's exit was 1 (SUITE_EXIT=1) — that is the runner reporting genuine reds,
 not a run failure; read the VERDICT, not the task's exit code (item 8).
+
+**2026-08-30 (alpha WORKER Body, `hostname` cc-07, `uname -r` 6.8.0-137-generic, own-cloud box with
+`STORAGE_BACKEND=local` pinned, pinned worktree at ac534c3ff — the g-115-3128 recommender fix — default rung
+→ 4 chunks of ~315 files, launched 06:15, VERDICT 07:05):** `TOTAL: 18888 passed, 47 failed, 12 errors` /
+`VERDICT: GENUINE`, spread 20 / 15 / 6+12err / 6 across the four chunks — not tail-loaded, not one-chunk-confined.
+`--triage`: **6 environmental | 18 genuine-owned | 0 genuine-UNOWNED** ("Nothing to file"). Domain half 77/77
++ 1 skipped.
+
+THIS ROW CLOSES THE ITEM-13 GAP THE cc-14 ROWS ABOVE LEFT OPEN, and that is its main reason for existing.
+Both of those recorded `FAIL(rc=1) test_capability_gate_narrative.py` and the first says ownership "NOT
+established in this session". It is now established both ways. PRE-EXISTING, measured rather than argued: a
+second worktree at `ac534c3ff~1` reproduces it **byte-identically** — same test, same 2 failures, same payload
+(`matched_keyword: 'land'` from the forged skill `land-stranded-pr`, `would_block=True` where the fixture
+expects False). And it is TRACKED: `g-115-7335` ("capability-gate matches the bare token 'land' from a forged
+skill") names precisely that mechanism, with `g-115-7346` covering it as a suite red. So it is neither mine nor
+unowned — nothing to file, and the two-point worktree diff is the cheap discriminator worth copying whenever a
+red needs separating from your own change.
+
+TWO METHOD NOTES FROM THIS RUN, both live instances of items already in the rule. (1) Item 8, in its
+task-notification form: the harness reported the backgrounded run as **"completed (exit code 0)"** while the log
+itself printed `=== !!! FRAMEWORK HALF DID NOT PASS (rc=1) !!! ===`. The notification's exit code is the
+wrapper's, never the runner's — read the log (guard-1431). (2) Item 6's backgrounding hazard fires even when you
+did not choose it: a foreground launch that exceeds the tool's 600s cap is **auto-backgrounded by the harness**,
+and an auto-backgrounded run inherits no `MIND_SID`, so it silently takes no tree lock. A first attempt from the
+live tree was discarded for exactly that (it had printed authoritative-looking chunk counts: 3 and 13 failures)
+and relaunched in the pinned worktree. Pin the tree BEFORE launching, not after the cap surprises you.
+
+**2026-08-30 (alpha, `hostname` cc-14, `uname -r` 6.8.0-137-generic, local backend, pinned worktree at
+62e9d9d83 — the v2.12.44 release — default rung → 4 chunks of ~314 files, launched 05:14, VERDICT 06:03):**
+`TOTAL: 18720 passed, 46 failed, 12 errors` / `VERDICT: GENUINE`, spread 20 / 18 / 3+12err / 5 — **count-for-count
+identical to the 2bbac6343 cc-14 row above** across all four chunks, so no fresh `--triage`: the ownership map is
+the one measured that morning, and the three releases between them (v2.12.42 skill_edit_gate exit-2, v2.12.43
+stranded-claim-sweep, v2.12.44 start-gate binding check) added no reds. Invisible half 114/115 — the red is
+`test_capability_gate_narrative.py`, whose ownership the cc-07 row directly above now settles as PRE-EXISTING by
+byte-identical reproduction at `ac534c3ff~1`; that closes the item-13 gap this row would otherwise have left open
+for the third time. Domain half 77/77 + 1 skipped — note the domain half GREW (76→77 units) as coach's world
+scripts landed, so a unit count that moves between rows is growth, not drift. The runner's own tail is worth
+quoting because it is item 6 in one line: `=== !!! FRAMEWORK HALF DID NOT PASS (rc=1) !!! === / Any green printed
+above covers the invisible-suite and domain halves ONLY.`

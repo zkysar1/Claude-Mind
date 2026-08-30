@@ -260,14 +260,38 @@ def _mind_recommendations(buckets: dict) -> list[str]:
         # collection/import regressions in the suite as a whole.
         recs.append(MIND_CORE_SUITE_CMD)
     if buckets["skill_md"]:
-        # One skill-evaluate per touched skill — the skill name is the directory
-        # immediately after .claude/skills/
-        for p in buckets["skill_md"]:
-            try:
-                skill = p.split("/")[2]
-            except IndexError:
-                continue
-            recs.append(f"bash core/scripts/skill-evaluate.sh {skill}")
+        # MIRROR THE RULE'S TABLE, DO NOT RE-INVENT IT (invariant note above).
+        # This arm used to emit `bash core/scripts/skill-evaluate.sh <skill>` —
+        # the ONE command the rule cited in this banner's own header singles out
+        # as wrong for this path class. skill-evaluate.sh requires a subcommand
+        # (read | report | underperforming | score), so the bare form only ever
+        # prints "Error: unknown subcommand", and `score --skill <s> --goal <g>`
+        # rates RUNTIME skill-on-goal performance — it can say nothing about a
+        # static SKILL.md edit. The gate was therefore recommending precisely
+        # what its governing rule forbids (, guard-4123).
+        #
+        # The checks below are that rule's per-path row UNIONED with
+        # guard-4123's ACTION list: the guard carries one the table omits (the
+        # guard-329 removed-literal grep), so both sources are mirrored rather
+        # than picking whichever was read first.
+        #
+        # NOT FIXED HERE, deliberately: skill-evaluate.sh's own exit code. The
+        # rc=0 claim in guard-4123 was measured and FALSIFIED ( head
+        # correction) — the script exits 1, and the rc=0 only reproduces through
+        # a trailing pipe, which is guard-1150, not a defect in the script.
+        touched = " ".join(sorted(buckets["skill_md"]))
+        recs.append(
+            f"[manual] Re-read the edited pseudocode in {touched} and confirm it matches intent"
+        )
+        recs.append("bash core/scripts/domain-leak-check.sh")
+        recs.append(
+            "[manual] grep .claude/skills/verify-learning/SKILL.md for any literal"
+            " you REMOVED (guard-329)"
+        )
+        recs.append(
+            f"py -3 core/scripts/line-class-diff-check.py {touched}"
+            "   # bulk prose edits -- per-class set-diff vs HEAD (g-115-7706)"
+        )
         recs.append("Consider /verify-learning if you changed skill behavior (not just narrative)")
     if buckets["rule_md"]:
         recs.append("[manual] Re-read .claude/rules/*.md and confirm wording matches intent (no automated check)")

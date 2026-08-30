@@ -78,6 +78,16 @@ def _sandbox_agent(entries):
 
 def _run(agent_dir: Path, goal_id: str, *extra):
     env = os.environ.copy()
+    # : BODY_WM_PATH is the FIRST branch of wm.wm_path(); MIND_AGENT_DIR
+    # below is only the SECOND. Every worker Body exports BODY_WM_PATH (the
+    # bash-agent-inject hook), so a bare os.environ.copy() sends this helper's WM
+    # reads AND WRITES to the LIVE per-Body working-memory.yaml instead of the
+    # sandbox -- the tests then fail on state that never round-trips, and the run
+    # mutates the Body's merge payload on its way past. Dropping the namespace
+    # lets the MIND_AGENT_DIR branch resolve. Same fix as the "BODY_" entry in
+    # the sibling files' _FRAMEWORK_ENV_PREFIXES.
+    for _k in [_k for _k in env if _k.startswith("BODY_")]:
+        del env[_k]
     env["MIND_AGENT_DIR"] = str(agent_dir)
     env["STORAGE_BACKEND"] = "local"          # guard-955
     return subprocess.run(

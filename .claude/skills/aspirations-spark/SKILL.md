@@ -494,7 +494,7 @@ doubt between framework and domain, pick domain.
         # days stale for gap-006 despite a daemon-routed read) — SKIP the gap.
         # forged-skills.yaml is the authoritative cross-agent registry; it is low-write-frequency
         # and far less divergence-prone than skill-gaps.yaml (guard-1163 family).
-        Bash: grep -q "gap_ref: {gap.id}" "$WORLD_DIR/forged-skills.yaml" && SKIP this gap (already forged by another agent)
+        Bash: source core/scripts/_paths.sh && grep -q "gap_ref: {gap.id}" "$WORLD_DIR/forged-skills.yaml" && SKIP this gap (already forged by another agent)
 
         Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
         Read agents/<agent>/developmental-stage.yaml → current stage

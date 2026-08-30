@@ -40,6 +40,7 @@ PROJECT_TMP = SCRIPT_DIR / "_tmp_pending_deploys_gate_test"
 _FRAMEWORK_ENV_PREFIXES = (
     "MIND_", "WORLD_", "META_", "STORAGE_", "FILEOPS_", "RT_",
     "RUNTIME_", "AGENTS_", "MACHINE_", "OWNERSHIP_", "ENVIRONMENT_", "MIND_",
+    "BODY_",  # : BODY_WM_PATH is the FIRST branch of wm_path()
 )
 
 sys.path.insert(0, str(SCRIPT_DIR))

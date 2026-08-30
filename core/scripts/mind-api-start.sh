@@ -439,7 +439,7 @@ fi
 # as well as RUNTIME_DIR, and comparing the resolved path also catches
 # RUNTIME_DIR pointed explicitly AT the shared dir. Keep both conditions in sync.
 if [ -n "${PYTEST_CURRENT_TEST:-}" ] \
-   && [ "$RT_DIR" = "$PROJECT_ROOT/mind_api/state" ] \
+   && [ "$(canon_dir "$RT_DIR")" = "$(canon_dir "$PROJECT_ROOT/mind_api/state")" ] \
    && [ "${MIND_ALLOW_SHARED_DAEMON_FROM_TEST:-}" != "1" ]; then
     _log "REFUSED shared-runtime claim from pytest (${PYTEST_CURRENT_TEST})"
     {

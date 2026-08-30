@@ -172,7 +172,7 @@ def test_isolated_runtime_is_allowed(tmp_path):
         'set -u\n'
         f'source "{RUNTIME_SH.as_posix()}"\n'
         'if [ -n "${PYTEST_CURRENT_TEST:-}" ] '
-        '&& [ "$RT_DIR" = "$PROJECT_ROOT/mind_api/state" ] '
+        '&& [ "$(canon_dir "$RT_DIR")" = "$(canon_dir "$PROJECT_ROOT/mind_api/state")" ] '
         '&& [ "${MIND_ALLOW_SHARED_DAEMON_FROM_TEST:-}" != "1" ]; then '
         'echo VERDICT=REFUSE; else echo VERDICT=ALLOW; fi\n'
         'echo "RT_DIR=$RT_DIR"\n'
@@ -215,11 +215,125 @@ def test_both_chokepoints_carry_the_same_condition():
     for path in (START_SH, RUNTIME_SH):
         src = path.read_text(encoding="utf-8")
         assert 'PYTEST_CURRENT_TEST' in src, f"{path.name}: lost the pytest clause"
-        assert '"$RT_DIR" = "$PROJECT_ROOT/mind_api/state"' in src, (
+        assert 'canon_dir "$RT_DIR"' in src, (
             f"{path.name}: lost the shared-dir comparison (or reverted to an "
             f"env-var-name check, which breaks RT_DIR-isolated fixture tests)"
+        )
+        assert 'canon_dir "$PROJECT_ROOT/mind_api/state"' in src, (
+            f"{path.name}: compares RT_DIR against a RAW shared path. Both "
+            f"operands must be canonicalized or a trailing slash / `..` "
+            f"spelling of the shared dir slips the gate (g-115-3362)."
         )
         assert 'MIND_ALLOW_SHARED_DAEMON_FROM_TEST' in src, (
             f"{path.name}: lost the deliberate-operator escape hatch"
         )
         assert 'g-115-3329' in src, f"{path.name}: lost the traceability marker"
+
+
+def test_noncanonical_spellings_of_shared_dir_are_refused(tmp_path):
+    """A trailing slash or a `..` segment must not slip the gate ().
+
+    The condition was an exact string compare, so every spelling of the shared
+    dir other than the canonical one evaluated ALLOW -- and RT_DIR is operator-
+    and fixture-supplied, i.e. exactly where alternate spellings come from. Runs
+    the REAL rt_spawn per spelling; non-destructive by the same construction as
+    test_rt_spawn_refuses_shared_claim_from_pytest (tmp RT_PID_FILE, and the
+    gate returns before any kill).
+    """
+    shared = SHARED_STATE.as_posix()
+    spellings = {
+        "trailing slash": shared + "/",
+        "doubled trailing slash": shared + "//",
+        "`..` round trip": (PROJECT_ROOT / "mind_api" / ".." / "mind_api" / "state").as_posix(),
+    }
+    for label, spelling in spellings.items():
+        spawn_log = tmp_path / f"spawn-{abs(hash(label))}.log"
+        script = (
+            'set -u\n'
+            f'source "{RUNTIME_SH.as_posix()}"\n'
+            'rt_spawn\n'
+            'echo "RC=$?"\n'
+        )
+        proc = subprocess.run(
+            [BASH, "-c", script],
+            capture_output=True, text=True, timeout=60, cwd=str(PROJECT_ROOT),
+            env=_clean_env(
+                RT_DIR=spelling,
+                RT_SPAWN_LOG=spawn_log,
+                RT_PID_FILE=tmp_path / "daemon.pid",
+            ),
+        )
+        assert "RC=0" in proc.stdout, (
+            f"[{label}] rt_spawn must return 0 on refusal. stdout={proc.stdout[:400]}"
+        )
+        log = spawn_log.read_text(encoding="utf-8") if spawn_log.exists() else ""
+        assert "REFUSED" in log, (
+            f"[{label}] spelling {spelling!r} of the SHARED runtime dir slipped "
+            f"the gate -- it would have killed the live daemon. log={log[:600]}"
+        )
+        assert "attempting daemon start" not in log, (
+            f"[{label}] rt_spawn proceeded to spawn despite the gate"
+        )
+
+
+def test_canonicalization_does_not_over_match_isolated_dirs(tmp_path):
+    """Negative control for the fix: a genuinely isolated RT_DIR still passes.
+
+    Canonicalizing both operands must narrow nothing -- a tmp RT_DIR spelled
+    with a trailing slash is still NOT the shared dir, and refusing it would
+    break every correctly-isolated fixture test (the failure mode
+    test_isolated_runtime_is_allowed exists to catch).
+    """
+    script = (
+        'set -u\n'
+        f'source "{RUNTIME_SH.as_posix()}"\n'
+        'if [ -n "${PYTEST_CURRENT_TEST:-}" ] '
+        '&& [ "$(canon_dir "$RT_DIR")" = "$(canon_dir "$PROJECT_ROOT/mind_api/state")" ] '
+        '&& [ "${MIND_ALLOW_SHARED_DAEMON_FROM_TEST:-}" != "1" ]; then '
+        'echo VERDICT=REFUSE; else echo VERDICT=ALLOW; fi\n'
+    )
+    proc = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, timeout=60,
+        cwd=str(PROJECT_ROOT), env=_clean_env(RT_DIR=tmp_path.as_posix() + "/"),
+    )
+    assert "VERDICT=ALLOW" in proc.stdout, (
+        f"canonicalization over-matched an isolated tmp dir. stdout={proc.stdout[:400]}"
+    )
+
+
+def test_refused_autospawn_surfaces_the_launcher_reason(tmp_path):
+    """rt_try_autospawn must re-emit the launcher's stderr on failure.
+
+    It ran `bash "$spawn_script" >/dev/null 2>&1`, so mind-api-start.sh's
+    542-byte shared-runtime REFUSAL -- which names both fixes -- was discarded
+    and the caller saw only rt_no_daemon_error's generic "daemon is
+    unreachable". Drives the real function against a stub launcher via
+    PROJECT_ROOT, so no daemon is touched.
+    """
+    stub_dir = tmp_path / "core" / "scripts"
+    stub_dir.mkdir(parents=True)
+    (stub_dir / "mind-api-start.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "echo '[daemon-start] REFUSED: would claim SHARED runtime (g-115-3329)' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    script = (
+        'set -u\n'
+        f'source "{RUNTIME_SH.as_posix()}"\n'
+        f'PROJECT_ROOT="{tmp_path.as_posix()}"\n'
+        'rt_try_autospawn\n'
+        'echo "RC=$?"\n'
+    )
+    proc = subprocess.run(
+        [BASH, "-c", script], capture_output=True, text=True, timeout=60,
+        cwd=str(PROJECT_ROOT), env=_clean_env(RT_NO_AUTOSPAWN="0"),
+    )
+    assert "RC=1" in proc.stdout, (
+        f"rt_try_autospawn must return 1 when the launcher fails. "
+        f"stdout={proc.stdout[:400]} stderr={proc.stderr[:400]}"
+    )
+    assert "REFUSED" in proc.stderr, (
+        f"launcher diagnostic was swallowed -- the caller cannot learn WHY the "
+        f"spawn failed. stderr={proc.stderr[:600]}"
+    )

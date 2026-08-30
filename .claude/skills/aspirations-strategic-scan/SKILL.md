@@ -691,216 +691,34 @@ FOR EACH asp in active_asps:
 # property of this portfolio, not a moment: treat a fresh fire as CONFIRMATION,
 # and do not route it to S5 as a new finding — see the dedup warning in S5.
 #
-# FOURTH BOX, 2026-08-13 (alpha, hostname cc-04, uname -r 6.8.0-137-generic; 2023
-# pending/in-progress across 33 active aspirations, 192 distinct categories):
-# 39.5% / 62.5% (23 `framework-*` labels) / 79.8%. Verdicts UNCHANGED — axis 2
-# still the only fire — so the standing-property claim above holds. But axis 1
-# held flat (39.9 -> 39.5) while axis 1b fell 5.1pp and axis 2 fell 3.3pp, on a
-# population 22% LARGER (1655 -> 2023). That is well past the "two significant
-# figures" noise floor the next paragraph sets, so it is a real move.
+#   BOX ROWS 2026-08-13 .. 2026-08-18T22:2x (10 rows: FOURTH..THIRTEENTH BOX, plus
+#   the 08-19/08-20 foxtrot FOLDS pointer, 15,575 B) moved VERBATIM to
+#   core/config/strategic-scan-readings.md (hot-path budget g-115-6977) — ADD YOUR BOX
+#   AS ONE ROW IN THE LEDGER, NEVER HERE. Prose below cites those rows by date
+#   ("1376 -> 1615 in four days", "the first same-box interval"); they resolve THERE,
+#   one hop, exactly as the S2a roster pointer above already works.
 #
-# FIFTH BOX, 2026-08-14 (foxtrot, hostname LAPTOP-3IOFCNEO, uname -r
-# 6.6.87.2-microsoft-standard-WSL2; 2043 pending/in-progress across 34 active
-# aspirations, 190 distinct categories): **39.6% / 62.5% (23 `framework-*`
-# labels) / 80.1%**. Verdicts unchanged — axis 2 still the only fire. This is a
-# ~14h re-read of alpha's row directly above (39.5 / 62.5 / 79.8 at n=2023) and
-# every axis reproduces to within 0.3pp, with axis 1b IDENTICAL to one decimal
-# and the label count identical at 23. Recorded because the alpha row is the
-# first to show axis 1b and axis 2 MOVING, and a lone moving reading cannot say
-# whether it moved or was mismeasured; two boxes agreeing on the new value
-# settles that it moved.
-# Confirming the dilution reading rather than restating it: asp-115 went
-# 1615 -> 1637 (+22) while its share went 79.8% -> 80.1% (+0.3pp) — so over this
-# interval the share rose SLIGHTLY even as the pile grew, which is the same
-# denominator arithmetic seen from the other side. Do not read either direction
-# as remediation; only a falling ABSOLUTE would be that, and it has never fallen
-# in any row here.
-# Also verified the goals_omitted guard the block head prescribes: `goals_omitted`
-# summed to **0** across all 34 aspirations, so these figures are full-corpus and
-# comparable to the rows above — not the 79.7%-trimmed summary that produced the
-# spurious axis2-PASSES reading. Checking it costs one line and is the only thing
-# separating a real row from a confidently wrong one.
-#
-# ⚠ A `goals_omitted` SUM OF 0 IS AMBIGUOUS, AND ON THE FULL FILE IT CAN NEVER BE
-# ANYTHING ELSE. Measured 2026-08-15 (zeta, hostname cc-02, uname -r
-# 6.8.0-137-generic) on the two files side by side:
-#     summary : 31 aspirations,  220 goals, key present 31/31, SUM = 1913
-#     full    : 31 aspirations, 2497 goals, key present  0/31, SUM =    0
-# The key is simply ABSENT from `aspirations-compact.json`, so a sum over it is
-# structurally 0 there — "full corpus" and "field does not exist here" produce
-# the identical number, and the check cannot fail on the file it is most often
-# run against. The row above reporting "summed to 0 across all 34 aspirations"
-# was therefore reading the FULL file: its conclusion was correct, but the
-# evidence cited for it was unfalsifiable (rb-245 class). DISAMBIGUATE ON THE
-# KEY'S PRESENCE OR THE GOAL COUNT, not the sum — `sum('goals_omitted' in a for a
-# in compact)` and `sum(len(a['goals']) for a in compact)` separate 220 from 2497
-# unambiguously. Same trap, same day, from the other direction: a top-level
-# `compact.get("goals_omitted")` also returns a confident None, because the
-# compact is a LIST.
-#
-# SIXTH BOX, 2026-08-15 (zeta, hostname cc-02, uname -r 6.8.0-137-generic; 2112
-# pending/in-progress across 31 active aspirations, 185 distinct categories):
-# **39.3% / 61.9% (22 `framework-*` labels) / 80.2%**. Verdicts unchanged — axis
-# 2 still the only fire, so the standing-property claim holds a sixth time. One
-# line rather than a paragraph (g-115-4058 folding practice): it confirms and
-# adds no mechanism. Full-store, verified by goal count (2497, not 220).
-#
-# SEVENTH BOX, 2026-08-16 (alpha, hostname cc-04, uname -r 6.8.0-137-generic; 2139
-# pending/in-progress across 31 active aspirations, 189 distinct categories):
-# **39.2% / 61.9% (22 `framework-*` labels) / 79.8%**. Verdicts unchanged — axis 2
-# still the only fire. Full-store, verified by goal count. One line per the folding
-# practice; it adds no mechanism but sharpens the dilution reading directly below:
-# asp-115's ABSOLUTE went 1637 -> 1706 (+69 in ~36h) while its SHARE went
-# 80.1% -> 79.8% (-0.3pp). Share down, pile up, again.
-#   FOLDED (echo, hostname cc-03, uname -r 6.8.0-137-generic, same date, ~30 min
-#   later): 38.9% / 61.8% (22 labels) / 79.7% at n=2140, 190 categories, 31 active
-#   — every axis within 0.3pp, so no new mechanism and no new row. Its one addition
-#   is the control this block's own dilution warning depends on: asp-115's ABSOLUTE
-#   measured **1706 on both boxes**, independently. The SHARES differ (79.8 vs 79.7)
-#   purely because the denominators differ by one goal, which is exactly the
-#   arithmetic the paragraph below describes — and it means the falling share cannot
-#   be a per-box parse artifact. An absolute agreeing across boxes is the only thing
-#   that separates "the pile is genuinely this big" from "one box computed it oddly";
-#   a share cannot do that job, because two boxes can agree on a ratio while
-#   disagreeing on both of its terms.
-#
-# EIGHTH BOX, 2026-08-16T22:0x (bravo, hostname cc-05, uname -r 6.8.0-137-generic;
-# 1886 pending/in-progress across 24 active aspirations, 179 distinct categories):
-# **40.0% / 63.0% (22 `framework-*` labels) / 82.0%**. Verdicts unchanged — axis 2
-# still the only fire, threshold read from config at run time (0.70). Full-store,
-# verified by goal COUNT (2543, not 220) per the ambiguity warning above.
-#
-# TWO ADDITIONS, AND THE FIRST IS THE ONE THE PARAGRAPH DIRECTLY BELOW SAYS HAS
-# NEVER HAPPENED. **asp-115's ABSOLUTE FELL: 1706 -> 1547 (-159) in ~9h**, against
-# a roster on which "NOTHING shrank" in every prior row. It is real completion, not
-# a parse difference: asp-115 carries **214 goals with `completed_date` == today**,
-# and its status histogram reads pending 1546 / in-progress 1 / completed 329 /
-# skipped 20 / blocked 1 / retired 3. Note the SHARE moved the OTHER way
-# (79.8 -> 82.0, +2.2pp) because the denominator fell faster (2139 -> 1886) — the
-# dilution arithmetic below running in REVERSE. So a RISING share is no more
-# evidence of worsening than a falling one was of remediation; quote both, always.
-#
-# SECOND, AND IT RETIRES THE ACTIVE-ASPIRATION COUNT AS A CROSS-BOX FIELD: I read
-# **24 active** where alpha and echo read 31 hours earlier, and NO aspiration went
-# terminal in between (`--archive` newest is 2026-08-10). The 24 is **21 world + 3
-# agent**, and the agent half is THIS agent's private queue — every agent has one,
-# of different size. So `active_asps`, and therefore `n`, are PER-AGENT BY
-# CONSTRUCTION: only world-aspiration ABSOLUTES (like asp-115's) are comparable
-# across boxes, and a differing active-count is not evidence of anything. Verified
-# against an independent instrument the same minute: precheck-eval's
-# `consolidation.active_count = 24`.
-#
-# NINTH BOX, 2026-08-17T08:2x (alpha, hostname cc-04, uname -r 6.8.0-137-generic;
-# 1882 pending/in-progress across 22 active aspirations, 180 distinct categories):
-# **40.1% / 63.0% (22 `framework-*` labels) / 82.9%**. Verdicts unchanged — axis 2
-# still the only fire, threshold read from config at run time. Full-store, verified
-# by GOAL COUNT (2627, not 220) and by `goals_omitted` key-presence 0/22 per the
-# ambiguity warning above.
-#
-# Its one addition is the CROSS-BOX control on bravo's 08-16T22:0x fall, which no
-# single box could supply: bravo measured asp-115's absolute dropping 1706 -> 1547
-# and attributed it to 214 same-day completions. Ten hours later I read **1561**
-# (+14) — so the pile resumed growing from the post-fall floor rather than continuing
-# down, and the fall was a discrete completion event, not the start of a trend. Share
-# moved 82.0 -> 82.9 on a denominator that fell 1886 -> 1882, i.e. both terms of the
-# ratio essentially still while the numerator rose: the cleanest reading in this
-# roster, and it says the concentration is neither easing nor accelerating.
-# Also confirms the 08-16T22:0x finding that `active_asps` is PER-AGENT — I read 22
-# where bravo read 24 and alpha/echo read 31 the day before, with no aspiration going
-# terminal in between. Do not compare that field across boxes; only world-aspiration
-# ABSOLUTES (like asp-115's 1561) are cross-box comparable.
-#   FOLDED (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r`
-#   6.6.87.2-microsoft-standard-WSL2, 2026-08-17T16:1x; 1910 pending/in-progress
-#   across 23 active aspirations, 179 categories): **40.4% / 63.2% (22
-#   `framework-*` labels) / 83.4%**. Verdicts unchanged — axis 2 still the only
-#   fire. Full-store, verified by GOAL COUNT (2620, not 261), and the ambiguity
-#   warning above bit exactly as written: `goals_omitted` key-presence was
-#   **23/23 on the SUMMARY** and **0/23 on the full file**, so key-presence
-#   separated the two corpora where a SUM would have read 1913 vs 0. The
-#   summary-derived axes were 18.2 / 36.4 / **57.9 — axis2 PASSES**, a 25.5pp
-#   understatement that RETIRES the standing fire: the block-head flip
-#   reproduced on a third box, so re-read the full corpus every time.
-#   Its one addition is a THIRD point in the post-fall series this row opened —
-#   asp-115 absolute **1547 (08-16T22) -> 1561 (08-17T08) -> 1593 (08-17T16)**,
-#   monotone up, now across two kernel families — so "the fall was a discrete
-#   completion event, not the start of a trend" rests on two intervals rather
-#   than one. Share rose 82.9 -> 83.4 on a denominator that rose 1882 -> 1910:
-#   both terms up, concentration neither easing nor accelerating. active_asps 23
-#   here vs 22/24/31 elsewhere — per-agent as this row says, no new mechanism.
-#
-# TENTH BOX, 2026-08-17T16:2x (zeta, hostname cc-02, uname -r 6.8.0-137-generic;
-# 1903 pending/in-progress across 22 active aspirations, 178 distinct categories):
-# **40.5% / 63.5% (22 `framework-*` labels) / 83.7%**. Verdicts unchanged — axis 2
-# still the only fire. Full-store, verified by GOAL COUNT (2610, not 220) and
-# `goals_omitted` key-presence 0/22. asp-115's absolute rose 1561 -> **1592 (+31)**
-# in ~8h — a SECOND consecutive post-fall rise, so alpha's "discrete completion
-# event, not the start of a trend" now rests on two intervals rather than one.
-#
-# ITS ONE ADDITION IS A TRAP THIS ROSTER SETS FOR ITSELF, and I nearly walked into
-# it. Every row header publishes `n`, so `non-115 = n - asp115` is the obvious
-# derived quantity — and it is **INVALID CROSS-BOX**, because the row directly above
-# established that `n` includes THIS agent's private queue. Differencing my 1903
-# against alpha's 1882 yields "non-115 shrank 321 -> 311 (-10)", which reads as
-# concentration accelerating on both terms — a shape no prior row shows, and
-# therefore exactly the kind of finding one wants to be true. It is really just
-# zeta's private queue being smaller than alpha's. The existing caveat says only
-# world ABSOLUTES are comparable; it does not name the SUBTRACTION, which is the
-# form the error actually takes, because a difference LOOKS like it cancels the
-# per-agent part and does not. Derive nothing from a cross-box `n` — including
-# deltas. Compare `n` only against a reading YOU took on YOUR OWN box.
-#
-# ELEVENTH BOX, 2026-08-18T07:2x (echo, hostname cc-03, uname -r 6.8.0-137-generic;
-# 1929 pending/in-progress across 23 active aspirations, 182 distinct categories):
-# **40.4% / 63.3% (22 `framework-*` labels) / 83.0%**. Verdicts unchanged — axis 2
-# still the only fire. Full-store, verified by GOAL COUNT (2722, not 258) and
-# `goals_omitted` key-presence 0/23; the summary path returned 23/23, so the two
-# corpora were separated by key-presence exactly as the ambiguity warning above
-# prescribes.
-#
-# Its one addition is the SAME-BOX LONGITUDINAL the trap paragraph directly above
-# asks for and that no row had yet supplied — every prior "reverse dilution" reading
-# is a cross-box comparison the trap invalidates. Against THIS box's own 08-16T16:32
-# row: **asp-115 absolute FELL 1642 -> 1601 (-41)** over ~39h while its **share ROSE
-# 80.3% -> 83.0% (+2.7pp)**, because the denominator fell faster (2045 -> 1929, -116).
-# Non-115 on one box is a legitimate subtraction: 403 -> 328, i.e. **-18.6% against
-# asp-115's -2.5%**. So the smaller pool drains ~7x faster proportionally, and the
-# concentration share rises on a shrinking base. Both halves of this file's standing
-# warning now rest on same-box evidence: a FALLING share was never remediation, and a
-# RISING one is not the problem worsening. Quote the absolute and the ratio, always.
-#
-# TWELFTH BOX, 2026-08-18T09:5x (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r`
-# 6.6.87.2-microsoft-standard-WSL2; 1952 pending/in-progress across 25 active
-# aspirations, 183 distinct categories): **39.8% / 62.8% (23 `framework-*` labels) /
-# 82.5%**. Verdicts unchanged — axis 2 still the only fire, threshold read from config.
-# Full-store, verified by GOAL COUNT (2779) and `goals_omitted` key-presence 0/25.
-#
-# Its one addition is a SAME-BOX longitudinal on the second kernel family, which the
-# trap paragraph above says is the only valid comparison: against THIS box's own
-# 08-17T16:1x row, asp-115 absolute rose **1593 -> 1611 (+18)** in ~18h while its share
-# fell **83.4% -> 82.5% (-0.9pp)** on a denominator that rose 1910 -> 1952. Both terms up,
-# share down — the dilution arithmetic in its ordinary direction, and NOT remediation.
-# Third consecutive same-box point in the post-fall series (1547 -> 1561 -> 1593 -> 1611,
-# monotone up across two kernel families), so bravo's "discrete completion event, not a
-# trend" reading now rests on three intervals. Do not derive non-115 from a cross-box `n`.
-#
-# THIRTEENTH BOX, 2026-08-18T22:2x (alpha, `hostname` cc-04, `uname -r` 6.8.0-137-generic;
-# 1973 pending/in-progress across 24 active aspirations, 186 distinct categories):
-# **39.6% / 62.6% (24 `framework-*` labels) / 82.1%**. Verdicts unchanged — axis 2 still
-# the only fire, threshold read from config at run time. Full-store, verified by GOAL
-# COUNT (2810) and `goals_omitted` key-presence 0/24 per the ambiguity warning above.
-#
-# Its one addition is a SAME-BOX longitudinal against cc-04's own 08-17T08:2x row (the
-# only comparison the trap paragraph above permits): asp-115 absolute **1561 -> 1620
-# (+59)** in ~38h while its share fell **82.9% -> 82.1% (-0.8pp)** on a denominator that
-# rose 1882 -> 1973 (+91). Both terms up, share down — the dilution arithmetic in its
-# ordinary direction, and NOT remediation. Fourth consecutive point in the post-fall
-# series and the second measured same-box, so bravo's "discrete completion event, not a
-# trend" reading holds on cc-04 as well as on LAPTOP-3IOFCNEO. Note non-115 on ONE box is
-# a legitimate subtraction: 321 -> 353 (+32), i.e. the smaller pool grew ~10% against
-# asp-115's ~3.8% — the first same-box interval in this roster where the non-115 pool
-# grew proportionally FASTER than asp-115, which is what actual de-concentration would
-# look like if it persisted. One interval is not a trend; do not read it as one.
-#   FOLDS 2026-08-19 + 2026-08-20 (foxtrot) moved VERBATIM to core/config/strategic-scan-readings.md (g-115-6470) — APPEND FUTURE FOLDS THERE. 08-20 headline: 39.2% / 63.5% / 82.7%, verdicts unchanged (axis 2 the only fire); the two-interval non-115-grows-faster run ENDED — asp-115 1638->1706 (+4.2%), non-115 362->357 (-1.4%), share 81.9->82.7 on a denominator 2000->2063. Quote both terms, both directions.
+#   THE FOUR METHOD RULES THOSE ROWS ESTABLISHED STAY HERE — they are operational
+#   priors, not data, and each was paid for by a row that got it wrong first:
+#   (1) `active_asps` and therefore `n` are PER-AGENT BY CONSTRUCTION (n = world +
+#       THIS agent's private queue). Only world-aspiration ABSOLUTES (asp-115's) are
+#       cross-box comparable. **This kills the SUBTRACTION too** — `non-115 = n - asp115`
+#       differenced across boxes LOOKS like it cancels the per-agent part and does not;
+#       it manufactured a "concentration accelerating on both terms" reading that was
+#       purely zeta's smaller private queue. Derive nothing from a cross-box `n`,
+#       deltas included; compare `n` only against a reading YOU took on YOUR OWN box.
+#   (2) AXIS 2 HAS BEEN THE ONLY FIRE IN EVERY ROW EVER TAKEN (~39-40% / 62-63% /
+#       80-84%, 22-30 `framework-*` labels). Treat a fresh fire as CONFIRMATION of a
+#       standing property — do NOT route it to S5 as a new finding.
+#   (3) QUOTE THE ABSOLUTE AND THE RATIO, BOTH DIRECTIONS. A falling share is usually
+#       DILUTION, not remediation (asp-115 grew while its share fell, repeatedly); a
+#       rising share can be the same arithmetic in REVERSE on a shrinking denominator.
+#       Neither direction is evidence on its own. Only a falling ABSOLUTE is necessary
+#       for remediation — and it is not sufficient.
+#   (4) DISAMBIGUATE THE CORPUS BY KEY-PRESENCE OR GOAL COUNT, NEVER BY SUMMING
+#       `goals_omitted` — the key is ABSENT from the full compact, so the sum is
+#       structurally 0 there and "full corpus" is indistinguishable from "field does
+#       not exist here" (rb-245 class).
 
 # DO NOT READ THE FALLING SHARE AS THE CONCENTRATION RESOLVING — the arithmetic
 # says the opposite. asp-115 grew 1376 -> 1615 (+239) and `framework-*` grew
