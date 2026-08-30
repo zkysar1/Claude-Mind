@@ -280,3 +280,91 @@ def test_manifest_glob_expansion_skips_non_repos(tmp_path):
     roots = _delivery_repo_roots(world)
     assert repo in roots
     assert (tmp_path / "not-a-repo") not in roots
+
+
+# ── guard-5538: the local-only test reads a LOCAL cache ──────────────────────
+# Added by  after the gate false-blocked EVERY goal close fleet-wide
+# for ~3 days (measured 2026-08-29, bravo/cc-05). Vinheim-Web-App was a
+# single-branch clone holding 3 remote-tracking refs against 53 real branches
+# on origin; a commit that had been on origin the whole time read as local-only.
+# No fetch can repair that -- fetch obeys the same restricted refspec -- so the
+# gate's existing fetch-retry was structurally powerless. Same mechanism
+# guard-1250 measured one namespace over (refs/workers/* outside the default
+# refspec); there it renders as a structural ZERO, here as a permanent veto.
+
+
+def _narrow_refspec_to_default(clone: Path) -> None:
+    """Make `clone` a single-branch clone: refs/remotes/* stops covering
+    non-default branches, exactly as `git clone --single-branch` leaves it."""
+    _git(clone, "config", "--unset-all", "remote.origin.fetch")
+    _git(clone, "config", "--add", "remote.origin.fetch",
+         "+refs/heads/master:refs/remotes/origin/master")
+
+
+def test_single_branch_clone_does_not_false_block_delivered_work(tmp_path, framework_repo):
+    """A commit that IS on origin must not block just because the local
+    refs/remotes/* cache cannot see the branch carrying it."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _narrow_refspec_to_default(clone)
+
+    (clone / "app.py").write_text("v2 delivered on a side branch\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "an anonymous subject naming no goal at all")
+    _git(clone, "push", "-q", "origin", "HEAD:refs/heads/side")
+
+    # PRECONDITION, asserted rather than assumed: the commit is genuinely on
+    # origin AND genuinely invisible to the local cache. Without this the test
+    # could pass for the wrong reason (e.g. push having created the ref anyway),
+    # and would then certify nothing.
+    sha = _git(clone, "rev-parse", "HEAD")
+    assert sha in _git(clone, "ls-remote", "origin", "refs/heads/side"), \
+        "setup failed: the commit is not actually on origin"
+    _git(clone, "fetch", "-q", "origin")          # cannot help: same refspec
+    assert _git(clone, "branch", "-r", "--contains", sha) == "", \
+        "setup failed: the local cache CAN see it, so this is not the guard-5538 shape"
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-5538", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    assert res["stranded_repos"][0]["refspec_complete"] is False
+
+
+def test_narrow_refspec_still_blocks_dirty_and_attributed_work(tmp_path, framework_repo):
+    """THE MUTATION KILL (guard-3126). The fix drops ONE unsound inference; it
+    must not become a way to close with real work outstanding. Both surviving
+    blocking paths are asserted on the SAME narrow-refspec repo the test above
+    proves is released."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _narrow_refspec_to_default(clone)
+
+    # (a) dirty tracked file — never depended on remote refs, must still block.
+    (clone / "app.py").write_text("uncommitted edit\n")
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-5538b", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+
+    # (b) THIS goal's own commit, stranded off the default branch — the
+    # /6785 shape the gate exists for. Attribution does not read
+    # refs/remotes/*, so a narrow refspec must not release it.
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-m", "fix(g-test-5538c): my own work, not merged")
+    res2 = evaluate(goal_id="g-test-5538c", override=None,
+                    repo_path=framework_repo, world_dir=world)
+    assert res2["stranded_would_block"] is True, res2["stranded_repos"]
+
+
+def test_complete_refspec_reports_the_flag_and_keeps_blocking(tmp_path, framework_repo):
+    """The control for the two above: an ordinary clone is unaffected, and the
+    flag says which half ran. A release that cannot be distinguished from a
+    deleted gate is not a fix."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    (clone / "app.py").write_text("v2 local only\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "never pushed anywhere")
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-5538d", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+    assert res["stranded_repos"][0]["refspec_complete"] is True

@@ -435,6 +435,13 @@ MAP_SLOTS = {
 # (loop-state-bump-counters.py, productivity-gate.sh, compact-restore-slots.sh).
 #  traced the exact pattern;  is the structural refusal.
 STRUCTURED_DICT_SLOTS = {"loop_state"}
+# Top-level slots holding a LIST OF ROWS and nothing else — a scalar written
+# here is corruption, never data (2026-08-28: a wm-set of a timestamp string
+# broke 36 of 51 sessions' Phase 4b appends for 39 hours on a live deployment).
+# Not ARRAY_SLOTS (that membership governs reset/prune survival). TWIN of the
+# daemon mind_api/src/endpoints/wm_write.py LIST_ROW_SLOTS — keep in sync; the
+# daemon copy is the LIVE path (guard-742).
+LIST_ROW_SLOTS = {"goals_completed_this_session"}
 
 # Cadence-tracker slot patterns — stale by design (fire every N goals or N hours,
 # often much longer than evict_threshold_minutes). wm-prune must not evict these
@@ -933,6 +940,16 @@ def cmd_set(args):
             file=sys.stderr,
         )
         sys.exit(1)
+    # TWIN of the daemon's not_a_list_value refusal (wm_write.py set_slot) — keep in sync.
+    if args.slot in LIST_ROW_SLOTS and value is not None and not isinstance(value, list):
+        print(
+            f"BLOCKED: '{args.slot}' holds a LIST of hand-off rows; a {type(value).__name__} "
+            f"there is corruption every reader drops. Append a row: echo '<json-row>' | "
+            f"wm-append.sh {args.slot}; reset it: printf '%s' '[]' | wm-set.sh {args.slot}; "
+            f"a timestamp belongs in a last_* slot",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     with wm_lock():
         data = read_wm()
@@ -1092,16 +1109,17 @@ def cmd_append(args):
         # hand-off rows; an int there is the loop_state counter's NAME leaking
         # into the wrong key (2026-08-16, worker-loop Phase 4b outage — 3 of 3
         # forked Bodies checked). An int carries no rows, so it is always
-        # corruption: heal to [] loudly and continue. Scoped to this one slot.
+        # corruption: heal to [] loudly and continue. Widened to ANY scalar
+        # 2026-08-30 (a wm-set of a timestamp string, 36 of 51 sessions, 39 h
+        # of refused closes on a live deployment). Scoped to LIST_ROW_SLOTS.
         _healed_int = None
-        if (is_top and key == "goals_completed_this_session"
-                and isinstance(arr, (int, float)) and not isinstance(arr, bool)):
+        if is_top and key in LIST_ROW_SLOTS and arr is not None and not isinstance(arr, list):
             _healed_int = arr
             parent[key] = []
             arr = parent[key]
             print(f"WARN: 'goals_completed_this_session' was {type(_healed_int).__name__}:"
-                  f"{_healed_int} (loop_state counter name collided with the top-level "
-                  f"hand-off LIST); reset to [] before appending — find the writer",
+                  f"{_healed_int} (a counter's name or a last_*-style stamp written into "
+                  f"the top-level hand-off LIST); reset to [] before appending — find the writer",
                   file=sys.stderr)
         if not isinstance(arr, list):
             print(f"ERROR: '{args.slot}' is {type(arr).__name__}, not a list", file=sys.stderr)

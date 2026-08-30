@@ -5322,7 +5322,7 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for SIX path-pattern branches that run
+    Dispatch is by basename EXCEPT for SEVEN path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
@@ -5336,10 +5336,13 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
       6. tree-node markdown ``world/knowledge/tree/**/*.md`` -- section-union
          (g-115-7071); 1,555 unique basenames make per-node registration
          structurally impossible.
-    Branches 1-4 register stores whose basenames are DYNAMIC and therefore
+      7. telemetry append streams ``**/telemetry/**/*.jsonl`` -- line-union
+         (g-115-6947). EXTENSION-DISCRIMINATED, never a bare directory prefix:
+         the same tree holds 1,145 ``*.json`` snapshots.
+    Branches 1-4 and 7 register stores whose basenames are DYNAMIC and therefore
     unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
-    entry (1-4) and NO despite one (5) -- always resolve through this function,
+    entry (1-4, 7) and NO despite one (5) -- always resolve through this function,
     never through a grep of the dict.
 
     Shard detail: basenames are dynamic (alpha.yaml/bravo.yaml/...) and so cannot
@@ -5471,6 +5474,61 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
             and parts.index("knowledge") + 1 < len(parts)
             and parts[parts.index("knowledge") + 1] == "tree"):
         return merge_tree_node_md
+    # SEVENTH path-pattern case (): telemetry APPEND STREAMS. Dynamic
+    # basenames like branches 1-4 — the wedge is a property of the DIRECTORY's
+    # write pattern (remote-appended event streams), not of any one file, so a
+    # basename entry only covers the files someone thought to enumerate. That is
+    # not hypothetical: zakpod1-thermal.jsonl was diagnosed first (60 consecutive
+    # diverged_skipped sweeps) and ONE DAY LATER a second, unrelated telemetry
+    # file turned up frozen at 1,045 sweeps on another box. A basename cure would
+    # have been re-litigated immediately.
+    #
+    # WHY EXTENSION-DISCRIMINATED AND NOT A BARE `telemetry/` PREFIX — this is
+    # the scope decision, recorded here so it is not re-opened. Measured on this
+    # box: world/telemetry holds 1,145 `*.json` against 6 `*.jsonl`. The .json
+    # mass is `bridge-sessions/<port>/ci-<uuid>.json` plus `plugin-version.json`,
+    # which are SNAPSHOTS — single JSON objects, last-writer-wins. A line-union
+    # over one of those concatenates two versions of a record into invalid JSON,
+    # so a prefix widened without a class branch turns this cure into the next
+    # corruption. The `.jsonl` test IS the class branch. The snapshots are
+    # deliberately left unregistered here: they are session-UUID / port-keyed
+    # machine-local telemetry, which guard-1055's own scope correction (the
+    #  supersession finding) says belongs in .gitignore rather than in
+    # this registry — registering 1,145 of them would be the anti-pattern that
+    # guardrail names, not a fix.
+    #
+    # ANY DEPTH, on evidence rather than taste: the second specimen was two
+    # levels down (`telemetry/bridge-sessions/<port>/`), and a `parts[-2] ==
+    # "telemetry"` test would have missed it. Same shape as branch 6, which also
+    # matches on segment membership rather than a fixed position.
+    #
+    # APPEND-ONLY VERIFIED PER FILE (rb-245: read the writers, do not infer from
+    # the name — two of these are named "state" and "snapshot"). All six live
+    # `.jsonl` files, and NO removal path exists for any of them (no prune,
+    # rotate, truncate, filter or expire reference fleet-wide), so guard-1816's
+    # disqualifier — a deletion path makes the union resurrect deleted records —
+    # is not reached. store-hygiene.yaml configures no cap on world/telemetry/*:
+    #   zakpod1-thermal.jsonl     zakpod1-thermal-record.sh   `sample >> "$OUT"`
+    #   studio-edit-state.jsonl   roblox-edit-state.sh        `' >> "$LEDGER"`
+    #   cycle-sidecar-exits.jsonl cycle.sh                    open(OUTF, "a")
+    #   bridge-liveness.jsonl     cycle.sh                    open(OUTF, "a")
+    #   s3-cost-telemetry.jsonl   locked_append_jsonl         (already registered
+    #                             by basename; this branch now shadows that entry
+    #                             with the IDENTICAL handler, so behavior is
+    #                             unchanged — the entry is kept because it
+    #                             carries its own  evidence)
+    #   ayoai-warmpool-snapshot.jsonl — RESIDUAL, stated rather than discovered
+    #                             later: no writer found on this box or anywhere
+    #                             in the product estate, so its write mode is
+    #                             UNVERIFIED and it is covered by inference from
+    #                             the directory's pattern, not by evidence. If it
+    #                             ever gains a rewriting writer, this branch is
+    #                             where that breaks.
+    #
+    # merge_append_only_jsonl is commutative by construction (guard-907): dedup is
+    # by serialized line and _parse_jsonl_lossy is symmetric in its two arguments.
+    if parts[-1].endswith(".jsonl") and "telemetry" in parts:
+        return merge_append_only_jsonl
     if parts[-1] == "meta.yaml":
         return merge_meta_index
     return _HANDLERS.get(os.path.basename(str(path)))

@@ -89,6 +89,17 @@ MAP_SLOTS = {
     "archived_context": {"summary": None, "experience_refs": []},
 }
 STRUCTURED_DICT_SLOTS = {"loop_state"}
+# Top-level slots that hold a LIST OF ROWS and nothing else. Deliberately NOT
+# ARRAY_SLOTS (membership there governs reset/prune survival — ); this
+# set only says a scalar written here is corruption, never data. Measured
+# 2026-08-28 on a live deployment: `wm-set.sh goals_completed_this_session
+# '<timestamp>'` (a Body reaching for a last_*-style stamp) left a STRING in the
+# agent-wide WM, every per-session WM cloned from it inherited the string (36 of
+# 51 sessions), and every worker close's Phase 4b hand-off append was refused
+# `not_a_list` for 39 hours. set refuses the scalar naming the two commands that
+# DO express the intent; append heals a scalar already on disk (see append_slot).
+# TWIN in core/scripts/wm.py — keep in sync; this daemon copy is the LIVE path.
+LIST_ROW_SLOTS = {"goals_completed_this_session"}
 # Mirror of core/scripts/wm.py CADENCE_TRACKER_PATTERNS — keep in sync (parity
 # asserted by test_wm_reset_cadence.py). THIS copy is the live one: wm-prune and
 # wm-reset are daemon-only, so a wm.py-only edit changes nothing at runtime
@@ -607,6 +618,13 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
             400, "structured_dict_required",
             f"structured-dict slot '{slot}' refuses non-dict-or-null write "
             f"(got {type(value).__name__})")
+    if slot in LIST_ROW_SLOTS and value is not None and not isinstance(value, list):
+        return Response.error(
+            400, "not_a_list_value",
+            f"'{slot}' holds a LIST of hand-off rows; a {type(value).__name__} there is "
+            f"corruption every reader drops. Append a row: echo '<json-row>' | "
+            f"wm-append.sh {slot}; reset it: printf '%s' '[]' | wm-set.sh {slot}; "
+            f"a timestamp belongs in a last_* slot")
 
     override = ctx.query.get("override_merge_gate")
 
@@ -816,13 +834,17 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
             # lane for the Body's whole life. Heal to [] and CONTINUE, loudly:
             # the refusal protected nothing (the int is not a value anyone
             # reads), while the heal restores the lane on the next append.
-            # Scoped to this ONE slot + int/float; every other type mismatch
-            # still refuses. TWIN of core/scripts/wm.py cmd_append — keep in
-            # sync; this daemon copy is the LIVE path (guard-742).
-            _healed_int = None
-            if (is_top and key == "goals_completed_this_session"
-                    and isinstance(arr, (int, float)) and not isinstance(arr, bool)):
-                _healed_int = arr
+            # Widened from int/float to ANY scalar 2026-08-30: a STRING got in
+            # the same way (`wm-set.sh goals_completed_this_session '<timestamp>'`,
+            # 2026-08-28, live deployment), 36 of 51 cloned sessions inherited
+            # it, and the int-only heal left every worker close refused for 39
+            # hours — a string carries no rows either. Scoped to LIST_ROW_SLOTS;
+            # every other slot's type mismatch still refuses. TWIN of
+            # core/scripts/wm.py cmd_append — keep in sync; this daemon copy is
+            # the LIVE path (guard-742).
+            _healed_scalar = None
+            if is_top and key in LIST_ROW_SLOTS and arr is not None and not isinstance(arr, list):
+                _healed_scalar = arr
                 parent[key] = []
                 arr = parent[key]
             if not isinstance(arr, list):
@@ -991,15 +1013,16 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
     # "this slot is empty", so a caller who guesses wrong gets no error.
     out = {"ok": True, "slot": slot, "evicted": _evicted,
            "placement": _placement}
-    if _healed_int is not None:
+    if _healed_scalar is not None:
         # Surface the heal in the SAME response as the write, never silently:
         # a caller that reads `healed_from` non-null knows this Body's slot had
-        # been collapsed to a counter and that a writer upstream still needs
-        # finding (test fixtures were the measured writer —  class).
-        out["healed_from"] = f"{type(_healed_int).__name__}:{_healed_int}"
-        out["warning"] = ("goals_completed_this_session was an int (the loop_state "
-                          "counter's name collided with the top-level hand-off LIST); "
-                          "reset to [] before appending — find the writer")
+        # been collapsed to a scalar and that a writer upstream still needs
+        # finding (test fixtures were the measured writer —  class;
+        # a Body's wm-set of a timestamp was the 2026-08-28 one).
+        out["healed_from"] = f"{type(_healed_scalar).__name__}:{_healed_scalar}"
+        out["warning"] = (f"goals_completed_this_session was a {type(_healed_scalar).__name__} "
+                          "(a counter's name or a last_*-style stamp written into the "
+                          "top-level hand-off LIST); reset to [] before appending — find the writer")
     return Response.json(out)
 
 

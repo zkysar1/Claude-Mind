@@ -34,9 +34,24 @@ RESOLUTION ORDER
    discard an explicit operator statement. It is NOT existence-checked, so a
    typo'd value can reintroduce the original bug; that case is flagged in the
    returned label rather than hidden.
-2. The first id in `candidates` that ACTUALLY EXISTS in the world or agent queue.
-   Existence is the whole point: the bug was filing into an absent aspiration.
-3. `candidates[0]` unchanged. Deliberately NOT a silent no-op — if nothing
+2. The catch-all named by THIS world's `conventions/deployment-routing.md` (the
+   domain overlay `/encode-session` already routes through — g-001-195), when
+   that id is live in a queue. The convention is deployment DATA, so it is the
+   right home for the mapping; a stale entry (retired/absent id) falls through
+   rather than reproducing the bug through a new door.
+3. The first id in `candidates` that is LIVE in the world or agent queue.
+   Existence is the whole point: the bug was filing into an absent aspiration —
+   and a retired/archived record is absent for this purpose (the upstream world
+   carries a RETIRED asp-001 that must never be targeted).
+4. A title heuristic over the live queues (world first, then agent): the
+   aspiration whose title reads as the framework's operating-rhythm /
+   maintenance / hygiene home. Measured 2026-08-30 on a third deployment
+   (coach@zc-03, world queue asp-002 "Operating Rhythm", asp-003 "Memory
+   Hygiene", asp-006/007 domain work): neither candidate existed, no convention
+   file, so every watchdog escalation — 28 GitDriftProbe ticks in 5 h — failed
+   `aspiration_not_found` and no goal ever landed. Loud-and-useless every tick
+   is not the failure mode step 5 was written to preserve.
+5. `candidates[0]` unchanged. Deliberately NOT a silent no-op — if nothing
    resolves, the add SHOULD fail loudly the way it does today rather than
    swallow the escalation. A canary that quietly drops its own alarm is worse
    than one that errors visibly.
@@ -47,6 +62,7 @@ the next step, never raises. This runs on the iteration-close path.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 # The UPSTREAM deployment's recurring-infra aspiration first (the historical
@@ -70,9 +86,28 @@ def _config_override(core_root) -> str:
         return ""
 
 
-def _existing_ids(*store_paths) -> set:
-    """Aspiration ids present across the given JSONL stores. Never raises."""
-    found = set()
+#: A record in one of these states is not a filing target: the goal would land
+#: in a queue nothing selects from (the upstream world's  is `retired` +
+#: `archived: true`, and deployment-routing.md says never to target it).
+_DEAD_STATUSES = frozenset({"retired", "archived", "completed"})
+
+#: Titles that read as the framework's operating / maintenance home. Ordered by
+#: specificity; the first pattern with a live match wins, then ascending id.
+_HOME_TITLE_PATTERNS = (
+    re.compile(r"(?i)operating rhythm"),
+    re.compile(r"(?i)agent health|framework[- ]hygiene|framework[- ]maintenance"),
+    re.compile(r"(?i)recurring infrastructure|infrastructure hygiene|housekeeping"),
+    re.compile(r"(?i)\bmaintenance\b|\bhygiene\b"),
+)
+
+
+def _live_records(*store_paths) -> dict:
+    """{aspiration id: title} for LIVE records across the given JSONL stores.
+
+    Retired / archived / completed records are skipped — for a filing target
+    they are as absent as a missing id. Never raises.
+    """
+    found = {}
     for sp in store_paths:
         if not sp:
             continue
@@ -88,22 +123,78 @@ def _existing_ids(*store_paths) -> set:
                     rec = json.loads(line)
                 except Exception:
                     continue
-                if isinstance(rec, dict) and rec.get("id"):
-                    found.add(str(rec["id"]))
+                if not (isinstance(rec, dict) and rec.get("id")):
+                    continue
+                if str(rec.get("status") or "").lower() in _DEAD_STATUSES:
+                    continue
+                if rec.get("archived") is True:
+                    continue
+                found.setdefault(str(rec["id"]), str(rec.get("title") or ""))
         except Exception:
             continue
     return found
 
 
+def _existing_ids(*store_paths) -> set:
+    """Live aspiration ids present across the given JSONL stores. Never raises."""
+    return set(_live_records(*store_paths))
+
+
+_ROUTING_ROW_RE = re.compile(r"(?i)catch-all")
+_ASP_ID_RE = re.compile(r"\basp-\d{3,4}\b")
+
+
+def _routing_convention(world_dir) -> str:
+    """The catch-all id named by `<world>/conventions/deployment-routing.md`, or ''.
+
+    Reads the table row that mentions "catch-all" and carries an aspiration id —
+    the shape the convention documents for every deployment ("| Framework-hygiene
+    / maintenance catch-all | **asp-115** | `world` |"). The FIRST such row is
+    this world's own mapping; the sibling-deployments table below it is only
+    consulted if no own row exists, which the convention's own text forbids
+    relying on, so a file with only sibling rows resolves to nothing here.
+    Never raises.
+    """
+    try:
+        if not world_dir:
+            return ""
+        p = Path(world_dir) / "conventions" / "deployment-routing.md"
+        if not p.is_file():
+            return ""
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.lstrip().startswith("|"):
+                continue
+            if "deployment" in line.lower() and "catch-all" in line.lower() and "|---" not in line:
+                # The sibling table's HEADER row ("| Deployment | Catch-all | ...")
+                # is not a mapping; everything after it is another world's data.
+                break
+            if _ROUTING_ROW_RE.search(line):
+                m = _ASP_ID_RE.search(line)
+                if m:
+                    return m.group(0)
+    except Exception:
+        return ""
+    return ""
+
+
+def _title_heuristic(world_records: dict, agent_records: dict) -> tuple:
+    """(id, title) of the live aspiration that reads as the operating/maintenance
+    home — world queue first, then agent — or ('', '')."""
+    for records in (world_records, agent_records):
+        for rx in _HOME_TITLE_PATTERNS:
+            hits = sorted((aid, title) for aid, title in records.items()
+                          if title and rx.search(title))
+            if hits:
+                return hits[0]
+    return "", ""
+
+
 def resolve(core_root, world_dir=None, agent_dir=None,
             candidates=DEFAULT_CANDIDATES) -> tuple:
     """(aspiration_id, source_label). See module docstring for the order."""
-    stores = []
-    if world_dir:
-        stores.append(Path(world_dir) / "aspirations.jsonl")
-    if agent_dir:
-        stores.append(Path(agent_dir) / "aspirations.jsonl")
-    present = _existing_ids(*stores)
+    world_records = _live_records(Path(world_dir) / "aspirations.jsonl") if world_dir else {}
+    agent_records = _live_records(Path(agent_dir) / "aspirations.jsonl") if agent_dir else {}
+    present = set(world_records) | set(agent_records)
 
     override = _config_override(core_root)
     if override:
@@ -119,9 +210,15 @@ def resolve(core_root, world_dir=None, agent_dir=None,
             return override, "config:stale_cadence.escalation_aspiration"
         return override, ("config:stale_cadence.escalation_aspiration"
                           " (WARNING: not present in world or agent queue)")
+    routed = _routing_convention(world_dir)
+    if routed and routed in present:
+        return routed, "resolved:deployment-routing.md"
     for cid in candidates:
         if cid in present:
             return cid, "resolved:exists-in-queue"
+    home_id, home_title = _title_heuristic(world_records, agent_records)
+    if home_id:
+        return home_id, f"resolved:title-heuristic ({home_title[:40]})"
 
     # Nothing resolved — return the upstream default so the failure stays LOUD.
     return candidates[0], "fallback:none-exist"

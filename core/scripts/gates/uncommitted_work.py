@@ -232,6 +232,45 @@ def _repo_default_ref(repo: Path) -> Optional[str]:
     return None
 
 
+def _refspec_covers_all_heads(repo: Path) -> bool:
+    """Can this clone's refs/remotes/* actually SEE every remote branch?
+
+    The local-only test below infers "no remote has this commit" from
+    `rev-list --branches --not --remotes`, which walks the LOCAL
+    refs/remotes/* cache. That inference is only sound when the fetch
+    refspec populates that cache for every branch. On a single-branch
+    clone (`remote.origin.fetch = +refs/heads/main:refs/remotes/origin/main`)
+    it does not, and NO fetch can repair it -- fetch obeys the same refspec --
+    so every commit on every non-default branch reads local-only forever.
+
+    Measured 2026-08-29 (bravo, cc-05, g-115-3258): Vinheim-Web-App held 3
+    local remote-tracking refs against 53 real branches on origin; a commit
+    that had been on origin for days blocked EVERY goal close fleet-wide for
+    ~3 days. guard-5538.
+
+    This is the same mechanism guard-1250 already measured one namespace over
+    -- there the default `+refs/heads/*:refs/remotes/origin/*` refspec does not
+    cover refs/workers/*, so that namespace reads as a structural ZERO. Both
+    are "the refspec does not reach it, so the local cache is not evidence
+    about the remote"; guard-1250 assumes refs/heads IS covered, and this is
+    the case where that assumption is false.
+
+    Fail-CLOSED to True (assume coverage) on any git error: a probe failure
+    must not silently disable the local-only block that g-115-6784/6785 exist
+    to enforce. The unsound direction is only entered on a POSITIVE reading of
+    a restricted refspec.
+    """
+    r = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get-all", "remote.origin.fetch"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return True
+    # A wildcard mapping of refs/heads/* is what populates refs/remotes/* for
+    # every branch. Anything narrower (a single explicit branch) does not.
+    return any("refs/heads/*" in ln for ln in r.stdout.splitlines())
+
+
 def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
                        goal_id: str = "") -> List[dict]:
     """The 'built but never connected' probe ( /  class).
@@ -303,8 +342,12 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
                 # One retry after a targeted default-branch refresh, so a
                 # remotely-merged PR does not read as stranded (see docstring).
                 subprocess.run(
+                    # --prune covers guard-4463: a DELETED remote branch
+                    # leaves a stale refs/remotes/* ref alive, and an unpruned
+                    # fetch keeps the orphaned tip readable, so squash-merged
+                    # work reads as stranded. Refs-only, safe to run anytime.
                     ["git", "-C", str(repo), "fetch", "origin",
-                     "--quiet", "--no-tags"],
+                     "--quiet", "--no-tags", "--prune"],
                     capture_output=True, text=True, timeout=30,
                 )
                 finding = _check_one_repo(repo, fresh_hours, goal_id)
@@ -355,7 +398,24 @@ def _check_one_repo(repo: Path, fresh_hours: int,
     since = [f"--since={fresh_hours}.hours.ago"]
 
     fresh_off_default = _rev_list(off_default + since)
-    fresh_local_only = set(_rev_list(local_only_args + since))
+    # The local-only inference is only sound when this clone actually fetches
+    # every remote branch into refs/remotes/* (guard-5538). When it does not,
+    # DROP that half rather than veto on it: the gate's own contract is "a gate
+    # that cannot probe must not veto". Attributed commits (this goal's own
+    # work, the /6785 shape) still block, and dirty_tracked still
+    # blocks -- only the unsound half is dropped.
+    refspec_complete = _refspec_covers_all_heads(repo)
+    if refspec_complete:
+        fresh_local_only = set(_rev_list(local_only_args + since))
+    else:
+        fresh_local_only = set()
+        print(f"[uncommitted-gate] {repo}: remote.origin.fetch does not cover "
+              f"refs/heads/* (single-branch clone) -- refs/remotes/* cannot see "
+              f"non-default branches, so the local-only test is unsound here and "
+              f"is SKIPPED. Delivered work on a side branch would otherwise read "
+              f"as stranded forever; no fetch can repair it (guard-5538). "
+              f"Verify with `git ls-remote origin`, or widen the refspec to "
+              f"`+refs/heads/*:refs/remotes/origin/*`.", file=sys.stderr)
     # Attribution: the fleet's commit convention names the goal as the
     # conventional-commit SCOPE (`fix(): ...`). The needle is the
     # PARENTHESIZED form, byte-identical to completed-not-committed-sweep's
@@ -381,6 +441,7 @@ def _check_one_repo(repo: Path, fresh_hours: int,
         "stranded_commits": blocking[:20],
         "stale_stranded_commits": stale[:20],
         "unattributed_unmerged": unattributed[:20],
+        "refspec_complete": refspec_complete,
     }
 
 

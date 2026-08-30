@@ -326,3 +326,9 @@ agents/*/temp/*
 
 # stray 0-byte artifact re-created by tooling in the repo root (g-315-537)
 logs.log
+
+# Zak-Code harness files at the workspace root: the per-turn busy lock
+# (`say_inbox.py` BUSY_FILENAME) and its session/config dir. Both were being
+# committed by a `git add -A` on a Body-run deployment (2026-08-30, coach).
+/.busy
+/.zakcode/

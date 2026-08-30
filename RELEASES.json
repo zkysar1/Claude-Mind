@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.37",
+    "previous_version": "2.12.36",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Drift probe measures ahead at the push destination (pushurl); escalation catch-all resolves per deployment (deployment-routing.md, live-only candidates, title heuristic); pre-commit Gate 14 refuses invented top-level repo entries; domain-suite gate credential tripwire (name-keyed); WM hand-off list slot refuses scalars and heals any scalar on append; .gitignore for Zak-Code workspace files",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.36",
     "previous_version": "2.12.35",
     "date": "2026-08-29",

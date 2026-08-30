@@ -198,3 +198,15 @@ _gate check-no-bare-bash $PY "$REPO/core/scripts/check-no-bare-bash.py"
 # allowed, staged DELETION allowed (no mode to gate), and a rename INTO
 # core/scripts at 100644 REFUSED.
 _gate check-sh-exec-bits bash "$REPO/core/scripts/check-sh-exec-bits.sh" --staged
+
+# Gate 14: no INVENTED top-level entry (2026-08-30, coach@zc-03). A staged
+# addition whose first path component is not a top-level entry at HEAD is
+# refused with the routing (domain code -> <world>/scripts, scratch ->
+# agents/<agent>/temp, framework -> core/.claude). The L1 hook covers
+# world/meta/agent-dir invention for Write/Edit only; PROJECT_ROOT is not a
+# governed root and Bash mkdir/touch/cp bypass it — measured: 8 new root
+# entries on one deployment, 6 cruft, and a domain package duplicated at the
+# root that then diverged from the world copy for a day. The commit is the
+# chokepoint Bash cannot skip. Override for a genuine framework extension:
+# REPO_ROOT_ENTRY_OVERRIDE="<why>" (logged as an override firing).
+_gate check-repo-root-entries $PY "$REPO/core/scripts/check-repo-root-entries.py" "$REPO"
