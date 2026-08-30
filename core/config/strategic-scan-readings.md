@@ -7281,3 +7281,61 @@ member set did not widen at all** — still exactly one goal, still `g-335-816`.
 rows could not separate "one goal's window" from "we can only see one goal"; this one
 can, and it favours the window confound. A member set that stays at 1 while the
 ceiling grows 8x is not a visibility limit.
+
+## S3 — alpha, cc-04, 6.8.0-137-generic, 2026-08-30T01:4x (own-cloud)
+
+n=2209 pending/in-progress across 27 active aspirations, 224 distinct categories:
+**36.8% / 62.0% (30 `framework-*` labels) / 84.1%**. Verdicts unchanged — axis 2
+still the only fire, threshold 0.7 read from config at run time. Full-store,
+verified by GOAL COUNT (2869, not 220) and `goals_omitted` key-presence 0/27.
+
+**Its addition is the first same-box interval in this roster where the non-115
+pool went BACKWARDS while the total grew.** Against cc-04's own 08-18T22:2x row
+(39.6 / 62.6 / 82.1, n=1973, asp-115 1620, non-115 353): asp-115 **1620 -> 1858
+(+238)** while the denominator rose only 1973 -> 2209 (**+236**) — so asp-115
+absorbed **more than 100% of net growth** and non-115 **fell 353 -> 351 (-2)**.
+Share 82.1% -> 84.1% (+2.0pp).
+
+Read that against the two standing warnings, because it satisfies NEITHER. It is
+not the ordinary dilution direction (share falling while the pile grows), and it
+is not the 08-16T16:32 reverse-dilution case (share rising on a SHRINKING base) —
+the base grew by 236. Both terms moved toward concentration at once. Every prior
+same-box row has the two pools moving the same way; this is the first that does
+not, so it is the first row where "concentration accelerating" is the plain
+reading rather than a denominator artifact. One interval is not a trend — the
+08-18T22:2x row recorded the mirror case (non-115 growing ~10% against asp-115's
+3.8%) and explicitly said not to read one interval as one. Same caution applies
+here, in the other direction.
+
+Second, smaller: axis 1 FELL 39.6% -> 36.8% while categories grew 186 -> 224. So
+the category axis is fragmenting further and the axis1/axis2 gap is WIDENING
+(45.3pp here vs 42.5pp on 08-18). rb-4502's finding — the two axes disagree and
+the category axis is the one giving false comfort — is getting worse, not better,
+and a reader looking only at axis 1 would see a portfolio that improved.
+
+## S4.6 — alpha, cc-04, 6.8.0-137-generic, 2026-08-30T01:4x (own-cloud, read-only)
+
+**0 candidates at BOTH `--min-failures 2` and `1`, distinct failing-goal members
+0** — the undecidable case, so the positive control did NOT discriminate.
+`ceiling_ratio` **0.0056 (156 of 27635)**, inside the ~0.0026-0.009 band, so this
+is a COVERAGE measurement and not a skill-quality one. Routed nothing.
+`--failing-invocations` reported `failing_count: 2` against 0 surfaced candidates;
+read that gap as coverage, never as suppression working.
+
+**Its addition: the peer seed is stable across WEEKS, not merely days.** The
+standing claim (foxtrot 2026-08-19) was "stable across two calendar days / ~29
+hours". On this box bravo's slice starts `2026-07-15T17:10:20` — **byte-identical
+to the start alpha recorded here on 2026-08-16 AND 2026-08-17, i.e. unmoved for 14
+days and now 46 days stale** — with echo `08-06T07:55:56` and foxtrot
+`08-06T08:54:32` (24d) and zeta `08-04T01:01:06` (26d). Only the resident diary
+advanced (alpha `08-29T17:23:56..08-30T01:17:06`, 8h). That matters because every
+discriminator in the S4.6 marker rests on repeating a reading on ONE box and
+expecting the peer slices to hold; they hold for weeks, not hours.
+
+Also a clean instance of the decline-by-denominator case with the confound
+removed: the ratio fell **0.0073 (08-17T08:2x) -> 0.0056** while `invocations`
+grew 23387 -> 27635 (+18%) and every peer span was UNCHANGED — so nothing but the
+all-time denominator moved. The 2026-08-18T19:4x falsification (ratio can RISE
+when a peer is re-pulled) is untouched: span width is still the fast term, it
+simply did not move here. Per-agent in-span 20/28/39/17/52 against 5391/5873/
+5115/5192/6064 totals — 0.3%-0.9% each, unchanged in shape.
