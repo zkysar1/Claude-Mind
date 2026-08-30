@@ -226,6 +226,13 @@ if [ -n "${MIND_SID:-}" ]; then
             "$MIND_SID" "${MIND_AGENT:-}" "$(hostname || echo unknown)" \
             "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" > "$_HB_CARRIER.tmp" \
             && mv -f "$_HB_CARRIER.tmp" "$_HB_CARRIER" || true
+    else
+        # Say so. A silent skip here reads as "the tick ran and wrote nothing",
+        # and the caller's next move is to hand-write the carrier (measured
+        # 2026-08-30, coach/zc-03: /start skipped Step 0, this branch was
+        # silent, a wrong-shape carrier was written by hand). Not a failure —
+        # an observer or assistant session legitimately has no bound dir.
+        echo "[heartbeat-tick] no liveness carrier written: bound session dir $_HB_BODY_DIR is missing — a runner must run /start Step 0 (session-binding-write.sh --sid \"\$MIND_SID\" --agent <agent> --mode autonomous --retire-legacy) before this tick; never write the carrier by hand" >&2
     fi
 fi
 
