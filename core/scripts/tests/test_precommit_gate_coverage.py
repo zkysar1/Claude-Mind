@@ -61,6 +61,10 @@ EXPECTED = {
     "check-no-ownership-flag":         'bash "$REPO/core/scripts/check-no-ownership-flag.sh"',
     "check-no-bare-bash":              '$PY "$REPO/core/scripts/check-no-bare-bash.py"',
     "check-sh-exec-bits":              'bash "$REPO/core/scripts/check-sh-exec-bits.sh" --staged',
+    # Gates 14 + 15 (2026-08-30, coach@zc-03): covered by test_check_repo_root_entries.py
+    # and test_framework_origin_policy.py respectively.
+    "check-repo-root-entries":         '$PY "$REPO/core/scripts/check-repo-root-entries.py" "$REPO"',
+    "check-framework-origin-writes":   '$PY "$REPO/core/scripts/check-framework-origin-writes.py" "$REPO"',
 }
 
 # Gates with NO test that exercises them. Measured 2026-08-29 with the corrected
