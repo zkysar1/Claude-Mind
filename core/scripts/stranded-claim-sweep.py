@@ -13,14 +13,20 @@ frozen until /felt-sense-checkin Phase 2 happens to catch it on its
 Sweep logic per g-115-1044:
 
   for each goal where claimed_by == MIND_AGENT AND status == "in-progress":
-      if execution-diary has an entry for this goal_id AFTER claimed_at:
+      if execution-diary has an EXECUTION entry for this goal_id AFTER claimed_at
+         (the claim-time breadcrumb does not count — CLAIM_BREADCRUMB_MARKER):
           NOT stranded (work is in progress)
       elif (now - claimed_at) < stale_threshold_minutes (default 5):
           NOT stranded (fresh claim, race-condition window)
-      elif claimed_by_sid is set AND != this process's MIND_SID
-           AND age < foreign_sid_grace_minutes (default 120):
-          NOT stranded (g-115-4004 — another live INSTANCE of this same
-          agent holds it; see the foreign-session guard below)
+      elif claimed_by_sid is set AND != this process's MIND_SID:
+          if age < foreign_sid_grace_minutes (default 120): NOT stranded
+              (g-115-4004 — another live INSTANCE of this same agent holds it)
+          elif its body carrier is fresh: NOT stranded (alive on another box)
+          elif its own transcript on THIS box is fresh: NOT stranded (alive
+              here — a worker mid-unit writes no carrier; 2026-08-30)
+          else: STRANDED
+      elif team-state in_flight still names the goal (own session):
+          NOT stranded (mid-execution after a compaction resume)
       else:
           STRANDED
 
@@ -166,6 +172,25 @@ DEFAULT_STALE_MINUTES = 5
 # multi-hour goal on a peer box whose diary this box cannot read, short enough
 # that a genuinely dead instance cannot freeze a shared world goal for a day.
 DEFAULT_FOREIGN_SID_GRACE_MINUTES = 120
+#: How recent the HOLDER's own transcript on THIS box (its Claude Code
+#: `<sid>.jsonl` or its zakcode `sessions/<sid>.json`) must be for the holder to
+#: count as ALIVE past the foreign-sid grace. Sibling of the body carrier, which
+#: is written only at a worker's cycle top — a worker mid-unit for hours writes
+#: no carrier, but every model step it takes lands in its transcript. Same
+#: default as the carrier window, for the same reason: above the measured step
+#: gap (~7 min on a shared local pod), below the grace.
+DEFAULT_HOLDER_FRESH_MINUTES = 100
+#: The content marker aspirations-claim.sh stamps into the execution diary AT
+#: CLAIM TIME (). It is CLAIM evidence, never EXECUTION evidence: it
+#: lands the same second as claimed_at, so an inclusive "entry at or after
+#: claimed_at" test was satisfied by construction for every claim ever made.
+#: Measured 2026-08-30 (coach, zc-03): 6 of 6 in-progress claims came back
+#: `possible-displacement (do NOT auto-act)`, one of them held by a session
+#: dead for 18 h, and the sweep had released nothing since the breadcrumb
+#: shipped. The scan below skips it; liveness is judged by the carrier, the
+#: holder transcript and in_flight instead. The literal MUST match the writer
+#: (aspirations-claim.sh) — test_claim_time_diary_breadcrumb.py pins both ends.
+CLAIM_BREADCRUMB_MARKER = "claim-time liveness breadcrumb"
 
 
 def _now_iso() -> str:
@@ -575,12 +600,100 @@ def _local_sid() -> Optional[str]:
     return v or None
 
 
+_ATF_MODULE = None
+
+
+def _assistant_turn_freshness_module():
+    """assistant-turn-freshness.py, loaded by path (its filename is hyphenated)."""
+    global _ATF_MODULE
+    if _ATF_MODULE is None:
+        import importlib.util
+        path = SCRIPT_DIR / "assistant-turn-freshness.py"
+        spec = importlib.util.spec_from_file_location("assistant_turn_freshness", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _ATF_MODULE = mod
+    return _ATF_MODULE
+
+
+def _holder_transcript_verdict(sid: str, fresh_minutes: float, now: dt.datetime,
+                               transcripts_dir: Optional[Path] = None,
+                               zakcode_home: Optional[str] = None) -> Dict[str, Any]:
+    """Is the session that holds a claim demonstrably ALIVE on THIS box?
+
+    Reads the holder's own transcript — the Claude Code `<sid>.jsonl` under the
+    project's transcripts dir, else the zakcode `sessions/<sid>.json` document —
+    through the same readers recovery-gate's Path D veto uses
+    (assistant-turn-freshness.py), and returns one of:
+
+      alive      newest credible assistant turn <= fresh_minutes old
+      stale      a transcript exists, newest turn older than that (dead or parked)
+      absent     no transcript for this sid here (the holder lives on another box —
+                 the body carrier is the cross-box signal; this one is box-local)
+      unreadable a transcript exists but could not be read (fail toward the
+                 caller's existing ladder, never toward a verdict)
+
+    Why it exists: the body carrier is written at a worker's cycle top only, so a
+    worker mid-unit for hours has none and the execution diary carries nothing
+    between claim and close by construction (g-115-6677) — yet every model step
+    the holder takes lands in its transcript. Measured 2026-08-30 (coach, zc-03):
+    4 of 6 live holders had no carrier while the dead one's transcript had been
+    silent for 18 h. Box-local by design: a fresh reading is proof of life, an
+    `absent` reading is not proof of death.
+    """
+    out: Dict[str, Any] = {"verdict": "absent", "sid": (sid or "")[:8],
+                           "fresh_minutes": fresh_minutes}
+    if not sid:
+        return out
+    try:
+        atf = _assistant_turn_freshness_module()
+        tdir = Path(transcripts_dir) if transcripts_dir else atf.default_transcripts_dir(PROJECT_ROOT)
+        path = tdir / f"{sid}.jsonl"
+        reader = atf.newest_assistant_timestamp
+        source = "claude-code"
+        if not path.is_file():
+            zdoc = atf.zakcode_session_doc(sid, PROJECT_ROOT, zakcode_home)
+            if zdoc is None:
+                return out
+            path, reader, source = Path(zdoc), atf.newest_assistant_timestamp_zakcode, "zakcode"
+        out["source"] = source
+        out["path"] = str(path)
+        newest = reader(path, now)
+    except Exception as exc:  # a liveness probe must never traceback the sweep
+        out["verdict"] = "unreadable"
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    if newest is None:
+        out["verdict"] = "stale"
+        out["age_minutes"] = None
+        return out
+    age_min = round((now - newest).total_seconds() / 60.0, 2)
+    out["newest_assistant_at"] = newest.isoformat()
+    out["age_minutes"] = age_min
+    out["verdict"] = "alive" if age_min <= fresh_minutes else "stale"
+    return out
+
+
+def _is_claim_breadcrumb(entry: Dict[str, Any]) -> bool:
+    """True iff `entry` is the claim-time breadcrumb aspirations-claim.sh writes.
+
+    Recognised by content, not entry_type: the breadcrumb is a plain
+    `observation`, the same type real Phase-4 observations use.
+    """
+    return CLAIM_BREADCRUMB_MARKER in str(entry.get("content", ""))
+
+
 def _scan_diary_text(text: str, goal_id: str, since_iso: str) -> bool:
-    """True iff `text` (diary JSONL) has an entry for goal_id with ts >= since_iso.
+    """True iff `text` (diary JSONL) has an EXECUTION entry for goal_id with ts >= since_iso.
 
     Shared by the box-local and store-of-record readers below so the two can
     never drift apart on parsing — the whole point of the pair is that they
     answer the SAME question over DIFFERENT bytes.
+
+    The claim-time breadcrumb (see CLAIM_BREADCRUMB_MARKER) is skipped: it is
+    written by the claim itself, so counting it would make this predicate true
+    for every claim from the moment it exists and the sweep could never release
+    anything.
     """
     since_dt = _parse_iso(since_iso)
     if since_dt is None:
@@ -593,7 +706,11 @@ def _scan_diary_text(text: str, goal_id: str, since_iso: str) -> bool:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if not isinstance(entry, dict):
+            continue
         if entry.get("goal_id") != goal_id:
+            continue
+        if _is_claim_breadcrumb(entry):
             continue
         ts = _parse_iso(entry.get("timestamp", ""))
         if ts is None:
@@ -1536,6 +1653,19 @@ def main() -> int:
              f"{DEFAULT_CARRIER_FRESH_MINUTES}.",
     )
     parser.add_argument(
+        "--holder-fresh-minutes",
+        type=float,
+        default=DEFAULT_HOLDER_FRESH_MINUTES,
+        help=f"How recent the claim holder's OWN transcript on this box (its "
+             f"Claude Code <sid>.jsonl or zakcode sessions/<sid>.json) must be "
+             f"for the holder to count as ALIVE past --foreign-sid-grace-minutes "
+             f"when it has no fresh body carrier. A worker mid-unit writes no "
+             f"carrier and no diary, but every model step lands in its "
+             f"transcript. Box-local: a fresh reading keeps the claim; an absent "
+             f"transcript (holder on another box) changes nothing. Default: "
+             f"{DEFAULT_HOLDER_FRESH_MINUTES}.",
+    )
+    parser.add_argument(
         "--completion-note-min-chars",
         type=int,
         default=_NOTE_EVIDENCE_MIN_CHARS,
@@ -1583,6 +1713,7 @@ def main() -> int:
         "local_sid": local_sid,
         "foreign_sid_grace_minutes": args.foreign_sid_grace_minutes,
         "carrier_fresh_minutes": args.carrier_fresh_minutes,
+        "holder_fresh_minutes": args.holder_fresh_minutes,
         # EACH GUARD REPORTS A PAIR: how many times it was REACHED, and how many
         # times it FIRED. Eager-0 on the fired-counter alone was not enough
         # ( F-001) — it separates "old build without this counter" from
@@ -1603,6 +1734,13 @@ def main() -> int:
         "carrier_checks": 0,
         "carrier_reads": 0,
         "kept_live_carrier": 0,
+        # holder_checks / kept_live_holder : the holder-transcript probe
+        #   (box-local liveness of the claiming session; 2026-08-30).
+        # kept_own_in_flight : own-session claims kept because team-state
+        #   in_flight still names the goal (mid-execution after a compaction).
+        "holder_checks": 0,
+        "kept_live_holder": 0,
+        "kept_own_in_flight": 0,
         # authoritative_checks : times the store-of-record diary gate was
         #   reached — i.e. release candidates that survived every cheaper guard.
         # kept_authoritative_diary : releases the LOCAL diary would have made
@@ -1643,6 +1781,7 @@ def main() -> int:
     # has-pending subprocess cost is paid only when a release is actually about
     # to happen (never on the common scanned=0 / all-kept path).
     bg_pending: Optional[bool] = None
+    live_in_flight_ids: Optional[set] = None
 
     # : per-RUN memo for the body-carrier probe, keyed by the same
     # (sid, fresh_minutes) the probe is a pure function of (agent is fixed for
@@ -1968,11 +2107,57 @@ def main() -> int:
                 summary["kept_live_carrier"] += 1
                 summary["stranded"].append(record)
                 continue
+            # No fresh carrier — ask the holder's own transcript on THIS box
+            # (2026-08-30). A worker mid-unit writes no carrier and no diary,
+            # but every step it takes lands in its transcript; a dead session's
+            # transcript simply stops. `absent` (holder on another box) and
+            # `unreadable` change nothing — this probe can only KEEP.
+            holder = _holder_transcript_verdict(
+                claimed_by_sid, args.holder_fresh_minutes, now)
+            summary["holder_checks"] += 1
+            record["holder_transcript"] = holder
+            if holder["verdict"] == "alive":
+                record["verdict"] = "kept"
+                record["reason"] = (
+                    f"foreign-session HELD PAST GRACE: no fresh body carrier for "
+                    f"sid={claimed_by_sid[:8]}, but its {holder.get('source')} "
+                    f"transcript on this box has an assistant turn "
+                    f"{holder.get('age_minutes')}m old (<= "
+                    f"{args.holder_fresh_minutes}m) — the holder is ALIVE here; "
+                    f"a carrier is written only at a worker's cycle top."
+                )
+                summary["kept"] += 1
+                summary["skipped_foreign_sid"] += 1
+                summary["kept_live_holder"] += 1
+                summary["stranded"].append(record)
+                continue
             # Not demonstrably alive — proceed exactly as before. The evidence
             # stays on the record so the release is explainable after the fact,
             # and so a reader can tell a genuinely-dead holder (stale) from a
             # carrier that never arrived (absent) without re-running anything.
             record["foreign_sid_grace_expired"] = True
+        else:
+            # OWN session (or an unstamped claim). Nothing in the diary between
+            # claim and close is normal (), so "no diary rows" cannot
+            # mean abandoned on its own. team-state in_flight is stamped at
+            # claim and overwritten by the NEXT claim: while it still names
+            # this goal, this session is mid-execution (an autocompact resume —
+            # the sweep released  26 min into a live execution that
+            # way, 2026-08-18); once a later claim has replaced it, the goal
+            # was left behind and the original  release applies.
+            if live_in_flight_ids is None:
+                live_in_flight_ids = _read_all_in_flight_goal_ids()
+            if goal_id in live_in_flight_ids:
+                record["verdict"] = "kept"
+                record["reason"] = (
+                    f"own-session mid-execution: team-state in_flight still "
+                    f"names {goal_id}, so this session is executing it (no "
+                    f"diary row is expected before close — g-115-6677)."
+                )
+                summary["kept"] += 1
+                summary["kept_own_in_flight"] += 1
+                summary["stranded"].append(record)
+                continue
 
         # : bg-pending guard (mirrors stop-hook Gate 2.5). A claim
         # that looks stranded may be legitimately paused awaiting REGISTERED

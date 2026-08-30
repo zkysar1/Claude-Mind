@@ -110,8 +110,23 @@ def test_breadcrumb_is_fail_open(claim_src):
     assert "|| echo" in block, "breadcrumb must degrade to a WARN, never fail the claim"
 
 
-def test_emitted_entry_satisfies_the_production_sweep_predicate(sweep):
-    """guard-4323: exercise the REAL predicate, not a regex rewritten here."""
+def test_emitted_entry_is_claim_evidence_not_execution_activity(sweep):
+    """guard-4323: exercise the REAL predicate, not a regex rewritten here.
+
+    REVERSED 2026-08-30. This test used to assert the breadcrumb SATISFIES the
+    sweep's diary predicate — that was the g-115-6677 remedy ("make the existing
+    predicate true by construction"). Measured on a live fleet (coach, zc-03):
+    the breadcrumb lands the same second as claimed_at, so the inclusive
+    ">= claimed_at" test was true for every claim from the instant it existed;
+    6 of 6 in-progress claims read `possible-displacement (do NOT auto-act)`,
+    one held by a session dead for 18 h, and the sweep had released nothing
+    since the breadcrumb shipped. The sweep now RECOGNISES the breadcrumb and
+    skips it; the 26-minute live execution the breadcrumb was written to
+    protect is kept by the in_flight / holder-transcript guards instead.
+    Both ends of the literal are pinned: the writer (claim_src) and the
+    reader's constant.
+    """
+    assert sweep.CLAIM_BREADCRUMB_MARKER == BREADCRUMB_MARKER
     entry = {
         "entry_type": "observation",
         "goal_id": "g-115-6677",
@@ -119,7 +134,12 @@ def test_emitted_entry_satisfies_the_production_sweep_predicate(sweep):
         "timestamp": "2026-08-18T22:47:10",
     }
     raw = json.dumps(entry)
-    assert sweep._scan_diary_text(raw, "g-115-6677", "2026-08-18T22:37:10") is True
+    assert sweep._is_claim_breadcrumb(entry) is True
+    assert sweep._scan_diary_text(raw, "g-115-6677", "2026-08-18T22:37:10") is False
+    # positive control: a real execution row at the SAME instant still counts
+    real = dict(entry, content="probe surprise: fixture shape differed", entry_type="observation")
+    assert sweep._is_claim_breadcrumb(real) is False
+    assert sweep._scan_diary_text(json.dumps(real), "g-115-6677", "2026-08-18T22:37:10") is True
 
 
 def test_predicate_still_discriminates(sweep):
