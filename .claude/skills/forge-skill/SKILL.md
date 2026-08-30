@@ -271,13 +271,18 @@ then come back here for the integration requirements.
 
    ```
    Bash: py -3 core/scripts/skill_edit_gate.py gate \
-       --new-judgments '{"safety":"<g|a|p>","completeness":"<g|a|p>","executability":"<g|a|p>","maintainability":"<g|a|p>","cost_awareness":"<g|a|p>"}' \
+       --new-judgments '{"safety":"<good|average|poor>","completeness":"<good|average|poor>","executability":"<good|average|poor>","maintainability":"<good|average|poor>","cost_awareness":"<good|average|poor>"}' \
        --skill-name "{new-skill-name}" --caller "forge-skill:Step3.5"
+   # Each value is the FULL WORD good, average or poor -- the gate refuses
+   # abbreviations (a Body copied "g" from an earlier <g|a|p> placeholder here
+   # and read the refusal as a BLOCK; 2026-08-30).
    # exit 0 = PASS  -> proceed to Step 4 registration.
    # exit 1 = BLOCK -> the gate already logged the verdict to meta/gate-firings.jsonl
    #          (id eval-harness-forge-accept) AND appended the rejected edit to
    #          meta/skill-rejected-edits.jsonl (negative memory). Do NOT register:
    #          STOP, revise the SKILL.md to fix the weakest dim(s), then re-run.
+   # exit 2 = MALFORMED CALL, not a verdict (bad JSON or a judgment outside the
+   #          three words); nothing was logged. Fix the call and re-run.
    ```
    For a refactor/edit of an EXISTING skill (not a new forge), pass
    `--old-judgments` with the pre-edit scores and `--policy no_regression
