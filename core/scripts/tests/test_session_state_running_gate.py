@@ -86,20 +86,48 @@ def _carrier(agent_dir: Path, sid: str) -> None:
         '{"sid": "%s", "agent": "gate-probe"}\n' % sid, encoding="utf-8")
 
 
+def _bind(agent_dir: Path, sid: str) -> None:
+    """What /start Step 0 (session-binding-write.sh) leaves behind: the per-session dir."""
+    d = agent_dir / "sessions" / sid
+    d.mkdir(parents=True)
+    (d / "binding.yaml").write_text("agent: gate-probe\nmode: autonomous\n", encoding="utf-8")
+
+
 def test_running_is_allowed_when_the_runner_sid_is_this_session(agent_dir: Path) -> None:
     (agent_dir / "session" / "running-session-id").write_text("abc123\n", encoding="utf-8")
+    _bind(agent_dir, "abc123")
     _carrier(agent_dir, "abc123")
     r = _run(agent_dir, "RUNNING", sid="abc123")
     assert r.returncode == 0, r.stderr
     assert _state(agent_dir) == "RUNNING"
 
 
-def test_running_is_refused_without_this_sessions_liveness_carrier(agent_dir: Path) -> None:
-    # The triple-write ran but the pre-flip heartbeat-tick did not: the tool-call-cadence
-    # tick would never fire for this runner and its lease would starve through /boot.
+def test_running_is_refused_without_the_bound_session_dir_and_names_step_0(agent_dir: Path) -> None:
+    # /start Step 0 (session-binding-write.sh) skipped: heartbeat-tick writes the carrier
+    # only under sessions/<SID>/, so the carrier refusal's remedy could never succeed and
+    # a small model's next move was to hand-write the carrier (2026-08-30, coach/zc-03).
+    # The binding must be checked FIRST and the refusal must name the binding step —
+    # even when a (hand-written) carrier is already present.
     (agent_dir / "session" / "running-session-id").write_text("abc123\n", encoding="utf-8")
+    _carrier(agent_dir, "abc123")
+    r = _run(agent_dir, "RUNNING", sid="abc123")
+    assert r.returncode == 1 and "REJECTED" in r.stderr
+    assert "session-binding-write.sh" in r.stderr and "Step 0" in r.stderr
+    assert "by hand" in r.stderr
+    assert _state(agent_dir) is None
+    _bind(agent_dir, "abc123")
+    assert _run(agent_dir, "RUNNING", sid="abc123").returncode == 0  # positive control
+
+
+def test_running_is_refused_without_this_sessions_liveness_carrier(agent_dir: Path) -> None:
+    # The triple-write and the binding ran but the pre-flip heartbeat-tick did not: the
+    # tool-call-cadence tick would never fire for this runner and its lease would starve
+    # through /boot.
+    (agent_dir / "session" / "running-session-id").write_text("abc123\n", encoding="utf-8")
+    _bind(agent_dir, "abc123")
     r = _run(agent_dir, "RUNNING", sid="abc123")
     assert r.returncode == 1 and "REJECTED" in r.stderr and "carrier" in r.stderr
+    assert "session-binding-write.sh" not in r.stderr  # the binding is present; name the tick
     assert _state(agent_dir) is None
     _carrier(agent_dir, "abc123")
     assert _run(agent_dir, "RUNNING", sid="abc123").returncode == 0  # positive control

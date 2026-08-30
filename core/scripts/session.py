@@ -23,7 +23,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import AGENT_DIR
+from _paths import AGENT_DIR, SESSIONS_DIRNAME
 
 # AGENT_DIR is None when MIND_AGENT is not set (no-agent mode).
 # Session scripts return "NO_AGENT" instead of crashing.
@@ -124,6 +124,25 @@ def require_runner_sid():
             f"REJECTED: running-session-id names {sid[:8]}… but this session is {env_sid[:8]}… — "
             "a stale runner file. Run /start's manifest-clear and the runner triple-write in THIS "
             "session before setting RUNNING.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # heartbeat-tick.sh writes the carrier ONLY under the bound session dir
+    # (agents/<agent>/sessions/<SID>/, created by /start Step 0's session-binding-write.sh),
+    # so check the binding FIRST and name THAT step. Checked in the other order, a skipped
+    # Step 0 surfaces as the carrier refusal below, whose remedy (run heartbeat-tick) cannot
+    # succeed — and the model's next move is to hand-write the carrier. Measured 2026-08-30
+    # (coach, zc-03, small-model /start): W0 skipped, the pre-flip tick wrote nothing, a
+    # wrong-shape carrier was hand-written, RUNNING flipped, and the lease then aged 238 s
+    # into /boot with no cadence tick until an operator ran the binding by hand.
+    if env_sid and not (AGENT_DIR / SESSIONS_DIRNAME / env_sid).is_dir():
+        print(
+            f"REJECTED: state RUNNING requires this session's bound session dir "
+            f"({AGENT_DIR / SESSIONS_DIRNAME / env_sid}). Run /start Step 0 first "
+            "(session-binding-write.sh --sid \"$MIND_SID\" --agent <agent> --mode autonomous "
+            "--retire-legacy), THEN the pre-flip heartbeat-tick, then set RUNNING — the tick "
+            "writes the liveness carrier only under that dir, so nothing else can satisfy "
+            "the carrier check below. Do NOT write the carrier by hand.",
             file=sys.stderr,
         )
         sys.exit(1)
