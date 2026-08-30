@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.39",
+    "previous_version": "2.12.38",
+    "date": "2026-08-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "iteration-close derives --source from the goal id and refuses --status blocked without blocker evidence with the shell remedy (goal-store-resolve.py) — a small-model Body looped four times on a human-gated block while the recovery hints echoed its invalid --source",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.38",
     "previous_version": "2.12.37",
     "date": "2026-08-30",

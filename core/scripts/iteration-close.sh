@@ -219,6 +219,46 @@ for g in asp.get("goals", []):
 # aspirations.jsonl cache via _probe_is_recurring, guard-980 — still stands and
 # applies to the record probe's daemon-backed read, which is why neither helper
 # touches the local file.)
+# ── --source is DERIVED from the goal id, never merely demanded (2026-08-30,
+# coach@zc-03). A small-model Body that had correctly diagnosed a human-gated
+# block tried verify --status blocked four times: `--source external` (not a
+# store), `--source agent` (wrong store), then world — and every RECOVERY hint
+# below parroted its own invalid value back as the retry command. Now: a valid
+# --source that does not hold the goal is corrected to the store that does (one
+# extra daemon read, noted on stderr); an omitted or invalid one is resolved
+# from the goal id; a value that is not a store and cannot be resolved is
+# refused HERE, with SOURCE cleared so no hint can echo it. Probe unavailable
+# (daemon down, g-xw-* ids) keeps the caller's valid value — fail open. The
+# decision is goal-store-resolve.py::decide, branch-tested.
+_resolve_source() {
+    [[ -z "$GOAL_ID" ]] && return 0
+    local _given="$SOURCE" _out="" _rc=0 _invalid=""
+    case "$_given" in world|agent|"") ;; *) _invalid="1" ;; esac
+    _out="$(python3 "$SCRIPT_DIR/goal-store-resolve.py" --goal "$GOAL_ID" --source "$_given" 2>&1)" || _rc=$?
+    case "$_rc" in
+        0)
+            local _store="${_out%%$'\n'*}" _note="${_out#*$'\n'}"
+            [[ "$_note" == "$_out" ]] && _note=""
+            if [[ -n "$_store" && "$_store" != "$_given" ]]; then
+                SOURCE="$_store"
+                [[ -n "$_note" ]] && echo "[iteration-close] $_note" >&2
+            fi
+            ;;
+        1)
+            echo "${_CURRENT_PHASE:-iteration-close}: $_out" >&2
+            SOURCE=""
+            exit 2
+            ;;
+        *)
+            if [[ -n "$_invalid" ]]; then
+                echo "${_CURRENT_PHASE:-iteration-close}: --source must be world or agent (got '$_given'), and it could not be resolved from the goal id (queue probe unavailable)." >&2
+                SOURCE=""
+                exit 2
+            fi
+            ;;
+    esac
+}
+
 _probe_goal_status() {
     local rec
     rec="$(_probe_goal_record)"
@@ -941,6 +981,7 @@ do_verify() {
     # outcome_class, the diary breadcrumb, the board post, clear-in-flight). A
     # missing flag that fails HERE costs one retry; the same flag missing three
     # steps later costs a half-closed goal with no error anywhere.
+    _resolve_source
     if [[ -z "$GOAL_ID" || -z "$GOAL_STATUS" || -z "$SOURCE" || -z "$OUTCOME" ]]; then
         local missing=""
         [[ -z "$GOAL_ID" ]]     && missing+=" --goal"
@@ -953,6 +994,28 @@ do_verify() {
         exit 2
     fi
     echo "[iteration-close] verify: goal=$GOAL_ID status=$GOAL_STATUS source=$SOURCE"
+
+    # ── blocked needs a blocker, and the refusal must name the shell remedy
+    # (2026-08-30, coach@zc-03). Without this, the daemon refuses the status
+    # write with `blocker_ref_required_for_blocked_status` and a remedy that
+    # names an HTTP header — nothing a Body can act on — and the block a Body
+    # correctly diagnosed is never recorded. Refused HERE, before anything
+    # downstream runs, with the two real routes. rc=2 (unknown) falls through
+    # to the write, whose own refusal still stands.
+    if [[ "$GOAL_STATUS" == "blocked" ]]; then
+        local _be=0
+        python3 "$SCRIPT_DIR/goal-store-resolve.py" --goal "$GOAL_ID" --source "$SOURCE" --blocker-evidence >/dev/null 2>&1 || _be=$?
+        if [[ "$_be" -eq 1 ]]; then
+            echo "verify: --status blocked needs blocker evidence on $GOAL_ID, and it has none (no blocker_ref, no blocked_by). Nothing was written." >&2
+            echo "  A goal is BLOCKED only through a blocker record. Pick the route that matches WHO must act:" >&2
+            echo "  - a PERSON (an approval, a credential, an authorization click) -> record a human-gated defer and leave the status pending:" >&2
+            echo "      bash core/scripts/aspirations-update-goal.sh --source $SOURCE $GOAL_ID defer_reason \"human_blocked: <what the person must do, and where>\"" >&2
+            echo "      then release your claim so the loop moves on:  bash core/scripts/aspirations-release.sh $GOAL_ID --source $SOURCE" >&2
+            echo "  - INFRASTRUCTURE or a service the agent can provision -> file the blocker with its Unblock goal, then re-run this verify:" >&2
+            echo "      bash core/scripts/create-blocker.sh --help" >&2
+            exit 2
+        fi
+    fi
 
     # ── Pending-deploys ENFORCE gate (SG-b, g-115-2688-b) ───────────────────
     # Refuse CLEAN-SUCCESS closure while a deploy THIS goal pushed is unverified.
@@ -1699,6 +1762,7 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
 # --------------------------- phase: state-update ---------------------------
 do_state_update() {
     _CURRENT_PHASE="state-update"
+    _resolve_source
     [[ -z "$GOAL_ID" || -z "$SOURCE" || -z "$OUTCOME" ]] && {
         echo "state-update: --goal, --source, --outcome required" >&2
         echo "  usage: iteration-close.sh --phase state-update --goal <id> --source <world|agent> --outcome <deep|routine>" >&2
@@ -3251,6 +3315,7 @@ print(json.dumps({
 # --------------------------- phase: learning-gate ---------------------------
 do_learning_gate() {
     _CURRENT_PHASE="learning-gate"
+    _resolve_source
     [[ -z "$GOAL_ID" || -z "$SOURCE" || -z "$OUTCOME" ]] && {
         echo "learning-gate: --goal, --source, --outcome required" >&2
         echo "  usage: iteration-close.sh --phase learning-gate --goal <id> --source <world|agent> --outcome <deep|routine>" >&2
