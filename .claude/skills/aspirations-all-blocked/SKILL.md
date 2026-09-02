@@ -209,14 +209,42 @@ constraint_context = {
 
 ## Step B2: Constraint-Aware Aspiration Generation
 
+**Empty is the designed outcome.** This step asks the generator whether
+anything VERIFIABLE is missing from the portfolio — not to "create work
+because the queue is empty". Every candidate it files is refused by the
+daemon's aspiration-supply gate (`core/scripts/gates/aspiration_supply.py`,
+g-357-82/83) unless it carries `supply_evidence` with ≥2 existing referents,
+does not restate a blocker as a gap, overlaps no existing aspiration by ≥40%,
+and the per-agent daily cap (2) is not reached. On a mature portfolio expect
+empty most of the time; that routes to B6.5/B7 — the quiet window — which is
+cheaper than one manufactured aspiration (measured 2026-09-02: eleven idle-path
+aspirations in six days on one deployment, each seeding goals that consumed
+iterations and tree writes). Never pass `--override-supply` from this path.
+
+**Do not regenerate against an unchanged portfolio.** Generation is the most
+expensive call on the idle path (it pages the full skill and the archive). If
+B2 returned empty and no goal has completed since, the answer is the same —
+skip it and let the backoff run.
+
 ```
-Output: "▸ Attempting constraint-aware aspiration generation..."
-invoke /create-aspiration from-self --plan with: constraint_context
-if new_aspirations_generated:
-    blocked_idle_attempts.append("create-aspiration: SUCCESS")
-    Output: "▸ Generated new aspirations avoiding blocked resources"
-    LOOP_CONTINUE
-blocked_idle_attempts.append("create-aspiration: no viable aspirations found")
+Bash: wm-read.sh loop_state --json → current
+completed_now = len(current.goals_completed_this_session or [])
+IF current.b2_empty_at_completed == completed_now AND current.b2_empty_at_completed is not null:
+    blocked_idle_attempts.append("create-aspiration: skipped (empty last time, portfolio unchanged)")
+    Output: "▸ Skipping aspiration generation — last result was empty and no goal has completed since"
+ELSE:
+    Output: "▸ Attempting constraint-aware aspiration generation..."
+    invoke /create-aspiration from-self --plan with: constraint_context
+    if new_aspirations_generated:
+        blocked_idle_attempts.append("create-aspiration: SUCCESS")
+        Output: "▸ Generated new aspirations avoiding blocked resources"
+        LOOP_CONTINUE
+    blocked_idle_attempts.append("create-aspiration: no viable aspirations found")
+    # Remember the portfolio state this empty result was computed against.
+    # Surgical per-key update (see B7 for why wholesale replacement is unsafe).
+    Bash: wm-read.sh loop_state --json → merged
+    merged.b2_empty_at_completed = completed_now
+    echo '<merged as JSON>' | Bash: wm-set.sh loop_state
 ```
 
 ## Step B2.5: Signal-Gated Goal Generation (replaces "idle playbook")
@@ -574,59 +602,12 @@ IF B6.5 returned rc=1 (quiescence denied):
     the text before the FIRST colon in blocker_ref.external_id. When there is
     no colon, the whole string is its own group (correctly a singleton).
 
-    # DO NOT group by the FULL external_id (g-115-4923, filed by omni from
-    # ZDS-Mind, reproduced here). external_id is near-unique per goal, so
-    # affected_count is ~1 for every group and the `>= 2` gate below is
-    # unreachable BY CONSTRUCTION — the PRIMARY synthesis target could never
-    # fire. omni measured 76 ids / 76 distinct / max-sharing 1. Measured here
-    # 2026-08-04 (bravo, hostname cc-05, uname -r 6.8.0-136-generic) on a live
-    # 169-goal blocked queue: 159 distinct of 169, max-sharing 3 — so a rare
-    # group CAN reach 2, which makes the defect intermittent rather than total
-    # and is exactly why it survived. Same vacuous-gate class as the
-    # covered_patterns bug documented below: a guard on a loop body that
-    # never runs.
-    #
-    # The prefix IS the blocker class — all 169 external_ids here carry a
-    # colon, and the prefixes are `hypothesis-gate` 99, `dependency` 25,
-    # `structured-defer` 19, `precondition` 9, `time-gate` 8, `not-my-lane` 5,
-    # `narrative-defer` 1, `explicit-status` 1, plus 2 colon-less
-    # create-blocker ids. That is 10 groups, SIX at >= 2 — the signal this
-    # step wants is present and abundant; only the key was wrong.
-    #
-    # blocker_ref.type is NOT the fallback to reach for, despite reading like
-    # the schema-backed choice. Measured on the same queue it is DEGENERATE:
-    # 167 of 169 are `resource`, giving 3 groups. It would collapse every
-    # distinct blocker class into one bucket and synthesize one meaningless
-    # aspiration. (This was a hypothesis of mine, falsified by measuring.)
-    #
-    # by_reason — already returned by the same call, above — is a valid but
-    # STRICTLY COARSER key: 6 groups, because it collapses `structured-defer`,
-    # `time-gate` and `narrative-defer` into one `deferred` bucket. Those want
-    # different Unblock aspirations, so prefer the prefix. Cross-tab confirms
-    # the prefix refines by_reason rather than cutting across it.
-    #
-    # CAUTION — THIS STEP NOW FIRES, SO JUDGE THE PATTERN BEFORE SYNTHESIZING.
-    # It has been inert, so its output has never been reviewed in practice. On
-    # the queue measured above the top three candidates are `hypothesis-gate`
-    # (99), `dependency` (25) and `structured-defer` (19), and the per-iteration
-    # cap of 3 means those are exactly what the first live firing would create.
-    # At least one is not an actionable blocker: a hypothesis gate is a TIME
-    # LOCK that resolves on its own schedule, so "Unblock: hypothesis-gate (99
-    # goals waiting)" is noise, not work. `time-gate` and `not-my-lane` are
-    # likewise self-resolving or routing artifacts. Prefer patterns naming a
-    # condition an agent can act on; skip the self-resolving classes. Whether
-    # to encode that as a hard exclusion list is g-115-4966 — until it lands,
-    # this is the operator's judgment call at synthesis time.
-    #
-    # MEASURE BOTH KEYS AGAINST `goal-selector.sh blocked`, NOT against
-    # `aspirations-query.sh --goal-status blocked` — the two populations
-    # differ by 30x here (169 vs 5), because `status: blocked` is a narrow
-    # field while this step's notion of blocked includes deferred,
-    # hypothesis-gated and dependency-blocked goals. Measuring the narrow one
-    # first produced a confident, wrong reading of this very defect
-    # (2 ids, no colons, "the prefix fix is inert here") before re-measuring
-    # on the population the code actually reads. guard-1802 class: a probe
-    # predicate narrower than the production path's.
+    # NOT the full external_id (near-unique → the >= 2 gate is unreachable,
+    # g-115-4923), NOT blocker_ref.type (167/169 `resource` → degenerate), NOT
+    # by_reason (strictly coarser). Measure against `goal-selector.sh blocked`,
+    # never `aspirations-query.sh --goal-status blocked` (30x smaller population).
+    # Rationale (WHY the class prefix, with the measurements):
+    # core/config/rationale/blocker-pattern-grouping-key.md
 
     # Build the set of blocker patterns already covered by an OUTSTANDING
     # Unblock aspiration, so we don't spam duplicates.
@@ -665,7 +646,10 @@ IF B6.5 returned rc=1 (quiescence denied):
             covered_patterns.add(origin_signal with the "blocker_pattern:" prefix stripped)
 
     created_count = 0
-    FOR EACH pattern WHERE affected_count >= 2 AND pattern NOT IN covered_patterns:
+    # g-115-4966 landed: self-resolving / routing-artifact classes are a hard
+    # exclusion list, core/config/aspirations.yaml → idle_supply.blocker_pattern_exclusions.
+    excluded = config.idle_supply.blocker_pattern_exclusions
+    FOR EACH pattern WHERE affected_count >= 2 AND pattern NOT IN covered_patterns AND pattern NOT IN excluded:
         Output: "▸ MW#5 Target 1: synthesizing Unblock aspiration for " + pattern
         aspiration_data = {
             title: "Unblock: " + pattern_summary + " (" + affected_count + " goals waiting)",
@@ -673,6 +657,14 @@ IF B6.5 returned rc=1 (quiescence denied):
             description: "Blocker pattern: " + pattern + ". Affected goals: " + goal_id_list +
                 ". Synthesized by MW#5 Target 1 from blocker_ref signal.",
             origin_signal: "blocker_pattern:" + pattern,
+            # blocker_pattern:* is a self-generated origin — the aspiration-supply
+            # gate refuses it without supply_evidence. The blocked goal ids ARE the
+            # referents; "Unblock:" titles are exempt from the blocker-as-gap check.
+            supply_evidence: {
+                gap: "No outstanding Unblock covers the " + pattern + " class; " + affected_count + " goals wait on it: " + goal_id_list,
+                needle: "Those " + affected_count + " goals become executable once the class is cleared",
+                checked: goal_ids_of_affected_goals,
+            },
         }
         invoke /create-aspiration from-followup with: aspiration_data
         blocked_idle_attempts.append("MW#5 Target 1: created Unblock aspiration for " + pattern)

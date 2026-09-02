@@ -28,6 +28,10 @@ Tests:
   7. State round-trips through to_dict/from_dict (tick mode persists across
      separate invocations).
   8. MemoryHeadroomProbe is registered in build_probes().
+  9. Box-local alert state (2026-09-02 email flood): dedup survives separate
+     invocations on one box, a re-alert window while the box stays over,
+     recovery clears it, the mirrored per-agent tick state never overrides
+     it, and every state-file failure fails OPEN.
 """
 from __future__ import annotations
 
@@ -212,10 +216,11 @@ def test_state_round_trips(monkeypatch):
     monkeypatch.setenv("AGENT_WATCHDOG_MEM_PCT", "60")
     p = _probe(monkeypatch, total_kb=BOX, procs=[(1, "claude", int(BOX * 0.9))])
     p.check()
-    assert p.to_dict() == {"over": True}
+    saved = p.to_dict()
+    assert saved["over"] is True and isinstance(saved["last_alert_ts"], float)
 
     revived = WD.MemoryHeadroomProbe(_Ctx())
-    revived.from_dict({"over": True})
+    revived.from_dict({"over": True})  # an older writer's shape: no stamp
     assert revived.over is True
     # A revived over-threshold probe must stay deduped across invocations.
     monkeypatch.setattr(WD, "_mem_total_kb", lambda: BOX)
@@ -557,3 +562,226 @@ def test_notify_reports_nonzero_rc_without_raising(monkeypatch):
     monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
     got = WD._notify_critical_memory("s", "m")
     assert got["sent"] is False and got["rc"] == 5
+
+
+# ── 9. box-local alert state — the email flood (2026-09-02) ──────────────────
+#
+# The transition dedup above is in-process and persisted PER AGENT under
+# agents/<agent>/session/, a directory mirrored across boxes. An agent ticking
+# on two hosts alternated that file between over=True and over=False, so the
+# starved host re-alerted on nearly every tick: 1,696 decision-needed emails in
+# four days. The alert state now lives box-locally in core/logs/ and is keyed
+# by the box alone, with a re-alert window while the box stays over.
+
+class _RootCtx:
+    """A context that knows its project root — the tick-mode shape."""
+
+    def __init__(self, root):
+        self.project_root_path = root
+
+
+def _root_probe(monkeypatch, root, *, total_kb, procs, avail_kb="healthy"):
+    """A probe whose box file lives under `root` — via the env override, which
+    is the only way a test may get the file written at all (see the probe's
+    PYTEST_CURRENT_TEST refusal)."""
+    if avail_kb == "healthy":
+        avail_kb = None if not total_kb else int(total_kb * 0.5)
+    monkeypatch.setattr(WD, "_mem_total_kb", lambda: total_kb)
+    monkeypatch.setattr(WD, "_claude_rss_kb", lambda: procs)
+    monkeypatch.setattr(WD, "_mem_available_kb", lambda: avail_kb)
+    monkeypatch.setenv(WD.MemoryHeadroomProbe.BOX_STATE_DIR_ENV,
+                       str(Path(root) / "core" / "logs"))
+    return WD.MemoryHeadroomProbe(_RootCtx(root))
+
+
+def _record_notifies(monkeypatch):
+    sent = []
+
+    def _rec(subject, message):
+        sent.append(subject)
+        return {"sent": True, "rc": 0}
+    monkeypatch.setattr(WD, "_notify_critical_memory", _rec)
+    return sent
+
+
+def _state_path(root):
+    return Path(root) / "core" / "logs" / WD.MemoryHeadroomProbe.BOX_STATE_NAME
+
+
+def _write_state(root, **fields):
+    import json
+    p = _state_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(fields), encoding="utf-8")
+
+
+def _read_state(root):
+    import json
+    return json.loads(_state_path(root).read_text(encoding="utf-8"))
+
+
+PRESSURE = dict(total_kb=BOX, procs=[(1478029, "claude.exe", int(6.3 * GIB))])
+HEALTHY = dict(total_kb=BOX, procs=[(1478029, "claude.exe", int(0.6 * GIB))])
+
+
+def test_realert_window_defaults_to_six_hours(monkeypatch):
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.REALERT_ENV, raising=False)
+    assert WD.MemoryHeadroomProbe._realert_seconds() == pytest.approx(6 * 3600)
+    monkeypatch.setenv(WD.MemoryHeadroomProbe.REALERT_ENV, "120")
+    assert WD.MemoryHeadroomProbe._realert_seconds() == pytest.approx(120)
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-1", "6h"])
+def test_malformed_realert_window_falls_back(monkeypatch, raw):
+    monkeypatch.setenv(WD.MemoryHeadroomProbe.REALERT_ENV, raw)
+    assert WD.MemoryHeadroomProbe._realert_seconds() == pytest.approx(6 * 3600)
+
+
+def test_box_state_dedups_across_separate_invocations(monkeypatch, tmp_path):
+    """Two ticks from two different processes (two probe instances) on one box:
+    the first alerts and writes the box file; the second reads it and stays
+    silent. This is the exact shape the per-agent file could not hold."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.REALERT_ENV, raising=False)
+    sent = _record_notifies(monkeypatch)
+
+    first = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    events = first.check()
+    assert len(events) == 1 and events[0].event == "memory_pressure"
+    assert events[0].payload["realert"] is False
+    assert len(sent) == 1 and events[0].payload["notified"]["sent"] is True
+    st = _read_state(tmp_path)
+    assert st["over"] is True and isinstance(st["last_alert_ts"], float)
+    assert st["triggers"] == events[0].payload["triggers"]
+
+    second = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    assert second.over is True  # loaded from the box file, not from memory
+    assert second.check() == []
+    assert len(sent) == 1
+
+
+def test_still_over_is_silent_inside_the_window(monkeypatch, tmp_path):
+    import time
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.REALERT_ENV, raising=False)
+    sent = _record_notifies(monkeypatch)
+    _write_state(tmp_path, over=True, last_alert_ts=time.time() - 60, triggers=["largest_process"])
+    p = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    assert p.check() == []
+    assert sent == []
+
+
+def test_still_over_realerts_once_the_window_has_passed(monkeypatch, tmp_path):
+    """A box that has been starved for longer than the window gets ONE reminder,
+    the stamp moves forward, and the next tick is silent again."""
+    import time
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.REALERT_ENV, raising=False)
+    sent = _record_notifies(monkeypatch)
+    old = time.time() - 7 * 3600
+    _write_state(tmp_path, over=True, last_alert_ts=old, triggers=["largest_process"])
+
+    p = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    events = p.check()
+    assert len(events) == 1 and events[0].payload["realert"] is True
+    assert len(sent) == 1
+    assert _read_state(tmp_path)["last_alert_ts"] > old + 6 * 3600
+
+    again = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    assert again.check() == [] and len(sent) == 1
+
+
+def test_recovery_clears_the_box_state_and_a_new_episode_alerts(monkeypatch, tmp_path):
+    import time
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.REALERT_ENV, raising=False)
+    sent = _record_notifies(monkeypatch)
+    _write_state(tmp_path, over=True, last_alert_ts=time.time() - 60, triggers=["largest_process"])
+
+    healthy = _root_probe(monkeypatch, tmp_path, **HEALTHY)
+    events = healthy.check()
+    assert len(events) == 1 and events[0].event != "memory_pressure"
+    assert _read_state(tmp_path)["over"] is False
+    assert sent == []
+
+    relapse = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    events = relapse.check()
+    assert len(events) == 1 and events[0].payload["realert"] is False
+    assert len(sent) == 1
+
+
+def test_mirrored_per_agent_state_never_overrides_the_box_file(monkeypatch, tmp_path):
+    """The per-agent tick file (from_dict) is what other boxes overwrite. With a
+    box file present it must be ignored in BOTH directions: a mirrored
+    over=False cannot re-arm an alert the box already sent, and a mirrored
+    over=True cannot suppress a box's first alert."""
+    import time
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.REALERT_ENV, raising=False)
+    sent = _record_notifies(monkeypatch)
+
+    _write_state(tmp_path, over=True, last_alert_ts=time.time() - 60, triggers=["largest_process"])
+    p = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    p.from_dict({"over": False})  # the healthy box's tick, mirrored here
+    assert p.over is True and p.check() == [] and sent == []
+
+    fresh_root = tmp_path / "other-box"
+    q = _root_probe(monkeypatch, fresh_root, **PRESSURE)
+    q.from_dict({"over": True})  # a starved box's tick, mirrored here
+    assert q.over is False
+    assert len(q.check()) == 1 and len(sent) == 1
+
+
+def test_box_state_path_resolution(monkeypatch, tmp_path):
+    """Production: <project root>/core/logs/<name>. Under pytest with no
+    override: NO file — the probe tests run on the real project root, and a
+    stamped over=True there would silence a live box's next alert. The env
+    override wins everywhere."""
+    env = WD.MemoryHeadroomProbe.BOX_STATE_DIR_ENV
+    name = WD.MemoryHeadroomProbe.BOX_STATE_NAME
+    monkeypatch.delenv(env, raising=False)
+    assert WD.MemoryHeadroomProbe(_RootCtx(tmp_path))._box_state_path() is None
+    assert WD.MemoryHeadroomProbe(_Ctx())._box_state_path() is None
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    assert (WD.MemoryHeadroomProbe(_RootCtx(tmp_path))._box_state_path()
+            == tmp_path / "core" / "logs" / name)
+    assert WD.MemoryHeadroomProbe(_Ctx())._box_state_path() is None
+
+    monkeypatch.setenv(env, str(tmp_path / "elsewhere"))
+    assert (WD.MemoryHeadroomProbe(_Ctx())._box_state_path()
+            == tmp_path / "elsewhere" / name)
+
+
+def test_context_without_a_root_keeps_the_in_process_behaviour(monkeypatch):
+    """No box file (stub context, no override): the per-agent state is
+    honoured and nothing is written anywhere."""
+    monkeypatch.delenv(WD.MemoryHeadroomProbe.BOX_STATE_DIR_ENV, raising=False)
+    p = _probe(monkeypatch, **PRESSURE)
+    assert p._box_state_path() is None
+    p.from_dict({"over": True})
+    assert p.over is True
+
+
+def test_unwritable_state_dir_fails_open(monkeypatch, tmp_path):
+    """core/logs occupied by a FILE: mkdir raises, the alert still fires, and
+    nothing propagates. A broken state file must never silence the probe."""
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    sent = _record_notifies(monkeypatch)
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "logs").write_text("not a directory", encoding="utf-8")
+    p = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    events = p.check()
+    assert len(events) == 1 and len(sent) == 1
+
+
+def test_corrupt_state_file_fails_open_to_not_over(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_WATCHDOG_MEM_PCT", raising=False)
+    sent = _record_notifies(monkeypatch)
+    p = _state_path(tmp_path)
+    p.parent.mkdir(parents=True)
+    p.write_text("{not json", encoding="utf-8")
+    probe = _root_probe(monkeypatch, tmp_path, **PRESSURE)
+    assert probe.over is False
+    assert len(probe.check()) == 1 and len(sent) == 1
+    assert _read_state(tmp_path)["over"] is True  # rewritten cleanly

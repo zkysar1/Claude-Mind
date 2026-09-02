@@ -106,6 +106,30 @@ def main():
                 print(f"   - {r['file']}: {r['status']}")
         return 1
 
+    if args.cmd == "verify-exec-bits":
+        # : index-mode comparison. SKIP is loud and distinct from PASS
+        # (a destination with no git index has no modes to compare yet);
+        # an unreadable side is a FAIL, never a clean read (guard-1947).
+        if data.get("skipped"):
+            print(f"   SKIP: {data['skipped']}")
+            return 0
+        if data.get("error"):
+            print(f"   FAIL: {data['error']}")
+            return 1
+        stripped = data.get("stripped", [])
+        checked = data.get("checked", 0)
+        if not stripped:
+            print(f"   PASS ({checked} source-executable path(s) carry 100755 in the destination index)")
+            return 0
+        print(f"   FAIL: {len(stripped)} path(s) executable at the source but 100644 in the destination index")
+        for rel in stripped[:20]:
+            print(f"   - {rel}")
+        if len(stripped) > 20:
+            print(f"   ... and {len(stripped) - 20} more")
+        print("   Fix: git -C <dest> update-index --chmod=+x -- <path>, then commit."
+              " A chmod never reaches the index on a core.fileMode=false clone (g-360-16).")
+        return 1
+
     # Default
     print(json.dumps(data, indent=2))
     return 0

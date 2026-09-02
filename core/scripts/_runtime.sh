@@ -457,28 +457,32 @@ rt_spawn() {
         # suite's wrapper call respawned the production daemon carrying
         # STORAGE_BACKEND=local + MIND_ALLOW_TMP_OWNCLOUD_PUT=1 +
         # PYTEST_CURRENT_TEST (~6min LocalBackend split-brain, tempdir
-        # tripwire dormant). mind_api's _load_env_local uses setdefault
-        # ("explicit launch env wins"), so an inherited var BLOCKS the
-        # .env.local value. Scrub, inside this subshell only:
-        #   - test markers (PYTEST_*, MOTO_*) + the tripwire escape hatch —
-        #     no daemon should ever carry a test session's flags;
-        #   - every storage/config key the daemon self-resolves from
-        #     .env.local / the environment registry (_N3_ALLOWED_EXACT in
-        #     mind_api/src/__main__.py, minus RUNTIME_DIR) — .env.local
-        #     becomes the single source of truth on this path.
-        # RUNTIME_DIR is deliberately KEPT: it is the sanctioned per-test
-        # daemon-isolation override (lifecycle.runtime_dir). Deliberate
-        # env-shaping for DIRECT launches (python3 -m mind_api.src,
-        # mind-api-start.sh, daemon_integration fixtures) is untouched —
-        # those do not pass through rt_spawn, and there the launcher is a
-        # deliberate operator, not an accidental parent.
-        local _v
-        for _v in $(compgen -e); do
-            case "$_v" in
-                PYTEST_*|MOTO_*) unset "$_v" ;;
-                MIND_ALLOW_TMP_OWNCLOUD_PUT|STORAGE_BACKEND|STORAGE_S3_BUCKET|STORAGE_DDB_SESSIONS_TABLE|STORAGE_DDB_LOCK_TABLE|ENVIRONMENT_ID|MACHINE_ID|MACHINE_MULTI|OWNCLOUD_SYNC_INTERVAL|OWNCLOUD_CACHE_TTL|MIND_API_TOKEN|MIND_API_BIND) unset "$_v" ;;
-            esac
-        done
+        # tripwire dormant).
+        #
+        # THE LIST ITSELF LIVES IN _daemon_env_scrub.sh — one definition, two
+        # spawn sites (). It is sourced HERE, inside the spawn
+        # subshell, rather than at file top: this file is on the per-Bash-call
+        # latency path for ~200 wrappers (see the header), while rt_spawn is
+        # the cold path — reached only when the daemon is down, stale or
+        # unreachable. The unsets scope to this subshell.
+        #
+        # CORRECTED 2026-09-02 (): this comment used to end with
+        # "Deliberate env-shaping for DIRECT launches (python3 -m mind_api.src,
+        # mind-api-start.sh, daemon_integration fixtures) is untouched — those
+        # do not pass through rt_spawn, and there the launcher is a deliberate
+        # operator, not an accidental parent." That exemption was FALSE for the
+        # launcher whenever its parent is a test, which mind-api-start.sh's own
+        # gate comment had already said in as many words. Read literally it also
+        # TAUGHT the gap (guard-1662: a prescriptive doc naming a retired pattern
+        # is an active generator), and the gap was taken: on 2026-09-02 the
+        # launcher spawned the shared daemon from inside pytest with
+        # STORAGE_BACKEND=local intact and six hours of world writes stayed on
+        # the local mirror. mind-api-start.sh now applies this same scrub when
+        # PYTEST_CURRENT_TEST is set; a genuine operator launch is still
+        # unscrubbed there, which is the half of the old claim that was true.
+        # shellcheck disable=SC1091
+        source "$PROJECT_ROOT/core/scripts/_daemon_env_scrub.sh"
+        daemon_scrub_inherited_env
         # guard-586: cap before the redirect creates the long-lived fd. Twin of
         # the mind-api-start.sh spawn site — the two are independent spawn paths
         # to the same file, so a cap on only one leaves the other unbounded.

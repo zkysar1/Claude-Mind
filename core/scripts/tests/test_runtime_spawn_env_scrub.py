@@ -173,3 +173,30 @@ def test_sanctioned_vars_preserved():
     assert "STORAGE_BACKEND" not in keys, (
         "control failed: STORAGE_BACKEND should be scrubbed in this case too"
     )
+
+
+def test_git_repo_override_vars_scrubbed():
+    """git's repository-override variables must not reach the spawned daemon.
+
+    git exports them into HOOK processes, and the private-index commit recipe
+    (rb-9959) exports GIT_INDEX_FILE by hand. Observed 2026-09-02 (alpha,
+    DESKTOP-O91DLK2): a pre-commit gate poked a wrapper mid-commit, rt_spawn
+    respawned the daemon carrying GIT_INDEX_FILE=<tmp index>, the temp file
+    was deleted seconds later, and every git call the daemon made afterwards
+    saw a MISSING index -- the uncommitted-work gate reported every tracked
+    framework file dirty while `git status` in a shell was clean, refusing
+    every goal close on the box until the daemon was restarted clean.
+    """
+    captured = _run_spawn(
+        'export GIT_INDEX_FILE="/tmp/tmp.private-index"\n'
+        'export GIT_DIR=".git"\n'
+        'export GIT_WORK_TREE="."\n'
+        'export GIT_PREFIX="core/scripts/"\n'
+        'export GIT_COMMON_DIR=".git"\n'
+    )
+    keys = _env_keys(captured)
+    leaked = {k for k in keys if k in (
+        "GIT_INDEX_FILE", "GIT_DIR", "GIT_WORK_TREE", "GIT_PREFIX", "GIT_COMMON_DIR",
+    )}
+    assert not leaked, f"git repo-override vars leaked into daemon env: {leaked}"
+    assert "PATH" in keys, "sanity: capture missing PATH -- harness broken"

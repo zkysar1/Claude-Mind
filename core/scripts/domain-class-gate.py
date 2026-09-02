@@ -140,8 +140,11 @@ def cmd_check(args) -> int:
     # Convert to 0.0-1.0 ratios for comparison with thresholds.
     current_ratio_int = pcts.get(candidate_class)
     if current_ratio_int is None:
-        # Class not in pct map (rare — only the 4 declared classes appear).
-        # Treat as zero ratio.
+        # Class not in pct map. Since  the map is an OPEN vocabulary
+        # (the four base classes plus any domain_class a deployment tags a tree
+        # node with), so a miss here means the class is genuinely unrepresented
+        # in the counted population — not that it fell outside a closed set of
+        # four. Treat as zero ratio either way.
         current_ratio = 0.0
     else:
         current_ratio = float(current_ratio_int) / 100.0

@@ -635,8 +635,7 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
             pass
     if not staged_names:
         return
-    reducer_wm = _read_yaml(reducer_wm_path)
-    staged_changed = False
+    pending_merges: list = []  # (body_wm, baseline_wm) -- applied under the lock
     merged_files: list = []  # authoritative deletes deferred past the WM write
     for name in sorted(staged_names):
         staged_path = staged_dir / name
@@ -678,15 +677,28 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
                 # raising would abort the whole drain and strand every later
                 # staged unit in the loop.
                 baseline_wm = _read_staged_yaml(backend, baseline_path)
-                reducer_wm = merge_wm(reducer_wm, body_wm, baseline_wm)
-                staged_changed = True
+                pending_merges.append((body_wm, baseline_wm))
                 summary["staged_merged"].append(unit_key)
                 merged_files.append((staged_path, hash_path, baseline_path))
         else:
             summary["skipped"].append(unit_key)
             _delete_staged(backend, staged_path, hash_path, baseline_path)
-    if staged_changed:
-        _write_yaml_atomic(reducer_wm_path, reducer_wm)
+    if pending_merges:
+        # : the read AND the write happen inside ONE lock hold, and
+        # the read is taken fresh HERE rather than before the loop -- the loop
+        # does authoritative-store I/O per unit, so a WM read taken before it
+        # is arbitrarily stale by the time the write lands, and a concurrent
+        # daemon /v1/wm/set is silently reverted (guard-5818: a lock cannot
+        # protect a read-modify-write it does not span).
+        # The store I/O stays deliberately OUTSIDE the lock: wm_lock breaks at
+        # stale_seconds=10 and an S3 drain can exceed that, which would make
+        # this a stale-break GENERATOR rather than a mutex (guard-1965 -- audit
+        # the whole cycle body, not just the read and the persist).
+        with wm.wm_lock_for(reducer_wm_path):
+            reducer_wm = _read_yaml(reducer_wm_path)
+            for _body_wm, _baseline_wm in pending_merges:
+                reducer_wm = merge_wm(reducer_wm, _body_wm, _baseline_wm)
+            _write_yaml_atomic(reducer_wm_path, reducer_wm)
     # Consume merged units only now — after their content is durably in the
     # reducer WM (see the CROSS-BOX docstring paragraph for the crash trade).
     for files in merged_files:
@@ -814,8 +826,7 @@ def generalize_down(agent: str, project_root: Path | None = None,
         if not pending:
             break
         summary["passes"] = _pass + 1
-        reducer_wm = _read_yaml(reducer_wm_path)
-        changed = False
+        pass_merges: list = []  # (body_wm, baseline) -- applied under the lock
         for unit_key, manifest in pending:
             summary["scanned"] += 1
             already.add(unit_key)
@@ -864,12 +875,26 @@ def generalize_down(agent: str, project_root: Path | None = None,
             # cross-box leg degrades exactly as a local one always has.
             baseline = _read_staged_yaml(
                 backend, sessions_root / unit_key / bm._BASELINE_FILENAME)
-            reducer_wm = merge_wm(reducer_wm, body_wm, baseline)
-            changed = True
+            pass_merges.append((body_wm, baseline))
+            # NOTE: _mark_merged still precedes the WM write, exactly as before
+            # . That ordering is PRE-EXISTING (a failed write would
+            # leave units marked merged with their content unwritten) and is
+            # deliberately not altered here -- a different defect from the lost
+            # update this remedy closes, and folding it in would put an untested
+            # state-machine change inside a locking fix.
             _mark_merged(unit_key, agent, pr, manifest)
             summary["merged"].append(unit_key)
-        if changed:
-            _write_yaml_atomic(reducer_wm_path, reducer_wm)  # copy-back
+        if pass_merges:
+            # : same one-lock read->merge->write as _consume_staged,
+            # for the same reason -- the loop above does per-unit store I/O, so
+            # a pre-loop WM read is stale at write time and reverts a concurrent
+            # daemon set. Store I/O stays outside the lock (see _consume_staged
+            # for the stale_seconds argument).
+            with wm.wm_lock_for(reducer_wm_path):
+                reducer_wm = _read_yaml(reducer_wm_path)
+                for _body_wm, _baseline in pass_merges:
+                    reducer_wm = merge_wm(reducer_wm, _body_wm, _baseline)
+                _write_yaml_atomic(reducer_wm_path, reducer_wm)  # copy-back
 
     # /: drain staged orphans, skipping any unit_key already
     # merged in the sessions-pass above (the concurrent-double-merge guard).

@@ -2576,7 +2576,8 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
 
 def pull_continuity(be, agent: str, *, dry_run: bool = False,
                     only: "set[str] | None" = None,
-                    include_temp: bool = False) -> dict:
+                    include_temp: bool = False,
+                    adopt_store: "set[str] | None" = None) -> dict:
     """Pull every continuity-tier session file for `agent` from S3 to local,
     freshness-aware (never clobbering unpushed local writes). Called by the
     /start IDLE branch (via owncloud-pull.sh -> POST /v1/admin/owncloud-pull)
@@ -2619,7 +2620,52 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False,
     agents/<agent>/experience/, NEVER under temp/), and artifact-reference-
     integrity.md already ratified box-dependent temp-citation dangling as
     tolerated rather than worth a rewrite engine. Nothing is destroyed: the
-    objects stay in S3 and `--with-temp` fetches them on demand."""
+    objects stay in S3 and `--with-temp` fetches them on demand.
+
+    `adopt_store` (g-306-409) names continuity files whose MANIFEST BASELINE is
+    dropped before the freshness gate runs, so S3 is adopted as canonical. It
+    exists for one shape the gate above cannot resolve on its own: THREE-WAY
+    DIVERGENCE, local md5 != baseline md5 != S3 md5. The gate reads that as
+    "local has unpushed writes", skips as `local_ahead_skipped`, and does so
+    FOREVER -- nothing below the pull re-derives a baseline, so a poisoned one
+    is a PERMANENT wedge, not a transient skip. Measured 2026-09-02: cc-09 and
+    cc-13 carry the IDENTICAL poisoned baseline md5 (08ae6a83...), so it is not
+    box-specific; 40 continuity files across five agents are pull-skipped on one
+    box, with alpha/foxtrot/zeta working-memory.yaml all three-way diverged.
+    The class is governed-mirror class (b) -- no reconciler below the write
+    (governed-store-write-classes.md) -- and hand-writing the file is refused by
+    guard-996, which is the dead end that motivated this lane.
+
+    TWO no-clobber fences read that baseline, and the drop must reach BOTH or
+    the lane silently no-ops: (1) _pull_one's gate, which takes baseline_md5 as
+    an argument, and (2) be.refresh -> _overwrite_decision, which RE-READS
+    _load_manifest() from disk and deliberately mirrors (1). Dropping only the
+    argument left fence (2) reading the poisoned value: it returned
+    "no_clobber", kept local, and _pull_one -- already committed to pulling --
+    counted pulled += 1 and re-stamped the baseline to LOCAL's md5. Measured
+    2026-09-02 on cc-09: `pulled=1 adopted=1/1 errors=0` over a file that kept
+    its 10-day-old bytes and mtime. So the drop is PERSISTED to the manifest
+    before the loop; an absent baseline is the S3-authoritative first-pull state
+    both fences already implement.
+
+    It adds NO new overwrite path, which is the whole design. Dropping the
+    baseline routes the file into _pull_one's EXISTING `baseline_md5 is None`
+    branch -- already the correct lane for "S3 is authoritative and local may be
+    an unpushed authored write": it snapshots local to .history FIRST
+    (_snapshot_before_pull), and the md5 it returns re-stamps the baseline
+    through the same loop below, so the next sweep is no longer wedged
+    (guard-1004 satisfied by the existing re-stamp, not by a second writer).
+    `dry_run` still returns before BOTH the snapshot and the refresh, so a dry
+    adopt writes nothing.
+
+    PER-PATH OPT-IN, NEVER A SWEEP, and the asymmetry is the reason: `local !=
+    baseline` alone does NOT prove three-way divergence -- some of those 40 are
+    genuinely unpushed local writes where the skip is CORRECT and adopting would
+    destroy them. The caller must name each path, having established that S3 is
+    the side to keep. Names are matched against the continuity set exactly as
+    `only` is, so adopt can never widen the pull or reach a non-continuity file,
+    and an unmatched name is surfaced (`adopt_requested_missing`) instead of
+    silently ignored -- guard-3489, an absent field can BE the zero."""
     stats = {"agent": agent, "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
              "multipart_deferred": 0, "errors": 0, "pulled_files": []}
@@ -2639,6 +2685,19 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False,
             stats["requested_missing"] = missing
         stats["only"] = sorted(wanted)
 
+    # Resolved AFTER the `only` narrowing and against the SAME continuity set,
+    # so adopt can neither widen the pull nor reach a file this call is not
+    # already scanning. A name outside that set adopts nothing and is surfaced.
+    adopt_names = set()
+    if adopt_store:
+        wanted_adopt = {str(n).strip() for n in adopt_store if str(n).strip()}
+        adopt_names = {n for n in continuity_names if n in wanted_adopt}
+        adopt_missing = sorted(wanted_adopt - adopt_names)
+        if adopt_missing:
+            stats["adopt_requested_missing"] = adopt_missing
+        stats["adopt_store"] = sorted(wanted_adopt)
+        stats["adopted"] = []
+
     agents_roots = _roots(be, "agents")
     if not agents_roots:
         stats["error"] = "no agents root on backend"
@@ -2648,11 +2707,37 @@ def pull_continuity(be, agent: str, *, dry_run: bool = False,
 
     manifest = _load_manifest()
     new_manifest = dict(manifest)
+    if adopt_names and not dry_run:
+        # BOTH no-clobber fences must see the drop, not just this loop's.
+        # be.refresh -> _overwrite_decision RE-READS the PERSISTENT manifest and
+        # applies its own gate (deliberately mirroring _pull_one's). With the
+        # poisoned baseline still on disk it returns "no_clobber" and keeps
+        # local, while _pull_one -- having already decided to pull -- counts
+        # pulled += 1 and re-stamps the baseline to LOCAL's md5. Measured
+        # 2026-09-02 (cc-09): the adopt reported pulled=1 adopted=1/1 errors=0
+        # and wrote nothing; the file kept its 10-day-old bytes and mtime.
+        # An ABSENT baseline is what BOTH gates treat as S3-authoritative
+        # first-pull, so persisting the drop here is what makes the lane
+        # single-pass -- and it is still not a new overwrite path.
+        for _n in sorted(adopt_names):
+            _k = f"agents/{agent}/session/{_n}"
+            manifest.pop(_k, None)
+            new_manifest.pop(_k, None)
+        _save_manifest(new_manifest)
     for name in continuity_names:
         full = session_dir / name
         stats["scanned"] += 1
         rel_key = f"agents/{agent}/session/{name}"
         _base_mtime, base_md5 = _manifest_entry(manifest.get(rel_key))
+        if name in adopt_names:
+            # The ONE lane that discards a local divergence on purpose -> log it
+            # unconditionally, on the same stderr channel as every other pull
+            # decision, so the receipt exists even when a caller drops stats.
+            print(f"[pull] adopt-store: dropping manifest baseline for "
+                  f"{rel_key} (S3 becomes canonical; local snapshotted to "
+                  f".history first)", file=sys.stderr)
+            base_md5 = None
+            stats["adopted"].append(name)
         before = stats["pulled"]
         new_md5 = _pull_one(be, full, dry_run=dry_run, stats=stats,
                             baseline_md5=base_md5)

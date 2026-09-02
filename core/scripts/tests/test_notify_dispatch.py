@@ -119,12 +119,25 @@ def test_missing_slot_is_rc5_no_transport(world):
     assert _ledger(world) == []  # nothing was sent, nothing recorded as sent
 
 
-def test_transport_failure_is_rc6_and_not_recorded_as_sent(world):
-    p = _run(world, "--category", "decision-needed", "--subject", "Your call on asp-9",
-             "--message", "I decided to pause asp-9 for a week because the data source is down; override if you disagree.", FAKE_FAIL="1")
+def test_transport_failure_is_rc6_and_recorded_as_failed_not_sent(world):
+    """A refused delivery is ledgered with rc=6 + delivery_failed (2026-09-02):
+    a day of statusCode-403 refusals previously left NO trace, so a ledger
+    census read them as sent. And the failure row must not poison the
+    duplicate check -- the retry is not a duplicate of mail nobody received."""
+    msg = "I decided to pause asp-9 for a week because the data source is down; override if you disagree."
+    p = _run(world, "--category", "decision-needed", "--subject", "Your call on asp-9", "--message", msg, FAKE_FAIL="1")
     assert p.returncode == nd.RC_TRANSPORT_FAIL
     assert "transport exploded" in p.stderr
-    assert _ledger(world) == []
+    rows = _ledger(world)
+    assert len(rows) == 1 and rows[0]["rc"] == nd.RC_TRANSPORT_FAIL and rows[0]["delivery_failed"] is True
+    assert "transport rc=7" in rows[0]["transport_note"]
+    assert not any(r["rc"] == 0 for r in rows)  # never recorded as sent
+
+    # retry after the transport recovers: delivered, not refused as a duplicate
+    p2 = _run(world, "--category", "decision-needed", "--subject", "Your call on asp-9", "--message", msg)
+    assert p2.returncode == nd.RC_SENT, (p2.returncode, p2.stderr)
+    rows = _ledger(world)
+    assert rows[-1]["rc"] == 0 and not rows[-1].get("delivery_failed") and not rows[-1].get("suppressed_duplicate_of")
 
 
 def test_payload_stdin_path_derives_subject_body_category(world):

@@ -109,6 +109,53 @@ PREFIX_FALLBACK = [
 ]
 
 
+# The four classes this deployment's PREFIX_FALLBACK can produce. They are the
+# BASE of every bucket dict so the emitted shape never shrinks — but they are no
+# longer the whole vocabulary: load_tree_classes() reads an OPEN set (any
+# domain_class string a deployment puts on a tree node) and classify() returns it
+# verbatim, so the counters must accept a class they have never seen. Pre-seeding
+# exactly these four made the documented use of domain_class raise KeyError on its
+# first run in any deployment that tagged a node with its own class (g-115-4228,
+# found on ZDS as g-001-291; reproduced here before the fix).
+BASE_CLASSES = ("framework-meta", "ayoai-product", "npc-domain", "other")
+
+
+def _new_counts():
+    """A bucket dict pre-seeded with the base classes (never the whole vocabulary)."""
+    return {k: 0 for k in BASE_CLASSES}
+
+
+def _bump(counts, cls):
+    """Increment `cls`, creating the bucket if this deployment has never used it.
+
+    This is the KeyError fix: an open producer (arbitrary domain_class) now feeds
+    an open consumer. `dict.get` rather than defaultdict so the dicts stay plain
+    and JSON-serializable for the --json payload."""
+    counts[cls] = counts.get(cls, 0) + 1
+
+
+def _align(*dicts):
+    """Give every bucket dict an identical key set, and return the print order.
+
+    guard-3948: when a key can appear in a contract output it must appear on EVERY
+    exit path. A deployment class discovered in one store/source but not another
+    would otherwise leave per_store/per_source dicts with mismatched keys, and any
+    consumer diffing them would read a missing key as a real zero it cannot
+    distinguish from an absent bucket. Order is base-minus-`other`, then discovered
+    classes sorted, then the `other` catch-all last — so with no discovered classes
+    the output is byte-identical to the pre-fix line."""
+    discovered = []
+    for d in dicts:
+        for k in d:
+            if k not in BASE_CLASSES and k not in discovered:
+                discovered.append(k)
+    order = [k for k in BASE_CLASSES if k != "other"] + sorted(discovered) + ["other"]
+    for d in dicts:
+        for k in order:
+            d.setdefault(k, 0)
+    return order
+
+
 def load_tree_classes():
     """Read _tree.yaml and build {node_key: domain_class} for tagged nodes."""
     if not TREE_PATH.exists():
@@ -119,7 +166,15 @@ def load_tree_classes():
     for key, node in (data or {}).get("nodes", {}).items():
         dc = node.get("domain_class")
         if dc:
-            out[key] = dc
+            # str() because YAML parses `domain_class: yes` as the bool True and
+            # `domain_class: 3` as an int. Either then reaches _align's
+            # sorted(discovered), where mixing one with a real string class raises
+            # `TypeError: '<' not supported between instances of 'bool' and 'str'`
+            # -- and alone it prints `True 100%` into the line domain-class-gate.py
+            # parses. A YAML list is worse: unhashable, so it dies at _bump. The
+            # vocabulary is open to any scalar the deployment writes; the counters
+            # need it comparable. (fresh-eyes echo-fec-open-vocab-is-string-only.)
+            out[key] = str(dc)
     return out
 
 
@@ -136,18 +191,18 @@ def classify(category, tree_classes):
 
 
 def count_store(path, tree_classes):
-    counts = {"framework-meta": 0, "ayoai-product": 0, "npc-domain": 0, "other": 0}
+    counts = _new_counts()
     for rec in _rb.read_jsonl(path):
         if rec.get("status") != "active":
             continue
-        counts[classify(rec.get("category", ""), tree_classes)] += 1
+        _bump(counts, classify(rec.get("category", ""), tree_classes))
     return counts
 
 
 def count_goals(tree_classes):
     """Count active + in-progress goals across world + agent aspirations.jsonl,
     classified by domain_class. Returns {counts_dict, per_source_dict}."""
-    counts = {"framework-meta": 0, "ayoai-product": 0, "npc-domain": 0, "other": 0}
+    counts = _new_counts()
     per_source = {}
     active_statuses = {"pending", "in-progress"}
     sources = []
@@ -159,7 +214,7 @@ def count_goals(tree_classes):
         if not path.exists():
             per_source[label] = {k: 0 for k in counts}
             continue
-        src_counts = {"framework-meta": 0, "ayoai-product": 0, "npc-domain": 0, "other": 0}
+        src_counts = _new_counts()
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -176,12 +231,12 @@ def count_goals(tree_classes):
                         if g.get("status") not in active_statuses:
                             continue
                         cat = g.get("category", "") or ""
-                        src_counts[classify(cat, tree_classes)] += 1
+                        _bump(src_counts, classify(cat, tree_classes))
         except OSError:
             pass
         per_source[label] = src_counts
         for k, v in src_counts.items():
-            counts[k] += v
+            counts[k] = counts.get(k, 0) + v
     return counts, per_source
 
 
@@ -199,27 +254,32 @@ def main(argv=None):
     fw_max, npc_min = load_targets()
 
     if args.scope == "artifacts":
-        totals = {"framework-meta": 0, "ayoai-product": 0, "npc-domain": 0, "other": 0}
+        totals = _new_counts()
         per_store = {}
         for label, path in [("guardrails", _rb.GUARD_PATH),
                             ("reasoning_bank", _rb.RB_PATH)]:
             c = count_store(path, tree_classes)
             per_store[label] = c
             for k, v in c.items():
-                totals[k] += v
+                totals[k] = totals.get(k, 0) + v
         scope_label = "Learning ratio (artifacts)"
+        order = _align(totals, *per_store.values())
         detail = {"totals": totals, "per_store": per_store}
     else:  # goals
         totals, per_source = count_goals(tree_classes)
         scope_label = "Learning ratio (goals)"
+        order = _align(totals, *per_source.values())
         detail = {"totals": totals, "per_source": per_source}
 
     total = sum(totals.values()) or 1
     pct = {k: round(100 * v / total) for k, v in totals.items()}
-    print(f"{scope_label}: framework-meta {pct['framework-meta']}% · "
-          f"ayoai-product {pct['ayoai-product']}% · "
-          f"npc-domain {pct['npc-domain']}% · "
-          f"other {pct['other']}%  "
+    # Built from `order`, not four literals: a deployment class that reaches
+    # `totals` must also reach the printed line, or the percentages silently stop
+    # summing to 100 and under-report exactly the domain half this dashboard
+    # exists to measure. With no deployment classes present `order` is the
+    # original four in the original order, so this line is byte-identical.
+    parts = " · ".join(f"{k} {pct[k]}%" for k in order)
+    print(f"{scope_label}: {parts}  "
           f"(target: framework ≤ {fw_max}%, npc ≥ {npc_min}%)")
     if args.json:
         detail["pct"] = pct

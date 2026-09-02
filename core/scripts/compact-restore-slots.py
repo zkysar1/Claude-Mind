@@ -31,7 +31,7 @@ from _paths import AGENT_DIR, assert_agent_dir, body_state_path
 # Path at import time; calling wm_path() per use re-resolves through BODY_WM_PATH
 # every time. Behavior-preserving here (short-lived CLI, env fixed at launch);
 # matches the per-use pattern in tree-encoding-drift-gate.py.
-from wm import wm_path as _resolve_wm_path, read_wm, write_wm
+from wm import wm_path as _resolve_wm_path, read_wm, write_wm, wm_lock
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
@@ -254,29 +254,36 @@ def _recover_lost_loop_state():
         ck_ls = (ck.get("all_slots") or {}).get("loop_state")
         if not isinstance(ck_ls, dict):
             return  # checkpoint carries no valid loop_state to recover from
-        wm = read_wm()
-        if not wm:
-            return  # uninitialized wm — main()'s read_wm guard handles this
-        slots = wm.setdefault("slots", {})
-        disk_ls = slots.get("loop_state")
-        if isinstance(disk_ls, dict):
-            return  # on-disk loop_state is valid — DO NOT clobber ()
-        # on-disk loop_state is null/lost — recover from the checkpoint snapshot
-        slots["loop_state"] = ck_ls
-        meta = wm.setdefault("slot_meta", {})
-        prev = meta.get("loop_state") if isinstance(meta.get("loop_state"), dict) else {}
-        meta["loop_state"] = {
-            "updated_at": now_iso(),
-            "accessed_at": now_iso(),
-            "update_count": prev.get("update_count", 0) + 1,
-        }
-        write_wm(wm)
-        gc = ck_ls.get("goals_completed", "?")
-        pg = ck_ls.get("productive_goals", "?")
-        print(
-            f"loop_state RECOVERED from checkpoint (was null on disk; "
-            f"goals_completed={gc}, productive_goals={pg}) [g-115-1302]"
-        )
+        # : read AND write under ONE lock hold. The null-guard below
+        # is a DECISION taken from the read ("on-disk loop_state is invalid"),
+        # so an unlocked straddle can act on a value a concurrent daemon
+        # /v1/wm/set already replaced -- reinstating a checkpoint snapshot over
+        # a live one and reverting the peer's write (guard-5818, guard-746:
+        # loop_state must never be persisted from a pre-mutation snapshot).
+        with wm_lock():
+            wm = read_wm()
+            if not wm:
+                return  # uninitialized wm — main()'s read_wm guard handles this
+            slots = wm.setdefault("slots", {})
+            disk_ls = slots.get("loop_state")
+            if isinstance(disk_ls, dict):
+                return  # on-disk loop_state is valid — DO NOT clobber ()
+            # on-disk loop_state is null/lost — recover from the checkpoint snapshot
+            slots["loop_state"] = ck_ls
+            meta = wm.setdefault("slot_meta", {})
+            prev = meta.get("loop_state") if isinstance(meta.get("loop_state"), dict) else {}
+            meta["loop_state"] = {
+                "updated_at": now_iso(),
+                "accessed_at": now_iso(),
+                "update_count": prev.get("update_count", 0) + 1,
+            }
+            write_wm(wm)
+            gc = ck_ls.get("goals_completed", "?")
+            pg = ck_ls.get("productive_goals", "?")
+            print(
+                f"loop_state RECOVERED from checkpoint (was null on disk; "
+                f"goals_completed={gc}, productive_goals={pg}) [g-115-1302]"
+            )
     except Exception as e:
         print(f"WARN: loop_state recovery skipped ({e})", file=sys.stderr)
 
@@ -375,98 +382,107 @@ def main():
         _delete_checkpoint_safely(CHECKPOINT_PATH, "empty-checkpoint")
         return
 
-    wm = read_wm()
-    if not wm:
-        # Preserve checkpoint for next-iteration retry — wm-init may recover.
-        print("ERROR: Working memory not initialized", file=sys.stderr)
-        sys.exit(1)
+    # : the whole restore is ONE lock hold -- read_wm() here and
+    # write_wm() at the end of the block. This region carries loop_state as
+    # COLLATERAL (it is in SKIP_SLOTS, so it is never merged, only re-persisted
+    # verbatim from the opening read), which is precisely the shape guard-746
+    # forbids persisting from a pre-mutation snapshot: an unlocked straddle
+    # reverts any daemon counter bump that lands mid-restore. Everything
+    # between the two calls is local slot merging -- no network I/O -- so the
+    # hold stays far inside wm_lock's stale_seconds=10 (guard-1965).
+    with wm_lock():
+        wm = read_wm()
+        if not wm:
+            # Preserve checkpoint for next-iteration retry — wm-init may recover.
+            print("ERROR: Working memory not initialized", file=sys.stderr)
+            sys.exit(1)
 
-    wm_slots = wm.setdefault("slots", {})
-    wm_meta = wm.setdefault("slot_meta", {})
+        wm_slots = wm.setdefault("slots", {})
+        wm_meta = wm.setdefault("slot_meta", {})
 
-    restored = []
-    skipped = []
-    merged = []
+        restored = []
+        skipped = []
+        merged = []
 
-    for slot_name, saved_value in all_slots.items():
-        # Skip list
-        if slot_name in SKIP_SLOTS:
-            skipped.append(slot_name)
-            continue
+        for slot_name, saved_value in all_slots.items():
+            # Skip list
+            if slot_name in SKIP_SLOTS:
+                skipped.append(slot_name)
+                continue
 
-        # Skip null/empty values from checkpoint
-        if saved_value is None:
-            continue
-        if isinstance(saved_value, list) and not saved_value:
-            continue
-        if isinstance(saved_value, dict) and not any(v is not None for v in saved_value.values()):
-            continue
+            # Skip null/empty values from checkpoint
+            if saved_value is None:
+                continue
+            if isinstance(saved_value, list) and not saved_value:
+                continue
+            if isinstance(saved_value, dict) and not any(v is not None for v in saved_value.values()):
+                continue
 
-        current = wm_slots.get(slot_name)
+            current = wm_slots.get(slot_name)
 
-        # Merge logic
-        if isinstance(saved_value, list) and isinstance(current, list) and current:
-            # Array merge: extend with checkpoint items not already present
-            existing_set = {
-                json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item)
-                for item in current
-            }
-            added = 0
-            for item in saved_value:
-                key = json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item)
-                if key not in existing_set:
-                    current.append(item)
-                    existing_set.add(key)
-                    added += 1
-            if added:
-                merged.append(f"{slot_name}(+{added})")
-        elif isinstance(saved_value, dict) and isinstance(current, dict) and current:
-            # Map merge with timestamp-aware preference (, Fix 1 of ).
-            # Sibling to the SKIP_SLOTS list above (Fix 2, ) — that list
-            # names the slots known today to need latest-wins semantics. THIS
-            # branch protects FUTURE dict-shape slots whose authors forget to add
-            # to SKIP_SLOTS: when both dicts carry an epoch-like field, keep the
-            # newer one; when timestamps are missing or ambiguous, fall through
-            # to the original checkpoint-wins semantics for backward compat.
-            cur_ts = current.get("timestamp") or current.get("updated_at") or current.get("time")
-            chk_ts = saved_value.get("timestamp") or saved_value.get("updated_at") or saved_value.get("time")
-            if cur_ts and chk_ts and cur_ts >= chk_ts:
-                # Current is newer than checkpoint — preserve it. Fill nulls
-                # from checkpoint (don't overwrite anything current already has).
-                for k, v in saved_value.items():
-                    if v is not None and current.get(k) is None:
-                        current[k] = v
+            # Merge logic
+            if isinstance(saved_value, list) and isinstance(current, list) and current:
+                # Array merge: extend with checkpoint items not already present
+                existing_set = {
+                    json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item)
+                    for item in current
+                }
+                added = 0
+                for item in saved_value:
+                    key = json.dumps(item, sort_keys=True, default=str) if isinstance(item, dict) else str(item)
+                    if key not in existing_set:
+                        current.append(item)
+                        existing_set.add(key)
+                        added += 1
+                if added:
+                    merged.append(f"{slot_name}(+{added})")
+            elif isinstance(saved_value, dict) and isinstance(current, dict) and current:
+                # Map merge with timestamp-aware preference (, Fix 1 of ).
+                # Sibling to the SKIP_SLOTS list above (Fix 2, ) — that list
+                # names the slots known today to need latest-wins semantics. THIS
+                # branch protects FUTURE dict-shape slots whose authors forget to add
+                # to SKIP_SLOTS: when both dicts carry an epoch-like field, keep the
+                # newer one; when timestamps are missing or ambiguous, fall through
+                # to the original checkpoint-wins semantics for backward compat.
+                cur_ts = current.get("timestamp") or current.get("updated_at") or current.get("time")
+                chk_ts = saved_value.get("timestamp") or saved_value.get("updated_at") or saved_value.get("time")
+                if cur_ts and chk_ts and cur_ts >= chk_ts:
+                    # Current is newer than checkpoint — preserve it. Fill nulls
+                    # from checkpoint (don't overwrite anything current already has).
+                    for k, v in saved_value.items():
+                        if v is not None and current.get(k) is None:
+                            current[k] = v
+                else:
+                    # Current is older OR timestamps missing OR undeterminable.
+                    # Fall back to original checkpoint-wins for backward compat —
+                    # SKIP_SLOTS still names the slots where even this is wrong.
+                    for k, v in saved_value.items():
+                        if v is not None:
+                            current[k] = v
+                merged.append(slot_name)
             else:
-                # Current is older OR timestamps missing OR undeterminable.
-                # Fall back to original checkpoint-wins for backward compat —
-                # SKIP_SLOTS still names the slots where even this is wrong.
-                for k, v in saved_value.items():
-                    if v is not None:
-                        current[k] = v
-            merged.append(slot_name)
-        else:
-            # Scalar or replacing empty: direct overwrite
-            wm_slots[slot_name] = saved_value
-            restored.append(slot_name)
+                # Scalar or replacing empty: direct overwrite
+                wm_slots[slot_name] = saved_value
+                restored.append(slot_name)
 
-        # Restore slot_meta timestamps
-        if slot_name in saved_meta:
-            sm = saved_meta[slot_name]
-            wm_meta[slot_name] = {
-                "updated_at": sm.get("updated_at") or now_iso(),
-                "accessed_at": sm.get("accessed_at") or now_iso(),
-                "update_count": sm.get("update_count", 0),
-            }
+            # Restore slot_meta timestamps
+            if slot_name in saved_meta:
+                sm = saved_meta[slot_name]
+                wm_meta[slot_name] = {
+                    "updated_at": sm.get("updated_at") or now_iso(),
+                    "accessed_at": sm.get("accessed_at") or now_iso(),
+                    "update_count": sm.get("update_count", 0),
+                }
 
-    # Restore top-level WM keys from checkpoint
-    top_restored = []
-    for key in ["goals_completed_this_session", "aspiration_touched_last", "last_goal_category"]:
-        val = checkpoint.get(key)
-        if val is not None and val != "" and val != []:
-            wm[key] = val
-            top_restored.append(key)
+        # Restore top-level WM keys from checkpoint
+        top_restored = []
+        for key in ["goals_completed_this_session", "aspiration_touched_last", "last_goal_category"]:
+            val = checkpoint.get(key)
+            if val is not None and val != "" and val != []:
+                wm[key] = val
+                top_restored.append(key)
 
-    write_wm(wm)
+        write_wm(wm)
 
     # Output summary for the LLM
     parts = []

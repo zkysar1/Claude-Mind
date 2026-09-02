@@ -102,6 +102,41 @@ KNOWLEDGE_COUNT_KEYS: tuple[str, ...] = ("tree", "hypotheses", "guardrails", "le
 #: not the filter — :func:`project_self` is.
 _SELF_PURPOSE_CAP = 1200
 
+#: The opt-in markers that delimit the customer-facing region of a ``world/program.md``.
+#: Everything outside them is suppressed, and a file carrying NEITHER marker publishes
+#: NOTHING. This is the one place this module does not mirror :func:`project_self`, and
+#: the divergence is measured rather than stylistic.
+#:
+#: ``self.md`` has an ENFORCED structure (``.claude/rules/self.md``): an identity
+#: statement, then ``##`` sections that are uniformly plumbing. That is what makes a
+#: structural "cut at the first ``##``" cut safe there. ``program.md`` has no such rule
+#: and is free-form, so the same cut is unsafe on it -- MEASURED 2026-09-02 on the only
+#: real ``program.md`` in existence (22,453 B): its pre-``##`` region is 3,216 chars and
+#: a self-style 1200-char slice of it ships a verbatim competitive directive naming a
+#: named competition track twice ("we are NOT entering ...", "Do NOT publish the ...
+#: repo"), while the full region additionally carries internal repo names, an
+#: ``EnvironmentAdapter`` contract, source-tree paths and ``AGENT_WRITE_PATH``. The
+#: :class:`Redactor` strips none of them: it covers agent names, workspace paths and
+#: secrets, which is a different set.
+#:
+#: So the world DECLARES what is customer-facing instead of a heuristic guessing --
+#: filter-at-the-source (PEARL 10.3) applied honestly. Fail-closed is free here because
+#: ``published`` already makes "nothing published" a first-class state the consumer
+#: renders, so an unmarked world degrades to the honest answer rather than to a leak.
+PROGRAM_PUBLIC_OPEN = "<!-- public:begin -->"
+PROGRAM_PUBLIC_CLOSE = "<!-- public:end -->"
+
+#: Front-matter keys of a ``world/program.md`` that may reach a customer. Same
+#: allowlist, same two dates, same reason as :data:`SELF_EXPOSED_FM_FIELDS` -- "how
+#: current is this?" is the only front-matter question a customer has. Kept as its own
+#: constant rather than aliased: the two files' front matter evolve independently, and
+#: widening one must never silently widen the other.
+PROGRAM_EXPOSED_FM_FIELDS = frozenset({"created", "last_updated"})
+
+#: Cap on the projected program text. Bounds a malformed or run-away marked block; it
+#: is not the filter -- the markers are.
+_PROGRAM_PURPOSE_CAP = 1200
+
 #: Framework-id shapes stripped from any exposed string. These are internal handles
 #: (reasoning-bank / guardrail / goal ids, script filenames) — noise and mild leakage
 #: to a kid. Order matters: strip compound ids before bare tokens.
@@ -465,6 +500,60 @@ def project_self(
     return out if "purpose" in out else {}
 
 
+def project_program(
+    front_matter: Mapping[str, object] | None,
+    body: str,
+    redactor: "Redactor",
+) -> dict[str, object]:
+    """Project a world ``program.md`` down to the customer-facing "what is this FOR" view.
+
+    The consumer-side twin of :func:`project_self`: same return contract, same
+    ``{}``-means-nothing-published signal, same allowlisted dated front matter, same
+    redact-then-cap ordering. A member who can read WHO their agent is should be able to
+    read what it is FOR.
+
+    The ONE deliberate divergence is the prose cut, and it is fail-closed: only the
+    region between :data:`PROGRAM_PUBLIC_OPEN` and :data:`PROGRAM_PUBLIC_CLOSE` is
+    published. A ``program.md`` with no markers -- which today is every one of them,
+    including the zero-byte placeholder ``init-world.sh`` creates -- publishes ``{}``.
+    See those constants for the measurement that ruled out mirroring ``self.md``'s
+    structural ``##`` cut here.
+
+    Redaction happens BEFORE the cap, never after, so a forbidden token straddling the
+    cap boundary cannot survive by being truncated into a different shape -- the same
+    ordering :func:`project_self` uses and the same one its cap test pins.
+
+    Returns ``{}`` when there is nothing exposable -- an absent, empty, unmarked or
+    unreadable ``program.md`` yields no key rather than a hollow one, so a consumer can
+    distinguish "no program published" from "published and blank".
+    """
+    fm = dict(front_matter or {})
+    out: dict[str, object] = {}
+
+    text = body or ""
+    start = text.find(PROGRAM_PUBLIC_OPEN)
+    end = text.find(PROGRAM_PUBLIC_CLOSE, start + len(PROGRAM_PUBLIC_OPEN)) if start != -1 else -1
+    # BOTH markers required, in order. A lone opener is a half-written edit, and
+    # publishing "everything after it" would turn a typo into a leak.
+    if start != -1 and end != -1:
+        purpose = text[start + len(PROGRAM_PUBLIC_OPEN):end].strip()
+        if purpose:
+            out["purpose"] = redactor(purpose)[:_PROGRAM_PURPOSE_CAP]
+
+    for key in sorted(PROGRAM_EXPOSED_FM_FIELDS):
+        value = fm.get(key)
+        if value in (None, ""):
+            continue
+        # Dates are NOT redacted, for the same reason as everywhere else in this module:
+        # an ISO date carries no secret and no agent name, and the redactor could only
+        # mangle it.
+        out[key] = str(value)
+
+    # A dates-only projection is not a program -- refuse to publish a husk, exactly as
+    # project_self refuses a dates-only identity.
+    return out if "purpose" in out else {}
+
+
 @dataclass
 class ProjectedBundle:
     """The kid-facing knowledge view. Shape-preserving; every string already redacted."""
@@ -480,6 +569,12 @@ class ProjectedBundle:
     #: The customer-facing "what is planned" view. A LIST (unlike ``agent_self``), so
     #: emptiness is a length, not a shape change; ``[]`` means nothing exposable.
     goals: list[dict[str, object]] = field(default_factory=list)
+    #: The customer-facing "what is this FOR" view, or ``{}`` when nothing is
+    #: exposable. An OBJECT like ``agent_self`` (not a list like ``goals``): it is one
+    #: projected view, so emptiness is a shape, and ``{}`` is what distinguishes "no
+    #: program published" from "published and blank". Emitted under the JSON key
+    #: ``program``.
+    program: dict[str, object] = field(default_factory=dict)
 
     def counts(self) -> dict[str, int]:
         # `self` is 0/1, not a length: it is one projected view, not a store. It is in
@@ -500,6 +595,12 @@ class ProjectedBundle:
             # product goals while its four knowledge stores are healthy -- folding it in
             # would let a broken export pass the refusal gate.
             "goals": len(self.goals),
+            # 0/1 like `self`, and for the same reason: one projected view, not a store.
+            # In counts() because guard-5144 makes counts the verification signal for an
+            # export. NOT in KNOWLEDGE_COUNT_KEYS: a world can legitimately publish no
+            # program while its four knowledge stores are healthy, so folding it in
+            # would let a genuinely broken export pass the refusal gate.
+            "program": 1 if self.program else 0,
         }
 
 
@@ -513,6 +614,8 @@ def project(
     self_front_matter: Mapping[str, object] | None = None,
     self_body: str = "",
     goals: Iterable[Mapping[str, object]] = (),
+    program_front_matter: Mapping[str, object] | None = None,
+    program_body: str = "",
 ) -> ProjectedBundle:
     """Filter + redact all four stores into a :class:`ProjectedBundle`.
 
@@ -527,6 +630,7 @@ def project(
     # Keyword-only with defaults, so every existing caller keeps its exact behaviour and
     # gets an empty `agent_self` rather than a changed shape.
     bundle.agent_self = project_self(self_front_matter, self_body, redactor)
+    bundle.program = project_program(program_front_matter, program_body, redactor)
     bundle.goals = project_goals(goals, redactor)
     for n in nodes:
         bundle.tree.append(
@@ -591,7 +695,11 @@ __all__ = [
     "ProjectedBundle",
     "project",
     "project_self",
+    "project_program",
     "SELF_EXPOSED_FM_FIELDS",
+    "PROGRAM_EXPOSED_FM_FIELDS",
+    "PROGRAM_PUBLIC_OPEN",
+    "PROGRAM_PUBLIC_CLOSE",
     "KNOWLEDGE_COUNT_KEYS",
     "FRAMEWORK_TREE_ROOT",
 ]

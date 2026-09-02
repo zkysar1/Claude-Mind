@@ -119,6 +119,13 @@ ALLOWED_PREFIXES = (
     # _goal_source.infer(); check-origin-signal-drift.py re-runs the diff.
     "skill-discovery-audit:",   # aspirations-evolve Step 9.5.5 forged-skill audit
     "blocker_pattern:",         # aspirations-all-blocked MW#5 T1 Unblock synthesis
+    # : the aspirations-complete-review "replacement" lane. A
+    # successor to completed work is SELF-GENERATED; it used to be stamped
+    # `user_directive` (measured 2026-09-02: three of three on one
+    # deployment), which exempted it from every gate. `successor:<asp-id>`
+    # names the lane so the aspiration-supply gate can see it. Mirrored in
+    # _goal_source.infer() (agent-self).
+    "successor:",
     "s3-churn:",                # world/scripts/s3-churn-alarm.sh per-key churn breach ()
     # Same cycle-detector lane, THIRD reconciliation (). Surfaced by
     # test_every_origin_signal_literal_carries_a_registered_prefix against

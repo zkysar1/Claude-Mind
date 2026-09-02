@@ -633,6 +633,53 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
 
     override = ctx.query.get("override_merge_gate")
 
+    #  remedy (a): OPT-IN compare-and-set. The lock makes each REQUEST
+    # atomic; it cannot make a client-side read->modify->set atomic, because that
+    # RMW spans TWO requests and the lock is released between them. Reproduced
+    # deterministically in : two Bodies each read
+    # knowledge_debt[].sessions_deferred, each bump it, both sets return
+    # 200 ok:true, and the slot ends +1 instead of +2.
+    #
+    # OPT-IN is the whole design. Making set conditional by default would tax
+    # every write fleet-wide for a hazard only a two-request RMW has, and would
+    # break every existing caller. Absent the param this path is byte-identical
+    # to before.
+    expected_uc = ctx.query.get("expected_update_count")
+    if expected_uc is not None and str(expected_uc).strip() != "":
+        try:
+            expected_uc = int(str(expected_uc).strip())
+        except ValueError:
+            return Response.error(
+                400, "invalid_expected_update_count",
+                f"expected_update_count must be an integer, got {expected_uc!r}")
+        if expected_uc < 0:
+            return Response.error(
+                400, "invalid_expected_update_count",
+                f"expected_update_count must be >= 0, got {expected_uc}")
+        # TOP_LEVEL_KEYS carry no slot_meta at all (_resolve_slot routes them
+        # outside `slots`, and set_slot deliberately skips _update_modified for
+        # them), so there is no update_count to compare against. Refusing is the
+        # only honest answer: silently ignoring the param would hand the caller a
+        # 200 that LOOKS like a satisfied CAS and protects nothing.
+        if slot.split(".")[0] in TOP_LEVEL_KEYS:
+            return Response.error(
+                400, "cas_unsupported_for_top_level_key",
+                f"'{slot}' is a TOP_LEVEL_KEYS slot; those carry no slot_meta and "
+                f"therefore no update_count token. CAS is available for "
+                f"slots-mapped keys only.")
+        # loop_state already has SERVER-side CAS () via
+        # loop_state_cas_retry, which re-reads and re-runs the mutation on a
+        # stale-steal. A caller-supplied token would fight that retry: the retry's
+        # fresh read legitimately changes update_count, so the caller's token would
+        # spuriously mismatch on exactly the races the retry already handles.
+        if slot == "loop_state":
+            return Response.error(
+                400, "cas_already_server_side",
+                "loop_state carries server-side CAS (g-115-1394); a caller token "
+                "would fight its retry. Omit expected_update_count for this slot.")
+    else:
+        expected_uc = None
+
     try:
         with _wm_lock(ctx):
             if slot == "loop_state":
@@ -694,6 +741,28 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 data = _read_yaml(_wm_path(ctx))
                 if not data:
                     data = _default_wm_data(ctx)  #  self-heal (set only)
+                # The comparison happens INSIDE _wm_lock and against the value
+                # just read under it. Reading the token outside the lock would
+                # re-create the very TOCTOU this closes.
+                if expected_uc is not None:
+                    current_uc = (data.get("slot_meta", {})
+                                  .get(slot.split(".")[0], {})
+                                  .get("update_count", 0) or 0)
+                    if current_uc != expected_uc:
+                        # Structured fields, not prose: the caller must branch on
+                        # this programmatically, and a client regex over a detail
+                        # string is the hand-written-parser class (guard-2298).
+                        # NO WRITE happens on this path.
+                        return Response.json({
+                            "error": "stale_write",
+                            "detail": (
+                                f"slot '{slot}' has update_count {current_uc}, "
+                                f"caller expected {expected_uc}; another writer "
+                                f"landed first. Re-read and re-apply."),
+                            "slot": slot,
+                            "expected_update_count": expected_uc,
+                            "current_update_count": current_uc,
+                        }, status=409)
                 parent, key, is_top = _resolve_slot(data, slot)
                 if parent is None:
                     return Response.error(400, "unresolvable_slot",

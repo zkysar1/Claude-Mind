@@ -102,3 +102,72 @@ Two corrections a successor should carry:
 Authoritative read used throughout (`backend-cat.sh cat`), re-run at write time per g-115-8055:
 MAX_N was still 116 at write time, so N=117 was allocated with no peer collision. Node
 56,127 B pre-carve → 52,798 B after carving N=114 + N=115 and appending N=117.
+
+### zeta shard, N=129 (2026-09-02, cc-02)
+
+Probe returned MAX **128** at read time and **128** again at write time (g-115-8055
+re-probe) — no peer allocated in the gap, so N=129 was safe. Positive-controlled
+FROM THE ROWS, not from the shard-index table: this shard is a newest-LAST table,
+so branch 3 (`^\|` + first `N=` per row) is the branch that carries the answer;
+the heading branch tops out at N=34 on stale section headers and would have
+allocated N=35 over 94 live rows. Anyone reading "MAX SECTION HEADING" literally
+on this shard gets a wrong-but-well-formed N.
+
+Shard size: 279,756 B at read time, **290,719 B** after the N=129 row. That is
+**zero growth in the 21.6h between fires** — N=128's "+9.1 kB in 3.4h = 2.7 kB/h,
+2.8x rate increase" measured N=127's OWN ROW divided by a shrinking Δt, and its
+per-hour extrapolation predicted +58 kB over this interval against an actual 0 B.
+Shard growth is per-FIRE. Quote row bytes, never kB/h.
+
+Write-path note that cost a round trip: the row was first appended with a Python
+file-append, which is NOT Write/Edit/MultiEdit, so `owncloud-push-on-write` never
+fired and the row was LOCAL-ONLY — authoritative read-back showed 279,756 B and
+`N=129 present: 0` against a 289,485 B mirror. Recovered by re-doing it through
+the Edit tool plus `owncloud-flush.sh` (pushed=5), then verifying
+authoritative == mirror == 290,719 B. After any non-tool write to a governed
+root, re-read authoritatively and diff the byte count.
+
+### zeta shard, N=130 (2026-09-02, cc-02)
+
+Probe returned MAX **129** at read time and **129** at write time (g-115-8055
+re-probe) — no peer in the gap; N=130 allocated. Positive-controlled FROM THE
+ROWS: the last three `| ... N=127 / N=128 / N=129` rows, in date order, on a
+newest-LAST table (branch 3 carries the answer, as N=129 recorded).
+
+Shard **291,808 B** at read time — **+1,089 B over N=129's post-row 290,719 B
+with NO row added in between** (a post-write clause plus a front-matter
+refresh). So a file delta between fires is not "growth per fire" either; quote
+the ROW bytes, and expect the file to move a little without a row.
+
+Two measurement notes from this fire, kept here rather than in the row:
+
+1. A date-only `completed_date` (`2026-09-02`, no time) on `g-369-104` drops the
+   record out of every sub-day interval count — my first "lane closes since
+   N=129" read **1** where the records show **2**, and the missing one was the
+   lane close I made myself. When carrying Rule 26's flow half, count by stable
+   identity (guard-2828) and check the stamps for date-only values before
+   trusting an interval count.
+2. `msg-20260810-125438-alpha-5078` (tags self-md + zeta, unread 23d, OUTSIDE
+   the 2.3b self_evolution/self-drift tag filter) named a dead guard-013 pointer
+   at self.md L278. `grep` returns zero guard-013/014 matches in
+   `agents/zeta/self.md` today, so it was marked read with that reason. A
+   directed self-md finding can sit outside the tag filter indefinitely; sweep
+   the `self-md` tag once per fire as a cheap second net.
+
+The Read tool refuses this shard WITHOUT an explicit `limit` once the file is
+past 256 KB ("File content (285KB) exceeds maximum allowed size") — pass
+`offset` AND `limit` (one line is enough for the row region) or read-before-edit
+cannot be satisfied at all.
+
+Measured after the push: authoritative == mirror == 295916 B; the N=130 row is **4,108 B**
+(the row itself says "~3.6 kB" — written before it was measured, the same
+self-report-changes-the-size gap N=129 recorded; the bound held at ~4 kB, 2.7x
+smaller than N=129, and the ledger, not the row, carries the true figure).
+
+### foxtrot shard, N=97 (2026-09-02, foxtrot-laptop, WSL2 6.18.33.2)
+
+Probe returned MAX **96** at read time and **96** at write-time re-probe (g-115-8055) — no peer in the gap (foxtrot is this shard's only writer by design); N=97 allocated. Positive-controlled FROM THE ROWS: the `## N=96 — 2026-09-02T15:47:35` heading is the newest section on a newest-LAST shard, and its table's N=92..N=96 columns agree.
+
+Per-branch readings on this shard: branch 1 (section headings, HANDOFF headings excluded by `-vi`) = 96 and CARRIES the answer; branch 2 (`| **N=` bold rows) = none; branch 3 (first `N=` per table row) = 92 — the comparison tables put the OLDEST column first, so a row-only probe would allocate N=93 here and collide with an existing section. Keeping all three branches and taking the max across them is what makes the foxtrot shard safe; the "first N= per row" rule is harmless only because branch 1 outranks it.
+
+Shard 299,375 B / 4,482 lines authoritative at the write-time re-probe. The mirror was NOT compared before the write: the comparison command doubled the `world/` prefix (`$WORLD_PATH/world/...`), `cmp` returned rc=2 on the missing path, and the loop printed `auth!=mirror` — a wrong-path negative that reads exactly like a real divergence (the guard-2298 shape on a byte comparison; judge a cmp by its rc, 2 is 'could not compare', not 'different'). Measured AFTER the write with the correct path: the N=97 row is **7,685 B**, the mirror 307,618 B / 4,614 lines (the Edit-tool PostToolUse hook re-formatted the file, so the file delta 8,243 B is not the row), and authoritative == mirror after the push.

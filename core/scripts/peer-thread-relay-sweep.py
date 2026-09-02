@@ -242,7 +242,10 @@ def main():
                   % (r["goal_id"], r["peer_agent"], r["peer_env"], r["age_days"],
                      r.get("priority") or "?", (r.get("title") or "")[:46]))
         print("      ACTION: relay via core/scripts/peer-board-post.sh, or post to the")
-        print("      coordination board tagged relay + forward-to:<agent>@<env> + the goal id.")
+        print("      coordination board tagged relay + forward-to:<agent>@<env> + the goal id")
+        print("      AS A BARE TAG (`g-115-8605`, NOT `target:g-115-8605`) — build_delivery_index")
+        print("      matches GOAL_ID_RE at tag START, so the framework's usual `target:`/`affects:`")
+        print("      goal-id prefix is INVISIBLE here and the relay reports undelivered.")
         print("      This sweep NEVER relays: reachability is box-dependent (g-115-5890).")
     if amb:
         print("  /?\\ %d AMBIGUOUS (name is both local and a peer's) — not routed:" % len(amb))

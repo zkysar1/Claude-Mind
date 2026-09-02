@@ -89,18 +89,40 @@ def __getattr__(name):
 import contextlib
 
 @contextlib.contextmanager
+def wm_lock_for(path):
+    """Hold the WM advisory lock for an EXPLICIT WM path.
+
+    Sibling of wm_lock() for callers that write a WM file they resolved
+    THEMSELVES rather than the per-process effective one -- body-merge.py
+    (always the agent-wide reducer WM) and wm-contamination-check.py (a path
+    handed in as an argument). Those must NOT lock via wm_path(), which honors
+    BODY_WM_PATH: on a Body that env IS set, so wm_lock() would lock the Body's
+    fork while the caller writes the agent-wide file -- a lock that reads as
+    protection and excludes nothing. The reducer has no body-WM-file today so
+    the two coincide there, but that is a property of the ENVIRONMENT, not of
+    the code, and bash-agent-inject.py's own comment flags the coupling.
+
+    guard-1357: lock the DERIVED .lock sibling, never the resource path itself.
+    Same derivation as file_locks.locked() in the daemon -- that shared
+    convention is what makes a CLI writer and a /v1/wm/* request exclude.
+    """
+    lock = Path(path).with_suffix(".lock")
+    acquire_lock(lock, stale_seconds=10)
+    try:
+        yield
+    finally:
+        release_lock(lock)
+
+
+@contextlib.contextmanager
 def wm_lock():
     """Hold the WM advisory lock across a read-modify-write cycle.
 
     stale_seconds=10: WM RMW is sub-100ms; 30s default would block 6+ aspiration
     iterations on a crashed mid-RMW writer. 10s is still 100x cycle time.
     """
-    lock = wm_lock_path()
-    acquire_lock(lock, stale_seconds=10)
-    try:
+    with wm_lock_for(wm_path()):
         yield
-    finally:
-        release_lock(lock)
 
 # Top-level keys (not inside slots:)
 # `capture_evictions` is a per-session tally of captures destroyed by the

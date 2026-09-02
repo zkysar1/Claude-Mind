@@ -130,6 +130,71 @@ Review is **asynchronous and non-blocking**. Goals are NOT held pending review.
 The reviewing agent picks up reviews during idle time, catching bugs faster than
 purely retroactive review without creating bottlenecks.
 
+### Blocking Tier: async is the rule for tier <= 1, tier 2 BLOCKS (g-357-40 / g-357-42)
+
+The paragraph above is the rule for **tier 0 and tier 1 only**. A **tier-2** close is
+**BLOCKING**: the goal does not reach `completed` until an independent APPROVE verdict
+exists. The SDLC principle it enforces is that **the author must not approve their own
+close** — the async lane cannot enforce that, because it lets the close land first and
+reviews afterwards.
+
+Motivating incident (coach g-012-02, g-357-39): a goal enumerating 16 named entities
+closed green with 6 of them substituted by famous-name priors. Its verification
+criterion was count-based — "all 16 entries present" — so the count matched while the
+identities did not, and the author self-graded against it. No criterion of that kind
+can catch the defect; an independent reader is the remedy. Reproduced end to end in
+`core/scripts/tests/test_close_review_coach_fixture.py`.
+
+**Risk tiers** (SSOT: `core/scripts/goal_close_risk_tier.py::classify` — this table
+documents it, it does not define it):
+
+| tier | condition | review cost |
+|---|---|---|
+| **0** | recurring AND `outcome_class: routine` AND no new artifacts. Checked FIRST and short-circuits, so a recurring routine sweep that touches a framework file is still tier 0 | none — the cadence must stay affordable |
+| **1** | default: no tier-2 trigger fired | none |
+| **2** | ANY one trigger below, each independently sufficient | APPROVE verdict required |
+
+Tier-2 triggers: `entities` (>= 3 distinct id-shaped tokens in title/description),
+`user_truth` (participants include user, or directive/mission-sourced), `deliverable`
+(new tree node or user-facing output), `framework` (touched `core/` or `.claude/`),
+`high_prio` (HIGH priority, non-recurring), `first_of_asp`.
+
+**Verdict artifact** — `agents/<agent>/session/close-reviews/<goal-id>.json`:
+
+```json
+{
+  "verdict": "APPROVE",
+  "reviewer": "<the reviewing agent's MIND key, which MUST differ from the executor's>",
+  "checks": ["source-fidelity: artifact identities vs description identities", "..."],
+  "findings": ["..."]
+}
+```
+
+`verdict` is compared **exactly** against `APPROVE` (case-insensitively). Everything
+else — `REJECT`, a missing file, an unparseable file, an absent field — leaves the
+close refused. That exactness is the reviewer's power to say no, and it is pinned by
+`test_a_REJECT_verdict_does_NOT_satisfy_the_gate`: relaxing it to a truthiness test
+keeps every other close-review test green while silently closing every rejected goal.
+
+Independence is the MIND-level rule below, unchanged: a different `claimed_by_sid` does
+NOT satisfy it, and where no other mind is available the request stays OPEN.
+
+**Fail directions.** Everything degrades to tier 1 (no review) on a classifier or
+config fault — a gate that blocks work because of its own bugs is worse than the
+problem it catches (guard-142). The single exception, and the reason the gate exists:
+the **absence** of an APPROVE verdict on a tier-2 goal is a REFUSAL, never an error.
+Overrides take `--override-close-review "<justification>"` and land in
+`world/close-review-overrides.jsonl` (the per-gate ledger, NOT the `--override-all`
+bulk ledger, whose `slots_filled` field means blast radius across gates).
+
+**Ship state:** both flags default OFF in `core/config/aspirations.yaml`
+(`close_review_gate.enabled`, `.note_marker_enabled`). Check A's remedy names a
+producer — the fresh-eyes close reviewer, sibling goal g-357-41 — that has not landed;
+enabling before it exists would force every tier-2 close onto the override path and
+manufacture false records in the ledger that measures whether to enable at all
+(rb-4452: ship a dep-blocked gate's invariant BEFORE the dependency so it constrains
+that dependency's design).
+
 ### Independence Is At The MIND Level, Not The Session Level
 
 **The reviewing identity MUST differ from the executing identity by MIND KEY —

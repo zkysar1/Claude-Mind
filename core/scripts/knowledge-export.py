@@ -409,6 +409,17 @@ def _read_self(project_root: Path, env: Mapping[str, str]) -> tuple[dict[str, ob
     except (OSError, UnicodeDecodeError):
         return {}, ""
 
+    return _split_front_matter(text)
+
+
+def _split_front_matter(text: str) -> tuple[dict[str, object], str]:
+    """``text`` -> ``(front_matter, body)``; ``({}, body)`` when there is no parsable block.
+
+    Extracted from :func:`_read_self` when :func:`_read_program` needed the identical
+    split -- two real call sites, not a speculative one. Malformed YAML degrades to
+    ``{}`` rather than raising: a broken front-matter block must cost the dated fields,
+    never the whole export.
+    """
     body = _strip_front_matter(text)
     if body == text:          # no front matter at all
         return {}, body
@@ -421,6 +432,25 @@ def _read_self(project_root: Path, env: Mapping[str, str]) -> tuple[dict[str, ob
     except yaml.YAMLError:
         fm = {}
     return (fm if isinstance(fm, dict) else {}), body
+
+
+def _read_program(world_path: Path) -> tuple[dict[str, object], str]:
+    """Read the world's ``program.md`` -> ``(front_matter, body)``; ``({}, "")`` on any miss.
+
+    Store I/O only -- the projection/redaction decision lives in
+    :func:`knowledge_projection.project_program`, per PEARL 10.3 filter-at-the-source.
+
+    Deliberately far simpler than :func:`_read_self`: ``program.md`` is WORLD-level, one
+    file per world, so there is no agent to resolve and no ambiguity to fail closed on.
+    An absent, empty or unreadable file returns nothing -- including the zero-byte
+    placeholder ``init-world.sh`` creates, which is the state of a freshly initialised
+    world and must read as "no program published" rather than as an error.
+    """
+    try:
+        text = (world_path / "program.md").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}, ""
+    return _split_front_matter(text)
 
 
 def _read_goals(world_path: Path) -> list[dict[str, object]]:
@@ -483,6 +513,7 @@ def build_bundle(
         secret_values=tuple(_secret_values(env)),
     )
     self_fm, self_body = _read_self(project_root, env)
+    program_fm, program_body = _read_program(world_path)
     return project(
         tree_nodes=read_tree_nodes(world_path, status=tree_status),
         reasoning=_read_jsonl(world_path / "reasoning-bank.jsonl"),
@@ -491,6 +522,8 @@ def build_bundle(
         redactor=redactor,
         self_front_matter=self_fm,
         self_body=self_body,
+        program_front_matter=program_fm,
+        program_body=program_body,
         goals=_read_goals(world_path),
     )
 
@@ -620,6 +653,21 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
             encoding="utf-8",
         )
 
+    # program.md — the "what is this FOR" concept, same one-concept-one-file shape and
+    # same required `type` discriminator as self.md above. Written ONLY when the
+    # projection is non-empty, so an absent file means "no program published" — the
+    # shape this format has for absence, matching the JSON payload's `{}`.
+    if bundle.program:
+        _prog = bundle.program
+        _prog_fm = {"type": "program"}
+        for _k in ("created", "last_updated"):
+            if _prog.get(_k):
+                _prog_fm[_k] = str(_prog[_k])
+        (out_dir / "program.md").write_text(
+            f"{_okf_frontmatter(_prog_fm)}\n# What this agent is for\n\n{_prog.get('purpose', '')}\n",
+            encoding="utf-8",
+        )
+
     # goals.md — the "what is planned" concept. ONE file, not one per goal: a goal is a
     # roadmap line rather than a standalone concept, and 400+ near-empty concept files
     # would drown the wiki's article list. Same absence contract as self.md above —
@@ -660,6 +708,8 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
     ]
     if counts.get("self"):
         lines.append("- [About this agent](self.md)")
+    if counts.get("program"):
+        lines.append("- [What this agent is for](program.md)")
     if counts.get("goals"):
         lines.append(f"- [What's planned](goals.md) ({counts['goals']})")
     lines += [
@@ -820,6 +870,12 @@ def main(argv: list[str] | None = None) -> int:
             # Projection/redaction happened at the source in
             # knowledge_projection.project_goals; this writer only shapes.
             "goals": bundle.goals,
+            # The customer-facing "what is this FOR" view. `{}` when nothing is
+            # exposable; the key is always present, so emptiness is the signal rather
+            # than an absent key -- same contract as `self` above. Projection and
+            # redaction happened at the source in
+            # knowledge_projection.project_program; this writer only shapes.
+            "program": bundle.program,
         }
     )
     text = json.dumps(payload, indent=2, ensure_ascii=False)

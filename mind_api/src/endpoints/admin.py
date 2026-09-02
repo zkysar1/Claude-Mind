@@ -178,9 +178,22 @@ def owncloud_pull(ctx) -> "Response":  # type: ignore[name-defined]
     # docstring for the measurement and the machine-move trade-off.
     with_temp = (ctx.query.get("with_temp") or "").strip().lower() in (
         "1", "true", "yes")
+    # `adopt_store` (): comma-separated continuity filenames whose
+    # MANIFEST BASELINE is dropped before the freshness gate runs, so S3 is
+    # adopted as canonical. For the three-way-divergence wedge only -- local md5
+    # != baseline md5 != S3 md5 -- which the no-clobber gate reads as "unpushed
+    # local writes" and skips PERMANENTLY, because nothing below the pull ever
+    # re-derives a baseline. Adds no overwrite path: it routes the file into
+    # _pull_one's existing no-baseline branch, which snapshots local to .history
+    # first. Per-path opt-in BY DESIGN, never a sweep -- `local != baseline`
+    # alone does not prove divergence, and adopting a genuinely-unpushed local
+    # write would destroy it. Absent/empty -> unchanged no-clobber pull.
+    adopt_raw = (ctx.query.get("adopt_store") or "").strip()
+    adopt_store = {p.strip() for p in adopt_raw.split(",") if p.strip()} or None
     try:
         stats = owncloud_sync.pull_continuity(get_backend(), agent, only=only,
-                                              include_temp=with_temp)
+                                              include_temp=with_temp,
+                                              adopt_store=adopt_store)
     except Exception as e:  # noqa: BLE001
         return Response.json(
             {"backend": backend, "ok": False,

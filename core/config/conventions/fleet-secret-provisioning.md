@@ -57,6 +57,18 @@ final `.env.local`.
    starting state and is a safe no-op (or explicit refuse-without-`--force`) when
    `.env.local` is already fully provisioned, or when the bootstrap key is absent.
    This makes it safe to re-run and safe to ship onto a node that does not need it.
+   **An ADDITIVE mode belongs inside this invariant, not beside it.** The guard
+   exists to stop a TRUNCATING re-run, so a mode that can only append or rotate a
+   single key is outside what it defends and must bypass it — otherwise the guard
+   blocks the one safe way to change a provisioned file. And the refusal MUST name
+   that additive path: a guard whose only stated remedy is the destructive flag
+   *teaches* the destructive flag. Measured (gap-054): three agents on three boxes
+   inside nine hours each had to read the script, recognise the trap, and disbelieve
+   its own error message before hand-building the safe append; a convention file
+   documenting the trap did not stop the third. The additive mode preserves every
+   invariant above — in-memory only, values-blind, mode 600 — and adds one of its
+   own: verify by RE-READING the file and diffing key counts, never by trusting the
+   write's own echo.
 7. **The env-prefix mapping is the contract.** The vault stores keys under a stable
    prefix scheme; the provisioner's mapping table is the single source of truth for
    which vault key becomes which container env var. Changing the mapping is a

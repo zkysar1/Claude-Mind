@@ -79,6 +79,45 @@ if [[ "${1:-}" == "--staged" ]]; then
     exit 0
 fi
 
+# (default) FILESYSTEM scan -- unless the filesystem answer is meaningless
+# here. Two cases, one remedy: core.fileMode=false (git ignores the
+# filesystem mode, so a chmod never reaches the index) and Windows itself
+# (NTFS has no execute bit at all; MSYS `-perm -u+x` is a shebang heuristic,
+# not a mode). Measured 2026-09-02 () on a Windows box with
+# fileMode=true: the find reported two 100755 sourced libraries as "missing"
+# and passed fifteen 100644 scripts. In both cases the INDEX is the only
+# meaningful answer to EITHER question, so scan every tracked *.sh in the
+# index instead -- and say so, because "OK" from the wrong instrument is the
+# shape that hid the v2.12.47 strip.
+filemode="$(git -C "$SCRIPT_DIR" config --get core.fileMode 2>/dev/null || true)"
+why=""
+if [[ "${filemode,,}" == "false" ]]; then
+    why="core.fileMode=false on this clone"
+elif [[ "$(uname -s 2>/dev/null || true)" == MINGW* || "$(uname -s 2>/dev/null || true)" == MSYS* || "$(uname -s 2>/dev/null || true)" == CYGWIN* ]]; then
+    why="Windows has no filesystem execute bit"
+fi
+if [[ -n "$why" ]]; then
+    bad=""
+    total=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        mode="${line%% *}"
+        p="${line#*$'\t'}"
+        total=$((total + 1))
+        [ "$mode" = "100755" ] || bad="${bad}${mode}  core/scripts/${p}"$'\n'
+    done < <(git -C "$SCRIPT_DIR" -c core.quotePath=false ls-files -s -- '*.sh' 2>/dev/null)
+    bad="$(printf '%s' "$bad" | sed '/^$/d' | sort)"
+    if [[ -n "$bad" ]]; then
+        count="$(printf '%s\n' "$bad" | grep -c . || true)"
+        echo "FAIL: $count core/scripts *.sh file(s) at a non-executable mode in the INDEX ($why, so the index mode is the one that ships) — direct-exec chains will fail with 'Permission denied' on Linux:" >&2
+        printf '%s\n' "$bad" | sed 's/^/  /' >&2
+        echo "Fix: git update-index --chmod=+x <file> (a chmod +x does not reach the index here), then commit." >&2
+        exit 1
+    fi
+    echo "OK: all ${total} tracked core/scripts *.sh files carry 100755 in the index ($why — index mode checked, not the filesystem)."
+    exit 0
+fi
+
 missing="$(find "$SCRIPT_DIR" -name '*.sh' -type f ! -perm -u+x 2>/dev/null | sort)"
 
 if [[ -n "$missing" ]]; then

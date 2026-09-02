@@ -28,7 +28,7 @@ GOAL_NORMALIZE_TARGET=positional source "$CORE_ROOT/scripts/_goal-arg-normalize.
 source "$CORE_ROOT/scripts/_argv_strict.sh"
 
 # ONE literal, referenced by BOTH the --help arm and the refusal ().
-_ACCEPTED_FLAGS="--source --reason"
+_ACCEPTED_FLAGS="--source --reason --reason-kind"
 
 # --- Parse args -----------------------------------------------------------
 GOAL_ID=""
@@ -67,6 +67,46 @@ SOURCE_VAL="world"
 # loosening the `-*)` refusal: that strict refusal is the  fix and is a
 # feature, not an obstacle.
 REASON_VAL=""
+
+# WHY --reason-kind EXISTS (). --reason above captures the negative;
+# this types it. The captured entry was {box, agent, reason, at} with `reason`
+# as FREE PROSE, so any consumer wanting the locus subset had to CLASSIFY prose
+# — the keyword-regex approach this goal has already falsified twice (echo's
+# 60.8% bare-hostname match; zeta's 79-vs-85 bracketing correction).
+#
+# MEASURED 2026-09-02 (alpha, cc-10) over the 52 live reason strings: the
+# over-matching locus regex returns 8, of which 3 are true locus — a 62.5%
+# false-positive rate — and the under-matching one MISSES both Studio-gated
+# rows, which name no host at all. The sharpest false positive is self-refuting:
+# the row reading "this box can still run this goal ... NOT FOR LOCUS" MATCHES
+# the locus regex.
+#
+# The releasing agent already KNOWS why it released. Asserting a token removes
+# the classification step entirely, which is design caution (1) of 
+# ("key on a MEASURED negative, never a hostname string match") satisfied for
+# the first time: measured AND typed by the party that measured it.
+#
+# locus      — bound to a machine/host/checkout THIS box is not (another box can run it)
+# capability — bound to a credential/identity/permission this agent lacks. NOT the
+#              same as locus and must not be merged with it: every fleet box carries
+#              the same IAM users, so only another PRINCIPAL changes the answer
+#              (-b). A consumer conflating the two re-routes work to boxes
+#              that also cannot run it.
+# role       — bound to a role this Body is not (worker vs reducer)
+# not-due    — a recurring goal that was not actually due
+# progress   — a partial advance; work remains, no barrier
+# other      — a real release that is none of the above
+#
+# EMPTY BY DEFAULT and omitted from the query when empty, so every existing
+# caller stays byte-identical. Consumers MUST fail open: `kind` is absent on
+# every row written before this flag, and absent means UNMEASURED, never
+# "runnable nowhere" (design caution (2)).
+#
+# Kept in sync with RELEASE_REASON_KINDS in mind_api/src/endpoints/aspirations_write.py
+# by test_release_reason_kind.py::test_wrapper_and_daemon_token_sets_agree — a
+# shell/daemon constant pair drifts silently otherwise (guard-742/547 class).
+REASON_KIND_VAL=""
+_REASON_KINDS="locus capability role not-due progress other"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -108,11 +148,23 @@ while [[ $# -gt 0 ]]; do
             REASON_VAL="$2"; shift 2;;
         --reason=*)
             REASON_VAL="${1#--reason=}"; shift;;
+        --reason-kind)
+            # Same ARITY GUARD as --source/--reason above (): a missing
+            # value must be an ARGV defect at rc=2, never a silent set -e death
+            # at rc=1 that reads like a transport failure.
+            if [ $# -lt 2 ]; then
+                echo "Error: --reason-kind requires a value (${_REASON_KINDS// /|})." >&2
+                echo "  Accepted flags: $_ACCEPTED_FLAGS" >&2
+                exit 2
+            fi
+            REASON_KIND_VAL="$2"; shift 2;;
+        --reason-kind=*)
+            REASON_KIND_VAL="${1#--reason-kind=}"; shift;;
         -h|--help)
             # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
             # exit 2 would be a regression the refusal introduced rather than a
             # defect it fixed (). Help exits 0.
-            argv_strict_help "$(basename "$0")" "<goal-id> [--source world|agent] [--reason <why>]" \
+            argv_strict_help "$(basename "$0")" "<goal-id> [--source world|agent] [--reason <why>] [--reason-kind locus|capability|role|not-due|progress|other]" \
                 "$_ACCEPTED_FLAGS";;
         -*)
             argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
@@ -145,6 +197,56 @@ case "$SOURCE_VAL" in
         exit 1;;
 esac
 
+# Out-of-vocabulary kinds are refused HERE, at the layer that can name the typo,
+# exactly as --source is. An unrecognised token must never reach the store: the
+# whole value of a typed field is that a consumer can trust the token, and one
+# misspelled `locis` silently absent from every query is the failure mode a
+# free-text field already had.
+if [ -n "$REASON_KIND_VAL" ]; then
+    case " $_REASON_KINDS " in
+        *" $REASON_KIND_VAL "*) ;;
+        *)
+            echo "Error: --reason-kind must be one of: ${_REASON_KINDS// /|} (got '${REASON_KIND_VAL}')." >&2
+            exit 1;;
+    esac
+    if [ -z "$REASON_VAL" ]; then
+        # A kind with no reason would store a token with no evidence behind it.
+        # The pair is the record; neither half is useful alone.
+        echo "Error: --reason-kind requires --reason (the token types the reason; it does not replace it)." >&2
+        exit 1
+    fi
+fi
+
+# ── ADOPTION NUDGE () ───────────────────────────────────────────────
+# ADVISORY ONLY. It never changes the exit code, never blocks the release, and
+# never touches stdout (callers parse the JSON there).
+#
+# WHY IT LIVES HERE RATHER THAN IN THE CALLERS' PROSE. Ten prescriptive call
+# sites tell an LLM to run this script (5 SKILL.md, the loop digest, two
+# conventions, an iteration-close hint, consolidation-housekeeping). FIVE are on
+# the hot-path SIZE BUDGET, so "also pass --reason-kind" would cost a
+# size-budget-override each AND leave ten copies free to drift apart. guard-399
+# settles the shape: write the bash baseline first and treat the LLM step as
+# optional enrichment on top of it. This wrapper is the ONE funnel every call
+# site passes through, so the nudge reaches callers that were never edited —
+# including any written after this line, which is the half prose can never do.
+#
+# DELIBERATELY SCOPED TO "A REASON WAS WRITTEN". A bare release has no evidence
+# to type, and is already discouraged on other grounds (), so firing
+# there would put noise on the highest-volume path and train readers to ignore
+# the line. When a caller has written a reason it has ALREADY done the thinking;
+# naming the kind is one more token. That is the moment of maximum leverage and
+# minimum noise, and it is why this is not simply "warn on every release".
+#
+# A caller running this under `2>/dev/null` loses the nudge (guard-3662 class).
+# Accepted: stderr is the only channel that cannot corrupt the parsed stdout.
+if [ -n "$REASON_VAL" ] && [ -z "$REASON_KIND_VAL" ]; then
+    echo "Note: --reason given WITHOUT --reason-kind — this negative is stored as untyped prose." >&2
+    echo "  A consumer wanting one subset must then classify text: measured 62.5% false-positive" >&2
+    echo "  for locus over the live corpus (g-115-8163). That is what the typed token removes." >&2
+    echo "  Prefer: --reason-kind <${_REASON_KINDS// /|}>" >&2
+fi
+
 if [ -z "$GOAL_ID" ]; then
     echo "Error: goal_id is required." >&2
     exit 1
@@ -171,6 +273,12 @@ fi
 # spaces and `&`.
 if [ -n "$REASON_VAL" ]; then
     QUERY="${QUERY}&reason=$(rt_url_encode "$REASON_VAL")"
+fi
+# : likewise omitted when empty, so a release with no --reason-kind is
+# byte-identical to the pre-flag query. Validated above, so only a vocabulary
+# token can reach the endpoint from this wrapper.
+if [ -n "$REASON_KIND_VAL" ]; then
+    QUERY="${QUERY}&reason_kind=$(rt_url_encode "$REASON_KIND_VAL")"
 fi
 
 # --- in_flight clear () -----------------------------------------

@@ -473,19 +473,41 @@ def _pytest_lock_path() -> Path | None:
     return Path(WORLD_DIR) / ".locks" / "pytest-suite.lock"
 
 
+def _pytest_lock_meta_path(lock_path: Path) -> Path:
+    """Sidecar carrying the human-readable holder metadata.
+
+    Deliberately NOT the lock file itself. acquire_lock writes an ownership
+    token into the lock file and release_lock compares it to decide whether the
+    release is ours (g-115-8536). Overwriting that token made EVERY release
+    take the victim branch: the mutex was never unlinked, it leaked for the
+    full PYTEST_SUITE_LOCK_STALE_SECONDS TTL (suppressing peers' full-suite
+    runs), and every deep close emitted a false `[lock-stale-break] victim=self`
+    — poisoning the very frequency signal that diagnostic exists to measure
+    (g-115-8659). Keeping the lock file opaque to this caller makes the
+    corruption structurally impossible rather than merely tolerated.
+    """
+    return Path(str(lock_path) + ".meta")
+
+
 def _read_lock_info(lock_path: Path) -> dict:
-    """Best-effort read of lock metadata for the skip-message display."""
-    try:
-        content = lock_path.read_text(encoding="utf-8")
-    except OSError:
-        return {}
-    content = content.strip()
-    if not content:
-        return {}
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        return {"raw": content}
+    """Best-effort read of lock metadata for the skip-message display.
+
+    Sidecar first, then the lock file — the fallback covers a lock written
+    before the sidecar existed, and the case where the best-effort sidecar
+    write in _acquire_pytest_lock failed.
+    """
+    for path in (_pytest_lock_meta_path(lock_path), lock_path):
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not content:
+            continue
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return {"raw": content}
+    return {}
 
 
 def _acquire_pytest_lock(lock_path: Path, goal_id: str) -> bool:
@@ -506,8 +528,10 @@ def _acquire_pytest_lock(lock_path: Path, goal_id: str) -> bool:
         )
     except TimeoutError:
         return False
-    # acquire_lock writes the holder PID; overwrite with richer metadata so
-    # the skip-message can name the holding session in human terms.
+    # acquire_lock wrote the ownership token into the lock file; park the
+    # richer metadata in the SIDECAR so the skip-message can name the holding
+    # session without destroying that token ( — see
+    # _pytest_lock_meta_path).
     try:
         info = {
             "pid": os.getpid(),
@@ -515,11 +539,30 @@ def _acquire_pytest_lock(lock_path: Path, goal_id: str) -> bool:
             "agent": os.environ.get("MIND_AGENT", "unknown"),
             "goal_id": goal_id,
         }
-        lock_path.write_text(json.dumps(info), encoding="utf-8")
+        _pytest_lock_meta_path(lock_path).write_text(
+            json.dumps(info), encoding="utf-8")
     except OSError:
-        # Best-effort enrichment; PID-only content from acquire_lock still works.
+        # Best-effort enrichment; _read_lock_info falls back to the lock file.
         pass
     return True
+
+
+def _release_pytest_lock(lock_path: Path) -> None:
+    """Release the mutex, then drop our metadata sidecar.
+
+    Order is load-bearing. release_lock only unlinks the lock when it is still
+    OURS, so the lock file being GONE afterwards is the evidence that we were
+    the holder. If a peer stale-broke us mid-run the lock file survives (it is
+    theirs now) and we must leave THEIR sidecar alone — deleting it would be
+    the same shape as the victim-deletes-the-thief's-lock defect g-115-8536
+    closed, one file over.
+    """
+    release_lock(lock_path)
+    if not lock_path.exists():
+        try:
+            _pytest_lock_meta_path(lock_path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _emit_skip_banner(goal_id: str, info: dict) -> None:
@@ -610,7 +653,7 @@ def main() -> int:
     try:
         _emit_banner(goal_id, mind_buckets, mind_recs, product_results)
     finally:
-        release_lock(lock_path)
+        _release_pytest_lock(lock_path)
     return 0
 
 

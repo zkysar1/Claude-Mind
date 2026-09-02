@@ -429,6 +429,22 @@ MAX_RC=0
 PHASE_RESULTS=""
 FAILED_PHASES=""       # space-separated names, for the repair imperative ()
 FAILED_RETRY_CMDS=""   # one exact retry command per failed phase, newline-separated
+# : state for the post-phase counter-block safety net below.
+#   COUNTERS_OWED      -- the counters owe an advance. Set from TWO places, and
+#                         both are load-bearing: (a) the moment verify lands,
+#                         because that is when achievedCount advances and the
+#                         split this fix repairs opens; (b) unconditionally once
+#                         the four phases have been dispatched, so a run whose
+#                         verify FAILED still advances the counters exactly as it
+#                         did before this fix. Gating on (a) alone would have
+#                         silently changed behaviour on every verify-failed close.
+#   COUNTERS_FINALIZED -- one-shot guard; the block is read-modify-write
+#                         (current + 1), so a blind re-run double-counts
+#   PY_RC              -- consumed at the bottom of this file; pre-seeded so an
+#                         early-returning finalize_counters() cannot trip `set -u`
+COUNTERS_OWED=0
+COUNTERS_FINALIZED=0
+PY_RC=0
 
 run_phase() {
     local phase_name="$1"; shift
@@ -462,9 +478,57 @@ run_phase() {
         [[ $rc -gt $MAX_RC ]] && MAX_RC=$rc
     else
         PHASE_RESULTS+="${phase_name}=ok "
+        # Source (a): verify is what advances achievedCount / lastAchievedAt.
+        # Once IT lands, the close has happened and the  counters owe an
+        # advance whether or not this process survives to run them. This is the
+        # setter that covers a kill DURING state-update / learning-gate /
+        # productivity, where the achievedCount-vs-counters split is already open
+        # ().
+        [[ "$phase_name" == "verify" ]] && COUNTERS_OWED=1
     fi
     FAILED_PHASE=""  # clear so trap EXIT doesn't misreport a successful phase
 }
+
+# ─── : post-phase counter-block safety net ───
+# finalize_counters (defined below, after the phase dispatch) is the ONLY writer
+# of the seven  counter fields. A SIGTERM landing after verify committed
+# the close but before the script reached that block dropped all seven silently:
+# the goal's achievedCount had advanced while consecutive_routine /
+# consecutive_deep / substantive_hits / substantive_runs / pull_signal had not,
+# and no `--phase` call can reach the block to repair it.  already
+# moved the SENTINEL out of this window (bb3e67c02); this is the remaining
+# payload. guard-2592 names the delivery vector: never wrap this script in
+# `timeout N`.
+#
+# Installed HERE, before the dispatch, so the whole post-verify window is
+# covered rather than just the tail. Bash allows ONE trap per signal, so this
+# REPLACES the FAILED_PHASE-only trap from the top of the file and must keep
+# doing that job. The explicit TERM/INT traps make EXIT-trap delivery
+# deterministic under a signal instead of version-dependent. `declare -F` is
+# load-bearing: this trap can fire before the function definition below has been
+# evaluated, and calling a not-yet-defined function would emit a spurious
+# "command not found" over the real diagnostic.
+_recurring_close_on_exit() {
+    local _rc=$?
+    if declare -F finalize_counters >/dev/null 2>&1; then
+        # OBSERVABILITY (fresh-eyes on ). Without this line the rescue is
+        # UNFALSIFIABLE IN THE FIELD: finalize_counters prints the same
+        # `outcome_origin=... consecutive_deep=...` narration on both paths, so no
+        # log anywhere distinguishes "the trap saved this close" from "nothing was
+        # ever interrupted" -- and the recurrence this fix exists to stop could
+        # never be attributed either way. Fires ONLY on the genuine rescue: the
+        # counters are owed and the normal path never reached them.
+        if [[ "$COUNTERS_FINALIZED" != "1" && "$COUNTERS_OWED" == "1" ]]; then
+            echo "[recurring-close] ABORT-PATH FINALIZE (g-115-8668): the normal path never reached the g-317-02 counter block; the EXIT trap is writing all seven fields now. exit_rc=$_rc" >&2
+        fi
+        finalize_counters || true
+    fi
+    [[ -n "$FAILED_PHASE" ]] && echo "[recurring-close] ABORT during: $FAILED_PHASE" >&2
+    return $_rc
+}
+trap _recurring_close_on_exit EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # Build verify-specific arg array — only this phase consumes
 # --override-uncommitted (per iteration-close.sh do_verify gating in b13325b:
@@ -520,6 +584,25 @@ run_phase learning-gate    --phase learning-gate    "${COMMON[@]}" --outcome "$O
 run_phase productivity     --phase productivity-check
 
 echo "[recurring-close] phases: $PHASE_RESULTS" >&2
+
+# Source (b): the dispatch finished. Before  the counter block ran
+# unconditionally from here regardless of any phase's rc, so this assignment is
+# what keeps a verify-FAILED close advancing its counters exactly as it always
+# did. Without it, gating on source (a) alone would have been a silent behaviour
+# change on a path this goal never set out to touch.
+COUNTERS_OWED=1
+
+# ─── : the block below is now a guarded, idempotent function ───
+# Called once on the normal path (immediately after its definition) and once
+# from the EXIT trap installed above. COUNTERS_FINALIZED makes it one-shot per
+# process (guard-1185's double-count hazard); COUNTERS_OWED keeps it from
+# firing on a run that died before the close committed. Body is unchanged --
+# it still reads post-phase state, which is exactly why the write cannot simply
+# be moved earlier the way  moved the sentinel.
+finalize_counters() {
+    [[ "$COUNTERS_FINALIZED" == "1" ]] && return 0
+    [[ "$COUNTERS_OWED" == "1" ]] || return 0
+    COUNTERS_FINALIZED=1
 
 # ─────────────────────────── consecutive_routine + cargo-cult ───────────────────────────
 # OUTCOME_ORIGIN (): derived from caller-side comparison of the
@@ -858,6 +941,12 @@ if outcome == "deep" and new_deep >= contract_threshold:
               f"failed: {det.stderr}", file=sys.stderr)
 PYEOF
 PY_RC=$?
+}
+
+# Normal path: run it here, exactly where it always ran. The EXIT trap's call is
+# a no-op after this (COUNTERS_FINALIZED), so a completed run advances each
+# counter exactly once.
+finalize_counters
 
 # ─────────────────────────── Phase 4.25 enforcement () ───────────────────────────
 # Per-goal experience-staleness check for deep-outcome recurring goals.

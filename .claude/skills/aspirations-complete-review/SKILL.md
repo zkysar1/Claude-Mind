@@ -54,16 +54,18 @@ if has_recurring and functionally_complete:
     # Guard: only fire once per aspiration (prevent repeated triggering)
     IF asp.functionally_complete_at is not null:
         RETURN (should_archive = false, goals_added = 0)  # already processed
-    # ASPIRATION-FIELD setter, NOT aspirations-meta-update.sh (g-115-2592):
-    # meta-update takes exactly <key> <value> — passing {asp.id} as a positional
-    # made it write a spurious meta key `{asp.id}: functionally_complete_at` and
-    # silently DROP the timestamp, so the field was never set and precheck-eval
-    # re-flagged the aspiration as an all_terminal zombie every iteration.
+    # ASPIRATION-FIELD setter, NOT aspirations-meta-update.sh (g-115-2592: that
+    # one wrote a spurious meta key and dropped the timestamp → zombie re-flags).
     Bash: aspirations-update.sh --source {source} {asp.id} functionally_complete_at "$(date +%Y-%m-%dT%H:%M:%S)"
 
     Output: "▸ Functionally complete: {asp.id} '{asp.title}' — all non-recurring goals done, {recurring_count} recurring continue"
     run_aspiration_spark(goal.aspiration)
+    # SELF-GENERATED (g-357-82): origin `successor:{asp.id}`, never
+    # `user_directive`; needs supply_evidence citing {asp.id}. The aspiration-
+    # supply gate refuses a successor that restates the completed work. EMPTY
+    # is expected when nothing genuine follows — recurring goals continue it.
     invoke /create-aspiration from-self --plan with:
+        origin_signal: "successor:{asp.id}"
         replacement_context: "Aspiration '{asp.title}' is functionally complete — all non-recurring goals done. Recurring goals continue as monitoring. Generate a NEW aspiration that advances the agent's purpose in a fresh direction, informed by the completed aspiration's outcomes."
     RETURN (should_archive = false, goals_added = 0)  # keep alive for recurring, but replacement was triggered
 
@@ -323,9 +325,7 @@ Bash: echo '<reasoning-bank JSON>' | reasoning-bank-add.sh
   # category: "meta-strategy"
   # content: <content above>
   # when_to_use: "When an aspiration with similar motivation shape has trailing blocked goals"
-  # applies_to: any  # REQUIRED. Intent-satisfaction is a methodological pattern that
-  #                  # transfers across domains — same shape applies regardless of
-  #                  # what the aspiration was about.
+  # applies_to: any  # REQUIRED — a methodological pattern; transfers across domains
   # tags: ["intent-satisfaction", "meta-strategy", asp.scope, ...evidence_categories]
 
 Output: "▸ Learning emitted: reasoning-bank entry captures evidence/superseded split"

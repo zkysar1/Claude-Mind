@@ -586,7 +586,7 @@ def test_build_bundle_filters_and_redacts(tmp_path: Path) -> None:
 
     # Exactly the domain entries survive; framework rows are gone.
     assert bundle.counts() == {
-        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0, "goals": 0,
+        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0, "goals": 0, "program": 0,
     }  # the fixture world has no agents/<a>/self.md -> `self` projects empty
 
     node = bundle.tree[0]
@@ -656,7 +656,7 @@ def test_build_bundle_empty_world_is_empty_bundle(tmp_path: Path) -> None:
     (tmp_path / "world").mkdir()
     bundle = M.build_bundle(tmp_path / "world", tmp_path, env={})
     assert bundle.counts() == {
-        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0, "goals": 0,
+        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0, "goals": 0, "program": 0,
     }
 
 
@@ -732,7 +732,7 @@ def test_okf_empty_bundle_writes_index_and_empty_dirs(tmp_path: Path) -> None:
     out = tmp_path / "okf"
     counts = M.write_okf_bundle(bundle, out)
     assert counts == {
-        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0, "goals": 0,
+        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0, "goals": 0, "program": 0,
     }
     assert (out / "index.md").is_file()
     assert list((out / "nodes").glob("*.md")) == []
@@ -1315,3 +1315,144 @@ def test_goals_projection_never_emits_an_internal_goal_field(tmp_path: Path) -> 
     blob = "".join(p.read_text(encoding="utf-8") for p in okf.rglob("*.md"))
     for internal in ("prod-accounts", "cc-02", "zeta", "human_blocked", "HIGH", "g-369-70"):
         assert internal not in blob, internal
+
+
+# ── program projection wiring () ───────────────────────────────────
+
+_PROGRAM_MD = '''---
+created: "2026-05-13"
+last_updated: "2026-08-29"
+revision_id: "program-20260829-bravo"
+---
+
+# The Program
+
+the framework is a platform. We are NOT entering the Kaggle competition.
+
+<!-- public:begin -->
+Your agent is here to learn what makes a world feel alive.
+<!-- public:end -->
+
+## Architecture
+
+primitives/ drives every EnvironmentAdapter; resolve AGENT_WRITE_PATH from
+agents/alpha/local-paths.conf.
+'''
+
+
+def _program_bundle(tmp_path: Path, text: str | None = _PROGRAM_MD):
+    """A world plus a program.md, projected. ``None`` writes no program.md at all."""
+    world = _build_world(tmp_path, write_bodies=True)
+    if text is not None:
+        (world / "program.md").write_text(text, encoding="utf-8")
+    return M.build_bundle(world, tmp_path, env={"MIND_AGENT": "alpha"})
+
+
+def test_program_projection_publishes_the_marked_block_and_suppresses_the_rest(
+    tmp_path: Path,
+) -> None:
+    """Only the marked region reaches the view; the surrounding file does not."""
+    got = _program_bundle(tmp_path).program
+    assert set(got) == {"purpose", "created", "last_updated"}
+    assert got["created"] == "2026-05-13" and got["last_updated"] == "2026-08-29"
+    assert "makes a world feel alive" in str(got["purpose"])
+    blob = repr(got)
+    for forbidden in ("Kaggle", "revision_id", "program-20260829",
+                      "primitives/", "EnvironmentAdapter",
+                      "AGENT_WRITE_PATH", "local-paths.conf"):
+        assert forbidden not in blob, f"`{forbidden}` reached the customer-facing program view"
+
+
+@pytest.mark.parametrize("text,label", [
+    (None, "no program.md on disk"),
+    ("", "zero-byte file — exactly what init-world.sh's `touch` creates"),
+    ('---\ncreated: "2026-05-13"\n---\n\n# The Program\n\nUnmarked prose.\n',
+     "real prose, but no markers"),
+])
+def test_program_absent_or_unmarked_publishes_no_key_rather_than_a_hollow_one(
+    tmp_path: Path, text, label
+) -> None:
+    """`{}` so a consumer can tell 'no program published' from 'published and blank'.
+
+    The zero-byte row is not hypothetical: `init-world.sh` `touch`es program.md at
+    world init, so EVERY freshly initialised world sits in exactly that state and
+    must read as "not published" rather than as an error or an empty panel.
+    """
+    bundle = _program_bundle(tmp_path, text)
+    assert bundle.program == {} and bundle.counts()["program"] == 0, label
+
+
+def test_program_reaches_json_payload_and_okf_bundle(tmp_path: Path) -> None:
+    """Both emitted forms carry it — an enumerated writer drops what it is not told about."""
+    bundle = _program_bundle(tmp_path)
+    out = tmp_path / "okf"
+    counts = M.write_okf_bundle(bundle, out)
+
+    assert counts["program"] == 1
+    program_md = (out / "program.md").read_text(encoding="utf-8")
+    fm = _fm(program_md)
+    assert fm["type"] == "program", "one concept = one md + a required `type` discriminator"
+    assert fm["created"] == "2026-05-13" and fm["last_updated"] == "2026-08-29"
+    assert "makes a world feel alive" in program_md
+    assert "- [What this agent is for](program.md)" in (out / "index.md").read_text(encoding="utf-8")
+
+
+def test_every_projected_bundle_field_reaches_the_json_payload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """guard-3357: DERIVE the expectation from the record, never enumerate it by hand.
+
+    The JSON writer is an EXPLICIT field list (`payload.update({...})`). An enumerated
+    list of expected keys has to be remembered and extended by whoever adds the NEXT
+    projection — which is exactly the step that gets missed, and the miss is silent
+    because every other test asserts on the in-memory bundle rather than on the
+    emitted write. Iterating the dataclass instead covers the next field for free.
+
+    `agent_self` is the one field whose JSON key differs from its Python name (a
+    dataclass field literally named `self` would shadow the receiver). The alias map
+    is asserted TOTAL below, so a new field arriving with neither a matching key nor
+    a deliberate alias fails here rather than shipping unpersisted.
+    """
+    import dataclasses
+
+    import knowledge_projection as K
+
+    field_names = [f.name for f in dataclasses.fields(K.ProjectedBundle)]
+    assert field_names, "derived expectation set is empty — the assertion would be vacuous"
+
+    aliases = {"agent_self": "self"}
+
+    world = _build_world(tmp_path)
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+
+    for name in field_names:
+        key = aliases.get(name, name)
+        assert key in payload, (
+            f"ProjectedBundle.{name} never reaches the emitted JSON (expected key "
+            f"`{key}`). Add it to the payload.update({{...}}) literal in main(), or "
+            f"add a deliberate alias if its JSON key differs."
+        )
+        assert key in payload["counts"] or key not in K.ProjectedBundle().counts(), (
+            f"`{key}` is in counts() but missing from the emitted counts block"
+        )
+
+
+def test_program_count_cannot_satisfy_the_broken_export_refusal(tmp_path: Path) -> None:
+    """A published program must not mask four dead knowledge stores.
+
+    Same reasoning as `self` and `goals`: a world can legitimately publish a program
+    while its knowledge stores are healthy, so folding `program` into
+    KNOWLEDGE_COUNT_KEYS would let a genuinely broken export pass the gate built to
+    catch it.
+    """
+    import knowledge_projection as K
+
+    assert "program" in K.ProjectedBundle().counts()
+    assert "program" not in K.KNOWLEDGE_COUNT_KEYS
+    bundle = M.ProjectedBundle(program={"purpose": "p"})
+    assert any(bundle.counts().values()), "the naive check would pass this broken bundle"
+    assert not any(bundle.counts()[k] for k in K.KNOWLEDGE_COUNT_KEYS)

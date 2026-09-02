@@ -1396,6 +1396,31 @@ _GENERIC_NAME_PARTS = frozenset({
     # auto-files a HIGH-priority Unblock, so each of these manufactures
     # fleet-visible work rather than noise).
     "felt", "sense", "eyes", "body", "field", "usage", "proof", "timeline",
+    # measured FP 2026-09-02 (g-115-8640, echo). Forging `fleet-capacity-snapshot`
+    # put `fleet` and `capacity` into the name-parts branch, and two EXISTING
+    # tests went red the same hour under the canonical gate invocation:
+    # test_capability_gate_prose_collision.py::test_fleet_defer_does_not_falsely_block
+    # and ::test_boolean_literal_defer_does_not_falsely_block, both reporting
+    # matched_keyword='fleet' against a defer naming no capability at all. That is
+    # this predicate's premise failing exactly as g-115-3934 describes: ordinary
+    # framework defer prose says "fleet" constantly ("the fleet is validating",
+    # "waking partner sessions"), so a sole `fleet` hit is vocabulary, not a
+    # reference. Note the trigger wording was NOT the mechanism and rewording it
+    # would not have helped -- _identifier_parts reads the NAME only, so every
+    # part of any new skill name enters this branch the moment the skill is forged.
+    # OLD vs NEW predicate, one corpus snapshot, one process (guard-2201):
+    # neutral-carrier ("waiting for the <tok> to settle before this can proceed")
+    # FPs {capacity, fleet} -> {}, REMOVED == exactly these two, ADDED empty.
+    # `snapshot` is deliberately NOT demoted -- it produced no measured FP (it does
+    # not survive extraction from the neutral carrier), and the EXTENSION RULE above
+    # admits a token only WITH one.
+    # guard-958 recall control, MEASURED not argued: three adversarial genuine
+    # references still block after the demotion -- "I need the fleet capacity
+    # snapshot to see who has capacity right now" (4 hits), "run the per-agent
+    # available work report to find which agent should take this" (4 hits), "is any
+    # agent starved -- get the fleet capacity numbers" (3 hits) -- each surviving on
+    # the >=2-hit path this predicate never reaches. Zero recall cost.
+    "fleet", "capacity",
 })
 
 

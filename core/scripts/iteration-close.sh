@@ -126,6 +126,8 @@ OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
 OVERRIDE_RESIDUAL=""
 OVERRIDE_DOMAIN_SUITE=""
+OVERRIDE_CLOSE_REVIEW=""
+OVERRIDE_NOTE_MARKER=""
 OUTCOME_NOTE_FILE=""
 
 # g-284-04: Recovery instructions on non-zero exit. The trap below reads
@@ -717,6 +719,15 @@ while [[ $# -gt 0 ]]; do
         # g-353-75: forwarded to domain-suite-gate.py inside do_verify. Turns a
         # domain-suite BLOCK into a logged pass (world/domain-suite-overrides.jsonl).
         --override-domain-suite) OVERRIDE_DOMAIN_SUITE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        # g-357-40: forwarded to close-review-gate.py inside do_verify. Both are
+        # parsed HERE, at the wrapper every loop close actually goes through, and
+        # not only on the gate that defines them — that split is exactly the
+        # guard-1532 defect the --override-residual comment above records: the gate
+        # named a flag verbatim in its own refusal text while this parser died
+        # `unknown arg` on it, so the advertised escape hatch was unreachable from
+        # the standard close path. Logged to world/close-review-overrides.jsonl.
+        --override-close-review) OVERRIDE_CLOSE_REVIEW="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --override-note-marker) OVERRIDE_NOTE_MARKER="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # g-358-36: outcome_note rides the status write as a companion in ONE
         # locked RMW (one S3 PUT) instead of the separate note-then-status
         # pair. File transport only here — do_verify passes it straight to
@@ -1016,7 +1027,13 @@ do_verify() {
             echo "  A goal is BLOCKED only through a blocker record. Pick the route that matches WHO must act:" >&2
             echo "  - a PERSON (an approval, a credential, an authorization click) -> record a human-gated defer and leave the status pending:" >&2
             echo "      bash core/scripts/aspirations-update-goal.sh --source $SOURCE $GOAL_ID defer_reason \"human_blocked: <what the person must do, and where>\"" >&2
-            echo "      then release your claim so the loop moves on:  bash core/scripts/aspirations-release.sh $GOAL_ID --source $SOURCE" >&2
+            # g-115-8163: TYPED, and no longer bare. `role` is the token for "the
+            # actor who must act is a person, not this agent" — distinct from
+            # `capability` (a credential or tool the fleet lacks). A bare release
+            # here also re-armed finished work at rank 1 on fresh metadata
+            # (g-115-5177); the reason is what stops that.
+            echo "      then release your claim so the loop moves on:" >&2
+            echo "      bash core/scripts/aspirations-release.sh $GOAL_ID --source $SOURCE --reason \"human gate: <what the person must do, and where>\" --reason-kind role" >&2
             echo "  - INFRASTRUCTURE or a service the agent can provision -> file the blocker with its Unblock goal, then re-run this verify:" >&2
             echo "      bash core/scripts/create-blocker.sh --help" >&2
             exit 2
@@ -1113,6 +1130,44 @@ do_verify() {
             return 1
         elif [[ $_dsg_rc -ne 0 ]]; then
             echo "[iteration-close] WARN domain-suite-gate rc=$_dsg_rc (gate fault, fail-open) — the domain suite was NOT checked for $GOAL_ID" >&2
+        fi
+    fi
+
+    # ── Close-review gate (g-357-40) ─────────────────────────────────────────
+    # Definition of Done. Two independent checks, BOTH DORMANT BY DEFAULT:
+    #   A. a tier-2 goal refuses to close without an APPROVE close-review verdict
+    #      artifact  (core/config/aspirations.yaml close_review_gate.enabled)
+    #   B. a goal whose OWN outcome_note/progress_note carries a HIGH-confidence
+    #      not-done marker refuses, printing the match
+    #      (close_review_gate.note_marker_enabled)
+    # Placed here for the same reasons as the domain-suite gate directly above:
+    # BEFORE the status write, so a refusal leaves the goal OPEN and the EXIT
+    # trap's verify branch prints the retry line carrying the override flags; and
+    # both roles close through here, so it is the one place enforcement lands.
+    #
+    # WHY DORMANT ON SHIP, and why that is the correct posture rather than a hedge
+    # (guard-1532): check A's refusal text names "run the close review", whose
+    # PRODUCER is the sibling goal g-357-41 and does not exist yet. A gate whose
+    # named remedy is unreachable forces every caller onto --override, which
+    # manufactures false records in the very ledger the gate exists to fill — and
+    # those records are not self-correcting. Check B's own filing requires
+    # measuring the refusal rate over the live completed population first (the
+    # high tier is known to flag at least one legitimate close, g-115-5085). Flip
+    # each flag when its own precondition lands, independently.
+    # Only the gate's OWN verdict refuses: rc 1 is a block; rc 0 is
+    # pass/noop/override/error; anything else is a gate fault and fails OPEN.
+    if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/close-review-gate.py" ]]; then
+        _crg_args=(--goal "$GOAL_ID" --source "$SOURCE")
+        [[ -n "$OVERRIDE_CLOSE_REVIEW" ]] && _crg_args+=(--override-close-review "$OVERRIDE_CLOSE_REVIEW")
+        [[ -n "$OVERRIDE_NOTE_MARKER" ]] && _crg_args+=(--override-note-marker "$OVERRIDE_NOTE_MARKER")
+        _crg_rc=0
+        python3 "$SCRIPT_DIR/close-review-gate.py" "${_crg_args[@]}" \
+            >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _crg_rc=$?
+        if [[ $_crg_rc -eq 1 ]]; then
+            echo "[iteration-close] ✖ REFUSED — CLOSE REVIEW (g-357-40): goal $GOAL_ID stays open. See the reason above, then re-run this close." >&2
+            return 1
+        elif [[ $_crg_rc -ne 0 ]]; then
+            echo "[iteration-close] WARN close-review-gate rc=$_crg_rc (gate fault, fail-open) — close review was NOT checked for $GOAL_ID" >&2
         fi
     fi
 

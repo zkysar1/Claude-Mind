@@ -94,6 +94,53 @@ _N3_ALLOWED_EXACT = frozenset({
 })
 
 
+# Keys whose VALUES must never be printed. `_load_env_local` also accepts the
+# MIND_AWS_* scoped-credential family and MIND_API_TOKEN; every other key it
+# loads is non-secret storage/config wiring. Same posture as fleet-config-parity,
+# which compares env by key NAME only and emits no secret value.
+def _is_secret_env_key(key: str) -> bool:
+    return key == "MIND_API_TOKEN" or key.startswith("MIND_AWS_")
+
+
+def _warn_if_inherited_overrides(key: str, file_val: str) -> None:
+    """Say so, loudly, when an INHERITED env var silently beats .env.local.
+
+    g-115-8604. `_load_env_local` uses ``setdefault`` ("explicit launch env
+    wins"), so a var the daemon inherited from whoever spawned it BLOCKS the
+    .env.local value -- silently, for the daemon's whole life. That is the
+    mechanism of the 2026-09-02 incident: seven --restart recycles from inside
+    pytest handed the shared daemon STORAGE_BACKEND=local on an own-cloud box,
+    and every daemon-mediated world write from that box stayed on the local
+    mirror from 00:34Z to 06:45Z. Nothing anywhere said a word.
+
+    THIS IS THE ONLY PLACE BOTH VALUES ARE IN HAND. The launcher cannot make
+    this comparison without re-deriving .env.local resolution -- a second
+    implementation of this function (guard-2676) -- and /proc/<pid>/environ,
+    which the fleet-config-parity checker reads, is frozen at exec time and so
+    cannot see an in-process resolution at all (guard-1582).
+
+    Fires ONLY for a key .env.local actually declares with a non-empty value
+    whose inherited value DIFFERS. RUNTIME_DIR-style test isolation, and every
+    var absent from .env.local, are silent by construction.
+
+    WARN, NEVER REFUSE. Under the daemon-only architecture a false positive
+    here fails every wrapper on the box. The same predicate family wired as a
+    VERDICT rather than a REPORT produced 31h of false HIGH goals against a
+    correctly-configured node (g-115-3157), so report is the sanctioned shape
+    and the deliberate-operator override stays available by design.
+    """
+    prior = os.environ.get(key)
+    if not file_val or prior is None or prior == file_val:
+        return
+    detail = ("(values withheld -- credential key)" if _is_secret_env_key(key)
+              else f"inherited={prior!r} .env.local={file_val!r}")
+    print(
+        f"[runtime] WARNING: inherited env OVERRIDES .env.local for {key} "
+        f"{detail} -- the INHERITED value is in force (g-115-8604)",
+        file=sys.stderr,
+    )
+
+
 def _load_env_local(project_root: Path) -> None:
     """Populate ``os.environ`` from ``.env.local`` for the keys the daemon needs
     to select + configure the storage backend (the ``own-cloud`` cutover, s7).
@@ -140,6 +187,7 @@ def _load_env_local(project_root: Path) -> None:
         # config value begins with '#'.
         if tok.startswith("#"):
             tok = ""
+        _warn_if_inherited_overrides(key, tok)
         os.environ.setdefault(key, tok)
 
 

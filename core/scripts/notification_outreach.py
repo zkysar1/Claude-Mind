@@ -352,6 +352,12 @@ def find_prior(subject: str, body: str, category: str, *, world: Path | None = N
     for r in _read_jsonl(ledger_path(world)):
         if exclude_suppressed and r.get("suppressed_duplicate_of"):
             continue
+        # A send the transport REFUSED (2026-09-02: rc=6 rows carry
+        # delivery_failed) never reached anyone, so it is not prior outreach --
+        # counting it would suppress the retry as a "duplicate" of a message
+        # the user never got.
+        if r.get("delivery_failed"):
+            continue
         ts = _parse_ts(r.get("ts"))
         if not ts or ts < since:
             continue

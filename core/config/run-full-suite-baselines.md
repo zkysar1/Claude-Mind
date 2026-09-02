@@ -1128,3 +1128,24 @@ worktree `/tmp/wt-g35841` @ d5c2ecdcb3, `--chunks 8`, conf + daemon.port both co
   tracked red set; WinError 5 sharing violation in `os.replace` under a concurrent reader — production
   `_atomic_write_local` has no Windows retry; path untouched by the change), test_iteration_push CRLF case →
   g-115-7311 (Windows-only).
+
+**2026-09-01→09-02 (alpha, `hostname` DESKTOP-O91DLK2, `uname -r` 3.4.10-87d57229.x86_64 (MSYS/Git Bash, Windows 10
+19045), own-cloud box, g-357-51 + g-357-31 closure — recovery-gate hardening, 35 framework files).** Run 1 from the
+live checkout: `VERDICT: INVALID (tree-moved)` — a SECOND live session (bravo's session-close flush) commits into
+this checkout, so the tree cannot be held still; voided, not read. Run 2 in a **detached worktree pinned at
+e7a350e536** (private-index pin commit of the change) with `agents/alpha/local-paths.conf` +
+`mind_api/state/daemon.port` copied in, `STORAGE_BACKEND=local`: the default chunking died at launch with
+WinError 206 (command line too long — the Windows argv ceiling, not the suite); `--chunks 8` launched.
+`VERDICT: GENUINE` · `TOTAL: 19717 passed, 91 failed, 24 errors` · invisible half 115/122 · domain half 63/80
+(world scripts; `.env.local`-gated families as on 08-31). Failures spread across all 8 chunks (no confinement).
+`--triage`: **3 environmental | 30 genuine-owned | 4 genuine-UNOWNED** → the four filed as **g-115-8624**
+(goal_selector_silent_empty_guard `/tmp` capture path, world_script_crlf_check fixture runs clean on git-bash,
+post_status_stamps_are_non_fatal do_verify anchor drift, full_suite_recommender mutex release). **Zero reds in the
+change's blast radius**: every red in the 41 failing files either reproduces on a pristine pre-change worktree
+(quality_flag_carry 9, post_status_stamps 2, iteration_push, domain_suite_gate 3, stop_hook_gate_integration 5,
+worker_closure_evidence 21, wrapper_retire 4), is Windows/env (exec bits, path forms, CRLF, /tmp, suite mutex), or
+was daemon-down: 17 daemon-class reds traced to a daemon SPAWN STORM my own solo re-runs of wrapper-heavy files
+caused (00:32–00:34) — all green after a daemon restart, and `daemon-orphan-sweep.sh` later found and reaped 2
+orphan daemon processes from that window. Lesson: on this box run solo re-runs through the pinned worktree with
+`daemon.port` copied in, never bare from the live checkout, or the re-run itself manufactures the reds it is
+meant to triage.

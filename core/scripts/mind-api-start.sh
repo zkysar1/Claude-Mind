@@ -23,6 +23,28 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
 
+# : THE TEST HATCH LIFTS THE REFUSAL, NEVER THE SCRUB.
+# When PYTEST_CURRENT_TEST is set this launcher is NOT the "deliberate operator"
+# that _runtime.sh's rt_spawn exemption assumed — the shared-runtime gate below
+# already says so in as many words. That gate REFUSES such a spawn and
+# MIND_ALLOW_SHARED_DAEMON_FROM_TEST lifts the refusal; until 2026-09-02 it
+# lifted the dirty ENVIRONMENT with it, because this launcher spawned with the
+# caller env intact while rt_spawn scrubbed. Measured (alpha, DESKTOP-O91DLK2):
+# seven --restart recycles from inside pytest spawned the SHARED daemon carrying
+# guard-955's mandatory STORAGE_BACKEND=local, the daemon resolved LocalBackend
+# on an own-cloud box, and every daemon-mediated world write from that box
+# stayed on the local mirror for six hours (00:34:27Z -> 06:52:47Z). guard-2617:
+# the DAEMON resolves the backend, so the only environment that matters is the
+# one it is handed. A genuine operator launch (no PYTEST_CURRENT_TEST) is
+# deliberately left UNSCRUBBED — hand-set env still shapes the daemon, the half
+# of the old "deliberate operator" claim that was always true.
+# The key list lives in _daemon_env_scrub.sh: ONE definition, TWO spawn sites.
+# Sourced at top level here (this launcher is not on a hot path); rt_spawn
+# sources it lazily INSIDE its subshell on purpose — _runtime.sh is declared
+# IRREDUCIBLY LOCAL for the per-Bash-call latency budget. Do not "unify" those.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_daemon_env_scrub.sh"
+
 # B16: RUNTIME_DIR override isolates the daemon's runtime files so a
 # daemon-integration test can spawn a daemon without hijacking the live one's
 # PROJECT_ROOT/mind_api/state. Unset (production default) -> the canonical path,
@@ -683,6 +705,8 @@ cap_log_file "$SPAWN_LOG"
 # daemon itself. `</dev/null` ensures no caller stdin is inherited (guard-4527).
 # Twin of the _runtime.sh rt_spawn site — fix both or neither.
 (
+    #  scrub (rationale at the source line near the file head).
+    if [ -n "${PYTEST_CURRENT_TEST:-}" ]; then daemon_scrub_inherited_env; fi
     cd "$PROJECT_ROOT" || exit 1
     $py_cmd -m mind_api.src </dev/null >> "$SPAWN_LOG" 2>&1 &
     disown $! 2>/dev/null || true

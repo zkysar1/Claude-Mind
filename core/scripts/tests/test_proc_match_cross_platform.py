@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -57,20 +58,77 @@ def run_probe(pattern: str, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+# The child signals readiness by CREATING this file, then sleeps. Waiting on a
+# file the child creates is a POSITIVE terminal token (guard-4396: never write a
+# wait predicate as the ABSENCE of something — an empty or errored probe
+# satisfies almost every absence predicate, so its failure becomes
+# indistinguishable from the success being waited for). It is also portable:
+# Windows, macOS and Linux all have a filesystem, whereas `ps -eo pid=,args=`
+# does not exist usefully under MSYS.
+_READY_ENV = "PROCMATCH_TEST_READY_FILE"
+
+# The signal is carried in the ENVIRONMENT, not in argv, deliberately: argv is
+# the thing under test, so the readiness mechanism must not perturb it. The
+# token stays the LAST argv element exactly as before.
+_CHILD_CODE = (
+    "import os,pathlib,time;"
+    "pathlib.Path(os.environ['" + _READY_ENV + "']).write_text('R');"
+    "time.sleep(60)"
+)
+
+_READY_TIMEOUT = 30.0
+
+
 @pytest.fixture
-def marked_process():
+def marked_process(tmp_path):
     """A real child process carrying a unique token in its command line.
 
     The token is passed as an argv element after `-c`, so it lands in the
     process command line on Windows, macOS and Linux alike — which is exactly
     the thing a name-only probe cannot see.
+
+    WAITS FOR THE CHILD TO BE REAL BEFORE YIELDING (g-115-8666). The original
+    fixture yielded the instant Popen returned, and Popen returns after the
+    FORK, before the EXEC — during which window the child's command line is
+    still the PARENT's argv, so the token is not in the process table at all
+    and any probe correctly finds nothing. Measured on cc-08 (idle, 20 cores):
+    the token takes 2.3-4.1 ms to become visible to `ps` after Popen returns.
+    That is a race in the HARNESS, not in the probe, and it fails in the
+    fail-open direction the whole file exists to prevent — an rc=1 with empty
+    stdout/stderr, which reads exactly like a broken probe.
+
+    The wait does NOT weaken the positive control: it only removes the
+    harness's own timing bug, so a probe that genuinely cannot see a live,
+    fully-exec'd process still fails the assertion below. If the child never
+    signals, that is itself a real defect and the fixture fails LOUDLY rather
+    than yielding a process that was never running (guard-2700: a fixture must
+    not make a failure mode unreachable).
     """
     token = "PROCMATCH_MARKER_" + uuid.uuid4().hex[:12]
+    ready = tmp_path / "child-ready"
+    env = dict(os.environ, **{_READY_ENV: str(ready)})
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(60)", token],
+        [sys.executable, "-c", _CHILD_CODE, token],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
+    deadline = time.monotonic() + _READY_TIMEOUT
+    while not ready.exists():
+        if proc.poll() is not None:
+            pytest.fail(
+                f"marker child exited early (rc={proc.returncode}) without "
+                f"signalling readiness — the spawn itself is broken, so no "
+                f"conclusion about proc-match.sh can be drawn from this run."
+            )
+        if time.monotonic() > deadline:
+            proc.kill()
+            pytest.fail(
+                f"marker child did not signal readiness within "
+                f"{_READY_TIMEOUT}s. Not a proc-match.sh failure — the child "
+                f"never started."
+            )
+        time.sleep(0.01)
     try:
         yield token, proc
     finally:
@@ -81,13 +139,44 @@ def marked_process():
             proc.kill()
 
 
+def _process_table_says(token: str) -> str:
+    """Diagnostic ONLY, used in the failure message — never in an assertion.
+
+    g-115-8666 was filed because this test failed with `stdout='' stderr=''`,
+    which is compatible with three unrelated causes (probe self-exclusion, ps
+    truncation, spawn race) and distinguishes none of them — so the goal had to
+    enumerate all three as guesses. Reading the process table INDEPENDENTLY of
+    proc-match.sh at the moment of failure separates "the probe cannot see a
+    process that is plainly there" from "the process is not there at all".
+    """
+    try:
+        snap = subprocess.run(
+            ["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=30
+        ).stdout
+    except Exception as exc:  # no ps (Windows/MSYS), or it failed — say so
+        return f"independent ps read unavailable ({exc!r})"
+    hits = [ln.strip() for ln in snap.splitlines() if token in ln]
+    if hits:
+        return (
+            f"token IS in the process table ({len(hits)} line(s)): {hits[0][:200]!r} "
+            f"-> the process exists and the PROBE failed to report it "
+            f"(suspect self-exclusion or the grep/ps arm, NOT a spawn race)"
+        )
+    return (
+        f"token is NOT in the process table at all ({len(snap.splitlines())} procs "
+        f"scanned) -> the child was not visible, so this is a SPAWN/readiness "
+        f"problem, not a proc-match.sh defect"
+    )
+
+
 def test_finds_a_live_process_by_command_line(marked_process):
     """POSITIVE CONTROL — without this, every other assertion here is vacuous."""
     token, proc = marked_process
     r = run_probe(token)
     assert r.returncode == 0, (
         f"probe failed to find a live process carrying {token!r} on "
-        f"{sys.platform}. stdout={r.stdout!r} stderr={r.stderr!r}"
+        f"{sys.platform}. stdout={r.stdout!r} stderr={r.stderr!r}. "
+        f"DIAGNOSIS: {_process_table_says(token)}"
     )
     assert token in r.stdout, f"match printed but token absent: {r.stdout!r}"
     assert str(proc.pid) in r.stdout, (

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.48",
+    "previous_version": "2.12.47",
+    "date": "2026-09-02",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "aspiration-supply gate: script-gated quality bar for self-generated aspirations (g-357-82/83) — supply_evidence, blocker-as-gap refusal, archive overlap, per-agent daily cap, successor:* lane; idle path goes quiet instead of manufacturing work",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.47",
     "previous_version": "2.12.46",
     "date": "2026-09-02",

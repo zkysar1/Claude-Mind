@@ -93,6 +93,33 @@ ELSE:
    strategic_focus` — fail-open if absent). Generated goals must serve the
    standing directives, and lane weighting follows the strategic focus.
 
+## Phase 0.5: Demand-First Ordering (consume before inventing)
+
+Runs BEFORE the supply governor, and the order is the point: a queue can be
+thin (Phase 1 says "generate") while real requests addressed to this agent sit
+unanswered on the board. Consuming demand outranks inventing supply.
+
+```
+Bash: bash core/scripts/board-read.sh --channel coordination --since 168h --json > /tmp/demand.jsonl
+Bash: bash core/scripts/board-read.sh --channel general --since 168h --json >> /tmp/demand.jsonl
+Bash: py -3 core/scripts/generation_phase_gate.py demand-check \
+        --posts-file /tmp/demand.jsonl --author "$MIND_AGENT" --json
+# exit 0 = allow (proceed to Phase 1) | exit 1 = defer
+IF exit 1:
+    Read `outstanding` from the JSON — those posts ARE this cycle's work.
+    → Post a one-line coordination tick naming the deferring count, ROUTE the
+      outstanding posts (answer, file, or ack), and DONE. Do NOT generate.
+IF exit 0:
+    → proceed to Phase 1.
+```
+
+Which post types count as demand comes from the `domain-calendar` slot's
+`demand.actionable_types` (default: directive / escalation / question /
+request / review-request / decision-needed / blocker). A post is consumed when
+THIS agent has replied to it — a peer's reply does not discharge demand
+addressed here. Fail-open in both directions: no calendar means the default
+set, and an unreadable board yields zero posts, which allows.
+
 ## Phase 1: Supply Governor (do NOT flood the queue)
 
 Consolidate-before-expand applies to generation itself: new supply is only
@@ -235,6 +262,23 @@ re-run it harder rather than filing.
    against the rubric file.
 5. **Acceptance-verifiability check**: every criterion observable at
    verification time or explicitly staged.
+6. **Domain-phase check** (`domain-calendar` hook slot): a candidate whose
+   category only makes sense in a phase that has already closed is waste, not
+   supply — evidence-backed and still worthless. Run the gate per candidate:
+
+   ```
+   Bash: py -3 core/scripts/generation_phase_gate.py phase-check \
+           --category "<candidate category or work_class>" --json
+   # exit 0 = allow (or fail-open) | exit 1 = phase-invalid
+   ```
+
+   Exit 1 → KILL the candidate, or REWRITE it into the current phase's valid
+   categories when the underlying story still matters. Record the refusal:
+   `Bash: bash core/scripts/gate-log.sh generation-phase-gate block --caller
+   "generate-domain-goals/SKILL.md:Phase 4.6" --payload "<candidate title>"`;
+   log an `allow` verdict as `noop` on the same id. A world with no
+   `world/conventions/domain-calendar.md` fails open — every candidate passes
+   and this step costs one exit-0 call.
 
 Kill or fix WRONG candidates here. Convert already-exists candidates into
 validation goals when the story still matters ("verify the existing X is
