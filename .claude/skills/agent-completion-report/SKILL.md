@@ -58,6 +58,22 @@ All data comes from framework scripts — no direct JSONL reads.
    Bash: bash core/scripts/aspirations-read.sh --archive
    → Filter where completed_at >= since date
    → Count and list titles
+   # ⚠ THIS IS A WINDOW COUNT AND ONLY A WINDOW COUNT. When `since` is null (the
+   # "Lifetime" branch at step 0) the filter goes vacuous and this degrades into a
+   # RECORD ENUMERATION over archive ∪ live — which no longer reaches the lifetime
+   # population. The 2026-08-14T12:56 metric-neutral eviction moved 5,003 terminal
+   # goal records out of the live world queue into each aspiration's
+   # `archived_census`, and the evictor DELIBERATELY does not re-append them to the
+   # archive store (its docstring says why), so they survive only in .history blobs.
+   # Measured cc-08 2026-08-15 (g-001-04): enumeration over archive(370 asps) +
+   # live(30 world, 1 agent) = 2,679 completed, against 7,084 done of 9,854 from the
+   # census-folded `--summary` at step 3 — a 4,405-goal gap, all of it invisible here.
+   # RULE: take LIFETIME totals from step 3's `--summary`, which folds the census;
+   # keep this enumeration for the WINDOW count, where it stays exact. Window safety
+   # was verified separately: of the 4,972 goals present in the 08-14T12:53 .history
+   # blob but absent from BOTH live and archive, ZERO have completed_at >=
+   # 2026-08-13T20:25:22. Lifetime figures are NOT comparable across the 2026-08-14
+   # boundary by either method — say that, rather than reporting a drop.
 
 3. Active aspirations progress
    Bash: bash core/scripts/aspirations-read.sh --summary
@@ -142,6 +158,8 @@ All data comes from framework scripts — no direct JSONL reads.
    #   08-30 99.94h(date-floored 5 calendar days) 93.3% (n=60, split 58/1397)  <- WIDEST WINDOW *AND* HIGHEST NON-100%, TOGETHER
    #   08-31 102.5h 48.7% (n=39, split 22/1554)  <- WIDER THAN 08-30 AND HALF ITS COVERAGE, ONE DAY LATER
    #   08-31 29.9h(date-floored 46.8h) 100% (n=14, split 22/1554)  <- SAME BOX-DAY, IDENTICAL STORE SPLIT, NARROWER WINDOW
+   #   09-02 27.85h(date-floored 2 calendar days) 100% (n=16, split 24/1577)  <- NEAR-EXACT REPLICATION OF THE ROW ABOVE, 2 DAYS LATER
+   #   09-02 21.2h(date-floored 37.2h) 100% (n=16, split 24/1577)  <- SMALLEST BACKLOG SINCE 08-31 (24), STILL 100% ON A ~1-DAY WINDOW; consistent with the 08-31 narrow row, not with the wide one
    # THE 08-30/08-31 PAIR IS THE CLEANEST WIDTH-CONTROLLED TEST IN THIS SERIES AND IT
    # SETTLES THE ARGUMENT: 99.94h -> 93.3%, then 102.5h -> 48.7% ONE DAY LATER. The
    # window got WIDER and coverage HALVED, so width cannot be the driver in either
@@ -247,6 +265,16 @@ All data comes from framework scripts — no direct JSONL reads.
    Bash: bash core/scripts/load-aspirations-compact.sh → IF path returned: Read it
    (compact data has IDs, titles, statuses, participants — no descriptions/verification)
    Filter goals with participants containing "user"
+   # ⚠ AND NO completed_date — ON ANY RECORD, INCLUDING THE COMPLETED ONES. So a
+   # window-scoped completion count computed from this index returns 0 regardless of
+   # actual activity, and the 0 reads as a quiet fleet rather than as a missing field
+   # (rb-245 class). Measured cc-08 2026-08-17: 2,685 goals / 23 aspirations, 694 at
+   # status=completed, and a one-record schema probe of a completed goal shows only
+   # title/status/priority/category/participants/skill/discovered_by/filed_by_agent/
+   # work_class/id/started — no completion timestamp of any kind, while
+   # `aspirations-read.sh --summary` reported asp-115 alone at 4,422 done. Use this
+   # index for IDENTITY and STATUS only; take every dated or counted figure from the
+   # full store.
 
 9. Blocked goals analysis
    Bash: bash core/scripts/goal-selector.sh blocked
@@ -617,11 +645,29 @@ Since: {since_timestamp} ({hours}h {min}m ago)
       a regression did not ship. This is NOT the "0/0" the GRACEFUL OMIT forbids;
       that prohibition is about a tally with no RUNS behind it, where nothing has
       been measured at all.}
-    {GRACEFUL OMIT (the early-data default): IF NO recurring goal completed this
-     window has runs > 0 -- the writer has not accumulated yet, or this window held
-     only non-recurring goals -- show NONE of the per-goal lines above; keep only the
-     generic recognition framing. NEVER print a "0/0" tally. Spinning an empty tally
-     as a win violates communication-clarity rule 6.}
+    {GRACEFUL OMIT (a FALLBACK -- no longer the expected default): IF NO recurring
+     goal completed this window has runs > 0, or this window held only non-recurring
+     goals -- show NONE of the per-goal lines above; keep only the generic recognition
+     framing. NEVER print a "0/0" tally. Spinning an empty tally as a win violates
+     communication-clarity rule 6.
+     ⚠ "THE WRITER HAS NOT ACCUMULATED YET" IS NO LONGER THE LIKELY CAUSE OF AN
+     EMPTY TALLY, and reaching for that phrasing now misreports the fleet. Measured
+     2026-08-22 (alpha worker Body, hostname cc-07, uname -r 6.8.0-137-generic,
+     own-cloud): 83 of 95 recurring goals carry a run history, and the aggregate is
+     652 substantive hits over 1,939 runs = 33.6% -- about one upkeep run in three
+     catches something real. An empty tally today points at THIS WINDOW's goal mix,
+     or at a read failure, far more often than at an unaccumulated writer; say which.
+     Read 33.6% as a BAND, never a target -- the spread is what carries the meaning:
+     g-326-85 96/130 = 74%, g-001-10 45/109 = 41%, g-115-817 49/138 = 36%,
+     g-115-1538 43/127 = 34%, g-115-754 23/102 = 23%, g-001-04 5/40 = 13%, and the
+     measured floor is g-115-105 at 10/175 = 5.7% (last catch 2026-08-10).
+     ⚠ AND TREAT IT AS AN UPPER BOUND, NOT A POINT ESTIMATE (guard-3232). A
+     recurring close killed mid-sequence lands lastAchievedAt/achievedCount inside
+     do_verify but never reaches recurring-close.sh's own counter heredoc, so
+     substantive_runs -- the DENOMINATOR -- freezes although the close happened;
+     legacy closes predating the g-317-02 writer are frozen the same way. Both errors
+     shrink the denominator, which INFLATES the rate. Do not quote this figure as a
+     baseline any individual goal must beat.}
     → The journal's per-goal `Value:` line is the canonical one-line framing for each
       recorded outcome (DERIVED from outcome_class + work_class by
       `core/scripts/_value_framing.py`, value-framing-mapping.yaml). This
@@ -725,6 +771,15 @@ the agents' forensic record.
 1. Build the digest (framework script reads the stores; do not hand-write it):
    Bash: bash core/scripts/completion-digest.sh --agent <agent> \
            --since <the since-timestamp Phase 1 resolved> \
+   # PASS THE PHASE-1 VALUE FROM CONTEXT — NEVER re-read last-report-timestamp
+   # here. Phase 5 has ALREADY overwritten it, so a re-read returns NOW, the window
+   # collapses to 0h and a "Done: 0 goals" digest goes out. Measured 2026-09-02
+   # (zeta, cc-02, 6.8.0-138-generic): the timestamp write and a digest call that
+   # re-derived `since` from the file were batched as "independent" — they share
+   # disk state, so they were not — and the 0h digest was SENT before the defect
+   # was noticed; the corrected send needed --allow-duplicate. Same class as the
+   # cwd-persists-across-batched-calls trap (guard-1012): a call that READS a file
+   # another call in the batch WRITES is sequential, whatever the tool ordering.
            [--notes-file agents/<agent>/session/digest-notes.md] \
            --out agents/<agent>/session/fleet-digest.md \
            --html-out agents/<agent>/session/fleet-digest.html

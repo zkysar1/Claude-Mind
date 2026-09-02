@@ -141,6 +141,21 @@ SessionStart sources too, where Path A is skipped):
 | **C** — hung-autocompact | `_check_hung_autocompact` | A compact/resume that never progressed | STALE |
 | **D** — wedged-loop (g-328-23) | `_check_wedged_loop` | Loop wedged behind a storage-layer `_fileops.acquire_lock` failure: the execution-diary's most-recent marker is an unclosed `phase_start` past `runner_heartbeat.wedge_stale_minutes` (65min, > `stale_minutes` by the g-328-25 invariant) | **FRESH** |
 
+Path C keys on the `compact-in-flight` sentinel (written by
+`precompact-serialize.sh` with the compacting SID; consumed by
+`session-save-id.sh` on the `source=compact` resume). Two guards keep it from
+killing a loop that resumed and kept working (g-357-51, 2026-09-02 — the
+2026-09-01 fleet yank, where a rate-limit backoff stretched one compaction past
+the consumer's 10-min window and the lingering sentinel fired Path C 60 min
+later): `session-save-id.sh` clears a sentinel whose content equals the
+resuming SID regardless of age (only a FOREIGN SID keeps the <10-min rule), and
+`_check_hung_autocompact` suppresses — consuming the sentinel and writing an
+`action: suppressed` / `path: C` verdict row (with the two mtimes as
+`evidence`) to `recovery-log.jsonl` through `_recovery_log_entry`, the same
+shape as a Path A veto — when
+`execution-diary.jsonl` is newer than the sentinel, because a post-compact
+diary write proves the round-trip completed.
+
 Path D is the mirror image of Paths A/C: it keys on a **FRESH** heartbeat. The
 2026-07-04 own-cloud fleet-wedge (g-328-19 #4/#5) is its origin — a wedged loop
 keeps re-ticking the DDB heartbeat (which is a simple put) while diary writes

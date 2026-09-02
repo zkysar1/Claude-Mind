@@ -11,6 +11,16 @@ is the half most likely to rot, so it carries the most cases.
 """
 import importlib.util
 import pathlib
+import sys
+
+# The sweep imports `_paths` at module scope (unblock-parent-status-sweep.py:120).
+# exec_module below runs that import, and this file is ALSO run directly by
+# run-invisible-suites.sh, where core/scripts/tests/conftest.py never loads — so
+# without this insert the direct run dies at collection with
+# ModuleNotFoundError: No module named '_paths' while pytest passes (conftest.py
+# already inserts the same directory). Scoped to this module, matching the
+# sibling spec_from_file_location tests. ()
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 _SPEC = importlib.util.spec_from_file_location(
     "ups", pathlib.Path(__file__).resolve().parents[1] / "unblock-parent-status-sweep.py")

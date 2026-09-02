@@ -2388,10 +2388,14 @@ def _notify_critical_memory(subject: str, message: str) -> dict:
     """Best-effort human alert through the FRAMEWORK notification chokepoint.
 
     Routes via notify-user.sh, which resolves the domain's transport slot --
-    core never names an address or a transport (domain-free-examples.md). The
-    probe already dedups on transition, and notify_dispatch applies its own
-    prior-outreach and duplicate gates, so this cannot become a per-tick mail
-    loop.
+    core never names an address or a transport (domain-free-examples.md).
+    The probe's box-local alert state (MemoryHeadroomProbe._save_box_state)
+    is the ONLY thing standing between this call and a per-tick mail loop:
+    notify_dispatch's duplicate gate fingerprints the first 400 chars of the
+    body, and every tick's numbers differ, so it never matches; and the
+    category is decision-needed, which is always sent. Until 2026-09-02 the
+    dedup rode the per-agent tick state, which is mirrored across boxes and
+    re-armed on every cross-box tick -- measured 1,696 emails in four days.
 
     FAIL-OPEN, always: a watchdog that dies because email is down is worse
     than the condition it was reporting. Every failure mode is captured into
@@ -2516,9 +2520,99 @@ class MemoryHeadroomProbe(Probe):
 
     name = "memory-headroom"
 
+    # Re-alert cadence while the box STAYS over: one human email per episode,
+    # then at most one every REALERT window. Override (seconds, > 0) with
+    # AGENT_WATCHDOG_MEM_REALERT_SECONDS.
+    REALERT_ENV = "AGENT_WATCHDOG_MEM_REALERT_SECONDS"
+    REALERT_DEFAULT_SECONDS = 6 * 3600
+    BOX_STATE_NAME = "watchdog-memory-alert.json"
+
     def __init__(self, ctx: WatchdogContext) -> None:
         super().__init__(ctx)
         self.over = False
+        self._last_alert_ts: Optional[float] = None
+        self._load_box_state()
+
+    # ── box-local alert state ────────────────────────────────────────────────
+    # Memory pressure is a property of the BOX, but tick state is persisted
+    # per AGENT (watchdog-prev-state.json under agents/<agent>/session/), and
+    # that directory is mirrored across boxes. An agent whose Bodies tick on
+    # two hosts alternates the file between over=True (the starved host) and
+    # over=False (the healthy one), so the "emit once per episode" dedup
+    # re-armed on nearly every tick. Measured 2026-09-02 (outreach ledger):
+    # 1,696 "Memory pressure on <box>" decision-needed emails in four days
+    # (662 / 392 / 252 / 390), 332 of one day's from a single agent, and the
+    # user's real mail was buried under them. The alert state therefore lives
+    # in core/logs/ (box-local, never synced) and is keyed by nothing but the
+    # box. Fail-open at every step: an unreadable or unwritable state file
+    # degrades to the in-process behaviour, never to a crash.
+    #
+    # Under pytest the file is NOT written unless BOX_STATE_DIR_ENV points at
+    # a directory: the probe tests build their context on the REAL project
+    # root (a tmp root does not carry the worker-shaped state they need), so
+    # an induced-pressure test would otherwise stamp over=True into the live
+    # box's file and silence a genuine alert for a whole re-alert window.
+    # Same shape as the daemon-spawn refusal under PYTEST_CURRENT_TEST
+    # (): a test that wants the file says where, loudly.
+    BOX_STATE_DIR_ENV = "AGENT_WATCHDOG_BOX_STATE_DIR"
+
+    def _box_state_path(self) -> Optional[Path]:
+        override = os.environ.get(self.BOX_STATE_DIR_ENV, "").strip()
+        if override:
+            return Path(override) / self.BOX_STATE_NAME
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        root = getattr(self.ctx, "project_root_path", None)
+        if root is None:
+            return None
+        return Path(root) / "core" / "logs" / self.BOX_STATE_NAME
+
+    def _load_box_state(self) -> None:
+        path = self._box_state_path()
+        if path is None:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                st = json.load(f) or {}
+            self.over = bool(st.get("over", False))
+            ts = st.get("last_alert_ts")
+            self._last_alert_ts = float(ts) if isinstance(ts, (int, float)) else None
+        except (OSError, ValueError, TypeError):
+            return
+
+    def _save_box_state(self, triggers: list) -> None:
+        path = self._box_state_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"over": self.over, "last_alert_ts": self._last_alert_ts,
+                           "triggers": triggers, "box": _box_id()}, f)
+            os.replace(tmp, path)
+        except OSError:
+            return
+
+    @classmethod
+    def _realert_seconds(cls) -> float:
+        raw = os.environ.get(cls.REALERT_ENV, "").strip()
+        if raw:
+            try:
+                v = float(raw)
+                if v > 0:
+                    return v
+            except ValueError:
+                pass
+        return float(cls.REALERT_DEFAULT_SECONDS)
+
+    def _realert_due(self, now: float) -> bool:
+        # An episode with no stamp (state restored from an older writer) is
+        # NOT due: unknown must fail towards silence, since silence is bounded
+        # by the recovery transition and noise is bounded by nothing.
+        if self._last_alert_ts is None:
+            return False
+        return (now - self._last_alert_ts) >= self._realert_seconds()
 
     def check(self) -> list[Event]:
         total_kb = _mem_total_kb()
@@ -2589,8 +2683,15 @@ class MemoryHeadroomProbe(Probe):
             "triggers": triggers,
         }
 
-        if triggers and not self.over:
+        now = time.time()
+        # First tick over = a new episode; still over after the re-alert window
+        # = remind. Everything in between is silent: the ledger already holds
+        # the alert, and a second email teaches the reader to ignore the first.
+        realert = bool(triggers and self.over and self._realert_due(now))
+        if triggers and (not self.over or realert):
             self.over = True
+            self._last_alert_ts = now
+            payload["realert"] = realert
             if "swap_exhausted" in triggers:
                 why = (f"swap {payload['pct_swap_free']}% free "
                        f"(floor {payload['swap_floor_pct']}%) — the kernel is "
@@ -2632,6 +2733,7 @@ class MemoryHeadroomProbe(Probe):
                     "sent": False,
                     "reason": f"{type(exc).__name__}: {exc}"[:200],
                 }
+            self._save_box_state(triggers)
             return [Event(
                 probe=self.name, event="memory_pressure", severity="critical",
                 payload=payload, include_processes=True, summary=summary,
@@ -2646,6 +2748,7 @@ class MemoryHeadroomProbe(Probe):
         if (self.over and not triggers and proc_recovered and avail_recovered
                 and swap_recovered):
             self.over = False
+            self._save_box_state([])
             return [Event(
                 probe=self.name, event="memory_pressure_cleared", severity="info",
                 payload=payload,
@@ -2657,11 +2760,17 @@ class MemoryHeadroomProbe(Probe):
         return []
 
     def to_dict(self) -> dict:
-        return {"over": self.over}
+        return {"over": self.over, "last_alert_ts": self._last_alert_ts}
 
     def from_dict(self, state: dict) -> None:
-        if state:
+        # The per-agent tick state is mirrored across boxes and cannot describe
+        # THIS box's memory; the box-local file (loaded in __init__) is the
+        # truth wherever it exists. Honour the per-agent value only where no
+        # box-local store is available (a context without a project root).
+        if state and self._box_state_path() is None:
             self.over = bool(state.get("over", False))
+            ts = state.get("last_alert_ts")
+            self._last_alert_ts = float(ts) if isinstance(ts, (int, float)) else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -26,4 +26,14 @@ source "$CORE_ROOT/scripts/_platform.sh" 2>/dev/null || true
 # by running .py file directly so sys.stdin gets the hook JSON payload, not
 # the script body. (The earlier all-bash heredoc approach had python3 read
 # the heredoc as its script AND lost the hook payload.)
-exec python3 "$CORE_ROOT/scripts/presence-tick.py"
+#
+# STORAGE_BACKEND=local: this hook touches ONLY machine-local paths
+# (presence/ is sync-excluded; team-state/diary/changelog resolve to the local
+# cache), so it never needs the remote-storage client. Inheriting the box's
+# remote-storage default made every fire instantiate the remote backend
+# (client + credential setup) — measured ~0.16s of pure init on a fast box and
+# multiple seconds on a slow one, where a fire can approach this hook's 5s
+# timeout and be killed. Forcing the local backend cuts backend init to
+# ~0.001s with byte-identical output (goal_id/phase/append are local either
+# way), restoring the intended local-only fast path. ()
+exec env STORAGE_BACKEND=local python3 "$CORE_ROOT/scripts/presence-tick.py"

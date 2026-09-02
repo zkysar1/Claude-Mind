@@ -155,7 +155,7 @@ Two script families — world (default) and agent — operate on separate queues
 | Script | Purpose |
 |--------|---------|
 | `aspirations-claim.sh <goal-id> [agent-name]` | Atomically claim a goal for an agent |
-| `aspirations-release.sh <goal-id> [--source world\|agent]` | Release a claimed goal |
+| `aspirations-release.sh <goal-id> [--source world\|agent] [--reason <text>] [--reason-kind <token>]` | Release a claimed goal; `--reason` records WHY, `--reason-kind` types it (see *Typed release negatives*) |
 | `aspirations-complete-by.sh [--source world\|agent] <goal-id> [agent-name]` | Mark goal completed with agent attribution |
 
 Agent name defaults to `$MIND_AGENT` for claim and complete-by.
@@ -168,6 +168,50 @@ agent-queue release that omits the flag silently resolves the wrong queue and
 strands the claim — which is precisely why the flag is written out in the table
 above rather than left implicit.
 
+#### Typed release negatives (`--reason-kind`, g-115-8163)
+
+A release records a NEGATIVE — "this agent, on this box, did not complete this
+goal" — in the goal's `release_negatives` array. `--reason` has always carried
+the narrative; `--reason-kind` carries the one token a consumer can actually
+query on:
+
+| token | means |
+|---|---|
+| `locus` | the remaining step needs a machine this box is not |
+| `capability` | a credential, tool or permission this agent lacks |
+| `role` | the actor who must act is someone else (often a person) |
+| `not-due` | timing — a window, a wait, a cadence not yet elapsed |
+| `progress` | real progress landed; the goal is still valid and unfinished |
+| `other` | none of the above fits |
+
+**Why a token and not a better classifier.** Classifying the prose was tried and
+MEASURED: over the 52 live reason strings, the over-matching locus regex returned
+8 matches with 3 true (62.5% false-positive) and the under-matching one returned
+3 while missing every row gated on a GUI-only tool — those name no host at
+all, so a hostname pattern cannot see them. One row reading *"this box can still run
+this goal ... NOT FOR LOCUS"* MATCHES the locus regex. No threshold fixes that;
+only the releasing agent knows the kind, so only the releasing agent can assert it.
+
+Three properties worth not re-deriving:
+
+1. **`locus` and `capability` are deliberately NOT one token.** A credential
+   barrier does not clear by moving boxes (the fleet shares its IAM principals),
+   so a consumer that conflates them re-routes work to boxes that also cannot run
+   it. Merging them is the natural "simplification" a later reader will reach for.
+2. **Absent means UNMEASURED, never "no barrier."** Every row predating the flag
+   carries no `kind`, so a consumer must fail OPEN on absence. Reading absent as
+   "not locus" would silently mark the entire backlog as locus-clear.
+3. **The wrapper nudges but never refuses.** `--reason` without `--reason-kind`
+   prints an advisory to stderr and proceeds. Refusing would strand a claim, which
+   is far worse than an untyped row — a release must never fail closed.
+
+The vocabulary is duplicated in exactly two places, `_REASON_KINDS` in
+`core/scripts/aspirations-release.sh` and `RELEASE_REASON_KINDS` in
+`mind_api/src/endpoints/aspirations_write.py`. They are pinned equal by an
+AST-based parity test (`core/scripts/tests/test_release_reason_kind.py`), because
+a shell/daemon constant pair otherwise drifts silently — the wrapper would refuse
+a token the daemon accepts, or forward one it drops.
+
 #### Claim Protocol (Goal Lifecycle)
 
 World goals MUST be claimed before execution to prevent duplicate work across agents.
@@ -178,7 +222,7 @@ be released with `--source agent` or it outlives the session.
 | Step | Script | When |
 |------|--------|------|
 | **Claim** | `aspirations-claim.sh <goal-id>` | Before Phase 4 execution (world goals) |
-| **Release** | `aspirations-release.sh <goal-id> --source {source}` | On execution failure, infrastructure failure, goal revert, or session end |
+| **Release** | `aspirations-release.sh <goal-id> --source {source} --reason "<why>" --reason-kind <token>` | On execution failure, infrastructure failure, goal revert, or session end |
 | **Complete-by** | `aspirations-complete-by.sh <goal-id>` | On verified completion (Phase 5.3) |
 
 **Rules:**
@@ -409,6 +453,59 @@ prioritization pull months out — enough to bias selection toward deadline-boun
 without overriding near-term urgency (3/2/1) or `priority` weight. Omitting `deadline`
 leaves scoring byte-identical to the pre-g-318-04 behavior (the inherited value is
 `None`, so `remaining` is `None` and `deadline_urgency` is 0).
+
+## Self-Generated Aspirations: `supply_evidence` and the aspiration-supply gate
+
+An aspiration the agent invents for itself — the all-blocked B2 → create-aspiration
+from-self path, B6.7 blocker-pattern synthesis, complete-review replacement
+generation — is the one class of record where the writer had no external signal
+and every incentive to fill an empty queue. The daemon's add endpoint runs
+`core/scripts/gates/aspiration_supply.py` (gate id `aspiration-supply-gate`,
+g-357-82 / g-357-83) on every aspiration BEFORE the per-goal gates. It fires when
+`origin_signal` contains any of `idle_supply.gated_origin_patterns`
+(`all_blocked`, `all-blocked`, `idle_fallback`, `blocker_pattern`,
+`constraint-aware`, `successor`, `replacement`, …) or when `motivation` is
+successor-shaped ("Replace(s) completed X with Y") under ANY origin — a
+replacement for completed work is self-generated by construction, and stamping
+it `user_directive` is an origin misattribution the gate refuses. User-directed
+and board-derived aspirations return `gated: false` and are untouched.
+
+Aspiration-level fields (all optional on user-directed records, REQUIRED on
+gated ones):
+
+```yaml
+supply_evidence:
+  gap: string       # >= 40 chars — what is MISSING, concretely (file, node, capability, user-visible outcome)
+  needle: string    # >= 30 chars — what the user can do or see once this lands
+  checked: [string] # >= 2 entries that EXIST: asp-/g- ids in the store, tree node keys,
+                    # files under world/ meta/ agents/ or the project root, msg-/rb-/guard-/sig-/pq- ids,
+                    # hypothesis ids (YYYY-MM-DD_slug). URLs and category labels are not referents.
+created_at: ISO     # stamped by the add endpoint (setdefault — transplant callers keep their own)
+created_by_agent: s # stamped from the request's agent header; both feed the daily cap
+```
+
+Checks, in order (all must hold): `origin_misattributed`, `supply_evidence_missing`,
+`gap_unspecified` / `needle_unspecified`, `referents_unverified`, `blocker_as_gap`
+(the motivation's first sentence or the gap is blocker-shaped — "X is human-blocked
+/ awaiting approval / until access is restored"; a blocked lane is a reason to wait,
+not to build adjacent work; `Unblock:`-titled aspirations are exempt because they
+target the blocker itself), `overlaps_active` (≥ `overlap_threshold` of the
+candidate's distinctive tokens already belong to an ACTIVE aspiration → file goals
+under it), `overlaps_archived` (same against a completed/retired one, allowed only
+when that id is in `checked`), `daily_cap` (`max_self_generated_per_agent_per_day`).
+Refusal shape: HTTP 400 `{"error": "aspiration_supply_blocked", "gate":
+"aspiration-supply-gate", "gate_output": {failures[], overlaps[], remedy}}`.
+
+Override: `aspirations-add.sh --override-supply "<why>"` (header
+`X-Mind-Override-Supply`; `--override-all` fans into it) — audited to
+`world/aspiration-supply-overrides.jsonl` and to the bulk ledger. Reserved for
+user/operator-directed re-filing; the from-self path never overrides.
+Pre-flight the same evaluator on a candidate with
+`echo '<json>' | py -3 core/scripts/aspiration-supply-gate.py --output human`
+(rc 0 pass / 1 block / 2 usage). Thresholds: `core/config/aspirations.yaml`
+→ `idle_supply`. Tests: `core/tests/gates/test_aspiration_supply_gate.py`
+(replay of the deployment portfolio that motivated the gate),
+`mind_api/tests/test_runtime_aspiration_supply_gate.py` (daemon wiring).
 
 ## Goal-ID Argument Convention (unified)
 

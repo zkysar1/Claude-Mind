@@ -259,17 +259,17 @@ def _split_simple_commands(tokens: list[str]) -> list[list[str]]:
     return cmds
 
 
-def _git_commit_argv(cmd: list[str]) -> list[str] | None:
-    """Return the argv AFTER `commit` when `cmd` really is a `git commit`.
+def _git_subcommand_argv(cmd: list[str], sub: str) -> list[str] | None:
+    """Return the argv AFTER git's OWN subcommand `sub`, else None.
 
-    `commit` must be git's OWN subcommand — argv[0]'s basename is git, and
-    `commit` is the first non-option word after any leading env assignments and
-    any git GLOBAL options. Returns None otherwise, so a bare `commit` token
-    appearing as a grep pattern, a filename, or heredoc prose can never arm
-    Form A. That conflation is the whole defect (g-115-4695): the gate matched
-    `commit` anywhere in the flat token stream, so a pipeline with no git
-    invocation at all — `grep -n "commit" f | grep -i "git" | head` — refused
-    on the `-n`/`-rn` of an unrelated grep.
+    argv[0]'s basename must be git, and `sub` must be the first non-option word
+    after any leading env assignments and any git GLOBAL options. A bare
+    `commit` or `config` token appearing as a grep pattern, a filename, or
+    heredoc prose can therefore never arm a form. That conflation is the whole
+    defect (g-115-4695): the gate matched `commit` anywhere in the flat token
+    stream, so a pipeline with no git invocation at all — `grep -n "commit" f |
+    grep -i "git" | head` — refused on the `-n`/`-rn` of an unrelated grep.
+    Form D had the same shape until g-115-8672 (see scan_command).
     """
     i = 0
     while i < len(cmd) and _ENV_ASSIGN_RE.match(cmd[i]):
@@ -285,9 +285,14 @@ def _git_commit_argv(cmd: list[str]) -> list[str] | None:
             i += 1
         else:
             break
-    if i < len(cmd) and cmd[i].lower() == "commit":
+    if i < len(cmd) and cmd[i].lower() == sub:
         return cmd[i + 1:]
     return None
+
+
+def _git_commit_argv(cmd: list[str]) -> list[str] | None:
+    """Return the argv AFTER `commit` when `cmd` really is a `git commit`."""
+    return _git_subcommand_argv(cmd, "commit")
 
 
 def find_override(tokens: list[str]) -> str | None:
@@ -322,32 +327,40 @@ def scan_command(command: str) -> list[tuple[str, str]]:
         return []
 
     findings: list[tuple[str, str]] = []
-    lowered = [t.lower() for t in tokens]
 
     # ── Form D: persistent config writes (self-contained; no commit needed) ──
-    if "config" in lowered:
-        cfg_idx = lowered.index("config")
-        after = tokens[cfg_idx + 1:]
-        after_lower = [t.lower() for t in after]
-        if "core.hookspath" in after_lower:
-            key_pos = after_lower.index("core.hookspath")
-            flags = {t for t in after_lower[:key_pos] if t.startswith("-")}
-            value = after[key_pos + 1] if key_pos + 1 < len(after) else None
-            if "--unset" in after_lower or "--unset-all" in after_lower:
+    # Scoped to ONE SIMPLE COMMAND whose argv[0] is git, exactly as Forms A-C
+    # are (). The flat-stream scan this replaced read the token AFTER
+    # `core.hooksPath` as the VALUE across a `;` / `&&` boundary, so the
+    # read-only `git config core.hooksPath; echo x` was DENIED as a config-write
+    # with value ';' (measured 2026-09-02, ) — and a `config` token in
+    # an UNRELATED command (`grep config core.hooksPath notes.txt; git status`)
+    # armed it with `notes.txt` as the value.
+    for cmd in _split_simple_commands(tokens):
+        cfg = _git_subcommand_argv(cmd, "config")
+        if cfg is None:
+            continue
+        cfg_lower = [t.lower() for t in cfg]
+        if "core.hookspath" not in cfg_lower:
+            continue
+        key_pos = cfg_lower.index("core.hookspath")
+        flags = {t for t in cfg_lower[:key_pos] if t.startswith("-")}
+        value = cfg[key_pos + 1] if key_pos + 1 < len(cfg) else None
+        if "--unset" in cfg_lower or "--unset-all" in cfg_lower:
+            findings.append((
+                "config-unset",
+                "git config --unset core.hooksPath — on this repo that DISABLES "
+                "the 9-gate chain (it lives at core.hooksPath=core/githooks)",
+            ))
+        elif value is not None and not value.startswith("-") \
+                and "--get" not in flags and "--get-all" not in flags:
+            if value.replace("\\", "/").strip("/") != CANONICAL_HOOKS_PATH:
                 findings.append((
-                    "config-unset",
-                    "git config --unset core.hooksPath — on this repo that DISABLES "
-                    "the 9-gate chain (it lives at core.hooksPath=core/githooks)",
+                    "config-write",
+                    f"git config core.hooksPath {value!r} — persistent hook "
+                    "redirection away from core/githooks",
                 ))
-            elif value is not None and not value.startswith("-") \
-                    and "--get" not in flags and "--get-all" not in flags:
-                if value.replace("\\", "/").strip("/") != CANONICAL_HOOKS_PATH:
-                    findings.append((
-                        "config-write",
-                        f"git config core.hooksPath {value!r} — persistent hook "
-                        "redirection away from core/githooks",
-                    ))
-            # bare key / --get reads: diagnostic, approved.
+        # bare key / --get reads: diagnostic, approved.
 
     # Forms A/B/C are COMMIT-SCOPED, and the scope is one SIMPLE COMMAND — not
     # the whole line (). Each is evaluated only against a simple

@@ -276,6 +276,22 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
         return rc
     if rc != RC_SENT:
         _log(note)
+        # Ledger the FAILURE too (2026-09-02). Until now only successes and
+        # duplicates were recorded, so a refused delivery left no trace and a
+        # census of the ledger could not tell "sent" from "never arrived" --
+        # which is exactly how a day of statusCode-403 refusals (the 2026-09-01
+        # recipient allowlist vs the user's own address) read as 25 sent emails.
+        # The row is marked delivery_failed so find_prior never treats it as
+        # prior outreach. Best-effort: a ledger write must not mask the rc.
+        try:
+            rec = outreach.build_record(agent=agent, category=category, subject=subject, body=body,
+                                        goal_id=goal_id, transport=transport_path(world).name, rc=rc,
+                                        to=to_shape_src, override_reason=allow_duplicate)
+            rec["delivery_failed"] = True
+            rec["transport_note"] = note
+            outreach._append(outreach.ledger_path(world), rec)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"ledger write for the failed send skipped: {exc}")
         return rc
 
     # 5. record + mirror

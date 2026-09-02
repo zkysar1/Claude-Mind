@@ -223,8 +223,14 @@ def test_owncloud_pull_own_cloud_invokes_pull_continuity(running_daemon, monkeyp
     # off" from "the endpoint never passed it", and off-by-default is the whole
     # behavior being pinned -- the temp/ sweep is what pushed the /start pull
     # past its own RT_CURL_TIMEOUT (cc-04: scanned 1590, 164.6s vs a 90s ceiling).
-    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False):
-        calls.append((agent, dry_run, only, include_temp))
+    # `adopt_store` () is the THIRD instance of that shape, and the one
+    # where a silent default matters most: it DROPS a manifest baseline so S3
+    # overwrites the local mirror, so "the endpoint never passed it" and "the
+    # endpoint passed None" must stay distinguishable. None here is the safe
+    # default -- an adopt must be asked for explicitly, never inferred.
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False,
+                  adopt_store=None):
+        calls.append((agent, dry_run, only, include_temp, adopt_store))
         return {"agent": agent, "scanned": 16, "pulled": 2, "in_sync": 11,
                 "would_pull": 0, "s3_absent": 3, "local_ahead_skipped": 0,
                 "multipart_deferred": 0, "errors": 0,
@@ -245,7 +251,9 @@ def test_owncloud_pull_own_cloud_invokes_pull_continuity(running_daemon, monkeyp
     assert body["agent"] == "alpha"
     assert body["pulled"] == 2
     assert body["pulled_files"] == ["handoff.yaml", "working-memory.yaml"]
-    assert calls == [("alpha", False, None, False)]  # include_temp OFF by default
+    # include_temp OFF and adopt_store None by default -- neither is ever
+    # inferred; an adopt is opt-in per path ().
+    assert calls == [("alpha", False, None, False, None)]
 
 
 def test_owncloud_pull_with_temp_query_param_opts_in(running_daemon, monkeypatch):
@@ -260,8 +268,9 @@ def test_owncloud_pull_with_temp_query_param_opts_in(running_daemon, monkeypatch
 
     fake_sync = types.ModuleType("owncloud_sync")
 
-    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False):
-        calls.append((agent, only, include_temp))
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False,
+                  adopt_store=None):
+        calls.append((agent, only, include_temp, adopt_store))
         return {"agent": agent, "scanned": 1590, "pulled": 0, "in_sync": 1590,
                 "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
                 "multipart_deferred": 0, "errors": 0, "pulled_files": []}
@@ -278,7 +287,55 @@ def test_owncloud_pull_with_temp_query_param_opts_in(running_daemon, monkeypatch
         port, "/v1/admin/owncloud-pull?agent=alpha&with_temp=1", agent="alpha")
     assert status == 200
     assert body["ok"] is True
-    assert calls == [("alpha", None, True)]
+    assert calls == [("alpha", None, True, None)]
+
+
+def test_owncloud_pull_adopt_store_query_param_propagates(running_daemon, monkeypatch):
+    """: ?adopt_store=a,b reaches pull_continuity as a SET.
+
+    Twin of the default-None pin above, and required for the same reason the
+    with_temp pair is: a handler that hardcoded adopt_store=None would pass the
+    default test while silently discarding the caller's request. That failure is
+    not cosmetic here -- it is the exact shape observed live on cc-09, where a
+    daemon running older code accepted the query param, ignored it, and returned
+    a normal no-clobber pull with rc=0 while the wedge stood. The wrapper now
+    refuses that case (rc=6), but the endpoint half is pinned HERE.
+
+    Parsed as a SET, matching `only`: order is meaningless and duplicates are
+    not a second adopt.
+    """
+    _, port = running_daemon
+    calls = []
+
+    fake_sync = types.ModuleType("owncloud_sync")
+
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False,
+                  adopt_store=None):
+        calls.append((agent, only, adopt_store))
+        return {"agent": agent, "scanned": 1, "pulled": 1, "in_sync": 0,
+                "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
+                "multipart_deferred": 0, "errors": 0, "pulled_files": ["h.yaml"],
+                "adopt_store": ["h.yaml"], "adopted": ["h.yaml"]}
+
+    fake_sync.pull_continuity = fake_pull  # type: ignore[attr-defined]
+    fake_backend_mod = types.ModuleType("storage_backend")
+    fake_backend_mod.get_backend = lambda: object()  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "owncloud_sync", fake_sync)
+    monkeypatch.setitem(sys.modules, "storage_backend", fake_backend_mod)
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+
+    status, body = _post(
+        port,
+        "/v1/admin/owncloud-pull?agent=alpha&only=h.yaml&adopt_store=h.yaml",
+        agent="alpha")
+    assert status == 200
+    assert body["ok"] is True
+    assert calls == [("alpha", {"h.yaml"}, {"h.yaml"})]
+    # The endpoint must SPREAD the adopt receipts back onto the wire -- the
+    # wrapper's coverage line and its non-zero exit both read these keys, and an
+    # absent field can BE the zero (guard-2018).
+    assert body["adopted"] == ["h.yaml"]
 
 
 def test_owncloud_pull_error_returns_500(running_daemon, monkeypatch):
@@ -291,7 +348,8 @@ def test_owncloud_pull_error_returns_500(running_daemon, monkeypatch):
     # and this test passes having never reached the RuntimeError it exists to
     # exercise -- green for the wrong reason (). The assertion below
     # names "S3 down" for exactly that reason.
-    def boom(be, agent, *, dry_run=False, only=None, include_temp=False):
+    def boom(be, agent, *, dry_run=False, only=None, include_temp=False,
+             adopt_store=None):
         raise RuntimeError("S3 down")
 
     fake_sync.pull_continuity = boom  # type: ignore[attr-defined]
@@ -325,7 +383,8 @@ def test_owncloud_pull_fail_closed_manifest_returns_200_ok_false(running_daemon,
 
     fake_sync = types.ModuleType("owncloud_sync")
 
-    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False):
+    def fake_pull(be, agent, *, dry_run=False, only=None, include_temp=False,
+                  adopt_store=None):
         return {"agent": agent, "scanned": 0, "pulled": 0,
                 "error": "session-manifest untrustworthy — pulled nothing (fail-closed)"}
 

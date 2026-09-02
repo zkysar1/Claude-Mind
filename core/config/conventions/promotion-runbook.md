@@ -54,12 +54,22 @@ exit 2 as a work list, not a blocker override prompt:
 - Parallel evolution is common: dest and frontier often fix the same defect
   independently. When the frontier's form is equal-or-better, carry NOTHING —
   record the finding in the force ledger instead.
+- When the work list reconciles to NOTHING to carry (all parallel evolution, or
+  the frontier's own later refactors of previously-planted lines), the hop still
+  needs `PROMOTE_ALLOW_DRIFT=1`: `promote-to-upstream.sh` hard-fails on preflight
+  exit 2 by design, so an EMPTY work list does not clear the gate. Set it only
+  with the reconcile ledger written and cited in the PR body — measured v2.12.5
+  and v2.12.47 (2026-09-02), both with zero unexplained residue.
 
 ## Phase 2 — Cut the release
 
 `release.sh {patch|minor|major} --summary "..."` then
-`git push origin main --tags`. release.sh is the sole tag creator and never
-pushes.
+`git push origin main vX.Y.Z` — push the ONE tag by name. `--tags` uploads every
+local tag, and a fleet box carries many that are not releases: measured 2026-09-02,
+`0.0.1`–`0.0.6` and `archive/alpha-stash-*` stash-archive tags went to origin under
+`--tags` beside v2.12.47 — harmless, but every clone now pulls them. release.sh is the
+sole tag creator and never pushes; an untracked file (an agent health ledger, a
+scratch note) counts as DIRTY to its dry-run — commit it as a `chore:` first.
 
 ## Phase 3 — Hop: promote one step down
 
@@ -181,11 +191,14 @@ back-ported-in-commit-X / superseded-by-Y). The two 2026-08-01 forces (18/18
 and 108/108 decomposed) are the reference shape. An unexplained residue means
 DO NOT force.
 
-**Known structural fact:** a staging repo with no resident agents can only
-ever produce DEST-FROZEN or SEED-MOTION flags, yet the plan will still block
-every run whose release modified previously-planted files — i.e., nearly all
-of them. Until the auto-excusal lands inside the plan itself, expect one
-mechanical force per staging hop.
+**Auto-excusal is LIVE inside the plan (g-115-4389, 5bbfb7ac7e, 2026-08-28).**
+A staging repo with no resident agents can only ever produce DEST-FROZEN or
+SEED-MOTION flags, and the plan now excuses those itself: the v2.12.47 hop
+(2026-09-02) auto-excused 134 SEED-MOTION flags and returned SAFE with no force
+— the first hop since this runbook was written that needed none. A
+DO-NOT-PROMOTE verdict on a staging hop is therefore no longer routine: treat
+it as an AUTHORED-residue signal and run the triage above. (Until 2026-08-28
+this paragraph said to expect one mechanical force per staging hop.)
 
 ## Phase 5 — Post-plant verification at a living dest
 
@@ -238,6 +251,19 @@ Run every item; each is a one-liner and each has caught a real defect:
    A reported site is not automatically a defect: the transform working as
    designed lands here too — both survivors of the measured 4,829 -> 2
    reduction were exactly that (rb-6267). Read each site.
+10. Executable bits by GIT INDEX MODE, not by the plant's own stats (guard-5806):
+    diff the 100755 path sets of `git ls-tree -r vX.Y.Z` (source) and
+    `git ls-tree -r <merge-sha>` (dest); every planted source-executable path
+    must be 100755 at the dest. From a Windows box the plant's chmod carry
+    (g-360-13) is a silent no-op — `core.fileMode=false` — so NEW scripts land
+    100644 while seed-verify reports FAILS 0; measured v2.12.47 (2026-09-02),
+    15 files, restored at staging by the mode-only commit bf497ec. Since
+    g-360-16 the plant carries the bit at the GIT level after its `git add -A`
+    (`_seed_engine.py carry-exec-bits`, fail-closed rc=11) and seed-verify
+    Check 8 compares source index vs destination index (`verify-exec-bits`,
+    FAIL). This item stays as the independent read: `py -3
+    core/scripts/_seed_engine.py verify-exec-bits --source <worktree> --dest
+    <dest>` prints `stripped: []` on a clean hop.
 
 ## Phase 6 — Handoff
 

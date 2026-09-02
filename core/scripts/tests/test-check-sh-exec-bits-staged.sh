@@ -55,6 +55,12 @@ new_repo() {
     printf 'k\n' > "$d/core/scripts/keep.sh"
     chmod +x "$d/core/scripts/orig.sh" "$d/core/scripts/keep.sh"
     git -C "$d" add -A
+    # Set the mode in the INDEX too: on a core.fileMode=false clone (git's
+    # Windows default) the chmod above never reaches it, and the seed scripts
+    # -- and the copied gate itself -- would be committed at 100644, which is
+    # the defect under test, not the fixture.
+    git -C "$d" update-index --chmod=+x core/scripts/orig.sh core/scripts/keep.sh \
+        core/scripts/check-sh-exec-bits.sh
     git -C "$d" commit -qm seed
     echo "$d"
 }
@@ -160,6 +166,36 @@ if [[ $RC -eq 0 ]] && grep -q 'OK: all' <<<"$OUT"; then
     pass "default filesystem mode still reports OK"
 else
     fail "default mode: expected rc=0 and 'OK: all', rc=$RC out=$OUT"
+fi
+rm -rf "$R"
+
+# --- 9: default mode on a core.fileMode=false clone reads the INDEX ---------
+# Git's default on Windows. There a chmod never reaches the index and the
+# filesystem answer is noise (: 2 false positives and 15 false
+# negatives measured on one box), so the default mode must switch to the index,
+# name the 100644 script, and pass once the INDEX mode is fixed.
+R="$(new_repo)"
+git -C "$R" config core.fileMode false
+printf 'n\n' > "$R/core/scripts/new.sh"
+chmod +x "$R/core/scripts/new.sh"
+git -C "$R" add core/scripts/new.sh
+git -C "$R" update-index --chmod=-x core/scripts/new.sh
+git -C "$R" commit -qm "new at 100644"
+OUT="$(cd "$R" && bash core/scripts/check-sh-exec-bits.sh 2>&1)"
+RC=$?
+if [[ $RC -ne 0 ]] && grep -q 'core/scripts/new.sh' <<<"$OUT" && grep -q 'INDEX' <<<"$OUT"; then
+    pass "fileMode=false: default mode reads the index and names the 100644 script"
+else
+    fail "fileMode=false refuse: expected rc!=0 naming new.sh via the INDEX, rc=$RC out=$OUT"
+fi
+git -C "$R" update-index --chmod=+x core/scripts/new.sh
+git -C "$R" commit -qm "fixed in the index"
+OUT="$(cd "$R" && bash core/scripts/check-sh-exec-bits.sh 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q 'OK: all' <<<"$OUT" && grep -q 'index' <<<"$OUT"; then
+    pass "fileMode=false: index modes fixed -> OK, and it says which instrument it used"
+else
+    fail "fileMode=false allow: expected rc=0 'OK: all' naming the index, rc=$RC out=$OUT"
 fi
 rm -rf "$R"
 

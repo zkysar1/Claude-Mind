@@ -85,10 +85,46 @@
 # a machine-moved agent does not auto-resume its temp/ docs; pass --with-temp to
 # fetch them (nothing is deleted — the objects stay in S3).
 #
+# --adopt-store <a.yaml[,b.jsonl]> () drops the MANIFEST BASELINE for
+# those continuity files before the freshness gate runs, so the S3 copy is
+# adopted as canonical. It is the remedy for exactly one shape: THREE-WAY
+# DIVERGENCE, local md5 != baseline md5 != S3 md5. The no-clobber gate reads
+# that as "local has unpushed writes" and skips it as `local_ahead`, and it does
+# so FOREVER -- nothing below the pull re-derives a baseline, so a poisoned
+# baseline is a PERMANENT wedge rather than a transient skip. Measured
+# 2026-09-02: cc-09 and cc-13 carry the IDENTICAL poisoned baseline md5
+# (08ae6a83...), so the defect is not box-specific; 40 continuity files across
+# five agents were pull-skipped on one box, alpha/foxtrot/zeta working-memory.yaml
+# all three-way diverged. Hand-writing the file instead is refused by guard-996
+# (class (b) governed mirror, no reconciler below the write) -- that dead end is
+# what this flag replaces.
+#
+# THIS IS NOT THE --only WIDENING DECLINED ABOVE. Adopt names are matched
+# against the continuity set exactly as --only names are, so the invariant holds
+# unchanged: it can never widen the pull or reach a non-continuity path. What it
+# changes is the BASELINE for a file already in scope, not the scope.
+#
+# It adds NO new overwrite path: dropping the baseline routes the file into the
+# pull's EXISTING no-baseline branch, which snapshots local to .history BEFORE
+# refreshing (archive-before-delete) and re-stamps the baseline from what it
+# fetched, so the wedge clears. There is deliberately NO --dry-run here: this
+# endpoint does not expose pull_continuity's dry_run (only the sibling
+# owncloud-sync-file does), so do NOT reach for one. The pre-check is
+# `backend-cat.sh head <path>`, which prints the store version+size beside the
+# local mirror's and is how you establish WHICH SIDE to keep before adopting.
+#
+# PER-PATH OPT-IN, NEVER A SWEEP -- and REFUSED with --all-agents for that
+# reason. `local != baseline` alone does NOT prove three-way divergence; some
+# skipped files carry genuinely unpushed local writes where the skip is CORRECT
+# and adopting would DESTROY them. Establish that S3 is the side to keep (e.g.
+# `backend-cat.sh head <path>`), then name that one path, on that one agent.
+#
 # Usage: bash core/scripts/owncloud-pull.sh [--agent <name>]
 #        bash core/scripts/owncloud-pull.sh --all-agents
 #        bash core/scripts/owncloud-pull.sh --all-agents --only pending-questions.yaml
 #        bash core/scripts/owncloud-pull.sh --agent <name> --with-temp
+#        bash core/scripts/owncloud-pull.sh --agent <name> --only working-memory.yaml \
+#             --adopt-store working-memory.yaml   # unwedge a poisoned baseline
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
@@ -99,17 +135,30 @@ AGENT=""
 ALL_AGENTS=""
 ONLY=""
 WITH_TEMP=""
+ADOPT_STORE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --agent) AGENT="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --all-agents) ALL_AGENTS=1; shift;;
         --only) ONLY="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --with-temp) WITH_TEMP=1; shift;;
+        --adopt-store) ADOPT_STORE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         *) echo "[owncloud-pull] unknown arg: $1" >&2; exit 2;;
     esac
 done
 if [ -n "$ALL_AGENTS" ] && [ -n "$AGENT" ]; then
     echo "[owncloud-pull] ERROR: --all-agents and --agent are mutually exclusive" >&2
+    exit 2
+fi
+# --adopt-store is deliberately NOT available fleet-wide (). Adopting
+# S3 over a local divergence is only safe once someone has established, for THAT
+# path on THAT agent, that S3 is the side to keep -- and `local != baseline`
+# alone does not establish it. A fleet form would apply one such judgement to
+# every agent at once, which is the sweep the design forbids.
+if [ -n "$ALL_AGENTS" ] && [ -n "$ADOPT_STORE" ]; then
+    echo "[owncloud-pull] ERROR: --adopt-store is per-agent only; it is refused with --all-agents." >&2
+    echo "[owncloud-pull]   Adopting S3 over a local divergence needs a per-path judgement that S3 is" >&2
+    echo "[owncloud-pull]   the side to keep. Re-run with --agent <name> for each agent you have checked." >&2
     exit 2
 fi
 
@@ -243,6 +292,7 @@ _do_call() {
     local _q="agent=$(rt_url_encode "$1")"
     [ -n "$ONLY" ] && _q="$_q&only=$(rt_url_encode "$ONLY")"
     [ -n "$WITH_TEMP" ] && _q="$_q&with_temp=1"
+    [ -n "$ADOPT_STORE" ] && _q="$_q&adopt_store=$(rt_url_encode "$ADOPT_STORE")"
     rt_call POST /v1/admin/owncloud-pull --query "$_q"
 }
 
@@ -429,7 +479,7 @@ if [ -z "$PYLAUNCH" ]; then
     exit 0
 fi
 pyrc=0
-SUMMARY="$(RESPONSE="$RESPONSE" $PYLAUNCH - <<'PYEOF'
+SUMMARY="$(RESPONSE="$RESPONSE" ADOPT_REQ="$ADOPT_STORE" $PYLAUNCH - <<'PYEOF'
 import json, os, sys
 try:
     r = json.loads(os.environ["RESPONSE"])
@@ -464,6 +514,34 @@ if only and not r.get("scanned", 0):
     print("[owncloud-pull] NOTHING WAS SCANNED: the --only scope matched no "
           "continuity file, so pulled=0 means 'never looked', NOT 'in sync'.")
     sys.exit(4)
+# --adopt-store COVERAGE (), same discipline as --only above: report
+# what the flag LOCATED beside what it did, and never let a request that adopted
+# NOTHING exit 0 -- a caller unwedging a baseline reads rc=0 as "adopted".
+adopt_req = [n.strip() for n in (os.environ.get("ADOPT_REQ") or "").split(",")
+             if n.strip()]
+adopted = r.get("adopted")
+# The ENDPOINT is the contract (guard-2374): this wrapper being able to SEND
+# --adopt-store proves nothing about whether anything honoured it. A daemon
+# running older code accepts the query param, ignores it, and returns a normal
+# no-clobber pull -- no `adopted` key, no adopt line, rc=0, wedge intact.
+# Measured live while building this lane, against a not-yet-recycled daemon.
+# So key off what WE SENT, and treat a missing echo as the failure it is.
+if adopt_req and adopted is None:
+    print("[owncloud-pull] --adopt-store was SENT but the response carries no "
+          "'adopted' field — this daemon does not implement it (stale process, "
+          "or an older build). NOTHING was adopted; the baseline is unchanged.")
+    sys.exit(6)
+if adopted is not None:
+    requested = r.get("adopt_store") or []
+    amiss = r.get("adopt_requested_missing") or []
+    print(f"[owncloud-pull] --adopt-store: baseline dropped for "
+          f"{len(adopted)}/{len(requested)} name(s)"
+          + (f": {', '.join(adopted)}" if adopted else ""))
+    if amiss:
+        print("[owncloud-pull] --adopt-store: NOT IN THE SCANNED CONTINUITY "
+              f"SET, nothing adopted: {', '.join(amiss)}")
+    if not adopted:
+        sys.exit(5)
 sys.exit(2 if errs else 0)
 PYEOF
 )" || pyrc=$?
@@ -482,6 +560,24 @@ case $pyrc in
     4) echo "$SUMMARY"
        echo "[owncloud-pull] ERROR: --only matched no continuity file — nothing was pulled and nothing was CHECKED." >&2
        echo "[owncloud-pull]   Name a file from the continuity set (session-manifest.yaml, sync_tier: continuity), or drop --only for the full pull." >&2
+       exit 2;;
+    # 5 = --adopt-store named only files the scanned continuity set does not
+    # contain, so NO baseline was dropped and the wedge this call existed to
+    # clear is still there. Same class as 4 (a vacuous invocation, nothing
+    # FAILED) and exits 2 for the same reason: rc=0 would read as "adopted".
+    # 6 = the wrapper sent --adopt-store and the endpoint did not echo it back,
+    # i.e. nothing honoured the flag. rc 2 (usage/config: recycle the daemon,
+    # `mind-api-start.sh --restart`) rather than 1 — no pull FAILED, the lane
+    # simply was not there. Exiting 0 was the observed defect.
+    6) echo "$SUMMARY"
+       echo "[owncloud-pull] ERROR: --adopt-store was not honoured by the daemon — nothing adopted." >&2
+       echo "[owncloud-pull]   The daemon is serving code without the adopt_store lane. Recycle it:" >&2
+       echo "[owncloud-pull]     bash core/scripts/mind-api-start.sh --restart" >&2
+       exit 2;;
+    5) echo "$SUMMARY"
+       echo "[owncloud-pull] ERROR: --adopt-store adopted NOTHING — no baseline was dropped." >&2
+       echo "[owncloud-pull]   Name a file from the continuity set (session-manifest.yaml, sync_tier: continuity)," >&2
+       echo "[owncloud-pull]   and if --only is also set, the name must be inside that scope too." >&2
        exit 2;;
     *) echo "[owncloud-pull] (raw) $RESPONSE"; exit 0;;
 esac

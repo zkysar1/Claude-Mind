@@ -17,9 +17,13 @@
 #   2-8   usage / pre-flight refusal / build-plan / swap faults
 #   9     destination commit REFUSED (e.g. a dest pre-commit hook) — 
 #   10    post-plant verification FAILED — 
+#   11    exec-bit carry into the destination INDEX failed (git-level carry
+#         after `git add -A`; a plant that cannot prove its modes must not
+#         commit them) — 
 #   20/21 --plan verdicts only (REVIEW REQUIRED / DO NOT PROMOTE) — 
-# 9 and 10 sit above the pre-existing 2-8 range and clear of the plan verdicts so
-# a refusal can never be read as a usage error or as a blast-radius verdict.
+# 9, 10 and 11 sit above the pre-existing 2-8 range and clear of the plan
+# verdicts so a refusal can never be read as a usage error or as a blast-radius
+# verdict.
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
@@ -494,6 +498,31 @@ if [ $DO_COMMIT -eq 1 ] && [ -e "$DEST/.git" ]; then
     # in iteration-commit.sh:1105 / release.sh Step 9) does not apply here; the
     # transplant intends to capture ALL planted + post-action files in one commit.
     git -C "$DEST" add -A
+    # : carry the executable bit at the GIT level, now that the add has
+    # staged the planted files. The copy step's chmod carry () is only
+    # as real as the filesystem: on a Windows clone (core.fileMode=false) it is
+    # a silent no-op, and `git add` records every NEW file at 100644 while the
+    # copy counters still say "carried" -- measured on the v2.12.47 hop, 15
+    # files. The index mode is the one that propagates, so set it there
+    # directly (`git update-index --chmod=+x`) and re-read the index to prove
+    # it. Fail CLOSED (exit 11 — see the EXIT CODES block): a plant that cannot
+    # prove its modes must not commit them. stderr goes to a file, not a `2>&1`
+    # capture, so the JSON parse below never reads hook chatter as data
+    # (guard-659 shape).
+    CARRY_ERR="$(mktemp)"
+    set +e
+    CARRY_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" carry-exec-bits --source "$PROJECT_ROOT" --dest "$DEST" 2>"$CARRY_ERR")"
+    CARRY_RC=$?
+    set -e
+    if [ $CARRY_RC -ne 0 ]; then
+        echo "[seed-transplant] FAIL: exec-bit carry into the destination index failed (rc=$CARRY_RC, g-360-16):" >&2
+        printf '%s\n' "$CARRY_JSON" | tail -8 >&2
+        tail -5 "$CARRY_ERR" >&2
+        rm -f "$CARRY_ERR"
+        exit 11
+    fi
+    rm -f "$CARRY_ERR"
+    echo "$CARRY_JSON" | py -3 -c 'import sys, json; d = json.load(sys.stdin); print("[seed-transplant] exec bits in destination index: %s set to 100755, %s already executable, %s source-executable path(s) not planted" % (d.get("updated", 0), d.get("already_executable", 0), d.get("not_in_dest", 0)))'
     TS="$(date +%Y-%m-%d)"
     # Generic, public-safe commit message — source path / repo name MUST NOT
     # appear here. The destination is a publication target; commits show on

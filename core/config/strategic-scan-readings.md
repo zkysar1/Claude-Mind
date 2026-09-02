@@ -27,6 +27,7 @@ WHOLLY in this ledger; the SKILL.md keeps the METHOD and a pointer.
 #   2026-08-30T08:5x  **5 of 31**  bravo (`hostname` cc-05, `uname -r` 6.8.0-137-generic)  opened 31/31; **THE NUMERATOR ROSE 2 -> 5 AND TWO THIRDS OF IT IS THE NET WIDENING, NOT NEW DRIFT** — first row in TEN DAYS (the 08-20 pair above is the prior). Members: the SAME TWO (`solver-v0-audits` distill, `infrastructure-performance` decompose) PLUS `v2-directed-steering-ship-log` + `v2-directed-steering-wiring` (**both `node_split`**) and `env-agnostic-exploration-primitives` (`distill`). `node_split` joined STRUCTURAL_TRIGGERS on **2026-08-22, AFTER the 08-20 prior**, and that change's own blast-radius measurement recorded "node_split 2 fleet-wide, BOTH inside the stale screen (2/30 -> 4/30)" — these are those two, named. So 2 of the 3 arrivals were PREDICTED by the widening and exactly ONE (`env-agnostic-exploration-primitives`) is genuine new structural drift; a reader taking 2 -> 5 as drift would over-read it 3x. Split **31 raw / 6 re-verify / 25 suspect**, total **1528**, EXPLORE **55**. Histogram {31:1,35:1,40:1,42:1,43:1,44:2,46:1,49:8,50:8,57:1,61:1,63:1,90:1,101:1,102:1,112:1}. **DENOMINATOR COINCIDENTALLY IDENTICAL AT 31 WHILE MEMBERSHIP TURNED OVER — do not read the equality as stability.** The 08-20 cohorts {39:8,40:10} age to {49:8,50:10} today; I measure {49:8,**50:8**}, so TWO nodes exited that cohort, and 08-20's {137:1} would read {147:1} and is ABSENT — three exits (WORK, per the 08-16T22:1x rule) offset by three calendar arrivals. A ten-day gap makes bucket arithmetic the only way to see that; the bare 31 -> 31 hides it completely, which is a case neither the rise-is-calendar nor the fall-is-work rule covers — **a HOLD can be turnover, and only the buckets say so.** **RE-VERIFY COHORT MOVED FOR THE FIRST TIME: 8 -> 6**, ending a run this roster recorded unbroken for sixteen consecutive readings (08-11 .. 08-20), so the "every arrival lands in suspect" regularity no longer holds either; overstatement 31 vs 25 (+24%), the LOWEST recorded here (was +35% on 08-20). `content_verified` present on **0 of 31** — corroborating zeta's 08-20 finding that null `content_verified` is the NORM in this population and cannot discriminate a stamp-bump exit. Screened at the CONFIGURED 30d read from aspirations.yaml; g-115-1420 guard passed (55 EXPLORE of 1528). Routed nothing — owned by g-115-4132 / g-115-5198 / g-115-5462.
 #   2026-08-31T00:1x  **5 of 31**  echo (`hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud)  opened 31/31; **INDEPENDENT CROSS-BOX CONFIRMATION OF THE ROW ABOVE, ~16h LATER, AND THE ONLY THING THAT MOVED WAS THE CALENDAR.** Members byte-identical to bravo's 08-30 five (`solver-v0-audits` distill, `infrastructure-performance` decompose, `v2-directed-steering-ship-log` + `v2-directed-steering-wiring` node_split, `env-agnostic-exploration-primitives` distill); split **31 raw / 6 re-verify / 25 suspect**; total **1528**; EXPLORE **55**; `content_verified` present on **0 of 31**. Histogram {32:1,35:1,41:1,43:1,44:1,45:2,47:1,50:8,51:8,58:1,62:1,64:1,91:1,102:1,103:1,113:1} = bravo's buckets **+1 on every bucket, no entrant and no exit** — so the 2 -> 5 rise it recorded is not a one-box parse, and I re-derived its decomposition independently before reading it (the two `node_split` members share ONE split event, `g-315-341` echo 2026-07-12, which is the same-age/same-trigger CLUSTER the S2a block tells you to look for; `node_split` joined STRUCTURAL_TRIGGERS 2026-08-22, AFTER the 08-20 prior, so the comparable-to-prior numerator is **3**, not 5). **ITS ONE ADDITION: `total` HELD AT 1528 ACROSS THE INTERVAL** — every prior confirmation pair in this roster carried tree growth (+1 to +15) alongside an unmoved stale set, and this is the first with growth EXACTLY ZERO. The denominator's independence from tree growth has been demonstrated at several positive growth rates; the null case had never been measured, and a reader who had only seen the growth rows could not tell whether the stale set was stable *despite* growth or *because* the two move together. They do not. Screened at the CONFIGURED 30d read from aspirations.yaml:713; g-115-1420 guard passed (55 EXPLORE of 1528). Routed nothing — owned by g-115-4132 / g-115-5198 / g-115-5462, all re-verified `pending` this pass, and the 8-node count in g-115-5462's TITLE is superseded by this roster, not by a sixth goal.
 #   2026-09-01T08:5x  **5 of 31**  echo (`hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud, `time_cadence`)  opened 31/31; **SAME-BOX REPEAT ~32.7h AFTER THE ROW ABOVE — THE FIRST ROSTER PAIR SPANNING MORE THAN 24h, AND THAT ALONE BREAKS THE '+1 ON EVERY BUCKET' TEST EVERY PRIOR PAIR RELIED ON.** Members byte-identical to the 08-30/08-31 five (`solver-v0-audits` distill, `infrastructure-performance` decompose, `v2-directed-steering-ship-log` + `v2-directed-steering-wiring` node_split, `env-agnostic-exploration-primitives` distill) — SIXTEENTH consecutive reading with the membership set unmoved counting the 2->5 turnover as one event; split **31 raw / 6 re-verify / 25 suspect** (identical, overstatement +24%); `content_verified` **0 of 31**; screened at the CONFIGURED 30d from aspirations.yaml; g-115-1420 guard passed (54 EXPLORE of 1537). Histogram {33:1,37:1,42:1,44:1,45:1,46:2,48:1,51:8,52:8,59:1,63:1,65:1,92:1,103:1,104:1,114:1}. **TWO ADDITIONS.** (1) THE ONE BUCKET THAT DOES NOT MATCH `+1` IS A TRANSCRIPTION ERROR IN THE ROW ABOVE, NOT AN ENTRANT/EXIT HERE — and it is settled by arithmetic, not by judgement. 15 of 16 buckets are 08-31 +1; the sixteenth reads 35 -> **37**. There is exactly ONE stale node in that neighbourhood — `lambda-user-and-data-management`, `last_updated: 2026-07-26`, and nothing at 34/35/36/38 — so its age is forced: 35 on 08-30 (bravo's row, correct), **36** on 08-31, 37 today. The 08-31 row therefore wrote 35 where its own stated claim ('+1 on every bucket, no entrant and no exit') required 36; bravo's 08-30 row and this one are both right and the intermediate transcription is wrong. Note the SHAPE: the claim is prose and the histogram it certifies is prose, so nothing could contradict the other — the same hand-maintained-cell-with-no-writer class as the fresh-eyes shard-index off-by-three (guard-2421 positive-control lineage). **BEFORE READING ANY BUCKET MISMATCH AS DRIFT, RESOLVE THE BUCKET TO A NODE AND DO THE DATE ARITHMETIC** — one lookup, and it is the only check that can outvote a transcribed control. (2) A NEW INDEPENDENCE RESULT THE ROSTER HAD NOT MEASURED: **EXPLORE FELL 55 -> 54 while `total` ROSE 1528 -> 1537 (+9) and the stale set did not move by one member or bucket.** Prior rows established the denominator's independence from tree GROWTH (several positive rates) and from class ENTRY; a class EXIT had never been observed, and it is the direction that could plausibly have shrunk the screen. It did not — the node that left EXPLORE was not one of the stale 31, i.e. graduation happens out of the FRESH part of the class. Also restores growth after the 08-31 row's null-growth case, so growth and the stale set are now shown independent in both directions within one box-pair. Routed nothing — owned by g-115-4132 / g-115-5198 / g-115-5462, all re-verified `pending` this pass (titles still say 9 / 8 nodes; superseded by this roster, not by a sixth goal), and g-115-4840 `pending` for the S2b/S4a duplicate pile.
+#   2026-09-02T18:3x  **5 of 31**  bravo (`hostname` cc-05, `uname -r` 6.8.0-137-generic, own-cloud, `time_cadence`)  opened 31/31; **SEVENTEENTH consecutive reading with the membership set unmoved**, and the cleanest `+1 on every bucket` pair in the roster — every one of the 16 buckets matches echo's 09-01T08:5x row exactly +1, with no entrant and no exit, so the transcription error that row had to resolve by date-arithmetic does not recur here. Members byte-identical to the 08-30/08-31/09-01 five (`solver-v0-audits` distill, `infrastructure-performance` decompose, `v2-directed-steering-ship-log` + `v2-directed-steering-wiring` node_split, `env-agnostic-exploration-primitives` distill); split **31 raw / 6 re-verify / 25 suspect** (overstatement +24%, unchanged for a fourth reading); screened at the CONFIGURED 30d read from aspirations.yaml; g-115-1420 guard passed (55 EXPLORE of 1556). Histogram {34:1,38:1,43:1,45:1,46:1,47:2,49:1,52:8,53:8,60:1,64:1,66:1,93:1,104:1,105:1,115:1}. **ITS ONE ADDITION IS THE MIRROR OF THE ROW ABOVE'S: EXPLORE ROSE 54 -> 55 while `total` rose 1537 -> 1556 (+19) and the stale set did not move by one member or bucket.** That row measured a class EXIT (55 -> 54) and established that graduation happens out of the FRESH part of the class; this measures a class ENTRY in the same conditions and the screen is equally unmoved, so the entrant also landed in the fresh part. The denominator's independence from class membership is now demonstrated in BOTH directions on consecutive days, where before it was established for entry (08-12) and exit (09-01) ten weeks and one day apart respectively — i.e. never as a matched pair. Routed nothing — owned by g-115-4132 / g-115-5198 / g-115-5462; the node counts in their titles remain superseded by this roster, not by a sixth goal.
 ```
 
 ## S2a stale-EXPLORE roster — readings 2026-08-18 and earlier (migrated 2026-08-24)
@@ -9142,6 +9143,47 @@ while the aspiration axis is not: rb-4502 exactly — the two axes disagree and 
 category axis is the one giving false comfort. S3c: HIGH 12/26 = 46.2% (under 0.70),
 `completed_unarchived` 0 — no `portfolio_health_signal` written.
 
+## 2026-09-02T08:2x — foxtrot (`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud), scan_trigger=time_cadence (starved 6x — dispatched under the g-115-6564 override)
+
+**S2a — 5 of 31 at 30d, opened 31/31.** Numerator 2 -> **5**, and the members
+moved, which this roster says is signal: `solver-v0-audits` (distill) and
+`infrastructure-performance` (decompose) still present; `v2-directed-steering-
+ship-log` + `v2-directed-steering-wiring` (node_split — the pair the 2026-08-22
+zeta census placed inside the screen) now both past 30d; and ONE genuinely new
+member, `env-agnostic-exploration-primitives` (distill). Age histogram
+{34:1,38:1,43:1,45:1,46:1,47:2,49:1,52:8,53:8,60:1,64:1,66:1,93:1,104:1,105:1,115:1}
+— the re-verify cohort now sits at 52-53d (16 nodes at 52-53; trigger buckets
+re-verify 6, refresh 5, knowledge_reconciliation 3, distill 2, node_split 2,
+goal_completion 2, decompose 1, others 1 each). `content_verified` present on
+0/31. Split: **31 raw / 6 re-verify / 25 suspect.** Total 1552, EXPLORE 55.
+Not routed (owned 5x; g-115-5462 is the newest pending owner).
+
+**S3 — full corpus** (`aspirations-compact.json` 1256133 B, `goals_omitted` absent
+on 27/27): n=2252 pending/in-progress across 27 active aspirations, 238
+categories. axis1 framework-architecture 772/2252 = **34.3%** passes; axis1b
+framework-* 1369/2252 = **60.8%** (37 labels) passes; axis2 asp-115 1847/2252 =
+**82.0%** FIRES — confirmation of the standing property, routed nothing.
+Absolute: **asp-115 = 1847, a new recorded high** (prior 1827, foxtrot 2026-09-01).
+S3c HIGH 13/27 = 0.48, completed_unarchived 0 — no portfolio_health_signal.
+
+**S4.6 — 0 candidates at BOTH `--min-failures 2` and `1`, members 0,
+`ceiling_ratio` 0.0654 (1854 of 28368)** — the HIGHEST in this ledger, and the
+per-agent map says why: alpha's slice on this box is `08-05T18:05..08-26T06:30`
+(1696 of 5529 in span, 15 windows) while bravo/echo/zeta still sit on the
+08-05T17:35..08-06T02:12 batched seed (43/46/47 in span) and foxtrot (resident)
+reads `09-01T11:51..09-02T08:11` (22 of 5259, 5 windows). One wide peer pull
+moved the ratio 8x; the band's upper bound is now ~0.065. Still coverage, not
+skill quality — `failing_count 1` at the ledger vs 0 surfaced. Routed nothing.
+
+**S1 — census reproduces g-115-3215: 4 of 10 sensors DROPPED at `mine < 2`**
+(g-335-09 mine 0 / fleet 33; g-306-284 0/48; g-326-609 0/1; g-115-1538 1/55);
+g-115-105 unread (loop dropped the un-terminated last line of the sensor list —
+`while read` gotcha). Negative control g-999-999 = 0 on all stores. The only
+mine == fleet row is g-326-85 (101/101, foxtrot-private by construction): its
+last three entries (#166, #170, #174) all carry **prod FAIL 0 steps on the owned
+key halt** while dev/ppe PASS — a standing red, owned by g-350-108's human leg,
+not re-filed. S4.5: 0 new / 2 dedup-suppressed. S4b: rb-8483 (roblox-integration,
+retrieved 11x, v2 0.0; 34/79 mature) stored as LOW.
 ---
 
 ### 2026-09-02T07:0x — alpha, `hostname` cc-04, `uname -r` 6.8.0-138-generic, own-cloud, world `ayoai-mind`
@@ -9195,3 +9237,169 @@ FIRES** — 1832 absolute, a new recorded high (prior 1827, this box 2026-09-01)
 property. S3c HIGH 12/26 = 46.2%, `completed_unarchived` 0 — no signal written.
 **S3b** no uncovered Self priority at title level: server/backend, ML, infra, CI/CD,
 framework and all four PRODUCT FOCUS lanes (asp-363/364/368/369) carry active work.
+
+### 2026-09-02T08:0x — zeta, `hostname` cc-02, `uname -r` 6.8.0-138-generic, own-cloud, world=ayoai-mind (`time_cadence`)
+
+⛔ **NEW BAND MAXIMUM, AND "the peer seed is STABLE across days" IS FALSIFIED FOR A
+LIVE PEER — S4.6 `ceiling_ratio` **0.092** (2610 of 28380), ~15x the row directly
+above (0.0063, 178 of 28367) taken on THIS SAME BOX minutes earlier (invocations
+moved only 28367 -> 28380).** Above the previously recorded top of 0.087, and ~10x
+the ~0.0026-0.009 band.
+
+The mechanism is visible in one field: **alpha's local diary slice was REPLACED
+between the two readings**, `09-01T10:25..09-02T07:02` (~21h) -> **`08-01T23:29..09-01T19:13`
+(~31 DAYS)**, taking `invocations_in_diary_span` to **2488/5536 = 44.94%** where
+every peer row ever recorded here sat at 0.3-1.1%. Note the span END moved
+BACKWARD while the START moved back a month — a re-pull serving a different
+version, not an extension. Peers unchanged and narrow: bravo 49/6015 (0.81%),
+echo 39/5323 (0.73%), foxtrot 29/5253 (0.55%), zeta (resident) 5/6253 (0.08%,
+`09-02T07:07..07:47`).
+
+**Two standing claims this row moves.** (1) The stability claim is scoped, not
+general: peer SEED slices are stable across days (three foxtrot rows), but a slice
+can be swapped wholesale in MINUTES under the own-cloud read-through cache — so
+the repeat-on-one-box discriminator holds only while no re-pull lands between the
+two reads. Record `diary_first`/`diary_last` on BOTH reads, not just the ratio.
+(2) The verdict is unchanged and that is the point: **0 candidates at BOTH
+`--min-failures 2` and `1`, distinct failing-goal members 0**, ledger
+`failing_count: 6`. A zero at 9.2% coverage is a materially stronger negative than
+the same zero at 0.63%, but it is still not fleet-conclusive — three peers remain
+under 1%. Read the 6-vs-0 gap as coverage, never as suppression working. Routed
+nothing.
+
+**S2a / S2b / S3 — REPRODUCTIONS, recorded as confirmation, not as new rows.**
+S2a **5 of 31** structural, opened 31/31, members and age histogram
+(`{34:1,38:1,43:1,45:1,46:1,47:2,49:1,52:8,53:8,60:1,64:1,66:1,93:1,104:1,105:1,115:1}`)
+byte-identical to the row above, including the `v2-directed-steering-*` `node_split`
+pair. S2b 51/55 = 92.7%. S3 full corpus (26 active, n=**2249**, `goals_omitted` absent
+= full): axis1 34.3% / axis1b 60.9% (**37** framework-* labels, up from 36) /
+**axis2 asp-115 82.1% FIRES at 1847 absolute** — a new recorded high (prior 1832),
++17 goals and +15 asp-115 in ~1h, non-115 flat at 402. Still growing, still
+confirmation of a standing property. S3c HIGH 12/26 = 46%. Routed nothing (owned by
+g-115-4132 / g-115-5198 / g-115-5462 and g-115-4840).
+
+**S1 fleet census — top-10 sensors, presence-count only.** The inline-parse route is
+REFUSED by the direct-store-parse gate (`grep -c` presence checks are permitted; the
+PARSE is not), so this census carries counts and no timestamps — the
+local-newest-vs-fleet-newest half of the marker's ask is NOT expressible under the
+gate and was not attempted. **10 of 10 sensors are cross-agent and my local share is a
+minority in every one.** 2 DROPPED (`mine<2`): `g-326-609` 0/2, `g-306-284` **1/55**
+(alpha holds 53). Sharpest skew is `g-326-85` **3/120** (foxtrot holds 108 = 90%).
+Also `g-115-15` 26/115, `g-115-817` 24/80, `g-115-105` 3/28. g-115-3215 confirmed
+live; routed nothing.
+
+**S4.5** 0 new gaps, 0 dedup-suppressed, 0 rb-245-suppressed (2249 open goals, 3264
+source files scanned) — the common case. **S4b** `framework-maintenance`: scanned 443 /
+mature 125 / **candidates 52**, top `rb-7696` (retrieved 5x, `utilization_score_v2`
+0.0) — a real fire under the recalibrated predicate, stored as the single LOW signal.
+**S4a** not computed: known confound (disjoint vocabularies), owned by
+g-115-3246/4600/5435.
+
+### 2026-09-02T12:5x — foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud, world=ayoai-mind (`time_cadence`) — CONFIRMATION ROW
+
+**S2a** 5 of 31 structural, opened 31/31, threshold 30d — age histogram and members BYTE-IDENTICAL to this box's 08:2x row and zeta's 08:0x row (`env-agnostic-exploration-primitives` 34d distill, `infrastructure-performance` 53d decompose, `solver-v0-audits` 66d distill, `v2-directed-steering-ship-log` / `-wiring` 52d node_split). Split raw 31 / re-verify 6 / suspect 25; `content_verified` present on 0. **S2b** 51/55 = 92.7%. Routed nothing (g-115-4132/5198/5462, g-115-4840).
+
+**S3** full corpus (`goals_omitted` absent; compact mtime 12:54): **27 active** (asp-005 back in the active set, 1 pending), n=2271 (per-agent; not cross-box comparable), 234 categories. axis1 framework-architecture 34.2% passes / axis1b framework-* 61.0% (37 labels) passes / **axis2 asp-115 82.3% FIRES at 1868 absolute** — a new recorded high: +21 in ~5h against zeta's 08:0x 1847, non-115 402 -> 403. Still growth, still confirmation of a standing property. S3c HIGH 13/27 = 48%, completed_unarchived 0.
+
+**S1** top-5 sensors, `mine/fleet` via `MIND_AGENT=<peer> experience-read.sh --goal` (script route, so timestamps ARE expressible — the 08:2x row's "not expressible under the gate" applied to the inline parse, not to the per-agent script call): `g-115-315` 0/6 DROPPED; `g-306-284` 0/50 DROPPED (alpha 50); `g-115-817` 3/69, local newest 08-05 vs fleet 09-01; `g-115-754` 7/34, local 08-04 vs fleet 08-31; **`g-326-85` 102/102 — the one sensor this box holds whole**, and it carries a real S1a REGRESSION: #174 ppe PASS-degraded -> #175 ppe DEGRADED then SYSTEM HALTED at step 144 (`[ball_physics_start][POST_BATCH]` TestBall_Moving never appeared). **Already owned: g-326-798**, filed at the #175 close — recorded as confirmation, not routed. prod FAIL is the g-350-108 human leg. g-115-3215 blindness reproduced on 4 of 5.
+
+**S4.5** 0 new / 0 filed / 2 dedup-suppressed (2269 open goals, 3278 source files). **S4b** `roblox-integration`: scanned 198 / mature 79 / candidates 34, top `rb-8483` (retrieved 11x, v2 0.0) — stored as the LOW signal. **S4a** confound 60/72, not computed further. **S4.6** read-only: **0 candidates at both `--min-failures 2` and `1`**, distinct members 0 (undecidable), ledger `failing_count` 4; `ceiling_ratio` **0.0648** (1846 of 28504) — alpha's slice here spans 08-05T18:05..08-26T06:30 (1696 in-span, 15 windows) while bravo/echo/zeta sit on the 08-05..08-06 batched seed (43/46/47 in-span) and the resident foxtrot diary is 07:57..12:53 today (14 in-span, 3 windows). Coverage measurement, routed nothing.
+## 2026-09-02T13:0x — zeta, `hostname` cc-02, `uname -r` 6.8.0-138-generic, own-cloud, world=ayoai-mind, `time_cadence`
+
+**S2a — 5 of 31 structural, opened 31/31, a byte-identical REPRODUCTION of the row above**
+(threshold 30d from config; EXPLORE 55 of 1556; age histogram
+`{34:1,38:1,43:1,45:1,46:1,47:2,49:1,52:8,53:8,60:1,64:1,66:1,93:1,104:1,105:1,115:1}`;
+trigger buckets re-verify 6 / refresh 5 / knowledge_reconciliation 3 / distill 2 /
+goal_completion 2 / node_split 2 / 11 singletons; re-verify cohort 6, suspect 25).
+Structural members: `env-agnostic-exploration-primitives` (distill 34d),
+`infrastructure-performance` (decompose 53d), `solver-v0-audits` (distill 66d),
+`v2-directed-steering-ship-log` + `-wiring` (node_split 52d). `content_verified` null on
+all 31. Recorded as confirmation; routed nothing (owned g-115-4132 / 5198 / 5462).
+
+**S3 axes (FULL corpus via `aspirations-read.sh --active` world 19,567,501 B + agent
+116,187 B; `goals_omitted` absent on all 26 = full; 2,773 goal records).** n=**2268**
+pending+in-progress, 233 categories. axis1 `framework-architecture` 776/2268 = **34.2%
+passes** · axis1b `framework-*` 1386/2268 = **61.1% passes** across 37 labels · axis2
+`asp-115` 1868/2268 = **82.4% FIRES**, absolute **1868** (new recorded high; +21 on the
+row above's 1847 in ~4h), non-115 **400** (was 402). Growth still lands in asp-115;
+confirmation of the standing property. S3c HIGH 12/26 = 0.46, completed_unarchived 0.
+S3b: no Self priority without active work. S4a confound 60/72 L2 keys, not routed.
+
+**S4.6 — 0 candidates at BOTH `--min-failures 2` and `1`, distinct members 0, ledger
+`failing_count` 8, `ceiling_ratio` 0.0926 (2636 of 28478).** Same high-coverage regime as
+the row above, and the per-agent map shows WHY the ratio sits an order of magnitude above
+the 0.003–0.009 band: alpha's slice on this box is a MONTH wide (`08-01T23:29 ->
+09-01T19:13`, 2488 of 5560 in span, 24 windows) while bravo/echo/foxtrot still hold the
+08-01/08-02 ~8h batched seed (49/39/29 in span) and zeta (resident) is live
+`09-02T07:07 -> 12:43` (31 in span). One wide peer slice carries the whole ratio. A zero
+at 9.3% coverage is a stronger negative than at 0.7% and still not fleet-conclusive
+(three peers under 1%); read the 8-vs-0 gap as coverage. Routed nothing.
+
+**S1 — 10 of 10 sensors cross-agent; 4 DROPPED (`mine<2`): `g-306-284` 0/50 (alpha),
+`g-326-85` 0/101 (foxtrot), `g-115-105` 0/18, `g-326-516` 0/3.** Local share a minority
+everywhere except `g-001-08` (33/78). CORRECTION to the row above's method note: the
+timestamp half IS expressible under the direct-store-parse gate — presence counts by
+`grep -c` per store, then `MIND_AGENT=<agent> experience-read.sh --goal <id>` per
+holding agent returns `created` + `summary` (50 calls, ~1 min). Fleet-newest per sensor
+all 2026-08-30..09-02. Trends read: `g-326-85` prod FAIL persists across cycles #171/#174/
+#175 (human-blocked API key, foxtrot's lane); `g-115-817` keeps filing HIGH Unblocks from
+CIS-UnauthorizedAPICalls (rb-9958 classes the ayoai-processor+SendCommand form benign);
+`g-335-09` run 60 quiet/cheap, live=0 largely unmeasured; `g-326-516` backstop fires each
+time at 22–27h vs 20h (desktop task OFF). All owned; no HIGH/MEDIUM signal.
+
+**S4.5** 0 new / 0 dedup / 0 rb-245 (the common case). **S4b** `infrastructure`: scanned
+742 / mature 246 / candidates 53, top `rb-8476` (retrieved 12x, v2 0.0, helpful 0) —
+stored as a LOW signal with `thin_knowledge` 51/55 = 92.7% (non-discriminating).
+
+**Net:** stamp written via `verified-wm-set.sh`; 2 LOW signals to WM; nothing filed.
+Instrument note for the next zeta pass: a `cd` inside one Bash call persisted as the
+session cwd and blinded four sibling calls with plausible failures — guard-1012 /
+guard-3047 / guard-903 already carry it; do not `cd` in a compound call.
+#   2026-09-02T12:5x  **34.2 / 61.0 / 82.2**  alpha (`hostname` cc-04, `uname -r` 6.8.0-138-generic, own-cloud, `time_cadence`)  full corpus (`goals_omitted` sum 0 AND key-absent on all 26 active — disambiguated by key-presence per method rule 4, never by the sum alone); n=**2272**, asp-115 absolute **1868**, 37 `framework-*` labels, 237 distinct categories. Axis 2 fires; axes 1 and 1b pass. **BOTH TERMS ROSE TOGETHER, WHICH IS THE CASE THE DILUTION RULE DOES NOT COVER.** Against echo's 08-16T16:32 row (n 2045, asp-115 1642, share 80.3%): the absolute grew **1642 -> 1868 (+226)** and the share grew **80.3% -> 82.2% (+1.9pp)** over 17 days. Every prior roster row was one of the two documented shapes — a rising absolute with a FALLING share (dilution, 08-13) or a falling absolute with a RISING share (the smaller pool draining faster, 08-16). Neither applies: non-115 moved 403 -> 404, i.e. flat to within one goal, so asp-115 absorbed **~99.6% of net new work** in the interval. That is the only reading in this roster where the share movement is not a denominator effect in either direction, and it is the one shape that needs no caveat — method rule 3 says a falling absolute is necessary but not sufficient for remediation; here nothing fell at all. Per method rule 1, `n` is per-agent and not cross-box comparable; the 1642 -> 1868 comparison is on the world-aspiration ABSOLUTE, which is. Treated as CONFIRMATION of the standing property per method rule 2 — **routed nothing** to S5. Kernel note: this box reads 6.8.0-138-generic, one minor version above every prior 6.8.0-137 row; recorded per the record-hostname-and-kernel-verbatim rule, no effect observed. S4.5 0 new / 2 dedup-suppressed. S4.6 **0 candidates at BOTH `--min-failures 2` and `1`** — the undecidable case — with `ceiling_ratio` **0.0058 (164 of 28464)**, inside the ~0.0026-0.009 band, so a COVERAGE measurement and not a skill-quality one; `failing_count: 2` at the ledger level against 0 surfaced, read as coverage and never as suppression working. S1 / S2a / S2b / S4a not routed: known-owned or known-confound per their in-instrument markers.
+
+### 2026-09-02T19:1x — foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud, world=ayoai-mind, `time_cadence` (6.3h since 12:58)
+
+**S2a (30d, opened 31/31): 31 stale EXPLORE, STRUCTURAL 5/31** — `solver-v0-audits`
+(distill 66d), `infrastructure-performance` (decompose 53d),
+`v2-directed-steering-ship-log` + `v2-directed-steering-wiring` (node_split 52d) — the
+four known members — **plus ONE NEW: `env-agnostic-exploration-primitives` (distill,
+34d)**, which crossed the 30d line ~4 days ago carrying a structural stamp (an AGING-IN
+entry, the kind the roster says to expect; numerator 4 -> 5, no parser change). Buckets:
+re-verify 6 / refresh 5 / suspect 25; histogram
+{34:1,38:1,43:1,45:1,46:1,47:2,49:1,52:8,53:8,60:1,64:1,66:1,93:1,104:1,105:1,115:1} —
+the 52-53d cohort of 16 is the old 31d cohort aged 21 days. content_verified 0/31.
+**CROSS-BOX CONTROL: echo (cc-03) attached the SAME 31 raw / 6 re-verify / 25 suspect and
+a byte-identical histogram to `g-115-5462` earlier today** — so the count is a property of
+the corpus, not of this parse; nothing attached, nothing filed (owners g-115-4132 / 5198 /
+5462). S2b 51/55 = 92.7% thin (owned g-115-4840; `depth>=2` inert at 55/55).
+
+**S1 — gate LIVE (summary keyed 93/98, 83 sensors); top-10 census mine/fleet on this
+box: 5 DROPPED (`mine<2`): `g-306-284` 0/52 (alpha), `g-326-589` 0/1, `g-115-7106` 0/2,
+`g-115-1538` 1/34, `g-363-75` 0/2.** Two foxtrot-private sensors fully readable
+(`g-326-85` 102, `g-326-84` 13); three cross-agent sensors whose LOCAL slice trails
+fleet-newest by 27–79 days (`g-115-817` local 08-05 vs echo 09-01; `g-115-105` 06-15 vs
+alpha 08-27; `g-115-15` 07-15 vs zeta 08-29) — owned g-115-3215. Trends: `g-326-85` prod
+FAIL identical across #171/#174/#175 (owned g-350-108, human_blocked on the prod API key
+value), dev/ppe PASS; `g-326-84` 09-02 run produced the ppe ball-physics hypothesis whose
+fix merged as PR #276 at 16:06Z. No regression, no HIGH/MEDIUM signal.
+
+**S3 row (full corpus, `goals_omitted` key ABSENT on 27/27, n=2281, 236 categories,
+compact mtime 18:58):**
+#   2026-09-02T19:1x  **34.2 / 61.2 / 82.0**  foxtrot (`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud, `time_cadence`)  full corpus; asp-115 1871 / non-115 410 (this box's 12:5x row: 1873 / 411 — both terms flat, −2 / −1); framework-* 1397 across 37 labels; axis 2 FIRES = confirmation of the standing property, not routed.
+
+**S4.6** read-only: 0 candidates at `--min-failures 2` AND `1` (undecidable 0-at-both),
+distinct failing members 0, ledger `failing_count` 4; **`ceiling_ratio` 0.0652 (1865 of
+28614) — ABOVE the 0.003–0.009 band**, and the per-agent map says why: alpha's slice on
+this box is now `08-05T18:05 -> 08-26T06:30` (1696 of 5577 in span, 15 windows) while
+bravo / echo / zeta still hold the 08-05 batched seed unchanged for 16 days (43/46/47 in
+span) and foxtrot (resident) is live `09-02T10:28 -> 18:53` (33 in span). One re-pulled
+peer slice carries the whole ratio, exactly as zeta's 13:0x row read for alpha on cc-02.
+Coverage measurement, not skill quality; routed nothing. **S4.5** 0 new / 2 dedup / 0
+rb-245 / 0 filed. **S4b** `diagnostic-methodology`: scanned 11 / mature 1 / candidates 1,
+top `rb-373` (retrieved 171x, v2 0.0247) — stored as a LOW signal with `thin_knowledge`
+and the `g-326-85` prod stagnation. **S4a** CONFOUND 60/72 L2 keys absent (not routed).
+
+**Net:** stamp written first via `verified-wm-set.sh` (landed, verified); 3 LOW signals to
+WM; nothing filed, nothing attached.
+#   2026-09-02T18:1x  **34.1 / 61.1 / 81.9**  alpha (`hostname` cc-04, `uname -r` 6.8.0-138-generic, own-cloud, `time_cadence`)  full corpus (`goals_omitted` sum 0 AND key-absent on all 26 active — key-presence per method rule 4); n=**2289**, asp-115 absolute **1874**, 37 `framework-*` labels, 239 distinct categories. Axis 2 fires; 1 and 1b pass. **SAME-BOX REPEAT ~5.5h AFTER THE 12:5x ROW ABOVE, AND IT HOLDS: 34.2/61.0/82.2 -> 34.1/61.1/81.9.** asp-115 1868 -> 1874 (+6), n 2272 -> 2289 (+17), so non-115 404 -> 415 (+11) and the share fell 0.3pp purely because the smaller pool happened to take 11 of 17 new goals in a five-hour window. **Do NOT read that 0.3pp as remediation, and do not read it as contradicting the 12:5x "~99.6% absorption" finding** — over 5.5h this is sampling noise on a stock with invisible arrivals and drains, and the 17-day comparison that row rests on is unaffected. The repeat's real value is that it makes the 12:5x shape a measurement rather than a moment. Routed nothing (method rule 2). **S4.6 — THE SHARPEST COVERAGE ROW IN THIS LEDGER: `ceiling_ratio` 0.0058 (165 of 28599) against the 12:5x row's 0.0058 (164 of 28464) — IDENTICAL TO FOUR DECIMAL PLACES across 5.5h while `invocations` grew +135.** Same box, same day, spans held; this is the "box-local and stable across hours" claim measured directly instead of inferred across boxes, and it is what licenses the repeat-on-one-box discriminator. 0 candidates at BOTH `--min-failures 2` and `1` (undecidable case), `failing_count: 2` at the ledger level against 0 surfaced — coverage, never suppression working. Live diary spans: alpha (resident) `09-02T09:50..17:42` (29 of 5581 in span), bravo `07-15` (a month and a half stale, 28 of 6062), echo + foxtrot both `08-06`. **S2a 31 stale EXPLORE of 55**, histogram `{34:1,38:1,43:1,45:1,46:1,47:2,49:1,52:8,53:8,60:1,64:1,66:1,93:1,104:1,105:1,115:1}` — the 52/53d pair of 8+8 is the re-verify cohort last recorded at 31/32d, aged exactly as the moving-window account predicts. **I did NOT run the structural front-matter pass, so I report NO structural count** — per this block's own rule a 0 from a partial read is worse than none, and an absent number cannot be mistaken for a clean one. **S2b 51 of 55 = 92.7%**, reproducing echo's 92.2%; `depth >= 2` true for 55/55, still inert. **S4b** `framework-hygiene`: scanned 373 / mature 77 / candidates 15, top `rb-2264` (retrieved 15x, v2 0.0208) — stored as the ONLY routable LOW signal. **S4.5** 0 new / 2 dedup / 0 rb-245. **S3c** did not fire (26 active, 12 HIGH = 46.2%, 0 completed_unarchived). Net: stamp written via `verified-wm-set.sh` and read back; 1 LOW signal to WM; nothing filed.
+#   2026-09-02T18:3x  **34.0 / 61.0 / 81.7**  bravo (`hostname` cc-05, `uname -r` 6.8.0-137-generic, own-cloud, `time_cadence`)  full corpus (loader stderr said the summary was BOUNDED — **2193 of 2312 omitted, 94.9%** — and the full file's `goals_omitted` key is ABSENT on all 27 active, disambiguated by key-presence per method rule 4); n=**2292**, asp-115 absolute **1873**, 37 `framework-*` labels, 237 distinct categories, 27 active aspirations. Axis 2 fires; axes 1 and 1b pass. Treated as CONFIRMATION per method rule 2 — **routed nothing**. **ITS ADDITION IS A METHOD CORRECTION, NOT A DATUM: THE SHARES IN THIS ROSTER ARE NOT CROSS-BOX COMPARABLE EITHER, AND THE ROWS COMPARE THEM ANYWAY.** Against alpha's 09-02T12:5x row (n 2272, asp-115 1868, share 82.2%) taken ~5.5h earlier: the world-aspiration ABSOLUTE moved 1868 -> 1873 (+5) and that comparison is sound per method rule 1. The SHARE appears to fall 82.2% -> 81.7%, and that apparent fall is **not a measurement of anything** — share is asp115/n, method rule 1 states n is per-agent by construction (world + THIS agent's private queue), so a share inherits the same incomparability its own denominator has. My non-115 reads 419 against alpha's 404, and rule 1 explicitly forbids differencing that subtraction across boxes, which is exactly the quantity a share difference is built from. So a 0.5pp cross-box share delta is fully explained by two private queues differing by ~15 goals and requires no portfolio account at all. Rule 1 named the absolute and the subtraction as the unsafe comparisons and stopped short of the ratio, which reads as though the ratio were the safe one — it is the least safe, since it hides the per-agent term in a denominator rather than showing it. **Compare shares only against a reading you took on your OWN box; cross-box, compare the world-aspiration absolute and nothing else.** S4.5 0 new / 2 dedup-suppressed / 0 rb-245. S4.6 **7 candidates at `--min-failures 2`, 10 at `1`** (control DISCRIMINATED, not the undecidable case) but **DISTINCT failing-goal members = 1 -> `g-335-816`**, the same sole member recorded on 08-12/08-14x2/08-15/08-16 and `completed` in the store, so 0 of 1 is a real failure: the confound, reported and **`--apply` deliberately skipped**. `ceiling_ratio` **0.0668 (1911 of 28603)** — the high-coverage regime, carried by alpha's 18-day slice (`08-11T17:56 -> 08-29T14:21`, 1134 of 5577 in span) while bravo (resident) is live-but-narrow (26 in span, 32 windows); `failing_count` 647 against 7 surfaced, read as coverage and never as suppression working. S4b `infrastructure`: scanned 744 / mature 246 / candidates 53, top `rb-8476` (retrieved 12x, v2 0.0) — stored as the one LOW signal. S1 97 sensors pass the `achievedCount>=2` gate; no trend reported, because the cross-agent census rule 3 requires was not run and a local-only read is a claim about this box (owned g-115-3215). S2a / S2b / S4a not routed: known-owned or known-confound per their in-instrument markers.

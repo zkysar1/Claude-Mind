@@ -427,6 +427,25 @@ gates:
 
   # ─── Asymmetry: FN > FP (medium-high) ────────────────────────────────
 
+  - id: generation-phase-gate
+    script: core/scripts/generation_phase_gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/generate-domain-goals/SKILL.md", phase: "Phase 0.5 (demand) + Phase 4.6 (phase)" }
+      - { file: ".claude/skills/create-aspiration/SKILL.md", phase: "Phase A.0b" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: null
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "A valid candidate is refused because the domain's calendar mis-declares its phase windows or category lists. Cheap: generation re-runs next cadence, and the domain owns the file it can correct."
+    fn_description: "Evidence-backed work is generated for a phase that already closed, or supply is invented while unanswered demand sits on the board. Measured: a generation lane created pre-draft strategy work for a league whose draft had happened, while five actionable findings went unconsumed (g-357-48)."
+    rb_evidence: []
+    tuning_notes: "FAIL-OPEN BY CONSTRUCTION at every entry point — absent slot, unparseable calendar, no phase covering now, and unreadable board ALL allow. So on a world with no world/conventions/domain-calendar.md this gate cannot fire at all and its FP rate is structurally zero; a firing count of 0 is therefore evidence about slot adoption, NOT about the gate's calibration. Never count-retire on the firing count alone — check whether any world declares the slot first. The demand half keys on post `type`, never `severity` (zero of 12,147 live posts carry that field, guard-159)."
+    retirement_eligible: false
+
   - id: depends-on-consistency
     script: core/scripts/gates/depends_on_consistency.py
     embedded: false
@@ -585,6 +604,25 @@ gates:
     rb_evidence: ["rb-466"]
     tuning_notes: "Closed allowlist (ALLOWED_PREFIXES tuple). Tuning is via prefix-set expansion as new agent classes emerge — not keyword fuzziness."
     retirement_eligible: true
+
+  - id: aspiration-supply-gate
+    script: core/scripts/gates/aspiration_supply.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "add(ctx) aspiration-level, before the per-goal gates" }
+      - { file: "core/scripts/aspiration-supply-gate.py", phase: "create-aspiration Step 5.7 pre-flight (per candidate)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: balanced
+    override_flag: "--override-supply"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A genuine self-generated aspiration must carry supply_evidence naming the gap, the user-visible outcome and >=2 existing referents; ~1 min to add, or the generator drops the candidate and the loop goes quiet."
+    fn_description: "Manufactured aspiration lands (blocker restated as a gap, archive duplicate, replacement-of-completed under a false user_directive); measured 2026-09-02: eleven in six days on one deployment, each seeding goals that consume iterations and tree writes."
+    rb_evidence: []
+    tuning_notes: "Structured checks, not keywords: origin substring list (idle_supply.gated_origin_patterns), referent existence, blocker-shape regex on the FIRST sentence + gap only, token containment against live+archive with a shared-token floor, per-agent daily cap. Tune thresholds in core/config/aspirations.yaml idle_supply."
+    retirement_eligible: false
 
   - id: operator-offload-gate
     script: core/scripts/gates/operator_offload.py
@@ -992,6 +1030,24 @@ gates:
     fn_description: "A unit closes 'verified' while the world's domain test suite cannot even collect. Measured 2026-08-29 on a live deployment: tests importing symbols that later units removed; `Interrupted: 2 errors during collection`; every later goal in the lane verified against nothing. The domain half is invisible to full-suite-recommender (git-based, guard-1947) and run-full-suite-after-deep-code.md only NAMES its command."
     rb_evidence: ["guard-399", "guard-1947", "guard-955"]
     tuning_notes: "Instrumented from day one (g-353-75). Fires only when a code file (.py .sh .yaml .toml .cfg .ini) under $WORLD_PATH/scripts is newer than the goal's claimed_at (aspirations-read.sh; fallback 6h); a world with no run-domain-tests.sh hook AND no test_*.py is noop. Runner: the world hook when present, else python -m pytest -q with cwd=scripts, STORAGE_BACKEND=local pinned, 900s bound (timeout and pytest rc 3/4 fail OPEN as decision=error). Verdict is a RATCHET, not green-or-block: the dev world measured 651s with 2 real reds nobody had seen, so demanding green would have refused every fleet close on day one. world/domain-suite-baseline.json (per box) holds the previous run's failing set; the first run seeds it and passes; a later run blocks only on a red NOT in it or on a collection error (rc=2, never baseline-able); a subset run passes and shrinks the baseline. Read the FP ratio against world/domain-suite-overrides.jsonl reasons: an override citing a tracked goal is the designed shared-tree FP; an override on a COLLECTION error is a Body laundering a broken import and is the signal to tighten, not retire."
+    retirement_eligible: false
+
+  - id: close-review-gate
+    script: core/scripts/close-review-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/iteration-close.sh", phase: "do_verify (status=completed, BEFORE the status write; both roles)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: "--override-close-review / --override-note-marker"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A tier-2 close is refused for a goal whose accuracy was in fact fine, costing one review cycle; or the note-marker check flags a legitimate close whose note QUOTES a not-done phrase while refuting it. The second is measured and real — g-115-5085 ('do not reopen this goal') is a correct close the high tier flags — which is why the refusal prints the matched context and is override-able rather than being a hard deny, and why the detector must NOT be widened to raise yield (guard-2201)."
+    fn_description: "A goal closes green while its stated outcomes were never checked by anyone but its author. Measured: coach g-012-02 closed with 6/16 wrong entity identities because the author self-graded against count-based criteria (g-357-39). Note-marker half: a goal sits at a terminal status while its own note argues it is not done — g-326-736 read `completed` under a note opening 'REOPENED BY ITS OWN CRITERIA', and it was the sole owner of a product smoke test that went dark three days."
+    rb_evidence: ["guard-1532", "guard-142", "rb-4452", "guard-2201"]
+    tuning_notes: "SHIPPED DORMANT (2026-09-02, g-357-40) — close_review_gate.enabled and .note_marker_enabled both default false in core/config/aspirations.yaml, a MISSING key reads false. This is a ship condition, not a hedge: check A's refusal names a remedy (the fresh-eyes close reviewer) whose producer is sibling goal g-357-41 and does not exist yet, and enabling a gate whose named remedy is unreachable forces every caller onto --override, manufacturing false records in the very ledger the gate fills (guard-1532, measured twice). Check B needs its refusal rate measured over the live completed population first. The flags are independent — flip each when ITS precondition lands. Tier logic is a pure, separately-tested module (goal_close_risk_tier.py): tier 0 (recurring + routine + no artifacts) short-circuits FIRST so a recurring framework-hygiene sweep never demands review; tier 2 fires on any of 6 triggers. Fail-to-tier-1 on every classifier fault (guard-142) — but verdict ABSENCE is a refusal, never a fail-open, because absence of review is the condition the gate exists to catch. Read the FP ratio against world/close-review-overrides.jsonl."
     retirement_eligible: false
 
 pending_audit:

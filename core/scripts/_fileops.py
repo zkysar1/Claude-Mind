@@ -129,6 +129,14 @@ def acquire_lock(lock_path, timeout=10, stale_seconds=30):
     surfaces the DISTINCT WriteQueueFullError/WriteQueueTimeoutError, never a
     pile-up of raw lock timeouts. The turn spans acquire→release (see
     release_lock); a backend failure releases the turn before re-raising.
+
+    THE LOCK FILE'S CONTENT IS THE OWNERSHIP TOKEN, NOT SCRATCH SPACE.
+    acquire_lock writes a holder id into it and release_lock compares that id
+    before unlinking (g-115-8536), so a caller that overwrites the file with
+    its own metadata makes every release read as a stale-break victim: the
+    lock is never unlinked, it leaks for its full stale_seconds TTL, and a
+    false `[lock-stale-break] victim=self` fires on each release. Measured on
+    the pytest-suite mutex, g-115-8659. Put caller metadata in a sidecar path.
     """
     from _write_queue import acquire_turn, release_turn
     acquire_turn(lock_path, hold_stale=stale_seconds)

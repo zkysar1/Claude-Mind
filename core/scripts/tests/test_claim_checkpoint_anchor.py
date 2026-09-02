@@ -85,7 +85,7 @@ def _build_tree(tmp_path: Path, wrapper_text: str) -> Path:
     (scripts / "_runtime.sh").write_text(
         "rt_python_launcher() { printf '%s' \"${STUB_LAUNCHER}\"; }\n"
         "rt_url_encode() { printf '%s' \"$1\"; }\n"
-        "rt_call() { printf '%s' \"${STUB_RESPONSE}\"; return 0; }\n"
+        "rt_call() { printf '%s' \"${STUB_RESPONSE}\"; return \"${STUB_RC:-0}\"; }\n"
         "rt_try_autospawn() { return 1; }\n"
         "rt_no_daemon_error() { echo \"no daemon: $1\" >&2; exit 1; }\n",
         encoding="utf-8", newline="")
@@ -143,7 +143,7 @@ def _build_tree(tmp_path: Path, wrapper_text: str) -> Path:
 
 def _run(tmp_path: Path, goal_id: str, *, wrapper_text: str | None = None,
          existing_goal: str = "", init_fail: bool = False,
-         claimed_by: str = "alpha"):
+         claimed_by: str = "alpha", stub_rc: int = 0):
     """Run the wrapper against the stub tree. Returns (CompletedProcess, payloads)."""
     text = wrapper_text if wrapper_text is not None else WRAPPER.read_text(encoding="utf-8")
     script = _build_tree(tmp_path, text)
@@ -157,6 +157,7 @@ def _run(tmp_path: Path, goal_id: str, *, wrapper_text: str | None = None,
         "STUB_RESPONSE": _canned_claim(goal_id, claimed_by=claimed_by),
         "CP_LOG": str(log),
         "CP_EXISTING_GOAL": existing_goal,
+        "STUB_RC": str(stub_rc),
     })
     if init_fail:
         env["CP_INIT_FAIL"] = "1"
@@ -295,3 +296,57 @@ def test_unrecognized_id_shape_writes_no_anchor(tmp_path, bad):
     proc, payloads = _run(tmp_path, bad)
     assert proc.returncode == 0, proc.stderr
     assert payloads == []
+
+
+# --------------------------------------------------------------------------
+# Refuse-case: a REFUSED claim must leave no anchor behind ().
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("stub_rc", [1, 2])
+def test_refused_claim_writes_no_anchor(tmp_path, stub_rc):
+    """A claim the daemon refused must not anchor the checkpoint.
+
+    WHY THIS IS WORTH A TEST rather than being obvious from the source. The
+    wrapper's `case $rc` dispatch reaches `_post_claim_effects` from the rc=0
+    and rc=3-after-autospawn arms only, and a comment at the function head says
+    so. But a comment is not a pin: fold one more effect in above the case
+    statement, or add an arm that falls through, and a refused claim starts
+    anchoring the checkpoint to a goal nobody is executing.
+
+    That is not a hypothetical failure — it is the exact shape g-115-4753 spent
+    a month chasing. A checkpoint anchoring `g-001-01` (a goal whose world copy
+    has been `skipped` since 2026-07-22) was read as proof of a rogue writer,
+    and elimination (e) of that goal reasoned in the opposite direction: the
+    daemon refuses that claim twice over, therefore `_post_claim_effects` never
+    ran, therefore the writer is not the claim path. That inference is only as
+    good as this ordering, and nothing pinned it.
+
+    rc=1 is the record-level refusal family (409 `goal_terminal`, 409
+    `goal_id_collision`, 400 `agent_queue_goal`) — measured live on this box
+    2026-09-02: claiming an already-completed world goal returned rc=1 with
+    `{"error": "goal_terminal"}` and left the checkpoint untouched. rc=2 is the
+    routing-POLICY family (`cross_lane_refused`, `lane_pin_refused`), which
+    exits through a different arm and so is a distinct path, not a duplicate.
+    rc=3 is deliberately NOT parametrized here: its arm retries via
+    `rt_try_autospawn`, which the harness stubs to fail, so it would exercise
+    the no-daemon exit rather than the refusal ordering this test is about.
+
+    The in-test CONTROL is load-bearing and follows this file's own rule about
+    harness defects reading as defects in the code under test: without it, a
+    stub that silently stopped recording would satisfy `payloads == []` for
+    every rc and the test would pass while measuring nothing.
+    """
+    control_proc, control_payloads = _run(tmp_path / "control", "g-115-4753")
+    assert control_proc.returncode == 0, control_proc.stderr
+    assert len(control_payloads) == 1, (
+        "harness control failed: an ACCEPTED claim did not record an anchor, so "
+        "an empty log below would prove nothing about the refusal path")
+
+    proc, payloads = _run(tmp_path / "refused", "g-115-4753", stub_rc=stub_rc)
+    assert proc.returncode != 0, (
+        f"stub rc={stub_rc} should have propagated a non-zero exit; got 0 with "
+        f"stderr={proc.stderr!r}")
+    assert payloads == [], (
+        f"a claim refused with rc={stub_rc} anchored the checkpoint anyway: "
+        f"{payloads}. Downstream readers would then attribute this session to a "
+        f"goal it never claimed.")

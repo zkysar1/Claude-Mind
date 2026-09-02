@@ -401,6 +401,78 @@ def test_start_cw1a_step_does_not_reference_the_retired_copy():
     assert "owncloud-pull.sh --agent <agent-name> --only working-memory.yaml" in skill
 
 
+# ---- board channel files (). Measured 2026-09-02 on a downstream
+# deployment: five board posts hand-appended with `cat >> .../board/findings.jsonl
+# <<'EOF'` by both Bodies in one day, each carrying a Z-suffixed timestamp that
+# board-read.sh --since never returns. The guard fired 236 times that day and saw
+# none of them: a channel file is named by its PARENT DIRECTORY, not by a fixed
+# basename, and `findings.jsonl` was on no list.
+BOARD_WRITE_SHAPES = [
+    "cd /opt/mind && cat >> .mind-data/world/board/findings.jsonl <<'EOF'\n"
+    '{"id": "msg-20260902-171617-coach-078", "timestamp": "2026-09-02T17:16:17Z"}\nEOF',
+    "echo '{\"id\":\"msg-2\"}' >> \"$WORLD_PATH/board/coordination.jsonl\"",
+    "printf '%s\\n' \"$REC\" | tee -a world/board/general.jsonl",
+    "sed -i 's/Z\"/\"/' world/board/findings.jsonl",
+    "python3 - <<'EOF'\nimport json\nopen('world/board/decisions.jsonl', 'a').write(json.dumps({'id': 'x'}) + '\\n')\nEOF",
+    "cp fixed.jsonl /opt/mind/.mind-data/world/board/findings.jsonl",
+]
+
+
+@pytest.mark.parametrize("command", BOARD_WRITE_SHAPES)
+def test_hand_writes_to_a_board_channel_are_refused(command):
+    decision, reason = run(command)
+    assert decision == "deny", command
+    assert "direct store write refused" in reason
+    assert "board-post.sh --channel <channel>" in reason
+    assert "STORE_WRITE_GUARD_OVERRIDE" not in reason
+
+
+def test_a_hand_parser_over_a_board_channel_names_the_reader():
+    cmd = (
+        "grep coach-078 world/board/findings.jsonl | "
+        "python3 -c 'import sys,json; print(json.loads(sys.stdin.read())[\"timestamp\"])'"
+    )
+    decision, reason = run(cmd)
+    assert decision == "deny"
+    assert "direct store parse refused" in reason
+    assert "board-read.sh --channel <channel>" in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # the sanctioned writer and reader, in the shapes the skills prescribe
+        "bash core/scripts/board-post.sh --channel findings --type finding --tags teaching < /root/.alpha-board-11.txt",
+        "echo 'claimed g-022-02' | bash core/scripts/board-post.sh --channel coordination --type claim",
+        "bash core/scripts/board-read.sh --channel findings --since 2026-09-02T17:00:00 > agents/alpha/temp/board.txt",
+        # presence checks are not parses
+        "grep -c msg-20260902-171617-coach-078 .mind-data/world/board/findings.jsonl",
+        "wc -l world/board/*.jsonl",
+        # temp copies, look-alike names, and a non-board directory pass
+        "echo '{}' >> agents/alpha/temp/board/findings.jsonl",
+        "echo x >> notes/board/findings.txt",
+        "echo x >> world/boardroom/findings.jsonl",
+        # prose that DESCRIBES the rule: the documented `board/<channel>.jsonl`
+        # beside `sed -i` / `>>` / `tee` is not a store. Measured 2026-09-02: the
+        # board post announcing the rule was refused as an in-place edit of
+        # board/PLACEHOLDER.jsonl.
+        'git commit -q -m "fix(store-guard): refuse sed -i / tee / >> into board/<channel>.jsonl; name board-post.sh"',
+        "ssh host 'cat > /root/note.txt' <<'POST'\nThe guard now refuses any redirect/tee/sed -i/cp/inline-Python write into board/<channel>.jsonl.\nPOST",
+    ],
+)
+def test_board_wrappers_reads_and_temp_paths_pass(command):
+    decision, reason = run(command)
+    assert decision == "allow", (command, reason[:120])
+
+
+def test_board_channel_key_is_the_parent_directory():
+    assert _mod._basename_of("/opt/mind/.mind-data/world/board/findings.jsonl") == "board/<channel>.jsonl"
+    assert _mod._basename_of("world/aspirations.jsonl") == "aspirations.jsonl"
+    assert direct_store_writes("echo x >> world/board/findings.jsonl") == [
+        ("shell redirect into", "world/board/findings.jsonl")
+    ]
+
+
 def test_hook_is_registered_on_the_bash_matcher():
     settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
     bash_hooks = [

@@ -25,6 +25,8 @@
       "Write(*/world/knowledge/tree/_tree.yaml)",
       "Edit(*/world/*.jsonl)",
       "Write(*/world/*.jsonl)",
+      "Edit(*/world/board/*.jsonl)",
+      "Write(*/world/board/*.jsonl)",
       "Edit(*/meta/*.jsonl)",
       "Write(*/meta/*.jsonl)",
       "Write(*/session/agent-state)",
@@ -140,6 +142,11 @@
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-store-write-guard.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/embedded-block-extraction-gate.sh",
             "timeout": 15
           }
         ]

@@ -267,3 +267,75 @@ def test_owncloud_iterates_past_unresolvable_conf(tmp_path):
     )
     assert Path(env["WORLD_PATH"]) == w   # resolved from zeta after aaa raised
     assert Path(env["META_PATH"]) == m
+
+
+# ---------------------------------------------------------------------------
+#  — the inherited-override WARNING.
+#
+# `_load_env_local` uses setdefault ("explicit launch env wins"), so a var the
+# daemon inherited from whoever spawned it BLOCKS the .env.local value for the
+# daemon's whole life. On 2026-09-02 that was silent: seven --restart recycles
+# from inside pytest handed the shared daemon STORAGE_BACKEND=local on an
+# own-cloud box, and every daemon-mediated world write from that box stayed on
+# the local mirror 00:34Z-06:45Z with nothing said anywhere.
+#
+# The setdefault CONTRACT IS DELIBERATELY UNCHANGED — a deliberate operator
+# override must keep working. What changed is that the override now announces
+# itself. Hence the assertion in the first test that the inherited value still
+# wins: these tests pin a REPORT, never a refusal (a false positive here would
+# fail every wrapper on the box under the daemon-only architecture; the same
+# predicate family wired as a verdict produced 31h of false HIGH goals against
+# a correctly-configured node, ).
+# ---------------------------------------------------------------------------
+
+def test_inherited_override_warns_with_both_values(tmp_path, capsys):
+    """The incident, reduced: inherited local vs .env.local own-cloud."""
+    env = _run_loader(tmp_path, "STORAGE_BACKEND=own-cloud\n",
+                      preset={"STORAGE_BACKEND": "local"})
+    err = capsys.readouterr().err
+    assert "inherited env OVERRIDES .env.local for STORAGE_BACKEND" in err
+    assert "'local'" in err and "'own-cloud'" in err, (
+        "the warning must name BOTH values — which one is in force is the "
+        "whole question a reader has at that moment"
+    )
+    assert "g-115-8604" in err
+    # The setdefault contract is unchanged: the inherited value still wins.
+    assert env["STORAGE_BACKEND"] == "local"
+
+
+def test_agreeing_inherited_value_is_silent(tmp_path, capsys):
+    """NEGATIVE CONTROL (guard-1220). A predicate must reject as well as
+    accept. An inherited value EQUAL to .env.local's is not an override and
+    must stay silent, or the warning becomes noise on every healthy daemon
+    start and is tuned out exactly when it matters."""
+    _run_loader(tmp_path, "STORAGE_BACKEND=own-cloud\n",
+                preset={"STORAGE_BACKEND": "own-cloud"})
+    assert "OVERRIDES" not in capsys.readouterr().err
+
+
+def test_uninherited_key_is_silent(tmp_path, capsys):
+    """The ordinary path — .env.local supplies a key nothing inherited."""
+    _run_loader(tmp_path, "STORAGE_BACKEND=own-cloud\n",
+                clear_keys=("STORAGE_BACKEND",))
+    assert "OVERRIDES" not in capsys.readouterr().err
+
+
+def test_empty_file_value_is_silent(tmp_path, capsys):
+    """`MACHINE_ID=  # note` (an unedited .env.example copy) declares no value,
+    so an inherited value is not overriding anything. Silent by construction —
+    the existing required-var checks own that case."""
+    _run_loader(tmp_path, "MACHINE_ID=  # UNIQUE per-machine id\n",
+                preset={"MACHINE_ID": "cc-10"})
+    assert "OVERRIDES" not in capsys.readouterr().err
+
+
+def test_credential_mismatch_warns_without_leaking_values(tmp_path, capsys):
+    """SECURITY. The loader also accepts the MIND_AWS_* credential family, so
+    the warning path can see secrets. It names the key and withholds both
+    values — the same key-NAME-only posture fleet-config-parity uses."""
+    _run_loader(tmp_path, "MIND_AWS_SECRET_ACCESS_KEY=file-secret-value\n",
+                preset={"MIND_AWS_SECRET_ACCESS_KEY": "inherited-secret-value"})
+    err = capsys.readouterr().err
+    assert "MIND_AWS_SECRET_ACCESS_KEY" in err and "credential key" in err
+    assert "file-secret-value" not in err
+    assert "inherited-secret-value" not in err

@@ -79,8 +79,19 @@ IF mode == "from-followup":
                        at add time, but downstream audits/reports consume this —
                        non-allowed values create forward-compat debt. Do not invent
                        new prefixes without extending ALLOWED_PREFIXES first.)
-                      IF --source-goal provided: "idea:<source-goal-id>"
+                      IF the caller passed an explicit origin_signal
+                        (all-blocked B6.7 passes "blocker_pattern:<class>",
+                         complete-review passes "successor:<asp-id>"): use it —
+                        and carry the caller's supply_evidence object into the
+                        JSON below verbatim; the daemon's aspiration-supply gate
+                        refuses those origins without it (Step 5.7 / conventions
+                        aspirations.md "Self-Generated Aspirations").
+                      ELIF --source-goal provided: "idea:<source-goal-id>"
                       ELSE: "user_directive"
+                      # NEVER "user_directive" for an aspiration the agent
+                      # derived from its own idle state or from completing
+                      # another aspiration — that label exempts the record
+                      # from every gate.
 
     ID assignment — OMIT the "id" field (g-328-29):
       # The daemon mints the next asp-NNN INSIDE the write lock (max+1
@@ -121,7 +132,7 @@ IF mode == "from-followup":
       where <seed-goal-json> =
       {
         "title": "Design implementation plan and file sub-goals under this aspiration",
-        "description": "Review the motivation, outline the work lifecycle (research / build / test / integrate / encode as applicable), then EITHER file at least 2 concrete sub-goals under this aspiration OR archive the aspiration via aspirations-retire.sh as not-worth-pursuing. This seed goal forces a decision at pickup so from-followup aspirations cannot silently coast.",
+        "description": "Review the motivation, outline the work lifecycle (research / build / test / integrate / encode as applicable), then EITHER file at least 2 concrete sub-goals under this aspiration — chained in plan order with blocked_by (a step that consumes an earlier step's output lists that step's goal id; the selector reads blocked_by ONLY, so depends_on, prose and priority do not order it — guard-4554) — OR archive the aspiration via aspirations-retire.sh as not-worth-pursuing. This seed goal forces a decision at pickup so from-followup aspirations cannot silently coast.",
         "skill": null,
         "type": "idea",
         "category": <same as aspiration>,
@@ -132,7 +143,7 @@ IF mode == "from-followup":
         "verification": {
           "outcomes": [
             "Implementation plan documented in the aspiration description (via aspirations-update.sh)",
-            "At least 2 concrete sub-goals filed under this aspiration OR aspiration archived via aspirations-retire/complete as not-worth-pursuing"
+            "At least 2 concrete sub-goals filed under this aspiration, every output-consuming step carrying blocked_by on its prerequisite, OR aspiration archived via aspirations-retire/complete as not-worth-pursuing"
           ],
           "checks": [],
           "preconditions": []
@@ -277,6 +288,42 @@ Phase A.0 — Consolidation gate (hard block, from-self only):
         Bash: echo '{"date":"<today>","event":"consolidation_gate_override","details":"from-self override: '$justification'","thresholds":"active_count>=6 AND avg_completion<0.35"}' | bash core/scripts/evolution-log-append.sh
         (proceed to Phase A.evidence)
 
+Phase A.0b — Domain-phase + demand gate (from-self only; the `domain-calendar` hook slot):
+
+    # Sibling of the consolidation gate above. That one asks "is the portfolio
+    # too fragmented to add work?"; this one asks "is this the right KIND of
+    # work RIGHT NOW, and is there unanswered demand I should consume first?"
+    # Both are supply-side brakes on from-self creation; user-directed
+    # (from-user) paths do not route through here.
+    #
+    # ONE component, called — never transcribed (guard-2676). The same module
+    # backs /generate-domain-goals Phase 0.5 + Phase 4.6, so the two generation
+    # lanes cannot drift apart in what they consider phase-valid.
+
+    # (a) DEMAND FIRST — consuming demand outranks inventing supply.
+    Bash: bash core/scripts/board-read.sh --channel coordination --since 168h --json > /tmp/ca-demand.jsonl
+    Bash: py -3 core/scripts/generation_phase_gate.py demand-check \
+            --posts-file /tmp/ca-demand.jsonl --author "$MIND_AGENT" --json
+    IF exit 1 (unconsumed actionable demand outstanding):
+        Log: "▸ DEMAND GATE: refusing from-self aspiration creation — N
+              unconsumed actionable board post(s) addressed here. Route those
+              first (the JSON's `outstanding` names them)."
+        RETURN {created: 0, gate: "demand", action: "routed_to_board"}
+
+    # (b) PHASE VALIDITY — per candidate, at the point of composition.
+    FOR EACH candidate aspiration in the pool:
+        Bash: py -3 core/scripts/generation_phase_gate.py phase-check \
+                --category "<candidate category>" --json
+        IF exit 1: DROP the candidate (or re-aim it at a category valid in the
+          current phase when the motivation still holds), and log the refusal:
+          Bash: bash core/scripts/gate-log.sh generation-phase-gate block \
+                  --caller "create-aspiration/SKILL.md:Phase A.0b" \
+                  --payload "<candidate title>"
+
+    # FAIL-OPEN, both halves. A world with no world/conventions/domain-calendar.md
+    # gets exit 0 everywhere and this phase is a no-op — the slot is opt-in and
+    # absence means "this domain has no phase model", never "refuse".
+
 Phase A.evidence — Evidence-citation requirement (from-self only, governs ALL phases A-D):
 
     **Mandatory rule for every candidate aspiration generated in Phases A,
@@ -305,16 +352,49 @@ Phase A.evidence — Evidence-citation requirement (from-self only, governs ALL 
     aspiration level.
 
     If you cannot write a specific evidence sentence for a candidate,
-    DROP the candidate. An empty pool at the end of Phase D is an
-    acceptable outcome — Step 6 and downstream handlers can act on an
-    empty result. Do NOT backfill with generic candidates to avoid
-    returning empty; that IS the failure mode.
+    DROP the candidate. An empty pool at the end of Phase D is the
+    EXPECTED outcome on a mature portfolio — Step 6 and downstream handlers
+    act on an empty result by going quiet (all-blocked B6.5/B7). Do NOT
+    backfill with generic candidates to avoid returning empty; that IS the
+    failure mode.
 
-    Every surviving candidate carries its evidence sentence forward as
-    the aspiration's `motivation` field (or is prefixed to it). This makes
-    the cited evidence auditable in aspirations.jsonl — a reader can
-    trace any agent-generated aspiration back to the concrete signal that
-    produced it.
+    **A blocker is not a gap.** "X is human-blocked / awaiting approval /
+    until access is restored, so build Y meanwhile" is REJECTED here: a
+    blocked lane is a reason to wait for the unblock, not to manufacture
+    adjacent work. Measured 2026-09-02 on a live deployment: eleven
+    self-generated aspirations in six days, nearly all "frameworks from
+    public data while the API is blocked", each seeding goals that consumed
+    iterations and tree writes. (An `Unblock:` aspiration that targets the
+    blocker itself is the opposite case and is fine.)
+
+    Every surviving candidate carries its evidence sentence forward as the
+    aspiration's `motivation` field AND as a structured `supply_evidence`
+    object that the daemon's **aspiration-supply gate** verifies at write
+    time (`core/scripts/gates/aspiration_supply.py`; refusal =
+    `aspiration_supply_blocked`). The gate fires for every self-generated
+    origin (`all_blocked_gap`, `idle_fallback`, `blocker_pattern:*`,
+    `successor:*`, and every spelling of the all-blocked lane) and for any
+    "replace completed …" motivation regardless of origin:
+
+        "supply_evidence": {
+          "gap":     "<what is MISSING, concretely — the file, node, capability
+                       or user-visible outcome that does not exist yet>",
+          "needle":  "<what the user can do or see once this lands>",
+          "checked": ["<asp-/g- id you read>", "<tree node key or file path>",
+                      "<msg-/rb-/guard-/hypothesis id>"]
+        }
+
+    `checked` is the retrieval-first proof: ≥2 entries MUST resolve to things
+    that EXIST (aspiration/goal ids in the store, tree node keys, files under
+    the governed roots, board/reasoning-bank/guardrail/hypothesis ids).
+    Category labels and URLs are not referents. The gate also refuses a
+    candidate whose distinctive tokens are ≥40% contained in ANY existing
+    aspiration (live or archived): an ACTIVE match means file goals under
+    that aspiration instead; a completed/retired match is allowed only when
+    its id is in `checked` and `gap` names what it delivered and what is
+    missing. A per-agent daily cap (default 2) closes the loop: past it the
+    generator returns empty and the idle path sleeps. Thresholds:
+    `core/config/aspirations.yaml` → `idle_supply`.
 
     When a child goal of this aspiration reaches `aspirations-add-goal.sh`,
     set `origin_signal` to `parent_aspiration:<parent-asp-id>` so the
@@ -975,13 +1055,44 @@ candidate generation in Phases A-D via interestingness criteria. Stage 2
    blocked_by to the ids read back from each response.
 ```
 
+## Step 5.7: Supply-Gate Pre-flight (from-self and from-followup on a self-generated origin)
+
+The interestingness filter above is a judgment you grade yourself on; the
+aspiration-supply gate is the script that checks it. Run it on every
+ACCEPTED candidate BEFORE Step 6 so a refusal arrives as structured
+feedback, not a 400 after the record is assembled. Same evaluator the
+daemon runs at write time.
+
+```
+FOR EACH accepted candidate:
+    Bash: echo '<candidate-json incl. supply_evidence>' | py -3 core/scripts/aspiration-supply-gate.py --output human
+    # rc 0 = pass (or not gated: user-directed origins are never gated)
+    # rc 1 = would block — the output names each failing check and the remedy
+    IF rc == 1:
+        Log: echo '{"date":"<today>","event":"supply_gate_refused","details":"<title>: <failing checks>","trigger_reason":"create-aspiration"}' | bash core/scripts/evolution-log-append.sh
+        # DROP the candidate. Do NOT reword it to slip past the checks and do
+        # NOT pass --override-supply from this path (the override exists for
+        # user/operator-directed re-filing only). The ONE permitted retry: a
+        # referents_unverified refusal where a NAMED referent genuinely exists
+        # and was simply omitted from `checked` — add it and re-run once.
+        remove candidate from the pool
+
+IF the pool is now empty:
+    RETURN {created: 0, reason: "supply-gate: nothing verifiable is missing"}
+    # The caller's quiet window (all-blocked B6.5 quiescence / B7 dry-idle
+    # backoff) is the correct outcome. Do NOT loop back to Phase A for
+    # another batch — the portfolio has not changed since the first pass.
+```
+
 ## Step 6: Create
 
 ```
 For each validated aspiration:
-  Build aspiration JSON with all goals
+  Build aspiration JSON with all goals (+ supply_evidence on self-generated origins)
   Pipe to: echo '<aspiration-json>' | bash core/scripts/aspirations-add.sh
   IF exit code != 0: report validation error, skip this aspiration
+  # `aspiration_supply_blocked` here means Step 5.7 was skipped or the
+  # portfolio changed under you — treat it exactly like a 5.7 refusal (drop).
 ```
 
 **Goal-duplication gate (asp-248 / g-248-01)** fires automatically inside

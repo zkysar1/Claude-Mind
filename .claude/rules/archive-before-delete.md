@@ -76,25 +76,25 @@ its owner, tmp files this session created, or append-only writes.
    in a durable retrievable store (knowledge tree node + reasoning bank).
 
    **Name it `RECEIPT.*` at the archive's TOP LEVEL, and if you write a READER
-   for it, match extension- and case-insensitively.** This step deliberately
-   mandated a receipt while naming no filename — which left writers and readers
-   free to disagree, and every one of them did. Measured 2026-08-08 (g-115-3397):
+   for it, match extension- and case-insensitively.** Until 2026-08-08
+   (g-115-3397) this step named no filename, so writers and readers disagreed:
    `_seed_engine.py` writes `RECEIPT.json`, `history_vacuum_archive.py` writes
    lowercase `receipt.json`, and the one reader in the tree
-   (`temp-drain-purge.sh` Lane 3, which preserves archives from a drain purge)
-   required `RECEIPT.md` **exactly** — a name **zero** producers write. The
-   protection was therefore unreachable by every archive the framework itself
-   creates; it fired only on a receipt a human had hand-named. A live
-   archive-before-delete archive carrying `RECEIPT.json` was listed for deletion
-   and survived only because someone hand-marked it mid-drain.
+   (`temp-drain-purge.sh` Lane 3) required `RECEIPT.md` **exactly** — a name **zero** producers write, so the
+   protection fired only on hand-named receipts; a live archive carrying
+   `RECEIPT.json` survived a drain purge only because someone hand-marked it.
 
    The asymmetry is what makes this a rule rather than a preference: a missed
    sentinel DESTROYS a recovery layer, while an over-match merely retains a
    directory until someone looks. So readers widen on the PRESERVE side — but
    anchor the match (`RECEIPT` / `RECEIPT.*`, top level only). A bare
-   `*receipt*` substring, or a match at any depth, preserves scratch dirs full
-   of receipt-ish notes and makes the guard unfalsifiable (guard-2860 — never
-   relax an ownership predicate into a pattern).
+   `*receipt*` substring or an any-depth match preserves every scratch dir of
+   receipt-ish notes and makes the guard unfalsifiable (guard-2860).
+
+   **A receipt never lives INSIDE the store or directory it describes.** A
+   comment line in a JSONL store breaks every parser that reads it: measured
+   2026-09-02, a downstream Body wrote `# RECEIPT: …` as line 1 of a board
+   channel file and every post to that channel returned `internal_error`.
 7. **Blast-radius check before the delete fires**: enumerate what READS this
    data. Read-through/restore-on-miss sync layers, session-binding caches,
    and registry rows can re-materialize or depend on "deleted" data (the

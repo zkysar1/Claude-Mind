@@ -338,7 +338,16 @@ def test_origin_signal_auto_derive_visible_to_later_gates(running_daemon):
 # ---------------------------------------------------------------------------
 
 def test_warnings_field_absent_when_no_advisories(running_daemon):
-    """A goal that triggers no advisories should NOT have a warnings field."""
+    """A goal that triggers no advisories should NOT have a warnings field.
+
+    Every field below is load-bearing and annotated with the advisory it
+    silences — the fixture has to dodge ALL of them or it stops testing the
+    clean-response contract and starts testing whichever advisory it happens to
+    trip. Adding an advisory to _run_add_goal_pipeline without extending this
+    fixture breaks this test, which is guard-1038 exactly: a new gate's own unit
+    tests passing says nothing about pre-existing RUNTIME tests that POST the
+    now-warned shape.
+    """
     _, port = running_daemon
     goal = {
         "title": "Clean goal",
@@ -346,6 +355,9 @@ def test_warnings_field_absent_when_no_advisories(running_daemon):
         "origin_signal": "user_directive",
         "description": "x" * 100,  # long enough → no description-length warning
         # no user participant → no user_leg_scope warning
+        # outcomes present → no verification-outcomes-absent warning ()
+        "verification": {"outcomes": ["the clean-response contract holds"],
+                         "checks": [], "preconditions": []},
     }
     code, body = _add_goal(port, goal)
     assert code == 200

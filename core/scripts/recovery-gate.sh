@@ -653,6 +653,44 @@ _check_hung_autocompact() {
         fi
     fi
 
+    # Roundtrip-completed suppressor (, 2026-09-02). The sentinel is
+    # written ONLY at PreCompact, so a diary write NEWER than the sentinel
+    # proves the loop executed post-compact work — the roundtrip COMPLETED
+    # and the sentinel is a leftover, not a hang. The 15-min freshness window
+    # above cannot see this case: under provider rate-limit backoff the
+    # resumed loop can go quiet >15min (diary stale, heartbeat stale) while
+    # the sentinel ages past 60min — every "stale" signal true, yet the
+    # stalest artifact of all is the sentinel itself. Measured
+    # 2026-09-01T07:01:34 (staging deployment): Path C demoted a LIVE
+    # rate-limited loop to IDLE off a sentinel the resumed loop had outlived
+    # by hours. session-save-id.sh's SID-match clear closes the common case
+    # at the next SessionStart; this closes the window where Path C evaluates
+    # first. Consume the sentinel here (self-heal — the diary already proves
+    # completion, so its evidentiary value is spent; leaving it re-arms the
+    # same false positive on every later evaluation) and suppress. The
+    # cleanup-vs-recovery boundary above is intact: we are past
+    # state==RUNNING, on the road to a recovery the diary just falsified.
+    if [[ -f "$diary" && "$diary" -nt "$cif" ]]; then
+        # Evidence + audit row through the shared verdict-record writer so the
+        # suppression carries the same shape as a Path A veto (action=suppressed,
+        # path=C) and recovery_yank.py — which treats action=recover, or a row
+        # with NO action, as a yank — never mistakes it for one.
+        local sh_sid="" sh_ev
+        [[ -f "$_adir/session/running-session-id" ]] && sh_sid="$(tr -d '\r\n[:space:]' < "$_adir/session/running-session-id")"
+        sh_ev="$(RG_CIF="$(stat -c %Y "$cif" 2>/dev/null || echo 0)" RG_DIARY="$(stat -c %Y "$diary" 2>/dev/null || echo 0)" RG_CIF_SID="$(tr -d '\r\n[:space:]' < "$cif" 2>/dev/null | head -c 64)" \
+            python3 -c 'import json,os; print(json.dumps({"sentinel_consumed": True, "compact_in_flight_mtime_epoch": int(os.environ["RG_CIF"] or 0), "execution_diary_mtime_epoch": int(os.environ["RG_DIARY"] or 0), "compact_in_flight_sid": os.environ.get("RG_CIF_SID") or None}))' 2>/dev/null || echo "")"
+        rm -f "$cif" 2>/dev/null || true
+        local shentry
+        shentry="$(_recovery_log_entry suppressed "$(date +%Y-%m-%dT%H:%M:%S)" "$agent" \
+            "hung-autocompact kill SUPPRESSED: execution-diary newer than compact-in-flight (autocompact roundtrip completed after the sentinel was written); stale sentinel consumed, loop preserved" \
+            "$sh_sid" C "$sh_ev")"
+        if [[ -n "$shentry" ]]; then
+            printf '%s\n' "$shentry" >> "$_adir/session/recovery-log.jsonl"
+        fi
+        echo "[recovery-gate] Path C SUPPRESSED for $agent: execution-diary newer than compact-in-flight (roundtrip completed); stale sentinel consumed" >&2
+        return 0
+    fi
+
     # stop-requested gate: graceful /stop owns the wind-down.
     # Exit-code semantics mirror Cond 2.5/Cond 4 (rb-762): rc=1 is the ONLY
     # "continue" code. rc=0 (signal exists) AND rc=2+ (script error) both
@@ -661,7 +699,7 @@ _check_hung_autocompact() {
     local sr_rc=$?
     [[ $sr_rc -eq 1 ]] || return 0   # 0=signal-set, 2+=error → both suppress recovery
 
-    local cause="hung autocompact: compact-in-flight mtime >60min, heartbeat=$hb, state=RUNNING, no stop-requested, no execute-in-flight, diary stale"
+    local cause="hung autocompact: compact-in-flight mtime >60min, heartbeat=$hb, state=RUNNING, no stop-requested, no execute-in-flight, diary stale and not newer than sentinel"
     _perform_recovery "$agent" "$cause" C
 }
 

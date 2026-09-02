@@ -272,17 +272,33 @@ if [ "$SOURCE" = "compact" ]; then
 
     # POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
     # --- Clear compact-in-flight sentinels for any agent whose compact just
-    # finished. Written by precompact-serialize.sh; mtime <10min means "compact
-    # just resumed via this SessionStart event" — the autocompact roundtrip
-    # is complete and the sentinel has served its purpose. Older files are
-    # genuine hangs and stay for recovery-gate Path C to act on. Cross-agent
-    # iteration mirrors the stale-cleanup pattern at line 86. Fail-open.
+    # finished. Written by precompact-serialize.sh with the compacting SID as
+    # content. Two clear conditions (, 2026-09-02):
+    #   1. SID MATCH, any age: the sentinel names THIS SessionStart's SID —
+    #      the roundtrip that wrote it has definitionally completed (we ARE
+    #      its resume event). Age is irrelevant: provider rate-limit backoff
+    #      stretches legitimate roundtrips past any fixed window (measured
+    #      2026-09-01, staging deployment: >60min), and the pre-fix
+    #      <10min-only rule left those sentinels behind for recovery-gate
+    #      Path C to misread as hung autocompacts — yanking a LIVE loop to
+    #      IDLE hours later.
+    #   2. FOREIGN/UNREADABLE SID, mtime <10min: "some compact just resumed
+    #      via this SessionStart event" — the original heuristic, kept for
+    #      sentinels this SID cannot vouch for. Older foreign files are
+    #      genuine hangs and stay for recovery-gate Path C to act on.
+    # Cross-agent iteration mirrors the stale-cleanup pattern at line 86.
+    # Fail-open.
     for _CIF in "$PROJECT_ROOT/$AGENTS_PARENT_DIR"/*/session/compact-in-flight; do
         [ -f "$_CIF" ] || continue
+        _CIF_SID=$(cat "$_CIF" 2>/dev/null | tr -d '\r\n')
+        if [ -n "$SID" ] && [ "$_CIF_SID" = "$SID" ]; then
+            rm -f "$_CIF" 2>/dev/null || true
+            continue
+        fi
         [ -n "$(find "$_CIF" -maxdepth 0 -mmin -10 2>/dev/null)" ] || continue
         rm -f "$_CIF" 2>/dev/null || true
     done
-    unset _CIF
+    unset _CIF _CIF_SID
 fi
 
 # --- 2. Resolve agent binding for the new SID ---

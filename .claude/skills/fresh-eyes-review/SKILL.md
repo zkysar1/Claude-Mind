@@ -783,7 +783,16 @@ Branch on decision:
 ALWAYS log the decision to `agents/<agent>/journal` (one-line tagged
 `fresh-eyes-decision`) and append a single board post to the `reasoning`
 channel summarizing decision + rationale. The audit trail is the
-guardrail's evidence path.
+guardrail's evidence path. **Post the board line AFTER Phase 5.6's
+write-time N re-probe has allocated N, carrying the N the row actually got —
+or carry no N.** The Phase-2 probe's max+1 is PROVISIONAL until written
+(g-115-8055): on 2026-09-02 two user-forced passes in two windows on ONE box
+(alpha, sessions 823b7471 and f056c8f8) both announced "N=123" here at
+15:12/15:13; one minted it at 15:15, the other's re-probe refused the
+duplicate and its reading was folded into the N=123 block as a collision
+note. Before a user-forced pass, `board-read.sh --channel reasoning --since
+30m` for a sibling's fresh-eyes line — same box, same cadence stamp,
+identical inputs.
 
 ## Phase 5.6: Encode Non-Routed Observations
 

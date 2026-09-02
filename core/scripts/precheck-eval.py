@@ -1643,9 +1643,21 @@ def cmd_peer_thread_relay(args, config, compact):
         # posts carried a goal id and no requires_action_by against 9 that routed —
         # 61% undeliverable, across four agents over 8 days, with this sweep
         # reporting "clean" throughout.
+        # AND the goal id must be a BARE tag ( sibling, measured
+        # 2026-09-02 alpha/cc-04). build_delivery_index matches GOAL_ID_RE at tag
+        # START, so `target:<goal-id>` — the framework's dominant goal-id tag
+        # idiom, prescribed for directive targeting in aspirations-select Phase
+        # 2.07 and mirrored by insight triggers' `affects:<goal-id>` — is
+        # INVISIBLE here. Same failure shape as the forward-to defect above: the
+        # instruction was followed exactly and the relay still reached nobody,
+        # except this time the sweep kept reporting the goal UNRELAYED rather
+        # than falsely clean. Naming the shape costs six words; omitting it cost
+        # a re-post on a HIGH user directive.
         summary = ("%d peer-thread directive(s) never relayed (oldest %.1fd): %s — "
                    "relay via peer-board-post.sh or a board post tagged relay + "
-                   "requires_action_by:<agent>[@<env-id>] + the goal id "
+                   "requires_action_by:<agent>[@<env-id>] + the goal id AS A BARE "
+                   "TAG (`g-115-8605`, NOT `target:g-115-8605` — a prefixed tag is "
+                   "invisible to the delivery index) "
                    "(requires_action_by is the ONLY prefix that routes; "
                    "forward-to: routes to nobody)"
                    % (len(und), oldest, ", ".join(r["goal_id"] for r in und[:6])))

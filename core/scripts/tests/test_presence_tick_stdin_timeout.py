@@ -145,5 +145,24 @@ def test_presence_tick_stdin_read_is_bounded():
     )
 
 
+def test_presence_tick_wrapper_forces_local_backend():
+    """Structural guard: presence-tick.sh must force STORAGE_BACKEND=local on the
+    python exec. The hook touches only machine-local paths (presence/ is
+    sync-excluded; team-state/diary/changelog read the local cache), so it never
+    needs the own-cloud S3 client. Without the prefix an own-cloud box
+    instantiates OwnCloudBackend every fire (boto3 client + creds): measured
+    0.61s -> 0.077s (~8x) on cc-02, and a slow box can hit the 5s hook timeout
+    (g-115-8533)."""
+    src = (CORE_SCRIPTS / "presence-tick.sh").read_text(encoding="utf-8")
+    exec_lines = [ln for ln in src.splitlines()
+                  if ln.strip().startswith("exec") and "presence-tick.py" in ln]
+    assert exec_lines, "presence-tick.sh no longer execs presence-tick.py"
+    assert all("STORAGE_BACKEND=local" in ln for ln in exec_lines), (
+        "presence-tick.sh dropped STORAGE_BACKEND=local on the python exec -- an "
+        "own-cloud box then instantiates OwnCloudBackend every fire (~8x slower, "
+        "5s-timeout risk on a slow box; g-115-8533)"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(main())

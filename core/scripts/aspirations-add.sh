@@ -23,7 +23,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 
 # ONE literal, shared by the help text and the refusal message — never two
 # copies (see argv_strict_refuse_unknown's header in _argv_strict.sh).
-_ACCEPTED_FLAGS="--source <world|agent> | --schema | --override-signal <why> | --override-duplication <why> | --override-all <why>"
+_ACCEPTED_FLAGS="--source <world|agent> | --schema | --override-signal <why> | --override-duplication <why> | --override-supply <why> | --override-all <why>"
 
 SOURCE_VAL=""
 # PASSTHROUGH IS PARTIALLY LIVE — do NOT delete it. The loop below reads it for
@@ -50,11 +50,19 @@ while [[ $# -gt 0 ]]; do
         --override-duplication)
             HEADERS+=(--header "X-Mind-Override-Duplication: ${2-}")
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-supply)
+            # Aspiration-supply gate bypass (/83): a SELF-GENERATED
+            # aspiration (idle-path origin_signal, or a "replace completed"
+            # motivation) refused for missing supply_evidence / unverifiable
+            # referents / blocker-as-gap / archive overlap / daily cap. Audited
+            # to world/aspiration-supply-overrides.jsonl by the gate.
+            HEADERS+=(--header "X-Mind-Override-Supply: ${2-}")
+            PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --override-all)
             # Send a single bulk header; the daemon fans this into any
             # unset per-gate slot (X-Mind-Override-Signal, X-Mind-Override-
-            # Duplication) and audits the bulk override to
-            # world/override-bypass-ledger.jsonl. Per-gate headers always win.
+            # Duplication, X-Mind-Override-Supply) and audits the bulk override
+            # to world/override-bypass-ledger.jsonl. Per-gate headers always win.
             HEADERS+=(--header "X-Mind-Override-All: ${2-}")
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         -h|--help)

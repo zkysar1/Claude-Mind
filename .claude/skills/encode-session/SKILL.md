@@ -974,11 +974,13 @@ writes. The framework's lockfiles handle ordering, but the LLM may briefly
 see "file is locked" retries — that's expected, not a failure.
 
 For Lane 1.6 specifically: the sweep does wm-read → mutate → wm-set across
-multiple Bash invocations, releasing the WM advisory lock between them.
-A concurrent autonomous-loop `wm-append knowledge_debt` between the read
-and the wm-set is clobbered (lost). This is the same RMW pattern
-`aspirations-consolidate` Step 2.25 uses — accepted limitation, not a bug
-introduced here.
+multiple Bash invocations, releasing the WM advisory lock between them, so a
+concurrent autonomous-loop `wm-append knowledge_debt` lands in that window.
+It is no longer LOST (g-115-8667): digest Section E step 5 carries the
+`--expect-update-count` CAS token, so the racing write is REFUSED with rc 9
+and the sweep re-applies onto a fresh read. Follow the digest's retry — the
+token alone detects the collision without resolving it. Same for
+`aspirations-consolidate` Step 2.25, which routes through the same step.
 
 ## Return Protocol
 

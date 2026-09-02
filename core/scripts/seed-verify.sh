@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# /seed verify <destination> — post-plant smoke test (8 checks).
+# /seed verify <destination> — post-plant smoke test (9 checks).
 #
 # Usage: seed-verify.sh <destination> [--manifest <path>] [--expect-commit]
 #
@@ -173,7 +173,19 @@ else
     WARNS=$((WARNS+1))
 fi
 
-# --- Check 8: Summary ---
+# --- Check 8: Executable bits by GIT INDEX MODE (, guard-5806) ---
+# The plant's own counters report what the copy DID; this reads what git
+# RECORDED -- source index vs destination index, for every path both carry. A
+# Windows-driven hop (core.fileMode=false) chmods into the void and lands NEW
+# scripts at 100644 while every other check here passes: v2.12.47, 15 files.
+run_check "Executable bits (source index vs destination index)" "fail" "8" \
+    --engine "$SCRIPT_DIR/_seed_engine.py" \
+    --cmd verify-exec-bits \
+    --manifest "$MANIFEST" \
+    --source "$PROJECT_ROOT" \
+    --dest "$DEST"
+
+# --- Check 9: Summary ---
 echo ""
 echo "[seed-verify] SUMMARY"
 echo "  FAILS: $FAILS"

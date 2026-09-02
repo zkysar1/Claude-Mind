@@ -98,6 +98,11 @@ from _goal_census import TERMINAL_STATUSES as _TERMINAL_STATUSES  # noqa: E402
 import _aspirations_resurrection as _resurrection  # noqa: E402  # archive-sweep resurrection predicate SSOT (2026-08-16)
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
+from gates.aspiration_supply import (  # noqa: E402
+    evaluate as _aspiration_supply_eval,
+    load_tree_keys as _supply_tree_keys,
+    DEFAULT_CONFIG as _SUPPLY_DEFAULT_CONFIG,
+)
 from gates.operator_offload import evaluate as _operator_offload_eval  # noqa: E402
 from gates.uncommitted_work import evaluate as _uncommitted_work_eval  # noqa: E402
 from gates.capability import evaluate as _capability_eval  # noqa: E402
@@ -119,6 +124,7 @@ from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E
 from gates.intended_agent_vocab import evaluate as _intended_agent_vocab_eval  # noqa: E402
 from gates.approval_reference import evaluate as _approval_ref_eval  # noqa: E402
 from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
+from gates.verification_outcomes import evaluate as _verification_outcomes_eval  # noqa: E402
 from gates.check_schema import evaluate as _check_schema_eval  # noqa: E402
 from gates.user_leg_scope import evaluate as _user_leg_scope_eval  # noqa: E402
 from gates.defer_classifier import (  # noqa: E402
@@ -197,6 +203,25 @@ _VALID_ASP_STATUSES = {"active", "paused", "completed", "retired"}
 _VALID_PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
 _VALID_SCOPES = {"sprint", "project", "initiative"}
 _VALID_COORDINATION_MODES = ("parallel", "serial", "mixed")
+
+#  — the closed vocabulary for release_negatives[].kind. Ordered by
+# what a consumer must be able to tell apart, not alphabetically:
+#   locus      a machine/host/checkout barrier — ANOTHER BOX CAN RUN IT
+#   capability a credential/identity/permission barrier — another box probably
+#              CANNOT, since the fleet shares its principals (-b), so a
+#              consumer that merges this into `locus` re-routes work to boxes
+#              that also cannot run it. The distinction is the point of typing.
+#   role       a Body-role barrier (worker holding reducer-only work)
+#   not-due    a recurring goal that was not actually due
+#   progress   a partial advance; work remains but nothing is blocking
+#   other      a real release fitting none of the above
+# Absence is NOT a member: rows written before this field carry no kind, and
+# consumers must read absent as UNMEASURED, never as a barrier.
+# Mirrored by _REASON_KINDS in core/scripts/aspirations-release.sh; the pair is
+# pinned by test_release_reason_kind.py::test_wrapper_and_daemon_token_sets_agree.
+RELEASE_REASON_KINDS = frozenset({
+    "locus", "capability", "role", "not-due", "progress", "other",
+})
 
 
 # Duplicated from aspirations.py — see DECISIONS.md #3 for the rationale.
@@ -1535,6 +1560,22 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     if ar_result["warned"]:
         warnings.append(ar_result["message"])
 
+    # 2c. absent-verification-outcomes advisory — . A goal filed with
+    # no verification.outcomes can only ever be ASSERTED complete: Phase-5
+    # verify, the learning gate and pre-completion review all read the
+    # structured field, so with none present they degrade to narrative and the
+    # executor writes the acceptance criteria at close time, when they are
+    # least impartial. WARN-only and deliberately so — fast-capture paths
+    # (from-followup, watchdog probes) file thin goals on purpose, and blocking
+    # capture to enforce rigor loses more than it gains.
+    #
+    # Goals whose description ADVERTISES criteria are suppressed inside the
+    # gate and left to the prose-verification blocker below, so one defect is
+    # never reported twice (see gates/verification_outcomes.py).
+    vo_result = _verification_outcomes_eval(goal)
+    if vo_result["warned"]:
+        warnings.append(vo_result["message"])
+
     # === Phase B: mutators (run BEFORE blockers that read these fields) ===
 
     # 3. category-suggest — only when caller didn't pick one or marked
@@ -2310,7 +2351,19 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
         response_body["routing_audit_investigate_id"] = routing_audit_investigate_id
     # Surface advisory warnings on 200 — wrappers (when migrated) can
     # re-emit them to stderr to match the legacy CLI experience.
+    #
+    # Backfill the goal id first (). Every Phase-A advisory runs
+    # BEFORE _allocate_goal_id stamps `goal["id"]`, so each one renders the id
+    # it was asked to name as the literal "<unassigned>" — a warning the reader
+    # cannot act on without correlating it to stdout by hand. The id exists by
+    # the time the response is assembled, so substitute it here rather than
+    # reordering the pipeline (advisories run early on purpose: they must not
+    # depend on allocation succeeding). Applies to every advisory, not just the
+    # verification-outcomes one, because they all share the placeholder.
     if warnings:
+        _gid = goal.get("id")
+        if _gid:
+            warnings = [w.replace("<unassigned>", _gid) for w in warnings]
         response_body["warnings"] = warnings
     return Response.json(response_body)
 
@@ -3831,6 +3884,23 @@ def _motivation_tokens(text: str) -> set:
     return {t for t in re.split(r"[^a-zA-Z0-9]+", text.lower()) if len(t) >= 4}
 
 
+def _load_idle_supply_config(project_root: Path) -> Dict[str, Any]:
+    """`idle_supply` block of core/config/aspirations.yaml over the gate's
+    defaults. Tolerates a missing block or file (older checkouts) — the gate
+    then runs on DEFAULT_CONFIG rather than silently disabling itself."""
+    import yaml
+    cfg: Dict[str, Any] = dict(_SUPPLY_DEFAULT_CONFIG)
+    try:
+        cfg_path = project_root / "core" / "config" / "aspirations.yaml"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            block = (yaml.safe_load(f) or {}).get("idle_supply") or {}
+        if isinstance(block, dict):
+            cfg.update({k: v for k, v in block.items() if v is not None})
+    except (OSError, yaml.YAMLError):
+        pass
+    return cfg
+
+
 def _load_intent_satisfaction_config(project_root: Path) -> Dict[str, Any]:
     """Load intent_satisfaction config from core/config/aspirations.yaml."""
     import yaml
@@ -5187,9 +5257,33 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
                 negatives = goal.get("release_negatives")
                 if not isinstance(negatives, list):
                     negatives = []
+                # : the TYPED half of the negative. `reason` below is
+                # prose and cannot be classified back into a category at usable
+                # precision — measured 2026-09-02 (alpha, cc-10) over the 52 live
+                # reason strings: an over-matching locus regex returns 8 with 3
+                # true positives (62.5% FP), and an under-matching one misses the
+                # Studio-gated rows entirely because they name no host. One live
+                # row reading "this box can still run this goal ... NOT FOR LOCUS"
+                # MATCHES the locus regex, which is the whole argument in one line.
+                #
+                # The releasing agent knows the category; asking it for a token
+                # removes the inference instead of relocating it. Unrecognised
+                # tokens are DROPPED rather than stored, so a consumer can trust
+                # that any present `kind` is vocabulary — the wrapper refuses them
+                # at rc=1 first, and this is the defence for a direct API caller.
+                #
+                # ABSENT IS THE NORM AND MUST STAY MEANINGFUL: every row written
+                # before this field lacks it, so consumers MUST read absence as
+                # UNMEASURED (no penalty), never as "runnable nowhere".
+                # Kept in sync with _REASON_KINDS in core/scripts/aspirations-release.sh
+                # by test_release_reason_kind.py::test_wrapper_and_daemon_token_sets_agree.
+                reason_kind = (ctx.query.get("reason_kind") or "").strip()
+                entry_kind = reason_kind if reason_kind in RELEASE_REASON_KINDS else None
+
                 negatives.append({
                     "box": box,
                     "agent": agent,
+                    "kind": entry_kind,
                     #  (echo, cc-03, 2026-09-01): cap raised 500 -> 2000
                     # AND truncation made VISIBLE. The list is ALREADY bounded to
                     # 20 entries below, so this per-entry cap was redundant growth
@@ -7691,6 +7785,8 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
       1. Parse body JSON (the aspiration dict)
       2. Apply defaults (archived, blocked_since)
       3. Validate aspiration + embedded goals
+      3.5 Run the aspiration-supply gate (aspiration-level; fires only for
+          self-generated origins / successor-shaped motivations — g-357-82)
       4. Run origin-signal gate per goal (batch)
       5. Apply goal-source auto-derive per goal
       6. Run goal-duplication gate per goal
@@ -7703,6 +7799,7 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     Override headers:
       X-Mind-Override-Signal       — origin-signal gate bypass (per-gate)
       X-Mind-Override-Duplication  — goal-duplication gate bypass (per-gate)
+      X-Mind-Override-Supply       — aspiration-supply gate bypass (per-gate)
       X-Mind-Override-All          — bulk bypass (fans into any unset
                                        per-gate slot; per-gate ALWAYS wins;
                                        audited to world/override-bypass-ledger.jsonl)
@@ -7758,6 +7855,13 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
             1 for g in asp.get("goals", []) if not g.get("recurring")
         )
     now_ts = datetime.now().isoformat(timespec="seconds")
+    # Aspiration-level created_at / created_by_agent (): the record
+    # had no creation stamp at all, so nothing could count "self-generated
+    # aspirations filed today" — the supply gate's daily cap keys on both.
+    # setdefault: a transplant/migration caller's own values are preserved.
+    asp.setdefault("created_at", now_ts)
+    if agent:
+        asp.setdefault("created_by_agent", agent)
     for g in asp.get("goals", []):
         if g.get("blocked_by") and not g.get("blocked_since"):
             g["blocked_since"] = now_ts
@@ -7825,6 +7929,7 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     raw_override_signal = _header_override(ctx, "X-Mind-Override-Signal")
     raw_override_dup = _header_override(ctx, "X-Mind-Override-Duplication")
     raw_override_off = _header_override(ctx, "X-Mind-Override-Offload")
+    raw_override_supply = _header_override(ctx, "X-Mind-Override-Supply")
     bulk_slots_filled: List[str] = []
     if bulk_override:
         if raw_override_signal is None:
@@ -7833,9 +7938,46 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
             bulk_slots_filled.append("override_duplication")
         if raw_override_off is None:
             bulk_slots_filled.append("override_offload")
+        if raw_override_supply is None:
+            bulk_slots_filled.append("override_supply")
     override_signal = raw_override_signal or bulk_override
     override_dup = raw_override_dup or bulk_override
     override_off = raw_override_off or bulk_override
+    override_supply = raw_override_supply or bulk_override
+
+    # Aspiration-supply gate ( / ) — aspiration-level, BEFORE
+    # the per-goal gates. Fires only for self-generated origins (idle path,
+    # blocker synthesis, replacement generation) or a successor-shaped
+    # motivation; user-directed records return gated=False and pass. The
+    # existing set is live ∪ archive of the TARGET queue, read outside the
+    # lock (the in-lock re-read below is authoritative for id minting; the
+    # gate needs the archive only for overlap and the daily cap, where a
+    # concurrent add can at worst let one extra record through).
+    supply_result = _aspiration_supply_eval(
+        asp,
+        existing=(_read_jsonl(live_path)
+                  + _read_jsonl(live_path.parent / "aspirations-archive.jsonl")),
+        tree_keys=_supply_tree_keys(ctx.paths.world),
+        override_supply=override_supply,
+        agent_name=ctx.paths.agent_name or "",
+        world_dir=ctx.paths.world,
+        project_root=ctx.paths.project_root,
+        meta_dir=ctx.paths.meta,
+        agent_dir=(ctx.paths.agent if getattr(ctx.paths, "agent", None) else None),
+        config=_load_idle_supply_config(ctx.paths.project_root),
+    )
+    if supply_result.get("would_block"):
+        return Response.json({
+            "error": "aspiration_supply_blocked",
+            "gate": "aspiration-supply-gate",
+            "gate_output": supply_result,
+        }, status=400)
+    if supply_result.get("override_applied"):
+        warnings.append(
+            "aspiration-supply-gate: refusal overridden "
+            f"({supply_result['override_applied']}) — failures: "
+            + ", ".join(f["check"] for f in supply_result.get("failures", []))
+        )
 
     # Origin-signal gate per goal (batch — any block rejects the whole asp)
     for g in asp.get("goals", []):

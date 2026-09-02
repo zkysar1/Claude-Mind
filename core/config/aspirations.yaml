@@ -405,6 +405,29 @@ precheck:
 anticipatory_reflection:
   enabled: false               # default-OFF off-ramp; env override GATE_3_96_ENABLED for experiments
 
+# --- CLOSE-REVIEW GATE (, Definition of Done) ---
+# Read by core/scripts/close-review-gate.py, wired in iteration-close.sh do_verify.
+# A MISSING key reads false — fail-safe to dormant; the gate never raises on config.
+# Each flag has its OWN precondition and they flip independently. Do NOT enable
+# either "because the code is written": a gate whose named remedy is unreachable
+# forces callers onto --override and manufactures false ledger records (guard-1532).
+close_review_gate:
+  # Tier-2 goals refuse to close without an APPROVE verdict artifact at
+  # agents/<agent>/session/close-reviews/<goal-id>.json.
+  # PRECONDITION TO ENABLE: the fresh-eyes close reviewer (the verdict PRODUCER,
+  # sibling goal ) exists and is invocable. Until then the refusal text
+  # names a remedy nobody can run.
+  enabled: false
+  # Refuse a close whose own outcome_note/progress_note carries a HIGH-confidence
+  # not-done marker (reuses the closed_against_own_note detector, precheck 0.5b.22).
+  # PRECONDITION TO ENABLE: measure the refusal rate over the live completed
+  # population — the high tier is known to flag at least one legitimate close
+  # (, "do not reopen this goal"). Refusal-with-context, never a hard
+  # deny; and do NOT widen the detector to raise its yield (guard-2201).
+  note_marker_enabled: false
+  # Env overrides for tests / a deliberate one-run enable:
+  #   CLOSE_REVIEW_GATE_ENABLED=1  CLOSE_REVIEW_NOTE_MARKER_ENABLED=1
+
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals
   novelty_drought_hours: 48     # hours since last first-time goal completion
@@ -1921,6 +1944,51 @@ dry_idle_backoff:
                                # productivity-stop-gate for a graceful drop to assistant
   # sleep(streak) = min(base_seconds * multiplier**(streak-1), max_seconds)
   #   streak 1->120s 2->240s 3->480s 4->960s 5->1920s 6->3840s 7+->7200s (capped)
+
+# --- IDLE SUPPLY GATE ( / , alpha 2026-09-02) ---
+# Script-gated quality bar for SELF-GENERATED aspirations (the all-blocked B2
+# create-aspiration path, B6.7 blocker synthesis, complete-review replacement
+# generation). Enforced inside the daemon's aspiration add endpoint via
+# core/scripts/gates/aspiration_supply.py; callable pre-flight through
+# core/scripts/aspiration-supply-gate.py. Measured on a live deployment
+# 2026-09-02: eleven self-generated aspirations in six days restating one idea,
+# every prose quality rule in create-aspiration skipped, zero interestingness
+# events logged. The judgments now live here, not in the skill's prose.
+# User-directed / board-derived aspirations are never gated (gated: false).
+idle_supply:
+  enabled: true
+  # origin_signal values that mark the self-generated lane — case-insensitive
+  # SUBSTRING match (one deployment spelled the idle path eight ways).
+  gated_origin_patterns:
+    - all_blocked
+    - all-blocked
+    - idle_fallback
+    - blocker_pattern
+    - constraint-aware
+    - constraint_aware
+    - successor
+    - replacement
+    - self_gap
+    - strategic_scan
+    - gap_analysis
+  overlap_threshold: 0.40      # fraction of the candidate's distinctive tokens already in one existing aspiration
+  min_shared_tokens: 4         # an overlap refusal needs at least this many shared tokens (tiny candidates inflate the ratio)
+  min_checked_referents: 2     # supply_evidence.checked entries that must EXIST (ids, tree keys, paths)
+  min_gap_chars: 40            # supply_evidence.gap — what is missing, concretely
+  min_needle_chars: 30         # supply_evidence.needle — the user-visible outcome
+  max_self_generated_per_agent_per_day: 2   # juice-vs-squeeze backstop; 0 disables. Beyond it the idle path goes quiet.
+  # B6.7 Target 1 (blocker-pattern → Unblock aspiration synthesis) skips these
+  # external_id class prefixes: they are self-resolving (a hypothesis gate is a
+  # time lock; a time-gate / calendar precondition expires on its own) or a
+  # routing artifact (not-my-lane), so an "Unblock:" for them is noise
+  # ( — the hard exclusion list the skill used to defer to judgment).
+  blocker_pattern_exclusions:
+    - hypothesis-gate
+    - time-gate
+    - precondition
+    - not-my-lane
+    - narrative-defer
+    - explicit-status
 
 # --- BATCH CALIBRATION SWEEP (Change 3) ---
 # When a single recurring goal hits cargo_cult_threshold, redirect to a

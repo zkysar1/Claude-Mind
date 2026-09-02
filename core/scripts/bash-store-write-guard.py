@@ -127,6 +127,13 @@ WRITER_FOR = {
     "working-memory.yaml": "wm-set.sh / wm-append.sh / wm-prune.sh",
     "team-state.yaml": "team-state-update.sh",
     "_tree.yaml": "tree-update.sh (Edit the node .md; the hook syncs the index)",
+    "board/<channel>.jsonl": (
+        "board-post.sh --channel <channel> [--type <t>] [--reply-to <id>] "
+        "[--tags <a,b>] with the message text on STDIN (`echo \"msg\" | ...` or "
+        "`< file`; there is no --message flag). It stamps id, author, session_id "
+        "and the naive timestamp that board-read.sh --since filters on -- a "
+        "hand-typed record with a `Z` suffix is invisible to every watcher"
+    ),
 }
 
 # The sanctioned READER, named in the parse deny. The single-record forms come
@@ -151,15 +158,39 @@ READER_FOR = {
     "working-memory.yaml": "`wm-read.sh <slot> --json` (the slot name, e.g. current_goal, goals_completed_this_session)",
     "team-state.yaml": "`team-state-read.sh --field <dotted.path> --json`",
     "_tree.yaml": "`tree-find-node.sh --text <q>` / `retrieve.sh --category <q> --depth shallow`",
+    "board/<channel>.jsonl": (
+        "`board-read.sh --channel <channel> [--since <window>] [--author <a>] "
+        "[--tag <t>] [--type <t>] [--last <N>] [--json]` / `board-channels.sh`"
+    ),
 }
 
 _BASENAME_ALT = "(?:" + "|".join(re.escape(b) for b in GOVERNED_BASENAMES) + ")"
+# A message-board CHANNEL file: any `board/<channel>.jsonl`. The channel set is
+# open (board.py globs the directory), so this store is named by its parent
+# directory, not by a fixed basename. Measured 2026-09-02 (a downstream
+# deployment): five posts hand-appended to board/findings.jsonl in one day
+# (`cat >> ... <<'EOF'`, both Bodies), each stamped with a Z-suffixed timestamp
+# that board-read.sh --since never returns -- every watcher on the channel
+# missed them. This guard fired 236 times that day; `findings.jsonl` simply was
+# not a governed basename. The Edit/Write deny globs (`*/world/*.jsonl`) have the
+# same blind spot: `*` does not cross `/`, so `world/board/x.jsonl` is one
+# segment too deep (probed 2026-09-02).
+# The write scan rewrites `<channel>` to PLACEHOLDER first (see _PLACEHOLDER_RE),
+# so the documented form `board/<channel>.jsonl` -- this guard's own deny text,
+# quoted in a commit message or a heredoc beside `sed -i` -- must not read as a
+# store. Measured on the first commit that shipped the board rule (2026-09-02):
+# a board post DESCRIBING the rule was refused as "in-place edit of
+# board/PLACEHOLDER.jsonl". A fixed basename cannot collide with the
+# placeholder token; an open channel name can, hence the lookahead.
+_BOARD_CHANNEL = r"board/(?!PLACEHOLDER\b)[\w\-]+\.jsonl"
+_BOARD_KEY = "board/<channel>.jsonl"
+_STORE_ALT = "(?:" + _BASENAME_ALT + "|" + _BOARD_CHANNEL + ")"
 # A path token that ENDS in a governed basename: `world/aspirations.jsonl`,
 # `"$WORLD_PATH/guardrails.jsonl"`, `agents/alpha/session/working-memory.yaml`.
 # The lookbehind keeps `backup-aspirations.jsonl` / `my_guardrails.jsonl` out: a
 # governed basename is the WHOLE final path component, never a suffix of one.
-_PATH_TOKEN = r"(?:[\w./~$\{\}\-]*/)?(?<![\w\-])" + _BASENAME_ALT + r"(?![\w.\-])"
-_BASENAME_END_RE = re.compile(r"(?<![\w\-])" + _BASENAME_ALT + r"$")
+_PATH_TOKEN = r"(?:[\w./~$\{\}\-]*/)?(?<![\w\-])" + _STORE_ALT + r"(?![\w.\-])"
+_BASENAME_END_RE = re.compile(r"(?<![\w\-])" + _STORE_ALT + r"$")
 
 _REDIRECT_RE = re.compile(r"(?<![<>&\d])\d?>{1,2}\s*[\"']?(" + _PATH_TOKEN + ")")
 _TEE_RE = re.compile(r"\btee\b(?:\s+-\w+)*\s+[\"']?(" + _PATH_TOKEN + ")")
@@ -240,8 +271,12 @@ def _is_temp_path(token: str) -> bool:
 
 
 def _basename_of(token: str) -> str:
+    """The WRITER_FOR / READER_FOR key for a governed path token. A board channel
+    is keyed by its parent directory (`board/<channel>.jsonl`), every other store
+    by its basename."""
     m = _BASENAME_END_RE.search(token)
-    return m.group(0) if m else token
+    base = m.group(0) if m else token
+    return _BOARD_KEY if base.startswith("board/") else base
 
 
 def _governed(token: str) -> bool:

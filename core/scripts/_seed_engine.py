@@ -32,7 +32,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import _seed_transforms as xform  # noqa: E402
-from _exec_bits import carry_exec_bit, index_exec_map  # noqa: E402  ()
+from _exec_bits import (  # noqa: E402  (; index-level carry + verify )
+    carry_exec_bit, carry_index_exec_bits, index_exec_map, verify_index_exec_bits,
+)
 
 try:
     import yaml
@@ -1151,6 +1153,17 @@ def do_remove_orphans(dest_root: Path, manifest: dict, source_root: Path,
         # microsecond precision closes it.
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S-%f")
         graveyard = dest_root / f".seed-backup-orphans-{timestamp}"
+        # ...on a clock that actually ticks per microsecond. Windows' does not
+        # (~1-15 ms), so %f repeats across two back-to-back sweeps and both land
+        # in ONE graveyard again — the second RECEIPT.json overwriting the first,
+        # exactly the defect the precision was added for. Measured 2026-09-02
+        # (DESKTOP-O91DLK2, test_graveyard_survives_a_subsequent_sweep red
+        # in-suite, green solo). Uniqueness is a property of the DIRECTORY, so
+        # check the directory: a taken name gets a counter suffix.
+        n = 1
+        while graveyard.exists():
+            n += 1
+            graveyard = dest_root / f".seed-backup-orphans-{timestamp}-{n}"
         entries = []
         failures = []
 
@@ -2032,6 +2045,19 @@ def _parse_args():
     sp.add_argument("--source", default=str(PROJECT_ROOT))
     sp.add_argument("--dest", required=True)
 
+    # : the git-level exec-bit carry and its verifier. --manifest is
+    # accepted (seed-verify's formatter always passes one) and unused: index
+    # modes are compared for every path BOTH repos carry, manifest-free.
+    sp = sub.add_parser("carry-exec-bits")
+    sp.add_argument("--manifest", default=None)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
+    sp = sub.add_parser("verify-exec-bits")
+    sp.add_argument("--manifest", default=None)
+    sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--dest", required=True)
+
     sp = sub.add_parser("diff")
     sp.add_argument("--manifest", required=True)
     sp.add_argument("--source", default=str(PROJECT_ROOT))
@@ -2055,7 +2081,7 @@ def _parse_args():
 
 def main():
     args = _parse_args()
-    manifest_path = Path(args.manifest) if hasattr(args, "manifest") else None
+    manifest_path = Path(args.manifest) if getattr(args, "manifest", None) else None
     source_root = Path(getattr(args, "source", PROJECT_ROOT)).resolve()
     dest_root = Path(args.dest).resolve() if hasattr(args, "dest") else None
 
@@ -2105,6 +2131,16 @@ def main():
         # cruft is a WARN not a FAIL — exit 0 even with hits
     elif args.cmd == "verify-integrity":
         result = do_verify_integrity(dest_root, manifest, source_root)
+        print(json.dumps(result, indent=2))
+        if not result["pass"]:
+            sys.exit(1)
+    elif args.cmd == "carry-exec-bits":
+        result = carry_index_exec_bits(source_root, dest_root)
+        print(json.dumps(result, indent=2))
+        if not result["pass"]:
+            sys.exit(1)
+    elif args.cmd == "verify-exec-bits":
+        result = verify_index_exec_bits(source_root, dest_root)
         print(json.dumps(result, indent=2))
         if not result["pass"]:
             sys.exit(1)

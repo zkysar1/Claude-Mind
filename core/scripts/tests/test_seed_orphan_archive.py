@@ -223,3 +223,41 @@ def test_manifested_file_is_never_treated_as_an_orphan(tmp_path):
 
     assert "core/keep.py" not in res["removed"]
     assert (dest / "core" / "keep.py").exists()
+
+
+def test_two_sweeps_in_one_clock_tick_get_separate_graveyards(monkeypatch, tmp_path):
+    """The %f precision only helps on a clock that ticks per microsecond.
+
+    Windows' ticks every ~1-15 ms -- measured 2026-09-02 (DESKTOP-O91DLK2): six
+    back-to-back datetime.now() calls returned the same %f -- so two sweeps can
+    share a timestamp and, before the directory check, ONE graveyard: the second
+    RECEIPT.json overwrote the first while the archived file sat beside it,
+    unlisted. That is the flake test_graveyard_survives_a_subsequent_sweep showed
+    in-suite (red) and could not show solo (green). Pin the clock and prove the
+    split deterministically, on every platform.
+    """
+    from datetime import datetime as _real_dt
+
+    frozen = _real_dt(2026, 9, 2, 12, 0, 0, 123456)
+
+    class _FrozenDT(_real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(_engine, "datetime", _FrozenDT)
+    src, dest = _mk_source(tmp_path), _mk_dest(tmp_path)
+
+    res1 = _engine.do_remove_orphans(dest, MANIFEST, src)
+    (dest / "core" / "gone2.py").write_text("SECOND = 2\n", encoding="utf-8")
+    res2 = _engine.do_remove_orphans(dest, MANIFEST, src)
+
+    assert ORPHAN_REL in res1["removed"] and "core/gone2.py" in res2["removed"]
+    graves = sorted(g.name for g in _graveyards(dest))
+    assert graves == [
+        ".seed-backup-orphans-20260902T120000-123456",
+        ".seed-backup-orphans-20260902T120000-123456-2",
+    ], graves
+    # Both RECEIPTs exist -- neither sweep's row was overwritten.
+    receipts = sorted(p for g in _graveyards(dest) for p in g.iterdir() if p.name.lower().startswith("receipt"))
+    assert len(receipts) == 2, receipts

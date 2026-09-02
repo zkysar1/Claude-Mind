@@ -52,9 +52,30 @@
 #
 # ── Usage ───────────────────────────────────────────────────────────────────────
 #   provision-from-vault.sh [--force] [--dry-run] [--out <path>]
+#   provision-from-vault.sh --append-key <NAME> [--allow-replace] [--also K=V ...]
 #     --force    overwrite an already-provisioned .env.local (FROM-state guard off)
+#                DESTRUCTIVE on an ACCRETED file -- see --append-key below.
 #     --dry-run  read + map + verify, but do NOT write .env.local
 #     --out P    target path (default: <repo-root>/.env.local)
+#     --append-key NAME
+#                ADD OR ROTATE EXACTLY ONE KEY on a LIVE, ACCRETED .env.local
+#                without truncating the keys this vault does not know about.
+#                This is the mode to use on a box that is ALREADY provisioned.
+#     --allow-replace  permit --append-key to REPLACE a key whose live value
+#                differs (a rotation). Without it, a differing value REFUSES.
+#     --also K=V  append a companion NON-SECRET var the vault does not carry
+#                (repeatable). Written in the same pass as the key.
+#
+# WHY --append-key EXISTS (gap-054, guard-2023, rb-5914). The default mode is a
+# fresh-container bootstrap: it TRUNCATES $OUT and rewrites it from the vault.
+# That is correct on a file this script fully GENERATES and catastrophic on one
+# that has ACCRETED keys across many sessions -- rb-5914: the discriminator is
+# WHO OWNS THE FILE'S CONTENTS, not whether the tool rewrites or merges. Measured
+# on cc-03: --force would have replaced 25 accreted keys with the vault's 5,
+# destroying ANTHROPIC_API_KEY / ARC_API_KEY / AYO_OPERATOR_KEY / STORAGE_BACKEND.
+# Three agents on three boxes within nine hours each read this script, recognised
+# the trap, and hand-built the safe append; a convention doc did not stop the
+# third. --append-key is that hand-built procedure, mechanised.
 #
 # ── Configuration (env vars; defaults suit ENVIRONMENT_ID=ayoai-mind) ───────────
 #   BOOTSTRAP_KEY_PATH  bootstrap SSH key (default /root/.ssh/efs-master-key.pem)
@@ -74,11 +95,17 @@ set -euo pipefail
 FORCE=0
 DRY_RUN=0
 OUT=""
+APPEND_KEY=""
+ALLOW_REPLACE=0
+ALSO_VARS=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --force)   FORCE=1 ;;
         --dry-run) DRY_RUN=1 ;;
         --out)     OUT="${2:-}"; shift ;;
+        --append-key)   APPEND_KEY="${2:-}"; shift ;;
+        --allow-replace) ALLOW_REPLACE=1 ;;
+        --also)    ALSO_VARS="${ALSO_VARS}${2:-}"$'\n'; shift ;;
         -h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "provision-from-vault: unknown arg '$1'" >&2; exit 2 ;;
     esac
@@ -121,9 +148,31 @@ if [ -z "${VAULT_SSH_HOST:-}" ] || [ -z "${VAULT_REMOTE_PATH:-}" ]; then
     echo "  Set them to the operator host and the vault file path on it." >&2
     exit 2
 fi
-if [ -f "$OUT" ] && grep -q '^MIND_AWS_ACCESS_KEY_ID=..*' "$OUT" 2>/dev/null && [ "$FORCE" -eq 0 ]; then
+# --append-key and --force are contradictory: one preserves the accreted file,
+# the other replaces it. Refuse rather than pick.
+if [ -n "$APPEND_KEY" ] && [ "$FORCE" -eq 1 ]; then
+    echo "provision-from-vault: --append-key and --force are mutually exclusive." >&2
+    echo "  --append-key PRESERVES the accreted file; --force REPLACES it." >&2
+    exit 2
+fi
+if [ -n "$APPEND_KEY" ]; then
+    case "$APPEND_KEY" in
+        [A-Za-z_]*[!A-Za-z0-9_]*|"") 
+            echo "provision-from-vault: --append-key takes a bare env var NAME (got '$APPEND_KEY')." >&2
+            exit 2 ;;
+    esac
+fi
+# The FROM-state guard exists to stop a re-run TRUNCATING an already-provisioned
+# file. --append-key cannot truncate, so the guard does not apply to it —
+# appending to an already-provisioned file is precisely its job.
+if [ -f "$OUT" ] && grep -q '^MIND_AWS_ACCESS_KEY_ID=..*' "$OUT" 2>/dev/null \
+   && [ "$FORCE" -eq 0 ] && [ -z "$APPEND_KEY" ]; then
     echo "provision-from-vault: $OUT already provisioned (MIND_AWS_ACCESS_KEY_ID present)." >&2
-    echo "  Re-run with --force to overwrite. (idempotent no-op by default)" >&2
+    echo "  To ADD OR ROTATE ONE KEY on this live file, use:" >&2
+    echo "      provision-from-vault.sh --append-key <NAME> [--allow-replace]" >&2
+    echo "  --force REWRITES $OUT from the vault and DELETES every key the vault" >&2
+    echo "  does not carry (measured on cc-03: 25 accreted keys -> 5). Use it only" >&2
+    echo "  on a fresh container. (idempotent no-op by default; guard-2023)" >&2
     exit 0
 fi
 
@@ -387,6 +436,118 @@ fi
 if [ -z "$ENV_BODY" ]; then
     echo "provision-from-vault: no vault entries matched prefix '${prefix}' — check VAULT_KEY_PREFIX (currently '$VAULT_KEY_PREFIX')." >&2
     exit 1
+fi
+
+# ── Append mode (gap-054): ADD OR ROTATE ONE KEY, never truncate ────────────────
+# Reuses the read+map pipeline above verbatim, so prefix stripping and per-agent
+# scoping cannot drift from the bootstrap path (guard-2676: one implementation).
+# ONLY the write differs: merge one key into the live file instead of replacing it.
+if [ -n "$APPEND_KEY" ]; then
+    # Presence-probe the vault BY NAME (invariant 5 — the value is never printed,
+    # here or anywhere below; only OK/EMPTY/derived booleans are).
+    vault_line="$(printf '%s' "$ENV_BODY" | grep -m1 "^${APPEND_KEY}=" || true)"
+    if [ -z "$vault_line" ]; then
+        echo "provision-from-vault: '$APPEND_KEY' is not in the vault under prefix '${VAULT_KEY_PREFIX}'." >&2
+        echo "  (probed by NAME only; no value was read or printed)" >&2
+        echo "  Keys this vault DOES carry for this box:" >&2
+        printf '%s' "$ENV_BODY" | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/    \1/p' >&2
+        exit 1
+    fi
+    new_val="${vault_line#*=}"
+    if [ -z "$new_val" ]; then
+        echo "provision-from-vault: '$APPEND_KEY' is present in the vault but EMPTY — refusing to write an empty credential." >&2
+        exit 1
+    fi
+
+    _key_count() { [ -f "$1" ] && grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$1" 2>/dev/null || echo 0; }
+    before="$(_key_count "$OUT")"
+
+    # Live state, decided WITHOUT printing either value (guard-1270: printing a
+    # secret to check it is the leak case).
+    live_line=""
+    [ -f "$OUT" ] && live_line="$(grep -m1 "^${APPEND_KEY}=" "$OUT" || true)"
+    if [ -n "$live_line" ]; then
+        live_val="${live_line#*=}"
+        if [ "$live_val" = "$new_val" ]; then
+            echo "provision-from-vault: $APPEND_KEY already matches the vault — no write. ($before key(s) intact)" >&2
+            exit 0
+        fi
+        if [ "$ALLOW_REPLACE" -eq 0 ]; then
+            echo "provision-from-vault: $APPEND_KEY exists in $OUT with a DIFFERENT value." >&2
+            echo "  Refusing to overwrite a live credential by default. This is a ROTATION:" >&2
+            echo "      provision-from-vault.sh --append-key $APPEND_KEY --allow-replace" >&2
+            echo "  (values compared in memory; neither was printed)" >&2
+            exit 3
+        fi
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        verb="append"; [ -n "$live_line" ] && verb="replace"
+        echo "provision-from-vault: --dry-run — would $verb $APPEND_KEY in $OUT ($before key(s) now)" >&2
+        exit 0
+    fi
+
+    umask 077
+    if [ ! -f "$OUT" ]; then
+        : > "$OUT"; chmod 600 "$OUT" 2>/dev/null || true
+    fi
+    if [ -n "$live_line" ]; then
+        # ROTATE: rewrite through a temp file in the SAME directory, then mv.
+        # A temp+mv is atomic, so an interrupted rotation leaves the ORIGINAL
+        # file whole — the one property the --force path does not have.
+        tmp_out="$(mktemp "${OUT}.append.XXXXXX")"
+        chmod 600 "$tmp_out" 2>/dev/null || true
+        replaced=0
+        while IFS= read -r ln || [ -n "$ln" ]; do
+            case "$ln" in
+                "${APPEND_KEY}="*) [ "$replaced" -eq 0 ] && printf '%s=%s\n' "$APPEND_KEY" "$new_val" >> "$tmp_out" && replaced=1 ;;
+                *) printf '%s\n' "$ln" >> "$tmp_out" ;;
+            esac
+        done < "$OUT"
+        mv -f "$tmp_out" "$OUT"
+        chmod 600 "$OUT" 2>/dev/null || true
+        echo "provision-from-vault: rotated $APPEND_KEY in $OUT (mode 600)" >&2
+    else
+        # APPEND: a missing trailing newline would otherwise splice this key onto
+        # the previous line, corrupting BOTH.
+        if [ -s "$OUT" ] && [ "$(tail -c1 "$OUT" | wc -l)" -eq 0 ]; then printf '\n' >> "$OUT"; fi
+        printf '%s=%s\n' "$APPEND_KEY" "$new_val" >> "$OUT"
+        echo "provision-from-vault: appended $APPEND_KEY to $OUT (mode 600)" >&2
+    fi
+
+    # Companion NON-SECRET vars the vault does not carry (gap-054 step 3).
+    n_also=0
+    while IFS= read -r kv; do
+        [ -n "$kv" ] || continue
+        case "$kv" in
+            *=*) ;;
+            *) echo "provision-from-vault: --also expects K=V (got '$kv')" >&2; exit 2 ;;
+        esac
+        also_k="${kv%%=*}"
+        if [ -f "$OUT" ] && grep -q "^${also_k}=" "$OUT"; then
+            echo "provision-from-vault: companion $also_k already present — left as-is." >&2
+            continue
+        fi
+        if [ -s "$OUT" ] && [ "$(tail -c1 "$OUT" | wc -l)" -eq 0 ]; then printf '\n' >> "$OUT"; fi
+        printf '%s\n' "$kv" >> "$OUT"
+        n_also=$((n_also+1))
+    done <<< "$ALSO_VARS"
+
+    # Verify by RE-READING the file (guard-2023: diff key counts). An echo of the
+    # write is not evidence the write landed.
+    after="$(_key_count "$OUT")"
+    if [ "$after" -lt "$before" ]; then
+        echo "provision-from-vault: FATAL — key count FELL ${before} -> ${after}. $OUT may be damaged." >&2
+        exit 1
+    fi
+    if ! grep -q "^${APPEND_KEY}=..*" "$OUT"; then
+        echo "provision-from-vault: FATAL — $APPEND_KEY is not present after the write." >&2
+        exit 1
+    fi
+    echo "provision-from-vault: verify (key names + presence only; NO values printed):" >&2
+    printf '    %-32s [OK]\n' "$APPEND_KEY" >&2
+    echo "provision-from-vault: ${before} key(s) before, ${after} after (+${n_also} companion(s)); no key removed." >&2
+    exit 0
 fi
 
 # ── Write (mechanism step 4): mode 600, single write ────────────────────────────

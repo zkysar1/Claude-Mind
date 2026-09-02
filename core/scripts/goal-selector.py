@@ -3872,7 +3872,7 @@ def lane_nominee_exclusion(s):
          under-counting means some hypothesis goals still slip through as
          nominees, which is the safe direction. Measured miss 2026-08-19 (echo,
          cc-03): the banner nominated g-326-221 'Resolve hypothesis: recency-decay
-         defaults rarely flip IAUS argmax' -- non-recurring, so clause (ii) could
+         defaults rarely flip <scorer> argmax' -- non-recurring, so clause (ii) could
          not catch it.
     parked -- goals the OWNER has explicitly held. Not a directive clause; it is
          a stronger constraint that the directive never anticipated. Measured

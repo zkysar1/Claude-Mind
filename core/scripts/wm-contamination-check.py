@@ -381,7 +381,43 @@ def analyze(wm: dict, world_dir: Path | None, agent_dir: Path, agent: str,
 
 def quarantine(wm_path: Path, project_root: Path) -> tuple[bool, str]:
     """Move the contaminated WM aside and write a fresh template in its place.
-    Atomic (os.replace). Returns (ok, quarantine_path_or_error)."""
+    Atomic (os.replace). Returns (ok, quarantine_path_or_error).
+
+    HOLDS THE WM LOCK ACROSS BOTH REPLACES (g-115-8667). Each os.replace is
+    atomic on its own, but the PAIR is a read-modify-write on the same file the
+    daemon writes under its own lock, and nothing here held that lock. A daemon
+    set landing between them is reverted AFTER its own read-back verified it —
+    the g-115-7322 signature (fresh mtime, update_count back at the snapshot's
+    value), which is why it reads as a lost update rather than an error.
+
+    LOCKS THE PATH IT WAS HANDED, NOT wm.wm_lock(). wm_lock() resolves through
+    wm_path(), which honors BODY_WM_PATH, so it locks whatever the ENVIRONMENT
+    points at rather than the file this function mutates. Measured 2026-09-02
+    (alpha, cc-10): with BODY_WM_PATH set, wm_lock_path() returns the Body's
+    sessions/<sid>/working-memory.lock while this function may be quarantining
+    the agent-wide WM. Taking the wrong lock is indistinguishable from taking
+    the right one, so the fix would look complete while the race persisted.
+    When the two paths agree — the reducer case, which is the one that matters —
+    this IS the daemon's lock file.
+    """
+    from _fileops import acquire_lock, release_lock
+
+    lock_path = wm_path.with_suffix(".lock")
+    try:
+        acquire_lock(lock_path, stale_seconds=10)
+    except Exception as e:  # noqa: BLE001 — lock unavailable is a refusal, not a crash
+        # Fail CLOSED: quarantine destroys a WM, so not holding the lock is a
+        # reason NOT to proceed. The caller already treats False as "did not
+        # quarantine" and reports it.
+        return False, f"quarantine-failed: WM lock unavailable: {e}"
+    try:
+        return _quarantine_locked(wm_path, project_root)
+    finally:
+        release_lock(lock_path)
+
+
+def _quarantine_locked(wm_path: Path, project_root: Path) -> tuple[bool, str]:
+    """The original body, unchanged, now only ever called under the WM lock."""
     try:
         ts = _now().strftime("%Y%m%dT%H%M%S")
         wm_dir = wm_path.parent
@@ -391,14 +427,31 @@ def quarantine(wm_path: Path, project_root: Path) -> tuple[bool, str]:
         while q_path.exists():
             suffix += 1
             q_path = wm_dir / f"working-memory-quarantined-{ts}-{suffix}.yaml"
-        os.replace(str(wm_path), str(q_path))
+        # : hold the WM lock across the SWAP. Between the two
+        # os.replace calls wm_path DOES NOT EXIST; a concurrent daemon
+        # /v1/wm/set landing in that window re-creates the file and the second
+        # replace then clobbers it. That loss is NOT preserved by the
+        # quarantine copy -- the write never reached the quarantined file -- so
+        # it is the one silent-loss path here, distinct from the (intended)
+        # wholesale set-aside of a contaminated WM.
+        # guard-1357: lock the DERIVED .lock sibling, the same path
+        # file_locks.locked() derives in the daemon. Local import so an import
+        # fault is caught by the enclosing except and this stays fail-open --
+        # the script must never block session start.
+        from _fileops import acquire_lock, release_lock
+        _lock = wm_path.with_suffix(".lock")
+        acquire_lock(_lock, stale_seconds=10)
+        try:
+            os.replace(str(wm_path), str(q_path))
 
-        import yaml
-        fresh = _fresh_wm(project_root)
-        tmp = wm_dir / f".working-memory-fresh-{ts}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            yaml.dump(fresh, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        os.replace(str(tmp), str(wm_path))
+            import yaml
+            fresh = _fresh_wm(project_root)
+            tmp = wm_dir / f".working-memory-fresh-{ts}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                yaml.dump(fresh, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            os.replace(str(tmp), str(wm_path))
+        finally:
+            release_lock(_lock)
         return True, str(q_path)
     except Exception as e:
         return False, f"quarantine-failed: {e}"

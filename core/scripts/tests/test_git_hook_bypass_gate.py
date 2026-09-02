@@ -150,6 +150,35 @@ def test_config_restore_canonical_approved():
     assert _run("git config core.hooksPath core/githooks") == ""
 
 
+#  (2026-09-02): Form D used to scan the FLAT token stream, so the
+# token after `core.hooksPath` across a `;` / `&&` boundary was read as the
+# VALUE and a read-only query was denied as a config-write with value ';'.
+# It is now scoped to one simple command whose argv[0] is git, like Forms A-C.
+def test_config_read_followed_by_separator_approved():
+    assert _run("git config core.hooksPath; echo x") == ""
+    assert _run('echo "=== hooksPath ==="; git config core.hooksPath; echo "=== hooks dir ==="') == ""
+    assert _run("echo a && git config --get core.hooksPath && echo b") == ""
+
+
+def test_config_write_after_separator_still_denied():
+    out = _run("echo a; git config core.hooksPath /dev/null")
+    assert _is_deny(out)
+    assert "config-write" in _reason(out)
+
+
+def test_config_unset_after_separator_still_denied():
+    out = _run("echo a && git config --unset core.hooksPath")
+    assert _is_deny(out)
+    assert "config-unset" in _reason(out)
+
+
+def test_config_token_in_unrelated_command_not_scanned():
+    # `config` and `core.hooksPath` are grep ARGUMENTS here, with a real git call
+    # on the same line: that simple command's argv[0] is grep, so Form D must
+    # not arm (the flat scan read `notes.txt` as the config value and denied).
+    assert _run("grep config core.hooksPath notes.txt; git status") == ""
+
+
 # ── False-positive surface (guard-958: token-anchored, prose-safe) ─────────
 
 def test_legitimate_commit_approved():

@@ -246,7 +246,24 @@ the skill — the exact drift this digest exists to prevent):
    renders as "DROPPED debt for null", naming nothing recoverable). A
    HIGH debt at ceiling ALSO files a MEDIUM Investigate — 10 failed
    sweeps is a finding about the RESOLVER. Then max_defer_dropped.
-5. WRITE-BACK: filter resolved entries yourself and wm-set the slot.
+5. WRITE-BACK: filter resolved entries yourself and wm-set the slot,
+   CARRYING THE CAS TOKEN (g-115-8667) so a concurrent append is REFUSED
+   rather than silently clobbered:
+     Bash: bash core/scripts/wm-ages.sh --json    # -> .knowledge_debt.update_count
+     Bash: <filtered json> | bash core/scripts/wm-set.sh knowledge_debt \
+             --expect-update-count <that value>
+   Read the token in the SAME turn as the wm-read whose value you filtered — a
+   token read later than the data it guards attests to nothing.
+   rc 9 == 409 stale_write: a peer wrote between your read and your write and
+   NOTHING LANDED. Re-read knowledge_debt, re-apply your resolutions to the
+   FRESH list, re-send ONCE with the new token. If the retry also returns 9,
+   write without the token and say so in the report — the sweep is idempotent
+   (it filters already-resolved entries), so a second collision is not worth a
+   third round trip, and a debt sweep that refuses to write is worse than one
+   that occasionally re-does work.
+   The retry is the load-bearing half, not the flag: CAS DETECTS the collision,
+   it does not prevent it. A caller that passes the token and then treats rc 9
+   as failure has converted a silent loss into a loud one and fixed nothing.
    knowledge_debt is NOT in item_stale_minutes, so wm-prune's
    array-item gate is unreachable for this slot — resolved entries
    otherwise live forever.
@@ -268,9 +285,14 @@ the skill — the exact drift this digest exists to prevent):
    collapsing them would merge unrelated debts.
 ```
 
-RMW caveat: the sweep is wm-read → mutate → wm-set across separate calls;
-a concurrent `wm-append knowledge_debt` between them is lost. Accepted
-limitation, same as consolidate Step 2.25.
+RMW caveat (CLOSED 2026-09-02, g-115-8667): the sweep is wm-read → mutate →
+wm-set across separate calls, so the per-request WM lock cannot span it — a
+lock covers ONE request and this is three. A concurrent `wm-append
+knowledge_debt` between them USED to be lost silently, with rc=0 at every step.
+Step 5's `--expect-update-count` closes that: the loser is REFUSED (rc 9) and
+re-applies onto a fresh read instead of clobbering. This is no longer an
+accepted limitation, and consolidate Step 2.25 inherits the fix by routing
+through this step rather than carrying its own copy.
 
 ## Section F — Chunked Encoding (E13)
 

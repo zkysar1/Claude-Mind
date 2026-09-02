@@ -7,9 +7,13 @@ hypotheses) fail CLOSED — an untagged or framework entry is suppressed, never 
 
 from __future__ import annotations
 
+import pytest
+
 from knowledge_projection import (
+    _PROGRAM_PURPOSE_CAP,
     _SELF_PURPOSE_CAP,
     project_goals,
+    project_program,
     project_self,
     FRAMEWORK_TREE_ROOT,
     ProjectedBundle,
@@ -277,7 +281,7 @@ def test_project_suppresses_framework_and_exposes_domain() -> None:
     assert isinstance(bundle, ProjectedBundle)
     # Exactly the domain entries survive each store.
     assert bundle.counts() == {
-        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0, "goals": 0,
+        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0, "goals": 0, "program": 0,
     }  # no self.md passed to project() -> `self` projects empty
     assert bundle.tree[0]["key"] == "reefs"
     assert bundle.hypotheses[0]["horizon"] == "short"
@@ -604,3 +608,99 @@ def test_goals_is_in_counts_but_not_in_the_broken_export_refusal_set() -> None:
     assert not any(bundle.counts()[k] for k in KNOWLEDGE_COUNT_KEYS), (
         "the refusal must still see this export as all-zero knowledge"
     )
+
+
+# ── project_program () ─────────────────────────────────────────────
+#
+# The consumer-side twin of the self projection, with ONE deliberate divergence:
+# the prose cut is an opt-in marker, not the structural "##" cut self.md uses.
+# These tests pin the divergence, because the tempting change is to "make it
+# consistent" with project_self — which is what would reintroduce the leak.
+
+_PROGRAM_MD = """the framework is a platform for autonomous agents.
+
+<!-- public:begin -->
+Your agent is here to learn what makes a world feel alive, and to get better
+at it every day.
+<!-- public:end -->
+
+We are NOT entering the Kaggle competition. Do NOT publish the Kaggle repo.
+Resolve the root from AGENT_WRITE_PATH in agents/alpha/local-paths.conf.
+"""
+
+
+def _program(body, fm=None, redactor=None):
+    return project_program(fm if fm is not None else {"created": "2026-05-13",
+                                                      "last_updated": "2026-08-29"},
+                           body,
+                           redactor or Redactor(agent_names=(), workspace_paths=(), secret_values=()))
+
+
+def test_program_publishes_only_the_marked_block():
+    """The marked region ships; everything around it is suppressed."""
+    got = _program(_PROGRAM_MD)
+    assert set(got) == {"purpose", "created", "last_updated"}
+    assert "makes a world feel alive" in str(got["purpose"])
+    # The measured leak case: real strategy prose sits OUTSIDE the markers and must
+    # not travel, however close to the block it is.
+    for outside in ("Kaggle", "AGENT_WRITE_PATH", "local-paths.conf",
+                    "the framework is a platform"):
+        assert outside not in str(got["purpose"]), f"content outside the markers leaked: {outside}"
+
+
+def test_program_without_markers_publishes_nothing():
+    """THE load-bearing test. Fail-closed is the whole design.
+
+    MEASURED 2026-09-02 on the only real program.md that exists: a self-style
+    "cut at the first ##" slice of it ships a verbatim competitive directive
+    naming a competition track twice, plus internal repo names and source paths,
+    none of which the Redactor covers. So an unmarked file must publish NOTHING
+    rather than a heuristic guess at what is safe.
+    """
+    unmarked = ("the framework is a platform.\n\nWe are NOT entering the Kaggle competition.\n"
+                "\n## Architecture\n\nprimitives/ drives every EnvironmentAdapter.\n")
+    assert _program(unmarked) == {}
+
+
+@pytest.mark.parametrize("body,label", [
+    ("<!-- public:begin -->\nhalf written\n", "opener with no closer"),
+    ("trailing\n<!-- public:end -->\n", "closer with no opener"),
+    ("<!-- public:end -->\nbackwards\n<!-- public:begin -->\n", "markers out of order"),
+    ("<!-- public:begin -->\n   \n<!-- public:end -->\n", "marked block is blank"),
+    ("", "empty file — the init-world.sh zero-byte placeholder"),
+])
+def test_program_requires_both_markers_in_order(body, label):
+    """A half-written edit must cost the feature, never leak the remainder of the file."""
+    assert _program(body) == {}, label
+
+
+def test_program_refuses_a_dates_only_husk():
+    """Front matter with no marked prose is not a program — publish nothing."""
+    assert _program("no markers here", fm={"created": "2026-05-13"}) == {}
+
+
+def test_program_redacts_before_capping_so_a_straddling_token_cannot_leak():
+    """Same ordering property project_self pins, for the same reason.
+
+    Redacting AFTER a cap would let a forbidden token survive by being truncated
+    into a shape the redactor no longer matches.
+    """
+    secret = "sk-live-programsecret"
+    redactor = Redactor(agent_names=(), workspace_paths=(), secret_values=(secret,))
+    straddling = "x" * (_PROGRAM_PURPOSE_CAP - 8) + secret + "y" * 400
+    out = _program(f"<!-- public:begin -->\n{straddling}\n<!-- public:end -->", redactor=redactor)
+    assert secret not in str(out["purpose"])
+    assert len(str(out["purpose"])) <= _PROGRAM_PURPOSE_CAP
+
+
+def test_project_wires_program_through_and_defaults_it_empty():
+    """An existing caller that passes no program keeps its exact shape, not a changed one."""
+    redactor = Redactor(agent_names=(), workspace_paths=(), secret_values=())
+    assert project(tree_nodes=[], reasoning=[], guardrails=[], hypotheses=[],
+                   redactor=redactor).program == {}
+    wired = project(tree_nodes=[], reasoning=[], guardrails=[], hypotheses=[],
+                    redactor=redactor,
+                    program_front_matter={"created": "2026-05-13"},
+                    program_body=_PROGRAM_MD)
+    assert "makes a world feel alive" in str(wired.program["purpose"])
+    assert wired.counts()["program"] == 1

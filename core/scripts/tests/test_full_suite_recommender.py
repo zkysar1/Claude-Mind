@@ -456,26 +456,37 @@ class TestPytestSuiteMutex(unittest.TestCase):
         self.lock_path = Path(self.tmpdir) / "pytest-suite.lock"
 
     def tearDown(self):
-        # Ensure no orphan lock left behind across tests
-        try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        # Ensure no orphan lock (or metadata sidecar) left behind across tests
+        for orphan in (self.lock_path,
+                       self.mod._pytest_lock_meta_path(self.lock_path)):
+            try:
+                orphan.unlink()
+            except FileNotFoundError:
+                pass
         try:
             os.rmdir(self.tmpdir)
         except OSError:
             pass
 
     def test_acquire_succeeds_when_lock_absent(self):
-        """Fresh lock path => acquire returns True and writes metadata."""
+        """Fresh lock path => acquire returns True and writes metadata.
+
+        The metadata lands in the SIDECAR. The lock file keeps the ownership
+        token acquire_lock wrote, because release_lock compares it before
+        unlinking (g-115-8536); overwriting it broke every release (g-115-8659).
+        """
         rc = self.mod._acquire_pytest_lock(self.lock_path, "g-test")
         self.assertTrue(rc)
         self.assertTrue(self.lock_path.exists())
-        info = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        meta_path = self.mod._pytest_lock_meta_path(self.lock_path)
+        info = json.loads(meta_path.read_text(encoding="utf-8"))
         self.assertEqual(info["goal_id"], "g-test")
         self.assertEqual(info["pid"], os.getpid())
         self.assertIn("started_at", info)
         self.assertIn("agent", info)
+        # The lock file must NOT carry our metadata — that is the whole defect.
+        self.assertNotIn("goal_id",
+                         self.lock_path.read_text(encoding="utf-8"))
         self.lock_path.unlink()
 
     def test_acquire_fails_when_lock_held_fresh(self):
@@ -504,10 +515,63 @@ class TestPytestSuiteMutex(unittest.TestCase):
         os.utime(str(self.lock_path), (old_time, old_time))
         rc = self.mod._acquire_pytest_lock(self.lock_path, "g-test")
         self.assertTrue(rc)
-        # Lock content is now ours (overwritten with richer metadata)
-        info = json.loads(self.lock_path.read_text(encoding="utf-8"))
+        # The lock is now ours; our metadata is in the sidecar beside it.
+        meta_path = self.mod._pytest_lock_meta_path(self.lock_path)
+        info = json.loads(meta_path.read_text(encoding="utf-8"))
         self.assertEqual(info["pid"], os.getpid())
         self.lock_path.unlink()
+
+    def test_acquire_release_round_trip_unlinks_and_is_silent(self):
+        """ regression. acquire -> release must REMOVE the lock and
+        emit NO [lock-stale-break].
+
+        Before the fix the enrichment overwrote the ownership token, so
+        release_lock took the victim branch on every single release: the mutex
+        was never unlinked and leaked for its full 300s TTL (peers reaching
+        _acquire_pytest_lock got False and SKIPPED their full-suite runs), and
+        a false `victim=self` diagnostic fired on every deep close — poisoning
+        the frequency signal that diagnostic exists to measure.
+        """
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            self.assertTrue(
+                self.mod._acquire_pytest_lock(self.lock_path, "g-test"))
+            # The skip-banner's inputs survive the round trip. The fix must not
+            # buy correctness by deleting the enrichment it exists to protect.
+            info = self.mod._read_lock_info(self.lock_path)
+            self.assertEqual(info["goal_id"], "g-test")
+            self.assertEqual(info["pid"], os.getpid())
+            self.assertIn("started_at", info)
+            self.assertIn("agent", info)
+            self.mod._release_pytest_lock(self.lock_path)
+        self.assertFalse(self.lock_path.exists())
+        self.assertFalse(
+            self.mod._pytest_lock_meta_path(self.lock_path).exists())
+        self.assertNotIn("[lock-stale-break]", err.getvalue())
+
+    def test_release_leaves_a_thief_sidecar_alone(self):
+        """A stale-break VICTIM must not delete the thief's metadata.
+
+        release_lock refuses to unlink a lock that is no longer ours, so the
+        sidecar cleanup is gated on the lock file actually being gone —
+        otherwise this would re-create, one file over, the
+        victim-deletes-the-thief's-lock defect g-115-8536 closed.
+        """
+        self.assertTrue(self.mod._acquire_pytest_lock(self.lock_path, "g-mine"))
+        # Simulate a peer stale-breaking us and taking over.
+        self.lock_path.write_text("99999:99999", encoding="utf-8")
+        meta_path = self.mod._pytest_lock_meta_path(self.lock_path)
+        meta_path.write_text(
+            json.dumps({"pid": 99999, "started_at": "2026-09-02T00:00:00",
+                        "agent": "peer", "goal_id": "g-theirs"}),
+            encoding="utf-8")
+        with mock.patch("sys.stderr", io.StringIO()):
+            self.mod._release_pytest_lock(self.lock_path)
+        self.assertTrue(self.lock_path.exists())
+        self.assertTrue(meta_path.exists())
+        self.assertEqual(
+            json.loads(meta_path.read_text(encoding="utf-8"))["goal_id"],
+            "g-theirs")
 
     def test_read_lock_info_handles_corrupt_content(self):
         """Unparseable lock content returns {'raw': ...} not a crash."""
@@ -545,19 +609,24 @@ class TestPytestSuiteMutex(unittest.TestCase):
     def test_main_acquires_and_releases_on_clean_path(self):
         """When main() emits the banner, the lock is released on exit."""
         buf = io.StringIO()
+        err = io.StringIO()
         with mock.patch.object(self.mod, "_git_changed_paths") as mock_git, \
              mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
              mock.patch.object(self.mod, "_pytest_lock_path",
                                 return_value=self.lock_path), \
              mock.patch("sys.stdout", buf), \
+             mock.patch("sys.stderr", err), \
              mock.patch("sys.argv", ["x", "g-test", "--outcome-class", "deep"]):
             mock_git.return_value = ["core/scripts/foo.py"]
             rc = self.mod.main()
         self.assertEqual(rc, 0)
         # Banner emitted
         self.assertIn("FULL-SUITE TEST RECOMMENDER", buf.getvalue())
-        # Lock released
+        # Lock released, sidecar cleaned, and no false stale-break ()
         self.assertFalse(self.lock_path.exists())
+        self.assertFalse(
+            self.mod._pytest_lock_meta_path(self.lock_path).exists())
+        self.assertNotIn("[lock-stale-break]", err.getvalue())
 
     def test_main_skips_banner_when_lock_held(self):
         """When another session holds the lock, main() prints skip-message
