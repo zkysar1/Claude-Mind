@@ -209,29 +209,29 @@ def test_gate_accepts_APPROVE_verdict_artifact(tmp_path):
     distinguish 'the gate reads the verdict' from 'the gate always blocks tier 2'
     — the two are indistinguishable from a single red result (guard-2298).
 
-    Writes through the REAL production path (agent_dir -> session/close-reviews)
-    under a throwaway agent name, so the test exercises the resolution the gate
-    actually uses rather than a stand-in."""
-    from _paths import agent_dir
+    Writes through the REAL production path resolution — which since g-357-41 is
+    WORLD-scoped and GOAL-keyed (audit-reports/close-reviews/<goal-id>.json under
+    the same CLOSE_REVIEW_LEDGER_DIR root _run_gate already isolates), not the
+    closing agent's private dir. `reviewer` is deliberately NOT the closing agent:
+    a self-approval no longer satisfies the gate.
 
-    d = Path(agent_dir("pytest-throwaway")) / "session" / "close-reviews"
-    art = d / "g-999-01.json"
-    created_root = Path(agent_dir("pytest-throwaway"))
-    try:
-        d.mkdir(parents=True, exist_ok=True)
-        art.write_text(json.dumps({
-            "verdict": "APPROVE", "reviewer": "test-reviewer",
-            "checks": ["criteria re-read", "entities spot-checked"],
-        }), encoding="utf-8")
-        r = _run_gate(_goal(priority="HIGH"), tmp_path,
-                      {"CLOSE_REVIEW_GATE_ENABLED": "1",
-                       "MIND_AGENT": "pytest-throwaway"})
-        assert r.returncode == 0, r.stdout + r.stderr
-        assert '"decision": "pass"' in r.stdout
-        assert "test-reviewer" in r.stdout
-    finally:
-        import shutil
-        shutil.rmtree(created_root, ignore_errors=True)
+    Note this version creates NO real agent directory. The previous one wrote
+    into agent_dir("pytest-throwaway") and rmtree'd it in a finally — a live
+    write outside tmp whose cleanup was the only thing standing between the
+    suite and a stray agent dir. The world-scoped path removes that exposure
+    rather than guarding it."""
+    d = tmp_path / "audit-reports" / "close-reviews"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "g-999-01.json").write_text(json.dumps({
+        "verdict": "APPROVE", "reviewer": "test-reviewer",
+        "checks": ["criteria re-read", "entities spot-checked"],
+    }), encoding="utf-8")
+    r = _run_gate(_goal(priority="HIGH"), tmp_path,
+                  {"CLOSE_REVIEW_GATE_ENABLED": "1",
+                   "MIND_AGENT": "pytest-throwaway"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert '"decision": "pass"' in r.stdout
+    assert "test-reviewer" in r.stdout
 
 
 def test_note_marker_refusal_names_the_matched_context(tmp_path):

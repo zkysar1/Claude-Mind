@@ -108,6 +108,8 @@ def world(tmp_path: Path):
     wd = tmp_path / "world"
     (wd / "board").mkdir(parents=True)
     (wd / "knowledge" / "tree").mkdir(parents=True)
+    (wd / "knowledge" / "tree" / "intelligence").mkdir()
+    (wd / "knowledge" / "tree" / "intelligence" / "qb-evaluation-framework.md").write_text("# qb\n", encoding="utf-8")
     (wd / "conventions").mkdir()
     live = [e for e in PORTFOLIO if e.get("status") == "active"]
     arch = [e for e in PORTFOLIO if e.get("status") != "active"]
@@ -218,6 +220,7 @@ def test_unblock_aspiration_may_name_the_blocker_but_still_owes_referents():
             "needle": "The three waiting goals become executable in the next iteration.",
             "checked": ["g-006-15", "g-006-22"],
         },
+        "goals": [{"title": "Produce the shared fixture and point both waiting goals at it"}],
     }
     r = _eval(cand, PORTFOLIO)
     assert r["gated"] and not r["would_block"], r["failures"]
@@ -293,6 +296,40 @@ def test_referent_kinds_are_verified_against_the_stores(world):
     # never as a verified referent
     assert verify_referent("research", **kw)["kind"] in ("tree_node", "unrecognized")
     assert verify_referent("Research coverage", **kw)["kind"] == "unrecognized"
+
+
+def test_tree_relative_path_referent_verifies(world):
+    """A tree file cited tree-relative is the natural citation form (measured
+    2026-09-02: a deployment cited two real tree files that way and was refused
+    twice before spelling the full world path)."""
+    from gates.aspiration_supply import load_tree_keys
+    kw = dict(existing_ids=set(), tree_keys=load_tree_keys(world["world"]),
+              world_dir=world["world"], meta_dir=world["meta"],
+              project_root=world["root"], agent_dir=world["agent"])
+    for ref in ("intelligence/qb-evaluation-framework.md",
+                "knowledge/tree/intelligence/qb-evaluation-framework.md",
+                "world/knowledge/tree/intelligence/qb-evaluation-framework.md"):
+        v = verify_referent(ref, **kw)
+        assert v["kind"] == "path" and v["verified"], (ref, v)
+    v = verify_referent("intelligence/missing.md", **kw)
+    assert v["kind"] == "path" and not v["verified"]
+
+
+def test_self_generated_aspiration_without_a_first_goal_is_refused():
+    """An aspiration with no goals creates no work: the selector has nothing to
+    pick and the loop stays all-blocked (measured 2026-09-02 — the first
+    gate-clean aspiration on a deployment landed with 0 goals and the loop slept)."""
+    cand = _control()
+    cand["goals"] = []
+    r = _eval(cand, PORTFOLIO)
+    assert r["would_block"] and {f["check"] for f in r["failures"]} == {"no_goals"}, r["failures"]
+    assert r["checks"]["goals"] == 0 and "goals" in r["remedy"]
+    # the knob: 0 disables the check
+    r0 = _eval(cand, PORTFOLIO, config={"min_goals": 0})
+    assert not r0["would_block"], r0["failures"]
+    # user directives are never gated, goals or not
+    ud = dict(cand, origin_signal="user_directive")
+    assert not _eval(ud, PORTFOLIO)["gated"]
 
 
 def test_gating_matches_every_spelling_of_the_idle_lane():

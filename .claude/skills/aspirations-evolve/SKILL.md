@@ -1212,10 +1212,22 @@ For each `recommendation` in {retire, tighten, widen, investigate, inert_candida
      byte-identical to the records under investigation. File NOTHING for a
      gate whose taxonomy defect is already tracked.
 
-   **THE DISCRIMINATOR, and it is one read.** Before filing on `fail_open`,
-   open the firing records in `meta/gate-firings.jsonl` and look for evidence
-   the gate THREW — not the recommendation's own `reason` text. Read
-   `extra.reason`: `JSONDecodeError` on empty stdin is a DECLINE, not a crash.
+   **THE DISCRIMINATOR, and it is one read — but GLOB THE SHARD FAMILY:**
+   `cat "$META_PATH"/gate-firings*.jsonl | grep -- '"gate_id": "<gate>"'`.
+   The store is daily-rotated into `gate-firings-YYYY-MM-DD.jsonl` siblings and
+   `_load_firings` reads the family, so grepping the bare `gate-firings.jsonl`
+   this step named until 2026-09-02 returns a FALSE ABSENCE that reads exactly
+   like a genuine "no firings" (echo cc-03 2026-09-02: `domain-suite-gate` 0 vs
+   **480**, `worker-ref-report-check` 0 vs **5** — yet `store-dupe-warn` has 6,064
+   rows in the bare file, so the absence is GATE-SPECIFIC; cost six probes).
+   `_load_firings`'s own g-328-38 comment still claims it resolves to exactly
+   FIRINGS_JSONL — STALE, and what makes the single-file reading look right.
+   Then find evidence the gate THREW, not the recommendation's `reason` text —
+   and read BOTH `extra.reason` and `gate_error`, which decide opposite verdicts:
+   `JSONDecodeError` on empty stdin is a DECLINE; a populated `gate_error` naming
+   a timeout or non-zero rc is a REAL fault (measured: `worker-ref-report-check`
+   3/3 genuine, g-115-8611; `domain-suite-gate` had BOTH fields absent on 10/10 —
+   UNDETERMINED, not clean, guard-1675 — g-115-8355).
    Measured 2026-08-21 (zeta, cc-02, 6.8.0-137-generic): **120 of 120**
    `store-dupe-warn` fail_open records carry `extra.reason: JSONDecodeError`.
    `gate_error` — the field the emitted reason tells you to inspect, ABSENT

@@ -118,6 +118,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_gap_chars": 40,
     "min_needle_chars": 30,
     "max_self_generated_per_agent_per_day": 2,
+    "min_goals": 1,
 }
 
 REMEDY_SHAPE = (
@@ -341,7 +342,15 @@ def _resolve_pathish(ref: str, *, world_dir: Optional[Path], meta_dir: Optional[
         if cand.exists():
             return cand
     if world_dir is not None:
-        cand = Path(world_dir) / raw
+        # A tree file cited tree-relative ("<category>/<node>.md") is the natural
+        # citation form — measured 2026-09-02: a deployment cited two real tree
+        # files that way and was refused twice before it wrote the full
+        # "<world>/knowledge/tree/…" path.
+        for cand in (Path(world_dir) / raw, Path(world_dir) / "knowledge" / "tree" / raw):
+            if cand.exists():
+                return cand
+    if meta_dir is not None:
+        cand = Path(meta_dir) / raw
         if cand.exists():
             return cand
     return Path(project_root) / raw if project_root is not None else p
@@ -610,10 +619,27 @@ def evaluate(asp: Dict[str, Any], *, existing: Iterable[Dict[str, Any]],
                        "go quiet instead"),
         })
 
+    # 6. a first goal. An aspiration filed with no goals creates NO work: the
+    # selector has nothing to pick, the loop stays all-blocked, and the idle
+    # path runs again (measured 2026-09-02: the first gate-clean aspiration on
+    # a deployment landed with "0 pending, 0 done of 0" and the loop slept).
+    goals = asp.get("goals") if isinstance(asp.get("goals"), list) else []
+    min_goals = int(cfg.get("min_goals", 1) or 0)
+    checks["goals"] = len(goals)
+    if min_goals > 0 and len(goals) < min_goals:
+        failures.append({
+            "check": "no_goals",
+            "detail": (f"self-generated aspiration carries {len(goals)} goal(s) (need ≥{min_goals}) — "
+                       "an aspiration without a first verifiable goal is a title, not work; file "
+                       "the first goal(s) in the same record (title, priority, participants, "
+                       "verification.outcomes)"),
+        })
+
     remedy = None
     if failures:
         remedy = ("Either drop the candidate (an empty pool is the expected outcome when nothing "
-                  "verifiable is missing — the loop goes quiet) or fix the record: " + REMEDY_SHAPE)
+                  "verifiable is missing — the loop goes quiet) or fix the record: " + REMEDY_SHAPE
+                  + '; and "goals": [<at least one concrete, verifiable first goal>]')
 
     override_applied = None
     would_block = bool(failures)

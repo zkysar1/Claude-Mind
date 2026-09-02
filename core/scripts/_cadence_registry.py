@@ -67,11 +67,72 @@ Entry fields:
                  The battery does NOT read the meter (the checks are cheap +
                  read-only); the SKILL.md dispatch loop meter-gates the expensive
                  SKILL INVOCATION on FIRE, carrying this name.
-  fire_dispatch  human dispatch string the battery prints on FIRE — names the
-                 skill the SKILL.md dispatch loop must invoke.
+  dispatch_skill the skill the FIRE action invokes, as its slash name
+                 (e.g. "/fresh-eyes-review"). MACHINE-READABLE — this is the
+                 field a consumer joins on. See "The dispatch stage" below.
+  dispatch_args  argument string passed with the skill, "" when there are none.
+  dispatch_note  free prose qualifying the invocation ("re-evaluate gates; ...")
+                 or "" — the ONLY part of the dispatch that is addressed to a
+                 reader rather than to a program.
+  fire_dispatch  DERIVED human dispatch string the battery prints on FIRE.
+                 Computed from the three fields above by _compose_dispatch();
+                 it is NOT hand-written per entry. See below for why.
+
+The dispatch stage (g-115-5396, guard-5298)
+-------------------------------------------
+`fire_dispatch` used to be a hand-written PROSE STRING per entry, and that is
+the whole of the defect guard-5298 records: "a config field whose VALUE is an
+instruction addressed to a reader (invoke /x, then run y) is an unexecuted
+stage wearing a config schema. Grep for who CONSUMES it; if the only consumer
+is a print statement, there is no automation there and no counter can be
+measuring it." Measured 2026-08-27 (foxtrot, LAPTOP-3IOFCNEO, fresh-eyes N=80):
+the fresh-eyes ritual was 42 goals past due while precheck-drops.jsonl read
+sweeps_dropped=0 / zone=fresh / tail_reached=true on every record — every
+counter TRUE, every one of them measuring whether the CHECK ran, none observing
+the DISPATCH. Six sibling Investigate goals accumulated, one per cadence
+(g-115-4913/4967/5396/5835/6167/6585), because nothing pointed at the common
+seam.
+
+WHAT THIS SPLIT DOES AND DOES NOT FIX. It does NOT make the dispatch execute:
+every entry's fire-action is a Claude SKILL invocation, and no script can call
+one — the LLM remains the sole executor, by construction and not by oversight.
+What it fixes is that the dispatch is now JOINABLE: `dispatch_skill` is a
+stable identifier a consumer can match, route on, or check for, where prose was
+neither parseable nor uniform (compare "invoke /aspirations-evolve" against
+"invoke /curriculum-gates (re-evaluate gates; route to promotion if all pass)").
+`cadence-stale-canary.py` is the first non-print consumer: it files a goal
+naming the exact `Skill(...)` call instead of an investigation into a question
+that is already answered.
+
+`fire_dispatch` is DERIVED rather than stored so the prose and the structured
+form cannot drift — the single-source-of-truth rule in
+`.claude/rules/communication-clarity.md` (5). The composition reproduces all
+seven legacy strings byte-for-byte; `test_cadence_registry_dispatch.py` pins
+that against the literals, so a future edit to the composer that changes any
+printed line fails loudly rather than silently rewording an imperative.
+
+ROUTING IS NOT UNIFORM, and the structured field is what makes that visible:
+six of the seven skills are worker-eligible and `/aspirations-evolve` is
+reducer-only-by-design (measured via `worker_execute.py skill-eligible`, which
+is the SSOT — do NOT hardcode a second copy of that answer here).
 """
 
 from __future__ import annotations
+
+
+def _compose_dispatch(skill: str, args: str = "", note: str = "") -> str:
+    """Render the human dispatch line from the structured dispatch fields.
+
+    The ONE writer of `fire_dispatch`. Kept trivial on purpose: it exists to
+    remove a second hand-maintained copy of the same fact, not to add behavior.
+    """
+    out = f"invoke {skill}"
+    if args:
+        out += f" {args}"
+    if note:
+        out += f" ({note})"
+    return out
+
 
 CADENCES: list[dict] = [
     {
@@ -79,21 +140,27 @@ CADENCES: list[dict] = [
         "phase": "0.5e",
         "check_cmd": ["fresh-eyes-cadence-check.sh"],
         "meter_name": "fresh-eyes-cadence",
-        "fire_dispatch": "invoke /fresh-eyes-review --cadence",
+        "dispatch_skill": "/fresh-eyes-review",
+        "dispatch_args": "--cadence",
+        "dispatch_note": "",
     },
     {
         "name": "fresh-eyes-program",
         "phase": "0.5e.5",
         "check_cmd": ["fresh-eyes-cadence-check.sh", "--config-block", "fresh_eyes_program"],
         "meter_name": "fresh-eyes-program-cadence",
-        "fire_dispatch": "invoke /fresh-eyes-program --cadence",
+        "dispatch_skill": "/fresh-eyes-program",
+        "dispatch_args": "--cadence",
+        "dispatch_note": "",
     },
     {
         "name": "fresh-eyes-tree",
         "phase": "0.5e.7",
         "check_cmd": ["fresh-eyes-cadence-check.sh", "--config-block", "fresh_eyes_tree"],
         "meter_name": "fresh-eyes-tree-cadence",
-        "fire_dispatch": "invoke /fresh-eyes-tree --cadence",
+        "dispatch_skill": "/fresh-eyes-tree",
+        "dispatch_args": "--cadence",
+        "dispatch_note": "",
     },
     {
         # . Phase id 0.5e.9 places it after the fresh-eyes trio and
@@ -104,30 +171,48 @@ CADENCES: list[dict] = [
         "phase": "0.5e.9",
         "check_cmd": ["strategic-scan-cadence-check.sh"],
         "meter_name": "strategic-scan-cadence",
-        "fire_dispatch": "invoke /aspirations-strategic-scan (scan_trigger=time_cadence)",
+        "dispatch_skill": "/aspirations-strategic-scan",
+        "dispatch_args": "",
+        "dispatch_note": "scan_trigger=time_cadence",
     },
     {
         "name": "felt-sense",
         "phase": "0.5f",
         "check_cmd": ["felt-sense-cadence-check.sh"],
         "meter_name": "felt-sense-cadence",
-        "fire_dispatch": "invoke /felt-sense-checkin --cadence",
+        "dispatch_skill": "/felt-sense-checkin",
+        "dispatch_args": "--cadence",
+        "dispatch_note": "",
     },
     {
         "name": "curriculum",
         "phase": "0.5i",
         "check_cmd": ["curriculum-cadence-check.sh"],
         "meter_name": "curriculum-cadence",
-        "fire_dispatch": "invoke /curriculum-gates (re-evaluate gates; route to promotion if all pass)",
+        "dispatch_skill": "/curriculum-gates",
+        "dispatch_args": "",
+        "dispatch_note": "re-evaluate gates; route to promotion if all pass",
     },
     {
         "name": "evolution",
         "phase": "0.5j",
         "check_cmd": ["evolution-cadence-check.sh"],
         "meter_name": "evolution-cadence",
-        "fire_dispatch": "invoke /aspirations-evolve",
+        "dispatch_skill": "/aspirations-evolve",
+        "dispatch_args": "",
+        "dispatch_note": "",
     },
 ]
+
+# Derive the printed prose ONCE, at import, for every entry. Consumers that read
+# `fire_dispatch` (precheck-cadence-battery, cadence-stale-canary, the tests)
+# keep working unchanged and cannot see a value that disagrees with the
+# structured fields, because there is only one writer.
+for _c in CADENCES:
+    _c["fire_dispatch"] = _compose_dispatch(
+        _c["dispatch_skill"], _c["dispatch_args"], _c["dispatch_note"]
+    )
+del _c
 
 
 def cadences() -> list[dict]:

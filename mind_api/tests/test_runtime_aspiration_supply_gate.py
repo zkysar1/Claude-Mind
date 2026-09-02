@@ -110,7 +110,13 @@ def test_well_formed_self_generated_aspiration_lands(running_daemon):
             "needle": "Each morning the user sees the open questions with one suggested default action per question.",
             "checked": [existing_id, "world/aspirations.jsonl"],
         },
-        "goals": [],
+        # min_goals: a self-generated aspiration must carry its first goal
+        "goals": [{
+            "title": "Build the nightly digest job and deliver the first digest",
+            "status": "pending", "priority": "MEDIUM", "participants": ["agent"],
+            "origin_signal": "idea:nightly-open-question-digest",
+            "verification": {"outcomes": ["one digest delivered with a default action per question"], "checks": []},
+        }],
     }
     status, body = _add(port, asp)
     assert status == 200, body

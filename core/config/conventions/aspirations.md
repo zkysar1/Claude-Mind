@@ -492,7 +492,10 @@ not to build adjacent work; `Unblock:`-titled aspirations are exempt because the
 target the blocker itself), `overlaps_active` (≥ `overlap_threshold` of the
 candidate's distinctive tokens already belong to an ACTIVE aspiration → file goals
 under it), `overlaps_archived` (same against a completed/retired one, allowed only
-when that id is in `checked`), `daily_cap` (`max_self_generated_per_agent_per_day`).
+when that id is in `checked`), `daily_cap` (`max_self_generated_per_agent_per_day`), `no_goals`
+(`min_goals`, default 1 — an aspiration filed without a first verifiable goal is a title, not work:
+the selector has nothing to pick and the loop stays all-blocked). Path referents resolve from the
+world, meta, project and agent roots AND tree-relative (`intelligence/foo.md` → `world/knowledge/tree/intelligence/foo.md`).
 Refusal shape: HTTP 400 `{"error": "aspiration_supply_blocked", "gate":
 "aspiration-supply-gate", "gate_output": {failures[], overlaps[], remedy}}`.
 

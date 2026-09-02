@@ -12,7 +12,10 @@ TWO INDEPENDENT CHECKS, TWO FLAGS, BOTH DEFAULT-OFF:
 
   A. tier-2 close review   — close_review_gate.enabled
      A tier-2 goal (goal_close_risk_tier.classify) REFUSES to close unless an APPROVE
-     verdict artifact exists at agents/<agent>/session/close-reviews/<goal-id>.json.
+     verdict artifact exists at world/audit-reports/close-reviews/<goal-id>.json,
+     written by someone OTHER than the closing agent. The path is GOAL-keyed and
+     world-scoped (g-357-41); an APPROVE whose `reviewer` is the closer, or which
+     names no reviewer at all, is refused as not-an-independent-review.
   B. note-marker           — close_review_gate.note_marker_enabled
      A goal whose own outcome_note/progress_note carries a HIGH-confidence not-done
      marker (REVERTED / REVIEWED-NOT-CLOSED / do-not-close / reopen) REFUSES, printing
@@ -140,15 +143,68 @@ def load_goal(goal_id: str, source: str) -> dict:
     return {}
 
 
-def verdict_path(agent: str, goal_id: str) -> Path | None:
-    """agents/<agent>/session/close-reviews/<goal-id>.json — resolved through
-    agent_dir(), never a PROJECT_ROOT/<agent> join (CLAUDE.md Agent-dir Resolution)."""
+def verdict_path(goal_id: str) -> Path | None:
+    """world/audit-reports/close-reviews/<goal-id>.json — GOAL-keyed and
+    WORLD-scoped, deliberately NOT keyed by the closing agent.
+
+    It was agents/<CLOSING agent>/session/close-reviews/<goal-id>.json until
+    2026-09-02, and that made this gate satisfiable ONLY BY SELF-REVIEW — the
+    exact thing the module docstring's SDLC principle forbids. An INDEPENDENT
+    reviewer cannot write into the closer's private agent dir: cross-agent
+    writes are unsupported by design (path-resolution.md routes them through
+    the world board or the shared team-state store instead), and a SUBAGENT
+    reviewer is not exempt, because it inherits its own agent binding and hits
+    the same wall. All 32 tests passed throughout, because every one built the
+    artifact under the SAME agent that then closed — a fixture shape that
+    cannot express the defect. Found by fresh-eyes review (bravo, cc-05,
+    2026-09-02) BEFORE the producer half was built, which is the only reason
+    this is one function instead of two coordinated halves.
+
+    WHY world/audit-reports/ AND NOT world/close-reviews/: guard-599 names
+    agents/<agent>/session/ as a wrong home for exactly this artifact class
+    ("fresh-eyes reports"), and the L1 cruft hook REFUSES a NEW top-level entry
+    under WORLD_PATH with no agent-side override — its own printed remedy is
+    "place under an EXISTING top-level dir". audit-reports/ already holds
+    per-goal verdicts (g-335-534-verdict.md), so this needs no new world
+    top-level entry and no init script change.
+
+    Root resolution MIRRORS _log_override on purpose: the same env seam, so a
+    test that isolates one isolates both and neither can reach the production
+    world. That is the g-357-40 ledger-pollution lesson applied ahead of time
+    rather than after."""
     try:
-        if agent_dir is None:
+        root = os.environ.get("CLOSE_REVIEW_LEDGER_DIR", "").strip() or WORLD_DIR
+        if root is None:
             return None
-        return Path(agent_dir(agent)) / "session" / "close-reviews" / f"{goal_id}.json"
+        return Path(root) / "audit-reports" / "close-reviews" / f"{goal_id}.json"
     except Exception:
         return None
+
+
+def independence_defect(verdict: dict | None, closer: str) -> str | None:
+    """Why this APPROVE verdict is not an INDEPENDENT review, or None if it is.
+
+    The module docstring has carried "the author must not approve their own
+    close" since g-357-40 as a stated principle with NO mechanism — none was
+    POSSIBLE while the artifact lived in the closer's own agent dir, since every
+    verdict there was self-written by construction. A goal-keyed world path is
+    what makes reviewer identity comparable to closer identity, so the principle
+    becomes checkable. Two defects, both meaning "nobody independent signed
+    this":
+      self-review   — reviewer IS the closing agent.
+      unattributed  — no reviewer named. An approval nobody is accountable for
+                      cannot be shown to be independent, and this gate's own
+                      fail-direction rule says absence of review is a refusal,
+                      never a fail-open (guard-142).
+    Compared case-insensitively on the trimmed name: `reviewer` is written by
+    the producer and `closer` comes from argv/env — two different hands, and a
+    casing difference is not independence."""
+    r = str((verdict or {}).get("reviewer") or "").strip()
+    if not r:
+        return "unattributed"
+    if r.lower() == str(closer or "").strip().lower():
+        return "self-review"
+    return None
 
 
 def read_verdict(path: Path | None) -> dict | None:
@@ -288,8 +344,15 @@ def main(argv=None) -> int:
             _emit("pass", args.goal, "tier", tier=tier.get("tier"))
             return 0
 
-        v = read_verdict(verdict_path(agent, args.goal))
+        v = read_verdict(verdict_path(args.goal))
         approved = isinstance(v, dict) and str(v.get("verdict", "")).upper() == "APPROVE"
+        # A self-approved or unattributed APPROVE is NOT an approval. Demoting it
+        # here (rather than refusing inline) is deliberate: it falls through to the
+        # SAME override branch and the same _emit shape as verdict absence, so the
+        # override stays reachable and there is exactly one refusal path to test.
+        defect = independence_defect(v, agent) if approved else None
+        if defect:
+            approved = False
         if approved:
             _emit("pass", args.goal, "tier", tier=2, reviewer=v.get("reviewer"))
             return 0
@@ -297,19 +360,33 @@ def main(argv=None) -> int:
         # ABSENCE OF REVIEW — the one condition that must never fail open.
         if args.override_close_review:
             _emit("override", args.goal, "tier", override=args.override_close_review,
-                  tier=2, reasons=tier.get("reasons"))
+                  tier=2, reasons=tier.get("reasons"), defect=defect)
             return 0
 
-        print(f"close-review-gate: REFUSED — {args.goal} is tier 2 and has no APPROVE "
-              f"close-review verdict.", file=sys.stderr)
+        if defect == "self-review":
+            print(f"close-review-gate: REFUSED — {args.goal} is tier 2 and its only "
+                  f"APPROVE verdict was written by the closing agent itself "
+                  f"(reviewer={str((v or {}).get('reviewer'))!r} == closer={agent!r}).",
+                  file=sys.stderr)
+            print("  A self-approved close is not a reviewed close — the author must "
+                  "not approve their own close.", file=sys.stderr)
+        elif defect == "unattributed":
+            print(f"close-review-gate: REFUSED — {args.goal} is tier 2 and its APPROVE "
+                  f"verdict names no reviewer, so its independence cannot be "
+                  f"established.", file=sys.stderr)
+        else:
+            print(f"close-review-gate: REFUSED — {args.goal} is tier 2 and has no APPROVE "
+                  f"close-review verdict.", file=sys.stderr)
         for r in tier.get("reasons", []):
             print(f"    trigger: {r}", file=sys.stderr)
-        p = verdict_path(agent, args.goal)
+        p = verdict_path(args.goal)
         print(f"  Expected verdict artifact: {p}", file=sys.stderr)
-        print("  Produce it with the fresh-eyes close reviewer, or pass "
-              "--override-close-review \"<justification>\" "
+        print("  Produce it with the fresh-eyes close reviewer run by an INDEPENDENT "
+              "reviewer (a live peer via the review-request lane, else a fresh-context "
+              "subagent), or pass --override-close-review \"<justification>\" "
               "(logged to world/close-review-overrides.jsonl).", file=sys.stderr)
-        _emit("block", args.goal, "tier", tier=2, reasons=tier.get("reasons"))
+        _emit("block", args.goal, "tier", tier=2, reasons=tier.get("reasons"),
+              defect=defect)
         return 1
 
     return 0
