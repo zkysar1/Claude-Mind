@@ -49,14 +49,12 @@ modified in any repo of the primary workspace):
   fresh-eyes failover form a pre/post-commit gate pair documented in
   `core/config/conventions/domain-hooks.md`.
 
-  ### 1.75a. Capture pre-invocation timestamp
-  Bash: date +%Y-%m-%dT%H:%M:%S
-
-  Capture the output (a timestamp like `2026-05-09T13:42:11`). You will
-  substitute this LITERAL value into Step 1.75d's command. Bash variables
-  do not persist across separate Bash tool calls — the value lives only
-  in your conversation context, not in any shell. Do not write `$pre_ts`
-  into 1.75d's command; substitute the literal timestamp string.
+  ### 1.75a. (RETIRED — no timestamp capture is needed)
+  This step used to capture `date +%Y-%m-%dT%H:%M:%S` for substitution into
+  1.75d. Retired because `board-read.sh --since` takes a DURATION WINDOW, never
+  an ISO timestamp — an ISO string is silently ignored and the filter dropped,
+  returning the entire history into a fail-closed gate. 1.75d now uses `10m`
+  directly. Go straight to 1.75b. (g-115-3569)
 
   ### 1.75b. Build the changed-files list
   For each repo in the primary workspace:
@@ -76,12 +74,18 @@ modified in any repo of the primary workspace):
   `world/board/findings.jsonl` tagged `fresh-eyes-code`.
 
   ### 1.75d. Read findings from this invocation
-  Bash: bash core/scripts/board-read.sh --channel findings --since "<TIMESTAMP-FROM-1.75a>" --tag fresh-eyes-code --author $MIND_AGENT --json
+  Bash: bash core/scripts/board-read.sh --channel findings --since 10m --tag fresh-eyes-code --author $MIND_AGENT --json
 
-  Substitute the literal timestamp from 1.75a in place of
-  `<TIMESTAMP-FROM-1.75a>`. The `--author $MIND_AGENT` filter scopes
-  results to this agent — partner agents running /fresh-eyes-code in
-  parallel would otherwise leak findings into this gate's input.
+  `--since` takes a DURATION WINDOW (`10m`, `24h`), NEVER an ISO timestamp: an
+  ISO string is accepted, silently ignored, and the filter is dropped, so the
+  call returns the ENTIRE history. Because 1.75e is fail-closed on
+  `invalidates`/`constrains`, that would block every commit permanently on
+  findings resolved months ago. Measured on the live world convention
+  2026-08-30: ISO -> 679 lines, `10m` -> 0. `10m` covers the 1.75c invocation
+  you just made; widen only if that probe genuinely ran longer.
+  The `--author $MIND_AGENT` filter scopes results to this agent — partner
+  agents running /fresh-eyes-code in parallel would otherwise leak findings
+  into this gate's input. (g-115-3569)
 
   ### 1.75e. Decision gate
   - IF any finding has severity in [invalidates, constrains]:

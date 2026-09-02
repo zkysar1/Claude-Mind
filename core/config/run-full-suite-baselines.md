@@ -1004,3 +1004,127 @@ for the third time. Domain half 77/77 + 1 skipped — note the domain half GREW 
 scripts landed, so a unit count that moves between rows is growth, not drift. The runner's own tail is worth
 quoting because it is item 6 in one line: `=== !!! FRAMEWORK HALF DID NOT PASS (rc=1) !!! === / Any green printed
 above covers the invisible-suite and domain halves ONLY.`
+
+
+**2026-08-30 (alpha, `hostname` cc-14, `uname -r` 6.8.0-137-generic, local backend, pinned worktree at the
+v2.12.45 tag → default rung, 4 chunks of ~314 files, launched 10:12, VERDICT 11:01):**
+`TOTAL: 18723 passed, 46 failed, 12 errors` / `VERDICT: GENUINE`, spread **20 / 18 / 3+12err / 5** — the same
+four-chunk distribution as the two cc-14 rows above, so again no fresh `--triage`. Two things make this row worth
+keeping rather than folding into its predecessors.
+
+**The passed count moved +3 (18720 → 18723) and that is the whole delta.** v2.12.45 added exactly three tests to
+`core/scripts/tests/test_worker_reducer_liveness.py` (same-box restart ADOPTs the new fp; cross-box takeover stays
+LATCHED; the poll rejoins under the new runner one poll later). A passed-count delta that equals the number of
+tests you added, with the failure distribution byte-identical across every chunk, is the cheapest available
+evidence that a change added no reds — and it is the one comparison the `TOTAL` line CAN support. Item 5 still
+holds for everything else: judge by the failing FILE SET, which here is unchanged and **fully owned — zero
+unowned files across all 46+12**.
+
+**SCOPE CAVEAT, stated because the ledger is read as coverage: this run does NOT cover what shipped.** The tag
+under test is v2.12.45; the payload actually promoted to Claude-Mind (PR #67) and pulled by coach is **v2.12.46**,
+which is v2.12.45 plus a merge of `origin/main` carrying a peer's work. v2.12.46 was cut only because the v2.12.45
+promotion was REFUSED by seed-preflight (`registered-but-untagged: ['call-shape-census']` — the tag predated the
+peer's merge, so the worktree-at-tag lacked a skill the unversioned external registry already listed; hence
+guard-5583, merge origin/main BEFORE cutting the release). Invisible half 114/115, same
+`test_capability_gate_narrative.py` red the cc-07 row settled as pre-existing. Domain half 77/77 + 1 skipped.
+And item 8's task-notification form fired a THIRD time in a row: the harness reported **"completed (exit code
+0)"** over a log whose own last line is `SUITE_EXIT=1`. Three rows, three identical misreports — treat the
+notification's exit code as carrying no information about the runner at all (guard-1431).
+
+**2026-08-30 (alpha WORKER Body, `hostname` cc-07, `uname -r` 6.8.0-137-generic, own-cloud box with
+`STORAGE_BACKEND=local` pinned, TWO pinned-worktree runs bracketing one fix — g-306-379 claim-continuity —
+default rung → 4 chunks of ~315 files):**
+
+- **Run A @ `0af373baf`** (the change): `TOTAL: 18938 passed, 62 failed, 12 errors` / `VERDICT: GENUINE`,
+  spread 20 / 22 / 14+12err / 6. `--triage`: **6 environmental | 21 genuine-owned | 1 genuine-UNOWNED** —
+  `test_owncloud_sid_carrier_carveout.py`.
+- **Run B @ `6d4e47ac0`** (the fix): `TOTAL: 18943 passed, 57 failed, 12 errors` / `VERDICT: GENUINE`,
+  spread 20 / 22 / 9 / 6. `--triage`: **6 environmental | 20 genuine-owned | 0 genuine-UNOWNED**
+  ("Nothing to file"). Domain half 77/77 + 1 skipped in both.
+
+THE UNOWNED RED IN RUN A WAS MINE, AND ONLY THE FULL SUITE CAUGHT IT — that is the row's point. 44 targeted
+tests (9 new + 6 new + 29 pre-existing across every file touching the changed surfaces) were GREEN over the
+defect. The change had moved `sweep()`'s ownership call from `_owned_agents()` to a new combined
+`_owned_claims()`, which silently BYPASSED the `_owned_agents` seam that callers and tests substitute: the
+carveout test's monkeypatch stopped taking effect and the sweep ran a real claim read instead of the injected
+ownership. Chunks 00/01 were **count-for-count identical** across the two runs (4328/20, 4260/22) and chunk 02
+moved exactly +5 passed / −5 failed, so the delta is attributable to the fix alone and to nothing else. Lesson
+worth copying: when a refactor introduces a new entry point to an existing resolver, the old function is a SEAM
+— check what substitutes it before routing production past it.
+
+**NEW, AND NOT IN ITEM 6: THE PINNED-WORKTREE PROTOCOL ITSELF MANUFACTURES INVISIBLE-HALF FAILURES.** Item 6
+prescribes copying `local-paths.conf` into the worktree and stops there. Run A's invisible half reported THREE
+`^FAIL` lines; two of them — `test_wm_advisory_lock.py` (rc=2, "working memory not initialized") and
+`test-wm-prune-cadence-protection.sh` (rc=1, `cp: cannot stat .../working-memory.yaml`) — are pure worktree
+artifacts: `agents/<agent>/session/working-memory.yaml` is gitignored, so a fresh worktree has none. Both
+reproduce identically at `0af373baf~1`, and both DISAPPEARED in Run B after one extra
+`cp agents/<agent>/session/working-memory.yaml` into the worktree — a positive control, not an inference. So
+copy the agent session state alongside the conf, or the invisible half reports two phantom reds on every
+worktree-pinned run, which trains readers to discount the one half that has no VERDICT line to protect it.
+Run B's invisible half was then a single `FAIL(rc=1) test_capability_gate_narrative.py` — the known red already
+established PRE-EXISTING and TRACKED (g-115-7335 / g-115-7346) in the cc-07 / `ac534c3ff` row above.
+
+**2026-08-30 (alpha, `hostname` cc-14, `uname -r` 6.8.0-137-generic, local-backend box, TWO pinned-worktree runs
+bracketing the g-115-8357 + g-115-8360 gate fixes, default rung → 4 chunks of ~315 files):**
+
+- **Run A @ `7c7fe4272`** (pre-fix): `TOTAL: 18804 passed, 45 failed, 12 errors` / `VERDICT: GENUINE`, spread
+  20 / 17 / 3+12err / 5. Invisible half **115/116** — the one FAIL the known pre-existing
+  `test_capability_gate_narrative.py` (g-115-7335 / g-115-7346). Domain half **76/77 + 1 skipped** — the one
+  FAILED `test_alert_dedup_pii_shape.py::test_editable_world_stores_carry_the_operator_address_in_shape_only`.
+- **Run B @ `620d85d2c`** (the fixes: domain-suite-gate refusal-text + `blocking_units` ledger fields,
+  capability-gate `land` → `_GENERIC_NAME_PARTS`, census stray-NAMING): `TOTAL: 18810 passed, 44 failed,
+  12 errors` / `VERDICT: GENUINE`, spread 20 / 16 / 3+12err / 5. Chunk-diff by failing SET: 00/02/03
+  identical, chunk 01 −1. Zero new failures. Invisible half **116/116** — the narrative-gate red went GREEN at
+  the fix commit (its subject is the capability gate this change touched). Domain half **77/77 + 1 skipped** —
+  the pii-shape red also green (not touched by the change; treat as flaky/environmental until it recurs).
+
+**RUN B READ AS DEAD MID-RUN AND WAS NOT — item 9's mtime rule, measured from the failing side.** At diagnosis
+time the harness task had completed with EMPTY output and no `EXIT=` line, the log sat at 168 lines with no
+runner footer, and `grep -c "^FAIL"` returned 0 — which nearly read as a clean run and was actually ABSENCE OF
+EXECUTION (caught by positive control: Run A's log carries 2 `^FAIL` lines at the same phase). A kill was issued,
+but the runner's detached children survived it and went on to complete BOTH post-chunk halves; the footer landed
+~35 min later and the log grew 168 → 310 lines. Two lessons, one per direction: (a) half-level greens mean
+nothing until the runner's own footer is present (guard-5599); (b) a dead-looking task + verdict-less log is
+STILL-RUNNING until the log mtime goes stale — re-read the log LATER before recording a run as killed, or you
+under-report a run that finished on its own (this row's first draft would have said "domain half never ran").
+Box context worth carrying: cc-14 has 4 GB RAM with a ~2 GB resident claude process; a solo invisible-half
+re-run during the confusion independently reported 116/116.
+
+**2026-08-31→09-01 (alpha, `hostname` DESKTOP-O91DLK2, Windows 10 MSYS, own-cloud box, g-358-36 closure — three
+attempts, two new Windows lessons):**
+
+- **Run 1 @ main repo** (4 chunks): `TOTAL: 19442 passed, 89 failed, 12 errors` / `VERDICT: INVALID (tree-moved)`
+  — bravo's live session on the SAME box committed + merged mid-run. Item 6's busy-box warning applies to a
+  second agent sharing the clone, not just your own pushes.
+- **Run 2 @ pinned worktree d75935d92** (default 4 chunks): chunk 00 DIED AT SPAWN —
+  `[WinError 206] The filename or extension is too long` from `subprocess.run` composing 322 file paths as argv.
+  **NEW LESSON: the worktree remedy interacts with guard-5634 on Windows** — a worktree under
+  `%LOCALAPPDATA%\Temp\<name>` lengthens every one of the ~322 per-chunk paths ~16 chars and pushes the composed
+  command line over the ~32,767 CreateProcess cap. Remedy that worked: MORE chunks (161 files/chunk), not a
+  shorter path.
+- **Run 3 @ same worktree, `--chunks 8`**: `TOTAL: 19443 passed, 85 failed, 12 errors` / `VERDICT: GENUINE`,
+  spread 1+12err / 10 / 7 / 12 / 4 / 5 / 12 / 34. Every named FAILED is a WORLD domain test
+  (`$WORLD_PATH/scripts/tests`) — **env-degraded by the worktree itself**: `.env.local` is gitignored so the
+  worktree has none, and the email/flywheel/ohs/usage-liveness/launch-env-key families need it. The `12 errors`
+  in chunk 00 match the standing cc-14 signature above (both its runs: `3+12err`). Zero failures in the
+  g-358-36 blast radius (update_goal / aspirations_write / iteration-close / cascade) across all three
+  executions. mind_api arm run separately in the MAIN repo (env present): 1,377 passed / 9 failed, all nine
+  pre-existing Windows wrapper-subprocess classes (5 = claim wrapper's scorer-verdict-gate invoked via a
+  POSIX-style path Windows Python reads as `C:\c\...` — g-115-3376-adjacent; 4 = wm-write/utilization/
+  store-author/history-cas wrapper files untouched by the change).
+
+**2026-09-01 (alpha, `hostname` DESKTOP-O91DLK2, MINGW64_NT-10.0-19045, own-cloud box, g-358-41 closure — pinned
+worktree `/tmp/wt-g35841` @ d5c2ecdcb3, `--chunks 8`, conf + daemon.port both copied per item 6):**
+
+- `TOTAL: 19538 passed, 88 failed, 24 errors` / `VERDICT: GENUINE`, spread 1 / 11 / 8 / 12 / 6+12err / 4 / …
+  across all 8 chunks (no confinement). Failing-file set matches the 08-31 run-3 profile: same standing
+  families (iteration_close_quality_flag_carry 9, cross_world_target_resolution 6, goal_selector_silent_empty 5,
+  stop_hook_gate_integration 5), domain half again env-degraded by the worktree (`.env.local` gitignored →
+  alert_sweep/email/product_pr_flow/ddb/efs families red exactly as 08-31). Errors 24 vs 12: +12 =
+  test_backpressure_owner_mandated (chunk 04), pre-existing family.
+- **Zero failures in the g-358-41 blast radius**: test_merge_noop_identical (9/9 in-suite),
+  test_owncloud_backend, test_owncloud_codec_backend, test_owncloud_sync*, test_tree_node_md_merge all green.
+  Two merge-ADJACENT reds, both pre-owned: test_owncloud_atomic_materialize (1) → g-115-5583 (this box's
+  tracked red set; WinError 5 sharing violation in `os.replace` under a concurrent reader — production
+  `_atomic_write_local` has no Windows retry; path untouched by the change), test_iteration_push CRLF case →
+  g-115-7311 (Windows-only).

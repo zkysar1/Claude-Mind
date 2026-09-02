@@ -163,6 +163,50 @@ def _validate_keys(payload: dict, mode: str) -> list[str]:
     return warns
 
 
+def _infer_aspiration_id(goal_id: str):
+    """Derive the owning aspiration id from a goal id by PATTERN, with no I/O.
+
+    Both goal-id shapes carry their aspiration in the prefix, so this needs no
+    store read (and therefore cannot fail because a store is unreachable):
+        g-115-3704              -> asp-115
+        g-115-3704-a            -> asp-115
+        g-xw-20260830T041617-01 -> asp-xw-20260830T041617
+    Returns None when the id matches neither shape -- the caller then omits the
+    key and lets the normal SCHEMA check report it, rather than inventing an
+    aspiration that does not exist."""
+    import re
+    m = re.match(r"^g-(\d{3})-\d{2,4}(?:-[a-z])?$", goal_id)
+    if m:
+        return "asp-" + m.group(1)
+    m = re.match(r"^g-(xw-\d{8}T\d{6})-\d{2}$", goal_id)
+    if m:
+        return "asp-" + m.group(1)
+    return None
+
+
+def _payload_from_goal_id(goal_id: str, args) -> dict:
+    """Build a complete init payload from just a goal id ().
+
+    Every required key is either derived from the id or defaulted, so the
+    remedy `_warn_checkpoint_missing` prints is runnable AS PRINTED -- which
+    it was not while the only form demanded a hand-built object carrying all
+    five (g-115-3704). `selected_at` is the RE-ANCHOR time, not the original
+    selection time: this path exists precisely because the original anchor is
+    gone, so there is nothing on disk to recover the earlier stamp from, and
+    claiming otherwise would be worse than being explicit."""
+    from datetime import datetime
+    payload = {
+        "goal_id": goal_id,
+        "source": getattr(args, "source", None) or "world",
+        "phase": getattr(args, "phase", None) or "selected",
+        "selected_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    asp = _infer_aspiration_id(goal_id)
+    if asp:
+        payload["aspiration_id"] = asp
+    return payload
+
+
 def _set_dotted(data: dict, path: str, value) -> None:
     """Mutate `data` so the dotted path resolves to `value`, creating intermediate
     dicts as needed. Mirrors jq's `.a.b.c = x` semantics."""
@@ -254,7 +298,14 @@ def cmd_init(args) -> int:
     """Write the initial checkpoint. Reads JSON payload from stdin OR from
     the --json flag. Required keys per SCHEMA must be present. Existing
     checkpoint is overwritten (selecting a new goal supersedes any prior anchor)."""
-    if args.json:
+    if getattr(args, "goal_id", None):
+        # Self-sufficient form: infer the whole payload from the goal id, then
+        # let an explicit --json override any inferred field (explicit beats
+        # inferred). Deliberately checked BEFORE --json so the two compose.
+        payload = _payload_from_goal_id(args.goal_id, args)
+        if args.json:
+            payload.update(json.loads(args.json))
+    elif args.json:
         payload = json.loads(args.json)
     elif not sys.stdin.isatty():
         raw = _read_optional_stdin().strip()
@@ -270,10 +321,33 @@ def cmd_init(args) -> int:
         print("ERROR: payload must be a JSON object", file=sys.stderr)
         return 2
 
+    # An unknown key is a TYPO; a missing anchor is an OUTAGE. Refusing the
+    # whole write over a stray key traded the cheap failure for the expensive
+    # one: every downstream reader then degrades silently for the REST of the
+    # session (that is what _warn_checkpoint_missing exists to catch), and the
+    # rc=1 was announced with the word "WARN" -- so the message told the caller
+    # the opposite of what happened. Unknown keys are now DROPPED and warned
+    # (non-fatal, which is what "WARN" promises); everything else still refuses
+    # and SAYS it refused. Known keys stay fully validated either way.
+    #
+    # Dropping happens BEFORE validation on purpose: every warn _validate_keys
+    # then returns is a genuine schema violation by construction, so nothing
+    # here has to classify a message by its text ().
+    unknown = [k for k in payload if k.split(".", 1)[0] not in SCHEMA]
+    if unknown:
+        for k in unknown:
+            print(
+                f"WARN[loop-state-save:init] unknown key {k!r} -- DROPPED; "
+                f"checkpoint still written, known keys unaffected",
+                file=sys.stderr,
+            )
+        payload = {k: v for k, v in payload.items() if k not in unknown}
+
     warns = _validate_keys(payload, mode="init")
     if warns:
         for w in warns:
-            print(f"WARN[loop-state-save:init] {w}", file=sys.stderr)
+            print(f"REFUSED[loop-state-save:init] {w} -- wrote NOTHING, "
+                  f"checkpoint unchanged", file=sys.stderr)
         return 1
 
     _atomic_write(_checkpoint_path(), payload)
@@ -304,15 +378,20 @@ def _warn_checkpoint_missing(path, args) -> None:
             "Cause is almost always a skipped Phase 2.95 (aspirations-select creates "
             "the checkpoint; only iteration-close deletes it), which leaves it absent "
             "for the REST of the session and silently degrades every downstream "
-            "reader. Re-anchor with the NON-BLOCKING form, which passes the "
-            "payload as an ARGUMENT instead of on stdin: "
-            "`loop-state-save.sh init --json '{...}'` carrying ALL required "
-            "keys (%s). Do NOT use a bare `loop-state-save.sh init`: with no "
+            "reader. Re-anchor with the SELF-SUFFICIENT form, which needs no "
+            "payload at all: `loop-state-save.sh init --goal-id <g-NNN-NN>` -- "
+            "it infers aspiration_id from the id, phase=selected and "
+            "selected_at=now (add `--source agent` for an agent-queue goal, "
+            "`--phase X` to override). The explicit form "
+            "`loop-state-save.sh init --json '{...}'` still works and must "
+            "carry ALL required keys (%s). Do NOT use a bare "
+            "`loop-state-save.sh init`: with no "
             "stdin it exits 2, and with an inherited never-EOF stdin it BLOCKED "
             "FOREVER until g-115-3661 (it now degrades after "
             "LOOP_STATE_SAVE_STDIN_TIMEOUT_S, default 10s, and still exits 2). "
-            "A partial object warns once per missing key and writes nothing, so "
-            "the naive reading of this line fails before it works (g-115-3454)."
+            "A partial object REFUSES once per missing key and writes nothing "
+            "(g-115-3454); an unknown key is warned and dropped, and the "
+            "checkpoint is still written (g-115-3704)."
             % (path, ", ".join(keys) or "<none>", ", ".join(REQUIRED_INIT_KEYS)),
             file=sys.stderr,
         )
@@ -477,6 +556,12 @@ def main():
 
     p_init = sub.add_parser("init", help="Write initial checkpoint (overwrites existing)")
     p_init.add_argument("--json", help="JSON payload (alternative to stdin)")
+    p_init.add_argument("--goal-id", dest="goal_id", default=None,
+                        help="Self-sufficient form: infer the whole payload from this goal id")
+    p_init.add_argument("--source", default=None, choices=("world", "agent"),
+                        help="Queue the goal came from (default: world). Only with --goal-id.")
+    p_init.add_argument("--phase", default=None,
+                        help="Phase to anchor at (default: selected). Only with --goal-id.")
     p_init.set_defaults(func=cmd_init)
 
     p_update = sub.add_parser("update", help="Merge-update fields on existing checkpoint")

@@ -334,7 +334,7 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # the rb-245 one-record schema probe afterwards.
    #
    # POSITIVE CONTROL — the ONLY number that should ever alarm:
-   #   [r for r in payload if r.get("outcome") in ("CONFIRMED","CORRECTED","REFUTED")
+   #   [r for r in payload if r.get("outcome") in _reflectable.REFLECTABLE_OUTCOMES
    #                       and not r.get("reflected")]
    # RUN IT. Do not read a number off this comment — it was 0 on 2026-08-19,
    # 1 on 2026-08-22 (2026-08-09_prose-mandate-rate-generalizes, CONFIRMED,

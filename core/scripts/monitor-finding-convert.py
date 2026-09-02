@@ -146,7 +146,12 @@ def _read_open_goals(source):
     for asp in (data or []):
         if isinstance(asp, dict):
             for g in asp.get("goals", []) or []:
-                if isinstance(g, dict) and g.get("status") in ("pending", "in-progress"):
+                # +candidate — §11b/ (world/conventions/goal-intake-management.md).
+                # HIGHEST-SEVERITY row of that sweep: this feeds is_duplicate() below, so
+                # a candidate missing here makes the dedup gate a DUPLICATE GENERATOR —
+                # the converter would file a fresh goal for a finding an existing
+                # candidate already covers, inflating the very intake the tier reduces.
+                if isinstance(g, dict) and g.get("status") in ("pending", "in-progress", "candidate"):
                     goals.append(g)
     return goals
 

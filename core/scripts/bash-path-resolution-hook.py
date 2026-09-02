@@ -51,6 +51,7 @@ contract as path-resolution-hook.py.
 
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -134,8 +135,18 @@ PATTERNS_LAST_ARG = [
     (r'\bcp\s+' + FLAG_TOKENS + r'(?:' + PATH_CHARS + r'+\s+)+(["\']?)(' + PATH_CHARS + r'+)\1(?=\s|[;&|]|$)', 2),
     # mv [-flags] <src> <dst>
     (r'\bmv\s+' + FLAG_TOKENS + r'(?:' + PATH_CHARS + r'+\s+)+(["\']?)(' + PATH_CHARS + r'+)\1(?=\s|[;&|]|$)', 2),
-    # >  <path> or >> <path>   (file redirect, leading whitespace required so 1>/2>/&> don't match)
-    (r'(?<=\s)>>?\s*(["\']?)(' + PATH_CHARS + r'+)\1',                          2),
+    # install [-flags] <src> ... <dst> — same last-arg destination shape as cp/mv
+    # (g-115-3345). `install -m 644 src dst` parses because FLAG_TOKENS eats
+    # `-m ` and the mode `644` is then absorbed by the src repetition group.
+    (r'\binstall\s+' + FLAG_TOKENS + r'(?:' + PATH_CHARS + r'+\s+)+(["\']?)(' + PATH_CHARS + r'+)\1(?=\s|[;&|]|$)', 2),
+    # dd ... of=<path> — the destination is NOT positional, so no last-arg
+    # pattern can reach it (g-115-3345). Bounded to one command segment so a
+    # later `of=` on the far side of a `;` cannot be attributed to this dd.
+    (r'\bdd\s+[^;&|\n]*?\bof=(["\']?)(' + PATH_CHARS + r'+)\1',                 2),
+    # >  <path> or >> <path> or >| <path>   (file redirect, leading whitespace
+    # required so 1>/2>/&> don't match). `>|` is bash's force-clobber form and
+    # is a plain write — the `\|?` is the whole fix for it (g-115-3345).
+    (r'(?<=\s)>>?\|?\s*(["\']?)(' + PATH_CHARS + r'+)\1',                       2),
 ]
 
 # Multi-arg verbs — every positional arg after the flag block is a target.
@@ -310,6 +321,78 @@ def _in_span(pos, spans):
     return any(s <= pos < e for s, e in spans)
 
 
+# `sed -i` target extraction (g-115-3345). Deliberately NOT a regex. The target
+# is a positional arg that FOLLOWS an expression which routinely contains
+# slashes, spaces, quotes and even `;`, so every regex candidate measured
+# against the 60,507-call corpus leaked expression fragments as paths
+# ('role-ish', 'timer/On', 'is/carries', and a bare '/'). shlex already knows
+# where the quoting ends, which is the entire difficulty of this form.
+_SED_SEP = {';', '&&', '||', '|', '&', ';;'}
+_SED_IN_PLACE_RE = re.compile(r'^-(?=[a-zA-Z]*i)[a-zA-Z]*(?:\..*)?$|^--in-place')
+
+
+def _sed_inplace_targets(cmd, spans):
+    """Return [('sed-i', path), ...] for every `sed -i` write in cmd.
+
+    Fails OPEN (returns []) on anything unparseable: a missed write is merely
+    the pre-existing state, whereas an invented target is a false DENIAL of a
+    command that was never doing anything wrong.
+    """
+    # A newline separates commands in bash, but only OUTSIDE a quoted span (an
+    # expression may legally contain one). shlex treats '\n' as ordinary
+    # whitespace, so without this substitution the walker runs past the sed
+    # invocation into the following line and captures later commands as
+    # "files" — measured on the corpus, that denied /usr/bin/grep.
+    flat = ''.join(' ; ' if (ch == '\n' and not _in_span(i, spans)) else ch
+                   for i, ch in enumerate(cmd))
+    try:
+        toks = shlex.split(flat, posix=True)
+    except ValueError:
+        return []
+    out = []
+    i = 0
+    while i < len(toks):
+        if toks[i] != 'sed':
+            i += 1
+            continue
+        i += 1
+        inplace = False
+        expr_seen = False
+        files = []
+        while i < len(toks) and toks[i] not in _SED_SEP:
+            tok = toks[i]
+            if tok == '--':
+                i += 1
+                while i < len(toks) and toks[i] not in _SED_SEP:
+                    files.append(toks[i])
+                    i += 1
+                break
+            if tok.startswith('-') and len(tok) > 1:
+                if _SED_IN_PLACE_RE.match(tok):
+                    inplace = True
+                if tok in ('-e', '-f', '--expression', '--file'):
+                    expr_seen = True   # script supplied by flag; no bare script
+                    i += 2
+                    continue
+                if tok.startswith('-e') or tok.startswith('-f'):
+                    expr_seen = True
+                    i += 1
+                    continue
+                i += 1
+                continue
+            if not expr_seen:
+                expr_seen = True       # first bare arg IS the script, not a file
+                i += 1
+                continue
+            files.append(tok)
+            i += 1
+        if inplace:
+            for f in files:
+                if f and f not in ('/', '//') and _PATH_TOKEN_RE.match(f):
+                    out.append(('sed-i', f))
+    return out
+
+
 def extract_targets(cmd, _depth=0):
     """Return a list of (verb, path) tuples extracted from the bash command.
 
@@ -365,11 +448,14 @@ def extract_targets(cmd, _depth=0):
             # `--summary "...>>/tee..."` does not (the `>>` is inside one).
             if _in_span(m.start(), spans):
                 continue
-            verb_match = re.search(r'\b(cp|mv)\b', m.group(0))
+            verb_match = re.search(r'\b(cp|mv|install|dd)\b', m.group(0))
             verb = verb_match.group(1) if verb_match else "redirect"
             path = m.group(target_group)
             if path:
                 targets.append((verb, path))
+
+    # sed -i writes — a tokenizer walk, not a pattern; see _sed_inplace_targets.
+    targets.extend(_sed_inplace_targets(cmd, spans))
     return targets
 
 
@@ -385,7 +471,11 @@ def main():
         approve_no_mutation()
 
     # Fast filter: skip commands that can't possibly create files.
-    if not re.search(r'(mkdir|touch|tee|cp|mv|\s>)', cmd):
+    # MUST list every verb extract_targets can extract, or that verb's support
+    # is unreachable in production while its unit-level extraction tests pass
+    # (g-115-3345; guard-3448 — a gate is only as broad as its entry points).
+    # `\s>` already admits the `>|` clobber form, so it needs no entry here.
+    if not re.search(r'(mkdir|touch|tee|cp|mv|sed|install|\bdd\b|\s>)', cmd):
         approve_no_mutation()
 
     project_root = os.environ.get("PROJECT_ROOT", "")

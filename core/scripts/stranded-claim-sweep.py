@@ -261,6 +261,15 @@ def _query_claimed_goals(agent: str) -> List[Dict[str, Any]]:
                 },
             )
         except _rt.RtError as e:
+            # The daemon derives its goal_field_name allowlist FROM THE LIVE
+            # CORPUS, so `claimed_by` is a valid field name exactly while a
+            # claim is outstanding and an INVALID one exactly when there is
+            # nothing to sweep. A 400 unknown_goal_field here therefore means
+            # "zero claims in this status", which is the documented safe case
+            # ({scanned: 0}), not a failure -- re-raising it killed the sweep
+            # on every iteration of an idle fleet ().
+            if "unknown_goal_field" in str(e):
+                continue
             raise SystemExit(f"aspirations query failed: {e}") from e
         try:
             data = json.loads(raw or "[]")

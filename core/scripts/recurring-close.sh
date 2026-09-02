@@ -281,6 +281,96 @@ if [[ "$FINAL_OUTCOME" != "$ORIGINAL_OUTCOME" ]]; then
 fi
 OUTCOME="$FINAL_OUTCOME"
 
+# ─── Phase-6 sentinel: written HERE, BEFORE the kill window () ─────
+# OUTCOME is final on the line above (Block A/C reclassification, L270-282).
+# The four iteration-close phases dispatch further below; this sentinel USED
+# to be written ~836 lines below, at end-of-script. A SIGTERM at the harness's
+# 2-minute Bash ceiling anywhere in that window left the close COMMITTED (or
+# PARTIALLY committed) with the sentinel never written — so the stdout
+# imperative AND its backstop were lost to ONE event, and Phase 6 was silently
+# skipped on a DEEP close. Four detected instances in 11 days, three agents,
+# three boxes (07-30 bravo/cc-05, 08-04 bravo/cc-05, 08-09 echo/cc-03, 08-10
+# zeta/cc-02); every one was caught BY HAND, so four is a FLOOR, not a rate.
+# Writing here also covers the guard-2357 manual repair route, which re-enters
+# iteration-close.sh but never this script — so no second write site is needed.
+#
+# TRADE-OFF, taken deliberately: if the close later aborts BEFORE committing,
+# the sentinel is set for a close that never finished. That costs at most one
+# redundant spark, bounded by the 60-min expires_at TTL and de-duplicated by
+# spark-fire-dedup. A LOST spark is unbounded and silent. Cheap-and-noisy beats
+# free-and-invisible.
+#
+# Fail-open at every step — must never change MAX_RC or block the close.
+write_phase6_sentinel() {
+    local _exp _set _payload _existing _other
+    _exp="$(py -3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
+    if [[ -z "$_exp" ]]; then
+        echo "[recurring-close] WARN: could not compute expires_at for pending_phase_6_spark (non-fatal)" >&2
+        return 0
+    fi
+    _set="$(py -3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
+
+    # guard-2104 REFUSE-GUARD. This slot is a payload-carrying SINGLE-SLOT
+    # sentinel whose payload is derived from THIS close, so it is LOSS-BEARING:
+    # an unconditional write silently CANCELS an unconsumed obligation still
+    # sitting there, and nothing reports the loss. guard-2104 sanctions MERGE or
+    # REFUSE LOUDLY. Refusing is chosen because merging would require the slot to
+    # hold a LIST, and five readers consume it as a SINGLE object (aspirations
+    # Phase -0.5c.2, spark-fire-dedup.py, orchestrator-entry-battery,
+    # _sentinel_registry.py, stale-sentinel-canary.py). An EXPIRED payload is a
+    # dead obligation and is overwritten freely.
+    _existing="$(bash "$SCRIPT_DIR/wm-read.sh" pending_phase_6_spark --json 2>/dev/null || true)"
+    _other="$(printf '%s' "$_existing" | GID="$GOAL_ID" py -3 -c '
+import json, os, sys
+from datetime import datetime
+raw = sys.stdin.read().strip()
+if not raw or raw == "null":
+    sys.exit(0)
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+gid = d.get("goal_id")
+if not gid or gid == os.environ["GID"]:
+    sys.exit(0)
+exp = d.get("expires_at") or ""
+if exp:
+    try:
+        if datetime.now() > datetime.fromisoformat(exp):
+            sys.exit(0)
+    except Exception:
+        pass
+print(gid)
+' 2>/dev/null || true)"
+    if [[ -n "$_other" ]]; then
+        echo "[recurring-close] REFUSING to overwrite pending_phase_6_spark: the slot holds an UNCONSUMED, unexpired Phase-6 obligation for $_other and this close is $GOAL_ID. guard-2104 — overwriting would silently cancel $_other's obligation with nothing reporting it. Leaving it intact; $GOAL_ID's Phase 6 rides the stdout imperative at end-of-script." >&2
+        return 0
+    fi
+
+    _payload="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$_exp" SETAT="$_set" py -3 -c "
+import json, os
+print(json.dumps({
+    'goal_id':    os.environ['GID'],
+    'outcome':    os.environ['OUT'],
+    'source':     os.environ['SRC'],
+    'summary':    os.environ.get('SUM',''),
+    'expires_at': os.environ['EXP'],
+    'set_at':     os.environ.get('SETAT',''),
+}))
+" 2>/dev/null || true)"
+    if [[ -n "$_payload" ]]; then
+        echo "$_payload" | bash "$SCRIPT_DIR/wm-set.sh" pending_phase_6_spark >/dev/null 2>&1 \
+            || echo "[recurring-close] WARN: pending_phase_6_spark sentinel write failed (non-fatal — stdout imperative remains as fallback)" >&2
+    else
+        echo "[recurring-close] WARN: could not build pending_phase_6_spark payload (non-fatal)" >&2
+    fi
+    return 0
+}
+
+write_phase6_sentinel
+
 # ─── close out phase-4-execute () ───────────────────────────────────
 # Phase 4's phase-END lives at the tail of the Phase-4 body in the loop digest,
 # and the recurring shortcut never walks that far: its terminal imperative sends
@@ -1080,50 +1170,27 @@ fi
 # Without an outcome-aware imperative here, deep-outcome recurring closures
 # silently bypass Phase 6 — the same docs-vs-impl drift class universal RB
 # "Docs-vs-impl drift in framework shortcut wrappers" was filed against.
-# Sentinel-WM-slot transport for Phase 6 spark imperative ().
-# When recurring-close.sh's wall-clock exceeds the Bash 2-minute timeout the
-# call backgrounds, the harness fires the stop hook before bg completes, and
-# the LLM re-enters /aspirations loop never seeing the stdout imperative
-# below. Phase 6 spark was silently bypassed on deep recurring closes
-# (observed 2/2:  bfzr7dvyk +  bo42a8rld).
-#
-# Write the OUTCOME (post Block A/C flip), goal_id, source, summary, and a
-# 60-min expires_at into wm.pending_phase_6_spark. The aspirations
-# orchestrator's Phase -0.5c.X consumes this slot on next-iteration entry
-# BEFORE precheck — if outcome=deep and not expired, it fires
-# Skill(aspirations-spark); if outcome=routine or expired, clears silently.
-# Stdout imperative below is preserved as backward-compatible signal for
-# non-bg cases. The sentinel is the authoritative transport.
-# Fail-open: errors echo to stderr and do not change MAX_RC.
-EXPIRES_AT="$(py -3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
-# set_at = sentinel creation time (now). Consumed by Phase -0.5c.2's dedup
-# (spark-fire-dedup.py check --sentinel-set-at): a spark recorded at/after this
-# set_at fired in response to THIS close (skip the re-fire); one from a prior
-# close fired before it (fire). Additive field — older consumers ignore it; the
-# new consumer prefers it over the time-window heuristic ( / rb-1674).
-SET_AT="$(py -3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
-if [[ -n "$EXPIRES_AT" ]]; then
-    SENTINEL_PAYLOAD="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$EXPIRES_AT" SETAT="$SET_AT" py -3 -c "
-import json, os
-print(json.dumps({
-    'goal_id':    os.environ['GID'],
-    'outcome':    os.environ['OUT'],
-    'source':     os.environ['SRC'],
-    'summary':    os.environ.get('SUM',''),
-    'expires_at': os.environ['EXP'],
-    'set_at':     os.environ.get('SETAT',''),
-}))
-" 2>/dev/null || true)"
-    if [[ -n "$SENTINEL_PAYLOAD" ]]; then
-        echo "$SENTINEL_PAYLOAD" | bash "$SCRIPT_DIR/wm-set.sh" pending_phase_6_spark >/dev/null 2>&1 \
-            || echo "[recurring-close] WARN: pending_phase_6_spark sentinel write failed (non-fatal — stdout imperative remains as fallback)" >&2
-    else
-        echo "[recurring-close] WARN: could not build pending_phase_6_spark payload (non-fatal)" >&2
-    fi
-else
-    echo "[recurring-close] WARN: could not compute expires_at for pending_phase_6_spark (non-fatal)" >&2
-fi
+# ─── Phase-6 sentinel: NO LONGER WRITTEN HERE () ───────────────────
+# The write moved to write_phase6_sentinel(), called immediately after OUTCOME
+# is finalized near the top of this script. It used to sit here, 836 lines past
+# the outcome flip, so a SIGTERM at the harness's 2-minute Bash ceiling anywhere
+# in that window lost BOTH the stdout imperative below AND its sentinel backstop
+# to a single event, and Phase 6 was silently skipped on a DEEP close.
+# Do NOT re-add a write here: a second write site on this slot would be exactly
+# the guard-2104 loss-bearing overwrite of whatever the early write — or a peer
+# close — legitimately put there.
 
+# STATE-MISMATCH LANDING () — mirror of iteration-close.sh. If agent-state
+# left RUNNING under this loop (recovery-gate yank, or /stop from another window)
+# the landing script tries the yank reversal for THIS sid and, failing that,
+# prints the graceful-landing directive (consolidate, then END the turn) and
+# exits 0 — after which the ITERATION COMPLETE imperative below MUST NOT print:
+# its Skill(aspirations) re-entry refuses at IDLE with nothing consolidated.
+if [ -f "$SCRIPT_DIR/state-mismatch-landing.sh" ]    && bash "$SCRIPT_DIR/state-mismatch-landing.sh" --agent "${MIND_AGENT:-}" --sid "${MIND_SID:-}"; then
+    printf '{"ts":"%s","script":"recurring-close","goal_id":"%s","outcome":"%s","agent":"%s","max_rc":%s,"event":"state-mismatch-landing"}
+'         "$(date +%Y-%m-%dT%H:%M:%S)" "${GOAL_ID:-unknown}" "${OUTCOME:-unknown}" "${MIND_AGENT:-unknown}" "${MAX_RC:-0}"         >> "$CORE_ROOT/logs/imperative-fires.jsonl" 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+    exit $MAX_RC
+fi
 echo ""
 echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
 # Deadman's-switch terminal-pair (DEFAULT-ON since Stage 5, 2026-06-23). Mirror

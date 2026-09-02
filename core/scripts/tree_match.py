@@ -107,6 +107,34 @@ PROVENANCE_WEIGHTS = {
 }
 DEFAULT_PROVENANCE_WEIGHT = 0.9  # Legacy nodes without provenance field
 
+
+def safe_num(value, default, *, rid="", field=""):
+    """Coerce a record-sourced numeric field to float; on failure warn (naming
+    the record and field) and return ``default`` — a malformed record costs
+    ITSELF a scoring term, never the whole query (g-357-49).
+
+    A hand-edited front matter or store record can carry a quoted number, a
+    list, or arbitrary text where the scorer expects a number. Raw arithmetic
+    on such a value crashes the entire retrieval ("can't multiply sequence by
+    non-int of type float" — observed live on a peer deployment, deterministic
+    for any query whose candidate set included the one malformed record).
+    Shared by tree_match and retrieve.py scoring (retrieve already imports
+    from this module; the reverse import would cycle).
+    """
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        try:
+            sys.stderr.write(
+                f"[retrieve] WARN: non-numeric {field or 'field'}="
+                f"{value!r} on record {rid or '?'} — scored as {default} "
+                f"(g-357-49)\n")
+        except Exception:
+            pass
+        return default
+
 # MMR (Maximal Marginal Relevance) parameters (P2 #11, 2026-05-10).
 # Re-ranks the top-K to favor diversity when multiple high-relevance results
 # come from the same subtree (e.g., 5 siblings under one parent crowding out
@@ -148,8 +176,10 @@ def _recency_bonus(node, cfg=None):
     if age_days < 0:
         age_days = 0
 
-    # Rehearsal-adaptive TAU
-    rc = node.get("retrieval_count", 0) or 0
+    # Rehearsal-adaptive TAU (safe_num: a non-numeric retrieval_count must not
+    # crash the rc/neutral comparison below — g-357-49)
+    rc = safe_num(node.get("retrieval_count", 0) or 0, 0.0,
+                  rid=node.get("key", ""), field="retrieval_count")
     if cfg:
         tau_base = float(cfg.get("rehearsal_tau_base", REHEARSAL_TAU_BASE))
         tau_max = float(cfg.get("rehearsal_tau_max", REHEARSAL_TAU_MAX))
@@ -611,7 +641,7 @@ def _compute_match_score(key, node, channel, cfg=None):
     score = CHANNEL_SCORES.get(channel, 0.5)
 
     # Depth bonus: deeper = more specific knowledge (inverted from old depth-first)
-    depth = node.get("depth", 0)
+    depth = safe_num(node.get("depth", 0), 0.0, rid=key, field="depth")
     if depth >= 3:
         score += 1.5
     elif depth == 2:
@@ -623,10 +653,15 @@ def _compute_match_score(key, node, channel, cfg=None):
     # DIRECT observations get full confidence credit; INFERRED/SYNTHESIZED/
     # HEARSAY get progressively less.  Legacy nodes without provenance tag
     # get DEFAULT_PROVENANCE_WEIGHT (0.9).  YAML null -> Python None; guard.
-    score += (node.get("confidence") or 0) * _provenance_weight(node)
+    # safe_num (g-357-49): a non-numeric confidence (quoted string, list) was
+    # `sequence * float` here — one malformed record crashed the whole query.
+    score += safe_num(node.get("confidence") or 0, 0.0,
+                      rid=key, field="confidence") * _provenance_weight(node)
 
-    # Capability bonus
-    score += CAPABILITY_BONUS.get(node.get("capability_level", ""), 0)
+    # Capability bonus (str() guard: an unhashable capability_level must cost
+    # only its own bonus, not the query — same g-357-49 class)
+    _cl = node.get("capability_level", "")
+    score += CAPABILITY_BONUS.get(_cl if isinstance(_cl, str) else str(_cl), 0)
 
     # Recency bonus (asymmetric -- recently-updated content gets a boost,
     # stable old content gets no penalty). See _recency_bonus.

@@ -101,6 +101,22 @@ def _run_helper(helper: Path, tmpdir: Path, *extra_args) -> tuple:
     env = os.environ.copy()
     env["MIND_AGENT_DIR"] = str(tmpdir)
     env["MIND_AGENT"] = "test-agent-isolated"
+    # guard-862 / guard-3375 (): os.environ.copy() inherits everything,
+    # and on a worker Body bash-agent-inject.py exports BODY_WM_PATH. wm.wm_path()
+    # (wm.py) returns BODY_WM_PATH whenever it is set and only falls back to
+    # AGENT_DIR/session/working-memory.yaml when it is not — so it OUTRANKS the
+    # MIND_AGENT_DIR isolation set two lines up, and every helper below wrote the
+    # live per-Body WM instead of this tmpdir fixture. The fixture's slot_meta then
+    # stayed frozen at SEED_TIMESTAMP, which is verbatim the assertion that fired:
+    # all 7 tests here failed on every worker-run suite, on any box, while passing
+    # on a reducer. Measured on cc-08 2026-08-31: 7/7 FAIL with the var inherited,
+    # 7/7 PASS under `env -u BODY_WM_PATH`, no other change.
+    # BODY_WM_PATH is the only BODY_* var that reaches this test: BODY_ROLE is read
+    # only by close-phase-skip-check.py and uncommitted-work-gate.py (neither is
+    # exercised here), and _paths.py mentions it in prose only — so it is
+    # deliberately NOT popped. Sibling fix: test_class_balance_cross_session.py's
+    # with_sandbox () saves/sets/restores the same var.
+    env.pop("BODY_WM_PATH", None)
     result = subprocess.run(
         ["py", "-3", str(helper), *extra_args],
         env=env,

@@ -76,7 +76,21 @@ except ImportError:
 # Heuristic constants — change here, not inline
 # ---------------------------------------------------------------------------
 
-TERMINAL_STATUSES = {"resolved", "superseded"}
+# g-115-3746: sourced from the shared vocabulary module, NOT re-inlined here.
+#
+# This is the SWEEP's set: "needs no further transition". It deliberately EXCLUDES
+# `answered`/`agent_answered`, which are the transition backlog `_h_answered_not_
+# cleaned` classifies as needs_transition and `--apply-cleanup` discharges. Adding
+# them here would make that heuristic unreachable (heuristic 1 fires first) and
+# make the writer skip those entries, deleting the executor g-115-3753/g-115-5025
+# built. Measured: doing so turns three tests in test_pending_questions_sweep.py
+# red. If you came here from a goal saying "answered should be terminal", read the
+# module docstring first -- that reading is five weeks stale.
+#
+# Widened by this goal from {"resolved", "superseded"} to also cover `retired`,
+# `closed` and `done` -- states that are settled but were in NEITHER script's set,
+# so a retired question stayed eligible for staleness flagging forever (g-115-4276).
+from _pending_question_status import SWEEP_SETTLED as TERMINAL_STATUSES  # noqa: F401
 INFRA_PATTERN = re.compile(
     r"PID \d+|port \d+|VRAM|GPU|SSH.*host.?key|\.exe|Lambda",
     re.IGNORECASE,

@@ -87,6 +87,23 @@ def _run_cli(meta, args, agent="alpha", check_rc=True):
     return proc
 
 
+def _cli_judge_from_env():
+    """What the CLI subprocess will resolve for judge provenance ().
+
+    _run_cli hands the subprocess a copy of THIS process's environment, so the
+    CLI's own resolver run here yields exactly what it will resolve there. Used
+    by the byte-compat harness to feed the daemon equivalent input, since the
+    daemon takes these in the body rather than from an environment it must not
+    read.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("skill_evaluate_cli_judge",
+                                                  EVAL_PY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._judge_from_env()
+
+
 class _FakePaths:
     def __init__(self, meta):
         self.meta = meta
@@ -230,9 +247,20 @@ class TestScoreByteCompat:
                 "--executability", "poor", "--maintainability", "good",
                 "--cost-awareness", "average"]
         cli_out = _run_cli(cli_meta, args).stdout
+        # Judge provenance travels by a DIFFERENT transport on each side
+        # (): the CLI runs in the judge's own process and resolves it
+        # from that environment, while the daemon is a long-lived process and
+        # must be told, in the body. Byte-compat is "same INPUTS -> same
+        # bytes", so the harness has to supply the daemon the values the CLI
+        # just resolved for itself -- otherwise it compares a populated judge
+        # against an honestly-absent one and reports a parity break that is
+        # really a transport difference (guard-1189).
+        judge_model, harness = skill_evaluate._judge_provenance(
+            *_cli_judge_from_env())
         body = {"skill": "new-skill", "goal": "g-9-1", "safety": "good",
                 "completeness": "average", "executability": "poor",
-                "maintainability": "good", "cost_awareness": "average"}
+                "maintainability": "good", "cost_awareness": "average",
+                "judge_model": judge_model, "harness": harness}
         resp = skill_evaluate.score(_FakeCtx(dmn_meta, body=json.dumps(body).encode("utf-8")))
         # stdout line is timestamp-free -> byte-identical.
         assert resp.body.decode("utf-8") == cli_out

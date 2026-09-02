@@ -55,6 +55,7 @@ INFER_RECOGNIZED_SIGNALS = [
     "insight_trigger:msg-20260611-120000-zeta-1900",
     "skill-discovery-audit:some-forged-skill:silently_undertriggering",
     "blocker_pattern:efs-unreachable",
+    "s3-churn:example-world/hot-object",
     # -> agent-self
     "idle_fallback",
     "decomposition:parent-1",

@@ -18,6 +18,38 @@
 # fallback was retired — the daemon now files the Unblock atomically with
 # the refusal under the same aspirations.jsonl lock and surfaces
 # `filed_unblock_id` in the 400 response body.
+#
+# ── WRITING A NARRATIVE FIELD? USE goal-field-append.sh INSTEAD ────────────
+# This wrapper REPLACES the field. For the prose fields that accumulate across
+# sessions and contributors — progress_note, outcome_note, description — a
+# plain set is destructive by default, and the loss is invisible at the call
+# site: the write returns rc=0 with the full record echoed either way.
+#
+#   bash core/scripts/goal-field-append.sh [--source world|agent] \
+#        <goal-id> <field> <marker> [--value-file <path> | --value-stdin]
+#
+# That script exists for exactly this and carries what a hand-rolled
+# read-modify-write cannot: a CAS conflict check (the value moving under you
+# between read and write), post-state verification (post_len + delta +
+# confirm_read:agreed), and marker-keyed idempotency so a retry cannot
+# double-paste. Note rc=0 with `changed:false` means NOTHING was written —
+# never read the exit code as "landed" (guard-3381).
+#
+# The field-shrink guard below does NOT cover this: it fires on the SHRINK
+# direction past a 25% floor, so a same-size or modestly-smaller replacement —
+# the ordinary addendum-clobber — passes it silently (guard-5228, which
+# measured four clobbers in one session).
+#
+# Do NOT "fix" this by adding an --append flag here. That was considered and
+# rejected (guard-2525 / guard-2460 / guard-1047 / guard-1488): this wrapper
+# hand-rolls its parser, and a distinct script name cannot be swallowed by a
+# flag-parsing arm. Rationale lives in goal-field-append.sh's own header.
+#
+# HARD LIMIT: if the field has a concurrent CROSS-BOX writer, neither this
+# wrapper nor goal-field-append.sh can win — the loss happens at the sync
+# merge, between the read and the write, and local .history never captures a
+# pre-image. Move the content to an append-only channel (a board post) and
+# reference it from the field instead (guard-5234).
 set -euo pipefail
 
 # --- Skinny PROJECT_ROOT resolve ------------------------------------------
@@ -40,7 +72,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field"
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --outcome-note --outcome-note-file"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
@@ -54,6 +86,9 @@ FORCE_UNSTRUCTURED_DEFER=""
 OVERRIDE_BLOCKER_GATE=""
 ALLOW_NEW_FIELD=""
 CROSS_LANE=""
+VALUE_STDIN=""
+OUTCOME_NOTE=""
+OUTCOME_NOTE_FILE=""
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
 declare -a POSITIONALS=()
@@ -110,6 +145,19 @@ while [[ $# -gt 0 ]]; do
             OVERRIDE_SHRINK="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --outcome-note)
+            # : companion outcome_note riding a status write — the
+            # daemon lands both fields in ONE locked RMW (one S3 PUT instead
+            # of the measured 2-call close ritual). Only valid with
+            # <field>=status; refused otherwise below.
+            OUTCOME_NOTE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --outcome-note-file)
+            # : same as --outcome-note but reads the text from a
+            # file — the safe transport for multi-KB notes (argv caps:
+            # guard-5634 CreateProcess ~32k / guard-1187 MAX_ARG_STRLEN).
+            OUTCOME_NOTE_FILE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --blocker-ref)
             BLOCKER_REF="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
@@ -133,6 +181,22 @@ while [[ $# -gt 0 ]]; do
             ALLOW_NEW_FIELD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --value-stdin)
+            # : take VALUE from stdin so it never enters argv. A
+            # composed prose value passed as an argv element is bounded by the
+            # OS — Windows CreateProcess caps the whole command line at ~32,767
+            # chars (guard-5634) and Linux MAX_ARG_STRLEN at ~128KB per string
+            # (guard-1187) — which made a growing progress_note PERMANENTLY
+            # unwritable from every Windows box once it crossed the ceiling.
+            # The bound is on the COMPOSED TOTAL, so no smaller append helps.
+            # Takes NO argument, so this is a BARE shift — deliberately NOT the
+            # `shift $(( $# >= 2 ? 2 : 1 ))` form every value-taking flag above
+            # uses (guard-1224 governs those; copying it here would silently eat
+            # the next token, which on this wrapper is a POSITIONAL).
+            # Not appended to PASSTHROUGH: this selects an INPUT SHAPE for this
+            # wrapper and is not a daemon-side override (and PASSTHROUGH has no
+            # reader here anyway — see the -*) arm below).
+            VALUE_STDIN=1; shift;;
         -h|--help)
             # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
             # exit 2 would be a regression the refusal introduced rather than a
@@ -160,6 +224,31 @@ GOAL_ID="${POSITIONALS[0]-}"
 FIELD="${POSITIONALS[1]-}"
 VALUE="${POSITIONALS[2]-}"
 
+# --value-stdin: the value arrives on stdin, so POSITIONALS carries only
+# <goal-id> <field>. READ IT ONLY WHEN THE FLAG WAS PASSED. An ungated
+# `$(cat)` — the shape the stdin-JSON wrapper family uses — does not reject a
+# bad call, it HANGS: with no redirect the read blocks on an empty-but-open
+# stdin until the caller's 2-minute timeout kills the turn with exit 143, no
+# message and no write, which reads as a wedged daemon rather than a wrong call
+# shape (guard-3173). Refusing on a terminal keeps the failure fast and named.
+if [ -n "$VALUE_STDIN" ]; then
+    if [ -n "$VALUE" ]; then
+        echo "Error: --value-stdin was passed AND a positional value is present ('${VALUE:0:40}...'). Supply the value on stdin OR positionally, never both." >&2
+        exit 1
+    fi
+    if [ -t 0 ]; then
+        echo "Error: --value-stdin was passed but stdin is a terminal — there is nothing to read. Pipe the value in or redirect a file (< payload.txt). Refusing rather than blocking (guard-3173)." >&2
+        exit 1
+    fi
+    # `$(cat)` alone STRIPS trailing newlines — a command-substitution property, not a
+    # cat one. The positional path preserves them, so a bare $(cat) would make the two
+    # call shapes store DIFFERENT bytes for the same value, and the caller's post-write
+    # confirm-read (which compares against the value it composed) would disagree for a
+    # reason nothing in the output names. The sentinel-x idiom is byte-exact.
+    VALUE="$(cat; printf x)"
+    VALUE="${VALUE%x}"
+fi
+
 # Missing positionals → error
 if [ -z "$GOAL_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
     echo "Error: goal_id, field, and value are all required." >&2
@@ -183,11 +272,41 @@ esac
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# : resolve the companion outcome_note BEFORE the encode step below
+# (which wraps it into the body via MIND_COMPANION_NOTE — env transport,
+# never argv interpolation, guard-165). File form wins the size problem;
+# both forms refuse on a non-status field so the flag can never silently
+# no-op.
+if [ -n "$OUTCOME_NOTE_FILE" ]; then
+    if [ -n "$OUTCOME_NOTE" ]; then
+        echo "Error: pass --outcome-note OR --outcome-note-file, not both." >&2
+        exit 1
+    fi
+    if [ ! -f "$OUTCOME_NOTE_FILE" ]; then
+        echo "Error: --outcome-note-file not found: $OUTCOME_NOTE_FILE" >&2
+        exit 1
+    fi
+    OUTCOME_NOTE="$(cat "$OUTCOME_NOTE_FILE"; printf x)"
+    OUTCOME_NOTE="${OUTCOME_NOTE%x}"
+fi
+if [ -n "$OUTCOME_NOTE" ] && [ "$FIELD" != "status" ]; then
+    echo "Error: --outcome-note/--outcome-note-file ride only a status write (g-358-36). For a standalone note use: aspirations-update-goal.sh <id> outcome_note <text>." >&2
+    exit 1
+fi
+
 # Encode value as JSON, mirroring aspirations.py parse_value. Single py -3
 # call (~30-50ms on Windows) vs full aspirations.py module load (~400-500ms).
-ENCODED_VALUE=$($(rt_python_launcher) -c '
+# : VALUE travels on STDIN, never argv. Passing it as `-c '...' "$VALUE"`
+# re-spawned the WHOLE value through CreateProcess (~32,767-char cap on the composed
+# command line, guard-5634) / execve (MAX_ARG_STRLEN ~128KB, guard-1187), so fixing only
+# the caller's hop would have moved WinError 206 here instead of removing it. `printf`
+# is a bash BUILTIN, so the pipe adds no process and no argv.
+# The program still arrives via `-c` (argv), which is what keeps stdin free for the
+# data: `python3 -` or a heredoc-fed program would consume stdin ITSELF and silently
+# discard the piped value (guard-4740 / guard-4728).
+ENCODED_VALUE=$(printf '%s' "$VALUE" | MIND_COMPANION_NOTE="$OUTCOME_NOTE" $(rt_python_launcher) -c '
 import json, sys
-v = sys.argv[1]
+v = sys.stdin.read()
 if v == "true":
     r = True
 elif v == "false":
@@ -209,8 +328,16 @@ else:
             r = float(v)
         except ValueError:
             r = v
+# : companion outcome_note rides the same POST as the status value —
+# the daemon unwraps {"value": ..., "outcome_note": ...} and lands both
+# fields in one locked RMW. Empty env var (flag not passed) leaves the body
+# byte-identical to the historical shape.
+import os
+_n = os.environ.get("MIND_COMPANION_NOTE", "")
+if _n:
+    r = {"value": r, "outcome_note": _n}
 sys.stdout.write(json.dumps(r))
-' "$VALUE")
+')
 
 QUERY="id=${GOAL_ID}&field=${FIELD}&source=${SOURCE_VAL}"
 # Session identity () — mirrors aspirations-complete-by.sh. This is the

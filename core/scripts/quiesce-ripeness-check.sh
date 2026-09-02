@@ -52,12 +52,26 @@ mkdir -p "$TMP" || { echo "quiesce-ripeness: cannot create $TMP" >&2; exit 2; }
 # 7 rows/115 min with BOTH stale rows hidden, still printing GO. The module now
 # refuses to score an all-empty status map, but the error must also be VISIBLE
 # rather than inferred from a downstream refusal.
+#
+# `| tr -d '\r'` BELOW IS LOAD-BEARING ON WINDOWS AND MUST NOT BE DROPPED
+# (found 2026-09-02, quiesce window). Python's stdout is a TEXT stream, so on
+# Windows `print()` emits CRLF; the shell captures "\r\n\r\n"
+# and word-splits into ids that each keep a trailing CR. Every downstream
+# `aspirations-query.sh --goal-field id $'\r'` then matches nothing,
+# the status map comes back empty, and this script exits 2 CANNOT-EVALUATE --
+# which on this box it had done since it was written. It is invisible from an
+# interactive shell (a literal id works) and doubly hidden by the `2>/dev/null`
+# on the per-goal query plus the bare `except: arr = []` below, so the only way
+# to SEE it is `bash -x` (which renders the argument as $'...\r'); a repr of the
+# value INSIDE Python looks clean, because the CR is added by the stdout
+# translation and is not carried in the string. Linux Bodies are unaffected,
+# which is why no other box ever surfaced it.
 IDS="$(PYTHONPATH="$REPO/core/scripts" py -3 -c "
 import sys
 from quiesce_ripeness import parse_rows
 md = open(sys.argv[1], encoding='utf-8').read()
 print('\n'.join(sorted({r['goal_id'] for r in parse_rows(md) if r['goal_id']})))
-" "$CONV")" || { echo "quiesce-ripeness: manifest parse failed (see stderr above)" >&2; exit 2; }
+" "$CONV" | tr -d '\r')" || { echo "quiesce-ripeness: manifest parse failed (see stderr above)" >&2; exit 2; }
 
 # ---- 2. live status + priority for each named goal -------------------------
 # Per-goal lookups, bounded by manifest size (~10). Deliberately NOT derived by

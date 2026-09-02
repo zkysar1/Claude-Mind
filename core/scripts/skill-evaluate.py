@@ -9,6 +9,7 @@ meta/skill-quality-strategy.yaml.
 
 import argparse
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -130,8 +131,96 @@ def compute_aggregate(evaluations, weights):
 # Subcommands
 # ---------------------------------------------------------------------------
 
+HARNESS_VALUES = ("claude-code", "zakcode", "unknown")
+
+
+def _judge_provenance(judge_model=None, harness=None):
+    """Judge identity for one quality evaluation (, ).
+
+    Returns (judge_model, harness), NORMALIZED from values the CALLER supplied.
+    Both fall back to "unknown" rather than guessing, because this field exists
+    to make cross-model comparison sound and a wrong value is worse than an
+    absent one.
+
+    RESOLVED CALLER-SIDE, NEVER HERE -- this function reads no environment. The
+    judge is the process that produced the grades, but on the path that
+    actually executes, the WRITER is the long-lived daemon: it inherits the
+    environment of whichever session spawned it and holds that for its entire
+    lifetime. An environment read here therefore reports one arbitrary
+    session's values for every agent's request, on every record, forever --
+    not absent, but confidently WRONG and authoritative-looking (guard-2480;
+    the guard-1925 hazard). Wrappers resolve via rt_judge_provenance and
+    forward judge_model/harness in the request body.
+
+    judge_model is never inferred from CLAUDE_CODE_SUBAGENT_MODEL: that names
+    the SUBAGENT model while scoring runs on the MAIN loop, so the two
+    genuinely differ (measured 2026-09-01 on cc-04: subagent env read
+    claude-opus-4-6 while the scoring session ran claude-opus-5).
+
+    An unrecognised harness normalizes to "unknown" rather than passing
+    through: it is a closed vocabulary that aggregate consumers group by, and
+    a caller-supplied string is untrusted input.
+
+    Legacy records carry neither key; absent therefore means "unknown" too, so
+    no backfill is required (the merge handler unions whole evaluation dicts,
+    so records written by older code survive unchanged).
+    """
+    model = (judge_model or "").strip() or "unknown"
+    name = (harness or "").strip()
+    return model, (name if name in HARNESS_VALUES else "unknown")
+
+
+def _judge_from_env(env=None):
+    """Resolve the judge's identity from the JUDGE'S OWN environment.
+
+    CLI-LAYER ONLY, and the layer is the whole point. This module runs as a
+    fresh subprocess of the session that produced the grades, so its
+    environment IS the judge's -- the read is correct here and would be wrong
+    one layer down in the writer, which under daemon-only architecture is a
+    long-lived process holding a different session's environment entirely
+    (guard-2480). The daemon twin deliberately has no counterpart to this
+    function; its callers supply the values from the request body instead.
+
+    Returns raw, UNNORMALIZED strings (empty when unresolvable) for
+    _judge_provenance to normalize, so both layers share exactly one
+    fallback rule.
+    """
+    env = os.environ if env is None else env
+    model = (env.get("MIND_JUDGE_MODEL") or "").strip()
+    if (env.get("CLAUDECODE") or "").strip():
+        harness = "claude-code"
+    elif ((env.get("ZAKCODE_MODEL") or "")
+          or (env.get("ZAKCODE_SESSION") or "")).strip():
+        harness = "zakcode"
+    else:
+        harness = ""
+    return model, harness
+
+
+def _judge_summary(evaluations):
+    """Composition of the judge population behind an aggregate ().
+
+    Returns a sorted list of {judge_model, harness, n}. Legacy records carry
+    neither key and count as unknown/unknown: the field exists to make a
+    MIXTURE visible, so dropping un-provenanced records would hide exactly the
+    mixture the caller is asking about. A single-element list means the
+    aggregate is judge-homogeneous and safe to compare over time; more than one
+    means drift in it may be a judge change rather than a skill change.
+    """
+    counts = {}
+    for e in evaluations or []:
+        if not isinstance(e, dict):
+            continue
+        key = (str(e.get("judge_model") or "unknown"),
+               str(e.get("harness") or "unknown"))
+        counts[key] = counts.get(key, 0) + 1
+    return [{"judge_model": m, "harness": h, "n": n}
+            for (m, h), n in sorted(counts.items())]
+
+
 def cmd_score(args):
     """Record a quality evaluation for a skill execution."""
+    judge_model, harness = _judge_provenance(*_judge_from_env())
     data = read_yaml(QUALITY_PATH)
     weights = load_weights()
 
@@ -155,6 +244,8 @@ def cmd_score(args):
         "maintainability": scores["maintainability"],
         "cost_awareness": scores["cost_awareness"],
         "overall": overall,
+        "judge_model": judge_model,
+        "harness": harness,
     }
 
     # Ensure skills dict exists
@@ -229,6 +320,7 @@ def cmd_read(args):
                 "maintainability": agg.get("maintainability", 0.0),
                 "cost_awareness": agg.get("cost_awareness", 0.0),
                 "overall": agg.get("overall", 0.0),
+                "judges": _judge_summary(sdata.get("evaluations") or []),
             })
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return
@@ -262,7 +354,9 @@ def cmd_report(args):
 
     for name, sdata in skills.items():
         agg = sdata.get("aggregate", {})
-        skills_agg[name] = agg
+        skills_agg[name] = dict(agg)
+        skills_agg[name]["judges"] = _judge_summary(
+            sdata.get("evaluations") or [])
         overall = agg.get("overall", 0.0)
         overalls.append(overall)
 

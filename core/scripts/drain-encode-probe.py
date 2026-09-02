@@ -68,6 +68,52 @@ TIMEOUT = 120
 
 GOAL_ID_RE = re.compile(r"\bg-\d{1,3}-\d{1,4}\b")
 
+# Message-scratch filename shapes (). These files' DURABLE artifact is
+# a sent message -- a submitted PR, a row in world/board/*.jsonl, an outbound
+# mail -- NOT an experience record. Judging them by the experience store asks
+# the wrong store and returns a confident `absent`, which blocks discard
+# forever: 24 of the 49 absent .md under agents/bravo/temp (49%) were this
+# shape (measured 2026-08-12, bravo, cc-05). The direction is fail-safe (a false
+# absent over-retains and never destroys), which is why this is a convergence
+# defect rather than a data-loss one.
+_MESSAGE_SCRATCH_RE = re.compile(
+    r"^(notify-|pr-body-|board-|reply-|ack-|forge-notice-|coord-|stop-email)"
+    r"|(-pr-body)\.md$",
+    re.I,
+)
+
+# A goal id in the BODY is usually a CITATION, not the owner -- measured 4 of 4
+# by echo/cc-03 (2026-08-21, ): every first-token id named a goal the
+# file was merely referencing, and all 4 files had in fact landed. So prefer the
+# FILENAME, then front-matter `goal_id:`, and treat a body-only id as weak.
+_FM_GOAL_ID_RE = re.compile(r"^goal_id:[ \t]*[\"']?(g-\d{1,3}-\d{1,4})", re.M)
+
+
+def _front_matter(body):
+    """Return ONLY the leading YAML front-matter block, or "" if there is none.
+
+    Scoping is load-bearing, not tidiness. `_FM_GOAL_ID_RE` carries re.M so its
+    `^` matches EVERY line start; run against the whole document it promotes any
+    body line beginning `goal_id:` -- prose, or a line inside a fenced code block
+    -- to front-matter provenance and a DEFINITE verdict. That is the exact
+    citation-treated-as-owner defect this module was changed to eliminate,
+    reintroduced through another door, and strictly worse than the old behaviour
+    for that input (a body id used to take the weak path). Measured
+    (g-115-8496): a prose `goal_id: g-999-9` line and a fenced `goal_id: g-888-8`
+    block each classified as (trace_md, <that id>) when the real citation was
+    g-777-7 and the answer should have been (trace_md_weak, g-777-7).
+    Do NOT "fix" this by tightening the pattern instead -- guard-1092's lesson is
+    that regex over YAML is fragile; bounding WHAT it sees is the durable fix.
+    """
+    if not body.startswith("---"):
+        return ""
+    # Opening fence is line 1; find the closing fence line.
+    rest = body.split("\n", 1)
+    if len(rest) < 2:
+        return ""
+    end = re.search(r"^---[ \t]*$", rest[1], re.M)
+    return rest[1][: end.start()] if end else ""
+
 # Element keys that are batch INPUTS (identify/locate the target) rather than
 # the EFFECT the batch applies. Anything outside this set is a candidate effect.
 _TREE_STRUCTURAL = {
@@ -130,8 +176,18 @@ def classify(path):
             body = open(path, encoding="utf-8", errors="replace").read(8000)
         except Exception:
             return "unreadable", None
+        base = os.path.basename(path)
+        if _MESSAGE_SCRATCH_RE.search(base):
+            return "message_scratch", base
+        # Owner resolution, strongest source first ( half 2).
+        fm = _FM_GOAL_ID_RE.search(_front_matter(body))
+        fn = GOAL_ID_RE.search(base)
+        if fn:
+            return "trace_md", fn.group(0)
+        if fm:
+            return "trace_md", fm.group(1)
         m = GOAL_ID_RE.search(body)
-        return ("trace_md", m.group(0)) if m else ("unknown_shape", None)
+        return ("trace_md_weak", m.group(0)) if m else ("unknown_shape", None)
 
     try:
         d = json.load(open(path, encoding="utf-8", errors="replace"))
@@ -285,6 +341,37 @@ def probe_trace_md(goal_id):
     if isinstance(rows, list) and not rows:
         return "absent", "no experience record references %s" % goal_id
     return "encoded", "an experience record references %s" % goal_id
+
+
+def probe_message_scratch(basename):
+    """Message scratch: the experience store cannot answer this question.
+
+    The durable artifact for these shapes is a sent message (submitted PR, board
+    row, outbound mail), not an experience record, so an `absent` here would be a
+    definite verdict built on the wrong store. `unknown` hands the call to a
+    reader instead -- the same discipline probe_goal applies to a too-short
+    title, and what guard-3616 requires of the no-information case.
+    """
+    return "unknown", (
+        "message scratch (%s): durable artifact is a sent message (PR / "
+        "world/board/*.jsonl / outbound mail), not an experience record -- "
+        "the experience store cannot establish this either way" % basename
+    )
+
+
+def probe_trace_md_weak(goal_id):
+    """A body-only goal id is a citation until shown otherwise.
+
+    Measured 4 of 4 (echo/cc-03, 2026-08-21): the first goal-id-shaped token in
+    the body named a goal the file merely CITED, never the owner, and all four
+    files had already landed. Asking the store about a cited goal answers a
+    question nobody asked, so refuse to assert rather than return `absent`.
+    """
+    return "unknown", (
+        "goal id %s came only from the body, where it is usually a CITATION "
+        "rather than the owner (4/4 measured) -- no owner resolved from "
+        "filename or front matter, so no verdict is established" % goal_id
+    )
 
 
 def _resolve_node_path(node_file):
@@ -465,6 +552,8 @@ _PROBES = {
     "experience": probe_experience,
     "tree_batch": probe_tree_batch,
     "trace_md": probe_trace_md,
+    "trace_md_weak": probe_trace_md_weak,
+    "message_scratch": probe_message_scratch,
     "hypothesis": probe_hypothesis,
     "aspiration": probe_aspiration,
 }

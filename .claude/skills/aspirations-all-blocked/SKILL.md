@@ -145,7 +145,7 @@ FOR EACH review_msg NOT from this agent:
         #      Compute recent_accuracy = confirmed / total
         #      Log BOTH arms (resolved n / archived n), never just the total —
         #      a silent regression to resolved-only logs identically otherwise
-        #      (guard-2529 / guard-2273 / guard-2191).
+        #      (guard-2529 / guard-2273 / guard-2129).
         #   b. Apply confidence ceiling:
         #      - If recent_accuracy < 0.40: cap at 0.55
         #      - If recent_accuracy >= 0.40 and < 0.60: cap at 0.65
@@ -172,7 +172,7 @@ FOR EACH review_msg NOT from this agent:
         #   Bash: echo "Review of {goal_id}: {hypothesis_summary}. Assessment: {architectural_notes}" \
         #         | board-post.sh --channel findings --type finding \
         #           --tags "code_review,{goal_id}"
-        #   (message text goes on STDIN — there is NO --message flag; guard-1394)
+        #   (message text goes on STDIN — there is NO --message flag; guard-1531)
 
         # R5 Issue Handling (preserved from original protocol):
         IF issues_found during R2 assessment:
@@ -985,7 +985,7 @@ BEFORE the sleep Bash call.
 # stranding risk for the cycles that matter.
 # NEVER BLOCK THE SLEEP: on any non-zero rc, log it and continue to the sleep
 # below. A failed commit must not strand the loop awake.
-Bash: bash core/scripts/iteration-commit.sh --goal-id all-blocked \
+Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --goal-id all-blocked \
         --title "Maintain: encode learning produced on the idle path" \
         --outcome deep --repo "$PROJECT_ROOT"
 ```

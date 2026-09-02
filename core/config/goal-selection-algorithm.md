@@ -55,3 +55,50 @@ The LLM reads ranked output and applies Phase 2.5 metacognitive assessment.
 4. SELECT: highest total score
    Tiebreak: lower aspiration number, then lower goal number
 ```
+
+## Reading ONE field from the selector — use `--field`, never a pipe (g-115-8362)
+
+`goal-selector.sh` carries a silent-empty guard: `goal-selector.py` exiting 0 with
+zero bytes is a failure to PRODUCE a result (an empty ranking prints `[]`, never
+`""`), so the wrapper emits a FATAL on stderr and exits **7**.
+
+That guard was unreachable through both call shapes anyone actually used, because
+`select` and `blocked` register **zero** options — so a caller wanting one field had
+to hand-roll a parser, and every hand-rolled parser pipes:
+
+| shape | what happens to the exit-7 FATAL |
+|---|---|
+| `2>&1 \| python3 -c 'json.load(sys.stdin)'` | FATAL merges into the JSON stream → `json.load` raises → caller's except-branch yields EMPTY, pipeline rc 0 |
+| `2>/dev/null \| python3 -c 'json.load(sys.stdin)'` | FATAL discarded → `json.load` raises on empty stdin → same EMPTY, same rc 0 |
+
+Both render as "no candidates" — precisely the misreading the guard exists to
+prevent, on the MANDATORY selection path. Measured 103x across 8 live sessions.
+
+**Use the flag instead.** It reads the already-captured temp FILE, so no pipe exists
+and rc survives:
+
+```bash
+bash core/scripts/goal-selector.sh select --field goal_id
+```
+
+| rc | meaning |
+|---|---|
+| 0 | the value, on stdout |
+| 7 | silent-empty signature — **RE-RUN the selector**; never read this as "no candidates" |
+| 8 | a real, measured ZERO candidates |
+| 9 | that field is absent from the payload (stderr names the available keys) |
+
+Handles both legitimate top-level shapes: the ranked LIST (`goal-selector.py:6197`,
+rows are FLAT — `goal_id`/`score`/`title` are top-level per row, there is no nested
+`goal` object) and the all-blocked DICT (`:6011`).
+
+Parsing the FULL array is still correct when you need the whole ranking — capture
+stdout and rc **separately**, never through a pipe, as `iteration-open.py:_selection`
+and `dependency-timeout-check.py:_read_blocked` already do. Those two were never
+vulnerable, which is why the remedy was a new flag rather than a stdout-contract
+change that would have altered behaviour for the safe callers.
+
+Do not discover this flag by running `--help`: it passes through to `goal-selector.py`,
+which knows nothing about it. Wrapper flags live in the wrapper's own argument-parsing
+case block (guard-2172), and probing `core/scripts` wrappers with `--help` is itself
+ruled out (guard-2350, guard-3533).

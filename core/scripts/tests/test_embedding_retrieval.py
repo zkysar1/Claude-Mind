@@ -6,7 +6,10 @@ desync-truncation) in milliseconds. End-to-end validation against the real
 all-MiniLM-L6-v2 model is done interactively during development, not in the
 hot suite.
 """
+import importlib.util
 import json
+import shutil
+from pathlib import Path
 
 import pytest
 
@@ -116,3 +119,54 @@ def test_model_error_degrades_to_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(er, "_get_model", _boom)
     # Must NOT raise into the retrieval hot path — degrades to {}.
     assert er.cosine_scores("q", index_dir=tmp_path) == {}
+
+
+def test_default_index_dir_when_env_and_arg_both_absent(tmp_path, monkeypatch):
+    """The one branch production takes and no test covered ().
+
+    guard-1482 exactly: every other test in this file passes `index_dir=`
+    explicitly, and conftest.py pins MIND_EMBEDDING_INDEX_DIR for the WHOLE
+    pytest session — so both overriding inputs are always present and the
+    `else DEFAULT_INDEX_DIR` arm was dark. Seven tests in this file made that
+    look covered; the count is what hid it.
+
+    Exercised through a FAKE ROOT rather than by unsetting the env against the
+    live module, and the distinction is the whole safety argument. DEFAULT_INDEX_DIR
+    is derived from the module's own __file__ at import time, so a copy under
+    tmp_path anchors the entire `../../mind_api/state` derivation inside tmp.
+    That is what makes delenv safe HERE: the default now resolves to a tmp path,
+    so walking the very branch the hermeticity hole lived on cannot reach the
+    real per-box index (guard-1645 / the conftest seam). Unsetting the env
+    against the live `er` would reopen that hole.
+    """
+    fake_scripts = tmp_path / "core" / "scripts"
+    fake_scripts.mkdir(parents=True)
+    src = Path(er.__file__)
+    shutil.copy2(src, fake_scripts / src.name)
+
+    # Unique module name + module_from_spec: never inserted into sys.modules,
+    # so the real `er` object the other tests share is left untouched.
+    spec = importlib.util.spec_from_file_location(
+        "_embedding_retrieval_fake_root", fake_scripts / src.name
+    )
+    fake = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fake)
+
+    # Omit BOTH inputs: no explicit arg, and no env seam.
+    monkeypatch.delenv(er._INDEX_DIR_ENV, raising=False)
+    landed = fake._resolve_index_dir(None)
+
+    # ONE exact-equality assert, deliberately — it IS guard-1482's two-sided
+    # assertion. Equality on the full path already excludes every wrong
+    # location (the real per-box index, and conftest's pin), so the separate
+    # `!= er.DEFAULT_INDEX_DIR` and `"_no_such_embedding_index" not in ...`
+    # asserts this test first carried were strictly IMPLIED by it: they could
+    # never fail while this line passed, and asserts run in order so they would
+    # never even execute on a failure. Dropped rather than kept as decoration.
+    #
+    # Mutation-proved rather than asserted (guard-1482 action_hint, rb-4133):
+    # unmutated + env deleted PASSES; `.parent.parent`->`.parent` in the
+    # copied module FAILS; NOT deleting the env (so the resolver takes the env
+    # arm) FAILS. Both mutants die on this single line, which is what makes the
+    # delenv above load-bearing rather than ceremonial.
+    assert landed == tmp_path / "mind_api" / "state" / "retrieval-embedding-index"

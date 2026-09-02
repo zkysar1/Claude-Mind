@@ -458,3 +458,117 @@ def test_scalar_was_not_raised_to_force_product_work():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# --------------------------------------------- shared exclusion source ()
+#
+# Clause (ii) landed as an inline conjunct at this site () and the
+# remaining classes were then reported against it one at a time: clause (i)
+# (hypothesis-resolution) measured 2026-08-19 on echo/cc-03, where the banner
+# nominated non-recurring , a 'Resolve hypothesis:' goal (title elided
+# -- it names a domain scorer, and core/ stays domain-free per
+# .claude/rules/domain-free-examples.md); and the owner-PARKED class 2026-08-24 on
+# alpha/cc-04, where it nominated  ('PARKED (LOW):', carrying a dated
+# first-person owner instruction not to pull it forward) and prescribed
+# --deviation meta-tiebreaker to take it. Both are invisible to a `recurring`
+# filter. The list now lives in gs.lane_nominee_exclusion and is shared with
+# apply_strategic_focus_floor.
+
+
+def test_lane_nominee_exclusion_names_each_class():
+    """Unit-level pin on the SOURCE of the list. Each class returns its own
+    reason, so a caller can say WHY it declined instead of going silent."""
+    assert gs.lane_nominee_exclusion(
+        _c("g-1", 1.0, recurring=True, title="Recurring: sweep")) == "recurring"
+    assert gs.lane_nominee_exclusion(
+        _c("g-2", 1.0, title="Resolve hypothesis: does X flip Y")
+    ) == "hypothesis-resolution"
+    assert gs.lane_nominee_exclusion(
+        _c("g-3", 1.0, title="PARKED (LOW): keep US for now")) == "parked"
+    assert gs.lane_nominee_exclusion(
+        _c("g-4", 1.0, title="Build the pricing page")) is None
+
+
+def test_lane_nominee_exclusion_matches_anchored_prefixes_only():
+    """guard-2860: never relax an ownership predicate into a pattern. A title
+    that merely MENTIONS a parked or hypothesis goal is ordinary product work
+    and must stay nominable -- under-matching is the sanctioned direction here,
+    because a false exclusion only costs silence while a false inclusion steers
+    an agent across an owner instruction."""
+    assert gs.lane_nominee_exclusion(
+        _c("g-5", 1.0, title="Unpark the checkout flow (was PARKED)")) is None
+    assert gs.lane_nominee_exclusion(
+        _c("g-6", 1.0, title="Ship the page that will resolve hypothesis H")
+    ) is None
+
+
+@pytest.mark.parametrize("row", [
+    {},
+    {"title": None},
+    {"title": 17},
+    None,
+])
+def test_lane_nominee_exclusion_never_raises(row):
+    """Both call sites promise fail-open, so a malformed row must read as
+    ELIGIBLE rather than crash selection. Eligible is the safe default here
+    precisely because the pre-fix behavior was 'no filter at all'."""
+    assert gs.lane_nominee_exclusion(row) is None
+
+
+def test_hypothesis_titled_lane_goal_is_never_nominated(focus, capsys):
+    """The  case. Non-recurring, so clause (ii) cannot see it. A valid
+    nominee is present deliberately -- with only the excluded one the test would
+    pass against a filter that broke nomination outright (guard-1220)."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 12.0, recurring=True, title="Recurring: tripwire"),
+              _c("g-335-221", 11.0, asp="asp-335", ia="zeta",
+                 title="Resolve hypothesis: recency-decay rarely flips argmax"),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta",
+                 title="Build the parity surface")]
+    warnings = gs.emit_strategic_focus_banner(scored, "zeta")
+    assert len(warnings) == 1
+    err = capsys.readouterr().err
+    assert "g-335-285" in err
+    assert "g-335-221" not in err, (
+        "clause (i): a hypothesis-resolution goal is not unbuilt product work")
+
+
+def test_owner_parked_lane_goal_is_never_nominated(focus, capsys):
+    """The  case, and the severe one. The banner cites the standing
+    directive, names the goal, and pre-authorises --deviation meta-tiebreaker,
+    so complying is the path of least resistance -- and complying here means
+    crossing a dated first-person owner instruction while believing the
+    directive is being honoured."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-105", 13.21, recurring=True, title="Recurring: stall sweep"),
+              _c("g-335-81", 11.43, asp="asp-335", ia="zeta",
+                 title="PARKED (LOW): keep US for now"),
+              _c("g-335-285", 10.0, asp="asp-335", ia="zeta",
+                 title="Build the parity surface")]
+    warnings = gs.emit_strategic_focus_banner(scored, "zeta")
+    assert len(warnings) == 1
+    err = capsys.readouterr().err
+    assert "g-335-285" in err
+    assert "g-335-81" not in err, "an owner-parked goal is never a nominee"
+
+
+def test_banner_silent_when_every_lane_candidate_is_excluded(focus, capsys):
+    """Silence is the truthful state: under the exclusions there is no countable
+    lane work, so there is nothing to prefer over the sweep. The INERT banner
+    covers the neighbouring case (no lane row reached the pool at all).
+
+    NOTE the `recurring=True` on the sweep row: clause (ii) is a FIELD test, and
+    a title reading "Recurring: ..." is NOT one of the anchored title prefixes.
+    The first draft of this test set only the title and the banner correctly
+    fired -- the fixture was wrong, not the filter. That is the clause (ii) /
+    clause (i) distinction behaving exactly as the directive states it."""
+    focus({"strategic_focus": {"primary": LIVE_PRIMARY}})
+    scored = [_c("g-115-831", 12.0, recurring=True, title="Recurring: tripwire"),
+              _c("g-335-658", 11.0, asp="asp-335", ia="zeta", recurring=True,
+                 title="Recurring: cross-repo audit"),
+              _c("g-335-221", 10.5, asp="asp-335", ia="zeta",
+                 title="Resolve hypothesis: does X flip Y"),
+              _c("g-335-81", 10.0, asp="asp-335", ia="zeta",
+                 title="PARKED (LOW): held by owner")]
+    assert gs.emit_strategic_focus_banner(scored, "zeta") == []
+    assert "STRATEGIC-FOCUS" not in capsys.readouterr().err

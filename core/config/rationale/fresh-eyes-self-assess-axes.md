@@ -25,18 +25,52 @@ prior fires (N=44/45/47) each booked it as robustness and none re-examined it. T
 valid form: hold every other axis at a value that CANNOT produce the verdict, then
 sweep, and report the neutralized flip point rather than the constancy. On this
 helper those boundaries are `drift` flips at **0.40** with `confirming = 1.00`, and
-`confirming` flips to `no_change` at **0.75** with `drift = 0.05`.
+`confirming` flips to `no_change` where **`N·(1−confirming) < 2.0`** with
+`drift = 0.05` — an inequality in `N`, NOT a fixed fraction.
+
+⚠ This line read "`confirming` flips to `no_change` at **0.75**" until 2026-09-01
+(echo, N=120, `hostname` cc-03, `uname -r` 6.8.0-137-generic). 0.75 is only that
+measurement's own `N = 8` sample point, and it contradicted THIS FILE's own
+"Why the `confirming` boundary is an inequality, not a fraction" section below —
+which derives `> 0.50` at `N = 4` and `> 5/7 = 0.7143` at `N = 7`, and says in so
+many words "neither 0.75 nor 5/7". `guard-3311` already carried the general form
+(`1 − 2.0/self_evolution_signals_count`); this SUMMARY restatement had drifted from
+the derivation it summarizes, which is why the contradiction survived — a reader
+who stops at the summary never reaches the section that refutes it. Class:
+`guard-5724` (a sample-specific bound written as a universal one, ratcheting once
+per reader) crossed with `guard-5556` (an early summary going stale relative to a
+later section of the SAME document). Flagged by fresh-eyes N=118 item 6, recorded
+still-unaddressed at N=119 item 4, corrected here.
 
 ## Why the third axis went unrecorded for 69 fires
 
-`signal_actionable_score >= 0.40` fires `act_later` ON ITS OWN, boundary in
-(0.35, 0.40]. Measured 2026-08-12 (alpha, N=69, `hostname` cc-04, `uname -r`
+`signal_actionable_score >= 0.40` fires `act_later` ON ITS OWN. It is a plain
+`>=` cutoff, NOT an interval. Measured 2026-08-12 (alpha, N=69, `hostname` cc-04, `uname -r`
 6.8.0-137-generic) with `drift` neutralized to 0.05 and `confirming` held at 1.00:
 0.20 / 0.30 / **0.35 → `no_change`**, **0.40** / 0.49 / 0.50 / 0.55 → `act_later`,
 the rationale reading `weak-but-present signal: actionable=<v>` with no other axis
 named. It went unrecorded for 69 fires because this field is scored by hand from
 "how clearly do the signals map to a specific Self edit", and a review that finds
 diffuse signal scores it ~0.20 — so it had never crossed.
+
+**This paragraph read "boundary in (0.35, 0.40]" until echo N=118 (2026-09-01,
+cc-03), and that notation is contradicted by the very measurement in the line
+above it** — 0.20 and 0.30 are recorded here as `no_change` too, so 0.35 was
+never a lower BOUND, only the lowest point alpha happened to sample. An interval
+invites the reader to test one point below it and raise the bound; that is
+exactly what happened. echo N=117 (2026-08-31) tested 0.36, got `no_change`,
+published "(0.36, 0.40] — NARROWER than the skill's stated (0.35, 0.40]", and
+left a standing instruction to propagate that into `fresh-eyes-review/SKILL.md`.
+N=118 swept 0.34/0.35/0.36/0.37/0.38/0.39 (all `no_change`) and 0.40/0.41
+(`act_later`) with drift=0.05 and confirming=1.00 held non-firing, which settles
+it: the cutoff is `>= 0.40` and there is no lower bound to find.
+
+The generalizable half — a threshold written as a half-open interval creates a
+phantom lower bound that ratchets upward once per reader, because each reader's
+own no_change sample looks like evidence the bound moved. Both drifts were made
+by careful passes that measured correctly and reported the interval their sample
+supported. State a cutoff as a cutoff. (Sibling: `guard-3297`, thresholds
+without a designed variance estimate.)
 
 **It also MASKS the drift boundary.** At `actionable = 0.55` the documented
 0.39/0.40 drift sweep returns `act_later` at BOTH points, so a reader running that

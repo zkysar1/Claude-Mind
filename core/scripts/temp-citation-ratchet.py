@@ -75,6 +75,29 @@ KEY = "temp_citations_durable_stores"
 # sentence ("see agents/x/temp/y.md.") does not fold the period into the path.
 TEMP_CITE_RE = re.compile(r"agents/[A-Za-z0-9_-]+/temp/[^\s\"',;)\]`>]*[^\s\"',;)\]`>.]")
 
+# A citation carrying a glob or placeholder metacharacter is NOT a path: it is a
+# pattern or a redaction lifted out of prose (`agents/x/temp/pl_*.json`,
+# `agents/y/temp/alerts/<K`, `agents/z/temp/flywheel-{legacy`). Such an entry can
+# never resolve to a file, so it can never take any exit of the drain-temp folding
+# lane (: fold / graveyard / annotate all presuppose a referent), which
+# makes that lane's own terminal condition — "every pair resolves to exactly one
+# exit" — UNREACHABLE while these are counted. It also inflates this ratchet.
+#
+# REJECT the whole match; do NOT exclude the metacharacters from TEMP_CITE_RE's
+# character class. Measured 2026-08-31 (bravo, cc-05) on ONE 60.5 MB / 1659-file
+# corpus snapshot per guard-2201: class-exclusion TRUNCATES at the metacharacter
+# and INVENTS 9 new stub paths (`.../-*.md` -> `.../-`), which
+# look like real paths and are worse than the globs they replace. A post-filter
+# cannot invent — verified ADDED=0, REMOVED=11, every removal metacharacter-bearing,
+# zero collateral: 182 -> 171 distinct cited paths.
+_CITE_META_RE = re.compile(r"[*?{}<\[\]]")
+
+
+def _cite_hits(text):
+    """TEMP_CITE_RE matches minus glob/placeholder non-paths. Single chokepoint
+    for both scanners so the two can never diverge."""
+    return [h for h in TEMP_CITE_RE.findall(text) if not _CITE_META_RE.search(h)]
+
 # The three uncovered durable stores, plus pattern-signatures. The filing goal
 # measured pattern-signatures at 0 and asked that it be stated rather than
 # re-measured by a future audit — so it is scanned and reported, not assumed.
@@ -98,7 +121,7 @@ def _scan_jsonl(path: Path):
         if not line:
             continue
         records += 1
-        hits = TEMP_CITE_RE.findall(line)
+        hits = _cite_hits(line)
         if not hits:
             continue
         rec_id = ""
@@ -125,7 +148,7 @@ def _scan_tree(tree_dir: Path):
             text = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        for h in TEMP_CITE_RE.findall(text):
+        for h in _cite_hits(text):
             pairs.add((p.relative_to(tree_dir).as_posix(), h))
     return pairs, files
 

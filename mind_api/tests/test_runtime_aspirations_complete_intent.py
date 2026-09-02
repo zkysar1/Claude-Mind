@@ -231,7 +231,9 @@ def test_complete_intent_superseded_recurring_rejected(running_daemon):
 
     Note: when a goal is marked recurring=True, the recurring-goals guard
     fires BEFORE intent validation (recurring goals must not be archived).
-    So the error is recurring_goals_present, not intent_validation_failed.
+    Since g-357-31 the guard RE-HOMES the goal into a live container when one
+    exists; this world has no other live aspiration, so the archive is refused
+    with recurring_rehome_target_missing, not intent_validation_failed.
     """
     project_root, port = running_daemon
     _ensure_intent_config(project_root)
@@ -248,7 +250,7 @@ def test_complete_intent_superseded_recurring_rejected(running_daemon):
     )
     assert status == 400
     resp = json.loads(body)
-    assert resp["error"] == "recurring_goals_present"
+    assert resp["error"] == "recurring_rehome_target_missing"
     assert "recurring" in resp["detail"]
 
 
@@ -325,7 +327,7 @@ def test_complete_intent_recurring_goals_blocked(running_daemon):
     )
     assert status == 400
     resp = json.loads(body)
-    assert resp["error"] == "recurring_goals_present"
+    assert resp["error"] == "recurring_rehome_target_missing"
 
 
 def test_complete_intent_missing_body(running_daemon):

@@ -50,6 +50,22 @@ EVIDENCE_WEIGHTS = {
     "times_cited": 1.0,
 }
 
+# Lifted verbatim from core/scripts/utilization-stats.py () — the
+# RETIREMENT numerator, which is EVIDENCE_WEIGHTS minus the automated-scan term.
+# times_active is incremented on a bulk text match with no agent decision in the
+# path (guard-3995), and `evidence == 0 AND retrieval_count >= 50` is empty by
+# construction because the composite's terms accrue as a function of retrieval.
+# THIS FILE IS THE LIVE PATH: the wrappers are daemon-only
+# (.claude/rules/no-python-cli-fallback.md), so utilization-stats.sh — and
+# therefore the aspirations-curate-memory sweep — reaches THIS predicate, not
+# the CLI's. Keep both in lockstep; TestStoreByteCompat in
+# mind_api/tests/test_runtime_utilization.py fails loudly when they drift.
+ATTESTED_WEIGHTS = {
+    "times_helpful": 1.0,
+    "times_inferred_helpful": 0.5,
+    "times_cited": 1.0,
+}
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (verbatim from CLI — no path dependencies)
@@ -103,6 +119,17 @@ def _evidence(util):
         return 0.0
     score = 0.0
     for key, weight in EVIDENCE_WEIGHTS.items():
+        v = util.get(key, 0)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            score += weight * v
+    return score
+
+
+def _attested_evidence(util):
+    if not isinstance(util, dict):
+        return 0.0
+    score = 0.0
+    for key, weight in ATTESTED_WEIGHTS.items():
         v = util.get(key, 0)
         if isinstance(v, (int, float)) and not isinstance(v, bool):
             score += weight * v
@@ -170,9 +197,16 @@ def _is_candidate(rec, today=None, counters=None):
     if rec.get("status") != "active":
         return False
     util = _util_of(rec, counters)
+    # The KEEP cooldown binds EVERY candidate, auto-flagged included — it sits
+    # ABOVE the escape hatch deliberately, or a curator's explicit KEEP is
+    # silently ineffective for exactly the entries the sweep is told to review.
+    eligible_after = _parse_date(rec.get("next_review_eligible_at"))
+    if eligible_after is not None and eligible_after > today:
+        return False
     if rec.get("auto_flagged_for_review"):
         return True
-    if _evidence(util) > 0:
+    # ATTESTED, not the composite — see ATTESTED_WEIGHTS above.
+    if _attested_evidence(util) > 0:
         return False
     rc = util.get("retrieval_count", 0)
     if rc < MIN_EXPOSURE:
@@ -182,15 +216,14 @@ def _is_candidate(rec, today=None, counters=None):
         pass
     elif (today - created).days < MIN_AGE_DAYS:
         return False
-    eligible_after = _parse_date(rec.get("next_review_eligible_at"))
-    if eligible_after is not None and eligible_after > today:
-        return False
     return True
 
 
 def _candidate_sort_key(rec, counters=None):
     util = _util_of(rec, counters)
-    evidence = _evidence(util)
+    # ATTESTED, matching _is_candidate: every candidate scores 0 here, so using
+    # the composite would rank them by scan noise alone.
+    evidence = _attested_evidence(util)
     created = _parse_date(rec.get("created")) or _today()
     age_days = (_today() - created).days
     rc = util.get("retrieval_count", 0)
@@ -206,6 +239,7 @@ def _summarize(rec, kind, counters=None):
         "kind": kind,
         "status": rec.get("status"),
         "evidence": round(_evidence(util), 4),
+        "attested_evidence": round(_attested_evidence(util), 4),
         "retrieval_count": util.get("retrieval_count", 0),
         "times_helpful": util.get("times_helpful", 0),
         "times_inferred_helpful": util.get("times_inferred_helpful", 0),

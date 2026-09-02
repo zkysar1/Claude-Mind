@@ -566,8 +566,32 @@ if [[ $DO_PR -eq 1 ]]; then
       PR_MERGEABLE="UNKNOWN"; PR_CHECKS=0; PR_BAD=0
       for _mtry in 1 2 3 4 5; do
         if PR_FACTS="$( cd "$TARGET" && "$GH_BIN" pr view "$PR_URL" --json mergeable,statusCheckRollup \
-             --jq '[.mergeable, (.statusCheckRollup|length), ([.statusCheckRollup[]|select((.conclusion // .state // "") != "SUCCESS")]|length)] | @tsv' )"; then
-          IFS=$'\t' read -r PR_MERGEABLE PR_CHECKS PR_BAD <<<"$PR_FACTS"
+             --jq '[.mergeable, (.statusCheckRollup|length), ([.statusCheckRollup[]|select((.conclusion // .state // "") != "SUCCESS")]|length)] | join("\u001f")' | tr -d '\r' )"; then
+          # DELIMITER IS US (0x1f), NOT TAB, and the CR strip above is not
+          # cosmetic — each closed an INDEPENDENT fail-OPEN on this one line,
+          # both measured 2026-09-01 (alpha, cc-07, 6.8.0-137-generic):
+          #   CR: a CRLF-emitting gh (Windows/MSYS2 gh.exe) puts the CR on the
+          #     LAST field only, so PR_BAD becomes '2\r'; `[[ "2\r" -gt 0 ]]`
+          #     raises 'invalid arithmetic operator' and evaluates FALSE — a PR
+          #     with FAILING checks fell through to the MERGE branch.
+          #   TAB: tab is IFS *whitespace*, so `read` collapses runs and STRIPS
+          #     leading ones. jq renders a null as EMPTY in @tsv, so a null
+          #     .mergeable shifted every field left and PR_BAD — the safety
+          #     predicate — ended up EMPTY, defaulting to 0. Same fail-open,
+          #     different cause. US is not IFS whitespace, so empties survive.
+          # House pattern: mutation-partition-proof.sh:150 and
+          # pending-deploys-gate.sh:241 both read US for exactly this reason.
+          # jq's @tsv cannot emit US, hence the explicit join() above; `join`
+          # maps null -> "" (measured on jq-1.7), which is what we want.
+          # The `| tr` does NOT mask gh's exit status because `set -euo
+          # pipefail` (line 36) is never disabled on this path — verified. If a
+          # future edit clears pipefail, the UNREADABLE branch below dies
+          # silently and this fix becomes a fail-open of its own.
+          IFS=$'\x1f' read -r PR_MERGEABLE PR_CHECKS PR_BAD <<<"$PR_FACTS"
+          # A null .mergeable now ARRIVES as an empty field instead of shifting.
+          # Name it, so the refusal below reads as a verdict rather than as a
+          # plumbing failure ("mergeable=" tells the next reader nothing).
+          PR_MERGEABLE="${PR_MERGEABLE:-NULL}"
         else
           PR_MERGEABLE="UNREADABLE"; PR_CHECKS=0; PR_BAD=0
           break
@@ -598,10 +622,32 @@ if [[ $DO_PR -eq 1 ]]; then
         # is therefore NOT the verdict, and this `|| true` is a deliberate
         # discard of a known-unreliable signal, not a guard-139 error-silencing:
         # the authoritative check is the remote read on the next line.
-        ( cd "$TARGET" && "$GH_BIN" pr merge "$PR_URL" --merge ) || true
+        # --delete-branch: prevention beats the postflight sweep (runbook
+        # Phase 7). The REMOTE half is the half that matters here — guard-4463's
+        # stranded-tip scan is about the remote branch. The LOCAL half CANNOT
+        # succeed on this path, and that is expected rather than a fault: at
+        # this point '$BRANCH' is still checked out in the promotion worktree
+        # and git refuses ("cannot delete branch 'X' used by worktree at ..." —
+        # measured 2026-09-01). _wt_teardown below removes the worktree and by
+        # design leaves the branch (see its comment); the local branch is the
+        # postflight sweep's business, not this line's.
+        ( cd "$TARGET" && "$GH_BIN" pr merge "$PR_URL" --merge --delete-branch ) || true
         MERGED_AT="$( cd "$TARGET" && "$GH_BIN" pr view "$PR_URL" --json mergedAt --jq '.mergedAt // ""' 2>/dev/null )" || MERGED_AT=""
         if [[ -n "$MERGED_AT" ]]; then
           say "--auto-merge OK: merged at $MERGED_AT — $PR_URL"
+          # rb-240 (ZDS corpus; cited by promotion-runbook.md Phase 7): after a
+          # --delete-branch merge, gh switches the LOCAL checkout to the base
+          # and fast-forwards it. Do it explicitly here, and --prune, because
+          # `git fetch` does not prune deleted branches and a stale
+          # remotes/origin/* ref keeps the deleted tip alive (guard-4463).
+          git -C "$TARGET" fetch --prune origin >/dev/null 2>&1 \
+            || say "WARNING: post-merge 'git fetch --prune origin' failed in $TARGET — its remote-tracking refs may be stale."
+          # A REFUSED ff is reported, never repaired. Per rb-240 the resulting
+          # stale working tree is a LOCAL artifact only — origin is correct —
+          # and editing those files is a wrong-direction change.
+          if ! git -C "$TARGET" merge --ff-only '@{u}' >/dev/null 2>&1; then
+            say "NOTE: $TARGET did not fast-forward to its upstream after the merge (diverged, or no upstream configured). Its working tree may show STALE content — that is a local artifact; origin is correct, so do NOT edit those files (rb-240). Reconcile with: git -C \"$TARGET\" status && git -C \"$TARGET\" reset --hard @{u}"
+          fi
         else
           say "WARNING: --auto-merge did NOT land — PR still open at $PR_URL; merge it manually."
         fi

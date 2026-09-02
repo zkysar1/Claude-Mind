@@ -89,70 +89,39 @@ re-reading.
 # delivering nothing. It can also read rc=0 when piped (guard-1150) — judge by
 # the OUTPUT, never the exit status.
   # (a) YOUR OWN SERIES ROW — two levels down, and the ONLY place the readings live.
-  #     ⚠ NO FLEET-WIDE "TOP" OR "TAIL" — THE SHARDS DIVERGED AND GET RESTRUCTURED
-  #     WITHOUT ANNOUNCEMENT. "Read the TOP" and "read the TAIL" have EACH been wrong
-  #     for some agent at some date; one shard is now NEITHER (an off-by-SEVEN that
-  #     overwrote six successors' slots), and an ordering classifier passes VACUOUSLY
-  #     on shards with zero `## N=` headings (guard-1922). Yours may describe only
-  #     yours (guard-3487). Dated readings, verbatim:
+  #     ⚠ NO FLEET-WIDE "TOP" OR "TAIL": the shards diverged and get restructured
+  #     without announcement, so DERIVE N AS THE MAX over the three shapes the probe
+  #     below reads. Exclude forward-reference headings ("Handoff to N=k") CASE-
+  #     INSENSITIVELY (`-vi`) — they name an entry that does not exist yet
+  #     (guard-2653, guard-1922, guard-3487). Dated per-shard readings:
   #     `core/config/fresh-eyes-shard-readings.md` — APPEND THERE, never here (this
   #     file is over its injection ceiling; g-115-6690).
-  #     DERIVE N AS THE MAX OVER SECTION HEADINGS — order-independent, so it is
-  #     correct under every layout above. Exclude forward-reference headings
-  #     ("Handoff to N=k"): those name an entry that does not exist yet (guard-2653).
-  #     ⚠ THE EXCLUSION MUST BE CASE-INSENSITIVE (`-vi`). Fleet agents write the
-  #     pre-registration heading in more than one casing (bravo writes `### HANDOFF
-  #     to N=k`), and a case-SENSITIVE filter leaks the forward reference into the
-  #     MAX — measured -v -> 57 vs -vi -> 56 against a true `## N=56`. Silent, and
-  #     off-by-one in the direction that overwrites your successor's slot. When you
-  #     fix a casing assumption in one filter, grep the file for the others
-  #     (guard-2653 is WHAT to exclude; this is the MATCH surviving how five
-  #     different agents actually type it).
-  #     ⚠ THE PROBE TAKES THE MAX OVER **THREE** SHAPES — headings, `| **N=`-leading
-  #     rows, and the FIRST `N=` token of any other table row. Heading-only was wrong
-  #     for echo by THREE (its rows are TABLE ROWS, which no heading grep sees at any
-  #     casing). Do NOT "simplify" to a single union regex: the obvious form
-  #     `^(#{1,4} |\| \*\*)N=[0-9]+` requires N= IMMEDIATELY after the prefix and so
-  #     returns EMPTY for alpha and zeta, whose headings carry other text first —
-  #     measured all five shards, the union regressed 2 of 5 to nothing, max-of-both
-  #     regressed none.
-  #     ⚠ THE THIRD BRANCH TAKES THE **FIRST** `N=` PER ROW, NOT THE MAX WITHIN IT,
-  #     AND THAT DISTINCTION IS THE WHOLE BRANCH. A row's own index appears FIRST;
-  #     any later `N=` in the same row is prose naming a DIFFERENT — possibly FORWARD
-  #     — point. A max-within-row variant read echo as 74 against a true 73.
-  #     guard-2653's `handoff to N=` filter cannot be widened to catch that (the
-  #     forms are unbounded prose): position is the discriminator, not wording.
-  #     ⚠ READ THE AUTHORITATIVE STORE COPY, NOT $WORLD_PATH — AND RE-RUN THIS
-  #     PROBE IMMEDIATELY BEFORE THE PHASE-8 WRITE (g-115-8055). Two independent
-  #     defects; fixing only the first leaves the collision intact. (1) SOURCE —
-  #     under own-cloud $WORLD_PATH is a read-through cache, so N could be minted
-  #     from stale bytes (guard-157); `backend-cat.sh cat` is a pure authoritative
-  #     read. (2) SHELF LIFE, the load-bearing half — the PUT fence proves no LOST
-  #     UPDATE and says NOTHING about whether the allocated VALUE is unique, so two
-  #     boxes can mint the SAME N while every drift and integrity probe still
-  #     reports [match] (guard-5322, guard-1876). That minted the 89a/89b collision.
-  #     SO: allocate at WRITE time, not at read time. Re-run this probe as the last
-  #     step before writing the section heading and use THAT max+1. If the value
-  #     moved between the two runs, a peer allocated in the gap — take the new max,
-  #     do not keep your earlier number.
-  #     ⚠ FAIL LOUD, NEVER FALL BACK TO THE MIRROR. A failed authoritative read
-  #     means N is unallocatable this pass; silently re-reading $WORLD_PATH restores
-  #     defect (1) at precisely the moment it is most likely to bite. The three
-  #     branches below are UNCHANGED and must stay byte-identical — the shape is
-  #     correct and hard-won. Only the SOURCE of $S and the TIMING are the fix.
+  #     ⚠ THE PROBE'S THREE BRANCHES ARE LOAD-BEARING AND MUST STAY BYTE-IDENTICAL.
+  #     Do NOT "simplify" them into a single union regex, do NOT drop the `-vi`, and do
+  #     NOT take the max WITHIN a row (branch 3 takes the FIRST `N=` per row). Each of
+  #     those returns a wrong-but-WELL-FORMED N, which reads as plausible rather than as
+  #     an error. Every one is measured, with the numbers and the shards it broke, in
+  #     `core/config/rationale/fresh-eyes-series-index-probe.md` — read it BEFORE
+  #     touching the probe.
+  #     ⚠ READ THE AUTHORITATIVE STORE COPY, NOT $WORLD_PATH — AND RE-RUN THIS PROBE
+  #     IMMEDIATELY BEFORE THE PHASE-8 WRITE (g-115-8055). Two independent defects, and
+  #     fixing only the first leaves the collision intact: SOURCE ($WORLD_PATH is a
+  #     read-through cache — guard-157) and SHELF LIFE, the load-bearing half (the PUT
+  #     fence proves no LOST UPDATE and says NOTHING about whether the allocated VALUE
+  #     is unique, so two boxes can mint the SAME N while every drift and integrity
+  #     probe reports [match] — guard-5322, guard-1876). SO: allocate at WRITE time.
+  #     Re-run this as the last step before writing the section heading and use THAT
+  #     max+1; if the value moved, a peer allocated in the gap — take the new max.
+  #     ⚠ FAIL LOUD, NEVER FALL BACK TO THE MIRROR. A failed authoritative read means N
+  #     is unallocatable this pass; silently re-reading $WORLD_PATH restores the SOURCE
+  #     defect at precisely the moment it is most likely to bite.
   Bash: source core/scripts/_paths.sh && P="world/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; S="$(mktemp)"; bash core/scripts/backend-cat.sh cat "$P" > "$S" 2>/dev/null || { echo "FATAL: authoritative read of $P failed — N is UNALLOCATABLE this pass. Do NOT fall back to \$WORLD_PATH (g-115-8055)."; rm -f "$S"; exit 1; }; test -s "$S" || { echo "FATAL: authoritative read returned 0 bytes — refusing to allocate N from an empty file."; rm -f "$S"; exit 1; }; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | grep -E '^\|' | sed -nE 's/^[^N]*(N=[0-9]+).*/\1/p'; } | grep -oE '[0-9]+' | sort -n | tail -1; rm -f "$S"
-  #     VERIFIED 2026-08-18 across all five shards, two-branch vs three-branch,
-  #     same run: zero regressions, zero over-matches, zeta corrected by **45**.
-  #     ⚠ POSITIVE-CONTROL WHATEVER THIS PROBE RETURNS (guard-2421) against a
-  #     shard whose N you have confirmed FROM THE ROWS — a wrong-but-well-formed
-  #     N reads as plausible, not as an error.
-  #     ⚠ AND THE SHARD-INDEX TABLE IS NOT THAT ANCHOR. It is a hand-maintained
-  #     prose cell with no writer and no check, and it produced a live off-by-three
-  #     (it read `68–` for three consecutive fires while N=68/69/70 sat in the tail
-  #     directly below it). The trustworthy anchor is the ROWS THEMSELVES (the
-  #     probe's second half, or a targeted `grep -n 'N=' | tail`). A wrong index is
-  #     embarrassing; the real cost is the wrong PRIOR POINT it carries into
-  #     Decision Rule 11 — a wrong drift score and therefore a wrong verdict.
+  #     ⚠ POSITIVE-CONTROL WHATEVER THIS PROBE RETURNS (guard-2421) against a shard
+  #     whose N you have confirmed FROM THE ROWS — and NOT against the shard-index
+  #     table, a hand-maintained prose cell with no writer and no check that produced a
+  #     live off-by-three. A wrong index is embarrassing; the real cost is the wrong
+  #     PRIOR POINT it carries into Decision Rule 11 — a wrong drift score and therefore
+  #     a wrong verdict.
   #     Then read the section around that heading/row.
   # (b) The parent's Decision Rules + measurement recipe (load-bearing — see 2.2b
   #     SOURCE below). The parent is over the Read cap, so grep its headers and
@@ -332,7 +301,19 @@ Read agents/<agent>/session/pending-questions.yaml
     signal because a product repo/goal/PR occasioned it, since a scope question only
     ever arises WHILE DOING WORK. Reading it the other way produced 23 consecutive
     false P=0 readings (measurement + direction-of-defect: guard-5433).
-  → capture such entries created within the last 30 days (any status)
+  → capture such entries created within the last 30 days, EXCLUDING any whose
+    `status` is already terminal (`resolved`/`answered`/`superseded`) — a CONSUMED
+    signal is not change-pressure. This is 2.3b's `--unread-only` (g-115-2486) on
+    this surface; without it an actioned decision re-counts toward P every fire for
+    its full 30d window. Measured 2026-09-01 (echo, cc-03, N=121):
+    `pq-echo-ayoai-public-web-app-scope`, consumed by N=119 (self.md rev 0027), was
+    still the ONLY pq_signal — P=1 not 0, and that single stale count DECIDED the
+    verdict (evo=5/conf=0.60 → net 2.0000 `act_later`; at P=0, evo=4/conf=0.75 →
+    net 1.0 `no_change`). Predicted at N=120, confirmed live at N=121.
+    ⚠ FILTER ON CONSUMPTION, NEVER ON SUBJECT MATTER — guard-5433's 23 consecutive
+    false P=0 readings are the OPPOSITE error (rejecting identity signals because a
+    product occasioned them). A terminal-status test is orthogonal to that: it drops
+    what was already ACTED ON, whatever the signal is about.
   → call these pq_signals
   → EXPECT ZERO and say so explicitly. Since the 2026-04-22 supersession the
     primary sq-012 surfaces are 2.3b (board) and 2.6b (partner beliefs); an empty
@@ -528,22 +509,28 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
     so the briefing names the unread finding(s), not just pending-questions
 
 # 2.4 Evolution engine output — dev stage, gap analysis, novelty pressure
-# The dev STAGE does NOT live in evolution-log.jsonl. Probed 2026-07-30 (bravo,
-# cc-05): the live record schema is exactly {date, event, details}, and NO entry
-# in the last 40 carries any *stage* key. This step used to say "capture
-# current_stage, gap_analysis summary, interestingness_state" from that file —
-# three fields the store has never had, so all three returned null for every
-# agent on every pass, and that null reads as "the evolution engine has no
-# signal" rather than "this step read the wrong file." rb-245 class: verify the
-# field exists in one live record before reporting its absence.
+# The dev STAGE is NOT in evolution-log.jsonl (schema: {date, event, details};
+# probed 2026-07-30, bravo cc-05). This step once captured current_stage/
+# gap_analysis/interestingness_state here — fields it never had — so it read
+# null every pass, and null read as "no signal" not "wrong file" (rb-245: verify
+# a field exists in one live record before reporting its absence). The same
+# ambiguity survives a CORRECT read, so classify it (guard-4759).
 Bash: bash core/scripts/curriculum-evaluate.sh
   → capture current_stage (+ stage_name / all_passed / terminal_stage / next_stage).
     Branch on SHAPE per the cadence-battery contract: terminal_stage:true with
-    all_passed:true and gates:[] is the CORRECT end state, not a pending promotion.
+    all_passed:true and gates:[] is the CORRECT end state, not a pending
+    promotion — and stage_name/next_stage are emitted only on the non-terminal
+    branch, so their absence there is correct too (g-115-2513).
 Bash: tail -n 5 <META_DIR>/evolution-log.jsonl
   → parse recent entries for `event` + `details` (the fields that exist).
-    `event` values seen live: strategic_scan. Gap-analysis / interestingness
-    narrative, when present, is prose inside `details` — read it, do not key on it.
+    `event` values seen live: strategic_scan, gap_analysis. Gap-analysis and
+    interestingness are event VALUES carrying prose in `details`, never keys
+    (measured 2026-08-31: gap_analysis as a KEY is 0 of 7090). Read the prose.
+  → carry ONE disposition to Phase 3 — absence alone cannot distinguish
+    "measured, nothing there" from "never measured", and the two have opposite
+    responses (ignore vs. repair the read):
+    dev_stage_signal = "measured:<summary>" | "measured:none" (a real negative)
+                     | "unmeasured:<why>"   (zero signal, and a repair lead)
 
 # 2.5 Strategic-scan portfolio health — category concentration, uncovered Self priorities
 Bash: wm-read.sh portfolio_health_signal
@@ -662,7 +649,8 @@ Current Self (last updated {N} days ago):
 Recent self-evolution signals (FYI):
 - {Evidence-backed bullet — e.g., "sq-012 flagged 'core purpose may
   be narrowing' in pq-NNN (2026-04-NN)."}
-- {Evidence-backed bullet — dev-stage / gap analysis signal, if any}
+- {Phase 2.4 `dev_stage_signal`, rendered in full and NEVER omitted — an absent
+  bullet cannot distinguish "no signal this window" from "never measured".}
 - {Partner-belief bullet from Phase 2.6b belief_signals, if any — e.g.,
   "bravo believes (conf 0.5, 4d old): alpha may be on a cross-domain stretch."
   State it as a weighted external hypothesis, not a verdict.}
@@ -748,10 +736,9 @@ not the swept one — three prior fires (N=44/45/47) each booked exactly that as
 "robustness". Neutralize to `drift = 0.05`, `confirming = 1.00`,
 `actionable <= 0.35`, sweep, and report the flip point rather than the constancy.
 
-Boundaries, all measured: `drift` flips at **0.40** · `signal_actionable_score`
-flips in **(0.35, 0.40]** · `confirming` flips where **`N·(1−confirming) < 2.0`**
-— an inequality in `N`, NOT a fixed fraction (0.50 at N=4, 5/7=0.7143 at N=7).
-Quote the inequality.
+Boundaries: `confirming` fires where **`N·(1−confirming) >= 2.0`** — an inequality
+in `N`, not a fixed fraction (0.50/N=4, 0.60/N=5, 0.7143/N=7). The two `>= 0.40`
+cutoffs above are plain bounds, NEVER intervals — `(0.35, 0.40]` drifted twice.
 
 **COMPUTE `P = len(pq_signals) + len(board_signals)` BEFORE YOU READ THE BELIEFS,
 AND SAY WHAT IT WAS** (guard-3390). `pq_signals + board_signals` are spec'd

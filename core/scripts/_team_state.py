@@ -1045,7 +1045,10 @@ def retire_agent(world_dir, core_path, agent, author, now, *,
 
     Protocol: ENUMERATE -> ARCHIVE (to world/team-state/.graveyard/, a path
     the live system never reads) -> VERIFY the archive against the
-    enumeration -> DELETE (pop the core key under lock + unlink the shard)
+    enumeration -> DELETE (pop the core key under lock; TOMBSTONE the shard
+    rather than unlink it — the unlink is LOCAL-ONLY and a no-op under a
+    remote-authoritative backend, which re-supplies the row on the next
+    composed read; g-115-4327, and _is_retired's docstring says the same)
     -> RECEIPT (the archive file IS the receipt). NEVER deletes on an
     unverified archive — raises RuntimeError instead.
 

@@ -47,16 +47,26 @@ gate refuses to recover (returns 0 with reason).
 | # | Condition | Probe script | Rationale |
 |---|---|---|---|
 | 1 | `agent-state == RUNNING` | `session-state-get.sh` | Recovery is only relevant for sessions that claim to be running. |
-| 2 | Heartbeat is stale per `heartbeat-stale.sh` | `core/scripts/heartbeat-stale.sh` | Live runner ticks `runner-heartbeat` on every iteration. Stale heartbeat = crashed iteration loop. Threshold: `runner_heartbeat.stale_minutes` in `core/config/aspirations.yaml`. |
+| 2 | Heartbeat is `stale` per `heartbeat-stale.sh` — the file EXISTS and its mtime aged out. `absent` (no file) is INERT: it satisfies this condition only beside a positive death signal from `runner-liveness-evidence.sh` (g-357-51) | `core/scripts/heartbeat-stale.sh` (three-way: `fresh` / `stale` / `absent`) | Live runner ticks `runner-heartbeat` on every iteration. Stale heartbeat = crashed iteration loop. A MISSING file is not a measurement: a box with no heartbeat infrastructure (or one whose file a prior recovery cleared) would otherwise read "crashed" forever. Threshold: `runner_heartbeat.stale_minutes` in `core/config/aspirations.yaml`. |
 | 2.5 | `runner-recent-block.sh` returns 1 (no BLOCK in `.stop-hook-log` within last 5 min) | `core/scripts/runner-recent-block.sh` | Multi-signal liveness fix from g-115-492 (2026-05-09 cross-binding stomp). A recent stop-hook BLOCK means the runner WAS alive moments ago — a stale heartbeat alone could be misleading. |
 | 2.7 | `execution-diary.jsonl` mtime older than `DIARY_STALE_MINUTES` (default 15 min) | `mtime` check | Second multi-signal liveness fix from g-115-494 (2026-05-10). Execution diary appends at sub-minute granularity and survives stop-hook interruptions where heartbeat-tick may not — covers race where heartbeat is stale but the session was actually mid-iteration. |
 | 3 | `stop-requested` is NOT set | `session-signal-exists.sh stop-requested` | If the user explicitly typed `/stop`, the in-flight obligation path (Phase -1.4 graceful stop) is the correct recovery path — not this gate. |
 | 4 | `background-jobs.sh has-pending` exits 1 (no Tier-A registered job) | `core/scripts/background-jobs.sh has-pending` | A Tier-A background job (forged-skill long-running task) means the loop is legitimately blocked on external work, not crashed. |
+| 5 | **Pre-kill re-check** (g-357-51): `runner-liveness-evidence.sh` finds no positive LIFE signal (rc≠0) and nothing unreadable (rc≠2). Evaluated only once 1–4 all hold. | `core/scripts/runner-liveness-evidence.sh` | Conditions 1–4 are all ABSENCE-of-activity signals, and a multi-hour provider rate-limit backoff makes every one of them true on a LIVE loop (2026-09-01: a live, rate-limited reducer was demoted to IDLE and its runner manifest wiped). This condition asks the complementary question — is there positive evidence of life (a live runner process by pid+starttime, a recent assistant turn in the transcript or zakcode session doc, a live sidecar on this SID, recent provider-retry activity)? Any one vetoes the kill (guard-2364). A vetoed firing is logged to `recovery-log.jsonl` as `action: suppressed` with the full evaluation. |
 
-All six conditions are evaluated AT THE SCRIPT LEVEL — the LLM cannot
+All conditions are evaluated AT THE SCRIPT LEVEL — the LLM cannot
 override the AND, cannot pass `--force-recover`, cannot bypass any single
 condition. The gate is the SOLE authority on whether crashed-runner
 recovery fires automatically.
+
+Every firing — and every pre-kill veto — writes a durable verdict record to
+`agents/<agent>/session/recovery-log.jsonl`: `{ts, agent, action:
+recover|suppressed|self_heal|yank_reversed, path: A|B|C|D, cause,
+sid_recorded, acting_sid (the SessionStart hook's own session — the one that
+performed the demotion), source, evidence (the full runner-dead-check.sh JSON
+for Path A, the assistant-turn probe for Path D)}`. The same verdict is
+mirrored to the agent's team-state row as `agent_status.<agent>.last_recovery`
+so a worker Body on ANOTHER box can see it (`recovery-yank-check.py`).
 
 ## What `recovery-gate.sh` Does (on AND-gate pass)
 
@@ -207,3 +217,24 @@ eventually by a long healthy phase.
 - `core/config/session-manifest.yaml` — `recovery_action: clear` list
 - `core/config/aspirations.yaml` — `runner_heartbeat.stale_minutes`,
   `DIARY_STALE_MINUTES`
+
+## The consumer side: who reads a demotion (g-357-51 part 3, 2026-09-01)
+
+Until 2026-09-01 the gate wrote `recovery-log.jsonl` + `recovery-notice` and
+NOTHING read them. Three consumers now exist, one per place a false demotion
+surfaces:
+
+| Where | Script | What it does |
+|---|---|---|
+| The demoted reducer's own turn-end | `stop-hook.sh` Gate 1-pre → `recovery-yank-reverse.sh --agent --sid` | A process executing its own stop hook is alive by construction. Under `recovery_yank.py preconditions` (this sid is `sid_recorded`, bound autonomous BEFORE the yank, yank inside `RECOVERY_YANK_REVERSE_WINDOW_MINUTES` = 360, not already reversed, no user-stop artifact after it, no other `running-session-id`) it re-creates the runner triple, re-acquires the claim (rc=4 aborts), seeds the heartbeat, sets RUNNING, appends `action: yank_reversed`, rewrites the notice, mirrors `reversed_at` into team-state. Any miss is a no-op. |
+| The reducer's iteration close | `state-mismatch-landing.sh` from `iteration-close.sh` / `recurring-close.sh`, BEFORE `ITERATION COMPLETE` | Same reversal attempt; when it cannot reverse it prints the LANDING directive (consolidate, then END the turn) and the closer suppresses the re-entry imperative — the loop lands with its learning consolidated instead of dying on the entry gate's refusal. |
+| A parked worker Body | `recovery_yank.py check --agent` in the worker-loop park sequence | Classifies the park as `recovery-yank` (rc=0: post the finding + notify the user ONCE per yank, `--mark-escalated`), `user-stop` (rc=1) or `none` (rc=2). Reads the local log AND the synced team-state row `agent_status.<agent>.last_recovery`, because the log and the notice are machine-local. |
+
+Vocabulary shared by all three (`recovery_yank.py` is the SSOT): a **yank** is
+the newest `recover` entry (or the team-state marker); **user-stop** evidence
+is `stop-requested` / `stop-loop` / `stop-target-mode`, a `last-stop-reason`
+with a user path at/after the yank, or a `handoff.yaml` written after it;
+**resolved** is a later `yank_reversed` entry or RUNNING with a
+`running-session-id`. The worker resolves ambiguity TOWARD escalating (silence
+was the measured defect); the reducer resolves it TOWARD no-op (a wrong RUNNING
+restore is dual reducers).

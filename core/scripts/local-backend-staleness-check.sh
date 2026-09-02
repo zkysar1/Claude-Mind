@@ -59,6 +59,11 @@ BEHIND_THRESHOLD="${LOCAL_STALENESS_BEHIND_THRESHOLD:-5}"
 FETCH_INTERVAL_MIN="${LOCAL_STALENESS_FETCH_INTERVAL_MIN:-10}"
 FETCH_TIMEOUT_S="${LOCAL_STALENESS_FETCH_TIMEOUT_S:-15}"
 PEER_WINDOW_MIN="${LOCAL_STALENESS_PEER_WINDOW_MIN:-120}"
+# How stale the last SUCCESSFUL fetch must be before an unmeasurable verdict is
+# announced. Deliberately generous: a transient offline moment must stay quiet
+# (this file's contract), but a box that has not reached origin in hours is
+# reporting "clean" from refs that cannot support the claim.
+UNMEASURED_WARN_MIN="${LOCAL_STALENESS_UNMEASURED_WARN_MIN:-360}"
 
 # ─── Backend gate ───────────────────────────────────────────────────────────
 # STORAGE_BACKEND is not exported into the agent shell, so resolve it the same
@@ -90,11 +95,25 @@ _last=0
 [ -f "$FETCH_HEAD" ] && _last=$(date -r "$FETCH_HEAD" +%s 2>/dev/null || echo 0)
 _age_min=$(( (_now - _last) / 60 ))
 THROTTLED=0
+FETCH_FAILED=0
 if [ "$_last" -gt 0 ] && [ "$_age_min" -lt "$FETCH_INTERVAL_MIN" ]; then
     THROTTLED=1
 else
     # Hard-bounded. An offline box must not hang session start on a DNS timeout.
-    timeout "$FETCH_TIMEOUT_S" git -C "$PROJECT_ROOT" fetch --quiet origin >/dev/null 2>&1 || true
+    # The BOUND is right; discarding its outcome was not. `|| true` threw away the
+    # one fact that decides whether the measurement below means anything: on a
+    # timeout (rc=124) or any fetch error, BEHIND is computed from the LAST
+    # SUCCESSFUL fetch's refs, so a box that cannot reach origin reports "0 behind"
+    # and this check stays SILENT — the same confident-wrong-reading failure its
+    # own warning text names, turned on itself (guard-1947: an instrument that
+    # cannot see is not one that saw nothing).
+    timeout "$FETCH_TIMEOUT_S" git -C "$PROJECT_ROOT" fetch --quiet origin >/dev/null 2>&1 || FETCH_FAILED=1
+    # Re-read the clock: a SUCCESSFUL fetch just rewrote FETCH_HEAD, so _age_min
+    # must not keep describing the pre-fetch state in the report below.
+    if [ "$FETCH_FAILED" = "0" ] && [ -f "$FETCH_HEAD" ]; then
+        _last=$(date -r "$FETCH_HEAD" +%s 2>/dev/null || echo "$_last")
+        _age_min=$(( (_now - _last) / 60 ))
+    fi
 fi
 
 # ─── Measure ────────────────────────────────────────────────────────────────
@@ -128,6 +147,14 @@ fi
 # ─── Report (stdout — guard-772) ────────────────────────────────────────────
 _note=""
 [ "$THROTTLED" = "1" ] && _note=" [throttled: last fetch ${_age_min}m ago (< ${FETCH_INTERVAL_MIN}m) — measured against the last-known origin ref, not a fresh one]"
+# Same idiom as the throttled note, for the branch that never had one: a failed
+# fetch also measures against a stale ref, and BEHIND is then a LOWER BOUND.
+# _last==0 means NO successful fetch is on record (no FETCH_HEAD, or unreadable).
+# _age_min is then (_now/60) — a ~56-year nonsense figure, not an age. The
+# original code never met this because the throttled branch requires _last>0;
+# both uses added below can. Render the state, never the arithmetic.
+if [ "$_last" -gt 0 ]; then _age_desc="${_age_min}m ago"; else _age_desc="never (no successful fetch on record)"; fi
+[ "$FETCH_FAILED" = "1" ] && _note=" [fetch FAILED (timeout or unreachable) — measured against a ref last updated ${_age_desc}, so this count is a LOWER BOUND]"
 
 if [ "$BEHIND" -ge "$BEHIND_THRESHOLD" ]; then
     echo "⚠ LOCAL-BACKEND STALENESS: this clone is ${BEHIND} commit(s) BEHIND ${UPSTREAM}.${_note}"
@@ -140,6 +167,26 @@ if [ -n "$PEERS" ]; then
     echo "⚠ ANOTHER MACHINE HAS PUSHED: unlanded commits in the last ${PEER_WINDOW_MIN}m authored by: ${PEERS}"
     echo "   (this box is ${MY_ID}). A second box is active on this deployment right now — reconcile"
     echo "   before trusting any partner-liveness or claim-ownership conclusion drawn from this tree."
+fi
+
+# ─── Unearned silence ───────────────────────────────────────────────────────
+# Both reports above speak only when they CAN SEE. A failed fetch is a third
+# state — cannot tell — and rendering it as quiet is the one direction this
+# check must never fail in, the same argument the PEERS awk comment makes about
+# false negatives. Bounded by UNMEASURED_WARN_MIN so a transient offline moment
+# stays quiet (this file's "an offline box starts clean and quiet" contract is
+# about NOISE, not about concealing an unmeasurable verdict), and suppressed
+# when the BEHIND warning already fired, since its _note carries the caveat.
+# _last==0 (never fetched) is the MOST unmeasured state there is, so it must
+# satisfy the age gate rather than fall through it on a nonsense comparison.
+if [ "$FETCH_FAILED" = "1" ] && [ "$BEHIND" -lt "$BEHIND_THRESHOLD" ] \
+   && { [ "$_last" -eq 0 ] || [ "$_age_min" -ge "$UNMEASURED_WARN_MIN" ]; }; then
+    echo "⚠ LOCAL-BACKEND STALENESS: NOT MEASURED — could not reach '${UPSTREAM%%/*}' (fetch timed out after ${FETCH_TIMEOUT_S}s or the remote was unreachable)."
+    echo "   The last SUCCESSFUL fetch was ${_age_desc}, so the quiet result above is NOT evidence this clone"
+    echo "   is current — it is the absence of a measurement. Under STORAGE_BACKEND=local the git remote is the"
+    echo "   ONLY cross-machine sync point, so an unmeasured clone can read every world/meta store from a stale"
+    echo "   tree. Re-check: git -C \"$PROJECT_ROOT\" fetch origin"
+    echo "   (Quiet by design below ${UNMEASURED_WARN_MIN}m — raise/lower via LOCAL_STALENESS_UNMEASURED_WARN_MIN.)"
 fi
 
 exit 0

@@ -187,7 +187,7 @@ by both the CLI path and the daemon writer endpoint):
 |------------------------|------------------------|
 | `user_directive`, `user-directed:*`, `user_directed:*`, `pending_question:*`, `chat-goal:*` | `user` |
 | `recurring_cadence:*`, `recurring:*` | `recurring-cycle` |
-| `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*`, `skill-discovery-audit:*`, `blocker_pattern:*`, `unit-economics-move:*` | `cycle-detector` |
+| `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*`, `skill-discovery-audit:*`, `blocker_pattern:*`, `unit-economics-move:*`, `s3-churn:*` | `cycle-detector` |
 | `decomposition:*`, `parent_aspiration:*`, `unblock:*`, `investigate:*`, `investigation:*`, `idea:*`, `maintain:*`, `apply:*`, `brief:*`, `board_post:*`, `program-change-proposal:*`, `idle_fallback` | `agent-self` |
 
 Variant prefixes (`investigation:` vs canonical `investigate:`, `user-directed:`

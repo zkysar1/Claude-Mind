@@ -628,3 +628,66 @@ def test_the_stale_verdict_exit_code_is_not_treated_as_failure(monkeypatch, caps
     }), rc=1)
     assert "RE-MEASURE BEFORE EXECUTING" in out
     assert "check FAILED" not in out, "rc=1 is a verdict, not a failure"
+
+
+# --- : a killed run must not look like a clean one -----------------
+
+def test_selection_is_in_the_stage_table_with_its_own_timing(table, capsys):
+    """The stage table must account for the selector, which is the biggest stage.
+
+    It runs outside the STAGES loop and _selection() discarded the runner's
+    elapsed_ms, so the table a reader consults to size a timeout omitted the single
+    most expensive thing the run does. Measured on cc-08 2026-08-31 BEFORE the fix:
+    68,205 ms wall against a 42,190 ms table sum — 26,015 ms (38%) invisible, with
+    goal-selector.sh alone timing 23,442 ms as the positive control. Sizing a bound
+    off that table under-shoots by more than a third, which is how a 110s bound got
+    chosen for a run that cannot fit in it on a slower box.
+    """
+    runner = make_runner({"goal-selector.sh": (0, json.dumps([]), None)})
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    report = json.loads(capsys.readouterr().out)
+    keys = [s["key"] for s in report["stages"]]
+    assert "selection" in keys, f"selector missing from the stage table: {keys}"
+    row = next(s for s in report["stages"] if s["key"] == "selection")
+    assert isinstance(row["elapsed_ms"], int)
+    assert report["candidates"]["elapsed_ms"] == row["elapsed_ms"]
+
+
+def test_every_stage_announces_itself_on_stderr_BEFORE_it_runs(table, capsys):
+    """The breadcrumb must precede the stage, or a kill leaves no name behind.
+
+    THE ORDERING IS THE WHOLE POINT. A breadcrumb emitted after a stage completes
+    tells you only about stages that already finished — the one that was in flight
+    when the process died, which is the one you need, is exactly the one it omits.
+    """
+    seen = []
+    base = make_runner({"goal-selector.sh": (0, json.dumps([]), None)})
+
+    def runner(argv, timeout):
+        seen.append(("RAN", argv[0]))
+        return base(argv, timeout)
+
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    err = capsys.readouterr().err
+    assert err, "a run that emits nothing on stderr is indistinguishable from a kill"
+    for stage in io_mod.STAGES:
+        arrow = f"-> {stage['key']}"
+        done = f"{stage['key']} done"
+        assert arrow in err, f"no pre-run breadcrumb for {stage['key']}"
+        assert err.index(arrow) < err.index(done), (
+            f"{stage['key']} announced itself only AFTER running — a kill during "
+            "that stage would leave no trace of which stage it was"
+        )
+
+
+def test_breadcrumbs_go_to_stderr_so_the_wrappers_stdout_capture_cannot_eat_them(table, capsys):
+    """iteration-open.sh redirects ONLY stdout (`> "$_OUT"`), so stderr reaches the
+    caller live. Moving these to stdout would put them inside the captured file
+    that a killed run never writes — reintroducing the defect invisibly, since a
+    completed run would still look perfectly correct."""
+    runner = make_runner({"goal-selector.sh": (0, json.dumps([]), None)})
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    cap = capsys.readouterr()
+    assert "[iteration-open] ->" in cap.err
+    assert "[iteration-open] ->" not in cap.out, "breadcrumbs must never touch stdout"
+    json.loads(cap.out)  # stdout stays a single parseable JSON object

@@ -144,6 +144,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                 "maintainability": agg.get("maintainability", 0.0),
                 "cost_awareness": agg.get("cost_awareness", 0.0),
                 "overall": agg.get("overall", 0.0),
+                "judges": _judge_summary(sdata.get("evaluations") or []),
             })
         return _out(summary)
 
@@ -165,7 +166,9 @@ def report(ctx) -> "Response":  # type: ignore[name-defined]
     alerts = []
     for name, sdata in skills.items():
         agg = sdata.get("aggregate", {})
-        skills_agg[name] = agg
+        skills_agg[name] = dict(agg)
+        skills_agg[name]["judges"] = _judge_summary(
+            sdata.get("evaluations") or [])
         overall = agg.get("overall", 0.0)
         overalls.append(overall)
         low_dims = [dim for dim in DIMENSIONS if agg.get(dim, 0.0) < 0.30]
@@ -223,8 +226,77 @@ def underperforming(ctx) -> "Response":  # type: ignore[name-defined]
 # Write handler: score
 # ---------------------------------------------------------------------------
 
-def _score_write(ctx, skill, goal, grades):
-    """Inlined cmd_score logic. Returns the 'Scored ...' stdout line."""
+HARNESS_VALUES = ("claude-code", "zakcode", "unknown")
+
+
+def _judge_provenance(judge_model=None, harness=None):
+    """Judge identity for one quality evaluation (, ).
+
+    Returns (judge_model, harness), NORMALIZED from values the CALLER supplied.
+    Both fall back to "unknown" rather than guessing, because this field exists
+    to make cross-model comparison sound and a wrong value is worse than an
+    absent one.
+
+    RESOLVED CALLER-SIDE, NEVER HERE -- this function reads no environment. The
+    judge is the process that produced the grades, but on the path that
+    actually executes, the WRITER is the long-lived daemon: it inherits the
+    environment of whichever session spawned it and holds that for its entire
+    lifetime. An environment read here therefore reports one arbitrary
+    session's values for every agent's request, on every record, forever --
+    not absent, but confidently WRONG and authoritative-looking (guard-2480;
+    the guard-1925 hazard). Wrappers resolve via rt_judge_provenance and
+    forward judge_model/harness in the request body.
+
+    judge_model is never inferred from CLAUDE_CODE_SUBAGENT_MODEL: that names
+    the SUBAGENT model while scoring runs on the MAIN loop, so the two
+    genuinely differ (measured 2026-09-01 on cc-04: subagent env read
+    claude-opus-4-6 while the scoring session ran claude-opus-5).
+
+    An unrecognised harness normalizes to "unknown" rather than passing
+    through: it is a closed vocabulary that aggregate consumers group by, and
+    a caller-supplied string is untrusted input.
+
+    Legacy records carry neither key; absent therefore means "unknown" too, so
+    no backfill is required (the merge handler unions whole evaluation dicts,
+    so records written by older code survive unchanged).
+    """
+    model = (judge_model or "").strip() or "unknown"
+    name = (harness or "").strip()
+    return model, (name if name in HARNESS_VALUES else "unknown")
+
+
+def _judge_summary(evaluations):
+    """Composition of the judge population behind an aggregate ().
+
+    Returns a sorted list of {judge_model, harness, n}. Legacy records carry
+    neither key and count as unknown/unknown: the field exists to make a
+    MIXTURE visible, so dropping un-provenanced records would hide exactly the
+    mixture the caller is asking about. A single-element list means the
+    aggregate is judge-homogeneous and safe to compare over time; more than one
+    means drift in it may be a judge change rather than a skill change.
+    """
+    counts = {}
+    for e in evaluations or []:
+        if not isinstance(e, dict):
+            continue
+        key = (str(e.get("judge_model") or "unknown"),
+               str(e.get("harness") or "unknown"))
+        counts[key] = counts.get(key, 0) + 1
+    return [{"judge_model": m, "harness": h, "n": n}
+            for (m, h), n in sorted(counts.items())]
+
+
+def _score_write(ctx, skill, goal, grades, judge_model=None, harness=None):
+    """Inlined cmd_score logic. Returns the 'Scored ...' stdout line.
+
+    judge_model/harness come from the CALLER (request body), never from this
+    process's environment -- see _judge_provenance. Both entry points into this
+    writer must forward them: the /v1/skill-evaluate/score route below, and
+    skill_quality_score.score, which is the Step 8.76 per-goal call site and so
+    the dominant producer of evaluations (guard-3448: a gate is only as broad
+    as its entry points).
+    """
+    judge_model, harness = _judge_provenance(judge_model, harness)
     data = _read_yaml(_quality_path(ctx))
     weights = _load_weights(ctx)
     scores = {dim: GRADE_MAP[grades[dim]] for dim in DIMENSIONS}
@@ -238,6 +310,8 @@ def _score_write(ctx, skill, goal, grades):
         "maintainability": scores["maintainability"],
         "cost_awareness": scores["cost_awareness"],
         "overall": overall,
+        "judge_model": judge_model,
+        "harness": harness,
     }
     if "skills" not in data:
         data["skills"] = {}
@@ -284,7 +358,8 @@ def score(ctx) -> "Response":  # type: ignore[name-defined]
                 "{} must be one of good/average/poor (got {!r})".format(dim, val))
         grades[dim] = val
 
-    line = _score_write(ctx, skill, goal, grades)
+    line = _score_write(ctx, skill, goal, grades,
+                        body.get("judge_model"), body.get("harness"))
     return Response.text(line + "\n", content_type="text/plain")
 
 

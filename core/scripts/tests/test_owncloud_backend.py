@@ -460,6 +460,118 @@ def test_dual_runner_second_acquire_raises(cloud):
         other.acquire_runner("alpha", "tokB")
 
 
+# --- claim continuity: holder_since () ------------------------------
+# holder_since answers "has ONE box held this claim without interruption?", which
+# a plain acquisition timestamp cannot: continuous tenure and re-acquisition-
+# after-a-peer produce the same value. So the property under test is not "is it
+# set" but "is it set on a HANDOVER and left alone on a same-box re-acquire".
+#
+# Time is not used as the discriminator. Both acquires can land in the same
+# clock second, so an equal-value assertion would pass vacuously; instead the
+# stored value is forced to a sentinel between acquires and the tests assert on
+# the sentinel's SURVIVAL or REPLACEMENT. Deterministic, and it cannot pass by
+# coincidence.
+_HS_SENTINEL = 12345
+
+
+def _read_holder_since(cloud, agent="alpha"):
+    item = cloud["ddb"].get_item(
+        TableName=SESSIONS,
+        Key={"session_key": {"S": f"{ENV_ID}/{agent}"}})["Item"]
+    raw = item.get("holder_since", {}).get("N")
+    return int(raw) if raw is not None else None
+
+
+def _force_holder_since(cloud, value, agent="alpha"):
+    cloud["ddb"].update_item(
+        TableName=SESSIONS,
+        Key={"session_key": {"S": f"{ENV_ID}/{agent}"}},
+        UpdateExpression="SET holder_since = :hs",
+        ExpressionAttributeValues={":hs": {"N": str(value)}})
+
+
+def test_first_acquire_stamps_holder_since(cloud):
+    """POSITIVE CONTROL for the two tests below: without this, a bug that never
+    wrote holder_since at all would satisfy the 'preserved' assertion trivially."""
+    a = _backend(cloud, machine_id="A")
+    assert a.acquire_runner("alpha", "tokA") is True
+    assert _read_holder_since(cloud) is not None
+    assert _read_holder_since(cloud) > 0
+
+
+def test_same_machine_reacquire_preserves_holder_since(cloud):
+    """The half that keeps the gate from re-arming the 451-skip wedge. A box
+    restarting its own session has never lost tenure, so bumping holder_since
+    here would make every file it wrote before the restart look suspect —
+    exactly the ~30% false-closed population measured on the naive
+    runner-token-mtime form this design replaced."""
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")
+    _force_holder_since(cloud, _HS_SENTINEL)
+    assert a.release_runner("alpha", "tokA") is True
+    assert a.acquire_runner("alpha", "tokA2") is True
+
+    assert _read_holder_since(cloud) == _HS_SENTINEL      # tenure UNBROKEN
+    state = a.get_runner_state("alpha")
+    assert state["agent_state"] == "RUNNING"              # and the acquire worked
+    assert state["machine_id"] == "A"
+
+
+def test_machine_change_stamps_new_holder_since(cloud):
+    """The half that closes the clobber. A different machine taking the claim
+    STARTS a new tenure, so every file the previous holder wrote is older than
+    holder_since and loses its LOCAL-WINS admission."""
+    a = _backend(cloud, machine_id="A")
+    b = _backend(cloud, machine_id="B")
+    a.acquire_runner("alpha", "tokA")
+    _force_holder_since(cloud, _HS_SENTINEL)
+    a.release_runner("alpha", "tokA")
+    assert b.acquire_runner("alpha", "tokB") is True
+
+    assert _read_holder_since(cloud) != _HS_SENTINEL      # tenure RESET
+    assert _read_holder_since(cloud) > _HS_SENTINEL
+    assert a.get_runner_state("alpha")["machine_id"] == "B"
+
+
+def test_holder_since_reaches_list_runner_claims(cloud):
+    """The sync side reads this through RunnerClaim, not off the raw item — an
+    attribute stamped but not projected would be invisible where it is used."""
+    a = _backend(cloud, machine_id="A")
+    a.acquire_runner("alpha", "tokA")
+    _force_holder_since(cloud, _HS_SENTINEL)
+    claim = [c for c in a.list_runner_claims() if c.agent == "alpha"][0]
+    assert claim.holder_since == _HS_SENTINEL
+
+
+def test_legacy_row_without_holder_since_reads_zero(cloud):
+    """Backward compatibility, and the reason this change refuses NOTHING on the
+    day it ships: every pre-existing row lacks the attribute, so it must project
+    as 0 (UNKNOWN) rather than raising or defaulting to 'now' — consumers fail
+    OPEN on 0 (guard-1562: enumerate what is NEWLY refused; here, nothing)."""
+    a = _backend(cloud, machine_id="A")
+    cloud["ddb"].put_item(
+        TableName=SESSIONS,
+        Item={"session_key": {"S": f"{ENV_ID}/legacyagent"},
+              "agent_state": {"S": "RUNNING"},
+              "machine_id": {"S": "A"}})
+    claim = [c for c in a.list_runner_claims() if c.agent == "legacyagent"][0]
+    assert claim.holder_since == 0
+
+
+def test_acquire_on_legacy_row_same_machine_still_succeeds(cloud):
+    """A row with NO machine_id attribute at all must not wedge the acquire: the
+    same-machine attempt fails its condition (absent != :mid) and the handover
+    attempt takes it. Regression guard for the two-attempt split itself."""
+    a = _backend(cloud, machine_id="A")
+    cloud["ddb"].put_item(
+        TableName=SESSIONS,
+        Item={"session_key": {"S": f"{ENV_ID}/alpha"},
+              "agent_state": {"S": "IDLE"}})
+    assert a.acquire_runner("alpha", "tokA") is True
+    assert _read_holder_since(cloud) > 0
+    assert a.get_runner_state("alpha")["machine_id"] == "A"
+
+
 # --- crashed-runner reclaim (fix B2) ----------------------------------------
 def test_reclaim_stale_runner(cloud):
     a = _backend(cloud, machine_id="A")
@@ -1576,7 +1688,8 @@ def test_cas_metrics_start_at_zero(cloud):
     409-rate surface the goal names exists and reads 0.0 before any fenced write."""
     b = _backend(cloud)
     assert b.cas_metrics() == {
-        "writes": 0, "conflicts": 0, "resolved": 0, "conflict_rate": 0.0}
+        "writes": 0, "conflicts": 0, "resolved": 0, "conflict_rate": 0.0,
+        "merge_noop_identical": 0}
 
 
 def test_conflict_backoff_is_jittered_and_bounded():

@@ -157,6 +157,60 @@ def test_traversal_out_of_external_root_is_refused(ext_roots):
         str(_paths.PROJECT_ROOT), "world/../../etc/passwd") == []
 
 
+def test_traversal_onto_an_EXISTING_out_of_root_file_is_refused(ext_roots, tmp_path):
+    """The escape above lands on a path that does not exist, so two of its
+    three surfaces prove nothing. This one lands on a file that DOES exist.
+
+    WHY BOTH CASES ARE NEEDED (g-115-3752, measured 2026-07-28 by neutered-build
+    differential). `world/../../etc/passwd` is filtered by `.is_file()` before
+    containment is ever consulted, so `_resolve_target_paths(...) == []` and the
+    `_read_target_file` chokepoint stay GREEN even with the containment line in
+    `_resolve_virtual_path` deleted. Only its `is None` assertion discriminates.
+    That makes the sibling above a real guard on ONE surface and a decoration on
+    the others — the exact shape guard-4166 warns about, where an absence-shaped
+    expectation is also what a dead component produces.
+
+    Here the escape resolves onto a file that exists, so all three surfaces
+    separate the builds: with containment removed, `_resolve_virtual_path`
+    returns the path, `_resolve_target_paths` returns it too, and
+    `_read_target_file` READS IT — the last being the chokepoint where an
+    out-of-root read actually happens, which carried no traversal assertion at
+    all before this test.
+
+    Kept hermetic (the target file is created inside tmp_path, one level above
+    the fixture's WORLD_DIR) rather than escaping onto a real repo file. The
+    fixture's own docstring makes hermeticity a deliberate property, and a test
+    that reads PROJECT_ROOT content to prove containment would trade this
+    file's isolation for the very reachability it is asserting against.
+    """
+    world, _meta = ext_roots
+    outside = tmp_path / "outside-of-world-root.md"
+    outside.write_text("SENTINEL_OUT_OF_ROOT_CONTENT\n", encoding="utf-8")
+    escape = "world/../outside-of-world-root.md"
+
+    # Positive control for the SETUP: the escape must genuinely land on the
+    # file, or this test degrades into the non-existent case it exists to
+    # complement and would go green for the wrong reason.
+    assert (world / ".." / "outside-of-world-root.md").resolve() == outside.resolve()
+    assert outside.is_file()
+
+    assert ts_mod._resolve_virtual_path(escape) is None, (
+        "containment: a virtual prefix authorizes its OWN root only"
+    )
+    assert ts_mod._resolve_target_paths(str(_paths.PROJECT_ROOT), escape) == [], (
+        "an existing out-of-root file must not be returned as a resolved target"
+    )
+    content, existed = ts_mod._read_target_file(str(_paths.PROJECT_ROOT), escape)
+    assert existed is False, (
+        "_read_target_file is the chokepoint where the out-of-root READ happens; "
+        "it must refuse the escape rather than report the file as present"
+    )
+    assert content is None, "no out-of-root content may be returned"
+    assert "SENTINEL_OUT_OF_ROOT_CONTENT" not in (content or ""), (
+        "out-of-root file content leaked through _read_target_file"
+    )
+
+
 def test_non_virtual_path_is_untouched(ext_roots):
     """An ordinary in-repo path still resolves via the PROJECT_ROOT join."""
     assert ts_mod._resolve_virtual_path("core/scripts/_target_state.py") is None

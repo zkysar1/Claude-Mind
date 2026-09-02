@@ -291,13 +291,53 @@ def test_main_does_not_warn_when_scoped(tmp_path, capsys):
 
 
 def test_main_does_not_warn_on_a_small_unscoped_result(tmp_path, capsys):
-    """Second positive control: below both thresholds, no warning."""
+    """Second positive control: below both thresholds, no warning.
+
+    NARROWED (g-115-3982): this asserted a bare `"WARNING" not in err`, written
+    when exactly two warnings existed (unreadable-files, unscoped-hit-count) —
+    so "no WARNING at all" and "neither of THOSE two" were the same sentence.
+    The corpus-accounting fix adds a THIRD, and this fixture is a 1-file tree,
+    so it fires here by design. The assertion is pinned to the two warnings this
+    control is actually about; the misaimed one has its own test below.
+    """
     root = tmp_path / "proj"
     (root / "core").mkdir(parents=True)
     (root / "core" / "a.py").write_text('x = {"reason": 1}\n', encoding="utf-8")
     rc, out, err = _run_main(kcc, capsys, ["reason", "--project-root", str(root)])
     assert rc == 0
-    assert "WARNING" not in err, err
+    assert "unreadable" not in err, err
+    assert "hits across" not in err, err
+
+
+def test_main_warns_when_the_corpus_is_misaimed(tmp_path, capsys):
+    """: a zero over an EMPTY corpus must not read as an absence.
+
+    The regression this pins: pointed at a repo without core/ or .claude/, the
+    tool walked 1 file of ~390 and printed its ordinary no-hit line. Measured
+    (echo, cc-03, 2026-07-30): files_walked=1 for a product repo against 3898
+    for the framework. rb-245 vacuous-zero class.
+    """
+    root = tmp_path / "proj"
+    (root / "src").mkdir(parents=True)
+    (root / "src" / "Widget.java").write_text("String reason;\n", encoding="utf-8")
+    rc, out, err = _run_main(kcc, capsys, ["reason", "--project-root", str(root)])
+    assert rc == 0
+    assert "MISAIMED SCAN" in err, err
+    # the accounting itself reaches stdout, so a zero is self-refuting
+    assert "file(s) walked" in out, out
+
+
+def test_census_stats_out_reports_corpus(tmp_path):
+    """stats_out is the out-parameter idiom (mirrors owncloud_sync.sync_file)."""
+    root = tmp_path / "proj"
+    (root / "core").mkdir(parents=True)
+    for i in range(3):
+        (root / "core" / f"f{i}.py").write_text('x = {"reason": 1}\n', encoding="utf-8")
+    stats = {}
+    rows = kcc.census(["reason"], project_root=str(root), stats_out=stats)
+    assert stats["files_walked"] == 3, stats
+    assert stats["files_scanned"] == 3, stats
+    assert rows, "positive control: the fixture really does contain the key"
 
 
 def test_census_reports_unreadable_files(tmp_path, capsys):

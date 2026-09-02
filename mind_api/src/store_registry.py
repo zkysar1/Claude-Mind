@@ -949,7 +949,13 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         created_stamp=_stamp_now,
         recompute=_recompute_utilization_score,
         recompute_on_fields=frozenset({"utilization"}),
-        immutable_fields=frozenset({"created"}),
+        # : BOTH halves of _rb_identity are protected, not just the
+        # script-stamped one. coordination_merge._rb_identity keys a record on
+        # (created, title), so an in-place `title` edit makes the next cross-box
+        # merge read it as a NEW entity and fork it — the rb-5511 mechanism,
+        # which was measured on the guardrail twin. `content` stays amendable:
+        # it is the payload the per-field amended_fields tier exists to order.
+        immutable_fields=frozenset({"created", "title"}),
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS,
         amend_stamp_field="amended_fields",
@@ -986,7 +992,13 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         created_stamp=_stamp_now,
         recompute=_recompute_utilization_score,
         recompute_on_fields=frozenset({"utilization"}),
-        immutable_fields=frozenset({"created"}),
+        # : both halves of _guard_identity (created, rule). rb-5511
+        # measured 11 forked pairs in the LIVE store from in-place `rule` edits.
+        # _merge_guard_record names the amendable free-text fields explicitly —
+        # trigger_condition / action_hint / source — and `rule` was never among
+        # them: a divergent rule SPLITS rather than merging. This makes the write
+        # path agree with the merge design instead of silently disagreeing.
+        immutable_fields=frozenset({"created", "rule"}),
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS,
         amend_stamp_field="amended_fields",
@@ -1009,7 +1021,10 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         created_stamp=_stamp_now,
         recompute=_recompute_patsig_accuracy,
         recompute_on_fields=frozenset({"outcome_stats"}),
-        immutable_fields=frozenset({"created"}),
+        # : both halves of _sig_identity (created, name). Same latent
+        # shape as rb-5511; `name` simply had no writer, which is why this store
+        # has not forked yet. Absence of a writer is not a protection.
+        immutable_fields=frozenset({"created", "name"}),
         amend_stamp_field="amended_fields",
         #  — see the census rationale on the reasoning-bank spec above.
         # This store had NO authorship key on any of its 79 rows.
@@ -1027,5 +1042,15 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         prepare=_spark_prepare,
         recompute=_recompute_spark_yield_rate,
         recompute_on_fields=frozenset({"times_asked", "sparks_generated"}),
+        # : _spark_identity keys on the SOLE field `text`, so this store
+        # had NO protected half whatsoever — the worst case of the class, and the
+        # one  did not cover.
+        # Candidate->question promotion is unaffected twice over: spark-questions.py
+        # cmd_promote rewrites id/type/status/times_asked/sparks_generated/
+        # yield_rate and never `text`, AND it writes through locked_modify_jsonl
+        # directly rather than the set-field endpoint, so this gate is not even on
+        # its path. Keying identity on `text` is what lets a promotion CHANGE the
+        # id while the merge still recognises the same record.
+        immutable_fields=frozenset({"text"}),
     ),
 }

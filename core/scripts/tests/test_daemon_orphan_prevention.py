@@ -121,6 +121,16 @@ def _run_start(args=()):
     # must isolate with RUNTIME_DIR instead of taking this hatch.
     env = dict(os.environ)
     env["MIND_ALLOW_SHARED_DAEMON_FROM_TEST"] = "1"
+    #  restart-rate guard: mind-api-start.sh refuses a --restart issued
+    # within MIND_RESTART_MIN_INTERVAL_S (default 60) of the last one, exit 3, with
+    # its reason going to the daemon log rather than stderr -- so the caller sees a
+    # bare rc=3 and no message. This file restarts REPEATEDLY and on purpose
+    # (test_n_restarts_leave_exactly_one_pair is the whole point), which is
+    # indistinguishable from the restart-storm shape the guard exists to stop. Same
+    # deliberate-operator exception as the shared-daemon opt-in above, so it is
+    # declared the same way rather than by slowing the test to a 60s cadence.
+    # Measured 2026-08-23: 3 of 4 cases failed on rc=3; with this set they pass.
+    env["MIND_RESTART_FORCE_RATE"] = "1"
     return subprocess.run(cmd, capture_output=True, text=True, timeout=30,
                           cwd=str(PROJECT_ROOT), env=env)
 

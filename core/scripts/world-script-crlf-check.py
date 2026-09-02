@@ -79,6 +79,41 @@ def _world_scripts_root() -> Path | None:
     return Path(env) / "scripts" if env else None
 
 
+def _in_scope(root: Path):
+    """Files the CR check governs: every *.sh, plus every EXECUTABLE file whose
+    first two bytes are `#!`.
+
+    WHY THE SECOND CLAUSE (g-115-7422, zeta 2026-08-24): the no-false-positive
+    argument this lane rests on is about the KERNEL SHEBANG PATH, and that path
+    does not care about the extension. Any exec+`#!` file is read by the kernel
+    as `#!/usr/bin/env python3\r` and dies "bad interpreter". The lane keyed on
+    EXTENSION while the failure keys on EXEC+SHEBANG.
+
+    The exec bit is load-bearing and must NOT be dropped to "any file with a
+    shebang": a `.py` invoked as `python3 file.py` never reaches the kernel
+    shebang path and CPython tolerates CRLF, so sweeping those in would
+    manufacture exactly the false-positive class this lane claims not to have.
+    Measured at widening (one snapshot, both predicates): world/scripts ADDED=0,
+    core/scripts ADDED=46, REMOVED=0 in both, CR-bearing among ADDED=0 in both
+    (guard-2201 — a widening must be a proper superset, and the assertion that
+    matters is that the OLD set lost nothing).
+    """
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.suffix == ".sh":
+            yield path
+            continue
+        try:
+            if path.stat().st_mode & 0o111 and path.open("rb").read(2) == b"#!":
+                yield path
+        except Exception:
+            # Unreadable here is not a silent drop: the file is still reached by
+            # the *.sh arm if it qualifies, and scan_root records read failures
+            # in failed[] rather than treating them as clean.
+            continue
+
+
 def scan_root(root: Path | None, label: str) -> dict:
     """Return {label, root, scanned, offenders[], failed[]} for one root.
 
@@ -93,7 +128,7 @@ def scan_root(root: Path | None, label: str) -> dict:
     if not root.is_dir():
         out["failed"].append(f"{label}: {root} is not a directory")
         return out
-    for path in sorted(root.rglob("*.sh")):
+    for path in _in_scope(root):
         try:
             data = path.read_bytes()
         except Exception as exc:                       # unreadable == blind

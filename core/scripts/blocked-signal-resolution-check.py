@@ -160,7 +160,26 @@ from _dependency_graph import (  # noqa: E402  SSOT (guard-547)
 from _runtime_bash import bash_cmd  # noqa: E402   Windows-safe bash resolution
 import _rt  # noqa: E402  canonical Python -> daemon client
 
-TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
+# : this reader resolves TWO KINDS of referent -- goals and pending
+# questions -- and they have DIFFERENT terminal vocabularies. Until now both
+# branches shared the one set below, so an `answered` pending question (the state
+# pending-questions-close.sh actually writes) read as NOT resolved forever, and a
+# blocked signal citing it could never discharge. The two sets are deliberately
+# NOT merged: a pending question is never "completed" and a goal is never
+# "answered" (guard-1127 -- decouple at the consumer, do not widen a shared value).
+# The name carries GOAL_ so the next reader cannot reach for the ambient one by
+# accident, which is exactly how the pq branch acquired the wrong set.
+GOAL_TERMINAL_STATUSES = ("completed", "archived", "skipped", "expired", "resolved")
+
+# discharges_a_blocker, and NEITHER of its neighbours — the choice is measured,
+# not stylistic:
+#   is_settled  would exclude `answered`, re-creating the very defect this fixes
+#               (the closer WRITES `answered`, so the signal never discharges).
+#   is_closed   would include `retired`, which means the question was WITHDRAWN —
+#               that kills a blocker's clearing path rather than satisfying it, so
+#               counting it as a discharge silently unblocks a goal nobody answered
+#               (human-blocked-defer-join.py:83-87 keeps the same distinction).
+from _pending_question_status import discharges_a_blocker as pq_discharges  # noqa: E402
 
 # ── Routing cooldown () ────────────────────────────────────────────
 # The tag written by `_post_routing_breadcrumb`, and the primary marker read
@@ -492,11 +511,12 @@ def _classify_ref(ref_id, goal_index, pq_index, pq_complete=True):
             # "unknown" — the superseding goal is absent from live AND archive.
             # guard-1890: absence is ignorance, never evidence. Fall through to
             # the plain status read rather than guessing.
-        return (status in TERMINAL_STATUSES,
+        return (status in GOAL_TERMINAL_STATUSES,
                 f"goal {rid} is {status} (found in {_where})", "goal")
     if rid in pq_index:
         status = pq_index[rid]
-        return (status in TERMINAL_STATUSES,
+        # PENDING-QUESTION vocabulary, not the goal one directly above ().
+        return (pq_discharges(status),
                 f"pending-question {rid} is {status}", "pending_question")
     if rid.startswith(_BOARD_PREFIXES):
         return (None, f"board reference {rid} — not resolvable here", "board")
@@ -624,7 +644,7 @@ def _resolve_blocker_ref(kind, as_dict, raw, goal_index, pq_index, now,
                     whys.append(f"external_id: cross-world {ext_s} — resolver "
                                 f"raised {type(exc).__name__}: {exc}")
                 if status is not None:
-                    ext_resolved = status in TERMINAL_STATUSES
+                    ext_resolved = status in GOAL_TERMINAL_STATUSES
                     ext_referent = "external"
                     whys.append(f"external_id: cross-world {ext_s} is {status}")
             if ext_referent is None:
@@ -744,7 +764,7 @@ def _classify(goal, goal_index, pq_index, now, pq_complete=True):
     # "disagreements" were goals with ONE live signal — i.e. plain blocked
     # goals, working exactly as intended, reported as findings. A detective
     # sweep whose report is majority-noise trains its reader to skip it.
-    bb_resolved = (not bb) or all(s in TERMINAL_STATUSES for s in bb_status.values())
+    bb_resolved = (not bb) or all(s in GOAL_TERMINAL_STATUSES for s in bb_status.values())
     bb_present = bool(bb)
 
     br_resolved, br_why, basis = _resolve_blocker_ref(

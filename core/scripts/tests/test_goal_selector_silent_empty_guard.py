@@ -167,3 +167,108 @@ def test_bare_invocation_forwards_select(tmp_path):
         "bare invocation must default to the select subcommand; "
         f"got {r.stdout!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# --field extraction ().
+#
+# WHY THESE PINS: the exit-7 guard above is defeated by a PIPE, and every real
+# ad-hoc caller pipes (`2>&1 | python3 -c json.load` merges the FATAL into the
+# JSON stream; `2>/dev/null | ...` discards it) -- both yield EMPTY at pipeline
+# rc=0, which is exactly the "no candidates" misreading the guard exists to
+# prevent. The root cause of the piping is that `select`/`blocked` take ZERO
+# options, so a caller wanting one field must hand-roll a parser. --field
+# removes the NEED to parse. These pin the three rc states a caller now
+# distinguishes WITHOUT a pipe, and the two forwarding invariants that the
+# `"$@"` -> ARGS[@] refactor could silently break (rb-538).
+# ---------------------------------------------------------------------------
+
+def test_field_extracts_top_row_value(tmp_path):
+    """--field prints ONLY the scalar, from the FLAT top row (no nested 'goal')."""
+    payload = '[{"goal_id":"g-1-1","score":9.9},{"goal_id":"g-2-2","score":1.0}]'
+    binddir = _stub_python(tmp_path, f"    printf '%s' '{payload}'; exit 0")
+    r = _run(binddir, args=("select", "--field", "goal_id"))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "g-1-1"
+
+
+def test_field_on_empty_ranking_exits_8_not_7(tmp_path):
+    """THE POINT OF THE FLAG: a real empty ranking must never read as the
+    silent-empty signature. 8 and 7 are different answers to different
+    questions -- 'nothing to pick' vs 'the selector failed to produce'."""
+    binddir = _stub_python(tmp_path, "    printf '[]'; exit 0")
+    r = _run(binddir, args=("select", "--field", "goal_id"))
+    assert r.returncode == 8, (r.returncode, r.stdout, r.stderr)
+    assert "ZERO candidates" in r.stderr
+    assert "NOT the exit-7" in r.stderr
+
+
+def test_field_does_not_mask_the_silent_empty_guard(tmp_path):
+    """The guard runs BEFORE extraction; --field must not swallow exit 7."""
+    binddir = _stub_python(tmp_path, "    exit 0")  # rc=0, zero bytes
+    r = _run(binddir, args=("select", "--field", "goal_id"))
+    assert r.returncode == 7, (r.returncode, r.stdout, r.stderr)
+    assert "silent-empty signature" in r.stderr
+
+
+def test_field_handles_the_all_blocked_dict_shape(tmp_path):
+    """cmd_select emits TWO legitimate shapes; rejecting the dict would fail in
+    exactly the state whose signal matters most (g-115-7898)."""
+    payload = '{"all_blocked":true,"blocked_count":42}'
+    binddir = _stub_python(tmp_path, f"    printf '%s' '{payload}'; exit 0")
+    r = _run(binddir, args=("select", "--field", "blocked_count"))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "42"
+
+
+def test_absent_field_exits_9_and_names_the_available_keys(tmp_path):
+    """A missing field is loud and self-teaching -- never an empty stdout at
+    rc=0, which is the very shape this whole file exists to outlaw."""
+    payload = '[{"goal_id":"g-1-1","score":9.9}]'
+    binddir = _stub_python(tmp_path, f"    printf '%s' '{payload}'; exit 0")
+    r = _run(binddir, args=("select", "--field", "bogus_xyz"))
+    assert r.returncode == 9, (r.returncode, r.stdout, r.stderr)
+    assert r.stdout.strip() == ""
+    assert "goal_id" in r.stderr and "score" in r.stderr
+
+
+def test_field_flag_is_consumed_and_never_forwarded_to_python(tmp_path):
+    """rb-538: multi-layer arg parsers drop or hard-reject unknown flags.
+    goal-selector.py's argparse registers NO options on `select`, so leaking
+    --field through would make the wrapper fail on its own new flag."""
+    # Encode argv INSIDE a valid JSON payload so the extractor can surface it;
+    # a bare "ARGV:..." echo is not JSON and would fail for the wrong reason.
+    binddir = _stub_python(
+        tmp_path, '''    printf '[{"goal_id":"argv2=%s argv3=%s"}]' "$2" "$3"; exit 0''')
+    r = _run(binddir, args=("select", "--field", "goal_id"))
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    # $2 is the subcommand; $3 must be EMPTY -- --field never reached python.
+    assert r.stdout.strip() == "argv2=select argv3="
+
+
+def test_other_args_still_forward_after_the_args_refactor(tmp_path):
+    """The ARGS[@] rewrite must not drop ordinary passthrough argv."""
+    binddir = _stub_python(tmp_path, '    printf "ARGV:%s,%s" "$2" "$3"; exit 0')
+    r = _run(binddir, args=("blocked", "--some-passthrough"))
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "ARGV:blocked,--some-passthrough"
+
+
+def test_trailing_valueless_field_exits_2_and_does_not_hang(tmp_path):
+    """guard-1224: a bare `shift 2` is out-of-range at $#=1, bash does NOT shift,
+    and the `while [ $# -gt 0 ]` loop re-processes the same $1 FOREVER.
+
+    Two independent things keep that unreachable here, and this pins both:
+      1. ORDERING -- the `-z "$FIELD"` check exits 2 BEFORE the shift, so a
+         valueless --field never reaches it. A later edit could reorder that.
+      2. `shift $(( $# >= 2 ? 2 : 1 ))` -- the defensive form, so the safety no
+         longer DEPENDS on (1) holding.
+    Note the failure MODE, because it is not an assertion failure: under bare
+    `shift 2` with the validation moved after it, this hangs. `_run`'s existing
+    subprocess timeout=120 is what converts that hang into a reported error, so
+    this pin depends on that timeout staying non-None -- it is not decoration."""
+    binddir = _stub_python(tmp_path, '    printf "[]"; exit 0')
+    r = _run(binddir, args=("select", "--field"))
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "--field requires a name" in r.stderr
+    assert r.stdout.strip() == ""

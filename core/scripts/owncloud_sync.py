@@ -204,6 +204,33 @@ _EXCLUDE_NAMES = {
     # mirror sits wedged. Measured on cc-02: streak 38 at filing, 797 ~25h
     # later, with its excluded sibling gate-firings.spool.last-flush clean.
     "citation-credit-ledger.last-sweep",
+    # domain-suite ratchet baseline (g-115-8431). SAME SHAPE as the entry
+    # directly above, and the same measured symptom: two boxes rewrite one
+    # shared object, it both-diverges, and the sync conflict-skips it forever.
+    # Streak was 123 consecutive sweeps on cc-07 and 417 on cc-02 at filing.
+    #
+    # WHY MACHINE-LOCAL IS THE RIGHT CLASS HERE, per guard-3018 (read the
+    # CONSUMER, never infer from the name): the only reader/writer in the tree
+    # is core/scripts/domain-suite-gate.py (load_baseline / save_baseline), and
+    # it is a per-box RATCHET -- "the failing set THIS box saw on its previous
+    # run", used so a red that predates the gate cannot refuse a close. Nothing
+    # reads it cross-box, and nothing should: a peer's failing set admitted as
+    # this box's baseline silently mis-gates closes in BOTH directions (admits a
+    # regression the other box already had; blocks on a red this box never saw).
+    # That also rules out the merge-handler cure -- a union would FORMALISE the
+    # cross-box sharing that is the defect, not fix it.
+    #
+    # NOT the guard-3018 hazard class: that warns about SHARED,
+    # authoritative-in-S3 content (any *-archive.jsonl, any append-only store),
+    # where machine-local means one box's appends never reach S3. This file has
+    # no cross-box consumer and no append semantics -- it is a single-record
+    # snapshot rewritten wholesale by whichever box last ran the domain suite.
+    # The archive tripwires in test_eager_pull_exclusion.py are untouched.
+    #
+    # This entry makes domain-suite-gate.py's own scope comment TRUE rather than
+    # redesigning around it: it claimed "on a synced world it stays local",
+    # which was false precisely because nothing excluded the basename here.
+    "domain-suite-baseline.json",
 }
 # Basename glob patterns never synced.
 _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",
@@ -422,12 +449,23 @@ def _is_single_writer_session_file(full, be) -> bool:
     (working-memory.yaml, handoff.yaml, execution-diary.jsonl, ...) authored by
     exactly ONE box — the one running that agent — so they are deliberately NOT
     merge-registered (a UNION of two sessions' private scratch is semantically
-    wrong: it would mix loop_state counters etc.; guard-907). Reaching the
-    both-diverged branch of _sync_one for such a file PROVES this box authored
-    the local change: the sweep's H4a owned-prune (sweep(), ~L1027) never walks a
-    PEER agent's session dir under own-cloud, so a caching box hits the
-    stale-cache PULL branch, never both-diverged, for a file it does not author.
-    Local is therefore authoritative and local-wins is safe.
+    wrong: it would mix loop_state counters etc.; guard-907).
+
+    CLASSIFICATION ONLY — NOT SUFFICIENT FOR LOCAL-WINS ON ITS OWN. Every
+    caller MUST also pass :func:`_claim_held_continuously`; admitting on this
+    predicate alone is the g-306-379 clobber (guard-2851: a file syncable BY
+    CLASSIFICATION can still be unpublishable BY OWNERSHIP, and passing the first
+    gate proves nothing about the second). This docstring used to end "Reaching the both-diverged branch PROVES
+    this box authored the local change", justified by the H4a owned-prune never
+    walking a PEER agent's session dir. g-306-378 measured that argument and
+    found it both mis-stated and incomplete: the prune is keyed on agent dir NAME
+    (`keep = [d for d in keep if d in owned]`), so it separates AGENTS, not
+    BOXES, and what actually bounds the writer to one box is the live DDB claim
+    (`_owned_claims`) — the LEASE, not peer-vs-own. And a lease can MOVE: a box
+    that loses the claim stops pushing within one sweep but KEEPS WRITING its
+    local session files, so after a peer legitimately advances S3 and this box
+    RE-ACQUIRES, both-diverged is reachable with a STALE local file. "PROVES"
+    holds only if the claim never left and came back (g-306-379).
 
     EXCLUDED (keep the conservative clobber-safe skip): merge-registered
     peer-authored stores (handled upstream by _try_merge_put), the world/ + meta/
@@ -465,6 +503,67 @@ def _is_single_writer_session_file(full, be) -> bool:
                     break
         return tier in ("continuity", "ephemeral")
     return False
+
+
+def _claim_held_continuously(full, be, holder_since_by_agent) -> bool:
+    """True iff THIS box has held the owning agent's runner claim CONTINUOUSLY
+    since `full` was last written locally (g-306-379).
+
+    This is the second, INDEPENDENT gate behind LOCAL-WINS. Its sibling
+    :func:`_is_single_writer_session_file` answers a CLASSIFICATION question
+    ("is this file the kind that one box authors?"); this answers an OWNERSHIP-
+    CONTINUITY question ("was this box that one box, without interruption, when
+    the bytes were written?"). Passing the first says nothing about the second
+    — guard-2851 — which is exactly why they are two functions and not one.
+
+    FAILS OPEN on absent data, deliberately, and that is what makes this change
+    safe to ship. `holder_since` is 0/absent on every row that has not changed
+    hands since the field shipped, so at deploy time this refuses NOTHING and the
+    LOCAL-WINS lane behaves byte-for-byte as before — the enumeration
+    guard-1562 demands, run against live state, comes back empty. The gate arms
+    itself at precisely the moment the risk appears: a handover to a different
+    machine is what stamps holder_since (acquire_runner attempt 2), so the very
+    event that creates a stale local file also installs the defense against it.
+
+    It fails CLOSED on an unreadable mtime — there the data exists and we simply
+    cannot prove continuity, so the conservative both-diverged skip is correct.
+
+    NO CROSS-BOX CLOCK SKEW. `holder_since` is stamped by the ACQUIRING box, and
+    a nonzero value is only ever consulted by the box that currently holds the
+    claim — i.e. the box that stamped it. Both sides of the comparison are this
+    machine's own clock.
+
+    KNOWN RESIDUAL: a handover that happened BEFORE this field shipped leaves 0,
+    so a local file stale since then is still eligible for LOCAL-WINS. The first
+    post-deploy handover on a row closes that permanently. Not papered over
+    because the window is real, and bounded by reducer-self-fence.sh's
+    lose-claim-but-keep-working stepdown."""
+    if not holder_since_by_agent:
+        return True                      # no continuity data at all -> fail OPEN
+    roots = getattr(be, "_roots", None)
+    if not roots:
+        return True
+    try:
+        fp = Path(full).resolve()
+    except OSError:
+        return False
+    for root_path, prefix in roots:
+        if prefix != "agents":
+            continue
+        try:
+            rel_parts = fp.relative_to(Path(root_path).resolve()).parts
+        except ValueError:
+            continue
+        if not rel_parts:
+            return True
+        held_since = int(holder_since_by_agent.get(rel_parts[0], 0) or 0)
+        if held_since <= 0:
+            return True                  # legacy row / never handed over -> OPEN
+        try:
+            return fp.stat().st_mtime >= held_since
+        except OSError:
+            return False                 # cannot prove continuity -> skip
+    return True
 
 
 # --- manifest (machine-local mtime cache to skip unchanged files) ----------
@@ -553,18 +652,30 @@ def _save_manifest(m: dict) -> None:
 _OWNERSHIP_STALE_SECONDS_DEFAULT = 3900
 
 
-def _owned_agents_with_provenance(be=None):
+def _owned_claims(be=None):
     """Resolve the agent dirs THIS machine owns for the sweep, from the LIVE DDB
     runner claims — the SAME single-runner claims the cross-machine lock uses
     (lodestar dynamic-ownership design §3). STORAGE_BACKEND is the ONLY signal;
     there is no OWNERSHIP_MODE flag and no MACHINE_OWNED_AGENTS env list.
 
-    Returns:
-      None  — local backend → single machine, own ALL agents (no sync
+    THE ONE IMPLEMENTATION of the ownership rule; `_owned_agents_with_provenance`
+    and `_owned_agents` are projections of it (communication-clarity rule 5), so
+    the ownership set and the tenure map below can never be read from two
+    different claim reads that disagree.
+
+    Returns a 3-tuple `(owned, provenance, holder_since_by_agent)`:
+      owned — None  — local backend → single machine, own ALL agents (no sync
               contention; the periodic sweep pushes every agent dir).
-      set   — own-cloud → the agent names this machine currently holds a fresh
-              RUNNING claim for. May be EMPTY (own none this sweep → no agent
-              dir is pushed, but world/ and meta/ still sync).
+            — set   — own-cloud → the agent names this machine currently holds a
+              fresh RUNNING claim for. May be EMPTY (own none this sweep → no
+              agent dir is pushed, but world/ and meta/ still sync).
+      holder_since_by_agent — {agent: epoch-seconds} for the OWNED agents only,
+              carrying when THIS machine became the continuous holder (g-306-379).
+              0 / absent = UNKNOWN (legacy row) and every consumer fails OPEN on
+              it. Empty dict on the local-backend and conservative-degrade paths,
+              which is the same fail-open value — correct, because those paths
+              own nothing or own all, and in neither case is there an interim
+              peer holder to defend against.
 
     FAIL-SAFE: on ANY DDB / resolution error, OR when this machine's identity is
     unknown, return the EMPTY set (own none) — NEVER own-all. A machine that
@@ -578,7 +689,7 @@ def _owned_agents_with_provenance(be=None):
     claim table, not a local runner-token scan."""
     kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if kind != "own-cloud":
-        return None, "local-backend"
+        return None, "local-backend", {}
     # g-328-20: the diagnosable permission-gap type. Safe to import here — own-cloud
     # mode is confirmed above, so owncloud_backend is importable (get_backend below
     # depends on it, so this import cannot fail where get_backend would succeed).
@@ -590,7 +701,7 @@ def _owned_agents_with_provenance(be=None):
         # (SSOT), so the resolver's 'me' matches the claim's machine_id exactly.
         me = getattr(be_dyn, "machine_id", None)
         if not me or me == "unknown":
-            return set(), "unknown-machine"  # cannot identify this machine → own none (safe)
+            return set(), "unknown-machine", {}  # cannot identify this machine → own none (safe)
         claims = be_dyn.list_runner_claims()
     except OwnCloudPermissionError:
         # g-328-20: a PERSISTENT IAM/permission gap (e.g. the daemon's creds lack
@@ -608,7 +719,7 @@ def _owned_agents_with_provenance(be=None):
               f"({type(exc).__name__}: {exc}); owning NO agent dirs this sweep "
               "(conservative — never own-all, never clobber a peer).",
               file=sys.stderr)
-        return set(), "transient-error"
+        return set(), "transient-error", {}
     # Staleness threshold: env override (call-time, guard-594 calibration) ->
     # the live backend's runner_stale_seconds (SSOT — the SAME value
     # reclaim_if_stale enforces for the lock-break, parsed from the same env
@@ -623,12 +734,48 @@ def _owned_agents_with_provenance(be=None):
     except (TypeError, ValueError):
         stale = _fallback
     now = time.time()
-    return {
-        c.agent for c in claims
-        if c.machine_id == me
-        and c.agent_state == "RUNNING"
-        and (now - c.heartbeat_at) < stale
-    }, "live-claims"
+    mine = [c for c in claims
+            if c.machine_id == me
+            and c.agent_state == "RUNNING"
+            and (now - c.heartbeat_at) < stale]
+    # holder_since is read from the SAME claim list as the owned set, so the two
+    # can never disagree about who holds what (g-306-379). getattr keeps a stub
+    # backend whose RunnerClaim predates the field working — it degrades to 0,
+    # i.e. fail OPEN, which is this feature's designed unknown value.
+    return ({c.agent for c in mine}, "live-claims",
+            {c.agent: int(getattr(c, "holder_since", 0) or 0) for c in mine})
+
+
+def _owned_agents_with_provenance(be=None):
+    """`(owned, provenance)` projection of :func:`_owned_claims` — the
+    long-standing 2-tuple contract its callers use. Kept as a thin delegate so
+    there is exactly ONE implementation of the ownership rule."""
+    owned, provenance, _holder_since = _owned_claims(be=be)
+    return owned, provenance
+
+
+def _holder_since_map(be=None):
+    """{agent: holder_since} for the agents this box owns (g-306-379).
+
+    A projection of :func:`_owned_claims`, so the tenure values are produced by
+    the SAME resolution rule as the ownership set and cannot drift from it.
+
+    Two reads per sweep instead of one is deliberate — preserving the
+    `_owned_agents` seam matters more, and the failure direction is safe: if the
+    claim moves BETWEEN the two reads, this read is the newer one, so
+    holder_since is LATER, more files fall before it, and the extra refusals land
+    on the conservative both-diverged skip. Disagreement can only make the gate
+    stricter, never admit a clobber.
+
+    Fails OPEN to {} on any error. The loud-on-permission-gap contract is not
+    weakened by that: `_owned_agents` above already ran the same resolution this
+    sweep and re-raised OwnCloudPermissionError if it applied, so reaching here
+    means that path was already clear."""
+    try:
+        _owned, _prov, holder_since = _owned_claims(be=be)
+        return holder_since or {}
+    except Exception:  # noqa: BLE001 — advisory input; never fail a sweep on it
+        return {}
 
 
 def _owned_agents(be=None):
@@ -685,6 +832,30 @@ def _manifest_etag(v):
 
 
 # --- backend wiring --------------------------------------------------------
+def _env_local_declares_owncloud():
+    """True iff <PROJECT_ROOT>/.env.local sets STORAGE_BACKEND=own-cloud.
+
+    A deliberate string scan rather than a dotenv parse: this decides only
+    whether to REFUSE a silent no-op, so every failure mode (missing file,
+    unreadable, odd quoting) degrades to False — i.e. to the pre-existing
+    behaviour. Never let this helper be the reason a push path breaks.
+    """
+    try:
+        p = Path(__file__).resolve().parents[2] / ".env.local"
+        if not p.is_file():
+            return False
+        for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == "STORAGE_BACKEND":
+                return v.strip().strip('"').strip("'").lower() == "own-cloud"
+    except Exception:
+        return False
+    return False
+
+
 def _require_owncloud_backend():
     kind = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if kind != "own-cloud":
@@ -870,7 +1041,8 @@ def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
 # --- core: one file --------------------------------------------------------
 def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
               baseline_md5=None, multi_machine: bool = False,
-              own_cloud_authority: bool = False):
+              own_cloud_authority: bool = False,
+              holder_since_by_agent=None):
     """HEAD-compare one governed file and decide push / skip.
 
     Returns the md5 to record as the new baseline (on push or in-sync), or None
@@ -1031,7 +1203,22 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # (single-writer + owned-prune => no peer authored S3), already in
             # local .history; the pre-adopt snapshot is the archive-before-delete
             # receipt (see .claude/rules/archive-before-delete.md).
-            if own_cloud_authority and _is_single_writer_session_file(full, be):
+            # g-306-379: classification alone is not admission — the claim must
+            # also have been held CONTINUOUSLY since the local write, or LOCAL-WINS
+            # can push bytes this box authored while a PEER legitimately held the
+            # claim. Counted, not silent: a gate whose refusals are invisible
+            # cannot be calibrated against the 451-skip wedge it must not re-arm.
+            _lw_classified = (own_cloud_authority
+                              and _is_single_writer_session_file(full, be))
+            _lw_admitted = _lw_classified and _claim_held_continuously(
+                full, be, holder_since_by_agent)
+            if _lw_classified and not _lw_admitted:
+                stats["local_wins_blocked_claim_gap"] = \
+                    stats.get("local_wins_blocked_claim_gap", 0) + 1
+                _sync_print(
+                    "[sync] skip (local-wins withheld: claim changed hands after "
+                    f"this file was written): {full}", file=sys.stderr)
+            if _lw_admitted:
                 if dry_run:
                     stats["local_wins_would_resolve"] = \
                         stats.get("local_wins_would_resolve", 0) + 1
@@ -1234,6 +1421,24 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
     try:
         be.mirror_put(full, local_bytes, expected_version=expected)
         stats["pushed"] += 1
+        # g-115-8155: record WHICH object was pushed, not merely how many.
+        # The `push_paths` append existed ONLY in the `if dry_run:` branch
+        # above, so a real sweep incremented the counter and never touched
+        # the list. Measured over 1415 logged rows: 1137 carried pushed>0
+        # and EVERY ONE carried `push_paths: []`, while ZERO rows ever
+        # carried would_push>0 -- i.e. the only populating branch is
+        # structurally unreachable in production, so the field answered
+        # "which files did this sweep write?" with silence every time.
+        # Bounded exactly like error_paths (_record_error): overflow is
+        # COUNTED via push_paths_truncated, never silently dropped -- a
+        # truncated list that looks complete would reintroduce the same
+        # ambiguity this records away.
+        _pp = stats.setdefault("push_paths", [])
+        if len(_pp) < _PUSH_PATHS_CAP:
+            _pp.append(str(full))
+        else:
+            stats["push_paths_truncated"] = \
+                stats.get("push_paths_truncated", 0) + 1
         return local_md5
     except ConflictError:
         # Concurrent backend write moved the object between our HEAD and PUT —
@@ -1497,6 +1702,8 @@ _SWEEP_LOG_KEEP_BYTES = 1_000_000
 # lines is a FALSE-CLEAN monitor), one level further out: there the detail
 # existed and was unread, here it existed and was not retained.
 _ERROR_PATHS_CAP = 40
+# g-115-8155: same bound, same rationale, for the push lane.
+_PUSH_PATHS_CAP = 40
 
 
 def _record_error(stats: dict, path, exc, *, phase: str) -> None:
@@ -1722,6 +1929,18 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
     manifest = _load_manifest() if use_manifest else {}
     new_manifest = dict(manifest)
     owned = _owned_agents(be=be)   # H4a: agent dirs this machine owns (None=all)
+    # g-306-379: the tenure stamps come from a SEPARATE call, deliberately, and
+    # NOT from a combined `_owned_claims` unpack here. sweep() consulting
+    # `_owned_claims` directly BYPASSES the `_owned_agents` seam that callers and
+    # tests substitute — measured: it silently broke
+    # test_owncloud_sid_carrier_carveout's monkeypatch, which then exercised a
+    # real claim read instead of the injected ownership. Ownership must keep
+    # flowing through the one function everything else overrides.
+    #
+    # Only resolved when this box owns something — on a local backend or a
+    # conservative-degrade sweep there is no interim peer holder to defend
+    # against, and {} is the fail-OPEN value.
+    holder_since_by_agent = _holder_since_map(be=be) if owned else {}
     # H4b/H4c: the flag _sync_one reads as "cannot prove local authority". The
     # periodic sweep NEVER knows per-file authorship (unlike sync_file, which
     # fires right after THIS machine wrote the file). It must therefore DEFER
@@ -1819,7 +2038,8 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                 stale_pulled_before = stats.get("stale_pulled", 0)
                 new_md5 = _sync_one(be, full_path, dry_run=dry_run, stats=stats,
                                     baseline_md5=base_md5, multi_machine=mm,
-                                    own_cloud_authority=own_cloud)
+                                    own_cloud_authority=own_cloud,
+                                    holder_since_by_agent=holder_since_by_agent)
                 # Record {mtime, md5} only when a baseline was confirmed (pushed
                 # or in_sync). Skips/conflicts return None -> keep the old
                 # baseline so the next sweep re-evaluates instead of trusting a
@@ -1870,7 +2090,8 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                 # when it fires right after a local write.
                 _cmd5 = _sync_one(be, _cpath, dry_run=dry_run, stats=stats,
                                   baseline_md5=_cbase_md5, multi_machine=False,
-                                  own_cloud_authority=own_cloud)
+                                  own_cloud_authority=own_cloud,
+                                  holder_since_by_agent=holder_since_by_agent)
                 if _cmd5 is not None:
                     stats["own_carrier_pushed"] = (
                         stats.get("own_carrier_pushed", 0) + 1)
@@ -2935,6 +3156,56 @@ def main() -> int:
     ap.add_argument("--no-manifest", action="store_true",
                     help="do not read or write the mtime manifest")
     args = ap.parse_args()
+
+    # A `--file` push is an explicit "put THIS file in the store" request, so a
+    # no-op is a FAILED request rather than a success. On a box whose .env.local
+    # declares own-cloud, an UNSET STORAGE_BACKEND means this process never
+    # loaded the deployment env — a state indistinguishable from a genuine
+    # local-backend box by `kind` alone, and conflating the two is a
+    # silent-failure generator.
+    #
+    # Measured 2026-08-31 (g-369-80): this exact recipe — printed verbatim by
+    # owncloud-push-on-write.sh's own failure message as the guard-983 manual
+    # recovery — returned rc=0 with ZERO bytes on BOTH stdout and stderr and
+    # pushed nothing, against a file genuinely absent from the store. A silent
+    # command is zero signals, not one (verify-before-assuming rule 4), and the
+    # hook's own comment warns that such an unpushed write "WILL be reverted by
+    # the next no-baseline reconcile" — so the silence loses data rather than
+    # merely deferring it.
+    #
+    # An EXPLICIT STORAGE_BACKEND=local stays a silent no-op: that is the form
+    # guard-955 mandates for every test runner on an own-cloud box, and failing
+    # it would break the suite. Only the UNSET case is refused.
+    # PYTEST_CURRENT_TEST exemption keeps this guard HERMETIC. test_owncloud_sync.py
+    # carries an autouse fixture that DELETES STORAGE_BACKEND for every test in the
+    # file, so the `is None` arm is true throughout it, and `.env.local` is the real
+    # repo's — meaning a future test calling main(["--file", ...]) would pass on a
+    # local-backend box and fail on an own-cloud one. That is the environment-dependent
+    # split this codebase already refuses elsewhere (the same PYTEST_CURRENT_TEST signal
+    # gates the daemon-spawn chokepoints, g-115-3329). Nothing under test needs this
+    # protection: it guards an interactive recovery recipe, not library code.
+    if (args.file
+            and os.environ.get("STORAGE_BACKEND") is None
+            and not os.environ.get("PYTEST_CURRENT_TEST")
+            and _env_local_declares_owncloud()):
+        _sync_print(
+            "[sync] REFUSING --file: STORAGE_BACKEND is unset but .env.local "
+            "declares own-cloud, so this process never loaded the deployment "
+            "env and would push NOTHING while exiting 0.\n"
+            "Preferred fix — use the daemon route, which already carries the "
+            "registry-derived STORAGE_* + MIND_AWS_* context:\n"
+            "  PORT=$(tr -d '[:space:]' < mind_api/state/daemon.port)\n"
+            "  curl -sf -X POST \"http://127.0.0.1:$PORT/v1/admin/"
+            "owncloud-sync-file?path=<urlencoded-absolute-path>\"\n"
+            "  Gate on \"pushed\">=1 AND \"errors\"==0 — that route answers "
+            "\"ok\": true even when it pushed nothing.\n"
+            "Or load the env first, per this module's own docstring:\n"
+            "  set -a; source .env.local; set +a\n"
+            "  source core/scripts/_paths.sh\n"
+            "If a no-op really is intended, pass STORAGE_BACKEND=local "
+            "explicitly (the test-runner form, guard-955).",
+            file=sys.stderr)
+        return 2
 
     be = _require_owncloud_backend()
     if be is None:

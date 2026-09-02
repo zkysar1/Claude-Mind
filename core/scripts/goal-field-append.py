@@ -30,6 +30,16 @@ helpers this codebase already has (wm-append, journal-append,
 evolution-log-append, decision-rules-append, health-ledger-append,
 meta-log-append, mind-append) — of which zero are generic.
 
+CORRECTION (2026-08-31, g-115-8406): that PASSTHROUGH mechanism is FIXED and the
+paragraph above is kept only as the history that produced this script. Measured on
+all four: every one now ends in ``argv_strict_refuse_unknown`` (g-115-4733), so an
+unrecognized flag is REFUSED at exit 2, never swallowed, and no token is promoted
+into the value slot. The transfer hazard that argued against a flag is therefore
+gone in the form described — which is what makes it safe for this script to pass
+the real ``--value-stdin`` flag below. The conclusion still stands on its other
+legs (a distinct name needs no daemon change and matches the eight per-store append
+helpers); only the swallowing mechanism is out of date.
+
 READ-SOURCE SAFETY (guard-1251 / guard-1912)
 Those guardrails say never RMW a goal field from ``aspirations-query.sh``,
 because its projection omits large text fields and an append onto an empty read
@@ -334,11 +344,21 @@ def main(argv=None) -> int:
              "lost. Re-run the identical command: the fresh read picks up their text and "
              "the marker keeps the retry idempotent (g-115-5638).")
 
-    # WRITE — positionally, no flags in the value slot (guard-1047 / guard-2460).
+    # WRITE — the value goes on STDIN, never argv (). Passing it
+    # positionally bounded the field at the OS command-line limit: Windows
+    # CreateProcess caps the COMPOSED total at ~32,767 chars (guard-5634), so once a
+    # progress_note crossed that it became permanently unwritable from every Windows
+    # box — WinError 206, and no smaller append helps, because the whole value is
+    # re-sent on every append. Measured on  at 32,152 chars: a 2.6k and a 4.6k
+    # append failed identically.
+    # This SUBSUMES the guard-1047 / guard-2460 concern the old positional form managed
+    # by ordering — a value beginning with '-' cannot be read as a flag when it is not
+    # in argv at all — and sidesteps guard-5633 (Windows argv silently truncates on an
+    # embedded double quote), which composed prose can trip at any length.
     res = _run(bash_cmd(
         SCRIPTS / "aspirations-update-goal.sh",
-        "--source", args.source, args.goal_id, args.field, new,
-    ))
+        "--source", args.source, "--value-stdin", args.goal_id, args.field,
+    ), input=new)
     if res.returncode != 0:
         _die(RC_WRITE_FAILED, f"write failed (rc={res.returncode}): {res.stderr.strip()[:600]}")
 

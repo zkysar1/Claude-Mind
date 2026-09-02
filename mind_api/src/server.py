@@ -29,6 +29,26 @@ from .agent_paths import AgentPathResolver, AgentPaths
 from .endpoints import load_all
 
 
+def _log_internal_error(method: str, path: str) -> None:
+    """Log the FULL traceback of the current exception server-side ().
+
+    Called from the request handler's catch-all immediately before it builds
+    the sanitized 500 ``internal_error`` response. The client gets one
+    exception line and, until this landed, NOTHING was recorded anywhere
+    server-side — a live scoring TypeError on a peer deployment left no trace
+    in any daemon log, turning a one-look diagnosis into archaeology. stderr
+    is the daemon's fd-attached spawn.log, so this lands there. Must never
+    raise (best-effort logging inside an error path).
+    """
+    try:
+        import traceback
+        sys.stderr.write("[server] internal_error on %s %s\n%s"
+                         % (method, path, traceback.format_exc()))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 # --- Request body normalization --------------------------------------------
 
 def _normalize_request_body(raw: bytes) -> bytes:
@@ -417,6 +437,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # : no repr(e) — repr of a UnicodeError embeds the
                 # whole failed payload and re-triggers the surrogate cascade
                 # (empty body).
+                _log_internal_error(method, getattr(self, "path", "?"))
                 detail = type(e).__name__ + ": " + str(e)[:200]
                 resp = Response.error(500, "internal_error", detail)
             try:

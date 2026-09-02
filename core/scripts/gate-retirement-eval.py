@@ -205,6 +205,18 @@ def _load_firings(since):
         except Exception:
             skipped += 1
             continue
+        # A line can PARSE and still not be a record: a bare int/list/str is
+        # valid JSON, so json.loads does not raise and the next .get() dies with
+        # AttributeError. Measured 2026-08-30: meta/gate-firings-2026-08-19.jsonl
+        # line 1 is `7`, and it had taken BOTH gate-telemetry tools down since
+        # 2026-08-19 — this prescriptive evaluator and the descriptive
+        # gate-stats.py dashboard — while override-ledger-consume.py's twin
+        # loader was hardened on 08-29 and the fix was not swept to either
+        # (guard-1710 class). guard-1512 is the general form: one malformed
+        # record must never abort a whole-store walk.
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             skipped += 1

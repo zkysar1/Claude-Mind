@@ -903,21 +903,14 @@ drive to explore and discover, not just maintain and fix.
 # recomputes it and nothing in this block said it was known. That is why the
 # note lives HERE and not only in the goals (guard-1984: a guardrail cannot
 # outvote the instrument it guards; guard-2177: coverage-check before filing).
-# S4b below is the same family (g-115-3853, g-115-4537) — and it is NO LONGER an
-# unmeasured pointer. MEASURED 2026-08-14 (echo, hostname cc-03, uname -r
-# 6.8.0-137-generic): `reasoning-bank-read.sh --recent 10` returned rb-7801..7810
-# and **10 of 10 carry times_helpful == 0**, so the `< 2` predicate admits the
-# entire sample — the same non-discriminating signature as S1 / S2a(93%) /
-# S2b(96%) / S4a(88%). The cause is structural and g-115-3853's title already
-# states it exactly ("samples by recency, then scores with a metric recency
-# suppresses by construction"): every entry in the sample was created within ~24h,
-# so none has had an OPPORTUNITY to be used, and a low use-count measures age
-# rather than transferability. The predicate has no age floor.
-# So an S4b fire is a CONFOUND like S4a's. Report it as an observation, route
-# nothing to S5, and file nothing — g-115-3853 (pending) and g-115-3246
-# (in-progress, names "S4b recency-not-transfer" verbatim) both own it, and
-# g-115-4840 is open to COLLAPSE the S4a/S4b duplicate pile. Attach a fresh
-# measurement to those rather than opening #7.
+# S4b WAS the same family — RECALIBRATED 2026-08-30 (g-115-3853), so unlike S4a
+# above an S4b fire is now a FINDING, not a confound. Both the old predicate and
+# the remedy the goal preferred admit ~100% of the corpus; the SAMPLE, not the
+# metric, was the load-bearing half. Do not re-derive this or re-widen the
+# window — the measurement is written up once, here:
+# Rationale (WHY category sampling + utilization_score_v2): core/config/rationale/s4b-cross-pollination-recalibration.md
+# g-115-3246 / g-115-4537 / g-115-4840 still own the S4a half and the duplicate
+# pile; this note retires only the S4b limb of it.
 explored_cats = set(categories.keys())  # from S3
 all_L2_cats = set(node.key for node in node_list if node.depth <= 2)
 unexplored = all_L2_cats - explored_cats
@@ -927,20 +920,24 @@ IF unexplored:
     # vocabulary mismatch above stands.
     Output: ">> S4a (CONFOUND, owned by g-115-3246/4600/5435): {len(unexplored)}/{len(all_L2_cats)} L2 keys absent from goal-category strings — disjoint vocabularies, not unexplored territory. Not routed to S5."
 
-# S4b: Cross-pollination opportunities
-# Look for recent reasoning bank insights from one category that
-# might apply to other categories -- transfer learning opportunities.
-Bash: reasoning-bank-read.sh --recent 10
-recent_insights = parse result
-FOR EACH insight in recent_insights:
-    IF insight.category != max_cat AND insight.utilization.times_helpful < 2:
-        signals.append({
-            type: "cross_pollination",
-            description: "Insight '{insight.title}' from {insight.category} may transfer to other domains -- used only {insight.utilization.times_helpful} times",
-            severity: "LOW",
-            insight_id: insight.id
-        })
-        break  # One cross-pollination signal per scan is enough
+# S4b: Cross-pollination opportunities  (RECALIBRATED g-115-3853 — see above)
+# An entry RETRIEVED many times but credited helpful almost never is the real
+# transfer candidate: it keeps surfacing and keeps not paying off HERE. Pick
+# `cat` = any category OTHER than max_cat; category is independent of age and
+# of utilization, so the sample is no longer chosen by the variable scored.
+# Thresholds and the pure core live in the script; `scanned` is the control.
+Bash: py -3 core/scripts/scan-cross-pollination.py --category {cat}
+result = parse the JSON
+IF result.top is not None:
+    signals.append({
+        type: "cross_pollination",
+        description: "Insight {result.top.id} from {cat}: retrieved {result.top.retrieval_count}x, scores {result.top.v2} on utilization_score_v2 -- retrieved often, credited rarely, so its value may lie in another domain ({result.candidates}/{result.mature} mature qualify)",
+        severity: "LOW",
+        insight_id: result.top.id
+    })
+ELSE:
+    # A real negative, not a broken detector: mature == 0 means too young to score.
+    Output: ">> S4b: no cross-pollination candidate in {cat} ({result.mature} mature entries scored, 0 qualified)"
 ```
 
 ## Phase S4.5: Silent-Gap / Orphaned-Asset Audit (g-318-11)

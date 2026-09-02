@@ -1491,5 +1491,160 @@ def test_live_boxes_exposes_machine_ids_without_changing_its_return_shape(monkey
 
 
 
+# ── ITEM A: the drift record names WHICH ARM produced its value () ──
+#
+# The unit tests here are the additive half the ITEM B hoist bought. The four
+# end-to-end tests above deliberately still go through the whole compare path —
+# they are what catches a WIRING break, which no unit test can see (guard-1943),
+# so these are a supplement and never a replacement.
+
+
+def test_daemon_lane_reports_the_logline_arm():
+    got, arm = fcp._daemon_lane(
+        {"daemon_logline_readable": "yes", "logline_STORAGE_BACKEND": "own-cloud",
+         "resolved_STORAGE_BACKEND": "unset"}, "STORAGE_BACKEND")
+    assert (got, arm) == ("own-cloud", "logline")
+
+
+def test_unset_normalisation_is_still_the_logline_arm():
+    """"<unset->local>" is the daemon SAYING local, not a fall-through. Labelling
+    it "resolved" would send a reader hunting a stale environ field for a value the
+    daemon actually declared."""
+    got, arm = fcp._daemon_lane(
+        {"daemon_logline_readable": "yes",
+         "logline_STORAGE_BACKEND": "<unset->local>"}, "STORAGE_BACKEND")
+    assert (got, arm) == ("local", "logline")
+
+
+def test_the_two_resolved_arms_are_DISTINGUISHABLE():
+    """THE point of ITEM A, and the reason a two-value label was not enough.
+
+    Both cases fall through to the /proc environ read and both would have been
+    labelled "resolved" by the obvious design. They have OPPOSITE remedies:
+      - logline READ but silent on this key  -> the daemon predates the emitter;
+        restart THAT NODE and it self-heals.
+      - logline not readable at all          -> a node-level read problem; the key
+        is a red herring and chasing it wastes the iteration.
+    A single "resolved" label is accurate for both and actionable for neither.
+    """
+    silent, silent_arm = fcp._daemon_lane(
+        {"daemon_logline_readable": "yes", "resolved_MACHINE_ID": "cc-09"},
+        "MACHINE_ID")
+    nolog, nolog_arm = fcp._daemon_lane(
+        {"daemon_logline_readable": "no", "resolved_MACHINE_ID": "cc-09"},
+        "MACHINE_ID")
+    assert silent == nolog == "cc-09", "both arms must still return the SAME value"
+    assert silent_arm == "resolved-silent"
+    assert nolog_arm == "resolved-nolog"
+    assert silent_arm != nolog_arm, (
+        "the two fall-through cases MUST be distinguishable — collapsing them is "
+        "exactly the defect ITEM A was carved out to fix"
+    )
+
+
+def test_drift_record_names_its_arm_in_BOTH_directions():
+    """VERIFY (1): both arm values appear across the two constructed cases.
+
+    Asserting only the logline case would pass against a hardcoded `arm="logline"`,
+    so the resolved case is the control that rules that out (guard-385 shape)."""
+    from_logline = _real(_logline(logline_STORAGE_BACKEND="local",
+                                  cli_STORAGE_BACKEND="local"))
+    assert any("[arm=logline]" in d for d in from_logline), (
+        "a value taken from the startup logline must say so: %r" % (from_logline,))
+
+    from_environ = _real(_healthy(daemon_logline_readable="no",
+                                  resolved_STORAGE_BACKEND="local",
+                                  cli_STORAGE_BACKEND="local"))
+    assert any("[arm=resolved-nolog]" in d for d in from_environ), (
+        "a value that fell through to the environ read must say which fall-through "
+        "it was: %r" % (from_environ,))
+    assert not any("[arm=logline]" in d for d in from_environ), (
+        "the arm must be MEASURED per record, not stamped constant"
+    )
+
+
+def test_machine_id_resolved_json_field_now_prefers_the_logline():
+    """The published field used to contradict the verdict: nodes printed
+    `machine_id_resolved: unset` while PASSING, because the verdict read the
+    logline arm and this field read raw environ. It is now the value the verdict
+    used, and `machine_id_arm` says which arm that was."""
+    fields = _healthy(daemon_logline_readable="yes", logline_MACHINE_ID="test-box",
+                      resolved_MACHINE_ID="unset")
+    assert fcp._daemon_lane(fields, "MACHINE_ID") == ("test-box", "logline")
+    src_text = (CORE_SCRIPTS / "fleet_config_parity.py").read_text(encoding="utf-8")
+    assert '"machine_id_resolved": _daemon_lane(fields, "MACHINE_ID")[0],' in src_text, (
+        "machine_id_resolved must report the value the VERDICT used, not raw environ"
+    )
+    assert '"machine_id_arm":' in src_text
+
+
+# ── ITEM C: pin the EMITTER contract (, from zeta's sq-019 spark) ───
+#
+# The logline path is: daemon emitter -> collector sed -> _daemon_lane. The
+# CONSUMER half is well covered here; the PRODUCER half had ZERO assertions, so a
+# later edit to the emitter could silently reintroduce the every-node false
+# positive  fixed, with a fully green suite. Silent, because an empty sed
+# capture is indistinguishable from a daemon that genuinely lacks the value.
+
+def _emitter_logline() -> str:
+    """The emitted startup-logline expression, as source text."""
+    # CORE_SCRIPTS is core/scripts, so the repo root is TWO parents up.
+    main_py = CORE_SCRIPTS.parent.parent / "mind_api" / "src" / "__main__.py"
+    assert main_py.is_file(), "daemon entrypoint not found at %s" % main_py
+    text = main_py.read_text(encoding="utf-8")
+    anchor = '"[runtime] resolved STORAGE_BACKEND="'
+    # Fail with a NAMED reason. A bare .index() raises ValueError, and an
+    # exception in a shared helper makes every test below it red for a reason
+    # that has nothing to do with what they assert — measured while
+    # mutation-proving this file (): a mutant that edited the anchor
+    # turned BOTH emitter tests red and neither red meant what it looked like.
+    assert anchor in text, (
+        "the startup-logline prefix %s is gone from %s — these emitter tests "
+        "cannot locate the block, so their result says nothing about ordering "
+        "or key presence. Re-anchor this helper before reading them."
+        % (anchor, main_py.name)
+    )
+    start = text.index(anchor)
+    end = text.index("file=sys.stderr", start)
+    return text[start:end]
+
+
+def test_emitter_declares_all_three_audited_keys():
+    """MACHINE_ID is the third member of the exact set rt_spawn scrubs. Dropping it
+    from the logline sends the checker back to the /proc environ read, which is
+    absent on every autospawned daemon — the false positive that cost two HIGH
+    Investigate goals against a healthy node."""
+    block = _emitter_logline()
+    for key in ("STORAGE_BACKEND=", "ENVIRONMENT_ID=", "MACHINE_ID="):
+        assert key in block, (
+            "the startup logline no longer declares %s; fleet-config-parity's "
+            "logline arm for that key goes permanently silent and every node "
+            "false-positives" % key
+        )
+
+
+def test_emitter_orders_machine_id_AFTER_environment_id():
+    r"""ORDERING IS LOAD-BEARING and non-obvious. The collector's ENVIRONMENT_ID sed
+    is `.*ENVIRONMENT_ID=\([^ ]*\)` — greedy `.*`, so it takes the LAST match on
+    the line. APPENDING after it is safe; PREPENDING MACHINE_ID would change which
+    token that greedy prefix consumes. Nothing pinned this before."""
+    block = _emitter_logline()
+    assert block.index("ENVIRONMENT_ID=") < block.index("MACHINE_ID="), (
+        "MACHINE_ID= must stay AFTER ENVIRONMENT_ID= in the startup logline — "
+        "moving it ahead changes what the greedy ENVIRONMENT_ID sed captures"
+    )
+
+
+def test_collector_extracts_every_key_the_emitter_declares():
+    """The two halves must not drift apart: a key emitted but never extracted is
+    dead weight, and a key extracted but never emitted is the g-115-5433 defect
+    verbatim. Pinning both sides here keeps them in one place."""
+    template = (CORE_SCRIPTS / "fleet_config_parity.py").read_text(encoding="utf-8")
+    for key in ("STORAGE_BACKEND", "ENVIRONMENT_ID", "MACHINE_ID"):
+        assert "say logline_%s " % key in template, (
+            "the collector no longer extracts logline_%s, so _daemon_lane's "
+            "logline arm for it can never fire" % key
+        )
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

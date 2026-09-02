@@ -109,6 +109,12 @@ _refscan = _load_ref_scan()
 # domain wrappers that read the same keys.
 _EXTRA_REPO_GLOBS = ("mind_api/**/*",)
 
+# A SMELL threshold, not a correctness boundary (g-115-3982). _REPO_GLOBS in
+# goal-reference-scan is hardcoded to the two FRAMEWORK prefixes, so aiming this
+# tool at a repo without them walks almost nothing. Any real corpus is in the
+# hundreds; single digits means the scan was MISAIMED, not that the key is absent.
+_MISAIMED_CORPUS_MAX = 10
+
 
 def _iter_census_targets(project_root: Path, extra_roots):
     """goal-reference-scan's targets plus mind_api, de-duplicated."""
@@ -195,7 +201,8 @@ def classify(line: str, key: str) -> str:
     return "MENTION"
 
 
-def census(keys, project_root=None, include_narration=False, scope=None):
+def census(keys, project_root=None, include_narration=False, scope=None,
+           stats_out=None):
     """Census `keys`, optionally restricted to files that also mention `scope`.
 
     WHY --scope IS EFFECTIVELY REQUIRED FOR GENERIC KEYS. A census is always
@@ -232,9 +239,18 @@ def census(keys, project_root=None, include_narration=False, scope=None):
 
     rows = []
     unreadable = 0
+    # CORPUS ACCOUNTING (g-115-3982). The `unreadable` counter below already
+    # embodies the principle -- "a dropped file is exactly the thing a reader
+    # must know about" -- but it was never applied to the corpus SIZE, so a
+    # scan of an EMPTY corpus and a scan that genuinely found nothing printed
+    # the identical no-hit line. Measured on a product repo: files_walked=1
+    # against 3898 for the framework, reported as "no live hits".
+    walked = narration_skipped = scope_skipped = scanned = 0
     for p, rel in _iter_census_targets(base, extra_roots):
+        walked += 1
         narration = _refscan.is_historical(p, rel)
         if narration and not include_narration:
+            narration_skipped += 1
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -247,7 +263,9 @@ def census(keys, project_root=None, include_narration=False, scope=None):
             unreadable += 1
             continue
         if scope and scope not in text:
+            scope_skipped += 1
             continue
+        scanned += 1
         if not any(k in text for k in keys):
             continue
         for i, line in enumerate(text.splitlines(), 1):
@@ -265,6 +283,14 @@ def census(keys, project_root=None, include_narration=False, scope=None):
         print(f"key-consumer-census: WARNING — {unreadable} file(s) were "
               "unreadable and are ABSENT from this census. The result is a "
               "lower bound, not a complete enumeration.", file=sys.stderr)
+    if stats_out is not None:
+        stats_out.update({
+            "files_walked": walked,
+            "files_scanned": scanned,
+            "narration_skipped": narration_skipped,
+            "scope_skipped": scope_skipped,
+            "unreadable": unreadable,
+        })
     return rows
 
 
@@ -329,15 +355,33 @@ def main() -> int:
     ap.add_argument("--project-root", help="Override PROJECT_ROOT (tests).")
     args = ap.parse_args()
 
+    stats = {}
     rows = census(args.keys, project_root=args.project_root,
-                  include_narration=args.include_narration, scope=args.scope)
+                  include_narration=args.include_narration, scope=args.scope,
+                  stats_out=stats)
+    walked = stats.get("files_walked", 0)
+    # Printed on EVERY exit path, hits or none. guard-2298: a count is only
+    # readable beside the size of the population it was drawn from.
+    corpus = (f"  corpus: {walked} file(s) walked, {stats.get('files_scanned', 0)} scanned"
+              f" ({stats.get('narration_skipped', 0)} narration,"
+              f" {stats.get('scope_skipped', 0)} out-of-scope,"
+              f" {stats.get('unreadable', 0)} unreadable)")
+    misaimed = (f"key-consumer-census: WARNING — only {walked} file(s) were walked. "
+                "That is a MISAIMED SCAN, not an absence: this tool's repo globs are "
+                "hardcoded to the framework prefixes (core/, .claude/), so pointing it "
+                "at a repo without them yields an empty corpus. Do NOT read the result "
+                "below as evidence about the key.")
 
     if args.json:
-        print(json.dumps({"keys": args.keys, "count": len(rows), "rows": rows}, indent=1))
+        print(json.dumps({"keys": args.keys, "count": len(rows),
+                          "corpus": stats, "rows": rows}, indent=1))
         return 0
 
     if not rows:
+        if walked <= _MISAIMED_CORPUS_MAX:
+            print(misaimed, file=sys.stderr)
         print(f"key-consumer-census: no live hits for {args.keys}.")
+        print(corpus)
         print("  NOT proof of absence — narration is excluded by default "
               "(--include-narration), and a key referenced only via a variable "
               "is invisible to a literal scan. Verify before concluding "
@@ -351,6 +395,9 @@ def main() -> int:
                      if any("READ" in r for r in ks.values()))
 
     print(f"=== key-consumer census: {', '.join(args.keys)} ===")
+    if walked <= _MISAIMED_CORPUS_MAX:
+        print(misaimed, file=sys.stderr)
+    print(corpus)
     print(f"{len(rows)} live hits across {len(table)} files "
           f"({len(writers)} with writes, {len(readers)} with reads)\n")
 

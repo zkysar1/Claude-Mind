@@ -313,6 +313,16 @@ W3. **Invoke worker loop**:
     State stays RUNNING under the Reducer's SID — this worker does NOT set
     agent-state, agent-mode, or persona-active.)
 
+**IF output is `absent`** → INERT (g-357-51; rationale: start-recovery-ceremony.md).
+Do NOT walk the inline conditions below — ask the canonical gate, which admits
+absence only beside a positive death signal and vetoes on life evidence:
+
+Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-dead-check.sh; echo "rdc_rc=$?"`
+
+**IF rdc_rc == 0** → **AUTO-RECOVER** (block below); else → live runner: print
+the helper's stderr + the heartbeat=fresh message, then proceed to the
+**Worker Body Activation Sequence**. No state changes.
+
 **IF output is `stale`** → probe condition 2.5:
 
 Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-recent-block.sh <agent-name>; echo "recent_block_rc=$?"`
@@ -329,7 +339,17 @@ Bash: `MIND_AGENT=<agent-name> bash core/scripts/background-jobs.sh has-pending;
 
 
 **IF stop_req_rc == 1 AND bg_jobs_rc == 1** (no stop-requested + no registered
-background jobs; recent_block_rc == 1 already verified above) → **AUTO-RECOVER**
+background jobs; recent_block_rc == 1 already verified above) → run the
+canonical gate ONCE more before touching state (g-357-51: its pre-kill re-check
+vetoes on life evidence — a provider rate-limit backoff makes every inline
+condition above true on a LIVE loop):
+
+Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-dead-check.sh; echo "rdc_rc=$?"`
+
+**IF rdc_rc != 0** → DO NOT auto-recover: print its `[5]` line + the "live
+runner detected" message, then the **Worker Body Activation Sequence**.
+
+**IF rdc_rc == 0** → **AUTO-RECOVER**
 (zombie confirmed, scenario 2). Same cleanup as Step 0.7's explicit `--recover`
 branch and as recovery-gate.sh's `_perform_recovery`.
 # Rationale (WHY state-set-first ordering): core/config/rationale/start-recovery-ceremony.md
@@ -343,32 +363,17 @@ branch and as recovery-gate.sh's `_perform_recovery`.
    Manifest-clear was SKIPPED to avoid half-recovered zombie. Investigate
    agents/<agent-name>/session/agent-state directly before retrying." DONE.
 
-  **Session-telemetry crash close (WP5, 2026-06-03).** This branch auto-recovers
-  a crashed prior runner — the SAME event recovery-gate.sh handles via its
-  SessionStart hook (WP4), but here it is LLM-orchestrated at /start time. The
-  crashed runner's SID is still in `running-session-id` (manifest-clear below
-  has not run yet), so finalize its durable telemetry record now with
-  status=crashed, ended_reason=recovery-gate. MUST run BEFORE manifest-clear
-  (which deletes running-session-id). write_crash forces goals_completed=-1
-  (the crashed runner's outcome is unknown). Fire-and-forget (|| true) — a
-  telemetry failure must NEVER abort recovery. guard-165: SID/agent via ENV,
-  python source single-quoted. `py -3` (Bash-tool context — NOT a sourced .sh,
-  so the Microsoft-Store-stub rule applies). Only when a crashed SID is present.
+  **Session-telemetry crash close (WP5)** — BEFORE manifest-clear deletes `running-session-id`.
+  # Rationale (WHY crash-close before manifest-clear): core/config/rationale/start-recovery-ceremony.md
   Bash: `RECSID=$(cat "agents/<agent-name>/session/running-session-id" 2>/dev/null | tr -d '\r\n'); [ -n "$RECSID" ] && TSID="$RECSID" TAGENT="<agent-name>" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_crash; write_crash(sid=os.environ["TSID"], agent=os.environ["TAGENT"])' >/dev/null 2>&1 || true`
 
   Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh release --agent <agent-name> || true`
   DDB claim release with the crashed session's OLD on-disk runner-token —
-  same rationale as Step 0.7 (2026-07-07 bravo dual-runner follow-through):
-  a crashed runner's DDB row stays RUNNING, and without this release the
-  fresh acquire below is blocked by its OWN stale row for up to
-  OWNERSHIP_STALE_SECONDS (~65 min). MUST run BEFORE manifest-clear
-  (`runner-token` is `recovery_action: clear`). Token-conditional +
-  idempotent — a peer's re-claimed row has a different token, so this can
-  never steal a peer's claim. Fail-open.
+  same rationale, guarantees and ordering as Step 0.7: MUST run BEFORE
+  manifest-clear (`runner-token` is `recovery_action: clear`). Fail-open.
 
   Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-manifest-clear.sh`
-  Runs AFTER state-set IDLE succeeded; cleanup window now shows
-  state=IDLE + sid present (mirrors aspirations-graceful-stop D1→D6).
+  Runs AFTER state-set IDLE succeeded (mirrors aspirations-graceful-stop D1→D6).
 
 # Rationale: core/config/rationale/start-observer-and-worker-activation.md — On success, output
 

@@ -1918,3 +1918,89 @@ def test_behind_undeterminable_is_distinguishable_from_current(tmp_path, monkeyp
     # can never confuse "absent key" with "nothing undeterminable".
     empty = M._scan_product_repos("g-000-00", "", [], [], 1, 99)
     assert "behind_undeterminable" in empty
+
+
+# ── Pre-claim supersession probe () ────────────────────────────
+# Pins the PURE pair: id extraction from verification/skill, and the
+# already-terminal classification. The daemon read that joins them is impure
+# and fail-open by contract, so it is deliberately not driven here — same
+# split the rest of this file uses.
+#
+# Lineage:  (2026-08-02) — a hypothesis-resolution goal claimed and
+# executed in full while its pipeline record was ALREADY stage=resolved with a
+# non-null outcome, two days earlier, by a partner. rb-6366.
+
+
+def test_extract_referenced_ids_from_verification_checks():
+    """Ids in verification.checks[] are found, de-duplicated and kinded."""
+    v = {"checks": [
+        "pipeline record 2026-07-29_ci-principal-cannot-read-commons has a "
+        "non-null outcome",
+        "guard-147 is cited and g-115-4561 is closed",
+    ]}
+    got = M.extract_referenced_record_ids(v)
+    by_id = {e["id"]: e["kind"] for e in got}
+    assert by_id["2026-07-29_ci-principal-cannot-read-commons"] == "pipeline"
+    assert by_id["guard-147"] == "entry"
+    assert by_id["g-115-4561"] == "goal"
+
+
+def test_extract_referenced_ids_ignores_description_free_text():
+    """SCOPE: only verification + skill are scanned, never the description."""
+    assert M.extract_referenced_record_ids(None) == []
+    assert M.extract_referenced_record_ids({}) == []
+    # skill IS in scope
+    got = M.extract_referenced_record_ids(
+        None, skill="/review-hypotheses --hypothesis 2026-07-29_some-claim")
+    assert [e["id"] for e in got] == ["2026-07-29_some-claim"]
+
+
+def test_extract_referenced_ids_open_ended_width():
+    """guard-1161: ids past the current digit count must still match."""
+    v = {"checks": ["rb-6366 and rb-1234567 and g-115-99999 all resolve"]}
+    ids = {e["id"] for e in M.extract_referenced_record_ids(v)}
+    assert "rb-1234567" in ids
+    assert "g-115-99999" in ids
+
+
+def test_advisory_fires_on_already_resolved_pipeline_record():
+    """CHECK 1: a named pipeline record at stage=resolved with a non-null
+    outcome is classified terminal — the g-335-393 case."""
+    verdict = M.classify_referenced_record(
+        "pipeline", {"stage": "resolved", "outcome": "CONFIRMED"})
+    assert verdict["terminal"] is True
+    assert "resolved" in verdict["reason"]
+
+
+def test_no_advisory_on_unresolved_referenced_record():
+    """CHECK 2: no false positive. An active record, and — the case that
+    actually bites — a record at stage=resolved whose outcome is still null
+    because a partner is mid-resolution (guard-1433: `outcome` is a
+    three-state field and must not be read with bare truthiness)."""
+    assert M.classify_referenced_record(
+        "pipeline", {"stage": "active", "outcome": None})["terminal"] is False
+    assert M.classify_referenced_record(
+        "pipeline", {"stage": "resolved", "outcome": None})["terminal"] is False
+    assert M.classify_referenced_record(
+        "pipeline", {"stage": "resolved"})["terminal"] is False
+    # blocked is WAITING, not terminal — claiming it is legitimate
+    assert M.classify_referenced_record(
+        "goal", {"status": "blocked"})["terminal"] is False
+
+
+def test_terminal_goal_and_entry_statuses():
+    for st in ("completed", "skipped", "superseded"):
+        assert M.classify_referenced_record(
+            "goal", {"status": st})["terminal"] is True
+    assert M.classify_referenced_record(
+        "entry", {"status": "retired"})["terminal"] is True
+    assert M.classify_referenced_record(
+        "entry", {"status": "active"})["terminal"] is False
+
+
+def test_unreadable_record_is_never_terminal():
+    """Fail-open: absence of evidence must never fire the advisory."""
+    for bad in (None, "", [], 0):
+        assert M.classify_referenced_record("pipeline", bad)["terminal"] is False
+    assert M.classify_referenced_record(
+        "nonsense-kind", {"status": "completed"})["terminal"] is False

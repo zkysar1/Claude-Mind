@@ -347,6 +347,32 @@ class TestMainEntrypoint(unittest.TestCase):
 
     def setUp(self):
         self.mod = _load_recommender()
+        # : the banner path acquires the REAL
+        # {WORLD_DIR}/.locks/pytest-suite.lock, so ANY other recommender
+        # invocation on this box diverts main() into the SKIP branch and
+        # reddens a test that is about banner CONTENT. Measured holders:
+        # an agent's iteration-close / aspirations-execute call, a hand run,
+        # and mutation-proof-test.sh's own pytest runs — in every observed
+        # case the holder pid was already DEAD and the red was the 300s
+        # stale window, so a CRASHED prior run reproduces it too.
+        # Redirect the lock to a tmpdir: the acquire/emit/release path still
+        # runs for real, only its location moves (guard-2626 — redirect the
+        # store, do not mock the gate away; guard-5074 — mock as a function
+        # over real state, not a constant). This also stops the test being a
+        # PRODUCER of stale world locks for whoever reads next.
+        self.tmpdir = tempfile.mkdtemp(prefix="fsr-main-test-")
+        self.lock_path = Path(self.tmpdir) / "pytest-suite.lock"
+
+    def tearDown(self):
+        # Ensure no orphan lock left behind across tests
+        try:
+            self.lock_path.unlink()
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(self.tmpdir)
+        except OSError:
+            pass
 
     def test_routine_outcome_skips(self):
         """Routine outcome class triggers quiet skip with breadcrumb."""
@@ -383,6 +409,8 @@ class TestMainEntrypoint(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.object(self.mod, "_git_changed_paths") as mock_git, \
              mock.patch.object(self.mod, "_agent_write_paths", return_value=[]), \
+             mock.patch.object(self.mod, "_pytest_lock_path",
+                                return_value=self.lock_path), \
              mock.patch("sys.stdout", buf), \
              mock.patch("sys.argv", ["x", "g-test", "--outcome-class", "deep"]):
             mock_git.return_value = ["core/scripts/foo.py"]

@@ -158,7 +158,10 @@ def test_complete_unfinished_goals_blocked(running_daemon):
 
 
 def test_complete_force_bypasses_guards(running_daemon):
-    """force=true skips both recurring and unfinished guards."""
+    """force=true skips the unfinished guard; the live recurring goal is
+    RE-HOMED into the live container rather than archived (g-357-31 — an
+    archived recurring goal is unreachable by the selector, so force may
+    never strand one; with no live container the archive is refused)."""
     project_root, port = running_daemon
     world = project_root / "world"
     asp = {
@@ -172,13 +175,23 @@ def test_complete_force_bypasses_guards(running_daemon):
         ],
         "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 1},
     }
-    _seed_aspiration(world, asp)
+    container = {
+        "id": "asp-002", "title": "Recurring home", "status": "active",
+        "priority": "LOW", "archived": False, "recurring_home": True,
+        "goals": [],
+        "progress": {"completed_goals": 0, "total_goals": 0, "recurring_goals": 0},
+    }
+    _seed_two_aspirations(world, asp, container)
 
     status, body = _post(port, "/v1/aspirations/complete",
                          {"asp_id": "asp-001", "force": "true"})
     assert status == 200, f"Expected 200, got {status}: {body}"
     resp = json.loads(body)
     assert resp["aspiration"]["status"] == "completed"
+    live = [json.loads(l) for l in (world / "aspirations.jsonl").read_text(
+        encoding="utf-8").splitlines() if l.strip()]
+    home = next(a for a in live if a["id"] == "asp-002")
+    assert [g["id"] for g in home["goals"]] == ["g-001-01"], home["goals"]
 
 
 def test_complete_not_found(running_daemon):

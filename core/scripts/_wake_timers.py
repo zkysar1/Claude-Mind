@@ -74,7 +74,10 @@ def _goal_wake_time(goal, now):
     # status=blocked, foxtrot, yet a vestigial defer fired a 4.4d-past wake). Same
     # status-gated lingering-field class as the blocker/abstention lanes below.
     #  (guard-1389).
-    if goal.get("defer_reason") and status == "pending":
+    # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+    # row 7's invisible half. :69 and :127 are a terminal skip and a `blocked`
+    # test respectively, both safe untouched.
+    if goal.get("defer_reason") and status in ("pending", "candidate"):
         du = _parse_iso(goal.get("deferred_until"))
         if du is not None:
             candidates.append(du)

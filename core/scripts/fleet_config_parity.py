@@ -226,7 +226,8 @@ if [ -n "$RL" ]; then
   # EVERY node, not just the one being edited.
   say logline_STORAGE_BACKEND "$(printf '%%s\n' "$RL" | sed -n 's/.*resolved STORAGE_BACKEND=\([^ ]*\).*/\1/p')"
   say logline_ENVIRONMENT_ID "$(printf '%%s\n' "$RL" | sed -n 's/.*ENVIRONMENT_ID=\([^ ]*\).*/\1/p')"
-  # MACHINE_ID (g-115-5433). _daemon_val has ALWAYS preferred logline_MACHINE_ID —
+  # MACHINE_ID (g-115-5433). _daemon_lane (named _daemon_val until g-115-4158)
+  # has ALWAYS preferred logline_MACHINE_ID —
   # it reads "logline_%%s" %% key generically — but no producer ever emitted it, so
   # the MACHINE_ID verdict fell through to the exec-time /proc/environ read on every
   # node. That is the false positive the two lines above exist to prevent, left live
@@ -261,15 +262,20 @@ if [ -n "$RL" ]; then
   # per-box split above is a snapshot of launch lineage, not a stable fact about
   # the machine. Read a PRESENT/ABSENT reading as evidence about the last restart's
   # path, never as a box attribute.
-  # THE ARM IS WIRED INTO THE VERDICT ONLY, NOT INTO THE JSON OUTPUT. `_daemon_val`
-  # prefers logline_MACHINE_ID (so drift is correctly clean on all four nodes), but
-  # the `machine_id_resolved` field emitted for the caller reads
+  # THE ARM WAS WIRED INTO THE VERDICT ONLY, NOT INTO THE JSON OUTPUT — FIXED
+  # 2026-08-30 by g-115-4158 ITEM A; kept here because the SYMPTOM is what a reader
+  # searching an old report will have in hand. `_daemon_lane` prefers
+  # logline_MACHINE_ID (so drift was correctly clean on all four nodes), but the
+  # `machine_id_resolved` field emitted for the caller read
   # fields.get("resolved_MACHINE_ID") DIRECTLY -- the exec-time environ read, with
-  # no logline fallback. That is why cc-05 and cc-02 publish `unset` in --json while
-  # simultaneously passing. Verified by hand on both boxes with the exact collector
-  # line from this template: RL is non-empty and the sed yields cc-05 / cc-02, and
-  # their state/*.log files carry zero NUL bytes, so nothing about the READ is
-  # broken. Tracked separately; do not "fix" it by changing this say line.
+  # no logline fallback. That is why cc-05 and cc-02 published `unset` in --json
+  # while simultaneously passing. Verified by hand on both boxes with the exact
+  # collector line from this template: RL is non-empty and the sed yields cc-05 /
+  # cc-02, and their state/*.log files carry zero NUL bytes, so nothing about the
+  # READ was broken. The field now reports the value the VERDICT used, and the new
+  # `machine_id_arm` field says which arm produced it. The original warning still
+  # stands and is the reason this note survives its own fix: the defect was never
+  # in this say line, so do NOT "fix" anything by changing it.
   # Empty here on a daemon that started before the emitter landed, which falls
   # through to the old environ read — no regression, self-heals on next restart.
   say logline_MACHINE_ID "$(printf '%%s\n' "$RL" | sed -n 's/.*MACHINE_ID=\([^ ]*\).*/\1/p')"
@@ -610,6 +616,76 @@ def _cmp_version(got, floor):
     return g >= f
 
 
+# ── daemon-lane value + ARM (hoisted from _check_node, g-115-4158 ITEM B) ────
+#
+# Daemon-lane value: prefer the daemon's OWN startup declaration (g-115-3410)
+# over /proc/<pid>/environ. environ exposes only the EXEC-TIME block, so a daemon
+# that derives its config in-process (mind_api/src/__main__.py) reports every
+# derived key as "unset" there for its whole life, and a correctly-configured
+# node reads as DRIFT — g-115-3157, where foxtrot emitted 31h of false HIGH goals
+# while demonstrably writing to own-cloud. The logline states what is actually in
+# force. A genuinely local-only daemon logs "<unset->local>", normalised to
+# "local" here, so the failure this check exists for (2026-07-26: 28 of 49 starts
+# local-only, ~8 encodings stranded) is still caught.
+#
+# ITEM B VERDICT — HOIST, decided g-115-4158 (alpha, cc-07, 2026-08-30). This
+# lived as a closure inside _check_node, rebuilt once per host, closing over
+# `fields`. The question carved out of g-115-3446 was whether to hoist it to
+# module scope with an explicit `fields` parameter. Decided on two measurements
+# rather than taste, and RECORDED here so the next reader does not re-derive it:
+#   (1) COST IS ONE ARGUMENT AT TWO CALL SITES. `fields` was the function's only
+#       free variable, and `fields` is already a PARAMETER of _check_node — so
+#       hoisting moved a name that was in scope anyway, rather than threading new
+#       state down. The "keeps call sites short" counter-argument is real and it
+#       is worth exactly one extra argument, twice.
+#   (2) THE TESTABILITY ARGUMENT GREW. When the question was carved out, this was
+#       a 6-line two-arm selector and every test of it had to go through the whole
+#       compare path. g-115-4158 then made it a THREE-arm selector that also
+#       reports WHICH arm fired — logic whose whole point is to be inspected. A
+#       function that must be observed is a function that must be callable, and
+#       the closure made direct observation impossible.
+# The trade flips on (2): the closure was defensible while the logic was trivial
+# and is not once the logic became the thing under test. The four end-to-end tests
+# from g-115-3446 deliberately STILL go through the real compare path — the unit
+# tests added here are additive, never a replacement, because the end-to-end half
+# is what catches a wiring break that a unit test cannot see (guard-1943).
+def _daemon_lane(fields, key):
+    """Return (value, arm) — the value the verdict uses and WHICH ARM produced it.
+
+    The arm is the answer to "why does this node read the way it does", and it is
+    reported because the two arms can disagree while the report reads IDENTICALLY
+    either way: a reader cannot otherwise tell a genuine mismatch from a stale
+    resolved_* field the logline should have overridden.
+
+    THREE arms, not two, and the split inside "resolved" is the load-bearing part
+    (g-115-4158 ITEM A, from the zeta 2026-08-04 MACHINE_ID sub-case). A bare
+    "logline"/"resolved" label would have been ACCURATE for MACHINE_ID on every
+    node and every run, and still would not have told a reader that the value was
+    UNOBTAINABLE rather than merely stale:
+
+      "logline"          the daemon's own startup declaration supplied the value.
+      "resolved-silent"  the startup logline was READ, and carried no value for
+                         THIS key. Today that means the daemon predates the
+                         emitter for this key — it self-heals on the next restart,
+                         so this arm is a RESTART hint, not a config fault.
+      "resolved-nolog"   the startup logline could not be read at all, so no key
+                         could have come from it. A node-level read problem, not a
+                         per-key one — do not chase the key.
+
+    Distinguishing the last two is the whole reason the arm is worth emitting: they
+    have OPPOSITE remedies (restart this node vs. fix the log read), and both
+    present as the identical fall-through to /proc/<pid>/environ.
+    """
+    if fields.get("daemon_logline_readable") == "yes":
+        lv = fields.get("logline_%s" % key)
+        if lv:
+            if lv.startswith("<unset"):
+                return ("local" if key == "STORAGE_BACKEND" else "unset"), "logline"
+            return lv, "logline"
+        return fields.get("resolved_%s" % key), "resolved-silent"
+    return fields.get("resolved_%s" % key), "resolved-nolog"
+
+
 def _check_node(node, fields, manifest, deploy_keys):
     """Return list of drift strings (empty == PASS)."""
     drift = []
@@ -662,42 +738,28 @@ def _check_node(node, fields, manifest, deploy_keys):
             if got and got != want:
                 drift.append("file %s=%s expected %s" % (k, got, want))
     else:
-        # Daemon-lane value: prefer the daemon's OWN startup declaration
-        # (g-115-3410) over /proc/<pid>/environ. environ exposes only the
-        # EXEC-TIME block, so a daemon that derives its config in-process
-        # (mind_api/src/__main__.py:526-536) reports every derived key as
-        # "unset" there for its whole life, and a correctly-configured node
-        # reads as DRIFT — g-115-3157, where foxtrot emitted 31h of false HIGH
-        # goals while demonstrably writing to own-cloud. The logline states what
-        # is actually in force. A genuinely local-only daemon logs
-        # "<unset->local>", normalised to "local" here, so the failure this
-        # check exists for (2026-07-26: 28 of 49 starts local-only, ~8 encodings
-        # stranded) is still caught.
-        def _daemon_val(key):
-            if fields.get("daemon_logline_readable") == "yes":
-                lv = fields.get("logline_%s" % key)
-                if lv:
-                    if lv.startswith("<unset"):
-                        return "local" if key == "STORAGE_BACKEND" else "unset"
-                    return lv
-            return fields.get("resolved_%s" % key)
-
         for k, want in exp.items():
-            got = _daemon_val(k)
+            got, arm = _daemon_lane(fields, k)
+            # The arm is APPENDED, never woven into the existing text. Every test
+            # that reads these strings does a substring `in` check, so a suffix is
+            # invisible to them while a reformat would break all of them — the same
+            # append-safe / prepend-unsafe asymmetry the emitter ordering has
+            # against the greedy collector sed (ITEM C below).
             if got in (None, "unset"):
-                drift.append("daemon has no %s (expected %s)" % (k, want))
+                drift.append("daemon has no %s (expected %s) [arm=%s]" % (k, want, arm))
             elif got != want:
-                drift.append("daemon-resolved %s=%s expected %s" % (k, got, want))
+                drift.append("daemon-resolved %s=%s expected %s [arm=%s]" % (k, got, want, arm))
             fileval = fields.get("file_%s" % k)
             if fileval and got and fileval != got:
                 drift.append("%s disagrees: daemon=%s file=%s (daemon wins; file is stale)"
                              % (k, got, fileval))
-        mid = _daemon_val("MACHINE_ID")
+        mid, mid_arm = _daemon_lane(fields, "MACHINE_ID")
         if node.get("machine_id_check") != "skip":
             if mid in (None, "unset"):
-                drift.append("daemon has no MACHINE_ID")
+                drift.append("daemon has no MACHINE_ID [arm=%s]" % mid_arm)
             elif mid != node.get("host"):
-                drift.append("MACHINE_ID=%s but manifest host is %s" % (mid, node.get("host")))
+                drift.append("MACHINE_ID=%s but manifest host is %s [arm=%s]"
+                             % (mid, node.get("host"), mid_arm))
 
     # (c2) LANE PARITY — g-115-3168. The daemon environ is not the authority either.
     # A single-lane probe is structurally blind to the shape that actually occurred
@@ -1301,7 +1363,7 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
                 "claude": fields.get("claude_version"),
                 "kernel": fields.get("kernel"),
                 # Report the value the VERDICT used (startup logline preferred over
-                # exec-time environ, see _daemon_val). Displaying the raw environ
+                # exec-time environ, see _daemon_lane). Displaying the raw environ
                 # here printed "PASS sb=unset" for any daemon that derives its
                 # config in-process — a contradiction on its face that invites a
                 # re-investigation of the very false positive this fix removed.
@@ -1309,7 +1371,15 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
                                              or fields.get("resolved_STORAGE_BACKEND")),
                 "environment_id_resolved": (fields.get("logline_ENVIRONMENT_ID")
                                             or fields.get("resolved_ENVIRONMENT_ID")),
-                "machine_id_resolved": fields.get("resolved_MACHINE_ID"),
+                # Was `fields.get("resolved_MACHINE_ID")` — the RAW environ read,
+                # alone among the three in not preferring the logline. That is why
+                # nodes published `machine_id_resolved: unset` in --json while
+                # simultaneously PASSING: the verdict used the logline arm and this
+                # field did not, so the report contradicted its own verdict. Now it
+                # reports the value the verdict used, like its two siblings above,
+                # and `machine_id_arm` says which arm that was. (g-115-4158 ITEM A)
+                "machine_id_resolved": _daemon_lane(fields, "MACHINE_ID")[0],
+                "machine_id_arm": _daemon_lane(fields, "MACHINE_ID")[1],
                 "storage_backend_cli": fields.get("cli_STORAGE_BACKEND"),
                 "environment_id_cli": fields.get("cli_ENVIRONMENT_ID"),
                 "machine_id_cli": fields.get("cli_MACHINE_ID"),

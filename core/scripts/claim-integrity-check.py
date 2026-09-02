@@ -45,12 +45,28 @@ and ``claimed_by`` appears on ZERO of them, so a version of this check built on
 the compact would have returned ``clean`` permanently, on every box, forever
 (measured 2026-08-22, cc-02).
 
-So the verdict is BLIND, never clean, whenever ``present_value == 0``. On a
-running fleet some goal is always claimed right now; zero live claims anywhere
-means the field is not reaching this code, not that nobody is working. The
-``key_presence`` census is printed beside the finding count on every run so the
-zero is always readable (guard-1419: a zero with two explanations must be
-disambiguated; guard-2298: print the shape beside the count).
+So ``present_value == 0`` is NEVER clean. It resolves to one of two verdicts,
+and which one depends on a signal from the same scan (g-115-7876):
+
+  * ``BLIND``          -- something is marked in-progress (so a claim SHOULD
+                          exist) and none carries a value, OR the scan located
+                          no non-terminal population at all. Source defect.
+  * ``no-live-claims`` -- nothing is claimed AND nothing is in-progress, so the
+                          zero is ENTAILED and says nothing about the source.
+                          NOT APPLICABLE, and NOT a clean bill of health.
+
+The older text asserted "on a running fleet some goal is always claimed right
+now" as though it were unconditional. It holds on a multi-agent fleet and FAILS
+on a one-agent deployment or a quiesced window, where BLIND then fired on every
+iteration forever -- and a flag no action can clear is one a reader learns to
+skip, which was burying this check's real damage findings on the box that
+reported it (ZDS-Mind, 2026-08-26: 3 damaged records under a permanent BLIND).
+
+The ``key_presence`` census is printed beside the finding count on EVERY run,
+in every verdict, so the zero is always readable (guard-1419: a zero with two
+explanations must be disambiguated; guard-2298: print the shape beside the
+count), and ``scanned``/``in_progress`` are published beside it so a reader can
+re-derive the verdict from the record rather than trusting the label.
 
 PROVENANCE. Under own-cloud the local tree is a read-through cache (guard-980),
 so this reads whatever the mirror currently holds and labels it
@@ -91,6 +107,15 @@ TERMINAL_STATUSES = {
 # moves them as a unit with claimed_by. Any of these present beside a null
 # claimed_by is positive evidence of reconcile damage rather than a pop.
 SIBLING_FIELDS = ("claimed_at", "started", "executed_by")
+
+# A goal in one of these statuses ASSERTS that work is underway, so it should
+# carry a live claim. This is the `in_progress` signal verdict_for() uses to
+# tell "nobody is working" apart from "the field is not reaching this code"
+# (). Deliberately NOT the complement of TERMINAL_STATUSES: `pending`
+# and `blocked` are non-terminal but assert no work, so counting them would
+# make in_progress > 0 on every quiet store and re-arm the permanent BLIND this
+# distinction exists to retire.
+ACTIVE_STATUSES = {"in-progress"}
 
 
 def _load_jsonl(path: Path, stats: dict = None) -> list:
@@ -163,6 +188,15 @@ def _scan_store(path: Path, source: str, now: dt.datetime, presence: dict,
             if goal.get("status") in TERMINAL_STATUSES:
                 continue
             scanned += 1
+            # The in-progress census (). Rides in `stats` alongside
+            # parse_skipped rather than in `presence`, which is reserved for
+            # claimed_by key-STATES and must keep absent/null/value as its only
+            # keys -- main_result reads presence positionally into
+            # key_presence, and a fourth key there would silently widen that
+            # published shape. A caller passing stats=None simply does not
+            # collect the signal, and verdict_for then falls back to BLIND.
+            if stats is not None and goal.get("status") in ACTIVE_STATUSES:
+                stats["in_progress"] = stats.get("in_progress", 0) + 1
             state = _key_state(goal, "claimed_by")
             presence[state] = presence.get(state, 0) + 1
             if state != "null":
@@ -216,18 +250,63 @@ def _scan_store(path: Path, source: str, now: dt.datetime, presence: dict,
     return scanned
 
 
-def verdict_for(present_value: int, findings) -> str:
-    """BLIND | damaged | clean -- the false-zero control, kept pure so a test
-    can prove it FIRES rather than merely observing it stay quiet (rb-5828: a
-    green check that cannot be shown to go red is not evidence).
+def verdict_for(present_value: int, findings, *, in_progress=None,
+                scanned=None) -> str:
+    """BLIND | no-live-claims | damaged | clean -- the false-zero control,
+    kept pure so a test can prove it FIRES rather than merely observing it stay
+    quiet (rb-5828: a green check that cannot be shown to go red is not
+    evidence).
 
-    present_value == 0 outranks everything: on a running fleet some goal is
-    always claimed, so no live claim anywhere means the field is not reaching
-    this code. Reporting that as clean is the exact failure guard-2467
-    describes, and it is indistinguishable from health in every downstream
-    consumer.
+    present_value == 0 outranks everything: no live claim anywhere means either
+    nobody is working OR the field is not reaching this code. Reporting the
+    second as clean is the exact failure guard-2467 describes.
+
+    THE TWO ZEROS ARE NOT THE SAME ZERO (g-115-7876, filed by omni from
+    ZDS-Mind 2026-08-26). The original premise -- "on a running fleet some goal
+    is always claimed right now" -- is TRUE on a multi-agent fleet and FALSE on
+    a one-agent deployment or a quiesced window, where present_value == 0 is
+    the correct steady state. Measured on ZDS: in-progress 0, non-terminal 121,
+    key_presence absent=118 null=3 value=0, and goal-selector all_blocked=true
+    with candidates=0 -- so the queue could not have produced a claim. There,
+    BLIND fired on EVERY iteration, permanently, and a flag no action can clear
+    is one a reader learns to skip -- which was burying three real damage
+    findings on that same box.
+
+    THE DISAMBIGUATOR IS `in_progress`, AND IT COSTS NOTHING -- it comes from
+    the same scan. A goal marked in-progress ASSERTS work is underway, so it
+    should carry a live claim; in_progress > 0 beside present_value == 0 is the
+    genuine source defect this check was built for. in_progress == 0 means no
+    goal even claims to be worked, so present_value == 0 is ENTAILED and
+    carries no information about the source.
+
+    Note claims legitimately sit on `pending` goals (aspirations-claim.sh does
+    not flip status), but that only ever RAISES present_value -- it cannot
+    reach this branch, so it does not weaken the discriminator.
+
+    BOTH NEW SIGNALS FAIL SAFE, which is the whole reason they are keyword-only
+    with None defaults: an un-migrated call site passing two positionals gets
+    BLIND exactly as before (guard-2275 -- prefer the fail-safe value as the
+    default so an un-migrated caller gets more work, never less).
+
+    `scanned` is the coverage count (guard-3489) and it gates the new verdict:
+    a scan that located NO non-terminal population has verified nothing, and an
+    empty population must return the UNSAFE verdict rather than the safe one
+    (guard-2166 -- "all members satisfy P" is vacuously true on an empty set).
+    So scanned == 0 stays BLIND even when in_progress == 0.
+
+    `no-live-claims` is NOT a clean bill of health and must never be treated as
+    one -- it is a third, honest verdict meaning "this check is not applicable
+    right now". guard-2467's protection is preserved exactly: nothing here can
+    return "clean" off a zero.
     """
     if present_value == 0:
+        # Population never located -> the read is broken, not the fleet quiet.
+        if not scanned:
+            return "BLIND"
+        # Explicitly `== 0`, never falsy: None (un-migrated caller) must NOT
+        # satisfy this branch, and `not in_progress` would let it through.
+        if in_progress == 0:
+            return "no-live-claims"
         return "BLIND"
     return "damaged" if findings else "clean"
 
@@ -262,7 +341,12 @@ def main_result(since_hours=None) -> dict:
                                presence, findings, stats)
 
     present_value = presence.get("value", 0)
-    verdict = verdict_for(present_value, findings)
+    # `scanned` is this run's coverage count and `in_progress` its
+    # applicability signal; both are already computed above, so the third
+    # verdict costs no extra pass over the stores ().
+    in_progress = stats.get("in_progress", 0)
+    verdict = verdict_for(present_value, findings,
+                          in_progress=in_progress, scanned=scanned)
 
     reported = findings
     if since_hours is not None:
@@ -285,6 +369,11 @@ def main_result(since_hours=None) -> dict:
         # parse_skipped is clean-over-a-population-it-never-saw (guard-3714).
         "parse_skipped": stats.get("parse_skipped", 0),
         "scanned_non_terminal": scanned,
+        # Published so a reader can re-derive the verdict from the record
+        # (guard-3743: a decision record must reproduce its own verdict from
+        # its own recorded inputs). Without it, `no-live-claims` would be an
+        # assertion nobody downstream could check.
+        "in_progress": in_progress,
         "key_presence": {
             "absent": presence.get("absent", 0),
             "present_null": presence.get("null", 0),
@@ -320,16 +409,26 @@ def main(argv=None):
     else:
         kp = result["key_presence"]
         print(f"[claim-integrity] verdict={verdict} provenance=local-mirror "
-              f"scanned={scanned}")
+              f"scanned={scanned} in_progress={result['in_progress']}")
         print(f"  key_presence: absent={kp['absent']} "
               f"present_null={kp['present_null']} "
               f"present_value={kp['present_value']}"
-              "   <- present_value==0 means BLIND, not clean")
+              "   <- present_value==0 is never clean: BLIND, or no-live-claims")
         if verdict == "BLIND":
             print("  BLIND: no live claim carries a value anywhere in the "
-                  "scanned stores. On a running fleet that is a source defect "
+                  "scanned stores, AND either something is marked in-progress "
+                  "(so a claim SHOULD exist) or the scan located no "
+                  "non-terminal population at all. That is a source defect "
                   "(projection / wrong store), NOT a clean bill of health. "
                   "Do not report zero. (guard-2467)")
+        elif verdict == "no-live-claims":
+            print("  no-live-claims: nothing is claimed and nothing is marked "
+                  "in-progress, so present_value==0 is ENTAILED and says "
+                  "nothing about the source. This check is NOT APPLICABLE "
+                  "right now -- it is not a clean bill of health, and it is "
+                  "the expected steady state on a one-agent deployment or a "
+                  "quiesced window. It becomes BLIND again the moment any goal "
+                  "goes in-progress without a claim. (g-115-7876)")
         print(f"  findings: {len(reported)} reported "
               f"({len(damaged)} with partial field survival = reconcile damage)")
         for f in reported:

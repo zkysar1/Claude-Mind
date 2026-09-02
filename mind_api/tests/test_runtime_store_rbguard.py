@@ -232,6 +232,22 @@ def test_rb_set_field_immutable_created(running_daemon):
     assert "immutable_field" in body
 
 
+def test_rb_set_field_immutable_title(running_daemon):
+    """title is HALF the merge identity (_rb_identity = created + title).
+
+    Editing it in place changes what the record IS, so the next cross-box merge
+    reads the edited copy as a new entity and keeps BOTH (g-115-8396). `created`
+    was protected here since day one; the human-authored half was not.
+    """
+    _, port = running_daemon
+    status, body = _post_err(port, "/v1/store/set-field",
+                             {"store": "reasoning-bank",
+                              "id": "rb-001", "field": "title",
+                              "value": "a materially different title"})
+    assert status == 400
+    assert "immutable_field" in body
+
+
 def test_rb_set_field_rejects_dotted(running_daemon):
     # Dotted check fires before validation — safe on seed records.
     _, port = running_daemon
@@ -472,6 +488,24 @@ def test_guard_set_field_immutable_created(running_daemon):
                              {"store": "guardrails",
                               "id": "guard-001", "field": "created",
                               "value": "2099-01-01T00:00:00"})
+    assert status == 400
+    assert "immutable_field" in body
+
+
+def test_guard_set_field_immutable_rule(running_daemon):
+    """rule is HALF the merge identity (_guard_identity = created + rule).
+
+    NOT hypothetical: rb-5511 measured 11 forked guardrail pairs in the live
+    store from in-place `rule` edits. coordination_merge's own amendment tier
+    deliberately exposes trigger_condition / action_hint / source instead, so
+    protecting `rule` ALIGNS the write path with the merge design rather than
+    removing a capability (g-115-8396).
+    """
+    _, port = running_daemon
+    status, body = _post_err(port, "/v1/store/set-field",
+                             {"store": "guardrails",
+                              "id": "guard-001", "field": "rule",
+                              "value": "a materially different rule"})
     assert status == 400
     assert "immutable_field" in body
 

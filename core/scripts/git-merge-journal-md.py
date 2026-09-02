@@ -61,9 +61,18 @@ by g-115-4253 2026-07-31). The open question was whether a same-heading
 divergence is safe to auto-union rather than conflict. It is not, and the
 REFUSE above stands, on three grounds:
 
-  1. Headings are minute-keyed (``## HH:MM — <label>``; measured across three
-     live agent-days). Identical heading + different body therefore means two
-     DIFFERENT events collapsed onto one key. Coalescing them concatenates two
+  1. Headings are USUALLY minute-keyed (``## HH:MM — <label>``), so identical
+     heading + different body means two DIFFERENT events collapsed onto one
+     key. "Three live agent-days" understated the sample and the shape:
+     re-measured 2026-08-31 (g-115-4259) over every reachable agent-day on
+     cc-08, 1,533 of 20,941 headings (7.3%) are NOT minute-keyed, and 159 carry
+     NO minute component at all — ``## Consolidation — <date>`` (31),
+     ``## Hippocampal Replay — <date> (g-N-N)``, ``## What landed``,
+     ``## Changes Made``. Those come from aspirations-consolidate, replay and
+     boot SKILL.md, NOT from journal-append.sh (whose :143 heading is
+     minute-AND-goal-id keyed by construction). So the genuine same-heading
+     collision class is real but lives in those three writers; widening
+     journal-append.sh's key would not touch it. Coalescing them concatenates two
      unrelated narratives under one timestamp, and the result is thereafter
      indistinguishable from a single entry — the loss is silent and permanent.
   2. The cost of refusing is already bounded. Per the exit-1 contract above,
@@ -76,13 +85,32 @@ REFUSE above stands, on three grounds:
      failure shape, different remedy — do not import the fallback from
      git-merge-ayoai-ledger.py into this driver.
 
-The improvement actually available is UPSTREAM of the merge: if two boxes can
-emit the same ``## HH:MM — <label>`` for different events, the key is not unique
-enough, and widening it at write time (journal-append.sh) removes the class
-instead of teaching the merge to paper over it. Deliberately NOT implemented
-here: the reported collisions were on another deployment's journal, unreadable
-from this box, so the same-minute-different-event cause is UNMEASURED. Filed
-rather than fixed on a guess.
+THE REPORTED omni COLLISION WAS NOT A SAME-HEADING COLLISION (g-115-4259,
+2026-08-31). Still do NOT widen journal-append.sh's key on its account.
+
+The cited evidence was agents/omni/journal/2026/07/2026-07-31.md diverging with
+entries timed 03:12 and 03:20. journal-append.sh:143 emits
+``## $(date +%H:%M) — Goal: <summary> (<goal-id>)`` unconditionally, so entries
+eight minutes apart carry DIFFERENT headings by construction and this driver
+unions them cleanly. omni's own file is unreadable from cc-08 too (no agents/omni
+on the filesystem; zds-mind declares no peer_world_path, and peer_retrieve's
+store list covers board/tree/conventions/JSONL — never agents/*/journal/), so
+the verdict rests on the writer's shape plus the reproduction below, NOT on
+omni's two literal lines, which remain unread.
+
+REPRODUCED both ways in a throwaway repo — two boxes adding this same path with
+those two timestamps, no common ancestor:
+  - driver NOT registered -> ``CONFLICT (add/add)``, rc=1, BOTH entries wrapped
+    in ONE ``<<<<<<<``/``>>>>>>>`` block. Reads exactly like "the same heading
+    diverged". git emits NO warning that the attribute names an absent driver.
+  - driver registered      -> rc=0, clean chronological section-union.
+So the reported symptom is fully explained WITHOUT identical headings. The
+driver landed here 2026-07-27 and the conflict was 2026-07-31 on a deployment
+two promotion stages downstream; registration is per-clone in .git/config (NOT
+version-controlled), written by install-git-hooks.sh via a fail-open ``|| true``
+at sessionstart-orchestrator.sh:103. check-merge-driver-registered.sh
+(g-306-333, 2026-08-20) was built for precisely this failure mode three weeks
+later. Diagnose an add/add journal conflict by running that check FIRST.
 """
 import re
 import sys

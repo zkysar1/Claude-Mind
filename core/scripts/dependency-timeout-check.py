@@ -347,6 +347,153 @@ def _root_of(goal, index):
     return (bb[0] if bb else None), (index.get(bb[0]) if bb else None)
 
 
+# ---------------------------------------------------------------------------
+# STALE-DEPENDENCY DETECTION ()
+#
+# `_root_of` above returns the FIRST UNRESOLVED blocker. When every blocker has
+# gone terminal its loop falls through and returns `bb[0]` — a COMPLETED goal —
+# and run() then escalates that as though it were a live blocker. So a goal
+# whose dependencies are all satisfied stays blocked forever, and because
+# goal-selector path (d) treats a non-empty `blocked_by` as a dependency wait,
+# it never reaches the scorer either. Measured instances in the originating
+# goal:  sat blocked 7 days on  (completed);  named a
+# completed unblock_goal with an expires_at two days past. Both had to be
+# unblocked BY HAND.
+#
+# WHY A SEPARATE TERMINAL SET. `_root_of` tests
+# ("completed", "skipped", "expired") and is deliberately left alone — widening
+# it would change WHICH root gets escalated on live chains, which is a
+# different behavior change than this goal asks for. This tuple is the
+# complete terminal set per CLAUDE.md § Status Values, and the divergence is
+# pinned by test_terminal_sets_diverge_deliberately so a future fusion of the
+# two fails loudly rather than silently altering escalation.
+TERMINAL_FOR_UNBLOCK = (
+    "completed", "skipped", "expired", "superseded", "decomposed",
+)
+
+
+def _stale_dependency(goal, index):
+    """All of `goal`'s blocked_by targets are terminal -> the receipt, else None.
+
+    FAIL-SAFE ON THE UNKNOWN. An id absent from `index` returns None, NEVER a
+    stale verdict: the index is assembled fail-open per source (a failed read
+    just yields fewer entries), so "not found" means "could not be resolved",
+    not "finished". Treating an unresolvable id as terminal would let one
+    degraded read clear a live dependency — the guard-1715 shape, where an
+    all-clear is bounded by the population the index happens to declare.
+    """
+    edges = _blocking_edges(goal)
+    if not edges:
+        return None  # no edges — not this class (prose-only lives in the census)
+    resolved = []
+    for rid, origin in edges:
+        root = index.get(rid)
+        if root is None:
+            return None  # unresolvable != terminal
+        st = root.get("status")
+        if st not in TERMINAL_FOR_UNBLOCK:
+            return None  # at least one live blocker — genuinely still blocked
+        resolved.append({"root_id": rid, "status": st, "via": origin,
+                         "archived": bool(root.get("_archived"))})
+    return {"edges": resolved,
+            "edge_count": len(resolved),
+            "summary": ", ".join("%s=%s(%s)" % (r["root_id"], r["status"], r["via"])
+                                 for r in resolved)}
+
+
+def _blocking_edges(goal):
+    """Every goal-id this goal is blocked ON, as [(id, "blocked_by"|"blocker_ref")].
+
+    BOTH FIELDS, because the class this detector serves is defined over both.
+    g-115-3201's title says "blocked_by/blocker_ref targets have ALL gone
+    terminal", and its SECOND measured instance is a blocker_ref one:
+    g-250-258 "named a completed unblock_goal with an expires_at two days
+    past". A blocked_by-only reader would have covered exactly one of the two
+    incidents the goal was filed from, while its report line still said
+    "stale_dependency", so the miss would have read as a clean result —
+    reclaim-routed-work.md rule 7 (a reclaim predicate narrower than the
+    population that creates it) reproduced inside the remedy for it.
+
+    Deduped, first origin wins, order preserved: the same id commonly appears
+    as BOTH a blocked_by edge and the blocker_ref's unblock_goal, and counting
+    it twice would inflate edge_count and read as two independent blockers.
+    """
+    out, seen = [], set()
+    bb = goal.get("blocked_by") or []
+    if isinstance(bb, str):
+        bb = [bb]
+    for rid in bb:
+        if rid and rid not in seen:
+            seen.add(rid)
+            out.append((rid, "blocked_by"))
+    ref = goal.get("blocker_ref")
+    if isinstance(ref, dict):
+        # `unblock_goal` is the Blocker Reference Schema's pointer at the goal
+        # that clears this blocker. An `external_id` is NOT a goal id and is
+        # deliberately not followed — it names infrastructure, which this
+        # detector cannot resolve and must not guess at.
+        rid = ref.get("unblock_goal")
+        if rid and rid not in seen:
+            seen.add(rid)
+            out.append((rid, "blocker_ref"))
+    return out
+
+
+def _clear_blocked_by(goal_id, source):
+    """Drop satisfied blocked_by edges so the goal reaches the scorer again.
+
+    Called ONLY after _post_board has recorded the edges and their statuses, so
+    the cleared relation stays recoverable from the board (and from the queue's
+    git history) rather than being destroyed silently.
+    """
+    try:
+        proc = subprocess.run(
+            bash_cmd(SCRIPT_DIR / "aspirations-update-goal.sh",
+                     goal_id, "blocked_by", "[]", "--source", source),
+            capture_output=True, text=True, timeout=120)
+        if proc.returncode == 0:
+            return True, "cleared satisfied blocked_by on %s" % goal_id
+        return False, "clear rc=%s %s" % (proc.returncode, (proc.stderr or "")[:160])
+    except Exception as e:
+        return False, "clear raised: %s" % e
+
+
+# The widening note on  (bravo, 2026-08-26): this sweep's predicate
+# reads blocked_by, so a dependency stated ONLY in prose is outside the
+# population and the sweep reports clean on it forever — reclaim-routed-work.md
+# rule 7. Measured there:  said "DEPENDS ON  — do not start
+# until that spec exists" in prose with no edge;  completed 2026-08-25
+# and nothing re-surfaced , which then ranked TOP of 1163 candidates
+# for 5 consecutive iterations and was declined each time by readers re-reading
+# the stale prose. So the census below is reported BESIDE the filtered count,
+# per guard-2298: a zero from this sweep means "no edge-recorded stale
+# dependency", never "no stale dependency".
+DEP_PHRASE_RE = re.compile(
+    r"(depends?\s+on|blocked\s+(?:on|by)|waiting\s+(?:on|for)|"
+    r"do\s+not\s+start\s+until|gated\s+on|prerequisite)", re.I)
+
+
+def _prose_only_dependency_census(index, sample=10):
+    """Non-terminal goals stating a dependency in prose with NO structured edge."""
+    hits = []
+    for gid, g in index.items():
+        if g.get("status") in TERMINAL_FOR_UNBLOCK or g.get("status") == "blocked-archived":
+            continue
+        if g.get("blocked_by") or g.get("blocker_ref") or g.get("defer_reason"):
+            continue  # has SOME structured signal — a sweep can reach it
+        text = "%s %s" % (g.get("title") or "", g.get("description") or "")
+        m = DEP_PHRASE_RE.search(text)
+        if m:
+            hits.append({"goal_id": gid, "status": g.get("status"),
+                         "phrase": m.group(0).lower(),
+                         "title": (g.get("title") or "")[:70]})
+    hits.sort(key=lambda h: h["goal_id"])
+    return {"count": len(hits), "sample": hits[:sample],
+            "note": "EXCLUDED from this sweep by construction (no structured "
+                    "edge to read). A zero in `stale_dependency` is not "
+                    "evidence these are unblocked — guard-2298."}
+
+
 # A root can be genuinely user-gated while its `participants` still reads
 # ["agent"] — the gate lives in defer_reason instead. Observed on 
 # (defer_reason "credentials-required: ...", participants ["agent"]), the very
@@ -566,6 +713,7 @@ def run(args) -> dict:
     already = _read_recent_escalations(threshold, args.board_escalation_log)
 
     candidates, escalated, boosted, needs_notify = [], [], [], []
+    stale_dependency = []
     reprobe_suppressed = []
     skipped_cooldown, skipped_young, skipped_no_ts, failed = [], [], [], []
 
@@ -574,6 +722,46 @@ def run(args) -> dict:
         goal = index.get(gid)
         if goal is None:
             continue
+        # STALE-DEPENDENCY PASS () — deliberately BEFORE the age
+        # gates below. A dependency whose targets have ALL gone terminal is not
+        # "young" or "old", it is SATISFIED, and the two gates underneath would
+        # each hide it: `blocked_since` is frequently null (those goals land in
+        # skipped_no_blocked_since and are never looked at again), and the 36h
+        # threshold would make an already-satisfied dependency wait out a clock
+        # measuring nothing. Putting the check here is what keeps the detector
+        # from shipping inert. It is pure in-memory status resolution over an
+        # index already built — no extra I/O for the common no-hit case.
+        stale = _stale_dependency(goal, index)
+        if stale is not None:
+            rec = {"goal_id": gid, "title": (goal.get("title") or "")[:90],
+                   "source": goal.get("_source", "world"),
+                   "edges": stale["edges"], "summary": stale["summary"],
+                   "cleared": None, "detail": None}
+            if args.apply:
+                # Board FIRST: it records the edges and their statuses, so the
+                # relation stays recoverable after the clear rather than being
+                # destroyed silently (archive-before-delete's proportionate
+                # form for a two-token edge).
+                ok, note = _post_board(
+                    gid, stale["edges"][0]["root_id"], 0.0,
+                    "STALE DEPENDENCY: every blocked_by target of %s is "
+                    "terminal (%s). Clearing the satisfied edges so the goal "
+                    "reaches the scorer again; goal-selector path (d) treats a "
+                    "non-empty blocked_by as a live dependency wait, so it "
+                    "could not rank while they stood. (g-115-3201)"
+                    % (gid, stale["summary"]),
+                    args.no_board)
+                if ok:
+                    cok, cnote = _clear_blocked_by(gid, rec["source"])
+                    rec["cleared"], rec["detail"] = cok, cnote
+                    if not cok:
+                        failed.append({"goal_id": gid, "detail": cnote})
+                else:
+                    rec["cleared"], rec["detail"] = False, note
+                    failed.append({"goal_id": gid, "detail": note})
+            stale_dependency.append(rec)
+            continue
+
         # blocked_since lives on the GOAL RECORD, not on the selector entry
         # (every selector entry reports blocked_since=None — verified
         # 2026-07-25). Reading it off the entry would skip 100% of candidates.
@@ -686,6 +874,8 @@ def run(args) -> dict:
         "scanned": len(dep_entries),
         "eligible": len(candidates),
         "candidates": candidates,
+        "stale_dependency": stale_dependency,
+        "prose_only_dependencies": _prose_only_dependency_census(index),
         "escalated": escalated,
         "boosted": boosted,
         "needs_user_notification": needs_notify,

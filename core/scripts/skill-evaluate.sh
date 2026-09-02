@@ -111,6 +111,12 @@ case "$CMD" in
         esac
         ;;
     score)
+        # Judge provenance is resolved HERE, in the judge's own process, and
+        # forwarded in the body. The daemon that performs the write cannot read
+        # it from its own environment without reporting its spawning session's
+        # values on every request (guard-2480, ).
+        rt_judge_provenance
+
         # Build JSON body from CLI args. The endpoint accepts cost_awareness
         # (underscore) and cost-awareness (hyphen); send underscore form.
         BODY="$($(rt_python_launcher) -c "
@@ -123,8 +129,11 @@ if sys.argv[4]: body['completeness'] = sys.argv[4]
 if sys.argv[5]: body['executability'] = sys.argv[5]
 if sys.argv[6]: body['maintainability'] = sys.argv[6]
 if sys.argv[7]: body['cost_awareness'] = sys.argv[7]
+if sys.argv[8]: body['judge_model'] = sys.argv[8]
+if sys.argv[9]: body['harness'] = sys.argv[9]
 print(json.dumps(body))
-" "$SKILL" "$GOAL" "$SAFETY" "$COMPLETENESS" "$EXECUTABILITY" "$MAINTAINABILITY" "$COST_AWARENESS")"
+" "$SKILL" "$GOAL" "$SAFETY" "$COMPLETENESS" "$EXECUTABILITY" "$MAINTAINABILITY" "$COST_AWARENESS" \
+  "$RT_JUDGE_MODEL" "$RT_JUDGE_HARNESS")"
 
         rc=0
         rt_call POST /v1/skill-evaluate/score --body-string "$BODY" || rc=$?

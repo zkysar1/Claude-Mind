@@ -85,13 +85,26 @@ def with_sandbox(test_fn):
         prior_env = {
             k: os.environ.get(k) for k in
             ("MIND_AGENT", "MIND_WORLD", "MIND_META", "MIND_AGENT_DIR",
-             "MIND_SID", "GID", "OUTCOME", "ORIGINAL_OUTCOME", "PR", "SD")
+             "MIND_SID", "BODY_WM_PATH",
+             "GID", "OUTCOME", "ORIGINAL_OUTCOME", "PR", "SD")
         }
         os.environ["MIND_AGENT"] = "alpha-test"
         os.environ["MIND_WORLD"] = str(world_dir)
         os.environ["MIND_META"] = str(meta_dir)
         os.environ["MIND_AGENT_DIR"] = str(agent_dir)
         os.environ.pop("MIND_SID", None)
+        # guard-862 / guard-3375 (): wm.wm_path() returns BODY_WM_PATH
+        # whenever it is set and only falls back to AGENT_DIR/session/
+        # working-memory.yaml when it is not — so it OUTRANKS the MIND_AGENT_DIR
+        # isolation above, and on a worker Body (where bash-agent-inject.py
+        # exports it) the canary wrote the live per-Body WM instead of the
+        # _write_wm fixture. The fixture read then returned None, which is
+        # verbatim the "canary should have set force_experience_archival"
+        # assertion. Measured on cc-08 2026-08-31: sFFF with the var inherited,
+        # all pass under `env -u BODY_WM_PATH`.
+        # Popping HERE also covers _run_canary's os.environ.copy() below, which
+        # runs inside this sandbox — so no second pop is needed there.
+        os.environ.pop("BODY_WM_PATH", None)
 
         try:
             test_fn(sandbox, agent_dir)

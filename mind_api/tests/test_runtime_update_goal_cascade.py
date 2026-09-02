@@ -59,9 +59,19 @@ def _post(port, path, query, body, *, agent="alpha", headers=None):
 
 
 def _seed_goal(port, **fields):
-    """Add a base goal to asp-001 for the test. Returns the persisted goal."""
+    """Add a base goal to asp-001 for the test. Returns the persisted goal.
+
+    The default title is UNIQUE per call: the duplication gate's title_exact
+    strategy (gates/goal_duplication.py) refuses an add whose exact title
+    already sits on a pending/in-progress goal, and several tests here leave
+    their seeds pending — so a shared literal title makes seed N collide with
+    seed N-1's leftovers (measured 2026-08-31: deterministic 400 on the
+    second default-titled seed in test_status_blocked_auto_stamps_blocked_since,
+    solo AND in-suite). Uniqueness restores seed-independence without
+    monkeypatching the gate out of the picture."""
+    import uuid
     goal = {
-        "title": "Seed goal for cascade test",
+        "title": f"Seed goal for cascade test {uuid.uuid4().hex[:8]}",
         "status": "pending",
         "origin_signal": "user_directive",
         "description": "x" * 100,
@@ -436,6 +446,110 @@ def test_participants_without_user_no_warn(running_daemon):
     assert code == 200
     resp = json.loads(body)
     assert "warnings" not in resp or not resp["warnings"]
+
+
+# ---------------------------------------------------------------------------
+# : companion outcome_note on a status write — one locked RMW
+# ---------------------------------------------------------------------------
+
+def test_companion_outcome_note_lands_with_status_in_one_write(running_daemon):
+    """{"value": "completed", "outcome_note": ...} on field=status lands BOTH
+    fields plus the 6a/6b auto-stamps in a single write."""
+    project_root, port = running_daemon
+    g = _seed_goal(port, title="g-358-36 companion happy-path seed")
+    note = "verified: measured X, shipped Y, tests green (companion write)"
+    code, body = _update(port, g["id"], "status",
+                         {"value": "completed", "outcome_note": note})
+    assert code == 200, body
+    persisted = _read_goal(project_root, g["id"])
+    assert persisted["status"] == "completed"
+    assert persisted["outcome_note"] == note
+    # auto-stamp cascade fired inside the SAME write
+    assert persisted.get("completed_date")
+    assert persisted.get("completed_by")
+
+
+def test_companion_non_string_refused(running_daemon):
+    """A non-string outcome_note companion is a 400 before any gate runs."""
+    project_root, port = running_daemon
+    # Unique title: this goal deliberately STAYS pending, and the shared seed
+    # title would title_exact-collide with every later seed in the module
+    # (the daemon fixture is module-scoped; the world accumulates).
+    g = _seed_goal(port, title="g-358-36 companion non-string-refusal seed")
+    code, body = _update(port, g["id"], "status",
+                         {"value": "completed", "outcome_note": 123})
+    assert code == 400
+    err = json.loads(body)
+    assert err["error"] == "invalid_companion"
+    # nothing persisted
+    persisted = _read_goal(project_root, g["id"])
+    assert persisted["status"] == "pending"
+    assert persisted.get("outcome_note") in (None, "")
+
+
+def test_plain_string_status_body_unchanged(running_daemon):
+    """The historical bare-string body shape is untouched — no outcome_note
+    appears from nowhere."""
+    project_root, port = running_daemon
+    g = _seed_goal(port, title="g-358-36 plain-string-body seed")
+    code, _ = _update(port, g["id"], "status", "completed")
+    assert code == 200
+    persisted = _read_goal(project_root, g["id"])
+    assert persisted["status"] == "completed"
+    assert persisted.get("outcome_note") in (None, "")
+
+
+def test_companion_shrink_guard_fires_and_override_passes(running_daemon):
+    """The companion gets the same field-shrink guard the note would face on
+    its own write: replacing a >2000-char note with a tiny one is a 400
+    (atomic — the status flip must NOT land), and the standard override
+    header passes it."""
+    project_root, port = running_daemon
+    g = _seed_goal(port, title="g-358-36 companion shrink-guard seed")
+    long_note = "L" * 2400
+    code, _ = _update(port, g["id"], "outcome_note", long_note)
+    assert code == 200
+    code, body = _update(port, g["id"], "status",
+                         {"value": "completed", "outcome_note": "tiny"})
+    assert code == 400, body
+    err = json.loads(body)
+    assert err["error"] == "field_shrink_blocked"
+    assert err["field"] == "outcome_note"
+    persisted = _read_goal(project_root, g["id"])
+    assert persisted["status"] == "pending"          # atomic: neither landed
+    assert persisted["outcome_note"] == long_note
+    # override header → 200, both land
+    code, body = _update(
+        port, g["id"], "status",
+        {"value": "completed", "outcome_note": "tiny"},
+        headers={"X-Mind-Override-Shrink": "test: deliberate condense"})
+    assert code == 200, body
+    persisted = _read_goal(project_root, g["id"])
+    assert persisted["status"] == "completed"
+    assert persisted["outcome_note"] == "tiny"
+
+
+def test_residual_work_gate_sees_companion_note(running_daemon,
+                                                aspirations_write_module,
+                                                monkeypatch):
+    """Ordering contract: the residual-work gate must evaluate the INCOMING
+    companion note (the note the old 2-call ritual would have landed first),
+    not the pre-write value."""
+    _, port = running_daemon
+    seen = {}
+
+    def _capture(**kwargs):
+        seen["outcome_note"] = kwargs.get("outcome_note")
+        return {"would_block": False, "reason": "monkeypatched pass"}
+
+    monkeypatch.setattr(aspirations_write_module, "_residual_work_eval",
+                        _capture)
+    g = _seed_goal(port, title="g-358-36 companion residual-ordering seed")
+    note = "agent-leg-complete; everything shipped"
+    code, body = _update(port, g["id"], "status",
+                         {"value": "completed", "outcome_note": note})
+    assert code == 200, body
+    assert seen["outcome_note"] == note
 
 
 def test_other_field_writes_omit_warnings_key(running_daemon):

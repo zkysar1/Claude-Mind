@@ -56,11 +56,12 @@ def _pin_lanes(monkeypatch, lanes=LANES, weight=1.0):
         lambda: {"aspirations": set(lanes), "weight": weight})
 
 
-def _row(gid, asp, score, *, recurring=False, ia="either", routed=False):
+def _row(gid, asp, score, *, recurring=False, ia="either", routed=False,
+         title=None):
     return {
         "goal_id": gid, "aspiration_id": asp, "score": score,
         "recurring": recurring, "intended_agent": ia, "routed_to_me": routed,
-        "title": f"title for {gid}",
+        "title": title if title is not None else f"title for {gid}",
     }
 
 
@@ -280,3 +281,68 @@ def test_floor_banner_silent_when_nothing_was_picked():
     with redirect_stderr(buf):
         gs.emit_strategic_focus_floor_banner(None, {"claimable": 0})
     assert buf.getvalue() == ""
+
+
+# ------------------------------------- shared exclusion source ()
+#
+# The floor and the banner both pick ONE lane row to put in front of the agent,
+# and both now source the exclusion list from gs.lane_nominee_exclusion. Fixing
+# only the banner would have been the guard-2128 shape -- a pattern converted at
+# SOME call sites reads as complete. The floor is the site that matters more:
+# the banner ADVISES, whereas a hoist here reaches index 0 and then
+# write_scorer_verdict makes the claim chokepoint accept it WITHOUT a deviation
+# code, so an excluded goal promoted here meets no friction at all.
+
+
+def test_floor_does_not_nominate_a_hypothesis_resolution_lane_goal(monkeypatch):
+    """Clause (i). Non-recurring, so the pre-fix `not recurring` filter that
+    already lived here could not see it."""
+    _pin_lanes(monkeypatch)
+    scored = [
+        _row("g-115-1", "asp-115", 11.6),
+        _row("g-369-14", "asp-369", 8.0,
+             title="Resolve hypothesis: does recency-decay flip argmax"),
+    ]
+    picked, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert picked is None
+    assert status["claimable"] == 0
+    assert status["pool_lane_rows"] == 1   # seen, but not a nominee
+    assert scored[0]["goal_id"] == "g-115-1", "no hoist happened"
+
+
+def test_floor_does_not_nominate_an_owner_parked_lane_goal(monkeypatch):
+    """The severe case. A hoist here puts an owner-held goal at index 0 and the
+    claim chokepoint then accepts it with no deviation code at all -- the agent
+    crosses a dated first-person owner instruction with zero friction and a
+    banner telling it the pick is sanctioned."""
+    _pin_lanes(monkeypatch)
+    scored = [
+        _row("g-115-1", "asp-115", 11.6),
+        _row("g-368-9", "asp-368", 8.0, title="PARKED (LOW): keep US for now"),
+    ]
+    picked, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert picked is None
+    assert status["claimable"] == 0
+    assert scored[0]["goal_id"] == "g-115-1"
+    assert "strategic_focus_pick" not in scored[1]
+
+
+def test_floor_still_hoists_a_clean_lane_goal_ranked_below_an_excluded_one(
+        monkeypatch):
+    """Anti-vacuity (guard-1220), and the ordering half: `nominees[0]` takes the
+    best row AFTER filtering, so an excluded row ranked above a clean one must
+    not suppress the hoist -- it must be skipped over."""
+    _pin_lanes(monkeypatch)
+    clean = _row("g-369-20", "asp-369", 7.0, title="Ship the pricing page")
+    scored = [
+        _row("g-115-1", "asp-115", 11.6),
+        _row("g-368-9", "asp-368", 8.0, title="PARKED (LOW): held"),
+        _row("g-369-14", "asp-369", 7.5, recurring=True),
+        clean,
+    ]
+    picked, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert picked is clean
+    assert status["claimable"] == 1
+    assert status["pool_lane_rows"] == 3
+    assert scored[0] is clean
+    assert clean["strategic_focus_pick"] is True

@@ -430,18 +430,73 @@ def _mark_superseded(source, goal_id, sibling_ids, metrics_path=None,
 
     sibling_str = ", ".join(sibling_ids)
     note = f"superseded by sibling decomposition: {sibling_str}"
+
+    # : BOTH failure arms below emit a goal-keyed metrics row, and the
+    # second one is the whole reason this goal existed.
+    #
+    # The writes are ORDERED note-then-status and the caller's success metric is
+    # gated on `if ok:` (main(), the `_append_metric` after `applied += 1`). So a
+    # run where the note lands and the status write is refused returns False,
+    # emits `action: "mark_failed"` into the in-memory `details` only, and writes
+    # NO metrics row naming the goal — while a false "superseded by sibling
+    # decomposition" note is now sitting on a live goal. Phase 0.5b.8.5, the
+    # sweep-mutation visibility surface (), reads this log, so the one
+    # case where a mutation ACTUALLY LANDED was the one case it could not see.
+    #
+    # Measured on this world 2026-08-31 (alpha, cc-08) before the fix: the log
+    # held 2189 rows, ALL of type run_summary — `grep -c 'g-[0-9]'` returned 0,
+    # so no goal was named anywhere in it, ever. 117 of those runs were
+    # mode=apply with candidates>0, i.e. 117 attempted mutations with zero
+    # goal-keyed trace. Zero refused_stale_candidate rows exist, which rules out
+    # the pre-write guard and leaves this path. That is how  came to
+    # carry a supersession note the metrics log had never heard of.
+    #
+    # Logging from INSIDE rather than from the caller is deliberate: only here is
+    # it known WHICH write failed, and therefore whether the note is on disk.
+    # Deriving that in the caller would mean sniffing the reason string.
+    _failed_common = {
+        "type": "parent_supersession_mark_failed",
+        "goal_id": goal_id,
+        "source": source,
+        "aspiration_id": aspiration_id,
+        "sibling_ids": list(sibling_ids or []),
+        "agent": os.environ.get("MIND_AGENT", "") or None,
+    }
+
     # First write outcome_note (informational only — does NOT close goal).
     rc1, out1, err1 = _py([str(SCRIPT_DIR / "aspirations.py"),
                            "--source", source, "update-goal",
                            goal_id, "outcome_note", note])
     if rc1 != 0:
-        return False, _write_failure_reason("outcome_note", rc1, out1, err1)
+        reason = _write_failure_reason("outcome_note", rc1, out1, err1)
+        _append_metric(metrics_path, {
+            **_failed_common,
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "failed_field": "outcome_note",
+            # Nothing landed — the goal is untouched and needs no repair.
+            "outcome_note_written": False,
+            "reason": reason,
+        })
+        return False, reason
     # Then close the goal.
     rc2, out2, err2 = _py([str(SCRIPT_DIR / "aspirations.py"),
                            "--source", source, "update-goal",
                            goal_id, "status", "completed"])
     if rc2 != 0:
-        return False, _write_failure_reason("status", rc2, out2, err2)
+        reason = _write_failure_reason("status", rc2, out2, err2)
+        _append_metric(metrics_path, {
+            **_failed_common,
+            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+            "failed_field": "status",
+            # THE REPAIRABLE CASE. The note IS on disk and the goal is still
+            # open, so it now reads as superseded while remaining live. The
+            # note text rides along so a repair can match it exactly rather
+            # than reconstructing the template and hoping the format matches.
+            "outcome_note_written": True,
+            "outcome_note": note,
+            "reason": reason,
+        })
+        return False, reason
     # Stamp completed_date if absent.
     today = dt.date.today().isoformat()
     rc3, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
@@ -502,13 +557,18 @@ def main():
             lane = "apply" if _is_apply_goal(g) else None
             struct_sibs = []
             if lane is None:
-                if g.get("status") in ("pending", "in-progress"):
+                # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+                # row 31, found only after the sweep's predicate was widened to see
+                # the `.get("status")` accessor. Without this a candidate parent is
+                # never superseded by its own decomposition siblings.
+                if g.get("status") in ("pending", "in-progress", "candidate"):
                     struct_sibs = _find_structural_split_siblings(g, goals)
                 if not struct_sibs:
                     continue
                 lane = "structural"
             scanned += 1
-            if g.get("status") not in ("pending", "in-progress"):
+            # +candidate — §11b/ (world/conventions/goal-intake-management.md).
+            if g.get("status") not in ("pending", "in-progress", "candidate"):
                 continue
             # A recurring goal is a STANDING CADENCE and can never be
             # superseded by sibling decomposition (). Siblings that

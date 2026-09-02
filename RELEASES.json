@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.47",
+    "previous_version": "2.12.46",
+    "date": "2026-09-02",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Recovery-gate false-positive hardening (g-357-51): absent heartbeat is INERT, backoff-aware pre-kill liveness re-check, durable verdict rows, yank reversal + state-mismatch landing, park-orbit backoff; recurring goals un-strandable at archive (g-357-31)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.46",
     "previous_version": "2.12.45",
     "date": "2026-08-30",

@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from gates.residual_work import (  # via conftest sys.path
     ACTIVE_STATUSES,
     build_successor_goal,
@@ -416,3 +418,125 @@ class TestProvenanceAcceptPath:
         r = _eval("No code was written; the work landed in the defaced repo.")
         assert r["provenance_found"] is False
         assert r["would_block"] is True
+
+
+# ---------------------------------------------------------------------------
+# Bare-noun markers: `remainder` / `successor` ()
+# ---------------------------------------------------------------------------
+
+# VERBATIM from world/residual-work-overrides.jsonl. guard-920: a regression
+# test must replicate the literal production input, not a paraphrase — and
+# here the ledger IS the ground truth the goal was scoped against, so a
+# reworded clause would test a case that never happened.
+#
+# class B — the author is DECLINING to file a carrier. Negated or subjunctive.
+LEDGER_DECLINE_CLAUSES = [
+    "- Did not file a successor.",
+    'No successor goal filed: filing one to "fix the union" would re-create '
+    "the trap",
+    "Did not file a Case-A remainder goal for the resolution — verified the",
+    "Filing a successor would re-open finished work",
+    "Filing a fix goal off one anecdote would route a successor into changing "
+    "a commutativity invariant on the shared work queue.",
+]
+
+# class A — the NOUN with a non-work referent (an API, a code comment, a lane
+# label, a data field). No negation appears anywhere in these, which is the
+# whole reason a negation guard cannot reach them.
+LEDGER_BARE_NOUN_CLAUSES = [
+    "FireCustomEvent is deprecated, and its successor",
+    "The list was amended **twice today**: asp-363 (echo, revenue-lane "
+    "successor,",
+    "Successor to g-326-68 (whose record vanished); this outcome cites "
+    "g-326-68 so the three",
+    "returning `(verdict, reason)` TUPLES, and the whole non-conflicting "
+    "remainder of that function",
+    "frees the successor.",
+    "timestamps and the appended remainder now reads 2026-08-30 instead of "
+    "its true",
+]
+
+
+class TestBareNounMarkers:
+    @pytest.mark.parametrize("clause", LEDGER_DECLINE_CLAUSES)
+    def test_filing_decline_does_not_fire(self, clause):
+        """class B: 'did not file a successor' is the OPPOSITE of a residual."""
+        r = _eval(clause)
+        assert "successor" not in r["matched_markers"]
+        assert "remainder" not in r["matched_markers"]
+
+    @pytest.mark.parametrize("clause", LEDGER_BARE_NOUN_CLAUSES)
+    def test_bare_noun_without_work_context_does_not_fire(self, clause):
+        """class A: the noun refers to an API / comment / label / data field.
+
+        These carry no negation at all, so they are the proof that class A is
+        an ANCHORING problem and not a negation problem — the decision this
+        goal asked to be recorded.
+        """
+        r = _eval(clause)
+        assert "successor" not in r["matched_markers"]
+        assert "remainder" not in r["matched_markers"]
+
+    # --- positive controls: over-suppression is the worse failure ----------
+
+    def test_genuine_filed_successor_still_fires(self):
+        """THE CONTROL the goal names. If this goes silent the markers have
+        been disabled rather than narrowed, and real stranded work ships."""
+        r = _eval("Filed a successor: g-115-1234 carries the rest.")
+        assert "successor" in r["matched_markers"]
+
+    def test_negated_WORK_verb_still_fires(self):
+        """The trap that makes a blanket negation guard wrong.
+
+        'The remainder was NOT attempted' is a negated clause that asserts
+        residual work EXISTS. The negation must scope to the FILING verb
+        (did not file), never to the work verb (not attempted). This is also
+        a pre-existing control in TestMarkers — pinned again here because the
+        bare-noun guard is what could silently break it.
+        """
+        r = _eval("The remainder was not attempted.")
+        assert "remainder" in r["matched_markers"]
+        assert r["would_block"] is True
+
+    def test_successor_goal_needed_still_fires(self):
+        assert "successor" in _eval(
+            "A successor goal is needed for the untouched half."
+        )["matched_markers"]
+
+    def test_remainder_unfinished_still_fires(self):
+        assert "remainder" in _eval(
+            "The remainder of the migration remains unfinished."
+        )["matched_markers"]
+
+    def test_owner_declined_remainder_still_reaches_accept_path_3(self):
+        """`declin*` is WORK context, not a decline-to-file: it asserts a
+        remainder exists and routes it to the owner-decline accept path.
+        Suppressing the marker here would silently disable path 3."""
+        r = _eval("Remainder declined by the owner on 2026-08-13.")
+        assert "remainder" in r["matched_markers"]
+        assert r["owner_decline_found"] is True
+        assert r["would_block"] is False
+
+    # --- scan semantics ----------------------------------------------------
+
+    def test_class_a_mention_does_not_mask_a_later_real_residual(self):
+        """Why the guard uses finditer, not search.
+
+        `search` stops at the FIRST hit. A note that opens with an API-sense
+        'successor' and later names genuine undone work would be waved
+        through on the strength of the irrelevant first mention — a
+        false NEGATIVE introduced by the false-positive fix.
+        """
+        note = ("FireCustomEvent is deprecated, and its successor "
+                "LogCustomEvent is live. Separately, a successor goal is "
+                "still needed for the retry path.")
+        r = _eval(note)
+        assert "successor" in r["matched_markers"]
+        assert r["would_block"] is True
+
+    def test_phrase_markers_are_untouched_by_the_noun_guard(self):
+        """Scope control: the guard applies to the two bare NOUNS only.
+        `follow_up` keeps its own lookbehinds and every phrase marker is
+        unchanged — verified by asserting one of each still behaves."""
+        assert _eval("All shipped. No follow-up needed.")["would_block"] is False
+        assert _eval("Cleanup deferred to a later cycle.")["would_block"] is True

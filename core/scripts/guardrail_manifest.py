@@ -194,7 +194,7 @@ def main():
     est_tokens = int(nbytes / ID_DENSE_BYTES_PER_TOKEN)
     if est_tokens > BUDGET_TOKENS:
         # Bytes AND est-tokens AND the record-count denominator together — a
-        # token estimate without its denominator is the guard-2529/guard-2191
+        # token estimate without its denominator is the guard-2529/guard-2129
         # failure (nothing to sanity-check the conversion against).
         sys.stderr.write(
             "[guardrail-manifest] BUDGET BREACH: {} bytes ~= {} est tokens at the "

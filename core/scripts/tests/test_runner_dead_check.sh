@@ -13,9 +13,9 @@
 #   3. Exit code 1 for the bound agent; JSON shape branches on the observed
 #      role — reducer (RUNNING, heartbeat fresh) vs worker/IDLE ().
 #   4. JSON output is well-formed and contains the 6 condition booleans.
-#   5. Stderr contains a verdict line + 6 per-condition labels.
+#   5. Stderr contains a verdict line + 7 per-condition labels (incl. [5], ).
 #
-# Out-of-scope: rc=0 (all 6 conditions met → dead) requires constructing
+# Out-of-scope: rc=0 (all 7 conditions met → dead) requires constructing
 # a fixture agent dir with controlled state across 6 sub-probes. Manual
 # verification is documented in the goal description ( check #3:
 # two-terminal reproduction). The /start --recover behavior tests live
@@ -147,7 +147,10 @@ if [[ -n "$SELF_AGENT" ]]; then
 import json, sys
 d = json.loads(sys.stdin.read())
 expected_conds = {'state_running', 'heartbeat_stale', 'no_recent_block',
-                  'diary_stale', 'no_stop_requested', 'no_background_jobs'}
+                  'diary_stale', 'no_stop_requested', 'no_background_jobs',
+                  'no_life_evidence'}  # [5] pre-kill re-check, 
+assert d.get('heartbeat') in ('fresh', 'stale', 'absent'), f'heartbeat must be three-way, got {d.get("heartbeat")!r}'
+assert 'life_evidence' in d, 'life_evidence key must be present (null when the re-check did not run)'
 got_conds = set(d.get('conditions', {}).keys())
 missing = expected_conds - got_conds
 assert not missing, f'missing conditions: {missing}'
@@ -159,7 +162,7 @@ assert not (expected_msgs - got_msgs), f'missing messages: {expected_msgs - got_
 assert isinstance(d.get('diary_age_min'), int), 'diary_age_min must be int'
 " 2>/dev/null; then
         pass_count=$((pass_count+1))
-        echo "PASS: scenario 4 (JSON has all 6 condition booleans + messages + diary_age_min)"
+        echo "PASS: scenario 4 (JSON has all 7 condition booleans + messages + diary_age_min + heartbeat/life_evidence)"
     else
         failures=$((failures+1))
         echo "FAIL: scenario 4 JSON structure incomplete. stdout=$out"
@@ -168,16 +171,16 @@ else
     echo "SKIP: scenario 4 (no MIND_AGENT)"
 fi
 
-# ─── Scenario 5: stderr has 6 per-condition labels ─────────────────────
+# ─── Scenario 5: stderr has 7 per-condition labels ─────────────────────
 if [[ -n "$SELF_AGENT" ]]; then
     err=$(MIND_AGENT="$SELF_AGENT" bash "$HELPER" 2>&1 >/dev/null)
-    label_count=$(echo "$err" | grep -cE '^\s*\[(1|2|2\.5|2\.7|3|4)\]')
-    if [[ "$label_count" -eq 6 ]]; then
+    label_count=$(echo "$err" | grep -cE '^\s*\[(1|2|2\.5|2\.7|3|4|5)\]')
+    if [[ "$label_count" -eq 7 ]]; then
         pass_count=$((pass_count+1))
-        echo "PASS: scenario 5 (stderr has 6 per-condition labels)"
+        echo "PASS: scenario 5 (stderr has 7 per-condition labels)"
     else
         failures=$((failures+1))
-        echo "FAIL: scenario 5 expected 6 condition labels, got $label_count. stderr=$err"
+        echo "FAIL: scenario 5 expected 7 condition labels, got $label_count. stderr=$err"
     fi
 
     # Verdict line present

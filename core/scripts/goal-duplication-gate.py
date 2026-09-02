@@ -160,6 +160,14 @@ def main(argv=None) -> int:
                     print("      match: " + json.dumps(m)[:200])
         if result.get("override_applied"):
             print(f"override: {result['override_applied']}")
+        # : the human path is what an operator reads at the moment of
+        # decision, so the remedy must land here too — not only in the JSON.
+        _rem = result.get("remedy")
+        if _rem:
+            print(f"remedy ({_rem['shape']}, {_rem['cites']}): {_rem['why']}")
+            print(f"  FIRST: {_rem['first_action']}")
+            print(f"  OVERRIDE: {_rem['override_guidance']}")
+            print(f"  CAVEAT: {_rem['verification_path_caveat']}")
         # : on a SCOPED block the reason carries the only information
         # that matters — WHICH match the justification never named. The text
         # path printed no reason at all, so that landed nowhere.

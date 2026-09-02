@@ -719,6 +719,24 @@ gates:
     tuning_notes: "Phase-1 earn-the-keep (g-115-1465). strict_improve eps=0.0 for new forges (ties rejected); no_regression eps~0.02 for refactors. Tune epsilon up once Tier-2 (g-115-1467) supplies a real noise estimate."
     retirement_eligible: true
 
+  - id: skill-edit-precommit
+    script: core/scripts/skill-edit-precommit-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/githooks/pre-commit", phase: "Gate 10 (staged .claude/skills/*/SKILL.md, HEAD-vs-worktree structural no_regression)" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: conservative
+    override_flag: "SKILL_EDIT_GATE_OVERRIDE"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A deliberate structural reduction (moving a section out of a SKILL.md) is blocked; author sets SKILL_EDIT_GATE_OVERRIDE with a justification (cheap; audited on stderr + an `override` firing)."
+    fn_description: "A commit that silently guts a SKILL.md (front-matter loss, Return Protocol loss, truncation) lands and every downstream parser breaks — the 2026-05-11 seven-file incident class (high)."
+    rb_evidence: []
+    tuning_notes: "g-115-1467 chokepoint (earn-the-keep G3). Telemetry added 2026-08-31 during the validation-gate-keystone debt reconciliation: the gate was enforce-only from 2026-06-15 with no _gate_log call and no registry id, so its zero firings were a structural cannot-log, not evidence it never ran. Logs noop/pass/block/override per gated path, fail-open (guard-502, guard-2293)."
+    retirement_eligible: true
+
   - id: mdl-encode-parsimony
     script: core/scripts/mdl_gate.py
     embedded: false

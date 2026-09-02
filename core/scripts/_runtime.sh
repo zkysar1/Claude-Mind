@@ -140,6 +140,32 @@ rt_url_encode() {
     printf '%s' "$out"
 }
 
+# rt_judge_provenance — resolve the CALLER's judge identity into
+# RT_JUDGE_MODEL / RT_JUDGE_HARNESS (exported; empty when unresolvable).
+#
+# Judge provenance is a property of the process running the LLM judgment, and
+# that process is the caller — never the long-lived daemon that performs the
+# write. The daemon inherits the environment of whichever session spawned it
+# and holds it for its whole lifetime, so an environment read inside the writer
+# reports one arbitrary session's values for every agent's request: not missing,
+# systematically wrong, and authoritative-looking (guard-2480). Wrappers call
+# this and forward the result in the request body; the writer normalizes what it
+# is given and never consults its own environment ().
+#
+# Empty is deliberate and load-bearing — the writer maps empty to "unknown",
+# which records that the value is absent rather than inventing one (guard-2086).
+rt_judge_provenance() {
+    RT_JUDGE_MODEL="${MIND_JUDGE_MODEL:-}"
+    if [ -n "${CLAUDECODE:-}" ]; then
+        RT_JUDGE_HARNESS="claude-code"
+    elif [ -n "${ZAKCODE_MODEL:-}${ZAKCODE_SESSION:-}" ]; then
+        RT_JUDGE_HARNESS="zakcode"
+    else
+        RT_JUDGE_HARNESS=""
+    fi
+    export RT_JUDGE_MODEL RT_JUDGE_HARNESS
+}
+
 # rt_port — print the daemon's port, or empty string if not running.
 rt_port() {
     [ -f "$RT_PORT_FILE" ] || return 0
@@ -911,8 +937,24 @@ rt_curl() {
         # : 4 consecutive "@alpha" board posts "timed out" at 60-180s
         # while every non-@ post landed instantly). --data-raw is byte-identical
         # to -d except it never file-expands @ (curl >= 7.43).
-        result=$(curl -s --max-time "$RT_CURL_TIMEOUT" -X "$method" "${headers[@]}" \
-            --data-raw "$body_string" -w "${RT_MARKER}%{http_code}" "$url" 2>/dev/null) || curl_rc=$?
+        # BODY GOES ON STDIN, NOT ARGV (). `--data-raw "$body_string"` put the
+        # whole body on the command line, which CreateProcess caps at ~32,767 chars for
+        # the composed total (guard-5634) and execve at MAX_ARG_STRLEN ~128KB per string
+        # (guard-1187). That made any daemon write of a large field impossible from a
+        # Windows box — a goal progress_note past ~32k became permanently unwritable
+        # (WinError 206), with no smaller append that helps, because the bound is on the
+        # whole value being re-sent. `printf` is a bash BUILTIN, so the pipe costs no
+        # process and adds no argv.
+        # `--data-binary`, NOT `--data-raw`: `@-` must be honored as "read stdin", and
+        # --data-raw exists precisely to NOT expand @. Not a regression of the hazard
+        # that chose --data-raw (: a body like "@alpha — ..." was read as a
+        # filename and hard-failed before sending) — that hazard is now STRUCTURALLY
+        # impossible rather than avoided by flag choice, because the only @-token here is
+        # the fixed literal `@-` and no byte of the body is in argv to be expanded.
+        # `--data-binary`, NOT `--data`: --data strips CR/LF when reading from a file
+        # handle; --data-binary is byte-exact, which -raw's contract also was.
+        result=$(printf '%s' "$body_string" | curl -s --max-time "$RT_CURL_TIMEOUT" -X "$method" "${headers[@]}" \
+            --data-binary @- -w "${RT_MARKER}%{http_code}" "$url" 2>/dev/null) || curl_rc=$?
         curl_rc=${curl_rc:-0}
     else
         result=$(curl -s --max-time "$RT_CURL_TIMEOUT" -X "$method" "${headers[@]}" \

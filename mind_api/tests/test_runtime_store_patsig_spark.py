@@ -318,6 +318,20 @@ def test_patsig_set_field_immutable_created(running_daemon):
     assert "immutable_field" in body
 
 
+def test_patsig_set_field_immutable_name(running_daemon):
+    """name is HALF the merge identity (_sig_identity = created + name).
+
+    Same fork risk as the rb/guardrail halves — see g-115-8396.
+    """
+    _, port = running_daemon
+    status, body = _post_err(port, "/v1/store/set-field",
+                             {"store": "pattern-signatures",
+                              "id": "sig-001", "field": "name",
+                              "value": "a materially different name"})
+    assert status == 400
+    assert "immutable_field" in body
+
+
 def test_patsig_set_field_rejects_dotted(running_daemon):
     _, port = running_daemon
     status, body = _post_err(port, "/v1/store/set-field",
@@ -498,6 +512,22 @@ def test_spark_set_field_updates_value(running_daemon):
     on_disk = next(r for r in _read_jsonl(_spark_path(project_root))
                    if r["id"] == "sq-100")
     assert on_disk["status"] == "retired"
+
+
+def test_spark_set_field_immutable_text(running_daemon):
+    """text is the WHOLE merge identity (_spark_identity = text, alone).
+
+    This store was the worst case of the four: it declared no immutable_fields
+    at all, so nothing about a spark record was write-protected and a single
+    set-field could re-key it outright (g-115-8396).
+    """
+    _, port = running_daemon
+    status, body = _post_err(port, "/v1/store/set-field",
+                             {"store": "spark-questions",
+                              "id": "sq-001", "field": "text",
+                              "value": "a materially different question"})
+    assert status == 400
+    assert "immutable_field" in body
 
 
 def test_spark_set_field_rejects_dotted(running_daemon):

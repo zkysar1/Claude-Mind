@@ -189,7 +189,11 @@ if [ "$SOURCE" = "compact" ]; then
         # before this hook fires); a stranded breadcrumb's owning agent
         # does not. Same probe used by L67-73 stale-breadcrumb cleanup —
         # single source of truth for "is this agent live".
-        if [ "$(MIND_AGENT=$_AGENT_NAME bash "$(dirname "$0")/heartbeat-stale.sh" 2>/dev/null)" = "stale" ]; then
+        # `!= fresh`, not `= stale`: heartbeat-stale.sh is three-way since
+        #  (fresh|stale|absent). The autocompacting agent ticked
+        # seconds ago, so anything but FRESH (stale, absent, or a probe
+        # error) means this breadcrumb is not its own — leave it.
+        if [ "$(MIND_AGENT=$_AGENT_NAME bash "$(dirname "$0")/heartbeat-stale.sh" 2>/dev/null)" != "fresh" ]; then
             continue
         fi
         _CLAIMED="$_CP.claimed-$$"

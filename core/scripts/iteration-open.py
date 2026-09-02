@@ -93,6 +93,34 @@ TIER_TABLE_MD = (
 # sentinel battery and selector are comparable. 180s per STAGE leaves headroom
 # for a cold daemon without letting one wedged stage hold loop entry open.
 _STAGE_TIMEOUT_S = 180
+
+
+def _crumb(msg):
+    """One live progress breadcrumb on STDERR. The ONE thing that survives a kill.
+
+    g-115-7844. This wrapper's whole report — the STAGE rc table included — is
+    printed by _emit() at the END, and iteration-open.sh CAPTURES stdout to a temp
+    file so it can count the bytes. So when the caller's bound expires mid-run
+    (`timeout 110 ... ` -> rc=124, or the harness backgrounding the command at its
+    120s default), the process is killed before a single byte of that report is
+    written, and BOTH of the wrapper's own alarms — `wrapper_failed` and `SILENT
+    RUN — ZERO bytes` — are downstream of the kill and never execute. Measured on
+    cc-08 2026-08-31: a clean run emitted stdout 2,648 bytes / stderr 0 bytes, so
+    there was nothing whatsoever to distinguish "killed at 68s" from "ran clean".
+    Zero bytes on both streams is exactly what a quiet clean pass looks like.
+
+    STDERR specifically, and that is the load-bearing detail: iteration-open.sh
+    redirects only stdout (`> "$_OUT"`), so stderr is already un-captured and
+    reaches the caller LIVE. A breadcrumb here needs no change to the wrapper's
+    capture design and cannot be swallowed by it. flush=True because Python
+    block-buffers to a pipe, and an unflushed breadcrumb dies with the process it
+    was meant to outlive.
+
+    Cost is ~10 short lines per run. It does not touch stdout, so --json consumers
+    are unaffected.
+    """
+    print(f"[iteration-open] {msg}", file=sys.stderr, flush=True)
+
 _METER = "aspirations-precheck-budget-meter.sh"
 
 
@@ -146,6 +174,14 @@ STAGES = (
             # precheck-always-run-battery.LANES -- the two must not drift, and
             # test_iteration_open_stage_registry_parity fails if they do.
             "close-phase-skip-check",
+            # Same pairing, third occurrence. Registered in
+            # precheck-always-run-battery.LANES and named in the
+            # aspirations-precheck tier table as Phase 0.5b.1d, but absent from
+            # this tuple -- so the lane RAN while COVERAGE reported it unwired,
+            # exactly the under-report world-script-crlf-check produced. Caught
+            # by test_iteration_open_stage_registry_parity rather than by a
+            # reader, which is the arithmetic doing its job.
+            "directive-mix-check",
         ),
         # Count re-derived from the tuple, never re-typed: the sibling battery's
         # own docstring records seven stale "five lanes" claims from doing that.
@@ -624,7 +660,9 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
         argv = [stage["script"], *stage["args"]]
         if apply and stage["apply_flag"]:
             argv.append("--apply")
+        _crumb(f"-> {stage['key']}")
         rc, out, ms, err = runner(argv, _STAGE_TIMEOUT_S)
+        _crumb(f"   {stage['key']} done rc={rc} {ms}ms")
         row = {"key": stage["key"], "rc": rc, "elapsed_ms": ms, "note": stage["note"]}
 
         if err is not None:
@@ -654,7 +692,28 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
         report["blind"].extend(_blind_from(stage["key"], payload))
         report["stages"].append(row)
 
+    # SELECTION IS A STAGE AND WAS NEVER IN THE STAGE TABLE (). It runs
+    # here, outside the STAGES loop, and _selection() takes the runner's elapsed_ms
+    # only to discard it — so the table a reader consults to judge headroom omitted
+    # the single most expensive thing the run does. Measured on cc-08 2026-08-31:
+    # 68,205 ms wall against a 42,190 ms table sum, i.e. 26,015 ms — 38% of the run
+    # — invisible; goal-selector.sh alone timed 23,442 ms as the positive control.
+    # Anyone sizing a timeout off the table therefore under-shoots by more than a
+    # third, which is precisely how a 110s bound was chosen for a run that cannot
+    # fit in it on a slower box. Timed here rather than inside _selection so its
+    # five return paths stay untouched.
+    _sel_t0 = time.perf_counter()
+    _crumb("-> selection (goal-selector.sh)")
     report["candidates"] = _selection(runner)
+    _sel_ms = int((time.perf_counter() - _sel_t0) * 1000)
+    report["candidates"]["elapsed_ms"] = _sel_ms
+    report["stages"].append({
+        "key": "selection",
+        "rc": 1 if report["candidates"].get("error") else 0,
+        "elapsed_ms": _sel_ms,
+        "note": "goal-selector.sh candidates (outside the STAGES registry)",
+    })
+    _crumb(f"   selection done {_sel_ms}ms")
     if report["candidates"].get("error"):
         errors.append("selector: " + report["candidates"]["error"])
 

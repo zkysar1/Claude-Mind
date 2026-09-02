@@ -127,6 +127,20 @@ if [ -f "$PORT_FILE" ]; then
         resp=$(curl -sf -X POST --max-time 8 "http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}" 2>/dev/null || echo "")
         if [ -n "$resp" ]; then
             case "$resp" in
+                # `"ok": true` alone does NOT mean the file reached the store.
+                # The route answers ok:true with `pushed: 0` and
+                # `"reason": "missing_or_dir"` when it cannot see the path at
+                # all (measured 2026-08-31, ). Gating on ok alone
+                # therefore logs "daemon push ok" for a file that was never
+                # pushed AND suppresses the CLI fallback below — a silent
+                # local-only write, which the warning text already calls out as
+                # revert-bound. Match the did-nothing shape FIRST so it cannot
+                # be absorbed by the ok-true arm. Still exit 0: this hook is
+                # fail-open by contract (guard-141), and a path the daemon
+                # cannot see is one the CLI fallback could not push either.
+                *'"reason": "missing_or_dir"'*|*'"reason":"missing_or_dir"'*)
+                    echo "[owncloud-push-on-write] daemon answered ok but pushed NOTHING for $target — the path is not visible to it — $resp — so the edit is LOCAL-ONLY and will be reverted by the next no-baseline reconcile. Most likely the write landed somewhere unintended (a literal PROJECT_ROOT/world|meta path rather than the configured external root). Confirm with core/scripts/backend-cat.sh before assuming it synced." >&2
+                    exit 0 ;;
                 *'"ok": true'*|*'"ok":true'*)
                     echo "[owncloud-push-on-write] daemon push ok: $resp"
                     exit 0 ;;

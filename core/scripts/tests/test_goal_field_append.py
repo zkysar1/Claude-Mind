@@ -289,8 +289,22 @@ def _concurrent_store(monkeypatch, *, pre, peer_text, field="outcome_note"):
                 store[field] = (store[field] + "\n\n" if store[field] else "") + peer_text
             return _Res(stdout=snapshot)
         if "aspirations-update-goal.sh" in joined:
-            state["writes"].append(argv[-1])
-            store[field] = argv[-1]
+            # The composed value travels on STDIN, never argv (). Reading it
+            # from kw["input"] is not a cosmetic harness update to match the caller —
+            # the three asserts below ARE the pin for that contract. Through argv the
+            # value was capped by Windows CreateProcess at ~32,767 chars for the whole
+            # command line (guard-5634), so any field past that became permanently
+            # unwritable from half the fleet (WinError 206). A regression to a
+            # positional value must fail HERE, cheaply, rather than on a Windows box at
+            # 32k — and it would otherwise pass silently, because the fake would happily
+            # store argv[-1] whatever it holds (guard-920: replicate the literal
+            # production arg shape, not the contract-ideal one).
+            assert "--value-stdin" in argv, "the write must declare --value-stdin"
+            written = kw.get("input")
+            assert written is not None, "the composed value must arrive on stdin"
+            assert written not in argv, "the value must NOT appear in argv at all"
+            state["writes"].append(written)
+            store[field] = written
             return _Res(stdout=json.dumps(dict(store)))
         raise AssertionError(f"unexpected subprocess: {joined}")
 

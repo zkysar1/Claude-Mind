@@ -586,7 +586,12 @@ CADENCE_TRACKER_PATTERNS = (
 # the original bug while looking fixed. Written by capture_fast_lane._merge_flagged
 # at MERGE time; read back as _dedup_append(extra_seen=...).
 RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capture",
-                         "hyp_capture", "encoding_capture", "capture_consumed_hashes"}
+                         "hyp_capture", "encoding_capture", "capture_consumed_hashes",
+                         # : a pinned user-interrupt task is a STANDING HUMAN
+                         # OBLIGATION, not session bookkeeping. A consolidation-time reset
+                         # dropping it reproduces the exact defect the pin exists to fix
+                         # (a directive lost to loop momentum while a person waits).
+                         "interrupt_task_open"}
 
 def _is_cadence_tracker(slot_name):
     """True if slot name matches a cadence-tracker pattern — do not evict.

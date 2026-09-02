@@ -169,3 +169,137 @@ def test_claim_integrity_is_registered_in_subcmds_not_only_dispatch():
         "claim-integrity fell out of SUBCMDS — it would still answer on the "
         "CLI via DISPATCH while silently never running in run-all")
     assert "claim-integrity" in pe.DISPATCH
+
+
+# --- the THIRD verdict: no-live-claims () -------------------------
+#
+# Filed by omni from ZDS-Mind. BLIND's premise -- "on a running fleet some goal
+# is always claimed right now" -- is true on a multi-agent fleet and FALSE on a
+# one-agent deployment, where it fired every iteration forever and buried three
+# real damage findings. These pin the disambiguation AND that it fails safe.
+
+
+def test_no_live_claims_when_nothing_claimed_and_nothing_in_progress():
+    """The ZDS steady state: the zero is ENTAILED, so it carries no
+    information about the source and must not read as a source defect."""
+    assert cic.verdict_for(present_value=0, findings=[],
+                           in_progress=0, scanned=121) == "no-live-claims"
+
+
+def test_blind_still_fires_when_something_is_in_progress():
+    """The genuine source defect this check was built for: a goal ASSERTS work
+    is underway, so a claim should exist, and none carries a value."""
+    assert cic.verdict_for(present_value=0, findings=[],
+                           in_progress=1, scanned=121) == "BLIND"
+
+
+def test_blind_when_scan_located_no_population(tmp_path):
+    """guard-2166: an empty population must return the UNSAFE verdict. 'All
+    members satisfy P' is vacuously true on an empty set, so a scan that found
+    nothing has verified nothing -- scanned==0 outranks in_progress==0."""
+    assert cic.verdict_for(present_value=0, findings=[],
+                           in_progress=0, scanned=0) == "BLIND"
+
+
+def test_unmigrated_two_arg_caller_still_gets_blind():
+    """guard-2275: prefer the fail-safe value as the DEFAULT so an un-migrated
+    call site gets more work, never less. Both new signals are keyword-only
+    with None defaults, and None must NOT satisfy the `in_progress == 0`
+    branch -- a `not in_progress` form would let it through."""
+    assert cic.verdict_for(0, []) == "BLIND"
+    assert cic.verdict_for(present_value=0, findings=[], scanned=121) == "BLIND"
+    assert cic.verdict_for(present_value=0, findings=[], in_progress=0) == "BLIND"
+
+
+def test_no_live_claims_is_never_clean():
+    """guard-2467 preserved exactly: nothing may return 'clean' off a zero.
+    The third verdict is honest ('not applicable'), not healthy."""
+    for in_prog in (0, 1, None):
+        for scanned in (0, 5, None):
+            v = cic.verdict_for(present_value=0, findings=[],
+                                in_progress=in_prog, scanned=scanned)
+            assert v in ("BLIND", "no-live-claims")
+            assert v != "clean"
+
+
+def test_findings_still_outranked_by_a_zero_even_in_the_quiet_case():
+    """present_value==0 outranks findings in BOTH zero-branches: a source that
+    carries no live claim cannot be trusted to have produced a meaningful
+    finding set either."""
+    f = [{"goal_id": "g-1"}]
+    assert cic.verdict_for(present_value=0, findings=f,
+                           in_progress=0, scanned=9) == "no-live-claims"
+    assert cic.verdict_for(present_value=0, findings=f,
+                           in_progress=2, scanned=9) == "BLIND"
+
+
+def test_scan_store_counts_in_progress_into_stats(tmp_path):
+    """The signal must come from the SAME scan -- a second pass would be a
+    second predicate free to drift. Only in-progress counts: pending and
+    blocked are non-terminal but assert no work, and counting them would make
+    in_progress>0 on every quiet store and re-arm the permanent BLIND."""
+    import datetime as dt
+    presence, findings, stats = {}, [], {}
+    scanned = cic._scan_store(
+        _write_store(tmp_path, [
+            {"id": "g-run", "status": "in-progress", "claimed_by": "echo"},
+            {"id": "g-pend", "status": "pending"},
+            {"id": "g-block", "status": "blocked"},
+            {"id": "g-done", "status": "completed", "claimed_by": "echo"},
+        ]),
+        "world", dt.datetime.now(), presence, findings, stats)
+    assert scanned == 3, "terminal excluded, the other three counted"
+    assert stats.get("in_progress") == 1, (
+        "only in-progress asserts work underway; pending/blocked must not "
+        "count or every quiet store reads as a source defect")
+
+
+def test_scan_store_tolerates_absent_stats(tmp_path):
+    """stats is optional (the existing _scan helper passes none). A caller
+    that skips it simply does not collect the signal, and verdict_for then
+    falls back to BLIND -- it must not raise."""
+    import datetime as dt
+    presence, findings = {}, []
+    scanned = cic._scan_store(
+        _write_store(tmp_path, [
+            {"id": "g-run", "status": "in-progress", "claimed_by": "echo"},
+        ]),
+        "world", dt.datetime.now(), presence, findings)
+    assert scanned == 1
+
+
+def test_quiet_single_agent_store_end_to_end(tmp_path):
+    """The reported shape, end to end: non-terminal goals exist, none is
+    in-progress, none carries a claim value. Must be no-live-claims, and the
+    key_presence census must still be computed."""
+    import datetime as dt
+    presence, findings, stats = {}, [], {}
+    scanned = cic._scan_store(
+        _write_store(tmp_path, [
+            {"id": "g-1", "status": "pending"},
+            {"id": "g-2", "status": "blocked"},
+            {"id": "g-3", "status": "pending", "claimed_by": None},
+        ]),
+        "world", dt.datetime.now(), presence, findings, stats)
+    assert presence == {"absent": 2, "null": 1}
+    assert cic.verdict_for(presence.get("value", 0), findings,
+                           in_progress=stats.get("in_progress", 0),
+                           scanned=scanned) == "no-live-claims"
+    # ...and the damage finding is still reported, which is the whole point:
+    # the permanent BLIND was burying exactly these.
+    assert [f["goal_id"] for f in findings] == ["g-3"]
+
+
+def test_result_publishes_in_progress_so_the_verdict_is_re_derivable():
+    """guard-3743: a decision record must reproduce its own verdict from its
+    own recorded inputs. Without in_progress on the result, 'no-live-claims'
+    would be an assertion no downstream reader could check."""
+    res = cic.main_result()
+    assert "in_progress" in res
+    assert isinstance(res["in_progress"], int)
+    assert "scanned_non_terminal" in res
+    # The published inputs must actually reproduce the published verdict.
+    assert cic.verdict_for(res["key_presence"]["present_value"],
+                           res["findings"],
+                           in_progress=res["in_progress"],
+                           scanned=res["scanned_non_terminal"]) == res["verdict"]

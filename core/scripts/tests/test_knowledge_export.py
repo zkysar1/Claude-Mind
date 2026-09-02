@@ -61,6 +61,10 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
 # assertions that check a degraded entry's `path` cannot drift apart.
 TREE_INDEX_BASENAME = "_tree.yaml"
 
+# Basename of the aspiration store, same reason. Fixtures write it only inside a
+# tmp world; the LIVE store is written exclusively through its framework scripts.
+ASPIRATIONS_BASENAME = "aspirations.jsonl"
+
 
 def _build_world(root: Path, *, write_bodies: bool = False) -> Path:
     """Create a minimal but realistic world/ tree + three JSONL stores under root.
@@ -582,7 +586,7 @@ def test_build_bundle_filters_and_redacts(tmp_path: Path) -> None:
 
     # Exactly the domain entries survive; framework rows are gone.
     assert bundle.counts() == {
-        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0,
+        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0, "goals": 0,
     }  # the fixture world has no agents/<a>/self.md -> `self` projects empty
 
     node = bundle.tree[0]
@@ -652,7 +656,7 @@ def test_build_bundle_empty_world_is_empty_bundle(tmp_path: Path) -> None:
     (tmp_path / "world").mkdir()
     bundle = M.build_bundle(tmp_path / "world", tmp_path, env={})
     assert bundle.counts() == {
-        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0,
+        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0, "goals": 0,
     }
 
 
@@ -728,7 +732,7 @@ def test_okf_empty_bundle_writes_index_and_empty_dirs(tmp_path: Path) -> None:
     out = tmp_path / "okf"
     counts = M.write_okf_bundle(bundle, out)
     assert counts == {
-        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0,
+        "tree": 0, "hypotheses": 0, "guardrails": 0, "lessons": 0, "self": 0, "goals": 0,
     }
     assert (out / "index.md").is_file()
     assert list((out / "nodes").glob("*.md")) == []
@@ -1046,7 +1050,7 @@ def test_healthy_export_omits_the_degraded_key_from_the_written_payload(
 def test_malformed_index_refuses_to_write_and_names_the_cause(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """A malformed index REFUSES the write (rc=2). It does not emit a degraded bundle.
+    """A malformed index refuses the write (rc=2) WHEN A PRIOR BUNDLE WOULD BE LOST.
 
     This is not the assertion g-368-54 asked for, and the difference is the finding.
     That goal asked for a test pinning ``degraded`` in main()'s WRITTEN payload. Writing
@@ -1076,9 +1080,16 @@ def test_malformed_index_refuses_to_write_and_names_the_cause(
     monkeypatch.setenv("WORLD_PATH", str(world))
     monkeypatch.delenv("META_PATH", raising=False)
     out = tmp_path / "bundle.json"
+    #  narrowed the refusal to `evidence and (prior_exists or not degraded)`, so
+    # the KNOWN-cause + no-prior cell now EMITS a degraded bundle (a marker beats absence)
+    # and only this cell still refuses. Planting the prior bundle is what keeps this test
+    # pinning the stderr contract below instead of pinning behaviour that was replaced.
+    out.write_text('{"previous": "good"}', encoding="utf-8")
 
     assert M.main(["-o", str(out)]) == 2
-    assert not out.exists(), "the refusal must leave the previous bundle in place"
+    assert out.read_text(encoding="utf-8") == '{"previous": "good"}', (
+        "the refusal must leave the previous bundle byte-intact"
+    )
 
     err = capsys.readouterr().err
     assert "REFUSING to write an all-zero bundle" in err
@@ -1089,17 +1100,23 @@ def test_malformed_index_refuses_to_write_and_names_the_cause(
     assert TREE_INDEX_BASENAME in err, err
 
 
-def test_degraded_payload_branch_is_currently_unreachable(tmp_path: Path) -> None:
-    """Pins the reachability gap itself, so making it reachable is a DELIBERATE act.
+def test_degraded_refusal_preconditions_still_hold(tmp_path: Path) -> None:
+    """Pins the three preconditions that make the all-zero refusal fire on a degraded tree.
 
-    If a future change exempts a degraded export from the all-zero refusal (or lets the
-    non-tree stores project independently of the tree), this test fails and points the
-    author at ``test_malformed_index_refuses_to_write_and_names_the_cause`` — which will
-    then need to become the payload assertion g-368-54 originally asked for.
+    ⚠ THIS TEST WAS NAMED ``..._branch_is_currently_unreachable`` UNTIL 2026-08-30, AND IT
+    FAILED TO DETECT THE CHANGE IT EXISTED TO DETECT. Its docstring promised that if "a
+    future change exempts a degraded export from the all-zero refusal ... this test fails".
+    g-368-57 (c82b0a120) did exactly that — narrowing the refusal to
+    ``evidence and (prior_exists or not degraded)`` — and this test stayed GREEN, because
+    it asserts the PRECONDITIONS (all-zero counts, non-empty evidence) and the carve-out
+    was added DOWNSTREAM of them. Both preconditions remained true; only the predicate
+    reading them changed. A proxy assertion cannot see a change made past the proxy.
 
-    Asserted on the PRECONDITION, not by grepping the source: the branch is unreachable
-    because degradation implies all-zero counts AND non-empty evidence, and that is a
-    property of behaviour, not of text.
+    The reachability claim is now pinned DIRECTLY, per-cell, by the pair in
+    ``test_knowledge_export_tree_layout.py`` (emit when no prior bundle; refuse when one
+    would be lost). What survives here is the narrower, still-true property those two
+    depend on: a degraded tree zeroes every knowledge count while the world still
+    demonstrably holds stores. Keep it asserted on behaviour, never by grepping source.
     """
     import knowledge_projection as K
 
@@ -1139,3 +1156,162 @@ def test_self_count_cannot_satisfy_the_broken_export_refusal(tmp_path: Path) -> 
     assert not any(bundle.counts()[k] for k in K.KNOWLEDGE_COUNT_KEYS), (
         "the refusal must still see this export as all-zero knowledge"
     )
+
+
+# ── goals projection () — the -style end-to-end coverage ──────
+
+def _goal(**kw) -> dict:
+    base = {"title": "Ship the reef explorer", "work_class": "product", "status": "pending"}
+    base.update(kw)
+    return base
+
+
+def _world_with_goals(root: Path, aspirations: list[dict]) -> Path:
+    """A normal world plus a WORLD aspiration store carrying nested goals.
+
+    Fixture-local tmp world — never the live store, which is written only through
+    its framework scripts.
+    """
+    world = _build_world(root)
+    (world / ASPIRATIONS_BASENAME).write_text(
+        "\n".join(json.dumps(a) for a in aspirations) + "\n", encoding="utf-8"
+    )
+    return world
+
+
+def test_read_goals_flattens_nested_world_aspirations(tmp_path: Path) -> None:
+    """Store I/O only: flatten nested `goals`, skip malformed aspirations, never raise.
+
+    A single malformed aspiration must not zero the whole projection — the store is
+    append-only and one bad line has to stay one bad line.
+    """
+    world = _world_with_goals(
+        tmp_path,
+        [
+            {"id": "asp-369", "goals": [_goal(title="A"), _goal(title="B")]},
+            {"id": "asp-368", "goals": "not-a-list"},   # malformed → skipped, not raised
+            {"id": "asp-115"},                          # no goals key at all
+            {"id": "asp-364", "goals": [_goal(title="C"), "not-a-dict"]},
+        ],
+    )
+    assert [g["title"] for g in M._read_goals(world)] == ["A", "B", "C"]
+
+
+def test_read_goals_absent_store_is_empty_not_an_error(tmp_path: Path) -> None:
+    """A world with no aspiration store publishes zero goals, same as a new world."""
+    assert M._read_goals(_build_world(tmp_path)) == []
+
+
+def test_read_goals_reads_the_world_queue_not_the_agent_queue(tmp_path: Path) -> None:
+    """WORLD ONLY, deliberately — and this is the assertion that pins the choice.
+
+    An agent's own queue is private maintenance. Reading it would publish per-agent
+    housekeeping AND make the bundle depend on which agent happened to run the export.
+    """
+    world = _world_with_goals(tmp_path, [{"id": "asp-369", "goals": [_goal(title="World goal")]}])
+    (tmp_path / "agents" / "alpha" / ASPIRATIONS_BASENAME).write_text(
+        json.dumps({"id": "asp-private", "goals": [_goal(title="Agent private goal")]}) + "\n",
+        encoding="utf-8",
+    )
+    assert [g["title"] for g in M._read_goals(world)] == ["World goal"]
+
+
+def test_goals_reach_json_payload_and_okf_bundle(tmp_path: Path, monkeypatch) -> None:
+    """Both enumerated writers carry it — an enumerated writer drops what it is not told about.
+
+    This is the g-368-54 lesson applied to a second projection: ``self`` shipped with a
+    unit test that never called ``main()``, and the JSON half went untested until a
+    hand-run positive control caught it. So this exercises the WHOLE path — real store on
+    disk, ``main()`` to a file, then ``write_okf_bundle`` — not the projection alone.
+    """
+    world = _world_with_goals(
+        tmp_path,
+        [{"id": "asp-369", "goals": [
+            _goal(title="Ship the reef explorer", status="in-progress", started="2026-08-01"),
+            _goal(title="Framework chore", work_class="framework"),   # gate 1 drops
+            _goal(title="Blocked thing", status="blocked"),           # gate 2 drops
+        ]}],
+    )
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    out = tmp_path / "bundle.json"
+
+    assert M.main(["-o", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "goals" in payload, sorted(payload)
+    assert "goals" in payload["counts"], sorted(payload["counts"])
+    assert payload["counts"]["goals"] == 1
+    assert payload["goals"] == [
+        {"title": "Ship the reef explorer", "status": "in progress", "updated": "2026-08-01"}
+    ]
+
+    bundle = M.build_bundle(world, tmp_path)
+    okf = tmp_path / "okf"
+    counts = M.write_okf_bundle(bundle, okf)
+    assert counts["goals"] == 1
+    goals_md = (okf / "goals.md").read_text(encoding="utf-8")
+    assert _fm(goals_md)["type"] == "goals", "one concept = one md + a required discriminator"
+    assert _fm(goals_md)["count"] == 1
+    assert "Ship the reef explorer" in goals_md and "in progress" in goals_md
+    assert "Framework chore" not in goals_md and "Blocked thing" not in goals_md
+    assert "- [What's planned](goals.md) (1)" in (okf / "index.md").read_text(encoding="utf-8")
+
+
+def test_goals_absent_publishes_no_okf_file_rather_than_an_empty_one(tmp_path: Path) -> None:
+    """Same absence contract as self.md: no file means "nothing published", not "blank".
+
+    An empty *What's planned* page on a member-facing wiki advertises that a surface
+    exists and is empty, which is a worse signal than the surface not being there.
+    """
+    okf = tmp_path / "okf"
+    counts = M.write_okf_bundle(M.build_bundle(_build_world(tmp_path), tmp_path), okf)
+    assert counts["goals"] == 0
+    assert not (okf / "goals.md").exists()
+    assert "goals.md" not in (okf / "index.md").read_text(encoding="utf-8")
+
+
+def test_goals_count_cannot_satisfy_the_broken_export_refusal(tmp_path: Path) -> None:
+    """`goals` is in counts() but NOT in KNOWLEDGE_COUNT_KEYS — the `self` gap, mirrored.
+
+    In counts() because guard-5144 says a projection absent from counts is a projection
+    no verifier can check. Out of the refusal set because goals are work items, not
+    knowledge: a world can legitimately publish zero product goals while its four
+    knowledge stores are healthy, so folding it in would let a genuinely broken export
+    walk past the all-zero gate built to catch it.
+    """
+    import knowledge_projection as K
+
+    assert "goals" in K.ProjectedBundle().counts()
+    assert "goals" not in K.KNOWLEDGE_COUNT_KEYS
+
+    bundle = M.ProjectedBundle(goals=[{"title": "t", "status": "planned", "updated": ""}])
+    assert bundle.counts()["goals"] == 1
+    assert any(bundle.counts().values()), "the naive check would pass this broken bundle"
+    assert not any(bundle.counts()[k] for k in K.KNOWLEDGE_COUNT_KEYS), (
+        "the refusal must still see this export as all-zero knowledge"
+    )
+
+
+def test_goals_projection_never_emits_an_internal_goal_field(tmp_path: Path) -> None:
+    """End-to-end leak check, at the WRITTEN-BYTES level rather than the dict level.
+
+    The unit test pins the allowlist on the returned dict; this pins that nothing
+    re-attaches an internal field on the way through either writer. ``outcome_note`` and
+    ``defer_reason`` carry verbatim measurements — account ids, table names, box
+    hostnames, partner-agent names — and are the highest-value leak in the bundle.
+    """
+    world = _world_with_goals(
+        tmp_path,
+        [{"id": "asp-369", "goals": [_goal(
+            goal_id="g-369-70",
+            outcome_note="table prod-accounts on cc-02 holds 110 keys",
+            defer_reason="human_blocked: awaiting sign-off",
+            claimed_by="zeta",
+            priority="HIGH",
+        )]}],
+    )
+    okf = tmp_path / "okf"
+    M.write_okf_bundle(M.build_bundle(world, tmp_path), okf)
+    blob = "".join(p.read_text(encoding="utf-8") for p in okf.rglob("*.md"))
+    for internal in ("prod-accounts", "cc-02", "zeta", "human_blocked", "HIGH", "g-369-70"):
+        assert internal not in blob, internal

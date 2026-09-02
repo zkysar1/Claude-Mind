@@ -560,6 +560,21 @@ export MIND_AGENT="$HOOK_AGENT"
 
 # --- Gate 1: Not RUNNING → allow stop ---
 STATE=$(bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
+# Gate 1-pre ( part 3): a live reducer whose agent-state was YANKED to
+# IDLE by recovery-gate.sh dies SILENTLY here — this gate ALLOWs any non-RUNNING
+# turn-end, and nothing distinguishes "the user stopped me" from "a false crash
+# recovery demoted me while I was alive". The process executing THIS hook is,
+# by construction, alive. recovery-yank-reverse.sh re-derives the yank against
+# that fact under narrow preconditions (this SID is the demoted runner, bound
+# autonomous, the demotion is recent, no user-stop artifact post-dates it) and
+# restores RUNNING; every other input returns non-zero and the status quo
+# stands. The script is the whole mechanism — the hook only re-reads state.
+if [ "$STATE" = "IDLE" ] && [ -f "$CORE_ROOT/scripts/recovery-yank-reverse.sh" ] \
+   && [ -f "$HOOK_AGENT_DIR/session/recovery-log.jsonl" ] \
+   && bash "$CORE_ROOT/scripts/recovery-yank-reverse.sh" --agent "$HOOK_AGENT" --sid "$HOOK_SID" >>"$LOG" 2>&1; then
+    STATE=$(bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
+    echo "$(date +%Y-%m-%dT%H:%M:%S) YANK-REVERSED sid=$HOOK_SID agent=$HOOK_AGENT state=$STATE" >> "$LOG" 2>/dev/null || true
+fi
 if [ "$STATE" != "RUNNING" ]; then
     # SG-c (-c): the runner session is ending. A graceful /stop sets
     # IDLE at D1 BEFORE stop-loop at D2, so THIS not-RUNNING gate — not Gate 2 —

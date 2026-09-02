@@ -286,13 +286,49 @@ def _read_local_paths():
         # Falling through (rather than raising) preserves the loop when a
         # test polluter sets MIND_AGENT without restoring; the warning
         # surfaces the polluter for the next sweep / audit.
-        print(
-            f"[_paths] WARN: MIND_AGENT={agent!r} but {conf} does not exist. "
-            f"Falling through to first-available local-paths.conf to prevent "
-            f"PROJECT_ROOT/world,meta cruft. Likely a test polluter set "
-            f"MIND_AGENT without restoring the env var (g-115-960 / g-115-953).",
-            file=sys.stderr,
-        )
+        # SILENCE GATE (). Re-measured 2026-08-30 (zeta, cc-02,
+        # Linux 6.8.0-137-generic): 6 of the 7 real fleet agents have NO
+        # local-paths.conf, so on a .mind-data box this warning names a
+        # nonexistent "test polluter" on ~6/7 invocations.
+        #
+        # The warning guards TWO distinct harms, and they need DIFFERENT
+        # predicates -- silencing on either one alone trades a false positive
+        # for a false negative (guard-4349: fail direction follows blast
+        # radius, not the sibling that shares the predicate):
+        #   (a) WORLD/META misroute -- the fallthrough adopts an ARBITRARY
+        #       other agent's conf. Impossible when .mind-data/ exists, because
+        #       _resolve_tier takes its .mind-data branch BEFORE any conf
+        #       ( M1), so which conf the glob picks cannot matter.
+        #   (b) agent-private misroute -- AGENT_DIR still resolves to the NAMED
+        #       dir, so writes land in a directory that may not exist. The
+        #       .mind-data tier does NOT cover this. Measured: MIND_AGENT=
+        #       bogus-polluter-zzz gives WORLD_DIR=.mind-data/world (fine) and
+        #       agent_dir=agents/bogus-polluter-zzz (absent -> new cruft).
+        #
+        # So the goal's own proposed remedy (".mind-data present = silent") was
+        # REFUSED: it silences (b), which is the half that still bites, on a box
+        # whose agents/ already carries misroute residue. Requiring BOTH means
+        # the warning goes quiet exactly when NEITHER harm is reachable, and
+        # stays loud for the original  pattern -- a name with no dir.
+        #
+        # Gated on (PROJECT_ROOT / ".mind-data") rather than MIND_DATA_DIR
+        # because this function runs at module import (`_local = ...`) BEFORE
+        # that constant is bound. Keep the two expressions identical; the
+        # shared predicate is what makes (a) a guarantee instead of a
+        # coincidence -- if .mind-data/ ever stops existing, the override and
+        # the silence lapse together. MIRROR: core/scripts/_paths.sh (guard-867).
+        _md_ok = (PROJECT_ROOT / ".mind-data").is_dir()
+        _dir_ok = agent_dir(agent).is_dir()
+        if _md_ok and _dir_ok:
+            pass  # neither harm reachable -- fall through to the glob, silently
+        else:
+            print(
+                f"[_paths] WARN: MIND_AGENT={agent!r} but {conf} does not exist. "
+                f"Falling through to first-available local-paths.conf to prevent "
+                f"PROJECT_ROOT/world,meta cruft. Likely a test polluter set "
+                f"MIND_AGENT without restoring the env var (g-115-960 / g-115-953).",
+                file=sys.stderr,
+            )
         # fall through to the first-available glob below
 
     # MIND_AGENT unset OR named a nonexistent agent — use the first available

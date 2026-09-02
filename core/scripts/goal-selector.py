@@ -87,6 +87,11 @@ from _paths import (WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT,
                     ENVIRONMENT_ID, agents_root as _agents_root, read_agent_conf)
 from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
 from wm import read_wm  # noqa: E402
+# : the pull_signal liveness arithmetic lives in
+# pull_signal_producer (the only importable side — this file is hyphenated)
+# so the producer's SKIP-live guard and this file's two consumers cannot
+# drift apart about which signals are live.
+from pull_signal_producer import live_age_hours as _pull_live_age_hours  # noqa: E402
 # : the board-routing-tag rule lives in peer_surface (the same module
 # that owns split_author) so directive-honor here, insight-trigger-gate, and the
 # sweep cannot drift apart about what `agent@env-id` means.
@@ -1187,20 +1192,31 @@ def load_fan_in_config():
 FAN_IN_CONFIG = load_fan_in_config()
 
 
-_PULL_SKEW_TOLERANCE_H = 1.0
 
 
 def pull_signal_live_age_hours(sig, config, now=None):
-    """SINGLE SOURCE OF TRUTH for "is this ``pull_signal`` live?".
+    """Config-aware view of the pull_signal liveness rule for THIS file.
 
     Returns the signal's age in hours (clamped at 0.0) when it is LIVE, or
     ``None`` when it is absent, malformed, aged out, or implausibly far in the
-    future. Two callers consume it and they must never disagree:
+    future. Two callers in this file consume it and they must never disagree:
 
       * ``apply_pull_boost`` — converts a live signal into RANK.
       * the recurring hour gate — converts a live signal into ELIGIBILITY.
 
-    WHY THIS IS ONE FUNCTION AND NOT TWO COPIES (g-115-6590, 2026-08-28). The
+    THE ARITHMETIC IS NOT HERE, AND THAT IS THE POINT (g-115-6590, 2026-08-30).
+    The bounds, the parse and the skew tolerance live in
+    ``pull_signal_producer.live_age_hours``; this function adds exactly one thing
+    on top of it — the ``enabled`` gate — and unpacks the config. Until 2026-08-30
+    this file carried its own copy of that arithmetic. The two copies AGREED
+    (verified across 0.5/12/23.9/25/100h plus the absent-signal case), which is
+    precisely why the duplication was survivable long enough to become load-bearing:
+    the g-353-62 review named the residual as "one predicate per FILE, not one per
+    mechanism", and agreeing today is not the same as being one rule. Direction is
+    forced, not chosen: this file is HYPHENATED and cannot be imported by name, so
+    the shared half can only sit on the producer's side. Do not re-inline it here.
+
+    WHY ONE PREDICATE AND NOT TWO COPIES (g-115-6590, 2026-08-28). The
     boost shipped 2026-08-17 reading this predicate inline, and the eligibility
     half did not exist at all -- so a not-yet-due recurring consumer carrying a
     live signal was dropped by the hour gate BEFORE ``apply_pull_boost`` ran over
@@ -1212,8 +1228,8 @@ def pull_signal_live_age_hours(sig, config, now=None):
     are live -- a goal admitted by one and ignored by the other -- so both call
     this.
 
-    THE SKEW TOLERANCE IS LOAD-BEARING, NOT DEFENSIVE PADDING, and it is why this
-    does not use ``hours_since``: that helper folds ANY future timestamp into
+    THE SKEW TOLERANCE IS LOAD-BEARING, NOT DEFENSIVE PADDING, and it is why the
+    shared helper does not use ``hours_since``: that helper folds ANY future timestamp into
     "corrupt" and returns None. Correct for its own callers, wrong here -- the
     signal is written on the PRODUCER's box and read on the CONSUMER's, so a
     producer even seconds ahead stamps a ``set_at`` in the reader's future and
@@ -1229,20 +1245,8 @@ def pull_signal_live_age_hours(sig, config, now=None):
     """
     if not config.get("enabled"):
         return None
-    if not isinstance(sig, dict):
-        return None
-    raw_set_at = sig.get("set_at")
-    if not raw_set_at or not isinstance(raw_set_at, str):
-        return None
-    try:
-        set_at = datetime.fromisoformat(raw_set_at)
-    except (ValueError, TypeError):
-        return None
-    max_age = float(config.get("max_age_hours", 24.0))
-    age_h = ((now or datetime.now()) - set_at).total_seconds() / 3600.0
-    if age_h > max_age or age_h < -_PULL_SKEW_TOLERANCE_H:
-        return None
-    return max(0.0, age_h)
+    return _pull_live_age_hours(
+        sig, now or datetime.now(), float(config.get("max_age_hours", 24.0)))
 
 
 def load_user_signal_boost_config():
@@ -2426,7 +2430,12 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
         for goal in asp.get("goals", []):
             if goal_record_id(asp, goal) is None:
                 continue  # string ref / id-less stub: warned once, never a candidate
-            if goal.get("status") != "pending":
+            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+            # the collection loop itself. Without this a candidate-status goal never
+            # becomes a scoring candidate at all — the highest-severity row of batch 2.
+            # (NB the word "candidate" on the line above means a SCORING candidate;
+            # the status of the same name is unrelated to it.)
+            if goal.get("status") not in ("pending", "candidate"):
                 continue
 
             # Self-abstention check: skip goals this agent previously abstained from.
@@ -2597,34 +2606,35 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                         # la 2.1h < interval 4.45h. Absence, not a low rank:
                         # nothing score-side could have reached it.
                         #
-                        # Liveness comes from pull_signal_producer.is_live, whose
-                        # docstring is literally "True when apply_pull_boost would
-                        # currently honour this signal" — ONE predicate, TWO
-                        # consumers, so eligibility and lift cannot drift apart.
-                        # That is the same argument overdue_exemption_level makes
-                        # for its own two consumers (); a second inline
-                        # copy of the skew/age arithmetic is what would rot.
+                        # Liveness comes from
+                        # pull_signal_producer.live_age_hours — ONE predicate,
+                        # THREE consumers (this gate, apply_pull_boost, and the
+                        # producer's own SKIP-live guard), so eligibility, lift
+                        # and idempotence cannot drift apart. Same argument
+                        # overdue_exemption_level makes for its own two
+                        # consumers ().
                         #
-                        # NO-REGRESSION BY CONSTRUCTION: is_live returns False for
-                        # a goal with no pull_signal dict, so every unpulled goal
-                        # takes the `continue` exactly as before. Gated on
+                        # NO-REGRESSION BY CONSTRUCTION: it returns None for a
+                        # goal carrying no pull_signal dict, so every unpulled
+                        # goal takes the `continue` exactly as before. Gated on
                         # PULL_CONFIG["enabled"] so disabling the mechanism
                         # disables the bypass too, matching apply_pull_boost's
                         # own early return.
                         #
-                        # PREDICATE CHOICE, settled at the cc-05/cc-07 merge
-                        # (2026-08-28): this calls goal-selector's own
-                        # pull_signal_live_age_hours, NOT pull_signal_producer's
-                        # is_live. Both were written for this gate and they agree
-                        # across the whole age range (verified 0.5/12/23.9/25/100h
-                        # plus the absent-signal case) — but is_live re-implements
-                        # the skew/age arithmetic in the producer module, and
-                        # apply_pull_boost needs the AGE (it records
-                        # pull_signal_age_hours), so it cannot use a bool. Reading
-                        # is_live here would therefore leave the gate and the boost
-                        # on two SEPARATE copies of one rule, which is precisely
-                        # the drift the paragraph above argues against. One
-                        # predicate, two consumers — literally, not by intent.
+                        # HISTORY, kept because this block spent two days
+                        # asserting the opposite of the code beneath it. At the
+                        # cc-05/cc-07 merge (2026-08-28) the gate deliberately
+                        # called THIS file's own copy of the arithmetic rather
+                        # than the producer's is_live, on the sound reasoning
+                        # that apply_pull_boost needs the AGE and is_live returns
+                        # a bool. Sound, and it left one predicate per FILE
+                        # rather than per MECHANISM — which the  review
+                        # named as the residual.  closed it 2026-08-30
+                        # by moving the age arithmetic to the producer module
+                        # (the only importable side — this file is hyphenated)
+                        # and making is_live a one-line bool view of it, so the
+                        # bool-vs-age tension that forced the split no longer
+                        # exists. Do not re-inline the bounds here.
                         if not (
                             PULL_CONFIG.get("enabled")
                             and pull_signal_live_age_hours(
@@ -2923,6 +2933,17 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
       dependency       — blocked_by contains unmet prerequisite IDs
       deferred         — deferred_until is in the future
       hypothesis_gate  — resolves_no_earlier_than is in the future
+      precondition_unmet — a structured verification.preconditions predicate failed
+      routed_to_agent  — intended_agent names another agent and no escape applies
+      not_my_lane      — the lane-pin claim gate excludes this runner (guard-2900)
+
+    The last three were emitted but UNDOCUMENTED until 2026-08-30, and
+    routed_to_agent is the DOMINANT reason — measured that day, 842 of 1058
+    live blocks (80%). This docstring is the surface agents read to learn why
+    a goal was dropped, and a reader who trusts it concludes the queue holds
+    an unexplained population that does not exist: g-115-3152's own 2026-07-31
+    correction cites this docstring as listing "all five predicates in priority
+    order". Keep it in sync with the entry["block_reason"] emit sites below.
 
     Excludes: recurring cooldown (not a real block), user-only goals,
     completed/skipped/expired/decomposed/in-progress goals.
@@ -3027,7 +3048,10 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 continue
 
             # Only pending goals from here
-            if status != "pending":
+            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+            # a candidate falls past the blocked.append branch above and was then
+            # continue'd, so it was reported neither as selectable NOR as blocked.
+            if status not in ("pending", "candidate"):
                 continue
 
             # 2. Infrastructure blocker (skill-based, primary)
@@ -3801,6 +3825,79 @@ def directive_boost_score(goal_id, category):
     return boost
 
 
+# --- directive exclusion classes for lane NOMINEES () --------------
+# The directive names which aspirations are boosted; it also names which goals
+# INSIDE those lanes do not count as unbuilt product work. Both the banner and
+# the floor pick one lane row to put in front of the agent, and neither
+# inherited those qualifiers -- load_strategic_focus() returns only
+# {"aspirations", "weight"}, so there is nothing upstream to inherit and the
+# filter has to exist here.
+#
+# WHY A SHARED HELPER AND NOT ANOTHER `and not ...` CONJUNCT. The exclusion set
+# arrived one class at a time, at two call sites, over three weeks, and each
+# increment was applied to whichever site the reporter happened to be looking
+# at.  added `not recurring` to BOTH sites correctly; clause (i) and
+# the parked class were then reported against the banner alone. A chain of
+# conjuncts makes "which classes does this site apply?" a per-site question
+# with no single answer -- exactly the shape guard-2128 names (a fix that
+# converts SOME call sites of a pattern reads as complete). One function is
+# the source of the list; both sites ask it.
+#
+# THE ASYMMETRY THAT SETS THE MATCHING POLICY. A false EXCLUSION costs a banner
+# that stays silent or a floor that does not hoist -- the pre-existing state,
+# and the inert banner already reports it. A false INCLUSION steers an agent
+# onto work the owner said not to touch, and at the FLOOR site it does so with
+# no friction at all: the floor hoists to index 0 and write_scorer_verdict makes
+# the claim chokepoint accept it WITHOUT a deviation code. So the title tests
+# are ANCHORED prefixes, never substrings (guard-2860: never relax a predicate
+# into a pattern), and under-matching is the sanctioned direction.
+#
+# Returns the REASON so a caller can name it; None means "eligible nominee".
+# Never raises -- both call sites promise fail-open, and a malformed row must
+# read as eligible rather than crash selection.
+_LANE_NOMINEE_HYPOTHESIS_PREFIX = "resolve hypothesis:"
+_LANE_NOMINEE_PARKED_PREFIX = "parked"
+
+
+def lane_nominee_exclusion(s):
+    """Reason this lane row is not a directive nominee, or None if it is one.
+
+    (ii) recurring:true -- a FIELD test, the directive's own words: recurring
+         lane goals "re-supply continuously from the lane's own cadence and
+         neither is unbuilt product work". Nominating one swaps a routine sweep
+         for a routine sweep, which the "product outranks sweeps" premise cannot
+         discriminate between (g-115-5327).
+    (i)  hypothesis-resolution -- a TITLE heuristic, and the directive itself
+         records it as carrying "a known under-count (g-115-4855)". Kept anyway:
+         under-counting means some hypothesis goals still slip through as
+         nominees, which is the safe direction. Measured miss 2026-08-19 (echo,
+         cc-03): the banner nominated g-326-221 'Resolve hypothesis: recency-decay
+         defaults rarely flip IAUS argmax' -- non-recurring, so clause (ii) could
+         not catch it.
+    parked -- goals the OWNER has explicitly held. Not a directive clause; it is
+         a stronger constraint that the directive never anticipated. Measured
+         2026-08-24 (alpha, cc-04): the banner nominated g-363-81, whose title
+         begins "PARKED (LOW):" and whose description carries a dated first-person
+         owner instruction not to pull it forward, and prescribed
+         --deviation meta-tiebreaker to take it. The banner is persuasive by
+         construction -- it cites the standing directive, names the goal, and
+         pre-authorises the deviation -- so compliance is the path of least
+         resistance and a complying agent crosses the owner while believing it is
+         honouring them.
+    """
+    try:
+        if s.get("recurring"):
+            return "recurring"
+        title = (s.get("title") or "").strip().lower()
+        if title.startswith(_LANE_NOMINEE_HYPOTHESIS_PREFIX):
+            return "hypothesis-resolution"
+        if title.startswith(_LANE_NOMINEE_PARKED_PREFIX):
+            return "parked"
+    except Exception:  # pragma: no cover - fail-open guard
+        return None
+    return None
+
+
 def emit_strategic_focus_banner(scored, agent_name):
     """Emit a LOUD stderr STRATEGIC-FOCUS banner when a routine sweep outranks the
     standing directive's own lane (g-115-3251).
@@ -3871,23 +3968,21 @@ def emit_strategic_focus_banner(scored, agent_name):
         return []  # top eligible pick is not a sweep -- directive says nothing
     if top.get("aspiration_id") in lanes:
         return []  # the sweep IS lane work -- already honoring the directive
-    # Clause (ii) of the directive: recurring lane goals are NOT eligible
-    # nominees (). The directive excludes them from what counts as
-    # lane work remaining -- "both re-supply continuously from the lane's own
-    # cadence and neither is unbuilt product work" -- so nominating one swaps
-    # a routine sweep for a routine sweep, and the "product outranks sweeps"
-    # premise cannot discriminate between them. The top-pick side above already
-    # tests `recurring`; this is the same field test on the other side of the
-    # comparison, which is what the directive calls clause (ii) (a FIELD test,
-    # recurring:true, not a title heuristic -- so unlike clause (i) it carries
-    # no under-count). Left unfiltered, an agent that complied literally would
-    # file a meta-tiebreaker deviation for work the directive excludes, which
-    # is what pollutes the Layer-C deviation audit.
+    # The nominee must survive every directive exclusion class --
+    # lane_nominee_exclusion is the SOURCE of that list (), shared with
+    # apply_strategic_focus_floor so the two can never apply different sets.
+    # Clause (ii) (recurring) landed here first as an inline conjunct
+    # (); clause (i) and the parked class were reported against this
+    # site afterwards, which is what motivated hoisting the list out. Left
+    # unfiltered, an agent that complied literally would file a meta-tiebreaker
+    # deviation for work the directive excludes -- and, at the floor site, would
+    # not even need a deviation code.
     lane = next((s for s in mine
-                 if s.get("aspiration_id") in lanes and not s.get("recurring")),
+                 if s.get("aspiration_id") in lanes
+                 and not lane_nominee_exclusion(s)),
                 None)
     if lane is None:
-        return []  # no NON-RECURRING lane candidate available to this agent now
+        return []  # every lane candidate is excluded by lane_nominee_exclusion
     try:
         gap = round(float(top.get("score") or 0.0) - float(lane.get("score") or 0.0), 2)
     except (TypeError, ValueError):
@@ -4408,8 +4503,15 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # cannot tell a standing user directive apart from a board directive — and only
     # the former carries the precedence claim that justifies waiving a sibling term.
     _sf_boost = strategic_focus_boost(asp.get("id", ""), completion_ratio)
-    raw["directive_boost"] = (
-        directive_boost_score(goal.get("id", ""), category) + _sf_boost)
+    _dir_boost = directive_boost_score(goal.get("id", ""), category)
+    raw["directive_boost"] = _dir_boost + _sf_boost
+    # NOTHING MAY SIT BETWEEN THOSE TWO HELPER CALLS AND THIS ASSIGNMENT.
+    # test_score_goal_adds_the_boost_into_directive_boost anchors on the FIRST
+    # `raw["directive_boost"]` in the file -- which is the guard-2412 comment above,
+    # not this line -- and requires both helper calls inside a 400-char window from
+    # it. A comment block between them pushes directive_boost_score() out of range
+    # and reds a structural pin that has nothing to do with the edit (measured
+    # ). Rationale for the _dir_boost local lives at 13b-iii, below.
 
     # 13b-i. FLOOR class_balance_bonus AT ZERO INSIDE A LIVE strategic_focus LANE
     # (). The balancer may still BOOST a directive lane; it may never
@@ -4522,6 +4624,78 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         if _sf["aspirations"] and _sf["weight"] > 0:
             _cb_bonus_waived = raw["class_balance_bonus"]
             raw["class_balance_bonus"] = 0.0
+
+    # 13b-iii. WAIVE per_goal_saturation WHEN THE REPEAT WAS EXPLICITLY ASKED FOR
+    # (). per_goal_saturation exists to suppress a goal firing again
+    # that NOBODY ASKED to fire again -- the " fired 4x in 2 min" failure
+    # mode rb-390 was filed over. A live pull_signal is a producer saying the
+    # thing this goal exists to consume has JUST ARRIVED; a directive naming this
+    # goal is a person or partner saying it matters now. Either one is direct
+    # evidence that the repeat is WANTED, which is precisely the condition the
+    # penalty assumes to be absent.
+    #
+    # THE TWO TERMS WERE SIZED INDEPENDENTLY AND CANCEL EXACTLY. pull_boost is
+    # +4.0 (sized against exploration-noise width, deliberately capped below
+    # directive_boost 4.5) and per_goal_saturation is raw -5.0 x weight 0.8 =
+    # -4.0. Neither config block references the other. Measured 2026-08-30 on the
+    # live store:  -- pull_boost own HARDCODED carrier_consumer_goal --
+    # scored 11.25 at RANK 370 of 1392 WITH the boost fully applied, because it
+    # had just fired. Without the boost it scores 7.25; with it, 11.25.
+    #
+    # ANTI-CORRELATED BY CONSTRUCTION, which is what makes this pathological
+    # rather than unlucky: the consumer is a RECURRING drain goal, so it is
+    # saturated precisely when it has just run -- and the pull signal exists to
+    # make it run AGAIN the moment a fresh carrier ref lands. The signal is
+    # strongest exactly when the penalty is at full strength.
+    #
+    # WHY THE DIRECTIVE HALF IS PART OF THIS CHANGE: it makes the ordering
+    # invariant WEIGHT-INDEPENDENT. Stated precisely, because the obvious version
+    # of this claim is false and was measured false before shipping.
+    #
+    # At the weight this box actually runs (WEIGHTS["directive_boost"] = 3.0, so a
+    # 3.0 raw directive contributes 9.0) a pull-ONLY waiver also preserves the
+    # ordering: measured 2026-08-30, saturated directive 19.18 vs saturated
+    # pull-waived 18.18. So the directive half is NOT required at 3.0, and saying
+    # otherwise would be a rationale that does not survive its own test.
+    #
+    # It IS required at 1.5 -- and 1.5 is the value three separate comments in
+    # THIS FILE state as the weight (the module docstring formula, and the two
+    # notes near directive_boost_score), with aspirations.yaml pointing at
+    # meta/goal-selection-strategy.yaml as the source. At 1.5 a 3.0 raw directive
+    # contributes 4.5, so under saturation it nets 4.5 - 4.0 = +0.5 against a
+    # pull-waived +4.0, and a machine-set pull outranks a fresh USER directive --
+    # exactly what pull_boost's 4.0 ceiling exists to prevent. The framework
+    # promotes to other deployments, whose weight file is theirs, so pinning the
+    # invariant to one box's weight is not a property worth having when the
+    # alternative costs a measured zero (blast radius on the live store this day:
+    # 0 of 1388 candidates carry per_goal_saturation at all).
+    #
+    # WORTH KNOWING WHILE READING THE CONFIG COMMENTS: aspirations.yaml says
+    # pull_boost is "kept BELOW directive_boost's 4.5 raw max", but pull_boost is
+    # a POST-WEIGHT flat add to the final score while 4.5 is a PRE-WEIGHT raw
+    # ceiling. Those are not the same units, so that comparison does not mean what
+    # it reads as; the real margin is whatever the weight makes it.
+    #
+    # NOTE the pre-existing test of the invariant asserts only
+    # load_pull_boost_config()["boost"] <= 4.5 -- a CONFIG VALUE -- so it cannot
+    # see an inversion introduced by a sibling term at all. A test that measures
+    # the ordering END-TO-END under saturation, at BOTH weights, ships with this
+    # change.
+    #
+    # KEYED ON _dir_boost, NOT raw["directive_boost"]: the composite folds in
+    # _sf_boost, and waiving lane-wide is a far broader change than this needs
+    # (13b-i applies the same discipline in the opposite direction).
+    #
+    # Telemetry rides OUT as a top-level candidate field, exactly like
+    # class_balance_penalty_waived above and for the same KNOWN_CRITERIA reason:
+    # a silently-zeroed term is the invisibility this goal exists to remove.
+    _pgs_waived = None
+    if raw.get("per_goal_saturation", 0.0) < 0 and (
+            _dir_boost > 0
+            or pull_signal_live_age_hours(
+                goal.get("pull_signal"), PULL_CONFIG) is not None):
+        _pgs_waived = raw["per_goal_saturation"]
+        raw["per_goal_saturation"] = 0.0
 
     # 13c. handoff_bonus (cross-agent handoff routing).
     # A planning/reviewer agent files implementer-targeted goals via
@@ -4729,6 +4903,10 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # OUTSIDE a live strategic_focus lane (None when no waiver fired).
         # Same telemetry posture as the penalty field above.
         "class_balance_bonus_waived": _cb_bonus_waived,
+        # : the per_goal_saturation penalty waived by 13b-iii when the
+        # repeat was explicitly asked for (None when no waiver fired -- the
+        # common case). Same telemetry posture as the two fields above.
+        "per_goal_saturation_waived": _pgs_waived,
         "recurring": bool(goal.get("recurring")),
         "recurring_overdue_ratio": round(overdue_ratio, 3),
         "recurring_interval_hours": round(interval, 3),
@@ -5485,10 +5663,13 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     stealing a correction defers it another full K-cycle. The floor carries no
     cadence bound and can take the very next invocation, so it yields.
 
-    RECURRING LANE GOALS ARE NOT NOMINEES, for the same reason clause (ii) of
-    the banner excludes them (g-115-5327): swapping a routine sweep for a
-    routine sweep cannot honor a directive whose premise is that product work
-    outranks sweeps.
+    NOMINEES ARE FILTERED BY lane_nominee_exclusion, the shared source of the
+    directive's exclusion classes (g-115-5354) -- recurring sweeps (clause ii),
+    hypothesis-resolution goals (clause i), and owner-PARKED goals. This site
+    matters more than the banner's: the banner only ADVISES, whereas a hoist
+    here reaches index 0 and write_scorer_verdict then makes the claim
+    chokepoint accept it WITHOUT a deviation code, so an excluded goal promoted
+    here meets no friction at all.
 
     Fail-open throughout: never raises, never blocks selection.
     """
@@ -5509,7 +5690,7 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     lane_rows = [s for s in scored if s.get("aspiration_id") in lanes]
     status["pool_lane_rows"] = len(lane_rows)
     nominees = [s for s in lane_rows
-                if not s.get("recurring")
+                if not lane_nominee_exclusion(s)
                 and _strategic_focus_claimable(s, agent_name)]
     status["claimable"] = len(nominees)
     if not nominees:
@@ -5584,7 +5765,17 @@ def emit_strategic_focus_inert_banner(status):
         "no matter how it is weighted. This is NOT evidence the lanes are "
         "drained and NOT evidence they were outranked; the goals exist and were "
         "filtered upstream. Run `bash core/scripts/goal-selector.sh blocked` "
-        "(a PURE read — guard-2331) and read block_reason to see which.".format(
+        "(a PURE read — guard-2331) and read block_reason to see which. "
+        "THEN ASK THE FLEET QUESTION BEFORE CONCLUDING ANYTHING FLEET-WIDE: this "
+        "banner describes THIS BOX'S pool, and a lane goal a PARTNER has already "
+        "claimed is absent from it for the best possible reason. `blocked`'s row "
+        "projection carries no claimed_by, so it cannot answer this — read the "
+        "lane's own records (aspirations-query.sh --goal-field id <id> --full) or "
+        "the bottlenecks[] block of this same output, whose cause=READY rows name "
+        "the enablers. An enabler that is READY but missing from your pool is "
+        "being worked by someone else; that is the directive being SERVED, not "
+        "ignored (guard-1007: never mutate it). Do NOT infer a scoring defect, a "
+        "missing lane, or a needed directive edit from a one-box empty pool.".format(
             n=len(lanes), lanes=", ".join(lanes))
     )
     print(warn, file=sys.stderr)

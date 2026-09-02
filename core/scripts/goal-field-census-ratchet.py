@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import subprocess
 import sys
 from datetime import datetime
@@ -96,6 +97,14 @@ def _census() -> dict:
         "distinct_keys": len(keys),
         "stray_names": len(strays),
         "stray_occurrences": occurrences,
+        # The NAMES, not just how many there are. `strays` was built here and
+        # discarded, so every consumer learned "17 stray field name(s)" and had
+        # no way to find out which — a count with no identities cannot be acted
+        # on, and the strays are explicitly the half this ratchet REPORTS rather
+        # than gates (see the module docstring), so reporting is its whole job.
+        # Sorted by descending count then name: the reader wants the widespread
+        # ones first, and a stable order keeps successive runs diffable.
+        "strays": dict(sorted(strays.items(), key=lambda kv: (-kv[1], kv[0]))),
         "statuses_scanned": len(VALID_GOAL_STATUSES),
     }
 
@@ -150,8 +159,17 @@ def main():
                 f"(--allow-new-field / X-Mind-Allow-New-Field, audited in "
                 f"world/override-bypass-ledger.jsonl), legitimately extended in "
                 f"_goal_fields.py, or regressed. Check the ledger FIRST — a deliberate "
-                f"registration is expected to raise this number, and the correct "
-                f"response is to re-seed, not to hunt a bug.")
+                f"registration legitimately raises this number. DO NOT RE-SEED: the "
+                f"assignment above pins new_baseline to `prior` on purpose, and "
+                f"coordination_merge.merge_audit_baselines merges `baseline` by MIN "
+                f"(one-way shrink, never grow), because audit-baselines.md names "
+                f"growing a baseline on regression as THE anti-pattern that defeats "
+                f"the ratchet. A hand re-seed therefore verifies STABLE locally and is "
+                f"silently reverted at the next merge — measured 2026-08-31 (echo, "
+                f"cc-03): 132->134 read STABLE, then 132 again minutes later. When the "
+                f"growth is deliberate and ledger-confirmed, LEAVE THE BASELINE ALONE "
+                f"and let this advisory stand until the schema shrinks back. It is "
+                f"advisory: it gates nothing.")
         elif cur < prior:
             verdict, new_baseline = "ratcheted", cur
             message = (f"OK: distinct goal-field names shrank from baseline {prior} to "
@@ -167,7 +185,7 @@ def main():
             "verdict": verdict,
             "goals_scanned": current["goals_scanned"],
             "stray_occurrences": current["stray_occurrences"],
-            "hostname": os.environ.get("HOSTNAME") or "",
+            "hostname": os.environ.get("HOSTNAME") or socket.gethostname(),
         })
         baselines[KEY] = {
             "baseline": new_baseline,
@@ -232,6 +250,17 @@ def main():
               f"{current['distinct_keys']} strays={current['stray_names']} name(s)/"
               f"{current['stray_occurrences']} occurrence(s) "
               f"[strays reported, NOT ratcheted — see --help]")
+        # Name them. "17 stray name(s)" with no identities is a number nobody can
+        # act on, and reporting is this metric's entire job (it is deliberately
+        # not gated). Capped at 12 with an explicit remainder so the line stays
+        # readable and never implies it showed everything (guard-1760: a tool
+        # must not silently truncate and read as complete). --json carries all.
+        if current["strays"]:
+            shown = list(current["strays"].items())[:12]
+            print("  stray fields: "
+                  + ", ".join(f"{n}({c})" for n, c in shown)
+                  + (f", ... and {len(current['strays']) - len(shown)} more "
+                     f"(--json for all)" if len(current["strays"]) > len(shown) else ""))
 
     if os.environ.get("VERIFY_LEARNING_DRIFT_HARD_GATE") == "1":
         return 1 if captured["verdict"] == "regressed" else 0

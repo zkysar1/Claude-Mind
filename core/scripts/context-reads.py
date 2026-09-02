@@ -392,13 +392,32 @@ def cmd_record(args):
 # ---------------------------------------------------------------------------
 
 def cmd_invalidate(args):
-    """PostToolUse invalidator: remove path from tracker if present."""
+    """PostToolUse invalidator: remove path from tracker if present.
+
+    session_id routes through tracker_path() exactly as `record` and `gate` do
+    (g-115-3764). Without it invalidation always targeted the AGENT-WIDE
+    session/context-reads.txt while reads were recorded per-Body, so in a forked
+    Body editing a tracked tree node did NOT clear it: the stale entry survived
+    the edit, `gate` kept BLOCKING re-reads of a file that HAD CHANGED, and
+    `check-file` stayed silent for it. That is the false-all-clear direction —
+    invalidation exists precisely so a mid-session edit re-arms the advisory.
+
+    Latent until a 2nd Body forks (g-306-64: with one Body the routing collapses
+    to the agent-wide file), which is why it sat undetected — and why the
+    single-Body path is pinned alongside the Body path in the tests.
+
+    getattr rather than args.session_id: callers that build a Namespace directly
+    (tests, and any in-process caller) predate this flag, and an AttributeError
+    inside a PostToolUse hook is swallowed — it would silently disable
+    invalidation entirely, which is a worse failure than the one being fixed.
+    """
     normalized = normalize_path(args.file_path)
+    session_id = getattr(args, "session_id", None)
 
     # Allow invalidation of individually tracked files (e.g., aspirations-compact.json)
     for tf in TRACKED_FILES:
         if normalized == tf.replace("\\", "/"):
-            remove_from_tracker(normalized)
+            remove_from_tracker(normalized, session_id)
             return
 
     # Only invalidate tree nodes — they change during goal execution.
@@ -407,7 +426,7 @@ def cmd_invalidate(args):
     if not normalized.startswith(tree_prefix):
         return
 
-    remove_from_tracker(normalized)
+    remove_from_tracker(normalized, session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +563,7 @@ def build_parser():
 
     inv_p = sub.add_parser("invalidate", help="Remove a file from the tracker (modified)")
     inv_p.add_argument("file_path", help="Absolute path to the file that was modified")
+    inv_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
 
     check_p = sub.add_parser("check", help="Batch check: print untracked convention paths")
     check_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")

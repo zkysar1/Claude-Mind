@@ -158,6 +158,29 @@ def passes_active_formation(rec):
         return False
 
 
+def formation_failure_reason(rec):
+    """The MESSAGE passes_active_formation() throws away, or None when it passes.
+
+    passes_active_formation returns a bare bool, so an "under-formed" record
+    surfaces with no statement of WHICH field the gate wanted. That is a
+    diagnostic gap, not a scoping one, and it misleads: on 2026-09-01 the prior
+    occurrence of g-001-02 read five such records, saw claims and statements on
+    them, and concluded the predicate was "mis-scoped". Re-probed with this
+    function, the gate's actual complaints were `Missing resolution method`
+    (3 long-horizon records that genuinely carry no resolution_criteria) and
+    `Missing measurement_channel` (2 short-horizon records) — a field nobody had
+    looked for, because nothing printed its name. The predicate was correct.
+    Same fail-safe posture as its sibling: any exception is reported, never raised.
+    """
+    test = dict(rec)
+    test["stage"] = "active"
+    try:
+        validate_formation_quality(test)
+        return None
+    except Exception as e:  # noqa: BLE001 - reporting, never raising
+        return str(e)
+
+
 def classify_overdue(records, now, expire_days_short=DEFAULT_EXPIRE_DAYS_SHORT,
                      expire_days_long=DEFAULT_EXPIRE_DAYS_LONG):
     """Pure classifier. `records`: list of pipeline record dicts (any stage).
@@ -405,6 +428,14 @@ def main() -> int:
         "eligible": e["eligible"],
         "eligible_promoted": eligible_promoted,
         "eligible_needs_judgment": [r.get("id") for r in e["needs_judgment"]],
+        # ADDITIVE (never replaces the id lists above): id -> the gate's own
+        # message, so "under-formed" names the field it wants instead of
+        # inviting a guess about the predicate. See formation_failure_reason.
+        "formation_reasons": {
+            r.get("id"): formation_failure_reason(r)
+            for r in (c["needs_judgment"] + e["needs_judgment"])
+            if r.get("id")
+        },
         "failed": failed,
         "applied": args.apply,
     }
@@ -423,9 +454,13 @@ def main() -> int:
             f"failed={len(failed)}"
         )
         for rid in result["needs_judgment"][:10]:
-            print(f"  needs-judgment (synthesize claim from position, then resolve/expire): {rid}")
+            _why = result["formation_reasons"].get(rid)
+            print(f"  needs-judgment (synthesize claim from position, then resolve/expire): {rid}"
+                  + (f"\n      gate says: {_why}" if _why else ""))
         for rid in result["eligible_needs_judgment"][:10]:
-            print(f"  eligible-needs-judgment (in-window, under-formed -- synthesize a claim; do NOT expire): {rid}")
+            _why = result["formation_reasons"].get(rid)
+            print(f"  eligible-needs-judgment (in-window, under-formed -- synthesize a claim; do NOT expire): {rid}"
+                  + (f"\n      gate says: {_why}" if _why else ""))
     return 0
 
 

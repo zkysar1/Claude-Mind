@@ -9,7 +9,7 @@ After the capability-route gate stamps intended_agent on a new goal, this
 audit reads each active agent's Self.md "What I Do" / "Boundaries" sections,
 tokenizes them, and computes which agent's self-description best matches the
 goal's title+description. If the best-match agent != stamped agent AND the
-score gap is significant (>= min_gap, default 5 tokens), the audit decision
+score gap is significant (>= min_gap, default 0.015 float Jaccard), the decision
 is "file" — the caller (aspirations_write.py post-Phase-D) is expected to
 file an Investigate goal in asp-115 so bravo / the better-matched agent can
 review and decide whether to re-route.
@@ -24,18 +24,25 @@ Design constraints
     caller does the file/dedup.
 
 Public API
-    audit(goal, *, project_root, agents_root=None, min_gap=3,
-          min_gap_either=5, exclude_agents=None) -> dict
+    audit(goal, *, project_root, agents_root=None, min_gap=0.015,
+          min_gap_either=0.015, min_best_score=0.10, exclude_agents=None,
+          liveness_verdicts=None) -> dict
+
+  min_gap / min_gap_either / min_best_score are FLOAT JACCARD similarities in
+  [0.0, 1.0] (g-115-1200), never token counts. The pre-g-115-1200 signature
+  above read "min_gap=3 / min_gap_either=5 ... tokens", which described the
+  raw set-intersection scoring this module replaced; a reader who trusted it
+  would size a threshold ~200x too large and silently disable the audit.
 
 Returns a dict shaped per the schema in the module docstring's RETURNS block;
 see _make_decision below.
 
 Two routing-mismatch shapes filed (g-115-1122):
   - "routing-mismatch:<id>" — stamped_agent is a SPECIFIC agent but another
-    agent's Self.md domains match better by at least min_gap tokens.
+    agent's Self.md domains match better by at least min_gap (float Jaccard).
   - "routing-either-resolve:<id>" — stamped_agent is the "either" sentinel
     AND one agent's Self.md domains stand out from second-best by at least
-    min_gap_either tokens, suggesting a re-stamp from either → best_agent.
+    min_gap_either (float Jaccard), suggesting a re-stamp either → best_agent.
 
 Both shapes use the recursion guard at the origin_signal check; an Investigate
 filed BY this audit (either shape) is never re-audited.
@@ -206,6 +213,121 @@ def _active_agents(project_root: Path) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Liveness ()
+# ---------------------------------------------------------------------------
+
+# Process-level cache. audit() runs on the add-goal WRITE path
+# (aspirations_write._file_routing_audit_investigate), so an uncached probe
+# would tax every goal filing. MEASURED 2026-08-30 (echo, cc-03): a single
+# liveness-check is ~1500ms cold / ~133ms warm, so a 5-agent sweep is ~1.5s
+# cold. The TTL below samples 72x finer than the 6h dormancy threshold it is
+# reading, so the cache cannot mask a state change that matters.
+_LIVENESS_VERDICT_CACHE: dict = {}
+_LIVENESS_CACHE_STAMP: list = [0.0]
+_LIVENESS_TTL_SECONDS = 300.0
+
+
+def _liveness_verdicts(agents: Iterable[str], project_root: Path) -> dict:
+    """Return {agent: verdict} for ``agents``; {} when liveness is unavailable.
+
+    FAIL-OPEN BY CONTRACT, and the direction is the whole safety argument: {}
+    (or a missing agent) means "no liveness information", which the caller
+    treats as *filter nothing*, never as "everyone is dormant". A liveness
+    probe that breaks must not silently stop the audit from nominating anyone
+    — that would convert an outage into fleet-wide routing paralysis.
+
+    Modelled on goal-selector._liveness_confirms_dormant (g-115-2315), which is
+    the proven in-process consumer of this signal; the field names come from the
+    emitter, not from a hand-written guess (guard-5232: liveness-check --json has
+    NO ``last_active`` key — a parser reading it gets None for EVERY agent while
+    ``verdict`` still parses, which reads as a fleet-wide dead signal).
+    """
+    import time
+    now = time.time()
+    if _LIVENESS_VERDICT_CACHE and (now - _LIVENESS_CACHE_STAMP[0]) < _LIVENESS_TTL_SECONDS:
+        return dict(_LIVENESS_VERDICT_CACHE)
+    verdicts = {}
+    try:
+        import os
+        from datetime import datetime
+        # The sys.path insert is LOAD-BEARING, not defensive boilerplate. The
+        # production caller (mind_api aspirations_write._file_routing_audit_
+        # investigate) loads this module via spec_from_file_location, so
+        # core/scripts is NOT necessarily importable at that point. Without it
+        # both imports raise, the except returns {}, and the gate is silently
+        # INERT in the only place it matters — a green unit suite certifying a
+        # function nothing reaches (guard-1943 / rb-9801). Mirrors
+        # _active_agents above.
+        scripts_dir = project_root / "core" / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import liveness_check as _lc  # type: ignore
+        import _team_state as _ts  # type: ignore
+        from _paths import WORLD_DIR  # type: ignore
+        world = str(WORLD_DIR)
+        backend = os.environ.get("STORAGE_BACKEND", "local")
+        now_dt = datetime.now()
+        # last_active comes from TEAM-STATE, not from a liveness_check fetcher —
+        # that is why the CLI takes --last-active. fetch_row_stamp returns the
+        # row's `row_updated_by` STRING (), NOT a row dict; treating
+        # it as one raised AttributeError per agent, was swallowed by the
+        # per-agent except, and left this resolver returning {} on every call.
+        # Caught only by probing the real daemon load path, never by the unit
+        # suite (guard-2298: read the emitter, do not guess its shape).
+        rows = _ts.load_rows(world) or {}
+        threshold = getattr(_lc, "DEFAULT_THRESHOLD_HOURS", 6)
+        for agent in agents:
+            if not isinstance(agent, str) or not agent:
+                continue
+            try:
+                row = rows.get(agent) or {}
+                last_active = row.get("last_active")
+                # Cheap fast path, mirroring liveness_check.main(): only pay for
+                # the authoritative/fresh signals when last_active is NOT fresh.
+                # Under own-cloud those are per-agent remote reads, and this
+                # resolver sits on the add-goal write path.
+                fresh_iso = auth_iso = auth_prov = None
+                try:
+                    la_age = _lc._age(last_active, now_dt)
+                    stale = (la_age is None
+                             or la_age.total_seconds() >= float(threshold) * 3600)
+                except Exception:  # pylint: disable=broad-except
+                    stale = True  # unknown age → pay for the full signal set
+                if stale:
+                    fresh_iso = _lc.fetch_fresh_signal(agent, world, backend)
+                    (auth_iso, auth_prov) = (
+                        _lc.fetch_authoritative_last_active_with_provenance(
+                            agent, world))
+                verdict = _lc.decide_liveness(
+                    last_active, fresh_iso, now=now_dt,
+                    retired_entry=_lc.fetch_retirement_tombstone(agent, world),
+                    authoritative_last_active_iso=auth_iso,
+                    authoritative_provenance=auth_prov,
+                    row_updated_by=_lc.fetch_row_stamp(agent, world),
+                    row_agent=agent,
+                ).get("verdict")
+                if isinstance(verdict, str):
+                    verdicts[agent] = verdict
+            except Exception:  # pylint: disable=broad-except
+                continue  # this agent stays unknown → not filtered
+    except Exception:  # pylint: disable=broad-except
+        return {}
+    _LIVENESS_VERDICT_CACHE.clear()
+    _LIVENESS_VERDICT_CACHE.update(verdicts)
+    _LIVENESS_CACHE_STAMP[0] = now
+    return dict(verdicts)
+
+
+# Verdicts that DISQUALIFY an agent from being nominated. Deliberately does NOT
+# include "unknown": guard-941 says re-route on 'alive', hold on 'dormant', and
+# treat 'unknown' as alive — never conclude dormant from an ambiguous signal
+# (check-team-state-before-silent.md rule 5: a stale last_active is ambiguous,
+# not evidence of death). "retired" means decommissioned rather than merely
+# quiet, so it disqualifies for a different reason than dormancy does.
+_NOMINATION_DISQUALIFYING = frozenset({"dormant", "retired"})
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
 
@@ -249,7 +371,8 @@ def _make_decision(*, decision: str, reason: str,
                    best_agent: Optional[str], best_score: float,
                    stamped_score: float, gap: float, scores: dict,
                    goal_id: Optional[str],
-                   investigate_spec: Optional[dict]) -> dict:
+                   investigate_spec: Optional[dict],
+                   liveness_excluded: Optional[dict] = None) -> dict:
     """Assemble the final decision dict. Always returns a complete schema so
     callers can rely on key presence."""
     return {
@@ -263,6 +386,11 @@ def _make_decision(*, decision: str, reason: str,
         "scores": scores,
         "goal_id": goal_id,
         "investigate_spec": investigate_spec,
+        # {agent: verdict} for agents removed from the nomination pool. {} means
+        # liveness ran and disqualified nobody; it does NOT mean liveness was
+        # skipped — that case is visible as {} too, which is why the reason
+        # string names the suppression explicitly when it fires.
+        "liveness_excluded": liveness_excluded or {},
     }
 
 
@@ -351,7 +479,8 @@ def audit(goal: dict, *, project_root: Path,
           min_gap: float = 0.015,
           min_gap_either: float = 0.015,
           min_best_score: float = 0.10,
-          exclude_agents: Optional[set] = None) -> dict:
+          exclude_agents: Optional[set] = None,
+          liveness_verdicts: Optional[dict] = None) -> dict:
     """Audit a freshly-stamped goal and decide whether to file an Investigate
     goal for routing-mismatch detection.
 
@@ -535,6 +664,60 @@ def audit(goal: dict, *, project_root: Path,
     # no Self.md to score against. Gap is measured against second-best below.
     stamped_score = 0 if is_either_case else scores.get(stamped_agent, 0)
 
+    # ── Liveness gate () ──────────────────────────────────────
+    # The audit had ZERO liveness input: it picked a nomination target purely
+    # on Self.md Jaccard overlap and never asked whether that agent was
+    # running, so it happily nominated a dormant agent and the goal was
+    # STRANDED rather than mis-routed. Measured 2026-07-28 (): 7 of
+    # 8 open routing-audit goals nominated an agent that was dormant at the
+    # time. guard-941 had to carry the check by hand, on every consumer, and a
+    # rule a human must remember is not a gate.
+    #
+    # CHOSEN BEHAVIOUR: next-best-LIVE, falling back to suppression.
+    # Rejected alternatives, and why:
+    #   - suppress-on-dormant-best: throws away a real routing signal whenever
+    #     a live agent also clears the thresholds. The finding is "this goal is
+    #     mis-stamped", which stays true regardless of who is awake.
+    #   - flag-only (file anyway, annotate): the Investigate's whole payload is
+    #     an actionable nominee. Filing one that names a dormant agent is the
+    #     stranding this fix exists to remove.
+    # Scoring is unchanged — only the NOMINATION POOL narrows — so `scores`
+    # still reports every agent and the decision stays auditable.
+    #
+    # The stamped agent is deliberately NOT filtered: stamped_score is read
+    # from the full `scores` above, so a goal already routed to a dormant agent
+    # still gets a correct gap. Re-routing work AWAY from a dormant agent is
+    # exactly what this audit is for.
+    if liveness_verdicts is None:
+        try:
+            liveness_verdicts = _liveness_verdicts(scores.keys(), project_root)
+        except Exception:  # pylint: disable=broad-except
+            # Module contract: audit() NEVER raises; all errors collapse to a
+            # no_file decision. The resolver already fails open internally, but
+            # guarding the CALL keeps that promise true no matter what the
+            # resolver becomes later. {} = filter nothing. Caught by this
+            # module's own fail-open regression test.
+            liveness_verdicts = {}
+    liveness_excluded = {
+        a: v for a, v in (liveness_verdicts or {}).items()
+        if a in scores and v in _NOMINATION_DISQUALIFYING and a != stamped_agent
+    }
+    pool = {a: sc for a, sc in scores.items() if a not in liveness_excluded}
+
+    if scores and not pool:
+        # Every scored agent is dormant/retired. Suppress rather than nominate
+        # someone who cannot act — and say so, so the empty result is never
+        # read as "no mismatch".
+        return _make_decision(
+            decision="no_file",
+            reason=("all scored agents disqualified by liveness "
+                    f"({sorted(liveness_excluded)}) — no live nominee"),
+            stamped_agent=stamped_agent, best_agent=None, best_score=0,
+            stamped_score=stamped_score, gap=0, scores=scores,
+            goal_id=goal_id, investigate_spec=None,
+            liveness_excluded=liveness_excluded,
+        )
+
     # Pick the agent with the highest score. Ties: lexicographically
     # smallest name (deterministic). The stamped agent counts in the tie
     # set — if the stamped agent ties for first place, no mismatch.
@@ -545,14 +728,14 @@ def audit(goal: dict, *, project_root: Path,
             stamped_score=stamped_score, gap=0, scores=scores,
             goal_id=goal_id, investigate_spec=None,
         )
-    max_score = max(scores.values())
-    best_candidates = sorted(a for a, s in scores.items() if s == max_score)
+    max_score = max(pool.values())
+    best_candidates = sorted(a for a, s in pool.items() if s == max_score)
     best_agent = best_candidates[0]
     best_score = max_score
 
     if is_either_case:
         # Gap for the either-case is best - second_best (stand-out measure).
-        sorted_vals = sorted(scores.values(), reverse=True)
+        sorted_vals = sorted(pool.values(), reverse=True)
         second_best_score = sorted_vals[1] if len(sorted_vals) >= 2 else 0
         gap = best_score - second_best_score
         threshold = min_gap_either
@@ -573,7 +756,7 @@ def audit(goal: dict, *, project_root: Path,
                 stamped_agent=stamped_agent, best_agent=best_agent,
                 best_score=best_score, stamped_score=stamped_score,
                 gap=gap, scores=scores, goal_id=goal_id,
-                investigate_spec=None,
+                investigate_spec=None, liveness_excluded=liveness_excluded,
             )
 
     # Absolute min-best-score floor (rb-1488 / ). The gap check below
@@ -591,7 +774,7 @@ def audit(goal: dict, *, project_root: Path,
             stamped_agent=stamped_agent, best_agent=best_agent,
             best_score=best_score, stamped_score=stamped_score,
             gap=gap, scores=scores, goal_id=goal_id,
-            investigate_spec=None,
+            investigate_spec=None, liveness_excluded=liveness_excluded,
         )
 
     if gap < threshold:
@@ -601,7 +784,7 @@ def audit(goal: dict, *, project_root: Path,
             stamped_agent=stamped_agent, best_agent=best_agent,
             best_score=best_score, stamped_score=stamped_score,
             gap=gap, scores=scores, goal_id=goal_id,
-            investigate_spec=None,
+            investigate_spec=None, liveness_excluded=liveness_excluded,
         )
 
     # Significant mismatch — assemble the Investigate spec.
@@ -614,7 +797,7 @@ def audit(goal: dict, *, project_root: Path,
             stamped_agent=stamped_agent, best_agent=best_agent,
             best_score=best_score, stamped_score=stamped_score,
             gap=gap, scores=scores, goal_id=None,
-            investigate_spec=None,
+            investigate_spec=None, liveness_excluded=liveness_excluded,
         )
 
     if is_either_case:
@@ -639,7 +822,7 @@ def audit(goal: dict, *, project_root: Path,
         stamped_agent=stamped_agent, best_agent=best_agent,
         best_score=best_score, stamped_score=stamped_score,
         gap=gap, scores=scores, goal_id=goal_id,
-        investigate_spec=spec,
+        investigate_spec=spec, liveness_excluded=liveness_excluded,
     )
 
 

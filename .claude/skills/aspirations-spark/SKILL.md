@@ -871,7 +871,7 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
           resolved-only fetch would log identically to a correct run — and the
           n is the only place that difference is visible. (guard-2529 /
           guard-2273: a count taken behind a filter must state what the filter
-          excluded; guard-2191: state the n for both arms.)
+          excluded; guard-2129: state the n for both arms.)
      c. The agent MAY assign confidence below the cap freely.
         The cap only prevents overconfidence, not underconfidence.
 0.7. Adversarial pre-mortem (required when proposed confidence > 0.65):

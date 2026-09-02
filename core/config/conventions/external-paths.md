@@ -329,7 +329,32 @@ write and lists the standard alternatives.
 - Writes inside `PROJECT_ROOT` OUTSIDE the bound agent's dir
   (`core/`, `.claude/`, the project root itself, OTHER agent dirs) —
   those are governed by their own conventions and protected by L2
-  permission rules, and remain git-tracked so cruft surfaces in `git status`
+  permission rules, and are USUALLY git-tracked so cruft surfaces in
+  `git status`.
+
+  ⚠ **"Usually" is load-bearing, and this clause used to say "remain",
+  full stop (corrected g-115-3225).** A path matching a RECURSIVE
+  `.gitignore` glob is invisible to `git status` AND out of L1's scope, so
+  for that class the fallback named here does not exist — nothing reports
+  it at all. Measured cost: a stray `core/agents/<name>/session/` sat 7
+  days unseen and silently narrowed `provision-from-vault.sh`'s roster glob
+  to a single entry, so its all-empty-roster guard never fired (rb-5190).
+  The globs are read out of `.gitignore` BY CONTENT — do not cite line
+  numbers for them; four of the five the filing goal cited had already
+  drifted (108→117, 137→146, 141→150, 173→182), three now landing on a
+  comment or a blank line.
+
+  The gap is now covered by a detector rather than by this sentence:
+  `py -3 core/scripts/misrooted-write-check.py` (verification-checklist
+  item 60). It exempts the sanctioned homes WITH their reasons, and
+  announces — instead of silently absorbing — any new recursive glob it has
+  no reasoning for. Note `.claude/.history` is exempt because it is
+  *sanctioned*, not stray: `_fileops._classify_base` recognises
+  `PROJECT/.claude` as a first-class base kind and `history-list.sh`
+  resolves snapshots there (both probe-verified). Its real defect is
+  unrelated to rooting and still open — no GC sweeps it, since
+  `history.py` `cmd_prune` / `cmd_prune_legacy` and
+  `history-vacuum-tick.sh:64` all enumerate WORLD and META only.
 - Writes inside `AGENT_WRITE_PATH` (sibling product repos — also git-tracked)
 
 ### How to legitimately add a new top-level entry

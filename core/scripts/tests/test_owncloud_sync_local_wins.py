@@ -12,9 +12,19 @@ g-115-2816). Nothing AUTO-RESOLVED it.
 
 The fix: for a single-writer session file under own_cloud_authority, resolve
 both-diverged as LOCAL-WINS (push local -> S3, adopt local md5 as the new
-baseline). Reaching the both-diverged branch for such a file PROVES this box
-authored the local change (the sweep's H4a owned-prune never walks a PEER
-agent's session dir under own-cloud), so local IS authoritative.
+baseline).
+
+THE JUSTIFICATION THIS FILE ORIGINALLY CARRIED WAS FALSE, and is corrected here
+rather than deleted because the tests below still pin the right behaviour. It
+read "reaching the both-diverged branch PROVES this box authored the local
+change (the H4a owned-prune never walks a PEER agent's session dir)". g-306-378
+measured that: the prune is keyed on agent dir NAME, so it separates AGENTS, not
+BOXES, and what actually bounds the writer to one box is the live DDB claim.
+A claim can MOVE, so a box that lost it, kept writing locally, and later
+RE-ACQUIRED can reach both-diverged with a STALE file. Admission therefore needs
+a second, independent gate — see test_claim_continuity_local_wins.py (g-306-379).
+These tests pass `holder_since_by_agent=None`, which fails OPEN, so they continue
+to exercise the LOCAL-WINS lane exactly as before.
 
 Tests:
   A  single-writer session file + own-cloud auth -> local-wins (push+adopt)

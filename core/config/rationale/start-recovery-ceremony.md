@@ -77,6 +77,35 @@ explicit `--recover` / `--recover --force` paths still exist for cases where
 the gate holds back (heartbeat fresh but runner is wedged, or stop-requested
 set, or background-job is registered but actually orphaned).
 
+## Why the session-telemetry crash-close fires before manifest-clear (WP5, 2026-06-03)
+
+The /start RUNNING+autonomous auto-recover branch handles the SAME event
+`recovery-gate.sh` handles via its SessionStart hook (WP4), but LLM-orchestrated
+at /start time. The crashed runner's SID is still in `running-session-id`
+(manifest-clear has not run yet), so its durable telemetry record is finalized
+there with status=crashed, ended_reason=recovery-gate — and it MUST run BEFORE
+manifest-clear, which deletes `running-session-id`. `write_crash` forces
+goals_completed=-1 (the crashed runner's outcome is unknown). Fire-and-forget
+(`|| true`): a telemetry failure must NEVER abort recovery. guard-165: SID and
+agent travel via ENV with the python source single-quoted; `py -3` because this
+is Bash-tool context, not a sourced .sh (the Microsoft-Store-stub rule applies).
+Runs only when a crashed SID is present.
+
+## Why an absent heartbeat is inert at /start (g-357-51, 2026-09-01)
+
+`heartbeat-stale.sh` prints `absent` when no heartbeat file exists (never
+seeded, or cleared by an earlier recovery). Absence is not evidence of a crash:
+a box with no heartbeat infrastructure would otherwise read "crashed" forever,
+and the 2026-09-01 false-positive kill of a live, rate-limited loop showed that
+every inline condition passes on a LIVE loop during a multi-hour provider
+backoff. So /start never walks the inline conditions on `absent` and never
+auto-recovers from them alone: it asks `runner-dead-check.sh`, which admits an
+absent heartbeat only beside a positive death signal (dead runner-proc stamp,
+stale assistant turn) and vetoes on positive life evidence (live process,
+recent assistant turn, live sidecar, provider-retry activity) — the same
+pre-kill re-check the confirmed-zombie path runs once more before touching
+state.
+
 ## Cross-references
 
 - `core/scripts/runner-dead-check.sh` — SSOT for the 6-condition gate; MUST match inline checks

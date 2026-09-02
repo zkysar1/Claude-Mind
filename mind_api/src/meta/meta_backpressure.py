@@ -649,12 +649,14 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
         out["rollback_actions"] = rollback_actions
         out["graduated"] = graduated
         out["audit_only_skipped"] = audit_only_skipped
+        out["owner_mandated_skipped"] = owner_mandated_skipped
 
     file_locks.locked_rmw(bp_path, _cycle)
     data = out["data"]
     rollback_actions = out["rollback_actions"]
     graduated = out["graduated"]
     audit_only_skipped = out["audit_only_skipped"]
+    owner_mandated_skipped = out["owner_mandated_skipped"]
 
     newly_rolled_fields = {"{}:{}".format(a["strategy_file"], a["field"])
                            for a in rollback_actions}
@@ -665,6 +667,7 @@ def check(ctx) -> "Response":  # type: ignore[name-defined]
         "rollback_actions": rollback_actions, "graduated": graduated,
         "dead_end_candidates": dead_end_candidates,
         "audit_only_skipped": audit_only_skipped,
+        "owner_mandated_skipped": owner_mandated_skipped,
         "active_monitors_count": len(data["active_monitors"]),
     }
     return Response.text(

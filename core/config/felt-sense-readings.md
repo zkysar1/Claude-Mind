@@ -1610,3 +1610,249 @@ Note for a successor comparing points: the derived lane set now tracks the
 owner's 2026-08-29 `strategic_focus` rewrite exactly (four boosted lanes), so
 a derived point from before that rewrite is measuring a different lane set.
 The legacy row is the comparable one across the boundary.
+
+---
+
+## 2026-08-30T16:01:32 — echo, hostname cc-03, uname -r 6.8.0-137-generic
+
+Cadence diff=187 (fires every 75), goals_count 12400. SID e8970acb.
+Sweep ran across an autocompact (the cadence gate fired pre-compaction at
+15:5x; lanes 1b-8 executed post-resume).
+
+**Lane 1b**: insights unprocessed = 0 — nothing to curate, queue already clean.
+
+**Lane 2 census** (both queries, `--full`):
+`q1 in-progress: bytes=2 records=0` — genuinely empty. Per this skill's own
+rule, that reads "no worker Bodies active on this box", never "no out-of-cycle
+work found".
+`q2 pending+agent: bytes=13,527,669 records=2198, 44 distinct keys on record[0]`
+`2198 candidates — 2194 mutable-eligible, 0 foreign sid, 0 absent sid, 4 partner`
+`fields: claimed_by 4/2198, claimed_by_sid 4/2198, executed_by 260, outcome_note 192, defer_reason 153, blocked_by 107, blocker_ref 1`
+Claimant composition: null 2194, alpha 2, bravo 1, foxtrot 1.
+
+**⚠ THE MANDATED TALLY'S SECOND SLOT IS AMBIGUOUS, AND TWO ROWS OF THIS LEDGER
+NOW DISAGREE ON WHAT IT MEANS.** The format string says `M mutated`. The
+2026-08-2x row above filled it with **0** (goals actually mutated); this row
+fills it with **2194** (goals mutation-ELIGIBLE after the four gates). Both are
+truthful readings of the same population and the same word, and the two numbers
+differ by 2194. A successor diffing the two rows would read a catastrophic
+behaviour change where there is none. Until the format is disambiguated, state
+which you counted, in the row — this row counts ELIGIBLE. (Same defect family
+as the count-vs-set collapse: a slot that admits two quantities silently
+averages two different measurements into one series.)
+
+Vantage (method rule 2): reducer reading its own queue. This is a **THIRD
+distinct column profile** for the protection counters — prior recorded profiles
+were `0 partner / 196 foreign-sid` and `207 partner / 0 foreign-sid`; this one
+is `4 partner / 0 foreign-sid / 0 absent-sid`, i.e. **both** skip columns near
+zero. Cause is the population, not the vantage: pending+agent is unclaimed by
+construction (2194 of 2198 carry a null `claimed_by`), so there is almost
+nothing for the ownership gates to refuse. Method rule 6 ("a small mutable count
+is the gates working") therefore inverts here for the second recorded time —
+do not read the large mutable count as gate failure.
+
+**Out-of-cycle verdict: 0.** Decomposing the 74 unclaimed / non-recurring /
+un-deferred rows carrying any completion fingerprint:
+`44 executed_by-only · 16 outcome_note+executed_by · 14 outcome_note`
+— and `completed_by` or `completed_at` present on **0 of 2198**. No goal in
+this population carries an actual completion stamp, so the 44 `executed_by`-only
+rows are executed-then-reset-to-pending (correct state), not missed closes.
+Cross-checked against the standing owner `completed-not-closed-slate.sh`:
+it reports `fleet_noted=33` against my 30 outcome_note-bearing rows — its
+predicate is slightly WIDER than mine (I additionally excluded `recurring` and
+`defer_reason`), so **no reclaim-rule-7 narrowness defect**. Its slate is empty
+because the 6h age gate holds 1 fresh row, and it says so itself rather than
+printing a bare clean.
+
+**Lane 3 (unblocks): 0.** 25 blocked, `blocked_by` 24/25. Twenty are
+dependency-chain blocks (owned by dependency-timeout-check / dependency-cycle-check).
+RULE axis walked first per Step 3.0: no standing grant retires any cited
+condition. Of the five non-dependency blocks — g-115-3578 and g-250-124 are
+genuine measurement-window preconditions (the first probed 2026-08-29, ~1 day
+old); g-326-133's `partner-response` ref was re-stated 2026-08-19 with a
+structural block (this box is not the Studio host) and expires 2026-09-02;
+g-369-66 was created 14:10 TODAY by bravo against g-369-72. All still valid.
+
+**Lane 5b (staleness scanner, `--all-skills`):**
+`132 skills / 3796 assertions / 5 parse-lines / 0 stale`. Sub-population counts
+read, not just `stale_count` — `parse_lines_scanned=5` is non-zero, so that lane
+really ran. Surface growth against the 2026-07-31 baseline recorded in the skill
+(90 skills / 3648 assertions): **+42 skills, +148 assertions in one month**, and
+the `--all-skills` widening is still buying the only coverage the parse-line
+lane ever gets.
+
+**Lane 7, canonical instrument, both guard-1944 runs** (`lane_source` read
+FIRST: `derived-from-strategic-focus`, so the second run is LEGACY_LANE):
+
+| run | lane set | 7d share | 7d work_class | 48h share | 48h work_class |
+|---|---|---|---|---|---|
+| derived-from-strategic-focus | asp-363/364/368/369 | 11.2% | 31.2% | 7.1% | 25.7% |
+| legacy (explicit-flag) | asp-334/335 | 3.2% | 28.0% | 1.4% | 22.9% |
+
+7d composition: lane 14 / infra 75 / other 36 / total 125. floor_pct 33.3.
+Session tally (`counted_goals_this_session`, n=144, elements are bare strings):
+asp-115 **81** · asp-326 16 · asp-001 12 · asp-335 10 · asp-368 7 · asp-363 5 ·
+asp-369 4 · asp-306 3 · asp-364 2 · rest 1 each. The four boosted lanes total
+**18 of 144 (12.5%)** against asp-115's 56%.
+
+**Tilt test (rider c) is TRUE in both windows** — `infra > lane + other`:
+7d 75 > 50, 48h 47 > 40. The rare genuine condition, not the common
+`ordering_ok: False` false positive.
+
+**Mechanism grep run BEFORE asserting one** (the rider that refuted the
+2026-07-28 alpha finding): `goal-selector.py` DOES score the directive —
+`load_strategic_focus()` :3724 and `strategic_focus_boost()` :3776. So "the
+directive is not scored" is FALSE and was not filed.
+
+**Lane 4 (forward backlog): filed NOTHING, deliberately.** An ownership probe
+over pending+blocked returned **100 goals** matching
+`strategic_focus|directive.lane|lane.share|product focus|generation brake|framework-lane`,
+including the exact finding (`g-115-8352`: "the boosted-lane supply excuse is
+falsified — **selection**, not gating, is holding derived share"), its remedy
+(`g-115-7745`: lift `strategic_focus_boost` to the `directive_boost` user tier),
+a named mechanism-level cause (`g-115-8380`: `pull_boost` +4.0 exactly cancelled
+by `per_goal_saturation` -4.0 **on its own designated consumer**), and the prior
+trend point (`g-115-6051`: "every recency window is now worse than the last").
+
+**Lane 7 finding — the pain is not the tilt, it is that the tilt is
+100-goals-owned and still tilting.** Diagnosis capacity is not the bottleneck
+here; execution of the already-filed remedy is. Producing a 101st correct
+diagnosis of this defect is the failure mode, not the contribution. Classified
+NOT material (no Self change): this is an execution choice available at the very
+next selection, not an identity drift. Recorded here and left to bind selection.
+
+---
+
+## 2026-09-01T05:33 — echo, `hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud
+
+Cadence: current=12666 last=12590 **diff=76** (cadence 75). Compaction #1 landed
+at skill load; deadman re-armed first per return-protocol before any lane ran.
+
+**Phase 1b:** insights backlog **0** — `examined=0/0 curated=0 dropped=0
+cleared_queue=0`. No-op, recorded so a later zero is readable as "ran and was
+empty" rather than "never ran".
+
+**Phase 2 — and this reading exists mainly for the method rule it produced.**
+
+| query | rows | claimed_by | claimed_by_sid | name-less-sid |
+|---|---|---|---|---|
+| `in-progress --full` | 2 | 2/2 | 2/2 | 0 |
+| `pending + participants agent --full` | 2162 | 3/2162 | 3/2162 | 0 |
+| **combined (the mandated tally)** | **2164** | **5/2164** | **5/2164** | **0** |
+
+Tally: `2164 candidates — 2159 mutable, 0 skipped (foreign sid), 0 skipped
+(absent sid), 5 skipped (partner)`. Claimants: alpha 4, zeta 1.
+
+**METHOD RULE 8 — A LARGE MUTABLE COUNT IS AN UNCLAIMED POPULATION, NEVER A WORK
+LIST.** Rule 6 covers the small case ("the gates working, not a small
+population"); nothing covered the large case, and the large case is the more
+misleading of the two because 2159 reads as actionable. It is not: `claimed_by`
+is set on **0.23%** of this population, so the ownership branches never fire and
+"mutable" degenerates to "unclaimed", which is the default state of the entire
+pending backlog. The two queries differ in claim density by **~430x** (100% vs
+0.14%) and the skill mandates ONE combined tally across both, so the combined
+line is dominated by the query where ownership means least. Read the per-query
+split above, never the combined number alone — and remember mutable-by-ownership
+is not a completion verdict: the actual Phase 2 predicate is "outcomes
+satisfied", which was evaluated on **0** of the 2159 (declared, per guard-1760).
+
+Both in-progress rows were alpha's, claimed 18 and 28 min earlier with matching
+`executed_by_sid` — live executions, correctly skipped. **0/2 carried an
+`outcome_note`**, so this reading is the claim→status window, NOT the
+worker-delivery queue the skill's current text describes; that text is itself a
+dated reading (2026-08-19) and should not be read as the standing shape.
+
+Canonical detector `completed-not-closed-slate.sh`: `slate=0`, mine=2 (both
+suppressed on unchanged notes). **0 out-of-cycle closes.**
+
+**Phase 3:** 21 blocked. `21 candidates — 0 mutated, 0 skipped (foreign sid), 0
+skipped (absent sid), 1 skipped (partner)`. The other 20 are ownership-mutable
+and every one retains a live signal. Verdict from the purpose-built auditor, not
+a hand scan: `blocked-signal-resolution-check --post-routing` →
+`all_resolved_count 0`, `dangling_ref []`, `undecidable []`,
+`naive_would_unblock []` (scanned 2760, blocked_with_signal 19).
+`reason-less-blocked-check` → `reason_less_count 0`. The 21-vs-19 gap is
+predicate scope; both scanners report zero on their own predicate.
+RULE axis (Step 3.0): only **grant-009** retires a `defer_reason` class (DEV
+env-server down) and none of the 21 cite it — the live defers are
+`precondition_unmet:` (self-re-probing) and `blocked_on_dependency:`. Note
+`g-369-41` carries `blocked_by` as a bare **string**, not a list.
+
+**Phase 4: 0 goals filed, deliberately.** The one finding — `(unattributed): 14`
+noted-open goals, oldest **309.1h**, which the slate script itself says has "no
+drainer at all" — is already owned by **g-115-6483**, inside a 10-goal
+completed-not-closed family. Contributed a third series point to it instead:
+7 rows/174.4h (08-17) → 11/193.6h (08-19) → **14/309.1h** (09-01); +100%
+population, +78% age, never once down. zeta (16) has now overtaken it in raw
+count while remaining drainable, so the argument for that goal is now purely
+structural, not size — recorded there so a successor does not re-derive priority
+from the count.
+
+**Phase 5b:** `--all-skills` → **133 skills / 3804 assertions / 5 parse-lines /
+0 stale**. Parse-line lane non-zero, so it really ran. Growth against the
+2026-08-19 point (91 skills / 3652 assertions): **+42 skills, +152 assertions**.
+Phase 5a: no new framework contract this window (the locus finding is already
+covered by the 0.5b.18 census lane) — no check appended.
+
+**Phase 6 — a mechanism I was about to act on, falsified by one grep.**
+`depth_allocation` is `{micro: 0.9, long: 0.1}` and looked like the cause of
+/reflect Phase B starvation (extract-patterns + calibration skipped on fires
+#120 and #121). It is not: **no consumer gates Phase B on it.** Every hit is
+meta-transfer / meta-generations / backpressure-test / config-schema plumbing
+plus two *advisory* comment lines in `reflect/SKILL.md`. Phase B starvation is
+LLM scoping discretion at `--full-cycle` time, and re-weighting the knob would
+have changed nothing. (Also latent: `meta.yaml` declares
+`depth_allocation_constraint: "episode + pattern + strategic must sum to 1.0"`
+while the live value's keys are `micro`/`long` — the constraint names three keys
+that do not exist in the data.)
+
+Second Phase 6 finding: `roi_history.session` carries **five incompatible value
+shapes** across 20 entries — ints (121, 126, 1), goal-ids (`g-001-01`),
+agent-sid strings (`echo-0a0d4a76`), a goal-id-plus-fire string, and one entry
+where a full ~300-char narrative was pasted into `session`. No consumer can key
+on it. Routed to **guard-4037** (a field whose current value violates its own
+rule teaches that violation to every subsequent writer — "a chain is precedent
+that looks like a convention"), strengthened rather than duplicated;
+**guard-3782** strengthened too, having actually been applied this sweep (the
+old distinctive text was asserted present in the read-back of both note
+appends). Both spooled to the sidecar as expected.
+
+**Lane 7, canonical instrument, both guard-1944 legs** (`lane_source` read
+FIRST: `derived-from-strategic-focus`, so leg 2 is LEGACY_LANE):
+
+| run | lane set | 7d share | 7d work_class | 48h share | 48h work_class |
+|---|---|---|---|---|---|
+| derived-from-strategic-focus | asp-363/364/368/369 | 5.9% | 26.1% | 8.1% | 27.0% |
+| legacy (explicit-flag) | asp-334/335 | 3.4% | 26.1% | 2.7% | 27.0% |
+
+7d composition: lane 7 / infra 70 / other 42 / total 119. floor_pct 33.3.
+**Tilt test (rider c) TRUE in both windows** — 7d 70 > 49, 48h 41 > 33.
+Session tally (`counted_goals_this_session`, n=175, bare strings): asp-115 **102**
+· asp-001 17 · asp-326 16 · asp-335 10 · asp-368 7 · asp-306 5 · asp-363 5 ·
+asp-369 4 · asp-364 3 · rest ≤2. Boosted lanes **19 of 175 (10.9%)**.
+Against the prior point, 7d share fell 11.2% → 5.9% and work_class 31.2% →
+26.1%. Availability caveat is printed by the script itself and is NOT resolved
+here: `pool.lane_pct 1.63` (lane 36 vs infra 1809), and guard-2379's candidate
+check is deliberately NOT RUN — an absence, not a zero.
+
+**Lane 7 finding — deliberately NOT another directive-lane diagnosis.** The
+prior reading's own verdict applies unchanged and I am honouring it rather than
+producing the 101st correct diagnosis of an already-100-goals-owned defect. The
+new finding is method rule 8 above, plus one measured near-miss:
+
+**felt-sense-checkin/SKILL.md is the strongest evidence on the surface that the
+extraction method does not hold.** 146,036 B (arriving truncated, 08-19) →
+58,554 B (extraction) → 61,828 B **the same day** → **63,178 B** at HEAD —
++4,624 B (+7.9%) in 11 days, **2,358 B of headroom**. The diet goal g-115-8214
+selects on "over 65,536" so it excludes this file permanently and will only see
+it *after* it truncates again; its four rows have never been dieted, so none of
+them tests whether the fix STICKS. Recorded as evidence on g-115-8214 (predicate
+narrower than the at-risk population — `reclaim-routed-work.md` rule 7), not as
+a new goal. Correction to my own first framing: for a TRACKED member the
+operative cap is the size at HEAD, **not** 65,536 (that is `new_file_cap`, for
+NEW members only), so that re-growth went through `size-budget-override:`
+trailers — the ledger holds **54** `hot-path-size-gate` override rows, 5 naming
+felt-sense, against `hot-path-budget.yaml`'s verbatim "the count of those rows
+is the metric to watch". The ratchet regression is g-115-6817's; the
+override-count has no watcher named in either. **Classified NOT material** — no
+Self change; these are instrument-calibration findings, not identity drift.

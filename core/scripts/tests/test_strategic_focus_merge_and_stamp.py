@@ -353,6 +353,62 @@ def test_an_ack_cannot_outrank_the_owner_directive_in_the_merge(world: Path):
         "and every acknowledgement must still survive the union"
 
 
+# --- whole-sub-document scope of the ack exemption (restored) --------------
+# These three were dropped by evil merge b9ef9676 ("take the peer Body's
+# allowlist over mine for "), which resolved this file by taking
+# parent-2 wholesale: merge blob == ^2 exactly (17279 B), discarding ^1's
+# extra 5838 B. Every other function it dropped came back under a new name;
+# these did not, and `subdocument` scored 0 hits at HEAD. Restored verbatim
+# from b9ef9676^1 by the  evil-merge audit. The merge also dropped
+# the `STALE` constant these referenced; inlined to the literal here because
+# that is what the other 26 uses in this file do (no competing convention).
+def test_whole_subdocument_write_of_only_acks_still_bumps(world: Path):
+    """THE SCOPE BOUNDARY, and it is the opposite of what it looks like.
+
+    `--field strategic_focus` takes a whole dict, so a payload carrying nothing
+    but `acknowledged_by` LOOKS like the same non-amendment said another way. It
+    is not: `_set_nested` REPLACES the sub-document, so that write DELETES
+    primary, rationale, set_by and set_at. This test was originally written to
+    assert the stamp was preserved and failed with a bare `KeyError: 'set_at'`,
+    which is what established the behaviour — a directive WIPE is maximally
+    content-changing, and exempting it would hand a brand-new sub-document a
+    stale inherited stamp. The exemption is therefore dot-path-only."""
+    assert _run(world, "update", "--field", "strategic_focus.set_at",
+                "--value", "2026-07-04T13:45:00").returncode == 0
+    import json as _json
+    assert _run(world, "update", "--field", "strategic_focus",
+                "--value", _json.dumps({"acknowledged_by": ["alpha"]})
+                ).returncode == 0
+    f = _read_focus(world)
+    assert "primary" not in f, \
+        "fixture assumption: a whole-map write replaces rather than merges"
+    assert f["set_at"] > "2026-07-04T13:45:00", "a directive wipe must bump the stamp"
+
+
+def test_whole_subdocument_write_carrying_content_still_bumps(world: Path):
+    """POSITIVE CONTROL for the dict form (guard-4166): the same write shape
+    with one content key present must still bump."""
+    assert _run(world, "update", "--field", "strategic_focus.set_at",
+                "--value", "2026-07-04T13:45:00").returncode == 0
+    import json as _json
+    assert _run(world, "update", "--field", "strategic_focus",
+                "--value", _json.dumps({"acknowledged_by": ["alpha"],
+                                        "primary": "new directive"})).returncode == 0
+    assert _read_focus(world)["set_at"] > "2026-07-04T13:45:00"
+
+
+def test_empty_whole_subdocument_write_still_bumps(world: Path):
+    """`--value {}` REPLACES the sub-document with nothing — the most
+    destructive write available on this field. Pinned alongside the ack-only
+    whole-map case above so the dot-path-only scope of the exemption is covered
+    from both ends of the payload spectrum (empty and ack-only)."""
+    assert _run(world, "update", "--field", "strategic_focus.set_at",
+                "--value", "2026-07-04T13:45:00").returncode == 0
+    assert _run(world, "update", "--field", "strategic_focus",
+                "--value", "{}").returncode == 0
+    assert _read_focus(world)["set_at"] > "2026-07-04T13:45:00"
+
+
 # --- the DAEMON arm of the same predicate (, carried) -------------
 #
 # Everything above drives `core/scripts/team-state.py`. That is the MIRROR, not

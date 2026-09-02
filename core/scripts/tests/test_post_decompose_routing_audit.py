@@ -142,6 +142,13 @@ def audit_mod(monkeypatch):
     monkeypatch.setattr(mod, "_active_agents", lambda _root: (
         "alpha", "bravo", "delta", "echo",
     ))
+    # Freeze liveness for the same reason _active_agents is frozen: without
+    # this the  resolver runs against the REAL team-state, so every
+    # pre-existing test's outcome would depend on which fleet agents happen to
+    # be awake while the suite runs. {} = "no liveness info" = filter nothing,
+    # which reproduces pre- behavior exactly, so the 8 original tests
+    # keep asserting what they were written to assert.
+    monkeypatch.setattr(mod, "_liveness_verdicts", lambda _agents, _root: {})
     return mod
 
 
@@ -526,7 +533,7 @@ def test_decision_schema_complete(tmp_path, audit_mod):
     expected_keys = {
         "decision", "reason", "stamped_agent", "best_agent",
         "best_score", "stamped_score", "gap", "scores", "goal_id",
-        "investigate_spec",
+        "investigate_spec", "liveness_excluded",
     }
     # bad input
     d = audit_mod.audit("not a dict", project_root=project_root)
@@ -657,3 +664,203 @@ def test_g1351_insight_trigger_recursion_guard_no_file(tmp_path, audit_mod):
     assert decision["decision"] == "no_file", decision
     assert "recursion" in decision["reason"].lower(), decision
     assert decision["investigate_spec"] is None
+
+
+# ---------------------------------------------------------------------------
+# : liveness gate on the nomination pool
+#
+# The audit had ZERO liveness input, so it nominated dormant agents and the
+# goal was STRANDED. These pin the four verdict semantics guard-941 prescribes
+# (alive -> nominate, dormant -> hold, unknown -> treat as alive, retired ->
+# decommissioned) plus the fail-open direction.
+# ---------------------------------------------------------------------------
+
+_LIVENESS_GOAL = {
+    "id": "g-315-99",
+    "title": "Apply: solver_v0 client adapter — neural tree wiring",
+    "description": (
+        "Wire the solver_v0 hand-built neural tree into the "
+        "Ayoai-ARC-AGI-3-Integration client adapter so ARC game "
+        "sessions route per-tick frames through the the framework server."
+    ),
+    "intended_agent": "alpha",
+}
+
+
+def _all_selfmd():
+    return {"alpha": _ALPHA_SELFMD, "bravo": _BRAVO_SELFMD,
+            "delta": _DELTA_SELFMD, "echo": _ECHO_SELFMD}
+
+
+def test_dormant_best_match_is_not_nominated(tmp_path, audit_mod):
+    """echo wins on Jaccard but is dormant — it must not be the nominee."""
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    d = audit_mod.audit(_LIVENESS_GOAL, project_root=project_root,
+                        liveness_verdicts={"echo": "dormant"})
+    assert d["best_agent"] != "echo", d
+    assert d["liveness_excluded"] == {"echo": "dormant"}, d
+    # Scoring is untouched — echo is still SCORED, just not nominated.
+    assert "echo" in d["scores"], d
+
+
+def test_retired_best_match_is_not_nominated(tmp_path, audit_mod):
+    """retired is decommissioned, not merely quiet — also disqualifying."""
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    d = audit_mod.audit(_LIVENESS_GOAL, project_root=project_root,
+                        liveness_verdicts={"echo": "retired"})
+    assert d["best_agent"] != "echo", d
+    assert d["liveness_excluded"] == {"echo": "retired"}, d
+
+
+def test_unknown_verdict_is_treated_as_alive(tmp_path, audit_mod):
+    """guard-941 / check-team-state-before-silent rule 5: 'unknown' is an
+    AMBIGUOUS signal, never evidence of death. It must NOT disqualify."""
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    base = audit_mod.audit(_LIVENESS_GOAL, project_root=project_root,
+                           liveness_verdicts={})
+    d = audit_mod.audit(_LIVENESS_GOAL, project_root=project_root,
+                        liveness_verdicts={"echo": "unknown"})
+    assert d["best_agent"] == base["best_agent"] == "echo", (d, base)
+    assert d["liveness_excluded"] == {}, d
+
+
+def test_alive_verdict_nominates_normally(tmp_path, audit_mod):
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    d = audit_mod.audit(_LIVENESS_GOAL, project_root=project_root,
+                        liveness_verdicts={"echo": "alive"})
+    assert d["decision"] == "file", d
+    assert d["best_agent"] == "echo", d
+    assert d["liveness_excluded"] == {}, d
+
+
+def test_all_agents_dormant_suppresses_with_named_reason(tmp_path, audit_mod):
+    """No live nominee -> suppress. The reason must SAY so, so an empty
+    result is never misread as 'no mismatch found'.
+
+    Uses the "either" sentinel deliberately: the stamped agent is exempt from
+    liveness filtering (test_stamped_agent_is_never_liveness_filtered), so on
+    the specific-agent path the pool always retains at least the stamped agent
+    and can never empty. "either" is not a real agent name, so it is the only
+    path on which every scored agent can be disqualified.
+    """
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    goal = dict(_LIVENESS_GOAL, id="g-315-98", intended_agent="either")
+    d = audit_mod.audit(
+        goal, project_root=project_root,
+        liveness_verdicts={"alpha": "dormant", "bravo": "dormant",
+                           "delta": "dormant", "echo": "dormant"})
+    assert d["decision"] == "no_file", d
+    assert "liveness" in d["reason"], d
+    assert d["investigate_spec"] is None, d
+    assert set(d["liveness_excluded"]) == {"alpha", "bravo", "delta", "echo"}, d
+
+
+def test_stamped_agent_is_never_liveness_filtered(tmp_path, audit_mod):
+    """A goal already routed to a dormant agent is the case this audit most
+    needs to re-route AWAY. Filtering the stamped agent out of `scores` would
+    zero its stamped_score and distort the gap."""
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    d = audit_mod.audit(_LIVENESS_GOAL, project_root=project_root,
+                        liveness_verdicts={"alpha": "dormant"})
+    assert "alpha" not in d["liveness_excluded"], d
+    assert d["stamped_score"] == d["scores"]["alpha"], d
+
+
+def test_liveness_resolver_failure_is_fail_open(tmp_path, monkeypatch):
+    """A broken liveness probe must filter NOTHING. The opposite direction
+    would turn a probe outage into fleet-wide routing paralysis."""
+    mod = _load_audit_module()
+    monkeypatch.setattr(mod, "_active_agents", lambda _root: (
+        "alpha", "bravo", "delta", "echo"))
+
+    def _boom(_agents, _root):
+        raise RuntimeError("probe down")
+    monkeypatch.setattr(mod, "_liveness_verdicts", _boom)
+    project_root = _seed_project_root(tmp_path, _all_selfmd())
+    try:
+        d = mod.audit(_LIVENESS_GOAL, project_root=project_root)
+    except Exception as exc:  # pragma: no cover
+        raise AssertionError(f"audit must never raise; got {exc!r}")
+    assert d["decision"] in ("file", "no_file"), d
+
+
+def test_resolver_returns_empty_dict_on_import_failure(tmp_path, monkeypatch):
+    """The REAL resolver fails open to {} when its dependencies are unusable.
+
+    NOTE the earlier version of this test passed a nonexistent project_root and
+    expected {}. That premise is false once any prior test has imported
+    liveness_check: the module is then in sys.modules, so the sys.path insert
+    is irrelevant, the import succeeds, and the resolver correctly returns REAL
+    verdicts. Forcing the import to fail is the only way to exercise the outer
+    handler — and doing it via sys.modules also keeps the test hermetic
+    (no dependence on which fleet agents happen to be awake).
+    """
+    import sys as _sys
+    mod = _load_audit_module()
+    mod._LIVENESS_VERDICT_CACHE.clear()
+    mod._LIVENESS_CACHE_STAMP[0] = 0.0
+    monkeypatch.setitem(_sys.modules, "_paths", None)  # -> ImportError
+    out = mod._liveness_verdicts(("alpha",), tmp_path)
+    assert out == {}, out
+
+
+def test_resolver_uses_real_liveness_api_shapes(tmp_path, monkeypatch):
+    """Pin the API SHAPES the resolver consumes.
+
+    The first implementation treated liveness_check.fetch_row_stamp as a row
+    DICT and called .get() on it. It returns the row's `row_updated_by` STRING
+    (g-115-6410), so every agent raised AttributeError, the per-agent handler
+    swallowed it, and the resolver returned {} — i.e. the whole gate was INERT
+    on the production (daemon spec_from_file_location) path while all 8 unit
+    tests stayed green. A unit suite over audit() structurally cannot catch
+    that, because the fixture stubs the resolver out.
+
+    This test therefore stubs liveness_check/_team_state with their REAL return
+    shapes and asserts a verdict actually comes back. If someone "simplifies"
+    the resolver back onto a guessed shape, this fails.
+    """
+    import sys as _sys
+    import types
+
+    mod = _load_audit_module()
+    mod._LIVENESS_VERDICT_CACHE.clear()
+    mod._LIVENESS_CACHE_STAMP[0] = 0.0
+
+    calls = {}
+
+    fake_lc = types.ModuleType("liveness_check")
+    fake_lc.DEFAULT_THRESHOLD_HOURS = 6
+
+    def _age(ts, now):
+        from datetime import timedelta
+        return None if not ts else timedelta(minutes=1)
+    fake_lc._age = _age
+    # REAL shape: a STRING (row_updated_by), never a dict.
+    fake_lc.fetch_row_stamp = lambda a, w: a
+    fake_lc.fetch_retirement_tombstone = lambda a, w: None
+    fake_lc.fetch_fresh_signal = lambda a, w, b: calls.setdefault("fresh", 0)
+    fake_lc.fetch_authoritative_last_active_with_provenance = (
+        lambda a, w: (None, None))
+
+    def _decide(last_active, fresh, **kw):
+        # Assert the caller handed us the shapes decide_liveness documents.
+        assert isinstance(kw.get("row_updated_by"), (str, type(None))), kw
+        return {"verdict": "dormant" if last_active is None else "alive"}
+    fake_lc.decide_liveness = _decide
+
+    fake_ts = types.ModuleType("_team_state")
+    # REAL shape: {agent: row_dict}, last_active lives HERE, not in liveness_check.
+    fake_ts.load_rows = lambda w: {
+        "alpha": {"last_active": "2026-08-30T22:00:00"},
+        "echo": {},   # no last_active -> exercises the stale/expensive branch
+    }
+
+    fake_paths = types.ModuleType("_paths")
+    fake_paths.WORLD_DIR = tmp_path / "world"
+
+    monkeypatch.setitem(_sys.modules, "liveness_check", fake_lc)
+    monkeypatch.setitem(_sys.modules, "_team_state", fake_ts)
+    monkeypatch.setitem(_sys.modules, "_paths", fake_paths)
+
+    out = mod._liveness_verdicts(("alpha", "echo"), tmp_path)
+    assert out == {"alpha": "alive", "echo": "dormant"}, out

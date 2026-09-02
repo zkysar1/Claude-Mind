@@ -46,6 +46,22 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eval_harness as eh  # noqa: E402
 
+# Registered id in core/config/gates.yaml — NOT the filename. Counting this
+# gate's firings by the script name returns a false zero (measured 2026-08-31:
+# the sibling Tier-1 gate logs as `eval-harness-forge-accept`).
+GATE_ID = "skill-edit-precommit"
+
+
+def _log_firing(decision, path, verdict=None, override=None):
+    """Telemetry (guard-502): lazy import, best-effort, never influences the gate."""
+    try:
+        import _gate_log
+        _gate_log.log(GATE_ID, decision, caller=path,
+                      override_reason=override or None,
+                      extra=(verdict.as_dict() if verdict is not None else None))
+    except Exception:
+        return
+
 # Objective structural dimensions — each maps a SKILL.md body to [0,1]. These
 # are the signals real regressions have dropped (front-matter loss; Return
 # Protocol loss; truncation). Weighted equally; the gate keys on the aggregate.
@@ -137,9 +153,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if v is None:
             print(f"[skill-edit-gate] SKIP {p} (new skill — forge-time gate governs)",
                   file=sys.stderr)
+            _log_firing("noop", p)
             continue
         if not v.passed:
             regressions.append((p, v))
+        else:
+            _log_firing("pass", p, v)
 
     if not regressions:
         return 0
@@ -150,11 +169,15 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"delta={v.delta:.3f})", file=sys.stderr)
 
     if override:
+        for p, v in regressions:
+            _log_firing("override", p, v, override)
         print(f"[skill-edit-gate] OVERRIDE accepted: {override!r} — allowing "
               f"{len(regressions)} structural regression(s) (audit: stderr).",
               file=sys.stderr)
         return 0
 
+    for p, v in regressions:
+        _log_firing("block", p, v)
     print("[skill-edit-gate] BLOCKED: a SKILL.md edit regressed structural "
           "completeness (front matter / Return Protocol / body / headings / "
           "procedure). Fix the edit, or set "

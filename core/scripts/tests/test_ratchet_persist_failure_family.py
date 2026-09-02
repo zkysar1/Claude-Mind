@@ -36,6 +36,7 @@ FAMILY = [
     ("goal-field-census-ratchet", ["--json"]),
     ("experience-orphan-ratchet", ["--json"]),
     ("eviction-conservation-ratchet", ["--json"]),
+    ("verification-check-validity-ratchet", ["--json"]),
     ("skillmd-flag-audit", ["--output", "json", "--ratchet"]),
 ]
 

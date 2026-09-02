@@ -381,12 +381,24 @@ class RunnerClaim(NamedTuple):
     There is deliberately NO raw-token field on this tuple: the projection is the
     boundary the token must not cross, so making it unrepresentable here means a
     future caller cannot leak it by adding one line to a response dict. Defaulted
-    so every existing positional construction stays valid."""
+    so every existing positional construction stays valid.
+
+    ``holder_since`` is epoch-seconds marking when the CURRENT ``machine_id``
+    became the holder — NOT when the claim was last acquired (g-306-379). It is
+    deliberately NOT bumped when the SAME machine re-acquires, because the
+    question it answers is "has one box held this claim continuously?", and a
+    plain acquisition timestamp cannot distinguish continuous tenure from
+    re-acquisition after a peer held it (both produce the same value). 0 means
+    UNKNOWN — a legacy row that has not changed hands since this field shipped —
+    and every consumer must fail OPEN on 0, exactly as ``heartbeat_at``'s 0
+    means "never heartbeated" rather than "infinitely stale". Defaulted for the
+    same positional-construction reason as ``runner_token_fp``."""
     agent: str
     machine_id: Optional[str]
     agent_state: str
     heartbeat_at: int
     runner_token_fp: Optional[str] = None
+    holder_since: int = 0
 
 
 # Own-cloud writes use S3 PutObject(IfMatch=<etag>) compare-and-swap (fix #3 in
@@ -439,6 +451,17 @@ def _assert_ifmatch_supported() -> None:
 # test_ownership_cutover.py::test_config_invariant_ddb_stale_exceeds_local_heartbeat_stale.
 DEFAULT_RUNNER_STALE_SECONDS = 3900
 
+# Reader-cache TTL: seconds a cached read trusts the local mirror before
+# re-checking S3 freshness (HEAD + ETag compare). Raised 30 -> 120 on
+# 2026-08-30 (S3 cost plan): egress attribution measured the fleet's read
+# amplification as the dominant S3 cost, and a 30s TTL re-HEADs (and, for a
+# store that changes every ~33s like world/aspirations.jsonl, re-GETs) on
+# nearly every clustered read. 120s matches the push-sweep cadence the fleet
+# already tolerates for cross-box visibility, and write correctness never
+# rode on this value: RMW writes refresh force_fresh and the fenced PUT +
+# merge handlers arbitrate conflicts. Per-box override: OWNCLOUD_CACHE_TTL.
+DEFAULT_CACHE_TTL_SECONDS = 120
+
 
 class OwnCloudBackend:
     """StorageBackend over S3 + DynamoDB. Constructed explicitly (tests) or via
@@ -459,7 +482,7 @@ class OwnCloudBackend:
     def __init__(self, *, env_id: str, bucket: str, lock_table: str,
                  sessions_table: str, cache_root: PathLike = None,
                  root_map=None,
-                 cache_ttl: int = 30, machine_id: str = "unknown",
+                 cache_ttl: int = DEFAULT_CACHE_TTL_SECONDS, machine_id: str = "unknown",
                  region: str = "us-east-2",
                  runner_stale_seconds: int = DEFAULT_RUNNER_STALE_SECONDS,
                  aws_access_key_id: str = None, aws_secret_access_key: str = None,
@@ -550,6 +573,7 @@ class OwnCloudBackend:
         self._cas_writes = 0
         self._cas_conflicts = 0
         self._cas_conflicts_resolved = 0
+        self._merge_noop_identical = 0
         # Preflight: fail loud NOW if botocore is too old for PutObject IfMatch,
         # rather than letting every _put crash cryptically at runtime (reads
         # would still work, masking the break). See _assert_ifmatch_supported.
@@ -643,7 +667,8 @@ class OwnCloudBackend:
             lock_table=os.environ["STORAGE_DDB_LOCK_TABLE"],
             sessions_table=os.environ["STORAGE_DDB_SESSIONS_TABLE"],
             root_map=cls._resolve_root_map(),
-            cache_ttl=int(os.environ.get("OWNCLOUD_CACHE_TTL", "30")),
+            cache_ttl=int(os.environ.get("OWNCLOUD_CACHE_TTL",
+                                         str(DEFAULT_CACHE_TTL_SECONDS))),
             machine_id=machine_id,
             region=os.environ.get("AWS_DEFAULT_REGION", "us-east-2"),
             runner_stale_seconds=runner_stale,
@@ -900,6 +925,63 @@ class OwnCloudBackend:
             return candidate
         return None
 
+    def _cache_fetch(self, key: str, etag: str) -> Optional[bytes]:
+        """g-358-40: ask the LAN object cache for this exact (key, ETag).
+
+        Returns the decoded plaintext on a hit, or None — and None ALWAYS means
+        "caller proceeds exactly as it did before this feature existed".
+
+        OFF BY DEFAULT. Enabled only when OWNCLOUD_OBJECT_CACHE names a base
+        URL (e.g. http://10.63.163.202:34915). The URL *is* the flag, so there
+        is no separate on/off switch that could disagree with the address it
+        points at, and the kill switch is one `unset`.
+
+        WHY THIS IS SAFE TO PUT IN THE HOT READ PATH:
+        the caller has already HEADed S3 and holds the authoritative `etag`, so
+        this asks a content-addressed store for one specific content hash. The
+        cache can only answer with bytes stored under that exact ETag. A hit is
+        therefore byte-equivalent to `get_object`; it is not a freshness
+        judgement and no staleness window applies (distinct from `cache_ttl`
+        above it, which IS time-based — guard-1578/guard-5617).
+
+        FAIL-OPEN, TOTAL: every failure mode — flag unset, DNS, refused
+        connection, timeout, 404 miss, 401, malformed reply, short read — takes
+        the same path, `return None`, and the caller does its normal S3 GET.
+        Nothing here can turn a working read into a failed one; the worst case
+        is one wasted round-trip on the LAN.
+        """
+        base = os.environ.get("OWNCLOUD_OBJECT_CACHE", "").strip()
+        if not base:
+            return None  # feature off: byte-identical to the pre-feature path
+        try:
+            import urllib.parse
+            import urllib.request
+
+            url = (base.rstrip("/") + "/v1/cache/object?"
+                   + urllib.parse.urlencode({"key": key, "etag": etag}))
+            headers = {"X-Runtime-Client": "owncloud-backend"}
+            token = os.environ.get("MIND_API_TOKEN", "").strip()
+            if token:
+                headers["Authorization"] = "Bearer " + token
+            timeout = float(os.environ.get("OWNCLOUD_OBJECT_CACHE_TIMEOUT", "2"))
+            req = urllib.request.Request(url, method="GET", headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    return None
+                body = resp.read()
+            # A truncated body would be silently wrong, and this is the one
+            # error the transport can hand us that still looks like success.
+            declared = resp.headers.get("Content-Length")
+            if declared is not None and len(body) != int(declared):
+                return None
+            self._cache_hits = getattr(self, "_cache_hits", 0) + 1
+            return body
+        except Exception:
+            # Deliberately bare: this is the fail-open boundary. Any exception
+            # at all means "cache unavailable", never "read failed".
+            self._cache_errors = getattr(self, "_cache_errors", 0) + 1
+            return None
+
     def _refresh(self, path: PathLike, force_fresh: bool) -> Path:
         """Ensure the local cache file is current vs S3, returning its path. On a
         fresh-enough cache (within cache_ttl) and not force_fresh, skips the HEAD.
@@ -1008,10 +1090,23 @@ class OwnCloudBackend:
                 self._etags[key] = etag
                 self._stamp_manifest_baseline(path, tail_body, etag=etag)
                 return local
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        # g-358-11: the mirror holds DECODED bytes — every consumer above the
-        # backend keeps reading plaintext, whatever the object's encoding.
-        body = _codec_decode_response(obj, key=key)
+        # g-358-40: try the LAN object cache before spending S3 egress. `etag`
+        # here is the value HEADed from S3 a few lines above, so this asks for
+        # one specific, already-verified content hash. None -> unchanged path.
+        #
+        # ORDERING IS DELIBERATE — do NOT hoist this above _range_tail_pull.
+        # The tail pull moves only the appended DELTA over the internet; a cache
+        # hit moves the WHOLE object over the LAN. For an append-mostly store
+        # (1 KB appended to a 100 MB file) the range GET is far cheaper in real
+        # terms even though the LAN looks "free", and it also leaves the object
+        # out of the cache's working set. Cheapest-transfer-first is the rule:
+        # range GET -> LAN cache -> full S3 GET.
+        body = self._cache_fetch(key, etag)
+        if body is None:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+            # g-358-11: the mirror holds DECODED bytes — every consumer above
+            # the backend keeps reading plaintext, whatever the encoding.
+            body = _codec_decode_response(obj, key=key)
         _atomic_write_local(local, body)
         self._etags[key] = etag
         # Reaching this line requires verdict=="download" or local-absent --
@@ -1459,7 +1554,7 @@ class OwnCloudBackend:
         `listed` can see how much of the tree actually benefited, which is the
         difference between a measurement and a hopeful assertion.
 
-        Batch validity deliberately inherits `cache_ttl` (default 30s) rather
+        Batch validity deliberately inherits `cache_ttl` (DEFAULT_CACHE_TTL_SECONDS) rather
         than inventing a second expiry concept — the mail asked for "a decision
         about how long a batch stays valid" and the existing TTL already IS that
         decision, applied by the one code path that consumes it. A walk longer
@@ -1805,6 +1900,52 @@ class OwnCloudBackend:
                     f"handler declined to reconcile diverged content (same-heading "
                     f"divergence or an undecodable side). Frozen for reader "
                     f"reconciliation -- no write attempted.")
+            if remote_etag is not None and merged == remote_bytes:
+                # g-358-41: the union added NOTHING beyond what S3 already
+                # holds (local is a subset of remote), so a PUT here would
+                # create a new version of byte-identical content — and that
+                # ETag movement is what every OTHER box's next refresh pulls
+                # and re-merges, often producing another identical PUT. The
+                # echo measured ~23x on the hot stores (1,186 versions /
+                # 8.15 GB PUT in 12h on the goal queue vs ~95 logical
+                # writes/day, 2026-09-01 census). Skip the PUT: converge the
+                # LOCAL side to the union and adopt the observed remote ETag
+                # as the fence. Fail-safe under a concurrent third writer —
+                # if S3 moved after our GET, skipping merely leaves this box
+                # one cycle behind (the same terminal state as never having
+                # been called); the next refresh/sweep pulls and re-merges.
+                # The local write is itself conditional: rewriting identical
+                # bytes would bump mtime and re-arm the next sweep cycle,
+                # turning one no-op into a perpetual-motion no-op loop.
+                self._merge_noop_identical += 1
+                try:
+                    local_now = local.read_bytes()
+                except OSError:
+                    local_now = None
+                if local_now != merged:
+                    # Converge the local cache to the union — but only when
+                    # it actually differs: rewriting identical bytes bumps
+                    # mtime, which re-arms the next sweep cycle. Compare the
+                    # FILE, not `body`: in the _put entry paths `body` is the
+                    # new outgoing content and the local file still holds the
+                    # pre-write bytes (local is written only after S3 success).
+                    _atomic_write_local(local, merged)
+                self._etags[key] = remote_etag
+                self._cache_check[str(local)] = time.monotonic()
+                self._diverged_keys.discard(key)
+                self._stamp_manifest_baseline(path, merged, etag=remote_etag)
+                if saw_conflict:
+                    self._cas_conflicts_resolved += 1
+                    _LOG.info(
+                        "owncloud CAS conflict resolved for %s by IDENTITY — "
+                        "merge added nothing, PUT skipped (merge_noop_identical=%d)",
+                        key, self._merge_noop_identical)
+                elif self._merge_noop_identical % 50 == 1:
+                    _LOG.info(
+                        "owncloud merge-noop: PUT skipped for %s — merged bytes "
+                        "identical to remote (merge_noop_identical=%d this process)",
+                        key, self._merge_noop_identical)
+                return WriteResult(version=remote_etag, fallback_used=False)
             kw = dict(Bucket=self.bucket, Key=key)
             kw.update(self._body_kwargs(path, merged))  # g-358-11 transport encode
             if remote_etag is not None:
@@ -1858,6 +1999,7 @@ class OwnCloudBackend:
             "conflicts": self._cas_conflicts,
             "resolved": self._cas_conflicts_resolved,
             "conflict_rate": self._cas_conflict_rate(),
+            "merge_noop_identical": self._merge_noop_identical,
         }
 
     def atomic_write(self, target: PathLike, write_to_handle,
@@ -2015,6 +2157,19 @@ class OwnCloudBackend:
                 raise
             # Someone else holds it now (we were stale-broken mid-work). No-op —
             # same forgiving semantics as LocalBackend.release_lock(missing).
+            # Stale-break instrumentation (g-115-8536), VICTIM side: this
+            # cond-fail is positive proof a peer stole the lock while we were
+            # inside the critical section — our just-completed write may have
+            # been overwritten (lost update). Silent until 2026-09-01. One
+            # stderr line; never raises past the except.
+            try:
+                import sys
+                sys.stderr.write(
+                    f"[lock-stale-break] victim=self lock_key={lock_key} "
+                    f"holder={self._holder()} — peer stole the lock mid-work; "
+                    f"our RMW may be a lost update (g-115-8536)\n")
+            except Exception:
+                pass
 
     # --- agent-session coordination (SYNC-DDB tier; dual-runner + heartbeat)
     def _session_key(self, agent_name: str) -> str:
@@ -2034,18 +2189,51 @@ class OwnCloudBackend:
         except ClientError as e:
             if e.response["Error"]["Code"] != _COND_FAILED:
                 raise  # already exists is fine
+        # TWO ATTEMPTS, and the split is the whole point of holder_since
+        # (g-306-379). Attempt 1 is the SAME-MACHINE re-acquire: it asserts
+        # machine_id is already us, so it must NOT touch holder_since — this box's
+        # tenure never lapsed to a peer, and bumping it here would forget that.
+        # Attempt 2 is a tenure CHANGE (a different machine held it, or the row
+        # was never claimed), so holder_since is stamped to now.
+        #
+        # Atomicity is unchanged: BOTH attempts carry `agent_state = :idle`, which
+        # is the condition that makes acquire mutually exclusive. Attempt 1 adding
+        # a second conjunct can only make it refuse MORE often, and its sole
+        # failure follow-up is attempt 2, whose condition is the original one — so
+        # the acquire semantics this method already guaranteed are preserved
+        # exactly, and a concurrent peer still loses at attempt 2.
+        #
+        # Attempt 1 deliberately does NOT set machine_id: its own condition has
+        # already proven the stored value equals ours.
+        common = {":run": {"S": "RUNNING"},
+                  ":idle": {"S": "IDLE"},
+                  ":tok": {"S": token},
+                  ":hb": {"N": str(now)},
+                  ":mid": {"S": self.machine_id}}
         try:
             self.ddb.update_item(
                 TableName=self.sessions_table,
                 Key={"session_key": {"S": skey}},
                 UpdateExpression=("SET agent_state = :run, runner_token = :tok, "
-                                  "heartbeat_at = :hb, machine_id = :mid"),
+                                  "heartbeat_at = :hb"),
+                ConditionExpression="agent_state = :idle AND machine_id = :mid",
+                ExpressionAttributeValues=common)
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] != _COND_FAILED:
+                raise
+            # Not a same-machine re-acquire (different machine_id, or the
+            # attribute is absent on a never-claimed row), OR not IDLE. Attempt 2
+            # decides which — it re-tests IDLE alone.
+        try:
+            self.ddb.update_item(
+                TableName=self.sessions_table,
+                Key={"session_key": {"S": skey}},
+                UpdateExpression=("SET agent_state = :run, runner_token = :tok, "
+                                  "heartbeat_at = :hb, machine_id = :mid, "
+                                  "holder_since = :hs"),
                 ConditionExpression="agent_state = :idle",
-                ExpressionAttributeValues={":run": {"S": "RUNNING"},
-                                           ":idle": {"S": "IDLE"},
-                                           ":tok": {"S": token},
-                                           ":hb": {"N": str(now)},
-                                           ":mid": {"S": self.machine_id}})
+                ExpressionAttributeValues=dict(common, **{":hs": {"N": str(now)}}))
             return True
         except ClientError as e:
             if e.response["Error"]["Code"] == _COND_FAILED:
@@ -2158,6 +2346,11 @@ class OwnCloudBackend:
                 if not skey.startswith(prefix):
                     continue  # defense-in-depth: never leak a peer env's claim
                 hb_raw = item.get("heartbeat_at", {}).get("N")
+                # g-306-379: absent on every legacy row -> 0 -> consumers fail
+                # OPEN. The Scan carries no ProjectionExpression (see the
+                # runner_token note below), so this attribute needs no projection
+                # change to become visible here.
+                hs_raw = item.get("holder_since", {}).get("N")
                 # The Scan carries no ProjectionExpression, so `item` already
                 # holds the raw runner_token. It is digested HERE and the raw
                 # value is dropped on the floor — this line is the boundary the
@@ -2168,7 +2361,8 @@ class OwnCloudBackend:
                     agent_state=item.get("agent_state", {}).get("S", "IDLE"),
                     heartbeat_at=int(hb_raw) if hb_raw is not None else 0,
                     runner_token_fp=runner_token_fingerprint(
-                        item.get("runner_token", {}).get("S"))))
+                        item.get("runner_token", {}).get("S")),
+                    holder_since=int(hs_raw) if hs_raw is not None else 0))
             start_key = resp.get("LastEvaluatedKey")
             if not start_key:
                 break

@@ -239,7 +239,10 @@ def frontier_census(world_dir, agents_root_path, *, now: float | None = None,
         if status == "blocked":
             counts["blocked"] += 1
             continue
-        if status != "pending":
+        # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+        # an ALLOWLIST on the literal `pending` drops the tier from the frontier
+        # entirely. Ships dark until B1 () adds the status to the enum.
+        if status not in ("pending", "candidate"):
             continue
         if goal.get("recurring"):
             counts["recurring"] += 1
@@ -302,7 +305,8 @@ def open_funnel_goals(goal_index: dict) -> list:
         sig = goal.get("origin_signal") or ""
         if not isinstance(sig, str) or not sig.startswith(FUNNEL_SIGNAL_PREFIX):
             continue
-        if goal.get("status") != "pending" or goal.get("claimed_by"):
+        # +candidate — §11b/ (world/conventions/goal-intake-management.md).
+        if goal.get("status") not in ("pending", "candidate") or goal.get("claimed_by"):
             continue
         out.append({"id": gid, "root": sig[len(FUNNEL_SIGNAL_PREFIX):],
                     "source": goal.get("_source", "world")})

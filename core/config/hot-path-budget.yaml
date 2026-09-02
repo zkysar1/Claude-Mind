@@ -50,6 +50,16 @@ sets:
   - name: loop-digest
     paths: ["core/config/aspirations-loop-digest.md"]
     new_file_cap: 40960
+  # The precheck digest () holds the PROSE of aspirations-precheck's
+  # 19 deferrable-tier phases; the chain skeleton (## Phase headings, meter
+  # checks, drop branches) stayed inline in SKILL.md. Registered here so the
+  # extraction does not create an UNRATCHETED surface that can silently regrow
+  # the 57KB it just removed. Cap is above loop-digest's because this file is
+  # deduped by load-precheck-digest.sh (context-reads check-file), so it is not
+  # re-paid per iteration the way the loop digest is.
+  - name: precheck-digest
+    paths: ["core/config/aspirations-precheck-digest.md"]
+    new_file_cap: 73728
 
   # ── IDENTITY FILES () ───────────────────────────────────────────
   # agents/<agent>/self.md is re-read WHOLE at every post-compaction identity

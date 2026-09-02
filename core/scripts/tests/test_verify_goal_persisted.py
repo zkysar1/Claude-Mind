@@ -252,6 +252,144 @@ def test_claim_verifier_s3_raises_fails_open_true(monkeypatch):
                                       CLAIM_AGENT) is True
 
 
+# ═══ : HEAD-ETag fast path — skip the whole-store GET when S3's head
+# IS this process's own last write ══════════════════════════════════════════
+#
+# The fake below adds the two surfaces the fast path feature-detects on top of
+# the own-cloud trio: `_etags` (the fence `_put` records) and `stat()` (HEAD).
+# `get_object` is COUNTED, and the raw S3 body is deliberately set to DISAGREE
+# with the local mirror in the "no GET" tests — so a fast path that silently
+# fell through to the GET would be caught by the body, not just the counter.
+
+from types import SimpleNamespace as _NS  # noqa: E402
+
+
+class _FakeFastPathBackend(_FakeOwnCloudBackend):
+    def __init__(self, *, mirror: Path, fence, head, raw: bytes | None = None,
+                 head_raises: Exception | None = None):
+        super().__init__(raw=raw)
+        self._mirror = mirror
+        self._etags = {} if fence is None else {self._s3_key(str(mirror)): fence}
+        self._head = head
+        self._head_raises = head_raises
+        self.get_calls = 0
+        _orig = self.s3.get_object
+
+        def _counting(Bucket, Key):  # noqa: N803
+            self.get_calls += 1
+            return _orig(Bucket=Bucket, Key=Key)
+        self.s3.get_object = _counting
+
+    def stat(self, path):
+        if self._head_raises is not None:
+            raise self._head_raises
+        return None if self._head is None else _NS(version=self._head, size=1)
+
+    def _local(self, path):
+        return self._mirror
+
+
+def _mirror_with(tmp_path, *goal_ids: str) -> Path:
+    p = tmp_path / "aspirations.jsonl"
+    p.write_bytes(_jsonl({"id": ASP_ID, "goals": [{"id": g} for g in goal_ids]}))
+    return p
+
+
+def test_fast_path_head_equal_answers_from_mirror_with_zero_gets(tmp_path, monkeypatch):
+    """Fence == HEAD ETag and the goal is in the local mirror -> found, no GET.
+    The raw S3 body LACKS the goal on purpose: had the GET run, the verdict
+    would have been False."""
+    mirror = _mirror_with(tmp_path, "g-115-0001", GOAL_ID)
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head='"e1"',
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": "g-115-0001"}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 0
+
+
+def test_fast_path_quoting_differences_still_match(tmp_path, monkeypatch):
+    """S3 ETags arrive quoted; a fence recorded unquoted must still compare."""
+    mirror = _mirror_with(tmp_path, GOAL_ID)
+    be = _FakeFastPathBackend(mirror=mirror, fence="e1", head='"e1"',
+                              raw=_jsonl({"id": ASP_ID, "goals": []}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 0
+
+
+def test_fast_path_head_mismatch_falls_back_to_get(tmp_path, monkeypatch):
+    """A peer wrote since (HEAD != fence): only the authoritative bytes decide.
+    Mirror HAS the goal, raw S3 does NOT -> the GET verdict (False) wins."""
+    mirror = _mirror_with(tmp_path, GOAL_ID)
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head='"e2"',
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": "g-115-0001"}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is False
+    assert be.get_calls == 1
+
+
+def test_fast_path_head_raises_falls_back_to_get(tmp_path, monkeypatch):
+    mirror = _mirror_with(tmp_path, GOAL_ID)
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head='"e1"',
+                              head_raises=RuntimeError("HEAD transient"),
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": GOAL_ID}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 1
+
+
+def test_fast_path_head_absent_falls_back_to_get(tmp_path, monkeypatch):
+    mirror = _mirror_with(tmp_path, GOAL_ID)
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head=None,
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": GOAL_ID}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 1
+
+
+def test_fast_path_no_fence_falls_back_to_get(tmp_path, monkeypatch):
+    """Fresh daemon (empty _etags): the existing GET path runs unchanged."""
+    mirror = _mirror_with(tmp_path, GOAL_ID)
+    be = _FakeFastPathBackend(mirror=mirror, fence=None, head='"e1"',
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": GOAL_ID}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 1
+
+
+def test_fast_path_goal_absent_from_mirror_falls_back_to_get(tmp_path, monkeypatch):
+    """ETag equal but the mirror lacks the goal: never a fast negative — the
+    GET decides (here: present in S3 -> True)."""
+    mirror = _mirror_with(tmp_path, "g-115-0001")
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head='"e1"',
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": GOAL_ID}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 1
+
+
+def test_fast_path_unreadable_mirror_falls_back_to_get(tmp_path, monkeypatch):
+    mirror = tmp_path / "missing.jsonl"  # never written
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head='"e1"',
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": GOAL_ID}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_goal_persisted(mirror, ASP_ID, GOAL_ID) is True
+    assert be.get_calls == 1
+
+
+def test_fast_path_serves_the_claim_verifier_fields(tmp_path, monkeypatch):
+    """The claim verifier compares fields on the returned record; the mirror's
+    record carries them, so the claim read-back also needs zero GETs."""
+    mirror = tmp_path / "aspirations.jsonl"
+    mirror.write_bytes(_jsonl({"id": ASP_ID, "goals": [
+        {"id": GOAL_ID, "claimed_by": CLAIM_AGENT, "status": "in-progress"}]}))
+    be = _FakeFastPathBackend(mirror=mirror, fence='"e1"', head='"e1"',
+                              raw=_jsonl({"id": ASP_ID, "goals": [{"id": GOAL_ID}]}))
+    _patch_backend(monkeypatch, be)
+    assert aw._verify_claim_persisted(mirror, ASP_ID, GOAL_ID, CLAIM_AGENT) is True
+    assert be.get_calls == 0
+
+
 # ═══ : claim() endpoint refuses the false 200 on resolve-away ═════
 # Direct-call endpoint tests: real claim() write path against a tmp world,
 # with get_backend monkeypatched to a fake own-cloud whose raw content IS the
@@ -406,7 +544,7 @@ def test_transition_verifier_fields_match_true(monkeypatch):
     _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
     assert aw._verify_transition_persisted(
         LIVE_PATH, ASP_ID, GOAL_ID,
-        {"defer_reason": "waiting on X"}) is True
+        {"defer_reason": "waiting on X"})[0] is True
 
 
 def test_transition_verifier_stale_value_false(monkeypatch):
@@ -417,7 +555,7 @@ def test_transition_verifier_stale_value_false(monkeypatch):
     # The release wrote claimed_by=absent; the store still shows echo → loss.
     assert aw._verify_transition_persisted(
         LIVE_PATH, ASP_ID, GOAL_ID,
-        {"claimed_by": None, "claimed_at": None}) is False
+        {"claimed_by": None, "claimed_at": None})[0] is False
 
 
 def test_transition_verifier_none_expected_matches_absent(monkeypatch):
@@ -427,7 +565,7 @@ def test_transition_verifier_none_expected_matches_absent(monkeypatch):
     _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
     assert aw._verify_transition_persisted(
         LIVE_PATH, ASP_ID, GOAL_ID,
-        {"defer_reason": None, "claimed_by": None}) is True
+        {"defer_reason": None, "claimed_by": None})[0] is True
 
 
 def test_transition_verifier_goal_absent_false(monkeypatch):
@@ -435,20 +573,20 @@ def test_transition_verifier_goal_absent_false(monkeypatch):
     raw = _jsonl({"id": ASP_ID, "goals": [{"id": "g-115-0001"}]})
     _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
     assert aw._verify_transition_persisted(
-        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"}) is False
+        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"})[0] is False
 
 
 def test_transition_verifier_local_backend_fails_open_true(monkeypatch):
     _patch_backend(monkeypatch, _FakeLocalBackend())
     assert aw._verify_transition_persisted(
-        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"}) is True
+        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"})[0] is True
 
 
 def test_transition_verifier_s3_raises_fails_open_true(monkeypatch):
     _patch_backend(monkeypatch,
                    _FakeOwnCloudBackend(raise_exc=RuntimeError("transient")))
     assert aw._verify_transition_persisted(
-        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"}) is True
+        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"})[0] is True
 
 
 # ═══ : endpoint guards refuse the false 200 on swallowed PUT ═══
@@ -796,3 +934,127 @@ def test_complete_by_nonrecurring_unaffected_by_the_recurring_branch(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ═══ : the verifier must NAME the field that disagreed ═══════════
+#
+# The predicate returned a bare `all(...)`, so all three call sites could
+# report only THAT a critical transition had not persisted. Six failed closes
+# of one recurring goal were measured from the outside across two days
+# (achievedCount 66 -> 72, so every "failed" write had in fact LANDED) and the
+# failing key could not be named from any of them.
+#
+# guard-3292: the diagnostic is part of the RETURN, not an optional
+# out-parameter — an optional one has no failure mode at the call site, so two
+# of the three sites would have stayed silently undiagnosable.
+
+
+def test_transition_verifier_names_the_mismatching_field(monkeypatch):
+    """The observed value is the half the old bare-bool implementation threw
+    away, and it is the half that identifies the defect."""
+    raw = _jsonl({"id": ASP_ID, "goals": [
+        {"id": GOAL_ID, "status": "in-progress", "claimed_by": "echo"}]})
+    _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
+    ok, mm = aw._verify_transition_persisted(
+        LIVE_PATH, ASP_ID, GOAL_ID, {"claimed_by": None, "claimed_at": None})
+    assert ok is False
+    assert [m["field"] for m in mm] == ["claimed_by"]
+    assert mm[0]["expected"] is None
+    assert mm[0]["observed"] == "echo"
+
+
+def test_transition_verifier_reports_every_mismatch_not_just_the_first():
+    """A close writes several fields at once; short-circuiting on the first
+    disagreement would hide the rest and invite a second measurement pass."""
+    raw = _jsonl({"id": ASP_ID, "goals": [
+        {"id": GOAL_ID, "status": "in-progress",
+         "lastAchievedAt": "2026-08-31T18:05:14", "claimed_by": "alpha"}]})
+    import pytest as _pytest
+    mp = _pytest.MonkeyPatch()
+    try:
+        _patch_backend(mp, _FakeOwnCloudBackend(raw=raw))
+        ok, mm = aw._verify_transition_persisted(
+            LIVE_PATH, ASP_ID, GOAL_ID,
+            {"status": "pending", "lastAchievedAt": "2026-09-01T00:35:25",
+             "claimed_by": None, "claimed_at": None})
+    finally:
+        mp.undo()
+    assert ok is False
+    assert {m["field"] for m in mm} == {"status", "lastAchievedAt",
+                                        "claimed_by"}
+
+
+def test_transition_verifier_match_reports_no_mismatches(monkeypatch):
+    """POSITIVE CONTROL. Without it the two assertions above would pass even
+    if the verifier had started reporting a mismatch unconditionally."""
+    raw = _jsonl({"id": ASP_ID, "goals": [
+        {"id": GOAL_ID, "status": "pending", "defer_reason": "waiting on X"}]})
+    _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
+    ok, mm = aw._verify_transition_persisted(
+        LIVE_PATH, ASP_ID, GOAL_ID, {"defer_reason": "waiting on X"})
+    assert ok is True
+    assert mm == []
+
+
+def test_transition_verifier_fail_open_paths_report_no_mismatches(monkeypatch):
+    """The conservative fail-open contract is unchanged: no-verify returns
+    True, and must not manufacture a mismatch for a caller to render."""
+    _patch_backend(monkeypatch, _FakeLocalBackend())
+    ok, mm = aw._verify_transition_persisted(
+        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"})
+    assert (ok, mm) == (True, [])
+
+
+def test_transition_verifier_goal_absent_carries_a_sentinel(monkeypatch):
+    """goal-absent is a real failure, so it must not render as the empty
+    'no field mismatch reported' string at the call site."""
+    raw = _jsonl({"id": ASP_ID, "goals": [{"id": "g-115-0001"}]})
+    _patch_backend(monkeypatch, _FakeOwnCloudBackend(raw=raw))
+    ok, mm = aw._verify_transition_persisted(
+        LIVE_PATH, ASP_ID, GOAL_ID, {"status": "completed"})
+    assert ok is False
+    assert mm and mm[0]["field"] == "<goal>"
+    assert "absent" in aw._format_transition_mismatches(mm)
+
+
+def test_format_transition_mismatches_renders_both_shapes():
+    assert aw._format_transition_mismatches([]) == "no field mismatch reported"
+    rendered = aw._format_transition_mismatches(
+        [{"field": "status", "expected": "pending", "observed": "completed"},
+         {"field": "claimed_at", "expected": None, "observed": "2026-09-01"}])
+    assert "status: expected='pending' observed='completed'" in rendered
+    assert "claimed_at: expected=None observed='2026-09-01'" in rendered
+
+
+def test_format_transition_mismatches_caps_long_values():
+    """`_CRITICAL_TRANSITION_FIELDS` includes `defer_reason`, which is
+    narrative by design (probe-before-defer tells authors to cite probe
+    output). Measured on the live queue 2026-09-01: 157 goals carrying one,
+    median 1,044 chars, max 5,204, 133 of 157 over 500. Uncapped, one
+    mismatch renders both ends into an HTTP body and a stderr line."""
+    long_a = "x" * 4000
+    rendered = aw._format_transition_mismatches(
+        [{"field": "defer_reason", "expected": long_a, "observed": "short"}])
+    assert len(rendered) < 400, f"rendering not bounded: {len(rendered)} chars"
+    assert "truncated, 4002 chars" in rendered   # repr adds the two quotes
+    assert "observed='short'" in rendered        # the short side stays whole
+
+
+def test_cap_keeps_length_visible_when_both_sides_truncate():
+    """The length is the load-bearing part. Two long values that differ only
+    PAST the cap would render identically without it, turning a real
+    disagreement into apparent noise."""
+    a, b = "y" * 3000, "y" * 3500
+    rendered = aw._format_transition_mismatches(
+        [{"field": "defer_reason", "expected": a, "observed": b}])
+    assert "3002 chars" in rendered and "3502 chars" in rendered
+
+
+def test_cap_is_off_below_the_threshold():
+    """POSITIVE CONTROL: values under the cap must pass through untouched,
+    or every short diagnostic would carry truncation noise."""
+    short = "z" * (aw._MISMATCH_VALUE_CAP - 10)
+    rendered = aw._format_transition_mismatches(
+        [{"field": "status", "expected": short, "observed": None}])
+    assert "truncated" not in rendered
+    assert short in rendered

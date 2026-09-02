@@ -29,6 +29,9 @@ def load_all() -> Routes:
     from . import wm_write as _wm_write
     from . import aspirations_write as _aspirations_write
     from . import admin as _admin
+    #  — LAN-shared content-addressed S3 object cache (read-side only;
+    # collapses the ~16x per-object download amplification that drives egress)
+    from . import cache_object as _cache_object
     # Phase 5 — world-service module (ctx.paths.world endpoints)
     from ..world import tree as _tree
     from ..world import pipeline as _pipeline
@@ -123,4 +126,5 @@ def load_all() -> Routes:
     _meta_backpressure.register(routes)
     _meta_yaml.register(routes)
     _strategy_apply.register(routes)
+    _cache_object.register(routes)
     return routes

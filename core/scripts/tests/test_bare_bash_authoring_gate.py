@@ -185,3 +185,76 @@ def test_heredoc_honors_the_escape_hatch(payload_line, expected_denied):
     cmd = "py -3 - <<'PY'\nimport subprocess\n" + payload_line + "\nPY"
     denied = _run(_bash(cmd)).stdout.strip() != ""
     assert denied is expected_denied
+
+
+# --- 7. HEREDOC written INTO a .py FILE (, 2026-08-31) ------------
+#
+# The third authoring route. Demonstrated live 2026-07-27 and re-measured
+# still-open 2026-08-28: the SAME argv was BLOCKED as `py -3 - <<PY` and
+# EXECUTED as `cat > scratch.py <<PY; py -3 scratch.py`. A session-scratch
+# file is neither inline nor committed, so neither guard-580 layer saw it.
+#
+# The fix keys on the DESTINATION, not the consuming command — `cat`, `tee`,
+# `dd` and anything future must all name the file on the opener line. Matching
+# `cat >` alone would catch the demonstrated shape while reading like class
+# coverage, which is worse than an honest gap.
+
+@pytest.mark.parametrize("cmd,why", [
+    ("cat > x.py <<'PY'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nPY",
+     "the demonstrated shape: cat > .py"),
+    ("cat > /tmp/t.py <<EOF\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nEOF",
+     "unquoted delimiter, absolute path"),
+    ("cat >> x.py <<'PY'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nPY",
+     "append redirect is the same authoring act"),
+    ("cat <<'PY' > x.py\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nPY",
+     "redirect AFTER the opener is equally valid shell"),
+    ("tee agents/echo/temp/s.py <<'PY'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nPY",
+     "tee is a different consumer, same destination"),
+    ("dd of=x.py <<'PY'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nPY",
+     "dd names its destination with of="),
+])
+def test_heredoc_to_py_file_is_denied(cmd, why):
+    hso = _assert_denied(_run(_bash(cmd)))
+    assert "guard-580" in hso["permissionDecisionReason"], why
+
+
+@pytest.mark.parametrize("cmd,why", [
+    ("cat > f.txt <<'EOF'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nEOF",
+     "REGRESSION PIN: a non-.py destination stays approved. This body parses "
+     "as Python and WOULD be flagged, so an AST-only filter silently reverses "
+     "the deliberate decision pinned in section 6."),
+    ("cat > x.py <<'PY'\nfrom _runtime_bash import BASH\nimport subprocess\n"
+     "subprocess.run([BASH, \"a.sh\"])\nPY",
+     "negative control: the sanctioned resolver must never be flagged"),
+    ("cat > x.py <<'PY'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])  # allow-bare-bash: posix\nPY",
+     "the documented escape hatch must work on this route too"),
+    ("cat > x.py <<'PY'\nthis is not || python {{{\nPY",
+     "an unparseable body is skipped, not blocked"),
+    ("cat > notes.md <<'EOF'\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nEOF",
+     "a markdown destination is not Python being authored"),
+    ("echo 'shift x << SHIFT here' > out.py",
+     "a << that is not a heredoc opener must not invent a body"),
+])
+def test_heredoc_to_py_file_non_violations_fail_open(cmd, why):
+    assert _run(_bash(cmd)).stdout.strip() == "", why
+
+
+def test_interpreter_heredoc_redirected_to_py_reports_once():
+    """A heredoc that feeds an interpreter AND redirects to .py matches BOTH
+    heredoc extractors. The finding must appear once, not twice."""
+    cmd = "py -3 - <<'PY' > x.py\nimport subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\nPY"
+    hso = _assert_denied(_run(_bash(cmd)))
+    reason = hso["permissionDecisionReason"]
+    assert reason.count("[list-argv]") == 1, reason
+
+
+def test_route_b_write_tool_remains_uncovered_by_design():
+    """HONEST-GAP PIN. The Write tool never reaches a PreToolUse[Bash] hook —
+    payload.tool_name is 'Write', so main() approves at the early return. This
+    is documented in extract_heredoc_to_py_file's docstring rather than
+    implied-covered. If a future PreToolUse[Write] matcher lands, this test is
+    the one that should change."""
+    payload = {"tool_name": "Write",
+               "tool_input": {"file_path": "x.py",
+                              "content": "import subprocess\nsubprocess.run([\"bash\", \"a.sh\"])\n"}}
+    _assert_approved(_run(payload), "Write is out of this hook's scope")
