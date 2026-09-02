@@ -63,6 +63,14 @@ FRAMEWORK_PATHS = [
     "core/config",
     "core/scripts",
     "core/githooks",
+    # core/tests is the third pytest.ini testpath (core/tests/gates). It was
+    # absent here until 2026-09-02, and framework_pull.py READS this list as its
+    # copy set, so a pull-adoption updated core/scripts/gates/<module>.py but
+    # left core/tests/gates/test_<module>.py at the prior tag: the downstream's
+    # C4 suite then failed on a fixture the adoption never delivered -- a red
+    # that reads as a code regression and can trigger the rollback of a correct
+    # adoption. Tests travel with the code they test.
+    "core/tests",
     ".claude/skills",
     ".claude/rules",
     ".claude/settings.json",
@@ -93,9 +101,11 @@ MANIFEST_NOT_DRIFT_CHECKED = {
     # chain (guard-844), and this tool could not have caught it in ANY
     # dimension because the files were outside the walk entirely. A mode check
     # alone would have been inert here — the surface gap came first.
-    "core/": "copied whole; core/config + core/scripts + core/githooks are "
-             "checked (core/logs is machine-local; core/tests and "
-             "core/BOUNDARY.md still need their own exclusion design)",
+    "core/": "copied whole; core/config + core/scripts + core/githooks + "
+             "core/tests are checked (core/logs is machine-local; "
+             "core/BOUNDARY.md still needs its own exclusion design). "
+             "core/tests CLOSED 2026-09-02: framework_pull.py copies THIS "
+             "list, so its absence shipped gate modules without their tests",
     # Repo-furniture that legitimately differs per deployment. A promote
     # overwriting these is expected, not drift.
     ".env.example": "deployment-local credential template",
