@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""PreToolUse[Bash] hook — refuse a bare-``"bash"`` argv[0] in INLINE Python.
+"""PreToolUse[Bash] hook — refuse a bare-``"bash"`` argv[0] in AD-HOC Python.
 
 The authoring-time half of the guard-580 Layer-B defense (goal g-115-3171).
 The pre-commit gate (``check-no-bare-bash.py``) covers committed files. This
 covers the surface that gate structurally cannot reach: ad-hoc, one-off,
 throwaway Python passed straight to the interpreter as ``python -c '...'`` /
-``py -3 -c '...'`` and never written to a tracked file.
+``py -3 -c '...'``, or fed by heredoc, or WRITTEN INTO A SCRATCH ``.py`` FILE
+that is then run — none of which is ever committed.
+
+THREE EXTRACTION ROUTES, added in the order the gaps were measured:
+  1. ``-c`` payloads                      (g-115-3171, the original)
+  2. heredoc -> INTERPRETER                (g-115-3180, 2026-07-27)
+  3. heredoc -> ``.py`` FILE               (g-115-3467, this one)
+Route 3 keys on the DESTINATION, not the consuming command — see
+``extract_heredoc_to_py_file`` for why, and for what it deliberately does
+NOT cover (the Write/Edit tool never reaches a PreToolUse[Bash] hook).
 
 WHY THIS HALF IS THE LOAD-BEARING ONE (rb-5255, the scope correction on
 g-115-3171): the reintroduction that promoted this work to HIGH was NOT in a
@@ -95,7 +104,7 @@ def _log(decision, *, path, form=None, error=None):
         return  # telemetry must never influence the gate
 
 DENY_TEMPLATE = (
-    "BLOCKED by bare-bash-authoring-gate (guard-580): this inline Python builds a "
+    "BLOCKED by bare-bash-authoring-gate (guard-580): this ad-hoc Python builds a "
     "subprocess argv whose argv[0] is a bare \"bash\".\n\n"
     "{findings}\n\n"
     "On win32 CreateProcess searches System32 BEFORE PATH, so a bare \"bash\" "
@@ -174,6 +183,43 @@ _HEREDOC_RE = re.compile(
 )
 
 
+# A heredoc opener with NO interpreter requirement, plus the ``.py`` DESTINATION
+# that decides whether its body is Python being AUTHORED. Keying on the
+# destination rather than the consumer is deliberate: the set of commands that
+# can consume a heredoc is unbounded (`cat`, `sed`, `dd`, tomorrow's), but they
+# must all NAME the file on the opener line, so the destination is the bounded
+# half. Covering `cat > x.py` alone would read like class coverage while
+# catching one shape — worse than an honest gap ( scope note).
+_HEREDOC_ANY_RE = re.compile(
+    r"<<-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))",
+    re.MULTILINE,
+)
+
+# `> x.py` / `>> x.py` (either side of the opener), `tee [-a] x.py`, `dd of=x.py`.
+# `<` and `>` are excluded from the path class so a match cannot run into the
+# heredoc opener itself.
+_PY_DEST_RE = re.compile(
+    r">>?\s*['\"]?([^\s'\";|&<>]+\.py)\b"
+    r"|\btee\b(?:\s+-\w+)*\s+['\"]?([^\s'\";|&<>]+\.py)\b"
+    r"|\bdd\b[^\n]*?\bof=['\"]?([^\s'\";|&<>]+\.py)\b"
+)
+
+
+def _heredoc_body(command: str, opener_end: int, delim: str) -> str:
+    """Body of the heredoc whose opener ends at ``opener_end``, or "".
+
+    Shared by both heredoc extractors so the two cannot drift — a divergent
+    copy of terminator handling is exactly the defect this gate keeps finding
+    in other people's code.
+    """
+    body_lines: list[str] = []
+    for line in command[opener_end:].split("\n")[1:]:   # skip opener remainder
+        if line.strip() == delim:
+            break
+        body_lines.append(line)
+    return "\n".join(body_lines)
+
+
 def extract_heredoc_python(command: str) -> list[str]:
     """Return every heredoc-fed inline Python program in ``command``.
 
@@ -203,14 +249,63 @@ def extract_heredoc_python(command: str) -> list[str]:
             delim = m.group(1) or m.group(2) or m.group(3)
             if not delim:
                 continue
-            rest = command[m.end():]
-            body_lines: list[str] = []
-            for line in rest.split("\n")[1:]:   # skip remainder of opener line
-                if line.strip() == delim:
-                    break
-                body_lines.append(line)
-            if body_lines:
-                out.append("\n".join(body_lines))
+            body = _heredoc_body(command, m.end(), delim)
+            if body:
+                out.append(body)
+    except Exception:
+        return []   # never block on an extractor bug
+    return out
+
+
+def extract_heredoc_to_py_file(command: str) -> list[str]:
+    """Return every heredoc body being WRITTEN INTO a ``.py`` file.
+
+    THE THIRD AUTHORING ROUTE (g-115-3467, demonstrated live 2026-07-27 and
+    re-measured still-open 2026-08-28). The same argv was BLOCKED as
+    ``py -3 - <<PY`` and EXECUTED as ``cat > scratch.py <<PY; py -3 scratch.py``
+    — neither guard-580 layer saw the second: a session-scratch file is neither
+    inline nor committed.
+
+    WHY THE DESTINATION AND NOT THE CONSUMER. The set of commands that can
+    consume a heredoc is unbounded, so matching `cat >` would catch the
+    demonstrated shape while reading like class coverage. Every such command
+    must NAME its destination on the opener line, so the destination is the
+    bounded half and keying on it covers `cat`, `sed`, `dd`, `tee` and whatever
+    comes next.
+
+    WHY NOT SCAN EVERY HEREDOC AND LET THE AST DECIDE. Because a deliberate
+    prior decision says otherwise: `cat > f.txt` carrying a bare-bash argv is
+    APPROVED and pinned by test ("a NON-python heredoc must not be scanned as
+    python"). That case parses as Python and WOULD be flagged, so an
+    AST-only filter silently reverses it. This reconciles with the module
+    docstring's "scope globs are NOT applied": INLINE code has no path, so it
+    is scanned unconditionally; a heredoc-to-file HAS one, and it is the
+    signal that separates authoring Python from writing text that resembles it.
+
+    NOT COVERED, deliberately and stated rather than implied: a Python script
+    that writes another Python script (destination is not on the opener line);
+    write-then-rename (`cat > x.tmp ...; mv x.tmp x.py`); and the Write/Edit
+    tool, which never reaches this PreToolUse[Bash] hook at all.
+    """
+    if not command or "<<" not in command or ".py" not in command:
+        return []
+    out: list[str] = []
+    try:
+        for m in _HEREDOC_ANY_RE.finditer(command):
+            delim = m.group(1) or m.group(2) or m.group(3)
+            if not delim:
+                continue
+            line_start = command.rfind("\n", 0, m.start()) + 1
+            line_end = command.find("\n", m.start())
+            if line_end == -1:
+                line_end = len(command)
+            # Redirect may sit on EITHER side of the opener, so scan the whole
+            # opener line: `cat > x.py <<EOF` and `cat <<EOF > x.py` both count.
+            if not _PY_DEST_RE.search(command[line_start:line_end]):
+                continue
+            body = _heredoc_body(command, m.end(), delim)
+            if body:
+                out.append(body)
     except Exception:
         return []   # never block on an extractor bug
     return out
@@ -230,7 +325,14 @@ def main() -> None:
     if not isinstance(command, str) or not command:
         approve_no_mutation()
 
-    snippets = extract_inline_python(command) + extract_heredoc_python(command)
+    snippets = (
+        extract_inline_python(command)
+        + extract_heredoc_python(command)
+        + extract_heredoc_to_py_file(command)
+    )
+    # An interpreter-fed heredoc that ALSO redirects to a .py file matches both
+    # heredoc extractors; dedupe so one violation is reported once.
+    snippets = list(dict.fromkeys(snippets))
     if not snippets:
         approve_no_mutation()
 

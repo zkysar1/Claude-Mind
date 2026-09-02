@@ -423,6 +423,30 @@ def _read_self(project_root: Path, env: Mapping[str, str]) -> tuple[dict[str, ob
     return (fm if isinstance(fm, dict) else {}), body
 
 
+def _read_goals(world_path: Path) -> list[dict[str, object]]:
+    """Flatten the WORLD aspiration queue's nested goals -> a flat list of goal records.
+
+    Store I/O only — the projection/redaction decision lives in
+    :func:`knowledge_projection.project_goals`, per PEARL 10.3 filter-at-the-source.
+
+    WORLD ONLY, deliberately. ``agents/<name>/aspirations.jsonl`` is each agent's private
+    maintenance queue; the world queue is the shared domain work, which is the only half
+    a member-facing board is asking about. Reading the agent queues here would publish
+    per-agent housekeeping AND make the bundle's contents depend on which agent happened
+    to run the export — the same ambiguity :func:`_read_self` refuses to guess through.
+
+    A non-list ``goals`` value is skipped rather than raised on: one malformed aspiration
+    must not zero the whole projection.
+    """
+    out: list[dict[str, object]] = []
+    for asp in _read_jsonl(world_path / "aspirations.jsonl"):
+        goals = asp.get("goals")
+        if not isinstance(goals, list):
+            continue
+        out.extend(g for g in goals if isinstance(g, dict))
+    return out
+
+
 def _secret_values(env: dict[str, str]) -> list[str]:
     """Env var VALUES whose name ends in a secret suffix — stripped from output.
 
@@ -467,6 +491,7 @@ def build_bundle(
         redactor=redactor,
         self_front_matter=self_fm,
         self_body=self_body,
+        goals=_read_goals(world_path),
     )
 
 
@@ -595,6 +620,22 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
             encoding="utf-8",
         )
 
+    # goals.md — the "what is planned" concept. ONE file, not one per goal: a goal is a
+    # roadmap line rather than a standalone concept, and 400+ near-empty concept files
+    # would drown the wiki's article list. Same absence contract as self.md above —
+    # written only when non-empty, so an absent file means "nothing published".
+    if bundle.goals:
+        _rows = "\n".join(
+            f"- **{g.get('status', '')}** — {g.get('title', '')}"
+            + (f" _(updated {g['updated']})_" if g.get("updated") else "")
+            for g in bundle.goals
+        )
+        (out_dir / "goals.md").write_text(
+            f"{_okf_frontmatter({'type': 'goals', 'count': len(bundle.goals)})}\n"
+            f"# What's planned\n\n{_rows}\n",
+            encoding="utf-8",
+        )
+
     # index.md — the optional progressive-disclosure index (invariant 7).
     # `generated_at` rides in the frontmatter AND as a visible line: the downloadable
     # wiki outlives the box it came from, so a reader holding an unzipped copy needs
@@ -619,6 +660,8 @@ def write_okf_bundle(bundle: ProjectedBundle, out_dir: Path) -> dict[str, int]:
     ]
     if counts.get("self"):
         lines.append("- [About this agent](self.md)")
+    if counts.get("goals"):
+        lines.append(f"- [What's planned](goals.md) ({counts['goals']})")
     lines += [
         "",
         "## Articles",
@@ -771,6 +814,12 @@ def main(argv: list[str] | None = None) -> int:
             # the content, never mere presence). Projection/redaction happened at the
             # source in knowledge_projection.project_self; this writer only shapes.
             "self": bundle.agent_self,
+            # The customer-facing "what is planned" view — the Planned board reads FROM
+            # this durable published copy. `[]` when nothing is exposable; the key is
+            # always present, so emptiness is the signal rather than an absent key.
+            # Projection/redaction happened at the source in
+            # knowledge_projection.project_goals; this writer only shapes.
+            "goals": bundle.goals,
         }
     )
     text = json.dumps(payload, indent=2, ensure_ascii=False)

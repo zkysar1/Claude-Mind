@@ -525,7 +525,7 @@ print(f'g-{asp_num}-{max_seq + 1}')
 # (g-115-1 fix: previously appended standalone records invisible to collect_candidates())
 set +e   # see the WRITE2 rc handling below -- do NOT let set -e swallow this
 WRITE2_RC=$(py -3 -c "
-import json, os, sys, tempfile
+import json, os, stat, sys, tempfile
 goal_id=sys.argv[1]; title=sys.argv[2]; description=sys.argv[3]
 priority=sys.argv[4]; category=sys.argv[5]; origin=sys.argv[6]
 reason=sys.argv[7]; timestamp=sys.argv[8]; audit_ref=sys.argv[9]
@@ -602,13 +602,25 @@ if lines_now != len(output_lines):
           f'clobber a concurrent write. Re-run the injection.', file=sys.stderr)
     sys.exit(2)
 
+# (3) Mode preservation. mkstemp creates 0600 BY CONTRACT and os.replace swaps
+#     that inode over the peer's store, so the atomic form above inherits
+#     mkstemp's mode where the old write-through form preserved the file's own.
+#     Measured: 0644 -> 0600. If the peer's daemon runs as a different uid (normal
+#     for a long-lived service) one injection makes the peer's whole goal store
+#     unreadable to its own daemon -- surfacing on the PEER box, blamed on the
+#     peer's daemon, while this side printed Layer 2 verified and exited 0. And
+#     .history is no recovery layer for it: snapshots are box-local BY AUTHOR, so
+#     a peer-side clobber leaves no snapshot anywhere (guard-5413).
+#     asp_file exists here -- Write[1] appended to it.
 target_dir = os.path.dirname(os.path.abspath(asp_file)) or '.'
+prev_mode = stat.S_IMODE(os.stat(asp_file).st_mode)
 fd, tmp_path = tempfile.mkstemp(dir=target_dir, prefix='.aspirations-inject-', suffix='.tmp')
 try:
     with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as fh:
         fh.writelines(output_lines)
         fh.flush()
         os.fsync(fh.fileno())
+    os.chmod(tmp_path, prev_mode)
     os.replace(tmp_path, asp_file)
 except BaseException:
     try:

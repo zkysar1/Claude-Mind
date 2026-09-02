@@ -256,12 +256,87 @@ def test_blocked_with_no_signal_is_left_to_the_complement_sweep():
     assert _classify(_goal(blocked_by=[], blocker_ref="")) is None
 
 
-def test_every_terminal_status_counts_as_resolved():
+def test_every_GOAL_terminal_status_counts_as_resolved():
+    """Renamed from ...every_terminal_status... by .
+
+    The constant is now GOAL_TERMINAL_STATUSES, because this reader resolves TWO
+    kinds of referent with two different vocabularies and the unqualified name is
+    what let the pending-question branch acquire the goal set by accident.
+    """
     mod = _import()
-    for st in mod.TERMINAL_STATUSES:
+    for st in mod.GOAL_TERMINAL_STATUSES:
         e = _classify(_goal(blocker_ref="g-1"),
                       _index(_goal(id="g-1", status=st)))
         assert e["verdict"] == "all_resolved", st
+
+
+def test_an_ANSWERED_pending_question_referent_is_resolved():
+    """THE  DEFECT, pinned.
+
+    pending-questions-close.sh writes status='answered'. This reader used to test
+    a pq status against the GOAL vocabulary — {completed, archived, skipped,
+    expired, resolved} — which does not contain 'answered'. So a blocked signal
+    citing a question the closer had already answered read as UNRESOLVED forever
+    and could never discharge.
+
+    `answered` is deliberately NOT in the sweep's settled set (it still owes the
+    --apply-cleanup transition to 'resolved'), so this test also pins that the
+    reader uses is_closed and not is_settled — the narrower set would re-create
+    the defect while looking like a tightening.
+    """
+    e = _classify(_goal(blocker_ref="pq-x"), {}, {"pq-x": "answered"})
+    assert e["verdict"] == "all_resolved", "an answered pq must discharge the signal"
+
+
+def test_every_DISCHARGING_pending_question_status_resolves_the_signal():
+    import importlib.util as _u
+    _s = _u.spec_from_file_location(
+        "_pqs", SCRIPT.parent / "_pending_question_status.py")
+    _m = _u.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    for st in _m.DISCHARGES_A_BLOCKER:
+        e = _classify(_goal(blocker_ref="pq-x"), {}, {"pq-x": st})
+        assert e["verdict"] == "all_resolved", st
+    # and a genuinely-open one does NOT
+    e = _classify(_goal(blocker_ref="pq-x"), {}, {"pq-x": "pending"})
+    assert e["verdict"] != "all_resolved"
+
+
+def test_a_RETIRED_pending_question_does_NOT_discharge_the_signal():
+    """`retired` means WITHDRAWN, not answered.
+
+    A question that was withdrawn kills the defer's clearing path rather than
+    satisfying it, so a goal blocked on one is NOT resolved — it needs a human
+    to notice the blocker lost its referent. Counting it as discharged would
+    silently unblock work nobody answered. The same distinction is kept, for the
+    same reason, in human-blocked-defer-join.py:83-87 (ANSWERED_STATUSES vs
+    RETIRED_STATUSES, "opposite actions").
+
+    This is the one status where `is_closed` and `discharges_a_blocker` differ,
+    so it is the test that pins them apart.
+    """
+    e = _classify(_goal(blocker_ref="pq-x"), {}, {"pq-x": "retired"})
+    assert e["verdict"] != "all_resolved", (
+        "a withdrawn question must not read as an answered one")
+
+
+def test_the_two_vocabularies_are_NOT_merged():
+    """guard-1127: decouple at the consumer, never widen one shared value.
+
+    A pending question is never 'completed' and a goal is never 'answered'. If a
+    future change merges these sets, this fails — which is the point.
+    """
+    import importlib.util as _u
+    mod = _import()
+    _s = _u.spec_from_file_location(
+        "_pqs2", SCRIPT.parent / "_pending_question_status.py")
+    _m = _u.module_from_spec(_s)
+    _s.loader.exec_module(_m)
+    assert "answered" not in mod.GOAL_TERMINAL_STATUSES
+    assert "completed" not in _m.CLOSED_STATUSES
+    assert not hasattr(mod, "TERMINAL_STATUSES"), (
+        "the unqualified name is what caused the cross-vocabulary misuse; "
+        "keep it retired so a reader cannot reach for the ambient set")
 
 
 def test_unparseable_timestamps_never_raise():

@@ -72,6 +72,18 @@ def has_blocker_evidence(record: dict) -> bool:
     if str(record.get("blocker_ref") or "").strip():
         return True
     blocked_by = record.get("blocked_by")
+    # blocked_by is POLYMORPHIC in the live store: measured 2026-09-01 (zeta,
+    # cc-02, Linux 6.8.0-137-generic) across 2751 goals -> 160 list, 2 bare str
+    # ( -> '',  -> ''). A bare-string
+    # dependency IS blocker evidence; a list-only test reads it as ABSENT, so
+    # iteration-close.sh's blocked-status gate refuses the write and prints
+    # "it has none (no blocker_ref, no blocked_by)" about a goal that has one,
+    # then steers the caller toward filing a redundant blocker. Fails closed,
+    # so nothing unsafe shipped -- but the refusal reason is false. guard-5479
+    # (blocked_by polymorphism) + guard-4622 (the non-adopter of a shared
+    # normalizer keeps a quietly narrower predicate).
+    if isinstance(blocked_by, str):
+        return bool(blocked_by.strip())
     return isinstance(blocked_by, list) and len(blocked_by) > 0
 
 

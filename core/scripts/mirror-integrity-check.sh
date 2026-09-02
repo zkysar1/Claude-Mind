@@ -34,7 +34,7 @@ source "$SCRIPT_DIR/_paths.sh"
 SINCE=""; DRIFT=1
 while [ $# -gt 0 ]; do
     case "$1" in
-        --since) SINCE="${2:-}"; shift 2 ;;
+        --since) SINCE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --no-drift) DRIFT=0; shift ;;
         *) echo "usage: mirror-integrity-check.sh [--since <iso>] [--no-drift]" >&2; exit 2 ;;
     esac

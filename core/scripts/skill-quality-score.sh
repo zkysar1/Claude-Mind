@@ -88,9 +88,19 @@ if [ "$SUBCMD" = "derive" ]; then
 # score — POST /v1/skill-quality/score
 # =============================================================================
 elif [ "$SUBCMD" = "score" ]; then
+    # Judge provenance is resolved HERE, in the judge's own process, and
+    # forwarded in the body. This is the Step 8.76 per-goal call site, so it is
+    # the DOMINANT producer of skill-quality evaluations; the daemon writer it
+    # reaches (skill_evaluate._score_write) cannot read these from its own
+    # environment without stamping its spawning session's values on every
+    # record fleet-wide (guard-2480, ).
+    rt_judge_provenance
+
     # Build JSON body from parsed args. Pass values via env (guard-165:
     # never interpolate bash variables into python source text).
     BODY="$(_SQS_SKILL="$SKILL" \
+        _SQS_JUDGE="$RT_JUDGE_MODEL" \
+        _SQS_HARNESS="$RT_JUDGE_HARNESS" \
         _SQS_GOAL="$GOAL" \
         _SQS_COST="$COST_AWARENESS" \
         _SQS_OMET="$OUTCOMES_MET" \
@@ -124,6 +134,8 @@ if s("_SQS_SO"): body["safety_override"] = s("_SQS_SO")
 if s("_SQS_CO"): body["completeness_override"] = s("_SQS_CO")
 if s("_SQS_EO"): body["executability_override"] = s("_SQS_EO")
 if s("_SQS_MO"): body["maintainability_override"] = s("_SQS_MO")
+if s("_SQS_JUDGE"):   body["judge_model"] = s("_SQS_JUDGE")
+if s("_SQS_HARNESS"): body["harness"]     = s("_SQS_HARNESS")
 if s("_SQS_DRY") == "1": body["dry_run"] = True
 print(json.dumps(body))
 ')"

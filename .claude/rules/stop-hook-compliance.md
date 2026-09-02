@@ -87,6 +87,19 @@ a signal to stop.
    (productivity-stop-gate stays in RUNNING and only sets the stop signal;
    recovery-gate moves RUNNING → IDLE).
 
+   <!-- exception added 2026-09-01 for recovery-yank-reverse (g-357-51) -->
+   **Exception**: `core/scripts/recovery-yank-reverse.sh` (invoked only by
+   `stop-hook.sh` Gate 1-pre, when the turn-ending session finds agent-state
+   IDLE beside a `session/recovery-log.jsonl`) is authorized to call
+   `session-state-set.sh RUNNING` (IDLE → RUNNING only) for the ONE sid the
+   recovery gate demoted: a process executing its own stop hook is alive by
+   construction, so that demotion was false (the 2026-09-01 rate-limited-alive
+   kill). Script-gated by `recovery_yank.py preconditions` — same sid, bound
+   autonomous BEFORE the yank, inside the reversal window (default 6h), no
+   user-stop artifact after the yank, no peer holding the runner claim — and
+   every miss is a no-op. The LLM MUST NOT invoke it directly. Third authorized
+   caller outside `/start` and `/stop`; the only one that moves IDLE → RUNNING.
+
 3. **Context compression is normal** — "The session has been running for a long time" is NOT
    a reason to stop. Autocompact compresses context to free space. The loop is designed to
    run indefinitely. Re-enter it.

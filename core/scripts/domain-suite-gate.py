@@ -301,9 +301,24 @@ def failing_ids(lines: list[str]) -> set[str]:
 # set from the previous run is the baseline; a close blocks only on a red that
 # is NOT in it (or on a collection error, which is never baseline-able); a run
 # whose reds are a subset of the baseline passes AND shrinks the baseline to
-# what still fails. The first run seeds it. The file is per box (a plain write
-# to the world mirror; on a synced world it stays local), which is the honest
-# scope — the baseline describes what THIS box last saw.
+# what still fails. The first run seeds it. The file is per box — the baseline
+# describes what THIS box last saw, which is the honest scope.
+#
+# THAT PER-BOX SCOPE IS ENFORCED BY THE BASENAME BEING MACHINE-LOCAL, not by
+# the write being "plain" (). Until 2026-08-31 this comment read "a
+# plain write to the world mirror; on a synced world it stays local" — and the
+# parenthetical was FALSE on any own-cloud deployment. The write IS plain, but
+# the sync WALK picks the file up afterwards, so two boxes rewrote one shared
+# S3 object. merge_handler_for("domain-suite-baseline.json") returns None, i.e.
+# governed-store-write-classes class (b): nothing reconciles below the write, so
+# the resulting fence is a PERMANENT wedge. Measured both-diverged for 123
+# consecutive mirror sweeps on cc-07 and 417 on cc-02. Because the consumer is a
+# GATE whose verdict is a ratchet, a foreign box's baseline mis-gates closes in
+# BOTH directions: admitting a real regression the other box already carried, or
+# blocking on a red this box never saw.
+# The basename is now in owncloud_sync._EXCLUDE_NAMES, which makes the claim
+# above true — _put short-circuits on _machine_local and writes local-only. If
+# that entry is ever removed, this comment is false again and the wedge returns.
 
 def _baseline_path(world_dir: Path) -> Path:
     return Path(world_dir) / "domain-suite-baseline.json"
@@ -411,6 +426,15 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         return 0
 
     baseline = load_baseline(world_dir)
+    # The units this block is actually about, recorded verbatim in the override
+    # ledger below. Without them the ledger holds only `why` (truncated at 6
+    # entries with " ...") and a free-text claim, so no later reader can check
+    # whether an override was honest — measured 2026-08-30 on a live 8-worker
+    # fleet: 7 of 12 refusals overridden, every one asserting the reds were
+    # "pre-existing", with the asserted count wandering 54 -> 66 -> 44 -> 47 ->
+    # 43 across seven hours (the true figure was 25). An unverifiable audit
+    # field is not an audit field.
+    blocking_units: list[str] = []
     if rc == 2 or not failing:
         why = ("domain suite could not COLLECT (rc=2: an import or syntax error in a test module)"
                if rc == 2 else f"domain suite RED (rc={rc}) and no failing unit could be identified from its output")
@@ -431,6 +455,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
                   "later closes block only on NEW reds", runner=runner_label, rc=rc, touched=touched,
                   failing=sorted(failing))
             return 0
+        blocking_units = own
         why = (f"no baseline yet, and {len(own)} red(s) sit in files THIS unit touched, so they cannot be "
                "called pre-existing: " + ", ".join(own[:6]) + (" ..." if len(own) > 6 else "")
                + f" ({len(failing) - len(own)} other red(s) will be recorded once these are fixed)")
@@ -442,6 +467,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
                   f"{baseline.get('recorded_at', '?')} (baseline ratcheted)", runner=runner_label, rc=rc,
                   touched=touched, failing=sorted(failing))
             return 0
+        blocking_units = new_reds
         why = (f"domain suite has {len(new_reds)} NEW red(s) not in the baseline of "
                f"{baseline.get('recorded_at', '?')}: " + ", ".join(new_reds[:6])
                + (" ..." if len(new_reds) > 6 else ""))
@@ -451,6 +477,11 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
             "goal_id": goal_id, "agent": os.environ.get("MIND_AGENT", "unknown"),
             "reason": override, "runner": runner_label, "rc": rc,
             "touched": [t[0] for t in touched], "why": why,
+            # The full blocking set, untruncated — what the claim in `reason`
+            # can be checked against later. Empty means no unit was
+            # identifiable (a collection error), which is never overridable.
+            "blocking_units": blocking_units,
+            "baseline_recorded_at": (baseline or {}).get("recorded_at"),
         })
         _emit("override", goal_id, override, reason=why + " — overridden: " + override,
               runner=runner_label, rc=rc, touched=touched, tail=tail)
@@ -472,8 +503,24 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     print("  no longer resolves: restore the symbol in the module, or update the test if the rename", file=sys.stderr)
     print("  was deliberate and every importer moved. Re-run it yourself first:", file=sys.stderr)
     print('    cd "$WORLD_PATH/scripts" && STORAGE_BACKEND=local python3 -m pytest -q', file=sys.stderr)
-    print("  Only when the red is PRE-EXISTING and tracked by a goal this close did not cause, pass", file=sys.stderr)
-    print('    --override-domain-suite "<goal-id>: <why this close is not the cause>"', file=sys.stderr)
+    # "PRE-EXISTING" IS NOT AN AVAILABLE RATIONALE HERE, and this text used to
+    # invite it. Every blocking branch above has ALREADY excluded the reds it
+    # knew about: the baseline holds the previous run's failing set, so a red
+    # that reaches this point is by construction either NEW to it or sitting in
+    # a file this very unit touched. Telling the operator to override when "the
+    # red is PRE-EXISTING" therefore named the one condition that cannot be true
+    # at this line — and the fleet answered exactly as instructed. Measured
+    # 2026-08-30 across 8 workers: 7 of 12 refusals overridden, every single
+    # justification asserting "pre-existing", one of them reading "all 47 NEW
+    # reds are pre-existing failures". The operators were honest; the prompt was
+    # wrong. Name the real alternative causes instead, so the claim is one a
+    # later reader can check against `blocking_units` in the ledger.
+    print("  These reds are NOT pre-existing — the baseline already excluded every red it knew", file=sys.stderr)
+    print("  about, so do not override by calling them that. Override only when another cause is", file=sys.stderr)
+    print("  identifiable, and NAME it:", file=sys.stderr)
+    print("    - a concurrent unit or an out-of-scope commit broke it (name the agent/goal/sha)", file=sys.stderr)
+    print("    - the unit is flaky or environment-dependent, not caused by any code change", file=sys.stderr)
+    print('    --override-domain-suite "<goal-id>: <named cause>, not this close"', file=sys.stderr)
     print("  (appended to world/domain-suite-overrides.jsonl). Never override a collection error.", file=sys.stderr)
     return 1
 

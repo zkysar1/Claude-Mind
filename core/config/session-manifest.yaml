@@ -465,6 +465,14 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  - file: recovery-yank-escalated
+    purpose: timestamp of the recovery-gate demotion this box's worker Body has ALREADY escalated (board finding + user notification) — recovery-yank-check.py reads it so a yank is announced once, not on every hourly park re-poll (g-357-51 part 3)
+    writer: recovery-yank-check.py --mark-escalated
+    recovery_action: preserve
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
   - file: recovery-failure-count
     purpose: integer count of consecutive _perform_recovery failures (circuit breaker); reset to absent on next successful recovery
     writer: recovery-gate.sh

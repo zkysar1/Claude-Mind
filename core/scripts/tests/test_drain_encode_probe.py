@@ -89,10 +89,95 @@ def test_md_without_goal_id_is_not_a_trace(tmp_path):
     p.write_text("just some prose with no goal reference", encoding="utf-8")
     assert probe.classify(str(p))[0] == "unknown_shape"
 
+    # A goal id found ONLY in the body is a CITATION until shown otherwise --
+    # measured 4 of 4 (echo/cc-03, 2026-08-21, ): every first-token id
+    # named a goal the file merely referenced, never its owner, and all four
+    # files had in fact already landed. So this shape is `trace_md_weak`, whose
+    # probe returns `unknown` rather than a definite `absent` ().
     p2 = tmp_path / "trace.md"
     p2.write_text("trace for g-115-3089 execution", encoding="utf-8")
-    atype, gid = probe.classify(str(p2))
-    assert (atype, gid) == ("trace_md", "g-115-3089")
+    assert probe.classify(str(p2)) == ("trace_md_weak", "g-115-3089")
+    assert probe._PROBES["trace_md_weak"]("g-115-3089")[0] == "unknown"
+
+
+def test_trace_md_owner_resolution_precedence(tmp_path):
+    """Owner comes from the FILENAME first, then front matter, then (weakly) body."""
+    fn = tmp_path / "g-364-132-notes.md"
+    fn.write_text("---\ngoal_id: g-999-1\n---\ncites g-777-2\n", encoding="utf-8")
+    assert probe.classify(str(fn)) == ("trace_md", "g-364-132")
+
+    fm = tmp_path / "analysis.md"
+    fm.write_text("---\ngoal_id: g-888-3\n---\ncites g-777-2\n", encoding="utf-8")
+    assert probe.classify(str(fm)) == ("trace_md", "g-888-3")
+
+    body = tmp_path / "analysis2.md"
+    body.write_text("cites g-777-2 only\n", encoding="utf-8")
+    assert probe.classify(str(body)) == ("trace_md_weak", "g-777-2")
+
+
+def test_front_matter_goal_id_is_scoped_to_the_fence_block(tmp_path):
+    """A `goal_id:` line OUTSIDE front matter must not be promoted to owner.
+
+    Regression, g-115-8496: `_FM_GOAL_ID_RE` carries re.M, so its `^` matches
+    every line start. Run against the whole document it promoted any body line
+    beginning `goal_id:` -- prose, or a line inside a fenced code block -- to
+    front-matter provenance and a DEFINITE verdict, which is the exact
+    citation-treated-as-owner defect this module was changed to eliminate.
+    It was strictly WORSE than the prior behaviour for that input: a body id
+    used to take the weak path unconditionally.
+    """
+    prose = tmp_path / "a1.md"
+    prose.write_text(
+        "# notes\n\nSome prose.\n\n"
+        "goal_id: g-999-9 was mentioned in a code sample\n\ncites g-777-7\n",
+        encoding="utf-8")
+    assert probe.classify(str(prose))[0] == "trace_md_weak"
+
+    fenced = tmp_path / "a2.md"
+    fenced.write_text(
+        "# doc\n\n```yaml\ngoal_id: g-888-8\n```\n\nreal cite g-777-7\n",
+        encoding="utf-8")
+    assert probe.classify(str(fenced))[0] == "trace_md_weak"
+
+    # Positive control -- REAL front matter must still resolve strongly, or the
+    # fix would have been a blanket downgrade rather than a scoping correction.
+    real = tmp_path / "a3.md"
+    real.write_text("---\ngoal_id: g-888-3\n---\ncites g-777-2\n", encoding="utf-8")
+    assert probe.classify(str(real)) == ("trace_md", "g-888-3")
+
+    # Malformed front matter resolves WEAK, never strongly: an unterminated
+    # fence and an empty block both mean "no front matter established".
+    for name, text in (
+        ("e1.md", "---\ngoal_id: g-111-1\nno closing fence\ncites g-222-2\n"),
+        ("e2.md", "---\n---\ncites g-333-3\n"),
+    ):
+        f = tmp_path / name
+        f.write_text(text, encoding="utf-8")
+        assert probe.classify(str(f))[0] == "trace_md_weak", name
+
+
+def test_message_scratch_never_judged_by_experience_store(tmp_path):
+    """Message scratch asks the wrong store, so it must never return `absent`.
+
+    The durable artifact for these shapes is a sent message (submitted PR, a row
+    in world/board/*.jsonl, outbound mail) -- not an experience record. Measured
+    2026-08-12 (bravo/cc-05): 24 of 49 permanently DISCARD-blocked .md were this
+    shape. guard-3616 forbids a definite verdict for the no-information case.
+    """
+    for name in ("notify-user-x.md", "pr-body-463.md", "g-115-1-pr-body.md",
+                 "board-post-x.md", "reply-zach.md", "ack-alpha.md",
+                 "stop-email.md", "forge-notice-skill.md", "coord-alpha.md"):
+        f = tmp_path / name
+        f.write_text("see g-115-9999 for context\n", encoding="utf-8")
+        atype, payload = probe.classify(str(f))
+        assert atype == "message_scratch", name
+        assert probe._PROBES[atype](payload)[0] == "unknown", name
+
+    # Negative control: an ordinary working doc must NOT be captured by the
+    # filename shapes -- there the experience-store question is fair.
+    ordinary = tmp_path / "prune-prep.md"
+    ordinary.write_text("cites g-115-9999 here\n", encoding="utf-8")
+    assert probe.classify(str(ordinary))[0] != "message_scratch"
 
 
 # ------------------------------------------------------------------- fail-open

@@ -485,6 +485,40 @@ def _build_recurrence_index(all_aspirations):
     return idx
 
 
+def _is_starvation_unblock(g):
+    """True when THIS Unblock was filed by recurring-starvation-check.
+
+    THE CADENCE PREDICATE BELOW IS ONLY VALID FOR THIS POPULATION, and
+    `_recurring_parent_resolved`'s own docstring already says so: "for a
+    starvation Unblock the status test can still come out right ... it would
+    come out WRONG for any other Unblock about a recurring parent." The code
+    did not gate on it, so every Unblock whose parent happened to be recurring
+    was resolved by a threshold denominated in the starvation population's unit
+    (guard-4946: a constant carried across a population split is still in the
+    OLD unit — the fix is to restrict the population, never to retune).
+
+    WHY IT MATTERS, MEASURED (alpha, 2026-08-31/09-01, cc-04). g-306-284's
+    close was returning HTTP 500 while the write LANDED, so each failed retry
+    advanced `lastAchievedAt`. Two successive Unblock goals filed to
+    investigate that exact defect (g-115-8485, then g-115-8501 sixty seconds
+    after filing) were auto-skipped here with "recurring cadence has resumed" —
+    the defect's own symptom read as evidence the defect had resolved. Neither
+    was a starvation Unblock; neither was asking whether the cadence had
+    resumed. Encoded as guard-5708.
+
+    Both origin_signal forms emitted by recurring-starvation-check._origin_signal
+    are matched by the shared prefix: world "unblock:recurring-starved-<goal-id>"
+    and agent "unblock:recurring-starved-<owner>-<goal-id>"
+    (AGENT_QUALIFIED_STARVED_PATTERN). Prefix rather than either full pattern on
+    purpose — this gate must ADMIT the whole starvation population, and a
+    tightened id-shape here would silently eject rows the detector still files
+    (guard-1802: a downstream predicate narrower than the gate that creates the
+    population reports clean forever).
+    """
+    return (g.get("origin_signal") or "").strip().startswith(
+        "unblock:recurring-starved-")
+
+
 def _recurring_parent_resolved(interval_hours, last_achieved):
     """(resolved: bool|None, reason: str) for a RECURRING parent.
 
@@ -565,6 +599,81 @@ def _build_completed_ts_index(all_aspirations):
             if gid:
                 idx[gid] = g.get("completed_at") or g.get("completed_date")
     return idx
+
+
+def _build_outcome_note_index(all_aspirations):
+    """Return {goal_id: outcome_note-or-""} across queues.
+
+    Third companion index beside _build_status_index / _build_completed_ts_index,
+    kept separate for the same reason: their contracts and tests stay untouched.
+    Feeds _diagnostic_parent_guard below.
+    """
+    idx = {}
+    for asp, _src in all_aspirations:
+        for g in (asp.get("goals") or []):
+            gid = g.get("id")
+            if gid:
+                idx[gid] = g.get("outcome_note") or ""
+    return idx
+
+
+# A parent that says, in its own close note, that the blocking condition still
+# holds. Kept deliberately narrow and literal: every phrase here is an explicit
+# statement about the DEPENDENT or the condition, not a mood word. "failed",
+# "error" and friends are excluded on purpose — a parent can mention a failure
+# it FIXED, and this guard must not fire on that.
+_PERSISTS_MARKERS = (
+    "stays blocked",
+    "remains blocked",
+    "still blocked",
+    "unblock outcome: n/a",
+    "unblock outcome was n/a",
+    "unblock outcome n/a",
+    "dependent goal stays blocked",
+    "does not unblock",
+    "did not unblock",
+    "not unblocked",
+    "condition persists",
+    "still dark",
+)
+
+
+def _diagnostic_parent_guard(parent_id, outcome_note_idx):
+    """: a DIAGNOSTIC parent completes by CONFIRMING the problem.
+
+    The sweep's core predicate — parent reached a terminal state, therefore the
+    child Unblock is moot — assumes a parent completes by RESOLVING the blocking
+    condition. A parent whose deliverable is a MEASUREMENT completes by
+    confirming it. For that class the predicate is anti-correlated with what it
+    is meant to detect: the child is closed at the exact moment its premise
+    becomes best-evidenced.
+
+    Rather than classify parents as diagnostic-vs-remedial (which needs a taxonomy
+    nobody maintains), read what the parent SAYS about its own unblocking. In both
+    confirmed instances the parent's close note stated outright that the dependent
+    remained blocked.
+
+    Returns a skip-reason string when the parent's own note says the condition
+    persists; None when sweeping may proceed. Fails toward NOT sweeping, matching
+    this file's stated bias: the FP direction kills live work, the miss direction
+    is benign and other sweeps still cover it.
+
+    Measured population at time of writing: TWO, both HIGH live-outage class, one
+    day apart — a HIGH Unblock on an 8-day product-service outage (foxtrot,
+    2026-09-01), and g-326-793 on the Environment Processor outage, swept at
+    17:05 the same day, which had to be REFILED as g-326-795 because it would not
+    stay reopened. Two is not a rate; the population remains unmeasured.
+    """
+    note = (outcome_note_idx.get(parent_id) or "").lower()
+    if not note:
+        return None
+    for marker in _PERSISTS_MARKERS:
+        if marker in note:
+            return (f"parent {parent_id} states in its own outcome_note that the "
+                    f"blocking condition persists ({marker!r}) — a diagnostic parent "
+                    f"completes by CONFIRMING the problem, so its completion is not "
+                    f"evidence the child Unblock is moot (g-115-8586)")
+    return None
 
 
 def _provenance_only_parent(g, parent_id):
@@ -1026,6 +1135,7 @@ def main():
     status_idx = _build_status_index(all_aspirations)
     recurrence_idx = _build_recurrence_index(all_aspirations)
     completed_ts_idx = _build_completed_ts_index(all_aspirations)
+    outcome_note_idx = _build_outcome_note_index(all_aspirations)
 
     # guard-1890: resolve parent ids against the ARCHIVE too. Without this a
     # COMPLETED-then-ARCHIVED parent is indistinguishable from one that never
@@ -1140,6 +1250,33 @@ def main():
             # recurring parent the status is the wrong question entirely.
             if parent_id in recurrence_idx:
                 interval_h, last_ach = recurrence_idx[parent_id]
+                # The cadence predicate is denominated in the STARVATION
+                # population's unit and answers "has this goal resumed
+                # firing?". For any other Unblock about a recurring parent
+                # that is the wrong question, and when the Unblock's SUBJECT
+                # is the parent's own close machinery it is an actively
+                # inverted one — a broken close that still persists
+                # lastAchievedAt makes the parent read fresh, so the sweep
+                # retires the report of the defect feeding it (guard-5708).
+                # Report and skip: undecidable here, which is the same
+                # fail-safe direction `resolved is not True` already takes.
+                if not _is_starvation_unblock(g):
+                    details.append({
+                        "goal_id": g.get("id"),
+                        "aspiration_id": asp.get("id"),
+                        "parent_id": parent_id,
+                        "parent_status": parent_status,
+                        "parent_recurring": True,
+                        "age_hours": round(age_h, 1),
+                        "action": "skipped",
+                        "reason": ("recurring parent, but this Unblock was not "
+                                   "filed by recurring-starvation-check "
+                                   "(origin_signal does not start with "
+                                   "'unblock:recurring-starved-'), so cadence "
+                                   "freshness does not answer the question it "
+                                   "asks — undecidable here (guard-5708)"),
+                    })
+                    continue
                 resolved, why = _recurring_parent_resolved(interval_h, last_ach)
                 if resolved is not True:
                     details.append({
@@ -1202,6 +1339,18 @@ def main():
                     "age_hours": round(age_h, 1),
                     "action": "skipped",
                     "reason": succ_reason,
+                })
+                continue
+            diag_reason = _diagnostic_parent_guard(parent_id, outcome_note_idx)
+            if diag_reason:
+                details.append({
+                    "goal_id": g.get("id"),
+                    "aspiration_id": asp.get("id"),
+                    "parent_id": parent_id,
+                    "parent_status": parent_status,
+                    "age_hours": round(age_h, 1),
+                    "action": "skipped",
+                    "reason": diag_reason,
                 })
                 continue
             fp_reason = _provenance_fp_guard(g, parent_id, completed_ts_idx)

@@ -25,11 +25,23 @@
 #
 # The 6 conditions (must ALL hold for dead-runner verdict):
 #   (1)   agent-state == RUNNING
-#   (2)   heartbeat-stale.sh returns "stale" (mtime > threshold)
+#   (2)   heartbeat-stale.sh returns "stale" (file EXISTS, mtime > threshold).
+#         "absent" (no heartbeat file) is INERT — it satisfies this condition
+#         ONLY beside a positive DEATH signal from runner-liveness-evidence.sh
+#         (). A box with no heartbeat infrastructure must not read as
+#         a crashed writer forever.
 #   (2.5) runner-recent-block.sh returns 1 (no .stop-hook-log BLOCK in 5 min)
 #   (2.7) execution-diary.jsonl mtime > DIARY_STALE_MINUTES (default 15 min)
 #   (3)   session-signal-exists.sh stop-requested returns 1 (signal absent)
 #   (4)   background-jobs.sh has-pending returns 1 (no Tier-A jobs)
+# plus the PRE-KILL RE-CHECK, evaluated only once (1)-(4) all hold:
+#   (5)   runner-liveness-evidence.sh finds NO positive LIFE signal (rc != 0)
+#         and nothing UNREADABLE (rc != 2). A live runner process, a recent
+#         assistant turn, a live sidecar on this SID, or recent provider-retry
+#         activity each VETO the kill. This is what a multi-hour rate-limit
+#         backoff looks like: every absence-of-activity condition above is TRUE
+#         on a loop that is asleep in a retry (2026-09-01 false kill, ;
+#         guard-2364 — re-derive before destructive automation acts).
 #
 # Exit-code semantics for sub-probes (rb-762): only rc=1 is "continue".
 # rc=0 (positive signal) AND rc=2+ (script error) BOTH suppress recovery.
@@ -86,9 +98,37 @@ fi
 # so a stale mtime means nobody is running the loop at all.
 hb="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/heartbeat-stale.sh" 2>/dev/null || echo "fresh")"
 c2_pass=0
+evidence_json=""   # runner-liveness-evidence.sh JSON, filled lazily (cond 2 absent / cond 5)
+evidence_rc=""
+_run_evidence() {
+    # One evaluation per run; both consumers read the same verdict.
+    [[ -n "$evidence_rc" ]] && return 0
+    evidence_json="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/runner-liveness-evidence.sh" 2>/dev/null)"
+    evidence_rc=$?
+    [[ "$evidence_rc" =~ ^[0-3]$ ]] || evidence_rc=1   # a broken probe says nothing
+    [[ -n "$evidence_json" ]] || evidence_json='{"verdict": "unknown", "error": "probe produced no output"}'
+}
+_evidence_field() {
+    # $1 = life|death|verdict ; prints the field (lists comma-joined) from the JSON
+    RDC_EJ="$evidence_json" RDC_KEY="$1" python3 -c 'import json,os
+try:
+    v = json.loads(os.environ["RDC_EJ"]).get(os.environ["RDC_KEY"])
+    print(",".join(v) if isinstance(v, list) else (v or ""))
+except Exception:
+    print("")' 2>/dev/null
+}
 if [[ "$hb" == "stale" ]]; then
     c2_pass=1
-    c2_msg="heartbeat=stale"
+    c2_msg="heartbeat=stale (file present, mtime past threshold)"
+elif [[ "$hb" == "absent" ]]; then
+    # INERT unless a positive death signal stands in for the missing writer.
+    _run_evidence
+    if [[ "$evidence_rc" -eq 3 ]]; then
+        c2_pass=1
+        c2_msg="heartbeat=absent (inert) + positive death signal: $(_evidence_field death)"
+    else
+        c2_msg="heartbeat=absent — no heartbeat infrastructure on this box; condition INERT, no positive death signal (evidence verdict: $(_evidence_field verdict))"
+    fi
 else
     c2_msg="heartbeat=fresh (last tick within staleness threshold)"
 fi
@@ -120,19 +160,25 @@ fi
 diary="$agent_dir/session/execution-diary.jsonl"
 diary_stale_min="${DIARY_STALE_MINUTES:-15}"
 diary_age_min=999
+diary_probe_ok=1
 if [[ -f "$diary" ]]; then
-    diary_age_min=$(DIARY_E="$diary" py -3 - <<'PYEOF' 2>/dev/null || echo "999"
-import os, time
+    # python3, NOT `py -3`: `py` is the Windows launcher and does not exist on a
+    # Linux box, so the old `py -3 ... || echo 999` read EVERY diary as 999 min
+    # stale there — a silently-failing probe manufacturing a kill condition
+    # (guard-4220). This script sources _paths.sh, so python3 is the sanctioned
+    # form. A probe failure is now UNKNOWN (condition NOT met), never stale.
+    diary_age_min=$(DIARY_E="$diary" python3 -c 'import os, time
 try:
-    age_s = time.time() - os.path.getmtime(os.environ['DIARY_E'])
-    print(int(age_s / 60))
+    print(int((time.time() - os.path.getmtime(os.environ["DIARY_E"])) / 60))
 except Exception:
-    print(999)
-PYEOF
-)
+    print("")' 2>/dev/null)
+    diary_age_min="$(printf '%s' "$diary_age_min" | tail -n1)"
+    case "$diary_age_min" in ''|*[!0-9]*) diary_probe_ok=0; diary_age_min=-1 ;; esac
 fi
 c27_pass=0
-if [[ "$diary_age_min" -ge "$diary_stale_min" ]] 2>/dev/null; then
+if [[ "$diary_probe_ok" -eq 0 ]]; then
+    c27_msg="execution-diary age probe FAILED (python3 unavailable or unreadable mtime) — condition not met (fail toward alive)"
+elif [[ "$diary_age_min" -ge "$diary_stale_min" ]] 2>/dev/null; then
     c27_pass=1
     if [[ ! -f "$diary" ]]; then
         c27_msg="execution-diary absent (fresh-install — fail-open: gate by other signals)"
@@ -171,9 +217,25 @@ else
     c4_msg="background-jobs probe error (rc=$hp_rc — fail-open conservative)"
 fi
 
-# Determine overall dead/alive — AND all 6 conditions
+# ─── Condition 5: PRE-KILL RE-CHECK — no positive life evidence () ──
+# Evaluated ONLY when every absence-of-activity condition above already holds,
+# i.e. exactly at the moment a kill would otherwise fire. Any positive LIFE
+# signal vetoes; an UNREADABLE probe vetoes (guard-487); UNKNOWN and DEAD pass.
+c5_pass=0
+c5_msg="pre-kill re-check not reached (an earlier condition already reads alive)"
+if [[ "$c1_pass" -eq 1 && "$c2_pass" -eq 1 && "$c25_pass" -eq 1 && "$c27_pass" -eq 1 && "$c3_pass" -eq 1 && "$c4_pass" -eq 1 ]]; then
+    _run_evidence
+    case "$evidence_rc" in
+        0) c5_msg="POSITIVE LIFE EVIDENCE — kill vetoed: $(_evidence_field life) (rate-limit backoff or off-loop activity; runner alive)" ;;
+        2) c5_msg="liveness evidence UNREADABLE — kill vetoed (fail-closed-as-suppressed, guard-487)" ;;
+        3) c5_pass=1; c5_msg="no life evidence; positive death signal: $(_evidence_field death)" ;;
+        *) c5_pass=1; c5_msg="no positive evidence either way (silence; the six absence conditions stand)" ;;
+    esac
+fi
+
+# Determine overall dead/alive — AND all 6 conditions + the pre-kill re-check
 dead=1
-for v in "$c1_pass" "$c2_pass" "$c25_pass" "$c27_pass" "$c3_pass" "$c4_pass"; do
+for v in "$c1_pass" "$c2_pass" "$c25_pass" "$c27_pass" "$c3_pass" "$c4_pass" "$c5_pass"; do
     if [[ "$v" -eq 0 ]]; then
         dead=0
         break
@@ -195,7 +257,8 @@ cat <<JSON
     "no_recent_block": $(_bool "$c25_pass"),
     "diary_stale": $(_bool "$c27_pass"),
     "no_stop_requested": $(_bool "$c3_pass"),
-    "no_background_jobs": $(_bool "$c4_pass")
+    "no_background_jobs": $(_bool "$c4_pass"),
+    "no_life_evidence": $(_bool "$c5_pass")
   },
   "messages": {
     "state_running": $(_esc "$c1_msg"),
@@ -203,10 +266,13 @@ cat <<JSON
     "no_recent_block": $(_esc "$c25_msg"),
     "diary_stale": $(_esc "$c27_msg"),
     "no_stop_requested": $(_esc "$c3_msg"),
-    "no_background_jobs": $(_esc "$c4_msg")
+    "no_background_jobs": $(_esc "$c4_msg"),
+    "no_life_evidence": $(_esc "$c5_msg")
   },
+  "heartbeat": $(_esc "$hb"),
   "diary_age_min": $diary_age_min,
-  "diary_stale_threshold_min": $diary_stale_min
+  "diary_stale_threshold_min": $diary_stale_min,
+  "life_evidence": ${evidence_json:-null}
 }
 JSON
 
@@ -224,6 +290,7 @@ fi
     echo "  [2.7] $c27_msg"
     echo "  [3]   $c3_msg"
     echo "  [4]   $c4_msg"
+    echo "  [5]   $c5_msg"
 } >&2
 
 if [[ "$dead" -eq 1 ]]; then

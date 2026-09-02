@@ -65,6 +65,25 @@ Bash: load-conventions.sh temp-store learning-routing
    Bash: ls -1 "$TEMP_DIR"/*.md "$TEMP_DIR"/*.json 2>/dev/null
    (drained/ is the archive subdir — never re-drain it; the glob above does not
    descend into it.)
+2b. ALSO list the THIRD-CLASS residue — everything matching NEITHER the
+   *.md/*.json glob above NOR Phase 1.5's ephemera suffixes:
+   Bash: find "$TEMP_DIR" -maxdepth 1 -type f ! -name '.*' \
+       ! -name '*.md' ! -name '*.json' ! -name '*.log' ! -name '*.txt' \
+       ! -name '*.py' ! -name '*.sh' ! -name '*.err' ! -name '*.raw' \
+       ! -name '*.out' ! -name '*.bak*'
+   These are NOT auto-drained; CLASSIFY each one in Phase 2 alongside the docs
+   (same routing table, same 3b probe where the shape is probe-able).
+   WHY AT CENSUS TIME AND NOT LATER: Phase 2.5's stamp gate condemns exactly
+   this population, so meeting it there means meeting it as a list of files you
+   are about to DELETE. Measured twice on the same box (2026-08-27 and
+   2026-08-30, echo/cc-03): both passes correctly retracted the stamp per
+   guard-4864, and substantially the same five files came back — because a
+   correctly-refused stamp protects them from deletion while nothing ever
+   classifies them, so they can never be legitimately discharged either. Two
+   correct mechanisms composing into a permanent blind spot. Retracting is safe
+   and INSUFFICIENT; this step is what lets the stamp pass on merit. The 08-30
+   pass classified all five in minutes and one turned out to be a working
+   compile gate that existed nowhere else on the box. (rb-9792, g-001-104.)
 3. IF no drainable files (.md/.json): set docs_count=0 and skip Phase 2-3, but
    STILL run Phase 1.5 — pure ephemera (.log/.txt) may need purging even when no
    docs remain (the g-115-1727 case: 7 ephemera survived a full doc-drain).

@@ -202,6 +202,17 @@ IF stop_signal:
     RETURN  # Sub-skill completes the stop (D1-D7); DO NOT continue the iteration loop.
             # On next turn the agent is IDLE and the Session Start Protocol handles re-entry.
 
+# Phase -1.35: Directive-Hold Pin (g-306-386)
+# `stop-requested` survives turn boundaries; a USER DIRECTIVE does not — measured
+# twice with a human waiting LIVE. Same survival pattern, OPPOSITE polarity. Placed
+# after -1.4 so a real /stop still wins. Fail-open (rc=1) by contract.
+# Rationale + coach field trace: core/config/rationale/directive-hold-pin.md
+Bash: `bash core/scripts/interrupt-task.sh check`
+IF exit code == 0:   # pinned — the command printed the task and the imperative
+    Complete the task, then `interrupt-task.sh release --reason "<what happened>"`;
+    or if genuinely blocked, say so TO THE USER and release with that reason.
+    Do NOT proceed to Phase -1 / precheck / selection with the pin open.
+
 # Phase -1: Initialize Working Memory (runs once, idempotent)
 Bash: wm-read.sh --json
 if all slots null:

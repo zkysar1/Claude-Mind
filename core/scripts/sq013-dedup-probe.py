@@ -122,6 +122,32 @@ MIN_IDF_CORPUS = 20
 # fixed ceiling cannot span corpora of different sizes.
 RARE_DF_DIVISOR = 200
 
+# BM25 length normalisation (). `weight` is an unnormalised SUM over
+# the overlap, so a long record wins by SIZE alone: more tokens means more
+# chances to overlap any subject, and more chances to contain SOME rare token by
+# coincidence. Measured on the live 2,883-goal corpus (2026-08-30): the median
+# blob is 127 unique tokens, p99 is 651 and the largest is 1,544 -- 12x median.
+# A merge-wedge relay was DECLINED citing  (1,107 tokens, a goal about
+# an unrelated sweep) on the single coincidental token `granularity`, while the
+# owner  (147 tokens, sharing the rare `ayoai-journal-md` df=2,
+# `hand-resolved` df=2 and `same-heading` df=10) ranked BELOW it. Dividing by the
+# standard BM25 factor puts the genuine owner first.
+#
+# NOTE THE REPORTED MECHANISM WAS WRONG AND THE CORRECTION IS THE POINT: the
+# report blamed `outcome_note` blobs. outcome_note has NEVER been in the blob
+# (only title+description, in every commit this file has ever had), so excluding
+# it would have shipped a no-op that read as a fix. The sponge is the
+# DESCRIPTION -- on  it is 71,504 chars against a 2,057-char
+# outcome_note, 35x the field that was blamed.
+#
+# b=0.75 is the BM25 default. The factor is exactly 1.0 at |D| == avgdl, so an
+# average-length record scores as it always did and WEIGHT_THRESHOLD keeps the
+# meaning it was calibrated with. sqrt/log normalisation (the report's
+# suggestion) rescales the whole distribution instead; measured, no true owner
+# fell under the floor with either, so that is a robustness argument for this
+# form rather than a defect found in the others.
+LENGTH_NORM_B = 0.75
+
 
 def _compute_idf(docs, terms):
     """(idf_map, n) over the goal corpus. Rare tokens weigh high, common ones
@@ -134,6 +160,14 @@ def _compute_idf(docs, terms):
         df = sum(1 for d in docs if t in d)
         out[t] = (df, max(0.0, math.log(n / (1 + df))))
     return out, n
+
+
+def _length_norm(doc_len, avgdl):
+    """BM25 document-length divisor: 1.0 at average length, >1 for sponges,
+    <1 for short records. Fails open to 1.0 on an empty corpus."""
+    if not avgdl:
+        return 1.0
+    return (1.0 - LENGTH_NORM_B) + LENGTH_NORM_B * (doc_len / float(avgdl))
 
 
 def _tokens(text):
@@ -207,6 +241,7 @@ def decide(subject, goals, now, session_start=None,
     idf, n = _compute_idf(docs, subj)
     inert = n < MIN_IDF_CORPUS
     rare_ceil = max(2, n // RARE_DF_DIVISOR)
+    avgdl = (sum(len(d) for d in docs) / float(len(docs))) if docs else 0.0
 
     for g, blob_tokens in zip(records, docs):
         status = (g.get("status") or "").strip().lower()
@@ -216,7 +251,12 @@ def decide(subject, goals, now, session_start=None,
         if inert:
             weight, rare = float(len(overlap)), sorted(overlap)
         else:
-            weight = sum(idf[t][1] for t in overlap)
+            # Length-normalised: an unnormalised sum lets a sponge outrank the
+            # genuine owner. The INERT branch above is deliberately left raw --
+            # there IDF is off, so there is no idf-sum for a length factor to
+            # correct, and fixture corpora all live there.
+            weight = (sum(idf[t][1] for t in overlap)
+                      / _length_norm(len(blob_tokens), avgdl))
             rare = sorted(t for t in overlap if idf[t][0] <= rare_ceil)
         # BOTH gates. Weight alone does not discriminate: the measured false
         # positive scored 11.04 on generic English, above any sane floor. What
@@ -251,7 +291,7 @@ def decide(subject, goals, now, session_start=None,
 
     # Strongest signal first, then most recent, so the cited id is the most
     # defensible one rather than whichever the corpus happened to list first.
-    # Ranked by WEIGHT, not count — see the module header.
+    # Ranked by LENGTH-NORMALISED weight, not count — see the module header.
     matches.sort(key=lambda m: (m["weight"], m["when"] or ""), reverse=True)
 
     if matches:

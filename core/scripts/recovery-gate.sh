@@ -179,6 +179,13 @@ fi
 _perform_recovery() {
     local agent="$1"
     local cause="$2"
+    # : which path fired (A|B|C|D) and the probe JSON it fired on. Both
+    # ride into recovery-log.jsonl so a firing is never a bare conclusion: the
+    # 2026-09-01 false kill could not be triaged from "all 6 signals confirm
+    # dead" because the log carried the verdict without the evaluations or the
+    # session that performed it.
+    local path="${3:-?}"
+    local evidence="${4:-}"
     local _adir
     _adir="$(agent_dir "$agent")"
 
@@ -331,17 +338,60 @@ _perform_recovery() {
     mkdir -p "$_adir/session"
     printf '%s\n' "Auto-recovered: $cause" > "$_adir/session/recovery-notice"
 
-    # Audit log — append-only JSONL.
+    # Audit log — append-only JSONL. The entry is the durable VERDICT RECORD
+    # (): action, path, the acting session (the SessionStart hook's own
+    # SID — the session that performed the demotion, distinct from the runner
+    # SID it demoted) and the full probe evaluation the path fired on. Readers:
+    # recovery-yank-check.py (worker-side escalation), recovery-yank-reverse.sh
+    # (a live reducer proving the yank false), and cross-box triage.
     local ts
     ts="$(date +%Y-%m-%dT%H:%M:%S)"
     local entry
-    entry="$(python3 -c "import json,sys; print(json.dumps({'ts': sys.argv[1], 'agent': sys.argv[2], 'cause': sys.argv[3], 'sid_recorded': sys.argv[4] or None}))" \
-        "$ts" "$agent" "$cause" "$sid_recorded" 2>/dev/null || echo "")"
+    entry="$(_recovery_log_entry recover "$ts" "$agent" "$cause" "$sid_recorded" "$path" "$evidence")"
     if [[ -n "$entry" ]]; then
         printf '%s\n' "$entry" >> "$_adir/session/recovery-log.jsonl"
     fi
 
-    echo "[recovery-gate] RECOVERED $agent: $cause" >&2
+    # Cross-box marker ( part 3). recovery-log.jsonl and recovery-notice
+    # are machine-local files a worker Body on ANOTHER box can never read, so
+    # the same verdict is mirrored into this agent's team-state row, which IS
+    # synced. Fail-open and quiet: a daemon hiccup must not turn a completed
+    # recovery into a failed one.
+    local marker
+    marker="$(RG_TS="$ts" RG_CAUSE="$cause" RG_SID="$sid_recorded" RG_PATH="$path" RG_ACT="${SESSION_ID:-}" \
+        python3 -c 'import json,os; print(json.dumps({"ts": os.environ["RG_TS"], "path": os.environ["RG_PATH"], "cause": os.environ["RG_CAUSE"][:240], "sid_recorded": os.environ["RG_SID"] or None, "acting_sid": os.environ["RG_ACT"] or None}))' 2>/dev/null || echo "")"
+    if [[ -n "$marker" ]]; then
+        bash "$SCRIPT_DIR/team-state-update.sh" --field "agent_status.$agent.last_recovery" --value "$marker" >/dev/null 2>&1 || true
+    fi
+
+    echo "[recovery-gate] RECOVERED $agent (path $path): $cause" >&2
+}
+
+# _recovery_log_entry <action> <ts> <agent> <cause> <sid_recorded> <path> <evidence-json>
+# Builds one recovery-log.jsonl row. Everything passes through the ENVIRONMENT
+# (guard-165): the evidence blob is arbitrary JSON and the cause is free text.
+# `evidence` is embedded as an object when it parses, else as a string (never
+# dropped — a malformed blob is still evidence of what the probe printed).
+_recovery_log_entry() {
+    RL_ACTION="$1" RL_TS="$2" RL_AGENT="$3" RL_CAUSE="$4" RL_SID="$5" RL_PATH="$6" RL_EVIDENCE="$7" \
+    RL_ACTING="${SESSION_ID:-}" RL_SOURCE="${SOURCE:-}" \
+    python3 -c 'import json, os
+ev_raw = os.environ.get("RL_EVIDENCE") or ""
+try:
+    ev = json.loads(ev_raw) if ev_raw else None
+except Exception:
+    ev = ev_raw
+print(json.dumps({
+    "ts": os.environ["RL_TS"],
+    "agent": os.environ["RL_AGENT"],
+    "action": os.environ["RL_ACTION"],
+    "path": os.environ["RL_PATH"],
+    "cause": os.environ["RL_CAUSE"],
+    "sid_recorded": os.environ["RL_SID"] or None,
+    "acting_sid": os.environ["RL_ACTING"] or None,
+    "source": os.environ["RL_SOURCE"] or None,
+    "evidence": ev,
+}))' 2>/dev/null || echo ""
 }
 
 # POST_RECOVERY_EDIT_OVERRIDE="User-directed Path-B self-heal + SID-loss forensics (2026-06-18, bravo investigation). Recovery-flow framework fix authored in (IDLE,autonomous) before the user re-runs /start. Bug 1: Path B demoted a DEMONSTRABLY-ALIVE runner to IDLE after it lost running-session-id mid-run, killing the loop (3rd occurrence). Bug 2: the SID-loss deleter was never captured. Audited to world/post-recovery-edits.jsonl."
@@ -495,14 +545,14 @@ _check_state_corruption() {
         # Self-heal write failed (rare — local FS error). Fall through to
         # recovery so the degenerate state does not persist unaddressed.
         echo "[recovery-gate] SELF-HEAL write FAILED for $agent — falling through to recovery" >&2
-        _perform_recovery "$agent" "state corruption: running-session-id missing, runner alive but self-heal write failed"
+        _perform_recovery "$agent" "state corruption: running-session-id missing, runner alive but self-heal write failed" B
         return 0
     fi
 
     # Genuinely dead, oracle error/unknown, or no latest-session-id to restore.
     _capture_sid_loss_forensics "$agent" "$latest" "$rdc_rc" "recover"
     local cause="state corruption: state=RUNNING, running-session-id missing, no stop-requested"
-    _perform_recovery "$agent" "$cause"
+    _perform_recovery "$agent" "$cause" B
 }
 
 # POST_RECOVERY_EDIT_OVERRIDE="User-directed framework fix for hung-autocompact false-positive recovery; implementing before /start delta to prevent immediate repeat."
@@ -567,7 +617,10 @@ _check_hung_autocompact() {
     state="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/session-state-get.sh" 2>/dev/null || echo "")"
     [[ "$state" == "RUNNING" ]] || return 0
 
-    # Heartbeat gate: must be stale (no iteration is advancing it).
+    # Heartbeat gate: must be stale (no iteration is advancing it). Exactly
+    # `stale` — a heartbeat file that EXISTS and aged out. `absent` (no file)
+    # is inert here as everywhere (): a box with no heartbeat writer
+    # would otherwise satisfy this gate permanently.
     local hb
     hb="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/heartbeat-stale.sh" 2>/dev/null || echo "fresh")"
     [[ "$hb" == "stale" ]] || return 0
@@ -609,7 +662,7 @@ _check_hung_autocompact() {
     [[ $sr_rc -eq 1 ]] || return 0   # 0=signal-set, 2+=error → both suppress recovery
 
     local cause="hung autocompact: compact-in-flight mtime >60min, heartbeat=$hb, state=RUNNING, no stop-requested, no execute-in-flight, diary stale"
-    _perform_recovery "$agent" "$cause"
+    _perform_recovery "$agent" "$cause" C
 }
 
 # === PATH D: Wedged-loop detection (heartbeat FRESH + unclosed phase, ) ===
@@ -834,7 +887,7 @@ _check_wedged_loop() {
     # "Which artifact to read"). Recording the conclusion without the evidence is
     # what makes a log unable to answer the question it was kept for.
     local cause="wedged loop: heartbeat=fresh, state=RUNNING, execution-diary phase_start unclosed past wedge threshold, runner older than wedge threshold, no stop-requested, no pending bg job, no recent assistant turn [probe: ${turn_json:-unavailable}] (g-328-23, g-328-45, g-115-6253)"
-    _perform_recovery "$agent" "$cause"
+    _perform_recovery "$agent" "$cause" D "${turn_json:-}"
 }
 
 # === PATH A: Crashed-runner detection (6-condition gate, source-gated) ===
@@ -842,7 +895,9 @@ _check_wedged_loop() {
 # The 6 conditions are EXTRACTED to `core/scripts/runner-dead-check.sh`
 # (, 2026-05-19 — single source of truth). The helper checks:
 #   (1)   agent-state == RUNNING
-#   (2)   heartbeat-stale.sh returns "stale"
+#   (2)   heartbeat-stale.sh returns "stale" — a file that EXISTS and aged out.
+#         "absent" (no heartbeat file at all) is INERT and counts only beside a
+#         positive death signal from runner-liveness-evidence.sh ()
 #   (2.5) runner-recent-block.sh returns 1 (no BLOCK in last 5 min;
 #          multi-signal — Claude Code 2.1.133 hook timeouts
 #         make heartbeat alone a false-positive zombie signal)
@@ -851,6 +906,12 @@ _check_wedged_loop() {
 #         because phase-end writes BEFORE the LLM yields the turn)
 #   (3)   stop-requested NOT set (rb-762 rc=1-only continue semantics)
 #   (4)   background-jobs.sh has-pending returns 1 (no Tier-A jobs)
+#   (5)   PRE-KILL RE-CHECK (): once (1)-(4) all hold, the helper runs
+#         runner-liveness-evidence.sh and any positive LIFE signal — a live
+#         runner process, a recent assistant turn, a live sidecar on this SID,
+#         recent provider-retry activity — VETOES the kill. A multi-hour
+#         provider rate-limit backoff makes (1)-(4) all true on a LIVE loop;
+#         that is the 2026-09-01 false kill this condition closes.
 #
 # Three parallel callers defer to that helper:
 #   - This function (silent SessionStart-hook recovery)
@@ -887,15 +948,39 @@ run_gate_for_agent() {
     fi
 
     # Delegate to the canonical helper. Exit-code semantics (rb-762 propagated):
-    #   0   = all 6 conditions met (dead) — proceed with recovery
+    #   0   = all 6 conditions + the pre-kill re-check met (dead) — recover
     #   1   = at least one liveness signal positive (alive) — suppress
     #   2+  = script error — suppress (conservative, fail-open)
-    MIND_AGENT="$agent" bash "$SCRIPT_DIR/runner-dead-check.sh" >/dev/null 2>&1
+    # stdout is the JSON verdict record and is CAPTURED (bare, guard-4129) so
+    # the firing — or the veto — is logged with every condition evaluation.
+    local rdc_json
+    rdc_json="$(MIND_AGENT="$agent" bash "$SCRIPT_DIR/runner-dead-check.sh" 2>/dev/null)"
     local rc=$?
-    [[ "$rc" -eq 0 ]] || return 0
+    if [[ "$rc" -ne 0 ]]; then
+        #  / guard-3385: when the SIX absence conditions all held and
+        # ONLY the pre-kill re-check (condition 5) vetoed, record the veto. This
+        # is the rate-limited-alive shape the 2026-09-01 kill would have been,
+        # and a suppressed firing that leaves no trace is indistinguishable from
+        # a gate that never evaluated. Every other rc=1 (some earlier condition
+        # read alive) is the ordinary quiet path and is not logged.
+        if [[ "$rc" -eq 1 ]] && RG_J="$rdc_json" python3 -c 'import json,os,sys
+c = json.loads(os.environ["RG_J"]).get("conditions", {})
+six = ("state_running","heartbeat_stale","no_recent_block","diary_stale","no_stop_requested","no_background_jobs")
+sys.exit(0 if all(c.get(k) is True for k in six) and c.get("no_life_evidence") is False else 1)' 2>/dev/null; then
+            local sup_sid=""
+            [[ -f "$_adir/session/running-session-id" ]] && sup_sid="$(tr -d '\r\n[:space:]' < "$_adir/session/running-session-id")"
+            local sup_entry
+            sup_entry="$(_recovery_log_entry suppressed "$(date +%Y-%m-%dT%H:%M:%S)" "$agent" \
+                "crashed-runner kill VETOED by the pre-kill re-check: all six absence conditions held but positive life evidence exists (rate-limit backoff / off-loop activity)" \
+                "$sup_sid" A "$rdc_json")"
+            [[ -n "$sup_entry" ]] && printf '%s\n' "$sup_entry" >> "$_adir/session/recovery-log.jsonl"
+            echo "[recovery-gate] Path A SUPPRESSED for $agent: six absence conditions held, pre-kill re-check found life evidence — not recovering." >&2
+        fi
+        return 0
+    fi
 
-    local cause="crashed runner: all 6 liveness signals confirm dead (runner-dead-check.sh rc=0)"
-    _perform_recovery "$agent" "$cause"
+    local cause="crashed runner: all 6 liveness signals confirm dead and the pre-kill re-check found no life evidence (runner-dead-check.sh rc=0)"
+    _perform_recovery "$agent" "$cause" A "$rdc_json"
 }
 
 # All three paths act on BOUND_AGENT only (per bound-agent gate above).

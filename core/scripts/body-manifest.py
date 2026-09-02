@@ -103,6 +103,36 @@ VALID_STATES = ("active", "parked", "closed-pending-merge", "merged",
 # the wind-down board post already went out, so the Body closes durably for real.
 PARK_MAX_HOURS = 60.0
 
+# PARK-ORBIT BACKOFF ( part 4). A parked Body re-polls on a wakeup, and
+# a full re-poll is the whole worker preamble (~25 iterations, measured ~1.75M
+# tokens on 2026-09-01) — hourly, forever, on every Body the fleet has parked.
+# ScheduleWakeup clamps delaySeconds to 3600, so the interval itself cannot
+# grow; what grows is the interval between FULL polls. `park_count` climbs on
+# every consecutive park and resets on resume, and `park-due` tells an
+# off-cycle wakeup to re-arm cheaply and end the turn instead of polling.
+# Schedule: 1h, 2h, 4h, then capped — a 60h park costs ~14 full polls instead
+# of 60. Env overrides: PARK_BACKOFF_BASE_SECONDS / PARK_BACKOFF_MAX_SECONDS.
+# The park cap (PARK_MAX_HOURS) still measures the WHOLE park from the original
+# parked_at (guard-4184: what resets a stamp defines its meaning; only `resume`
+# resets either).
+PARK_BACKOFF_BASE_SECONDS = 3600
+PARK_BACKOFF_MAX_SECONDS = 4 * 3600
+
+
+def park_backoff_seconds(park_count: int) -> int:
+    """Seconds between full re-polls after `park_count` consecutive parks.
+
+    Doubles from the base per consecutive park (1h, 2h, 4h, ...), capped at
+    PARK_BACKOFF_MAX_SECONDS. A count of 0 or less reads as the first park.
+    """
+    try:
+        base = int(os.environ.get("PARK_BACKOFF_BASE_SECONDS", PARK_BACKOFF_BASE_SECONDS))
+        cap = int(os.environ.get("PARK_BACKOFF_MAX_SECONDS", PARK_BACKOFF_MAX_SECONDS))
+    except (TypeError, ValueError):
+        base, cap = PARK_BACKOFF_BASE_SECONDS, PARK_BACKOFF_MAX_SECONDS
+    n = max(int(park_count or 0), 1)
+    return int(min(base * (2 ** (n - 1)), cap))
+
 # THE PARTITION, NAMED ONCE (). Before `parked` existed every non-active
 # state was terminal, so `!= "active"` and "is closed" were the same predicate and
 # the codebase used them interchangeably — in body-manifest, in worker-loop's
@@ -522,11 +552,18 @@ def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
     data = read_manifest(sid, agent, project_root)
     state = data.get("body_state")
     if state == "parked":
+        # Idempotent re-park: parked_at is preserved (the cap measures the whole
+        # park) but the ORBIT advances — one more consecutive park means the next
+        # full poll is due later ( part 4).
+        _advance_park_orbit(data)
+        _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
         return "already-parked"
     if state != "active":
         return "not-active"
     data["body_state"] = "parked"
     data["parked_at"] = _now_iso_local()
+    data["park_count"] = 0
+    _advance_park_orbit(data)
     _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
     # : this function writes the manifest directly rather than through
     # set_state (it must set `parked_at` in the SAME atomic write), so it needs
@@ -553,6 +590,10 @@ def resume_body(sid: str, agent: str, project_root: Path | None = None) -> str:
         return "not-parked"
     data["body_state"] = "active"
     data.pop("parked_at", None)
+    # The orbit resets with the clock: a resumed Body that parks again starts
+    # back at the base interval ( part 4).
+    data.pop("park_count", None)
+    data.pop("park_next_poll_at", None)
     _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
     # : same reason as park_body -- direct manifest write, so its own
     # mirror. Leaving a resumed Body's carrier reading `parked` would suppress a
@@ -585,6 +626,44 @@ def park_expired(sid: str, agent: str, project_root: Path | None = None,
         return False
     elapsed = (datetime.datetime.now() - parked).total_seconds() / 3600.0
     return elapsed > max_hours
+
+
+def _advance_park_orbit(data: dict) -> None:
+    """Bump park_count and stamp park_next_poll_at from the backoff schedule."""
+    try:
+        count = int(data.get("park_count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    count += 1
+    data["park_count"] = count
+    due = datetime.datetime.now() + datetime.timedelta(seconds=park_backoff_seconds(count))
+    data["park_next_poll_at"] = due.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def park_due(sid: str, agent: str, project_root: Path | None = None) -> tuple[bool, int]:
+    """(due, seconds_remaining) for a parked Body's next FULL re-poll.
+
+    FAIL-SAFE TOWARD POLLING: a Body that is not parked, or whose
+    `park_next_poll_at` is missing or unparseable, is DUE (True, 0). The
+    alternative — treating an unreadable stamp as "not yet" — would let a
+    field-format problem hold a Body in a cheap-wake orbit that never polls,
+    which is a park with no exit. An extra poll costs one preamble; a missed
+    one costs the fleet a worker. `seconds_remaining` is 0 when due.
+    """
+    data = read_manifest(sid, agent, project_root)
+    if data.get("body_state") != "parked":
+        return True, 0
+    stamp = (data.get("park_next_poll_at") or "").strip()
+    if not stamp:
+        return True, 0
+    try:
+        due_at = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return True, 0
+    remaining = int((due_at - datetime.datetime.now()).total_seconds())
+    if remaining <= 0:
+        return True, 0
+    return False, remaining
 
 
 def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
@@ -798,7 +877,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("write", "read", "set-state", "is-reducer",
                  "close-body-on-genuine", "push-staged",
-                 "park", "resume", "park-expired"):
+                 "park", "resume", "park-expired", "park-due"):
         sp = sub.add_parser(name)
         sp.add_argument("--sid", required=True)
         sp.add_argument("--agent", required=True)
@@ -849,6 +928,17 @@ def main(argv=None):
                                    max_hours=args.max_hours)
             print("expired" if expired else "not-expired")
             return 0 if expired else 1
+        elif args.cmd == "park-due":
+            # EXIT CODE is the contract, like park-expired: 0 = due (run the
+            # full re-poll), 1 = not yet (re-arm the wakeup cheaply and END the
+            # turn). The LAST stdout line is the integer seconds remaining (0
+            # when due) so the caller can size the re-arm without parsing prose
+            # (guard-4697). Errors return 2/3 — neither branch — and a broken
+            # probe therefore reads as DUE at the caller (fail toward polling).
+            due, remaining = park_due(args.sid, args.agent)
+            print("due" if due else "not-due")
+            print(remaining)
+            return 0 if due else 1
         elif args.cmd == "push-staged":
             # --sid IS the unitKey here. Used by cleanup-stale-bindings.sh's
             # crash-preserve path, which stages in bash and cannot reach the

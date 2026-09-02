@@ -1592,6 +1592,18 @@ def cmd_update_goal(args):
     field = args.field
     value = parse_value(args.value)
 
+    #  daemon-parity (guard-742/guard-2323): unwrap the companion
+    # outcome_note body shape ({"value": <status>, "outcome_note": <text>})
+    # so a dict status is never stored raw by this legacy path (the daemon
+    # twin in aspirations_write.py::update_goal unwraps identically; the
+    # rb-428 sweeps that drive this CLI never send companions, so this is
+    # shape-safety parity, not a live feature port).
+    companion_note = None
+    if field == "status" and isinstance(value, dict) and "value" in value:
+        _cn = value.get("outcome_note")
+        companion_note = _cn if isinstance(_cn, str) else None
+        value = value["value"]
+
     # UNKNOWN-FIELD GATE (). Twin of the daemon check in
     # mind_api/src/endpoints/aspirations_write.py::update_goal — BOTH import the
     # same list from _goal_fields, so this is a second CALL SITE and never a
@@ -1632,6 +1644,11 @@ def cmd_update_goal(args):
         asp_idx, goal_idx, asp = result
         _check_not_archived(asp["id"])
         goal = asp["goals"][goal_idx]
+
+        # : apply the companion outcome_note before the primary field
+        # write (mirror of the daemon's in-lock apply; same one-RMW property).
+        if companion_note is not None:
+            goal["outcome_note"] = companion_note
 
         # user_leg_scope advisory on participants updates — see
         # _warn_missing_user_leg_scope. Uses the INCOMING participants value

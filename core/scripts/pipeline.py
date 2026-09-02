@@ -18,6 +18,7 @@ from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
 from _paths import WORLD_DIR
+from _pipeline_fields import warn_unknown_fields  #  unknown-key WARN arm
 from _jsonl_helpers import set_nested_field
 from _surprise import apply_derived_surprise  # : surprise is DERIVED, not caller-supplied
 
@@ -174,6 +175,13 @@ def validate_record(rec, changed_fields=None):
     missing = REQUIRED_FIELDS - set(rec.keys())
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
+    # Unknown-key WARN arm (). Placed INSIDE the validator, not at a
+    # call site, so it covers the add AND move/update paths by construction
+    # rather than by remembering to add it twice (guard-330). Never raises:
+    # 136 of the 348 caller-supplied keys measured in the live corpus are
+    # written by framework code or pseudocode, so refusing is not available.
+    # Rationale, census and banding: core/scripts/_pipeline_fields.py.
+    warn_unknown_fields(rec, source="pipeline.py")
 
     if not ID_RE.match(rec["id"]):
         raise ValueError(f"Invalid record ID format: {rec['id']} (expected YYYY-MM-DD_slug)")
@@ -287,10 +295,19 @@ def validate_formation_quality(rec):
     stage = rec.get("stage", "discovered")
     horizon = rec.get("horizon", "")
 
-    # (a) claim field: if present, must be non-empty and >=20 chars. If
-    # absent, require the title to carry the claim (title is already a
-    # REQUIRED_FIELDS check). Skeletal discovered records with missing
-    # claim fall back to title; active/resolved records must have claim.
+    # (a) claim field: if present, must be non-empty and >=20 chars.
+    # discovered-stage records may omit it (skeletal seed); active/resolved
+    # MUST carry it. THERE IS NO TITLE FALLBACK. This comment asserted one
+    # until 2026-08-31 and the code never implemented it — the gate reads
+    # `claim` and nothing else, so a record whose prediction lives only in
+    # `title`/`position` is refused at the move with no hint that a
+    # perfectly good statement is sitting one key away. Measured 
+    # (zeta, cc-02): 22 of 29 discovered records were stuck exactly that
+    # way, all 22 carrying a full falsifiable statement in `position`;
+    # repaired by backfilling claim from position. Do not re-add the
+    # fallback here — populate `claim` at write time instead (guard-304:
+    # a comment claiming a defense the code does not implement is worse
+    # than no comment, because it turns off reviewer skepticism).
     claim = rec.get("claim")
     if stage != "discovered":
         if not isinstance(claim, str) or len(claim.strip()) < 20:

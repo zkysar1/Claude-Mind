@@ -133,8 +133,68 @@ the bias cheaper still: the cost of a WRONG wind-down used to be a human `/start
 per worker and is now one hourly poll. Relaxations of NEVER-PROMOTE live behind
 the gates in `core/config/conventions/reducer-promotion.md`, not here.
 
+## Transient poll failures
+
+A single transient failure (daemon/DDB error) does NOT wind down — that would
+let one daemon blip kill every worker in the fleet at once. Transients
+accumulate to `error_threshold` (default 3 consecutive); any LIVE poll resets
+the count.
+
+## Takeover detection — the measured limit, and its closure
+
+The poll originally read `GET /v1/admin/runner-claims` as exactly
+`{agent, machine_id, agent_state, heartbeat_at}` — no runner token — so the
+design's "OR runner_token changed" was NOT implemented: `machine_id` caught a
+reducer that stale-broke in from ANOTHER box, and a SAME-BOX reducer restart
+(new token, same machine_id) was invisible and reported CONTINUE. Closed
+2026-08-17 (g-306-224): `runner-claim.sh status` now carries `token-fp <digest>`
+on its LIVE line and `worker_reducer_liveness.py` consumes it as a second
+takeover axis. The raw token is never exposed — it is the bearer credential for
+heartbeat and release (see `owncloud_backend.runner_token_fingerprint`).
+
+## The park orbit backs off (g-357-51 part 4)
+
+Measured 2026-09-01: after the fleet's reducers were yanked, every parked Body
+woke hourly, ran the FULL worker preamble (~25 iterations, ~1.75M tokens),
+parked, re-armed — forever. `ScheduleWakeup` clamps `delaySeconds` to 3600, so
+the wake interval cannot grow; what grows is the interval between FULL polls.
+`body-manifest.py park` advances `park_count` on every consecutive park and
+stamps `park_next_poll_at` from `park_backoff_seconds` (1h, 2h, 4h, capped at
+4h; env `PARK_BACKOFF_BASE_SECONDS` / `PARK_BACKOFF_MAX_SECONDS`). Phase -0 and
+the deadman's parked branch ask `park-due` first: rc=1 means re-arm the wakeup
+for `min(remaining, 3600)` and END the turn on a Bash echo — no preamble, no
+poll, no SELECT. `resume` clears both fields, so a re-park after real work
+starts back at the base (guard-4184: a stamp's meaning is what resets it). The
+60h cap still measures the WHOLE park from the original `parked_at`; the orbit
+never touches it. `park-due` fails TOWARD polling (unreadable stamp = due),
+because a park that never polls has no exit.
+
+## The park must tell a yank from a user stop (g-357-51 part 3)
+
+`recovery-gate.sh` demotes a reducer RUNNING→IDLE, writes `recovery-log.jsonl`
++ `recovery-notice`, and nothing read them: a worker that parked on a demoted
+reducer parked exactly as it would on a user `/stop`, and a FALSE demotion (the
+2026-09-01 rate-limited-alive kill) went unannounced until a human noticed the
+whole fleet idle. `recovery_yank.py check` classifies the park: `recovery-yank`
+(a demotion post-dates every user-stop artifact — `stop-requested`,
+`stop-loop`, `stop-target-mode`, a `user-stop` reason file, a newer
+`handoff.yaml`), `user-stop`, or `none`. It reads the local log AND the synced
+team-state row `agent_status.<agent>.last_recovery` (the log and the notice are
+machine-local; a cross-box worker sees only the row). On `recovery-yank` the
+park sequence posts the finding and notifies the user ONCE per yank
+(`--mark-escalated` writes `recovery-yank-escalated`), then parks as usual —
+the worker cannot restore a reducer on another box, and `/start` is user-only.
+The reducer-side half is `recovery-yank-reverse.sh`: at turn-end the stop-hook's
+not-RUNNING gate hands the demoted SID to it, and a process that is executing
+the hook is alive by construction, so under narrow preconditions (this SID is
+the demoted runner, bound autonomous, the demotion is recent and no user-stop
+artifact post-dates it, no peer holds the claim) it restores the runner
+triple-write + heartbeat + RUNNING and logs `action: yank_reversed`.
+
 ## Cross-references
 
+- g-357-51 — absent-heartbeat inertness, the pre-kill re-check, the yank
+  consumer and the park orbit (2026-09-01 fleet-wide false-recovery incident)
 - g-306-291 — the park (reducer-gone) landing; g-306-303 — the manifest valve
   replacing the sentinel-file valve (guard-4184 patience-vs-liveness)
 - g-353-73 — supply-exhaustion parks too; the 2026-08-29 zc-03 measurement

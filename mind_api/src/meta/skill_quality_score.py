@@ -276,7 +276,12 @@ def score(ctx) -> "Response":  # type: ignore[name-defined]
             return Response.error(503, "lock_timeout",
                                   "skill-quality.yaml lock busy; try again")
         try:
-            scored_line = skill_evaluate._score_write(ctx, skill, goal, grades)
+            # Judge provenance is forwarded from the caller's body; the writer
+            # must not read it from this long-lived process's environment
+            # (guard-2480, ).
+            scored_line = skill_evaluate._score_write(
+                ctx, skill, goal, grades,
+                body.get("judge_model"), body.get("harness"))
         finally:
             file_locks.release_lock(lock_path)
     finally:

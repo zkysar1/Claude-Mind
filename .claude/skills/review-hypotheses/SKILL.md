@@ -617,6 +617,11 @@ For each resolved hypothesis, execute this checklist IN ORDER.
        Bash: bash core/scripts/reflect-bookkeeping.sh dual-classification \
                --outcome {outcome} --confidence {confidence}
        Take dual_classification and process_quality VERBATIM from its JSON.
+       # SHAPE: the writers agree on the VALUE, not the LOCATION — "agree by
+       # construction" is about the value only. CANONICAL IS FLAT TOP-LEVEL;
+       # this site writes NESTED (legacy, still read by a both-shapes consumer).
+       # New writers emit FLAT; do not add a third location. Why + measurements
+       # (g-115-5538): core/config/rationale/dual-classification-shape.md
        # Reference only — the branch table the script implements. Do NOT
        # hand-evaluate it: g-115-3402's reflection batch (2026-07-27) found TWO
        # resolved records whose hand-written process_score said unlucky_corrected

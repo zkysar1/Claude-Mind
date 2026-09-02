@@ -557,6 +557,15 @@ are ANDed, not ORed. Resolving one leaves the others live, so confirm ALL
 THREE are clear before flipping status — and prefer clearing the single
 stale signal over unblocking the goal.
 
+⚠ `blocked_by` IS POLYMORPHIC (list | bare str) — isinstance-check it before
+iterating, exactly as Gate 3 below mandates for `blocker_ref`. Iterating a bare
+string yields per-character pseudo-ids that resolve to nothing, so an
+"every dependency is terminal" test is silently TRUE and releases a
+correctly-blocked goal. Full measurement + the normalizer: **guard-5479**,
+whose trigger names THIS phase. Written here because the guard predicted its
+own recurrence "one field over" and it recurred here on 2026-09-01 (zeta,
+cc-02) — the guard was read only afterward, at pre-apply consult.
+
 Measured the same window: `g-250-03-c` had `blocked_by: ['g-250-127']` where
 g-250-127 was `completed` — a genuinely stale dependency edge — while its
 `blocker_ref` (resource-contention, two named unmet conditions, `expires_at`
@@ -671,13 +680,31 @@ Gates 1-3 alone this goal was an unblock candidate. Encoded as `guard-2620`;
 
 FOLLOW-UP, same goal, 7 days on (2026-08-11, echo, `hostname` cc-03, `uname -r`
 **6.8.0-137-generic**, own-cloud) — folded here rather than given its own block,
-because it is this example's END STATE and a reader who meets the goal today will
-not find the shape described above. **`g-250-124` now carries
-`blocked_by: ['g-250-345']`**, and `g-250-345` reads `status=in-progress`
-(claimed by alpha) — so the sole-signal `blocked_by: []` condition is GONE and
-rule 2's re-statement is what replaced it. The block was re-stated in terms that
-are still true, not re-gated, which is the remedy this section prescribes
-observed landing on the case that motivated it.
+because a reader who meets the goal today will not find the shape described
+above. As of that date **`g-250-124` carried `blocked_by: ['g-250-345']`**, with
+`g-250-345` at `status=in-progress` (claimed by alpha) — so the sole-signal
+`blocked_by: []` condition was GONE and rule 2's re-statement is what replaced
+it. The block was re-stated in terms that are still true, not re-gated, which is
+the remedy this section prescribes observed landing on the case that motivated it.
+
+⚠ **THIS BLOCK CALLED THAT READING THE "END STATE" UNTIL 2026-08-30, AND IT WAS
+NOT ONE.** Re-measured that day (bravo, cc-05, `uname -r` 6.8.0-137-generic) with
+the canonical reader (`aspirations-query.sh --goal-field id g-250-124 --full`,
+guard-5460): `blocked_by: []`, `blocker_ref: None`, and a single
+`precondition_unmet:` defer set 2026-08-29T23:27:06 naming a checkable premise
+(outcome 2 needs a session with R>0 reaction opportunities). So the goal has now
+cycled through THREE shapes — `blocker_ref`-only → `blocked_by` edge → defer-only
+— and the 08-11 reading was a waypoint that this block asserted in the PRESENT
+TENSE, which is the rb-5818 expired-reason class this very file corrects twice
+elsewhere (the health-regression header, and the cadence-battery count). A worked
+example is a dated reading like any other; never label one an end state.
+Two things survive the correction, and they are the load-bearing ones. The
+section's own warning — *do not read this as the defect class being retired* — is
+now doubly earned: the instance did not stay repaired, it kept moving. And rule
+2's argument is UNCHANGED, because the current shape is also a re-statement onto
+a cheaper signal: a `precondition_unmet:` defer is re-probed every 2h by precheck
+0.5b.3, whereas the original expired-`external_id` shape had no sweep that could
+check it at all.
 
 Two things that changes for a successor. **Do not read this as the defect class
 being retired** — one instance was repaired by hand; nothing structural stops the

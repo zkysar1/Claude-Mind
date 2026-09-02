@@ -351,3 +351,176 @@ def test_rules_audit_runs_against_real_repo():
         assert "citation_count" in it
         assert "stale_paths" in it
         assert "stale_path_count" in it
+
+
+# ---------------------------------------------------------------------------
+# KEEP-cooldown vs the auto-flag escape hatch ()
+#
+# The module docstring states the candidate filter as a CONJUNCTION ending
+# "AND (next_review_eligible_at is absent OR <= today)". The auto_flagged
+# early-return used to fire BEFORE that clause, so a curator's explicit KEEP
+# decision was silently ineffective for exactly the entries the sweep is told
+# to look at, and they resurfaced daily. Measured on the live stores
+# 2026-08-30: 1 of 1 auto-flagged entries in EACH store sat inside an unexpired
+# cooldown (guard-541 -> 2026-09-13; rb-1327), and each was that store's ENTIRE
+# candidate output — so the daily sweep reviewed a cooled-down entry while the
+# non-flagged retire path returned nothing.
+# ---------------------------------------------------------------------------
+
+def _load_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("utilization_stats", str(SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _flagged_rec(eligible_after):
+    """An auto-flagged active record carrying a KEEP cooldown."""
+    return {
+        "id": "guard-test-1",
+        "status": "active",
+        "created": "2020-01-01",
+        "auto_flagged_for_review": True,
+        "next_review_eligible_at": eligible_after,
+        "utilization": {"retrieval_count": 0, "times_helpful": 0},
+    }
+
+
+def test_cooldown_binds_auto_flagged_entries():
+    """THE ASSERTION UNDER TEST. An unexpired KEEP cooldown suppresses an
+    auto-flagged entry; the escape hatch does not outrank a curator decision."""
+    mod = _load_mod()
+    today = date(2026, 8, 30)
+    assert mod._is_candidate(_flagged_rec("2026-09-13"), today, {}) is False
+
+
+def test_auto_flag_still_fires_once_the_cooldown_expires():
+    """POSITIVE CONTROL (guard-4166). The headline assertion is a REFUSAL, and a
+    predicate that refused everything would satisfy it. An expired cooldown — and
+    an absent one — must still admit the auto-flagged entry, or the fix has
+    deleted the C.3 escape hatch instead of repairing it."""
+    mod = _load_mod()
+    today = date(2026, 8, 30)
+    assert mod._is_candidate(_flagged_rec("2026-08-29"), today, {}) is True   # expired
+    assert mod._is_candidate(_flagged_rec(None), today, {}) is True           # absent
+
+
+def test_auto_flag_still_bypasses_exposure_and_age():
+    """The escape hatch bypasses the EVIDENCE clause and the exposure/age gates,
+    exactly as before — only the cooldown was added. Measured justification:
+    applying the FULL docstring conjunction to auto-flagged entries admits 0 of 1
+    in BOTH live stores, which would delete the hatch rather than repair it."""
+    mod = _load_mod()
+    today = date(2026, 8, 30)
+    rec = _flagged_rec(None)
+    rec["created"] = today.isoformat()          # age 0, far below MIN_AGE_DAYS
+    rec["utilization"]["retrieval_count"] = 0   # far below MIN_EXPOSURE
+    assert mod._is_candidate(rec, today, {}) is True
+
+
+def test_cooldown_check_precedes_the_auto_flag_return():
+    """MUTATION PROOF (guard-2903). Neutralising the cooldown parser must flip
+    the headline test, or it is passing for some reason other than the fix."""
+    mod = _load_mod()
+    today = date(2026, 8, 30)
+    original = mod._parse_date
+    try:
+        mod._parse_date = lambda *_a, **_k: None   # cooldown becomes invisible
+        assert mod._is_candidate(_flagged_rec("2026-09-13"), today, {}) is True, (
+            "with the cooldown neutralised the entry should resurface; it did "
+            "not, so the fixture no longer reproduces the defect")
+    finally:
+        mod._parse_date = original
+
+
+# ---------------------------------------------------------------------------
+# : the retirement numerator excludes the automated-scan term.
+#
+# `evidence == 0 AND retrieval_count >= 50` is empty BY CONSTRUCTION — the
+# composite's terms accrue as a function of retrieval, so the conjuncts are
+# anti-correlated and the filter returned 0 candidates across 14,573 active
+# entries. The fix is the numerator (guard-3995: times_active is a bulk-scan
+# text match, not an attestation), NOT the floors.
+# ---------------------------------------------------------------------------
+
+def _load_mod():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("utilization_stats", str(SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_attested_evidence_excludes_times_active():
+    """attested = helpful + 0.5*inferred + cited. times_active must NOT count."""
+    mod = _load_mod()
+    util = {"times_helpful": 2, "times_inferred_helpful": 4,
+            "times_active": 8, "times_cited": 1}
+    # composite keeps the scan term: 2 + 2 + 2 + 1 = 7.0
+    assert mod._evidence(util) == 7.0
+    # attested drops it:            2 + 2 + 0 + 1 = 5.0
+    assert mod._attested_evidence(util) == 5.0
+    assert mod._attested_evidence({}) == 0.0
+    assert mod._attested_evidence({"times_helpful": True}) == 0.0
+
+    # THE MUTATION PROOF: a purely scan-driven record (the live rb-592 shape —
+    # times_active 6895, everything else zero) must score >0 on the composite
+    # and exactly 0 on attested. If a future edit folds times_active back into
+    # ATTESTED_WEIGHTS, this flips and the candidate test below fails with it.
+    scan_only = {"times_helpful": 0, "times_inferred_helpful": 0,
+                 "times_active": 6895, "times_cited": 0}
+    assert mod._evidence(scan_only) > 1000
+    assert mod._attested_evidence(scan_only) == 0.0
+    assert "times_active" not in mod.ATTESTED_WEIGHTS
+
+
+def test_scan_dominated_entry_becomes_a_candidate():
+    """The defect, pinned: high times_active + zero attested == retire candidate.
+
+    Under the old `evidence == 0` predicate this record was EXCLUDED (its
+    composite evidence is 1723.75 purely from bulk-scan text matches), which is
+    how the only anti-ratchet mechanism reached zero candidates.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        world = _seed_world(tmp)
+        agent = _seed_agent(tmp)
+        guards = [
+            # scan noise only → CANDIDATE (this is the fix)
+            _make_guard("guard-scan", retrieval_count=99, times_active=6895),
+            # POSITIVE CONTROL: one real attestation → still refused, even
+            # with identical exposure. The filter must not admit everything.
+            _make_guard("guard-attested", retrieval_count=99, times_active=6895,
+                        times_helpful=1),
+            # POSITIVE CONTROL: inferred-helpful alone is an attestation too.
+            _make_guard("guard-inferred", retrieval_count=99, times_active=6895,
+                        times_inferred_helpful=1),
+            # exposure floor still binds — numerator change must not move it
+            _make_guard("guard-lowexp", retrieval_count=10, times_active=6895),
+        ]
+        _write_jsonl(world / "guardrails.jsonl", guards)
+        env = {"MIND_WORLD": str(world), "MIND_AGENT_DIR": str(agent),
+               "MIND_AGENT_NAME": "alpha"}
+        out = _run(["guardrails", "candidates", "--limit", "15"], env)
+        ids = {r["id"] for r in (out.get("items") or out.get("candidates") or [])}
+        assert ids == {"guard-scan"}, (
+            f"expected only the scan-dominated record to be a candidate: {ids}")
+
+
+def test_report_surfaces_both_scores():
+    """attested_evidence is reported beside evidence so the split is visible."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        world = _seed_world(tmp)
+        agent = _seed_agent(tmp)
+        _write_jsonl(world / "guardrails.jsonl",
+                     [_make_guard("guard-split", retrieval_count=99,
+                                  times_active=100, times_helpful=3)])
+        env = {"MIND_WORLD": str(world), "MIND_AGENT_DIR": str(agent),
+               "MIND_AGENT_NAME": "alpha"}
+        out = _run(["guardrails", "report"], env)
+        row = next(r for r in out["items"] if r["id"] == "guard-split")
+        # composite: 3 + 0.25*100 = 28.0 ; attested: 3
+        assert row["evidence"] == 28.0
+        assert row["attested_evidence"] == 3.0

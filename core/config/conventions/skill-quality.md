@@ -56,8 +56,106 @@ skills:
         maintainability: 1.0
         cost_awareness: 0.5
         overall: 0.80
-        notes: "Episode chain triggered once"
+        judge_model: "claude-opus-5"   # who graded; "unknown" when unresolvable
+        harness: "claude-code"         # claude-code | zakcode | unknown
+        notes: "Episode chain triggered once"   # ILLUSTRATIVE ONLY — see below
 ```
+
+`notes` appears in this example for historical reasons but is written by
+NEITHER writer and has no CLI flag (measured 2026-09-01, g-306-394). Do not
+expect it on a real record.
+
+### Judge provenance (`judge_model`, `harness`) — g-306-394
+
+Grades are judge-based measurements, and the judge population is heterogeneous:
+different boxes run different models, models roll forward over time, and some
+deployments route Mind turns to non-Claude local models. All of it lands in one
+rolling window of 20. Without provenance, aggregate drift across a model upgrade
+is indistinguishable from real skill-quality change, and the retirement/review
+floors fire on a mixture nobody can reconstruct.
+
+- **Resolved CALLER-SIDE and forwarded in the request body — g-306-400.** Both
+  values are resolved by the WRAPPER, in the judge's own session, via
+  `rt_judge_provenance` (`core/scripts/_runtime.sh`), and travel to the writer
+  as `judge_model` / `harness` body keys. The writer normalizes what it is
+  given and reads NO environment. This is not a style choice: under daemon-only
+  architecture the writer is the long-lived daemon, which inherits the
+  environment of whichever session spawned it and holds it for its whole
+  lifetime, so an environment read there reports one arbitrary session's values
+  for every agent's request (guard-2480). g-306-394 shipped exactly that, with
+  15 green tests — measured 2026-09-01, daemon pid 505894: `MIND_JUDGE_MODEL`
+  absent, so `judge_model` was `"unknown"` on every record, and `CLAUDECODE`
+  present, so `harness` was stamped `"claude-code"` on every evaluation forever.
+  Absent would have been honest; that is confidently WRONG.
+  **BOTH entry points into the writer must forward.** There are two:
+  `skill-evaluate.sh` → `/v1/skill-evaluate/score`, and `skill-quality-score.sh`
+  → `/v1/skill-quality/score` → `skill_evaluate._score_write`. The second is the
+  Phase 8.76 per-goal call site and therefore the dominant producer of
+  evaluations, so fixing only the first leaves the defect on the path that
+  actually runs (guard-3448).
+- **`judge_model`** — the caller resolves it ONLY from an explicit
+  `MIND_JUDGE_MODEL`; otherwise `"unknown"`. It is deliberately NOT inferred
+  from `CLAUDE_CODE_SUBAGENT_MODEL`: that names the SUBAGENT model while scoring
+  runs on the MAIN loop, and the two genuinely differ (measured 2026-09-01 on
+  cc-04 — subagent env read `claude-opus-4-6` while the session ran
+  `claude-opus-5`). A confidently wrong judge is worse than an absent one,
+  because it corrupts the exact comparison the field exists to enable
+  (guard-1925).
+- **`harness`** — the caller resolves `claude-code` when `CLAUDECODE` is set,
+  `zakcode` when a `ZAKCODE_*` marker is, else empty. The writer maps empty —
+  and any value outside the closed set `claude-code | zakcode | unknown` — to
+  `"unknown"`: the body is caller-supplied over HTTP, so it is untrusted input,
+  and aggregate consumers group by this field.
+- **Legacy-absent semantics** — records written before this change carry neither
+  key. Absent reads as `"unknown"`; no backfill is required or wanted. The
+  merge handler unions whole evaluation dicts, so old records survive untouched
+  and new fields propagate across boxes without a handler change.
+- **Surfacing** — `read --skill` and bare `read` dump whole records, so the
+  fields appear directly. `read --all --summary` and `report` add a `judges`
+  list of `{judge_model, harness, n}` giving the composition behind each
+  aggregate: one entry means judge-homogeneous and safe to compare over time;
+  more than one means drift may be a judge change rather than a skill change.
+  Un-provenanced records are counted as `unknown` rather than dropped — hiding
+  them would hide the very mixture the list exists to expose.
+
+Both writers are byte-compat twins (`core/scripts/skill-evaluate.py` and
+`mind_api/src/meta/skill_evaluate.py`) dumping with `sort_keys=False`, so
+insertion order is the on-disk byte order; the new keys go LAST so existing
+records' prefix is unchanged. `core/BOUNDARY.md` forbids the daemon importing
+the CLI module, so the duplication is deliberate and
+`core/scripts/tests/test_skill_evaluate_judge_provenance.py` is what keeps the
+two aligned.
+
+Because the CLI twin runs as a fresh subprocess of the judging session, its
+environment IS the judge's, so it resolves via its own `_judge_from_env` and
+feeds the same normalizer. The daemon twin has no counterpart to that function
+by design. `core/scripts/tests/test_skill_evaluate_judge_wiring.py` pins the
+WIRING rather than the function — an exported `MIND_JUDGE_MODEL` reaching the
+recorded evaluation through each real wrapper, and the writer recording
+`"unknown"` while judge variables are set in its own process. That second
+assertion is the regression pin: it is what a function-level test cannot make
+(guard-1943 — a green suite certifies the FUNCTION, never the WIRING).
+
+### Can these grades FAIL? — measured miss rate (g-306-403)
+
+Provenance above records WHO graded. This records whether the grading can
+return a bad verdict at all. Six canaries with objectively-planted flaws, run
+through `skill-quality-score.sh derive` (read-only, no store written):
+**2 of 6 missed, 2026-09-01.** Both misses grade toward the TOP.
+
+- `completeness` returns `good` when `outcomes_total` is 0 — an execution that
+  verified nothing is byte-identical to one that met every outcome.
+- `maintainability` is a constant: base skills default to `good`, and 0 of 82
+  forged registry entries carry `quality_at_forge`, so all 133 canonical skills
+  score `good` on it forever while it holds 0.15 of the aggregate weight.
+
+Also worth carrying when reading any aggregate here: **four of the five
+dimensions are deterministic derivation from integer arguments, not judgment.**
+Only `cost_awareness` is LLM-supplied — and it arrives as a caller argument, so
+it is the one dimension a self-administered canary cannot test.
+
+Canary set, re-run commands, and the rotation note (why a static set decays):
+`core/config/judge-canary-skill-quality.md`.
 
 ## Script API
 

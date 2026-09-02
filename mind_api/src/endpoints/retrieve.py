@@ -391,6 +391,11 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                                               read_only=read_only)
             beliefs = _r.load_beliefs(categories, as_of=as_of)
             experiential_index = _r.load_experiential_index(categories)
+            # . NOT flag-gated, deliberately: the whole point is to
+            # surface a matching forged skill BEFORE execution, and a flag the
+            # caller must know to set reproduces the discoverability problem
+            # this lane exists to fix. No side effects (no counters to bump).
+            forged_skills = _r.load_forged_skills(categories)
 
             framework_rules = (_r.load_framework_rules(categories)
                                if include_framework else [])
@@ -407,6 +412,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                 "pattern_signatures": len(pattern_signatures),
                 "experiences": len(experiences),
                 "beliefs": len(beliefs),
+                "forged_skills": len(forged_skills),
             }
             if include_framework:
                 items_returned["framework_rules"] = len(framework_rules)
@@ -662,6 +668,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
         "experiences": experiences,
         "beliefs": beliefs,
         "experiential_index": experiential_index,
+        "forged_skills": forged_skills,
     }
 
     # Framework asymmetry: meta-marker AND list both included only when the

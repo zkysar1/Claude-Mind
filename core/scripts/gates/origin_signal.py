@@ -119,6 +119,7 @@ ALLOWED_PREFIXES = (
     # _goal_source.infer(); check-origin-signal-drift.py re-runs the diff.
     "skill-discovery-audit:",   # aspirations-evolve Step 9.5.5 forged-skill audit
     "blocker_pattern:",         # aspirations-all-blocked MW#5 T1 Unblock synthesis
+    "s3-churn:",                # world/scripts/s3-churn-alarm.sh per-key churn breach ()
     # Same cycle-detector lane, THIRD reconciliation (). Surfaced by
     # test_every_origin_signal_literal_carries_a_registered_prefix against
     # world/scripts/unit-economics-readout.py:556, whose threshold-move branch
@@ -134,6 +135,22 @@ ALLOWED_PREFIXES = (
     # than left absent. A wrong lane is worse than a null one: a null shows up
     # in a null-source scan and a misattribution does not.
     "unit-economics-move:",     # unit-economics-readout.py threshold-move auto-file
+    # Same cycle-detector lane, FOURTH reconciliation (). Surfaced
+    # NOT by check-origin-signal-drift.py, which reported CLEAN, but by the
+    # domain suite: world/scripts/tests/test_s3_churn_alarm.py
+    # ::test_origin_signal_is_stable_and_registered asserts the producer
+    # prefix is in this tuple. The drift detector could not see it because its
+    # _GLOBS are (".claude/skills/*/SKILL.md", "core/config/**/*.md") -- it
+    # reconciles prefixes PRESCRIBED IN FRAMEWORK MARKDOWN and is structurally
+    # blind to producers that live in CODE, which is where every domain filer
+    # lives. So its CLEAN is true about its scope and silent about this class.
+    # s3_churn_alarm.py stamps `s3-churn:{hot-key}` with NO date component
+    # (one goal per hot key, not one per day) -- that key IS the dedup
+    # discriminator, so (b) rewriting to a generic prefix would erase it and
+    # (a) is correct per the detector's own guidance and the  /
+    #  /  precedent. Keep locked with the cycle-detector
+    # branch in _goal_source.infer().
+    "s3-churn:",                # s3_churn_alarm.py per-hot-key breach auto-file
     "idle_fallback",
     "program-change-proposal:",
     # _goal_source.infer() parity (). These prefixes were already

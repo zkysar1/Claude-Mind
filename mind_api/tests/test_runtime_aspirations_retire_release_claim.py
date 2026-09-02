@@ -164,7 +164,9 @@ def test_retire_recurring_goals_blocked(running_daemon):
 
 
 def test_retire_force_bypasses_recurring_guard(running_daemon):
-    """force=true skips recurring guard."""
+    """force=true skips the recurring guard by RE-HOMING the live recurring
+    goal into the live container (g-357-31): force may never strand a
+    recurring goal in the archive, and with no live container it refuses."""
     project_root, port = running_daemon
     world = project_root / "world"
     asp = {
@@ -176,13 +178,23 @@ def test_retire_force_bypasses_recurring_guard(running_daemon):
         ],
         "progress": {"completed_goals": 0, "total_goals": 0, "recurring_goals": 1},
     }
-    _seed_aspiration(world, asp)
+    container = {
+        "id": "asp-002", "title": "Recurring home", "status": "active",
+        "priority": "LOW", "archived": False, "recurring_home": True,
+        "goals": [],
+        "progress": {"completed_goals": 0, "total_goals": 0, "recurring_goals": 0},
+    }
+    _seed_two_aspirations(world, asp, container)
 
     status, body = _post(port, "/v1/aspirations/retire",
                          {"asp_id": "asp-001", "force": "true"})
     assert status == 200, f"Expected 200, got {status}: {body}"
     resp = json.loads(body)
     assert resp["aspiration"]["status"] == "retired"
+    live = [json.loads(l) for l in (world / "aspirations.jsonl").read_text(
+        encoding="utf-8").splitlines() if l.strip()]
+    home = next(a for a in live if a["id"] == "asp-002")
+    assert [g["id"] for g in home["goals"]] == ["g-001-01"], home["goals"]
 
 
 def test_retire_not_found(running_daemon):

@@ -81,3 +81,24 @@ is a timestamp in disguise. Read the shape from this file; read the MAX from the
 probe, every fire.
 
 - **2026-08-28, bravo/cc-05 (Linux 6.8.0-137-generic), N=101.** Three-branch probe returned **100** on BOTH the read-time and the write-time run (g-115-8055), authoritative `backend-cat.sh` copy 61,310 B, byte-identical to the `$WORLD_PATH` mirror. Positive-controlled against the ROWS, not the shard-index table (guard-2421): `grep -n 'N=' | tail` showed `## N=100 — 2026-08-28T18:13` as the last section heading, agreeing with the probe. Shard layout: **oldest-first, newest-LAST** — the section tail is the newest point, so append at EOF. Post-append size **69,124 B**, which at the head banner's measured 2.579 B/token is ~26.8k tokens and therefore **already past the ~25k Read cap**; the inherited "distill advisory ~N=107" is stale and the fold is due at N=102 (recorded in that shard's HANDOFF (g)).
+
+### 2026-08-31 — echo shard, read by fresh-eyes N=117 (echo, cc-03, Linux 6.8.0-137-generic)
+
+Three-branch probe returned **116**; positive-controlled against the rows themselves
+(`grep -n 'N=' | tail -8`), which showed `| **N=116** 2026-08-31 17:03` as the last table row.
+Layout: **oldest-first, table rows** (`| **N=NN** DATE TIME | ... |`), carve stubs interleaved
+in the same table, plus prose sections for N=110/111/112 BELOW the table. Heading-only greps
+still see nothing on this shard — branch 3 (first `N=` token per table row) does all the work,
+as the skill records.
+
+Two corrections a successor should carry:
+
+- **The shard-index cell was stale again.** It reads `104–` while N=116/N=117 sit in the tail.
+  Third recorded instance of the same hand-maintained-cell defect. Anchor on the ROWS.
+- **N=116's own row miscounted the live points** ("N=113/114/115/116 = 4"). N=113 had been
+  carved by that same pass, so the table held 3. A row's self-reported survivor count is not
+  an anchor either — count the `| **N=` rows.
+
+Authoritative read used throughout (`backend-cat.sh cat`), re-run at write time per g-115-8055:
+MAX_N was still 116 at write time, so N=117 was allocated with no peer collision. Node
+56,127 B pre-carve → 52,798 B after carving N=114 + N=115 and appending N=117.

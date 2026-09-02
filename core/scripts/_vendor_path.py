@@ -47,13 +47,33 @@ VENDOR_DIR = Path(os.environ.get("MIND_VENDOR_DIR")
                   or (Path.home() / ".ayoai-vendor" / "py"))
 
 
+def _resolve_vendor_dir():
+    """The vendor dir, resolved at CALL time.
+
+    MIND_VENDOR_DIR is re-read on every call, so the override the module
+    docstring promises ("a box with a different layout — or a test — should
+    set it") is real for a caller that sets it AFTER import. The three
+    importers pull this module in at daemon startup, so an import-time-only
+    read is unreachable for everyone downstream of them — and the redirect
+    still LOOKS like it worked (guard-4337: a value frozen at import silently
+    ignores every later attempt to point it elsewhere).
+
+    Falls back to VENDOR_DIR, which stays the import-time computed default, so
+    redirecting the constant keeps working too — the shape core/scripts tests
+    already use for path constants (guard-577).
+    """
+    env = os.environ.get("MIND_VENDOR_DIR")
+    return Path(env) if env else VENDOR_DIR
+
+
 def ensure_vendor_path():
     """Append the per-box vendor dir to sys.path. Returns True if it is on
     the path afterwards, False when the box has no vendored stack."""
     try:
-        if not VENDOR_DIR.is_dir():
+        vendor_dir = _resolve_vendor_dir()
+        if not vendor_dir.is_dir():
             return False
-        p = str(VENDOR_DIR)
+        p = str(vendor_dir)
         if p not in sys.path:
             sys.path.append(p)
         return True

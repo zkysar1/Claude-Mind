@@ -213,6 +213,15 @@ def promote(ctx) -> "Response":  # type: ignore[name-defined]
         if rec.get("type") != "candidate":
             raise ValueError(
                 f"Record {candidate_id} is not a candidate (type={rec.get('type')})")
+        # A RETIRED candidate must never reach the live spark set. Retiring is
+        # the only safe way to neutralise a row on this union-by-id store
+        # (guard-1072: DELETE does not survive the cross-box merge, MARK does),
+        # so without this check the mark is cosmetic — the row stays one
+        # `promote` call from firing on real goals. Measured : 2 of 7
+        # candidates were leaked test fixtures and both passed every filter here.
+        if rec.get("status") == "retired":
+            raise ValueError(
+                f"Candidate {candidate_id} is retired and cannot be promoted")
         # Duplicate-id check inside the lock (was racy outside).
         for item in items:
             if item.get("id") == new_id:

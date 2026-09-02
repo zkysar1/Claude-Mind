@@ -39,6 +39,7 @@ diagnosable, a wrong one writes into the WRONG world (guard-955 / rb-2983).
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -395,6 +396,52 @@ def test_no_literal_agent_identity_anywhere(script):
     )
 
 
+def test_filed_by_agent_is_a_variable_reference_not_any_quoted_literal():
+    """SHAPE, not membership -- the name-list guard above is itself predicate-narrow.
+
+    test_no_literal_agent_identity_anywhere builds its regex from FLEET_AGENT_NAMES,
+    so it catches exactly the eight names that existed when it was written. A NINTH
+    agent, a typo, or any novel literal hardcoded into filed_by_agent passes it
+    green. The guard written to fix predicate-narrowness (guard-1802) is itself
+    predicate-narrow -- the soft form of the same class.
+
+    Asserting the SHAPE makes the guard name-independent: whatever the fleet is
+    called next year, the provenance stamp must be a variable reference. The name
+    list is KEPT rather than replaced -- it still catches literals in other fields,
+    where no single shape rule applies.
+    """
+    text = (PROJECT_ROOT / INJECT).read_text(encoding="utf-8", errors="replace")
+    lines = [(n, ln) for n, ln in enumerate(text.splitlines(), 1)
+             if "filed_by_agent" in ln and not ln.lstrip().startswith("#")]
+
+    # NON-VACUITY FIRST. A bare "zero bad matches" assertion also passes when the
+    # field is renamed or deleted, which is the shape guard-2903 warns about: an
+    # invariance test is green by DEFAULT when it is broken. The population must
+    # exist before its cleanliness means anything.
+    assert lines, (
+        "no non-comment line in the inject script mentions filed_by_agent. Either "
+        "the provenance field was renamed (update this test) or it was dropped "
+        "(a real regression) -- this guard cannot pass vacuously"
+    )
+
+    literal = re.compile(r"""filed_by_agent['"]?\s*:\s*['"][^'"]+['"]""")
+    offenders = [f"  {n}: {ln.strip()}" for n, ln in lines if literal.search(ln)]
+    assert offenders == [], (
+        "filed_by_agent must be assigned from the origin_agent variable, never a "
+        "quoted literal -- a literal forges the identity of whichever agent is "
+        "named, on the PEER's box, under this world's provenance stamp:\n"
+        + "\n".join(offenders)
+    )
+
+    # And positively: at least one of those lines must reference the variable, so
+    # the field cannot be satisfied by some third construct that is neither.
+    assert any("origin_agent" in ln for _, ln in lines), (
+        "filed_by_agent is present but never references origin_agent; the "
+        "provenance stamp is being built some other way:\n"
+        + "\n".join(f"  {n}: {ln.strip()}" for n, ln in lines)
+    )
+
+
 def _peer_with_target_aspiration(tmp_path, asp_id="asp-115"):
     """A peer world whose aspirations.jsonl holds a real target aspiration.
 
@@ -518,6 +565,58 @@ def test_live_write_is_atomic_not_a_truncate_rewrite(tmp_path):
     assert "os.replace(" in body, "atomic replace is missing from the write path"
     assert "tempfile.mkstemp(" in body, "no temp file is created for the rewrite"
     assert "os.fsync(" in body, "the temp file is replaced without an fsync"
+
+
+def test_live_write_preserves_the_peer_stores_file_mode(tmp_path):
+    """BEHAVIOURAL, because the structural sibling above is satisfied BY the defect.
+
+    mkstemp creates 0600 by contract and os.replace swaps that inode over the
+    peer's store, so the atomic form inherits mkstemp's mode where the old
+    write-through form preserved the file's own. Measured before the fix on a
+    replay of this exact path: 0644 -> mkstemp 0600 -> after replace 0600.
+
+    Why this needs its own test rather than an extra assert up there: every
+    assertion in test_live_write_is_atomic_not_a_truncate_rewrite is fully
+    SATISFIED by the construct that caused this bug -- os.replace present,
+    mkstemp present, no truncating open. Both guards were mutation-tested the
+    day they shipped. Mutation-testing proves a guard catches the defect it was
+    written for; it never proves the predicate spans the class.
+
+    Blast radius, which is why mode is not cosmetic here: if the peer's daemon
+    runs under a different uid (normal for a long-lived service), one injection
+    makes the peer's whole aspirations.jsonl unreadable to its own daemon --
+    surfacing on the PEER box, attributed to the peer's daemon, while the
+    injecting side printed 'Layer 2 verified' and exited 0. And .history cannot
+    recover it: snapshots are box-local BY AUTHOR, so a peer-side clobber leaves
+    no snapshot on any box (guard-5413).
+    """
+    peer, asp_file = _peer_with_target_aspiration(tmp_path)
+    os.chmod(asp_file, 0o644)
+    before = stat.S_IMODE(os.stat(asp_file).st_mode)
+    # Positive control on the FIXTURE: if the chmod did not take, the assertion
+    # below would compare 0600 to 0600 and pass against a live defect.
+    assert before == 0o644, f"fixture setup failed: mode is {before:04o}, not 0644"
+
+    r = _run(INJECT, "--target", "ayoai", "--title", "Investigate: mode probe",
+             "--description", "d", "--reason", "r", "--shared",
+             env_extra=_live_env(peer))
+    assert r.returncode == 0, (
+        f"live write should succeed.\nrc={r.returncode}\n"
+        f"stdout:\n{r.stdout[:600]}\nstderr:\n{r.stderr[:800]}"
+    )
+    # The write must actually have happened, or mode is trivially preserved.
+    assert "mode probe" in asp_file.read_text(encoding="utf-8"), (
+        "the injection did not reach the peer store, so this test proves nothing "
+        "about mode preservation"
+    )
+
+    after = stat.S_IMODE(os.stat(asp_file).st_mode)
+    assert after == before, (
+        f"the injection changed the peer store's mode from {before:04o} to "
+        f"{after:04o}. mkstemp creates 0600 and os.replace swaps that inode over "
+        f"the peer's file, so the temp file's mode must be restored to the "
+        f"target's BEFORE the replace."
+    )
 
 
 def test_concurrent_change_abort_does_not_false_fire_on_a_missing_trailing_newline(tmp_path):

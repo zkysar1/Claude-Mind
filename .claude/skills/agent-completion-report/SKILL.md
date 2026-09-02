@@ -136,9 +136,29 @@ All data comes from framework scripts — no direct JSONL reads.
    #   08-22 15.2h(date-floored 16.2h) 100% (n=14, split 62/1278)
    #   08-24 32.5h(date-floored 48.8h) 86.2% (n=29, split 73/1279)  <- 3 CALENDAR DAYS
    #   08-24 34.8h(date-floored 48.8h) 87.5% (n=32, split 76/1279)  <- SAME DAY, ~13min later, DIFFERENT BOX
-   #   08-24 63.3h(date-floored 83.9h) 83.3% (n=66, split 78/1279)  <- WIDEST WINDOW IN THE SERIES
+   #   08-24 63.3h(date-floored 83.9h) 83.3% (n=66, split 78/1279)
    #   08-25 13.3h(date-floored 25.3h) 63.0% (n=27, split 40/1335)  <- BACKLOG DRAINED 78->40, COVERAGE FELL WITH IT
-   #   08-29 49.4h(date-floored 3 calendar days) 90.3% (n=31, split 50/1397)  <- HIGHEST NON-100% IN THE SERIES, ON A WIDE WINDOW
+   #   08-29 49.4h(date-floored 3 calendar days) 90.3% (n=31, split 50/1397)
+   #   08-30 99.94h(date-floored 5 calendar days) 93.3% (n=60, split 58/1397)  <- WIDEST WINDOW *AND* HIGHEST NON-100%, TOGETHER
+   #   08-31 102.5h 48.7% (n=39, split 22/1554)  <- WIDER THAN 08-30 AND HALF ITS COVERAGE, ONE DAY LATER
+   #   08-31 29.9h(date-floored 46.8h) 100% (n=14, split 22/1554)  <- SAME BOX-DAY, IDENTICAL STORE SPLIT, NARROWER WINDOW
+   # THE 08-30/08-31 PAIR IS THE CLEANEST WIDTH-CONTROLLED TEST IN THIS SERIES AND IT
+   # SETTLES THE ARGUMENT: 99.94h -> 93.3%, then 102.5h -> 48.7% ONE DAY LATER. The
+   # window got WIDER and coverage HALVED, so width cannot be the driver in either
+   # direction (08-30 already falsified 'wider drives coverage down'; this falsifies
+   # the converse too). The resolved backlog drained 58 -> 22 across that same day and
+   # coverage tracked it down -- the identical signature as the 08-25 row. Backlog is
+   # the driver; width is noise. Note also this window's outcome mix, which no prior
+   # row records: 159 in-window records but only 39 SCOREABLE (26 CONFIRMED, 13
+   # CORRECTED) against 113 EXPIRED + 7 UNRESOLVABLE. Compute coverage over SCOREABLE
+   # only or the row is not comparable to any other -- an all-records count here would
+   # have reported 12.6% and silently entered a different quantity into the series.
+   # THE 08-30 ROW FALSIFIES THE WIDTH HALF OF THAT MODEL. It is the WIDEST window
+   # in the series (99.94h, 1.6x the prior widest) and scored the HIGHEST non-100%
+   # (93.3%) -- so "a window wide enough to cross the horizon pulls in archived rows
+   # and drives coverage DOWN" is not a law. Only 4 of its 60 in-window records had
+   # reached the archived stage at all, against a 58-deep resolved backlog. Backlog,
+   # not width, is what the series keeps measuring.
    # THE THIRD 08-24 ROW REFINES THE BACKLOG MODEL THE OTHER TWO PROPOSED, and it is the
    # only row that can: it carries the HIGHEST backlog yet recorded (78 resolved) and still
    # scored the LOWEST of the three, because its window is ~1.7x wider and reaches back past

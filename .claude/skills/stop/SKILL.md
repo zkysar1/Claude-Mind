@@ -198,9 +198,12 @@ the in-turn chain is interrupted, but the normal path no longer depends on it �
        # single-quoted. `py -3` (Bash-tool context). Fire-and-forget (|| true).
        Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop")' >/dev/null 2>&1 || true`
 
-       # Two-way heartbeat probe (pure mtime):
-       #   fresh → runner is alive; leave the signal for its next iteration.
-       #   stale → runner crashed; route user to `/start --recover`.
+       # Three-way heartbeat probe (pure mtime; g-357-51):
+       #   fresh  → runner is alive; leave the signal for its next iteration.
+       #   stale  → heartbeat file aged out; runner presumed crashed → route
+       #            the user to `/start --recover`.
+       #   absent → no heartbeat file on this box. NOT a crash verdict; the
+       #            canonical gate decides (it needs positive death evidence).
        Bash: `bash core/scripts/heartbeat-stale.sh`
 
        IF output is "stale":
@@ -209,6 +212,15 @@ the in-turn chain is interrupted, but the normal path no longer depends on it �
            core/config/aspirations.yaml → runner_heartbeat.stale_minutes).
            The signal will not be picked up by the dead runner. Run
            `/start <agent-name> --recover` to force cleanup."
+           DONE. Do not chain.
+
+       IF output is "absent":
+           Bash: `bash core/scripts/runner-dead-check.sh; echo "rdc_rc=$?"`
+           IF rdc_rc == 0: same Output as the "stale" branch (crash confirmed
+             by positive evidence). DONE. Do not chain.
+           ELSE: Output: "Stop signal set. No heartbeat file exists on this box
+             (absent, not stale) and the liveness gate does not read the runner
+             as dead — the signal will be picked up at its next iteration."
            DONE. Do not chain.
 
        # output is "fresh" — normal observer path

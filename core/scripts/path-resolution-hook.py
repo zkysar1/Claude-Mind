@@ -274,11 +274,57 @@ def main():
     if not file_path:
         approve_no_mutation()
 
-    # Relative paths resolve against cwd at tool execution time. The permission
-    # layer (L2) handles those; we gate only absolute paths, where the 2026-04-02
-    # bug lives.
+    # Relative paths resolve against cwd at tool execution time, and for the
+    # write tools that cwd is PROJECT_ROOT. Until 2026-08-31 this hook approved
+    # EVERY relative path outright, on the stated premise that "the permission
+    # layer (L2) handles those". That premise was falsified by measurement
+    # (): a Write to the relative path
+    # `world/knowledge/archive/<dir>/RECEIPT.md` was approved here and landed at
+    # PROJECT_ROOT/world/... as cruft, shadowing the configured external
+    # WORLD_PATH. The literal-virtual-prefix deny below would have caught it —
+    # it fires correctly on the ABSOLUTE spelling of the identical target and
+    # was simply unreachable via the relative one. Positive control, same run:
+    # relative => approved (empty stdout), absolute => deny.
+    #
+    # This was not an edge case but the DEFAULT phrasing: every skill's
+    # pseudocode and every convention file writes `world/...` and `meta/...` in
+    # exactly this relative form, so the natural thing to type was the one
+    # spelling no check could see.
+    #
+    # Fix follows rb-9356 (the ADR-0031 precedent for this same class — a
+    # permission decision made on RAW tool arguments missing the relative
+    # spelling of a denied path): resolve against the root and gate on the
+    # resolved form. String math only, so this stays a pure decision with no
+    # filesystem calls, and `..` normalizes before any matching.
+    #
+    # TIGHTEN-ONLY BY CONSTRUCTION: relative paths were previously approved
+    # unconditionally, so evaluating the resolved form can only ADD denials,
+    # never remove one. A raw-form pass is deliberately omitted rather than
+    # forgotten — every check below is `is_under(target, <absolute root>)`, and
+    # a relative string can never be under an absolute root, so the raw arm of
+    # rb-9356's union would contribute nothing here.
+    #
+    # The sibling bash-path-resolution-hook.py ALREADY did this (see its
+    # `abs_path = os.path.join(project_root, raw_path)` branch) — the two hooks
+    # had simply diverged, and the blind one was the one covering the tools the
+    # model authors with. Do NOT "harmonize" them by narrowing this to the
+    # sibling's `agents/|world/|meta/` lead-filter: that filter exists because
+    # the Bash hook SCRAPES candidate paths out of arbitrary command lines,
+    # where a wrong guess is a false-positive deny. Here `file_path` is a single
+    # unambiguous argument, so resolving every relative path is both safe and
+    # strictly more correct.
+    #
+    # Fail open when PROJECT_ROOT is absent: an unresolvable relative path gets
+    # exactly the pre-existing behaviour, preserving this file's stated posture
+    # that a broken hook never accidentally emits a partial deny.
     if not is_absolute_path(file_path):
-        approve_no_mutation()
+        _pr = os.environ.get("PROJECT_ROOT", "")
+        if not _pr:
+            approve_no_mutation()
+        # Forward slashes so the resolved path DISPLAYS in deny messages the
+        # same way the absolute-spelling case already does; norm_path() applies
+        # the identical conversion for comparisons, so this changes no verdict.
+        file_path = os.path.normpath(os.path.join(_pr, file_path)).replace("\\", "/")
 
     # --- Harness-scratchpad deny (P4, 2026-08-21) ---
     # The platform injects a per-session scratchpad (<system-temp>/claude/

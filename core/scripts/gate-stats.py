@@ -70,6 +70,20 @@ def _load_records(path, since):
         except Exception:
             skipped += 1
             continue
+        # A line can PARSE and still not be a record: a bare int/list/str is
+        # valid JSON, so json.loads does not raise and the next .get() dies with
+        # AttributeError, taking the whole dashboard down over one bad row —
+        # which is what "skip malformed lines" above already promised not to do.
+        # Measured 2026-08-30: meta/gate-firings-2026-08-19.jsonl line 1 is `7`,
+        # and this script crashed on every invocation because of it. The
+        # identical guard was added to override-ledger-consume.py's twin loader
+        # on 2026-08-29 and NOT swept to this one (guard-1710 class: a fix
+        # applied to one of two consumers). guard-1512 is the general form — one
+        # malformed record must never abort a whole-store walk; guard-5469 is
+        # the write-side twin.
+        if not isinstance(rec, dict):
+            skipped += 1
+            continue
         ts_raw = rec.get("ts")
         if not isinstance(ts_raw, str):
             skipped += 1

@@ -742,8 +742,8 @@ ELSE:
 
 Bash: NOW="$(date +%Y-%m-%dT%H:%M:%S)";
       # When cross_agent_owner is set, splice the extra field into the JSON;
-      # otherwise emit the base shape. loop-state-save.py rejects unknown keys,
-      # so the conditional shape stays validated either way.
+      # otherwise emit the base shape. loop-state-save.py validates known
+      # keys, WARNS+drops unknown ones; the shape stays checked.
       if [[ -n "{cross_agent_owner}" ]]; then
         printf '{"goal_id":"%s","aspiration_id":"%s","source":"%s","phase":"selected","selected_at":"%s","selector_score":%s,"skill":"%s","cross_agent_owner":"%s"}' \
           "{goal.goal_id}" "{goal.aspiration_id}" "{effective_source}" "$NOW" "{goal.score}" "{goal.skill or ''}" "{cross_agent_owner}"

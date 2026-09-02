@@ -332,11 +332,9 @@ ELSE: invoke /aspirations-consolidate with: stop_mode = true
 Bash: MIND_AGENT=<agent> bash core/scripts/wm-clear-identity.sh
 # D5: Clear loop_state
 echo 'null' | MIND_AGENT=<agent> bash core/scripts/wm-set.sh loop_state
-# D5.5: (Retired — the agent-watchdog no longer runs as a daemon. It is now
-# a periodic probe invoked from iteration-close.sh productivity-check via
-# `agent-watchdog.py --tick`. No process to kill here. The probe's state
-# file agents/<agent>/session/watchdog-prev-state.json is cleared by D6 below
-# via session-manifest-clear semantics.)
+# D5.5: RETIRED — the watchdog is a PROBE (iteration-close.sh `--tick`), not a
+# daemon: no process to kill, and D6 clears watchdog-prev-state.json. Do not
+# re-add a kill here.
 # D6: Session cleanup — runner-session files only, NOT the SID binding.
 # The .active-agent-$SID binding deletion moved to D7.1 below so D7's
 # session-mode-set.sh call still has the hook auto-inject source if its
@@ -400,30 +398,25 @@ Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r
 # construction: on a merge conflict iteration-push runs `git merge --abort` and
 # defers, so it never hands D6.7 a conflicted tree.
 #
-# FAIL-SOFT BY CONSTRUCTION, and the `|| true` is NOT what makes it so. Without
-# --strict, iteration-push's soft_exit() returns 0 on EVERY path including genuine
-# push/merge failure, so an rc-gated `|| handle_failure` here would be DEAD CODE
-# (guard-775). Do NOT add --strict to "improve" error handling: that would let a
-# transient network failure abort the stop sequence. The script logs every
-# decision to stderr, which is the real visibility channel. The `|| true` mirrors
-# iteration-close.sh's production shape as belt-and-suspenders only.
-# D6.62 (g-115-4145): commit BEFORE D6.65's push+merge — nothing in D1-D7 ever
-# committed, so D4's git-tracked writes sat uncommitted and the push had
-# nothing ahead to flush. Fail-soft; rationale in the commit message.
-Bash: MIND_AGENT=<agent> bash core/scripts/iteration-commit.sh || true
+# FAIL-SOFT BY CONSTRUCTION, NOT because of `|| true`: without --strict,
+# soft_exit() returns 0 on EVERY path including genuine push/merge failure, so an
+# rc-gated branch here would be DEAD CODE (guard-775). Do NOT add --strict — a
+# transient network failure would then abort the stop. stderr is the real
+# visibility channel; `|| true` mirrors iteration-close.sh as belt-and-suspenders.
+# D6.62 (g-115-4145): commit BEFORE D6.65's push+merge, else D4's git-tracked
+# writes sit uncommitted. All 4 flags REQUIRED and `source` is load-bearing:
+# $PROJECT_ROOT is UNSET in a bare Bash call, so --repo passes EMPTY and exits 1
+# naming the flags you DID pass. Ran flagless and inert until 2026-09-01. `||
+# true` discards the rc (a commit failure must never abort a stop), so the
+# git-status line — not the rc — is the check. Both: rb-9907.
+Bash: source core/scripts/_paths.sh && MIND_AGENT=<agent> bash core/scripts/iteration-commit.sh --goal-id graceful-stop --title "Maintain: graceful-stop consolidation artifacts" --outcome deep --type chore --repo "$PROJECT_ROOT" || true
+Bash: D=$(git status --porcelain | wc -l | tr -d ' '); if [ "$D" -eq 0 ]; then echo "[stop-commit] tree clean after D6.62"; else echo "[stop-commit] WARN: $D file(s) still uncommitted after D6.62 — session writes may be stranded (rb-9907)" >&2; git status --porcelain | head -10; fi
 Bash: MIND_AGENT=<agent> bash core/scripts/iteration-push.sh --min-commits 0 --max-age-min 0 --fetch-interval-min 0 || true
-# D6.7 (session-continuity redesign, 2026-06-02): Flush this machine's governed
-# writes to S3 NOW so a machine-move right after this clean stop cannot strand
-# the session's last continuity writes locally. By this point ALL continuity
-# files are written: handoff (D4 consolidate), working-memory (D4.5/D5),
-# execution-diary, session-summary (D6.5); machine-local files were deleted in
-# D6. The flush is the deterministic race-closer over the daemon's 120s periodic
-# sweep — under the own-cloud backend it pushes continuity/ephemeral session
-# files (+ world/meta) immediately; under the local backend it is a clean no-op.
-# Best-effort: the daemon's periodic sweep is STILL running after this agent
-# goes IDLE and will retry any file the flush missed, so a flush error warns
-# but never blocks the stop. (Runs as its own Bash line — its rc cannot break
-# D7's chain.)
+# D6.7 (session-continuity redesign, 2026-06-02): flush this machine's governed
+# writes to S3 NOW so a machine-move right after a clean stop cannot strand the
+# session's last continuity writes locally — the deterministic race-closer over
+# the daemon's 120s sweep. Best-effort: that sweep keeps running after this agent
+# goes IDLE and retries anything missed, so a flush error warns, never blocks.
 # D6.7+D6.8 (flush->VERIFY->release HARD GATE, design §6 — g-115-1339): the two
 # steps are fused into ONE Bash call so the flush's rc is in scope for the
 # release decision (shell vars do not persist across separate `Bash:` calls).

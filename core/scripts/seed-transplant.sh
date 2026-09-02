@@ -465,7 +465,8 @@ elif a.get('archived') and not a.get('verified'):
         print(f\"    ! {f.get('stage')}: {f.get('path')} — {f.get('error')}\")
     print(f\"    partial archive: {a.get('path')}\")
 else:
-    print('  no orphans found')"
+    print('  no orphans found')
+"
 
 # Step 11: Handle git (init only — commit happens AFTER post-actions so
 # their outputs land in the same commit as the planted files)

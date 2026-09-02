@@ -296,7 +296,10 @@ def load_dedup_titles(aspiration_id):
             status = g.get("status") or ""
             if not title:
                 continue
-            if status in ("pending", "in-progress"):
+            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+            # this builds the title corpus the duplication gate reads, so a candidate
+            # absent here lets a duplicate of it pass the gate.
+            if status in ("pending", "in-progress", "candidate"):
                 titles.append(title)
             elif status == "completed" and asp_id == aspiration_id:
                 titles.append(title)

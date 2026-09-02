@@ -207,7 +207,7 @@ def test_over_budget_warns_loudly_but_never_refuses(monkeypatch, capsys):
     rc, out, err = _run_main(monkeypatch, capsys, src)
     assert rc == 0, "WARN-never-refuse: an absent index is worse than an oversized one"
     assert "BUDGET BREACH" in err
-    # Denominators travel with the estimate (guard-2529/guard-2191 class).
+    # Denominators travel with the estimate (guard-2529/guard-2129 class).
     assert "9000 records" in err
     assert str(gm.BUDGET_TOKENS) in err
     # The manifest itself is still complete — coverage floor unaffected.

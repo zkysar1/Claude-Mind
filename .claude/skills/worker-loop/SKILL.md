@@ -123,9 +123,15 @@ IF the value is in the CLOSED SET — 'closed-pending-merge' / 'merged' /
   (The stop-hook worker-net stands down on the same manifest read —
   gate=worker-net-body-closed — so this turn-end is ALLOWed, not trapped.)
 IF the value is 'parked': this Body is RESUMABLE and did NOT close (g-306-291).
-  Do NOT end the turn here. Skip the closure exit, continue through the
-  preamble: Phase 0.5 re-polls the reducer and SELECT decides — a claim RESUMES
-  (Phase 2), no goal re-parks (Phase 1). This gate never re-derives that.
+  Do NOT end the turn here. FIRST ask if the full re-poll is DUE — the park orbit
+  backs off on consecutive parks (g-357-51 part 4):
+  Bash: py -3 core/scripts/body-manifest.py park-due --sid "$MIND_SID" --agent "$MIND_AGENT"
+  rc=1 (not due; last stdout line = seconds left): re-arm ScheduleWakeup(<the
+  Phase 0.5 park prompt>, delaySeconds=min(remaining,3600)) and END the turn on
+  a Bash echo — no preamble, no poll, no SELECT. rc=0 (due, or any error — fail
+  toward polling): skip the closure exit, continue through the preamble: Phase
+  0.5 re-polls the reducer and SELECT decides — a claim RESUMES (Phase 2), no
+  goal re-parks (Phase 1). This gate never re-derives that.
   TEST THE CLOSED SET, NEVER 'not active'. The old predicate here was
   "anything other than active", correct while every non-active state was
   terminal — so introducing `parked` would have made this gate refuse every
@@ -413,46 +419,36 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #     NOT optional bookkeeping: it is what keeps the fleet sweeper reading
 #     EXPECTED_IDLE instead of emailing the user that this box is DEAD. The path
 #     is in the recorder's NO_NOTIFY_PATHS, enforced inside record().
+#   Bash: py -3 core/scripts/recovery_yank.py check --agent "$MIND_AGENT"
+#     rc=0 = RECOVERY-YANK: recovery-gate.sh demoted the reducer, no user did
+#     (g-357-51 part 3). ESCALATE ONCE per yank (escalated_before=false): post
+#     the finding (tags recovery-yank,escalation), then
+#     Notify the user about the recovery yank. (Check world/forged-skills.yaml
+#     for a skill whose triggers match "notify the user" and invoke it with a
+#     short subject and message. If no matching skill is registered, fall back
+#     to a `participants: [agent, user]` goal via aspirations-add-goal.sh. Never
+#     block on notification failure.) Then `--mark-escalated`. rc=1 (user-stop)
+#     / rc=2 (none): park quietly.
 #   Tool (not Bash): ScheduleWakeup(prompt="Parked worker Body: re-enter
 #     /worker-loop at Phase -0 (manifest reads parked = RESUMABLE), re-run the
 #     Phase 0.5 poll and SELECT; a claim resumes, no goal re-parks.",
 #     delaySeconds=3600)
 # and NOTHING after it — that wakeup IS the auto-resume; a park turn that forgets
-# to arm is indistinguishable from a close. DO NOT STAGE THE WM: a Body queued for
-# merge that keeps working diverges into a merged manifest; `park` never stages,
-# only a real close does. Say PARKED, not "winding down". Fail-open: a failed
-# post must never block the park.
+# to arm is indistinguishable from a close. DO NOT STAGE THE WM (`park` never
+# stages, only a real close does). Say PARKED, not "winding down". Fail-open: a
+# failed post must never block the park.
 #
-# ON RE-ENTRY (the wakeup fires): Phase -0 sees `parked` (resumable, not closed).
-# Re-run this poll. rc=0 -> SELECT: Phase 2 resumes on a claim, Phase 1 re-parks
-# on no goal. rc=1 -> re-park (idempotent) and re-arm.
+# ON RE-ENTRY (the wakeup fires): Phase -0 owns it — park-due, then this poll.
 #
 # THE PARK IS CAPPED at body-manifest.PARK_MAX_HOURS (60h), whichever trigger
-# parked it. When `py -3 core/scripts/body-manifest.py park-expired --sid ...
-# --agent ...` exits 0, stop re-parking and take the GENUINE close in Phase 1 —
-# recorded as a REAL stop that DOES email, because from a closed Body `/start`
-# is user-only and a human now genuinely has to act. Expiry FAILS TOWARD STAYING
-# PARKED (an unreadable `parked_at` is not-expired): a wrong close is the
-# unrecoverable direction; a long park costs one hourly poll.
-#
-# NEVER-PROMOTE is the invariant the poll turns on: no rc yields "become the
-# reducer". Every ambiguous signal resolves toward wind-down, which loses nothing
-# (the divergent WM stays live and unstaged across the park and reaches the
-# reducer at the eventual close) while continuing without a reducer accumulates
-# work that is thrown away.
-#
-# A single transient failure (daemon/DDB error) does NOT wind down — that would
-# let one daemon blip kill every worker in the fleet at once. Transients
-# accumulate to `error_threshold` (default 3 consecutive); any LIVE poll resets
-# the count.
-#
-# MEASURED LIMIT, stated because the design asks for more than the endpoint can
-# give: GET /v1/admin/runner-claims returns exactly
-# {agent, machine_id, agent_state, heartbeat_at} — there is NO runner_token, so
-# the design's "OR runner_token changed" is NOT implemented. `machine_id` is the
-# takeover proxy and catches a reducer that stale-breaks in from ANOTHER box; a
-# SAME-BOX reducer restart (new token, same machine_id) is invisible to this
-# poll and reports CONTINUE. Closing that needs the endpoint to expose the token.
+# parked it: when `py -3 core/scripts/body-manifest.py park-expired --sid ...
+# --agent ...` exits 0, stop re-parking and take the GENUINE close in Phase 1
+# (a REAL stop that DOES email — from a closed Body `/start` is user-only).
+# Expiry FAILS TOWARD STAYING PARKED (unreadable `parked_at` = not-expired).
+# NEVER-PROMOTE: no rc yields "become the reducer"; every ambiguous signal
+# resolves toward wind-down. A single transient poll failure does NOT wind
+# down — transients accumulate to `error_threshold` (3); any LIVE poll resets.
+# Takeover detection: machine_id + claim token fingerprint (g-306-224).
 
 # Phase 1 — SELECT (reuse the existing scorer; a worker selects like the reducer)
 Bash: goal-selector.sh

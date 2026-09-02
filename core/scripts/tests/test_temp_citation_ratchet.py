@@ -65,6 +65,18 @@ def _run(world: Path, meta: Path, extra=(), cwd=None):
     return json.loads(r.stdout)
 
 
+def _cited_paths(world: Path, meta: Path):
+    """The --cited-paths exit (a pure read), which --json does not carry."""
+    env = os.environ.copy()
+    env["MIND_WORLD"] = str(world)
+    env["MIND_META"] = str(meta)
+    env["STORAGE_BACKEND"] = "local"
+    r = subprocess.run([sys.executable, str(SCRIPT), "--cited-paths"],
+                       capture_output=True, text=True, encoding="utf-8", env=env)
+    assert r.returncode == 0, f"--cited-paths exited {r.returncode}: {r.stderr}"
+    return [x for x in r.stdout.splitlines() if x.strip()]
+
+
 def test_seeds_then_reports_stable():
     with tempfile.TemporaryDirectory(prefix="tcr_seed_") as d:
         tmp = Path(d)
@@ -278,3 +290,73 @@ def test_same_path_cited_by_two_records_counts_twice():
         world = _mkworld(tmp, tree_cites=[same, same])
         out = _run(world, meta, extra=("--dry-run",))
         assert out["current"]["total"] == 2, out
+
+
+# ── glob/placeholder citations are not paths ( baseline) ──────────
+
+GLOB_CITES = [
+    "agents/alpha/temp/*.raw",
+    "agents/alpha/temp/alerts/<K",
+    "agents/alpha/temp/flywheel-{legacy",
+    "agents/bravo/temp/g-115-3544-*.md",
+    "agents/bravo/temp/pl_*.json",
+    "agents/echo/temp/g-335-531-*",
+    "agents/foxtrot/temp/<file",
+    "agents/zeta/temp/prune-probe*-g-115-2020.py",
+]
+
+REAL_CITES = [
+    "agents/bravo/temp/od2.txt",
+    "agents/bravo/temp/pmfirst.py",
+    "agents/alpha/temp/a335.json",
+]
+
+
+def test_glob_and_placeholder_citations_are_not_counted():
+    """A pattern lifted out of prose is not a citation.
+
+    Such an entry can never resolve to a file, so it can never take ANY exit of
+    the drain-temp folding lane (fold / graveyard / annotate all presuppose a
+    referent) — which makes that lane's own terminal condition, "every pair
+    resolves to exactly one exit", unreachable while they are counted.
+    Measured live 2026-08-31 (bravo, cc-05): 11 of 182 distinct cited paths.
+    """
+    with tempfile.TemporaryDirectory(prefix="tcr_glob_") as d:
+        tmp = Path(d)
+        meta = tmp / "meta"
+        meta.mkdir()
+        world = _mkworld(tmp, tree_cites=GLOB_CITES, rb_cites=REAL_CITES)
+        out = _run(world, meta)
+        # Only the real ones survive; the 8 globs contribute nothing.
+        # `baseline` is the (record, path) PAIR count — the ratchet's own metric,
+        # and the one carried by --json. cited_paths rides the separate
+        # --cited-paths exit, so it is asserted via that flag below.
+        assert out["baseline"] == len(REAL_CITES), out
+        paths = _cited_paths(world, meta)
+        assert set(paths) == set(REAL_CITES), sorted(paths)
+
+
+def test_rejects_whole_match_never_emits_a_truncated_stub():
+    """THE load-bearing property, and the one the obvious fix gets wrong.
+
+    Excluding the metacharacters from TEMP_CITE_RE's character class makes the
+    regex stop AT the metacharacter instead of rejecting the match, INVENTING a
+    stub that looks like a real path ('.../g-115-3544-*.md' -> '.../g-115-3544-').
+    Measured on a 60.5 MB / 1659-file corpus snapshot under the guard-2201
+    one-snapshot protocol: class-exclusion produced 9 such stubs. A post-filter
+    cannot invent, so nothing derived from a glob may appear at all.
+    """
+    with tempfile.TemporaryDirectory(prefix="tcr_trunc_") as d:
+        tmp = Path(d)
+        meta = tmp / "meta"
+        meta.mkdir()
+        world = _mkworld(tmp, tree_cites=GLOB_CITES)
+        out = _run(world, meta)
+        assert out["baseline"] == 0, out
+        cited = set(_cited_paths(world, meta))
+        assert cited == set(), f"emitted from glob-only corpus: {sorted(cited)}"
+        for stub in ("agents/bravo/temp/g-115-3544-",
+                     "agents/bravo/temp/pl_",
+                     "agents/alpha/temp/alerts/",
+                     "agents/alpha/temp/flywheel-"):
+            assert stub not in cited, f"truncated stub emitted: {stub}"

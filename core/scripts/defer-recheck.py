@@ -879,7 +879,11 @@ def main():
         # Skip goals that are not pending/in-progress — a completed or blocked
         # goal has defer_reason as historical residue, not a live constraint.
         # Clearing cosmetic-only text has no selection impact.
-        if g.get("status") not in ("pending", "in-progress"):
+        # +candidate — §11b/g-353-82 (world/conventions/goal-intake-management.md):
+        # without this a candidate's defer is never re-probed, so a goal promoted
+        # later arrives carrying a stale defer and probe-before-defer.md rule 4
+        # silently stops applying to the tier.
+        if g.get("status") not in ("pending", "in-progress", "candidate"):
             continue
         # Skip goals with structured deferred_until set — that field is the
         # authoritative time gate consumed by goal-selector.py. defer-recheck's

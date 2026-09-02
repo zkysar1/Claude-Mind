@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from knowledge_projection import (
     _SELF_PURPOSE_CAP,
+    project_goals,
     project_self,
     FRAMEWORK_TREE_ROOT,
     ProjectedBundle,
@@ -276,7 +277,7 @@ def test_project_suppresses_framework_and_exposes_domain() -> None:
     assert isinstance(bundle, ProjectedBundle)
     # Exactly the domain entries survive each store.
     assert bundle.counts() == {
-        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0,
+        "tree": 1, "hypotheses": 1, "guardrails": 1, "lessons": 1, "self": 0, "goals": 0,
     }  # no self.md passed to project() -> `self` projects empty
     assert bundle.tree[0]["key"] == "reefs"
     assert bundle.hypotheses[0]["horizon"] == "short"
@@ -450,3 +451,156 @@ def test_self_purpose_redacts_before_capping_so_a_straddling_token_cannot_leak()
     # so it guards the ordinary path without standing in for the assertion above.
     inside = "x" * 1100 + " " + secret + " " + "y" * 400
     assert secret not in project_self({"created": "2026-01-01"}, inside, redactor)["purpose"]
+
+
+# ── project_goals — the two fail-closed gates + the three-field allowlist ─────
+
+def _g(**kw):
+    """A goal record with the two gate fields defaulted OPEN, so each test varies one."""
+    base = {"title": "Ship the reef explorer", "work_class": "product", "status": "pending"}
+    base.update(kw)
+    return base
+
+
+def test_project_goals_work_class_gate_exposes_only_product() -> None:
+    """Gate 1. Everything that is not literally ``product`` is dropped, missing included.
+
+    The queue is overwhelmingly framework plumbing; publishing it would show a member
+    the agent's maintenance backlog instead of the roadmap they came for.
+    """
+    goals = [
+        _g(work_class="product", title="Product one"),
+        _g(work_class="framework", title="Framework one"),
+        _g(work_class="hygiene", title="Hygiene one"),
+        _g(work_class="unclassified", title="Unclassified one"),
+        _g(work_class=None, title="Null one"),
+        {"title": "Absent one", "status": "pending"},  # key missing entirely
+    ]
+    out = project_goals(goals, Redactor())
+    assert [g["title"] for g in out] == ["Product one"]
+
+
+def test_project_goals_work_class_match_is_case_and_space_insensitive() -> None:
+    """A store value is hand-written often enough that ``" Product "`` must not leak-by-drop.
+
+    This gate fails CLOSED, so a casing miss silently HIDES real product work rather
+    than exposing private work — the safe direction, and therefore the one nothing
+    would ever alert on.
+    """
+    out = project_goals([_g(work_class="  Product  ")], Redactor())
+    assert len(out) == 1
+
+
+def test_project_goals_status_gate_maps_three_and_suppresses_the_rest() -> None:
+    """Gate 2. An UNMAPPED status is suppressed, not passed through.
+
+    That is the load-bearing half: a new internal status added to the store later stays
+    private by default instead of appearing verbatim on a member-facing page.
+    """
+    mapped = [
+        (_g(status="pending", title="A"), "planned"),
+        (_g(status="in-progress", title="B"), "in progress"),
+        (_g(status="completed", title="C"), "done"),
+    ]
+    for goal, public in mapped:
+        out = project_goals([goal], Redactor())
+        assert len(out) == 1 and out[0]["status"] == public, goal
+
+    for internal in ("blocked", "skipped", "expired", "decomposed", "superseded", "", None):
+        assert project_goals([_g(status=internal)], Redactor()) == [], internal
+
+
+def test_project_goals_emits_exactly_three_keys_and_no_internal_field() -> None:
+    """The ALLOWLIST is the whole security property — an internal field must not ride along.
+
+    ``outcome_note`` and ``defer_reason`` carry verbatim measurements (account ids, table
+    names, box hostnames, partner-agent names); ``participants``/``claimed_by`` carry
+    fleet internals. None of them are read, so none can leak.
+    """
+    goal = _g(
+        goal_id="g-369-70",
+        asp_id="asp-369",
+        outcome_note="dynamo table prod-accounts on cc-02 holds 110 vin_ keys",
+        defer_reason="human_blocked: waiting on zachary",
+        participants=["agent", "user"],
+        claimed_by="zeta",
+        priority="HIGH",
+        category="ayoai-platform-services",
+        created_at="2026-08-01",
+    )
+    out = project_goals([goal], Redactor())
+    assert len(out) == 1
+    assert set(out[0]) == {"title", "status", "updated"}, sorted(out[0])
+    blob = " ".join(str(v) for v in out[0].values())
+    for internal in ("dynamo", "prod-accounts", "cc-02", "zeta", "human_blocked", "HIGH", "asp-369"):
+        assert internal not in blob, internal
+
+
+def test_project_goals_redacts_and_caps_the_title() -> None:
+    """The title is the one free-text field that survives, so it gets the full redactor.
+
+    A product title routinely cites a script or an agent name; belt and braces.
+    """
+    from knowledge_projection import _GOAL_TITLE_CAP
+
+    out = project_goals(
+        [_g(title="alpha fixed knowledge-export.py for g-369-70 " + "x" * _GOAL_TITLE_CAP)],
+        Redactor(agent_names=("alpha",)),
+    )
+    assert len(out) == 1
+    title = out[0]["title"]
+    assert "alpha" not in title and "knowledge-export.py" not in title and "g-369-70" not in title
+    assert len(title) <= _GOAL_TITLE_CAP
+
+
+def test_project_goals_drops_a_goal_whose_title_redacts_to_nothing() -> None:
+    """A title that is ENTIRELY internal must not publish as an empty row.
+
+    An empty-titled entry on a member-facing page is worse than absence: it advertises
+    that something was hidden.
+    """
+    assert project_goals([_g(title="g-369-70")], Redactor()) == []
+    assert project_goals([_g(title="   ")], Redactor()) == []
+
+
+def test_project_goals_updated_prefers_completed_then_started_then_created() -> None:
+    """The fallback chain, and the "" floor.
+
+    "" must read as UNKNOWN, never as old — which is why it is empty rather than an
+    epoch date a consumer would render as 1970.
+    """
+    assert project_goals(
+        [_g(completed_date="2026-08-30", started="2026-08-01", created_at="2026-07-01")],
+        Redactor(),
+    )[0]["updated"] == "2026-08-30"
+    assert project_goals(
+        [_g(started="2026-08-01", created_at="2026-07-01")], Redactor()
+    )[0]["updated"] == "2026-08-01"
+    assert project_goals([_g(created_at="2026-07-01")], Redactor())[0]["updated"] == "2026-07-01"
+    assert project_goals([_g()], Redactor())[0]["updated"] == ""
+
+
+def test_project_goals_empty_input_is_empty_output() -> None:
+    assert project_goals([], Redactor()) == []
+
+
+def test_goals_is_in_counts_but_not_in_the_broken_export_refusal_set() -> None:
+    """The twin of ``self``'s gap, and it is load-bearing for the OPPOSITE reason.
+
+    ``goals`` is in ``counts()`` because guard-5144 says a projection absent from counts
+    is a projection no verifier can check. It is NOT in ``KNOWLEDGE_COUNT_KEYS`` because
+    goals are work items, not knowledge: a world can legitimately publish zero product
+    goals while its four knowledge stores are perfectly healthy, so folding it in would
+    let a genuinely broken export walk past the all-zero refusal gate.
+    """
+    from knowledge_projection import KNOWLEDGE_COUNT_KEYS
+
+    assert "goals" in ProjectedBundle().counts()
+    assert "goals" not in KNOWLEDGE_COUNT_KEYS
+
+    bundle = ProjectedBundle(goals=[{"title": "t", "status": "planned", "updated": ""}])
+    assert bundle.counts()["goals"] == 1
+    assert any(bundle.counts().values()), "the naive check would pass this broken bundle"
+    assert not any(bundle.counts()[k] for k in KNOWLEDGE_COUNT_KEYS), (
+        "the refusal must still see this export as all-zero knowledge"
+    )

@@ -118,9 +118,23 @@ def _parse_lossy(path: Path):
         if not line:
             continue
         try:
-            records.append(json.loads(line))
+            rec = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             torn += 1
+            continue
+        # A torn append can land on a valid JSON SCALAR — an interleaved write
+        # that happens to break after a digit leaves a line like `7`, which
+        # parses fine and so was never counted as torn. This flush then appended
+        # it into the shared store, where every reader doing rec.get() died on
+        # it: meta/gate-firings-2026-08-19.jsonl line 1 is exactly that, and it
+        # took BOTH gate-telemetry tools down from 08-19 to 08-30. A non-dict is
+        # torn by the same argument as an unparseable line — it is not a record.
+        # This is the write-side stop; the read-side guards are the defence in
+        # depth (guard-1512), not a substitute.
+        if not isinstance(rec, dict):
+            torn += 1
+            continue
+        records.append(rec)
     return records, torn
 
 

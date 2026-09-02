@@ -367,6 +367,12 @@ def _authoritative_goal_lookup(live_path: Path, asp_id: str, goal_id: str):
         return "no-verify", None
     try:
         key = be._s3_key(str(live_path))
+    except Exception:  # noqa: BLE001 — cannot even derive the key -> fail-open
+        return "no-verify", None
+    fast = _head_etag_fast_path(be, key, live_path, asp_id, goal_id)
+    if fast is not None:
+        return fast
+    try:
         obj = be.s3.get_object(Bucket=be.bucket, Key=key)
         # : decode through the one transport seam — the store may be
         # gzip on the wire (magic-byte authoritative; plain passes through).
@@ -395,6 +401,61 @@ def _authoritative_goal_lookup(live_path: Path, asp_id: str, goal_id: str):
     # whole-aspiration anomaly (or sharding) we cannot pin to this goal;
     # fail-open rather than risk a false failure.
     return "no-verify", None
+
+
+def _head_etag_fast_path(be, key: str, live_path: Path, asp_id: str, goal_id: str):
+    """: answer the persistence read-back from the LOCAL mirror when a
+    HEAD proves S3's head IS the bytes this process last wrote or read.
+
+    `OwnCloudBackend._put` records the PUT response ETag in `be._etags[key]`
+    after every successful fenced PUT, and `_refresh` records the ETag it last
+    downloaded. A HEAD (free of data-transfer charges) whose ETag equals that
+    fence proves the object S3 serves right now is byte-identical to the local
+    mirror, so parsing the mirror answers "did the goal persist?" exactly as
+    the full GET would. The GET it replaces is the whole store — 6.5 MB gzip on
+    the wire for world/aspirations.jsonl, measured 2026-08-29 at 60-108 such
+    read-backs per hour fleet-wide (one per add/claim/critical transition),
+    ~$25-45/mo of the S3 bill.
+
+    Returns ("found", goal) ONLY on the equal-ETag AND goal-present-locally
+    path. Every other outcome returns None so the caller falls through to the
+    full GET+parse unchanged: no fence recorded (fresh daemon, machine-local
+    path), HEAD raised or reports absent, ETag mismatch (a peer wrote since —
+    the merge may or may not have kept the goal, and only the authoritative
+    bytes can say), local mirror unreadable, or goal absent from the mirror.
+    So the g-115-2208 loss-signature detection and the fail-open contract are
+    exactly as before; the fast path can never turn a loss into a false
+    "found", because an equal ETag means the bytes S3 holds ARE the bytes
+    being parsed.
+    """
+    fence = (getattr(be, "_etags", None) or {}).get(key)
+    if not fence:
+        return None
+    try:
+        st = be.stat(live_path)  # S3 HEAD; None when absent
+    except Exception:  # noqa: BLE001 — HEAD unavailable -> the full read decides
+        return None
+    if st is None:
+        return None
+    if str(getattr(st, "version", "") or "").strip('"') != str(fence).strip('"'):
+        return None
+    try:
+        local_fn = getattr(be, "_local", None)
+        mirror = Path(local_fn(live_path)) if callable(local_fn) else Path(live_path)
+        raw = mirror.read_text(encoding="utf-8", errors="replace")
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec.get("id") == asp_id:
+                for g in (rec.get("goals") or []):
+                    if g.get("id") == goal_id:
+                        return "found", g
+                return None  # present-but-absent locally: let the GET decide
+    except Exception:  # noqa: BLE001 — local anomaly -> the full read decides
+        return None
+    return None
 
 
 def _verify_claim_persisted(live_path: Path, asp_id: str, goal_id: str,
@@ -430,8 +491,9 @@ def _verify_claim_persisted(live_path: Path, asp_id: str, goal_id: str,
 _CRITICAL_TRANSITION_FIELDS = {"status", "defer_reason"}
 
 
-def _verify_transition_persisted(live_path: Path, asp_id: str, goal_id: str,
-                                 expected: Dict[str, Any]) -> bool:
+def _verify_transition_persisted(
+        live_path: Path, asp_id: str, goal_id: str,
+        expected: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]]]:
     """never-success-without-persistence invariant for critical goal
     TRANSITIONS — update-goal status/defer_reason, release, complete-by
     (g-115-2429; siblings: add_goal g-115-2208, claim g-115-2306).
@@ -454,14 +516,79 @@ def _verify_transition_persisted(live_path: Path, asp_id: str, goal_id: str,
     "no-verify" (local backend, backend/read/parse failure, aspiration
     absent) → True; goal ABSENT on a clean read → False (the store lacks
     the goal, so it certainly lacks the transition).
+
+    RETURNS ``(persisted, mismatches)``. ``mismatches`` is a list of
+    ``{"field", "expected", "observed"}`` — empty whenever ``persisted`` is
+    True. THE SECOND ELEMENT IS THE POINT (g-115-8502): this predicate used
+    to return a bare ``all(...)``, so every one of the three call sites could
+    report only THAT a critical transition had not persisted, never WHICH
+    field disagreed. Six failed closes of a recurring goal were measured
+    from the outside over two days (achievedCount 66 -> 72, so every
+    "failed" write had in fact LANDED) and the failing key could not be
+    named from any of them, because nothing here ever emitted it.
+
+    The signature changed rather than gaining an optional out-parameter
+    DELIBERATELY (guard-3292): an optional diagnostic has no failure mode at
+    the call site — omitting it raises nothing and exits 0 — so two of the
+    three sites would have stayed silently undiagnosable, which is the exact
+    state this change exists to end. Making it part of the return forces
+    every site, present and future, to hold the detail.
+
+    Values are NOT short by construction — `_CRITICAL_TRANSITION_FIELDS`
+    includes `defer_reason`, which is narrative and, per probe-before-defer,
+    is SUPPOSED to cite probe output. Measured on the live queue 2026-09-01
+    (157 goals carrying one): median 1,044 chars, p90 2,129, max 5,204, with
+    133 of 157 over 500. Rendered raw at both ends of a mismatch that is over
+    10 KB in an HTTP error body and a stderr line, so
+    `_format_transition_mismatches` caps each value — see the cap's own note
+    on why the length is printed rather than the tail dropped silently. The
+    structured list returned here stays UNCAPPED; only the rendering is
+    bounded, so a future consumer loses nothing.
     """
     status, g = _authoritative_goal_lookup(live_path, asp_id, goal_id)
     if status == "no-verify":
-        return True
+        return True, []
     if status == "goal-absent":
-        return False
+        return False, [{"field": "<goal>", "expected": "present",
+                        "observed": "absent"}]
     g = g or {}
-    return all(g.get(f) == v for f, v in expected.items())
+    mismatches = [{"field": f, "expected": v, "observed": g.get(f)}
+                  for f, v in expected.items() if g.get(f) != v]
+    return (not mismatches), mismatches
+
+
+_MISMATCH_VALUE_CAP = 120
+
+
+def _cap_mismatch_value(value: Any) -> str:
+    """repr(value), capped, ALWAYS naming the full length when it truncates.
+
+    The length is not decoration. Two long `defer_reason`s that differ only
+    past the cap render identically, so a bare ellipsis would turn a real
+    disagreement into two strings that look the same — the caller would read
+    the diagnostic as noise. Printing both lengths keeps a size difference
+    visible, and an equal-length pair is then explicitly "differs somewhere
+    past char 120" rather than silently nothing.
+    """
+    text = repr(value)
+    if len(text) <= _MISMATCH_VALUE_CAP:
+        return text
+    return f"{text[:_MISMATCH_VALUE_CAP]}...<truncated, {len(text)} chars>"
+
+
+def _format_transition_mismatches(mismatches: List[Dict[str, Any]]) -> str:
+    """Compact one-line rendering of _verify_transition_persisted detail.
+
+    Bounded on purpose: this string reaches an HTTP error body and a stderr
+    log line, and `defer_reason` is a narrative field (measured max 5,204
+    chars on the live queue). See _verify_transition_persisted's docstring.
+    """
+    if not mismatches:
+        return "no field mismatch reported"
+    return "; ".join(
+        f"{m['field']}: expected={_cap_mismatch_value(m['expected'])} "
+        f"observed={_cap_mismatch_value(m['observed'])}"
+        for m in mismatches)
 
 
 # ---------------------------------------------------------------------------
@@ -2262,6 +2389,26 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     except (ValueError, json.JSONDecodeError) as e:
         return Response.error(400, "invalid_body", f"body must be JSON value: {e}")
 
+    # : companion outcome_note on a status write — one locked RMW
+    # instead of the measured 2-call close ritual (outcome_note PUT, then
+    # status PUT: 42/43 completions in a 3d changelog sample were exactly
+    # that pair, and on own-cloud each logical write costs ~23x in sync-layer
+    # echo versions). For field=status the body MAY be
+    # {"value": <status>, "outcome_note": <text>}; unwrap HERE so every gate
+    # and cascade below sees the plain status string. Backward-compatible:
+    # a bare-string body is untouched, and a dict body for status was
+    # previously always an invalid-status refusal, so no caller relied on it.
+    companion_note = None
+    if field == "status" and isinstance(value, dict) and "value" in value:
+        _cn = value.get("outcome_note")
+        if _cn is not None and not isinstance(_cn, str):
+            return Response.error(
+                400, "invalid_companion",
+                f"outcome_note companion on the status write must be a "
+                f"string, got {type(_cn).__name__} (goal {goal_id})")
+        companion_note = _cn
+        value = value["value"]
+
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
 
@@ -2784,6 +2931,47 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                         f"or ensure blocker_ref is already populated via a "
                         f"prior defer_reason write.",
                     )
+
+            # : apply the companion outcome_note BEFORE the
+            # completed-only gates so the residual-work gate evaluates the
+            # INCOMING note — the same note the old 2-call ritual would have
+            # landed first. Guarded by the same field-shrink predicate the
+            # note would face on its own write (honoring the same override
+            # header); a shrink refusal aborts the whole RMW, so neither the
+            # note nor the status flip lands — atomic by construction.
+            if companion_note is not None:
+                _c_shrink = _field_shrink_eval(
+                    "outcome_note", goal.get("outcome_note"), companion_note)
+                if _c_shrink["blocked"]:
+                    _c_shrink_override = _header_override(
+                        ctx, "X-Mind-Override-Shrink")
+                    _gate_log.log(
+                        "field-shrink-guard",
+                        "override" if _c_shrink_override else "block",
+                        caller="daemon:update_goal:companion",
+                        trigger_matched=_c_shrink["decision_path"],
+                        payload=goal_id,
+                        override_reason=_c_shrink_override,
+                        extra={"field": "outcome_note",
+                               "old_len": _c_shrink["old_len"],
+                               "new_len": _c_shrink["new_len"],
+                               "ratio": _c_shrink["ratio"]},
+                        meta_dir=ctx.paths.meta,
+                        agent_name=ctx.paths.agent_name,
+                    )
+                    if not _c_shrink_override:
+                        return Response.json({
+                            "error": "field_shrink_blocked",
+                            "gate": "field-shrink-guard",
+                            "field": "outcome_note",
+                            "old_len": _c_shrink["old_len"],
+                            "new_len": _c_shrink["new_len"],
+                            "ratio": _c_shrink["ratio"],
+                            "detail": f"{_c_shrink['message']} (companion "
+                                      f"outcome_note on status write, goal "
+                                      f"{goal_id})",
+                        }, status=400)
+                goal["outcome_note"] = companion_note
 
             # Pre-completion artifact-existence gate (, 2026-05-14).
             # Mirror of aspirations.py cmd_update_goal lines 1849-1907.
@@ -3345,11 +3533,16 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # dict reference) so the mutation persists into items.
             _recompute_progress(asp)
 
+            # : name the companion in the summary so changelog-based
+            # writes-per-completion measurements can see the consolidated shape.
+            _write_summary = (f"update-goal {goal_id} {field}"
+                              + ("+outcome_note" if companion_note is not None
+                                 else ""))
             history.snapshot(live_path, base_dir, agent,
-                             summary=f"update-goal {goal_id} {field}")
+                             summary=_write_summary)
             _atomic_write_jsonl(live_path, items)
             changelog.append(base_dir, agent, live_path, "edit",
-                             summary=f"update-goal {goal_id} {field}",
+                             summary=_write_summary,
                              lines_changed=len(items))
             # Invalidate while the lock is held — same rationale as add_goal:
             # close the eventual-consistency window on the write-then-cache-
@@ -3369,18 +3562,20 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
         expected = {field: goal.get(field)}
         if field == "status" and value in _TERMINAL_GOAL_STATUSES:
             expected["claimed_by"] = None  # step 9 popped the claim in-lock
-        if not _verify_transition_persisted(live_path, asp["id"], goal_id,
-                                            expected):
+        _ok, _mm = _verify_transition_persisted(live_path, asp["id"], goal_id,
+                                                expected)
+        if not _ok:
             import sys
+            _detail = _format_transition_mismatches(_mm)
             print(f"[daemon update_goal] WRITE-LOSS DETECTED: {field} "
                   f"transition on {goal_id} returned success-shaped but the "
                   f"authoritative store does not carry it (own-cloud silent "
-                  f"write-loss, g-115-2429)", file=sys.stderr)
+                  f"write-loss, g-115-2429) — {_detail}", file=sys.stderr)
             return Response.error(
                 500, "update_not_persisted",
                 f"update-goal {goal_id} {field} did not persist to the "
                 f"authoritative store (own-cloud write-loss, g-115-2429); "
-                f"retry the update")
+                f"retry the update [{_detail}]")
 
     # === PR 7i post-lock E9 skip observation ===
     # Fires AFTER the lock releases so the wm-append doesn't hold
@@ -3467,6 +3662,135 @@ def _disposition_open_goals_on_retire(asp: Dict[str, Any],
             f"stranding (g-115-2860)")
         dispositioned.append(g.get("id"))
     return dispositioned
+
+
+def _load_rehome_container(project_root: Path) -> Optional[str]:
+    """`recurring.rehome_container` from core/config/aspirations.yaml — None
+    when unset or unreadable (auto-detect then applies; the config is advisory)."""
+    try:
+        import yaml
+        cfg_path = project_root / "core" / "config" / "aspirations.yaml"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        val = (cfg.get("recurring") or {}).get("rehome_container")
+        return str(val).strip() if val else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _find_recurring_pending(asp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """recurring=true goals that are still LIVE (non-terminal) — exactly the
+    goals an archive would strand (g-357-31)."""
+    return [g for g in (asp.get("goals") or [])
+            if isinstance(g, dict) and g.get("recurring")
+            and g.get("status") not in _TERMINAL_GOAL_STATUSES]
+
+
+def _recurring_rehome_target(items: List[Dict[str, Any]], asp_id: str,
+                             requested: Optional[str],
+                             configured: Optional[str]) -> Tuple[Optional[Dict[str, Any]], str]:
+    """The live container that adopts stranded recurring goals ().
+
+    Precedence: explicit `requested` (query/flag) > configured
+    `recurring.rehome_container` > the live aspiration flagged
+    `recurring_home: true` > the live ACTIVE aspiration holding the most
+    recurring goals (the world's de-facto standing container). The archiving
+    aspiration itself is never a candidate. Returns (target, how) on a hit,
+    (None, reason) on a miss — an explicitly named target that is not live is
+    a miss, never silently replaced by a weaker rule."""
+    def _live(a: Any) -> bool:
+        return (isinstance(a, dict) and a.get("id") != asp_id
+                and a.get("status") not in ("completed", "retired")
+                and not a.get("archived"))
+    by_id = {a.get("id"): a for a in items if isinstance(a, dict)}
+    for cand, how in ((requested, "requested"), (configured, "configured")):
+        if not cand:
+            continue
+        a = by_id.get(cand)
+        if a is None or not _live(a):
+            return None, f"{how} rehome target {cand} is not a live aspiration"
+        return a, how
+    flagged = [a for a in items if _live(a) and a.get("recurring_home") is True]
+    if flagged:
+        return flagged[0], "recurring_home flag"
+    ranked = sorted((a for a in items if _live(a) and a.get("status") == "active"
+                     and _find_recurring_goals(a)),
+                    key=lambda a: (-len(_find_recurring_goals(a)), str(a.get("id"))))
+    if ranked:
+        return ranked[0], "most recurring goals"
+    return None, "no live aspiration carries recurring goals or a recurring_home flag"
+
+
+def _rehome_recurring_goals(asp: Dict[str, Any], asp_id: str,
+                            target: Dict[str, Any], warnings: List[str],
+                            reason: str) -> List[str]:
+    """Move every live recurring goal of `asp` into `target` (SAME goal id —
+    the id is the record's identity across the fleet) and turn the copy left
+    behind into a `superseded` pointer (`rehomed_to`) with recurring=false, so
+    no sweep ever reads the archived copy as a live ritual again. Idempotent:
+    a goal the target already holds is not duplicated. Returns the moved ids.
+
+    Why re-home rather than disposition (g-357-31, measured 2026-08-30 on a
+    downstream deployment): the selector never reads the archive and all three
+    cadence instruments (cadence canary, precondition sweep, overdue_ratio) are
+    scoped to the selectable queue, so a recurring goal that rides into the
+    archive is undetectably dead — the archive-time invariant is the ONLY
+    possible detector."""
+    moved: List[str] = []
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    have = {g.get("id") for g in (target.get("goals") or []) if isinstance(g, dict)}
+    for g in _find_recurring_pending(asp):
+        gid = g.get("id")
+        if gid not in have:
+            adopted = dict(g)
+            adopted["rehomed_from"] = asp_id
+            adopted["rehomed_at"] = now
+            adopted["rehome_reason"] = reason
+            target.setdefault("goals", []).append(adopted)
+            have.add(gid)
+        g["status"] = "superseded"
+        g["recurring"] = False
+        g["rehomed_to"] = target.get("id")
+        g["rehomed_at"] = now
+        g["superseded_by_goal"] = gid
+        g["disposition_reason"] = reason
+        moved.append(str(gid))
+    if moved:
+        _recompute_progress(target)
+        _recompute_progress(asp)
+        warnings.append(
+            f"REHOMED {len(moved)} recurring goal(s) from {asp_id} to "
+            f"{target.get('id')} (un-strandable recurring invariant, g-357-31): "
+            f"{', '.join(moved)}.")
+    return moved
+
+
+def _rehome_or_refuse(items: List[Dict[str, Any]], asp: Dict[str, Any],
+                      asp_id: str, ctx, warnings: List[str], verb: str):
+    """Archive-time guard shared by complete / complete-intent / retire: re-home
+    the aspiration's live recurring goals into a live container, or return the
+    400 that REFUSES the archive. None = nothing to do or re-homed."""
+    from ..server import Response
+    pending = _find_recurring_pending(asp)
+    if not pending:
+        return None
+    requested = (ctx.query.get("rehome_target") or "").strip() or None
+    configured = _load_rehome_container(ctx.paths.project_root)
+    target, how = _recurring_rehome_target(items, asp_id, requested, configured)
+    if target is None:
+        rg_ids = ", ".join(str(g.get("id")) for g in pending)
+        return Response.error(400, "recurring_rehome_target_missing",
+            f"{asp_id} still carries {len(pending)} live recurring goal(s): {rg_ids}. "
+            f"Refusing to {verb}: an archived recurring goal is unreachable by the "
+            f"selector and every cadence instrument (g-357-31), and no live container "
+            f"can adopt them ({how}). Pass rehome_target=<live asp id>, flag a live "
+            f"aspiration `recurring_home: true`, set recurring.rehome_container in "
+            f"core/config/aspirations.yaml, or set recurring=false on the goals.")
+    _rehome_recurring_goals(
+        asp, asp_id, target, warnings,
+        f"parent {asp_id} archived via {verb}; recurring goals are un-strandable — "
+        f"re-homed to {target.get('id')} ({how}) (g-357-31)")
+    return None
 
 
 def _find_shape_recurring_corrupted(asp: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -3919,6 +4243,12 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
                     f"{asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
                     f"Recurring goals run perpetually and must not be archived. "
                     f"Set recurring=false on goals to stop, or use force=true.")
+            # : force=true may archive the aspiration but must NOT strand
+            # its live recurring goals — re-home them into a live container, or
+            # refuse the archive outright (force does not override this).
+            rehome_err = _rehome_or_refuse(items, asp, asp_id, ctx, warnings, "complete")
+            if rehome_err is not None:
+                return rehome_err
 
             # Intent-satisfied pathway
             if intent_block is not None:
@@ -4089,13 +4419,14 @@ def complete_intent(ctx) -> "Response":  # type: ignore[name-defined]
                                       f"Aspiration {asp_id} not found")
             idx, asp = result
 
-            # Guard: refuse recurring goals
-            recurring = _find_recurring_goals(asp)
-            if recurring:
-                rg_ids = ", ".join(g["id"] for g in recurring)
-                return Response.error(400, "recurring_goals_present",
-                    f"{asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
-                    f"Recurring goals run perpetually and must not be archived.")
+            # : the intent sweep is the archive path that stranded LIVE
+            # recurring goals on a downstream deployment (2026-08-30). Re-home
+            # them into a live container before the intent validation; when no
+            # container can adopt them the completion is REFUSED — never
+            # archived with recurring goals aboard.
+            rehome_err = _rehome_or_refuse(items, asp, asp_id, ctx, warnings, "complete-intent")
+            if rehome_err is not None:
+                return rehome_err
 
             # Intent-satisfied validation
             config = _load_intent_satisfaction_config(ctx.paths.project_root)
@@ -4538,18 +4869,26 @@ def complete_by(ctx):
         # branch and every write site, so the pair witnesses the sid.
         _cb_expected["claimed_by"] = None
         _cb_expected["claimed_at"] = None
-    if not _verify_transition_persisted(live_path, asp["id"], goal_id,
-                                        _cb_expected):
+    _cb_ok, _cb_mm = _verify_transition_persisted(live_path, asp["id"],
+                                                  goal_id, _cb_expected)
+    if not _cb_ok:
         import sys
+        # : THIS is the site that produced six un-diagnosable 500s
+        # while every write landed. "retry the completion" below is advice the
+        # measured failure mode makes ACTIVELY HARMFUL for a recurring goal —
+        # each retry re-advances lastAchievedAt and achievedCount, resets the
+        # cadence timer, and poisons every downstream freshness reader
+        # (guard-5708). Read the mismatch detail before retrying anything.
+        _cb_detail = _format_transition_mismatches(_cb_mm)
         print(f"[daemon complete_by] WRITE-LOSS DETECTED: completion of "
               f"{goal_id} returned success-shaped but the authoritative "
               f"store does not carry it (own-cloud silent write-loss, "
-              f"g-115-2429)", file=sys.stderr)
+              f"g-115-2429) — {_cb_detail}", file=sys.stderr)
         return Response.error(
             500, "complete_not_persisted",
             f"complete-by for {goal_id} did not persist to the "
             f"authoritative store (own-cloud write-loss, g-115-2429); "
-            f"retry the completion")
+            f"retry the completion [{_cb_detail}]")
 
     # Team-state cross-write AFTER aspirations lock released.
     #
@@ -4646,6 +4985,12 @@ def retire(ctx) -> "Response":  # type: ignore[name-defined]
                     f"{asp_id} contains {len(recurring)} recurring goal(s): {rg_ids}. "
                     f"Recurring goals run perpetually and must not be archived. "
                     f"Set recurring=false on goals to stop, or use force=true.")
+
+            # : a forced retire must NOT strand live recurring goals —
+            # re-home them into a live container, or refuse the archive.
+            rehome_err = _rehome_or_refuse(items, asp, asp_id, ctx, warnings, "retire")
+            if rehome_err is not None:
+                return rehome_err
 
             unfinished = _find_unfinished_goals(asp)
             if unfinished:
@@ -4845,7 +5190,27 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
                 negatives.append({
                     "box": box,
                     "agent": agent,
-                    "reason": release_reason[:500],
+                    #  (echo, cc-03, 2026-09-01): cap raised 500 -> 2000
+                    # AND truncation made VISIBLE. The list is ALREADY bounded to
+                    # 20 entries below, so this per-entry cap was redundant growth
+                    # protection whose real effect was destroying executor handoff
+                    # notes. MEASURED over 2,759 goals: 15 of 49 live entries
+                    # (30.6%) sat exactly at 500 -- every one clipped mid-sentence,
+                    # 3 agents, 5 days.  lost two of three design findings
+                    # an agent wrote explicitly "for the next executor"; 
+                    # was cut WHILE NAMING where its full analysis lived. The
+                    # silence is the defect: a reader cannot distinguish a clipped
+                    # note from a complete one (rb-654 -- a cap set from an
+                    # estimate rather than observed lengths, hiding DATA LOSS;
+                    # rb-7994 -- never leave a degraded channel looking clean).
+                    # Observed length p50 is 345, so 2000 clears the real
+                    # distribution with headroom and the 20-entry bound still caps
+                    # total growth.
+                    "reason": (
+                        release_reason[:2000]
+                        + "\u2026[TRUNCATED at 2000 chars \u2014 the rest of this note was NOT stored;"
+                        + " long handoffs belong in progress_note]"
+                    ) if len(release_reason) > 2000 else release_reason,
                     "at": datetime.now().isoformat(timespec="seconds"),
                 })
                 # Bounded so a goal repeatedly released cannot grow without
@@ -4908,18 +5273,21 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
     # re-sync). Verified unconditionally (not just had_claim): the store copy
     # may carry a claim the stale local mirror lacked. Conservative fail-open
     # (see _verify_transition_persisted).
-    if not _verify_transition_persisted(live_path, asp["id"], goal_id,
-                                        {"claimed_by": None,
-                                         "claimed_at": None}):
+    _rel_ok, _rel_mm = _verify_transition_persisted(
+        live_path, asp["id"], goal_id,
+        {"claimed_by": None, "claimed_at": None})
+    if not _rel_ok:
         import sys
+        _rel_detail = _format_transition_mismatches(_rel_mm)
         print(f"[daemon release] WRITE-LOSS DETECTED: release of {goal_id} "
               f"returned success-shaped but a claim persists in the "
               f"authoritative store (own-cloud silent write-loss, "
-              f"g-115-2429)", file=sys.stderr)
+              f"g-115-2429) — {_rel_detail}", file=sys.stderr)
         return Response.error(
             500, "release_not_persisted",
             f"release of {goal_id} did not persist to the authoritative "
-            f"store (own-cloud write-loss, g-115-2429); retry the release")
+            f"store (own-cloud write-loss, g-115-2429); retry the release "
+            f"[{_rel_detail}]")
 
     if had_claim:
         try:
@@ -6766,6 +7134,93 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({"ok": True, "goal": goal})
 
 
+def rehome_recurring_backfill(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/aspirations/rehome-recurring-backfill?source=<world|agent>
+        [&rehome_target=<asp-id>][&dry_run=true]
+
+    One-shot sweep over ALREADY-ARCHIVED aspirations (g-357-31): every archived
+    row still carrying a live (non-terminal) recurring=true goal has that goal
+    re-homed into the live container — same target rules as the archive-time
+    guard (_recurring_rehome_target) — and the archived copy becomes a
+    `superseded` pointer. Idempotent: a second run moves nothing. `dry_run=true`
+    reports the plan without writing either file. Archive rows are mutated IN
+    PLACE and the whole list is written back — no row is dropped or replaced
+    wholesale (guard-4066 / _archive_replace_row's keep clause).
+    """
+    from ..server import Response
+    source = (ctx.query.get("source") or "world").strip()
+    if source not in ("world", "agent"):
+        return Response.error(400, "invalid_source",
+                              "source must be world or agent")
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+    agent = _agent_name(ctx)
+    live_path, base_dir = _resolve_paths(ctx, source)
+    archive_path = base_dir / "aspirations-archive.jsonl"
+    dry_run = (ctx.query.get("dry_run") or "").strip().lower() in ("true", "1", "yes")
+    requested = (ctx.query.get("rehome_target") or "").strip() or None
+    configured = _load_rehome_container(ctx.paths.project_root)
+    warnings: List[str] = []
+    moved_by_asp: Dict[str, List[str]] = {}
+    target_id: Optional[str] = None
+    target_how = ""
+    archive_scanned = 0
+    stranded_count = 0
+    try:
+        with file_locks.locked(live_path):
+            items = _read_jsonl(live_path)
+            archive = _read_jsonl(archive_path)
+            archive_scanned = len(archive)
+            stranded = [a for a in archive
+                        if isinstance(a, dict) and _find_recurring_pending(a)]
+            stranded_count = len(stranded)
+            if stranded:
+                target, target_how = _recurring_rehome_target(
+                    items, "", requested, configured)
+                if target is None:
+                    ids = ", ".join(
+                        f"{a.get('id')}({len(_find_recurring_pending(a))})"
+                        for a in stranded)
+                    return Response.error(400, "recurring_rehome_target_missing",
+                        f"{len(stranded)} archived aspiration(s) carry live recurring "
+                        f"goal(s): {ids}; no live container can adopt them ({target_how}). "
+                        f"Pass rehome_target=<live asp id> or flag a live aspiration "
+                        f"`recurring_home: true`.")
+                target_id = str(target.get("id"))
+                for a in stranded:
+                    aid = str(a.get("id"))
+                    moved = _rehome_recurring_goals(
+                        a, aid, target, warnings,
+                        f"stranded in the archive under {aid}; re-homed to {target_id} "
+                        f"({target_how}) by the g-357-31 backfill sweep")
+                    if moved:
+                        moved_by_asp[aid] = moved
+                if moved_by_asp and not dry_run:
+                    _atomic_write_jsonl(archive_path, archive)
+                    n = sum(len(v) for v in moved_by_asp.values())
+                    history.snapshot(live_path, base_dir, agent,
+                                     summary=f"rehome-recurring-backfill ({n} -> {target_id})")
+                    _atomic_write_jsonl(live_path, items)
+                    changelog.append(base_dir, agent, live_path, "edit",
+                                     summary=f"rehome-recurring-backfill ({n} goal(s) -> {target_id})",
+                                     lines_changed=len(items))
+                    _jsonl_cache().invalidate(live_path)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+    return Response.json({
+        "ok": True,
+        "dry_run": dry_run,
+        "archived_scanned": archive_scanned,
+        "stranded_aspirations": stranded_count,
+        "moved": moved_by_asp,
+        "moved_count": sum(len(v) for v in moved_by_asp.values()),
+        "target": target_id,
+        "target_how": target_how or None,
+        "warnings": warnings if warnings else None,
+    })
+
+
 def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/aspirations/archive-sweep?source=<world|agent>
 
@@ -7306,6 +7761,42 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     for g in asp.get("goals", []):
         if g.get("blocked_by") and not g.get("blocked_since"):
             g["blocked_since"] = now_ts
+        # created_at / alloc_nonce / filed_by_agent parity with add_goal
+        # (). This loop stamped ONLY blocked_since, so every goal
+        # embedded in an aspiration at CREATION time was born without the
+        # three fields the single-goal path stamps — while any goal added to
+        # the same aspiration later, via add_goal, got all three.
+        #
+        # MEASURED, and the id ordering is the proof: the unstamped goals are
+        # always the LOWEST-numbered ones in their aspiration. asp-369's
+        # /04/08/09 lack all three;  onward carry all three.
+        # asp-326 is the same shape at 126 goals — only  is bare.
+        #
+        # THIS IS NOT A USER-DIRECTIVE DEFECT, which is how it was originally
+        # framed. goal_source correlated (13 of the first 14 found were
+        # goal_source=user) only because user-supplied plans arrive as a whole
+        # aspiration while agent work appends goals one at a time.  is
+        # goal_source=agent-self and unstamped;  is goal_source=user
+        # and stamped. The discriminating fact is the WRITE PATH, not the
+        # source — which also settles the "is there a second producer?"
+        # question: there is one producer, and this is it.
+        #
+        # WHY created_at MATTERS MOST: it is the age input to
+        # apply_starvation_boost, which fail-opens to NO boost on a missing
+        # timestamp, so these goals can never be starvation-rescued. Confirmed
+        # on a live victim —  sat 1,878h (78 days) at the tail of a
+        # working agent's queue, ~2.4x older than anything else it held. A
+        # second consumer is user-facing: user-blocker-escalation-check renders
+        # an ageless goal into the user's blocked-goals digest with age
+        # "unknown".
+        #
+        # setdefault, matching add_goal exactly: an explicit caller value is
+        # preserved (a plan may legitimately carry its own created_at), and
+        # this is a no-op for every goal that already has one.
+        g.setdefault("created_at", now_ts)
+        g.setdefault("alloc_nonce", uuid.uuid4().hex)
+        if agent:
+            g.setdefault("filed_by_agent", agent)
 
     # --- Validate ---
     try:
@@ -7901,6 +8392,7 @@ def register(routes) -> None:
     routes[("POST", "/v1/aspirations/release")] = release
     routes[("POST", "/v1/aspirations/claim")] = claim
     routes[("POST", "/v1/aspirations/archive-sweep")] = archive_sweep
+    routes[("POST", "/v1/aspirations/rehome-recurring-backfill")] = rehome_recurring_backfill
     routes[("POST", "/v1/aspirations/meta-update")] = meta_update
     routes[("POST", "/v1/aspirations/clear-stale-claims")] = clear_stale_claims
     routes[("POST", "/v1/aspirations/add")] = add

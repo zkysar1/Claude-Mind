@@ -21,7 +21,7 @@ OUTPUT CONTRACT (required, not a logging nicety): n_resolved and n_archived are
 reported SEPARATELY, never as a single total. A single number cannot show
 whether the union was actually read, so a silent regression to the
 resolved-only fetch would print identically to a correct run — the per-arm n is
-the only place that difference is visible (guard-2529 / guard-2273 / guard-2191).
+the only place that difference is visible (guard-2529 / guard-2273 / guard-2129).
 
 KNOWN INHERITED DEFECT, DECLARED IN OUR OWN OUTPUT: an AGGREGATE accuracy
 cannot denominate a PER-BAND ceiling. A ceiling asserts a realized frequency AT

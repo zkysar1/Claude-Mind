@@ -109,8 +109,15 @@ ACTIVE_STATUSES = ("pending", "in-progress")
 # Conservative residual markers — Step 8.55 vocabulary, tightened to phrases
 # that rarely appear in a fully-executed goal's outcome. Bare "follow-up" /
 # "remainder" / "successor" mostly occur while NAMING the filed carrier, in
-# which case accept path 1 lifts the block; the negative lookbehinds strip the
-# common benign negations ("no follow-up needed").
+# which case accept path 1 lifts the block.
+#
+# THE LOOKBEHINDS BELOW BELONG TO `follow_up` ALONE. This comment used to say
+# "the negative lookbehinds strip the common benign negations" without naming a
+# marker, which reads as a property of all three — and `remainder`/`successor`
+# had NOTHING. That sentence is how the gap survived review ().
+# Those two are now guarded differently and for a different reason, by
+# `_noun_marker_survives` below: they are bare common NOUNS, not phrases, so
+# negation was never their main defect (guard-1923, guard-1024).
 RESIDUAL_MARKERS: List[Tuple[str, re.Pattern]] = [
     ("no_code_written",
      re.compile(r"\bno\s+(?:product\s+|new\s+)?code\s+(?:was\s+)?written\b",
@@ -132,6 +139,70 @@ RESIDUAL_MARKERS: List[Tuple[str, re.Pattern]] = [
     ("successor",
      re.compile(r"\bsuccessor\b", re.IGNORECASE)),
 ]
+
+# --- Bare-noun marker guard () -----------------------------------
+# `remainder` and `successor` are bare common English nouns. Unlike every other
+# entry above — all of which are PHRASES that assert incompleteness ("no code
+# written", "deferred to") — the noun alone asserts nothing, so it matches
+# ordinary prose about an unrelated subject. Measured over the whole override
+# ledger (37 rows, 2026-08-30): of the 16 rows these two markers produced, ~7
+# were the noun in a non-work sense and ~4 were an author saying they
+# DELIBERATELY DID NOT file one. guard-1923 prescribes the remedy for a
+# polysemous token: do not drop it, NARROW it to the referent form.
+#
+# TWO DISTINCT DEFECTS, and conflating them is why one guard cannot fix both:
+#
+#   class A — the noun with a non-work referent: "its successor
+#     LogCustomEvent", "the remainder of that function", "carried into the
+#     successor comment". There is NO negation anywhere in these clauses, so a
+#     negation guard is structurally incapable of touching them. They need an
+#     ANCHOR to work vocabulary (_WORK_CONTEXT_RE).
+#
+#   class B — a filing DECLINE: "Did not file a successor", "No successor goal
+#     filed", "Filing a successor would re-open finished work". These need
+#     negation/subjunctive detection (_FILING_DECLINE_RE).
+#
+# THE NEGATION MUST SCOPE TO THE FILING VERB, NEVER TO THE WORK VERB. This is
+# the trap that makes a blanket negation guard wrong: "The remainder was not
+# attempted" is a NEGATED clause that asserts residual work EXISTS, and it is a
+# standing positive control in the gate's own tests. So _FILING_DECLINE_RE
+# matches negation adjacent to file/create/open, and deliberately does not fire
+# on "not attempted".
+#
+# SCOPE HONESTLY STATED: this narrows, it does not eliminate. Two class-A rows
+# in the ledger survive by construction because their clauses genuinely contain
+# work vocabulary — "were carried into the successor comment" (carrier verb,
+# code-comment referent) and prose ABOUT successor goals as a concept. Per
+# guard-1892 the residue is a WORDING problem that no match-time parsing
+# repairs; the remaining lever is the marker vocabulary, not more machinery.
+_NOUN_MARKERS = ("remainder", "successor")
+
+# A DECLINE to file a carrier, in the three shapes the ledger actually shows:
+# negation before the noun, negation of the filing verb after it, and the
+# subjunctive "filing one would ..." form.
+_FILING_DECLINE_RE = re.compile(
+    r"\b(?:no|not|never)\b[^.;\n]{0,40}?\b(?:successor|remainder)\b"
+    r"|\b(?:successor|remainder)\b[^.;\n]{0,40}?"
+    r"\b(?:not|never)\s+(?:been\s+)?(?:filed|created|opened|raised)\b"
+    r"|\b(?:filing|file)\b[^.;\n]{0,40}?\bwould\b",
+    re.IGNORECASE,
+)
+
+# Vocabulary that makes the noun refer to WORK rather than to an API, a code
+# comment, a data field, or a lane label. Deliberately narrow: an unanchored
+# noun is the defect being fixed, so absence of this vocabulary suppresses.
+_WORK_CONTEXT_RE = re.compile(
+    r"\b(?:goal|goals|task|tasks|carrier|file|filed|files|filing|carry|"
+    r"carried|carries|attempted|unfinished|undone|remains|remaining|"
+    r"outstanding|pending|deferred|executed|implemented|addressed|"
+    # declin* is work context, not a decline-to-file: "Remainder declined by
+    # the owner" asserts a remainder EXISTS and routes it to accept path 3.
+    # Safe against class B because _FILING_DECLINE_RE runs FIRST and has
+    # already returned on "did not file a successor" and friends.
+    r"declined|declines|decline)\b",
+    re.IGNORECASE,
+)
+
 
 GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,4}\b")
 
@@ -219,6 +290,20 @@ def _residual_clause(text: str, first_match_start: int) -> str:
     return text[lo:first_match_start + 90].strip()
 
 
+def _noun_marker_survives(text: str, start: int) -> bool:
+    """True when a bare-noun marker hit is a REAL claim that work remains.
+
+    Scoped to the SENTENCE containing the hit, not the whole note: a long
+    outcome_note routinely discusses successors and remainders in several
+    unrelated senses, and widening the window would let any one work-shaped
+    sentence license every other match in the note.
+    """
+    clause = _residual_clause(text, start)
+    if _FILING_DECLINE_RE.search(clause):
+        return False
+    return bool(_WORK_CONTEXT_RE.search(clause))
+
+
 def _extract_carrier_candidates(text: str) -> List[str]:
     """Goal ids within CARRIER_WINDOW chars of carrier vocabulary."""
     vocab_spans = [m.start() for m in CARRIER_VOCAB_RE.finditer(text)]
@@ -296,7 +381,15 @@ def evaluate(goal_id: str,
 
     first_start: Optional[int] = None
     for name, rx in RESIDUAL_MARKERS:
-        m = rx.search(text)
+        # Bare-noun markers scan EVERY occurrence and keep the first one that
+        # survives the guard. `search` would stop at the first hit, so a note
+        # whose opening prose mentions "its successor" in an API sense would
+        # mask a genuine residual later in the same note.
+        if name in _NOUN_MARKERS:
+            m = next((h for h in rx.finditer(text)
+                      if _noun_marker_survives(text, h.start())), None)
+        else:
+            m = rx.search(text)
         if m:
             result["matched_markers"].append(name)
             if first_start is None or m.start() < first_start:

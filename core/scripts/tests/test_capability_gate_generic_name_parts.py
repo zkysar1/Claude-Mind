@@ -57,6 +57,8 @@ import pathlib
 import subprocess
 import sys
 
+import pytest
+
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 GATE_PY = CORE_SCRIPTS / "capability-gate.py"
@@ -71,6 +73,15 @@ _RUNTIME_FP = (
     "precondition_unmet: a new runtime endpoint must appear before this can be "
     "verified"
 )
+# Measured 2026-08-30. `land` reached the name-parts branch through the forged
+# skill `land-stranded-pr`; here it is ordinary English ("before we land the
+# unit-file change") about a systemd unit, not a pull request. Surfaced as the
+# only red in the pytest-invisible half of a full-suite run
+# (test_capability_gate_narrative.py case ).
+_LAND_FP = (
+    "user approves the systemd Restart=always vs Restart=no policy decision "
+    "before we land the unit-file change"
+)
 
 # guard-958 adversarial recall controls — each is a SOLE-surviving-keyword case.
 _SOLE_IDENTIFIER = "human_blocked: cannot access EFS"          # 'efs' ()
@@ -80,6 +91,14 @@ _SOLE_IMPERATIVE = "human_blocked: commit the hotfix"
 # true discriminator ('npc'), so the >=2-hit path must still fire.
 _DEMOTED_WITH_DISCRIMINATOR = (
     "human_blocked: user must add an npc task to the environment"
+)
+# The recall control the EXTENSION RULE demands for `land`: a GENUINE reference
+# to land-stranded-pr. Measured hit counts are what make the demotion safe —
+# the FP carries one shared token, this carries four (land, main, onto,
+# stranded) and so never reaches _single_token_qualifies at all.
+_LAND_WITH_DISCRIMINATOR = (
+    "human_blocked: the PR went conflicting because main moved; someone must "
+    "land the stranded PR onto main"
 )
 
 
@@ -127,6 +146,17 @@ def test_runtime_name_part_does_not_falsely_block():
     )
 
 
+def test_land_name_part_does_not_falsely_block():
+    """`land` is a common English verb that happens to open a forged skill's
+    name. Left qualified, the gate refuses the defer AND auto-files an Unblock
+    (Layer D) pointing at a PR-landing skill for a systemd unit-file change."""
+    _, d = _run_gate(_LAND_FP)
+    assert not d.get("would_block"), (
+        f"generic name part 'land' wrongly blocked a capability-free defer; "
+        f"matches={d.get('matches')} keywords={d.get('keywords_extracted')}"
+    )
+
+
 # --- guard-958 recall controls (sole-surviving-keyword, not happy paths) -----
 
 def test_sole_identifier_name_part_still_matches():
@@ -166,6 +196,23 @@ def test_demoted_token_still_matches_with_its_discriminator():
     assert "task" in kws, (
         f"'task' was suppressed from MATCHING entirely (looks like it was "
         f"stopworded rather than demoted): {sorted(kws)}")
+
+
+def test_land_still_matches_a_genuine_stranded_pr_reference():
+    """guard-958 recall control for the `land` demotion, and the positive
+    control the mutation proof must show NOT flipping: demoting a token may only
+    remove the SOLE-token collision, never a real reference. A genuine
+    stranded-PR defer shares four tokens with the skill, so it fires on the
+    >=2-hit path that never consults _single_token_qualifies."""
+    _, d = _run_gate(_LAND_WITH_DISCRIMINATOR)
+    kws = {k for m in (d.get("matches") or [])
+           for k in (m.get("all_matched_keywords") or [])}
+    assert d.get("would_block"), (
+        f"genuine land-stranded-pr reference lost; "
+        f"keywords={d.get('keywords_extracted')} matches={d.get('matches')}")
+    assert "land" in kws, (
+        f"'land' was suppressed from MATCHING entirely (stopworded rather than "
+        f"demoted): {sorted(kws)}")
 
 
 def test_demoted_token_still_extracted():
@@ -249,5 +296,155 @@ def test_demotion_is_load_bearing():
         assert matched(_TASK_FP), "reverting the fix did not reproduce the 'task' FP"
         assert matched(_RUNTIME_FP), "reverting the fix did not reproduce the 'runtime' FP"
         assert matched(_SOLE_IDENTIFIER), "recall case must be invariant to the fix"
+    finally:
+        m._GENERIC_NAME_PARTS = saved
+
+
+# ---------------------------------------------------------------------------
+#  (2026-08-31): the eight-token survey slice.
+#
+# The originating filing named three FPs — 'page', 'found' via build-landing-page
+# / manage-website / document-found-opportunity. Re-measured on 2026-08-31 those
+# tokens no longer fire, and NOT because the matcher was fixed: all three skills
+# had been retired from forged-skills.yaml, so the collisions left with them. The
+# defect class was fully intact. Anyone re-running the filing's stated repro today
+# reads "no match" and wrongly concludes it is closed — which is why these cases
+# are pinned against tokens that are still live.
+#
+# SURVEY (canonical evaluate() over the production corpus resolved by
+# capability-gate.py's own _resolve_world_dir — 241 entries: 80 forged + 133
+# SKILL.md + 28 routing): 138 of 196 name-only-qualifying tokens block a NEUTRAL
+# prose carrier. So this branch's premise fails for ~70% of its own population.
+# The eight below are the unambiguous common-noun slice.
+#
+# guard-2201 delta discipline: OLD and NEW predicates were run against ONE corpus
+# snapshot in ONE process — neutral-carrier FPs 138 -> 130, REMOVED set == exactly
+# these eight, ADDED set EMPTY.
+_SURVEY_20260831 = {
+    # token: (measured FP prose, target skill, genuine reference)
+    "felt": (
+        "precondition_unmet: the defect felt intermittent and has not shown up again",
+        "felt-sense-checkin",
+        "human_blocked: user must run the felt sense checkin"),
+    "sense": (
+        "precondition_unmet: the numbers make no sense until the next invoice arrives",
+        "felt-sense-checkin",
+        "human_blocked: user must run the felt sense checkin"),
+    "eyes": (
+        "precondition_unmet: more eyes on the rollout are wanted before the window opens",
+        "fresh-eyes-tree",
+        "human_blocked: user must review the tree with fresh eyes"),
+    "body": (
+        "precondition_unmet: the body of the incident writeup is not finished yet",
+        "decode-email-body",
+        "human_blocked: user must decode the email body"),
+    "field": (
+        "precondition_unmet: the field is empty on every row until the backfill completes",
+        "recover-clobbered-store-field",
+        "human_blocked: user must recover the clobbered store field"),
+    "usage": (
+        "precondition_unmet: usage has not crossed the threshold that would make this measurable",
+        "sweep-customer-server-usage",
+        "human_blocked: user must sweep the customer server usage"),
+    "proof": (
+        "precondition_unmet: no proof of the race exists until it happens again under load",
+        "mutation-proof-regression-test",
+        "human_blocked: user must write the mutation proof regression test"),
+    "timeline": (
+        "precondition_unmet: the timeline slipped and the dependency has not shipped",
+        "reconstruct-env-server-restart-timeline",
+        "human_blocked: user must reconstruct the env server restart timeline"),
+}
+
+
+def _production_world():
+    """Resolve the world dir exactly as the production entry point does.
+
+    Never fall back to os.environ["WORLD_PATH"]: an interactive shell exports it
+    and the pytest runner does not, so an env lookup PASSES by hand and goes
+    vacuous in the suite (guard-1906 / guard-920). Measured while writing these
+    tests: passing world_dir=None silently drops forged-skills.yaml AND the
+    capability-routing rows, cutting the corpus from 241 entries to 133 — a
+    measurement of a subset wearing the costume of the whole.
+    """
+    spec = importlib.util.spec_from_file_location("cap_gate_cli_survey", GATE_PY)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    world = cli._resolve_world_dir()
+    assert world is not None and world.is_dir(), (
+        f"world dir did not resolve via the production path: {world!r}")
+    return world
+
+
+@pytest.mark.parametrize("token", sorted(_SURVEY_20260831))
+def test_survey_token_does_not_falsely_block(token):
+    """Each demoted token, in ordinary English prose naming no capability."""
+    fp_text = _SURVEY_20260831[token][0]
+    _, d = _run_gate(fp_text)
+    assert not d.get("would_block"), (
+        f"generic name part {token!r} wrongly blocked a capability-free defer; "
+        f"matches={d.get('matches')} keywords={d.get('keywords_extracted')}"
+    )
+
+
+@pytest.mark.parametrize("token", sorted(_SURVEY_20260831))
+def test_survey_token_recall_control(token):
+    """guard-958: a GENUINE reference must still match, with the demoted token
+    LOAD-BEARING on the right skill.
+
+    Asserting only `would_block` would be the multi-keyword happy path this
+    file's docstring warns MASKS recall loss — measured while writing this:
+    "decode the email body" blocks via `email` on access-email, which says
+    nothing about whether demoting `body` cost anything. So the assertion is
+    that the target skill matched AND the demoted token is among ITS matched
+    keywords, alongside >=1 other token (the >=2-hit path this predicate never
+    reaches).
+    """
+    _, skill, genuine = _SURVEY_20260831[token]
+    m = _load_module()
+    world = _production_world()
+    res = m.evaluate(genuine, intended_participants="user", world_dir=world,
+                     skills_dir=pathlib.Path(".claude/skills"))
+    hit = [x for x in (res.get("matches") or [])
+           if x.get("skill") == skill and token in (x.get("all_matched_keywords") or [])]
+    assert hit, (
+        f"recall lost: genuine reference {genuine!r} no longer matches {skill!r} "
+        f"with {token!r} load-bearing; matches="
+        f"{[(x.get('skill'), x.get('all_matched_keywords')) for x in (res.get('matches') or [])[:5]]}"
+    )
+    assert len(hit[0]["all_matched_keywords"]) >= 2, (
+        f"{token!r} is a SOLE-token match on {skill!r} — the demotion would kill "
+        f"it; a genuine reference must carry >=2 tokens: {hit[0]['all_matched_keywords']}"
+    )
+
+
+def test_survey_demotion_is_load_bearing():
+    """Mutation sensitivity for the  slice (guard-4166): emptying
+    _GENERIC_NAME_PARTS must reproduce EVERY one of the eight FPs, while every
+    recall control stays put. Naming the recall controls here is the half that
+    makes the proof mean something — a mutation that flipped them too would show
+    the same RED and prove nothing."""
+    m = _load_module()
+    world = _production_world()
+    skills = pathlib.Path(".claude/skills")
+
+    def blocks(text):
+        return bool(m.evaluate(text, intended_participants="user",
+                               world_dir=world, skills_dir=skills).get("would_block"))
+
+    for tok, (fp, _skill, genuine) in sorted(_SURVEY_20260831.items()):
+        assert not blocks(fp), f"{tok}: FP blocks with the fix in place"
+        assert blocks(genuine), f"{tok}: recall control does not block with the fix in place"
+
+    saved = m._GENERIC_NAME_PARTS
+    try:
+        m._GENERIC_NAME_PARTS = frozenset()
+        for tok, (fp, _skill, genuine) in sorted(_SURVEY_20260831.items()):
+            assert blocks(fp), (
+                f"reverting the fix did not reproduce the {tok!r} FP — the test "
+                f"is not pinning what it claims to pin")
+            assert blocks(genuine), (
+                f"{tok!r} recall control FLIPPED under the mutation; it is "
+                f"tracking the fix rather than controlling for it")
     finally:
         m._GENERIC_NAME_PARTS = saved

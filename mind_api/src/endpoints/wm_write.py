@@ -162,7 +162,12 @@ CADENCE_TRACKER_PATTERNS = (
 # watermark exists BECAUSE consumption destroys the live dedup basis, so a
 # watermark that is itself wiped restores the original bug while looking fixed.
 RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capture",
-                         "hyp_capture", "encoding_capture", "capture_consumed_hashes"}
+                         "hyp_capture", "encoding_capture", "capture_consumed_hashes",
+                         # : a pinned user-interrupt task is a STANDING HUMAN
+                         # OBLIGATION, not session bookkeeping. THIS copy is the live
+                         # runtime path (POST /v1/wm/reset), so a wm.py-only edit would
+                         # leave the pin droppable by the reset that actually runs.
+                         "interrupt_task_open"}
 
 #  — mirror of wm.py. Ordered tuple, deliberately NOT ARRAY_SLOTS: that
 # set contains non-capture members, so it is the wrong thing to iterate when the

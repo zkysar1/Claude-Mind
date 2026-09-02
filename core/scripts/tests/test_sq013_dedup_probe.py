@@ -264,3 +264,64 @@ def test_rare_token_owner_is_cited_over_the_generic_decoy():
     assert r["decision"] == "DECLINE", r
     assert r["cited_goal_id"] == "g-326-711", r
     assert "picknearbyplayer" in r["matches"][0]["rare_tokens"], r["matches"][0]
+
+
+# ── LENGTH NORMALISATION () ────────────────────────────────────────
+# The corpus above is length-UNIFORM by construction, so it cannot reach the
+# defect these tests pin: on the live 2,883-goal queue the median blob is 127
+# unique tokens and the largest is 1,544, and `weight` is an unnormalised SUM
+# over the overlap. A record 12x the median therefore wins on SIZE -- it has
+# more tokens, so more chances to overlap the subject AND more chances to hold
+# some rare token by coincidence. Measured live: a merge-wedge relay was
+# DECLINED citing  (1,107 tokens, an unrelated sweep goal) on the lone
+# coincidental token `granularity`, while the genuine owner  (147
+# tokens, sharing `ayoai-journal-md` df=2 and `same-heading` df=10) ranked below
+# it. Same class as the generic-decoy false positive above, one axis over:
+# there the decoy won on COUNT, here the sponge wins on LENGTH.
+
+def _sponge_record():
+    """A record that qualifies on LENGTH ALONE.
+
+    It contains every token of RELAY -- which is what a 71,504-char description
+    does in practice, it mentions everything -- plus 900 distinct filler tokens
+    nothing else shares. So it overlaps the subject maximally while being about
+    nothing in particular, exactly the live shape.
+    """
+    filler = " ".join("fillertoken%04d" % i for i in range(900))
+    return {
+        "id": "g-999-SPONGE",
+        "status": "pending",
+        "title": "Sponge record that mentions everything",
+        "description": RELAY + " " + filler,
+    }
+
+
+def test_sponge_does_not_outrank_the_genuine_owner():
+    """THE ASSERTION UNDER TEST. A record whose only claim is length must not
+    take the citation away from the goal that actually owns the work."""
+    r = sq.decide(RELAY, _big_corpus() + [_sponge_record()], NOW, SESSION_START)
+    assert r["decision"] == "DECLINE", r
+    assert r["cited_goal_id"] == "g-326-711", (
+        "the sponge took the citation from the true owner: %s" % r["cited_goal_id"])
+
+
+def test_sponge_test_is_not_green_by_default(monkeypatch):
+    """MUTATION PROOF (guard-2903). Setting b=0 disables length normalisation
+    and nothing else; the sponge must then WIN, or the test above is passing for
+    some reason other than the fix it exists to pin."""
+    monkeypatch.setattr(sq, "LENGTH_NORM_B", 0.0)
+    r = sq.decide(RELAY, _big_corpus() + [_sponge_record()], NOW, SESSION_START)
+    assert r["cited_goal_id"] == "g-999-SPONGE", (
+        "with normalisation OFF the sponge should win; it did not, so the "
+        "fixture no longer reproduces the defect: %s" % r["cited_goal_id"])
+
+
+def test_length_norm_is_unity_at_average_length():
+    """WHY BM25 AND NOT sqrt/log: the factor is exactly 1.0 at |D| == avgdl, so
+    an average-length record scores as it always did and the calibrated
+    WEIGHT_THRESHOLD keeps its meaning. sqrt/log rescale every record and would
+    move that boundary silently -- which g-115-8036 explicitly warned against."""
+    assert sq._length_norm(157.0, 157.0) == 1.0
+    assert sq._length_norm(1570.0, 157.0) > 1.0     # sponge is penalised
+    assert sq._length_norm(15.0, 157.0) < 1.0       # short record is favoured
+    assert sq._length_norm(100.0, 0) == 1.0         # empty corpus fails open

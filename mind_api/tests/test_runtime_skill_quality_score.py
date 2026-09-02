@@ -55,6 +55,22 @@ def _setup(tmp_path, name="x"):
     return meta, world, agent
 
 
+def _cli_judge_provenance():
+    """What the CLI chain will stamp for judge provenance ().
+
+    skill-quality-score.py subprocesses skill-evaluate.py, which resolves from
+    its own environment; _run_cli passes a copy of THIS process's environment,
+    so running the same resolver here yields the same pair.
+    """
+    import importlib.util
+    path = REPO_ROOT / "core" / "scripts" / "skill-evaluate.py"
+    spec = importlib.util.spec_from_file_location("skill_evaluate_cli_judge",
+                                                  path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._judge_provenance(*mod._judge_from_env())
+
+
 def _run_cli(meta, world, agent, args, check_rc=True):
     env = dict(os.environ)
     env["MIND_META"] = str(meta)
@@ -191,9 +207,16 @@ class TestByteCompat:
                 "--episode-chain-count", "0", "--guardrail-violations", "0",
                 "--cost-awareness", "good"]
         cli_out = _run_cli(cli_meta, cli_world, cli_agent, args).stdout
+        # Judge provenance reaches each side by a different transport
+        # (): the CLI chain subprocesses skill-evaluate.py, which runs
+        # in the judge's own process and resolves from its environment; the
+        # daemon is long-lived and must be told, in the body. Feed it the same
+        # input so this compares bytes rather than transports (guard-1189).
+        judge_model, harness = _cli_judge_provenance()
         body = {"skill": "tq-skill", "goal": "g-9-1", "outcomes_met": 3,
                 "outcomes_total": 3, "episode_chain_count": 0,
-                "guardrail_violations": 0, "cost_awareness": "good"}
+                "guardrail_violations": 0, "cost_awareness": "good",
+                "judge_model": judge_model, "harness": harness}
         resp = skill_quality_score.score(
             _FakeCtx(dmn_meta, dmn_world, dmn_agent, body=json.dumps(body).encode("utf-8")))
         assert resp.status == 200

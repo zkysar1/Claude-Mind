@@ -79,6 +79,42 @@ def resolve_bash() -> str:
 BASH = resolve_bash()
 
 
+# --- win32 argv-corruption guard (, guard-5633) -------------------
+# On Windows the MSYS runtime re-processes the raw command line (quote handling
+# plus glob/brace expansion) before handing argv to the program. Python's
+# subprocess.list2cmdline only wraps an argument in quotes when it contains
+# WHITESPACE, so a whitespace-free argument carrying quotes or braces reaches
+# that re-processing unprotected and is silently altered.
+#
+# Two distinct failure modes, both measured 2026-08-31 with an argv-echo script:
+#   quotes  -> argv TRUNCATION. '{"title":"probe"}' collapsed argc to 1-2 and
+#              EVERY FOLLOWING ARGUMENT WAS LOST.
+#   braces  -> value MANGLING, argc usually preserved: '{a:b}' arrives as
+#              'a:b', 'a{b}c' as 'abc'; and '{a,b}' brace-EXPANDS into TWO
+#              arguments, so argc GROWS.
+#
+# What makes this worth refusing rather than logging: the program then reports
+# a DIFFERENT argument as missing than the one that was corrupted (observed:
+# "ERROR: Missing --reason" when --inject-goal was the mangled flag), and the
+# same command run by hand succeeds because an interactive shell quotes for
+# itself. Hand-works/harness-fails plus a wrong-flag error is the fingerprint,
+# and it cost a full investigation before the mechanism was found.
+#
+# Predicate measured over 25 shapes: 0 false positives, 0 false negatives.
+# Whitespace is protective for BOTH classes (Python quotes those), so it is
+# checked first. Backslash, backtick, $VAR, ; | & ( ) > and a non-matching *
+# all survive unquoted and are deliberately NOT flagged -- flagging them would
+# be the over-broad predicate guard-2860 warns against.
+_WIN_ARG_UNSAFE = "\"'{}"
+
+
+def _win_arg_corrupts(value: str) -> bool:
+    """True when Windows will silently alter this argument in transit."""
+    if any(ch.isspace() for ch in value):
+        return False  # list2cmdline quotes it; measured safe for both classes
+    return any(ch in value for ch in _WIN_ARG_UNSAFE)
+
+
 def bash_cmd(script, *args) -> "list[str]":
     """Build a ``subprocess.run`` argv that invokes a ``.sh`` wrapper safely.
 
@@ -88,7 +124,46 @@ def bash_cmd(script, *args) -> "list[str]":
     introducers and strips, silently producing a nonexistent path). Extra args
     are stringified and appended verbatim.
 
+    On win32 ONLY, raises ``ValueError`` for an argument Windows would corrupt
+    in transit (see the guard above). This is a no-op on Linux/macOS, where the
+    argv list is delivered to execve untouched. The script path itself is not
+    checked — ``as_posix()`` output is the established contract (guard-581).
+
     The caller keeps its own ``subprocess.run`` kwargs (``capture_output``,
     ``text``, ``input``, ``cwd``, ``env``, ``timeout``, …).
     """
-    return [BASH, Path(script).as_posix(), *(str(a) for a in args)]
+    argv = [str(a) for a in args]
+    if sys.platform == "win32" and not os.environ.get("MIND_BASH_ALLOW_UNSAFE_ARGS"):
+        for i, value in enumerate(argv):
+            if not _win_arg_corrupts(value):
+                continue
+            bad = "".join(sorted({c for c in value if c in _WIN_ARG_UNSAFE}))
+            shown = value if len(value) <= 120 else value[:117] + "..."
+            mode = ("TRUNCATE argv — this and EVERY FOLLOWING argument are lost"
+                    if ('"' in value or "'" in value)
+                    else "MANGLE this value (braces are stripped; {a,b} expands into extra args)")
+            raise ValueError(
+                "bash_cmd: argument %d would be silently corrupted by Windows and "
+                "was REFUSED rather than passed.\n"
+                "  argument : %r\n"
+                "  offending: %s   (quote/brace characters, with no whitespace in the value)\n"
+                "  effect   : Windows would %s\n"
+                "\n"
+                "  WHY YOU ARE SEEING THIS RATHER THAN A CONFUSING ERROR LATER:\n"
+                "    Unrefused, the program receives different arguments than you passed and\n"
+                "    blames the WRONG ONE — e.g. reporting a missing --reason when a JSON\n"
+                "    --flag value was the corrupted argument. The same command run by hand\n"
+                "    works, because an interactive shell quotes for itself.\n"
+                "\n"
+                "  FIX (in preference order):\n"
+                "    1. Pass the payload on STDIN — subprocess.run(..., input=payload).\n"
+                "       This is already the house convention for JSON (guard-2037).\n"
+                "    2. Write it to a temp file and pass the PATH.\n"
+                "    3. If the value is genuinely meant to be shell-expanded, set\n"
+                "       MIND_BASH_ALLOW_UNSAFE_ARGS=1 to accept the corruption knowingly.\n"
+                "\n"
+                "  Do NOT 'fix' this by adding a space to the value — that changes the data.\n"
+                "  Detail: guard-5633, g-115-8409."
+                % (i + 1, shown, bad, mode)
+            )
+    return [BASH, Path(script).as_posix(), *argv]

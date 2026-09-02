@@ -533,8 +533,13 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
 
     if notes.strip():
         L.append("## Notes from the agent")
-        for line in notes.strip().splitlines()[:12]:
+        _note_lines = notes.strip().splitlines()
+        for line in _note_lines[:_NOTES_MAX_LINES]:
             L.append(line.rstrip())
+        _dropped = len(_note_lines) - _NOTES_MAX_LINES
+        if _dropped > 0:
+            L.append(f"[... {_dropped} more line(s) TRUNCATED — full text in "
+                     f"agents/{agent}/COMPLETION-REPORT.md]")
         L.append("")
 
     L.append("---")
@@ -549,6 +554,14 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
 # --------------------------------------------------------------------------
 
 import html as _html  # noqa: E402
+
+# Max operator-note lines rendered in the digest. The notes block is the ONLY
+# free-text agent->principal channel, and truncation deletes the TAIL, where
+# authors put the newest/most urgent item (: a production email
+# announced "TWO DEADLINES NEED YOU", delivered one, and ended mid-word).
+# Raising the cap alone is NOT the fix -- an unannounced cut is the defect
+# (guard-3976, guard-3698), so both renderers below MUST emit the marker.
+_NOTES_MAX_LINES = 40
 
 
 def _e(x) -> str:
@@ -771,8 +784,15 @@ def render_html(data: dict, *, agent: str, since: datetime | None, now: datetime
 
     # ---- notes
     if notes.strip():
-        lines = notes.strip().splitlines()[:12]
-        out.append(_card(f"Notes from {agent}", "".join(f'<p style="margin:0 0 4px;font-size:13px">{_e(l)}</p>' for l in lines), "#6c757d", "#fafafa"))
+        _note_lines = notes.strip().splitlines()
+        lines = _note_lines[:_NOTES_MAX_LINES]
+        _dropped = len(_note_lines) - len(lines)
+        _body = "".join(f'<p style="margin:0 0 4px;font-size:13px">{_e(l)}</p>' for l in lines)
+        if _dropped > 0:
+            _body += (f'<p style="margin:6px 0 0;font-size:12px;color:#b00020">'
+                      f'[... {_dropped} more line(s) TRUNCATED — full text in '
+                      f'agents/{_e(agent)}/COMPLETION-REPORT.md]</p>')
+        out.append(_card(f"Notes from {agent}", _body, "#6c757d", "#fafafa"))
 
     out.append("</div>")  # padding
     out.append('<div style="padding:12px 22px;background:#f8f9fa;border-top:1px solid #eee;font-size:12px;color:#999">'

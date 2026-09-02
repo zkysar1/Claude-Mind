@@ -140,6 +140,23 @@ LANES = (
         },
     },
     {
+        "name": "directive-mix-check",
+        "phase": "0.5b.1d",
+        "meter_name": "directive-mix-check",
+        "script": "directive-mix-check.sh",
+        # Read-only lane: it computes a mix and reports it. --apply is accepted
+        # by the script for battery uniformity but changes nothing, so there is
+        # no reason to pass it.
+        "apply_flag": False,
+        # Reports health as a POSITIVE flag, same idiom as
+        # user-blocker-escalation-check above: the finding is
+        # on_directive_ok == False. A COUNT would be exactly wrong here --
+        # closes_on_directive reads healthiest at zero. (_findings_for only
+        # consults lane["finds"], so a bespoke key would be silently ignored
+        # and the lane would have a name but never report: guard-3531.)
+        "finds": {"counts": (), "lists": (), "false": ("on_directive_ok",)},
+    },
+    {
         "name": "handoff-aging-check",
         "phase": "0.5b.2b",
         "meter_name": "handoff-aging-check",

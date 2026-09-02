@@ -2829,6 +2829,162 @@ def _override_scope(failing_checks: list, justification: str) -> dict:
             "unnamed_matches": uniq, "blocks": bool(uniq)}
 
 
+# ── Refusal remedy () ──────────────────────────────────────────────
+# guard-1470 carries times_active in the THOUSANDS and the behaviour still
+# drifts, because the guidance never reaches the moment of use: that moment is
+# reading THIS refusal, and the refusal used to offer "retitle or retry with
+# --override-duplication" as two EQUAL options. It stated no priority, cited no
+# guardrail, and — worst — invited a retitle past a TRUE positive, since
+# trimming defeats a real overlap exactly as easily as a false one.
+#
+# So the remedy is stated HERE, in priority order, derived from the signals the
+# gate has ALREADY computed. Same move as : when well-indexed
+# knowledge repeatedly fails to reach the decision, put it AT the chokepoint.
+#
+# WHY evaluate() AND NOT THE CALLERS: the daemon's goal-add and aspiration-add
+# handlers both return `gate_output: dup_result` VERBATIM, and the CLI prints
+# the same dict. One insertion here reaches every surface; four insertions
+# would drift (communication-clarity rule 5).
+#
+# GUARD-2030 BOUNDS WHAT THIS MAY CLAIM. A prescribed classification is a
+# prescribed PROBE, and a bad probe "hands you a wrong ANSWER that you then
+# decide on ... it fails toward a FALSE BLOCK". So this classifies ONLY from
+# fields the emitters actually write (match_strategy, file_path_hits,
+# keyword_hits, strong_keyword_only — verified present on live matches), and
+# reports `unclassified` rather than guessing. It never invents a discriminator
+# and never speaks with more confidence than the signals carry.
+
+_STRONG_STRATEGIES = frozenset({
+    "target_state", "structural_overlap", "title_exact",
+    "origin_signal", "origin_signal_completed",
+})
+_GOAL_ID_HIT_RE = re.compile(r"\bg-\d{2,4}-\d{1,4}\b")
+
+# The one caveat no signal can settle, so it is stated on every shape.
+_VERIFICATION_PATH_CAVEAT = (
+    "Before acting, check WHERE in this goal the colliding path appears: if it "
+    "entered through a VERIFICATION instruction or a 'run X to check' clause "
+    "rather than the goal's scope, neither trimming nor an override is right — "
+    "reword that clause to name the tool without its path and refile "
+    "(guard-1470 fourth case). A path in a verification instruction reads "
+    "identically to a path in scope, so this is invisible from this output."
+)
+
+
+def _refusal_remedy(failing: list) -> dict:
+    """Priority-ordered remedy for a blocking refusal, per guard-1470.
+
+    Pure: reads only the failing checks' already-computed match fields.
+    Never raises — evaluate() calls this on the critical path of every filing.
+    """
+    matches = []
+    for c in failing:
+        matches.extend(c.get("matches") or [])
+
+    strategies = sorted({m.get("match_strategy") for m in matches
+                         if m.get("match_strategy")})
+    paths = [p for m in matches for p in (m.get("file_path_hits") or [])]
+    qualified = sorted({p for p in paths if "/" in p})
+    basenames = sorted({p for p in paths if "/" not in p})
+    kw = [str(k) for m in matches for k in (m.get("keyword_hits") or [])]
+    goal_id_hits = sorted({k for k in kw if _GOAL_ID_HIT_RE.search(k)})
+    matched_ids = sorted({m.get("goal_id") for m in matches if m.get("goal_id")})
+
+    strong_strategy = sorted(set(strategies) & _STRONG_STRATEGIES)
+    identifier_signal = bool(strong_strategy or qualified or goal_id_hits)
+
+    if identifier_signal:
+        shape = "identifier-overlap"
+        why = ("identifier-strength signals present ("
+               + "; ".join(filter(None, [
+                   "match_strategy=" + ", ".join(strong_strategy) if strong_strategy else "",
+                   "qualified path(s)=" + ", ".join(qualified[:3]) if qualified else "",
+                   "goal-id hit(s)=" + ", ".join(goal_id_hits[:3]) if goal_id_hits else "",
+               ])) + ")")
+        first_action = (
+            "STOP and READ the matched goal(s)"
+            + (" — " + ", ".join(matched_ids[:5]) if matched_ids else "")
+            + ". This is the TRUE-POSITIVE shape: the gate is reporting a REAL "
+            "overlap and a refusal is evidence about the CLAIM, not an obstacle "
+            "between you and the write. Do NOT trim and do NOT override before "
+            "reading — trimming defeats a true positive exactly as easily as a "
+            "false one (guard-1470 inverse test)."
+        )
+        override_guidance = (
+            "Override only AFTER reading the match and finding it genuinely "
+            "distinct, and name that match in the justification "
+            "(an override clears the matches it NAMES, not the whole gate)."
+        )
+    elif basenames and not qualified:
+        shape = "basename-only"
+        why = ("the only path hit(s) are bare basenames with no directory "
+               "component: " + ", ".join(basenames[:3]))
+        first_action = (
+            "Treat this as PROSE-strength, NOT identifier-strength — a bare "
+            "basename is shared by hundreds of files, so the path co-signal is "
+            "weak (guard-1470 basename qualifier). Still READ the match "
+            + (", ".join(matched_ids[:5]) + " " if matched_ids else "")
+            + "(cheap, and it has paid off), but expect a false positive. Do "
+            "NOT trim here: a colliding basename is usually this goal's own core "
+            "artifact identifier, so trimming either cannot remove it or "
+            "destroys what the goal is about."
+        )
+        override_guidance = (
+            "A justified --override-duplication is appropriate once you have "
+            "read the match; do not let the basename co-signal alone talk you "
+            "out of it."
+        )
+    elif matches:
+        shape = "prose-overlap"
+        why = ("no identifier-strength signal — no qualified file path, no "
+               "goal-id hit, no target_state/structural/exact strategy"
+               + ("; keyword hits are prose: " + ", ".join(kw[:5]) if kw else ""))
+        first_action = (
+            "FIRST trim the description to its essentials and refile. This is "
+            "the prose-keyword false-positive shape: a long technical "
+            "description inflates the match surface and collides on generic "
+            "English with semantically unrelated goals. Move the full evidence "
+            "to a briefing or journal artifact and link it from the "
+            "description. Trimming preserves the gate and usually passes on the "
+            "first refile (guard-1470)."
+        )
+        override_guidance = (
+            "Reach for --override-duplication only if trimming would lose "
+            "diagnostic content. The override is AUDITED to "
+            "world/goal-duplication-overrides.jsonl and erodes the gate for "
+            "every future filing — it is the fallback, not the peer of trimming."
+        )
+    else:
+        shape = "unclassified"
+        why = ("the failing check(s) carry no matches[] to classify from: "
+               + ", ".join(c.get("name", "?") for c in failing))
+        first_action = (
+            "Classify by hand before acting: read the failing check's reason and "
+            "decide whether it reports a real overlap (read the match) or a "
+            "prose collision (trim and refile). guard-1470 carries the test."
+        )
+        override_guidance = (
+            "Do not override on an unclassified refusal without stating which "
+            "shape you concluded and why."
+        )
+
+    return {
+        "shape": shape,
+        "why": why,
+        "first_action": first_action,
+        "override_guidance": override_guidance,
+        "verification_path_caveat": _VERIFICATION_PATH_CAVEAT,
+        "cites": "guard-1470",
+        "signals": {
+            "match_strategies": strategies,
+            "qualified_paths": qualified,
+            "basename_only_paths": basenames,
+            "goal_id_hits": goal_id_hits,
+            "matched_goal_ids": matched_ids,
+        },
+    }
+
+
 def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
              agent_name: str = "", world_dir: Optional[Path] = None,
              project_root: Optional[Path] = None) -> dict:
@@ -2906,6 +3062,24 @@ def evaluate(goal: dict, *, override_duplication: Optional[str] = None,
             "the unnamed match: if it is a genuine duplicate, do not file. If "
             "it is another false positive, name it too."
         )
+
+    # : state the remedy AT the refusal, in priority order. Fail-open
+    # on ANY error — a gate on the critical path of every filing must never
+    # refuse work because its own guidance builder raised (the 
+    # precedent immediately above).
+    if would_block:
+        try:
+            result["remedy"] = _refusal_remedy(failing)
+        except Exception:
+            result["remedy"] = None
+        _rem = result.get("remedy")
+        if _rem:
+            result["reason"] = (
+                result["reason"]
+                + " REMEDY [" + _rem["shape"] + ", per guard-1470 — "
+                + _rem["why"] + "]: " + _rem["first_action"] + " "
+                + _rem["override_guidance"]
+            )
 
     # description_quality_warning — informational only, never flips
     # would_block. Recurring goals exempt (title-as-spec by design).

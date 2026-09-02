@@ -437,6 +437,9 @@ def status_keyed_control(goals, registry, self_env, roster):
         if not token:
             continue
         verdict, _ = classify_agent_name(token.lower(), registry, self_env, roster)
-        if verdict in ("peer", "ambiguous") and str(g.get("status") or "") == "pending":
+        # +candidate — §11b/ (world/conventions/goal-intake-management.md).
+        # Note :112 above is a terminal DENY-list and is safe untouched; only this
+        # relay-lane ALLOWLIST was the invisible half of row 6.
+        if verdict in ("peer", "ambiguous") and str(g.get("status") or "") in ("pending", "candidate"):
             n += 1
     return n

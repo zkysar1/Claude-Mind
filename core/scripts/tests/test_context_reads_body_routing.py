@@ -248,5 +248,91 @@ def test_clear_cannot_resolve_a_tracker_without_an_agent_in_env():
         assert not body.exists(), "agent-supplied clear must delete the body tracker"
 
 
+# ---------------------------------------------------------------------------
+# : `invalidate` must route on --session-id like every other subcommand.
+#
+# It did not. cmd_invalidate called remove_from_tracker(normalized) with no
+# session_id, and its subparser defined no --session-id at all -- it was the only
+# subcommand in that group without one. So invalidation ALWAYS targeted the
+# agent-wide session/context-reads.txt while READS were routed per-Body (Phase 1D
+# above). In a forked Body, editing a tracked file therefore did NOT clear it: the
+# stale entry survived the edit, `gate` kept BLOCKING re-reads of a file that HAD
+# CHANGED, and `check-file` stayed silent for it. That is the false-all-clear
+# direction -- invalidation exists precisely so a mid-session edit re-arms the
+# advisory.
+#
+# Structurally identical to the `clear` defect above (): the same
+# tracker_path(None) shape, one subcommand over. Latent until a 2nd Body forks
+# (with one Body the routing collapses), and silent when it arms.
+#
+# TARGET CHOICE IS LOAD-BEARING: these use a TRACKED_FILES path
+# (aspirations-compact.json), not the in-scope SKILL.md the record tests use.
+# cmd_invalidate acts ONLY on TRACKED_FILES and tree nodes, so invalidating
+# SKILL.md returns 0 without touching anything -- a test built on it would pass
+# while exercising nothing.
+# ---------------------------------------------------------------------------
+
+def _tracked_target(adir):
+    """A TRACKED_FILES path that cmd_invalidate actually acts on."""
+    p = adir / "session" / "aspirations-compact.json"
+    p.write_text("{}\n", encoding="utf-8")
+    return p
+
+
+def _invalidate(env, file_path, sid=None):
+    cmd = [sys.executable, str(CR_PY), "invalidate"]
+    if sid is not None:
+        cmd += ["--session-id", sid]
+    cmd += [str(file_path)]
+    return subprocess.run(cmd, capture_output=True, text=True, env=env,
+                          cwd=str(PROJECT_ROOT), timeout=30)
+
+
+def test_invalidate_with_session_id_clears_the_body_tracker():
+    with _agent(fork_sids=[SID_A]) as (env, adir):
+        target = _tracked_target(adir)
+        assert _record(env, SID_A, target).returncode == 0
+        body = adir / "sessions" / SID_A / "body-context-reads.txt"
+        assert _norm(target) in body.read_text(encoding="utf-8"), (
+            "precondition: the record must land in the BODY tracker")
+
+        r = _invalidate(env, target, SID_A)
+        assert r.returncode == 0, r.stderr
+        assert _norm(target) not in body.read_text(encoding="utf-8"), (
+            "a session-scoped invalidate must clear the BODY tracker")
+
+
+def test_invalidate_without_session_id_leaves_the_body_tracker_stale():
+    # The defect's exact shape, pinned so the flag cannot be quietly dropped
+    # again. With no --session-id the invalidation resolves to the agent-wide
+    # file -- which a forked Body's gate never reads -- and exits 0 looking
+    # entirely successful. That asymmetry is why the flag is load-bearing.
+    with _agent(fork_sids=[SID_A]) as (env, adir):
+        target = _tracked_target(adir)
+        assert _record(env, SID_A, target).returncode == 0
+        body = adir / "sessions" / SID_A / "body-context-reads.txt"
+
+        r = _invalidate(env, target)          # no --session-id
+        assert r.returncode == 0, r.stderr
+        assert _norm(target) in body.read_text(encoding="utf-8"), (
+            "an unrouted invalidate must not reach a Body tracker; if this ever "
+            "fails, routing has silently become unconditional")
+
+
+def test_invalidate_without_a_fork_still_clears_agent_wide():
+    # The collapsed-routing path (one Body), pinned so the fix cannot regress the
+    # single-Body case -- which is every session until a 2nd Body forks, i.e. the
+    # only case anyone would notice breaking.
+    with _agent() as (env, adir):
+        target = _tracked_target(adir)
+        assert _record(env, SID_A, target).returncode == 0
+        agent_wide = adir / "session" / "context-reads.txt"
+        assert _norm(target) in agent_wide.read_text(encoding="utf-8"), "precondition"
+
+        assert _invalidate(env, target, SID_A).returncode == 0
+        assert _norm(target) not in agent_wide.read_text(encoding="utf-8"), (
+            "with no forked Body, --session-id must collapse to the agent-wide tracker")
+
+
 if __name__ == "__main__":
     sys.exit(__import__("pytest").main([__file__, "-q"]))

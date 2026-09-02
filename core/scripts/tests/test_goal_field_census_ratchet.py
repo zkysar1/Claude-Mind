@@ -59,6 +59,40 @@ def test_stray_count_is_recorded_as_reported_but_not_ratcheted():
     assert "stray_occurrences" in _SRC
 
 
+def test_the_strays_are_reported_by_NAME_not_only_by_COUNT():
+    """`strays` (name -> count) was built in _census and thrown away, so every
+    consumer learned "17 stray field name(s)" and had no way to discover which.
+    Reporting is this metric's whole job — it is deliberately not gated — so a
+    count without identities makes it unactionable. Measured 2026-08-30: naming
+    them surfaced camelCase leaks (desiredEndState, lastAchieved, scheduleType),
+    a kebab-case leak (complete-by), and two test artifacts (__noop, _probe)
+    sitting in the production store, none of which the count could reveal.
+    """
+    assert '"strays": dict(sorted(' in _SRC, "the names must reach the payload"
+    # The text lane must name them too — --json alone leaves the default
+    # invocation as uninformative as before.
+    assert "stray fields: " in _SRC
+    # And it must not silently truncate: a capped list has to say so (guard-1760).
+    assert "and {len(current['strays']) - len(shown)} more" in _SRC
+
+
+def test_stray_names_and_counts_stay_internally_consistent():
+    """A self-check the census can always make about itself: the number of names
+    must equal len(strays), and their counts must sum to stray_occurrences. If a
+    future refactor emits a filtered or capped dict into the payload, these two
+    stop agreeing and the report becomes quietly wrong rather than loudly so."""
+    strays = {"b": 3, "a": 3, "c": 1}
+    payload = {
+        "stray_names": len(strays),
+        "stray_occurrences": sum(strays.values()),
+        "strays": dict(sorted(strays.items(), key=lambda kv: (-kv[1], kv[0]))),
+    }
+    assert len(payload["strays"]) == payload["stray_names"]
+    assert sum(payload["strays"].values()) == payload["stray_occurrences"]
+    # Ties break by name, so successive runs stay diffable.
+    assert list(payload["strays"]) == ["a", "b", "c"]
+
+
 def test_a_zero_population_is_refused_rather_than_seeding_a_baseline_of_zero():
     """rb-245: an empty result means the query broke, not that the fleet is empty.
 

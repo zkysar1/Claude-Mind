@@ -58,7 +58,12 @@ if [ -f "$LOG" ]; then
     if [ -n "$LAST_BLOCK" ]; then
         BLOCK_TS="${LAST_BLOCK%% *}"
         # date -d isn't reliable across MSYS / WSL / GNU date — route through python.
-        BLOCK_EPOCH="$(py -3 -c "
+        # python3, not the Windows-only `py` launcher: on a Linux box `py` is
+        # absent, the capture came back EMPTY and the parse-failed branch below
+        # declared "alive" on every call — a probe that never measured anything
+        # ( hardening; this script sources _paths.sh, so python3 is the
+        # sanctioned form).
+        BLOCK_EPOCH="$(python3 -c "
 import sys, datetime
 try:
     print(int(datetime.datetime.strptime(sys.argv[1], '%Y-%m-%dT%H:%M:%S').timestamp()))
@@ -90,7 +95,7 @@ DIARY_AGE="-1"
 if [ -f "$DIARY" ]; then
     # Cross-platform mtime: stat -c %Y on GNU, stat -f %m on BSD/macOS.
     # Route through python for portability with the BLOCK_EPOCH path.
-    DIARY_EPOCH="$(py -3 -c "
+    DIARY_EPOCH="$(python3 -c "
 import os, sys
 try:
     print(int(os.path.getmtime(sys.argv[1])))

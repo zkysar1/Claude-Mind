@@ -1124,6 +1124,17 @@ open_ended_progress:
 # All values are read by goal-selector.py at scoring time.
 
 recurring:
+  # Un-strandable recurring goals (, 2026-09-01). Archiving an aspiration
+  # that still carries recurring=true goals must RE-HOME them into a live
+  # container (or refuse the archive): the selector never reads the archive and
+  # every cadence instrument is scoped away from it, so an archived recurring
+  # goal is undetectably dead. `rehome_container` names the live aspiration that
+  # adopts them; null = auto-detect (the live aspiration flagged
+  # `recurring_home: true`, else the live ACTIVE aspiration holding the most
+  # recurring goals). An explicit `rehome_target` query/flag on the archiving
+  # call always wins. No live container => the archive is REFUSED
+  # (recurring_rehome_target_missing), even under force=true.
+  rehome_container: null
   urgency_base: 1.5              # Base score when a recurring goal becomes due
   urgency_log_scale: 1.5         # Multiplier for log2(1 + overdue_ratio)
   urgency_max: 4.0               # Cap on log-scaled urgency raw (g-115-1090, zeta-1477).

@@ -967,3 +967,56 @@ def test_bare_remainder_branch_stays_retired():
     mod = _import_sweep()
     assert r"\b[Rr]emainder\b" not in mod.SUCCESSOR_MARKER_PATTERN.pattern
     assert r"[Rr]emainder of (?:the parent|g-\d)" in mod.SUCCESSOR_MARKER_PATTERN.pattern
+
+
+# ──  / guard-5708 — the cadence predicate is population-scoped ──────
+#
+# MEASURED 2026-08-31/09-01 (alpha, cc-04): 's close returned HTTP 500
+# while the write LANDED, so every failed retry advanced `lastAchievedAt`
+# (achievedCount 66 -> 72). Two successive Unblock goals filed to investigate
+# that exact defect were auto-skipped here with "recurring cadence has resumed"
+# — the defect's own symptom read as evidence it had resolved. Neither was a
+# starvation Unblock and neither was asking whether the cadence had resumed.
+
+
+def test_starvation_unblock_gate_admits_both_emitted_forms():
+    """The gate must ADMIT the whole starvation population (guard-1802): a
+    predicate narrower than the detector that files these goals would silently
+    eject rows and report clean forever."""
+    mod = _import_sweep()
+    assert mod._is_starvation_unblock(
+        {"origin_signal": "unblock:recurring-starved-g-306-284"}) is True
+    assert mod._is_starvation_unblock(
+        {"origin_signal": "unblock:recurring-starved-alpha-g-306-284"}) is True
+    assert mod._is_starvation_unblock(
+        {"origin_signal": "  unblock:recurring-starved-g-306-284 "}) is True
+
+
+def test_non_starvation_unblock_is_excluded_from_cadence_predicate():
+    """Everything outside the starvation population is refused — including the
+    generic `unblock:<id>` shape, which parses as a parent link but was never
+    filed by the starvation detector."""
+    mod = _import_sweep()
+    assert mod._is_starvation_unblock({"origin_signal": "unblock:g-306-284"}) is False
+    assert mod._is_starvation_unblock({}) is False
+    assert mod._is_starvation_unblock({"origin_signal": None}) is False
+    assert mod._is_starvation_unblock(
+        {"origin_signal": "predecessor g-115-8485 auto-skipped by "
+                          "unblock-parent-status-sweep"}) is False
+
+
+def test_positive_control_pre_fix_path_still_resolves_the_killing_case():
+    """POSITIVE CONTROL (guard-2421). Without this, the two assertions above
+    would pass even if `_recurring_parent_resolved` had stopped resolving
+    anything at all — and the gate would look effective for the wrong reason.
+
+    Pins that the underlying predicate STILL returns True on the exact input
+    that skipped g-115-8485 and g-115-8501, so the behaviour change is
+    attributable to the population gate and to nothing else."""
+    import datetime
+    mod = _import_sweep()
+    fresh = (datetime.datetime.now()
+             - datetime.timedelta(hours=0.3)).strftime("%Y-%m-%dT%H:%M:%S")
+    resolved, why = mod._recurring_parent_resolved(7.8, fresh)
+    assert resolved is True
+    assert "recurring cadence has resumed" in why

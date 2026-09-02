@@ -69,9 +69,9 @@ caught up.
 For each candidate (process in returned order — already sorted by evidence asc,
 age desc, exposure desc):
 
-1. **Read the full record** — Bash: `bash core/scripts/guardrails-read.sh --active`
-   then jq/python filter for the id. Look at: full `rule` text, `trigger_condition`,
-   `source`, `category`, `tags`, `created`, all evidence counters.
+1. **Read the full record** — Bash: `bash core/scripts/guardrails-read.sh --id <candidate-id>`
+   Look at: full `rule` text, `trigger_condition`, `source`, `category`, `tags`,
+   `created`, all evidence counters.
 
 2. **Decide RETIRE | KEEP | REVISE | SKIP**:
 

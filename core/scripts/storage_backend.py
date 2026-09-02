@@ -270,6 +270,19 @@ class LocalBackend:
     #     release_lock it replaces. The lock_path = resource.with_suffix(".lock")
     #     derivation stays in _fileops's callers. A cloud backend maps the same
     #     lock_path onto a remote lock-table key. ----------------------------
+    @staticmethod
+    def _holder_id() -> str:
+        """Identity written into the lock file at acquire and compared at
+        release (g-115-8536). pid:native-thread-id distinguishes every real
+        contender topology — cross-process (script invocations) and
+        cross-thread (the daemon's request threads) — and is stable across a
+        single acquire→release span. Deliberately NOT a random token: one
+        thread cannot occupy two critical sections on the same path at once,
+        so pid:tid answers the release-ownership question unambiguously and
+        statelessly (no token map to leak or race)."""
+        import threading
+        return f"{os.getpid()}:{threading.get_native_id()}"
+
     def acquire_lock(self, lock_path: PathLike, timeout: int = 10,
                      stale_seconds: int = 30) -> None:
         lock_path = Path(lock_path)
@@ -281,7 +294,7 @@ class LocalBackend:
                 # with exists()+write (TOCTOU race).
                 fd = os.open(str(lock_path),
                              os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode("utf-8"))
+                os.write(fd, self._holder_id().encode("utf-8"))
                 os.close(fd)
                 return
             except (FileExistsError, PermissionError):
@@ -289,7 +302,27 @@ class LocalBackend:
                 # surface ERROR_SHARING_VIOLATION as PermissionError. Treat
                 # both as "held, retry".
                 try:
-                    if time.time() - lock_path.stat().st_mtime > stale_seconds:
+                    age = time.time() - lock_path.stat().st_mtime
+                    if age > stale_seconds:
+                        # Stale-break instrumentation (): this branch
+                        # DESTROYS another writer's mutual exclusion — the holder
+                        # still believes it owns the lock, so both proceed and the
+                        # loser's read-modify-write silently vanishes (last writer
+                        # wins). It fired with ZERO trace until 2026-09-01, which
+                        # made the lost-update class unmeasurable from history.
+                        # One stderr line on the RARE branch only; the happy path
+                        # is untouched, and diagnostics must never break acquisition.
+                        try:
+                            holder = lock_path.read_text(errors="replace").strip()[:32]
+                        except OSError:
+                            holder = "?"
+                        try:
+                            sys.stderr.write(
+                                f"[lock-stale-break] path={lock_path} age={age:.1f}s "
+                                f"stale_seconds={stale_seconds} holder_pid={holder} "
+                                f"breaker_pid={os.getpid()}\n")
+                        except Exception:
+                            pass
                         lock_path.unlink(missing_ok=True)
                         continue
                 except FileNotFoundError:
@@ -299,7 +332,43 @@ class LocalBackend:
                 time.sleep(0.1)
 
     def release_lock(self, lock_path: PathLike) -> None:
-        Path(lock_path).unlink(missing_ok=True)
+        # Holder-checked release () — the LocalBackend twin of
+        # OwnCloudBackend's ConditionExpression="holder = :me". Until
+        # 2026-09-01 this was an unconditional unlink, so a stale-broken
+        # victim's release DELETED THE THIEF'S LOCK and let a third writer
+        # straight in (pinned by test_lock_stale_break_g115_8536.py). The
+        # compare-then-unlink below is not atomic, but the residual race
+        # requires the lock to be BOTH ours and stale-broken within the
+        # microseconds between read and unlink — strictly narrower than the
+        # unconditional clobber it replaces. This closes the third-writer
+        # door only; the lost-update race itself is still open (remedy gated
+        # on measured [lock-stale-break] frequency).
+        lock_path = Path(lock_path)
+        try:
+            content = lock_path.read_text(errors="replace").strip()
+        except FileNotFoundError:
+            return                  # already released (or broken + released)
+        except OSError:
+            return                  # unreadable: leak-then-stale-break beats clobber
+        if content and content != self._holder_id():
+            # VICTIM side: a peer stale-broke us mid-critical-section and now
+            # holds the lock. Do NOT delete their lock; our own RMW may
+            # already be a lost update. Mirrors owncloud_backend's release
+            # cond-fail diagnostic. Legacy bare-pid content (a hold that
+            # straddled a code upgrade) also lands here and self-heals via
+            # the next stale-break; empty content (holder crashed between
+            # create and write) is unattributable and falls through to the
+            # unlink, preserving the old cleanup behavior.
+            try:
+                sys.stderr.write(
+                    f"[lock-stale-break] victim=self path={lock_path} "
+                    f"held_by={content[:64]} our_id={self._holder_id()} — "
+                    f"peer stole the lock mid-work; skipping release, our "
+                    f"RMW may be a lost update (g-115-8536)\n")
+            except Exception:
+                pass
+            return
+        lock_path.unlink(missing_ok=True)
 
     # --- reads -------------------------------------------------------------
     def read_bytes(self, path: PathLike, *, force_fresh: bool = False) -> bytes:

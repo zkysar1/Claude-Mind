@@ -211,12 +211,26 @@ IF experience record was loaded (from Step 1 experience_ref):
 After ABC chain analysis, apply extraction based on outcome. First compute `dual_classification` to modulate extraction priority:
 
 ```
-Read hypothesis process_score (if populated by /review-hypotheses Step 4.1):
-  If process_score.dual_classification exists:
+READ BOTH SHAPES. TOP-LEVEL IS CANONICAL (g-115-5538):
+  classification = record.dual_classification              # canonical, flat
+                   or record.process_score.dual_classification   # legacy nested
+  quality        = record.process_quality
+                   or record.process_score.process_quality
+
+  If classification is present (EITHER shape):
     Use it to modulate extraction below
-  If not yet computed (process_score.process_quality is null):
+  Else (neither shape carries it):
     Defer modulation — extract normally (computed later in Step 7.6c)
 ```
+
+⚠ **Do not narrow this back to the nested path alone.** Two writers emit different
+shapes (Step 4.1 nested at resolve time; Step 7.6c flat at reflect time, because
+`pipeline-update-field.sh` rejects dotted paths), so a one-shape reader is blind to
+a whole population — measured 2026-08-09: 25 nested-only, 15 top-level-only, 0 both.
+New writers emit **flat**. The 41 records carrying neither shape, and the unmeasured
+`stage=archived` corpus, are owned by g-115-8480.
+Rationale (WHY two shapes, why flat is canonical, what the split cost):
+`core/config/rationale/dual-classification-shape.md`
 
 **For CONFIRMED (confirmed hypotheses):**
 - If `dual_classification == lucky_confirmed`: evaluate the SOUND-METHOD OVERRIDE (next bullet) FIRST. If the override FIRES: treat this record as `earned_confirmed` — run the full Strategy Validation step below, do NOT downgrade priority, and do NOT attach the "do not reinforce" note; record which discriminator fired. If the override does NOT fire: LOW PRIORITY extraction — the reasoning was flawed despite confirmed outcome. Create reasoning bank entry but tag `confidence: low`, add note: "Lucky confirmed — do not reinforce this reasoning pattern"

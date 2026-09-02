@@ -467,3 +467,204 @@ def test_positive_control_same_shape_without_recurring_is_a_candidate(
     assert ids == ["g-350-04"], (
         f"non-recurring parent of the same shape MUST be a candidate, got {out}")
     assert out["eligible"] == 1, out
+
+
+# ── : a FAILED mark must leave a goal-keyed durable trace ─────────
+#
+# The reported symptom was one live recurring goal () wearing a
+# "superseded by sibling decomposition: ..." outcome_note that the metrics log
+# had never recorded. The provenance question — how does a note land with no
+# row? — mattered more than the goal, because it is a hole in the 
+# sweep-mutation visibility guarantee that Phase 0.5b.8.5 reads.
+#
+# THE MECHANISM, and it is an interaction, not a single-site bug:
+#   _mark_superseded writes outcome_note FIRST and status SECOND. The caller
+#   gates the only goal-keyed metric on `if ok:`. So the one run shape where a
+#   mutation ACTUALLY LANDED — note written, status refused — returns False and
+#   emits NO row naming the goal. Its `reason` () reaches `details`,
+#   which is stdout for that one run and is gone the moment it scrolls.
+#
+# MEASURED on this world before the fix (alpha, cc-08, 2026-08-31):
+#   world/parent-supersession-sweep-metrics.jsonl held 2189 rows, ALL of type
+#   run_summary. `grep -c 'goal_id'` -> 0. `grep -c 'g-[0-9]'` -> 0 (positive
+#   control: no goal id appeared anywhere in the file, ever). 119 runs had
+#   candidates>0, 117 of them in mode=apply — i.e. 117 attempted mutations with
+#   zero goal-keyed trace. Zero refused_stale_candidate rows, which rules out
+#   the pre-write guard and leaves exactly this path.
+#
+# These tests drive main() --apply end-to-end rather than calling
+# _mark_superseded directly, because a helper-level test cannot see the `if ok:`
+# gate — and the gate is half the defect.
+
+def _run_apply_capturing_metrics(monkeypatch, capsys, tmp_path,
+                                 *, rc1=0, rc2=0):
+    """Drive main() --apply over a real g-350 candidate, capturing metrics.
+
+    rc1 / rc2 are the exit codes of the two child writes _mark_superseded
+    performs, IN ORDER: outcome_note (rc1), then status (rc2).
+
+    _append_metric is monkeypatched rather than allowed to write, matching
+    _run_main above. That is not a stylistic choice: the real append goes
+    through _fileops.locked_append_jsonl, which raises NoClaimError on any box
+    not holding the live runner claim, so a write-and-read-back test would fail
+    on every non-reducer box. Capturing at that seam still asserts the payload
+    this unit constructs, and the metrics_path assertion below covers the one
+    thing the seam would otherwise hide (a row built correctly but sent to None).
+    """
+    import sys as _sys
+    mod = _import_sweep()
+    rows = []
+    fields_written = []
+    metrics_log = tmp_path / "metrics.jsonl"
+
+    def _fake_py(args, input_text=None):
+        # [aspirations.py, --source, SRC, update-goal, GOAL, FIELD, VALUE]
+        field = args[5] if len(args) > 5 else ""
+        fields_written.append(field)
+        if field == "outcome_note":
+            return (rc1, "", "child refused the note write" if rc1 else "")
+        if field == "status":
+            return (rc2, "", "child refused the status write" if rc2 else "")
+        # completed_date — a THIRD write, deliberately best-effort: its rc is
+        # bound and never checked, and _mark_superseded returns (True, None)
+        # regardless ("most stores stamp it server-side"). So it is not a
+        # failure arm and cannot produce a mark_failed; it is out of scope for
+        # the trace gap. Returned green so it never perturbs these tests.
+        return (0, "", "")
+
+    monkeypatch.setattr(
+        mod, "_read_aspirations",
+        lambda source: _recurring_shape(recurring=False) if source == "world"
+        else [])
+    monkeypatch.setattr(mod, "_append_metric",
+                        lambda path, record: rows.append((path, record)))
+    # Let the writes be reached: the pre-write stale guard re-reads the goal
+    # authoritatively, which is real I/O and would refuse before this path.
+    monkeypatch.setattr(mod, "_stale_candidate_reason",
+                        lambda source, goal_id: None)
+    monkeypatch.setattr(mod, "_py", _fake_py)
+    monkeypatch.setattr(_sys, "argv", [
+        "parent-supersession-sweep.py", "--max-age-hours", "24",
+        "--min-siblings", "2", "--metrics-log", str(metrics_log),
+        "--output", "json", "--apply",
+    ])
+    assert mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    return out, rows, fields_written, metrics_log
+
+
+def _rows_naming_the_goal(rows):
+    return [r for _p, r in rows if r.get("goal_id") == "g-350-04"]
+
+
+def test_status_write_failure_still_names_the_goal_in_the_metrics_log(
+        monkeypatch, capsys, tmp_path):
+    """THE defect. Note landed, status refused → the log must name the goal.
+
+    Before the fix this produced exactly zero goal-keyed rows, which is how
+    g-249-06 acquired a supersession note no audit could trace.
+    """
+    out, rows, fields, _log = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=0, rc2=1)
+
+    # Precondition: we really did exercise the note-succeeded/status-failed arm.
+    assert fields == ["outcome_note", "status"], fields
+    assert out["details"][0]["action"] == "mark_failed", out["details"]
+
+    named = _rows_naming_the_goal(rows)
+    assert named, (
+        "a failed mark left NO row naming the goal — the g-115-2676 visibility "
+        f"hole this goal exists to close. rows={[r for _p, r in rows]}")
+    assert [r["type"] for r in named] == ["parent_supersession_mark_failed"]
+
+
+def test_the_status_failure_row_says_the_note_ALREADY_LANDED(
+        monkeypatch, capsys, tmp_path):
+    """Not just "a failure happened" — the row must say it is REPAIRABLE.
+
+    This is the difference between a log entry and a usable one. A reader
+    finding this row needs to know a false note is sitting on a live goal, and
+    needs the exact text to match against rather than reconstructing the
+    template and hoping the format still agrees.
+    """
+    _out, rows, _fields, _log = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=0, rc2=1)
+    row = _rows_naming_the_goal(rows)[0]
+
+    assert row["failed_field"] == "status"
+    assert row["outcome_note_written"] is True
+    assert row["outcome_note"] == (
+        "superseded by sibling decomposition: g-350-17, g-350-18")
+    # The reason from  must survive into the DURABLE record, not only
+    # into `details` (which is one run's stdout).
+    assert "child refused the status write" in row["reason"]
+    assert row["aspiration_id"] == "asp-350"
+    assert row["sibling_ids"] == ["g-350-17", "g-350-18"]
+
+
+def test_note_write_failure_is_recorded_as_NOT_repairable(
+        monkeypatch, capsys, tmp_path):
+    """The other arm. Nothing landed, so the goal needs no repair — and the row
+    must say so, or a reader would hunt for a note that was never written.
+
+    Pinned separately from the status arm on its own observable (guard-4637):
+    two fixes in one function, so one mutation must not be able to satisfy both.
+    """
+    _out, rows, fields, _log = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=1, rc2=0)
+
+    # Precondition: the status write is never reached when the note write fails.
+    assert fields == ["outcome_note"], fields
+
+    row = _rows_naming_the_goal(rows)[0]
+    assert row["type"] == "parent_supersession_mark_failed"
+    assert row["failed_field"] == "outcome_note"
+    assert row["outcome_note_written"] is False
+    assert "outcome_note" not in row, (
+        "the note-failure row must carry no note text — nothing was written, "
+        f"and offering some would send a reader chasing a phantom: {row}")
+    assert "child refused the note write" in row["reason"]
+
+
+def test_the_two_failure_arms_are_distinguishable(monkeypatch, capsys, tmp_path):
+    """A single flag that fires on both arms would be worse than none: it would
+    send a reader looking for a phantom note half the time."""
+    _o1, rows_status, _f1, _l1 = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=0, rc2=1)
+    _o2, rows_note, _f2, _l2 = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=1, rc2=0)
+
+    a = _rows_naming_the_goal(rows_status)[0]
+    b = _rows_naming_the_goal(rows_note)[0]
+    assert a["failed_field"] != b["failed_field"]
+    assert a["outcome_note_written"] != b["outcome_note_written"]
+
+
+def test_the_failure_row_is_sent_to_the_configured_metrics_log(
+        monkeypatch, capsys, tmp_path):
+    """Covers what monkeypatching _append_metric would otherwise hide: a row
+    built perfectly and handed to None goes nowhere, silently (the appender is
+    fail-open by design and returns early on a None path)."""
+    _out, rows, _fields, metrics_log = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=0, rc2=1)
+    paths = [p for p, r in rows if r.get("goal_id") == "g-350-04"]
+    assert paths == [metrics_log], (
+        f"failure row went to {paths}, expected {metrics_log}")
+
+
+def test_a_SUCCESSFUL_mark_emits_no_failure_row(monkeypatch, capsys, tmp_path):
+    """Positive control. Without it, every assertion above passes for a script
+    that emits a mark_failed row unconditionally — and the existing success
+    metric, which was never the broken half, must still be there.
+    """
+    out, rows, fields, _log = _run_apply_capturing_metrics(
+        monkeypatch, capsys, tmp_path, rc1=0, rc2=0)
+
+    # Also documents the full write sequence: the third write is best-effort.
+    assert fields == ["outcome_note", "status", "completed_date"], fields
+    assert out["details"][0]["action"] == "marked", out["details"]
+    assert out["applied"] == 1, out
+
+    types = [r["type"] for r in _rows_naming_the_goal(rows)]
+    assert "parent_supersession_mark_failed" not in types, types
+    assert types == ["parent_superseded"], types

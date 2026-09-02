@@ -86,9 +86,21 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
    lock does NOT cover you -- it returns 0 for your own sid, and a BACKGROUNDED
    run inherits no MIND_SID at all so it takes no lock while still printing
    authoritative-looking chunk counts. Remedy: `git worktree add --detach
-   /tmp/<name> <sha>`. FIRST `cp agents/<you>/local-paths.conf`
-   INTO the worktree, then run the suite THERE exporting MIND_AGENT,
-   MIND_SID, STORAGE_BACKEND=local. The conf copy is load-bearing: it is
+   /tmp/<name> <sha>`. FIRST copy BOTH gitignored runtime files INTO the
+   worktree -- `cp agents/<you>/local-paths.conf` AND `cp
+   mind_api/state/daemon.port` (mkdir -p its dir first) -- then run the suite
+   THERE exporting MIND_AGENT, MIND_SID, STORAGE_BACKEND=local. TWO copies,
+   not one: the daemon.port half was missing from this line until 2026-08-31
+   and costs a chunk. Without it every daemon-only test fails
+   `daemon not reachable: no mind_api/state/daemon.port`, and the run reports a
+   large authoritative-looking failure count that is PURE ENVIRONMENT. Measured
+   (bravo cc-05, g-115-5979): chunk 00 read 20 failed / 4486 passed, all 20 in
+   ONE file; the SAME file gave 28 passed rc=0 in the main repo and 28 passed
+   rc=0 in the worktree once the port was copied in. The file holds only a port
+   number and the daemon listens on localhost, so copying it suffices -- do NOT
+   start a second daemon. (guard-5702; sibling of guard-5365, which asks whether
+   your CHANGE reached the worktree -- both required, neither implies the
+   other.) The conf copy is load-bearing: it is
    GITIGNORED, so a worktree cannot inherit it and WORLD_DIR/META_DIR resolve
    EMPTY -- 0 passed / 106 errors, an INVALID run that reads as a
    catastrophic regression (alpha cc-04; zeta cc-02 2026-08-27). DO NOT reach

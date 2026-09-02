@@ -67,6 +67,27 @@ _EXPOSED_APPLIES_TO = frozenset({"domain", "any"})
 #: names and internal findings verbatim).
 SELF_EXPOSED_FM_FIELDS = frozenset({"created", "last_updated"})
 
+#: Goal ``work_class`` values that represent product-facing work (exposed). Every other
+#: value ("framework", "hygiene", "unclassified", or missing) is suppressed — fail
+#: closed, exactly like :data:`_EXPOSED_APPLIES_TO`. The goal queue is overwhelmingly
+#: framework plumbing, so a dump would publish the agent's own maintenance backlog to a
+#: member-facing board; ``work_class`` is the field that already draws that line.
+_EXPOSED_WORK_CLASSES = frozenset({"product"})
+
+#: Goal ``status`` -> the coarse word a member sees. An ALLOWLIST, fail-closed: a status
+#: absent from this map is suppressed. ``blocked``/``skipped``/``expired``/``superseded``
+#: /``decomposed`` are internal queue mechanics, and on a "Planned" board they would read
+#: as broken promises rather than as the routine bookkeeping they are.
+_GOAL_PUBLIC_STATUS: dict[str, str] = {
+    "pending": "planned",
+    "in-progress": "in progress",
+    "completed": "done",
+}
+
+#: Cap on a projected goal title. Bounds a malformed record; it is not the filter —
+#: :func:`project_goals` is.
+_GOAL_TITLE_CAP = 200
+
 #: The count keys that represent actual KNOWLEDGE. The broken-export refusal in
 #: knowledge-export's ``main()`` fires when every one of these is zero over a world that
 #: demonstrably holds stores. ``self`` is excluded on purpose: it is projected from the
@@ -314,6 +335,81 @@ def is_exposed_by_category(entry: Mapping[str, object], allow: frozenset[str]) -
 
 # ── projections (shape-preserving) ───────────────────────────────────────────
 
+def project_goals(
+    goals: Iterable[Mapping[str, object]],
+    redactor: "Redactor",
+) -> list[dict[str, object]]:
+    """Project the goal queue down to the customer-facing "what is planned" view.
+
+    PEARL §10.3 is filter-at-the-source, so the cut is made HERE and the consumer holds
+    no projection logic — same contract as :func:`project_self`.
+
+    TWO independent fail-closed gates, because a goal record is the single most
+    internal-leaking store in the bundle: its ``outcome_note`` and ``defer_reason`` carry
+    verbatim measurements (cloud account ids, table ids, lambda ARNs, box hostnames,
+    partner-agent names), and its ``title`` routinely names internal scripts. So this is
+    an ALLOWLIST of three fields and everything else is dropped — notes, reasons,
+    participants, claim data, priority, scores, ids and aspiration linkage never appear.
+
+    Gate 1 is ``work_class``: only ``product`` is exposed. The queue is overwhelmingly
+    framework plumbing, and publishing that would show a member the agent's own
+    maintenance backlog rather than the product roadmap they came for.
+
+    Gate 2 is ``status``, mapped through :data:`_GOAL_PUBLIC_STATUS`. An unmapped status
+    is suppressed rather than passed through, so a new internal status value added later
+    stays private until someone decides otherwise.
+
+    The remaining ``title`` still goes through the redactor, which strips goal ids,
+    filenames and agent names — belt and braces, since a product title can still cite a
+    script. Returns ``[]`` when nothing is exposable.
+
+    ⚠ THESE GATES ARE NECESSARY AND **NOT SUFFICIENT** — MEASURED, so do not ship a
+    member-facing board on them alone without reading this. Live run 2026-08-30 (zeta,
+    cc-02, 6.8.0-137-generic): 377 goals projected, and **129 of them (34%) came from
+    the framework/maintenance lane**, carrying titles like "Verify remote-filesystem connectivity"
+    and "Scan for stale background processes" — internal ops chores that are
+    nevertheless tagged ``work_class: product`` in the store. That is a DATA-quality
+    problem, not a bug here: those labels are individually defensible (the work *is*
+    about platform services), they are simply not roadmap items a member asked to see.
+
+    A category gate was the obvious second filter and was MEASURED AND REJECTED rather
+    than assumed: :func:`is_exposed_by_category` against the tree-derived domain
+    allowlist does NOT separate the two populations — ONE broad platform-services category covers
+    102 of the mis-tagged chores AND 6 genuine goals in a real product lane, and it is a
+    legitimate domain category in both. Adding it would narrow nothing while creating
+    the impression the surface had been filtered. Filtering by aspiration id WOULD
+    separate them cleanly, and is deliberately not done here: this is a core framework
+    file and a hardcoded lane id is a domain leak
+    (``.claude/rules/domain-free-examples.md``) that would rot at the first re-org.
+
+    The fix belongs upstream in the goal records' ``work_class``. Until it lands, treat
+    this projection as "product-classed work" and NOT as a curated roadmap.
+    """
+    out: list[dict[str, object]] = []
+    for g in goals:
+        if str(g.get("work_class") or "").strip().lower() not in _EXPOSED_WORK_CLASSES:
+            continue
+        status = _GOAL_PUBLIC_STATUS.get(str(g.get("status") or "").strip().lower())
+        if status is None:
+            continue
+        title = redactor(str(g.get("title") or "")).strip()
+        if not title:
+            continue
+        out.append(
+            {
+                "title": title[:_GOAL_TITLE_CAP],
+                "status": status,
+                # NOT redacted, for the same reason tree `last_updated` is not: an ISO
+                # date carries no secret and no agent name. "" when absent, so a
+                # consumer must read "" as unknown rather than as old.
+                "updated": str(
+                    g.get("completed_date") or g.get("started") or g.get("created_at") or ""
+                ),
+            }
+        )
+    return out
+
+
 def project_self(
     front_matter: Mapping[str, object] | None,
     body: str,
@@ -381,6 +477,9 @@ class ProjectedBundle:
     #: ``agent_self`` because a dataclass field literally named ``self`` would shadow
     #: the receiver in every method below; it is emitted under the JSON key ``self``.
     agent_self: dict[str, object] = field(default_factory=dict)
+    #: The customer-facing "what is planned" view. A LIST (unlike ``agent_self``), so
+    #: emptiness is a length, not a shape change; ``[]`` means nothing exposable.
+    goals: list[dict[str, object]] = field(default_factory=list)
 
     def counts(self) -> dict[str, int]:
         # `self` is 0/1, not a length: it is one projected view, not a store. It is in
@@ -394,6 +493,13 @@ class ProjectedBundle:
             "guardrails": len(self.guardrails),
             "lessons": len(self.lessons),
             "self": 1 if self.agent_self else 0,
+            # A real length, unlike `self` above: goals is a store-shaped list. In
+            # counts() for the guard-5144 reason -- a projection absent from counts is a
+            # projection no verifier can check. NOT in KNOWLEDGE_COUNT_KEYS: goals are
+            # work items, not knowledge, and a world can legitimately publish zero
+            # product goals while its four knowledge stores are healthy -- folding it in
+            # would let a broken export pass the refusal gate.
+            "goals": len(self.goals),
         }
 
 
@@ -406,6 +512,7 @@ def project(
     redactor: Redactor,
     self_front_matter: Mapping[str, object] | None = None,
     self_body: str = "",
+    goals: Iterable[Mapping[str, object]] = (),
 ) -> ProjectedBundle:
     """Filter + redact all four stores into a :class:`ProjectedBundle`.
 
@@ -420,6 +527,7 @@ def project(
     # Keyword-only with defaults, so every existing caller keeps its exact behaviour and
     # gets an empty `agent_self` rather than a changed shape.
     bundle.agent_self = project_self(self_front_matter, self_body, redactor)
+    bundle.goals = project_goals(goals, redactor)
     for n in nodes:
         bundle.tree.append(
             {

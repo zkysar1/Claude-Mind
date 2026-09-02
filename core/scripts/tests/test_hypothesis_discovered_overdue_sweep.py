@@ -457,3 +457,43 @@ def test_lanes_are_disjoint_over_a_mixed_corpus():
     assert o_ids & e_ids == set(), o_ids & e_ids
     assert o_ids == {"a_overdue", "b_overdue_bare"}
     assert e_ids == {"c_eligible", "d_eligible_bare", "f_boundary_today"}
+
+
+def test_formation_failure_reason_names_the_missing_field():
+    """The gate's message must survive, not just its boolean ().
+
+    passes_active_formation() swallows the exception, so an "under-formed"
+    verdict used to carry no statement of WHICH field the gate wanted. That
+    silence is what let a prior pass conclude the PREDICATE was mis-scoped when
+    it was correct — the records were missing a field nobody had looked for,
+    because nothing printed its name.
+    """
+    bare = _bare(id="x_bare", resolves_by=_iso(+5))
+    reason = SW.formation_failure_reason(bare)
+    assert reason, "an under-formed record must yield a non-empty reason"
+    assert not SW.passes_active_formation(bare), "fixture must be under-formed"
+    # The message is the whole point: it must NAME the deficient field, not
+    # just report failure. Which field comes first depends on the fixture (the
+    # validator raises one per attempt), so assert the class, not the wording.
+    assert any(f in reason for f in
+               ("claim", "resolution", "measurement_channel")), reason
+
+    good = _well_formed(id="x_good", resolves_by=_iso(+5))
+    assert SW.passes_active_formation(good), "fixture must be well-formed"
+    assert SW.formation_failure_reason(good) is None, "a passing record has no reason"
+
+
+def test_formation_reasons_map_covers_every_flagged_id():
+    """Both human lanes read result["formation_reasons"] by id — so every id in
+    needs_judgment / eligible_needs_judgment must have an entry, or the printed
+    line silently drops back to the bare verdict it replaced."""
+    corpus = [
+        _bare(id="p_overdue_bare", resolves_by=_iso(-5)),
+        _bare(id="q_eligible_bare", resolves_by=_iso(+5)),
+    ]
+    o = SW.classify_overdue(corpus, NOW)
+    e = SW.classify_eligible(corpus, NOW)
+    flagged = [r for r in (o["needs_judgment"] + e["needs_judgment"])]
+    assert flagged, "fixture must produce at least one flagged record"
+    for rec in flagged:
+        assert SW.formation_failure_reason(rec), rec.get("id")

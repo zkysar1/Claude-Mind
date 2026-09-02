@@ -68,12 +68,56 @@ def signal_age_hours(sig, now):
         return None
 
 
-def is_live(sig, now, max_age_hours):
-    """True when apply_pull_boost would currently honour this signal."""
+def live_age_hours(sig, now, max_age_hours):
+    """SINGLE SOURCE OF TRUTH for "is this ``pull_signal`` live, and how old?".
+
+    Returns the age in hours (clamped at 0.0) when the signal is LIVE, or
+    ``None`` when it is absent, malformed, aged out, or implausibly far in the
+    future.
+
+    THREE consumers across TWO files, and they must never disagree about which
+    signals are live:
+
+      * ``is_live`` below — the producer's idempotence guard (SKIP-live).
+      * goal-selector ``apply_pull_boost`` — converts a live signal into RANK.
+      * goal-selector's recurring hour gate — converts it into ELIGIBILITY.
+
+    WHY THE ARITHMETIC LIVES HERE AND THE SELECTOR IMPORTS IT (g-115-6590,
+    2026-08-30). Until now the selector carried its own copy of this parse and
+    these bounds. Both copies agreed — verified across the whole age range —
+    but agreeing today is not the same as being one rule, and the g-353-62
+    review named the residual precisely: "one predicate per FILE, not one per
+    mechanism". The direction is forced rather than chosen: ``goal-selector.py``
+    is HYPHENATED and so cannot be imported by name, so the shared arithmetic
+    can only sit on this side. Same argument ``peer_surface`` makes for
+    ``split_author``.
+
+    It returns the AGE rather than a bool because ``apply_pull_boost`` records
+    ``pull_signal_age_hours``; a bool consumer is a one-line wrapper over an age
+    (``is_live``, immediately below), while the reverse cannot be written — so
+    the age is the shareable form.
+
+    ``enabled`` is deliberately NOT read here, and that is the one thing the two
+    callers do NOT share. The selector gates on it so a single flag disables both
+    of its axes; the producer's idempotence guard must stay correct whatever the
+    consumer's flag says, or a disabled mechanism would re-stamp a live signal on
+    a shared world goal several times an hour. One shared arithmetic, each caller
+    keeping its own policy over it.
+    """
     age = signal_age_hours(sig, now)
     if age is None:
-        return False
-    return -SKEW_TOLERANCE_H <= age <= max_age_hours
+        return None
+    if age > max_age_hours or age < -SKEW_TOLERANCE_H:
+        return None
+    return max(0.0, age)
+
+
+def is_live(sig, now, max_age_hours):
+    """True when apply_pull_boost would currently honour this signal.
+
+    A bool view of ``live_age_hours`` — no second copy of the bounds.
+    """
+    return live_age_hours(sig, now, max_age_hours) is not None
 
 
 def decide(goal, *, now, max_age_hours, clear=False, reason="", by=""):

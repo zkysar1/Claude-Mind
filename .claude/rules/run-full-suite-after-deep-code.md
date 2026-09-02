@@ -61,6 +61,38 @@ A separate existing test (`testSymmetry`) was actually broken by the change
 correct fix was a conditional (`if raw < 0: raw = b`). The regression
 shipped because the closure trusted targeted-only test results.
 
+## The second axis: ENVIRONMENT (guard-1515)
+
+Everything below this line is about breadth of TEST SELECTION — "targeted tests
+are necessary but not sufficient, run the whole module." A regression can satisfy
+that axis completely and still ship, because a suite result is a claim about
+**one box's environment**, not about the code.
+
+Measured (g-335-264): a deep change added a pre-dispatch guard reading
+`System.getenv` for two API keys. The FULL Gradle suite ran — 4523 passed, 0
+failed, BUILD SUCCESSFUL — and it pushed (96d8cbf). Two test classes point the
+service at a local stub and need no real credential, but the guard runs before
+dispatch regardless, so with those vars UNSET they fail. The author's box had a
+populated key, so the suite was green; CI does not, so CI would have been red.
+The regression broke 6 tests and was caught minutes later by an unrelated spark
+(83d9c8f), not by the rule.
+
+**When a change reads any environment input — env var, credential, locale, TZ,
+`$HOME`, a file outside the repo — a green suite on your box is not evidence
+until you re-run the affected tests with that input ABSENT:**
+
+```bash
+env -u OPENAI_API_KEY -u GROQ_API_KEY ./gradlew test --no-daemon
+```
+
+Generalise per input, not per name: `env -u <VAR>` for each var the diff reads.
+The unset case is the one CI runs and the one your box hides, and it is the
+cheap direction to check — a populated value masks the failure, an absent one
+cannot mask a success.
+
+This axis is ORTHOGONAL to test selection: satisfying one says nothing about the
+other, so a closure claiming "all tests pass" on an env-reading change owes both.
+
 ## Scope
 
 Applies when ALL of the following hold:
@@ -132,38 +164,32 @@ while post-chunk phases are still writing). Before diagnosing anything from a
 suite run, confirm no other run is live:
 
 ```bash
-pgrep -af "[r]un-full-suite"   # bracket prevents matching your own command line
+bash core/scripts/proc-match.sh run-full-suite
 ```
 
-The bracket is not cosmetic: `pgrep -f "run-full-suite"` matches the shell
-running the pgrep, so the naive form reports phantom orphans and aborts your
-probe. Measured the same day.
+**Not `pgrep`.** `pgrep -af "[r]un-full-suite"` stood here until 2026-08-31 and
+ran on ONE of three platforms: Windows/MSYS has no pgrep (measured — `pkill` IS
+present, so the gap is invisible at a glance), BSD/macOS lacks `-a`. The obvious
+Windows fallback is worse: MSYS `ps -ef` prints no arguments, so `ps | grep`
+returned **0 while 4 matching processes were live**. `proc-match.sh` branches
+PowerShell/`Win32_Process` vs POSIX `ps -eo pid=,args=` and prints the
+`pgrep -af` shape everywhere.
 
-**`-f` is equally load-bearing, and dropping it fails in the OPPOSITE, more
-dangerous direction.** Without `-f`, `pgrep` matches the process NAME only — and
-the name of a live suite run is `bash`, not `run-full-suite.sh`. So
-`pgrep -c "[r]un-full-suite"` returns **0 against a run that is actively
-executing**. The bracket-only failure above is a false POSITIVE (it aborts a
-probe, loudly). This one is a false NEGATIVE: it says "finished" about a run
-still writing, which is exactly the premise under which someone reads a
-verdict-less log as a dead run, or launches a second overlapping invocation —
-the contention this whole paragraph exists to prevent. Measured 2026-08-11
-(bravo, `hostname` cc-05, `uname -r` 6.8.0-137-generic): `pgrep -c` reported 0
-while `pgrep -af` reported 2 live PIDs and the log mtime was 2 seconds old.
-Corroborate a "finished" reading with the log's mtime before believing it; a
-verdict-less tail plus a fresh mtime means STILL RUNNING, never died.
+It also closes three silent lies the bracket could not (guard-3159, guard-1238).
+Without `-f` a live run's process NAME is `bash`, so `pgrep -c` returns **0
+against a run that is executing** — a false NEGATIVE, the premise under which
+someone reads a verdict-less log as dead or launches a second run (2026-08-11,
+bravo, cc-05, 6.8.0-137-generic: `pgrep -c` said 0 while `pgrep -af` showed 2
+live PIDs, log mtime 2s old). The bracket stops the matcher matching its OWN
+argv but never an ENCLOSING wrapper's, so folding the check into the launch
+aborts the launch it protects — a false POSITIVE (2026-08-01, alpha, cc-04,
+6.8.0-136-generic: a clean process table reported one phantom whose only cited
+PID was the guard's own wrapper). And the matcher can match itself: the script
+snapshots before matching and drops its own PID.
 
-**Run the probe as its OWN command — the bracket does not save you otherwise.**
-It only stops `pgrep` matching its own argv. Put the check and the launch in one
-command (`if pgrep -af "[r]un-full-suite"; then abort; else run-full-suite.sh …`)
-and the ENCLOSING wrapper shell's argv contains the literal script name — a
-different process, which the bracket cannot defend against. It matches, and the
-guard aborts the launch it was written to protect. Measured 2026-08-01 (alpha,
-`hostname` cc-04, `uname -r` 6.8.0-136-generic): a clean process table reported
-one phantom "live run" whose only cited PID was the guard's own wrapper. Two
-separate calls, always. (guard-1238 is the general form — "never use a pattern
-that appears in the probing command itself"; the bracket is a partial mitigation
-of it, not an exemption from it.)
+Still run it as its OWN command, and corroborate a "finished" reading with the
+log's mtime: a verdict-less tail plus a fresh mtime means STILL RUNNING, never
+died.
 
 **`VERDICT: GENUINE` CAN BE FALSE — and this is the first row in this file that
 says so. Read it before acting on any large failure count.** Every row below
@@ -443,16 +469,15 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > Read it. Committed live once: a notification reported exit 0 for a contended
 > run with no verdict anywhere in the captured output.
 >
-> **9. CHECK FOR A CONCURRENT RUN AS ITS OWN COMMAND, WITH `pgrep -af`.**
-> `pgrep -af "[r]un-full-suite"`. Both flags are load-bearing and they fail in
-> OPPOSITE directions: the bracket stops `pgrep` matching its own argv (a false
-> POSITIVE that aborts your probe), and `-f` is required because a live run's
-> process NAME is `bash` — so `pgrep -c` returns **0 against a run that is
-> actively executing**, the false NEGATIVE that causes two overlapping
-> invocations. Run it as its own command; folding the check and the launch into
-> one compound command puts the literal name in the wrapper shell's argv, which
-> the bracket cannot defend against. Corroborate a "finished" reading with the
-> log's mtime — a verdict-less tail plus a fresh mtime means STILL RUNNING.
+> **9. CHECK FOR A CONCURRENT RUN AS ITS OWN COMMAND:
+> `bash core/scripts/proc-match.sh run-full-suite`.** NOT `pgrep` — it does not
+> exist on Windows/MSYS and lacks `-a` on BSD/macOS, so the old recipe ran on
+> one of three platforms. The script also removes the bracket idiom's two
+> silent failures (a false NEGATIVE without `-f`, since a live run's process
+> NAME is `bash`; a false POSITIVE from an ENCLOSING wrapper's argv, which the
+> bracket cannot defend against). Still run it as its own command, and
+> corroborate a "finished" reading with the log's mtime — a verdict-less tail
+> plus a fresh mtime means STILL RUNNING.
 >
 > **10. RECORD `hostname` AND `uname -r` VERBATIM, NEVER A NICKNAME.** "cc-04"
 > has named at least two different machines (one Linux 6.8.0-136-generic, one

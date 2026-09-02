@@ -61,11 +61,17 @@ def infer(origin_signal):
                        # by diffing prescribed SKILL.md literals against
                        # ALLOWED_PREFIXES; both are automated sweeps
                        "skill-discovery-audit:", "blocker_pattern:",
+                       #  — S3 per-key churn alarm auto-Investigate
+                       "s3-churn:",
                        # third reconciliation () — unit-economics-readout.py
                        # threshold-move auto-file; without it the Layer-D rewrite
                        # made this automated filer infer as "agent-self", i.e.
                        # misattributed rather than null
-                       "unit-economics-move:")):
+                       "unit-economics-move:",
+                       # fourth reconciliation () - s3_churn_alarm.py
+                       # per-hot-key breach auto-file; the DOMAIN suite pins this
+                       # pair, check-origin-signal-drift.py cannot (markdown-only)
+                       "s3-churn:")):
         return "cycle-detector"
     if sig == "idle_fallback" or sig.startswith((
             "decomposition:", "parent_aspiration:", "unblock:",

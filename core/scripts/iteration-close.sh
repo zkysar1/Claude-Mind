@@ -126,6 +126,7 @@ OVERRIDE_UNCOMMITTED=""
 OVERRIDE_MISSING_ARTIFACT=""
 OVERRIDE_RESIDUAL=""
 OVERRIDE_DOMAIN_SUITE=""
+OUTCOME_NOTE_FILE=""
 
 # g-284-04: Recovery instructions on non-zero exit. The trap below reads
 # _CURRENT_PHASE (set by each do_* function at entry) and prints
@@ -716,6 +717,11 @@ while [[ $# -gt 0 ]]; do
         # g-353-75: forwarded to domain-suite-gate.py inside do_verify. Turns a
         # domain-suite BLOCK into a logged pass (world/domain-suite-overrides.jsonl).
         --override-domain-suite) OVERRIDE_DOMAIN_SUITE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        # g-358-36: outcome_note rides the status write as a companion in ONE
+        # locked RMW (one S3 PUT) instead of the separate note-then-status
+        # pair. File transport only here — do_verify passes it straight to
+        # aspirations-update-goal.sh --outcome-note-file.
+        --outcome-note-file) OUTCOME_NOTE_FILE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *)
             # (2026-08-29): a bare `unknown arg: --outcome-class` sent a downstream
             # Body (small local model) into a second invented flag (`--executed-by`),
@@ -1278,14 +1284,20 @@ do_verify() {
         if [[ "$GOAL_STATUS" == "completed" && -n "$OVERRIDE_RESIDUAL" ]]; then
             update_cmd+=(--override-residual "$OVERRIDE_RESIDUAL")
         fi
-        "${update_cmd[@]}"
-        if [[ "$GOAL_STATUS" == "completed" ]]; then
-            # NON-FATAL (g-115-7663). Bare, this aborts the whole close under
-            # `set -euo pipefail` AFTER the status write has already landed —
-            # see the block above outcome_class for the forensics.
-            bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" completed_date "$TODAY" \
-                || echo "[iteration-close] ⚠ completed_date stamp failed for $GOAL_ID (non-fatal; status is already committed)" >&2
+        # g-358-36: fold the closure note into the SAME locked RMW as the
+        # status flip when the caller provided one (one PUT, and the
+        # residual-work gate evaluates the incoming note).
+        if [[ -n "$OUTCOME_NOTE_FILE" ]]; then
+            update_cmd+=(--outcome-note-file "$OUTCOME_NOTE_FILE")
         fi
+        "${update_cmd[@]}"
+        # completed_date: NO separate stamp here (g-358-36). The daemon's 6a
+        # cascade (g-115-5069, aspirations_write.py) auto-stamps
+        # completed_date inside the status write itself whenever the field is
+        # unset, so the explicit follow-up write this block used to make was
+        # a redundant second S3 PUT per completion (measured: same value,
+        # whole-file rewrite). Removed rather than made conditional — the
+        # cascade is idempotent and covers every fresh completion.
     fi
 
     # g-248-72: persist outcome_class to the goal record at completion time.
@@ -4157,6 +4169,19 @@ do_productivity_check() {
     # always exit 0, one line normally; loud banner only when >= 1 iteration
     # closed since the precheck last started.
     bash "$SCRIPT_DIR/precheck-gap-check.sh" 2>/dev/null || true
+    # STATE-MISMATCH LANDING (g-357-51). agent-state left RUNNING under this
+    # loop — a recovery-gate yank (2026-09-01: live rate-limited reducers were
+    # demoted mid-iteration) or a /stop from another window. The landing script
+    # first tries recovery-yank-reverse.sh for THIS sid; when it cannot reverse,
+    # it prints the graceful-landing directive (consolidate, then END the turn)
+    # and exits 0 — and then this close MUST NOT print ITERATION COMPLETE, whose
+    # Skill(aspirations) re-entry refuses at IDLE with nothing consolidated.
+    # rc=1 (state RUNNING, or just restored) falls through unchanged.
+    if [ -f "$SCRIPT_DIR/state-mismatch-landing.sh" ]        && bash "$SCRIPT_DIR/state-mismatch-landing.sh" --agent "${MIND_AGENT:-}" --sid "${MIND_SID:-}"; then
+        printf '{"ts":"%s","script":"iteration-close","phase":"productivity-check","agent":"%s","event":"state-mismatch-landing"}
+'             "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}"             >> "$CORE_ROOT/logs/imperative-fires.jsonl" 2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+        return 0
+    fi
     echo ""
     echo "[iteration-close] ═══ ITERATION COMPLETE ═══"
     # Deadman's-switch terminal-pair (DEFAULT-ON since Stage 5, 2026-06-23).

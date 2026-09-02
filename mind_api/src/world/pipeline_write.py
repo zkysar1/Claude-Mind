@@ -28,6 +28,7 @@ from _fileops import _atomic_write_with_fallback  # noqa: E402
 from _surprise import apply_derived_surprise  # noqa: E402  # : surprise is DERIVED, not caller-supplied
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
 from ..agent_paths import assert_not_cruft  # noqa: E402
+from _pipeline_fields import warn_unknown_fields  # noqa: E402  #  unknown-key WARN arm
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +246,13 @@ def _validate_record(rec: Dict[str, Any],
     missing = REQUIRED_FIELDS - set(rec.keys())
     if missing:
         raise ValueError(f"Missing required fields: {missing}")
+    # Unknown-key WARN arm (). Placed INSIDE the validator, not at a
+    # call site, so it covers the add AND move/update paths by construction
+    # rather than by remembering to add it twice (guard-330). Never raises:
+    # 136 of the 348 caller-supplied keys measured in the live corpus are
+    # written by framework code or pseudocode, so refusing is not available.
+    # Rationale, census and banding: core/scripts/_pipeline_fields.py.
+    warn_unknown_fields(rec, source="pipeline_write")
     if not ID_RE.match(rec["id"]):
         raise ValueError(f"Invalid record ID format: {rec['id']} (expected YYYY-MM-DD_slug)")
     if rec["stage"] not in VALID_STAGES:

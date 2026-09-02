@@ -147,6 +147,34 @@ def get_undelivered_framework_files(repo_path: Path) -> List[str]:
     branch has no upstream (a fresh local branch, detached HEAD), which is not
     evidence of undelivered work.
     """
+    # Tree-identity short-circuit (). A history divergence can be
+    # CONTENT-FREE: after a merge whose resolution matched upstream exactly, HEAD
+    # and @{u} name different commits while their TREES are byte-identical. The
+    # three-dot diff below then reports every file changed since the merge-base --
+    # files already present on origin -- so fully-delivered content reads as
+    # undelivered and blocks every close. Measured live 2026-08-31 (bravo/cc-05):
+    # a 12-iteration integrate wedge resolved by taking upstream's exact file, after
+    # which the resolved blob hashed identically to origin/main.
+    #
+    # Ordered BEFORE the existing fail-open early-returns per guard-3072: the
+    # population this arm exists for is precisely where the old arm has no useful
+    # evidence, so evaluating it second would re-create the blind spot it closes.
+    # Two-dot (tree-to-tree) is deliberate and is NOT the three-dot below -- the
+    # question here is "is the content the same", not "what changed since the
+    # merge-base". `--quiet` exits 0 when there is no difference, 1 when there is,
+    # and >1 on error; only rc==0 is the identical case. No upstream / detached HEAD
+    # exits non-zero and falls through to the existing handling, so the fail-open
+    # contract is unchanged.
+    try:
+        _same = subprocess.run(
+            ["git", "-C", str(repo_path), "diff", "--quiet", "@{u}", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        _same = None
+    if _same is not None and _same.returncode == 0:
+        return []
+
     try:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "diff", "--name-only", "@{u}...HEAD"],

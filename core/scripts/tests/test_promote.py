@@ -660,7 +660,7 @@ elif [[ "$1 $2" == "pr view" ]]; then
     [[ -f "$GH_CAPTURE_FILE.n" ]] && _n=$(cat "$GH_CAPTURE_FILE.n")
     _n=$((_n+1)); echo "$_n" > "$GH_CAPTURE_FILE.n"
     if [[ "$_n" == "1" && -n "${SHIM_PR_FACTS_FIRST:-}" ]]; then printf '%b\n' "$SHIM_PR_FACTS_FIRST"
-    else printf '%b\n' "${SHIM_PR_FACTS-MERGEABLE\t0\t0}"; fi
+    else printf '%b\n' "${SHIM_PR_FACTS-MERGEABLE\x1f0\x1f0}"; fi
   fi
 elif [[ "$1 $2" == "pr merge" ]]; then
   if [[ -n "${SHIM_MERGE_FATAL:-}" ]]; then
@@ -706,7 +706,7 @@ def test_auto_merge_off_by_default(tmp_path):
 def test_auto_merge_merges_when_mergeable_with_zero_checks(tmp_path):
     """guard-2640: zero checks is NOT laundered into 'CI passed' — the script
     says so explicitly and names the local gate it is actually relying on."""
-    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\t0\\t0")
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\x1f0\\x1f0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pr merge" in cap
     assert "NOT read as CI-green" in r.stdout
@@ -717,7 +717,7 @@ def test_auto_merge_merges_when_mergeable_with_zero_checks(tmp_path):
 @requires_git
 def test_auto_merge_refuses_when_not_mergeable(tmp_path):
     """A conflicted PR is never merged, and the PR is left open."""
-    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="CONFLICTING\\t0\\t0")
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="CONFLICTING\\x1f0\\x1f0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pr merge" not in cap
     assert "REFUSED" in r.stdout and "CONFLICTING" in r.stdout
@@ -727,7 +727,7 @@ def test_auto_merge_refuses_when_not_mergeable(tmp_path):
 @requires_git
 def test_auto_merge_refuses_when_checks_failing(tmp_path):
     """Checks that EXIST and are red block the merge (guard-1199/1264)."""
-    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\t3\\t1")
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\x1f3\\x1f1")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pr merge" not in cap
     assert "REFUSED" in r.stdout
@@ -737,7 +737,7 @@ def test_auto_merge_refuses_when_checks_failing(tmp_path):
 @requires_git
 def test_auto_merge_proceeds_when_checks_all_green(tmp_path):
     """The positive control for the branch above: same shape, 0 bad -> merges."""
-    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\t3\\t0")
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="MERGEABLE\\x1f3\\x1f0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pr merge" in cap
     assert "3 status check(s) all SUCCESS" in r.stdout
@@ -750,7 +750,7 @@ def test_auto_merge_trusts_remote_over_gh_exit_status(tmp_path):
     the remote merge SUCCEEDED. Reading the exit code would report a false
     failure; the remote mergedAt read is the only verdict."""
     r, cap = _auto_merge_run(tmp_path, "--auto-merge",
-                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0",
+                             SHIM_PR_FACTS="MERGEABLE\\x1f0\\x1f0",
                              SHIM_MERGE_FATAL="1",
                              SHIM_MERGED_AT="2026-08-10T07:11:00Z")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -765,12 +765,80 @@ def test_auto_merge_reports_when_remote_says_not_merged(tmp_path):
     """The other half of guard-1897: a clean gh exit is not success either.
     Empty mergedAt at the remote must surface as a WARNING, not as OK."""
     r, cap = _auto_merge_run(tmp_path, "--auto-merge",
-                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0",
+                             SHIM_PR_FACTS="MERGEABLE\\x1f0\\x1f0",
                              SHIM_MERGED_AT="")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pr merge" in cap
     assert "did NOT land" in r.stdout
     assert "--auto-merge OK" not in r.stdout
+
+
+# --- the two fail-OPEN mechanisms on the PR_FACTS parse () --------
+# Both were measured live on 2026-09-01 (alpha, cc-07, 6.8.0-137-generic) and
+# both defeated the SAME predicate — the status-check block — on the axis it
+# exists to defend (guard-2908: never force-merge past a required check).
+#
+# The harness CAN express them, contrary to this goal's filing, which said the
+# `printf '%b\n'` shim was "structurally incapable" of a CRLF line. It is not:
+# %b interprets \r and \x1f alike. Verified before these tests were written —
+# the claim would have justified skipping the only tests that matter here.
+
+
+@requires_git
+def test_auto_merge_refuses_when_checks_failing_under_crlf(tmp_path):
+    """MECHANISM 1 — trailing CR. Only the LAST field can carry it, so PR_BAD
+    becomes '1\r'; `[[ "1\r" -gt 0 ]]` raises 'invalid arithmetic operator'
+    and evaluates FALSE, so a PR with a FAILING check reached the merge."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS="MERGEABLE\\x1f3\\x1f1\\r")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--auto-merge REFUSED" in r.stdout
+    assert "1 of 3 status check(s) not SUCCESS" in r.stdout
+    assert "pr merge" not in cap
+
+
+@requires_git
+def test_auto_merge_still_merges_on_green_checks_under_crlf(tmp_path):
+    """The CR strip must not turn a GREEN run into a refusal — a fix that
+    refuses everything passes the test above and is still broken."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS="MERGEABLE\\x1f3\\x1f0\\r")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "3 status check(s) all SUCCESS" in r.stdout
+    assert "pr merge" in cap
+
+
+@requires_git
+def test_auto_merge_refuses_when_mergeable_is_null(tmp_path):
+    """MECHANISM 2 — empty-field collapse. jq renders null as an EMPTY field.
+    Under IFS=$'\t' (tab is IFS *whitespace*) the leading empty was STRIPPED
+    and every field shifted left: PR_MERGEABLE took the check count and PR_BAD
+    — the safety predicate — ended up empty, defaulting to 0.
+
+    The discriminator is in the MESSAGE, not merely in the refusal: pre-fix the
+    line read `mergeable=3` (the shifted check count), post-fix `mergeable=NULL`.
+    Asserting only "REFUSED" would pass against the shifted parse too, because
+    a shifted '3' is also != MERGEABLE — the bug refuses for the wrong reason
+    and would look fixed."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS="\\x1f3\\x1f1")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--auto-merge REFUSED: mergeable=NULL" in r.stdout
+    assert "mergeable=3" not in r.stdout
+    assert "pr merge" not in cap
+
+
+@requires_git
+def test_auto_merge_passes_delete_branch(tmp_path):
+    """Prevention half of the branch sweep (runbook Phase 7). The LOCAL half of
+    --delete-branch cannot succeed here — '$BRANCH' is checked out in the
+    promotion worktree and git refuses — so only the flag's presence is
+    assertable at this layer."""
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge",
+                             SHIM_PR_FACTS="MERGEABLE\\x1f0\\x1f0")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "pr merge" in cap
+    assert "--delete-branch" in cap
 
 
 def test_auto_merge_requires_pr_flag(tmp_path):
@@ -791,8 +859,8 @@ def test_auto_merge_polls_through_unknown_mergeable(tmp_path):
     almost every real promotion while passing every mocked test, so the poll is
     load-bearing and this pins it."""
     r, cap = _auto_merge_run(tmp_path, "--auto-merge",
-                             SHIM_PR_FACTS_FIRST="UNKNOWN\\t0\\t0",
-                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0")
+                             SHIM_PR_FACTS_FIRST="UNKNOWN\\x1f0\\x1f0",
+                             SHIM_PR_FACTS="MERGEABLE\\x1f0\\x1f0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "mergeable=UNKNOWN" in r.stdout and "re-reading" in r.stdout
     assert "pr merge" in cap
@@ -803,7 +871,7 @@ def test_auto_merge_polls_through_unknown_mergeable(tmp_path):
 def test_auto_merge_refuses_when_mergeable_never_resolves(tmp_path):
     """The other side of the poll: UNKNOWN that never resolves is a REFUSAL, not
     consent. Retrying must not decay into merging on an unresolved signal."""
-    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="UNKNOWN\\t0\\t0")
+    r, cap = _auto_merge_run(tmp_path, "--auto-merge", SHIM_PR_FACTS="UNKNOWN\\x1f0\\x1f0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pr merge" not in cap
     assert "REFUSED" in r.stdout and "UNKNOWN" in r.stdout
@@ -817,7 +885,7 @@ def test_auto_merge_survives_extra_stdout_from_pr_create(tmp_path):
     false UNREADABLE -> REFUSED. Only the last non-empty line is the URL."""
     r, cap = _auto_merge_run(tmp_path, "--auto-merge",
                              SHIM_CREATE_PREAMBLE="Warning: 3 uncommitted changes",
-                             SHIM_PR_FACTS="MERGEABLE\\t0\\t0")
+                             SHIM_PR_FACTS="MERGEABLE\\x1f0\\x1f0")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PR opened: https://github.com/acme/widget/pull/42" in r.stdout
     assert "Warning: 3 uncommitted changes" not in r.stdout.split("PR opened:")[1][:80]

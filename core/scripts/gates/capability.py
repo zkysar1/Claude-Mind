@@ -1360,6 +1360,42 @@ _GENERIC_NAME_PARTS = frozenset({
     # whose skill-name occurrence is incidental, and each retains its skill's
     # true discriminators (npc / margin / vinheim / play-mode / studio compounds)
     "session", "endpoint", "margin", "state", "health", "data", "report",
+    # measured FP 2026-08-30 (canonical invocation: test_capability_gate_narrative.py
+    # case g-115-148, which runs capability-gate.py itself). The defer prose
+    # "...before we land the unit-file change" uses `land` as ordinary English;
+    # it matched forged skill `land-stranded-pr` through the name-parts branch
+    # alone, so the gate refused the defer AND would auto-file an Unblock
+    # (Layer D) for a PR-landing skill that has nothing to do with a systemd
+    # unit file. Recall control per the SAFETY DIRECTION above, measured not
+    # argued: the FP carries exactly ONE shared token (`land`), while a genuine
+    # reference — "the PR went conflicting because main moved; I need to land
+    # the stranded PR onto main" — carries FOUR (land, main, onto, stranded)
+    # and survives on the >=2-hit path this predicate never reaches. So the
+    # demotion removes the collision and costs zero recall.
+    "land",
+    # measured FP SURVEY 2026-08-31 (g-115-4755; canonical evaluate() over the
+    # live corpus, cc-07). 89 of 202 name-only-qualifying tokens block a NEUTRAL
+    # prose carrier ("waiting for the <tok> to settle before this can proceed"),
+    # so this branch's premise -- a prose keyword equal to a name part is a
+    # deliberate reference -- fails for ~45% of its own population. The eight
+    # below are the unambiguous common-noun slice; each is ordinary English no
+    # domain reader would read as naming a specific thing, and each skill keeps
+    # 2+ real discriminators (checkin / fresh+review / decode+email /
+    # recover+clobbered+store / sweep+customer+server / mutation+regression+test
+    # / reconstruct+env+restart).
+    # SAFETY DIRECTION and the guard-958 recall control, MEASURED not argued,
+    # with OLD and NEW predicates run against ONE corpus snapshot in ONE process
+    # per guard-2201: neutral-carrier FPs 89 -> 81, REMOVED set == exactly these
+    # eight, ADDED set EMPTY, and an adversarial genuine reference for each
+    # ("run the felt-sense checkin", "decode the email body", "sweep the
+    # customer server usage", ...) STILL blocks after the demotion -- it carries
+    # 2+ tokens and survives on the >=2-hit path this predicate never reaches.
+    # Zero recall cost.
+    # Prescribed by guard-5594 (a forged skill NAME is a matcher token, not a
+    # label); cost basis guard-3505 (a FP does not merely refuse -- it also
+    # auto-files a HIGH-priority Unblock, so each of these manufactures
+    # fleet-visible work rather than noise).
+    "felt", "sense", "eyes", "body", "field", "usage", "proof", "timeline",
 })
 
 

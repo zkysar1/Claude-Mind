@@ -43,7 +43,17 @@ except ImportError:
 
 from storage_backend import get_backend  # type: ignore
 
-TERMINAL = {"answered", "closed", "resolved", "agent_answered", "done"}
+# : sourced from the shared vocabulary module, NOT re-inlined here.
+#
+# This is the CLOSER's set: "finished, stop asking". It is a strict superset of
+# the sweep's SWEEP_SETTLED, by exactly {answered, agent_answered} -- the states
+# this script writes, which are finished for the asker but still owe the sweep's
+# canonicalisation pass. That difference is intentional and pinned by a test; it
+# is NOT the accidental disagreement this goal was filed about.
+#
+# Widened by this goal to also cover `retired` and `superseded`, which were absent
+# here, so the closer would try to re-close an already-retired question.
+from _pending_question_status import CLOSED_STATUSES as TERMINAL  # noqa: F401
 
 
 def _find(qs, qid):

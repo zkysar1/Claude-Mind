@@ -1,21 +1,62 @@
 #!/usr/bin/env python3
 """utilization-stats — read-only reporting on guardrail / rb / rules utilization.
 
-Composite evidence score (single source of truth for retire-candidate ranking):
+TWO scores, deliberately. `evidence` is the composite reported to consumers;
+`attested_evidence` is the stricter numerator the RETIREMENT filter uses.
 
-    evidence = times_helpful
-             + 0.5  * times_inferred_helpful
-             + 0.25 * times_active
-             + 1.0  * times_cited
+    evidence          = times_helpful
+                      + 0.5  * times_inferred_helpful
+                      + 0.25 * times_active          <- automated scan term
+                      + 1.0  * times_cited
+
+    attested_evidence = times_helpful
+                      + 0.5  * times_inferred_helpful
+                      + 1.0  * times_cited           <- agent decisions only
 
 Candidate filter (B.1 of the curation plan):
 
     candidate iff
       status == 'active'
-      AND (auto_flagged_for_review == true   OR   evidence == 0)
+      AND (next_review_eligible_at is absent OR <= today)
+      AND (auto_flagged_for_review == true   OR   attested_evidence == 0)
       AND retrieval_count >= 50
       AND age_days >= 30
-      AND (next_review_eligible_at is absent OR <= today)
+
+WHY attested_evidence AND NOT evidence (g-115-8350, 2026-08-30). The filter
+read `evidence == 0 AND retrieval_count >= 50` for its whole life, and that
+conjunction is EMPTY BY CONSTRUCTION: every term of the composite accrues as a
+function of retrieval, so the two conjuncts are anti-correlated. Measured on
+the live corpus (zeta, cc-02, 6.8.0-137-generic) — zero-evidence rate by
+exposure bucket, guardrails / rb:
+
+    rc 0-9     23.8% / 18.3%
+    rc 10-49    1.1% /  3.0%
+    rc 50-99    0.0% /  0.0%
+    rc 100+     0.0% /  0.0%
+
+It reaches exactly 0% AT the floor and stays there, and the MAX retrieval_count
+among evidence==0 entries is 32 (guardrails) and 47 (rb) against a floor of 50
+— so the conjunct is DEAD, not merely unsatisfied (guard-2239's discriminator).
+The fleet's only anti-ratchet mechanism returned 0 candidates across 14,573
+active entries.
+
+The fix is the NUMERATOR, not the floors: neither MIN_EXPOSURE nor MIN_AGE_DAYS
+moved. times_active is not an attestation (guard-3995) — it is incremented on a
+text match by an automated bulk scan, and it supplies >=90% of the composite
+numerator for 56.0% of rb entries with nonzero evidence. Excluding it yields 57
+candidates: 2.0% of guardrails and 2.9% of rb within the rc>=50/age>=30
+population, where 98.0% / 97.1% of that same population DO carry attested
+evidence. That base rate is the control — the tail is real, not a cold counter.
+
+A ratio-based floor (attested/retrieval <= 0.02/0.05/...) was measured and
+REJECTED: it requires choosing an arbitrary threshold that decides which
+40-486 entries get proposed, while `attested == 0` needs no threshold at all
+and is strictly more conservative.
+
+NOT sufficient on its own: guard-707 still applies. An entry cited by ID in
+live framework files is load-bearing even at attested_evidence == 0 — 6 of the
+57 are (guard-145 appears in 16 live files). The curation sweep must grep
+before retiring; this filter proposes, it never acts.
 
 The exposure floor used to be `(retrieval_count + times_skipped) >= 50`, but
 the 2026-05-09 audit found `times_skipped` was inflated 2-15x by
@@ -88,6 +129,31 @@ EVIDENCE_WEIGHTS = {
     "times_cited": 1.0,
 }
 
+# ATTESTED evidence — the RETIREMENT numerator. Identical to EVIDENCE_WEIGHTS
+# with `times_active` REMOVED, because times_active is not an attestation:
+# guardrail-check.py increments it on a TEXT MATCH during an automated bulk
+# scan that fires twice per iteration per agent, fleet-wide, with no agent
+# decision anywhere in that path (guard-3995). Folding it into a retirement
+# score means "was frequently text-matched" reads as "was useful", which
+# inverts the ranking the curation sweep exists to produce.
+#
+# MEASURED 2026-08-30 (zeta, cc-02, 6.8.0-137-generic) on the live active
+# corpus: times_active supplies >=90% of the composite numerator for 4465 of
+# 7978 rb entries with nonzero evidence (56.0%), and the numerator is PURELY
+# scan noise for 4022 (50.4%). Worst case rb-592: times_active 6895 =>
+# evidence 1723.75, while times_helpful, times_inferred_helpful and
+# times_cited are ALL zero.
+#
+# `evidence` (above) is unchanged and still what report rows and the
+# aspirations-curate-memory consumer read; this is a SECOND, stricter score
+# used only by the candidate filter. Keep both — see guard-3995 step 3
+# ("report times_active separately as EXPOSURE, never folded into evidence").
+ATTESTED_WEIGHTS = {
+    "times_helpful": 1.0,
+    "times_inferred_helpful": 0.5,
+    "times_cited": 1.0,
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -146,6 +212,23 @@ def _evidence(util):
     return score
 
 
+def _attested_evidence(util):
+    """Retirement numerator: evidence MINUS the automated-scan term.
+
+    See ATTESTED_WEIGHTS. Zero here means no agent decision has ever marked
+    this entry helpful, inferred-helpful, or cited it — regardless of how
+    many times a bulk text scan happened to match it.
+    """
+    if not isinstance(util, dict):
+        return 0.0
+    score = 0.0
+    for key, weight in ATTESTED_WEIGHTS.items():
+        v = util.get(key, 0)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            score += weight * v
+    return score
+
+
 def _is_candidate(rec, today=None, counters=None):
     """Apply the candidate filter. See module docstring."""
     if today is None:
@@ -155,12 +238,45 @@ def _is_candidate(rec, today=None, counters=None):
 
     util = utilization_of(rec, counters) or {}
 
+    # The KEEP cooldown binds EVERY candidate, auto-flagged included. This check
+    # is deliberately ABOVE the auto-flag escape hatch: the docstring's filter is
+    # a conjunction that ends "AND (next_review_eligible_at is absent OR <=
+    # today)", but the early return below used to fire first, so a curator's
+    # explicit KEEP decision was silently ineffective for exactly the entries the
+    # sweep is told to look at, and they resurfaced every single day ().
+    # Measured 2026-08-30 on the live stores: 1 of 1 auto-flagged entries in EACH
+    # store was inside an unexpired cooldown (guard-541 -> 2026-09-13,
+    # rb-1327), and each was that store's ENTIRE candidate output. Suppressing
+    # them correctly returns 0, which is the honest reading — the non-flagged
+    # retire path is empty by construction (the second half of ), and
+    # the spurious single result was masking it.
+    eligible_after = _parse_date(rec.get("next_review_eligible_at"))
+    if eligible_after is not None and eligible_after > today:
+        return False
+
     # Auto-flagged forces inclusion (C.3 escape hatch — explicit "we tried
-    # --infer N times and couldn't classify, please review").
+    # --infer N times and couldn't classify, please review"). It bypasses the
+    # EVIDENCE clause only, exactly as the docstring says ("regardless of
+    # evidence"); it does NOT bypass the cooldown above. The exposure and age
+    # gates stay bypassed deliberately: measured, applying the FULL conjunction
+    # to auto-flagged entries admits 0 of 1 in BOTH stores, which would delete
+    # the escape hatch rather than repair it.
     if rec.get("auto_flagged_for_review"):
         return True
 
-    if _evidence(util) > 0:
+    # ATTESTED evidence, not the composite: `evidence == 0 AND retrieval_count
+    # >= 50` is EMPTY BY CONSTRUCTION, because the composite's own terms accrue
+    # as a function of retrieval, so the two conjuncts are anti-correlated
+    # (). Measured on the live corpus: zero-evidence rate is 23.8% /
+    # 18.3% at rc 0-9 and reaches EXACTLY 0.0% at rc>=50 and stays there; the
+    # max retrieval_count among evidence==0 entries is 32 (guardrails) and 47
+    # (rb) against a floor of 50 — a dead conjunct, not a clean store
+    # (guard-2239's discriminator). Excluding the scan term makes the filter
+    # discriminating again WITHOUT moving either floor: 57 candidates, i.e.
+    # 2.0% of guardrails and 2.9% of rb in the rc>=50/age>=30 population, where
+    # 98.0% / 97.1% of that same population DO carry attested evidence — so
+    # this is a real tail, not a cold-counter artifact.
+    if _attested_evidence(util) > 0:
         return False
 
     # Exposure = retrieval_count alone (2026-05-09 audit). times_skipped was
@@ -177,10 +293,7 @@ def _is_candidate(rec, today=None, counters=None):
     elif (today - created).days < MIN_AGE_DAYS:
         return False
 
-    eligible_after = _parse_date(rec.get("next_review_eligible_at"))
-    if eligible_after is not None and eligible_after > today:
-        return False
-
+    # (cooldown already applied above, before the auto-flag escape hatch)
     return True
 
 
@@ -193,7 +306,10 @@ def _candidate_sort_key(rec, counters=None):
     module docstring on the inflation issue).
     """
     util = utilization_of(rec, counters) or {}
-    evidence = _evidence(util)
+    # ATTESTED, matching _is_candidate: every candidate has attested == 0, so
+    # using the composite here would rank them by scan noise alone (rb-592,
+    # times_active 6895, would sort LAST despite zero attested value).
+    evidence = _attested_evidence(util)
     created = _parse_date(rec.get("created")) or _today()
     age_days = (_today() - created).days
     rc = util.get("retrieval_count", 0)
@@ -210,6 +326,7 @@ def _summarize(rec, kind, counters=None):
         "kind": kind,
         "status": rec.get("status"),
         "evidence": round(_evidence(util), 4),
+        "attested_evidence": round(_attested_evidence(util), 4),
         "retrieval_count": util.get("retrieval_count", 0),
         "times_helpful": util.get("times_helpful", 0),
         "times_inferred_helpful": util.get("times_inferred_helpful", 0),

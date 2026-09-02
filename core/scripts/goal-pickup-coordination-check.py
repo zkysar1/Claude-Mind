@@ -265,6 +265,172 @@ def extract_keywords(title):
     return out
 
 
+# ── Pre-claim supersession probe () ────────────────────────────
+# The sibling lanes above ask "is a PARTNER working this surface NOW?" by
+# reading git commits, uncommitted files, board posts and in_flight. This lane
+# asks a different question: "is the record this goal exists to change ALREADY
+# terminal?" — i.e. was the goal passing before it was ever claimed.
+#
+# Canonical incident (, 2026-08-02): a hypothesis-resolution goal was
+# claimed and executed in full before its hypothesis was found already resolved
+# by a partner two days earlier. race_risk was correctly false — resolving a
+# PIPELINE RECORD writes no commit (the store is external and gitignored), left
+# no claim post, and the in_flight had been released. Every existing lane was
+# pointed at a store the completing action never touches
+# (reclaim-routed-work.md rule 7). Encoded rb-6366.
+#
+# SCOPE, deliberately narrow (the goal's own SCOPE NOTE): ids are read from
+# verification.checks[] and the `skill` field ONLY, where they are near-
+# structured. Descriptions are free text and are NOT scanned — widen only on a
+# measured hit rate, never on intuition.
+#
+# guard-1161: every id width below is fully open-ended (`\d+`, never `\d{3}`).
+# These counters grow past their current digit count, and a width-pinned regex
+# silently stops matching at the rollover with no error anywhere.
+_REF_PIPELINE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2}_[a-z0-9][a-z0-9-]*)\b")
+_REF_ENTRY_RE = re.compile(
+    r"\b((?:rb|guard|sig|sq|bel|trans|sa|pt|asp)-\d+)\b", re.IGNORECASE)
+_REF_GOAL_RE = re.compile(r"\b(g-\d+-\d+)\b", re.IGNORECASE)
+
+
+def extract_referenced_record_ids(verification, skill=None):
+    """PURE. Extract record ids a goal's verification/skill NAMES, as
+    [{"id":..., "kind":...}] sorted and de-duplicated.
+
+    kind is one of: pipeline | entry | goal. Reads ONLY
+    verification.checks[] + verification.outcomes[] + the skill string —
+    NOT the description (see SCOPE above). Returns [] for any malformed
+    input: this is an advisory probe and must never raise.
+    """
+    parts = []
+    if isinstance(verification, dict):
+        for key in ("checks", "outcomes"):
+            v = verification.get(key)
+            if isinstance(v, str):
+                parts.append(v)
+            elif isinstance(v, (list, tuple)):
+                parts.extend(str(x) for x in v)
+    elif isinstance(verification, (list, tuple)):
+        parts.extend(str(x) for x in verification)
+    elif isinstance(verification, str):
+        parts.append(verification)
+    if skill:
+        parts.append(str(skill))
+    text = "\n".join(parts)
+    if not text.strip():
+        return []
+
+    found = {}
+    # Pipeline ids first: a YYYY-MM-DD_slug can contain no g-/rb- token, and
+    # matching it first keeps the cheaper patterns from splitting it.
+    for m in _REF_PIPELINE_RE.finditer(text):
+        found.setdefault(m.group(1), "pipeline")
+    for m in _REF_ENTRY_RE.finditer(text):
+        found.setdefault(m.group(1).lower(), "entry")
+    for m in _REF_GOAL_RE.finditer(text):
+        found.setdefault(m.group(1).lower(), "goal")
+    return [{"id": k, "kind": v} for k, v in sorted(found.items())]
+
+
+# Terminal states, per store. A goal that is `blocked` is NOT terminal — it is
+# waiting, and claiming it is legitimate.
+_TERMINAL_GOAL_STATUSES = frozenset({"completed", "skipped", "superseded"})
+_TERMINAL_PIPELINE_STAGES = frozenset({"resolved", "archived"})
+
+
+def classify_referenced_record(kind, record):
+    """PURE. Given a fetched record, decide whether it is ALREADY terminal.
+
+    Returns {"terminal": bool, "reason": str}. A None/unreadable record is
+    NOT terminal — absence of evidence never fires this advisory (fail-open;
+    the whole lane is report-only).
+    """
+    if not isinstance(record, dict):
+        return {"terminal": False, "reason": "unreadable"}
+
+    if kind == "pipeline":
+        stage = (record.get("stage") or "").strip().lower()
+        # guard-1433: `outcome` is a THREE-state field — absent, explicit
+        # null, or a value — so it must not be read with bare truthiness.
+        # A record can sit at stage=resolved with outcome still null while a
+        # partner is mid-resolution; that is NOT terminal and firing on it
+        # would be the false positive this lane's second test pins.
+        has_outcome = ("outcome" in record
+                       and record.get("outcome") is not None
+                       and str(record.get("outcome")).strip() != "")
+        if stage in _TERMINAL_PIPELINE_STAGES and has_outcome:
+            return {"terminal": True,
+                    "reason": "stage=%s outcome=%s" % (
+                        stage, str(record.get("outcome"))[:40])}
+        if stage in _TERMINAL_PIPELINE_STAGES:
+            return {"terminal": False,
+                    "reason": "stage=%s but outcome is null/absent" % stage}
+        return {"terminal": False, "reason": "stage=%s" % (stage or "unknown")}
+
+    if kind == "goal":
+        status = (record.get("status") or "").strip().lower()
+        if status in _TERMINAL_GOAL_STATUSES:
+            return {"terminal": True, "reason": "status=%s" % status}
+        return {"terminal": False, "reason": "status=%s" % (status or "unknown")}
+
+    if kind == "entry":
+        status = (record.get("status") or "").strip().lower()
+        if status == "retired":
+            return {"terminal": True, "reason": "status=retired"}
+        return {"terminal": False, "reason": "status=%s" % (status or "active")}
+
+    return {"terminal": False, "reason": "unknown kind"}
+
+
+def probe_referenced_records(refs):
+    """Impure. Read each referenced record and classify it. Fail-open: any
+    daemon error yields no advisory, never an exception.
+
+    SCOPE: pipeline refs ONLY for now. That is the canonical incident
+    (g-335-393 named a pipeline record) and both of this lane's regression
+    checks are written against it. Goal refs are extracted and REPORTED as
+    `not_probed` rather than silently dropped, because `_read_goal` reads
+    active=True and a TERMINAL goal is by definition absent from that set —
+    so "not found" and "already completed" are indistinguishable there, and
+    guessing either way would be an unearned verdict (rb-245 class).
+    """
+    out = {"checked": 0, "terminal": [], "not_probed": [], "errors": []}
+    if not refs:
+        return out
+    pipeline_refs = [r for r in refs if r.get("kind") == "pipeline"]
+    out["not_probed"] = [r["id"] for r in refs if r.get("kind") != "pipeline"]
+    if not pipeline_refs:
+        return out
+
+    records = {}
+    for stage in ("resolved", "archived"):
+        try:
+            raw = _rt.rt_call("GET", "/v1/pipeline/read",
+                              query={"stage": stage})
+            data = _rt.tolerant_decode_list(
+                "goal-pickup-coord: pipeline/%s" % stage, raw)
+        except Exception as e:
+            out["errors"].append("%s: %s" % (stage, e))
+            continue
+        for rec in (data or []):
+            if isinstance(rec, dict) and rec.get("id"):
+                records.setdefault(rec["id"], rec)
+
+    for ref in pipeline_refs:
+        out["checked"] += 1
+        rec = records.get(ref["id"])
+        # Absent from BOTH terminal stages => not terminal. Correct fail-open
+        # direction: a missing record never fires the advisory.
+        if rec is None:
+            continue
+        verdict = classify_referenced_record("pipeline", rec)
+        if verdict.get("terminal"):
+            out["terminal"].append(
+                {"id": ref["id"], "kind": "pipeline",
+                 "reason": verdict.get("reason", "")})
+    return out
+
+
 def commit_goal_id(subject):
     """Extract the goal id from a commit subject's scope, else None. Pure."""
     if not subject:
@@ -1115,7 +1281,7 @@ def _git_behind_count(repo_dir, timeout_s=10):
     preserving the `_git_fetch_remote` restraint documented above (guard-741).
 
     WHY this exists: the "pull before premise-checking" lesson is encoded 78
-    times (16 guardrails + 62 rb entries, e.g. guard-1361 / rb-3726) and every
+    times (16 guardrails + 62 rb entries, e.g. guard-1759 / rb-3726) and every
     one is Layer A — the agent remembering. None of them SHOWS the number. A
     grep of a behind checkout returns zero hits and reads authoritative, which
     is how g-335-282's premise read FALSE against a tree 9 commits stale. This
@@ -1563,7 +1729,7 @@ def _scan_product_repos(goal_id, surface_text, affected_paths, keywords,
                     f"[goal-pickup-coord] ADVISORY: product repo '{n}' is "
                     f"{_behind} commit(s) behind origin — a grep of this "
                     f"working tree is reading a stale snapshot "
-                    f"(guard-1361/rb-3726: pull before premise-checking).",
+                    f"(guard-1759/rb-3726: pull before premise-checking).",
                     file=sys.stderr,
                 )
             if gh_ok:
@@ -2333,6 +2499,12 @@ def main():
     vtext = json.dumps(verification) if verification else ""
     surface_text = "\n".join([title, desc, vtext])
 
+    # Pre-claim supersession lane (). Narrow by design: reads ids
+    # from verification + skill only, never the free-text description.
+    referenced_refs = extract_referenced_record_ids(
+        verification, (goal or {}).get("skill"))
+    referenced_records = probe_referenced_records(referenced_refs)
+
     affected_paths = extract_paths(surface_text)
     keywords = extract_keywords(title)
 
@@ -2433,6 +2605,10 @@ def main():
         "affected_paths": sorted(affected_paths),
         "keywords": sorted(keywords),
         "race_risk": race_risk,
+        # Emitted on EVERY run, hit or not (guard-5271): a key that
+        # appears only on a hit makes "ran, found nothing" and "never
+        # ran" byte-identical. `checked` is the readable zero.
+        "referenced_records": referenced_records,
         "overlapping_commits": overlapping,
         "matched_uncommitted": matched_uncommitted,
         "board_partner_activity": board_hits,

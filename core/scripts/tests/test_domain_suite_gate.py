@@ -366,6 +366,60 @@ def test_an_override_on_a_green_suite_writes_no_ledger_row(tmp_path):
     assert not (world / "domain-suite-overrides.jsonl").exists()
 
 
+def test_the_refusal_never_invites_a_pre_existing_override(tmp_path):
+    """Every blocking branch has ALREADY excluded pre-existing reds, so the
+    refusal must not offer that as a rationale. It used to, and the fleet
+    complied exactly as instructed: measured 2026-08-30 across 8 live workers,
+    7 of 12 refusals were overridden and EVERY justification claimed the reds
+    were "pre-existing" — one of them reading "all 47 NEW reds are pre-existing
+    failures". The operators were honest; the prompt named the one condition
+    that cannot hold at that line. This pins the text that replaced it.
+    """
+    world = _world(tmp_path, {"test_red.py": RED_TEST})
+    _seed(tmp_path, world)
+    (world / "scripts" / "tests" / "test_red2.py").write_text("def test_red2():\n    assert 0\n", encoding="utf-8")
+    rc, doc, err = _run(tmp_path, world, "--since", OLD)
+    assert rc == 1 and doc["decision"] == "block"
+    assert "NOT pre-existing" in err
+    assert "do not override by calling them that" in err
+    # The retired instruction must not come back.
+    assert "Only when the red is PRE-EXISTING" not in err
+    # Controls: it must still say HOW to override, and name the causes that
+    # ARE available — a refusal that only forbids teaches nothing.
+    assert "--override-domain-suite" in err
+    assert "concurrent unit" in err and "flaky" in err
+
+
+def test_the_override_ledger_records_the_blocking_units_verbatim(tmp_path):
+    """`reason` is free prose no reader can check. `blocking_units` is the set
+    the block was actually about, untruncated (`why` cuts off at 6 with " ..."),
+    so a later audit can test an override's claim against what was really red.
+    """
+    world = _world(tmp_path, {"test_red.py": RED_TEST})
+    _seed(tmp_path, world)
+    (world / "scripts" / "tests" / "test_red2.py").write_text("def test_red2():\n    assert 0\n", encoding="utf-8")
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD, "--override", "g-000-00: partner broke it")
+    assert rc == 0 and doc["decision"] == "override"
+    row = json.loads((world / "domain-suite-overrides.jsonl").read_text(encoding="utf-8").strip())
+    assert row["blocking_units"] == ["tests/test_red2.py::test_red2"]
+    assert row["baseline_recorded_at"], "the baseline this override was judged against"
+    # Control: the genuinely pre-existing red is NOT in the blocking set, which
+    # is what makes a "pre-existing" claim checkable rather than rhetorical.
+    assert "tests/test_red.py::test_red" not in row["blocking_units"]
+
+
+def test_a_collection_error_override_records_no_blocking_units(tmp_path):
+    """A collection error identifies no unit, so the field is empty rather than
+    absent or guessed. Empty is the honest answer AND the fingerprint of the one
+    override the gate says is never legitimate."""
+    world = _world(tmp_path, {"test_broken.py": BROKEN_IMPORT_TEST})
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD, "--override", "g-000-00: forced")
+    assert rc == 0 and doc["decision"] == "override"
+    row = json.loads((world / "domain-suite-overrides.jsonl").read_text(encoding="utf-8").strip())
+    assert row["blocking_units"] == []
+    assert row["baseline_recorded_at"] is None
+
+
 # ─── the runner hook ──────────────────────────────────────────────────────
 
 def test_the_world_runner_hook_takes_precedence_over_pytest(tmp_path):
@@ -433,6 +487,94 @@ def test_bad_since_is_a_usage_error_not_a_block(tmp_path):
                           cwd=str(PROJECT_ROOT), env=env, capture_output=True, text=True, check=False)
     assert proc.returncode == 2
     assert "not an ISO timestamp" in proc.stderr
+
+
+# --- the baseline's per-box scope is ENFORCED, not merely claimed () ---
+#
+# The gate's scope comment said the baseline is per box because the write is "a
+# plain write to the world mirror; on a synced world it stays local". The write
+# IS plain, but the sync WALK picks the file up afterwards, so on an own-cloud
+# deployment two boxes rewrote one shared S3 object. merge_handler_for returns
+# None for it (governed-store-write-classes class (b), fence-only), so the
+# resulting fence never self-resolves: measured both-diverged for 123 consecutive
+# mirror sweeps on cc-07 and 417 on cc-02. Because the consumer is a ratchet
+# GATE, a foreign box's baseline mis-gates closes in BOTH directions -- admitting
+# a regression the other box already carried, or blocking on a red never seen here.
+#
+# These pin the cure, which lives in a DIFFERENT file
+# (owncloud_sync._EXCLUDE_NAMES) from the gate that depends on it -- exactly the
+# split that let the premise rot unnoticed.
+
+def _both_legs_machine_local(name: str) -> bool:
+    """The full predicate, BOTH legs. Calling _is_machine_local alone is the
+    documented trap (guard-2471): it deliberately does not test _EXCLUDE_DIRS,
+    and one leg returns a confidently wrong answer rather than an error."""
+    sys.path.insert(0, str(CORE_SCRIPTS))
+    import owncloud_sync as ocs
+    root = Path("/nonexistent-world")
+    target = root / name
+    rel = target.relative_to(root)
+    leg_dirs = any(seg in ocs._EXCLUDE_DIRS for seg in rel.parts[:-1])
+    leg_name = ocs._is_machine_local(target.name, "world",
+                                     full_path=target, root_path=root)
+    return leg_dirs or leg_name
+
+
+def test_baseline_is_machine_local():
+    assert _both_legs_machine_local("domain-suite-baseline.json"), (
+        "domain-suite-baseline.json must be machine-local, or two boxes rewrite "
+        "one shared S3 object and the class-(b) fence wedges permanently")
+
+
+@pytest.mark.parametrize("shared", ["reasoning-bank.jsonl", "guardrails.jsonl",
+                                    "aspirations.jsonl", "pipeline.jsonl"])
+def test_shared_stores_still_sync(shared):
+    """guard-3018 control, and the load-bearing half: adding a SHARED,
+    authoritative-in-S3 file to the machine-local sets means one box's writes
+    never reach S3 and every peer diverges permanently, with nothing erroring.
+    A test asserting only the target would pass just as well if the whole set
+    had been widened."""
+    assert not _both_legs_machine_local(shared), (
+        f"{shared} became machine-local -- that is silent cross-box data loss, "
+        f"not a scope fix")
+
+
+def test_baseline_pull_cannot_clobber_the_only_good_copy():
+    """A machine-local file is never pushed, so a force-pull before an in-lock
+    read would overwrite the only good (local) copy with whatever stale object
+    the remote holds (guard-881). refresh_would_clobber must gate it now, and
+    must NOT gate a genuinely synced store."""
+    sys.path.insert(0, str(CORE_SCRIPTS))
+    import owncloud_sync as ocs
+    root = Path("/nonexistent-world")
+
+    class _Be:
+        _roots = [(root, "world")]
+
+    assert ocs.refresh_would_clobber(_Be(), root / "domain-suite-baseline.json") is True
+    assert ocs.refresh_would_clobber(_Be(), root / "guardrails.jsonl") is False
+
+
+def test_scope_comment_no_longer_asserts_the_falsified_premise():
+    """The prose is what routed every prior reader away from the defect, so pin
+    it: a comment claiming a plain write "stays local" on a synced world is the
+    exact false premise this fix removed (guard-4526 -- correct the artifacts
+    written under the old premise in the same change)."""
+    src = (CORE_SCRIPTS / "domain-suite-gate.py").read_text(encoding="utf-8")
+    # The phrase may survive ONCE, quoted as the premise that was falsified --
+    # that history is the point (guard-4526). What must never return is the
+    # phrase stated as CURRENT fact, i.e. a second occurrence or a surviving
+    # occurrence with no correction beside it.
+    stale = "on a synced world it stays local"
+    assert src.count(stale) <= 1, (
+        "the falsified scope premise is asserted again in domain-suite-gate.py")
+    if stale in src:
+        assert "was FALSE" in src, (
+            "the old premise is quoted but nothing marks it false -- a reader "
+            "will take the quote for the current rule")
+    assert "_EXCLUDE_NAMES" in src, (
+        "the comment must name the mechanism that actually enforces per-box "
+        "scope, so the next reader can find it")
 
 
 if __name__ == "__main__":

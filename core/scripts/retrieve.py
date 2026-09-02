@@ -215,7 +215,7 @@ SUPPLEMENTARY_CAPS = {"shallow": 20, "medium": 40, "deep": 80}
 from tree_match import (
     build_concept_index, _match_nodes, _include_siblings,
     _include_parents, _score_and_limit, _compute_match_score, CHANNEL_SCORES,
-    COSINE_BONUS_WEIGHT, _mmr_rerank,
+    COSINE_BONUS_WEIGHT, _mmr_rerank, safe_num,
 )
 
 def _goal_id_is_terminal(goal_id):
@@ -1531,15 +1531,23 @@ def _sort_by_utility(entries, counters=None):
     def _key(r):
         # No `or {}` guard: utilization_of documents that it returns {} rather
         # than None precisely so callers can .get() directly (see its docstring).
-        util = _utilization_of(r, counters).get("utilization_score", 0) or 0
+        # safe_num (g-357-49): a non-numeric utilization_score was `str * float`
+        # under the blend (and a mixed-type sort tuple without it) — one
+        # malformed record crashed the whole query's sort.
+        util = safe_num(
+            _utilization_of(r, counters).get("utilization_score", 0) or 0,
+            0.0, rid=r.get("id", ""), field="utilization_score")
         # M-5: provenance is the secondary key (a trust signal — DIRECT over
         # HEARSAY at equal utility). When the poignancy blend is on, the
         # poignancy factor stays a lower-priority key so it still orders the
         # large util*pf==0 mass within equal provenance.
+        # str() on created: a non-string value would make this sort key a
+        # mixed-type tuple against sibling records and crash the sort (same
+        # g-357-49 class — the record must cost itself, not the query).
         if blend:
             pf = _poignancy_weight(r, cfg)
-            return (util * pf, _prov_w(r), pf, r.get("created", "") or "")
-        return (util, _prov_w(r), r.get("created", "") or "")
+            return (util * pf, _prov_w(r), pf, str(r.get("created", "") or ""))
+        return (util, _prov_w(r), str(r.get("created", "") or ""))
 
     entries.sort(key=_key, reverse=True)
     return entries
@@ -2092,6 +2100,121 @@ def load_framework_rules(categories):
                                 e["path"]))
     return matches[:FRAMEWORK_RULES_CAP]
 
+# ---------------------------------------------------------------------------
+# Forged skills (g-115-8226 — implementation of the decision g-115-3267
+# measured its way to).
+#
+# The problem: a goal's execution can reinvent work a forged skill already
+# does. g-115-3267 measured 24 of 632 completed goals (3.8%) carrying a
+# forged trigger phrase LITERALLY, and established that 3.8% is a FLOOR, not
+# an estimate — triggers are INTENT-phrased ("land a stranded PR") while
+# goals are PROBLEM-phrased ("commit is stranded on an unmerged branch").
+# The measurement proves its own undercount: g-115-8176/8177 matched on
+# "stranded commit" while g-115-8173 — same family, same defect, hand-executed
+# the same session — did not, on wording alone.
+#
+# Why this lane and not an execute-preamble grep: a grep can only ever catch
+# the literal 3.8% and is blind to exactly the intent-vs-problem gap that
+# dominates. This surfaces at goal-execution retrieval, already upstream of
+# Phase 6.5, so it satisfies g-115-3267 outcome 3 without a new call site.
+#
+# THE BINDING IS LOAD-BEARING AND IS *NOT* THE RB/GUARDRAIL ONE. Forged
+# skills carry NO category field, so the combined `_entry_matches` predicate
+# (strict category FIRST, token-overlap only as fallback) would match nothing
+# and return an empty store on every query — and it would LOOK correct,
+# because empty is also what a genuine no-match returns. This lane therefore
+# binds DIRECTLY to `_entry_matches_text`, the same choice `load_framework_rules`
+# makes for the same reason. That channel is what the goal's whole rationale
+# rests on: token overlap surfaces stranded+PR/branch and two-way+diff despite
+# the phrasing mismatch. Bind it anywhere else and the 3.8%-floor argument
+# stops applying.
+# ---------------------------------------------------------------------------
+
+FORGED_SKILLS_PATH = WORLD_DIR / "forged-skills.yaml" if WORLD_DIR else None
+
+# Cap on returned forged-skill entries. Deliberately tighter than
+# FRAMEWORK_RULES_CAP: the job is to surface THE matching skill, not a
+# catalogue, and an over-long list at execution time is noise the reader
+# scrolls past. 80 skills live in the store today, which is EXACTLY
+# SUPPLEMENTARY_CAPS["deep"] — so an unranked lane would return everything at
+# depth=deep and the cap would be doing nothing. Ranking by query overlap
+# before the cut (below) is what makes this number mean something.
+FORGED_SKILLS_CAP = 10
+
+
+def _build_forged_skills_index():
+    """Synthetic match entries for the forged-skill registry.
+
+    Field names are chosen for compatibility with `_entry_token_corpus`
+    (which scans `title`, `content`, `rule`, `summary`, `tags`,
+    `when_to_use.conditions`):
+      name    — the registry key, which IS the skill name; there is no id field
+      title   — the same key, so the skill's own words join the match corpus
+      content — the trigger phrases joined; THIS is the text the lane matches on
+
+    STORE SHAPE, measured 2026-09-01 rather than assumed: the YAML has TWO
+    top-level keys, `skills` (80 entries, 79 carrying triggers) and
+    `skills_pending_commit` (2). The skill records are nested one level DOWN
+    under `skills` — a loader that iterates the top level finds two keys, no
+    triggers, and returns an empty index while looking perfectly healthy.
+    `skills_pending_commit` is deliberately EXCLUDED: an uncommitted skill is
+    not yet reachable fleet-wide, so surfacing it would advertise a capability
+    a peer Body cannot invoke.
+
+    Opportunistic like `_build_framework_index`: an unreadable or malformed
+    store yields [] rather than failing the whole retrieve call.
+    """
+    if not FORGED_SKILLS_PATH:
+        return []
+    data = read_yaml(FORGED_SKILLS_PATH)
+    skills = (data or {}).get("skills")
+    if not isinstance(skills, dict):
+        return []
+    entries = []
+    for name, rec in skills.items():
+        if not isinstance(name, str) or not isinstance(rec, dict):
+            continue
+        triggers = [t for t in (rec.get("triggers") or []) if isinstance(t, str)]
+        if not triggers:
+            # No triggers = nothing to match on. Skipping keeps the corpus
+            # honest rather than admitting an entry that can never hit.
+            continue
+        entries.append({
+            "name": name,
+            "title": name,
+            "content": " ".join(triggers),
+            "triggers": triggers,
+            "type": rec.get("type"),
+            "parent": rec.get("parent"),
+            "companion_scripts": rec.get("companion_scripts") or [],
+        })
+    return entries
+
+
+def load_forged_skills(categories):
+    """Return forged skills whose TRIGGER phrases overlap the query.
+
+    Reuses `_entry_matches_text` (token overlap) — see the block comment
+    above for why the category-first predicate is wrong for this store.
+    No side effects: forged skills carry no utilization counters, so there
+    is nothing to bump and no lock to take (same shape as
+    `load_framework_rules`).
+
+    Ranked by `_query_overlap` DESC then name, then capped. The rank is not
+    cosmetic: at 80 entries the store sits exactly on the deep supplementary
+    cap, so cutting an unranked list would be indistinguishable from not
+    capping at all.
+
+    Returns [] when categories is empty/falsy — symmetric with
+    `_entry_matches_text`, which requires at least one query token.
+    """
+    if not categories:
+        return []
+    entries = _build_forged_skills_index()
+    matches = [e for e in entries if _entry_matches_text(e, categories)]
+    matches.sort(key=lambda e: (-_query_overlap(e, categories), e["name"]))
+    return matches[:FORGED_SKILLS_CAP]
+
 def load_experiences(categories, depth, read_only=False):
     """Load top N experiences matching any category. Increment retrieval counters unless read_only.
 
@@ -2135,9 +2258,13 @@ def load_experiences(categories, depth, read_only=False):
         if _entry_matches(r, categories):
             matching.append(r)
 
-    # Sort by retrieval_count descending (most-proven first)
+    # Sort by retrieval_count descending (most-proven first). safe_num
+    # (g-357-49): a non-numeric count would make a mixed-type sort key and
+    # crash the whole query's sort.
     matching.sort(
-        key=lambda r: r.get("retrieval_stats", {}).get("retrieval_count", 0),
+        key=lambda r: safe_num(
+            (r.get("retrieval_stats") or {}).get("retrieval_count", 0), 0.0,
+            rid=r.get("id", ""), field="retrieval_stats.retrieval_count"),
         reverse=True,
     )
 
@@ -2380,7 +2507,8 @@ def _utility_weight(node, cfg=None):
     "no centering" instead of to the bug.
     """
     cfg = cfg or _load_retrieval_config()
-    rc = node.get("retrieval_count", 0) or 0
+    rc = safe_num(node.get("retrieval_count", 0) or 0, 0.0,
+                  rid=node.get("key", ""), field="retrieval_count")
     if rc < cfg["utility_weight_neutral_below_retrievals"]:
         return 1.0
     # Path-c no-feedback-signal exemption (origin/design g-115-1284, guard-393).
@@ -2396,9 +2524,10 @@ def _utility_weight(node, cfg=None):
        and (node.get("times_inferred_helpful", 0) or 0) == 0 \
        and (node.get("times_noise", 0) or 0) == 0:
         return 1.0
-    ur = node.get("utility_ratio", 0) or 0
+    ur = safe_num(node.get("utility_ratio", 0) or 0, 0.0,
+                  rid=node.get("key", ""), field="utility_ratio")
     center = float(cfg.get("utility_weight_center", 0.0) or 0.0)
-    w = 1.0 + (float(ur) - center)
+    w = 1.0 + (ur - center)
     lo = float(cfg["utility_weight_min"])
     hi = float(cfg["utility_weight_max"])
     if w < lo:

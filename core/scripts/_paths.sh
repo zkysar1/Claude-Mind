@@ -32,12 +32,32 @@ export PROJECT_ROOT="$(cd "$CORE_ROOT/.." && pwd)"  # repo root (exported so wor
 CONFIG_DIR="$CORE_ROOT/config"
 REPO_ROOT="$PROJECT_ROOT"                        # legacy alias
 
-# --- Python 3 interpreter resolution ---
-# Ensures 'python3' is available on PATH regardless of platform.
-# On Windows (Git Bash): python3 may be a Microsoft Store stub — falls back to py launcher.
-# On any platform: falls back to 'python' if it's Python 3.8+.
-# Creates a cached shim script in .python-shim/ (gitignored). Delete to re-detect.
+# --- Python 3 interpreter resolution (WINDOWS SHELLS ONLY) ---
+# On Git Bash / MSYS2 / Cygwin, `python3` may be a Microsoft Store stub that
+# exits 49 or hangs. This block resolves a working launcher and caches a shim
+# script in .python-shim/ (gitignored — delete the dir to re-detect).
+#
+# : GATED on a Windows shell; skipped entirely on Linux/macOS/WSL —
+# no PATH prepend, no probe, no generation. python3 is native there, and a shim
+# on a Linux box is not merely useless but dangerous: a shim that execs a
+# PATH-relative launcher NAME, on a box whose `py` is itself an `exec python3`
+# wrapper, forms an exec-loop — one PID, ~0 RSS, cpu_time ≈ elapsed — that no
+# count/RSS monitor sees. It burned a full core on the fleet host for 3 days
+# (rb-9904, guard-5772). The old unbounded probe could also SELF-INSTALL that
+# loop: `python3 -c pass` entering an existing loop hangs, and a "python3 is
+# unusable" verdict then wrote the very shim that loops.
+#
+# The gate reads $OSTYPE — set by bash itself at startup, no fork: `msys` on
+# Git Bash/MSYS2, `cygwin` on Cygwin, `linux-gnu` on Linux/WSL, `darwin*` on
+# macOS. Empty or anything else means "not a Windows shell" → skip. bash honours
+# an INHERITED OSTYPE (set-if-not), which is what lets the regression test
+# (core/scripts/tests/test_paths_python_shim.py) simulate either platform on
+# either box.
 _PY_SHIM_DIR="$SCRIPT_DIR/.python-shim"
+case "${OSTYPE:-}" in
+    msys*|cygwin*) _PY_SHIM_PLATFORM=1 ;;
+    *)             _PY_SHIM_PLATFORM=0 ;;
+esac
 # TEST SEAM (). MIND_SKIP_PY_SHIM=1 suppresses the PATH prepend below.
 # Unset in production, so the default path is unchanged for every real caller.
 #
@@ -53,8 +73,8 @@ _PY_SHIM_DIR="$SCRIPT_DIR/.python-shim"
 #
 # Only ever set this in a test that provides its own python3 on PATH. Setting it
 # without one leaves `python3` unresolvable on Windows.
-if [ "${MIND_SKIP_PY_SHIM:-}" = "1" ]; then
-    :   # test-controlled: leave PATH alone so a test-provided python3 stub wins
+if [ "${MIND_SKIP_PY_SHIM:-}" = "1" ] || [ "$_PY_SHIM_PLATFORM" = "0" ]; then
+    :   # test-controlled, or not a Windows shell: leave PATH alone
 elif [ -x "$_PY_SHIM_DIR/python3" ]; then
     export PATH="$_PY_SHIM_DIR:$PATH"
     # Backfill: older shim dirs only had python3 — also expose `python` for
@@ -63,35 +83,43 @@ elif [ -x "$_PY_SHIM_DIR/python3" ]; then
         cp "$_PY_SHIM_DIR/python3" "$_PY_SHIM_DIR/python" 2>/dev/null && \
             chmod +x "$_PY_SHIM_DIR/python"
     fi
-elif ! python3 -c "pass" &>/dev/null; then
+elif ! timeout 15 python3 -c "pass" &>/dev/null; then
+    # BOUNDED probe (). A hang here — rc=124 — is the Store stub's
+    # signature (or an exec-loop already on PATH) and reads as "python3 is
+    # unusable", which is exactly the condition the shim exists for. The
+    # platform gate above is what makes acting on that verdict safe: this
+    # branch can never run on a Linux box, so it can never self-install a
+    # Linux exec-loop.
     _PY_TARGET=""
     if command -v py &>/dev/null; then
-        _PY_TARGET="py"
-    elif command -v python &>/dev/null && python -c "import sys;sys.exit(0 if sys.version_info>=(3,8) else 1)" &>/dev/null; then
-        _PY_TARGET="python"
+        _PY_TARGET="$(command -v py)"
+    elif command -v python &>/dev/null && \
+         timeout 15 python -c "import sys;sys.exit(0 if sys.version_info>=(3,8) else 1)" &>/dev/null; then
+        _PY_TARGET="$(command -v python)"
     fi
+    # Never generate from a candidate that resolves inside the shim dir itself.
+    case "$_PY_TARGET" in
+        "$_PY_SHIM_DIR"/*) _PY_TARGET="" ;;
+    esac
     if [ -n "$_PY_TARGET" ]; then
         mkdir -p "$_PY_SHIM_DIR"
-        # Multi-launcher shim with self-recursion guard (2026-08-06): the shim
-        # runs later in subprocess chains whose PATH differs from generation
-        # time (C:\Windows often stripped, so `py` unresolvable) — it must
-        # re-resolve per call and must never exec a candidate that resolves
-        # back into its own dir. That exec loop spawned alternating env+bash
-        # pairs at ~700MB each until the caller timed out, on every hook and
-        # polling tick.
-        cat > "$_PY_SHIM_DIR/python3" <<'PYSHIM'
+        # The generated shim execs the ABSOLUTE path resolved HERE, at
+        # generation time — never a bare launcher name re-resolved per call.
+        # The pre-2026-09-01 shim looped over candidate NAMES (py python
+        # python3 /c/Windows/py) because subprocess chains strip C:\Windows
+        # from PATH; an absolute path needs no PATH at all, so that concern is
+        # moot, and a name can no longer resolve back into a wrapper that
+        # execs `python3` by name. If the interpreter moves, the shim fails
+        # LOUDLY (rc=127, naming the remedy) instead of guessing.
+        cat > "$_PY_SHIM_DIR/python3" <<PYSHIM
 #!/usr/bin/env bash
-shim_dir=$(cd "$(dirname "$0")" && pwd)
-for candidate in py python python3 /c/Windows/py; do
-  resolved=$(command -v "$candidate" 2>/dev/null)
-  if [ -z "$resolved" ] && [ -x "$candidate" ]; then resolved="$candidate"; fi
-  [ -n "$resolved" ] || continue
-  case "$resolved" in
-    "$shim_dir"/*) continue ;;
-  esac
-  exec "$resolved" "$@"
-done
-echo "python3 shim: no Python launcher found (tried: py, python, python3, /c/Windows/py)" >&2
+# Generated by core/scripts/_paths.sh (). Delete this directory to
+# re-detect. Absolute target resolved at generation — never a bare name.
+_py="$_PY_TARGET"
+if [ -x "\$_py" ]; then
+    exec "\$_py" "\$@"
+fi
+echo "python3 shim: \$_py is gone — delete \$(dirname "\$0") to re-detect" >&2
 exit 127
 PYSHIM
         chmod +x "$_PY_SHIM_DIR/python3"
@@ -101,7 +129,7 @@ PYSHIM
     fi
     unset _PY_TARGET
 fi
-unset _PY_SHIM_DIR
+unset _PY_SHIM_DIR _PY_SHIM_PLATFORM
 
 # --- Centralized Python bytecode cache (2026-05-19, plan v1 step 0.20) ---
 # Without this, Python writes __pycache__/ subdirs next to every .py file —
@@ -299,7 +327,27 @@ else
         [ -f "$_CONF" ] || continue
         source "$_CONF"
         if [ -n "${WORLD_PATH:-}" ]; then
-            if [ -n "$AGENT_NAME" ]; then
+            # SILENCE GATE () -- MIRROR of the same gate in
+            # core/scripts/_paths.py _read_local_paths() (guard-867: an
+            # agent-dir/path-resolver change must be mirrored across every
+            # resolver layer). Keep the two predicates identical.
+            # Quiet ONLY when BOTH harms are unreachable:
+            #   .mind-data/ exists -> WORLD/META come from that tier, so which
+            #     conf the loop picked cannot matter ( M1);
+            #   the named agent dir exists -> AGENT_DIR (which this warning
+            #     itself notes "still points at the named agent") resolves to a
+            #     real provisioned dir, so agent-private writes are not
+            #     misrouted into new cruft.
+            # Either predicate ALONE is insufficient: .mind-data covers WORLD/
+            # META only, and it is the agent-dir half that still bites. Measured
+            # 2026-08-30 (zeta, cc-02): 6 of 7 real fleet agents have no conf,
+            # so this fired on ~6/7 invocations naming a polluter that does not
+            # exist; with the gate, `test-alpha-zzz` (the literal 
+            # pattern) stays LOUD.
+            if [ -d "$PROJECT_ROOT/.mind-data" ] && [ -n "$AGENT_NAME" ] \
+                 && [ -d "$(agent_dir "$AGENT_NAME")" ]; then
+                : # neither harm reachable -- silent by design
+            elif [ -n "$AGENT_NAME" ]; then
                 echo "[_paths] WARN: MIND_AGENT='$AGENT_NAME' but $(agent_dir "$AGENT_NAME")/local-paths.conf does not exist. Falling through to first-available conf ($(basename "$(dirname "$_CONF")")) for WORLD/META; AGENT_DIR still points at the named agent. Likely a test polluter set MIND_AGENT without restoring it (g-115-960 / g-115-6417)." >&2
             elif [ "$_CONF_COUNT" -gt 1 ]; then
                 echo "[_paths] WARN: MIND_AGENT unset, falling through to first agent: $(basename "$(dirname "$_CONF")"). This is usually a hook miss -- check core/logs/bash-inject-misses.jsonl for the SID (g-115-1146)." >&2

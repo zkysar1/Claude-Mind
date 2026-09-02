@@ -502,7 +502,12 @@ def test_sync_one_over_gzip_object_no_thrash_and_pushes_local_change(cloud, tmp_
     got2 = sync._sync_one(b, p, dry_run=False, stats=s2, baseline_md5=V1_MD5,
                           multi_machine=True, own_cloud_authority=True)
     assert got2 == V2_MD5, s2
-    assert s2.get("pushed_merged", 0) == 1, s2   # registered store -> union push
+    # s3_at_baseline gate (, 3f8ff55800): S3 UNCHANGED since baseline
+    # -> the fenced mirror_put is safe and the union lane is bypassed (the
+    # union fires only when S3 moved off baseline). This asserted the pre-gate
+    # unconditional-union routing until 2026-09-01 — the gate adoption updated
+    # test_owncloud_sync_merge_lanes.py but missed this file.
+    assert s2["pushed"] == 1 and s2.get("pushed_merged", 0) == 0, s2
     h = _head(cloud, key)
     assert h["ContentEncoding"] == "gzip" and h["Metadata"]["plain-md5"] == V2_MD5
     assert b.read_authoritative_bytes(p) == V2

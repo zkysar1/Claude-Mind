@@ -107,6 +107,11 @@ def test_world_wins_when_both_queues_hold_the_id():
 @pytest.mark.parametrize("rec,expected", [
     ({"blocker_ref": "blk-001"}, True),
     ({"blocked_by": ["g-115-1"]}, True),
+    # blocked_by is polymorphic in the live store (160 list / 2 bare str,
+    # measured 2026-09-01) -- the string shape was absent from this matrix
+    # while both live instances sat in the store. guard-5479.
+    ({"blocked_by": "g-369-08"}, True),
+    ({"blocked_by": "   "}, False),
     ({"blocker_ref": "", "blocked_by": []}, False),
     ({"defer_reason": "human_blocked: re-authorize the app"}, False),
     ({}, False),

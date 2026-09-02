@@ -49,6 +49,7 @@ from _paths import AGENT_DIR, PROJECT_ROOT, CORE_ROOT, META_DIR, WORLD_DIR  # ty
 from _fileops import log_script_decision  # type: ignore
 from _gate_log import log as _gate_log  # type: ignore
 from _prefix_registry import PRIMITIVE_PREFIXES  # type: ignore
+from _dependency_graph import norm_blocked_by  # type: ignore  (guard-5479 SSOT)
 from _goal_census import effective_counts  # type: ignore  (B9-deep census-augmented counts)
 from _drain_title import (  # type: ignore  ( owner-scope drain SSOT)
     _DRAIN_GOAL_TITLE_PREFIX, _DRAIN_GOAL_TITLE_INFIX, is_drain_action_title)
@@ -460,12 +461,17 @@ def cmd_pipeline_depth(args, config, compact):
     executable = 0
     for asp in active:
         for g in asp.get("goals", []):
-            if g.get("status") != "pending":
+            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+            # the pipeline-depth health metric under-reports without this.
+            if g.get("status") not in ("pending", "candidate"):
                 continue
             du = _parse_iso(g.get("deferred_until"))
             if du is not None and du > now:
                 continue
-            blocked_by = g.get("blocked_by") or []
+            # blocked_by is POLYMORPHIC (bare str on some goals) — iterating a
+            # string yields per-character phantom ids (guard-5479). Route through
+            # the SSOT normalizer rather than re-deriving the isinstance guard.
+            blocked_by = norm_blocked_by(g.get("blocked_by"))
             if blocked_by and not all(b in completed_ids for b in blocked_by):
                 continue
             executable += 1
@@ -1096,7 +1102,9 @@ def cmd_user_goals(args, config, compact):
         for g in asp.get("goals", []):
             if len(candidates) >= cap:
                 break
-            if g.get("status") != "pending":
+            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
+            # the user-goals lane never surfaced a candidate without this.
+            if g.get("status") not in ("pending", "candidate"):
                 continue
             participants = g.get("participants") or []
             if participants != ["user"]:
