@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.50",
+    "previous_version": "2.12.49",
+    "date": "2026-09-02",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "promotion: core/tests (the gates testpath) joins FRAMEWORK_PATHS so pull-adoptions ship gate tests with gate modules; pin derived from pytest.ini",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.49",
     "previous_version": "2.12.48",
     "date": "2026-09-02",
