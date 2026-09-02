@@ -1977,6 +1977,7 @@ idle_supply:
   min_gap_chars: 40            # supply_evidence.gap — what is missing, concretely
   min_needle_chars: 30         # supply_evidence.needle — the user-visible outcome
   max_self_generated_per_agent_per_day: 2   # juice-vs-squeeze backstop; 0 disables. Beyond it the idle path goes quiet.
+  min_goals: 1                 # a self-generated aspiration must carry its first verifiable goal(s); 0 disables. An empty shell creates no work and leaves the loop all-blocked (measured 2026-09-02).
   # B6.7 Target 1 (blocker-pattern → Unblock aspiration synthesis) skips these
   # external_id class prefixes: they are self-resolving (a hypothesis gate is a
   # time lock; a time-gate / calendar precondition expires on its own) or a

@@ -159,7 +159,8 @@ Tier-2 triggers: `entities` (>= 3 distinct id-shaped tokens in title/description
 (new tree node or user-facing output), `framework` (touched `core/` or `.claude/`),
 `high_prio` (HIGH priority, non-recurring), `first_of_asp`.
 
-**Verdict artifact** — `agents/<agent>/session/close-reviews/<goal-id>.json`:
+**Verdict artifact** — `world/audit-reports/close-reviews/<goal-id>.json`, GOAL-keyed
+and WORLD-scoped:
 
 ```json
 {
@@ -176,8 +177,32 @@ close refused. That exactness is the reviewer's power to say no, and it is pinne
 `test_a_REJECT_verdict_does_NOT_satisfy_the_gate`: relaxing it to a truthiness test
 keeps every other close-review test green while silently closing every rejected goal.
 
-Independence is the MIND-level rule below, unchanged: a different `claimed_by_sid` does
-NOT satisfy it, and where no other mind is available the request stays OPEN.
+**Independence is now ENFORCED, and the artifact's LOCATION is why (g-357-41).** Until
+2026-09-02 the verdict lived at `agents/<CLOSING agent>/session/close-reviews/`, which
+made this gate satisfiable ONLY BY SELF-REVIEW: an independent reviewer cannot write
+into the closer's private agent dir (cross-agent writes are unsupported by design —
+`path-resolution.md`), and a subagent reviewer is NOT exempt, since it inherits its own
+agent binding. So "the reviewer MUST differ from the executor" was a sentence with no
+mechanism behind it, and all 32 tests passed regardless, because every one built the
+artifact under the same agent that then closed. Two changes fix it together:
+
+- the path is goal-keyed under an EXISTING world top-level dir. Not
+  `world/close-reviews/` — the L1 cruft hook refuses a new top-level entry under
+  `WORLD_PATH` with no agent-side override, and its own printed remedy is "place under
+  an EXISTING top-level dir"; `audit-reports/` already holds per-goal verdicts. This
+  also satisfies guard-599, which names `agents/<agent>/session/` as a wrong home for
+  exactly this artifact class ("fresh-eyes reports").
+- `close-review-gate.py::independence_defect` demotes an APPROVE to a refusal when
+  `reviewer` IS the closing agent (`self-review`) or is absent (`unattributed` — an
+  approval nobody is accountable for cannot be shown to be independent, and absence of
+  review is the one thing this gate never fails open on). The demotion routes through
+  the SAME override branch as verdict absence, so `--override-close-review` stays
+  reachable for solo deployments and the override record carries the `defect` it
+  bypassed.
+
+Independence is otherwise the MIND-level rule below, unchanged: a different
+`claimed_by_sid` does NOT satisfy it, and where no other mind is available the request
+stays OPEN.
 
 **Fail directions.** Everything degrades to tier 1 (no review) on a classifier or
 config fault — a gate that blocks work because of its own bugs is worse than the

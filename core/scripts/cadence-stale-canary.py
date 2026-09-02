@@ -215,7 +215,17 @@ def _recent_investigate_exists(cadence: str, since_hours: int = DEDUP_HOURS) -> 
 
 
 def _file_investigate(cadence: str, stuck: int, cadence_dict: dict, dry_run: bool) -> dict:
-    """File an Investigate goal under  via aspirations-add-goal.sh.
+    """File the starved-cadence goal under  via aspirations-add-goal.sh.
+
+    Named `_file_investigate` to match the fleet-wide canary convention (the
+    same helper name in stale-sentinel-canary, fleet-config-parity,
+    completed-not-committed and others); the NAME is the convention, the goal it
+    files is a DISPATCH ask. Changed 2026-09-02 (g-115-5396): it used to file an
+    "Investigate: ... likely bypassed" goal offering two candidate causes, one of
+    which was already falsified. Six of those accumulated, and executing any of
+    them would have re-derived the mechanism rather than run the ritual — which
+    is exactly what happened. The cause is now guard-5298, so the goal names the
+    exact Skill(...) call instead of asking a solved question.
 
     Uses POSIX-form path (forward slashes) so Git-Bash-for-Windows can resolve the
     script — passing Windows-form ``C:\\...`` paths through subprocess gets
@@ -223,27 +233,44 @@ def _file_investigate(cadence: str, stuck: int, cadence_dict: dict, dry_run: boo
     """
     dispatch = cadence_dict.get("fire_dispatch", "the cadence ritual")
     check_cmd_str = " ".join(cadence_dict.get("check_cmd", []) or [])
+    # Structured dispatch (). Fall back to the prose only if a caller
+    # hands us a pre-split-registry dict — never silently print "None".
+    skill = cadence_dict.get("dispatch_skill") or ""
+    args = cadence_dict.get("dispatch_args") or ""
+    call = f"Skill({skill}){(' with args: ' + args) if args else ''}" if skill else dispatch
     title = (
-        f"Investigate: cadence {cadence} FIRING for {stuck} iterations without "
-        "dispatch — ritual skill likely bypassed"
+        f"Dispatch the starved {cadence} cadence ritual — {call}; "
+        f"FIRING {stuck} iterations, root cause already known (guard-5298)"
     )
     description = (
-        f"The {cadence} cadence-check has returned FIRE for {stuck} consecutive "
-        f"cadence-stale-canary runs without its dispatch stamp advancing (a "
-        f"successful dispatch would stamp the slot and flip the check to noop). "
-        f"Its skill dispatch ({dispatch}) is LLM-orchestrated at "
-        f"aspirations-precheck Phase 0.5e on the printed '▸ CADENCE FIRE' line "
-        f"— the residual abbreviation risk one level below g-115-2984 (which made "
-        f"the CHECK un-skippable; the DISPATCH stays LLM-driven). The likely cause "
-        f"is an LLM omission under context pressure, OR a persistent tight-zone "
-        f"meter-drop of the ritual. This is the felt-sense-starvation class "
-        f"(g-115-2982: felt-sense fired for 3 days / 581 goals un-dispatched). "
-        f"Investigate: (1) confirm the cadence still fires — run its check_cmd "
-        f"`{check_cmd_str}` (exit 0 == fire); (2) if firing, {dispatch} now to "
-        f"advance the stamp; (3) if a persistent meter-drop is the cause "
-        f"(tight zone), investigate why the loop stays in tight zone. Filed by "
-        f"cadence-stale-canary; threshold `stale_cadence.threshold_iterations` "
-        f"controls sensitivity."
+        f"ACTION: run {call} now. That is the whole deliverable — the dispatch "
+        f"stamps the slot and the check flips to noop, which is what closes this "
+        f"goal. Confirm with its check_cmd `{check_cmd_str}` (exit 0 == still "
+        f"firing, non-zero == dispatched).\n\n"
+        f"WHY THIS IS NOT AN INVESTIGATION. The {cadence} cadence-check returned "
+        f"FIRE for {stuck} consecutive cadence-stale-canary runs without its "
+        f"dispatch stamp advancing. The cause is ESTABLISHED and encoded as "
+        f"guard-5298 — do not re-derive it: the dispatch stage is a Claude SKILL "
+        f"invocation, so no script can execute it and the LLM is the sole "
+        f"executor for all seven cadences. It is LLM-orchestrated at "
+        f"aspirations-precheck Phase 0.5e on the printed '▸ CADENCE FIRE' line — "
+        f"the residual abbreviation risk one level below g-115-2984, which made "
+        f"the CHECK un-skippable while the DISPATCH stayed LLM-driven. This is "
+        f"the felt-sense-starvation class (g-115-2982: felt-sense fired 3 days / "
+        f"581 goals un-dispatched).\n\n"
+        f"THE TIGHT-ZONE METER-DROP HYPOTHESIS IS FALSIFIED — this goal used to "
+        f"offer it as a co-equal cause and it is not one. Measured 2026-08-27 "
+        f"(foxtrot, LAPTOP-3IOFCNEO, fresh-eyes N=80): precheck-drops.jsonl read "
+        f"sweeps_dropped=0, zone=fresh, tail_reached=true, tail_executed=8 on "
+        f"every recent record while the ritual sat 42 goals past due. The meter "
+        f"approved the ritual every time. Do not spend a pass on the meter.\n\n"
+        f"IF IT STILL FIRES AFTER YOU DISPATCH, that is a different and more "
+        f"interesting defect (the stamp write failed, or the check reads a "
+        f"different slot than the skill writes) — say so explicitly rather than "
+        f"re-filing this. Filed by cadence-stale-canary; threshold "
+        f"`stale_cadence.threshold_iterations` controls sensitivity. Six sibling "
+        f"goals (g-115-4913/4967/5396/5835/6167/6585) were filed one-per-ritual "
+        f"against this ONE shared seam before it had a name."
     )
     payload = {
         "title": title,
@@ -262,7 +289,15 @@ def _file_investigate(cadence: str, stuck: int, cadence_dict: dict, dry_run: boo
         ],
     }
     if dry_run:
-        return {"dry_run": True, "payload_title": title}
+        # payload_description is additive (): a dry run that hides the
+        # body cannot validate the body, and the body is where the dispatch ask
+        # and the falsified-hypothesis correction live. Existing readers of
+        # payload_title are unaffected.
+        return {
+            "dry_run": True,
+            "payload_title": title,
+            "payload_description": description,
+        }
 
     # SCRIPT_DIR (Path(__file__).resolve().parent) is ALWAYS absolute and
     # independent of cwd/env — unlike PROJECT_ROOT, which can resolve to an
