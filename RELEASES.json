@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.52",
+    "previous_version": "2.12.51",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Aspiration-supply creation checks (needle_by, self-referential gap, overlap delta; g-357-87), supply-closure gate refusing needle-unmet completes (g-357-86), per-deployment idle cadence via config-overrides (g-357-90), seed-preflight: registry-ahead forged skills WARN not FAIL (g-357-91)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.51",
+    "previous_version": "2.12.50",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "idle-sleep yield on a harness that cannot notify (g-357-89): harness-capabilities probe, idempotent idle launch, no-notify directive branch, B7.2 harness branch",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.50",
     "previous_version": "2.12.49",
     "date": "2026-09-02",

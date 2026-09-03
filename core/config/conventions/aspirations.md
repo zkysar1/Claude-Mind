@@ -475,8 +475,13 @@ gated ones):
 
 ```yaml
 supply_evidence:
-  gap: string       # >= 40 chars — what is MISSING, concretely (file, node, capability, user-visible outcome)
+  gap: string       # >= 40 chars — what is MISSING, concretely (file, node, capability, user-visible outcome).
+                    # NOT the queue itself: "no active aspiration/goal for X", "the agent identity lacks X",
+                    # "needs a refresh", "nothing is assigned to X" are refused (gap_self_referential)
   needle: string    # >= 30 chars — what the user can do or see once this lands
+  needle_by: date   # YYYY-MM-DD — the calendar moment the user needs it by (a fixture, a deadline, a
+                    # cadence's next tick); REQUIRED while idle_supply.require_needle_by is true,
+                    # refused when in the past (needle_undated / needle_expired)
   checked: [string] # >= 2 entries that EXIST: asp-/g- ids in the store, tree node keys,
                     # files under world/ meta/ agents/ or the project root, msg-/rb-/guard-/sig-/pq- ids,
                     # hypothesis ids (YYYY-MM-DD_slug). URLs and category labels are not referents.
@@ -485,14 +490,25 @@ created_by_agent: s # stamped from the request's agent header; both feed the dai
 ```
 
 Checks, in order (all must hold): `origin_misattributed`, `supply_evidence_missing`,
-`gap_unspecified` / `needle_unspecified`, `referents_unverified`, `blocker_as_gap`
-(the motivation's first sentence or the gap is blocker-shaped — "X is human-blocked
-/ awaiting approval / until access is restored"; a blocked lane is a reason to wait,
-not to build adjacent work; `Unblock:`-titled aspirations are exempt because they
-target the blocker itself), `overlaps_active` (≥ `overlap_threshold` of the
-candidate's distinctive tokens already belong to an ACTIVE aspiration → file goals
+`gap_unspecified` / `needle_unspecified`, `needle_undated` / `needle_expired`
+(`needle_by` missing, not a date, or already past — a self-generated aspiration is
+worth filing only when the user needs it by a moment that has not gone by; a
+calendar-blind candidate is the one the idle path manufactures), `referents_unverified`,
+`blocker_as_gap` (the motivation's first sentence or the gap is blocker-shaped — "X is
+human-blocked / awaiting approval / until access is restored"; a blocked lane is a
+reason to wait, not to build adjacent work; `Unblock:`-titled aspirations are exempt
+because they target the blocker itself), `gap_self_referential` (the gap or the
+motivation's first sentence names the QUEUE as the gap — "no active aspiration for
+X", "the agent identity as Y has no dedicated aspiration", "needs a refresh",
+"nothing is assigned to" — an empty queue is the designed idle state, not a gap;
+`Unblock:` exempt for the same reason), `overlaps_active` (≥ `overlap_threshold` of
+the candidate's distinctive tokens already belong to an ACTIVE aspiration → file goals
 under it), `overlaps_archived` (same against a completed/retired one, allowed only
-when that id is in `checked`), `daily_cap` (`max_self_generated_per_agent_per_day`), `no_goals`
+when that id is in `checked`), `overlap_delta_missing` (the cited archived twin must
+be NAMED in `gap`, and `gap` must state what it delivered AND what is still missing
+since its `completed_at` — "asp-009 completed, needs refresh" is a re-file, not a
+delta; the g-357-87 fixture is the 2026-09-03 asp-026/asp-009 pair), `daily_cap`
+(`max_self_generated_per_agent_per_day`), `no_goals`
 (`min_goals`, default 1 — an aspiration filed without a first verifiable goal is a title, not work:
 the selector has nothing to pick and the loop stays all-blocked). Path referents resolve from the
 world, meta, project and agent roots AND tree-relative (`intelligence/foo.md` → `world/knowledge/tree/intelligence/foo.md`).
@@ -509,6 +525,41 @@ Pre-flight the same evaluator on a candidate with
 → `idle_supply`. Tests: `core/tests/gates/test_aspiration_supply_gate.py`
 (replay of the deployment portfolio that motivated the gate),
 `mind_api/tests/test_runtime_aspiration_supply_gate.py` (daemon wiring).
+
+### Closure rule: the needle, not the goal count (g-357-86)
+
+The creation gate's twin runs at CLOSE. A record carrying `supply_evidence.needle`
+may not be archived because its goals are terminal: measured 2026-09-03 on a
+downstream deployment, asp-025 and asp-027 were each filed under the creation gate
+with a real needle, given one goal, and archived through the plain all-goals-terminal
+path ~75 min after creation, needle unmet, no intent block — churn that read as
+supply. `POST /v1/aspirations/complete` (and `complete-intent`) now run
+`aspiration_supply.evaluate_close` (gate id `aspiration-supply-close-gate`) after the
+unfinished-goals guard; `force=true` does NOT bypass it. Refusal: HTTP 400
+`{"error": "aspiration_needle_unmet", "gate": "aspiration-supply-close-gate",
+"gate_output": {failures[], checks, remedy}}`. Records without a needle (user-directed)
+are untouched (`gated: false`).
+
+The closer has three honest exits, and the remedy text names each:
+(a) the needle is NOT met → file the next goal toward it
+(`origin_signal: parent_aspiration:<asp>`) and leave the aspiration open;
+(b) the needle IS met → `aspirations-complete.sh <asp> --needle-satisfied < needle.json`
+with `{"statement": "<how the delivered work gives the operator what the needle names, in
+its own terms (>= close_min_statement_chars)>", "artifacts": ["<file path / tree node key /
+board post id that EXISTS and that the operator uses — never a goal id>"]}` — stamped on
+the archived record as `needle_satisfaction` with `claimed_at`;
+(c) the needle is moot → `aspirations-retire.sh` with the reason.
+Checks are on CONTENT, not presence (rb-10045): `needle_unaddressed` (no block),
+`needle_statement_short`, `needle_statement_disjoint` (< `close_min_shared_tokens`
+distinctive tokens shared with the needle), `needle_artifact_unverified` (nothing named
+resolves via `verify_referent`, or only goal ids were named). On the intent path the
+validated block's `rationale` is the statement and no artifact is demanded (that path
+already requires ≥ N completed evidence goals). Override:
+`--override-supply-close "<why>"` (header `X-Mind-Override-Supply-Close`;
+`--override-all` fans in) — ledgered to `world/aspiration-supply-overrides.jsonl` with
+`kind: close`. Tests: `core/tests/gates/test_aspiration_supply_close_gate.py`,
+`mind_api/tests/test_runtime_aspiration_supply_close_gate.py`,
+`mind_api/tests/test_wrapper_aspirations_complete_needle.py`.
 
 ## Goal-ID Argument Convention (unified)
 

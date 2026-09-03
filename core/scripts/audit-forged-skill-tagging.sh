@@ -45,7 +45,9 @@ if not WORLD_DIR:
     print('INFO: no world overlay at source (seed-role mirror) — forged-skill registry audit N/A')
     sys.exit(0)
 
-forged_path = WORLD_DIR / 'forged-skills.yaml'
+# Test seams (): point the audit at a tmp registry / skills dir.
+_reg_env = os.environ.get('FORGED_SKILL_AUDIT_REGISTRY')
+forged_path = pathlib.Path(_reg_env) if _reg_env else (WORLD_DIR / 'forged-skills.yaml')
 if not forged_path.is_file():
     print(f'INFO: no forged-skills.yaml at {forged_path} — nothing to audit')
     sys.exit(0)
@@ -53,23 +55,37 @@ if not forged_path.is_file():
 reg = yaml.safe_load(forged_path.read_text(encoding='utf-8')) or {}
 registered = set((reg.get('skills') or {}).keys())
 
-skills_dir = PROJECT_ROOT / '.claude' / 'skills'
+_skills_env = os.environ.get('FORGED_SKILL_AUDIT_SKILLS_DIR')
+skills_dir = pathlib.Path(_skills_env) if _skills_env else (PROJECT_ROOT / '.claude' / 'skills')
+present = {p.parent.name for p in skills_dir.glob('*/SKILL.md')}
 tagged = {
     p.parent.name for p in skills_dir.glob('*/SKILL.md')
     if re.search(r'^forged:\s*true\b', p.read_text(encoding='utf-8'), re.MULTILINE)
 }
 
-missing_tag = registered - tagged
+# : a registry key with NO SKILL.md on this checkout is the registry
+# running AHEAD of the repo — a peer forged the skill into the shared world
+# registry and has not pushed the folder yet. Nothing absent can be
+# mis-packaged, so that is a WARN (named, so the push can be chased), never a
+# promotion-blocking FAIL. The FAIL set stays the actual leak risk: a folder
+# that EXISTS without the in-file tag, or a tagged folder nobody registered.
+# Measured 2026-09-03: two such entries withheld a release from staging for
+# 2h on a box that owned neither.
+untagged = (registered - tagged) & present
+absent = (registered - tagged) - present
 missing_reg = tagged - registered
-ok = (not missing_tag and not missing_reg)
+ok = (not untagged and not missing_reg)
 
+if absent:
+    print(f'WARN: registered-but-absent on this checkout (peer has not pushed the folder yet — '
+          f'push hygiene, not a packaging risk): {sorted(absent)}')
 if ok:
     print(f'PASS: forged-skill tagging consistent ({len(tagged)} skills tagged, all in registry)')
     sys.exit(0)
 
 print(f'FAIL: forged-skill tagging drift detected')
-if missing_tag:
-    print(f'  registered-but-untagged: {sorted(missing_tag)}')
+if untagged:
+    print(f'  registered-but-untagged: {sorted(untagged)}')
 if missing_reg:
     print(f'  tagged-but-unregistered: {sorted(missing_reg)}')
 print(f'  fix per .claude/rules/forged-skill-resolution.md')

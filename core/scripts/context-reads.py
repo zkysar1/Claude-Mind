@@ -22,6 +22,7 @@ Session scoping:
 """
 
 import argparse
+import datetime
 import os
 import sys
 import threading
@@ -98,6 +99,23 @@ SESSION_HEADER_PREFIX = "#session:"
 # read with offset/limit), and read-before-edit.md Rule 4 names that
 # desensitization as the specific harm.
 PARTIAL_PREFIX = "#partial:"
+
+# Marker for a PROVENANCE entry — a thing RETRIEVED this session that is not a
+# local file read: a WebFetch/WebSearch URL, a tree-node key, a board message.
+# Entry body is "<kind>|<iso-ts>|<value>" (split on the first two pipes only, so
+# a value may itself contain them).
+#
+# These share the tracker file to inherit its session-scoping, its self-healing
+# session-mismatch delete, and its per-Body routing — one file, one lifecycle.
+# But they are NOT reads of a tracked path, so `_read_tracker_split` drops them
+# on the floor before its full/partial fork. That exclusion is load-bearing for
+# the same reason PARTIAL_PREFIX's is: `full` feeds read_tracker(), and
+# read_tracker() feeds cmd_gate — the BLOCKING dedup gate. A marker line landing
+# in `full` would put a URL into the set of "files already in context" and print
+# it from cmd_check_file as though it were an unread path. The default branch
+# there is `else: full.add(line)`, i.e. it admits ANYTHING unrecognised, so a new
+# prefix is only excluded by being excluded EXPLICITLY.
+PROVENANCE_PREFIX = "#prov:"
 
 # Scope filter: only these path prefixes are tracked
 TRACKED_PREFIXES = [
@@ -256,6 +274,8 @@ def _read_tracker_split(session_id=None):
         line = line.strip()
         if not line:
             continue
+        if line.startswith(PROVENANCE_PREFIX):
+            continue  # provenance markers are not path reads — see PROVENANCE_PREFIX
         if line.startswith(PARTIAL_PREFIX):
             partial.add(line[len(PARTIAL_PREFIX):])
         else:
@@ -291,13 +311,64 @@ def append_tracker(normalized, session_id=None, partial=False):
     if tp is None or not tp.parent.is_dir():
         return
 
+    _append_line(tp, entry, session_id)
+
+
+def _append_line(tp, entry, session_id):
+    """Append one already-composed line, creating the header on a new tracker.
+
+    APPEND-CHEAP BY CONTRACT (guard-875): the steady-state path is a single
+    open(..., "a") + write — never a read of the whole file. This runs from
+    PostToolUse hooks on every Read and every fetch, and the tracker is
+    append-only, so an unbounded read here would be O(filesize) per tool call.
+    Callers that need to SEARCH the tracker (provenance-check) pay that read
+    once, on an explicit query, off the hook path.
+    """
     if not tp.exists() or tp.stat().st_size == 0:
-        # New tracker — write session header + first path
+        # New tracker — write session header + first entry
         header = f"{SESSION_HEADER_PREFIX}{session_id}\n" if session_id else ""
         tp.write_text(header + entry + "\n", encoding="utf-8")
     else:
         with open(tp, "a", encoding="utf-8") as f:
             f.write(entry + "\n")
+
+
+def append_provenance(kind, value, session_id=None, when=None):
+    """Record one non-file retrieval (url / search / node / board) this session."""
+    if SESSION_DIR is None:
+        return
+    tp = tracker_path(session_id)
+    if tp is None or not tp.parent.is_dir():
+        return
+    ts = when or datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    # Newlines would forge extra entries; pipes are the field separator for the
+    # first two fields only, so they are safe inside the value itself.
+    value = str(value).replace("\r", " ").replace("\n", " ").strip()
+    kind = str(kind).replace("|", "-").strip()
+    if not value:
+        return
+    _append_line(tp, f"{PROVENANCE_PREFIX}{kind}|{ts}|{value}", session_id)
+
+
+def read_provenance(session_id=None):
+    """All provenance entries this session as [(kind, timestamp, value)].
+
+    Shares _read_raw_lines with the path lanes, but deliberately does NOT go
+    through _read_tracker_split — that function's job is to drop these.
+    """
+    stored_sid, path_lines = _read_raw_lines(session_id)
+    if session_id and stored_sid and session_id != stored_sid:
+        return []          # stale tracker; the split-reader owns deleting it
+    out = []
+    for line in path_lines:
+        line = line.strip()
+        if not line.startswith(PROVENANCE_PREFIX):
+            continue
+        body = line[len(PROVENANCE_PREFIX):]
+        parts = body.split("|", 2)
+        if len(parts) == 3:
+            out.append((parts[0], parts[1], parts[2]))
+    return out
 
 
 def remove_from_tracker(normalized, session_id=None):
@@ -544,6 +615,53 @@ def cmd_check_file(args):
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: record-prov / provenance-check  (session provenance manifest)
+# ---------------------------------------------------------------------------
+
+PROVENANCE_KINDS = ("url", "search", "node", "board")
+
+
+def cmd_record_prov(args):
+    """PostToolUse: record one non-file retrieval into the session manifest."""
+    append_provenance(args.kind, args.value, session_id=args.session_id)
+
+
+def cmd_provenance_check(args):
+    """Answer 'was this retrieved this session?' — exit 0 yes, 1 no.
+
+    Accepts a URL, a file path, or a tree-node key. File paths are answered from
+    the SAME full/partial sets the read tracker already maintains, so a Read and
+    a WebFetch are queryable through one interface; anything else is answered
+    from the provenance lane.
+    """
+    query = args.query.strip()
+    hits = []
+
+    for kind, ts, value in read_provenance(session_id=args.session_id):
+        if value == query:
+            hits.append((kind, ts, value))
+
+    # File-path lane: a tracked path is provenance too, recorded by the Read hook.
+    full, partial = _read_tracker_split(session_id=args.session_id)
+    normalized = normalize_path(query)
+    if normalized in full:
+        hits.append(("read", "", normalized))
+    elif normalized in partial:
+        hits.append(("read-partial", "", normalized))
+
+    if not hits:
+        if not args.quiet:
+            print(f"NOT RETRIEVED this session: {query}")
+        sys.exit(1)
+
+    if not args.quiet:
+        for kind, ts, value in hits:
+            when = ts or "(this session)"
+            print(f"RETRIEVED\t{kind}\t{when}\t{value}")
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -582,6 +700,18 @@ def build_parser():
                               "Omit for the agent-wide tracker.")
     sub.add_parser("status", help="Print tracker contents")
 
+    rp_p = sub.add_parser("record-prov", help="Record a non-file retrieval (URL, node, board msg)")
+    rp_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
+    rp_p.add_argument("--kind", default="url", choices=list(PROVENANCE_KINDS),
+                      help="What kind of thing was retrieved (default: url)")
+    rp_p.add_argument("value", help="The URL, node key, or message id that was retrieved")
+
+    pc_p = sub.add_parser("provenance-check",
+                          help="Was this URL/path/node retrieved this session? exit 0 yes, 1 no")
+    pc_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
+    pc_p.add_argument("--quiet", action="store_true", help="Exit code only, no output")
+    pc_p.add_argument("query", help="URL, file path, or tree-node key")
+
     return parser
 
 
@@ -593,6 +723,8 @@ DISPATCH = {
     "check-file": cmd_check_file,
     "clear": cmd_clear,
     "status": cmd_status,
+    "record-prov": cmd_record_prov,
+    "provenance-check": cmd_provenance_check,
 }
 
 

@@ -232,12 +232,72 @@ def load_lease_hours(project_root=PROJECT_ROOT):
         return DEFAULT_LEASE_HOURS
 
 
-def _read_board(since_hours):
+def _refresh_board_cache():
+    """Pull the coordination channel from the store of record before deciding.
+
+    THE READ HALF IS CACHED WHILE THE WRITE HALF IS WRITE-THROUGH, AND THAT
+    ASYMMETRY IS THE WHOLE DEFECT. This module's own docstring argues the board
+    is "append-only and cross-box replicated ... which is the write semantics a
+    claim actually needs" -- true, and it settles only the WRITE side. Nothing
+    ever checked whether a READ sees a peer's just-written claim. It does not:
+    ``coordination.jsonl`` is merge-registered and is served to readers from a
+    LOCAL cache that converges on a sync cadence.
+
+    So ``decide()`` was never the defect, and its tests were never wrong --
+    ``test_second_body_same_unit_is_refused`` has passed since day one. It is
+    handed records that do not contain the peer, and returns the only verdict
+    those records support (guard-1943: pinning the writer says nothing about
+    the wiring).
+
+    Measured 2026-09-03 (cc-08, own-cloud): two alpha Bodies claimed the SAME
+    unit of g-368-77 nineteen seconds apart, both rc=0, and both built the same
+    production IAM role. The same day, the local copy of ``coordination.jsonl``
+    was missing 3 records that existed in the store of record -- seconds old,
+    written by two OTHER Bodies. ``force_fresh`` returned them in 0.30s and
+    refreshed the on-disk cache IN PLACE, so the canonical ``board-read.sh``
+    below then sees current data: no second reader, and no re-implementation of
+    its channel/type/tag/since filtering (guard-2676, no-transcription).
+
+    FAIL DIRECTION -- REFUSE, never degrade. A refresh failure leaves a stale
+    cache, and a stale cache reports "the unit is free": the duplicate-producing
+    answer this module exists to prevent. So this exits 2 exactly as
+    ``_read_board`` already does for a failed board-read, rather than warning
+    and continuing (verify-before-assuming rule 4: a silenced read is zero
+    signals, not one).
+
+    NOT CALLED FOR ``release``. A release neither reads nor needs exclusivity
+    (``main`` discards the records for that command), so making a release
+    depend on remote reachability would let a network blip wedge a unit for a
+    full lease -- failing in the direction this module is built to avoid.
+
+    On ``LocalBackend`` ``force_fresh`` is a documented no-op (the local file IS
+    the store), so ``STORAGE_BACKEND=local`` runs are byte-identically
+    unaffected.
+    """
+    try:
+        from _paths import WORLD_DIR
+        import storage_backend
+
+        storage_backend.get_backend().read_text(
+            str(Path(WORLD_DIR) / "board" / f"{CHANNEL}.jsonl"), force_fresh=True
+        )
+    except Exception as exc:
+        print(f"[unit-claim] board cache refresh failed "
+              f"({type(exc).__name__}: {exc}) -- REFUSING rather than deciding "
+              f"exclusivity from a cache that may not contain a peer's claim.",
+              file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _read_board(since_hours, *, fresh=True):
     """Fetch recent unit-claim traffic via the canonical wrapper.
 
     Both ``claim`` and ``release`` types are needed, and ``board-read.sh``
     filters to ONE type per call, so this makes two calls and concatenates.
     """
+    if fresh:
+        _refresh_board_cache()
+
     from _runtime_bash import bash_cmd
 
     script = str(PROJECT_ROOT / "core" / "scripts" / "board-read.sh")
@@ -317,7 +377,7 @@ def main(argv=None):
     now = datetime.now()
     lease = load_lease_hours()
     my_sid = os.environ.get("MIND_SID", "").strip()
-    records = _read_board(lease)
+    records = _read_board(lease, fresh=(args.command != "release"))
 
     if args.command == "status":
         live = live_claims(records, now=now, lease_hours=lease)

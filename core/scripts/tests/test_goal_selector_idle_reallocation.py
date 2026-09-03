@@ -423,3 +423,200 @@ def test_liveness_crosscheck_passes_the_row_stamp(monkeypatch):
     assert seen.get("row_agent") == "echo", (
         "the row's OWN agent must travel with it — without it the guard cannot "
         "tell a foreign stamp from a self-stamp and disqualifies nothing")
+
+
+# ===========================================================================
+#  — the CADENCE door on the reallocation escape
+#
+# Until 2026-09-02 owner-idleness was the escape's only door, and that shut the
+# starvation case out completely: a recurring goal routed to a LIVE but busy
+# owner is unreachable by every Body — its owner never ranks it ( and
+#  sat at 1097/1180 with recurring_urgency already AT the urgency_max
+# clamp, so no further waiting could raise them) while every peer is excluded by
+# block_reason=routed_to_agent. Both had to be widened by hand after 144h and 9h
+# stopped.
+#
+# EVERY TEST BELOW PINS THE OWNER AS **ACTIVE**. That is the load-bearing part
+# of the fixture, not setup noise: with the owner idle the pre-existing door
+# would open and each assertion would pass without the new code existing at all
+# — the tests would be green and prove nothing. Owner-active is what makes the
+# cadence door the ONLY thing that can be under test.
+# ===========================================================================
+
+def _recurring_goal(gid, intended, hours_since_last, interval=24,
+                    claimed_by=None, last_achieved=_UNSET, origin_signal=None):
+    g = _goal(gid, intended=intended, claimed_by=claimed_by)
+    g["recurring"] = True
+    g["interval_hours"] = interval
+    if origin_signal is not None:
+        g["origin_signal"] = origin_signal
+    if last_achieved is _UNSET:
+        g["lastAchievedAt"] = _iso(hours_since_last)
+    elif last_achieved is not None:
+        g["lastAchievedAt"] = last_achieved
+    return g
+
+
+def _blocked_ids(monkeypatch, goals, reallocation_hours=8):
+    _pin_runner_identity(monkeypatch)
+    monkeypatch.setattr(gs, "_get_runner_capabilities", lambda: set())
+    monkeypatch.setattr(gs, "_liveness_confirms_dormant", lambda *a: True)
+    return {e["goal_id"]: e for e in gs.collect_blocked(
+        _asps(goals), reallocation_hours=reallocation_hours)}
+
+
+# --- the predicate itself ---------------------------------------------------
+
+def test_cadence_predicate_unit_is_overdue_ratio_not_elapsed_multiple():
+    """The one distinction the whole change turns on.
+
+    overdue_ratio = elapsed/interval - 1, so the configured 2.0 fires at elapsed
+    3x — NOT 2x. A reader who takes the threshold for an elapsed multiple is off
+    by exactly one interval, and the surrounding prose has genuinely used "2.0x"
+    for both readings (aspirations.yaml's urgency_max note says "the starvation
+    predicate starts at 2.00x" in overdue_ratio while
+    recurring-starvation-check.py compares age > 3.0 * interval in elapsed).
+    Pinned numerically so the ambiguity cannot be resolved the wrong way by a
+    later edit.
+    """
+    assert gs.RECURRING_CONFIG["realloc_overdue_ratio"] == 2.0
+    # elapsed 2.99x -> overdue_ratio 1.99 -> NOT stranded
+    assert not gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 24 * 2.99))
+    # elapsed 3.00x -> overdue_ratio 2.00 -> stranded (boundary is >=)
+    assert gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 24 * 3.0))
+    assert gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 24 * 78.7))  # the worst measured row
+
+
+def test_cadence_predicate_ignores_non_recurring_and_bad_intervals():
+    non_recurring = _goal("g", intended="bravo")
+    non_recurring["lastAchievedAt"] = _iso(10000)
+    assert not gs._recurring_cadence_stranded(non_recurring)
+    assert not gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 10000, interval=0))
+    assert not gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 10000, interval=-4))
+    assert not gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 10000, interval="not-a-number"))
+    # A string interval is not malformed — store records carry it — and it must
+    # WORK rather than merely not crash. get_interval_hours returns it raw.
+    assert gs._recurring_cadence_stranded(
+        _recurring_goal("g", "bravo", 24 * 4, interval="24"))
+
+
+def test_cadence_predicate_never_fired_clock_starts_at_created_at():
+    """Mirrors compute_score's never-fired fallback ( / ).
+
+    Without it the MOST neglected class — recurring goals that have never fired
+    at all — would be the only one this escape could never reach, since they
+    carry no lastAchievedAt to measure from.
+    """
+    never = _recurring_goal("g", "bravo", 0, last_achieved=None)
+    never["created_at"] = _iso(24 * 5)
+    assert gs._recurring_cadence_stranded(never)
+    fresh = _recurring_goal("g", "bravo", 0, last_achieved=None)
+    fresh["created_at"] = _iso(24 * 1.5)
+    assert not gs._recurring_cadence_stranded(fresh)
+
+
+def test_cadence_predicate_future_stamp_is_not_read_as_never_fired():
+    """An off-machine ahead-clock stamps a FUTURE lastAchievedAt, which
+    hours_since() reports as None — the same value an ABSENT field produces.
+    Keying the fallback on the FIELD's absence (not on a None elapsed) is what
+    keeps a goal that just ran from being freed as though it had never run.
+    """
+    ahead = _recurring_goal("g", "bravo", 0, last_achieved=_iso(-6))
+    ahead["created_at"] = _iso(24 * 400)  # would strand it via the fallback
+    assert not gs._recurring_cadence_stranded(ahead)
+
+
+# --- the escape, end to end -------------------------------------------------
+
+def test_cadence_stranded_goal_surfaces_though_owner_is_active(monkeypatch):
+    """The headline behaviour, with its own control.
+
+    Both goals are routed to an ACTIVE bravo, so the idle door is shut for both.
+    The only difference between them is overdue-ness, so the control is what
+    proves the cadence door — and nothing else — did the surfacing.
+    """
+    _pin_team_state(monkeypatch, {"alpha": 0.1, "bravo": 0.1})
+    ids = _collect(monkeypatch, [
+        _recurring_goal("g-starved", "bravo", 24 * 6.0),   # overdue_ratio 5.0
+        _recurring_goal("g-merely-due", "bravo", 24 * 1.2),  # overdue_ratio 0.2
+    ])
+    assert "g-starved" in ids
+    assert "g-merely-due" not in ids
+
+
+def test_cadence_door_does_not_widen_the_other_two_conjuncts(monkeypatch):
+    """Unclaimed-only and not-owner-scoped still bind on the NEW door.
+
+    A disjunct added to one conjunct of an AND is exactly where the other
+    conjuncts get silently dropped, and both exist for measured reasons: never
+    yank a goal an active peer already owns, and never surface owner-scoped work
+    a reallocatee structurally cannot execute (g-115-2945 / rb-4792).
+    """
+    _pin_team_state(monkeypatch, {"alpha": 0.1, "bravo": 0.1})
+    ids = _collect(monkeypatch, [
+        _recurring_goal("g-claimed", "bravo", 24 * 9.0, claimed_by="bravo"),
+        # origin_signal, not a title: measured 2026-09-03, none of five
+        # plausible drain TITLES satisfies is_drain_action_title, so a
+        # title-shaped fixture would assert owner-scoping while the predicate
+        # returned False — a test passing for the wrong reason.
+        _recurring_goal("g-owner-scoped", "bravo", 24 * 9.0,
+                        origin_signal="recurring:drain-temp"),
+        _recurring_goal("g-clean", "bravo", 24 * 9.0),
+    ])
+    assert ids == {"g-clean"}, (
+        "only the goal satisfying all three conjuncts may surface; got %r" % ids)
+
+
+def test_idle_door_still_opens_for_a_non_recurring_goal(monkeypatch):
+    """The pre-existing door is untouched — a disjunct must ADD a way through,
+    never replace one. A non-recurring routed goal is invisible to the cadence
+    predicate by construction, so this can only pass via the idle door.
+    """
+    _pin_team_state(monkeypatch, {"alpha": 0.1, "bravo": 99})
+    assert "g-idle-route" in _collect(
+        monkeypatch, [_goal("g-idle-route", intended="bravo")])
+
+
+# --- candidate XOR blocked --------------------------------------------------
+
+def test_blocked_side_adopts_the_cadence_door_too(monkeypatch):
+    """guard-4622 / the SYMMETRY contract in collect_blocked.
+
+    A shared predicate does not make its non-adopters consistent. Had only
+    collect_candidates taken the new door, a cadence-stranded goal would appear
+    in the ranked list AND the blocked list at once, carrying a block_detail
+    asserting an escape that had in fact opened.
+    """
+    _pin_team_state(monkeypatch, {"alpha": 0.1, "bravo": 0.1})
+    goals = [
+        _recurring_goal("g-starved", "bravo", 24 * 6.0),
+        _recurring_goal("g-merely-due", "bravo", 24 * 1.2),
+    ]
+    selectable = _collect(monkeypatch, goals)
+    blocked = _blocked_ids(monkeypatch, goals)
+    assert "g-starved" in selectable and "g-starved" not in blocked
+    assert "g-merely-due" not in selectable and "g-merely-due" in blocked
+    assert blocked["g-merely-due"]["block_reason"] == "routed_to_agent"
+
+
+def test_blocked_detail_names_the_cadence_door_when_both_are_shut(monkeypatch):
+    """guard-3644 in its exact form: name EVERY unmet conjunct.
+
+    Reporting only "owner not idle" describes the cheaper check and invites the
+    "the owner will wake up, this self-clears" forecast — which is now wrong,
+    because waiting long enough is itself a way out.
+    """
+    _pin_team_state(monkeypatch, {"alpha": 0.1, "bravo": 0.1})
+    entry = _blocked_ids(
+        monkeypatch, [_recurring_goal("g-due", "bravo", 24 * 1.2)])["g-due"]
+    unmet = " ".join(entry["unmet_escape_conditions"])
+    assert "owner not idle" in unmet
+    assert "cadence-stranded" in unmet, (
+        "the detail must say the cadence door is shut too, not only the idle "
+        "one: %r" % entry["block_detail"])

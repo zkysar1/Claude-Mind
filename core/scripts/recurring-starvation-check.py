@@ -751,6 +751,47 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
         "; UNMEASURED — no demonstrated cadence is on record, so this is the "
         "cadence the goal DECLARES, not one it has been observed to keep"
     )
+    # ROUTING IS THE FIRST HYPOTHESIS (, measured 2026-09-02). It used
+    # to be the LAST line of the description, phrased as "confirm that agent is
+    # live" — and that check answers YES in the case that actually happens, so
+    # the reader ruled routing out and went looking elsewhere. A LIVE but busy
+    # owner starves a recurring goal exactly like a dormant one, and it is the
+    # MORE likely of the two here: a dormant owner opens the selector's
+    # idle-reallocation escape, so a goal still starving is evidence its owner
+    # is awake. Same degrade-to-old-text discipline as basis_note above — rows
+    # are hand-built by callers and tests, so an absent field must produce the
+    # ruled-out wording, never a claim about a value nobody supplied.
+    _ia = str(row.get("intended_agent") or "").strip()
+    if _ia and _ia != "either":
+        routing_note = (
+            f"FIRST HYPOTHESIS — SINGLE-AGENT ROUTING. This goal carries "
+            f"intended_agent={_ia}, so no other Body can select it: every peer "
+            f"classifies it block_reason=routed_to_agent. Check {_ia}'s RANKING "
+            f"of it, NOT {_ia}'s liveness. A live-but-busy owner and a dormant "
+            f"one are indistinguishable from the goal's side, and the busy case "
+            f"is the more likely one here — a dormant owner would have opened "
+            f"the idle-reallocation escape and some other Body would have run "
+            f"it. Measured: g-353-04 stopped 144h and g-115-8602 stopped 9h at "
+            f"ranks 1097/1180 on a live owner's queue, recurring_urgency already "
+            f"AT the urgency_max clamp so no further waiting could raise them. "
+            f"Remedy: widen to intended_agent=either and READ THE FIELD BACK "
+            f"(guard-2980 — omission does not mean unrouted; the capability-route "
+            f"gate re-stamps an owner).\n\n"
+        )
+    elif _ia == "either":
+        routing_note = (
+            "Routing is NOT the cause: intended_agent=either, so every Body can "
+            "select this goal. (Routing is checked first because it is the most "
+            "common cause — see g-115-8700 — so this line records a measured "
+            "negative rather than a silence.)\n\n"
+        )
+    else:
+        routing_note = (
+            "Routing was NOT measured for this row: no intended_agent value was "
+            "supplied. Read the field off the goal before ruling routing out — "
+            "an absent value in THIS report is a gap in the report, not evidence "
+            "the goal is unrouted.\n\n"
+        )
     _sel = row.get("selector_excess_ratio")
     selector_note = "" if _sel is None else (
         f"On the scorer's own scale this is {_sel}x overdue. Compare THAT number "
@@ -769,6 +810,7 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
             f"(basis: {row['basis_reason'].replace('_', ' ')}{basis_note}), and "
             f"{row['declared_ratio']}x the {row['interval_hours']}h cadence the "
             f"goal declares for itself.\n\n"
+            f"{routing_note}"
             f"{selector_note}"
             f"No blocker, no defer, no claim, and no failing structured gate was "
             f"found. That is what was checked, and it does NOT establish that "
@@ -779,8 +821,9 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
             f"Ask why it is not being selected. Whether its declared cadence is "
             f"realistic is part of the question: a cadence the goal has never "
             f"actually met is itself a data-quality defect worth correcting, and "
-            f"correcting it is a legitimate resolution of this Unblock. If the "
-            f"goal is routed to a specific agent, confirm that agent is live."
+            f"correcting it is a legitimate resolution of this Unblock. Routing "
+            f"is addressed above and is the first thing to rule out — do not "
+            f"re-check it by asking whether the owner is alive."
         ),
         "priority": "HIGH",
         "participants": ["agent"],

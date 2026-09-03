@@ -84,6 +84,7 @@ except Exception:  # pragma: no cover - telemetry is optional
         return None
 
 GATE_ID = "aspiration-supply-gate"
+GATE_ID_CLOSE = "aspiration-supply-close-gate"  # : the closure twin
 LEDGER_NAME = "aspiration-supply-overrides.jsonl"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -119,13 +120,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "min_needle_chars": 30,
     "max_self_generated_per_agent_per_day": 2,
     "min_goals": 1,
+    # : a needle without a date is a wish. Gated origins must name the
+    # calendar moment the user needs the outcome by, and it must not be past.
+    "require_needle_by": True,
+    # : closure gate (evaluate_close). A record that carries
+    # supply_evidence.needle may not close on goal COUNT — the closer must say,
+    # in the needle's own terms, how the delivered work meets it, and name one
+    # artifact the operator can use (path / tree node / post — not a goal id).
+    "close_min_statement_chars": 40,
+    "close_min_shared_tokens": 2,
 }
 
 REMEDY_SHAPE = (
     '"supply_evidence": {'
     '"gap": "<what is MISSING, named concretely — a file, node, capability, or '
-    'user-visible outcome that does not exist yet>", '
+    'user-visible outcome that does not exist yet; NOT \'no aspiration/goal for X\'>", '
     '"needle": "<what the user will be able to do/see once this lands>", '
+    '"needle_by": "<YYYY-MM-DD — the calendar moment the user needs it by; a real '
+    'date on the domain calendar, not \'soon\' or \'the season\'>", '
     '"checked": ["<asp-id or g-id you read>", "<tree node key or file path you '
     'looked at>", "<msg-/rb-/guard-/hypothesis id>"]}'
 )
@@ -147,6 +159,38 @@ _BLOCKER_RE = re.compile(
 )
 _PLACEHOLDER_RE = re.compile(r"(\bTBD\b|\bTODO\b|<[^>]{1,60}>|\.\.\.\s*$|\bN/?A\b)", re.IGNORECASE)
 _FIRST_SENTENCE_RE = re.compile(r"^(.*?)(?:[.;!?](?:\s|$)|$)", re.DOTALL)
+# : a gap whose stated lack is an ASPIRATION / GOAL / IDENTITY is the
+# absence of bookkeeping, not an operator need. Measured 2026-09-03 (
+# on a downstream deployment): gap "No active aspiration dedicated to draft
+# strategy —  completed and archived, needs refresh for 2026",
+# motivation "The agent identity as a draft strategist has no dedicated active
+# aspiration". Both passed the shape checks; neither names anything a user
+# would notice missing. `Unblock:` aspirations are exempt (the queue IS their
+# subject) — see the blocker_as_gap exemption.
+_QUEUE_NOUN = r"(?:aspiration|goal|work[- ]?item|task|initiative|epic|lane)s?"
+_QUEUE_ADJ = r"(?:\s+(?:active|dedicated|current|open|standing|ongoing|new|separate|own))*"
+_SELF_REFERENTIAL_RE = re.compile(
+    # "no / without / lacks / needs / missing [a] [active dedicated] aspiration"
+    r"(?:\b(?:no|without|lack(?:s|ing)?|need(?:s)?|missing)(?:\s+an?)?" + _QUEUE_ADJ + r"\s+" + _QUEUE_NOUN + r"\b)"
+    # "the agent identity as X has no dedicated active aspiration"
+    r"|(?:\b(?:agent|identity|self|persona|role)(?:'s)?(?:\s+identity)?(?:\s+as\s+[^,;.]{1,40}?)?\s+"
+    r"(?:has|have|lacks?|needs?|without)(?:\s+(?:no|an?))?" + _QUEUE_ADJ + r"\s+" + _QUEUE_NOUN + r"\b)"
+    r"|(?:\bneeds?\s+(?:a\s+)?refresh\b)"
+    r"|(?:\bnothing\s+(?:is\s+)?(?:dedicated|assigned|devoted)\s+to\b)"
+    r"|(?:\bno\s+one\s+is\s+(?:working|assigned)\b)",
+    re.IGNORECASE,
+)
+# An archived overlap that is CITED still owes a delta: the gap must say what
+# the archived record delivered AND what is missing now. Citation alone was the
+# laundering path ( cited  and passed).
+_DELIVERED_RE = re.compile(
+    r"\b(delivered|produced|built|shipped|landed|covers?|covered|contains?|includes?|has|had|gave|left)\b",
+    re.IGNORECASE)
+_MISSING_RE = re.compile(
+    r"\b(lacks?|lacking|missing|no longer|stale|outdated|does not|doesn't|did not|didn't|never|without|"
+    r"not yet|but no|nothing|absent|gap|still no|stops? at|only)\b",
+    re.IGNORECASE)
+_ISO_DATE_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})")
 
 # --- Referent classification --------------------------------------------------
 
@@ -510,6 +554,33 @@ def evaluate(asp: Dict[str, Any], *, existing: Iterable[Dict[str, Any]],
         if needle and gap and needle == gap:
             failures.append({"check": "needle_unspecified",
                              "detail": "supply_evidence.needle repeats gap verbatim"})
+        # : the needle has a DATE. "a framework for the 2026 season"
+        # passed while the operator's draft was already over; a needle_by that
+        # is checked against today closes that.
+        needle_by = str(se.get("needle_by") or "").strip()
+        checks["needle_by"] = needle_by or None
+        if cfg.get("require_needle_by", True):
+            m = _ISO_DATE_RE.match(needle_by)
+            by_date = None
+            if m:
+                try:
+                    by_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+                except ValueError:
+                    by_date = None
+            if by_date is None:
+                failures.append({
+                    "check": "needle_undated",
+                    "detail": ("supply_evidence.needle_by must be an ISO date (YYYY-MM-DD) naming the "
+                               "calendar moment the user needs this by — a needle without a date is a "
+                               "wish; find the date on the domain calendar or drop the candidate"),
+                })
+            elif by_date < (now or datetime.now()).date():
+                failures.append({
+                    "check": "needle_expired",
+                    "detail": (f"supply_evidence.needle_by {by_date.isoformat()} is already past "
+                               f"(today {_today(now)}) — the moment this was for has gone; if a later "
+                               "moment exists, name it, otherwise drop the candidate"),
+                })
 
     # 2. checked referents exist
     existing_ids: Set[str] = set()
@@ -558,6 +629,25 @@ def evaluate(asp: Dict[str, Any], *, existing: Iterable[Dict[str, Any]],
                          "adjacent work; if something is genuinely missing, name THAT in gap"),
         })
 
+    # 3b. self-referential gap / motivation (): "no active aspiration
+    # for X" / "the agent identity lacks a dedicated goal" describe the queue,
+    # not the operator. Same Unblock exemption as 3.
+    self_ref_hits = []
+    if not is_unblock:
+        for field, text in (("gap", gap), ("motivation", first)):
+            m = _SELF_REFERENTIAL_RE.search(text or "")
+            if m:
+                self_ref_hits.append((field, m.group(0)))
+    checks["self_referential"] = [{"field": f, "text": t[:120]} for f, t in self_ref_hits]
+    if self_ref_hits:
+        failures.append({
+            "check": "gap_self_referential",
+            "detail": ("the stated lack is an aspiration/goal/identity, not an operator outcome ("
+                       + "; ".join(f"{f}: \"{t[:80]}\"" for f, t in self_ref_hits)
+                       + ") — the absence of bookkeeping is not a need; name what the OPERATOR cannot "
+                         "do or see today and the date (needle_by) they need it by"),
+        })
+
     # 4. overlap with the archive
     cand_tokens = _aspiration_tokens(asp, include_goals=True)
     overlaps: List[Dict[str, Any]] = []
@@ -594,6 +684,27 @@ def evaluate(asp: Dict[str, Any], *, existing: Iterable[Dict[str, Any]],
                            f"\"{o['title']}\" (shared: {', '.join(o['shared'][:8])}) — building on "
                            f"finished work is fine only when you cite it: add {o['id']} to "
                            f"supply_evidence.checked and state in gap what it delivered and what is missing"),
+            })
+            break
+        # : cited, so the exemption used to end here — and the citation
+        # alone was the laundering path ( cited its archived twin 
+        # and passed with gap " completed and archived, needs refresh").
+        # A cited archived overlap owes a DELTA: the gap names the record AND
+        # says what it delivered AND what is missing now.
+        rec = next((e for e in existing_list if str(e.get("id")) == str(o["id"])), {})
+        closed_at = str(rec.get("completed_at") or rec.get("archived_at") or rec.get("retired_at")
+                        or rec.get("completed_date") or "")[:10]
+        names_it = str(o["id"]) in gap
+        has_delta = bool(_DELIVERED_RE.search(gap)) and bool(_MISSING_RE.search(gap))
+        checks["archived_overlap_delta"] = {"id": o["id"], "closed_at": closed_at or None,
+                                            "names_it": names_it, "has_delta": has_delta}
+        if not (names_it and has_delta):
+            failures.append({
+                "check": "overlap_delta_missing",
+                "detail": (f"{o['containment']:.0%} overlap with {o.get('status')} {o['id']} "
+                           f"\"{o['title']}\" is cited, but supply_evidence.gap does not state the delta — "
+                           f"name {o['id']}, what it DELIVERED, and what is MISSING now (what changed since "
+                           f"{closed_at or 'it closed'}); a citation is not a delta"),
             })
             break
 
@@ -668,6 +779,160 @@ def evaluate(asp: Dict[str, Any], *, existing: Iterable[Dict[str, Any]],
         "would_block": would_block, "gated": True,
         "reason": ("pass" if not failures else "; ".join(f["detail"] for f in failures)),
         "failures": failures, "checks": checks, "overlaps": top, "remedy": remedy,
+    }
+    if override_applied:
+        result["override_applied"] = override_applied
+    return result
+
+
+# --- Closure gate () ---------------------------------------------------
+#
+# The creation gate above decides whether a self-generated aspiration may be
+# FILED. This one decides whether a record that carries supply_evidence.needle
+# may be CLOSED. Measured on a downstream deployment 2026-09-03:  and
+# , each filed under the creation gate with a real needle, each given
+# exactly one goal, each archived through the plain all-goals-terminal path
+# within ~75 min of creation with the needle plainly unmet and no
+# intent_satisfaction block — churn that looked like supply. The needle is the
+# promise the record was filed on; goal COUNT is not evidence about it.
+
+def needle_of(asp: Dict[str, Any]) -> Optional[str]:
+    se = asp.get("supply_evidence")
+    if not isinstance(se, dict):
+        return None
+    n = str(se.get("needle") or "").strip()
+    return n or None
+
+
+def evaluate_close(asp: Dict[str, Any], *, satisfaction: Optional[Dict[str, Any]] = None,
+                   mode: str = "needle", override_close: Optional[str] = None,
+                   existing_ids: Optional[Set[str]] = None, tree_keys: Optional[Set[str]] = None,
+                   agent_name: str = "", world_dir: Optional[Path] = None,
+                   project_root: Optional[Path] = None, meta_dir: Optional[Path] = None,
+                   agent_dir: Optional[Path] = None, config: Optional[Dict[str, Any]] = None,
+                   now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Decide whether an aspiration carrying `supply_evidence.needle` may close.
+
+    mode="needle": `satisfaction` is the closer's needle block
+        {"statement": str, "artifacts": [referent, ...]} — the statement must
+        share >= close_min_shared_tokens distinctive tokens with the needle and
+        run >= close_min_statement_chars; at least one artifact must resolve to
+        something that EXISTS and is not a goal/aspiration id.
+    mode="intent": `satisfaction` is a validated intent_satisfaction block; its
+        `rationale` is the statement and no artifact is required (the intent
+        path already demands >= N completed evidence goals).
+
+    Not gated (gated=False, never blocks) when the record has no needle.
+    """
+    cfg = dict(DEFAULT_CONFIG)
+    cfg.update(config or {})
+    asp_id = str(asp.get("id") or "?")
+    title = str(asp.get("title") or "")
+    needle = needle_of(asp)
+    se = asp.get("supply_evidence") if isinstance(asp.get("supply_evidence"), dict) else {}
+    needle_by = se.get("needle_by")
+
+    if not cfg.get("enabled", True) or not needle:
+        return {"would_block": False, "gated": False,
+                "reason": "not gated (no supply_evidence.needle)",
+                "failures": [], "checks": {}, "remedy": None}
+
+    failures: List[Dict[str, str]] = []
+    checks: Dict[str, Any] = {"needle": needle, "needle_by": needle_by, "mode": mode}
+    block = satisfaction if isinstance(satisfaction, dict) else None
+    promised = f'{asp_id} promised the operator: "{needle}"' + (f" by {needle_by}" if needle_by else "")
+
+    if block is None:
+        failures.append({
+            "check": "needle_unaddressed",
+            "detail": (promised + " — closing on goal count does not meet it, and nothing states "
+                       "how the completed goals deliver that (or why the needle is moot)"),
+        })
+    else:
+        statement = str(block.get("statement") or block.get("rationale") or "").strip()
+        shared = sorted(tokens(needle) & tokens(statement))
+        checks["statement_chars"] = len(statement)
+        checks["shared_tokens"] = shared
+        min_chars = int(cfg.get("close_min_statement_chars", 40))
+        min_shared = int(cfg.get("close_min_shared_tokens", 2))
+        if len(statement) < min_chars:
+            failures.append({
+                "check": "needle_statement_short",
+                "detail": (f"the closing statement is {len(statement)} chars (need >= {min_chars}) — "
+                           "say how the delivered work gives the operator what the needle names"),
+            })
+        if len(shared) < min_shared:
+            failures.append({
+                "check": "needle_statement_disjoint",
+                "detail": (f"the closing statement shares {len(shared)} distinctive token(s) with the "
+                           f"needle (need >= {min_shared}) — address the needle in its own terms; "
+                           f'needle: "{needle}"'),
+            })
+        if mode == "needle":
+            raw_arts = block.get("artifacts")
+            arts = raw_arts if isinstance(raw_arts, list) else []
+            verified: List[Dict[str, Any]] = []
+            unverified: List[Dict[str, Any]] = []
+            for a in arts:
+                v = verify_referent(a, existing_ids=set(existing_ids or ()), tree_keys=set(tree_keys or ()),
+                                    world_dir=world_dir, meta_dir=meta_dir,
+                                    project_root=project_root, agent_dir=agent_dir)
+                if v.get("kind") in ("aspiration", "goal"):
+                    v = dict(v, verified=False,
+                             note="a goal/aspiration id is not an artifact — name the file, node or post the operator uses")
+                (verified if v.get("verified") else unverified).append(v)
+            checks["artifacts"] = verified + unverified
+            if not verified:
+                failures.append({
+                    "check": "needle_artifact_unverified",
+                    "detail": ("no artifact resolves: " + (
+                        "; ".join(f"{u['ref']} ({u.get('note')})" for u in unverified)
+                        if unverified else "none named")
+                        + " — name at least one file path, tree node key or board post id that EXISTS "
+                          "and that the operator can use"),
+                })
+
+    remedy = None
+    if failures:
+        remedy = (
+            f"{asp_id} carries supply_evidence.needle — the promise it was filed on. Do ONE of: "
+            f"(a) the needle is NOT met → file the next goal that moves the operator toward it "
+            f"(aspirations-add-goal.sh --source <src> {asp_id}, origin_signal parent_aspiration:{asp_id}) "
+            f"and leave the aspiration open; "
+            f"(b) the needle IS met → aspirations-complete.sh {asp_id} --needle-satisfied < needle.json, "
+            'needle.json = {"statement": "<how the completed goals give the operator exactly what the '
+            'needle names, in its own terms (>= 40 chars)>", "artifacts": ["<file path / tree node key / '
+            'board post id the operator can use — NOT a goal id>"]}; '
+            f"(c) the needle is moot → aspirations-retire.sh {asp_id} with the reason; "
+            f'or the audited bypass --override-supply-close "<why>".'
+        )
+
+    override_applied = None
+    would_block = bool(failures)
+    decision = "block" if would_block else "pass"
+    if would_block and override_close:
+        would_block = False
+        override_applied = override_close
+        decision = "override"
+        _append_ledger(world_dir, {
+            "ts": (now or datetime.now()).isoformat(timespec="seconds"),
+            "gate": GATE_ID_CLOSE, "kind": "close", "agent": agent_name or None,
+            "asp_id": asp_id, "title": title, "needle": needle,
+            "justification": override_close,
+            "failures": [f["check"] for f in failures],
+        })
+
+    _gate_log(GATE_ID_CLOSE, decision, trigger_matched=(failures[0]["check"] if failures else None),
+              payload=f"{asp_id} {title}"[:120],
+              override_reason=override_close if override_applied else None,
+              agent_name=agent_name or None, meta_dir=meta_dir,
+              extra={"gated": True, "mode": mode, "needle_by": needle_by,
+                     "failures": [f["check"] for f in failures]})
+
+    result: Dict[str, Any] = {
+        "would_block": would_block, "gated": True,
+        "reason": ("pass" if not failures else "; ".join(f["detail"] for f in failures)),
+        "failures": failures, "checks": checks, "remedy": remedy,
     }
     if override_applied:
         result["override_applied"] = override_applied

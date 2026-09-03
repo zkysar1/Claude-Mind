@@ -160,6 +160,7 @@ All data comes from framework scripts — no direct JSONL reads.
    #   08-31 29.9h(date-floored 46.8h) 100% (n=14, split 22/1554)  <- SAME BOX-DAY, IDENTICAL STORE SPLIT, NARROWER WINDOW
    #   09-02 27.85h(date-floored 2 calendar days) 100% (n=16, split 24/1577)  <- NEAR-EXACT REPLICATION OF THE ROW ABOVE, 2 DAYS LATER
    #   09-02 21.2h(date-floored 37.2h) 100% (n=16, split 24/1577)  <- SMALLEST BACKLOG SINCE 08-31 (24), STILL 100% ON A ~1-DAY WINDOW; consistent with the 08-31 narrow row, not with the wide one
+   #   09-02 9.76h(date-floored 1 calendar day) 100% (n=20, split 31/1577)  <- THIRD 09-02 READING. Backlog GREW 24->31 and coverage HELD at 100%; the within-window backlog model predicts UP and 100% is the ceiling, so this row is SATURATED and tests nothing. Same-day window, so guard-2303 discounts it too. Recorded for the denominator, not as evidence.
    # THE 08-30/08-31 PAIR IS THE CLEANEST WIDTH-CONTROLLED TEST IN THIS SERIES AND IT
    # SETTLES THE ARGUMENT: 99.94h -> 93.3%, then 102.5h -> 48.7% ONE DAY LATER. The
    # window got WIDER and coverage HALVED, so width cannot be the driver in either

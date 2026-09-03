@@ -213,13 +213,13 @@ constraint_context = {
 anything VERIFIABLE is missing from the portfolio — not to "create work
 because the queue is empty". Every candidate it files is refused by the
 daemon's aspiration-supply gate (`core/scripts/gates/aspiration_supply.py`,
-g-357-82/83) unless it carries `supply_evidence` with ≥2 existing referents,
-does not restate a blocker as a gap, overlaps no existing aspiration by ≥40%,
-and the per-agent daily cap (2) is not reached. On a mature portfolio expect
-empty most of the time; that routes to B6.5/B7 — the quiet window — which is
-cheaper than one manufactured aspiration (measured 2026-09-02: eleven idle-path
-aspirations in six days on one deployment, each seeding goals that consumed
-iterations and tree writes). Never pass `--override-supply` from this path.
+g-357-82/83/87) unless it carries `supply_evidence` with ≥2 existing referents
+and a dated `needle_by`, names an operator outcome as the gap (never a blocker,
+never the empty queue itself), overlaps no existing aspiration by ≥40%, and the
+daily cap (2/agent) is not reached. On a mature portfolio expect empty most of
+the time; that routes to B6.5/B7, the quiet window, cheaper than one
+manufactured aspiration (measured 2026-09-02: eleven idle-path aspirations in
+six days on one deployment). Never pass `--override-supply` from this path.
 
 **Do not regenerate against an unchanged portfolio.** Generation is the most
 expensive call on the idle path (it pages the full skill and the archive). If
@@ -839,8 +839,9 @@ the rule prevents.
 # B6.5 did not approve (denied → B6.7 fell through; gate-error → na). The
 # single-writer tick applies the Layer-2 streak transition (interlude reset
 # per reset_on_executable), persists loop_state.signals.dry_idle under the WM
-# lock, and returns the exponential sleep (120s→7200s cap) that replaces the
-# legacy flat schedule. Fail-open: dry=false / enabled=false → legacy schedule.
+# lock, and returns the exponential sleep: 120s→7200s cap; flat 2h blocks per
+# deployment via meta/config-overrides.yaml
+# aspirations.dry_idle_backoff.base_seconds (g-357-90). Fail-open → legacy.
 Bash: tick=$(py -3 core/scripts/dry-idle-tick.py --executable-count 0 --quiescence-decision denied)
 IF tick.enabled == true AND tick.dry == true:
     sleep_seconds = tick.sleep_seconds
@@ -849,8 +850,8 @@ IF tick.enabled == true AND tick.dry == true:
                                     # informational-signal demotion: dry sleeps
                                     # wake on board activity (criterion 4).
 ELSE:
-    # Tick disabled or fail-open — legacy flat schedule (pre-Layer-3 behavior).
-    BACKOFF_SCHEDULE = [300, 600, 1200, 1800]  # 5min, 10min, 20min, 30min cap
+    # Tick disabled/fail-open — legacy schedule.
+    BACKOFF_SCHEDULE = [300, 600, 1200, 1800]  # 5/10/20/30 min
     sleep_index = min(session_signals.consecutive_blocked_sleeps, len(BACKOFF_SCHEDULE) - 1)
     sleep_seconds = BACKOFF_SCHEDULE[sleep_index]
 session_signals.consecutive_blocked_sleeps += 1
@@ -983,26 +984,30 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --g
 ```
 
 ```
-# Magic Wand #2 (alpha session-60): when arriving from B6.5 with quiescence
-# approval, prepend QUIESCENCE_SLEEP=1 so interruptible-sleep.sh demotes
-# informational wake signals (board-activity, goal-claim-released — partner
-# activity) without breaking the sleep. From the B7 dry path (g-115-2084-c),
-# dry_sleep_env carries DRY_SLEEP=1 instead — same Tier-A bg-job registration
-# (stop-hook Gate 2.6 ALLOW, guard-967) but NO informational demotion: partner
-# activity may create claimable work in the dry state, so it wakes the sleep.
-# Legacy fail-open arrivals leave both unset (all wake signals break the sleep,
-# unregistered — pre-Layer-3 behavior).
-Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} (run_in_background=true)
-RETURN   # yield contract (guard-153): the bg sleep IS the terminal tool call;
-         # the harness re-invokes on completion/wake — no ScheduleWakeup arm,
-         # no synchronous Skill re-entry (that re-entry is the dry spin this
-         # branch exists to stop — g-115-2084).
+# Magic Wand #2 (alpha session-60): from B6.5 with quiescence approval prepend
+# QUIESCENCE_SLEEP=1 (informational wake signals demoted); from the B7 dry path
+# (g-115-2084-c) dry_sleep_env carries DRY_SLEEP=1 — same Tier-A bg-job
+# registration (Gate 2.6 ALLOW, guard-967), NO demotion (partner activity may
+# create claimable work). Legacy arrivals leave both unset (unregistered).
+# HARNESS BRANCH (g-357-89): "the harness re-invokes on completion" is a Claude
+# Code fact (run_in_background → task notification). Ask, never assume:
+Bash: bash core/scripts/harness-capabilities.sh --get background_job_notify   # true | false (unknown harness → false: a spare net is harmless, a missing one is a dead loop)
+IF true:
+  Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} (run_in_background=true)
+  RETURN   # yield contract (guard-153): the bg sleep IS the terminal tool call; the harness
+           # re-invokes on completion/wake — no ScheduleWakeup arm, no synchronous Skill
+           # re-entry (that re-entry is the dry spin this branch exists to stop — g-115-2084).
+IF false (no background-job notification — measured on a downstream harness 2026-09-03: five launch attempts, three sleep processes, a 2-minute "quiet window"):
+  Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} &   # ONCE. The tool may time out on this call — the process survives; a repeat launch JOINS the live sleep ("idle-sleep JOINED"), it never spawns another
+  ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=min({sleep_seconds}+60, 3600))   # TERMINAL call: the wake IS the re-entry here (rb-9668; sanctioned carve-out of schedule-wakeup-correctness.md Anti-pattern C). A remainder past 3600s re-sleeps via Phase -0.5e — which is why B7 MUST have written blocked_sleep_until
+  RETURN   # no Skill(aspirations), no further Bash, no prose
 ```
 
 > **RETURN-PROTOCOL TRAP — read before you write anything after the Bash call (g-115-770, zeta session 74).**
 >
-> The `interruptible-sleep.sh ... run_in_background=true` Bash call above **IS
-> the terminal tool call** for the RETURN path. **NO prose may follow it** —
+> The `interruptible-sleep.sh ... run_in_background=true` Bash call above — or, on
+> a no-notify harness, the sized `ScheduleWakeup` after it — **IS the terminal
+> tool call** for the RETURN path. **NO prose may follow it** —
 > not a "Summary of this iteration", not "the autonomous loop is now in a
 > self-recovering blocked state", not a ✶ Insight block, not a "going idle"
 > sign-off. The tool call is LAST, period.
@@ -1035,8 +1040,9 @@ RETURN   # yield contract (guard-153): the bg sleep IS the terminal tool call;
 ## Return Protocol
 
 This skill's terminal actions (either `LOOP_CONTINUE` via `Skill('aspirations') with args='loop'`
-OR `interruptible-sleep.sh` via Bash with `run_in_background=true`) are tool calls, satisfying
-the return-protocol requirement. See `.claude/rules/return-protocol.md`.
+OR `interruptible-sleep.sh` via Bash with `run_in_background=true`, OR — on a harness that cannot
+notify on background-job exit — `ScheduleWakeup` sized to the registered sleep, g-357-89) are tool
+calls, satisfying the return-protocol requirement. See `.claude/rules/return-protocol.md`.
 
 ## Chaining
 

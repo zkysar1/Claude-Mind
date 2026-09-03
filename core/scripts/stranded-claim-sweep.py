@@ -1459,6 +1459,10 @@ def _reap_stale_body_rows(
         "decisions": [],
         "shard_provenance": None,
         "claims_via": None,
+        # Paired with claims_via for the same guard-1419 reason: a run that
+        # reaped nothing because no goal was terminal and a run that reaped
+        # nothing because the queues were unreadable must not print alike.
+        "terminal_via": None,
         "errors": [],
     }
     try:
@@ -1466,7 +1470,10 @@ def _reap_stale_body_rows(
         from _team_state import (  # noqa: PLC0415
             read_shard_authoritative_with_provenance,
         )
-        from worker_stall import read_claims_union  # noqa: PLC0415
+        from worker_stall import (  # noqa: PLC0415
+            read_claims_union,
+            read_terminal_goal_ids,
+        )
         import body_row_reaper as _reaper  # noqa: PLC0415
         from worker_close_in_flight_clear import clear_body_row  # noqa: PLC0415
     except Exception as exc:  # noqa: BLE001 — optional deps; never break the sweep
@@ -1532,6 +1539,33 @@ def _reap_stale_body_rows(
     claims, claims_via = first
     out["claims_via"] = claims_via
 
+    def _read_terminal() -> "Optional[set]":
+        """Ids of FINISHED goals across both queues, or None when unanswered.
+
+        `None`, never an empty set, on any failure: the reaper reads None as
+        NOT MEASURED and an empty set as "read fine, nothing is terminal". Both
+        decline every reap today, so the distinction costs nothing now and is
+        the entire difference the moment anyone reads `goal_is_terminal` out of
+        a decision record (guard-2298 — a parser that converts absence into a
+        confident value).
+        """
+        try:
+            ids, via = read_terminal_goal_ids(
+                Path(WORLD_DIR) / "aspirations.jsonl",
+                agent_dir(agent) / "aspirations.jsonl",
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"terminal-read: {type(exc).__name__}: {exc}")
+            return None
+        out["terminal_via"] = via
+        if via == "none":
+            out["errors"].append(
+                "terminal-read: no layer answered (provenance=none)")
+            return None
+        return ids
+
+    terminal_ids = _read_terminal()
+
     def _verdicts(sids) -> Dict[str, Any]:
         got: Dict[str, Any] = {}
         for sid in sids:
@@ -1542,7 +1576,8 @@ def _reap_stale_body_rows(
                 got[sid] = (None, {})  # unrecognised -> KEEP, never reap
         return got
 
-    decision = _reaper.decide(rows, _verdicts(rows.keys()), claims, self_sid)
+    decision = _reaper.decide(rows, _verdicts(rows.keys()), claims, self_sid,
+                              terminal_ids)
     out["verdict_counts"] = decision["verdict_counts"]
     out["decisions"] = decision["decisions"]
     out["reap_candidates"] = len(decision["reapable"])
@@ -1575,8 +1610,17 @@ def _reap_stale_body_rows(
         if fresh_claims is None:
             cand["apply_result"] = "claims-unreadable-at-write"
             continue
+        # The terminal-id set is a THIRD half of the decision ( item
+        # 3) and gets the same guard-3020 treatment as the rows and the claim
+        # map: re-read here, never reused from the scan. Unlike the other two
+        # this one can move in BOTH directions between scan and write — a goal
+        # reopened mid-sweep must stop being reapable, and one that finished
+        # mid-sweep legitimately becomes reapable — so it is re-read rather
+        # than merely re-validated.
+        fresh_terminal = _read_terminal()
         recheck = _reaper.decide(
-            {sid: fresh_rows[sid]}, _verdicts([sid]), fresh_claims[0], self_sid
+            {sid: fresh_rows[sid]}, _verdicts([sid]), fresh_claims[0], self_sid,
+            fresh_terminal
         )
         if not recheck["reapable"]:
             cand["apply_result"] = "recheck-declined"

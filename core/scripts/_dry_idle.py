@@ -51,15 +51,29 @@ _DRY_QUIESCENCE = ("denied", "na")
 
 def load_config(config_path=None):
     """Read dry_idle_backoff from core/config/aspirations.yaml, merged over
-    DEFAULTS. Fail-open: any missing key / parse error yields DEFAULTS."""
+    DEFAULTS. Fail-open: any missing key / parse error yields DEFAULTS.
+
+    The LIVE read (config_path None) goes through _config_overlay.merged_config,
+    so meta/config-overrides.yaml keys `aspirations.dry_idle_backoff.<k>` take
+    effect — a single-agent deployment runs flat 2-hour idle blocks
+    (base_seconds 7200) while a busy fleet keeps the 2-minute re-check (user
+    directive 2026-09-03, g-357-90). An explicit config_path (tests) reads raw.
+    """
     cfg = dict(DEFAULTS)
     try:
         import yaml
+        block = None
         if config_path is None:
             config_path = (Path(__file__).resolve().parent.parent
                            / "config" / "aspirations.yaml")
-        raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-        block = raw.get("dry_idle_backoff") or {}
+            try:
+                from _config_overlay import merged_config
+                block = (merged_config("aspirations.yaml") or {}).get("dry_idle_backoff")
+            except Exception:
+                block = None  # overlay unavailable -> raw framework read below
+        if not isinstance(block, dict):
+            raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
+            block = raw.get("dry_idle_backoff") or {}
         for k in DEFAULTS:
             if k in block:
                 cfg[k] = block[k]

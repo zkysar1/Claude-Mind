@@ -247,13 +247,47 @@ handle_wake_signal() {
 #     (rb-400); stdout silenced only to keep the bg task output clean.
 _QS_BGJOBS_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/background-jobs.sh"
 _QS_JOB_ID=""
+# Idle-sleep marker (): "<pid> <wake_epoch> <job-id>". Written beside
+# the registration for the two IDLE classes (quiescence / dry) and retired by
+# the same trap chain. It makes the launch IDEMPOTENT: a second idle launch
+# while the first is alive JOINS it -- registers nothing, sleeps only until
+# the existing wake time. Measured need (coach, 2026-09-03 03:04Z): a harness
+# with no run_in_background timed out the launch call five times and each
+# retry spawned another 1800s sleep process (three live at once). The retry
+# reflex is the model's; absorbing it belongs to the script.
+_QS_ACTIVE_FILE="$AGENT_DIR/session/.idle-sleep-active"
+_QS_JOINED=0
 _qs_deregister() {
   if [ -n "$_QS_JOB_ID" ]; then
     bash "$_QS_BGJOBS_SCRIPT" deregister --id "$_QS_JOB_ID" >/dev/null || true
     _QS_JOB_ID=""
   fi
+  # Retire the marker only when it still names THIS process (a joiner never
+  # owns it; a newer registrant may have replaced it).
+  if [ -f "$_QS_ACTIVE_FILE" ] && [ "$(cut -d' ' -f1 "$_QS_ACTIVE_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$_QS_ACTIVE_FILE"
+  fi
 }
-if [ "${QUIESCENCE_SLEEP:-0}" = "1" ] || [ "${DRY_SLEEP:-0}" = "1" ] || [ "${EXTERNAL_WAIT:-0}" = "1" ]; then
+_qs_iso() { date -d "@$1" +%FT%T 2>/dev/null || date -r "$1" +%FT%T 2>/dev/null || echo "$1"; }
+if [ "${QUIESCENCE_SLEEP:-0}" = "1" ] || [ "${DRY_SLEEP:-0}" = "1" ]; then
+  if [ -f "$_QS_ACTIVE_FILE" ]; then
+    _act_pid=""; _act_wake=""; _act_id=""
+    read -r _act_pid _act_wake _act_id < "$_QS_ACTIVE_FILE" || true
+    _now=$(date +%s)
+    if [[ "$_act_pid" =~ ^[0-9]+$ ]] && [[ "$_act_wake" =~ ^[0-9]+$ ]] \
+       && [ "$_act_pid" != "$$" ] && kill -0 "$_act_pid" 2>/dev/null \
+       && [ "$_act_wake" -gt "$_now" ]; then
+      SECONDS_TO_SLEEP=$(( _act_wake - _now ))
+      _QS_JOINED=1
+      echo "idle-sleep JOINED: job ${_act_id:-?} pid $_act_pid is already sleeping -- this call registers nothing and waits ${SECONDS_TO_SLEEP}s (wake_at $(_qs_iso "$_act_wake"))"
+    else
+      rm -f "$_QS_ACTIVE_FILE"   # stale: dead pid or elapsed wake time
+    fi
+  fi
+fi
+if [ "$_QS_JOINED" = "1" ]; then
+  :   # joined the live idle sleep above: no traps, no row, no marker
+elif [ "${QUIESCENCE_SLEEP:-0}" = "1" ] || [ "${DRY_SLEEP:-0}" = "1" ] || [ "${EXTERNAL_WAIT:-0}" = "1" ]; then
   # Traps BEFORE register so no catchable-signal window exists where a
   # registered row outlives the process. Deregistering an unregistered id
   # is a harmless no-op ("not found").
@@ -276,6 +310,12 @@ if [ "${QUIESCENCE_SLEEP:-0}" = "1" ] || [ "${DRY_SLEEP:-0}" = "1" ] || [ "${EXT
         --id "$_QS_JOB_NAME" --type "$_QS_JOB_TYPE" --pid "$_QS_PID" \
         --completion-check "true" >/dev/null; then
     _QS_JOB_ID="$_QS_JOB_NAME"
+    if [ "$_QS_JOB_TYPE" != "external-wait-sleep" ]; then
+      _QS_WAKE=$(( SLEEP_START + SECONDS_TO_SLEEP ))
+      echo "$$ $_QS_WAKE $_QS_JOB_ID" > "$_QS_ACTIVE_FILE"
+      # One line for the caller that must size a wake-up (no-notify harness).
+      echo "idle-sleep REGISTERED: job $_QS_JOB_ID pid $_QS_PID seconds $SECONDS_TO_SLEEP wake_at $(_qs_iso "$_QS_WAKE")"
+    fi
   fi
 fi
 

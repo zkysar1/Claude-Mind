@@ -361,25 +361,22 @@ Phase A.evidence — Evidence-citation requirement (from-self only, governs ALL 
     **A blocker is not a gap.** "X is human-blocked / awaiting approval /
     until access is restored, so build Y meanwhile" is REJECTED here: a
     blocked lane is a reason to wait for the unblock, not to manufacture
-    adjacent work. Measured 2026-09-02 on a live deployment: eleven
-    self-generated aspirations in six days, nearly all "frameworks from
-    public data while the API is blocked", each seeding goals that consumed
-    iterations and tree writes. (An `Unblock:` aspiration that targets the
-    blocker itself is the opposite case and is fine.)
+    adjacent work (measured 2026-09-02: eleven such aspirations in six days
+    on one deployment). An `Unblock:` aspiration that targets the blocker
+    itself is the opposite case and is fine.
 
     Every surviving candidate carries its evidence sentence forward as the
     aspiration's `motivation` field AND as a structured `supply_evidence`
     object that the daemon's **aspiration-supply gate** verifies at write
     time (`core/scripts/gates/aspiration_supply.py`; refusal =
-    `aspiration_supply_blocked`). The gate fires for every self-generated
-    origin (`all_blocked_gap`, `idle_fallback`, `blocker_pattern:*`,
-    `successor:*`, and every spelling of the all-blocked lane) and for any
-    "replace completed …" motivation regardless of origin:
+    `aspiration_supply_blocked`). It fires for every self-generated origin
+    and for any "replace completed …" motivation regardless of origin:
 
         "supply_evidence": {
-          "gap":     "<what is MISSING, concretely — the file, node, capability
-                       or user-visible outcome that does not exist yet>",
-          "needle":  "<what the user can do or see once this lands>",
+          "gap": "<what is MISSING, concretely — the file, node, capability or
+                   user-visible outcome that does not exist yet>",
+          "needle": "<what the user can do or see once this lands>",
+          "needle_by": "<YYYY-MM-DD — when the user needs it by>",
           "checked": ["<asp-/g- id you read>", "<tree node key or file path>",
                       "<msg-/rb-/guard-/hypothesis id>"]
         }
@@ -387,21 +384,22 @@ Phase A.evidence — Evidence-citation requirement (from-self only, governs ALL 
     `checked` is the retrieval-first proof: ≥2 entries MUST resolve to things
     that EXIST (aspiration/goal ids in the store, tree node keys, files under
     the governed roots, board/reasoning-bank/guardrail/hypothesis ids).
-    Category labels and URLs are not referents. The gate also refuses a
-    candidate whose distinctive tokens are ≥40% contained in ANY existing
-    aspiration (live or archived): an ACTIVE match means file goals under
-    that aspiration instead; a completed/retired match is allowed only when
-    its id is in `checked` and `gap` names what it delivered and what is
-    missing. A per-agent daily cap (default 2) closes the loop: past it the
-    generator returns empty and the idle path sleeps. Thresholds:
-    `core/config/aspirations.yaml` → `idle_supply`.
+    Category labels and URLs are not referents. `needle_by` is the calendar
+    moment the user needs this by — if you cannot name one, the idle path is
+    the answer, not a filing. The gate refuses (g-357-87) a gap that names the
+    QUEUE ("no active aspiration for X", "the agent identity lacks X", "needs
+    a refresh"), an undated or past needle, a candidate whose distinctive
+    tokens are ≥40% contained in ANY existing aspiration (ACTIVE → file goals
+    under it; archived → only when cited in `checked` AND `gap` names what it
+    delivered and what is still missing), and a third self-generated
+    aspiration per agent per day (then the generator returns empty).
+    Thresholds: `core/config/aspirations.yaml` → `idle_supply`; check
+    catalog: `core/config/conventions/aspirations.md`.
 
     When a child goal of this aspiration reaches `aspirations-add-goal.sh`,
     set `origin_signal` to `parent_aspiration:<parent-asp-id>` so the
     origin-signal gate (core/scripts/origin-signal-gate.py) accepts it —
     the parent aspiration's evidence transitively licenses its goals.
-    (Works for both from-user and from-self parents — the name is
-    semantically parent-centric, not source-centric.)
 
 Phase A — Purpose scan:
     "What does Self need that isn't covered by current aspirations?"

@@ -87,6 +87,11 @@ fi
 # Mandatory: interruptible-sleep.sh (not plain `sleep`). The 1s-granularity
 # stop-signal check lets /stop respond within seconds instead of waiting for
 # a 30-minute plain sleep to exit.
+# Harness branch (): "the harness notifies you" is a Claude Code fact.
+# On a harness that cannot notify on background-job exit the wake-up IS the
+# re-entry, so the directive carries the sized ScheduleWakeup arm (empty on a
+# notifying harness; one shared text in _harness_caps.no_notify_hint).
+NO_NOTIFY_HINT="$(bash "$CORE_ROOT/scripts/harness-capabilities.sh" --hint "$SLEEP_DURATION" 2>/dev/null)"
 cat <<EOF
 === IDLE TICK ===
 Blocked-sleep timer active: ${REMAINING}s remaining (wake at ${VAL}).
@@ -98,6 +103,7 @@ DO NOT load Skill(aspirations). DO NOT run any selection or execution.
 Emit exactly ONE tool call:
   Bash("MIND_AGENT=${AGENT_NAME} QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh ${SLEEP_DURATION}", run_in_background=true)
 When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.
+${NO_NOTIFY_HINT}
 If you see this directive again after an autocompact, re-emit the Bash call
 for the NEW ${SLEEP_DURATION} printed above (this script recomputes on each invocation).
 =================

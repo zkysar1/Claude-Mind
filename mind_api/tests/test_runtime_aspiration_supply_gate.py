@@ -108,6 +108,7 @@ def test_well_formed_self_generated_aspiration_lands(running_daemon):
         "supply_evidence": {
             "gap": "No cadence reads the pending-question store and produces a digest; the existing aspiration only files questions.",
             "needle": "Each morning the user sees the open questions with one suggested default action per question.",
+            "needle_by": "2999-01-01",
             "checked": [existing_id, "world/aspirations.jsonl"],
         },
         # min_goals: a self-generated aspiration must carry its first goal
@@ -123,3 +124,31 @@ def test_well_formed_self_generated_aspiration_lands(running_daemon):
     rec = next(a for a in _read_jsonl(root / "world" / "aspirations.jsonl") if a["id"] == body["aspiration_id"])
     assert rec["supply_evidence"]["checked"][0] == existing_id
     assert rec["created_by_agent"] == "alpha"
+
+
+def test_g357_87_codes_surface_at_the_endpoint(running_daemon):
+    """The three  refusals travel through the daemon's 400 body:
+    an undated needle, a self-referential gap, and (shape check) the remedy
+    naming needle_by."""
+    root, port = running_daemon
+    live = _read_jsonl(root / "world" / "aspirations.jsonl")
+    existing_id = live[0]["id"]
+    asp = {
+        "title": "Nightly digest of unanswered questions with one recommended action each",
+        "motivation": "The agent identity as a question-router has no dedicated active aspiration.",
+        "priority": "MEDIUM", "status": "active", "scope": "sprint",
+        "origin_signal": "all_blocked_gap",
+        "supply_evidence": {
+            "gap": "No active aspiration covers the pending-question store; nothing is assigned to producing a digest.",
+            "needle": "Each morning the user sees the open questions with one suggested default action per question.",
+            "checked": [existing_id, "world/aspirations.jsonl"],
+        },
+        "goals": [{"title": "Build the nightly digest job", "status": "pending", "priority": "MEDIUM",
+                   "participants": ["agent"], "origin_signal": "idea:nightly-digest",
+                   "verification": {"outcomes": ["one digest delivered"], "checks": []}}],
+    }
+    status, body = _add(port, asp)
+    assert status == 400, body
+    checks = {f["check"] for f in body["gate_output"]["failures"]}
+    assert {"needle_undated", "gap_self_referential"} <= checks, checks
+    assert "needle_by" in body["gate_output"]["remedy"]

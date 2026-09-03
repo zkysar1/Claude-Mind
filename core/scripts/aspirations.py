@@ -505,7 +505,13 @@ def validate_goal(goal):
     if "verification" in goal:
         validate_verification(goal["verification"], goal["id"])
     # Validate recurring goal fields if present
-    if "interval_hours" in goal:
+    # A CLEARED interval_hours (present-but-None) is VALID () — see
+    # the mirrored comment in mind_api/src/endpoints/aspirations_write.py
+    # ::_validate_goal. Both sites must move together (guard-742 byte-parallel,
+    # guard-3275 one-defect-two-sites): fixing only the daemon leaves the CLI
+    # rejecting a value the daemon accepts, which relocates the wedge instead
+    # of clearing it.
+    if goal.get("interval_hours") is not None:
         if not isinstance(goal["interval_hours"], (int, float)) or goal["interval_hours"] <= 0:
             raise ValueError(f"Goal {goal['id']}: interval_hours must be a positive number")
     if "recurring" in goal:

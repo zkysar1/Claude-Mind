@@ -115,6 +115,7 @@ from typing import Any, Dict, List, Optional
 # holding — and they imply different follow-ups (a fleet of `no-carrier` means
 # the carrier pipeline is broken; a fleet of `alive` means it is working).
 R_REAP = "reap"                               # stale + no live claim -> orphan
+R_REAP_TERMINAL_GOAL = "reap-terminal-goal"   # the row's goal is FINISHED
 K_SELF_SID = "self-sid"                       # this process's own row
 K_NO_CARRIER = "no-carrier"                   # carrier absent -> death unproven
 K_ALIVE = "alive"                             # carrier fresh and ours
@@ -123,8 +124,15 @@ K_UNREADABLE = "unreadable"                   # carrier present, no usable ts
 K_SID_MISMATCH = "carrier-sid-mismatch"       # guard-358
 K_NULL_RESIDUE = "null-residue"               # pre- null-valued key
 
-#: Only this verdict mutates.
-REAPING_VERDICTS = frozenset({R_REAP})
+#: The verdicts that mutate. TWO, since  item 3 -- and they reap on
+#: DIFFERENT evidence, which is why the second is not folded into the first:
+#: `R_REAP` concludes the BODY is gone (a stale carrier), while
+#: `R_REAP_TERMINAL_GOAL` concludes the WORK is gone (the store says the goal is
+#: finished) and says nothing at all about the Body, which is usually alive and
+#: simply moved on. Keeping the tokens distinct keeps the two populations
+#: countable in `verdict_counts`, which is how the next decision about either
+#: predicate gets made (guard-2293).
+REAPING_VERDICTS = frozenset({R_REAP, R_REAP_TERMINAL_GOAL})
 
 #: Deliberately LONGER than the sweep's own `--carrier-fresh-minutes`. That
 #: threshold governs whether to HOLD A CLAIM, which is reversible on the next
@@ -158,8 +166,18 @@ def decide_row(
     carrier_evidence: Optional[Dict[str, Any]] = None,
     holds_live_claim: bool = False,
     self_sid: Optional[str] = None,
+    goal_is_terminal: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Pure per-row decision — every branch reachable with no daemon and no I/O."""
+    """Pure per-row decision — every branch reachable with no daemon and no I/O.
+
+    `goal_is_terminal` is TRI-STATE and the third state is load-bearing
+    (g-306-412 item 3): True = the queue SAYS this row's goal is finished,
+    False = the queue was read and the goal is not terminal, None = NOT
+    MEASURED (no goal_id on the row, the store was unreadable, or a caller that
+    predates the parameter). Only True reaps. A `bool` here would collapse
+    "unmeasured" into "not terminal", which is the harmless direction -- but it
+    would also let a future caller silently opt the whole predicate out while
+    still type-checking, so the absence is kept nameable (guard-2418)."""
     ev = carrier_evidence or {}
     out: Dict[str, Any] = {
         "sid": sid,
@@ -168,6 +186,10 @@ def decide_row(
         "carrier_verdict": carrier_verdict,
         "carrier_age_minutes": ev.get("carrier_age_minutes"),
         "holds_live_claim": bool(holds_live_claim),
+        # Emitted as the tri-state it is, never coerced: a `false` and a `null`
+        # here mean "the queue said not-terminal" and "nobody looked", and a
+        # reader triaging why a row survived needs to tell those apart.
+        "goal_is_terminal": goal_is_terminal,
     }
 
     # Order matters: the most certain KEEPs come first, so an ambiguous carrier
@@ -187,6 +209,39 @@ def decide_row(
         # recently, which is exactly what breaks under the API-storm shape this
         # defect is about. Belt and braces, deliberately.
         out["verdict"] = K_SELF_SID
+        return out
+
+    if goal_is_terminal is True:
+        # THE WORK IS OVER, whatever the Body is doing ( item 3).
+        #
+        # Every branch below this one asks "is the BODY alive", and until now
+        # that was the only question asked. It cannot reach a row whose Body is
+        # perfectly alive and has simply MOVED ON: the carrier is fresh, so the
+        # row is `alive` and kept forever, while the goal it names finished
+        # hours ago. That row is not live contention -- it is a phantom claim,
+        # and `goal-pickup-coordination-check._partner_in_flight` picks the
+        # NEWEST body row with no staleness guard of any kind, so a phantom
+        # wins outright whenever it is the newest.
+        #
+        # MEASURED 2026-09-03 on the live shard: alpha carried 7 body rows, two
+        # of them naming goals `completed` on 2026-09-01 ( claimed
+        # 14:19,  claimed 20:14) -- 37h and 31h of phantom. Neither was
+        # reachable by the carrier predicate: `CV_ABSENT` returns K_NO_CARRIER
+        # and `CV_FRESH_CORRECT` returns K_ALIVE, so the ONLY reaping path was
+        # `CV_STALE` + no live claim, and neither row was ever in that state.
+        #
+        # ORDERED AFTER `self_sid` DELIBERATELY, not by oversight. A row of the
+        # RUNNING session naming a finished goal is a miss in the CLEAN-close
+        # path (`worker_close_in_flight_clear`), and that is where it should be
+        # fixed; reaping it here would mask the defect and would weaken the
+        # belt-and-braces self-preservation the API-storm shape motivated.
+        #
+        # ORDERED BEFORE EVERY CARRIER BRANCH because this is the stronger
+        # evidence: a terminal status is a FACT the store asserts, while every
+        # carrier verdict is an inference from an mtime. Only `True` reaches
+        # here -- `None` (unmeasured) and `False` fall through untouched, so a
+        # caller that cannot answer the question changes nothing.
+        out["verdict"] = R_REAP_TERMINAL_GOAL
         return out
 
     # guard-358, both spellings. `fresh-wrong` is the explicit token; a STALE
@@ -226,11 +281,31 @@ def decide_row(
     return out
 
 
+def _goal_terminal(row: Any, terminal_goal_ids: Optional[set]):
+    """Tri-state: is THIS row's goal in a terminal status? ( item 3)
+
+    `None` whenever the question was not answerable -- the caller passed no id
+    set (it could not read the queues, or predates the parameter), or the row
+    carries no `goal_id` to look up. Never guesses: an id absent from a set that
+    was genuinely read means the goal is NOT terminal, which is `False`, and the
+    two are kept apart because only one of them may ever reach a delete.
+    """
+    if terminal_goal_ids is None:
+        return None
+    if not isinstance(row, dict):
+        return None
+    gid = row.get("goal_id")
+    if not gid:
+        return None
+    return str(gid) in terminal_goal_ids
+
+
 def decide(
     rows: Dict[str, Any],
     carrier_verdicts: Dict[str, Any],
     claims_by_sid: Dict[str, str],
     self_sid: Optional[str] = None,
+    terminal_goal_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Decide over one agent's whole `in_flight_bodies` map. Pure.
 
@@ -252,6 +327,8 @@ def decide(
                 carrier_evidence=evidence,
                 holds_live_claim=(claims_by_sid or {}).get(sid) is not None,
                 self_sid=self_sid,
+                goal_is_terminal=_goal_terminal(
+                    (rows or {})[sid], terminal_goal_ids),
             )
         )
     counts: Dict[str, int] = {}

@@ -112,10 +112,13 @@ def _load_config():
     """Read quiescence_gate block from aspirations.yaml.
 
     Fails loud if the block is missing — config is the single source of truth.
+    Routes through _config_overlay.merged_config so meta/config-overrides.yaml
+    keys `aspirations.quiescence_gate.<k>` (e.g. sleep_seconds_max 7200 for a
+    deployment that sleeps in 2-hour blocks — user directive 2026-09-03,
+    g-357-90) take effect; a malformed override fails loud there too (rb-215).
     """
-    import yaml
-    with open(CONFIG_DIR / "aspirations.yaml", "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
+    from _config_overlay import merged_config
+    cfg = merged_config("aspirations.yaml") or {}
     qg = cfg.get("quiescence_gate")
     if qg is None:
         raise RuntimeError(

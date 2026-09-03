@@ -857,9 +857,84 @@ blocks with "Skill /name instructions already in context."
 Skills use `load-conventions.sh` in Step 0 to batch-check which conventions need loading.
 
 **Scope**: `core/config/**`, `.claude/skills/**/SKILL.md` (Read AND Skill tool), `world/knowledge/tree/**`, `world/conventions/**`.
-Partial reads (offset/limit) bypass tracking.
+Partial reads (offset/limit/pages) ARE recorded, behind the `#partial:` marker — visible to the
+read-before-edit advisory, invisible to the blocking dedup gate (g-115-3747). They were dropped
+entirely until then, which is what the superseded "partial reads bypass tracking" line described.
 
 **Scripts**: `core/scripts/context-reads.py`, `core/scripts/context-reads-skill-gate.sh`, `core/scripts/load-conventions.sh`.
+
+## Session Provenance Manifest (g-357-43)
+
+The same tracker file also answers a second question: **what did this session actually
+retrieve?** — so a citation can be checked instead of taken on trust. It exists because an
+agent can state a claim confidently and set a plausible-looking URL beside it that it never
+fetched (the g-012-03 incident: a trade-compensation claim written backwards, with a citation).
+Prose cannot be audited for that; a manifest of real retrievals can.
+
+**Lanes and markers.** One tracker file, three line shapes:
+
+| Line shape | Meaning | Fed by |
+|---|---|---|
+| `<abs-path>` | file read in full | `PostToolUse[Read]` → `context-reads-record.sh` |
+| `#partial:<abs-path>` | file read in part (offset/limit/pages) | same hook, `--partial` |
+| `#prov:<kind>\|<iso-ts>\|<value>` | non-file retrieval | `PostToolUse[WebFetch\|WebSearch]` → `context-reads-record-fetch.sh`, or `context-reads.py record-prov` |
+
+`kind` ∈ `url` (a fetched URL, including each result URL a search returned), `search` (the query
+text), `node` (a tree-node key), `board` (a message id). The value keeps any `|` it contains —
+only the first two separators are structural. The set is closed: `record-prov` refuses an
+unknown kind rather than writing a lane nothing queries.
+
+**Which lanes have an automatic producer** — check before trusting a negative:
+
+| kind | producer | wired? |
+|---|---|---|
+| `url`, `search` | `PostToolUse[WebFetch\|WebSearch]` | yes |
+| `node` | `tree-read.sh --node`, on rc=0 only | yes |
+| `board` | — | **no** — `record-prov --kind board` exists, nothing calls it |
+
+`retrieve.sh` is also unwired: it is daemon-only and its node keys arrive in the *response*, so
+recording there means parsing JSON on the framework's hottest read path — deliberately deferred
+rather than paid on every consult. Until those land, an exit 1 for a board message or for a node
+surfaced only through `retrieve.sh` means "no producer", not "not retrieved".
+
+The `node` recorder is **success-gated**: it fires on rc=0 and never on the not-found branch.
+Recording a failed lookup would authenticate a citation to a node that never resolved — the one
+direction this manifest must not fail in.
+
+**Why one file.** Provenance entries inherit the tracker's session scoping, its self-healing
+session-mismatch delete, and its per-Body routing (`sessions/<unitKey>/body-context-reads.txt`)
+for free. One lifecycle, not two.
+
+**The exclusion is load-bearing.** `_read_tracker_split`'s path fork ends in
+`else: full.add(line)`, and `full` is what `read_tracker()` hands `cmd_gate` — the BLOCKING
+PreToolUse dedup gate. Any unrecognised line is admitted, so a marker stays out of that set
+only by being excluded EXPLICITLY, exactly as `#partial:` is. Without the skip, a URL is
+counted as a tracked file read and `cmd_status` renders it through `os.path.relpath` as
+garbage. Pinned (and mutation-proved) by
+`core/scripts/tests/test_provenance_manifest.py::test_provenance_never_inflates_the_read_tracker`.
+
+**Append-cheap by contract** (guard-875): recording is one `open(..., "a")` + write, never a
+read of the whole file — this runs on every read and every fetch. Only `provenance-check` pays
+a full read, once, on an explicit query, off the hook path.
+
+**Query API.**
+
+```bash
+bash core/scripts/provenance-check.sh <url-or-path-or-node-key>     # exit 0 = retrieved
+bash core/scripts/provenance-check.sh --session-id <sid> --quiet <q>  # exit code only
+```
+
+Exit 0 prints `RETRIEVED\t<kind>\t<when>\t<value>` per hit; exit 1 means no record; exit 2 is a
+usage error. File paths are answered from the read lanes, so one call covers a Read and a
+WebFetch alike.
+
+**READ THE NEGATIVE CORRECTLY.** Exit 1 means *"no tool-fetch record in this session's
+manifest"* — never *"this URL was fabricated"*. The manifest is fed by hooks bound to the
+**Read / WebFetch / WebSearch tools**, so a page pulled with `curl` in a Bash call, or a file
+read with `cat`, is invisible to it by construction — the guard-4407 predicate (*before trusting
+any hook-fed instrument, ask which TOOL its hook binds to*) applies to this instrument too, and
+bites harder in a Bash-preference session. Anything retrieved before the manifest's last session
+reset is likewise absent. Exit 1 is a prompt to go verify, not a verdict.
 
 ---
 
