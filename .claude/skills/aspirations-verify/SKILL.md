@@ -52,10 +52,12 @@ scans those journal lines and logs false claims to
 - `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
 - `prior_checks`: dict (optional, default `{}`) — map of checks already passed in a prior turn that was interrupted by autocompact or graceful stop. Keys: `q1_passed`, `q1_artifact`, `q1_5_passed`, `q1_5_checklist`, `q2_passed`, `q2_failure_mode_checked`, `q3_scope`, `standard_checks_passed`. Threaded in by the Phase -1.4 Graceful Stop Handler from `iteration-checkpoint.json`'s `phase_progress` field. See [core/config/conventions/compact-recovery.md](core/config/conventions/compact-recovery.md) "Iteration Checkpoint `phase_progress` Field".
 
+- `scope`: `"full"` (default) or `"own-unit"` (g-306-417) — a worker Body verifying only the goal it just executed (worker-loop Phase 4a, before the mechanical close). Runs each per-goal section below for that goal alone; skips the cross-Body residue (streaks, sampled review). A pass means the criteria were met on THIS Body, never that its code landed (guard-4638). Why: `core/config/rationale/worker-verify-own-unit.md`.
+
 ## Outputs (to orchestrator)
 
 - `goal_completed`: Boolean — did the goal pass verification?
-- `aspiration_complete`: Boolean — is the parent aspiration now fully complete?
+- `aspiration_complete`: Boolean — is the parent aspiration now fully complete? Under `scope == "own-unit"` this is REPORTED only; closing the parent aspiration stays reducer-side.
 
 ## Hypothesis Goal Verification
 
@@ -449,24 +451,15 @@ written by the canonical close path on a recurring goal. The block below
 DESCRIBES what that path computes so a reader can interpret the values — it is
 NOT a set of commands to run.
 
-Why this is worse than a harmless duplicate, which is the reason it needs a
-warning rather than a note: **`lastAchievedAt` is an INPUT to the derivation,
-read immediately before it is overwritten.** Setting it by hand to the current
-time collapses `elapsed` to ~0, and the close then derives an UNBROKEN streak
-from that corrupted input — so a wrong number arrives looking script-computed.
-Nothing errors, and the false value is always the flattering one. Measured
-(g-001-02, bravo, 2026-08-04): a true 19.1h gap against a 15.99h break threshold
-correctly yields streak = 1; the hand-written path recorded 4.
+It is worse than a harmless duplicate: `lastAchievedAt` is an INPUT read
+immediately before it is overwritten, so a hand-write collapses `elapsed` to ~0
+and the close derives a flattering UNBROKEN streak from it (measured: true 19.1h
+gap recorded as streak 4, not 1).
 
-**Re-running the close does NOT repair it.** The hand-write destroyed the only
-copy of the previous `lastAchievedAt`, so a second run reads the value the first
-run just wrote, computes `elapsed ≈ 0` again, and derives the same unbroken
-streak — deterministically, forever. Recovery needs the ORIGINAL timestamp from
-the store's `.history` snapshot; there is no in-band fix.
-
-The cost is a suppressed learning signal, not a cosmetic one: the streak-break
-reflector consumes this field, so a falsely-unbroken streak silently removes the
-very signal that a cadence was missed.
+**Re-running the close does NOT repair it.** The original timestamp is gone, so
+each re-run reproduces the same wrong streak. The suppressed streak-break signal,
+not the wrong number, is the real cost. Why:
+`core/config/rationale/recurring-streak-hand-write.md`.
 
 ```
 # DESCRIPTIVE — what the canonical close path computes. Do not execute.

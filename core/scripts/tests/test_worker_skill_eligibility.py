@@ -350,3 +350,97 @@ def test_non_evaluation_message_is_scoped_to_the_skill_less_branch():
     pinned = we.skill_eligibility("/tree")
     assert "NOT EVALUATED" not in pinned.reason
     assert pinned.eligible is True
+
+
+# ----------------- : the GOAL-level role declaration -----------------
+#
+# The skill bridge above is SKILL-keyed and 1,411 of 1,447 live candidates carry
+# no skill (97.5%, cc-09 2026-09-03), so for ~98% of the queue it answers "NOT
+# EVALUATED". `goal_eligibility` reads a GOAL-level `executable_by_role` first.
+#
+# Weighted the same way as the block above (guard-2860): the load-bearing tests
+# are the ones that must not fail in the dangerous direction -- the CONTRADICTION
+# case (metadata must never unlock a reducer-only skill) and the UNSET case (the
+# existing corpus must behave exactly as it did before this field existed).
+
+
+def test_unset_role_preserves_the_skill_bridge_verdict_exactly():
+    """THE REGRESSION PIN. The field is new, so the entire existing corpus is
+    unset; if the unset path diverged from skill_eligibility in either
+    direction this change would silently re-route the whole live queue."""
+    for skill in (None, "", "/replay --sharp-wave", "/tree", "/reflect",
+                  "/never-heard-of-it", "/agent-completion-report"):
+        assert (we.goal_eligibility(skill, None).eligible
+                is we.skill_eligibility(skill).eligible), skill
+
+
+def test_declared_reducer_is_refused_even_with_no_skill():
+    """The gap this goal exists to close: a skill-LESS reducer-only goal."""
+    v = we.goal_eligibility(None, "reducer")
+    assert v.eligible is False
+    assert "executable_by_role='reducer'" in v.reason
+
+
+def test_declared_worker_is_eligible_and_routes_positively():
+    """The BIDIRECTIONAL half. Of the 3 measured role-unsatisfiable defers, TWO
+    need a worker -- a boolean `reducer_only` could not express them."""
+    v = we.goal_eligibility(None, "worker")
+    assert v.eligible is True
+    assert "executable_by_role='worker'" in v.reason
+
+
+def test_worker_declaration_cannot_unlock_a_reducer_only_skill():
+    """MOST LOAD-BEARING. Filer-supplied metadata must never relax a structural
+    fence: running /replay on a worker encodes from unmerged state (the
+    Nth-reducer defect). The contradiction must refuse AND name both halves so
+    the mis-filed record gets corrected rather than silently honoured."""
+    v = we.goal_eligibility("/replay --sharp-wave", "worker")
+    assert v.eligible is False
+    assert "CONTRADICTION" in v.reason
+    assert "unmerged" in v.reason      # the skill verdict is still carried through
+
+
+def test_any_defers_to_the_skill_bridge_in_both_directions():
+    assert we.goal_eligibility("/tree", "any").eligible is True
+    assert we.goal_eligibility("/replay", "any").eligible is False
+
+
+def test_unrecognised_role_falls_back_and_says_it_is_not_a_cleared_check():
+    """A typo must not fence a goal in EITHER direction, and must not read as a
+    pass -- the guard-1760 class (a checker must not report what it declined to
+    look at as a pass)."""
+    v = we.goal_eligibility(None, "reduser")
+    assert v.eligible is we.skill_eligibility(None).eligible
+    assert "UNRECOGNISED" in v.reason
+    assert "NOT a cleared check" in v.reason
+    # ...and it must still not unlock a refused skill
+    assert we.goal_eligibility("/replay", "reduser").eligible is False
+
+
+def test_role_value_is_case_and_whitespace_insensitive():
+    for raw in ("reducer", "Reducer", "  REDUCER  "):
+        assert we.goal_eligibility(None, raw).eligible is False, raw
+
+
+def test_declared_values_are_the_documented_set():
+    assert we.EXECUTABLE_BY_ROLE_VALUES == ("worker", "reducer", "any")
+
+
+def test_positive_control_the_field_actually_changes_something():
+    """POSITIVE CONTROL (guard-4166). Every assertion above would still pass if
+    `goal_eligibility` ignored its role argument entirely and forwarded to the
+    skill bridge -- except this one. On a skill-LESS goal the bridge says
+    ELIGIBLE, so a role of 'reducer' must flip the verdict; that flip is the
+    whole capability being added."""
+    skill_less = we.skill_eligibility(None)
+    assert skill_less.eligible is True, "precondition: the bridge fails open"
+    assert we.goal_eligibility(None, "reducer").eligible is False, \
+        "the role field had no effect -- the fix is inert"
+
+
+def test_schema_registers_the_field_so_a_writer_exists():
+    """guard-167: a new tracked field must wire BOTH producer and consumer. The
+    consumer is goal_eligibility; the producer is the generic goal-field write
+    path, which refuses any name absent from GOAL_KNOWN_FIELDS."""
+    import _goal_fields
+    assert _goal_fields.is_known("executable_by_role")

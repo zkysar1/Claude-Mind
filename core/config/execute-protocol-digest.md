@@ -349,6 +349,69 @@ IF productive:
     # uses the id verbatim, so compose it collision-free here.)
     experience_id = "exp-{goal.id}-{skill_slug}-{YYYYMMDD}"
     Write agents/<agent>/experience/{experience_id}.md (full trace)
+    # ── WORKER BODY: THIS STEP IS YOURS FOR YOUR OWN GOAL (g-306-418) ──────
+    # Until 2026-09-03 experience-add.sh refused EVERY worker write and exited 0
+    # while doing it, which contradicted this very step: worker-loop Phase 3
+    # grants a worker "Phase 3.9 .. 4.5", and 4.25 lives inside that range. The
+    # contradiction was documented (g-115-5058) and proposed to be resolved by
+    # narrowing the DOCS to match the refusal. The owner chose the other
+    # direction, and the reasoning is the part worth carrying:
+    #
+    #   an experience record is the raw TRACE of one goal's execution — the
+    #   INPUT to reflection, not a learned artifact — and the store is
+    #   append-only with locked appends. N workers each appending the trace of
+    #   the goal THEY executed do not become N encoders. One archive, N honest
+    #   authors. Reflection over the merged result stays the reducer's.
+    #
+    # THE PARTITION, and it is the same sentence worker-loop/SKILL.md Phase 3.6
+    # points here for — one statement, two readers:
+    #   ALLOWED from a worker : the experience record for a goal THIS Body HOLDS
+    #                           (claimed_by_sid == MIND_SID) — SUBJECT to the
+    #                           runner-claim precondition below.
+    #   REFUSED from a worker : agent-wide or unscoped experience writes, and
+    #                           every tree / reasoning-bank / guardrail / journal
+    #                           write. Those stay reducer-only — the convergence
+    #                           invariant is narrowed here, never repealed.
+    #
+    # TWO THINGS THIS PARTITION DOES NOT GRANT — both measured 2026-09-03 on the
+    # unit that shipped it, and both easy to misread from the ALLOWED line alone:
+    #
+    # 1. HYPOTHESIS RESOLUTION IS NOT INCLUDED. An earlier draft of this block
+    #    said a worker may also resolve the pipeline hypothesis attached to its
+    #    goal. It may not, and the capability was never built: pipeline_write.py
+    #    ::move sets rec["stage"] = target_stage UNCONDITIONALLY, with no
+    #    already-terminal check anywhere below it, so "resolve without
+    #    duplication" is not a property that exists to be granted. Granting the
+    #    permission without the guard would turn a refusal into a silent
+    #    double-resolve. Tracked by g-306-421 (precondition) and g-306-417
+    #    (feature). Until both land, hypothesis resolution stays reducer-only.
+    #
+    # 2. PASSING THIS GATE IS NOT THE SAME AS THE WRITE LANDING. experience-add
+    #    is an AGENT-WIDE store write, so it sits behind a SECOND, independent
+    #    fence: the box must hold the agent's runner claim. A worker Body on the
+    #    reducer's own box holds it and the write lands. A CROSS-BOX worker does
+    #    not, and the store returns {"error":"no_claim"} — structural, not a
+    #    race, so do not retry or refresh. Measured: alpha worker on cc-10 with
+    #    the claim live on cc-04. The correct response is the one the error
+    #    itself prescribes — relay the payload to the coordination board for the
+    #    claim-holder to execute.
+    #    Note what this means for testing: a hermetic test that stubs the store
+    #    CANNOT see fence 2, so a green suite over this gate says nothing about
+    #    whether a cross-box worker's record actually lands (rb-9476 shape — a
+    #    scoped fix can be correct at its own layer and inert one layer down).
+    #
+    # THE GATE IS IN THE SCRIPT, so you do not have to self-police it: it
+    # resolves the record's goal (goal_id field, else derived from an
+    # exp-{goal-id}-{slug} id — g-115-1917), reads the LIVE claim, and exits 3
+    # unless this Body holds it. rc 3, never 0: a refusal you cannot detect is
+    # the g-306-252 / guard-5596 defect class. An UNREADABLE claim also refuses —
+    # a claim that cannot be read is not one that may be assumed
+    # (core/config/conventions/reducer-promotion.md's "refuse on unverifiability").
+    #
+    # A worker still writes its Phase 3.6 exp_capture WM entry as well. The two
+    # are not redundant: this record is the archived trace, that lane carries the
+    # verbatim_anchors and the outcome_class the reducer needs at generalize-down,
+    # and it is the only one of the two that survives if this box never syncs.
     echo '<experience-json>' | bash core/scripts/experience-add.sh
     # Include: goal_id "{goal.id}" (CANONICAL join key — the recurring-close 4.25
     #   canary and experience-read --goal match on goal_id, NOT source_goal;

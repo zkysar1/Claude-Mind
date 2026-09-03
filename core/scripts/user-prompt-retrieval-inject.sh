@@ -135,40 +135,135 @@ except Exception:
 query = text[:400]
 env = dict(os.environ)
 env['MIND_AGENT'] = agent
-try:
-    r = subprocess.run(
-        bash_cmd(os.path.join(scripts_dir, 'retrieve.sh'),
-                 '--category', query, '--depth', 'shallow',
-                 '--read-only', '--include-framework'),
-        capture_output=True, text=True, timeout=18, env=env,
-        cwd=os.environ.get('PROJECT_ROOT') or None)
-    out = r.stdout
-    data = json.loads(out[out.find('{'):])
-except Exception:
-    sys.exit(0)
+
+# HARD LATENCY BUDGET. This hook runs BEFORE the model starts thinking, so
+# every second here is dead air the user watches. The ceiling is therefore a
+# UX bound, not a correctness bound -- blowing it costs one un-injected
+# message, which is exactly the pre-hook state and never an error.
+#
+# MEASURED (alpha worker Body, hostname cc-08, uname -r 6.8.0-138-generic,
+# own-cloud, 2026-09-03) on this script's exact invocation -- same flags, warm
+# daemon: 957ms / 1037ms / 1575ms across three unrelated queries. 5s is ~3.2x
+# the observed max, while capping worst-case dead air at 5s.
+#
+# It was 18s until now, against a goal () that specified "~2s": an
+# 18s ceiling means a pathological retrieval blocks the user's prompt for 18
+# seconds, which defeats the point of having a budget at all. 2s exactly was
+# NOT taken -- it leaves only 27% headroom over the measured max, so ordinary
+# jitter (cold daemon, contention, a slower box) would silently stop injecting
+# on the boxes that need it most. The number is a measurement, not the spec's
+# literal value, and the spec's "~" is read as licensing that.
+RETRIEVE_TIMEOUT_S = 5
+
+# Test seam, same family as MIND_PROMPT_HOOK_DRYRUN above: supply the
+# retrieval JSON directly so the dedup lattice below can be exercised
+# hermetically. Without it a dedup test needs a live daemon AND a stable
+# corpus, which makes it an integration test that cannot pin the branch.
+_fake = os.environ.get('MIND_PROMPT_HOOK_FAKE_RETRIEVAL')
+if _fake:
+    try:
+        data = json.loads(_fake)
+    except Exception:
+        sys.exit(0)
+else:
+    try:
+        r = subprocess.run(
+            bash_cmd(os.path.join(scripts_dir, 'retrieve.sh'),
+                     '--category', query, '--depth', 'shallow',
+                     '--read-only', '--include-framework'),
+            capture_output=True, text=True, timeout=RETRIEVE_TIMEOUT_S, env=env,
+            cwd=os.environ.get('PROJECT_ROOT') or None)
+        out = r.stdout
+        data = json.loads(out[out.find('{'):])
+    except Exception:
+        sys.exit(0)
 
 def _clip(s, n):
     s = ' '.join(str(s or '').split())
     return s if len(s) <= n else s[:n - 1] + '…'
 
-lines = []
 ec = (data.get('meta') or {}).get('embedding_channel', '?')
-tree = data.get('tree_nodes') or []
-rb = data.get('reasoning_bank') or []
-guards = data.get('guardrails') or []
-fw = data.get('framework_rules') or []
+
+# ---- SESSION DEDUP ( outcome 3) --------------------------------
+# A focused conversation re-retrieves the same nodes turn after turn, so
+# without this the identical index is re-injected on every message -- pure
+# context burn, and it crowds out the hits that ARE new.
+#
+# FAIL-OPEN IS IN THE *INJECT* DIRECTION, and that asymmetry is the whole
+# design. Any failure reading or writing the state file leaves every hit
+# unfiltered: a dedup fault must never be able to SUPPRESS retrieval, because
+# that converts a cache miss into a silent regression of the entire hook and
+# looks identical to "no matches" from the outside. Over-injecting costs
+# tokens; under-injecting costs the feature.
+#
+# A repeat is never dropped in SILENCE either. When every hit is one this
+# session already saw, the recap line below still names the ids -- the scent
+# survives at ~1 line instead of ~6, and the model can still expand them.
+def _hid(kind, e):
+    return '%s:%s' % (kind, e.get('key') or e.get('id') or e.get('path')
+                      or e.get('file') or '')
+
+seen, state_path = set(), None
+try:
+    from _paths import SESSIONS_DIRNAME
+    if sid and re.fullmatch(r'[A-Za-z0-9._-]+', sid):
+        state_path = (_agent_dir(root, agent) / SESSIONS_DIRNAME / sid /
+                      'prompt-injected-hits.txt')
+        if state_path.exists():
+            seen = {ln.strip() for ln
+                    in state_path.read_text(encoding='utf-8').splitlines()
+                    if ln.strip()}
+except Exception:
+    seen, state_path = set(), None
+
+fresh_ids, repeat_ids = [], []
+
+def _fresh(kind, entries, cap):
+    """Filter BEFORE capping, so a session that already saw the top N gets
+    the next N rather than nothing -- the repeats are what we are paying to
+    remove, not the depth."""
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        h = _hid(kind, e)
+        if h in seen:
+            repeat_ids.append(h)
+            continue
+        out.append(e)
+        fresh_ids.append(h)
+        if len(out) >= cap:
+            break
+    return out
+
+lines = []
+tree = _fresh('t', data.get('tree_nodes'), 4)
+rb = _fresh('r', data.get('reasoning_bank'), 3)
+guards = _fresh('g', data.get('guardrails'), 3)
+fw = _fresh('f', data.get('framework_rules'), 2)
 if tree:
     lines.append('tree: ' + '; '.join(
-        '%s — %s' % (e.get('key'), _clip(e.get('summary'), 60)) for e in tree[:4]))
+        '%s — %s' % (e.get('key'), _clip(e.get('summary'), 60)) for e in tree))
 if rb:
     lines.append('rb: ' + '; '.join(
-        '%s — %s' % (e.get('id'), _clip(e.get('title'), 60)) for e in rb[:3]))
+        '%s — %s' % (e.get('id'), _clip(e.get('title'), 60)) for e in rb))
 if guards:
     lines.append('guards: ' + '; '.join(
-        '%s — %s' % (e.get('id'), _clip(e.get('rule'), 70)) for e in guards[:3]))
+        '%s — %s' % (e.get('id'), _clip(e.get('rule'), 70)) for e in guards))
 if fw:
     lines.append('rules: ' + '; '.join(
-        _clip(e.get('path') or e.get('file'), 60) for e in fw[:2]))
+        _clip(e.get('path') or e.get('file'), 60) for e in fw))
+
+# Persist AFTER building, and only what was actually injected -- recording a
+# hit the caller never saw would suppress it forever on the strength of a
+# message that never carried it.
+if state_path is not None and fresh_ids:
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        with state_path.open('a', encoding='utf-8') as fh:
+            fh.write('\n'.join(fresh_ids) + '\n')
+    except Exception:
+        pass
 
 if lines:
     body = ('[auto-retrieval pre-pass | embedding_channel: %s] Store matches for '
@@ -177,6 +272,17 @@ if lines:
             'a truncated rule head is not the rule, guard-1421) BEFORE answering; '
             'respond Step 4 escalation still applies for depth.\n' % ec
             + '\n'.join(lines))
+    if repeat_ids:
+        body += ('\n(%d further match(es) were already injected earlier this '
+                 'session and are not repeated.)' % len(repeat_ids))
+elif repeat_ids:
+    # EVERY hit is a repeat. Silence here would be a REGRESSION dressed as a
+    # saving: the model would read "no output" identically to "nothing in the
+    # stores matches", which is the opposite of the truth. Recap the ids only.
+    body = ('[auto-retrieval pre-pass | embedding_channel: %s] Every store match '
+            'for this message was already injected earlier this session — not '
+            'repeating the index. Still relevant, expand on demand: %s'
+            % (ec, ', '.join(h.split(':', 1)[1] for h in repeat_ids[:12] if ':' in h)))
 else:
     body = ('[auto-retrieval pre-pass | embedding_channel: %s] No store matches '
             'for this message. If it needs domain knowledge, that absence means '

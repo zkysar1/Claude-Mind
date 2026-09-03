@@ -513,6 +513,58 @@ def test_push_sends_the_whole_file_so_a_failed_push_self_heals(tmp_path, monkeyp
         "the recovered push must carry the entry whose own push failed")
 
 
+def test_push_failure_is_reported_once_and_still_never_raises(tmp_path, monkeypatch, capsys):
+    """A failed push must NAME its cause on stderr, exactly once per process.
+
+    g-306-420: this except discarded the cause entirely, so a transport that
+    could not work AT ALL looked identical to one with nothing to send —
+    measured on cc-08, a worker Body's carrier held 101 undelivered rows behind
+    a quiet False, because the carrier's destination is inside the
+    claim-protected agent tree and a worker never holds the runner claim.
+
+    ONCE, not per-call, is the half worth pinning: on a non-reducer box every
+    push fails, so a per-call report would be noise that the first reader
+    filters out — which is how a loud failure becomes a dark one again.
+
+    The module flag is process-global and pytest shares a process, so it is
+    reset explicitly here. Without the reset this test passes or fails on
+    whichever sibling happened to push first, which is a cross-test dependency
+    that would be blamed on whatever failed next rather than on this file.
+    """
+    # raising=False so a source that lost the FLAG fails on the missing REPORT
+    # below rather than here — the assertion should name the behaviour that
+    # regressed, not a private attribute.
+    monkeypatch.setattr(bcc, "_PUSH_FAILURE_REPORTED", False, raising=False)
+    root = _mk_root(tmp_path)
+    wm = root / "agents" / AGENT / "sessions" / "sid-rep" / "working-memory.yaml"
+    wm.parent.mkdir(parents=True)
+    wm.write_text("slots: {}\n", encoding="utf-8")
+
+    be = DivergingBackend(fail_writes=True)
+    import storage_backend
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: be)
+
+    p = bcc.record_local(wm, "spark_capture", _entry("g-REP"))
+
+    assert bcc.push(p) is False, "a failed push still returns False"
+    first = capsys.readouterr().err
+    assert "push FAILED" in first, (
+        "a failed push must name itself on stderr; a bare False is the dark "
+        "failure g-306-420 was filed about")
+    assert "NOT reaching the reducer" in first, (
+        "the report must say what the failure COSTS, not merely that it happened")
+
+    assert bcc.push(p) is False, "still False on the second failure"
+    second = capsys.readouterr().err
+    assert "push FAILED" not in second, (
+        "the report is once-per-process; a per-call report is noise on a "
+        "non-reducer box where every push fails")
+
+    # The never-raises contract is the reason this swallows at all: a raise here
+    # would fail the WM append the transport exists to back.
+    assert bcc.push(None) is False
+
+
 # --------------------------------------------------------------------------
 #  — the carrier must not inflate the flagged:total denominator
 # --------------------------------------------------------------------------

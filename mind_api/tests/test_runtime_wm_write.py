@@ -639,10 +639,15 @@ def test_byte_compat_set_top_level(tmp_path):
 # floor-aware since  and this comment named the wrong branch until
 # : when flagged entries exceed (cap - _unflagged_floor) the oldest
 # FLAGGED one goes, otherwise the oldest UNFLAGGED one goes. The seed below is
-# 100% load_bearing, so THIS test exercises the FLAGGED branch — the recoverable
-# one, since a flagged entry was mirrored to the Body's carrier at append time
-# and still reaches the reducer from there. The unflagged branch is the
-# unrecoverable one (the WM slot is that entry's only copy).
+# 100% load_bearing, so THIS test exercises the FLAGGED branch — the
+# CONDITIONALLY recoverable one: a flagged entry is mirrored to the Body's
+# carrier at append time, which makes delivery possible but does not effect it.
+# The carrier still has to PUSH, and on a non-reducer Body that push fails
+# structurally — the destination is inside the claim-protected agent tree and a
+# worker never holds the runner claim (; measured 101 undelivered rows
+# on one worker box). So "flagged" reads as recoverable ON A REDUCER and as an
+# equal loss on a worker whose carrier is dark. The unflagged branch is
+# unrecoverable everywhere (the WM slot is that entry's only copy).
 #
 # known_blockers (array_limits 10) is used rather than a capture lane: the
 # behaviour is slot-agnostic, and known_blockers has no per-slot validation.
@@ -718,6 +723,19 @@ def test_wrapper_surfaces_eviction_on_stderr(running_daemon):
     assert "The victim is the OLDEST peer" not in proc.stderr, (
         "regressed to the unconditional victim claim g-306-353 removed: "
         f"{proc.stderr!r}")
+
+    # : the SECOND false claim in this notice, and the same shape as
+    # the one above — an unobservable guarantee stated as fact. Naming the
+    # FLAGGED branch "recoverable" is only true where the carrier can PUSH, and
+    # on a non-reducer Body it cannot (claim-protected destination). The notice
+    # must state that dependency and hand the reader the tell, or a worker Body
+    # reads "carrier-backed" and treats an unrecoverable loss as safe.
+    assert "so it still reaches the reducer" not in proc.stderr, (
+        "regressed to asserting delivery the wrapper cannot observe; "
+        f"carrier-backing is a precondition, not a guarantee: {proc.stderr!r}")
+    assert "push FAILED" in proc.stderr, (
+        "the notice must name the stderr tell that distinguishes a live "
+        f"carrier from a dark one, or the dependency is unactionable: {proc.stderr!r}")
 
     # : the newcomer is protected, so it is the entry that SURVIVES
     # and an old peer is the one destroyed. Asserting this here keeps the

@@ -86,6 +86,10 @@ See coordination convention for full scan protocol.
 > this banner is a forward defense for the next author.
 
 ```
+# g-357-94: directives are the ONE board input that can steer GENERATION (B1/B2). Phase 2.07
+# acks them (on the all_blocked branch too); this read only feeds scope. veto = out of scope.
+active_directives = selection_context.active_directives or board-read.sh --channel coordination --type directive --since 24h --json
+active_directives = [d for d in active_directives if not past(d.tags expires:) and "directive_type:veto" not in d.tags]
 Bash: board-read.sh --channel coordination --type escalation --since 12h --json
 FOR EACH escalation_msg NOT from this agent:
     Extract goal_id from msg.tags
@@ -128,29 +132,12 @@ FOR EACH review_msg NOT from this agent:
         # R3 Hypothesis Formation:
         # Form a testable prediction about the change's downstream impact.
         # Example: "Change to X will cause Y in the next N executions"
-        # Apply calibration gate (same ceiling as spark Step 0.5):
-        #   a. Read recent accuracy — BOTH stages are REQUIRED:
-        #        Bash: pipeline-read.sh --stage resolved
-        #        Bash: pipeline-read.sh --stage archived
-        #      `--stage resolved` ALONE is a SURVIVORSHIP FILTER — it was 9.4% of
-        #      the store when measured 2026-08-04, and scoring only it moves the
-        #      cap a FULL BAND (62.4% -> cap 0.80 vs the union's 55.5% -> cap
-        #      0.65). Do NOT re-duplicate the rationale here: aspirations-spark
-        #      Step 0.5(a) is the single source of truth for this gate, and this
-        #      site drifted from it precisely because the two were maintained as
-        #      independent copies. Read it there; keep this block a pointer.
-        #      (g-115-4866.)
-        #      Count CONFIRMED vs CORRECTED over the UNION of both stages, for
-        #      code_review category (or overall if <3)
-        #      Compute recent_accuracy = confirmed / total
-        #      Log BOTH arms (resolved n / archived n), never just the total —
-        #      a silent regression to resolved-only logs identically otherwise
-        #      (guard-2529 / guard-2273 / guard-2129).
-        #   b. Apply confidence ceiling:
-        #      - If recent_accuracy < 0.40: cap at 0.55
-        #      - If recent_accuracy >= 0.40 and < 0.60: cap at 0.65
-        #      - If recent_accuracy >= 0.60 and < 0.80: cap at 0.80
-        #      - If recent_accuracy >= 0.80: no cap
+        # Apply the calibration gate EXACTLY as aspirations-spark Step 0.5(a) — the single
+        # source of truth (g-115-4866; this site drifted when it carried its own copy):
+        # count CONFIRMED vs CORRECTED over the UNION of pipeline-read.sh --stage resolved
+        # AND --stage archived (resolved alone is a survivorship filter), for code_review
+        # (or overall if <3); log BOTH arms (guard-2529/2273/2129); cap confidence by band
+        # (<0.40: 0.55; <0.60: 0.65; <0.80: 0.80; else no cap).
         # Add to pipeline. pipeline-add.sh reads a JSON record on STDIN — NOT
         # --title/--confidence flags (the flag form sends an empty body and the
         # wrapper STILL exits 0; see rb "pipeline-add.sh contract"). Required
@@ -201,6 +188,7 @@ FOR EACH blocker in known_blockers:
 constraint_context = {
     blocked_resources: list(blocked_resources),
     avoid_skills: list(blocked_skills),
+    directives: [{id: d.id, author: d.author, text: d.text, tags: d.tags} for d in active_directives],
     trigger: "all_blocked",
     blocked_count: selection_context.blocked_count,
     by_reason: selection_context.by_reason
@@ -235,6 +223,9 @@ IF current.b2_empty_at_completed == completed_now AND current.b2_empty_at_comple
 ELSE:
     Output: "▸ Attempting constraint-aware aspiration generation..."
     invoke /create-aspiration from-self --plan with: constraint_context
+    # constraint_context.directives is SCOPE — what the operator/peer put in or out of bounds
+    # for creation — not supply evidence: the gate's bar is unchanged. A candidate that follows
+    # one cites it: origin_signal user_directive:<msg-id> (peer_directive:<msg-id>).
     if new_aspirations_generated:
         blocked_idle_attempts.append("create-aspiration: SUCCESS")
         Output: "▸ Generated new aspirations avoiding blocked resources"

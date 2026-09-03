@@ -377,62 +377,33 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
            correction that opens "CORRECTION to my own Fresh-eyes N=57 post …"
            matches none of them and survives as a signal — the ritual then reads
            its own erratum as external change-pressure, one extra count per
-           corrected fire. This is the echo-N=19 finding measured verbatim ("one
-           sq-012 self-signal counted twice because its own 10-minute correction
-           is a separate post"), which was recorded there and never encoded in
-           the predicate. Measured 2026-08-16 (bravo N=58, `hostname` cc-05,
-           `uname -r` 6.8.0-137-generic) over all 97 self_evolution/self-drift
-           findings unread in 30d: survivors 19 → 17, dropping exactly two, BOTH
-           ritual corrections — `msg-20260816-165514-bravo-5085` (mine) and
-           `msg-20260729-170301-foxtrot-5015` (foxtrot's N=7 correction, 18 days
-           earlier), so this is fleet-wide and long-standing, not one agent's
-           quirk. Negative control, same run: a substantive non-ritual correction
-           ("CORRECTION: the env-server retry budget is 3, not 5") still
-           SURVIVES, which is what keeps this a receipt filter rather than a
-           correction filter — the `[^\n]{0,80}?` leash is what requires the
-           opening clause to NAME the ritual. Widening measured over the full
-           live population before adoption, never against the motivating example
-           (guard-2499).
-           The sentence directly above says "match the SUFFIXED forms too", which
-           invites building the suffix INTO the pattern; do not. Measured
-           2026-08-12 (echo, N=54, cc-03 / Linux 6.8.0-137-generic) on the same
-           corpus, same run, only the pattern differing: a regex requiring the
-           suffix (`fresh[- ]eyes[- ](review|code|tree|program)`) dropped **16 of
-           82**, where the anchored form dropped **70 of 82 (85.4%)** — survivors
-           66 vs 12, again in the false-`act_later` direction. The bare
-           `Fresh-eyes <n>-><n>` and `Fresh-eyes N=<k>` shapes named at the top of
-           this block carry no suffix at all, so a suffix-requiring pattern misses
-           the majority of the receipts the block exists to catch. Measured
-           2026-08-01 (alpha, N=21, cc-04, over every self_evolution/self-drift
-           finding in the 30d window): opening tokens split **287 lowercase vs 40
-           capital** — `fresh-eyes-code` ×267, `FRESH-EYES-CODE` ×40, `Fresh-eyes`
-           ×27, `FRESH-EYES` ×13, `fresh-eyes` ×12, `fresh-eyes-review` ×4,
-           `sq-012 tentative` ×4 (lowercase, against the `sq-012 TENTATIVE`
-           literal above), plus `Fresh-eyes-TREE`, `fresh-eyes-tree`,
-           `FRESH-EYES-PROGRAM`, `Fresh-eyes-program`. A reader who implements the
-           shape list LITERALLY — which is what a pseudocode literal invites —
-           catches ~12% of the receipts it was written to catch.
-           This was measured BY this defect firing: alpha's own N=14 receipt
-           (`fresh-eyes N=14 (alpha, cc-04): COMPLIES at 42.7%...`, lowercase f)
-           survived a literal (a-pre) implementation, reached (a0), matched its own
-           `alpha` tag, and landed in `board_signals` as a self-evolution signal —
-           the exact echo-N=19 convergence above, reproduced one day later by the
-           fix meant to prevent it. The case gap lands PRECISELY on own-authored
-           receipts, because (a-pre) is the only test that can reach them (see the
-           next paragraph), so a case miss here is never harmless.
-           Note the direction, which is why this cannot wait for a tidier fix:
-           every escaped receipt INFLATES `self_evolution_signals_count`, and
-           Phase 5.5 reads that count as change-pressure — so the failure always
-           pushes toward a false `act_later`, never toward a missed one.
+           corrected fire.
+           A substantive non-ritual correction still SURVIVES — the
+           `[^\n]{0,80}?` leash requires the opening clause to NAME the ritual,
+           which is what keeps this a receipt filter and not a correction filter.
+           **The sentence above says "match the SUFFIXED forms too"; that invites
+           building the suffix INTO the pattern — do NOT.** The bare
+           `Fresh-eyes <n>-><n>` / `Fresh-eyes N=<k>` shapes carry no suffix at
+           all, so a suffix-requiring regex misses MOST of what this block exists
+           to catch, and the fleet writes the opening token in at least four
+           casings — implementing the shape list LITERALLY catches ~12% of them.
+           **Direction, which is why no variant of this is harmless:** every
+           escaped receipt INFLATES `self_evolution_signals_count`, which Phase
+           5.5 reads as change-pressure, so the failure always pushes toward a
+           false `act_later` and never toward a missed one.
            **Why this shape test sits ABOVE (a0):** (a0) short-circuits on the
-           agent tag, and the tag on a receipt is the AUTHOR'S OWN name — so for
-           exactly the agent that posted them, the test that would catch them was
-           unreachable, and the ritual reads its own output as input, converging
-           on a permanent act_later. Measured echo N=19: filter kept 4, all 4
-           echo's own ritual output; honest partner-authored count 0. Line 91's
-           intent is preserved — a genuine own-authored FOLLOWUP still counts.
-           Owned by `g-115-4087`. Rationale:
+           agent tag, and a receipt's tag is the AUTHOR'S OWN name — so for
+           exactly the agent that posted them this is the ONLY test that can
+           reach them, and the ritual reads its own output as input, converging
+           on a permanent act_later. A case miss here is therefore never
+           harmless. A genuine own-authored FOLLOWUP still counts.
+           Owned by `g-115-4087`. **FOUR dated measurements back every claim in
+           this block — the casing census, the suffix-vs-anchored comparison, the
+           correction-receipt widening with its negative control, and the
+           reproduction-by-the-fix — relocated VERBATIM (nothing deleted) to
            core/config/rationale/fresh-eyes-board-signal-attribution.md
+           § "Measured evidence for the (a-pre) receipt filter". Read them before
+           weakening, re-deriving, or "simplifying" any part of the predicate.**
       (a0) tags carry ANY agent name → that tag DECIDES. MIND_AGENT among them
            → directed. Another agent's name and not MIND_AGENT → it is THAT
            agent's own signal → EXCLUDE, and do not consult the text at all.
@@ -559,8 +530,25 @@ FROM the agent_status read in 2.6:
       IF b.about == MIND_AGENT:
         staleness_days = (today - date(b.last_observed)).days
         weight = b.confidence * (1.0 if staleness_days <= 14 else 0.5)   # fresh + confident = stronger
+        # ANSWERED test (guard-5863) — the input Phase 5.5's CONFIRMING
+        # disjunction needs, and the ONLY one of the three sibling surfaces that
+        # was missing its consumption filter. 2.3 drops terminal-status
+        # pending-questions; 2.3b passes --unread-only; 2.6b filtered on
+        # staleness ALONE. Each agent writes at most ONE belief per partner and
+        # supersedes it only when THAT partner next runs its own fresh-eyes, so
+        # an ALREADY-ANSWERED belief sits fresh-by-clock and discharged for a
+        # full partner cadence, re-counting every fire in between — one-signed
+        # toward a false act_later, same direction as the 2.3b receipt leak.
+        # The test is a DURABLE ANSWERING RECORD dated after b.last_observed —
+        # never the reviewer's own judgment (N=125 meta-rule (f): probing a
+        # signal does not retire it). Search ALL channels, not two (g-115-4405).
+        #   Bash: bash core/scripts/board-read.sh --channel <ch> --since 60d --json
+        #         for each channel, OR py -3 core/scripts/board-citation-check.py
+        answered_by = <board msg id authored by MIND_AGENT, addressed to
+                       b's holder, timestamp > b.last_observed> or null
         belief_signals.append({holder: <partner>, claim: b.belief,
-                               confidence: b.confidence, staleness_days, weight})
+                               confidence: b.confidence, staleness_days, weight,
+                               answered_by})
   → **READ EACH BELIEF TO FULL LENGTH BEFORE CLASSIFYING IT.** A partner belief
     states the OBSERVATION first and its QUALIFYING INTERPRETATION last, so a
     fixed-width display slice reliably shows a drift claim and cuts the clause
@@ -719,7 +707,7 @@ SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree the portfolio has drifted from Self emphasis since last review},
   "completion_health":              {0..1 — mean completion ratio across active aspirations, EXCLUDING single-goal `asp-xw-` cross-world imports (guard-2829, guard-2804). Each such import is one goal wearing an aspiration's clothes: a hard 0.0 weighted like an 897-goal aspiration, so it dilutes portfolio health rather than measuring it. Measured swing 0.5025 raw -> 0.7537 filtered; two consecutive passes still shipped the RAW figure. Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
   "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214) + len(belief_signals from Phase 2.6b, g-306-28). A partner's belief ABOUT this agent is an external self-evolution signal even when pending-questions.yaml AND the findings board are both empty},
-  "confirming_signal_fraction":     {0..1 — = confirming_beliefs / self_evolution_signals_count. A belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND suggesting drift/contradiction. pq_signals + board_signals are genuine change-indicators, NEVER confirming. Emit 0.0 only when self_evolution_signals_count == 0. An affirming partner-belief is STABILITY evidence, not change-pressure — counting it toward act_later was a measured false-positive treadmill (g-115-1742). Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
+  "confirming_signal_fraction":     {0..1 — = confirming_beliefs / self_evolution_signals_count. A belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14) OR **ANSWERED** (`answered_by` is non-null — a durable answering record dated after `last_observed`; guard-5863, and the disjunct whose ABSENCE here left the rule stated only in a guardrail for three fires while this instrument kept counting the belief, guard-1984) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND UNANSWERED AND suggesting drift/contradiction. pq_signals + board_signals are genuine change-indicators, NEVER confirming. Emit 0.0 only when self_evolution_signals_count == 0. An affirming partner-belief is STABILITY evidence, not change-pressure — counting it toward act_later was a measured false-positive treadmill (g-115-1742). Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
   "self_last_updated_days":         {int — days_since_self_updated from Phase 2.1},
   "explicit_user_directive":        {true|false — outstanding /respond about purpose or portfolio},
   "signal_actionable_score":        {0..1 — how clearly the signals map to a specific Self edit}

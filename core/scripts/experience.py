@@ -288,8 +288,13 @@ def validate_record(rec):
 # TWIN — DO NOT EDIT THIS PATTERN ALONE (guard-130). It is mirrored at
 # mind_api/src/endpoints/experience_write.py::GOAL_ID_IN_EXP_ID_RE and the two
 # MUST stay literally identical. That copy is the one that RUNS: experience-add.sh
-# is daemon-only (no Python CLI fallback since 2026-05-14), so every real write
-# derives through the daemon's copy and this one fires only on core-side touches.
+# is daemon-only (no Python CLI fallback since 2026-05-14), so every real WRITE
+# derives through the daemon's copy.
+# NO LONGER core-side-touches-only (, 2026-09-03): experience-add.sh's
+# worker scoping gate imports derive_goal_id_from_id from THIS file to decide
+# whether a worker Body's record names a goal, and that gate runs BEFORE the
+# daemon call on every worker write. So a divergence between the twins is now
+# observable as a REFUSED write, not merely as a stale core-side helper.
 # Widening only this file is therefore a silent no-op at write time — which is
 # exactly what happened to the  `xw-` widening, lost for months until
 #  found the two had diverged under a comment claiming they were

@@ -59,6 +59,74 @@ the PARTNER side — the self side had no shape test at all. Line 91's intent is
 preserved: a genuine own-authored FOLLOWUP finding does not match these shapes and
 still counts.
 
+## Measured evidence for the (a-pre) receipt filter
+
+Relocated VERBATIM from `.claude/skills/fresh-eyes-review/SKILL.md` Phase 2.3b on
+2026-09-03 (bravo, cc-05, g-357-41 iteration). The skill was 66,208 B against a
+65,536 B injection ceiling — over the ceiling a skill reaches the model TRUNCATED,
+so its later content is silently absent, and the `commit-msg` hot-path size gate
+refuses any commit that grows it further. The four measurements below are what the
+predicate is DERIVED from; the skill keeps the imperatives and the copyable regex.
+Nothing was deleted — read this section before weakening, re-deriving, or
+"simplifying" any part of the (a-pre) predicate.
+
+corrected fire. This is the echo-N=19 finding measured verbatim ("one
+sq-012 self-signal counted twice because its own 10-minute correction
+is a separate post"), which was recorded there and never encoded in
+the predicate. Measured 2026-08-16 (bravo N=58, `hostname` cc-05,
+`uname -r` 6.8.0-137-generic) over all 97 self_evolution/self-drift
+findings unread in 30d: survivors 19 → 17, dropping exactly two, BOTH
+ritual corrections — `msg-20260816-165514-bravo-5085` (mine) and
+`msg-20260729-170301-foxtrot-5015` (foxtrot's N=7 correction, 18 days
+earlier), so this is fleet-wide and long-standing, not one agent's
+quirk. Negative control, same run: a substantive non-ritual correction
+("CORRECTION: the env-server retry budget is 3, not 5") still
+SURVIVES, which is what keeps this a receipt filter rather than a
+correction filter — the `[^\n]{0,80}?` leash is what requires the
+opening clause to NAME the ritual. Widening measured over the full
+live population before adoption, never against the motivating example
+(guard-2499).
+The sentence directly above says "match the SUFFIXED forms too", which
+invites building the suffix INTO the pattern; do not. Measured
+2026-08-12 (echo, N=54, cc-03 / Linux 6.8.0-137-generic) on the same
+corpus, same run, only the pattern differing: a regex requiring the
+suffix (`fresh[- ]eyes[- ](review|code|tree|program)`) dropped **16 of
+82**, where the anchored form dropped **70 of 82 (85.4%)** — survivors
+66 vs 12, again in the false-`act_later` direction. The bare
+`Fresh-eyes <n>-><n>` and `Fresh-eyes N=<k>` shapes named at the top of
+this block carry no suffix at all, so a suffix-requiring pattern misses
+the majority of the receipts the block exists to catch. Measured
+2026-08-01 (alpha, N=21, cc-04, over every self_evolution/self-drift
+finding in the 30d window): opening tokens split **287 lowercase vs 40
+capital** — `fresh-eyes-code` ×267, `FRESH-EYES-CODE` ×40, `Fresh-eyes`
+×27, `FRESH-EYES` ×13, `fresh-eyes` ×12, `fresh-eyes-review` ×4,
+`sq-012 tentative` ×4 (lowercase, against the `sq-012 TENTATIVE`
+literal above), plus `Fresh-eyes-TREE`, `fresh-eyes-tree`,
+`FRESH-EYES-PROGRAM`, `Fresh-eyes-program`. A reader who implements the
+shape list LITERALLY — which is what a pseudocode literal invites —
+catches ~12% of the receipts it was written to catch.
+This was measured BY this defect firing: alpha's own N=14 receipt
+(`fresh-eyes N=14 (alpha, cc-04): COMPLIES at 42.7%...`, lowercase f)
+survived a literal (a-pre) implementation, reached (a0), matched its own
+`alpha` tag, and landed in `board_signals` as a self-evolution signal —
+the exact echo-N=19 convergence above, reproduced one day later by the
+fix meant to prevent it. The case gap lands PRECISELY on own-authored
+receipts, because (a-pre) is the only test that can reach them (see the
+next paragraph), so a case miss here is never harmless.
+Note the direction, which is why this cannot wait for a tidier fix:
+every escaped receipt INFLATES `self_evolution_signals_count`, and
+Phase 5.5 reads that count as change-pressure — so the failure always
+pushes toward a false `act_later`, never toward a missed one.
+**Why this shape test sits ABOVE (a0):** (a0) short-circuits on the
+agent tag, and the tag on a receipt is the AUTHOR'S OWN name — so for
+exactly the agent that posted them, the test that would catch them was
+unreachable, and the ritual reads its own output as input, converging
+on a permanent act_later. Measured echo N=19: filter kept 4, all 4
+echo's own ritual output; honest partner-authored count 0. Line 91's
+intent is preserved — a genuine own-authored FOLLOWUP still counts.
+Owned by `g-115-4087`. Rationale:
+core/config/rationale/fresh-eyes-board-signal-attribution.md
+
 ## Cross-references
 
 - guard-1877 — tags decide before prose; the order is load-bearing

@@ -71,7 +71,26 @@ from _paths import (  # noqa: E402
 
 # The phases a WORKER Body runs -- the simplified per-Body path (design: "a
 # simplified per-Body select->claim->execute that SKIPS verify/encode/reflect").
-WORKER_PHASES = ("select", "claim", "execute")
+#
+# `verify-own-unit` (, owner directive 2026-09-03) is the FOURTH phase
+# and the only one that is not select/claim/execute. It is the LLM verification
+# of THE UNIT THIS BODY JUST EXECUTED -- its hypothesis outcome, its Q1/Q2/Q3
+# escalation, and the unblocking of goals whose `blocked_by` named it. It is NOT
+# the reducer's `verify` phase, which stays in REDUCER_ONLY_PHASES below as the
+# RESIDUE (the reducer's own units, plus the sampled completion review that
+# checks this self-grading).
+#
+# WHY THIS ONE MOVED AND THE OTHERS DID NOT -- the convergence invariant is
+# untouched. "One Mind, one encoder" is about SHARED KNOWLEDGE: tree nodes, the
+# reasoning bank, guardrails, reflection. Verification writes GOAL STATE
+# (status, escalations, blocked_by clears), which is per-goal and already
+# per-Body-owned -- worker-loop Phase 4a has recorded the caller-declared status
+# through the shared close writer since 2026-08-16 (). So this is the
+# largest per-goal reducer cost carrying the least convergence risk: the reducer
+# was re-deriving the judgment from notes it did not write, for 50+ worker
+# closures a day. Encoding, reflection, state-update, evolution and the learning
+# gate all REMAIN reducer-only and must not follow this one out.
+WORKER_PHASES = ("select", "claim", "execute", "verify-own-unit")
 
 # The phases a worker SKIPS -- reducer-only (encode / reflect / consolidate). The
 # single reducer applies these to the MERGED state of ALL Bodies at
@@ -92,7 +111,23 @@ REDUCER_ONLY_PHASES = frozenset({
     # body-merge.py only names ids. Capturing the caller-declared outcome is
     # part of executing; running the LLM verify phase is the phase. Do not read
     # Phase 4a as a violation of this entry.
-    "verify",             # Phase 5   -- outcome verification (LLM phase)
+    #
+    # SPLIT 2026-09-03 (): the per-unit half of this phase moved to the
+    # worker as `verify-own-unit` (see WORKER_PHASES). What REMAINS here is the
+    # RESIDUE, and it is genuinely reducer-only:
+    #   - verification of units the REDUCER itself executed;
+    #   - the SAMPLED completion review over worker-verified closures, which is
+    #     the check on self-grading -- a Body cannot be the sole grader of its
+    #     own work, so the sampling stays with the other Body by construction;
+    #   - any cross-unit judgment that needs MERGED state (streak tracking
+    #     across Bodies), which by definition only exists after generalize-down.
+    # A worker asking `should-run-phase verify` still gets False, and that is
+    # correct: it runs `verify-own-unit`, a different phase with a narrower
+    # scope. Do not "simplify" by making a worker run `verify` -- the scope
+    # difference IS the safety property (guard-4638: a worker closing a goal
+    # does not mean its code landed on main, so verify-own-unit must never
+    # claim landing).
+    "verify",             # Phase 5   -- outcome verification (LLM phase, reducer residue)
     # A worker does NOT run the spark PHASE -- it creates no rb/guardrail/tree
     # artifact (that would make it an Nth reducer). It DOES record raw spark
     # observations into the `spark_capture` WM slot during execute
@@ -252,6 +287,7 @@ CANONICAL_LIFECYCLE_STAGES = (
     "claim",
     "execute",
     "spark-capture",
+    "verify-own-unit",
     "heartbeat-liveness",
     "compact-checkpoint",
     "compact-restore",
@@ -351,9 +387,50 @@ LIFECYCLE_DISPOSITIONS = {
             "requires merged state that only the reducer holds. It reuses the existing Phase "
             "6.5 handlers rather than a worker-side encoder -- the capture/replay split is "
             "the no-transcription rule applied to learning."),
+    "verify-own-unit": LifecycleDisposition(
+        kind=SCOPED_CALL,
+        # DECLARED, NOT YET WIRED -- and this field is the only honest way to say
+        # so. The phase and its disposition exist and are machine-checkable
+        # (`should-run-phase verify-own-unit` exits 0), but worker-loop Phase 4a
+        # does NOT yet invoke the verify skill.
+        #
+        # THE PREREQUISITE IS NOW MET (2026-09-03,  part1a): the scope
+        # mode this row names EXISTS -- /aspirations-verify takes a `scope` input
+        # of "full" (default) or "own-unit", documented in its Inputs section.
+        # Until part1a it did not, and a worker told to invoke an UNSCOPED verify
+        # would have run the reducer-side cross-Body parts (streak tracking) --
+        # the Nth-reducer defect. What remains is only the worker-loop Phase 4a
+        # invocation, which is kept a SEPARATE increment because it changes the
+        # live loop under every worker Body in the fleet at once.
+        #
+        # `pending_goal` therefore STAYS until that invocation lands: this row
+        # states the contract without asserting the code honours it (see the
+        # LifecycleDisposition docstring: "an aspirational row written as a fact
+        # is worse than no row"). test_worker_lifecycle_contract.py pins the
+        # marker by name and goal id and is written to FAIL when the wiring
+        # lands, so whoever wires it removes both in the same change.
+        pending_goal="g-306-417",
+        target="aspirations-verify",
+        mode="own-unit only: the hypothesis outcome, Q1/Q2/Q3 escalation and "
+             "blocked_by-clears for the ONE goal this Body just executed "
+             "(worker-loop Phase 4a, before the mechanical close). Cross-Body "
+             "streaks and the sampled review of these closures stay reducer-side.",
+        why="A worker verifies the ONE unit it executed and nothing else: that unit's "
+            "hypothesis outcome, its Q1/Q2/Q3 escalation, and the unblocking of goals "
+            "whose blocked_by named it. SCOPED_CALL and not WORKER_ONLY is the whole "
+            "design -- per guard-1867 the worker INVOKES the existing verify skill "
+            "rather than transcribing its steps into worker-loop, so there is one "
+            "implementation and it cannot drift. The reducer keeps the residue "
+            "(its own units, cross-Body streaks, and the SAMPLED review of these "
+            "self-graded closures) under reducer-iteration below. Two rails bound "
+            "what this may assert: guard-4638 -- closing is not landing, so it must "
+            "never claim the code reached main; and guard-3034 -- an outside-world "
+            "reading (PR mergeable, CI green, a live endpoint) is a TIMESTAMPED "
+            "observation, not a settled fact, so it is recorded with its instant "
+            "and the reducer re-reads it rather than trusting it."),
     "reducer-iteration": LifecycleDisposition(
         kind=REDUCER_ONLY_BY_DESIGN,
-        target="verify / complete-review / state-update / evolution / learning-gate",
+        target="verify (residue) / complete-review / state-update / evolution / learning-gate",
         why="The per-iteration encode+reflect block. Applied ONCE to the MERGED state of all "
             "Bodies at generalize-down, not per-Body. This stage is the lifecycle twin of "
             "REDUCER_ONLY_PHASES minus spark and productivity-check, which have their own "
@@ -377,6 +454,7 @@ PHASE_LIFECYCLE_STAGE = {
     "select": "select",
     "claim": "claim",
     "execute": "execute",
+    "verify-own-unit": "verify-own-unit",
     "spark": "spark-capture",
     "verify": "reducer-iteration",
     "complete-review": "reducer-iteration",
@@ -605,6 +683,126 @@ def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:
         True, norm, stage, disp.kind,
         f"{norm} IS lifecycle stage {stage!r}, declared {disp.kind} -- "
         f"worker-eligible")
+
+
+
+# ── GOAL-LEVEL ROLE DECLARATION () ──────────────────────────────────
+#
+# `skill_eligibility` above is SKILL-keyed, and 1,411 of 1,447 live candidates
+# carry no skill at all (97.5%, measured cc-09 2026-09-03; 919/938 = 98.0% when
+# the defect was relayed from cc-07 2026-08-23). So for ~98% of the queue that
+# bridge structurally CANNOT answer the question a worker actually has -- is
+# THIS GOAL reducer-only? -- and says so honestly rather than reporting a pass.
+# This field closes that gap from the GOAL side.
+#
+# THREE DESIGN CONSTRAINTS, each measured before this was written. Do not
+# "simplify" past any of them:
+#
+# 1. ROLE-VALUED, NOT BOOLEAN. The class is BIDIRECTIONAL: of the 3 genuinely
+#    role-unsatisfiable defers measured fleet-wide (zeta, cc-02, 2026-08-24,
+#    over 2860 goals / 2219 non-terminal / 154 deferred), TWO need a WORKER
+#    ( needs a Body reading its own box-local WM;  needs a
+#    worker on a named box) and only ONE needs the reducer. A boolean
+#    `reducer_only` cannot express the majority direction, and once the bridge
+#    reads a boolean, widening it becomes a migration instead of one extra word.
+#
+# 2. NO DISPATCH SEMANTICS. This is why the field is new rather than a reuse of
+#    `skill`. `skill` IS the executor's dispatch key
+#    (aspirations-execute: `result = invoke goal.skill with goal.args`), so
+#    stamping a skill on a skill-less goal to win this fence changes WHAT THE
+#    GOAL RUNS -- on  it would run the entire spark phase every 2.67h to
+#    buy a refusal (guard-4618 / guard-4978 / rb-9926, and the warning already
+#    sits on SKILL_LIFECYCLE_STAGE above). This field is read HERE and nowhere
+#    that dispatches.
+#
+# 3. `intended_agent` CANNOT SUBSTITUTE. Its values are agent NAMES
+#    (alpha/bravo/either/null), not roles, and goal-schemas.md calls it advisory
+#    -- "the goal-selector may use it to bias scoring WITHOUT RESTRICTING
+#    ACCESS". A biasing hint cannot fence anything.
+#
+# THE SELECTOR STAYS ROLE-BLIND. Nothing here is called from goal-selector:
+# LIFECYCLE_DISPOSITIONS["select"] and guard-2783 both forbid role-conditional
+# logic in a component BOTH roles run, so the scorer remains byte-identical for
+# a worker and a reducer. This is a CLAIM-time fence, not a scoring one -- which
+# is also why the drain lane can still promote a reducer-only goal to top pick
+# (measured three times on ): the lane moves ORDER, this moves the
+# claim decision, and the worker is expected to consult this and skip.
+#
+# KNOWN LIMIT, stated rather than papered over: an UNSET field is
+# indistinguishable from "not reducer-only", so this improves the FUTURE corpus
+# and leaves the existing one exactly as it was. That is an argument for a
+# back-fill plan, not for skipping the field (and it is why the unset branch
+# below preserves the old behaviour byte-for-byte instead of tightening).
+
+EXECUTABLE_BY_ROLE_VALUES = ("worker", "reducer", "any")
+
+
+def goal_eligibility(skill: "str | None",
+                     executable_by_role: "str | None" = None
+                     ) -> _SkillEligibilityFields:
+    """Whether a WORKER Body may claim a goal, GOAL-level declaration first.
+
+    Reads `executable_by_role` when it carries a recognised value and falls back
+    to the skill-keyed bridge otherwise. Never raises on a bad value: an
+    unrecognised role degrades to the skill bridge and NAMES itself in the
+    reason, because a typo must not silently fence a goal in either direction.
+    """
+    role = (executable_by_role or "").strip().lower() or None
+
+    if role == "reducer":
+        return _SkillEligibilityFields(
+            False, normalize_skill(skill), None, REDUCER_ONLY_BY_DESIGN,
+            "goal declares executable_by_role='reducer' -- a WORKER must not "
+            "claim it. This is a GOAL-level declaration, decisive and "
+            "independent of the skill field. Leave it for the reducer and take "
+            "the next candidate. (g-115-7372)")
+
+    verdict = skill_eligibility(skill)
+
+    if role == "worker":
+        # A GOAL-level 'worker' declaration must NOT unlock a skill the skill
+        # fence refuses. That combination is a CONTRADICTION, not an override:
+        # the skill fence is structural (running /reflect on a worker encodes
+        # from unmerged state -- the Nth-reducer defect the convergence forbids)
+        # while this field is filer-supplied metadata, and metadata must never
+        # relax a structural ownership predicate (guard-2860's direction). It
+        # should not arise legitimately either -- the measured worker-needing
+        # cases (box-local WM, a named box) are all skill-LESS -- so when it
+        # does arise it is a mis-filing, and the useful behaviour is to refuse
+        # AND say both halves out loud so the record gets corrected.
+        if not verdict.eligible:
+            return verdict._replace(reason=(
+                "CONTRADICTION: the goal declares executable_by_role='worker' "
+                "but its skill is refused by the skill fence, so the "
+                "declaration is IGNORED and the goal is treated as "
+                "reducer-only. Metadata does not relax a structural fence. "
+                "Fix the goal record rather than the fence. Skill verdict: "
+                + verdict.reason))
+        return _SkillEligibilityFields(
+            True, normalize_skill(skill), verdict.stage, verdict.disposition,
+            "goal declares executable_by_role='worker' -- worker-eligible, and "
+            "positively so: this value also ROUTES a goal that only a Body with "
+            "box-local state can satisfy, which is the majority direction of "
+            "the measured role-unsatisfiable class. (g-115-7372)")
+
+    if role == "any":
+        return verdict._replace(
+            reason="goal declares executable_by_role='any' (explicitly not "
+                   "role-fenced), so the SKILL bridge decides: " + verdict.reason)
+
+    if role is not None:
+        return verdict._replace(
+            reason=(f"goal carries an UNRECOGNISED executable_by_role="
+                    f"{executable_by_role!r} (expected one of "
+                    f"{'/'.join(EXECUTABLE_BY_ROLE_VALUES)}) -- IGNORED, and "
+                    f"this is NOT a cleared check. Falling back to the SKILL "
+                    f"bridge: ") + verdict.reason)
+
+    return verdict._replace(
+        reason="goal carries no executable_by_role declaration (the common "
+               "case -- the field is new, so the existing corpus is unset and "
+               "unset is NOT evidence of anything). Falling back to the SKILL "
+               "bridge: " + verdict.reason)
 
 
 # --------------------------- carrier contract () ---------------------------
@@ -1168,6 +1366,21 @@ def _main(argv=None) -> int:
     p_skill.add_argument("skill", nargs=argparse.REMAINDER, default=[],
                          help="the goal's skill field, args and all "
                               "(e.g. /replay --sharp-wave); empty means no skill")
+    p_goal = sub.add_parser("goal-eligible",
+                            help="exit 0 (+'eligible') if a WORKER Body may claim a "
+                                 "goal, reading the GOAL-level executable_by_role "
+                                 "declaration first and falling back to the "
+                                 "skill-keyed bridge (g-115-7372). Answers for the "
+                                 "~98%% of candidates that carry no skill.")
+    p_goal.add_argument("--role", default=None,
+                        help="the goal's executable_by_role field verbatim "
+                             "(worker|reducer|any); omit when unset")
+    # REMAINDER for the same guard-920 reason as skill-eligible above: the
+    # production arg shape is the skill field verbatim, args and all. --role
+    # must precede it, because REMAINDER swallows everything from the first
+    # positional onward.
+    p_goal.add_argument("skill", nargs=argparse.REMAINDER, default=[],
+                        help="the goal's skill field, args and all; empty means no skill")
     sub.add_parser("reducer-only-skills",
                    help="print every skill a worker must not claim, with the "
                         "lifecycle stage each one IS")
@@ -1299,6 +1512,11 @@ def _main(argv=None) -> int:
         # The reason goes to stderr so `$(... skill-eligible ...)` captures the
         # one-word verdict cleanly while a human (or a loop transcript) still
         # sees WHY. A silent skip is the half of this fix that would rot.
+        print(verdict.reason, file=sys.stderr)
+        return 0 if verdict.eligible else 1
+    if args.cmd == "goal-eligible":
+        verdict = goal_eligibility(" ".join(args.skill), args.role)
+        print("eligible" if verdict.eligible else "reducer-only")
         print(verdict.reason, file=sys.stderr)
         return 0 if verdict.eligible else 1
     if args.cmd == "reducer-only-skills":

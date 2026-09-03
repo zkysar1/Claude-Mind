@@ -65,6 +65,16 @@ IF parsed_output is a JSON object with "all_blocked": true:
     Output: "▸ ALL GOALS BLOCKED: {blocked_count} goals — {by_reason summary}"
     FOR EACH goal in blocked_goals: Output: "  {goal_id}: {detail}"
     # parsed_output contains blocked_goals, blocked_count, by_reason — orchestrator needs these
+    # g-357-94: an idle agent must still HEAR directives. Phase 2.07 sits BELOW this return,
+    # so while all-blocked no directive was acked, marked or passed on for as long as the
+    # agent stayed idle (measured 2026-09-03: a user scope directive unheard for 4h). ACK
+    # here exactly as 2.07 (dedup read + moot short-circuit); the honor set is empty with
+    # zero candidates. Hand the ACTIVE set to the all-blocked handler, which reads it as
+    # generation SCOPE (B0/B1/B2) — a directive never creates work by itself (guard-732).
+    Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
+    FOR EACH directive in new_directives: ack per Phase 2.07 (skip moot targets; else
+        echo "Acknowledged directive {directive.id}" | board-post.sh --channel coordination --type status --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}")
+    Bash: parsed_output.active_directives = board-read.sh --channel coordination --type directive --since 24h --json
     RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)
 
 ranked_goals = parsed_output  # JSON array of scored candidates
@@ -97,13 +107,11 @@ ranked_goals = parsed_output  # JSON array of scored candidates
 # COMPLETELY (g-306-276). `in_flight` is REDUCER-OWNED: team-state-in-flight.sh
 # stamps it only when this box's running-session-id exists AND equals MIND_SID,
 # and SKIPs for every other Body — writing `in_flight_bodies.<sid>` instead.
-# So a partner running as a WORKER Body is invisible in `in_flight`. Measured
-# 2026-08-10 (alpha, cc-07): `in_flight` was null for ALL four live agents
-# fleet-wide while alpha/bravo/foxtrot each held live claims in body rows, and
-# the only non-null `in_flight` anywhere was a test fixture. This is the same
-# defect g-306-160 already repaired in goal-pickup-coordination-check.py — that
-# fix's own comment records the gate "silently opened"; this is the second of
-# the three readers, and the digest Phase 4 hard gate is the third.
+# So a partner running as a WORKER Body is invisible in `in_flight` (measured
+# 2026-08-10, alpha cc-07: null for ALL four live agents while three held live
+# body-row claims). Same defect g-306-160 repaired in
+# goal-pickup-coordination-check.py ("silently opened"); this is the second of
+# three readers, the digest Phase 4 hard gate the third.
 #
 # Staleness is the REAPER's job, not this filter's: body_row_reaper (via
 # stranded-claim-sweep) deletes rows whose carrier is stale for
@@ -137,25 +145,14 @@ Directives influence scoring (handled mechanically by `goal-selector.py` `direct
 criterion). The LLM handles acknowledgment and insight trigger processing.
 
 ```
-# Directive acknowledgment + HONOR (g-115-2797 / guard-1310 — directive-target lane-skip gap)
-# TWO reads with DIFFERENT scopes (g-115-2990 / discovered_by g-115-2768 — the old SINGLE
-# read re-acked every directive in the 24h window EVERY iteration, 5×-spam): the ACK path must
-# DEDUP (ack a directive at most once per agent), while the HONOR path needs ALL active
-# directives (acked or not) so a still-targeted goal keeps getting honored.
-#
-# HONOR read — full scan, ALL active directives (NO --unread-only, NO --mark-read; the ACK
-# read below owns marking): feeds the directive_targeted_goals honor set. A directive I acked
-# yesterday whose target is in TODAY's ranked_goals must still be honored, so this read must
-# NOT filter by seen-state.
+# Directive acknowledgment + HONOR (g-115-2797 / guard-1310). TWO reads with DIFFERENT scopes
+# (g-115-2990): the ACK read must DEDUP — --unread-only returns only directives THIS agent has
+# not seen and --mark-read records the receipt so the next iteration filters them out (the old
+# single read had --mark-read without --unread-only: receipts written, never consumed, every
+# directive re-acked every iteration, 5x-spam) — while the HONOR read needs ALL active
+# directives (no --unread-only, no --mark-read) so a directive acked yesterday whose target is
+# in TODAY's ranked_goals is still honored.
 Bash: all_directives = board-read.sh --channel coordination --type directive --since 24h --json
-# ACK read — DEDUP scan: --unread-only returns ONLY directives THIS agent has not yet seen
-# (the per-agent read-receipt seen-set is the dedup key); --mark-read records the receipt so
-# the NEXT iteration's --unread-only filters them out. This is the g-115-2990 fix: the old
-# single read used --mark-read WITHOUT --unread-only, so receipts were WRITTEN but never
-# CONSUMED, and the loop condition "no acknowledgment reply from this agent exists" was
-# UNVERIFIABLE from a directive-only read (the type=status ack replies were never loaded) — so
-# the LLM re-acked every directive every iteration. --mark-read ALSO preserves the g-2797
-# delivery-observability receipt (a directive is marked the first iteration it is unseen).
 Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
 directive_targeted_goals = {}   # goal_id -> directive_id, ONLY for directives directed at THIS agent
 FOR EACH directive in new_directives:   # ONLY unseen directives — dedup by construction

@@ -32,6 +32,7 @@ from _daemon_fixture import DaemonFixture  # noqa: E402
 def _make_world(tmp: Path, *, interval_hours: float = 4.0,
                 consecutive_deep: int = 0,
                 original_interval_hours: float | None = None,
+                calibration_exempt: bool | None = None,
                 extra_goals: list | None = None) -> Path:
     world = tmp / "world"
     world.mkdir()
@@ -53,6 +54,8 @@ def _make_world(tmp: Path, *, interval_hours: float = 4.0,
     }
     if original_interval_hours is not None:
         goal["original_interval_hours"] = original_interval_hours
+    if calibration_exempt is not None:
+        goal["calibration_exempt"] = calibration_exempt
     goals = [goal]
     if extra_goals:
         goals.extend(extra_goals)
@@ -201,3 +204,58 @@ def test_dry_run_no_writes():
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---- calibration_exempt () ---------------------------------------
+#
+# These two are a PAIR and must be read together. They feed the detector
+# byte-identical worlds except for one flag, and assert OPPOSITE outcomes --
+# guard-3292: a flag that selects between two paths differing in SEMANTICS is
+# only verified by an input on which those paths MUST disagree. Asserting the
+# exempt case alone would still pass if the flag were ignored and some other
+# condition happened to block the contraction.
+
+
+def test_calibration_exempt_blocks_contraction():
+    """Same world as test_above_floor_contracts_and_records_original, plus the
+    flag: the goal must NOT be contracted.
+
+    calibration_exempt already opted a goal out of auto-EXTENSION
+    (_propose_new_interval, g-115-2049). It was not read on the contract path,
+    so an exempt goal could still be auto-SHORTENED one divisor step at a time
+    down to floor_ratio x original -- a half-wired opt-out that reads as a full
+    exemption at the call site. Measured on g-369-14 (12.0h already walked to
+    8.0h, next step 5.33h).
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), interval_hours=4.0,
+                            consecutive_deep=3, calibration_exempt=True)
+        rc, out, err = _run_contract(world, "g-100-01")
+        assert rc == 0, err
+        assert "EXEMPT" in out, out
+        # The contraction line (detector line ~1296) is the only place the goal
+        # id follows "auto-contracted" with a colon. Match THAT, not the bare
+        # word -- the exempt message itself says "not auto-contracted", so a
+        # substring check on the word alone fails against a correct run.
+        assert "auto-contracted g-100-01:" not in out, out
+        g, _ = _read_goal(world, "g-100-01")
+        # Untouched: interval held AND the streak counter is not consumed, so a
+        # later un-exempting does not start from a silently-reset counter.
+        assert g["interval_hours"] == 4.0, g["interval_hours"]
+        assert g["consecutive_deep"] == 3, g["consecutive_deep"]
+
+
+def test_without_the_flag_the_same_world_still_contracts():
+    """The positive control for the test above: identical inputs, flag absent,
+    contraction MUST fire. If this ever goes green-by-accident (the world stops
+    being contractable for an unrelated reason), the exempt test above proves
+    nothing and this one says so."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), interval_hours=4.0,
+                            consecutive_deep=3)
+        rc, out, err = _run_contract(world, "g-100-01")
+        assert rc == 0, err
+        assert "auto-contracted g-100-01:" in out, out
+        assert "EXEMPT" not in out, out
+        g, _ = _read_goal(world, "g-100-01")
+        assert g["interval_hours"] == 2.67, g["interval_hours"]
