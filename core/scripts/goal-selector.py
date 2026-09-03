@@ -850,6 +850,14 @@ def load_recurring_config():
         # K knob would read as its default forever with no parse error.
         "drain_lane_enabled": True,
         "drain_lane_interval_iterations": 5,
+        #  cadence-stranded reallocation. Listed here for the SAME
+        # allowlist reason as the keys above. UNIT IS overdue_ratio, NOT an
+        # elapsed multiple: overdue_ratio = elapsed/interval - 1, so 2.0 means
+        # elapsed >= 3x the interval. That is the SAME point the starvation
+        # detector fires at (recurring-starvation-check.DEFAULT_MULTIPLIER = 3.0
+        # compares age > 3.0 * interval) -- the two say it in different units,
+        # which is exactly why the unit is spelled out here.
+        "realloc_overdue_ratio": 2.0,
     }
     try:
         import importlib.util
@@ -2220,6 +2228,62 @@ def _is_owner_scoped_goal(goal):
     return False
 
 
+def _recurring_cadence_stranded(goal):
+    """True when a RECURRING goal is overdue past `recurring.realloc_overdue_ratio`.
+
+    WHY THIS EXISTS (g-115-8700, measured 2026-09-02): a recurring goal routed to
+    a LIVE but busy owner starves exactly like one routed to a dormant owner, and
+    the idle-reallocation escape below cannot free it because the owner is not
+    idle. Two bravo-routed goals stopped firing for 144h and 9h while sitting at
+    rank 1097/1180 on their owner's queue with recurring_urgency already at the
+    urgency_max clamp -- so no amount of further waiting could raise them, and
+    every other Body was excluded by block_reason=routed_to_agent. For CADENCE
+    purposes a busy owner that never reaches rank 1 is indistinguishable from a
+    dormant one, which is the whole argument for opening the escape on overdue-ness
+    rather than on owner liveness.
+
+    THE UNIT IS overdue_ratio, NOT AN ELAPSED MULTIPLE, and they differ by exactly
+    one: overdue_ratio = elapsed/interval - 1. A threshold of 2.0 therefore means
+    elapsed >= 3x interval. This is written out because the surrounding prose has
+    used "2.0x" for BOTH readings -- aspirations.yaml's urgency_max comment says
+    "the starvation predicate starts at 2.00x" (overdue_ratio) while
+    recurring-starvation-check.py compares `age_h > multiplier * basis_h` with
+    multiplier 3.0 (elapsed). They denote the SAME instant; only the units differ.
+    Keyed to overdue_ratio so this escape lines up with recurring_urgency, which is
+    the score the starved goal failed to win on.
+
+    Mirrors compute_score's never-fired fallback (g-303-32 / g-115-1763): a
+    recurring goal whose lastAchievedAt FIELD is absent has never fired, so its
+    clock starts at created_at. Keying on the field's absence rather than on a
+    None elapsed matters -- an off-machine ahead-clock stamps a FUTURE
+    lastAchievedAt, which hours_since() also reports as None, and treating that as
+    never-fired would free a goal that just ran. Without the fallback the
+    most-neglected goals -- the ones that never ran at all -- would be the only
+    class this escape could never reach.
+    """
+    if not goal.get("recurring"):
+        return False
+    try:
+        # float() is not defensive decoration: get_interval_hours returns
+        # goal["interval_hours"] RAW, and a store record can carry it as a
+        # string. Un-coerced, "48" compares fine against 0 but explodes on the
+        # subtraction below -- inside collect_candidates, i.e. one malformed
+        # goal takes down selection for every goal.
+        interval = float(get_interval_hours(goal))
+    except (TypeError, ValueError):
+        return False
+    if interval <= 0:
+        return False
+    la_raw = goal.get("lastAchievedAt")
+    la = hours_since(la_raw)
+    if la_raw is None:  # FIELD absence == never fired ()
+        la = hours_since(goal.get("created_at") or goal.get("created"))
+    if la is None:
+        return False
+    threshold = float(RECURRING_CONFIG.get("realloc_overdue_ratio", 2.0))
+    return ((la - interval) / interval) >= threshold
+
+
 def _get_idle_agents(reallocation_hours):
     """Set of agent names whose team-state last_active is older than
     reallocation_hours (g-115-1766 gap #4 — intended_agent idle-reallocation).
@@ -2793,17 +2857,41 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                 # unclaimed, fall through so a running capable agent can pick up
                 # otherwise-stranded work. Mirrors the reallocatable path above
                 # but keyed on intended-agent idleness rather than the explicit
-                # reallocatable flag. Conservative: fires only when team-state
-                # POSITIVELY shows the target idle (missing last_active => not
-                # idle => keep routing, status quo). Unclaimed-only so a goal an
-                # active peer already owns is never yanked away.
+                # reallocatable flag.
+                #
+                # TWO DOORS, NOT ONE (, measured 2026-09-02). Owner
+                # idleness was the ONLY door until then, and it shut out the
+                # starvation case entirely: a recurring goal on a LIVE but busy
+                # owner is unreachable by every Body -- its owner never ranks it
+                # ( and  sat at 1097/1180, recurring_urgency
+                # already AT the urgency_max clamp, so no further waiting could
+                # raise them) and every peer is excluded by routed_to_agent. The
+                # remedy had to be manual. For CADENCE purposes a busy owner and
+                # a dormant one are indistinguishable, so overdue-ness is now a
+                # second, independent door: see _recurring_cadence_stranded().
+                #
+                # Conservative on the IDLE door, unchanged: it fires only when
+                # team-state POSITIVELY shows the target idle (missing
+                # last_active => not idle => keep routing, status quo). The
+                # CADENCE door does not consult team-state at all -- that is the
+                # point of it -- so the "positively idle" property now describes
+                # one disjunct rather than the whole escape.
+                #
+                # Both conjuncts below still bind on BOTH doors, deliberately:
+                # unclaimed-only, so a goal an active peer already owns is never
+                # yanked away, and not owner-scoped (below).
                 # Owner-scoped exclusion (, rb-4792): NEVER reallocate
                 # a goal that operates only on its owner's own dir tree (e.g.
                 # /drain-temp) -- the reallocatee cannot execute it (wrong temp),
                 # so surfacing it here just strands the reallocatee's top-of-queue
-                # on unexecutable work. Owner-idle is NOT a reason to reallocate
-                # owner-scoped work; it waits for the owner to revive.
-                if (intended_agent in idle_agents
+                # on unexecutable work. NEITHER door is a reason to reallocate
+                # owner-scoped work -- not owner-idle, and not cadence-stranded
+                # (): a starved owner-scoped goal is still unexecutable
+                # by anyone else, so widening it converts a stalled cadence into
+                # a stalled cadence PLUS a wasted top-of-queue slot on every
+                # other Body. It waits for the owner to revive.
+                if ((intended_agent in idle_agents
+                     or _recurring_cadence_stranded(goal))
                         and not goal.get("claimed_by")
                         and not _is_owner_scoped_goal(goal)):
                     pass  # reallocate — surface to this running agent
@@ -3248,9 +3336,19 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             #    SYMMETRY: must be the logical complement of the intended_agent
             #    check in collect_candidates. If you change one, change the
             #    other. That side ESCAPES (surfaces the goal as selectable) only
-            #    when ALL THREE hold -- owner idle, goal unclaimed, goal not
-            #    owner-scoped -- so this side blocks unless all three hold, which
-            #    keeps candidate XOR blocked exact.
+            #    when ALL THREE hold -- (owner idle OR the goal is a recurring
+            #    goal stranded past recurring.realloc_overdue_ratio), goal
+            #    unclaimed, goal not owner-scoped -- so this side blocks unless
+            #    all three hold, which keeps candidate XOR blocked exact.
+            #     turned the FIRST of the three into a DISJUNCTION
+            #    (owner-idle OR cadence-stranded); note it is still one conjunct
+            #    of three, so the XOR argument is unchanged in shape. A
+            #    non-adopting complement is the failure this comment exists to
+            #    prevent (guard-4622): had only the candidate side taken the new
+            #    door, a cadence-stranded goal would appear in the ranked list
+            #    AND in the blocked list at once, which is worse than the
+            #    invisibility guard-1698 named -- the same goal would carry a
+            #    block_detail asserting an escape that had in fact opened.
             #    guard-3644: the detail names EVERY unmet escape conjunct, not
             #    just the first. A message reporting one conjunct of an AND
             #    describes the cheapest check, never the decisive one -- and an
@@ -3261,8 +3359,17 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             intended_agent = goal.get("intended_agent")
             if routes_away_from(intended_agent, AGENT_NAME):
                 unmet_escape = []
-                if intended_agent not in idle_agents:
-                    unmet_escape.append("owner not idle")
+                if (intended_agent not in idle_agents
+                        and not _recurring_cadence_stranded(goal)):
+                    # BOTH doors shut. Naming both is the guard-3644 obligation
+                    # in its exact form: reporting only "owner not idle" would
+                    # describe the cheaper check while a reader waits for an
+                    # owner-revival that is no longer the only way out.
+                    unmet_escape.append(
+                        "owner not idle, and not cadence-stranded (recurring "
+                        "goal overdue >= {r}x interval beyond due)".format(
+                            r=RECURRING_CONFIG.get(
+                                "realloc_overdue_ratio", 2.0)))
                 if goal.get("claimed_by"):
                     unmet_escape.append(
                         "claimed by {c}".format(c=goal.get("claimed_by")))
@@ -3271,7 +3378,7 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 if unmet_escape:
                     entry["block_reason"] = "routed_to_agent"
                     entry["block_detail"] = (
-                        "Routed to {a}; idle-reallocation escape unavailable "
+                        "Routed to {a}; reallocation escape unavailable "
                         "({w})".format(a=intended_agent,
                                        w="; ".join(unmet_escape)))
                     # guard-1362: routing/ownership fields must reach the

@@ -74,7 +74,11 @@ to continue iterating; the Skill call queues the next turn synchronously.
 The prohibition is on SUBSTITUTION (using ScheduleWakeup *instead of* the
 Skill call to advance the loop). It is NOT a prohibition on the deadman's
 re-arm below, where ScheduleWakeup is a NET *behind* an unchanged Skill
-re-entry.
+re-entry. One sanctioned substitution (g-357-89): on a harness that cannot
+notify on background-job exit (`harness-capabilities.sh --get
+background_job_notify` prints `false`) the idle sleep's sized wakeup IS the
+re-entry — `aspirations-all-blocked` B7.2. The forbidden half stays forbidden
+there too: never a synchronous Skill re-entry after a registered sleep.
 
 ## Sanctioned Exception: the deadman's-switch terminal-pair
 

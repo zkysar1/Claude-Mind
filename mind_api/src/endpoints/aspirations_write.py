@@ -100,6 +100,8 @@ from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
 from gates.aspiration_supply import (  # noqa: E402
     evaluate as _aspiration_supply_eval,
+    evaluate_close as _aspiration_supply_close_eval,  # 
+    GATE_ID_CLOSE as _SUPPLY_CLOSE_GATE_ID,
     load_tree_keys as _supply_tree_keys,
     DEFAULT_CONFIG as _SUPPLY_DEFAULT_CONFIG,
 )
@@ -156,6 +158,30 @@ from gates.capability_route import _active_agents as _gate_active_agents  # noqa
 
 def _valid_intended_agents() -> set:
     return set(_gate_active_agents()) | {"either"}
+
+
+def _recurring_routes_to_either(goal) -> bool:
+    """True when a goal is RECURRING and carries no declared owner-constraint,
+    so its cadence must not be tied to one agent's queue depth (g-115-8700).
+
+    "unless they carry requires_capability or a box affinity" is the
+    commissioning goal's wording, and those are ONE test, not two: measured
+    2026-09-03, `requires_capability` is the only field in the goal schema that
+    expresses where a goal can run (`_goal_fields.py` lists it; there is no
+    requires_box / affinity / runs_on field anywhere in goal-selector.py or this
+    module), and it is resolved per-BOX by `_runner_capabilities.py`. So a box
+    affinity IS a requires_capability today. If a distinct affinity field is
+    ever added, it belongs in this predicate — that is why the reasoning is
+    written down rather than left as a bare `not goal.get(...)`.
+
+    Presence is the test, not truthiness of the contents: a caller that went to
+    the trouble of naming a capability has declared a constraint, and an empty
+    list from a buggy caller should keep the goal pinned (conservative
+    direction) rather than silently widen it.
+    """
+    if not goal.get("recurring"):
+        return False
+    return "requires_capability" not in goal
 
 
 def _routes_away_from(intended_agent, agent_name) -> bool:
@@ -646,7 +672,18 @@ def _validate_goal(goal: Dict[str, Any], *, require_id: bool = True) -> None:
         raise ValueError(f"Invalid goal status for {gid}: {goal['status']}")
     if "recurring" in goal and not isinstance(goal["recurring"], bool):
         raise ValueError(f"Goal {gid}: recurring must be a boolean")
-    if "interval_hours" in goal:
+    # A CLEARED interval_hours (present-but-None) is VALID (). The
+    # key-presence form rejected it, so the documented recurring-retirement
+    # sequence (recurring=false -> interval_hours=null -> lastAchievedAt=null)
+    # produced a goal that could not change status AT ALL — completed AND
+    # blocked both raised, while non-status writes kept working. A goal that
+    # never had the key validated fine; a goal correctly retired could not
+    # transition. Measured on  (bravo, cc-05, 2026-09-02).
+    # `is not None` keeps every other case identical: absent -> skip (as
+    # before), 0 / negative / non-numeric -> still rejected.
+    # Mirrored in core/scripts/aspirations.py::validate_goal — fix BOTH or the
+    # CLI keeps rejecting what the daemon accepts (guard-742, guard-3275).
+    if goal.get("interval_hours") is not None:
         v = goal["interval_hours"]
         if not isinstance(v, (int, float)) or v <= 0:
             raise ValueError(f"Goal {gid}: interval_hours must be positive")
@@ -1632,7 +1669,34 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     if not goal.get("intended_agent"):
         route_to = _header_override(ctx, "X-Mind-Route-To")
         handoff_to = goal.get("handoff_to")
-        if (not route_to) and isinstance(handoff_to, str) \
+        if (not route_to) and _recurring_routes_to_either(goal):
+            # RECURRING GOALS DEFAULT TO "either" (, measured
+            # 2026-09-02). A recurring goal is a CADENCE obligation, not a piece
+            # of owned work: what matters is that it fires on time, not who
+            # fires it. Single-agent routing converts the owner's queue depth
+            # into the goal's cadence, and when that owner is busy the goal is
+            # unreachable by anyone —  stopped for 144h and 
+            # for 9h exactly this way, both sitting at 1097/1180 on bravo's
+            # ranking with recurring_urgency already at the urgency_max clamp
+            # while every peer was excluded by block_reason=routed_to_agent.
+            #
+            # This branch fires ONLY where the classifier would otherwise guess.
+            # It is deliberately placed ABOVE the handoff_to branch but BELOW
+            # every caller-explicit signal, because those three are not the same
+            # kind of thing: `route_to` (the X-Mind-Route-To header) and a
+            # pre-set `intended_agent` are the caller SAYING where this goes,
+            # while `handoff_to` on a recurring goal is a hand-off of THIS
+            # firing, not a permanent cadence owner — treating it as routing is
+            # what re-creates the defect one filing later. A caller that really
+            # does want a permanent owner sets intended_agent, which never
+            # reaches this block at all.
+            goal["intended_agent"] = "either"
+            warnings.append(
+                "recurring-route-default: intended_agent set to 'either' "
+                "(g-115-8700) — a recurring goal routed to one agent starves "
+                "when that agent is merely busy. Set intended_agent explicitly, "
+                "or declare requires_capability, to pin an owner.")
+        elif (not route_to) and isinstance(handoff_to, str) \
                 and handoff_to in _valid_intended_agents():
             # An explicit handoff_to is ALSO the caller's routing choice
             # (): without this, the title-verb classifier can stamp a
@@ -4276,6 +4340,19 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
 
     force = (ctx.query.get("force") or "").strip().lower() in ("true", "1", "yes")
     intent_satisfied = (ctx.query.get("intent_satisfied") or "").strip().lower() in ("true", "1", "yes")
+    # : the closer's needle block rides the body under needle_satisfied=true
+    # (mutually exclusive with intent_satisfied — the intent block is the
+    # statement in that case, rationale mode).
+    needle_satisfied = (ctx.query.get("needle_satisfied") or "").strip().lower() in ("true", "1", "yes")
+
+    # : closure-gate override (per-gate header wins; --override-all
+    # fans into the slot when unset, mirroring add()).
+    bulk_override = _header_override(ctx, "X-Mind-Override-All")
+    raw_override_close = _header_override(ctx, "X-Mind-Override-Supply-Close")
+    close_bulk_slots: List[str] = []
+    if bulk_override and raw_override_close is None:
+        close_bulk_slots.append("override_supply_close")
+    override_close = raw_override_close or bulk_override
 
     agent = _agent_name(ctx)
     live_path, base_dir = _resolve_paths(ctx, source)
@@ -4283,6 +4360,7 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
 
     # Parse intent_satisfaction body BEFORE lock (mirrors CLI stdin read)
     intent_block = None
+    needle_block = None
     if intent_satisfied:
         try:
             intent_block = _parse_body_json(ctx.body)
@@ -4292,6 +4370,16 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
         if not isinstance(intent_block, dict):
             return Response.error(400, "invalid_body",
                                   "intent_satisfaction body must be a JSON object")
+    elif needle_satisfied:
+        try:
+            needle_block = _parse_body_json(ctx.body)
+        except (ValueError, json.JSONDecodeError) as e:
+            return Response.error(400, "invalid_body",
+                                  f"needle_satisfied requires JSON body: {e}")
+        if not isinstance(needle_block, dict):
+            return Response.error(400, "invalid_body",
+                                  "needle_satisfaction body must be a JSON object "
+                                  '{"statement": str, "artifacts": [str, ...]}')
 
     warnings: List[str] = []
 
@@ -4347,6 +4435,43 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
                     f"{asp_id} has {len(unfinished)} unfinished goal(s): {uf_summary}. "
                     f"All non-recurring goals must be terminal before archival. "
                     f"Use force=true to override, or intent_satisfied=true.")
+
+            # : closure gate — a record carrying supply_evidence.needle
+            # (self-generated under the supply gate) may not close on goal
+            # COUNT. The closer states how the delivered work meets the needle
+            # (needle_satisfied body, or the intent block's rationale) and
+            # names one artifact the operator can use; otherwise the remedy is
+            # the NEXT goal, not an archive row. force=true does NOT bypass —
+            # only the audited X-Mind-Override-Supply-Close / --override-all.
+            close_result = _aspiration_supply_close_eval(
+                asp,
+                satisfaction=(needle_block if needle_block is not None else intent_block),
+                mode=("intent" if (needle_block is None and intent_block is not None) else "needle"),
+                override_close=override_close,
+                tree_keys=_supply_tree_keys(ctx.paths.world),
+                agent_name=ctx.paths.agent_name or "",
+                world_dir=ctx.paths.world,
+                project_root=ctx.paths.project_root,
+                meta_dir=ctx.paths.meta,
+                agent_dir=(ctx.paths.agent if getattr(ctx.paths, "agent", None) else None),
+                config=_load_idle_supply_config(ctx.paths.project_root),
+            )
+            if close_result.get("would_block"):
+                return Response.json({
+                    "error": "aspiration_needle_unmet",
+                    "gate": _SUPPLY_CLOSE_GATE_ID,
+                    "gate_output": close_result,
+                }, status=400)
+            if close_result.get("override_applied"):
+                warnings.append(
+                    f"{_SUPPLY_CLOSE_GATE_ID}: refusal overridden "
+                    f"({close_result['override_applied']}) — failures: "
+                    + ", ".join(f["check"] for f in close_result.get("failures", []))
+                )
+            if needle_block is not None and close_result.get("gated"):
+                stamped = dict(needle_block)
+                stamped["claimed_at"] = datetime.now().isoformat(timespec="seconds")
+                asp["needle_satisfaction"] = stamped
 
             # Maturity warning (advisory, not blocking)
             scope = asp.get("scope", "project")
@@ -4407,6 +4532,19 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
             _jsonl_cache().invalidate(live_path)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
+
+    # : audit a bulk override that reached the closure slot (mirror of
+    # add()'s blast-radius record). Best-effort; the helper never raises.
+    if bulk_override and close_bulk_slots:
+        import hashlib as _hashlib
+        bulk_token = _hashlib.sha1(
+            bulk_override.encode("utf-8", errors="replace")
+        ).hexdigest()[:12]
+        _audit_bulk_override(
+            bulk_token, bulk_override, close_bulk_slots,
+            context={"caller": "aspirations_write.py:complete",
+                     "asp_id": asp_id, "source": source},
+            world_dir=ctx.paths.world)
 
     return Response.json({
         "ok": True,
@@ -4503,6 +4641,33 @@ def complete_intent(ctx) -> "Response":  # type: ignore[name-defined]
             ok, err = _validate_intent_satisfaction(asp, intent_block, config)
             if not ok:
                 return Response.error(400, "intent_validation_failed", err)
+
+            # : closure gate, rationale mode — on a record carrying
+            # supply_evidence.needle the rationale must address the NEEDLE in
+            # its own terms (the intent validation only checks it against the
+            # motivation). No artifact is required here: this path already
+            # demands >= N completed evidence goals.
+            close_result = _aspiration_supply_close_eval(
+                asp, satisfaction=intent_block, mode="intent",
+                override_close=(_header_override(ctx, "X-Mind-Override-Supply-Close")
+                                or _header_override(ctx, "X-Mind-Override-All")),
+                agent_name=ctx.paths.agent_name or "",
+                world_dir=ctx.paths.world, project_root=ctx.paths.project_root,
+                meta_dir=ctx.paths.meta,
+                config=_load_idle_supply_config(ctx.paths.project_root),
+            )
+            if close_result.get("would_block"):
+                return Response.json({
+                    "error": "aspiration_needle_unmet",
+                    "gate": _SUPPLY_CLOSE_GATE_ID,
+                    "gate_output": close_result,
+                }, status=400)
+            if close_result.get("override_applied"):
+                warnings.append(
+                    f"{_SUPPLY_CLOSE_GATE_ID}: refusal overridden "
+                    f"({close_result['override_applied']}) — failures: "
+                    + ", ".join(f["check"] for f in close_result.get("failures", []))
+                )
 
             # Stamp and persist
             intent_block = dict(intent_block)
@@ -6283,7 +6448,14 @@ def _holder_session_is_live_runner(ctx, agent_name: str,
       - absent/empty -> this box does not run this agent's loop, so the file
         is not stale, it is UNANSWERABLE (guard-2418). Previously this fell
         straight to False and a LIVE reducer on another box was silently
-        taken over. Now it consults an authoritative, goal-scoped signal.
+        taken over. It now consults the two SID-keyed Body probes FIRST and
+        only then the agent-keyed goal-scoped signal (g-306-412). Reading
+        this bullet as "the reducer-on-another-box case" is what left the
+        gap: an absent `running-session-id` is the NORMAL state on a WORKER
+        box, so this is the branch every worker-vs-worker claim takes, and
+        the agent-keyed `in_flight` row it used to consult alone is
+        reducer-written and session-less -- blind to two worker Bodies by
+        construction.
     `goal_id` is REQUIRED (F-002 of g-306-141). It was `Optional[str] = None`,
     an explicit opt-in — but every caller already passed it, so the default was
     reachable only by a NEW call site, and reaching it would silently disable
@@ -6316,7 +6488,63 @@ def _holder_session_is_live_runner(ctx, agent_name: str,
         if rsid_path.exists():
             running_sid = rsid_path.read_text(encoding="utf-8").strip()
         if not running_sid:
-            # UNANSWERABLE locally -> cross-box fallback (see above).
+            # UNANSWERABLE locally -> SID-KEYED probes FIRST, agent-keyed last
+            # ( item 1).
+            #
+            # THIS IS THE BRANCH EVERY WORKER BOX TAKES, and until now it was
+            # the only branch with no session-level signal at all. A worker
+            # Body never writes `running-session-id` (/start W0: the worker
+            # variant "MUST NOT touch running-session-id or latest-session-id;
+            # those are reducer-owned"), so on a worker box the file is ABSENT
+            # and control arrives here -- while all three SID-keyed probes
+            # built for exactly this question (_same_box_body_is_live
+            # , _cross_box_body_is_live , and the carrier
+            # escalation ) were wired ONLY into the
+            # `running_sid != holder_sid` branch below, which only a REDUCER
+            # box can reach. The machinery existed and was structurally
+            # unreachable from the boxes that need it -- guard-3448 ("a gate is
+            # only as broad as its entry points") landing on a predicate whose
+            # own sibling docstring called that branch "the last cell of the
+            # holder-liveness matrix". It was not the last cell.
+            #
+            # MEASURED 2026-09-03 (, the goal this closes). Two alpha
+            # worker Bodies claimed  32 s apart and both built the same
+            # IAM role. The world override-bypass ledger carries the
+            # fall-through TWICE, in both directions: "cross-session take-over:
+            # dormant sid=94c0ad1f -> sid=2fda1f3e" at 00:31:12 and the exact
+            # reverse at 00:52:42. Corroboration that control came through HERE
+            # rather than the branch below: `_cross_box_body_is_live` logs a
+            # `cross-box-body-liveness` firing on EVERY outcome, and that gate
+            # has ZERO firings on 2026-09-03 (8 blocks 08-27..09-01, all from a
+            # box where `running-session-id` is present).
+            #
+            # WHY THE AGENT-KEYED PROBE CANNOT COVER THIS, so re-ordering is
+            # not enough on its own: its own docstring says the shard "carries
+            # NO session id ... so it cannot answer the session-level question
+            # directly", and the `in_flight` row it reads is written for the
+            # REDUCER Body ONLY (coordination.md:1065). Two worker Bodies are
+            # invisible to it by construction, whatever it returns.
+            #
+            # ORDER MIRRORS THE SIBLING BRANCH: local mtime stat first (free),
+            # then the SID-keyed shard row, then the agent-keyed row as the
+            # last resort it has always been. Each added probe returns True
+            # ONLY on positive confirmation, so this can only NARROW the
+            # take-over window: the documented fail-open asymmetry is untouched
+            # and a holder with neither a heartbeat nor a body row still falls
+            # through exactly as before.
+            #
+            # THE SIBLING `_cross_agent_holder_is_live` HAS THE SAME GAP in its
+            # own absent-`running_sid` branch and is deliberately NOT changed
+            # here (guard-4622 -- naming the non-adopter rather than silently
+            # leaving it): that path only WARNS, so its gap costs one missing
+            # log line, not a duplicated execution, and this goal's scope says
+            # do not widen.
+            if _same_box_body_is_live(ctx, holder_sid, stale_minutes,
+                                      agent_name):
+                return True
+            if _cross_box_body_is_live(ctx, agent_name, holder_sid,
+                                       goal_id or "", stale_minutes):
+                return True
             return _cross_box_holder_is_live(ctx, agent_name, goal_id or "",
                                              stale_minutes)
         if running_sid != holder_sid:

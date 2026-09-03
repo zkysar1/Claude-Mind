@@ -624,6 +624,24 @@ gates:
     tuning_notes: "Structured checks, not keywords: origin substring list (idle_supply.gated_origin_patterns), referent existence, blocker-shape regex on the FIRST sentence + gap only, token containment against live+archive with a shared-token floor, per-agent daily cap. Tune thresholds in core/config/aspirations.yaml idle_supply."
     retirement_eligible: false
 
+  - id: aspiration-supply-close-gate
+    script: core/scripts/gates/aspiration_supply.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "complete(ctx) after the unfinished-goals guard; complete_intent(ctx) after intent validation (rationale mode)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: balanced
+    override_flag: "--override-supply-close"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A supply-gated aspiration whose needle IS met closes with one JSON block (a statement in the needle's terms + one artifact the operator can use) — ~1 min; one whose needle is not met gets its next goal filed instead of an archive row."
+    fn_description: "A self-generated aspiration closes on goal COUNT the moment its only goal completes, needle unmet, no intent block — measured 2026-09-03 on a downstream deployment: asp-025 and asp-027 each archived ~75 min after creation. Evidenced records flash and archive; the churn reads as supply."
+    rb_evidence: []
+    tuning_notes: "Content predicates, not presence: close_min_statement_chars, close_min_shared_tokens (needle∩statement distinctive tokens), artifact must resolve via verify_referent and may not be a goal/aspiration id. Not gated when the record has no supply_evidence.needle (user-directed records untouched). Tune in core/config/aspirations.yaml idle_supply."
+    retirement_eligible: false
+
   - id: operator-offload-gate
     script: core/scripts/gates/operator_offload.py
     embedded: false

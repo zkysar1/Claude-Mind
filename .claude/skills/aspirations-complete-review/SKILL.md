@@ -18,9 +18,8 @@ previous_revision_id: null
 
 # /aspirations-complete-review — Aspiration Completion Review
 
-Invoked by the aspirations orchestrator when an aspiration has ALL non-recurring goals completed.
-Sweeps goal outcomes for outstanding work, checks motivation fulfillment, and decides whether
-to archive or reopen the aspiration with new goals.
+Invoked by the orchestrator when an aspiration has ALL non-recurring goals completed: sweeps
+outcomes for outstanding work, checks needle/motivation fulfillment, decides archive vs reopen.
 
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter. Read only the paths returned (files not yet in context). If output is empty, all conventions already loaded — proceed to next step.
 
@@ -39,8 +38,8 @@ to archive or reopen the aspiration with new goals.
 ## Phase 7: Aspiration-Level Check
 
 Re-read the goal's parent aspiration via compact loader.
-GUARD: Aspirations containing ANY recurring goals cannot be archived — the data layer
-(`aspirations-complete.sh`) will block it. Check here to avoid wasted work.
+GUARD: aspirations with ANY recurring goals cannot be archived (`aspirations-complete.sh`
+blocks it); check here first.
 
 ```
 asp = get_aspiration(goal)
@@ -61,12 +60,11 @@ if has_recurring and functionally_complete:
     Output: "▸ Functionally complete: {asp.id} '{asp.title}' — all non-recurring goals done, {recurring_count} recurring continue"
     run_aspiration_spark(goal.aspiration)
     # SELF-GENERATED (g-357-82): origin `successor:{asp.id}`, never
-    # `user_directive`; needs supply_evidence citing {asp.id}. The aspiration-
-    # supply gate refuses a successor that restates the completed work. EMPTY
-    # is expected when nothing genuine follows — recurring goals continue it.
+    # `user_directive`; needs supply_evidence citing {asp.id}. The supply gate
+    # refuses a successor restating the completed work; EMPTY is expected.
     invoke /create-aspiration from-self --plan with:
         origin_signal: "successor:{asp.id}"
-        replacement_context: "Aspiration '{asp.title}' is functionally complete — all non-recurring goals done. Recurring goals continue as monitoring. Generate a NEW aspiration that advances the agent's purpose in a fresh direction, informed by the completed aspiration's outcomes."
+        replacement_context: "Aspiration '{asp.title}' is functionally complete (recurring goals continue as monitoring). Generate a NEW aspiration advancing the agent's purpose in a fresh direction, informed by its outcomes."
     RETURN (should_archive = false, goals_added = 0)  # keep alive for recurring, but replacement was triggered
 
 # ── Standard recurring guard ──
@@ -221,16 +219,19 @@ FOR EACH exp in exp_result:
     FOR EACH signal: append to outstanding_findings with source_experience
 ```
 
-### Step 7.5.2b: Motivation Fulfillment Check
+### Step 7.5.2b: Needle / Motivation Fulfillment Check
 
 ```
-Read asp.motivation. Given completed goals and outcomes:
+IF asp.supply_evidence.needle (g-357-86): the NEEDLE is the check: unmet →
+  add the next goal toward it below, never archive on count; met → close via
+  aspirations-complete.sh --needle-satisfied (else REFUSED: aspiration_needle_unmet).
+ELSE read asp.motivation. Given completed goals and outcomes:
   FULFILLED: Every claim addressed, no natural next steps remain.
   NOT FULFILLED: Motivation broader than goals, or depth remains.
 
 IF NOT fulfilled AND aspiration had < 10 completed goals:
-    Generate 1-3 follow-up goals advancing the motivation
-    Each goal MUST set origin_signal: "parent_aspiration:{asp.id}" (motivation-driven follow-up)
+    Generate 1-3 follow-up goals advancing the motivation (or needle)
+    Each goal MUST set origin_signal: "parent_aspiration:{asp.id}"
     Add via: aspirations-add-goal.sh --source {source} <asp.id>
     goals_added_to_completing_asp += count
     Output: "▸ Motivation check: not yet fulfilled — added {count} goal(s)"

@@ -233,6 +233,105 @@ def live_claim_sids(world_store: Path, text: Optional[str] = None) -> Dict[str, 
         return {}
 
 
+def _read_queue_lines(world_store: Path):
+    """`(lines | None, provenance)` for one aspirations queue.
+
+    EXTRACTED from `read_claims` (g-306-412 item 3) so a SECOND parser of the
+    same bytes cannot drift from the first. The read strategy, its ordering and
+    its provenance semantics are unchanged and still documented on
+    `read_claims`, which is where they were argued; this function is only the
+    I/O half, lifted so `read_terminal_goal_ids` shares it rather than copying
+    the S3-or-local block (guard-2676: a second implementation of a capability
+    drifts silently, and nothing fails when it does).
+
+    `None` for the lines means NEITHER layer was readable, and it is returned
+    beside `provenance == "none"` so a caller cannot mistake an unreadable store
+    for an empty one (guard-2418 / guard-1753) -- the distinction `read_claims`
+    already made and this preserves.
+    """
+    try:
+        import sys
+        scripts = world_store.parent.parent.parent / "core" / "scripts"
+        if scripts.is_dir() and str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from storage_backend import get_backend  # noqa: PLC0415
+        from _owncloud_codec import decode_response  # noqa: PLC0415  # 
+
+        b = get_backend()
+        key = b._s3_key(world_store)
+        # : the queue may be gzip on the wire — decode through the one
+        # transport seam (magic-byte authoritative; a plain object passes through).
+        body = decode_response(
+            b.s3.get_object(Bucket=b.bucket, Key=key), key=key
+        ).decode("utf-8")
+        return body.splitlines(), "authoritative"
+    except Exception:
+        pass
+    try:
+        with world_store.open(encoding="utf-8") as fh:
+            return fh.read().splitlines(), "local-mirror"
+    except OSError:
+        return None, "none"
+
+
+def _terminal_goal_ids_from_lines(lines) -> "set":
+    """Ids of goals sitting in a TERMINAL status. Sibling of `_claims_from_lines`.
+
+    POSITIVE evidence only, and that is the whole reason this exists rather than
+    reusing the claim map. `_claims_from_lines` records `sid -> goal_id` with
+    `setdefault`, so a sid holding TWO non-terminal goals keeps only the first:
+    "this row's goal is missing from the claim map" is therefore NOT evidence
+    the goal is finished, it can equally be the second goal of a busy Body. A
+    delete predicate cannot be built on that absence (guard-2418); it needs the
+    store to SAY the goal is terminal, which is what this returns.
+    """
+    out = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            asp = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for g in asp.get("goals") or []:
+            if g.get("status") in TERMINAL_STATUSES:
+                gid = g.get("id")
+                if gid:
+                    out.add(str(gid))
+    return out
+
+
+def read_terminal_goal_ids(*stores: Path) -> "tuple[set, str]":
+    """Terminal goal ids across SEVERAL queues, with the WEAKEST provenance.
+
+    Union sibling of `read_claims_union`, and union for the same reason: a Body
+    of this agent can claim into the world queue OR its own agent queue, so a
+    world-only read would report an agent-queue goal as "not terminal" purely
+    because it was never looked at.
+
+    THE CONSERVATIVE DIRECTION IS THE OPPOSITE ONE HERE, so the union's safety
+    argument does not carry over unexamined. For claims, adding entries can only
+    turn a reap into a keep. For terminal ids, adding entries can only turn a
+    keep into a REAP -- the destructive direction. What keeps that safe is that
+    every id added is POSITIVE evidence read from a queue: the union widens what
+    is READ, never what is INFERRED from silence. A store that cannot be read
+    contributes nothing and degrades the provenance, which the caller checks.
+    """
+    if not stores:
+        return set(), "none"
+    rank = {"none": 0, "local-mirror": 1, "authoritative": 2}
+    merged = set()
+    weakest = "authoritative"
+    for store in stores:
+        lines, prov = _read_queue_lines(store)
+        if lines is not None:
+            merged |= _terminal_goal_ids_from_lines(lines)
+        if rank[prov] < rank[weakest]:
+            weakest = prov
+    return merged, weakest
+
+
 def read_claims(world_store: Path) -> "tuple[Dict[str, str], str]":
     """Claim map plus the PROVENANCE of the bytes it was parsed from.
 
@@ -265,29 +364,10 @@ def read_claims(world_store: Path) -> "tuple[Dict[str, str], str]":
     layer answered". `"none"` now means exactly one thing -- neither layer was
     readable.
     """
-    try:
-        import sys
-        scripts = world_store.parent.parent.parent / "core" / "scripts"
-        if scripts.is_dir() and str(scripts) not in sys.path:
-            sys.path.insert(0, str(scripts))
-        from storage_backend import get_backend  # noqa: PLC0415
-        from _owncloud_codec import decode_response  # noqa: PLC0415  # 
-
-        b = get_backend()
-        key = b._s3_key(world_store)
-        # : the queue may be gzip on the wire — decode through the one
-        # transport seam (magic-byte authoritative; a plain object passes through).
-        body = decode_response(
-            b.s3.get_object(Bucket=b.bucket, Key=key), key=key
-        ).decode("utf-8")
-        return _claims_from_lines(body.splitlines()), "authoritative"
-    except Exception:
-        pass
-    try:
-        with world_store.open(encoding="utf-8") as fh:
-            return _claims_from_lines(fh), "local-mirror"
-    except OSError:
-        return {}, "none"
+    lines, provenance = _read_queue_lines(world_store)
+    if lines is None:
+        return {}, provenance
+    return _claims_from_lines(lines), provenance
 
 
 def read_claims_union(*stores: Path) -> "tuple[Dict[str, str], str]":

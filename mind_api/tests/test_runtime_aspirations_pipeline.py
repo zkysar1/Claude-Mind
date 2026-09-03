@@ -237,6 +237,137 @@ def test_capability_route_explicit_not_overridden(running_daemon):
     assert persisted["intended_agent"] == "alpha"
 
 
+# --- recurring goals default to "either" () ----------------------
+#
+# NOTE ON _OFFLOAD: every one of these files a RECURRING goal, and the
+# pre-existing operator-offload gate refuses ANY recurring filing that does not
+# carry a justification (it fires on `recurring: true` / `interval_hours` and is
+# entirely orthogonal to routing — it asks whether a cron should do the work,
+# not who owns it). Without the header these tests 400 before Phase D's result
+# is ever persisted, so the header is a precondition of the fixture, not part of
+# what is under test.
+#
+# A recurring goal is a CADENCE obligation, not owned work. Routing one to a
+# single agent makes that agent's queue depth the goal's cadence, and a busy
+# owner then starves it with no escape:  stopped for 144h and
+#  for 9h, both at 1097/1180 on bravo's ranking with
+# recurring_urgency already at the urgency_max clamp, every peer excluded by
+# block_reason=routed_to_agent. Both had to be widened by hand.
+
+
+_OFFLOAD = {"X-Mind-Override-Offload":
+            "routing-behaviour fixture; the cadence work is genuinely LLM work"}
+
+
+def test_recurring_goal_defaults_to_either(running_daemon):
+    """The headline behaviour, carrying its own control.
+
+    Both goals use the SAME "Investigate:" title shape that
+    test_capability_route_stamps_intended_agent pins to zeta. The only
+    difference is `recurring`, so the control is what proves recurring-ness —
+    not some incidental property of the title — produced "either".
+    """
+    project_root, port = running_daemon
+    for title, recurring in (("Investigate: cadence sweep A", True),
+                             ("Investigate: cadence sweep B", False)):
+        goal = {"title": title, "status": "pending",
+                "origin_signal": "user_directive"}
+        if recurring:
+            goal.update({"recurring": True, "interval_hours": 24})
+        code, body = _add_goal(port, goal, headers=_OFFLOAD)
+        assert code == 200, (title, body)
+    assert _read_persisted_goal(
+        project_root, "Investigate: cadence sweep A")["intended_agent"] == "either"
+    assert _read_persisted_goal(
+        project_root, "Investigate: cadence sweep B")["intended_agent"] == "zeta"
+
+
+def test_recurring_with_requires_capability_keeps_the_classifier(running_daemon):
+    """A DECLARED owner-constraint opts out of the widening.
+
+    requires_capability is the only field in the goal schema that expresses
+    where a goal can run (measured 2026-09-03; there is no requires_box /
+    affinity / runs_on field), so it is also the goal's stated "box affinity".
+    """
+    project_root, port = running_daemon
+    goal = {"title": "Investigate: pinned to a capable box", "status": "pending",
+            "origin_signal": "user_directive", "recurring": True,
+            "interval_hours": 24, "requires_capability": ["aws"]}
+    code, _ = _add_goal(port, goal, headers=_OFFLOAD)
+    assert code == 200
+    persisted = _read_persisted_goal(
+        project_root, "Investigate: pinned to a capable box")
+    assert persisted["intended_agent"] == "zeta"
+
+
+def test_recurring_explicit_intended_agent_still_wins(running_daemon):
+    """Caller-explicit routing outranks the default — the gate never overrides."""
+    project_root, port = running_daemon
+    goal = {"title": "Investigate: explicitly owned cadence", "status": "pending",
+            "origin_signal": "user_directive", "recurring": True,
+            "interval_hours": 24, "intended_agent": "alpha"}
+    code, _ = _add_goal(port, goal, headers=_OFFLOAD)
+    assert code == 200
+    assert _read_persisted_goal(
+        project_root,
+        "Investigate: explicitly owned cadence")["intended_agent"] == "alpha"
+
+
+def test_recurring_route_to_header_still_wins(running_daemon):
+    """The per-call header is the caller SAYING where this goes."""
+    project_root, port = running_daemon
+    goal = {"title": "Investigate: header-routed cadence", "status": "pending",
+            "origin_signal": "user_directive", "recurring": True,
+            "interval_hours": 24}
+    code, _ = _add_goal(port, goal,
+                        headers={**_OFFLOAD, "X-Mind-Route-To": "bravo"})
+    assert code == 200
+    assert _read_persisted_goal(
+        project_root,
+        "Investigate: header-routed cadence")["intended_agent"] == "bravo"
+
+
+def test_recurring_handoff_to_does_not_pin_the_cadence(running_daemon):
+    """Deliberate ordering, pinned so it is not "tidied" back later.
+
+    handoff_to is a hand-off of THIS firing, not the appointment of a permanent
+    cadence owner — honouring it as routing re-creates the starvation one filing
+    later. A caller that genuinely wants a permanent owner sets intended_agent,
+    which never reaches this branch (test above).
+    """
+    project_root, port = running_daemon
+    goal = {"title": "Investigate: handed-off cadence", "status": "pending",
+            "origin_signal": "user_directive", "recurring": True,
+            "interval_hours": 24, "handoff_to": "bravo"}
+    code, _ = _add_goal(port, goal, headers=_OFFLOAD)
+    assert code == 200
+    assert _read_persisted_goal(
+        project_root, "Investigate: handed-off cadence")["intended_agent"] == "either"
+
+
+def test_recurring_default_is_read_back_by_the_filer(running_daemon):
+    """guard-2980's second half: omission does NOT mean unrouted, so the value
+    has to travel BACK to whoever filed it.
+
+    Both channels are asserted because they reach different readers: the
+    response's `goal` is what aspirations-add-goal.sh prints to stdout, and
+    `warnings` is what it re-emits to stderr. A filer reading either one sees
+    the routing that actually landed rather than assuming its omission held.
+    """
+    project_root, port = running_daemon
+    goal = {"title": "Investigate: read-back cadence", "status": "pending",
+            "origin_signal": "user_directive", "recurring": True,
+            "interval_hours": 24}
+    code, body = _add_goal(port, goal, headers=_OFFLOAD)
+    assert code == 200
+    resp = json.loads(body)
+    assert resp["goal"]["intended_agent"] == "either"
+    warned = [w for w in (resp.get("warnings") or [])
+              if "recurring-route-default" in w]
+    assert warned, "the filer must be TOLD the field was set: %r" % resp.get("warnings")
+    assert "either" in warned[0] and "intended_agent" in warned[0]
+
+
 def test_route_to_header_forwarded(running_daemon, aspirations_write_module,
                                    monkeypatch):
     """X-Mind-Route-To header reaches capability-route as route_to kwarg."""

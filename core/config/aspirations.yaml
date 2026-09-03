@@ -1181,6 +1181,39 @@ recurring:
                                   # starvation fix did not need it — the saturation relief
                                   # below carries the effect — so the ordering question is
                                   # split out rather than bundled. See rb-5876.
+  # Cadence-stranded reallocation threshold (, measured 2026-09-02).
+  # When a RECURRING goal routed to a peer is overdue by at least this
+  # overdue_ratio, goal-selector's reallocation escape opens for it REGARDLESS
+  # of whether that peer is idle. Until this existed, owner-idleness was the
+  # only door, and a recurring goal on a LIVE but busy owner was unreachable by
+  # every Body: its owner never ranked it ( and  sat at
+  # 1097/1180 with recurring_urgency already at the urgency_max clamp, so no
+  # further waiting could raise them) and every peer was excluded by
+  # block_reason=routed_to_agent. Both had to be widened by hand, after 144h
+  # and 9h stopped.
+  #
+  # THE UNIT IS overdue_ratio, NOT AN ELAPSED MULTIPLE, and they differ by
+  # exactly one: overdue_ratio = elapsed/interval - 1. So 2.0 here means
+  # elapsed >= 3x the interval -- the SAME instant recurring-starvation-check.py
+  # fires at (its DEFAULT_MULTIPLIER is 3.0, compared as `age_h > N * basis_h`,
+  # i.e. in elapsed multiples). The escape and the detector therefore open
+  # together by construction, which is the property to preserve when tuning this.
+  # Read the urgency_max note above with that in mind: its "the hard clamp binds
+  # at elapsed 3.17x interval while the starvation predicate starts at 2.00x"
+  # is TRUE but states its two halves in DIFFERENT units (3.17 elapsed, 2.00
+  # overdue_ratio) -- both describe overdue_ratio 2.17 vs 2.00, so the clamp does
+  # bind just after the predicate, as that note concludes.
+  #
+  # KNOWN CONFLICT INSIDE THE COMMISSIONING GOAL, recorded rather than papered
+  # over: 's acceptance criterion says "the escape opens at overdue
+  # ratio >= 2x" (implemented here) while its 7-day measurement says "no
+  # recurring goal routed to a live agent exceeds 2x its interval" (elapsed 2x
+  # = overdue_ratio 1.0). Those differ by exactly one, and the escape as
+  # specified cannot achieve the measurement -- a goal can reach elapsed 3x
+  # before the door opens. The criterion is implemented because it is the
+  # criterion; whoever runs the measurement can set this to 1.0 and satisfy it
+  # without a code change, which is why it is a config key and not a literal.
+  realloc_overdue_ratio: 2.0
   saturation_window: 4            # Recent completions window for saturation check
   saturation_max_penalty: 4.0     # Max raw penalty when all recent are recurring.
                                   # NOTE (): equal to urgency_max, and both carry
@@ -1850,7 +1883,8 @@ quiescence_gate:
   hysteresis_iters: 2             # same blocker-set hash required across N iters
   budget_pct: 0.40                # max fraction of session wall-clock in quiescence
   sleep_seconds_min: 1800         # 30 min floor when quiescence approved
-  sleep_seconds_max: 3600         # 60 min cap (wake signals can break sooner)
+  sleep_seconds_max: 3600         # 60 min cap (wake signals can break sooner); per-deployment override
+                                  # key aspirations.quiescence_gate.sleep_seconds_max (; 7200 = 2-hour blocks)
   wake_miss_cooldown: 3           # N consecutive wake-misses → auto-disable session
   log_file: quiescence-log.jsonl  # relative to <agent>/session/ — decision trail
   audit_file: quiescence-audit.jsonl  # relative to <agent>/session/ — wake-miss record
@@ -1932,6 +1966,10 @@ quiescence_gate:
 #   cap_cycles       : int  consecutive sleeps at max_seconds (optional stop escalation)
 dry_idle_backoff:
   enabled: true
+  # Per-deployment override (, user directive 2026-09-03): meta-set.sh
+  # aspirations dry_idle_backoff.base_seconds 7200 -> flat 2-hour idle blocks
+  # from the first idle cycle (no 2/4/8/16-min ramp); a busy fleet keeps 120.
+  # _dry_idle.load_config reads the merged config (meta/config-overrides.yaml).
   base_seconds: 120        # streak 1 -> 2 min
   multiplier: 2.0          # exponential
   max_seconds: 7200        # cap -> 2 h
@@ -1978,6 +2016,14 @@ idle_supply:
   min_needle_chars: 30         # supply_evidence.needle — the user-visible outcome
   max_self_generated_per_agent_per_day: 2   # juice-vs-squeeze backstop; 0 disables. Beyond it the idle path goes quiet.
   min_goals: 1                 # a self-generated aspiration must carry its first verifiable goal(s); 0 disables. An empty shell creates no work and leaves the loop all-blocked (measured 2026-09-02).
+  require_needle_by: true      # g-357-87: supply_evidence.needle_by (YYYY-MM-DD) is required on gated origins and refused when past — a needle without a date is a wish (asp-026: "for the 2026 season" after the draft). Also live: gap_self_referential ("no active aspiration for X") and overlap_delta_missing (a cited archived overlap owes what it delivered + what is missing).
+  # : closure gate (aspiration-supply-close-gate). A record carrying supply_evidence.needle may
+  # not close on goal COUNT: aspirations-complete.sh refuses (aspiration_needle_unmet) unless
+  # --needle-satisfied supplies {statement, artifacts[]} — the statement in the needle's own terms, one
+  # artifact that EXISTS (path / tree node / post, never a goal id) — or the intent rationale addresses
+  # the needle. Measured 2026-09-03 (asp-025, asp-027): one goal, ~75 min, archived, needle unmet.
+  close_min_statement_chars: 40
+  close_min_shared_tokens: 2   # distinctive tokens the statement must share with the needle
   # B6.7 Target 1 (blocker-pattern → Unblock aspiration synthesis) skips these
   # external_id class prefixes: they are self-resolving (a hypothesis gate is a
   # time lock; a time-gate / calendar precondition expires on its own) or a
@@ -2125,6 +2171,9 @@ modifiable:
   recurring.urgency_base: {min: 0.5, max: 3.0, default: 1.5}
   recurring.urgency_log_scale: {min: 0.5, max: 3.0, default: 1.5}
   recurring.urgency_max: {min: 2.0, max: 8.0, default: 4.0}
+  # min 0.0 = "reallocate the moment it is merely due"; max 6.0 is the 6x
+  # elapsed-7x band  names as today's short-interval starvation floor.
+  recurring.realloc_overdue_ratio: {min: 0.0, max: 6.0, default: 2.0}
   recurring.saturation_window: {min: 2, max: 10, default: 4}
   recurring.saturation_max_penalty: {min: 2.0, max: 8.0, default: 4.0}
   recurring.debt_threshold: {min: 0.60, max: 0.95, default: 0.80}

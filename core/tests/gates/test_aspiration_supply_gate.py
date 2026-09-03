@@ -14,10 +14,14 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
+
+# g-357-87: every gated fixture now carries a dated needle. Dynamic (guard-566).
+NEEDLE_BY = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+YESTERDAY = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS_DIR = REPO_ROOT / "core" / "scripts"
@@ -95,6 +99,7 @@ def _control():
         "supply_evidence": {
             "gap": "No skill or script scores a two-sided trade offer; g-012-11 covers lineup only and asp-007 closed without a trade evaluator.",
             "needle": "The user can paste a trade offer and get accept/decline with the projected point delta for the rest of the season.",
+            "needle_by": NEEDLE_BY,
             "checked": ["asp-007", "asp-012", "g-012-11"],
         },
         "goals": [{"title": "Score a trade offer: rest-of-season projection delta per side"}],
@@ -201,11 +206,14 @@ def test_building_on_completed_work_is_allowed_only_when_cited():
     cand["supply_evidence"] = {
         "gap": "asp-018 delivered the valuation rubric but no weekly run of it; nothing produces a ranked waiver list each Tuesday.",
         "needle": "Every Tuesday the user gets a ranked waiver list with one recommended claim.",
+        "needle_by": NEEDLE_BY,
         "checked": ["asp-018", "asp-014"],
     }
     r = _eval(cand, _portfolio_without("asp-019"))
     checks = {f["check"] for f in r["failures"]}
     assert "overlaps_archived" not in checks
+    # cited AND the gap states the delta (delivered … but no …) -> no delta failure either
+    assert "overlap_delta_missing" not in checks
     # still overlaps ACTIVE asp-014 at >= threshold -> file goals there instead
     assert "overlaps_active" in checks
 
@@ -218,15 +226,101 @@ def test_unblock_aspiration_may_name_the_blocker_but_still_owes_referents():
         "supply_evidence": {
             "gap": "No goal or aspiration owns producing the shared fixture the dependency class waits on.",
             "needle": "The three waiting goals become executable in the next iteration.",
+            "needle_by": NEEDLE_BY,
             "checked": ["g-006-15", "g-006-22"],
         },
         "goals": [{"title": "Produce the shared fixture and point both waiting goals at it"}],
     }
     r = _eval(cand, PORTFOLIO)
+    # "No goal or aspiration owns …" is self-referential by shape, but an
+    # Unblock: aspiration's subject IS the queue — exempt, like blocker_as_gap.
     assert r["gated"] and not r["would_block"], r["failures"]
     cand["supply_evidence"]["checked"] = ["dependency"]
     r2 = _eval(cand, PORTFOLIO)
     assert {f["check"] for f in r2["failures"]} == {"referents_unverified"}
+
+
+# --- g-357-87: dated needle, self-referential gap, cited-overlap delta -------------
+
+ASP_009 = {"id": "asp-009", "title": "Draft Strategy & Expected Value Framework for the 2026 draft",
+           "motivation": "Build a draft strategy framework with expected value by pick and position tiers for the 2026 fantasy draft.",
+           "origin_signal": "all_blocked_gap", "status": "completed", "completed_at": "2026-08-31T12:00:00"}
+
+
+def _asp_026():
+    """The coach 2026-09-03 01:03Z record that passed the v2.12.49 gate: three
+    laundering shapes in one candidate."""
+    return {
+        "title": "Fantasy Football Draft Strategy & Expected Value Framework",
+        "motivation": "The agent identity as a draft strategist has no dedicated active aspiration. Refresh the draft strategy and expected value framework for 2026.",
+        "origin_signal": "all_blocked_gap",
+        "supply_evidence": {
+            "gap": "No active aspiration dedicated to draft strategy — asp-009 completed and archived, needs refresh for 2026",
+            "needle": "a framework that can guide actual draft decisions for the 2026 season",
+            "checked": ["asp-009", "asp-012"],
+        },
+        "goals": [{"title": "Draft the expected-value framework document"}],
+    }
+
+
+def test_asp026_shape_is_refused_three_ways():
+    r = _eval(_asp_026(), PORTFOLIO + [ASP_009])
+    checks = {f["check"] for f in r["failures"]}
+    assert {"gap_self_referential", "needle_undated", "overlap_delta_missing"} <= checks, r["failures"]
+    assert "overlaps_archived" not in checks  # cited -> the delta check, not the citation check
+    delta = next(f for f in r["failures"] if f["check"] == "overlap_delta_missing")
+    assert "asp-009" in delta["detail"] and "2026-08-31" in delta["detail"]
+    selfref = next(f for f in r["failures"] if f["check"] == "gap_self_referential")
+    assert "gap" in selfref["detail"] and "motivation" in selfref["detail"]
+    assert r["checks"]["archived_overlap_delta"] == {"id": "asp-009", "closed_at": "2026-08-31",
+                                                     "names_it": True, "has_delta": False}
+
+
+def test_asp026_repaired_with_a_date_and_a_delta_passes_the_new_checks():
+    cand = _asp_026()
+    cand["motivation"] = "The operator receives trade offers weekly and has no value sheet to judge them against the tiers asp-009 produced."
+    cand["supply_evidence"]["gap"] = ("asp-009 delivered position tiers and a pick-value table for the pre-draft window, "
+                                      "but nothing turns them into an in-season trade-value sheet; the operator lacks a weekly sheet.")
+    cand["supply_evidence"]["needle"] = "Each Wednesday the operator gets a trade-value sheet for every rostered player."
+    cand["supply_evidence"]["needle_by"] = NEEDLE_BY
+    r = _eval(cand, PORTFOLIO + [ASP_009])
+    checks = {f["check"] for f in r["failures"]}
+    assert not ({"gap_self_referential", "needle_undated", "needle_expired", "overlap_delta_missing"} & checks), r["failures"]
+
+
+def test_needle_by_required_and_not_past():
+    cand = _control()
+    del cand["supply_evidence"]["needle_by"]
+    assert "needle_undated" in {f["check"] for f in _eval(cand, PORTFOLIO)["failures"]}
+    cand["supply_evidence"]["needle_by"] = "the 2026 season"
+    assert "needle_undated" in {f["check"] for f in _eval(cand, PORTFOLIO)["failures"]}
+    cand["supply_evidence"]["needle_by"] = YESTERDAY
+    r = _eval(cand, PORTFOLIO)
+    assert "needle_expired" in {f["check"] for f in r["failures"]}
+    assert r["checks"]["needle_by"] == YESTERDAY
+    cand["supply_evidence"]["needle_by"] = NEEDLE_BY
+    assert _eval(cand, PORTFOLIO)["failures"] == []
+    # config knob: off -> neither check fires
+    del cand["supply_evidence"]["needle_by"]
+    r = _eval(cand, PORTFOLIO, config={"require_needle_by": False})
+    assert not ({"needle_undated", "needle_expired"} & {f["check"] for f in r["failures"]})
+
+
+def test_self_referential_gap_is_refused_but_operator_gaps_are_not():
+    cand = _control()
+    cand["supply_evidence"]["gap"] = "Coach lacks a dedicated lane for trade evaluation; nothing is assigned to it since asp-007 closed."
+    r = _eval(cand, PORTFOLIO)
+    assert "gap_self_referential" in {f["check"] for f in r["failures"]}
+    cand = _control()  # the control's "No skill or script scores …" names a capability, not the queue
+    assert "gap_self_referential" not in {f["check"] for f in _eval(cand, PORTFOLIO)["failures"]}
+
+
+def test_user_directive_is_never_gated_by_the_new_checks():
+    cand = _asp_026()
+    cand["origin_signal"] = "user_directive"
+    cand["motivation"] = "The operator asked for a draft value framework in chat."
+    r = _eval(cand, PORTFOLIO + [ASP_009])
+    assert r["gated"] is False and r["failures"] == []
 
 
 def test_tiny_candidate_overlap_is_advisory_only():

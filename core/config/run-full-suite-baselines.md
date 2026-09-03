@@ -1149,3 +1149,28 @@ caused (00:32–00:34) — all green after a daemon restart, and `daemon-orphan-
 orphan daemon processes from that window. Lesson: on this box run solo re-runs through the pinned worktree with
 `daemon.port` copied in, never bare from the live checkout, or the re-run itself manufactures the reds it is
 meant to triage.
+
+### 2026-09-03T03:33 — alpha, `hostname` cc-14, `uname -r` 6.8.0-138-generic, STORAGE_BACKEND=local pin, live fleet (5 agent dirs), 4 chunks (runner default), for the g-357-89 deep-code closure (65b9b516f)
+`TOTAL: 19969 passed, 29 failed, 0 errors` / `VERDICT: GENUINE`; invisible-suites 125/125; domain-tests 81/81 (1 self-skipped).
+Distribution chunk 00: 5 · 01: 17 · 02: 4 · 03: 3 (spread, not tail-confined). `--triage`: 17 failing files;
+**1 environmental** (`test_learning_routing_world_scope` — solo 3/3 green), **every genuine red OWNED** — the
+2026-09-02 unowned set now sits under **g-115-8698** (triage goal), the rest under g-115-6805 / g-115-7127 /
+g-115-4130 / g-115-8624 / g-115-3195 / g-115-3803 / g-115-4626 / g-115-6350; **0 genuine-UNOWNED, nothing to
+file.** Zero reds in the change's blast radius (no failure in the interruptible-sleep, idle-tick, cycle-cache or
+harness-capabilities tests). HEAD did not move during the run (launched at 65b9b516f, verified before reading).
+
+### 2026-09-03T05:10 — alpha, `hostname` cc-14, `uname -r` 6.8.0-138-generic, STORAGE_BACKEND=local pin, live fleet, runner-default chunking, for the g-357-87 deep-code closure (6f2b656c2)
+`TOTAL: 20031 passed, 29 failed, 0 errors` / `VERDICT: GENUINE`; invisible-suites 125/125; domain half 2325 passed / 0 failed
+(8/8 chunks). `--triage`: **1 environmental | 16 genuine-owned | 0 genuine-UNOWNED** — owners g-115-8698 (the 2026-09-02
+unowned set), g-115-7127, g-115-8624; **nothing to file.** Same 29-red set as the 03:33 row above, +62 passed (the six new
+supply-gate tests and the rest from chunk-boundary drift). Zero reds in the change's blast radius (no failure in
+`test_aspiration_supply_gate`, `test_runtime_aspiration_supply_gate`, `test_runtime_aspirations_add`). HEAD did not
+move during the run (launched at 6f2b656c2, verified `6f2b656c2` before reading).
+
+### 2026-09-03T06:05 — alpha, `hostname` cc-14, `uname -r` 6.8.0-138-generic, STORAGE_BACKEND=local pin, live fleet, runner-default chunking (4), for the g-357-86 deep-code closure (2ba6bc3b7)
+`TOTAL: 20083 passed, 34 failed, 0 errors` / `VERDICT: GENUINE`; invisible-suites 125/125; domain half 2325 passed / 0 failed
+(8/8 chunks). `--triage`: **2 environmental | 16 genuine-owned | 0 genuine-UNOWNED** — `test_embedding_index_freshness.py`
+solo 14/14 → environmental; the owned set is the same g-115-8698 / g-115-7127 / g-115-8624 population as the 05:10 row,
++52 passed (the closure-gate tests: `test_aspiration_supply_close_gate`, `test_runtime_aspiration_supply_close_gate`,
+`test_wrapper_aspirations_complete_needle`). Zero reds in the change's blast radius. HEAD did not move during the run
+(launched at 2ba6bc3b7, no commit or pull until the VERDICT was read).

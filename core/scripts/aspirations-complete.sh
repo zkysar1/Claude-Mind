@@ -30,13 +30,15 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # multi-line '--body-string' fragments alongside the real flags. That direction
 # is OVER-acceptance, which can MASK a genuine unknown flag, so the scan was NOT
 # trusted here; the three flags below come from reading the arg loop.
-_ACCEPTED_FLAGS="--source <world|agent> | --force | --intent-satisfied"
+_ACCEPTED_FLAGS="--source <world|agent> | --force | --intent-satisfied | --needle-satisfied | --override-supply-close <why> | --override-all <why>"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
 ASP_ID=""
 FORCE=0
 INTENT_SATISFIED=0
+NEEDLE_SATISFIED=0
+declare -a HEADERS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -49,6 +51,25 @@ while [[ $# -gt 0 ]]; do
         --intent-satisfied)
             INTENT_SATISFIED=1
             shift;;
+        --needle-satisfied)
+            # : the record carries supply_evidence.needle and the
+            # needle IS met — stdin is {"statement": "<how the delivered work
+            # gives the operator what the needle names>", "artifacts": ["<file
+            # / tree node / board post the operator uses — not a goal id>"]}.
+            # Without it the daemon REFUSES (aspiration_needle_unmet): a
+            # self-generated aspiration does not close on goal count.
+            NEEDLE_SATISFIED=1
+            shift;;
+        --override-supply-close)
+            # Audited bypass of the closure gate () — ledgered to
+            # world/aspiration-supply-overrides.jsonl (kind: close).
+            HEADERS+=(--header "X-Mind-Override-Supply-Close: ${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-all)
+            # Bulk header; the daemon fans it into the closure slot when unset
+            # and audits it to world/override-bypass-ledger.jsonl.
+            HEADERS+=(--header "X-Mind-Override-All: ${2-}")
+            shift $(( $# >= 2 ? 2 : 1 ));;
         -h|--help)
             # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
             # exit 2 would be a regression the refusal introduced rather than a
@@ -92,9 +113,10 @@ if [ -z "$ASP_ID" ]; then
 fi
 
 # Read stdin BEFORE invoking the daemon. If --intent-satisfied, the body is
-# the intent_satisfaction JSON block; otherwise body is empty.
+# the intent_satisfaction JSON block; if --needle-satisfied (), the
+# needle_satisfaction block; otherwise body is empty.
 BODY=""
-if [ "$INTENT_SATISFIED" = "1" ]; then
+if [ "$INTENT_SATISFIED" = "1" ] || [ "$NEEDLE_SATISFIED" = "1" ]; then
     BODY="$(cat)"
 fi
 
@@ -105,15 +127,18 @@ source "$CORE_ROOT/scripts/_runtime.sh"
 QUERY="asp_id=${ASP_ID}&source=${SOURCE_VAL}"
 [ "$FORCE" = "1" ] && QUERY="${QUERY}&force=true"
 [ "$INTENT_SATISFIED" = "1" ] && QUERY="${QUERY}&intent_satisfied=true"
+[ "$NEEDLE_SATISFIED" = "1" ] && QUERY="${QUERY}&needle_satisfied=true"
 
 rc=0
 if [ -n "$BODY" ]; then
     RESPONSE="$(rt_call POST /v1/aspirations/complete \
         --query "$QUERY" \
-        --body-string "$BODY")" || rc=$?
+        --body-string "$BODY" \
+        "${HEADERS[@]+"${HEADERS[@]}"}")" || rc=$?
 else
     RESPONSE="$(rt_call POST /v1/aspirations/complete \
-        --query "$QUERY")" || rc=$?
+        --query "$QUERY" \
+        "${HEADERS[@]+"${HEADERS[@]}"}")" || rc=$?
 fi
 
 case $rc in
@@ -151,10 +176,12 @@ else:
             if [ -n "$BODY" ]; then
                 RESPONSE="$(rt_call POST /v1/aspirations/complete \
                     --query "$QUERY" \
-                    --body-string "$BODY")" || rc=$?
+                    --body-string "$BODY" \
+                    "${HEADERS[@]+"${HEADERS[@]}"}")" || rc=$?
             else
                 RESPONSE="$(rt_call POST /v1/aspirations/complete \
-                    --query "$QUERY")" || rc=$?
+                    --query "$QUERY" \
+                    "${HEADERS[@]+"${HEADERS[@]}"}")" || rc=$?
             fi
             if [ "$rc" = "0" ]; then
                 #  fix: stdin route (same rationale as success path above).

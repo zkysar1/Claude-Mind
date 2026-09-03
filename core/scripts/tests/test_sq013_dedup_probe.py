@@ -325,3 +325,87 @@ def test_length_norm_is_unity_at_average_length():
     assert sq._length_norm(1570.0, 157.0) > 1.0     # sponge is penalised
     assert sq._length_norm(15.0, 157.0) < 1.0       # short record is favoured
     assert sq._length_norm(100.0, 0) == 1.0         # empty corpus fails open
+
+
+# ── ALL-COMMON-VOCABULARY TRUE DUPLICATES () ───────────────────────
+# The rarity gate requires a RARE token in the overlap. That premise is VACUOUS
+# when the SUBJECT itself carries no rare token -- then the gate is unsatisfiable
+# and silently drops true duplicates whose vocabulary is entirely common.
+# Measured on the live 2,836-goal queue:  ("Idea: deep audits closing
+# with empty outcome_note ...") self-matched at weight 3.55, subject-coverage
+# 1.0, yet FILEd -- an invisible false negative. The fix waives the veto ONLY
+# for an all-common subject a candidate restates VERBATIM at the TITLE level; a
+# generic-token or description-only collision must still FILE. These tests pin
+# BOTH directions so a later swing back is caught.
+
+ALLCOMMON_SUBJECT = "returns selection denominator unmeasured"  # all tokens common in _big_corpus, none rare
+
+
+def _allcommon_owner():
+    """A goal whose TITLE is token-identical to ALLCOMMON_SUBJECT."""
+    return {
+        "id": "g-703-ALLCOMMON",
+        "status": "pending",
+        "title": ALLCOMMON_SUBJECT,
+        "description": "The genuine owner of this all-common-vocabulary work.",
+    }
+
+
+def test_allcommon_fixture_reproduces_the_shape():
+    """Guards the guard (guard-2903 sibling). The subject must carry NO rare
+    token (or the waiver never engages), AND the owner must clear the WEIGHT
+    floor on live IDF (or the weight gate rejects it before the rarity path is
+    reached), AND the owner must share NO rare overlap token (or the OLD gate
+    would already have cited it and the fix is not what is under test)."""
+    corpus = _big_corpus() + [_allcommon_owner()]
+    docs = [sq._tokens(" ".join(str(g.get(f) or "")
+                                for f in ("title", "description")))
+            for g in corpus]
+    subj = sq._tokens(ALLCOMMON_SUBJECT)
+    idf, n = sq._compute_idf(docs, subj)
+    assert n >= sq.MIN_IDF_CORPUS, n            # IDF must be LIVE, not inert
+    rare_ceil = max(2, n // sq.RARE_DF_DIVISOR)
+    assert [t for t in subj if idf[t][0] <= rare_ceil] == [], "subject must be ALL-COMMON"
+    owner_blob = docs[-1]
+    avgdl = sum(len(d) for d in docs) / float(len(docs))
+    overlap = subj & owner_blob
+    weight = sum(idf[t][1] for t in overlap) / sq._length_norm(len(owner_blob), avgdl)
+    assert weight >= sq.WEIGHT_THRESHOLD, (
+        "owner weight %.2f must clear the floor, or the weight gate rejects it "
+        "before the rarity path" % weight)
+    assert [t for t in overlap if idf[t][0] <= rare_ceil] == [], \
+        "owner must share NO rare token, else the OLD gate would already cite it"
+
+
+def test_allcommon_true_duplicate_is_declined():
+    """CATCH DIRECTION. An all-common subject token-identical to an existing
+    goal's TITLE is a duplicate and must be cited -- the g-115-3755 live false
+    negative, pinned."""
+    r = sq.decide(ALLCOMMON_SUBJECT, _big_corpus() + [_allcommon_owner()],
+                  NOW, SESSION_START)
+    assert r["decision"] == "DECLINE", r
+    assert r["cited_goal_id"] == "g-703-ALLCOMMON", r
+
+
+def test_allcommon_description_collision_still_files():
+    """DO-NOT-OVERFIRE DIRECTION. Without the title-identical owner, the same
+    all-common subject overlaps the generic records' and the decoy's
+    DESCRIPTIONS in full (subject-coverage 1.0) -- but none RESTATES it at the
+    TITLE level, so the newly-enabled decline path must NOT fire. A false
+    DECLINE is the silent, permanent failure direction (guard-5147)."""
+    r = sq.decide(ALLCOMMON_SUBJECT, _big_corpus(with_owner=False),
+                  NOW, SESSION_START)
+    assert r["decision"] == "FILE", r
+
+
+def test_allcommon_waiver_is_not_green_by_default(monkeypatch):
+    """MUTATION PROOF (guard-2903). Raise the all-common min-overlap above the
+    subject's token count and the waiver can no longer admit the owner; the true
+    duplicate must then FILE, proving the waiver -- not some other path -- is
+    what declines it."""
+    monkeypatch.setattr(sq, "ALLCOMMON_TITLE_DUP_MIN_OVERLAP", 99)
+    r = sq.decide(ALLCOMMON_SUBJECT, _big_corpus() + [_allcommon_owner()],
+                  NOW, SESSION_START)
+    assert r["decision"] == "FILE", (
+        "with the waiver disabled the all-common owner should not be cited; it "
+        "was: %s" % r["cited_goal_id"])

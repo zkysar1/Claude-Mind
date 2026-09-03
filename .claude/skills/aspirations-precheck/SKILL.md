@@ -1041,12 +1041,12 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 #                                          skill self-discriminates: no-recurring falls through
 #                                          7.4's empty-unfinished fast-path to the Phase 7
 #                                          fully-complete gate → aspirations-complete.sh
-#                                          (validates all-terminal, NO evidence gate);
+#                                          (all-terminal; a supply_evidence.needle record is
+#                                          REFUSED without --needle-satisfied proof, g-357-86);
 #                                          has_recurring → Phase 7's functionally-complete
 #                                          stamp. Do NOT attempt complete-intent.sh — its
-#                                          evidence/outcomes gate is unsatisfiable with no open
-#                                          goals (asp-352: 3/25 had outcomes; close failed twice
-#                                          before the normal path succeeded).
+#                                          evidence gate is unsatisfiable with no open goals
+#                                          (asp-352).
 #                                        · blocked_stale (high completion, only blocked-and-
 #                                          stale trailing goals, AND a usable `motivation`)
 #                                          → invoke /aspirations-complete-review Phase 7.4

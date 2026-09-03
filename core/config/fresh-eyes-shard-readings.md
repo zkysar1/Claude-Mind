@@ -171,3 +171,11 @@ Probe returned MAX **96** at read time and **96** at write-time re-probe (g-115-
 Per-branch readings on this shard: branch 1 (section headings, HANDOFF headings excluded by `-vi`) = 96 and CARRIES the answer; branch 2 (`| **N=` bold rows) = none; branch 3 (first `N=` per table row) = 92 — the comparison tables put the OLDEST column first, so a row-only probe would allocate N=93 here and collide with an existing section. Keeping all three branches and taking the max across them is what makes the foxtrot shard safe; the "first N= per row" rule is harmless only because branch 1 outranks it.
 
 Shard 299,375 B / 4,482 lines authoritative at the write-time re-probe. The mirror was NOT compared before the write: the comparison command doubled the `world/` prefix (`$WORLD_PATH/world/...`), `cmp` returned rc=2 on the missing path, and the loop printed `auth!=mirror` — a wrong-path negative that reads exactly like a real divergence (the guard-2298 shape on a byte comparison; judge a cmp by its rc, 2 is 'could not compare', not 'different'). Measured AFTER the write with the correct path: the N=97 row is **7,685 B**, the mirror 307,618 B / 4,614 lines (the Edit-tool PostToolUse hook re-formatted the file, so the file delta 8,243 B is not the row), and authoritative == mirror after the push.
+
+### foxtrot shard, N=98 (2026-09-03, foxtrot-laptop, WSL2 6.18.33.2)
+
+Probe returned MAX **97** at read time (01:39) and **97** at the write-time re-probe (01:43:18, g-115-8055) — no peer in the gap (foxtrot is this shard's only writer by design); N=98 allocated. Positive-controlled FROM THE ROWS: the `## N=97 — 2026-09-02T19:04:51` heading at line 4485 is the max section heading, and the N=98 section was appended after its `### HANDOFF to N=98` block (line 4614 was the file's last line).
+
+Per-branch readings on this shard: branch 1 (section headings, HANDOFF headings excluded by `-vi`) = 97 and CARRIES the answer; branch 2 (`| **N=` bold rows) = none; branch 3 (first `N=` per table row) = 93 — the comparison tables' first column, which would have collided with the existing N=94 block had it been taken alone.
+
+Shard 307,618 B / 4,614 lines authoritative at the write-time re-probe; the local mirror measured the same 307,618 B in the same call (no doubled `world/` prefix this time — `$WORLD_PATH/knowledge/tree/...`).

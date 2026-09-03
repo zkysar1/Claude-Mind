@@ -170,18 +170,32 @@ if [ -z "$QUERY" ]; then
     exit 1
 fi
 
+# Session provenance (): record a node key that was ACTUALLY read.
+# Success-gated on purpose — a pre-emptive record would authenticate a citation
+# to a node the lookup never resolved, which is the one direction this manifest
+# must never fail in. Scoped to --node (an explicit single-node read); the
+# computational flags are not citations. Fail-open and silent: a provenance miss
+# must never disturb a tree read, and stdout belongs to the response.
+_record_node_provenance() {
+    [ -n "$NODE" ] || return 0
+    local sid_arg=()
+    [ -n "${MIND_SID:-}" ] && sid_arg=(--session-id "$MIND_SID")
+    python3 "$CORE_ROOT/scripts/context-reads.py" record-prov \
+        "${sid_arg[@]}" --kind node "$NODE" >/dev/null 2>&1 || true
+}
+
 rc=0
 rt_call GET /v1/tree/read --query "$QUERY" || rc=$?
 
 case $rc in
-    0) exit 0;;
+    0) _record_node_provenance; exit 0;;
     2) exit 1;;
     3)
         # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
             rc=0
             rt_call GET /v1/tree/read --query "$QUERY" || rc=$?
-            if [ "$rc" = "0" ]; then exit 0; fi
+            if [ "$rc" = "0" ]; then _record_node_provenance; exit 0; fi
         fi
         rt_no_daemon_error "tree-read.sh";;
     *)

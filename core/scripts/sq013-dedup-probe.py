@@ -122,6 +122,14 @@ MIN_IDF_CORPUS = 20
 # fixed ceiling cannot span corpora of different sizes.
 RARE_DF_DIVISOR = 200
 
+# When the SUBJECT itself carries no rare token (subj_rare empty), the `not
+# rare` gate below is vacuous and silently drops true duplicates whose whole
+# vocabulary is common (). The waiver that rescues that case fires
+# ONLY for a token-identical-TITLE restatement with at least this many
+# overlapping tokens -- the tightest form, because a false DECLINE is the
+# permanent, invisible failure direction (guard-5147).
+ALLCOMMON_TITLE_DUP_MIN_OVERLAP = 4
+
 # BM25 length normalisation (). `weight` is an unnormalised SUM over
 # the overlap, so a long record wins by SIZE alone: more tokens means more
 # chances to overlap any subject, and more chances to contain SOME rare token by
@@ -238,12 +246,18 @@ def decide(subject, goals, now, session_start=None,
     docs = [_tokens(" ".join(str(g.get(f) or "")
                              for f in ("title", "description")))
             for g in records]
+    titles = [_tokens(g.get("title") or "") for g in records]
     idf, n = _compute_idf(docs, subj)
     inert = n < MIN_IDF_CORPUS
     rare_ceil = max(2, n // RARE_DF_DIVISOR)
     avgdl = (sum(len(d) for d in docs) / float(len(docs))) if docs else 0.0
+    # Subject's OWN rare tokens (live IDF only; inert corpora have none by
+    # construction). When empty, the `not rare` veto below has no premise to
+    # enforce -- see the all-common waiver at the gate.
+    subj_rare = {t for t in subj
+                 if not inert and t in idf and idf[t][0] <= rare_ceil}
 
-    for g, blob_tokens in zip(records, docs):
+    for g, blob_tokens, cand_title in zip(records, docs, titles):
         status = (g.get("status") or "").strip().lower()
         overlap = subj & blob_tokens
         if len(overlap) < min_overlap:
@@ -258,12 +272,33 @@ def decide(subject, goals, now, session_start=None,
             weight = (sum(idf[t][1] for t in overlap)
                       / _length_norm(len(blob_tokens), avgdl))
             rare = sorted(t for t in overlap if idf[t][0] <= rare_ceil)
-        # BOTH gates. Weight alone does not discriminate: the measured false
-        # positive scored 11.04 on generic English, above any sane floor. What
-        # separated it from the true owner (16.04) was that the owner shared a
-        # RARE identifier and it shared none.
-        if weight < WEIGHT_THRESHOLD or not rare:
+        # Weight gate first. Weight alone does not discriminate: the measured
+        # false positive scored 11.04 on generic English, above any sane floor.
+        if weight < WEIGHT_THRESHOLD:
             continue
+        # Rare gate. What separated the false positive from the true owner
+        # (16.04) was that the owner shared a RARE identifier and it shared
+        # none. But that premise assumes the SUBJECT has a rare identifier to
+        # share. When it does not (subj_rare empty), requiring one silently
+        # drops true duplicates whose vocabulary is entirely common
+        # (:  self-matched at weight 3.55, subject-coverage
+        # 1.0, and was vetoed then re-filed). Waive the veto ONLY for an
+        # all-common subject that a candidate restates VERBATIM at the title
+        # level -- subject fully covered AND the candidate's whole title
+        # covered, >= ALLCOMMON_TITLE_DUP_MIN_OVERLAP tokens. This is the one
+        # path that can newly produce a DECLINE, so it is the tightest:
+        # subj_rare non-empty keeps the generic decoy () suppressed,
+        # and the title-identity guard keeps a description-only collision (an
+        # alarm vs its own fix) from declining. (guard-5147: a false DECLINE is
+        # the silent, permanent failure direction.)
+        if not rare:
+            if subj_rare:
+                continue
+            if (len(overlap) < ALLCOMMON_TITLE_DUP_MIN_OVERLAP
+                    or len(overlap) != len(subj)
+                    or not cand_title
+                    or not subj.issuperset(cand_title)):
+                continue
 
         if status in OPEN_STATUSES:
             when, in_window = _goal_time(g), True

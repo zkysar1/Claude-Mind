@@ -61,6 +61,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR  # noqa: E402
+import _harness_caps  # noqa: E402  (: no-notify harness directive lines)
 from _idle_cache_common import (  # noqa: E402
     wake_timer_elapsed,
     authoritative_earliest_wake_at,
@@ -233,6 +234,7 @@ def _emit_hit_directive(cache, cap, earliest_wake_at=None):
         "Emit exactly ONE tool call:\n"
         f"  Bash(\"MIND_AGENT={agent} QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh {sleep_seconds}\", run_in_background=true)\n"
         "When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.\n"
+        + _harness_caps.no_notify_hint(sleep_seconds) +
         f"After {cap} consecutive short-circuits a full cycle is forced for drift detection.\n"
         "================="
     )

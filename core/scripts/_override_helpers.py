@@ -57,6 +57,7 @@ SLOT_TO_GATE_ID = {
     "override_offload": "operator-offload-gate",
     "override_no_investigate": "scaffolded-exploration-gate",
     "override_supply": "aspiration-supply-gate",
+    "override_supply_close": "aspiration-supply-close-gate",  # 
 }
 
 
