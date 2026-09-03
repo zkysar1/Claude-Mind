@@ -3133,6 +3133,41 @@ print('; '.join(
         fi
     fi
 
+    # Step 8.79c IDEA-CAPTURE: mechanical Actionable-Findings scan of the
+    # outcome_note (g-357-108). The user's standing complaint: an agent states a
+    # recommendation / follow-up / idea at close ("RECOMMENDATION: create 3
+    # feature goals") and it dies in the note — never filed, never actioned. The
+    # historical Step 8.5 gate scanned only the tree-INSIGHT and only when the
+    # LLM ran it (abbreviate-able under context pressure, the felt-sense
+    # starvation class). This makes the capture MECHANICAL and fed the right
+    # input: do_state_update runs on every non-recurring reducer close, and it
+    # already re-reads the CURRENT note (the _sc_note block above uses it), so
+    # the note is populated here (g-115-5157). findings-gate --scan-outcome-note
+    # reads the durable record itself and files Idea/Unblock goals with its own
+    # dedup (title + origin_signal idea:<src>), so a double-scan with the LLM's
+    # tree-insight Step 8.5 never double-files.
+    #
+    # SKIP recurring goals: their outcome_note ages silently (never rewritten
+    # after the first close — guard-3056), so re-scanning re-reads stale text.
+    # Worker-Body closes get the same scan mechanically from
+    # worker_retrospective._lane_findings (also --scan-outcome-note). Fail-open:
+    # a capture failure NEVER blocks state-update. Quiet by default — only a
+    # non-zero created count surfaces in-turn; the full log is findings-gate.log.
+    if [[ "$recurring" != "true" && -n "$asp_id" ]]; then
+        local _idea_out _idea_created=""
+        _idea_out=$(bash "$SCRIPT_DIR/findings-gate.sh" \
+            --goal "$GOAL_ID" --aspiration "$asp_id" \
+            --category "$category" --source "${SOURCE:-world}" \
+            --scan-outcome-note \
+            2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true)
+        if [[ "$_idea_out" =~ created=([0-9]+) ]]; then
+            _idea_created="${BASH_REMATCH[1]}"
+        fi
+        if [[ -n "$_idea_created" && "$_idea_created" != "0" ]]; then
+            echo "[iteration-close] IDEA-CAPTURE: filed $_idea_created goal(s) from $GOAL_ID's outcome_note recommendation(s) (findings-gate --scan-outcome-note). Full log: core/logs/findings-gate.log." >&2
+        fi
+    fi
+
     # Step 8.79b Domain post-close pipeline-freshness hook (rb-428
     # sentinel family). Pattern B domain-overlay seam (domain-overlay-pattern.md,
     # mirrors aspirations-precheck's signal-refresh hook): CORE stays domain-
