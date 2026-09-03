@@ -3,6 +3,14 @@
 Every test builds a hermetic tmp project root. The lane writes the AGENT-WIDE
 working memory, so it must never be exercised against the live tree.
 
+A tmp project root stopped being SUFFICIENT for that in g-306-420: the capture
+carrier moved from `agents/<agent>/session/pending-body-merges/` (derived from
+the project root, hermetic for free) to `world/body-carriers/<agent>/`, and
+`world` is an EXTERNAL path that the project root does not determine. So the
+`_hermetic_world` fixture below is now load-bearing, not tidiness -- without it
+these tests write real carriers into the LIVE world and then read them back
+(measured: `bodies_scanned: 6` against a one-body fixture, 15 failures).
+
 The load-bearing assertions, and why each one is here rather than being obvious:
 
   * ACTIVE Bodies contribute. This is the whole point of the lane —
@@ -57,6 +65,21 @@ def _mk_root(tmp_path: Path, agent: str = "testagent") -> Path:
     (tmp_path / "agents" / agent / "session").mkdir(parents=True)
     (tmp_path / "agents" / agent / "sessions").mkdir(parents=True)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_world(tmp_path, monkeypatch):
+    """Point the capture carrier's world root at tmp_path ().
+
+    AUTOUSE because the escape is silent: a test that forgot it would still
+    pass in isolation and only corrupt the run once a sibling test had left a
+    carrier in the live world.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
 
 
 def _write_reducer_wm(root: Path, agent: str, slots: dict | None = None) -> Path:

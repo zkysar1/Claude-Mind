@@ -76,18 +76,19 @@ blocked_idle_attempts = []
 See coordination convention for full scan protocol.
 
 > **Pre-silence rule (`.claude/rules/check-team-state-before-silent.md`, `guard-321`).**
-> If any branch in B0–B7 — board scan, aspiration generation rationale, backoff
-> escalation reasoning, take-back narrative, or proactive notification body — is
-> about to conclude that the partner agent is silent / absent / crashed /
-> unresponsive / inactive / stalled, run the canonical probe FIRST:
-> `bash core/scripts/team-state-read.sh --field agent_status.<partner>.last_active --json`.
-> If the timestamp is within 6h of now, the partner is NOT silent. Drop the
-> branch. Audit on 2026-04-19 found no committed silent-branch in this skill;
-> this banner is a forward defense for the next author.
+> Before any B0–B7 branch (board scan, generation rationale, backoff escalation,
+> take-back, notification body) concludes the partner is silent / absent / crashed /
+> stalled, run `bash core/scripts/team-state-read.sh --field agent_status.<partner>.last_active --json`
+> FIRST; within 6h of now the partner is NOT silent — drop the branch. (Forward
+> defense; the 2026-04-19 audit found no such branch here.)
 
 ```
-# g-357-94: directives are the ONE board input that can steer GENERATION (B1/B2). Phase 2.07
-# acks them (on the all_blocked branch too); this read only feeds scope. veto = out of scope.
+# g-357-94: directives are the ONE board input that can steer GENERATION (B1/B2). ACK here
+# too (dedup via --unread-only/--mark-read; iteration-open routes all_blocked straight here,
+# bypassing aspirations-select). veto = out of scope.
+Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
+FOR EACH directive in new_directives: ack as select 2.07 (skip moot targets; else
+    echo "Acknowledged directive {directive.id}" | board-post.sh --channel coordination --type status --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}")
 active_directives = selection_context.active_directives or board-read.sh --channel coordination --type directive --since 24h --json
 active_directives = [d for d in active_directives if not past(d.tags expires:) and "directive_type:veto" not in d.tags]
 Bash: board-read.sh --channel coordination --type escalation --since 12h --json
@@ -197,22 +198,19 @@ constraint_context = {
 
 ## Step B2: Constraint-Aware Aspiration Generation
 
-**Empty is the designed outcome.** This step asks the generator whether
-anything VERIFIABLE is missing from the portfolio — not to "create work
-because the queue is empty". Every candidate it files is refused by the
+**Empty is the designed outcome.** This step asks whether anything VERIFIABLE is
+missing from the portfolio — never "create work because the queue is empty". The
 daemon's aspiration-supply gate (`core/scripts/gates/aspiration_supply.py`,
-g-357-82/83/87) unless it carries `supply_evidence` with ≥2 existing referents
-and a dated `needle_by`, names an operator outcome as the gap (never a blocker,
-never the empty queue itself), overlaps no existing aspiration by ≥40%, and the
-daily cap (2/agent) is not reached. On a mature portfolio expect empty most of
-the time; that routes to B6.5/B7, the quiet window, cheaper than one
-manufactured aspiration (measured 2026-09-02: eleven idle-path aspirations in
-six days on one deployment). Never pass `--override-supply` from this path.
+g-357-82/83/87) refuses any candidate without `supply_evidence` (≥2 existing
+referents, dated `needle_by`), an operator-outcome gap (never a blocker or the
+empty queue), <40% overlap, and headroom under the daily cap (2/agent). On a
+mature portfolio expect empty most of the time — B6.5/B7's quiet window is
+cheaper than one manufactured aspiration (measured 2026-09-02: eleven idle-path
+aspirations in six days). Never pass `--override-supply` from this path.
 
-**Do not regenerate against an unchanged portfolio.** Generation is the most
-expensive call on the idle path (it pages the full skill and the archive). If
-B2 returned empty and no goal has completed since, the answer is the same —
-skip it and let the backoff run.
+**Do not regenerate against an unchanged portfolio** — generation pages the full
+skill and the archive; if B2 returned empty and no goal has completed since, skip
+it and let the backoff run.
 
 ```
 Bash: wm-read.sh loop_state --json → current
@@ -223,9 +221,9 @@ IF current.b2_empty_at_completed == completed_now AND current.b2_empty_at_comple
 ELSE:
     Output: "▸ Attempting constraint-aware aspiration generation..."
     invoke /create-aspiration from-self --plan with: constraint_context
-    # constraint_context.directives is SCOPE — what the operator/peer put in or out of bounds
-    # for creation — not supply evidence: the gate's bar is unchanged. A candidate that follows
-    # one cites it: origin_signal user_directive:<msg-id> (peer_directive:<msg-id>).
+    # constraint_context.directives is SCOPE (what the operator/peer put in or out of bounds),
+    # not supply evidence — the gate's bar is unchanged. A candidate that follows one cites
+    # origin_signal user_directive:<msg-id> (peer_directive:<msg-id>).
     if new_aspirations_generated:
         blocked_idle_attempts.append("create-aspiration: SUCCESS")
         Output: "▸ Generated new aspirations avoiding blocked resources"

@@ -44,6 +44,10 @@ def test_phase_2_07_still_carries_both_reads_with_different_scopes():
 def test_all_blocked_handler_reads_directives_as_generation_scope():
     text = ALL_BLOCKED.read_text(encoding="utf-8")
     b0 = text[text.index("## Step B0"):text.index("## Step B1")]
+    # The handler acks too (dedup read, same shape) — a digest may route all_blocked here
+    # without paging aspirations-select, and the sender must still be answered.
+    assert "new_directives = board-read.sh --channel coordination " + ACK_READ in b0
+    assert 'acknowledged,{AGENT_NAME}' in b0
     assert "selection_context.active_directives or " + HONOR_READ in b0
     assert '"directive_type:veto" not in d.tags' in b0
     b1 = text[text.index("## Step B1"):text.index("## Step B2")]

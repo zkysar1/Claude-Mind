@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.55",
+    "previous_version": "2.12.54",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "supply gate: source from-self gates regardless of origin string (parent_aspiration bypass — 4 aspirations/12 goals in 6 min past a full cap on a downstream deployment); all-blocked handler acks directives itself (iteration-open routes all_blocked past aspirations-select)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.54",
     "previous_version": "2.12.53",
     "date": "2026-09-03",

@@ -50,7 +50,8 @@ import capture_fast_lane as cfl  # noqa: E402
 bmg = _load("body_merge", "body-merge.py")
 
 AGENT = "testagent"
-CARRIER_DIRNAME = "pending-body-merges"
+CARRIER_DIRNAME = "pending-body-merges"   # the PRE- location
+WORLD_CARRIER_DIRNAME = "body-carriers"   # where the carrier lives now
 
 
 # --------------------------------------------------------------------------
@@ -60,21 +61,38 @@ CARRIER_DIRNAME = "pending-body-merges"
 class DivergingBackend:
     """A store that does NOT mirror the local filesystem.
 
-    Keyed by BASENAME because carriers live flat in one directory (unlike the
-    sessions/ layout, where basenames collide across unit dirs and the sibling
-    fixture must key by parent/name).
+    Keyed by BASENAME WITHIN A DIRECTORY, because carriers live flat in one
+    directory (unlike the sessions/ layout, where basenames collide across unit
+    dirs and the sibling fixture must key by parent/name).
 
-    `write_bytes` records into the same dict, so a producer test can assert the
-    push actually reached the store rather than only the local file.
+    DIRECTORY-AWARE ON PURPOSE. `read_carriers` consults TWO directories now —
+    the world root and the pre-g-306-420 legacy location — so a fake that
+    returned the same listing for ANY path would hand the SAME object to both
+    legs and fabricate a duplicate that no real store can produce. Measured
+    while writing this: three unrelated tests turned red on that artifact alone
+    (`flagged_seen` 2 -> 4), which would have been "fixed" by relaxing their
+    assertions and would have deleted the very counts they exist to pin.
+    `files` is the WORLD carrier dir; `legacy` is
+    `agents/<agent>/session/pending-body-merges`.
+
+    `write_bytes` records into `files`, so a producer test can assert the push
+    actually reached the store rather than only the local file — and a write
+    landing in `legacy` would be a bug, since nothing produces there any more.
     """
 
     def __init__(self, files: dict[str, bytes] | None = None,
-                 fail_reads: bool = False, fail_writes: bool = False):
+                 fail_reads: bool = False, fail_writes: bool = False,
+                 legacy: dict[str, bytes] | None = None):
         self.files = dict(files or {})
+        self.legacy = dict(legacy or {})
         self.fail_reads = fail_reads
         self.fail_writes = fail_writes
         self.listed: list[str] = []
         self.written: list[str] = []
+
+    def _bucket(self, path) -> dict:
+        parent = Path(path).parent.name if Path(path).suffix else Path(path).name
+        return self.legacy if parent == CARRIER_DIRNAME else self.files
 
     def list_dir(self, path):
         p = Path(path)
@@ -83,21 +101,44 @@ class DivergingBackend:
             ".resolve() is load-bearing (a relative path makes _s3_key raise "
             "and the listing degrades silently)")
         self.listed.append(str(p))
-        return sorted(self.files)
+        return sorted(self._bucket(p))
 
     def read_authoritative_bytes(self, path) -> bytes:
         if self.fail_reads:
             raise RuntimeError("simulated transport error")
+        bucket = self._bucket(path)
         name = Path(path).name
-        if name not in self.files:
+        if name not in bucket:
             raise FileNotFoundError(name)
-        return self.files[name]
+        return bucket[name]
 
     def write_bytes(self, path, data):
         if self.fail_writes:
             raise RuntimeError("simulated write failure")
         self.written.append(Path(path).name)
         self.files[Path(path).name] = data
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_world(tmp_path, monkeypatch):
+    """Point the carrier root at a TMP world for every test in this file.
+
+    Load-bearing, not tidiness (g-306-420). The carrier now resolves through
+    `_paths.WORLD_DIR`, so without this fixture a producer test would write its
+    carrier into the LIVE `world/` — and on an own-cloud box that is the
+    guard-955 production-key collision class, from a test that looks hermetic
+    because every path it constructs itself is under tmp_path.
+
+    Patching the module ATTRIBUTE works because `_world_carrier_dir` does its
+    `from _paths import WORLD_DIR` inside the function body; a module-level
+    import there would have frozen the real path at collection time and this
+    fixture would silently do nothing.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
 
 
 def _mk_root(tmp_path: Path) -> Path:
@@ -255,7 +296,7 @@ def test_same_entry_in_both_carrier_and_sessions_wm_merges_once(tmp_path, monkey
     # carrier pass is deleted — measured: it was the one survivor of the
     # consumer mutation. Proving the carrier dir was actually consulted is what
     # makes this a dedup test rather than a sessions/ test wearing its name.
-    assert any(CARRIER_DIRNAME in p for p in be.listed), (
+    assert any(WORLD_CARRIER_DIRNAME in p for p in be.listed), (
         f"carrier dir was never listed; backend saw {be.listed}")
 
 
@@ -402,10 +443,15 @@ def test_record_local_writes_a_carrier_for_a_body_wm(tmp_path):
 
     assert path is not None
     assert path.name == "sid-1-fastlane.jsonl"
-    assert path.parent.name == CARRIER_DIRNAME
-    # session/ (singular) — the syncable dir. Under sessions/ it would be
-    # machine-local and the whole carrier would be as invisible as the WM.
-    assert path.parent.parent.name == "session"
+    # world/body-carriers/<agent>/ (). The old assertion here pinned
+    # `session/` (singular) on the reasoning that it is the SYNCABLE dir. That
+    # reasoning was true and insufficient: syncable is not the same as
+    # writable, and every write under agents/<agent>/ is refused by the
+    # own-cloud claim fence on any box that does not hold the runner claim —
+    # i.e. on every worker Body, which is the only kind of Body that produces
+    # a carrier at all.
+    assert path.parent.name == AGENT
+    assert path.parent.parent.name == WORLD_CARRIER_DIRNAME
     rec = json.loads(path.read_text(encoding="utf-8").strip())
     assert rec == {"unit_key": "sid-1", "slot": "spark_capture", "entry": entry}
 
@@ -419,7 +465,7 @@ def test_record_local_refuses_the_agent_wide_wm(tmp_path):
     agent_wm = root / "agents" / AGENT / "session" / "working-memory.yaml"
 
     assert bcc.record_local(agent_wm, "spark_capture", _entry("g-8")) is None
-    assert not (root / "agents" / AGENT / "session" / CARRIER_DIRNAME).exists()
+    assert not (root / "world" / WORLD_CARRIER_DIRNAME / AGENT).exists()
 
     # PAIRED POSITIVE — assert-absence alone would also pass if record_local
     # were broken for EVERY path, so pin the discriminator in both directions
@@ -519,12 +565,15 @@ def test_push_failure_is_reported_once_and_still_never_raises(tmp_path, monkeypa
     g-306-420: this except discarded the cause entirely, so a transport that
     could not work AT ALL looked identical to one with nothing to send —
     measured on cc-08, a worker Body's carrier held 101 undelivered rows behind
-    a quiet False, because the carrier's destination is inside the
-    claim-protected agent tree and a worker never holds the runner claim.
+    a quiet False, because the carrier's destination was then inside the
+    claim-protected agent tree and a worker never holds the runner claim. (The
+    same change moved it to world/body-carriers/<agent>/, so that particular
+    always-fails condition is gone; the reporting requirement is not, because a
+    push can still fail for transport reasons and the caller sees only a bool.)
 
-    ONCE, not per-call, is the half worth pinning: on a non-reducer box every
-    push fails, so a per-call report would be noise that the first reader
-    filters out — which is how a loud failure becomes a dark one again.
+    ONCE, not per-call, is the half worth pinning: a systematically dark carrier
+    fails on EVERY append, so a per-call report would be noise that the first
+    reader filters out — which is how a loud failure becomes a dark one again.
 
     The module flag is process-global and pytest shares a process, so it is
     reset explicitly here. Without the reset this test passes or fails on
@@ -670,3 +719,181 @@ def test_carrier_only_lane_still_reports_that_the_share_is_unmeasurable(
     # The pre-fix behaviour was total silence about the share. Pin that it
     # cannot return: a line with no share clause at all is the regression.
     assert "load-bearing share" in line, line
+
+
+# --------------------------------------------------------------------------
+#  — the carrier lives under world/, NOT under the agent tree
+# --------------------------------------------------------------------------
+
+def test_carrier_is_not_under_the_agent_tree(tmp_path, _hermetic_world):
+    """THE DEFECT PIN.
+
+    Every other location assertion in this file would pass against the pre-fix
+    source too, because they only ever check that producer and consumer AGREE —
+    and they agreed perfectly while both pointed at a path no worker could write.
+    This one does not agree-check: pre-fix, `carrier_dir` returned
+    `<agent_dir>/session/pending-body-merges`, inside the own-cloud claim fence,
+    so `push()` raised NoClaimError on every non-reducer box, forever. This
+    assertion is the one that FAILS against the pre-fix source, which is what
+    makes the rest of this file's location assertions more than a restatement of
+    whatever the code currently does (rb-9217).
+    """
+    agent_dir = tmp_path / "agents" / AGENT
+    cdir = bcc.carrier_dir(agent_dir)
+
+    assert agent_dir not in cdir.parents, (
+        f"carrier resolved INSIDE the claim-fenced agent tree: {cdir}")
+    assert CARRIER_DIRNAME not in cdir.parts, (
+        f"carrier still at the pre-g-306-420 location: {cdir}")
+    assert cdir == _hermetic_world / WORLD_CARRIER_DIRNAME / AGENT
+
+
+def test_producer_and_consumer_resolve_the_same_carrier_dir(tmp_path):
+    """guard-3408, both ends: the producer emits a path the consumer must find.
+
+    Asserted as a ROUND TRIP, not by comparing two path expressions. The
+    consumer derives its directory inline from `state_dir`, so a path-equality
+    check would only restate the code; a write-then-read proves DELIVERY, which
+    is the property that was actually broken.
+    """
+    agent_dir = tmp_path / "agents" / AGENT
+    unit = "unit-abc"
+    wm_path = agent_dir / "sessions" / unit / "working-memory.yaml"
+
+    written = bcc.record_local(wm_path, "spark_capture", {"observation": "x"})
+    assert written is not None, "producer refused to write a carrier line"
+    assert written == bcc.carrier_path(agent_dir, unit)
+
+    got = bcc.read_carriers(agent_dir / "session", backend=None)
+    assert got == {unit: {"spark_capture": [{"observation": "x"}]}}
+
+
+def test_world_dir_is_injectable_so_a_carrier_never_escapes_to_the_live_world(
+        tmp_path, _hermetic_world):
+    """`world_dir` is a correctness fence, not a test convenience.
+
+    Without it every caller falls through to the REAL world root, so a hermetic
+    test building a tmp agent tree would still write its carrier into the LIVE
+    `world/` — under own-cloud that is the guard-955 / rb-2983 production-key
+    collision class, which has truncated a live store before.
+    """
+    agent_dir = tmp_path / "agents" / AGENT
+    elsewhere = tmp_path / "another-world"
+    unit = "unit-xyz"
+    wm_path = agent_dir / "sessions" / unit / "working-memory.yaml"
+
+    written = bcc.record_local(wm_path, "spark_capture", {"observation": "y"},
+                               world_dir=elsewhere)
+    assert written == (elsewhere / WORLD_CARRIER_DIRNAME / AGENT
+                       / f"{unit}{bcc.CARRIER_SUFFIX}")
+    assert written.is_file()
+    # the INJECTED root is the only one touched — the ambient world stays clean
+    assert not (_hermetic_world / WORLD_CARRIER_DIRNAME).exists()
+
+    got = bcc.read_carriers(agent_dir / "session", backend=None,
+                            world_dir=elsewhere)
+    assert got == {unit: {"spark_capture": [{"observation": "y"}]}}
+
+
+# --------------------------------------------------------------------------
+# THE TRANSITION READ ( /  follow-up)
+# --------------------------------------------------------------------------
+
+def test_a_carrier_pushed_before_the_move_is_still_read(tmp_path, monkeypatch):
+    """THE DEFECT PIN. Moving the carrier to `world/` must not strand carriers
+    that were already pushed to the OLD location.
+
+    Not hypothetical. Measured against the authoritative store from cc-09 on
+    2026-09-03: `agents/alpha/session/pending-body-merges/` holds FOUR carriers
+    (3,718,867 B, 1,632 flagged entries), newest store write
+    2026-08-27T16:59:39Z, and ZERO staged `<unit>-wm.yaml` beside them — so the
+    close-time `generalize_down` merge, the fallback the omission relied on, has
+    nothing to merge for those Bodies. The carrier is their only surviving copy.
+
+    Store leg, not the local one: a remote Body's carrier exists ONLY in the
+    store, which is the case this whole module was built for.
+    """
+    root = _mk_root(tmp_path)
+    be = DivergingBackend(legacy={
+        "old-body-fastlane.jsonl": _carrier_bytes(
+            "old-body", [("spark_capture", _entry("g-legacy"))]),
+    })
+    monkeypatch.setattr(bmg, "_get_backend", lambda: be)
+
+    summary = cfl.fast_lane(AGENT, project_root=root)
+
+    assert summary["carrier_merged"] == 1, summary
+    assert [e["goal_id"] for e in _reducer_slots(root)["spark_capture"]] == ["g-legacy"]
+    # REACHABILITY CONTROL — prove the legacy DIRECTORY was the one consulted,
+    # so this cannot pass by the world leg happening to hold the same object.
+    assert any(Path(p).name == CARRIER_DIRNAME for p in be.listed), (
+        f"legacy carrier dir was never listed; backend saw {be.listed}")
+
+
+def test_both_carrier_locations_union_for_one_body(tmp_path, monkeypatch):
+    """A Body that pushed BEFORE the move and appended AFTER it has entries in
+    both places, and BOTH must arrive.
+
+    The consumer accumulates into `out[unit][slot]`, so a second directory that
+    REPLACED rather than extended that list would silently drop whichever leg
+    ran first — invisible in the single-directory tests, and the reason this
+    asserts on one unit key present in both dirs rather than two separate ones.
+    """
+    root = _mk_root(tmp_path)
+    unit = "straddling-body"
+    be = DivergingBackend(
+        files={f"{unit}-fastlane.jsonl": _carrier_bytes(
+            unit, [("spark_capture", _entry("g-after"))])},
+        legacy={f"{unit}-fastlane.jsonl": _carrier_bytes(
+            unit, [("spark_capture", _entry("g-before"))])},
+    )
+    monkeypatch.setattr(bmg, "_get_backend", lambda: be)
+
+    got = bcc.read_carriers(root / "agents" / AGENT / "session", backend=be)
+
+    assert sorted(e["goal_id"] for e in got[unit]["spark_capture"]) == \
+        ["g-after", "g-before"], got
+
+
+def test_the_same_entry_in_both_locations_merges_once(tmp_path, monkeypatch):
+    """The hazard the omission cited — "a real double-append when one Body has
+    entries in both" — does not exist, and this is the control that says so.
+
+    `body-merge._dedup_append` does `seen.add(h)` INSIDE its own loop, so the
+    same entry arriving twice within ONE call is dropped on the second sighting;
+    the g-306-311 `capture_consumed_hashes` watermark covers the across-call
+    case. Pinned rather than argued, because the argument was the thing that
+    turned out to be wrong.
+    """
+    root = _mk_root(tmp_path)
+    unit = "duplicated-body"
+    entry = _entry("g-dup")
+    payload = _carrier_bytes(unit, [("spark_capture", entry)])
+    be = DivergingBackend(files={f"{unit}-fastlane.jsonl": payload},
+                          legacy={f"{unit}-fastlane.jsonl": payload})
+    monkeypatch.setattr(bmg, "_get_backend", lambda: be)
+
+    summary = cfl.fast_lane(AGENT, project_root=root)
+
+    assert len(_reducer_slots(root)["spark_capture"]) == 1, _reducer_slots(root)
+    assert summary["carrier_bodies"] == 1, summary
+
+
+def test_nothing_is_ever_written_to_the_legacy_location(tmp_path):
+    """The transition read is ONE-DIRECTIONAL, so the legacy directory drains
+    and never refills.
+
+    The producer must keep resolving to `world/`: a write here would be refused
+    by the own-cloud claim fence on every worker box anyway (`NoClaimError`,
+    which is what stranded those 3.7 MB in the first place), and would re-arm
+    the exact defect g-306-420 removed.
+    """
+    agent_dir = tmp_path / "agents" / AGENT
+    unit = "unit-legacy-write"
+    wm_path = agent_dir / "sessions" / unit / "working-memory.yaml"
+
+    written = bcc.record_local(wm_path, "spark_capture", {"observation": "z"})
+
+    assert written is not None
+    assert CARRIER_DIRNAME not in written.parts, written
+    assert not (agent_dir / "session" / CARRIER_DIRNAME).exists()

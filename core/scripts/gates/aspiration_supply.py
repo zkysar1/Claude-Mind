@@ -108,7 +108,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "self_gap",
         "strategic_scan",
         "gap_analysis",
+        "parent_aspiration",
     ],
+    # The origin_signal is LLM-authored text and every unlisted spelling is a
+    # bypass: measured 2026-09-03, the from-self idle path stamped
+    # `parent_aspiration:` (a successor of a flash-archived record) and
+    # the gate logged `gated: False` — no needle, gap, overlap or daily-cap check
+    # ran, and a third self-generated aspiration landed past a cap of two. The
+    # `source` field is set by the create-aspiration MODE, not composed per
+    # record, so it gates regardless of what the origin string says.
+    "gated_sources": ["from-self"],
     "overlap_threshold": 0.40,
     # An overlap refusal also needs this many SHARED tokens: a six-word
     # candidate reaches 40% on three incidental words, which is noise. The
@@ -472,18 +481,27 @@ def origin_is_self_generated(origin: Any, cfg: Dict[str, Any]) -> bool:
     return any(p and p in o for p in patterns)
 
 
+def source_is_self_generated(source: Any, cfg: Dict[str, Any]) -> bool:
+    """True when the record's `source` names a self-generated create-aspiration mode."""
+    s = str(source or "").strip().lower()
+    return bool(s) and s in {str(x).lower() for x in (cfg.get("gated_sources") or [])}
+
+
 def is_gated(asp: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, Any]:
     origin = str(asp.get("origin_signal") or "").strip()
     motivation = str(asp.get("motivation") or "")
     by_origin = origin_is_self_generated(origin, cfg)
+    by_source = source_is_self_generated(asp.get("source"), cfg)
     successor = bool(_SUCCESSOR_RE.match(motivation))
     misattributed = successor and not by_origin and origin.startswith("user_directive")
     return {
-        "gated": by_origin or successor,
+        "gated": by_origin or by_source or successor,
         "by_origin": by_origin,
+        "by_source": by_source,
         "successor_shaped": successor,
         "origin_misattributed": misattributed,
         "origin_signal": origin or None,
+        "source": str(asp.get("source") or "") or None,
     }
 
 
