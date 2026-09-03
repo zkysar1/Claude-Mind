@@ -642,11 +642,15 @@ def test_byte_compat_set_top_level(tmp_path):
 # 100% load_bearing, so THIS test exercises the FLAGGED branch — the
 # CONDITIONALLY recoverable one: a flagged entry is mirrored to the Body's
 # carrier at append time, which makes delivery possible but does not effect it.
-# The carrier still has to PUSH, and on a non-reducer Body that push fails
-# structurally — the destination is inside the claim-protected agent tree and a
-# worker never holds the runner claim (; measured 101 undelivered rows
-# on one worker box). So "flagged" reads as recoverable ON A REDUCER and as an
-# equal loss on a worker whose carrier is dark. The unflagged branch is
+# The carrier still has to PUSH. That push USED to fail structurally on a
+# non-reducer Body — the destination sat inside the claim-protected agent tree
+# and a worker never holds the runner claim (measured: 101 undelivered rows on
+# one worker box).  moved the carrier to world/body-carriers/<agent>/,
+# which is claim-EXEMPT, so a worker push now works (verified from a worker Body
+# 2026-09-03). The DEPENDENCY this test pins is unchanged and is why the
+# assertions below still stand: carrier-backing is a PRECONDITION, not a
+# guarantee — a transport failure still leaves the entry undelivered, and the
+# wrapper cannot observe delivery either way. The unflagged branch is
 # unrecoverable everywhere (the WM slot is that entry's only copy).
 #
 # known_blockers (array_limits 10) is used rather than a capture lane: the
@@ -726,10 +730,13 @@ def test_wrapper_surfaces_eviction_on_stderr(running_daemon):
 
     # : the SECOND false claim in this notice, and the same shape as
     # the one above — an unobservable guarantee stated as fact. Naming the
-    # FLAGGED branch "recoverable" is only true where the carrier can PUSH, and
-    # on a non-reducer Body it cannot (claim-protected destination). The notice
-    # must state that dependency and hand the reader the tell, or a worker Body
-    # reads "carrier-backed" and treats an unrecoverable loss as safe.
+    # FLAGGED branch "recoverable" is only true where the carrier can PUSH. When
+    # this was written a non-reducer Body structurally could not (claim-protected
+    # destination); since the carrier moved to world/ it can, and these two
+    # assertions are UNCHANGED by that, deliberately — the wrapper still cannot
+    # observe delivery, so stating it remains a claim beyond what its path saw.
+    # The notice must state the dependency and hand the reader the tell, or a
+    # worker Body reads "carrier-backed" and treats a loss as safe.
     assert "so it still reaches the reducer" not in proc.stderr, (
         "regressed to asserting delivery the wrapper cannot observe; "
         f"carrier-backing is a precondition, not a guarantee: {proc.stderr!r}")

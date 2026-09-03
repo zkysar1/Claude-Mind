@@ -13,11 +13,33 @@ one unit key — not this one — while the Body held 107 flagged entries. So th
 lane could only ever see Bodies on the reducer's own box, which is precisely the
 case it was NOT built for.
 
-THE ASYMMETRY THIS EXPLOITS. `sessions` (plural, per-Body) is sync-excluded;
-`session` (singular, agent-wide) is NOT. Verified the same day, with the
-syncable `session/body-heartbeat-<SID>.json` carrier as the positive control
-(`_machine_local=False`). So a `session/`-rooted file reaches the store from any
-box, using the transport that already exists.
+THE ASYMMETRY THIS ORIGINALLY EXPLOITED, AND WHY IT WAS NOT ENOUGH. `sessions`
+(plural, per-Body) is sync-excluded; `session` (singular, agent-wide) is NOT, so
+the carrier was first rooted at `agents/<agent>/session/pending-body-merges/`.
+That reasoning was correct about SYNC and blind to a SECOND, independent guard:
+the own-cloud claim fence refuses EVERY write under `agents/<agent>/` from a box
+that does not hold the live runner claim, and a worker Body never holds it. The
+destination was therefore syncable in principle and unwritable in practice, and
+`push()` raised `NoClaimError` on every append from every non-reducer box.
+
+** THE POSITIVE CONTROL THIS DOCSTRING USED TO CITE IS FALSE — do not restore
+it. ** It read: "verified with the syncable `session/body-heartbeat-<SID>.json`
+carrier as the positive control (`_machine_local=False`), so a `session/`-rooted
+file reaches the store from any box." `_machine_local=False` is true and proves
+only that SYNC would not prune it; it says nothing about the claim fence, which
+is the guard that actually decides. Measured on cc-09 (alpha worker Body, SID
+2fda1f3e, `uname -r` 6.8.0-138-generic, own-cloud, 2026-09-03): that heartbeat
+carrier is 148 bytes locally and its S3 key is ABSENT
+(`read_authoritative_bytes` -> FileNotFoundError), exactly like the fastlane
+carrier's 151,390 bytes beside it. The cited control was itself stranded. A
+`_machine_local` check is not a delivery check; only an authoritative read is.
+(That heartbeat lane is a SEPARATE defect from this one — it belongs to the
+worker-liveness carrier, not to captures — and is relayed rather than fixed
+here.)
+
+WHERE IT LIVES NOW: `world/body-carriers/<agent>/` — see `carrier_dir` for the
+deadlock that leaves `world/` as the only location which is both syncable and
+worker-writable.
 
 WHY NOT SIMPLY SYNC sessions/. Rejected twice (g-306-119-b, g-115-6240): it puts
 a second copy of the same bytes in the store and breaks the per-box closure
@@ -104,16 +126,88 @@ def split_body_wm_path(wm_path):
         return None, None
 
 
-def carrier_dir(agent_dir) -> Path:
-    bm = _bm()
-    return Path(agent_dir) / bm._STATE_DIRNAME / bm._STAGED_DIRNAME
+# The carrier lives under `world/`, NOT under the agent tree ().
+# `body-carriers` is a deliberate basename: `owncloud_sync._EXCLUDE_DIRS`
+# walk-prunes `sessions`, `.history`, `presence` et al., so a dir named for one
+# of those would be silently unsyncable — the same trap init-world.sh already
+# records for `telemetry/session-records`.
+_WORLD_CARRIER_DIRNAME = "body-carriers"
+
+# The PRE- location, kept READ-ONLY for the transition (see
+# `read_carriers`). Deliberately the same literal `body-merge._STAGED_DIRNAME`
+# uses, because it is the same directory — the staged `<unit>-wm.yaml` files and
+# the old `<unit>-fastlane.jsonl` carriers were co-tenants there.
+_LEGACY_CARRIER_DIRNAME = "pending-body-merges"
 
 
-def carrier_path(agent_dir, unit_key) -> Path:
-    return carrier_dir(agent_dir) / f"{unit_key}{CARRIER_SUFFIX}"
+def _legacy_carrier_dir(state_dir) -> Path:
+    """`agents/<agent>/session/pending-body-merges` — READ ONLY, never written.
+
+    Nothing produces here any more; `carrier_dir` resolves to `world/` and the
+    claim fence refuses a worker write here regardless. This exists so carriers
+    that WERE pushed before the move stay reachable by the consumer.
+    """
+    return Path(state_dir) / _LEGACY_CARRIER_DIRNAME
 
 
-def record_local(wm_path, slot: str, item) -> Path | None:
+def _world_carrier_dir(agent_name: str, world_dir=None) -> Path:
+    """`world/body-carriers/<agent>` — the ONE resolver both sides call.
+
+    `world_dir` is INJECTABLE and defaults to the lazy `_paths` lookup, matching
+    `storage_backend.py`'s own `from _paths import META_DIR, WORLD_DIR` inside a
+    function. Lazy rather than module-level because this module is loaded BY THE
+    DAEMON (`mind_api/src/endpoints/wm_write.py` imports it by file path) and
+    `path-resolution.md` forbids a daemon path resolving through a constant
+    captured at import time.
+
+    THE PARAMETER IS NOT A TEST CONVENIENCE — it is a correctness fence. Without
+    it every caller falls through to the REAL world root, so a hermetic test
+    that builds a tmp agent tree would still write its carrier into the live
+    `world/`, and under own-cloud that is the guard-955 production-key collision
+    class. Callers that own a resolved world path (the daemon's
+    `ctx.paths.world`, a test's tmp root) should pass it.
+    """
+    if world_dir is None:
+        from _paths import WORLD_DIR
+        world_dir = WORLD_DIR
+    return Path(world_dir) / _WORLD_CARRIER_DIRNAME / agent_name
+
+
+def carrier_dir(agent_dir, world_dir=None) -> Path:
+    """PRODUCER side. Derived from the agent NAME, not the agent PATH.
+
+    WHY THIS MOVED OUT OF THE AGENT TREE (g-306-420, measured cc-08 then
+    reproduced cc-09 2026-09-03). The original destination was
+    `agents/<agent>/session/pending-body-merges/`, chosen because `session`
+    (singular) is NOT in `owncloud_sync._EXCLUDE_DIRS` while `sessions` (plural)
+    is — so it solved the SYNC problem. It ran straight into a SECOND, entirely
+    separate guard: every write under `agents/<agent>/` is refused by the
+    own-cloud claim fence unless this box holds the live runner claim, and a
+    worker Body by definition never does. `push()` therefore raised
+    `NoClaimError` on every append from every non-reducer box, forever.
+
+    The two in-tree candidates DEADLOCK, which is why no path under
+    `agents/<agent>/` can work:
+      - `session/`  (singular) — syncable, but CLAIM-FENCED.
+      - `sessions/` (plural)   — claim-EXEMPT, but sync-excluded (machine-local).
+    Neither is both. `world/` is both: it is the store root, and worker writes
+    to it are accepted (this session's own goal-record and board writes land
+    from a worker box).
+
+    Measured on cc-09 (alpha worker Body, SID 2fda1f3e, 6.8.0-138-generic,
+    own-cloud) before the move: the local carrier held 151,390 bytes and
+    `read_authoritative_bytes` reported the S3 key ABSENT. The same probe at the
+    world-rooted destination wrote and read back byte-identical, with the key
+    confirmed absent immediately beforehand.
+    """
+    return _world_carrier_dir(Path(agent_dir).name, world_dir)
+
+
+def carrier_path(agent_dir, unit_key, world_dir=None) -> Path:
+    return carrier_dir(agent_dir, world_dir) / f"{unit_key}{CARRIER_SUFFIX}"
+
+
+def record_local(wm_path, slot: str, item, world_dir=None) -> Path | None:
     """Append one flagged capture to this Body's carrier. Returns the carrier
     path when a line was written, else None.
 
@@ -132,7 +226,7 @@ def record_local(wm_path, slot: str, item) -> Path | None:
     if agent_dir is None:
         return None  # agent-wide WM (the reducer's own) — no carrier needed
     try:
-        path = carrier_path(agent_dir, unit_key)
+        path = carrier_path(agent_dir, unit_key, world_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps({"unit_key": unit_key, "slot": slot, "entry": item},
                           sort_keys=True)
@@ -225,7 +319,7 @@ def _iter_carrier_names(cdir: Path, backend) -> list:
     return sorted(names)
 
 
-def read_carriers(state_dir, backend) -> dict:
+def read_carriers(state_dir, backend, world_dir=None) -> dict:
     """{unit_key: {slot: [entry, ...]}} across every Body's carrier.
 
     Reads authoritative-first per file (`body-merge._read_staged_bytes`), so a
@@ -239,7 +333,62 @@ def read_carriers(state_dir, backend) -> dict:
     out: dict = {}
     try:
         bm = _bm()
-        cdir = Path(state_dir) / bm._STAGED_DIRNAME
+        # ONE directory, resolved by the SAME function the producer calls
+        # (). These two sides used to derive the same path by two
+        # DIFFERENT expressions — `agent_dir/state/staged` in the producer,
+        # `state_dir/staged` here — which is exactly the producer/consumer
+        # path-drift class guard-3408 names. They now share
+        # `_world_carrier_dir`, keyed on the agent NAME, so they cannot drift.
+        #
+        # `state_dir` is `agents/<agent>/session`, so its parent IS the agent
+        # dir; deriving the name from it keeps this signature unchanged for
+        # capture_fast_lane.py, the only caller.
+        #
+        # TRANSITION READ of the pre-move `agents/<agent>/session/
+        # pending-body-merges/` location, in ADDITION to the world root.
+        #
+        # This block first said the legacy read was omitted "deliberately", on
+        # two premises. MEASURED FROM cc-09 AGAINST THE AUTHORITATIVE STORE the
+        # same day (alpha worker Body, SID 2fda1f3e, `uname -r`
+        # 6.8.0-138-generic, own-cloud), BOTH ARE FALSE:
+        #
+        #  (1) "Only a Body on the REDUCER'S OWN box ever landed a carrier
+        #      there." The store holds FOUR legacy carriers for alpha —
+        #      1dc6fc35 (713,285 B), 9a35daca (669,705 B), cd5fd3b9 (784,595 B),
+        #      d1aec55b (1,551,282 B) = 3,718,867 B / 1,632 flagged entries —
+        #      and 9a35daca is the cc-08 Body whose close logged
+        #      `result=marked-push-failed` on 2026-09-01. Newest store write
+        #      2026-08-27T16:59:39Z, independently reproducing 's
+        #      "frozen since 08-27" from a different box. (WHY those pushes
+        #      succeeded and later ones did not is NOT established here; the
+        #      claim would have to be read off the runner-claim history.)
+        #
+        #  (2) "a real double-append hazard when one Body has entries in both."
+        #      There is none. Every consumer path runs through
+        #      `capture_fast_lane._merge_flagged`, which dedups by CONTENT HASH
+        #      via `body-merge._dedup_append(existing, flagged, extra_seen=prior)`
+        #      — and `_dedup_append` does `seen.add(h)` inside its own loop, so
+        #      the SAME entry arriving from both directories in ONE call is
+        #      dropped on the second sighting. The  consumed-watermark
+        #      (`capture_consumed_hashes`) covers the across-call case.
+        #
+        # The load-bearing half was the fallback claim — that those entries are
+        # "still delivered by the close-time `generalize_down` full merge". That
+        # merge needs a staged `<unit>-wm.yaml`; the store holds ZERO of them
+        # (4 objects in the legacy dir, all `-fastlane.jsonl`), and 9a35daca's
+        # session dir was reaped by the stale-binding sweep. So for those Bodies
+        # the carrier is the ONLY surviving copy, and dropping the read would
+        # strand it permanently rather than merely lose acceleration.
+        #
+        # Cost is one extra listing per call — `read_carriers` runs at
+        # generalize_down, not per unit. The read is one-directional: nothing
+        # writes here any more, so the directory drains and never refills, and
+        # the listing goes empty on its own.
+        state_dir_p = Path(state_dir)
+        cdirs = [
+            _world_carrier_dir(state_dir_p.parent.name, world_dir),
+            _legacy_carrier_dir(state_dir_p),
+        ]
     except Exception:  # noqa: BLE001
         return out
 
@@ -254,13 +403,14 @@ def read_carriers(state_dir, backend) -> dict:
         except Exception:  # noqa: BLE001
             return out
 
-    for name in _iter_carrier_names(cdir, backend):
+    for cdir, name in [(d, n) for d in cdirs
+                       for n in _iter_carrier_names(d, backend)]:
         raw, transient = bmg._read_staged_bytes(backend, cdir / name)
         if transient or raw is None:
-            # transient: the store hid it AND there is no local copy. Skipping
-            # is correct — an empty read here would look like "this Body has
-            # nothing flagged", which is the false-negative this whole file is
-            # about.
+            # transient: the store hid it AND there is no local copy.
+            # Skipping is correct — an empty read here would look like
+            # "this Body has nothing flagged", which is the false-negative
+            # this whole file is about.
             continue
         try:
             text = raw.decode("utf-8", errors="replace")

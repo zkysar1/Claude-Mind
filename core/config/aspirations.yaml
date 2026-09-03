@@ -2009,6 +2009,12 @@ idle_supply:
     - self_gap
     - strategic_scan
     - gap_analysis
+    - parent_aspiration      # the GOAL-side origin form copied onto an aspiration (asp-028, 2026-09-03) — a spawn of another aspiration is self-generated
+  # `source` values that mark the self-generated create-aspiration MODE. Gates regardless of the
+  # origin string: origin_signal is LLM-authored and every unlisted spelling is a bypass (measured
+  # 2026-09-03 — `parent_aspiration:asp-025` logged gated:false and a third record passed the cap).
+  gated_sources:
+    - from-self
   overlap_threshold: 0.40      # fraction of the candidate's distinctive tokens already in one existing aspiration
   min_shared_tokens: 4         # an overlap refusal needs at least this many shared tokens (tiny candidates inflate the ratio)
   min_checked_referents: 2     # supply_evidence.checked entries that must EXIST (ids, tree keys, paths)

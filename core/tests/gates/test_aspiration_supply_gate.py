@@ -439,6 +439,29 @@ def test_gating_matches_every_spelling_of_the_idle_lane():
     assert g["gated"] and g["successor_shaped"] and g["origin_misattributed"]
 
 
+def test_from_self_source_is_gated_whatever_the_origin_string_says():
+    """Measured 2026-09-03: the idle path stamped the GOAL-side origin form
+    `parent_aspiration:asp-025` on an aspiration, the substring list had no such
+    entry, and the gate logged gated:false — no needle/gap/overlap/cap check ran
+    and a third self-generated record landed past a cap of two. `source` is set
+    by the create-aspiration MODE, not composed per record, so it gates alone."""
+    novel = {"origin_signal": "parent_aspiration:asp-025", "motivation": "Build an injury impact analysis framework."}
+    g = is_gated(dict(novel, source="from-self"), DEFAULT_CONFIG)
+    assert g["gated"] and g["by_origin"] and g["by_source"]          # both catch it now
+    g = is_gated({"origin_signal": "mystery-lane:xyz", "motivation": "x", "source": "From-Self"}, DEFAULT_CONFIG)
+    assert g["gated"] and g["by_source"] and not g["by_origin"]      # source alone suffices, case-insensitive
+    g = is_gated({"origin_signal": "mystery-lane:xyz", "motivation": "x", "source": "from-user"}, DEFAULT_CONFIG)
+    assert not g["gated"] and not g["by_source"]                     # a user-directed mode is untouched
+    # and the whole evaluate() path runs the checks for it — no more noop firing
+    r = _eval({
+        "title": "Injury Impact Analysis Framework",
+        "motivation": "Build a framework for injury impact analysis on public data.",
+        "origin_signal": "parent_aspiration:asp-025", "source": "from-self",
+        "goals": [{"title": "Survey public injury data sources"}]}, PORTFOLIO)
+    assert r["gated"] is True and r["would_block"] is True
+    assert "supply_evidence_missing" in {f["check"] for f in r["failures"]}
+
+
 def test_tokenizer_and_containment_are_symmetric_on_stems():
     a = tokens("Player evaluation frameworks and matchup templates")
     b = tokens("player evaluation framework; matchup template")

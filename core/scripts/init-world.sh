@@ -133,13 +133,22 @@ seed_needed() {
 # also creates it lazily, so this is belt-and-suspenders (and documents intent).
 # NOT "telemetry/sessions" — owncloud_sync.py _EXCLUDE_DIRS walk-prunes the
 # "sessions" basename, which would block the S3 sweep (rb 2026-06-03).
+# body-carriers/<agent>/<unitKey>-fastlane.jsonl — the load-bearing-capture
+# carrier from every worker Body (core/scripts/body_capture_carrier.py). It
+# lives HERE, not under agents/<agent>/, because the own-cloud claim fence
+# refuses every write into the agent tree from a box that does not hold the
+# runner claim — which is every worker Body, always (). The writer
+# creates it lazily too; this line makes it a first-class world dir and
+# documents the intent. NOT a "sessions"-flavoured basename, for the same
+# _EXCLUDE_DIRS reason recorded just above for telemetry/session-records.
 mkdir -p \
     "$WORLD/conventions" \
     "$WORLD/config" \
     "$WORLD/knowledge/tree" \
     "$WORLD/knowledge/patterns" \
     "$WORLD/knowledge/strategies" \
-    "$WORLD/telemetry/session-records"
+    "$WORLD/telemetry/session-records" \
+    "$WORLD/body-carriers"
 
 echo "  Created directory structure"
 

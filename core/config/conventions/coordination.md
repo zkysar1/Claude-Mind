@@ -524,7 +524,7 @@ assuming a directive reached the Body you meant it for.
 | # | Step | Who runs it | Body scope |
 |---|---|---|---|
 | 1 | **Post**: Sender posts directive to coordination channel with relevant tags | sender | any Body |
-| 2 | **Scan**: Receiver's Phase 2.07 (Directive Scan) reads directives since last scan — and, since g-357-94, the all_blocked early-return branch runs the same ACK read before returning | `aspirations-select` | **REDUCER ONLY** |
+| 2 | **Scan**: Receiver's Phase 2.07 (Directive Scan) reads directives since last scan — and, since g-357-94, the all_blocked early-return branch runs the same ACK read before returning; the all-blocked handler's B0 runs it too, because `iteration-open.py` routes an all_blocked selector verdict straight to `Skill(aspirations-all-blocked)` without paging this skill (the dedup receipt makes a double ack impossible) | `aspirations-select` / `aspirations-all-blocked` B0 | **REDUCER ONLY** |
 | 3 | **Score**: `goal-selector.py` reads active directives, applies `directive_boost` as a weighted scoring criterion to matching goals/categories | `goal-selector.py` | **EVERY Body** |
 | 4 | **Acknowledge**: Receiver posts `--type status --reply-to <directive-id>` with tag `acknowledged,<agent-name>` | `aspirations-select` | **REDUCER ONLY** |
 | 5 | **Expire**: Directives auto-expire per their `expires` tag, or `scope: session` directives expire at session end | mechanical | n/a |

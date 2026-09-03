@@ -1242,10 +1242,14 @@ def cmd_append(args):
             update_modified(data, args.slot)
 
         write_wm(data)
-        # : mirror a LOAD-BEARING capture into this Body's
-        # session/-rooted carrier so capture_fast_lane can reach it from ANOTHER
-        # box (sessions/ is sync-excluded and machine-local, so the lane could
-        # otherwise only ever see same-box Bodies). Local append INSIDE the lock
+        # : mirror a LOAD-BEARING capture into this Body's carrier so
+        # capture_fast_lane can reach it from ANOTHER box (sessions/ is
+        # sync-excluded and machine-local, so the lane could otherwise only ever
+        # see same-box Bodies). WORLD-rooted since  — the
+        # session/-rooted destination this comment used to name was inside the
+        # own-cloud claim fence. No `world_dir` here on purpose: this is the CLI
+        # path, where the `_paths` lookup IS the sanctioned resolution; the
+        # daemon twin must pass ctx.paths.world. Local append INSIDE the lock
         # so carrier order matches WM order. TWIN of the daemon copy in
         # wm_write.py::append_slot — the DAEMON one is the LIVE path
         # (wrappers are daemon-only); this exists for parity, same as the

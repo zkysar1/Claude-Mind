@@ -1050,10 +1050,15 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 _update_modified(data, slot)
             _write_wm(_wm_path(ctx), data)
             # : mirror a LOAD-BEARING capture into this Body's
-            # session/-rooted carrier so capture_fast_lane can see it from
-            # ANOTHER box. sessions/ is sync-excluded and machine-local, so
-            # without this the lane can only ever reach same-box Bodies — the
-            # one case it was not built for. TWIN of core/scripts/wm.py
+            # carrier so capture_fast_lane can see it from ANOTHER box.
+            # sessions/ is sync-excluded and machine-local, so without this the
+            # lane can only ever reach same-box Bodies — the one case it was not
+            # built for. The carrier is WORLD-rooted since  (the
+            # session/-rooted destination this comment used to name was inside
+            # the own-cloud claim fence, so every non-reducer push raised
+            # NoClaimError); `world_dir` is passed from the request context
+            # because path-resolution.md forbids a daemon path resolving through
+            # a module-level constant. TWIN of core/scripts/wm.py
             # cmd_append; this daemon copy is the LIVE path (wm-append.sh is
             # daemon-routed, so the wm.py edit alone is inert: guard-742).
             # Local append only, INSIDE the lock so carrier order matches WM
@@ -1063,7 +1068,8 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 _cm = _carrier_mod(ctx)
                 if _cm is not None:
                     _carrier_path = _cm.record_local(
-                        _wm_path(ctx), root_slot_for_validation, item)
+                        _wm_path(ctx), root_slot_for_validation, item,
+                        world_dir=ctx.paths.world)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 
