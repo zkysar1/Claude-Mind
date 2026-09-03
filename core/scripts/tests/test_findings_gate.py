@@ -223,3 +223,116 @@ def test_child_goal_still_carries_its_provenance_fields():
     assert goal["priority"] == "HIGH"
     assert "Discovered by: Step 8.5 Actionable Findings Gate" in goal["description"]
     json.dumps(goal)  # must stay serialisable for aspirations-add-goal.sh stdin
+
+
+# --------------------------------------------------------------------------
+# deferred_idea — the idea-capture lane ()
+# --------------------------------------------------------------------------
+# The 5th signal pattern captures an agent's OWN end-of-goal recommendation /
+# follow-up — the "here is future work to file" idiom the other four miss.
+# The literal fixture is the  outcome_note tail that the user reported
+# as forgotten ("recommended four fix goals but did not file them").
+
+G02907_RECOMMENDATION = (
+    "RECOMMENDATION: Create 3+ feature goals: (1) fix test_case_4, "
+    "(2) implement bye-week benching, (3) implement matchup-threshold benching, "
+    "(4) implement injury replacement"
+)
+
+
+def test_deferred_idea_fires_on_the_forgotten_recommendation():
+    """The exact idiom the user reported as lost must now produce a signal."""
+    signals = fg.scan_signals(G02907_RECOMMENDATION)
+    di = [s for s in signals if s["type"] == "deferred_idea"]
+    assert len(di) == 1, f"expected one deferred_idea, got {signals}"
+
+
+def test_deferred_idea_is_idea_medium_not_unblock_high():
+    """A recommendation is a lead, not a confirmed bug — MEDIUM Idea, never HIGH."""
+    goal = fg.make_child_goal(
+        {"type": "deferred_idea", "match": "RECOMMENDATION: create a goal to backfill DvP data"},
+        "g-029-07", "fantasy-strategy", "body",
+    )
+    assert goal["priority"] == "MEDIUM"
+    assert goal["origin_signal"] == "idea:g-029-07"
+    assert goal["title"].startswith("Idea: create a goal"), goal["title"]  # label stripped
+
+
+@pytest.mark.parametrize("text", [
+    # Bare modal on ordinary closing prose — the #1 false-positive risk.
+    "The retry path should be fine now.",
+    "This could be revisited later if latency regresses.",
+    # Adjectival "open goals"/"OPEN HIGH goals" = PENDING goals, not "open A goal".
+    # This class dominated the  census false positives.
+    "12 open goals carry no intended_agent in asp-335.",
+    "The remaining OPEN HIGH goals are all blocked on the same probe.",
+    "This goal's premise no longer holds after the merge.",
+    # A normal fold/cleanup close must stay quiet.
+    "Folded 6 invented world roots into proper tree/conventions. Cleaned 4 empty dirs.",
+])
+def test_deferred_idea_stays_quiet_on_non_recommendations(text):
+    assert [s for s in fg.scan_signals(text) if s["type"] == "deferred_idea"] == []
+
+
+@pytest.mark.parametrize("text", [
+    "RECOMMENDATION: create a goal for X — already filed as g-123.",
+    "Follow-up: fix the parser (created goal g-999).",
+    "Next steps: wire the alert → g-357-41 tracks it.",
+])
+def test_deferred_idea_resolution_suppressed(text):
+    """A recommendation already filed as a goal must not re-fire."""
+    assert [s for s in fg.scan_signals(text) if s["type"] == "deferred_idea"] == []
+
+
+def test_deferred_idea_degenerate_label_only_produces_no_signal():
+    """ class: a bare "next step:" at end of line (its content on the
+    NEXT line the [^.!?\\n] span cannot reach) strips to empty and would title a
+    goal "Idea: ". The min-content guard must drop it."""
+    assert fg.scan_signals("Analysis complete.\nnext step:\nrerun the probe next week") == [] \
+        or all(s["type"] != "deferred_idea" for s in
+               fg.scan_signals("Analysis complete.\nnext step:\nrerun the probe next week"))
+
+
+@pytest.mark.parametrize("text,should_fire", [
+    ("Recommend creating a goal to backfill the 2025 DvP data.", True),
+    ("TODO: wire the injury replacement path into the optimizer.", True),
+    ("Worth filing a goal to add unit tests for the scorer.", True),
+    ("file a goal to register a merge handler for this store.", True),
+])
+def test_deferred_idea_recall_on_genuine_recommendations(text, should_fire):
+    di = [s for s in fg.scan_signals(text) if s["type"] == "deferred_idea"]
+    assert bool(di) == should_fire, f"{text!r} -> {di}"
+
+
+# --------------------------------------------------------------------------
+# --scan-outcome-note plumbing + optional --insight-file ()
+# --------------------------------------------------------------------------
+
+def test_insight_file_now_optional_but_a_source_is_required(tmp_path):
+    """Neither --insight-file nor --scan-outcome-note is an argument error —
+    the gate must refuse rather than scan an empty string."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "findings-gate.py"),
+         "--goal", "g-test", "--aspiration", "asp-test", "--category", "framework",
+         "--dry-run"],
+        capture_output=True, text=True, timeout=60, check=False,
+        env={**os.environ, "PYTEST_CURRENT_TEST": "findings-gate-source-required"},
+    )
+    assert result.returncode == 1
+    assert "at least one insight source" in result.stderr
+
+
+def test_scan_outcome_note_only_is_accepted(tmp_path):
+    """--scan-outcome-note WITHOUT --insight-file must parse and run. For an
+    unknown goal the note read returns empty, so the gate reports empty_insight
+    and exits 0 (this is exactly the shape worker_retrospective now uses, which
+    previously died rc=2 at argparse)."""
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / "findings-gate.py"),
+         "--goal", "g-nonexistent-xyz", "--aspiration", "asp-test",
+         "--category", "framework", "--scan-outcome-note", "--dry-run"],
+        capture_output=True, text=True, timeout=60, check=False,
+        env={**os.environ, "PYTEST_CURRENT_TEST": "findings-gate-scan-note"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "findings_count=0 created=0" in result.stdout

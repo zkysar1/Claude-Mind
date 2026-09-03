@@ -581,7 +581,7 @@ IF outcome_class == "routine":
 # sq-013 (Phase 6) is complementary — it catches obvious work BEFORE
 # encoding; this gate catches what crystallizes DURING encoding.
 #
-# Bash-enforced (rb-428 / guard-365). The wrapper does the 4-signal
+# Bash-enforced (rb-428 / guard-365). The wrapper does the 5-signal
 # keyword scan with resolution filters, dedup against active + sibling-
 # completed titles (reads aspirations-compact.json), and dispatches via
 # aspirations-add-goal.sh. Emits `findings_count=N created=M` for

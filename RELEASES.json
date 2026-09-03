@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.57",
+    "previous_version": "2.12.56",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Mechanical idea-capture: findings-gate scans goal outcome_notes for recommendations/follow-ups and files them as Idea goals (5th deferred_idea pattern + --scan-outcome-note); mounted at iteration-close do_state_update + worker_retrospective (repairs its rc=2 no-op). g-357-108.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.56",
     "previous_version": "2.12.55",
     "date": "2026-09-03",

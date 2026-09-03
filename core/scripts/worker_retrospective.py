@@ -796,11 +796,20 @@ def _lane_journal(item, agent, now_iso, root):
 
 
 def _lane_findings(item, agent, now_iso, root):
+    # --scan-outcome-note (): this lane passes NO --insight-file (a
+    # worker Body has no LLM-assembled tree-insight temp file here), so before
+    # this flag existed the call died rc=2 at argparse ("--insight-file is
+    # required") and scanned NOTHING — the worker-side idea-capture path was a
+    # silent no-op. --scan-outcome-note makes --insight-file optional and points
+    # the gate at the goal's durable outcome_note, which is exactly where a
+    # worker's end-of-goal RECOMMENDATION/follow-up lives. Reducer-side closes
+    # get the same scan mechanically from iteration-close.sh do_state_update.
     return _run(bash_cmd(str(root / "core" / "scripts" / "findings-gate.sh"),
                          "--goal", item["goal_id"],
                          "--aspiration", item["aspiration_id"],
                          "--category", item["category"],
-                         "--source", item["source"]))
+                         "--source", item["source"],
+                         "--scan-outcome-note"))
 
 
 def _lane_impk(item, agent, now_iso, root, artifacts_count):

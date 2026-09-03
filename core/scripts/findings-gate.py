@@ -95,7 +95,23 @@ def _sanitize_fragment(fragment):
     """
     return re.sub(r"\s+", " ", fragment or "").strip()
 
-# Four structural signal patterns. Each is (name, match_pattern, resolution_filter_pattern).
+
+# Leading labels a deferred_idea match tends to open with. Stripping them yields
+# a title that reads "Idea: create 3 feature goals" instead of the stutter
+# "Idea: RECOMMENDATION: create 3 feature goals". No-op for the other four
+# patterns (their matches never open with these labels).
+_LEADING_LABEL_RE = re.compile(
+    r"^(recommendations?|follow[- ]?ups?|next steps?|future work|todo)\s*:\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_label(reference):
+    """Drop a leading 'RECOMMENDATION:'/'follow-up:'/'todo:' label from a title
+    reference. Applied to every signal's reference — harmless where absent."""
+    return _LEADING_LABEL_RE.sub("", reference or "").strip()
+
+# Five structural signal patterns. Each is (name, match_pattern, resolution_filter_pattern).
 # match_pattern is compiled case-insensitive. resolution_filter_pattern is also
 # case-insensitive and checked in the RESOLUTION_SUPPRESSION_CHARS window
 # immediately after the match.
@@ -141,6 +157,51 @@ SIGNAL_PATTERNS = [
         ),
         re.compile(
             r"\b(done|completed|applied|implemented|resolved)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        # deferred_idea (): the "here is future work to file" idiom —
+        # an agent's OWN end-of-goal recommendation. The other four patterns all
+        # miss it because they name a defect in the PRESENT (root cause / bug /
+        # proposed fix / unimplemented action), whereas this names work to
+        # capture as a NEW goal: "RECOMMENDATION: create 3 feature goals",
+        # "follow-up: ...", "next steps: ...", "worth filing". This is the whole
+        # point of the gate for the idea-capture lane (scan-outcome-note): the
+        # recommendation an agent writes into outcome_notes and then forgets.
+        #
+        # Idea MEDIUM, never HIGH (make_child_goal: not in high_signal_types) —
+        # a recommendation is a lead, not a confirmed bug.
+        #
+        # DELIBERATELY ANCHORED on an explicit label-colon, a "recommend +
+        # gerund/that", an explicit "file/create/open/add ... goal(s)" verb
+        # phrase, or "worth <verb>" — NOT a bare "should"/"could", which fire on
+        # ordinary closing prose ("should be fine now"). `goals?(?![\w-])` keeps
+        # "create a goal-selection cache" (goal-hyphen) out of the verb branch.
+        # Under-reach is the safe direction here exactly as for the four above:
+        # a missed recommendation costs a re-scan next close; an over-match costs
+        # one visible, skippable Idea goal. Calibrated against the live
+        # completed-goal corpus before promotion ( census).
+        "deferred_idea",
+        re.compile(
+            r"(?:"
+            r"\b(?:recommendations?|follow[- ]?ups?|next steps?|future work|todo)\s*:"
+            r"|\brecommend(?:s|ed)?\s+(?:creating|filing|adding|opening|building|that\b)"
+            # verb + REQUIRED article/number: "file a goal", "create 3+ goals".
+            # The article/number is what separates a filing INTENT from the
+            # adjectival "open goals"/"OPEN HIGH goals" (= pending goals) that
+            # dominated the false positives in the  census. "the" is
+            # deliberately excluded — "open the goal" usually references an
+            # existing goal, not a new filing.
+            r"|\b(?:file|create|open|add)\s+(?:an?|another|\d+\+?)\s+(?:new )?"
+            r"(?:[\w-]+ ){0,3}goals?(?![\w-])"
+            r"|\bworth\s+(?:a goal|filing|investigating|creating|doing)\b"
+            r")[^.!?\n]{0,200}",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\b(already (?:filed|created|done|tracked)|filed as g-|"
+            r"created goal g-|tracked (?:in|as) g-|no action needed)\b|→\s*g-\d",
             re.IGNORECASE,
         ),
     ),
@@ -204,7 +265,24 @@ def scan_signals(insight_text):
                 )
                 continue
             # Extract a 50-char reference for the goal title.
-            reference = match_text.strip()
+            reference = _strip_leading_label(match_text.strip())
+            # Degenerate-match guard (). A match that is ONLY a label —
+            # "next step:" at end of line, its actionable text on the NEXT line
+            # that the [^.!?\n] span cannot reach — strips to empty/near-empty
+            # and would title a goal "Idea: " with no content. Require real
+            # substance before emitting. Under-reach is the safe direction (the
+            # four other patterns never produce a tiny match, so this is a no-op
+            # for them; the newline-separated recommendation is simply re-scanned
+            # next close if its content ever lands on the label line).
+            if len(re.sub(r"[^A-Za-z0-9]", "", reference)) < 6:
+                _gate_log(
+                    "findings-gate",
+                    "noop",
+                    trigger_matched=f"{name}:degenerate",
+                    caller="findings-gate.py:scan_signals",
+                    extra={"decision_path": "degenerate-match"},
+                )
+                continue
             if len(reference) > 50:
                 reference = reference[:50].rstrip() + "…"
             signals.append({"type": name, "match": reference})
@@ -312,7 +390,7 @@ def make_child_goal(signal, source_goal, source_category, insight_text):
     # whitespace collapse is enforced once rather than at each producer. A goal
     # title carrying an embedded newline breaks display, token-overlap dedup, and
     # every line-oriented consumer downstream.
-    match = _sanitize_fragment(signal["match"])
+    match = _strip_leading_label(_sanitize_fragment(signal["match"]))
     high_signal_types = {"root_cause", "bug_identified", "investigation_finding"}
     if signal["type"] in high_signal_types:
         title = f"Unblock: Fix {match}"
@@ -370,13 +448,66 @@ def dispatch_goal(goal_json, aspiration_id, source):
     return True
 
 
+def read_outcome_note(goal_id):
+    """Return a goal's outcome_note text via the aspirations-query.sh WRAPPER.
+
+    The idea-capture lane (g-357-108): the recommendation an agent writes into
+    outcome_notes at close is exactly the signal that was being lost — the tree
+    insight Step 8.5 historically scanned rarely carries it. Reading the durable
+    record's note (not an LLM-assembled temp file) also REPAIRS the mechanical
+    worker_retrospective._lane_findings call, which passed no --insight-file and
+    so died rc=2 at argparse before scanning anything (measured g-357-108).
+
+    Store-parse discipline: aspirations.jsonl is NEVER read/parsed directly —
+    aspirations-query.sh is the sanctioned wrapper and its JSON output is
+    parseable by contract. Best-effort: any failure returns "" (the caller then
+    falls back to --insight-file, or reports empty_insight).
+    """
+    if not goal_id:
+        return ""
+    script = PROJECT_ROOT / "core" / "scripts" / "aspirations-query.sh"
+    if not script.exists():
+        return ""
+    try:
+        result = subprocess.run(
+            bash_cmd(script, "--goal-field", "goal_id", goal_id, "--full"),
+            env={**os.environ, "MIND_AGENT": os.environ.get("MIND_AGENT", "")},
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0 or not result.stdout.strip():
+        return ""
+    try:
+        records = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    if not isinstance(records, list):
+        return ""
+    for rec in records:
+        if isinstance(rec, dict) and rec.get("goal_id") == goal_id:
+            return (rec.get("outcome_note") or "").strip()
+    # Fall back to the first record if the id field is projected differently.
+    if records and isinstance(records[0], dict):
+        return (records[0].get("outcome_note") or "").strip()
+    return ""
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Phase 8.5 Actionable Findings Gate — keyword scan + goal creation."
     )
     parser.add_argument("--goal", required=True, help="Source goal ID (discovering goal)")
-    parser.add_argument("--insight-file", required=True,
-                        help="Path to file containing the just-written insight text")
+    parser.add_argument("--insight-file", required=False, default=None,
+                        help="Path to file containing the just-written insight text. "
+                             "Optional when --scan-outcome-note is given; at least one "
+                             "insight source is required.")
+    parser.add_argument("--scan-outcome-note", action="store_true",
+                        help="ALSO scan the source goal's durable outcome_note (read via "
+                             "aspirations-query.sh). This is the idea-capture lane: it "
+                             "catches an agent's own end-of-goal RECOMMENDATION/follow-up "
+                             "that the tree-insight scan misses (g-357-108). Combined with "
+                             "--insight-file when both are given.")
     parser.add_argument("--aspiration", required=True,
                         help="Parent aspiration ID (where child goals will be filed)")
     parser.add_argument("--category", required=True,
@@ -395,13 +526,33 @@ def main():
                         help="Scan and report but do NOT create goals (for testing)")
     args = parser.parse_args()
 
-    insight_path = Path(args.insight_file)
-    if not insight_path.is_absolute():
-        insight_path = PROJECT_ROOT / insight_path
-    if not insight_path.exists():
-        print(f"ERROR: insight-file does not exist: {insight_path}", file=sys.stderr)
+    # Assemble the scanned text from up to two sources. At least one must be
+    # requested — either an --insight-file (the tree-insight, Step 8.5's historical
+    # input) or --scan-outcome-note (the durable outcome_note, the idea-capture
+    # lane). Both are combined when both are given.
+    if not args.insight_file and not args.scan_outcome_note:
+        print("ERROR: supply --insight-file and/or --scan-outcome-note "
+              "(at least one insight source is required)", file=sys.stderr)
         sys.exit(1)
-    insight_text = insight_path.read_text(encoding="utf-8").strip()
+
+    parts = []
+    if args.insight_file:
+        insight_path = Path(args.insight_file)
+        if not insight_path.is_absolute():
+            insight_path = PROJECT_ROOT / insight_path
+        if not insight_path.exists():
+            print(f"ERROR: insight-file does not exist: {insight_path}", file=sys.stderr)
+            sys.exit(1)
+        file_text = insight_path.read_text(encoding="utf-8").strip()
+        if file_text:
+            parts.append(file_text)
+
+    if args.scan_outcome_note:
+        note_text = read_outcome_note(args.goal)
+        if note_text:
+            parts.append(note_text)
+
+    insight_text = "\n\n".join(parts).strip()
     if not insight_text:
         print("findings_count=0 created=0 reason=empty_insight")
         return
