@@ -286,9 +286,9 @@ IF "create-aspiration: no viable aspirations found" in blocked_idle_attempts:
             "category": "coordination",
         })
 
-    # S3. Findings-board posts with actionable tag that nobody has claimed
+    # S3. Unclaimed findings — BOTH request vocabularies (g-357-101)
     Bash: core/scripts/board-read.sh --channel findings --since 7d --json
-    For each post tagged "actionable" with no linked goal_id:
+    For each post tagged "actionable" OR ("insight_trigger" + requires_action_by:<me>), no goal_id, no reply from me:
         signals.append({
             "kind": "finding",
             "id": post["id"],
@@ -681,9 +681,9 @@ IF B6.5 returned rc=1 (quiescence denied):
             LOOP_CONTINUE
         # else fall through to Target 3
 
-    # Target 3: actionable finding without goal
+    # Target 3: unclaimed finding, either vocabulary
     Bash: board-read.sh --channel findings --since 7d --json
-    Filter for posts with "actionable" tag AND no "goal_id" tag AND author != MIND_AGENT.
+    Filter: tag "actionable" OR ("insight_trigger" + requires_action_by:<me>); no goal_id; author != me; no reply from me.
     IF non-empty:
         chosen = sort by created_at DESC, take first
         Output: "▸ MW#5 Target 3: converting finding " + chosen.id + " to goal"

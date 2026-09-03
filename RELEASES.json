@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.56",
+    "previous_version": "2.12.55",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "iteration-open imperative routes the reducer through aspirations-select (Phase 2.07 directive/insight-trigger scan was being skipped); all-blocked S3/Target 3 honor insight_trigger+requires_action_by requests; decision-rules node-path resolution for external worlds",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.55",
     "previous_version": "2.12.54",
     "date": "2026-09-03",

@@ -2403,6 +2403,37 @@ runner_heartbeat:
 # unit tests, but not yet by kill-tests ON THIS FLEET. `fence_verified_at` is the
 # second, independent gate for exactly that reason — flipping `enabled` alone
 # cannot promote anything, so neither flag is a single point of failure.
+# ---------------------------------------------------------------------------
+# reducer_selection_policy (, OWNER DIRECTIVE 2026-09-03)
+# ---------------------------------------------------------------------------
+# With enough live worker Bodies, the reducer stops competing for ORDINARY goals
+# and spends its cycles on work only it can do. Measured that day: the reducer
+# runs the same goal-selector as five workers, while  (Reflect and
+# journal, reducer-only by nature, 29.25h cadence) had not fired since 08-26 and
+# fleet guardrail creation fell ~100/day -> 72/day with completions flat.
+#
+# Implemented as a one-slot FLOOR, not a scoring weight. The directive says
+# "threshold and weight"; apply_strategic_focus_floor already measured on this
+# queue that a +1.5 scalar cannot close a 4.41 deficit against 1.22 of
+# exploration noise, and guard-1895 rule (2) names a sub-band intervention as one
+# that "changes almost nothing WHILE LOOKING LIKE A FIX". So the threshold is
+# here and the preference is a reorder — no weight key, deliberately, rather than
+# a knob that reads adjustable and does nothing.
+#
+# BELOW THE THRESHOLD, AND FOR EVERY NON-REDUCER, SELECTION IS BYTE-IDENTICAL.
+# That is the load-bearing property and it is pinned by a test.
+reducer_selection_policy:
+  enabled: true
+  # Live worker Bodies (fleet-wide, any agent) at or above which the reducer
+  # steps back. 3 is the directive's number.
+  worker_threshold: 3
+  # An in_flight_bodies row older than this is NOT counted as a live worker.
+  # Load-bearing: measured 2026-09-03, bravo carried a row claimed 2026-08-07 —
+  # 27 days stale — for a long-terminal goal. Counting it would stand the reducer
+  # down against a fleet that is not there.  owns CLEARING those rows;
+  # this threshold must be correct while they are still present.
+  claim_fresh_hours: 6.0
+
 reducer_promotion:
   # G1 master kill switch. Only an explicit `true` enables; absent means off.
   enabled: false

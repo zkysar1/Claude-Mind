@@ -670,6 +670,30 @@ def normalize_virtual_path(raw_path):
     return path
 
 
+def resolve_node_path(raw_path):
+    """Resolve a CLI `--node-path` argument to an absolute tree-node file.
+
+    Accepts every form callers actually pass: an absolute path (returned as
+    is), a repo-relative path that exists under PROJECT_ROOT (the legacy
+    layout, kept so nothing that resolved before stops resolving), and the
+    two forms that used to FAIL on an external world — the virtual
+    `world/knowledge/tree/<cat>/<node>.md` and the bare tree-relative
+    `<cat>/<node>.md` — which go through normalize_virtual_path (THE
+    canonicalization point) and then resolve_file_path (world/ → WORLD_DIR).
+    Measured 2026-09-03 on a downstream deployment: decision-rules-append.py
+    joined the bare form to PROJECT_ROOT and the reducer spent ~10 minutes
+    of state-update discovering that. Does not check existence: the caller
+    owns the error message.
+    """
+    p = Path(raw_path)
+    if p.is_absolute():
+        return p
+    legacy = PROJECT_ROOT / p
+    if legacy.exists():
+        return legacy
+    return resolve_file_path(normalize_virtual_path(str(raw_path)))
+
+
 def compute_child_path(parent_file, child_slug):
     """Compute the file path for a new child node.
     Strip .md from parent, use as directory, append {slug}.md.

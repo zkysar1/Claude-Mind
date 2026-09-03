@@ -444,3 +444,134 @@ def test_schema_registers_the_field_so_a_writer_exists():
     path, which refuses any name absent from GOAL_KNOWN_FIELDS."""
     import _goal_fields
     assert _goal_fields.is_known("executable_by_role")
+
+
+# ─── : MSYS argv conversion defeats the gate on Windows ────────────
+# Git-Bash rewrites ANY argv beginning with "/" into a Windows path rooted at
+# the Git prefix, so worker-loop Phase 1's own documented invocation
+# (`skill-eligible /reflect`) arrives as "C:/Program Files/Git/reflect". The
+# rewrite embeds a SPACE, so normalize_skill's whitespace split saw
+# "C:/Program", which maps to no lifecycle stage and returned the deliberate
+# fail-open GREEN -- the gate inverted to PERMISSIVE for every reducer-only
+# skill, as a pass rather than an error.
+#
+# SCOPE OF WHAT THESE TESTS PROVE, stated plainly because the goal that filed
+# this asked for something they are NOT: the filer requires a regression test
+# driven through a SHELL on MINGW64, since only a real MSYS shell performs the
+# rewrite. These tests instead pin the LITERAL post-rewrite string measured on
+# DESKTOP-O91DLK2 and assert the module handles it. That is the production
+# ARGUMENT shape (guard-920) but not the production SHELL, so it runs and means
+# the same thing on every platform -- and it does NOT discharge the MINGW64
+# end-to-end check, which remains open and can only be run on a Windows box.
+
+MSYS_GIT_PREFIX = "C:/Program Files/Git/"
+
+
+def _mangled(skill: str) -> str:
+    """The argv a Git-Bash shell actually delivers for `skill`.
+
+    Measured form, not a guess: `py -3 -c "print(sys.argv[1:])" "/reflect"` on
+    MINGW64 printed ['C:/Program Files/Git/reflect'].
+    """
+    return MSYS_GIT_PREFIX + skill.lstrip("/")
+
+
+def test_every_reducer_only_skill_is_still_refused_when_msys_mangles_it():
+    """THE REGRESSION. Before the fix all ten returned eligible=True.
+
+    Parameterised over the table rather than a hand-listed set, so a skill added
+    to SKILL_LIFECYCLE_STAGE later is covered without editing this test -- the
+    hand-listed variant would have gone stale silently, which is the shape
+    guard-1760 warns about (a checker must not report what it declined to look
+    at as a pass).
+    """
+    reducer_only = [s for s in we.SKILL_LIFECYCLE_STAGE
+                    if we.skill_eligibility(s).eligible is False]
+    assert reducer_only, "precondition: the bridge refuses at least one skill"
+    for skill in reducer_only:
+        raw = _mangled(skill)
+        assert we.normalize_skill(raw) == skill, \
+            f"{raw!r} did not recover to {skill!r}"
+        assert we.skill_eligibility(raw).eligible is False, \
+            f"MSYS-mangled {skill!r} read as worker-eligible -- the gate is inverted"
+
+
+def test_mangled_skill_keeps_its_arguments_and_still_resolves():
+    """The goal's skill field carries the whole invocation, not the bare name,
+    so the mangled value has trailing args after the rewritten prefix."""
+    raw = _mangled("/review-hypotheses --resolve")
+    assert we.normalize_skill(raw) == "/review-hypotheses"
+    assert we.skill_eligibility(raw).eligible is False
+
+
+def test_CONTROL_a_pinned_eligible_skill_stays_eligible_when_mangled():
+    """LOAD-BEARING EXCLUSION (this file's own weighting, guard-2860).
+
+    `/tree` is pinned worker-eligible despite encoding. Recovery must return it
+    to the bridge as `/tree` and the bridge must still say YES -- a recovery
+    that refused everything it recognised would strand sanctioned worker work,
+    which is the expensive direction.
+    """
+    raw = _mangled("/tree")
+    assert we.normalize_skill(raw) == "/tree"
+    assert we.skill_eligibility(raw).eligible is True
+
+
+def test_CONTROL_an_unrecognised_mangled_value_is_left_alone():
+    """Recovery is a POSITIVE LIST, not heuristic path-stripping.
+
+    A path naming no known skill must NOT be rewritten into one, and the
+    fail-open default must survive untouched. This is what stops the fix
+    inventing a skill nobody asked for.
+    """
+    raw = MSYS_GIT_PREFIX + "notaskill"
+    assert we.normalize_skill(raw) == "/C:/Program"      # unchanged, pre-fix shape
+    assert we.skill_eligibility(raw).eligible is True
+
+
+def test_CONTROL_posix_and_bare_forms_are_unchanged_by_the_recovery():
+    """INVARIANCE (guard-2903: an invariance test is green by default when it is
+    broken, so assert the values rather than merely calling the function).
+
+    On Linux no rewrite happens, and goal records carry both `/replay` and
+    `replay`. All three pre-existing shapes must resolve exactly as before.
+    """
+    assert we.normalize_skill("/reflect") == "/reflect"
+    assert we.normalize_skill("replay") == "/replay"
+    assert we.normalize_skill("/replay --sharp-wave") == "/replay"
+    assert we.skill_eligibility("/reflect").eligible is False
+    assert we.skill_eligibility("replay").eligible is False
+    assert we.normalize_skill("") is None
+    assert we.skill_eligibility("").eligible is True
+
+
+def test_recovery_is_reachable_through_the_CLI_argument_shape():
+    """guard-920: pin the production ARG shape, not the contract-ideal one.
+
+    `goal-eligible`/`skill-eligible` take the skill via argparse.REMAINDER and
+    join it with spaces, so the mangled value arrives as several argv entries
+    that re-join to one string. Exercise that join rather than calling the
+    helper with an already-joined literal.
+    """
+    import subprocess
+    script = str(CORE_SCRIPTS / "worker_execute.py")
+    # The shell splits the mangled value on its embedded space, so the CLI
+    # receives TWO argv entries that REMAINDER re-joins -- exactly what a
+    # MINGW64 shell delivers. Reproduce that split rather than passing a
+    # pre-joined literal.
+    argv = [sys.executable, script, "skill-eligible", "C:/Program", "Files/Git/reflect"]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 1, (
+        f"CLI returned rc={proc.returncode} for an MSYS-mangled /reflect; "
+        f"rc=0 is the inverted gate this goal exists to close. "
+        f"stdout={proc.stdout!r} stderr={proc.stderr[-400:]!r}")
+    assert "reducer-only" in proc.stdout
+
+    # POSITIVE CONTROL through the same entry point: an unrecognised value must
+    # still exit 0, so the rc=1 above is attributable to the recovery and not to
+    # the CLI erroring on a multi-token argument.
+    ctrl = subprocess.run(
+        [sys.executable, script, "skill-eligible", "C:/Program", "Files/Git/notaskill"],
+        capture_output=True, text=True, timeout=120)
+    assert ctrl.returncode == 0, (
+        f"control flipped: rc={ctrl.returncode}, stderr={ctrl.stderr[-300:]!r}")

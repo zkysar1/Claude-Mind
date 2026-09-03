@@ -571,15 +571,29 @@ def _emit(report, as_json):
         print("[iteration-open] NOT COVERED BY THIS ENTRY: %d tier-table lane(s) "
               "remain unwired (the deferrable tier). They did not run and nothing "
               "above reflects them — `--dry-run` lists them by name." % unwired)
+    # The chain below MUST name Skill(aspirations-select) between the precheck
+    # tail and Skill(aspirations-execute). Until 2026-09-03 it read "claim from
+    # SELECTION and enter execution — Skill(aspirations-execute)", and a reducer
+    # read SELECTION as the candidates printed above: measured on a downstream
+    # deployment, 6 consecutive precheck-led iterations with 0 select
+    # invocations, while 5 findings tagged insight_trigger +
+    # requires_action_by:<it> sat unread — the directive ack/honor, the
+    # insight-trigger scan, self-abstention and the deviation check live ONLY in
+    # aspirations-select (Phase 2.07 / 2.55 / 2.94), so skipping the Skill
+    # skips all four, silently. test_iteration_open pins the order.
     print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings above "
           "(each becomes a goal, a defer, or an explicit no-op). THEN, AS THE "
           "REDUCER, RESUME aspirations-precheck AT ITS FIRST DEFERRABLE SWEEP — "
           "this entry ran the always-run AND medium tiers, but the deferrable "
-          "tier is still unwired, so going straight to SELECTION silently skips "
-          "it and the meter still reads sweeps_dropped=0 (g-115-7847). Only "
-          "after that tail, claim from SELECTION and enter execution — "
-          "Skill(aspirations-execute). A worker Body runs NO precheck tail: "
-          "dispose, then worker-loop Phase 2 CLAIM.")
+          "tier is still unwired, so going straight to selection silently skips "
+          "it and the meter still reads sweeps_dropped=0 (g-115-7847). THEN "
+          "Phase 2: Skill(aspirations-select) — the candidates printed above "
+          "are its INPUT, not a substitute: directive ack/honor, the "
+          "insight-trigger scan of the findings board, self-abstention and the "
+          "deviation check run ONLY inside that Skill, and claiming the top "
+          "candidate here skips all four. Only after select returns a goal, "
+          "enter execution — Skill(aspirations-execute). A worker Body runs NO "
+          "precheck tail and NO select: dispose, then worker-loop Phase 2 CLAIM.")
 
 
 def _selection(runner):

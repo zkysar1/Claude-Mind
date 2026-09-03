@@ -604,6 +604,48 @@ _SkillEligibilityFields = collections.namedtuple(
     "_SkillEligibilityFields", "eligible skill stage disposition reason")
 
 
+def _known_skill_names() -> "tuple[str, ...]":
+    """Every skill name this module can recognise, LONGEST FIRST.
+
+    Longest-first is defensive rather than load-bearing: the recovery regex
+    already anchors on a literal "/" before the name, so a name that is only a
+    trailing SUBSTRING of another (".../aspirations-complete-review" vs a
+    hypothetical "/review") cannot match. Ordering keeps that true if someone
+    later relaxes the anchor.
+    """
+    names = set(SKILL_LIFECYCLE_STAGE) | set(SKILL_ELIGIBLE_DESPITE_ENCODING)
+    return tuple(sorted(names, key=len, reverse=True))
+
+
+def _recover_msys_mangled_skill(raw: "str | None") -> "str | None":
+    """Recover a skill token MSYS/Git-Bash rewrote before python ever saw it.
+
+    Git-Bash rewrites ANY argv beginning with "/" into a Windows path rooted at
+    the Git prefix, so worker-loop Phase 1's own documented invocation --
+    `skill-eligible /reflect` -- arrives as "C:/Program Files/Git/reflect". The
+    rewrite embeds a SPACE, so normalize_skill's whitespace split sees
+    "C:/Program", which maps to no lifecycle stage and returns the deliberate
+    fail-open GREEN. The role-safety gate is therefore inverted to PERMISSIVE
+    for all ten reducer-only skills on that platform -- a DEFEATED check that
+    reads as a pass rather than as an error, which is why it survived so long
+    (g-115-8758, measured on DESKTOP-O91DLK2; a Linux box never sees it).
+
+    Recovery is by POSITIVE LIST, never by heuristic path-stripping: a value is
+    recovered ONLY when a KNOWN skill name appears as a whole trailing path
+    segment. Anything naming no known skill is returned unrecovered, so this can
+    never invent a skill and the fail-open default is untouched for everything
+    it does not recognise. The residual is that a genuine path argument ending
+    in a known skill name recovers to that skill -- which fails toward REFUSING
+    a worker, the recoverable direction, and `skill-eligible` takes a skill
+    field rather than a path in the first place.
+    """
+    text = str(raw or "").replace("\\", "/")
+    for known in _known_skill_names():
+        if re.search(r"/" + re.escape(known[1:]) + r"(?=\s|$)", text):
+            return known
+    return None
+
+
 def normalize_skill(skill: "str | None") -> "str | None":
     """The bare skill token from a goal's `skill` field, or None.
 
@@ -617,7 +659,15 @@ def normalize_skill(skill: "str | None") -> "str | None":
     if not parts:
         return None
     token = parts[0]
-    return token if token.startswith("/") else "/" + token
+    if token.startswith("/"):
+        return token
+    # The token lost its leading slash. That is EITHER a goal record carrying
+    # the bare name ("replay"), OR an MSYS argv rewrite that replaced the slash
+    # with a Windows path prefix. Try the rewrite first: it is the only one of
+    # the two that can silently DEFEAT the gate rather than merely miss a
+    # lookup ().
+    recovered = _recover_msys_mangled_skill(skill)
+    return recovered if recovered else "/" + token
 
 
 def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:

@@ -9447,3 +9447,96 @@ WM; nothing filed, nothing attached.
 **S4b** `roblox-integration`: scanned **204** / mature **79** / candidates **34**, top **`rb-8483`** (retrieved **11x**, v2 **0.0**) — retrieved often, credited never. Stored as the ONLY routable LOW signal. Per the 09-03T04:2x row's own lesson, naming the sampled category beside the top: this is the same `rb-8483` that row lists among prior 9-15x tops, reached from a different category — so a top recurring ACROSS categories is weaker evidence of category-dependence than that row's `rb-4050` (182x) was of it.
 **S4.5** 0 new / **2 dedup-suppressed** / 0 rb-245 / 0 filed. **S3c** did not fire (26 active, 12 HIGH = 46.2%, 0 completed_unarchived). **S1 / S2a / S2b / S4a** not routed — known-owned or known-confound per their in-instrument markers; **no cross-agent census run this pass, so no S1 trend is reported** (a local-only read is a claim about this box — g-115-3215).
 **Net:** stamp written FIRST via `verified-wm-set.sh` (landed, verified); 1 LOW signal to WM; evolution-log `strategic_scan` appended; nothing filed, nothing attached.
+
+### 2026-09-03T11:2x — S4.6 reconsolidation (bravo, `hostname` cc-05, `uname -r` 6.8.0-138-generic, own-cloud, read-only)
+
+**7 candidates | DISTINCT failing-goal members = 1 → `g-335-816` | `ceiling_ratio` 0.0754 (2178 of 28901) | `failing_count` 644.** Routed nothing; did not run `--apply`.
+
+⚠ **THIS ROW DISCRIMINATES BETWEEN THE MARKER'S TWO STANDING HYPOTHESES, AND IT FAVOURS THE JOIN DEFECT OVER COVERAGE.** Every prior row reasoning about the sole-member confound was taken at `ceiling_ratio` 0.0026–0.009, and the marker's settled reading ("SETTLED — COVERAGE, NOT CALENDAR") explains the 0-vs-21 split by box-local diary slices. That explanation is about which runs see candidates AT ALL. It does not survive this reading of the *members*: at **0.0754 — roughly 10x the band, `classifiable_ceiling` 2178 against the 61–206 every prior row recorded** — the join can classify an order of magnitude more invocations, and the distinct member set is **still exactly `{g-335-816}`**, the same archived goal recorded on 08-12, 08-14 (×2), 08-15 and 08-16 (×2).
+
+If the sole member were a coverage artifact, a 10x wider ceiling should surface *other* members. It surfaced none. That points at `_resolve_window_outcome`'s `return 'failure'` default — a window with no locally-readable success evidence is classified FAILED rather than `unknown` — which is a property of the JOIN and is indifferent to how much the box can see. Coverage still explains the candidate COUNT (7 here vs 21 vs 0); it no longer explains the MEMBERSHIP.
+
+Second point, and it is the same defect from the other side: **`failing_count` 644 at the ledger level against 7 surfaced candidates.** Prior rows recorded gaps of 1-vs-0, 6-vs-1 and 7-vs-0 and read them as coverage. A 644-vs-7 gap at 10x coverage is too large for that reading — 644 ledger-level failures collapsing to one distinct goal id is the default-to-failure signature at scale, not a slice that is too narrow.
+
+**Do not read 0.0754 as the coverage problem being fixed.** The band's own claim is that the ratio is span-width news in either direction (falsified as monotonic on 2026-08-18); what is new here is not the ratio but that the CONFOUND HELD while the ratio moved 10x. Method note for the next reader: the member-set check is the load-bearing one and it cost one expression — `{g for c in candidates for g in c.recent_failing_goals}` — while the candidate count moved 21 → 7 → 7 and would have suggested a trend that does not exist. Compare the MEMBER SET, never the count (the marker's own rule, holding again).
+
+---
+
+### 2026-09-03T10:3x — alpha, `hostname` cc-04, `uname -r` 6.8.0-138-generic, own-cloud, world `/opt/ayoai-mind/.mind-data/world` (trigger `time_cadence`)
+
+**S2a — THE PRIOR IS DEFEATED ON THE NUMERATOR, AND THE CONTROL PASSED (opened 31/31).**
+Screened at the configured `knowledge_staleness_days: 30` (read from config, not from a
+comment). 1567 total nodes / **55 EXPLORE** / **31 stale**.
+**STRUCTURAL 5/31**, against the standing prior of **2** (recorded 2026-08-20: solver-v0-audits,
+infrastructure-performance). Both prior members are still present and still structural, so this is
+a numerator RISE with the prior set intact, not a re-based measurement:
+  - `solver-v0-audits` (distill) — present in every corrected pass since 2026-08-05
+  - `infrastructure-performance` (decompose)
+  - `env-agnostic-exploration-primitives`  **NEW**
+  - `v2-directed-steering-ship-log`        **NEW**
+  - `v2-directed-steering-wiring`          **NEW**
+
+**The two `v2-directed-steering-*` members are the SAME-TRIGGER CLUSTER the block tells you to
+look for, and they are the whole rise-mechanism here.** Trigger buckets carry exactly
+`node_split: 2`, and those two are the only node_split members — one split relocating prose into
+two nodes understates BOTH at once. So of the +3, two are one event and only
+`env-agnostic-exploration-primitives` is an independent arrival. Read the numerator as 2 prior
++ 1 new + 1 split-event, not as five independent drifts. (`node_split` joined
+STRUCTURAL_TRIGGERS on 2026-08-22 with a measured blast radius of 2 fleet-wide, both inside the
+stale screen — that prediction is now observed landing on this box.)
+
+Trigger buckets (all 31): re-verify 6, refresh 5, knowledge_reconciliation 3, distill 2,
+goal_completion 2, node_split 2, and one each of tree_correction, hypothesis_resolution,
+goal_execution, decompose, reconciliation, deepen, verification, tree_growth,
+cross_solver_finding, tree-content-hardening, user_directive.
+Age histogram: `{35:1, 39:1, 44:1, 46:1, 47:1, 48:2, 50:1, 53:8, 54:8, 61:1, 65:1, 67:1, 94:1,
+105:1, 106:1, 116:1}` — **16 of 31 sit in a two-day 53/54d cohort**, i.e. the denominator is once
+again a moving window the corpus aged into together. A changed denominator is a calendar; the
+NUMERATOR and the MEMBER NAMES are what moved here.
+**SPLIT: 31 raw / 6 re-verify / 25 suspect.** A raw-31 signal overstates real frontier drift by
+~24%; the re-verify cohort is content deliberately re-verified and its dates are the most
+trustworthy in the list.
+
+**S2b — the inert clause is confirmed by direct measurement, not inferred.** thin **51/55 EXPLORE
+= 92.7%** (matching the 92.2% non-discriminating signature already recorded). `depth >= 2` is true
+on **55/55**, so it excludes nothing and `children` alone carries the whole screen; `children` is
+truthy on 4/55. Routed nothing — g-115-4840 owns the collapse.
+
+**S3 — FULL corpus** (`aspirations-compact.json`; `goals_omitted` key present on **0/26**, which is
+the key-presence disambiguation, never a sum). The loader's stderr warned the summary was BOUNDED at
+**2258 of 2375 omitted (95.1%)** — by far the widest trim recorded here, so a summary-derived run
+this pass would have scored ~5% of the corpus. mtime 2026-09-03T10:32:11. n=2354 pending/in-progress
+across 26 active aspirations.
+  axis1  framework-architecture   791/2354 = **33.6%**  PASSES
+  axis1b framework-*             1423/2354 = **60.5%**  PASSES (**38** distinct labels)
+  axis2  asp-115                 1893/2354 = **80.4%**  FIRES  (non-asp-115 absolute 461)
+Axis 2 fires, as in every row ever taken — CONFIRMATION of a standing property, not a new finding;
+not routed. **Two things moved against the historical band and they point the same way:** axis1 fell
+to 33.6% (band 39-40%) and axis1b to 60.5% (band 62-63%), while the framework-* label count rose
+22-30 -> **38** and distinct categories 186 -> **242**. That is method rule 3's dilution arithmetic
+acting on the CATEGORY axes: the lane did not shrink (asp-115 absolute 1642 on 08-16 -> **1893**
+today, the highest recorded), it fragmented across more labels, so both category axes read lower
+while the aspiration axis stayed in-band. Do not read the falling axis1/axis1b as de-concentration.
+
+**S4.6 — UNDECIDABLE, and the positive control is what establishes that.** 0 candidates at
+`--min-failures 2` AND at `--min-failures 1`; distinct failing-goal members **0**.
+`ceiling_ratio` **0.0053** (154 of 28893) — inside the ~0.0026-0.009 band, so this is a COVERAGE
+measurement and not a skill-quality one. Routed nothing. `--failing-invocations` reported
+`failing_count: 4` against 0 surfaced candidates: read that gap as coverage, never as suppression
+working. Per-agent spans show the INDEPENDENT-PULL shape (not the batched seed): alpha resident and
+live `09-03T02:06..10:16` (windows 62, 18/5632 in span), **bravo `07-15T17:10` — 50 days stale**,
+echo `08-06T07:55`, foxtrot `08-06T08:54`, zeta `08-04T01:01` — four peers on three different dates.
+In-span coverage 0.3-0.8% each.
+
+**S4b** `infrastructure`: scanned **747** / mature **246** / candidates **54**, top **`rb-8476`**
+(retrieved **12x**, v2 **0.0**) — retrieved often, credited never. Stored as the only routable LOW
+signal. Naming the sampled category beside the top, per the 09-03T04:2x row's practice: this top is
+NOT the `rb-8483` that row reached from `roblox-integration`, so the two categories yield different
+tops — mild evidence FOR category-dependence, where that row found the opposite.
+
+**S4.5** 0 new / **2 dedup-suppressed** / 0 rb-245 / 0 filed.
+**S1 / S4a** not routed — known-owned (g-115-3215) and known-confound respectively; **no cross-agent
+sensor census run this pass, so no S1 trend is reported.**
+**Net:** stamp written FIRST via `verified-wm-set.sh` (landed, verified 10:34:24); S2a reading
+attached to g-115-5462 rather than filed (the block's prescribed handling); 1 LOW signal to WM;
+nothing filed.

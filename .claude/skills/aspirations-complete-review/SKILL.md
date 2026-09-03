@@ -363,6 +363,18 @@ IF goals_added_to_completing_asp == 0:
         # Plateau confirms this aspiration has run its course
 ```
 
+## Phase 7.7: Worker-Closure Sampling Audit (report-only)
+
+```
+Bash: py -3 core/scripts/worker-closure-audit.py --asp {asp.id} --source {source}
+```
+
+Samples this aspiration's worker closures (every HIGH + a deterministic fraction) and
+appends AGREE / DISAGREE / REVIEW to `world/audit-reports/worker-closure-audit.jsonl`.
+Never blocks archival. Route real findings through Steps 7.5.4-7.5.5. Position is
+load-bearing — 7.4 jumps to 7.5.9 and would skip it (guard-1843).
+Why: `core/config/rationale/worker-closure-audit.md`
+
 ## Archival Decision
 
 ```

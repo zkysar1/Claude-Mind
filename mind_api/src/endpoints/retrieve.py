@@ -286,7 +286,16 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
             "EXP_PATH": _r.EXP_PATH,
             "EI_PATH": _r.EI_PATH,
             "FRAMEWORK_WORLD_CONVENTIONS_DIR": _r.FRAMEWORK_WORLD_CONVENTIONS_DIR,
+            # : not a path global, but it belongs here for exactly the
+            # reason the block exists — it is request-scoped module state on a
+            # long-lived multi-agent process, so the `finally` must put the
+            # previous list back or one request's skip is reported on the next.
+            "TELEMETRY_SKIPS": _r.TELEMETRY_SKIPS,
         }
+        # Fresh list per request (a NEW object, so the restore above hands back
+        # the untouched original). Loaders append here when a telemetry write is
+        # structurally un-landable on this box; drained into session_record below.
+        _r.TELEMETRY_SKIPS = []
         # Decision #58: also swap MIND_AGENT env. _infer_in_flight_goal_id()
         # reads os.environ["MIND_AGENT"] + WORLD_DIR/team-state.yaml; _fileops
         # _agent_name() (save_history / append_changelog attribution on the
@@ -589,6 +598,13 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                     },
                     "utilization_pending": True,
                     "utilization_completed_at": None,
+                    # : [] on the normal path. Non-empty means the
+                    # retrieval RAN and returned its full payload, but a counter
+                    # write could not land on this box (own-cloud no_claim —
+                    # this box does not hold the agent's runner claim). Recorded
+                    # so a reader can tell that apart from "no retrieval
+                    # happened", which is the same manifest state otherwise.
+                    "telemetry_skipped": list(_r.TELEMETRY_SKIPS),
                 }
                 try:
                     from _fileops import locked_write_json

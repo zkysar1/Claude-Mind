@@ -37,6 +37,87 @@ from _pipeline_fields import warn_unknown_fields  # noqa: E402  #  unknown-key W
 # ---------------------------------------------------------------------------
 
 VALID_STAGES = {"discovered", "active", "measurement-pending", "resolved", "archived"}
+
+#: Monotonic lifecycle rank. DELIBERATELY the same ordering as
+#: `coordination_merge._PIPELINE_STAGE_RANK`, which has always treated the
+#: lifecycle as forward-only ("a resolution/archival must never be reverted by a
+#: peer's concurrent metadata bump"). The MERGE layer enforced that invariant;
+#: this WRITE layer did not, so a second resolve overwrote the first verdict
+#: locally and the merge then faithfully propagated the survivor. Duplicated
+#: rather than imported because core/scripts is Layer 1 and mind_api/src is
+#: Layer 2 — the layering gate forbids the import, and a 5-key dict is the
+#: cheaper of the two evils. If you change one, change both.
+_STAGE_RANK = {
+    "discovered": 0, "active": 1, "measurement-pending": 2,
+    "resolved": 3, "archived": 4,
+}
+#: Stages carrying a verdict that later writes must not silently replace.
+TERMINAL_STAGES = ("resolved", "archived")
+
+
+def _terminal_transition_refusal(current_stage: str, target_stage: str) -> str | None:
+    """Why this move would destroy a recorded verdict, or None if it is legal.
+
+    THE PREDICATE IS STAGE-BASED, NOT OUTCOME-BASED, and that is a deliberate
+    choice the goal asked to be stated (g-306-421 DO(3)). An "already carries a
+    non-null outcome" predicate fails in BOTH directions: g-115-4376 measured 40
+    archived records with `outcome: null`, so an outcome test would leave every
+    one of them re-writable, while records that DO carry an outcome would have
+    their perfectly normal resolved->archived archival refused. Stage is also the
+    field the merge layer already ranks, so write-side and merge-side agree on
+    what "terminal" means instead of holding two different notions of it.
+
+    FORWARD MOVES STAY LEGAL — resolved -> archived above all. That is the
+    ordinary archival lifecycle and archive_sweep depends on it; refusing it
+    would strand every resolved record permanently. This file has already paid
+    for exactly that mistake once: a whole-record position check made 70 records
+    immutable to EVERY later mutation "including archive_sweep, which is the
+    mechanism that would have retired it" (g-115-4821). guard-1080 is the
+    general form — narrow a guard to the harmful STATE TRANSITION, never to the
+    whole operation — so the refusal below fires only when the record is ALREADY
+    terminal and the move makes no forward progress.
+
+    ARCHIVED -> ARCHIVED IS DELIBERATELY STILL ALLOWED, and it is the reason
+    this predicate is not the tidier "already terminal and no forward progress".
+    guard-1080 says to enumerate the callers that legitimately do the thing you
+    are about to forbid; that enumeration found one, pinned by
+    test_move_to_archived_idempotent_no_double_append, which asserts a SECOND
+    move to archived returns 200. It is idempotent BY DESIGN: tombstone-in-live
+    archival (g-115-1986) exists because a pre-removal peer copy can resurrect a
+    record at its old stage, and the re-move is how the fleet re-converges. The
+    archive append is separately deduped by id, so the repeat costs nothing.
+    Re-RESOLVING has no such caller and no such purpose — it only overwrites a
+    verdict — which is why the two same-stage cases are split rather than
+    handled by one rank comparison.
+
+    THIS IS NOT A COMPLETE INVARIANT, and saying so here is the point. It guards
+    the MOVE path only. `update_field` has no field whitelist (it accepts any key
+    already on the record), so `--field stage --value active` can launder a
+    resolved record back to a live stage and a re-resolve then walks in the front
+    door. That hole is real, is NOT closed here, and closing it needs its own
+    caller enumeration — legitimate stage-via-update-field writers may exist and
+    guard-1080 applies to that change exactly as it applied to this one. Tracked
+    as a successor goal. The write-once `_stamp_resolution_provenance` is what
+    still holds on that path, which is why it was not removed as redundant.
+
+    No override argument exists, and that is also deliberate. A verdict recorded
+    in error is corrected through `pipeline-update-field.sh --field outcome`,
+    which reaches the record at any stage and is unaffected by this guard, so
+    nothing is stranded by refusing here. An override flag would be a second
+    route to the one operation this guard exists to make deliberate.
+    """
+    if current_stage not in TERMINAL_STAGES:
+        return None
+    if current_stage == "resolved" and target_stage == "resolved":
+        return ("Record is already stage=resolved; resolving it again would "
+                "silently replace its recorded outcome, outcome_date and "
+                "resolution fields with whichever write ran last.")
+    if _STAGE_RANK.get(target_stage, -1) < _STAGE_RANK.get(current_stage, -1):
+        return (f"Record is already stage={current_stage}; moving it BACK to "
+                f"{target_stage} would revert a recorded resolution. The "
+                f"lifecycle is forward-only (see _STAGE_RANK) and the own-cloud "
+                f"merge relies on it.")
+    return None
 VALID_HORIZONS = {"micro", "session", "short", "long"}
 VALID_TYPES = {"high-conviction", "calibration", "exploration", "contrarian"}
 VALID_OUTCOMES = {"CONFIRMED", "CORRECTED", "EXPIRED", "UNRESOLVABLE"}
@@ -638,6 +719,25 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                 return Response.error(404, "record_not_found",
                                       f"Record {rec_id} not found in live file")
             idx, rec = found
+
+            # Terminal-verdict guard (). BEFORE the merge loop, so the
+            # decision reads the stage ON DISK and a `stage` key in the merge
+            # body cannot talk its way past it. Returning here writes nothing:
+            # `rec` is still the unmutated dict from `items` and _write_jsonl
+            # has not run.
+            refusal = _terminal_transition_refusal(rec.get("stage"), target_stage)
+            if refusal is not None:
+                return Response.error(
+                    400, "invalid_stage_transition",
+                    f"{refusal} Pick the route that matches what is true: "
+                    f"(1) the recorded verdict is WRONG and needs correcting -- "
+                    f"pipeline-update-field.sh <id> --field outcome --value <v> "
+                    f"(reaches the record at any stage; this guard does not "
+                    f"apply). (2) the hypothesis should be re-examined as NEW "
+                    f"evidence -- form a fresh record rather than overwriting "
+                    f"the original verdict, so both readings survive. "
+                    f"(3) you are ARCHIVING a resolved record -- that is "
+                    f"stage=archived and is still allowed.")
 
             for key, val in merge_data.items():
                 rec[key] = val

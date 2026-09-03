@@ -265,6 +265,18 @@ def test_a_produced_APPROVE_by_the_CLOSER_still_cannot_release(tmp_path):
 
 # ─── outcome 3, the routing half: a REJECT reaches the GOAL, not just the ledger ──
 
+def _verdict_file(tmp_path: Path, goal_id: str) -> Path:
+    """Where CLOSE_REVIEW_LEDGER_DIR=tmp_path actually puts the artifact.
+
+    Spelled out rather than guessed. The gate nests it under
+    audit-reports/close-reviews/ (guard-599 — place under an EXISTING
+    top-level dir), so a bare tmp_path/<goal>.json misses it — and the
+    `assert not ...exists()` cases would then pass VACUOUSLY, which is the
+    reason this is a helper instead of a literal repeated six times.
+    """
+    return tmp_path / "audit-reports" / "close-reviews" / f"{goal_id}.json"
+
+
 def _producer_module():
     """close-review-verdict.py by path — its filename is hyphenated."""
     import importlib.util
@@ -363,7 +375,139 @@ def test_a_routing_failure_is_LOUD_and_never_crashes_the_verdict(monkeypatch, ca
     err = capsys.readouterr().err
     assert "ROUTING FAILED (rc=2)" in err and "goal g-9-9 not found" in err
 
-    # Nothing to route is a no-op, not a failure report.
+    # PIN FLIPPED 2026-09-03 ( independent re-review, finding F4).
+    # This asserted SILENCE on the empty case, on the reading that "nothing to
+    # route is a no-op, not a failure report". The function's own docstring
+    # says the opposite two lines up — "It must also never be silent: an
+    # unrouted REJECT looks exactly like a goal nobody found defects in" — and
+    # the docstring is right, because the ONLY call site is behind
+    # `if args.route_to_goal and payload["verdict"] != "APPROVE"`: reaching
+    # here means a caller explicitly asked to route rework from a
+    # close-blocking verdict and there was none. That is the stall the module
+    # docstring warns about ("blocks the close without routing the rework"),
+    # not a benign no-op.
+    #
+    # The RETURN contract is unchanged (still False, still no raise) — only the
+    # silence is gone. Flipping a pin is worth this much comment because the
+    # move is indistinguishable from covering up a regression when it isn't
+    # explained.
     monkeypatch.setattr(m.subprocess, "run", boom)
     assert m.route_findings("g-9-9", "world", "peer", []) is False
-    assert capsys.readouterr().err == ""
+    err = capsys.readouterr().err
+    assert "NOTHING ROUTED" in err and "no findings" in err
+
+
+# ---------------------  re-review: F2, F3, F5 ---------------------
+
+def test_reviewed_at_is_stamped_on_every_written_verdict(tmp_path):
+    """F2. WHEN a review happened was unrecoverable from the artifact — absent
+    from the producer, the gate and the skill alike. Nothing gates on it; it is
+    the audit field that makes a ledger row datable at all."""
+    r = _run(tmp_path, "--goal", "g-9-9", "--reviewer", "peer",
+             "--source-file", str(_source(tmp_path)),
+             "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)),
+             "--approve", "--write")
+    assert r.returncode == 0, r.stdout + r.stderr
+    rec = json.loads(_verdict_file(tmp_path, "g-9-9").read_text(encoding="utf-8"))
+    # naive ISO-8601 to the second, the repo-wide stamp shape
+    assert len(rec["reviewed_at"]) == 19 and rec["reviewed_at"][10] == "T"
+
+
+def test_approve_with_notes_releases_the_close_AND_routes_its_notes(tmp_path, monkeypatch):
+    """F3. The binary forced a reviewer with non-blocking observations to either
+    REJECT a sound close or drop the observations.
+
+    Both halves are asserted together because either alone is a different (and
+    broken) feature: a third state the GATE does not recognise silently behaves
+    as REJECT, and one that does not ROUTE leaves the notes in a ledger nobody
+    reads — which is the same "reaches the ledger and nobody else" defect the
+    REJECT routing already exists to fix.
+    """
+    m = _producer_module()
+    calls = []
+    monkeypatch.setattr(m, "route_findings", lambda *a, **k: calls.append((a, k)) or True)
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    rc = m.main(["--goal", "g-9-9", "--reviewer", "peer",
+                 "--source-file", str(_source(tmp_path)),
+                 "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)),
+                 "--approve-with-notes", "--finding", "naming is inconsistent",
+                 "--write", "--route-to-goal", "world"])
+    assert rc == 0, "an approval is an approval — it must not exit like a REJECT"
+    rec = json.loads(_verdict_file(tmp_path, "g-9-9").read_text(encoding="utf-8"))
+    assert rec["verdict"] == "APPROVE_WITH_NOTES"
+    assert len(calls) == 1, "notes that reach only the ledger reach nobody"
+    assert calls[0][1]["verdict"] == "APPROVE_WITH_NOTES"
+
+
+def test_the_gate_RELEASES_on_approve_with_notes(tmp_path):
+    """The consumer half of F3, pinned separately. A third state the producer can
+    write but the gate does not recognise would read as 'not APPROVE' and behave
+    as a REJECT while looking like a third state — the exact trap the producer's
+    own VERDICTS comment predicted."""
+    # via the producer's own loader, so this pins the SAME module object the
+    # producer consults — not a second copy that could diverge from it.
+    g = _producer_module()._gate()
+    assert g.releases_close("APPROVE_WITH_NOTES")
+    assert g.releases_close("  approve_with_notes  "), "written by one hand, read by another"
+    assert g.releases_close("APPROVE")
+    assert not g.releases_close("REJECT")
+    assert not g.releases_close(None)
+
+
+def test_approve_with_notes_carrying_no_notes_is_REFUSED(tmp_path):
+    """Same rule as the fidelity veto (guard-2564): the label may not assert more
+    than the record carries. 'With notes' and no notes is a lie in the direction
+    that matters, because it releases a close."""
+    r = _run(tmp_path, "--goal", "g-9-9", "--reviewer", "peer",
+             "--source-file", str(_source(tmp_path)),
+             "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)),
+             "--approve-with-notes", "--write")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "no notes" in r.stderr
+    assert not _verdict_file(tmp_path, "g-9-9").exists()
+
+
+def test_approve_with_notes_is_still_subject_to_the_fidelity_VETO(tmp_path):
+    """It is an APPROVAL, so the machine veto applies unchanged. Adding a third
+    state must not open a lane around the one check that is mechanised."""
+    r = _run(tmp_path, "--goal", "g-9-9", "--reviewer", "peer",
+             "--source-file", str(_source(tmp_path)),
+             "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+             "--approve-with-notes", "--finding", "x", "--write")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "REFUSING to write APPROVE_WITH_NOTES" in r.stderr
+    assert not _verdict_file(tmp_path, "g-9-9").exists()
+
+
+def test_a_reviewer_may_REJECT_their_own_close(tmp_path):
+    """F5. The independence guard used to fire on any --closer match regardless
+    of verdict, so recording a REJECT on your own work was refused.
+
+    Finding fault in your own close is the one direction that needs no
+    independence — refusing it suppressed the RECORD, not the conflict. The gate
+    itself has always scoped the same function to approvals only
+    (`independence_defect(v, agent) if approved else None`), and the function's
+    docstring opens 'Why this APPROVE verdict is not an INDEPENDENT review'.
+    """
+    r = _run(tmp_path, "--goal", "g-9-9", "--reviewer", "same", "--closer", "same",
+             "--source-file", str(_source(tmp_path)),
+             "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+             "--reject", "--write")
+    assert r.returncode == 3, r.stdout + r.stderr
+    rec = json.loads(_verdict_file(tmp_path, "g-9-9").read_text(encoding="utf-8"))
+    assert rec["verdict"] == "REJECT"
+
+
+def test_self_APPROVAL_is_still_refused_in_both_approving_forms(tmp_path):
+    """The other half of F5, and the reason the scoping is by RELEASING verdict
+    rather than by the --approve flag: APPROVE_WITH_NOTES releases a close too,
+    so it must not become a self-review bypass."""
+    for extra in (["--approve"], ["--approve-with-notes", "--finding", "x"]):
+        r = _run(tmp_path, "--goal", "g-9-9", "--reviewer", "same", "--closer", "SAME",
+                 "--source-file", str(_source(tmp_path)),
+                 "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)),
+                 *extra, "--write")
+        assert r.returncode == 1, (extra, r.stdout + r.stderr)
+        assert "self-review" in r.stderr
+        assert not _verdict_file(tmp_path, "g-9-9").exists()
