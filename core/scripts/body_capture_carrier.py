@@ -146,12 +146,36 @@ def record_local(wm_path, slot: str, item) -> Path | None:
         return None
 
 
+_PUSH_FAILURE_REPORTED = False
+
+
 def push(path) -> bool:
     """Push the WHOLE carrier to the authoritative store. Never raises.
 
     Whole-file rather than delta: see the module docstring. This is what makes a
     failed push self-repairing instead of requiring a retry queue.
+
+    A FAILURE IS REPORTED ONCE PER PROCESS, and the never-raises contract is
+    unchanged (g-306-420). This except used to discard the cause entirely, so a
+    transport that could not work AT ALL was indistinguishable from one that had
+    nothing to send: measured 2026-09-03 on cc-08, a worker Body's carrier held
+    101 undelivered rows while every push returned a quiet False. The cause was
+    a structural `NoClaimError` — the carrier's destination is inside the
+    claim-protected agent tree and a worker Body never holds the runner claim —
+    which is exactly the kind of permanent, non-retryable fault that most needs
+    to be seen and was the least visible.
+
+    Reported ONCE rather than every call on purpose: on a non-reducer box this
+    fails on EVERY append, so per-call logging would be pure noise and would be
+    filtered out by the first reader who noticed it (the failure mode
+    rb-5242's degrade-and-log pattern exists to avoid). One line per process
+    names the exception class, which is what distinguishes a permanent
+    structural refusal from a transient blip.
+
+    Still returns bool and still swallows: a raise here would fail the WM append
+    this transport exists to back, which is strictly worse than a dark push.
     """
+    global _PUSH_FAILURE_REPORTED
     if path is None:
         return False
     try:
@@ -160,7 +184,20 @@ def push(path) -> bool:
         p = Path(path)
         be.write_bytes(p, p.read_bytes())
         return True
-    except Exception:  # noqa: BLE001 — transport must never fail a WM append
+    except Exception as exc:  # noqa: BLE001 — transport must never fail a WM append
+        if not _PUSH_FAILURE_REPORTED:
+            _PUSH_FAILURE_REPORTED = True
+            try:
+                sys.stderr.write(
+                    "[body-capture-carrier] push FAILED (%s: %s) — capture "
+                    "entries are accumulating in the local carrier and are NOT "
+                    "reaching the reducer. Reported once per process; further "
+                    "failures are silent. A NoClaimError here is STRUCTURAL, "
+                    "not transient (g-306-420).\n"
+                    % (type(exc).__name__, exc)
+                )
+            except Exception:  # noqa: BLE001 — reporting must never fail the push
+                pass
         return False
 
 

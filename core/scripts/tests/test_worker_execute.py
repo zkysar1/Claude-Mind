@@ -44,7 +44,53 @@ SID_B = "66666666-6666-4666-8666-666666666666"
 def test_worker_runs_select_claim_execute():
     for p in ("select", "claim", "execute"):
         assert we.worker_should_run_phase(p), f"worker must run {p}"
-    assert we.WORKER_PHASES == ("select", "claim", "execute")
+    assert we.WORKER_PHASES == ("select", "claim", "execute", "verify-own-unit")
+
+
+def test_worker_runs_verify_own_unit_but_not_the_reducer_verify_phase():
+    """: the per-unit half of verification moved to the worker; the
+    reducer keeps the residue.
+
+    Both halves are asserted together ON PURPOSE. The whole safety property of
+    the split is that these two phases are DIFFERENT SCOPES, so a change that
+    collapsed them -- e.g. "simplifying" by letting a worker run `verify` --
+    would keep the first assertion green while destroying the design. Pinning
+    the negative beside the positive is what makes that regression loud.
+    """
+    assert we.worker_should_run_phase("verify-own-unit")
+    assert not we.worker_should_run_phase("verify")
+    assert "verify" in we.REDUCER_ONLY_PHASES
+    assert "verify-own-unit" not in we.REDUCER_ONLY_PHASES
+
+
+def test_verify_own_unit_is_a_scoped_call_naming_its_mode():
+    """It must be a SCOPED_CALL into the existing verify skill (guard-1867 /
+    guard-2676: invoke the component, never transcribe its steps), and a
+    scoped call is only distinguishable from a transcription by naming the
+    mode INSIDE that component."""
+    d = we.LIFECYCLE_DISPOSITIONS["verify-own-unit"]
+    assert d.kind == we.SCOPED_CALL
+    assert "aspirations-verify" in d.target
+    assert (d.mode or "").strip(), "a scoped call must name its mode"
+    assert "own-unit" in d.mode
+
+
+def test_verify_own_unit_is_marked_pending_until_the_loop_actually_invokes_it():
+    """The phase is DECLARED but worker-loop does not yet invoke the verify
+    skill, so the row must carry `pending_goal` — otherwise it reads downstream
+    as evidence the wiring exists.
+
+    This test is deliberately written to FAIL when the wiring lands: whoever
+    wires worker-loop Phase 4a to invoke the scoped verify must come here,
+    delete the pending marker, and delete this test. That is the point — a
+    pending marker nobody is forced to remove becomes permanent, and then the
+    table is lying in the other direction.
+    """
+    d = we.LIFECYCLE_DISPOSITIONS["verify-own-unit"]
+    assert d.pending_goal == "g-306-417", (
+        "verify-own-unit must stay marked pending until worker-loop Phase 4a "
+        "actually invokes the scoped verify skill; if you just wired it, "
+        "remove pending_goal AND delete this test")
 
 
 def test_worker_skips_all_reducer_only_phases():

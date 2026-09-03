@@ -54,18 +54,18 @@ The phase contract is owned by `core/scripts/worker_execute.py`, NOT duplicated
 here, so the worker and its tests agree on one source of truth:
 
 ```
-Bash: py -3 core/scripts/worker_execute.py phases               # -> select claim execute
+Bash: py -3 core/scripts/worker_execute.py phases               # the phases this loop RUNS
 Bash: py -3 core/scripts/worker_execute.py reducer-only-phases  # the phases this loop SKIPS
 Bash: py -3 core/scripts/worker_execute.py should-run-phase <p> # exit 0 = run, exit 1 = skip
 ```
 
-A worker runs ONLY `select`, `claim`, `execute`. Every reducer-only phase
-(`verify`, `spark`, `complete-review`, `state-update`, `evolution`,
-`learning-gate`, `productivity-check`) returns `skip`. `verify` there means the
-LLM phase (/aspirations-verify: hypothesis outcomes, Q1/Q2/Q3, dependent
-unblocking); the MECHANICAL status write for the unit the worker itself executed
-is Phase 4a below — a scoped call to the shared close writer, sanctioned by the
-`REDUCER_ONLY_PHASES` note in `worker_execute.py` (2026-08-16, g-115-6337).
+A worker runs ONLY those; `verify-own-unit` is DECLARED, NOT WIRED (g-306-417),
+so the loop body below is the whole contract — never read the `phases` output as
+an instruction to verify. Every reducer-only phase (`verify`, `spark`,
+`complete-review`, `state-update`, `evolution`, `learning-gate`,
+`productivity-check`) returns `skip`. `verify` there is the LLM phase; the
+MECHANICAL close for this worker's own unit is Phase 4a below (g-115-6337).
+Rationale: core/config/rationale/worker-verify-own-unit.md
 
 ## The lifecycle split + the no-transcription rule (g-306-212)
 
@@ -650,10 +650,10 @@ FOR EACH spark-worthy observation from this work unit (usually 0 or 1, rarely >2
 # useful narrative. Capturing only interesting units would bias the archive
 # toward drama and silently lose the baseline it is measured against.
 #
-# Do NOT write the experience .md here. Encoding is reducer-only-by-design
-# (worker_execute.LIFECYCLE_DISPOSITIONS), and the reducer half is a CALL into
-# the existing writers — experience-add.sh and experience-archive-goal.sh — never
-# a reimplementation (no-transcription contract, guard-2676).
+# You MAY also write the experience .md for THIS goal: experience-add.sh takes
+# a worker write SCOPED to a goal this Body holds, rc=3 otherwise (g-306-418;
+# partition in digest 4.25). Tree/rb/guardrail/journal stay reducer-only. OFF
+# the claim-holding box it returns no_claim: relay, never retry.
 Bash: echo '{"goal_id":"<goal-id>","category":"<goal.category>","execution_summary":"<2-3 sentences: what was done and what it produced>","outcome_class":"<deep|routine>","key_decisions":["<decision + why, one per entry>"],"surprise_level":<0-10>,"verbatim_anchors":["<exact error codes / paths / hashes / commit shas — the strings a future reader would grep for>"]}' | bash core/scripts/wm-append.sh exp_capture
 # verbatim_anchors is the field that makes this worth more than reconstructing
 # from the goal record: exact strings die with the session that saw them, and a

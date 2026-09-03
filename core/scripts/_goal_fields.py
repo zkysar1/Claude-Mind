@@ -58,6 +58,15 @@ GOAL_KNOWN_FIELDS = frozenset({
     'blocked_since',                     # 98
     'blocker_ref',                       # 14
     'cadence_signal',                    # 2
+    # 0 live (g-369-109). READ by cargo-cult-detector.py in BOTH adaptive-
+    # cadence paths — _propose_new_interval (auto-extend, g-115-2049) and
+    # cmd_contract_per_goal (auto-contract, added in this same change) — but
+    # it was absent here, so `aspirations-update-goal.sh <g> calibration_exempt
+    # true` was refused `unknown_goal_field` and NO goal could carry it. A
+    # reader with no writable field is an inert mechanism (guard-3625). Shipped
+    # with its writer, per this module's extension rule: the same change sets it
+    # on g-369-14 (role-owned fleet-manager check-in, deliberate cadence).
+    'calibration_exempt',                # 0 (new)
     'category',                          # 2782
     'claimed_at',                        # 22
     'claimed_by',                        # 24
@@ -104,6 +113,7 @@ GOAL_KNOWN_FIELDS = frozenset({
     'estimated_depth',                   # 38
     'estimated_seconds',                 # 34
     'evidence_note',                     # 12
+    'executable_by_role',                # 0 (g-115-7372: role-VALUED worker|reducer|any; NO dispatch semantics)
     'executed_by',                       # 886
     'executed_by_sid',                   # 886
     'expected_coverage_paths',           # 2

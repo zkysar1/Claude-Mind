@@ -1153,6 +1153,36 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
         sys.stderr.write(f"cargo-cult-detector: {args.goal_id} is not recurring\n")
         return 1
 
+    # calibration_exempt applies to BOTH adaptive-cadence directions ().
+    # This function's own docstring calls itself a "Mirror of the auto-extend
+    # per-goal path", and it was not one: _propose_new_interval returns None on
+    # this flag, so an exempt goal could not be auto-EXTENDED but could still be
+    # auto-CONTRACTED, one divisor step at a time, down to floor_ratio x original.
+    # The flag's stated rationale (, at its extend-path site) is that a
+    # review-ritual goal "fires at a DELIBERATE cadence" — which argues against
+    # moving that cadence in EITHER direction, and the name says `calibration`,
+    # not `extension`. A half-wired opt-out is worse than none: it reads as a
+    # full exemption at the call site while one direction still moves.
+    #
+    # Measured on  (role-owned fleet-manager check-in, intended_agent
+    # bravo): original 12.0h already contracted to 8.0h, and a dry-run of this
+    # path proposed 8.0h -> 5.33h next. The tightening inflates the lateness
+    # RATIO for the same absolute gap (48.57h read 6.07x at 8h vs 4.05x at 12h),
+    # manufacturing streak-break noise without changing real fire frequency —
+    # rb-434: shortening the interval to fit is cargo-cult, not efficiency.
+    #
+    # Note the sibling suppression gate below cannot cover this class: it reads
+    # the RUNNING agent's own session/streak-breaks.jsonl, so for a goal whose
+    # closes are spread across agents the lateness evidence is partitioned
+    # per-box and no box reaches contract_suppress_min_samples. Measured: 0
+    # entries for  in alpha's file (81 lines, 24139 B — populated, just
+    # not with this goal), which that gate reads as "fires on time".
+    if goal.get("calibration_exempt"):
+        print(f"[cargo-cult-contract] EXEMPT: {args.goal_id} is "
+              f"calibration_exempt — deliberate cadence, not auto-contracted "
+              f"(symmetric with the auto-extend path)")
+        return 0
+
     interval_hours = goal.get("interval_hours")
     consecutive_deep = int(goal.get("consecutive_deep", 0))
     asp_id = asp.get("id")

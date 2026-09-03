@@ -335,7 +335,7 @@ def test_carrier_table_did_not_disturb_the_phase_or_lifecycle_contracts():
     """Three SSOT tables now live in this module. A change to one must not
     quietly break another -- cheap to assert, and the reason to assert it here
     is that all three are edited in the same file."""
-    assert we.WORKER_PHASES == ("select", "claim", "execute")
+    assert we.WORKER_PHASES == ("select", "claim", "execute", "verify-own-unit")
     assert we.lifecycle_gaps() == []
 
 

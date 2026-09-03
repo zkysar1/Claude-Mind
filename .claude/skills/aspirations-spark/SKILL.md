@@ -955,9 +955,9 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
             - Why this confidence level was chosen
             - What would change the prediction
         WORKER-BODY BRANCH (g-115-6155) — decide BEFORE the add call below.
-        experience-add.sh REFUSES on a worker Body ('BODY=worker — SKIPPED
-        agent-wide experience write'). The fence is CORRECT (encoding is
-        reducer-only). What must NOT happen is the improvised hand-off it
+        experience-add.sh REFUSES this rc=3: since g-306-418 it takes only a
+        record SCOPED to a goal this Body HOLDS. The fence is CORRECT. What
+        must NOT happen is the improvised hand-off it
         used to force: staging the payload JSON in agents/<agent>/temp/ and
         naming the command in the outcome_note. The reducer inherits a
         well-written command pointing at a file it cannot read, and when the
@@ -991,7 +991,7 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
         NOT a reliable carrier: survival is topology-dependent (cross-box
         worker synced; same-box forked Body lost — both measured, g-115-6155).
         IF this Body is a worker (fork WM present per worker-loop Phase -0,
-        or the add below just refused with the BODY=worker message):
+        or the add below just refused rc=3):
             - Still write the .md above — bonus redundancy where it survives.
             - INLINE the complete experience JSON into THIS goal's
               outcome_note, appended as a block headed exactly:

@@ -223,8 +223,12 @@ def test_live_corpus_discovery_is_not_vacuous():
     """A deriving scanner that matches NOTHING makes every other test trivially true.
 
     Carried forward from test_bash_embedded_python_blocks.py, which this suite
-    supersedes. It catches a REGEX collapse -- an opener derivation that stops
-    matching -- and nothing else.
+    superseded and which was RETIRED 2026-09-03 (g-115-4846) -- so this floor is
+    now the only surviving descendant of that file's anti-vacuity assertion, and
+    the "do NOT delete this assertion" note it carried transfers here. Recover
+    the retired file with `git show <pre-retirement-sha>:core/scripts/tests/
+    test_bash_embedded_python_blocks.py` (blob e7c85b17). It catches a REGEX
+    collapse -- an opener derivation that stops matching -- and nothing else.
 
     IT IS NOT THIS SUITE'S ANTI-VACUITY GUARD, and describing it as one is the
     error guard-1793 names: an aggregate chosen as the vacuity proof is often

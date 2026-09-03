@@ -400,6 +400,24 @@ def iter_roots(explicit):
     the world root unconditionally would silently un-hermeticize every fixture
     test (guard-1836: a coverage assertion has no power against over-matching,
     so it must be paired with a control naming what must NOT be scanned).
+
+    WHY THE WORLD ROOT IS NOT OPTIONAL, carried forward 2026-09-03 (g-115-4846)
+    from test_bash_embedded_python_blocks._scan_roots, which this tool
+    supersedes and which was retired in that goal. That docstring was where the
+    previous author put the reasoning, and it describes ANY scanner of this
+    class -- this one included -- not the retired implementation (guard-4561):
+
+      - The canonical incidents of this very class (g-115-3430, g-115-3498)
+        happened in the WORLD script dir, not in core. A guard that skips the
+        surface that motivated it is the guard-1291 failure mode, so dropping
+        the world root is never a neutral narrowing however convenient it is.
+      - The world dir is an EXTERNAL, gitignored path, so it is genuinely
+        absent on a fresh clone or in CI. That is a SUPPORTED CONFIGURATION,
+        not a breakage: the `configured-absent` state below narrows coverage
+        honestly and reports it, which is why it is not the guard-139 masking
+        anti-pattern. The distinction is whether the absence is REPORTED --
+        silently scanning one root and printing "clean" is the defect
+        (measured 2026-08-10: 137 blocks / 1 root read as a clean corpus).
     """
     if explicit:
         return [Path(e) for e in explicit if Path(e).exists()], "explicit-root"

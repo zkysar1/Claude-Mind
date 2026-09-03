@@ -509,9 +509,9 @@ text is a human-readable summary. Tags carry structured metadata:
 
 | Tag | Format | Purpose |
 |-----|--------|---------|
-| `directive_type` | `priority_shift\|focus_window\|veto` | What kind of influence |
+| `directive_type` | `priority_shift\|focus_window\|veto\|generation_scope` | What kind of influence (`generation_scope`: what an idle agent may or may not CREATE — g-357-94, see below) |
 | `scope` | `session\|until_completed\|permanent` | How long it lasts |
-| `target:<id>` | `target:g-166-06` | Specific goal to boost/deprioritize |
+| `target:<id>` | `target:g-166-06` | Specific GOAL to boost/deprioritize. `target:<agent-name>` matches NOTHING — route to an agent with a bare `<agent>` / `<agent>@<env-id>` tag or `requires_action_by:<agent>` (Phase 2.07 honor rules) |
 | `category:<name>` | `category:infrastructure` | Category-level influence |
 | `weight:<N>` | `weight:+2.0` or `weight:-1.5` | Additive score modifier |
 | `expires:<ISO>` | `expires:2026-04-05T00:00:00` | Auto-expiry timestamp |
@@ -524,7 +524,7 @@ assuming a directive reached the Body you meant it for.
 | # | Step | Who runs it | Body scope |
 |---|---|---|---|
 | 1 | **Post**: Sender posts directive to coordination channel with relevant tags | sender | any Body |
-| 2 | **Scan**: Receiver's Phase 2.07 (Directive Scan) reads directives since last scan | `aspirations-select` | **REDUCER ONLY** |
+| 2 | **Scan**: Receiver's Phase 2.07 (Directive Scan) reads directives since last scan — and, since g-357-94, the all_blocked early-return branch runs the same ACK read before returning | `aspirations-select` | **REDUCER ONLY** |
 | 3 | **Score**: `goal-selector.py` reads active directives, applies `directive_boost` as a weighted scoring criterion to matching goals/categories | `goal-selector.py` | **EVERY Body** |
 | 4 | **Acknowledge**: Receiver posts `--type status --reply-to <directive-id>` with tag `acknowledged,<agent-name>` | `aspirations-select` | **REDUCER ONLY** |
 | 5 | **Expire**: Directives auto-expire per their `expires` tag, or `scope: session` directives expire at session end | mechanical | n/a |
@@ -580,6 +580,22 @@ that goal proposed, would have shipped a contract that is false in the common ca
 and silent on the real gap (2). Note also that steering which must produce *work*
 still has to reach a queue: a board post alone is advisory context and the selector
 only sees queues (guard-732).
+
+### Generation-scope directives — what reaches an IDLE agent
+
+Steps 2–4 only ever touch EXISTING goals, and until g-357-94 (2026-09-03) they did
+not run at all while an agent was all-blocked: `aspirations-select` returned at the
+all_blocked branch BEFORE Phase 2.07, so a directive to an idle agent was neither
+acked nor marked for as long as it stayed idle (measured on a single-agent
+deployment: a user scope directive unheard for 4h), and the all-blocked handler's
+B0 read only escalation / review-request posts. Now the all_blocked branch runs the
+ACK read and hands `selection_context.active_directives` to the handler; B0 reads
+active (unexpired, non-veto) directives, B1 carries them as
+`constraint_context.directives`, and B2 passes them to `/create-aspiration
+from-self` as SCOPE. A candidate filed under one cites
+`origin_signal user_directive:<msg-id>` (`peer_directive:<msg-id>` for an agent
+sender). Scope is not supply evidence — the aspiration-supply gate's bar is
+unchanged — and a directive still creates no work by itself (guard-732).
 
 ### Rules
 

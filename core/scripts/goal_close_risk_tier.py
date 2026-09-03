@@ -82,12 +82,28 @@ def _text_of(goal: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def named_entities(text: Optional[str]) -> set:
+    """The distinct id-shaped tokens themselves, lowercased.
+
+    Exists so the close-review verdict producer can DIFF two entity sets
+    (source vs artifact) against the same regex the tier classifier counts with
+    (g-357-41). The alternative — a second regex in the producer — is the
+    failure this function prevents: the classifier would route a goal to tier 2
+    for enumerating entities its reviewer then could not see, and the two
+    definitions would drift with nothing failing when they did.
+
+    Lowercased because id families are written both ways in prose and an
+    identity check must not report a case difference as a substitution.
+    """
+    if not isinstance(text, str) or not text:
+        return set()
+    return {m.group(0).lower() for m in _ENTITY_RE.finditer(text)}
+
+
 def count_named_entities(text: Optional[str]) -> int:
     """Distinct id-shaped tokens in text. Distinct, not total: a description that
     repeats one goal id eight times names ONE thing to check, not eight."""
-    if not isinstance(text, str) or not text:
-        return 0
-    return len({m.group(0).lower() for m in _ENTITY_RE.finditer(text)})
+    return len(named_entities(text))
 
 
 def touches_framework(files: Optional[List[str]]) -> bool:

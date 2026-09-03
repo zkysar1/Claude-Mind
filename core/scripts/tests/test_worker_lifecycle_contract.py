@@ -303,10 +303,25 @@ def test_cli_lifecycle_marks_pending_dispositions(capsys):
     with mock.patch.object(we, "LIFECYCLE_DISPOSITIONS", synthetic):
         assert we._main(["lifecycle"]) == 0
     assert "[PENDING g-999-01]" in capsys.readouterr().out
-    # ...and the live table really is clean, which is the fact that forced this
-    # rewrite. If a future row is declared-but-unbuilt this flips red, which is
-    # the prompt to confirm the marker renders for it too.
-    assert [s for s, d in we.LIFECYCLE_DISPOSITIONS.items() if d.pending_goal] == []
+    # ...and the LIVE table's pending set is pinned by name, so a row cannot be
+    # declared-but-unbuilt without someone editing this line.
+    #
+    # This assertion read `== []` until 2026-09-03, and the tripwire worked
+    # exactly as its comment promised:  added `verify-own-unit` and
+    # this flipped red on the first run. The prompt it carried — "confirm the
+    # marker renders for it too" — was then discharged against the real CLI:
+    #   verify-own-unit  scoped-call(aspirations-verify, mode=...)  [PENDING ]
+    # so the marker is verified for the live row, not merely for the synthetic
+    # one above.
+    #
+    # KEEP THIS BY-NAME rather than relaxing to "non-empty". A count-or-presence
+    # assertion would let the NEXT declared-but-unbuilt row slip in silently,
+    # which is precisely the protection the 2026-08-16 rewrite existed to keep
+    # alive when its last subject shipped.
+    assert sorted(
+        s for s, d in we.LIFECYCLE_DISPOSITIONS.items() if d.pending_goal
+    ) == ["verify-own-unit"]
+    assert we.LIFECYCLE_DISPOSITIONS["verify-own-unit"].pending_goal == "g-306-417"
 
 
 def test_existing_phase_cli_surfaces_unchanged():

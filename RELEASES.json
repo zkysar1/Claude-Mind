@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.54",
+    "previous_version": "2.12.53",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Directives reach an all-blocked agent: ack on the all_blocked branch of aspirations-select, active directives carried through the all-blocked handler (B0/B1/B2) as generation scope, generation_scope directive form documented (g-357-94)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.53",
+    "previous_version": "2.12.52",
+    "date": "2026-09-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Owner-directed promote-all 2026-09-03: seed .github preserve fix (g-335-1456), forged-skill tag hygiene, worker claim-race fix (g-306-412), verify scope input (g-306-417), calibration_exempt auto-CONTRACT (g-369-109), auto-retrieval hook dedup + latency budget (g-357-46) + fleet commits since v2.12.52",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.52",
     "previous_version": "2.12.51",
     "date": "2026-09-03",

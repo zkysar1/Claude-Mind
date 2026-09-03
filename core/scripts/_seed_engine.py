@@ -734,6 +734,24 @@ _ORPHAN_SCAN_SKIP_TOP = {
     "agents",               # per-deployment state (created by /start)
     "world",                # per-deployment domain state (external path in source)
     "meta",                 # per-deployment strategy state (external path in source)
+    ".github",              # DESTINATION-OWNED CI configuration. The source has no
+                            # .github/ at all and the manifest has zero .github
+                            # entries in include OR exclude_always, so a transplant
+                            # can never PLANT this tree -- it could only ever DELETE
+                            # it. Measured 2026-09-03 (): the seed
+                            # publication lane added 2026-08-21 (9dc21b38b, )
+                            # published mind-seed.tar.gz exactly ONCE (2026-08-22
+                            # 00:35:40) and was then removed from Claude-Mind main by
+                            # `chore: sync framework (2026-08-23)` (3ea17d0f1), which
+                            # deleted the whole .github tree as orphans. main took 100
+                            # further commits and 12+ merges with ZERO publishes, so
+                            # every live Vinheim customer environment froze on the
+                            # 2026-08-22 artifact -- which is why the owner's resident
+                            # showed no self identity (the exporter in every env
+                            # predates the self projection lane entirely). Same class
+                            # as the .mind-data row below, and the third occurrence:
+                            # a destination-owned tree absent from this set is not
+                            # preserved-by-default, it is destroyed by default.
     ".mind-data",           # in-repo own-cloud world/meta store (ZDS layout since
                             # 2026-06-30). EMERGENCY STOPGAP 2026-07-07 (applied by omni
                             # with user's explicit direction, all three repos): the

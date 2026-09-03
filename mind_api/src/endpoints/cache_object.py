@@ -134,15 +134,29 @@ def _evict_if_oversize(root: Path) -> None:
         if total <= _MAX_BYTES:
             return
         entries.sort(key=lambda t: t[0])
+        evicted = 0
         for _mtime, size, p in entries:
             if total <= _MAX_BYTES:
                 break
             try:
                 p.unlink()
                 total -= size
-                _STATS["evictions"] += 1
+                evicted += 1
             except OSError:
                 continue
+        if evicted:
+            # Counter flush. `evictions` was the ONE _STATS mutation of eight
+            # that ran unlocked, so it lost updates under concurrent misses --
+            # and it is precisely the field that diagnoses cap-thrash (an
+            # evict->refetch loop turns this cache from an egress SAVER into an
+            # amplifier), which is what guard-3992 in the module docstring asks
+            # these counters to make visible.
+            # The lock is taken for the counter ONLY, never across the
+            # rglob+stat+unlink walk above: holding a mutex across filesystem
+            # I/O is the guard-1965 hazard, and it is the same line the sibling
+            # WM fix () drew when it kept store I/O outside wm_lock.
+            with _LOCK:
+                _STATS["evictions"] += evicted
     except OSError:
         return
 
