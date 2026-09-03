@@ -489,6 +489,35 @@ def read_yaml(path):
         data = yaml.safe_load(f)
     return data if isinstance(data, dict) else {}
 
+# g-115-8750. Skips recorded by THIS request's loaders, drained by the daemon
+# retrieve endpoint into the retrieval-session manifest as `telemetry_skipped`.
+# A LIST, not a bool, because the reader needs to know WHICH store and WHY —
+# "the retrieval ran and one counter write could not land" and "no retrieval
+# happened" must stay distinguishable (aspirations-learning-gate Phase 9.5b).
+#
+# Daemon-safety: the endpoint captures this in its per-request `saved` dict and
+# restores it in the `finally`, so a skip can never leak into the NEXT request
+# (the daemon is long-lived and serves every agent from one process). Any new
+# loader that records a skip appends here; nothing else writes it.
+TELEMETRY_SKIPS = []
+
+
+def _no_claim_error_types():
+    """Exception types meaning 'this box structurally cannot land this write'.
+
+    Asked of the BACKEND rather than imported, for the reason the backend's own
+    `no_claim_error` attribute exists: off own-cloud it is the empty tuple, so
+    `except _no_claim_error_types()` is a no-op and the local-backend path keeps
+    byte-identical behaviour. Never widen this to `Exception` — a genuine I/O or
+    lock failure on the counter write must still surface.
+    """
+    try:
+        return getattr(get_backend(), "no_claim_error", ()) or ()
+    except Exception:
+        # Backend unavailable: catch nothing rather than catch everything.
+        return ()
+
+
 def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retrieval_count"),
                       timestamp_path=("utilization", "last_retrieved"), kind=None):
     """Read JSONL under lock, bump retrieval counters on matching records, write back.
@@ -2281,12 +2310,46 @@ def load_experiences(categories, depth, read_only=False):
         # We discard the locked-read return value because `selected` is the
         # caller's contract — keeping it stable preserves the existing
         # "top-N most-proven" semantic the LLM relies on.
-        _locked_bump_jsonl(
-            EXP_PATH,
-            _should_bump,
-            counter_path=("retrieval_stats", "retrieval_count"),
-            timestamp_path=("retrieval_stats", "last_retrieved"),
-        )
+        #
+        # g-115-8750: this bump is the ONE utilization write that lands inside
+        # an AGENT DIR, and on a box that does not hold that agent's runner
+        # claim it is structurally un-landable — so before this guard it took
+        # the whole retrieval down with it (measured cc-07 2026-09-03:
+        # `retrieve.sh --goal` rc=1 after ~18s, while the identical query
+        # without --goal returned a byte-identical payload rc=0). Experience is
+        # the unique case: `kind=None` here means the legacy full-store RMW
+        # (see _locked_bump_jsonl's docstring), and unlike reasoning-bank /
+        # guardrails — whose g-358-22 sidecars live in world/ — and unlike
+        # pattern-signatures, whose store is also in world/, EXP_PATH is under
+        # agents/<agent>/. A telemetry counter must never fail the read that
+        # produced it.
+        #
+        # NOT a bare `except Exception` and NOT a silent pass: the type is
+        # asked of the backend (empty tuple off own-cloud, so this is a no-op
+        # there), every other error still propagates, and the skip is RECORDED
+        # in TELEMETRY_SKIPS so "telemetry skipped" stays distinguishable from
+        # "retrieval never happened" — the distinction aspirations-learning-gate
+        # Phase 9.5b audits on. A silent fail-open would make that audit vacuous
+        # on every non-claim box, which is the failure this goal forbids.
+        try:
+            _locked_bump_jsonl(
+                EXP_PATH,
+                _should_bump,
+                counter_path=("retrieval_stats", "retrieval_count"),
+                timestamp_path=("retrieval_stats", "last_retrieved"),
+            )
+        except _no_claim_error_types() as _exc:
+            TELEMETRY_SKIPS.append({
+                "store": "experience",
+                "path": str(EXP_PATH),
+                "reason": "no_claim",
+                "detail": str(_exc)[:300],
+                "records_not_bumped": len(selected_ids),
+            })
+            print("WARN: experience utilization bump skipped (no_claim): this "
+                  "box does not hold the claim for %s. The RETRIEVAL SUCCEEDED "
+                  "and is being returned; only the counter write was skipped "
+                  "(g-115-8750)." % EXP_PATH, file=sys.stderr)
 
     return selected
 

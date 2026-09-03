@@ -109,6 +109,7 @@ from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter
     derive_runner_capabilities, box_config_from_conf, merge_capability_config,
     goal_is_locally_executable, goal_required_capabilities)
 from _drain_title import is_drain_action_title  # noqa: E402  ( owner-scope drain SSOT)
+import reducer_selection_policy  # noqa: E402  ( reducer selection policy)
 from _dependency_graph import supersession_satisfied_ids  # noqa: E402  ( SSOT, guard-547)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
@@ -876,6 +877,38 @@ def load_recurring_config():
     except Exception:
         pass
     return defaults
+
+
+def load_reducer_selection_policy_config():
+    """reducer_selection_policy from aspirations.yaml, via the same overlay path
+    load_recurring_config uses so meta/config-overrides.yaml entries keyed
+    `aspirations.reducer_selection_policy.*` take effect.
+
+    The defaults dict is the ALLOWLIST, exactly as it is above: the loop iterates
+    `defaults`, so a key present in the YAML but absent here is silently
+    discarded and would read as its default forever with no parse error.
+    """
+    defaults = dict(reducer_selection_policy.DEFAULTS)
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        section = (overlay.merged_config("aspirations.yaml") or {}).get(
+            "reducer_selection_policy", {})
+        if isinstance(section, dict):
+            for k, default in defaults.items():
+                v = section.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+REDUCER_SELECTION_CONFIG = load_reducer_selection_policy_config()
 
 
 RECURRING_CONFIG = load_recurring_config()
@@ -5821,6 +5854,174 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     return picked, status
 
 
+def _reducer_policy_inputs(agent_dir):
+    """The three role signals + the team-state snapshot, read once.
+
+    Separated from the decision so `reducer_selection_policy.decide` stays pure
+    and the CALL SITE -- which is where guard-2783 says this class of defect
+    actually lives -- is the only thing doing I/O.
+    """
+    running_sid = ""
+    try:
+        if agent_dir is not None:
+            f = agent_dir / "session" / "running-session-id"
+            if f.exists():
+                running_sid = f.read_text(encoding="utf-8").strip()
+    except Exception:  # pragma: no cover - fail-open guard
+        running_sid = ""
+    return (os.environ.get("BODY_ROLE"), os.environ.get("MIND_SID"), running_sid)
+
+
+def _append_policy_diary(entry, agent_dir):
+    """Append ONE reducer_selection_policy row to the execution diary.
+
+    LAZY, GUARDED, FAIL-OPEN -- and every one of those three is load-bearing.
+    `execution-diary.py` calls `assert_agent_dir()` at IMPORT time and hard-fails
+    when MIND_AGENT is unset, so a module-level import here would crash the
+    single most load-bearing component in the fleet in every context that lacks
+    it -- tests, ad-hoc runs, any unbound session. Importing inside the function
+    means that assertion is only ever reached on a reducer, where the binding
+    exists by construction.
+
+    The write goes through `execution-diary.sh`, not by opening the JSONL:
+    `bash-store-write-guard.py` maps that store to that script, and the diary is
+    append-only shared state. `bash_cmd` is the guard-580-sanctioned way to build
+    the argv (never a bare "bash" argv[0]).
+
+    WHY THE DIARY AND NOT THE SIDECAR. `write_scorer_verdict` is atomically
+    OVERWRITTEN every run, so it records the current verdict and no history --
+    it cannot answer "did the policy fire on the last three iterations", which is
+    exactly what this goal asks to be auditable.
+    """
+    try:
+        import subprocess as _sp
+        from _runtime_bash import bash_cmd
+        _sp.run(bash_cmd(str(CORE_ROOT / "scripts" / "execution-diary.sh"), "append"),
+                input=json.dumps(entry), capture_output=True, text=True, timeout=20)
+    except Exception as e:  # pragma: no cover - defensive; never block selection
+        print(f"[goal-selector] reducer-policy diary append skipped "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False):
+    """With enough live workers, hoist reducer-only work to the top ().
+
+    Mirrors apply_strategic_focus_floor exactly: it REORDERS one slot and never
+    writes `score`, so every non-floor pick stays byte-identical and the change
+    is a pure reordering. Returns (picked_row_or_None, status_dict).
+
+    THE ROLE GUARD IS FIRST AND THE WORKER PATH IS A NO-OP. `role_of` runs before
+    anything else and only ROLE_REDUCER proceeds; a worker, an observer session
+    and an unbound ad-hoc run all fall out at `decide`'s first branch. That
+    preserves LIFECYCLE_DISPOSITIONS["select"] ("A worker selects exactly like
+    the reducer -- same scorer, same candidate set"): nothing worker-specific is
+    added, and the asymmetry is entirely on the reducer side, which is the
+    direction the owner directive asks for.
+
+    YIELDS TO ANY PRIOR HOIST, for the reason apply_strategic_focus_floor already
+    records: the drain lane and the strategic-focus floor both write index 0, so
+    whichever runs last wins, and this one carries no cadence bound and can take
+    the very next invocation. A standing user directive and a starving recurring
+    goal both outrank a policy preference.
+
+    Fail-open throughout: never raises, never blocks selection.
+    """
+    status = {"role": None, "branch": None, "live_workers": 0, "detail": {},
+              "reducer_only_rows": 0, "picked": None, "yielded": False}
+    body_role, sid, running_sid = _reducer_policy_inputs(agent_dir)
+    role = reducer_selection_policy.role_of(body_role, sid, running_sid)
+    status["role"] = role
+
+    cfg = REDUCER_SELECTION_CONFIG
+    detail = reducer_selection_policy.live_worker_count(
+        _load_team_state_cached() or {}, datetime.now(),
+        cfg.get("claim_fresh_hours", 6.0), exclude_sid=sid)
+    status["detail"] = detail
+    status["live_workers"] = detail["live"]
+
+    decision = reducer_selection_policy.decide(
+        role=role, live_workers=detail["live"], config=cfg)
+    status["branch"] = decision.branch
+    status["reason"] = decision.reason
+    status["threshold"] = cfg.get("worker_threshold")
+
+    # Outcome 1: the reducer logs the count and the branch EVERY iteration --
+    # including the branches that change nothing. A record that only appears when
+    # the policy fires cannot distinguish "did not fire" from "did not run".
+    if role == reducer_selection_policy.ROLE_REDUCER:
+        _append_policy_diary({
+            "entry_type": "decision",
+            "content": (f"reducer_selection_policy: {decision.branch} "
+                        f"({decision.reason})"),
+            "reducer_selection_policy": {
+                "branch": decision.branch,
+                "live_workers": detail["live"],
+                "threshold": cfg.get("worker_threshold"),
+                "stale_rows_ignored": detail["stale"],
+                "undated_rows_ignored": detail["undated"],
+            },
+        }, agent_dir)
+
+    if not decision.prefer_reducer_only or not scored:
+        return None, status
+
+    # THE GOAL FIELD ONLY. `test_selection_stays_role_blind` forbids this file
+    # from naming the worker-side eligibility module AT ALL -- it asserts by raw
+    # source grep, so even a comment mentioning it trips the pin, which is why
+    # this one does not. The fence is right:
+    # LIFECYCLE_DISPOSITIONS["select"] says "there is no worker-specific selection
+    # logic and there must not be one", and reaching for that module here would
+    # put the WORKER's routing code inside the component both roles run. This
+    # floor needs none of it -- `executable_by_role` is a plain field on the goal
+    # record, so the selector reads DATA, not a role module, and the fence stands
+    # unmodified.
+    #
+    # CONSEQUENCE, STATED PLAINLY: this is INERT until 's commit
+    # (e62c24033) is merged off refs/workers/alpha/2fda1f3e... and goals are
+    # stamped -- `executable_by_role` is registered in _goal_fields.py THERE, and
+    # writes are gated on registration, so no goal can carry it yet. Shipping the
+    # mechanism ahead of its data is the same shape as the close-review gate
+    # (), and it is strictly better than making a tested architectural
+    # fence go green by deleting it (guard-4618).
+    nominees = [r for r in scored
+                if reducer_selection_policy.is_reducer_only_row(r)]
+    status["reducer_only_rows"] = len(nominees)
+    if not nominees:
+        return None, status  # nothing reducer-only in the pool -- the inert case
+    if prior_hoist_fired:
+        status["yielded"] = True
+        return None, status
+
+    picked = nominees[0]  # `scored` is already sorted, so this is the best one
+    if scored[0] is not picked:
+        scored.remove(picked)
+        scored.insert(0, picked)
+    picked["reducer_only_pick"] = True
+    status["picked"] = picked.get("goal_id")
+    return picked, status
+
+
+def emit_reducer_only_floor_banner(picked, status):
+    """stderr-only, mirroring emit_strategic_focus_floor_banner -- including the
+    'this IS the sanctioned top pick' clause, which is not politeness: once
+    write_scorer_verdict records the hoist the claim chokepoint accepts it
+    WITHOUT a deviation code, and a hoist the LLM reads as an anomaly gets
+    re-litigated into a deviation that is not needed (guard-2331 direction B)."""
+    if picked is None:
+        return
+    print(
+        "[goal-selector] REDUCER-ONLY FLOOR: promoted {gid} to top — {n} live "
+        "worker Bod(ies) >= threshold {t}, so the reducer steps back from "
+        "ordinary goals and takes reducer-only work while the workers keep the "
+        "rest claimable. {r} reducer-only row(s) were in the pool. Scores are "
+        "UNCHANGED; only ordering moved, for this one slot. This IS the "
+        "sanctioned top pick — claim it without a deviation code.".format(
+            gid=picked.get("goal_id"), n=status.get("live_workers", 0),
+            t=status.get("threshold", "?"), r=status.get("reducer_only_rows", 0)),
+        file=sys.stderr,
+    )
+
+
 def emit_strategic_focus_floor_banner(picked, status):
     """stderr-only, mirroring emit_drain_lane_banner. Says WHY the top pick is
     not the scorer's, so the LLM does not read the hoist as a scoring anomaly —
@@ -6325,6 +6526,12 @@ def cmd_select(args):
     # aspirations-claim.sh, which is the exact failure guard-2331 measured. Same
     # defensive wrapper as the lane: a floor bug must never suppress the ranked
     # output every agent depends on each iteration.
+    # _sf_pick is pre-bound for the same reason _sf_floor_status is: the except
+    # arm below prints but does not assign, so a floor error would leave the name
+    # UNBOUND and the  reducer-only floor's `prior_hoist_fired` argument
+    # would raise NameError — silently disabling that floor whenever this one
+    # errored. Pre-binding makes an error here mean "no hoist", which is true.
+    _sf_pick = None
     _sf_floor_status = {}
     try:
         _sf_pick, _sf_floor_status = apply_strategic_focus_floor(
@@ -6333,6 +6540,30 @@ def cmd_select(args):
         emit_strategic_focus_inert_banner(_sf_floor_status)
     except Exception as e:  # pragma: no cover - defensive; floor must never block
         print(f"[goal-selector] strategic-focus floor error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    # REDUCER-ONLY FLOOR (, OWNER DIRECTIVE 2026-09-03). Runs AFTER both
+    # prior hoists and yields to either, for the reason apply_strategic_focus_floor
+    # already records: all three write index 0, so whichever runs last wins, and
+    # this one carries no cadence bound and can take the very next invocation. A
+    # standing user directive and a starving recurring goal both outrank a policy
+    # preference. BEFORE write_scorer_verdict for the same reason the other two
+    # are: without that ordering the promoted goal is UNCLAIMABLE at
+    # aspirations-claim.sh (guard-2331 direction B). Same defensive wrapper — a
+    # policy bug must never suppress the ranked output every agent depends on.
+    #
+    # The role guard is INSIDE the function and runs before the decision, so on a
+    # WORKER this whole block is a no-op and selection stays byte-identical
+    # (LIFECYCLE_DISPOSITIONS["select"]: "there is no worker-specific selection
+    # logic and there must not be one" — none is added; the asymmetry is entirely
+    # on the reducer side, which is the direction the directive asks for).
+    try:
+        _ro_pick, _ro_status = apply_reducer_only_floor(
+            scored, AGENT_DIR,
+            prior_hoist_fired=(_lane_pick is not None or _sf_pick is not None))
+        emit_reducer_only_floor_banner(_ro_pick, _ro_status)
+    except Exception as e:  # pragma: no cover - defensive; policy must never block
+        print(f"[goal-selector] reducer-only floor error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
     # : log meta-strategy application. Proof-of-concept that the

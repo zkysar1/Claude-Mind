@@ -40,7 +40,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
-from _paths import PROJECT_ROOT  # noqa: E402
+from _paths import PROJECT_ROOT  # noqa: E402,F401
+from tree import resolve_node_path  # noqa: E402
 
 SECTION_HEADING = "## Decision Rules"
 OVERLAP_THRESHOLD = 0.70
@@ -130,11 +131,12 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    node_path = Path(args.node_path)
-    if not node_path.is_absolute():
-        node_path = PROJECT_ROOT / node_path
+    # Virtual `world/knowledge/tree/...` and bare `<cat>/<node>.md` forms resolve
+    # to WORLD_DIR (external worlds); repo-relative and absolute forms are unchanged.
+    node_path = resolve_node_path(args.node_path)
     if not node_path.exists():
-        print(f"ERROR: node path does not exist: {node_path}", file=sys.stderr)
+        print(f"ERROR: node path does not exist: {node_path} (from --node-path {args.node_path!r})",
+              file=sys.stderr)
         sys.exit(1)
 
     body = node_path.read_text(encoding="utf-8")

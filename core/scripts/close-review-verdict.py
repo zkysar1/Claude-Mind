@@ -55,6 +55,7 @@ import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -63,11 +64,26 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from goal_close_risk_tier import named_entities  # noqa: E402
 
-#: Verdict values the gate recognises. APPROVE is the only one that releases a
-#: close; everything else is a refusal, so an unknown string must never be
-#: writable (it would read as "not APPROVE" and silently behave as REJECT while
-#: looking like a third state).
-VERDICTS = ("APPROVE", "REJECT")
+#: Verdict values this script can write. The RELEASING subset is the gate's to
+#: define (`close_review_gate.RELEASING_VERDICTS`), imported rather than copied —
+#: an unknown string must never be writable, because it would read as "not
+#: APPROVE" downstream and silently behave as REJECT while looking like a third
+#: state.
+#:
+#: APPROVE_WITH_NOTES (added by the  re-review, finding F3) exists
+#: because the binary forced a reviewer with non-blocking observations to either
+#: REJECT a sound close or APPROVE and drop the observations on the floor. It is
+#: writable ONLY through `--approve-with-notes` and ONLY with at least one
+#: finding — a "with notes" verdict carrying no notes asserts more than its
+#: content supports, which is the same predicate-honesty rule that makes
+#: `--approve` refusable on a failed fidelity diff (guard-2564).
+#:
+#: guard-334 (add an enum value WITH its writer, then sweep): the writer is the
+#: flag above and the gate half landed in the same change. Backfill sweep of the
+#: live ledger at add time: 1 record total (), a REJECT with 9 findings
+#: — genuinely a rejection, not a mislabelled approval. Backfill set: EMPTY,
+#: measured, not assumed.
+VERDICTS = ("APPROVE", "APPROVE_WITH_NOTES", "REJECT")
 
 #: The check id this script mechanises. Named so a reader of a findings list can
 #: tell a machine-verified failure from a reviewer's prose judgement.
@@ -154,20 +170,36 @@ def fidelity_findings(fid: dict) -> list:
 
 
 def build_verdict(*, goal_id: str, reviewer: str, fidelity: dict,
-                  approve: bool, checks: list, findings: list) -> dict:
+                  approve: bool, checks: list, findings: list,
+                  notes: bool = False, reviewed_at: str | None = None) -> dict:
     """Resolve the verdict and assemble the artifact.
 
     The resolution is ONE rule and it is not symmetric: a failed fidelity diff
     forces REJECT no matter what the caller asserted, while a passed diff grants
-    nothing on its own. See the module docstring.
+    nothing on its own. See the module docstring. `notes` selects the third
+    state and is subject to the SAME machine veto as `approve` — it is an
+    approval, so the diff may refuse it for the same reason.
     """
     generated = fidelity_findings(fidelity)
     all_findings = generated + [f for f in findings if f]
-    verdict = "APPROVE" if (approve and fidelity["passed"]) else "REJECT"
+    if not fidelity["passed"]:
+        verdict = "REJECT"
+    elif notes:
+        verdict = "APPROVE_WITH_NOTES"
+    elif approve:
+        verdict = "APPROVE"
+    else:
+        verdict = "REJECT"
     return {
         "verdict": verdict,
         "reviewer": reviewer,
         "goal_id": goal_id,
+        # F2: WHEN the review happened. Absent from every artifact written
+        # before this change (measured: 1 of 1 in the live ledger) and NOT
+        # backfilled — inventing a timestamp on another reviewer's attestation
+        # would be worse than the gap. Readers must therefore treat it as
+        # optional; nothing consumes it as a gate today.
+        "reviewed_at": reviewed_at or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "checks": list(checks) + [
             f"{FIDELITY_CHECK}: every entity enumerated in the source diffed "
             f"verbatim against the artifact (mechanical)"],
@@ -179,7 +211,7 @@ def build_verdict(*, goal_id: str, reviewer: str, fidelity: dict,
     }
 
 
-def route_marker(findings: list) -> str:
+def route_marker(findings: list, verdict: str = "REJECT") -> str:
     """The idempotency marker for a routed REJECT.
 
     Keyed on a digest of the FINDINGS, not on the goal or the reviewer. That is
@@ -189,10 +221,12 @@ def route_marker(findings: list) -> str:
     findings — the exact case this routing exists to serve.
     """
     digest = hashlib.sha1("\n".join(findings).encode("utf-8")).hexdigest()[:10]
-    return f"close-review-reject:{digest}"
+    kind = "notes" if str(verdict).upper() == "APPROVE_WITH_NOTES" else "reject"
+    return f"close-review-{kind}:{digest}"
 
 
-def route_command(goal_id: str, source: str, reviewer: str, findings: list) -> list:
+def route_command(goal_id: str, source: str, reviewer: str, findings: list,
+                  verdict: str = "REJECT") -> list:
     """The argv that routes a REJECT's findings into the goal record.
 
     A scoped CALL to `goal-field-append.sh` — the framework's one goal-field
@@ -204,15 +238,24 @@ def route_command(goal_id: str, source: str, reviewer: str, findings: list) -> l
     (guard-580).
     """
     body = "\n".join(f"- {f}" for f in findings)
-    text = (f"[close-review REJECT by {reviewer}] the close is blocked until "
-            f"these are reworked and re-reviewed:\n{body}")
+    # The header must not overstate the verdict. An APPROVE_WITH_NOTES released
+    # the close; announcing it as "blocked until reworked" would tell the next
+    # Body to stop working on a goal that already passed review.
+    if str(verdict).upper() == "APPROVE_WITH_NOTES":
+        text = (f"[close-review APPROVE_WITH_NOTES by {reviewer}] the close was "
+                f"APPROVED; these are non-blocking observations recorded for "
+                f"whoever picks this up next:\n{body}")
+    else:
+        text = (f"[close-review REJECT by {reviewer}] the close is blocked until "
+                f"these are reworked and re-reviewed:\n{body}")
     return [shutil.which("bash") or "/bin/bash",
             str(SCRIPT_DIR / "goal-field-append.sh"),
             "--source", source, goal_id, "progress_note",
-            route_marker(findings), text]
+            route_marker(findings, verdict), text]
 
 
-def route_findings(goal_id: str, source: str, reviewer: str, findings: list) -> bool:
+def route_findings(goal_id: str, source: str, reviewer: str, findings: list,
+                   verdict: str = "REJECT") -> bool:
     """Execute the routing. Reports LOUDLY on failure and never raises.
 
     The verdict artifact is already on disk by this point and is the primary
@@ -221,8 +264,18 @@ def route_findings(goal_id: str, source: str, reviewer: str, findings: list) -> 
     nobody found defects in.
     """
     if not findings:
+        # F4 ( re-review): this used to return silently, which is the
+        # exact failure the docstring above names — an unrouted verdict looking
+        # like a goal nobody found defects in. A non-APPROVE with no findings is
+        # itself the anomaly worth saying out loud: the caller asked to route
+        # rework and there is none to route.
+        print("close-review-verdict: NOTHING ROUTED — --route-to-goal was given "
+              "but the verdict carries no findings, so the goal record was not "
+              "annotated. A blocking verdict with no findings tells the next "
+              "Body nothing; add --finding, or drop --route-to-goal.",
+              file=sys.stderr)
         return False
-    cmd = route_command(goal_id, source, reviewer, findings)
+    cmd = route_command(goal_id, source, reviewer, findings, verdict)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -236,7 +289,7 @@ def route_findings(goal_id: str, source: str, reviewer: str, findings: list) -> 
               f"{proc.stderr.strip()}", file=sys.stderr)
         return False
     print(f"close-review-verdict: findings routed into {goal_id} progress_note "
-          f"({route_marker(findings)})")
+          f"({route_marker(findings, verdict)})")
     return True
 
 
@@ -279,6 +332,11 @@ def main(argv=None) -> int:
     ap.add_argument("--approve", action="store_true",
                     help="assert the JUDGMENT checks passed. Refused when the "
                          "mechanical fidelity diff is non-empty.")
+    ap.add_argument("--approve-with-notes", action="store_true",
+                    help="approve the close AND record non-blocking observations. "
+                         "Releases the close like --approve; requires at least one "
+                         "--finding, and is refused on a failed fidelity diff for "
+                         "the same reason --approve is.")
     ap.add_argument("--reject", action="store_true",
                     help="record a REJECT (with any --finding you supply)")
     ap.add_argument("--check", action="append", default=[],
@@ -299,7 +357,8 @@ def main(argv=None) -> int:
 
     # A verdict is never invented. Refusing here rather than defaulting is what
     # keeps "the reviewer did not say" distinguishable from "the reviewer said no".
-    if not (args.approve or args.reject):
+    approving = args.approve or args.approve_with_notes
+    if not (approving or args.reject):
         print(json.dumps({"fidelity": fid, "verdict": None}, indent=2, sort_keys=True))
         print("\nclose-review-verdict: no verdict recorded — pass --approve or --reject.\n"
               f"  mechanical {FIDELITY_CHECK}: "
@@ -308,18 +367,43 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
-    if args.approve and not fid["passed"]:
+    if approving and not fid["passed"]:
         for line in fidelity_findings(fid):
             print(f"  {line}", file=sys.stderr)
-        print(f"close-review-verdict: REFUSING to write APPROVE — the mechanical "
+        _label = "APPROVE_WITH_NOTES" if args.approve_with_notes else "APPROVE"
+        print(f"close-review-verdict: REFUSING to write {_label} — the mechanical "
               f"{FIDELITY_CHECK} check failed. The label may not assert more than "
               f"the predicate supports (guard-2564). Re-run with --reject, or fix "
               f"the artifact.", file=sys.stderr)
         return 1
 
-    if args.closer:
-        payload_probe = {"verdict": "APPROVE", "reviewer": args.reviewer}
-        defect = _gate().independence_defect(payload_probe, args.closer)
+    if args.approve_with_notes and not [f for f in args.finding if f]:
+        print("close-review-verdict: REFUSING to write APPROVE_WITH_NOTES with no "
+              "notes — the label would assert an observation the record does not "
+              "carry (guard-2564). Pass --finding, or use --approve.",
+              file=sys.stderr)
+        return 1
+
+    payload = build_verdict(goal_id=args.goal, reviewer=args.reviewer, fidelity=fid,
+                            approve=args.approve, checks=args.check,
+                            findings=args.finding, notes=args.approve_with_notes)
+
+    # F5 ( re-review): the independence guard is scoped to the RESOLVED
+    # verdict, and only to the verdicts that RELEASE a close. It used to run
+    # whenever --closer was given, so a reviewer recording a REJECT on their own
+    # close was refused — and the code already knew better: it probed
+    # independence_defect with a hardcoded {"verdict": "APPROVE"} payload while
+    # the gate itself applies the same function only `if approved`
+    # (close-review-gate.py, the `defect = ... if approved else None` line), and
+    # the function's own docstring opens "Why this APPROVE verdict is not an
+    # INDEPENDENT review". Self-REJECT is not a self-approval: finding fault in
+    # your own work is the one direction that needs no independence, and
+    # refusing it suppressed the record rather than the conflict.
+    #
+    # The real payload is passed now instead of the probe, so the scope
+    # question is asked of the verdict that will actually be written.
+    if args.closer and _gate().releases_close(payload["verdict"]):
+        defect = _gate().independence_defect(payload, args.closer)
         if defect:
             print(f"close-review-verdict: REFUSING to write — reviewer "
                   f"{args.reviewer!r} vs closer {args.closer!r} is '{defect}'. "
@@ -328,23 +412,22 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 1
 
-    payload = build_verdict(goal_id=args.goal, reviewer=args.reviewer, fidelity=fid,
-                            approve=args.approve, checks=args.check,
-                            findings=args.finding)
-
     if args.write:
         p = write_verdict(args.goal, payload)
         print(f"close-review-verdict: {payload['verdict']} written -> {p}")
         # REJECT only, and only once the artifact exists. An APPROVE has nothing
         # to rework, and a dry run must leave no trace anywhere.
-        if args.route_to_goal and payload["verdict"] == "REJECT":
+        # A plain APPROVE has nothing to say and a dry run must leave no trace.
+        # APPROVE_WITH_NOTES routes for the same reason a REJECT does: notes that
+        # reach only the ledger reach nobody (F3).
+        if args.route_to_goal and payload["verdict"] != "APPROVE":
             route_findings(args.goal, args.route_to_goal, args.reviewer,
-                           payload["findings"])
+                           payload["findings"], verdict=payload["verdict"])
     else:
         print(json.dumps(payload, indent=2, sort_keys=True))
         print("\nclose-review-verdict: DRY RUN — pass --write to record it.",
               file=sys.stderr)
-    return 0 if payload["verdict"] == "APPROVE" else 3
+    return 0 if _gate().releases_close(payload["verdict"]) else 3
 
 
 if __name__ == "__main__":

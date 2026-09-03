@@ -65,6 +65,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 GATE_ID = "close-review-gate"
 
+#: The verdicts that RELEASE a tier-2 close. This gate owns the definition —
+#: `close-review-verdict.py` imports it rather than keeping a second copy, the
+#: same reason `independence_defect` lives here ( re-review, F3).
+#:
+#: APPROVE_WITH_NOTES is an APPROVAL, not a soft REJECT: the reviewer found the
+#: close sound AND recorded non-blocking observations. It had to be added HERE
+#: in the same change that made it writable, because the producer's own comment
+#: on `VERDICTS` predicted exactly what a producer-only addition would do — an
+#: unrecognised string "would read as 'not APPROVE' and silently behave as
+#: REJECT while looking like a third state". A third state the consumer does not
+#: know is worse than no third state at all.
+#:
+#: Its one behavioural difference from APPROVE is downstream, in the producer:
+#: an APPROVE_WITH_NOTES ROUTES its findings to the goal record. A plain APPROVE
+#: carrying findings routes nothing, so before this existed the notes on an
+#: otherwise-good close reached the ledger and nobody else.
+RELEASING_VERDICTS = ("APPROVE", "APPROVE_WITH_NOTES")
+
+
+def releases_close(verdict: str | None) -> bool:
+    """Whether this verdict string releases a tier-2 close.
+
+    Case- and whitespace-insensitive on the same grounds as
+    `independence_defect`: the value is written by one hand and read by another.
+    """
+    return str(verdict or "").strip().upper() in RELEASING_VERDICTS
+
 try:
     from _paths import PROJECT_ROOT, WORLD_DIR, agent_dir  # noqa: E402
 except Exception:  # pragma: no cover - fail-open on import trouble
@@ -345,7 +372,7 @@ def main(argv=None) -> int:
             return 0
 
         v = read_verdict(verdict_path(args.goal))
-        approved = isinstance(v, dict) and str(v.get("verdict", "")).upper() == "APPROVE"
+        approved = isinstance(v, dict) and releases_close(v.get("verdict"))
         # A self-approved or unattributed APPROVE is NOT an approval. Demoting it
         # here (rather than refusing inline) is deliberate: it falls through to the
         # SAME override branch and the same _emit shape as verdict absence, so the

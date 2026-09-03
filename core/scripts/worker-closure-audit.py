@@ -62,15 +62,32 @@ REPORT_REL = "audit-reports/worker-closure-audit.jsonl"
 # ─── check definitions ─────────────────────────────────────────────────────
 
 # Work-remains language (guard-4007): a population-scoped goal closed on one batch.
+#
+# DELIBERATELY NARROW, and every dropped pattern was dropped on measurement
+# (2026-09-03, 110 live samples). `still pending` and a bare `remainder` fired 12
+# times and were WRONG every time: closure notes in this corpus cite sibling goal
+# ids constantly (" ... still pending"), so generic queue vocabulary
+# describes OTHER goals far more often than this one's leftovers. Only
+# self-referential, quantified forms survive. Under-matching is the correct
+# direction here — a missed remainder costs one unaudited goal, while a checker
+# that cries wolf on ordinary cross-references gets ignored wholesale.
 REMAINDER_RE = re.compile(
-    r"\b(\d+\s+(?:entries|items|records|goals|files|observations)?\s*remain(?:ing|s)?"
-    r"|still\s+(?:undrained|pending|outstanding|remaining)"
-    r"|not\s+cleared"
-    r"|partial(?:ly)?\s+(?:complete|done|drained)"
-    r"|remainder\b"
-    r"|deliberately\s+NOT\s+cleared)",
+    r"\b(\d+\s+(?:entries|items|records|goals|files|observations)\s+remain(?:ing|s)?"
+    r"|\d+\s*,?\s*\d*\s*remain\s*\("
+    r"|still\s+undrained"
+    r"|(?:deliberately\s+)?NOT\s+cleared"
+    r"|partial(?:ly)?\s+(?:complete|done|drained))",
     re.IGNORECASE,
 )
+
+# guard-4007's PRESCRIBED REMEDY is "file the successor FIRST and name its id in
+# the outcome_note". A note that does so is COMPLIANT, so flagging it punishes the
+# exact behaviour the guardrail asks for — measured:  wrote "Filed as
+#  (Case A — the unfinished remainder of sanctioned scope)" and was
+# flagged for it. When a goal id sits near the remainder language, a tracker
+# exists and the check suppresses.
+SUCCESSOR_RE = re.compile(r"\bg-\d+-\d+\b", re.IGNORECASE)
+SUCCESSOR_WINDOW = 300
 
 # Note asserts completion (guard-2852(b)); paired with a status that disagrees.
 DONE_RE = re.compile(
@@ -95,16 +112,49 @@ EVIDENCE_RE = re.compile(
 TERMINAL_OK = {"completed"}
 
 
-def _note(goal: dict) -> str:
-    """Every free-text field a closure can leave its account in."""
+NOTE_FIELDS = ("outcome_note", "outcome_notes", "progress_note", "key_finding", "notes")
+
+
+def _note_parts(goal: dict) -> list[tuple[str, str]]:
+    """(field, text) for every free-text field a closure leaves its account in."""
     parts = []
-    for key in ("outcome_note", "outcome_notes", "progress_note", "key_finding", "notes"):
+    for key in NOTE_FIELDS:
         v = goal.get(key)
-        if isinstance(v, str):
-            parts.append(v)
-        elif isinstance(v, list):
-            parts.extend(str(x) for x in v)
-    return "\n".join(parts).strip()
+        if isinstance(v, str) and v.strip():
+            parts.append((key, v))
+        elif isinstance(v, list) and v:
+            parts.append((key, "\n".join(str(x) for x in v)))
+    return parts
+
+
+def _note(goal: dict) -> str:
+    return "\n".join(t for _, t in _note_parts(goal)).strip()
+
+
+def _where(goal: dict, rx: re.Pattern,
+           suppress_near: re.Pattern | None = None,
+           window: int = SUCCESSOR_WINDOW) -> tuple[str, str] | None:
+    """(field, matched_text) for the first field the pattern hits.
+
+    The field is reported in every finding because the account is spread across
+    five fields: the first live finding (g-306-420) matched in progress_note
+    while outcome_note was clean, and a reader who greps only outcome_note
+    concludes the audit misfired. Naming the field turns a 3-command hunt into a
+    1-command confirmation.
+
+    `suppress_near` skips a match that has an exonerating token within `window`
+    characters either side — used so a remainder that already names its successor
+    goal reads as compliance rather than a defect.
+    """
+    for key, text in _note_parts(goal):
+        for m in rx.finditer(text):
+            if suppress_near is not None:
+                lo = max(0, m.start() - window)
+                hi = min(len(text), m.end() + window)
+                if suppress_near.search(text[lo:hi]):
+                    continue
+            return key, m.group(0)
+    return None
 
 
 def _declared_criteria(goal: dict) -> int:
@@ -129,25 +179,38 @@ def run_checks(goal: dict) -> list[dict]:
                       f"of what was done",
         })
 
-    if status not in TERMINAL_OK and DONE_RE.search(note):
-        m = DONE_RE.search(note)
-        fired.append({
-            "check": "note_done_status_disagrees",
-            "confidence": "high",
-            "guardrail": "guard-2852",
-            "detail": f"note asserts completion ({m.group(0)!r}) but status is {status!r} "
-                      f"— the stranded-claim release class",
-        })
+    # RECURRING GOALS REST AT `pending` BY DESIGN — a run completes, the note says
+    # DONE, and the goal returns to pending for its next interval. That is health,
+    # not the stranded-claim class, so this ONE check must exclude them. Measured
+    # 2026-09-03 before this guard existed: all 12 DISAGREE verdicts on 
+    # were recurring goals (recurring=True, achievedCount up to 426), i.e. the
+    # entire HIGH-confidence bucket on the largest aspiration was noise. The other
+    # three checks stay live for recurring goals — an empty note or an unrun
+    # criterion is a defect whatever the goal's cadence.
+    if status not in TERMINAL_OK and not goal.get("recurring"):
+        hit = _where(goal, DONE_RE)
+        if hit:
+            field, text = hit
+            fired.append({
+                "check": "note_done_status_disagrees",
+                "confidence": "high",
+                "guardrail": "guard-2852",
+                "field": field,
+                "detail": f"{field} asserts completion ({text!r}) but status is {status!r} "
+                          f"— the stranded-claim release class",
+            })
 
     if status in TERMINAL_OK:
-        m = REMAINDER_RE.search(note)
-        if m:
+        hit = _where(goal, REMAINDER_RE, suppress_near=SUCCESSOR_RE)
+        if hit:
+            field, text = hit
             fired.append({
                 "check": "remainder_language",
                 "confidence": "medium",
                 "guardrail": "guard-4007",
-                "detail": f"closed completed while its own note says work remains "
-                          f"({m.group(0)!r})",
+                "field": field,
+                "detail": f"closed completed while its own {field} says work remains "
+                          f"({text!r}) and names no successor goal to track it",
             })
 
     if status in TERMINAL_OK and _declared_criteria(goal) > 0 and note:

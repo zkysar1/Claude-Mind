@@ -279,14 +279,31 @@ def test_historical_record_is_not_backfilled_on_unrelated_move(tmp_path):
 
 def test_resolver_stamp_does_not_clobber_a_prior_resolver_on_re_move(tmp_path):
     """A record re-moved into resolved keeps the FIRST resolver — the decision
-    is owned by whoever made it, not whoever last touched the record."""
+    is owned by whoever made it, not whoever last touched the record.
+
+    CONTRACT STRENGTHENED 2026-09-03 (g-306-421). The second move used to
+    return 200 and this test's whole protection was the write-once stamp: the
+    re-resolve LANDED and only `resolved_by` survived, while `outcome`,
+    `outcome_date` and every merged resolution field were replaced by the
+    second writer. The move handler now REFUSES a resolved -> resolved
+    transition outright, so the second call is a 400 and the entire first
+    verdict survives, not just its author.
+
+    The stamp itself is deliberately NOT removed and this test still asserts
+    it. `update_field` has no field whitelist, so a caller can still set
+    `stage` directly and reach a re-resolve around the move guard — the stamp
+    is what holds on that path. Deleting a defence because a newer one covers
+    the case you happened to test is how the remaining case gets found the
+    hard way.
+    """
     world = _seed_world(tmp_path, live=[_rec("2026-07-01_re-move", "active")])
     q = {"id": "2026-07-01_re-move", "stage": "resolved"}
     body = json.dumps({"outcome": "CONFIRMED",
                        "experience_ref": "exp-re-move"}).encode()
     assert pipeline_write.move(
         FakeCtx(world, q, body=body, agent="echo")).status == 200
-    assert pipeline_write.move(
-        FakeCtx(world, q, body=body, agent="zeta")).status == 200
+    second = pipeline_write.move(FakeCtx(world, q, body=body, agent="zeta"))
+    assert second.status == 400, getattr(second, "body", second)
+    assert "invalid_stage_transition" in second.body.decode()
 
     assert _live(world, "2026-07-01_re-move")["resolved_by"] == "echo"

@@ -1,6 +1,6 @@
 ---
 name: fresh-eyes-close
-description: "Use when a tier-2 goal needs its blocking close review — the INDEPENDENT adversarial review that produces the verdict artifact core/scripts/close-review-gate.py reads before allowing a close. Fires when close-review-gate.py REFUSES a close for want of an APPROVE verdict, when a peer sends a review request for a tier-2 goal, or when the user invokes /fresh-eyes-close directly. Runs four mandatory checks — requirements traceability, source fidelity (mechanised: every enumerated entity diffed verbatim), criteria adequacy, and an adversarial wrong-artifact probe — and writes APPROVE or REJECT to world/audit-reports/close-reviews/<goal-id>.json. The reviewer MUST NOT be the closing agent. Distinct from /fresh-eyes-code (bug hunt on a named artifact set) and /fresh-eyes-review (portfolio + self meta-review): this one is close-time, goal-scoped, and BLOCKING."
+description: "Use when a tier-2 goal needs its blocking close review — the INDEPENDENT adversarial review that produces the verdict artifact core/scripts/close-review-gate.py reads before allowing a close. Fires when close-review-gate.py REFUSES a close for want of an APPROVE verdict, when a peer sends a review request for a tier-2 goal, or when the user invokes /fresh-eyes-close directly. Runs four mandatory checks — requirements traceability, source fidelity (mechanised: every enumerated entity diffed verbatim), criteria adequacy, and an adversarial wrong-artifact probe — and writes APPROVE, APPROVE_WITH_NOTES or REJECT to world/audit-reports/close-reviews/<goal-id>.json. The reviewer MUST NOT be the closing agent. Distinct from /fresh-eyes-code (bug hunt on a named artifact set) and /fresh-eyes-review (portfolio + self meta-review): this one is close-time, goal-scoped, and BLOCKING."
 user-invocable: true
 triggers:
   - "/fresh-eyes-close"
@@ -29,8 +29,10 @@ what writes the REJECT that sends the work back.
 ## The one rule that makes this skill worth having
 
 **The reviewer MUST NOT be the closing agent.** The gate enforces it
-(`independence_defect` refuses a verdict whose `reviewer` is the closer, and
-refuses one that names no reviewer at all), and the verdict path is
+(`independence_defect` refuses an APPROVING verdict whose `reviewer` is the
+closer, and refuses one that names no reviewer at all; a REJECT on your own
+close is allowed — finding fault in your own work needs no independence, and
+refusing it would suppress the record rather than the conflict), and the verdict path is
 goal-keyed and world-scoped precisely so an independent party can write it.
 
 Independence order, per `coordination.md` Review Gate:
@@ -114,10 +116,31 @@ py -3 core/scripts/close-review-verdict.py \
   --source-file <source> --artifact-file <artifact> \
   --approve --check "traceability: <what you verified>" \
   --check "criteria-adequacy: <the wrong artifact you constructed>" --write
+
+# APPROVE_WITH_NOTES — the close is sound AND you have non-blocking observations
+py -3 core/scripts/close-review-verdict.py \
+  --goal <goal-id> --reviewer <your-name> --closer <closing-agent> \
+  --source-file <source> --artifact-file <artifact> \
+  --approve-with-notes --finding "<the non-blocking observation>" --write \
+  --route-to-goal <world|agent>
 ```
 
-Exit codes: `0` APPROVE written, `3` REJECT written, `1` refused (a failing
-fidelity diff under `--approve`, or self-review), `2` no verdict asserted.
+Exit codes: `0` an APPROVAL written (`APPROVE` or `APPROVE_WITH_NOTES`), `3`
+REJECT written, `1` refused (a failing fidelity diff under either approving
+flag, self-review of an APPROVAL, or `--approve-with-notes` carrying no
+`--finding`), `2` no verdict asserted.
+
+Every written verdict carries `reviewed_at` (naive ISO-8601, UTC wall time).
+Artifacts written before 2026-09-03 do not have it and were deliberately NOT
+backfilled — inventing a timestamp on another reviewer's attestation is worse
+than the gap — so treat it as optional when reading old rows.
+
+**Pick APPROVE_WITH_NOTES over a REJECT when the defects do not block the
+close, and over a plain APPROVE when you have any.** It releases the close
+exactly like APPROVE (`close_review_gate.RELEASING_VERDICTS`) and, unlike
+APPROVE, it ROUTES its findings to the goal record. Before it existed the
+binary forced a reviewer with a minor observation either to block sound work or
+to drop the observation, because a plain APPROVE routes nothing.
 
 Three refusals are deliberate and must not be worked around:
 
@@ -141,9 +164,11 @@ already pinned. Route the defects so the work resumes rather than stalling:
 
 1. `--route-to-goal <world|agent>` appends the findings to the goal's
    `progress_note` — a scoped call to `goal-field-append.sh`, the framework's
-   one goal-field append writer. It fires on a WRITTEN REJECT only: an APPROVE
-   has nothing to rework and a dry run leaves no trace. Without it the defects
-   live only in the verdict artifact, which nothing reads at claim time.
+   one goal-field append writer. It fires on any WRITTEN non-APPROVE verdict —
+   REJECT and APPROVE_WITH_NOTES: a plain APPROVE has nothing to rework and a
+   dry run leaves no trace. Without it the defects live only in the verdict
+   artifact, which nothing reads at claim time. The appended header names the
+   verdict, so an APPROVE_WITH_NOTES is never announced as a block.
 2. Leave the goal claimable — release rather than closing it.
 3. Re-review after rework: the same command, a fresh diff, a new verdict.
 

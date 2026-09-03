@@ -247,6 +247,24 @@ def test_terminal_line_is_the_next_action_imperative(table, capsys):
     assert lines[-1].startswith("[iteration-open] NEXT ACTION REQUIRED:")
 
 
+def test_imperative_routes_through_select_before_execute(table, capsys):
+    """The imperative is the chain the reducer actually follows, and until
+    2026-09-03 it read "claim from SELECTION and enter execution —
+    Skill(aspirations-execute)". A reducer read SELECTION as the candidates this
+    battery prints and never invoked aspirations-select (measured downstream: 6
+    consecutive precheck-led iterations, 0 select invocations, 5 tagged insight
+    triggers unread). Directive ack/honor, the insight-trigger scan,
+    self-abstention and the deviation check live only in that Skill, so the
+    chain must name it, between the precheck tail and execute."""
+    io_mod.run(runner=make_runner({}), md_path=table)
+    last = [l for l in capsys.readouterr().out.splitlines() if l.strip()][-1]
+    sel = last.find("Skill(aspirations-select)")
+    exe = last.find("Skill(aspirations-execute)")
+    assert sel != -1 and exe != -1, last
+    assert sel < exe, last
+    assert "claim from SELECTION" not in last
+
+
 def test_selector_error_surfaces_rather_than_reading_as_zero_candidates(table, capsys):
     """goal-selector.sh's wrapper already fails loud on the  silent-empty
     signature; this battery must not paper over it with a comfortable 0."""
