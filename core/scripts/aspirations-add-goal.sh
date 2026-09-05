@@ -56,6 +56,9 @@ Options:
   --override-signal <reason>       Bypass origin-signal gate.
   --override-duplication <reason>  Bypass goal-duplication gate.
   --override-no-investigate <reason>  Bypass no-investigate-slots gate.
+  --override-deadline <reason>     Bypass deadline-date gate (goal text
+                                   promises a deadline but carries no
+                                   resolves_by/expires_at/deadline/due_date).
   --override-offload <reason>      Bypass operator-offload gate (recurring
                                    goals must otherwise carry offload_decision).
   --override-all <reason>          Bulk-override all gates (audited).
@@ -102,6 +105,7 @@ OVERRIDE_SIGNAL=""
 OVERRIDE_DUPLICATION=""
 OVERRIDE_NO_INVESTIGATE=""
 OVERRIDE_OFFLOAD=""
+OVERRIDE_DEADLINE=""
 OVERRIDE_ALL=""
 ALLOW_NEW_FIELD=""
 SCHEMA=0
@@ -146,6 +150,9 @@ while [[ $# -gt 0 ]]; do
             OVERRIDE_NO_INVESTIGATE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-deadline)
+            OVERRIDE_DEADLINE="${2-}"
+            shift 2;;
         --override-offload)
             OVERRIDE_OFFLOAD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
@@ -167,7 +174,7 @@ while [[ $# -gt 0 ]]; do
             # reader in this script, so the flag never reached the daemon either. Correct
             # diagnosis, wrong conclusion: describing a silent drop is a reason to refuse,
             # not a reason to keep passing it through.
-            argv_strict_refuse_unknown "$(basename "$0")" "$1" "--help --aspiration --source --override-signal --override-duplication --override-no-investigate --override-offload --override-all --allow-new-field";;
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "--help --aspiration --source --override-signal --override-duplication --override-no-investigate --override-offload --override-deadline --override-all --allow-new-field";;
         *)
             # Positional asp_id (first non-flag wins)
             [ -z "$ASP_ID" ] && ASP_ID="$1"
@@ -230,6 +237,7 @@ declare -a HEADER_ARGS=()
 [ -n "$OVERRIDE_DUPLICATION" ] && HEADER_ARGS+=(--header "X-Mind-Override-Duplication: $OVERRIDE_DUPLICATION")
 [ -n "$OVERRIDE_NO_INVESTIGATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-No-Investigate: $OVERRIDE_NO_INVESTIGATE")
 [ -n "$OVERRIDE_OFFLOAD" ] && HEADER_ARGS+=(--header "X-Mind-Override-Offload: $OVERRIDE_OFFLOAD")
+[ -n "$OVERRIDE_DEADLINE" ] && HEADER_ARGS+=(--header "X-Mind-Override-Deadline: $OVERRIDE_DEADLINE")
 [ -n "$OVERRIDE_ALL" ] && HEADER_ARGS+=(--header "X-Mind-Override-All: $OVERRIDE_ALL")
 [ -n "$ALLOW_NEW_FIELD" ] && HEADER_ARGS+=(--header "X-Mind-Allow-New-Field: $ALLOW_NEW_FIELD")
 

@@ -105,14 +105,14 @@ IF cross_agent_owner is non-empty:
     #     claimed BRAVO's goal, not BRAVO claimed it)
     #   - board-post.sh (board entries are authored by the calling agent)
     #   - heartbeat-tick.sh (ticks THIS runner's heartbeat)
-    # MOVED SIDES (g-306-249) — aspirations-claim.sh was listed here as NOT
-    # affected, on the reasoning "--source world is world-scoped, no swap". That
-    # held only while the claim was world-only. It now honors `&source=agent`
-    # and resolves `ctx.paths.agent` from the X-Mind-Agent header, so a
-    # CROSS-AGENT goal (effective_source='agent') claimed without the prefix
-    # resolves THIS agent's queue, not the owner's — the goal is not there, and
-    # the claim 404s. Prefix it like the others when --source agent:
-    #   - aspirations-claim.sh <goal-id> --source agent   (world claims: no swap)
+    # MOVED SIDES (g-306-249; command CORRECTED g-115-8762) — the claim resolves
+    # its queue from the X-Mind-Agent header, so a CROSS-AGENT goal needs the
+    # prefix. THE PREFIX ALONE IS NOT ENOUGH: env sets the QUEUE *and*, absent a
+    # positional, the CLAIMER — so the OWNER claims a goal routed to YOU and is
+    # refused. Pass BOTH (world claims: no swap); guard-3584 +
+    # core/config/rationale/cross-agent-claim-two-identities.md:
+    #   - MIND_AGENT={cross_agent_owner} aspirations-claim.sh <goal-id> {SELF} \
+    #         --source agent --deviation cross-agent
     # Pattern: prefix the affected subprocess invocations with
     #   MIND_AGENT={cross_agent_owner} <command>
     # rather than the global env-prefix the PreToolUse[Bash] hook applies.

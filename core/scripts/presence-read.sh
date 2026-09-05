@@ -42,6 +42,24 @@ if [ -z "$AGENT" ]; then
     exit 1
 fi
 
+# --since is compared LEXICOGRAPHICALLY against the record's ISO `ts` (see the
+# filter below), which is order-preserving for any ISO-8601 prefix and total
+# nonsense for anything else. An unvalidated value therefore fails SILENTLY at
+# rc=0, and in the direction that looks like an answer: measured on this box
+# 2026-09-04 against alpha's 4081-record stream, `--since 30h` (the duration
+# form board-read.sh accepts) returned 0 rows, as did `zzz` and `not-a-time`.
+# Zero rows out of four thousand, reported as success. That is the 
+# defect class one wrapper over — an unknown FLAG is refused loudly here
+# (line 36) while an unparseable VALUE for a known flag was not ().
+# Refuse it instead, naming the accepted form. Exit 1 per the contract above:
+# a bad value is an invalid ARG, not a missing presence file (2).
+if [ -n "$SINCE" ] && ! [[ "$SINCE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}([T\ ][0-9]{2}:[0-9]{2}(:[0-9]{2})?)?$ ]]; then
+    echo "presence-read: --since '$SINCE' is not an ISO-8601 timestamp." >&2
+    echo "  accepted: YYYY-MM-DD | YYYY-MM-DDTHH:MM | YYYY-MM-DDTHH:MM:SS" >&2
+    echo "  note: a DURATION such as '30h' is NOT accepted here (board-read.sh takes those; this reader does not)." >&2
+    exit 1
+fi
+
 PRESENCE_FILE="$WORLD_DIR/presence/$AGENT.jsonl"
 if [ ! -f "$PRESENCE_FILE" ]; then
     echo "presence-read: no presence file at $PRESENCE_FILE" >&2

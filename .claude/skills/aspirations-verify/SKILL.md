@@ -1,6 +1,6 @@
 ---
 name: aspirations-verify
-description: "Phase 5 of the aspirations loop: verifies a just-executed goal using hypothesis outcomes, unified outcome/check evaluation, Q1/Q2/Q3 verification escalation, streak tracking, and dependent-goal unblocking. Use whenever /aspirations-execute finishes and the loop must confirm the goal actually met its verification criteria before state-update fires. Internal sub-skill — never invoke outside the aspirations loop; assumes the just-executed goal is still in working context."
+description: "Phase 5 of the aspirations loop: verifies a just-executed goal using hypothesis outcomes, unified outcome/check evaluation, Q1-Q4 escalation, streak tracking, and dependent-goal unblocking. Use when /aspirations-execute finishes and the loop must confirm the goal met its criteria before state-update fires. Internal sub-skill with two callers: the aspirations loop, and worker-loop Phase 4a at scope=own-unit; assumes the just-executed goal is still in working context."
 user-invocable: false
 parent-skill: aspirations
 conventions: [aspirations, goal-schemas]
@@ -50,7 +50,7 @@ scans those journal lines and logs false claims to
 - `goal`: The executed goal object (with verification field)
 - `result`: Execution result (from Phase 4)
 - `source`: Queue origin (`"world"` or `"agent"`) — pass `--source {source}` to all `aspirations-*.sh` calls
-- `prior_checks`: dict (optional, default `{}`) — map of checks already passed in a prior turn that was interrupted by autocompact or graceful stop. Keys: `q1_passed`, `q1_artifact`, `q1_5_passed`, `q1_5_checklist`, `q2_passed`, `q2_failure_mode_checked`, `q3_scope`, `standard_checks_passed`. Threaded in by the Phase -1.4 Graceful Stop Handler from `iteration-checkpoint.json`'s `phase_progress` field. See [core/config/conventions/compact-recovery.md](core/config/conventions/compact-recovery.md) "Iteration Checkpoint `phase_progress` Field".
+- `prior_checks`: dict (optional, default `{}`) — map of checks already passed in a prior turn that was interrupted by autocompact or graceful stop. Keys: `q1_passed`, `q1_artifact`, `q1_5_passed`, `q1_5_checklist`, `q2_passed`, `q2_failure_mode_checked`, `q3_scope`, `q4_passed`, `standard_checks_passed`. Threaded in by the Phase -1.4 Graceful Stop Handler from `iteration-checkpoint.json`'s `phase_progress` field. See [core/config/conventions/compact-recovery.md](core/config/conventions/compact-recovery.md) "Iteration Checkpoint `phase_progress` Field".
 
 - `scope`: `"full"` (default) or `"own-unit"` (g-306-417) — a worker Body verifying only the goal it just executed (worker-loop Phase 4a, before the mechanical close). Runs each per-goal section below for that goal alone; skips the cross-Body residue (streaks, sampled review). A pass means the criteria were met on THIS Body, never that its code landed (guard-4638). Why: `core/config/rationale/worker-verify-own-unit.md`.
 
@@ -102,37 +102,18 @@ Read JSON result:
 ```
 
 `checks_unevaluatable` (g-115-4849) means the evaluator COULD NOT RUN one or
-more checks — an unknown type name, a missing required field, a command outside
-the allowlist — as opposed to running them and finding the work undone. Until it
-existed both landed in `checks_failed`, so a goal that genuinely succeeded was
-marked `pending` because its check used a type name predicate.py does not
-implement.
+more checks, as opposed to running them and finding the work undone. `all_passed`
+is **null** on that path, exactly as on `checks_empty` — nothing was verified, so
+it must not read `true`; nothing failed, so it must not read `false`. A genuine
+failure OUTRANKS an unevaluatable one: when both are present the flag is
+`checks_failed`, so an unevaluatable check can never launder a real failure into
+a fall-through; the tally survives in the separate `unevaluatable_count` field,
+which you read rather than inferring from flags.
 
-Measured on the live world queue 2026-08-11 (20 active aspirations, 145
-structured checks): **68 of 145 — 46.9% — cannot be evaluated**, split
-`not-in-allowlist` 29, `missing-command` 22, `unknown-type` 17. That is a
-static LOWER BOUND: it is computed by inspection rather than by calling
-`evaluate()`, because evaluating an allowlisted `command_succeeds` would
-actually run the command 145 times, and it cannot see run-time schema failures
-such as an unresolvable `after_ref`.
-
-**Do not read the type-name bucket as the whole population.** The first pass of
-this very measurement counted only unknown type names, got 17/145 = 11.7%, and
-was wrong by a factor of four — the two larger buckets dispatch to a real
-evaluator and then get refused before anything is checked, so a census keyed on
-`type not in PREDICATE_TYPES` cannot see them. The 71% figure in g-115-4849's
-description is the pre-alias type-name count; g-115-5186's alias tables cut that
-bucket specifically, which is why the type-name share fell while the true
-unevaluatable share did not.
-
-`all_passed` is **null** on this path, exactly as on `checks_empty`: nothing was
-verified, so it must not read `true`; nothing failed, so it must not read
-`false`. Exit code is 0 — only a genuine failure exits 1.
-
-A genuine failure OUTRANKS an unevaluatable one: when both are present the flag
-is `checks_failed`, because an unevaluatable check must never launder a real
-failure into a fall-through. The unevaluatable tally survives that branch in the
-separate `unevaluatable_count` field — read it rather than inferring from flags.
+Why the flag exists, the measured size of the unevaluatable population (46.9% of
+145 structured checks, and why a type-name census under-counts it fourfold), and
+how wide this fall-through is (~98.7% of the live queue reaches Q1-Q4):
+`core/config/rationale/verify-check-unevaluatable.md`.
 
 ### Sub-Phase Checkpoint Helper (shared by Q1/Q2/Q3 and standard checks)
 
@@ -234,21 +215,15 @@ IF "user" in (goal.participants or []) AND goal.verification.outcomes_agent_leg 
         Continue to Empty-Checks Escalation Protocol.
 ```
 
-### Empty-Checks Escalation Protocol (Q1/Q2/Q3)
+### Empty-Checks Escalation Protocol (Q1/Q2/Q3/Q4)
 
 When `len(checks) == 0`, the agent MUST answer three structured questions.
 Each Q respects `prior_checks` — a Q already passed in a prior turn is skipped.
 
-**Assertion format requirement** (communication-clarity.md Rule 6): Every
-verification statement in Q1/Q2/Q3 responses MUST use the form "X is Y
-because Z" — cite the concrete evidence source (script output, file read,
-command result, artifact path). Hedging language on observed evidence —
-"possibly", "might be", "could be", "seems to", "appears to" — on an
-outcome the execution actually produced triggers re-verification: the
-reviewer cannot distinguish "evidence was genuinely ambiguous" from "agent
-didn't look carefully enough," so hedge detection forces another pass.
-When evidence is truly partial, state what was observed and what is
-unknown as two separate claims, not one hedged claim.
+**Assertion format requirement**: every Q-answer obeys `communication-clarity.md`
+Rule 6 — "X is Y because Z", citing the evidence source. A hedge on an outcome the
+execution actually produced ("possibly", "appears to") forces re-verification,
+because a reader cannot tell ambiguous evidence from a shallow look.
 
 **Q1 EVIDENCE**: "What concrete artifact (file, output, state change, commit) proves
 this goal succeeded?" Must reference a checkable artifact.
@@ -363,6 +338,30 @@ APPEARED to succeed but actually failed? Did I check for that?"
   bash core/scripts/loop-state-save.sh update --set "phase_progress.q3_scope=<unit|integration>"
   echo '{"entry_type":"observation","goal_id":"<goal.id>","content":"Q3 scope: <unit|integration>"}' | bash core/scripts/execution-diary.sh append
   ```
+
+**Q4 ENTITY-FACT PROVENANCE** (g-357-44): "Do the artifact's factual claims rest
+on sources this session actually fetched?" Runs only when Q1 named a concrete
+file artifact; skip otherwise.
+- `IF prior_checks.q4_passed`: log `"Q4 skipped (prior checkpoint)"`; proceed.
+- Else run the sampler. You do NOT choose which claims it checks — that is the
+  point. Add `--source-file` when the goal cites a source the artifact must be
+  faithful to:
+  ```bash
+  bash core/scripts/q4-provenance-sample.sh --goal <goal.id> --artifact <Q1 artifact> [--source-file <cited source>]
+  ```
+- Exit `1` = FAIL (a sampled claim is uncited, decoratively cited, or reversed
+  against its source) → `all_passed = false`, status → pending, append each
+  finding to sensory_buffer as a `verification_gap`. Exit `0` is `pass` OR
+  `skipped` — **not the same answer**; read the verdict and never count
+  `skipped` as evidence. No override flag, by design.
+- **On Q4 assessed**:
+  ```bash
+  bash core/scripts/loop-state-save.sh update --set "phase_progress.q4_passed=true"
+  echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q4 provenance: <verdict>, <sampled>/<total> cluster(s)"}' | bash core/scripts/execution-diary.sh append
+  ```
+  Why the sample is scripted, why `--session-id` must stay defaulted on a worker
+  Body, and why a `cat`-read file reads as uncited:
+  `core/config/rationale/verify-check-unevaluatable.md` § Q4.
 
 ### Standard Checks
 

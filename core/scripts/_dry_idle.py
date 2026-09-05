@@ -41,6 +41,16 @@ DEFAULTS = {
     "budget_pct": 0.90,
     "reset_on_executable": True,
     "stop_after_cap_cycles": None,
+    # : max age of a signals.last_all_blocked marker for the DRY-SPIN
+    # guard to treat the previous cycle as "just routed all_blocked and wrote no
+    # sleep" and short-circuit re-entry. Deliberately equal to the base_seconds
+    # DEFAULT (120), not to the live base_seconds: a deployment that raises
+    # base_seconds to 7200 for flat 2-hour idle blocks () must not widen
+    # this window to 2h, because the window bounds how long a STALE marker can
+    # keep firing the guard. Past the gap a genuine long sleep elapsed -> normal
+    # entry. See dry-spin-guard.py and guard-4870 (a re-entry watch is valid only
+    # against a signal re-measured between the two reads).
+    "min_reentry_gap_s": 120,
 }
 
 # Quiescence decisions that leave the loop with NO gated sleep -> dry-eligible.

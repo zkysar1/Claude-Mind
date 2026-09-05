@@ -127,9 +127,37 @@ def truncate(text, max_chars):
     return text[:max_chars - 3] + "..."
 
 
+# Chars per token for the text THIS script emits. MEASURED here, never inherited
+# (guard-2026: justify the base independently instead of adopting the literal you
+# are replacing). Ground truth 2026-09-03 (alpha, DESKTOP-O91DLK2): a real
+# `--category infrastructure --role executor` build of 205,007 B was reported as
+# 85,232 tokens by the Read tool's own truncation notice -> 2.405 B/token. Two
+# further builds, counted with tiktoken and corrected by the factor that same
+# file calibrates (x1.6903), gave 2.406 (framework-maintenance) and 2.370
+# (knowledge-management). Independent corroboration: rb-9606 measures chars/4 at
+# ~40% low on id-dense Mind text, which is the same 1.69x from other content.
+#
+# The prior value (4) underestimated by 1.67-1.71x, and did so in the UNSAFE
+# direction: this estimate gates the trimming loops in build_context(), so an
+# undercount stops trimming early and emits a block BIGGER than the caller
+# budgeted — which the consumer then truncates at the far end, silently. 2.3 is
+# set deliberately BELOW the measured floor (2.370) so the estimate runs ~3% HIGH
+# and errs toward trimming one node too many; that degrades gracefully, because
+# matched_nodes is confidence-sorted and popped from the bottom.
+#
+# DO NOT UNIFY WITH tree.py / tree_write_fence.py CHARS_PER_TOKEN (also 2.3).
+# Same number, DIFFERENT invariant: theirs is measured on tree-node markdown
+# against a ~25k-token Read cap; this one on guardrail one-liners against an
+# output budget. They agree today by a coincidence of content density, not by
+# construction, so a shared helper would silently re-tune this site whenever that
+# one is recalibrated (guard-3810). Keep them independent and re-measure this
+# constant against THIS script's own output.
+CHARS_PER_TOKEN = 2.3
+
+
 def estimate_tokens(text):
-    """Crude token estimate: chars / 4."""
-    return len(text) // 4 if text else 0
+    """Token estimate for this script's own output class (see CHARS_PER_TOKEN)."""
+    return int(len(text) / CHARS_PER_TOKEN) if text else 0
 
 
 # ---------------------------------------------------------------------------

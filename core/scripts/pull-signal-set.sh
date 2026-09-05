@@ -40,8 +40,17 @@
 #
 # Usage:
 #   bash core/scripts/pull-signal-set.sh --if-carrier-content
-#   bash core/scripts/pull-signal-set.sh --goal <id> --reason "<one line>"
+#   bash core/scripts/pull-signal-set.sh --goal <id> --reason "<one line>" [--base "<b>"]
 #   bash core/scripts/pull-signal-set.sh --goal <id> --clear
+#
+# --base records WHAT THE CALLER MEASURED AHEAD-NESS AGAINST ( outcome
+# 1) — conventionally "head=<short sha> origin=<short sha>". The --if-carrier-
+# content lane fills it in itself; a caller passing --reason should pass it too.
+# It exists because ahead-ness is BOX-LOCAL by construction and this field is
+# fleet-visible: a behind base MANUFACTURES outstanding tips, and the consumer
+# cannot audit the number without knowing its base (guard-5797). Omitted from
+# the payload when empty, so "no base declared" stays distinguishable from
+# "base was empty".
 #
 # Verdicts (first token of stdout):
 #   SET             wrote a fresh pull_signal
@@ -58,17 +67,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
 REPO="$PROJECT_ROOT"
 
-GOAL=""; SOURCE="world"; REASON=""; BY=""; IF_CARRIER=0; DO_CLEAR=0; STRICT=0
+GOAL=""; SOURCE="world"; REASON=""; BY=""; BASE=""; IF_CARRIER=0; DO_CLEAR=0; STRICT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --goal)               GOAL="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --source)             SOURCE="${2:-world}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --reason)             REASON="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --by)                 BY="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --base)               BASE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --if-carrier-content) IF_CARRIER=1; shift;;
     --clear)              DO_CLEAR=1; shift;;
     --strict)             STRICT=1; shift;;
-    -h|--help)            sed -n '1,52p' "${BASH_SOURCE[0]}"; exit 0;;
+    -h|--help)            sed -n '1,62p' "${BASH_SOURCE[0]}"; exit 0;;
     *) echo "pull-signal-set: unknown flag '$1'" >&2; exit 2;;
   esac
 done
@@ -120,6 +130,13 @@ if [ "$IF_CARRIER" = 1 ]; then
   fi
   REF_SHA="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   REASON="carrier ref $REF_SHA, $FW_COUNT framework file(s)"
+  #  outcome 1. The count above is ahead-ness measured against THIS
+  # box's origin/main ref, which the close path deliberately does not re-fetch
+  # (it throttles). Record what it was measured against so a consumer can
+  # discount a stale-base signal rather than trusting a number it cannot audit
+  # (guard-5797). Self-supplied here because this lane owns its own git
+  # detection; the reducer lane passes --base explicitly.
+  [ -z "$BASE" ] && BASE="head=$REF_SHA origin=$(git -C "$REPO" rev-parse --short origin/main 2>/dev/null || echo unknown)"
 fi
 
 if [ "$DO_CLEAR" = 0 ] && [ -z "$REASON" ]; then
@@ -131,7 +148,7 @@ fi
 # branch is testable without a daemon, a world or a git tree (same shape and same
 # reason as reducer_self_fence.py::decide). This wrapper owns only arg parsing
 # and the git detection above; it must not re-implement any of the decision.
-GOAL="$GOAL" SOURCE="$SOURCE" REASON="$REASON" BY="$BY" \
+GOAL="$GOAL" SOURCE="$SOURCE" REASON="$REASON" BY="$BY" BASE="$BASE" \
 MAX_AGE="$CFG_MAX_AGE" DO_CLEAR="$DO_CLEAR" \
 python3 "$SCRIPT_DIR/pull_signal_producer.py"
 PY_RC=$?

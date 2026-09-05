@@ -80,13 +80,13 @@ Bash: session-desync-check.sh
 # recovery_action, or file a Maintain goal if the file is non-framework.
 ```
 
-## Phase -1: Persona State Migration
+## Phase -1: Persona Activation
 
-Ensure persona configuration exists in state files (handles upgrades from pre-persona installations):
+Step 1 is UNCONDITIONAL — the only persona write in the autonomous path; 2-3 are legacy no-ops:
 
-1. Read `agents/<agent>/profile.yaml`. If `persona:` key is missing, append persona defaults from `core/config/profile.yaml` `initial_state.persona`
-2. Read `agents/<agent>/profile.yaml`. If `focus` key is missing, add `focus: null` (migration for pre-focus installations)
-3. Bash: `session-persona-set.sh true` — starting the loop always means full agent mode
+1. Bash: `session-persona-set.sh true` — starting the loop always means full agent mode
+2. Read `agents/<agent>/profile.yaml`. If `persona:` key is missing, append persona defaults from `core/config/profile.yaml` `initial_state.persona`
+3. Read `agents/<agent>/profile.yaml`. If `focus` key is missing, add `focus: null` (migration for pre-focus installations)
 
 ## Phase -0.5: Environment Check
 

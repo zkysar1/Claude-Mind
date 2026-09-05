@@ -17,6 +17,7 @@ execution_history:
   last_invocation: null
   known_pitfalls: []
   reconsolidation_trigger: "After 10 invocations with declining success rate, trigger skill review"
+companion_scripts: [core/scripts/recent-completions-packet.sh]
 conventions: [pipeline, aspirations, tree-retrieval, reasoning-guardrails, pattern-signatures]
 minimum_mode: assistant
 revision_id: "skill-bootstrap-review-hypotheses-9490ec"

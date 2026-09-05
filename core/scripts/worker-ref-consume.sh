@@ -402,14 +402,59 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   # A ref whose only unlanded commits are content-free sync merges carries no
   # framework files of its own — the three-dot diff would list what it pulled
   # FROM main, so it is skipped rather than reported (same false-reading class).
+  # mind_api/{src,tests} IS framework and must be counted here ().
+  # This predicate gates the DEMAND signal: fw_count>0 is what increments
+  # pull_tip_count (below), which is worth pull_boost=4.00 — the out-of-cadence
+  # promotion. While it read '^(core/|\.claude/|CLAUDE\.md)' a ref carrying only
+  # daemon code scored fw_count=0, so it raised NO pull signal and waited out the
+  # ordinary interval timer. The ref was never invisible (n_outstanding
+  # increments unconditionally); what it lost was the demand signal and the
+  # merge suggestion gated on the same count. promotion-preflight.sh already
+  # defines framework as 'core/config, core/scripts, .claude/{skills,rules},
+  # CLAUDE.md, settings.json, mind_api/{src,tests}' (.claude/rules/
+  # promotion-cycle.md) — two instruments disagreeing, with the narrower one
+  # gating a fleet-visible signal. Measured before widening (30d, 6,718
+  # non-merge commits): 273 touched mind_api/, 100 of them touched NO
+  # core/|.claude/|CLAUDE.md — 36.6% of daemon work, so the dropped population
+  # is common. Consumers audited: nothing outside this script reads
+  # framework_files, and --check thresholds key on ahead/age_h, never fw_count.
   fw_all=""
   if [ "$ahead" -gt 0 ]; then
     fw_all="$(git -C "$REPO" diff --name-only "HEAD...$ref" 2>/dev/null \
-              | grep -E '^(core/|\.claude/|CLAUDE\.md)')"
+              | grep -E '^(core/|\.claude/|CLAUDE\.md|mind_api/src/|mind_api/tests/)')"
   fi
   fw_count="$(printf '%s' "$fw_all" | grep -c . || true)"
   fw="$(printf '%s' "$fw_all" | head -50)"
   fw_more=$(( fw_count > 50 ? fw_count - 50 : 0 ))
+  # Goal ids NAMED by the unlanded commits (). `commits_ahead` and
+  # `framework_files` say HOW MUCH is stranded; nothing said WHAT WORK it is,
+  # so a reader deciding "drain now or later?" had no way to see that a ref
+  # holds the precondition for the goal they are about to pick. MEASURED
+  # (2026-09-04, the incident this closes): ref .../2fda1f3e carried
+  # a0f9f37c22 + dd77e0e97a, whose messages name  AND its parent
+  #  — and  was the very goal being selected while the ref was
+  # judged "0-1h old, not urgent". The information was in the commit messages
+  # the whole time and no instrument surfaced it.
+  #
+  # Same content-not-commits rule as `ahead` and `fw_all`: --no-merges drops
+  # sync merges, and --invert-grep drops iteration-push.sh's self-heal churn
+  # commit (iteration-push.sh:1083), whose message names  in EVERY
+  # such commit on EVERY ref — a constant that would otherwise appear as
+  # stranded work on refs carrying none. Its diff is agent-namespace only.
+  #
+  # ADVISORY AND LOSSY BY CONSTRUCTION, stated so nobody reads an empty value
+  # as "this ref strands nothing": the goal-id-in-commit-message convention is
+  # partial (measured ~32 of 60 commits in goal-claim-commit-gate.py), so an
+  # empty `goal_ids` means "no commit here NAMED a goal", never "no goal work
+  # is stranded here". commits_ahead remains the count of record.
+  goal_ids=""
+  if [ "$ahead" -gt 0 ]; then
+    goal_ids="$(git -C "$REPO" log --format='%B' --no-merges \
+                  --invert-grep --grep='pre-merge self-namespace churn' \
+                  "HEAD..$ref" 2>/dev/null \
+                | grep -oE 'g-[0-9]+-[0-9]+' | sort -u | tr '\n' ' ')"
+    goal_ids="${goal_ids% }"
+  fi
   is_self=0; [ -n "$SELF_SID" ] && [ "$sid" = "$SELF_SID" ] && is_self=1
   superseded_by=""
   [ "$ahead" -gt 0 ] && superseded_by="$(superseding_of "$ref")"
@@ -457,13 +502,19 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   if [ "$AS_JSON" = 1 ]; then
     [ "$first" = 0 ] && printf ','
     first=0
-    printf '{"ref":"%s","agent":"%s","sid":"%s","commits_ahead":%s,"framework_files":%s,"is_self":%s,"superseded_by":"%s","oldest_unlanded_age_h":%s,"unreadable":%s,"sync_merges":%s}' \
-      "$ref" "$agent" "$sid" "$ahead" "$fw_count" "$is_self" "$superseded_by" "$age_h" "$unreadable" "$sync_merges"
+    printf '{"ref":"%s","agent":"%s","sid":"%s","commits_ahead":%s,"framework_files":%s,"is_self":%s,"superseded_by":"%s","oldest_unlanded_age_h":%s,"unreadable":%s,"sync_merges":%s,"goal_ids":"%s"}' \
+      "$ref" "$agent" "$sid" "$ahead" "$fw_count" "$is_self" "$superseded_by" "$age_h" "$unreadable" "$sync_merges" "$goal_ids"
   else
     tag=""; [ "$is_self" = 1 ] && tag="  (this body — nothing to consume)"
     [ "$sync_merges" -gt 0 ] && tag="$tag  (+$sync_merges content-free sync merge(s) of origin/main — not counted)"
     echo "  $ref"
     echo "      agent=$agent sid=$sid  commits_ahead=$ahead  framework_files=$fw_count  oldest_unlanded=${age_h}h$tag"
+    # WHAT work is stranded, not just how much (). Printed for every
+    # ref with named goals — deliberately NOT folded into the --check breach
+    # banner, which fires only past the depth/age thresholds: the incident ref
+    # was 1h old with 2 commits and breached neither, so a breach-only surface
+    # would have stayed silent on the exact case this closes.
+    [ -n "$goal_ids" ] && echo "      carries work naming: $goal_ids"
     [ "$unreadable" = 1 ] && echo "      ⚠ UNREADABLE — rev-list failed for this ref (bad object / corrupt ref / unfetched sid); ahead-count unknown, NOT counted outstanding"
     if [ -n "$superseded_by" ]; then
       echo "      ANCESTOR of ${superseded_by} — its commits are contained there; review the tip instead"
@@ -517,9 +568,61 @@ fi
 # STRICTLY ADVISORY: rc swallowed. This is the reducer's close path, which must
 # never fail on a visibility instrument.
 if [ "$DO_CHECK" = 1 ] && [ "$pull_tip_count" -gt 0 ]; then
-  extra=""
-  [ "$pull_tip_count" -gt 1 ] && extra=" (+$((pull_tip_count-1)) more tip(s))"
-  log "pull: $(bash "$SCRIPT_DIR/pull-signal-set.sh" \
-      --reason "outstanding carrier $pull_first_ref, $pull_fw_total framework file(s)$extra" 2>&1 | head -1)"
+  # --- PRODUCER GATE ( outcome 2; guard-5797, guard-5953) ---------
+  # Everything above this point is a BOX-LOCAL git measurement. Everything below
+  # writes it into a SHARED world-store field that other machines consume and
+  # cannot audit. That asymmetry is the whole reason this gate exists.
+  #
+  # BOTH refusals FAIL CLOSED, and the direction is not arbitrary: the producer
+  # is idempotent-skip-while-live (rb-662), so a phantom signal does not merely
+  # add a false boost — it BLOCKS the real one until it ages out. A missed stamp
+  # costs a delayed pull; a false stamp costs a SUPPRESSED true signal plus a
+  # wrong ranking. Measured 2026-09-04: a fixture signal suppressed the real one
+  # from 3 genuine outstanding tips carrying 16 framework files.
+  pull_bound_repo="$(cd "${PROJECT_ROOT:-$SCRIPT_DIR/../..}" 2>/dev/null && pwd -P || echo '')"
+  pull_this_repo="$(cd "$REPO" 2>/dev/null && pwd -P || echo '')"
+  pull_head_sha="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  pull_origin_sha="$(git -C "$REPO" rev-parse --short refs/remotes/origin/main 2>/dev/null || echo unknown)"
+  pull_skip=""
+
+  # (1) FOREIGN REPO. --repo points somewhere that is not this agent's own tree,
+  # so the refs measured have no relationship to the world store about to be
+  # stamped. This is the pytest-fixture channel: the tmp repo isolates GIT and
+  # nothing isolates the world store, so `--repo <tmp_path>` wrote a real
+  # pull_signal naming a ref (refs/workers/alpha/sid-bbbb) that exists nowhere
+  # (guard-5953). Gating on repo identity closes it for EVERY caller present and
+  # future, which an opt-in test seam would not — a new test that forgets the
+  # seam leaks again, and nothing would fail.
+  if [ -z "$pull_this_repo" ] || [ "$pull_this_repo" != "$pull_bound_repo" ]; then
+    pull_skip="SKIP-foreign-repo (--repo resolves to '${pull_this_repo:-<unresolvable>}', not the bound agent repo '$pull_bound_repo'; refusing to stamp a shared field from a foreign tree)"
+  # (2) BEHIND BASE. ahead-ness here is computed against the LOCAL branch and
+  # this path deliberately does not fetch (the close path throttles), so a local
+  # branch behind origin MANUFACTURES outstanding tips out of already-landed
+  # commits (guard-5797). Uses the last-known origin ref already in the ref
+  # store — no new fetch, per the outcome's own constraint. An unresolvable
+  # origin/main means the base cannot be established at all, which fails closed
+  # for the same reason: an unauditable number must not reach a shared field.
+  elif [ "$pull_origin_sha" = "unknown" ]; then
+    pull_skip="SKIP-unreadable-base (refs/remotes/origin/main does not resolve; cannot establish the base this count was measured against)"
+  else
+    pull_behind="$(git -C "$REPO" rev-list --count "HEAD..refs/remotes/origin/main" 2>/dev/null || echo '')"
+    if [ -z "$pull_behind" ]; then
+      pull_skip="SKIP-unreadable-base (git could not count HEAD..origin/main — NOT the same as 'not behind')"
+    elif [ "$pull_behind" -gt 0 ]; then
+      pull_skip="SKIP-behind-base (local is $pull_behind commit(s) behind origin/main at $pull_origin_sha; already-landed commits would read as outstanding)"
+    fi
+  fi
+
+  if [ -n "$pull_skip" ]; then
+    # Logged, never silent: a producer that declines invisibly is indistinguishable
+    # from one that is broken (the F-002 shape this script already fixed on itself).
+    log "pull: $pull_skip"
+  else
+    extra=""
+    [ "$pull_tip_count" -gt 1 ] && extra=" (+$((pull_tip_count-1)) more tip(s))"
+    log "pull: $(bash "$SCRIPT_DIR/pull-signal-set.sh" \
+        --reason "outstanding carrier $pull_first_ref, $pull_fw_total framework file(s)$extra" \
+        --base "head=$pull_head_sha origin=$pull_origin_sha" 2>&1 | head -1)"
+  fi
 fi
 exit 0

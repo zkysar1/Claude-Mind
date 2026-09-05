@@ -261,6 +261,17 @@ def _get_runner_capabilities():
 # structured prefixes keep the fail-open expiry (their sweeps auto-clear them).
 _HUMAN_BLOCKED_PREFIX = "human_blocked:"
 
+#  / PEARL B2b. A MEMBER paused or declined this goal from the Planned board.
+# Third instance of the never-self-clears property (human_blocked: is a human gate,
+# _is_handoff_gated_defer is a routing gate, this is a member gate) — the 120h fail-open
+# re-probes defers whose premise is a WORLD condition, and no probe can answer "does the
+# member still want this paused". Only the member's inverse verb clears it.
+_MEMBER_PAUSED_PREFIX = "member_paused:"
+
+# str.startswith takes a tuple, so both never-expiring prefixes share ONE test at each of
+# the two sites below. SYMMETRY: collect_candidates and collect_blocked both use this.
+_NEVER_EXPIRING_DEFER_PREFIXES = (_HUMAN_BLOCKED_PREFIX, _MEMBER_PAUSED_PREFIX)
+
 
 def _is_handoff_gated_defer(goal):
     """A STRUCTURED defer on a goal that is ROUTED ELSEWHERE ().
@@ -1430,17 +1441,46 @@ def compute_role_affinity(agent_name, goal_class, multipliers):
 
     Returns 0.0 (zero contribution) when:
     - agent_name is empty/None
-    - goal_class is None or "unclassified"
+    - goal_class is None/empty
     - agent has no entry in multipliers
     - agent's entry is not a dict (corrupt config)
     - goal_class has no entry under that agent
     - the looked-up value cannot be coerced to float
+
+    "unclassified" is NOT special-cased here. It resolves through the table
+    like any other class, so its value is whatever the config says (g-115-8789).
     """
-    # "unclassified" is excluded by design — same precedent as criterion
-    # 7e (class_balance_bonus, line ~1473): goals with no work_class tag
-    # don't participate in class-based scoring at all. Removing this
-    # exclusion would attribute role_affinity to backfill-pending goals.
-    if not agent_name or not goal_class or goal_class == "unclassified":
+    # : the hardcoded `goal_class == "unclassified"` short-circuit
+    # that used to sit here made the seven `unclassified:` rows in
+    # meta/goal-selection-strategy.yaml DEAD CONFIG — the function returned
+    # before ever reading them. Measured: compute_role_affinity('alpha',
+    # 'unclassified', {'alpha': {'unclassified': 0.9}}) returned 0.0.
+    #
+    # Its stated rationale was "removing this exclusion would attribute
+    # role_affinity to backfill-pending goals" (criterion 7e precedent). That
+    # premise is FALSIFIED. Those goals are not backfill-PENDING, they are
+    # backfill-UNREACHABLE: backfill-work-class.py skips on
+    # `if existing: continue`, and "unclassified" is truthy, so a goal that
+    # already stores it can never be re-resolved by the tool that exists.
+    # Measured 2026-09-03 on the live queue: 587 of 2388 non-terminal goals
+    # (24.6%, 40 of them HIGH) store unclassified-or-absent, and the share has
+    # not moved in five weeks across a completed coverage sweep (
+    # added 36 mapping rows; open-goal share went 24.9% -> 24.7%).
+    #
+    # The exclusion is therefore not a temporary stance during a migration —
+    # it is a permanent 0.0 for a quarter of the corpus, applied to all seven
+    # agents at once. Removing it is deliberately BEHAVIOUR-PRESERVING on its
+    # own: with the shipped table still reading `unclassified: 0.0`, this
+    # returns exactly 0.0 as before. The value now lives in ONE place (the
+    # config, per guard-134) instead of being hardcoded here and duplicated
+    # there, so changing it is a visible config edit rather than a code change.
+    #
+    # NOTE the criterion 7e precedent does NOT transfer, and that is why only
+    # this term changed: 7e excludes "unclassified" from a DENOMINATOR (a share
+    # computation, where an unknown class genuinely cannot participate), while
+    # this term is a per-goal MULTIPLIER (where exclusion means a veto). Same
+    # word, opposite consequence.
+    if not agent_name or not goal_class:
         return 0.0
     if not isinstance(multipliers, dict):
         return 0.0
@@ -1837,6 +1877,88 @@ def _log_transient_allblocked_recovery(first_world, retry_world, retry_count,
             pass
     except Exception:
         pass
+
+
+def _allblocked_marker_write_refused():
+    """True when the all_blocked marker write must be suppressed ().
+
+    Mirrors _anomalies_write_refused above, including its use of a DEDICATED
+    opt-in variable. That detail is load-bearing and was learned the hard way:
+    this guard first keyed on BODY_WM_PATH, reasoning that a test setting the
+    framework's own per-Body WM redirect has already isolated itself. But
+    bash-agent-inject.py sets BODY_WM_PATH on EVERY Bash call of EVERY worker
+    Body, so the guard evaluated False precisely on the boxes it was written to
+    protect, and its first control run stamped a live marker into a running
+    Body's WM (measured 2026-09-04, cc-07). An isolation signal must be one that
+    PRODUCTION NEVER SETS; anything production sets makes the guard inert where
+    it matters.
+
+    The harm suppressed is worse than dirty evidence: the next REAL cycle would
+    read fixture residue as "the previous iteration routed all_blocked" and
+    short-circuit a healthy entry into a sleep. Suppression is announced on
+    stderr -- a silent skip would trade one invisible behavior for another.
+    """
+    return bool(os.environ.get("PYTEST_CURRENT_TEST")) and not os.environ.get(
+        "GOAL_SELECTOR_ALLBLOCKED_MARKER")
+
+
+def _write_allblocked_marker():
+    """Record that THIS cycle routed to all_blocked ().
+
+    Loop entry cannot otherwise tell a cycle that routed all_blocked from a
+    productive one: every existing fast path CONSUMES state the previous cycle
+    must have WRITTEN (blocked_sleep_until, dry_idle.streak,
+    quiescence-last-cycle.json), so a cycle whose handler was NARRATED instead
+    of run leaves nothing behind and the loop reloads the full ~75-minute
+    handler back to back. Measured on coach 2026-09-03 02:10Z. This marker is
+    the one piece of that state a narrated handler cannot fake, because a
+    SCRIPT writes it at the moment the route is taken -- which is why the goal
+    asks for it here and not in the handler.
+
+    COVERAGE IS THE SCRIPT-EMITTED ROUTE ONLY, deliberately. aspirations-select
+    also returns selection_reason "all_blocked" when a partner holds the only
+    candidate (its SKILL.md L131) and "all_blocked_by_gate" when the blocker
+    gate exhausts the ranking (L566). Both are LLM-narrated returns -- no script
+    runs at that moment, so nothing can write a marker without reintroducing the
+    LLM-discretionary step this goal exists to remove. Those cycles keep today's
+    behavior: absent marker -> detector no-op -> normal entry. That is the
+    goal's own negative control #5 and the fail-safe direction (a missed
+    detection costs one slow cycle; a false one sleeps through live work).
+
+    sys.executable, not bash_cmd: the target is a .py, so invoking the running
+    interpreter directly sidesteps the Windows python-shim path entirely
+    (python-invocation.md). capture_output keeps the child's stdout out of this
+    process's stdout, which goal-selector.sh parses as JSON.
+
+    Fail-open at every layer: this must never break selection.
+    """
+    if _allblocked_marker_write_refused():
+        sys.stderr.write(
+            "[goal-selector] all_blocked marker SUPPRESSED under pytest -- "
+            "refusing to stamp a fixture marker into a real deployment's "
+            "loop_state, which the next real cycle would read as a live route. "
+            "Set GOAL_SELECTOR_ALLBLOCKED_MARKER=1 (with an isolated WM) to capture it. (g-357-88)\n")
+        return
+    try:
+        import subprocess as _sp
+        r = _sp.run([sys.executable,
+                     str(CORE_ROOT / "scripts" / "loop-state-bump-counters.py"),
+                     "--all-blocked-marker"],
+                    capture_output=True, text=True, timeout=20)
+        # The writer is fail-open BY DESIGN (_run_field_op returns 0 even when
+        # the lock cannot be acquired), which is the right direction -- a missing
+        # marker costs one slow entry, never a false sleep. But capture_output
+        # would then swallow the WARN entirely and the write would be a SILENT
+        # no-op, which is the exact "nothing script-side notices" defect this
+        # goal exists to remove. rc is uninformative here, so relay on the
+        # writer's own WARN prefix (its two failure paths share it).
+        if r.returncode != 0 or "WARN" in (r.stderr or ""):
+            sys.stderr.write(
+                "[goal-selector] all_blocked marker NOT written (rc=%s): %s\n"
+                % (r.returncode, (r.stderr or "").strip()[:300]))
+    except Exception as e:  # pragma: no cover - defensive; never block selection
+        print(f"[goal-selector] all_blocked marker write skipped "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -2779,7 +2901,7 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     # candidate every iteration. Always skip it (excluded from
                     # candidates); collect_blocked routes it to blocked[] with a
                     # synthesized blocker_ref so quiescence can fire.
-                    if (goal.get("defer_reason") or "").lower().startswith(_HUMAN_BLOCKED_PREFIX):
+                    if (goal.get("defer_reason") or "").lower().startswith(_NEVER_EXPIRING_DEFER_PREFIXES):
                         continue
                     # Handoff-gated defer (): same never-self-clears
                     # property as human_blocked:, different cause — routing, not a
@@ -3281,10 +3403,17 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     # _synth_blocker_ref_from_structured_defer) so all_blocked can
                     # be asserted and quiescence fires, instead of falling through
                     # to the candidate pool every iteration.
-                    if (goal.get("defer_reason") or "").lower().startswith(_HUMAN_BLOCKED_PREFIX):
+                    if (goal.get("defer_reason") or "").lower().startswith(_NEVER_EXPIRING_DEFER_PREFIXES):
                         entry["block_reason"] = "deferred"
-                        entry["block_detail"] = "Human-blocked: {reason}".format(
-                            reason=goal.get("defer_reason", ""))
+                        _reason = goal.get("defer_reason", "")
+                        # Name the gate that actually fired. A member pause reported as
+                        # "Human-blocked" would route a reversible member action into the
+                        # human-escalation lane the precheck age-escalation surfaces.
+                        _label = ("Member-paused"
+                                  if str(_reason).lower().startswith(_MEMBER_PAUSED_PREFIX)
+                                  else "Human-blocked")
+                        entry["block_detail"] = "{label}: {reason}".format(
+                            label=_label, reason=_reason)
                         blocked.append(entry)
                         continue
                     # Handoff-gated twin of the guard above (). Keep it in
@@ -4243,8 +4372,36 @@ def emit_directive_honor_banner(scored, agent_name, board_path=None):
             or any(t in known_agents for t in tags)
             or any(parse_routing_tag(t)[0] in known_agents
                    for t in tags if "@" in str(t)))
+        # : board-post.sh stamps the AUTHOR's own name into every
+        # post's tags, so EVERY directive an agent writes carries its own bare
+        # name. The bare-name disjunct therefore matched the AUTHOR, and an
+        # agent was compelled to honor directives it wrote FOR SOMEONE ELSE.
+        # The severity is INVERTED from an ordinary false positive: this banner
+        # forbids a silent skip, so the louder it shouts the more likely a
+        # reader complies rather than investigates -- and complying means doing
+        # a peer's assigned work. Measured 2026-09-03 on cc-09,
+        # msg-20260903-065244-alpha-5364: tags ['requires_action_by:foxtrot',
+        # 'target:', 'action_type:restart-daemon-and-sweep', 'alpha',
+        # 'sprint-planning'], text opening '@foxtrot -  needs one leg
+        # on YOUR box', banner read "(directed at alpha, UNACKED)".
+        #
+        # AN EXPLICIT ADDRESSEE IS THE WHOLE ADDRESSEE SET. requires_action_by:
+        # is a deliberate routing decision, so the bare-name form must not
+        # widen it. With NO such tag the bare form still routes -- that is the
+        #  path (test_fires_on_unacked_directive_targeting_scored_goal)
+        # and it must not regress; note the prose fallback below is gated on
+        # has_routing_tag, which is unchanged, so a directive with an addressee
+        # tag still suppresses the fallback for everyone it does not name.
+        #
+        # The startswith selects the tag KIND, never the agent: the agent
+        # comparison stays component-wise inside routing_tag_targets_agent, so
+        # guard-2860 ("not a pattern match") still holds. Same idiom as
+        # has_routing_tag immediately above.
+        addressee_tags = [t for t in tags
+                          if str(t).startswith("requires_action_by:")]
         explicitly_directed = any(
-            routing_tag_targets_agent(t, agent_name, self_env) for t in tags)
+            routing_tag_targets_agent(t, agent_name, self_env)
+            for t in (addressee_tags or tags))
         directed = explicitly_directed or (
             not has_routing_tag and agent_name.lower() in text.lower())
         if not directed:
@@ -5019,6 +5176,22 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # own HIGH-routed .
         "intended_agent": goal.get("intended_agent"),
         "routed_to_me": bool((source or "").startswith("cross-agent:")),
+        # : carry the goal-level reducer-only declaration onto the ROW.
+        # apply_reducer_only_floor's predicate (reducer_selection_policy
+        # .is_reducer_only_row) reads `executable_by_role` off the SCORED ROW, and
+        # this emission IS that row. Without this line the predicate reads None for
+        # every candidate, `nominees` is empty on every pass, and the floor returns
+        # its documented "inert case" forever -- including after BOTH preconditions
+        # its own comment names were satisfied (e62c24033 is on origin/main, and 60
+        # goals carry the field). Measured 2026-09-03 (echo, cc-03, Linux
+        # 6.8.0-138-generic): branch=prefer-reducer-only logged 3x at 6 live workers
+        # while 6 stamped goals sat at ranks 28/512/628/633/665/1102, unhoisted.
+        # guard-1362 (a field present in the source goal record but absent from the
+        # emission is a silent semantic gap) and guard-2518 (a projection is a schema
+        # in its own right; filtering on a field it omits yields a silent zero) both
+        # name this exact shape. Passthrough only -- not a WEIGHTS/scoring field, so
+        # guard-760 and the KNOWN_CRITERIA contract do not apply.
+        "executable_by_role": goal.get("executable_by_role"),
         "skill": goal.get("skill"),
         "category": category,
         "tags": _ensure_list(goal.get("tags")),
@@ -5650,6 +5823,13 @@ def apply_drain_lane(scored, config, agent_dir):
     Existing filters are untouched — blocked/deferred/claimed/intended_agent
     routing all still apply upstream, so the lane can only promote a row that
     was already a legitimate candidate for THIS agent.
+
+    ONE FILTER IS ADDED AND IT IS ROLE-AWARE (g-115-8865): a reducer-only row is
+    excluded unless the running Body is a confirmed reducer. That is the single
+    exception to this lane's role-blindness, and the body comment at the
+    eligibility predicate carries the argument for why it must live here and not
+    in the role-aware floor downstream (which yields to this lane's hoist and so
+    can never reach the case).
     """
     if not scored or not config.get("drain_lane_enabled", True):
         return None
@@ -5686,10 +5866,53 @@ def apply_drain_lane(scored, config, agent_dir):
         return pull_signal_live_age_hours(
             s.get("pull_signal"), PULL_CONFIG) is not None
 
-    eligible = [
-        s for s in scored
-        if s.get("recurring")
-        and (
+    # ROLE GATE (). Every other filter in this lane is role-blind
+    # because selection itself is (LIFECYCLE_DISPOSITIONS["select"]), and that is
+    # correct for all of them EXCEPT this one: a reducer-only row hoisted to
+    # index 0 for a WORKER Body is not merely mis-ranked, it is an affirmative
+    # instruction to claim work the goal's own description orders the worker to
+    # release -- emit_drain_lane_banner says verbatim "This IS the sanctioned top
+    # pick -- claim it without a deviation code". Measured twice on :
+    # a release_negative on cc-07 2026-08-31, and a worker relay 2026-09-03.
+    #
+    # WHY HERE AND NOT IN apply_reducer_only_floor, WHICH IS ALREADY ROLE-AWARE.
+    # That floor yields to any prior hoist (`if prior_hoist_fired: yielded`), so
+    # the one path that knows about roles defers to the one that does not, and a
+    # role fix applied only there cannot reach this case. Gating the lane is what
+    # makes the two complementary rather than competing: an excluded row is not
+    # lost, it simply stops jumping the queue for a Body that cannot run it, and
+    # for a genuine reducer the floor is the mechanism built to hoist it.
+    #
+    # ONLY A CONFIRMED REDUCER KEEPS THEM, mirroring the floor's own posture
+    # ("only ROLE_REDUCER proceeds; a worker, an observer session and an unbound
+    # ad-hoc run all fall out"). The asymmetry is deliberate and it is the whole
+    # argument: excluding costs at most one deferred drain hoist on a row that
+    # still competes normally on score, while including costs a claim that must
+    # be released and re-selected. `_reducer_policy_inputs` is itself fail-open
+    # (it swallows its own I/O errors and returns empty strings), and empty
+    # signals resolve to ROLE_UNKNOWN -- which excludes, the safe direction.
+    #
+    # THE GOAL FIELD ONLY. `is_reducer_only_row` reads `executable_by_role` off
+    # the SCORED ROW, so this stays DATA, not a role module, and the
+    # test_selection_stays_role_blind fence (this file must never name the
+    # worker-side eligibility module) is untouched -- see the same note in
+    # apply_reducer_only_floor.
+    _role = reducer_selection_policy.role_of(*_reducer_policy_inputs(agent_dir))
+    _skip_reducer_only = (_role != reducer_selection_policy.ROLE_REDUCER)
+    # COUNTS ROWS ACTUALLY KEPT OUT, NOT ROWS MERELY PRESENT. The first cut
+    # counted every recurring reducer-only row, which overstates: a row that is
+    # neither overdue-exempt nor pulled was never lane-eligible, so excluding it
+    # changed nothing. A counter that reports exclusions which did not happen is
+    # the guard-1760 shape -- it makes the gate LESS falsifiable, which is the
+    # opposite of why this field exists. Computed below, after the eligibility
+    # test it must agree with.
+    _role_excluded = 0
+
+    def _lane_admissible(s):
+        """Everything the lane asks EXCEPT the role gate -- factored so the
+        exclusion counter is computed against the same test, and cannot drift
+        from it."""
+        return bool(s.get("recurring")) and (
             overdue_exemption_level(
                 float(s.get("recurring_overdue_ratio") or 0.0),
                 float(s.get("recurring_interval_hours") or 0.0),
@@ -5697,7 +5920,14 @@ def apply_drain_lane(scored, config, agent_dir):
             ) >= 1.0
             or _pull_live(s)
         )
-    ]
+
+    admissible = [s for s in scored if _lane_admissible(s)]
+    if _skip_reducer_only:
+        eligible = [s for s in admissible
+                    if not reducer_selection_policy.is_reducer_only_row(s)]
+        _role_excluded = len(admissible) - len(eligible)
+    else:
+        eligible = admissible
 
     picked = None
     if eligible and since >= k:
@@ -5728,6 +5958,8 @@ def apply_drain_lane(scored, config, agent_dir):
         "invocations_since_pick": since,
         "k": k,
         "eligible_count": len(eligible),
+        "role": _role,
+        "role_excluded_reducer_only": _role_excluded,
         "last_pick_goal_id": (picked or {}).get("goal_id") or state.get("last_pick_goal_id"),
         "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     })
@@ -5741,14 +5973,39 @@ def emit_drain_lane_banner(picked, eligible_count, since, k):
     on every quiet iteration would train the reader to skip it."""
     if picked is None:
         return
+    # : the waiver clause below is CONDITIONAL on the goal's own role
+    # declaration. It read "claim it without a deviation code" unconditionally,
+    # and that sentence was measured instructing worker Bodies onto reducer-only
+    # goals FOUR times ( /replay on cc-08 2026-08-10; , which
+    # pushes main; and twice since). A banner that waives the deviation code is
+    # the strongest claim-permit the selector emits, so emitting it over a
+    # reducer-only row actively defeats the role fence rather than merely
+    # failing to help.
+    #
+    # THIS IS NOT ROLE-CONDITIONAL BEHAVIOR and does not touch guard-2783 /
+    # LIFECYCLE_DISPOSITIONS["select"]: the branch reads a FIELD ON THE GOAL
+    # (via the same pure predicate apply_reducer_only_floor already uses), never
+    # who is reading. Both roles get byte-identical bytes out of this function
+    # for the same row; the reducer reads "not yours to waive" as "mine", the
+    # worker as "not mine". The routing decision stays with the reader, which is
+    # exactly where the fence puts it.
+    reducer_only = reducer_selection_policy.is_reducer_only_row(picked)
+    closing = (
+        "This IS the sanctioned lane pick, but it declares "
+        "executable_by_role='reducer': the deviation code is NOT waived for a "
+        "Body whose role does not match, and a WORKER Body must NOT claim it — "
+        "leave it for the reducer and take the next candidate."
+        if reducer_only else
+        "This IS the sanctioned top pick — claim it without a deviation code."
+    )
     print(
         "[goal-selector] DRAIN-LANE: promoted {gid} to top — recurring goal "
         "{r:.2f}x overdue on the SELECTOR scale ((age-interval)/interval), past the "
         "exemption bar, and {n} eligible row(s) were starved. Scores are UNCHANGED; "
         "only ordering moved, for this one slot, at most once per {k} invocations. "
-        "This IS the sanctioned top pick — claim it without a deviation code.".format(
+        "{closing}".format(
             gid=picked.get("goal_id"), r=float(picked.get("recurring_overdue_ratio") or 0.0),
-            n=eligible_count, k=k),
+            n=eligible_count, k=k, closing=closing),
         file=sys.stderr,
     )
 
@@ -5903,7 +6160,8 @@ def _append_policy_diary(entry, agent_dir):
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
 
-def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False):
+def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False,
+                             now=None):
     """With enough live workers, hoist reducer-only work to the top ().
 
     Mirrors apply_strategic_focus_floor exactly: it REORDERS one slot and never
@@ -5933,8 +6191,21 @@ def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False):
     status["role"] = role
 
     cfg = REDUCER_SELECTION_CONFIG
+    # `now` is INJECTABLE and defaults to the wall clock ( follow-up).
+    # live_worker_count already takes `now` as a parameter deliberately -- it
+    # compares `claimed_at` against a freshness cutoff, so a caller that hardcodes
+    # datetime.now() SEVERS that seam and makes every threshold behaviour
+    # untestable except against the real clock. It did, and the cost was a TIME
+    # BOMB: test_reducer_selection_policy.py anchors its fixture rows to a frozen
+    # NOW (2026-09-03 12:00), so rows written as "1 hour ago" aged past the 6h
+    # cutoff at ~17:00 that same day and four tests flipped from green to red
+    # PERMANENTLY -- 25/25 passing when authored that morning, 4 failing by
+    # evening, with no code change between. A date-dependent red reads as a real
+    # regression to everyone who meets it later (it cost one reducer a baseline
+    # run against a pristine worktree to rule out). Restoring the seam is the
+    # module's own pattern, not a new one.
     detail = reducer_selection_policy.live_worker_count(
-        _load_team_state_cached() or {}, datetime.now(),
+        _load_team_state_cached() or {}, now or datetime.now(),
         cfg.get("claim_fresh_hours", 6.0), exclude_sid=sid)
     status["detail"] = detail
     status["live_workers"] = detail["live"]
@@ -6408,6 +6679,9 @@ def cmd_select(args):
                                       reallocation_hours=reallocation_hours,
                                       global_live_ids=global_live_ids_retry)
             if blocked:
+                # : record the route BEFORE emitting the verdict, so the
+                # marker exists whenever a consumer can have seen all_blocked.
+                _write_allblocked_marker()
                 print(json.dumps({
                     "candidates": [],
                     "all_blocked": True,

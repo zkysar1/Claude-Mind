@@ -133,6 +133,72 @@ simply never connected to the worker case.
 The reducer wording in item 4 is deliberately unchanged; only the role split and the
 pointer here were added, at zero net bytes in that rule.
 
+## The COMMIT half of the door (g-115-8957, 2026-09-04)
+
+`iteration-push.sh` consults `tree-lock.sh check` and soft-exits when a peer
+holds the tree (`iteration-push.sh:254` fail-open note, the call at :281). That
+guards the MERGE/PUSH half of worker-loop Phase 3.8. It does not guard the half
+the phase ORDERS in prose: **COMMIT FIRST**. A hand-made commit moves HEAD with
+no lock consult anywhere in the path, and HEAD movement is the detector — so the
+loop's own instruction could void a co-resident Body's suite while every guarded
+call behaved correctly.
+
+Two remedies landed, and the ranking is the opposite of the one that looks
+obvious:
+
+1. `core/githooks/pre-commit` ADVISORY 16 — warn-only, never blocks. This is the
+   **enforcement baseline**: it fires on every committer that reaches this repo,
+   not only on a Body that elects to read a phase. Deliberately not a `_gate`
+   (that helper `exit`s, and blocking a commit to protect a suite trades a
+   recoverable void for an unrecoverable stop).
+2. worker-loop Phase 3.8's consult — **enrichment**, because prose and a `Bash:`
+   line inside a loaded digest are the same enforcement class: both require the
+   model to elect to run them (guard-399 amendment 2). It earns its place by
+   producing the DEFERRAL (leave the work uncommitted, carry it next cycle),
+   which a warning cannot do.
+
+### rc table for `tree-lock.sh check`
+
+| state | rc | Phase 3.8 | hook |
+|---|---|---|---|
+| no lock present | 0 | commit | silent |
+| **peer holds, fresh, pid alive** | **1** | **defer one cycle** | **warns** |
+| held by THIS body (`state: mine`, `tree_lock.py:147`) | 0 | commit | silent |
+| expired past ttl | 0 | commit | silent |
+| holder provably dead | 0 | commit | silent |
+
+**rc=1 is not exclusively "held" — a BROKEN INSTALL exits 1 too.** Measured
+2026-09-04: the wrapper invoked without `_paths.sh` beside it returns rc=1 with
+"No such file or directory". Every *genuine* lock fault returns 0 (malformed
+JSON, unreadable file, absent `holder_sid`, expired — all four measured), so the
+table above holds for every state the lock file can be in; the exception is the
+script failing to start at all. The two consumers do not inherit the same trade:
+the pre-commit hook only WARNS, so warning on a plumbing fault is the safe
+direction and the printed output discloses it; Phase 3.8 DEFERS, so on a box
+where the framework is that broken the defer would repeat. It is left as-is
+because `_paths.sh` is sourced by essentially every script in the loop — a box
+missing it cannot reach Phase 3.8 — but a consumer added later that BLOCKS on
+rc=1 must discriminate, not inherit this.
+
+Only rc=1 defers. Everything else proceeds — the same fail-open direction
+`iteration-push.sh:254` already documents, and the reason a Body running its own
+suite is never told to defer to itself.
+
+Measured 2026-09-04 (cc-13, isolated temp project root, real `core/` symlinked so
+`tree_lock.py` resolves): the four fixtures produce **1 warn / 3 silent**, and the
+advisory exits 0 in all four. An earlier harness symlinked only `tree-lock.sh`,
+so the script could not find its Python and exited 1 on every fixture — all four
+"warned", which is the vacuous signature (guard-1793: assert the arms DIFFER, or
+the suite proves nothing).
+
+### Scope boundary
+
+This closes the DETECTABLE void axis only. A commit moves HEAD, so
+`run-full-suite` compares HEAD before/after and prints `VERDICT: INVALID
+(tree-moved)` (guard-4940). An **uncommitted** mid-run edit to a file the suite
+imports is equally destructive and leaves HEAD untouched, so no lock consult and
+no hook can see it (guard-5987). Neither remedy above addresses that axis.
+
 ## Cross-references
 
 - `rb-8554` — commit-before-launch; names the RUNNER's door into `tree-moved`.
@@ -147,3 +213,6 @@ pointer here were added, at zero net bytes in that rule.
   guide, including why `VERDICT` outranks the numbers.
 - `.claude/skills/worker-loop/SKILL.md` Phase -0.3 and Phase 3.8 — the two
   consumers of this rationale.
+- `core/githooks/pre-commit` ADVISORY 16 + `guard-399` — the warn-only baseline
+  and why it outranks the phase step; `guard-4940` / `guard-5987` — the two void
+  axes, only the first of which is reachable from here.

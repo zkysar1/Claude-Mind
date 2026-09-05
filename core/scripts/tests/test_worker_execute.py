@@ -75,22 +75,42 @@ def test_verify_own_unit_is_a_scoped_call_naming_its_mode():
     assert "own-unit" in d.mode
 
 
-def test_verify_own_unit_is_marked_pending_until_the_loop_actually_invokes_it():
-    """The phase is DECLARED but worker-loop does not yet invoke the verify
-    skill, so the row must carry `pending_goal` — otherwise it reads downstream
-    as evidence the wiring exists.
+def test_worker_loop_phase_4a_invokes_the_scoped_verify_before_the_close():
+    """The WIRING pin. It replaces the pending-marker tripwire that stood here
+    until 2026-09-03 (g-306-417 part1b), which was written to fail the moment
+    the loop invoked the skill — it did, so the tripwire was discharged and this
+    took its place. A retired tripwire deleted without a successor would leave
+    the declaration asserted by nothing.
 
-    This test is deliberately written to FAIL when the wiring lands: whoever
-    wires worker-loop Phase 4a to invoke the scoped verify must come here,
-    delete the pending marker, and delete this test. That is the point — a
-    pending marker nobody is forced to remove becomes permanent, and then the
-    table is lying in the other direction.
+    Pinning SKILL.md TEXT is the right level here, not the guard-2195
+    two-ends-agree-on-a-name anti-pattern: worker-loop/SKILL.md IS the executable
+    artifact for this phase — an LLM reads those lines and acts on them — so the
+    text is the behaviour rather than a proxy for it.
+
+    ORDER IS THE LOAD-BEARING HALF. Judgement must precede the mechanical status
+    write: `iteration-close.sh --phase verify` is the only writer of the status
+    transition (guard-2523), so a verify invoked AFTER it would grade a goal that
+    is already closed and could not affect `--status`. Asserting presence alone
+    would stay green through exactly that reordering.
     """
-    d = we.LIFECYCLE_DISPOSITIONS["verify-own-unit"]
-    assert d.pending_goal == "g-306-417", (
-        "verify-own-unit must stay marked pending until worker-loop Phase 4a "
-        "actually invokes the scoped verify skill; if you just wired it, "
-        "remove pending_goal AND delete this test")
+    skill = (CORE_SCRIPTS.parent.parent / ".claude" / "skills" / "worker-loop"
+             / "SKILL.md").read_text(encoding="utf-8")
+
+    invoke = skill.find('Skill(aspirations-verify)')
+    assert invoke != -1, (
+        "worker-loop Phase 4a must INVOKE the verify skill (guard-1867: never "
+        "transcribe a sub-skill's steps)")
+    line = skill[invoke:skill.find("\n", invoke)]
+    assert 'scope="own-unit"' in line, (
+        f"the invocation must be scoped to this Body's own unit, got: {line!r}")
+
+    close = skill.find("iteration-close.sh --phase verify")
+    assert close != -1, "the mechanical close writer call is missing from Phase 4a"
+    assert invoke < close, (
+        "the scoped verify must run BEFORE the mechanical close, not after it")
+
+    assert we.LIFECYCLE_DISPOSITIONS["verify-own-unit"].pending_goal is None, (
+        "the wiring has landed, so the row must no longer read as pending")
 
 
 def test_worker_skips_all_reducer_only_phases():

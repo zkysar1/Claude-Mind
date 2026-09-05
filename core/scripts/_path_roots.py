@@ -31,9 +31,18 @@ import os
 #   /dev   — device / pseudo-file sinks (`> /dev/null`, `/dev/stderr`,
 #            `/dev/fd/N`). Nothing is created; nothing persists.
 #   /proc  — procfs control writes. Same reasoning.
-#   /tmp, /var/tmp — the system temp tree, which CONTAINS the Claude Code
-#            session scratchpad (`/tmp/claude-*/…`) that CLAUDE.md explicitly
-#            sanctions for temporary files.
+#   /tmp, /var/tmp — the system temp tree. NOTE the scratchpad carve-out
+#            below: this exemption covers the temp tree EXCEPT the Claude Code
+#            session scratchpad, which is denied by is_harness_scratchpad().
+#            This clause used to read that the temp tree "CONTAINS the Claude
+#            Code session scratchpad (/tmp/claude-*/…) that CLAUDE.md
+#            explicitly sanctions for temporary files" — that was true when
+#            written and was invalidated on 2026-08-21 by
+#            .claude/rules/no-scratchpad.md, which OVERRIDES the harness
+#            instruction (the scratchpad is invisible to every other agent and
+#            to the citation/drain/receipt/encoding machinery). The exemption
+#            outlived its own rationale, which is the defect class g-115-8761
+#            was filed about: a stale claim about a safety layer.
 #
 # MEASURED, not assumed. Over 11,559 real Bash tool calls drawn from two
 # independent sessions, the per-call false-positive rate of the refusal is:
@@ -53,6 +62,98 @@ import os
 # `> /dev/null`. An allowlist built from the pre-mortem alone would have been
 # measured at ~26% and the whole approach abandoned as unworkable.
 WRITE_EXEMPT_PREFIXES = ("/dev", "/proc", "/tmp", "/var/tmp")
+
+# --- Harness-scratchpad carve-out (g-115-8761) -------------------------------
+# ONE predicate, shared by BOTH L1 hooks. path-resolution-hook.py (Write/Edit/
+# MultiEdit) carried these prefixes inline and bash-path-resolution-hook.py had
+# no scratchpad check at all, so the two tool surfaces answered "is this the
+# scratchpad?" differently — the exact drift consolidating norm_path/is_under
+# here was meant to end (g-115-3338).
+#
+# THE CARVE-OUT IS NEARLY FREE, and this file's own measurement says so. The
+# WRITE_EXEMPT table above shows /tmp + /var/tmp account for 0.484pp of the
+# false-positive rate while /dev carries essentially all of it, so denying a
+# narrow subtree of /tmp costs a small fraction of that half-point. The temp
+# tree stays exempt; only the scratchpad is denied.
+#
+# DO NOT widen these prefixes to bare "/tmp". The framework deliberately puts
+# its own artifacts in the system temp tree — run-full-suite.sh defaults its
+# logs to <tmpdir>/ayoai-suite-run-<agent> precisely to keep them OFF the
+# fleet-synced tree (g-115-6409) — and a bare-/tmp deny would refuse the
+# remedy another guardrail prescribes.
+HARNESS_SCRATCHPAD_PREFIXES = (
+    "/tmp/claude/",
+    "/tmp/claude-",
+    "/var/tmp/claude/",
+    "/var/tmp/claude-",
+)
+#: Windows form, matched as a substring because the drive prefix varies.
+HARNESS_SCRATCHPAD_SUBSTR = "/appdata/local/temp/claude/"
+
+
+def is_harness_scratchpad(target):
+    """True if `target` (a norm_path'd, lowercased path) is in the scratchpad.
+
+    Accepts either raw or normalized input — it normalizes defensively, because
+    the two call sites reach it from different places (one has already
+    absolutized a tool file_path, the other holds a token lifted out of command
+    text). Fail-safe direction on bad input is False: a hook that cannot parse a
+    path must approve, never deny (both hooks' fail-open contract).
+
+    The tempfile-derived prefix keeps this truthful on a box with a nonstandard
+    TMPDIR, where BOTH literal shapes AND the settings-layer deny globs miss.
+    """
+    if not target:
+        return False
+    try:
+        sp = norm_path(target).lower()
+    except Exception:  # pragma: no cover - norm_path is total, belt and braces
+        return False
+    if not sp:
+        return False
+    if HARNESS_SCRATCHPAD_SUBSTR in sp:
+        return True
+    if any(sp.startswith(p) for p in HARNESS_SCRATCHPAD_PREFIXES):
+        return True
+    try:
+        import tempfile
+        # os.path.join, not pathlib: this module imports ONLY `os`. The first
+        # draft used Path(...) here and the NameError was swallowed by this very
+        # except, leaving the branch silently dead while all 11 literal-prefix
+        # cases still passed — a fail-open catch hiding a defect inside the
+        # fallback it was protecting. Verified live after the fix (TMPDIR set to
+        # a real directory), not just re-read.
+        td = norm_path(os.path.join(tempfile.gettempdir(), "claude")).lower()
+    except Exception:
+        td = ""
+    # `td + "/"` matches the unsuffixed dir; `td + "-"` the numeric-suffixed
+    # form the harness actually creates (/tmp/claude-0/...). Requiring the
+    # separator is what stops this matching a sibling like /tmp/claudex.
+    return bool(td) and (sp.startswith(td + "/") or sp.startswith(td + "-"))
+
+
+def scratchpad_deny_reason(surface, path):
+    """The refusal text for a scratchpad write, shared by both L1 hooks.
+
+    The routing advice must be IDENTICAL whichever door the agent came through
+    (Write/Edit vs a Bash redirect) — an agent that learns the sanctioned homes
+    from one refusal should not meet different wording at the other. `surface`
+    names the door only, so the diagnosis stays specific while the remedy stays
+    the same.
+    """
+    return (
+        f"Path-resolution hook (L1) blocked {surface} to:\n"
+        f"  {path}\n"
+        f"This is the Claude Code harness scratchpad — a per-session dir "
+        f"invisible to every other agent and to the framework's citation, "
+        f"drain, receipt, and encoding machinery. This project does not "
+        f"use it (see .claude/rules/no-scratchpad.md), the same way it "
+        f"does not use platform auto-memory.\n"
+        f"Route instead:\n"
+        f"  - session-scoped scratch -> agents/<agent>/sessions/<SID>/scratch/\n"
+        f"  - working files / evidence with a lifecycle -> agents/<agent>/temp/\n"
+        f"  - knowledge worth keeping -> the tree / reasoning bank, not a temp file"
+    )
 
 
 def norm_path(p):

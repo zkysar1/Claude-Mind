@@ -117,6 +117,7 @@ from gates.residual_work import (  # noqa: E402
 from _override_helpers import audit_bulk_override as _audit_bulk_override  # noqa: E402
 # PR 7c additions:
 from gates.scaffolded_exploration import evaluate as _scaff_eval  # noqa: E402
+from gates.deadline_date import evaluate as _deadline_date_eval  # noqa: E402
 from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as _ACTIVE_AGENTS  # noqa: E402
 from gates.field_shrink import evaluate as _field_shrink_eval  # noqa: E402
 from gates.lane_pin import evaluate as _lane_pin_eval  # noqa: E402
@@ -1549,6 +1550,7 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     raw_dup = _header_override(ctx, "X-Mind-Override-Duplication")
     raw_ni = _header_override(ctx, "X-Mind-Override-No-Investigate")
     raw_off = _header_override(ctx, "X-Mind-Override-Offload")
+    raw_dl = _header_override(ctx, "X-Mind-Override-Deadline")
     bulk_slots_filled: List[str] = []
     if bulk_override:
         if raw_sig is None:
@@ -1559,10 +1561,13 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
             bulk_slots_filled.append("override_no_investigate")
         if raw_off is None:
             bulk_slots_filled.append("override_offload")
+        if raw_dl is None:
+            bulk_slots_filled.append("override_deadline")
     eff_sig = raw_sig or bulk_override
     eff_dup = raw_dup or bulk_override
     eff_ni = raw_ni or bulk_override
     eff_off = raw_off or bulk_override
+    eff_dl = raw_dl or bulk_override
     bulk_audit: Optional[Tuple[str, List[str]]] = (
         (bulk_override, bulk_slots_filled)
         if (bulk_override and bulk_slots_filled) else None
@@ -1779,6 +1784,28 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
             "gate_output": scaff_result,
         }, status=400), warnings, None
 
+    # === Phase H: deadline-date blocker () ===
+    # User directive 2026-09-04: "you get an error if you add something
+    # without a date." A record whose TEXT promises a deadline but whose
+    # FIELDS carry none is invisible to every deadline alarm — the alarm can
+    # only see what the write recorded, so filing time is the only place this
+    # is fixable. ADD-path only, never the update path (guard-2475: a
+    # whole-record rule added after the fact wedges every pre-existing record
+    # out of all future writes). Measured on the live corpus at 0.87% of
+    # goals; fail-open on its own errors (guard-142).
+    dl_result = _deadline_date_eval(
+        goal,
+        override_deadline=eff_dl,
+        agent_name=ctx.paths.agent_name,
+        world_dir=ctx.paths.world,
+    )
+    if dl_result.get("would_block"):
+        return Response.json({
+            "error": "deadline_date_blocked",
+            "gate": "deadline-date-gate",
+            "gate_output": dl_result,
+        }, status=400), warnings, None
+
     return None, warnings, bulk_audit
 
 
@@ -1883,6 +1910,40 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
                 "error": "uncommitted_work_blocked",
                 "gate": "uncommitted-work-gate",
                 "gate_output": unc_result,
+            }, status=400), None, None
+
+    # Layer 0: routing-target validation (). Fires on the FIELD, and
+    # runs BEFORE the narrative branch below precisely because that branch is
+    # where the coverage hole is: `_is_narrative_defer` is False for every
+    # STRUCTURED_DEFER_PREFIXES value, and measured on the live corpus
+    # 2026-09-04, of 131 non-terminal goals carrying a defer_reason **131 were
+    # structured and 0 were narrative**. Every gate hanging off that predicate
+    # therefore sees none of the real population. Same guard-1802 shape as the
+    # defer-target advisory below, and the same remedy: trigger on the field.
+    #
+    # What it refuses: a defer routing work to a named agent whose standing lane
+    # pin EXCLUDES that work class, and a defer citing a grant id that does not
+    # exist in the registry. Both are claims the writer asserted and the registry
+    # contradicts. Everything softer — an `ambiguous` pin verdict, a prose
+    # ownership claim naming no addressable target — is an ADVISORY appended in
+    # the warnings block below, never a refusal (guard-1470: refusing on prose is
+    # the false-positive shape).
+    #
+    # Override is `X-Mind-Force-Defer` — the SAME header/flag Layer 1 honours.
+    # No second override exists by design: a gate with its own private bypass
+    # teaches the caller to reach for whichever one is nearest.
+    if field == "defer_reason" and value not in (None, ""):
+        try:
+            from gates.defer_routing_target import evaluate as _routing_eval
+            _rt = _routing_eval(goal_id, value, world_dir=ctx.paths.world)
+        except Exception:
+            _rt = None  # fail OPEN — a gate that cannot run must not block
+        if _rt and _rt.get("refuse") and not _header_override(
+                ctx, "X-Mind-Force-Defer"):
+            return Response.json({
+                "error": "defer_routing_target_invalid",
+                "gate": "defer-routing-target",
+                "gate_output": _rt,
             }, status=400), None, None
 
     # Capability gate fires ONLY on NARRATIVE defer_reason writes. Structured
@@ -2744,6 +2805,22 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             )
             if _dt.get("message"):
                 warnings.append(_dt["message"])
+        except Exception:
+            pass  # advisory must never break a durable write
+
+    # Routing-target advisories () — the non-refusing half of the
+    # Layer-0 gate in _run_update_goal_gates. Recomputed rather than threaded
+    # through the gate's return tuple: evaluate() is pure in
+    # (goal_id, text, goal, world_dir), so a second call cannot diverge from the
+    # first, and this keeps the file's own architecture intact (blocking gates
+    # pre-lock, advisories here). It takes no goal record — see the gate module. A refusal already returned 400 upstream, so
+    # anything reaching this point advises only.
+    if field == "defer_reason" and value not in (None, ""):
+        try:
+            from gates.defer_routing_target import evaluate as _routing_eval2
+            _rt2 = _routing_eval2(goal_id, value, world_dir=ctx.paths.world)
+            for _adv in (_rt2.get("advisories") or []):
+                warnings.append(_adv)
         except Exception:
             pass  # advisory must never break a durable write
 
@@ -8154,6 +8231,7 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     # the caller did not explicitly set. Track which slots received the
     # bulk so audit_bulk_override below can record the blast radius.
     bulk_override = _header_override(ctx, "X-Mind-Override-All")
+    raw_override_deadline = _header_override(ctx, "X-Mind-Override-Deadline")
     raw_override_signal = _header_override(ctx, "X-Mind-Override-Signal")
     raw_override_dup = _header_override(ctx, "X-Mind-Override-Duplication")
     raw_override_off = _header_override(ctx, "X-Mind-Override-Offload")
@@ -8270,6 +8348,24 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
                 "gate": "operator-offload-gate",
                 "blocked_goal": g.get("id"),
                 "gate_output": off_result,
+            }, status=400)
+
+    # Deadline-date gate per goal (any block rejects the whole asp) —
+    # . See the twin call in _run_add_goal_gates for rationale.
+    override_deadline = raw_override_deadline or bulk_override
+    for g in asp.get("goals", []):
+        dl_result = _deadline_date_eval(
+            g,
+            override_deadline=override_deadline,
+            agent_name=ctx.paths.agent_name,
+            world_dir=ctx.paths.world,
+        )
+        if dl_result.get("would_block"):
+            return Response.json({
+                "error": "deadline_date_blocked",
+                "gate": "deadline-date-gate",
+                "blocked_goal": g.get("id"),
+                "gate_output": dl_result,
             }, status=400)
 
     # --- Lock: archive-check + dup-check + recompute + write ---

@@ -413,6 +413,33 @@ CASES = [
     ("aspirations-retire.sh", ["--nonexistent-flag", "SLID", BOGUS_ASP]),
     ("aspirations-meta-update.sh", ["--nonexistent-flag", "SLID", "refusal-fixture-field", "v"]),
     ("pipeline-move.sh", ["--nonexistent-flag", "SLID", BOGUS_PIPE, "archived"]),
+    #
+    # ---- aspirations-complete-by.sh (, 2026-09-05, alpha on cc-13) ----
+    # The near-namesake aspirations-complete.sh was covered above from the start;
+    # THIS wrapper was not, and it is the more dangerous of the pair. Its catch-all
+    # was `*) POSITIONAL+=("$1")` with no `-*)` arm, and POSITIONAL[0] is the
+    # GOAL-ID with [1] the agent-name — so a typo'd flag closed a DIFFERENT goal,
+    # or closed the right goal as the wrong agent, and exited 0. It is also the
+    # REQUIRED close path for recurring goals (the daemon refuses a direct
+    # status=completed write on one), so iteration-close.sh routes every recurring
+    # close through it.
+    #
+    # Caller scan BEFORE the refusal: unknown-flag-caller-scan.py over SEVEN roots
+    # (core + .claude + the external world/ and meta/) reported blocking=0,
+    # hazard=0, unresolved=1. The unresolved site was hand-read as the tool
+    # requires: iteration-close.sh:1225, `--source "$SOURCE" "$GOAL_ID"`. Both
+    # unresolved tokens sit in a VALUE and a POSITIONAL slot respectively, never in
+    # a flag position, so no caller passes a now-refused flag. Every other
+    # reference in the tree is a doc table using the same `[--source] <goal-id>`
+    # form.
+    #
+    # The scanner's own accepted_flags output was NOT used and must not be: it
+    # mis-parses the usage heredoc as case arms and reports fragments like
+    # '--source        queue to write to (default: world' as accepted. That is
+    # OVER-acceptance, which MASKS a genuine unknown flag — the same limitation
+    # already recorded on the aspirations-complete.sh row. Real set, read off the
+    # arg loop: --source / --key-finding, plus --help/-h and two positionals.
+    ("aspirations-complete-by.sh", ["--nonexistent-flag", "SLID", BOGUS_GOAL]),
     # experience-update-field.sh is deliberately NOT here: its  fix
     # adopted argv_strict_parse, joining the four *-update-field siblings whose
     # refusal predates this file's message contract ( wording, usage
@@ -543,6 +570,13 @@ HELP_AFTER_FLAG = [
     # aspirations-query.sh now REFUSES, so reusing it here would assert the
     # opposite of this test's intent. Its real flags are the four below.
     ("aspirations-query.sh", ["--goal-status", "completed", "--help"]),
+    # : this wrapper's help was a `case "${1-}"` pre-parse block testing
+    # $1 ALONE — the exact shape whose regression this test was written for on
+    # aspirations-add-goal.sh. Adding the -*) refusal would have made
+    # `--source world --help` exit 2, so the same pre-scan loop was adopted there.
+    # --source is genuinely accepted by this wrapper, so it is the right probe here
+    # (unlike aspirations-query.sh above, which refuses it).
+    ("aspirations-complete-by.sh", ["--source", "world", "--help"]),
 ]
 
 

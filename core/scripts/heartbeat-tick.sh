@@ -326,6 +326,74 @@ if [ "$_HOOKS_VALUE" != "$_HOOKS_PREV" ] || [ "$_HOOKS_STALE" = "1" ]; then
     fi
 fi
 
+# --- retrieval-index identity publish () --------------------------
+# ABOVE THE STATE GATE, for the SAME reason as core_hooks_path directly above
+# and read off the same warning: a cross-box worker Body is IDLE by design, so a
+# publish below the gate never runs on most of the fleet — and "most of the
+# fleet" is precisely the population this signal exists to make visible. The
+# agent-wide team-state write at the bottom of this file sits below the gate;
+# copying ITS placement is the trap here, not the model.
+#
+# Hoisting passes the same safety test the hooks-path block passes: an index's
+# model / doc-count / built-at is a static FACT about a local artifact, not a
+# liveness claim, so publishing it from an IDLE box asserts nothing about
+# whether the agent is running and creates no heartbeat_without_running desync
+# (guard-543).
+#
+# WHY IT EXISTS: a PER-BOX DERIVED CACHE whose correctness depends on a SHARED
+# config value has no parity check by construction — the shared half is
+# identical everywhere so config-parity tooling sees nothing, and the derived
+# half is local so no shared store sees it. Measured 2026-09-03 (): a
+# box served retrieval from a bge-small index while tree.yaml named MiniLM, both
+# cosine floors are MiniLM-calibrated, and ranking collapsed to the static terms
+# (hit@1 0). Index FRESH, daemon healthy, channel 'alive', every liveness probe
+# green — for five weeks. Publishing the CALIBRATION ANCHOR (which shared value
+# the local artifact was built against) is what makes it visible at all.
+#
+# CHANGE-GATED ON A FILE COMPARISON, NOT ON THE VALUE. Measured on this box:
+# stat 0.011ms, parsing the 1.27MB meta.json 7.3ms, computing the whole block
+# (it imports retrieve for the channel status) ~65ms, one team-state publish
+# 0.649s. Keying on "is meta.json newer than our stamp" keeps the steady state
+# at one find(1) per tick and pays the rest only when the index actually
+# changed — which is also the only moment the published value could differ.
+# `find -newer` rather than `stat -c`: -c is GNU-only and this fleet includes
+# BSD and MSYS boxes, where a stat-based gate would fail open every tick and
+# republish forever (the 0.649s it exists to avoid).
+#
+# The 24h floor republishes a value the ROW may have lost independently of this
+# box — shard reset, row rebuild, or a peer's WHOLE-ROW newest-wins write
+# landing on top of ours (agent_status.<agent> merges per-agent whole-row, never
+# field-stitch). Without it a dropped field stays silently absent, which is the
+# exact failure class this goal exists to close.
+#
+# STAMP ONLY ON SUCCESS: recording the intent instead of the outcome would mark
+# a FAILED publish as done and never retry it — the silently-marked-seen defect.
+_RI_META="$PROJECT_ROOT/mind_api/state/retrieval-embedding-index/meta.json"
+_RI_STAMP="$AGENT_DIR/session/retrieval-index-published"
+_RI_DUE=0
+if [ ! -f "$_RI_STAMP" ]; then
+    _RI_DUE=1                                    # never published from this box
+elif [ -n "$(find "$_RI_STAMP" -mmin +1440 2>/dev/null || true)" ]; then
+    _RI_DUE=1                                    # 24h floor
+elif [ -f "$_RI_META" ] && [ -n "$(find "$_RI_META" -newer "$_RI_STAMP" 2>/dev/null || true)" ]; then
+    _RI_DUE=1                                    # index rebuilt since last publish
+fi
+if [ "$_RI_DUE" = "1" ]; then
+    # `python3`, not `py -3`: this script SOURCES _paths.sh (line 41), which is
+    # exactly the condition python-invocation.md names for using python3
+    # directly. `py` is a Windows-only launcher and dies rc=127 on Linux — and
+    # with the fail-open swallow below that would be a publish that never
+    # happens and never says so.
+    _RI_VALUE="$(python3 "$(dirname "$0")/retrieval_index_status.py" publish-value 2>/dev/null || true)"
+    if [ -n "$_RI_VALUE" ]; then
+        if bash "$(dirname "$0")/team-state-update.sh" \
+            --field "agent_status.$MIND_AGENT.retrieval_index" \
+            --value "$_RI_VALUE" >/dev/null 2>&1; then
+            printf '%s' "$_RI_VALUE" > "$_RI_STAMP" 2>/dev/null || true
+        fi
+    fi
+fi
+
 # --- State gate (g-115-NEW, 2026-05-13) -------------------------------------
 # Refuse to tick when agent-state=IDLE. Without this gate, a stop-hook-
 # cancelled loop death + recovery-gate's RUNNING→IDLE flip leaves callers

@@ -308,3 +308,124 @@ def test_sweep_own_agent_scope_still_pushes_own_carrier(env, monkeypatch):
                    only_agent="alpha")
     assert stats.get("own_carrier_pushed") == 1
     assert str(p.resolve()) in env["be"].puts
+
+
+# ── _put: the THIRD ownership gate () ───────────────────────────────
+#
+# The two sections above pin the carve-out in owncloud_sync's two publication
+# paths. Both were correct and both were INERT, because a later change
+# () added an INDEPENDENT ownership refusal at the write itself —
+# OwnCloudBackend._put — and did not carry the exemption down. Measured on
+# cc-09 2026-09-04: sync_file admitted the carrier (`would_push: 1`, the exempt
+# path resolving to exactly this file) and the PUT one call below refused it
+# `no_claim`, so the carrier never reached S3 from ANY worker box. Every
+# peer-side reader of it — stranded-claim-sweep's foreign-SID grace,
+# worker_stall's S3 prefix listing, reducer_promotion — saw `absent` for a
+# demonstrably live Body, and stranded-claim-sweep released a live worker's
+# claim at 126.5 minutes (msg-20260904-045322-alpha-6092).
+#
+# THE LESSON THESE TESTS EXIST TO PIN is not "the carrier publishes" — the
+# section above already asserted that and stayed green through the whole
+# defect. It is that a gate's exemption must be pinned at EVERY layer that can
+# refuse (guard-2783), because passing one gate proves nothing about the next.
+
+class _ReachedPut(Exception):
+    """Sentinel: _put got PAST the ownership consult to the real write."""
+
+
+class _FakeSelf:
+    """Minimal stand-in for an OwnCloudBackend instance. `_put` is called
+    unbound so no S3/DDB config is needed; `_s3_key` is the first call after
+    the consult, so raising there is exactly 'the consult admitted this'."""
+
+    def __init__(self, roots):
+        self._roots = roots
+
+    def _machine_local(self, path):
+        return False
+
+    def _assert_not_tempdir_put(self, path):
+        # The guard-955 tripwire fires on tmp_path by design and sits BEFORE
+        # the consult (ordering pinned by test_no_claim_error). Neutralised
+        # here so this test can reach the layer it is about.
+        return None
+
+    def _s3_key(self, path):
+        raise _ReachedPut(str(path))
+
+
+def _put_env(env, monkeypatch, owned):
+    """Present this box as holding a live claim on `owned` only."""
+    import _paths
+    import owncloud_sync as _ocs
+    monkeypatch.setattr(_paths, "agents_root", lambda: env["agents"])
+    monkeypatch.setattr(_ocs, "_owned_agents_with_provenance",
+                        lambda *a, **k: (set(owned), "live-claims"))
+    return _FakeSelf([(str(env["agents"]), "agents")])
+
+
+def _call_put(slf, path):
+    import owncloud_backend
+    return owncloud_backend.OwnCloudBackend._put(slf, path, b'{"ok":1}')
+
+
+def test_put_admits_own_sid_carrier_when_agent_not_owned(env, monkeypatch):
+    """THE regression. Before  this raised NoClaimError, which is why
+    a worker Body's carrier never reached S3 and `fresh-correct` was
+    unreachable on every box."""
+    import owncloud_backend
+    p = _carrier(env["agents"], "alpha", MY_SID)
+    slf = _put_env(env, monkeypatch, {"bravo"})
+    with pytest.raises(_ReachedPut):
+        _call_put(slf, p)
+    # and specifically NOT the refusal
+    try:
+        _call_put(slf, p)
+    except owncloud_backend.NoClaimError:  # pragma: no cover - fails the test
+        pytest.fail("_put refused this session's own SID-keyed carrier")
+    except _ReachedPut:
+        pass
+
+
+def test_put_still_refuses_peer_carrier_in_unowned_dir(env, monkeypatch):
+    """LOAD-BEARING (guard-2860: pin the negatives). Under own-cloud the local
+    tree is a read-through cache, so a PEER's carrier legitimately sits on this
+    disk as pulled bytes. A `body-heartbeat-*.json` predicate would admit it
+    and push stale bytes over the peer's newer write."""
+    import owncloud_backend
+    _carrier(env["agents"], "alpha", MY_SID)          # ours exists
+    peer = _carrier(env["agents"], "alpha", PEER_SID)  # theirs, pulled here
+    slf = _put_env(env, monkeypatch, {"bravo"})
+    with pytest.raises(owncloud_backend.NoClaimError):
+        _call_put(slf, peer)
+
+
+def test_put_still_refuses_same_sid_under_other_agent(env, monkeypatch):
+    """LOAD-BEARING. The sid alone must not authorise a write — the agent dir
+    is half of the identity."""
+    import owncloud_backend
+    _carrier(env["agents"], "alpha", MY_SID)
+    other = _carrier(env["agents"], "bravo", MY_SID)
+    slf = _put_env(env, monkeypatch, set())
+    with pytest.raises(owncloud_backend.NoClaimError):
+        _call_put(slf, other)
+
+
+def test_put_still_refuses_non_carrier_in_unowned_dir(env, monkeypatch):
+    """LOAD-BEARING. The exemption is ONE computed path, not a directory."""
+    import owncloud_backend
+    _carrier(env["agents"], "alpha", MY_SID)
+    other = env["agents"] / "alpha" / "session" / "handoff.yaml"
+    other.write_bytes(b"x: 1\n")
+    slf = _put_env(env, monkeypatch, {"bravo"})
+    with pytest.raises(owncloud_backend.NoClaimError):
+        _call_put(slf, other)
+
+
+def test_put_unaffected_when_agent_is_owned(env, monkeypatch):
+    """CONTROL — green before AND after. An owned dir never consulted the
+    exemption; the change must not alter that path."""
+    p = _carrier(env["agents"], "alpha", MY_SID)
+    slf = _put_env(env, monkeypatch, {"alpha"})
+    with pytest.raises(_ReachedPut):
+        _call_put(slf, p)

@@ -150,6 +150,189 @@ class TestCarrierCitation:
 
 
 # ---------------------------------------------------------------------------
+# Accept path 1b: own-provenance citation ()
+#
+# A carrier this gate auto-filed carries origin_signal "residual:<parent>".
+# Its honest outcome_note must quote the parent's residual language to explain
+# where it came from, so the marker fires on the QUOTATION and a phantom
+# successor is filed for work the note is reporting as DONE (guard-2096: a text
+# detector over a corpus that documents its own findings re-flags every
+# correction it causes). Reproduces the measured  ->  case.
+# ---------------------------------------------------------------------------
+
+# THE VERBATIM outcome_note OF , generated mechanically from the
+# stored record on 2026-09-03 — never retyped, and NEVER REFLOW IT.
+# The first cut of this fixture reproduced the PROSE but collapsed the hard
+# wraps, and passed against a shape production never emits: _split_sentences
+# terminates on newlines, so on a wrapped note the residual "clause" is one
+# LINE. The parent id sits on the line BEFORE the marker, 103 chars back, so
+# the clause-scoped first fix measured green here and did nothing at all to
+# the real input. guard-920 — a regression test must replicate the literal
+# production shape, not the contract-ideal one. test_g1498_fixture_keeps_the
+# _production_line_breaks below fails loudly if anyone unwraps this.
+_G1498_NOTE = (
+    "Merged PR #442 to Vinheim-Web-App main and verified the deploy. All three\n"
+    "verification outcomes met.\n"
+    "\n"
+    "WHAT THIS GOAL WAS. The residual-work gate auto-filed it when the previous unit\n"
+    "(g-335-1483, the SET-03 account-delete disclosure fix) closed while its\n"
+    "outcome_note named the merge as follow-up work with no live carrier. Rather than\n"
+    "override that gate, the previous unit gave this carrier a real title and three\n"
+    "verification outcomes so it would be executable instead of a stub. Its blocking\n"
+    "precondition -- PR CI concluding -- cleared between units, so it was claimed and\n"
+    "executed here rather than left to age.\n"
+    "\n"
+    "OUTCOME 1 (PR merged, or closed with a recorded reason) -- MET. Squash-merged as\n"
+    "42a302f90586d68274fe003c59019e9580c3e543 on main, source branch deleted. The PR\n"
+    "was MERGEABLE / mergeStateStatus CLEAN / not a draft at merge time.\n"
+    "\n"
+    "OUTCOME 2 (pre-merge gate satisfied by a direct check-runs read, not an empty\n"
+    "statusCheckRollup) -- MET, and the instrument choice turned out to be the whole\n"
+    "lesson of this unit. gh api repos/zkysar1/Vinheim-Web-App/commits/c90cac30.../\n"
+    "check-runs returned 2 runs, both completed/success (one pull_request event, one\n"
+    "push event). guard-1264's other half was honoured too: no empty rollup was read\n"
+    "as evidence of anything.\n"
+    "\n"
+    "  THE INSTRUMENT TRAP, measured in both directions inside this unit. guard-1264\n"
+    "  also says verbatim \"ALWAYS settle merge-readiness with deploy-verify.sh against\n"
+    "  the PR head SHA\". Run that way it returned status=unverified, rc=2, detail \"CI\n"
+    "  passed but the platform build is unknown: no job across 2 connected branch(es)\n"
+    "  carries this sha\". That is NOT a block and is the expected answer -- it is\n"
+    "  asking about the Amplify PLATFORM build, which by construction cannot exist for\n"
+    "  a sha that has never been on main, i.e. the signal it waits for only arrives\n"
+    "  AFTER the merge it would be gating. world/conventions/ayoai-product-repos.md\n"
+    "  carries the correction explicitly: the tool gates on repo push-capability, is\n"
+    "  correct for post-push deploy verification (guard-119), and is WRONG as a\n"
+    "  pre-merge gate; use the single check-runs read instead, and only to BLOCK.\n"
+    "  Proved rather than assumed: the SAME script returned status=ok rc=0 against the\n"
+    "  merge commit minutes later. Two instruments, two moments.\n"
+    "\n"
+    "OUTCOME 3 (PR comments read before merging, guard-5230) -- MET. comment_count 0,\n"
+    "review_count 0 -- no park comment, no annotation contradicting the gate. Read\n"
+    "even though this session authored the PR minutes earlier and expected none: the\n"
+    "guardrail exists precisely because a green gate and a written annotation are\n"
+    "different sources, and \"I would already know\" is the reasoning it was written\n"
+    "against.\n"
+    "\n"
+    "POST-MERGE, per guard-1264's own tail (\"re-run against the MERGE commit to\n"
+    "confirm main stayed green\"): check-runs on 42a302f returned test\n"
+    "completed/success, and deploy-verify.sh against that sha returned status=ok\n"
+    "rc=0. main stayed green and the Amplify build resolved.\n"
+    "\n"
+    "HOUSEKEEPING. The shared Vinheim-Web-App checkout was returned to main; the\n"
+    "previous unit had left it parked on alpha/g-335-1483-account-delete-disclosure,\n"
+    "which product-repo-freshness flags as an OFF-DEFAULT READ HAZARD -- the same\n"
+    "condition that cost this session's first unit an isolated worktree when it found\n"
+    "Zak-Code parked 211 commits behind on another agent's branch.\n"
+    "\n"
+    "WHAT SHIPPED. Members deleting their account now see billing history and any\n"
+    "remaining prepaid balance named in the enumeration, a warning that the balance\n"
+    "goes with no record kept, a working address behind \"ask an operator\", and the\n"
+    "running-server precondition stated before they type their email rather than as an\n"
+    "error afterwards."
+)
+
+
+class TestOwnProvenanceCitation:
+    def _carrier_world(self, parent="g-001-05", status="completed"):
+        """The closing goal IS the gate-filed carrier for `parent`."""
+        return _world(
+            _goal("g-001-99", "in-progress",
+                  origin_signal=f"residual:{parent}"),
+            _goal(parent, status),
+        )
+
+    def test_g1498_fixture_keeps_the_production_line_breaks(self):
+        # The fixture guard. The defect this whole class exists to pin was NOT
+        # in the gate's logic first — it was here: a reconstruction that kept
+        # the wording and dropped the hard wraps. That fixture passed against
+        # the clause-scoped fix while the real note still filed a phantom. So
+        # assert the SHAPE, or the next reflow silently re-opens the hole.
+        import re as _re
+        marker = _re.search(r"(?<!\bno\s)(?<!without\s)\bfollow-up\b",
+                            _G1498_NOTE, _re.I)
+        assert marker, "precondition: the fixture must still contain the marker"
+        parent = _G1498_NOTE.index("g-335-1483")
+        assert parent < marker.start(), "parent must precede the marker"
+        assert "\n" in _G1498_NOTE[parent:marker.start()], (
+            "the parent id and the marker sit on DIFFERENT physical lines in "
+            "production — that line break is the whole reason clause scoping "
+            "failed. Do not reflow this fixture (guard-920).")
+        assert marker.start() - parent == 103, (
+            "measured distance in the real note; the accept path is windowed "
+            "on CARRIER_WINDOW=120, so this pins that the case stays inside it")
+
+    def test_g1498_shape_files_no_phantom(self):
+        r = _eval(_G1498_NOTE, items=self._carrier_world("g-335-1483"))
+        assert "follow_up" in r["matched_markers"], (
+            "precondition: the marker must still fire — this path suppresses "
+            "the BLOCK, it does not stop the scan")
+        assert r["would_block"] is False
+        assert r["own_provenance_found"] is True
+        assert r["successor_title"] is None
+
+    def test_parent_still_open_uses_the_live_path_not_this_one(self):
+        # Same note, parent still pending: accept path 1 lifts it first. Pins
+        # that 1b is additive and never shadows the live-carrier path.
+        items = self._carrier_world("g-335-1483", status="pending")
+        r = _eval(_G1498_NOTE, items=items)
+        assert r["would_block"] is False
+        assert any(c["live"] for c in r["carrier_refs_found"])
+
+    def test_genuine_uncarried_residual_still_fires(self):
+        # The  shape: a real residual, no carrier anywhere. This is
+        # the positive control — the check named in 's verification.
+        r = _eval("Shipped the disclosure copy. The PR merge is a one-command "
+                  "follow-up once CI concludes.",
+                  items=_world(_goal("g-001-99", "in-progress")))
+        assert r["would_block"] is True
+        assert r["own_provenance_found"] is False
+        assert r["successor_title"] is not None
+
+    def test_provenance_outside_the_marker_window_does_not_lift(self):
+        # Parent named far from the marker: the CARRIER_WINDOW scoping must
+        # hold, or this becomes a blanket bypass for every gate-filed carrier.
+        # 300 filler chars puts the id well past the 120-char window on a
+        # single line, so this fails for the scoping reason and not because a
+        # newline happened to intervene.
+        note = ("Context: this goal descends from g-001-05. " + "x" * 300 +
+                " Separately, no product code was written this pass.")
+        r = _eval(note, items=self._carrier_world("g-001-05"))
+        assert r["would_block"] is True
+        assert r["own_provenance_found"] is False
+
+    def test_citing_a_goal_that_is_not_this_goals_parent_still_blocks(self):
+        # origin_signal names ; the note cites . A carrier
+        # relationship with SOME goal must not excuse quoting a DIFFERENT one.
+        items = _world(
+            _goal("g-001-99", "in-progress", origin_signal="residual:g-001-05"),
+            _goal("g-001-07", "completed"),
+        )
+        r = _eval("No code was written; residual carried by g-001-07.",
+                  items=items)
+        assert r["would_block"] is True
+        assert r["own_provenance_found"] is False
+
+    def test_goal_without_residual_origin_signal_is_unaffected(self):
+        items = _world(
+            _goal("g-001-99", "in-progress", origin_signal="maintain:x"),
+            _goal("g-001-05", "completed"),
+        )
+        r = _eval("No code was written; residual carried by g-001-05.",
+                  items=items)
+        assert r["would_block"] is True
+        assert r["own_provenance_found"] is False
+
+    def test_missing_own_record_does_not_crash(self):
+        # The closing goal absent from both queues (cross-queue close): the
+        # lookup returns None and the gate must fall through, not raise.
+        r = _eval("No code was written; residual carried by g-001-05.",
+                  items=_world(_goal("g-001-05", "completed")))
+        assert r["would_block"] is True
+        assert r["own_provenance_found"] is False
+
+
+# ---------------------------------------------------------------------------
 # Accept path 2: owner decline
 # ---------------------------------------------------------------------------
 
@@ -540,3 +723,80 @@ class TestBareNounMarkers:
         unchanged — verified by asserting one of each still behaves."""
         assert _eval("All shipped. No follow-up needed.")["would_block"] is False
         assert _eval("Cleanup deferred to a later cycle.")["would_block"] is True
+
+
+# ---------------------------------------------------------------------------
+# Identifier-head anchoring ()
+# ---------------------------------------------------------------------------
+# `\b` is not an identifier boundary: `-`, `.` and `/` are all non-word
+# characters, so `\bgoal\b` matches the HEAD of `goal-eligible`. The work-context
+# anchor then reads a quoted shell command as the author asserting that work
+# remains, and Layer D auto-files a HIGH goal off it.
+#
+# The verbatim clause from 's outcome_note. Its subject is COMPLETED
+# test coverage ("Also newly pinned"), which is the opposite of residual work.
+G306440_CLAUSE = (
+    "Also newly pinned: a MEASURED trap where `skill` is argparse REMAINDER, "
+    "so a TRAILING `--role reducer` is swallowed as skill text (\"/--role\") "
+    "and the role is never read — `goal-eligible --role reducer \"\"` -> "
+    "reducer-only rc=1 vs `goal-eligible \"\" --role reducer` -> "
+    "undetermined rc=0."
+)
+
+IDENTIFIER_HEAD_CLAUSES = [
+    # every one of these is a work-vocabulary word heading a larger identifier
+    "The remainder is described by `goal-eligible --role reducer`.",
+    "The remainder is handled in goal-selector.py.",
+    "The remainder lives in task-runner.sh.",
+    "See the remainder in file.txt.",
+    "The remainder sits in the deferred-work lane.",
+    "The remainder is under world/pending/x.",
+]
+
+
+class TestIdentifierHeadAnchor:
+    def test_g306440_clause_produces_no_residual_finding(self):
+        """THE INCIDENT. This exact sentence auto-filed  HIGH, which
+        sat at rank 3 of 1,881 candidates until it was closed by hand as moot.
+        `remainder` fires three times on the argparse constant; two were
+        already suppressed, and the third survived on `goal` inside
+        `goal-eligible`."""
+        r = _eval(G306440_CLAUSE)
+        assert r["matched_markers"] == []
+        assert r["would_block"] is False
+        assert r["successor_title"] is None
+
+    @pytest.mark.parametrize("clause", IDENTIFIER_HEAD_CLAUSES)
+    def test_identifier_head_is_not_work_context(self, clause):
+        r = _eval(clause)
+        assert "remainder" not in r["matched_markers"]
+
+    # --- positive controls: the gate must not have been disabled -----------
+
+    def test_standalone_work_word_still_fires(self):
+        """THE CONTROL for this fix. A token used as a standalone word is
+        untouched; if this goes silent the anchor was disabled, not narrowed."""
+        r = _eval("The remainder was not attempted.")
+        assert "remainder" in r["matched_markers"]
+        assert r["would_block"] is True
+
+    @pytest.mark.parametrize("clause", [
+        "The remainder was re-filed.",
+        "The remainder was auto-deferred.",
+        "The remainder was hand-carried.",
+        "The remainder is un-implemented.",
+    ])
+    def test_hyphen_PREFIXED_work_verb_still_fires(self, clause):
+        """THE ASYMMETRY, pinned so a future "tidy" cannot quietly undo it.
+
+        The guard excludes the identifier HEAD only. Making it symmetric — a
+        leading lookbehind, which reads like the obvious completion of the
+        pattern — would drop `filed` in "re-filed" and `carried` in
+        "hand-carried", which are ordinary English work prose. Losing those is
+        a FALSE NEGATIVE, and this module ranks that strictly worse than a
+        false positive: a block refuses loudly, a miss strands work silently.
+        guard-1901 is the general form (tightening a predicate that is a
+        REQUIREMENT for blocking weakens the gate); these four cases are its
+        enumerated answer here.
+        """
+        assert "remainder" in _eval(clause)["matched_markers"]

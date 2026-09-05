@@ -295,6 +295,21 @@ housekeeping_tick:
   shadow: true
   scratch_session_age_days: 14        # this project's session dirs idle past this -> GC
   scratch_empty_project_age_days: 30  # recursively-empty project dirs idle past this -> GC
+  transcript_archive_interval_hours: 12  # lane D: copy both harnesses' transcript
+                                        # trees to the storage backend (owner: 1-2x/day).
+                                        # NOT gated by `shadow` -- shadow arms DELETERS and
+                                        # this lane only copies. Set to 0 to turn it off.
+  mind_seed_freshness_interval_hours: 24  # lane E: mind-seed publish-key SILENCE detector
+                                        # (). The publish lane alerts only on a FAILED
+                                        # run, so it cannot fire when NO run happens -- the
+                                        # failure that froze every live customer environment on
+                                        # one artifact for ~12 days with no alert. 24h runs well
+                                        # INSIDE the detector's own 72h staleness threshold so a
+                                        # freeze is caught within one window, not at its edge.
+                                        # NOT gated by `shadow` (it reads, never deletes). Set
+                                        # to 0 to turn it off. Only rc=1 (STALE) alerts; rc=3
+                                        # (unreachable) is zero signals, not one, and never
+                                        # stamps -- so the next tick retries.
 
 # --- STALE-SENTINEL CANARY () ---
 # Defense-in-depth for Cat C sentinels (bash writer + SKILL-only consumer).
@@ -424,6 +439,15 @@ close_review_gate:
   # population — the high tier is known to flag at least one legitimate close
   # (, "do not reopen this goal"). Refusal-with-context, never a hard
   # deny; and do NOT widen the detector to raise its yield (guard-2201).
+  # MEASURED (, zeta cc-02 2026-09-04): note-marker refusal rate = 0/448
+  # = 0.0% at the gate's own HIGH-confidence threshold over the live completed
+  # population (86 carry a marker at some confidence, 0 at high --  no
+  # longer flags). Precondition (measure the rate first) is now SATISFIED green
+  # (0 false positives), so check B is ELIGIBLE to enable and its override
+  # --override-note-marker is reachable (guard-1532 unreachable-remedy does NOT
+  # apply to B). LEFT DORMANT: enabling changes fleet-wide close behaviour + the
+  # shipped-dormant posture guarded by test_gate_is_DORMANT_by_default, a separate
+  # decision beyond 's scope (which was to record the rate).
   note_marker_enabled: false
   # Env overrides for tests / a deliberate one-run enable:
   #   CLOSE_REVIEW_GATE_ENABLED=1  CLOSE_REVIEW_NOTE_MARKER_ENABLED=1
@@ -1980,6 +2004,14 @@ dry_idle_backoff:
   stop_after_cap_cycles: null  # null = hold at cap forever (~12 wakes/day, negligible tokens);
                                # int N = after N cap-level sleeps, route to
                                # productivity-stop-gate for a graceful drop to assistant
+  min_reentry_gap_s: 120   # g-357-88 DRY-SPIN guard: max age of a
+                           # signals.last_all_blocked marker for dry-spin-guard.py to
+                           # treat the previous cycle as "routed all_blocked and wrote
+                           # no sleep" and short-circuit re-entry. Do NOT raise this
+                           # alongside base_seconds: it bounds how long a STALE marker
+                           # can keep firing the guard, so it stays at the 120s DEFAULT
+                           # even where base_seconds is 7200 (). Past the gap a
+                           # genuine long sleep elapsed -> normal entry.
   # sleep(streak) = min(base_seconds * multiplier**(streak-1), max_seconds)
   #   streak 1->120s 2->240s 3->480s 4->960s 5->1920s 6->3840s 7+->7200s (capped)
 

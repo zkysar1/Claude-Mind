@@ -1234,6 +1234,12 @@ def test_goals_reach_json_payload_and_okf_bundle(tmp_path: Path, monkeypatch) ->
     )
     monkeypatch.setenv("WORLD_PATH", str(world))
     monkeypatch.delenv("META_PATH", raising=False)
+    # The assertion below is an EXACT dict comparison, so it must not depend on whether
+    # THIS box happens to have the goal-handle secret provisioned — a provisioned box
+    # adds a fourth key and turns a green pin red for an environment reason
+    # (run-full-suite-after-deep-code.md, "the second axis: ENVIRONMENT"). The absent
+    # case is the one this test is about; the handle has its own coverage below.
+    monkeypatch.delenv(M._GOAL_HANDLE_SECRET_VAR, raising=False)
     out = tmp_path / "bundle.json"
 
     assert M.main(["-o", str(out)]) == 0
@@ -1456,3 +1462,149 @@ def test_program_count_cannot_satisfy_the_broken_export_refusal(tmp_path: Path) 
     bundle = M.ProjectedBundle(program={"purpose": "p"})
     assert any(bundle.counts().values()), "the naive check would pass this broken bundle"
     assert not any(bundle.counts()[k] for k in K.KNOWLEDGE_COUNT_KEYS)
+
+
+# ── goal handles end to end () ──────────────────────────────────────
+#
+# The projection's own tests pin the handle ALGEBRA. These pin the WIRING: that the
+# secret reaches the projection from the environment, that the handle survives into the
+# published JSON bundle, and that the box-side resolve reads the same world queue back.
+# The  lesson again — a unit-tested projection whose main() path was never
+# exercised is a projection that can silently stop being emitted.
+
+_EXPORT_HANDLE_SECRET = "export-test-handle-secret-not-a-real-key"
+
+
+def _goal_world_with_secret(tmp_path: Path, monkeypatch) -> Path:
+    world = _world_with_goals(
+        tmp_path,
+        [{"id": "asp-369", "goals": [
+            _goal(id="g-369-119", title="Ship the reef explorer"),
+            _goal(id="g-369-30", title="Chart the kelp forest", status="in-progress"),
+            _goal(id="g-369-201", title="Framework chore", work_class="framework"),
+        ]}],
+    )
+    monkeypatch.setenv("WORLD_PATH", str(world))
+    monkeypatch.delenv("META_PATH", raising=False)
+    monkeypatch.setenv(M._GOAL_HANDLE_SECRET_VAR, _EXPORT_HANDLE_SECRET)
+    monkeypatch.setenv("ENVIRONMENT_ID", "test-env")
+    return world
+
+
+def test_published_bundle_carries_a_handle_and_still_no_id(tmp_path: Path, monkeypatch) -> None:
+    """OUTCOME 1 at the published surface — the bundle a member's board actually reads."""
+    world = _goal_world_with_secret(tmp_path, monkeypatch)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+
+    text = out.read_text(encoding="utf-8")
+    payload = json.loads(text)
+    assert payload["counts"]["goals"] == 2
+    for row in payload["goals"]:
+        assert set(row) == {"title", "status", "updated", "handle"}, sorted(row)
+        assert len(str(row["handle"])) == 16
+    assert len({str(r["handle"]) for r in payload["goals"]}) == 2, "handles must be per-goal"
+    # No goal id and no secret anywhere in the published bytes.
+    for fragment in ("g-369-119", "g-369-30", "asp-369", _EXPORT_HANDLE_SECRET):
+        assert fragment not in text, fragment
+    assert "Framework chore" not in text, "gate 1 still drops non-product work"
+
+
+def test_bundle_carries_no_handle_when_the_secret_is_unset(tmp_path: Path, monkeypatch) -> None:
+    """FAIL CLOSED at the wiring layer: no secret provisioned -> the original shape."""
+    _goal_world_with_secret(tmp_path, monkeypatch)
+    monkeypatch.delenv(M._GOAL_HANDLE_SECRET_VAR, raising=False)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    for row in json.loads(out.read_text(encoding="utf-8"))["goals"]:
+        assert set(row) == {"title", "status", "updated"}, sorted(row)
+
+
+def test_resolve_handle_round_trips_the_published_handle(tmp_path: Path, monkeypatch) -> None:
+    """OUTCOME 2: the handle the BUNDLE published resolves back to exactly one goal id.
+
+    Deliberately reads the handle out of the written bundle rather than recomputing it —
+    a recomputed handle would round-trip even if the export published something else.
+    """
+    world = _goal_world_with_secret(tmp_path, monkeypatch)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    rows = json.loads(out.read_text(encoding="utf-8"))["goals"]
+    by_title = {str(r["title"]): str(r["handle"]) for r in rows}
+
+    assert M.resolve_handle(world, tmp_path, by_title["Ship the reef explorer"]) == "g-369-119"
+    assert M.resolve_handle(world, tmp_path, by_title["Chart the kelp forest"]) == "g-369-30"
+    assert M.resolve_handle(world, tmp_path, "deadbeefdeadbeef") is None
+
+
+def test_resolve_handle_is_none_without_the_secret(tmp_path: Path, monkeypatch) -> None:
+    """An unprovisioned box refuses every addressed write instead of resolving them all."""
+    world = _goal_world_with_secret(tmp_path, monkeypatch)
+    from knowledge_projection import goal_handle
+
+    handle = goal_handle("g-369-119", _EXPORT_HANDLE_SECRET, "test-env")
+    assert M.resolve_handle(world, tmp_path, handle) == "g-369-119"
+    monkeypatch.delenv(M._GOAL_HANDLE_SECRET_VAR, raising=False)
+    assert M.resolve_handle(world, tmp_path, handle) is None
+
+
+def test_resolve_handle_cli_prints_the_id_on_rc_zero_and_nothing_on_rc_one(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """The entry point the write path calls. rc IS the signal; stdout is never parsed.
+
+    An unknown handle must print NOTHING — telling an unauthenticated caller apart
+    "unknown" from "known but not yours" would leak which handles exist.
+    """
+    world = _goal_world_with_secret(tmp_path, monkeypatch)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    handle = str(json.loads(out.read_text(encoding="utf-8"))["goals"][0]["handle"])
+    capsys.readouterr()
+
+    assert M.main(["--resolve-handle", handle]) == 0
+    assert capsys.readouterr().out.strip() == "g-369-119"
+
+    assert M.main(["--resolve-handle", "deadbeefdeadbeef"]) == 1
+    assert capsys.readouterr().out.strip() == ""
+
+
+def test_resolve_handle_answers_before_the_all_zero_export_refusal(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A resolve publishes nothing, so the artifact-protecting refusal must not swallow it.
+
+    A world whose knowledge stores are unreadable would make an EXPORT return 2. A resolve
+    against that same world is still a valid question with a valid answer, and turning it
+    into "the exporter is unhappy" would strand the write path on an unrelated fault.
+    """
+    world = _goal_world_with_secret(tmp_path, monkeypatch)
+    # Break the tree index: every knowledge count goes to zero, which is the condition
+    # the export refusal fires on.
+    (world / "knowledge" / "tree" / TREE_INDEX_BASENAME).write_text("{[", encoding="utf-8")
+    from knowledge_projection import goal_handle
+
+    handle = goal_handle("g-369-119", _EXPORT_HANDLE_SECRET, "test-env")
+    capsys.readouterr()
+    assert M.main(["--resolve-handle", handle]) == 0
+    assert capsys.readouterr().out.strip() == "g-369-119"
+
+
+def test_resolve_handle_flag_without_a_value_refuses_instead_of_exporting(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A value-less --resolve-handle must NOT fall through to a full export.
+
+    Every other flag here uses the `and i + 1 < len(argv)` shape, where a missing value
+    harmlessly falls through to a default. This one selects the OPERATION, so the same
+    shape turned `--resolve-handle` with no value into a full bundle dump on stdout at
+    rc 0 — measured at 9,684,089 bytes before the guard existed. A shell caller that
+    branches on the rc and reads stdout as a goal id would take that as a resolved
+    handle whose id is the entire knowledge bundle.
+    """
+    _goal_world_with_secret(tmp_path, monkeypatch)
+    capsys.readouterr()
+    assert M.main(["--resolve-handle"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "", "a usage error must print nothing on stdout"
+    assert "--resolve-handle requires a handle value" in captured.err

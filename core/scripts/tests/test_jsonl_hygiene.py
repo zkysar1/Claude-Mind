@@ -580,3 +580,64 @@ def test_refresh_would_clobber_classifies(tmp_path):
     class _NoRoots:
         def refresh(self, p): pass
     assert rwc(_NoRoots(), world / "presence" / "alpha.jsonl") is False
+
+
+# ── recovery-layer gate on cap mode () ────────────────────────────
+# cap writes NO archive sibling, so the .history snapshot is its only recovery
+# layer -- and _fileops SKIPS that snapshot for every blacklisted store. The
+# combination silently destroyed 30,588 records across three stores (measured
+# 2026-09-04). These pin the refusal AND its control: a test that only asserts
+# "refused" is green by default if the gate never fires (guard-2903).
+def _force_blacklist(monkeypatch, base_dir, blacklisted):
+    import _fileops
+    monkeypatch.setattr(_fileops, "resolve_base_dir", lambda p: base_dir)
+    monkeypatch.setattr(_fileops, "_is_snapshot_blacklisted",
+                        lambda b, r: blacklisted)
+
+
+def test_cap_refuses_when_the_store_is_snapshot_blacklisted(tmp_path, monkeypatch):
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    _force_blacklist(monkeypatch, tmp_path, True)
+    rep = jh.hygiene_one(p, mode="cap", by="lines", max_lines=4, apply=True)
+    assert rep["action"] == "refused-no-recovery-layer"
+    assert rep["applied"] is False
+    assert rep["dropped"] == 0
+    assert rep["kept"] == 10
+    assert "snapshot-blacklisted" in rep["refused_reason"]
+    assert "rotate" in rep["refused_reason"]          # names the remedy
+    assert [r["i"] for r in _read(p)] == list(range(10))   # NOTHING dropped
+
+
+def test_CONTROL_the_same_store_IS_capped_when_a_snapshot_would_be_taken(
+        tmp_path, monkeypatch):
+    # Identical fixture, one variable flipped: the gate must not be inert.
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    _force_blacklist(monkeypatch, tmp_path, False)
+    rep = jh.hygiene_one(p, mode="cap", by="lines", max_lines=4, apply=True)
+    assert rep["action"] == "capped"
+    assert rep["dropped"] == 6
+    assert [r["i"] for r in _read(p)] == [6, 7, 8, 9]
+
+
+def test_rotate_is_unaffected_by_the_gate(tmp_path, monkeypatch):
+    # rotate is archive-FIRST, so it HAS a recovery layer regardless of
+    # .history -- the gate must not spread to it.
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    _force_blacklist(monkeypatch, tmp_path, True)
+    rep = jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert rep["action"] == "rotated"
+    assert rep["dropped"] == 6
+    assert [r["i"] for r in _read(tmp_path / "gate-firings-archive.jsonl")] == \
+        list(range(6))
+
+
+def test_the_real_blacklist_still_covers_the_measured_stores(tmp_path):
+    # Pins the LINKAGE to the real _fileops blacklist, not just the wiring:
+    # if gate-firings.jsonl were ever un-blacklisted, the two tests above
+    # would keep passing against a mock while the production refusal vanished.
+    import _fileops
+    meta_patterns = _fileops._SNAPSHOT_BLACKLIST.get("meta", ())
+    assert "gate-firings.jsonl" in meta_patterns

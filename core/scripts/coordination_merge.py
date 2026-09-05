@@ -5119,6 +5119,39 @@ def _is_gate_firings_segment(basename: str) -> bool:
     return bool(_GATE_FIRINGS_SEGMENT_RE.match(basename))
 
 
+# Compiled productivity-snapshot date-segment matcher, populated on first use
+# from _productivity_snapshots (which owns `segment_name`, what the G4 writer
+# emits, beside `_SEGMENT_RE`, what `snapshot_paths()` matches). Same sentinel
+# semantics as _GATE_FIRINGS_SEGMENT_RE: None = not attempted, False = import
+# failed (cached, no retry per write).
+_PRODUCTIVITY_SNAPSHOT_SEGMENT_RE = None
+
+
+def _is_productivity_snapshot_segment(basename: str) -> bool:
+    """True when `basename` is a productivity-snapshot date segment
+    (`productivity-snapshots-YYYY-MM-DD.jsonl`), the file the
+    PRODUCTIVITY_SNAPSHOTS_SEGMENTED writer lane emits instead of the legacy
+    `productivity-snapshots.jsonl`.
+
+    Pattern IMPORTED from `_productivity_snapshots`, never re-typed here, for
+    the same reason as `_is_gate_firings_segment` above. The import is LAZY
+    because that module pulls in `_paths` (which resolves WORLD_DIR at import),
+    and this module otherwise depends on stdlib + yaml ALONE — a module-level
+    import would give a pure merge library a filesystem-resolution side effect.
+    Import failure degrades to False (safe-freeze).
+    """
+    global _PRODUCTIVITY_SNAPSHOT_SEGMENT_RE
+    if _PRODUCTIVITY_SNAPSHOT_SEGMENT_RE is None:
+        try:
+            import _productivity_snapshots as _ps
+            _PRODUCTIVITY_SNAPSHOT_SEGMENT_RE = _ps._SEGMENT_RE
+        except Exception:  # noqa: BLE001 — any import/attr failure -> safe-freeze
+            _PRODUCTIVITY_SNAPSHOT_SEGMENT_RE = False
+    if not _PRODUCTIVITY_SNAPSHOT_SEGMENT_RE:
+        return False
+    return bool(_PRODUCTIVITY_SNAPSHOT_SEGMENT_RE.match(basename))
+
+
 # --- : front-matter-aware preamble reconcile ----------------------
 # _section_merge.merge_sections' preamble branch has exactly three outcomes:
 # identical / one-side-empty / CONFLICT. A knowledge-tree node ALWAYS carries
@@ -5333,7 +5366,7 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for SEVEN path-pattern branches that run
+    Dispatch is by basename EXCEPT for EIGHT path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
@@ -5350,10 +5383,13 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
       7. telemetry append streams ``**/telemetry/**/*.jsonl`` -- line-union
          (g-115-6947). EXTENSION-DISCRIMINATED, never a bare directory prefix:
          the same tree holds 1,145 ``*.json`` snapshots.
-    Branches 1-4 and 7 register stores whose basenames are DYNAMIC and therefore
+      8. productivity-snapshot date segments
+         ``productivity-snapshots-<YYYY-MM-DD>.jsonl`` -- routed to the legacy
+         file's append-only handler (g-358-49)
+    Branches 1-4, 7 and 8 register stores whose basenames are DYNAMIC and therefore
     unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
-    entry (1-4, 7) and NO despite one (5) -- always resolve through this function,
+    entry (1-4, 7, 8) and NO despite one (5) -- always resolve through this function,
     never through a grep of the dict.
 
     Shard detail: basenames are dynamic (alpha.yaml/bravo.yaml/...) and so cannot
@@ -5445,6 +5481,31 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     # line-union can never resurrect a deletion (guard-1816 satisfied).
     if _is_gate_firings_segment(parts[-1]):
         return merge_append_only_jsonl
+    # EIGHTH path-pattern case (): the productivity-snapshot date
+    # segments `world/productivity-snapshots-YYYY-MM-DD.jsonl` that the G4 block
+    # in productivity-stop-gate.sh writes once PRODUCTIVITY_SNAPSHOTS_SEGMENTED
+    # is set. Dynamic basenames like branches 1-4, and a HOT store — every box
+    # appends one record at every iteration close (measured 662 appends/24h
+    # fleet-wide), so an unregistered segment is not a soft default: a fenced-PUT
+    # 412 has no reconciler below the write and falls to the bare RMW retry,
+    # which loses races in lockstep contention.
+    #
+    # PLACED HERE, beside its structural twin, rather than appended at the end of
+    # the dispatcher (guard-1907): the registration branches cluster ABOVE the
+    # `core/config` EXCLUSION below, and a registration appended past an
+    # exclusion gate inherits it. Harmless for this path today (parent is
+    # `world`, never `config`), but the ordering is the invariant, not the
+    # accident that today's path survives it.
+    #
+    # It inherits the legacy file's handler (merge_append_only_jsonl,
+    # `"productivity-snapshots.jsonl"` in _HANDLERS): identical record schema,
+    # and NO removal path anywhere in the tree — guard-1816 verified 2026-09-04
+    # by walking every write site, of which there is exactly ONE (the bare
+    # `open(snap_path, "a")` in productivity-stop-gate.sh). Every other reference
+    # is a reader, a docstring, or a config mention, so a segment is append-only
+    # for its whole life and a line-union can never resurrect a deletion.
+    if _is_productivity_snapshot_segment(parts[-1]):
+        return merge_append_only_jsonl
     # Second PATH-PATTERN case (), for the opposite reason to the
     # shard branch above: that one exists because the basenames are DYNAMIC,
     # this one because a basename can be AMBIGUOUS. A name registered in
@@ -5515,11 +5576,20 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     #
     # APPEND-ONLY VERIFIED PER FILE (rb-245: read the writers, do not infer from
     # the name — two of these are named "state" and "snapshot"). All six live
-    # `.jsonl` files, and NO removal path exists for any of them (no prune,
-    # rotate, truncate, filter or expire reference fleet-wide), so guard-1816's
+    # `.jsonl` files, and NO REMOVAL path exists for any of them (no prune,
+    # truncate, filter or expire reference fleet-wide), so guard-1816's
     # disqualifier — a deletion path makes the union resurrect deleted records —
-    # is not reached. store-hygiene.yaml configures no cap on world/telemetry/*:
-    #   zakpod1-thermal.jsonl     zakpod1-thermal-record.sh   `sample >> "$OUT"`
+    # is not reached.
+    #
+    # ROTATION IS NOT A REMOVAL PATH, and one now exists ():
+    # zakpod1-thermal-record.sh dates its output daily. That opens a NEW file and
+    # never removes a line, so every record still merges by union and the
+    # disqualifier stays unreached — verified against merge_handler_for() itself,
+    # which returns this same handler for the dated name. A ring buffer, prune or
+    # truncate on ANY file in this table WOULD reach it (the union resurrects the
+    # deleted lines from every peer's copy), so bound these stores by ROTATING,
+    # never by deleting. store-hygiene.yaml configures no cap on world/telemetry/*:
+    #   zakpod1-thermal.jsonl     zakpod1-thermal-record.sh   `sample >> "$CUR"`
     #   studio-edit-state.jsonl   roblox-edit-state.sh        `' >> "$LEDGER"`
     #   cycle-sidecar-exits.jsonl cycle.sh                    open(OUTF, "a")
     #   bridge-liveness.jsonl     cycle.sh                    open(OUTF, "a")

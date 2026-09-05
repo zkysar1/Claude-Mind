@@ -17,6 +17,53 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
+# --- Unknown-flag refusal (sourced BEFORE _runtime.sh on purpose) -----------
+# . Sourced here rather than beside _runtime.sh so a box where the
+# daemon fails to spawn still shows the REFUSAL instead of a transport error --
+# a guard whose failure mode is masked by an unrelated error is not a guard.
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+# The flag surface, in ONE place. The usage heredoc below interpolates this and
+# the -*) arm passes it to the refusal, so the two can never drift apart.
+_ACCEPTED_FLAGS="--source <world|agent> | --key-finding <text>"
+
+# --- Usage (early exit: BEFORE the normalizer, the arg loop and any rt_call) --
+# guard-3872: a usage probe against an arg-tolerant WRITE wrapper can BE the
+# invocation (measured: `pipeline-archive.sh --help` performed a permanent
+# prune). This wrapper requires a goal_id, so `--help` previously fell through
+# as a bogus positional and POSTed it to the daemon, which rejected it
+# read-only as goal_not_found -- safe only by luck, not by construction.
+# This branch MUST stay above the arg loop and every rt_call so a help flag
+# can never ride into a real close (guard-5459: on a passthrough wrapper a
+# flag the inner layer handles-and-exits still rides into a real run).
+# HELP AT ANY POSITION. The branch below tests $1 alone, which was harmless
+# while unknown flags were silently swallowed -- `<id> --source world --help`
+# just fell through as a positional. The -*) refusal this goal adds converts
+# that latent asymmetry into a LIVE regression, which is exactly what
+# test_help_works_after_an_accepted_flag caught on aspirations-add-goal.sh. So
+# normalize a help flag found anywhere to $1 first, using that wrapper's shape.
+for _a in "$@"; do
+    case "$_a" in -h|--help) set -- "--help"; break;; esac
+done
+case "${1-}" in
+    --help|-h)
+        cat <<USAGE
+Usage: aspirations-complete-by.sh <goal-id> [agent-name] [flags]
+
+  Marks a goal completed with agent attribution. For a RECURRING goal this is
+  the required close path: it atomically advances lastAchievedAt, achievedCount
+  and currentStreak/longestStreak (the daemon refuses a direct status=completed
+  write on a recurring goal).
+
+  Accepted flags: ${_ACCEPTED_FLAGS}
+    --source        queue to write to (default: world)
+    --key-finding   one-line finding persisted on the goal record
+
+  Any other argument is positional: first goal-id, then agent-name.
+USAGE
+        exit 0;;
+esac
+
 # Normalize --goal/--goal-id flag aliases → positional goal id (rewrites $@).
 # SSOT for the dual-accept goal-id contract; verify-learning enforces that this
 # wrapper sources the normalizer (12-wrapper coverage grep). Restored 2026-05-29
@@ -39,6 +86,13 @@ while [[ $# -gt 0 ]]; do
         --key-finding)
             KEY_FINDING="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
+        -*)
+            # Was swallowed by the *) arm below into POSITIONAL, where the next
+            # token slides one slot left. POSITIONAL[0] is the GOAL-ID and [1]
+            # the agent-name, so a typo'd flag closed a DIFFERENT goal, or closed
+            # the right goal as the wrong agent, and exited 0. This wrapper
+            # CLOSES GOALS -- the write side of the  class.
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
         *)
             POSITIONAL+=("$1"); shift;;
     esac

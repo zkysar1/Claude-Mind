@@ -259,6 +259,33 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         out.append(f"  id: {msg.get('id', '')}")
         out.append("")
 
+    # Filter-provenance footer ( follow-up). A filtered EMPTY result is
+    # indistinguishable from "the record is not there" unless the reply states the
+    # window it actually covered: a query for an 05:07 post against a --last slice
+    # that begins 17:52 returns a clean, wrong zero. Printing the realized extent
+    # beside the count makes a wrong-WINDOW zero self-refuting the same way a byte
+    # count makes a wrong-PARSER zero self-refuting (guard-2298). The generalisation
+    # is that a positive control sharing the TOOL but not the FILTER cannot detect a
+    # filter miss, so the filter has to report itself.
+    # HUMAN OUTPUT ONLY, deliberately: the JSON branch above returns one object per
+    # line and returns early, so a non-JSON footer can never reach a parser (the
+    # receipt-inside-a-JSONL-store defect, archive-before-delete.md step 6).
+    _filters = ["channel=" + str(channel)]
+    for _k in ("since", "author", "tag", "type", "last"):
+        _v = q.get(_k)
+        if _v:
+            _filters.append(f"{_k}={_v}")
+    if unread_only:
+        _filters.append("unread_only=1")
+    _fstr = " ".join(_filters)
+    if messages:
+        _stamps = sorted(m.get("timestamp", "") for m in messages if m.get("timestamp"))
+        _extent = f"{_stamps[0]} .. {_stamps[-1]}" if _stamps else "unknown"
+        out.append(f"-- {len(messages)} message(s); window covered {_extent}; filters: {_fstr}")
+    else:
+        out.append(f"-- 0 messages matched; filters: {_fstr}")
+        out.append("   (empty is scoped to these filters - not proof the record is absent)")
+
     # T1.7: mark_read AFTER building output (mirrors CLI: display then mark).
     if mark_read and messages:
         _mark_read_append(ctx, channel, current_agent, messages, seen)

@@ -355,7 +355,14 @@ def run_suite(project_root: Path, log_path: Path):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "w", encoding="utf-8", errors="replace") as fh:
         try:
+            # cwd is EXPLICIT, not inherited. The runner resolves its own
+            # SCRIPT_DIR from $0, but pytest's rootdir/conftest discovery and
+            # every relative path inside the suite resolve against the PROCESS
+            # cwd -- so an inherited cwd would run the worktree's scripts
+            # against the live tree's files, which is precisely the split this
+            # C4 change exists to remove.
             p = subprocess.run([BASH, (project_root / "core/scripts/run-full-suite.sh").as_posix()],
+                               cwd=str(project_root),
                                stdout=fh, stderr=subprocess.STDOUT, env=env, timeout=14400)
             rc = p.returncode
         except Exception as exc:  # pragma: no cover
@@ -369,18 +376,228 @@ def run_suite(project_root: Path, log_path: Path):
     return rc, verdict, text
 
 
-def suite_is_green(rc: int, verdict: str | None) -> bool:
+# The halves run-full-suite.sh gates its own exit code on, in the order it
+# tests them (run-full-suite.sh:461-465). "domain" is the deployment-owned
+# half; every other half is framework-owned. SSOT for the split is that exit
+# block -- read it before editing this tuple.
+FRAMEWORK_HALVES = ("invisible", "deferred")
+DEPLOYMENT_HALVES = ("domain",)
+
+
+def suite_is_green(rc: int, verdict: str | None, halves=None) -> bool:
     """Read the VERDICT line first, never the totals.
 
     A missing verdict is NOT green: run-full-suite reports what it RAN, and an
     absent verdict means the chunked half never reached its conclusion
     (guard-1760). INVALID means the numbers mean nothing.
+
+    `halves` is the parsed halves.jsonl record (see read_halves). When it is
+    supplied, a red DOMAIN half no longer blocks the adoption -- it is reported
+    separately instead. Measured justification, and why this is scoped rather
+    than relaxed: core/config/conventions/pull-promotion.md, "The domain half
+    does not gate adoption".
+
+    FAIL-SAFE DIRECTION (g-360-19): with `halves` absent or unreadable this is
+    byte-for-byte the old strict predicate (rc == 0). Missing evidence NEVER
+    turns a red run green -- the loosening requires positive proof of WHICH
+    half was red.
     """
     if verdict is None:
         return False
     if "CLEAN" not in verdict:
         return False
-    return rc == 0
+    if rc == 0:
+        return True
+    if not halves:
+        return False
+    # rc != 0 and the chunked half said CLEAN, so the red is in one of the
+    # non-chunked halves. Green only if EVERY framework-owned half is clean and
+    # at least one deployment-owned half actually accounts for the red -- an
+    # unexplained rc stays red.
+    by_half = {h.get("half"): h for h in halves if isinstance(h, dict)}
+    for name in FRAMEWORK_HALVES:
+        row = by_half.get(name)
+        if row is not None and row.get("rc") not in (0, None):
+            return False
+    return any((by_half.get(n) or {}).get("rc") not in (0, None)
+               for n in DEPLOYMENT_HALVES)
+
+
+def suite_out_dir(project_root: Path):
+    """Resolve the runner's log dir the SAME way run-full-suite.sh does.
+
+    One call to the runner's own --print-out-dir, never a re-derivation of its
+    default (guard-2676: the layout is the runner's to own, not ours).
+    """
+    try:
+        p = subprocess.run(
+            [sys.executable, (project_root / "core/scripts/run-full-suite.py").as_posix(),
+             "--print-out-dir"],
+            cwd=str(project_root), capture_output=True, text=True, timeout=120)
+    except Exception:
+        return None
+    out = (p.stdout or "").strip()
+    return Path(out) if p.returncode == 0 and out else None
+
+
+def read_halves(out_dir):
+    """Parse <out_dir>/halves.jsonl -> list of dicts. [] when unreadable.
+
+    Returning [] rather than raising is deliberate: an absent record must land
+    on suite_is_green's strict branch (see its FAIL-SAFE note), never abort C4.
+    """
+    if not out_dir:
+        return []
+    f = Path(out_dir) / "halves.jsonl"
+    rows = []
+    try:
+        for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return rows
+
+
+# --------------------------------------------------- C4 in a pinned worktree
+
+# The gitignored runtime state a `git worktree add --detach` checkout does NOT
+# inherit. Each row is (source-relative-path, destination-relative-path, mode).
+# A missing source is SKIPPED, never fatal: not every deployment has every file.
+#
+# guard-5253 states the generalization this table serves and warns against
+# memorizing it: ask what NON-GIT state the run reads, because the list grows
+# with the daemon surface. Each entry below cost a voided ~40-minute run:
+#   local-paths.conf  absent -> WORLD_DIR/META_DIR resolve EMPTY, 0 passed /
+#                     106 errors, an INVALID run that reads as catastrophic
+#   .env.local        absent -> the invisible + domain halves fail with
+#                     "ERROR: .env.local not found", and --triage cannot see it
+#                     because --triage reads the CHUNK logs only (guard-5702)
+#   daemon.port       absent -> "daemon not reachable"; and a COPY goes STALE
+#                     when the daemon recycles mid-run, which a `test -f` check
+#                     cannot detect -- hence symlink (guard-5702 action_hint)
+#   .mind-data        absent -> on a .mind-data deployment _paths._resolve_tier
+#                     skips tiers 2-3 (both gated on the dir existing) and, with
+#                     no local-paths.conf, returns None
+WORKTREE_RUNTIME_STATE = (
+    (".env.local", ".env.local", "copy"),
+    ("mind_api/state/daemon.port", "mind_api/state/daemon.port", "symlink"),
+    (".mind-data", ".mind-data", "symlink"),
+)
+
+# Agent-scoped members of the same table, appended once the agent is known.
+# COPY, never symlink, and the reason is the exact inverse of daemon.port's:
+# there staleness is the hazard and mutation is impossible, so a symlink wins;
+# here the file is rewritten continuously by the live loop AND a test may write
+# to it, so a symlink would let a scratch suite mutate the agent-wide working
+# memory. An isolated snapshot is both sufficient and safe.
+#   local-paths.conf   absent -> WORLD_DIR/META_DIR resolve EMPTY
+#   the working-memory snapshot absent -> measured 2026-09-04 (alpha, cc-13):
+#     test-wm-prune-cadence-protection.sh dies `cp: cannot stat
+#     .../session/working-memory.yaml: No such file or directory`, rc=1, in a
+#     worktree at BOTH the change under test AND its parent commit. A red that
+#     reads as a regression and is pure environment.
+AGENT_RUNTIME_STATE = (
+    ("agents/{agent}/local-paths.conf", "copy"),
+    ("agents/{agent}/session/working-memory.yaml", "copy"),
+)
+
+
+def bridge_runtime_state(project_root: Path, wt: Path, agent: str | None) -> list:
+    """Populate a detached worktree with the gitignored state the suite reads.
+
+    Returns one row per item: {"item", "mode", "ok", "detail"}. Never raises --
+    a bridge failure must surface in the verdict, not as a traceback that skips
+    the worktree teardown.
+    """
+    import shutil as _sh
+    items = list(WORKTREE_RUNTIME_STATE)
+    if agent:
+        for i, (tmpl, mode) in enumerate(AGENT_RUNTIME_STATE):
+            rel = tmpl.format(agent=agent)
+            items.insert(i, (rel, rel, mode))
+    rows = []
+    for src_rel, dst_rel, mode in items:
+        src, dst = project_root / src_rel, wt / dst_rel
+        row = {"item": src_rel, "mode": mode, "ok": False, "detail": ""}
+        try:
+            if not src.exists():
+                row.update(ok=True, detail="absent at source; skipped")
+            else:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists() or dst.is_symlink():
+                    row["detail"] = "replaced existing"
+                    if dst.is_dir() and not dst.is_symlink():
+                        _sh.rmtree(dst, ignore_errors=True)
+                    else:
+                        dst.unlink()
+                if mode == "symlink":
+                    dst.symlink_to(src, target_is_directory=src.is_dir())
+                else:
+                    # copy2 carries the mode across, which matters for
+                    # .env.local (0600 secrets) -- the worktree lives under a
+                    # world-readable /tmp parent.
+                    _sh.copy2(src, dst)
+                row["ok"] = True
+        except OSError as exc:
+            row["detail"] = f"{type(exc).__name__}: {exc}"
+        rows.append(row)
+    return rows
+
+
+def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
+                       agent: str | None = None, runner=None, bridger=None):
+    """C4 verify, pinned at `sha` in a detached worktree off project_root.
+
+    WHY THE LIVE TREE CANNOT BE THE VERIFY TREE: run-full-suite's tree-moved
+    detection outranks every other verdict, and HEAD moves under a ~40-minute
+    C4 for reasons that have nothing to do with the adoption -- the adopting
+    Mind's OWN iteration-push merge is enough. Measured 2026-09-02 on zc-03
+    (g-360-19): adopt commit 22:14Z, the loop's merge landed on top by 22:16Z
+    while chunk
+    00 was still running; the verdict was going to come back tree-moved and
+    rollback() -- a `git reset --hard <pre_sha>` -- would have fired, taking
+    every uncommitted store write the loop had made during the run with it
+    (guard-5846). Pinning the tree makes the verdict a property of the adopted
+    commit instead of a race against the loop.
+
+    Returns (rc, verdict, meta). rc is None when the worktree could not be
+    created, which suite_is_green reads as not-green via the INVALID verdict.
+    The teardown is in a `finally`, per guard-5842: a leftover worktree is not
+    inert -- it is a live source of reds elsewhere in the suite.
+    """
+    import shutil as _sh
+    import tempfile as _tf
+    runner = runner or run_suite
+    bridger = bridger or bridge_runtime_state
+    meta = {"worktree": None, "sha": sha, "bridge": [], "out_dir": None}
+
+    wt = Path(_tf.mkdtemp(prefix="framework-pull-verify-wt-"))
+    rc_a, _, err = git(project_root, "worktree", "add", "--detach", str(wt), sha,
+                       timeout=600)
+    if rc_a != 0:
+        _sh.rmtree(wt, ignore_errors=True)
+        meta["error"] = f"worktree add rc={rc_a}: {err[:200]}"
+        return None, f"VERDICT: INVALID (verify-worktree-unavailable) {meta['error']}", meta
+    meta["worktree"] = str(wt)
+    try:
+        meta["bridge"] = bridger(project_root, wt, agent)
+        # The log lives OUTSIDE the worktree by construction (caller passes a
+        # project_root path): a log written INSIDE it makes the teardown below
+        # fail "handle still busy" (guard-5842).
+        rc, verdict, _ = runner(wt, log_path)
+        out_dir = suite_out_dir(wt)
+        meta["out_dir"] = str(out_dir) if out_dir else None
+        meta["halves"] = read_halves(out_dir)
+        return rc, verdict, meta
+    finally:
+        git(project_root, "worktree", "remove", "--force", str(wt), timeout=300)
+        _sh.rmtree(wt, ignore_errors=True)
 
 
 # ------------------------------------------------------------ orchestration
@@ -497,7 +714,7 @@ def build_plan(*, project_root: Path, source_repo: Path, agent: str | None,
 
     report["rollback"] = {
         "source_sha": installed_doc.get("source_sha"),
-        "command": "git reset --hard <source_sha>; bash core/scripts/mind-api-start.sh --restart",
+        "command": "framework-pull.sh --rollback (scoped: reset --soft to <source_sha>, then restore the framework paths only); bash core/scripts/mind-api-start.sh --restart",
         "note": "prefer the RELEASES.json entry's own rollback_recipe when it carries one",
     }
     report["proceed"] = not report["blockers"]
@@ -576,22 +793,77 @@ def copy_tree(src: Path, dst: Path) -> int:
     return n
 
 
-def rollback(project_root: Path, source_sha: str, restart=None) -> dict:
-    """C4 rollback: one reset, then recycle the daemon.
+def rollback(project_root: Path, source_sha: str, restart=None,
+             script_dir: Path = None) -> dict:
+    """C4 rollback: undo the FRAMEWORK, never the whole tree, then recycle.
 
     `restart` is injectable so a test can exercise the ROLLBACK PATH without a
-    live daemon -- the goal requires this path be exercised, not documented.
+    live daemon (g-360-02) -- that goal requires this path be exercised, not
+    documented.
+
+    WHY THIS IS NOT `git reset --hard` (g-360-17). The adopting Mind is usually
+    LIVE, and its loop writes its governed stores -- the goal queue, the
+    changelog, the journal -- continuously through the ~40-minute C4 suite. A
+    whole-tree hard reset discards every one of those uncommitted writes along
+    with the framework it meant to undo: work the adoption never touched and
+    has no business destroying. Measured 2026-09-02 on zc-03 (g-360-17): the
+    plan reported 3 dirty tracked store files, proceeded because they were
+    disjoint from the incoming set, and a red or voided verdict would have
+    taken them. guard-5846 carries the incident.
+
+    So the undo is SCOPED: move HEAD back with `--soft` (which touches neither
+    the index nor the working tree), then restore ONLY the framework paths from
+    `source_sha`. Anything outside that set -- every store, every agent dir --
+    is left exactly as the loop left it. The path set is read from
+    promotion-preflight.py via framework_paths(), never re-declared here.
     """
     out = {"source_sha": source_sha, "reset_rc": None, "restarted": False}
     if not source_sha:
         out["error"] = "no source_sha recorded; cannot roll back automatically"
         return out
-    rc, _, err = git(project_root, "reset", "--hard", source_sha)
+    if script_dir is None:
+        script_dir = project_root / "core/scripts"
+    try:
+        wanted = framework_paths(script_dir)
+    except Exception as exc:
+        # Without the path set a SCOPED undo is impossible, and the unscoped
+        # one is the thing this function exists to stop doing. Refuse loudly
+        # rather than silently widening the blast radius back to the tree.
+        out["error"] = f"cannot resolve framework paths, refusing to roll back: {exc}"
+        return out
+
+    # --soft: HEAD moves, index and working tree do NOT. A caller asserting
+    # HEAD == pre_sha still sees what it expects; a store write made during the
+    # suite is still on disk.
+    rc, _, err = git(project_root, "reset", "--soft", source_sha)
     out["reset_rc"] = rc
     if err:
         out["reset_stderr"] = err[:300]
     if rc != 0:
         return out
+
+    # Restore the framework paths that EXISTED at source_sha, and remove the
+    # ones the adoption ADDED. Splitting them is not defensive padding: one
+    # pathspec absent at that sha makes `git checkout` fail for the whole
+    # batch and restore NOTHING (the guard-5011 shape, one command over).
+    present, added = [], []
+    for rel in wanted:
+        if git(project_root, "cat-file", "-e", f"{source_sha}:{rel}")[0] == 0:
+            present.append(rel)
+        elif (project_root / rel).exists():
+            added.append(rel)
+    if present:
+        rc_r, _, err_r = git(project_root, "checkout", source_sha, "--", *present)
+        if rc_r != 0:
+            out["restore_error"] = f"checkout rc={rc_r}: {err_r[:200]}"
+            return out
+    if added:
+        rc_d, _, err_d = git(project_root, "rm", "-rf", "--quiet", "--", *added)
+        if rc_d != 0:
+            out["restore_error"] = f"rm rc={rc_d}: {err_d[:200]}"
+            return out
+    out["framework_paths_restored"] = len(present)
+    out["framework_paths_removed"] = len(added)
     if restart is None:
         restart = _default_restart
     try:
@@ -666,6 +938,43 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
     # The install-side gate is C4 verify + rollback below, which is stronger.
     failure = None
     try:
+        # CHECKPOINT the dirty TRACKED files before anything touches the tree
+        # (). The plan's disjointness step REPORTS them and proceeds --
+        # correctly, since disjoint work cannot be clobbered by the copy -- but
+        # "not clobbered by the copy" is not "safe": a red or voided verdict
+        # sends the tree through rollback(), and until this commit exists that
+        # uncommitted work has no anchor to come back to. Committing it here
+        # gives it one. `--no-verify` for the same install-time reason as the
+        # two commits below.
+        rc_s, st_s, _ = git(project_root, "status", "--porcelain")
+        dirty = []
+        if rc_s == 0:
+            for line in st_s.splitlines():
+                # SPLIT, never a fixed offset. git() strips stdout, so the
+                # leading space of a " M path" status is already gone on the
+                # first line and present on the rest -- a line[3:] slice ate a
+                # character off the path and git refused the pathspec rc=128
+                # (measured while writing this). split(None, 1) reads both
+                # shapes and leaves paths containing spaces intact.
+                parts = line.strip().split(None, 1)
+                if len(parts) != 2 or parts[0] == "??":
+                    continue          # untracked: nothing to anchor, leave it
+                rel = parts[1]
+                if " -> " in rel:     # rename -- the destination is the file
+                    rel = rel.split(" -> ", 1)[1]
+                dirty.append(rel.strip().strip('"'))
+        if dirty:
+            rc_k, _, err_k = git(project_root, "add", "--", *dirty)
+            if rc_k == 0 and git(project_root, "diff", "--cached",
+                                 "--name-only")[1].strip():
+                rc_k, _, err_k = git(
+                    project_root, "commit", "-m",
+                    f"chore(pull): checkpoint {len(dirty)} dirty file(s) "
+                    f"before adopting {newest}", "--no-verify")
+            if rc_k != 0:
+                failure = f"checkpoint commit failed rc={rc_k}: {err_k[:200]}"
+        step("checkpoint-dirty", failure is None, files=len(dirty))
+
         if copier is None:
             copier = copy_tree
         written = 0
@@ -745,22 +1054,43 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
         # Never run a 32-minute verify over a tree whose adopt did not land,
         # and never leave the half-applied copy behind.
         result["error"] = failure
-        result["rollback"] = rollback(project_root, pre_sha, restart=restart)
+        result["rollback"] = rollback(project_root, pre_sha, restart=restart,
+                                  script_dir=script_dir)
         result["rolled_back"] = True
         return result
 
-    # C4 -- verify on THIS box. Never set verified: true without a clean verdict.
+    # C4 -- verify on THIS box, PINNED. Never set verified: true without a
+    # clean verdict, and never run the verify on the live tree: the adopting
+    # Mind's own loop moves HEAD under a ~40-minute suite, which returns
+    # tree-moved and drives rollback() over work the adoption never touched
+    # (guard-5846; see verify_in_worktree for the measurement).
+    agent = os.environ.get("MIND_AGENT") or "unknown"
+    _, adopt_sha, _ = git(project_root, "rev-parse", "HEAD")
+    result["verify_sha"] = adopt_sha
     if verify is None:
-        log = project_root / "agents" / (os.environ.get("MIND_AGENT") or "unknown") \
-              / "temp" / f"framework-pull-verify-{newest}.log"
-        def verify(root=project_root, _log=log):
-            rc, verdict, _ = run_suite(root, _log)
-            return suite_is_green(rc, verdict), verdict
-    green, verdict = verify()
-    step("verify", green, verdict=verdict)
+        # The log path is under project_root, i.e. OUTSIDE the verify worktree
+        # -- a log written inside it wedges the teardown (guard-5842).
+        log = project_root / "agents" / agent / "temp" \
+              / f"framework-pull-verify-{newest}.log"
+
+        def verify(root=project_root, _log=log, _sha=adopt_sha, _agent=agent):
+            rc, verdict, meta = verify_in_worktree(root, _sha, _log, agent=_agent)
+            return (suite_is_green(rc, verdict, meta.get("halves")), verdict, meta)
+    outcome = verify()
+    # Injected verifies (the RED-path tests) return the 2-tuple this signature
+    # has always had; the pinned default adds a third element. Accept both so a
+    # collaborator written against the old contract keeps working.
+    if len(outcome) == 3:
+        green, verdict, vmeta = outcome
+    else:
+        green, verdict = outcome
+        vmeta = {}
+    step("verify", green, verdict=verdict, sha=adopt_sha,
+         worktree=vmeta.get("worktree"), halves=vmeta.get("halves"))
 
     if not green:
-        result["rollback"] = rollback(project_root, pre_sha, restart=restart)
+        result["rollback"] = rollback(project_root, pre_sha, restart=restart,
+                                  script_dir=script_dir)
         result["rolled_back"] = True
         step("rollback", bool(result["rollback"].get("reset_rc") == 0))
         return result

@@ -42,19 +42,20 @@ its owner, tmp files this session created, or append-only writes.
    meant "delayed permanent deletion", not "archived".
    **When the identity cannot READ the recovery config, the layer is
    UNVERIFIABLE — treat it as ABSENT (g-115-2692).** A least-privilege storage
-   identity is often granted object read/write but DENIED the bucket-level reads
-   that verify a recovery layer — the lifecycle/retention-rule read and version
-   enumeration — while the cheap versioning on/off flag read stays allowed. So
-   the layer can report "enabled" yet its expiry rules are unreadable and no
-   prior version can be confirmed to exist. A readable "enabled" flag is NOT a
-   satisfied recovery layer: it is exactly the rb-2859 trap ("versioned" ≠
-   "archived") made STRUCTURAL by permission. When the specific config reads
+   identity is often granted object read/write but DENIED some bucket-level
+   read that verifies a recovery layer. WHICH one varies by bucket AND by
+   principal — both directions measured in one account (g-115-2692: flag
+   readable, rules denied; g-115-4624: the inverse, no principal reading the
+   flag) — so never predict the split. Probe it, and name the principal that
+   produced the reading (guard-1787). The layer is UNVERIFIABLE either way:
+   the rb-2859 trap ("versioned" ≠ "archived") made STRUCTURAL by permission.
+   When the specific config reads
    step 2 requires return access-denied, do NOT treat versioning/soft-delete as
    a recovery layer at all — proceed as if it does not exist: the independent
    current-version-copy archive in step 3 (retention-immune, needs only
    object-level read/write) becomes MANDATORY, not optional, and IS the recovery
-   layer. Never let a readable on/off flag substitute for the unreadable
-   retention rule that actually governs survival.
+   layer. Never let ANY readable sub-part stand in for the unreadable one that
+   governs survival.
 3. **Archive independently, outside the blast radius.** COPY (never move) to
    a location that (a) the live system does not read, sync, or restore from,
    and (b) no retention clock touches: a cold archive prefix outside the
@@ -105,10 +106,10 @@ its owner, tmp files this session created, or append-only writes.
 - Deleting first and verifying the recovery layer afterward (the exact
   ordering failure the canonical incident demonstrates)
 - "The store is versioned, so it's safe" without reading its retention rules
-- "Versioning reads as enabled, so it's safe" when the lifecycle/retention
-  rules or the version list are permission-denied — a readable on/off flag does
-  not prove noncurrent versions survive; the recovery layer is unverifiable, so
-  the current-version-copy archive is mandatory (g-115-2692)
+- Reading whichever sub-part your principal CAN see as the verdict, when any
+  other one is permission-denied — the readable half never proves noncurrent
+  versions survive, whichever half that is; the layer is unverifiable, so the
+  current-version-copy archive is mandatory (g-115-2692, g-115-4624)
 - Treating user authorization ("go ahead and purge") as waiving the archive
   step — authorization sets the GOAL; this protocol sets the METHOD
 - Archiving by moving (a move is a delete of the original)

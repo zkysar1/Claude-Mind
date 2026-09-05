@@ -255,10 +255,14 @@ def test_scorer_uses_embedding_bonus_over_tfidf():
                                         query_text="q", all_nodes=None,
                                         emb_scores={"a": 0.1, "b": 0.9})
     assert [e[0] for e in out] == ["b", "a"]
-    # And the bonus magnitude reflects COSINE_BONUS_WEIGHT * cosine.
+    # And the bonus magnitude reflects the CONFIGURED embedding weight * cosine
+    # (tree.yaml retrieval: embedding_cosine_bonus_weight, 2026-09-03 — the
+    # real-embedding path no longer uses the TF-IDF COSINE_BONUS_WEIGHT; see
+    # test_embedding_cosine_bonus_weight.py for the absent-key fallback).
     eff = {e[0]: e[4] for e in out}  # base score at index 4
     assert eff["b"] - eff["a"] == pytest.approx(
-        _retrieve.COSINE_BONUS_WEIGHT * 0.8, abs=1e-6)
+        _retrieve._DEFAULT_RETRIEVAL_CFG["embedding_cosine_bonus_weight"] * 0.8,
+        abs=1e-6)
 
 
 def test_scorer_without_emb_scores_unchanged_shape():

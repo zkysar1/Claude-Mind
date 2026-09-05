@@ -29,11 +29,10 @@ below live in `core/config/conventions/negative-conclusions.md`
    without running `infra-health.sh check <component>`.
 4. **Silent failure awareness**: Commands with silent-failure flags (`-sf`, `-q`,
    `2>/dev/null`) are ZERO signals, not one. A silently-failed command that
-   returns empty output has told you nothing. **A hand-written parser over a
-   framework script's output is the same class** — a `try/except` (or
-   `|| echo 0`) around a parse you wrote this turn converts a shape mismatch
-   into a confident zero, and sibling scripts do not agree on shape (JSONL vs
-   pretty-printed array). Before writing the parser, print the SHAPE and the
+   returns empty output has told you nothing. **A `try/except` or `|| echo 0`
+   around a parse you wrote this turn is the same class** — sibling scripts
+   disagree on output shape, so it converts a mismatch into a confident zero.
+   Before writing the parser, print the SHAPE and the
    BYTE COUNT beside the record count in the same call: `bytes: 8044449`
    next to `records: 0` is self-refuting. (guard-2298; do not expect retrieval
    to surface this — it fires 932:4.)
@@ -65,6 +64,9 @@ NOT be stated as fact. Enforced by `core/scripts/positive-state-gate.py`
 (aspirations-verify Q1; advisory in agent-completion-report and
 aspirations-state-update Step 8.75). Canonical incident: "handoff.yaml
 reflects session 50" narrated from a summary while the file did not exist.
+
+A positive claim about the WORLD written into a knowledge node is the third
+positive class — see `.claude/rules/ground-truth-citation.md` (path-scoped).
 
 ## Post-Insertion Verification
 
@@ -99,12 +101,10 @@ Same-turn evidence, or no causal connector, on every surface the convention
 lists (rb-734).
 
 **Place the hedge where it survives, and scope the work to the measured half.**
-A guardrail survey shows the head of `rule` — `--summary` prints it even for the
-~12% that carry a `title` — and guard-1421 measured the imperative past that
-slice 85% of the time. So put the uncertainty in a goal's TITLE and in a
-guardrail `rule`'s FIRST clause; mid-field it reads as certainty. Then scope the
-deliverable to whichever half is MEASURED — it must stay correct if the
-inferred mechanism is falsified.
+Put the uncertainty in a goal's TITLE and in a guardrail `rule`'s FIRST clause: a
+survey shows only that head, so mid-field it reads as certainty (guard-1421 —
+measured, in the convention). Then scope the deliverable to whichever half is
+MEASURED — it must stay correct if the inferred mechanism is falsified.
 
 ## Capability-Absence Claims ("Y Needs To Be Built")
 

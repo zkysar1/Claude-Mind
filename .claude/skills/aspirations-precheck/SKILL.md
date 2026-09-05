@@ -135,6 +135,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5b.20 | phantom-goal-audit | deferrable | `py -3 core/scripts/phantom-goal-audit.py audit` (positional REQUIRED; no `--json` flag exists) |
 | 0.5b.21 | hardcoded-scope-audit | deferrable | `source core/scripts/_paths.sh && py -3 core/scripts/hardcoded-scope-audit.py --json` (the `source` is load-bearing) |
 | 0.5b.22 | closed-against-own-note-check | deferrable | `bash core/scripts/closed-against-own-note-check.sh --min-confidence high` (report-only BY DESIGN — no --apply path exists and none may be added: a wrong auto-close is not cheap. HIGH tier only — medium precision is ~50% because "reopened" fires on ordinary prose. `--json`, NOT `--output json`) |
+| 0.5b.23 | abandoned-claim-check | deferrable | `bash core/scripts/abandoned-claim-check.sh` (`.sh` REQUIRED — guard-3864: only the wrapper makes the read AUTHORITATIVE. Report-only) |
 | 0.5c | recurring-precondition-sweep | deferrable | `py -3 core/scripts/recurring-precondition-sweep.py` (.py ONLY — no .sh wrapper exists) |
 | 0.5c.1 | recurring-starvation-check | medium | `bash core/scripts/recurring-starvation-check.sh --apply --max-file 1` |
 | 0.5e | fresh-eyes-cadence | deferrable | checked inside `bash core/scripts/precheck-cadence-battery.sh` (Phase 0.5e Cadence Battery) — do NOT meter-check or invoke separately |
@@ -161,7 +162,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5k.8 | hook-slot-contract-check | deferrable | `py -3 core/scripts/hook-slot-contract-check.py` (rc=1 IS a finding) |
 | 0.5k.9 | narrative-clobber-audit | deferrable | `py -3 core/scripts/narrative-clobber-audit.py` |
 | 0.5k.10 | guardrail-pair-audit | deferrable | `bash core/scripts/guardrail-pair-audit.sh` (.sh REQUIRED — guard-3864) |
-| 0.5k.11 | dropped-field-audit | deferrable | `py -3 core/scripts/dropped-field-audit.py` (~29s) |
+| 0.5k.11 | dropped-field-audit | deferrable | `py -3 core/scripts/dropped-field-audit.py` (169s) |
 | 0.5k.12 | unchecked-write-ratchet | deferrable | `bash core/scripts/unchecked-write-ratchet.sh` (.sh REQUIRED) |
 | 0.5k.13 | tree-last-updated-drift-check | deferrable | `py -3 core/scripts/tree-last-updated-drift-check.py` |
 | 0.5k.14 | goal-field-census-ratchet | deferrable | `bash core/scripts/goal-field-census-ratchet.sh` (.sh REQUIRED) |
@@ -170,6 +171,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5k.17 | tree-adjudication-scan | deferrable | `py -3 core/scripts/tree-adjudication-scan.py` |
 | 0.5k.18 | displaced-id-audit | deferrable | `py -3 core/scripts/displaced-id-audit.py` (~13s) |
 | 0.5k.19 | repo-hygiene-sweep | deferrable | `bash core/scripts/repo-hygiene-sweep.sh` (~77s — needs >=120s bound; g-115-8361) |
+| 0.5k.20 | stalled-goal-ratchet | deferrable | `bash core/scripts/stalled-goal-ratchet.sh` (~60s — needs >=120s bound). The only lane bounding TOTAL non-executable time, not one block class. `--dry-run --json` for rows (summary on stderr) |
 
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
@@ -1628,9 +1630,14 @@ IF decision == "drop": SKIP; continue to Phase 0.5b.21
 ▸ Body in `core/config/aspirations-precheck-digest.md` (§ Phases 0.5b.19-0.5b.21) — `bash core/scripts/load-precheck-digest.sh`. g-115-6583.
 
 ## Phase 0.5b.21: Hardcoded-Scope Audit (g-115-7871)
-IF decision == "drop": SKIP; continue to Phase 0.5c
+IF decision == "drop": SKIP; continue to Phase 0.5b.23
 
 ▸ Body in `core/config/aspirations-precheck-digest.md` (§ Phases 0.5b.19-0.5b.21) — `bash core/scripts/load-precheck-digest.sh`. g-115-6583.
+
+## Phase 0.5b.23: Abandoned-Claim Detector (g-306-445)
+IF decision == "drop": SKIP; continue to Phase 0.5c
+
+▸ Body in `core/config/aspirations-precheck-digest.md` (§ Phase 0.5b.23) — `bash core/scripts/load-precheck-digest.sh`. g-306-445.
 
 ## Phase 0.5c: Recurring-Goal Precondition-Filter lastAchievedAt Sweep
 IF decision == "drop": SKIP this phase; continue to Phase 0.5c.1

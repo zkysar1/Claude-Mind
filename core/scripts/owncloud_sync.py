@@ -2558,6 +2558,12 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
 
     if dry_run:
         stats["would_pull"] += 1
+        # Name them, don't just count them (g-115-8929): a dry-run that reports
+        # "6 files differ" tells an operator a box is stale without telling it
+        # WHICH scripts it has been executing stale, and a one-sided warning that
+        # names neither side is the guard-4421 shape. setdefault so callers whose
+        # stats dict predates the key are unaffected.
+        stats.setdefault("would_pull_files", []).append(str(full))
         return None
     if snapshot_first:
         _snapshot_before_pull(full)
@@ -2909,6 +2915,20 @@ def pull_temp(be, agent: str, *, dry_run: bool = False,
 # eagerly would bloat every fresh boot.
 _FIRMWARE_SUBPATHS = (("world", "scripts"),)
 
+# How long a written marker suppresses re-materialization (g-115-8929). The
+# marker is a COST throttle, NOT a freshness signal: inside the window a warm
+# boot still costs ~1 stat, and past it the SAME _pull_one md5-vs-ETag compare
+# decides per file whether anything is actually stale (rb-190 -- content, never
+# mtime). Before this bound the marker was PERMANENT, so a box that had ever
+# materialized never refreshed world/scripts again -- a box returning from a
+# wedge, an outage or a restore came back executing whatever scripts it had,
+# silently. That silence IS the defect, and the asymmetry is why: a stale DATA
+# shard yields a wrong READING that downstream logic already distrusts, while a
+# stale SCRIPT yields wrong BEHAVIOUR that nothing distrusts. 6h matches the
+# fleet's other staleness floor (check-team-state-before-silent.md); set too
+# high the cost is unbounded staleness, too low an S3 walk of one small subtree.
+_FIRMWARE_RECHECK_SECONDS = 6 * 3600
+
 
 def _materialize_tree(be, root_path: Path, cur: Path, prefix: str, *,
                       stats: dict, manifest: dict, new_manifest: dict,
@@ -2973,17 +2993,24 @@ def materialize_firmware(be, project_root, *, dry_run: bool = False,
     """Fresh-box firmware materialization (g-328-13).
 
     Pull the governed non-agent firmware subtrees (`_FIRMWARE_SUBPATHS`, i.e.
-    `world/scripts`) from S3 to local ONCE per box, so bare-bash `world/scripts/
-    *.sh` and plain-cat reads work on day 1 of a fresh own-cloud clone. Reuses
+    `world/scripts`) from S3 to local on a fresh box -- and again whenever the
+    marker has aged out -- so bare-bash `world/scripts/*.sh` and plain-cat reads
+    work on day 1 of a fresh own-cloud clone AND stay current afterwards. Reuses
     `_pull_one`'s no-clobber baseline gate, so it never overwrites an
     init-written default (no baseline + local differs -> S3 authoritative, pull;
     but a genuinely unpushed local edit -> skip) or a peer's cache.
 
-    own-cloud only (no-op on local — the local files ARE the store). One-time per
-    box via a machine-local marker (`mind_api/state/.firmware-materialized`,
-    which is NOT synced), written ONLY after a clean (error-free) pass so a
-    partial failure retries on the next daemon start. `force=True` re-runs
-    ignoring the marker (test hook / manual re-materialize).
+    own-cloud only (no-op on local — the local files ARE the store). Throttled by
+    a machine-local marker (`mind_api/state/.firmware-materialized`, which is NOT
+    synced), written ONLY after a clean (error-free) pass so a partial failure
+    retries on the next daemon start. The marker BOUNDS the recheck rather than
+    ending it: once it is older than `_FIRMWARE_RECHECK_SECONDS` the walk runs
+    again, so a box returning from a wedge/outage/restore refetches instead of
+    executing stale scripts forever (g-115-8929). S3 is the leading side on that
+    recheck — `_pull_one` pulls only where the store's content differs AND the
+    local copy is unmodified since its last reconcile, so an unpushed local edit
+    is never clobbered. `force=True` re-runs ignoring the marker entirely (test
+    hook / manual re-materialize).
 
     Called from the background owncloud-sync thread AFTER the daemon is already
     serving (see mind_api/src/__main__._start_owncloud_sync_thread), so a slow
@@ -2994,14 +3021,27 @@ def materialize_firmware(be, project_root, *, dry_run: bool = False,
              "materialized_roots": [], "scanned": 0, "pulled": 0, "in_sync": 0,
              "would_pull": 0, "s3_absent": 0, "local_ahead_skipped": 0,
              "multipart_deferred": 0, "errors": 0, "pulled_files": [],
-             "skipped": None}
+             "would_pull_files": [], "skipped": None, "recheck": False,
+             "marker_age_seconds": None}
     if stats["backend"] != "own-cloud":
         stats["skipped"] = "local backend (no-op)"
         return stats
     marker = Path(project_root) / "mind_api" / "state" / ".firmware-materialized"
-    if marker.exists() and not force:
-        stats["skipped"] = "already materialized (marker present)"
-        return stats
+    try:
+        marker_age = time.time() - marker.stat().st_mtime
+    except OSError:
+        marker_age = None  # absent (fresh box) or unreadable -> materialize
+    if marker_age is not None:
+        stats["marker_age_seconds"] = int(marker_age)
+        # A marker stamped in the FUTURE (clock skew) reads negative and lands
+        # here as "inside the window" -- deliberately the conservative side: a
+        # skipped recheck costs one cycle of staleness, a spurious S3 walk on a
+        # skewed clock would repeat every daemon start.
+        if marker_age < _FIRMWARE_RECHECK_SECONDS and not force:
+            stats["skipped"] = (f"within recheck window ({int(marker_age)}s < "
+                                f"{_FIRMWARE_RECHECK_SECONDS}s since materialize)")
+            return stats
+        stats["recheck"] = True
 
     manifest = _load_manifest()
     new_manifest = dict(manifest)

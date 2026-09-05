@@ -1652,16 +1652,19 @@ def test_materialize_firmware_pulls_world_scripts(tmp_path, monkeypatch):
     assert (tmp_path / "mind_api" / "state" / ".firmware-materialized").exists()
 
 
-def test_materialize_firmware_marker_skips_rerun(tmp_path, monkeypatch):
-    # Second run with the marker present is a one-stat no-op — a script added to S3
-    # AFTER the first materialization is NOT pulled (one-time-per-box semantics).
+def test_materialize_firmware_marker_skips_rerun_inside_window(tmp_path, monkeypatch):
+    # A re-run INSIDE the recheck window is a one-stat no-op — the marker is a COST
+    # throttle, so a script added to S3 seconds after the first materialization is
+    # not pulled until the window elapses. (Before  this skip was
+    # PERMANENT; the assertion below now pins the window, not "forever".)
     monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
     monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
     be, world = _fw_backend(tmp_path, {"scripts/email-send.sh": b"x"})
     _mod.materialize_firmware(be, tmp_path)  # first run writes the marker
     be.s3[str(world / "scripts" / "new.sh")] = b"new"
     stats = _mod.materialize_firmware(be, tmp_path)
-    assert stats["skipped"] == "already materialized (marker present)"
+    assert stats["skipped"].startswith("within recheck window")
+    assert stats["recheck"] is False
     assert stats["pulled"] == 0
     assert not (world / "scripts" / "new.sh").exists()
 
@@ -1675,6 +1678,93 @@ def test_materialize_firmware_force_ignores_marker(tmp_path, monkeypatch):
     stats = _mod.materialize_firmware(be, tmp_path, force=True)
     assert stats["skipped"] is None
     assert (world / "scripts" / "new.sh").exists()
+
+
+def _age_marker(tmp_path, seconds):
+    """Backdate the machine-local materialize marker by `seconds`. This is how a
+    box that has been AWAY (wedged, powered off, restored from a clone) looks on
+    its next daemon start — the artifact staled and the effect measured are both
+    box-local, so the probe stays in scope (guard-2585)."""
+    marker = tmp_path / "mind_api" / "state" / ".firmware-materialized"
+    st = marker.stat()
+    os.utime(marker, (st.st_atime - seconds, st.st_mtime - seconds))
+    return marker
+
+
+def test_materialize_firmware_rechecks_after_marker_ages_out(tmp_path, monkeypatch):
+    #  OUTCOME 1: a box whose world/scripts mirror is stale refetches on
+    # its next start. Before/after probe — the SAME local path holds the old bytes
+    # before the aged-out run and the store's bytes after it.
+    # OUTCOME 2: the refresh covers world SCRIPTS specifically (asserted on
+    # materialized_roots), not continuity-tier session files.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    be, world = _fw_backend(tmp_path, {"scripts/email-send.sh": b"#!/bin/sh\nv1\n"})
+    _mod.materialize_firmware(be, tmp_path)
+    local = world / "scripts" / "email-send.sh"
+    assert local.read_bytes() == b"#!/bin/sh\nv1\n"          # BEFORE
+
+    # The fleet moved the script forward while this box was away.
+    be.s3[str(local)] = b"#!/bin/sh\nv2\n"
+    be.s3[str(world / "scripts" / "added-while-away.sh")] = b"new\n"
+    _age_marker(tmp_path, _mod._FIRMWARE_RECHECK_SECONDS + 60)
+
+    stats = _mod.materialize_firmware(be, tmp_path)
+    assert stats["skipped"] is None
+    assert stats["recheck"] is True
+    assert stats["marker_age_seconds"] >= _mod._FIRMWARE_RECHECK_SECONDS
+    assert local.read_bytes() == b"#!/bin/sh\nv2\n"          # AFTER — refetched
+    assert (world / "scripts" / "added-while-away.sh").exists()
+    assert stats["materialized_roots"] == ["world/scripts"]   # SCRIPTS, not sessions
+
+
+def test_materialize_firmware_recheck_on_fresh_box_pulls_nothing(tmp_path, monkeypatch):
+    #  OUTCOME 3 (negative control): a box that is ALREADY current pays
+    # the walk but refetches nothing, so the caller — which prints only when
+    # `pulled` or `errors` is non-zero — stays silent.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    be, world = _fw_backend(tmp_path, {
+        "scripts/email-send.sh": b"a\n", "scripts/output-style-mode-guard.sh": b"b\n"})
+    first = _mod.materialize_firmware(be, tmp_path)
+    assert first["pulled"] == 2
+    _age_marker(tmp_path, _mod._FIRMWARE_RECHECK_SECONDS + 60)
+
+    stats = _mod.materialize_firmware(be, tmp_path)   # nothing changed in S3
+    assert stats["recheck"] is True
+    assert stats["pulled"] == 0                       # no unnecessary refetch
+    assert stats["in_sync"] == 2                      # both compared, both current
+    assert stats["errors"] == 0
+
+
+def test_materialize_firmware_recheck_restamps_marker(tmp_path, monkeypatch):
+    # A clean recheck RE-STAMPS the marker, restarting the window. Without this the
+    # first expiry would make every subsequent daemon start walk S3 forever, which
+    # is the cost the marker exists to bound.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    be, world = _fw_backend(tmp_path, {"scripts/email-send.sh": b"x"})
+    _mod.materialize_firmware(be, tmp_path)
+    marker = _age_marker(tmp_path, _mod._FIRMWARE_RECHECK_SECONDS + 60)
+    aged_mtime = marker.stat().st_mtime
+
+    assert _mod.materialize_firmware(be, tmp_path)["recheck"] is True
+    assert marker.stat().st_mtime > aged_mtime        # window restarted
+    # ...and the very next start is back to the one-stat skip.
+    assert _mod.materialize_firmware(be, tmp_path)["skipped"].startswith(
+        "within recheck window")
+
+
+def test_materialize_firmware_unreadable_marker_materializes(tmp_path, monkeypatch):
+    # A marker that cannot be stat'd is treated as ABSENT (materialize), never as
+    # "recently materialized" — an unreadable throttle must not pin a box to stale
+    # scripts. Absent marker == the fresh-box path, so recheck stays False.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    be, world = _fw_backend(tmp_path, {"scripts/email-send.sh": b"x"})
+    stats = _mod.materialize_firmware(be, tmp_path)
+    assert stats["marker_age_seconds"] is None and stats["recheck"] is False
+    assert stats["pulled"] == 1
 
 
 def test_materialize_firmware_no_clobber_unpushed_local(tmp_path, monkeypatch):

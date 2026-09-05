@@ -173,41 +173,22 @@ FOR EACH directive in new_directives:   # ONLY unseen directives — dedup by co
     echo "Acknowledged directive {directive.id}" | \
       Bash: board-post.sh --channel coordination --type status \
         --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}"
-# Build the honor set from ALL active directives in all_directives (acked or not): a directive is
-# DIRECTED AT THIS AGENT when its tags include AGENT_NAME (bare) or requires_action_by:{AGENT_NAME}
-# — OR its text names this agent AND the directive carries NO explicit routing tag (g-115-2870).
-# An explicit routing tag (any requires_action_by:* tag, OR a bare tag that is another known
-# agent's name) takes PRECEDENCE over a loose prose mention: a directive routed to agent X but
-# naming agent Y in an exclusionary clause ("X please claim; Y cannot do it") must NOT flag Y,
-# and a self-authored directive (author names self in prose) must not flag the author. The
-# prose-mention fallback fires ONLY when no routing tag is present. Each of a directed
-# directive's target:{goal-id} tags names a goal this agent is tasked to prioritize.
-# (Mirrors goal-selector.py emit_directive_honor_banner exactly so both enforcement points agree.)
-#
-# BOTH ADDRESSING FORMS COUNT (g-115-4188). A routing tag may be bare
-# (`<AGENT>`, `requires_action_by:<AGENT>`) or @env-QUALIFIED
-# (`<AGENT>@<ENV-ID>`, `requires_action_by:<AGENT>@<ENV-ID>`). Split on the
-# FIRST `@` — every registry env-id contains a hyphen, so a hyphen-joined form
-# cannot be split back unambiguously. Then:
-#   agent-part != AGENT_NAME                      -> not for me
-#   no @ qualifier (bare)                         -> for me (unchanged behavior)
-#   @qualifier == this deployment's ENVIRONMENT_ID -> for me
-#   @qualifier == some OTHER deployment's env-id   -> NOT for me, it is a peer
-# Do NOT shortcut this by comparing only the text before the `@`: that admits a
-# PEER deployment's same-named agent as if it were the local one (guard-2860 —
-# never relax an ownership predicate to a pattern). If ENVIRONMENT_ID is
-# unresolvable, treat a qualified tag as FOR ME: this path only prints a
-# MUST-SELECT advisory, so a false positive is one dismissible line while a
-# false negative is the silent lane-skip guard-1310 exists to prevent.
-# The qualified form is what cross-deployment-channel.md RECOMMENDS for an agent
-# name more than one deployment declares, and insight-trigger-sweep.py actively
-# tells posters to write it — so an exact-string test makes the very form the
-# convention recommends invisible here. Canonical implementation (import it, do
-# not re-derive it): peer_surface.routing_tag_targets_agent.
-FOR EACH directive in all_directives WHERE it is directed at this agent
-        (tag AGENT_NAME / requires_action_by:{AGENT_NAME}, in either the bare or
-         the @ENVIRONMENT_ID-qualified form, OR text names agent ONLY WHEN no
-         explicit routing tag is present) AND still active:
+# Build the honor set from ALL active directives in all_directives (acked or not). A directive is
+# DIRECTED AT THIS AGENT by exactly one of these, in order:
+#   1. a requires_action_by:{AGENT_NAME} tag;
+#   2. ONLY when NO requires_action_by: tag is present at all, a bare {AGENT_NAME} tag;
+#   3. ONLY when NO explicit routing tag is present at all, its text names this agent (g-115-2870).
+# Steps 1-2: AN EXPLICIT ADDRESSEE IS THE WHOLE ADDRESSEE SET — board-post.sh stamps the AUTHOR's
+# own name into every post, so a bare-name match on an already-addressed directive makes an agent
+# honor work assigned to someone else (g-115-8827). Either tag form may be bare or
+# @ENVIRONMENT_ID-qualified (g-115-4188); compare component-wise, never as a prefix (guard-2860).
+# Canonical implementation — import it, do not re-derive it: peer_surface.routing_tag_targets_agent,
+# which goal-selector.py emit_directive_honor_banner calls, so both enforcement points agree.
+# Each of a directed directive's target:{goal-id} tags names a goal this agent must prioritize.
+# Rationale (WHY the addressee set is exclusive, the @-qualified table, the precedence example):
+# core/config/rationale/directive-honor-addressee-set.md
+FOR EACH directive in all_directives WHERE it is directed at this agent (steps 1-3 above)
+        AND still active:
     FOR EACH "target:{goal-id}" tag: directive_targeted_goals[goal-id] = directive.id
 
 # ── DIRECTIVE-HONOR HARD RULE (guard-1310 — the residual LLM-path gap) ──

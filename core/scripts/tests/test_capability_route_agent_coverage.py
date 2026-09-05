@@ -149,7 +149,8 @@ def test_merged_specialist_present_in_live_route_tables():
 def test_existing_routes_intact():
     if not cr.TITLE_PREFIX_ROUTES:
         pytest.skip("capability-routing overlay absent (fresh deployment)")
-    assert cr.evaluate("Investigate: flaky selector")["intended_agent"] == "zeta"
+    # 'either' since  (2026-09-04) — Investigate: routes by category.
+    assert cr.evaluate("Investigate: flaky selector")["intended_agent"] == "either"
     assert cr.evaluate("Build: new daemon endpoint")["intended_agent"] == "alpha"
     if "arc-agi-3" in cr.CATEGORY_ROUTES:
         assert cr.evaluate("x", category="arc-agi-3")["intended_agent"] == "echo"

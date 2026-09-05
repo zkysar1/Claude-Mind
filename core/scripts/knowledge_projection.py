@@ -45,6 +45,8 @@ redacted husk.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -87,6 +89,18 @@ _GOAL_PUBLIC_STATUS: dict[str, str] = {
 #: Cap on a projected goal title. Bounds a malformed record; it is not the filter —
 #: :func:`project_goals` is.
 _GOAL_TITLE_CAP = 200
+
+#: Hex characters kept from a goal handle's HMAC (:func:`goal_handle`). 16 hex chars is
+#: 64 bits: over a queue of a few hundred exposed goals a collision sits around 1e-15,
+#: and a collision is not a silent wrong answer here anyway — :func:`resolve_goal_handle`
+#: returns ``None`` when two exposed goals share a handle, so the failure mode is "does
+#: nothing", never "mutates the wrong member's goal". Short on purpose: this is an
+#: ADDRESSING token that rides in a URL or a JSON body, not a credential.
+#: Two incidental safety properties worth keeping if this number ever moves: hex caps at
+#: 4.0 bits/char, under :data:`_ENTROPY_THRESHOLD`, and 16 is under
+#: :data:`_ENTROPY_MIN_LEN` — so a handle cannot be eaten by the high-entropy catch-all
+#: if a future caller ever routes it through :func:`redact`.
+_GOAL_HANDLE_HEX = 16
 
 #: The count keys that represent actual KNOWLEDGE. The broken-export refusal in
 #: knowledge-export's ``main()`` fires when every one of these is zero over a world that
@@ -373,6 +387,9 @@ def is_exposed_by_category(entry: Mapping[str, object], allow: frozenset[str]) -
 def project_goals(
     goals: Iterable[Mapping[str, object]],
     redactor: "Redactor",
+    *,
+    handle_secret: str = "",
+    environment_id: str = "",
 ) -> list[dict[str, object]]:
     """Project the goal queue down to the customer-facing "what is planned" view.
 
@@ -385,6 +402,15 @@ def project_goals(
     partner-agent names), and its ``title`` routinely names internal scripts. So this is
     an ALLOWLIST of three fields and everything else is dropped — notes, reasons,
     participants, claim data, priority, scores, ids and aspiration linkage never appear.
+
+    A FOURTH field, ``handle``, is emitted only when ``handle_secret`` is supplied. It is
+    an opaque per-environment HMAC of the goal id (:func:`goal_handle`) and exists so a
+    member-facing WRITE can say WHICH goal without the board carrying an id — the gap
+    that blocked the Planned-board verbs. It does not widen the allowlist: no additional
+    goal FIELD is read, the id itself is not recoverable from it, and with no secret
+    configured the row is byte-identical to the three-field shape. Title matching was the
+    obvious alternative and is REJECTED: titles are capped at :data:`_GOAL_TITLE_CAP`,
+    redactor-rewritten and not unique, so a near-miss mutates the wrong member's goal.
 
     Gate 1 is ``work_class``: only ``product`` is exposed. The queue is overwhelmingly
     framework plumbing, and publishing that would show a member the agent's own
@@ -422,27 +448,147 @@ def project_goals(
     """
     out: list[dict[str, object]] = []
     for g in goals:
-        if str(g.get("work_class") or "").strip().lower() not in _EXPOSED_WORK_CLASSES:
+        row = _exposed_goal(g, redactor)
+        if row is None:
             continue
-        status = _GOAL_PUBLIC_STATUS.get(str(g.get("status") or "").strip().lower())
-        if status is None:
-            continue
-        title = redactor(str(g.get("title") or "")).strip()
-        if not title:
-            continue
-        out.append(
-            {
-                "title": title[:_GOAL_TITLE_CAP],
-                "status": status,
-                # NOT redacted, for the same reason tree `last_updated` is not: an ISO
-                # date carries no secret and no agent name. "" when absent, so a
-                # consumer must read "" as unknown rather than as old.
-                "updated": str(
-                    g.get("completed_date") or g.get("started") or g.get("created_at") or ""
-                ),
-            }
-        )
+        # Fail closed: no secret configured -> no handle key at all, so the emitted row
+        # is byte-identical to the three-field shape every existing consumer already
+        # reads. There is deliberately NO fallback to the goal id here; an unaddressable
+        # board is the safe degradation, a published id is not.
+        if handle_secret:
+            handle = goal_handle(_goal_id_of(g), handle_secret, environment_id)
+            if handle:
+                row["handle"] = handle
+        out.append(row)
     return out
+
+
+def _goal_id_of(goal: Mapping[str, object]) -> str:
+    """The goal's own id, read from the field the RAW store actually carries.
+
+    MEASURED 2026-09-04 over the live world queue (2,887 goal records read through
+    ``knowledge-export._read_goals``, the canonical reader): **2,887 carry ``id`` and 0
+    carry ``goal_id``**. ``goal_id`` is synthesised by the QUERY layer, so a reader who
+    checks a goal through ``aspirations-query.sh`` sees both keys and would naturally
+    reach for ``goal_id`` first — against the store, that resolves to nothing and every
+    handle silently disappears (the projection would simply emit no ``handle``, which
+    looks exactly like "no secret configured"). Hence the order below, and hence this
+    note: do not "tidy" it the other way round without re-measuring the STORE.
+    """
+    return str(goal.get("id") or goal.get("goal_id") or "").strip()
+
+
+def goal_handle(goal_id: str, secret: str, environment_id: str = "") -> str:
+    """An opaque, per-environment handle for one goal id — or ``""`` when unavailable.
+
+    A truncated HMAC-SHA256 of the goal id under a per-environment ``secret``. It exists
+    so a member-facing write ("pause THIS one") can name a target without the board ever
+    carrying an id, which :func:`project_goals` strips by design.
+
+    Three properties, all of which the caller depends on:
+
+    * **The id is not recoverable.** HMAC is preimage-resistant, and the goal-id space is
+      small enough to enumerate (``g-NNN-NNNN``) — so the *key* is what makes this true,
+      not the hash. A publicly-derivable key would let anyone brute-force the id space and
+      invert the handle. Never derive ``secret`` from a published value.
+    * **No cross-environment correlation.** ``environment_id`` is mixed into the MESSAGE
+      (not just relied upon through the key), so the same goal id in two environments
+      yields two unrelated handles even if an operator provisions one secret fleet-wide.
+    * **No stored mapping.** The box recomputes handles over its own goals to resolve one
+      (:func:`resolve_goal_handle`), so there is no side table to keep in sync, migrate,
+      or leak.
+
+    Returns ``""`` on an empty id or an empty secret — fail closed, so an unprovisioned
+    box publishes a board with no handles rather than one with a guessable token.
+
+    ⚠ OPERATIONAL: every box serving one ``environment_id`` must hold the SAME secret.
+    The export can run on one box and the write can land on another; with divergent
+    secrets the handle computed at export never matches the one computed at resolve, and
+    the failure is silent-and-correct (the write resolves to nothing and is dropped).
+    """
+    gid = str(goal_id or "").strip()
+    key = str(secret or "")
+    if not gid or not key:
+        return ""
+    # NUL-separated so ("env", "g-1-2") and ("envg", "-1-2") cannot collide.
+    msg = f"{str(environment_id or '').strip()}\x00{gid}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:_GOAL_HANDLE_HEX]
+
+
+def _exposed_goal(
+    goal: Mapping[str, object], redactor: "Redactor"
+) -> dict[str, object] | None:
+    """The projected row for one goal, or ``None`` when the goal is not exposable.
+
+    THE single exposure predicate. :func:`project_goals` and :func:`resolve_goal_handle`
+    both route through it so the set a member can SEE and the set a member can ADDRESS are
+    the same set by construction rather than by two implementations agreeing. Splitting
+    them would let a handle resolve to a goal that was never published — the fail-open
+    direction, and the one nothing would alert on.
+    """
+    if str(goal.get("work_class") or "").strip().lower() not in _EXPOSED_WORK_CLASSES:
+        return None
+    status = _GOAL_PUBLIC_STATUS.get(str(goal.get("status") or "").strip().lower())
+    if status is None:
+        return None
+    title = redactor(str(goal.get("title") or "")).strip()
+    if not title:
+        return None
+    return {
+        "title": title[:_GOAL_TITLE_CAP],
+        "status": status,
+        # NOT redacted, for the same reason tree `last_updated` is not: an ISO
+        # date carries no secret and no agent name. "" when absent, so a
+        # consumer must read "" as unknown rather than as old.
+        "updated": str(
+            goal.get("completed_date") or goal.get("started") or goal.get("created_at") or ""
+        ),
+    }
+
+
+def resolve_goal_handle(
+    handle: str,
+    goals: Iterable[Mapping[str, object]],
+    secret: str,
+    redactor: "Redactor",
+    environment_id: str = "",
+) -> str | None:
+    """Resolve an inbound handle back to exactly ONE goal id, or ``None``.
+
+    The box-side half of :func:`goal_handle`: recompute the handle over the goals this box
+    holds and return the id of the one that matches. No stored mapping is read or written.
+
+    Every branch that is not "exactly one exposed goal matches" returns ``None``, because
+    the caller is a WRITE path against live member data and a near-miss there mutates the
+    wrong member's goal:
+
+    * unknown handle → ``None``; a handle for a goal that has since stopped being
+      exposable (status moved out of :data:`_GOAL_PUBLIC_STATUS`, work_class re-tagged)
+      also stops resolving, by the same predicate that stopped publishing it;
+    * two exposed goals sharing a handle → ``None``, never an arbitrary pick;
+    * empty handle or unconfigured secret → ``None``, so an unprovisioned box refuses
+      every addressed write instead of resolving them all to the same goal.
+
+    Comparison is :func:`hmac.compare_digest` rather than ``==``: a dict lookup keyed on
+    the handle would be shorter, and would also hand an attacker a timing oracle over the
+    one token that addresses a member's goal. The scan is O(goals) over a few hundred
+    records — the cost is not worth the oracle.
+    """
+    want = str(handle or "").strip().lower()
+    if not want or not secret:
+        return None
+    found: str | None = None
+    for g in goals:
+        if _exposed_goal(g, redactor) is None:
+            continue
+        gid = _goal_id_of(g)
+        computed = goal_handle(gid, secret, environment_id)
+        if computed and hmac.compare_digest(computed, want):
+            # A repeated record for the SAME id is not ambiguity; two DIFFERENT ids are.
+            if found is not None and found != gid:
+                return None
+            found = gid
+    return found
 
 
 def project_self(
@@ -616,6 +762,8 @@ def project(
     goals: Iterable[Mapping[str, object]] = (),
     program_front_matter: Mapping[str, object] | None = None,
     program_body: str = "",
+    goal_handle_secret: str = "",
+    environment_id: str = "",
 ) -> ProjectedBundle:
     """Filter + redact all four stores into a :class:`ProjectedBundle`.
 
@@ -631,7 +779,9 @@ def project(
     # gets an empty `agent_self` rather than a changed shape.
     bundle.agent_self = project_self(self_front_matter, self_body, redactor)
     bundle.program = project_program(program_front_matter, program_body, redactor)
-    bundle.goals = project_goals(goals, redactor)
+    bundle.goals = project_goals(
+        goals, redactor, handle_secret=goal_handle_secret, environment_id=environment_id
+    )
     for n in nodes:
         bundle.tree.append(
             {
@@ -696,6 +846,9 @@ __all__ = [
     "project",
     "project_self",
     "project_program",
+    "project_goals",
+    "goal_handle",
+    "resolve_goal_handle",
     "SELF_EXPOSED_FM_FIELDS",
     "PROGRAM_EXPOSED_FM_FIELDS",
     "PROGRAM_PUBLIC_OPEN",

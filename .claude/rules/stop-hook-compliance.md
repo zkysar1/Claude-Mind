@@ -35,9 +35,12 @@ a signal to stop.
    Parameters: `core/config/aspirations.yaml` → `productivity_gate`
    (`min_iterations`, `stop_threshold`). This was the ONLY authorized caller of
    `session-signal-set.sh stop-requested` outside `/stop` until 2026-08-05;
-   `reducer-self-fence.sh` (below) is now the second. Whoever adds a fourth must
-   correct this sentence in the same change — an authoritative-sounding count
-   that has silently gone stale is worse than no count at all.
+   `reducer-self-fence.sh` is the second and `loop-exhaustion-fence.sh` the
+   third (both below). Whoever adds a fourth must correct this sentence in the
+   same change — an authoritative-sounding count that has silently gone stale
+   is worse than no count at all. Count `stop-requested` WRITERS here: the
+   recovery-gate / recovery-yank pair below move `agent-state` instead and are
+   counted separately in their own entries.
 
    <!-- exception added 2026-08-05 for reducer-self-fence (g-306-225) -->
    **Exception**: `core/scripts/reducer-self-fence.sh` (invoked only by
@@ -71,6 +74,30 @@ a signal to stop.
    the two modules are deliberate mirrors with opposite fail-safe directions, and
    `test_reducer_self_fence.py` pins that divergence against the real worker
    module so a future fusion of the two fails loudly.
+
+   <!-- exception added 2026-09-04 for loop-exhaustion-fence (g-115-8939) -->
+   **Exception**: `core/scripts/loop-exhaustion-fence.sh` (invoked only by
+   `stop-hook.sh`, immediately before it builds the BLOCK payload) is authorized
+   to set `stop-requested` when the loop CANNOT EXECUTE. A loop out of context
+   had no legal move but to iterate emptily — measured 2026-09-04 on cc-05:
+   ~35 null iterations over 2h21m, execution-diary mtime frozen throughout,
+   one full model turn per ~40s, because rules 3-4 of this file, the
+   never-self-stop invariant and the unconditional BLOCK are each correct and
+   together leave nothing else legal (USER DIRECTIVE: "the loop needs a branch
+   for 'no context to execute' that isn't 'iterate emptily'").
+   Like its two siblings it MUST write `stop-target-mode` ("assistant") BEFORE
+   setting the signal. The LLM MUST NOT invoke it directly.
+   The decision is script-gated in `core/scripts/loop_exhaustion_fence.py::decide`
+   (pure, fully branch-tested) and keys on a BEHAVIOURAL predicate the model
+   supplies no input to — N consecutive stop-hook BLOCKs for one sid with the
+   execution diary's mtime frozen throughout — so "out of context" is
+   structurally distinguishable from "feels done" and rule 5 is intact. It
+   deliberately does NOT decide on `context-budget-status.py`'s zone: that
+   sensor read `fresh` with 479998 headroom right through the measured
+   exhaustion (its repair is g-115-8310). Two rungs: `pause` at 4 BLOCKs writes
+   NOTHING and only directs the turn to end on a REGISTERED external-wait
+   sleep; `stop` at 10 writes the signal. Every unreadable input HOLDS —
+   stopping a healthy loop is worse than the disease (guard-1562).
 
    <!-- exception added 2026-04-19 for recovery-gate (cross-agent visibility plan) -->
    **Exception**: `core/scripts/recovery-gate.sh` (invoked only by the

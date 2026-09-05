@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.59",
+    "previous_version": "2.12.58",
+    "date": "2026-09-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Plan-completion verdict: on plan completion, clear the plan and answer the user's original question (rule + PostToolUse[ExitPlanMode] reminder hook + 6 tests). Re-cut of v2.12.58 plus two fleet-introduced publishability fixes (forged-skill tag; core/config domain-leak) so seed-preflight passes.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.58",
+    "previous_version": "2.12.57",
+    "date": "2026-09-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Plan-completion verdict: on plan completion, clear the plan and answer the user's original question (always-loaded rule + PostToolUse[ExitPlanMode] reminder hook + 6 tests). Closes the 'plan finished' bare-status handoff gap.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.57",
     "previous_version": "2.12.56",
     "date": "2026-09-03",

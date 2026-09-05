@@ -106,6 +106,48 @@ def _scan(completed_id):
     return blocked, deps
 
 
+def _fetch_goal(goal_id):
+    """The record for one goal id, or None. Same store walk as _scan."""
+    for _source, base in (("world", WORLD_DIR), ("agent", AGENT_DIR)):
+        if base is None:
+            continue
+        path = base / "aspirations.jsonl"
+        if not path.exists():
+            continue
+        for asp in read_jsonl(path):
+            for goal in asp.get("goals", []):
+                if goal.get("id") == goal_id:
+                    return goal
+    return None
+
+
+def _delivery_hold(completed_id):
+    """(held, detail) — must this predecessor's dependents STAY blocked?
+
+    g-306-442. This script performs the transition outcome 1 names: Step 1b
+    flips a dependent `blocked` -> `pending`. Releasing on the predecessor's
+    STATUS alone freed downstream work while its commit existed only on
+    `refs/workers/**`, so the next executor rebuilt work that already existed or
+    built against an interface that had not landed — both silent.
+
+    GATED HERE **AND** in aspirations.py `_clear_stale_blockers` because they are
+    two independent release paths (a gate is only as broad as its entry points).
+    This is the one verify Phase 5 calls, and the only one that restores status.
+
+    Fail-open in every ambiguous case — see _delivery_gate's module docstring for
+    why the fail direction is inverted relative to the prober beneath it.
+    """
+    try:
+        import _delivery_gate as dg
+    except Exception:
+        return False, "delivery gate unavailable"
+    blocker = _fetch_goal(completed_id)
+    if not blocker:
+        return False, "predecessor record not found"
+    state, detail = dg.blocker_delivery_state(blocker)
+    return state == dg.PENDING, detail
+
+
 def _update(source, goal_id, field, value, dry_run):
     """Shell out to aspirations-update-goal.sh.
 
@@ -154,6 +196,11 @@ def main(argv=None):
                     help="output_summary text to inject into dependent goals")
     ap.add_argument("--dry-run", action="store_true",
                     help="scan + report only; perform no writes")
+    ap.add_argument("--ignore-delivery", action="store_true",
+                    help="release dependents even when the predecessor's "
+                         "deliverable is not reachable from origin/main "
+                         "(g-306-442 delivery gate); use when the deliverable "
+                         "is not a commit, or when landing is tracked elsewhere")
     args = ap.parse_args(argv)
 
     completed_id = args.goal
@@ -169,6 +216,57 @@ def main(argv=None):
     unblocked = []
     injected = []
     skipped = []
+    delivery_held = []
+
+    #  delivery gate. Probed ONCE per invocation, not once per
+    # dependent: the verdict is a property of the PREDECESSOR, so a per-match
+    # probe would shell out to git N times for one answer.
+    #
+    # Step 2 is skipped alongside Step 1 on a hold, deliberately. Injecting the
+    # predecessor's output summary and stamping `unblocked_by` would tell the
+    # dependent its input had arrived while the code is still only on a carrier
+    # ref — the same false signal in prose that the status flip makes in
+    # structure. Step 2 is idempotent via its marker, so the next run after the
+    # commit lands performs both halves cleanly.
+    held, hold_detail = (False, "")
+    if not args.ignore_delivery:
+        held, hold_detail = _delivery_hold(completed_id)
+    if held:
+        for source, asp_id, goal in blocked_matches:
+            delivery_held.append({"goal_id": goal.get("id", ""),
+                                  "source": source, "asp_id": asp_id,
+                                  "reason": hold_detail})
+        print(f"dependent-unblock: delivery-hold — {completed_id} is terminal but "
+              f"its deliverable is not reachable ({hold_detail}); "
+              f"{len(delivery_held)} dependent(s) stay blocked",
+              file=sys.stderr)
+        blocked_matches, dep_matches = [], []
+
+    #  release valve — THE HALF THAT MAKES THE HOLD SAFE.
+    # Both gate sites (here and aspirations.py _clear_stale_blockers) fire only
+    # on a predecessor's terminal TRANSITION. A dependent held above has a
+    # predecessor that already made that transition, so nothing would ever look
+    # at it again and the hold would be PERMANENT — a correct safety mechanism
+    # and a correct release path composing into a dead end. This runs the
+    # read-time re-probe on EVERY close, which is why the gate can be trusted to
+    # hold at all. Fail-open by contract: a sweep error must never break a close.
+    delivery_released = []
+    try:
+        import importlib.util
+        _p = Path(__file__).resolve().parent / "delivery-recheck.py"
+        _spec = importlib.util.spec_from_file_location("_delivery_recheck",
+                                                       str(_p))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        delivery_released = _mod.sweep(apply=not args.dry_run,
+                                       update=_update)["released"]
+        if delivery_released:
+            print(f"dependent-unblock: delivery-recheck released "
+                  f"{len(delivery_released)} previously-held dependent(s)",
+                  file=sys.stderr)
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"dependent-unblock: delivery-recheck skipped ({exc})",
+              file=sys.stderr)
 
     # Step 1: blocked_by cleanup. Remove completed_id from each match.
     for source, asp_id, goal in blocked_matches:
@@ -253,6 +351,14 @@ def main(argv=None):
         "unblocked": unblocked,
         "injected": injected,
         "skipped": skipped,
+        # : dependents deliberately NOT released because the
+        # predecessor's deliverable is not reachable. Non-empty here is a
+        # correct outcome, not a failure — read it beside `unblocked`, or a
+        # held run looks identical to one with nothing to do.
+        "delivery_held": delivery_held,
+        # Dependents released by the read-time re-probe above (their blocker
+        # was already terminal AND held; its deliverable has since landed).
+        "delivery_released": delivery_released,
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0

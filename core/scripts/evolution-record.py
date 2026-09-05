@@ -515,6 +515,32 @@ def main():
             pass
         approve_no_mutation()
 
+    # Chain repair (): the sidecar carries a predecessor only for the
+    # kinds whose files hold a front-matter revision chain. script_edit and
+    # rule_edit hold none, so the pointer arrives null and every row for a file
+    # records itself as a chain root — measured 2026-09-03: 10,998 of 12,993
+    # script-evolution rows and 219 of 225 live rule-evolution rows are null
+    # although an earlier row for the same file exists. Ask the store instead.
+    #
+    # ONLY when the sidecar pointer is NULL. A non-null pointer is left exactly
+    # as written even when it names an id absent from the store: those are the
+    # frozen `skill-bootstrap-*` front-matter sentinels (guard-4808 — 1,811 rows
+    # over 65 distinct targets here, a fan-out of 27.9, i.e. 65 stale fields and
+    # not 1,811 lost rows). Overwriting them would repair the SYMPTOM and hide
+    # the missing front-matter writeback that is the actual defect (guard-2719).
+    if entry.get("previous_revision_id") is None:
+        try:
+            from _evolution_chain import chain_index, latest_rid
+            prev = latest_rid(
+                chain_index(Path(world_dir) / _STREAM_FILENAME[file_kind]),
+                entry.get("file_path"),
+            )
+            if prev:
+                entry["previous_revision_id"] = prev
+        except Exception:
+            # Never let a chain lookup cost the caller its event-stream row.
+            pass
+
     try:
         write_stub_entry(world_dir, file_kind, entry)
     except Exception:

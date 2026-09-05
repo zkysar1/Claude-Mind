@@ -891,11 +891,30 @@ unknown kind rather than writing a lane nothing queries.
 | `url`, `search` | `PostToolUse[WebFetch\|WebSearch]` | yes |
 | `node` | `tree-read.sh --node`, on rc=0 only | yes |
 | `board` | — | **no** — `record-prov --kind board` exists, nothing calls it |
+| `retrieval` | `retrieve.sh`, on rc=0 only | yes (g-357-47) |
+| `retrieval-auto` | `retrieve.sh` under `MIND_RETRIEVAL_AUTO=1` | yes (g-357-47) |
 
-`retrieve.sh` is also unwired: it is daemon-only and its node keys arrive in the *response*, so
-recording there means parsing JSON on the framework's hottest read path — deliberately deferred
-rather than paid on every consult. Until those land, an exit 1 for a board message or for a node
-surfaced only through `retrieve.sh` means "no producer", not "not retrieved".
+`retrieve.sh` records the **event**, never the returned node keys. The keys arrive in the
+*response*, so capturing them would put a JSON parse on the framework's hottest read path — that
+half stays deferred. An exit 1 for a board message, or for a specific NODE surfaced only through
+`retrieve.sh`, therefore still means "no producer", not "not retrieved".
+
+**`retrieval` vs `retrieval-auto` is load-bearing, not a taxonomy nicety.** `retrieve.sh` has two
+callers with opposite meanings: an agent deliberately consulting the stores, and
+`user-prompt-retrieval-inject.sh`'s automatic per-prompt pre-pass, which the model never asked for
+and may never read. The `retrieval-floor` query counts only the deliberate kinds
+(`DELIBERATE_RETRIEVAL_KINDS`). Collapsing the two would not merely add noise — it would make the
+floor **unreachable**, passing for every session in which a human typed a sentence while measuring
+nothing, which reads as coverage (guard-1760). Pinned by
+`test_auto_prepass_alone_does_not_satisfy_the_floor`, which is mutation-proved.
+
+**Consumer:** `context-reads.py retrieval-floor` (exit 0 = this session consulted something,
+exit 1 = zero), read by `retrieval-floor-gate.sh`, the `PreToolUse[Edit|MultiEdit|Write]` advisory
+that warns when a NON-LOOP session writes to `knowledge/tree/**` or `**/conventions/**` having
+consulted nothing. Advisory only, and it must stay so: per guard-4407 the hook binds to the
+Edit/Write TOOLS while the manifest binds to Read/WebFetch/WebSearch, so under a Bash-preference
+session both halves go blind together and silently — its silence is not evidence a session
+retrieved, and its firing is not proof one did not.
 
 The `node` recorder is **success-gated**: it fires on rc=0 and never on the not-found branch.
 Recording a failed lookup would authenticate a citation to a node that never resolved — the one

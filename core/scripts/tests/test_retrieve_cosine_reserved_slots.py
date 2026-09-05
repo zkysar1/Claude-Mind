@@ -41,10 +41,19 @@ import retrieve as R  # noqa: E402
 FLOOR = 0.35
 
 
-def _cfg(reserved):
+def _cfg(reserved, cosine_weight=None):
     cfg = dict(R._DEFAULT_RETRIEVAL_CFG)
     cfg["cosine_reserved_slots"] = reserved
     cfg["embedding_min_cosine"] = FLOOR
+    # The defect these tests pin was measured at the TF-IDF cosine weight
+    # (COSINE_BONUS_WEIGHT=2.0). Since 2026-09-03 the real-embedding path reads
+    # tree.yaml retrieval: embedding_cosine_bonus_weight (12.0 shipped), at
+    # which the top-cosine node survives WITHOUT reservation — the weight
+    # change is the primary fix and reservation is the floor guarantee behind
+    # it (see test_shipped_weight_makes_reservation_a_backstop). Pin the weight
+    # the fixture was built for so the reservation mechanism stays exercised.
+    cfg["embedding_cosine_bonus_weight"] = (
+        R.COSINE_BONUS_WEIGHT if cosine_weight is None else cosine_weight)
     return cfg
 
 
@@ -107,6 +116,23 @@ def test_reserved_slot_rescues_top_cosine_node(monkeypatch):
     assert keys[7] in {e[0] for e in with_res}, (
         "reservation must guarantee the top-cosine node a slot"
     )
+
+
+def test_shipped_weight_makes_reservation_a_backstop(monkeypatch):
+    """Positive control for the 2026-09-03 weight change: at the SHIPPED
+    embedding_cosine_bonus_weight the top-cosine node survives the composite
+    WITHOUT any reservation — the same fixture that reproduces the defect at
+    the TF-IDF weight above. Reservation is now the floor guarantee for
+    thinner cosine margins, not the primary rescue."""
+    shipped = R._DEFAULT_RETRIEVAL_CFG["embedding_cosine_bonus_weight"]
+    assert shipped > R.COSINE_BONUS_WEIGHT
+    emb = lambda ks: {k: (0.9 if k == ks[7] else 0.4) for k in ks}
+    keys, nodes, matched, channels = _corpus(8, weak=7)
+    monkeypatch.setattr(R, "_load_retrieval_config",
+                        lambda: _cfg(0, cosine_weight=shipped))
+    out = R._score_weight_limit(matched, channels, 3, query_text="q",
+                                all_nodes=nodes, emb_scores=emb(keys))
+    assert keys[7] in {e[0] for e in out}
 
 
 def test_disabled_is_plain_mmr(monkeypatch):

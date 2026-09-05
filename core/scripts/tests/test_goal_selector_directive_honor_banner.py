@@ -289,3 +289,64 @@ def test_bare_qualified_tag_does_not_reopen_prose_fallback(tmp_path, monkeypatch
     bp = _board(tmp_path, [directive])
     assert gs.emit_directive_honor_banner(
         _scored("g-315-390"), "zeta", board_path=bp) == []
+
+
+# ── : the AUTHOR tag is not an addressee ──────────────────────────
+#
+# board-post.sh stamps the author's own name into every post's tags, so EVERY
+# directive an agent writes carries its own bare name. The bare-name disjunct
+# matched it, and the banner told the AUTHOR to honor a directive it had
+# written for someone else -- under a guard that forbids a silent skip.
+#
+# The trio below is one discriminating set, not three flavours of one check:
+#   author       -> NO banner   (the defect)
+#   addressee    -> banner      (positive control: the fix did not mute it)
+#   no addressee -> banner      (the  bare-name path, unregressed)
+# A fix that simply stopped honouring bare-name tags would pass the first and
+# fail the third; one that dropped the requires_action_by branch would pass the
+# first and fail the second. Each case fails for its own reason.
+#
+# MUTATION EVIDENCE (guard-1475), RUN not predicted: with the `addressee_tags`
+# narrowing reverted in goal-selector.py, `test_author_tag_does_not_direct_the_
+# author` FAILS and the other two PASS. Recorded in the goal's outcome_note.
+
+# Verbatim tag set of msg-20260903-065244-alpha-5364 (measured on cc-09):
+# an alpha-authored directive routed to foxtrot. The bare 'alpha' is the
+# author stamp, NOT an addressee.
+AUTHORED_BY_ALPHA_FOR_FOXTROT = {
+    "id": "msg-20260903-065244-alpha-5364",
+    "author": "alpha",
+    "type": "directive",
+    "channel": "coordination",
+    "tags": ["requires_action_by:foxtrot", "target:g-115-7744",
+             "action_type:restart-daemon-and-sweep", "alpha", "sprint-planning"],
+    "text": "@foxtrot - g-115-7744 needs one leg on YOUR box.",
+}
+
+
+def test_author_tag_does_not_direct_the_author(tmp_path):
+    bp = _board(tmp_path, [AUTHORED_BY_ALPHA_FOR_FOXTROT])
+    assert gs.emit_directive_honor_banner(
+        _scored("g-115-7744"), "alpha", board_path=bp) == []
+
+
+def test_addressee_still_directed_by_same_directive(tmp_path):
+    # Positive control. Without this, muting the banner entirely would pass.
+    bp = _board(tmp_path, [AUTHORED_BY_ALPHA_FOR_FOXTROT])
+    warns = gs.emit_directive_honor_banner(
+        _scored("g-115-7744"), "foxtrot", board_path=bp)
+    assert len(warns) == 1
+    assert warns[0]["directive_id"] == "msg-20260903-065244-alpha-5364"
+    assert warns[0]["goal_id"] == "g-115-7744"
+
+
+def test_bare_name_still_directs_when_no_addressee_tag(tmp_path):
+    # The  path: with no requires_action_by tag anywhere, a bare
+    # agent-name tag is still the routing signal and MUST still fire.
+    d = {**AUTHORED_BY_ALPHA_FOR_FOXTROT,
+         "id": "msg-dir-bare-1",
+         "tags": ["directive", "target:g-115-7744", "zeta"],
+         "text": "USER DIRECTIVE: zeta -- prioritize g-115-7744."}
+    bp = _board(tmp_path, [d])
+    assert len(gs.emit_directive_honor_banner(
+        _scored("g-115-7744"), "zeta", board_path=bp)) == 1

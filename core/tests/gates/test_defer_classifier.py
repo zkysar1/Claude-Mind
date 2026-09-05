@@ -107,10 +107,18 @@ def test_structured_prefixes_published():
     -- the canonical schema doc and the rule that governs defer routing.
     A tripwire whose only job is to prompt a docs update is worth nothing
     if nothing runs it; both docs are updated as part of this fix.
+
+    Refreshed again 2026-09-04 (g-369-30) for "member_paused:", the
+    Planned-board member verbs' suppression prefix. It is the SECOND
+    never-auto-clearing member, which falsified the "human_blocked: is the
+    one member that is not self-clearing" sentence carried by BOTH docs
+    named above; both were corrected in the same change. The tripwire fired
+    correctly this time and was caught the same hour.
     """
     assert STRUCTURED_DEFER_PREFIXES == (
         "precondition_unmet:",
         "blocked_on_dependency",
         "Circuit breaker:",
         "human_blocked:",
+        "member_paused:",
     )

@@ -45,7 +45,7 @@ Phase 0.5b closes it.
       around.
    e. When that signal is a HUMAN gate specifically (an approval click,
       outside counsel, a credential only a person can grant), write it with
-      the `human_blocked:` structured prefix — the one `STRUCTURED_DEFER_PREFIXES`
+      the `human_blocked:` structured prefix — a `STRUCTURED_DEFER_PREFIXES`
       member that never auto-clears (suppressed from the selector, counted as
       blocked, surfaced by the precheck age-escalation). The prefix attests
       that the routing was FORMATTED correctly, not that it is still correct:

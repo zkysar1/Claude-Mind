@@ -66,6 +66,25 @@ mapping:
   self-program-evolution-historical-audit: framework  # g-115-1241: was unmapped -> unclassified -> role_affinity 0.0 -> 82.8h streak-break (g-115-760)
   framework-guardrails-and-gates: framework  # g-115-2438: was unmapped -> stamped unclassified -> consult-streak reset never fired on g-115-2416's consulted close
   framework-testing: framework               # g-115-2438 audit: sibling gap, same class as line above
+  #  (alpha worker, cc-07, 2026-09-03): framework-* near-synonyms still
+  # unmapped while 15 siblings above were mapped. framework-infrastructure alone
+  # was 21 of 603 closes in the 14d window — the largest MAPPABLE family.
+  framework-infrastructure: framework
+  framework-verification: framework
+  framework-retrieval: framework
+  framework-recovery: framework
+  self-evolution: framework          # sibling of framework-self-improvement above
+  deployment-lifecycle: framework    # measured: these are Mind promotion/release-tag
+                                     # discipline (staging tags, cut+push), NOT product
+                                     # deploy — see deployment-infrastructure in the
+                                     # WORLD overlay, which stays product.
+  #  batch 2 — sibling families, gated the same way (tight aspiration
+  # spread and/or an unambiguous existing sibling row).
+  skill-quality: framework           # skill evaluation IS the cognitive engine
+  framework-tooling: framework
+  framework-decomposition: framework
+  knowledge-tree: framework          # the tree is engine state, not domain data
+  test-coverage: framework           # sibling of `testing` / `framework-testing`
 
   # ---- hygiene (ops plumbing — universal patterns) ----
   infrastructure: hygiene
@@ -76,6 +95,17 @@ mapping:
   data-quality: hygiene
   framework-hygiene: hygiene
   health-and-operations: hygiene
+  # : the two categories the goal asked to DECIDE EXPLICITLY, with reasoning.
+  # security -> hygiene: the measured closes are IAM condition fencing, anonymous-role
+  #   scoping and API-gateway throttles — ops plumbing on the deployment surface, the
+  #   same family as `infrastructure: hygiene`. Two goals carried a `product` stamp
+  #   because the flaw SURFACED in a product feature, but the WORK is infra hardening.
+  # deployment -> hygiene: deploy machinery is ops plumbing. The domain's
+  #   `deployment-infrastructure: product` override in the WORLD overlay is
+  #   deliberately NOT changed — that names the product runtime's own deploy path.
+  security: hygiene
+  deployment: hygiene
+  infrastructure-cost: hygiene       # S3 churn / storage-version cost work
 
   # ---- research (investigation/analysis — universal) ----
   research: research

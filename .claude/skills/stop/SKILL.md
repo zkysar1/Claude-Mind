@@ -88,27 +88,52 @@ Bash: `if [ -n "$MIND_SID" ] && [ -f "agents/<agent-name>/sessions/$MIND_SID/wor
 
 IF output is "worker":
 
-1. Stage + push this worker's own per-session state so a machine-move right after the
+1. Arm the SESSION-SCOPED stop signal so this turn can actually end (g-115-7309).
+   FIRST, before the flush: the remaining steps are fire-and-forget, and a stop that
+   cannot end its own turn is worse than one that skipped a push.
+   Bash: `mkdir -p "agents/<agent-name>/sessions/$MIND_SID" && touch "agents/<agent-name>/sessions/$MIND_SID/stop-requested"`
+
+   WHY THIS FILE AND NOT `session/stop-requested`: the stop-hook worker-net has four
+   stand-down valves, and valve #2 (`stop-hook.sh`, gate
+   `worker-net-stop-requested`) reads the AGENT-WIDE `session/stop-requested` —
+   which this very branch is forbidden to write, because the reducer's Phase -1.4 on
+   another machine reads it. So the one actor that needs valve #2 was structurally
+   barred from firing it: every worker `/stop` BLOCKed at turn-end, and the only
+   escape was hand-writing `body-closing`, which DURABLY retires the Body
+   (`closed-pending-merge`, Phase -0 then refuses every further unit on that SID, and
+   only a user-only `/start` reopens it). Stopping one box is not retiring that Body.
+   This file is read by the paired valve `worker-net-stop-requested-session`, is
+   keyed to THIS SID, and never reaches the reducer. (guard-4900 documents the trap;
+   this step is its fix.)
+
+2. Stage + push this worker's own per-session state so a machine-move right after the
    stop cannot strand it. This is the same call graceful-stop D6.7 makes for the same
    reason — it pushes owned-agent `session/` continuity files (working-memory.yaml,
    execution-diary.jsonl, ...) to the backend now instead of at the sweep thread's next
    tick. Fire-and-forget: a flush failure must not block the stop.
    Bash: `bash core/scripts/owncloud-flush.sh || true`
 
-2. Close this session's telemetry record. The worker got a WP1 `active` record at
+3. Close this session's telemetry record. The worker got a WP1 `active` record at
    `/start` and never reaches the IDLE branch's WP2, so without this it orphans as
    permanently-`active` and pollutes the live-sessions query. Keyed on the WORKER's own
    `$MIND_SID`. guard-165: SID/agent via ENV, python source single-quoted.
    Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop")' >/dev/null 2>&1 || true`
 
-3. Clean this session's SID binding so PROJECT_ROOT does not accumulate one file per
+4. Clean this session's SID binding so PROJECT_ROOT does not accumulate one file per
    stopped worker. Idempotent.
    Bash: `rm -f ".active-agent-$MIND_SID"`
 
-4. Output: `"Worker Body stopped on this box. The reducer was NOT signalled — its claim, canonical working memory, and session state are untouched. This worker's session state has been staged and pushed. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+5. Output: `"Worker Body stopped on this box. The reducer was NOT signalled — its claim, canonical working memory, and session state are untouched. This worker's session state has been staged and pushed. To stop the whole agent, run /stop <agent-name> on the reducer box."`
 
-DONE. Do NOT continue to Step 1. Do NOT write `stop-target-mode`. Do NOT set
-`stop-requested`. Do NOT chain into the aspirations loop.
+DONE. Do NOT continue to Step 1. Do NOT write `stop-target-mode`. Do NOT set the
+AGENT-WIDE `session/stop-requested`. Do NOT chain into the aspirations loop.
+
+The word AGENT-WIDE is load-bearing and was added with step 1 (g-115-7309): this
+clause used to read "Do NOT set `stop-requested`" unqualified, which now reads as a
+prohibition on step 1 itself. The two files are different objects with opposite
+blast radii — `session/stop-requested` is agent-wide and stops the REDUCER wherever
+it runs; `sessions/<SID>/stop-requested` is scoped to this Body on this box. Only
+the first is forbidden here.
 
 IF output is "reducer-or-single": continue to Step 1 unchanged. This is the ordinary
 single-box case and behaves exactly as it did before this step existed.
@@ -299,9 +324,13 @@ Output: "Agent has not been started yet. Type `/start <name>` to begin."
 ## Chaining
 - Sets: `stop-target-mode` file, `stop-requested` signal
 - Sets NEITHER of the above on the **worker-Body path** (Step 0.6): a `/stop` typed on
-  a worker box stages+pushes its own per-session state, closes its telemetry, cleans
-  its binding, and exits without touching any agent-wide file. The reducer is not
-  signalled and keeps running (g-306-125).
+  a worker box arms its SESSION-SCOPED `sessions/<SID>/stop-requested` (g-115-7309),
+  stages+pushes its own per-session state, closes its telemetry, cleans its binding,
+  and exits without touching any agent-wide file. The reducer is not signalled and
+  keeps running (g-306-125). The session-scoped file is what lets the turn END: it
+  fires the stop-hook's `worker-net-stop-requested-session` valve. It does NOT retire
+  the Body — `body_state` stays `active`, so a later `/start` resumes this SID
+  normally instead of needing the user-only reopen a `body-closing` close would force.
 - Calls (RUNNING branch, runner session only): `Skill: aspirations` with args `loop` as
   the final action, so Phase -1.4 runs in the same user turn and the graceful stop
   (D1–D7) completes before the turn ends. Observer sessions skip the chain and leave

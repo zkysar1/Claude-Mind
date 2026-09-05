@@ -182,6 +182,12 @@ _RANGE_TAIL_STORES = (
     "world/changelog.jsonl",
     "meta/changelog.jsonl",
     "world/productivity-snapshots.jsonl",
+    # g-358-49: its date segments. A PREFIX entry (matched by the
+    # `rel.startswith(s)` arm below) rather than an exact name, because segment
+    # basenames are dates and cannot be enumerated. Same append-mostly class as
+    # the legacy file above — records are only ever appended, never rewritten —
+    # so a range-tail pull is byte-safe.
+    "world/productivity-snapshots-",
     "world/goal-duplication-overrides.jsonl",
     "meta/trigger-firings.jsonl",
     "world/telemetry/zakpod1-thermal.jsonl",
@@ -1672,7 +1678,10 @@ class OwnCloudBackend:
         # existing owncloud_sync imports in this file, L684/784/1000/1078).
         try:
             from _paths import agents_root
-            from owncloud_sync import _owned_agents_with_provenance
+            from owncloud_sync import (
+                _own_sid_carrier_path,
+                _owned_agents_with_provenance,
+            )
             _root = Path(agents_root()).resolve()
             try:
                 _agent = Path(path).resolve().relative_to(_root).parts[0]
@@ -1681,16 +1690,56 @@ class OwnCloudBackend:
             if _agent is not None:
                 _owned, _prov = _owned_agents_with_provenance()
                 if _prov == "live-claims" and _agent not in (_owned or set()):
-                    raise NoClaimError(
-                        "no_claim: this box does not hold the live runner claim "
-                        "for agent dir '%s'. The write did NOT land, and NO "
-                        "retry or refresh can EVER succeed from here -- this box "
-                        "is permanently behind the claim-holder's advancing "
-                        "version. STRUCTURAL, not a race: do not retry, do not "
-                        "refresh. Relay instead -- post the full payload plus "
-                        "registration instructions to the coordination board for "
-                        "the claim-holding instance to execute (worked example: "
-                        "msg-20260827-110602-bravo-6570, g-364-104)." % _agent)
+                    # g-306-430: carry the g-306-235 carve-out DOWN to this
+                    # layer. That goal exempted THIS session's own
+                    # body-heartbeat carrier from the ownership gate in
+                    # owncloud_sync -- correctly, and in both of that module's
+                    # publication paths. This consult (g-115-8028) is a THIRD,
+                    # independent ownership refusal added later at the write
+                    # itself, and it did not carry the exemption. Net effect
+                    # measured on cc-09 2026-09-04: sync_file's H4a gate admits
+                    # the carrier (`would_push: 1`, exempt path resolves), the
+                    # PUT one call below refuses it `no_claim`, the file never
+                    # reaches S3 from any worker box, and every peer-side reader
+                    # of it -- stranded-claim-sweep's foreign-SID grace,
+                    # worker_stall's S3 prefix listing, reducer_promotion --
+                    # sees `absent` for a demonstrably live Body. The sweep
+                    # thread re-attempted the same PUT every cycle: that is the
+                    # standing `errors 1 (scanned 6907)` in spawn.log.
+                    # A worker Body NEVER holds the claim, so the one file whose
+                    # entire purpose is to let it vouch for itself cross-box was
+                    # the one file structurally guaranteed to be refused.
+                    #
+                    # SHAPE per guard-2860: the admitted set has exactly ONE
+                    # member BY CONSTRUCTION, not by test -- the path is
+                    # COMPUTED from MIND_AGENT + MIND_SID by the same SSOT
+                    # helper owncloud_sync's two carve-outs call, never matched
+                    # by glob or prefix. A peer's carrier sitting here as a
+                    # pulled read-through cache carries a foreign sid and can
+                    # never match, so the peer-clobber hole the gate exists to
+                    # close stays closed. Reusing the helper rather than
+                    # recomputing is deliberate: three copies of this predicate
+                    # would be three things to keep in sync (guard-130).
+                    #
+                    # The helper additionally requires the local file to EXIST,
+                    # which narrows the exemption further -- the fail-CLOSED
+                    # direction, and correct for the real flow (heartbeat-tick
+                    # writes locally, then the push follows).
+                    _own_carrier = _own_sid_carrier_path(self)
+                    _is_own_carrier = (
+                        _own_carrier is not None
+                        and Path(path).resolve() == _own_carrier[0].resolve())
+                    if not _is_own_carrier:
+                        raise NoClaimError(
+                            "no_claim: this box does not hold the live runner claim "
+                            "for agent dir '%s'. The write did NOT land, and NO "
+                            "retry or refresh can EVER succeed from here -- this box "
+                            "is permanently behind the claim-holder's advancing "
+                            "version. STRUCTURAL, not a race: do not retry, do not "
+                            "refresh. Relay instead -- post the full payload plus "
+                            "registration instructions to the coordination board for "
+                            "the claim-holding instance to execute (worked example: "
+                            "msg-20260827-110602-bravo-6570, g-364-104)." % _agent)
         except NoClaimError:
             raise
         except Exception as _consult_exc:

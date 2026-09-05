@@ -351,12 +351,29 @@ try:
         "current_streak": _g4_pending_streak,
         "cooldown_ladder_len": _g4_cd_len,
     }
-    snap_path = _paths.WORLD_DIR / "productivity-snapshots.jsonl"
-    # Same best-effort single-line append pattern as _record_fallback_hit
-    # in _fileops.py — single-line JSON under PIPE_BUF is single-write atomic
-    # on most filesystems. Torn-line risk is observability-grade.
-    with open(snap_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(snapshot, ensure_ascii=True) + "\n")
+    # : segmented store + locked append. `store_name()` is the ONE
+    # writer rule (today's date segment when PRODUCTIVITY_SNAPSHOTS_SEGMENTED is
+    # on, the legacy file otherwise); `snapshot_paths()` is the one reader rule.
+    # Both live in _productivity_snapshots so the writer's filename and the
+    # readers' matcher cannot drift — when they do, the failure is silent: the
+    # writer keeps emitting files the readers do not recognise and consumers
+    # report a short window as the full history.
+    #
+    # WHY THE LOCKED APPEND replaced a bare open(...,"a"): under own-cloud S3 has
+    # no append primitive, so every append PUT the WHOLE object. Measured
+    # 2026-09-04 — the unrotated legacy file was 7,417,337 B taking ~662
+    # appends/24h fleet-wide, transferring ~4.7 GB/24h to add ~250 KB of content
+    # (86.9% of the August S3 bill). Segmenting bounds each PUT to the current
+    # day, and locked_append_jsonl routes the write through the backend so it
+    # reaches S3 at all. Both names sit in _fileops._SNAPSHOT_BLACKLIST so the
+    # locked path's save_history() cannot convert that saving into .history
+    # churn (guard-2415). Serialization is unchanged (LocalBackend performs the
+    # identical json.dumps(ensure_ascii=True) append), so the append-only
+    # line-union merge handler keeps its byte-identical dedup identity.
+    from _fileops import locked_append_jsonl
+    import _productivity_snapshots as _ps
+    snap_path = _paths.WORLD_DIR / _ps.store_name()
+    locked_append_jsonl(snap_path, snapshot)
 except Exception as _g4_e:
     # Best-effort: never crash the gate on telemetry-write failure.
     print(f"[productivity-gate] G4 snapshot write failed: {_g4_e}", file=sys.stderr)

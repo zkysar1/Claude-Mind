@@ -846,6 +846,13 @@ ELSE:
 session_signals.consecutive_blocked_sleeps += 1
 wake_at = (now + sleep_seconds seconds) as ISO timestamp
 echo '"{wake_at}"' | Bash: wm-set.sh blocked_sleep_until
+# g-357-88: stamp the script-written all_blocked marker + leave a diary row, so
+# the NEXT loop entry can tell an EXECUTED B7 from a NARRATED one. Without these
+# a narrated B7 is indistinguishable from this one and dry-spin-guard.py fires a
+# short sleep instead of letting the handler's own backoff stand. Both are
+# single-writer calls and both no-op harmlessly if the marker is absent.
+Bash: py -3 core/scripts/loop-state-bump-counters.py --all-blocked-sleep --sleep-seconds {sleep_seconds}
+Bash: echo '{"entry_type":"finding","content":"B7: backoff sleep {sleep_seconds}s, blocked_sleep_until={wake_at}"}' | bash core/scripts/execution-diary.sh append
 
 # Persist ONLY the LLM-owned signals subkey we just mutated. Do NOT do
 # `merged.signals = session_signals` here — that wholesale replacement
@@ -979,6 +986,11 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --g
 # registration (Gate 2.6 ALLOW, guard-967), NO demotion (partner activity may
 # create claimable work). Legacy arrivals leave both unset (unregistered).
 # HARNESS BRANCH (g-357-89): "the harness re-invokes on completion" is a Claude
+# g-357-88: ONE diary row before the branch, so both yield shapes leave a trace.
+# The 2026-09-03 02:10Z incident reported "[x] 23 Step B7.2: Yield ... complete"
+# with ZERO diary rows across the whole 66-min handler; this line is what makes
+# that claim falsifiable, and dry-spin-guard.py reads its absence.
+Bash: echo '{"entry_type":"finding","content":"B7.2: yielding via bg interruptible-sleep {sleep_seconds}s"}' | bash core/scripts/execution-diary.sh append
 # Code fact (run_in_background → task notification). Ask, never assume:
 Bash: bash core/scripts/harness-capabilities.sh --get background_job_notify   # true | false (unknown harness → false: a spare net is harmless, a missing one is a dead loop)
 IF true:

@@ -104,25 +104,47 @@ _swap_lock = threading.Lock()
 # process-wide and monotonic (caches strictly add information; original
 # behaviour is preserved when caches miss). No per-request undo needed.
 
-# Each entry is (idx, anchor) where `anchor` is a strong reference to the
-# nodes dict that produced this idx. Holding the dict strongly is LOAD-BEARING:
-# without it, after yaml_cache invalidates a tree.yaml entry, the old dict
-# becomes GC-eligible. CPython's small-object pool reuses freed addresses, so
-# a new dict can land at the same memory address — at which point id(new_nodes)
-# would collide with our cache key and return the STALE idx. Do not remove
-# the anchor.
+# Keyed on a CONTENT fingerprint of `nodes` (2026-09-03), not id(nodes). The
+# concept index is a pure function of each node's `file` and that file's
+# front matter, and every hook-mediated front-matter edit bumps the node's
+# `last_updated` in _tree.yaml (T21) — so (key, file, last_updated) over all
+# nodes changes exactly when the index can. The old id(nodes) key missed on
+# every yaml_cache reload, and _tree.yaml reloads on every box each time ANY
+# agent's counting retrieval writes a retrieval_count into it: on a busy fleet
+# essentially every request paid the full 1,569-file front-matter walk
+# (measured on DESKTOP-O91DLK2: 24.4 s cold vs 4.3 s warm for ONE request).
+# The anchor the id-keyed entry carried (a strong ref to the nodes dict, to
+# defeat CPython address reuse) is unnecessary under a content key and is
+# gone, so a retained index no longer pins a 1.7 MB dict per slot. Known
+# staleness: a hand edit to a node's entities that bypasses the hook is
+# invisible here until that node's last_updated next moves — the same class
+# as yaml_cache's own mtime keying.
 _concept_cache: dict = {}
 _concept_cache_lock = threading.Lock()
 _CONCEPT_CACHE_MAX = 8  # bounded; ~1 entry per agent
 
 
+def _concept_fingerprint(nodes):
+    """Content key for the concept index — see the block above. ~2 ms over
+    1,569 nodes. Falls back to id(nodes) (the pre-2026-09-03 key) when the
+    dict is not the shape expected, so a malformed index degrades to the old
+    behaviour rather than to a stale hit."""
+    try:
+        return hash(tuple(sorted(
+            (str(k), str((n or {}).get("file", "")),
+             str((n or {}).get("last_updated", "")))
+            for k, n in nodes.items())))
+    except Exception:
+        return id(nodes)
+
+
 def _cached_build_concept_index(nodes, world_root=None):
-    """(id(nodes), world_root)-keyed wrapper. Misses naturally when yaml_cache
-    reloads _tree.yaml (mtime change → new dict identity → cache miss → real
-    rebuild). The anchor in the cache entry prevents id reuse from causing
-    stale hits. ``world_root`` arrives as the swapped-in ``retrieve.WORLD_DIR``
-    of the request being served (g-367-08) and is part of the key."""
-    cache_key = (id(nodes), str(world_root))
+    """(fingerprint(nodes), world_root)-keyed wrapper. HITS across yaml_cache
+    reloads whose only change is retrieval counters; misses when any node's
+    key, file or last_updated moves. ``world_root`` arrives as the swapped-in
+    ``retrieve.WORLD_DIR`` of the request being served (g-367-08) and is part
+    of the key."""
+    cache_key = (_concept_fingerprint(nodes), str(world_root))
     with _concept_cache_lock:
         entry = _concept_cache.get(cache_key)
     if entry is not None:
@@ -130,7 +152,7 @@ def _cached_build_concept_index(nodes, world_root=None):
     # Build outside the lock — file I/O can be slow on cold caches.
     idx = _real_build_concept_index(nodes, world_root=world_root)
     with _concept_cache_lock:
-        _concept_cache[cache_key] = (idx, nodes)  # anchor pins the dict
+        _concept_cache[cache_key] = (idx, None)
         if len(_concept_cache) > _CONCEPT_CACHE_MAX:
             _concept_cache.pop(next(iter(_concept_cache)))
     return idx

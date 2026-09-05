@@ -132,7 +132,54 @@ def _read_state(agent_dir: Path) -> "str | None":
         return None
 
 
-def _read_mode(agent_dir: Path) -> "str | None":
+# POST_RECOVERY_EDIT_OVERRIDE="repairing this gate's own mode read under an explicit user
+# directive; the gate refused this very edit from a session whose binding.yaml says
+# mode: assistant, which is the defect being fixed and its own live reproduction"
+def _read_mode(agent_dir: Path, sid: str = "") -> "str | None":
+    """Mode for THIS session — the per-session binding first, agent-wide after.
+
+    THIRD POPULATION THE AGENT-WIDE READ MIS-DESCRIBES (2026-09-04), and the
+    same defect as the worker and graceful-stop exemptions below, one layer
+    down. Those two fixed WHICH TUPLES are exempt while leaving the tuple itself
+    read out of `session/agent-mode`, which is AGENT-WIDE. On a box running more
+    than one Body that file holds whatever the Body that started LAST wrote, so
+    the mode it reports is not a property of the asking session at all.
+
+    MEASURED on DESKTOP-O91DLK2: an assistant session bound 2026-09-02T19:02:14
+    carrying `mode: assistant` in its own sessions/<SID>/binding.yaml was
+    refused, because a worker Body started on the same box the next day and left
+    `autonomous` in the agent-wide file. The gate's own `(IDLE, assistant) —
+    user-directed work` exemption was therefore never reached and the override
+    became the only way through — precisely the "how a gate stops being a gate"
+    failure the worker exemption was written to end. The edit that introduced
+    this docstring was itself refused by this function, which is as direct a
+    reproduction as the defect admits.
+
+    This NARROWS the gate; it does not weaken the crashed-reducer catch it
+    exists for. A crashed or auto-recovered REDUCER was started autonomous, so
+    its binding says `autonomous` and it stays in scope — the canonical incident
+    (charlie session d600a945, an orphan edit against a confabulated goal id) is
+    refused exactly as before.
+
+    `resolve_binding` is the declared resolver for session identity (CLAUDE.md §
+    Session Binding), so mode comes from the SSOT rather than a second
+    hand-rolled parse of the same file. It already falls back to the legacy
+    `.active-agent-<SID>` form, where `mode` is None — there the agent-wide file
+    remains the only signal and the old behaviour is preserved exactly.
+    Fail-open on every error path: a gate that cannot resolve a mode must not
+    invent one.
+    """
+    if sid:
+        try:
+            from _session_binding import resolve_binding
+
+            bound = resolve_binding(sid, PROJECT_ROOT)
+            bound_mode = getattr(bound, "mode", None)
+            if bound_mode and str(bound_mode).strip():
+                return str(bound_mode).strip()
+        except Exception:
+            pass  # fall through to the agent-wide file
+
     path = agent_dir / "session" / "agent-mode"
     try:
         return path.read_text(encoding="utf-8").strip()
@@ -207,7 +254,13 @@ def main():
             approve_no_mutation()
 
         state = _read_state(agent_dir)
-        mode = _read_mode(agent_dir)
+        # POST_RECOVERY_EDIT_OVERRIDE="second half of this gate's own mode-read repair under
+        # an explicit user directive — passing sid is what makes the fixed _read_mode reachable"
+        # `sid` is load-bearing here, not decorative: without it _read_mode falls
+        # back to the AGENT-WIDE agent-mode file, which on a multi-Body box
+        # reports whichever Body started last rather than this session. See
+        # _read_mode's docstring for the measured case.
+        mode = _read_mode(agent_dir, sid)
         # Only the (IDLE, autonomous) tuple is in scope for this gate.
         if state != "IDLE" or mode != "autonomous":
             approve_no_mutation()

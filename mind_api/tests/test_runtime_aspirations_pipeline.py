@@ -209,7 +209,39 @@ def test_work_class_explicit_not_overridden(running_daemon):
 
 
 def test_capability_route_stamps_intended_agent(running_daemon):
-    """Title 'Investigate: ...' → capability-route stamps intended_agent=zeta."""
+    """Title 'Build: ...' → capability-route stamps intended_agent=alpha.
+
+    Used 'Investigate: ...' -> zeta until g-353-86 (2026-09-04) re-pointed that
+    prefix at 'either'. The example moved to a prefix that still resolves to a
+    SPECIFIC agent so this keeps proving what it was written to prove — that the
+    daemon stamps the CLASSIFIER'S ANSWER onto a goal that set no
+    intended_agent. Asserting 'either' here would have been strictly weaker: it
+    is also the classifier's no-signal default, so the assertion could no longer
+    distinguish a real stamp from a fallback. The Investigate: case is pinned
+    separately below, where 'either' IS the behaviour under test."""
+    project_root, port = running_daemon
+    goal = {
+        "title": "Build: weird behavior",
+        "status": "pending",
+        "origin_signal": "user_directive",
+    }
+    code, _ = _add_goal(port, goal)
+    assert code == 200
+    persisted = _read_persisted_goal(project_root, "Build: weird behavior")
+    assert persisted.get("intended_agent") == "alpha"
+
+
+def test_capability_route_investigate_defaults_to_either(running_daemon):
+    """ regression pin: an 'Investigate:' goal with no domain category
+    must NOT be stamped to a single agent.
+
+    'Investigate' names a WORK-TYPE, not a domain, and every machine filer emits
+    it, so a strong title-prefix route on it made one agent the default owner of
+    ~18% of all new goals — 477 live goals carried intended_agent=zeta (433 of
+    them titled Investigate) while four peers were barred from claiming them by
+    routed_to_agent. This pins the end-to-end daemon path, not just the
+    classifier: `.get()` returning 'either' rather than None also proves the
+    stamp fired at all."""
     project_root, port = running_daemon
     goal = {
         "title": "Investigate: weird behavior",
@@ -219,7 +251,7 @@ def test_capability_route_stamps_intended_agent(running_daemon):
     code, _ = _add_goal(port, goal)
     assert code == 200
     persisted = _read_persisted_goal(project_root, "Investigate: weird behavior")
-    assert persisted.get("intended_agent") == "zeta"
+    assert persisted.get("intended_agent") == "either"
 
 
 def test_capability_route_explicit_not_overridden(running_daemon):
@@ -262,14 +294,22 @@ _OFFLOAD = {"X-Mind-Override-Offload":
 def test_recurring_goal_defaults_to_either(running_daemon):
     """The headline behaviour, carrying its own control.
 
-    Both goals use the SAME "Investigate:" title shape that
-    test_capability_route_stamps_intended_agent pins to zeta. The only
+    Both goals use the SAME "Build:" title shape that
+    test_capability_route_stamps_intended_agent pins to alpha. The only
     difference is `recurring`, so the control is what proves recurring-ness —
     not some incidental property of the title — produced "either".
+
+    The shape was "Investigate:" until g-353-86 (2026-09-04) re-pointed that
+    prefix at "either". Keeping it would have QUIETLY DESTROYED THIS TEST'S
+    CONTROL: the non-recurring arm would also have returned "either", so the
+    assertion pair could no longer distinguish "recurring widened it" from
+    "the title already yielded either" — it would have passed while proving
+    nothing. The control must use a prefix that still routes to a SPECIFIC
+    agent, which is the whole reason this test files two goals instead of one.
     """
     project_root, port = running_daemon
-    for title, recurring in (("Investigate: cadence sweep A", True),
-                             ("Investigate: cadence sweep B", False)):
+    for title, recurring in (("Build: cadence sweep A", True),
+                             ("Build: cadence sweep B", False)):
         goal = {"title": title, "status": "pending",
                 "origin_signal": "user_directive"}
         if recurring:
@@ -277,9 +317,9 @@ def test_recurring_goal_defaults_to_either(running_daemon):
         code, body = _add_goal(port, goal, headers=_OFFLOAD)
         assert code == 200, (title, body)
     assert _read_persisted_goal(
-        project_root, "Investigate: cadence sweep A")["intended_agent"] == "either"
+        project_root, "Build: cadence sweep A")["intended_agent"] == "either"
     assert _read_persisted_goal(
-        project_root, "Investigate: cadence sweep B")["intended_agent"] == "zeta"
+        project_root, "Build: cadence sweep B")["intended_agent"] == "alpha"
 
 
 def test_recurring_with_requires_capability_keeps_the_classifier(running_daemon):
@@ -290,14 +330,17 @@ def test_recurring_with_requires_capability_keeps_the_classifier(running_daemon)
     affinity / runs_on field), so it is also the goal's stated "box affinity".
     """
     project_root, port = running_daemon
-    goal = {"title": "Investigate: pinned to a capable box", "status": "pending",
+    goal = {"title": "Build: pinned to a capable box", "status": "pending",
             "origin_signal": "user_directive", "recurring": True,
             "interval_hours": 24, "requires_capability": ["aws"]}
     code, _ = _add_goal(port, goal, headers=_OFFLOAD)
     assert code == 200
     persisted = _read_persisted_goal(
-        project_root, "Investigate: pinned to a capable box")
-    assert persisted["intended_agent"] == "zeta"
+        project_root, "Build: pinned to a capable box")
+    # "Build:" (-> alpha), not "Investigate:", since  (2026-09-04) made
+    # that prefix return "either" — which is also what the widening produces, so
+    # the assertion could no longer show the classifier was KEPT.
+    assert persisted["intended_agent"] == "alpha"
 
 
 def test_recurring_explicit_intended_agent_still_wins(running_daemon):
@@ -506,7 +549,7 @@ def test_add_goal_response_includes_full_goal(running_daemon):
     wrappers can print it to stdout (matches legacy CLI's json.dumps(goal))."""
     _, port = running_daemon
     goal = {
-        "title": "Investigate: full goal in response",
+        "title": "Build: full goal in response",
         "status": "pending",
         "origin_signal": "user_directive",
         "description": "x" * 100,
@@ -517,11 +560,14 @@ def test_add_goal_response_includes_full_goal(running_daemon):
     assert "goal" in resp, "200 response missing 'goal' key"
     persisted = resp["goal"]
     # Identifying fields must round-trip
-    assert persisted["title"] == "Investigate: full goal in response"
+    assert persisted["title"] == "Build: full goal in response"
     assert persisted["status"] == "pending"
     assert persisted["id"] == resp["goal_id"]
-    # Daemon-side mutations must appear (capability-route stamps zeta on
-    # 'Investigate:' titles; category-suggest assigns a category)
-    assert persisted.get("intended_agent") == "zeta"
+    # Daemon-side mutations must appear (capability-route stamps alpha on
+    # 'Build:' titles; category-suggest assigns a category). Deliberately a
+    # prefix that still yields a SPECIFIC agent after : "either" is the
+    # classifier's no-signal default, so asserting it would not evidence that
+    # the mutator ran at all — which is what this line is here to show.
+    assert persisted.get("intended_agent") == "alpha"
     assert persisted.get("category"), "category mutator should have set a value"
     assert persisted.get("work_class"), "work_class resolver should have set a value"

@@ -16,6 +16,7 @@ from quiesce_ripeness import (  # noqa: E402
     STAMP_SENTINEL,
     apply_stamp,
     evaluate,
+    is_quiesce_frozen_defer,
     parse_minutes,
     parse_rows,
     render_stamp,
@@ -328,3 +329,56 @@ def test_tombstoned_rows_are_counted_separately_from_not_ready():
     md += row("Q9", "item", "~30 min", "no — needs a measurement first")
     c = evaluate(md, {})["counts"]
     assert c["tombstoned"] == 1 and c["not_ready"] == 1 and c["ready"] == 0
+
+
+# --- criterion (b) defer predicate (, 2026-09-05) -------------------
+# The gap these pin: the detector matched the bare substring "quiesce" while the
+# master goal's own registration prefix says "quiet-window member of <master>".
+# Two goals with the IDENTICAL registered prefix landed on opposite sides,
+# because one happened to also write "quiesced-fleet-window" in its prose.
+
+
+def test_the_registered_membership_prefix_is_matched_without_the_word_quiesce():
+    # Verbatim shape of a live member's defer. It contains NO "quiesce".
+    defer = (
+        "human_blocked: quiet-window member of g-000-000 — NEXT WINDOW "
+        "2026-09-05..07. WINDOW-READY: YES for the delete (~45 min)."
+    )
+    assert "quiesce" not in defer.lower(), "fixture must not smuggle in the old token"
+    assert is_quiesce_frozen_defer(defer)
+
+
+def test_CONTROL_the_old_bare_token_still_matches():
+    # The widening is ADDITIVE. A defer that only ever said "quiesce" -- the
+    # prose form the 2026-08-13 comment measured -- must not regress.
+    assert is_quiesce_frozen_defer(
+        "human_blocked: requires a fleet-quiesced window only the user can create"
+    )
+
+
+def test_the_SPACED_form_is_NOT_matched_because_it_names_a_different_window():
+    # A live goal uses "quiet window" for a HEAD-quiet window (no git merges for
+    # N minutes so a long suite run is not voided). Admitting it would report a
+    # goal as fleet-quiesce-frozen that its author never registered.
+    assert not is_quiesce_frozen_defer(
+        "precondition_unmet: ~187 min needed vs a 116 min longest HEAD-quiet "
+        "quiet window today, with 7 Bodies active and merging at every turn-end."
+    )
+
+
+def test_an_unrelated_defer_and_an_absent_one_are_both_false():
+    assert not is_quiesce_frozen_defer("precondition_unmet: waiting on PR #1 to merge")
+    assert not is_quiesce_frozen_defer("")
+    assert not is_quiesce_frozen_defer(None)
+
+
+def test_the_caller_consumes_THIS_predicate_and_does_not_re_inline_one():
+    # The drift this whole fix is about: the shell had its own copy of the
+    # substring test, so the module could widen and the live scan stay narrow.
+    # Pin the wiring, not just the function -- guard-1943 (pinning the writer
+    # says nothing about the wiring).
+    src = (Path(__file__).resolve().parents[1] / "quiesce-ripeness-check.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "is_quiesce_frozen_defer" in src
+    assert "'quiesce' in (g.get('defer_reason')" not in src

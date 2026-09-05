@@ -15,14 +15,28 @@ Behavior (all paths fail-open; this must never delay loop continuation):
      of CPU embedding) is a deliberate operator/goal action, never spawned
      from a hook. Only incremental freshness (--update: re-embeds changed
      docs only, typically seconds) is automated.
-  3. Index fresh (meta.json mtime >= newest source-store mtime) → exit 0.
-  4. Stale + debounce clear → record the attempt marker, spawn
+  3. Index fresh (meta.json mtime >= newest source-store mtime) AND the
+     index's model matches tree.yaml `embedding_model_name` → exit 0.
+  4. Stale OR model-drifted, debounce clear → record the attempt marker, spawn
      `embedding-index-build.py --update` DETACHED (never waits), print one
      JSON status line. Debounce: at most one spawn per 6h per box — a
      persistently-failing update retries next window instead of storming.
 
-The updater itself pins the index's existing model (g-306-82), so a config
-model change can never be half-applied by this tick.
+MODEL DRIFT IS A STALENESS CONDITION IN ITS OWN RIGHT (cdb3288607,
+2026-09-03), and the corpus-mtime test cannot see it. An index built on a
+model other than the configured one scores on a different cosine
+distribution, so the floors and `embedding_cosine_bonus_weight` — all
+measured on `embedding_model_name` — are silently wrong; retrieve.py freezes
+the embedding lanes while that holds. The heal is `--update`, but a QUIET box
+(no recent store or tree writes) never reached step 4, so the freeze would
+have been permanent there. Drift is therefore checked BEFORE the mtime test.
+The debounce still applies: when the configured model cannot load, the
+updater refuses rc=2 with the index untouched and this retries next window.
+
+This docstring claimed until cdb3288607 that "the updater itself pins the
+index's existing model (g-306-82), so a config model change can never be
+half-applied by this tick." That pinning is exactly what let a drifted index
+survive five weeks: the updater now rebuilds on the CONFIGURED model instead.
 """
 import json
 import os
@@ -51,15 +65,57 @@ INDEX_DIR = SCRIPT_DIR.parent.parent / "mind_api" / "state" / "retrieval-embeddi
 UPDATE_LOG = SCRIPT_DIR.parent / "logs" / "embedding-index-update.log"
 
 
-def _blend_enabled():
+_CFG_CACHE = []
+
+
+def _retrieval_cfg():
+    """The `retrieval:` block of tree.yaml, or {} if unreadable.
+
+    Memoized for the life of the process (this is a one-shot tick, so the
+    config cannot change under it) so that serving both the flag read and the
+    configured-model read costs ONE parse, not two — the drift check adds no
+    YAML work to a tick that exists to be cheap. Fail-quiet by contract: every
+    caller treats {} as "cannot tell", never as "disabled and undrifted"."""
+    if _CFG_CACHE:
+        return _CFG_CACHE[0]
     try:
         import yaml
         cfg_path = SCRIPT_DIR.parent / "config" / "tree.yaml"
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-        return bool((cfg.get("retrieval") or {}).get("embedding_blend_enabled",
-                                                     False))
+        out = cfg.get("retrieval") or {}
+    except Exception:
+        out = {}
+    _CFG_CACHE.append(out)
+    return out
+
+
+def _blend_enabled():
+    """Kept ZERO-ARG deliberately: every test in
+    test_embedding_index_freshness.py monkeypatches this with `lambda: False`
+    / `lambda: True`, so giving it a parameter that main() then passes would
+    break 14 tests at the call site rather than at an assertion."""
+    return bool(_retrieval_cfg().get("embedding_blend_enabled", False))
+
+
+def _model_drifted(meta_path, cfg=None):
+    """True when the index names a model other than the configured one.
+
+    Reads only `meta.json` (already stat-ed by the caller) and the config dict
+    the caller already holds. Fail-quiet: an unreadable meta, an absent
+    `model` key, or an absent `embedding_model_name` returns False — this tick
+    may never manufacture a rebuild out of a missing signal. `--stats` is the
+    diagnostic surface; this is the automatic heal trigger.
+
+    """
+    cfg = _retrieval_cfg() if cfg is None else cfg
+    configured = cfg.get("embedding_model_name")
+    if not configured:
+        return False
+    try:
+        indexed = (json.loads(meta_path.read_text(encoding="utf-8")) or {}).get("model")
     except Exception:
         return False
+    return bool(indexed) and indexed != configured
 
 
 def _source_mtime():
@@ -149,8 +205,12 @@ def main():
     if not meta.exists():
         return 0  # initial build is deliberate, never hook-spawned
 
+    # Drift outranks the mtime test and is checked first: a quiet box can be
+    # drifted with a perfectly fresh index, and the embedding lanes stay
+    # frozen until an --update rebuilds on the configured model.
+    drifted = _model_drifted(meta)
     src_m = _source_mtime()
-    if src_m is None or src_m <= meta.stat().st_mtime:
+    if not drifted and (src_m is None or src_m <= meta.stat().st_mtime):
         return 0  # fresh (or sources unreadable — fail quiet)
 
     marker = index_dir / ".last-update-attempt"
@@ -169,6 +229,7 @@ def main():
 
     if dry_run:
         print(json.dumps({"op": "freshness-tick", "would_spawn": True,
+                          "reason": "model_drift" if drifted else "stale_sources",
                           "index_dir": str(index_dir)}))
         return 0
 

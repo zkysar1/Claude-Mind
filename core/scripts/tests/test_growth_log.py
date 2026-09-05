@@ -10,6 +10,7 @@ write paths. A green behavioural suite over a module nobody calls is exactly
 the shape that let the sibling l1-pick-log go silent for ~6 weeks
 (g-115-1943) — the module worked fine; the daemon just never invoked it.
 """
+import ast
 import re
 import sys
 from pathlib import Path
@@ -244,35 +245,127 @@ def test_auto_flip_still_exists_so_the_redundancy_warning_stays_true():
 def test_growth_log_call_precedes_serialization_in_both_paths():
     """The row mutates `tree`, so it must land BEFORE the write. If it moves
     after, every row is silently dropped and every test above still passes —
-    which is precisely the invisible-failure shape this file exists for."""
+    which is precisely the invisible-failure shape this file exists for.
+
+    SCOPED TO THE INNERMOST ENCLOSING BLOCK, not a line window (g-115-8344).
+    The prior form asked "is there A writer within N code lines after the
+    call", which cannot tell THIS call's writer from a LATER one's:
+    tree_write.py carries 3 growth call sites and 12 `_write_tree_locked`
+    occurrences, so a call relocated PAST its own serialization point still
+    found a writer inside the window and passed (reproduced bravo 2026-08-30,
+    alpha 2026-09-05). guard-2340: never associate structure with a call site
+    by line proximity. guard-2257: an assertion that cannot go RED against
+    the regression it names is worse than absent.
+
+    WHY THE BLOCK AND NOT THE FUNCTION — measured, after an enclosing-function
+    version of this test FAILED to catch the relocation. The daemon's `write()`
+    spans lines 1348-2270 and holds many branches, each with its own writer, so
+    "a writer later in this function" is satisfied by a DIFFERENT branch's
+    writer and the mutant stayed green. Each growth call in fact sits in its own
+    `If.body` branch holding exactly one writer (1656->1705, 1886->1889,
+    2074->2077), which is the true unit of the contract.
+
+    The CLI needs the enclosing rung as well, and that is not a loosening: it
+    uses a CALLBACK shape — `_do_remove(data)` mutates and the caller one scope
+    out runs `locked_modify_yaml(_tree_path(), _do_remove)` — so the writer
+    CANNOT be inside the mutator. All three tree.py sites are exactly that
+    (2772->2779, 3159->3163, 3566->3571), and the invariant still holds.
+
+    Using ast bounds also retires the code-line-budget proxy, so the comment
+    fragility the sibling fix worked around cannot recur.
+    """
+    def _enclosing_blocks(module):
+        """(lo, hi, label) for every statement-list block, plus function
+        bodies, so a call can be scoped to the tightest one containing it."""
+        out = []
+
+        def walk(node):
+            for field in ("body", "orelse", "finalbody"):
+                stmts = getattr(node, field, None)
+                if isinstance(stmts, list) and stmts:
+                    lo = min(s.lineno for s in stmts)
+                    hi = max(getattr(s, "end_lineno", s.lineno) for s in stmts)
+                    out.append((lo, hi, "%s.%s" % (type(node).__name__, field)))
+                    for s in stmts:
+                        walk(s)
+            for handler in getattr(node, "handlers", []) or []:
+                walk(handler)
+
+        walk(module)
+        return out
+
     for path, writer in ((CLI, "locked_modify_yaml"),
                          (DAEMON, "_write_tree_locked")):
-        lines = path.read_text(encoding="utf-8").splitlines()
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        blocks = _enclosing_blocks(ast.parse(text, filename=str(path)))
+
+        found_any = False
         for i, ln in enumerate(lines):
-            if re.search(r"\b_growth_record_(batch|reparent)\s*\(", ln) \
-                    and "import" not in ln:
-                # Window measured in CODE lines, not raw lines. The contract
-                # being pinned is "the call precedes the write, closely" — and
-                # comments are not distance. A raw-line window conflates a
-                # genuine drift past serialization with an explanatory comment
-                # block landing between the two, which is a LEGITIMATE addition
-                # (guard-4223: restate the contract in its true unit; do not
-                # relax the threshold to accommodate one). Measured 2026-08-30:
-                # tree_write.py:1656 -> writer at 1705 is 49 RAW lines but only
-                # 21 CODE lines, because 29 of the 50 (58%) are comment/blank
-                # explaining the list.remove() FATAL CATCH. The invariant held
-                # the whole time; only the ruler was wrong.
-                budget, after = 25, []
-                for ln2 in lines[i:]:
-                    after.append(ln2)
-                    if writer in ln2:
-                        break
-                    st = ln2.strip()
-                    if st and not st.startswith("#"):
-                        budget -= 1
-                        if budget <= 0:
-                            break
-                assert writer in "\n".join(after), (
-                    "%s:%d — growth-log call is not followed by a %s within "
-                    "25 CODE lines; it may have drifted past serialization"
-                    % (path.name, i + 1, writer))
+            if not re.search(r"\b_growth_record_(batch|reparent)\s*\(", ln) \
+                    or "import" in ln:
+                continue
+            call_line = i + 1
+            found_any = True
+
+            # Tightest enclosing block first, then widening. The call is
+            # satisfied by the FIRST enclosing scope that contains a writer
+            # after it — tight enough that a sibling branch's writer cannot
+            # count, wide enough for the CLI's callback shape.
+            chain = sorted((b for b in blocks if b[0] <= call_line <= b[1]),
+                           key=lambda b: b[1] - b[0])
+            assert chain, (
+                "%s:%d — growth-log call is not inside any block; the "
+                "enclosing-scope contract cannot be evaluated"
+                % (path.name, call_line))
+
+            # WIDEN AT MOST ONE RUNG, AND ONLY OUT OF A FUNCTION BODY.
+            # Unlimited widening defeats the whole fix, measured 2026-09-05:
+            # for a call relocated past its writer the tightest block
+            # (If.body 1635-1714) correctly holds NO later writer — the RED
+            # signal — but the next rungs out (With.body / Try.body /
+            # FunctionDef.body, all ~866 lines) each contain five writers
+            # belonging to OTHER branches, so any walk up the chain finds one
+            # and the mutant stays green. The only legitimate reason to leave
+            # the tightest block is the CLI's callback shape, where the writer
+            # lives in the CALLER of the mutator function; that is exactly one
+            # step, out of a FunctionDef body, so the escape is scoped to it.
+            def _writers_in(hi_line):
+                return [
+                    k + 1 for k in range(call_line, hi_line)
+                    if writer in lines[k]
+                    and not lines[k].strip().startswith("#")
+                ]
+
+            where = chain[0]
+            writer_lines = _writers_in(where[1])
+            if not writer_lines:
+                # The escape target must itself be a FUNCTION body — the
+                # caller of the mutator. Widening to Module.body would admit
+                # every writer in the file and silently restore the defect
+                # (measured 2026-09-05: the daemon chain is If.body ->
+                # With.body -> Try.body -> FunctionDef.body -> Module.body,
+                # and only Module.body is reachable past the function, so an
+                # unrestricted "one rung out" is really "the whole file").
+                fn_idx = next(
+                    (j for j, b in enumerate(chain)
+                     if b[2] == "FunctionDef.body"), None)
+                if fn_idx is not None:
+                    outer = next(
+                        (b for b in chain[fn_idx + 1:]
+                         if b[2] == "FunctionDef.body"), None)
+                    if outer is not None:
+                        writer_lines = _writers_in(outer[1])
+                        if writer_lines:
+                            where = outer
+            assert writer_lines, (
+                "%s:%d — growth-log call is not followed by a %s inside its "
+                "enclosing block %s (lines %d-%d), nor in the caller function "
+                "body if this is a callback mutator; it may have drifted past "
+                "serialization"
+                % (path.name, call_line, writer, where[2], where[0], where[1]))
+
+        assert found_any, (
+            "%s — no _growth_record_* call site found at all; the pin has "
+            "lost its subject (guard-1653: a test that asserts nothing "
+            "passes)" % path.name)

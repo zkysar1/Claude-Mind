@@ -20,6 +20,7 @@ Run: py -3 core/scripts/tests/test_fileops_snapshot_blacklist_and_gzip.py
 """
 import gzip
 import json
+import pathlib
 import os
 import shutil
 import sys
@@ -166,6 +167,55 @@ def test_save_history_skips_blacklisted_gate_firings_segments_meta(sandbox, meta
                 "non-jsonl sibling must not be blacklisted")
     assert_true(not _fileops._is_snapshot_blacklisted(sandbox, "gate-firings-2026-08-17.jsonl"),
                 "meta glob must not bleed into the world base")
+
+
+@with_sandbox
+def test_save_history_skips_blacklisted_productivity_snapshots_world(sandbox, meta_sandbox, _fileops):
+    """world/productivity-snapshots.jsonl AND its date segments must NOT create
+    a .history snapshot (g-358-49).
+
+    This is the guard-2415 case in its pure form. The writer moved off a bare
+    open(...,"a") onto locked_append_jsonl, which calls save_history() on EVERY
+    append; the legacy file was 7.4 MB taking ~662 appends/24h fleet-wide, so an
+    unblacklisted cutover writes ~4.9 GB of .history per day — strictly worse
+    than the S3 churn the cutover exists to remove.
+
+    Asserted against the sandbox base (which _classify_base resolves to "world"),
+    NOT a bare tmp_path: a tmp_path classifies as "unknown" and matches an empty
+    pattern tuple, which makes every such assertion pass vacuously.
+    """
+    names = ("productivity-snapshots.jsonl",
+             "productivity-snapshots-2026-09-04.jsonl",
+             "productivity-snapshots-2027-01-01.jsonl")
+    for name in names:
+        target = sandbox / name
+        target.write_text(json.dumps({"agent": "a", "score": 0.5}) + "\n",
+                          encoding="utf-8")
+        _fileops.save_history(str(target), str(sandbox), "test-agent",
+                              summary="snapshot append")
+        history_path = sandbox / ".history" / name
+        assert_true(not history_path.exists(),
+                    f"{name} snapshots should be blacklisted; "
+                    f"{history_path} unexpectedly exists")
+        assert_true(_fileops._is_snapshot_blacklisted(sandbox, name),
+                    f"{name} must be blacklisted under world")
+
+    # SSOT pin: whatever the writer actually targets must be covered. If
+    # _productivity_snapshots ever changes its naming, this fails rather than
+    # silently letting the new name snapshot per append.
+    import sys as _sys
+    _sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    from _productivity_snapshots import segment_name, LEGACY_STORE_NAME
+    assert_true(_fileops._is_snapshot_blacklisted(sandbox, segment_name()),
+                "today's segment name (per the writer SSOT) must be blacklisted")
+    assert_true(_fileops._is_snapshot_blacklisted(sandbox, LEGACY_STORE_NAME),
+                "the legacy store name (per the writer SSOT) must be blacklisted")
+
+    # Negative controls, both directions.
+    assert_true(not _fileops._is_snapshot_blacklisted(sandbox, "productivity-summary.txt"),
+                "unrelated sibling must not be blacklisted")
+    assert_true(not _fileops._is_snapshot_blacklisted(meta_sandbox, "productivity-snapshots.jsonl"),
+                "world entry must not bleed into the meta base")
 
 
 @with_sandbox

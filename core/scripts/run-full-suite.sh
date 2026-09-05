@@ -170,9 +170,10 @@ done
 # exclusion reads as coverage: measured 2026-08-02 (), triage printed
 # "2 environmental | 0 genuine" while two shell files in the invisible half were
 # red solo. The halves stream to THIS script's stdout and nothing durable is
-# written -- a real log dir holds chunk-*.log and nothing else (measured
-# 2026-08-10) -- so a later triage has nothing to read unless each half's result
-# is recorded HERE, at the moment it is produced.
+# written -- a real log dir holds chunk-*.log, this record and the chunk-*.args
+# lists (), but NOTHING FROM THESE HALVES (measured 2026-08-10) -- so
+# a later triage has nothing to read unless each half's result is recorded
+# HERE, at the moment it is produced.
 #
 # The dir comes from run-full-suite.py --print-out-dir, i.e. the SAME resolver
 # the run used. Re-deriving that default in bash would be a second source of

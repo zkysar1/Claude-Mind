@@ -618,7 +618,176 @@ def cmd_check_file(args):
 # Subcommand: record-prov / provenance-check  (session provenance manifest)
 # ---------------------------------------------------------------------------
 
-PROVENANCE_KINDS = ("url", "search", "node", "board")
+# `retrieval` vs `retrieval-auto` is the load-bearing distinction in this tuple,
+# not a taxonomy nicety (). Both are written by retrieve.sh, the
+# framework's unified retrieval entry point. But retrieve.sh has TWO callers with
+# opposite meanings:
+#   retrieval       — an agent DELIBERATELY consulted the stores before acting.
+#   retrieval-auto  — user-prompt-retrieval-inject.sh ran its automatic pre-pass
+#                     on a user message. The model did not ask for this and may
+#                     never read the injected result.
+# The retrieval-floor query below counts only the DELIBERATE kinds. Collapsing
+# the two would make the floor unreachable rather than merely noisy: that hook
+# fires on essentially every substantive non-loop user message, so a floor that
+# accepted `retrieval-auto` as evidence would report "the agent consulted its
+# knowledge" for every session in which a human typed a sentence — passing
+# forever while measuring nothing, which is the failure mode a floor exists to
+# prevent (guard-1760: a checker must not report what it declined to look at as
+# a pass).
+PROVENANCE_KINDS = ("url", "search", "node", "board", "retrieval", "retrieval-auto")
+
+# Kinds that count as the agent having actually consulted something. Everything
+# in PROVENANCE_KINDS except the automatic pre-pass.
+DELIBERATE_RETRIEVAL_KINDS = ("url", "search", "node", "board", "retrieval")
+
+
+def count_deliberate_retrievals(session_id=None):
+    """How many DELIBERATE store/source consultations happened this session.
+
+    Excludes `retrieval-auto` by construction — see DELIBERATE_RETRIEVAL_KINDS.
+    """
+    return sum(1 for kind, _ts, _v in read_provenance(session_id=session_id)
+               if kind in DELIBERATE_RETRIEVAL_KINDS)
+
+
+def cmd_retrieval_floor(args):
+    """exit 0 = this session HAS consulted something; exit 1 = zero consultations.
+
+    THE NEGATIVE IS NARROW AND MUST BE READ AS SUCH (guard-4407). The manifest is
+    fed by hooks bound to the Read/WebFetch/WebSearch TOOLS plus retrieve.sh and
+    tree-read.sh. A page pulled with `curl`, a store read with `cat`, or a
+    consultation made before the last manifest reset leaves no entry. So exit 1
+    means "no recorded consultation", never "the agent invented this" — which is
+    why every consumer of this query is ADVISORY and none may refuse a write.
+    """
+    n = count_deliberate_retrievals(session_id=args.session_id)
+    if not args.quiet:
+        print(n)
+    # sys.exit, NOT `return` — main() calls fn(args) and DISCARDS the result, so
+    # a returned code is silently dropped and this query would answer "consulted"
+    # for every session including the empty ones. The exit code IS the answer
+    # here, exactly as in cmd_provenance_check below.
+    sys.exit(0 if n > 0 else 1)
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: retrieval-pulse  ( layer 2 — the zero-retrieval pulse)
+# ---------------------------------------------------------------------------
+#
+# Layer 1 (retrieval-floor-gate.sh) asks "did this session consult ANYTHING
+# before writing to a knowledge store?" — one question, at one moment, on one
+# store class. That leaves the mid-task interior uncovered: a session can run
+# for dozens of substantive tool calls, drift a long way from what it last
+# checked, and never touch a knowledge store at all — so the floor never fires
+# and nothing else is watching.
+#
+# The pulse is the interior counter. It counts consecutive substantive tool
+# calls with NO new deliberate consultation and, at the threshold, emits one
+# advisory naming the count and the nearest retrieve-before-deciding decision
+# points, then resets.
+#
+# IT MUST REUSE count_deliberate_retrievals AND NEVER RE-COUNT THE MANIFEST.
+# The layer-1 author recorded this as the design constraint the spec did not
+# anticipate: `retrieval-auto` (the UserPromptSubmit auto pre-pass) fires on
+# essentially every substantive user message, so a pulse that reset on injected
+# retrievals would reset constantly and measure nothing — the same
+# unreachable-gate failure the floor's DELIBERATE_RETRIEVAL_KINDS split exists
+# to prevent (guard-1760).
+
+DEFAULT_PULSE_THRESHOLD = 15
+
+
+def pulse_state_path(session_id=None):
+    """Counter state for the zero-retrieval pulse, beside this session's tracker.
+
+    Routed through tracker_path() rather than resolving a second time of its
+    own: two concurrent Bodies must not share a streak counter, for exactly the
+    reason they must not share a dedup tracker (Phase 1D per-Body routing).
+    """
+    t = tracker_path(session_id=session_id)
+    if t is None:
+        return None
+    return t.with_name(t.stem + "-pulse.txt")
+
+
+def _read_pulse_state(path):
+    """(last_n, streak) from the one-line state file; (0, 0) on any problem.
+
+    Plain text, not JSON, matching the sibling tracker's format — and so that a
+    truncated or hand-mangled file degrades to a reset rather than an exception
+    on a hook path that must never raise.
+    """
+    try:
+        parts = path.read_text(encoding="utf-8").split()
+        return int(parts[0]), int(parts[1])
+    except Exception:
+        return 0, 0
+
+
+def _write_pulse_state(path, last_n, streak):
+    """Best-effort atomic write. Never raises — this runs inside a PostToolUse hook."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text("%d %d\n" % (last_n, streak), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+PULSE_ADVISORY = (
+    "[retrieval-pulse] ADVISORY: {n} substantive tool calls this session with no new "
+    "recorded store consultation. If you are about to edit an existing file (point 10), "
+    "file a goal that prescribes a fix (11), run a probe whose empty result authorizes an "
+    "action (12), report a count or census (13), or declare something absent/impossible (8) "
+    "— retrieve first: bash core/scripts/retrieve.sh --category \"<topic>\" --depth shallow. "
+    "Consultations made with cat/curl/grep are invisible to the manifest (guard-4407), so "
+    "this is a prompt to check, never a claim that you have retrieved nothing."
+)
+
+
+def cmd_retrieval_pulse(args):
+    """exit 0 = pulse FIRED (advisory printed); exit 1 = silent.
+
+    The exit code IS the answer, as in cmd_retrieval_floor — main() calls fn(args)
+    and discards the return value, so a returned code would be dropped and every
+    tick would read as "fired".
+    """
+    threshold = args.threshold
+    if threshold is None:
+        try:
+            threshold = int(os.environ.get("RETRIEVAL_PULSE_THRESHOLD", "")
+                            or DEFAULT_PULSE_THRESHOLD)
+        except ValueError:
+            threshold = DEFAULT_PULSE_THRESHOLD
+    if threshold <= 0:          # 0 / negative disables the pulse entirely
+        sys.exit(1)
+
+    path = pulse_state_path(session_id=args.session_id)
+    if path is None:
+        sys.exit(1)
+
+    n = count_deliberate_retrievals(session_id=args.session_id)
+    last_n, streak = _read_pulse_state(path)
+
+    # ANY movement in the deliberate count resets the streak, in EITHER
+    # direction. An increase means the agent consulted something. A DECREASE
+    # means the manifest was cleared (new context window after autocompact), so
+    # the streak that preceded it describes a session that no longer exists —
+    # continuing to count it would fire an advisory about someone else's work.
+    if n != last_n:
+        _write_pulse_state(path, n, 0)
+        sys.exit(1)
+
+    streak += 1
+    if streak >= threshold:
+        _write_pulse_state(path, n, 0)
+        if not args.quiet:
+            print(PULSE_ADVISORY.format(n=streak))
+        sys.exit(0)
+
+    _write_pulse_state(path, n, streak)
+    sys.exit(1)
 
 
 def cmd_record_prov(args):
@@ -706,6 +875,20 @@ def build_parser():
                       help="What kind of thing was retrieved (default: url)")
     rp_p.add_argument("value", help="The URL, node key, or message id that was retrieved")
 
+    rf_p = sub.add_parser("retrieval-floor",
+                          help="Count DELIBERATE consultations this session; exit 1 if zero")
+    rf_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
+    rf_p.add_argument("--quiet", action="store_true", help="Exit code only, no count")
+
+    pu_p = sub.add_parser("retrieval-pulse",
+                          help="Tick the zero-retrieval counter; exit 0 (+advisory) when it fires")
+    pu_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
+    pu_p.add_argument("--threshold", type=int, default=None,
+                      help="Consecutive no-consultation tool calls before firing "
+                           "(default: $RETRIEVAL_PULSE_THRESHOLD or %d; <=0 disables)"
+                           % DEFAULT_PULSE_THRESHOLD)
+    pu_p.add_argument("--quiet", action="store_true", help="Exit code only, no advisory text")
+
     pc_p = sub.add_parser("provenance-check",
                           help="Was this URL/path/node retrieved this session? exit 0 yes, 1 no")
     pc_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
@@ -724,6 +907,8 @@ DISPATCH = {
     "clear": cmd_clear,
     "status": cmd_status,
     "record-prov": cmd_record_prov,
+    "retrieval-floor": cmd_retrieval_floor,
+    "retrieval-pulse": cmd_retrieval_pulse,
     "provenance-check": cmd_provenance_check,
 }
 

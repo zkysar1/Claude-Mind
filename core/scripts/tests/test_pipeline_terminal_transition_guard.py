@@ -133,6 +133,16 @@ def _move(world: Path, rid: str, stage: str, body: dict | None = None):
         body=json.dumps(body).encode() if body else b""))
 
 
+def _update_field(world: Path, rid: str, field: str, value: str):
+    """The SECOND write path (). Deliberately exercised through the
+    endpoint rather than the predicate: the predicate has its own matrix test
+    below, and what this successor had to prove is that update_field actually
+    CONSULTS it — a guard function nothing calls is the shape g-306-421's own
+    docstring warned was still open here."""
+    return pipeline_write.update_field(FakeCtx(
+        world, {"id": rid, "field": field, "value": value}))
+
+
 # --------------------------------------------------------------------------
 # The defect: resolve twice
 # --------------------------------------------------------------------------
@@ -169,7 +179,16 @@ def test_the_refusal_names_the_legal_route_rather_than_only_saying_no(tmp_path):
     world = _seed(tmp_path, [_rec(rid, "resolved", outcome="CONFIRMED")])
     body = _move(world, rid, "resolved").body.decode()
     assert "pipeline-update-field.sh" in body, "must name the correction route"
-    assert "--field outcome" in body
+    # THE SHAPE, not just the script name (). This assertion read
+    # `"--field outcome" in body` until 2026-09-03, pinning a command the
+    # wrapper REFUSES: pipeline-update-field.sh parses three positionals and its
+    # `-*)` arm calls argv_strict_refuse_unknown, so the route this guard names
+    # as its only escape exited 2 with "unknown option '--field'". Measured
+    # live, both directions: the flag form rc=2, `<id> outcome CONFIRMED`
+    # reached the daemon. A guard with no override handing out a dead command
+    # is worse than one that says nothing.
+    assert "pipeline-update-field.sh <id> outcome <v>" in body, body
+    assert "--field" not in body, "must not resurrect the refused flag form"
     assert "archiv" in body.lower(), "must say archival is still allowed"
 
 
@@ -289,6 +308,123 @@ def test_the_write_layer_rank_matches_the_merge_layer_rank():
     that makes that loud."""
     import coordination_merge
     assert pipeline_write._STAGE_RANK == coordination_merge._PIPELINE_STAGE_RANK
+
+
+# --------------------------------------------------------------------------
+# The update_field launder path ()
+#
+#  guarded `move` and said so in its own docstring: update_field has no
+# field whitelist, so a bare `stage` write could walk a resolved record back to
+# a live stage and a re-resolve then entered through the front door with the
+# move guard never firing. These pin the successor.
+#
+# THE guard-1080 ENUMERATION behind the shape of this fix, recorded here because
+# it is what stops the next reader "simplifying" it into a field refusal: ZERO
+# scripted writers of `stage` through update-field exist in the tree (.sh, .py,
+# SKILL.md, .yaml) and ZERO tests wrote one. That empty set makes refusing the
+# field outright *available* — and it is still the wrong fix, because ad-hoc
+# agent use is real and legitimate: bravo resolved a record in place with
+# `pipeline-update-field <id> stage resolved` while pipeline-move was blocked by
+# the rb-3080 write-block (journal 2026-07-12; exp--resolution-survives-
+# writeblock records it landing cleanly). Refusing the field would have deleted
+# that path. The forward test below is that caller.
+# --------------------------------------------------------------------------
+
+def test_update_field_cannot_launder_resolved_BACK_to_active(tmp_path):
+    """The defect this successor exists to close, asserted by ERROR CODE and by
+    SURVIVAL. Status alone would be weak here for the same reason the move
+    tests give: 400 is reachable from _validate_record too, so a bare status
+    assertion can pass with the guard reverted."""
+    rid = "2026-07-01_uf-launder"
+    world = _seed(tmp_path, [_rec(rid, "resolved", outcome="CONFIRMED",
+                                  outcome_date="2026-07-02",
+                                  outcome_detail="confirmed by g-306-421")])
+    before = json.dumps(_live(world, rid), sort_keys=True)
+
+    resp = _update_field(world, rid, "stage", "active")
+
+    assert resp.status == 400, getattr(resp, "body", resp)
+    assert "invalid_stage_transition" in resp.body.decode(), resp.body
+    after = json.dumps(_live(world, rid), sort_keys=True)
+    assert after == before, "the verdict must survive the refused stage write"
+
+
+def test_update_field_backward_from_archived_is_refused(tmp_path):
+    rid = "2026-07-01_uf-backward"
+    world = _seed(tmp_path, [_rec(rid, "archived", outcome="CONFIRMED",
+                                  archived_date="2026-07-03")])
+    resp = _update_field(world, rid, "stage", "resolved")
+    assert resp.status == 400, getattr(resp, "body", resp)
+    assert "invalid_stage_transition" in resp.body.decode(), resp.body
+    assert _live(world, rid)["stage"] == "archived"
+
+
+def test_update_field_re_resolving_a_resolved_record_is_refused(tmp_path):
+    """Same asymmetry as the move path: re-RESOLVE is refused, re-ARCHIVE is
+    not. Pinned separately so the two same-stage cases cannot be collapsed into
+    one rank comparison here either."""
+    rid = "2026-07-01_uf-re-resolve"
+    world = _seed(tmp_path, [_rec(rid, "resolved", outcome="CONFIRMED")])
+    resp = _update_field(world, rid, "stage", "resolved")
+    assert resp.status == 400, getattr(resp, "body", resp)
+    assert "invalid_stage_transition" in resp.body.decode(), resp.body
+
+
+# --------------------------------------------------------------------------
+# guard-1080 again: the legitimate update_field writes must still succeed.
+# These are the half that stops the over-fix, exactly as above.
+# --------------------------------------------------------------------------
+
+def test_update_field_FORWARD_stage_write_STILL_SUCCEEDS(tmp_path):
+    """THE enumerated legitimate caller: the in-place resolve bravo used when
+    pipeline-move was blocked. A field-level refusal passes every other test in
+    this section and deletes this path."""
+    rid = "2026-07-01_uf-forward"
+    world = _seed(tmp_path, [_rec(rid, "active")])
+    resp = _update_field(world, rid, "stage", "resolved")
+    assert resp.status == 200, getattr(resp, "body", resp)
+    assert _live(world, rid)["stage"] == "resolved"
+
+
+def test_update_field_archived_to_archived_STILL_SUCCEEDS(tmp_path):
+    """Tombstone convergence () reaches this path too."""
+    rid = "2026-07-01_uf-idempotent-archive"
+    world = _seed(tmp_path, [_rec(rid, "archived", outcome="CONFIRMED",
+                                  archived_date="2026-07-03")])
+    resp = _update_field(world, rid, "stage", "archived")
+    assert resp.status == 200, getattr(resp, "body", resp)
+    assert _live(world, rid)["stage"] == "archived"
+
+
+def test_update_field_NON_stage_writes_on_a_resolved_record_are_untouched(tmp_path):
+    """The correction route both refusal messages name. If the guard reached
+    any field on a terminal record, the guard would strand the very escape it
+    advertises — the g-115-4821 shape, one path over."""
+    rid = "2026-07-01_uf-outcome-route"
+    world = _seed(tmp_path, [_rec(rid, "resolved", outcome="CONFIRMED")])
+    resp = _update_field(world, rid, "outcome", "CORRECTED")
+    assert resp.status == 200, getattr(resp, "body", resp)
+    rec = _live(world, rid)
+    assert rec["outcome"] == "CORRECTED" and rec["stage"] == "resolved"
+
+
+def test_update_field_stage_writes_on_NON_terminal_records_are_untouched(tmp_path):
+    rid = "2026-07-01_uf-live-stage"
+    world = _seed(tmp_path, [_rec(rid, "discovered")])
+    resp = _update_field(world, rid, "stage", "active")
+    assert resp.status == 200, getattr(resp, "body", resp)
+    assert _live(world, rid)["stage"] == "active"
+
+
+def test_update_field_refusal_names_the_correction_route_in_a_shape_that_RUNS(tmp_path):
+    """Symmetric with the move-path route test, and pinning the same lesson:
+    the message must not name the `--field/--value` form, which the wrapper
+    refuses with exit 2."""
+    rid = "2026-07-01_uf-route"
+    world = _seed(tmp_path, [_rec(rid, "resolved", outcome="CONFIRMED")])
+    body = _update_field(world, rid, "stage", "active").body.decode()
+    assert "pipeline-update-field.sh <id> outcome <v>" in body, body
+    assert "--field" not in body, "must not resurrect the refused flag form"
 
 
 if __name__ == "__main__":

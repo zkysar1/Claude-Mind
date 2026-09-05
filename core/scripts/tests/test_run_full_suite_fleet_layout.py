@@ -107,7 +107,23 @@ def _capture_marker(monkeypatch, tmp_path, argv, populated):
         seen.append(list(cmd))
         return None
 
+    # BOTH, and _testpaths is the load-bearing one (). TESTS_DIR
+    # stopped being the collection root when the three-testpaths resolver
+    # landed () -- it is now only _testpaths()'s last-resort
+    # fallback -- so patching it alone left main() collecting the REAL 1,376
+    # files. That was merely wasteful until the argv-budget refusal landed
+    # (): one chunk of 1,376 real paths is a 72,588-char argv
+    # against a 28,000 budget, so main() returned 2 BEFORE spawning pytest and
+    # all six tests here failed "main() never invoked pytest" -- an assertion
+    # about the runner's fleet_layout decision, reddened by the size of a tree
+    # it was never supposed to look at.
     monkeypatch.setattr(RFS, "TESTS_DIR", fake_tests)
+    monkeypatch.setattr(RFS, "_testpaths", lambda: [fake_tests])
+    # main() narrates its roots as `d.relative_to(PROJECT_ROOT)`, so a
+    # collection root outside the repo raises ValueError before the chunk
+    # loop. Re-root at tmp_path -- the only other PROJECT_ROOT readers here
+    # are the two git probes, and both fail open under the stub above.
+    monkeypatch.setattr(RFS, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(RFS, "_populated_agents", lambda *a, **k: populated)
     monkeypatch.setattr(RFS.subprocess, "run", _fake_run)
 
@@ -115,7 +131,15 @@ def _capture_marker(monkeypatch, tmp_path, argv, populated):
 
     # main() also shells out to `git rev-parse HEAD` for the tree-move check
     # BEFORE the chunk loop, so seen[0] is git, not pytest. Select by content.
-    pytest_cmds = [c for c in seen if "pytest" in c]
+    # AND SKIP THE @argfile CAPABILITY PROBE, which is ALSO a pytest argv and
+    # ALSO precedes the loop (_pytest_expands_argfile). It is not a chunk
+    # invocation and carries no marker, so including it would make these four
+    # tests assert about the wrong command -- which is exactly what happened
+    # when the probe landed. Identify it by its own argfile name rather than by
+    # position, so a third pre-loop call cannot silently re-break the selector.
+    pytest_cmds = [c for c in seen
+                   if "pytest" in c
+                   and not any("argfile-probe" in str(tok) for tok in c)]
     assert pytest_cmds, "main() never invoked pytest (saw: %r)" % (seen,)
     cmd = pytest_cmds[0]
     dash_m = [i for i, tok in enumerate(cmd) if tok == "-m"]

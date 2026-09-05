@@ -120,7 +120,7 @@ def is_live(sig, now, max_age_hours):
     return live_age_hours(sig, now, max_age_hours) is not None
 
 
-def decide(goal, *, now, max_age_hours, clear=False, reason="", by=""):
+def decide(goal, *, now, max_age_hours, clear=False, reason="", by="", base=""):
     """Pure decision. Returns ``(verdict, value)``.
 
     ``value`` is the string to hand ``aspirations-update-goal.sh`` when the
@@ -129,6 +129,16 @@ def decide(goal, *, now, max_age_hours, clear=False, reason="", by=""):
     ``goal`` is None when the id resolved to no record — kept as an explicit
     input rather than an exception so the no-goal branch is testable like any
     other.
+
+    ``base`` is the git base the CALLER computed its ahead-ness against — a
+    short HEAD sha plus the last-known origin sha when the caller has one
+    (g-115-8634 outcome 1). It is recorded because the ahead-ness this signal
+    encodes is BOX-LOCAL by construction: a local branch that is behind origin
+    MANUFACTURES outstanding tips, and the resulting number is then written
+    into a shared field that other machines consume and cannot audit
+    (guard-5797). Carrying the base lets a consumer discount a stale-base
+    signal instead of trusting it blind. Optional and omitted when empty, so a
+    caller that genuinely has no base does not write a misleading one.
     """
     if goal is None:
         return VERDICT_SKIP_NO_GOAL, None
@@ -157,6 +167,12 @@ def decide(goal, *, now, max_age_hours, clear=False, reason="", by=""):
         # store; an unbounded field here is how a store grows a narrative column.
         "reason": " ".join((reason or "").split())[:200],
     }
+    # Bounded like `reason`, and OMITTED rather than written empty: a consumer
+    # must be able to tell "this producer declared no base" from "the base was
+    # empty", because only the first is a reason to distrust the count.
+    base_s = " ".join((base or "").split())[:120]
+    if base_s:
+        payload["base"] = base_s
     return VERDICT_SET, json.dumps(payload)
 
 
@@ -213,6 +229,7 @@ def main(argv):
     verdict, value = decide(
         goal, now=datetime.now(), max_age_hours=max_age, clear=clear,
         reason=os.environ.get("REASON", ""), by=os.environ.get("BY", ""),
+        base=os.environ.get("BASE", ""),
     )
 
     if verdict == VERDICT_SKIP_NO_GOAL:

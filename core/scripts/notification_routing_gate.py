@@ -177,8 +177,31 @@ HUMAN_ONLY_PATTERNS = (
      # /home/user/agent/out.log" MATCHED, because a filesystem path contains the
      # literal `user/`. Found by probing the pattern against ordinary prose
      # rather than only against the strings it was written for.
-     r"|\bIAM\b[^\n]{0,120}?(?<![\w/])user/[\w.+=,@-]+"
-     r"|(?<![\w/])user/[\w.+=,@-]+[^\n]{0,120}?\bIAM\b",
+     # The proximity window is [\s\S], NOT [^\n] (, measured
+     # 2026-09-03). A REAL notification body is multi-line -- it puts the
+     # principal, the action and the resource on separate lines -- so with a
+     # newline-excluding window `IAM` (in the subject or a heading) and
+     # `user/<name>` (on its own line) never co-occur inside one line and the
+     # entry MISSES the exact message it exists to catch. Reproduced against
+     # this module: decide("blocker", <real subject>, <multi-line body naming
+     # user/ayoai-fleet-agent>) returned SUPPRESS; the same content on ONE line
+     # returned SEND. That suppression sent a "we are blocked, only you can
+     # grant this" alert to the agent-facing findings board instead of the user.
+     # FP COST MEASURED over 13,114 live board messages by the method this file
+     # already uses (guard-1790 -- run it and READ the hits): 49 -> 53 hits,
+     # 0.37% -> 0.40%. All FOUR new hits read; all four are genuine IAM
+     # capability-boundary reports on user/ayoai-fleet-agent that the old window
+     # was MISSING because the principal and the `iam` token sat on different
+     # lines. Zero false positives introduced.
+     # THE TWO NEGATIVE CONTROLS SURVIVE THE WIDENING, and that is the load-
+     # bearing check rather than the hit count: `role/` still does not match
+     # (guard-3763 / rb-7835 -- role-vs-user is the discriminator and a ROLE
+     # grant is agent-doable), and the `(?<![\w/])` lookbehind still blocks the
+     # filesystem-path form -- "IAM audit complete.\nThe log is at
+     # /home/user/agent/out.log" does NOT match even now that the window spans
+     # newlines, which is the new risk surface this change creates.
+     r"|\bIAM\b[\s\S]{0,120}?(?<![\w/])user/[\w.+=,@-]+"
+     r"|(?<![\w/])user/[\w.+=,@-]+[\s\S]{0,120}?\bIAM\b",
      "IAM grant on a USER principal"),
     # A permissions-boundary EXPLICIT DENY is a different human-only shape and
     # deserves its own label in the audit line: an identity-policy addition

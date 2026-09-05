@@ -40,6 +40,7 @@ Exit codes:
 """
 
 import argparse
+import atexit
 import configparser
 import json
 import os
@@ -47,6 +48,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -132,8 +134,9 @@ OTHER_HALVES = (
 # other halves instead of being silent about them.
 #
 # WHY A FILE AND NOT A PARSE OF THE RUN LOG: measured on this box 2026-08-10,
-# a real log dir contains chunk-*.log and nothing else. There is no run log in
-# it -- the other halves stream to the shell's stdout, which an operator may or
+# a real log dir contains chunk-*.log, this record, and (since ) the
+# per-chunk chunk-*.args lists -- but NO RUN LOG. That absence is the point
+# here; the other halves stream to the shell's stdout, which an operator may or
 # may not have redirected, and never to a path this tool can find. So the
 # summary has to be RECORDED at the moment it is produced or it is gone.
 HALVES_RECORD = "halves.jsonl"
@@ -284,6 +287,13 @@ def _chunk(items, n):
     return out
 
 
+# Windows CreateProcess caps a whole command line here; the budget leaves room
+# for the interpreter path, the flags and the environment block, so the refusal
+# fires as a legible message rather than as WinError 206 (/guard-5635).
+_CMDLINE_CEILING = 32767
+_ARGV_BUDGET = 28000
+
+
 def _progress_tally(text):
     """(passed, failed, errors, last_pct) counted from pytest's progress chars.
 
@@ -329,6 +339,42 @@ def _parse_counts(text):
     return 0, 0, 0
 
 
+def _is_measurement(returncode, p, f, e):
+    """True when a pytest process's output may be READ AS A RESULT ().
+
+    ONE predicate, TWO call sites. `_solo` carried it inline and the chunk loop
+    carried NOTHING -- it discarded `subprocess.run`'s return value entirely, so
+    a chunk that exited 2/3/4/5 was counted exactly like one that exited 0. The
+    fix the goal asked for is REUSE, not a second copy: a duplicated validity
+    rule is the shape that drifts, and this one already reads as authoritative
+    on both paths.
+
+    Both halves are required, and `_solo`'s docstring holds the evidence for
+    why: pytest exits 0 or 1 to mean "I ran your tests" (2/3/4/5 are
+    interrupted, internal error, usage error and collected-nothing), AND the log
+    must account for at least one test. An empty population returns the UNSAFE
+    verdict, never the safe one (guard-2166).
+
+    WHAT THIS DOES NOT CATCH, stated here because the goal that commissioned it
+    (g-115-8887) prescribed it as the whole remedy and it is not. The defect,
+    measured on this tree 2026-09-04, is a process that dies mid-run at ~20%
+    with `returncode == 0` and a log whose
+    counts still parse non-zero (`_parse_counts` falls back to the progress-dot
+    tally, so 648 dots read as 648 passed). That input satisfies BOTH halves
+    here and is caught one layer over, by `_has_summary_line` -- see
+    `_looks_aborted`. guard-1501 states the same thing from the other side:
+    "rc=0 is not the tell; the ABSENT SUMMARY LINE is". This predicate covers
+    the spawn, usage and collected-nothing lanes; the completion marker covers
+    the death-mid-run lane. Neither subsumes the other.
+
+    Both call sites fail in the SAME direction (refuse to certify), so there is
+    no deliberate fail-open/fail-closed split to preserve here -- guard-2373
+    applies only when the callers' biases differ, and if a future caller wants
+    the other bias it must not get it by editing this function.
+    """
+    return returncode in (0, 1) and (p + f + e) > 0
+
+
 def _looks_aborted(text):
     """True only when the run stopped BEFORE reaching 100%.
 
@@ -340,8 +386,61 @@ def _looks_aborted(text):
     tally = _progress_tally(text)
     if not tally:
         return False
-    has_counts = bool(re.search(r"\d+\s+(passed|failed)\b", text))
-    return tally[3] < 100 and not has_counts
+    return tally[3] < 100 and not _has_summary_line(text)
+
+
+# pytest's own summary line, at the START of a line: "648 passed, 3 warnings in
+# 41.20s" under -q, "===== 648 passed in 41.20s =====" without it. The leading
+# `=*` covers the banner form; `\s*` after it must NOT be allowed to skip over
+# prose, which is why there is no `.*` anywhere in this pattern.
+_SUMMARY_LINE_RE = re.compile(r"^=*\s*\d+\s+(?:passed|failed|error)", re.M)
+# A pytest -q progress row: the dots/letters plus the trailing [ NN%] marker.
+_PROGRESS_LINE_RE = re.compile(r"^[.FEsxX]+\s*\[\s*\d+%\]", re.M)
+
+
+def _has_summary_line(text):
+    r"""True when the log carries pytest's OWN terminal summary line (g-115-8887).
+
+    THIS REPLACES `re.search(r"\d+\s+(passed|failed)")`, an UNANCHORED search
+    over the whole log, and the replacement is the fix for a measured false
+    CLEAN. `_looks_aborted` treats a count line as proof the run finished, so
+    ANY substring shaped like one anywhere in the log switched the abort
+    detector off. The silent-zero branch does not catch the leftover either --
+    it requires `_progress_tally` to be None, and a chunk that died at 21% has
+    plenty of progress rows. So the chunk contributed NO reason at all and the
+    run printed VERDICT: CLEAN.
+
+    NOT HYPOTHETICAL, AND THE CALLER IS THE SOURCE. Measured on this tree
+    2026-09-04: 30 files under core/scripts/tests carry pytest-summary-shaped
+    strings in their fixtures ("6 passed in 1.0s", "5 passed, 1 failed in 1.0s",
+    "32 passed in 4.0s") -- they are the suite's own self-tests, including this
+    runner's. pytest prints a failing test's captured stdout and assertion repr
+    into the log, so a chunk holding one of those files spills a count-shaped
+    line into its own log as a matter of course. Simulated end to end: a chunk
+    stopping at 21% with one such line classified `clean`, reasons `[]`, and
+    `_parse_counts` returned (20, 0, 0) -- the STRAY number, not the 648 dots.
+
+    THE DISCRIMINATOR IS ORDER, NOT SHAPE (g-115-8887), and it has to be: a
+    test that prints "6 passed in 1.0s" at column 0 produces a line
+    byte-identical to pytest's own. What cannot be forged is POSITION. pytest emits its summary AFTER all
+    progress output, so the real one is the last count line in the file and it
+    sits past the last progress row. A line spilled mid-run has progress rows
+    after it. When there is no progress output at all there is nothing to order
+    against, so the count line is accepted -- that lane is the silent-zero
+    branch's, not this one's, and stealing it here would double-report.
+
+    Deliberately NOT a duration or "in Ns" check: the fixture strings carry
+    those too, so shape-matching harder loses to the next fixture. Deliberately
+    NOT a tail-window check either: the measured log is nine lines, where "the
+    tail" is most of the file.
+    """
+    counts = list(_SUMMARY_LINE_RE.finditer(text))
+    if not counts:
+        return False
+    progress = list(_PROGRESS_LINE_RE.finditer(text))
+    if not progress:
+        return True
+    return counts[-1].start() > progress[-1].start()
 
 
 _HANG_RE = re.compile(r"Timeout \((\d+:\d{2}:\d{2})\)!")
@@ -758,7 +857,7 @@ def _solo(path, root, env):
     except Exception as exc:
         return None, None, str(exc)
     p, f, e = _parse_counts(r.stdout or "")
-    if r.returncode not in (0, 1) or (p + f + e) == 0:
+    if not _is_measurement(r.returncode, p, f, e):
         return None, None, (
             "pytest rc=%d accounted for %d test(s) -- executed nothing, so this "
             "is not a measurement" % (r.returncode, p + f + e))
@@ -939,6 +1038,94 @@ def triage(out, root, env):
                  or failed_halves) else 0
 
 
+def _pytest_expands_argfile(out, env):
+    """Does THIS pytest turn `@<file>` into the arguments inside that file?
+
+    PROBED, NEVER ASSUMED. The @argfile chunking landed 2026-09-03 (5b7089537)
+    on the stated premise that "pytest reads arguments from a file given an `@`
+    prefix (argparse fromfile_prefix_chars)". That premise is FALSE on pytest
+    7.4.4, which does not set `fromfile_prefix_chars` at all -- measured on
+    cc-07 2026-09-04: zero occurrences of the token in
+    `_pytest/config/argparsing.py`, and `pytest @<file>` naming ONE real test
+    file collected 0 tests where the same path on argv collected 25.
+
+    THE FAILURE IS QUIET IN THE WAY THAT MATTERS. pytest treats the unexpanded
+    `@<path>` as a test path, prints `ERROR: file or directory not found` at
+    rc=4 and collects NOTHING -- so every chunk log carries a warnings block
+    and NO summary line. _parse_counts reads (0,0,0) from each and classify()
+    calls the run INVALID (contended): a verdict that sends the reader up the
+    chunk ladder, which can NEVER fix it (run-full-suite-after-deep-code.md
+    item 3 -- INVALID has two causes and the ladder only fixes one). Measured
+    2026-09-04: all 4 chunks, 1,365 files, 0 tests run, on a box where the
+    same tree had run 15,513 tests four hours earlier.
+
+    The original change was RIGHT ABOUT ITS OWN PROBLEM -- guard-5635's
+    Windows CreateProcess ceiling is real and argv-length-bound. So support is
+    USED where it exists and fallen back from where it does not, rather than
+    reverted: a POSIX box has a ~2MB ARG_MAX and never needed the argfile.
+
+    AND THE POSITIVE CONTROL WAS NOT SKIPPED -- that is the instructive part.
+    `test_pytest_still_honours_an_argfile` was written as an external-contract
+    pin for exactly this, and it WORKED: measured at HEAD on cc-07 2026-09-04
+    it was the ONE failure in its file, naming the cause in a single line. The
+    gap was never a missing test. It is that the pin's answer DEPENDS ON THE
+    BOX -- green where the change was authored (Windows), red on Linux/pytest
+    7.4.4 -- and nothing ran it on a box of the second kind before the change
+    propagated there. A gate only reachable on hardware nobody runs it on is
+    not a gate. That test is now a probe-AGREEMENT pin, which holds on every
+    box, and this function is what makes the disagreement survivable.
+
+    Returns True only on positive evidence. Any error or unexpected shape reads
+    False: argv is the mechanism that demonstrably works here, so an unreadable
+    probe must degrade toward it, not away from it.
+
+    ANSWERED IN-PROCESS, DELIBERATELY -- DO NOT "IMPROVE" THIS BACK INTO A
+    SPAWN. The first shipped form ran the real binary (`pytest @<tmpfile>`
+    carrying `--version`, cwd=PROJECT_ROOT, timeout=60). That is the more
+    direct measurement and it was the wrong call, on two counts:
+
+      1. IT TIMED OUT, AND THE BARE `except` TURNED THAT INTO A CONFIDENT WRONG
+         ANSWER. Measured on cc-04 (Linux 6.8.0-138-generic, pytest 9.1.1)
+         2026-09-04: `subprocess.TimeoutExpired` after the full 60s -- pytest
+         starting up inside this project root is not a cheap process, whatever
+         the argfile asks it to do -- caught by `except Exception` and returned
+         as False. This box DOES expand argfiles, so the probe was selecting
+         the branch that collects NOTHING. A 60s wrong answer is strictly worse
+         than no probe at all.
+      2. main()'s spawns are OBSERVED STATE. Five tests in
+         test_run_full_suite_fleet_layout.py read `pytest_cmds[0]`, and the
+         probe's own pytest silently became that.
+
+    Its own agreement pin caught (1) -- not a suite run, not a reader. At HEAD,
+    test_the_argfile_probe_agrees_with_this_pytest was the single red and named
+    the disagreement in one line. That is the pin working exactly as designed.
+
+    Matching `fromfile_prefix_chars=` (WITH the `=`) looks for the KWARG in
+    argparsing's source, not the bare word in prose. 0.042s, and BOTH controls
+    were run before this shipped: the token is present here (True) and a
+    deliberately-bogus near-token is not (False), so this reads a real
+    distinction rather than always answering yes (guard-4414).
+
+    THE SPLIT IS BY PYTEST VERSION, MEASURED ON BOTH SIDES (folded in from the
+    g-115-8876 twin of this function at the 2026-09-04 merge, which reached the
+    same answer independently): pytest 7.4.4 on cc-02 REFUSES the argfile
+    (fromfile_prefix_chars unset); pytest 9.0.2 on DESKTOP-O91DLK2 accepts it
+    and collects identically to direct paths. Two boxes disagreeing is the
+    whole reason this is probed rather than version-compared -- a version
+    boundary would encode a cutoff nobody on this fleet has measured, and the
+    attribute IS the thing that decides.
+
+    `out` and `env` are unused now. The signature is kept because the call site
+    and the harness stub in test_run_full_suite_chunk_spawn.py both pass them.
+    """
+    try:
+        import inspect
+        from _pytest.config import argparsing
+        return "fromfile_prefix_chars=" in inspect.getsource(argparsing)
+    except Exception:
+        return False
+
+
 def _git_head(root):
     """Current HEAD sha, or None when it cannot be read.
 
@@ -962,6 +1149,120 @@ def _git_head(root):
         return (r.stdout or "").strip() or None
     except Exception:
         return None
+
+
+# How many commits the offender range READS, and how many the verdict PRINTS.
+# Both caps are load-bearing and were set from a measurement, not a guess: on
+# this fleet `HEAD~5..HEAD` resolves to THIRTY commits, because a merge brings
+# a whole branch into the range and the worker loop merges on every turn-end.
+# Uncapped, a voided run prints a screen of merge commits and the machine
+# record becomes a multi-kilobyte log line.
+_OFFENDER_READ_LIMIT = 50
+_OFFENDER_SHOW_LIMIT = 15
+
+
+def _git_offenders(root, start_sha, end_sha, limit=_OFFENDER_READ_LIMIT):
+    """Commits reachable from end_sha but not start_sha, newest first.
+
+    -> [{"sha", "author", "subject"}, ...], or None when the range cannot be
+    read. None and [] are DIFFERENT answers and callers MUST render them
+    differently: None means "could not look", [] means "looked and the range
+    is empty" -- which is itself a finding, because HEAD moved yet nothing is
+    in the range, i.e. a reset or rebase moved it BACKWARDS. Collapsing the
+    two is the same guard-1760 defect _git_head's docstring already warns
+    about: a detector that reports what it RAN but stays silent about what it
+    declined to look for.
+
+    Merges are deliberately NOT excluded. The worker loop's Phase -0.3 pull
+    integrates origin commits with `git merge --no-edit`, so the merge commit
+    is frequently the offender itself.
+
+    Fail-open like _git_head: a suite run must never fail because git could
+    not answer a question about who disturbed it.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "log", "--pretty=format:%h\x1f%an\x1f%s",
+             "-n", str(limit), "%s..%s" % (start_sha, end_sha)],
+            capture_output=True, text=True, cwd=str(root), timeout=15)
+        if r is None or r.returncode != 0:
+            return None
+        rows = []
+        for line in (r.stdout or "").splitlines():
+            parts = line.split("\x1f", 2)
+            if len(parts) == 3:
+                rows.append({"sha": parts[0], "author": parts[1],
+                             "subject": parts[2]})
+        return rows
+    except Exception:
+        return None
+
+
+# One greppable line per voided run ( item 3). The human-readable
+# verdict beside it is the by-product; THIS is the line that lets a later
+# cadence count voided runs per week and per offending Body.
+VOID_RECORD_PREFIX = "SUITE-VOID-RECORD:"
+
+
+def _render_offenders(offenders):
+    """-> the verdict's offender lines for `offenders` (the _git_offenders result).
+
+    EXTRACTED SO IT CAN BE TESTED (guard-5867): this text only ever prints on
+    the tree-moved branch, and driving main() to that branch means running a
+    real suite whose HEAD moves underneath it. Inline, the branch was verifiable
+    only by re-typing its logic in a scratch script and eyeballing the output --
+    which tests the copy, not the code. A pure list-returning helper lets the
+    None / empty / capped / normal cases each be asserted directly.
+    """
+    if offenders is None:
+        return ["  Offending commits: COULD NOT READ (git log failed) -- "
+                "this is 'did not look', NOT 'there were none'."]
+    if not offenders:
+        return ["  Offending commits: range is EMPTY. HEAD moved but nothing "
+                "is reachable from finish that was not reachable from launch "
+                "-- a reset or rebase moved HEAD BACKWARDS. The run is still "
+                "void; the cause is not a new commit."]
+    authors = sorted({c["author"] for c in offenders})
+    capped = len(offenders) >= _OFFENDER_READ_LIMIT
+    lines = ["  Offending commits: %s%d, by %s"
+             % ("AT LEAST " if capped else "", len(offenders),
+                ", ".join(authors))]
+    for c in offenders[:_OFFENDER_SHOW_LIMIT]:
+        lines.append("    %s  %-18s %s"
+                     % (c["sha"], c["author"][:18], c["subject"][:72]))
+    if len(offenders) > _OFFENDER_SHOW_LIMIT:
+        lines.append("    ... and %d more not shown"
+                     % (len(offenders) - _OFFENDER_SHOW_LIMIT))
+    if capped:
+        lines.append("  The range read stopped at %d commits, so the count "
+                     "above is a FLOOR, not a total -- a merge brings a whole "
+                     "branch into the range." % _OFFENDER_READ_LIMIT)
+    lines.append("  That list is the COMMITTED half only. A suite is ALSO "
+                 "voided by an UNCOMMITTED mid-run edit to the code under "
+                 "test, which moves no sha and which this runner is "
+                 "structurally blind to (guard-5987) -- so do not read the "
+                 "list above as a complete account of what disturbed the run.")
+    return lines
+
+
+def _emit_void_record(cause, **fields):
+    """Print the machine-readable void record. Never raises.
+
+    Emitted on EVERY path that returns 2, not only tree-moved. A cadence that
+    counted only tree-moved voids would under-report exactly the way the
+    unattributed verdict this supplements already does, and a contract key
+    present on some exit paths but not others is guard-3948's defect --
+    an exact-equality test over the causes is what catches the one you miss.
+    """
+    rec = {"cause": cause,
+           "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "agent": os.environ.get("MIND_AGENT", "") or None,
+           "sid": os.environ.get("MIND_SID", "") or None}
+    rec.update(fields)
+    try:
+        print("%s %s" % (VOID_RECORD_PREFIX, json.dumps(rec, sort_keys=True)))
+    except Exception:
+        pass
 
 
 def _populated_agents(agents_root_dir=None):
@@ -1024,6 +1325,323 @@ def _populated_agents(agents_root_dir=None):
         return None, "agents root unreadable (%s)" % e
 
 
+# ── The log dir is shared, so treat it like one ──────────────────────────────
+# Two distinct defects, one dir (). The dir is keyed only on agent
+# name, so every run by one agent on one box lands in the SAME place.
+#
+# (a) EVIDENCE DESTRUCTION. The stale-chunk clear below used to be a bare
+#     unlink() of chunk-*.log -- a hard delete of records the system cannot
+#     regenerate (a 10-hour run's logs), which is precisely the anti-pattern
+#     archive-before-delete.md names. MEASURED 2026-09-04: a run finished at
+#     03:09 and a second run started 05:24 deleted its chunk logs while they
+#     were still being read for triage. The invariant "one run per log dir"
+#     is right and stays; what was wrong was achieving it by destruction.
+#     Move-aside is the form that rule prefers (step 5), and one slot bounds
+#     the growth at 2 runs -- the previous run survives, the one before it
+#     does not, deliberately: an unbounded archive in a temp dir is a disk
+#     leak, and a pruner would put a delete path back.
+#
+# (b) CONCURRENT STOMP, which is worse and was entirely unguarded. The
+#     working-tree lock in run-full-suite.sh does NOT cover this: it is keyed
+#     on sid, returns 0 for your own sid, and a BACKGROUNDED run inherits no
+#     MIND_SID at all, so it takes no lock while still printing
+#     authoritative-looking chunk counts. Two live runs interleaving into one
+#     dir produce a verdict assembled from two measurements.
+# Refusal texts live as module constants, not inline literals: they are long,
+# they are the only thing a refused caller sees, and a test asserts on their
+# content rather than on a substring buried in main().
+WORKTREE_DAEMON_REFUSAL_TEXT = """run-full-suite: REFUSING -- %s.
+  The worktree spawns its own daemon, and mind-api-start.sh's orphan sweep
+  matches mind_api.src processes by COMMAND LINE with no runtime-dir scoping,
+  so it KILLS the fleet's live daemon -- once per chunk gap. Every daemon-backed
+  test then fails on a stale port, and the run reports a large,
+  authoritative-looking failure count that is PURE ENVIRONMENT (guard-5866).
+  Copying daemon.port does not fix this and neither does a symlink: the kill is
+  the defect, the stale port is only its most visible symptom.
+  Use the daemon-safe MAIN-REPO route instead -- run from the main checkout with
+  STORAGE_BACKEND=local, chunked, and simply do not commit while it runs.
+  Deliberate exception: --override-worktree-daemon "<justification>"."""
+
+CONCURRENT_RUN_REFUSAL_TEXT = """run-full-suite: REFUSING -- another run holds this log dir (%s).
+  Two runs sharing one log dir produce a verdict assembled from two different
+  measurements, and the later run clears the earlier one's chunk logs.
+  The working-tree lock in run-full-suite.sh does NOT cover this: it is keyed on
+  sid, returns 0 for your own sid, and a BACKGROUNDED run inherits no MIND_SID
+  at all, so it takes no lock while still printing authoritative chunk counts.
+  Wait for the other run, give this one its own --out, or pass
+  --override-concurrent-run "<justification>".
+  If you are certain nothing is running, delete %s."""
+
+
+RUN_LOCK_NAME = ".run-lock.json"
+# Longer than the longest measured run on the slowest box (10h01m, alpha
+# DESKTOP-O91DLK2, 24 chunks, 2026-09-03). A TTL shorter than a real run would
+# let a second run steal the lock mid-flight -- the exact collision it exists
+# to prevent.
+RUN_LOCK_TTL_SECONDS = 12 * 3600
+
+
+def _pid_alive_platform(pid):
+    """True / False / None -- and on Windows it actually answers.
+
+    tree_lock._pid_alive returns None for a DEAD pid on Windows, because
+    os.kill(pid, 0) raises a bare OSError there. The run lock's only other
+    escape is the 12h TTL, so a hard kill of a suite run wedges the runner for
+    half a day. Not hypothetical: the FIRST production crash of this lock did
+    exactly that (2026-09-04, pid 23180 killed mid-chunk-01, atexit never fired,
+    lock held with liveness unknowable). OpenProcess + GetExitCodeProcess is
+    the question Windows can answer.
+
+    Every uncertain path returns None so the caller's fail-direction is
+    unchanged when this genuinely cannot tell: ERROR_ACCESS_DENIED (a live
+    process owned by another user) and a handle that will not read both stay
+    UNKNOWN rather than being guessed. Only ERROR_INVALID_PARAMETER -- which is
+    Windows for "there is no such pid" -- returns False.
+    """
+    if os.name != "nt":
+        from tree_lock import _pid_alive
+        return _pid_alive(pid)
+    try:
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_INVALID_PARAMETER = 87
+        STILL_ACTIVE = 259
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else None
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return None
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001 -- cannot tell is not the same as dead
+        return None
+
+
+def evaluate_run_lock(record, my_pid, now, ttl=RUN_LOCK_TTL_SECONDS,
+                      pid_alive=None):
+    """Pure decision: {'blocked': bool, 'reason': str}.
+
+    Split from the IO so the whole truth table is unit-testable with no
+    filesystem and no live process, mirroring tree_lock.evaluate.
+
+    UNKNOWN LIVENESS FALLS BACK TO THE TTL, and on Windows that is the ONLY
+    path that ever frees a lock: os.kill(dead_pid, 0) raises a bare OSError
+    there, so _pid_alive returns None -- not False -- for a dead holder
+    (verified on this box: _pid_alive(999999) -> None). A design that broke
+    the lock only on an explicit False would wedge every future run on
+    Windows, which is the platform this runner is most used on.
+    """
+    if pid_alive is None:
+        pid_alive = _pid_alive_platform
+    if not isinstance(record, dict):
+        return {"blocked": False, "reason": "no lock"}
+    pid = record.get("pid")
+    started = record.get("started_at")
+    if pid == my_pid:
+        return {"blocked": False, "reason": "our own lock"}
+    age = None
+    if isinstance(started, (int, float)):
+        age = now - started
+    alive = pid_alive(pid) if isinstance(pid, int) else None
+    if alive is False:
+        return {"blocked": False, "reason": "holder pid %s is gone" % pid}
+    if age is not None and age >= ttl:
+        return {"blocked": False,
+                "reason": "lock is %.1fh old (TTL %.1fh) -- stale"
+                          % (age / 3600.0, ttl / 3600.0)}
+    # Say WHICH of the two blocking cases this is. `alive is True` is a
+    # confirmed live holder and the operator should wait; `alive is None` is
+    # UNCONFIRMED -- on Windows that is every dead holder, because os.kill
+    # raises a bare OSError there. Both block, but they call for opposite
+    # operator actions, and a message that reads equally confident in both
+    # cases sends someone away to wait out a holder that died hours ago.
+    # A log-mtime progress check was considered as a second signal and
+    # rejected: chunk logs are block-buffered, so a slow buffered chunk can
+    # look stalled, and unblocking on that would readmit the concurrent run
+    # this lock exists to prevent.
+    return {"blocked": True,
+            "reason": "pid %s holds this log dir%s%s"
+                      % (pid,
+                         "" if age is None else " (started %.1fh ago)"
+                         % (age / 3600.0),
+                         "" if alive else
+                         " -- LIVENESS UNCONFIRMED on this platform, so the "
+                         "holder may already be dead")}
+
+
+def read_run_lock(out):
+    """The lock record, or None. Absent/unreadable/malformed all collapse to
+    None on purpose -- each means "no evidence anyone holds this dir", and a
+    gate that blocks on its own read error violates guard-142."""
+    try:
+        data = json.loads((Path(out) / RUN_LOCK_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def take_run_lock(out, pid=None, now=None):
+    """Best-effort. A dir we cannot write is a dir whose logs will fail loudly
+    a moment later; never abort the run over the lock file itself."""
+    rec = {"pid": pid if pid is not None else os.getpid(),
+           "started_at": now if now is not None else time.time(),
+           "argv": sys.argv[1:]}
+    try:
+        (Path(out) / RUN_LOCK_NAME).write_text(json.dumps(rec), encoding="utf-8")
+    except OSError:
+        pass
+    return rec
+
+
+def release_run_lock(out, pid=None):
+    """Remove only OUR lock. Releasing a peer's would hand the dir to a third
+    run while the peer is still writing into it."""
+    me = pid if pid is not None else os.getpid()
+    rec = read_run_lock(out)
+    if isinstance(rec, dict) and rec.get("pid") != me:
+        return False
+    try:
+        (Path(out) / RUN_LOCK_NAME).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def rotate_prior_logs(out):
+    """Move the previous run's chunk logs + halves record into out/prev/.
+
+    Returns the number of files rotated. Clears the top level exactly as the
+    unlink did -- --triage still globs one run's logs -- but the prior run
+    stays readable for one more cycle.
+    """
+    out = Path(out)
+    prior = sorted(out.glob("chunk-*.log")) + sorted(out.glob("chunk-*.args"))
+    rec = out / HALVES_RECORD
+    if rec.is_file():
+        prior.append(rec)
+    if not prior:
+        return 0
+    prev = out / "prev"
+    try:
+        if prev.is_dir():
+            for stale in prev.iterdir():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        prev.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0
+    moved = 0
+    for p in prior:
+        try:
+            p.replace(prev / p.name)
+            moved += 1
+        except OSError:
+            # Could not move it aside -> LEAVE IT. Falling back to unlink here
+            # would restore the exact destruction this function exists to stop.
+            pass
+    return moved
+
+# ── Constraint 4: never run pinned-in-a-worktree beside a live daemon ────────
+# guard-5866. The worktree spawns its OWN daemon, and mind-api-start.sh
+# _sweep_orphan_daemons matches mind_api.src processes by COMMAND LINE with
+# ZERO runtime-dir scoping -- so its spawn-time sweep KILLS the fleet's live
+# daemon, once per chunk gap. The copied daemon.port then goes stale and every
+# daemon-backed test fails `REFUSED: recycle/spawn requested from inside
+# pytest`: a large, authoritative-looking count that is PURE ENVIRONMENT.
+# Measured as a one-variable pre-registered control (bravo cc-05 2026-09-03:
+# 3 daemon kills + 12 stale-port errors in the worktree vs 0 and 0 for the SAME
+# suite/commit/box in the main repo); reproduced alpha cc-04 2026-09-04.
+#
+# WHY A CHECK AND NOT PROSE (). The guardrail existed 12h before the
+# run that tripped it; what lagged was _full_suite_imperative.py, the always-on
+# PreToolUse block whose entire job is to carry this warning -- by 29 HOURS.
+# Hand-maintained prose in a second file is a delivery channel that fails
+# silently, so the condition is decided here, in the tool, where it cannot lag.
+#
+# FAIL-OPEN BY CONTRACT (guard-142): every probe below collapses an error into
+# "not established", so a gate bug can never block a legitimate run. Only two
+# POSITIVE readings refuse.
+def _git_dir_pair(root):
+    """(git_dir, common_dir) resolved absolute, or None when git cannot say.
+
+    Not --absolute-git-dir / --path-format=absolute: both are newer flags, and
+    an old git on one box would make this probe error -- i.e. fail open -- on
+    exactly the boxes most likely to need it. Plain --git-dir/--git-common-dir
+    are ancient and portable; resolving them against root does the rest.
+    """
+    out = {}
+    for flag in ("--git-dir", "--git-common-dir"):
+        # The WHOLE per-flag block is inside the try, not just the spawn.
+        # Wrapping only subprocess.run() left the dereference below outside the
+        # fail-open contract, and a subprocess.run that returns an unexpected
+        # object -- None, a stub, a Mock -- raised AttributeError straight out
+        # of a gate that guard-142 requires to fail OPEN on its own dependency
+        # errors. Caught by test_run_full_suite_chunk_spawn, which stubs
+        # subprocess.run to None: 19 tests went red on a gate that was supposed
+        # to be invisible to them ().
+        try:
+            p = subprocess.run(["git", "-C", str(root), "rev-parse", flag],
+                               capture_output=True, text=True, timeout=15)
+            if p.returncode != 0 or not p.stdout.strip():
+                return None
+            out[flag] = (Path(root) / p.stdout.strip()).resolve()
+        except Exception:  # noqa: BLE001 -- no usable git answer, no verdict
+            return None
+    return out["--git-dir"], out["--git-common-dir"]
+
+
+def _live_daemon_port(main_root):
+    """The port a daemon is ACTUALLY listening on for main_root, else None.
+
+    The port FILE is not the signal -- a stale file outlives its daemon, and
+    refusing on a stale file would block runs on a box with no daemon at all.
+    Connecting is the signal.
+    """
+    try:
+        raw = (Path(main_root) / "mind_api" / "state" / "daemon.port").read_text(
+            encoding="utf-8").strip()
+        port = int(raw)
+    except Exception:  # noqa: BLE001 -- absent/unreadable/garbage = no daemon proven
+        return None
+    if not (0 < port < 65536):
+        return None
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return port
+    except Exception:  # noqa: BLE001 -- nothing listening = no live daemon
+        return None
+
+
+def worktree_daemon_refusal(root):
+    """Refusal detail when BOTH conditions hold, else None (proceed).
+
+    Split from main() so the two-condition truth table is unit-testable by
+    monkeypatching the two probes, with no git tree and no socket.
+    """
+    pair = _git_dir_pair(root)
+    if pair is None:
+        return None                       # git unreadable -> not established
+    git_dir, common_dir = pair
+    if git_dir == common_dir:
+        return None                       # main checkout -> the safe case
+    main_root = common_dir.parent         # <main>/.git -> <main>
+    port = _live_daemon_port(main_root)
+    if port is None:
+        return None                       # no live daemon -> worktree is fine
+    return ("this is a LINKED WORKTREE (%s) and a LIVE mind_api daemon is "
+            "listening on port %d for the main checkout at %s"
+            % (git_dir, port, main_root))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--chunks", type=int, default=4,
@@ -1044,6 +1662,14 @@ def main(argv=None):
                     help="on a contended verdict, re-run the worst-hit file alone to prove it")
     ap.add_argument("--print-out-dir", action="store_true",
                     help="resolve and print the log dir, then exit (for run-full-suite.sh)")
+    ap.add_argument("--override-worktree-daemon", metavar="JUSTIFICATION",
+                    help="proceed despite worktree+live-daemon (guard-5866). "
+                         "Justification is REQUIRED and is echoed into the run "
+                         "header, which is what run-full-suite.sh captures -- so "
+                         "the audit trail rides with the verdict a reader sees")
+    ap.add_argument("--override-concurrent-run", metavar="JUSTIFICATION",
+                    help="proceed despite another run holding this log dir. "
+                         "Justification is REQUIRED and echoed as above")
     args = ap.parse_args(argv)
 
     # Resolved BEFORE the testpaths check so --print-out-dir answers even on a
@@ -1102,6 +1728,20 @@ def main(argv=None):
         env["PYTHONUNBUFFERED"] = "1"
         return triage(out, PROJECT_ROOT, env)
 
+    # Constraint 4 (guard-5866) and the concurrency check run HERE: after
+    # --triage returns (triage re-reads logs, it never runs tests, so a
+    # worktree is harmless there) and BEFORE anything touches the prior run's
+    # logs. A refusal that fired after the rotation would still have moved a
+    # peer's evidence.
+    if args.override_worktree_daemon:
+        print("  OVERRIDE (guard-5866 worktree+daemon): %s"
+              % args.override_worktree_daemon)
+    else:
+        detail = worktree_daemon_refusal(PROJECT_ROOT)
+        if detail:
+            print(WORKTREE_DAEMON_REFUSAL_TEXT % detail, file=sys.stderr)
+            return 3
+
     # ONE run per log dir, always. --triage globs chunk-*.log, so a leftover
     # chunk from an earlier run at a DIFFERENT --chunks count silently joins the
     # evidence for this one. MEASURED 2026-07-31 (echo, cc-03) on this feature's
@@ -1112,21 +1752,28 @@ def main(argv=None):
     # INCOMPLETE chunk would have made classify() call a healthy run contended.
     # This tool exists to refuse an invalid measurement; it must not assemble one
     # out of two runs.
-    for old in out.glob("chunk-*.log"):
-        try:
-            old.unlink()
-        except OSError:
-            pass
-    # Same reasoning, same moment: a halves record left by an EARLIER run would
-    # otherwise be reported by this run's --triage as though it described this
-    # run -- and a stale PASS is worse than no record at all, because "NOT
-    # RECORDED" is loud while a stale PASS reads as coverage. Cleared here (the
-    # run path) rather than in the shell, so it happens exactly once and before
-    # the shell appends anything.
-    try:
-        (out / HALVES_RECORD).unlink()
-    except OSError:
-        pass
+    #
+    # A CONCURRENT run is the case the paragraph above does not cover: those
+    # logs are not stale, they are LIVE, and clearing them corrupts a
+    # measurement that is still being taken. Check before touching anything.
+    if args.override_concurrent_run:
+        print("  OVERRIDE (concurrent run): %s" % args.override_concurrent_run)
+    else:
+        verdict = evaluate_run_lock(read_run_lock(out), os.getpid(), time.time())
+        if verdict["blocked"]:
+            print(CONCURRENT_RUN_REFUSAL_TEXT
+                  % (verdict["reason"], out / RUN_LOCK_NAME), file=sys.stderr)
+            return 3
+    take_run_lock(out)
+    atexit.register(release_run_lock, out, os.getpid())
+
+    # The prior run's logs move ASIDE rather than being deleted (see
+    # rotate_prior_logs). The halves record travels with them for the same
+    # reason it was cleared with them: a stale PASS reads as coverage.
+    rotated = rotate_prior_logs(out)
+    if rotated:
+        print("  rotated %d file(s) from the previous run -> %s"
+              % (rotated, out / "prev"))
 
     # Non-recursive glob per root, matching pytest's own default discovery for
     # these trees (all three are flat -- verified 2026-07-31: 0 nested test
@@ -1198,8 +1845,19 @@ def main(argv=None):
     # loop's pull policy, but it can refuse to certify a run whose tree moved.
     head_at_launch = _git_head(PROJECT_ROOT)
 
+    # Whether the @argfile indirection below is available is a property of the
+    # INSTALLED pytest, not of this code, so it is measured once per run rather
+    # than assumed. False here is the normal, healthy Linux path.
+    argfile_ok = _pytest_expands_argfile(out, env)
+    if not argfile_ok:
+        print("  @argfile unsupported by this pytest (fromfile_prefix_chars "
+              "unset) -- chunk paths go on argv as REPO-RELATIVE paths "
+              "instead (fine on POSIX; see _pytest_expands_argfile, g-115-8876)")
+
     combined = []
     tot_p = tot_f = tot_e = 0
+    rc_invalid = []
+    rc_unreadable = []
     for i, group in enumerate(groups):
         # NO -q HERE, DELIBERATELY (). pytest.ini:12 already sets
         # `addopts = -q`; passing it again makes -qq, which SUPPRESSES the final
@@ -1208,7 +1866,68 @@ def main(argv=None):
         # still exits 0 and still prints dots to [100%] so it looks healthy.
         # Measured both directions on cc-02 2026-08-29: with -q, zero lines match
         # "[0-9]+ passed"; without it, "20 passed, 2 warnings in 0.50s".
-        cmd = [sys.executable, "-u", "-m", "pytest", *group]
+        # ARGV LENGTH IS A CHUNK'S REAL LIMIT, NOT ITS FILE COUNT ().
+        # Windows CreateProcess caps a command line near 32,767 chars, so a
+        # chunk's cost is (mean path length x files per chunk) -- guard-5635's
+        # measured product. MEASURED on DESKTOP-O91DLK2 2026-09-03: 1,358 files
+        # at an 83.7-char mean put the default --chunks 4 at a 29,824-char argv
+        # IN THE MAIN REPO -- 9% under the ceiling, and rising with every test
+        # file added. From a worktree (longer prefix, +26 chars per path) the
+        # same chunk measured 38,664 and died `FileNotFoundError: [WinError 206]`
+        # BEFORE collection. So this is not a worktree-only problem deferred by
+        # raising --chunks; the default is on track to cross on its own.
+        # WHERE pytest SUPPORTS IT, an `@` prefix reads arguments from a file
+        # (argparse fromfile_prefix_chars), making argv a constant ~6 items no
+        # matter how many files the chunk holds or how deep the tree sits -- the
+        # ceiling stops being reachable instead of being sized around. SUPPORT
+        # IS NOT UNIVERSAL AND IS NOT ASSUMED: pytest 7.4.4 does not enable it,
+        # and using it there collects ZERO tests while looking like contention.
+        # `argfile_ok` above is the measured answer; see _pytest_expands_argfile.
+        # CHUNK COUNT IS DELIBERATELY LEFT ALONE. Sizing chunks to a byte budget
+        # would fix the same product, but the chunk ladder is a retry protocol
+        # and the per-chunk diagnostics keyed on it (guard-1448 chunk-confinement,
+        # the chunk-09 signature) are read by index -- silently splitting a
+        # requested 4 into 6 would change the thing those readings depend on.
+        # ONLY PATHS GO IN THE FILE; FLAGS STAY ON ARGV. A value containing
+        # spaces (`-m "not daemon_integration and not fleet_layout"`) would ride
+        # on argparse's one-arg-per-line convert_arg_line_to_args, and the -m
+        # clause is ~50 chars -- every byte of the bloat is the paths.
+        # A malformed argfile is LOUD, not silent: verified 2026-09-03 that both
+        # a nonexistent path and an MSYS-form path yield pytest's
+        # `ERROR: file or directory not found` at rc=4 rather than a quiet
+        # 0-collected, so a broken chunk cannot read as an empty-but-fine one.
+        # CORRECTED 2026-09-04 (). That verification tested only BAD
+        # inputs, and the conclusion it licensed -- "a broken chunk cannot read
+        # as an empty-but-fine one" -- was FALSE for the very case it enabled.
+        # `@argfile` is argparse's fromfile_prefix_chars, which pytest 7.4.4
+        # does not set, so on that pytest a PERFECTLY VALID argfile is itself
+        # the rc=4 usage error. rc was then discarded (see the capture below),
+        # _parse_counts read (0,0,0), and classify() called it `contended` --
+        # so the loud failure this comment promised arrived as a quiet INVALID
+        # verdict blaming contention, on EVERY run, on every box with an older
+        # pytest. A positive control on a bad input certifies the INPUT, never
+        # the QUESTION (guard-4512).
+        argfile = out / ("chunk-%02d.args" % i)
+        argfile.write_text("\n".join(group) + "\n", encoding="utf-8")
+        # The .args file is written EITHER WAY: it is a run artifact this
+        # module's docstring already promises, --triage reads the chunk file
+        # lists back out of it, and it is the per-chunk diagnostic that lets a
+        # reader re-run exactly this chunk's file list solo (the guard-1448
+        # discriminator) -- all of which matter on the fallback path too.
+        if argfile_ok:
+            cmd = [sys.executable, "-u", "-m", "pytest", "@" + str(argfile)]
+        else:
+            # REPO-RELATIVE paths, not absolute. This is what makes the
+            # fallback safe rather than a revert to the pre- state:
+            # argv still scales with the file count, but it no longer scales
+            # with WHERE THE REPO LIVES, and the prefix was the whole of
+            # guard-5635 (a worktree added +26 chars per path and pushed
+            # 29,824 -> 38,664). Measured on this repo 2026-09-04: mean path
+            # 84.7 chars absolute vs 52.7 relative; at the default --chunks 4
+            # that is 28,975 -> 18,031, i.e. 45% under the ceiling and
+            # INVARIANT to the worktree prefix.
+            cmd = [sys.executable, "-u", "-m", "pytest"]
+            cmd += [os.path.relpath(p, str(PROJECT_ROOT)) for p in group]
         # ONE -m carrying every clause. A SECOND -m does not AND with the first;
         # pytest keeps only the last and SILENTLY DISCARDS the earlier one.
         # Measured 2026-08-19 on test_daemon_orphan_prevention.py: `-m "not
@@ -1225,19 +1944,232 @@ def main(argv=None):
             marker_terms.append("not fleet_layout")
         if marker_terms:
             cmd += ["-m", " and ".join(marker_terms)]
+        # ARGV BUDGET -- CHECKED BEFORE THE SPAWN, so the fallback path fails
+        # with a sentence naming its own remedy instead of a WinError 206 that
+        # a reader has to decode. Deliberately NOT a re-chunk: the ladder is a
+        # retry protocol and its per-chunk diagnostics are read by index (see
+        # the CHUNK COUNT note above), so this refuses and tells the caller to
+        # raise --chunks -- which is exactly what guard-5635 already prescribes.
+        # Unreachable on the argfile path, where argv is a constant ~6 items.
+        argv_len = sum(len(a) + 1 for a in cmd)
+        if argv_len > _ARGV_BUDGET:
+            print(" ARGV TOO LONG")
+            print("\n" + "=" * 66)
+            print("VERDICT: INVALID (chunk %02d argv %d chars > budget %d) -- "
+                  "this run means NOTHING" % (i, argv_len, _ARGV_BUDGET))
+            print("  This pytest does not read @argfiles, so the chunk's file "
+                  "list must ride on argv, and this chunk's list does not fit "
+                  "under the %d-char CreateProcess ceiling." % _CMDLINE_CEILING)
+            print("  REMEDY: raise --chunks (fewer files per chunk). "
+                  "guard-5635 measured 16 working where the default 4 died.")
+            print("  Refusing BEFORE the spawn: a chunk that cannot run must "
+                  "not be parsed as a chunk that found nothing.")
+            _emit_void_record("argv-too-long", chunk=i, argv_len=argv_len,
+                              budget=_ARGV_BUDGET)
+            return 2
         log = out / ("chunk-%02d.log" % i)
         print("  chunk %02d: %d files ..." % (i, len(group)), end="", flush=True)
-        with open(log, "w", encoding="utf-8", errors="replace") as fh:
-            subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT,
-                           cwd=str(PROJECT_ROOT), env=env)
+        try:
+            with open(log, "w", encoding="utf-8", errors="replace") as fh:
+                # BIND THE RESULT (, and  independently).
+                # This call discarded it, so a chunk that exited 4 (usage
+                # error) or 5 (collected nothing) was counted exactly like one
+                # that exited 0 -- the chunk loop was the one pytest call site
+                # in this module with no rc check at all, while `_solo` twelve
+                # hundred lines up had the correct one inline.
+                proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT,
+                                      cwd=str(PROJECT_ROOT), env=env)
+        except OSError as exc:
+            # A CHUNK THAT NEVER SPAWNED IS NOT A CHUNK THAT PASSED ().
+            # Until this branch existed the OSError escaped main(), and
+            # `sys.exit(main())` rendered it as rc=1 -- so run-full-suite.sh,
+            # which is careful and DOES separate did-not-run from ran-and-failed,
+            # faithfully reported "rc=1 genuine failures" over a half in which
+            # zero tests executed. The wrapper was not wrong; it was handed a
+            # dishonest code. Exit 2 instead, reusing the "INVALID, re-measure"
+            # contract callers already honour (same reuse as the tree-move check
+            # below, rather than inventing a fourth exit code).
+            # FATAL, NOT SKIP-AND-CONTINUE: the remaining chunks cannot rescue a
+            # verdict that is already uncertifiable, and another ~30 minutes of
+            # green-looking chunk lines is precisely what makes a missing half
+            # invisible (guard-1760 -- a runner reports what it RAN, never what
+            # it declined to look for).
+            # KEPT EVEN THOUGH THE @argfile ABOVE SHOULD MAKE WinError 206
+            # UNREACHABLE. The next argv-shaped surprise will carry a different
+            # errno; the value of this branch is refusing to certify, which does
+            # not depend on knowing the cause.
+            not_run = sum(len(g) for g in groups[i:])
+            print(" SPAWN FAILED")
+            print("\n" + "=" * 66)
+            print("VERDICT: INVALID (chunk %02d could not spawn) -- this run "
+                  "means NOTHING" % i)
+            print("  %s" % exc)
+            print("  %d of %d test files never ran (chunks %02d-%02d of %d)."
+                  % (not_run, len(files), i, len(groups) - 1, len(groups)))
+            print("  Counts before the failure -- NOT a result: %d passed, "
+                  "%d failed, %d errors." % (tot_p, tot_f, tot_e))
+            if getattr(exc, "winerror", None) == 206:
+                print("  WinError 206 is the command line exceeding the "
+                      "32,767-char CreateProcess ceiling.")
+                if argfile_ok:
+                    print("  The chunk file list went via @argfile to keep argv "
+                          "constant, so an argv this long means something OTHER "
+                          "than the file count grew -- inspect cmd, not --chunks.")
+                else:
+                    # NOT "raise --chunks" (origin's wording, correct before
+                    # the pre-spawn budget check existed): _ARGV_BUDGET now
+                    # refuses over-long argv BEFORE the spawn, so reaching a
+                    # WinError 206 here means the budget itself is too close
+                    # to the 32,767-char ceiling.
+                    print("  This pytest does NOT support @argfile, so the file "
+                          "list rides on argv. The pre-spawn budget check "
+                          "should have refused first -- if it did not, the "
+                          "budget (%d) is too close to the ceiling."
+                          % _ARGV_BUDGET)
+            print("  A spawn failure is a setup fault, not a test regression: "
+                  "do not triage it as a red, and do not file goals from the "
+                  "partial counts above.")
+            _emit_void_record("chunk-spawn-failed", chunk=i,
+                              error=str(exc), files_never_run=not_run)
+            print("=" * 66)
+            return 2
+        # A CHUNK THAT SPAWNED BUT RAN NOTHING IS NOT A CHUNK THAT PASSED
+        # (). The OSError branch above covers the chunk that never
+        # STARTED; this covers the one that started, refused, and exited -- and
+        # until now that rc was DISCARDED (`subprocess.run(...)` with no
+        # binding), so pytest's rc=4 usage error reached _parse_counts as an
+        # ordinary log, parsed to (0, 0, 0), and classify() reported the whole
+        # run as `contended`. The operator was then sent up the chunk ladder,
+        # which can never fix a usage error. Same lesson as the branch above,
+        # one step later in the lifecycle, and the same remedy: refuse to
+        # certify. This is the module's own idiom -- _rerun_solo already says
+        # "executed nothing, so this is not a measurement" for exactly this
+        # shape; the chunk loop simply never applied it to itself.
+        # 0 = passed, 1 = tests failed, 5 = nothing collected (legitimate when a
+        # marker deselects a whole chunk). 2/3/4 and anything else mean pytest
+        # did not run this chunk's tests.
+        # THE RESULT IS GUARDED AS WELL AS THE CALL, exactly as _git_head above
+        # documents and for the same reason: the suite's own tests stub
+        # subprocess.run and some stubs RETURN None instead of raising, so
+        # reading `proc.returncode` unguarded dies on the stub. An unreadable rc
+        # fails toward CONTINUING -- aborting a 30-minute run over a missing
+        # attribute that only a stub can produce would be the cure being worse
+        # than the disease.
+        rc_chunk = getattr(proc, "returncode", None)
+        if rc_chunk is not None and rc_chunk not in (0, 1, 5):
+            not_run = sum(len(g) for g in groups[i:])
+            print(" RC=%d" % rc_chunk)
+            print("\n" + "=" * 66)
+            print("VERDICT: INVALID (chunk %02d exited rc=%d without running "
+                  "its tests) -- this run means NOTHING" % (i, rc_chunk))
+            # SAME SENTENCE the `_is_measurement` collector below emits, on
+            # purpose (2026-09-04 merge of  with ). The two
+            # checks are complements, not rivals: this one is a pure rc-SET
+            # test for the SYSTEMIC faults (2/3/4) where every later chunk will
+            # fail identically, so it aborts and saves the hours; the collector
+            # is a per-chunk validity test over rc AND counts, so it continues.
+            # A reader must not have to learn two vocabularies for one
+            # condition, and grepping either phrase must find both lanes.
+            print("  chunk %02d is NOT A MEASUREMENT -- pytest rc=%d ran none "
+                  "of its tests. rc 2/3/4 mean interrupted, internal error and "
+                  "usage error. This is a SETUP fault, not contention: do NOT "
+                  "climb the chunk ladder -- re-read chunk-%02d.log for "
+                  "pytest's own error." % (i, rc_chunk, i))
+            print("  %d of %d test files never ran (chunks %02d-%02d of %d)."
+                  % (not_run, len(files), i, len(groups) - 1, len(groups)))
+            print("  Counts before the failure -- NOT a result: %d passed, "
+                  "%d failed, %d errors." % (tot_p, tot_f, tot_e))
+            if rc_chunk == 4:
+                print("  rc=4 is pytest's USAGE error, not a test failure. If "
+                      "the log says `file or directory not found: @...` then "
+                      "this pytest does not read @argfiles and the probe that "
+                      "should have caught it (_pytest_expands_argfile) "
+                      "disagreed with reality -- fix the probe, not --chunks.")
+            print("  Chunk log: %s" % log)
+            print("  This is a setup fault, not a test regression: do not "
+                  "triage it as a red, and do NOT climb the chunk ladder -- a "
+                  "retry cannot clear it.")
+            # Emit the same verdict line the general rc check below would have
+            # produced for this chunk (). The two features met here in
+            # a merge and disagreed about who owns the rc!=0 exit: that check
+            # COLLECTS and continues so --triage still gets every chunk log,
+            # while this rc=4 path STOPS at the first refusing chunk because a
+            # usage error cannot be cleared by running more chunks. Both are
+            # right; only the reporting was lost. Stopping is kept (it is this
+            # path's whole point) and the verdict is restored, so a reader gets
+            # the same words for the same condition on either path.
+            #
+            # ⚠ THIS BLOCK NOW PRINTS THE "NOT A MEASUREMENT" VERDICT TWICE --
+            # once ~28 lines above and once here, with DIFFERENT text ("ran none
+            # of its tests" vs "accounted for 0 test(s)", and rc 2/3/4 vs
+            # 2/3/4/5). Not introduced by the merge that added _emit_void_record
+            # below: measured on origin/main itself, which carries three
+            # occurrences of the phrase where this branch carried two. Two agents
+            # each restored the verdict into this block at different offsets, so
+            # git auto-merged both without a conflict -- guard-1849's DOUBLED
+            # shape, and the hazard worker-loop's own Phase -0.2 comment
+            # narrates. Left in place DELIBERATELY rather than deleted inside a
+            # merge resolution, where a silent deletion of a peer's landed line
+            # gets no review; relayed as sq-013 for an owner. Note the second
+            # copy hardcodes 0 for its count, so it always reads "0 test(s)".
+            print("  chunk %02d is NOT A MEASUREMENT -- pytest rc=%d accounted "
+                  "for %d test(s). rc 2/3/4/5 mean interrupted, internal error, "
+                  "usage error and collected-nothing; none of them ran your "
+                  "tests." % (i, rc_chunk, 0))
+            _emit_void_record("chunk-rc-without-running", chunk=i,
+                              rc=rc_chunk, files_never_run=not_run)
+            print("=" * 66)
+            return 2
         text = log.read_text(encoding="utf-8", errors="replace")
         combined.append(text)
         p, f, e = _parse_counts(text)
         tot_p += p; tot_f += f; tot_e += e
+        rc = getattr(proc, "returncode", None)
+        if rc is None:
+            # rc UNREADABLE IS A THIRD OUTCOME, NOT "FINE". `_git_head` twenty
+            # lines up documents the same hazard and guards the same way: this
+            # module's own tests stub subprocess.run and several stubs RETURN
+            # None rather than a CompletedProcess, so reading `.returncode`
+            # unguarded dies inside six harnesses that are about argv length and
+            # chunk counts, not about this check. Production always yields a
+            # CompletedProcess, so this branch is reachable only under a stub --
+            # and it still NARRATES, because a check that quietly declines to
+            # run reports success by default (guard-1760). The completion-marker
+            # half is unaffected and still judges this chunk.
+            rc_unreadable.append(i)
+        elif not _is_measurement(rc, p, f, e):
+            # NOT a second predicate -- the same `_is_measurement` `_solo` uses
+            # ( outcome 2). Collected rather than returned so the
+            # remaining chunks still run and their logs still land on disk:
+            # --triage reads chunk-*.log, and aborting here would destroy the
+            # evidence for the very chunk being reported.
+            rc_invalid.append(
+                "chunk %02d is NOT A MEASUREMENT -- pytest rc=%d accounted for "
+                "%d test(s). rc 2/3/4/5 mean interrupted, internal error, usage "
+                "error and collected-nothing; none of them ran your tests. Its "
+                "%d passed below is NOT a result and the TOTAL includes it. "
+                "This is a SETUP fault, not contention: do NOT climb the chunk "
+                "ladder -- re-read chunk-%02d.log for pytest's own error."
+                % (i, rc, p + f + e, p, i))
         print(" %d passed, %d failed, %d errors" % (p, f, e))
 
     blob = "\n".join(combined)
+    if rc_unreadable:
+        print("  exit-code check: NOT RUN for chunk(s) %s (the process object "
+              "carried no returncode) -- those chunks are NOT certified against "
+              "a setup fault; the completion-marker check still applies."
+              % ", ".join("%02d" % i for i in rc_unreadable))
     verdict, reasons = classify(blob, tot_f, chunks=combined)
+    if rc_invalid:
+        # FIRST in the list because an rc fault EXPLAINS whatever classify()
+        # then says about the same chunk's truncated log, exactly as the hang
+        # check is ordered ahead of the two branches it explains. Forcing
+        # "contended" reuses the existing INVALID/exit-2 contract callers
+        # already honour rather than inventing a fourth verdict; the remedy
+        # divergence rides in the reason STRING, which is how the NUL check
+        # already carries "do NOT climb the ladder".
+        reasons = rc_invalid + list(reasons)
+        verdict = "contended"
     files_failing = failing_files(blob)
 
     print("\n" + "=" * 66)
@@ -1279,6 +2211,13 @@ def main(argv=None):
         print("VERDICT: INVALID (tree-moved) -- this number means NOTHING")
         print("  HEAD at launch: %s" % head_at_launch)
         print("  HEAD at finish: %s" % head_at_finish)
+        # NAME THE OFFENDERS (). Two opaque shas told the reader a
+        # tree moved but never who moved it, and the verdict prints hours
+        # later to the Body that LAUNCHED the run -- never the one that caused
+        # the void. So nobody who causes this ever learns they did.
+        offenders = _git_offenders(PROJECT_ROOT, head_at_launch, head_at_finish)
+        for line in _render_offenders(offenders):
+            print(line)
         print("  Chunk file lists are computed AT LAUNCH, so later chunks ran "
               "against a different tree than chunk 00 -- possibly against "
               "paths the merge deleted.")
@@ -1292,6 +2231,24 @@ def main(argv=None):
               "(iteration-push.sh --no-push), which fires on EVERY turn-end "
               "re-entry, so any suite longer than one turn is exposed at every "
               "turn boundary.")
+        # The COUNT and the AUTHOR SET are the fields a cadence needs ("voided
+        # runs per week and per offending Body"); the commit list is a
+        # convenience and is capped so one void cannot emit a multi-kilobyte
+        # log line. offender_count_is_floor says the count hit the read cap.
+        _emit_void_record("tree-moved",
+                          head_at_launch=head_at_launch,
+                          head_at_finish=head_at_finish,
+                          offenders_readable=offenders is not None,
+                          offender_count=None if offenders is None
+                          else len(offenders),
+                          offender_count_is_floor=bool(
+                              offenders and
+                              len(offenders) >= _OFFENDER_READ_LIMIT),
+                          offender_authors=None if offenders is None
+                          else sorted({c["author"] for c in offenders}),
+                          offenders=None if offenders is None
+                          else offenders[:_OFFENDER_SHOW_LIMIT],
+                          would_have_said=verdict)
         print("=" * 66)
         return 2
 
@@ -1326,6 +2283,9 @@ def main(argv=None):
         else:
             print("\nRe-run when the fleet is quiet, or raise --chunks.")
         print("Do NOT file regressions from this run. Do NOT wave it away either.")
+        _emit_void_record("hung" if hung else "contended",
+                          reasons=list(reasons),
+                          passed=tot_p, failed=tot_f, errors=tot_e)
         print("=" * 66)
         return 2
 

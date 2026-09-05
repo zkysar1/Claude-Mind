@@ -85,7 +85,20 @@ _is_pid_alive() {
 
 _health_probe() {
     local port="$1"
-    curl -s -f --max-time 2 "http://127.0.0.1:${port}/v1/admin/health" >/dev/null 2>&1
+    # LIVENESS, not authorization: any HTTP status proves the daemon answered.
+    # `curl -f` fails on 4xx, so with MIND_API_TOKEN set (FR-4, server.py) this
+    # probe read a perfectly healthy daemon as DEAD -- 401 IS a response.
+    # Measured 2026-09-04 (, cc-07): daemon bound and serving on
+    # 0.0.0.0, `-f` rc=22, and --restart reported "did not become ready within
+    # 10s". %{http_code} is "000" ONLY when no HTTP response arrived at all
+    # (connection refused / timeout: rc=7), which is the real dead signal.
+    # Deliberately NOT fixed by teaching this third client to attach the bearer:
+    # a liveness probe needs a RESPONSE, not a credential, and keeping the token
+    # out of this script keeps the delivery surface to the two rt clients.
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+        "http://127.0.0.1:${port}/v1/admin/health" 2>/dev/null)"
+    [ -n "$code" ] && [ "$code" != "000" ]
 }
 
 _read_pid() {
@@ -193,7 +206,12 @@ _kill_escalate() {
             # is appropriate for liveness checks but too slow for a tight
             # kill loop). A connection-refused returns near-instantly; only
             # a hung-but-bound daemon hits the 0.3s ceiling.
-            if ! curl -s -f --max-time 0.3 "http://127.0.0.1:${port}/v1/admin/health" >/dev/null 2>&1; then
+            # Same 401-is-alive correction as _health_probe (): with a
+            # token set, `-f` would report a live daemon as gone and this loop
+            # would declare a graceful exit that never happened.
+            _kill_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 0.3 \
+                "http://127.0.0.1:${port}/v1/admin/health" 2>/dev/null)"
+            if [ -z "$_kill_code" ] || [ "$_kill_code" = "000" ]; then
                 _log "PID $pid no longer responding on port $port (graceful exit detected in iter $((waited + 1)))"
                 return 0
             fi

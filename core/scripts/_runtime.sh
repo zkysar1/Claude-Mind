@@ -875,6 +875,41 @@ _rt_record_elapsed() {
     return 0
 }
 
+# _rt_api_token — the bearer token for rt_curl: ambient env first, else the
+# gitignored .env.local. Python twin: core/scripts/_rt.py::_api_token.
+#
+# WHY (): once MIND_API_TOKEN is set on the daemon, FR-4
+# (server.py:298-306) demands a matching bearer on EVERY request -- LOCAL
+# callers included -- but an ad-hoc Bash tool call's environment carries no such
+# variable, so every store call on the box would 401. The one surface that
+# reaches every tool call (.claude/settings.json env) is GIT-TRACKED and must
+# never hold a credential (guard-724); .env.local is the sanctioned mode-600
+# gitignored store, so the CLIENT reads it instead of the token being pushed
+# into every process environment.
+#
+# The file read is cached in this shell for the life of the sourcing script,
+# INCLUDING the negative result -- with no token configured (today's default on
+# every box) that is one failed open per script, not one per daemon call.
+# Fail-open: unreadable or token-less .env.local yields "" -> no header ->
+# byte-identical to today's loopback behavior. Never echoes the value.
+_rt_api_token() {
+    if [ -n "${MIND_API_TOKEN:-}" ]; then
+        printf '%s' "$MIND_API_TOKEN"
+        return 0
+    fi
+    if [ "${_RT_ENV_TOKEN_RESOLVED:-}" != "1" ]; then
+        _RT_ENV_TOKEN_RESOLVED=1
+        _RT_ENV_TOKEN=""
+        if [ -r "${PROJECT_ROOT:-}/.env.local" ]; then
+            _RT_ENV_TOKEN="$(sed -n 's/^[[:space:]]*MIND_API_TOKEN[[:space:]]*=[[:space:]]*//p' \
+                "${PROJECT_ROOT}/.env.local" 2>/dev/null | head -1 \
+                | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//" \
+                | tr -d '\r' )"
+        fi
+    fi
+    printf '%s' "${_RT_ENV_TOKEN:-}"
+}
+
 rt_curl() {
     local method="$1" path="$2"; shift 2
     local _rt_t0="${EPOCHREALTIME/[.,]/}"
@@ -904,11 +939,13 @@ rt_curl() {
     local headers=( -H "X-Runtime-Client: shell" )
     [ -n "$agent" ] && headers+=( -H "X-Mind-Agent: $agent" )
     headers+=( -H "X-Mind-Tenant: ${MIND_TENANT:-default}" )
-    # FR-4 (BRD Shared-State-API): attach the daemon bearer token when
-    # MIND_API_TOKEN is set (remote/authenticated fleet daemon). Zero-latency env
-    # read — no remote indirection (respects the IRREDUCIBLY LOCAL contract).
-    # Unset → no header → byte-identical to today's localhost-only calls.
-    [ -n "${MIND_API_TOKEN:-}" ] && headers+=( -H "Authorization: Bearer ${MIND_API_TOKEN}" )
+    # FR-4 (BRD Shared-State-API): attach the daemon bearer token when one is
+    # configured — ambient env, else .env.local (see _rt_api_token). Local file
+    # read only, no remote indirection (respects the IRREDUCIBLY LOCAL contract).
+    # Neither → no header → byte-identical to today's localhost-only calls.
+    local _rt_tok
+    _rt_tok="$(_rt_api_token)"
+    [ -n "$_rt_tok" ] && headers+=( -H "Authorization: Bearer ${_rt_tok}" )
     # Forward the calling session's SID (always-injected by bash-agent-inject,
     # guard-341/rb-386) so endpoints that record session attribution
     # (board_write reads x-mind-sid) are byte-compat with the CLI, which reads

@@ -98,9 +98,17 @@ class YamlCache:
 
     @staticmethod
     def _load(path: Path) -> Any:
+        # libyaml's C scanner when the wheel ships it, else the pure-Python one
+        # — same SafeConstructor, identical objects. Same expression as
+        # core/scripts/tree_match._yaml_loader (inlined: this module must not
+        # depend on core/scripts import order). Measured 2026-09-03 on the live
+        # 1.75 MB tree index: 6.87 s -> 0.82 s per (re)load, and the index is
+        # reloaded on every box each time any agent's counting retrieval
+        # rewrites it.
+        loader = getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
         try:
             with path.open("r", encoding="utf-8") as f:
-                return yaml.safe_load(f)
+                return yaml.load(f, Loader=loader)
         except FileNotFoundError:
             return None
 

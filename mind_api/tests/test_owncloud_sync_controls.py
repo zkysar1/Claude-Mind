@@ -43,6 +43,25 @@ SCRIPTS_DIR = REPO_ROOT / "core" / "scripts"
 
 SOURCE = MAIN_PY.read_text(encoding="utf-8")
 
+# The daemon's storage BACKEND is a second consumer of the OWNCLOUD_* family, and
+# the read⇔loadable pin below was blind to it until 2026-09-04 (). It
+# scanned __main__.py alone, so OWNCLOUD_OBJECT_CACHE and
+# OWNCLOUD_OBJECT_CACHE_TIMEOUT — read at owncloud_backend.py:959,972, inside the
+# daemon process — became the THIRD and FOURTH instances of the exact class this
+# file was written to catch, and the pin reported clean the whole time. A drift
+# test is only as general as the set of modules it reads; scanning the module that
+# DOES the reading is what makes it general. OWNCLOUD_CACHE_TTL is read there too
+# and was already allowlisted, so the backend was always in scope in substance —
+# only the scan disagreed.
+BACKEND_PY = SCRIPTS_DIR / "owncloud_backend.py"
+BACKEND_SOURCE = BACKEND_PY.read_text(encoding="utf-8") if BACKEND_PY.exists() else ""
+
+# name -> source. Add a module here when it starts reading OWNCLOUD_* env keys.
+ENV_READ_SOURCES = {
+    "mind_api/src/__main__.py": SOURCE,
+    "core/scripts/owncloud_backend.py": BACKEND_SOURCE,
+}
+
 # `_load_env_local` accepts a key iff it is in _N3_ALLOWED_EXACT, starts with
 # MIND_AWS_, or is exactly AWS_DEFAULT_REGION. Mirrored from the function rather
 # than imported: importing __main__ starts the daemon's module-level machinery,
@@ -73,7 +92,22 @@ def test_every_owncloud_env_key_the_daemon_reads_is_loadable():
     docstring is reworded.
     """
     allowed = _allowed_exact()
-    read_keys = set(re.findall(r'os\.environ\.get\(\s*"(OWNCLOUD_[A-Z0-9_]+)"', SOURCE))
+
+    # A source that failed to load reads as "no keys here", which silently narrows
+    # the scan back to what it was before  widened it — the same
+    # fails-open shape this file exists to catch, one level up. Assert the bytes
+    # arrived before trusting any count derived from them (rb-245).
+    for where, src in ENV_READ_SOURCES.items():
+        assert src, (
+            f"{where} read as EMPTY, so this pin silently stopped covering it. "
+            f"A moved/renamed module must update ENV_READ_SOURCES, not vanish "
+            f"from the scan."
+        )
+
+    read_keys = {}          # key -> the module that reads it (for the message)
+    for where, src in ENV_READ_SOURCES.items():
+        for k in re.findall(r'os\.environ\.get\(\s*["\'](OWNCLOUD_[A-Z0-9_]+)', src):
+            read_keys.setdefault(k, where)
     assert read_keys, (
         "found ZERO OWNCLOUD_* os.environ.get reads — the regex has drifted from "
         "the source, so this test would pass vacuously (rb-245). Fix the regex."
@@ -81,8 +115,9 @@ def test_every_owncloud_env_key_the_daemon_reads_is_loadable():
     unreachable = sorted(k for k in read_keys if not _is_loadable(k, allowed))
     assert not unreachable, (
         f"OWNCLOUD_* keys READ by the daemon but not loadable from .env.local: "
-        f"{unreachable}. Either add each to _N3_ALLOWED_EXACT or stop reading it. "
-        f"A read-but-unsettable knob is a control that fails silently open."
+        f"{[(k, read_keys[k]) for k in unreachable]}. Either add each to "
+        f"_N3_ALLOWED_EXACT or stop reading it. A read-but-unsettable knob is a "
+        f"control that fails silently open."
     )
 
 

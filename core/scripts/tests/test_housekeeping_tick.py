@@ -265,3 +265,128 @@ def test_project_slug_transform():
     # harness scratchpad dir shape); POSIX absolute path keeps its leading '-'.
     assert HK.project_slug(Path(r"C:\Widgets\Acme-Repo")) == "C--Widgets-Acme-Repo"
     assert HK.project_slug(Path("/home/user/acme-repo")) == "-home-user-acme-repo"
+
+
+# ── Lane D: transcript archive ──────────────────────────────────────────────
+
+DCFG = dict(CFG, transcript_archive_interval_hours=12)
+
+RECEIPT = {"destination": "s3://b/env/transcripts/BOX", "machine": "BOX",
+           "live_files": 1060, "live_bytes": 768_000_000, "archived_count": 3,
+           "archived_bytes": 4096, "unchanged_skipped": 1057, "failed_count": 0,
+           "failures": [], "newly_deleted_detected": 0, "newly_deleted_sample": [],
+           "index_total_entries": 1060, "by_harness": {"claude-code": 3}}
+
+
+def _stub_archive(payload: dict) -> list:
+    return [sys.executable, "-c",
+            f"import json; print(json.dumps({payload!r}))"]
+
+
+def test_lane_d_disabled_when_interval_zero(tmp_path):
+    cfg = dict(CFG, transcript_archive_interval_hours=0)
+    out = HK.run_lane_d(cfg, state_path=tmp_path / "s.json",
+                        archive_cmd=_stub_archive(RECEIPT))
+    assert out == {"verdict": "disabled"}, "0 is the operator off-switch"
+
+
+def test_lane_d_absent_key_is_disabled(tmp_path):
+    """A config predating this lane must not start uploading by surprise."""
+    out = HK.run_lane_d(dict(CFG), state_path=tmp_path / "s.json",
+                        archive_cmd=_stub_archive(RECEIPT))
+    assert out["verdict"] == "disabled"
+
+
+def test_lane_d_not_due_within_interval(tmp_path):
+    sp = tmp_path / "s.json"
+    now = dt.datetime(2026, 9, 3, 12, 0, 0)
+    sp.write_text(json.dumps({"last_transcript_archive":
+                              (now - dt.timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")}),
+                  encoding="utf-8")
+    out = HK.run_lane_d(DCFG, state_path=sp,
+                        archive_cmd=_stub_archive(RECEIPT), now=now)
+    assert out["verdict"] == "not-due"
+
+
+def test_lane_d_due_runs_and_stamps(tmp_path):
+    sp = tmp_path / "s.json"
+    now = dt.datetime(2026, 9, 3, 12, 0, 0)
+    sp.write_text(json.dumps({"last_run": "keep-me", "last_transcript_archive":
+                              (now - dt.timedelta(hours=13)).strftime("%Y-%m-%dT%H:%M:%S")}),
+                  encoding="utf-8")
+    out = HK.run_lane_d(DCFG, state_path=sp,
+                        archive_cmd=_stub_archive(RECEIPT), now=now)
+    assert out["verdict"] == "ok"
+    assert out["archived_count"] == 3 and out["unchanged_skipped"] == 1057
+    st = json.loads(sp.read_text(encoding="utf-8"))
+    assert st["last_transcript_archive"] == "2026-09-03T12:00:00"
+    assert st["last_run"] == "keep-me", "must merge, never clobber the tick stamp"
+
+
+def test_lane_d_partial_still_stamps(tmp_path):
+    sp = tmp_path / "s.json"
+    r = dict(RECEIPT, failed_count=2, failures=[{"key": "a"}, {"key": "b"}])
+    out = HK.run_lane_d(DCFG, state_path=sp, archive_cmd=_stub_archive(r))
+    assert out["verdict"] == "partial" and len(out["failures"]) == 2
+    assert json.loads(sp.read_text(encoding="utf-8"))["last_transcript_archive"]
+
+
+def test_lane_d_timeout_does_not_stamp(tmp_path, monkeypatch):
+    sp = tmp_path / "s.json"
+    monkeypatch.setattr(HK, "LANE_D_TIMEOUT", 1)
+    out = HK.run_lane_d(DCFG, state_path=sp,
+                        archive_cmd=[sys.executable, "-c", "import time; time.sleep(20)"])
+    assert out["verdict"] == "timeout"
+    assert not sp.exists(), "an unreachable backend must retry next tick"
+
+
+def test_lane_d_unparseable_does_not_stamp(tmp_path):
+    sp = tmp_path / "s.json"
+    out = HK.run_lane_d(DCFG, state_path=sp,
+                        archive_cmd=[sys.executable, "-c", "print('not json')"])
+    assert out["verdict"] == "unparseable"
+    assert not sp.exists()
+
+
+def test_lane_d_spawn_error_does_not_stamp(tmp_path):
+    sp = tmp_path / "s.json"
+    out = HK.run_lane_d(DCFG, state_path=sp, archive_cmd=["/no/such/binary-xyz"])
+    assert out["verdict"] == "spawn-error"
+    assert not sp.exists()
+
+
+def test_lane_d_refuses_real_archiver_under_pytest(tmp_path, monkeypatch):
+    """No archive_cmd + inside pytest ⇒ never shell out to the production path.
+
+    PYTEST_CURRENT_TEST is pinned explicitly rather than inherited from the
+    ambient runner (guard-4522): the branch under test is env-dependent, so a
+    test that reads the env instead of setting it asserts nothing about the
+    branch when the runner changes.
+    """
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "pinned::test (call)")
+    out = HK.run_lane_d(DCFG, state_path=tmp_path / "s.json")
+    assert out == {"verdict": "skipped-under-pytest"}
+
+
+def test_lane_d_explicit_cmd_bypasses_the_pytest_guard(tmp_path, monkeypatch):
+    """The guard must gate only the DEFAULT command, never an injected one."""
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "pinned::test (call)")
+    out = HK.run_lane_d(DCFG, state_path=tmp_path / "s.json",
+                        archive_cmd=_stub_archive(RECEIPT))
+    assert out["verdict"] == "ok"
+
+
+def test_lane_d_is_not_gated_by_shadow(tmp_path):
+    """shadow arms DELETERS; lane D only copies. Parity here would be a bug."""
+    out = HK.run_lane_d(dict(DCFG, shadow=True), state_path=tmp_path / "s.json",
+                        archive_cmd=_stub_archive(RECEIPT))
+    assert out["verdict"] == "ok"
+
+
+def test_do_run_records_lane_d(tmp_path, monkeypatch):
+    _canned_lanes(monkeypatch, {"verdict": "ok"})
+    monkeypatch.setattr(HK, "run_lane_d",
+                        lambda cfg, archive_cmd=None: {"verdict": "ok", "archived_count": 7})
+    rec = HK.do_run(dict(DCFG), "test", log_path=tmp_path / "log.jsonl")
+    assert rec["lane_d"] == {"verdict": "ok", "archived_count": 7}
+    assert json.loads((tmp_path / "log.jsonl").read_text(encoding="utf-8"))["lane_d"]["archived_count"] == 7

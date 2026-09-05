@@ -78,6 +78,42 @@ gates:
     tuning_notes: "Phase 3 candidate. Widen trigger pattern set; tolerate FP."
     retirement_eligible: true
 
+  - id: retrieval-floor-gate
+    script: core/scripts/retrieval-floor-gate.sh
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/settings.json", phase: "PreToolUse[Edit|MultiEdit|Write]" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: generous
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A non-loop session that consulted the stores via cat/curl/grep (invisible to the manifest) gets one advisory banner on a knowledge write. Costs one re-check; nothing is blocked."
+    fn_description: "A knowledge-tree node or convention is written in a non-loop session with nothing consulted — the parametric-memory publish the 2026-08-31 directive names. Downstream readers treat it as ground truth."
+    rb_evidence: []
+    tuning_notes: "ADVISORY ONLY and must stay so — it can never refuse a write (see guard-4407: hook binds to the Edit/Write TOOLS and the manifest it reads binds to Read/WebFetch/WebSearch, so under a Bash-preference session BOTH halves go blind together and silently). Scope is deliberately narrower than pre-edit-context-gate's: knowledge/tree + conventions only, the stores that ASSERT facts. Do NOT widen to raise yield (guard-2201). The `retrieval-auto` exclusion in DELIBERATE_RETRIEVAL_KINDS is load-bearing — counting the UserPromptSubmit auto pre-pass would make this floor unreachable, passing forever while measuring nothing."
+    retirement_eligible: true
+
+  - id: retrieval-pulse-hook
+    script: core/scripts/retrieval-pulse-hook.sh
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/settings.json", phase: "PostToolUse[*]" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: generous
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A non-loop session that has been consulting via cat/curl/grep (invisible to the manifest) gets one advisory line after N tool calls. Costs one glance; nothing is blocked and the counter resets."
+    fn_description: "A non-loop session runs a long interior stretch — edits, filings, censuses, negations — without consulting anything, and no layer notices. Layer 1 only fires on a knowledge-store WRITE, so a session that never writes one is unobserved end to end."
+    rb_evidence: []
+    tuning_notes: "Layer 2 of g-357-47; layer 1 is retrieval-floor-gate (entry moment), this is the interior. ADVISORY ONLY and must stay so — a PostToolUse hook structurally cannot block, and the guard-4407 limit applies identically: firing is a prompt to check, never proof the session retrieved nothing. Threshold via --threshold or $RETRIEVAL_PULSE_THRESHOLD (default 15; <=0 disables). It MUST keep delegating the count to context-reads.py retrieval-pulse -> count_deliberate_retrievals: re-counting the manifest here, or accepting `retrieval-auto`, would make the pulse reset on the UserPromptSubmit auto pre-pass and measure nothing (guard-1760, the same failure DELIBERATE_RETRIEVAL_KINDS prevents for layer 1). Autonomous sessions are excluded by design — Phase 4 + the 9.5b audit already cover them."
+    retirement_eligible: true
+
   - id: verify-before-assuming-gate
     script: core/scripts/verify-before-assuming-gate.py
     embedded: false
@@ -605,6 +641,39 @@ gates:
     tuning_notes: "Closed allowlist (ALLOWED_PREFIXES tuple). Tuning is via prefix-set expansion as new agent classes emerge — not keyword fuzziness."
     retirement_eligible: true
 
+  - id: deadline-date-gate
+    script: core/scripts/gates/deadline_date.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "_run_add_goal_pipeline Phase H (single goal)" }
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "add(ctx) per-goal, after operator-offload" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: precision
+    override_flag: "--override-deadline"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "Goal whose SUBJECT is scheduling trips the cue; author adds a date field or overrides (~15s)."
+    fn_description: "Deadline-bearing record files with no date, every deadline alarm is structurally blind to it, and it sits until someone notices by hand. Measured once at 9 days against a hard external deadline (2026-09-04 directive)."
+    rb_evidence: ["guard-2073", "guard-2458", "guard-2475", "guard-2786", "guard-3179"]
+    tuning_notes: |
+      ADD-path only, never the update path (guard-2475: whole-record validation
+      added after records exist wedges every pre-existing record out of all
+      future writes).
+      Cue set is BOUND CONSTRUCTIONS (cue adjacent to a time expression), not
+      keyword-anywhere. The first design used cue-anywhere + time-token-within-60-
+      chars and measured 513/2423 live goals (21.17%), 14 of 14 hand-sampled
+      firings FALSE -- "closes/closing" is this framework's most common verb,
+      "EXPIRED" is a goal status, and every description carries an ISO date, so
+      the window was inert (guard-3179: the predicate measured the corpus's
+      subject matter). Adjacency + dropping the pure-noise cues (before/ends/
+      submission) took it to 21/2423 (0.87%) with all positive controls still
+      caught, including both goals of the originating incident.
+      Tune by tightening CONSTRUCTIONS, never by widening the window -- widening
+      is what produced the 21% and it degrades monotonically.
+    retirement_eligible: false
+
   - id: aspiration-supply-gate
     script: core/scripts/gates/aspiration_supply.py
     embedded: false
@@ -1065,7 +1134,26 @@ gates:
     fp_description: "A tier-2 close is refused for a goal whose accuracy was in fact fine, costing one review cycle; or the note-marker check flags a legitimate close whose note QUOTES a not-done phrase while refuting it. The second is measured and real — g-115-5085 ('do not reopen this goal') is a correct close the high tier flags — which is why the refusal prints the matched context and is override-able rather than being a hard deny, and why the detector must NOT be widened to raise yield (guard-2201)."
     fn_description: "A goal closes green while its stated outcomes were never checked by anyone but its author. Measured: coach g-012-02 closed with 6/16 wrong entity identities because the author self-graded against count-based criteria (g-357-39). Note-marker half: a goal sits at a terminal status while its own note argues it is not done — g-326-736 read `completed` under a note opening 'REOPENED BY ITS OWN CRITERIA', and it was the sole owner of a product smoke test that went dark three days."
     rb_evidence: ["guard-1532", "guard-142", "rb-4452", "guard-2201"]
-    tuning_notes: "SHIPPED DORMANT (2026-09-02, g-357-40) — close_review_gate.enabled and .note_marker_enabled both default false in core/config/aspirations.yaml, a MISSING key reads false. This is a ship condition, not a hedge: check A's refusal names a remedy (the fresh-eyes close reviewer) whose producer is sibling goal g-357-41 and does not exist yet, and enabling a gate whose named remedy is unreachable forces every caller onto --override, manufacturing false records in the very ledger the gate fills (guard-1532, measured twice). Check B needs its refusal rate measured over the live completed population first. The flags are independent — flip each when ITS precondition lands. Tier logic is a pure, separately-tested module (goal_close_risk_tier.py): tier 0 (recurring + routine + no artifacts) short-circuits FIRST so a recurring framework-hygiene sweep never demands review; tier 2 fires on any of 6 triggers. Fail-to-tier-1 on every classifier fault (guard-142) — but verdict ABSENCE is a refusal, never a fail-open, because absence of review is the condition the gate exists to catch. Read the FP ratio against world/close-review-overrides.jsonl."
+    tuning_notes: "SHIPPED DORMANT (2026-09-02, g-357-40) — close_review_gate.enabled and .note_marker_enabled both default false in core/config/aspirations.yaml, a MISSING key reads false. This is a ship condition, not a hedge: check A's refusal names a remedy (the fresh-eyes close reviewer) whose producer is sibling goal g-357-41 and does not exist yet, and enabling a gate whose named remedy is unreachable forces every caller onto --override, manufacturing false records in the very ledger the gate fills (guard-1532, measured twice). Check B needs its refusal rate measured over the live completed population first. MEASURED (g-357-77, zeta 2026-09-04): tier-2 share on deep non-recurring closes = 44/50 (88.0%) primary / 301/339 (88.8%) full -- hypothesis CONFIRMED (>=80%), tier-2 is near-universal on deep closes; the entities trigger dominates (38/44 tier-2), and framework+first_of_asp are structurally inert because iteration-close.sh:1160 passes only --goal/--source (no --files, no --first-of-aspiration). Note-marker (check B) refusal rate = 0/448 (0.0%) at the gate HIGH-confidence threshold over the live completed population, so check B's precondition is SATISFIED green and it is ELIGIBLE to enable (override --override-note-marker reachable; guard-1532 does not apply to B). Left dormant pending a separate enable decision -- flipping note_marker_enabled breaks test_gate_is_DORMANT_by_default and changes the shipped posture, beyond g-357-77's record-the-rate scope. The flags are independent — flip each when ITS precondition lands. Tier logic is a pure, separately-tested module (goal_close_risk_tier.py): tier 0 (recurring + routine + no artifacts) short-circuits FIRST so a recurring framework-hygiene sweep never demands review; tier 2 fires on any of 6 triggers. Fail-to-tier-1 on every classifier fault (guard-142) — but verdict ABSENCE is a refusal, never a fail-open, because absence of review is the condition the gate exists to catch. Read the FP ratio against world/close-review-overrides.jsonl."
+    retirement_eligible: false
+
+  - id: defer-routing-target
+    script: core/scripts/gates/defer_routing_target.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/aspirations.py", phase: "cmd_update_goal — field == defer_reason, triggered on the FIELD (never on _is_narrative_defer)" }
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "update_goal — field == defer_reason (the LIVE half; wrappers are daemon-only)" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: "--force-defer"
+    fp_cost: medium
+    fn_cost: medium
+    fp_description: "A correct defer is refused and the author must reach for --force-defer, which is the honor-system escape the gate exists to reduce. Measured and designed against on the live corpus of 130 deferred goals: the naive predicate (cites a grant + waits) fires on 2 and one of them, g-335-552, is the best-written defer in the corpus — human_blocked prefix, re-derived on both axes, a positive control on its own probe, and it names grant-014/013/010 precisely to explain why none of them retires it. That is the guard-3882 gradient, where the best-probed defers cite the most registries and so trip a naive target check. Judging citation STANCE (relied-on vs ruled-out) over a window around each citation drops the population to 1 — the true positive alone. Lane A (agent vs lane pin) was DEMOTED to advisory for the same reason: as a refusal it measured 1 firing and 1 false positive, g-350-334, which correctly routes a DEV session run to foxtrot and is blocked on the single generic token server leaked from surrounding prose."
+    fn_description: "A defer names an owner who is not the owner and the goal freezes behind them. Measured cost of the three instances that motivated this gate: g-369-112 sat undone while two HIGH goals named it as their blocker and took about 25 minutes to execute once attempted; g-369-08 and g-369-03 both routed to an external owner work the fleet identity could already perform in the same AWS account. The residual FN is deliberate: lane A advises rather than refuses, so an out-of-lane agent routing still lands."
+    rb_evidence: ["guard-3882", "guard-1470", "guard-3803", "guard-4883", "guard-1802", "rb-10090"]
+    tuning_notes: "Three lanes, each population measured against the 130 live deferred goals on 2026-09-04 (cc-08), never reasoned. Lane B (grant cited as a gate) REFUSES: a standing grant is a PERMISSION — every registry row ends never (revoke by deleting this row) — so a grant can retire a gate and can never create one, which makes a grant cited as grounds for waiting decidable without understanding the work. Lane A (agent a live pin excludes) also REFUSES, but ONLY with the pin matched over the ROUTED CLAUSE rather than the whole defer: a defer_reason is a paragraph in which one clause routes work, so whole-text matching let an unrelated sentence decide the verdict and measured 1 firing / 1 false positive (g-350-334, a lone 'server' inside a provenance marker two sentences from a clause pin-001 explicitly permits). Clause scoping takes lane A to 0 firings / 0 false positives across all 130 while a constructed genuine violation still refuses with the pin quoted — the zero is UNEXERCISED, not dead. Lane C ADVISES (owner-phrases are prose; guard-1470). Trigger on the FIELD, never on _is_narrative_defer: that predicate returns False for every STRUCTURED_DEFER_PREFIXES value and the live corpus measured 130 of 130 structured, so gating it the way capability-gate is gated would fire on exactly ZERO of the population while looking correct in review (guard-1802). Role-aware agent extraction is load-bearing: a bare roster word-match fires on 89 of 130 because defers cite agents as PROVENANCE, and requiring the agent to be the target of a routing verb takes that to 4 (guard-4883). Lane A calls gates.lane_pin.evaluate rather than re-deriving lane matching, so the defer gate and the claim gate cannot disagree about what a pin means (guard-2676). Deny messages are built by CONCATENATION, never format(), because they quote registry prose containing braces (guard-3803)."
     retirement_eligible: false
 
 pending_audit:

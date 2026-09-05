@@ -278,6 +278,35 @@ drainable working doc and Phase 3 archiving megabytes of valueless scratch into
 `drained/`. The extension is the stable purge marker; a bare-named `.json` dump
 is treated as a working doc and drained. (g-115-2947)
 
+**THE DESTINATION ABOVE IS SAFE FOR SMALL, FAST DUMPS AND UNSAFE FOR LONG OR
+LARGE ONES — and the split is `session/` vs `sessions/`, one character.**
+`session/scratch/` (SINGULAR) sits INSIDE the own-cloud sync walk;
+`sessions/<SID>/scratch/` (PLURAL, the L1 per-session home) is walk-PRUNED, because
+`owncloud_sync._EXCLUDE_DIRS` contains `'sessions'` and does NOT contain `'session'`
+(read from `core/scripts/owncloud_sync.py`, g-115-8914). For a redirect target that difference decides
+whether the bytes survive: the sync layer can REPLACE the file at a new inode while
+the writer still holds an fd on the old one, so the writer trickles into an orphaned
+inode and the caller sees **rc=0 with zero or partial bytes and no error text
+anywhere** — indistinguishable from a genuinely empty result.
+
+Route a dump to `sessions/<SID>/scratch/` (or `tempfile.gettempdir()`) when the
+writer is LONG-RUNNING or the payload is LARGE. Duration is the discriminator, not
+size alone — a fast large write usually survives. Worked example: `goal-selector.sh`
+is a ~23-second writer emitting 2.9–4.8 MB, and the committed A/B (g-115-6409) is the
+same command with the redirect target as the ONLY variable — tree path → 0 bytes at
+rc=0, `gettempdir()` → 129,157 bytes at rc=0.
+
+Two things not to conclude from a quiet run. Non-reproduction is NOT refutation: the
+mechanism needs a sync event to land inside the write window, so a clean A/B is one
+signal about one box at one moment (measured both ways on cc-07, g-115-8914). And the
+NUL-byte check is ONE-DIRECTIONAL — any NULs mean corruption, but zero NULs is not
+evidence against it, since the common variant has a clean prefix, zero NULs and rc=0.
+
+This does NOT deprecate `session/scratch/`. It is sanctioned by
+`session-state.md` as the manifest-managed home for ordinary ephemera, carries
+`recovery_action: clear`, and is correct for the small fast files that are most of
+what lands there. The caveat is scoped to the redirect-target case only.
+
 **The same rule applies to one-shot command INPUT, and that direction is the one
 that actually accumulates.** Everything above says "output" — dumps, stdout,
 "for inspection" — so a JSON body written to be piped INTO a script
@@ -526,7 +555,7 @@ at write time by the Phase-4 hard gate
 | Experience traces (narratives of what happened) | `experience/` |
 | Daily journal entries | `journal/` |
 | Session state (signals, working memory, handoff) | `session/` (registered in `session-manifest.yaml`) |
-| Per-session IO buffers / probe dumps | `session/scratch/` |
+| Per-session IO buffers / probe dumps | `session/scratch/` — but a LONG-RUNNING or LARGE redirect goes to `sessions/<SID>/scratch/` (plural, sync-pruned); see the raw-dump rule (g-115-8914) |
 | Per-session binding metadata | `sessions/<SID>/` |
 | Operational telemetry / diagnostic time-series (phase-costs) and delta baselines (`last-outcome-snapshot.yaml`) | `session/` — machine-local, never knowledge, regenerable |
 | Completion-report dashboard (latest pointer) | `COMPLETION-REPORT.md` at the agent root (git history is its archive) |

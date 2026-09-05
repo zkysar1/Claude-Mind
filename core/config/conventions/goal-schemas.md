@@ -582,13 +582,14 @@ via `aspirations-precheck` Phase 0.5b re-probe, disqualifying quiescence:
 
 **Structured-prefix bypass**: defer_reason values starting with
 `STRUCTURED_DEFER_PREFIXES` (`precondition_unmet:`, `blocked_on_dependency`,
-`Circuit breaker:`, `human_blocked:`) skip both the capability-gate AND the
+`Circuit breaker:`, `human_blocked:`, `member_paused:`) skip both the capability-gate AND the
 blocker_ref gate. Those are machine-written state markers from the framework
 itself, not narrative claims about external signals.
 
-`human_blocked:` (added 2026-06-25 by g-115-1646) is the one member that is
-NOT self-clearing, and it behaves differently enough to be worth stating
-here: it marks a genuinely non-agent-provisionable human gate (an approval
+`human_blocked:` (added 2026-06-25 by g-115-1646) is one of TWO members that
+are NOT self-clearing — `member_paused:` (added 2026-09-04 by g-369-30) is the
+other, and this sentence said "the one" until that landed. It behaves
+differently enough to be worth stating here: it marks a genuinely non-agent-provisionable human gate (an approval
 click, outside counsel, a credential only a person can grant), so it is
 exempt from the 120h defer fall-through in `collect_eligible` /
 `collect_blocked`. It stays suppressed-from-selector AND counted-in-blocked,
@@ -602,6 +603,17 @@ opposite. `.claude/rules/capability-before-user.md` and
 and a `human_blocked:` defer is subject to the same RULE-axis re-check as any
 other routing-away decision: a standing grant can retire the reason while the
 condition remains perfectly true.
+
+`member_paused:` marks a MEMBER-initiated pause or decline from the published
+Planned board (`planned_verbs.py`). It shares the never-auto-clears property
+for a different reason: the 120h fall-through exists to re-probe defers whose
+premise is a WORLD condition, and no probe can answer "does the member still
+want this paused" — an expiring pause would silently resume work a member
+explicitly stopped. Only the member's own inverse verb clears it. Note the
+asymmetry with `human_blocked:`: that one is surfaced by the precheck
+age-escalation because a human gate should be chased; a member pause should
+NOT be, and `collect_blocked` labels it `Member-paused` rather than
+`Human-blocked` so it does not enter that lane.
 
 (This paragraph is late by 36 days. `test_structured_prefixes_published`
 exists specifically to force a docs update when the tuple changes, went red

@@ -135,6 +135,14 @@ except Exception:
 query = text[:400]
 env = dict(os.environ)
 env['MIND_AGENT'] = agent
+# Mark this retrieval AUTOMATIC (). retrieve.sh records every successful
+# consultation into the session provenance manifest; this one was not requested
+# by the model and may never be read by it, so it must not count as evidence the
+# agent consulted its knowledge. Without this flag the retrieval-floor query
+# would pass for every session in which a human typed a substantive sentence --
+# a floor that can never fail, which is worse than no floor because it reads as
+# coverage. See DELIBERATE_RETRIEVAL_KINDS in context-reads.py.
+env['MIND_RETRIEVAL_AUTO'] = '1'
 
 # HARD LATENCY BUDGET. This hook runs BEFORE the model starts thinking, so
 # every second here is dead air the user watches. The ceiling is therefore a

@@ -8,9 +8,28 @@ caller regresses away reverts to exactly that state, silently — so the pin
 greps iteration-close.sh for a NON-comment invocation (guard-1099: an
 unanchored grep counts comments quoting the call as live code).
 
-All git fixtures are self-contained tmp repos; no network, no live daemon, no
-world store. STORAGE_BACKEND is irrelevant here but the suite-wide local pin
-is harmless.
+All git fixtures are self-contained tmp repos; no network and no live daemon.
+
+THE "NO WORLD STORE" CLAUSE THIS DOCSTRING USED TO CARRY WAS FALSE, and its
+falseness is worth keeping visible rather than quietly deleting (guard-5953,
+g-115-8634). Three tests here invoke `--check`, whose DO_CHECK branch calls
+pull-signal-set.sh — a SHARED WORLD-STORE writer. The tmp git repo isolated
+what the FIXTURE built and said nothing about a second store the SUBJECT
+reaches through its own path resolution, so `refs/workers/alpha/sid-bbbb`
+(pushed at the fixture below) was found LIVE in g-306-284.pull_signal, where
+its idempotent-skip-while-live contract (rb-662) then SUPPRESSED the real
+signal from 3 genuine outstanding tips carrying 16 framework files.
+
+The next sentence used to read "STORAGE_BACKEND is irrelevant here" — TRUE of
+the git fixture and IRRELEVANT to the leaking channel, which is precisely why
+it read as reasoned. A correct statement about the isolated resource is the
+strongest camouflage for an un-isolated one.
+
+The leak is now closed IN PRODUCTION, not by test opt-in: worker-ref-consume.sh
+refuses to stamp when --repo is not the bound agent repo. Because _paths.sh
+line 31 EXPORTS PROJECT_ROOT unconditionally, a test cannot inject a fake bound
+repo to get around it (the guard-2484 clobber, working in our favour here), so
+every tmp-repo invocation in this file is structurally incapable of writing.
 """
 import json
 import os
@@ -639,3 +658,310 @@ def test_unreachable_refusal_names_rebase_orphan_when_no_live_body_row(repo, tmp
     assert "sid-bbbb" in ls, "the ref must survive the refusal"
     receipts = repo["work"] / "core" / "logs" / "worker-ref-retirements.jsonl"
     assert not receipts.exists(), "a refused retire must not write a receipt"
+
+
+# --- : the pull_signal producer gate -------------------------------
+# Regression pins for the two ways --check wrote a phantom into a SHARED field.
+# Both members are real measurements, not hypotheticals: guard-5953 (this test
+# file's own fixture leaked into .pull_signal) and guard-5797 (a behind
+# local branch manufactured outstanding tips out of already-landed commits).
+
+def test_check_refuses_to_stamp_pull_signal_from_a_foreign_repo(repo):
+    """THE regression pin for guard-5953. Invoked in the LITERAL production arg
+    shape the rest of this file uses (`--repo <tmp>`), not a contract-ideal one
+    (guard-920) — that shape IS the defect, because every test here passes it.
+
+    Before the gate this exact call wrote a live pull_signal onto g-306-284
+    naming refs/workers/alpha/sid-bbbb, a ref that exists in no repo on the
+    fleet, and the producer's skip-while-live idempotence then blocked the real
+    signal."""
+    r = _consume(repo["work"], "--check", "--max-depth", "0", "--max-age-h", "9999")
+    assert r.returncode == 0, "advisory mode must exit 0 even on breach"
+
+    # NON-VACUITY CONTROL FIRST (guard-2421): a skip proves nothing if the
+    # producer had nothing to stamp anyway. This fixture's sid-bbbb touches
+    # core/x.sh, so the DO_CHECK branch reaches the producer with a real
+    # outstanding framework tip — the refusal is the GATE, not an empty set.
+    assert "sid-bbbb" in r.stdout and "framework_files=1" in r.stdout, (
+        "control failed: the fixture must present an outstanding framework tip, "
+        "or this test would pass even with the gate removed"
+    )
+
+    assert "SKIP-foreign-repo" in r.stdout, (
+        "--check from a tmp repo must refuse to stamp the shared pull_signal"
+    )
+    assert "SET (" not in r.stdout, (
+        "the producer must not have written: a SET verdict here means a test "
+        "process just wrote into the live world store (guard-5953)"
+    )
+
+
+def test_foreign_repo_gate_cannot_be_bypassed_by_injecting_project_root(repo):
+    """The gate compares against PROJECT_ROOT, and _paths.sh line 31 EXPORTS it
+    unconditionally — so an injected value is clobbered before the comparison.
+    That is the guard-2484 clobber working FOR us: it means no test, present or
+    future, can talk itself past this gate into the live store."""
+    r = _consume(repo["work"], "--check", "--max-depth", "0", "--max-age-h", "9999",
+                 env={"PROJECT_ROOT": str(repo["work"])})
+    assert r.returncode == 0
+    assert "SKIP-foreign-repo" in r.stdout, (
+        "injecting PROJECT_ROOT must NOT let a tmp repo pose as the bound repo"
+    )
+    assert "SET (" not in r.stdout
+
+
+def test_behind_base_is_measured_from_a_genuinely_behind_repo(tmp_path):
+    """guard-5797 / outcome 3: a GENUINELY behind base, never a mocked count.
+
+    Builds a clone whose local main is really two commits behind origin/main and
+    asserts the gate's own predicate — `git rev-list --count HEAD..refs/remotes/
+    origin/main` — reports it. This is the condition under which already-landed
+    commits read as outstanding, which is what manufactured the phantom tip.
+
+    Asserted as the predicate rather than end-to-end because the foreign-repo
+    gate (correctly) fires first on any tmp repo, so the behind-base branch is
+    unreachable from a fixture — stated plainly rather than papered over with a
+    seam that would reopen the leak the test above pins shut."""
+    origin = tmp_path / "o.git"
+    work = tmp_path / "w"
+    _run(["git", "init", "--bare", "--initial-branch=main", str(origin)])
+    _run(["git", "clone", str(origin), str(work)])
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    (work / "f.txt").write_text("base\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    _git(work, "push", "origin", "main")
+
+    # advance origin by two real commits, then park local main behind them
+    for n in ("one", "two"):
+        (work / f"{n}.txt").write_text(f"{n}\n")
+        _git(work, "add", ".")
+        _git(work, "commit", "-m", n)
+    _git(work, "push", "origin", "main")
+    _git(work, "fetch", "origin")
+    _git(work, "reset", "--hard", "HEAD~2")
+
+    behind = _git(work, "rev-list", "--count", "HEAD..refs/remotes/origin/main")
+    assert behind == "2", (
+        f"expected a genuinely behind base of 2 commits, got {behind!r} — the "
+        "fixture, not the gate, is wrong if this fails"
+    )
+    # Positive control on the predicate's other direction: a synced base is 0.
+    _git(work, "reset", "--hard", "refs/remotes/origin/main")
+    assert _git(work, "rev-list", "--count", "HEAD..refs/remotes/origin/main") == "0"
+
+
+def test_pull_producer_gate_is_pinned_in_source(repo):
+    """guard-920 mitigation, mirroring test_liveness_seam_default_is_the_real_
+    sibling above: the behaviour tests can only exercise the branch they reach,
+    so pin that the producer call is INSIDE the gated else-branch and that both
+    refusal reasons still exist. Without this, someone could delete the
+    behind-base arm and every test here would stay green."""
+    src = CONSUME.read_text(encoding="utf-8", errors="replace")
+    assert "SKIP-foreign-repo" in src
+    assert "SKIP-behind-base" in src
+    assert "SKIP-unreadable-base" in src
+    # the base must be handed to the producer (outcome 1) — a stamp with no
+    # recorded base is the unauditable number guard-5797 forbids
+    assert '--base "head=$pull_head_sha origin=$pull_origin_sha"' in src
+    # and the producer call must sit under the gate, not beside it
+    gate_at = src.index("pull_skip=\"\"")
+    call_at = src.index("pull-signal-set.sh")
+    assert gate_at < call_at, (
+        "the pull-signal-set.sh invocation must come AFTER the gate is computed"
+    )
+    assert (SCRIPTS / "pull-signal-set.sh").exists()
+
+
+# ---------------------------------------------------------------------------
+# goal_ids — WHAT work a carrier ref strands, not just how much ()
+#
+# The incident: a reducer selecting  weighed carrier-ref disposition
+# against it and deprioritised the ref as "0-1h old, not urgent". That ref held
+# , a decomposition child of , and its commit messages named
+# BOTH ids. `commits_ahead` and `framework_files` could not express that, so the
+# ordering was wrong on information the repository already had.
+#
+# CHURN EXCLUSION IS THE LOAD-BEARING HALF. iteration-push.sh's self-heal commit
+# (iteration-push.sh:1083) names  in EVERY such commit on EVERY ref, so
+# without the --invert-grep filter every ref in the fleet reports the same
+# constant as stranded work — a field that always says the same thing tells a
+# reader nothing, which is the failure mode this whole change exists to remove.
+# ---------------------------------------------------------------------------
+
+CHURN_SUBJECT = (
+    "chore(alpha): pre-merge self-namespace churn (iteration-push self-heal, g-115-2249)"
+)
+
+
+@pytest.fixture()
+def goalid_repo(tmp_path):
+    """origin + work clone carrying three worker refs:
+
+      sid-named  — one commit whose message names g-369-119 (subject) and
+                   g-369-30 (body): the incident's exact shape.
+      sid-churn  — one commit carrying ONLY the self-heal churn subject.
+      sid-plain  — one commit whose message names no goal at all.
+
+    HEAD is parked at base so every ref is ahead of it. The churn commit touches
+    a non-framework path so its fw_count is 0, exactly like the real one.
+    """
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    assert _run(["git", "init", "--bare", "--initial-branch=main", str(origin)]).returncode == 0
+    assert _run(["git", "clone", str(origin), str(work)]).returncode == 0
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    (work / "f.txt").write_text("base\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    _git(work, "push", "origin", "main")
+    base = _git(work, "rev-parse", "HEAD")
+
+    def _branch_commit(fname, body, message):
+        _git(work, "reset", "--hard", base)
+        (work / fname).parent.mkdir(parents=True, exist_ok=True)
+        (work / fname).write_text(body)
+        _git(work, "add", ".")
+        _git(work, "commit", "-m", message)
+        return _git(work, "rev-parse", "HEAD")
+
+    sha_named = _branch_commit(
+        "core/handle.py",
+        "handle\n",
+        "feat(knowledge-projection): opaque per-goal handle (g-369-119)\n\n"
+        "Precondition for g-369-30.\n",
+    )
+    _git(work, "push", "origin", f"{sha_named}:refs/workers/alpha/sid-named")
+
+    sha_churn = _branch_commit("notes/churn.txt", "churn\n", CHURN_SUBJECT)
+    _git(work, "push", "origin", f"{sha_churn}:refs/workers/alpha/sid-churn")
+
+    sha_plain = _branch_commit("core/plain.sh", "echo plain\n", "chore: tidy up")
+    _git(work, "push", "origin", f"{sha_plain}:refs/workers/alpha/sid-plain")
+
+    _git(work, "reset", "--hard", base)
+    return {"origin": origin, "work": work, "base": base}
+
+
+def test_goal_ids_names_the_goals_the_unlanded_commits_carry(goalid_repo):
+    """The incident's ref shape: subject names the child, body names the parent.
+    BOTH must surface — the parent id is the one that would have changed the
+    reducer's ordering, and it lives only in the body."""
+    r = _consume(goalid_repo["work"], "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    named = by_sid["sid-named"]
+    assert named["commits_ahead"] == 1, named
+    ids = named["goal_ids"].split()
+    assert ids == ["g-369-119", "g-369-30"], named["goal_ids"]
+
+
+def test_goal_ids_excludes_the_self_heal_churn_constant(goalid_repo):
+    """The churn commit names  in every such commit on every ref.
+
+    ANTI-VACUITY: the final assertion would also pass if goal_ids were broken
+    and always empty, so this test first PROVES the churn commit is present in
+    the ref's log and that its id is extractable from the raw messages — i.e.
+    that the exclusion is doing work rather than the extractor being dead."""
+    work = goalid_repo["work"]
+    ref = "refs/workers/alpha/sid-churn"
+    # --json runs FIRST because the script's own fetch is what materialises the
+    # worker refs in this clone (the fixture pushes them to origin only). The
+    # positive controls below would die rc=128 "ambiguous argument" if they ran
+    # against a ref this repo has never fetched — which reads like a defect in
+    # the feature rather than a test ordering bug.
+    r = _consume(work, "--json")
+    assert r.returncode == 0, r.stderr
+    # positive control 1: the commit really is on the ref, ahead of HEAD
+    assert _git(work, "rev-list", "--count", f"HEAD..{ref}") == "1"
+    # positive control 2: unfiltered, its id IS in the message stream
+    raw = _git(work, "log", "--format=%B", f"HEAD..{ref}")
+    assert "g-115-2249" in raw
+
+    by_sid, _ = _refs_by_sid(r.stdout)
+    churn = by_sid["sid-churn"]
+    assert churn["commits_ahead"] == 1, churn
+    assert churn["goal_ids"] == "", churn
+
+
+def test_goal_ids_is_empty_when_no_commit_names_a_goal(goalid_repo):
+    """Empty means 'no commit here NAMED a goal', never 'nothing is stranded' —
+    commits_ahead stays the count of record and must remain non-zero here."""
+    r = _consume(goalid_repo["work"], "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    plain = by_sid["sid-plain"]
+    assert plain["commits_ahead"] == 1, plain
+    assert plain["goal_ids"] == "", plain
+    # ...and the extractor is not simply dead in this run:
+    assert by_sid["sid-named"]["goal_ids"], "extractor produced nothing anywhere"
+
+
+def test_human_report_prints_carried_goals_only_when_there_are_some(goalid_repo):
+    """--check reaches the human report, and the drain decision is made there.
+    The line must appear for the named ref and NOT for the two without ids."""
+    r = _consume(goalid_repo["work"], "--check")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout + r.stderr
+    assert "carries work naming: g-369-119 g-369-30" in out, out
+    assert out.count("carries work naming:") == 1, out
+
+
+def test_every_json_row_carries_the_goal_ids_key(goalid_repo):
+    """A consumer reading .goal_ids must never hit a KeyError on some rows —
+    the field is emitted for every ref, empty string included."""
+    r = _consume(goalid_repo["work"], "--json")
+    assert r.returncode == 0, r.stderr
+    _, data = _refs_by_sid(r.stdout)
+    assert data["refs"], "no refs emitted"
+    assert all("goal_ids" in row for row in data["refs"]), data["refs"]
+
+
+def test_daemon_only_ref_counts_as_framework_and_is_pullable(repo):
+    """A carrier ref whose commits touch ONLY mind_api/src must count as
+    framework work (g-306-436). While the :408 predicate read
+    '^(core/|\\.claude/|CLAUDE\\.md)' such a ref reported framework_files=0, so
+    it never incremented pull_tip_count and raised NO pull signal — daemon-only
+    work waited out the ordinary interval timer while core/-touching work was
+    promoted out of cadence (pull_boost=4.00). The ref was never invisible
+    (n_outstanding increments unconditionally); what it lost was the DEMAND
+    signal, and with it the ':506' merge suggestion naming the changed files.
+
+    promotion-preflight.sh already counts mind_api/{src,tests} as framework
+    (.claude/rules/promotion-cycle.md, Pre-Overwrite Drift Gate); this pins the
+    two framework definitions together so they cannot drift apart again.
+
+    Measured when this landed (30d window, 6,718 non-merge commits): 273 touched
+    mind_api/ and 100 of those touched NO core/|.claude/|CLAUDE.md — 36.6% of
+    all daemon work, i.e. the population this predicate was dropping is common,
+    not hypothetical."""
+    work = repo["work"]
+    (work / "mind_api" / "src").mkdir(parents=True, exist_ok=True)
+    (work / "mind_api" / "src" / "d.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "worker D daemon-only commit")
+    sha_d = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_d}:refs/workers/alpha/sid-dddd")
+    _git(work, "reset", "--hard", "HEAD~1")
+
+    r = _consume(work, "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    d = by_sid["sid-dddd"]
+    assert d["commits_ahead"] == 1, d
+    assert d["framework_files"] == 1, (
+        "daemon-only ref reported framework_files=%s — the :408 predicate is "
+        "excluding mind_api/, so this ref raises no pull signal (g-306-436)"
+        % d["framework_files"]
+    )
+
+    # The actionable half: the human report must name the file and offer the
+    # merge, which is the ':506' branch gated on the same fw_count.
+    h = _consume(work, "--check")
+    assert h.returncode == 0, h.stderr
+    out = h.stdout + h.stderr
+    assert "mind_api/src/d.py" in out, out

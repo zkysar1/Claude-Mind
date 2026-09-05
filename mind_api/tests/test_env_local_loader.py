@@ -19,7 +19,11 @@ from pathlib import Path
 
 import pytest
 
-from mind_api.src.__main__ import _load_env_local, _ensure_owncloud_roots
+from mind_api.src.__main__ import (
+    _load_env_local,
+    _ensure_owncloud_roots,
+    _resolve_bind_port,
+)
 
 
 def _run_loader(tmp_path: Path, body: str, clear_keys=(), preset=None):
@@ -339,3 +343,66 @@ def test_credential_mismatch_warns_without_leaking_values(tmp_path, capsys):
     assert "MIND_AWS_SECRET_ACCESS_KEY" in err and "credential key" in err
     assert "file-secret-value" not in err
     assert "inherited-secret-value" not in err
+
+
+# ---------------------------------------------------------------------------
+# MIND_API_PORT — the listen-port pin ()
+#
+# The daemon's port was OS-assigned and turned over on every recycle (measured
+# on one box: 41247 -> 42055 -> 42387 inside ~25 min, the third from a SHA-move
+# auto-restart). A client pinned to the old port fails OPEN, so the breakage is
+# silent. MIND_API_PORT pins it, delivered through .env.local for the same
+# reason MIND_API_TOKEN / MIND_API_BIND are: it is re-read at EVERY start,
+# including an auto-respawn, whereas the two spawn wrappers are declared twins
+# a third spawn path would silently bypass.
+#
+# The end-to-end test below is the one that matters, and it is deliberately
+# MUTATION-SHAPED: it exercises .env.local -> _load_env_local -> the allowlist
+# -> _resolve_bind_port, so deleting "MIND_API_PORT" from _N3_ALLOWED_EXACT
+# makes it fail (the loader drops the key, the resolver sees unset, 4599 -> 0).
+# A resolver-only test would stay green through exactly that regression --
+# which is the guard-3485 defect class this key's own comment cites.
+
+
+def test_mind_api_port_is_loadable_from_env_local(tmp_path):
+    """READ <=> LOADABLE for MIND_API_PORT, through the real chain.
+
+    Mutation proof: drop the key from _N3_ALLOWED_EXACT and this fails.
+    """
+    env = _run_loader(tmp_path, "MIND_API_PORT=4599\n",
+                      clear_keys=("MIND_API_PORT",))
+    assert env.get("MIND_API_PORT") == "4599", (
+        "MIND_API_PORT did not survive _load_env_local — it is almost certainly "
+        "missing from _N3_ALLOWED_EXACT, which makes the documented .env.local "
+        "channel silently do nothing."
+    )
+    # ...and the loaded value is what the daemon would actually bind.
+    assert _resolve_bind_port(None, env) == 4599
+
+
+def test_resolve_bind_port_unset_is_os_assigned(tmp_path):
+    """Outcome 3: an unset key is byte-identical to the pre-existing behaviour."""
+    assert _resolve_bind_port(None, {}) == 0
+    # An empty value is 'unset', matching how the loader treats a blank
+    # .env.example-style line rather than binding something arbitrary.
+    assert _resolve_bind_port(None, {"MIND_API_PORT": ""}) == 0
+    assert _resolve_bind_port(None, {"MIND_API_PORT": "   "}) == 0
+
+
+def test_resolve_bind_port_explicit_cli_wins_over_env():
+    # default=None is what makes "not passed" distinguishable from "passed 0";
+    # both used to collapse to 0, so an explicit --port 0 could not be honoured.
+    assert _resolve_bind_port(8123, {"MIND_API_PORT": "4599"}) == 8123
+    assert _resolve_bind_port(0, {"MIND_API_PORT": "4599"}) == 0
+
+
+def test_resolve_bind_port_refuses_bad_values_instead_of_falling_back():
+    """A bad pin must NOT degrade to 0 — that is the failure it exists to remove."""
+    for bad in ("not-a-port", "80.5", "-1", "65536", "99999"):
+        with pytest.raises(ValueError):
+            _resolve_bind_port(None, {"MIND_API_PORT": bad})
+
+
+def test_resolve_bind_port_accepts_the_range_boundaries():
+    assert _resolve_bind_port(None, {"MIND_API_PORT": "0"}) == 0
+    assert _resolve_bind_port(None, {"MIND_API_PORT": "65535"}) == 65535

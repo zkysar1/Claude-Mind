@@ -247,6 +247,28 @@ _SNAPSHOT_BLACKLIST = {
         # literals are pinned to counters_name() by test instead.
         "reasoning-bank-utilization.jsonl",
         "guardrails-utilization.jsonl",
+        # : the per-iteration productivity snapshot store, added when its
+        # writer moved off bare open(...,"a") onto locked_append_jsonl. This is
+        # the guard-2415 case in its pure form — the locked path calls
+        # save_history() on EVERY append, and this file is 7.4MB taking ~662
+        # appends/24h fleet-wide, so an unblacklisted cutover would write ~4.9GB
+        # of .history per day: strictly worse than the S3 churn the cutover
+        # exists to remove, and invisible until the disk fills.
+        #
+        # Restore value is nil: append-only telemetry, the file IS the history,
+        # and the changelog still records every write. No .history subtree to
+        # delete alongside this addition (verified 2026-09-04: none exists) —
+        # the prior writer was a bare append, so one was never created.
+        #
+        # BOTH names, because the writer targets the legacy file when
+        # PRODUCTIVITY_SNAPSHOTS_SEGMENTED is off and a date segment when it is
+        # on; blacklisting only one leaves the other taking a full-file snapshot
+        # per append. Glob rather than the strict date shape
+        # _productivity_snapshots._SEGMENT_RE owns, for the same reason as the
+        # gate-firings entry below: this module is imported by nearly everything
+        # and must not import that one back.
+        "productivity-snapshots.jsonl",
+        "productivity-snapshots-*.jsonl",
         # The date SEGMENTS are deliberately absent, and that is the non-obvious
         # half. The meta/gate-firings-*.jsonl precedent above pushes the other
         # way, but it does not transfer: gate-firings segments are append-only

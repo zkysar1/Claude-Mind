@@ -108,7 +108,6 @@ def _run_cli(*, title: str, category: str = "", description: str = "",
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("title,expected_agent,min_conf", [
-    ("Investigate: Sound NullInput x6", "zeta", 0.85),
     ("Research: failure modes", "zeta", 0.80),
     ("Audit: completed Investigates", "bravo", 0.75),
     ("Decompose: g-001-99 into primitives", "zeta", 0.80),
@@ -119,7 +118,11 @@ def _run_cli(*, title: str, category: str = "", description: str = "",
     ("Strategic: next sprint priorities", "bravo", 0.85),
     ("Prioritize: aspirations backlog", "bravo", 0.80),
     ("Monitor: infra-health.sh failures", "bravo", 0.60),
-    # Ambiguous cognitive primitives → 'either' with low confidence
+    # Ambiguous cognitive primitives → 'either' with low confidence.
+    # Investigate: joined this group in  (2026-09-04): it names a
+    # WORK-TYPE, not a domain, so it now falls through to the category tier
+    # instead of making one agent the default owner of every filed probe.
+    ("Investigate: Sound NullInput x6", "either", 0.35),
     ("Unblock: EFS reconnect", "either", 0.35),
     ("Idea: try a new approach", "either", 0.35),
     ("Maintain: weekly cleanup", "either", 0.40),
@@ -153,14 +156,19 @@ def test_category_resolves_either_to_specific_agent():
 
 
 def test_category_reinforces_tier_1():
-    """Title says zeta (Investigate), category investigation-methodology
-    also says zeta → confidence bump."""
+    """Title says zeta (Research), category investigation-methodology also
+    says zeta → confidence bump.
+
+    Used 'Investigate:' until g-353-86 (2026-09-04) re-pointed that prefix at
+    'either'; the example moved to 'Research:' so this keeps testing the
+    REINFORCEMENT mechanic rather than silently degrading into a
+    Tier-2-only case."""
     _require_agent("zeta")
-    out = evaluate("Investigate: methodology gaps",
+    out = evaluate("Research: methodology gaps",
                    category="investigation-methodology")
     assert out["intended_agent"] == "zeta"
-    # Tier 1 confidence 0.88, reinforcing bump capped at 0.95
-    assert out["confidence"] >= 0.88
+    # Tier 1 confidence 0.85, reinforcing bump capped at 0.95
+    assert out["confidence"] >= 0.85
 
 
 def test_tier_1_wins_over_tier_2_conflict():
@@ -224,10 +232,13 @@ def test_route_to_override_bypasses_classifier(override):
 
 def test_invalid_route_to_falls_through_to_classifier():
     """route_to='garbage' must NOT be returned — classifier runs normally."""
-    _require_agent("zeta")
-    out = evaluate("Investigate: foo", route_to="garbage")
-    # Classifier sees Investigate: → zeta
-    assert out["intended_agent"] == "zeta"
+    _require_agent("alpha")
+    out = evaluate("Build: foo", route_to="garbage")
+    # Classifier sees Build: → alpha. Deliberately a SPECIFIC agent, not
+    # 'either': after  'Investigate:' returns 'either', which is also
+    # the no-signal default, so asserting it could not distinguish "the
+    # classifier ran" from "the classifier produced nothing".
+    assert out["intended_agent"] == "alpha"
 
 
 # ---------------------------------------------------------------------------

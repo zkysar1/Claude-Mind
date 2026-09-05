@@ -322,16 +322,53 @@ def cmd_update(out):
     old_meta = json.loads(meta_path.read_text(encoding="utf-8"))
     # MODEL PINNING (): an incremental update MUST embed with the
     # model the existing index was built with — mixing two models' vectors
-    # in one matrix silently corrupts every cosine. Config/--model changes
-    # take effect only via an explicit --build (full re-embed).
+    # in one matrix silently corrupts every cosine.
+    #
+    # MODEL DRIFT SELF-HEALS (2026-09-03). Until this date the pin was resolved
+    # the wrong way: on drift this path printed a JSON note to stderr and kept
+    # updating with the INDEX's model, so a per-box index built once with the
+    # wrong model was perpetuated by every later tick, forever, with nothing
+    # acting on the note (this box's log carried two such notes and nobody
+    # read either). The cost was not cosmetic: tree.yaml's cosine floors
+    # (embedding_min_cosine / embedding_tree_min_cosine) are CALIBRATED ON the
+    # configured model, and under a different model's cosine distribution the
+    # tree-lane floor admitted 99-100% of the tree for ANY query — measured
+    # with "how to bake sourdough bread" — so ranking collapsed onto the
+    # query-independent static bonuses and the same three nodes topped every
+    # retrieval on the box. The config is the SSOT; a full rebuild with the
+    # configured model never mixes vectors either, so it is the correct
+    # resolution of the pin. Refuse (index left intact, rc=2) ONLY when the
+    # configured model cannot load on this box — the query side freezes its
+    # embedding lanes on drift meanwhile (retrieve._embedding_model_drift), so
+    # the box serves the honest token baseline rather than a corrupted ranking.
     index_model = (old_meta.get("model") or "").strip() or MODEL_NAME
     configured = resolve_model_name(None)
     if configured != index_model:
         print(json.dumps({"op": "update", "note": "model_drift",
                           "index_model": index_model,
                           "configured_model": configured,
-                          "action": "updating with index_model; run --build "
-                                    "to switch models"}), file=sys.stderr)
+                          "action": "REBUILDING with configured_model (full "
+                                    "re-embed; the pin never mixes models)"}),
+              file=sys.stderr)
+        try:
+            _load_encoder(configured)
+        except Exception as exc:
+            print(json.dumps({"op": "update", "error": "model_drift_unhealable",
+                              "index_model": index_model,
+                              "configured_model": configured,
+                              "detail": (f"{type(exc).__name__}: {exc}")[:200],
+                              "action": "index left UNTOUCHED. Provision the "
+                                        "configured model on this box, or set "
+                                        "tree.yaml retrieval: embedding_model_name "
+                                        "to the index model TOGETHER WITH a "
+                                        "re-measured embedding_min_cosine / "
+                                        "embedding_tree_min_cosine. Until then "
+                                        "retrieval freezes its embedding lanes "
+                                        "to the token baseline (retrieve."
+                                        "_embedding_model_drift)"}),
+                  file=sys.stderr)
+            return 2
+        return cmd_build(out)
     old_emb = np.load(emb_path)
     old_by_id = {d["id"]: (i, d["hash"]) for i, d in enumerate(old_meta.get("docs", []))}
     cur = load_corpus()
@@ -418,7 +455,11 @@ def cmd_stats(out):
             load_probe.update({"model_load_seconds": round(time.time() - _t, 2),
                                "model_load_error": "%s: %s" % (type(exc).__name__,
                                                               str(exc)[:160])})
+    _configured = resolve_model_name(None)
     print(json.dumps({"op": "stats", "exists": True, "model": meta.get("model"),
+                      "configured_model": _configured,
+                      "model_drift": bool(meta.get("model")
+                                          and meta.get("model") != _configured),
                       "dim": meta.get("dim"), "indexed": meta.get("count"),
                       "live_corpus": len(cur), "added": len(added),
                       "removed": len(removed), "changed": len(changed),
@@ -438,16 +479,21 @@ def main():
     ap.add_argument("--model", type=str, default=None,
                     help="Model override for --build (g-306-82; default: "
                          "tree.yaml retrieval: embedding_model_name, then "
-                         f"{MODEL_NAME}). Ignored by --update, which pins "
-                         "the existing index's model.")
+                         f"{MODEL_NAME}). Ignored by --update. NOTE: the "
+                         "config is the SSOT — an index built with an "
+                         "override is REBUILT to the configured model by the "
+                         "next --update (2026-09-03 drift self-heal); for an "
+                         "experiment, build into a separate --out dir.")
     args = ap.parse_args()
     out = Path(args.out)
+    rc = 0
     if args.build:
         cmd_build(out, limit=args.limit, model_override=args.model)
     elif args.update:
-        cmd_update(out)
+        rc = cmd_update(out) or 0
     else:
         cmd_stats(out)
+    sys.exit(int(rc))
 
 
 if __name__ == "__main__":

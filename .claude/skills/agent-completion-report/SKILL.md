@@ -428,10 +428,32 @@ All data comes from framework scripts — no direct JSONL reads.
             outcome_prior = {}  # first report — deltas appear as "initial"
             baseline_age_note = None
         # Compute per-source deltas. Each source contributes exactly these
-        # three keys (consumer contract — do not omit any):
-        #   available: bool     — was the source present in outcome_now?
-        #   moved:     bool     — did any observable field change value vs prior?
+        # four keys (consumer contract — do not omit any):
+        #   available:   bool   — was the source present in outcome_now?
+        #   moved:       bool   — did any observable field change value vs prior?
+        #   substantive: bool   — is that move a real event rather than a
+        #                         COLLECTION ARTIFACT? (guard-2306)
         #   delta_summary: str  — one-line human description for the report
+        # `substantive` exists because "it moved" has two indistinguishable
+        # causes: something genuinely happened, or the measured population
+        # EMPTIED / REFILLED / the collector changed shape — which alters every
+        # field at once. Set substantive = false when the move is an artifact of
+        # collection rather than of the product. The discriminator is the
+        # DENOMINATOR (same one guard-2049 uses for the mirror case):
+        #   - the source's own denominator (runs_total, row count, sample size)
+        #     crossed zero in EITHER direction — 2->0 or 0->6 alike; a window
+        #     that empties and a window that refills are both the collector
+        #     talking, not the product;
+        #   - every observed field changed at once and at least one landed on
+        #     zero / null / empty;
+        #   - the source's shape changed (fields appeared or disappeared).
+        # BOTH DIRECTIONS ARE MEASURED, do not treat this as the empty case
+        # only: ci 2->0 suppressed the warning on 2026-08-01 (g-001-04 run 74,
+        # 23 goals) and ci 0->6 suppressed it again on 2026-08-06 (alpha, cc-04,
+        # 55.8h window).
+        # KEEP delta_summary HONEST EITHER WAY: still say the field changed, and
+        # say why it does not count — a suppressed number that is never printed
+        # is how this defect stayed invisible for three reproductions.
         # Never error if a key is missing from outcome_prior or outcome_now —
         # the source shape is domain-specific and may change.
         # Sources nest under the top-level `sources:` key in outcome-metrics.yaml
@@ -453,9 +475,25 @@ All data comes from framework scripts — no direct JSONL reads.
         any_outcome_moved = any(
             d.get("moved") for d in [git_delta, ci_delta, operator_delta]
         )
+        # Gate on SUBSTANTIVE movement, never on bare `moved` — a collection
+        # artifact reads moved=true and satisfies-away the very warning that
+        # exists to catch "lots of work, nothing happened" (guard-2306).
+        any_substantive_move = any(
+            d.get("substantive") for d in [git_delta, ci_delta, operator_delta]
+        )
+        # AND require at least one source to have been READ. This is the OTHER
+        # direction, and it must be checked in the same edit or the fix simply
+        # swings the bug back: g-115-2394 fixed a variant where every source
+        # read {} on both sides, so nothing could ever move and divergence fired
+        # FALSELY on every >=5-goal window. "Could not measure" is not the same
+        # claim as "nothing happened", and only `available` separates them.
+        any_source_available = any(
+            d.get("available") for d in [git_delta, ci_delta, operator_delta]
+        )
         divergence = (
             goals_completed_count >= 5
-            and not any_outcome_moved
+            and any_source_available
+            and not any_substantive_move
         )
     ELSE:
         outcome_delta_available = false
@@ -681,9 +719,14 @@ Since: {since_timestamp} ({hours}h {min}m ago)
   {IF debt_closure_events > 0:}
   Debt retired: {debt_closure_events} knowledge-debt item(s) closed across
    {len(debt_closure_node_keys)} node(s) — every future retrieval is cleaner for it.
-  {IF outcome_delta_available AND any_outcome_moved:}
-  Outcomes moved: {one-line summary from the moved source delta(s)} — the work
-   reached the product.
+  {IF outcome_delta_available AND any_substantive_move:}
+  Outcomes moved: {one-line summary from the substantive source delta(s)} — the
+   work reached the product.
+  {# `any_substantive_move`, NOT `any_outcome_moved`: this line asserts the work
+     REACHED THE PRODUCT, which a source that merely emptied or refilled does
+     not evidence. Printing it on a collection artifact is the recognition
+     section telling the agent a comforting falsehood in exactly the window
+     where the divergence warning below is the thing it needed to read.#}
   {ELIF outcome_delta_available AND divergence:}
   Outcomes flat this window — and that is stated honestly in Outcome Delta above.
    The counterweight: maintenance that prevents decay is value even when the needle

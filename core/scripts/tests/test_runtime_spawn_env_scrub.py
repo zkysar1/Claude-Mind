@@ -146,13 +146,14 @@ def test_storage_config_scrubbed():
         'export OWNCLOUD_CACHE_TTL="1"\n'
         'export MIND_API_TOKEN="fake-token"\n'
         'export MIND_API_BIND="0.0.0.0"\n'
+        'export MIND_API_PORT="59999"\n'
     )
     keys = _env_keys(captured)
     scrub_set = {
         "STORAGE_BACKEND", "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE",
         "STORAGE_DDB_LOCK_TABLE", "ENVIRONMENT_ID", "MACHINE_ID",
         "MACHINE_MULTI", "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
-        "MIND_API_TOKEN", "MIND_API_BIND",
+        "MIND_API_TOKEN", "MIND_API_BIND", "MIND_API_PORT",
     }
     leaked = keys & scrub_set
     assert not leaked, f"storage config leaked into daemon env: {leaked}"

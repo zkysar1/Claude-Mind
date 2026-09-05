@@ -4,8 +4,9 @@ Referenced from `.claude/skills/worker-loop/SKILL.md` § "The phase split" and
 from `WORKER_PHASES` / `LIFECYCLE_DISPOSITIONS` in `core/scripts/worker_execute.py`.
 Explains why `verify` — a phase that was wholly reducer-only from Phase 2A until
 2026-09-03 — now has a worker-side half called `verify-own-unit`, why that half
-is safe under the convergence invariant that forbids N reducers, and why the row
-is deliberately marked `pending_goal` rather than described as built.
+is safe under the convergence invariant that forbids N reducers, and why the
+judgement and the mechanical status write are one step in two calls rather than
+one call doing both.
 
 ## Why a worker may verify at all, when it may not encode
 
@@ -69,19 +70,65 @@ The disposition's `kind` is `SCOPED_CALL` and its `mode` field is mandatory at
 import; `worker_execute.py` raises on a scoped call that names no mode, which is
 what keeps this from degrading into a transcription by accident.
 
-## Why the row is marked `pending_goal` instead of just written
+## Why the mechanical close is a SECOND call, not folded into the verify skill
 
-The phase and its disposition exist; `worker-loop` does not yet invoke the
-verify skill. A disposition table is read downstream as a statement of fact
-about what the loop does, so an aspirational row written as a fact is worse than
-no row — it reads as evidence the wiring exists and suppresses the goal that
-would build it. `pending_goal="g-306-417"` says so in machine-readable form, the
-CLI renders it as `[PENDING g-306-417]`, and
-`test_verify_own_unit_is_marked_pending_until_the_loop_actually_invokes_it`
-fails the moment the wiring lands — forcing whoever wires it to remove the
-marker and delete that test in the same change. A pending marker nobody is
+Phase 4a is two calls in one step — `/aspirations-verify scope=own-unit` decides,
+then `iteration-close.sh --phase verify` writes — and the separation is load-bearing
+in both directions.
+
+The write half exists because of a measured failure. Until 2026-08-16 the worker
+loop said only "do not run verify" and left the goal at in-progress "for the
+reducer to close at generalize-down" — but no reducer lane ever flipped a worker
+goal's status (`worker_retrospective.py` has no close lane; `body-merge.py` only
+NAMES ids), so every worker completion stayed in-progress forever. Measured that
+day (alpha reducer, cc-04): 360 of 361 open alpha claims were finished work nobody
+closed, held by 7 worker SIDs, 261 by dead Bodies; the parent aspirations never
+completed, no successor goals were generated, and `goal-selector`'s `SKIP_STATUSES`
+hid every one of them from every Body (g-115-6337; guard-4000 class — a KEEP that
+never consults age grows without bound).
+
+`iteration-close.sh do_verify` is the ONLY writer of that status transition and of
+everything hanging off it: it routes recurring goals through
+`aspirations-complete-by.sh`, stamps `completed_date` + `outcome_class`, posts the
+"Completed:" board message the reducer and partners read, and clears `in_flight`
+ONLY when the row names THIS goal (`--if-goal` compare-and-swap, so a live
+reducer's row is never blanked). Its checkpoint write routes to THIS Body's
+`sessions/<sid>/` dir (`body_state_path`), not the agent-wide one. guard-2523
+names it as the sole writer for exactly this reason — a judgement phase that also
+wrote status would be a second writer of a transition that already has one.
+
+So the verify skill judges and writes per-goal verification state; the close writer
+writes the status and its side effects. Neither is the other's step, and inlining
+either into the other would reproduce a defect the fleet has already paid for.
+
+## What `pending_goal` bought while the wiring was missing (history)
+
+From 2026-09-03 until this wiring landed, the disposition row carried
+`pending_goal="g-306-417"` and the CLI rendered it `[PENDING g-306-417]`. A
+disposition table is read downstream as a statement of fact about what the loop
+does, so an aspirational row written as a fact is worse than no row — it reads as
+evidence the wiring exists and suppresses the goal that would build it. A test
+pinned the marker by name and goal id and was written to FAIL when the wiring
+landed, forcing whoever wired it to remove both in the same change. That is what
+happened, which is the outcome the mechanism was for: a pending marker nobody is
 compelled to remove becomes permanent, and then the table lies in the other
-direction.
+direction. The mechanism itself remains available for the next declared-but-unbuilt
+row; only this row's use of it is finished.
+
+Two things the carrier-ref implementation of this same change recorded that the
+main-line one did not, kept here because they generalize (g-306-284 merge of
+`refs/workers/alpha/2fda1f3e`, where both were written independently):
+
+**The split into two increments was not ceremony.** part1b changes the live loop
+under every worker Body in the fleet at once; part1a added an unreferenced table
+row. Those are different risks, and pairing them would have put the second one's
+blast radius on the first one's review.
+
+**The general form: a marker that can only ever be ADDED is a ratchet, not a
+tripwire. Both transitions have to be loud.** That is why the test that fired
+when the wiring landed was REPLACED rather than deleted — its successor asserts
+the row is NOT pending, so a silently re-added marker is as loud as a missing
+one, in the other direction.
 
 ## Why `verify` still reads "reducer-only" beside a worker that verifies
 
@@ -104,7 +151,9 @@ destroying the design, so the negative is pinned beside it.
 - g-115-6337 — the earlier, separate sanction for the worker-side mechanical close
 - `core/scripts/worker_execute.py` — `WORKER_PHASES`, `REDUCER_ONLY_PHASES`,
   `LIFECYCLE_DISPOSITIONS`, `PHASE_LIFECYCLE_STAGE` (the contract SSOT)
-- `.claude/skills/worker-loop/SKILL.md` Phase 4a — the mechanical close this
-  phase will precede
+- `.claude/skills/worker-loop/SKILL.md` Phase 4a — the invocation site: this
+  phase's judgement, then the mechanical close it precedes
+- guard-2523 — `iteration-close.sh --phase verify` is the only writer of the
+  status transition; guard-4000 — a KEEP that never consults age grows unbounded
 - `core/config/rationale/suite-run-voided-by-loop-merge.md` — sibling extraction
   from the same skill

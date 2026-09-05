@@ -63,6 +63,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from goal_close_risk_tier import named_entities  # noqa: E402
+from q4_provenance_sample import (  # noqa: E402
+    direction_fidelity, direction_findings)
 
 #: Verdict values this script can write. The RELEASING subset is the gate's to
 #: define (`close_review_gate.RELEASING_VERDICTS`), imported rather than copied —
@@ -85,9 +87,12 @@ from goal_close_risk_tier import named_entities  # noqa: E402
 #: measured, not assumed.
 VERDICTS = ("APPROVE", "APPROVE_WITH_NOTES", "REJECT")
 
-#: The check id this script mechanises. Named so a reader of a findings list can
+#: The check ids this script mechanises. Named so a reader of a findings list can
 #: tell a machine-verified failure from a reviewer's prose judgement.
 FIDELITY_CHECK = "source-fidelity"
+#: citations-MATCH (), the complement of the id-set diff above: the
+#: artifact asserts A -> B where the cited source asserts B -> A.
+DIRECTION_CHECK = "direction-fidelity"
 
 
 def _gate():
@@ -171,18 +176,33 @@ def fidelity_findings(fid: dict) -> list:
 
 def build_verdict(*, goal_id: str, reviewer: str, fidelity: dict,
                   approve: bool, checks: list, findings: list,
-                  notes: bool = False, reviewed_at: str | None = None) -> dict:
+                  notes: bool = False, reviewed_at: str | None = None,
+                  direction: dict | None = None) -> dict:
     """Resolve the verdict and assemble the artifact.
 
-    The resolution is ONE rule and it is not symmetric: a failed fidelity diff
-    forces REJECT no matter what the caller asserted, while a passed diff grants
-    nothing on its own. See the module docstring. `notes` selects the third
-    state and is subject to the SAME machine veto as `approve` — it is an
-    approval, so the diff may refuse it for the same reason.
+    The resolution is ONE rule and it is not symmetric: a failed MECHANICAL
+    check forces REJECT no matter what the caller asserted, while a passed one
+    grants nothing on its own. See the module docstring. `notes` selects the
+    third state and is subject to the SAME machine veto as `approve` — it is an
+    approval, so a mechanical check may refuse it for the same reason.
+
+    THERE ARE NOW TWO MECHANICAL CHECKS, and they are complements rather than
+    overlaps (g-357-44). `fidelity` is citations-EXIST: the id-set difference of
+    `named_entities`, which is deliberately narrow (id-shaped tokens only) so
+    the tier classifier it shares a regex with does not drag ordinary prose into
+    tier 2. `direction` is citations-MATCH: whether a sampled claim asserts
+    A -> B where its cited source asserts B -> A. MEASURED on the goal's own
+    trade-direction fixture — claim "Miami sent the first-round pick to Denver",
+    source "Denver sent ... to Miami" — `named_entities` returns the EMPTY SET
+    for BOTH sides and `fidelity["passed"]` is True, so citations-exist passes a
+    claim that is exactly backwards. `direction` is what refuses it.
+
+    `direction` is optional and defaults to None so a caller that only has the
+    id-diff keeps its existing behaviour; `main()` always supplies it.
     """
-    generated = fidelity_findings(fidelity)
+    generated = fidelity_findings(fidelity) + direction_findings(direction or {})
     all_findings = generated + [f for f in findings if f]
-    if not fidelity["passed"]:
+    if not fidelity["passed"] or (direction is not None and not direction["passed"]):
         verdict = "REJECT"
     elif notes:
         verdict = "APPROVE_WITH_NOTES"
@@ -202,11 +222,18 @@ def build_verdict(*, goal_id: str, reviewer: str, fidelity: dict,
         "reviewed_at": reviewed_at or datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "checks": list(checks) + [
             f"{FIDELITY_CHECK}: every entity enumerated in the source diffed "
-            f"verbatim against the artifact (mechanical)"],
+            f"verbatim against the artifact (mechanical)"] + ([
+            f"{DIRECTION_CHECK}: every directed relation asserted by the artifact "
+            f"compared against the same relation in the source (mechanical)"]
+            if direction is not None else []),
         "findings": all_findings,
         # guard-3743: the inputs the verdict is reproducible from, not just the
-        # conclusion. A reader can recompute `verdict` from `fidelity` alone.
+        # conclusion. A reader can recompute `verdict` from `fidelity` AND
+        # `direction` together — it was `fidelity` alone until  added the
+        # second mechanical check, and a record carrying only one of the two
+        # would no longer reproduce its own veto.
         "fidelity": fidelity,
+        "direction": direction,
         "produced_by": "close-review-verdict.py",
     }
 
@@ -354,25 +381,36 @@ def main(argv=None) -> int:
     source = _read(args.source_file, args.source_text, "source")
     artifact = _read(args.artifact_file, args.artifact_text, "artifact")
     fid = source_fidelity(source, artifact)
+    # citations-MATCH (). Computed unconditionally beside the id-diff:
+    # the two are complements, and the one that catches a reversed claim is the
+    # one the id-diff is blind to.
+    dir_fid = direction_fidelity(source, artifact)
+    mechanical_ok = fid["passed"] and dir_fid["passed"]
 
     # A verdict is never invented. Refusing here rather than defaulting is what
     # keeps "the reviewer did not say" distinguishable from "the reviewer said no".
     approving = args.approve or args.approve_with_notes
     if not (approving or args.reject):
-        print(json.dumps({"fidelity": fid, "verdict": None}, indent=2, sort_keys=True))
+        print(json.dumps({"fidelity": fid, "direction": dir_fid, "verdict": None},
+                         indent=2, sort_keys=True))
         print("\nclose-review-verdict: no verdict recorded — pass --approve or --reject.\n"
               f"  mechanical {FIDELITY_CHECK}: "
-              f"{'PASS' if fid['passed'] else 'FAIL'}"
-              f"{'' if fid['passed'] else ' (an APPROVE would be refused)'}",
+              f"{'PASS' if fid['passed'] else 'FAIL'}\n"
+              f"  mechanical {DIRECTION_CHECK}: "
+              f"{'PASS' if dir_fid['passed'] else 'FAIL'}"
+              f"{'' if mechanical_ok else ' (an APPROVE would be refused)'}",
               file=sys.stderr)
         return 2
 
-    if approving and not fid["passed"]:
-        for line in fidelity_findings(fid):
+    if approving and not mechanical_ok:
+        for line in fidelity_findings(fid) + direction_findings(dir_fid):
             print(f"  {line}", file=sys.stderr)
         _label = "APPROVE_WITH_NOTES" if args.approve_with_notes else "APPROVE"
+        _failed = ", ".join(
+            name for name, ok in ((FIDELITY_CHECK, fid["passed"]),
+                                  (DIRECTION_CHECK, dir_fid["passed"])) if not ok)
         print(f"close-review-verdict: REFUSING to write {_label} — the mechanical "
-              f"{FIDELITY_CHECK} check failed. The label may not assert more than "
+              f"{_failed} check failed. The label may not assert more than "
               f"the predicate supports (guard-2564). Re-run with --reject, or fix "
               f"the artifact.", file=sys.stderr)
         return 1
@@ -386,7 +424,8 @@ def main(argv=None) -> int:
 
     payload = build_verdict(goal_id=args.goal, reviewer=args.reviewer, fidelity=fid,
                             approve=args.approve, checks=args.check,
-                            findings=args.finding, notes=args.approve_with_notes)
+                            findings=args.finding, notes=args.approve_with_notes,
+                            direction=dir_fid)
 
     # F5 ( re-review): the independence guard is scoped to the RESOLVED
     # verdict, and only to the verdicts that RELEASE a close. It used to run

@@ -4,7 +4,9 @@
 Spec: core/config/conventions/health-ledger.md. Design: workflow
 wf_b82a26e9-958 (2026-06-03).
 
-Reads the agent's LATEST record from world/productivity-snapshots.jsonl — the
+Reads the agent's LATEST record from the productivity-snapshot store
+(world/productivity-snapshots.jsonl plus its date segments, composed by
+_productivity_snapshots.snapshot_paths — g-358-49) — the
 four health signals (composite_productivity, encoding_ratio, deep_ratio,
 tree_writes) are already computed once per iteration by productivity-stop-gate.sh
 and are reused here, NOT recomputed. Adds the cross-session intelligence the
@@ -71,26 +73,42 @@ def _load_config(config_dir):
 
 
 def _latest_productivity_snapshot(world_dir, agent):
-    """The agent's most recent record in world/productivity-snapshots.jsonl,
-    or None if absent. Scans from the end (newest-first) for the first match."""
-    snap_path = Path(world_dir) / "productivity-snapshots.jsonl"
+    """The agent's most recent productivity snapshot, or None if absent.
+
+    Reads through the store's composition seam (_productivity_snapshots.
+    snapshot_paths — g-358-49) rather than the hardcoded legacy filename. Once
+    PRODUCTIVITY_SNAPSHOTS_SEGMENTED is set the writer emits date segments and
+    the legacy file stops growing; a legacy-only read here would silently pin
+    this agent's health composite to its last pre-cutover record forever, which
+    the ledger would then publish as a real (stale) score. Fail-soft to the
+    legacy path if the seam cannot be imported.
+
+    Scans newest-first: segments in reverse chronological order, and within each
+    file from the end, returning the first record for `agent`."""
     try:
-        if not snap_path.exists():
-            return None
-        lines = snap_path.read_text(encoding="utf-8").splitlines()
-    except OSError as e:
-        _eprint(f"productivity-snapshots read failed ({e})")
-        return None
-    for ln in reversed(lines):
-        ln = ln.strip()
-        if not ln:
-            continue
+        from _productivity_snapshots import snapshot_paths  # type: ignore
+        paths = snapshot_paths(world_dir)
+    except Exception as e:  # noqa: BLE001 — fail-soft to the legacy filename
+        _eprint(f"snapshot seam unavailable ({e}) — falling back to legacy path")
+        paths = [Path(world_dir) / "productivity-snapshots.jsonl"]
+    for snap_path in reversed(paths):
         try:
-            rec = json.loads(ln)
-        except json.JSONDecodeError:
+            if not snap_path.exists():
+                continue
+            lines = snap_path.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            _eprint(f"productivity-snapshots read failed ({e})")
             continue
-        if rec.get("agent") == agent:
-            return rec
+        for ln in reversed(lines):
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("agent") == agent:
+                return rec
     return None
 
 

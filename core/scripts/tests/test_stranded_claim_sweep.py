@@ -2757,8 +2757,11 @@ def test_carrier_window_brackets_the_worker_cycle_cadence():
     # the  pop this veto was added () to prevent.
     assert window > _WORKER_CYCLE_GAP_MAX_MIN, (
         f"carrier window {window}m does not cover the measured worker cycle "
-        f"gap ({_WORKER_CYCLE_GAP_MAX_MIN}m). A worker mid-unit writes no "
-        f"carrier, so it would be judged stale while actively working."
+        f"gap ({_WORKER_CYCLE_GAP_MAX_MIN}m). This bound is the FALLBACK "
+        f"guarantee: since g-115-8200 the carrier also refreshes at tool-call "
+        f"cadence, but a Body whose hook tick is failing degrades to the "
+        f"once-per-cycle write, and it would then be judged stale while "
+        f"actively working."
     )
 
     # UPPER bound. At or past the grace the grace is unreachable, so a
@@ -2766,6 +2769,43 @@ def test_carrier_window_brackets_the_worker_cycle_cadence():
     assert window < grace, (
         f"carrier window {window}m must stay below the foreign-sid grace "
         f"{grace}m or the grace becomes unreachable."
+    )
+
+
+def test_carrier_refresh_interval_stays_inside_the_windows_it_protects():
+    """The refresh CADENCE must stay below the windows that consume it.
+
+    g-306-439. Since g-115-8200 the carrier is refreshed at tool-call cadence
+    by bash-agent-inject.py, throttled by SHARED_HEARTBEAT_INTERVAL_S — that
+    throttle is what keeps a long worker unit's carrier fresh, and therefore
+    what keeps the sweep from releasing a live Body mid-unit.
+
+    `_shared_tick` states the requirement in prose ("Must stay FAR below BOTH
+    windows it protects") and TRANSCRIBES the two windows into a comment as
+    literals (3900s / 7200s) while they are defined in other modules. That is
+    the guard-4282 shape the sibling test above was written for, one level up:
+    prose plus a copied constant, with nothing failing when the original moves.
+    Lower the grace or the carrier window far enough and the carrier goes stale
+    BETWEEN refreshes, silently restoring the mid-unit claim pop — with the
+    prose still asserting safety.
+    """
+    import _shared_tick
+
+    mod = _load_sweep_constants()
+    interval_min = _shared_tick.SHARED_HEARTBEAT_INTERVAL_S / 60.0
+    window = mod.DEFAULT_CARRIER_FRESH_MINUTES
+    grace = mod.DEFAULT_FOREIGN_SID_GRACE_MINUTES
+
+    # A tick must be able to fail SEVERAL times over and still be retried
+    # inside the shorter window — hence 2x, not merely "less than".
+    assert interval_min * 2 <= window, (
+        f"carrier refresh interval {interval_min:.1f}m leaves no retry margin "
+        f"inside the carrier window {window}m: one missed tick would age the "
+        f"carrier past fresh and the sweep would release a live worker Body."
+    )
+    assert interval_min * 2 <= grace, (
+        f"carrier refresh interval {interval_min:.1f}m leaves no retry margin "
+        f"inside the foreign-sid grace {grace}m."
     )
 
 

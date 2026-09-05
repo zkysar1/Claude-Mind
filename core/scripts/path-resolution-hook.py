@@ -48,10 +48,12 @@ from hook_helpers import (  # noqa: E402
 # semantically identical first).
 from _path_roots import (  # noqa: E402
     compute_allowed_roots,
+    is_harness_scratchpad,
     is_new_toplevel,
     is_under,
     norm_path,
     read_paths_conf,
+    scratchpad_deny_reason,
 )
 
 
@@ -341,39 +343,16 @@ def main():
     # categorically out of bounds, so this deny must fire even in an unbound
     # session — everything below fails open when no agent resolves, which is
     # exactly the state assistant-mode continuations run in. Needs only the
-    # path itself (no PROJECT_ROOT, no conf). Bash redirects are not gated by
-    # this hook; housekeeping-tick Lane B is the janitor for those.
-    _sp = norm_path(file_path).lower()
-    # The literal prefixes cover the fleet's observed shapes; the
-    # tempfile-derived prefix makes the deny platform-truthful on a box with
-    # a nonstandard TMPDIR (where BOTH literal shapes and the settings deny
-    # rules would miss). Same derivation housekeeping-tick Lane B uses.
-    try:
-        import tempfile
-        _td = norm_path(str(Path(tempfile.gettempdir()) / "claude")).lower()
-    except Exception:
-        _td = ""
-    if (
-        "/appdata/local/temp/claude/" in _sp
-        or _sp.startswith("/tmp/claude/")
-        or _sp.startswith("/tmp/claude-")
-        or _sp.startswith("/var/tmp/claude/")
-        or _sp.startswith("/var/tmp/claude-")
-        or (_td and _sp.startswith(_td + "/"))
-    ):
-        emit_deny(
-            f"Path-resolution hook (L1) blocked {tool_name} to:\n"
-            f"  {file_path}\n"
-            f"This is the Claude Code harness scratchpad — a per-session dir "
-            f"invisible to every other agent and to the framework's citation, "
-            f"drain, receipt, and encoding machinery. This project does not "
-            f"use it (see .claude/rules/no-scratchpad.md), the same way it "
-            f"does not use platform auto-memory.\n"
-            f"Route instead:\n"
-            f"  - session-scoped scratch -> agents/<agent>/sessions/<SID>/scratch/\n"
-            f"  - working files / evidence with a lifecycle -> agents/<agent>/temp/\n"
-            f"  - knowledge worth keeping -> the tree / reasoning bank, not a temp file"
-        )
+    # path itself (no PROJECT_ROOT, no conf).
+    #
+    # The predicate moved to _path_roots.is_harness_scratchpad () so
+    # the Bash surface can apply the IDENTICAL test. It used to live inline
+    # here, and the Bash hook had no scratchpad check at all — so a redirect
+    # (`echo x > /tmp/claude-0/.../f`) was approved while the byte-identical
+    # Write was denied. That is the same tool-surface asymmetry 
+    # consolidated norm_path/is_under to end, one predicate later.
+    if is_harness_scratchpad(file_path):
+        emit_deny(scratchpad_deny_reason(tool_name, file_path))
 
     project_root = os.environ.get("PROJECT_ROOT", "")
     if not project_root:

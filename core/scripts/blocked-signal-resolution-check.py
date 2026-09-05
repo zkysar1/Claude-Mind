@@ -79,12 +79,20 @@ Verdicts (only the first four are reported; still_blocked is the quiet case):
   disagreement  — one signal resolved, another did not. Do NOT unblock: the
                   disagreement IS the signal, and the stale half likely needs
                   reconciling instead.
-  dangling_ref  — a signal references an id that does not exist in any store.
-                  It can NEVER auto-clear, so it will sit blocked forever
-                  unless someone repoints or removes the reference. Emitted for
-                  a `pq-` referent ONLY when `pq_corpus_complete` is true —
-                  otherwise absence is ignorance, not evidence, and the verdict
-                  degrades to `undecidable` (see `_load_pq_index`).
+  dangling_ref  — a signal references an id that does not exist AND whose home
+                  store is THIS world, so "absent here" means absent. It can
+                  NEVER auto-clear, so it will sit blocked forever unless
+                  someone repoints or removes the reference.
+                  SCOPE LIMIT, and it is the whole point of the class: this
+                  verdict is reserved for a referent whose home is LOCAL. A
+                  referent homed ELSEWHERE is never dangling on the strength of
+                  a local miss — a deployment-qualified id routes to
+                  `undecidable` via `_cross_world_ref` (g-115-8913, guard-5545)
+                  — and a `pq-` referent is emitted ONLY when
+                  `pq_corpus_complete` is true, otherwise absence is ignorance,
+                  not evidence, and the verdict degrades to `undecidable` (see
+                  `_load_pq_index`). Both carve-outs are one lesson: a scan
+                  narrower than the referent's real home must not report ABSENT.
   undecidable   — the reference is opaque (board message / external id), or a
                   `pq-` referent could not be resolved against a complete
                   corpus.
@@ -447,6 +455,50 @@ def _norm_blocker_ref(v):
     return ("other", None, v)
 
 
+def _cross_world_ref(rid):
+    """Canonical '<world>:<goal-id>' form when `rid` carries a DEPLOYMENT
+    QUALIFIER naming another Mind deployment; None when it does not.
+
+    Truthiness is the "is this homed elsewhere?" test; the return value is the
+    id in the shape `external_resolver` documents itself as taking.
+
+    WHY THIS EXISTS (g-115-8913). This world is one of several registered
+    deployments (core/config/environments/*.yaml). A record here legitimately
+    cites a goal that lives in a sibling deployment's store, and that id
+    resolves to nothing locally, on every local surface, FOREVER -- which is
+    correct, not a defect (guard-5545). THE REMEDIES ARE OPPOSITE, which is what
+    makes the misclassification expensive: a genuinely dangling id means the
+    work was never filed and someone must file it; a cross-deployment id means
+    the work is filed and tracked elsewhere and NOTHING IS OWED HERE. Advising
+    removal of the second destroys a live dependency -- so this routes such ids
+    away from `dangling` rather than merely softening the wording.
+
+    TWO SPELLINGS, both in use, both must route here:
+      '<world>:<goal-id>'   'zds-mind:g-115-4173'  -- handled since g-115-3659
+      '<goal-id>@<env-id>'  'g-115-4173@zds-mind'  -- the form the board's own
+          `<agent>@<env-id>` addressing convention produces. Unhandled until
+          g-115-8913: it carries no colon, so it fell through to the `g-`
+          branch below and was hard-labelled "dangling".
+
+    STRUCTURAL, NOT REGISTRY-BACKED, DELIBERATELY. _classify_ref and _classify
+    are pure so the whole verdict ladder stays unit-testable with synthetic
+    goals (see _classify's docstring); reading the environments registry here
+    would end that. Over-matching is the SAFE direction -- it downgrades a
+    verdict from "delete this reference" to "this reader cannot see the
+    referent" -- and a goal id never legitimately contains '@'.
+    """
+    s = (rid or "").strip()
+    if not s or s.startswith(_BOARD_PREFIXES):
+        return None
+    if "@" in s:
+        ref, _, world = s.rpartition("@")
+        ref, world = ref.strip(), world.strip()
+        return "%s:%s" % (world, ref) if ref and world else None
+    if ":" in s:
+        return s
+    return None
+
+
 def _classify_ref(ref_id, goal_index, pq_index, pq_complete=True):
     """Resolve ONE reference id to (resolved, why, referent_kind).
 
@@ -520,6 +572,17 @@ def _classify_ref(ref_id, goal_index, pq_index, pq_complete=True):
                 f"pending-question {rid} is {status}", "pending_question")
     if rid.startswith(_BOARD_PREFIXES):
         return (None, f"board reference {rid} — not resolvable here", "board")
+    # Deployment-qualified is tested BEFORE the `pq-`/`g-` spelling branches
+    # below, which would otherwise call it dangling on the strength of a prefix
+    # (). NOT 'opaque': opaque means "a shape this reader does not
+    # understand", and this shape IS understood and merely unreachable from
+    # here -- the same distinction the external_id branch already draws.
+    if _cross_world_ref(rid):
+        return (None,
+                f"{rid} is homed in ANOTHER deployment — unresolvable HERE "
+                f"says nothing about absent THERE; read it via the cross-world "
+                f"transport, never repoint or remove it",
+                "external_unresolvable")
     if rid.startswith("pq-"):
         # FAIL-SAFE (see _load_pq_index): "not in the index" only means DANGLING
         # when the index is provably COMPLETE. With any agent's pq store
@@ -623,7 +686,8 @@ def _resolve_blocker_ref(kind, as_dict, raw, goal_index, pq_index, now,
         # ...), so a bare colon test would misroute them into the cross-world
         # branch and strip them of the board classification _classify_ref gives
         # them. Check the prefixes FIRST.
-        if ":" in ext_s and not ext_s.startswith(_BOARD_PREFIXES):
+        _xw = _cross_world_ref(ext_s)
+        if _xw:
             # Cross-world referent. The other world emits no completion
             # callback, which is the whole reason a defer against it decays
             # silently from accurate to false. Only an injected resolver can
@@ -638,7 +702,11 @@ def _resolve_blocker_ref(kind, as_dict, raw, goal_index, pq_index, now,
                 # The error is recorded in `whys` rather than swallowed, so a
                 # broken resolver is diagnosable instead of merely quiet.
                 try:
-                    status = external_resolver(ext_s)
+                    # `_xw`, not `ext_s`: the resolver documents itself
+                    # as taking '<world>:<goal-id>', so the '@' spelling is
+                    # NORMALISED rather than handed over in a shape its own
+                    # contract does not name ().
+                    status = external_resolver(_xw)
                 except Exception as exc:  # noqa: BLE001 — deliberate catch-all
                     status = None
                     whys.append(f"external_id: cross-world {ext_s} — resolver "
@@ -753,7 +821,13 @@ def _classify(goal, goal_index, pq_index, now, pq_complete=True):
     for b in bb:
         entry = goal_index.get(b)
         bb_status[b] = (entry[1].get("status") or "unknown") if entry else "NOT-FOUND"
-    bb_dangling = any(s == "NOT-FOUND" for s in bb_status.values())
+    # A deployment-qualified blocked_by entry reads NOT-FOUND here for the
+    # same correct reason a qualified blocker_ref does, so it must not raise
+    # `dangling_ref` either (). It still counts as UNRESOLVED --
+    # NOT-FOUND is not in GOAL_TERMINAL_STATUSES -- so such a goal reads
+    # `still_blocked`, which is true: nothing here can see that it cleared.
+    bb_dangling = any(s == "NOT-FOUND" and not _cross_world_ref(b)
+                      for b, s in bb_status.items())
     # VACUOUS TRUTH IS DELIBERATE HERE, AND DANGEROUS ONE STEP LATER. An absent
     # `blocked_by` must read as resolved=True so the `all_resolved` conjunction
     # can fire on `blocker_ref` alone — that is what catches the two genuinely

@@ -39,6 +39,32 @@ done
 [ -n "$AGENT" ] || exit 1
 export MIND_AGENT="$AGENT"
 
+# A WORKER Body is agent-state=IDLE BY DESIGN, so the mismatch this script
+# exists to catch CANNOT occur on one — guard-5821: agent-state is a
+# REDUCER-OWNED, per-agent signal that exactly one Body writes, at /start and
+# /stop; a worker NEVER writes it, so on every box but the reducer's own it
+# reads IDLE while a worker loop runs flat out. The header above is explicit
+# that the incident this script was built for demoted "LIVE reducers
+# RUNNING->IDLE"; a worker never held RUNNING to lose.
+#
+# Without this guard the landing fired at EVERY worker close (measured on cc-08,
+# 2026-09-04, : exit 0 on a healthy worker whose reducer was LIVE on
+# cc-04) and emitted an emphatic "STOP EXECUTING" directive whose step 1 is
+# "invoke /aspirations-consolidate" — a reducer-only phase a worker MUST NOT run
+# over its own unmerged state (the Nth-reducer defect). Firing wrongly here is
+# strictly worse than not firing: it stops a healthy loop AND prescribes a
+# forbidden action.
+#
+# BODY_ROLE is injected by the PreToolUse bash hook (bash-agent-inject.py) and
+# is inherited by child scripts, so it reaches here through both production
+# callers; it is the SAME signal agent-watchdog.py::is_worker_body reads, not a
+# new one. Unset/anything-else is the reducer shape and falls through unchanged,
+# so this can only ever SUPPRESS a landing on a worker — never manufacture one
+# (guard-4220: a landing must be EARNED).
+if [ "$(printf '%s' "${BODY_ROLE:-}" | tr '[:upper:]' '[:lower:]')" = "worker" ]; then
+    exit 1
+fi
+
 state="$(bash "$SCRIPT_DIR/session-state-get.sh" 2>/dev/null | tr -d '\r\n' || echo "")"
 case "$state" in
     RUNNING) exit 1 ;;

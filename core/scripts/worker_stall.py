@@ -332,6 +332,77 @@ def read_terminal_goal_ids(*stores: Path) -> "tuple[set, str]":
     return merged, weakest
 
 
+def _known_goal_ids_from_lines(lines) -> "set":
+    """EVERY goal id in these lines, whatever its status ().
+
+    Sibling of `_terminal_goal_ids_from_lines`, and deliberately status-blind:
+    this answers "does a record for this id EXIST anywhere", never "is it
+    finished". The two must not be merged — a status filter here would make an
+    id's absence ambiguous between "no such goal" and "a goal in a status the
+    filter dropped", and the caller reads absence as grounds to DELETE.
+    """
+    out = set()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            asp = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for g in asp.get("goals") or []:
+            gid = g.get("id")
+            if gid:
+                out.add(str(gid))
+    return out
+
+
+def read_known_goal_ids(*stores: Path) -> "tuple[set, str]":
+    """Ids of goals that EXIST in any of these stores, with WEAKEST provenance.
+
+    THE SAFETY DIRECTION IS THE EXACT INVERSE OF `read_terminal_goal_ids`, and
+    that inversion is the whole reason this is a separate reader rather than a
+    flag on that one. There, adding ids turns a keep into a REAP. Here, adding
+    ids turns a reap into a KEEP: a caller reaps on ABSENCE from this set, so
+    every store added can only ever spare a row. Widening the census is the
+    conservative move, which is why the ARCHIVE belongs in this call and must
+    never be added to the terminal one.
+
+    That inversion is also what makes the archive load-bearing rather than
+    thorough. MEASURED 2026-09-04 (alpha, hostname cc-09, uname -r
+    6.8.0-138-generic, authoritative reads): world queue 2,921 ids + alpha queue
+    32 + archive 2,480 = 5,432 union. Censusing only the two LIVE queues would
+    therefore have reported ~2,480 archived-but-present goals as "resolving
+    nowhere" — mass inference-from-silence in the delete direction, from a
+    predicate that would have looked correct in every test that never opened the
+    archive. guard-3379: an absence claim must name which persistence layers were
+    censused, and one store is never enough.
+
+    WHY THESE THREE LAYERS ARE SUFFICIENT for the reaper's question: it is
+    owning-agent-only and a session of agent X cannot claim into agent Y's queue,
+    so every goal a row of this agent can name lives in the world queue, this
+    agent's own queue, or the archive both drain into. Sufficiency is a property
+    of the CALLER's scope, not of this function — a caller that widens whose rows
+    it judges must widen the stores it passes, or absence stops meaning absence.
+
+    Provenance is the weakest of the halves, same as its siblings: an unreadable
+    layer contributes nothing and the caller — not this function — decides what an
+    unanswered layer means. An unreadable store must never be able to mint a reap.
+    """
+    if not stores:
+        return set(), "none"
+    rank = {"none": 0, "local-mirror": 1, "authoritative": 2}
+    merged = set()
+    weakest = "authoritative"
+    for store in stores:
+        lines, prov = _read_queue_lines(store)
+        if lines is not None:
+            merged |= _known_goal_ids_from_lines(lines)
+        if rank.get(prov, 0) < rank[weakest]:
+            weakest = prov if prov in rank else "none"
+    return merged, weakest
+
+
 def read_claims(world_store: Path) -> "tuple[Dict[str, str], str]":
     """Claim map plus the PROVENANCE of the bytes it was parsed from.
 

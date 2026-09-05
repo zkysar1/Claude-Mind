@@ -237,7 +237,7 @@ _resolve_source() {
     [[ -z "$GOAL_ID" ]] && return 0
     local _given="$SOURCE" _out="" _rc=0 _invalid=""
     case "$_given" in world|agent|"") ;; *) _invalid="1" ;; esac
-    _out="$(python3 "$SCRIPT_DIR/goal-store-resolve.py" --goal "$GOAL_ID" --source "$_given" 2>&1)" || _rc=$?
+    _out="$(python3 "$(_winpath "$SCRIPT_DIR/goal-store-resolve.py")" --goal "$GOAL_ID" --source "$_given" 2>&1)" || _rc=$?
     case "$_rc" in
         0)
             local _store="${_out%%$'\n'*}" _note="${_out#*$'\n'}"
@@ -811,7 +811,7 @@ if [[ -n "$SUMMARY_FILE" ]]; then
     # LOUDLY (guard-2298: a malfunction that renders as a clean result is worse
     # than the fault). `|| true` keeps `set -e` out of the decision.
     _sss_rc=0
-    py -3 "$SCRIPT_DIR/stale-summary-source-gate.py" \
+    py -3 "$(_winpath "$SCRIPT_DIR/stale-summary-source-gate.py")" \
         --path "$SUMMARY_FILE" --goal "${GOAL_ID:-}" --source "${SOURCE:-}" \
         --caller "iteration-close.sh:summary-file-resolve" \
         ${OVERRIDE_STALE_SOURCE:+--override-stale-source "$OVERRIDE_STALE_SOURCE"} \
@@ -847,9 +847,23 @@ TODAY="$(date +%Y-%m-%d)"
 # work outside the orchestrator without a checkpoint to refresh).
 _checkpoint_refresh() {
     local phase_name="$1"
+    # $2 is the goal this refresh belongs to. Forwarded to `update --if-goal` so
+    # a stale checkpoint anchored to a DIFFERENT goal is REFUSED rather than
+    # stamped (g-357-84: the coach 2026-09-02 incident, where no Phase 2.95
+    # anchor existed for the goal being closed and this refresh advanced another
+    # goal's record). An EMPTY value is forwarded deliberately -- the writer
+    # treats it as "no compare", so a caller with no GOAL_ID keeps its exact
+    # previous behavior.
+    local goal_id="${2-}"
+    # Keep this as ONE line-continued invocation and keep --if-goal on it:
+    # test_iteration_close_checkpoint_goal_id.py pins the three call sites BY
+    # SHAPE with a COUNT assertion (guard-2921 -- measured on this same file).
+    # `|| true` stays: the writer's contract is that a nonzero rc means
+    # ITERATION failure, and its refusal path deliberately exits 0.
     bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
         --set "phase_completed=$phase_name" \
-        --set "last_updated=$NOW_ISO" || true
+        --set "last_updated=$NOW_ISO" \
+        --if-goal "$goal_id" || true
 }
 
 # ─── Shared helper: probe whether GOAL_ID is a recurring goal ───────────────
@@ -1021,7 +1035,7 @@ do_verify() {
     # to the write, whose own refusal still stands.
     if [[ "$GOAL_STATUS" == "blocked" ]]; then
         local _be=0
-        python3 "$SCRIPT_DIR/goal-store-resolve.py" --goal "$GOAL_ID" --source "$SOURCE" --blocker-evidence >/dev/null 2>&1 || _be=$?
+        python3 "$(_winpath "$SCRIPT_DIR/goal-store-resolve.py")" --goal "$GOAL_ID" --source "$SOURCE" --blocker-evidence >/dev/null 2>&1 || _be=$?
         if [[ "$_be" -eq 1 ]]; then
             echo "verify: --status blocked needs blocker evidence on $GOAL_ID, and it has none (no blocker_ref, no blocked_by). Nothing was written." >&2
             echo "  A goal is BLOCKED only through a blocker record. Pick the route that matches WHO must act:" >&2
@@ -1123,7 +1137,7 @@ do_verify() {
         _dsg_args=(--goal "$GOAL_ID" --source "$SOURCE")
         [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && _dsg_args+=(--override "$OVERRIDE_DOMAIN_SUITE")
         _dsg_rc=0
-        python3 "$SCRIPT_DIR/domain-suite-gate.py" "${_dsg_args[@]}" \
+        python3 "$(_winpath "$SCRIPT_DIR/domain-suite-gate.py")" "${_dsg_args[@]}" \
             >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _dsg_rc=$?
         if [[ $_dsg_rc -eq 1 ]]; then
             echo "[iteration-close] ✖ REFUSED — DOMAIN SUITE RED (g-353-75): goal $GOAL_ID stays open. Fix the world test suite (see above), then re-run this close." >&2
@@ -1161,7 +1175,7 @@ do_verify() {
         [[ -n "$OVERRIDE_CLOSE_REVIEW" ]] && _crg_args+=(--override-close-review "$OVERRIDE_CLOSE_REVIEW")
         [[ -n "$OVERRIDE_NOTE_MARKER" ]] && _crg_args+=(--override-note-marker "$OVERRIDE_NOTE_MARKER")
         _crg_rc=0
-        python3 "$SCRIPT_DIR/close-review-gate.py" "${_crg_args[@]}" \
+        python3 "$(_winpath "$SCRIPT_DIR/close-review-gate.py")" "${_crg_args[@]}" \
             >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _crg_rc=$?
         if [[ $_crg_rc -eq 1 ]]; then
             echo "[iteration-close] ✖ REFUSED — CLOSE REVIEW (g-357-40): goal $GOAL_ID stays open. See the reason above, then re-run this close." >&2
@@ -1290,7 +1304,7 @@ do_verify() {
                     || echo "[iteration-close] WARN recurring-tally: $_tf stamp failed for $GOAL_ID (non-fatal; close already committed)" >&2
             done < <(GID="$GOAL_ID" SRC_FLAG="$SOURCE" OUTCOME="$OUTCOME" \
                          NOW="$(date +%Y-%m-%dT%H:%M:%S)" \
-                         python3 "$SCRIPT_DIR/recurring_tally.py" || true)
+                         python3 "$(_winpath "$SCRIPT_DIR/recurring_tally.py")" || true)
         fi
     else
         # g-280-09 auto-override: for deep-outcome iterations, iteration-commit.sh
@@ -1428,6 +1442,85 @@ do_verify() {
             || echo "[iteration-close] ⚠ completed_by_role stamp failed for $GOAL_ID (non-fatal; field stays absent = unknown)" >&2
     fi
 
+    # g-306-442: stamp the DELIVERABLE SHA on a worker close. The delivery gate
+    # in _delivery_gate.py holds a dependent whose blocker's commit is reachable
+    # only from refs/workers/** -- but it reads the registered `commit_sha`
+    # field, and nothing wrote it, so the gate was a reader with no writable
+    # field: an inert mechanism (guard-3625, and this module's own
+    # `calibration_exempt` precedent -- ship the field with its writer).
+    #
+    # WHY GATED ON BODY_ROLE, sharing the stamp above's exact condition rather
+    # than stamping every close. STRANDING IS A WORKER PHENOMENON: a reducer
+    # commits and pushes origin/main directly, so its deliverable is never on a
+    # carrier ref, and its close-time commit lands LATER (do_state_update) than
+    # this phase anyway -- stamping it here would record a sha one commit stale
+    # and could hold reducer work on a pure artifact of ordering. A worker has
+    # already pushed its carrier ref by Phase 3.8, so HEAD here IS the content
+    # the carrier carries. Narrower is the safe direction: an absent sha
+    # fails OPEN (releases), so the population this misses behaves exactly as it
+    # did before the gate existed.
+    #
+    # PROJECT_ROOT only. commit-reachability.py probes one repo, refs/workers/**
+    # is a Mind-repo mechanism, and a product-repo sha probed against this repo
+    # would resolve to a bogus verdict rather than no verdict.
+    #
+    # Non-fatal like every stamp above: status is already committed.
+    if [[ -n "${BODY_ROLE:-}" && "$GOAL_STATUS" == "completed" ]]; then
+        local _deliverable_sha
+        _deliverable_sha="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)"
+        if [[ -n "$_deliverable_sha" ]]; then
+            bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" commit_sha "$_deliverable_sha" \
+                || echo "[iteration-close] ⚠ commit_sha stamp failed for $GOAL_ID (non-fatal; delivery gate fails open without it)" >&2
+        fi
+    fi
+
+    # g-306-417: stamp the STRUCTURED own-unit verification verdict. Sits beside
+    # completed_by_role because it shares that stamp's shape exactly (post-status,
+    # completed-only, non-fatal) and answers the question that stamp raised: not
+    # just WHICH ROLE closed the goal, but WHAT IT JUDGED.
+    #
+    # WHY IT EXISTS: worker-closure-audit.py's stated job is to record "agreement
+    # or disagreement" on worker self-grading -- and agreement needs TWO verdicts.
+    # It computes its own; the worker's existed only in the transcript, in
+    # outcome_note prose, and in the body-keyed iteration-checkpoint that the NEXT
+    # claim overwrites. MEASURED 2026-09-04 (alpha worker Body, cc-13): the full
+    # Q1/Q1.5/Q2/Q3/Q4 verdict for g-115-8708 was gone ~5 minutes after it was
+    # produced, reset by the next claim's anchor -- so the audit's comparison side
+    # was structurally empty, not merely unpopulated.
+    #
+    # NO NEW PRODUCER. /aspirations-verify already writes each Q outcome to
+    # phase_progress via loop-state-save.sh; this harvests what it computed rather
+    # than asking the caller to re-declare it, so the field cannot disagree with
+    # what verify actually did. Read through the canonical `read` subcommand --
+    # never a hand-built path -- because _checkpoint_path() is BODY-KEYED
+    # (g-306-136) and a worker's checkpoint is not the agent-wide one.
+    #
+    # THE goal_id MATCH IS LOAD-BEARING, not defensive: the checkpoint is a
+    # single slot reused across goals, so without it a close would stamp the
+    # PREVIOUS goal's verdict onto this record -- a wrong value, which is worse
+    # than the absent one (the completed_by_role rule). Absent means no structured
+    # verify ran; it must never be read as a pass.
+    if [[ "$GOAL_STATUS" == "completed" ]]; then
+        _VV=$(bash "$CORE_ROOT/scripts/loop-state-save.sh" read 2>/dev/null \
+            | ICG="$GOAL_ID" python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict) or d.get("goal_id") != os.environ.get("ICG"):
+    sys.exit(0)
+pp = d.get("phase_progress")
+if isinstance(pp, dict) and pp:
+    print(json.dumps(pp, separators=(",", ":"), ensure_ascii=False))
+' 2>/dev/null || true)
+        if [[ -n "$_VV" ]]; then
+            bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" verify_verdict "$_VV" \
+                || echo "[iteration-close] ⚠ verify_verdict stamp failed for $GOAL_ID (non-fatal; field stays absent = no structured verdict)" >&2
+        fi
+        unset _VV
+    fi
+
     # g-115-5157: land the verify narrative on the GOAL RECORD. Until now
     # --summary reached the execution diary (per-agent, per-box) and a board
     # post (chronological, ages out of every --since window) but never the
@@ -1514,7 +1607,7 @@ print(json.dumps({
         # local file scan and posts exactly what it posted before. Fail-open:
         # a provenance lookup must never fail a close.
         local xw_json="" xw_addr="" xw_agent="" xw_env=""
-        xw_json="$(python3 "$SCRIPT_DIR/xw_origin.py" --goal "$GOAL_ID" --source "$SOURCE" 2>/dev/null || true)"
+        xw_json="$(python3 "$(_winpath "$SCRIPT_DIR/xw_origin.py")" --goal "$GOAL_ID" --source "$SOURCE" 2>/dev/null || true)"
         if [[ -n "$xw_json" ]]; then
             read -r xw_addr xw_agent xw_env < <(XWJ="$xw_json" python3 -c '
 import json, os
@@ -1821,7 +1914,7 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
     fi
     # ── End Phase-6 spark imperative ──────────────────────────────────────────
 
-    _checkpoint_refresh verify
+    _checkpoint_refresh verify "$GOAL_ID"
     # LLM residue at this phase: Q1/Q2/Q3 escalation, output summary generation.
     # See core/config/iteration-close-digest.md § VERIFY.
 }
@@ -1907,7 +2000,7 @@ do_state_update() {
         # "write|skip-write[<TAB>gap_seconds]". bash->bash->python is fine here
         # (the rb-225/rb-247 hang is python SPAWNING bash, not this direction).
         _sp_gate="$(bash "$SCRIPT_DIR/wm-read.sh" spark_fired_session --json 2>/dev/null \
-                    | python3 "$SCRIPT_DIR/spark-fire-dedup.py" fired "$GOAL_ID" --set-at "$_sp_setat" 2>/dev/null || true)"
+                    | python3 "$(_winpath "$SCRIPT_DIR/spark-fire-dedup.py")" fired "$GOAL_ID" --set-at "$_sp_setat" 2>/dev/null || true)"
         [[ -z "$_sp_gate" ]] && _sp_gate="write"   # fail-open
         _sp_verdict="${_sp_gate%%$'\t'*}"
         _sp_gap=""
@@ -2602,7 +2695,7 @@ print(sha)
     bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
         --set "outcome_class=$OUTCOME" || true
 
-    _checkpoint_refresh state_update
+    _checkpoint_refresh state_update "$GOAL_ID"
 
     # Step 8.78 Post-State-Update Gate (g-248-17, rb-428 pattern).
     # Script-without-caller drift fix: the gate itself (post-state-update-gate.sh)
@@ -2663,7 +2756,7 @@ print(sha)
             # sentinel worse than it was.
             local _fe_existing _fe_merged
             _fe_existing=$(bash "$SCRIPT_DIR/wm-read.sh" fresh_eyes_dispatch_pending --json 2>/dev/null || echo null)
-            _fe_merged=$(printf '%s' "$gate_json_stamped" | FRESH_EYES_EXISTING="$_fe_existing" python3 "$SCRIPT_DIR/fresh-eyes-sentinel-merge.py" 2>/dev/null) || _fe_merged=""
+            _fe_merged=$(printf '%s' "$gate_json_stamped" | FRESH_EYES_EXISTING="$_fe_existing" python3 "$(_winpath "$SCRIPT_DIR/fresh-eyes-sentinel-merge.py")" 2>/dev/null) || _fe_merged=""
             [ -n "$_fe_merged" ] || _fe_merged="$gate_json_stamped"
             echo "$_fe_merged" | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_dispatch_pending >/dev/null 2>&1 || true
             # DISPATCH line — LLM reads this in-turn and invokes /fresh-eyes-code.
@@ -2713,7 +2806,7 @@ print(sha)
     # affect goal closure.
     if [[ -n "${GOAL_ID:-}" ]]; then
         local _landed_json _stranded_n _benign_n _held_n _held_detail _unclassified
-        _landed_json=$(python3 "$SCRIPT_DIR/completed-not-committed-sweep.py" \
+        _landed_json=$(python3 "$(_winpath "$SCRIPT_DIR/completed-not-committed-sweep.py")" \
             --goal "$GOAL_ID" --min-age-minutes 0 --no-fetch --output json \
             2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || echo '{}')
         # BOTH lists, not just `stranded` (fresh-eyes, same day as the original
@@ -2938,7 +3031,7 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
     if [[ -z "$FINDINGS_COUNT" ]] && [[ -f "$AGENT_DIR/session/iteration-checkpoint.json" ]]; then
         FC_ANCHOR=$(python3 -c "import json,sys; d=json.load(open(r'$AGENT_DIR/session/iteration-checkpoint.json',encoding='utf-8')); print(d.get('selected_at',''))" 2>/dev/null || true)
         if [[ -n "$FC_ANCHOR" ]]; then
-            FC_DERIVED=$(python3 "$SCRIPT_DIR/execution-diary.py" read --goal "$GOAL_ID" --since "$FC_ANCHOR" --json 2>/dev/null \
+            FC_DERIVED=$(python3 "$(_winpath "$SCRIPT_DIR/execution-diary.py")" read --goal "$GOAL_ID" --since "$FC_ANCHOR" --json 2>/dev/null \
                 | python3 -c "import json,sys; print(sum(1 for e in (json.load(sys.stdin) or []) if e.get('entry_type')=='finding'))" 2>/dev/null || true)
             if [[ "$FC_DERIVED" =~ ^[0-9]+$ ]] && [[ "$FC_DERIVED" -gt 0 ]]; then
                 FINDINGS_COUNT="$FC_DERIVED"
@@ -3547,7 +3640,7 @@ os.replace(tmp, str(p))
         # invocation; guard-920: the tested shape must BE the production shape —
         # the unit tests all passed --query-json while this call site did not).
         bash "$SCRIPT_DIR/aspirations-query.sh" --goal-field id "$GOAL_ID" --full \
-            | python3 "$SCRIPT_DIR/mandated-retrieval-check.py" \
+            | python3 "$(_winpath "$SCRIPT_DIR/mandated-retrieval-check.py")" \
                   --goal-id "$GOAL_ID" --session-file "$ret_file" --query-json || true
     else
         perf="true"   # g-115-2201: retrieval fired for this goal
@@ -3764,7 +3857,7 @@ except Exception:
             || echo "[iteration-close] WARN: tree-accuracy-sync failed — non-fatal" >&2
     fi
 
-    _checkpoint_refresh learning_gate
+    _checkpoint_refresh learning_gate "$GOAL_ID"
     # LLM residue at this phase:
     #   - Meta-learning signal ("did learning suggest a better procedure?")
     #   - Forced encoding if no tree update for deep outcome (curator residue)

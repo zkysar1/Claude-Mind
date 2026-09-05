@@ -334,6 +334,14 @@ def main():
                   "has already reverted the store. Three agents have been caught here "
                   "(guard-5651, guard-4165).")
             print("READ-ONLY inspection: py -3 core/scripts/history.py diff <file> <version>. "
+                  "FIELD-GRANULAR — takes THIS TABLE'S OWN COLUMNS and is what you actually "
+                  "want here: bash core/scripts/history-field.sh <file> <snapshot> "
+                  "--goal <goal> --field <field>. Read-only by construction (it never "
+                  "reaches a restore path) and it resolves goals NESTED inside an "
+                  "aspiration line, which a top-level-only scan reports as a clean "
+                  "not-found. `history.py diff` is whole-file: on aspirations.jsonl that "
+                  "is one megabytes-long line per aspiration, unreadable per row — which "
+                  "is why this recovery kept reading as non-executable (g-115-8462). "
                   "APPEND-SAFE narrative writes: core/scripts/goal-field-append.sh — it avoids "
                   "the read-and-concatenate clobber class entirely (g-115-8404).")
     return 1 if clob else 0

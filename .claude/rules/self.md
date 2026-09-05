@@ -81,11 +81,11 @@ ids, guard ids, shas, timestamps, tables) tokenizes far denser than prose.
 A self.md's own ratio IS measured: **2.610 B/tok** (foxtrot, 2026-08-22,
 62,336 B) — id-dense, NOT prose-dominant, so the ~28%-of-cap line above
 understates ~1.5x (28k B is 43% of cap, not 28%). Treat
-4 B/tok as an unverified upper-bound estimate for prose and **2.5 B/tok as
-the measured floor for anything id-dense**; when it matters, get the real
-number from a truncation notice (it prints the token count) rather than
-converting. (hyp `2026-08-04_program-alignment-node-crosses-read-cap`,
-CONFIRMED; the density finding was not predicted by the claim.)
+4 B/tok is an unverified upper bound for prose. **The "2.5 B/tok floor for
+id-dense" is FALSIFIED**: 2.228 (80,920 B → 36,317 tok, foxtrot N=102,
+2026-09-04); 2.48 above was already under it. No floor exists — never
+convert; read the count off a truncation notice (guard-4689). (hyp
+`2026-08-04_program-alignment-node-crosses-read-cap`, CONFIRMED.)
 
 **Do NOT trim a self.md on byte count alone.** The unitless "~25k" above misled
 two agents on the SAME DAY (2026-07-31) into reading it as BYTES and concluding

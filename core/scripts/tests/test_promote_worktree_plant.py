@@ -191,7 +191,41 @@ def test_plant_dir_is_target_itself_when_pr_is_not_requested(target):
     proc = run_block(extract_step4(), target, do_pr=0)
     assert proc.returncode == 0, proc.stderr
     assert parsed(proc)["PLANT_DIR"] == str(target)
-    assert not (Path(git("rev-parse", "--git-common-dir", cwd=target)) / "worktrees").exists()
+    # --path-format=absolute is load-bearing, not decoration. `rev-parse
+    # --git-common-dir` answers RELATIVE to the git invocation's cwd (".git"),
+    # and Path(".git")/"worktrees" then resolves against the PYTEST process's
+    # cwd -- the live repo -- not against `target`. So this assertion used to
+    # read /opt/<repo>/.git/worktrees and went red whenever the developer had
+    # any worktree checked out, indistinguishably from a real regression
+    # (guard-5842, which described the collision as a procedure problem; the
+    # defect is here). Same idiom as worktree-teardown.sh:120.
+    common = Path(git("rev-parse", "--path-format=absolute",
+                      "--git-common-dir", cwd=target))
+    assert common.is_absolute(), f"git-common-dir not absolute: {common}"
+    assert not (common / "worktrees").exists()
+
+
+def test_git_common_dir_assertion_is_scoped_to_the_fixture_not_the_live_repo(target):
+    """Regression pin () for the assertion directly above.
+
+    `rev-parse --git-common-dir` answers RELATIVE to the git invocation's cwd,
+    so `Path(".git") / "worktrees"` resolves against the PYTEST PROCESS cwd --
+    the live repo -- not against `target`. The sibling test therefore went red
+    for anyone holding a worktree in the live checkout, indistinguishably from
+    a real regression. guard-5842 recorded that collision as a problem with the
+    developer's procedure; it is this line. Pin both halves so the naive form
+    cannot silently return.
+    """
+    assert Path.cwd() != target, "premise gone: pytest is running inside the fixture"
+    naive = Path(git("rev-parse", "--git-common-dir", cwd=target))
+    absolute = Path(git("rev-parse", "--path-format=absolute",
+                        "--git-common-dir", cwd=target))
+    assert not naive.is_absolute(), (
+        "git now answers absolutely by default -- re-derive this pin, do not delete it")
+    assert absolute.is_absolute()
+    assert absolute.parent == target, absolute
+    # The naive form escapes the fixture; the absolute form cannot.
+    assert naive.resolve() != absolute.resolve()
 
 
 def test_commit_in_worktree_is_reachable_from_target_after_teardown(target):
