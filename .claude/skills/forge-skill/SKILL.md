@@ -1,12 +1,12 @@
 ---
 name: forge-skill
-description: "Forges a new SKILL.md from a recurring capability gap recorded in meta/skill-gaps.yaml, registers it in world/forged-skills.yaml, creates companion scripts for restricted operations, announces on the message board, and adds a validation goal. Use whenever a gap reaches the forge threshold (times_encountered >= 2, estimated_value >= medium, no duplicate skill exists) and the curriculum permits forging, or the user runs /forge-skill list / skill {gap-id} / check / dismiss {gap-id}. Wraps Anthropic's generic skill-authoring pattern (see anthropics/skills/skill-creator) with this agent's gap-detection, registry, and validation loop."
+description: "Forges a new SKILL.md from a recurring capability gap recorded in meta/skill-gaps.yaml, registers it in world/forged-skills.yaml, creates companion scripts for restricted operations, announces on the message board, and adds a validation goal. Use whenever a gap reaches the forge threshold (times_encountered >= 2, estimated_value >= medium, no duplicate skill exists) and the curriculum permits forging, or the user runs /forge-skill list / skill {gap-id} / request {name}: {purpose} / check / dismiss {gap-id}. A user asking in chat or by directive for a new skill IS a request: run the request sub-command, never make them wait for a recurring gap. Wraps Anthropic's generic skill-authoring pattern (see anthropics/skills/skill-creator) with this agent's gap-detection, registry, and validation loop."
 user-invocable: true
 triggers:
   - "/forge-skill"
 parameters:
   - name: sub-command
-    description: "skill <gap-id> | check | list | dismiss <gap-id>"
+    description: "skill <gap-id> | request <name>: <purpose> | check | list | dismiss <gap-id>"
     required: true
 execution_history:
   total_invocations: 0
@@ -78,9 +78,41 @@ then come back here for the integration requirements.
 4. Display list of previously forged skills with creation dates
 5. Show forge eligibility summary (how many gaps meet threshold)
 
+### `/forge-skill request <name>: <purpose>` — Forge a skill the USER asked for
+
+A user asking for a skill — in chat, in a directive, or in a goal they filed — IS the
+justification the recurring-gap gates below exist to approximate. Do NOT make the user
+wait for `times_encountered` to climb, and NEVER bump an existing gap's counter to clear
+the threshold: a gap's identity is its procedure (guard-3177) and a forced count is a
+false record. Measured 2026-09-05 (field transcript, a small model on Zak-Code): asked for
+a `google-drive-list` skill, the agent incremented an unrelated gap's count to pass the
+threshold, was then blocked by the capability gate, and delivered no skill.
+
+1. Bash: `meta-read.sh skill-gaps.yaml` → next id `gap-{max+1}` and `<len>` = current
+   number of gaps. Bash: `load-conventions.sh aspirations` if not loaded.
+2. Register the gap with the request as its evidence — ONE whole-element append (the
+   aspirations-spark shape; never a per-field dotpath on a NEW gap):
+   ```
+   Bash: meta-set.sh skill-gaps.yaml "gaps[<len>]" '{"id":"gap-NNN","status":"registered","type":"utility","procedure_name":"<name>","description":"<purpose>","estimated_value":"high","times_encountered":<forge_threshold>,"requested_by":"user","encounter_log":[{"date":"<YYYY-MM-DD>","context":"user request: <the user's words, verbatim>"}]}'
+   ```
+   `times_encountered` is set to `forge_threshold` because the request satisfies the
+   threshold by definition; `requested_by: user` records WHY, so no auditor reads it as an
+   organic count. Gate the verdict on rc and read it back (the aspirations-spark
+   write-integrity block applies verbatim).
+3. Continue at `/forge-skill skill gap-NNN` below. For a `requested_by: user` gap the two
+   AUTONOMOUS-readiness gates are WAIVED and the waiver is written into the Step 9 report:
+   the curriculum contract (`allow_forge_skill`) and the category capability-level gate
+   both measure whether the agent may forge ON ITS OWN, and a user request answers that.
+   Every other step applies unchanged — overlap check, description check, Step 3.5 quality
+   gate, Step 3.6 dogfood, registration, board, test goal. The user asked for a skill, not
+   for a bad one.
+
 ### `/forge-skill skill <gap-id>` — Create a new skill from a gap
 
 **Forge Criteria** (ALL must be met):
+- **User-requested gap** (`requested_by: user`, filed by `/forge-skill request`): the
+  curriculum contract and the developmental gate in this list are WAIVED — log
+  `gate waived: user request` and continue; every other criterion still applies.
 - Curriculum contract: `Bash: curriculum-contract-check.sh --action allow_forge_skill`
   IF exit code 1: ABORT — "Forge blocked by curriculum (stage: {stage_name}). Forging unlocks at: {unlocks_at}."
 - `times_encountered >= config.forge_threshold` (currently 2)
@@ -270,9 +302,11 @@ then come back here for the integration requirements.
    the weighted mean — ties are rejected.
 
    ```
-   Bash: py -3 core/scripts/skill_edit_gate.py gate \
+   Bash: bash core/scripts/skill-edit-gate.sh gate \
        --new-judgments '{"safety":"<good|average|poor>","completeness":"<good|average|poor>","executability":"<good|average|poor>","maintainability":"<good|average|poor>","cost_awareness":"<good|average|poor>"}' \
        --skill-name "{new-skill-name}" --caller "forge-skill:Step3.5"
+   # skill-edit-gate.sh wraps core/scripts/skill_edit_gate.py and resolves python3 via
+   # _paths.sh; the former `py -3` spelling needs a box-level `py` shim (python-invocation.md).
    # Each value is the FULL WORD good, average or poor -- the gate refuses
    # abbreviations (a Body copied "g" from an earlier <g|a|p> placeholder here
    # and read the refusal as a BLOCK; 2026-08-30).
@@ -449,16 +483,17 @@ then come back here for the integration requirements.
    skill forging on notification failure.)
    - IF notification fails: continue (best-effort)
 
-8. **Create Test Goal** — Add a goal to the relevant aspiration:
-   - Find relevant aspiration: Bash: `load-aspirations-compact.sh` → IF path returned: Read it
-     (compact data has IDs, titles, categories — no descriptions/verification)
-   - Read the target aspiration: Bash: `aspirations-read.sh --id <asp-id>`
-   - Add goal with subject: "Validate forged skill: {skill-name}"
-   - Type: calibration
-   - desiredEndState: "Skill invoked 3 times successfully by parent"
-   - Priority: MEDIUM
-   - origin_signal: `"idea:forge-skill-{skill-name}"` (the forge event is the spawn cause)
-   - Pipe updated aspiration JSON: `echo '<aspiration-json>' | bash core/scripts/aspirations-update.sh <asp-id>`
+8. **Create Test Goal** — ONE call, the goal JSON on stdin. Never rewrite the whole
+   aspiration to add one goal (the former `aspirations-update.sh` shape asked a small model
+   to round-trip an entire aspiration record; `aspirations-add-goal.sh` is the Return
+   Protocol's named terminal action for this skill).
+   - Find the relevant aspiration: Bash: `load-aspirations-compact.sh` → IF path returned:
+     Read it (IDs, titles, categories) and pick the aspiration whose category the skill serves.
+   - Bash:
+     ```
+     echo '{"title":"Validate forged skill: {skill-name}","priority":"MEDIUM","participants":["agent"],"category":"{category}","description":"Invoke {skill-name} 3 times via its parent skill; each run succeeds and the skill fires from its description alone.","origin_signal":"idea:forge-skill-{skill-name}"}' \
+       | bash core/scripts/aspirations-add-goal.sh <asp-id>
+     ```
    - (User notification already sent in Step 7 — do not send a second notification here.)
 
 9. **Report** — Summarize what was created, where it lives, and what triggers it.

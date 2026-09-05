@@ -10600,3 +10600,71 @@ axis1b exists to see. S3c: high_pct 46.2% (12/26), completed_unarchived 0 → no
 — the entry is a genuine high-retrieval/low-credit candidate, but the category was nearly empty of
 mature entries, so treat the ranking as uncontested rather than won. Stored as the one
 genuinely-unowned LOW signal.
+
+---
+
+### 2026-09-05T09:3x — zeta, `hostname` cc-02, `uname -r` 6.8.0-138-generic, own-cloud (time_cadence)
+
+Corpus: FULL (`aspirations-compact.json`, mtime 09:29:57, `goals_omitted` sum 0). The bounded
+summary was refused at the door — its stderr read **2279 of 2396 omitted (95.1%)**, the highest
+omission this ledger records, so an S3 scored on it would have been ~95% blind.
+
+**S1** sensors(ach>=2) **96** of 104 recurring — gate LIVE. Cross-agent census, top-10 by
+`lastAchievedAt`, via the sanctioned `grep -c` presence check across 7 stores:
+**6/10 DROPPED (mine<2) = 60%**, consistent with g-115-3215's filed ~64%. Sharpest specimen:
+**`g-306-284` — fleet 80, ALL on alpha, ZERO here**, so S1 emits no signal for it at any
+threshold. New sub-finding attached to that goal: the drop line is not the whole exposure —
+`g-115-22` reads mine=3 (above the line, detectors RUN) against fleet=48 with echo holding 24,
+so the 2..k band is where a wrong trend gets REPORTED rather than suppressed.
+
+**S2a** stale EXPLORE (>30d, threshold read from config) **34** of 54 EXPLORE / 1574 total;
+opened **34/34** (guard-1102 control passed). **STRUCTURAL 5/34** —
+`env-agnostic-exploration-primitives`, `infrastructure-performance`, `solver-v0-audits`,
+`v2-directed-steering-ship-log`, `v2-directed-steering-wiring`. **The 08-20 prior's 2 members are
+BOTH still present**, so the prior is CONFIRMED and the 2 -> 5 rise is a changed NUMERATOR
+(signal), not a calendar. The same-age same-trigger CLUSTER this block asks for IS present: the
+two `v2-directed-steering-*` members are one `node_split` pair, reproducing node_split's measured
+blast radius (2 fleet-wide, both inside the screen). raw 34 / re-verify 6 / **suspect 28**.
+Ages: {31:1,32:2,37:1,41:1,46:1,48:1,49:1,50:2,52:1,55:8,56:8,63:1,67:1,69:1,96:1,107:1,108:1,118:1}.
+Fresh count attached to g-115-5462, whose filed scope ("8 stale, 2 structurally understated") is
+**4.25x stale** — executing at filed scope closes green with the population still red.
+
+**S2b** 50/54 = **92.6%** (echo measured 92.2% on 08-17) — predicate still non-discriminating;
+the `depth >= 2` clause admits **54/54**, i.e. still inert, still carrying the whole screen on
+`children`. Owned by g-115-4840; routed nothing.
+
+**S3** n=**2378**, 25 active aspirations, 246 distinct categories.
+axis1 `framework-architecture` 802/2378 = **33.7%** PASSES · axis1b `framework-*` 1480/2378 =
+**62.2%** across **38** labels PASSES · axis2 `asp-115` 1950/2378 = **82.0%** FIRES.
+Confirms the immediately-preceding row's fragmentation reading (33.2% / 38 labels / 61.6%) on the
+same box: the axis1 fall is labels multiplying, not the lane shrinking. asp-115 ABSOLUTE **1950**,
+up from 1642 (08-16) and 1376 (08-09) — share AND absolute both rising, so this is not dilution in
+either direction. Standing property; treated as CONFIRMATION, routed nothing. S3c high_pct 48.0%
+(12/25) — under 0.70, no `portfolio_health_signal` written.
+
+**S4a** 60/72 = **83%** — disjoint-vocabulary confound, observation only.
+**S4b** category `framework-verification`: scanned **16 / mature 0 / 0 qualified** — a real
+negative (too young to score), not a broken detector.
+**S4.5** 0 NEW / 0 filed / 0 dedup / 0 rb-245, and the positive control passes: `detectors_run` 4,
+`scanned` = 2378 open goals, 535 completed-in-window, **3465 source files**, 1 telemetry spec,
+0 zero-input specs. A genuine clean result, not a dark run.
+
+**S4.6 — `ceiling_ratio` 0.0972 (2886 of 29687): A NEW HIGH, ABOVE the recorded ~0.0026-0.087
+band, and it does NOT rescue the verdict.** 0 candidates at `--min-failures 2` AND at `1` (the
+undecidable case), distinct failing-goal members **0**, while `--failing-invocations` reports
+`failing_count: 10` at the ledger level. Read that 10-vs-0 gap as coverage, never as suppression
+working. Two things this row adds:
+- **The "one resident live + narrow seed" shape is broken.** `alpha` holds a **34-day** span
+  (`08-01T23:29 .. 09-05T00:41`, 24 windows) with `in_span` **2747/5814 = 47.2%** — two orders of
+  magnitude above every per-agent figure previously recorded here (0.3-1.1%). bravo/echo/foxtrot
+  remain on the SAME `08-02` ~8h seed (0.8/0.7/0.5%); zeta resident-live at 0.3%. So one peer's
+  wide slice, not the resident's, is what moved the ratio — a shape no prior row predicts.
+- **"Trends DOWN as invocations accumulate" is falsified again, harder.** `invocations` rose
+  24237 -> **29687** while the ratio rose 0.0084 -> **0.0972**. Span width dominates; the
+  denominator is the slow term. Confirms the 08-18 falsification rather than adding a new one.
+Still ~90% unclassifiable, so this remains a COVERAGE measurement and not a skill-quality one.
+Run was read-only; routed nothing.
+
+**Signals routed to S5: ZERO.** Every fire resolved to a known-owned confound (S2a/S2b/S4a),
+a standing portfolio property (S3 axis2), or a coverage measurement (S4.6). Two fresh counts
+attached to existing owners (g-115-5462, g-115-3215); no new goals filed.

@@ -546,8 +546,12 @@ def main():
                         f"core/scripts/cross-world-inject-goal.sh --target {fw_origin} "
                         f"--title \"Idea: ...\" --description \"...\" --reason \"...\" "
                         f"--shared  (lands in the origin's queue; a person reviews it there)\n"
-                        f"  - domain code, conventions, forged skills -> the world "
+                        f"  - domain code, conventions -> the world "
                         f"({fw_world}/scripts, {fw_world}/conventions), which IS writable here\n"
+                        f"  - a FORGED SKILL body has no writable home on this deployment yet: "
+                        f"no runtime loads a SKILL.md from the world path, and .claude/skills/ "
+                        f"is framework-owned here (g-115-9043). Do not write it anywhere else; "
+                        f"register the need upstream with cross-world-inject-goal.sh as above\n"
                         f"  - a change already made with a shell command -> revert it: "
                         f"git checkout HEAD -- <path>"
                     )

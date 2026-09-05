@@ -121,6 +121,10 @@ from gates.deadline_date import evaluate as _deadline_date_eval  # noqa: E402
 from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as _ACTIVE_AGENTS  # noqa: E402
 from gates.field_shrink import evaluate as _field_shrink_eval  # noqa: E402
 from gates.lane_pin import evaluate as _lane_pin_eval  # noqa: E402
+from gates.reallocation_exempt import (  # noqa: E402  ( SSOT)
+    evaluate as _realloc_exempt_eval,
+    idle_agents as _realloc_idle_agents,
+    confirms_dormant as _realloc_confirms_dormant)
 from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E402
 from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
 from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E402
@@ -5704,6 +5708,83 @@ def _no_sid_bypass() -> Optional[str]:
         return f"gate-dependency-error: {_NO_SID_ENV} read failed, failing open (guard-142)"
 
 
+def _realloc_config(project_root: Path):
+    """`(reallocation_hours, cadence_threshold)` from core/config/aspirations.yaml.
+
+    Returns `(None, None)` on ANY read failure, and a None CLOSES the door it
+    governs — an unreadable config must never widen an exemption (guard-3024).
+    This also keeps daemon test fixtures on the pre-existing refusal path: their
+    tmp project_root carries no core/config, so both doors stay shut and the
+    endpoint behaves exactly as it did before this gate existed.
+    """
+    try:
+        import yaml
+        cfg_path = project_root / "core" / "config" / "aspirations.yaml"
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return ((cfg.get("multi_agent") or {}).get("reallocation_hours"),
+                (cfg.get("recurring") or {}).get("realloc_overdue_ratio"))
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _realloc_agent_status(ctx) -> Dict[str, Any]:
+    """Composed team-state `agent_status` rows, or {} when unreadable.
+
+    Routed through `_team_state.compose_state` — the sharded-row composition
+    SSOT — rather than reading the core doc alone, because a per-agent shard row
+    holds the authoritative `last_active` and the bare core doc can lag it.
+    Fail-open to {}: no rows means no idle agents means no exemption.
+    """
+    try:
+        import yaml
+        from _team_state import compose_state
+        with open(ctx.paths.world / "team-state.yaml", "r", encoding="utf-8") as f:
+            core_doc = yaml.safe_load(f) or {}
+        composed = compose_state(core_doc, ctx.paths.world) or {}
+        return composed.get("agent_status") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _log_reallocation_exemption(ctx, *, goal_id: str, agent_claiming: str,
+                                intended_agent: str,
+                                result: Dict[str, Any]) -> None:
+    """Record the exemption decision to gate-firings.
+
+    DELIBERATELY NOT override-bypass-ledger.jsonl. An exemption is not a bypass:
+    writing it to the ledger would make a gate that never needed overriding
+    indistinguishable, in the telemetry used for retirement, from one that was
+    overridden (guard-4817) — which is exactly what g-115-3492's outcome 3
+    forbids. The trace still exists, so an allowed claim is distinguishable from
+    a gate that never fired; it just lands in the store meant for firings.
+
+    Daemon variant passes ctx.paths.meta + agent_name explicitly (the
+    module-level _gate_log.META_DIR is frozen at daemon startup).
+    """
+    try:
+        _gate_log.log(
+            "reallocation-exempt-gate",
+            "pass" if result.get("exempt") else "block",
+            caller="aspirations_write.claim()",
+            trigger_matched=str(result.get("door") or ""),
+            payload=goal_id,
+            extra={
+                "goal_id": goal_id,
+                "agent_claiming": agent_claiming,
+                "intended_agent": intended_agent,
+                "door": result.get("door"),
+                "failed_conjuncts": result.get("failed"),
+                "reason": result.get("reason"),
+                "source": "daemon",
+            },
+            meta_dir=ctx.paths.meta,
+            agent_name=ctx.paths.agent_name or None,
+        )
+    except Exception:  # noqa: BLE001 — telemetry must never break a claim
+        pass
+
+
 def _audit_no_sid_claim_inline(ctx, *, goal_id: str, agent_claiming: str,
                                justification: str,
                                title: Optional[str] = None) -> None:
@@ -7297,16 +7378,76 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
 
             intended = goal.get("intended_agent")
             if _routes_away_from(intended, agent_name):
-                if not cross_lane:
+                # Reallocation exemption (). goal-selector.py
+                # DELIBERATELY surfaces this goal to a running agent when the
+                # reallocation condition holds ("fall through so a running
+                # capable agent can pick up otherwise-stranded work"), and this
+                # endpoint then refused that very goal — a rescue path that
+                # surfaced work it could not deliver, terminating in a gate only
+                # an audited bypass could pass. The two components never
+                # disagreed about POLICY; this one simply could not EXPRESS the
+                # selector's exception. gates.reallocation_exempt IS that
+                # expression, imported by BOTH, so a future change to the
+                # condition cannot desync them (guard-547, guard-2184).
+                #
+                # THE CALL SITE FAILS OPEN TOO, not just the gate's body — the
+                # same reasoning the lane-pin gate above records (guard-142).
+                # Arguments are built BEFORE the gate is entered, so anything
+                # raised while assembling them would escape the gate's own
+                # except and 500 the claim; a broken gate must never wedge the
+                # fleet. Note "fails open" here means falling back to the
+                # PRE-EXISTING refusal — for an exemption gate the conservative
+                # direction is to grant nothing (guard-3024).
+                try:
+                    _rh, _ct = _realloc_config(Path(ctx.paths.project_root))
+                    _realloc = _realloc_exempt_eval(
+                        goal, intended_agent=intended,
+                        idle_agents=_realloc_idle_agents(
+                            _realloc_agent_status(ctx),
+                            reallocation_hours=_rh,
+                            # Same probe the selector runs, via the shared gate.
+                            # No memo here on purpose: a claim handles ONE goal,
+                            # so there is nothing to amortise, and a daemon-
+                            # lifetime cache would pin a liveness verdict across
+                            # requests — the opposite of what a claim needs.
+                            confirm=lambda _n, _la: _realloc_confirms_dormant(
+                                _n, _la, threshold_hours=_rh,
+                                world_dir=ctx.paths.world)),
+                        cadence_threshold=_ct)
+                except Exception as _re_err:
+                    import sys
+                    print(f"[daemon claim] WARN: reallocation-exempt gate "
+                          f"raised, falling back to the cross_lane refusal for "
+                          f"{goal_id} by {agent_name}: "
+                          f"{type(_re_err).__name__}: {_re_err}",
+                          file=sys.stderr)
+                    _realloc = {}
+
+                _log_reallocation_exemption(
+                    ctx, goal_id=goal_id, agent_claiming=agent_name,
+                    intended_agent=intended, result=_realloc)
+
+                if _realloc.get("exempt"):
+                    # Claims cleanly: NO override flag, NO ledger entry. That is
+                    # outcome 3 of  — a routine cross_lane override
+                    # would poison override-bypass-ledger.jsonl as retirement
+                    # evidence (guard-4817). The trace lives in gate-firings.
+                    pass
+                elif not cross_lane:
+                    # Message and error code kept BYTE-IDENTICAL: callers match
+                    # on `cross_lane_refused` and on this text, and the gate's
+                    # own reason is already recorded above (guard-2184 — never
+                    # change the shape a downstream matcher consumes).
                     return Response.error(400, "cross_lane_refused",
                         f"Goal {goal_id} routed to '{intended}' but claimer "
                         f"is '{agent_name}'. Pass cross_lane query param to "
                         f"override (justification logged to "
                         f"override-bypass-ledger.jsonl).")
-                _audit_cross_lane_claim_inline(
-                    ctx, goal_id=goal_id, agent_claiming=agent_name,
-                    intended_agent=intended, justification=cross_lane,
-                    category=goal.get("category"), title=goal.get("title"))
+                else:
+                    _audit_cross_lane_claim_inline(
+                        ctx, goal_id=goal_id, agent_claiming=agent_name,
+                        intended_agent=intended, justification=cross_lane,
+                        category=goal.get("category"), title=goal.get("title"))
 
             existing = goal.get("claimed_by")
             claim_summary = f"claim {goal_id}"
