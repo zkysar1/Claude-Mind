@@ -87,14 +87,17 @@ def _plan_tool_payload(output: str) -> str:
     })
 
 
-def test_plan_tool_completion_emits_clear_and_answer():
+def test_plan_tool_completion_emits_verdict_obligations_without_a_clear():
     r = _run(_plan_tool_payload(
         "Current plan (3/3 steps done):\n  [x] t1 a\n  [x] t2 b\n  [-] t3 c — dropped"))
     assert r.returncode == 0
     ac = _emitted_context(r)
-    for must in ("Plan COMPLETE", "update_plan with tasks: []", "ORIGINAL request",
+    for must in ("Plan COMPLETE", "do not call update_plan", "ORIGINAL request",
                  "plan finished", "plan-completion-verdict.md"):
         assert must in ac, must
+    # The harness retires a complete plan itself (Zak-Code ADR-0108); asking the model to
+    # clear it would only spend a tool call on a no-op.
+    assert "tasks: []" not in ac
 
 
 def test_plan_tool_in_progress_is_silent():

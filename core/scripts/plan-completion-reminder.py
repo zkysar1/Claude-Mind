@@ -17,7 +17,10 @@ at the structural moments each harness exposes:
   `Current plan (F/T steps done):`, and F == T is exactly the network's
   completion predicate (terminal leaves over all leaves), so the reminder
   fires at the moment the plan COMPLETES — once. "Plan cleared." renders no
-  header, so the clear the reminder asks for cannot re-trigger it. A payload
+  header, so an explicit clear cannot re-trigger it. The reminder does NOT ask
+  for that clear: since Zak-Code ADR-0108 (2026-09-05) the harness itself
+  retires a complete plan (one-line reminder to the model, collapsed row in
+  every UI), so the model's only remaining obligation is the verdict. A payload
   without `output` (a Claude Code TodoWrite, should anyone route it here) is
   silent by construction.
 
@@ -56,8 +59,8 @@ COMPLETE_REMINDER = (
     "<system-reminder>\n"
     "[plan-completion-verdict] Plan COMPLETE — every step is terminal. The plan\n"
     "was a MEANS, not the deliverable. Before you end this turn:\n"
-    "  1. CLEAR the plan: call update_plan with tasks: [] so a finished checklist\n"
-    "     does not linger as active work.\n"
+    "  1. Do NOT restate the plan or its steps, and do not call update_plan\n"
+    "     again — the harness has retired the finished checklist.\n"
     "  2. RE-READ the user's ORIGINAL request — the message that started this\n"
     "     task, not the last step's title.\n"
     "  3. ANSWER that original request with a conclusion/verdict, leading with\n"

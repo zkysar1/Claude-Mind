@@ -415,6 +415,49 @@ gates:
       as the modify/removal siblings.
     retirement_eligible: true
 
+  - id: reallocation-exempt-gate
+    script: core/scripts/gates/reallocation_exempt.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "claim() — inside the cross_lane refusal, before it returns 400" }
+      - { file: "core/scripts/goal-selector.py", phase: "collect_candidates — the intended_agent routing filter's escape" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "Exemption wrongly WITHHELD: the claim falls through to the pre-existing cross_lane refusal, which is exactly the status quo this gate improves on. The goal stays stranded and an audited --cross-lane override still works. No new harm."
+    fn_description: "Exemption wrongly GRANTED: a goal routed to a LIVE agent is claimed by another Body, yanking work from a peer that was going to do it. This is the direction that costs something, which is why every unreadable input closes the door rather than opening it."
+    rb_evidence: []
+    tuning_notes: >-
+      SSOT for the reallocation escape, shared by the selector and the daemon
+      claim gate (g-115-3492). The defect it closes was NOT a policy
+      disagreement: the selector deliberately surfaces a cross-lane goal when
+      the reallocation condition holds, and the daemon then refused that very
+      goal with cross_lane_refused because it had no way to EXPRESS the
+      selector's exception. One module, imported by both, is the fix — a second
+      copy on the daemon side would re-create the divergence class (guard-547,
+      guard-2184).
+      THIS GATE NEVER WRITES override-bypass-ledger.jsonl, deliberately. An
+      exemption is not a bypass: recording it as one would make a gate that
+      correctly declined to fire indistinguishable, in the telemetry used for
+      retirement, from a gate that was overridden (guard-4817), which is
+      precisely what the goal's outcome 3 forbids. The trace lands here in
+      gate-firings instead, so the exempted path still records WHY it was
+      allowed.
+      EVERY conjunct is evaluated rather than short-circuited: an AND-predicate
+      that stops at its first false reports the cheapest failing condition,
+      which is almost never the decisive one (guard-3644), and this gate's
+      whole audit value is naming which conjunct decided.
+      Fail-safe direction is uniform — an unreadable cadence threshold, an
+      unparseable last_active, and any liveness probe error all resolve to NOT
+      exempt (guard-3024, and decide_liveness's own "unknown" posture). Only a
+      positive `dormant` verdict opens the idle door; `unknown` never does,
+      because a wrong dormant hands a live peer's goal to someone else.
+    retirement_eligible: true
+
   - id: lane-pin-gate
     script: core/scripts/gates/lane_pin.py
     embedded: false

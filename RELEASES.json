@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.62",
+    "previous_version": "2.12.61",
+    "date": "2026-09-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "User-only control skills carry disable-model-invocation (start/stop/open-questions); /forge-skill gains the request sub-command, a portable Step 3.5 gate wrapper and a one-call test goal; plan-completion reminder no longer asks for a redundant plan clear (Zak-Code ADR-0108); path-resolution-hook stops routing forged skill bodies to a world path no runtime loads",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.61",
     "previous_version": "2.12.60",
     "date": "2026-09-05",

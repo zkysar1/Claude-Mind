@@ -1,8 +1,9 @@
 ---
 name: start
-description: "Creates or resumes an agent in reader (read-only), assistant (user-directed), or autonomous mode (perpetual loop), handling full initialization for new agents (Self, program, paths, aspirations, curriculum) and state transitions for existing ones. USER-ONLY — Claude must NEVER invoke /start. Fires only when the user types /start {agent-name} [--mode {mode}]. Enforces the one-autonomous-session-per-agent invariant and supports observer sessions alongside running loops. Auto-recovers zombie sessions (state=RUNNING + stale heartbeat + no pending obligations) inline so /start {name} just works after a crash; --recover is reserved for the --force override path."
+description: "Creates or resumes an agent in reader (read-only), assistant (user-directed), or autonomous mode (perpetual loop), initializing new agents (Self, program, paths, aspirations, curriculum) and transitioning existing ones. USER-ONLY: the user types /start {agent-name} [--mode {mode}]; Claude must NEVER invoke it. Enforces the one-autonomous-session-per-agent invariant and supports observer sessions alongside running loops. Auto-recovers zombie sessions (state=RUNNING + stale heartbeat + no pending obligations) inline so /start {name} just works after a crash; --recover is reserved for the --force override path."
 triggers:
   - "/start"
+disable-model-invocation: true
 minimum_mode: any
 conventions: [session-state, curriculum]
 revision_id: "skill-bootstrap-start-3fc46d"

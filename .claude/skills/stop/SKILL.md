@@ -3,6 +3,7 @@ name: stop
 description: "Stops the autonomous learning loop gracefully: writes stop-requested for Phase -1.4, waits for in-flight obligations (verify, state-update), consolidates session state via /aspirations-consolidate, drops the agent to assistant mode by default (or reader with --reader), and transitions state to IDLE. USER-ONLY — Claude must NEVER invoke /stop. Fires only when the user types /stop {agent-name} [--reader]. Agent name is REQUIRED — refuses with an error and a list of available agents otherwise. Preserves handoff.yaml for the next session to resume."
 triggers:
   - "/stop"
+disable-model-invocation: true
 conventions: [session-state, handoff-working-memory]
 minimum_mode: any
 revision_id: "skill-bootstrap-stop-ae82e1"

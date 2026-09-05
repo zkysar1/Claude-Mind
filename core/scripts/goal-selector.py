@@ -103,6 +103,12 @@ from cadence_signals import evaluate_cadence_signal  # noqa: E402  ( signal-gate
 # status is added to TERMINAL_GOAL_STATUSES.
 from aspirations import (TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES,  # noqa: E402
                          routes_away_from)
+from gates.reallocation_exempt import (  # noqa: E402  ( SSOT)
+    is_owner_scoped_goal as _realloc_is_owner_scoped,
+    recurring_cadence_stranded as _realloc_cadence_stranded,
+    evaluate as _realloc_exempt_eval,
+    idle_agents as _realloc_idle_agents,
+    confirms_dormant as _realloc_confirms_dormant)
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
 from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter)
@@ -2355,195 +2361,67 @@ def _is_owner_scoped_goal(goal):
     """True when a goal operates ONLY on the bound agent's own dir tree and so
     CANNOT be executed by a cross-agent reallocatee (rb-4792, g-115-2945).
 
-    /drain-temp is the canonical case: its SKILL.md Phase 1 sets
-    TEMP_DIR=$AGENT_DIR/temp and operates on the bound agent ONLY. Surfacing
-    such a goal to another agent via idle-reallocation puts it in the
-    reallocatee's candidate list where it is UNEXECUTABLE -- running it drains
-    the WRONG agent's temp, and running it as the owner collides with the
-    owner's live session. Owner-scoped goals must therefore never be
-    cross-agent reallocated, even when their owner looks idle.
-
-    Detected three independent ways so a rename of any one signal still catches
-    it: the skill id, the origin_signal, or the title. The `maintain:temp-drain`
-    Maintain goal (skill=None) is caught by origin_signal/title; the
-    orchestrator-filed HIGH `/drain-temp` action goal is caught by skill.
+    DELEGATES to gates.reallocation_exempt — the SSOT this predicate shares with
+    the daemon claim gate (g-115-3492). Do NOT re-inline the body here: the whole
+    defect that goal fixed was two components holding different views of one
+    policy, and a second copy re-creates it silently (guard-547, guard-2184).
     """
-    if (goal.get("skill") or "") == "/drain-temp":
-        return True
-    origin = (goal.get("origin_signal") or "").lower()
-    if "temp" in origin and "drain" in origin:
-        return True
-    # Positive drain-action signature () — the SAME SSOT matcher
-    # precheck-eval.py dedup uses, so a title-template edit cannot desync the
-    # two. The prior '"drain" in title and "temp" in title' fallback false-
-    # positived on any goal that merely MENTIONS temp-drain and stranded it
-    # with a dormant owner (rb-3452 "assert the mechanism, not the case").
-    if is_drain_action_title(goal.get("title")):
-        return True
-    return False
+    return _realloc_is_owner_scoped(goal)
 
 
 def _recurring_cadence_stranded(goal):
     """True when a RECURRING goal is overdue past `recurring.realloc_overdue_ratio`.
 
-    WHY THIS EXISTS (g-115-8700, measured 2026-09-02): a recurring goal routed to
-    a LIVE but busy owner starves exactly like one routed to a dormant owner, and
-    the idle-reallocation escape below cannot free it because the owner is not
-    idle. Two bravo-routed goals stopped firing for 144h and 9h while sitting at
-    rank 1097/1180 on their owner's queue with recurring_urgency already at the
-    urgency_max clamp -- so no amount of further waiting could raise them, and
-    every other Body was excluded by block_reason=routed_to_agent. For CADENCE
-    purposes a busy owner that never reaches rank 1 is indistinguishable from a
-    dormant one, which is the whole argument for opening the escape on overdue-ness
-    rather than on owner liveness.
-
-    THE UNIT IS overdue_ratio, NOT AN ELAPSED MULTIPLE, and they differ by exactly
-    one: overdue_ratio = elapsed/interval - 1. A threshold of 2.0 therefore means
-    elapsed >= 3x interval. This is written out because the surrounding prose has
-    used "2.0x" for BOTH readings -- aspirations.yaml's urgency_max comment says
-    "the starvation predicate starts at 2.00x" (overdue_ratio) while
-    recurring-starvation-check.py compares `age_h > multiplier * basis_h` with
-    multiplier 3.0 (elapsed). They denote the SAME instant; only the units differ.
-    Keyed to overdue_ratio so this escape lines up with recurring_urgency, which is
-    the score the starved goal failed to win on.
-
-    Mirrors compute_score's never-fired fallback (g-303-32 / g-115-1763): a
-    recurring goal whose lastAchievedAt FIELD is absent has never fired, so its
-    clock starts at created_at. Keying on the field's absence rather than on a
-    None elapsed matters -- an off-machine ahead-clock stamps a FUTURE
-    lastAchievedAt, which hours_since() also reports as None, and treating that as
-    never-fired would free a goal that just ran. Without the fallback the
-    most-neglected goals -- the ones that never ran at all -- would be the only
-    class this escape could never reach.
+    DELEGATES to gates.reallocation_exempt (g-115-3492 SSOT). The THRESHOLD read
+    stays here because RECURRING_CONFIG is the selector's config surface; the
+    POLICY lives in the gate so the daemon evaluates the identical condition.
     """
-    if not goal.get("recurring"):
-        return False
-    try:
-        # float() is not defensive decoration: get_interval_hours returns
-        # goal["interval_hours"] RAW, and a store record can carry it as a
-        # string. Un-coerced, "48" compares fine against 0 but explodes on the
-        # subtraction below -- inside collect_candidates, i.e. one malformed
-        # goal takes down selection for every goal.
-        interval = float(get_interval_hours(goal))
-    except (TypeError, ValueError):
-        return False
-    if interval <= 0:
-        return False
-    la_raw = goal.get("lastAchievedAt")
-    la = hours_since(la_raw)
-    if la_raw is None:  # FIELD absence == never fired ()
-        la = hours_since(goal.get("created_at") or goal.get("created"))
-    if la is None:
-        return False
-    threshold = float(RECURRING_CONFIG.get("realloc_overdue_ratio", 2.0))
-    return ((la - interval) / interval) >= threshold
+    return _realloc_cadence_stranded(
+        goal,
+        cadence_threshold=RECURRING_CONFIG.get("realloc_overdue_ratio", 2.0))
 
-
-def _get_idle_agents(reallocation_hours):
-    """Set of agent names whose team-state last_active is older than
-    reallocation_hours (g-115-1766 gap #4 — intended_agent idle-reallocation).
-
-    An intended_agent-routed goal is normally hidden from every other agent
-    (collect_candidates intended_agent filter). When the routed-to agent has
-    gone idle for longer than reallocation_hours, that routing STRANDS the
-    goal — invisible to the running agent AND absent from collect_blocked (a
-    select-time drop, not a block), so it vanishes from selection entirely
-    (verified 2026-07-08: 15 framework goals routed to a 5.75-day-idle agent
-    vanished from both selectable and blocked outputs -> running agent falsely
-    concluded all-blocked). This set lets the intended_agent filter fall
-    through for an idle target, mirroring the reallocatable+reallocation_hours
-    mechanism but keyed on intended-agent idleness rather than the explicit
-    reallocatable flag.
-
-    Conservative + fail-open (rb-1028 posture): returns an empty set when
-    reallocation is disabled (reallocation_hours is None) or team-state is
-    unavailable, and an agent with a missing/unparseable last_active is NOT
-    treated as idle — the goal stays routed (status quo) rather than being
-    surfaced on absent evidence.
-
-    g-115-2315: a stale last_active alone is NOT sufficient evidence of
-    idleness — it is the LOCAL MIRROR of the peer's pushed snapshot, and a
-    lagged pull path freezes it for every peer while they actively push
-    (the g-115-2149 read-side lie; observed 2026-07-16: foxtrot last_active
-    27.5h stale on this box while its shard hit the authoritative store 4
-    minutes earlier, so its alert goal leaked to echo). Before declaring an
-    agent idle, cross-check the inherently-fresh signal (the agent's
-    team-state shard write time read from the AUTHORITATIVE store) via
-    liveness_check: idle ONLY on a "dormant" verdict (both signals stale);
-    "alive" and "unknown" (fresh signal unreadable) keep the agent NOT idle,
-    honoring the never-on-absent-evidence promise above. Probe results are
-    memoized per process — one authoritative-store HEAD per stale agent per
-    selector run, not per goal.
-    """
-    if reallocation_hours is None:
-        return set()
-    ts = _load_team_state_cached() or {}
-    agent_status = ts.get("agent_status") or {}
-    idle = set()
-    for name, row in agent_status.items():
-        if not isinstance(row, dict):
-            continue
-        age = hours_since(row.get("last_active"))
-        if age is not None and age > reallocation_hours:
-            if _liveness_confirms_dormant(name, row.get("last_active"),
-                                          reallocation_hours):
-                idle.add(name)
-    return idle
 
 
 _LIVENESS_DORMANT_CACHE = {}
 
 
 def _liveness_confirms_dormant(name, last_active_iso, threshold_hours):
-    """True only when liveness_check upholds the dormant conclusion for
-    ``name`` (g-115-2315 — see _get_idle_agents docstring).
+    """True only when liveness_check upholds the dormant conclusion for `name`.
 
-    Dispatches to liveness_check.fetch_fresh_signal (authoritative-store
-    shard write time: S3 LastModified on own-cloud, shard mtime on local)
-    and the pure decide_liveness verdict. Memoized per process so repeated
-    collect_candidates calls (world + agent queues) probe each stale agent
-    once. Fail-safe: any import/probe error returns False (NOT idle) — the
-    same direction as decide_liveness's "unknown" verdict, degrading toward
-    goals-stay-routed (slow but never wrongly leaked) rather than reviving
-    the false-idle defect this check exists to fix.
+    The PROBE lives in gates.reallocation_exempt (g-115-3492 SSOT) so the daemon
+    claim gate runs byte-identical liveness logic. The MEMO stays here, per
+    selector run: collect_candidates walks the world and agent queues, so each
+    stale agent must be probed once, and this module's tests control liveness by
+    patching this function and this cache.
     """
     if name in _LIVENESS_DORMANT_CACHE:
         return _LIVENESS_DORMANT_CACHE[name]
-    try:
-        import liveness_check as _lc
-        backend = os.environ.get("STORAGE_BACKEND", "local")
-        fresh_iso = _lc.fetch_fresh_signal(name, str(WORLD_DIR), backend)
-        # The shard OBJECT's write time is BODY activity; the last_active VALUE
-        # inside the authoritative shard is MIND liveness (-e). Supply
-        # both so this routing decision cannot disagree with the CLI verdict —
-        # object-time alone made a worker Body's write look like a live reducer.
-        # Provenance travels WITH the value (). read_shard_authoritative
-        # fails open to the local mirror, and a mirror value promoted to
-        # verdict=alive is a false ALIVE — here that would keep goals routed to a
-        # dead agent. Passing the provenance lets decide_liveness degrade to
-        # "unknown", which this function does not treat as dormant either way, so
-        # the failure stays in the goals-stay-routed direction.
-        auth_la_iso, auth_la_prov = _lc.fetch_authoritative_last_active_with_provenance(
-            name, str(WORLD_DIR))
-        # A row stamped by ANOTHER agent cannot certify its subject alive
-        # (, guard-3604): clearing a dormant peer's stranded in_flight
-        # bumps the CLEARED row's last_active, so a peer this fleet just policed
-        # reads fresh for a full window. This call site must pass the stamp too
-        # or the reallocation gate keeps the defect the CLI just lost — the
-        # verdict is what decides whether a dormant agent's routed goals are
-        # reclaimed, so a false "alive" here strands them indefinitely.
-        row_stamp = _lc.fetch_row_stamp(name, str(WORLD_DIR))
-        verdict = _lc.decide_liveness(
-            last_active_iso, fresh_iso, threshold_hours=threshold_hours,
-            now=datetime.now(),
-            authoritative_last_active_iso=auth_la_iso,
-            authoritative_provenance=auth_la_prov,
-            row_updated_by=row_stamp, row_agent=name)["verdict"]
-        dormant = (verdict == "dormant")
-    except Exception:  # noqa: BLE001 — fail-safe toward NOT idle
-        dormant = False
+    dormant = _realloc_confirms_dormant(
+        name, last_active_iso, threshold_hours=threshold_hours,
+        world_dir=WORLD_DIR)
     _LIVENESS_DORMANT_CACHE[name] = dormant
     return dormant
+
+
+def _get_idle_agents(reallocation_hours):
+    """Set of agent names whose team-state last_active is older than
+    reallocation_hours AND whose dormancy liveness_check upholds
+    (g-115-1766 gap #4 — intended_agent idle-reallocation).
+
+    The AGE policy is delegated to gates.reallocation_exempt (g-115-3492 SSOT)
+    so the daemon claim gate cannot disagree with this selector about the
+    threshold. The team-state READ stays here (cached once per run, with this
+    module's shard composition and rb-2429 partial-YAML retry recovery), and the
+    dormancy CONFIRMATION is passed in as `confirm` so it routes through this
+    module's own memoized wrapper below — the seam this file's tests patch.
+    """
+    ts = _load_team_state_cached() or {}
+    return _realloc_idle_agents(
+        ts.get("agent_status") or {},
+        reallocation_hours=reallocation_hours,
+        confirm=lambda name, last_active: _liveness_confirms_dormant(
+            name, last_active, reallocation_hours))
+
 
 
 def collect_candidates(aspirations, known_blockers=None, source="world",

@@ -2,6 +2,7 @@
 name: open-questions
 description: "Shows the user dashboard: pending questions the agent has logged for the user, goals with participants including user, and blocked goals grouped by blocker reason. Use whenever the user says \"what do you need from me\", \"what's blocked\", \"what questions do you have\", \"what am I on the hook for\", or invokes /open-questions directly. USER-ONLY — Claude must never invoke this autonomously. Primes context first so follow-up is knowledge-informed."
 user-invocable: true
+disable-model-invocation: true
 triggers:
   - "/open-questions"
 conventions: [aspirations]
