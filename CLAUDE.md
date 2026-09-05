@@ -338,7 +338,7 @@ The shared purpose lives in `world/program.md` (The Program). Each agent's ident
 ### Skill Invocation Rules
 - **Control skills** (/start, /stop, /open-questions): user-invocable only — Claude MUST NOT invoke these
 - **Mode control**: `/start <agent-name> --mode <mode>` to enter a mode, `/stop <agent-name>` to return to assistant (or `/stop <agent-name> --reader` for read-only). Agent name is REQUIRED on `/stop`.
-- **Hybrid skills** (/agent-completion-report, /backlog-report, /forge-skill, /priority-review, /sprint-planning, /verify-learning, /generate-domain-goals): user-invocable AND agent-callable
+- **Hybrid skills** (/agent-completion-report, /backlog-report, /forge-skill, /priority-review, /sprint-planning, /verify-learning, /generate-domain-goals, /update-framework): user-invocable AND agent-callable
 - **Internal skills**: `user-invocable: false` — invoked by agent during RUNNING state
 - **No blocking on user input in RUNNING state** — skills must never wait for, request, or depend on user input during autonomous execution
 
@@ -436,6 +436,7 @@ and gitignored — not reachable by a cloud clone.
 | `/sprint-planning` | Full sprint-planning pass: backlog + priority data, fleet-vantage directive check, hygiene lanes (dups/routing/priorities/recurring/reclaim/zombies), verified queue writes with ledger, published plan. `--ultra` (user-invoked only) escalates to a multi-agent verified pass *(also agent-callable — the recurring sprint goal fires it in standard mode)* | ANY (assistant+) |
 | `/encode-session` | Run a structured 7-lane learning pass on the current chat session: encode tree/rb/guardrails/experience, file Maintain goals for inline work, re-probe blockers, surface discoveries, propose verify-learning checks (sq-018), and check meta + Self for evolution signals *(also agent-callable; chat-mode analogue of the autonomous loop's Phase 6.5 + Phase 8)* | IDLE (assistant) |
 | `/generate-domain-goals` | Supply-side domain goal generation: recon product surfaces through six lenses (metric, journey, code-reality, revenue, distribution, critic), generate evidence-backed user-story candidates, adversarially verify every evidence claim BEFORE filing, file survivors into aspiration lanes with dedup handling + board announcement. Reads the domain's `goal-generation-brief` hook slot; supply-governed (skips when backlog healthy). `--ultra` (user-invoked only) fans out multi-agent generation+verification *(also agent-callable — the recurring generation goal fires it in standard mode)* | ANY (assistant+) |
+| `/update-framework` | Update THIS deployment to the newest framework release from the staging Mind: loads `pull-promotion.md`, refuses at the dev origin, detects git-fed (merge the newest tag in place) vs transplant (`framework-pull.sh`), verifies, records `world/installed-release.yaml`. Never web-search for the framework *(also agent-callable — recurring g-002-02 fires it)* | ANY (assistant+) |
 
 \*When started from RUNNING state, reader/assistant create an **observer session** that coexists
 with the autonomous loop. Observer sessions do not write to agent-state, agent-mode, or

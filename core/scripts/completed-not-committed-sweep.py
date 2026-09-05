@@ -1337,6 +1337,79 @@ def build_sha_status(goals, candidate_repos):
     return status
 
 
+def split_repo_names(world_path=None):
+    """Repo names the Split-Repo Registry marks as split. Impure (reads the
+    domain convention). g-115-9040.
+
+    The registry table IS the test for whether a repo is split — "named
+    somewhere in the convention" is explicitly NOT the test (g-370-15, which
+    exists because the rule was stated in two places and found in neither). So
+    this parses the one `## Split-Repo Registry` table and nothing else.
+
+    FAILS CLOSED, matching this module's no-flag direction: a missing world
+    path, an unreadable file, an absent section or an unparseable table all
+    return the EMPTY set, which makes resolve_landing_ref fall through to the
+    default branch — i.e. exactly the behaviour before this function existed. A
+    registry we cannot read must never silently widen what counts as landed."""
+    world = (world_path or os.environ.get("WORLD_PATH")
+             or globals().get("WORLD_DIR"))
+    if not world:
+        return frozenset()
+    path = os.path.join(str(world), "conventions", "sdlc-environments.md")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return frozenset()
+    names, in_section = set(), False
+    for line in lines:
+        if line.startswith("## "):
+            if in_section:
+                break  # the next heading ends the table
+            in_section = line.startswith("## Split-Repo Registry")
+            continue
+        if not in_section or not line.startswith("|"):
+            continue
+        cols = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cols) < 2 or "YES" not in cols[1].upper():
+            continue
+        name = cols[0].strip().strip("`").strip()
+        if name and not name.startswith("("):  # skip the placeholder row
+            names.add(name)
+    return frozenset(names)
+
+
+def resolve_landing_ref(repo, split_names):
+    """The ref correctly-merged work is EXPECTED TO REACH: `origin/dev` on a
+    registry-listed split repo, else the repo's default branch. Impure (git);
+    the registry is INJECTED so the split decision stays testable. g-115-9040.
+
+    WHY THIS IS NOT resolve_default_ref. On the six registry-listed repos the
+    DEFAULT branch (`main`) is the PROD branch, and the charter states verbatim
+    "Nothing merges to `main` directly" — feature PRs merge to `dev`, and
+    dev->main travels only on the weekly promotion PR (asp-370). Containment
+    against the default branch therefore asks a question whose answer is "no"
+    for up to a week BY DESIGN, so every correctly-merged commit read as
+    stranded debt whose prescribed remedy ("merge it") is a guard-5389 charter
+    violation into an auto-deploying PROD target. Measured 2026-09-05 on
+    zkysar1/Vinheim-Web-App: origin/dev 64 ahead / 0 behind origin/main, and
+    four goals flagged whose commits had all merged to dev (guard-6045).
+
+    A commit on `dev` but not `main` is PROMOTION BACKLOG owned by asp-370 —
+    not debt owned by the goal's author.
+
+    Falls back to the default branch whenever `origin/dev` does not exist, so a
+    repo listed in the registry before its dev branch is cut keeps behaving as
+    it does today rather than becoming unjudgeable."""
+    name = os.path.basename(os.path.normpath(str(repo)))
+    if name in (split_names or frozenset()):
+        rc, _ = _git(repo, "rev-parse", "--verify", "--quiet",
+                     "origin/dev^{commit}")
+        if rc == 0:
+            return "origin/dev"
+    return resolve_default_ref(repo)
+
+
 def resolve_default_ref(repo):
     """Remote-tracking ref of the repo's DEFAULT branch ("origin/main"), or None
     when it cannot be resolved locally. Impure (git), no network, no mutation.
@@ -1527,8 +1600,30 @@ def probe_sha_pull_request(sha, candidate_repos):
 
     Uses `repos/{owner}/{repo}/commits/<sha>/pulls`, whose gh placeholders
     resolve from cwd — so no origin-URL parsing and no owner/name bookkeeping.
-    Prefers an OPEN pull request when several carry the commit; that is the one
-    whose non-merge is the stranding.
+
+    Prefers a MERGED pull request when several carry the commit, THEN an OPEN
+    one. This preference was inverted until 2026-09-05 (g-115-9040) and the
+    inversion had two distinct consequences, the second much worse than the
+    first. The endpoint returns EVERY pull request whose head contains the sha,
+    and on a split repo every branch cut from `dev` contains everything already
+    merged into `dev` — so the newest unrelated OPEN pull request off `dev`
+    carries every recently-merged commit and, under the old rule, was named for
+    all of them. Per guard-6045 (measured by zeta on cc-02), open PR #439
+    base=dev was named for four unrelated commits whose real merges were
+    #426/#427/#429/#430. Two of those four were re-derived independently on
+    cc-08 before this fix and are the citations this change rests on: the
+    commit behind g-115-9029 is 912184bd, subject `fix(g-363-121): ... (#430)`,
+    merged_at 2026-09-03T00:21:13Z, contained by origin/dev and absent from
+    origin/main; the g-115-9025 flag resolved the same way. The other two are
+    guard-6045's, not this author's.
+    The worse consequence is that this function returns ONE record per sha and
+    `all_merged_on_default` requires EVERY record to be MERGED — so returning
+    the OPEN sibling did not merely misname the pull request, it DISQUALIFIED
+    the benign_squash_merged carve-out for a commit that had genuinely merged.
+    A merged pull request is the single most conclusive evidence the work
+    shipped; an OPEN sibling that happens to contain the sha is evidence of
+    nothing. Read `merged_at`, never `state` — the forge reports a merged pull
+    request as state=closed, which `_norm` below already handles.
 
     DEGRADES, NEVER ERRORS. Every failure mode — gh absent, not authenticated,
     remote not on a forge, API unreachable, 404 — returns UNAVAILABLE, which
@@ -1588,7 +1683,8 @@ def probe_sha_pull_request(sha, candidate_repos):
             return {"state": "NONE", "number": None, "url": None,
                     "title": None, "created_at": None, "merge_commit_sha": None,
                     "draft": None}
-        return next((n for n in norms if n["state"] == "OPEN"), norms[0])
+        return next((n for n in norms if n["state"] == "MERGED"),
+                    next((n for n in norms if n["state"] == "OPEN"), norms[0]))
     return dict(_PR_UNAVAILABLE)  # SHA in no candidate repo — cannot query
 
 
@@ -2158,10 +2254,17 @@ def main():
     # Tier 1 above scores a commit LANDED when any remote branch contains it, so
     # a deliverable pushed to a feature branch whose PR is never merged reads as
     # clean. Tier 2 re-checks the goals tier 1 blessed: resolve each repo's
-    # default branch, keep the landed SHAs that missed it, then ask the forge
+    # LANDING branch, keep the landed SHAs that missed it, then ask the forge
     # which pull request carries them. Probes are staged narrowest-last — the
     # network call runs only on the off-default subset, never on every SHA.
-    default_refs = {str(r): resolve_default_ref(r) for r in candidate_repos}
+    #
+    # : the landing ref is the repo's default branch EXCEPT on the
+    # registry-listed split repos, where it is `origin/dev` — on those, `main`
+    # is PROD and correctly-merged work is uncontained by it for up to a week
+    # by design (guard-6045). Registry read ONCE, then injected per repo.
+    _split_repos = split_repo_names()
+    default_refs = {str(r): resolve_landing_ref(r, _split_repos)
+                    for r in candidate_repos}
 
     # : tier 1 asked a local-vs-remote BOOLEAN, which cannot tell an
     # unpushed commit from a dangling or worker-ref one — all three satisfy

@@ -10668,3 +10668,45 @@ Run was read-only; routed nothing.
 **Signals routed to S5: ZERO.** Every fire resolved to a known-owned confound (S2a/S2b/S4a),
 a standing portfolio property (S3 axis2), or a coverage measurement (S4.6). Two fresh counts
 attached to existing owners (g-115-5462, g-115-3215); no new goals filed.
+
+## 2026-09-05T12:3x — bravo, `hostname` cc-05, `uname -r` 6.8.0-138-generic, own-cloud, world=ayoai-mind, `time_cadence`
+
+Same box as the 04:4x row above, ~8h later. **S2a raw only, deliberately: 34 stale @30d of EXPLORE
+54, total 1575 — the age histogram is BYTE-IDENTICAL to that row
+({31:1,32:2,37:1,41:1,46:1,48:1,49:1,50:2,52:1,55:8,56:8,63:1,67:1,69:1,96:1,107:1,108:1,118:1}),
+so nothing aged in the interval.** I did NOT open the 34 node files, so I report NO structural
+count — per the CONTROL GATE, a structural number without `opened == len(stale_nodes)` is not a
+measurement, and the 04:4x row already carries the 5/34 with a full open. Nothing attached to
+g-115-5462: zero movement is not a fresh count. S2b thin EXPLORE leaves **50/54 = 92.6%**,
+reproducing the documented 92.2% — owned by g-115-4840, routed nothing.
+
+**S3 — asp-115's ABSOLUTE AND SHARE FELL TOGETHER, which is new for this roster and is still not
+remediation.** Full corpus (`goals_omitted` key ABSENT on all 26 → full store, rb-245
+disambiguation). n **2414 → 2386**; axis1 `framework-architecture` **797/2386 = 33.4%** PASSES;
+axis1b `framework-*` **1482/2386 = 62.1%** across **38** labels, PASSES; axis2 `asp-115`
+**1946/2386 = 81.6%** FIRES — the only fire, as in every row ever taken. asp-115 **1976 → 1946
+(−30)** while non-115 went **438 → 440 (+2)**.
+
+Read against 08-16 (absolute fell, share ROSE on a faster-draining base), this is the other
+direction: both fell. It is still not evidence of remediation, and the reason is that I am the
+cause — this session closed three asp-115 goals (g-115-8985, g-115-9024, g-115-9030) in that
+window. **A drain you performed yourself is not a portfolio trend; it is your own throughput
+showing up in the denominator.** Method rule (3) says quote both terms, and both terms here are
+attributable to one agent's afternoon. Categories 247 → 246; S3c high_pct 46.2% (12/26) — all
+unchanged, i.e. the shape is fixed and only the pile moved. Routed nothing (standing property).
+
+**S4.6 — 6 candidates, `distinct failing-goal members = 1 → g-335-816`.** The identical sole
+member every non-zero run on this box has produced since 08-12. Read-only; routed nothing. Note
+the 04:4x row on this same box recorded the same sole member at a much higher `ceiling_ratio`, so
+neither the count nor the ratio moves the verdict — only the member set does, and it has not moved
+in 24 days.
+
+**S4a** CONFOUND (disjoint vocabularies), owned — not routed. **S4b** candidate `rb-1619`:
+retrieved **250x**, `utilization_score_v2` **0.0051** (1/1 mature qualified) — stored as the single
+LOW signal. **S4.5** 0 NEW / 0 filed / 2 dedup-suppressed / 0 rb-245.
+
+**Signals routed to S5: ZERO; one LOW stored.** Three `0.5k` ratchets REGRESSED in the same
+iteration and were deliberately NOT filed under the standing product-first generation brake
+(review 2026-09-15): `unchecked-write` 457→460 (+3), `goal-field-census` 131→137 (+6, advisory by
+its own text and explicitly not to be re-seeded), `stalled-goal` 22 blocked >14d of 753. They are
+detection-side and worth a product-outcome justification before they earn queue space.

@@ -417,7 +417,12 @@ def scan(world_dir: Path, self_agent: str, *, now: Optional[dt.datetime] = None,
     independent reads run once, and only for peers whose heartbeat is stale.
     """
     now = now or utc_now()
-    thr = float(stale_hours_override) if stale_hours_override else stale_hours()
+    # `is not None`, NOT truthiness ( fresh-eyes). A caller asking for
+    # `stale_hours_override=0` wants EVERYTHING treated as stale -- the maximally
+    # forced positive control -- and a falsy test silently hands back the 3.0
+    # default instead, i.e. the exact OPPOSITE, reported as a clean "nothing is
+    # stalled". Measured through the CLI: `--stale-hours 0` produced thr=3.0.
+    thr = float(stale_hours_override) if stale_hours_override is not None else stale_hours()
     report: Dict[str, Any] = {
         "self": self_agent, "checked_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
         "stale_hours": thr, "peers": [], "blind": False, "blind_cause": None,
@@ -457,3 +462,64 @@ def scan(world_dir: Path, self_agent: str, *, now: Optional[dt.datetime] = None,
                                      goals=goals.get(a, signal(None, False, "goals")))
     report["peers"] = [first[a] for a in peers]
     return report
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI — a machine-readable entry point for OUT-OF-LOOP callers ()
+# ─────────────────────────────────────────────────────────────────────────────
+def main(argv=None) -> int:
+    """Emit scan() as JSON on stdout. Always prints a report; always returns 0.
+
+    EXISTS FOR THE HOST SWEEPER. world/scripts/fleet-liveness-sweep.py runs on
+    zakbox1, which has no Mind checkout, no world mirror and no store
+    credentials, so it cannot import this module -- it invokes this CLI inside a
+    Mind container over `lxc exec` and parses the JSON. Re-deriving the decision
+    table on the host instead would put two classifiers on one question, which
+    is the drift guard-2676 forbids.
+
+    `--self ''` (the default) classifies EVERY agent in the roster: the sweeper
+    is not a peer of anyone, so it needs the whole population and then subtracts
+    the agents its own container lane already covers.
+
+    THE VERDICT IS IN THE PAYLOAD, NOT IN THE EXIT CODE (guard-1150). A blind
+    scan prints `"blind": true` with a cause and still exits 0; an EMPTY stdout
+    is the only "this told me nothing" signal a caller may act on.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="Classify every agent from the authoritative team-state shards")
+    ap.add_argument("--world", default=None,
+                    help="world dir (default: resolved from _paths)")
+    ap.add_argument("--self", dest="self_agent", default="",
+                    help="agent to exclude as self (default: none -- classify all)")
+    ap.add_argument("--stale-hours", type=float, default=None,
+                    help=f"heartbeat staleness threshold (default {DEFAULT_STALE_HOURS})")
+    a = ap.parse_args(argv)
+
+    world = a.world
+    if not world:
+        try:
+            from _paths import WORLD_DIR  # type: ignore
+            world = str(WORLD_DIR)
+        except Exception as e:  # noqa: BLE001 -- a blind scan must SAY so
+            print(json.dumps({
+                "self": a.self_agent, "peers": [], "blind": True,
+                "blind_cause": f"world dir unresolved: {type(e).__name__}: {e}"[:300],
+                "roster_provenance": None,
+            }))
+            return 0
+    report = scan(Path(world), a.self_agent, stale_hours_override=a.stale_hours)
+    # Stamp the ALERTING decision on each peer HERE rather than letting an
+    # out-of-loop caller re-derive it. `ALERTING` (only `stalled` pages) is this
+    # module's contract; a host-side copy of that rule would be the second
+    # decision table guard-2676 forbids, and it would drift the first time a
+    # verdict is added.
+    for peer in report.get("peers") or []:
+        peer["alerting"] = is_alerting(peer.get("verdict"))
+    print(json.dumps(report, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

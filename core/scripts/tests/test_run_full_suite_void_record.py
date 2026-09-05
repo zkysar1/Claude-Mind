@@ -206,8 +206,14 @@ def test_the_cause_vocabulary_is_pinned_exactly():
                 for side in (a.body, a.orelse):
                     if isinstance(side, ast.Constant):
                         causes.add(side.value)
+    # "xdist-missing" (): the --parallel preflight refusal. Added
+    # here per the docstring; the "teach whatever counts these records" half
+    # was measured moot -- grep of core/, .claude/ and $WORLD_PATH/scripts on
+    # 2026-09-05 found NO consumer of SUITE-VOID-RECORD outside this file and
+    # the runner. The first counter written must read this set.
     assert causes == {"tree-moved", "contended", "hung", "argv-too-long",
-                      "chunk-spawn-failed", "chunk-rc-without-running"}, causes
+                      "chunk-spawn-failed", "chunk-rc-without-running",
+                      "xdist-missing"}, causes
 
 
 # ── the output caps ─────────────────────────────────────────────────────────

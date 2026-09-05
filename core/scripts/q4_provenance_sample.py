@@ -86,7 +86,7 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from ground_truth_citation import analyze, iter_clusters  # noqa: E402
+from ground_truth_citation import PARTIAL, analyze, iter_clusters  # noqa: E402
 
 DEFAULT_SAMPLE_N = 5
 
@@ -295,18 +295,43 @@ def retrieved_predicate(session_id: Optional[str]) -> Optional[Callable]:
         # by its own contract, and that is the right bar here: peeking at
         # one region of a file is not evidence you read the claim's source.
         paths = mod.read_tracker(session_id=session_id) or set()
+        # The PARTIAL set, for MESSAGE FIDELITY ONLY. It never makes a citation
+        # pass: read_tracker() excludes ranged reads by contract ("peeking at
+        # one region of a file is not evidence you read the claim's source")
+        # and that exclusion is deliberately unchanged here. All this buys is
+        # the ability to say WHICH failure it is -- never opened, or opened in
+        # part -- because the single message asserted the former for both and
+        # sent readers hunting for a read that had already happened.
+        # Private accessor because it is the only one exposing partials; a
+        # rename degrades to the previous wording rather than raising, which
+        # keeps a cosmetic dependency from breaking the whole check.
+        _split = getattr(mod, "_read_tracker_split", None)
+        partial_paths = set()
+        if _split is not None:
+            try:
+                _full_unused, partial_paths = _split(session_id=session_id)
+            except Exception:
+                partial_paths = set()
     except Exception:
         return None
     values = [str(e[2] if isinstance(e, (tuple, list)) and len(e) >= 3 else e)
               for e in entries]
     values += [str(p) for p in paths]
     values = [v for v in values if v]
+    # UNCHANGED GATE: an empty FULL set still returns None (skip), so a session
+    # whose manifest holds only partials behaves exactly as before rather than
+    # flagging every citation. Partials refine a message; they never open one.
     if not values:
         return None
+    partial_values = [str(x) for x in (partial_paths or set()) if x]
 
     def _retrieved(kind, value):
         v = str(value).rstrip("/.,);")
-        return any(v in got or got in v for got in values)
+        if any(v in got or got in v for got in values):
+            return True
+        if any(v in got or got in v for got in partial_values):
+            return PARTIAL
+        return False
     return _retrieved
 
 

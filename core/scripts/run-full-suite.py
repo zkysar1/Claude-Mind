@@ -1729,6 +1729,26 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--chunks", type=int, default=4,
                     help="fresh processes to split across (default 4)")
+    ap.add_argument("--parallel", type=int, default=0, metavar="N",
+                    help="run each chunk's tests across N pytest-xdist workers "
+                         "(default 0 = OFF, strictly sequential as before). "
+                         "Uses --dist load (per-TEST), not loadfile: measured "
+                         "2026-09-05 on core/tests/gates (501 tests, 8-core "
+                         "Windows box) seq=215s, loadfile -n8=181s (1.19x), "
+                         "load -n8=98s (2.19x) -- loadfile pins a whole file to "
+                         "one worker and test_post_state_update_metric_gate.py "
+                         "owns 8 of the 12 slowest tests, so seven workers idled. "
+                         "TWO COSTS, both real: (1) it degrades the contention "
+                         "detector further -- classify()'s positional profile is "
+                         "already blinded by chunking, and interleaved workers "
+                         "scramble the [NN%%] progression outright, so treat "
+                         "VERDICT: GENUINE as even weaker under --parallel and "
+                         "lean on per-chunk confinement + solo re-runs instead; "
+                         "(2) shared-state races are NOT ruled out -- rc=0 on 501 "
+                         "gates tests says nothing about the 19,362 tests across "
+                         "1,187 files in core/scripts/tests, many of which drive "
+                         "real git/bash subprocesses against shared paths. "
+                         "Default stays OFF for exactly that reason.")
     ap.add_argument("--triage", action="store_true",
                     help="triage the chunk logs already in --out; does NOT re-run the suite")
     ap.add_argument("--out", default=None,
@@ -1754,6 +1774,26 @@ def main(argv=None):
                     help="proceed despite another run holding this log dir. "
                          "Justification is REQUIRED and echoed as above")
     args = ap.parse_args(argv)
+
+    # --parallel preflight: FAIL LOUD AND EARLY, before a single chunk spawns.
+    # Without this, a missing xdist surfaces as pytest's `unrecognized arguments:
+    # -n` at rc=4 on EVERY chunk -- and rc=4 with 0 tests accounted for is
+    # exactly the shape _is_measurement rejects, so the run would end in a
+    # VERDICT that blames contention for a missing pip package (the 
+    # failure mode, one flag over). Refusing here costs one import and names its
+    # own remedy.
+    if args.parallel > 0:
+        import importlib.util as _ilu
+        if _ilu.find_spec("xdist") is None:
+            print("run-full-suite: --parallel %d requires pytest-xdist, which is "
+                  "not installed.\n  remedy: %s -m pip install pytest-xdist"
+                  % (args.parallel, sys.executable), file=sys.stderr)
+            # EVERY exit-2 path emits a record (guard-3948; the AST test in
+            # test_run_full_suite_void_record.py pins it). This refusal shipped
+            # without one and reached main red (): an invocation that
+            # produced no measurement is exactly what a void cadence must count.
+            _emit_void_record("xdist-missing", parallel=args.parallel)
+            return 2
 
     # Resolved BEFORE the testpaths check so --print-out-dir answers even on a
     # box whose pytest.ini is unusable: the shell needs somewhere to record the
@@ -2027,6 +2067,18 @@ def main(argv=None):
             marker_terms.append("not fleet_layout")
         if marker_terms:
             cmd += ["-m", " and ".join(marker_terms)]
+        # --parallel N: xdist workers WITHIN each chunk. Chunking and this are
+        # orthogonal and both are kept -- chunking still resets the Windows
+        # handle exhaustion that guard-1448 documents (a long-lived xdist worker
+        # accumulates handles exactly like a long-lived single process did), and
+        # this parallelises the work inside each of those fresh processes.
+        # --dist load, NOT loadfile: see the --parallel help text for the
+        # measured 1.19x-vs-2.19x split and why file-pinning wasted 7 of 8
+        # workers. Appended AFTER the -m block deliberately -- neither flag is
+        # an -m, so the last-wins hazard that comment describes does not reach
+        # them (guard-4437: checked, not assumed).
+        if args.parallel > 0:
+            cmd += ["-n", str(args.parallel), "--dist", "load"]
         # ARGV BUDGET -- CHECKED BEFORE THE SPAWN, so the fallback path fails
         # with a sentence naming its own remedy instead of a WinError 206 that
         # a reader has to decode. Deliberately NOT a re-chunk: the ladder is a

@@ -326,3 +326,64 @@ def test_scope_accepts_a_resolved_absolute_tree_path():
     mod = _load_entry_module()
     root = mod._world_tree_root()
     assert mod._in_scope(str(root / "system" / "pytest-fixture.md"), "")
+
+
+# ── PARTIAL: "never opened" vs "opened, in part" ( class 1) ────────
+#
+# The predicate was BOOLEAN, so one message served two different situations and
+# asserted the wrong one for the second: a file read with an offset/limit is
+# recorded behind context-reads.PARTIAL_PREFIX and excluded from read_tracker()'s
+# full set BY DESIGN, and the finding then told the reader the file had "NOT
+# [been] retrieved this session" -- sending them to look for a read that had
+# already happened. The VERDICT is deliberately unchanged (a ranged peek is
+# still not evidence for the claim); only what the message says it is changes.
+#
+# Three tests, because the interesting property is that three inputs produce
+# three DIFFERENT outputs. Two of them are controls: without the True case this
+# says nothing about whether anything still passes, and without the False case
+# nothing pins that the ORIGINAL wording survives for the case it was right
+# about (guard-4166 -- a fix whose effect is that something stops appearing
+# needs a control that does not flip).
+
+_PARTIAL_TEXT = (
+    "The sampler reads the manifest written by the PostToolUse hook.\n"
+    "Measured 2026-09-05 on cc-08: core/scripts/context-reads.py line 101 "
+    "defines PARTIAL_PREFIX and 42 entries were recorded.\n"
+)
+
+
+def test_a_partial_read_is_not_reported_as_never_retrieved():
+    """The fix: the message must stop asserting something FALSE."""
+    from ground_truth_citation import PARTIAL
+    findings = analyze(_PARTIAL_TEXT, retrieved=lambda k, v: PARTIAL)
+    assert len(findings) == 1, findings
+    detail = findings[0].detail
+    assert "ONLY IN PART" in detail, detail
+    assert "NOT retrieved this session" not in detail, detail
+
+
+def test_CONTROL_a_partial_read_still_FAILS():
+    """The half that must NOT change, and the alarm-suppressing direction.
+
+    PARTIAL is a truthy STRING, so a `any(verdicts)` truthiness test anywhere on
+    this path would read it as a full retrieval and silently pass the cluster.
+    That is the failure this gate exists to prevent, so it is asserted directly
+    rather than inferred from the message text above."""
+    from ground_truth_citation import PARTIAL
+    findings = analyze(_PARTIAL_TEXT, retrieved=lambda k, v: PARTIAL)
+    assert findings, "PARTIAL silently PASSED -- the alarm-suppressing direction"
+    assert findings[0].kind == "decorative-citation", findings[0].kind
+
+
+def test_CONTROL_never_retrieved_keeps_the_original_wording():
+    """The case the original message was RIGHT about must be untouched."""
+    findings = analyze(_PARTIAL_TEXT, retrieved=lambda k, v: False)
+    assert len(findings) == 1, findings
+    assert "NOT retrieved this session" in findings[0].detail, findings[0].detail
+    assert "ONLY IN PART" not in findings[0].detail, findings[0].detail
+
+
+def test_CONTROL_a_fully_retrieved_citation_still_passes():
+    """Without this, the three tests above are consistent with a gate that
+    flags everything."""
+    assert analyze(_PARTIAL_TEXT, retrieved=lambda k, v: True) == []

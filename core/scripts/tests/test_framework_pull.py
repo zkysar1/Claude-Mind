@@ -58,6 +58,101 @@ def test_tag_status(installed, newest, expected):
     assert fp.tag_status(installed, newest) == expected
 
 
+# --------------------------------------------------------- source-repo resolution
+
+def test_resolve_source_repo_explicit_wins(tmp_path, monkeypatch):
+    """An explicit --source-repo beats env and everything below it."""
+    monkeypatch.setenv("FRAMEWORK_SOURCE_REPO", str(tmp_path / "env-clone"))
+    got = fp.resolve_source_repo(tmp_path, str(tmp_path / "explicit-clone"))
+    assert got == (tmp_path / "explicit-clone").resolve()
+
+
+def test_resolve_source_repo_env_when_no_explicit(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRAMEWORK_SOURCE_REPO", str(tmp_path / "env-clone"))
+    got = fp.resolve_source_repo(tmp_path, None)
+    assert got == (tmp_path / "env-clone").resolve()
+
+
+def test_resolve_source_repo_sibling_when_it_is_a_git_repo(tmp_path, monkeypatch):
+    """No explicit, no env, no conf key -> the ../claude-mind sibling IF it is a repo."""
+    import _paths
+    monkeypatch.delenv("FRAMEWORK_SOURCE_REPO", raising=False)
+    monkeypatch.setattr(_paths, "_read_local_paths", lambda: {})
+    project_root = tmp_path / "serene-mind"
+    project_root.mkdir()
+    sibling = tmp_path / "claude-mind"
+    (sibling / ".git").mkdir(parents=True)
+    assert fp.resolve_source_repo(project_root, None) == sibling.resolve()
+
+
+def test_resolve_source_repo_none_when_nothing_resolves(tmp_path, monkeypatch):
+    """Nothing configured and no sibling repo -> None, so main() prints guidance
+    instead of dying on a bare argparse 'required' error (the flail this fixed)."""
+    import _paths
+    monkeypatch.delenv("FRAMEWORK_SOURCE_REPO", raising=False)
+    monkeypatch.setattr(_paths, "_read_local_paths", lambda: {})
+    project_root = tmp_path / "iso" / "serene-mind"
+    project_root.mkdir(parents=True)
+    assert fp.resolve_source_repo(project_root, None) is None
+
+
+def test_resolve_source_repo_sibling_ignored_when_not_a_git_repo(tmp_path, monkeypatch):
+    """A ../claude-mind that is a plain dir (no .git) is NOT a valid source."""
+    import _paths
+    monkeypatch.delenv("FRAMEWORK_SOURCE_REPO", raising=False)
+    monkeypatch.setattr(_paths, "_read_local_paths", lambda: {})
+    project_root = tmp_path / "serene-mind"
+    project_root.mkdir()
+    (tmp_path / "claude-mind").mkdir()  # exists, but no .git
+    assert fp.resolve_source_repo(project_root, None) is None
+
+
+# ------------------------------------------------- record-installed (git-fed)
+
+def _tagged_repo(tmp_path, tag):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    assert fp.git(repo, "init", "-q")[0] == 0
+    assert fp.git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit",
+                  "-q", "--allow-empty", "-m", "base")[0] == 0
+    if tag:
+        assert fp.git(repo, "tag", tag)[0] == 0
+    return repo
+
+
+def test_record_installed_writes_yaml_for_a_tag_in_this_checkout(tmp_path):
+    repo = _tagged_repo(tmp_path, "v1.2.3")
+    world = tmp_path / "world"
+    result = fp.record_installed(project_root=repo, world_dir=world, tag="v1.2.3",
+                                 verified=True, adopted_from="staging")
+    assert result["ok"] is True
+    doc = fp.parse_installed_release(
+        (world / "installed-release.yaml").read_text(encoding="utf-8"))
+    assert doc["installed_tag"] == "v1.2.3"
+    assert doc["verified"] is True
+    assert doc["adopted_from"] == "staging"
+    assert doc["source_sha"] == fp.tag_sha(repo, "v1.2.3")
+
+
+def test_record_installed_refuses_an_unresolvable_tag(tmp_path):
+    """An unknown tag is an error, never a silent record (C3: the record is the
+    only durable statement of what this deployment runs)."""
+    repo = _tagged_repo(tmp_path, None)
+    world = tmp_path / "world"
+    result = fp.record_installed(project_root=repo, world_dir=world, tag="v9.9.9",
+                                 verified=False)
+    assert result["ok"] is False
+    assert "v9.9.9" in result["error"]
+    assert not (world / "installed-release.yaml").exists()
+
+
+def test_record_installed_defaults_verified_false(tmp_path):
+    repo = _tagged_repo(tmp_path, "v1.0.0")
+    result = fp.record_installed(project_root=repo, world_dir=tmp_path / "w",
+                                 tag="v1.0.0", verified=False)
+    assert result["verified"] is False
+
+
 # ------------------------------------------------------------------ parsing
 
 def test_parse_installed_release_roundtrip():

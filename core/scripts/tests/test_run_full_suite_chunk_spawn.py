@@ -97,7 +97,7 @@ def _fake_tree(tmp_path, n_files, name_len=60):
 
 
 def _run_main(monkeypatch, tmp_path, *, n_files=8, chunks=1, raise_on_pytest=None,
-              argfile_supported=None, pytest_rc=None, name_len=60):
+              argfile_supported=None, pytest_rc=None, name_len=60, extra=()):
     """Drive main() with subprocess stubbed. Returns (rc, spawned_cmds, out_dir).
 
     `pytest_rc` makes the stub return a result carrying that returncode, for the
@@ -144,7 +144,7 @@ def _run_main(monkeypatch, tmp_path, *, n_files=8, chunks=1, raise_on_pytest=Non
     monkeypatch.setattr(RFS, "_populated_agents", lambda *a, **k: (["alpha", "bravo"], None))
     monkeypatch.setattr(RFS.subprocess, "run", _fake_run)
 
-    rc = RFS.main(["--out", str(out), "--chunks", str(chunks)])
+    rc = RFS.main(["--out", str(out), "--chunks", str(chunks)] + list(extra))
     # EXCLUDE THE CAPABILITY PROBE. It is a pytest argv that precedes the chunk
     # loop, so a bare "pytest" in cmd filter counts it as a chunk spawn -- which
     # silently breaks every caller that asserts a SPAWN COUNT (the chunk-count
@@ -612,3 +612,119 @@ def test_a_healthy_chunk_process_is_not_flagged(monkeypatch, tmp_path, capsys):
     assert "NOT A MEASUREMENT" not in text, text
     assert "exit-code check: NOT RUN" not in text, text
     assert rc == 0, text
+
+
+# ── --parallel: xdist workers inside each chunk (2026-09-05) ─────────────────
+#
+# Measured on core/tests/gates (501 tests, 8-core Windows box): sequential 215s,
+# `-n 8 --dist loadfile` 181s (1.19x), `-n 8 --dist load` 98s (2.19x). The
+# loadfile result is the one worth pinning against: it pins a whole FILE to one
+# worker, and test_post_state_update_metric_gate.py owns 8 of the 12 slowest
+# tests (19s/16s/13s/12s...), so seven workers idled while one carried the file.
+# A future edit that "tidies" load -> loadfile would halve the benefit and
+# nothing else in the tree would notice, which is exactly what these pin.
+
+def _pin_xdist(monkeypatch, present):
+    """Pin importlib.util.find_spec("xdist") so these tests do not read whether
+    pytest-xdist happens to be installed on THIS box.
+
+    g-115-9038: the two accept-axis tests below carried no pin, so they read
+    the host's real install state -- GREEN on the box that wrote them (xdist
+    installed) and RED on the reducer (not installed), while the refuse-axis
+    test stayed green in both places. That is guard-2636's signature exactly:
+    a harness that cannot reach the accept path, not a wrong fix. Reproduced
+    by hiding xdist: precisely those two went red. Both preflight branches
+    stay exercised through this one seam (guard-1908).
+    """
+    import importlib.util as ilu
+    real = ilu.find_spec
+    monkeypatch.setattr(
+        ilu, "find_spec",
+        lambda name, *a, **k: ((object() if present else None) if name == "xdist"
+                               else real(name, *a, **k)))
+
+
+def test_default_is_sequential_and_adds_no_xdist_flags(monkeypatch, tmp_path):
+    """DEFAULT OFF is the safety property, not a preference.
+
+    Shared-state races across the 1,187 files in core/scripts/tests are NOT
+    ruled out (rc=0 on 501 gates tests says nothing about them), so the runner
+    must stay strictly sequential unless a caller opts in by name.
+    """
+    _rc, cmds, _out = _run_main(monkeypatch, tmp_path, n_files=6, chunks=1)
+
+    assert cmds, "main() never invoked pytest"
+    for cmd in cmds:
+        assert "-n" not in cmd, "default run must not spawn xdist workers: %r" % (cmd,)
+        assert "--dist" not in cmd, "default run must not set a dist mode: %r" % (cmd,)
+
+
+def test_parallel_passes_n_workers_and_per_TEST_distribution(monkeypatch, tmp_path):
+    """THE REGRESSION: --dist must be `load`, never `loadfile`."""
+    _pin_xdist(monkeypatch, present=True)
+    _rc, cmds, _out = _run_main(monkeypatch, tmp_path, n_files=6, chunks=1,
+                                extra=["--parallel", "8"])
+
+    assert cmds, "main() never invoked pytest"
+    cmd = cmds[0]
+    assert "-n" in cmd, "--parallel must reach pytest as -n: %r" % (cmd,)
+    assert cmd[cmd.index("-n") + 1] == "8", "worker count must be the value passed"
+    assert "--dist" in cmd, "--parallel must set an explicit dist mode: %r" % (cmd,)
+    assert cmd[cmd.index("--dist") + 1] == "load", (
+        "dist mode must be per-TEST `load`; `loadfile` pins a file to one worker "
+        "and measured 1.19x against load's 2.19x on core/tests/gates")
+
+
+def test_parallel_survives_alongside_the_marker_exclusion(monkeypatch, tmp_path):
+    """The -m clause and the xdist flags must COEXIST.
+
+    run-full-suite.py carries a standing warning that a second -m silently voids
+    the first and would repeal the Live-Daemon Exception. The xdist flags are
+    appended after that block, so this pins that appending them neither adds an
+    -m nor drops the existing one (guard-4437, checked rather than assumed).
+    """
+    _pin_xdist(monkeypatch, present=True)
+    _rc, cmds, _out = _run_main(monkeypatch, tmp_path, n_files=6, chunks=1,
+                                extra=["--parallel", "4"])
+
+    cmd = cmds[0]
+    # COUNT ONLY THE PYTEST-LEVEL -m. The argv is
+    # [python, '-u', '-m', 'pytest', ...] -- the interpreter's own `-m pytest`
+    # is a second, unrelated occurrence of the same token, so a naive
+    # cmd.count("-m") is 2 on a perfectly correct command. (This assertion was
+    # written the naive way first and failed on the real argv; the token, not
+    # the code, was the defect -- which is guard-4437's hazard in miniature:
+    # the same flag string meaning two different things in one command line.)
+    after_pytest = cmd[cmd.index("pytest") + 1:]
+    assert after_pytest.count("-m") == 1, \
+        "exactly one pytest-level -m clause, got %r" % (cmd,)
+    assert "not daemon_integration" in after_pytest[after_pytest.index("-m") + 1], \
+        "the daemon exclusion must survive --parallel: %r" % (cmd,)
+    assert "-n" in after_pytest and "--dist" in after_pytest
+
+
+def test_parallel_refuses_early_when_xdist_is_not_installed(monkeypatch, tmp_path,
+                                                             capsys):
+    """Refuse BEFORE any chunk spawns, and say how to fix it.
+
+    Without the preflight, a missing xdist makes pytest reject `-n` at rc=4 on
+    every chunk -- and rc=4 accounting for 0 tests is the shape _is_measurement
+    rejects, so the run would end in a verdict blaming CONTENTION for a missing
+    pip package. The failure must name the package, not the weather.
+    """
+    _pin_xdist(monkeypatch, present=False)
+
+    rc, cmds, _out = _run_main(monkeypatch, tmp_path, n_files=6, chunks=1,
+                               extra=["--parallel", "4"])
+
+    assert rc == 2, "a missing xdist must refuse with rc=2, got %r" % (rc,)
+    assert not cmds, "refusal must precede every chunk spawn, spawned %d" % (len(cmds),)
+    # The SPECIFIC refusal, not the coarse rc (guard-1082): every exit-2 path
+    # emits a void record, and this one shipped without it ().
+    import json as _json
+    recs = [l for l in capsys.readouterr().out.splitlines()
+            if l.startswith(RFS.VOID_RECORD_PREFIX)]
+    assert len(recs) == 1, "exactly one void record expected, got %r" % (recs,)
+    rec = _json.loads(recs[0][len(RFS.VOID_RECORD_PREFIX):])
+    assert rec["cause"] == "xdist-missing", rec
+    assert rec["parallel"] == 4, rec

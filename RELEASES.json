@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.63",
+    "previous_version": "2.12.62",
+    "date": "2026-09-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "update-framework: a discoverable, knowledge-first skill for adopting the newest framework release (git-fed tag merge or transplant framework-pull), framework_pull --record-installed writes world/installed-release.yaml, seed g-002-02 invokes the skill, pull-promotion.md addendum h names the two deployment shapes; hot-path pointers (CLAUDE.md, /respond) route 'update the framework' to it",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.62",
     "previous_version": "2.12.61",
     "date": "2026-09-05",
