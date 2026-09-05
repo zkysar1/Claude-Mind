@@ -389,6 +389,56 @@ def _looks_aborted(text):
     return tally[3] < 100 and not _has_summary_line(text)
 
 
+def _died_silently(text):
+    """True when an aborted log ends ON a bare progress row with no error text.
+
+    This is the `os._exit()` signature and it is worth separating from ordinary
+    contention because the two have OPPOSITE remedies: contention wants a
+    higher chunk rung, a hard exit reproduces at every rung (g-115-9018).
+
+    When a chunk is starved of OS resources, SOMETHING reports it -- a
+    traceback, an INTERNALERROR, a Fatal Python error, a WinError/STATUS_ code.
+    `os._exit()` reports nothing at all: it skips exception handling, atexit
+    and every pytest teardown hook, so the last thing on disk is whatever
+    progress row was mid-flight, and the OS is handed status 0.
+
+    Callers must gate this behind `_looks_aborted` -- on its own it says
+    nothing, because a healthy chunk that has simply not finished writing its
+    summary yet looks identical.
+
+    DELIBERATELY NARROW, and the narrowness is the design. Two sibling causes
+    truncate a log the same way and have DIFFERENT remedies, so each exclusion
+    below defers to a classification that already exists:
+
+      * NUL bytes  -> log corruption (g-115-3387): the sync layer replaced the
+        file while the writer held an fd on the old inode. Remedy is `--out`
+        outside the synced tree. Claiming a hard exit here would send the
+        reader hunting a watchdog that does not exist.
+      * last line ENDS ON a complete `[ NN%]` marker -> an ordinary abort,
+        which run-full-suite has always called contention and which keeps the
+        chunk-ladder remedy on purpose (pinned by
+        test_run_full_suite_hang.test_real_contention_still_reported_as_stopped).
+
+    What is left is the measured signature and only that: the log stops
+    PART-WAY THROUGH a progress row -- dots with no closing percentage marker,
+    because the interpreter vanished between two markers. Under-claiming is the
+    safe direction: a missed silent death falls back to the old generic reason,
+    which is merely uninformative, whereas a false positive actively points the
+    reader at the wrong file.
+    """
+    if "\x00" in text:
+        return False
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    # A BARE progress row -- no trailing `[ NN%]`. That absence is the tell.
+    if not re.match(r"^[.FEsxX]+\s*$", lines[-1]):
+        return False
+    return not re.search(
+        r"INTERNALERROR|Traceback \(most recent call last\)|Fatal Python error"
+        r"|MemoryError|Killed|STATUS_[A-Z_]+|WinError", text)
+
+
 # pytest's own summary line, at the START of a line: "648 passed, 3 warnings in
 # 41.20s" under -q, "===== 648 passed in 41.20s =====" without it. The leading
 # `=*` covers the banner form; `\s*` after it must NOT be allowed to skip over
@@ -591,9 +641,42 @@ def classify(text, failed, chunks=None):
                 % (i, dur, where))
         if _looks_aborted(chunk):
             tally = _progress_tally(chunk)
-            reasons.append(
-                "chunk %02d stopped at %d%% -- it never finished, so the totals "
-                "are missing its tests" % (i, tally[3] if tally else 0))
+            pct = tally[3] if tally else 0
+            if _died_silently(chunk):
+                # IN-PROCESS HARD EXIT, not contention (). The log
+                # ends ON a bare progress row: no traceback, no INTERNALERROR,
+                # no signal notice -- the interpreter was removed from under
+                # pytest by os._exit(), which bypasses every teardown path and
+                # hands the OS status 0. So the chunk "succeeds", contributes
+                # nothing after the stop point, and its remaining results are
+                # erased in silence.
+                #
+                # THIS IS THE ONE ABORT THE CHUNK LADDER CANNOT FIX, which is
+                # why it gets its own reason instead of riding under
+                # `contended`: rungs change how many processes the files are
+                # split across, and a hard exit reproduces in every one of
+                # them. Measured twice -- chunk 04 at 13% () and
+                # chunk 09 at 88% (), the second costing ~2h on the
+                # ladder before a solo re-run falsified the contention premise.
+                # Both were an uncancelled module-level
+                # `threading.Timer(N, lambda: os._exit(0))` reaching a
+                # long-running process through an `exec_module` of a script
+                # that normally lives milliseconds.
+                reasons.append(
+                    "chunk %02d DIED SILENTLY at %d%% -- the log ends on a bare "
+                    "progress row with no traceback and no summary, i.e. an "
+                    "IN-PROCESS HARD EXIT (os._exit) with status 0, not "
+                    "contention. Do NOT climb the chunk ladder: no rung fixes "
+                    "this and every rung reproduces it. Re-run that chunk's "
+                    "file list solo to confirm, then look for a module-level "
+                    "self-destruct watchdog reaching the pytest process -- "
+                    "`grep -rln 'threading.Timer' core/scripts/*.py` and check "
+                    "every exec_module of those files cancels it (guard-2138)."
+                    % (i, pct))
+            else:
+                reasons.append(
+                    "chunk %02d stopped at %d%% -- it never finished, so the "
+                    "totals are missing its tests" % (i, pct))
         elif not hang and _progress_tally(chunk) is None and not re.search(
                 r"\d+\s+(passed|failed)\b", chunk):
             # SILENT-ZERO CHUNK (, 2026-07-27). _looks_aborted returns

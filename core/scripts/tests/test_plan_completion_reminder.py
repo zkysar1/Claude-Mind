@@ -74,6 +74,65 @@ def test_settings_json_wires_hook_exactly_once_on_exit_plan_mode():
     assert any("plan-completion-reminder.sh" in c for c in cmds), cmds
 
 
+# ── task-network harness (plan tool on the wire as TodoWrite, rendered `output`) ──
+
+def _plan_tool_payload(output: str) -> str:
+    # The wire shape a task-network harness hands a PostToolUse shell hook: the Claude Code
+    # contract (tool_name = the Claude Code counterpart, tool_input) plus the tool's rendered
+    # `output`. No `tool_response`/`data` — completion must be read from the render.
+    return json.dumps({
+        "event": "PostToolUse", "tool_name": "TodoWrite", "session_id": "s1", "cwd": "/ws",
+        "tool_input": {"tasks": [{"title": "a"}, {"title": "b"}, {"title": "c"}]},
+        "output": output, "is_error": False,
+    })
+
+
+def test_plan_tool_completion_emits_clear_and_answer():
+    r = _run(_plan_tool_payload(
+        "Current plan (3/3 steps done):\n  [x] t1 a\n  [x] t2 b\n  [-] t3 c — dropped"))
+    assert r.returncode == 0
+    ac = _emitted_context(r)
+    for must in ("Plan COMPLETE", "update_plan with tasks: []", "ORIGINAL request",
+                 "plan finished", "plan-completion-verdict.md"):
+        assert must in ac, must
+
+
+def test_plan_tool_in_progress_is_silent():
+    r = _run(_plan_tool_payload(
+        "Current plan (1/3 steps done):\n  [x] t1 a\n  [~] t2 b  <- current\n  [ ] t3 c"))
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+def test_plan_tool_cleared_is_silent_so_the_asked_for_clear_cannot_refire():
+    r = _run(_plan_tool_payload("Plan cleared."))
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+def test_plan_tool_zero_steps_is_silent():
+    r = _run(_plan_tool_payload("Current plan (0/0 steps done):"))
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+def test_todowrite_without_rendered_output_is_silent():
+    # A Claude Code TodoWrite payload carries tool_response, never `output` — silent by construction.
+    r = _run(json.dumps({"tool_name": "TodoWrite",
+                         "tool_input": {"todos": [{"content": "x", "status": "completed"}]},
+                         "tool_response": {"oldTodos": [], "newTodos": []}}))
+    assert r.returncode == 0
+    assert r.stdout.strip() == ""
+
+
+def test_settings_json_routes_the_plan_tool_matcher_to_the_same_script():
+    s = json.loads(SETTINGS.read_text())
+    hits = [e for e in s["hooks"]["PostToolUse"] if e.get("matcher") == "update_plan"]
+    assert len(hits) == 1, f"expected exactly one update_plan PostToolUse entry, got {len(hits)}"
+    cmds = [h["command"] for h in hits[0]["hooks"]]
+    assert any("plan-completion-reminder.sh" in c for c in cmds), cmds
+
+
 def test_rule_file_carries_anchor_clear_and_answer_clauses():
     rule = RULE.read_text()
     assert "## Original request" in rule            # the durable anchor (rule 1)

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # IRREDUCIBLY LOCAL -- per-tool-call latency budget / hook critical path. Keep local: never add MCP or remote-service indirection here.
-# PostToolUse[ExitPlanMode] hook — plan-completion verdict reminder.
+# PostToolUse[ExitPlanMode | update_plan] hook — plan-completion verdict reminder.
 #
 # Thin bash wrapper. The Python body lives in plan-completion-reminder.py
 # because a heredoc on `python -` would consume stdin before
 # json.load(sys.stdin) runs — same pattern as iteration-close-reminder.sh.
 #
-# Fires AFTER a plan is approved (ExitPlanMode), injecting a <system-reminder>
-# that commands: on completion, CLEAR the plan file and ANSWER the user's
-# original request with a verdict — never end on "plan finished".
+# Fires AFTER a plan is approved (ExitPlanMode), or the moment a task-network
+# plan tool renders every step terminal (matcher update_plan; wire name
+# TodoWrite), injecting a <system-reminder> that commands: CLEAR the plan and
+# ANSWER the user's original request with a verdict — never end on "plan
+# finished". Payload-shape detail: the .py docstring.
 # Rule: .claude/rules/plan-completion-verdict.md
 #
 # SAFETY: fail open on ANY error. Never exits non-zero. Never emits malformed

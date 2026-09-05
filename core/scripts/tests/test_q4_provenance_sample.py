@@ -416,11 +416,16 @@ def test_LIMITATION_citations_to_manifest_UNTRACKED_paths_always_read_decorative
     completely wrong zero. The in-scope assertion below is the positive control
     that makes the out-of-scope ones mean something (guard-2421).
     """
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "_ctx_scope", SCRIPTS / "context-reads.py")
-    cr = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cr)
+    # Use the SHARED loader, never a local exec_module of context-reads.py.
+    # That module arms `threading.Timer(10, lambda: os._exit(0))` at import
+    # scope; uncancelled inside pytest it kills the interpreter ~10s later with
+    # no traceback, no epilogue, no summary line and exit status 0. This call
+    # site did exactly that and voided suite chunk 09 at 88% () —
+    # the same defect the helper's docstring records against chunk 04 at 13%
+    # (). load_context_reads() cancels the timer and asserts `_timer`
+    # still exists, so a rename fails loudly instead of silently re-arming it.
+    from _context_reads_helper import load_context_reads
+    cr = load_context_reads()
     root = SCRIPTS.parent.parent
 
     # POSITIVE CONTROL — a class the manifest really does track.

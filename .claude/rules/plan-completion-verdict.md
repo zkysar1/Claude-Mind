@@ -1,3 +1,8 @@
+---
+description: "When the plan's last step is done, clear the plan and answer the user's ORIGINAL request with a verdict; never end on 'plan finished'."
+alwaysApply: true
+---
+
 # Plan Completion: Clear the Plan, Answer the Question
 
 ## Principle
@@ -8,8 +13,7 @@ When plan execution finishes, the agent owes the ANSWER — the conclusion or
 verdict to the original request, informed by what the plan produced. "Plan
 finished" is a status about the scaffolding, not a deliverable. Ending there
 hands the user a completed plan and an unanswered question (observed
-2026-09-05 as the #1 interactive quirk: agent ends on "plan finished", plan
-left in place, no conclusion).
+2026-09-05: agent ended on "plan finished", plan left in place, no verdict).
 
 Applies whenever plan mode is used (interactive / assistant lane). The
 autonomous loop's analog is goal verification (`return-protocol.md`).
@@ -40,13 +44,3 @@ autonomous loop's analog is goal verification (`return-protocol.md`).
 - Recapping the steps taken without stating what they concluded
 - Answering the question the plan drifted toward instead of the one the user
   originally asked (re-read the anchor)
-- Omitting the anchor section, then being unable to reconstruct the original
-  ask after compression
-
-## Cross-references
-
-- `communication-clarity.md` rule 6 — assert on observed evidence in the verdict
-- `pre-completion-review.md` — re-read your own WORK before declaring done;
-  this rule adds: re-read the ORIGINAL ASK
-- `return-protocol.md` — terminal-call contract for the autonomous loop; this
-  rule governs the interactive plan lane

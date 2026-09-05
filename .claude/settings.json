@@ -555,6 +555,16 @@
         ]
       },
       {
+        "matcher": "update_plan",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/plan-completion-reminder.sh",
+            "timeout": 30
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
