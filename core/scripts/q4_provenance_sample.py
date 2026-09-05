@@ -256,6 +256,30 @@ def retrieved_predicate(session_id: Optional[str]) -> Optional[Callable]:
             "_ctx_reads_for_q4", SCRIPTS / "context-reads.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)                      # type: ignore
+        # CANCEL THE SELF-DESTRUCT WATCHDOG (guard-2138). context-reads.py arms
+        # `threading.Timer(10, lambda: os._exit(0))` at module scope — correct
+        # for the millisecond-lived hook subprocess it was written for, fatal
+        # anywhere long-running. os._exit bypasses the interpreter entirely, so
+        # there is no exception to catch, no atexit, no pytest epilogue, and the
+        # OS sees status 0. This function is called once per analyzed citation,
+        # so it armed a FRESH timer per call: measured 4 live 10s timers after
+        # one 29-test file, and suite chunk 09 died at 88% with rc=0 and no
+        # summary line for exactly this reason ().
+        #
+        # CANCEL DEFENSIVELY, DO NOT ASSERT, and the difference matters here.
+        # guard-2138 says to assert `_timer` exists so a rename fails loudly —
+        # correct for the TEST helper, wrong at this call site for two reasons
+        # measured while writing this fix: (1) tests legitimately point this
+        # loader at a STUB context-reads.py that defines no timer, and (2) the
+        # assert lands inside the `except Exception: return None` below, which
+        # swallows it — so it cannot fail loudly, it just makes the function
+        # return None and the caller SKIP its check. Both directions are the
+        # guard-1760 alarm direction. The rename guarantee is kept where it can
+        # actually fire: _context_reads_helper.load_context_reads() asserts it
+        # against the REAL module, on every test run.
+        _t = getattr(mod, "_timer", None)
+        if _t is not None:
+            _t.cancel()
         entries = mod.read_provenance(session_id=session_id) or []
         # BOTH halves of the tracker, or file citations can never pass.
         # read_provenance() yields ONLY the `#prov:` retrieval-QUERY lines;

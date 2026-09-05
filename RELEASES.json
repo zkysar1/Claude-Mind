@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.61",
+    "previous_version": "2.12.60",
+    "date": "2026-09-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Plan-completion verdict reaches the task-network harness: PostToolUse matcher update_plan (wire TodoWrite) fires the clear-and-answer reminder when the rendered plan reads F/T with F==T; rule pinned alwaysApply (v2.12.60) rides along.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.60",
+    "previous_version": "2.12.59",
+    "date": "2026-09-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Pin plan-completion-verdict for Zak-Code: description + alwaysApply front matter so the lean rules index shows the imperative and the body rides pinned (test_rules_frontmatter_index was red on it in v2.12.59).",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.59",
     "previous_version": "2.12.58",
     "date": "2026-09-05",

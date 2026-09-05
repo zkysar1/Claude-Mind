@@ -98,6 +98,21 @@ def _retrieved_predicate(session_id):
             "_ctx_reads_for_gate", SCRIPTS / "context-reads.py")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)                       # type: ignore
+        # CANCEL THE SELF-DESTRUCT WATCHDOG (guard-2138) — sibling of the same
+        # fix in q4_provenance_sample.py. context-reads.py arms
+        # `threading.Timer(10, lambda: os._exit(0))` at module scope; left
+        # armed it kills any process living >10s with NO traceback and exit
+        # status 0. Harmless while this gate only ever ran as a short-lived
+        # CLI; fatal the moment it is imported into a long-running one
+        # (). Cancel DEFENSIVELY rather than asserting: an assert here
+        # would land inside the `except Exception: return None` below, which
+        # swallows it into a silent SKIP (the guard-1760 alarm direction), and
+        # tests legitimately point loaders like this at a stub with no timer.
+        # The rename guarantee lives where it can fire —
+        # _context_reads_helper.load_context_reads(), against the real module.
+        _t = getattr(mod, "_timer", None)
+        if _t is not None:
+            _t.cancel()
         entries = mod.read_provenance(session_id=session_id) or []
     except Exception:
         return None
