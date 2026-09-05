@@ -306,22 +306,29 @@ def test_cli_lifecycle_marks_pending_dispositions(capsys):
     # ...and the LIVE table's pending set is pinned by name, so a row cannot be
     # declared-but-unbuilt without someone editing this line.
     #
-    # This assertion read `== []` until 2026-09-03, and the tripwire worked
-    # exactly as its comment promised:  added `verify-own-unit` and
-    # this flipped red on the first run. The prompt it carried — "confirm the
-    # marker renders for it too" — was then discharged against the real CLI:
-    #   verify-own-unit  scoped-call(aspirations-verify, mode=...)  [PENDING ]
-    # so the marker is verified for the live row, not merely for the synthetic
-    # one above.
+    # The live pending set is pinned BY NAME, so a row cannot become
+    # declared-but-unbuilt without someone editing this line.
     #
-    # KEEP THIS BY-NAME rather than relaxing to "non-empty". A count-or-presence
-    # assertion would let the NEXT declared-but-unbuilt row slip in silently,
-    # which is precisely the protection the 2026-08-16 rewrite existed to keep
-    # alive when its last subject shipped.
+    # It has now cycled TWICE, both times as designed. It read `== []` until
+    # 2026-09-03, when  declared `verify-own-unit` and this flipped red
+    # on the first run; the prompt it carried was discharged against the real CLI
+    # (`verify-own-unit ... [PENDING ]`), and the list was set to that
+    # one name. Later the same day part1b WIRED the phase — worker-loop Phase 4a
+    # now invokes /aspirations-verify with scope="own-unit" — so the marker was
+    # removed and the set is empty again. That the entry both arrived and left
+    # under this assertion is the evidence the tripwire is alive rather than
+    # ornamental. The wiring itself is pinned in test_worker_execute.py by
+    # test_worker_loop_phase_4a_invokes_the_scoped_verify_before_the_close.
+    #
+    # KEEP THIS BY-NAME rather than relaxing to "non-empty" or deleting it now
+    # that it is empty. A count-or-presence assertion would let the NEXT
+    # declared-but-unbuilt row slip in silently, which is precisely the
+    # protection the 2026-08-16 rewrite existed to keep alive when its last
+    # subject shipped — and an empty list is this assertion's healthy resting
+    # state, not a sign it has nothing left to do.
     assert sorted(
         s for s, d in we.LIFECYCLE_DISPOSITIONS.items() if d.pending_goal
-    ) == ["verify-own-unit"]
-    assert we.LIFECYCLE_DISPOSITIONS["verify-own-unit"].pending_goal == "g-306-417"
+    ) == []
 
 
 def test_existing_phase_cli_surfaces_unchanged():

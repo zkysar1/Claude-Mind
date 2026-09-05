@@ -476,3 +476,146 @@ def test_wrapper_capability_blocked(running_daemon):
         assert "[defer-gate] routing Unblock" not in err
         # Wrapper does NOT print the daemon success shape on a refusal.
         assert not _looks_like_daemon_success_response(out)
+
+
+# ---------------------------------------------------------------------------
+# defer-routing-target gate () — END-TO-END through the wrapper.
+#
+# These are wrapper-level on purpose. The unit tests in
+# core/scripts/tests/test_defer_routing_target.py prove the PREDICATE; only a
+# run through the real wrapper -> daemon -> gate chain proves the gate is
+# REACHABLE. That distinction is the whole reason this goal exists: the sibling
+# defer-target advisory shipped once in core/scripts/aspirations.py alone and
+# emitted nothing through the wrapper, and exhaustive-search-gate (5 firings,
+# all noop) and verify-before-assuming-gate (0 firings) are inert for the same
+# reason. A green unit test says nothing about whether production reaches it.
+# ---------------------------------------------------------------------------
+
+_ROUTING_REGISTRY = """
+## Standing User Grants
+
+| id | scope | granted | source | quote | expires |
+|----|-------|---------|--------|-------|---------|
+| grant-007 | product-repo PR merge | 2026-07-18 | user | "q" | never |
+
+## Standing Lane Pins
+
+| id | agent | in lane | out of lane | set | source | authority | review |
+|----|-------|---------|-------------|-----|--------|-----------|--------|
+| pin-001 | bravo | RUN WORLDS: no-player sessions on dev; in-session verification | ALL CODE work: framework scripts, analyzers, env-server | 2026-08-06 | user directive | user directive only | 2026-11-04 |
+"""
+
+
+def _seed_routing_registry(project_root: Path) -> None:
+    conv = project_root / "world" / "conventions"
+    conv.mkdir(parents=True, exist_ok=True)
+    (conv / "capability-routing.md").write_text(_ROUTING_REGISTRY, encoding="utf-8")
+
+
+def test_wrapper_refuses_defer_routing_to_an_out_of_lane_agent(running_daemon):
+    """A structured defer routing work a lane pin EXCLUDES is refused.
+
+    STRUCTURED on purpose: `is_narrative_defer` is False for every
+    precondition_unmet: value, and 131 of 131 live defers are structured. A gate
+    hung off that predicate would let this through (guard-1802).
+    """
+    project_root, port = running_daemon
+    _seed_routing_registry(project_root)
+    goal_id = _seed_goal(project_root, port)
+
+    rc, out, err = _run(
+        [goal_id, "defer_reason",
+         "precondition_unmet: routed to bravo — rewrite the framework scripts."],
+        project_root=project_root,
+    )
+    assert rc != 0, f"gate did not refuse (rc={rc}); stdout={out}"
+    assert "pin-001" in err, err
+    assert "--force-defer" in err, err
+
+    # The refusal must be side-effect-free: nothing persisted.
+    rc2, out2, _ = _run([goal_id, "status", "pending"], project_root=project_root)
+    assert rc2 == 0
+    assert json.loads(out2).get("defer_reason") in (None, "")
+
+
+def test_wrapper_force_defer_overrides_the_routing_gate(running_daemon):
+    """Outcome 4: the EXISTING --force-defer flag is the override. No second one."""
+    project_root, port = running_daemon
+    _seed_routing_registry(project_root)
+    goal_id = _seed_goal(project_root, port)
+
+    rc, out, err = _run(
+        [goal_id, "defer_reason",
+         "precondition_unmet: routed to bravo — rewrite the framework scripts.",
+         "--force-defer", "user directed this routing on 2026-09-04"],
+        project_root=project_root,
+    )
+    assert rc == 0, f"wrapper exit {rc}: stderr={err}"
+    assert "routed to bravo" in json.loads(out)["defer_reason"]
+
+
+def test_wrapper_refuses_defer_citing_a_nonexistent_grant(running_daemon):
+    project_root, port = running_daemon
+    _seed_routing_registry(project_root)
+    goal_id = _seed_goal(project_root, port)
+
+    rc, out, err = _run(
+        [goal_id, "defer_reason",
+         "precondition_unmet: authorised under grant-099, awaiting the window."],
+        project_root=project_root,
+    )
+    assert rc != 0, f"gate did not refuse (rc={rc}); stdout={out}"
+    assert "grant-099" in err, err
+
+
+def test_wrapper_allows_an_ordinary_structured_defer(running_daemon):
+    """POSITIVE CONTROL (guard-5121). Without this the three refusals above are
+    consistent with a gate that refuses everything, which is the failure mode a
+    refusal-only test set cannot distinguish."""
+    project_root, port = running_daemon
+    _seed_routing_registry(project_root)
+    goal_id = _seed_goal(project_root, port)
+
+    rc, out, err = _run(
+        [goal_id, "defer_reason",
+         "precondition_unmet: the 7-day measurement window closes 2026-09-10."],
+        project_root=project_root,
+    )
+    assert rc == 0, f"clean defer wrongly refused: {err}"
+    assert json.loads(out)["defer_reason"].startswith("precondition_unmet:")
+
+
+def test_wrapper_allows_an_in_lane_routing(running_daemon):
+    """Second positive control: routing TO the pinned agent, INSIDE its lane."""
+    project_root, port = running_daemon
+    _seed_routing_registry(project_root)
+    goal_id = _seed_goal(project_root, port)
+
+    rc, out, err = _run(
+        [goal_id, "defer_reason",
+         "precondition_unmet: routed to bravo to run a no-player session on dev."],
+        project_root=project_root,
+    )
+    assert rc == 0, f"in-lane routing wrongly refused: {err}"
+
+
+def test_wrapper_surfaces_a_routing_advisory_without_refusing(running_daemon):
+    """The advisory lane must REACH the caller, not just the daemon log.
+
+    Daemon stderr goes to the daemon log; only `warnings[]` is re-emitted by the
+    wrapper. An advisory appended anywhere else is invisible to the model, which
+    is the failure the sibling advisory hit (guard-742).
+    """
+    project_root, port = running_daemon
+    _seed_routing_registry(project_root)
+    goal_id = _seed_goal(project_root, port)
+
+    rc, out, err = _run(
+        [goal_id, "defer_reason",
+         "precondition_unmet: blocked until an upstream owner restores the row."],
+        project_root=project_root,
+    )
+    assert rc == 0, f"advisory must not refuse: {err}"
+    assert "defer-routing-target" in err, f"advisory never reached stderr: {err}"
+    assert "ADVISORY" in err, err
+    assert json.loads(out)["defer_reason"].startswith("precondition_unmet:")

@@ -504,3 +504,47 @@ re-verify of a script after a linter/user touch (verify-before-assuming.md)
 is never refused as "already in context." The `is_in_scope` (narrow, dedup)
 vs `is_in_scope_advisory` (wide, recorder+advisory) split in
 `context-reads.py` is the single source of truth for this.
+
+**A BASH-FIRST READ POLICY VOIDS THE IN-SCOPE HALF OF THAT DESIGN** (measured
+2026-09-05, alpha worker Body, `hostname` cc-08, `uname -r` 6.8.0-138-generic,
+g-115-9002). The out-of-scope exclusion above rests on an assumption it never
+states: that reads of IN-scope paths *are* recorded. Only the Read TOOL is —
+`.claude/settings.json` wires `PostToolUse` matcher `Read` to
+`core/scripts/context-reads-record.sh` ("PostToolUse[Read] hook — record file
+reads into context-reads tracker", that script's own header line 3), and there
+is no Bash matcher that records a read at all; the only `PostToolUse` entries
+for `Write`/`Edit`/`MultiEdit` point at `context-reads-invalidate.sh`, which
+un-records rather than records. A session operating under a "prefer Bash
+for reads" instruction (`cat` / `head` / `sed -n` / `grep`, or a wrapper like
+`world-cat.sh`) records nothing, so every in-scope edit draws "has not been
+Read this session" while the agent has in fact read the file in full. That is
+exactly the guaranteed false positive the exclusion exists to prevent,
+reintroduced inside the gate's own scope — and it carries the same cost the
+design names: it desensitizes you to the banner, so the TRUE positives stop
+being read too.
+
+**`record-prov` does NOT clear it — do not reach for the obvious remedy.**
+guard-4407's `context-reads.py record-prov` writes the *provenance* manifest
+(citations); the gate reads the *file-read* tracked set via `check-file`. Two
+different stores. Measured in one pass with both controls:
+
+| probe | result |
+|---|---|
+| `check-file` on a file opened with the Read TOOL this session | empty (no warn) — **positive control**: the check works |
+| `check-file` on an in-scope file not yet read | warns |
+| same file after `cat` + `record-prov --kind retrieval` | **still warns** |
+
+So under a Bash-first policy the ONLY thing that clears this gate is a Read-tool
+read. Practical rule: **when you intend to EDIT an in-scope file, open it with
+the Read tool even if the session's policy prefers Bash for reading.** The
+policy optimises reading; this gate is about editing, and the two have different
+requirements. Reading with Bash and editing anyway is not *wrong* — Rules 1-3
+are the real guarantee and a Bash read satisfies them — but it forfeits the
+backstop and trains you to dismiss the banner.
+
+Corollary when triaging the banner under such a policy: its *firing* is then no
+more informative than its *silence* already was. Neither is evidence about your
+actual context; only your own record of what you read is. Note this is an
+interaction between a session policy and a hook, **not a defect in the gate** —
+the gate is behaving exactly as specified, which is why it will never show up as
+a test failure.

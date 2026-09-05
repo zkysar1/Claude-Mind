@@ -55,6 +55,20 @@ fired ~105% of closes and `end` 82% -- start-without-end is the abbreviated-
 precheck signature. A battery that runs the lanes but skips the stamps leaves the
 banner firing forever; one that writes them clears it by construction.
 
+THE `end` HERE IS `--keep-state`, AND THE FLAG IS THE WHOLE POINT (g-115-9009).
+Writing the stamp and CLOSING the metering window are two different acts, and
+this script must do only the first. The meter `start` above opens the window;
+the 23 deferrable `meter check` calls that consult it live in
+aspirations-precheck-digest.md and execute in the LLM's own turns, AFTER this
+function has returned. A bare `end` unlinks the state file, so before this flag
+existed every one of those checks hit the no-state-file fail-open and returned
+`run` regardless of zone -- the meter's only remaining drop path, inert.
+guard-2832 measured the signature independently: 92 precheck-end records, zone
+`fresh` on all 92, sweeps_ran averaging 3.3 against ~27 metered-tier sweeps.
+Deleting this call instead would fix the window and REGRESS the stamp back to
+82%; `--keep-state` keeps both. The real unlink is the precheck SKILL.md's own
+closing `end` (bare, no flag).
+
 Output (guard-424 fail-loud-on-stderr; guard-614 structured on every exit path):
   default -- a per-STAGE rc table first (so a stage that did not run is visible),
              then FINDINGS ONLY, then selection candidates, then the imperative:
@@ -731,7 +745,16 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
     if report["candidates"].get("error"):
         errors.append("selector: " + report["candidates"]["error"])
 
-    report["meter"]["end"] = _meter("end", runner)
+    # --keep-state (): write the precheck-end SUMMARY stamp here --
+    # precheck-gap-check reads it and start-without-end is the abbreviated-
+    # precheck signature -- but do NOT unlink the state file. The 23 deferrable
+    # `meter check` calls in aspirations-precheck-digest.md run AFTER this
+    # function returns, in the LLM's own turns; closing the window here made
+    # every one of them hit the no-state-file fail-open, so no sweep could ever
+    # drop no matter what the zone was (guard-2832: zone=fresh on 92/92
+    # precheck-end records). The precheck SKILL.md's closing `end` (Phase 2,
+    # bare, no flag) does the real unlink.
+    report["meter"]["end"] = _meter("end", runner, "--keep-state")
 
     # guard-4093: two ORTHOGONAL fields, never collapsed. ANY blind -> partial.
     report["completeness"] = "partial" if report["blind"] else "complete"

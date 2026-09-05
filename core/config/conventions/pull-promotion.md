@@ -107,7 +107,7 @@ verified: true          # set only after C4 passes
 Never infer the installed tag from the working tree — a reconcile leaves the
 tree deliberately unequal to any tag.
 
-## C4 — Verify after adopt, and the rollback is one command
+## C4 — Verify after adopt, and the rollback is SCOPED
 
 Adoption is not complete until the suite is green **on the adopting box**:
 
@@ -120,15 +120,142 @@ the numbers mean nothing, and `GENUINE` can still be false on a chunk-confined
 cluster (`.claude/rules/run-full-suite-after-deep-code.md`). Only on a clean
 verdict set `verified: true` in `world/installed-release.yaml`.
 
-Rollback, single sequence:
+Rollback runs through `framework_pull.rollback()`, which undoes the FRAMEWORK
+and nothing else, then recycles the daemon. Do NOT hand-run a whole-tree hard
+reset — see the normative subsection below for why. Prefer the entry's own
+`rollback_recipe` when it carries one; it is version-specific and outranks the
+generic form.
 
-```bash
-git reset --hard <source_sha of the previous installed_tag>
-bash core/scripts/mind-api-start.sh --restart
+### C4 runs in a worktree PINNED at the adopt commit (normative, g-360-19)
+
+`framework_pull.adopt()` does not run the suite on the live tree. It creates
+`git worktree add --detach <tmp> <adopt-sha>`, bridges the gitignored runtime
+state in, runs `run-full-suite.sh` **there**, and tears the worktree down in a
+`finally`.
+
+**Why.** `run-full-suite`'s `INVALID (tree-moved)` outranks every other verdict
+and voids the whole run, and HEAD moves under a ~40-minute C4 for reasons that
+have nothing to do with the adoption — the adopting Mind's **own** loop is
+enough. Measured 2026-09-02 on coach's box (zc-03): the adopt commit landed at
+22:14Z, the loop's `iteration-push` merge landed on top by 22:16Z while chunk 00
+was still executing. The verdict was going to come back tree-moved, and
+`rollback()` — a `git reset --hard <pre_sha>` — would have taken every
+uncommitted store write the loop made during the run with it. The orchestrator
+had to be killed by hand to prevent that (guard-5846). Pinning makes the verdict
+a property of the adopted commit instead of a race against the loop.
+
+**The five gitignored files the worktree does not inherit** —
+`framework_pull.WORKTREE_RUNTIME_STATE` (repo-scoped) plus `AGENT_RUNTIME_STATE`
+(agent-scoped, templated on the agent name) are the SSOT; this list is their reading:
+
+| item | mode | absent ⇒ |
+|---|---|---|
+| `agents/<agent>/local-paths.conf` | copy | `WORLD_DIR`/`META_DIR` resolve EMPTY — 0 passed / 106 errors, an INVALID run that reads as a catastrophic regression |
+| `.env.local` | copy (mode preserved) | the invisible + domain halves fail `ERROR: .env.local not found`; `--triage` cannot see it because triage reads the CHUNK logs only |
+| `mind_api/state/daemon.port` | **symlink** | `daemon not reachable`. A *copy* goes stale when the daemon recycles mid-run, and a `test -f` check cannot detect staleness — only the value can |
+| `.mind-data` | symlink | on a `.mind-data` deployment `_paths._resolve_tier` skips tiers 2–3 (both gated on the dir existing); with no `local-paths.conf` it returns `None` |
+| `agents/<agent>/session/<working-memory file>` | copy | `test-wm-prune-cadence-protection.sh` dies `cp: cannot stat ...`, rc=1. COPY not symlink: the live loop rewrites it continuously and a scratch suite may write to it, so a symlink would let a verify run mutate the agent-wide working memory — the inverse of `daemon.port`, where staleness is the hazard and mutation is impossible |
+
+Read `guard-5253`'s own generalization before extending that table: do not
+memorize the list, ask what NON-GIT state the run reads. Each entry above cost a
+voided run, and every one failed as a plausible catastrophic regression rather
+than as a config error.
+
+**Teardown is not hygiene, it is correctness.** A leftover worktree makes
+`.git/worktrees` exist, and that reds other tests (guard-5842). Keep every log
+OUTSIDE the worktree — a log written inside it wedges the teardown with
+`handle still busy`.
+
+### The domain half does not gate adoption (normative, decided g-360-19)
+
+**The question:** does a red DOMAIN half flip `run-full-suite.sh`'s rc and
+therefore block every framework adoption on that box?
+
+**Measured answer: YES, it did.** `core/scripts/run-full-suite.sh:461-465` is
+the whole exit contract:
+
+```sh
+if [ "$FRAMEWORK_RC" -ne 0 ]; then exit "$FRAMEWORK_RC"; fi
+if [ "$INVISIBLE_RC" -ne 0 ]; then exit 1; fi
+if [ "$DEFERRED_RC"  -ne 0 ]; then exit 1; fi
+if [ "$DOMAIN_RC"    -ne 0 ]; then exit 1; fi
+exit 0
 ```
 
-Prefer the entry's own `rollback_recipe` when it carries one — it is
-version-specific and outranks this generic form.
+A domain red yields rc=1, `suite_is_green` required `rc == 0`, so C4 went red and
+`rollback()` fired — on a box whose framework was perfectly healthy. The domain
+half is deployment-owned (coach's yahoo tests need live third-party API access);
+a deployment whose domain tests cannot pass in its own environment would be
+locked out of **every** framework adoption, permanently, by a signal that says
+nothing about the framework.
+
+**The decision:** `suite_is_green(rc, verdict, halves)` scopes the gate to the
+framework-owned halves — the chunked pytest `VERDICT` plus `invisible` and
+`deferred`. A red in `domain` is REPORTED (it rides in the adopt result's
+`verify` step under `halves`) and does not block.
+
+Three properties hold it honest, and none may be dropped:
+
+1. **The verdict still gates.** A non-`CLEAN` chunked verdict is red regardless
+   of the halves. The scoping only ever reinterprets the *exit code*.
+2. **Fail-safe on missing evidence.** With `halves` absent or unreadable the
+   predicate is byte-for-byte the old strict `rc == 0`. Missing evidence never
+   turns a red run green — the loosening requires positive proof of which half
+   was red.
+3. **An unexplained rc stays red.** Green requires that at least one
+   deployment-owned half actually accounts for the non-zero rc. Every half
+   reading clean beside `rc=1` is a contradiction, not a pass.
+
+`halves` comes from `<log-dir>/halves.jsonl`, which the runner writes itself
+(`_record_half`); the log dir is resolved by calling the runner's own
+`run-full-suite.py --print-out-dir`, never by re-deriving its default layout.
+
+### Rollback is framework-SCOPED, and adopt checkpoints first (normative, g-360-17)
+
+`rollback()` used to be `git reset --hard <pre_sha>`. On a Mind whose loop is
+running — which is the normal case, since C5 asks each Mind to pick its own
+window rather than to stop — that is a whole-tree undo of work the adoption
+never touched. The loop writes its governed stores (the goal queue, the
+changelog, the journal) continuously through the ~40-minute C4 suite, and every
+one of those uncommitted writes went with the reset.
+
+Measured 2026-09-02 on zc-03 while adopting v2.12.48: the plan's disjointness
+step REPORTED 3 dirty tracked store files and proceeded — correctly, since
+disjoint work cannot be clobbered by the *copy*. But "not clobbered by the copy"
+is not "safe": a red or voided verdict routes the tree through rollback, and
+there the disjointness is irrelevant. `guard-5846` carries the incident and the
+interim hand procedure.
+
+Two changes close it, and the goal asked for both because they fail
+independently:
+
+1. **`adopt()` checkpoints dirty TRACKED files before the copy** — `git add` +
+   `git commit --no-verify` with a `chore(pull): checkpoint N dirty file(s)`
+   subject, reported as the `checkpoint-dirty` step. Untracked files are left
+   alone: nothing in the rollback path touches them. `--no-verify` for the same
+   install-time reason as the adopt and re-graft commits (the githook chain
+   gates AUTHORING; an adoption installs already-gated content).
+2. **`rollback()` is scoped** — `git reset --soft <source_sha>` (HEAD moves;
+   index and working tree do not), then `git checkout <source_sha> -- <the
+   framework paths that existed there>` and `git rm -rf` for the ones the
+   adoption ADDED. The path set is read from `promotion-preflight.py` via
+   `framework_paths()`, never re-declared. When that set cannot be resolved,
+   rollback REFUSES rather than widening back to the tree.
+
+The two are not redundant. Mutation-proved on cc-13 (g-360-17): reverting only
+`--soft` to `--hard` reds the store-survival test, the end-to-end red-verify
+test, and the source pin — the checkpoint alone does not save the content,
+because a hard reset to the pre-adopt sha discards the checkpoint commit too.
+
+Restoring the framework paths that EXISTED at the sha is deliberately split
+from removing the ones that did not: one pathspec absent at that sha makes
+`git checkout` fail for the whole batch and restore NOTHING — the `guard-5011`
+shape, one command over. Tests assert the COMMIT (`git show <ckpt>:<path>`),
+never the working tree, for the reason `guard-5011` states: a working-tree
+assertion passes whether or not anything was committed, and it did — the first
+draft of the checkpoint parser sliced `git status --porcelain` at a fixed
+offset, ate a character off every path, and git refused the pathspec rc=128.
+Only the commit assertion caught it.
 
 ## C5 — Quiesce: time adoption inside YOUR OWN idle window
 

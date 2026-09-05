@@ -16,7 +16,9 @@ import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from _bash_helpers import resolve_winpath  # noqa: E402
 from recurring_tally import TALLY_FIELDS, compute, read_goal  # noqa: E402
 
 NOW = "2026-08-29T03:00:00"
@@ -129,7 +131,10 @@ def test_worker_branch_is_role_guarded_so_the_reducer_cannot_double_count():
     here would add a second increment to every reducer close. The guard is the
     load-bearing half of this change; assert the call site is inside it.
     """
-    src = (SCRIPTS / "iteration-close.sh").read_text(encoding="utf-8")
+    # Resolve the `_winpath` path helper before pinning the call shape --
+    # see _bash_helpers.resolve_winpath (a normalizer, not a loosened pattern).
+    src = resolve_winpath(
+        (SCRIPTS / "iteration-close.sh").read_text(encoding="utf-8"))
     # Anchor on the INVOCATION, not the module name: the name also appears in
     # the block comment above, and anchoring there passed over ~700 characters
     # of prose instead of the code. (This assertion caught exactly that on its
@@ -229,7 +234,10 @@ def test_recurring_close_declares_tally_ownership_around_its_verify_call():
 
 def test_do_verify_defers_to_a_declared_tally_owner():
     """The condition must test BOTH halves, not just the role."""
-    src = (SCRIPTS / "iteration-close.sh").read_text(encoding="utf-8")
+    # Resolve the `_winpath` path helper before pinning the call shape --
+    # see _bash_helpers.resolve_winpath (a normalizer, not a loosened pattern).
+    src = resolve_winpath(
+        (SCRIPTS / "iteration-close.sh").read_text(encoding="utf-8"))
     marker = "g-115-6768: WORKER-ONLY recurring-tally advance"
     call = 'python3 "$SCRIPT_DIR/recurring_tally.py"'
     window = src[src.index(marker):src.index(call)]

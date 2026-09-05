@@ -147,10 +147,15 @@ def store_name(day=None):
 def firings_paths(meta_dir=None):
     """Ordered paths comprising the gate-firings store, oldest-first.
 
-    Today this is the single legacy file, so callers are byte-identical to
-    reading it directly. Once the writer emits `gate-firings-YYYY-MM-DD.jsonl`
-    segments, they are appended in lexical (== chronological, ISO dates) order
-    and consumers pick them up with no change.
+    The store is the legacy file PLUS every `gate-firings-YYYY-MM-DD.jsonl`
+    segment, appended in lexical (== chronological, ISO dates) order. Reading
+    the legacy file alone is NOT equivalent and has not been since the segment
+    writer flipped on: measured 2026-09-05 (alpha, cc-04) the legacy file held
+    174,493 of 354,624 rows across 21 paths, so a consumer that reads it
+    directly silently drops 51% of the corpus. This docstring said the
+    opposite until then and cost a real measurement (g-115-5311, which scanned
+    only the legacy file on its first pass). Enumerate through this function;
+    never hand-roll the path.
 
     Excludes the machine-local spool files, which share the `gate-firings-`
     stem but are NOT part of the shared store (they are drained into it by

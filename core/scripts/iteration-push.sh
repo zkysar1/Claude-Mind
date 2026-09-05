@@ -235,6 +235,74 @@ if [ -n "$GITDIR" ] && [ -f "$GITDIR/index.lock" ]; then
   soft_exit 0
 fi
 
+# NOTE ON PLACEMENT (): this helper is defined ABOVE the tree-lock gate rather
+# than beside its other call site, because the gate itself now calls it. PURE RELOCATION —
+# the body below is byte-identical to where it previously lived, and every variable it
+# reads ($REPO, $DRY_RUN, $IP_TMO, $WORKER_REF_AGENT/$WORKER_REF_SID) is set by line 210,
+# well above both this point and the gate.
+# --- Worker carrier push () ----------------------------------------
+# The carrier push is INDEPENDENT of shared-tree integration. refs/workers/<agent>/<sid>
+# has exactly ONE writer by construction and touches no shared branch, so whether
+# `merge $UPSTREAM` succeeded, conflicted, or deferred says nothing about whether this
+# Body's HEAD should reach the reducer. The ref carries HEAD; integrating origin/main is
+# orthogonal to that.
+#
+# Before this helper existed the push lived ONLY in the block at the integrate/push seam
+# below, and every deferral path soft_exit'd past it. Measured 2026-08-16 (alpha worker
+# Body, cc-07): a 1-line diff in agents/zeta/aspirations.jsonl — a partner store file this
+# Body never touched, left dirty as ordinary own-cloud read-through-cache background state
+# — deferred the merge, so the commit never reached the reducer while the script exited 0.
+# On an own-cloud fleet box that condition is routine, not rare, and the worker neither
+# controls it nor has reason to notice it.
+#
+# Returns 0 when pushed / dry-run / not requested; 1 on unresolved identity or push failure.
+_ip_push_worker_ref() {
+  [ "$PUSH_WORKER_REF" = 1 ] || return 0
+  # Idempotence guard: the deferral seam and the seam block below are mutually
+  # exclusive today, but a future seam must not be able to double-push.
+  [ "${_IP_WREF_DONE:-0}" = 1 ] && return "${_IP_WREF_RC:-0}"
+  _IP_WREF_DONE=1
+  if [ -z "$WORKER_REF_AGENT" ] || [ -z "$WORKER_REF_SID" ]; then
+    log "--push-worker-ref: REFUSED — agent/sid unresolved (MIND_AGENT='$WORKER_REF_AGENT', MIND_SID='$WORKER_REF_SID')."
+    log "  A ref missing either segment would collide across bodies, which is the one property this carrier exists to guarantee."
+    _IP_WREF_RC=1; return 1
+  fi
+  WREF="refs/workers/${WORKER_REF_AGENT}/${WORKER_REF_SID}"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "--push-worker-ref (dry-run): would push HEAD -> $WREF"
+    _IP_WREF_RC=0; return 0
+  fi
+  # No --force. The ref only ever advances for a given body (HEAD moves forward
+  # through commits and merges), so a non-fast-forward here means an assumption
+  # broke — single-writer, or a reset — and it should be LOUD rather than
+  # silently overwritten.
+  if $IP_TMO git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
+    log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> REMOTE $WREF"
+    log "  verify with 'git ls-remote origin $WREF', NOT 'git rev-parse $WREF'. This push writes the REMOTE ref only."
+    log "  A local refs/workers/... ref exists only because some consumer fetched '+refs/workers/*:refs/workers/*'"
+    log "  earlier; it does NOT advance on this push, so rev-parse returns a PLAUSIBLE STALE sha from a previous"
+    log "  unit and the natural verification reports a false NO (g-306-313, guard-1250)."
+    # DEPENDENCY-PULL PRODUCER, worker lane (). The carrier has just
+    # LANDED, which is precisely the event the drain goal exists to consume — so
+    # the pull is stamped HERE, as an invariant of the push transition
+    # (guard-403), rather than as a second line in worker-loop's Phase 3.8.
+    # Three reasons this beats the SKILL.md call the goal originally specified:
+    # it fires on the real event instead of on an LLM remembering a step, it
+    # costs zero bytes of the hot-path prose budget, and the detection lives in
+    # exactly one place. pull-signal-set.sh is self-gating — it no-ops unless
+    # this push carried non-merge framework content, and no-ops again if a live
+    # signal is already stamped — so calling it unconditionally here is correct.
+    # STRICTLY ADVISORY: rc swallowed. A carrier push must never fail because a
+    # rank hint could not be written.
+    if [ -x "$SCRIPT_DIR/pull-signal-set.sh" ]; then
+      log "  pull: $(bash "$SCRIPT_DIR/pull-signal-set.sh" --if-carrier-content 2>&1 | head -1)"
+    fi
+    _IP_WREF_RC=0; return 0
+  fi
+  log "--push-worker-ref: push FAILED for $WREF — this Body's framework edits and local commits have NOT reached the reducer"
+  _IP_WREF_RC=1; return 1
+}
+
 # Skip if a CO-RESIDENT BODY holds the working tree (). Sibling of the
 # index.lock skip above and deliberately placed beside it: same semantics ("some
 # other process is mid-operation on this tree; come back next cycle"), different
@@ -280,6 +348,39 @@ if [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
   # suite runner's __file__-derived one name the same lock file.
   _TL_OUT="$(bash "$SCRIPT_DIR/tree-lock.sh" check --project-root "$REPO" 2>&1)"; _TL_RC=$?
   if [ "$_TL_RC" -eq 1 ]; then
+    # PUBLISH-ONLY DEGRADE (). A held lock used to end the invocation for
+    # EVERY mode, --push-worker-ref included, and that starved a real obligation:
+    # guard-5291 requires a forged/amended SKILL.md to be pushed in the SAME iteration
+    # its forged-skills.yaml row lands (the row syncs fleet-wide instantly, the SKILL.md
+    # travels only by git), and a co-resident suite can hold this lock for up to 90
+    # minutes. The obligation became unsatisfiable through no fault of the Body holding it.
+    #
+    # WHAT IS EXEMPT IS COMPUTED, NOT PATTERN-MATCHED (guard-2860). The exemption is NOT
+    # "--push-worker-ref is safe" — measured, it is NOT: in its production arg shape the
+    # flag runs fetch+integrate BEFORE the push and MOVES HEAD (cc-13 2026-09-04, hermetic
+    # repo, HEAD e2fb295 -> 0bd7dd4 on a --push-worker-ref with no --dry-run; and on the
+    # real tree the same call logged "integrated 64 origin commit(s) into main"). Exempting
+    # the flag as filed would let a worker merge into a tree whose co-resident Body is
+    # mid-suite — VERDICT: INVALID (tree-moved), the verdict that voids an entire run, and
+    # exactly the interference this lock exists to prevent.
+    # NOTE the near-miss for whoever revisits this: the SAME flag with --dry-run does NOT
+    # integrate, so a dry-run probe "confirms" the safe-by-nature reading. That is the
+    # canonical-invocation trap (probe-with-canonical-code-path.md).
+    #
+    # So the exempt path is CONSTRUCTED here rather than assumed: call ONLY the carrier
+    # push and exit. _ip_push_worker_ref touches no working tree — it resolves identity and
+    # runs one `git push origin HEAD:refs/workers/<agent>/<sid>` — so the publish half is
+    # genuinely safe while the integrate half never runs. The three merge sites below stay
+    # gated by construction, because control never reaches them (guard-3448: the gate keeps
+    # its breadth; nothing is relaxed, one safe action is hoisted ABOVE it).
+    #
+    # The Body is simply one integrate behind for this cycle and catches up next cycle,
+    # which is what the unmodified gate already did — minus the starvation.
+    if [ "$PUSH_WORKER_REF" = 1 ]; then
+      log "tree-lock: held — DEGRADING --push-worker-ref to PUBLISH-ONLY (carrier push only; no fetch, no merge, HEAD not moved). ${_TL_OUT}"
+      _ip_push_worker_ref; _TL_WREF_RC=$?
+      soft_exit "$_TL_WREF_RC"
+    fi
     log "tree-lock: a co-resident Body holds this working tree — skip, retry next iteration. ${_TL_OUT}"
     soft_exit 0
   elif [ "$_TL_RC" -ne 0 ]; then
@@ -1172,68 +1273,6 @@ _selfheal_cross_agent_churn_remerge() {
   return 1
 }
 
-# --- Worker carrier push () ----------------------------------------
-# The carrier push is INDEPENDENT of shared-tree integration. refs/workers/<agent>/<sid>
-# has exactly ONE writer by construction and touches no shared branch, so whether
-# `merge $UPSTREAM` succeeded, conflicted, or deferred says nothing about whether this
-# Body's HEAD should reach the reducer. The ref carries HEAD; integrating origin/main is
-# orthogonal to that.
-#
-# Before this helper existed the push lived ONLY in the block at the integrate/push seam
-# below, and every deferral path soft_exit'd past it. Measured 2026-08-16 (alpha worker
-# Body, cc-07): a 1-line diff in agents/zeta/aspirations.jsonl — a partner store file this
-# Body never touched, left dirty as ordinary own-cloud read-through-cache background state
-# — deferred the merge, so the commit never reached the reducer while the script exited 0.
-# On an own-cloud fleet box that condition is routine, not rare, and the worker neither
-# controls it nor has reason to notice it.
-#
-# Returns 0 when pushed / dry-run / not requested; 1 on unresolved identity or push failure.
-_ip_push_worker_ref() {
-  [ "$PUSH_WORKER_REF" = 1 ] || return 0
-  # Idempotence guard: the deferral seam and the seam block below are mutually
-  # exclusive today, but a future seam must not be able to double-push.
-  [ "${_IP_WREF_DONE:-0}" = 1 ] && return "${_IP_WREF_RC:-0}"
-  _IP_WREF_DONE=1
-  if [ -z "$WORKER_REF_AGENT" ] || [ -z "$WORKER_REF_SID" ]; then
-    log "--push-worker-ref: REFUSED — agent/sid unresolved (MIND_AGENT='$WORKER_REF_AGENT', MIND_SID='$WORKER_REF_SID')."
-    log "  A ref missing either segment would collide across bodies, which is the one property this carrier exists to guarantee."
-    _IP_WREF_RC=1; return 1
-  fi
-  WREF="refs/workers/${WORKER_REF_AGENT}/${WORKER_REF_SID}"
-  if [ "$DRY_RUN" = 1 ]; then
-    log "--push-worker-ref (dry-run): would push HEAD -> $WREF"
-    _IP_WREF_RC=0; return 0
-  fi
-  # No --force. The ref only ever advances for a given body (HEAD moves forward
-  # through commits and merges), so a non-fast-forward here means an assumption
-  # broke — single-writer, or a reset — and it should be LOUD rather than
-  # silently overwritten.
-  if $IP_TMO git -C "$REPO" push origin "HEAD:$WREF" >/dev/null 2>&1; then
-    log "--push-worker-ref: pushed HEAD ($(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)) -> REMOTE $WREF"
-    log "  verify with 'git ls-remote origin $WREF', NOT 'git rev-parse $WREF'. This push writes the REMOTE ref only."
-    log "  A local refs/workers/... ref exists only because some consumer fetched '+refs/workers/*:refs/workers/*'"
-    log "  earlier; it does NOT advance on this push, so rev-parse returns a PLAUSIBLE STALE sha from a previous"
-    log "  unit and the natural verification reports a false NO (g-306-313, guard-1250)."
-    # DEPENDENCY-PULL PRODUCER, worker lane (). The carrier has just
-    # LANDED, which is precisely the event the drain goal exists to consume — so
-    # the pull is stamped HERE, as an invariant of the push transition
-    # (guard-403), rather than as a second line in worker-loop's Phase 3.8.
-    # Three reasons this beats the SKILL.md call the goal originally specified:
-    # it fires on the real event instead of on an LLM remembering a step, it
-    # costs zero bytes of the hot-path prose budget, and the detection lives in
-    # exactly one place. pull-signal-set.sh is self-gating — it no-ops unless
-    # this push carried non-merge framework content, and no-ops again if a live
-    # signal is already stamped — so calling it unconditionally here is correct.
-    # STRICTLY ADVISORY: rc swallowed. A carrier push must never fail because a
-    # rank hint could not be written.
-    if [ -x "$SCRIPT_DIR/pull-signal-set.sh" ]; then
-      log "  pull: $(bash "$SCRIPT_DIR/pull-signal-set.sh" --if-carrier-content 2>&1 | head -1)"
-    fi
-    _IP_WREF_RC=0; return 0
-  fi
-  log "--push-worker-ref: push FAILED for $WREF — this Body's framework edits and local commits have NOT reached the reducer"
-  _IP_WREF_RC=1; return 1
-}
 
 # _ip_defer_exit: EVERY integrate-deferral seam exits through here, so the worker
 # carrier is flushed BEFORE the exit. Routing all three seams (conflict-abort,

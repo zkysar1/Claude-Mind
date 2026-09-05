@@ -267,7 +267,7 @@ ELSE:
     FOR EACH e in disagreement[:3]:
         Output: "▸ SIGNAL DISAGREEMENT: {e.goal_id} blocked {e.days_blocked}d — blocked_by resolved={e.blocked_by_resolved} but blocker_ref resolved={e.blocker_ref_resolved}. Do NOT unblock; reconcile the stale half instead."
     FOR EACH e in dangling_ref[:3]:
-        Output: "▸ DANGLING BLOCK REF: {e.goal_id} blocked {e.days_blocked}d — {e.blocker_ref_why}. Can never auto-clear; repoint or remove the reference."
+        Output: "▸ DANGLING BLOCK REF: {e.goal_id} blocked {e.days_blocked}d — {e.blocker_ref_why}. Confirm ABSENT in its home world before removing."
     IF routing_suppressed_count > 0:
         Output: "▸ routing: {routing_suppressed_count} hit(s) already routed by an agent within {routing_cooldown_hours}h — breadcrumb suppressed, not re-posted"
     IF routing_post_failed is non-empty:
@@ -666,6 +666,45 @@ IF files_scanned == 0: surface READ FAILURE. ELIF tier_counts["active-scope"] ==
 ELSE: surface the count; pull rows with `--tier active-scope --json`, route by lane.
 ```
 
+
+## Phase 0.5b.23
+
+Rationale (WHY a separate lane, the three-tool coverage table, the four
+keep-safe release conditions, holder-liveness independence):
+`core/config/rationale/abandoned-claim-lane.md`
+
+```
+# 0.5b.23 abandoned-claim-check — a goal sitting status=in-progress with
+# claimed_by set while NO in-flight row of EITHER shape names it. The population
+# falls BETWEEN the three existing claim tools, so none of them reports it:
+# clear-stale-claims is terminal-only, claim-liveness-check asks "is this claim
+# still MINE", claim-integrity-check asks about field damage (guard-6002).
+Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check abandoned-claim-check)
+Bash: bash core/scripts/abandoned-claim-check.sh --json
+# THE `.sh` IS LOAD-BEARING, not a style preference (guard-3864, g-115-6188):
+# only the wrapper sources _paths.sh, reads team-state through
+# team-state-read.sh, and passes --authoritative. A bare
+# `py -3 core/scripts/abandoned-claim-check.py` reads whatever file it is handed
+# — and under own-cloud the local tree is a read-through cache (guard-980), so a
+# thin mirror shows ZERO in-flight rows: the whole fleet reads as abandoned.
+IF the wrapper failed OR scanned_goals == 0: surface UNRELIABLE and STOP — a
+   zero over an unread population is not a measurement (rb-245, guard-2298).
+ALWAYS report claimed_in_progress and in_flight_rows BESIDE abandoned_count:
+   "1 of 1 scanned" and "1 of 400 scanned" are different findings (guard-3830).
+IF authoritative is false: report, release NOTHING — the read was a mirror.
+ELIF abandoned_count == 0: continue silently to Phase 0.5c.
+ELSE: surface each row with claimed_by, age_minutes and hold_reasons.
+   REPORT-ONLY from this lane. `--apply` exists on the wrapper and is
+   deliberately NOT invoked here (guard-4000 keep-safe): releasing a partner's
+   live claim is the exact failure this detector exists to avoid causing.
+   Route by lane (guard-1007) — the HOLDER releases its own claim, or file ONE
+   consolidated Investigate naming the ids.
+# Holder liveness is INPUT TO DISPOSITION, NEVER TO DETECTION. The first live
+# run found a 62h-old abandoned claim whose holder was alive 4 minutes earlier
+# (own writer — not the guard-3604 cross-agent-clear false positive). An agent
+# that moved on and left a claim behind is alive AND abandoned; gating the
+# predicate on liveness would miss precisely that case.
+```
 
 ## Phase 0.5c
 

@@ -2384,43 +2384,72 @@ def _swap_floor() -> float:
     return 0.25
 
 
-def _notify_critical_memory(subject: str, message: str) -> dict:
+def _notify_decision_needed(subject: str, message: str, *,
+                            allow_duplicate: Optional[str] = None) -> dict:
     """Best-effort human alert through the FRAMEWORK notification chokepoint.
 
-    Routes via notify-user.sh, which resolves the domain's transport slot --
-    core never names an address or a transport (domain-free-examples.md).
-    The probe's box-local alert state (MemoryHeadroomProbe._save_box_state)
-    is the ONLY thing standing between this call and a per-tick mail loop:
-    notify_dispatch's duplicate gate fingerprints the first 400 chars of the
-    body, and every tick's numbers differ, so it never matches; and the
-    category is decision-needed, which is always sent. Until 2026-09-02 the
-    dedup rode the per-agent tick state, which is mirrored across boxes and
-    re-armed on every cross-box tick -- measured 1,696 emails in four days.
+    THE ONE mail path in this file, shared by MemoryHeadroomProbe (via the
+    `_notify_critical_memory` name below) and PeerLivenessProbe. Routes via
+    notify-user.sh, which resolves the domain's transport slot -- core never
+    names an address or a transport (domain-free-examples.md, guard-945).
+
+    Each caller's box-local alert state is the ONLY thing standing between this
+    call and a per-tick mail loop: notify_dispatch's duplicate gate fingerprints
+    the first 400 chars of the body, so a body whose head changes every tick
+    never matches; and the category is decision-needed, which is always sent.
+    Until 2026-09-02 the memory dedup rode the per-agent tick state, which is
+    mirrored across boxes and re-armed on every cross-box tick -- measured
+    1,696 emails in four days.
+
+    `allow_duplicate` is the deliberate override for a RE-alert whose body head
+    is identical to an earlier send by design (PeerLivenessProbe re-pages the
+    same frozen episode after its re-alert window): it is forwarded verbatim as
+    notify-user.sh's `--allow-duplicate '<what is new>'` and recorded in the
+    outreach ledger. Never pass it on a first send.
 
     FAIL-OPEN, always: a watchdog that dies because email is down is worse
     than the condition it was reporting. Every failure mode is captured into
     the returned dict and folded into the event payload instead of raised.
+
+    INERT UNDER PYTEST unless AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST is set. The
+    induced-pressure tests monkeypatch _mem_total_kb/_claude_rss_kb and then
+    call check() for real, so without this every suite run MAILS A HUMAN a
+    fixture payload (pid 4242, 7.0/8.0 GiB, 87.5%) describing a machine that
+    exists nowhere. Measured 2026-09-04 (g-115-8955): 6,042 outreach rows
+    across 12 boxes, ONE distinct mem_total_gib. Sibling _box_state_path()
+    already refuses under pytest for the same reason -- which is also WHY this
+    never self-limited: with no box-state to load, self.over is False on every
+    fresh probe, so the hysteresis that would gate a real episode re-fires on
+    every run (cc-13: 144 rows, median gap 1.0s).
+    Same PYTEST_CURRENT_TEST chokepoint as the daemon-spawn refusal
+    (g-115-3329) and the _gate_log suppression (g-248-102). Emitter-side by
+    guard-1041: a test-side stub alone fixes only the tests that exist today.
     """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+            "AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST"):
+        return {"sent": False, "reason": "suppressed under pytest"}
     try:
         from _runtime_bash import bash_cmd
         script = Path(__file__).resolve().parent / "notify-user.sh"
         if not script.is_file():
             return {"sent": False, "reason": "notify-user.sh absent"}
+        # decision-needed, NOT blocker. Verified by dry-run: the routing gate
+        # SUPPRESSES 'blocker' as "a status report the fleet can handle itself"
+        # and re-routes it to the findings board -- the same silent fate this
+        # whole notification exists to escape. 'decision-needed' is an
+        # ALWAYS_SEND category, and it is the honest one: the fleet cannot add
+        # RAM, restart a dead peer's terminal, or reboot a host, so a human
+        # genuinely has to decide.
+        argv = ["--category", "decision-needed", "--subject", subject, "--message", message]
+        if allow_duplicate:
+            argv += ["--allow-duplicate", str(allow_duplicate)]
         # bash_cmd resolves BASH explicitly (guard-580: a bare "bash" argv[0]
         # reaches the System32 WSL stub on win32 and can HANG FOREVER -- the
         # worst possible failure for an alert path) and passes the script via
         # as_posix (guard-581: bash strips the backslashes of a str(WindowsPath)
         # and silently resolves a nonexistent file).
         proc = subprocess.run(
-            # decision-needed, NOT blocker. Verified by dry-run: the routing
-            # gate SUPPRESSES 'blocker' as "a status report the fleet can handle
-            # itself" and re-routes it to the findings board -- the same silent
-            # fate this whole notification exists to escape. 'decision-needed'
-            # is an ALWAYS_SEND category, and it is the honest one: the fleet
-            # cannot add RAM, set a per-container cap, or reboot a host, so a
-            # human genuinely has to decide.
-            bash_cmd(script, "--category", "decision-needed",
-                     "--subject", subject, "--message", message),
+            bash_cmd(script, *argv),
             capture_output=True, text=True, timeout=60,
         )
         # 0 sent | 3 suppressed (re-routed to board) | 4 duplicate |
@@ -2429,6 +2458,12 @@ def _notify_critical_memory(subject: str, message: str) -> dict:
                 "detail": (proc.stderr or proc.stdout or "").strip()[:300]}
     except Exception as exc:  # noqa: BLE001 - fail-open by contract
         return {"sent": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _notify_critical_memory(subject: str, message: str) -> dict:
+    """MemoryHeadroomProbe's alert. The name is kept because the probe and its
+    tests bind to it; the mechanism is the shared chokepoint above."""
+    return _notify_decision_needed(subject, message)
 
 
 def _claude_rss_kb() -> list[tuple[int, str, int]]:
@@ -4184,6 +4219,458 @@ class WorkerStallProbe(Probe):
         self.prev = dict(state.get("prev") or {})
 
 
+class RetrievalIndexProbe(Probe):
+    """Fleet-wide retrieval-index model drift () — the SCOPE leg.
+
+    A per-box embedding index whose model disagrees with the configured one
+    answers queries WRONG while every liveness signal stays green: the index is
+    fresh, the daemon is up, the channel reads 'alive'. Measured 2026-09-03
+    (g-115-8779): a box ran a bge-small index against MiniLM-calibrated cosine
+    floors, 98.9-100% of nodes cleared the floor, ranking collapsed to the
+    static terms (hit@1 0), and it had been that way for five weeks. Nothing
+    compared the index's model to the configured one, so nothing could see it.
+
+    The DATA leg is heartbeat-tick.sh, which publishes each box's block from
+    EVERY box (above its agent-state gate). This is the other half: one reader
+    that iterates every agent row. Both are required — guard-1414: fixing either
+    alone still shows nothing, and each is individually verifiable, so a one-leg
+    close can honestly report success while the reader stays blind.
+
+    NOT IN WORKER_SAFE_PROBES, on purpose, and for the reason InfraComponentProbe
+    already records: nothing it reads is reducer-shaped, so a worker COULD run
+    it — but this is a FLEET condition, so N Bodies polling it on the same
+    cadence means N alerts for one fault, and a duplicate alert is worse than a
+    late one. One reader per agent: the reducer. Note the asymmetry with the
+    DATA leg is deliberate rather than an oversight — publishing must happen on
+    every box precisely because a worker box is the one least likely to be
+    watched, while REPORTING must happen on one.
+
+    PACED, NOT PER-TICK. census() reads every peer shard from the AUTHORITATIVE
+    store (own-cloud's local mirror is conflict-frozen for peer shards, so a
+    mirror read is stale-or-absent and a mirror-vs-mirror census passes while
+    blind). Measured 2.7s on cc-09 for 15 shards. The watchdog tick runs every
+    iteration, so an unpaced census would spend ~2.7s per iteration restating a
+    value that changes when someone rebuilds an index — i.e. rarely.
+
+    FIRES ON DRIFT ONLY. `missing` (a live agent with no published block) rides
+    in the payload but never triggers, because during rollout EVERY row is
+    missing until its box ticks the new code — an alert that cannot be driven to
+    zero on the day it ships is one people learn to skip. Drift is the condition
+    that is always actionable and always wrong.
+
+    Transitions (state-deduped across ticks, the InfraComponentProbe shape):
+      - retrieval_index_drift (critical): the drifted set became non-empty or
+        changed membership.
+      - retrieval_index_drift_cleared (info): a previously-drifted fleet is clean.
+    """
+
+    name = "retrieval-index"
+    INTERVAL_MIN = 60
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.last_polled: Optional[float] = None
+        self.drifted: list = []
+
+    def check(self) -> list[Event]:
+        now = time.time()
+        if self.last_polled is not None:
+            elapsed = now - self.last_polled
+            # A negative elapsed means the clock moved backwards; re-poll rather
+            # than trust it (same tolerance InfraComponentProbe applies).
+            if 0 <= elapsed < self.INTERVAL_MIN * 60:
+                return []
+        self.last_polled = now
+        try:
+            # Lazy import inside check(), the FreshnessProbe convention: a
+            # syntax or import error in the census must never crash the tick
+            # that carries eleven other probes.
+            import retrieval_index_status as ris
+            rep = ris.census()
+        except Exception as exc:  # advisory probe — degrade, never raise
+            sys.stderr.write("[watchdog] retrieval-index census failed: %s\n" % exc)
+            return []
+        if rep.get("error"):
+            return []
+        drifted = sorted(rep.get("drifted") or [])
+        if drifted == self.drifted:
+            return []
+        prev, self.drifted = self.drifted, drifted
+        payload = {
+            "drifted": drifted,
+            "previous_drifted": prev,
+            "configured_model": rep.get("configured_model"),
+            "missing_block": rep.get("missing"),
+            "channel_not_alive": rep.get("channel_not_alive"),
+            "live_count": rep.get("live_count"),
+            "agent_count": rep.get("agent_count"),
+            "shard_count": rep.get("shard_count"),
+            "checked_from_box": rep.get("checked_from_box"),
+        }
+        if drifted:
+            detail = ", ".join(
+                "%s(box=%s model=%s)" % (
+                    a,
+                    ((rep["agents"].get(a) or {}).get("block") or {}).get("box"),
+                    ((rep["agents"].get(a) or {}).get("block") or {}).get("model"))
+                for a in drifted)
+            return [Event(
+                probe=self.name, event="retrieval_index_drift", severity="critical",
+                payload=payload,
+                summary=("retrieval-index DRIFT: %s built against a model other "
+                         "than the configured %s — cosine floors are calibrated on "
+                         "the configured model, so ranking is degraded on that box"
+                         % (detail, rep.get("configured_model"))))]
+        return [Event(
+            probe=self.name, event="retrieval_index_drift_cleared", severity="info",
+            payload=payload,
+            summary="retrieval-index drift cleared (was: %s)" % ", ".join(prev))]
+
+    def to_dict(self) -> dict:
+        return {"last_polled": self.last_polled, "drifted": self.drifted}
+
+    def from_dict(self, state: dict) -> None:
+        lp = state.get("last_polled")
+        self.last_polled = lp if isinstance(lp, (int, float)) else None
+        d = state.get("drifted")
+        self.drifted = sorted(d) if isinstance(d, list) else []
+
+
+class PeerLivenessProbe(Probe):
+    """Cross-agent liveness paging (owner directive 2026-09-05; foxtrot ~9h dark).
+
+    THE SECOND probe here that watches boxes other than its own, and the only
+    one that PAGES. foxtrot (a Windows/WSL2 tmux session, not an LXC container)
+    died on an API error at 2026-09-04T22:25 and nobody was told until the owner
+    restarted it by hand ~9h later: the fleet sweeper enumerates `lxc list` and
+    cannot see that machine, and every in-loop detector dies with the loop it
+    watches. So the reducers watch EACH OTHER from the tick that already fires
+    every iteration (iteration-close.sh) -- no new cron, no new daemon, and it
+    keeps working for any agent as long as ONE other reducer is alive.
+
+    The decision table and the store reads live in peer_liveness.py (lazy-
+    imported inside check() so a syntax error there can never crash the tick,
+    the WorkerStallProbe pattern). What this class owns is the TRANSITION and
+    PAGING policy:
+
+      - verdict transitions are remembered across ticks in the per-agent tick
+        state, so a persistent stall logs ONCE per episode and emits
+        `peer_liveness_cleared` on recovery (guard-2418 class);
+      - the PAGE dedup rides BOX-LOCAL state (core/logs/, never the mirrored
+        tick state -- MemoryHeadroomProbe's lesson: 1,696 emails in four days
+        when the dedup was re-armed by every cross-box tick), keyed by the
+        peer's frozen `last_active`, so one episode pages once per box and
+        re-pages only after REALERT_DEFAULT_SECONDS;
+      - the email body's first 400 chars are deterministic per episode (frozen
+        stamps only, detector identity at the END), so notify_dispatch's
+        fleet-wide fingerprint gate collapses the same episode seen from several
+        reducers into ONE mail; a deliberate re-alert passes --allow-duplicate.
+
+    A `slow` peer (heartbeat stale, but its diary / board / goal records moved)
+    is REPORTED as an info event and never paged (guard-4180). A blind roster
+    is reported as a warning, never as "all healthy" (guard-1977).
+
+    Advisory otherwise: it never mutates any store or state.
+    """
+    name = "peer-liveness"
+    BOX_STATE_DIR_ENV = "AGENT_WATCHDOG_PEER_BOX_STATE_DIR"
+    BOX_STATE_NAME = "watchdog-peer-liveness-alert.json"
+    REALERT_ENV = "AGENT_WATCHDOG_PEER_REALERT_SECONDS"
+    REALERT_DEFAULT_SECONDS = 6 * 3600
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.prev: dict = {}  # {peer_or_"__roster__": verdict}
+
+    def initialize(self) -> None:
+        # Empty baseline on purpose: a stall already in progress at the first
+        # tick is exactly the case worth reporting (WorkerStallProbe's reasoning).
+        self.prev = {}
+
+    # ── box-local paging state ────────────────────────────────────────────
+    def _box_state_path(self) -> Optional[Path]:
+        override = os.environ.get(self.BOX_STATE_DIR_ENV, "").strip()
+        if override:
+            return Path(override) / self.BOX_STATE_NAME
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return None
+        root = getattr(self.ctx, "project_root_path", None)
+        if root is None:
+            return None
+        return Path(root) / "core" / "logs" / self.BOX_STATE_NAME
+
+    def _load_box_state(self) -> dict:
+        path = self._box_state_path()
+        if path is None:
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                st = json.load(f) or {}
+            return st if isinstance(st, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_box_state(self, state: dict) -> None:
+        path = self._box_state_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError:
+            return
+
+    @classmethod
+    def _realert_seconds(cls) -> float:
+        raw = os.environ.get(cls.REALERT_ENV, "").strip()
+        if raw:
+            try:
+                v = float(raw)
+                if v >= 0:
+                    return v
+            except ValueError:
+                pass
+        return float(cls.REALERT_DEFAULT_SECONDS)
+
+    # ── the tick ──────────────────────────────────────────────────────────
+    def check(self) -> list[Event]:
+        try:
+            import peer_liveness as pl  # type: ignore
+            from _paths import WORLD_DIR  # type: ignore
+        except Exception as e:
+            sys.stderr.write(f"agent-watchdog: peer-liveness import failed: {e}\n")
+            return []
+        try:
+            report = pl.scan(Path(WORLD_DIR), self.ctx.agent_name)
+        except Exception as e:
+            sys.stderr.write(f"agent-watchdog: peer-liveness scan failed: {e}\n")
+            return []
+
+        events: list[Event] = []
+        seen: dict = {}
+
+        blind = bool(report.get("blind"))
+        seen["__roster__"] = "blind" if blind else "ok"
+        if blind and self.prev.get("__roster__") != "blind":
+            events.append(Event(
+                probe=self.name, event="peer_liveness_probe_blind", severity="warning",
+                payload={"blind_cause": report.get("blind_cause"),
+                         "roster_provenance": report.get("roster_provenance")},
+                summary=(f"peer-liveness probe cannot see the fleet "
+                         f"({report.get('blind_cause')}) -- a zero-alert result here "
+                         f"means UNKNOWN, not healthy"),
+            ))
+        elif not blind and self.prev.get("__roster__") == "blind":
+            events.append(Event(
+                probe=self.name, event="peer_liveness_probe_blind_cleared", severity="info",
+                payload={"roster_provenance": report.get("roster_provenance")},
+                summary="peer-liveness probe can see the fleet again",
+            ))
+
+        stalled_now: dict = {}
+        for peer in report.get("peers") or []:
+            agent = peer.get("agent")
+            verdict = peer.get("verdict") or ""
+            seen[agent] = verdict
+            was = self.prev.get(agent) or ""
+            if pl.is_alerting(verdict) and not pl.is_alerting(was):
+                events.append(Event(
+                    probe=self.name, event="peer_stalled", severity="critical",
+                    payload={**peer, "stale_hours": report.get("stale_hours")},
+                    summary=(f"PEER STALLED: {agent} -- {peer.get('reason')} "
+                             f"(in_flight={peer.get('in_flight')}, phase={peer.get('live_phase')})"),
+                ))
+            elif verdict == pl.V_SLOW and was != pl.V_SLOW:
+                events.append(Event(
+                    probe=self.name, event="peer_slow", severity="info",
+                    payload={**peer, "stale_hours": report.get("stale_hours")},
+                    summary=f"peer slow (not paged): {agent} -- {peer.get('reason')}",
+                ))
+            elif pl.is_alerting(was) and not pl.is_alerting(verdict):
+                events.append(Event(
+                    probe=self.name, event="peer_liveness_cleared", severity="info",
+                    payload={**peer},
+                    summary=f"peer liveness cleared: {agent} -> {verdict}",
+                ))
+            if pl.is_alerting(verdict):
+                stalled_now[agent] = peer
+
+        self._page(stalled_now, report, events)
+        self.prev = seen
+        return events
+
+    def _page(self, stalled: dict, report: dict, events: list) -> None:
+        """Page the owner once per (peer, frozen last_active) episode per box."""
+        state = self._load_box_state()
+        now_ts = time.time()
+        realert = self._realert_seconds()
+        changed = False
+        for agent, peer in stalled.items():
+            since = str(peer.get("last_active") or "")
+            prior = state.get(agent) if isinstance(state.get(agent), dict) else {}
+            new_episode = prior.get("since") != since
+            last_ts = prior.get("last_alert_ts")
+            last_ts = float(last_ts) if isinstance(last_ts, (int, float)) else 0.0
+            if not new_episode and (now_ts - last_ts) < realert:
+                continue
+            episode = _peer_stall_episode_key(agent, since)
+            # FLEET-SHARED dedup (the infra-streak-notify pattern): every live
+            # reducer sees the same stalled peer on the same tick, and the
+            # outreach ledger is a plain local file under own-cloud, so without
+            # this each box would mail the same episode once. A breadcrumb on
+            # the coordination board (written through the daemon, so every box
+            # reads it within seconds) means only the FIRST reducer mails; the
+            # rest record `peer_stall_paged_elsewhere` and arm their own
+            # re-alert clock. Fail-open: an unreadable board pages anyway.
+            if new_episode and _peer_stall_breadcrumb_seen(episode):
+                state[agent] = {"since": since, "last_alert_ts": now_ts, "box": _box_id(),
+                                "notified": {"sent": False, "reason": "paged by another box"}}
+                changed = True
+                events.append(Event(
+                    probe=self.name, event="peer_stall_paged_elsewhere", severity="info",
+                    payload={"agent": agent, "since": since, "episode": episode},
+                    summary=(f"peer-liveness: {agent} episode {episode} was already paged by "
+                             f"another box -- not mailing again from {_box_id()}"),
+                ))
+                continue
+            subject, body = _peer_stall_message(peer, report, self.ctx.agent_name)
+            allow = None if new_episode else (
+                f"{agent} still stalled after the re-alert window; last_active unchanged at {since}")
+            result = _notify_decision_needed(subject, body, allow_duplicate=allow)
+            if result.get("sent"):
+                _peer_stall_breadcrumb_post(agent, episode, subject)
+            state[agent] = {"since": since, "last_alert_ts": now_ts, "box": _box_id(),
+                            "notified": result}
+            changed = True
+            events.append(Event(
+                probe=self.name, event="peer_stall_paged", severity="info",
+                payload={"agent": agent, "since": since, "new_episode": new_episode,
+                         "episode": episode, "notified": result},
+                summary=(f"peer-liveness paged the owner about {agent} "
+                         f"(sent={result.get('sent')}, rc={result.get('rc')}, "
+                         f"{'new episode' if new_episode else 're-alert'})"),
+            ))
+        for agent in list(state):
+            if agent not in stalled:
+                del state[agent]
+                changed = True
+        if changed:
+            self._save_box_state(state)
+
+    def to_dict(self) -> dict:
+        return {"prev": self.prev}
+
+    def from_dict(self, state: dict) -> None:
+        prev = state.get("prev")
+        self.prev = dict(prev) if isinstance(prev, dict) else {}
+
+
+PEER_STALL_BREADCRUMB_TAG = "peer-stall-sent"
+
+
+def _peer_stall_episode_key(agent: str, since: str) -> str:
+    """Board-tag-safe episode key: one per (peer, frozen last_active)."""
+    stamp = re.sub(r"[^0-9A-Za-z]+", "-", str(since or "unknown")).strip("-")
+    return f"peer-stall-{agent}-{stamp}"
+
+
+def _peer_stall_breadcrumb_seen(episode: str) -> bool:
+    """True when ANY box already posted the breadcrumb for this episode.
+
+    Reads the coordination board through board-read.sh (daemon-backed, so a
+    peer box's post is visible fleet-wide within seconds). Inert under pytest
+    unless AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST is set, like the mail path.
+    FAIL-OPEN TOWARD PAGING: any error reads as "not seen" -- a duplicate mail
+    is cheaper than a stalled agent nobody hears about.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+            "AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST"):
+        return False
+    try:
+        from _runtime_bash import bash_cmd
+        script = Path(__file__).resolve().parent / "board-read.sh"
+        if not script.is_file():
+            return False
+        proc = subprocess.run(
+            bash_cmd(script, "--channel", "coordination", "--tag", episode,
+                     "--since", "48h", "--json"),
+            capture_output=True, text=True, timeout=60,
+        )
+        return proc.returncode == 0 and episode in (proc.stdout or "")
+    except Exception:  # noqa: BLE001 -- fail-open toward paging
+        return False
+
+
+def _peer_stall_breadcrumb_post(agent: str, episode: str, subject: str) -> dict:
+    """Post the fleet-shared 'already paged' breadcrumb. Best-effort, never raises."""
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
+            "AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST"):
+        return {"posted": False, "reason": "suppressed under pytest"}
+    try:
+        from _runtime_bash import bash_cmd
+        script = Path(__file__).resolve().parent / "board-post.sh"
+        if not script.is_file():
+            return {"posted": False, "reason": "board-post.sh absent"}
+        text = (f"PAGED THE OWNER about {agent} (episode {episode}) from {_box_id()}: {subject}. "
+                f"Other reducers: do not mail this episode again; your peer-liveness probe reads "
+                f"this breadcrumb by tag.")
+        proc = subprocess.run(
+            bash_cmd(script, "--channel", "coordination", "--type", "status",
+                     "--tags", f"{PEER_STALL_BREADCRUMB_TAG},{agent},{episode}"),
+            input=text, capture_output=True, text=True, timeout=60,
+        )
+        return {"posted": proc.returncode == 0, "rc": proc.returncode,
+                "detail": (proc.stdout or proc.stderr or "").strip()[:200]}
+    except Exception as exc:  # noqa: BLE001
+        return {"posted": False, "reason": f"{type(exc).__name__}: {exc}"[:200]}
+
+
+def _peer_stall_message(peer: dict, report: dict, detector: str) -> tuple:
+    """(subject, body) for a stalled peer.
+
+    THE FIRST 400 CHARACTERS OF THE BODY ARE THE DEDUP KEY (notification_outreach
+    BODY_FP_CHARS): they carry only the peer's FROZEN stamps, so every reducer
+    that sees the same episode renders the same head and the fleet-wide gate
+    sends one mail. The detecting agent, box and clock go at the very end.
+    """
+    agent = peer.get("agent")
+    sig = peer.get("signals") or {}
+
+    def _stamp(name: str) -> str:
+        s = sig.get(name) or {}
+        if s.get("ts"):
+            return str(s["ts"])
+        return "none found" if s.get("readable") else "unreadable"
+
+    since = str(peer.get("last_active") or "unknown")
+    hours = report.get("stale_hours")
+    subject = f"Fleet: {agent} looks STALLED since {since[:16]} UTC (no heartbeat, diary, board or goal activity)"
+    body = (
+        f"PEER STALL: {agent} has shown no sign of life for over {hours}h while its session is marked running.\n"
+        f"heartbeat last_active: {since}\n"
+        f"execution diary head: {_stamp('diary')}\n"
+        f"last board post: {_stamp('board')}\n"
+        f"last goal claim/completion: {_stamp('goals')}\n"
+        f"in flight: {peer.get('in_flight')} | phase: {peer.get('live_phase')}\n"
+        f"\n"
+        f"WHAT TO DO: open that agent's terminal or tmux session. If it shows an API error, a dead prompt, "
+        f"or a login screen, restart it with /start {agent}. If it is genuinely mid-way through a long goal, "
+        f"nothing is needed; this alert re-arms after {int(PeerLivenessProbe.REALERT_DEFAULT_SECONDS // 3600)}h "
+        f"and clears itself when the agent moves again.\n"
+        f"\n"
+        f"WHY YOU ARE HEARING THIS FROM A PEER: the fleet sweep only sees LXC containers, and an agent's own "
+        f"watchdog dies with its loop. The reducers now watch each other on every iteration (probe peer-liveness, "
+        f"core/scripts/agent-watchdog.py; classifier core/scripts/peer_liveness.py).\n"
+        f"--\n"
+        f"detected by {detector} on {_box_id()} at {report.get('checked_at')} UTC; "
+        f"verdict reason: {peer.get('reason')}\n"
+    )
+    return subject, body
+
+
 def build_probes(ctx: WatchdogContext) -> list[Probe]:
     """Single registration point. Add new probes here.
 
@@ -4199,9 +4686,13 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
     loop. Registering it on a worker would have each worker watching itself with
     a probe whose entire premise is out-of-process observation — coverage in
     appearance only, which is the same defect the filter below prevents.
+
+    PeerLivenessProbe (2026-09-05) is the second peer-side probe and the only
+    one that PAGES the owner; same reducer-only reasoning, same exclusion.
     """
     probes = [
         WorkerStallProbe(ctx),
+        PeerLivenessProbe(ctx),
         RunningSidProbe(ctx),
         HeartbeatProbe(ctx),
         ClaimHeartbeatProbe(ctx),
@@ -4216,6 +4707,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         GitDriftProbe(ctx),
         InfraComponentProbe(ctx),
         DependencyFunnelProbe(ctx),
+        RetrievalIndexProbe(ctx),
     ]
     if ctx.body_role == "worker":
         return [p for p in probes if p.name in WORKER_SAFE_PROBES]

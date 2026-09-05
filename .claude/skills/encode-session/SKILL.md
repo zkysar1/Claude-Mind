@@ -54,6 +54,10 @@ almost always < 2 KB), the only sanctioned scratch home is
 - **Always delete scratch at end-of-skill** in the same turn that
   applies the encodings. Orphan staging files are cruft even when the
   encodings landed successfully.
+  **EXCEPT a dir holding a top-level `RECEIPT.*`** — keep it, say so.
+  `ls "$S" | grep -iE '^receipt(\.[^.]+)?$'`; any hit, keep. Matches
+  `housekeeping-tick.py::_has_top_receipt`, which this bullet contradicted
+  until 2026-09-04. Why, and the measured case: guard-6001.
 
 The 2026-05-20 incident that motivated this policy: alpha session
 materialized 8 JSON payloads under `PROJECT_ROOT/.scratch-encode-session/`,

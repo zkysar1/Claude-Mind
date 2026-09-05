@@ -5,10 +5,11 @@ description: >-
   convergence Phase 2, asp-306). select -> claim -> execute -> RE-ENTER for the
   next work unit; parks (resumable) when work or the reducer is gone, closes
   only when a park expires.
-  Records the status it judged for each unit through the shared close writer
-  (Phase 4a), then SKIPS the reducer-only phases (the LLM verify phase / encode /
-  reflect / state-update / learning-gate); the single reducer applies those to
-  all Bodies' merged state at generalize-down.
+  Verifies and closes the ONE unit it just executed (Phase 4a: /aspirations-verify
+  scope=own-unit, then the shared close writer), then SKIPS the reducer-only
+  phases (the cross-Body verify residue / encode / reflect / state-update /
+  learning-gate); the single reducer applies those to all Bodies' merged state
+  at generalize-down.
 user-invocable: false
 minimum_mode: autonomous
 companion_scripts:
@@ -28,9 +29,10 @@ A **worker Body** is a forked instance of a Mind (keyed by `unitKey` = its
 session SID) that is NOT the reducer. It runs a deliberately thin loop —
 **select -> claim -> execute -> re-enter** — one work unit per pass, parking
 (resumable, hourly re-poll) when work or its reducer is gone, leaving its
-divergent working-memory for the single reducer to merge later. It does NOT verify,
-encode, reflect, update state, run the learning gate, evolve, or do completion
-review. Those are **reducer-only**: the one Body holding `running-session-id`
+divergent working-memory for the single reducer to merge later. It verifies ONLY
+the unit it just executed (Phase 4a, `scope=own-unit`); it does NOT encode,
+reflect, update state, run the learning gate, evolve, or do completion review.
+Those are **reducer-only**: the one Body holding `running-session-id`
 (the reducer) applies them to the MERGED state of every Body at generalize-down
 (Phase 1C `body-merge.py`, run from `aspirations-consolidate` Step -1). Running
 encode/reflect per-worker would create N reducers — the defect the convergence
@@ -59,12 +61,13 @@ Bash: py -3 core/scripts/worker_execute.py reducer-only-phases  # the phases thi
 Bash: py -3 core/scripts/worker_execute.py should-run-phase <p> # exit 0 = run, exit 1 = skip
 ```
 
-A worker runs ONLY those; `verify-own-unit` is DECLARED, NOT WIRED (g-306-417),
-so the loop body below is the whole contract — never read the `phases` output as
-an instruction to verify. Every reducer-only phase (`verify`, `spark`,
+A worker runs ONLY those. `verify-own-unit` is WIRED as of g-306-417: Phase 4a
+invokes `/aspirations-verify` with `scope=own-unit` for the goal it just
+executed, then closes it. Every reducer-only phase (`verify`, `spark`,
 `complete-review`, `state-update`, `evolution`, `learning-gate`,
-`productivity-check`) returns `skip`. `verify` there is the LLM phase; the
-MECHANICAL close for this worker's own unit is Phase 4a below (g-115-6337).
+`productivity-check`) still returns `skip` — `verify` there is the CROSS-BODY
+residue (streaks, the sampled review of these self-graded closures): a
+different scope, not a contradiction.
 Rationale: core/config/rationale/worker-verify-own-unit.md
 
 ## The lifecycle split + the no-transcription rule (g-306-212)
@@ -389,6 +392,20 @@ Bash: py -3 core/scripts/agent-watchdog.py --tick
 # Fail-open: advisory only. It announces the role filter on stderr every run so a
 # filtered tick is never mistaken for a full one. Never branch on this rc.
 
+# Phase -0.15 — GATE-FIRINGS SPOOL FLUSH (g-306-432). A scoped CALL to the SAME
+# flusher the reducer uses (guard-2676). Its ONLY caller was iteration-close's
+# reducer-only do_productivity_check, so under own-cloud EVERY worker gate firing
+# stayed stranded in the machine-local spool and invisible fleet-wide (measured
+# 522 records / 17h on cc-09; 194 / 6h on cc-08). Fourth instance of the
+# workers-never-inherit class (g-306-233 pull, -227 heartbeat, -370 product pull).
+# Self-throttling BY CONTRACT (--min-interval-seconds 300, --burst-records 200),
+# so call it EVERY cycle and never hand-roll a cadence — a caller-side interval
+# check would be a second, drifting copy of a bound the script already owns.
+# Rationale + measurements: core/config/rationale/worker-gate-firings-flush.md
+Bash: bash core/scripts/gate-firings-flush.sh
+# Fail-open; never branch on this rc. VERIFY IN THE SPOOL, never in the shared
+# firings store — an unmoved destination mtime is not evidence (guard-4040).
+
 # Phase 0.5 — REDUCER-LIVENESS POLL (g-306-125 mechanism 2). Runs at the top of
 # EVERY select cycle, before any claim. A worker whose reducer has died keeps
 # claiming and executing goals whose results nobody will ever merge — the
@@ -454,42 +471,38 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 Bash: goal-selector.sh
 Pick the top eligible unclaimed goal (drop any goal a partner is in_flight on).
 #
-# SKILL ELIGIBILITY (g-115-5664). "Eligible" includes the goal's SKILL, and the
-# scorer does not know that. Measured 2026-08-10 on cc-08: goal-selector offered
-# g-001-05 "Run hippocampal replay" (skill `/replay --sharp-wave`) as the top
-# pick, with the drain-lane banner reading verbatim "This IS the sanctioned top
-# pick — claim it without a deviation code." `/replay` calls guardrails-add.sh
-# and LIFECYCLE_DISPOSITIONS["replay"] is reducer-only-by-design, so a worker
-# following that banner writes guardrails from its OWN UNMERGED state — the
-# Nth-reducer defect — and the artifacts land in the shared world with nothing
-# marking them pre-merge. It was caught only by opening the skill before
-# claiming; nothing in this loop prompted that.
+# ROLE + SKILL ELIGIBILITY (g-115-5664, g-306-440). "Eligible" includes the
+# goal's ROLE and its SKILL, and the scorer knows neither. Four measured
+# incidents where a worker was offered — and once affirmatively INSTRUCTED by
+# the drain-lane banner — to claim reducer-only work.
+# Rationale (WHY role-first, why `undetermined` is a WORD not an rc, why the
+# flag ORDER is load-bearing, why the banner branch keeps the selector
+# role-blind): core/config/rationale/worker-role-gate.md
 #
-# So: for each candidate IN RANK ORDER, ask the contract before claiming.
-Bash: py -3 core/scripts/worker_execute.py skill-eligible <the goal's skill field, verbatim>
-# rc 0 = eligible -> proceed to CLAIM. rc 1 = reducer-only -> SKIP THIS GOAL and
-# take the NEXT candidate in the same pass (the reason is on stderr — say it out
-# loud in the turn; a silent skip is the half of this that would rot). Do NOT
-# burn a select cycle per refusal, and do NOT file anything: the goal is not
-# broken, it is simply the reducer's, and it stays visible to the reducer where
-# it belongs.
+# For each candidate IN RANK ORDER, ask the contract before claiming.
+# --role COMES FIRST (the skill arg is argparse REMAINDER, so a TRAILING
+# --role is swallowed as skill text and never read). Omit --role when unset.
+Bash: py -3 core/scripts/worker_execute.py goal-eligible --role <the goal's executable_by_role field> <the goal's skill field, verbatim>
+# THE GOAL-LEVEL executable_by_role IS CONSULTED FIRST and is decisive where
+# present. READ THE STDOUT WORD, not just rc — there are THREE:
+#   reducer-only (rc 1) -> SKIP THIS GOAL, take the NEXT candidate in the same
+#     pass. Say the stderr reason out loud; a silent skip is the half of this
+#     that would rot. Do NOT burn a select cycle per refusal, and do NOT file
+#     anything: the goal is not broken, it is the reducer's, and it stays
+#     visible to the reducer where it belongs.
+#   eligible (rc 0) -> a real judgment was made. Proceed to CLAIM.
+#   undetermined (rc 0) -> THE BRIDGE DECLINED TO JUDGE (skill-less goal, or a
+#     skill the table does not map). The zero is FAIL-OPEN, NOT a pass, and the
+#     call is YOURS (g-115-6523, g-306-440).
 #
 # The check is a scoped CALL into the shared component (guard-2676). The refusal
 # list is NOT duplicated here and must not be: worker_execute derives it from
 # LIFECYCLE_DISPOSITIONS, so a stage whose disposition changes moves its skills
 # with it. `reducer-only-skills` prints the current set if you want to see it.
 #
-# WHY THIS IS NOT IN goal-selector, where the starvation half would also be
-# fixed: LIFECYCLE_DISPOSITIONS["select"] forbids worker-specific selection logic
-# outright, and guard-2783 forbids role-conditional behavior in a component BOTH
-# roles run. The scorer stays byte-identical for both roles.
-#
-# A GREEN ANSWER IS NOT A PROOF, AND ON A SKILL-LESS GOAL THERE IS NO ANSWER.
-# The bridge is SKILL-keyed, so a goal with no skill (most candidates) returns
-# "NOT EVALUATED ... NOT a cleared check" at rc 0: eligible stays True because
-# fail-closed would strand the role, but the bridge DECLINED to judge and the
-# call is YOURS (g-115-6523). On that answer — and whenever a named skill looks
-# like loop-phase encoding over YOUR OWN unmerged experience — read the goal's
+# A GREEN ANSWER IS NOT A PROOF. On `undetermined` — and whenever a named skill
+# looks like loop-phase encoding over YOUR OWN unmerged experience — read the
+# goal's
 # verification outcomes and description BEFORE claiming, with THIS command
 # (never a hand parser over the store file — the guard refuses it):
 Bash: bash core/scripts/aspirations-query.sh --goal-field id <goal-id> --full
@@ -825,13 +838,17 @@ Bash: py -3 core/scripts/worker_execute.py check-outputs <class> [<class>...]
 # or made any local commit you want the reducer to see. Harmless otherwise — it
 # pushes the same HEAD the previous unit pushed.
 #
-# COMMIT FIRST. The ref carries HEAD, so anything uncommitted is NOT carried, and
-# that is the one residual failure mode of this carrier (it is why
-# local-git-commit keeps its own row in OUTPUT_CLASS_CARRIERS rather than being
-# folded into framework-file-edit).
-# THIS MERGES TOO (fetch + integrate BEFORE the push), so it voids a live
-# full-suite run exactly as Phase -0.3 does — the flags differ on PUSH, never on
-# MERGE. Same constraint, same rationale file as Phase -0.3.
+# COMMIT FIRST — BUT CONSULT THE LOCK FIRST (g-115-8957). Your commit and this
+# call's fetch+integrate BOTH move HEAD, voiding a co-resident Body's running
+# full-suite as Phase -0.3 does (flags differ on PUSH, never MERGE); iteration-push
+# guarded its own push, never the commit it orders.
+Bash: bash core/scripts/tree-lock.sh check --project-root "$(git rev-parse --show-toplevel)"
+# rc=1 (a PEER holds) is the ONLY defer: leave it uncommitted, note it in Phase
+# 3.9, carry it next cycle. Every other rc proceeds — including your OWN lock.
+# Rationale (WHY + rc table): core/config/rationale/suite-run-voided-by-loop-merge.md
+# The ref carries HEAD, so uncommitted work is NOT carried — this carrier's one
+# residual failure mode, and why local-git-commit keeps its own row in
+# OUTPUT_CLASS_CARRIERS rather than being folded into framework-file-edit.
 Bash: bash core/scripts/iteration-push.sh --push-worker-ref
 # Pushes HEAD to refs/workers/<agent>/<sid>, then STOPS — it never touches the
 # shared branch. This does NOT contradict Phase -0.3's --no-push: that flag's
@@ -886,27 +903,25 @@ Bash: bash core/scripts/closure-evidence-write.sh --goal <goal-id> --source worl
 
 # Phase 4 — CLOSE THE WORK UNIT: record the outcome on the goal, then hand off.
 #
-# 4a. RECORD THE STATUS YOU JUDGED, through the SHARED close writer. Until
-#     2026-08-16 this phase said only "do not run verify" and left the goal at
-#     in-progress "for the reducer to close at generalize-down" — but no reducer
-#     lane ever flipped a worker goal's status (worker_retrospective.py has no
-#     close lane; body-merge.py only NAMES ids), so every worker completion
-#     stayed in-progress forever. Measured 2026-08-16 (alpha reducer, cc-04):
-#     360 of 361 open alpha claims were finished work nobody closed, held by 7
-#     worker SIDs, 261 by dead bodies; the parent aspirations never completed, no
-#     successor goals were generated, and goal-selector's SKIP_STATUSES hid every
-#     one of them from every Body (g-115-6337; guard-4000 class — a KEEP that
-#     never consults age grows without bound).
-#     The status flip is NOT the LLM verify skill (/aspirations-verify Q1/Q2/Q3
-#     stays reducer-only per LIFECYCLE_DISPOSITIONS "reducer-iteration"). It is
-#     the MECHANICAL close writer, do_verify in iteration-close.sh, entered as a
-#     scoped call (guard-2676: call the component, never transcribe it). That
-#     one call already routes recurring goals through aspirations-complete-by.sh,
-#     stamps completed_date + outcome_class, posts the "Completed:" board message
-#     the reducer and partners read, and clears in_flight ONLY when the row names
-#     THIS goal (--if-goal compare-and-swap, so a live reducer's row is never
-#     blanked). Its checkpoint write routes to THIS Body's sessions/<sid>/ dir
-#     (body_state_path), not the agent-wide one.
+# 4a. JUDGE, THEN WRITE — two calls, one step (g-306-417).
+#     FIRST the LLM judgement, for the ONE unit you just executed. INVOKE the
+#     skill; never transcribe its steps (guard-1867 — inlining a sub-skill skips
+#     the side effects you did not know it had). scope=own-unit runs the per-goal
+#     sections for THIS goal alone and skips the cross-Body residue (streaks, and
+#     the SAMPLED review of these self-graded closures), which stay reducer-side.
+#     A pass means the criteria were met on THIS Body — NEVER that the code
+#     landed on main (guard-4638), and an outside-world reading it rests on is a
+#     timestamped observation, not a settled fact (guard-3034). Its verdict is
+#     what you pass as --status below; under own-unit `aspiration_complete` is
+#     REPORTED only, since closing the parent stays reducer-side.
+Skill(aspirations-verify) with: goal, result, scope="own-unit"
+#     THEN the mechanical status write, through the SHARED close writer, as its
+#     own separate call (guard-470). do_verify in iteration-close.sh is the ONLY
+#     writer of that transition and of everything hanging off it — recurring
+#     routing, completed_date + outcome_class, the "Completed:" board post,
+#     and the --if-goal in_flight clear (guard-2523). WHY these are two calls
+#     rather than one, and the 360-of-361 measurement behind the write half:
+#     core/config/rationale/worker-verify-own-unit.md
 Bash: bash core/scripts/iteration-close.sh --phase verify --goal <goal-id> \
         --status <completed|blocked|skipped> --source <world|agent> \
         --outcome <deep|routine> --summary "<one line: what this unit did>"
@@ -934,6 +949,15 @@ Bash: bash core/scripts/iteration-close.sh --phase verify --goal <goal-id> \
 #     g-115-5177: a bare release re-arms finished work at rank 1 on fresh
 #     metadata:
 #       Bash: bash core/scripts/aspirations-update-goal.sh --source <world|agent> <goal-id> defer_reason "precondition_unmet: <the gate, short>"
+#     THE PREFIX IS NOT THE STRUCTURE, and reading it as such is why this lane
+#     is starved: that prose is SKIPPED by the only sweep that clears this class
+#     (measured 81 of 84 eligible, cc-13 2026-09-04; 101 of 104, cc-04 08-26).
+#     So ALSO write a machine-evaluable predicate into verification.preconditions
+#     — the ONLY field precondition-defer-recheck reads (predicate.py owns the
+#     types; after_time for an elapsed window) — and make it evaluable on ANY
+#     box, never only yours (guard-4306). If the gate is not machine-checkable,
+#     SAY SO in the defer text: then no sweep owns it and a reader must.
+#     Rationale: core/config/rationale/worker-defer-predicate.md
 #     And if Phase 3.7 returned rc 1 (STRANDED) it has ALREADY told you to leave
 #     the goal in-progress with the stranding recorded: obey it and SKIP 4a.
 #     --outcome: routine for a presence-check / cadence unit, deep for anything

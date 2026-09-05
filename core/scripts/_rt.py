@@ -53,6 +53,65 @@ def _port():
         return ""
 
 
+_ENV_LOCAL_TOKEN_UNRESOLVED = object()
+_ENV_LOCAL_TOKEN = _ENV_LOCAL_TOKEN_UNRESOLVED
+
+
+def _env_local_token():
+    """MIND_API_TOKEN read from the gitignored .env.local, cached per process.
+
+    The negative result is cached too, deliberately: with no token configured
+    anywhere -- today's default on every box -- this costs ONE failed open per
+    process instead of one per daemon call, and every store read/write on the
+    box goes through rt_call.
+
+    Fail-open by contract: an absent, unreadable, or token-less .env.local
+    yields "". Never raises and never logs the value.
+    """
+    global _ENV_LOCAL_TOKEN
+    if _ENV_LOCAL_TOKEN is not _ENV_LOCAL_TOKEN_UNRESOLVED:
+        return _ENV_LOCAL_TOKEN
+    _ENV_LOCAL_TOKEN = ""
+    try:
+        raw = (_PROJECT_ROOT / ".env.local").read_text(encoding="utf-8")
+    except OSError:
+        return _ENV_LOCAL_TOKEN
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() != "MIND_API_TOKEN":
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        _ENV_LOCAL_TOKEN = val.strip()
+        break
+    return _ENV_LOCAL_TOKEN
+
+
+def _api_token():
+    """The bearer token for the Authorization header: env first, .env.local second.
+
+    WHY THE FALLBACK EXISTS (g-358-60). Once MIND_API_TOKEN is set on the daemon,
+    FR-4 (server.py:298-306) demands a matching bearer on EVERY request -- LOCAL
+    callers included -- but the ambient environment of an ad-hoc Bash tool call
+    carries no such variable, so every store call on the box would 401. The one
+    surface that reaches every tool call, `.claude/settings.json` env, is
+    GIT-TRACKED and must never hold a credential (guard-724). `.env.local` is the
+    sanctioned mode-600 gitignored secret store, so the client READS the token
+    there rather than the token being pushed into every process environment.
+
+    The env var is re-read on every call (free, and it keeps monkeypatching
+    honest); only the FILE read is cached.
+    """
+    tok = os.environ.get("MIND_API_TOKEN", "").strip()
+    if tok:
+        return tok
+    return _env_local_token()
+
+
 def rt_call(method, path, query=None, body=None, headers=None):
     """Call the daemon; return the response body (str) on HTTP 2xx.
 
@@ -79,12 +138,13 @@ def rt_call(method, path, query=None, body=None, headers=None):
     agent = os.environ.get("MIND_AGENT")
     if agent:
         h["X-Mind-Agent"] = agent
-    # FR-4 (BRD Shared-State-API): attach the daemon bearer token when
-    # MIND_API_TOKEN is set (parity with _runtime.sh rt_curl). Unset → no header
-    # → byte-identical to today's localhost-only calls.
-    _api_token = os.environ.get("MIND_API_TOKEN", "").strip()
-    if _api_token:
-        h["Authorization"] = "Bearer " + _api_token
+    # FR-4 (BRD Shared-State-API): attach the daemon bearer token when one is
+    # configured -- ambient env, else .env.local (see _api_token; parity with
+    # _runtime.sh rt_curl). Neither → no header → byte-identical to today's
+    # localhost-only calls.
+    _tok = _api_token()
+    if _tok:
+        h["Authorization"] = "Bearer " + _tok
     if headers:
         h.update(headers)
 

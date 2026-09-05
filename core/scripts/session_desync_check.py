@@ -94,12 +94,27 @@ def _inv_running_without_heartbeat(files, agent_state):
     return agent_state == "RUNNING" and not (hb and hb.get("exists"))
 
 
+def _inv_running_without_persona(files, agent_state):
+    # Gated on loop-active, NOT on agent-state alone: /start flips agent-state to
+    # RUNNING *before* invoking /boot, and /boot sets persona a few steps later, so
+    # a bare RUNNING+persona-false test would fire on EVERY legitimate boot.
+    # loop-active is written only once the aspirations loop is actually turning —
+    # past every persona-setting step — so this fires only on the real defect.
+    # Tests for "false" specifically, never "not true": an absent or unreadable
+    # persona-active is "unset", which user-interaction.md treats as persona ON.
+    lp = files.get("loop-active")
+    if agent_state != "RUNNING" or not (lp and lp.get("exists")):
+        return False
+    return _read_persona_active(files) == "false"
+
+
 _HANDLERS = {
     "heartbeat_without_running": _inv_heartbeat_without_running,
     "stop_requested_when_idle": _inv_stop_requested_when_idle,
     "iteration_checkpoint_when_idle": _inv_iteration_checkpoint_when_idle,
     "loop_active_when_idle": _inv_loop_active_when_idle,
     "running_without_heartbeat": _inv_running_without_heartbeat,
+    "running_without_persona": _inv_running_without_persona,
 }
 
 
@@ -166,6 +181,21 @@ def _read_agent_state(files):
     p = Path(AGENT_DIR) / "session" / "agent-state"
     try:
         return p.read_text(encoding="utf-8").strip()
+    except Exception:
+        return "UNKNOWN"
+
+
+def _read_persona_active(files):
+    """Read persona-active's value from disk. Returns the value or 'UNKNOWN'."""
+    rec = files.get("persona-active")
+    if not rec or not rec.get("exists"):
+        return "UNKNOWN"
+    # The manifest records mtime + size, not content — read the file directly.
+    if AGENT_DIR is None:
+        return "UNKNOWN"
+    p = Path(AGENT_DIR) / "session" / "persona-active"
+    try:
+        return p.read_text(encoding="utf-8").strip().lower()
     except Exception:
         return "UNKNOWN"
 

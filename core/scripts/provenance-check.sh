@@ -14,8 +14,10 @@
 # READ THE NEGATIVE CORRECTLY (guard-4407, and verify-before-assuming.md rule 1):
 # exit 1 means "no tool-fetch record in this session's manifest". It does NOT
 # mean the URL is fabricated. The manifest is fed by PostToolUse hooks bound to
-# the Read / WebFetch / WebSearch TOOLS, so a page pulled with `curl` in a Bash
-# call, or a file read with `cat`, is invisible to it by construction — as is
+# the Read / WebFetch / WebSearch TOOLS, plus two scripts that record from the
+# INSIDE and are therefore immune to that tool-binding (`tree-read.sh --node` and
+# `retrieve.sh`, both on rc=0 only — ). A page pulled with `curl` in a
+# Bash call, or a file read with `cat`, is still invisible by construction — as is
 # anything retrieved BEFORE the session's most recent manifest reset. Exit 1 is a
 # prompt to go verify, never by itself evidence of invention.
 set -euo pipefail

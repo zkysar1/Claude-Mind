@@ -47,10 +47,26 @@ from knowledge_projection import (  # noqa: E402
     Redactor,
     is_domain_tree_node,
     project,
+    resolve_goal_handle,
 )
 
 #: Env var name suffixes whose VALUES are stripped from exposed text (never their names).
 _SECRET_SUFFIXES = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD")
+
+#: Env var holding the per-environment secret that keys the published goal handles
+#: (:func:`knowledge_projection.goal_handle`). ABSENT IS A SUPPORTED STATE: the board is
+#: then published with no handles and every addressed write resolves to nothing — the
+#: fail-closed degradation, which is why nothing here raises on a missing key.
+#:
+#: The ``_SECRET`` suffix is chosen, not incidental: it lands this value in
+#: :func:`_secret_values`, so if the secret ever appears verbatim inside a projected
+#: string the redactor strips it — defense in depth on top of never emitting it.
+#:
+#: ⚠ PROVISIONING: this is per-ENVIRONMENT, not per-box. Every box serving one
+#: ``ENVIRONMENT_ID`` must hold the same value, because the export can run on one box and
+#: the resolve on another. Divergent secrets fail closed and SILENTLY (writes resolve to
+#: nothing); no parity check covers this today — see the goal note for g-369-119.
+_GOAL_HANDLE_SECRET_VAR = "KNOWLEDGE_HANDLE_SECRET"
 
 
 def _generated_at() -> str:
@@ -490,6 +506,26 @@ def _secret_values(env: dict[str, str]) -> list[str]:
     ]
 
 
+def _build_redactor(
+    world_path: Path,
+    project_root: Path,
+    extra_paths: tuple[str, ...],
+    env: Mapping[str, str],
+) -> Redactor:
+    """The ONE Redactor construction, shared by the export and the handle resolve.
+
+    :func:`resolve_goal_handle` re-applies the projection's exposure predicate, and that
+    predicate includes "the title survives redaction" — so a resolve built on a
+    differently-configured redactor could address a goal the export never published. One
+    constructor makes that divergence unrepresentable rather than merely unlikely.
+    """
+    return Redactor(
+        agent_names=tuple(_agent_names(project_root)),
+        workspace_paths=(str(world_path), str(project_root), *extra_paths),
+        secret_values=tuple(_secret_values(env)),
+    )
+
+
 def build_bundle(
     world_path: Path,
     project_root: Path,
@@ -507,11 +543,7 @@ def build_bundle(
     :class:`ProjectedBundle`, which describes the projection and not how the read went.
     """
     env = dict(os.environ if env is None else env)
-    redactor = Redactor(
-        agent_names=tuple(_agent_names(project_root)),
-        workspace_paths=(str(world_path), str(project_root), *extra_paths),
-        secret_values=tuple(_secret_values(env)),
-    )
+    redactor = _build_redactor(world_path, project_root, extra_paths, env)
     self_fm, self_body = _read_self(project_root, env)
     program_fm, program_body = _read_program(world_path)
     return project(
@@ -525,6 +557,42 @@ def build_bundle(
         program_front_matter=program_fm,
         program_body=program_body,
         goals=_read_goals(world_path),
+        # Read from the env, never from a store: the value is a secret and the projection
+        # is the one place it may be used (as an HMAC KEY, never as output). "" when
+        # unprovisioned, which suppresses the handle field entirely — see
+        # :data:`_GOAL_HANDLE_SECRET_VAR`.
+        goal_handle_secret=env.get(_GOAL_HANDLE_SECRET_VAR, ""),
+        environment_id=env.get("ENVIRONMENT_ID", ""),
+    )
+
+
+def resolve_handle(
+    world_path: Path,
+    project_root: Path,
+    handle: str,
+    *,
+    extra_paths: tuple[str, ...] = (),
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Box-side resolve: an inbound published handle -> the goal id it addresses.
+
+    The store-I/O half of :func:`knowledge_projection.resolve_goal_handle`, and the entry
+    point the Planned-board WRITE verbs call before touching a goal. Reads the same world
+    queue the export publishes from (:func:`_read_goals`) and builds the same redactor
+    (:func:`_build_redactor`), so "resolvable" and "published" are the same set.
+
+    Returns ``None`` — never a guess — for an unknown handle, an ambiguous one, a goal
+    that has stopped being exposable, or an unprovisioned secret. The caller MUST treat
+    ``None`` as "do nothing"; there is no partial or best-effort match to fall back to,
+    by design (a near-miss would mutate the wrong member's goal).
+    """
+    env = dict(os.environ if env is None else env)
+    return resolve_goal_handle(
+        handle,
+        _read_goals(world_path),
+        env.get(_GOAL_HANDLE_SECRET_VAR, ""),
+        _build_redactor(world_path, project_root, extra_paths, env),
+        env.get("ENVIRONMENT_ID", ""),
     )
 
 
@@ -771,6 +839,7 @@ def main(argv: list[str] | None = None) -> int:
     out_path = None
     out_dir = None
     fmt = "json"
+    handle = None
     for i, a in enumerate(argv):
         if a in ("-o", "--out") and i + 1 < len(argv):
             out_path = argv[i + 1]
@@ -778,8 +847,42 @@ def main(argv: list[str] | None = None) -> int:
             out_dir = argv[i + 1]
         elif a == "--format" and i + 1 < len(argv):
             fmt = argv[i + 1]
+        elif a == "--resolve-handle":
+            # NOT the `and i + 1 < len(argv)` shape the flags above use. For them a
+            # missing value falls through to a default and the operation is unchanged;
+            # here it would silently fall through to a full EXPORT, printing the whole
+            # bundle to stdout with rc 0 — a wrong-shaped success for a caller that
+            # branches on the rc and reads stdout as a goal id. Measured before this
+            # guard existed: `--resolve-handle` with no value emitted 9,684,089 bytes
+            # and exited 0.
+            if i + 1 >= len(argv):
+                print(
+                    "[knowledge-export] --resolve-handle requires a handle value",
+                    file=sys.stderr,
+                )
+                return 2
+            handle = argv[i + 1]
     world = _resolve_world()
     project_root = Path(__file__).resolve().parents[2]
+
+    # --resolve-handle is a LOOKUP, not an export: it answers here and returns, before
+    # any bundle is built or written. Deliberately ahead of the all-zero refusal below —
+    # that gate protects a PUBLISHED artifact, and a resolve publishes nothing, so
+    # letting a hollow-world refusal swallow the answer would turn "this handle is
+    # unknown" into "the exporter is unhappy" for the caller.
+    # rc 0 + the goal id on stdout = resolved. rc 1 + NOTHING on stdout = not resolved,
+    # which covers unknown / ambiguous / no-longer-exposed / unprovisioned-secret alike.
+    # rc 2 is neither answer — it means the CALLER erred (no handle value) or the
+    # exporter refused; a caller must not read it as "unknown handle".
+    # The caller must branch on the rc and never on parsing stdout, and must not try to
+    # tell those cases apart: distinguishing them would tell an unauthenticated caller
+    # which handles exist.
+    if handle is not None:
+        resolved = resolve_handle(world, project_root, handle)
+        if not resolved:
+            return 1
+        print(resolved)
+        return 0
     meta = os.environ.get("META_PATH")
     tree_status: dict[str, object] = {}
     bundle = build_bundle(

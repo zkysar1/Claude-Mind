@@ -1169,3 +1169,79 @@ def test_with_claim_alert_still_names_the_goal(tmp_path, monkeypatch):
     s = events[0].summary
     assert "while holding g-306-240" in s, s
     assert "died between units" not in s, s
+
+
+# ── read_known_goal_ids: the census the reaper deletes on ABSENCE () ─
+
+def _queue_file(tmp_path, name, goals):
+    p = tmp_path / name
+    p.write_text(json.dumps({"id": "asp-1", "goals": goals}) + "\n",
+                 encoding="utf-8")
+    return p
+
+
+def test_known_ids_are_STATUS_BLIND_unlike_terminal_ids(tmp_path):
+    """The two readers must disagree on the same bytes, or one is redundant.
+
+    `known` answers "does a record exist"; `terminal` answers "did it finish".
+    Collapsing them would make an id's absence ambiguous between "no such goal"
+    and "a goal in a status the filter dropped" — and the caller DELETES a row
+    on that absence.
+    """
+    q = _queue_file(tmp_path, "world-queue.jsonl", [
+        {"id": "g-1-1", "status": "completed"},
+        {"id": "g-1-2", "status": "pending"},
+        {"id": "g-1-3", "status": "blocked"},
+    ])
+    known, via = ws.read_known_goal_ids(q)
+    terminal, _ = ws.read_terminal_goal_ids(q)
+    assert known == {"g-1-1", "g-1-2", "g-1-3"}, known
+    assert terminal == {"g-1-1"}, terminal
+    assert known > terminal, "known must be a strict superset on this input"
+    assert via == "local-mirror"
+
+
+def test_known_ids_union_across_stores_including_the_archive(tmp_path):
+    """The union is the safe direction here and the INVERSE of the terminal
+    reader's: adding a store can only turn a reap into a KEEP.
+
+    The archive is the layer whose omission inverts the predicate. Measured on
+    the live tree (cc-09, 2026-09-04): it held 2,480 of 5,432 known ids, so a
+    two-store census would have called every one of those archived goals
+    "resolving nowhere". The two-store result is asserted explicitly BECAUSE
+    that difference is the whole hazard (guard-3379).
+    """
+    world = _queue_file(tmp_path, "world-queue.jsonl",
+                        [{"id": "g-1-1", "status": "pending"}])
+    agent = _queue_file(tmp_path, "agent-queue.jsonl",
+                        [{"id": "g-2-2", "status": "pending"}])
+    arch = _queue_file(tmp_path, "archived-queue.jsonl",
+                       [{"id": "g-3-3", "status": "completed"}])
+
+    two, _ = ws.read_known_goal_ids(world, agent)
+    three, _ = ws.read_known_goal_ids(world, agent, arch)
+    assert two == {"g-1-1", "g-2-2"}
+    assert three == {"g-1-1", "g-2-2", "g-3-3"}
+    assert "g-3-3" not in two, (
+        "the two-store census misses the archived goal — this difference IS the "
+        "mass false-reap the third store prevents")
+
+
+def test_known_ids_report_the_WEAKEST_provenance(tmp_path):
+    """One good read must never launder a failed one.
+
+    The caller declines on `none`, so a reader reporting its most flattering
+    half would arm the delete path off a hole in the census.
+    """
+    world = _queue_file(tmp_path, "world-queue.jsonl",
+                        [{"id": "g-1-1", "status": "pending"}])
+    ids, via = ws.read_known_goal_ids(world, tmp_path / "not-there.jsonl")
+    assert via == "none", via
+    assert ids == {"g-1-1"}, (
+        "the readable half still parses — it is the PROVENANCE that carries the "
+        "failure, which is why the caller must check it and not the set")
+
+
+def test_known_ids_with_no_stores_is_an_unanswered_census():
+    """Empty args is not an empty world."""
+    assert ws.read_known_goal_ids() == (set(), "none")

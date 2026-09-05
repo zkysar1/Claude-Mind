@@ -545,6 +545,13 @@ def test_real_notifier_swallows_a_broken_subprocess(monkeypatch):
     def _explode(*a, **k):
         raise OSError("no bash")
     monkeypatch.setattr(_sp, "run", _explode)
+    #  added a PYTEST_CURRENT_TEST short-circuit to the emitter so the
+    # suite stops mailing real memory alarms. That returns before the try/except
+    # this test is about, so without the sanctioned opt-out the assertion below
+    # reads 'suppressed under pytest' and the fail-open contract goes untested.
+    # Use the hatch the emitter provides rather than stubbing the function out —
+    # stubbing is precisely the defect this test's docstring records fixing.
+    monkeypatch.setenv("AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST", "1")
     got = WD._notify_critical_memory("s", "m")
     assert got["sent"] is False
     assert "OSError" in got["reason"]
@@ -560,6 +567,10 @@ def test_notify_reports_nonzero_rc_without_raising(monkeypatch):
         stdout = "no transport configured"
         stderr = ""
     monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
+    # Same  opt-out as above: the pytest short-circuit returns a dict
+    # with no "rc" key at all, so without this the assertion dies on KeyError
+    # rather than on the rc-reporting contract it is written to check.
+    monkeypatch.setenv("AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST", "1")
     got = WD._notify_critical_memory("s", "m")
     assert got["sent"] is False and got["rc"] == 5
 

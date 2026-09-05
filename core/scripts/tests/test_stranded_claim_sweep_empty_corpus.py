@@ -37,7 +37,21 @@ CORE_SCRIPTS = Path(__file__).resolve().parents[1]
 
 
 class _FakeRtError(RuntimeError):
-    pass
+    """Mirrors core/scripts/_rt.py::RtError — message, status AND body.
+
+    The status/body attributes are the whole point (g-357-69). This double
+    previously carried a message only, so a test could 'pass' against a
+    tolerance that read str(e) — which production can never satisfy, because
+    _rt.py puts the daemon's error CODE exclusively in the JSON body and the
+    message is always "daemon HTTP <code> for <method> <path>". A double that
+    is missing the attribute the production code must read cannot fail when
+    that read is missing (guard-920 / rb-9476).
+    """
+
+    def __init__(self, message, status=None, body=None):
+        super().__init__(message)
+        self.status = status
+        self.body = body
 
 
 class _RtStub:
@@ -75,9 +89,24 @@ def _load_sweep(monkeypatch, behaviour):
 def test_unknown_goal_field_returns_empty_not_systemexit(monkeypatch):
     """THE ASSERTION UNDER TEST. The daemon's 400 means 'zero claims', which is
     the documented {scanned: 0} case — the sweep must survive it."""
+    # THE LITERAL PRODUCTION SHAPE, byte-for-byte from _rt.py:105-107 —
+    # message carries NO error code, status=400, body carries the JSON. The
+    # previous fixture used "rt_call failed: 400 unknown_goal_field: ..."; that
+    # message shape is emitted NOWHERE in the tree, so this test passed for the
+    # whole time the tolerance was dead code ().
     err = _FakeRtError(
-        "rt_call failed: 400 unknown_goal_field: no goal record in any queue "
-        "carries that key. All 74 valid field names: id, title, status, ..."
+        "daemon HTTP 400 for GET /v1/aspirations/query",
+        status=400,
+        body=json.dumps({
+            "error": "unknown_goal_field",
+            "detail": "no goal record in any queue carries that key",
+        }),
+    )
+    # Guard the fixture itself: if this ever becomes satisfiable by str(e), the
+    # test has stopped exercising the defect it was written for.
+    assert "unknown_goal_field" not in str(err), (
+        "fixture regressed to a message-shaped error — production puts the code "
+        "in the body only, so a str(e) tolerance would pass vacuously again"
     )
     mod, stub = _load_sweep(monkeypatch, err)
     out = mod._query_claimed_goals("alpha")

@@ -6,13 +6,20 @@ xw_origin's resolution has its own functional tests in test_xw_origin.py).
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _bash_helpers import resolve_winpath  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "iteration-close.sh"
 
 
 def _do_verify_body() -> str:
-    src = SCRIPT.read_text(encoding="utf-8")
+    # Resolve the `_winpath` path helper before pinning the call shape --
+    # see _bash_helpers.resolve_winpath (a normalizer, not a loosened pattern).
+    src = resolve_winpath(SCRIPT.read_text(encoding="utf-8"))
     start = src.index("do_verify() {")
     end = src.index("\ndo_state_update() {", start)
     return src[start:end]

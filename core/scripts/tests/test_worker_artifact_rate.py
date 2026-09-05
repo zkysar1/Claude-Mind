@@ -42,7 +42,15 @@ _spec.loader.exec_module(war)
 
 
 def _world(tmp_path, goals, rb=(), guards=()):
-    """Build a minimal world dir. `goals` are (id_key, id, role, outcome)."""
+    """Build a minimal world dir.
+
+    `goals` are (id_key, id, role, outcome) or (id_key, id, role, outcome, day),
+    where `day` is a YYYY-MM-DD close date. DAY IS OPTIONAL AND DEFAULTS TO
+    ABSENT, deliberately: an absent day makes the window UNMEASURABLE, which is
+    the state the window guard must withhold a verdict on. Defaulting to a wide
+    span instead would satisfy the guard in every case that forgot to think
+    about it, and the guard would then be green-by-default (guard-2903).
+    """
     w = tmp_path / "world"
     # parents=True: callers nest under tmp_path (e.g. tmp_path/"id"/"world") to
     # get one world per sub-case, and those intermediate dirs do not exist yet.
@@ -51,9 +59,11 @@ def _world(tmp_path, goals, rb=(), guards=()):
         json.dumps({
             "id": "asp-1",
             "goals": [
-                {k: gid, "status": "completed",
-                 "completed_by_role": role, "outcome_class": outcome}
-                for (k, gid, role, outcome) in goals
+                dict({k: gid, "status": "completed",
+                      "completed_by_role": role, "outcome_class": outcome},
+                     **({"completed_at": g[4] + "T00:00:00"} if len(g) > 4 else {}))
+                for g in goals
+                for (k, gid, role, outcome) in [g[:4]]
             ],
         }) + "\n",
         encoding="utf-8",
@@ -113,8 +123,18 @@ def test_insufficient_data_below_min_sample(tmp_path, capsys, monkeypatch):
 
 
 def test_pass_and_fail_straddle_the_threshold(tmp_path, capsys, monkeypatch):
+    """RETARGETED, not opted out ( window guard, guard-4618).
+
+    These goals now carry close dates spanning 2026-09-01..2026-09-21 (20 days,
+    past the 14-day default), so this case ALSO proves the window guard does not
+    block a legitimately-wide population. Passing --min-window-days 0 would have
+    been the smaller edit and a strictly weaker test: it would prove the guard
+    can be switched off, not that it lets real data through.
+    """
     # 3 of 4 worker goals have an artifact -> 75%.
-    goals = [("id", f"g-4-0{i}", "worker", "deep") for i in range(1, 5)]
+    days = ["2026-09-01", "2026-09-07", "2026-09-14", "2026-09-21"]
+    goals = [("id", f"g-4-0{i}", "worker", "deep", days[i - 1])
+             for i in range(1, 5)]
     w = _world(tmp_path, goals=goals, rb=["g-4-01", "g-4-02"],
                guards=["g-4-03"])
 
@@ -156,3 +176,96 @@ def _run(mod, world: Path, monkeypatch, argv: list) -> int:
     monkeypatch.setattr(_paths, "WORLD_DIR", world, raising=False)
     monkeypatch.setattr(sys, "argv", ["worker-artifact-rate.py"] + argv)
     return mod.main()
+
+
+# ── The WINDOW guard ( unit artifact-rate-attribution-audit) ────────
+#
+# --min-sample bounds the population SIZE. It says nothing about its SPAN, and
+# the soak gate this check serves is explicitly a two-week window. MEASURED
+# 2026-09-05 on the live store: the stamped population went 0 -> 228 in FOUR
+# DAYS, so --min-sample 10 was satisfied within hours of the first worker close
+# and the check flipped straight to `FAIL: 10/228 (4.4%)` -- a confident verdict
+# on a population four days old.
+
+
+def test_window_guard_withholds_a_verdict_on_a_short_span(tmp_path, capsys,
+                                                          monkeypatch):
+    """A large population spanning too few days is INSUFFICIENT DATA, not FAIL."""
+    days = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+    goals = [("id", f"g-6-0{i}", "worker", "deep", days[i - 1])
+             for i in range(1, 5)]
+    # 0 of 4 carry an artifact -> the rate is 0%, which WOULD read FAIL.
+    w = _world(tmp_path, goals=goals, rb=["g-99-01"], guards=["g-6-01"])
+    rc = _run(war, w, monkeypatch, ["--min-sample", "4", "--min-window-days", "14"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "INSUFFICIENT DATA (window)" in out, out
+    assert not out.startswith("FAIL"), out
+    # The rate is still printed, explicitly labelled as trend-only -- withholding
+    # a verdict must not also withhold the number a reader is watching.
+    assert "reported for trend only" in out, out
+    assert "3 day(s)" in out, out
+
+
+def test_CONTROL_the_same_short_span_DOES_fail_with_the_guard_disabled(
+        tmp_path, capsys, monkeypatch):
+    """POSITIVE CONTROL (guard-2903): prove the guard is what withheld it.
+
+    Identical world, identical population, only --min-window-days changes. If
+    this case did not FAIL, the test above would be green for some unrelated
+    reason and would keep passing after the guard was removed.
+    """
+    days = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+    goals = [("id", f"g-6-0{i}", "worker", "deep", days[i - 1])
+             for i in range(1, 5)]
+    w = _world(tmp_path, goals=goals, rb=["g-99-01"], guards=["g-6-01"])
+    rc = _run(war, w, monkeypatch, ["--min-sample", "4", "--min-window-days", "0"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL"), out
+
+
+def test_an_unmeasurable_window_withholds_rather_than_passes(tmp_path, capsys,
+                                                             monkeypatch):
+    """No close dates at all -> span is None -> withhold.
+
+    The fail-safe DIRECTION is the point. An unreadable window could resolve
+    either way, and withholding says "not measured yet", which is true; passing
+    would assert the bridge is healthy on evidence that cannot support it.
+    """
+    goals = [("id", f"g-7-0{i}", "worker", "deep") for i in range(1, 5)]
+    w = _world(tmp_path, goals=goals, rb=["g-7-01"], guards=["g-7-02"])
+    rc = _run(war, w, monkeypatch, ["--min-sample", "4", "--min-window-days", "14"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "INSUFFICIENT DATA (window)" in out, out
+    assert "a single day" in out, out
+
+
+def test_population_shortfall_outranks_window_shortfall_in_the_json_reason(
+        tmp_path, capsys, monkeypatch):
+    """Both guards can trip at once; the reason must name the binding one.
+
+    A caller that reads `insufficient_reason` to decide what to WAIT for gets
+    the wrong answer if a 1-goal population reports "window" -- more elapsed
+    time will never fix a population of one.
+    """
+    w = _world(tmp_path, goals=[("id", "g-8-01", "worker", "deep", "2026-09-01")],
+               rb=["g-8-01"])
+    rc = _run(war, w, monkeypatch,
+              ["--min-sample", "10", "--min-window-days", "14", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert payload["verdict"] == "INSUFFICIENT_DATA"
+    assert payload["insufficient_reason"] == "population", payload
+
+
+def test_window_fields_are_measured_not_assumed(tmp_path):
+    """measure() reports the real span and both endpoints."""
+    goals = [("id", "g-9-01", "worker", "deep", "2026-08-20"),
+             ("id", "g-9-02", "worker", "deep", "2026-09-04"),
+             ("id", "g-9-03", "", "deep", "2026-01-01")]   # unstamped: excluded
+    m = war.measure(_world(tmp_path, goals=goals, rb=["g-9-01"]))
+    assert m["worker_window_days"] == 15, m
+    assert m["worker_window_first"] == "2026-08-20", m
+    assert m["worker_window_last"] == "2026-09-04", m

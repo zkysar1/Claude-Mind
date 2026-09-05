@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import json
 import os
 import re
 import subprocess
@@ -389,27 +390,19 @@ LIFECYCLE_DISPOSITIONS = {
             "the no-transcription rule applied to learning."),
     "verify-own-unit": LifecycleDisposition(
         kind=SCOPED_CALL,
-        # DECLARED, NOT YET WIRED -- and this field is the only honest way to say
-        # so. The phase and its disposition exist and are machine-checkable
-        # (`should-run-phase verify-own-unit` exits 0), but worker-loop Phase 4a
-        # does NOT yet invoke the verify skill.
+        # WIRED 2026-09-03 ( part1b). worker-loop Phase 4a now invokes
+        # /aspirations-verify with scope="own-unit" for the goal this Body just
+        # executed, immediately BEFORE the mechanical close. Both halves this row
+        # depended on are in place: part1a added the `scope` input to the verify
+        # skill (without it, a worker invoking an UNSCOPED verify would have run
+        # the cross-Body residue -- the Nth-reducer defect), and part2 added the
+        # reducer-side sampled audit (worker-closure-audit.py) that is the outside
+        # reader self-grading would otherwise remove.
         #
-        # THE PREREQUISITE IS NOW MET (2026-09-03,  part1a): the scope
-        # mode this row names EXISTS -- /aspirations-verify takes a `scope` input
-        # of "full" (default) or "own-unit", documented in its Inputs section.
-        # Until part1a it did not, and a worker told to invoke an UNSCOPED verify
-        # would have run the reducer-side cross-Body parts (streak tracking) --
-        # the Nth-reducer defect. What remains is only the worker-loop Phase 4a
-        # invocation, which is kept a SEPARATE increment because it changes the
-        # live loop under every worker Body in the fleet at once.
-        #
-        # `pending_goal` therefore STAYS until that invocation lands: this row
-        # states the contract without asserting the code honours it (see the
-        # LifecycleDisposition docstring: "an aspirational row written as a fact
-        # is worse than no row"). test_worker_lifecycle_contract.py pins the
-        # marker by name and goal id and is written to FAIL when the wiring
-        # lands, so whoever wires it removes both in the same change.
-        pending_goal="g-306-417",
+        # `pending_goal` was carried here from part1a until that invocation
+        # landed, and is deliberately gone now: this row asserts what the loop
+        # does, and it is true. The marker mechanism stays available for the next
+        # declared-but-unbuilt row (see the LifecycleDisposition docstring).
         target="aspirations-verify",
         mode="own-unit only: the hypothesis outcome, Q1/Q2/Q3 escalation and "
              "blocked_by-clears for the ONE goal this Body just executed "
@@ -601,7 +594,26 @@ SKILL_ELIGIBLE_DESPITE_ENCODING = frozenset({
 })
 
 _SkillEligibilityFields = collections.namedtuple(
-    "_SkillEligibilityFields", "eligible skill stage disposition reason")
+    "_SkillEligibilityFields",
+    "eligible skill stage disposition reason undetermined",
+    defaults=(False,))
+#
+# `undetermined` () is the DISCRIMINATOR, and it is separate from
+# `eligible` on purpose. The two branches below that CANNOT ANSWER the
+# question -- a skill-less goal, and a named skill the table does not map --
+# both returned `eligible=True` with the refusal written only into `reason`,
+# so every consumer that read the verdict rather than the prose saw a PASS.
+# The CLI printed the literal word "eligible" for them; worker-loop Phase 1
+# read that word. A decline that renders as a permit is the guard-1760 class
+# ("a checker must not report what it declined to look at as a pass").
+#
+# WHY THE EXIT CODE DOES NOT MOVE, stated so the next reader does not
+# "finish" this by making it non-zero: rc is the FAIL-OPEN axis. 919 of 938
+# live candidates carry no skill, so a non-zero rc on the can't-judge branch
+# converts "I have no key for this" into a REFUSAL for ~98% of the queue and
+# strands the worker role outright -- the exact failure skill_eligibility.__doc__
+# forbids. rc stays 0/1 (fail-open); the VERDICT WORD carries the third state.
+# Discrimination and fail-direction are different axes and must not be fused.
 
 
 def _known_skill_names() -> "tuple[str, ...]":
@@ -706,7 +718,8 @@ def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:
             "writes the agent-wide working-memory.yaml, it is REDUCER-ONLY -- "
             "release it and take the next candidate. "
             "(g-115-6523; guard-1760 class: a checker must not report what it "
-            "declined to look at as a pass.)")
+            "declined to look at as a pass.)",
+            undetermined=True)
     if norm in SKILL_ELIGIBLE_DESPITE_ENCODING:
         return _SkillEligibilityFields(
             True, norm, None, None,
@@ -717,9 +730,14 @@ def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:
     if stage is None:
         return _SkillEligibilityFields(
             True, norm, None, None,
-            f"{norm} maps to no lifecycle stage -- eligible by default (the "
-            f"bridge is a positive list of reducer-only skills; see "
-            f"skill_eligibility.__doc__ for why unknown is not fail-closed)")
+            f"{norm} maps to no lifecycle stage, so this bridge CANNOT "
+            f"ANSWER whether the goal is reducer-only -- UNDETERMINED, NOT a "
+            f"cleared check. Eligibility stays True because the bridge is a "
+            f"positive list of reducer-only skills and fail-closed would "
+            f"strand the role (see skill_eligibility.__doc__); the decision "
+            f"is YOURS. Read the goal's outcomes and description before "
+            f"claiming.",
+            undetermined=True)
     disp = LIFECYCLE_DISPOSITIONS[stage]
     if disp.kind == REDUCER_ONLY_BY_DESIGN:
         return _SkillEligibilityFields(
@@ -1360,6 +1378,20 @@ def worker_wm_path(agent: str, unit_key: "str | None" = None,
 
 # --------------------------- CLI ---------------------------
 
+def _verdict_word(verdict) -> str:
+    """The one-word stdout verdict. THREE values, not two ().
+
+    `undetermined` is what a caller must see when the bridge declined to judge.
+    It is checked BEFORE `eligible` because both can't-judge branches carry
+    eligible=True (fail-open, deliberate -- see _SkillEligibilityFields), so
+    testing eligible first would render every decline as a permit, which is the
+    defect this word exists to remove.
+    """
+    if verdict.undetermined:
+        return "undetermined"
+    return "eligible" if verdict.eligible else "reducer-only"
+
+
 def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Worker-body execution contract (Phase 2A, asp-306).")
@@ -1431,6 +1463,37 @@ def _main(argv=None) -> int:
     # positional onward.
     p_goal.add_argument("skill", nargs=argparse.REMAINDER, default=[],
                         help="the goal's skill field, args and all; empty means no skill")
+    p_claim = sub.add_parser("claim-role-recheck",
+                             help="re-run the role gate against a CLAIM RESPONSE "
+                                  "-- the fresh full record -- closing the TOCTOU "
+                                  "between a stale scored-row snapshot and a later "
+                                  "marking (g-306-449)")
+    # WHY THIS EXISTS AS A SECOND CALL SITE. `goal-eligible` above judges a
+    # candidate at SELECT time from the SCORED ROW. On a worker that row's
+    # `executable_by_role` is null for EVERY candidate it can ever see:
+    # goal-selector sets `_skip_reducer_only = (_role != ROLE_REDUCER)` and drops
+    # reducer-only rows before emission, so the select-time gate sits downstream
+    # of a filter that already removed everything it could catch. MEASURED
+    # 2026-09-05 (alpha, cc-13): 1859/1859 emitted rows carried the key, 1859
+    # null, and 0 of the 42 live goals stamped `reducer` were in the pool -- 27
+    # of them with no competing explanation (13 deferred, 2 claimed), against a
+    # control in which 88% of comparable unmarked pending goals WERE present.
+    # The claim response is therefore the ONLY surface on which a worker can
+    # ever observe a `reducer` value, which makes this -- not the select-time
+    # call -- the place the goal-level declaration actually binds.
+    # The residual risk is real and was observed: a peer write at
+    # 2026-09-05T02:38:25 stamped a goal `reducer` while it sat at RANK 1 in a
+    # worker's pool, scored under the older null.
+    # The claim response is the WHOLE record, verified rather than assumed
+    # (cc-13, same date: 25 keys returned vs 28 in the store record, the only
+    # three absent being the query wrapper's own asp_id/goal_id/source, i.e.
+    # ZERO goal fields dropped) -- so `executable_by_role` reaches here whenever
+    # the goal carries it. guard-4003: a criterion that asks a store for a field
+    # it does not carry is unsatisfiable forever and fails as a plausible "not
+    # yet"; that probe is what rules it out here.
+    p_claim.add_argument("--claim-file", required=True,
+                         help="path to the JSON claim response emitted by the "
+                              "claim wrapper; '-' reads stdin")
     sub.add_parser("reducer-only-skills",
                    help="print every skill a worker must not claim, with the "
                         "lifecycle stage each one IS")
@@ -1558,7 +1621,7 @@ def _main(argv=None) -> int:
         return 1
     if args.cmd == "skill-eligible":
         verdict = skill_eligibility(" ".join(args.skill))
-        print("eligible" if verdict.eligible else "reducer-only")
+        print(_verdict_word(verdict))
         # The reason goes to stderr so `$(... skill-eligible ...)` captures the
         # one-word verdict cleanly while a human (or a loop transcript) still
         # sees WHY. A silent skip is the half of this fix that would rot.
@@ -1566,7 +1629,38 @@ def _main(argv=None) -> int:
         return 0 if verdict.eligible else 1
     if args.cmd == "goal-eligible":
         verdict = goal_eligibility(" ".join(args.skill), args.role)
-        print("eligible" if verdict.eligible else "reducer-only")
+        print(_verdict_word(verdict))
+        print(verdict.reason, file=sys.stderr)
+        return 0 if verdict.eligible else 1
+    if args.cmd == "claim-role-recheck":
+        try:
+            raw = (sys.stdin.read() if args.claim_file == "-"
+                   else Path(args.claim_file).read_text(encoding="utf-8"))
+            record = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            # FAIL OPEN, deliberately, and say so in the same breath. An
+            # unreadable response is a PLUMBING fault, not a role declaration,
+            # and this gate must not invent a refusal from one -- the corpus it
+            # judges is ~100% unstamped, so a fail-closed default here would
+            # fence off nearly every goal a worker could legitimately take
+            # (the severity finding cc-08 already made against the fail-closed
+            # form of this criterion). Same direction as `undetermined`.
+            print("undetermined")
+            print(f"claim response at {args.claim_file!r} could not be read as "
+                  f"JSON ({exc}) -- the role re-check FAILS OPEN. This is NOT a "
+                  f"permit: judge the goal yourself.", file=sys.stderr)
+            return 0
+        if isinstance(record, list):
+            record = record[0] if record else {}
+        if not isinstance(record, dict):
+            print("undetermined")
+            print(f"claim response is a {type(record).__name__}, not a goal "
+                  f"record -- the role re-check FAILS OPEN. Judge it yourself.",
+                  file=sys.stderr)
+            return 0
+        verdict = goal_eligibility(record.get("skill"),
+                                   record.get("executable_by_role"))
+        print(_verdict_word(verdict))
         print(verdict.reason, file=sys.stderr)
         return 0 if verdict.eligible else 1
     if args.cmd == "reducer-only-skills":

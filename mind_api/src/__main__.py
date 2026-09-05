@@ -91,6 +91,31 @@ _N3_ALLOWED_EXACT = frozenset({
     # (byte-identical legacy behavior). MIND_API_BIND!=loopback fail-closes in
     # server.start() unless MIND_API_TOKEN is set.
     "MIND_API_TOKEN", "MIND_API_BIND",
+    # : the LAN object cache's CLIENT half. `OwnCloudBackend._cache_fetch`
+    # reads both (core/scripts/owncloud_backend.py:959,972) and the daemon IS the
+    # client on every box — but neither key was here, so setting the documented
+    # flag in .env.local silently did nothing and the cache could only ever be
+    # enabled by exporting into the launch env, "which is not where any other
+    # daemon setting lives" (the OWNCLOUD_PULL_EVERY_N note above — same defect,
+    # ; this is its third and fourth instance).
+    # Non-secret: a base URL and a float timeout, same class as OWNCLOUD_CACHE_TTL
+    # two lines up — which is read in that SAME backend module and was already
+    # allowed here, so backend-read OWNCLOUD_* keys belonging in this list is
+    # established practice, not a new precedent. guard-1900 / guard-3485.
+    "OWNCLOUD_OBJECT_CACHE", "OWNCLOUD_OBJECT_CACHE_TIMEOUT",
+    # : MIND_API_PORT pins the daemon's LISTEN port. Default-absent =>
+    # 0 => the OS-assigned port this daemon has always used, so adding the key
+    # changes nothing until someone sets it. It belongs on THIS surface for the
+    # same reason MIND_API_TOKEN / MIND_API_BIND six lines up do: .env.local is
+    # re-read at EVERY start, including the auto-respawn a SHA move triggers,
+    # whereas the two spawn wrappers are declared twins ("fix both or neither"
+    # at mind-api-start.sh) that a THIRD spawn path would silently bypass.
+    # Non-secret integer, same class as the cadence knobs above. Read in main()
+    # — the reader landed in the same change as this entry (guard-3485: a key
+    # in an allowlist with no reader is inert, and a reader not in the
+    # allowlist never receives the value; this defect's first three instances
+    # were OWNCLOUD_PULL_EVERY_N and the OBJECT_CACHE pair right above).
+    "MIND_API_PORT",
 })
 
 
@@ -440,20 +465,29 @@ def _start_owncloud_sync_thread(project_root: Path, shutdown: "threading.Event")
             print(f"[owncloud-sync] import failed; mirror sweep disabled: {e}",
                   file=sys.stderr)
             return
-        # Fresh-box firmware materialization (): ONE-TIME pull of the
-        # governed non-agent firmware (world/scripts) from S3 so bare-bash
-        # world/scripts/*.sh (email-send.sh, output-style-mode-guard.sh) work on
-        # day 1 of a fresh own-cloud clone. Runs BEFORE the settle delay so a
-        # fresh box materializes ASAP, but AFTER the daemon is already serving
-        # (this thread starts post-publish), so it is off the spawn critical path
-        # — a slow first pull can never delay daemon publish / trigger a
-        # spawn-timeout daemon storm. Marker-gated (one-time per box) + fully
-        # fail-open, so warm boots skip at ~1 stat and a bad pull never kills the
-        # sweep thread.
+        # Firmware materialization (): pull of the governed non-agent
+        # firmware (world/scripts) from S3 so bare-bash world/scripts/*.sh
+        # (email-send.sh, output-style-mode-guard.sh) work on day 1 of a fresh
+        # own-cloud clone. Runs BEFORE the settle delay so a fresh box
+        # materializes ASAP, but AFTER the daemon is already serving (this thread
+        # starts post-publish), so it is off the spawn critical path — a slow
+        # first pull can never delay daemon publish / trigger a spawn-timeout
+        # daemon storm. Marker-THROTTLED (not one-time: the marker ages out after
+        # _FIRMWARE_RECHECK_SECONDS, so a box returning from a wedge/outage/
+        # restore refetches instead of running stale scripts forever —
+        # ) + fully fail-open, so warm boots inside the window still
+        # skip at ~1 stat and a bad pull never kills the sweep thread.
         try:
             mstats = owncloud_sync.materialize_firmware(get_backend(), project_root)
             if mstats.get("pulled") or mstats.get("errors"):
-                print(f"[owncloud-materialize] roots={mstats.get('materialized_roots')} "
+                # Name BOTH sides (guard-4421/guard-5615): on a recheck the store
+                # is the leading side and `pulled` counts the files this box was
+                # executing stale, so the line has to say it was a REFRESH rather
+                # than reading like a first-boot materialization.
+                kind = ("refresh after {}s stale-window".format(mstats.get("marker_age_seconds"))
+                        if mstats.get("recheck") else "first materialization")
+                print(f"[owncloud-materialize] {kind}: store led, "
+                      f"roots={mstats.get('materialized_roots')} "
                       f"pulled={mstats.get('pulled', 0)} in_sync={mstats.get('in_sync', 0)} "
                       f"errors={mstats.get('errors', 0)}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001 — materialization must never kill the sweep
@@ -601,13 +635,52 @@ def _spawn_lock(project_root: Path):
             lock_path.unlink()
 
 
+def _resolve_bind_port(cli_port, environ) -> int:
+    """Resolve the daemon's listen port. .
+
+    An OS-assigned port turns over on every daemon recycle (measured on one box:
+    41247 -> 42055 -> 42387 inside ~25 min, the third from a SHA-move auto
+    restart), and a client pinned to the old one fails OPEN — no error, no hit,
+    indistinguishable from "the feature does not help". ``MIND_API_PORT`` pins it.
+
+    Precedence: an explicit ``--port`` wins; then ``$MIND_API_PORT``; then 0,
+    which IS the pre-existing OS-assigned behaviour, so an UNSET key leaves this
+    daemon byte-identical to before the key existed.
+
+    A non-empty UNPARSEABLE or out-of-range value raises rather than falling back
+    to 0. That direction is the whole point: a fall back would silently restore
+    the exact wrong-port failure the key exists to remove, and the operator who
+    typo'd it would get the fail-open behaviour they were trying to leave
+    (communication-clarity rule 5 — fail visibly over a silent inconsistent
+    source). An EMPTY value is treated as unset, matching how ``_load_env_local``
+    already treats a blank `.env.example`-style line.
+
+    Pure (environ is passed in, never read from the module) so the precedence
+    rules are pinnable without starting a daemon.
+    """
+    if cli_port is not None:
+        return cli_port
+    raw = (environ.get("MIND_API_PORT") or "").strip()
+    if not raw:
+        return 0
+    try:
+        port = int(raw)
+    except ValueError:
+        port = -1
+    if not 0 <= port <= 65535:
+        raise ValueError(f"MIND_API_PORT={raw!r} is not a port in 0-65535")
+    return port
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m mind_api.src",
         description="Framework runtime daemon (long-running localhost HTTP).",
     )
-    parser.add_argument("--port", type=int, default=0,
-                        help="Bind port (default 0 = OS-assigned)")
+    # default=None (not 0) so "--port not passed" is distinguishable from
+    # "--port 0 passed explicitly"; both used to collapse to 0. .
+    parser.add_argument("--port", type=int, default=None,
+                        help="Bind port (default: $MIND_API_PORT, else 0 = OS-assigned)")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
 
@@ -618,6 +691,18 @@ def main(argv=None) -> int:
     # does not otherwise read .env.local; without this a STORAGE_BACKEND
     # cutover would never take effect in the daemon. See _load_env_local.
     _load_env_local(project_root)
+
+    # : resolve the LISTEN port now that .env.local has reached
+    # os.environ. Refusing here is deliberate — see _resolve_bind_port.
+    try:
+        bind_port = _resolve_bind_port(args.port, os.environ)
+    except ValueError as exc:
+        print(
+            f"[runtime] FATAL: {exc}. Refusing to start on an OS-assigned port, "
+            "which would silently defeat the pin (g-358-62).",
+            file=sys.stderr,
+        )
+        return 2
 
     # Derive storage wiring (STORAGE_BACKEND / STORAGE_S3_BUCKET / STORAGE_DDB_* /
     # AWS_DEFAULT_REGION) from the local environment registry keyed on
@@ -680,7 +765,7 @@ def main(argv=None) -> int:
                 return 2
 
             lifecycle.clear_runtime_files(project_root)
-            server = Server(project_root=project_root, port=args.port)
+            server = Server(project_root=project_root, port=bind_port)
             # Server.start() writes PID + port files. The spawn lock is held
             # through that write so a racing spawn sees alive() on retry.
             shutdown = threading.Event()

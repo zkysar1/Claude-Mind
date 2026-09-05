@@ -46,7 +46,7 @@ def test_wrapper_happy_path(running_daemon):
     """Daemon path: prints goal JSON to stdout, exits 0."""
     project_root, _ = running_daemon
     goal = {
-        "title": "Investigate: wrapper happy path",
+        "title": "Build: wrapper happy path",
         "status": "pending",
         "origin_signal": "user_directive",
         "description": "x" * 100,
@@ -55,10 +55,14 @@ def test_wrapper_happy_path(running_daemon):
                         project_root=project_root)
     assert rc == 0, f"wrapper exit {rc}: stderr={err}"
     parsed = json.loads(out)
-    assert parsed["title"] == "Investigate: wrapper happy path"
+    assert parsed["title"] == "Build: wrapper happy path"
     assert parsed["id"].startswith("g-001-")
-    # Daemon-side mutator runs through the wrapper
-    assert parsed["intended_agent"] == "zeta"
+    # Daemon-side mutator runs through the wrapper. "Build:" (-> alpha), not
+    # "Investigate:", since  (2026-09-04) re-pointed that prefix at
+    # "either" — which is also the classifier's no-signal default, so asserting
+    # it would no longer evidence that the mutator ran at all, which is the one
+    # thing this line exists to show.
+    assert parsed["intended_agent"] == "alpha"
     # No warnings → stderr should not contain the description-length warning
     assert "description short" not in err
 

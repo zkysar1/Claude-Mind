@@ -360,21 +360,67 @@ def main(argv=None) -> int:
         "--source", args.source, "--value-stdin", args.goal_id, args.field,
     ), input=new)
     if res.returncode != 0:
-        _die(RC_WRITE_FAILED, f"write failed (rc={res.returncode}): {res.stderr.strip()[:600]}")
-
-    # VERIFY against PRE, never against `new` — comparing to your own
-    # construction only proves the write echoed (sig-40).
-    try:
-        written = _parse_json_tail(res.stdout)
-    except Exception as exc:  # noqa: BLE001
-        _die(RC_VERIFY_FAILED, f"write returned unparseable output, cannot verify: {exc}")
+        # The wrapper's rc is NOT the store of record (, rb-2648): its
+        # OWN output handling can raise (e.g. a JSONDecodeError when the appended
+        # text carries a dict/JSON literal) AFTER the field is already written —
+        # the measured rc=6 false alarm. Confirm against an independent read
+        # before declaring the write failed.
+        recovered = None
+        try:
+            again = read_goal(args.goal_id, args.source)
+            val = again.get(args.field)
+            if isinstance(val, str) and sentinel in val and (not pre or pre in val):
+                recovered = val
+        except SystemExit:
+            pass
+        if recovered is None:
+            _die(RC_WRITE_FAILED,
+                 f"write failed (rc={res.returncode}) and an independent store read does not "
+                 f"show it landed: {res.stderr.strip()[:400]}. Re-run the identical command — "
+                 "the marker keeps the retry idempotent.")
+        # Landed despite the wrapper's nonzero rc — verify against the
+        # authoritative value the store returned, not the errored echo.
+        written = {args.field: recovered}
+    else:
+        # VERIFY against PRE, never against `new` — comparing to your own
+        # construction only proves the write echoed (sig-40).
+        try:
+            written = _parse_json_tail(res.stdout)
+        except Exception as exc:  # noqa: BLE001
+            _die(RC_VERIFY_FAILED, f"write returned unparseable output, cannot verify: {exc}")
     post = written.get(args.field)
     problems = verify_post(pre, post, sentinel)
     if problems:
-        _die(RC_VERIFY_FAILED,
-             "write landed but verification FAILED: " + "; ".join(problems) +
-             ". Recover the PRE value from core/scripts/history.py list world/aspirations.jsonl "
-             "(the snapshot BEFORE the entry naming this write).")
+        # The wrapper's stdout ECHO is NOT the store of record (,
+        # sig-40, rb-2648, guard-1711): a full-field write can echo a
+        # projected/omitted field while the store itself is written correctly —
+        # the measured rc=7 "field was overwritten" false positive. Re-verify
+        # against an INDEPENDENT fresh read before declaring failure or naming
+        # any recovery. A sentinel-absent fresh read is own-cloud lag
+        # (guard-1122), NOT a loss; only marker-present-AND-PRE-absent is a real
+        # rewrite.
+        confirmed_lost = None  # None = confirmation read unavailable
+        try:
+            again = read_goal(args.goal_id, args.source)
+            val = again.get(args.field)
+            if isinstance(val, str):
+                confirmed_lost = bool(sentinel in val and pre and pre not in val)
+                if not confirmed_lost and sentinel in val:
+                    post = val  # store is sound; report its authoritative value
+        except SystemExit:
+            pass
+        if confirmed_lost is None or confirmed_lost:
+            detail = ("confirmed against an independent read of the store"
+                      if confirmed_lost
+                      else "the wrapper echo failed verification and the confirmation read was unavailable")
+            _die(RC_VERIFY_FAILED,
+                 "write verification FAILED (" + detail + "): " + "; ".join(problems) +
+                 ". Re-run the identical command — the marker keeps the retry idempotent. To "
+                 "inspect this one field's history use core/scripts/history.py list "
+                 "world/aspirations.jsonl; DO NOT run history.py restore — it rewrites the WHOLE "
+                 "shared store in place and discards every other Body's writes since the snapshot "
+                 "(g-115-8819).")
+        # else: the echo was misleading; the authoritative store confirms the write.
 
     # Independent confirmation read. Under own-cloud a same-second re-read can
     # lag the authoritative store (guard-1122), so a disagreement here is

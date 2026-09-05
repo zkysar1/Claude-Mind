@@ -116,6 +116,7 @@ from typing import Any, Dict, List, Optional
 # the carrier pipeline is broken; a fleet of `alive` means it is working).
 R_REAP = "reap"                               # stale + no live claim -> orphan
 R_REAP_TERMINAL_GOAL = "reap-terminal-goal"   # the row's goal is FINISHED
+R_REAP_VANISHED_GOAL = "reap-vanished-goal"   # the row's goal resolves NOWHERE
 K_SELF_SID = "self-sid"                       # this process's own row
 K_NO_CARRIER = "no-carrier"                   # carrier absent -> death unproven
 K_ALIVE = "alive"                             # carrier fresh and ours
@@ -124,15 +125,24 @@ K_UNREADABLE = "unreadable"                   # carrier present, no usable ts
 K_SID_MISMATCH = "carrier-sid-mismatch"       # guard-358
 K_NULL_RESIDUE = "null-residue"               # pre- null-valued key
 
-#: The verdicts that mutate. TWO, since  item 3 -- and they reap on
-#: DIFFERENT evidence, which is why the second is not folded into the first:
+#: The verdicts that mutate. THREE, since  -- and they reap on
+#: DIFFERENT evidence, which is why none is folded into another:
 #: `R_REAP` concludes the BODY is gone (a stale carrier), while
 #: `R_REAP_TERMINAL_GOAL` concludes the WORK is gone (the store says the goal is
 #: finished) and says nothing at all about the Body, which is usually alive and
 #: simply moved on. Keeping the tokens distinct keeps the two populations
 #: countable in `verdict_counts`, which is how the next decision about either
 #: predicate gets made (guard-2293).
-REAPING_VERDICTS = frozenset({R_REAP, R_REAP_TERMINAL_GOAL})
+#:
+#: `R_REAP_VANISHED_GOAL` is the third and is kept separate for a STRONGER
+#: reason than countability: it is the only verdict here that reaps on INFERENCE
+#: FROM SILENCE rather than on something a store affirmatively said. Every other
+#: reaping branch can point at bytes that assert its premise; this one points at
+#: the absence of bytes. Folding it into `R_REAP_TERMINAL_GOAL` -- which the
+#: filing goal's proposed shape would have done -- would make the fleet's riskiest
+#: predicate the only one nobody can count, and would hide it inside the token a
+#: reader trusts most. Separate token, separate column in `verdict_counts`.
+REAPING_VERDICTS = frozenset({R_REAP, R_REAP_TERMINAL_GOAL, R_REAP_VANISHED_GOAL})
 
 #: Deliberately LONGER than the sweep's own `--carrier-fresh-minutes`. That
 #: threshold governs whether to HOLD A CLAIM, which is reversible on the next
@@ -167,6 +177,7 @@ def decide_row(
     holds_live_claim: bool = False,
     self_sid: Optional[str] = None,
     goal_is_terminal: Optional[bool] = None,
+    goal_vanished: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Pure per-row decision — every branch reachable with no daemon and no I/O.
 
@@ -177,7 +188,17 @@ def decide_row(
     predates the parameter). Only True reaps. A `bool` here would collapse
     "unmeasured" into "not terminal", which is the harmless direction -- but it
     would also let a future caller silently opt the whole predicate out while
-    still type-checking, so the absence is kept nameable (guard-2418)."""
+    still type-checking, so the absence is kept nameable (guard-2418).
+
+    `goal_vanished` is tri-state for the same reason and carries MORE weight in
+    the None state (g-306-438): True = the caller censused every store a row of
+    this agent can name and this id was in NONE of them, False = it was found,
+    None = NOT MEASURED (no id on the row, a store was unreadable, the caller
+    could not census, or a caller predating the parameter). Only True reaps.
+    Because this is the one predicate that concludes from ABSENCE, `None` is not
+    merely the harmless default — it is the mandatory degradation whenever the
+    census was incomplete, and the caller owns that judgement because only the
+    caller knows which stores it actually read."""
     ev = carrier_evidence or {}
     out: Dict[str, Any] = {
         "sid": sid,
@@ -190,6 +211,11 @@ def decide_row(
         # here mean "the queue said not-terminal" and "nobody looked", and a
         # reader triaging why a row survived needs to tell those apart.
         "goal_is_terminal": goal_is_terminal,
+        # Same tri-state discipline, and the reason to emit it is sharper here:
+        # this is the field that says whether the DELETE-ON-ABSENCE predicate was
+        # even armed for this row, which is the first thing to check when a
+        # phantom survives a sweep.
+        "goal_vanished": goal_vanished,
     }
 
     # Order matters: the most certain KEEPs come first, so an ambiguous carrier
@@ -242,6 +268,64 @@ def decide_row(
         # here -- `None` (unmeasured) and `False` fall through untouched, so a
         # caller that cannot answer the question changes nothing.
         out["verdict"] = R_REAP_TERMINAL_GOAL
+        return out
+
+    if goal_vanished is True and not holds_live_claim:
+        # THE GOAL RESOLVES NOWHERE, so the work cannot still be in flight
+        # (). The branch above asks the store "is this goal finished?";
+        # a goal ARCHIVED OUT OF EXISTENCE cannot answer, because there is no
+        # record left to carry a status. It read as `False` — indistinguishable
+        # from a live, unfinished goal — and `decide_row` reaps on terminal only
+        # when the answer is `True`, so such a row was unreapable BY
+        # CONSTRUCTION, forever, whatever its carrier or age.
+        #
+        # MEASURED INSTANCE (bravo, sid 3ebc753b, goal , claimed
+        # 2026-08-07T23:58:02 = 669h / 27.9 days). Re-verified on cc-09
+        # 2026-09-04 against all three stores at authoritative provenance: absent
+        # from the world queue (2,921 ids), from alpha's queue (32) and from the
+        # archive (2,480). Positive controls in the same read: a live claimed
+        # goal was present-and-not-terminal, a just-completed one present-and-
+        # terminal — so the set was genuinely read and the absence is the finding.
+        #
+        # ORDERED AFTER `goal_is_terminal` because that branch rests on POSITIVE
+        # evidence and this one on its absence; where both could fire, the
+        # verdict should name the stronger reason. In practice they are mutually
+        # exclusive: a goal the store calls terminal is by definition a goal the
+        # store still has.
+        #
+        # ORDERED BEFORE THE CARRIER BRANCHES for the reason the branch above
+        # gives — the carrier answers "is the BODY alive", and a Body that is
+        # perfectly alive and has simply moved on keeps a phantom row forever
+        # (`CV_FRESH_CORRECT` -> K_ALIVE). The whole point is to reach rows the
+        # liveness question cannot.
+        #
+        # GATED ON `holds_live_claim`, UNLIKE THE TERMINAL BRANCH ABOVE, and the
+        # asymmetry is deliberate rather than an oversight. A terminal status is
+        # the store affirming the work is over, which makes any surviving claim
+        # on it stale by construction. Absence affirms nothing: the sid may be
+        # alive and holding a live claim on a DIFFERENT goal (`holds_live_claim`
+        # is per-SID, not per-goal), and reaping then hides a working Body for
+        # the rest of its goal — the guard-741 hazard this module's FAIL-SAFE
+        # note calls unrecoverable, since rows are written at CLAIM time and
+        # never re-written.
+        #
+        # Written ungated first, and two EXISTING tests caught it immediately:
+        # `test_agent_queue_only_claim_is_not_reaped` and
+        # `test_apply_declines_when_a_claim_appears_between_scan_and_write`. That
+        # is  re-opened one door over — its finding was a Body whose
+        # only claim sat in the agent queue being reaped, and an ungated branch
+        # here reproduces exactly that outcome by skipping the check instead of
+        # narrowing the map. Falling THROUGH to the carrier branches (rather
+        # than minting a new keep token) is what preserves the old behaviour
+        # byte-for-byte whenever a claim is held.
+        #
+        # THE REST OF THE SAFETY IS NOT HERE — it is in the caller. This module
+        # cannot see which stores were censused, so `True` must already mean
+        # "every store was read and the id was in none". guard-3379 is the
+        # standing hazard: a caller that censuses one layer fewer turns every
+        # goal held only in the missing layer into a reap, silently, and the
+        # measured cost of getting that wrong is ~2,480 archived goals.
+        out["verdict"] = R_REAP_VANISHED_GOAL
         return out
 
     # guard-358, both spellings. `fresh-wrong` is the explicit token; a STALE
@@ -300,12 +384,40 @@ def _goal_terminal(row: Any, terminal_goal_ids: Optional[set]):
     return str(gid) in terminal_goal_ids
 
 
+def _goal_vanished(row: Any, known_goal_ids: Optional[set]):
+    """Tri-state: does this row's goal resolve to NO RECORD ANYWHERE? ()
+
+    The FOURTH state `_goal_terminal` could not express. That function collapses
+    two opposite meanings into `False` — "the queue holds this goal and it is not
+    finished" (keep the row) and "no store holds this goal at all" (maximally
+    finished, and the row is immortal). This separates the second one out.
+
+    `None` whenever the question was not answerable: no census was supplied (the
+    caller could not read a store, or predates the parameter), or the row carries
+    no `goal_id`. `None` is the load-bearing state here, not a formality — this is
+    the only predicate in the module that concludes from absence, so an
+    incomplete census MUST arrive as `None` rather than as a set with a hole in
+    it. Passing a partial set is indistinguishable HERE from a complete one, and
+    the difference is a wrongly-deleted row (see the module's FAIL-SAFE note:
+    reaped rows do not self-heal).
+    """
+    if known_goal_ids is None:
+        return None
+    if not isinstance(row, dict):
+        return None
+    gid = row.get("goal_id")
+    if not gid:
+        return None
+    return str(gid) not in known_goal_ids
+
+
 def decide(
     rows: Dict[str, Any],
     carrier_verdicts: Dict[str, Any],
     claims_by_sid: Dict[str, str],
     self_sid: Optional[str] = None,
     terminal_goal_ids: Optional[set] = None,
+    known_goal_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Decide over one agent's whole `in_flight_bodies` map. Pure.
 
@@ -314,6 +426,16 @@ def decide(
     owning-agent note in the module docstring. This function cannot enforce that
     (it cannot see whose shard it was handed); the integration is responsible and
     its test pins it.
+
+    `known_goal_ids` carries the same caller-owned obligation as `claims`, in the
+    same direction, and it is the sharper of the two (g-306-438). It must be the
+    union over EVERY store a row of this agent can name — world queue, this
+    agent's own queue, and the archive both drain into — and the caller MUST pass
+    `None` rather than a partial set when any of them was unreadable. This
+    function cannot tell a complete census from an incomplete one, so a narrowed
+    set does not degrade the predicate, it INVERTS it: every goal living only in
+    the omitted store becomes "resolves nowhere" and its row becomes reapable.
+    That is the g-306-270 hole re-opened one store over, in the delete direction.
     """
     decisions: List[Dict[str, Any]] = []
     for sid in sorted(rows or {}):
@@ -329,6 +451,8 @@ def decide(
                 self_sid=self_sid,
                 goal_is_terminal=_goal_terminal(
                     (rows or {})[sid], terminal_goal_ids),
+                goal_vanished=_goal_vanished(
+                    (rows or {})[sid], known_goal_ids),
             )
         )
     counts: Dict[str, int] = {}

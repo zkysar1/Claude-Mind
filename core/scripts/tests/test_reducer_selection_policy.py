@@ -252,7 +252,15 @@ def _floor(monkeypatch, *, body_role, sid, running_sid, team_state, rows,
     monkeypatch.setattr(gs, "_load_team_state_cached", lambda: team_state)
     monkeypatch.setattr(gs, "REDUCER_SELECTION_CONFIG",
                         config or dict(R.DEFAULTS))
-    return gs.apply_reducer_only_floor(rows, None, prior_hoist_fired=prior_hoist)
+    # now=NOW is LOAD-BEARING, not tidiness. _team_state stamps `claimed_at`
+    # relative to the frozen NOW above, and live_worker_count drops any row older
+    # than claim_fresh_hours (6h). While the floor read the real wall clock, these
+    # fixtures were fresh only while real-now sat within 6h of NOW -- so this file
+    # passed 25/25 the morning it was written and went 4-red the same evening,
+    # then stayed red, with no code change in between. Freeze both ends or the
+    # freshness tests measure the calendar.
+    return gs.apply_reducer_only_floor(rows, None, prior_hoist_fired=prior_hoist,
+                                       now=NOW)
 
 
 def test_worker_selection_is_byte_identical_even_above_threshold(monkeypatch):
@@ -377,3 +385,77 @@ def test_config_is_read_from_aspirations_yaml_not_hardcoded():
     assert set(cfg) == set(R.DEFAULTS)
     assert cfg["worker_threshold"] == 3
     assert cfg["enabled"] is True
+
+
+# --- emitter (guard-1362): the ROW the floor actually filters ----------------
+#
+# Every test above builds its rows by hand via _rows(), so all of them passed
+# while the shipped floor was inert on EVERY box. score_goal's emission never
+# carried `executable_by_role`, so is_reducer_only_row read None for every real
+# candidate and `nominees` was empty on every pass -- the documented "inert
+# case" -- long after both preconditions the floor's own comment names were
+# satisfied (e62c24033 on origin/main; 60 goals stamped). Measured 2026-09-03
+# (echo, cc-03, Linux 6.8.0-138-generic): branch=prefer-reducer-only logged 3x
+# at 6 live workers while 6 stamped goals sat at ranks 28/512/628/633/665/1102,
+# none hoisted. Hand-built rows cannot catch that; only the emitter can.
+# Same class as guard-920 (a regression test must replicate the production
+# shape, not the contract-ideal one) and guard-2518 (a projection is a schema in
+# its own right; filtering on a field it omits yields a silent zero).
+
+def test_score_goal_emits_executable_by_role():
+    """guard-1362: the EMITTER carries the field, not only the consumer."""
+    gs._ACTIVE_DIRECTIVES = []
+    goal = {"id": "g-x-1", "title": "t", "priority": "HIGH",
+            "executable_by_role": "reducer"}
+    cand = {"goal": goal, "aspiration": {"id": "asp-x"}, "source": "world"}
+    result = gs.score_goal(cand, {}, [], [])
+    assert result["executable_by_role"] == "reducer"
+    # The end-to-end contract: the predicate must accept the row the emitter
+    # produced. Asserting only the key would still pass if the VALUE shape drifted.
+    assert R.is_reducer_only_row(result) is True
+
+
+def test_score_goal_emits_executable_by_role_as_none_when_unstamped():
+    """An unstamped goal emits the KEY with value None.
+
+    Presence-with-None, not absence: the key being in the emission is what makes
+    a future projection regression visible to a key-set assertion, and it keeps
+    the unstamped path byte-equivalent for the predicate (False either way).
+    """
+    gs._ACTIVE_DIRECTIVES = []
+    goal = {"id": "g-x-2", "title": "t", "priority": "HIGH"}
+    cand = {"goal": goal, "aspiration": {"id": "asp-x"}, "source": "world"}
+    result = gs.score_goal(cand, {}, [], [])
+    assert "executable_by_role" in result
+    assert result["executable_by_role"] is None
+    assert R.is_reducer_only_row(result) is False
+
+
+# ---- the frozen-clock seam ( follow-up; the time-bomb regression) ----
+
+def test_the_floor_honours_an_injected_clock(monkeypatch):
+    """`now=` must actually REACH live_worker_count's freshness comparison.
+
+    THE DEFECT THIS PINS, measured on cc-08 2026-09-03: apply_reducer_only_floor
+    hardcoded datetime.now() while this file anchors its fixture rows to the
+    frozen NOW above. live_worker_count drops rows older than claim_fresh_hours
+    (6h), so the fixtures were fresh only while real-now sat inside 6h of NOW --
+    the file passed 25/25 the morning it was authored and went 4-red the same
+    evening, then stayed red forever, with NO code change in between. A red that
+    switches on by calendar reads as a genuine regression to whoever meets it
+    next, and it cost a reducer a pristine-worktree baseline run to rule out.
+
+    Dropping the parameter is already caught (the `now=NOW` call in _floor would
+    raise TypeError). This pins the OTHER half -- accepting the parameter and
+    then ignoring it, which is silent. Both rows below are 1h before NOW and
+    therefore STALE against any real wall clock after NOW+7h; the count can only
+    reach the threshold if the injected clock is the one being compared against.
+    """
+    picked, status = _floor(
+        monkeypatch, body_role=None, sid=SID, running_sid=SID,
+        team_state=_team_state(("a", "s0", 1), ("a", "s1", 1), ("a", "s2", 1)),
+        rows=_rows(("g-1-1", None, "reducer"), ("g-1-2", None, None)))
+    assert status["live_workers"] == 3, (
+        "injected clock was ignored -- freshness compared against the wall clock")
+    assert status["branch"] == R.BRANCH_PREFER_REDUCER_ONLY
+    assert picked is not None and picked["goal_id"] == "g-1-1"

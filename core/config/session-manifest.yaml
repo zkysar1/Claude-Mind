@@ -1165,3 +1165,8 @@ invariants:
     description: agent-state is RUNNING but runner-heartbeat is missing — session may have crashed before first heartbeat
     rule: agent-state == RUNNING AND runner-heartbeat does NOT exist
     severity: warning
+
+  - id: running_without_persona
+    description: the aspirations loop is turning under agent-state RUNNING but persona-active reads false — /boot Phase -1 step 1 never fired, so the loop runs with its persona OFF
+    rule: loop-active exists AND agent-state == RUNNING AND persona-active reads "false"
+    severity: warning

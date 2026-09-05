@@ -152,6 +152,39 @@ def main():
     usage = cw.get("current_usage") or {}
     input_tokens = usage.get("input_tokens", 0)
 
+    # DERIVE input_tokens FROM used_percentage WHEN THE COUNTER IS DEAD
+    # ( class, measured 2026-09-03 on foxtrot / LAPTOP-3IOFCNEO).
+    #
+    # Everything below — headroom, pct_to_autocompact, zone — is computed from
+    # input_tokens ALONE. used_pct is recorded but never consumed. On a live
+    # session the statusLine payload delivered `used_percentage: 36` and
+    # `context_window_size: 1000000` beside `current_usage.input_tokens: 2`, so
+    # the record contained two mutually-falsifying halves: 36% of a 1M window is
+    # ~360k tokens in use, and 2 is not that. The zone read `fresh` with
+    # `headroom_tokens: 479998` and `pct_to_autocompact: 0.0` right up to hard
+    # context exhaustion, because every one of those three came off the dead
+    # half. Consequence: EVERY soft-degradation path keyed on the zone
+    # (aspirations Phase 8.8 evolution skip, aspirations-select batch sizing,
+    # aspirations-execute episode-chain capping, the abbreviation policy's
+    # zone==tight precondition) saw `fresh` and throttled nothing. The session
+    # ran to zero tokens and then livelocked against the stop hook, which
+    # correctly refuses a text-only turn-end but cannot be satisfied by a
+    # session with no budget left to act.
+    #
+    # This does NOT revert the zone to used_pct — see classify_zone's comment,
+    # which is still correct and still binding: anchoring zones on raw
+    # used_pct makes `tight` unreachable whenever autocompact fires below 85%
+    # of the raw window. The repair is to the INPUT, not the anchor.
+    #
+    # guard-2018 ("an absent counter field can BE the zero") is the reason this
+    # takes max() rather than replacing outright: a genuine early-session zero
+    # must stay zero. It survives because used_pct is then also ~0, so the
+    # derived figure is ~0 too. Overstating usage is the fail-safe direction —
+    # it degrades earlier than needed; understating is the failure above.
+    if used_pct and window_size:
+        derived_input_tokens = int(used_pct / 100 * window_size)
+        input_tokens = max(input_tokens, derived_input_tokens)
+
     # Autocompact anchors. CLAUDE_CODE_AUTO_COMPACT_WINDOW sets the effective
     # window Claude Code measures against; CLAUDE_AUTOCOMPACT_PCT_OVERRIDE sets
     # the trigger %. Defaults match stock Claude Code behavior when unset.

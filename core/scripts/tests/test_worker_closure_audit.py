@@ -244,3 +244,69 @@ def test_cli_is_report_only_never_refuses(tmp_path):
 
 def test_cli_requires_a_source():
     assert _run("--dry-run").returncode == 2
+
+
+# ──  part4: worker-vs-auditor agreement ───────────────────────────
+#
+# Until verify_verdict existed this module had NOTHING to compare against, so
+# its AGREE/DISAGREE measured whether the RECORD was self-consistent — not
+# whether the auditor agreed with the WORKER. These cases pin the difference,
+# and the one that matters most is the LAST: `not_comparable` must never be
+# counted or read as agreement (guard-963), because every closure written
+# before the field landed carries no verdict at all.
+
+
+def test_self_verdict_is_read_off_the_record():
+    assert wca.self_verdict_of(goal(verify_verdict={"verdict": "completed"})) == "completed"
+    assert wca.self_verdict_of(goal(verify_verdict={"verdict": "  SKIPPED "})) == "skipped"
+
+
+@pytest.mark.parametrize("bad", [
+    None,                          # field absent entirely (every legacy closure)
+    "completed",                   # a string where a dict belongs
+    {},                            # dict with no verdict key
+    {"verdict": None},             # explicit null
+    {"verdict": "   "},            # whitespace only
+    {"q1_passed": True},           # partial verdict, no overall call
+])
+def test_absent_or_malformed_verdict_is_none_never_a_pass(bad):
+    """Fail-open: a shape this module cannot read is UNKNOWN, not agreement."""
+    g = goal() if bad is None else goal(verify_verdict=bad)
+    assert wca.self_verdict_of(g) is None
+    assert wca.agreement_for(g, []) == "not_comparable"
+
+
+def test_agreement_disagrees_when_worker_self_graded_over_a_high_defect():
+    g = goal(outcome_note="done", verify_verdict={"verdict": "completed"},
+             verification={"outcomes": ["x"], "checks": []})
+    fired = wca.run_checks(g)
+    assert any(f["confidence"] == "high" for f in fired), "fixture must trip a high check"
+    assert wca.agreement_for(g, fired) == "disagree"
+
+
+def test_agreement_agrees_on_a_clean_close_carrying_a_verdict():
+    g = goal(verify_verdict={"verdict": "completed"})
+    assert wca.agreement_for(g, wca.run_checks(g)) == "agree"
+
+
+def test_not_comparable_is_tallied_separately_from_agree():
+    """The guard-963 property: zero compared items must not read as clean."""
+    goals = [goal(id="g-1-01"), goal(id="g-1-02")]          # neither has a verdict
+    res = wca.audit(goals, 1.0, "asp-t", "tester")
+    a = res["agreement_counts"]
+    assert a == {"agree": 0, "disagree": 0, "not_comparable": 2}
+    assert res["counts"]["AGREE"] == 2, (
+        "record-consistency still reads AGREE — which is exactly why the "
+        "agreement tally must be reported separately, not folded into it")
+
+
+def test_cli_says_no_agreement_was_measured_when_none_was(tmp_path):
+    p = tmp_path / "goals.json"
+    p.write_text(json.dumps([goal(id="g-1-01"), goal(id="g-1-02")]), encoding="utf-8")
+    env = {**os.environ, "STORAGE_BACKEND": "local"}
+    r = subprocess.run([sys.executable, str(SCRIPT), "--goals-json", str(p),
+                        "--asp", "t", "--dry-run", "--fraction", "1.0"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0
+    assert "not_comparable=2" in r.stdout
+    assert "not evidence of agreement" in r.stdout

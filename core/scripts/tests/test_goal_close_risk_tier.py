@@ -349,6 +349,31 @@ def _extract_gate_block() -> str:
     raise AssertionError("gate block has no matching fi")
 
 
+def _extract_winpath_def() -> str:
+    """Pull iteration-close.sh's own `_winpath` definition, verbatim.
+
+    The extracted gate block CALLS `_winpath` (g-115-8706 routed every
+    `python3 <file-arg>` through it), and the helper is defined near the top of
+    the script -- far outside the block. Running the block alone therefore hit
+    `_winpath: command not found`, `$(...)` expanded to empty, and python3 ran
+    with argv[0] unset: the gate looked dead when it was merely unresolvable
+    (13 tests red, g-115-8995).
+
+    EXTRACTED, NEVER HAND-COPIED, and this is the whole point: a pasted copy is
+    a second definition free to drift from the one production uses, which is
+    the defect class this file's own header warns about (guard-920). If the
+    helper is renamed or its body changes, the prelude changes with it.
+    """
+    lines = ITERATION_CLOSE.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.rstrip() == "_winpath() {"]
+    assert len(starts) == 1, f"expected exactly 1 _winpath def, found {len(starts)}"
+    start = starts[0]
+    for j in range(start + 1, len(lines)):
+        if lines[j].rstrip() == "}":
+            return "\n".join(lines[start:j + 1])
+    raise AssertionError("_winpath def has no closing brace")
+
+
 def _run_block(tmp_path, stub_rc, *, overrides=None, goal_status="completed"):
     """Execute the extracted block against a stub gate. Returns (rc, stderr, argv)."""
     script_dir = tmp_path / "scripts"
@@ -366,6 +391,9 @@ def _run_block(tmp_path, stub_rc, *, overrides=None, goal_status="completed"):
     ov = overrides or {}
     harness = "\n".join([
         "set -u",
+        # The block's own helper prelude, read from the same file the block
+        # came from -- see _extract_winpath_def.
+        _extract_winpath_def(),
         f"SCRIPT_DIR={str(script_dir)!r}",
         f"CORE_ROOT={str(core_root)!r}",
         f'GOAL_STATUS="{goal_status}"',

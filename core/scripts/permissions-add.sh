@@ -15,11 +15,17 @@
 # hook auto-injects this from the session binding written by /start A2).
 #
 # Usage:
-#   bash core/scripts/permissions-add.sh
+#   bash core/scripts/permissions-add.sh          # the ONLY form that writes
+#   bash core/scripts/permissions-add.sh --help   # usage; writes nothing
+#
+# This wrapper takes NO flags and NO positionals. Any flag is REFUSED (exit 2)
+# rather than dropped — see the arg loop below for why that matters here more
+# than on a typical wrapper.
 #
 # Exit codes:
-#   0 — success (created or merged idempotently)
-#   2 — required state missing (MIND_AGENT unset, paths unresolved)
+#   0 — success (created or merged idempotently), or --help
+#   2 — required state missing (MIND_AGENT unset, paths unresolved), or an
+#       unrecognised flag was passed
 #   3 — existing settings.local.json is malformed (refused to clobber)
 #   4 — Python helper missing or Python launcher unavailable
 #
@@ -28,6 +34,56 @@
 set -uo pipefail
 
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
+
+# Shared strict-argv refusal, same adoption shape as aspirations-read.sh.
+# shellcheck disable=SC1091
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+# ONE literal, referenced by BOTH the --help arm and the refusal, so the two
+# strings that must agree cannot drift apart ( fresh-eyes F-002).
+_ACCEPTED_FLAGS="(none — this wrapper takes no flags and no positionals)"
+
+# ARGUMENT PARSING. Until 2026-09-03 this script had NONE — no case, no while,
+# no getopts — and never referenced "$@" at all. So `--help` was not a query, it
+# was an INVOCATION: every argument was silently dropped and control fell
+# through to the write path below, mutating .claude/settings.local.json, THE
+# CONSTITUTIONAL ANCHOR (, measured — `--help` created a fresh
+# settings.local.json on the first attempt).
+#
+# Why that is worse here than on a typical wrapper: `--help` is the single most
+# reflexively-typed argument there is, and a caller reaches for it precisely
+# when they do NOT yet know what a script does. The least-informed possible
+# caller therefore got an unconfirmed write to the most-protected file in the
+# repo. The blast radius was not theoretical.
+#
+# Placed AFTER _paths.sh (which resolves CORE_ROOT for the source above) and
+# BEFORE the WORLD_DIR guard, so --help still answers when paths are
+# unresolved — the state a confused caller is most likely to be in.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            # BEFORE the -*) arm: --help matches `-*`, and refusing it would be
+            # a regression the refusal INTRODUCED rather than a defect it fixed
+            # (guard-2680, ). Help exits 0 and writes nothing.
+            argv_strict_help "$(basename "$0")" "[no positionals]" \
+                "$_ACCEPTED_FLAGS" \
+                "  Running this with NO arguments is the only form that writes: it merges
+  external-path allows and the constitutional deny baseline into
+  .claude/settings.local.json through the user-authorized maintenance path
+  (rb-931, CLAUDE.md \"two-file settings rule\"). It is idempotent.";;
+        -*)
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
+        *)
+            # Positionals accepted-and-ignored, matching aspirations-read.sh.
+            # This wrapper takes none, so a positional is already a caller
+            # error — but refusing them is a WIDER blast radius than this goal
+            # measured (guard-1562: never ship a refusal without enumerating
+            # what would newly fire), and the sole production call site
+            # (core/config/start-uninitialized-ceremony.md) passes no arguments
+            # at all.
+            shift;;
+    esac
+done
 
 if [ -z "${WORLD_DIR:-}" ] || [ -z "${META_DIR:-}" ]; then
     echo "ERROR: WORLD_DIR or META_DIR not resolved from local-paths.conf." >&2

@@ -58,6 +58,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import PROJECT_ROOT, WORLD_DIR, agents_root as _agents_root, agent_dir as _agent_dir
+from _evolution_chain import chain_index, latest_rid_before
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +566,12 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
 
     existing_ids = load_existing_revision_ids(world_dir).get(file_kind, set())
     pair_to_rid = load_existing_after_hashes(world_dir).get(file_kind, {}) if live_dedup else {}
+    # Chain seed: this file's last row ALREADY IN THE STORE (). Without
+    # it the per-file chain below restarts at None on every --since window, so the
+    # first new entry for a file in each window records a null predecessor even
+    # though the store holds earlier rows for it (measured: 239 such rows across
+    # the four swept streams).
+    chain_idx = chain_index(Path(world_dir) / _STREAM_FILENAME[file_kind])
 
     # Group commits by file → chain previous_revision_id correctly per file
     by_file = {}
@@ -582,7 +589,12 @@ def sweep_file_kind(file_kind, path_glob, since, until, world_dir, dry_run, verb
         # Sort by commit timestamp ascending (oldest first → chain naturally)
         commit_list.sort(key=lambda ck: ck[0]["ts"])
 
-        prev_rid_for_this_file = None
+        # Bounded by the FIRST entry's own ts, not the end of the list: a
+        # re-sweep of an OLD window must not chain backwards to a row that
+        # comes after it. Empty store (fresh world) → None, as before.
+        prev_rid_for_this_file = latest_rid_before(
+            chain_idx, rel_path, commit_ts_to_entry_ts(commit_list[0][0]["ts"])
+        )
         for commit, key in commit_list:
             agent = derive_agent(commit, file_kind, key)
             revision_id = make_revision_id(file_kind, commit["ts"], agent, commit["hash"], rel_path)

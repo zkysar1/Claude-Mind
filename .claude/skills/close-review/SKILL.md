@@ -4,7 +4,7 @@ description: "Adversarial independent close-time review for tier-2 goals. Receiv
 user-invocable: false
 parent-skill: aspirations
 tools_used: [Bash, Read, Grep]
-companion_scripts: [core/scripts/close-review-verdict.py, core/scripts/close-review-gate.py, core/scripts/liveness-check.sh]
+companion_scripts: [core/scripts/close-review-verdict.py, core/scripts/close-review-gate.py, core/scripts/q4-provenance-sample.sh, core/scripts/provenance-check.sh, core/scripts/liveness-check.sh]
 conventions: [goal-schemas, coordination, aspirations]
 minimum_mode: autonomous
 execution_history:
@@ -65,8 +65,22 @@ Never conclude a peer is unavailable from a stale `last_active` alone
 Exactly three things, and nothing more:
 
 1. **The goal record** — title, description, `verification` criteria, and every
-   referenced source message id RESOLVED TO ITS TEXT. An unresolved id is a
-   hole in check 2; resolve it or record it as unreviewable.
+   referenced source id FETCHED TO ITS TEXT. An unresolved id is a hole in
+   check 2; resolve it or record it as unreviewable.
+
+   FETCHED, not merely resolved (g-357-44). Naming a source is not reading one:
+   a citation this session never opened is DECORATIVE, and it is the shape that
+   makes a fabricated claim look sourced. Burn the tokens — the user directive
+   of 2026-08-31 asks for exactly that trade. Confirm each cited source was
+   actually retrieved rather than recalled:
+
+   ```
+   Bash: bash core/scripts/provenance-check.sh --session-id "$MIND_SID" <url-or-node-key>
+   ```
+
+   Exit 1 means no tool-fetch record this session — go fetch it, do not reason
+   from the citation. Keep `--session-id`: the manifest is per-Body, so omitting
+   it reads an agent-wide file a worker Body may not even have.
 2. **The artifact paths** produced by the goal.
 3. **The adversarial mandate** — Step 3.
 
@@ -75,10 +89,28 @@ Exactly three things, and nothing more:
 Run all four. Record each in `--check`, whether it passed or failed; a check
 that was not run must not be reported as one that passed.
 
-1. **Requirements traceability** — every `verification.outcome` maps to concrete
-   produced evidence. QUOTE the evidence. An outcome you cannot quote evidence
+1. **Requirements traceability — citations must MATCH, not merely EXIST**
+   (upgraded g-357-44). Every `verification.outcome` maps to concrete produced
+   evidence, and you QUOTE that evidence. An outcome you cannot quote evidence
    for is NOT MET, and a partially-met bar may not be narrated away
    (`guard-2541`).
+
+   Quoting a citation is citations-EXIST. This check is citations-MATCH: for each
+   sampled claim, diff what the claim asserts against what the FETCHED source
+   actually says, and REJECT on contradiction. The sample is not yours to choose —
+   run it:
+
+   ```
+   Bash: bash core/scripts/q4-provenance-sample.sh --goal <goal-id> \
+           --artifact <artifact path> --source-file <fetched source> --json
+   ```
+
+   It reports `missing-citation` (no source token), `decorative-citation` (cited
+   but never fetched this session) and `direction-contradiction` (the artifact
+   asserts A -> B where the source asserts B -> A). The last is the one a
+   citations-exist check cannot see, and Step 4 vetoes an APPROVE on it
+   mechanically. Read `clusters_total` beside `sampled_count`: a clean verdict
+   over 2 of 40 clusters is a thin one, and the reviewer says so.
 2. **Source fidelity** — diff EVERY enumerated entity in the description/source
    against the artifact VERBATIM. This is the mechanized check and the one the
    founding incident turned on: a source enumerated 16 entities, the artifact
@@ -110,14 +142,24 @@ Bash: py -3 core/scripts/close-review-verdict.py \
 
 **The label never outruns the predicate** (`guard-2564`). `--approve` is an
 assertion YOU make about the judgment checks 1, 3 and 4, and it is REFUSED
-outright when the mechanical fidelity diff is non-empty. The asymmetry is
-deliberate and load-bearing: the machine may VETO an approval on its own
-evidence and may never GRANT one. A verdict the script emits on its own
-authority is always a REJECT.
+outright when EITHER mechanical check fails. The asymmetry is deliberate and
+load-bearing: the machine may VETO an approval on its own evidence and may never
+GRANT one. A verdict the script emits on its own authority is always a REJECT.
+
+**There are TWO mechanical checks, and they are complements** (g-357-44):
+`source-fidelity` is the id-set difference — deliberately narrow, id-shaped
+tokens only, because it shares its regex with the tier classifier and widening
+it would drag ordinary prose into tier 2. `direction-fidelity` is citations-MATCH.
+The trade-direction fixture shows why one cannot cover the other: for the claim
+"Miami sent the first-round pick to Denver" against a source saying "Denver
+sent ... to Miami", `named_entities` returns the EMPTY SET for both sides, so
+`source-fidelity` passes a claim that is exactly backwards. Same entity set,
+same citation, reversed relation.
 
 The record reproduces its own verdict (`guard-3743`) — it carries the source
-set, the artifact set, and BOTH directions of the diff, so a later reader can
-recompute the verdict without the session that wrote it.
+set, the artifact set, both directions of the diff, AND the `direction` block
+with every directed pair from each side, so a later reader can recompute the
+verdict without the session that wrote it.
 
 ## Step 5: A REJECT Must Reach the Goal
 

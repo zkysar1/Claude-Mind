@@ -109,6 +109,15 @@ WRITTEN_NEVER_READ_EXCLUDE = (
     "meta-log", "evolution-log", "gate-firings", "gate-eval", "override-bypass",
     "health", "metrics", "audit", "-log", "ledger", "drops", "skill-quality",
     "blocker-gate-overrides", "recommendations", "feedback", "-archive",
+    #  — productivity-snapshot date SEGMENTS only. Deliberately carries
+    # the trailing hyphen so it matches `productivity-snapshots-<date>.jsonl`
+    # and NOT the legacy `productivity-snapshots.jsonl`: segment basenames are
+    # dates that appear in no source file, so _store_reader_patterns finds zero
+    # readers and false-flags every one of them, while the legacy file has two
+    # real readers (health-ledger-append, team-contribution-report) and should
+    # stay under detection. Narrower than the "gate-firings" entry above, which
+    # suppresses its own legacy file as a side effect.
+    "productivity-snapshots-",
 )
 
 # Detectors (b) telemetry-stale, (c) zero-input, and (d)'s situational-skill

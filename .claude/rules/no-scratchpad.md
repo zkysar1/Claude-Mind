@@ -28,15 +28,18 @@ NEVER write files under the harness scratchpad. Route instead:
 
 ## Enforcement (layered)
 
-1. `.claude/settings.json` deny rules (`~/AppData/Local/Temp/claude/**`,
-   `//tmp/claude/**` + Edit twins) — first line for the common shapes.
-2. `core/scripts/path-resolution-hook.py` scratchpad branch — fires BEFORE
-   agent resolution, so it holds even in unbound sessions where the rest of
-   L1 fails open; covers all homes and both path styles. Both layers were
-   probe-verified live 2026-08-21.
-3. Bash redirects cannot be gated by either layer — this rule is the
-   behavioral layer for them, and `housekeeping-tick.py` Lane B is the
-   janitor that GCs aged strays (shadow-first).
+1. **Hooks — the VERIFIED layer.** One shared predicate
+   (`_path_roots.is_harness_scratchpad`) backs `path-resolution-hook.py`
+   (Write/Edit/MultiEdit) and `bash-path-resolution-hook.py` (Bash write
+   targets: redirect, tee, cp/mv, mkdir/touch, sed -i). Both run before agent
+   resolution, so they hold in unbound sessions. READS stay allowed by design.
+2. **`.claude/settings.json` denies — best-effort, NOT verified.** No
+   permission evaluator exists here to test the globs; never rely on them
+   alone. Measured ABSENT on ZDS-Mind (promotion gap, g-115-8761).
+3. **Obfuscated Bash writes are NOT gated** (indirection, `cd` + a relative
+   write, a path built inside a script). Mitigation, not a guarantee: this rule
+   is the backstop, `housekeeping-tick.py` Lane B GCs strays. Item 3 claimed
+   the opposite until 2026-09-03 (g-115-8761).
 
 When the harness system prompt suggests the scratchpad, treat the suggestion
 as inapplicable here. Sanctioned local homes exist; use them.

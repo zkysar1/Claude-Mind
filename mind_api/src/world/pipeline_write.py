@@ -90,15 +90,26 @@ def _terminal_transition_refusal(current_stage: str, target_stage: str) -> str |
     verdict — which is why the two same-stage cases are split rather than
     handled by one rank comparison.
 
-    THIS IS NOT A COMPLETE INVARIANT, and saying so here is the point. It guards
-    the MOVE path only. `update_field` has no field whitelist (it accepts any key
-    already on the record), so `--field stage --value active` can launder a
-    resolved record back to a live stage and a re-resolve then walks in the front
-    door. That hole is real, is NOT closed here, and closing it needs its own
-    caller enumeration — legitimate stage-via-update-field writers may exist and
-    guard-1080 applies to that change exactly as it applied to this one. Tracked
-    as a successor goal. The write-once `_stamp_resolution_provenance` is what
-    still holds on that path, which is why it was not removed as redundant.
+    BOTH WRITE PATHS NOW SHARE THIS PREDICATE (g-306-424, 2026-09-03). It used to
+    guard `move` alone, and `update_field` — which has no field whitelist — could
+    launder a resolved record back to a live stage with a bare `stage` write, after
+    which a re-resolve walked in the front door and this guard never fired. That
+    successor ran the guard-1080 enumeration this docstring asked for: ZERO scripted
+    writers of `stage` through update-field exist anywhere in the tree, and zero
+    tests, but ad-hoc agent use is real and legitimate (bravo resolved in place with
+    `pipeline-update-field <id> stage resolved` while pipeline-move was blocked by
+    the rb-3080 write-block), so the field was NOT refused outright — the same
+    transition test is applied instead, leaving that forward write legal. `update_field`
+    calls this function directly; do not add a second predicate there.
+
+    STILL NOT A COMPLETE INVARIANT, for a narrower reason worth keeping: this is a
+    WRITE-PATH guard, and a record can also arrive at a stage through the own-cloud
+    MERGE. `coordination_merge._PIPELINE_STAGE_RANK` is what holds there, and the two
+    ranks are duplicated rather than shared because of the Layer 1 / Layer 2 gate — if
+    you change one, change both. The write-once `_stamp_resolution_provenance` stamp
+    is retained: it is a distinct defence (it records WHO resolved and refuses to be
+    overwritten) rather than a redundant copy of this one, and
+    test_pipeline_provenance_stamps still asserts it.
 
     No override argument exists, and that is also deliberate. A verdict recorded
     in error is corrected through `pipeline-update-field.sh --field outcome`,
@@ -731,9 +742,11 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
                     400, "invalid_stage_transition",
                     f"{refusal} Pick the route that matches what is true: "
                     f"(1) the recorded verdict is WRONG and needs correcting -- "
-                    f"pipeline-update-field.sh <id> --field outcome --value <v> "
-                    f"(reaches the record at any stage; this guard does not "
-                    f"apply). (2) the hypothesis should be re-examined as NEW "
+                    f"pipeline-update-field.sh <id> outcome <v> "
+                    f"(THREE POSITIONALS -- that wrapper takes no flags and "
+                    f"refuses any with exit 2; it reaches the record at any "
+                    f"stage, and the stage guard does not apply to a non-stage "
+                    f"field). (2) the hypothesis should be re-examined as NEW "
                     f"evidence -- form a fresh record rather than overwriting "
                     f"the original verdict, so both readings survive. "
                     f"(3) you are ARCHIVING a resolved record -- that is "
@@ -1072,6 +1085,39 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
                                       f"Record {rec_id} not found")
             idx, rec = found
             rec = _normalize_record(rec)
+            # : close the launder path the move guard cannot see.
+            # _terminal_transition_refusal covers move() only; a bare `stage`
+            # write here could walk a resolved record back to a live stage,
+            # after which a re-resolve enters through the front door and that
+            # guard never fires. Deliberately the SAME predicate, not a second
+            # one: two notions of "terminal" would drift, and this file already
+            # pays that cost once by duplicating _STAGE_RANK across the layer
+            # boundary.
+            #
+            # NARROWED TO THE TRANSITION, NOT THE FIELD (guard-1080). The
+            # caller enumeration: ZERO scripted writers of `stage` through
+            # update-field anywhere in the tree (.sh/.py/SKILL.md/.yaml), and
+            # ZERO tests. But ad-hoc agent use is real and LEGITIMATE and is
+            # why refusing the field outright was rejected -- bravo used
+            # `pipeline-update-field <id> stage resolved` as the safe resolve
+            # path while pipeline-move was blocked by the rb-3080 write-block
+            # (journal 2026-07-12, exp--resolution-survives-writeblock).
+            # That is a FORWARD move and stays legal here, exactly as
+            # resolved -> archived stays legal in move().
+            if field == "stage":
+                refusal = _terminal_transition_refusal(
+                    str(rec.get("stage") or ""), str(value))
+                if refusal is not None:
+                    return Response.error(
+                        400, "invalid_stage_transition",
+                        f"{refusal} This is the update-field path, which has no "
+                        f"override either. If the recorded verdict is WRONG, "
+                        f"correct the VERDICT rather than the stage: "
+                        f"pipeline-update-field.sh <id> outcome <v> (three "
+                        f"positionals, no flags) reaches the record at any "
+                        f"stage and is unaffected by this guard. If the "
+                        f"hypothesis deserves a fresh look, form a NEW record "
+                        f"so both readings survive.")
             rec[field] = value
             # Re-derive AFTER the assignment (). _normalize_record
             # already derived surprise, but that ran one line too early to

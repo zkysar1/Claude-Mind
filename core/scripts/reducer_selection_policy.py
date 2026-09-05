@@ -202,16 +202,29 @@ def is_reducer_only_row(row: dict, skill_is_reducer_only: bool = False) -> bool:
          as a plain bool so this module stays pure and there is no second copy
          of the bridge here; the caller owns the import and the caching.
 
-    `executable_by_role` IS NOT ON main AS OF 2026-09-03 -- commit e62c24033
-    (g-115-7372, COMPLETED) sits unconsumed on refs/workers/alpha/2fda1f3e..., so
-    a tree grep finds the name in zero files and no goal can carry it yet (writes
-    are gated on _goal_fields registration). Clause 1 is therefore INERT today and
-    correct tomorrow: it reads a plain dict key, so it needs no import and cannot
-    break while the field is absent, and it starts working the moment the reducer
-    merges that ref. This is guard-4638 in its exact shape -- a CLOSED goal does
-    not mean its code is on main -- and the note is here rather than in a commit
-    message because the next reader of this function will otherwise conclude the
-    clause is dead code and delete it.
+    `executable_by_role` IS ON main AS OF 2026-09-03, superseding this
+    paragraph's earlier claim that it was not. Verified in-turn (echo, cc-03):
+    `git merge-base --is-ancestor e62c24033 origin/main` rc=0, `origin/main` is in
+    `git branch -a --contains e62c24033`, `origin/main:core/scripts/_goal_fields.py`
+    line 116 registers the field, a tree grep finds it in 6 files, and 60 goals
+    carry `executable_by_role=reducer`. Clause 1 is LIVE.
+
+    THE INERTNESS OUTLASTED BOTH PRECONDITIONS THIS PARAGRAPH NAMED, AND THAT IS
+    THE PART WORTH KEEPING. Commit-on-main and goals-stamped were both satisfied
+    while the floor stayed inert on every box, because a THIRD precondition nobody
+    wrote down was false: this predicate reads the field off the SCORED ROW, and
+    `goal-selector.py score_goal` never copied it out of the goal into its
+    emission. `grep -n executable_by_role goal-selector.py` returned exactly two
+    hits, BOTH comments -- documented, not populated. Fixed in 7d9e30945
+    (g-306-427) and pinned by
+    tests/test_reducer_selection_policy.py::test_score_goal_emits_executable_by_role,
+    which drives the real emitter instead of hand-building a row. Encoded as
+    guard-5921; guard-3871 is its wiring-side sibling.
+
+    guard-4638 still stands as the lesson that a CLOSED goal does not mean its
+    code is on main, and this note stays here rather than in a commit message
+    because the next reader will otherwise conclude clause 1 is dead code and
+    delete it.
     """
     if not isinstance(row, dict):
         return False

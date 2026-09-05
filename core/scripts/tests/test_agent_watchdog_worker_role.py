@@ -120,7 +120,8 @@ ALL_REDUCER_PROBES = {
     "worker-stall", "running-sid", "heartbeat", "stalled", "background-job",
     "stop-hook-block", "daemon-health", "clock-skew", "freshness",
     "mirror-wedge", "memory-headroom", "claim-heartbeat", "git-drift",
-    "infra-component", "dependency-funnel",
+    "infra-component", "dependency-funnel", "retrieval-index",
+    "peer-liveness",
 }
 
 # Excluded from workers because they read REDUCER-SHAPED STATE a worker
@@ -138,7 +139,7 @@ EXCLUDED_REDUCER_SHAPED = {
 # still be wrong there, because the faults it catches (process death, lost auth)
 # kill the in-loop tick along with the loop. Folding it into the set above would
 # lose that, and the next reader would think it was excluded for state reasons.
-EXCLUDED_PEER_SIDE = {"worker-stall"}
+EXCLUDED_PEER_SIDE = {"worker-stall", "peer-liveness"}
 
 # The THIRD bucket the accounting test below invited someone to name.
 # infra-component fits NEITHER of the two above, and forcing it into either
@@ -153,7 +154,19 @@ EXCLUDED_PEER_SIDE = {"worker-stall"}
 # a late one does. One poller per agent, and the reducer is the Body that is
 # always present. The cost of the exclusion is bounded and known: on a box
 # running only a worker, external components go unpolled until a reducer ticks.
-EXCLUDED_DUPLICATE_SUPPRESSED = {"infra-component"}
+# retrieval-index () joins this bucket for the same reason, and the
+# match is exact rather than approximate: it censuses a FLEET condition — every
+# agent's published index model against the configured one — so N Bodies running
+# it on the same cadence produce N alerts for one drifted box. One reader per
+# agent, the reducer.
+#
+# Note the deliberate asymmetry with its own DATA leg, which is NOT excluded from
+# anything: heartbeat-tick publishes each box's block from EVERY box, above the
+# agent-state gate, precisely because a cross-box worker is the Body least likely
+# to be noticed. PUBLISHING must be everywhere; REPORTING must be one place.
+# Reading this exclusion as "the retrieval-index feature is reducer-only" would
+# invert that and is the misreading to guard against.
+EXCLUDED_DUPLICATE_SUPPRESSED = {"infra-component", "retrieval-index"}
 
 # The FOURTH bucket. dependency-funnel reads the shared QUEUES (world + agent
 # aspirations), which a worker holds a copy of, so it is not reducer-shaped
@@ -428,6 +441,15 @@ def test_induced_box_fault_DOES_fire_on_a_worker(tmp_path, monkeypatch):
     # 8 GiB box, one Claude process holding 7 GiB => 87.5%, over the default.
     monkeypatch.setattr(wd, "_mem_total_kb", lambda: 8 * 1024 * 1024)
     monkeypatch.setattr(wd, "_claude_rss_kb", lambda: [(4242, "claude", 7 * 1024 * 1024)])
+    # The probe MAILS A HUMAN on a critical event (agent-watchdog.py
+    # _notify_critical_memory, added 2026-08-22 c93d8d79e3 -- AFTER this
+    # test landed 2026-08-06, so the fixture below never pinned it:
+    # guard-2478, the function grew past the seam). Unstubbed, every suite
+    # run on every box emailed this FIXTURE payload as if it were a real
+    # reading (). The emitter now also refuses under pytest;
+    # this stub keeps the test honest independently of that env guard.
+    monkeypatch.setattr(wd, "_notify_critical_memory",
+                        lambda s, m: {"sent": True, "stub": True})
 
     events = _events_for_role(agent_dir, "worker")
     assert events, "induced memory pressure produced NO event on a worker"
@@ -461,6 +483,15 @@ def test_that_induced_fault_is_absent_when_the_box_is_healthy(tmp_path, monkeypa
     agent_dir = _worker_shaped_tree(tmp_path)
     monkeypatch.setattr(wd, "_mem_total_kb", lambda: 8 * 1024 * 1024)
     monkeypatch.setattr(wd, "_claude_rss_kb", lambda: [(4242, "claude", 256 * 1024)])
+    # The probe MAILS A HUMAN on a critical event (agent-watchdog.py
+    # _notify_critical_memory, added 2026-08-22 c93d8d79e3 -- AFTER this
+    # test landed 2026-08-06, so the fixture below never pinned it:
+    # guard-2478, the function grew past the seam). Unstubbed, every suite
+    # run on every box emailed this FIXTURE payload as if it were a real
+    # reading (). The emitter now also refuses under pytest;
+    # this stub keeps the test honest independently of that env guard.
+    monkeypatch.setattr(wd, "_notify_critical_memory",
+                        lambda s, m: {"sent": True, "stub": True})
     names = {name for name, _, _ in _events_for_role(agent_dir, "worker")}
     assert "memory-headroom" not in names, (
         "memory-headroom fired on healthy numbers, so the induction test above "

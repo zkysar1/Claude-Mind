@@ -3,7 +3,7 @@
     "allow": [
       "Bash(mkdir -p .claude/skills/*)",
       "Write(**/.claude/skills/**)",
-	  "Monitor(*)",
+      "Monitor(*)",
       "Edit(**/.claude/skills/**)"
     ],
     "deny": [
@@ -42,7 +42,22 @@
       "Write(~/AppData/Local/Temp/claude/**)",
       "Edit(~/AppData/Local/Temp/claude/**)",
       "Write(//tmp/claude/**)",
-      "Edit(//tmp/claude/**)"
+      "Edit(//tmp/claude/**)",
+      "Write(~/AppData/Local/Temp/claude*/**)",
+      "Edit(~/AppData/Local/Temp/claude*/**)",
+      "MultiEdit(~/AppData/Local/Temp/claude*/**)",
+      "Write(//tmp/claude*/**)",
+      "Edit(//tmp/claude*/**)",
+      "MultiEdit(//tmp/claude*/**)",
+      "Write(/tmp/claude*/**)",
+      "Edit(/tmp/claude*/**)",
+      "MultiEdit(/tmp/claude*/**)",
+      "Write(//var/tmp/claude*/**)",
+      "Edit(//var/tmp/claude*/**)",
+      "MultiEdit(//var/tmp/claude*/**)",
+      "Write(/var/tmp/claude*/**)",
+      "Edit(/var/tmp/claude*/**)",
+      "MultiEdit(/var/tmp/claude*/**)"
     ]
   },
   "env": {
@@ -55,6 +70,7 @@
     "GATE_D_WORLD": "ayoai",
     "GATE_D_CORPUS_PATH": "<PROJECT_ROOT>\\core\\config\\gate-d-corpus-zds-2026-06-10.jsonl",
     "GATE_FIRINGS_SEGMENTED": "1",
+    "PRODUCTIVITY_SNAPSHOTS_SEGMENTED": "1",
     "OWNCLOUD_GZIP_STORES": "ayoai-mind",
     "UTILIZATION_COUNTERS_SPOOLED": "1"
   },
@@ -206,8 +222,18 @@
           },
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/retrieval-floor-gate.sh",
+            "timeout": 30
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh check",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/ground-truth-citation-gate.sh",
+            "timeout": 15
           }
         ]
       },
@@ -261,8 +287,18 @@
           },
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/retrieval-floor-gate.sh",
+            "timeout": 30
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh check",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/ground-truth-citation-gate.sh",
+            "timeout": 15
           }
         ]
       },
@@ -316,8 +352,18 @@
           },
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/retrieval-floor-gate.sh",
+            "timeout": 30
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/tree-write-fence.sh check",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/ground-truth-citation-gate.sh",
+            "timeout": 15
           }
         ]
       }
@@ -499,12 +545,26 @@
         ]
       },
       {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/plan-completion-reminder.sh",
+            "timeout": 30
+          }
+        ]
+      },
+      {
         "matcher": "*",
         "hooks": [
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/presence-tick.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/retrieval-pulse-hook.sh"
           }
         ]
       }

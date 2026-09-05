@@ -220,3 +220,76 @@ _gate check-repo-root-entries $PY "$REPO/core/scripts/check-repo-root-entries.py
 # step headings. The promotion plant (seed-transplant.sh) is the sanctioned
 # writer and sets FRAMEWORK_WRITE_OVERRIDE itself (logged as an override).
 _gate check-framework-origin-writes $PY "$REPO/core/scripts/check-framework-origin-writes.py" "$REPO"
+
+# ADVISORY 16 (NOT a _gate): a PEER Body holds this working tree, so this commit
+# moves HEAD out from under their running suite (g-115-8957). WARN ONLY — it
+# never blocks and never changes the commit's exit status.
+#
+# WHY WARN AND NOT BLOCK. A hard block on `git commit` would strand every worker
+# behind a ~2h suite with uncommittable work, and it would break the worker-loop
+# Phase 3.8 invariant that uncommitted work is not carried by the worker ref.
+# That non-goal is stated explicitly on g-115-8957; do not "upgrade" this to a
+# _gate.
+#
+# WHY IT IS HERE AND NOT ONLY IN THE LOOP'S PSEUDOCODE. worker-loop Phase 3.8
+# instructs "COMMIT FIRST" in capitals, and tree_lock was enforced at exactly ONE
+# chokepoint — iteration-push.sh, the PUSH half. So the loop ordered every worker
+# to move HEAD and routed only the second half of that instruction through the
+# guard. Measured 2026-09-04: five commits landed inside one co-resident Body's
+# ~2h / 8-chunk / ~8,200-test run and voided it; two of the five were
+# iteration-push's OWN self-heal churn, so the framework voided its own runs by
+# this path. Per guard-399, a `Bash:` line added to a SKILL.md is the SAME
+# enforcement class as the prose it replaces — both need the model to elect to
+# run them — so THIS hook is the baseline and the Phase 3.8 check is enrichment
+# on top of it. This one also covers hand-run commits, which never pass through
+# Phase 3.8 at all.
+#
+# WHO ELSE RUNS THIS LINE (guard-2783 — enumerate the complement before wiring a
+# role-acting check): every committer in this repo — worker Bodies, the reducer,
+# and a human or agent committing by hand. The same input means the same thing
+# for all of them because the predicate is SID-keyed, not role-keyed: the lock is
+# consulted through `tree-lock.sh check`, whose `evaluate()` returns
+# state="mine" / blocked=False when `holder_sid == MIND_SID` (tree_lock.py:147),
+# so a Body never warns about its own lock and no new self/peer predicate is
+# introduced here (that self/merge axis is g-115-7223, still open). With
+# MIND_SID unset — a hand-run commit outside a bound session — no lock can be
+# "mine", so a live peer lock warns, which is exactly right: that commit does
+# void the holder's run.
+#
+# ONLY rc=1 WARNS, and the rc capture is load-bearing under `set -e`: a bare call
+# whose rc is non-zero would abort this hook and BLOCK the commit — the precise
+# outcome the non-goal above forbids. `check` is contracted to return 1 for held
+# and 0 for everything else (absent, malformed, expired, mine, dead-holder) and
+# never 2 — the four fault shapes were measured 2026-09-04 (malformed JSON,
+# unreadable file, absent holder_sid, expired: all rc=0). But it is NOT true
+# that rc=1 means "held" and nothing else: a BROKEN INSTALL exits 1 as well
+# (measured — the wrapper with no _paths.sh beside it returns rc=1 and "No such
+# file or directory"), so this block can warn about a lock nobody holds. That is
+# the ACCEPTED direction for a warn-only advisory: ${_TL_OUT} is printed, so the
+# reader sees the shell error rather than a fabricated peer, and a false warning
+# costs one message where a silent miss costs the whole protection. A consumer
+# that DEFERS on rc=1 does not inherit that trade — the rationale file carries
+# the caveat for worker-loop Phase 3.8. Call shape copied from the existing
+# consumer in iteration-push.sh rather than invented (guard-2676).
+#
+# SCOPE, stated so it is not over-read: this catches the HEAD-MOVEMENT class
+# (guard-4940 — a commit voids a run detectably, and run-full-suite reports
+# "VERDICT: INVALID (tree-moved)"). It does NOT catch guard-5987's class, where
+# an UNCOMMITTED mid-run edit to the code under test voids a run with HEAD never
+# moving and the runner structurally blind to it. Nothing here makes a peer's
+# suite safe; it makes one specific way of ruining it visible at the moment it is
+# incurred instead of hours later to someone else.
+if [ -f "$REPO/core/scripts/tree-lock.sh" ]; then
+  _TL_RC=0
+  _TL_OUT="$(bash "$REPO/core/scripts/tree-lock.sh" check --project-root "$REPO" 2>&1)" || _TL_RC=$?
+  if [ "$_TL_RC" -eq 1 ]; then
+    printf '%s\n' \
+      "[pre-commit] ADVISORY: a co-resident Body holds this working tree." \
+      "  ${_TL_OUT}" \
+      "  This commit MOVES HEAD, which VOIDS their running full-suite (guard-4940:" \
+      "  run-full-suite compares HEAD before/after and prints 'VERDICT: INVALID" \
+      "  (tree-moved)', a verdict that outranks every other)." \
+      "  NOT BLOCKING — your commit proceeds. If the work can ride the next cycle," \
+      "  consider deferring it (worker-loop Phase 3.8 does this automatically)." >&2
+  fi
+fi

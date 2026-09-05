@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import pytest
 
+import knowledge_projection as kp
 from knowledge_projection import (
     _PROGRAM_PURPOSE_CAP,
     _SELF_PURPOSE_CAP,
+    goal_handle,
     project_goals,
+    resolve_goal_handle,
     project_program,
     project_self,
     FRAMEWORK_TREE_ROOT,
@@ -704,3 +707,190 @@ def test_project_wires_program_through_and_defaults_it_empty():
                     program_body=_PROGRAM_MD)
     assert "makes a world feel alive" in str(wired.program["purpose"])
     assert wired.counts()["program"] == 1
+
+
+# ── goal handles () — the opaque per-goal address ───────────────────
+#
+# The Planned board strips ids BY DESIGN, so the four write verbs (/31) had no
+# way to say WHICH goal a member meant. These pin the handle that closes that gap and
+# the three properties the write path leans on: the id is not recoverable from the
+# published board, the publishable set and the addressable set are the SAME set, and
+# every case that is not exactly-one-match resolves to nothing rather than to a guess.
+
+_HANDLE_SECRET = "unit-test-handle-secret-not-a-real-key"
+_OTHER_SECRET = "unit-test-handle-secret-a-different-one"
+
+
+def test_project_goals_emits_no_handle_without_a_secret() -> None:
+    """FAIL CLOSED — and this pin is what keeps the default row shape unchanged.
+
+    An unprovisioned box publishes a board with NO handles: never a guessable token and
+    never the goal id. Every addressed write it then receives resolves to nothing, which
+    is the safe degradation. The three-field pin above stays literally true by default.
+    """
+    out = project_goals([_g(id="g-369-119")], Redactor())
+    assert len(out) == 1
+    assert set(out[0]) == {"title", "status", "updated"}, sorted(out[0])
+
+
+def test_project_goals_emits_a_fourth_handle_field_under_a_secret() -> None:
+    """The one shape change, and it is opt-in: a fourth key appears ONLY with a secret."""
+    out = project_goals([_g(id="g-369-119")], Redactor(), handle_secret=_HANDLE_SECRET)
+    assert len(out) == 1
+    assert set(out[0]) == {"title", "status", "updated", "handle"}, sorted(out[0])
+    handle = str(out[0]["handle"])
+    assert len(handle) == kp._GOAL_HANDLE_HEX
+    assert all(c in "0123456789abcdef" for c in handle), handle
+    # The three original fields are untouched — an added sibling field, never a
+    # redefinition of the locked ones (rb-2148).
+    assert out[0]["title"] == "Ship the reef explorer"
+    assert out[0]["status"] == "planned"
+
+
+def test_published_handle_does_not_leak_the_goal_id_or_the_secret() -> None:
+    """OUTCOME 1: the id is not recoverable from what the board publishes.
+
+    Two assertions, and the SECOND is the load-bearing one. That the id does not appear
+    verbatim is necessary but weak — the goal-id space is small enough to enumerate, so
+    a handle computed under a PUBLICLY derivable key could be inverted by brute force.
+    What actually makes the id unrecoverable is that the handle is a function of a
+    secret: change only the secret and the handle changes completely, so an attacker
+    without it cannot compute the mapping to invert.
+    """
+    gid = "g-369-119"
+    row = project_goals([_g(id=gid)], Redactor(), handle_secret=_HANDLE_SECRET)[0]
+    blob = " ".join(str(v) for v in row.values())
+    for fragment in (gid, "369-119", "g-369", _HANDLE_SECRET):
+        assert fragment not in blob, fragment
+    assert goal_handle(gid, _HANDLE_SECRET) != goal_handle(gid, _OTHER_SECRET)
+
+
+def test_goal_handle_is_stable_per_goal_and_distinct_between_goals() -> None:
+    """Stable, because resolve RECOMPUTES rather than reading a stored mapping."""
+    assert goal_handle("g-369-119", _HANDLE_SECRET) == goal_handle("g-369-119", _HANDLE_SECRET)
+    assert goal_handle("g-369-119", _HANDLE_SECRET) != goal_handle("g-369-30", _HANDLE_SECRET)
+
+
+def test_goal_handle_is_per_environment_even_under_one_shared_secret() -> None:
+    """No cross-environment correlation, and it must not depend on key hygiene.
+
+    environment_id is mixed into the MESSAGE, not merely assumed to differ through the
+    key — so one secret provisioned fleet-wide across two environments still yields two
+    unrelated handles for the same goal. The NUL separator is what stops
+    ("env", "g-1-2") and ("envg", "-1-2") from colliding.
+    """
+    a = goal_handle("g-369-119", _HANDLE_SECRET, "env-a")
+    b = goal_handle("g-369-119", _HANDLE_SECRET, "env-b")
+    assert a != b
+    assert goal_handle("g-1-2", _HANDLE_SECRET, "env") != goal_handle("-1-2", _HANDLE_SECRET, "envg")
+
+
+def test_goal_handle_is_empty_without_an_id_or_a_secret() -> None:
+    """Both inputs are required; an empty return is what suppresses the field."""
+    assert goal_handle("", _HANDLE_SECRET) == ""
+    assert goal_handle("g-369-119", "") == ""
+    assert goal_handle("   ", _HANDLE_SECRET) == ""
+
+
+def test_project_goals_publishes_an_id_less_goal_without_a_handle() -> None:
+    """A malformed record loses its ADDRESSABILITY, not its visibility.
+
+    Dropping the row instead would let one bad store line silently shrink the board.
+    """
+    out = project_goals([_g()], Redactor(), handle_secret=_HANDLE_SECRET)
+    assert len(out) == 1 and "handle" not in out[0], sorted(out[0])
+
+
+def test_resolve_round_trips_the_handle_the_board_actually_published() -> None:
+    """OUTCOME 2, end to end: resolve the PUBLISHED value, not a re-derived one.
+
+    Taking the handle off the projected row is the whole point — a test that recomputed
+    it would pass even if the projection published a different value.
+    """
+    goals = [_g(id="g-369-119", title="A"), _g(id="g-369-30", title="B")]
+    rows = project_goals(goals, Redactor(), handle_secret=_HANDLE_SECRET)
+    for row, goal in zip(rows, goals):
+        assert resolve_goal_handle(
+            str(row["handle"]), goals, _HANDLE_SECRET, Redactor()
+        ) == goal["id"]
+
+
+def test_resolve_returns_none_for_unknown_wrong_secret_and_wrong_environment() -> None:
+    """Every miss is None. An unknown handle must never fall back to a nearest match."""
+    goals = [_g(id="g-369-119")]
+    handle = str(project_goals(goals, Redactor(), handle_secret=_HANDLE_SECRET)[0]["handle"])
+
+    assert resolve_goal_handle("deadbeefdeadbeef", goals, _HANDLE_SECRET, Redactor()) is None
+    assert resolve_goal_handle(handle, goals, _OTHER_SECRET, Redactor()) is None
+    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor(), "env-b") is None
+    assert resolve_goal_handle(handle, goals, "", Redactor()) is None
+    assert resolve_goal_handle("", goals, _HANDLE_SECRET, Redactor()) is None
+    assert resolve_goal_handle(handle, [], _HANDLE_SECRET, Redactor()) is None
+
+
+def test_resolve_refuses_a_goal_the_board_never_published() -> None:
+    """The addressable set IS the publishable set — one predicate, so it cannot drift.
+
+    Each goal here is suppressed by a DIFFERENT gate, and a handle computed for it
+    resolves to nothing. Without the shared predicate a write could reach the agent's own
+    framework backlog, or a `blocked` goal no member ever saw.
+    """
+    for hidden in (
+        _g(id="g-369-201", work_class="framework"),   # gate 1 — not product work
+        _g(id="g-369-202", status="blocked"),         # gate 2 — status not published
+        _g(id="g-369-203", title="   "),              # title survives nothing
+    ):
+        assert project_goals([hidden], Redactor(), handle_secret=_HANDLE_SECRET) == []
+        handle = goal_handle(str(hidden["id"]), _HANDLE_SECRET)
+        assert resolve_goal_handle(handle, [hidden], _HANDLE_SECRET, Redactor()) is None
+
+
+def test_resolve_returns_none_when_two_exposed_goals_share_a_handle(monkeypatch) -> None:
+    """A collision resolves to NOTHING, never to an arbitrary pick.
+
+    Forced by shrinking the handle to one hex character (16 buckets) rather than by
+    stubbing goal_handle, so the real ambiguity branch runs against real digests. At the
+    production width a collision sits near 1e-15; the branch exists because the caller is
+    a write path against live member data, where a coin-flip mutates the wrong member's
+    goal.
+    """
+    monkeypatch.setattr(kp, "_GOAL_HANDLE_HEX", 1)
+    ids = [f"g-999-{n}" for n in range(200)]
+    seen: dict[str, str] = {}
+    pair = None
+    for gid in ids:
+        h = goal_handle(gid, _HANDLE_SECRET)
+        if h in seen:
+            pair = (seen[h], gid, h)
+            break
+        seen[h] = gid
+    assert pair is not None, "no collision at 1 hex char over 200 ids — widen the search"
+    first, second, handle = pair
+    goals = [_g(id=first), _g(id=second)]
+    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor()) is None
+
+
+def test_resolve_treats_a_repeated_record_for_one_id_as_unambiguous() -> None:
+    """Two records, ONE id, is duplication — not ambiguity. It must still resolve."""
+    goals = [_g(id="g-369-119", title="A"), _g(id="g-369-119", title="A again")]
+    handle = goal_handle("g-369-119", _HANDLE_SECRET)
+    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor()) == "g-369-119"
+
+
+def test_resolve_accepts_the_handle_with_surrounding_whitespace_and_uppercase() -> None:
+    """An inbound handle crosses a URL/JSON boundary before it gets here."""
+    handle = goal_handle("g-369-119", _HANDLE_SECRET)
+    goals = [_g(id="g-369-119")]
+    assert resolve_goal_handle(f"  {handle.upper()}  ", goals, _HANDLE_SECRET, Redactor()) == "g-369-119"
+
+
+def test_project_wires_the_handle_secret_through_and_defaults_it_off() -> None:
+    """The project() seam: an existing caller passing no secret keeps its exact shape."""
+    redactor = Redactor(agent_names=(), workspace_paths=(), secret_values=())
+    plain = project(tree_nodes=[], reasoning=[], guardrails=[], hypotheses=[],
+                    redactor=redactor, goals=[_g(id="g-369-119")])
+    assert set(plain.goals[0]) == {"title", "status", "updated"}, sorted(plain.goals[0])
+    wired = project(tree_nodes=[], reasoning=[], guardrails=[], hypotheses=[],
+                    redactor=redactor, goals=[_g(id="g-369-119")],
+                    goal_handle_secret=_HANDLE_SECRET, environment_id="env-a")
+    assert wired.goals[0]["handle"] == goal_handle("g-369-119", _HANDLE_SECRET, "env-a")

@@ -23,12 +23,32 @@ Sweep logic per g-115-1044:
               (g-115-4004 — another live INSTANCE of this same agent holds it)
           elif its body carrier is fresh: NOT stranded (alive on another box)
           elif its own transcript on THIS box is fresh: NOT stranded (alive
-              here — a worker mid-unit writes no carrier; 2026-08-30)
+              here — box-local fallback for a Body whose carrier never
+              reached the store; see the CORRECTION below)
           else: STRANDED
       elif team-state in_flight still names the goal (own session):
           NOT stranded (mid-execution after a compaction resume)
       else:
           STRANDED
+
+CORRECTION 2026-09-04 (g-306-439) — the ladder's transcript rung used to
+justify itself with "a worker mid-unit writes no carrier". That was written
+2026-08-30 04:52 (cee4d3c2a), 34 hours AFTER g-115-8200 (67b154406,
+2026-08-28 18:51) made it false: bash-agent-inject.py now fires
+heartbeat-tick.sh --body-only before EVERY Bash tool call, throttled by
+_shared_tick.SHARED_HEARTBEAT_INTERVAL_S (600s), so a worker's carrier is
+refreshed at TOOL-CALL cadence rather than once per unit. Measured live on
+cc-07 the same day: 4 of 6 Bodies carried `fresh-correct` carriers aged
+1.5-8.1 min while holding claims.
+
+This matters beyond tidiness: the stale sentence was read as a live finding
+and a HIGH goal (g-306-439) was filed to build a mid-unit carrier refresh
+that had already shipped a week earlier. A comment that outlives the
+behaviour it describes does not merely mislead — it manufactures work
+(guard-1710: when a conclusion is corrected, sweep EVERY artifact asserting
+the old one). The transcript rung is still correct and still earns its place
+as the box-local fallback for a carrier that never reached the store; only
+its stated reason was wrong.
 
 Foreign-session guard (g-115-4004): every other test above reads the execution
 diary under agents/<agent>/session/ to judge a SHARED subject (a claim in
@@ -239,6 +259,33 @@ def _agent_name() -> str:
 _STRANDABLE_STATUSES = ("in-progress", "pending")
 
 
+def _is_unknown_goal_field(e):
+    """True when an RtError is the daemon's `unknown_goal_field` 400.
+
+    The daemon derives its goal_field_name allowlist FROM THE LIVE CORPUS, so
+    `claimed_by` is a valid field name exactly while a claim is outstanding and
+    an INVALID one exactly when there is nothing to sweep. That 400 therefore
+    means "zero claims in this status" -- the documented safe case -- not a
+    failure.
+
+    Reads status + body because that is where the code actually is; str(e)
+    carries only "daemon HTTP <code> for <method> <path>". Prefers the parsed
+    JSON `error` field and falls back to a substring scan of the raw body, so a
+    non-JSON or truncated body still degrades to the old (correct) behaviour
+    rather than raising a second exception inside an exception handler.
+    """
+    if getattr(e, "status", None) != 400:
+        return False
+    body = getattr(e, "body", None) or ""
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, TypeError):
+        return "unknown_goal_field" in body
+    if isinstance(parsed, dict) and parsed.get("error") == "unknown_goal_field":
+        return True
+    return "unknown_goal_field" in body
+
+
 def _query_claimed_goals(agent: str) -> List[Dict[str, Any]]:
     """Daemon: GET /v1/aspirations/query — claimed goals in any strandable status.
 
@@ -268,7 +315,20 @@ def _query_claimed_goals(agent: str) -> List[Dict[str, Any]]:
             # "zero claims in this status", which is the documented safe case
             # ({scanned: 0}), not a failure -- re-raising it killed the sweep
             # on every iteration of an idle fleet ().
-            if "unknown_goal_field" in str(e):
+            #
+            # READ e.status/e.body, NEVER str(e) (). _rt.py raises
+            # RtError("daemon HTTP %s for %s %s" % (code, method, path),
+            # status=code, body=err_body) -- the daemon's error CODE lives ONLY
+            # in the JSON body. The original tolerance tested `in str(e)`, whose
+            # message is always "daemon HTTP 400 for GET /v1/aspirations/query",
+            # so it could never match and this handler fell through to
+            # SystemExit on exactly the idle-fleet case it was written to
+            # tolerate. It shipped inert WITH a passing test, because that test
+            # monkeypatched a message shape ("rt_call failed: 400
+            # unknown_goal_field: ...") that production never emits -- guard-920
+            # / rb-9476: replicate the LITERAL production shape, not the
+            # contract-ideal one.
+            if _is_unknown_goal_field(e):
                 continue
             raise SystemExit(f"aspirations query failed: {e}") from e
         try:
@@ -1463,6 +1523,13 @@ def _reap_stale_body_rows(
         # reaped nothing because no goal was terminal and a run that reaped
         # nothing because the queues were unreadable must not print alike.
         "terminal_via": None,
+        # Third provenance field, and the one it is least safe to omit
+        # (): the vanished-goal predicate reaps on ABSENCE, so "no row
+        # named a vanished goal" and "the census never happened" are the same
+        # zero on the surface and opposite underneath. guard-6002 — a clean
+        # sweep is not a clean population until its DOMAIN is stated beside it.
+        "known_via": None,
+        "known_population": None,
         "errors": [],
     }
     try:
@@ -1472,6 +1539,7 @@ def _reap_stale_body_rows(
         )
         from worker_stall import (  # noqa: PLC0415
             read_claims_union,
+            read_known_goal_ids,
             read_terminal_goal_ids,
         )
         import body_row_reaper as _reaper  # noqa: PLC0415
@@ -1566,6 +1634,46 @@ def _reap_stale_body_rows(
 
     terminal_ids = _read_terminal()
 
+    def _read_known() -> "Optional[set]":
+        """Ids of goals that EXIST anywhere, or None when the census is partial.
+
+        THREE stores, not the two the terminal read uses, and the third is not
+        thoroughness — it is what keeps the predicate from inverting. The reaper
+        treats absence from this set as grounds to DELETE, so every store omitted
+        converts its whole population into phantoms. MEASURED on cc-09
+        2026-09-04 at authoritative provenance: world 2,921 + alpha queue 32 +
+        archive 2,480 = 5,432. A two-store census would have declared those 2,480
+        archived goals "resolving nowhere" (guard-3379: an absence claim must name
+        which layers were censused, and one store is never enough).
+
+        `None`, never a partial set, on any failure — including a provenance of
+        "none" from ANY layer. This is the mandatory degradation the filing goal
+        specifies: an unreadable store must never be able to mint a reap, and
+        `read_known_goal_ids` reports the WEAKEST provenance precisely so this
+        caller can refuse on it rather than silently reaping on a hole.
+        """
+        try:
+            ids, via = read_known_goal_ids(
+                Path(WORLD_DIR) / "aspirations.jsonl",
+                agent_dir(agent) / "aspirations.jsonl",
+                Path(WORLD_DIR) / "aspirations-archive.jsonl",
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"known-read: {type(exc).__name__}: {exc}")
+            return None
+        out["known_via"] = via
+        if via == "none":
+            out["errors"].append(
+                "known-read: no layer answered (provenance=none)")
+            return None
+        # The DOMAIN this sweep's zero is measured against. Recorded whether or
+        # not anything reaps, so a later reader can tell a real clean sweep from
+        # a census that came back nearly empty (guard-6002).
+        out["known_population"] = len(ids)
+        return ids
+
+    known_ids = _read_known()
+
     def _verdicts(sids) -> Dict[str, Any]:
         got: Dict[str, Any] = {}
         for sid in sids:
@@ -1577,7 +1685,7 @@ def _reap_stale_body_rows(
         return got
 
     decision = _reaper.decide(rows, _verdicts(rows.keys()), claims, self_sid,
-                              terminal_ids)
+                              terminal_ids, known_ids)
     out["verdict_counts"] = decision["verdict_counts"]
     out["decisions"] = decision["decisions"]
     out["reap_candidates"] = len(decision["reapable"])
@@ -1618,9 +1726,20 @@ def _reap_stale_body_rows(
         # mid-sweep legitimately becomes reapable — so it is re-read rather
         # than merely re-validated.
         fresh_terminal = _read_terminal()
+        # The known-id census is the FOURTH half and gets the same treatment,
+        # and here it is not merely consistency — omitting it would make the
+        # whole  predicate INERT AT APPLY TIME. `known_goal_ids`
+        # defaults to None, and None means NOT MEASURED, so a recheck that
+        # skipped this read would hand every vanished candidate a
+        # `goal_vanished=None` and decline it as `recheck-declined` forever. The
+        # scan would keep reporting candidates and the sweep would keep reaping
+        # none of them — a defect that looks like healthy conservatism from the
+        # outside (guard-1943: pinning the decision says nothing about the
+        # wiring). Pinned by a test that asserts the reap actually applies.
+        fresh_known = _read_known()
         recheck = _reaper.decide(
             {sid: fresh_rows[sid]}, _verdicts([sid]), fresh_claims[0], self_sid,
-            fresh_terminal
+            fresh_terminal, fresh_known
         )
         if not recheck["reapable"]:
             cand["apply_result"] = "recheck-declined"
@@ -1695,12 +1814,16 @@ def main() -> int:
              f"(<agent>/session/body-heartbeat-<SID>.json) must be for its "
              f"holder to count as demonstrably ALIVE, which HOLDS the claim "
              f"past --foreign-sid-grace-minutes. CALIBRATE IT AGAINST THE "
-             f"CARRIER'S WRITE CADENCE, not against that grace. The carrier is "
-             f"NOT refreshed continuously: heartbeat-tick.sh writes it, and its "
-             f"only worker call site is worker-loop Phase -0.4 — the top of each "
-             f"cycle — so a worker mid-unit writes nothing, and measured unit "
-             f"gaps run 15-92 min. A window under that gap reports a live worker "
-             f"stale and releases its claim mid-execution. Bounded on BOTH "
+             f"CARRIER'S WRITE CADENCE, not against that grace. Since "
+             f"g-115-8200 (2026-08-28) there are TWO writers: worker-loop "
+             f"Phase -0.4 at the top of each cycle, and bash-agent-inject.py "
+             f"before every Bash tool call (--body-only, throttled by "
+             f"_shared_tick.SHARED_HEARTBEAT_INTERVAL_S = 600s). The tool-call "
+             f"writer normally dominates, but it is not guaranteed, so this "
+             f"window is still calibrated against the SLOWER per-cycle writer: "
+             f"measured unit gaps run 15-92 min. A window under that gap "
+             f"reports a live worker stale and releases its claim "
+             f"mid-execution. Bounded on BOTH "
              f"sides: above the measured gap, and below the grace (at or past "
              f"the grace the grace becomes unreachable). Default: "
              f"{DEFAULT_CARRIER_FRESH_MINUTES}.",
@@ -1712,8 +1835,10 @@ def main() -> int:
         help=f"How recent the claim holder's OWN transcript on this box (its "
              f"Claude Code <sid>.jsonl or zakcode sessions/<sid>.json) must be "
              f"for the holder to count as ALIVE past --foreign-sid-grace-minutes "
-             f"when it has no fresh body carrier. A worker mid-unit writes no "
-             f"carrier and no diary, but every model step lands in its "
+             f"when it has no fresh body carrier. Reaching this probe means the "
+             f"carrier never got to the store (push failure, pre-g-115-8200 "
+             f"code, or no bound session dir) — a worker DOES refresh its "
+             f"carrier mid-unit; every model step also lands in its "
              f"transcript. Box-local: a fresh reading keeps the claim; an absent "
              f"transcript (holder on another box) changes nothing. Default: "
              f"{DEFAULT_HOLDER_FRESH_MINUTES}.",
@@ -2161,10 +2286,12 @@ def main() -> int:
                 summary["stranded"].append(record)
                 continue
             # No fresh carrier — ask the holder's own transcript on THIS box
-            # (2026-08-30). A worker mid-unit writes no carrier and no diary,
-            # but every step it takes lands in its transcript; a dead session's
-            # transcript simply stops. `absent` (holder on another box) and
-            # `unreadable` change nothing — this probe can only KEEP.
+            # (2026-08-30). Since  (2026-08-28) a worker DOES refresh
+            # its carrier mid-unit, so reaching here means the carrier never
+            # got to the store (push failure, pre- code, or no bound
+            # session dir) — not that workers write no carrier. A dead
+            # session's transcript simply stops. `absent` (holder on another
+            # box) and `unreadable` change nothing — this probe can only KEEP.
             holder = _holder_transcript_verdict(
                 claimed_by_sid, args.holder_fresh_minutes, now)
             summary["holder_checks"] += 1

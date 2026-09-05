@@ -149,7 +149,7 @@ sweep_tier() {
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
-        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|locus-sweep|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|self-blocked-defer-sweep|phantom-goal-audit|hardcoded-scope-audit|closed-against-own-note-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|completed-not-closed-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence)
+        pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|locus-sweep|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|self-blocked-defer-sweep|phantom-goal-audit|hardcoded-scope-audit|closed-against-own-note-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|completed-not-closed-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence|stalled-goal-ratchet|abandoned-claim-check|check-stderr-json-merge|check-uncommitted-edits-log-freshness|role-multiplier-coverage-audit|verify-rb-type-parity|hand-command-audit|check-agents-parent-dir-sync|fromisoformat-idiom-guard|hook-slot-contract-check|narrative-clobber-audit|guardrail-pair-audit|dropped-field-audit|unchecked-write-ratchet|tree-last-updated-drift-check|goal-field-census-ratchet|check-tests-no-live-agent-wm|embedded-python-audit|tree-adjudication-scan|displaced-id-audit|repo-hygiene-sweep)
             echo "deferrable" ;;
         *)
             # Unknown sweep name — surface to stderr so a missing registration
@@ -294,7 +294,57 @@ PYEOF
             exit 0
         fi
         if [[ ! -f "$STATE_FILE" ]]; then
-            echo "run"  # no state → fail-open
+            # NO STATE => FAIL-OPEN, AND SAY SO (). The `run` below is
+            # DELIBERATE and must not be flipped: a fail-closed here would drop
+            # deferrable sweeps whenever the meter is not running, which is the
+            # inverted-default trap 's outcome 3 was rewritten to avoid.
+            # What was wrong was the SILENCE, not the decision.
+            #
+            # This branch short-circuits BEFORE the zone is ever read, so the
+            # commonly-stated cause "the zone defaults to fresh, whose rule list
+            # is empty" is not what happens — `check` never reaches
+            # `state.get('zone','fresh')` at all, and every sweep gets `run`
+            # regardless of real pressure. The absence itself is normal: `end`
+            # unlinks STATE_FILE (one-shot per iteration, see the `end` branch),
+            # so the file exists only INSIDE a start..end window. A `check` made
+            # outside that window is therefore unmetered by construction.
+            #
+            # Surfaced two ways because stderr alone is not enough: guard-772 —
+            # a fail-open WARN written only to stderr is INVISIBLE when the
+            # command runs inside a backgrounded Bash subprocess. So the durable
+            # record goes to DROP_LOG, which precheck-gap-check.py already reads
+            # (it filters on event == "precheck-end", so this new event type is
+            # ignored there rather than breaking it). stdout stays EXACTLY
+            # "run" — callers branch on that string, and guard-659 (stderr
+            # contaminating a 2>&1 JSON capture) is why nothing extra goes there.
+            # `>&2`, never a /dev/stderr path (guard-1883).
+            #
+            # SUPPRESSED ON A WORKER BODY: iteration-open.py::_meter refuses on a
+            # worker (returns "skipped-worker-body") precisely because STATE_FILE
+            # is agent-wide and syncable, so on a worker the file is SUPPOSED to
+            # be absent and a warning would be pure noise on every sweep.
+            if [[ "${BODY_ROLE:-}" != "worker" ]]; then
+                echo "[precheck-meter] UNMETERED: no state file at $STATE_FILE — '$SWEEP_NAME' returns run (fail-open) WITHOUT consulting the zone. Nothing is droppable while this persists; the meter's only drop path is inert. Expected only OUTSIDE a start..end window." >&2
+                mkdir -p "$(dirname "$DROP_LOG")" 2>/dev/null || true
+                SWEEP_E="$SWEEP_NAME" STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" \
+                py -3 - <<'PYEOF' 2>/dev/null || true
+import os, json, time
+try:
+    rec = {
+        "ts": int(time.time() * 1000),
+        "event": "meter-check-no-state",
+        "sweep": os.environ["SWEEP_E"],
+        "decision": "run",
+        "reason": "no-state-file:fail-open",
+        "state_file": os.environ["STATE_FILE_E"],
+    }
+    with open(os.environ["DROP_LOG_E"], "a") as f:
+        f.write(json.dumps(rec) + "\n")
+except Exception:
+    pass
+PYEOF
+            fi
+            echo "run"  # no state → fail-open (deliberate; see above)
             exit 0
         fi
         tier=$(sweep_tier "$SWEEP_NAME")
@@ -463,8 +513,27 @@ PYEOF
         if [[ ! -f "$STATE_FILE" ]]; then
             exit 0
         fi
+        # --keep-state (): write the precheck-end SUMMARY but leave
+        # the state file in place, so the metering WINDOW stays open for the
+        # caller's remaining `check` calls. iteration-open.py passes it; the
+        # precheck SKILL.md closing `end` uses the default (summary + unlink).
+        #
+        # WHY THE SPLIT: iteration-open opens the window at :671 and used to
+        # close it 63 lines later, before ANY of the 23 deferrable `meter
+        # check` calls in aspirations-precheck-digest.md execute -- so every
+        # one hit the no-state-file fail-open and NOTHING was ever droppable
+        # (guard-2832 measured zone=fresh on 92/92 precheck-end records).
+        # Deleting that close outright is the obvious fix and is WRONG:
+        # precheck-gap-check reads the `end` stamp, and start-without-end is
+        # the abbreviated-precheck signature -- `end` fired only 82% of closes
+        # before iteration-open guaranteed it. Writing the stamp while KEEPING
+        # the window open serves both. A leaked state file self-heals: `start`
+        # overwrites it unconditionally.
+        KEEP_STATE=""
+        [[ "$SWEEP_NAME" == "--keep-state" ]] && KEEP_STATE=1
         cur_ms=$(now_ms)
         STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" CUR_E="$cur_ms" \
+        KEEP_STATE_E="$KEEP_STATE" \
         py -3 - <<'PYEOF' 2>/dev/null || true
 import os, json
 state_file = os.environ['STATE_FILE_E']
@@ -549,16 +618,19 @@ else:
                 f.write(json.dumps(summary) + '\n')
         except Exception:
             pass
-# Clean up state file (one-shot per iteration)
-try:
-    os.unlink(state_file)
-except Exception:
-    pass
+# Clean up state file (one-shot per iteration) -- UNLESS the caller passed
+# --keep-state, which writes the summary but leaves the window open so the
+# caller's remaining `check` calls can still consult the zone ().
+if not os.environ.get('KEEP_STATE_E'):
+    try:
+        os.unlink(state_file)
+    except Exception:
+        pass
 PYEOF
         ;;
 
     *)
-        echo "usage: $0 {start|check <sweep-name>|executed <sweep-name>|end}" >&2
+        echo "usage: $0 {start|check <sweep-name>|executed <sweep-name>|end [--keep-state]}" >&2
         exit 2
         ;;
 esac

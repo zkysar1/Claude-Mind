@@ -44,6 +44,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/_platform.sh"
 
+# _platform.sh converts REPO_ROOT/PROJECT_ROOT/CORE_ROOT/etc but NOT SCRIPT_DIR,
+# which pwd set in MSYS /c/... form. The tree-edit-since.py call below hands
+# SCRIPT_DIR to the interpreter as the SCRIPT PATH, and _platform.sh exports
+# MSYS_NO_PATHCONV=1 so MSYS will not rewrite argv either -- Windows Python then
+# fails to open the script. That call sits inside an `if` with output redirected
+# to /dev/null, so the failure is swallowed whole and the tree probe silently
+# reports ran_no_edit. Callee-side normalization (rb-168) cannot reach this case
+# -- the interpreter fails before any Python executes. Same guard as
+# recurring-close.sh, whose post-conversion SCRIPT_DIR feeds bash, -f tests and
+# python alike; a no-op off Windows.
+if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
+  SCRIPT_DIR="$(cygpath -m "$SCRIPT_DIR")"
+fi
+
 OUTCOME_CLASS="${1:-}"
 GOAL_ID="${2:-}"
 CATEGORY="${3:-}"

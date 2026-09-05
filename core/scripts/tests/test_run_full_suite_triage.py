@@ -287,6 +287,16 @@ def test_run_clears_stale_chunk_logs_from_a_prior_run(tmp_path, monkeypatch):
     stale.write_text("FAILED some/old_test.py::test_gone\n", encoding="utf-8")
 
     monkeypatch.setattr(RFS, "TESTS_DIR", fake_tests)
+    # _testpaths(), not TESTS_DIR, is the collection resolver () --
+    # TESTS_DIR is only its last-resort fallback, so patching it alone left
+    # main() collecting the REAL tree. Harmless until the argv-budget refusal
+    # landed (), which then returned 2 BEFORE any chunk log was
+    # written and reddened this test. PROJECT_ROOT follows because main()
+    # narrates its roots as `d.relative_to(PROJECT_ROOT)` and tmp_path is
+    # outside the repo. Same repair as test_run_full_suite_fleet_layout.py
+    # ().
+    monkeypatch.setattr(RFS, "_testpaths", lambda: [fake_tests])
+    monkeypatch.setattr(RFS, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(RFS.subprocess, "run", lambda *a, **k: None)
 
     RFS.main(["--out", str(out), "--chunks", "1"])

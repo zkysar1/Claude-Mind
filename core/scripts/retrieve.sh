@@ -241,6 +241,34 @@ case $rc in
             echo "[retrieve.sh] FATAL: GET /v1/retrieve returned rc=0 with an EMPTY body after ${_ELAPSED_MS}ms (bound RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s) — the g-115-6189 silent-empty signature. A genuinely-empty retrieval is a non-empty JSON envelope, so this is a transport/daemon fault, NOT 'no guardrails apply'. Do not treat this consult as performed." >&2
             exit 7
         fi
+        # --- session provenance manifest ( producer; wired ) ---
+        # Record that a consultation HAPPENED. Deliberately records the EVENT and
+        # the query, never the returned node keys: parsing the JSON body here
+        # would put a parse on the framework's hottest read path, which is why
+        #  deferred this lane. The retrieval-floor consumer needs only
+        # the event, so it costs one append.
+        #
+        # SUCCESS-GATED, after the empty-body check above and before the body is
+        # emitted — same contract as tree-read.sh's node lane. Recording a
+        # consultation that returned nothing would authenticate a floor the
+        # session never actually cleared, which is the one direction this
+        # manifest must not fail in.
+        #
+        # AUTO vs DELIBERATE: user-prompt-retrieval-inject.sh sets
+        # MIND_RETRIEVAL_AUTO=1 for its automatic per-prompt pre-pass. That is
+        # NOT evidence the agent consulted anything — the model never asked for
+        # it and may never read it — so it lands in a separate kind the floor
+        # does not count. See DELIBERATE_RETRIEVAL_KINDS in context-reads.py.
+        #
+        # Fail-open and stdout-silent by contract: retrieve.sh's stdout is the
+        # retrieval payload its callers parse, so this must never write to it,
+        # and a manifest failure must never fail a retrieval that succeeded.
+        if [ "${MIND_RETRIEVAL_AUTO:-}" = "1" ]; then _prov_kind="retrieval-auto"; else _prov_kind="retrieval"; fi
+        _prov_sid_arg=()
+        [ -n "${MIND_SID:-}" ] && _prov_sid_arg=(--session-id "$MIND_SID")
+        python3 "$CORE_ROOT/scripts/context-reads.py" record-prov \
+            "${_prov_sid_arg[@]}" --kind "$_prov_kind" "$CATEGORY" >/dev/null 2>&1 || true
+
         cat "$_RETRIEVE_OUT"
         _commons_draw
         exit 0;;

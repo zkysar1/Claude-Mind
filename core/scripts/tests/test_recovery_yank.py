@@ -471,11 +471,21 @@ def test_state_mismatch_landing_is_wired_before_both_iteration_complete_imperati
         assert call < imperative, name
 
 
-def _run_landing(root: Path, sid=SID):
+def _run_landing(root: Path, sid=SID, body_role=None):
     env = dict(os.environ)
     env.update({"MIND_AGENT": AGENT, "STORAGE_BACKEND": "local", "RT_NO_AUTOSPAWN": "1",
                 "RUNTIME_DIR": str(root / "rt")})
     env.pop("MIND_SID", None)
+    # BODY_ROLE decides whether the landing may fire at all (), and the
+    # PreToolUse bash hook injects it into every Bash call — so on a WORKER box
+    # dict(os.environ) silently carries BODY_ROLE=worker and every landing test
+    # below would go RED there while staying green on the reducer's box. That is
+    # the guard-1515 environment axis: a suite result is a claim about ONE box's
+    # env, not about the code. Pin it explicitly instead of inheriting; the
+    # default is the REDUCER shape (absent), which is what these tests assert.
+    env.pop("BODY_ROLE", None)
+    if body_role is not None:
+        env["BODY_ROLE"] = body_role
     return subprocess.run([BASH, str(root / "core" / "scripts" / "state-mismatch-landing.sh"),
                            "--agent", AGENT, "--sid", sid],
                           capture_output=True, text=True, env=env, timeout=240)
@@ -495,6 +505,34 @@ def test_landing_prints_the_consolidate_directive_when_the_yank_cannot_be_revers
     assert "STATE MISMATCH" in r.stdout and "aspirations-consolidate" in r.stdout
     assert "do NOT call Skill(aspirations)" in r.stdout
     assert "ITERATION COMPLETE" not in r.stdout
+
+
+def test_landing_is_silent_on_a_worker_body_whose_idle_state_is_by_design(tmp_path):
+    """A worker Body is agent-state=IDLE BY DESIGN, so IDLE is not a mismatch.
+
+    guard-5821: agent-state is a REDUCER-OWNED signal exactly one Body writes, at
+    /start and /stop; a worker never writes it. Before g-115-8903 the landing
+    fired at EVERY worker close and told the worker to run /aspirations-consolidate
+    — a reducer-only phase — over its own unmerged state.
+
+    The reducer run is the POSITIVE CONTROL: same sandbox, same sid, same script;
+    only BODY_ROLE differs. Without it a broken guard that suppressed everything
+    would still pass the worker assertion.
+    """
+    root, _ = _sandbox(tmp_path, entries=[_recent_yank()])
+
+    reducer = _run_landing(root, sid=OTHER_SID)
+    assert reducer.returncode == 0, reducer.stdout + reducer.stderr
+    assert "STATE MISMATCH" in reducer.stdout
+
+    worker = _run_landing(root, sid=OTHER_SID, body_role="worker")
+    assert worker.returncode == 1, worker.stdout + worker.stderr
+    assert worker.stdout == ""
+    assert "LANDING" not in worker.stderr
+
+    # The guard lower-cases before comparing, so the hook's casing cannot matter.
+    upper = _run_landing(root, sid=OTHER_SID, body_role="WORKER")
+    assert upper.returncode == 1, upper.stdout + upper.stderr
 
 
 def test_landing_reverses_a_true_yank_and_continues(tmp_path):

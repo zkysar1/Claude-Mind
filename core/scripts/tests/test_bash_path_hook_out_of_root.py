@@ -240,14 +240,70 @@ class TestOutOfRootRefusal(unittest.TestCase):
                 self.assertEqual(bash_verdict(cmd), "approve")
 
     def test_exempt_sinks_are_approved(self):
-        """Device sinks and the system temp tree (which contains the sanctioned
-        session scratchpad) carry ~26pp of the measured false-positive mass."""
+        """Device sinks and the system temp tree carry ~26pp of the measured
+        false-positive mass, so both stay exempt.
+
+        The scratchpad case that used to sit in this list moved to
+        ``test_harness_scratchpad_write_is_denied`` below (g-115-8761). It was
+        justified here by a docstring calling the scratchpad "sanctioned",
+        which was true when written and was overridden on 2026-08-21 by
+        .claude/rules/no-scratchpad.md. The pin is not weakened — the temp tree
+        is still exempt and the four cases that carry the FP mass are
+        untouched; only the one case whose REQUIREMENT changed moved, and it
+        moved to an assertion rather than being deleted.
+        """
         for cmd in (
             "bash core/scripts/team-state-read.sh --json > /dev/null",
             "echo x >> /dev/null",
             "echo x > /tmp/scratch-g1153338.json",
-            "echo x > /tmp/claude-0/some-session/scratch/notes.md",
             "echo x > /var/tmp/probe.txt",
+            # The framework's OWN temp artifacts must keep working: run-full-suite
+            # defaults its logs here precisely to keep them off the synced tree
+            # (). A bare-/tmp deny would refuse the remedy another
+            # guardrail prescribes — this is the case that bounds the carve-out.
+            "echo x > /tmp/ayoai-suite-run-alpha/chunk-00.log",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(bash_verdict(cmd), "approve")
+
+    def test_harness_scratchpad_write_is_denied(self):
+        """A Bash write into the harness scratchpad is REFUSED ().
+
+        Before this, the Write tool refused the target and a Bash redirect to
+        the byte-identical path was approved — not merely unreached, but
+        AFFIRMATIVELY approved by the /tmp write-exempt sink above. Every write
+        verb extract_targets knows is covered, because the bypass is the shape
+        the agent reaches for, not the one the test author imagines.
+        """
+        for cmd in (
+            "echo x > /tmp/claude-0/some-session/scratch/notes.md",
+            "echo x >> /tmp/claude-0/some-session/scratch/notes.md",
+            "echo x > '/tmp/claude-0/s/quoted.md'",
+            "tee /tmp/claude-0/s/tee.md",
+            "cp /etc/hostname /tmp/claude-0/s/copied.txt",
+            "mv notes.md /tmp/claude-0/s/moved.md",
+            "mkdir -p /tmp/claude-0/s/newdir",
+            "touch /tmp/claude-0/s/touched.txt",
+            "echo x > /var/tmp/claude-3/s/notes.md",
+            "bash -c 'echo x > /tmp/claude-0/s/nested.md'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(bash_verdict(cmd), "deny")
+
+    def test_reading_from_the_scratchpad_is_still_approved(self):
+        """READS are untouched — the deny keys on write intent, not presence.
+
+        Load-bearing, not a courtesy: the harness itself writes background-task
+        output under the scratchpad and instructs the model to read it. A check
+        keyed on the mere presence of a scratchpad path would refuse ordinary
+        inspection of a task log, which is a false positive with real cost and
+        would push the next agent to disable the gate.
+        """
+        for cmd in (
+            "cat /tmp/claude-0/proj/sid/tasks/b8e93ayr7.output",
+            "tail -40 /tmp/claude-0/proj/sid/tasks/b8e93ayr7.output",
+            "grep -c VERDICT /tmp/claude-0/proj/sid/tasks/out.log",
+            "ls -la /tmp/claude-0/proj/sid/",
         ):
             with self.subTest(cmd=cmd):
                 self.assertEqual(bash_verdict(cmd), "approve")

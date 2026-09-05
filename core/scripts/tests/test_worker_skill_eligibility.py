@@ -242,10 +242,19 @@ def test_cli_eligible_case(capsys):
     assert capsys.readouterr().out.strip() == "eligible"
 
 
-def test_cli_no_skill_is_eligible(capsys):
+def test_cli_no_skill_is_UNDETERMINED_not_eligible(capsys):
+    """RETARGETED, not deleted (, guard-4618).
+
+    This test used to assert the stdout word "eligible" for a goal the bridge
+    CANNOT judge -- it pinned the defect. The property it was really protecting
+    is the FAIL-OPEN rc, and that is asserted here unchanged: rc stays 0 and
+    `eligible` stays True, because 919 of 938 live candidates take this branch
+    and refusing them would strand the worker role. Only the WORD moved.
+    """
     rc = we._main(["skill-eligible"])
-    assert rc == 0
-    assert capsys.readouterr().out.strip() == "eligible"
+    assert rc == 0, "fail-open rc must NOT move -- see _SkillEligibilityFields"
+    assert we.skill_eligibility(None).eligible is True
+    assert capsys.readouterr().out.strip() == "undetermined"
 
 
 def test_cli_verdict_on_stdout_reason_on_stderr(capsys):
@@ -256,7 +265,7 @@ def test_cli_verdict_on_stdout_reason_on_stderr(capsys):
     """
     we._main(["skill-eligible", "/replay"])
     out = capsys.readouterr()
-    assert out.out.strip() in ("eligible", "reducer-only")
+    assert out.out.strip() in ("eligible", "reducer-only", "undetermined")
     assert len(out.out.strip().split()) == 1
     assert len(out.err.strip()) > 40
 
@@ -575,3 +584,241 @@ def test_recovery_is_reachable_through_the_CLI_argument_shape():
         capture_output=True, text=True, timeout=120)
     assert ctrl.returncode == 0, (
         f"control flipped: rc={ctrl.returncode}, stderr={ctrl.stderr[-300:]!r}")
+
+
+# ============ : the decline must not render as a permit ============
+#
+# The measured defect: worker-loop Phase 1 called `skill-eligible` (SKILL-keyed,
+# blind to the goal's own role declaration), and BOTH of that bridge's
+# can't-judge branches printed the literal word "eligible" at rc 0 -- byte-
+# identical to a real pass. Meanwhile goal-selector's drain-lane banner
+# affirmatively told the reader to "claim it without a deviation code" for rows
+# declaring executable_by_role='reducer'. Four first-hand encounters.
+
+
+def test_undetermined_is_a_third_verdict_not_a_flavour_of_eligible():
+    v = we.skill_eligibility(None)
+    assert v.undetermined is True
+    assert we._verdict_word(v) == "undetermined"
+
+
+@pytest.mark.parametrize("skill", ["/forge-skill", "/some-skill-nobody-mapped"])
+def test_unmapped_skill_does_not_return_a_bare_eligible_verdict(skill):
+    """The goal's own check: `/forge-skill` on a worker Body must not come back
+    as a bare `eligible`. It maps to no lifecycle stage, so the bridge has no
+    key and no answer -- that is UNDETERMINED, and the caller decides."""
+    v = we.skill_eligibility(skill)
+    assert v.undetermined is True
+    assert we._verdict_word(v) == "undetermined"
+    assert v.eligible is True, "fail-open direction must not invert"
+
+
+@pytest.mark.parametrize("skill,word", [
+    ("/tree", "eligible"),                        # pinned worker-eligible
+    ("/agent-completion-report", "eligible"),     # pinned worker-eligible
+    ("/replay", "reducer-only"),                  # mapped reducer-only stage
+])
+def test_CONTROL_a_real_judgment_still_reads_as_a_real_judgment(skill, word):
+    """The positive control guard-2903/guard-5163 require: prove the new field
+    DISCRIMINATES. If `undetermined` were set unconditionally these three would
+    flip, and the test above would still pass."""
+    v = we.skill_eligibility(skill)
+    assert v.undetermined is False
+    assert we._verdict_word(v) == word
+
+
+def test_skill_null_reducer_role_is_refused_through_the_CLI(capsys):
+    """A worker Body IS refused on a skill-null executable_by_role=reducer goal
+    -- asserted through the CLI in the PRODUCTION arg shape (guard-920), not
+    only at the function level."""
+    rc = we._main(["goal-eligible", "--role", "reducer", ""])
+    assert rc == 1
+    assert capsys.readouterr().out.strip() == "reducer-only"
+
+
+def test_CONTROL_same_goal_without_the_role_field_is_undetermined(capsys):
+    """The discriminator control for the test above: identical skill-null input,
+    role dropped. If this also read `reducer-only`, the refusal would be proving
+    nothing about `executable_by_role`."""
+    rc = we._main(["goal-eligible", ""])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "undetermined"
+
+
+def test_role_flag_must_precede_the_remainder_skill_arg(capsys):
+    """MEASURED TRAP: `skill` is argparse REMAINDER, so a TRAILING `--role
+    reducer` is swallowed as skill text and the role is never read. Pinned so
+    the SKILL.md's "--role COMES FIRST" instruction has a test behind it, and so
+    the mis-ordered form can never silently read as a cleared check."""
+    rc = we._main(["goal-eligible", "", "--role", "reducer"])
+    assert rc == 0, "mis-ordered form does NOT reach the reducer branch"
+    assert capsys.readouterr().out.strip() == "undetermined", (
+        "a swallowed --role must surface as UNDETERMINED, never as `eligible`")
+
+
+# ------------- wiring: Phase 1 must actually CALL the role gate -------------
+#
+# guard-1943: pinning the writer says nothing about the wiring. `goal_eligibility`
+# shipped with  and its ONLY caller was its own CLI -- the worker loop
+# still called the role-blind `skill-eligible`, so the gate was inert on every
+# box. These assert the call site, which is the half that was missing.
+
+WORKER_LOOP_SKILL = CORE_SCRIPTS.parent.parent / ".claude" / "skills" / "worker-loop" / "SKILL.md"
+
+
+def test_worker_loop_phase_1_consults_the_goal_level_role_declaration():
+    src = WORKER_LOOP_SKILL.read_text(encoding="utf-8")
+    assert "executable_by_role" in src
+    assert "worker_execute.py goal-eligible" in src, (
+        "Phase 1 must call the GOAL-level gate, not the role-blind skill bridge")
+    call = src.split("worker_execute.py goal-eligible", 1)[1].split("\n", 1)[0]
+    assert call.lstrip().startswith("--role"), (
+        f"--role must PRECEDE the REMAINDER skill arg; got: {call!r}")
+
+
+def test_worker_loop_phase_1_teaches_all_three_verdict_words():
+    src = WORKER_LOOP_SKILL.read_text(encoding="utf-8")
+    for word in ("reducer-only", "eligible", "undetermined"):
+        assert word in src, f"Phase 1 never names the {word!r} verdict"
+
+
+# ---------------- the drain-lane banner must not waive on a role mismatch ----
+
+
+def _banner(row):
+    gs = _load("goal_selector_for_banner", "goal-selector.py")
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        gs.emit_drain_lane_banner(row, eligible_count=3, since=0, k=5)
+    return buf.getvalue()
+
+
+def test_banner_withholds_the_waiver_from_a_reducer_only_row():
+    out = _banner({"goal_id": "g-000-01", "recurring_overdue_ratio": 2.0,
+                   "executable_by_role": "reducer"})
+    assert "claim it without a deviation code" not in out
+    assert "executable_by_role='reducer'" in out
+    assert "must NOT claim it" in out
+
+
+@pytest.mark.parametrize("role", [None, "worker", "any"])
+def test_CONTROL_banner_still_waives_for_every_other_row(role):
+    """Positive control: if the branch fired unconditionally the assertion above
+    would pass while the lane stopped working for the 98% of rows it serves."""
+    out = _banner({"goal_id": "g-000-02", "recurring_overdue_ratio": 2.0,
+                   "executable_by_role": role})
+    assert "claim it without a deviation code" in out
+
+
+def test_the_banner_branch_reads_the_goal_field_not_the_reader_role():
+    """guard-2783 / LIFECYCLE_DISPOSITIONS["select"]: the selector must stay
+    role-blind. The branch is allowed because it reads a FIELD ON THE GOAL --
+    identical bytes for both roles on the same row."""
+    src = (CORE_SCRIPTS / "goal-selector.py").read_text(encoding="utf-8")
+    assert "skill_eligibility" not in src
+    assert "worker_execute" not in src
+    row = {"goal_id": "g-000-03", "recurring_overdue_ratio": 2.0,
+           "executable_by_role": "reducer"}
+    assert _banner(row) == _banner(dict(row)), "banner output must be role-free"
+
+
+# --------------- claim-boundary role re-check () ---------------
+# The select-time `goal-eligible` gate above judges the SCORED ROW. On a worker
+# that row's executable_by_role is null for every candidate it can ever see:
+# goal-selector sets `_skip_reducer_only = (_role != ROLE_REDUCER)` and drops
+# reducer-only rows before emission. Measured 2026-09-05 (alpha, cc-13):
+# 1859/1859 emitted rows carried the key and 1859 were null, while 42 live goals
+# in the store were stamped `reducer` and 0 of them were in the pool. So the
+# claim RESPONSE is the only surface on which a worker can observe the value,
+# and these tests pin the gate that reads it.
+
+def _claim_file(tmp_path, record):
+    import json as _json
+    p = tmp_path / "claim.json"
+    p.write_text(_json.dumps(record), encoding="utf-8")
+    return str(p)
+
+
+def test_claim_recheck_refuses_a_reducer_stamped_response(tmp_path, capsys):
+    """The TOCTOU this closes, observed live: a peer write stamped a goal
+    `reducer` at 2026-09-05T02:38:25 while it sat at RANK 1 in a worker's pool,
+    scored under the older null."""
+    f = _claim_file(tmp_path, {"id": "g-000-01", "skill": None,
+                               "executable_by_role": "reducer"})
+    rc = we._main(["claim-role-recheck", "--claim-file", f])
+    out = capsys.readouterr()
+    assert rc == 1
+    assert out.out.strip() == "reducer-only"
+    assert "executable_by_role='reducer'" in out.err
+
+
+@pytest.mark.parametrize("role", [None, "any", "Reducer-ish"])
+def test_CONTROL_claim_recheck_does_not_refuse_everything_else(tmp_path, capsys,
+                                                               role):
+    """Anti-vacuity. If the gate refused unconditionally the assertion above
+    would still pass while every claim a worker makes started failing -- and the
+    corpus this judges is ~100% unstamped, so that is the whole population.
+    An UNRECOGNISED value must degrade, not fence (a typo must not silently
+    fence a goal in either direction)."""
+    f = _claim_file(tmp_path, {"id": "g-000-02", "skill": None,
+                               "executable_by_role": role})
+    rc = we._main(["claim-role-recheck", "--claim-file", f])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "undetermined"
+
+
+def test_claim_recheck_fails_open_when_the_response_is_unreadable(tmp_path,
+                                                                  capsys):
+    """A plumbing fault is not a role declaration. Fail-CLOSED here would fence
+    off nearly every goal a worker could legitimately take."""
+    missing = str(tmp_path / "nope.json")
+    assert we._main(["claim-role-recheck", "--claim-file", missing]) == 0
+    assert capsys.readouterr().out.strip() == "undetermined"
+    garbage = tmp_path / "garbage.json"
+    garbage.write_text("not json at all", encoding="utf-8")
+    assert we._main(["claim-role-recheck", "--claim-file", str(garbage)]) == 0
+    assert capsys.readouterr().out.strip() == "undetermined"
+
+
+def test_claim_recheck_reuses_goal_eligibility_rather_than_copying_it():
+    """no-transcription contract (guard-2676): one role implementation, not two.
+    A second copy would drift silently -- and nothing would fail when it did."""
+    src = (CORE_SCRIPTS / "worker_execute.py").read_text(encoding="utf-8")
+    body = src.split('if args.cmd == "claim-role-recheck":', 1)[1]
+    body = body.split('if args.cmd == "reducer-only-skills":', 1)[0]
+    assert "goal_eligibility(" in body
+    for literal in ("REDUCER_ONLY_BY_DESIGN", "== \"reducer\""):
+        assert literal not in body, f"re-implemented role logic: {literal}"
+
+
+def test_a_stale_snapshot_role_never_overrides_the_fresh_claim_response(tmp_path,
+                                                                        capsys):
+    """checks[2] second half: the TOCTOU, pinned in BOTH directions.
+
+    The select-time snapshot and the claim response can disagree, and the whole
+    point of this gate is that the FRESH record decides. Testing only the
+    refusing direction would leave a gate that merely refuses `reducer` from
+    anywhere; testing both proves it is reading the response, not a cached row.
+    No store fixture is needed -- the snapshot is exactly the value that is NOT
+    passed in.
+    """
+    # Direction 1 -- the observed incident: scored under a null snapshot, then a
+    # peer stamps it `reducer` before the claim lands. Refuse.
+    stale_null_fresh_reducer = _claim_file(
+        tmp_path, {"id": "g-000-03", "skill": None,
+                   "executable_by_role": "reducer"})
+    assert we._main(["claim-role-recheck", "--claim-file",
+                     stale_null_fresh_reducer]) == 1
+    assert capsys.readouterr().out.strip() == "reducer-only"
+
+    # Direction 2 -- the converse. A snapshot that said `reducer` must NOT fence
+    # a goal whose fresh record no longer does (an unstamping, or a row read from
+    # a different pass). If this ever returns 1, the gate is consulting something
+    # other than the response it was handed.
+    stale_reducer_fresh_null = _claim_file(
+        tmp_path, {"id": "g-000-04", "skill": None,
+                   "executable_by_role": None})
+    assert we._main(["claim-role-recheck", "--claim-file",
+                     stale_reducer_fresh_null]) == 0
+    assert capsys.readouterr().out.strip() == "undetermined"

@@ -327,6 +327,47 @@ def _default_archive(path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+def _recovery_layer_absent(path: Path):
+    """(absent, reason) — does a bare record-dropping rewrite of `path` have NO recovery layer?
+
+    `cap` mode writes no archive sibling, so its ONLY recovery layer is the
+    .history snapshot that locked_modify_jsonl takes before overwriting. That
+    snapshot is SKIPPED for every store on the _fileops snapshot blacklist,
+    whose stated rationale is "the file IS the history" -- true for an
+    append-only READER, and false the moment a cap sweep truncates the file.
+    Measured 2026-09-04 (g-115-8978): 30,588 records dropped across three
+    blacklisted stores with archive=None and no snapshot -- unrecoverable.
+
+    Fail-CLOSED by contract (archive-before-delete.md step 2): when the
+    recovery layer cannot be VERIFIED it is treated as ABSENT. A store outside
+    every governed root gets no snapshot either, so an unresolvable base dir is
+    a true absence, not a conservative guess. The cost of a wrong refusal is a
+    store that stays unbounded until someone reads the reason; the cost of a
+    wrong apply is permanent record loss.
+    """
+    try:
+        from _fileops import resolve_base_dir, _is_snapshot_blacklisted
+    except Exception as e:  # pragma: no cover - import shape is pinned by tests
+        return True, f"cannot verify .history recovery layer ({e!r})"
+    base_dir = resolve_base_dir(path)
+    if base_dir is None:
+        # DELIBERATELY NARROW, and not an oversight. A path under no governed
+        # root gets no snapshot either -- but every store in the measured
+        # population (the store-hygiene registry sweep) is governed, while the
+        # non-governed callers of hygiene_one are ad-hoc utilities and test
+        # harnesses that own their own archive decision. Refusing there would
+        # be a scope-creep regression on callers this goal never measured.
+        return False, ""
+    try:
+        rel = Path(path).resolve().relative_to(Path(base_dir).resolve())
+    except ValueError as e:
+        return True, f"cannot resolve store path against its base dir ({e})"
+    if _is_snapshot_blacklisted(base_dir, rel):
+        return True, (f"{rel} is snapshot-blacklisted in _fileops, so no "
+                      ".history snapshot is taken before the rewrite")
+    return False, ""
+
+
 # The one-store operation. Returns a report dict.
 # ---------------------------------------------------------------------------
 def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
@@ -411,6 +452,24 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
     from _fileops import locked_modify_jsonl
 
     if mode == "cap":
+        # RECOVERY-LAYER GATE (). cap writes NO archive sibling, so
+        # the .history snapshot is the only thing standing between this
+        # rewrite and permanent loss. Verify it BEFORE the destructive write --
+        # there is no "after": the drop IS the locked write, so a post-hoc
+        # check would report the loss it was meant to prevent.
+        # archive-before-delete.md step 5: only then delete.
+        _no_recovery, _why = _recovery_layer_absent(path)
+        if _no_recovery:
+            rep["action"] = "refused-no-recovery-layer"
+            rep["applied"] = False
+            rep["dropped"] = 0
+            rep["kept"] = total
+            rep["refused_reason"] = (
+                f"{_why}; cap would drop {n_drop} record(s) with no archive "
+                f"and no snapshot. Use mode=rotate (archive-FIRST) to bound "
+                f"this store instead."
+            )
+            return rep
         # Atomic: keep the newest (total - n_drop). Using a fresh in-lock read,
         # keep the LAST `keep` records. Concurrent appends (newest) are kept.
         # Retry-with-backoff mirrors rotate Phase-2 (): world/changelog

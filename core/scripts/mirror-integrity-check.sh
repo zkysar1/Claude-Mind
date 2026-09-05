@@ -68,8 +68,26 @@ if [ "$DRIFT" = 1 ]; then
         [ "$RC" = 0 ] && RC=2
     else
         TREE="$WORLD_PATH/knowledge/tree"
-        NODES="$(python3 "$SCRIPT_DIR/tree-edit-since.py" "$SINCE" --list 2>/dev/null | tr -d '\r')"
-        if [ -z "$NODES" ]; then
+        # tree-edit-since.py REFUSES an unparseable timestamp loudly — "bad
+        # timestamp '<v>': Invalid isoformat string" on stderr. Routing that to
+        # /dev/null turned the refusal into an empty NODES, which the next branch
+        # reported as "0 tree nodes ... nothing to read": a silent zero wearing a
+        # plausible sentence, from a tool that had already said exactly what was
+        # wrong ( sibling audit of the  value-vs-flag class).
+        #
+        # DISCRIMINATE ON STDERR, NEVER ON THE RC. tree-edit-since.py documents
+        # exit 1 as "no such file (or could not parse timestamp / could not
+        # access tree dir)" and is fail-open by design — so rc=1 is the ORDINARY
+        # empty result as well as the refusal, and the two are indistinguishable
+        # there. A first version of this block branched on the rc and labelled
+        # every empty window a refusal; the good-timestamp control caught it.
+        TES_ERR="$(python3 "$SCRIPT_DIR/tree-edit-since.py" "$SINCE" --list 2>&1 >/dev/null || true)"
+        NODES="$(python3 "$SCRIPT_DIR/tree-edit-since.py" "$SINCE" --list 2>/dev/null | tr -d '\r' || true)"
+        if printf '%s' "$TES_ERR" | grep -q 'bad timestamp'; then
+            echo "mirror-integrity: tree-edit-since.py refused --since '$SINCE' — per-session drift check BLIND (not clean; guard-1947)"
+            printf '%s\n' "$TES_ERR" | sed 's/^/  /'
+            [ "$RC" = 0 ] && RC=2
+        elif [ -z "$NODES" ]; then
             echo "mirror-integrity: 0 tree nodes attributed to this session since $SINCE — drift check has nothing to read"
         else
             n=0; drift=0; indet=0

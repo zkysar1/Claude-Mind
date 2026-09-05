@@ -359,7 +359,16 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         #
         # SAFETY VALVES (guard-1813 — a refusal is not side-effect-free):
         #   1. body-closing present  -> branch above, ALLOW (genuine close)
-        #   2. stop-requested set    -> ALLOW (user asked the agent to stop)
+        #   2. stop-requested set    -> ALLOW (user asked the agent to stop).
+        #      TWO files, TWO gate names: the AGENT-WIDE session/stop-requested,
+        #      and the SESSION-SCOPED sessions/<SID>/stop-requested written by
+        #      /stop Step 0.6 (). The worker short-circuit is FORBIDDEN
+        #      to write the agent-wide one — that would stop the reducer on
+        #      another machine — so until the session-scoped file existed, the one
+        #      actor that needed this valve was structurally barred from firing
+        #      it and EVERY worker /stop BLOCKed at turn-end. The only escape was
+        #      hand-writing body-closing, which DURABLY retires the Body; stopping
+        #      one box is not retiring that Body (guard-4900).
         #   3. no per-Body WM        -> not a worker; reducer/observer untouched
         #   4. manifest body_state already closed -> ALLOW (the Body closed in
         #      a PRIOR turn; see the worker-net-body-closed branch below)
@@ -375,6 +384,22 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         # and correct. Same style as _BODY_WM / _CLOSE_SENTINEL above.
         if [ -f "$HOOK_AGENT_DIR/session/stop-requested" ]; then
             echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-stop-requested sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
+        elif [ -n "$HOOK_SID" ] && [ -f "$HOOK_AGENT_DIR/sessions/$HOOK_SID/stop-requested" ]; then
+            # SESSION-SCOPED user stop (). Written by /stop Step 0.6 for
+            # THIS SID only, so stopping one box never reaches the reducer's
+            # Phase -1.4 on another machine — the whole point of the short-circuit.
+            #
+            # A SEPARATE BRANCH WITH ITS OWN GATE NAME, deliberately — NOT an extra
+            # -f OR'd into the test above. The park-valve comment immediately below
+            # records what sharing one gate name cost: two mechanisms emitting
+            # `worker-net-body-parked` left the log unable to say which one fired.
+            #
+            # Keyed on $HOOK_SID, so it cannot leak to a sibling: a stop typed on
+            # box A leaves box B's worker Body fully netted. FAIL-SAFE if /stop
+            # never writes it (an LLM-elected step, guard-399) — the valve simply
+            # does not fire and the pre-existing BLOCK stands, which is today's
+            # behaviour, so a skipped write cannot un-net a live worker.
+            echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-stop-requested-session sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
         elif grep -Eq "^body_state: '?parked'?[[:space:]]*$" \
                 "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
             # THIS IS THE ONE PARK VALVE ( reducer ruling, 2026-08-17,
@@ -714,10 +739,33 @@ _T_AFTER_TTD=$(date +%s%3N)
 #
 # Python generates the full JSON so string content from the checkpoint (goal
 # IDs, phase values) cannot corrupt the decision payload via shell escaping.
+# --- Loop-exhaustion ladder (, USER DIRECTIVE) ---------------------
+# The streak block further down COMPUTES the right predicate and can only nag
+# with it; it printed correctly 11 times through a 2h21m livelock while the
+# loop had no other legal move than to iterate emptily. This call makes the
+# same predicate ACTIONABLE. Two rungs, both script-gated in
+# loop_exhaustion_fence.py::decide so the model supplies no input and cannot
+# elect a stop because it feels done: `pause` adds a directive to end the turn
+# on a REGISTERED external-wait sleep (no write, fully reversible), `stop`
+# writes stop-target-mode + stop-requested so Phase -1.4 runs the ordinary
+# graceful stop.
+#
+# FAIL-OPEN AND NON-BLOCKING: `|| true` plus a fence that exits 0 on every
+# unreadable input, so the hook's decision below is byte-identical to today's
+# whenever the fence holds. It does NOT change the BLOCK/ALLOW decision — it
+# only appends to the reason string, exactly like ttd_msg and streak_msg.
+EXHAUSTION_MSG=""
+if [ -n "$HOOK_AGENT" ]; then
+    EXHAUSTION_MSG="$(MIND_AGENT="$HOOK_AGENT" HOOK_SID="$HOOK_SID" HOOK_LOG="$LOG" \
+        bash "$CORE_ROOT/scripts/loop-exhaustion-fence.sh" 2>/dev/null || true)"
+fi
+
 HOOK_AGENT_DIR="$HOOK_AGENT_DIR" HOOK_AGENT="$HOOK_AGENT" \
 TTD_MARKER="$TTD_MARKER" TTD_SEVERITY="$TTD_SEVERITY" \
+HOOK_LOG="$LOG" HOOK_SID="$HOOK_SID" STALL_THRESHOLD="${STALL_THRESHOLD:-3}" \
+EXHAUSTION_MSG="$EXHAUSTION_MSG" \
 $PY - <<'PYEOF'
-import json, os, pathlib
+import datetime, json, os, pathlib
 
 agent_dir = pathlib.Path(os.environ["HOOK_AGENT_DIR"])
 agent     = os.environ["HOOK_AGENT"]
@@ -755,6 +803,83 @@ ttd_severity = os.environ.get("TTD_SEVERITY", "")
 if ttd_severity == "high" and ttd_marker:
     ttd_msg = f" TRAILING-TEXT PATTERN: {ttd_marker} -- see guard-454."
 
+# Consecutive-BLOCK streak (). This hook writes every BLOCK to its own
+# log with agent+sid and never read it back, so a session that had already failed
+# against this exact string N times was handed it an N+1th time with nothing new
+# in it. The message is identical at streak 1 and streak 200.
+#
+# THIS ADDS ONE LINE AND NOTHING ELSE. It is not an allow path: the hook still
+# BLOCKs at every streak length, and the "BLOCK unconditionally. No counter. No
+# tiers. No safety valve." contract at the top of this file is untouched. It sets
+# no signal, writes no file, and adds no config key -- STALL_THRESHOLD is the
+# env-with-default convention stop-hook-analyze.sh:39 already uses, with the
+# SAME meaning and the same default of 3 ("consecutive BLOCKs"), so raising it
+# moves the after-the-fact analyzer and this in-the-moment message together.
+# The two can still disagree, deliberately: the analyzer bounds its streak by a
+# WALL-CLOCK window (STALL_WINDOW_SEC, 300s) and this bounds it by PHASE
+# ADVANCE. A slow loop that is genuinely progressing trips the clock and not
+# this; that is the intended difference, not drift to be reconciled.
+#
+# COUNTED AGAINST PHASE ADVANCE, NOT WALL TIME, which is what keeps it off a
+# healthy loop: a loop that is advancing writes its diary between turns, and that
+# resets the count however often it blocks. The phase-advance signal is the
+# execution diary's MTIME -- this system's OWN predicate (recovery-gate.sh
+# condition 2.7, : appended at every Phase start/end at sub-minute
+# granularity, and it survives stop-hook interruptions because phase-end is
+# written before the LLM yields the turn) rather than a second predicate invented
+# here for the same question (guard-2783). An mtime stat is also not a store read,
+# so this stays off the daemon and out of the hook's latency budget.
+#
+# FAIL-OPEN BY CONSTRUCTION: every read is inside the try, so an absent log,
+# absent diary, unreadable either, or unparseable line all leave streak_msg == ""
+# and the reason string byte-identical to today's.
+streak_msg = ""
+try:
+    threshold = int(os.environ.get("STALL_THRESHOLD") or 3)
+except (TypeError, ValueError):
+    threshold = 3
+try:
+    sid = os.environ.get("HOOK_SID", "")
+    advanced = datetime.datetime.fromtimestamp(
+        (agent_dir / "session" / "execution-diary.jsonl").stat().st_mtime)
+    # Trailing space anchors the sid so a prefix cannot match a longer one.
+    #
+    # The match is on " BLOCK " so it accepts both writers' shapes, but this
+    # payload is REDUCER-ONLY in practice: the worker-net gate logs its own
+    # BLOCK and then `exit 0`s before reaching here, so a worker Body never
+    # emits this line (its net prints a Skill(worker-loop) message instead).
+    # Matching both shapes is deliberate and inert -- a sid belongs to one Body
+    # for its whole life, so a reducer's sid can never collect a worker's rows,
+    # and the broader match cannot over-count while it stays that way.
+    needle = "sid=" + sid + " "
+    streak = 0
+    for line in pathlib.Path(os.environ.get("HOOK_LOG", "")).read_text(
+            encoding="utf-8", errors="replace").splitlines():
+        if " BLOCK " not in line or needle not in line:
+            continue
+        try:
+            when = datetime.datetime.fromisoformat(line.split(" ", 1)[0])
+        except ValueError:
+            continue
+        if when >= advanced:
+            streak += 1
+    if sid and streak >= threshold:
+        streak_msg = (
+            f" STALL: this is BLOCK #{streak} for this session with NO phase"
+            f" advance since {advanced.strftime('%Y-%m-%dT%H:%M:%S')}"
+            f" (execution-diary mtime). Repeating the same re-entry has not been"
+            f" working -- read the checkpoint above and change approach rather"
+            f" than re-issuing it unchanged."
+        )
+except Exception:
+    streak_msg = ""
+
+# Loop-exhaustion ladder verdict (). Computed OUTSIDE this payload by
+# core/scripts/loop-exhaustion-fence.sh, which owns any write; empty whenever
+# the fence holds, which is the overwhelming majority of turns.
+_em = (os.environ.get("EXHAUSTION_MSG") or "").strip()
+exhaustion_msg = (" " + _em) if _em else ""
+
 reason = (
     "Turn ended without a Skill(aspirations) re-entry (autocompact OR a text "
     "summary terminated the turn). Your FIRST action MUST be: Skill('aspirations') "
@@ -764,6 +889,8 @@ reason = (
     + f" Agent: {agent}. Prefix all Bash with MIND_AGENT={agent}."
     + compact_msg
     + ttd_msg
+    + streak_msg
+    + exhaustion_msg
 )
 
 print(json.dumps({"decision": "block", "reason": reason}))

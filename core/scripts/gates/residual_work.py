@@ -22,6 +22,12 @@ Accept paths (any ONE lifts the block, mirroring Step 8.55):
   1. outcome_note cites a carrier goal id near carrier vocabulary AND that
      goal is LIVE (pending/in-progress) in the world queue or the agent
      queue — validated against queue state, never regex alone.
+  1b. the goal being closed is ITSELF a gate-filed carrier (origin_signal
+     "residual:<parent>") and that parent is cited within CARRIER_WINDOW
+     chars of the marker — the note is explaining its own provenance, not
+     naming new undone work (g-115-8775). Queue-verified like path 1, hence
+     ranked with it. Windowed, NOT clause-scoped: notes here are hard-wrapped
+     and _split_sentences breaks on newlines, so a "clause" is a line.
   2. --override-residual "<justification>" (daemon header
      X-Mind-Override-Residual) — audited to
      `<world_dir>/residual-work-overrides.jsonl`.
@@ -74,6 +80,7 @@ Output dict shape (evaluate):
       "matched_markers": [str, ...],          # marker names, first-hit order
       "residual_clause": str | None,          # sentence behind the suggestion
       "carrier_refs_found": [{"goal_id": str, "live": bool, "status": str|None}],
+      "own_provenance_found": bool,           # accept path 1b (marker-windowed)
       "owner_decline_found": bool,
       "provenance_found": bool,               # accept path 4 (clause-scoped)
       "successor_title": str | None,          # Layer-D suggestion
@@ -191,6 +198,32 @@ _FILING_DECLINE_RE = re.compile(
 # Vocabulary that makes the noun refer to WORK rather than to an API, a code
 # comment, a data field, or a lane label. Deliberately narrow: an unanchored
 # noun is the defect being fixed, so absence of this vocabulary suppresses.
+#
+# `\b` IS NOT AN IDENTIFIER BOUNDARY, and that gap cost a spurious HIGH goal
+# (). `-`, `.` and `/` are all non-word characters, so `\bgoal\b`
+# matches the HEAD of `goal-eligible`, `goal-selector.py`, `world/pending/x`.
+# An identifier is machine text, not the author asserting that work remains,
+# so anchoring on one lets any clause quoting a command read as work context.
+# MEASURED (, 2026-09-05): its note says "`skill` is argparse
+# REMAINDER ... `goal-eligible --role reducer`" — a sentence announcing NEW
+# TEST COVERAGE. `remainder` fired three times; `_noun_marker_survives`
+# correctly suppressed two, and the third survived on `goal` inside
+# `goal-eligible`. The gate refused the close and Layer-D auto-filed
+#  HIGH, which sat at rank 3 of 1,881 candidates until it was closed
+# by hand as moot.
+#
+# THE TRAILING GUARD EXCLUDES ONLY THE IDENTIFIER **HEAD** — deliberately, and
+# the asymmetry is the whole design. A leading guard would also drop `filed` in
+# "re-filed", `deferred` in "auto-deferred", `carried` in "hand-carried": those
+# are ordinary English work prose, and losing them costs a FALSE NEGATIVE,
+# which this module ranks as strictly worse than a false positive (see the
+# marker-list note above). guard-1901 governs the direction — this predicate is
+# a REQUIREMENT for blocking, so narrowing it weakens the gate — and its
+# mandated question ("what NEW input now passes?") has an enumerated answer: a
+# clause whose ONLY work word is an identifier head, e.g. "The remainder is in
+# the deferred-work lane." Measured over 438 real outcome_notes (guard-2201,
+# one snapshot, both patterns): exactly ONE verdict changes,  itself.
+# Zero collateral. Controls live in test_residual_work_gate.py.
 _WORK_CONTEXT_RE = re.compile(
     r"\b(?:goal|goals|task|tasks|carrier|file|filed|files|filing|carry|"
     r"carried|carries|attempted|unfinished|undone|remains|remaining|"
@@ -199,7 +232,7 @@ _WORK_CONTEXT_RE = re.compile(
     # the owner" asserts a remainder EXISTS and routes it to accept path 3.
     # Safe against class B because _FILING_DECLINE_RE runs FIRST and has
     # already returned on "did not file a successor" and friends.
-    r"declined|declines|decline)\b",
+    r"declined|declines|decline)\b(?!-|[./]\w)",
     re.IGNORECASE,
 )
 
@@ -315,12 +348,12 @@ def _extract_carrier_candidates(text: str) -> List[str]:
     return out
 
 
-def _lookup_goal_status(gid: str,
+def _lookup_goal_record(gid: str,
                         items: Optional[List[Dict[str, Any]]],
                         other_items: Optional[List[Dict[str, Any]]]
-                        ) -> Optional[str]:
-    """Status of goal `gid` across the target queue and THE OTHER queue, or
-    None when not found. First hit wins (ids are globally unique by
+                        ) -> Optional[Dict[str, Any]]:
+    """The goal record for `gid` across the target queue and THE OTHER queue,
+    or None when not found. First hit wins (ids are globally unique by
     convention). Both arguments must be genuinely different queues — see the
     module docstring; passing the same queue twice silently halves the search
     space and reports live carriers as dead."""
@@ -330,8 +363,18 @@ def _lookup_goal_status(gid: str,
         for asp in source:
             for g in asp.get("goals", []) or []:
                 if g.get("id") == gid:
-                    return g.get("status")
+                    return g
     return None
+
+
+def _lookup_goal_status(gid: str,
+                        items: Optional[List[Dict[str, Any]]],
+                        other_items: Optional[List[Dict[str, Any]]]
+                        ) -> Optional[str]:
+    """Status of goal `gid`, or None when not found. Thin wrapper over
+    `_lookup_goal_record` so the two-queue scan has ONE implementation."""
+    rec = _lookup_goal_record(gid, items, other_items)
+    return rec.get("status") if rec else None
 
 
 def _append_override_ledger(world_dir: Optional[Path], record: Dict[str, Any]
@@ -360,6 +403,7 @@ def evaluate(goal_id: str,
         "matched_markers": [],
         "residual_clause": None,
         "carrier_refs_found": [],
+        "own_provenance_found": False,
         "owner_decline_found": False,
         "provenance_found": False,
         "successor_title": None,
@@ -427,6 +471,78 @@ def evaluate(goal_id: str,
     result["provenance_found"] = bool(
         ATTRIBUTION_RE.search(clause) and ARTIFACT_REF_RE.search(clause))
 
+    # --- Accept path 1b: OWN-PROVENANCE citation () ---------------
+    # A goal this gate itself auto-filed carries `origin_signal`
+    # "residual:<parent>". When such a carrier is executed, the honest
+    # outcome_note explains where it came from — and that explanation must
+    # quote the parent's residual language to be intelligible. The marker then
+    # fires on the QUOTATION, and the gate files a fresh successor for the
+    # very work the note is reporting as DONE.
+    #
+    # MEASURED (, 2026-09-03): closing the carrier for 
+    # filed phantom  (origin_signal residual:, since
+    # skipped by hand), off the sentence "the previous unit ( ...)
+    # closed while its outcome_note named the merge as follow-up work with no
+    # live carrier". This is guard-2096's shape exactly — a text detector run
+    # over a corpus that DOCUMENTS ITS OWN FINDINGS re-flags every correction
+    # it causes — and here it does not merely warn, it WRITES A GOAL, so the
+    # queue grows by one phantom per honest post-mortem.
+    #
+    # WHY THIS SIGNAL AND NOT "the cited carrier is completed": that broader
+    # rule was tried first and is WRONG. It breaks
+    # test_completed_carrier_does_not_lift, which pins a genuinely different
+    # shape — a FORWARD claim ("residual carried by g-X") whose carrier has
+    # completed is ambiguous about ORDERING, because g-X may have completed
+    # before this residual ever arose. The shape fixed here is a BACKWARD
+    # provenance reference, and `origin_signal` states the parent relationship
+    # as stored queue fact rather than inferring it from prose.
+    #
+    # SCOPED TO A CHARACTER WINDOW AROUND THE MARKER — deliberately NOT to
+    # `clause`, and this is the half that was measured wrong first.
+    # `_split_sentences` terminates on `\n+` as well as on `.!?`, so in this
+    # corpus — where every outcome_note is hard-wrapped at ~78 columns — a
+    # "clause" is a LINE, not a sentence. Replaying the real 3,671-char
+    #  note proved it: the parent id sits on the physical line
+    # BEFORE the marker, so the clause was the bare fragment "outcome_note
+    # named the merge as follow-up work with no live carrier." and the id fell
+    # outside it. The first cut of this path scoped to `clause`, passed its own
+    # tests, and did nothing at all to the input it was written for — guard-920
+    # exactly (a fixture that reproduced the prose but not the line breaks).
+    #
+    # CARRIER_WINDOW is REUSED rather than duplicated under a new name: it
+    # already means "a goal id this far from the anchor is still plausibly
+    # about it", which is the identical question here, and there is no measured
+    # reason for the two to differ. Measured distance in the real note: -103.
+    #
+    # The carrier-VOCABULARY conjunct that _extract_carrier_candidates applies
+    # is deliberately NOT reused here, because it tests the wrong relationship.
+    # That helper asks "is this id named as the thing CARRYING the residual";
+    # path 1b asks "is this id my own recorded PARENT". A provenance sentence
+    # need carry no carrier vocabulary at all ("filed by the residual gate off
+    # g-X's outcome_note"); in the  note the word "carrier" happens to
+    # be nearby only because that sentence is about carriers. Keeping the
+    # conjunct would make the path fire on an accident of wording.
+    #
+    # LIMIT, STATED RATHER THAN PAPERED OVER: a note that BOTH explains
+    # provenance AND asserts genuinely new undone work within the same ~240
+    # characters will be suppressed. That is guard-1892's residue — a WORDING
+    # problem no match-time parsing repairs — and narrowing further would mean
+    # parsing unbounded prose, which is the machinery this module already
+    # refuses to add. The exposure is bounded by the window and, far more
+    # tightly, by the requirement that the cited id be THIS goal's own recorded
+    # parent — stored queue state, not an inference from prose.
+    own_parent = ""
+    own_record = _lookup_goal_record(goal_id, items, other_items)
+    if own_record:
+        signal = str(own_record.get("origin_signal") or "")
+        if signal.startswith("residual:"):
+            own_parent = signal.split(":", 1)[1].strip()
+    if own_parent:
+        anchor = first_start or 0
+        window = text[max(0, anchor - CARRIER_WINDOW):anchor + CARRIER_WINDOW]
+        result["own_provenance_found"] = bool(
+            re.search(r"\b" + re.escape(own_parent) + r"\b", window))
+
     # Accept path 2 — the audited override. Ranked ABOVE the owner-decline
     # inference and evaluated even when a live carrier was found, because an
     # override that was PASSED must always be recorded and always audited:
@@ -448,6 +564,14 @@ def evaluate(goal_id: str,
     # Accept path 1: live carrier citation (factual, verified against queue
     # state — needs no audit row because nothing was bypassed).
     if live_found:
+        return result
+
+    # Accept path 1b: own-provenance citation — VERIFIED (origin_signal is
+    # stored queue state), so it is ranked here with its live sibling rather
+    # than below with the two prose inferences. Reported as its own field so
+    # an auditor can tell which path lifted the block (`provenance_found`
+    # precedent).
+    if result["own_provenance_found"]:
         return result
 
     # Accept path 3: owner decline, INFERRED from prose. Ranked below the

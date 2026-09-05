@@ -292,7 +292,7 @@ def _verify_counted(wm_path, goal_id):
 # an evolution completing (increment). Both are bash writes invoked by the LLM
 # at the event, preserving the g-283 single-writer invariant (the LLM provides
 # the event signal; the bash gate owns the WM write + enforces the field set).
-def _field_op_mutate_factory(op):
+def _field_op_mutate_factory(op, payload=None):
     def _mutate(wm):
         if not isinstance(wm, dict):
             return False
@@ -310,6 +310,39 @@ def _field_op_mutate_factory(op):
             # last_evolution_at_time WM slot) but kept consistent for callers
             # that restore last_evolution_goal_count from loop_state.
             loop_state["last_evolution_at"] = _to_int(loop_state.get("goals_completed", 0))
+        elif op == "all-blocked-marker":
+            # : SCRIPT-WRITTEN record that the previous iteration routed
+            # to all_blocked. Written by goal-selector's all_blocked branch, read
+            # by dry-spin-guard.py at loop entry. The LLM never writes it — the
+            # defect this closes is precisely an LLM narrating B7/B7.2 as done
+            # while no artifact existed.
+            #
+            # A FRESH marker deliberately RESETS sleep_registered/sleep_seconds:
+            # a new all_blocked route starts a new cycle whose sleep has not been
+            # written yet. Without the reset, one cycle's sleep would vouch for
+            # the next cycle's silence and the guard could never fire twice.
+            import os as _os
+            signals = loop_state.get("signals")
+            if not isinstance(signals, dict):
+                signals = {}
+                loop_state["signals"] = signals
+            signals["last_all_blocked"] = {
+                "at": _now_iso(),
+                "sid": _os.environ.get("MIND_SID") or "",
+                "sleep_registered": False,
+                "sleep_seconds": None,
+            }
+        elif op == "all-blocked-sleep":
+            # : stamp the sleep the all-blocked handler actually
+            # registered onto the existing marker. Absent marker -> no-op
+            # (False): stamping a sleep with no route record would assert a
+            # cycle that was never observed.
+            signals = loop_state.get("signals")
+            marker = (signals or {}).get("last_all_blocked")
+            if not isinstance(signals, dict) or not isinstance(marker, dict):
+                return False
+            marker["sleep_registered"] = True
+            marker["sleep_seconds"] = _to_int((payload or {}).get("sleep_seconds"), 0)
         else:
             return False
         slots["loop_state"] = loop_state
@@ -319,7 +352,7 @@ def _field_op_mutate_factory(op):
     return _mutate
 
 
-def _run_field_op(wm_path, op):
+def _run_field_op(wm_path, op, payload=None):
     """Lock + CAS RMW for a single-field accumulator op. Fail-open (exit 0)."""
     if not wm_path.exists():
         return 0
@@ -340,7 +373,7 @@ def _run_field_op(wm_path, op):
             tmp.replace(wm_path)
 
         try:
-            loop_state_cas_retry(_read, _field_op_mutate_factory(op), _write)
+            loop_state_cas_retry(_read, _field_op_mutate_factory(op, payload), _write)
         except Exception as e:
             print(f"[loop-state-bump-counters] WARN: {op} RMW failed ({e})",
                   file=sys.stderr)
@@ -433,6 +466,34 @@ def main():
             "completes (Phase 8.8). Mutually exclusive with --outcome."
         ),
     )
+    # : script-written all_blocked route record + its sleep stamp.
+    parser.add_argument(
+        "--all-blocked-marker",
+        action="store_true",
+        help=(
+            "Write loop_state.signals.last_all_blocked = {at, sid, "
+            "sleep_registered: false, sleep_seconds: null}. Invoked by "
+            "goal-selector's all_blocked branch so loop entry can tell a cycle "
+            "that routed all_blocked from one that did not. Resets the sleep "
+            "fields by design. Mutually exclusive with --outcome. g-357-88."
+        ),
+    )
+    parser.add_argument(
+        "--all-blocked-sleep",
+        action="store_true",
+        help=(
+            "Stamp sleep_registered=true + sleep_seconds on an EXISTING "
+            "last_all_blocked marker (no-op when absent). Invoked by the "
+            "all-blocked handler once it has actually registered its sleep. "
+            "Requires --sleep-seconds. Mutually exclusive with --outcome. g-357-88."
+        ),
+    )
+    parser.add_argument(
+        "--sleep-seconds",
+        type=int,
+        default=None,
+        help="Seconds of the registered all-blocked sleep (with --all-blocked-sleep).",
+    )
     args = parser.parse_args()
 
     if AGENT_DIR is None:
@@ -454,12 +515,20 @@ def main():
         sys.exit(_run_field_op(wm_path, "reset-alignment"))
     if args.evolution_fired:
         sys.exit(_run_field_op(wm_path, "evolution-fired"))
+    # 
+    if args.all_blocked_marker:
+        sys.exit(_run_field_op(wm_path, "all-blocked-marker"))
+    if args.all_blocked_sleep:
+        if args.sleep_seconds is None:
+            parser.error("--all-blocked-sleep requires --sleep-seconds")
+        sys.exit(_run_field_op(wm_path, "all-blocked-sleep",
+                               {"sleep_seconds": args.sleep_seconds}))
 
     if not args.outcome:
         parser.error(
             "--outcome is required unless --verify-counted / --verify-counted-many / "
             "--reset-alignment / "
-            "--evolution-fired is given"
+            "--evolution-fired / --all-blocked-marker / --all-blocked-sleep is given"
         )
 
     # : hoist the Block C ceiling read OUT of the CAS loop below

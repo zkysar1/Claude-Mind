@@ -48,11 +48,58 @@ BATCH_FLOOR_MINUTES = 30
 # fleet actually frozen on this window (, manifest row Q1) carries
 # `human_blocked: requires a fleet-quiesced window only the user can create ...`,
 # so an exact-prefix match finds zero and reports a healthy hold forever. The
-# caller matches the substring "quiesce" over defer_reason instead, and the
-# reason string below names what was MATCHED rather than this nominal form --
+# caller matches SUBSTRINGS over defer_reason instead -- see
+# QUIESCE_DEFER_TOKENS / is_quiesce_frozen_defer below, which own that predicate
+# now (the caller used to inline it, and the two drifted). The reason string
+# names what was MATCHED rather than this nominal form --
 # a verdict that cites a marker the evidence does not contain is the kind of
 # authoritative-sounding wrongness that survives review.
 QUIESCE_DEFER_MARKER_NOMINAL = "precondition_unmet:fleet_quiesced_window"
+
+# The substrings the criterion-(b) scan actually matches, lowercased. Widened
+# 2026-09-05 () from the bare "quiesce" the caller used to inline.
+#
+# WHY: the master quiet-window goal mandates a registration prefix of the form
+# `human_blocked: quiet-window member of <master-goal-id> —`, and that phrase
+# contains "quiet-window", NOT "quiesce". So the detector was keyed on a word
+# the registration convention does not require, and membership was decided by
+# incidental prose. The built-in positive control: two goals carrying the
+# IDENTICAL registered prefix landed on opposite sides of the old predicate —
+# one matched only because its narrative happened to say "quiesced-fleet-window"
+# later on. Measured over 2,432 non-terminal goals: old predicate 2 hits, this
+# one 5. The three it had been missing were a HIGH member whose own defer read
+# `WINDOW-READY: YES`, a MEDIUM member, and a HIGH goal whose defer says
+# verbatim "Clears when <master>'s quiet window lifts".
+#
+# This is `reclaim-routed-work.md` rule 7: a reclaim predicate must not be
+# NARROWER than the gate that creates the population, or the gate's correct
+# operation fills the blind spot and the sweep reports clean forever. The
+# missing HIGH member was invisible to BOTH criteria at once, because the
+# manifest row for it says (correctly) "must NOT also be counted here as ready
+# minutes, it reaches ripeness via criterion (b)" — an anti-double-count rule
+# that is right on its own and, paired with this narrow predicate, produced a
+# total blind spot.
+#
+# THE SPACED FORM "quiet window" IS DELIBERATELY EXCLUDED, and the exclusion is
+# measured rather than cautious. That phrase has a SECOND, unrelated sense in
+# this fleet: a HEAD-quiet window (no git merges for N minutes, so a long test
+# run is not voided mid-flight). A live goal uses it that way — "a >=187 min
+# quiet window opens here" — and admitting it would report a goal as
+# fleet-quiesce-frozen that its author never registered. The hyphenated form is
+# the registration vocabulary; the spaced form is the collision.
+QUIESCE_DEFER_TOKENS = ("quiesce", "quiet-window")
+
+
+def is_quiesce_frozen_defer(defer_reason: Optional[str]) -> bool:
+    """True when a goal's defer_reason registers it as waiting on a quiesced fleet.
+
+    Single source of truth for criterion (b). The shell wrapper calls THIS —
+    it must not re-inline a substring test, or the two drift the next time the
+    registration vocabulary moves (which is exactly how the 2026-09-05 gap
+    opened: the vocabulary moved on 2026-08-23 and the inline test did not).
+    """
+    return any(t in (defer_reason or "").lower() for t in QUIESCE_DEFER_TOKENS)
+
 
 _GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,4}\b")
 _ROW_RE = re.compile(r"^\|\s*(Q\d+)\s*\|(.*)$")

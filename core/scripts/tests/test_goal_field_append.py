@@ -385,3 +385,73 @@ def test_cas_conflict_reports_creation_from_empty():
 
 def test_cas_conflict_rejects_a_non_text_reread():
     assert "not text" in GFA.cas_conflict("ORIGINAL", {"nested": 1})
+
+
+# ── 6. : echo/rc false alarms cleared by the authoritative store read ──
+
+def _stateful_run(state, echo_on_write, write_rc=0):
+    """A fake _run whose reads always reflect state['stored'] and whose write
+    lands `composed` in the store while returning a caller-supplied ECHO/rc."""
+    def fake_run(argv, input=None, **kw):
+        joined = " ".join(str(a) for a in argv)
+        if "aspirations-query.sh" in joined:
+            return _Res(stdout=json.dumps([{"goal_id": "g-1", "priority": "MEDIUM",
+                                            "outcome_note": state["stored"]}]))
+        if "aspirations-update-goal.sh" in joined:
+            state["stored"] = state["composed"]        # the write LANDS soundly
+            return _Res(stdout=echo_on_write, returncode=write_rc)
+        raise AssertionError(f"unexpected call: {joined}")
+    return fake_run
+
+
+def test_echo_missing_pre_is_cleared_by_authoritative_read(monkeypatch, capsys):
+    """The wrapper stdout ECHO can omit PRE while the store is written correctly
+    (the measured rc=7 signature: sentinel present, length grew, PRE absent).
+    verify_post against the echo alone would falsely die 'field was overwritten';
+    the fix re-verifies against an independent store read and SUCCEEDS."""
+    pre = "orig\n" + GFA.sentinel_for("m0")
+    marker, text = "m1", "the appended text"
+    sentinel = GFA.sentinel_for(marker)
+    composed = GFA.compose(pre, text, marker)
+    misleading_echo = json.dumps({"goal_id": "g-1",
+                                  "outcome_note": "X" * 200 + "\n\n" + text + "\n" + sentinel})
+    # sanity: this echo trips the OLD verify (PRE not a substring, but grew + sentinel)
+    assert GFA.verify_post(pre, "X" * 200 + "\n\n" + text + "\n" + sentinel, sentinel) == \
+        ["PRE content did NOT survive the write — the field was overwritten"]
+    state = {"stored": pre, "composed": composed}
+    monkeypatch.setattr(GFA, "_run", _stateful_run(state, misleading_echo))
+    assert GFA.main(["g-1", "outcome_note", marker, text]) == GFA.RC_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True and out["changed"] is True
+
+
+def test_wrapper_rc_nonzero_but_write_landed_recovers(monkeypatch, capsys):
+    """The wrapper can return rc!=0 from its OWN output parsing after the field
+    is already written (the measured rc=6). The fix confirms landing via an
+    independent read and SUCCEEDS instead of dying RC_WRITE_FAILED."""
+    pre = "orig\n" + GFA.sentinel_for("m0")
+    marker, text = "m1", "text with a dict literal {'a': 1}"
+    composed = GFA.compose(pre, text, marker)
+    state = {"stored": pre, "composed": composed}
+    monkeypatch.setattr(GFA, "_run",
+                        _stateful_run(state, "not-json JSONDecodeError noise", write_rc=1))
+    assert GFA.main(["g-1", "outcome_note", marker, text]) == GFA.RC_OK
+
+
+def test_genuine_loss_dies_without_prescribing_a_whole_store_restore(monkeypatch, capsys):
+    """A REAL rewrite (store shows the marker but PRE is gone) must still fail —
+    but the message must NOT prescribe history.py restore (which rewrites the
+    whole shared store in place and destroys concurrent Bodies' work)."""
+    pre = "orig content\n" + GFA.sentinel_for("m0")
+    marker, text = "m1", "appended"
+    sentinel = GFA.sentinel_for(marker)
+    rewritten = "TOTALLY DIFFERENT HEAD\n\n" + text + "\n" + sentinel   # marker present, PRE gone
+    bad_echo = json.dumps({"goal_id": "g-1", "outcome_note": rewritten})
+    state = {"stored": pre, "composed": rewritten}
+    monkeypatch.setattr(GFA, "_run", _stateful_run(state, bad_echo))
+    with pytest.raises(SystemExit) as exc:
+        GFA.main(["g-1", "outcome_note", marker, text])
+    assert exc.value.code == GFA.RC_VERIFY_FAILED
+    err = capsys.readouterr().err
+    assert "history.py restore" in err and "DO NOT run history.py restore" in err
+    assert "Recover the PRE value from" not in err

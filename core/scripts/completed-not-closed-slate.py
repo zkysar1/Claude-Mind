@@ -124,6 +124,10 @@ _HOLD_LEDGER_RETENTION_DAYS = 30
 _HOLDS_BASENAME = "cnc-drain-holds.jsonl"
 _CONFIG_BLOCK = "completed_not_closed_drain"
 _NOTE_HEAD_CHARS = 240
+# The holder bucket for a row carrying NEITHER claimed_by NOR executed_by.
+# Named because it is now read in three places (holder_of, the undrainable
+# sub-count in build_slate, and the render line that explains it).
+_UNATTRIBUTED = "(unattributed)"
 _GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,4}\b")
 
 
@@ -225,7 +229,7 @@ def holder_of(g: Dict[str, Any]) -> str:
     """Who is expected to drain this row: the claim holder; for an UNCLAIMED
     row the agent that executed it (`executed_by`, stamped at claim time and
     kept across release); neither -> "(unattributed)"."""
-    return (g.get("claimed_by") or g.get("executed_by") or "(unattributed)")
+    return (g.get("claimed_by") or g.get("executed_by") or _UNATTRIBUTED)
 
 
 def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
@@ -251,6 +255,13 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
     fleet_noted = 0            # widened population (see module docstring)
     fleet_noted_in_progress = 0
     fleet_noted_pending = 0
+    # Rows offered to NOBODY. `fleet_noted` is the population; this is the slice
+    # of it that no drainer can ever be handed, because the lane is holder-scoped
+    # and these rows have no holder to scope to. Reported beside the denominator
+    # rather than filtered out of it (guard-2529 / guard-2273: a count whose
+    # predicate excludes rows must name what it excluded, as its own figure).
+    fleet_undrainable = 0
+    fleet_undrainable_ids: List[str] = []
     mine_noted: List[Dict[str, Any]] = []
     mine_noted_in_progress = 0
     # Per-holder view of the FLEET population (2026-08-16 review, "completions
@@ -274,6 +285,9 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
         else:
             fleet_noted_pending += 1
         holder = holder_of(g)
+        if holder == _UNATTRIBUTED:
+            fleet_undrainable += 1
+            fleet_undrainable_ids.append(str(g.get("id") or ""))
         h = by_holder.setdefault(holder, {"noted": 0, "oldest_claim_age_h": None,
                                           "unclaimed": 0})
         h["noted"] += 1
@@ -381,6 +395,8 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
             "fleet_noted": fleet_noted,
             "fleet_noted_in_progress": fleet_noted_in_progress,
             "fleet_noted_pending": fleet_noted_pending,
+            "fleet_undrainable": fleet_undrainable,
+            "fleet_undrainable_goal_ids": sorted(fleet_undrainable_ids),
             "mine_noted": len(mine_noted),
             "mine_noted_in_progress": mine_noted_in_progress,
             "mine_noted_pending": len(mine_noted) - mine_noted_in_progress,
@@ -591,7 +607,8 @@ def _render(result: Dict[str, Any]) -> None:
     pop = result["population"]
     print(f"[cnc-slate] agent={result['agent']} population: fleet_noted="
           f"{pop['fleet_noted']} (in-progress {pop['fleet_noted_in_progress']} / "
-          f"pending {pop['fleet_noted_pending']}) mine={pop['mine_noted']} "
+          f"pending {pop['fleet_noted_pending']}"
+          f"; undrainable {pop.get('fleet_undrainable', 0)}) mine={pop['mine_noted']} "
           f"(in-progress {pop['mine_noted_in_progress']} / pending {pop['mine_noted_pending']}) "
           f"eligible(>= {result['min_claim_age_hours']:g}h)={pop['mine_eligible']} "
           f"held_back_fresh={pop['mine_held_back_fresh']} "
@@ -600,6 +617,15 @@ def _render(result: Dict[str, Any]) -> None:
           f"{pop.get('mine_held_back_recent_hold', 0)} "
           f"note_unchanged={pop.get('mine_held_back_note_unchanged', 0)} "
           f"| slate={len(result['slate'])} dropped={result['dropped']}")
+    if pop.get("fleet_undrainable"):
+        print(f"[cnc-slate] of fleet_noted, {pop['fleet_undrainable']} row(s) are "
+              "UNDRAINABLE: no claimed_by and no executed_by, so the holder-scoped "
+              "lane has nobody to offer them to — they are counted forever and "
+              "handed to no one. Read fleet_noted as the POPULATION, never as the "
+              "drainable backlog; subtract this figure for that. They occupy no "
+              "slate slot, so they starve nothing (measured g-115-7088): the cost "
+              "is a headline inflated by this much, not a blocked queue. Ids in "
+              "--json fleet_undrainable_goal_ids.")
     _nu = pop.get("note_unchanged_goal_ids") or []
     if _nu:
         print("[cnc-slate] suppressed on an UNCHANGED note (already judged not-cnc; "

@@ -44,6 +44,16 @@ STRUCTURED_DEFER_PREFIXES = (
                                   # User-surfacing preserved via the precheck
                                   # human_blocked age-escalation. Design: zeta's
                                   #  brief.
+    "member_paused:",             #  / PEARL B2b: a MEMBER paused (or declined)
+                                  # this goal from the Planned board. Same
+                                  # never-auto-clears property as human_blocked:,
+                                  # different cause -- the 120h fail-open exists to
+                                  # re-probe defers whose premise is a WORLD condition
+                                  # ("is the service up yet?"), and no probe can answer
+                                  # "does the member still want this paused". An
+                                  # expiring pause would silently resume work the member
+                                  # explicitly stopped. Cleared only by the member's own
+                                  # inverse verb (planned_verbs._plan_suppress off).
 )
 
 # CRITICAL: case-insensitive match. LLM-authored defers drift casing

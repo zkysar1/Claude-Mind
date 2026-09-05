@@ -1563,6 +1563,49 @@ def _warn_unresolvable_defer_targets(goal_id, text):
     if result.get("message"):
         print(result["message"], file=sys.stderr)
 
+def _run_defer_routing_target_gate(goal_id, value, args):
+    """Validate the routing TARGET a defer names ().
+
+    `capability-gate` keyword-matches the defer's VERB and never looks at the
+    named TARGET, so a defer that names WHO the work belongs to has that claim
+    accepted unexamined. All logic lives in `gates.defer_routing_target`.
+
+    TRIGGERED ON THE FIELD, deliberately NOT on `_is_narrative_defer` like the
+    two sibling checks in this function. That predicate returns False for every
+    `STRUCTURED_DEFER_PREFIXES` value, and the live corpus measured 130 of 130
+    STRUCTURED on 2026-09-04 — so reusing it here would fire this gate on
+    exactly ZERO of the population it guards while looking correct in review
+    (guard-1802; the same lesson `gates.defer_target_existence` records).
+
+    CLI half of a twin (guard-2323): the daemon half in
+    `aspirations_write.py::update_goal` is the LIVE one, because wrappers are
+    daemon-only (guard-742). A check added only here is inert on the path every
+    production caller takes.
+
+    Refuses by raising SystemExit(1); advisories print to stderr and return.
+    Every failure path is silent and fails OPEN — a gate that cannot run must
+    never block a write.
+    """
+    try:
+        from gates.defer_routing_target import evaluate
+        result = evaluate(goal_id, value, world_dir=WORLD_DIR)
+    except Exception:
+        return
+    if result.get("decision") == "block":
+        override = getattr(args, "force_defer", None)
+        if override:
+            print("[defer-routing-target] --force-defer override on "
+                  + str(goal_id) + ": " + str(override), file=sys.stderr)
+            return
+        # Concatenation, never .format() — the message quotes registry prose
+        # containing braces, and a formatter error here would be swallowed by
+        # the caller's fail-open handler and silently approve (guard-3803).
+        print(str(result.get("message") or ""), file=sys.stderr)
+        sys.exit(1)
+    elif result.get("advisory"):
+        print(str(result["advisory"]), file=sys.stderr)
+
+
 def cmd_update_asp_field(args):
     """Update a single field on an aspiration in place.
 
@@ -2133,6 +2176,33 @@ def cmd_update_goal(args):
                   file=sys.stderr)
             sys.exit(1)
 
+        # Routing-target validation () — Layer 0, FIELD-triggered.
+        # CLI half of a twin (guard-2323); the LIVE half is
+        # aspirations_write.py::_run_update_goal_gates, since this wrapper is
+        # daemon-only. Both must stay in sync.
+        #
+        # It runs BEFORE the narrative gate below because that gate's predicate
+        # is where the coverage hole is: `_is_narrative_defer` is False for every
+        # STRUCTURED_DEFER_PREFIXES value, and measured on the live corpus
+        # 2026-09-04, of 131 non-terminal goals carrying a defer_reason **131
+        # were structured and 0 were narrative** — so anything hanging off that
+        # predicate sees none of the real population (guard-1802).
+        #
+        # Refuses only registry-contradicted claims: routing to an agent whose
+        # standing lane pin EXCLUDES the work, and citing a grant id that does
+        # not exist. Softer signals advise (see the advisory call further down).
+        # Override is --force-defer, the SAME flag the capability gate honours;
+        # no second override exists by design.
+        if field == "defer_reason" and value not in (None, ""):
+            try:
+                from gates.defer_routing_target import evaluate as _routing_eval
+                _rt = _routing_eval(goal_id, str(value), world_dir=WORLD_DIR)
+            except Exception:
+                _rt = None  # fail OPEN — a gate that cannot run must not block
+            if _rt and _rt.get("refuse") and not getattr(args, "force_defer", None):
+                print(_rt["reason"], file=sys.stderr)
+                sys.exit(1)
+
         # Defer-time capability gate (rb/probe-before-defer.md).
         # A defer_reason that names an agent-provisionable capability freezes
         # real work for up to defer_reason_timeout_hours (default 120h = ~5 days)
@@ -2252,6 +2322,14 @@ def cmd_update_goal(args):
                     file=sys.stderr,
                 )
 
+        # Routing-TARGET validation (). Runs AFTER the capability
+        # gate above so that gate's behaviour is byte-identical when both would
+        # fire (guard-4238: the first gate to return hides every gate behind
+        # it). Triggered on the FIELD, not on _is_narrative_defer — see the
+        # helper's docstring for the 130-of-130-structured measurement.
+        if field == "defer_reason" and value:
+            _run_defer_routing_target_gate(goal_id, value, args)
+
         # Blocker-ref requirement for narrative defers (Change 1).
         # The capability-gate check above catches defers that name
         # agent-provisionable capabilities. This check catches the second
@@ -2334,6 +2412,15 @@ def cmd_update_goal(args):
         # not transfer. Trigger on the field itself.
         if field == "defer_reason" and value not in (None, ""):
             _warn_unresolvable_defer_targets(goal_id, value)
+            # Routing-target advisories — the non-refusing half of the Layer-0
+            # gate above (a refusal already exited 1, so anything here advises).
+            try:
+                from gates.defer_routing_target import evaluate as _routing_eval2
+                for _adv in (_routing_eval2(goal_id, str(value),
+                                            world_dir=WORLD_DIR).get("advisories") or []):
+                    print(_adv, file=sys.stderr)
+            except Exception:
+                pass  # advisory must never break a durable write
 
         # Blocker-ref requirement for direct status=blocked writes ().
         # Parallel to the defer_reason gate above. Without this check, the
@@ -2880,19 +2967,68 @@ def _emit_e9_skip_observation(goal_id, new_status, goal):
         print(f"[aspirations update-goal] WARN: E9 skip-encoding failed: {e}",
               file=sys.stderr)
 
-def _clear_stale_blockers(items, resolved_goal_ids):
-    """Remove blocked_by references to goals that are resolved (completed/archived/terminal).
+def _clear_stale_blockers(items, resolved_goal_ids, delivery_gate=True):
+    """Remove blocked_by refs to goals that are resolved AND whose deliverable landed.
 
     Called from: cmd_complete/cmd_retire/cmd_archive_sweep (archival),
     cmd_complete_by (goal completion), cmd_update_goal (terminal status).
+
+    THE DELIVERY GATE (g-306-442). Terminal STATUS alone used to release a
+    dependent, so a worker-closed blocker freed downstream work while its commit
+    existed only on `refs/workers/**`. The next executor then either rebuilt work
+    that already existed or built against an interface that had not landed —
+    both silently, because nothing in the pickup path can see the difference. A
+    blocker whose deliverable is DEFINITIVELY unreachable now KEEPS its
+    blocked_by entry, which is the structured hold goal-selector path (d)
+    already suppresses on; no new field is introduced, deliberately (see below).
+
+    FAIL OPEN, ALWAYS. Only a definitive "not reachable" holds. No recorded sha,
+    no prober, an INCONCLUSIVE verdict, or any exception releases exactly as
+    before this gate existed. The asymmetry is the point: a false HOLD freezes a
+    dependent for every agent on every box and a git hiccup would freeze the
+    whole blocked population at once, while a false RELEASE only reproduces the
+    behaviour that shipped for months.
+
+    NOTHING IS CACHED, and no verdict is stored on any record. A deliverable
+    stranded at close time becomes reachable later, when the carrier ref is
+    consumed; a stamped verdict would hold the dependent forever precisely
+    because nothing would re-derive it. The hold must stay re-derivable from
+    blocked_by alone, which is what lets the read-time sweep release it.
     """
+    dg = None
+    if delivery_gate:
+        try:
+            import _delivery_gate as dg
+        except Exception:
+            dg = None
+
+    lookup = {}
+    if dg is not None:
+        for asp in items:
+            for g in asp.get("goals", []) or []:
+                gid = g.get("id")
+                if gid:
+                    lookup[gid] = g
+
     for asp in items:
         for goal in asp.get("goals", []):
             bb = goal.get("blocked_by", [])
             if isinstance(bb, str):
                 bb = [bb]
             if bb:
-                cleaned = [b for b in bb if b not in resolved_goal_ids]
+                held = []
+                if dg is not None:
+                    resolved_here = [b for b in bb if b in resolved_goal_ids]
+                    if resolved_here:
+                        try:
+                            held, why = dg.held_blocker_ids(lookup, resolved_here)
+                        except Exception:
+                            held, why = [], {}
+                        for bid, detail in (why or {}).items():
+                            print(f"[aspirations] delivery-hold: {goal.get('id')} keeps "
+                                  f"blocked_by {bid} — {detail}", file=sys.stderr)
+                cleaned = [b for b in bb
+                           if b not in resolved_goal_ids or b in held]
                 if len(cleaned) != len(bb):
                     goal["blocked_by"] = cleaned
                     if not cleaned:

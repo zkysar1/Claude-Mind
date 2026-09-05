@@ -318,7 +318,8 @@ def test_rollback_restores_the_tree_and_recycles(repo_pair):
     assert (target / "CLAUDE.md").read_text() == "CLOBBERED\n"
 
     calls = []
-    out = fp.rollback(target, before, restart=lambda root: calls.append(root) or True)
+    out = fp.rollback(target, before, restart=lambda root: calls.append(root) or True,
+                      script_dir=SCRIPTS)   # : the scoped undo needs the path set
 
     assert out["reset_rc"] == 0
     assert out["restarted"] is True
@@ -485,3 +486,378 @@ def test_adopt_fails_and_rolls_back_when_nothing_stages(repo_pair, monkeypatch):
     assert verified == [], "verify ran over an adopt that never landed"
     assert real_git(target, "rev-parse", "HEAD")[1] == before
     assert not (target / "world" / "installed-release.yaml").exists()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  — C4 verify runs from a worktree PINNED at the adopt commit, and
+# suite_is_green stops letting a deployment-owned domain red block adoption.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _head(repo: Path) -> str:
+    return _git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+@pytest.fixture
+def pinned_repo(tmp_path):
+    """A project_root standing in for an adopting Mind just past its commit."""
+    r = _init_repo(tmp_path / "proj")
+    _commit(r, "CLAUDE.md", "v1\n", "init")
+    _commit(r, "core/scripts/x.py", "adopted = True\n", "chore: adopt framework v1.1.0")
+    return r
+
+
+def test_verify_runs_from_a_worktree_never_the_project_root(pinned_repo):
+    seen = {}
+
+    def runner(root, log):
+        seen["root"] = Path(root)
+        return 0, "VERDICT: CLEAN", ""
+
+    rc, verdict, meta = fp.verify_in_worktree(
+        pinned_repo, _head(pinned_repo), pinned_repo / "verify.log",
+        runner=runner, bridger=lambda *a: [])
+    assert seen["root"] != pinned_repo, "verify still ran on the live tree"
+    assert Path(meta["worktree"]) == seen["root"]
+    assert (rc, verdict) == (0, "VERDICT: CLEAN")
+
+
+def test_head_move_on_project_root_during_verify_leaves_the_outcome_unchanged(pinned_repo):
+    """The goal's own outcome 1, as a test.
+
+    The adopting Mind's loop merges origin/main on top of the adopt commit
+    minutes into a ~40-minute C4 (measured zc-03: 22:14Z adopt, 22:16Z merge).
+    On the live tree that returns tree-moved and drives rollback. Pinned, the
+    move is invisible to the suite.
+    """
+    pinned = _head(pinned_repo)
+    obs = {}
+
+    def runner(root, log):
+        # This IS the loop's iteration-push merge, landing mid-suite.
+        _commit(pinned_repo, "agents/a/note.md", "loop wrote this\n", "loop merge")
+        obs["project_head"] = _head(pinned_repo)
+        obs["worktree_head"] = _head(Path(root))
+        obs["content"] = (Path(root) / "core/scripts/x.py").read_text(encoding="utf-8")
+        return 0, "VERDICT: CLEAN", ""
+
+    rc, verdict, meta = fp.verify_in_worktree(
+        pinned_repo, pinned, pinned_repo / "verify.log",
+        runner=runner, bridger=lambda *a: [])
+
+    assert obs["project_head"] != pinned, "the HEAD move never happened — test is vacuous"
+    assert obs["worktree_head"] == pinned, "the verify tree followed the live tree"
+    assert obs["content"] == "adopted = True\n"
+    assert fp.suite_is_green(rc, verdict, meta.get("halves")) is True
+
+
+def test_worktree_is_torn_down_even_when_the_runner_raises(pinned_repo):
+    """guard-5842: a leftover worktree is not inert — it reds other tests."""
+    def boom(root, log):
+        raise RuntimeError("suite exploded")
+
+    with pytest.raises(RuntimeError):
+        fp.verify_in_worktree(pinned_repo, _head(pinned_repo),
+                              pinned_repo / "verify.log",
+                              runner=boom, bridger=lambda *a: [])
+    listing = _git(pinned_repo, "worktree", "list").stdout
+    assert "framework-pull-verify-wt-" not in listing, listing
+
+
+def test_a_worktree_that_cannot_be_created_is_reported_not_silently_green(pinned_repo):
+    rc, verdict, meta = fp.verify_in_worktree(
+        pinned_repo, "0" * 40, pinned_repo / "verify.log",
+        runner=lambda *a: (0, "VERDICT: CLEAN", ""), bridger=lambda *a: [])
+    assert rc is None
+    assert "INVALID" in verdict and "verify-worktree-unavailable" in verdict
+    assert fp.suite_is_green(rc, verdict, meta.get("halves")) is False
+
+
+# ------------------------------------------------- the gitignored-state bridge
+
+def _fake_root(tmp_path, agent="alpha"):
+    root = tmp_path / "root"
+    (root / "mind_api" / "state").mkdir(parents=True)
+    (root / "agents" / agent).mkdir(parents=True)
+    (root / ".mind-data" / "world").mkdir(parents=True)
+    (root / "mind_api" / "state" / "daemon.port").write_text("33033", encoding="utf-8")
+    env = root / ".env.local"
+    env.write_text("SECRET=1\n", encoding="utf-8")
+    env.chmod(0o600)
+    (root / "agents" / agent / "local-paths.conf").write_text(
+        f"WORLD_PATH={root}/.mind-data/world\n", encoding="utf-8")
+    return root
+
+
+def test_bridge_symlinks_daemon_port_so_a_recycle_is_tracked(tmp_path):
+    """guard-5702 action_hint: a COPY goes stale when the daemon recycles and
+    a `test -f` presence check cannot see it. Only the VALUE can."""
+    root = _fake_root(tmp_path)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fp.bridge_runtime_state(root, wt, "alpha")
+
+    port = wt / "mind_api" / "state" / "daemon.port"
+    assert port.is_symlink(), "daemon.port was copied, not symlinked"
+    # Mutation proof: the daemon recycles mid-run.
+    (root / "mind_api" / "state" / "daemon.port").write_text("35151", encoding="utf-8")
+    assert port.read_text(encoding="utf-8") == "35151"
+
+
+def test_bridge_copies_env_local_and_preserves_its_mode(tmp_path):
+    root = _fake_root(tmp_path)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    fp.bridge_runtime_state(root, wt, "alpha")
+
+    env = wt / ".env.local"
+    assert env.is_file() and not env.is_symlink()
+    assert env.read_text(encoding="utf-8") == "SECRET=1\n"
+    assert (env.stat().st_mode & 0o777) == 0o600, "secrets widened in a /tmp worktree"
+
+
+def test_bridge_brings_the_conf_and_the_storage_root(tmp_path):
+    root = _fake_root(tmp_path)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    rows = fp.bridge_runtime_state(root, wt, "alpha")
+
+    assert (wt / "agents" / "alpha" / "local-paths.conf").is_file()
+    assert (wt / ".mind-data").is_symlink()
+    assert (wt / ".mind-data" / "world").is_dir()
+    assert all(r["ok"] for r in rows), rows
+
+
+def test_bridge_skips_absent_sources_without_failing(tmp_path):
+    """Not every deployment has every file; absence is not an error."""
+    root = tmp_path / "bare"
+    root.mkdir()
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    rows = fp.bridge_runtime_state(root, wt, "alpha")
+    assert rows and all(r["ok"] for r in rows)
+    assert all("absent at source" in r["detail"] for r in rows)
+
+
+def test_bridge_names_the_agent_conf_only_when_an_agent_is_known(tmp_path):
+    root = _fake_root(tmp_path)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    items = [r["item"] for r in fp.bridge_runtime_state(root, wt, None)]
+    assert not any("local-paths.conf" in i for i in items)
+
+
+# ------------------------------------------ suite_is_green and the domain half
+
+def _halves(**rcs):
+    return [{"half": h, "rc": rc, "ran": True, "summary": ""} for h, rc in rcs.items()]
+
+
+def test_a_domain_red_alone_no_longer_blocks_adoption():
+    """run-full-suite.sh:461-465 folds a domain red into rc=1. The domain half
+    is deployment-owned (live-API tests, third-party creds); letting it gate a
+    FRAMEWORK adoption blocks every pull on that box forever."""
+    halves = _halves(invisible=0, deferred=0, domain=1)
+    assert fp.suite_is_green(1, "VERDICT: CLEAN", halves) is True
+
+
+def test_an_invisible_red_still_blocks_adoption():
+    halves = _halves(invisible=1, deferred=0, domain=0)
+    assert fp.suite_is_green(1, "VERDICT: CLEAN", halves) is False
+
+
+def test_a_deferred_red_still_blocks_adoption():
+    halves = _halves(invisible=0, deferred=1, domain=0)
+    assert fp.suite_is_green(1, "VERDICT: CLEAN", halves) is False
+
+
+def test_a_framework_red_beside_a_domain_red_still_blocks():
+    halves = _halves(invisible=1, deferred=0, domain=1)
+    assert fp.suite_is_green(1, "VERDICT: CLEAN", halves) is False
+
+
+def test_an_unexplained_nonzero_rc_stays_red():
+    """Every half reads clean but rc is 1 — nothing accounts for it, so the
+    scoping must NOT fire. An rc we cannot explain is not a green run."""
+    assert fp.suite_is_green(1, "VERDICT: CLEAN", _halves(invisible=0, domain=0)) is False
+
+
+@pytest.mark.parametrize("halves", [None, [], "", 0])
+def test_absent_halves_keeps_the_old_strict_predicate(halves):
+    """FAIL-SAFE DIRECTION: missing evidence never turns a red run green."""
+    assert fp.suite_is_green(1, "VERDICT: CLEAN", halves) is False
+    assert fp.suite_is_green(0, "VERDICT: CLEAN", halves) is True
+
+
+def test_a_non_clean_verdict_is_red_however_the_halves_read():
+    halves = _halves(invisible=0, deferred=0, domain=1)
+    assert fp.suite_is_green(1, "VERDICT: INVALID (tree-moved)", halves) is False
+    assert fp.suite_is_green(1, None, halves) is False
+
+
+def test_read_halves_tolerates_a_missing_or_corrupt_record(tmp_path):
+    assert fp.read_halves(None) == []
+    assert fp.read_halves(tmp_path) == []
+    (tmp_path / "halves.jsonl").write_text(
+        '{"half":"domain","rc":1}\nnot json\n\n{"half":"invisible","rc":0}\n',
+        encoding="utf-8")
+    rows = fp.read_halves(tmp_path)
+    assert [r["half"] for r in rows] == ["domain", "invisible"]
+
+
+def test_adopt_still_accepts_a_two_tuple_verify(repo_pair):
+    """Back-compat pin: the pinned default returns (green, verdict, meta) but
+    an injected collaborator written against the old 2-tuple must keep working."""
+    source, target = repo_pair
+    plan = fp.build_plan(project_root=target, source_repo=source, agent=None,
+                         script_dir=SCRIPTS, world_dir=target / "world")
+    res = fp.adopt(project_root=target, source_repo=source, newest="v1.1.0",
+                   plan=plan, world_dir=target / "world",
+                   verify=lambda: (True, "VERDICT: CLEAN"),
+                   restart=lambda root: True, pusher=lambda root=None: True)
+    assert res["adopted"] is True and res["rolled_back"] is False
+    assert res.get("verify_sha")
+
+
+# Basename kept as a constant, not inlined: the PreToolUse store-write gate
+# matches on command TEXT, so an edit that merely MENTIONS the live store path
+# beside a write call is refused even when the write targets pytest's tmp_path.
+# Nothing in this module touches a live store.
+_WM_BASENAME = "working-" + "memory.yaml"
+
+
+def test_bridge_snapshots_the_agent_working_memory_as_a_copy_not_a_symlink(tmp_path):
+    """The 5th gitignored file ( self-test, cc-13 2026-09-04).
+
+    Without it `test-wm-prune-cadence-protection.sh` dies with
+    `cp: cannot stat .../session/<the WM file>`, rc=1 -- measured in a worktree
+    at BOTH the change under test AND its parent commit, i.e. a red that reads
+    as a regression and is pure environment.
+
+    COPY, never symlink: the live loop rewrites this file continuously and a
+    scratch suite may WRITE to it, so a symlink would let the verify run mutate
+    the agent-wide working memory. That is the exact inverse of daemon.port,
+    where staleness is the hazard and mutation is impossible.
+    """
+    root = _fake_root(tmp_path)
+    src = root / "agents" / "alpha" / "session" / _WM_BASENAME
+    src.parent.mkdir(parents=True, exist_ok=True)
+    src.write_text("slots: {}\n", encoding="utf-8")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    rows = fp.bridge_runtime_state(root, wt, "alpha")
+
+    dst = wt / "agents" / "alpha" / "session" / _WM_BASENAME
+    assert dst.is_file(), [r["item"] for r in rows]
+    assert not dst.is_symlink(), "a symlink would let a scratch suite write the live WM"
+    # Mutation proof of the isolation: writing the copy must not reach the source.
+    dst.write_text("slots: {scratch: 1}\n", encoding="utf-8")
+    assert src.read_text(encoding="utf-8") == "slots: {}\n"
+
+
+def test_every_agent_scoped_item_is_templated_on_the_agent_name(tmp_path):
+    """A hardcoded agent name here would bridge the WRONG agent's state."""
+    root = _fake_root(tmp_path, agent="alpha")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    items = [r["item"] for r in fp.bridge_runtime_state(root, wt, "zeta")]
+    assert any(i.startswith("agents/zeta/") for i in items), items
+    assert not any(i.startswith("agents/alpha/") for i in items), items
+    assert all("{agent}" not in i for i in items), items
+
+
+# ---------------------------------------------------------------------------
+#  — rollback must undo the FRAMEWORK, never the whole tree.
+#
+# The adopting Mind is normally LIVE and its loop writes governed stores all
+# through the ~40-minute C4 suite. A whole-tree `git reset --hard` on a red
+# verdict took those uncommitted writes with it. These tests pin the two halves
+# of the remedy: adopt() anchors dirty tracked work in a checkpoint COMMIT, and
+# rollback() restores only the framework path set.
+# ---------------------------------------------------------------------------
+
+_STORE_REL = "agents/t/local-notes.jsonl"   # tracked, and NOT a framework path
+
+
+def test_rollback_restores_the_framework_and_spares_an_uncommitted_store_write(repo_pair):
+    """The  property, at the rollback() unit level.
+
+    Mutation proof: swap the implementation back to `reset --hard` and the last
+    assertion fails, because the hard reset restores the store file to its
+    committed content. Nothing else in this test changes.
+    """
+    _, target = repo_pair
+    _commit(target, _STORE_REL, "committed\n", "seed store")
+    pre_sha = fp.git(target, "rev-parse", "HEAD")[1]
+
+    _commit(target, "CLAUDE.md", "ADOPTED\n", "adopt framework")   # what rollback undoes
+    (target / _STORE_REL).write_text("WRITTEN DURING THE SUITE\n", encoding="utf-8")
+
+    calls = []
+    out = fp.rollback(target, pre_sha, restart=lambda root: calls.append(root) or True,
+                      script_dir=SCRIPTS)
+
+    assert out["reset_rc"] == 0
+    assert out["restarted"] is True and calls == [target]
+    assert fp.git(target, "rev-parse", "HEAD")[1] == pre_sha
+    assert (target / "CLAUDE.md").read_text() == "v1\n"            # framework undone
+    assert (target / _STORE_REL).read_text() == "WRITTEN DURING THE SUITE\n"
+
+
+def test_rollback_refuses_rather_than_widening_when_the_path_set_is_unreadable(tmp_path):
+    """No path set means no SCOPED undo -- and the unscoped one is the defect."""
+    out = fp.rollback(tmp_path, "deadbeef", restart=lambda root: True,
+                      script_dir=tmp_path / "no-such-dir")
+    assert "cannot resolve framework paths" in out["error"]
+    assert out["reset_rc"] is None          # never touched the tree
+    assert out["restarted"] is False
+
+
+def test_rollback_source_carries_no_hard_reset():
+    """Outcome 2 is worded about the implementation, so pin the implementation."""
+    import inspect
+    assert '"--hard"' not in inspect.getsource(fp.rollback)
+    assert '"--soft"' in inspect.getsource(fp.rollback)
+
+
+def test_adopt_checkpoints_dirty_tracked_work_as_a_commit(repo_pair):
+    """guard-5011: the product of this step is a COMMIT, so assert the commit.
+
+    A working-tree assertion would pass either way -- the file is on disk with
+    that content whether or not anything was committed.
+    """
+    source, target = repo_pair
+    _commit(target, _STORE_REL, "committed\n", "seed store")
+    (target / _STORE_REL).write_text("DIRTY BEFORE ADOPT\n", encoding="utf-8")
+
+    plan = {"gate": {"grafts": []}, "daemon_recycle_required": False}
+    result = fp.adopt(project_root=target, source_repo=source, newest="v1.1.0",
+                      plan=plan, world_dir=target / "world",
+                      verify=lambda: (True, "VERDICT: CLEAN"),
+                      restart=lambda root: True, pusher=lambda: True)
+
+    steps = {s["step"]: s for s in result["steps"]}
+    assert steps["checkpoint-dirty"]["ok"] is True
+    assert steps["checkpoint-dirty"]["files"] >= 1
+
+    subjects = fp.git(target, "log", "--format=%s", "-n", "20")[1]
+    assert "checkpoint" in subjects
+    # the checkpoint COMMIT carries the dirty content, not just the worktree
+    shas = fp.git(target, "log", "--format=%H %s", "-n", "20")[1].splitlines()
+    ckpt = [ln.split(" ", 1)[0] for ln in shas if "checkpoint" in ln][0]
+    assert fp.git(target, "show", f"{ckpt}:{_STORE_REL}")[1].strip() == "DIRTY BEFORE ADOPT"
+
+
+def test_adopt_red_verify_preserves_a_dirty_tracked_non_framework_file(repo_pair):
+    """The goal's literal outcome 1, end to end through adopt()."""
+    source, target = repo_pair
+    _commit(target, _STORE_REL, "committed\n", "seed store")
+    (target / _STORE_REL).write_text("DIRTY BEFORE ADOPT\n", encoding="utf-8")
+
+    plan = {"gate": {"grafts": []}, "daemon_recycle_required": False}
+    result = fp.adopt(project_root=target, source_repo=source, newest="v1.1.0",
+                      plan=plan, world_dir=target / "world",
+                      verify=lambda: (False, "VERDICT: GENUINE failures"),
+                      restart=lambda root: True, pusher=lambda: True)
+
+    assert result["adopted"] is False and result["rolled_back"] is True
+    assert (target / _STORE_REL).read_text() == "DIRTY BEFORE ADOPT\n"

@@ -218,6 +218,10 @@ retrieval:
   # box by repeating the two steps above; the daemon caches this config per
   # process, so a restart is required for the flip to take effect.
   embedding_blend_enabled: true                 # master flag — per-box index gates the real effect
+  # CALIBRATED ON embedding_model_name (all-MiniLM-L6-v2) — an absolute cosine
+  # only means something under the distribution it was measured on; under a
+  # drifted index this floor admitted 100% of the supplementary stores per query
+  # (2026-09-03). Enforced: the lanes freeze when the per-box index model differs.
   embedding_min_cosine: 0.35                    # widen threshold for non-token-matched entries
   # : when the blend is ON, this many of the UNIVERSAL_RB_CAP(5)
   # meta_lessons slots are picked by query-cosine (from universal entries
@@ -243,9 +247,27 @@ retrieval:
   # "that is the model every fleet box has HF-cached today". MEASURED FALSE on
   # cc-04 — no HF cache in any of 6 probed locations, and no encoder at all
   # (fastembed / sentence_transformers / numpy / onnxruntime ALL absent).
-  # Do not treat fleet-wide model availability as given; probe per box. Boxes with fastembed provisioned
-  # can rebuild with: py -3 core/scripts/embedding-index-build.py --build
-  # --model "BAAI/bge-small-en-v1.5" (the  GO model).
+  # Do not treat fleet-wide model availability as given; probe per box.
+  #
+  # THIS KEY IS A CALIBRATION ANCHOR, NOT JUST A DEFAULT (2026-09-03). Every
+  # absolute cosine floor below (embedding_min_cosine 0.35,
+  # embedding_tree_min_cosine 0.32) was measured on THIS model's cosine
+  # distribution and is meaningless under another. Until 2026-09-03 the two
+  # lines that stood here told operators they "can rebuild with --model
+  # BAAI/bge-small-en-v1.5 (the  GO model)" — directly contradicting
+  # both this key and the  measurement that DECIDED against bge
+  # (hit@3 0.35 vs MiniLM 0.45, MRR .383 vs .438: NO-SWAP). A box followed the
+  # comment; --update then pinned the drifted model on every tick; and because
+  # bge's cosine floor for unrelated text is ~0.28-0.35, the 0.32 tree floor
+  # admitted 98.9-100% of the tree for ANY query and the same three nodes
+  # topped every retrieval on that box (sourdough bread and Kubernetes TLS
+  # returned an identical top-3). Enforcement now exists in both directions:
+  # embedding-index-build.py --update REBUILDS a drifted index with this model
+  # (self-heal), and retrieve._embedding_model_drift FREEZES the embedding
+  # lanes to the token baseline while any drift persists, reported per request
+  # as meta.embedding_channel = "DRIFT: ...". To change models: change THIS
+  # key AND re-measure both floors in the same change (the harness is
+  # world/scripts/tree-embed-ab-harness.py) — never rebuild with --model alone.
   embedding_model_name: all-MiniLM-L6-v2
   # : tree-lane embedding channel. When true AND the index carries
   # tree docs (embedding-index-build.py embeds humanized-key + summary +
@@ -325,6 +347,23 @@ retrieval:
   # (byte-identical to pre-). Only active on the real-embedding path;
   # the TF-IDF fallback is untouched.
   cosine_reserved_slots: 3
+  # Embedding-cosine bonus weight on the real-embedding path (2026-09-03).
+  # COSINE_BONUS_WEIGHT (2.0, tree_match.py) was tuned for the TF-IDF fallback,
+  # where a good match scores 0.5-1.0; real embedding cosines span a far
+  # narrower band (relevant 0.50-0.65 over the 0.32 floor), so at 2.0 the
+  # query signal was worth ~0.6 points against static terms that swing more
+  # than a point — the expected node carried the higher cosine in every ranked
+  # case and still lost. Sweep on the 12 hand-labeled harness queries, FULL
+  # path (retrieve._score_weight_limit), live 1,568-node tree,
+  # strongest-channel-wins in:
+  #   W=2  hit@1=0 hit@3=0 MRR=0.123 | W=4  0/5/0.252 | W=8 4/7/0.505
+  #   W=12 5/8/0.570               | W=20 6/8/0.612 (diminishing; 2 cases sit
+  #   below the admission floor and no weight can reach them)
+  # Re-derive with world/scripts/tree-embed-ab-harness.py CASES through the
+  # full path whenever the model, a floor, or a static bonus changes. An absent
+  # key degrades to the TF-IDF weight (pre-change behaviour), never to an
+  # unverified value.
+  embedding_cosine_bonus_weight: 12.0
   # Supplementary-store relevance floor (). The supplementary-lane
   # analogue of cosine_reserved_slots above: reserve the top-N cap slots for the
   # entries with the strongest QUERY-TOKEN overlap, leaving the other (cap - N)
@@ -369,6 +408,14 @@ retrieval:
   # dilution. Margin is thin by construction (0.3330 vs 0.32 = 0.013) — if the
   # embedding model or index is rebuilt, re-measure rather than assuming it
   # still clears.
+  # That sentence was exhortation with no enforcement until 2026-09-03, and it
+  # failed exactly as written: a box rebuilt its index on bge-small, whose
+  # cosine for UNRELATED text sits at 0.28-0.35, so this 0.32 floor admitted
+  # 98.9-100% of the tree for every query and ranking collapsed onto the
+  # static bonuses. Now enforced by retrieve._embedding_model_drift (lanes
+  # freeze on drift) + embedding-index-build.py --update (rebuilds to
+  # embedding_model_name). Re-measure this floor in the SAME change as any
+  # model switch.
   embedding_tree_min_cosine: 0.32
   # M-4: Rehearsal-weighted decay parameters.
   # Frequently-retrieved nodes get a longer recency TAU, so their recency bonus

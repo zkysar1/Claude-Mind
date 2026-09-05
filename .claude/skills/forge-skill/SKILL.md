@@ -622,10 +622,22 @@ Pattern: `{verb}-{domain}-{noun}` — keeps names scannable and predictable.
 - Maximum 100 total skills (base + forged combined)
 - Only forge when developmental gate is met (CALIBRATE+ for utility gaps, EXPLOIT+ for analytical gaps)
 - Forged skills are always `user-invocable: false` (internal sub-skills — hyphen per Claude Code spec)
-- Never forge a skill that duplicates an existing one — before forging, check
-  `skill-relations.sh read --similar {candidate_name}` to verify no existing skill
-  covers the same capability. If a similar skill exists, strengthen that skill or
-  register a compose_with relation instead of forging a new one.
+- Never forge a skill that duplicates an existing one. Do the overlap check BY
+  HAND. Per guard-4841 and guard-2119, do NOT reach for
+  `skill-relations.sh read --similar {candidate_name}` here: it returns `[]` for
+  EVERY input, including names that certainly exist (measured 2026-08-22:
+  `uncrossed-seams` -> `[]`, `reflect` -> `[]`),
+  so its empty answer is ZERO signal, not evidence of no overlap — and this
+  Constraints bullet was the one place it was prescribed, which is the one place
+  that empty answer is most load-bearing. Even a working name-matcher would not
+  suffice: two skills covering overlapping procedures routinely share no name
+  tokens (guard-2119). Instead grep the skills corpus for the PROCEDURE'S OWN
+  vocabulary (the distinctive nouns in the gap's step list) across
+  `.claude/skills/` and `core/scripts/`, grep `forged_from` across
+  `.claude/skills/*/SKILL.md`, and read the front matter of the nearest
+  neighbours before concluding the capability is absent. If a similar skill
+  exists, strengthen that skill or register a compose_with relation instead of
+  forging a new one.
 - Always create a test aspiration goal after forging
 - Gap registry is append-only (dismissed gaps stay, never deleted)
 

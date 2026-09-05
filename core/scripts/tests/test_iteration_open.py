@@ -223,6 +223,36 @@ def test_reducer_writes_both_meter_stamps(table, monkeypatch):
     assert [a[1] for a in meter] == ["start", "end"]
 
 
+def test_reducer_end_keeps_the_metering_window_open(table, monkeypatch):
+    """: the `end` MUST carry --keep-state.
+
+    A BARE `end` unlinks the agent-wide state file. The 23 deferrable
+    `meter check` calls that consult it live in aspirations-precheck-digest.md
+    and execute in the LLM's own turns, AFTER run() has returned -- so a bare
+    end closes the window before any of them can read the zone, and every one
+    fails open to `run`. That is the defect this goal names: the meter's only
+    remaining drop path, inert. guard-2832 measured the signature independently
+    (92 precheck-end records, zone `fresh` on all 92).
+
+    Pinned as the FLAG rather than the op because the op alone was ALREADY
+    correct while the behaviour was broken -- the sibling test above passes in
+    both regimes, so it cannot catch this (rb-8963: once the shape is callable,
+    pin the behaviour). Deleting the `end` call instead would fix the window and
+    regress the stamp precheck-gap-check reads from ~100% back to 82%.
+    """
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    calls = []
+    io_mod.run(runner=make_runner({}, record=calls), md_path=table)
+    ends = [a for a in calls
+            if a[0] == "aspirations-precheck-budget-meter.sh" and a[1] == "end"]
+    assert len(ends) == 1, "exactly one meter end per run, got %d" % len(ends)
+    assert "--keep-state" in ends[0], (
+        "iteration-open must close with `end --keep-state`; a bare end unlinks "
+        "the state file before precheck's deferrable checks run (g-115-9009). "
+        "argv was: %r" % (ends[0],)
+    )
+
+
 # --- apply pass-through ------------------------------------------------------
 
 def test_apply_reaches_only_the_stage_that_declares_it(table, monkeypatch):

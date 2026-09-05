@@ -413,3 +413,151 @@ def test_unchunked_run_is_unaffected():
     verdict, reasons = RFS.classify(_CLEAN_CHUNK, 0)
     assert verdict == "clean"
     assert not [r for r in reasons if "NUL" in r]
+
+
+# ===========================================================================
+#  -- a chunk whose pytest process died mid-run must not read CLEAN
+# ===========================================================================
+#
+# THE FILED DEFECT AND WHAT RE-MEASUREMENT CHANGED. The goal reported a chunk
+# terminating at ~19-21% with rc=0, no summary line, "729 bytes of progress dots
+# and nothing else", and concluded that "no verdict layer flags it" -- remedy:
+# reuse the rc predicate `_solo` carries. Re-measured here before building
+# (guard-1422): that exact log IS flagged. `_looks_aborted` returns True on it
+# and classify() returns `contended`, in every shape tried -- with percent
+# markers, without them, solo, and as one chunk among healthy ones.
+#
+# The conclusion survived the correction; the mechanism did not. A false CLEAN
+# is reachable, through a door the goal did not name: `_looks_aborted` used an
+# UNANCHORED `re.search(r"\d+\s+(passed|failed)")` as its "the run finished"
+# evidence, so ANY count-shaped substring anywhere in the log switched the abort
+# detector off. The silent-zero branch cannot cover for it either -- that branch
+# requires `_progress_tally` to be None, and a chunk that died at 21% has plenty
+# of progress rows. Result: no reason from either branch, VERDICT: CLEAN.
+#
+# AND THE CALLER IS THE SOURCE OF THE POISON: 30 files under core/scripts/tests
+# carry pytest-summary-shaped strings in their fixtures (this file now among
+# them), because they are the suite's own self-tests. pytest prints a failing
+# test's captured stdout into the log, so a chunk holding one of those files
+# spills a count-shaped line into its own log as a matter of course.
+#
+# The goal's prescribed rc predicate does NOT catch this and is shipped anyway,
+# because it covers a different lane: rc 2/3/4/5 and collected-nothing. The two
+# checks are complements, neither subsumes the other, and guard-1501 states the
+# split from the other side -- "rc=0 is not the tell; the ABSENT SUMMARY LINE
+# is".
+
+_DIED_AT_21 = _progress([("." * 72, p) for p in (2, 4, 7, 9, 11, 14, 16, 19, 21)])
+
+
+def test_a_chunk_that_died_mid_run_is_not_laundered_by_a_stray_count_line():
+    """THE MEASURED FALSE CLEAN. Before the fix this returned ("clean", []).
+
+    The stray line sits at column 0 and is byte-identical to pytest's own
+    summary -- that is the point. It cannot be told apart by SHAPE, only by
+    POSITION, and a test's captured stdout necessarily has progress rows after
+    it while pytest's real summary necessarily does not.
+    """
+    poisoned = _DIED_AT_21.replace(" [ 11%]", " [ 11%]\n6 passed in 1.0s", 1)
+    assert RFS._has_summary_line(poisoned) is False
+    assert RFS._looks_aborted(poisoned) is True
+    verdict, reasons = RFS.classify(poisoned, 0, chunks=[poisoned])
+    assert verdict == "contended", reasons
+    assert any("stopped at 21%" in r for r in reasons), reasons
+
+
+def test_the_same_truncated_chunk_among_healthy_ones_still_reports():
+    """The production shape: one dead chunk, three good ones, one blob.
+
+    classify() judges per chunk, but a reader only ever sees the verdict, so
+    the property that matters is that three healthy chunks cannot outvote one
+    dead one.
+    """
+    poisoned = _DIED_AT_21.replace(" [ 11%]", " [ 11%]\n6 passed in 1.0s", 1)
+    chunks = [_CLEAN_CHUNK, _CLEAN_CHUNK, poisoned, _CLEAN_CHUNK]
+    verdict, reasons = RFS.classify("\n".join(chunks), 0, chunks=chunks)
+    assert verdict == "contended", reasons
+    assert any("chunk 02" in r for r in reasons), reasons
+
+
+def test_a_genuine_trailing_summary_still_reads_as_finished():
+    """NEGATIVE CONTROL -- without it, a check that flagged everything passes.
+
+    Byte-for-byte the same progress rows as the case above; the ONLY difference
+    is where the count line sits. If this goes red the fix has stopped being a
+    discriminator and started being a blanket refusal, which is the failure
+    mode guard-580 decayed to (times_noise=30, times_helpful=0).
+    """
+    finished = _DIED_AT_21 + "\n648 passed, 3 warnings in 41.20s"
+    assert RFS._has_summary_line(finished) is True
+    assert RFS._looks_aborted(finished) is False
+    assert RFS.classify(finished, 0, chunks=[finished]) == ("clean", [])
+
+
+def test_has_summary_line_discriminates_on_order_not_on_shape():
+    """The three orderings, stated as a table so the intent survives a refactor."""
+    prog = _progress([("." * 72, 50), ("." * 72, 100)])
+    # 1. pytest's own summary: after all progress output.
+    assert RFS._has_summary_line(prog + "\n144 passed in 90s") is True
+    # 2. A test's captured stdout: progress rows follow it.
+    assert RFS._has_summary_line("144 passed in 90s\n" + prog) is False
+    # 3. No progress output at all -- nothing to order against, so the count
+    #    line stands. This lane belongs to the silent-zero branch, and stealing
+    #    it here would double-report the same chunk.
+    assert RFS._has_summary_line("144 passed in 90s") is True
+    # 4. The banner form pytest uses without -q.
+    assert RFS._has_summary_line(prog + "\n===== 144 passed in 90s =====") is True
+    # 5. An indented echo is not a summary line at all, at any position.
+    assert RFS._has_summary_line(prog + "\n    captured: 6 passed in 1.0s") is False
+
+
+def test_the_poison_string_is_actually_present_in_this_repos_fixtures():
+    """ANTI-VACUITY FLOOR (): the hazard is real here, not invented.
+
+    If this repo stopped carrying pytest-summary-shaped fixture strings the
+    tests above would still pass while pinning a threat that no longer exists.
+    Measured 2026-09-04 on this tree (g-115-8887): 30 files. Asserting a
+    floor rather than the exact count -- the number moves with every test
+    added, the hazard does not.
+    """
+    import re as _re
+    tests_dir = SCRIPT_DIR
+    hits = [f.name for f in sorted(tests_dir.glob("test_*.py"))
+            if _re.search(r"\d+ (?:passed|failed)", f.read_text(encoding="utf-8", errors="replace"))]
+    assert len(hits) >= 10, (len(hits), hits[:5])
+
+
+# ── the rc half: the predicate `_solo` carries, now reused by the chunk loop ──
+
+def test_is_measurement_requires_both_halves():
+    """goal check 1: rc=0 with zero parsed tests is NOT a measurement.
+
+    An empty population must return the UNSAFE verdict, never the safe one
+    (guard-2166). Both directions are pinned so a mutant that drops either
+    conjunct reds.
+    """
+    assert RFS._is_measurement(0, 5, 0, 0) is True
+    assert RFS._is_measurement(1, 0, 5, 0) is True
+    # rc says "I ran your tests" but nothing was accounted for.
+    assert RFS._is_measurement(0, 0, 0, 0) is False
+    # counts present but rc says interrupted / internal error / usage error /
+    # collected-nothing. A dot tally can be non-zero on all of these.
+    for rc in (2, 3, 4, 5):
+        assert RFS._is_measurement(rc, 648, 0, 0) is False, rc
+
+
+def test_the_measurement_predicate_has_exactly_one_definition_and_two_callers():
+    """goal outcome 2: REUSED, not re-implemented.
+
+    A behavioural test cannot see the difference between one shared predicate
+    and two identical copies -- and copies are precisely what drifts. So this
+    reads the source. It is deliberately a FLOOR on call sites and an EXACT
+    count on definitions: adding a third caller is fine, adding a second
+    definition is the regression.
+    """
+    src = TARGET.read_text(encoding="utf-8")
+    assert src.count("def _is_measurement(") == 1, "predicate was duplicated"
+    calls = src.count("_is_measurement(") - src.count("def _is_measurement(")
+    assert calls >= 2, ("expected the solo path AND the chunk loop", calls)
+    # And the inline copy the goal named must be gone, not merely shadowed.
+    assert "returncode not in (0, 1)" not in src

@@ -8,7 +8,8 @@ desc: "Build an AGGREGATOR (not new instrumentation)"). No file is written
 except the report on stdout. Sources (all verified present at build time):
 
   contribution
-    - world/productivity-snapshots.jsonl   per-iteration {agent, score, breakdown,
+    - world/productivity-snapshots.jsonl (+ date segments, via
+      _productivity_snapshots.snapshot_paths)   per-iteration {agent, score, breakdown,
                                             goals_completed, productive_goals, ...}
   harm
     - meta/gate-firings.jsonl              {agent, gate_id, decision}  -> blocks
@@ -359,7 +360,23 @@ def main(argv=None):
 
     world_dir, meta_dir = _resolve_dirs(args.world_dir, args.meta_dir)
 
-    snapshots = list(_load_jsonl(world_dir / "productivity-snapshots.jsonl")) if world_dir else []
+    # Read through the store's composition seam (_productivity_snapshots.
+    # snapshot_paths — ) rather than the hardcoded legacy filename, for
+    # the identical reason as the gate-firings seam directly below: once
+    # PRODUCTIVITY_SNAPSHOTS_SEGMENTED is set the writer emits date segments and
+    # the legacy file stops growing, so a legacy-only read would silently
+    # under-report every agent's contribution after the cutover. Fail-soft to
+    # the legacy path if the seam cannot be imported.
+    snapshots = []
+    if world_dir:
+        try:
+            sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
+            from _productivity_snapshots import snapshot_paths  # type: ignore
+            snap_paths = snapshot_paths(world_dir)
+        except Exception:  # noqa: BLE001 — fail-soft to the legacy filename
+            snap_paths = [world_dir / "productivity-snapshots.jsonl"]
+        for _sp in snap_paths:
+            snapshots.extend(_load_jsonl(_sp))
     # Read through the store's composition seam (_gate_log.firings_paths — the
     #  seam) rather than the hardcoded legacy filename. Once
     # GATE_FIRINGS_SEGMENTED is set the flush writes date segments and the

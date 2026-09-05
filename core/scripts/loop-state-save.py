@@ -414,6 +414,58 @@ def _warn_checkpoint_missing(path, args) -> None:
         pass  # the ledger must never be the outage
 
 
+def _warn_checkpoint_wrong_goal(path, args, have: str, want: str) -> None:
+    """Surface a refresh aimed at a DIFFERENT goal than the checkpoint anchors.
+
+    Same two-channel design as _warn_checkpoint_missing (guard-772: a stderr
+    banner is invisible from a backgrounded subprocess, so the durable JSONL
+    half is what makes the refusal auditable), and deliberately the SAME ledger
+    file -- one place to look, distinguished by `event`.
+
+    REFUSING is the conservative half of the g-357-84 contract. Replacing the
+    record instead would fabricate a Phase-2.95 anchor that never existed --
+    the same "invent state rather than surface the miss" step the
+    missing-checkpoint branch already declines to take.
+    """
+    keys = []
+    try:
+        keys = [q.split("=", 1)[0] for q in (getattr(args, "set", None) or []) if "=" in q]
+    except Exception:
+        pass
+    try:
+        print(
+            "[loop-state-save] WARN: update REFUSED -- checkpoint at %s is anchored "
+            "to %s but the caller named %s. Wrote nothing, returning 0 for fail-open. "
+            "Attempted key(s): %s. This is the g-357-84 wrong-goal refresh: when no "
+            "Phase 2.95 anchor exists for the goal being closed, a stale checkpoint "
+            "for a DIFFERENT goal is the only record on disk, and an unguarded update "
+            "stamps phase_completed/last_updated onto it -- making that other goal "
+            "look freshly advanced to every downstream reader. Re-anchor the goal "
+            "actually being closed: `loop-state-save.sh init --goal-id %s`."
+            % (path, have or "<none>", want, ", ".join(keys) or "<none>", want),
+            file=sys.stderr,
+        )
+    except Exception:
+        pass
+    try:
+        from datetime import datetime
+        ledger = Path(path).parent / "checkpoint-miss.jsonl"
+        rec = {
+            "at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "agent": os.environ.get("MIND_AGENT", "unknown"),
+            "event": "update_against_wrong_goal",
+            "checkpoint_path": str(path),
+            "anchored_goal_id": have,
+            "requested_goal_id": want,
+            "attempted_keys": keys,
+        }
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        with open(ledger, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=True) + "\n")
+    except Exception:
+        pass  # the ledger must never be the outage
+
+
 def cmd_update(args) -> int:
     """Merge-update one or more fields on the existing checkpoint. If the
     checkpoint doesn't exist, exit 0 (treat as no-op — caller may be running
@@ -472,6 +524,21 @@ def cmd_update(args) -> int:
         return 1
 
     data = json.loads(path.read_text(encoding="utf-8"))
+    # : REFUSE a refresh aimed at a different goal than this checkpoint
+    # anchors. Placed AFTER the parse so it reuses the read above -- the calling
+    # shell would otherwise round-trip the value through text mode, where a
+    # trailing "\r" makes the compare never equal (the trap cmd_clear documents
+    # at its own --if-goal check). Inert when --if-goal is absent or empty, so
+    # every existing caller keeps its exact current behavior. Exit 0 on refusal
+    # is deliberate and load-bearing: the iteration-close.sh call sites read a
+    # nonzero rc as an ITERATION failure, so a wrong-goal refresh must not abort
+    # the close -- the stderr WARN + durable ledger are the observability half.
+    _want_goal = (getattr(args, "if_goal", None) or "").strip()
+    if _want_goal:
+        _have_goal = str((data or {}).get("goal_id") or "").strip()
+        if _have_goal != _want_goal:
+            _warn_checkpoint_wrong_goal(path, args, _have_goal, _want_goal)
+            return 0
     # Apply each key — dotted paths via _set_dotted (jq-style merge into nested
     # dicts); flat keys via plain assignment. Leaving plain dict.update() for
     # flat keys is intentional — overwrite is the right semantic for top-level
@@ -566,6 +633,9 @@ def main():
 
     p_update = sub.add_parser("update", help="Merge-update fields on existing checkpoint")
     p_update.add_argument("--set", action="append", help="key=value pair (repeatable)")
+    p_update.add_argument("--if-goal", dest="if_goal", default=None,
+                          help="COMPARE-AND-SWAP: apply only when the checkpoint is "
+                               "anchored to this goal id (empty/absent = no compare)")
     p_update.set_defaults(func=cmd_update)
 
     p_clear = sub.add_parser("clear", help="Remove the checkpoint file")

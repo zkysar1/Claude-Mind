@@ -4,13 +4,21 @@ Exercises the compute_role_affinity helper extracted from goal-selector.py.
 Tests the decision rule: agent role × goal work_class → multiplier.
 
 Decision rule:
-  - empty agent_name OR empty goal_class OR goal_class == "unclassified"
-    → return 0.0 (no contribution)
+  - empty agent_name OR empty goal_class → return 0.0 (no contribution)
   - agent not in multipliers dict → return 0.0
   - agent's entry not a dict → return 0.0
   - goal_class not in agent's entry → return 0.0
   - value not coercible to float → return 0.0
   - otherwise → float(multipliers[agent][goal_class])
+
+g-115-8789: "unclassified" is NOT special-cased. It used to be hardcoded to
+0.0 ahead of the table lookup, which made the seven `unclassified:` rows in
+meta/goal-selection-strategy.yaml dead config and pinned a quarter of the
+live corpus (587 of 2388 non-terminal goals, 40 HIGH) at a permanent zero
+multiplier for all seven agents. The value now comes from the table like
+every other class, so the config is the single source of truth (guard-134).
+The `unclassified-zero` case below still passes — CANONICAL carries 0.0 —
+but it now proves the CONFIG says zero, not that the code does.
 
 Pattern: import compute_role_affinity and call directly. Pure function;
 no subprocess, no file I/O.
@@ -75,6 +83,25 @@ CASES = [
     ("empty-goal-class-zero",      "alpha", "",          CANONICAL, 0.0),
     ("none-goal-class-zero",       "alpha", None,        CANONICAL, 0.0),
     ("unclassified-zero",          "alpha", "unclassified", CANONICAL, 0.0),
+    #  REGRESSION PIN — the table value for "unclassified" must be
+    # HONOURED, not short-circuited. Before the fix these three returned 0.0
+    # regardless of what the config said, which is exactly how the seven
+    # `unclassified:` rows became dead config. If a future edit reinstates a
+    # hardcoded `goal_class == "unclassified"` exclusion in
+    # compute_role_affinity, these fail. Do NOT "fix" them by asserting 0.0 —
+    # that restores the defect (a permanent zero multiplier on ~25% of the
+    # live corpus, all seven agents at once). The shipped value lives in
+    # meta/goal-selection-strategy.yaml, not here.
+    ("unclassified-config-value-honoured", "alpha", "unclassified",
+     {"alpha": {"unclassified": 0.3}}, 0.3),
+    ("unclassified-config-value-honoured-other-agent", "bravo", "unclassified",
+     {"bravo": {"unclassified": 0.3}}, 0.3),
+    ("unclassified-config-value-nonstandard", "alpha", "unclassified",
+     {"alpha": {"unclassified": 0.9}}, 0.9),
+    # Absent from the agent's table → still 0.0 via the ordinary
+    # `.get(goal_class, 0.0)` path, NOT via a special case.
+    ("unclassified-absent-from-table-zero", "alpha", "unclassified",
+     {"alpha": {"framework": 1.3}}, 0.0),
     ("unknown-agent-zero",         "charlie", "product", CANONICAL, 0.0),
     ("unknown-class-zero",         "alpha", "exotic",    CANONICAL, 0.0),
     ("empty-multipliers-zero",     "alpha", "product",   {},         0.0),

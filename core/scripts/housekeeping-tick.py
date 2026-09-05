@@ -55,6 +55,12 @@ LANES
      redesigned (P3) so the redesign starts from measured shapes. Census only:
      Lane A purges ONLY the bound agent; another agent's local tree may be a
      stale mirror of a store whose real home is another box (guard-980).
+  D  harness transcript archive — copies BOTH harness transcript trees to the
+     storage backend (core/scripts/transcript_archive.py). NOT gated by
+     `shadow`: shadow arms DELETERS, and this lane only copies (see the
+     docstring on run_lane_d). Self-throttled on its own sub-stamp at
+     transcript_archive_interval_hours (default 12 — the owner's 1-2x/day);
+     set that key to 0 to turn the archiver off.
 
 One JSONL record per EXECUTED tick → core/logs/housekeeping-<agent>.jsonl
 (not-due ticks write nothing). Self-gating via
@@ -112,12 +118,19 @@ from _dt import parse_naive_iso  # shared tolerant naive-ISO parse ()
 ORIGIN_SIGNAL = "investigate:housekeeping-tick"
 DEDUP_HOURS = 48
 LANE_A_TIMEOUT = int(os.environ.get("HK_LANE_A_TIMEOUT") or 300)
+LANE_D_TIMEOUT = int(os.environ.get("HK_LANE_D_TIMEOUT") or 1800)
+LANE_E_TIMEOUT = int(os.environ.get("HK_LANE_E_TIMEOUT") or 120)
 
 DEFAULTS = {
     "interval_hours": 6,
     "shadow": True,
     "scratch_session_age_days": 14,
     "scratch_empty_project_age_days": 30,
+    "transcript_archive_interval_hours": 12,
+    # Lane E. 24h against the detector's own 72h staleness threshold, so a
+    # freeze is caught inside one window rather than at its edge ().
+    # 0 disables the lane, the same off-switch shape lane D uses.
+    "mind_seed_freshness_interval_hours": 24,
 }
 
 
@@ -414,6 +427,204 @@ def run_lane_c(agents_root_fn=None) -> list[dict]:
     return rows
 
 
+# ── Lane D: harness transcript archive ──────────────────────────────────────
+
+def run_lane_d(cfg: dict, state_path: Path | None = None,
+               archive_cmd: list[str] | None = None,
+               now: _dt.datetime | None = None) -> dict:
+    """Copy both harnesses' transcript trees to the storage backend. Never raises.
+
+    NOT GATED BY `shadow`, AND THAT ASYMMETRY IS DELIBERATE — do not "restore
+    lane parity" here. `shadow` is the DELETION arming gate: it makes Lane A
+    dry-run a purge and Lane B report instead of removing. Lane D removes
+    nothing; it COPIES, and its worst failure mode is an extra object in the
+    archive. It ships `true` on every box, so a Lane D behind it would be
+    inert everywhere — an archiver that never runs against a harness that
+    deletes on a 30-day clock. The off-switch is its own interval key set to
+    0, which says "operator turned the archiver off" instead of overloading
+    the word that means "the deleters are not armed yet".
+
+    Self-throttled on its OWN sub-stamp in the tick's state file, because the
+    tick's 6h cadence is the purge's, not this one's (owner: 1-2x/day).
+    Re-reads state immediately before stamping so the window in which it could
+    clobber a concurrent tick stamp is milliseconds wide; the worst outcome of
+    losing that race is one extra interval, which is why it is not locked.
+
+    A timeout or a failed spawn deliberately does NOT stamp: an unreachable
+    backend should retry at the next tick, not wait out the full interval.
+    """
+    interval = float(cfg.get("transcript_archive_interval_hours") or 0)
+    if interval <= 0:
+        return {"verdict": "disabled"}
+    sp = state_path if state_path is not None else _state_path()
+    st = load_state(sp)
+    now = now or _dt.datetime.now()
+    last = st.get("last_transcript_archive")
+    if last:
+        parsed = parse_naive_iso(str(last))
+        if parsed is not None and (now - parsed).total_seconds() < interval * 3600:
+            return {"verdict": "not-due", "last": last,
+                    "interval_hours": interval}
+    if archive_cmd is None and os.environ.get("PYTEST_CURRENT_TEST"):
+        # Same chokepoint idiom the daemon-spawn paths use (): a
+        # test that did not ASK for this lane must never shell out to the
+        # real archiver, which writes to the PRODUCTION bucket. A test that
+        # wants it passes archive_cmd explicitly.
+        return {"verdict": "skipped-under-pytest"}
+    if archive_cmd is None:
+        archive_cmd = [sys.executable, str(SCRIPT_DIR / "transcript_archive.py"),
+                       "archive", "--json"]
+    try:
+        proc = subprocess.run(archive_cmd, capture_output=True, text=True,
+                              timeout=LANE_D_TIMEOUT, cwd=str(PROJECT_ROOT))
+    except subprocess.TimeoutExpired:
+        return {"verdict": "timeout", "timeout_s": LANE_D_TIMEOUT}
+    except Exception as exc:
+        return {"verdict": "spawn-error", "error": str(exc)[:200]}
+    try:
+        r = json.loads((proc.stdout or "").strip() or "{}")
+    except json.JSONDecodeError:
+        # rc is NOT the discriminator: the archiver exits 1 on partial failure
+        # and still prints a receipt, so an unparseable stdout is the only
+        # shape that leaves us with no measurement at all.
+        return {"verdict": "unparseable", "rc": proc.returncode,
+                "stderr": (proc.stderr or "").strip()[-400:],
+                "head": (proc.stdout or "")[:200]}
+    out = {k: r.get(k) for k in (
+        "destination", "machine", "live_files", "live_bytes", "archived_count",
+        "archived_bytes", "unchanged_skipped", "failed_count",
+        "newly_deleted_detected", "index_total_entries", "by_harness")}
+    out["failures"] = (r.get("failures") or [])[:10]
+    out["newly_deleted_sample"] = (r.get("newly_deleted_sample") or [])[:10]
+    out["verdict"] = "partial" if (r.get("failed_count") or 0) else "ok"
+    # A receipt exists ⇒ the attempt was MEASURED, so stamp even on partial.
+    if sp is None:
+        out["stamp"] = "unavailable"        # same exposure the tick itself has
+    else:
+        fresh = load_state(sp)
+        fresh["last_transcript_archive"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+        save_state(sp, fresh)
+    return out
+
+def run_lane_e(cfg: dict, state_path: Path | None = None,
+               check_cmd: list[str] | None = None,
+               now: _dt.datetime | None = None) -> dict:
+    """Mind-seed publish-key freshness — a SILENCE detector. Never raises.
+
+    WHY IT LIVES HERE (g-357-104). The Claude-Mind publish lane alerts only on
+    a FAILED run, so it cannot fire when NO RUN HAPPENS — and that is the
+    failure that occurred: the lane was deleted 2026-08-23, main took 100
+    commits with zero publishes, and every live customer environment froze on
+    the 2026-08-22 artifact for ~12 days with no alert at any point. A human
+    reading a code comment found it. The orphan-sweep CAUSE is fixed; the
+    DETECTION gap was not, and a disabled workflow, revoked OIDC trust, a
+    stale paths: filter or a branch rename all reproduce it identically.
+
+    The detector itself already existed as a verified script with an exit-code
+    contract and had no caller — which is exactly what guard-3570 / rb-4335
+    mean when they say authoring knowledge does not install it. This is the
+    caller.
+
+    NOT A NEW RECURRING GOAL, deliberately: operator-offload-gate (gh-005)
+    refuses one for work that is deterministic + clocked + checkable, and this
+    is all three. A lane on an existing interval-gated sweep costs no
+    per-cycle LLM iteration, so the gate never fires and nothing is overridden
+    to get past it. The goal's own wording allows it: "a recurring goal OR AN
+    EXISTING SWEEP". An Ayoai-Operator scheduled job stays the better END
+    state (token cost scales with EVENTS, not frequency); this is the smallest
+    thing that closes the detection gap now.
+
+    PER-BOX AND REDUNDANT ON PURPOSE. The publish key is one GLOBAL artifact,
+    so N boxes checking it is N times the work for one fact — but the work is
+    a single object-head per box per day, and the redundancy is a FEATURE for
+    a detector: if one box's credentials break, the others still see the
+    freeze. A fleet-wide-once design would put the detector behind the same
+    single point of failure it is watching.
+
+    NOT GATED BY `shadow` — same reasoning as lane D. `shadow` arms DELETERS;
+    this lane reads one object's timestamp and removes nothing, so a lane E
+    behind it would be inert on every box, which is a detector that never
+    runs. Its off-switch is its own interval key set to 0.
+
+    rc=3 (unreachable) IS NOT rc=1 (STALE) and must never be folded into it:
+    an unreadable probe is ZERO signals, not one (verify-before-assuming rule
+    4), so collapsing them would report a customer-facing freeze on every
+    credentials or network blip. Only rc=1 is an alert; rc=3 is recorded and
+    warned, and deliberately does NOT stamp so the next tick retries instead
+    of waiting out the full interval.
+    """
+    interval = float(cfg.get("mind_seed_freshness_interval_hours") or 0)
+    if interval <= 0:
+        return {"verdict": "disabled"}
+    sp = state_path if state_path is not None else _state_path()
+    st = load_state(sp)
+    now = now or _dt.datetime.now()
+    last = st.get("last_mind_seed_freshness")
+    if last:
+        parsed = parse_naive_iso(str(last))
+        if parsed is not None and (now - parsed).total_seconds() < interval * 3600:
+            return {"verdict": "not-due", "last": last,
+                    "interval_hours": interval}
+    if check_cmd is None and os.environ.get("PYTEST_CURRENT_TEST"):
+        # Same chokepoint idiom as lane D (): a test that did not ASK
+        # for this lane must never shell out to the real check, which makes a
+        # live AWS call. A test that wants it passes check_cmd explicitly.
+        return {"verdict": "skipped-under-pytest"}
+    if check_cmd is None:
+        # WORLD_DIR from _paths, NEVER os.environ["WORLD_PATH"]: that var is set
+        # by _paths.sh for SHELL callers and is absent in a Python child, so
+        # reading it returned "no-world-path" on a healthy box (measured before
+        # this line existed — the unit tests never caught it because they inject
+        # check_cmd and skip this branch entirely). Re-implementing the
+        # env/conf/fallback chain inline is also what path-resolution.md
+        # forbids; _paths owns it, and this module already imports it.
+        if not WORLD_DIR:
+            # world/ is an EXTERNAL path; a bare relative "world/scripts/..."
+            # dies rc=127 in a way that reads exactly like a dead backend
+            # (probe-with-canonical-code-path.md), so refuse to guess.
+            return {"verdict": "no-world-path"}
+        script = Path(WORLD_DIR) / "scripts" / "mind-seed-freshness-check.sh"
+        if not script.exists():
+            return {"verdict": "detector-absent", "expected": str(script)}
+        from _runtime_bash import bash_cmd                  # guard-580
+        check_cmd = bash_cmd(str(script), "--json")
+    try:
+        proc = subprocess.run(check_cmd, capture_output=True, text=True,
+                              timeout=LANE_E_TIMEOUT, cwd=str(PROJECT_ROOT))
+    except subprocess.TimeoutExpired:
+        return {"verdict": "timeout", "timeout_s": LANE_E_TIMEOUT}
+    except Exception as exc:
+        return {"verdict": "spawn-error", "error": str(exc)[:200]}
+    try:
+        r = json.loads((proc.stdout or "").strip() or "{}")
+    except json.JSONDecodeError:
+        return {"verdict": "unparseable", "rc": proc.returncode,
+                "stderr": (proc.stderr or "").strip()[-400:],
+                "head": (proc.stdout or "")[:200]}
+    out = {k: r.get(k) for k in (
+        "age_hours", "threshold_hours", "last_modified", "bucket", "key")}
+    out["rc"] = proc.returncode
+    # The SCRIPT's exit code is the contract, not its verdict string — the
+    # string is for humans and the code is what this lane branches on.
+    if proc.returncode == 0:
+        out["verdict"] = "ok"
+    elif proc.returncode == 1:
+        out["verdict"] = "stale"
+    elif proc.returncode == 3:
+        out["verdict"] = "unreachable"
+    else:
+        out["verdict"] = "unknown-rc"
+    if sp is not None and out["verdict"] in ("ok", "stale"):
+        # Stamp only on a MEASURED answer. unreachable/timeout/spawn-error left
+        # unstamped so the next tick retries rather than waiting the interval.
+        fresh = load_state(sp)
+        fresh["last_mind_seed_freshness"] = now.strftime("%Y-%m-%dT%H:%M:%S")
+        save_state(sp, fresh)
+    elif sp is None:
+        out["stamp"] = "unavailable"        # same exposure the tick itself has
+    return out
+
+
 # ── record + Investigate ────────────────────────────────────────────────────
 
 def _log_path() -> Path:
@@ -517,13 +728,16 @@ def file_investigate(reason: str, detail: str) -> dict:
 def do_run(cfg: dict, source: str, investigate_fn=None,
            purge_cmd: list[str] | None = None,
            scratch_root: Path | None = None,
-           log_path: Path | None = None) -> dict:
+           log_path: Path | None = None,
+           archive_cmd: list[str] | None = None) -> dict:
     """Execute the lanes synchronously and append one record."""
     shadow = bool(cfg.get("shadow", True))
     started = time.time()
     lane_a = run_lane_a(shadow, purge_cmd=purge_cmd)
     lane_b = run_lane_b(shadow, cfg, scratch_root=scratch_root)
     lane_c = run_lane_c()
+    lane_d = run_lane_d(cfg, archive_cmd=archive_cmd)
+    lane_e = run_lane_e(cfg)
     verdict = lane_a.get("verdict") or "ok"
     record = {
         "ts": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
@@ -534,14 +748,66 @@ def do_run(cfg: dict, source: str, investigate_fn=None,
         "lane_a": lane_a,
         "lane_b": lane_b,
         "lane_c": lane_c,
+        "lane_d": lane_d,
+        "lane_e": lane_e,
         "duration_s": round(time.time() - started, 2),
     }
+    if lane_d.get("verdict") in ("spawn-error", "timeout", "unparseable"):
+        # Reported on its own channel, NOT folded into the top-level verdict:
+        # that field drives lane A's WARN + Investigate path, whose message
+        # names lane A specifically.
+        #
+        # The verdict tuple is EXHAUSTIVE against run_lane_d's failure returns
+        # and must be re-derived, never guessed, if that function grows a new
+        # one: this hunk arrived from a carrier ref testing ("error", "failed",
+        # "partial") — none of which run_lane_d emits — so it merged clean,
+        # compiled clean, passed tests, and was INERT (, sig-29).
+        print(f"[housekeeping-tick] lane D verdict={lane_d.get('verdict')} — "
+              f"transcripts NOT fully archived this tick "
+              f"({lane_d.get('error') or lane_d.get('failed_count')})",
+              file=sys.stderr)
     if verdict != "ok":
         print(f"[housekeeping-tick] WARN — lane A verdict={verdict}; this run "
               f"is UNMEASURED, not clean", file=sys.stderr)
         if not shadow:
             fi = investigate_fn if investigate_fn is not None else file_investigate
             record["investigate"] = fi(verdict, json.dumps(lane_a)[:400])
+    if lane_d.get("verdict") not in ("ok", "not-due", "disabled",
+                                    "skipped-under-pytest"):
+        print(f"[housekeeping-tick] WARN — lane D verdict="
+              f"{lane_d.get('verdict')}; transcripts NOT archived this run",
+              file=sys.stderr)
+    # Lane E, on its OWN channel and NOT folded into the top-level verdict —
+    # that field drives lane A's WARN + Investigate path, whose message names
+    # lane A specifically. Two branches, because the whole point of the lane is
+    # that they are different findings:
+    #   stale  = a MEASURED customer-facing freeze -> Investigate (armed only)
+    #   others = the probe could not answer -> WARN, no Investigate. Filing on
+    #            an unreadable probe would file on every creds/network blip.
+    lane_e_verdict = lane_e.get("verdict")
+    if lane_e_verdict == "stale":
+        print(f"[housekeeping-tick] WARN — lane E: mind-seed publish key is "
+              f"STALE (age_hours={lane_e.get('age_hours')}, threshold="
+              f"{lane_e.get('threshold_hours')}). Live customer environments "
+              f"may be frozen on an old artifact and the publish lane's own "
+              f"failure alert CANNOT fire on silence.", file=sys.stderr)
+        if not shadow:
+            # KNOWN AND ACCEPTED: file_investigate dedups on the single shared
+            # ORIGIN_SIGNAL over 48h, so a lane-A Investigate filed in that
+            # window SUPPRESSES this one (and vice versa). Not silently lost —
+            # the stderr WARN above is ungated and the `lane_e` block is in
+            # every log record, which are the durable surfaces. Splitting the
+            # origin signal would change lane A's dedup semantics too, which is
+            # outside this goal; stated here so a reader finds it rather than
+            # rediscovering it from a missing goal.
+            fi = investigate_fn if investigate_fn is not None else file_investigate
+            record["investigate_lane_e"] = fi(
+                "mind-seed-publish-stale", json.dumps(lane_e)[:400])
+    elif lane_e_verdict not in ("ok", "not-due", "disabled",
+                                "skipped-under-pytest"):
+        print(f"[housekeeping-tick] WARN — lane E verdict={lane_e_verdict}; "
+              f"mind-seed freshness UNMEASURED this run (not a clean result)",
+              file=sys.stderr)
     append_record(record, log_path=log_path)
     return record
 

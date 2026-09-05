@@ -44,6 +44,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/_platform.sh"
 
+# _platform.sh converts REPO_ROOT/PROJECT_ROOT/CORE_ROOT/etc but NOT SCRIPT_DIR,
+# which pwd set in MSYS /c/... form. The call below hands SCRIPT_DIR to the
+# interpreter as the SCRIPT PATH, and _platform.sh exports MSYS_NO_PATHCONV=1 so
+# MSYS will not rewrite argv either -- Windows Python then reports
+# "cannot open file 'C:\c\...'" and this gate emits reason=wrapper-error with
+# claims_checked=0 at rc=0: a clean-looking zero from a check that never ran.
+# Callee-side normalization (rb-168) cannot reach this case -- the interpreter
+# fails before any Python executes. Same guard as recurring-close.sh; a no-op
+# off Windows.
+if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
+  SCRIPT_DIR="$(cygpath -m "$SCRIPT_DIR")"
+fi
+
 py -3 "$SCRIPT_DIR/shipped-claim-store-check.py" "$@"
 rc=$?
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then

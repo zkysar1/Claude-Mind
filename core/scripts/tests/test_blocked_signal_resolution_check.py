@@ -958,3 +958,111 @@ def test_scan_window_covers_the_whole_cooldown_with_margin():
     assert mod._routing_window_str(24.0) == "25h"
     assert mod._routing_window_str(0.5) == "2h"
     assert mod._routing_window_str(23.1) == "25h"
+
+
+# ── Cross-deployment referents are NOT dangling () ──────────────────
+#
+# Cross-world report from ZDS (omni@zds-mind): a blocker_ref naming a referent
+# homed in a SIBLING deployment resolves to nothing locally -- correctly, and
+# forever -- and was labelled `dangling_ref`, whose guidance said "repoint or
+# remove the reference". Measured twice the same day on live HIGH goals (refs to
+#  and , both status=pending in their home world). Following
+# that advice destroys a valid cross-world dependency.
+#
+# The external_id branch already had a correct cross-world path, but it keyed on
+# `":" in ext_s`. The framework's own addressing convention emits
+# '<goal-id>@<env-id>' (cross-deployment-channel.md: every env-id contains a
+# hyphen, so '@' is the only parseable separator), which carries no colon and
+# fell through to the `g-` spelling test.
+#
+# THE ASYMMETRY THESE TESTS PIN: over-matching merely downgrades a verdict to
+# "this reader cannot see the referent"; under-matching tells an agent to delete
+# a live blocker. So the no-loss-of-detection cases below are as load-bearing as
+# the fix cases -- a fix that silenced the whole dangling bucket would pass the
+# first group and fail the second.
+
+_XW_LIVE_A = "g-115-4173@zds-mind"   # the first measured live case
+_XW_LIVE_B = "g-115-8370@zds-mind"   # the second
+
+
+def test_cross_world_ref_normalises_both_spellings():
+    """Truthiness is the 'homed elsewhere?' test; the value is the shape
+    `external_resolver` documents itself as taking."""
+    mod = _import()
+    assert mod._cross_world_ref(_XW_LIVE_A) == "zds-mind:g-115-4173"
+    assert mod._cross_world_ref("zds-mind:g-115-4173") == "zds-mind:g-115-4173"
+
+
+def test_cross_world_ref_rejects_local_and_malformed_ids():
+    """A local-home id must stay falsy or the dangling bucket empties. The
+    half-formed '@' shapes are here because rpartition happily returns an empty
+    side, and an empty world would normalise to a ':'-prefixed nonsense id."""
+    mod = _import()
+    for rid in ("g-404-99", "pq-x", "some-external-thing", "", None,
+                "@zds-mind", "g-1@"):
+        assert mod._cross_world_ref(rid) is None, rid
+
+
+def test_board_prefix_beats_the_colon_test():
+    """Board ids legitimately contain ':' — misrouting them into the
+    cross-world branch would strip the classification _classify_ref gives
+    them."""
+    mod = _import()
+    assert mod._cross_world_ref("coordination:msg-20260725-085534-foxtrot-5196") is None
+    assert mod._classify_ref("coordination:msg-1", {}, {})[2] == "board"
+
+
+def test_at_form_external_id_is_not_dangling():
+    """THE REPORTED DEFECT. Pre-fix both of these returned `dangling_ref`."""
+    for ext in (_XW_LIVE_A, _XW_LIVE_B):
+        e = _classify(_goal(blocker_ref={"type": "partner-response",
+                                         "external_id": ext}))
+        assert e["verdict"] != "dangling_ref", ext
+        assert e["verdict"] == "undecidable", e["verdict"]
+
+
+def test_at_form_external_id_reports_external_unresolvable_basis():
+    """NOT 'opaque'. Opaque means 'a shape this reader does not understand';
+    this shape IS understood and merely unreachable — folding them together
+    makes a real operational population uncountable."""
+    mod = _import()
+    _resolved, _why, basis = mod._resolve_blocker_ref(
+        "dict", {"type": "partner-response", "external_id": _XW_LIVE_A}, None,
+        {}, {}, NOW)
+    assert basis == "external_unresolvable", basis
+
+
+def test_at_form_blocked_by_is_still_blocked_not_dangling():
+    """Same predicate, one rung up the ladder. It must stay UNRESOLVED — the
+    referent's state is unknown here, which is 'still blocked', not 'cleared'
+    and not 'dangling'."""
+    e = _classify(_goal(blocked_by=[_XW_LIVE_A]))
+    assert e["verdict"] == "still_blocked", e["verdict"]
+    assert e["blocked_by_status"] == {_XW_LIVE_A: "NOT-FOUND"}
+
+
+def test_injected_resolver_receives_the_canonical_colon_form():
+    """The resolver's docstring names '<world>:<goal-id>'; the '@' spelling is
+    normalised rather than handed over in a shape its contract does not name."""
+    mod = _import()
+    seen = []
+
+    def resolver(ref_id):
+        seen.append(ref_id)
+        return "completed"
+
+    resolved, _why, basis = mod._resolve_blocker_ref(
+        "dict", {"type": "partner-response", "external_id": _XW_LIVE_A}, None,
+        {}, {}, NOW, external_resolver=resolver)
+    assert seen == ["zds-mind:g-115-4173"], seen
+    assert resolved is True and basis == "referent_terminal_external", basis
+
+
+def test_no_loss_of_detection_for_local_home_referents():
+    """OUTCOME 4. A referent whose home IS this world stays dangling — absent
+    here means absent. A fix that emptied the bucket would pass every test
+    above and fail this one."""
+    assert _classify(_goal(blocked_by=["g-404-99"]))["verdict"] == "dangling_ref"
+    assert _classify(_goal(blocker_ref="g-404-99"))["verdict"] == "dangling_ref"
+    assert _classify_bsrc(_goal(blocker_ref="pq-nope"),
+                          pq_complete=True)["verdict"] == "dangling_ref"

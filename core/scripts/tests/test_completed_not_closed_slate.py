@@ -577,3 +577,49 @@ def test_prior_keyed_is_sampled_before_the_write_not_after(tmp_path, monkeypatch
         "this hold must itself be content-keyed — otherwise the test proves nothing")
     assert "NO prior hold" in out, (
         "the freshly-written digest must NOT count as a prior one")
+
+
+def test_undrainable_rows_are_disclosed_beside_the_denominator_not_filtered_out():
+    """. A row with neither claimed_by nor executed_by is offered to
+    NOBODY — the lane is holder-scoped and it has no holder to scope to — so it
+    sits in `fleet_noted` forever while no drainer can ever be handed it.
+    Measured on the live fleet 2026-09-03: 20 of 61, i.e. a third of the lane's
+    headline was a backlog figure nobody could act on.
+
+    The fix is DISCLOSURE, not exclusion (guard-2529 / guard-2273: a count whose
+    predicate would exclude rows must name what it excluded as its own figure,
+    beside the denominator). The subtraction assertion below is the load-bearing
+    one: it fails if a future author "fixes" this by dropping the rows from
+    `is_drain_candidate`, which would make the headline honest by making a real
+    20-row class invisible — the trade this test exists to refuse.
+    """
+    m = _load()
+    rows = [
+        _row("g-9-01"),                             # claimed -> alpha
+        _released("g-9-02", executed_by="bravo"),   # released but attributed
+        _released("g-9-03", executed_by=None),      # nobody to offer it to
+        _released("g-9-04", executed_by=None),      # ditto
+        _released("g-9-05", executed_by=None, note=""),   # no note: not in the population at all
+        _released("g-9-06", executed_by=None, defer="precondition_unmet: x"),  # defer lane owns it
+    ]
+    out = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW)
+    pop = out["population"]
+
+    # Counted by the property (neither field), not by a hardcoded row list.
+    expected = [r["id"] for r in rows
+                if m.is_drain_candidate(r) and m.holder_of(r) == m._UNATTRIBUTED]
+    assert pop["fleet_undrainable"] == len(expected) == 2
+    assert pop["fleet_undrainable_goal_ids"] == sorted(expected) == ["g-9-03", "g-9-04"]
+
+    # DISCLOSED, NOT SUBTRACTED — the undrainable rows are still inside fleet_noted.
+    assert pop["fleet_noted"] == 4                       # 01, 02, 03, 04
+    assert pop["fleet_undrainable"] < pop["fleet_noted"]
+    assert pop["by_holder"][m._UNATTRIBUTED]["noted"] == pop["fleet_undrainable"]
+
+    # An attributed row is never counted as undrainable, however it was attributed.
+    assert "g-9-01" not in pop["fleet_undrainable_goal_ids"]
+    assert "g-9-02" not in pop["fleet_undrainable_goal_ids"]
+
+    # A row outside the population cannot be undrainable, even with no holder.
+    assert "g-9-05" not in pop["fleet_undrainable_goal_ids"]
+    assert "g-9-06" not in pop["fleet_undrainable_goal_ids"]

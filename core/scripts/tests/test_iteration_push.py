@@ -1776,3 +1776,93 @@ def test_ordinary_dirty_defer_still_gets_the_clear_it_hint(tmp_path):
     assert "and clear it" in alarm, alarm
     assert "SANCTIONED PROCEDURE" not in alarm, \
         f"durable hint leaked onto an ordinary dirty defer: {alarm}"
+
+
+# --------------------------------------------------------------------------- #
+# tree-lock: publish-only degrade ()
+# --------------------------------------------------------------------------- #
+# A held tree lock used to end the WHOLE invocation, --push-worker-ref included, which
+# made guard-5291's same-iteration SKILL.md publication unsatisfiable for as long as a
+# co-resident suite held the lock. The fix hoists ONE safe action above the gate.
+#
+# WHAT THESE TESTS PIN, and why it is two tests and not one: the flag is NOT safe by
+# nature. In its production arg shape --push-worker-ref runs fetch+integrate and MOVES
+# HEAD, so exempting it wholesale would let a worker merge into a tree whose co-resident
+# Body is mid-suite. The degrade is what makes it safe, so BOTH halves are asserted --
+# the push happens AND the tree does not move -- and the merge modes are asserted still
+# refused. A test that only checked "the push happened" would pass on the unsafe fix.
+LOCK_SH = CORE_SCRIPTS / "tree-lock.sh"
+
+
+def _lock_as_peer(project_root: Path, sid: str = "peer-body-sid"):
+    env = dict(os.environ, MIND_SID=sid)
+    env.pop("BODY_WM_PATH", None)
+    return subprocess.run(
+        [BASH, str(LOCK_SH), "acquire", "--project-root", str(project_root),
+         "--reason", "peer suite running", "--ttl", "600"],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+
+def _unlock_as_peer(project_root: Path, sid: str = "peer-body-sid"):
+    env = dict(os.environ, MIND_SID=sid)
+    env.pop("BODY_WM_PATH", None)
+    return subprocess.run(
+        [BASH, str(LOCK_SH), "release", "--project-root", str(project_root)],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+
+def _run_push_as(repo: Path, agent: str, sid: str, *flags: str):
+    env = dict(os.environ, MIND_AGENT=agent, MIND_SID=sid)
+    env.pop("BODY_WM_PATH", None)   # guard-3375: never let a test resolve a live Body WM
+    return subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(repo), *flags],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+
+
+def test_held_lock_still_publishes_worker_carrier_ref(tmp_path):
+    """A peer lock must NOT starve the carrier push (outcome 0)."""
+    origin, a, b = _clone_pair(tmp_path)
+    # give origin a commit `a` lacks, so an integrate WOULD move HEAD if it ran
+    _commit_file(b, "upstream.txt", "up\n", "upstream commit")
+    _must(b, "push", "-q", "origin", "main")
+
+    before = _tip(a)
+    assert _lock_as_peer(a).returncode == 0
+    try:
+        r = _run_push_as(a, "alpha", "unit-sid", "--push-worker-ref",
+                         "--fetch-interval-min", "0")
+        out = r.stdout + r.stderr
+        assert "DEGRADING --push-worker-ref to PUBLISH-ONLY" in out, out
+        assert "--push-worker-ref: pushed HEAD" in out, out
+        assert "skip, retry next iteration" not in out, out
+        # the ref must exist on the REMOTE (guard-1250: ls-remote, never rev-parse)
+        ls = _must(a, "ls-remote", "origin", "refs/workers/alpha/unit-sid")
+        assert ls.split()[0] == before, f"carrier ref != pre-run HEAD: {ls}"
+        # and the tree must NOT have moved -- this is the half that makes it safe
+        assert _tip(a) == before, "publish-only degrade moved HEAD (tree-moved hazard)"
+        assert "integrating" not in out, out
+    finally:
+        _unlock_as_peer(a)
+
+
+def test_held_lock_still_refuses_every_merge_mode(tmp_path):
+    """The gate keeps its breadth for anything that touches the tree (outcome 1)."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "upstream.txt", "up\n", "upstream commit")
+    _must(b, "push", "-q", "origin", "main")
+
+    before = _tip(a)
+    assert _lock_as_peer(a).returncode == 0
+    try:
+        for flags in ([], ["--no-push"], ["--strict"]):
+            r = _run_push_as(a, "alpha", "unit-sid",
+                             *flags, "--fetch-interval-min", "0")
+            out = r.stdout + r.stderr
+            assert "skip, retry next iteration" in out, (flags, out)
+            assert "DEGRADING" not in out, (flags, out)
+            assert _tip(a) == before, f"{flags} merged under a peer lock"
+    finally:
+        _unlock_as_peer(a)

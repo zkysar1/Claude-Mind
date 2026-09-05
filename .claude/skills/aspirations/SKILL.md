@@ -595,7 +595,23 @@ IF stdout contains "=== DRY-IDLE CACHE HIT ===":
     # a background job (type dry-idle-sleep) so stop-hook Gate 2.6 ALLOWs the
     # turn-end. This mirrors the quiescence cache's terminal contract exactly.
     Emit the directive's single `Bash(... interruptible-sleep.sh {sleep_seconds}, run_in_background=true)` call. RETURN.
-# ELSE: cache MISS (empty stdout) — fall through to idle-tick.sh below.
+# ELSE: cache MISS (empty stdout) — fall through to the dry-spin guard below.
+
+# Phase -0.5e.0c: Dry-Spin Guard — narrated-yield backstop (g-357-88)
+# Every fast path above CONSUMES state the previous cycle must have WRITTEN, so a
+# cycle that routed all_blocked and then narrated B6.5/B7/B7.2 without running
+# them is invisible here and the loop reloads the ~75-min handler back to back
+# (measured, coach 2026-09-03 02:10Z). This fires only on the script-written
+# last_all_blocked marker plus three independent absences (no blocked_sleep_until,
+# no registered sleep job, no diary row after the route). Fails open to a MISS.
+# Rationale: core/config/rationale/dry-spin-guard.md
+Bash: py -3 core/scripts/dry-spin-guard.py check
+IF stdout contains "=== DRY-SPIN GUARD ===":
+    # Same terminal contract as the two caches above: emit ONLY the directive's
+    # single Bash(... DRY_SLEEP=1 ... interruptible-sleep.sh, run_in_background=true)
+    # call and RETURN. Do NOT load the all-blocked handler, do NOT run selection.
+    Emit the directive's single `Bash(... interruptible-sleep.sh {sleep_seconds}, run_in_background=true)` call. RETURN.
+# ELSE: MISS (empty stdout) — fall through to idle-tick.sh below.
 
 # Phase -0.5e: Blocked-Sleep Recovery — cheap-path sentinel + gated digest load.
 # DO NOT inline the digest here. Loading it every iteration (vs. only when a

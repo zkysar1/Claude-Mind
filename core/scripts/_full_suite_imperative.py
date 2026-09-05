@@ -50,6 +50,17 @@ _WRAPPERS = frozenset(
 _FRAMEWORK_HEAD_RE = re.compile(
     r"^(?:[\w./\\-]*[/\\])?(?:run-full-suite(?:\.sh|\.py)?|pytest)$"
 )
+
+# The EXPENSIVE form specifically. _FRAMEWORK_HEAD_RE deliberately lumps a
+# 3-second `pytest test_one.py` together with a 3-5 HOUR full-suite launch.
+# That is RIGHT for the imperative above -- both need the VERDICT-line and
+# never-pipe discipline -- and WRONG for a consultation trigger: asking for two
+# retrieval queries before every targeted pytest is how you train a reader to
+# skip the whole banner. So the consult below is gated on the runner itself,
+# where hours are at stake and the trigger fires rarely.
+_FULL_SUITE_HEAD_RE = re.compile(
+    r"^(?:[\w./\\-]*[/\\])?run-full-suite(?:\.sh|\.py)?$"
+)
 _PYTHON_HEAD_RE = re.compile(r"^(?:[\w./\\-]*[/\\])?(?:python3?(?:\.exe)?|py)$")
 _GRADLE_HEAD_RE = re.compile(r"^(?:[\w./\\-]*[/\\])?gradlew(?:\.bat)?$")
 
@@ -85,7 +96,24 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
    counts, and so does your own loop's turn-end iteration-push merge. The tree
    lock does NOT cover you -- it returns 0 for your own sid, and a BACKGROUNDED
    run inherits no MIND_SID at all so it takes no lock while still printing
-   authoritative-looking chunk counts. Remedy: `git worktree add --detach
+   authoritative-looking chunk counts. FIRST, THOUGH: IF THIS BOX HAS A LIVE
+   mind_api DAEMON, DO NOT PIN A WORKTREE AT ALL (guard-5866) -- it is worse
+   than the contention it avoids. The worktree spawns its OWN daemon, and
+   mind-api-start.sh _sweep_orphan_daemons matches mind_api.src processes by
+   COMMAND LINE with ZERO runtime-dir scoping, so its spawn-time sweep KILLS
+   the fleet's live daemon (every agent on the box loses it, once per chunk
+   gap). The copied daemon.port then goes stale on that recycle and every
+   daemon-backed test fails `REFUSED: recycle/spawn requested from inside
+   pytest` -- a large authoritative-looking count that is PURE ENVIRONMENT.
+   Measured as a one-variable pre-registered control (bravo cc-05 2026-09-03:
+   3 daemon kills + 12 stale-port errors in the worktree vs 0 and 0 for the
+   SAME suite/commit/box in the main repo); reproduced alpha cc-04 2026-09-04,
+   22 failures across 8 files, every one of them environment. Copying the port
+   does NOT fix this and a symlink does not either -- the kill is the defect,
+   the stale port is only its most visible symptom. Use the daemon-safe
+   MAIN-REPO route: STORAGE_BACKEND=local, chunked, `-m 'not
+   daemon_integration'`, and simply do not commit while it runs.
+   OTHERWISE (no live daemon on this box), remedy: `git worktree add --detach
    /tmp/<name> <sha>`. FIRST copy BOTH gitignored runtime files INTO the
    worktree -- `cp agents/<you>/local-paths.conf` AND `cp
    mind_api/state/daemon.port` (mkdir -p its dir first) -- then run the suite
@@ -119,6 +147,29 @@ On an own-cloud box `STORAGE_BACKEND=local` is MANDATORY for any test runner,
 including bash aggregators and direct `python3 test_*.py` (guard-955): a
 tmp-world write otherwise collides on the PRODUCTION S3 key. And a targeted run
 is never sufficient for a deep-code closure claim."""
+
+FULL_SUITE_CONSULT = """\
+THIS IS THE EXPENSIVE FORM (3-5h). CONSULT THE LIVE STORE BEFORE YOU LAUNCH.
+
+Everything above is STATIC TEXT baked into core/scripts/_full_suite_imperative.py.
+It carries only what someone hand-added to it, so a guardrail measured YESTERDAY
+is not in it yet -- the text cannot tell you what it is missing, and it looks
+equally authoritative either way. Two retrieval queries close that gap, because
+retrieve.sh reads the store as it is right now. Run BOTH (subject, then
+mechanism -- code-review-protocol.md step 4; a subject query systematically
+misses guardrails indexed on the METHOD):
+
+  bash core/scripts/retrieve.sh --category "running the full test suite on this box" --depth shallow --include-framework
+  bash core/scripts/retrieve.sh --category "<the METHOD you are about to use: pinned worktree / background / chunked / solo>" --depth shallow --include-framework
+
+Read the hits before launching, not after triaging. --include-framework is
+REQUIRED: without it the response carries no framework_rules key at all.
+
+MEASURED COST OF SKIPPING THIS (alpha, 2026-09-04): guard-5866 landed
+2026-09-03 and had not yet been hand-added above. A pinned-worktree launch on a
+box with a live daemon produced 111 failures, an unknown fraction manufactured
+by the METHOD rather than by the code. Three runs, ~8h of wall clock, no valid
+verdict -- and the second query above is the one that would have returned it."""
 
 GRADLE_IMPERATIVE = """\
 A gradle command is about to run (.claude/rules/run-full-suite-after-deep-code.md):
@@ -175,6 +226,8 @@ def matched_families(command):
     for head, rest in statement_heads(command):
         if _FRAMEWORK_HEAD_RE.match(head):
             found.add("framework")
+            if _FULL_SUITE_HEAD_RE.match(head):
+                found.add("full_suite")
         elif _PYTHON_HEAD_RE.match(head) and (
             # `python3 -m pytest ...`
             "pytest" in _module_target(rest)
@@ -184,15 +237,21 @@ def matched_families(command):
             or any(_FRAMEWORK_HEAD_RE.match(tok) for tok in rest)
         ):
             found.add("framework")
+            # Same interpreter form, but only when the RUNNER is the target --
+            # `python3 -m pytest core/scripts/tests` is not the expensive form.
+            if any(_FULL_SUITE_HEAD_RE.match(tok) for tok in rest):
+                found.add("full_suite")
         elif _GRADLE_HEAD_RE.match(head):
             found.add("gradle")
-    return [f for f in ("framework", "gradle") if f in found]
+    return [f for f in ("framework", "full_suite", "gradle") if f in found]
 
 
 def build_message(families):
     parts = []
     if "framework" in families:
         parts.append(FRAMEWORK_IMPERATIVE)
+    if "full_suite" in families:
+        parts.append(FULL_SUITE_CONSULT)
     if "gradle" in families:
         parts.append(GRADLE_IMPERATIVE)
     return "\n\n".join(parts)

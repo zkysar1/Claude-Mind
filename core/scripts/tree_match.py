@@ -217,6 +217,21 @@ def _provenance_weight(node):
 # Front matter parsing
 # ---------------------------------------------------------------------------
 
+def _yaml_loader():
+    """libyaml's CSafeLoader when the PyYAML wheel ships it, else SafeLoader.
+    Both drive the same SafeConstructor, so the parsed objects are identical —
+    only the scanner differs. Measured 2026-09-03 on the live 1.75 MB tree
+    index: 6.87 s -> 0.82 s (8.4x), output EQUAL; the front matter of 2,983
+    node files: 4.14 s -> 0.54 s, 0 differing. Those two parses were the whole
+    cold cost of a retrieval (a daemon request measured 24.4 s cold vs 4.3 s
+    warm, and under own-cloud the index goes cold on every box each time any
+    agent's counting retrieval rewrites it). Resolved per call, not at import,
+    so a box whose PyYAML lacks libyaml — or a test that removes it — falls
+    back transparently. yaml_cache.py (daemon) inlines the same expression.
+    """
+    return getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+
+
 def parse_front_matter(md_path):
     """Extract YAML front matter from a .md file. Returns dict or {}."""
     p = Path(md_path)
@@ -247,7 +262,7 @@ def parse_front_matter(md_path):
     if len(parts) < 3:
         return {}
     try:
-        fm = yaml.safe_load(parts[1])
+        fm = yaml.load(parts[1], Loader=_yaml_loader())
         return fm if isinstance(fm, dict) else {}
     except Exception:
         return {}

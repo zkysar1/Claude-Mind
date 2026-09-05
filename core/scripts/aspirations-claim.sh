@@ -173,7 +173,26 @@ if [ -z "$GOAL_ID" ]; then
     exit 1
 fi
 if [ -z "$AGENT" ]; then
-    echo "Error: agent_name is required (positional or via MIND_AGENT)." >&2
+    # NOT INTERCHANGEABLE — this message said "(positional or via MIND_AGENT)"
+    # until , which reads as EQUIVALENT and is why the cross-agent
+    # claim looked impossible for a month. They set DIFFERENT things:
+    #   MIND_AGENT  -> the X-Mind-Agent HEADER (_runtime.sh:881,905), which is
+    #                   what the daemon resolves the QUEUE from
+    #                   (_require_explicit_agent + _resolve_paths -> ctx.paths.agent),
+    #                   AND, only if no positional is given, the claimer below.
+    #   <agent-name> -> the `agent=` QUERY PARAM only, i.e. the CLAIMER identity
+    #                   that cross_lane_refused compares against intended_agent.
+    # So for a goal in a PEER's queue that is routed to YOU, pass BOTH:
+    #   MIND_AGENT=<owner> aspirations-claim.sh <goal-id> <self> --source agent
+    # Measured 2026-09-03 (echo, cc-03): same goal, env=alpha alone refuses
+    # "claimer is 'alpha'"; env=alpha + positional echo refuses "claimer is
+    # 'echo'" — the queue stayed alpha's, the claimer moved. See guard-3584.
+    echo "Error: agent_name is required." >&2
+    echo "  Give it as the POSITIONAL <agent-name> (sets the CLAIMER), or let it" >&2
+    echo "  default from MIND_AGENT. These are NOT equivalent: MIND_AGENT also" >&2
+    echo "  selects WHICH QUEUE the goal id resolves against (X-Mind-Agent header)." >&2
+    echo "  Cross-agent (goal in a peer queue, routed to you) needs BOTH:" >&2
+    echo "    MIND_AGENT=<owner> aspirations-claim.sh <goal-id> <self> --source agent" >&2
     exit 1
 fi
 
@@ -406,8 +425,37 @@ except Exception:
     MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/team-state-in-flight.sh" \
         --agent "$agent" --goal-id "$goal_id" \
         --title "${title:-$goal_id}" --phase 4 \
-        >/dev/null 2>&1 \
+        >/dev/null \
         || echo "[aspirations-claim] WARN: in_flight stamp failed for ${goal_id} (claim still succeeded)" >&2
+    # stdout dropped, stderr DELIBERATELY NOT -- the same split, for the same
+    # reason, as the checkpoint-init block ~25 lines above ().
+    # The `||` alone can never report this leg: EVERY non-reducer path of
+    # team-state-in-flight.sh ends `exit 0` (the reducer row is reducer-owned),
+    # so on a worker Body the WARN branch is unreachable BY DESIGN -- and
+    # `2>&1` then threw away the helper's own account of what it did. Three
+    # distinct messages were silenced, and only ONE of them is routine:
+    #   "SKIP stamp: non-reducer body ... in_flight is reducer-owned"  (routine)
+    #   "body row written: <agent>.in_flight_bodies.<sid> -> <goal>"   (the
+    #      worker's ONLY cross-Body visibility signal landing)
+    #   "WARN: body row write failed for <agent>/<sid>"                (that
+    #      write FAILING -- fail-open INSIDE this fail-open, so a worker's
+    #      entire cross-Body visibility could vanish with no signal on ANY
+    #      channel: rc 0, stdout empty, stderr discarded)
+    # That last shape is guard-114's rc=0-refusal case exactly, and it is worse
+    # than the absent signal the block comment above argues against, because
+    # the three named readers cannot tell it from "partner genuinely idle".
+    #
+    # WHAT THIS DOES NOT FIX, stated so the next reader does not assume it did.
+    # Measured 2026-09-03: all three readers named above now DO consume the
+    # body-keyed row ( / ) — aspirations-select/SKILL.md
+    # reads in_flight_bodies beside in_flight, goal-pickup-coordination-check
+    # :1882 folds body rows into its candidates, _cross_agent_attribution_filter
+    # :259 takes its Source-1 windows from them. So a worker Body is VISIBLE to
+    # them. What none of them can still distinguish is a body-row write that
+    # FAILED: the row is simply absent, byte-identical to "partner idle". This
+    # change moves that failure from invisible-everywhere to visible AT THE
+    # CLAIM; giving the consumers a distinguishing marker is a different change
+    # (and must not manufacture a row nothing can clear — guard-2166).
     # --- claim-time diary breadcrumb () --------------------------
     # FOURTH instance of the same fold as the three blocks above, and the only
     # one that closes a claim-LOSS path rather than a drift path.
@@ -466,6 +514,57 @@ except Exception:
         | MIND_AGENT="$agent" bash "$CORE_ROOT/scripts/execution-diary.sh" append \
             >/dev/null 2>&1 \
         || echo "[aspirations-claim] WARN: claim-time diary breadcrumb failed for ${goal_id} (claim still succeeded)" >&2
+
+    # ROLE RE-CHECK AT THE CLAIM BOUNDARY (). WORKER BODIES ONLY.
+    #
+    # The worker's select-time role gate (worker-loop Phase 1) judges the SCORED
+    # ROW, and on a worker that row's executable_by_role is null for EVERY
+    # candidate it can ever see: goal-selector sets
+    # `_skip_reducer_only = (_role != ROLE_REDUCER)` and drops reducer-only rows
+    # BEFORE emission, so that gate sits downstream of a filter which already
+    # removed everything it could catch. MEASURED 2026-09-05 (alpha, cc-13):
+    # 1859/1859 emitted rows carried the key, 1859 null, and 0 of the 42 live
+    # goals stamped `reducer` were in the pool (27 of them with no competing
+    # explanation, against a control where 88% of comparable goals WERE present).
+    # This response is therefore the ONLY surface on which a worker can observe
+    # the declaration -- and it IS carried here: verified same-day, a real claim
+    # response returned 25 keys vs 28 in the store record, the only three absent
+    # being the query wrapper's own asp_id/goal_id/source (ZERO goal fields
+    # dropped), which is the guard-4003 probe this check would be unsatisfiable
+    # without.
+    #
+    # What it closes is a narrow but OBSERVED TOCTOU: a peer write at
+    # 2026-09-05T02:38:25 stamped a goal `reducer` while it sat at RANK 1 in a
+    # worker's pool, scored under the older null.
+    #
+    # A BASH GATE, NOT A PROSE STEP (guard-399): an "the LLM must check X at step
+    # N" instruction has nothing that catches a skip, and worker-loop/SKILL.md is
+    # on the hot-path size budget besides. Placed with the other post-claim
+    # effects and ABOVE the `[ -z "$claimed_by" ]` early return, so it covers the
+    # agent queue too.
+    #
+    # BODY_WM_PATH is the worker discriminator, verified rather than assumed:
+    # bash-agent-inject.py injects it only for a bound session holding a forked
+    # body-WM-file, from INSIDE the sid-mismatch guard, so a reducer cannot reach
+    # it whatever its WM state. Unset on the reducer -> this block never runs.
+    #
+    # FAIL-OPEN like its siblings: only an explicit `reducer-only` warns. An
+    # unreadable response, a launcher fault, or an unrecognised value all stay
+    # silent -- the corpus is ~100% unstamped, so a fail-closed default here
+    # would shout on nearly every claim a worker legitimately makes.
+    # WARNS, does not release: unclaiming behind the caller's back would make a
+    # claim's success depend on a check the caller never asked for. The action is
+    # named in the message instead.
+    if [ -n "${BODY_WM_PATH:-}" ]; then
+        # shellcheck disable=SC2086  # rt_python_launcher is intentionally word-split
+        _role_verdict="$(printf '%s' "$response" \
+            | $(rt_python_launcher) "$CORE_ROOT/scripts/worker_execute.py" \
+                claim-role-recheck --claim-file - 2>/dev/null)" || true
+        if [ "${_role_verdict:-}" = "reducer-only" ]; then
+            echo "[aspirations-claim] ROLE REFUSAL: ${goal_id} declares executable_by_role='reducer' on the record you were just handed -- a WORKER must not execute it. It was stamped AFTER it was scored (the selector hides reducer rows from a worker, so Phase 1 saw null). RELEASE it and take the next candidate: bash core/scripts/aspirations-release.sh ${goal_id} --source \"\${SOURCE:-world}\". (g-306-449)" >&2
+        fi
+        unset _role_verdict
+    fi
     # Skip when the response carried no claimed_by. READ THE NEXT SENTENCE BEFORE
     # RELYING ON THIS: the guard no longer separates agent-queue from world-queue
     # claims. It was written when claim() answered agent-queue goals 400 and only

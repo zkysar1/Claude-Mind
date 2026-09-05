@@ -115,7 +115,11 @@ def test_mention_does_not_fire(command):
     ],
 )
 def test_repo_native_invocation_forms_fire(command):
-    assert matched_families(command) == ["framework"], command
+    # Every form in the list above IS the runner, so each must be recognised as
+    # the EXPENSIVE form too. Asserting the pair (rather than just membership)
+    # keeps this pinning both halves: drop the full_suite detection and this
+    # fails, rather than silently degrading to the old advisory-only behaviour.
+    assert matched_families(command) == ["framework", "full_suite"], command
 
 
 def test_both_families_in_one_command():
@@ -269,3 +273,87 @@ def test_hook_is_wired_into_settings():
 def test_wrapper_and_body_both_exist():
     assert GATE.is_file()
     assert (SCRIPT_DIR / "full-suite-imperative-gate.sh").is_file()
+
+
+# --------------------------------------------------------------------------
+# The EXPENSIVE-form consultation trigger (Layer 3, 2026-09-04)
+#
+# The advisory fires on every pytest invocation; the consult must fire ONLY on
+# the runner. The negative controls below are the load-bearing half -- without
+# them, a regression that emitted "full_suite" unconditionally would satisfy
+# every positive assertion in this file.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash core/scripts/run-full-suite.sh",
+        "bash core/scripts/run-full-suite.sh --chunks 24",
+        "sh core/scripts/run-full-suite.sh",
+        "py -3 core/scripts/run-full-suite.py --triage",
+        "python3 core/scripts/run-full-suite.py",
+        "STORAGE_BACKEND=local bash core/scripts/run-full-suite.sh",
+    ],
+)
+def test_runner_forms_are_flagged_expensive(command):
+    assert "full_suite" in matched_families(command), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pytest core/scripts/tests/test_one.py",
+        "pytest",
+        "python3 -m pytest core/scripts/tests",
+        "py -3 -m pytest core/scripts/tests/test_one.py -q",
+        "./gradlew test --no-daemon",
+    ],
+)
+def test_cheap_and_unrelated_forms_are_not_flagged_expensive(command):
+    """A targeted pytest is seconds, not hours. Asking for two retrieval
+    queries before each one is how a reader learns to skip the banner."""
+    assert "full_suite" not in matched_families(command), command
+
+
+def test_consult_text_only_accompanies_the_expensive_form():
+    expensive = build_message(matched_families("bash core/scripts/run-full-suite.sh"))
+    cheap = build_message(matched_families("pytest core/scripts/tests/test_one.py"))
+    assert "CONSULT THE LIVE STORE BEFORE YOU LAUNCH" in expensive
+    assert "CONSULT THE LIVE STORE BEFORE YOU LAUNCH" not in cheap
+    # The cheap form must still get the ordinary imperative -- this change adds
+    # a section, it does not gate the existing advisory behind the runner.
+    assert "VERDICT:" in cheap
+
+
+def test_consult_carries_two_runnable_queries_both_with_include_framework():
+    """The text asserts --include-framework is REQUIRED, so both emitted
+    commands must actually carry it (guard-355 / guard-5994: a check form that
+    was never run is a prediction). Two queries, not one: a subject-only query
+    systematically misses guardrails indexed on the mechanism."""
+    msg = build_message(["full_suite"])
+    queries = [
+        ln for ln in msg.splitlines()
+        if "retrieve.sh" in ln and "--category" in ln
+    ]
+    assert len(queries) == 2, queries
+    for q in queries:
+        assert "--include-framework" in q, q
+
+
+def test_consult_names_the_measured_incident_and_its_guardrail():
+    """The cost figure is what makes this readable rather than nagging. If a
+    later edit trims it to a bare instruction, this fails."""
+    msg = build_message(["full_suite"])
+    assert "guard-5866" in msg
+    assert "111" in msg
+
+
+def test_consult_follows_the_imperative_it_qualifies():
+    msg = build_message(matched_families("bash core/scripts/run-full-suite.sh"))
+    assert msg.index("VERDICT:") < msg.index("CONSULT THE LIVE STORE")
+
+
+def test_full_suite_alone_does_not_emit_the_gradle_section():
+    msg = build_message(["full_suite"])
+    assert "gradlew" not in msg

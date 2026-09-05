@@ -240,6 +240,42 @@ def is_worker_closure(goal: dict) -> bool:
     return (goal.get("completed_by_role") or "").strip().lower() == "worker"
 
 
+def self_verdict_of(goal: dict):
+    """The worker's OWN declared verdict, or None when it never recorded one.
+
+    g-306-417: until verify_verdict existed this module had nothing to compare
+    against, so its AGREE/DISAGREE measured whether the RECORD was internally
+    consistent -- not whether the auditor agreed with the WORKER. Reading the
+    field is what makes the module's stated job ("records agreement or
+    disagreement" on self-grading) literally true rather than aspirational.
+
+    None is the honest answer for every closure written before the field
+    landed, and it must NEVER be read as agreement (guard-963: an aggregator
+    must not report a clean verdict over zero compared items).
+    """
+    v = goal.get("verify_verdict")
+    if not isinstance(v, dict):
+        return None
+    verdict = v.get("verdict")
+    return verdict.strip().lower() if isinstance(verdict, str) and verdict.strip() else None
+
+
+def agreement_for(goal: dict, fired: list[dict]) -> str:
+    """agree | disagree | not_comparable -- the WORKER-vs-AUDITOR comparison.
+
+    Deliberately NOT a new check: a check would fire on all 202 pre-field
+    closures and flood the report (guard-3343 -- adding a check to a multi-check
+    reporter changes what its summary means). This is a per-row READING, so an
+    absent verdict costs nothing and is counted separately.
+    """
+    self_v = self_verdict_of(goal)
+    if self_v is None:
+        return "not_comparable"
+    if self_v == "completed" and any(f["confidence"] == "high" for f in fired):
+        return "disagree"
+    return "agree"
+
+
 def sampled(goal: dict, fraction: float) -> tuple[bool, str]:
     """Every HIGH, plus a deterministic fraction of the rest."""
     if (goal.get("priority") or "").strip().upper() == "HIGH":
@@ -323,6 +359,7 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     closures = [g for g in goals if is_worker_closure(g)]
     rows, counts = [], {"AGREE": 0, "DISAGREE": 0, "REVIEW": 0}
+    agree_counts = {"agree": 0, "disagree": 0, "not_comparable": 0}
     for g in closures:
         take, why = sampled(g, fraction)
         if not take:
@@ -330,6 +367,7 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
         fired = run_checks(g)
         v = verdict_for(fired)
         counts[v] += 1
+        agree_counts[agreement_for(g, fired)] += 1
         rows.append({
             "audited_at": now,
             "aspiration": asp_id,
@@ -341,6 +379,8 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
             "closed_by_sid": g.get("completed_by_sid"),
             "sample_reason": why,
             "verdict": v,
+            "self_verdict": self_verdict_of(g),
+            "agreement": agreement_for(g, fired),
             "checks_fired": fired,
             "reviewer": reviewer,
         })
@@ -351,6 +391,7 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
         "sampled": len(rows),
         "fraction": fraction,
         "counts": counts,
+        "agreement_counts": agree_counts,
         "rows": rows,
     }
 
@@ -399,7 +440,13 @@ def main() -> int:
     c = result["counts"]
     print(f"worker-closure-audit  asp={result['aspiration']}  "
           f"worker_closures={result['worker_closures']}  sampled={result['sampled']}")
-    print(f"  AGREE={c['AGREE']}  DISAGREE={c['DISAGREE']}  REVIEW={c['REVIEW']}")
+    print(f"  record-consistency: AGREE={c['AGREE']}  DISAGREE={c['DISAGREE']}  REVIEW={c['REVIEW']}")
+    a = result["agreement_counts"]
+    print(f"  worker-vs-auditor: agree={a['agree']}  disagree={a['disagree']}  "
+          f"not_comparable={a['not_comparable']} (no verify_verdict recorded)")
+    if a["agree"] == 0 and a["disagree"] == 0 and a["not_comparable"]:
+        print("  NOTE: ZERO closures carried a self-verdict, so NO agreement was "
+              "measured — this is not evidence of agreement (guard-963).")
     for r in result["rows"]:
         if r["verdict"] == "AGREE":
             continue

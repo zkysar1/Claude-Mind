@@ -293,8 +293,21 @@ def _in_flight(shard: Path):
 
 def _drive(tmp_path, claimed_by_sid=BODY_SID, mutate=None, closing=True,
            scrub_env=False, stop_requested=False, runner_file=True,
-           body_wm=True, body_state="active"):
-    """Run the whole chain once. `mutate` edits stop-hook.sh before the run."""
+           body_wm=True, body_state="active",
+           session_stop_requested=False, foreign_session_stop=False):
+    """Run the whole chain once. `mutate` edits stop-hook.sh before the run.
+
+    `session_stop_requested` writes the SESSION-SCOPED sessions/<BODY_SID>/
+    stop-requested that /stop Step 0.6 arms (g-115-7309). Deliberately a
+    separate knob from `stop_requested`, which writes the AGENT-WIDE file: they
+    are different objects with opposite blast radii, and the worker short-circuit
+    is forbidden to write the agent-wide one.
+
+    `foreign_session_stop` writes that same file under a DIFFERENT sid. It is the
+    negative control for the scoping — a stop typed on box A must leave box B's
+    worker fully netted — and without it a valve that ignored $HOOK_SID entirely
+    would pass every other test here.
+    """
     world = tmp_path / "world"
     world.mkdir()
     meta = tmp_path / "meta_hook"
@@ -308,6 +321,13 @@ def _drive(tmp_path, claimed_by_sid=BODY_SID, mutate=None, closing=True,
         # same path the worker-net tests directly.
         (root / "agents" / AGENT / "session" / "stop-requested").write_text(
             "", encoding="utf-8")
+    if session_stop_requested:
+        (root / "agents" / AGENT / "sessions" / BODY_SID
+         / "stop-requested").write_text("", encoding="utf-8")
+    if foreign_session_stop:
+        other = root / "agents" / AGENT / "sessions" / "some-other-body-sid"
+        other.mkdir(parents=True, exist_ok=True)
+        (other / "stop-requested").write_text("", encoding="utf-8")
     if mutate is not None:
         hook = root / "core" / "scripts" / "stop-hook.sh"
         hook.write_text(mutate(hook.read_text(encoding="utf-8")),
@@ -512,8 +532,103 @@ def test_worker_net_stands_down_on_stop_requested(tmp_path):
     assert not _blocked(proc), (
         "stop-requested was set and the worker net blocked anyway -- the user "
         f"cannot stop a worker.\nstdout:\n{proc.stdout}")
-    assert "gate=worker-net-stop-requested" in _hook_log(root), (
+    # TRAILING SPACE IS LOAD-BEARING (): the session-scoped valve's
+    # gate name `worker-net-stop-requested-session` CONTAINS this one as a
+    # prefix, so a bare substring test would pass on either valve and this test
+    # would stop discriminating the moment the sibling valve landed.
+    assert "gate=worker-net-stop-requested " in _hook_log(root), (
         f"the stand-down was not logged; log:\n{_hook_log(root)}")
+
+
+def test_worker_net_stands_down_on_session_scoped_stop_requested(tmp_path):
+    """A /stop typed on a WORKER box must be able to end its own turn.
+
+    THE DEFECT THIS PINS (guard-4900, fixed by g-115-7309): valve #2 read only
+    the AGENT-WIDE session/stop-requested, and /stop Step 0.6 is forbidden to
+    write it -- writing it would stop the REDUCER on another machine. So the one
+    actor that needed the valve was structurally barred from firing it, and every
+    worker /stop BLOCKed at turn-end. The only escape was hand-writing
+    body-closing, which DURABLY retires the Body.
+
+    Note the fixture sets NO agent-wide stop-requested, so a pass here cannot be
+    coming from the sibling valve.
+    """
+    proc, _shard, root = _drive(tmp_path, closing=False,
+                                session_stop_requested=True)
+    log = _hook_log(root)
+
+    assert proc.returncode == 0, f"hook must fail-open: {proc.stderr[-2000:]}"
+    assert not _blocked(proc), (
+        "a session-scoped stop was armed and the worker net blocked anyway -- "
+        f"the user still cannot stop this box.\nstdout:\n{proc.stdout}\nlog:\n{log}")
+    assert "gate=worker-net-stop-requested-session" in log, (
+        f"the stand-down was not logged as the session-scoped valve; log:\n{log}")
+
+
+def test_session_scoped_stop_does_not_retire_the_body(tmp_path):
+    """The whole point of the fix: stopping one box is not retiring the Body.
+
+    body-closing would ALSO clear the net, which is why it was the observed
+    workaround -- but it flips body_state to closed-pending-merge, after which
+    worker-loop Phase -0 refuses every further unit on that SID and only a
+    user-only /start reopens it. This asserts the cheaper signal does NOT do that.
+    """
+    proc, _shard, root = _drive(tmp_path, closing=False,
+                                session_stop_requested=True)
+    manifest = (root / "agents" / AGENT / "sessions" / BODY_SID
+                / "body-manifest.yaml").read_text(encoding="utf-8")
+
+    assert not _blocked(proc)
+    assert "body_state: 'active'" in manifest, (
+        "the session-scoped stop retired the Body -- it must only stand the net "
+        f"down, never close.\nmanifest:\n{manifest}")
+    assert not (root / "agents" / AGENT / "sessions" / BODY_SID
+                / "body-closing").exists(), (
+        "a body-closing sentinel appeared; the session-scoped path must not "
+        "invent one")
+
+
+def test_session_scoped_stop_does_not_leak_to_a_sibling_body(tmp_path):
+    """A stop typed on box A must leave box B's worker fully netted.
+
+    The negative control for `[ -n "$HOOK_SID" ] && [ -f .../$HOOK_SID/... ]`.
+    A valve that globbed sessions/*/stop-requested, or that ignored $HOOK_SID,
+    would pass every other test in this file and silently un-net every sibling
+    Body of the same agent -- which is the reducer-stopping blast radius the
+    short-circuit exists to prevent, reintroduced one directory down.
+    """
+    proc, _shard, root = _drive(tmp_path, closing=False,
+                                foreign_session_stop=True)
+    log = _hook_log(root)
+
+    assert proc.returncode == 0, f"hook must fail-open: {proc.stderr[-2000:]}"
+    assert _blocked(proc), (
+        "another Body's stop-requested stood this Body's net down -- the valve "
+        f"is not scoped to $HOOK_SID.\nstdout:\n{proc.stdout}\nlog:\n{log}")
+    assert "gate=worker-net-stop-requested-session" not in log, (
+        f"the session valve fired for a foreign sid; log:\n{log}")
+
+
+def test_mutation_removing_the_session_valve_turns_this_red(tmp_path):
+    """Mutation proof: the new elif IS the mechanism, not decoration.
+
+    Same discipline as test_mutation_neutralizing_the_worker_net_turns_this_red
+    -- without this, a rename or an accidental deletion would leave the three
+    tests above passing against whatever ELSE happens to ALLOW (rb-5146: source
+    text proves wiring exists, not that it runs).
+    """
+    def _kill(text):
+        needle = ('elif [ -n "$HOOK_SID" ] && '
+                  '[ -f "$HOOK_AGENT_DIR/sessions/$HOOK_SID/stop-requested" ]; then')
+        assert needle in text, "the session valve line moved; update this proof"
+        return text.replace(needle, 'elif false; then')
+
+    proc, _shard, root = _drive(tmp_path, closing=False,
+                                session_stop_requested=True, mutate=_kill)
+
+    assert _blocked(proc), (
+        "neutralizing the session valve did NOT turn this red -- the tests above "
+        f"are passing for some other reason.\nstdout:\n{proc.stdout}")
 
 
 def test_worker_net_stands_down_on_closed_manifest(tmp_path):

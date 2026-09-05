@@ -103,6 +103,14 @@ done
 # convention's criterion (b) matches zero forever while the real population is
 # one, and it would report that as a healthy hold. Cost is ~13MB / ~1.3s per
 # run; at a 24h cadence that is the right trade for not being structurally blind.
+#
+# WHICH substrings is NOT decided here -- quiesce_ripeness.QUIESCE_DEFER_TOKENS
+# owns it (, 2026-09-05). This block used to inline `'quiesce' in ...`,
+# and a substring predicate is only as good as the vocabulary it tracks: when
+# the master quiet-window goal standardised its members on a
+# `human_blocked: quiet-window member of <master>` prefix, the inline test kept
+# matching a word that prefix does not contain, and went blind to 3 of 5 frozen
+# goals -- including a HIGH member whose own defer read `WINDOW-READY: YES`.
 for s in pending blocked in-progress; do
   bash "$REPO/core/scripts/aspirations-query.sh" --goal-status "$s" --full 2>/dev/null > "$TMP/q-$s.json"
 done
@@ -110,7 +118,7 @@ done
 # ---- 4. score -------------------------------------------------------------
 PYTHONPATH="$REPO/core/scripts" py -3 -c "
 import json, sys
-from quiesce_ripeness import evaluate
+from quiesce_ripeness import evaluate, is_quiesce_frozen_defer
 
 conv, tmp, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 md = open(conv, encoding='utf-8').read()
@@ -129,7 +137,11 @@ for s in ('pending', 'blocked', 'in-progress'):
     except Exception: continue
     scanned += len(arr)
     for g in arr:
-        if 'quiesce' in (g.get('defer_reason') or '').lower():
+        # The predicate lives in quiesce_ripeness.QUIESCE_DEFER_TOKENS -- do NOT
+        # re-inline a substring test here. This line WAS \`'quiesce' in ...\`
+        # until 2026-09-05, and it went blind when the registration vocabulary
+        # moved to 'quiet-window member of <master>' on 2026-08-23 ().
+        if is_quiesce_frozen_defer(g.get('defer_reason')):
             deferred.append(g['goal_id'])
 
 res = evaluate(md, status, deferred)

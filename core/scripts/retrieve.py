@@ -215,7 +215,7 @@ SUPPLEMENTARY_CAPS = {"shallow": 20, "medium": 40, "deep": 80}
 from tree_match import (
     build_concept_index, _match_nodes, _include_siblings,
     _include_parents, _score_and_limit, _compute_match_score, CHANNEL_SCORES,
-    COSINE_BONUS_WEIGHT, _mmr_rerank, safe_num,
+    COSINE_BONUS_WEIGHT, _mmr_rerank, safe_num, _yaml_loader,
 )
 
 def _goal_id_is_terminal(goal_id):
@@ -485,8 +485,10 @@ def read_yaml(path):
     p = Path(get_backend().ensure_local(path))
     if not p.exists():
         return {}
+    # C scanner when available (tree_match._yaml_loader): 8.4x on the live
+    # tree index, identical output. The daemon's yaml_cache does the same.
     with open(p, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
+        data = yaml.load(f, Loader=_yaml_loader())
     return data if isinstance(data, dict) else {}
 
 # g-115-8750. Skips recorded by THIS request's loaders, drained by the daemon
@@ -842,11 +844,26 @@ def load_tree_nodes(categories, depth, read_only=False):
                 _cfg.get("embedding_min_cosine", 0.35)))
         except (TypeError, ValueError):
             _min_cos = 0.35
+        # STRONGEST CHANNEL WINS — the same rule the token channels apply to
+        # each other above (2026-09-03). Until this date a node that token-
+        # matched kept its token channel no matter how strong its cosine, so
+        # the query's best semantic match, when it ALSO lexically matched via
+        # word_prefix (1.5), scored a full point BELOW a marginal semantic-only
+        # node (embedding 2.5). Measured on the live tree: for a metacognition
+        # query the cosine-rank-1 node (0.63) came out 4th and the cosine-rank-2
+        # node (0.50) came out 15th of 15, behind nodes at cosine 0.34-0.39 with
+        # no lexical overlap at all. Being relevant in two ways must never score
+        # lower than being relevant in one.
+        _emb_rank = CHANNEL_SCORES.get("embedding", 0)
         for _k, _score in tree_emb.items():
-            if _score >= _min_cos and _k not in all_matched and _k in nodes:
+            if _score < _min_cos or _k not in nodes:
+                continue
+            if _k not in all_matched:
                 all_matched[_k] = nodes[_k]
                 all_channels[_k] = "embedding"
                 all_matched_keys.add(_k)
+            elif CHANNEL_SCORES.get(all_channels.get(_k, ""), 0) < _emb_rank:
+                all_channels[_k] = "embedding"
 
     # Convert to list form for sibling/parent inclusion
     matched = [(k, v) for k, v in all_matched.items()]
@@ -1060,14 +1077,41 @@ def _entry_matches_text(entry, categories):
 _TEXT_FALLBACK_MIN_OVERLAP = 2
 
 
+# Per-record token-set memo (2026-09-03). The daemon serves every request from
+# the SAME jsonl_cache record objects until a store file changes, yet this
+# function re-tokenized all ~15k reasoning-bank + guardrail records on every
+# request — measured 1.4 s of a 2.7 s warm request inside re.findall alone,
+# plus ~0.4 s of join/lower. Keyed by record id and validated by OBJECT
+# IDENTITY (`is`): a reloaded store hands out new objects, so it misses and
+# recomputes; an id collision can only miss, never hit wrong. Holds one strong
+# ref per id — the record already lives in jsonl_cache, so this pins nothing
+# new while the store is current. Tokens are interned so the ~15k sets share
+# one string object per distinct word instead of one per occurrence.
+_TOKEN_CORPUS_MEMO = {}
+
+
 def _entry_token_corpus(entry):
     """Lowercased token SET of an rb/guardrail/pattern-signature entry's
-    searchable text fields.
+    searchable text fields. Memoized per record object (see the block above);
+    callers must treat the returned set as read-only.
 
     Extracted from `_entry_matches_text` (g-115-7318) because the relevance
     floor needs the same corpus. Two live call sites — the boolean predicate
     and `_query_overlap` — so this is not a single-use abstraction.
     """
+    rid = entry.get("id") if isinstance(entry, dict) else None
+    memo_key = rid if isinstance(rid, str) and rid else None
+    if memo_key is not None:
+        hit = _TOKEN_CORPUS_MEMO.get(memo_key)
+        if hit is not None and hit[0] is entry:
+            return hit[1]
+    tokens = _entry_token_corpus_uncached(entry)
+    if memo_key is not None:
+        _TOKEN_CORPUS_MEMO[memo_key] = (entry, tokens)
+    return tokens
+
+
+def _entry_token_corpus_uncached(entry):
     parts = []
     for field in ("title", "content", "rule", "summary"):
         v = entry.get(field)
@@ -1088,7 +1132,7 @@ def _entry_token_corpus(entry):
     corpus = " ".join(parts).lower()
     if not corpus:
         return set()
-    return set(_TEXT_FALLBACK_TOKEN_RE.findall(corpus))
+    return {sys.intern(t) for t in _TEXT_FALLBACK_TOKEN_RE.findall(corpus)}
 
 
 def _query_overlap(entry, categories, corpus_tokens=None):
@@ -1175,6 +1219,9 @@ def _embedding_blend(matched, active, categories, exclude=None):
     cfg = _load_retrieval_config()
     if not cfg.get("embedding_blend_enabled", False):
         _BLEND_STATS["supplementary_blend_status"] = "off"
+        return matched
+    if _freeze_on_model_drift():
+        _BLEND_STATS["supplementary_blend_status"] = "model_drift"
         return matched
     try:
         from _embedding_retrieval import cosine_scores
@@ -1299,7 +1346,11 @@ def _universal_relevance_split(universal_sorted, categories, stats=None):
         invisible to every metric (same shape as guard-1977: a check that
         declines to run is indistinguishable from one that ran and passed).
 
-        `status` is FOUR-valued on purpose. A bare picked=0 count would collapse
+        `status` is FIVE-valued on purpose (`model_drift` joined 2026-09-03:
+        the lanes are FROZEN because the per-box index model differs from the
+        one the cosine floors were calibrated on — see _freeze_on_model_drift;
+        like the three non-`ran` states below it is NOT abstention).
+        A bare picked=0 count would collapse
         three genuinely different conditions into one number and rebuild the
         very defect this instruments: `off` (feature flag disabled), `no_slots`
         (configured to 0 pull slots), `no_scores` (enabled, but the embedding
@@ -1327,6 +1378,9 @@ def _universal_relevance_split(universal_sorted, categories, stats=None):
     slots = max(0, min(slots, UNIVERSAL_RB_CAP))
     if slots == 0:
         _rec("no_slots")
+        return universal_sorted[:UNIVERSAL_RB_CAP]
+    if _freeze_on_model_drift():
+        _rec("model_drift", slots_n=slots)
         return universal_sorted[:UNIVERSAL_RB_CAP]
     try:
         from _embedding_retrieval import cosine_scores
@@ -1444,6 +1498,8 @@ def _framework_embedding_scores(categories, entries):
     cfg = _load_retrieval_config()
     if not cfg.get("embedding_framework_channel_enabled", False):
         return {}
+    if _freeze_on_model_drift():
+        return {}
     try:
         from _embedding_retrieval import cosine_scores
         query = " ".join(c for c in categories
@@ -1475,6 +1531,8 @@ def _tree_embedding_scores(categories, nodes):
     """
     cfg = _load_retrieval_config()
     if not cfg.get("embedding_tree_channel_enabled", False):
+        return {}
+    if _freeze_on_model_drift():
         return {}
     try:
         from _embedding_retrieval import cosine_scores
@@ -2431,6 +2489,9 @@ _DEFAULT_RETRIEVAL_CFG = {
     # (limit - N) slots are ranked. 0 disables (byte-identical to pre-g-306-93).
     # Only active on the real-embedding path; the TF-IDF fallback is untouched.
     "cosine_reserved_slots": 3,
+    # Embedding-cosine bonus weight on the real-embedding path (2026-09-03).
+    # Derivation + the measured sweep: _score_weight_limit. Mirrors tree.yaml.
+    "embedding_cosine_bonus_weight": 12.0,
     # Supplementary-store relevance floor (g-115-7318). The supplementary lane's
     # analogue of cosine_reserved_slots above, using the token-overlap count the
     # admission predicate already computes instead of a cosine — so it needs no
@@ -2521,6 +2582,78 @@ def _load_retrieval_config():
     return merged
 
 
+_MODEL_DRIFT_WARNED = False
+
+
+def _embedding_model_drift():
+    """(index_model, configured_model) when this box's persisted index was built
+    with a model OTHER than tree.yaml retrieval: embedding_model_name; None when
+    they agree or when either side is unknown (no index on the box, no config
+    key, any read error).
+
+    WHY THIS EXISTS (2026-09-03). The cosine floors in tree.yaml
+    (embedding_min_cosine, embedding_tree_min_cosine) are absolute numbers
+    CALIBRATED ON the configured model's cosine distribution — the g-306-92
+    measurement that set the tree floor at 0.32 ranked its target case at
+    0.3330 and warned in its own comment: "if the embedding model or index is
+    rebuilt, re-measure rather than assuming it still clears." Nothing enforced
+    that. A per-box index built with a retrieval-tuned model whose cosine
+    floor for UNRELATED text sits at 0.28-0.35 admitted 98.9-100% of the tree
+    for every query (measured with "how to bake sourdough bread" and a
+    Kubernetes TLS query: same top-3 both times), so the tree lane's ranking
+    collapsed onto its query-independent static bonuses — depth, confidence,
+    capability, recency, utility — and the same three nodes topped every
+    retrieval on the box. The raw cosine channel was healthy throughout
+    (those nodes ranked 9,777th and 12,343rd of 16,883 by cosine); the damage
+    was entirely the mismatch between a calibration and the model it was
+    applied to. The query side already loads the index's OWN model, so
+    index-vs-query can never disagree (g-306-82); this closes the other pair,
+    index-vs-CALIBRATION, the way the g-306-92 comment asked for by hand.
+
+    The model name comes from the index cache _embedding_retrieval already
+    keeps (mtime-invalidated, one load per process), so this is a stat plus
+    a string compare on the hot path — it never loads an encoder.
+    """
+    try:
+        cfg = _load_retrieval_config()
+        configured = str(cfg.get("embedding_model_name") or "").strip()
+        if not configured:
+            return None
+        from _embedding_retrieval import _load_index, _resolve_index_dir
+        _emb, _ids, index_model = _load_index(_resolve_index_dir(None))
+        index_model = str(index_model or "").strip()
+        if not index_model or index_model == configured:
+            return None
+        return (index_model, configured)
+    except Exception:
+        return None
+
+
+def _freeze_on_model_drift():
+    """True when every embedding lane must serve the token baseline because the
+    per-box index model drifted from the configured (calibrated) model.
+    Warns ONCE per process — retrieval is a hot path (same posture as
+    _embedding_retrieval._degrade). Frozen is the honest state: the token
+    baseline is what these lanes served before the embedding channels existed
+    and what an unprovisioned box serves today, whereas a drifted index served
+    a confidently WRONG ranking. Self-heal: embedding-index-build.py --update
+    rebuilds the index with the configured model (2026-09-03)."""
+    drift = _embedding_model_drift()
+    if drift is None:
+        return False
+    global _MODEL_DRIFT_WARNED
+    if not _MODEL_DRIFT_WARNED:
+        _MODEL_DRIFT_WARNED = True
+        print("[retrieve] embedding lanes FROZEN to the token baseline: this "
+              "box's index was built with %r but tree.yaml retrieval: "
+              "embedding_model_name is %r, and the cosine floors are calibrated "
+              "on the configured model (a drifted index admitted ~100%% of the "
+              "tree per query and ranked on static bonuses, 2026-09-03). "
+              "Self-heal: py -3 core/scripts/embedding-index-build.py --update"
+              % drift, file=sys.stderr)
+    return True
+
+
 def embedding_channel_status():
     """One-line per-request health of the semantic (embedding) channel.
 
@@ -2544,6 +2677,15 @@ def embedding_channel_status():
                     "this box (build: embedding-index-build.py --build)")
     except Exception as exc:  # same structural degradation contract as the blend
         return "DEAD: _embedding_retrieval unavailable (%s)" % exc
+    drift = _embedding_model_drift()
+    if drift:
+        # Not "alive": the lanes are deliberately FROZEN (see
+        # _freeze_on_model_drift) — reporting alive here would reproduce the
+        # silence that let a drifted index serve a wrong ranking unreported.
+        return ("DRIFT: per-box index model %r != configured %r -- embedding "
+                "lanes FROZEN to the token baseline (cosine floors are "
+                "calibrated on the configured model); self-heal: "
+                "embedding-index-build.py --update" % drift)
     return "alive"
 
 def _utility_weight(node, cfg=None):
@@ -2838,12 +2980,40 @@ def _score_weight_limit(matched, channels, limit,
     if idf_index is not None:
         from tree_idf import cosine
 
+    # EMBEDDING-COSINE WEIGHT (2026-09-03). COSINE_BONUS_WEIGHT (2.0) was tuned
+    # for the TF-IDF fallback, where a good match scores 0.5-1.0. Real embedding
+    # cosines live in a far narrower band — relevant 0.50-0.65 over a 0.32
+    # floor — so at 2.0 the whole query-dependent term spanned ~0.6 points while
+    # the query-INDEPENDENT terms (depth 0.3-1.5, confidence 0-0.9, capability
+    # 0-0.5, recency 0-0.5, channel base) swing more than a point between two
+    # candidates. Measured on the 12 hand-labeled queries in
+    # world/scripts/tree-embed-ab-harness.py, FULL path, shallow window, live
+    # 1,568-node tree, strongest-channel-wins already in: the expected node
+    # carried the higher cosine in EVERY ranked case and still lost on statics.
+    #   W=2   hit@1=0 hit@3=0 hit@5=3 MRR=0.123   (this line before the change)
+    #   W=4   hit@1=0 hit@3=5 hit@5=6 MRR=0.252
+    #   W=8   hit@1=4 hit@3=7 hit@5=9 MRR=0.505
+    #   W=12  hit@1=5 hit@3=8 hit@5=9 MRR=0.570
+    #   W=20  hit@1=6 hit@3=8 hit@5=9 MRR=0.612   (diminishing; 2 of 12 sit
+    #                                              below the admission floor and
+    #                                              no weight can reach them)
+    # Utility weighting STAYS: with it MRR is higher at every W>=4 (0.570 vs
+    # 0.490 at 12). MMR on/off was identical at every W. The weight is a config
+    # key (tree.yaml retrieval: embedding_cosine_bonus_weight) so it can be
+    # re-derived with the harness; an ABSENT or malformed key degrades to the
+    # TF-IDF weight — this line's pre-change behaviour — never to an unverified
+    # value. The TF-IDF fallback below keeps COSINE_BONUS_WEIGHT untouched.
+    try:
+        _emb_w = float(cfg.get("embedding_cosine_bonus_weight",
+                               COSINE_BONUS_WEIGHT))
+    except (TypeError, ValueError):
+        _emb_w = COSINE_BONUS_WEIGHT
     scored = []
     for key, node in matched:
         channel = channels.get(key, "parent")
         base = _compute_match_score(key, node, channel)
         if use_emb:
-            base += COSINE_BONUS_WEIGHT * float(emb_scores.get(key, 0.0))
+            base += _emb_w * float(emb_scores.get(key, 0.0))
         elif idf_index is not None:
             d_vm = idf_index["vectors"].get(key, ({}, 0.0))
             base += COSINE_BONUS_WEIGHT * cosine(q_vm, d_vm)

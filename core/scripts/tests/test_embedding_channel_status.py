@@ -63,6 +63,18 @@ def _cfg(blend=False, tree=False):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_index_dir(tmp_path, monkeypatch):
+    # 2026-09-03: embedding_channel_status() also reads the per-box index's
+    # model name (the index-vs-calibration drift check). Pin the index dir
+    # to an empty tmp so these verdicts never depend on whatever index THIS
+    # box happens to carry (test_embedding_model_drift.py owns the DRIFT case).
+    monkeypatch.setenv(er._INDEX_DIR_ENV, str(tmp_path))
+    er.clear_caches()
+    yield
+    er.clear_caches()
+
+
+@pytest.fixture(autouse=True)
 def _reset_cfg_cache():
     saved = _retrieve._RETRIEVAL_CFG_CACHE
     yield

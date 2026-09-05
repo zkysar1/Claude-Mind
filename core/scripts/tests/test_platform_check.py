@@ -295,3 +295,200 @@ def test_detection_failure_is_not_reported_as_a_platform_mismatch(tmp_path):
         f"stderr={r.stderr!r}"
     )
     assert "cannot determine platform" in r.stderr
+
+
+# --- --machine: box-level affinity () ------------------------------
+#
+# --os is coarse: it filters only when the target box is the only one of its OS.
+# The motivating goal () must run on cc-04 while cc-07 is ALSO Linux,
+# so `--os linux` filters nothing and the constraint stayed prose-only — which
+# is invisible to goal-selector.py. Pre-flag measurement: that goal was a
+# top-of-queue pick on cc-07 for three separate Bodies.
+#
+# THE TWO OR-LANE TESTS BELOW ARE THE LOAD-BEARING ONES, for the same reason the
+# MSYSTEM pair above is. The script matches `uname -n` OR $MACHINE_ID, and each
+# lane alone reintroduces one goal-HIDING mode: nodename-only misjudges a box
+# whose MACHINE_ID is deliberately not its nodename, env-only disappears when the
+# variable is not inherited across predicate.py's spawn. A future "simplification"
+# to a single signal passes every positive test while restoring the fail-closed
+# blast radius, so these two are the mutation-proof for the design, not decoration.
+
+
+def this_machine():
+    """The nodename the SCRIPT will see — read the same way it reads it.
+
+    Deliberately not platform.node(): the script shells `uname -n`, and on MSYS
+    the two can disagree in case. Comparing against the script's own signal keeps
+    a harness discrepancy from reading as a script defect (guard-920).
+    """
+    r = subprocess.run(["uname", "-n"], capture_output=True, text=True, timeout=30)
+    return r.stdout.strip()
+
+
+def test_machine_matches_this_box():
+    me = this_machine()
+    assert me, "uname -n returned nothing; cannot run the positive control"
+    r = run(["--machine", me])
+    assert r.returncode == 0, (
+        f"--machine {me} should exit 0 on this box; rc={r.returncode} "
+        f"stderr={r.stderr!r}"
+    )
+
+
+def test_machine_value_is_case_insensitive():
+    me = this_machine()
+    r = run(["--machine", me.upper()])
+    assert r.returncode == 0, (
+        f"--machine {me.upper()} should match (hostnames fold case); "
+        f"rc={r.returncode}"
+    )
+
+
+def test_machine_mismatch_exits_one():
+    r = run(["--machine", "definitely-not-this-box-9271"])
+    assert r.returncode == 1, (
+        f"an unknown machine id should exit 1 (mismatch), got {r.returncode}"
+    )
+
+
+def test_machine_matches_on_nodename_when_machine_id_is_unset():
+    """OR lane 1 — scrubbing MACHINE_ID must not hide the goal.
+
+    predicate.py invokes this through subprocess.run(shell=True); an env var is
+    the signal most likely to go absent across that spawn. If detection is ever
+    narrowed to $MACHINE_ID alone, this fails.
+    """
+    me = this_machine()
+    r = run(["--machine", me], env={"MACHINE_ID": None})
+    assert r.returncode == 0, (
+        "--machine must still match via uname -n when MACHINE_ID is unset; "
+        f"rc={r.returncode} stderr={r.stderr!r}"
+    )
+
+
+def test_machine_matches_on_machine_id_when_it_differs_from_nodename():
+    """OR lane 2 — $MACHINE_ID is authoritative when it is not the nodename.
+
+    The fleet SSOT (_session_telemetry._machine_id) prefers MACHINE_ID over the
+    nodename, so a box configured that way must still answer YES. If detection is
+    ever narrowed to `uname -n` alone, this fails.
+    """
+    alias = "zz-alias-box-4417"
+    assert alias != this_machine(), "fixture alias collided with the real nodename"
+    r = run(["--machine", alias], env={"MACHINE_ID": alias})
+    assert r.returncode == 0, (
+        "--machine must match via $MACHINE_ID even when it differs from uname -n; "
+        f"rc={r.returncode} stderr={r.stderr!r}"
+    )
+
+
+def test_empty_machine_id_does_not_false_match():
+    """An absent signal must never manufacture a YES.
+
+    The empty-string lane is the one that could match something it should not,
+    which is the direction that runs a goal on a box that cannot do the work.
+    """
+    r = run(["--machine", "some-other-box"], env={"MACHINE_ID": ""})
+    assert r.returncode == 1, (
+        f"empty MACHINE_ID must not satisfy an unrelated target; rc={r.returncode}"
+    )
+
+
+def test_neither_flag_is_a_usage_error():
+    r = run([])
+    assert r.returncode == 2
+    assert "--machine" in r.stderr, (
+        "the usage error must name --machine, or a caller cannot discover it"
+    )
+
+
+def test_both_flags_are_anded():
+    me_os = this_platform()
+    me_box = this_machine()
+    other = next(p for p in ALL_PLATFORMS if p != me_os)
+
+    assert run(["--os", me_os, "--machine", me_box]).returncode == 0
+    assert run(["--os", me_os, "--machine", "not-this-box-3311"]).returncode == 1
+    assert run(["--os", other, "--machine", me_box]).returncode == 1
+
+
+def test_valueless_machine_flag_exits_two_instead_of_hanging():
+    """Same guard-1224 hazard as --os: bare `shift 2` with $#==1 never shifts."""
+    try:
+        r = subprocess.run(
+            [BASH, str(SCRIPT), "--machine"],
+            cwd=str(PROJECT_ROOT), capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        raise AssertionError(
+            "platform-check.sh --machine HUNG — use "
+            "`shift $(( $# >= 2 ? 2 : 1 ))`, never bare `shift 2` (guard-1224)."
+        )
+    assert r.returncode == 2, (
+        f"valueless --machine should be a usage error (2); got {r.returncode}"
+    )
+
+
+def test_machine_detection_failure_is_not_reported_as_a_mismatch(tmp_path):
+    """A broken `uname` with no MACHINE_ID must exit 2 (cannot tell), never 1.
+
+    Both codes hide the goal (predicate.py fails closed); the exit code is the
+    only way a human can tell an unreadable box from a genuinely different one.
+    """
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    fake = shim / "uname"
+    fake.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
+    fake.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{shim}{os.pathsep}{env.get('PATH', '')}"
+    env.pop("MACHINE_ID", None)
+
+    r = subprocess.run(
+        [BASH, str(SCRIPT), "--machine", "any-box"],
+        cwd=str(PROJECT_ROOT), capture_output=True, text=True, env=env, timeout=30,
+    )
+
+    # Control: prove the shim took effect, rather than passing vacuously (rb-245).
+    if r.returncode == 1 and "cannot determine machine identity" not in r.stderr:
+        import pytest
+        pytest.skip("uname shim did not take effect on this platform")
+
+    assert r.returncode == 2, (
+        f"an unreadable machine identity must exit 2, not {r.returncode}; "
+        f"stderr={r.stderr!r}"
+    )
+    assert "cannot determine machine identity" in r.stderr
+
+
+def test_predicate_evaluates_machine_precondition_end_to_end():
+    """Drive the real predicate registry — with a case expected to PASS.
+
+    box-affinity-preconditions.md mandates an expect-PASS control: evaluate_all
+    returns a LIST, and reading .passed off the list yields None -> falsy, so an
+    all-negative control set 'confirms' a stuck-false harness (guard-2298).
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "core" / "scripts"))
+    from predicate import evaluate_all, _command_allowed  # noqa: E402
+
+    me = this_machine()
+    cmd = f"bash core/scripts/platform-check.sh --machine {me}"
+    assert _command_allowed(cmd), "the machine gate must satisfy the predicate allowlist"
+
+    passing = [{"id": "pc-box-match", "type": "command_succeeds", "command": cmd}]
+    failing = [{"id": "pc-box-miss", "type": "command_succeeds",
+                "command": "bash core/scripts/platform-check.sh --machine not-a-real-box-8823"}]
+
+    got_pass = evaluate_all(passing, mode="fail_fast", include_skippable=False)
+    assert got_pass, "evaluate_all returned no results for the matching predicate"
+    assert all(r.passed for r in got_pass), (
+        f"expect-PASS control failed: {[(r.reason, r.observed_value) for r in got_pass]}"
+    )
+
+    got_fail = evaluate_all(failing, mode="fail_fast", include_skippable=False)
+    assert got_fail, "evaluate_all returned no results for the mismatching predicate"
+    assert any(not r.passed for r in got_fail), (
+        "a foreign machine id must FAIL the predicate — that is the direction "
+        "that removes the goal from this box's candidates"
+    )

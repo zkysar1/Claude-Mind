@@ -204,6 +204,20 @@ GOAL_KNOWN_FIELDS = frozenset({
     'verification',                      # 1308
     'verification_notes',                # 1
     'verify_summary',                    # 3
+    # g-306-417: writer is iteration-close.sh do_verify, stamped beside
+    # completed_by_role. Holds the STRUCTURED own-unit verification verdict
+    # (the Q1/Q1.5/Q2/Q3/Q4 phase_progress the verify skill already computed),
+    # harvested from the body-keyed iteration-checkpoint before the next claim
+    # resets it. 0 at introduction BY CONSTRUCTION — a going-forward stamp.
+    # WHY IT EXISTS: worker-closure-audit.py's stated job is to record
+    # "agreement or disagreement" on worker self-grading, and agreement needs
+    # TWO verdicts. Until this field the worker's judgment lived only in the
+    # transcript, in prose, and in a checkpoint that the NEXT claim overwrites
+    # (measured 2026-09-04: g-115-8708's full Q-verdict was unrecoverable ~5
+    # minutes after it was produced), so the audit had nothing to compare its
+    # own verdict against. ABSENT means no structured verify ran for this
+    # goal — never read absence as a pass (the completed_by_role rule).
+    'verify_verdict',                    # 0 (new)
     'windowStreak',                      # 81
     'work_class',                        # 2758
 })

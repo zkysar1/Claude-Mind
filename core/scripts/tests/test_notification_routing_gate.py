@@ -271,6 +271,66 @@ def test_patterns_rejected_for_breadth_stay_rejected(body):
     assert verdict == SUPPRESS
 
 
+# --------------------------------------------------------------------------- #
+# : the proximity window must span NEWLINES
+# --------------------------------------------------------------------------- #
+
+# A real notification body is multi-line. It puts the principal, the action and
+# the resource on separate lines, so `IAM` and `user/<name>` never co-occur
+# inside a single line -- and with the old `[^\n]{0,120}` window the entry
+# MISSED the exact message it exists to catch. Measured 2026-09-03: this body
+# returned SUPPRESS, and the same content on ONE line returned SEND.
+MULTILINE_IAM_USER_BODY = (
+    "Both available principals are denied.\n"
+    "\n"
+    "Principal: user/ayoai-fleet-agent\n"
+    "Action:    dynamodb:UpdateItem\n"
+    "Resource:  arn:aws:dynamodb:us-east-2:891377285145:table/WorldBuilders\n"
+    "\n"
+    "IAM self-inspection is also denied, so the fleet cannot verify this itself.\n"
+)
+
+
+def test_multiline_iam_user_body_sends():
+    """The defect this change fixes, pinned as a PROPERTY of line-spanning.
+
+    The body deliberately contains NO IAM user ARN and NO iam:*UserPolicy
+    action -- those two alternatives already matched and would make this test
+    pass for the wrong reason. It carries only the plain-English shape a human
+    actually writes, where the discriminating tokens land on different lines.
+    """
+    assert "arn:aws:iam::" not in MULTILINE_IAM_USER_BODY
+    assert "UserPolicy" not in MULTILINE_IAM_USER_BODY
+    assert "\n" in MULTILINE_IAM_USER_BODY.strip()
+
+    verdict, reason, _dest = decide("blocker", "", MULTILINE_IAM_USER_BODY)
+    assert verdict == SEND
+    assert "IAM grant on a USER principal" in reason
+
+
+# Widening the window to span newlines re-opens BOTH negatives that were only
+# ever pinned in their same-line form. These are the controls that make the
+# widening safe rather than merely effective (guard-3845: a classifier change
+# carries a positive AND a negative control; guard-3763 / rb-7835: role-vs-user
+# is the discriminator, and a ROLE grant is agent-doable).
+MULTILINE_NEGATIVES = [
+    # a ROLE target, split across lines exactly like the positive above
+    ("role target",
+     "IAM change required.\n\nPrincipal: role/ayoai-lambda-exec\nAction: s3:GetObject\n"),
+    # the filesystem-path false positive, now separated by a newline -- the
+    # `(?<![\w/])` lookbehind, not the window, is what must keep rejecting it
+    ("filesystem path across lines",
+     "IAM audit complete.\nThe log is at /home/user/agent/out.log\n"),
+]
+
+
+@pytest.mark.parametrize("tag,body", MULTILINE_NEGATIVES)
+def test_multiline_negatives_stay_suppressed(tag, body):
+    """A line-spanning window must not buy the positive at these two prices."""
+    verdict, _reason, _dest = decide("blocker", "", body)
+    assert verdict == SUPPRESS, f"multi-line negative {tag!r} wrongly SENDS"
+
+
 def test_permissions_boundary_fence_sends_without_the_word_authorized():
     """guard-3779 shape (b) must stand on its own.
 

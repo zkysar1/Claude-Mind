@@ -643,3 +643,256 @@ def test_unanswered_claim_half_declines_the_reap(monkeypatch):
     assert out["reap_candidates"] == 0, out
     assert calls["cleared"] == [], "an unread claim map must not license a write"
     assert any("provenance=none" in e for e in out["errors"]), out["errors"]
+
+
+# ── the FOURTH state: a goal that resolves NOWHERE () ───────────────
+#
+# `_goal_terminal` is tri-state and collapsed two opposite meanings into False:
+# "the queue holds this goal and it is not finished" (keep) and "no store holds
+# this goal at all" (maximally finished, row immortal). These pin the split.
+#
+# The KEEP cases outnumber the REAP case here too, and for a sharper reason than
+# the file header gives: this is the only predicate in the module that reaps on
+# the ABSENCE of evidence, so every way it can be wrong is a deletion.
+
+def _decide_v(known, terminal=None, holds_claim=False, carrier=None, row=LIVE_ROW):
+    """One row through the REAL `decide`, so `_goal_vanished` and the branch
+    ordering are exercised together rather than hand-fed to `decide_row`."""
+    out = R.decide(
+        {SID: row},
+        {SID: (carrier or R.CV_FRESH_CORRECT, {})},
+        {SID: "g-other"} if holds_claim else {},
+        None,
+        terminal,
+        known,
+    )
+    return out["decisions"][0], out
+
+
+def test_vanished_goal_is_reaped_even_though_the_body_is_ALIVE():
+    """THE NEW REACH, and the carrier is deliberately `fresh-correct`.
+
+    Every pre-existing reaping path needs the BODY to look gone: `R_REAP` wants a
+    stale carrier, and the terminal branch only fires when a store says the goal
+    finished. A Body that is perfectly alive and has simply MOVED ON hits
+    `K_ALIVE` and keeps its phantom row forever. So a fresh carrier here is not
+    incidental — it is what makes this test discriminating: nothing but the
+    vanished predicate can produce a reap from this input.
+    """
+    d, out = _decide_v(known={"g-other"}, terminal=set())
+    assert d["verdict"] == R.R_REAP_VANISHED_GOAL, d
+    assert d["goal_vanished"] is True
+    assert d["goal_is_terminal"] is False
+    assert R.is_reaping(d["verdict"]) is True
+    assert len(out["reapable"]) == 1
+
+
+def test_goal_that_EXISTS_and_is_unfinished_keeps_its_row():
+    """The live-non-terminal positive control the filing goal asks for.
+
+    Without this the suite could not tell a working predicate from one that
+    reaps every row it is shown, and that failure mode passes every REAP test.
+    """
+    d, out = _decide_v(known={"g-999-01"}, terminal=set())
+    assert d["goal_vanished"] is False
+    assert d["verdict"] == R.K_ALIVE, d
+    assert out["reapable"] == []
+
+
+def test_unreadable_known_set_declines_the_reap_and_degrades_to_today():
+    """`None` = NOT MEASURED, and it must behave exactly as before the fix.
+
+    This is the degradation the filing goal makes mandatory: an unreadable store
+    must never be able to mint a reap. `None` is not a tidy default here — it is
+    the whole safety contract, because this module cannot tell a complete census
+    from a partial one.
+    """
+    d, out = _decide_v(known=None, terminal=set())
+    assert d["goal_vanished"] is None, "unmeasured must not read as False"
+    assert d["verdict"] == R.K_ALIVE
+    assert out["reapable"] == []
+
+
+def test_a_PARTIAL_census_is_the_hazard_this_None_exists_to_prevent():
+    """Same row, same code, two censuses — only the narrower one deletes.
+
+    Not a restatement of the test above: that one asserts `None` is safe, this
+    one shows what a caller passing a set instead of `None` actually buys. It is
+    the guard-3379 failure in miniature, and on the live tree the omitted layer
+    was the archive, worth ~2,480 ids.
+    """
+    complete, _ = _decide_v(known={"g-999-01", "g-other"}, terminal=set())
+    partial, _ = _decide_v(known={"g-other"}, terminal=set())
+    assert complete["verdict"] == R.K_ALIVE
+    assert partial["verdict"] == R.R_REAP_VANISHED_GOAL
+    assert complete["verdict"] != partial["verdict"], (
+        "a narrowed census must be observably different, or the caller-side "
+        "obligation in `decide`'s docstring is untestable")
+
+
+def test_vanished_goal_with_a_LIVE_CLAIM_is_never_reaped():
+    """ re-opened one door over — caught by the existing suite.
+
+    `holds_live_claim` is per-SID, not per-goal, so a Body can hold a live claim
+    on goal Y while a stale row names a vanished goal X. Reaping then hides a
+    demonstrably working Body for the rest of its goal (guard-741), and rows are
+    written at CLAIM time so it never comes back. The branch was written ungated
+    first and two EXISTING tests failed immediately; this pins the gate directly
+    so the next reader does not have to rediscover it from those two.
+    """
+    d, out = _decide_v(known={"g-other"}, terminal=set(), holds_claim=True)
+    assert d["goal_vanished"] is True, "the predicate should still SEE it"
+    assert d["verdict"] != R.R_REAP_VANISHED_GOAL
+    assert d["verdict"] == R.K_ALIVE, d
+    assert out["reapable"] == []
+
+
+def test_vanished_and_claim_held_falls_THROUGH_to_the_carrier_verdict():
+    """The gate preserves old behaviour byte-for-byte, rather than minting a
+    new keep token: with a claim held, the row gets exactly the verdict it
+    would have got before this change existed."""
+    stale, _ = _decide_v(known={"g-other"}, terminal=set(), holds_claim=True,
+                         carrier=R.CV_STALE)
+    assert stale["verdict"] == R.K_STALLED_WITH_CLAIM, stale
+
+
+def test_terminal_evidence_outranks_vanished_inference():
+    """Ordering: where both could fire, the verdict names the STRONGER reason.
+
+    Positive evidence a store asserted beats an inference from silence — and the
+    two tokens must stay tellable apart in `verdict_counts`, which is the only
+    way anyone can later count how often the risky predicate fired.
+    """
+    d, _ = _decide_v(known=set(), terminal={"g-999-01"})
+    assert d["verdict"] == R.R_REAP_TERMINAL_GOAL, d
+    assert R.R_REAP_VANISHED_GOAL != R.R_REAP_TERMINAL_GOAL
+    assert R.R_REAP_VANISHED_GOAL in R.REAPING_VERDICTS
+
+
+def test_self_sid_still_outranks_the_vanished_branch():
+    """The running session's own row is belt-and-braces protected, and the new
+    branch must not slip above it — a self row naming a finished goal is a miss
+    in the CLEAN-close path and belongs fixed there, not masked here."""
+    d = R.decide_row(sid=SID, row=LIVE_ROW, carrier_verdict=R.CV_FRESH_CORRECT,
+                     self_sid=SID, goal_vanished=True)
+    assert d["verdict"] == R.K_SELF_SID
+
+
+@pytest.mark.parametrize("row", [
+    pytest.param({"claimed_at": "2026-08-07T23:58:02"}, id="no-goal_id"),
+    pytest.param(None, id="null-residue"),
+])
+def test_a_row_the_predicate_cannot_key_on_is_never_vanished(row):
+    """guard-1704: a signal added to a predicate over a population must be
+    DEFINED for every member. A row carrying no id cannot be looked up, so the
+    honest answer is `None` — never `True`, which here would mean deleting a row
+    precisely because it told us nothing."""
+    assert R._goal_vanished(row, {"g-999-01"}) is None
+
+
+# ── the vanished predicate END TO END, through the real sweep () ────
+
+def _wire_ids(monkeypatch, known, known_via="authoritative", terminal=None):
+    """Pin BOTH id censuses so these tests do not depend on the live queues."""
+    import worker_stall
+    monkeypatch.setattr(worker_stall, "read_terminal_goal_ids",
+                        lambda *s: (set(terminal or ()), "authoritative"))
+    monkeypatch.setattr(worker_stall, "read_known_goal_ids",
+                        lambda *s: (set(known or ()), known_via))
+
+
+def test_vanished_row_is_ACTUALLY_REAPED_through_the_apply_path(monkeypatch):
+    """The wiring test, and the one that catches an inert fix.
+
+    `decide` defaults `known_goal_ids` to None, so the guard-3020 re-check
+    immediately before the delete re-runs the decision — and if that call omits
+    the census, every vanished candidate comes back `goal_vanished=None` and is
+    dropped as `recheck-declined`. The scan would keep listing candidates and the
+    sweep would keep reaping none, which from the outside is indistinguishable
+    from healthy conservatism (guard-1943: pinning the decision says nothing
+    about the wiring). Asserting `cleared` — not `reap_candidates` — is the whole
+    point of this test; the first draft of the integration failed exactly here.
+    """
+    sweep = _load_sweep()
+    calls = _wire(monkeypatch, sweep, [{}], carrier=(R.CV_FRESH_CORRECT, {}))
+    _wire_ids(monkeypatch, known={"g-other"})
+
+    out = sweep._reap_stale_body_rows(
+        agent="bravo", self_sid=None, stale_minutes=180.0, apply_changes=True
+    )
+
+    assert out["reap_candidates"] == 1, out["decisions"]
+    assert calls["cleared"] == [SID], (
+        "the row was identified but never cleared — the apply-time re-check is "
+        "not passing the known-id census, so the predicate is inert")
+    assert out["reaped"] == 1, out
+    assert out["decisions"][0]["verdict"] == R.R_REAP_VANISHED_GOAL
+
+
+def test_unanswered_known_half_declines_the_reap(monkeypatch):
+    """Sibling of the claim-half test: `provenance == "none"` means no layer
+    answered, so the census is partial and MUST NOT license a delete. This is
+    the one direction where degrading quietly would delete live rows."""
+    sweep = _load_sweep()
+    calls = _wire(monkeypatch, sweep, [{}], carrier=(R.CV_FRESH_CORRECT, {}))
+    _wire_ids(monkeypatch, known=set(), known_via="none")
+
+    out = sweep._reap_stale_body_rows(
+        agent="bravo", self_sid=None, stale_minutes=180.0, apply_changes=True
+    )
+
+    assert out["reap_candidates"] == 0, out["decisions"]
+    assert calls["cleared"] == [], "an unread census must not license a write"
+    assert any("known-read" in e and "provenance=none" in e
+               for e in out["errors"]), out["errors"]
+    assert out["decisions"][0]["goal_vanished"] is None
+
+
+def test_the_census_DOMAIN_is_reported_beside_the_verdict(monkeypatch):
+    """guard-6002: a sweep reporting 0 is not a clean population until its
+    DOMAIN is stated beside the zero. `known_population` and `known_via` are
+    that domain — without them "no row named a vanished goal" and "the census
+    came back nearly empty" print identically."""
+    sweep = _load_sweep()
+    _wire(monkeypatch, sweep, [{}], carrier=(R.CV_FRESH_CORRECT, {}))
+    _wire_ids(monkeypatch, known={"g-999-01", "g-a", "g-b"})
+
+    out = sweep._reap_stale_body_rows(
+        agent="bravo", self_sid=None, stale_minutes=180.0, apply_changes=False
+    )
+
+    assert out["reap_candidates"] == 0
+    assert out["known_population"] == 3, out
+    assert out["known_via"] == "authoritative", out
+
+
+def test_the_archive_is_among_the_stores_the_sweep_censuses(monkeypatch):
+    """The layer whose omission inverts the predicate (guard-3379).
+
+    Measured on the live tree: the archive held 2,480 of the 5,432 known ids, so
+    a census that skipped it would have called every one of those goals
+    "resolving nowhere". Asserting the PATH is passed is the only way to pin
+    that, since a set alone cannot say where it came from.
+    """
+    sweep = _load_sweep()
+    import worker_stall
+    _wire(monkeypatch, sweep, [{}], carrier=(R.CV_FRESH_CORRECT, {}))
+    monkeypatch.setattr(worker_stall, "read_terminal_goal_ids",
+                        lambda *s: (set(), "authoritative"))
+
+    seen = []
+
+    def _known(*stores):
+        seen.extend(str(p).replace("\\", "/") for p in stores)
+        return {"g-999-01"}, "authoritative"
+
+    monkeypatch.setattr(worker_stall, "read_known_goal_ids", _known)
+    sweep._reap_stale_body_rows(agent="bravo", self_sid=None,
+                                stale_minutes=180.0, apply_changes=False)
+
+    assert any(p.endswith("aspirations-archive.jsonl") for p in seen), (
+        f"the archive was never censused: {seen}")
+    assert any(p.endswith("/bravo/aspirations.jsonl") for p in seen), seen
+    assert any(p.endswith("/world/aspirations.jsonl")
+               or (p.endswith("aspirations.jsonl") and "/bravo/" not in p
+                   and "archive" not in p) for p in seen), seen

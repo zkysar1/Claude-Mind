@@ -67,11 +67,13 @@ from hook_helpers import (  # noqa: E402
 # — verified semantically identical before consolidating.
 from _path_roots import (  # noqa: E402
     compute_allowed_roots,
+    is_harness_scratchpad,
     is_new_toplevel,
     is_under,
     is_write_exempt_sink,
     norm_path,
     read_paths_conf,
+    scratchpad_deny_reason,
 )
 
 # Sync with path-resolution-hook.py / _paths.py.
@@ -477,6 +479,42 @@ def main():
     # `\s>` already admits the `>|` clobber form, so it needs no entry here.
     if not re.search(r'(mkdir|touch|tee|cp|mv|sed|install|\bdd\b|\s>)', cmd):
         approve_no_mutation()
+
+    # --- Harness-scratchpad deny (g-115-8761) --------------------------------
+    # Placed HERE, above PROJECT_ROOT / agent / conf resolution, for the same
+    # reason the Write-side branch sits above them: a scratchpad target is
+    # categorically out of bounds, so the deny must fire even in an unbound
+    # session, and every check below fails open when no agent resolves.
+    #
+    # ORDER IS THE WHOLE FIX, not the predicate. Branch 3 below consults
+    # is_write_exempt_sink(), and /tmp + /var/tmp are on that exempt list — so a
+    # scratchpad redirect was not merely unreached, it was AFFIRMATIVELY
+    # APPROVED by an exemption whose own comment justified itself by saying
+    # CLAUDE.md sanctions the scratchpad. no-scratchpad.md overrode that on
+    # 2026-08-21 and the exemption outlived its rationale. Running this test
+    # first is what carves the scratchpad out while leaving the temp tree
+    # exempt; moving it below branch 3 silently restores the bypass.
+    #
+    # Reuses extract_targets — the WRITE-INTENT set (redirect / tee / cp / mv
+    # destinations, mkdir / touch operands, sed -i, heredoc sinks), already
+    # quote- and heredoc-aware. That is load-bearing rather than convenient: the
+    # harness itself writes background-task output under the scratchpad and
+    # tells the model to read it, so a check keyed on the mere PRESENCE of a
+    # scratchpad path would refuse ordinary `cat`/`tail` of a task log. Only
+    # write targets are denied.
+    #
+    # MITIGATION, NOT A GUARANTEE, and the rule text says so: command-string
+    # scanning cannot see through variable indirection, `cd` + a relative
+    # write, base64, or a path a script body builds internally. What justifies
+    # it is measurement — the naive `> /tmp/claude-N/...` redirect was 100% of
+    # the 47 observed violations, so this shape catches every one on record.
+    try:
+        _sp_targets = extract_targets(cmd)
+    except Exception:
+        _sp_targets = []          # fail-open: an unparseable command approves
+    for _verb, _target in _sp_targets:
+        if is_harness_scratchpad(_target):
+            emit_deny(scratchpad_deny_reason(f"Bash ({_verb})", _target))
 
     project_root = os.environ.get("PROJECT_ROOT", "")
     if not project_root:

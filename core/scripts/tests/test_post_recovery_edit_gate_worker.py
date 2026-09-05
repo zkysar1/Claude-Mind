@@ -54,7 +54,8 @@ IN_SCOPE_FILE = "core/scripts/some_framework_script.py"
 
 
 def _stage(tmp_path, *, state="IDLE", mode="autonomous", worker=False,
-           stopping=False, stray_checkpoint=False,
+           stopping=False, stray_checkpoint=False, binding_mode=None,
+           omit_binding_mode=False,
            agent="alpha", sid="11111111-2222-3333-4444-555555555555"):
     """Relocated PROJECT_ROOT. The gate derives PROJECT_ROOT from its own
     location (parent.parent.parent), so copying core/scripts into a staged tree
@@ -78,9 +79,25 @@ def _stage(tmp_path, *, state="IDLE", mode="autonomous", worker=False,
     # Session binding (Phase 2.6 layout) so the gate can resolve agent from SID.
     sess = adir / "sessions" / sid
     sess.mkdir(parents=True)
+    # `binding_mode` lets the PER-SESSION mode diverge from the AGENT-WIDE
+    # agent-mode file. They agreed unconditionally until 2026-09-04, which is
+    # exactly why this file could pass while the gate read the wrong one — see
+    # test_session_binding_mode_wins_over_agent_wide. `omit_binding_mode` stages
+    # the legacy shape (no mode key), where agent-wide is still the only signal.
+    _bmode = mode if binding_mode is None else binding_mode
+    _mode_line = "" if omit_binding_mode else f"mode: {_bmode}\n"
+    # `session_id` is REQUIRED, not decorative. Without it
+    # `_try_phase26_binding_with_reason` returns (None, "session-id-mismatch")
+    # and resolve_binding silently falls back to the legacy
+    # `.active-agent-<SID>` file — which carries an agent name but NO mode.
+    # This key was missing until 2026-09-04, so every test in this file had been
+    # exercising the LEGACY path only; the Phase 2.6 binding it appeared to
+    # stage was never once parsed. The tests still passed because the agent
+    # resolved fine either way and mode came from the agent-wide file, which is
+    # exactly the read this file now has to be able to distinguish.
     (sess / "binding.yaml").write_text(
-        f"agent: {agent}\nmode: {mode}\nstarted_at: 2026-08-06T00:00:00\n"
-        f"started_by: test\n", encoding="utf-8")
+        f"session_id: {sid}\nagent: {agent}\n{_mode_line}"
+        f"started_at: 2026-08-06T00:00:00\nstarted_by: test\n", encoding="utf-8")
     # Legacy fallback too, so the resolver finds it either way.
     (root / f".active-agent-{sid}").write_text(agent, encoding="utf-8")
 
@@ -216,3 +233,86 @@ def test_out_of_scope_path_untouched(tmp_path):
     root, sid = _stage(tmp_path, worker=False)
     r = _run(root, sid, rel_path="agents/alpha/notes.md")
     assert not _is_deny(r)
+
+
+# --------------------------------------------------------------------------
+# THE THIRD NARROWING (2026-09-04): mode is read PER SESSION, not agent-wide.
+#
+# The two narrowings above fixed WHICH TUPLES are exempt. Both still read the
+# tuple's mode from `session/agent-mode`, which is AGENT-WIDE — so on a box
+# running more than one Body it reports whichever Body started LAST, not the
+# session doing the asking. `_stage` wrote both sources from one `mode`
+# argument, so they could never disagree here and the whole file passed while
+# the gate consulted the wrong file in production.
+# --------------------------------------------------------------------------
+
+def test_session_binding_mode_wins_over_agent_wide(tmp_path):
+    """THE DEFECT: an assistant session refused because a WORKER wrote the
+    agent-wide file after it.
+
+    MEASURED on DESKTOP-O91DLK2 — a session bound `mode: assistant` at
+    2026-09-02T19:02:14 was refused because a worker Body started the next day
+    left `autonomous` in agents/alpha/session/agent-mode. The gate's own
+    `(IDLE, assistant) — user-directed work` exemption was never reached, so
+    the override became the only route: the same "how a gate stops being a
+    gate" failure the worker narrowing was written to end.
+
+    Note this session is NOT a worker (no forked WM) and is NOT stopping, so
+    neither existing exemption can rescue it — only reading the binding does.
+    """
+    root, sid = _stage(tmp_path, mode="autonomous", binding_mode="assistant",
+                       worker=False, stopping=False)
+    r = _run(root, sid)
+    assert not _is_deny(r), (
+        "the gate REFUSED a session whose own binding.yaml says mode: assistant, "
+        "because the AGENT-WIDE agent-mode file said autonomous. Mode must be "
+        "resolved per session (CLAUDE.md § Session Binding), not from a file any "
+        f"co-resident Body can overwrite. stdout={r.stdout[:400]}"
+    )
+
+
+def test_binding_autonomous_refused_even_when_agent_wide_says_assistant(tmp_path):
+    """LOAD-BEARING NEGATIVE for the third narrowing — the binding must win in
+    BOTH directions.
+
+    Without this, the change above is satisfiable by simply making the gate more
+    permissive (e.g. approving whenever a binding exists, or dropping the mode
+    check). Here the AGENT-WIDE file says `assistant` — the permissive reading —
+    while this session's binding says `autonomous` with no forked WM and no
+    checkpoint: the crashed-reducer shape. It must still be refused.
+    """
+    root, sid = _stage(tmp_path, mode="assistant", binding_mode="autonomous",
+                       worker=False, stopping=False)
+    r = _run(root, sid)
+    assert _is_deny(r), (
+        "a crashed REDUCER (binding mode: autonomous, no forked WM, no "
+        "checkpoint) was APPROVED because the agent-wide file happened to say "
+        "assistant. The per-session binding is authoritative in both "
+        f"directions. rc={r.returncode} stdout={r.stdout[:400]}"
+    )
+
+
+def test_missing_binding_mode_falls_back_to_agent_wide(tmp_path):
+    """BACKWARD COMPATIBILITY. `resolve_binding` also serves the legacy
+    `.active-agent-<SID>` form, where `mode` is None. There the agent-wide file
+    is still the only signal available and the pre-2026-09-04 behaviour must be
+    preserved exactly — a binding with no mode key must not read as "no mode,
+    therefore approve".
+    """
+    root, sid = _stage(tmp_path, mode="autonomous", omit_binding_mode=True,
+                       worker=False, stopping=False)
+    r = _run(root, sid)
+    assert _is_deny(r), (
+        "a binding carrying no mode key caused the gate to skip the agent-wide "
+        "fallback and approve a crashed-reducer edit. Absent per-session mode "
+        f"means fall back, not fail open. rc={r.returncode} stdout={r.stdout[:400]}"
+    )
+
+
+def test_worker_exemption_survives_binding_mode_read(tmp_path):
+    """The worker narrowing must not regress: a worker's binding says
+    `autonomous` (it was started autonomous), so the binding read alone puts it
+    back in scope and only the forked-WM predicate rescues it."""
+    root, sid = _stage(tmp_path, mode="autonomous", binding_mode="autonomous",
+                       worker=True)
+    assert not _is_deny(_run(root, sid))

@@ -52,9 +52,38 @@ See also:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
+
+
+_WINPATH_CALL = re.compile(r'\$\(_winpath "([^"]*)"\)')
+
+
+def resolve_winpath(src: str) -> str:
+    """Rewrite `$(_winpath "X")` back to `X` in shell source before asserting.
+
+    Structural tests over `core/scripts/*.sh` pin CALL SHAPES by searching the
+    source for a literal (`python3 "$SCRIPT_DIR/foo.py" --goal "$GOAL_ID"`).
+    g-115-8706 routed every `python3 <file-arg>` through the `_winpath` cygpath
+    helper, so those literals stopped appearing verbatim -- and three tests went
+    red while the property each pinned (foo.py is invoked, once, with those
+    args) stayed perfectly true (g-115-8995).
+
+    THIS IS A NORMALIZER, NOT A LOOSENED PATTERN, and the distinction is the
+    reason it exists (rb-9927): widening each assertion until it matches
+    `$(_winpath ...)` would re-pin the expression SHAPE at lower resolution and
+    go red again on the next path-routing refactor -- which is how a guard test
+    earns a reputation for false alarms and gets deleted. Resolving the helper
+    first is what the shell itself does at runtime, so every other byte of the
+    call stays pinned at full resolution.
+
+    Deliberately NARROW: only the double-quoted single-argument form this file's
+    callers use. An unrecognised form is left ALONE, so the assertion still
+    fails rather than silently matching something else.
+    """
+    return _WINPATH_CALL.sub(r"\1", src)
 
 
 def resolve_bash() -> str:
