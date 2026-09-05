@@ -104,6 +104,16 @@ class Cluster(NamedTuple):
     end_line: int
 
 
+# Third state for the ``retrieved`` predicate in :func:`analyze`. A file that
+# was read with an offset/limit is recorded by context-reads.py behind
+# PARTIAL_PREFIX and is DELIBERATELY excluded from read_tracker()'s full set
+# ("a ranged peek is not evidence you read the claim's source"). That exclusion
+# is correct and is NOT changed here -- a partial read still fails. What it
+# could not express is the DIFFERENCE between "never opened" and "opened, in
+# part", and the finding text asserted the former for both.
+PARTIAL = "partial"
+
+
 class Finding(NamedTuple):
     kind: str                # "missing-citation" | "decorative-citation"
     start_line: int
@@ -226,8 +236,34 @@ def analyze(text: str, retrieved=None) -> list:
         if retrieved is None:
             continue
         checkable = [t for t in cl.source_tokens if t[0] in ("url", "node-key")]
-        if checkable and not any(retrieved(k, v) for k, v in checkable):
-            cited = ", ".join(v for _, v in checkable[:3])
+        if not checkable:
+            continue
+        verdicts = [retrieved(k, v) for k, v in checkable]
+        # PARTIAL IS A TRUTHY STRING, so it MUST be excluded before any
+        # truthiness test -- a bare `any(verdicts)` reads it as a full
+        # retrieval and silently passes a cluster whose source was only
+        # peeked at. That is the ALARM-suppressing direction (guard-1760),
+        # which is the one this split must never fail in.
+        if any(v is not PARTIAL and v for v in verdicts):
+            continue
+        cited = ", ".join(v for _, v in checkable[:3])
+        if any(v is PARTIAL for v in verdicts):
+            # Same KIND and same severity -- the verdict is unchanged and no
+            # consumer branches on this text. What changes is that the message
+            # stops asserting something FALSE: the session DID retrieve this
+            # file, just not in full, and a reader told "NOT retrieved this
+            # session" goes looking for a read that already happened. The two
+            # texts mirror the pre-edit-context-gate advisories that
+            # read-before-edit.md Rule 4 already distinguishes ("has not been
+            # Read this session" vs "was Read only in part this session
+            # (ranged read)"), so the vocabulary is the framework's, not new.
+            findings.append(Finding(
+                "decorative-citation", cl.start_line, cl.end_line,
+                f"cited but retrieved ONLY IN PART this session (ranged read): "
+                f"{cited}. A ranged peek is not evidence for the claim -- "
+                "re-read the region that supports it. Same severity as "
+                "uncited; the difference is what to DO about it.", sample))
+        else:
             findings.append(Finding(
                 "decorative-citation", cl.start_line, cl.end_line,
                 f"cited but NOT retrieved this session: {cited}. A citation the "

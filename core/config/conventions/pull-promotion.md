@@ -292,6 +292,11 @@ over GitHub using the fleet token already provisioned per
 on the staging repo** — the pull side never pushes upstream, so a write scope is
 an unnecessary blast radius.
 
+The staging repo is `https://github.com/zkysar1/Claude-Mind` (locator, per
+`encode-stable-facts.md`; measured 2026-09-05 as coach-mind's `origin` fetch
+URL, and the repo serene-mind was hand-pointed at). A checkout whose `origin`
+fetch URL is this repo is the GIT-FED shape of §h.
+
 Failure behaviour is FAIL-CLOSED and non-escalating: if the fetch cannot
 authenticate, the adoption **does not start** — do not fall back to an
 unauthenticated clone, a mirror, or a hand-copied tree. The Mind keeps running
@@ -460,6 +465,16 @@ which is why the gate fails closed AND the wording names the subcommand.
    2026-08-27 coach-mind adoption ran the protocol by hand because the operator
    trusted this paragraph over `ls core/scripts`. An adopting Mind (and the
    g-002-02 cadence) should invoke the executor, not re-derive the steps.
+   **The entry point is `Skill(update-framework)`**
+   (`.claude/skills/update-framework/SKILL.md`, 2026-09-05): it loads this
+   convention, refuses at the dev origin, detects the deployment shape (§h) and
+   calls the executor — or merges the tag in place where the executor does not
+   apply. Never web-search for the framework: measured 2026-09-05 on
+   serene-mind, an agent asked to "pull fresh" guessed the executor, hit its
+   then-mandatory `--source-repo`, and fell through to a web search and then to
+   asking the user. The seed record for g-002-02 said "no executor or skill
+   exists" until the same day; a stale negative in a recurring goal's own text
+   is re-read every 72h and re-believed every time.
 
 ## f — The UPSTREAM lane: target-ahead files flow UP to the dev origin (normative)
 
@@ -582,8 +597,35 @@ deployment decision, not a framework default: coach-mind (small-model test bed)
 does; the production Mind, whose self-evolution has produced real target-ahead
 improvements that § f carries up, is left to its operator.
 
+## h — Two deployment shapes, one skill (normative, 2026-09-05)
+
+The executor (`framework-pull.sh`) copies framework files FROM a local clone of
+staging INTO a deployment whose own repo carries no framework history — the
+**TRANSPLANT** shape (seed-transplant targets; their `git tag --list 'v*'` is
+empty because "the plant carries no tags", C3). A deployment whose checkout IS
+a clone fed by the staging repo — `origin` fetch URL = the staging repo (C6),
+framework `v*` tags reachable in the repo itself — is the **GIT-FED** shape
+(measured 2026-09-05: coach-mind, `origin` → Claude-Mind, tags through
+v2.12.62, HEAD detached on a domain commit above v2.12.56). For git-fed the
+executor is the wrong tool, and its "no source repo" guidance now says so. The
+update is `git fetch origin --tags` then `git merge --no-edit <newest-tag>` in
+place — a fast-forward when there are no local commits, a real merge when there
+are, which is C2's reconcile done by git — followed by C4 verify, the
+addendum-d daemon recycle, and `framework-pull.sh --record-installed <tag>
+[--verified]` for the C3 record. That flag is the ONE writer of
+`world/installed-release.yaml` on this shape: the L1 path hook refuses a
+hand-Written NEW top-level world file, so without it a git-fed Mind could never
+start its record.
+
+The discriminator is one command — `git tag --list 'v*' --sort=v:refname |
+tail -1`, non-empty ⇒ git-fed — and `Skill(update-framework)` runs it before
+choosing. Both shapes share the dev-origin refusal (§e gate), the disjointness
+check (C5) and the seed-delta lane (§b). Neither shape ever pulls HEAD (C3),
+force-pushes, or hard-resets a tree that holds uncommitted store writes.
+
 ## Cross-references
 
+- `.claude/skills/update-framework/SKILL.md` — the entry point for both shapes (§h)
 - `.claude/rules/promotion-cycle.md` — the chain and the push/pull split
 - `core/scripts/_framework_origin.py`, `core/scripts/check-framework-origin-writes.py` — § g's policy module and Gate 15
 - `core/config/conventions/promotion-runbook.md` — the PUSH side

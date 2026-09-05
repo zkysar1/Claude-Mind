@@ -4,10 +4,16 @@
 # Thin wrapper over core/scripts/framework_pull.py. See
 # core/config/conventions/pull-promotion.md for the protocol this implements.
 #
-#   bash core/scripts/framework-pull.sh --source-repo ../claude-mind            # plan (default)
+#   bash core/scripts/framework-pull.sh                       # plan (default); source repo
+#                                                             # resolved from FRAMEWORK_SOURCE_REPO
+#                                                             # or the sibling ../claude-mind
 #   bash core/scripts/framework-pull.sh --source-repo ../claude-mind --json
 #   bash core/scripts/framework-pull.sh --source-repo ../claude-mind --adopt
+#   bash core/scripts/framework-pull.sh --record-installed v2.12.62 [--verified]
+#                                                             # git-fed shape (addendum h): record
+#                                                             # the tag merged in place; no source repo
 #
+# Entry point for BOTH deployment shapes: Skill(update-framework).
 # Exit: 0 ok | 2 blocked | 3 rolled back | 1 error.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

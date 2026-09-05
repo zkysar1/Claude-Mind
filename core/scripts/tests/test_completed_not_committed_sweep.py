@@ -865,27 +865,57 @@ def test_probe_sha_pull_request_gh_failure_is_unavailable():
         mod._git, mod._gh = orig_git, orig_gh
 
 
-def test_probe_sha_pull_request_prefers_the_open_one():
-    """When several PRs carry the commit, the OPEN one is the stranding."""
+def _pr_probe_with(payload):
+    """Run probe_sha_pull_request against a canned /pulls payload."""
     mod = _import()
     orig_git, orig_gh = mod._git, mod._gh
 
     def fake_git(repo, *args, timeout=15):
         return (0, "") if args[:2] == ("cat-file", "-e") else (1, "")
 
-    payload = json.dumps([
+    mod._git = fake_git
+    mod._gh = lambda repo, *a, **k: (0, json.dumps(payload))
+    try:
+        return mod.probe_sha_pull_request("deadbee", ["/repo"])
+    finally:
+        mod._git, mod._gh = orig_git, orig_gh
+
+
+# INVERTED 2026-09-05 (). This test previously asserted the OPEN one
+# wins, on the premise "when several PRs carry the commit, the OPEN one is the
+# stranding". That premise is FALSE and the test was pinning the defect. The
+# /pulls endpoint returns every PR whose head CONTAINS the sha, and on a split
+# repo every branch cut from `dev` contains everything already merged into dev
+# — so an unrelated open PR carries every recently-merged commit. Measured on
+# zkysar1/Vinheim-Web-App: open PR #439 was named for four unrelated commits
+# whose real merges were #426/#427/#429/#430 (guard-6045). The old fixture below
+# is unchanged, because it was always the false-positive shape: #40 is MERGED.
+def test_probe_sha_pull_request_prefers_the_merged_one():
+    """A MERGED PR carrying the commit outranks an OPEN one that merely
+    contains it — the merge is conclusive evidence the work shipped."""
+    rec = _pr_probe_with([
         {"number": 40, "state": "closed", "merged_at": "2026-07-01T00:00:00Z",
          "html_url": "u40", "title": "t40", "created_at": "2026-06-30T00:00:00Z"},
         {"number": 53, "state": "open", "merged_at": None,
          "html_url": "u53", "title": "t53", "created_at": "2026-07-21T09:15:50Z"},
     ])
-    mod._git = fake_git
-    mod._gh = lambda repo, *a, **k: (0, payload)
-    try:
-        rec = mod.probe_sha_pull_request("deadbee", ["/repo"])
-    finally:
-        mod._git, mod._gh = orig_git, orig_gh
-    assert rec["state"] == "OPEN" and rec["number"] == 53
+    assert rec["state"] == "MERGED" and rec["number"] == 40
+
+
+def test_probe_sha_pull_request_still_prefers_open_when_nothing_merged():
+    """POSITIVE CONTROL for the test above: the fix must not hardcode MERGED.
+
+    With no merged PR carrying the sha, the OPEN one is still selected — that
+    is the genuine stranding the sweep exists to flag, and inverting the
+    preference must not blind it. Without this control, a fix that always
+    returned norms[0] would pass the test above."""
+    rec = _pr_probe_with([
+        {"number": 41, "state": "closed", "merged_at": None,
+         "html_url": "u41", "title": "t41", "created_at": "2026-06-30T00:00:00Z"},
+        {"number": 54, "state": "open", "merged_at": None,
+         "html_url": "u54", "title": "t54", "created_at": "2026-07-21T09:15:50Z"},
+    ])
+    assert rec["state"] == "OPEN" and rec["number"] == 54
 
 
 def test_probe_sha_pull_request_empty_list_is_none_not_unavailable():

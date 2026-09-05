@@ -1140,16 +1140,79 @@ def render_adopt(result: dict) -> str:
     return "\n".join(L)
 
 
+def resolve_source_repo(project_root: Path, explicit: "str | None") -> "Path | None":
+    """The upstream clone to adopt FROM, resolved so the caller need not remember
+    the path (the gap that sent an agent web-searching for its own framework).
+
+    Priority: explicit --source-repo > FRAMEWORK_SOURCE_REPO (env, then the bound
+    agent's local-paths.conf) > the conventional sibling clone ``../claude-mind``
+    when it is a real git repo. Returns None only when nothing resolves, so main()
+    can print guidance instead of a bare argparse error.
+    """
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    env = os.environ.get("FRAMEWORK_SOURCE_REPO", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    try:
+        from _paths import _read_local_paths
+        conf_val = str((_read_local_paths() or {}).get("FRAMEWORK_SOURCE_REPO", "")).strip()
+    except Exception:
+        conf_val = ""
+    if conf_val:
+        return Path(conf_val).expanduser().resolve()
+    sibling = (project_root.parent / "claude-mind").resolve()
+    if (sibling / ".git").exists():
+        return sibling
+    return None
+
+
+def record_installed(*, project_root: Path, world_dir: Path, tag: str,
+                     verified: bool, adopted_from: "str | None" = None) -> dict:
+    """Write world/installed-release.yaml for a GIT-FED deployment (C3, §h).
+
+    The transplant path records this inside adopt(). A checkout that receives
+    the framework over git (its own repo carries the v* tags, `origin` is the
+    staging repo) has no adopt() step, and the L1 path hook refuses a
+    hand-Written NEW top-level world file -- so this is the one writer for that
+    shape. The tag must resolve in project_root: an unknown tag is an error,
+    never a silent record.
+    """
+    sha = tag_sha(project_root, tag)
+    if not sha:
+        return {"ok": False,
+                "error": f"tag {tag!r} does not resolve in {project_root}"}
+    doc = {
+        "installed_tag": tag,
+        "adopted_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "adopted_from": adopted_from or os.environ.get("MIND_UPSTREAM", "claude-mind"),
+        "source_sha": sha,
+        "verified": bool(verified),
+    }
+    world_dir.mkdir(parents=True, exist_ok=True)
+    (world_dir / "installed-release.yaml").write_text(render_installed_release(doc),
+                                                      encoding="utf-8")
+    return {"ok": True, **doc}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Framework-pull executor (pull-promotion.md). "
                     "Default mode is --plan: it never copies.")
-    ap.add_argument("--source-repo", required=True,
-                    help="path to the staging clone to adopt FROM")
+    ap.add_argument("--source-repo", default=None,
+                    help="path to the upstream clone to adopt FROM; if omitted, "
+                         "resolved from FRAMEWORK_SOURCE_REPO (env or "
+                         "local-paths.conf) then the sibling ../claude-mind")
     ap.add_argument("--plan", action="store_true",
                     help="dry run: full report, nothing copied (DEFAULT)")
     ap.add_argument("--adopt", action="store_true",
                     help="execute the adoption (requires a clear plan)")
+    ap.add_argument("--record-installed", metavar="TAG", default=None,
+                    help="git-fed shape only (pull-promotion.md addendum h): record TAG "
+                         "in world/installed-release.yaml and exit. TAG must resolve in "
+                         "THIS checkout. Needs no source repo.")
+    ap.add_argument("--verified", action="store_true",
+                    help="with --record-installed: the C4 suite was green on this box")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
     ap.add_argument("--agent", default=os.environ.get("MIND_AGENT"))
     ap.add_argument("--skip-quiesce-note", action="store_true",
@@ -1164,8 +1227,40 @@ def main(argv=None) -> int:
     except Exception:
         world_dir = project_root / "world"
 
+    if args.record_installed:
+        result = record_installed(project_root=project_root, world_dir=world_dir,
+                                  tag=args.record_installed, verified=args.verified)
+        if args.json:
+            print(json.dumps(result, indent=2, default=str))
+        elif result.get("ok"):
+            print(f"recorded {result['installed_tag']} ({result['source_sha'][:12]}) "
+                  f"verified={result['verified']} -> "
+                  f"{world_dir / 'installed-release.yaml'}")
+        else:
+            print(f"ERROR: {result['error']}", file=sys.stderr)
+        return EXIT_OK if result.get("ok") else EXIT_ERROR
+
+    source_repo = resolve_source_repo(project_root, args.source_repo)
+    if source_repo is None:
+        print(
+            "No source repo resolved. This script is the TRANSPLANT shape of the "
+            "adopting side (pull-promotion.md addendum h): it copies framework "
+            "files FROM a local clone of the staging framework repo INTO a "
+            "deployment whose own repo carries no framework history.\n"
+            "  - Pass --source-repo <path-to-staging-clone>, or set "
+            "FRAMEWORK_SOURCE_REPO in <agent>/local-paths.conf.\n"
+            "  - If THIS checkout carries the framework's v* tags (`git tag --list "
+            "'v*'` is non-empty) it is GIT-FED: do NOT use this script to adopt. "
+            "Run the update-framework skill, which merges the newest release tag "
+            "in place and then records it here with --record-installed.\n"
+            "  - Never web-search or hand-copy the framework. Read "
+            "core/config/conventions/pull-promotion.md.",
+            file=sys.stderr,
+        )
+        return EXIT_BLOCKED
+
     report = build_plan(project_root=project_root,
-                        source_repo=Path(args.source_repo).resolve(),
+                        source_repo=source_repo,
                         agent=args.agent, script_dir=script_dir,
                         world_dir=world_dir,
                         skip_quiesce=args.skip_quiesce_note)
@@ -1183,7 +1278,7 @@ def main(argv=None) -> int:
                   "above.", file=sys.stderr)
             return EXIT_BLOCKED
         result = adopt(project_root=project_root,
-                       source_repo=Path(args.source_repo).resolve(),
+                       source_repo=source_repo,
                        newest=report["newest_tag"], plan=report,
                        world_dir=world_dir)
         if args.json:

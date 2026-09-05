@@ -299,3 +299,98 @@ def test_scan_survives_a_raising_corroboration_reader(tmp_path):
     # diary + goals still read and frozen -> stalled; the board is recorded as unreadable
     assert fox["verdict"] == pl.V_STALLED
     assert fox["signals"]["board"]["readable"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI contract (). The zakbox1 host sweeper has no Mind checkout and
+# cannot import this module, so it runs THIS CLI inside a container over
+# `lxc exec` and parses the JSON. That makes the contract below a CROSS-REPO
+# dependency: world/scripts/fleet-liveness-sweep.py's shard lane is defined over
+# these keys, and its own tests mock `lxc`, so nothing else pins them.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cli_stamps_the_alerting_flag_on_every_peer(monkeypatch, capsys):
+    """`alerting` is the whole point: the host must not re-derive ALERTING."""
+    def fake_scan(world, self_agent, **kw):
+        return {"self": self_agent, "peers": [
+            {"agent": "a", "verdict": pl.V_STALLED},
+            {"agent": "b", "verdict": pl.V_SLOW},
+            {"agent": "c", "verdict": pl.V_UNKNOWN},
+            {"agent": "d", "verdict": pl.V_ALIVE},
+        ], "blind": False, "roster_provenance": pl.PROV_AUTHORITATIVE}
+
+    monkeypatch.setattr(pl, "scan", fake_scan)
+    assert pl.main(["--world", "/tmp/w"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    got = {p["agent"]: p["alerting"] for p in report["peers"]}
+    # Exactly the ALERTING set — only `stalled` pages.
+    assert got == {"a": True, "b": False, "c": False, "d": False}
+
+
+def test_cli_emits_a_report_and_exits_zero_even_when_blind(monkeypatch, capsys):
+    """The verdict is in the payload, never in the exit code (guard-1150).
+
+    The sweeper's reader-fallthrough keys on `blind`, and treats EMPTY STDOUT as
+    the only 'this told me nothing' signal — so a blind scan must still print.
+    """
+    monkeypatch.setattr(pl, "scan", lambda *a, **k: {
+        "peers": [], "blind": True, "blind_cause": "rows read failed"})
+    assert pl.main(["--world", "/tmp/w"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["blind"] is True and report["blind_cause"]
+
+
+def test_cli_defaults_to_classifying_the_whole_roster(monkeypatch, capsys):
+    """`--self` defaults to '' — the sweeper is nobody's peer and subtracts its
+    own container lane afterwards, so it needs every agent, not a peer set."""
+    seen = {}
+
+    def fake_scan(world, self_agent, **kw):
+        seen["self_agent"] = self_agent
+        seen["stale_hours"] = kw.get("stale_hours_override")
+        return {"peers": [], "blind": False}
+
+    monkeypatch.setattr(pl, "scan", fake_scan)
+    pl.main(["--world", "/tmp/w"])
+    assert seen["self_agent"] == ""
+    assert seen["stale_hours"] is None
+    pl.main(["--world", "/tmp/w", "--stale-hours", "0.01"])
+    assert seen["stale_hours"] == 0.01
+    capsys.readouterr()
+
+
+def test_cli_says_blind_rather_than_raising_when_the_world_is_unresolvable(
+        monkeypatch, capsys):
+    """A path failure must degrade to a readable blind report, never a traceback
+    — the sweeper parses stdout, and a traceback goes to stderr as empty JSON."""
+    monkeypatch.setitem(sys.modules, "_paths", None)   # import raises ModuleNotFoundError
+    assert pl.main([]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["blind"] is True
+    assert "world dir unresolved" in report["blind_cause"]
+
+
+def test_zero_stale_hours_is_honoured_not_swallowed_by_truthiness(monkeypatch):
+    """`--stale-hours 0` must mean 0, not the 3.0 default.
+
+    A falsy test here inverts a forced-stale positive control: the operator asks
+    for "treat everything as stale" and gets back a calm "nothing is stalled",
+    which reads as a working detector. Found by fresh-eyes on g-115-9030.
+    """
+    seen = {}
+
+    def rows(_world):
+        return ({"a": {"last_active": "2026-09-05T07:59:00", "session_ended": False}},
+                {"a": pl.PROV_AUTHORITATIVE}, pl.PROV_AUTHORITATIVE)
+
+    def spy(*a, **kw):
+        seen["thr"] = kw["stale_hours"]
+        return {"agent": a[0], "verdict": pl.V_ALIVE, "corroboration_needed": False}
+
+    monkeypatch.setattr(pl, "classify_peer", spy)
+    rep = pl.scan(Path("/tmp/w"), "", now=NOW, stale_hours_override=0, rows_reader=rows)
+    assert rep["stale_hours"] == 0.0
+    assert seen["thr"] == 0.0
+    # Positive control: None still falls through to the module default.
+    pl.scan(Path("/tmp/w"), "", now=NOW, stale_hours_override=None, rows_reader=rows)
+    assert seen["thr"] == pl.stale_hours() != 0.0
