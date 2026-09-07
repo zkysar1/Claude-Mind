@@ -64,11 +64,24 @@ def test_missing_slot_file_is_no_slot_not_a_drain_of_zero(tmp_path):
     assert res["failed"] == []
 
 
-def test_unresolvable_world_path_is_no_slot(monkeypatch):
+def test_unresolvable_world_path_falls_back_to_the_core_default(monkeypatch):
+    """CONTRACT CHANGED 2026-09-07 (). This asserted `no-slot`, which was
+    right while the world slot was the ONLY slot. It is now the exact case the core
+    default exists for: `world/` is excluded from the seed and is not in git, so a
+    seeded environment host resolves no world path at all — and answering `no-slot`
+    there disabled the drain on precisely the population it was built to serve.
+
+    The test's REAL invariant is preserved and still asserted: an unresolvable world
+    must never report a false drain. Only the status word moved.
+    """
     monkeypatch.setattr(MOD, "_world_path", lambda: None)
     res = MOD.run()
-    assert res["status"] == "no-slot"
+    assert res["slot_source"] == "core-default"
     assert res["drained"] == 0
+    # ... and `no-slot` must stay REACHABLE, or this test could pass against a
+    # runner that simply never reports it (the negative control lives in
+    # test_inbound_drain_default_slot.py::test_no_slot_only_when_the_core_default_is_also_gone).
+    assert res["status"] != "ok"
 
 
 def test_not_a_vessel_is_reported_as_such_and_not_as_ok_zero(tmp_path):

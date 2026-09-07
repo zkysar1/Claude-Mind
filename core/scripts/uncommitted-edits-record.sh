@@ -149,6 +149,20 @@ if [ "$goal_id" = "null" ] || [ -z "$goal_id" ]; then
     goal_id=""
 fi
 
+# WORKER-BODY FALLBACK (). `in_flight` is REDUCER-OWNED -- a worker Body's
+# claim writes agent_status.<agent>.in_flight_bodies.<sid> instead ("SKIP stamp:
+# non-reducer body ... in_flight is reducer-owned"), so the read above returns null
+# STRUCTURALLY on every worker edit and every row lands unattributed. Measured on cc-08
+# 2026-09-07: 197 of 242 .claude source rows had an empty goal_id, including an Edit made
+# under a live claim. Read the FULL nested path (guard-4455: a bare leaf silently returns
+# null), and only when the reducer-owned read came back empty, so a reducer is unchanged.
+if [ -z "$goal_id" ] && [ -n "${MIND_SID:-}" ]; then
+    goal_id=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight_bodies.${MIND_SID}.goal_id" --json 2>/dev/null | tr -d '"' || echo "")
+    if [ "$goal_id" = "null" ] || [ -z "$goal_id" ]; then
+        goal_id=""
+    fi
+fi
+
 # Append the record. AGENT_DIR is resolved by _paths.sh.
 log_path="$AGENT_DIR/session/uncommitted-edits.jsonl"
 mkdir -p "$(dirname "$log_path")" 2>/dev/null || exit 0
