@@ -196,6 +196,17 @@ STAGES = (
             # by test_iteration_open_stage_registry_parity rather than by a
             # reader, which is the arithmetic doing its job.
             "directive-mix-check",
+            # FOURTH occurrence of the identical drift, and the pattern is now
+            # the finding: registering a lane in precheck-always-run-battery.LANES
+            # is TWO edits, and the second one has been forgotten every single
+            # time. inbound-drain (Phase 0.5b.1e, the Pattern B executable hook
+            # slot) was wired 2026-09-07 and ran from that moment, while COVERAGE
+            # reported it unwired and `--dry-run` printed it as not-yet-wired —
+            # an under-report of the always-run tier, which is the one tier that
+            # may never be silently short. Caught by
+            # test_iteration_open_stage_registry_parity, which is the only reason
+            # any of the four were caught at all; no reader has ever spotted one.
+            "inbound-drain",
         ),
         # Count re-derived from the tuple, never re-typed: the sibling battery's
         # own docstring records seven stale "five lanes" claims from doing that.

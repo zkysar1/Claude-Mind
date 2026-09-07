@@ -134,22 +134,42 @@ def test_runtime_stamped_field_has_a_writer(field):
 
 
 def test_cooldown_uses_a_parser_that_can_parse_the_field():
-    """days_since() CANNOT parse last_selected. This is the trap, pinned behaviourally.
+    """The cooldown site must read last_selected with a parser that can parse it.
 
-    Not a style assertion: last_selected carries a time component, and
-    date.fromisoformat() raises on that, which days_since swallows into None. A
-    repoint to days_since(last_selected) is therefore still-dead code that looks
-    fixed. Asserted against the real functions so a future refactor of either
-    parser re-runs the discrimination rather than inheriting this claim.
+    HISTORY, because this test changed shape once and the reason matters. It used
+    to pin `days_since(datetime-shaped) is None` — the trap being that
+    date.fromisoformat() raises on a time component and days_since swallowed that
+    into None, so a repoint to days_since(last_selected) was still-dead code that
+    looked fixed. That pin carried its own release clause: "If that is deliberate,
+    the cooldown site may use either parser — but re-verify before relaxing this."
+
+    It WAS deliberate, 2026-09-07 (41cc4cb6f5): days_since/days_until now accept
+    both YYYY-MM-DD and YYYY-MM-DDTHH:MM:SS, because the SIBLING helper days_until
+    fed deadline_urgency and was silently scoring 0 for every timestamp deadline —
+    the framework's own mandated stamp format. RE-VERIFIED per the release clause:
+    the cooldown site still reads hours_since(last_selected) and still multiplies
+    by 24, both asserted below and both unchanged by that commit.
+
+    So the discrimination this test performs is now the POSITIVE one — both
+    parsers must handle the live stamp shape — while the call-site assertions,
+    which are the half that actually protects the branch, are untouched.
     """
     gs = _load_selector()
     live_shape = "2026-08-10T05:51:36"  # exactly what aspirations.py stamps
 
-    assert gs.days_since(live_shape) is None, (
-        "days_since now parses a datetime-shaped stamp. If that is deliberate, the "
-        "cooldown site may use either parser — but re-verify before relaxing this."
+    assert gs.days_since(live_shape) is not None, (
+        "days_since must parse the datetime-shaped stamp aspirations.py writes "
+        "(41cc4cb6f5). If this is None again, the both-shapes widening was "
+        "reverted — and its sibling days_until silently zeroes deadline_urgency "
+        "for every timestamp deadline when that happens (rb-10358)."
     )
     assert gs.days_since("2026-08-01") is not None, "date-only must still parse"
+    assert gs.days_since("2026-08-01") == gs.days_since("2026-08-01T23:59:59"), (
+        "the widening must be day-granular: a date-only value and a same-day "
+        "timestamp must agree, so a date-only deadline keeps its END-OF-DAY "
+        "meaning (guard-2073)"
+    )
+    assert gs.days_since("garbage") is None, "unparseable input must still be None"
 
     hs = gs.hours_since(live_shape)
     assert hs is not None, "hours_since must parse the datetime-shaped stamp"
@@ -199,8 +219,17 @@ def test_cooldown_branch_actually_skips_when_forced():
     assert skips(7, old) is False, "outside the cooldown window -> must not skip"
     assert skips(0, fresh) is False, "cooldown disabled -> never skip"
     assert skips(7, None) is False, "null recency -> never skip (fail-open)"
-    # The regression this whole goal is about: the pre-fix pairing.
-    assert gs.days_since(fresh) is None, (
-        "days_since(fresh datetime stamp) must be None — this is why the naive "
-        "repoint would have stayed dead"
+    # The regression this whole goal is about. Until 41cc4cb6f5 this asserted
+    # `days_since(fresh) is None` — the pre-fix pairing that made the naive
+    # repoint stay dead. days_since now parses both shapes, so the guard inverts:
+    # the site must WORK, and must not be silently depending on a broken parser.
+    assert gs.days_since(fresh) is not None, (
+        "days_since must parse a fresh datetime stamp (41cc4cb6f5)"
+    )
+    assert gs.hours_since(fresh) is not None, (
+        "hours_since is what the site actually calls and must keep working"
+    )
+    assert skips(7, fresh) is True, (
+        "the branch must still skip inside the window — re-asserted AFTER the "
+        "parser change, because that is the behaviour the pin above protects"
     )

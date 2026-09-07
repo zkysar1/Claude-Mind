@@ -2529,21 +2529,48 @@ def load_exploration_params():
 # ---------------------------------------------------------------------------
 
 def days_until(date_str):
-    """Days until a future date. Negative if past."""
+    """Days until a future date. Negative if past.
+
+    Accepts BOTH ``YYYY-MM-DD`` and ``YYYY-MM-DDTHH:MM:SS`` -- the latter is the
+    framework's canonical timestamp form (CLAUDE.md Naming Rules:
+    ``$(date +%Y-%m-%dT%H:%M:%S)``), and ``date.fromisoformat`` REJECTS it
+    (verified py3.12.3: ``date.fromisoformat("2026-09-07T20:39:55")`` ->
+    ValueError). The except below swallowed that into None, so a deadline
+    written in the framework's own timestamp format scored deadline_urgency 0
+    -- silently, and SELECTIVELY against the most urgent deadlines, because a
+    same-day deadline is the one an author naturally writes with a time while a
+    week-out deadline gets a bare date. Measured 2026-09-07 (bravo, cc-05) over
+    2453 live goal records: 6 non-terminal goals were losing ALL deadline pull,
+    incl. one due in <1d (+3.0 raw) and one in ~2d (+2.0). The sibling
+    ``hours_since`` already parsed both forms; the workaround comment at the
+    cooldown check names this defect and routes around it rather than fixing it.
+
+    Day granularity is preserved by slicing the date part instead of building a
+    datetime: a date-only value keeps its existing END-OF-DAY meaning
+    (guard-2073) and every value that parsed before parses identically, so the
+    widening is monotone. Not routed through ``_dt.parse_naive_iso`` -- that
+    returns a datetime and would introduce naive/aware comparison hazard
+    (guard-4372) for no gain at this call site's day resolution.
+    """
     if not date_str:
         return None
     try:
-        return (date.fromisoformat(str(date_str)) - date.today()).days
+        return (date.fromisoformat(str(date_str)[:10]) - date.today()).days
     except (ValueError, TypeError):
         return None
 
 
 def days_since(date_str):
-    """Days since a past date. Negative if future."""
+    """Days since a past date. Negative if future.
+
+    Same both-shapes tolerance and the same monotone date-part slice as
+    ``days_until`` above -- see its docstring for the measurement and for why a
+    datetime parse is deliberately NOT used here.
+    """
     if not date_str:
         return None
     try:
-        return (date.today() - date.fromisoformat(str(date_str))).days
+        return (date.today() - date.fromisoformat(str(date_str)[:10])).days
     except (ValueError, TypeError):
         return None
 

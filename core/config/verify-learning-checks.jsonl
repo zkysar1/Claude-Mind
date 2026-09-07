@@ -59,11 +59,15 @@
 {"k": "body", "raw": "- Journal entries in `agents/<agent>/journal/`\n", "s": 0}
 {"k": "body", "raw": "- Reasoning bank entries: `reasoning-bank-read.sh --summary`\n", "s": 0}
 {"k": "prose", "raw": "\n", "s": 0}
-{"k": "why", "raw": "   # AUTHORITATIVE CHECK SOURCE: All actively-evaluated checks live here in Step 3.\n", "s": 0}
-{"k": "why", "raw": "   # core/config/verification-checklist.md is a comprehensive reference catalog\n", "s": 0}
-{"k": "why", "raw": "   # (2000+ items) but is too large to load in one context window. When adding new\n", "s": 0}
-{"k": "why", "raw": "   # checks for new features, add them HERE, not in the checklist file.\n", "s": 0}
-{"k": "why", "raw": "   # The checklist file remains useful for per-section deep dives via targeted reads.\n", "s": 0}
+{"k": "why", "raw": "   # AUTHORITATIVE CHECK SOURCE: this registry — core/config/verify-learning-checks.jsonl.\n", "s": 0}
+{"k": "why", "raw": "   # The checks left .claude/skills/verify-learning/SKILL.md Step 3 on 2026-08-18\n", "s": 0}
+{"k": "why", "raw": "   # (g-115-6689): inline they reached 1,208,153 B against a 63,515 B skill-injection\n", "s": 0}
+{"k": "why", "raw": "   # ceiling, so every run received about the first 5% plus a truncation marker. A check\n", "s": 0}
+{"k": "why", "raw": "   # written back inline there today is installed, committed, greppable and NEVER RUN\n", "s": 0}
+{"k": "why", "raw": "   # (guard-4767). ADD CHECKS VIA `verify-check-registry.sh add`, never by hand-editing\n", "s": 0}
+{"k": "why", "raw": "   # a check record. core/config/verification-checklist.md remains a comprehensive\n", "s": 0}
+{"k": "why", "raw": "   # reference catalog (2000+ items), too large for one context window and useful for\n", "s": 0}
+{"k": "why", "raw": "   # per-section deep dives via targeted reads — it is not a place to add checks.\n", "s": 0}
 {"k": "prose", "raw": "\n", "s": 0}
 {"k": "why", "raw": "   # 4-Tier Architecture evidence checks (Section 4T)\n", "s": 0, "x": "4T"}
 {"k": "check", "raw": "   Check: `world/.initialized` exists (init-world.sh ran successfully)\n", "s": 0, "x": "4T"}
@@ -6065,6 +6069,8 @@
 {"k": "check", "raw": "   Check: `.claude/skills/tree/SKILL.md` DISTILL consumes the producer's `trigger` field, not only `recommended_action` — both emitted read-cap trigger values are named in that file: `grep -q \"trigger == oversized_not_append_grown\" .claude/skills/tree/SKILL.md` AND `grep -q \"trigger == oversized_append_grown\" .claude/skills/tree/SKILL.md` both exit 0. `core/scripts/tree.py` `get_distill_candidates` emits exactly this pair (tree.py:1237-1238, and `_READ_CAP_TRIGGERS` at :1315 names both); a consumer that stops naming them has dropped the append-grown/read-cap distinction the routing depends on.\n", "s": 0, "x": "PU2"}
 {"k": "why", "raw": "   # Closes the loop on g-115-4077 rather than reproducing its defect. This goal exists because a producer emitted `recommended_action` that no consumer read — invisible to 36 distill tests and a clean full suite, because every test asserted on the EMITTED value and none asserted anything READS it. The `owned_by` deliverable landed in exactly that shape: at first commit, a grep for `owned_by` across .claude/skills, core/config and mind_api/src returned hits ONLY inside core/scripts/tree.py itself. Caught by the Q2 negative check (name the failure mode, then actually check it), fixed by wiring tree/SKILL.md step 1, and pinned here so the asymmetry cannot come back. Positive-controlled before writing (alpha, cc-09, 2026-09-07): each anchor is 1 hit in tree/SKILL.md and 0 in .claude/skills/aspirations/SKILL.md.\n", "s": 0, "x": "PU2"}
 {"k": "check", "raw": "   Check: The `owned_by` annotation has a CONSUMER, not just a producer. `core/scripts/tree.py` `get_distill_candidates` emits `owned_by` on read-cap rows (:1274 default, :1337 annotation), and `.claude/skills/tree/SKILL.md` DISTILL step 1 reads it: all three of `grep -q \"OWNERSHIP (g-115-4077)\" .claude/skills/tree/SKILL.md`, `grep -q \"It ANNOTATES, it does NOT SUPPRESS\" .claude/skills/tree/SKILL.md` and `grep -q \"sig-229\" .claude/skills/tree/SKILL.md` exit 0. Each is a single hit in that file and exists only inside the ownership block, so absence means the consumer is gone while the producer keeps emitting.\n", "s": 0, "x": "PU2"}
+{"k": "why", "raw": "   # The g-115-6689 extraction was guarded in ONE direction only: the sibling check above asserts the retired add-them-HERE wording is absent from SKILL.md, but nothing guarded the pointers that send an author TO SKILL.md. Measured 2026-09-07: three prose surfaces plus this registry own preamble still named SKILL.md Step 3 as the authoritative destination three weeks after the move, and an encode-session run followed one of them, dedup-grepped the file that holds no checks, and read a false zero with PASSING positive controls. A stale SOURCE path fails loudly; a stale DESTINATION fails silently.\n", "s": 0, "x": "PU2"}
+{"k": "check", "raw": "   Check: the three prose surfaces that route check-authors all name the REGISTRY, not SKILL.md Step 3 (repointed 2026-09-07; the g-115-6689 move left them stale for three weeks). Bash: `grep -L \"verify-learning-checks.jsonl\" .claude/skills/encode-session/SKILL.md core/config/verification-checklist.md core/config/verification-checklist-domain-specific.md | grep . && { echo \"FAIL: file(s) above no longer name the check registry\"; exit 1; } || echo PASS` → expect PASS\n", "s": 0, "x": "PU2"}
 {"k": "why", "raw": "   # Multi-agent coordination evidence checks (Section MAC)\n", "s": 0, "x": "MAC"}
 {"k": "why", "raw": "   # Cross-pollinated from \"Language Model Teams as Distributed Systems\" (arXiv 2603.12229)\n", "s": 0, "x": "MAC"}
 {"k": "check", "raw": "   Check: `core/config/aspirations.yaml` has `multi_agent:` section with `claim_timeout_hours` and `reallocation_hours`\n", "s": 0, "x": "MAC"}

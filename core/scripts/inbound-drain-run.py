@@ -67,19 +67,48 @@ def _world_path() -> Path | None:
     return Path(v) if v else None
 
 
+#: The DEFAULT slot, used when this world does not fill the hook. Pattern B says
+#: the world slot is an OVERRIDE, and until 2026-09-07 an unfilled hook meant the
+#: feature was simply absent. That is the right default for an optional hook and
+#: the wrong one here: `world/` is excluded from the seed and is not in git, so
+#: the environments this feature exists to serve are exactly the ones that can
+#: never carry a world slot (measured 0 of 45 live workspaces — ).
+DEFAULT_SLOT = SCRIPT_DIR / f"{SLOT_NAME}-default.sh"
+
+
+def _resolve_slot(slot_override: Path | None) -> tuple[Path | None, str]:
+    """Return (slot, source). Source is world | core-default | none.
+
+    ORDER IS THE CONTRACT: a world that fills the hook still wins, so adding the
+    default cannot change behaviour on any box that already had a slot.
+    """
+    if slot_override is not None:
+        return slot_override, "override"
+    wp = _world_path()
+    if wp is not None:
+        world_slot = wp / "scripts" / f"{SLOT_NAME}.sh"
+        if world_slot.is_file():
+            return world_slot, "world"
+    if DEFAULT_SLOT.is_file():
+        return DEFAULT_SLOT, "core-default"
+    return None, "none"
+
+
 def run(apply: bool = False, slot_override: Path | None = None) -> dict:
-    slot = slot_override
-    if slot is None:
-        wp = _world_path()
-        if wp is None:
-            return {"status": "no-slot", "slot": SLOT_NAME, "drained": 0, "failed": [],
-                    "note": "WORLD_PATH unresolvable — cannot locate the slot"}
-        slot = wp / "scripts" / f"{SLOT_NAME}.sh"
+    slot, slot_source = _resolve_slot(slot_override)
 
     # Pattern B requirement 3: missing convention = silent no-op, never an error.
+    # Reachable now only if the core default is ALSO missing, which means a
+    # damaged install rather than an unfilled hook — so the note says so.
+    if slot is None:
+        return {"status": "no-slot", "slot": SLOT_NAME, "slot_source": "none",
+                "drained": 0, "failed": [],
+                "note": "no world slot and no core default — the core default "
+                        f"({DEFAULT_SLOT.name}) is missing from this install"}
     if not slot.is_file():
-        return {"status": "no-slot", "slot": slot.as_posix(), "drained": 0, "failed": [],
-                "note": "this world does not fill the inbound-drain slot — supported"}
+        return {"status": "no-slot", "slot": slot.as_posix(), "slot_source": slot_source,
+                "drained": 0, "failed": [],
+                "note": "the named slot does not exist"}
 
     argv = [BASH, slot.as_posix(), "--json"]   # guard-580: BASH resolved, never bare "bash"
     if apply:
@@ -87,30 +116,35 @@ def run(apply: bool = False, slot_override: Path | None = None) -> dict:
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"status": "unparseable", "slot": slot.as_posix(), "drained": 0,
+        return {"status": "unparseable", "slot": slot.as_posix(), "slot_source": slot_source,
+                "drained": 0,
                 "failed": [{"file": "-", "reason": f"slot did not run: {exc}"}]}
 
     out = (proc.stdout or "").strip()
     if not out:
-        return {"status": "unparseable", "slot": slot.as_posix(), "drained": 0,
+        return {"status": "unparseable", "slot": slot.as_posix(), "slot_source": slot_source,
+                "drained": 0,
                 "failed": [{"file": "-", "reason":
                             "slot printed ZERO bytes at rc=%s — a malfunction, not a "
                             "result; every branch of the slot emits JSON" % proc.returncode}]}
     try:
         payload = json.loads(out)
     except ValueError:
-        return {"status": "unparseable", "slot": slot.as_posix(), "drained": 0,
+        return {"status": "unparseable", "slot": slot.as_posix(), "slot_source": slot_source,
+                "drained": 0,
                 "failed": [{"file": "-", "reason":
                             "slot output is not JSON: %s" % out[:200]}]}
 
     if payload.get("not_a_vessel"):
-        return {"status": "not-a-vessel", "slot": slot.as_posix(), "drained": 0,
+        return {"status": "not-a-vessel", "slot": slot.as_posix(), "slot_source": slot_source,
+                "drained": 0,
                 "failed": [], "note": payload.get("reason") or "slot declined"}
 
     envs = payload.get("environments") or []
     res = {
         "status": "ok",
         "slot": slot.as_posix(),
+        "slot_source": slot_source,
         "root": payload.get("root"),
         "apply": bool(apply),
         "environments_seen": len(envs),

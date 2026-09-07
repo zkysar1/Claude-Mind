@@ -901,6 +901,23 @@ felt_sense:
 # state. Designed to accumulate evidence the taxonomy review can act on.
 # Implementation: core/scripts/l1-skew-check.py --cadence --post-board
 l1_skew_check:
+  # team_aware is deliberately ABSENT (i.e. false) — justified, not overlooked
+  # (). Structurally this looks like the guard-718 shared-resource
+  # class: it reviews the world-level L1 taxonomy, it SELF-ACTS (--post-board),
+  # and it carries the tightest cadence here, so N agents could each post about
+  # one shared tree. MEASURED 2026-09-07 (alpha, cc-07) before changing it:
+  # duplicate rate is ZERO — 7,296 coordination messages over 10 days
+  # (2026-08-28 -> 2026-09-07) carry 0 posts tagged l1-skew or tree-taxonomy,
+  # positive-controlled (the same query+parser returns 5 for type=finding).
+  # The reason is line 588: _post_board fires only on `any_flagged`, so a
+  # collision needs TWO agents to detect skew in the same window — a compound
+  # condition never once observed, though the check itself does run (three
+  # agents carry the wm slot). Per the  precedent (4 collisions
+  # measured before adding hot-path complexity), 0 does not buy a claim.
+  # TRIGGER TO REVISIT: the FIRST real l1-skew board post. From that moment the
+  # duplication is live, and team_aware should be added then — note it stamps
+  # its slot inside l1-skew-check.py rather than via fresh-eyes-record-tick.sh,
+  # so it will NOT inherit the  claim mechanism for free.
   goal_cadence: 50              # Every N completed goals — passive observability
   wm_slot: last_l1_skew_check
   threshold: 5.0                # LEGACY: ratio evidence carried in the payload
