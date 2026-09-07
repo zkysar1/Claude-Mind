@@ -11,6 +11,7 @@ than fixed. `FakeClock` also makes the assertions exact -- "expired at 5.0s"
 rather than "expired eventually".
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -908,4 +909,210 @@ def test_both_reference_modules_coexist_on_one_bus():
     bus.emit("file-touch")
     assert set(bus.read_continuous()) == {"script-poll"}
     assert bus.pending_event_count() == 0, "an absent file that stayed absent"
+    assert bus.error_counts == {}
+
+
+# ---------------------------------------------------------------------------
+# S2.3 read-file: StateDocumentModule. The third perception kind -- the one
+# M-12 needs, since S2.1 carries no payload and S2.2 spawns a process per tick.
+# ---------------------------------------------------------------------------
+
+def test_read_file_reference_module_delivers_through_the_bus(tmp_path):
+    """StateDocumentModule -- the S2.3 read-file reference."""
+    doc = tmp_path / "state.json"
+    doc.write_text('{"position": [1, 2, 3]}', encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "reference-pack", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+
+    assert m.cadence is pb.CadenceType.CONTINUOUS
+    assert bus.tick() == 1
+    percept = bus.read_continuous()["state-doc"]
+    assert percept.source_pack == "reference-pack"
+    assert percept.payload["content"] == {"position": [1, 2, 3]}
+    assert percept.payload["readable"] is True
+    assert percept.payload["error"] is None
+    assert percept.confidence == 1.0
+    assert percept.provenance is pb.ProvenanceTag.DIRECT
+
+
+def test_unchanged_content_is_not_re_reported(tmp_path):
+    """S2.3: a percept is delivered `only when the content has changed`."""
+    doc = tmp_path / "state.json"
+    doc.write_text('{"v": 1}', encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert bus.tick() == 1
+    assert bus.tick() == 0, "an unchanged document is not a new observation"
+
+
+def test_a_byte_identical_rewrite_is_not_a_change_even_though_mtime_moved(tmp_path):
+    """THE hash-not-mtime pin. A tick loop republishing an unchanged reading
+    moves mtime without changing the world; an mtime-based detector would
+    manufacture a percept per tick out of a world that stood still."""
+    import os
+    doc = tmp_path / "state.json"
+    doc.write_text('{"v": 1}', encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert bus.tick() == 1
+
+    before = os.stat(doc).st_mtime
+    doc.write_text('{"v": 1}', encoding="utf-8")     # same bytes, new write
+    os.utime(doc, (before + 10 ** 4, before + 10 ** 4))
+    assert os.stat(doc).st_mtime != before, "the premise: mtime really moved"
+    assert bus.tick() == 0, "identical content is not a new observation"
+
+
+def test_changed_content_is_reported(tmp_path):
+    doc = tmp_path / "state.json"
+    doc.write_text('{"v": 1}', encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    bus.tick()
+    doc.write_text('{"v": 2}', encoding="utf-8")
+    assert bus.tick() == 1
+    assert bus.read_continuous()["state-doc"].payload["content"] == {"v": 2}
+
+
+def test_an_absent_document_is_reported_once_then_falls_silent(tmp_path):
+    """Mirrors FileTouchModule's deletion contract: the absence is news the
+    first time (the producer is not publishing) and is not news thereafter."""
+    m = pb.StateDocumentModule("state-doc", "p", path=tmp_path / "never.json")
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert bus.tick() == 1
+    percept = bus.read_continuous()["state-doc"]
+    assert percept.payload["readable"] is False
+    assert percept.payload["content"] is None
+    assert percept.confidence == 0.5
+    assert bus.tick() == 0, "a still-absent document is not a new observation"
+
+
+def test_malformed_content_is_reported_not_swallowed(tmp_path):
+    """`the producer is publishing garbage` is itself an observation."""
+    doc = tmp_path / "state.json"
+    doc.write_text("{not json", encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert bus.tick() == 1
+    percept = bus.read_continuous()["state-doc"]
+    assert percept.payload["readable"] is False
+    assert percept.confidence == 0.5
+    assert "JSONDecodeError" in percept.payload["error"]
+
+
+def test_a_producer_that_changes_how_it_fails_is_a_new_observation(tmp_path):
+    """The error text is part of the state, so a NEW failure mode is news."""
+    doc = tmp_path / "state.json"
+    doc.write_text("{not json", encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert bus.tick() == 1
+    doc.unlink()
+    assert bus.tick() == 1, "malformed -> absent is a different failure"
+    assert "unreadable" in bus.read_continuous()["state-doc"].payload["error"]
+
+
+def test_an_injected_reader_is_used_instead_of_the_filesystem():
+    """The transport pin: the module never learns a layout, so M-12's
+    undecided JVM->Python transport is not prejudged by this class."""
+    readings = iter(['{"v": 1}', '{"v": 1}', '{"v": 2}'])
+    m = pb.StateDocumentModule("state-doc", "p", reader=lambda: next(readings))
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert m.path is None
+    assert bus.tick() == 1
+    assert bus.tick() == 0, "same reading twice is one observation"
+    assert bus.tick() == 1
+
+
+def test_a_raising_reader_is_reported_rather_than_blinding_the_module():
+    def boom():
+        raise RuntimeError("transport down")
+    m = pb.StateDocumentModule("state-doc", "p", reader=boom)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    assert bus.tick() == 1
+    percept = bus.read_continuous()["state-doc"]
+    assert percept.payload["readable"] is False
+    assert "transport down" in percept.payload["error"]
+    assert bus.error_counts == {}, "reported as a percept, not as a module error"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {},
+    {"path": "/tmp/x", "reader": lambda: "{}"},
+])
+def test_exactly_one_source_is_required(kwargs):
+    """Two sources is an ambiguity and zero is a silent no-op; both refused."""
+    with pytest.raises(ValueError):
+        pb.StateDocumentModule("state-doc", "p", **kwargs)
+
+
+def test_the_module_forwards_and_never_derives(tmp_path):
+    """S2.3 is distinguished from S2.2 by `the absence of computation`: the
+    payload carries the document verbatim, including fields nothing reads."""
+    payload = {"position": [1.5, 2.5, 3.5], "distance": 9.25,
+               "touchCount": 4, "distanceStatus": "near",
+               "unknownFutureField": {"deep": [1, 2]}}
+    doc = tmp_path / "state.json"
+    doc.write_text(json.dumps(payload), encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    bus.tick()
+    assert bus.read_continuous()["state-doc"].payload["content"] == payload
+
+
+def test_read_file_module_honors_throttle_and_ttl(tmp_path):
+    """S3.1 internal throttle applies to this kind like any other CONTINUOUS
+    module -- a 3 Hz producer need not imply a 3 Hz consumer."""
+    doc = tmp_path / "state.json"
+    doc.write_text('{"v": 1}', encoding="utf-8")
+    m = pb.StateDocumentModule("state-doc", "p", path=doc,
+                               throttle_ticks=3, ttl=5.0)
+    bus = pb.PerceptionBus()
+    bus.register(m)
+    bus.start()
+    # tick() increments _tick_no BEFORE the `% throttle_ticks == 0` test, so
+    # with throttle_ticks=3 the admitted ticks are 3, 6, 9 -- not 1, 4, 7.
+    assert bus.tick() == 0          # tick 1 throttled out
+    assert bus.tick() == 0          # tick 2 throttled out
+    assert bus.tick() == 1          # tick 3 admitted -- first reading
+    doc.write_text('{"v": 2}', encoding="utf-8")
+    assert bus.tick() == 0          # tick 4 throttled out
+    assert bus.tick() == 0          # tick 5 throttled out
+    assert bus.tick() == 1          # tick 6 admitted -- the change is delivered
+    assert bus.read_continuous()["state-doc"].payload["content"] == {"v": 2}
+    assert bus.read_continuous()["state-doc"].ttl == 5.0
+
+
+def test_all_three_perception_kinds_coexist_on_one_bus(tmp_path):
+    """The convention names three kinds (S2.1/S2.2/S2.3); one bus carries all."""
+    doc = tmp_path / "state.json"
+    doc.write_text('{"v": 1}', encoding="utf-8")
+    bus = pb.PerceptionBus()
+    bus.register(pb.FileTouchModule("file-touch", "reference-pack", doc))
+    bus.register(pb.ScriptPollModule("script-poll", "reference-pack",
+                                     [sys.executable, "-c", "print('ok')"]))
+    bus.register(pb.StateDocumentModule("state-doc", "reference-pack", path=doc))
+    bus.start()
+    bus.tick()
+    assert set(bus.read_continuous()) == {"script-poll", "state-doc"}
     assert bus.error_counts == {}

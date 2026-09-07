@@ -614,7 +614,38 @@ class Server:
         try:
             self._http.serve_forever()
         finally:
-            lifecycle.clear_runtime_files(self.project_root)
+            # : release the LISTENING SOCKET before the discovery
+            # files, never after. serve_forever() returning does NOT mean this
+            # process is dying — it runs in a background thread (__main__.py
+            # "CRITICAL: serve_forever runs in a background thread"), and on
+            # the catastrophic-exit path this finally is reached while the main
+            # thread is still alive and server.stop() has NOT run yet — the
+            # supervisor loop's own comment says so ("serve_forever() died ...
+            # its finally already cleared our files"). Clearing pid/port first
+            # therefore produced exactly the guard-5681 shape: a live process
+            # still holding its port with every file that made it findable
+            # deleted. Measured guard-6154 (echo, cc-03, 2026-09-06): five
+            # alive listeners, daemon.pid/parent.pid/port all missing, then
+            # seven consecutive bind_failed on the pinned port.
+            #
+            # The socket release is the ARBITER, not an exit code (guard-5681
+            # template). If it cannot be confirmed, KEEP the files: an
+            # unreachable-but-FINDABLE daemon is recoverable — daemon-orphan-
+            # sweep.sh builds its keep-set from exactly these files — whereas
+            # an unfindable one can only be resolved by hand.
+            released = True
+            try:
+                self._http.server_close()
+            except Exception as e:  # noqa: BLE001 — must never mask the exit
+                released = False
+                self._log_lifecycle("socket_close_failed", error=repr(e))
+            if released:
+                lifecycle.clear_runtime_files(self.project_root)
+            else:
+                self._log_lifecycle(
+                    "runtime_files_retained",
+                    reason="listening socket not confirmed released; files kept "
+                           "so the process stays findable (guard-5681)")
             self._log_lifecycle("stopped")
         return self.actual_port
 

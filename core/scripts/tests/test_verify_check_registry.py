@@ -127,9 +127,30 @@ class TestFixedPoint:
                 break
         assert self.run(mod, registry, lines) == 1
 
-    def test_deleted_middle_block_fails(self, mod, registry):
+    def test_deleted_middle_block_is_NOT_internally_detectable(self, mod, registry):
+        """Same honest limit as the tail case below — now symmetric, deliberately.
+
+        This asserted `== 1` while `seq` was STORED: a middle deletion left a gap
+        in the stored values and the contiguity check caught it, whereas dropping
+        the LAST block did not. That asymmetry was an artifact of storing
+        position, not a designed protection — the detector fired on where a line
+        sat rather than on anything about the corpus.
+
+        Storing `seq` is what made an insertion renumber every later record
+        (+5854/-5853 for ONE added check, measured), which on a store with no
+        merge handler wedged concurrent boxes out of pushing entirely. It is
+        derived at load now, so both deletion cases behave alike.
+
+        The narrow detector is not what was protecting this store, and the real
+        incident proves it: on 2026-09-05 a hand-resolved merge renumbered `q`
+        across the whole file, so contiguity PASSED, while `parent_seq` stayed
+        wrong on 83 records. The check that caught that corruption is the fixed
+        point immediately above, which is untouched and now actually holds. The
+        external defenses named in the tail-truncation sibling — the shrink guard
+        on `extract --write`, and git — are likewise untouched.
+        """
         lines = registry.read_text(encoding="utf-8").splitlines()
-        assert self.run(mod, registry, lines[:4] + lines[5:]) == 1
+        assert self.run(mod, registry, lines[:4] + lines[5:]) == 0
 
     def test_tail_truncation_is_NOT_internally_detectable(self, mod, registry):
         """An honest limit, pinned so nobody mistakes the fixed point for more.
@@ -246,7 +267,36 @@ class TestAdd:
         assert all(b["raw"].endswith("\n") for b in blocks)
         assert mod.cmd_verify(TestFixedPoint.Args()) == 0
 
-    def test_insertion_renumbers_and_keeps_the_fixed_point(self, mod, registry, capsys):
+    def test_insertion_rewrites_only_the_inserted_lines(self, mod, registry, capsys):
+        """The regression test for the merge wedge ().
+
+        A stored `seq` made every later record change on any insertion, so
+        adding ONE check produced +5854/-5853 on the live registry. This store
+        is fence-only — `merge_handler_for` returns None — so two boxes adding a
+        check in the same window conflicted on nearly every line and the loser
+        could not push at all (behind 40 -> 85 in 26 minutes while ahead sat at
+        5, measured 2026-09-05).
+
+        Position is derived at load now, so the on-disk cost of an insertion is
+        exactly the lines inserted. Asserted on the FILE, not on the in-memory
+        blocks, because the file is what git has to merge.
+        """
+        before_lines = registry.read_text(encoding="utf-8").splitlines()
+        assert mod.cmd_add(self.Args()) == 0
+        capsys.readouterr()
+        after_lines = registry.read_text(encoding="utf-8").splitlines()
+
+        added = [l for l in after_lines if l not in before_lines]
+        removed = [l for l in before_lines if l not in after_lines]
+        assert len(after_lines) == len(before_lines) + 1
+        assert removed == [], f"an insertion must rewrite no existing line, got {removed}"
+        assert len(added) == 1, f"expected exactly one new line, got {len(added)}"
+        # and the untouched lines keep their ORDER and position relative to the
+        # splice — a set comparison alone would miss a reshuffle.
+        at = after_lines.index(added[0])
+        assert after_lines[:at] + after_lines[at + 1:] == before_lines
+
+    def test_insertion_keeps_the_fixed_point(self, mod, registry, capsys):
         before = mod.load_registry(registry)
         n_before = sum(1 for b in before if b["kind"] in ("check", "bash_named"))
         assert mod.cmd_add(self.Args()) == 0
@@ -259,7 +309,7 @@ class TestAdd:
         known = set(seqs)
         assert all(b["parent_seq"] in known
                    for b in after if b.get("parent_seq") is not None), \
-            "parent_seq must be shifted with its parent"
+            "parent_seq must resolve to a real block after an insertion"
         assert mod.cmd_verify(TestFixedPoint.Args()) == 0
 
     def test_lands_in_the_requested_section(self, mod, registry, capsys):

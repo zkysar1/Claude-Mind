@@ -154,6 +154,16 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                 # .
                 "last_updated": node.get("last_updated"),
                 "article_count": node.get("article_count", 0),
+                # retrieval_count + utility_ratio: MIRROR of the same two fields
+                # in core/scripts/tree.py --summary — keep in sync. Rationale and
+                # the measured harm live beside the CLI copy. THIS copy is the one
+                # that matters at runtime: the wrapper is daemon-only, so editing
+                # tree.py alone changes NOTHING a caller sees while looking
+                # entirely correct in the diff (measured here 2026-09-06 —
+                # 1576/1576 nodes still lacked both fields after the CLI-side fix).
+                # .
+                "retrieval_count": node.get("retrieval_count", 0),
+                "utility_ratio": node.get("utility_ratio"),
                 "children": node.get("children", []),
             }
         return json_response_pretty({"nodes": compact, "total": len(compact)})

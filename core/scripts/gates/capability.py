@@ -660,18 +660,49 @@ def _load_human_only(world_dir) -> list:
     except Exception:
         return []
     rows, in_section = [], False
+    prev_was_pipe_row = False
     for line in raw.splitlines():
         s = line.strip()
         if s.startswith("## "):
             in_section = s.lower().startswith("## human-only")
+            prev_was_pipe_row = False
             continue
         if not in_section or not s:
+            prev_was_pipe_row = False
             continue
-        # bullets (the actual shape) or table rows (future-proofing)
+        # bullets or table rows — see the docstring's SHAPE note; both are live
         if s.startswith("- ") or s.startswith("* "):
             rows.append({"source": "capability-routing.md#human-only", "row": s})
-        elif s.startswith("|") and set(s.replace("|", "").replace("-", "").replace(":", "").strip()) > set(" "):
-            rows.append({"source": "capability-routing.md#human-only", "row": s})
+            prev_was_pipe_row = False
+        elif s.startswith("|"):
+            if set(s.replace("|", "").replace("-", "").replace(":", "").strip()) > set(" "):
+                rows.append({"source": "capability-routing.md#human-only", "row": s})
+                prev_was_pipe_row = True
+            else:
+                # DELIMITER row (|---|---|). It reduces to empty and was already
+                # excluded; what was NOT excluded is the line above it. In
+                # markdown the row immediately preceding a delimiter IS the
+                # table HEADER, so retract it — a header is column labelling,
+                # never an entry (g-115-4434 defect 3).
+                #
+                # WHY A LOOKBEHIND AND NOT A CONTENT TEST: the header's text is
+                # arbitrary, so any "does this look like a header" predicate is
+                # a guess that grows stale with the document. Position relative
+                # to the delimiter is what markdown actually defines, and it is
+                # the same structural signal the delimiter check already uses.
+                #
+                # DISCARDED BREADTH, INVENTORIED (guard-4315): the only row this
+                # removes from the live convention is `| Action | Why Human-Only |`,
+                # contributing the tokens Action / Why / Human-Only. Those are
+                # generic labels, not capability vocabulary, so nothing that
+                # SHOULD veto stops vetoing. Measured 2026-09-07 on cc-08: the
+                # section holds 12 pipe lines — 10 entries, 1 delimiter, this 1
+                # header — and 0 bullets.
+                if prev_was_pipe_row:
+                    rows.pop()
+                prev_was_pipe_row = False
+        else:
+            prev_was_pipe_row = False
     return rows
 
 

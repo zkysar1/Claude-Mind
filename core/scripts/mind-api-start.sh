@@ -744,6 +744,56 @@ while [ "$waited" -lt "$max_wait" ]; do
 done
 
 # 4. Timed out — daemon did not come up.
+#
+#  / guard-6154: separate the SELF-WEDGE from a generic slow start.
+# MIND_API_PORT pins the listen port (, and that pin is correct — it
+# removes a fail-OPEN bug where a client on a stale OS-assigned port silently
+# missed). But a pinned port turns ONE unpublished orphan into a PERMANENT
+# wedge: every later restart binds the same port, hits EADDRINUSE and dies.
+# Measured 2026-09-06 (echo, cc-03, Linux 6.8.0-138-generic): seven consecutive
+# bind_failed on 19003 behind a 27-minute-old orphan, while the message below
+# said only "did not become ready within 10s" — so the caller retried blind.
+# The framework is daemon-only, so this is a total work stoppage AND the agent
+# cannot use the daemon to diagnose the daemon. Naming the port and the recovery
+# is what breaks the retry loop.
+#
+# The log scan is DIAGNOSTIC ONLY. The exit code stays 1 and the readiness
+# contract above (published port + health probe) remains the sole success
+# signal — never derive an rc from output markers (guard-6060).
+#
+# NO IMPLICIT REAP, deliberately. The in-wrapper empty-args
+# _sweep_orphan_daemons kills every mind_api.src process system-wide and
+# collides with sibling deployments — see the "DELIBERATELY no implicit"
+# note above, which this change leaves intact. The cross-repo-safe reaper is
+# the standalone daemon-orphan-sweep.sh (keep-set built from every deployment's
+# published pair, ); it is NAMED here as the recovery and invoked
+# explicitly, never fired from this path.
+DAEMON_LOG="$RT_DIR/daemon.log"
+wedged_port=""
+if [ -f "$DAEMON_LOG" ]; then
+    wedged_port="$(tail -n 20 "$DAEMON_LOG" 2>/dev/null \
+        | grep 'bind_failed' | tail -1 \
+        | sed -n 's/.*"port": *\([0-9][0-9]*\).*/\1/p')"
+fi
+
+if [ -n "$wedged_port" ]; then
+    alive_list="$(bash "$PROJECT_ROOT/core/scripts/proc-match.sh" 'mind_api.src' 2>/dev/null || true)"
+    alive_n="$(printf '%s' "$alive_list" | grep -c . || true)"
+    echo "[daemon-start] ERROR: daemon did not become ready within 10s — PORT $wedged_port IS WEDGED (bind_failed: address already in use)." >&2
+    if [ -n "$alive_list" ]; then
+        echo "[daemon-start]   $alive_n mind_api.src process(es) alive; one holds $wedged_port but is NOT published, so nothing can reach it and EVERY restart fails identically. Retrying this command will NOT help." >&2
+    else
+        echo "[daemon-start]   The pinned port is held by a process this box could not enumerate; every restart will fail identically. Retrying this command will NOT help." >&2
+    fi
+    echo "[daemon-start]   RECOVERY (guard-6154):" >&2
+    echo "[daemon-start]     bash core/scripts/daemon-orphan-sweep.sh            # report" >&2
+    echo "[daemon-start]     bash core/scripts/daemon-orphan-sweep.sh --clean    # reap (cross-repo safe)" >&2
+    echo "[daemon-start]     bash core/scripts/mind-api-start.sh                 # restart" >&2
+    echo "[daemon-start]   Do NOT hand-kill by PID and do NOT rm the state files." >&2
+    _log "ERROR: did not become ready within 10s — port $wedged_port WEDGED (bind_failed); ${alive_n:-?} mind_api.src alive; recovery: daemon-orphan-sweep.sh --clean then mind-api-start.sh"
+    exit 1
+fi
+
 echo "[daemon-start] ERROR: daemon did not become ready within 10s" >&2
 _log "ERROR: daemon did not become ready within 10s"
 exit 1

@@ -86,6 +86,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import _rt  # canonical Python -> daemon client (post-cutover)
 from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
 DEFAULT_DEPENDENCY_TIMEOUT_HOURS = 48.0
 ESCALATE_AT_FRACTION = 0.75  # notify at 75% of the timeout (36h of 48h)
@@ -99,10 +100,7 @@ SUBJECT_TAG_PREFIX = "dep-subject:"
 def _parse_iso(s):
     if not s or not isinstance(s, str):
         return None
-    try:
-        return dt.datetime.fromisoformat(s.replace("Z", "").strip())
-    except Exception:
-        return None
+    return parse_naive_iso(s)
 
 
 def _age_hours(iso_ts, now):

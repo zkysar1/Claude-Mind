@@ -184,3 +184,141 @@ def test_verdict_roundtrip_writer_to_gate(tmp_path):
     assert svg.evaluate(verdict, "g-2", "", datetime.now())[0] == 2
     # Claiming the written top pick allows.
     assert svg.evaluate(verdict, "g-1", "", datetime.now())[0] == 0
+
+
+# ── gate telemetry: branch labels + registry pairing () ──────
+
+def _branch_cases():
+    """(label, verdict, claimed, code) for every branch `_classify` can reach
+    from a direct call. `path_resolution_failed` is main()-only — no verdict is
+    ever built on that path — and is covered by the completeness test below."""
+    return [
+        ("no_verdict",             None,                                      "g-2", ""),
+        ("malformed_verdict",      {"ts": NOW.strftime("%Y-%m-%dT%H:%M:%S")}, "g-2", ""),
+        ("stale_verdict",          _verdict("g-1", ts=NOW - timedelta(minutes=11)), "g-2", ""),
+        ("top_pick_match",         _verdict("g-1"),                           "g-1", ""),
+        ("unsanctioned_deviation", _verdict("g-1"),                           "g-2", ""),
+        ("sanctioned_deviation",   _verdict("g-1"),         "g-2", "self-abstention"),
+    ]
+
+
+def test_classify_emits_expected_branch_label():
+    """Every branch of the decision core returns its own stable label — the
+    telemetry discriminator guard-502 requires (no two branches conflated)."""
+    for want, verdict, claimed, code in _branch_cases():
+        got = svg._classify(verdict, claimed, code, NOW)[0]
+        assert got == want, f"expected {want}, got {got}"
+
+
+def test_branch_labels_are_unique():
+    """guard-502: a shared label would silently merge two branches in the
+    firing log, which is the failure this instrumentation exists to prevent."""
+    labels = [c[0] for c in _branch_cases()]
+    assert len(labels) == len(set(labels))
+
+
+def test_evaluate_is_a_faithful_facade_over_classify():
+    """`evaluate` keeps its 3-tuple contract and must never disagree with
+    `_classify` — the branch logic lives in exactly one place."""
+    for _want, verdict, claimed, code in _branch_cases():
+        path, rc, msg, ev = svg._classify(verdict, claimed, code, NOW)
+        assert svg.evaluate(verdict, claimed, code, NOW) == (rc, msg, ev)
+        assert path in svg.DECISION_BY_PATH
+
+
+def test_decision_by_path_covers_every_branch_and_uses_valid_decisions():
+    """Every label maps to a decision, and every decision is one _gate_log
+    accepts — an invalid value is silently coerced to fail_open, which would
+    make `block` and `pass` indistinguishable in the log."""
+    import importlib
+    gate_log = importlib.import_module("_gate_log")
+    reachable = {c[0] for c in _branch_cases()} | {"path_resolution_failed"}
+    assert reachable == set(svg.DECISION_BY_PATH), (
+        "DECISION_BY_PATH must cover exactly the reachable branch labels")
+    for path, decision in svg.DECISION_BY_PATH.items():
+        assert decision in gate_log._VALID_DECISIONS, f"{path} -> {decision}"
+
+
+def test_decisions_match_caller_control_flow_effect():
+    """guard-1743: the decision names the branch's effect AT THE CALLER
+    (aspirations-claim.sh aborts on rc 2 and proceeds otherwise), not local
+    intent. Deny -> block; sanctioned bypass -> override; validated allow ->
+    pass; unvalidated allow -> fail_open."""
+    d = svg.DECISION_BY_PATH
+    assert d["unsanctioned_deviation"] == "block"    # caller exits 2
+    assert d["sanctioned_deviation"] == "override"   # named bypass flag used
+    assert d["top_pick_match"] == "pass"             # validated, claim proceeds
+    for path in ("no_verdict", "malformed_verdict", "stale_verdict",
+                 "path_resolution_failed"):
+        assert d[path] == "fail_open", path
+
+
+def test_gate_id_is_registered_in_gates_yaml():
+    """_gate_log's contract: gate_id MUST match an `id` in core/config/gates.yaml
+    or the retirement evaluator and gate-stats cannot see this gate's firings."""
+    import yaml
+    registry = yaml.safe_load(
+        (CORE_SCRIPTS.parent / "config" / "gates.yaml").read_text(encoding="utf-8"))
+    entries = [g for g in registry["gates"] if g.get("id") == svg.GATE_ID]
+    assert len(entries) == 1, f"{svg.GATE_ID} not registered exactly once"
+    entry = entries[0]
+    assert entry["instrumented"] is True
+    assert entry["script"] == "core/scripts/scorer-verdict-gate.py"
+
+
+def test_log_gate_firing_never_raises():
+    """Telemetry is best-effort and must NEVER affect the claim — including on
+    a garbage decision path, a None agent, and an unknown label."""
+    svg._log_gate_firing("no_verdict", "alpha", "g-1", "g-1", "")
+    svg._log_gate_firing("not-a-real-path", None, None, None, None)
+    svg._log_gate_firing(None, "", "", "", "")
+
+
+def test_identifying_fields_travel_in_extra_not_payload(monkeypatch):
+    """`_gate_log` stores `extra` VERBATIM but reduces `payload` to a
+    `payload_hash`. The identifying fields — above all `scorer_top`, the goal
+    the selector ranked first and this Body did not take — must therefore go in
+    `extra`, or they reach no consumer. Caught in review 2026-09-06 after the
+    first implementation put them in `payload`; pinned here because the failure
+    is SILENT (rows still appear, they just answer nothing)."""
+    import importlib
+    gate_log = importlib.import_module("_gate_log")
+    seen = {}
+
+    def _capture(gate_id, decision, **kw):
+        seen["gate_id"] = gate_id
+        seen["decision"] = decision
+        seen.update(kw)
+
+    monkeypatch.setattr(gate_log, "log", _capture)
+    svg._log_gate_firing("sanctioned_deviation", "alpha", "g-2", "g-1",
+                         "self-abstention")
+
+    assert seen["gate_id"] == svg.GATE_ID
+    assert seen["decision"] == "override"
+    assert "payload" not in seen, "identifying fields must not be hashed away"
+    extra = seen["extra"]
+    assert extra["scorer_top"] == "g-1"      # the skipped goal — the point
+    assert extra["claimed"] == "g-2"
+    assert extra["deviation"] == "self-abstention"
+    assert extra["decision_path"] == "sanctioned_deviation"
+    assert seen["override_reason"] == "self-abstention"
+
+
+def test_override_reason_only_set_on_sanctioned_branch():
+    """`override_reason` names the bypass actually used. A stray --deviation
+    string on a non-override branch would inflate the override count and
+    corrupt the FP ratio this instrumentation exists to make measurable."""
+    import importlib
+    gate_log = importlib.import_module("_gate_log")
+    seen = []
+    orig = gate_log.log
+    try:
+        gate_log.log = lambda gid, dec, **kw: seen.append((dec, kw.get("override_reason")))
+        # a deviation code present on a branch that is NOT the sanctioned one
+        svg._log_gate_firing("stale_verdict", "alpha", "g-2", "g-1", "self-abstention")
+        svg._log_gate_firing("sanctioned_deviation", "alpha", "g-2", "g-1", "self-abstention")
+    finally:
+        gate_log.log = orig
+    assert seen[0] == ("fail_open", None)
+    assert seen[1] == ("override", "self-abstention")

@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.65",
+    "previous_version": "2.12.64",
+    "date": "2026-09-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Framework fixes + features from 2026-09-06/07: inbound-directive box-side drains (sidecar + member-write spools) wired through a hook slot; escalation-target routing for framework write sites; object-cache etag reclamation and a reachable size knob; human-window added to the user_leg_scope vocabulary; stop/worker/daemon correctness fixes (MIND_SID-empty refusal, pinned-port wedge recovery, closure-evidence clobber guard)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.64",
+    "previous_version": "2.12.63",
+    "date": "2026-09-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fix: vessel daemons bricked on Python 3.9 by PEP 604 unions in runtime annotations (ec14f563bf, 8 modules, future-import added); ships the inbound-drain family (member directives reach a stopped Mind); Pearl B2c critical path",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.63",
     "previous_version": "2.12.62",
     "date": "2026-09-05",

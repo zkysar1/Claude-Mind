@@ -60,6 +60,8 @@ unblocked the goal. Mirrors bravo's g-115-27 blocker-recheck (Layer C) for
 participants:[user] blockers.
 """
 
+from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json

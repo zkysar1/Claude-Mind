@@ -677,6 +677,7 @@ echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK sid=$HOOK_SID agent=$HOOK_AGENT runner_to
 TTD_MARKER=""
 TTD_SEVERITY=""
 TTD_EVIDENCE=""
+TTD_ENDS_WITH_TOOL=""
 TTD_DETECTOR="$WORLD_DIR/scripts/trailing-text-detector.py"
 if [ -f "$TTD_DETECTOR" ]; then
     # Hard timeout (, sq-011 forward-prediction). A hanging detector
@@ -690,18 +691,49 @@ if [ -f "$TTD_DETECTOR" ]; then
         TTD_MARKER=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('marker') or '')" 2>/dev/null || echo "")
         TTD_SEVERITY=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('severity') or '')" 2>/dev/null || echo "")
         TTD_EVIDENCE=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(d.get('evidence') or '')" 2>/dev/null || echo "")
+        # ends_with_tool is the detector's own AUTHORITATIVE compliance signal
+        # (its loader comment says so): the last content block was a tool_use.
+        # Lives under `context`, not at top level. Normalised to lowercase so
+        # the shell test below is stable against Python's True/False casing.
+        TTD_ENDS_WITH_TOOL=$(printf '%s' "$TTD_RESULT" | $PY -c "import sys,json;d=json.loads(sys.stdin.read() or '{}');print(str((d.get('context') or {}).get('ends_with_tool')).lower())" 2>/dev/null || echo "")
     fi
 fi
 
-# Append to detection log on high severity (fail-open)
+# Append to detection log (fail-open). severity=high OR the canonical
+# text-death shape: marker=trailing_prose with ends_with_tool=false.
+#
+# WHY trailing_prose is admitted despite being severity=low ().
+# The severity ladder ranks how confidently the detector can name WHY a turn
+# ended in prose; `trailing_prose` is its fallback branch, so the SHAPE the
+# return protocol exists to catch is structurally capped at "low" and could
+# never reach this append. That is not a cosmetic gap: the only consumer,
+# stop-hook-analyze.sh, uses this ledger as a false-positive SUPPRESSION
+# allow-list -- a BLOCK streak with zero records here is discarded as a
+# sleep-cycle (). So a real trailing_prose text-death was suppressed
+# as a false positive, which is the opposite of the intent.
+#
+# ends_with_tool is the right discriminator, and it is the one that
+# suppression comment already reaches for in prose: a sleep-cycle BLOCK ends
+# with a Bash tool call to interruptible-sleep.sh (ends_with_tool=true),
+# while a text-death ends on text (false). Severity was a proxy for that.
+#
+# MEASURED before widening (guard-1917/guard-5792, run against the real
+# population): over 1014 BLOCK invocations in core/logs/stop-hook-timing.jsonl
+# (2026-06-20..07-06, six agents), severity=high fired 0 times -- the gate was
+# dead -- while trailing_prose/low accounts for 35 (3.5%), about 2/day
+# fleet-wide. This widening admits those 35 and nothing else: marker=none
+# (3 records) and the 976 empty-severity records are untouched.
+#
 # Cross-agent concurrency: alpha and bravo stop-hooks can fire simultaneously
 # (e.g., parallel autocompact). Bare open(a) interleaves records and corrupts
 # the line-delimited format. Route through _fileops.locked_append_jsonl which
 # acquires .lock + snapshots history + atomic-writes. Fix per alpha F-001
 # finding (msg-20260504-223622-alpha-727,  cross-agent fresh-eyes).
-if [ "$TTD_SEVERITY" = "high" ] && [ -n "$TTD_MARKER" ]; then
+if [ -n "$TTD_MARKER" ] && { [ "$TTD_SEVERITY" = "high" ] || \
+     { [ "$TTD_MARKER" = "trailing_prose" ] && [ "$TTD_ENDS_WITH_TOOL" = "false" ]; }; }; then
     TTD_NOW="$(date +%Y-%m-%dT%H:%M:%S)"
     TTD_MARKER="$TTD_MARKER" TTD_SEVERITY="$TTD_SEVERITY" TTD_EVIDENCE="$TTD_EVIDENCE" \
+    TTD_ENDS_WITH_TOOL="$TTD_ENDS_WITH_TOOL" \
     TTD_NOW="$TTD_NOW" TTD_AGENT="$HOOK_AGENT" TTD_SID="$HOOK_SID" \
     TTD_LOG="$WORLD_DIR/loop-death-detections.jsonl" \
     TTD_CORE_SCRIPTS="$PROJECT_ROOT/core/scripts" \
@@ -716,6 +748,9 @@ rec = {
     'marker': os.environ['TTD_MARKER'],
     'evidence_snippet': os.environ.get('TTD_EVIDENCE', ''),
     'severity': os.environ['TTD_SEVERITY'],
+    # Records WHICH arm admitted this row: 'false' here beside severity='low'
+    # is the trailing_prose arm; a 'high' row is the original arm ().
+    'ends_with_tool': os.environ.get('TTD_ENDS_WITH_TOOL', ''),
 }
 locked_append_jsonl(os.environ['TTD_LOG'], rec)
 " 2>/dev/null || true

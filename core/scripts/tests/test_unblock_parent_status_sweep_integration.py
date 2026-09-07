@@ -166,6 +166,10 @@ def _read_goal(world: Path, goal_id: str) -> dict | None:
 def test_happy_path_parent_terminal_unblock_marked_skipped():
     """Canonical Layer D shape: Unblock + parent.status=skipped -> applied=1.
 
+    Lane 1 of the four this file was filed with (g-115-699); "Layer D" is the
+    capability-gate defer->Unblock auto-conversion (probe-before-defer.md rule 5,
+    core/config/conventions/defer-routing.md).
+
     After the sweep:
       - applied counter == 1
       - candidates length == 1
@@ -422,3 +426,91 @@ def test_untimestamped_unblock_reports_age_uncomputable_not_below_threshold():
             unblock = _read_goal(world, "g-700-73")
             assert unblock is not None and unblock["status"] == "pending", (
                 "an uncomputable-age Unblock must be left alone, exactly as before")
+
+
+def test_diagnostic_parent_guard_fires_through_main():
+    """ guard-FIRING branch through main() ().
+
+    THE WIRING, NOT THE FUNCTION. The eight unit tests for this guard live
+    in test_unblock_parent_diagnostic_guard.py and call
+    _diagnostic_parent_guard DIRECTLY, so deleting its invocation from the
+    apply loop leaves every one of them green -- the helper survives the
+    revert, and a test bound at the helper layer is blind to a call-site
+    defect by construction (guard-1648 / guard-1451, read as one law: match
+    the test's binding layer to the defect's layer). Measured on this
+    mutation: 110 pre-existing tests across the six test_unblock_parent_*
+    files all stayed GREEN and this test was the SOLE red (guard-4034 --
+    a test that is never the sole red for some mutation has not earned its
+    place). This test binds at the CALL-SITE layer: it runs the real apply
+    path through main() and asserts the veto reached the outcome.
+
+    Fixture: parent COMPLETED, and the parent's own close note says the
+    blocking condition still holds ("dependent goal stays blocked", a
+    _PERSISTS_MARKERS member). That is the diagnostic-parent shape -- the
+    parent was an investigation that ran to completion and reported the
+    block is REAL, so its terminal status discharges nothing and the child
+    Unblock must not be swept.
+
+    NOTHING ELSE MAY VETO IN THIS GUARD'S PLACE, or the test is vacuous:
+    every assertion here EXCEPT the reason-substring one would still hold
+    with the wiring deleted -- measured, not reasoned (g-115-8613 mutation
+    proof, 2026-09-06, alpha worker on cc-08; see the paragraph below).
+    So the fixture defuses both siblings deliberately. The child carries no
+    successor marker in any of the three SUCCESSOR_MARKER_FIELDS, so
+    _successor_marker_guard returns None. And the parent completes
+    2026-06-01, a MONTH AFTER the child was created -- the rb-3887
+    provenance guard's "genuine wait: Unblock long predates parent
+    completion" branch -- so it returns None too.
+
+    That date gap is load-bearing and was MEASURED, not reasoned: an
+    earlier draft of this fixture gave the parent completed_at equal to the
+    child's created_at, and under the g-115-8613 mutation proof the rb-3887
+    guard vetoed the sweep in this guard's place. applied and candidates
+    both still read 0 with the invocation removed, the goal stayed pending
+    on disk, and ONLY the reason-substring assertion reddened -- the test
+    would have shipped mostly vacuous. Do not "simplify" the parent's
+    completed_at back to the child's date. (rb-3887 covers ALL link priorities since g-115-2674 --
+    a priority-1 origin_signal link does NOT exempt it, which is the part
+    that is easy to get wrong from reading _provenance_only_parent alone.)
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_with_pair(
+            Path(tmpd),
+            parent_status="completed",
+            parent_extra={
+                # A MONTH after the child's created_at (2026-05-01), so the
+                # rb-3887 provenance guard reads a genuine wait and abstains.
+                "completed_at": "2026-06-01T00:00:00",
+                "outcome_note": (
+                    "Investigated end to end and CONFIRMED the processor is "
+                    "still unreachable; the dependent goal stays blocked "
+                    "until the service returns."),
+            })
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep rc={rc}; stderr={err!r}; stdout={out!r}"
+            result = json.loads(out)
+            assert result["applied"] == 0, (
+                f"a diagnostic parent's completion must NOT sweep its child; "
+                f"got applied={result['applied']}")
+            assert len(result["candidates"]) == 0, (
+                f"guard-vetoed Unblock must not surface as candidate; "
+                f"got {result['candidates']}")
+            fired = [d for d in result.get("details", [])
+                     if d.get("goal_id") == "g-700-73"
+                     and "g-115-8586" in (d.get("reason") or "")]
+            assert fired, (
+                f"details[] must record the g-115-8586 diagnostic-parent veto "
+                f"for g-700-73 -- its absence is the apply-loop invocation "
+                f"going missing; details={result.get('details')}")
+            assert fired[0].get("action") == "skipped", (
+                f"the veto row must be action=skipped; got {fired[0]!r}")
+
+            # On-disk: goal untouched (status pending, no outcome_note)
+            unblock = _read_goal(world, "g-700-73")
+            assert unblock is not None
+            assert unblock["status"] == "pending", (
+                f"guard-vetoed Unblock must stay pending; got {unblock['status']!r}")
+            assert not unblock.get("outcome_note"), (
+                f"guard-vetoed Unblock must have no outcome_note; "
+                f"got {unblock.get('outcome_note')!r}")

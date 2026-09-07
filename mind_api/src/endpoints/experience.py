@@ -1,6 +1,9 @@
 """GET /v1/experience/read — parity with `experience.py read`.
 
-Query params (mutually exclusive — exactly one):
+Query params. FILTERS COMPOSE with SELECTORS (g-115-5730); they are not
+mutually exclusive, whatever this docstring said before — it said "exactly
+one" while a live caller was already combining three, and the code silently
+honoured only the first:
     id=<exp-id>             searches live then archive
     category=<cat>          live only
     goal=<goal-id>
@@ -14,6 +17,17 @@ Query params (mutually exclusive — exactly one):
     meta=1
     validate=1              cross-file integrity check (JSONL vs .md files)
 
+Composition contract:
+    FILTERS   category / goal / hypothesis / type   — narrow, and AND together
+    SELECTORS most_retrieved | least_retrieved | recent — order + limit; these
+              stay exclusive among themselves (precedence in that order)
+    FORMAT    summary=1 — renders the filtered+limited set as plain text lines,
+              NOT JSON. That is by design and predates this change: `summary=1`
+              alone returns the same plain lines. A caller needing JSON, or any
+              field the line does not carry (e.g. tree_nodes_related), must not
+              pass it.
+    TERMINAL  id / archive / meta / validate — distinct modes, not composable.
+
 Live + archive + meta paths are AGENT-local (<agent>/experience*.jsonl).
 """
 from __future__ import annotations
@@ -22,7 +36,8 @@ import json
 
 from ..jsonl_cache import cache
 from ._jsonl_common import (
-    find_by_id, flag, json_response_pretty, missing_flag_error, plain_lines,
+    find_by_id, flag, json_response_pretty, missing_flag_error,
+    parse_int_param, plain_lines,
 )
 # Reuse the WRITER's derivation helper rather than adding a third copy of the
 # regex (). experience_write.py's own comment demands its copy stay
@@ -43,16 +58,6 @@ def _archive(ctx):
 
 def _meta(ctx):
     return ctx.paths.agent / "experience-meta.json"
-
-
-def _parse_n(s: str, default: int = 10) -> int:
-    if s == "" or s is None:
-        return default
-    try:
-        n = int(s)
-    except ValueError:
-        return default
-    return n if n > 0 else default
 
 
 def _validate(ctx):
@@ -131,90 +136,123 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             return Response.error(404, "not_found", f"Record {rec_id} not found")
         return json_response_pretty(result[1])
 
+    # ── COMPOSED READ PIPELINE () ─────────────────────────────
+    # These params were once a first-match-wins if/return chain, so a
+    # COMBINATION silently took the earliest branch and dropped the rest:
+    # `--type goal_execution --recent 30` returned the whole type-filtered
+    # store (849 records here, byte-identical to `--type` alone) because the
+    # `type` branch returned before `recent` was ever read. No error, rc=0.
+    #
+    # The module docstring called these "mutually exclusive", but NOTHING
+    # ENFORCED that and a real caller was already combining them:
+    # aspirations-consolidate Step 2.9 has called
+    # `--type goal_execution --recent 30 --summary` on every consolidation, on
+    # every box, since long before this was noticed. So the exclusivity was a
+    # claim in prose, not a property of the code — and the gap ran silent for
+    # the one reason that matters: each flag is CORRECT ALONE, so any test
+    # covering them individually passes while the combination is broken.
+    #
+    # Three separable concerns, applied in order. Filters NARROW, selectors
+    # ORDER-AND-LIMIT, format RENDERS. Ordering is load-bearing: filter before
+    # limit, or `--type X --recent N` returns the N most recent records OF ANY
+    # TYPE and then filters them, which yields fewer than N (often zero) while
+    # still looking plausible.
+    items = list(jc.get(_live(ctx)))
+
     category = q.get("category")
     if category:
-        items = jc.get(_live(ctx))
-        return json_response_pretty([r for r in items if r.get("category") == category])
+        items = [r for r in items if r.get("category") == category]
 
     goal = q.get("goal")
     if goal:
-        # Match the goal_id FIELD or the goal-id embedded in the record ID
-        # (). The field alone is not sufficient, and the reason is
-        # durability rather than writer bugs:  already fixed the
-        # writer and REPAIRED 862 records in this file at 04:13 on 2026-08-21 —
-        # by 06:00 the very next writes had reverted 26 of them to null. This
-        # store is append-heavy and fleet-synced, so a peer holding a copy that
-        # predates a repair silently un-does it on merge (guard-3209: a locked
-        # write plus a clean re-read proves the write LANDED, not that it
-        # SURVIVES). A field-only predicate therefore re-breaks on its own,
-        # and re-running the backfill is a treadmill.
-        #
-        # The record ID cannot be eroded that way — it is the record's identity,
-        # every writer forms it as exp-{goal_id}[-{slug}], and no merge rewrites
-        # it. So deriving from the id makes this read correct for the 28
-        # currently-invisible records AND immune to the next erosion, with no
-        # migration.
-        #
-        # This is what makes guard-2939's anti-overwrite pre-check able to fire
-        # at all: that check asks "does this goal already have an experience?"
-        # and a false [] tells a caller the bare exp-<goal-id> id and .md path
-        # are free when they are taken, so the Write silently overwrites.
-        #
-        # NOT widened to source_id, deliberately: source_id is the goal id only
-        # for goal_execution records, and carries hypothesis/other ids on the
-        # rest, so matching it would return foreign records under a goal query.
-        # The id derivation is exact — the regex anchors a full canonical goal
-        # id — so it cannot false-positive.
-        items = jc.get(_live(ctx))
-        return json_response_pretty([
+    # Match the goal_id FIELD or the goal-id embedded in the record ID
+    # (). The field alone is not sufficient, and the reason is
+    # durability rather than writer bugs:  already fixed the
+    # writer and REPAIRED 862 records in this file at 04:13 on 2026-08-21 —
+    # by 06:00 the very next writes had reverted 26 of them to null. This
+    # store is append-heavy and fleet-synced, so a peer holding a copy that
+    # predates a repair silently un-does it on merge (guard-3209: a locked
+    # write plus a clean re-read proves the write LANDED, not that it
+    # SURVIVES). A field-only predicate therefore re-breaks on its own,
+    # and re-running the backfill is a treadmill.
+    #
+    # The record ID cannot be eroded that way — it is the record's identity,
+    # every writer forms it as exp-{goal_id}[-{slug}], and no merge rewrites
+    # it. So deriving from the id makes this read correct for the 28
+    # currently-invisible records AND immune to the next erosion, with no
+    # migration.
+    #
+    # This is what makes guard-2939's anti-overwrite pre-check able to fire
+    # at all: that check asks "does this goal already have an experience?"
+    # and a false [] tells a caller the bare exp-<goal-id> id and .md path
+    # are free when they are taken, so the Write silently overwrites.
+    #
+    # NOT widened to source_id, deliberately: source_id is the goal id only
+    # for goal_execution records, and carries hypothesis/other ids on the
+    # rest, so matching it would return foreign records under a goal query.
+    # The id derivation is exact — the regex anchors a full canonical goal
+    # id — so it cannot false-positive.
+        items = [
             r for r in items
             if r.get("goal_id") == goal
             or _derive_goal_id_from_id(r.get("id")) == goal
-        ])
+        ]
 
     hypothesis = q.get("hypothesis")
     if hypothesis:
-        items = jc.get(_live(ctx))
-        return json_response_pretty(
-            [r for r in items if r.get("hypothesis_id") == hypothesis]
-        )
-
-    if flag(q, "summary"):
-        items = jc.get(_live(ctx))
-        lines = []
-        for rec in items:
-            typ = rec.get("type", "?")
-            cat = rec.get("category", "?")
-            summary = rec.get("summary", "(no summary)")
-            lines.append(f"{rec.get('id', '?')}: [{typ}] {cat} — {summary}")
-        return plain_lines(lines)
+        items = [r for r in items if r.get("hypothesis_id") == hypothesis]
 
     typ = q.get("type")
     if typ:
-        items = jc.get(_live(ctx))
-        return json_response_pretty([r for r in items if r.get("type") == typ])
+        items = [r for r in items if r.get("type") == typ]
 
+    # Selectors stay mutually exclusive AMONG THEMSELVES (most > least >
+    # recent), preserving the pre-existing precedence: two orderings cannot
+    # both apply, and silently picking one was the old behaviour too.
     most = q.get("most_retrieved")
+    least = q.get("least_retrieved")
+    recent = q.get("recent")
     if most is not None:
-        n = _parse_n(most)
-        items = list(jc.get(_live(ctx)))
+        n, err = parse_int_param(most, "most_retrieved", 10)
+        if err is not None:
+            return err
         items.sort(key=lambda r: (r.get("retrieval_stats") or {}).get("retrieval_count", 0),
                    reverse=True)
-        return json_response_pretty(items[:n])
-
-    least = q.get("least_retrieved")
-    if least is not None:
-        n = _parse_n(least)
-        items = list(jc.get(_live(ctx)))
+        items = items[:n]
+    elif least is not None:
+        n, err = parse_int_param(least, "least_retrieved", 10)
+        if err is not None:
+            return err
         items.sort(key=lambda r: (r.get("retrieval_stats") or {}).get("retrieval_count", 0))
-        return json_response_pretty(items[:n])
-
-    recent = q.get("recent")
-    if recent is not None:
-        n = _parse_n(recent)
-        items = list(jc.get(_live(ctx)))
+        items = items[:n]
+    elif recent is not None:
+        n, err = parse_int_param(recent, "recent", 10)
+        if err is not None:
+            return err
         items.sort(key=lambda r: r.get("created", ""), reverse=True)
-        return json_response_pretty(items[:n])
+        items = items[:n]
+
+    want_summary = flag(q, "summary")
+    # `summary` alone is a legitimate whole-store query and must keep working,
+    # so it LICENSES the read as well as formatting it — otherwise a bare
+    # --summary would fall through to the missing-filter error below.
+    selected = bool(category or goal or hypothesis or typ) or (
+        most is not None or least is not None or recent is not None
+    )
+    if selected or want_summary:
+        if want_summary:
+            # PLAIN TEXT BY DESIGN, and that is not a defect of the
+            # combination: `--summary` ALONE returns these same lines. A caller
+            # that needs to json.load the result must not pass --summary, and a
+            # caller that needs a field this line does not carry (notably
+            # tree_nodes_related) cannot use --summary at all. It now at least
+            # summarises the FILTERED, LIMITED set rather than the whole store.
+            return plain_lines([
+                f"{rec.get('id', '?')}: [{rec.get('type', '?')}] "
+                f"{rec.get('category', '?')} — {rec.get('summary', '(no summary)')}"
+                for rec in items
+            ])
+        return json_response_pretty(items)
 
     if flag(q, "archive"):
         return json_response_pretty(jc.get(_archive(ctx)))

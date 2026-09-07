@@ -120,6 +120,18 @@ Returns all context as JSON. Fails open — if nothing relevant, proceed without
 
 ## Entity Cross-Links
 
+> **RETIRED / INERT (g-115-2047, re-verified g-115-6601).** `entity_index` is
+> permanently `{}` — nothing writes it, and the extraction steps named below are
+> retired or permission-dead. It is superseded by the `embedding` retrieval
+> channel. The schema below is retained because the readers are left in place as
+> forward-compatible dormant infrastructure: adding a write endpoint would light
+> them up with no reader change. Do NOT treat an empty index as a defect, and do
+> NOT build a writer without first re-testing whether `embedding` already covers
+> the case. That re-test ran 2026-09-05 and came back NEGATIVE: 3 of 3 entities
+> sharing zero tokens with their declaring node were unreachable in the top 15.
+> An earlier rank-1 result was confounded by a shared token. The supersession
+> premise is unproven and the build/retire question is OPEN (g-115-6601).
+
 - Entity index lives in `world/knowledge/tree/_tree.yaml` under `entity_index`
 - Entity format: `{entity_name: {articles: [paths], tree_nodes: [node_ids], mention_count: N}}`
 - Entity types: `person`, `organization`, `concept`, `metric`, `event` (informational, not enforced)

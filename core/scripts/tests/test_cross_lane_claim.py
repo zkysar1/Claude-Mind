@@ -74,6 +74,7 @@ CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 from _daemon_fixture import DaemonFixture  # noqa: E402
+from _rt import _api_token  # noqa: E402
 
 # Session-id shape the production wrapper sends: a Claude Code session UUID.
 # A literal constant, deliberately NOT os.environ["MIND_SID"] — the test must
@@ -122,6 +123,19 @@ def _claim(port: int, goal_id: str, agent: str,
            + urllib.parse.urlencode(params))
     req = urllib.request.Request(url, data=b"", method="POST")
     req.add_header("X-Mind-Agent", agent)
+    # FR-4 bearer (). Once MIND_API_TOKEN is set on the daemon,
+    # server.py refuses EVERY request 401 before any handler — local callers
+    # included — and this file builds its requests with raw urllib rather than
+    # through rt_call, so it carried no Authorization header and failed 6/6 on a
+    # token-set box. Resolved through the canonical client resolver
+    # (_rt._api_token: ambient env first, else the gitignored .env.local) rather
+    # than a third resolution path, so this test and the production clients
+    # cannot disagree about where the token lives. Fail-open by contract: no
+    # token configured yields "" -> no header -> byte-identical to the
+    # pre-FR-4 behavior a token-less box still runs.
+    _tok = _api_token()
+    if _tok:
+        req.add_header("Authorization", "Bearer " + _tok)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.status, resp.read().decode("utf-8")

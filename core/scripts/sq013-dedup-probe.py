@@ -28,7 +28,8 @@ an executor who trusted it would have shipped a permanent zero that reads as a
 100% rate. A dedup miss handed a live trap to the next Body.
 
 WHY THIS IS NOT THE goal-duplication GATE. That gate has a `recent_completions`
-check, and it is NOT the backstop here for two independent reasons:
+check (gates/goal_duplication.py:534, `_check_recent_completions`; re-verified
+2026-09-06), and it is NOT the backstop here for two independent reasons:
   1. guard-4938 measured its completed-side coverage as PARTIAL and says
      explicitly it "must not be treated as the backstop".
   2. gates/goal_duplication.py:733 skips every entry whose `completed_by`
@@ -53,12 +54,70 @@ canonical wrapper so there is exactly one reader of the queue:
 Exit codes are the decision, so a caller can branch in bash without parsing:
     0  FILE    — no owner found; proceed with the sq-013 filing
     3  DECLINE — an owner exists; stdout names it (id, status, when)
+    4  MUST-READ (batch mode only) — N records cite a terminal-but-NOT-done
+       owner; each needs reading before ANY disposition. See below.
     2  usage / unreadable corpus (never a silent FILE — an unusable corpus is
        not evidence of absence; guard-2298 / verify-before-assuming rule 4)
 
 3 rather than 1 for DECLINE is deliberate, mirroring deploy-hold-check.sh:
 collapsing "an owner exists" and "the probe broke" onto one non-zero code makes
-each readable as the other, and the caller cannot tell which.
+each readable as the other, and the caller cannot tell which. 4 is distinct from
+3 for the same reason: "an owner exists" and "you must read before deciding" are
+different instructions to the caller.
+
+────────────────────────────────────────────────────────────────────────────
+BATCH MODE (g-306-458) — the drain shape, satisfying gap-162 by EXTENSION
+────────────────────────────────────────────────────────────────────────────
+
+    bash core/scripts/aspirations-query.sh \
+         --goal-status pending,in-progress,completed,skipped --full \
+      | py -3 core/scripts/sq013-dedup-probe.py \
+            --subjects-file <path-to-json-array-of-capture-records> \
+            --positive-control \
+            [--session-start <ISO>] [--window-hours 72]
+
+gap-162 ("durable spark_capture drain") recurs structurally: workers cannot
+file goals, so every worker window produces a capture only a reducer can
+drain. It was resolved `satisfied-by-extension` rather than forged as a skill
+— the mechanizable core is a parse+dedup+table producer, which is a flag on
+this script, not a new SKILL.md. (Skill bodies are loaded into every agent's
+system prompt at startup, so a forge is permanent per-turn weight on the whole
+fleet; measured 2026-09-06, the corpus stood at 146 directories against a
+configured ceiling of 100 that cannot be raised.) The CLASSIFICATION step —
+file / cite an owner / explicitly no owner — deliberately stays with the LLM.
+
+Two design requirements, both MEASURED in the drain that registered the gap:
+
+ 1. DO NOT PIPE THE CORPUS PER RECORD. The naive shape re-pipes the full
+    ~25MB queue into a fresh process for every record — 356MB of stdin for 14
+    records. The corpus is already a PARAMETER of `decide()`, so batch mode
+    reads it ONCE and calls the pure function N times. Importing `decide` is
+    therefore the canonical invocation, not a bypass: `main()` only reads
+    stdin, parses, and calls it.
+
+ 2. A DECLINE IS NOT A DISPOSITION. rc=3 must be re-read against the cited
+    owner's STATUS and CLAIM. In that same drain, 12 of 14 declines survived
+    reading and TWO did not — both cited one SKIPPED goal whose own
+    outcome_note asserts the OPPOSITE of the observations it was suppressing.
+    Both were real, unowned work. So a DECLINE citing a terminal-but-not-done
+    owner (skipped / superseded / expired) is reported as MUST-READ, carrying
+    that owner's STATUS and TITLE, and the batch exits 4. guard-5147: a false
+    DECLINE is the silent, PERMANENT failure direction — nothing re-opens it.
+    A COMPLETED owner stays a plain DECLINE; it is a legitimate one, and that
+    distinction is what keeps MUST-READ meaningful.
+
+`--positive-control` probes an alien-token subject against the SAME loaded
+corpus and reports whether it still returns FILE. Without it, a probe that
+declines EVERYTHING is indistinguishable from a working probe over a
+well-owned corpus. The tokens must be genuinely alien, not merely
+nonsense-sounding: ordinary English like "resurfacing" or "audit" is corpus
+vocabulary and will match (guard-5889).
+
+Batch output is never clipped (guard-5893) and always states the POPULATION
+it actually scanned (guard-3696) — a clean sweep and a blind one are otherwise
+identical on the page. One malformed record is counted UNREADABLE and the walk
+continues (guard-1512); the slot has no schema, so several observation keys are
+tried and the key distribution is reported (guard-4044).
 """
 
 import argparse
@@ -73,6 +132,36 @@ from datetime import datetime, timedelta
 # any of these states is evidence the work was already considered.
 TERMINAL_STATUSES = ("completed", "skipped", "superseded", "expired")
 OPEN_STATUSES = ("pending", "in-progress", "blocked")
+
+# ── batch mode () ────────────────────────────────────────────────
+# TERMINAL, BUT NOT DONE. A `completed` owner is evidence the work HAPPENED, so
+# declining to it is correct. These three are evidence only that someone once
+# CONSIDERED it — a skipped goal's own outcome_note can assert the OPPOSITE of
+# the observation it is suppressing, and then the decline is a silent, permanent
+# loss (guard-5147: a false DECLINE is the failure direction that never
+# surfaces). Measured in the  encounter-2 drain: 12 of 14 declines
+# survived reading and TWO did not — both cited  (status=skipped),
+# and both were real unowned work, filed afterwards as /.
+# So batch mode never collapses these to a bare DECLINE; it flags them MUST-READ.
+MUST_READ_STATUSES = ("skipped", "superseded", "expired")
+
+# The capture slot has NO schema — workers write whatever key they like
+# (guard-4044). A literal `record["observation"]` read silently drops every
+# entry that used a different name, and the drop is invisible because the
+# surviving entries process normally. So try alternates IN ORDER and REPORT the
+# key distribution rather than assuming one shape.
+OBSERVATION_KEYS = ("observation", "content", "text", "note", "summary",
+                    "finding", "body", "message", "proposed_work")
+
+# Tokens for the positive control. A token-overlap probe that DECLINES
+# everything is indistinguishable from a working probe over a well-owned
+# corpus, so batch mode can run an alien subject and assert FILE. These must be
+# guaranteed-absent, NOT merely nonsense-SOUNDING: ordinary English words like
+# "resurfacing" or "audit" are corpus vocabulary and will match (guard-5889).
+POSITIVE_CONTROL_SUBJECT = (
+    "zzqqxvv7 wgrblmk4 pflunzt9 hjxdvqw2 kbrmtzy6 nvxqplj3 "
+    "dfgwzkr8 tqmvbxn5 lkzjrwc1 ybnpxvg0"
+)
 
 # Default lookback when no session start is supplied. Deliberately WIDER than
 # the 24h the originating goal calls "the wrong shape" — the failure it fixes is
@@ -356,16 +445,167 @@ def decide(subject, goals, now, session_start=None,
     }
 
 
+def extract_subject(record):
+    """Pure. Return (text, key_used) for one capture record, or (None, None).
+
+    Tries OBSERVATION_KEYS in order rather than reading `observation` literally
+    (guard-4044). A record that is a bare string is its own subject — the slot
+    has no schema, so that shape occurs.
+    """
+    if isinstance(record, str):
+        return (record.strip() or None), ("<bare-string>" if record.strip() else None)
+    if not isinstance(record, dict):
+        return None, None
+    for key in OBSERVATION_KEYS:
+        val = record.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip(), key
+    return None, None
+
+
+def batch_decide(records, goals, now, session_start=None,
+                 window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2):
+    """Pure. Run `decide` over N records against ONE already-loaded corpus.
+
+    This is the whole point of batch mode: the naive shape pipes the full
+    corpus into a fresh process per record, which measured 356MB of stdin for
+    14 records (g-306-458). The corpus is a parameter of `decide`, so caching it
+    once and calling the function N times is the canonical invocation.
+
+    Returns a dict with `rows` (ONE per input record, never clipped —
+    guard-5893) and a `population` block naming what was actually scanned
+    (guard-3696). A record that cannot be parsed is SKIPPED and COUNTED, never
+    fatal: one malformed record must not abort the walk and silently disable the
+    sweep for everything after it (guard-1512).
+    """
+    rows, key_counts = [], {}
+    unreadable = 0
+    for idx, record in enumerate(records or []):
+        subject, key = extract_subject(record)
+        if not subject:
+            unreadable += 1
+            rows.append({
+                "index": idx,
+                "goal_id": (record.get("goal_id")
+                            if isinstance(record, dict) else None),
+                "verdict": "UNREADABLE",
+                "subject_key": None,
+                "reason": ("no non-empty value under any of %s — the slot has "
+                           "no schema (guard-4044)" % (", ".join(OBSERVATION_KEYS))),
+                "cited_goal_id": None, "cited_status": None,
+                "cited_title": None, "must_read": False, "matches": [],
+            })
+            continue
+        key_counts[key] = key_counts.get(key, 0) + 1
+        try:
+            res = decide(subject, goals, now, session_start,
+                         window_hours, min_overlap)
+        except Exception as exc:                       # never fatal (guard-1512)
+            unreadable += 1
+            rows.append({
+                "index": idx,
+                "goal_id": (record.get("goal_id")
+                            if isinstance(record, dict) else None),
+                "verdict": "PROBE-ERROR", "subject_key": key,
+                "reason": "%s: %s" % (type(exc).__name__, exc),
+                "cited_goal_id": None, "cited_status": None,
+                "cited_title": None, "must_read": False, "matches": [],
+            })
+            continue
+        top = (res.get("matches") or [{}])[0] if res.get("matches") else {}
+        cited_status = res.get("cited_status")
+        must_read = (res["decision"] == "DECLINE"
+                     and (cited_status or "").lower() in MUST_READ_STATUSES)
+        rows.append({
+            "index": idx,
+            "goal_id": (record.get("goal_id")
+                        if isinstance(record, dict) else None),
+            # A DECLINE against a terminal-but-not-done owner is NOT a
+            # disposition — it is a reading assignment (outcome 3).
+            "verdict": "MUST-READ" if must_read else res["decision"],
+            "subject_key": key,
+            "reason": res.get("reason"),
+            "cited_goal_id": res.get("cited_goal_id"),
+            "cited_status": cited_status,
+            "cited_title": top.get("title"),
+            "must_read": must_read,
+            "subject": subject[:200],
+            "matches": res.get("matches") or [],
+        })
+    return {
+        "rows": rows,
+        "population": {
+            "records_in": len(records or []),
+            "records_scored": len(records or []) - unreadable,
+            "records_unreadable": unreadable,
+            "corpus_goals": len(goals or []),
+            "subject_keys_used": key_counts,
+        },
+        "must_read_count": sum(1 for r in rows if r["must_read"]),
+        "file_count": sum(1 for r in rows if r["verdict"] == "FILE"),
+        "decline_count": sum(1 for r in rows if r["verdict"] == "DECLINE"),
+    }
+
+
+def render_batch(result):
+    """Human-readable table. Every row is printed — a dedup probe clipped to
+    the first N is not a dedup probe (guard-5893)."""
+    out, pop = [], result["population"]
+    out.append("POPULATION: %d record(s) in, %d scored, %d unreadable, "
+               "against %d corpus goal(s)"
+               % (pop["records_in"], pop["records_scored"],
+                  pop["records_unreadable"], pop["corpus_goals"]))
+    out.append("SUBJECT KEYS USED: %s"
+               % (", ".join("%s=%d" % kv for kv in
+                            sorted(pop["subject_keys_used"].items())) or "none"))
+    out.append("")
+    for r in result["rows"]:
+        out.append("[%d] %-9s %s" % (r["index"], r["verdict"],
+                                     r.get("goal_id") or ""))
+        if r["cited_goal_id"]:
+            out.append("      owner: %s  STATUS=%s" % (r["cited_goal_id"],
+                                                       r["cited_status"]))
+            out.append("      title: %s" % (r["cited_title"] or "(none)"))
+        if r["must_read"]:
+            out.append("      ^^ TERMINAL-BUT-NOT-DONE owner. Read its "
+                       "outcome_note before accepting this as a decline: a "
+                       "skipped/expired goal can assert the OPPOSITE of the "
+                       "observation it suppresses (guard-5147).")
+        elif r["verdict"] in ("UNREADABLE", "PROBE-ERROR"):
+            out.append("      %s" % r["reason"])
+    out.append("")
+    out.append("TOTALS: file=%d decline=%d must-read=%d"
+               % (result["file_count"], result["decline_count"],
+                  result["must_read_count"]))
+    return "\n".join(out)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--subject", required=True,
+    ap.add_argument("--subject", default=None,
                     help="the relay observation being deduped")
+    ap.add_argument("--subjects-file", default=None,
+                    help="BATCH MODE (g-306-458): path to a JSON array of "
+                         "capture records. The corpus is still read ONCE from "
+                         "stdin and reused for every record.")
+    ap.add_argument("--positive-control", action="store_true",
+                    help="also probe an alien-token subject and FAIL if it "
+                         "does not return FILE — a probe that declines "
+                         "everything is indistinguishable from a working one "
+                         "(guard-5889).")
     ap.add_argument("--session-start", default=None,
                     help="ISO start of the current session (widens the window)")
     ap.add_argument("--window-hours", type=float, default=DEFAULT_WINDOW_HOURS)
     ap.add_argument("--now", default=None, help="ISO override, for tests")
     ap.add_argument("--min-overlap", type=int, default=2)
     args = ap.parse_args(argv)
+
+    # Exactly one subject source. Enforced here rather than by
+    # required=True on --subject, which would make batch mode unreachable.
+    if bool(args.subject) == bool(args.subjects_file):
+        print("sq013-dedup-probe: pass exactly ONE of --subject <text> or "
+              "--subjects-file <path> (batch).", file=sys.stderr)
+        return 2
 
     raw = sys.stdin.read()
     if not raw.strip():
@@ -388,10 +628,56 @@ def main(argv=None):
         return 2
 
     now = _parse_ts(args.now) or datetime.now()
-    result = decide(args.subject, goals, now,
-                    _parse_ts(args.session_start), args.window_hours,
-                    args.min_overlap)
+    session_start = _parse_ts(args.session_start)
+
+    # Positive control (guard-5889). Runs against the SAME loaded corpus, so it
+    # proves this run's probe can still say FILE — not merely that it could in
+    # principle. Alien tokens, not nonsense-sounding English.
+    control_failed = False
+    if args.positive_control:
+        ctl = decide(POSITIVE_CONTROL_SUBJECT, goals, now, session_start,
+                     args.window_hours, args.min_overlap)
+        ok = ctl["decision"] == "FILE"
+        print("POSITIVE CONTROL: alien-token subject -> %s%s"
+              % (ctl["decision"],
+                 "" if ok else "  <-- FAILED: this probe declines everything, "
+                               "so no DECLINE below is trustworthy"),
+              file=sys.stderr)
+        control_failed = not ok
+
+    if args.subjects_file:
+        try:
+            with open(args.subjects_file, "r", encoding="utf-8") as fh:
+                records = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            print("sq013-dedup-probe: --subjects-file unreadable (%s) — "
+                  "refusing to report anything. An unreadable input is not "
+                  "evidence of absence." % exc, file=sys.stderr)
+            return 2
+        if isinstance(records, dict):
+            records = (records.get("records") or records.get("entries")
+                       or records.get("spark_capture") or [])
+        if not isinstance(records, list) or not records:
+            print("sq013-dedup-probe: --subjects-file parsed to ZERO records "
+                  "— refusing to report a clean sweep (guard-2298).",
+                  file=sys.stderr)
+            return 2
+        result = batch_decide(records, goals, now, session_start,
+                              args.window_hours, args.min_overlap)
+        print(render_batch(result))
+        print(json.dumps(result, indent=2), file=sys.stderr)
+        if control_failed:
+            return 2
+        # 4, not 3: a MUST-READ batch is not "an owner exists", it is "N records
+        # need reading before any disposition". Collapsing them makes each
+        # readable as the other, the same reason DECLINE is 3 and not 1.
+        return 4 if result["must_read_count"] else 0
+
+    result = decide(args.subject, goals, now, session_start,
+                    args.window_hours, args.min_overlap)
     print(json.dumps(result, indent=2))
+    if control_failed:
+        return 2
     return 3 if result["decision"] == "DECLINE" else 0
 
 

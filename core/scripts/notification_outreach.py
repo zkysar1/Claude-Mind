@@ -61,6 +61,11 @@ BOARD_TAG = "user-outreach"
 WINDOW_HOURS = {
     "blocker": 24,
     "user-digest": 20,   # one fleet digest per day-or-two, whoever's cadence fires first
+    # A scheduled per-day instrument whose whole value IS the daily delta ().
+    # Deliberately NOT in DIGEST_CATEGORIES: it must not be deduped against peers'
+    # fleet digests, which carry no spend. 20h < the 24h cadence, so tomorrow's report
+    # passes while a genuine same-day re-send is still refused.
+    "cost-report": 20,
     "_default": 24 * 7,
 }
 # Digest categories are matched by CATEGORY alone, fleet-wide: any digest sent

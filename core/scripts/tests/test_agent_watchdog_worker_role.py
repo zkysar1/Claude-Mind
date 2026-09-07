@@ -497,3 +497,80 @@ def test_that_induced_fault_is_absent_when_the_box_is_healthy(tmp_path, monkeypa
         "memory-headroom fired on healthy numbers, so the induction test above "
         "proves nothing; got probes %r" % (sorted(names),)
     )
+
+
+# ---------------------------------------------------------------------------
+# THE WIRING, as opposed to the filter ()
+#
+# Everything above pins WHICH probes a worker registers. Nothing above pins that
+# a worker ever REACHES the tick, and that is a different claim — guard-1943:
+# pinning the writer says nothing about the wiring. The gap is not theoretical.
+#  was filed against a live box on the premise that "the tick has ONE
+# live call site, inside do_productivity_check, a reducer-only phase", i.e. that
+# no worker reaches it at all. That premise is false — worker-loop/SKILL.md
+# carries the call at Phase -0.2 — but nothing in the suite would have said so,
+# and nothing would notice if that line were deleted tomorrow.
+# ---------------------------------------------------------------------------
+
+WORKER_LOOP_SKILL = PROJECT_ROOT / ".claude" / "skills" / "worker-loop" / "SKILL.md"
+
+
+def _tick_invocation_lines(text: str) -> list:
+    """Lines that INVOKE the watchdog tick — never lines that merely mention it.
+
+    The discrimination is the whole point. worker-loop/SKILL.md discusses
+    `agent-watchdog.py --tick` in prose several times (the Phase -0.2 rationale
+    block explains why the call exists), so a bare substring check would stay
+    green after someone deleted the actual invocation and left the commentary
+    behind — a check satisfied by its own documentation. The skill's executable
+    steps are the lines beginning `Bash:`, so that prefix is the discriminator,
+    and `_tick_invocation_lines` is mutation-proven below rather than trusted.
+    """
+    return [
+        s for s in (ln.strip() for ln in text.splitlines())
+        if s.startswith("Bash:") and "agent-watchdog.py" in s and "--tick" in s
+    ]
+
+
+def test_worker_loop_skill_invokes_the_watchdog_tick():
+    """A worker Body reaches the tick — the wiring half of .
+
+    Runtime corroboration when this landed (alpha WORKER Body, hostname cc-09,
+    uname -r 6.8.0-138-generic, 2026-09-07): agent-wide
+    session/watchdog-prev-state.json carried an mtime minutes old from this
+    loop's own Phase -0.2, on a box whose watchdog-<agent>.jsonl was 2.5 days
+    stale. Both readings are correct and they are not in tension — see the log
+    test below.
+    """
+    assert WORKER_LOOP_SKILL.is_file(), f"worker-loop SKILL.md missing at {WORKER_LOOP_SKILL}"
+    calls = _tick_invocation_lines(WORKER_LOOP_SKILL.read_text(encoding="utf-8"))
+    assert calls, (
+        "worker-loop/SKILL.md no longer INVOKES agent-watchdog.py --tick on any "
+        "`Bash:` line. A worker Body skips iteration-close's do_productivity_check "
+        "(reducer-only), so this skill is the only path by which any watchdog probe "
+        "runs on a worker-only box. Restore the Phase -0.2 call."
+    )
+
+
+def test_prose_mention_alone_does_not_satisfy_the_wiring_check():
+    """Negative control: delete the call, keep the commentary, expect FAILURE.
+
+    Without this, the test above could be passing on the rationale comments
+    rather than on the invocation, and would keep passing through exactly the
+    regression it exists to catch. Mutating the REAL file's text (not a
+    synthetic fixture) keeps the control honest if the surrounding prose is
+    later reworded.
+    """
+    text = WORKER_LOOP_SKILL.read_text(encoding="utf-8")
+    mutated = "\n".join(
+        ln for ln in text.splitlines() if ln.strip() not in _tick_invocation_lines(text)
+    )
+    assert "agent-watchdog.py --tick" in mutated, (
+        "the mutation removed the prose too, so this control proves nothing about "
+        "prose-vs-invocation discrimination"
+    )
+    assert _tick_invocation_lines(mutated) == [], (
+        "the predicate still reports an invocation after every `Bash:` tick line "
+        "was removed, so it is matching commentary — it cannot detect the deletion "
+        "it exists to detect"
+    )

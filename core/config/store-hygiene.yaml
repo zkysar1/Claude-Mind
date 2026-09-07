@@ -362,3 +362,78 @@ stores:
     by: lines
     max_lines: 2000
     owner_goal: g-115-5860
+
+  # ── : world/script-evolution.jsonl — the unregistered sibling ──────
+  # OMISSION, not policy: world/skill-evolution.jsonl (G11 above) is registered
+  # rotate/lines/5000 while its structurally identical sibling was in no entry
+  # at all. Same writer family (evolution-record.py --kind script_edit ->
+  # _STREAM_FILENAME), and merge_handler_for resolves BOTH to
+  # merge_evolution_stream (SSOT classifier, not a grep guess).
+  #
+  # MEASURED 2026-09-05 (alpha worker Body, hostname cc-09, uname -r
+  # 6.8.0-138-generic, own-cloud). guard-5201 positive control against zeta's
+  # cc-02 numbers of 2026-09-04 (13,167 lines / 13,361,870 B): this box reads
+  # 13,337 / 13,536,747 -- +170 lines / +174,877 B in ~1 day, i.e. the same
+  # store still growing at the rate the filing measured. Control PASSES.
+  #
+  # guard-5993 (cap dimension): the COST is BYTES, the CAP is LINES, so the
+  # real bound is cap x density, and the conversion is done here rather than
+  # assumed. Density measured on this box is 1,014 B/line (zeta's 1,015 B avg
+  # record agrees to 0.1%), so max_lines 5000 bounds this store at 5,070,000 B
+  # = 4.84 MiB against today's 13,536,747 B = 12.91 MiB. The filing's
+  # "12.74 MiB -> ~4.8 MiB, ~62%" is therefore CONFIRMED, not corrected -- it
+  # was already derived from THIS store's density. Cut = 1 - 5000/13337 =
+  # 62.5% of per-PUT bytes, plus the same cut on the reconcile-pull egress
+  # fan-out. State the unit: MiB and MB differ by 4.9% at this size and mixing
+  # them turns 62.5% into a plausible-looking 61%.
+  # WHAT guard-5993 DOES FLAG, kept because it is easy to re-derive wrongly:
+  # the sibling entry carries the SAME max_lines 5000 at 1,530 B/line, so one
+  # cap value yields TWO byte bounds -- 4.84 MiB here, 7.30 MiB there, 1.51x
+  # looser. Not fixed here (one store per goal), and not fixable by a value
+  # edit anyway: jsonl_hygiene implements only by=lines and by=age, so no
+  # byte-dimension cap exists for a registry entry to name.
+  #
+  # ENABLED IMMEDIATELY -- the three gates the header requires all pass, and
+  # each was measured this pass rather than inherited:
+  #   guard-881 (machine-local): owncloud_sync._is_machine_local(
+  #     "script-evolution.jsonl", "world") -> False, so jsonl_hygiene._snapshot's
+  #     unconditional refresh pulls authoritative S3 and cannot clobber. Same
+  #     reading as the sibling; contrast changelog.jsonl -> True.
+  #   CONSUMER RETENTION: the lifecycle consumer is evolution-stub-expiry.py
+  #     (iteration-close maintenance tick, --threshold-hours 24). A dry-run of
+  #     the script stream reads 213 awaiting_completion of which exactly 1 is
+  #     over the 24h deadline, and ALL 213 sit inside the newest 5,000. That is
+  #     structural, not luck: the newest 5,000 span 2026-08-09 -> 2026-09-05
+  #     (27 days) at ~170 rows/day, so the live window exceeds the sweep's need
+  #     by ~27x. Zero rows carry an unparseable ts (the never-expirable case).
+  #     evolution-complete.py finalizes stubs on the same live window.
+  #   REVISION CHAIN (the filing's named REAL RISK -- archiving an ancestor
+  #     could orphan a previous_revision_id pointer): measured, and it is
+  #     bounded. NOTHING RESOLVES THOSE POINTERS -- the only readers of
+  #     previous_revision_id WRITE it (evolution-git-sweep.py,
+  #     evolution-record.py, via _evolution_chain.chain_index) or print one
+  #     carried in a different store (meta-backpressure.py); no consumer walks
+  #     an ancestor up in this stream. The live effect of the cut is that a
+  #     NEW row for a file whose whole history was archived records
+  #     previous_revision_id: null -- 976 of 2,058 distinct file_paths are in
+  #     that state, and 404 more have a kept head whose ancestor moves to the
+  #     archive. Set against the baseline: 98.1% of all rows and 95.0% of the
+  #     KEPT rows ALREADY carry a null pointer (the  defect
+  #     _evolution_chain.py was built to stop RE-creating, not to backfill), so
+  #     rotation widens a dominant pre-existing state rather than opening a new
+  #     failure class. Recoverable either way: the ancestors are in the archive.
+  #
+  # THE ARCHIVE SINK IS REGISTERED IN THE SAME COMMIT and that pairing is
+  # load-bearing (guard-1055): this store is 2.7x over bound, so unlike the
+  # sibling (3,126 lines, its entry a no-op) it rotates on the FIRST sweep and
+  # CREATES world/script-evolution-archive.jsonl -- a new shared own-cloud store
+  # that write-FREEZES on S3 if merge_handler_for returns None for it. It
+  # resolved None before this change. Both files are git-tracked framework, so a
+  # box has the entry and the handler together or neither; a box on older code
+  # falls to `defaults.enabled: false` and skips.
+  - path: world/script-evolution.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 5000
+    owner_goal: g-358-64

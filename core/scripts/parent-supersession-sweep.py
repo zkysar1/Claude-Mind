@@ -464,9 +464,29 @@ def _mark_superseded(source, goal_id, sibling_ids, metrics_path=None,
     }
 
     # First write outcome_note (informational only — does NOT close goal).
-    rc1, out1, err1 = _py([str(SCRIPT_DIR / "aspirations.py"),
-                           "--source", source, "update-goal",
-                           goal_id, "outcome_note", note])
+    #
+    # APPEND, never REPLACE (). This was
+    # `aspirations.py update-goal <id> outcome_note <note>`, which REPLACES the
+    # field (guard-5228) — so on any candidate carrying real prior work the
+    # field-shrink guard correctly refused the write and the lane never reached
+    # the status write below. MEASURED on this world: 27 refusals against ONE
+    # goal (, outcome_note 9,246 → 13,460 chars) across 5 agents
+    # between 2026-09-03T21:04 and 2026-09-04T07:37, every one
+    # `field_shrink_blocked`, while `applied` stayed 0 across all 150 recent
+    # apply-runs that had candidates>0. The refusal was RIGHT and the caller was
+    # wrong: a 55-char supersession note must not overwrite 13k chars of work.
+    # Note the degradation shape — the shrink floor is 25%, so this bites only
+    # goals whose notes have grown, i.e. the lane gets deader as the fleet ages.
+    #
+    # goal-field-append.py read-modify-writes under the store lock and takes an
+    # idempotency MARKER as its third positional (guard-3381): a re-run with the
+    # same marker returns rc=0 {"changed": false}, so the retry this lane makes
+    # every iteration becomes a clean no-op that FALLS THROUGH to the status
+    # write — which is also the repair path for the note-landed/status-refused
+    # case the metrics block below describes.
+    rc1, out1, err1 = _py([str(SCRIPT_DIR / "goal-field-append.py"),
+                           "--source", source, goal_id, "outcome_note",
+                           "parent-supersession-sweep", note])
     if rc1 != 0:
         reason = _write_failure_reason("outcome_note", rc1, out1, err1)
         _append_metric(metrics_path, {

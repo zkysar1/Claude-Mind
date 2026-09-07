@@ -50,9 +50,23 @@ done
 # .git/hooks and unlike core.hooksPath's target — is NOT version-controlled, so
 # this tracked installer is the cross-clone registration mechanism. The driver
 # resolves cross-box iteration-push.sh conflicts on experience / changelog /
-# experience-meta / journal / aspirations ledgers by record-level commutative
-# union instead of aborting (). Idempotent (only writes on drift) +
-# fail-open (a config hiccup must not block session start).
+# experience-meta / journal / aspirations ledgers RECORD-LEVEL rather than
+# line-level, instead of aborting (). Idempotent (only writes on
+# drift) + fail-open (a config hiccup must not block session start).
+#
+# CORRECTED 2026-09-06 (): this comment read "record-level commutative
+# UNION", which was the same false premise .gitattributes stated twice — that
+# record-keying makes a union safe. It does not: id-keying changes what counts
+# as a DUPLICATE, never whether a ONE-SIDED record SURVIVES, so the union
+# resurrected whatever a peer had swept. Do not restore the word. The driver
+# dispatches on basename and only SOME arms are unions; experience.jsonl,
+# experience-archive.jsonl and journal.jsonl now take a base-aware 3-way merge
+# on `id`, which is why %O below is load-bearing and not decorative.
+#
+# %O IS REQUIRED IN THE DRIVER STRING. Dropping it (or reordering the
+# placeholders) silently reintroduces the resurrection for those three stores:
+# the driver degrades an absent base to the historical union by design, so the
+# failure is a SILENT wrong merge, never an error.
 _LEDGER_DRIVER='bash core/scripts/git-merge-ayoai-ledger.sh %O %A %B %P'
 _CUR_LEDGER_DRIVER="$(git config --local --get merge.ayoai-ledger.driver 2>/dev/null || echo "")"
 if [ "$_CUR_LEDGER_DRIVER" != "$_LEDGER_DRIVER" ]; then

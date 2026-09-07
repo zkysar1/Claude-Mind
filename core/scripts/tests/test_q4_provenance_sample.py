@@ -31,7 +31,8 @@ sys.path.insert(0, str(SCRIPTS))
 
 from q4_provenance_sample import (  # noqa: E402
     direction_contradictions, direction_fidelity, direction_findings,
-    directed_pairs, retrieved_predicate, run, sample_clusters, sample_key)
+    directed_pairs, expressible_predicate, retrieved_predicate, run,
+    sample_clusters, sample_key)
 
 VERDICT_CLI = SCRIPTS / "close-review-verdict.py"
 SAMPLER_CLI = SCRIPTS / "q4-provenance-sample.py"
@@ -266,11 +267,6 @@ def test_CONTROL_an_UNVERIFIED_tagged_claim_passes_untouched(tmp_path, monkeypat
 # The unreadable-manifest path: skipped is NOT pass
 # ---------------------------------------------------------------------------
 
-def test_retrieved_predicate_is_None_when_the_manifest_is_empty(tmp_path):
-    """guard-1760: a check that could not run must not report a pass."""
-    assert retrieved_predicate("a-session-id-that-never-existed") is None
-
-
 def test_an_unreadable_manifest_yields_SKIPPED_and_says_why(tmp_path, monkeypatch):
     art = _write(tmp_path, "art.md",
                  "Acme Corporation reported revenue of 4.2 billion in 2024,\n"
@@ -428,11 +424,21 @@ def test_LIMITATION_citations_to_manifest_UNTRACKED_paths_always_read_decorative
     cr = load_context_reads()
     root = SCRIPTS.parent.parent
 
+    # `.as_posix()`, NEVER `str()` — is_in_scope's parameter is literally named
+    # `normalized`: it normalizes its PATTERNS (prefix.replace("\\", "/")) and
+    # not its INPUT, so a Windows `str(Path)` arrives backslash-separated and
+    # returns False for everything. This test used str() and was therefore
+    # GREEN on Linux and RED on Windows (measured 2026-09-05, ) —
+    # and the Windows red was the lucky half. The two negative assertions
+    # below would have passed VACUOUSLY on Windows for the same reason the
+    # positive control failed, which is the exact "uniform, plausible and
+    # completely wrong" result this test's own docstring warns about. The
+    # positive control is what caught it; that is what positive controls are for.
     # POSITIVE CONTROL — a class the manifest really does track.
-    assert cr.is_in_scope(str(root / ".claude/skills/aspirations-verify/SKILL.md"))
+    assert cr.is_in_scope((root / ".claude/skills/aspirations-verify/SKILL.md").as_posix())
     # The blind spot itself.
-    assert not cr.is_in_scope(str(root / "agents/alpha/temp/note.md"))
-    assert not cr.is_in_scope(str(root / ".claude/rules/read-before-edit.md"))
+    assert not cr.is_in_scope((root / "agents/alpha/temp/note.md").as_posix())
+    assert not cr.is_in_scope((root / ".claude/rules/read-before-edit.md").as_posix())
 
 
 def test_REGRESSION_retrieved_predicate_consults_BOTH_halves_of_the_tracker(
@@ -472,7 +478,19 @@ def test_REGRESSION_retrieved_predicate_consults_BOTH_halves_of_the_tracker(
 
 def test_retrieved_predicate_still_returns_None_when_BOTH_halves_are_empty(
         tmp_path, monkeypatch):
-    """guard-1760 survives the union: nothing known means SKIP, never pass."""
+    """guard-1760 survives the union: nothing known means SKIP, never pass.
+
+    SOLE hermetic pin of the empty-manifest contract since 2026-09-05
+    (g-115-9059). A sibling test asserted the same contract by passing a
+    never-existed sid to the REAL loader, which is not a contract test at
+    all: `context-reads.tracker_path` falls back to the agent-wide
+    `session/context-reads.txt` for any sid without a forked body-WM, and
+    that file's existence varies by BOX (present on a reducer-shaped box,
+    absent on a worker) and by position in the COMPACTION cycle (the hooks
+    reset it each cycle). It therefore passed on cc-07 and failed on cc-08
+    with neither box measuring wrong. Stub both halves; never reach for the
+    live filesystem to prove "empty".
+    """
     stub = tmp_path / "context-reads.py"
     stub.write_text(
         "def read_provenance(session_id=None):\n    return []\n"
@@ -480,3 +498,164 @@ def test_retrieved_predicate_still_returns_None_when_BOTH_halves_are_empty(
         encoding="utf-8")
     monkeypatch.setattr("q4_provenance_sample.SCRIPTS", tmp_path)
     assert retrieved_predicate("any-sid") is None
+
+
+# ---------------------------------------------------------------------------
+# THE THIRD VERDICT () — a citation the manifest cannot express is a
+# check that did not run, not a check that failed.
+# ---------------------------------------------------------------------------
+
+_UNRECORDABLE = ("Widget Industries employs 12,000 people across its plants, "
+                 "per core/githooks/commit-msg.")
+
+
+def test_an_unrecordable_citation_is_unadjudicable_NOT_decorative():
+    """The defect: `decorative-citation` asserts the session never fetched the
+    source. That assertion is only available when the manifest COULD have held the
+    answer; where it structurally could not, nothing was measured."""
+    from ground_truth_citation import analyze
+    kinds = [f.kind for f in analyze(_UNRECORDABLE,
+                                     retrieved=lambda k, v: False,
+                                     expressible=lambda k, v: False)]
+    assert kinds == ["unadjudicable-citation"], kinds
+
+
+def test_CONTROL_an_EXPRESSIBLE_citation_still_reads_decorative():
+    """The other half, and the one that keeps this from gutting the check: when
+    the manifest COULD have recorded it and did not, the citation is decorative
+    exactly as before. Without this control the test above is equally satisfied by
+    a change that demotes every citation."""
+    from ground_truth_citation import analyze
+    kinds = [f.kind for f in analyze(_UNRECORDABLE,
+                                     retrieved=lambda k, v: False,
+                                     expressible=lambda k, v: True)]
+    assert kinds == ["decorative-citation"], kinds
+
+
+def test_CONTROL_omitting_the_predicate_preserves_the_PRE_CHANGE_behaviour():
+    """`expressible` defaults to None and None must mean "assume expressible" —
+    the fail-safe direction, since demoting on doubt suppresses alarms. Every
+    existing caller that does not pass it is unaffected."""
+    from ground_truth_citation import analyze
+    kinds = [f.kind for f in analyze(_UNRECORDABLE, retrieved=lambda k, v: False)]
+    assert kinds == ["decorative-citation"], kinds
+
+
+def test_a_run_whose_citations_are_ALL_unadjudicable_is_SKIPPED_not_failed(
+        tmp_path, monkeypatch):
+    """THE UNBLOCK. skipped exits 0, so the close stops being refused — and it is
+    still not a `pass`, because guard-1760 forbids reporting an unrun check as
+    one."""
+    art = _write(tmp_path, "art.md", _UNRECORDABLE + "\n")
+    monkeypatch.setattr("q4_provenance_sample.retrieved_predicate",
+                        lambda sid: (lambda k, v: False))
+    monkeypatch.setattr("q4_provenance_sample.expressible_predicate",
+                        lambda sid: (lambda k, v: False))
+    result = run("g-115-9059", [str(art)], n=5, session_id="x")
+    assert result["verdict"] == "skipped", result
+    assert result["verdict"] != "pass"
+    assert result["unadjudicable_count"] == 1
+    assert "NOT ADJUDICABLE" in result["skip_reason"]
+
+
+def test_a_BLOCKING_finding_still_fails_beside_an_unadjudicable_one(
+        tmp_path, monkeypatch):
+    """The demotion is per-citation, never per-run: one genuine decorative
+    citation must still fail the whole verdict even when another is unadjudicable.
+    A run-level demotion would let a real finding ride out beside an excused one."""
+    art = _write(tmp_path, "art.md",
+                 _UNRECORDABLE + "\n\n"
+                 "Globex Limited operates 37 refineries worldwide, per\n"
+                 "https://example.invalid/never-fetched.\n")
+    monkeypatch.setattr("q4_provenance_sample.retrieved_predicate",
+                        lambda sid: (lambda k, v: False))
+    # Only the URL is expressible -> it stays decorative; the path is demoted.
+    monkeypatch.setattr("q4_provenance_sample.expressible_predicate",
+                        lambda sid: (lambda k, v: k == "url"))
+    result = run("g-115-9059", [str(art)], n=5, session_id="x")
+    assert result["verdict"] == "fail", result
+    assert result["unadjudicable_count"] == 1
+    kinds = sorted(f["kind"] for f in result["findings"])
+    assert kinds == ["decorative-citation", "unadjudicable-citation"], kinds
+
+
+def test_expressible_predicate_demotes_ONLY_real_out_of_scope_files():
+    """The predicate itself, against the live repo. Three arms, because the
+    failure that matters is over-demotion: a bare tree-node key resolves to no
+    file and is recordable via a `#prov: node` row, so demoting it would switch
+    off a real alarm."""
+    pred = expressible_predicate("any-sid")
+    assert pred is not None
+    # In advisory scope (core/scripts) -> expressible, check stays ON.
+    assert pred("node-key", "core/scripts/q4-provenance-sample") is True
+    # A real file OUTSIDE advisory scope -> the manifest can never hold it.
+    assert pred("node-key", "core/githooks/commit-msg") is False
+    # Dotted, and the largest demotable class: _NODE_KEY strips the leading dot.
+    assert pred("node-key", "claude/rules/read-before-edit") is False
+    # Resolves to no file at all (a tree key) -> NOT demoted.
+    assert pred("node-key", "system/daemon-only-architecture") is True
+    # Non-path kinds are recordable via PROVENANCE_KINDS -> never demoted.
+    assert pred("url", "https://example.invalid/whatever") is True
+
+
+def _stub_world(tmp_path, monkeypatch):
+    """A tmp WORLD root + a stub context-reads exposing it, fully hermetic.
+
+    Hermetic on purpose: the real `world/` is an EXTERNAL, gitignored path whose
+    contents differ per box, so asserting against a live world file would pin the
+    BOX rather than the contract — the exact defect that made two sibling tests
+    pass on cc-07 and fail on cc-08 (g-115-9059 unit 2).
+    """
+    world = tmp_path / "w"
+    (world / "telemetry").mkdir(parents=True)
+    (world / "telemetry" / "ledger.jsonl").write_text("{}\n", encoding="utf-8")
+    (world / "conventions").mkdir()
+    (world / "conventions" / "cap.md").write_text("x\n", encoding="utf-8")
+    stub = tmp_path / "context-reads.py"
+    stub.write_text(
+        "from pathlib import Path\n"
+        "WORLD_DIR = Path(%r)\n"
+        "def is_in_scope_advisory(p):\n"
+        "    return '/conventions/' in str(p).replace(chr(92), '/')\n"
+        % world.as_posix(),
+        encoding="utf-8")
+    monkeypatch.setattr("q4_provenance_sample.SCRIPTS", tmp_path)
+    return world
+
+
+def test_an_out_of_scope_WORLD_path_is_demoted_not_left_blocking(
+        tmp_path, monkeypatch):
+    """`world/` is EXTERNAL, so resolution that only tries the repo root finds
+    nothing and falls through to the default-True fail-safe — reporting
+    `decorative-citation` for a file the session genuinely read.
+
+    Measured g-306-401 (cc-07): `world/telemetry/adjudication-lane-ledger.jsonl`
+    was read IN FULL (15,804 B, 28 lines) and cited for a claim it directly
+    supports, and Q4 still blocked the close. This is citation class (2) of the
+    four this goal enumerates.
+    """
+    _stub_world(tmp_path, monkeypatch)
+    pred = expressible_predicate("any-sid")
+    assert pred is not None
+    assert pred("node-key", "world/telemetry/ledger.jsonl") is False
+
+
+def test_CONTROL_an_IN_scope_world_path_still_blocks(tmp_path, monkeypatch):
+    """Resolving world paths must not demote them WHOLESALE. A world path the
+    recorder DOES track stays adjudicable, so the decorative alarm still fires
+    where it can legitimately fire. Without this arm the fix above is
+    indistinguishable from 'demote anything starting with world/'."""
+    _stub_world(tmp_path, monkeypatch)
+    pred = expressible_predicate("any-sid")
+    assert pred("node-key", "world/conventions/cap.md") is True
+
+
+def test_CONTROL_a_world_path_that_resolves_to_NOTHING_still_blocks(
+        tmp_path, monkeypatch):
+    """The predicate's stated invariant: demote ONLY where the token POSITIVELY
+    resolves to a real file the scope predicate excludes. A `world/`-prefixed
+    token naming no file must keep the check ON — otherwise the prefix alone
+    would become a way to switch off a real alarm (guard-1760)."""
+    _stub_world(tmp_path, monkeypatch)
+    pred = expressible_predicate("any-sid")
+    assert pred("node-key", "world/telemetry/no-such-file.jsonl") is True

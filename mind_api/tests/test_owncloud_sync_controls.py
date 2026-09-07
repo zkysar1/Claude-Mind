@@ -46,7 +46,8 @@ SOURCE = MAIN_PY.read_text(encoding="utf-8")
 # The daemon's storage BACKEND is a second consumer of the OWNCLOUD_* family, and
 # the read⇔loadable pin below was blind to it until 2026-09-04 (). It
 # scanned __main__.py alone, so OWNCLOUD_OBJECT_CACHE and
-# OWNCLOUD_OBJECT_CACHE_TIMEOUT — read at owncloud_backend.py:959,972, inside the
+# OWNCLOUD_OBJECT_CACHE_TIMEOUT — read in `_cache_fetch` (anchored by function
+# name: the line numbers cited here drifted when the TOKEN key landed), inside the
 # daemon process — became the THIRD and FOURTH instances of the exact class this
 # file was written to catch, and the pin reported clean the whole time. A drift
 # test is only as general as the set of modules it reads; scanning the module that
@@ -56,11 +57,34 @@ SOURCE = MAIN_PY.read_text(encoding="utf-8")
 BACKEND_PY = SCRIPTS_DIR / "owncloud_backend.py"
 BACKEND_SOURCE = BACKEND_PY.read_text(encoding="utf-8") if BACKEND_PY.exists() else ""
 
-# name -> source. Add a module here when it starts reading OWNCLOUD_* env keys.
+# The ENDPOINT modules are a THIRD consumer surface, and the pin was blind to it
+# until 2026-09-07 ( outcome 4). Widening the scan to the backend above
+# fixed the module set for the file that happened to be in front of that reader;
+# it did not make the scan GENERAL, which is exactly what guard-5971 says to
+# check ("a general drift test is only as general as the set of files it reads,
+# and a passing result cannot tell you which it is"). So this is a GLOB, not two
+# more hand-listed names: a new endpoint joins the scan by existing, and the next
+# reader does not have to remember this file. Every module is asserted non-empty
+# below, so a moved/renamed one fails loud instead of silently narrowing the scan.
+ENDPOINTS_DIR = REPO_ROOT / "mind_api" / "src" / "endpoints"
+
+# name -> source. Modules outside the endpoints glob are listed explicitly; add
+# one here when it starts reading a scanned env family.
 ENV_READ_SOURCES = {
     "mind_api/src/__main__.py": SOURCE,
     "core/scripts/owncloud_backend.py": BACKEND_SOURCE,
 }
+for _ep in sorted(ENDPOINTS_DIR.glob("*.py")):
+    ENV_READ_SOURCES[f"mind_api/src/endpoints/{_ep.name}"] = _ep.read_text(encoding="utf-8")
+
+# Families this pin enforces READ ⇔ LOADABLE for. OWNCLOUD_* was the original;
+# MIND_API_* joined 2026-09-07 because MIND_API_CACHE_MAX_BYTES /
+# MIND_API_CACHE_MAX_OBJECT_BYTES escaped on BOTH axes at once — read in an
+# endpoint module the scan never opened, under a prefix the regex never matched.
+# Adding the family was measured before landing (guard-1562/guard-2499): across
+# all 24 endpoint modules it newly flags exactly those two keys and nothing else,
+# and the OWNCLOUD_* count is unchanged at 0 unreachable.
+SCANNED_ENV_FAMILIES = ("OWNCLOUD_", "MIND_API_")
 
 # `_load_env_local` accepts a key iff it is in _N3_ALLOWED_EXACT, starts with
 # MIND_AWS_, or is exactly AWS_DEFAULT_REGION. Mirrored from the function rather
@@ -105,16 +129,33 @@ def test_every_owncloud_env_key_the_daemon_reads_is_loadable():
         )
 
     read_keys = {}          # key -> the module that reads it (for the message)
-    for where, src in ENV_READ_SOURCES.items():
-        for k in re.findall(r'os\.environ\.get\(\s*["\'](OWNCLOUD_[A-Z0-9_]+)', src):
-            read_keys.setdefault(k, where)
+    for fam in SCANNED_ENV_FAMILIES:
+        # BOTH access forms. `os.environ[...]` currently yields nothing extra in
+        # either family (measured 2026-09-07), so this is not speculative
+        # coverage — it is the measurement written down, and it keeps a future
+        # subscript read from escaping a test whose whole job is generality.
+        for pat in (r'os\.environ\.get\(\s*["\'](' + fam + r'[A-Z0-9_]+)',
+                    r'os\.environ\[\s*["\'](' + fam + r'[A-Z0-9_]+)'):
+            for where, src in ENV_READ_SOURCES.items():
+                for k in re.findall(pat, src):
+                    read_keys.setdefault(k, where)
     assert read_keys, (
-        "found ZERO OWNCLOUD_* os.environ.get reads — the regex has drifted from "
-        "the source, so this test would pass vacuously (rb-245). Fix the regex."
+        f"found ZERO {'/'.join(SCANNED_ENV_FAMILIES)}* os.environ reads — the "
+        f"regex has drifted from the source, so this test would pass vacuously "
+        f"(rb-245). Fix the regex."
     )
+    # Per-family vacuity guard: the aggregate assert above stays green while ONE
+    # family silently stops matching, which is the same fails-open shape one
+    # level up (guard-5971). Each scanned family must contribute a read.
+    for fam in SCANNED_ENV_FAMILIES:
+        assert any(k.startswith(fam) for k in read_keys), (
+            f"family {fam}* matched ZERO reads across {len(ENV_READ_SOURCES)} "
+            f"scanned modules — it has drifted out of the scan and is now "
+            f"enforcing nothing, while the aggregate assert above still passes."
+        )
     unreachable = sorted(k for k in read_keys if not _is_loadable(k, allowed))
     assert not unreachable, (
-        f"OWNCLOUD_* keys READ by the daemon but not loadable from .env.local: "
+        f"env keys READ by the daemon but not loadable from .env.local: "
         f"{[(k, read_keys[k]) for k in unreachable]}. Either add each to "
         f"_N3_ALLOWED_EXACT or stop reading it. A read-but-unsettable knob is a "
         f"control that fails silently open."
@@ -214,6 +255,39 @@ def test_the_sync_thread_still_gates_only_on_storage_backend():
     assert 'os.environ.get("OWNCLOUD_SYNC_INTERVAL"' in body, (
         "the sync thread no longer reads OWNCLOUD_SYNC_INTERVAL — the documented "
         "pause recipe (set a large interval + --restart) no longer works."
+    )
+
+
+def test_every_loadable_token_key_is_classified_secret():
+    """A loadable key whose name says TOKEN must never have its VALUE printed.
+
+    `_is_secret_env_key` gates the one place `_load_env_local` reports a value
+    (`"(values withheld -- credential key)"`), and it names its secrets
+    EXPLICITLY — so adding a credential to the allowlist without adding it there
+    too leaks the value, silently, and only into diagnostics nobody reads until
+    they matter. g-358-40 added OWNCLOUD_OBJECT_CACHE_TOKEN, the first secret in
+    that list that is not MIND_API_TOKEN or MIND_AWS_*.
+
+    Keyed on the NAME SUFFIX rather than on a hardcoded key list, for the same
+    reason the read⇔loadable pin above is prose-free: this must catch the NEXT
+    one, not re-assert the one that motivated it. It cannot catch a credential
+    whose name does not end in _TOKEN — a real limit, stated rather than papered
+    over; the suffix is the strongest signal available to a static check.
+    """
+    allowed = _allowed_exact()
+    token_keys = sorted(k for k in allowed if k.endswith("_TOKEN"))
+    assert token_keys, (
+        "found ZERO _TOKEN keys in _N3_ALLOWED_EXACT — the parse has drifted "
+        "from the source, so this test would pass vacuously (rb-245)."
+    )
+    m = re.search(r"def _is_secret_env_key\(.*?\n(.*?)\n\n", SOURCE, re.S)
+    assert m, "could not locate _is_secret_env_key's body"
+    body = m.group(1)
+    unmasked = [k for k in token_keys if f'"{k}"' not in body]
+    assert not unmasked, (
+        f"loadable _TOKEN keys not named in _is_secret_env_key: {unmasked}. "
+        f"Add each one, or its value will be printed by _load_env_local's "
+        f"inherited-override diagnostic."
     )
 
 

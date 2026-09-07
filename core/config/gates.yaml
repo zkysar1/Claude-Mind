@@ -1199,6 +1199,40 @@ gates:
     tuning_notes: "Three lanes, each population measured against the 130 live deferred goals on 2026-09-04 (cc-08), never reasoned. Lane B (grant cited as a gate) REFUSES: a standing grant is a PERMISSION — every registry row ends never (revoke by deleting this row) — so a grant can retire a gate and can never create one, which makes a grant cited as grounds for waiting decidable without understanding the work. Lane A (agent a live pin excludes) also REFUSES, but ONLY with the pin matched over the ROUTED CLAUSE rather than the whole defer: a defer_reason is a paragraph in which one clause routes work, so whole-text matching let an unrelated sentence decide the verdict and measured 1 firing / 1 false positive (g-350-334, a lone 'server' inside a provenance marker two sentences from a clause pin-001 explicitly permits). Clause scoping takes lane A to 0 firings / 0 false positives across all 130 while a constructed genuine violation still refuses with the pin quoted — the zero is UNEXERCISED, not dead. Lane C ADVISES (owner-phrases are prose; guard-1470). Trigger on the FIELD, never on _is_narrative_defer: that predicate returns False for every STRUCTURED_DEFER_PREFIXES value and the live corpus measured 130 of 130 structured, so gating it the way capability-gate is gated would fire on exactly ZERO of the population while looking correct in review (guard-1802). Role-aware agent extraction is load-bearing: a bare roster word-match fires on 89 of 130 because defers cite agents as PROVENANCE, and requiring the agent to be the target of a routing verb takes that to 4 (guard-4883). Lane A calls gates.lane_pin.evaluate rather than re-deriving lane matching, so the defer gate and the claim gate cannot disagree about what a pin means (guard-2676). Deny messages are built by CONCATENATION, never format(), because they quote registry prose containing braces (guard-3803)."
     retirement_eligible: false
 
+  - id: xtrace-credential-gate
+    script: core/scripts/xtrace-credential-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/settings.json", phase: "PreToolUse[Bash] hook" }
+    dominant_risk: FN
+    asymmetry_magnitude: extreme
+    keyword_bias: strict
+    override_flag: "XTRACE_CREDENTIAL_GATE_OVERRIDE (token in the command, not a flag)"
+    fp_cost: low
+    fn_cost: extreme
+    fp_description: "A command is refused and the author reaches for the override token or a heredoc. Measured blast radius 36/930 scripts (3.9%) reach the credential loader, so the refusable population is small. Two false-positive classes were found by running the gate and are now closed: an unanchored env-assignment pattern matched inside any quoted string, and heredoc bodies written out to a file were read as commands."
+    fn_description: "Shell xtrace runs over a credential-sourcing wrapper and every secret the loader exported is printed in plaintext into a transcript that persists. Happened 2026-08-16: four provider keys leaked this way. Unrecoverable once written -- the transcript is the artifact."
+    rb_evidence: ["guard-2846"]
+    tuning_notes: "Logs block and override only. noop is deliberately NOT logged: the hook fires on EVERY Bash call, so a noop row per invocation would write thousands of rows a day to buy an invocation denominator nothing consumes. The override record is contractual rather than telemetry -- the deny message promises the bypass is recorded, and an unlogged bypass makes that promise false inside a security control. It logs the COUNTERFACTUAL: the token is stripped and the predicate re-run, so only a command that would actually have been denied counts as a bypass. Heredoc bodies redirected to a file are stripped before scanning (authoring is not invoking) but bodies fed to a shell are kept, so the evasion closes structurally."
+  - id: scorer-sovereignty-claim-gate
+    script: core/scripts/scorer-verdict-gate.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/aspirations-claim.sh", phase: "pre-claim chokepoint, before the daemon claim POST" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: "--deviation"
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "A legitimate divergence is refused because the agent named no code (or a code outside the closed enum); the agent re-issues with the right --deviation and loses seconds. Bounded by construction: the enum has ten members covering every divergence path aspirations-select already sanctions, and the deny message prints the whole set."
+    fn_description: "An unsanctioned divergence from the scorer's fresh top pick lands unrecorded — the scorer is routed around rather than tuned, and the ranking stops meaning anything. Fail-open by design on a missing/malformed/stale verdict, so the realistic FN is a broken selector rather than a wrong call."
+    rb_evidence: ["guard-502", "guard-1743", "guard-2293", "guard-4040", "guard-1337", "guard-5817"]
+    tuning_notes: "Instrumented 2026-09-06 (g-115-8163). Before that the gate was UNREGISTERED and emitted no firings at all: its only record was a best-effort scorer_override row in the per-agent execution diary, written on the SANCTIONED-DEVIATION branch alone. That is the guard-2293 shape — an escape-path-only ledger — so blocks that STOOD and every ordinary pass left no trace and the FP ratio count(override)/(block+override) was unmeasurable. All seven branches now emit a unique decision_path (guard-502), each mapped to a _gate_log decision by its observable control-flow effect at aspirations-claim.sh rather than by local intent (guard-1743). The second reason to move off the diary is CARRIER, not coverage: measured 2026-09-06, read_fleet_diaries returned alpha's diary at 57,198 B with ZERO of its 70 scorer_override rows while being FRESHER (08:44:16) than the local copy (08:37:00) — a cross-Body last-writer-wins clobber, not staleness — so 82% of the fleet's abstention signal was invisible to scorer-override-audit.py, its only fleet-wide reader. The gate-firings store aggregates via gate-firings-flush.sh and does not have that failure mode. Do NOT verify a firing by reading the shared store on an own-cloud box: _gate_log routes the hot path to a machine-local spool and the direct read yields a false 'telemetry is dead' (guard-4040)."
+    retirement_eligible: false
+
 pending_audit:
   - audit-schema-gate.py
   - encode-stable-facts-gate.py

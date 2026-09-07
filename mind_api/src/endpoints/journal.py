@@ -13,21 +13,13 @@ Lives under AGENT_DIR (<agent>/journal.jsonl).
 from __future__ import annotations
 
 from ..jsonl_cache import cache
-from ._jsonl_common import flag, json_response_pretty, missing_flag_error, plain_lines
+from ._jsonl_common import (
+    flag, json_response_pretty, missing_flag_error, parse_int_param, plain_lines,
+)
 
 
 def _path(ctx):
     return ctx.paths.agent / "journal.jsonl"
-
-
-def _parse_n(s: str, default: int = 5) -> int:
-    if s == "" or s is None:
-        return default
-    try:
-        n = int(s)
-    except ValueError:
-        return default
-    return n if n > 0 else default
 
 
 def read(ctx) -> "Response":  # type: ignore[name-defined]
@@ -89,7 +81,9 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     recent = q.get("recent")
     if recent is not None:
-        n = _parse_n(recent)
+        n, err = parse_int_param(recent, "recent", 5)
+        if err is not None:
+            return err
         items = list(jc.get(path))
         items.sort(key=lambda r: r.get("session", 0), reverse=True)
         return json_response_pretty(items[:n])

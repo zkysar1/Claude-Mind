@@ -68,6 +68,12 @@ def _emit(monkeypatch, goal, new_status="skipped"):
         captured["input"] = kwargs.get("input")
         return _FakeCompleted()
 
+    # Opt out of the  pytest suppression. Every test in this file
+    # POSITIVELY asserts on the emitted observation, which is exactly the case
+    # the opt-out exists for (same contract as GATE_LOG_ALLOW_PYTEST). Safe
+    # because the wm.py subprocess is stubbed one line below, so nothing
+    # reaches a real working-memory file.
+    monkeypatch.setenv("E9_SKIP_OBSERVATION_ALLOW_PYTEST", "1")
     monkeypatch.setattr(aspirations.subprocess, "run", fake_run)
     aspirations._emit_e9_skip_observation(goal.get("id", "g-t-01"), new_status, goal)
     if "input" not in captured:
@@ -254,3 +260,77 @@ def test_cli_and_daemon_copies_agree_on_precedence():
             f"{label}: defer_reason outranks outcome_note — on a skipped goal "
             f"the defer is stale and the note is the decision"
         )
+
+
+# ---------------------------------------------------------------------------
+#  — the hook must not write LIVE working memory during a test run.
+#
+# THE DEFECT. This hook shells out to wm.py, which resolves the agent dir from
+# MIND_AGENT at call time. A test that seeds a tmp WORLD but not a tmp AGENT
+# dir therefore lands its skip observation in the live bound agent's real
+# working memory. Measured on alpha: sensory_buffer rows sourced to the fixture
+# goal  at 2026-08-10T10:12 and 12:10, with a THIRD by 2026-09-03 —
+# driven by test_update_goal_takeover_guard.py, whose ("status", "skipped")
+# case updates  through cmd_update_goal.
+#
+# WHY NO EXISTING SWEEP CATCHES IT. check-tests-no-live-agent-wm.py looks for
+# WM writes IN TEST FILES and passed over 1205 files in the same iteration the
+# residue was found. This write is in PRODUCTION code, reached THROUGH a test —
+# guard-1802's narrow-predicate class, where a sweep narrower than the
+# population it guards reports clean forever. These two tests are the runtime
+# counterpart that predicate structurally cannot cover.
+# ---------------------------------------------------------------------------
+
+def test_pytest_guard_blocks_the_live_wm_subprocess(monkeypatch):
+    """Under pytest and WITHOUT the opt-out, the hook must emit nothing.
+
+    Asserts on the SUBPROCESS, not on the payload: the whole defect is that a
+    real wm.py child process ran against a live agent dir, so the subprocess
+    call is the thing that must not happen.
+    """
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _FakeCompleted()
+
+    monkeypatch.delenv("E9_SKIP_OBSERVATION_ALLOW_PYTEST", raising=False)
+    monkeypatch.setattr(aspirations.subprocess, "run", fake_run)
+    aspirations._emit_e9_skip_observation("g-999-07", "skipped", {
+        "id": "g-999-07",
+        "title": "Test goal g-999-07",
+        "description": "fixture goal for the takeover guard matrix" + _DESC,
+        "outcome_note": "fixture",
+    })
+    assert calls == [], (
+        "E9 shelled out to wm.py during a pytest run — this is the live "
+        "working-memory leak g-115-5753 exists to close; argv=%r" % (calls,))
+
+
+def test_opt_out_re_enables_the_emit(monkeypatch):
+    """POSITIVE CONTROL for the test above (guard-3534).
+
+    Without this, `calls == []` would also pass if the hook had returned early
+    for some unrelated reason — a trivial-goal short-circuit, a raised
+    exception swallowed by the fail-open contract, or a renamed function. The
+    two tests differ in exactly ONE byte of environment, so a green pair pins
+    the suppression to the guard itself rather than to any of those.
+    """
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return _FakeCompleted()
+
+    monkeypatch.setenv("E9_SKIP_OBSERVATION_ALLOW_PYTEST", "1")
+    monkeypatch.setattr(aspirations.subprocess, "run", fake_run)
+    aspirations._emit_e9_skip_observation("g-999-07", "skipped", {
+        "id": "g-999-07",
+        "title": "Test goal g-999-07",
+        "description": "fixture goal for the takeover guard matrix" + _DESC,
+        "outcome_note": "fixture",
+    })
+    assert len(calls) == 1, (
+        "the opt-out did not re-enable the emit, so the test above proves "
+        "nothing about the guard; calls=%r" % (calls,))
+    assert "wm.py" in " ".join(str(a) for a in calls[0])

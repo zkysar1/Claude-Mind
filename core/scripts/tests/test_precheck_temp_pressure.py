@@ -552,5 +552,121 @@ def test_git_cross_check_fails_open(tmp_path, monkeypatch):
     assert r["ephemera_tracked_excluded"] == 0
 
 
+# ── full-depth footprint () ────────────────────────────────────────
+# The footprint is REPORTED, never thresholded. The first test below is the
+# load-bearing one: it pins the SEPARATION, so a future change that wires the
+# footprint into pressure_count fails here rather than shipping the guard-5329
+# defect (a metric that schedules a remedy the remedy cannot move).
+
+
+def test_footprint_never_moves_pressure_count(tmp_path, monkeypatch):
+    """A deep subtree adds mass and files to the footprint and NOTHING to the
+    scheduling signal. /drain-temp enumerates depth 1 only, so a full-depth
+    pressure_count would schedule a drain against files the drain cannot reach
+    (guard-5329)."""
+    agent = tmp_path / "agents" / "agent-a"
+    temp = agent / "temp"
+    temp.mkdir(parents=True)
+    (temp / "flat.md").write_text("d", encoding="utf-8")
+    deep = temp / "sub" / "deeper"
+    deep.mkdir(parents=True)
+    for i in range(30):                      # well past drain_goal_threshold=20
+        (deep / f"buried-{i:02d}.md").write_text("x" * 100, encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", agent)
+    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["count"] == 1                   # depth-1 only, as /drain-temp sees
+    assert r["pressure_count"] == 1
+    assert r["flags"] == []                  # 30 buried files trigger nothing
+    fp = r["footprint"]
+    assert fp["files"] == 31                 # the footprint DOES see them
+    assert fp["depth1_files"] == 1
+    assert fp["deeper_files"] == 30
+    assert "footprint(advisory, not thresholded)" in r["summary"]
+
+
+def test_footprint_depth_split_and_byte_totals(tmp_path):
+    """files/bytes are the sum of the depth-1 and deeper halves — the split is
+    the point (a count of N says nothing about mass; guard-3260)."""
+    temp = tmp_path / "temp"
+    (temp / "a" / "b").mkdir(parents=True)
+    (temp / "root.md").write_text("x" * 10, encoding="utf-8")
+    (temp / "a" / "mid.md").write_text("x" * 100, encoding="utf-8")
+    (temp / "a" / "b" / "leaf.md").write_text("x" * 1000, encoding="utf-8")
+    fp = pe._temp_footprint(temp)
+    assert (fp["files"], fp["bytes"]) == (3, 1110)
+    assert (fp["depth1_files"], fp["depth1_bytes"]) == (1, 10)
+    assert (fp["deeper_files"], fp["deeper_bytes"]) == (2, 1100)
+    assert fp["files"] == fp["depth1_files"] + fp["deeper_files"]
+    assert fp["bytes"] == fp["depth1_bytes"] + fp["deeper_bytes"]
+    assert fp["truncated"] is False and fp["error"] is None
+
+
+def test_footprint_prunes_clone_subtrees_dir_and_file_dotgit(tmp_path):
+    """Lane 3's own predicate is `-e <dir>/.git`, which catches a .git DIR and a
+    worktree/submodule .git FILE. Lane 3 PRESERVES such dirs, so counting them
+    would let a subtree no lane can remove dominate the number. Pruned dirs are
+    NAMED, never silently skipped."""
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    (temp / "kept.md").write_text("x" * 5, encoding="utf-8")
+    clone = temp / "some-clone"
+    (clone / ".git").mkdir(parents=True)
+    (clone / "huge.bin").write_text("x" * 9999, encoding="utf-8")
+    wt = temp / "a-worktree"
+    wt.mkdir()
+    (wt / ".git").write_text("gitdir: /elsewhere", encoding="utf-8")
+    (wt / "also-huge.bin").write_text("x" * 9999, encoding="utf-8")
+    fp = pe._temp_footprint(temp)
+    assert (fp["files"], fp["bytes"]) == (1, 5)      # only kept.md counted
+    assert fp["clone_dirs_excluded"] == 2
+    assert sorted(fp["clone_dirs"]) == ["a-worktree", "some-clone"]
+
+
+def test_footprint_scan_cap_reports_truncated(tmp_path):
+    """The cap is a COST bound, not a tuning knob (153,453 files were measured
+    under one scratch dir). A capped scan must never read as a whole one —
+    guard-1760: a checker may not report what it declined to look at."""
+    temp = tmp_path / "temp"
+    temp.mkdir(parents=True)
+    for i in range(12):
+        (temp / f"f-{i:02d}.md").write_text("x", encoding="utf-8")
+    fp = pe._temp_footprint(temp, file_cap=5)
+    assert fp["truncated"] is True
+    assert fp["files"] == 5
+    uncapped = pe._temp_footprint(temp)
+    assert uncapped["truncated"] is False and uncapped["files"] == 12
+
+
+def test_footprint_reaches_the_summary_on_a_CLEAN_tree(tmp_path, monkeypatch):
+    """A tree with mass at depth 3 and ZERO depth-1 docs is "clean" for
+    SCHEDULING and is exactly the shape this metric exists to make visible
+    (bravo/cc-05: ~1.1 GB under drained/). "clean" must therefore not be the
+    whole sentence — a number that lives only in the JSON body is the same
+    invisibility g-029-87 rejects. Caught by the Q1.5 generated checklist after
+    the clause was first built inside the pressure branch only."""
+    agent = tmp_path / "agents" / "agent-a"
+    deep = agent / "temp" / "drained" / "x"
+    deep.mkdir(parents=True)
+    (deep / "huge.json").write_text("y" * 5000, encoding="utf-8")
+    monkeypatch.setattr(pe, "AGENT_DIR", agent)
+    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["flags"] == [] and r["count"] == 0        # genuinely clean to schedule
+    assert r["summary"] != "temp-pressure: clean"      # but not a bare "clean"
+    assert "footprint(advisory, not thresholded)" in r["summary"]
+    assert "5000 B full-depth" in r["summary"]
+    assert r["footprint"]["deeper_bytes"] == 5000
+
+
+def test_footprint_missing_temp_dir_is_zero_not_error(tmp_path):
+    """Fail-open by contract: an absent temp/ is zeros with no error, so no
+    caller can ever branch on a footprint failure."""
+    fp = pe._temp_footprint(tmp_path / "nope")
+    assert fp["files"] == 0 and fp["bytes"] == 0
+    assert fp["truncated"] is False and fp["error"] is None
+    assert pe._temp_footprint(None)["files"] == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

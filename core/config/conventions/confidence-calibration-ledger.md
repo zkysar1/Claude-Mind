@@ -83,11 +83,43 @@ here.
 | surface | where | status |
 |---|---|---|
 | adjudication lane resolutions | `adjudication-lane.py::cmd_resolve` → `_capture_confidence_truth_event` | live |
+| guardrail retire/revise verdicts | `guardrail-retire.sh` step 3 → `guardrail_retire.truth_event_for` | live |
 
-Candidate surfaces named by g-306-399 but **not** wired: stale-claim-artifact sweeps,
-curate-memory RETIRE/REVISE decisions that cite CONTENT evidence, and hypothesis resolutions
-naming a tree/rb entry. Utilization-only retirements are explicitly **excluded** — a
-popularity signal is not a truth event, and mixing them pollutes the curve with usage data.
+### guardrail-retire, and the two things a reader must not re-derive
+
+Verdict map (`truth_event_for`, pure and unit-tested — `tests/test_guardrail_retire_truth_event.py`):
+`keep`/`refresh` → `survived`, `revise` → `revised`, `retire` → `refuted`.
+
+**`revise` is `revised`, never `refuted`.** `_verdict_mutations` defines that verdict as
+"still relevant, just stale-worded" — the CLAIM stood and the wording did not. Collapsing it
+into `refuted` scores a surviving entry as a failure and biases the curve pessimistic, which
+is the mirror of the g-115-9063 defect on the adjudication surface (an inverted mapping that
+wrote `survived` on every row where the entry was wrong, so the curve could only ever report
+perfect calibration). Both directions are silent: neither raises, and the ledger accepts any
+verdict it recognises.
+
+**Capture is in the WRAPPER, after the mutation loop — not in `apply()`, which is where it
+looks like it belongs.** `apply()` computes a mutation PLAN and returns it; the wrapper
+executes it via `guardrails-update-field.sh` and the engine never writes the store
+(guard-832). A recorder inside `apply()` would log verdicts that were merely COMPUTED,
+including plans the wrapper then failed to execute — manufacturing exactly the fiction this
+ledger exists to measure. That is guard-4238's adjacent trap. The capture is therefore gated
+on `exec_rc=0` after the loop, and is `apply`-only: `restore` un-does a prior verdict rather
+than rendering a new one.
+
+Remaining candidate surfaces named by g-306-399 but **not** wired: stale-claim-artifact
+sweeps, curate-memory RETIRE/REVISE decisions that cite CONTENT evidence, and hypothesis
+resolutions naming a tree/rb entry. The last of those needs a schema change before it is
+possible: pipeline records carry their own `confidence` and `outcome`, but **no field linking
+a hypothesis to the tree/rb entry it tests** (measured 2026-09-06 across 63 resolved records —
+no `entry_id`, `tree_node` or `rb_ref`; the nearest is `context_consulted`, present on 13).
+
+Utilization-only retirements are explicitly **excluded** — a popularity signal is not a truth
+event, and mixing them pollutes the curve with usage data. This is why a bare
+`guardrail-retire.sh apply <id> retire` records NOTHING: that lane's retire verdict is driven
+by staleness + `effective_relevance` scoring, so an uncited retire IS the utilization-only
+shape. A `retire` carrying `--reason` is a content judgement and IS recorded, with the reason
+as `evidence_ref`. The exclusion keys on the EVIDENCE, never on the verdict name.
 
 ## Reading it
 

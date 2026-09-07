@@ -4,6 +4,8 @@
 All shell scripts are thin wrappers around this. Subcommands managed via argparse.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -133,6 +135,23 @@ VALID_USER_LEG_SCOPES = {
     # SSOT — gates/user_leg_scope.py mirrors this set; parity is pinned by
     # tests/test_allowlist_parity_batch3.py::test_2b_user_leg_scopes_equal.
     "principal-identity",
+    # A quiesced or scheduled WINDOW that only the principal can open —
+    # stopping/killing/starting agents across the fleet, or being physically at
+    # the terminal. Added 2026-09-07 (alpha, cc-13, ).
+    # NOT A NEW COINAGE, and that is the point: `human-window` already existed
+    # in gates/defer_scope.py's DEFER_SCOPES ("needs a quiesced / scheduled
+    # window a human opens"), derived from the LIVE defer corpus on 2026-08-09.
+    # 's note proposed minting `operational-control` for this shape;
+    # reusing the token the sibling enum already carries is defer_scope.py's own
+    # stated principle ("Tokens that already existed in VALID_USER_LEG_SCOPES
+    # were REUSED rather than re-spelled"), and it keeps the two vocabularies
+    # spanning each other instead of drifting a synonym apart.
+    # BLAST RADIUS, measured before landing (guard-1910 — enumerate what READS
+    # the field, not what imports the code): DEFER_SCOPES is
+    # `VALID_USER_LEG_SCOPES | {... "human-window" ...}`, so this append leaves
+    # DEFER_SCOPES BYTE-IDENTICAL and widens only LANE_SCOPES' user-leg/grant
+    # lanes. The live carrier is  (fleet quiet window).
+    "human-window",
 }
 
 # `intended_agent` is the optional routing hint produced by
@@ -2886,6 +2905,40 @@ def _emit_e9_skip_observation(goal_id, new_status, goal):
     to stderr but never blocks the status-change return path. See encoding-
     triggers.md E9.
     """
+    # Pytest suppression () — the guard-1041 writer-side pattern,
+    # same shape as _gate_log's GATE_LOG_ALLOW_PYTEST ().
+    #
+    # WHY THIS WRITER NEEDS IT. This hook fires on ANY status flip to
+    # skipped/expired and shells out to wm.py, which resolves the agent dir
+    # from MIND_AGENT at call time. So a test that seeds a tmp WORLD but does
+    # not override the AGENT dir lands its skip observation in the LIVE bound
+    # agent's real working memory. Measured: alpha's live sensory_buffer held
+    # rows sourced to the fixture goal  at 2026-08-10T10:12 and
+    # 12:10, and a THIRD arrived by 2026-09-03 — driven by
+    # test_update_goal_takeover_guard.py, whose ("status", "skipped") case
+    # updates  through cmd_update_goal. The leak is not a test writing
+    # WM; it is THIS production hook, reached through a test.
+    #
+    # WHY AN ENV GUARD AND NOT A MONKEYPATCH. guard-1041's widened clause: the
+    # property that matters is whether a test can REACH the destination, not
+    # when the path is built. wm.py is invoked as a SUBPROCESS with an
+    # inline-constructed argv, so there is no module attribute to patch — the
+    # sibling live-WM writer (blocker-recheck._wm_set_blockers) is a plain
+    # module attribute and its suite already patches it, which is why that one
+    # does not leak and this one did.
+    #
+    # WHY AT THE TOP rather than inside the try below: the reason-chain and
+    # payload construction above the try are unguarded, so returning here also
+    # keeps this hook from raising at all under test. os.environ.get cannot
+    # raise, so the fail-open contract is preserved.
+    #
+    # Opt out with E9_SKIP_OBSERVATION_ALLOW_PYTEST=1 in a test that
+    # POSITIVELY asserts on emitted observations, with its agent dir
+    # redirected to a tmp root.
+    if (os.environ.get("PYTEST_CURRENT_TEST")
+            and not os.environ.get("E9_SKIP_OBSERVATION_ALLOW_PYTEST")):
+        return
+
     title = goal.get("title", "")
     desc = goal.get("description", "")
     # `outcome_note` is IN this chain because it is where the skip rationale

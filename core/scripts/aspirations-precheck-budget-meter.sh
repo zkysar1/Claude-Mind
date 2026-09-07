@@ -145,7 +145,7 @@ now_ms() {
 # Section PB check that asserts the SKILL.md tier table matches.
 sweep_tier() {
     case "$1" in
-        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|directive-mix-check|completed-not-closed-drain|world-script-crlf-check|close-phase-skip-check)
+        tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|directive-mix-check|completed-not-closed-drain|world-script-crlf-check|close-phase-skip-check|inbound-drain)
             echo "always-run" ;;
         aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
@@ -352,6 +352,7 @@ PYEOF
         # Decision logic in Python for atomic state update
         STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" SWEEP_E="$SWEEP_NAME" TIER_E="$tier" CUR_E="$cur_ms" \
         SCRIPT_DIR_E="$SCRIPT_DIR" TRACKER_FILE_E="$AGENT_DIR/session/precheck-retrospection-tracker.json" \
+        CB_FILE_E="$AGENT_DIR/session/context-budget.json" \
         py -3 - <<'PYEOF' 2>/dev/null || echo "run"
 import os, json, sys
 state_file = os.environ['STATE_FILE_E']
@@ -372,6 +373,63 @@ if state.get('disabled'):
 elapsed = cur_ms - state.get('start_ms', cur_ms)
 state['last_check_ms'] = cur_ms
 zone = state.get('zone', 'fresh')
+
+# LIVE-ZONE REFRESH (). `zone` above is a SNAPSHOT taken once, in
+# `start`. The event most likely to land mid-precheck is an autocompact -- and
+# an autocompact is exactly what FREES context -- so the snapshot goes stale
+# reliably in the RESTRICTIVE direction: it captures the pre-compaction 'tight'
+# and holds it for the whole window while the true zone is 'fresh', silently
+# dropping every deferrable lane (all seven cadence rituals, the ratchets, the
+# reclaim lanes, every *-audit) on a precheck that then reports clean. The
+# freeze is ONE-SIGNED, which is what makes it a defect and not a tradeoff: a
+# stale 'fresh' merely runs lanes that could have been skipped; a stale 'tight'
+# starves the rituals (guard-6050, measured twice -- cc-03 20.5 min apart with
+# live='normal' vs frozen='tight', and cc-04 with live='fresh' vs frozen=
+# 'tight' where re-running `start` flipped the same check from drop to run).
+#
+# WHY MTIME IS ADMISSIBLE HERE, both halves verified rather than assumed:
+#   guard-1504 (enumerate EVERY writer): context-budget.json has exactly ONE
+#     writer, context-budget-status.py, and it is REGISTERED MACHINE-LOCAL --
+#     `test_owncloud_sync.py::test_session_machine_local_excluded` pins it, so
+#     it never syncs and no peer Body or cache-fill can touch its mtime. That
+#     is what the amendment's "on a shared store the writer set is the whole
+#     fleet" warning would otherwise forbid.
+#   guard-2507 (is the file actually RE-WRITTEN during the measured lifetime?):
+#     yes -- context-budget-status.py is invoked from aspirations-select,
+#     -verify, -state-update, -learning-gate, loop-state-save.py,
+#     reasoning-snapshot.py and loop_exhaustion_fence.py, so the sensor is
+#     refreshed repeatedly inside a single precheck window. If it were written
+#     only at entry this compare would silently degrade into a no-op.
+# The mtime is only the CHEAPNESS gate; the DECISION is made on the file's
+# CONTENT (rb-190). Deliberately NOT an unconditional per-check re-read: there
+# are 51 `check` calls per iteration and read_zone() spawns a python for each,
+# but this runs INSIDE the python process already started for this check, so it
+# costs one stat plus at most one small json read and spawns nothing.
+#
+# FAIL-OPEN, mirroring read_zone() exactly: an absent or unreadable sensor
+# yields 'fresh' (read_zone returns "fresh" for both), which is the direction
+# that RUNS lanes. Never let a sensor fault manufacture a drop.
+_cb = os.environ.get('CB_FILE_E', '')
+if _cb:
+    try:
+        _cb_mtime_ms = int(os.path.getmtime(_cb) * 1000)
+    except Exception:
+        _cb_mtime_ms = None
+    if _cb_mtime_ms is None:
+        zone = 'fresh'
+        state['zone_source'] = 'sensor-absent-fail-open'
+    elif _cb_mtime_ms > int(state.get('start_ms', 0)):
+        try:
+            with open(_cb) as _cbf:
+                zone = (json.load(_cbf) or {}).get('zone') or 'fresh'
+        except Exception:
+            zone = 'fresh'
+        # Rewrite the snapshot so the precheck-end record reports the zone that
+        # actually GOVERNED this window, not the one captured at minute 0.
+        state['zone'] = zone
+        state['zone_refreshed_at_ms'] = cur_ms
+        state['zone_source'] = 'live-sensor'
+
 zone_rules = state.get('zone_drop_rules', {}) or {}
 zone_drops = zone_rules.get(zone, []) or []
 cap_ms = state.get('cap_ms', 9000)

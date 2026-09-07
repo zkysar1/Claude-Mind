@@ -382,7 +382,8 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
             if finding is not None and (finding["dirty_tracked"]
                                         or finding["stranded_commits"]
                                         or finding["stale_stranded_commits"]
-                                        or finding["unattributed_unmerged"]):
+                                        or finding["unattributed_unmerged"]
+                                        or finding["content_free_stranded_commits"]):
                 findings.append(finding)
         except (subprocess.TimeoutExpired, OSError) as exc:
             print(f"[uncommitted-gate] delivery-repo probe failed for "
@@ -460,7 +461,48 @@ def _check_one_repo(repo: Path, fresh_hours: int,
 
     blocking = [c for c in fresh_off_default
                 if c in fresh_local_only or c in fresh_attributed]
-    unattributed = [c for c in fresh_off_default if c not in set(blocking)]
+
+    # CONTENT-FREE DIVERGENCE (). This lane reasons purely over the
+    # commit GRAPH (`rev-list ... --not default_ref`) and never compares TREES,
+    # so a divergence carrying NO content is indistinguishable from genuinely
+    # undelivered work. Measured 2026-08-19 during the close of :
+    # one delivery repo reported 7 stranded commits, 4 of which were merge
+    # commits whose tree was byte-identical to origin/main. The condition is
+    # self-perpetuating -- it blocks EVERY subsequent close on that box -- and
+    # both ways to clear it are worse than the disease (a destructive local reset
+    # the agent cannot perform, or merging a no-op PR into a protected main).
+    #
+    # SCOPED TO COMMITS REACHABLE FROM HEAD, deliberately. Equal trees at the tip
+    # prove only that HEAD's CONTENT is already on the default ref; they say
+    # nothing about a side branch, which may carry real undelivered work. The
+    # off-default population is drawn from ALL branches and remotes, so releasing
+    # it wholesale on a HEAD-only proof would be exactly the mutation this gate
+    # exists to prevent. Verified on a fixture carrying both shapes at once:
+    # off-default 3, reachable-from-HEAD 2, and the feature commit kept blocking.
+    #
+    # Released, NEVER dropped: the commits move to `content_free_stranded_commits`
+    # and are reported by evaluate(). A diverged local default is still a real
+    # thing a maintainer may want to know about -- and equal trees do not prove
+    # the intervening commits are worthless (a revert pair has an identical tree).
+    # guard-1760: a gate reports what it ran, never only what it declined to look
+    # at. Fail-open direction is the SAFE one: any git error leaves content_free
+    # empty, so everything keeps blocking and nothing is released by an error.
+    content_free: List[str] = []
+    if blocking:
+        try:
+            _same_tree = subprocess.run(
+                ["git", "-C", str(repo), "diff", "--quiet", default_ref, "HEAD"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            _same_tree = None
+        if _same_tree is not None and _same_tree.returncode == 0:
+            from_head = set(_rev_list(["HEAD", "--not", default_ref]))
+            content_free = [c for c in blocking if c in from_head]
+            blocking = [c for c in blocking if c not in from_head]
+
+    unattributed = [c for c in fresh_off_default
+                    if c not in set(blocking) and c not in set(content_free)]
     stale = [c for c in _rev_list(off_default) if c not in set(fresh_off_default)]
     return {
         "repo": str(repo),
@@ -469,6 +511,7 @@ def _check_one_repo(repo: Path, fresh_hours: int,
         "stranded_commits": blocking[:20],
         "stale_stranded_commits": stale[:20],
         "unattributed_unmerged": unattributed[:20],
+        "content_free_stranded_commits": content_free[:20],
         "refspec_complete": refspec_complete,
     }
 
@@ -584,6 +627,19 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
                   f"{len(f['unattributed_unmerged'])} fresh commit(s) pushed to "
                   f"an unmerged branch by OTHER goals (not {goal_id or 'this goal'}"
                   f") — reporting, not blocking", file=sys.stderr)
+        # . Released by the tree-identity split, and reported every run
+        # for the same reason as the two above: a stranding that stops blocking
+        # SILENTLY is indistinguishable from a gate someone deleted (guard-1760).
+        # A diverged local default is still worth a maintainer's attention even
+        # though it owes no content.
+        if f["content_free_stranded_commits"]:
+            print(f"[uncommitted-gate] NOTE: {f['repo']} carries "
+                  f"{len(f['content_free_stranded_commits'])} commit(s) diverging "
+                  f"from {f['default_ref']} whose HEAD TREE is byte-identical to "
+                  f"it — no undelivered content, so reporting, not blocking. "
+                  f"History divergence only (e.g. merges resolved to upstream's "
+                  f"exact bytes); clear it with a fast-forward or leave it.",
+                  file=sys.stderr)
 
     would_block = (bool(dirty) or delivery_blocks or stranded_blocks) \
         and effective_override is None

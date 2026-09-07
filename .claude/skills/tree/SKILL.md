@@ -729,6 +729,14 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
 
 **Steps**:
 1. Scan candidates: `Bash: tree-read.sh --distill-candidates`
+
+   OWNERSHIP (g-115-4077) — each READ-CAP row also carries `owned_by`: the id of
+   the goal already tracking that node, or `null`. Read it BEFORE treating this
+   list as new work — cite that goal rather than re-censusing (sig-229).
+   It ANNOTATES, it does NOT SUPPRESS: an owned row still appears and still takes
+   the routing below. `null` is weak evidence, not proof — the join fails open.
+   # Rationale (WHY annotate rather than filter, why `null` is weak, and the
+   # two-census incident): core/config/rationale/distill-owned-by-annotation.md
 2. For each candidate (largest line_count first, up to `max_distill_per_invocation`):
    a0. ACTION ROUTING (g-115-4058) — read the candidate's `recommended_action`
       FIRST, before the coherence gate. This list is NOT all distills:

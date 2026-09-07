@@ -86,17 +86,29 @@ _EFS_SSH = (_WORLD / "scripts" / "efs-ssh.sh") if _WORLD else None
 class EfsSshPathWarning(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls._tmp = Path(
-            subprocess.run([BASH, "-c", "mktemp -d"], capture_output=True,
-                           text=True, timeout=60).stdout.strip()
-        )
+        # guard-956: never build an rm on an unguarded variable. Measured:
+        # Path("") == Path("."), so an empty `mktemp -d` would put the stub at
+        # the CWD (PROJECT_ROOT, per _run below) and make tearDownClass
+        # `rm -rf .`. Whether that has ever fired here is NOT established — a
+        # stray repo-root ssm-stub.sh byte-equal to _STUB exists, but its
+        # provenance is unproven. The guard stands on the hazard, not on that
+        # file. Skip rather than proceed on an unusable temp dir.
+        _tmp = subprocess.run([BASH, "-c", "mktemp -d"], capture_output=True,
+                              text=True, timeout=60).stdout.strip()
+        if not _tmp or _tmp in (".", "/"):
+            raise unittest.SkipTest(f"mktemp -d gave no usable path: {_tmp!r}")
+        cls._tmp = Path(_tmp)
         cls._stub = cls._tmp / "ssm-stub.sh"
         cls._stub.write_text(_STUB, encoding="utf-8")
         cls._stub.chmod(0o755)
 
     @classmethod
     def tearDownClass(cls):
-        subprocess.run([BASH, "-c", f"rm -rf {cls._tmp}"], timeout=60)
+        # setUpClass may have skipped before _tmp was set; re-assert the same
+        # shape here so no path can reach the rm unchecked.
+        tmp = str(getattr(cls, "_tmp", "") or "")
+        if tmp and tmp not in (".", "/"):
+            subprocess.run([BASH, "-c", f'rm -rf "{tmp}"'], timeout=60)
 
     def _run(self, command):
         env = dict(os.environ, EFS_SSM_RUN=str(self._stub))

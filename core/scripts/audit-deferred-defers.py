@@ -26,6 +26,8 @@ slipped past the gate.
 Origin: g-255-06 / g-255-02 lineage.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

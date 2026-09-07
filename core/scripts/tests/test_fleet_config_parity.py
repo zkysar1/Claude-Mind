@@ -23,6 +23,7 @@ test below asserts a healthy node produces NO drift — so a checker that return
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -462,9 +463,15 @@ def _run_with_fleet(monkeypatch, unreachable_agents, blackout_cfg=None, peers=4,
     monkeypatch.setattr(fcp, "_collect", fake_collect)
 
     filed = []
+    # box-drift rows are pre-rendered STRINGS, not node dicts () — that
+    # population by definition has no node record. A dict-only double would fail on
+    # the CALL rather than on the behaviour under test, which is the same reason
+    # fake_collect above takes **kw instead of a pinned arity (guard-920).
     monkeypatch.setattr(fcp, "_file_investigate",
                         lambda nodes_, payload, kind="drift":
-                        filed.append((kind, sorted(n["agent"] for n in nodes_))))
+                        filed.append((kind, sorted(
+                            n if isinstance(n, str) else n["agent"]
+                            for n in nodes_))))
 
     rc = fcp.run(file_investigate=True, nodes_filter=nodes_filter)
     return rc, filed
@@ -1341,12 +1348,21 @@ def test_no_rendering_site_reads_agent_directly():
 
 
 def test_manifest_body_boxes_do_not_perturb_roster_parity():
-    """The two Body rows must be invisible to _roster_parity, which keys on `agent`.
+    """Body rows must be invisible to _roster_parity, which keys on `agent`.
 
-    cc-07 reuses alpha (already a roster member, so the SET is unchanged) and cc-08
-    carries no `agent` at all (skipped by that function's `if n.get("agent")`). If
-    cc-08 ever gained a placeholder agent name, _roster_parity would emit a permanent
-    INFO calling it a retired node — false, and it trains readers to skim INFO lines.
+    cc-07 reuses alpha (already a roster member, so the SET is unchanged) and the
+    fleet-agnostic boxes carry no `agent` at all (skipped by that function's
+    `if n.get("agent")`). If one ever gained a placeholder agent name,
+    _roster_parity would emit a permanent INFO calling it a retired node — false,
+    and it trains readers to skim INFO lines.
+
+    THE AGENT-SET ASSERTION IS THE INVARIANT; the agent-less HOST LIST is not.
+    This test pinned that list to exactly ["cc-08"] until 2026-09-06, when
+    registering four measured Body boxes (cc-09/cc-10/cc-13/cc-14, g-115-9213)
+    failed it. Nothing was wrong: the exact-list pin made every legitimate
+    registration a test failure while protecting nothing the set assertion above
+    does not already protect — a placeholder agent name breaks THAT, which is the
+    thing the docstring says this test is for. Membership, not equality.
     """
     yaml = pytest.importorskip("yaml")
     manifest = yaml.safe_load(
@@ -1354,7 +1370,10 @@ def test_manifest_body_boxes_do_not_perturb_roster_parity():
     nodes = manifest["nodes"]
     assert {n.get("agent") for n in nodes if n.get("agent")} == {
         "alpha", "bravo", "echo", "zeta", "foxtrot"}
-    assert [n["host"] for n in nodes if not n.get("agent")] == ["cc-08"]
+    agentless = [n["host"] for n in nodes if not n.get("agent")]
+    assert "cc-08" in agentless, (
+        "cc-08 is the documented fleet-agnostic row; losing its agent-less "
+        "encoding is the regression this test exists to catch: %r" % (agentless,))
     assert {n["host"] for n in nodes} >= {"cc-07", "cc-08"}
 
 
@@ -1645,6 +1664,152 @@ def test_collector_extracts_every_key_the_emitter_declares():
             "the collector no longer extracts logline_%s, so _daemon_lane's "
             "logline arm for it can never fire" % key
         )
+
+# ---------------------------------------------------------------------------
+#  — box drift must FILE, not just print
+# ---------------------------------------------------------------------------
+# The pre-fix defect: run() gated its two filing branches on `drifted` and
+# `blackout`. `box_drift` belongs to neither, so a run could print BOX DRIFT,
+# exit 1, and leave no goal behind. Measured 2026-09-06 on a live fleet: five
+# live boxes unmeasured, surfaced by every sweep, owned by nobody.
+
+
+def _all_boxes_plus(extra=None, peers=4):
+    """The box set that AGREES with _run_with_fleet's synthetic manifest, plus
+    any extras. Agreement is the baseline, so a test that adds nothing must file
+    nothing — that is what makes the extras-case meaningful."""
+    boxes = {"self-box": _FRESH_TS}
+    boxes.update({"peer%d-box" % i: _FRESH_TS for i in range(peers)})
+    boxes.update(extra or {})
+    return boxes
+
+
+def test_live_box_missing_from_manifest_FILES_an_investigate(monkeypatch):
+    """THE STRUCTURAL TEST — it fails against the pre-fix tree.
+
+    No node drifts and nothing is unreachable, so neither pre-existing filing
+    branch can fire. The only population present is box drift. Before the fix
+    `filed` was empty here while rc was already 1: reported, exited non-zero,
+    and filed nothing.
+    """
+    rc, filed = _run_with_fleet(monkeypatch, set(),
+                                boxes=_all_boxes_plus({"unlisted-box": _FRESH_TS}))
+    assert rc == 1, "an unmeasured live box must fail the sweep"
+    assert [k for k, _ in filed] == ["box-drift"], (
+        "box drift must file its own Investigate, and must NOT be reported as "
+        "node drift or blackout — nothing is misconfigured and nothing is down; "
+        "the finding is that a live box was never measured at all: %r" % (filed,))
+    assert any("unlisted-box" in row for row in filed[0][1]), (
+        "the filed report must name the unmeasured box: %r" % (filed,))
+
+
+def test_agreeing_box_set_files_nothing(monkeypatch):
+    """Anti-vacuity: pins that the new branch is driven by the POPULATION and not
+    by the flag. Without this, a filer that fired unconditionally would satisfy
+    the test above."""
+    rc, filed = _run_with_fleet(monkeypatch, set(), boxes=_all_boxes_plus())
+    assert rc == 0
+    assert filed == [], "no unmeasured box means nothing to file: %r" % (filed,)
+
+
+def _capture_filing(monkeypatch, nodes, kind, *, open_goal=""):
+    """Drive the REAL _file_investigate with subprocess doubled.
+
+    Returns the dedup query argv and the goal dict actually handed to
+    aspirations-add-goal.sh, so the origin_signal and the description can be
+    asserted on the bytes that would be written rather than on a spy's summary.
+    """
+    calls = {"query": None, "goal": None}
+
+    class _R:
+        def __init__(self, rc=0, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def fake_run(cmd, **kw):
+        argv = [str(c) for c in cmd]
+        joined = " ".join(argv)
+        if "aspirations-query.sh" in joined:
+            calls["query"] = argv
+            return _R(0, open_goal)
+        if "aspirations-add-goal.sh" in joined:
+            calls["goal"] = json.loads(kw["input"])
+            return _R(0, "g-000-00")
+        raise AssertionError("unexpected subprocess call: %r" % (argv,))
+
+    monkeypatch.setattr(fcp.subprocess, "run", fake_run)
+    fcp._file_investigate(nodes, {"checked_at": "2026-01-01T00:00:00",
+                                  "checked_from": "test-box",
+                                  "results": []}, kind=kind)
+    return calls
+
+
+_BOX_ROWS = [
+    "LIVE-BOX-NOT-IN-MANIFEST: unlisted-box wrote a body-heartbeat 0.2h ago but "
+    "has no fleet-manifest node — this checker never measures it, and its config "
+    "drift is invisible",
+]
+
+
+def test_box_drift_investigate_uses_its_own_origin_signal(monkeypatch):
+    """A coverage gap and a misconfigured node are different findings with
+    different fixes, so neither may dedup the other away. Asserted on the exact
+    signal string because that IS the dedup key — a shared signal would let one
+    standing Investigate silence the other population indefinitely."""
+    calls = _capture_filing(monkeypatch, _BOX_ROWS, "box-drift")
+    assert calls["query"] is not None, "the dedup probe must run before filing"
+    assert "investigate:fleet-box-not-in-manifest" in calls["query"]
+    assert "investigate:fleet-config-drift" not in calls["query"]
+    assert "investigate:fleet-config-blackout" not in calls["query"]
+    assert calls["goal"]["origin_signal"] == "investigate:fleet-box-not-in-manifest"
+
+
+def test_box_drift_investigate_names_the_boxes_and_the_registration_bar(monkeypatch):
+    """The description must carry what the next reader needs to ACT: which boxes,
+    that each needs classifying, and that registering needs MEASURED fields from a
+    box that can reach them. Without the last part the obvious next step is to
+    append guessed addr/user/root rows, which _box_parity refuses to do for the
+    stated reason that it trades a visible gap for invisible wrong data."""
+    calls = _capture_filing(monkeypatch, _BOX_ROWS, "box-drift")
+    goal = calls["goal"]
+    assert "unlisted-box" in goal["description"]
+    assert "core/config/fleet-manifest.yaml" in goal["description"]
+    for token in ("CLASSIFY", "MEASURED", "ssh"):
+        assert token in goal["description"], (
+            "the report must state how to act on it (%r missing)" % token)
+    assert goal["priority"] == "HIGH"
+    assert goal["participants"] == ["agent"]
+
+
+def test_box_drift_filing_dedups_against_an_open_investigate(monkeypatch):
+    """One open coverage Investigate at a time. The dedup is the exact-origin_signal
+    probe, and it must SUPPRESS the second filing — otherwise every 12h sweep files
+    another copy for as long as the gap stands open."""
+    calls = _capture_filing(monkeypatch, _BOX_ROWS, "box-drift",
+                            open_goal='[{"id": "g-000-01"}]')
+    assert calls["goal"] is None, (
+        "an open Investigate on the same signal must suppress the filing")
+
+
+def test_box_drift_dedup_probe_failure_does_not_file(monkeypatch):
+    """guard-487: suppression gates fail CLOSED. An unreadable dedup probe means
+    'I do not know whether one is already open', which must never be read as 'none
+    is open' — that direction files a duplicate every sweep."""
+    class _R:
+        returncode, stdout, stderr = 2, "", "boom"
+
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(" ".join(str(c) for c in cmd))
+        return _R()
+
+    monkeypatch.setattr(fcp.subprocess, "run", fake_run)
+    fcp._file_investigate(_BOX_ROWS, {"checked_at": "t", "checked_from": "b",
+                                      "results": []}, kind="box-drift")
+    assert len(seen) == 1 and "aspirations-query.sh" in seen[0], (
+        "a refusing dedup probe must stop the filing, not fall through to "
+        "aspirations-add-goal.sh: %r" % (seen,))
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

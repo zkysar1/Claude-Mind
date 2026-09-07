@@ -349,7 +349,15 @@ def _apply_completion(goal: dict, current_run_dir: str, metrics_path=None) -> tu
     # the scan record is minutes old and its outcome_note may predate a worker's
     # close (guard-3020).
     note = _compose_note(reason, (fresh or {}).get("outcome_note"))
-    _py(
+    # CAPTURE the rc (). It used to be discarded, while the metrics row
+    # below asserted `preserved_prior_note_chars` unconditionally — so a failed
+    # note write produced a row CLAIMING a preservation that never happened. The
+    # store direction is safe either way (a failed write leaves the prior note
+    # intact), which is exactly why this is worth pinning: nothing else would ever
+    # surface it, and this row is the guard-1231 surface a filer reads to learn a
+    # sweep terminated their goal. A false row there is worse than a missing one.
+    # The completion itself still stands — a telemetry failure is not a failed sweep.
+    note_rc, _note_out, note_err = _py(
         [
             str(SCRIPT_DIR / "aspirations.py"),
             "--source",
@@ -371,7 +379,14 @@ def _apply_completion(goal: dict, current_run_dir: str, metrics_path=None) -> tu
         "source": source,
         "aspiration_id": goal.get("_asp_id"),
         "current_run_dir": current_run_dir,
-        "preserved_prior_note_chars": len(((fresh or {}).get("outcome_note") or "").strip()),
+        # Zero when the write did not land — never the length of a note the
+        # sweep failed to persist.
+        "preserved_prior_note_chars": (
+            0 if note_rc != 0
+            else len(((fresh or {}).get("outcome_note") or "").strip())
+        ),
+        "note_write_failed": True if note_rc != 0 else None,
+        "note_write_error": (note_err or "").strip()[:300] or None if note_rc != 0 else None,
         "agent": os.environ.get("MIND_AGENT", "") or None,
     })
     return True, reason

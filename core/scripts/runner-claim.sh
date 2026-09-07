@@ -338,6 +338,30 @@ PYEOF
 
 case $pyrc in
     0) echo "$SUMMARY"; exit 0;;
+    # rc=1 is the rc of ANY uncaught exception in the summary block above, and it
+    # MUST be op-aware (; governing lesson rb-6448). For the three
+    # MUTATING ops the daemon CALL already succeeded and only the summary
+    # rendering crashed, so raw-echo + exit 0 stays correct — the mutation
+    # happened. For `status` the exit code IS the answer, so routing a crash to
+    # exit 0 is the fail-OPEN direction: it reports a LIVE runner on the strength
+    # of a stack trace. This wrapper's own header states the contract — "4 —
+    # REFUSE ... Fail-safe direction: 4 asserts nothing" — so a crashed ASSERTING
+    # op must refuse rather than affirm.
+    #
+    # The question for an asserting op over a polymorphic backend is not what the
+    # siblings return, but whether silence reads as YES or NO in the caller's
+    # hands (rb-6448). -b applied exactly this reasoning to three other
+    # fail-open paths for `status` — the shared noop branch, an unparseable body,
+    # and a missing python launcher — and missed this one, which is the arm that
+    # catches everything the other three do not: any future KeyError, TypeError
+    # or shape surprise inside the status branch.
+    1)
+        if [ "$OP" = "status" ]; then
+            echo "[runner-claim] status: REFUSE — the summary block raised an uncaught exception (python rc=1). This asserts NOTHING about whether a runner is live; do NOT read it as LIVE or as ABSENT. Raw response follows." >&2
+            echo "[runner-claim] (raw) $RESPONSE" >&2
+            exit 4
+        fi
+        echo "[runner-claim] (raw) $RESPONSE"; exit 0;;
     2) echo "$SUMMARY" >&2; exit 1;;          # daemon op-level failure
     4) echo "$SUMMARY" >&2; exit 4;;          # acquire held -> caller refuses
     5) echo "$SUMMARY" >&2; exit 5;;          # release unconfirmed (released=False) -> D6.8 WARN + handoff note ()

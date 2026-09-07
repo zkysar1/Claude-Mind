@@ -176,8 +176,14 @@ def test_sweep_shipped_registry_dry_run_is_safe(tmp_path):
     result = jh.sweep(apply=False)
     assert result["swept"] >= 1
     assert result["apply"] is False
+    # refused-no-recovery-layer joined this set in , when the dry run
+    # learned to predict the apply-side recovery-layer gate. It is the SAFEST
+    # member: it proposes nothing and does nothing. The no-mutation guarantee
+    # is carried by the `applied` assertion below, not by this set, so widening
+    # here does not weaken what the test actually guards (rb-9217).
     SAFE = {"disabled", "within-bound", "would-cap", "would-rotate",
-            "would-compact", "absent-or-empty", "unresolved"}
+            "would-compact", "absent-or-empty", "unresolved",
+            "refused-no-recovery-layer"}
     actions = {r.get("action") for r in result["reports"]}
     assert actions <= SAFE, f"unexpected dry-run sweep actions: {actions}"
     assert not any(r.get("applied") for r in result["reports"])  # no mutation
@@ -641,3 +647,287 @@ def test_the_real_blacklist_still_covers_the_measured_stores(tmp_path):
     import _fileops
     meta_patterns = _fileops._SNAPSHOT_BLACKLIST.get("meta", ())
     assert "gate-firings.jsonl" in meta_patterns
+
+
+# ── over-cap detector () ──────────────────────────────────────────
+# The sweep computed a ratio for every store on every run and nothing consumed
+# it. These pin the consumer. The load-bearing one is the POSITIVE CONTROL: it
+# drives the REAL sweep over a REAL over-cap file, so a rename of `kept`/`total`
+# in hygiene_one's report breaks it -- a mocked sweep would keep passing forever
+# against a detector wired to nothing (guard-1943).
+
+def _detector_world(tmp_path, monkeypatch, stores, defaults=None):
+    """Point the detector at a tmp registry + tmp state-log home.
+
+    Both module globals are read at CALL time (`_load_registry` builds its path
+    from PROJECT_ROOT, `_overcap_log_path` from WORLD_DIR), so monkeypatching
+    the module attributes is sufficient and no import-order dance is needed
+    (guard-577).
+    """
+    import yaml
+    proj = tmp_path / "proj"
+    (proj / "core" / "config").mkdir(parents=True)
+    (proj / "core" / "config" / "store-hygiene.yaml").write_text(
+        yaml.safe_dump({"version": 1,
+                        "defaults": defaults or {},
+                        "stores": stores}),
+        encoding="utf-8")
+    world = tmp_path / "world"
+    world.mkdir()
+    monkeypatch.setattr(jh, "PROJECT_ROOT", str(proj))
+    monkeypatch.setattr(jh, "WORLD_DIR", str(world))
+    return world
+
+
+def _store_entry(path, max_lines=4, mode="cap", by="lines"):
+    # Absolute paths fall through _resolve_paths' verbatim branch, so the tmp
+    # store needs no world/meta prefix plumbing.
+    return {"path": str(path), "enabled": True, "mode": mode,
+            "by": by, "max_lines": max_lines}
+
+
+# ── ratio: only a line-bounded store has a bound to be a multiple OF ─────────
+def test_overcap_ratio_over_and_under_bound():
+    assert jh._overcap_ratio({"by": "lines", "total": 20, "kept": 4}) == 5.0
+    # Under the cap kept == total, so the same expression yields exactly 1.0.
+    assert jh._overcap_ratio({"by": "lines", "total": 3, "kept": 3}) == 1.0
+
+
+def test_overcap_ratio_is_none_for_age_bounded():
+    # For by=age, `kept` is whatever fell inside the retention window, so
+    # total/kept measures CHURN. Reporting it would call a busy store unbounded.
+    assert jh._overcap_ratio({"by": "age", "total": 900, "kept": 3}) is None
+
+
+def test_overcap_ratio_is_none_on_missing_or_unusable_fields():
+    assert jh._overcap_ratio({"by": "lines", "total": 20}) is None
+    assert jh._overcap_ratio({"by": "lines", "total": 20, "kept": 0}) is None
+    assert jh._overcap_ratio({"by": "lines", "total": None, "kept": 4}) is None
+    assert jh._overcap_ratio({"action": "disabled", "path": "x"}) is None
+
+
+# ── POSITIVE CONTROL (goal check 3) ─────────────────────────────────────────
+def test_detect_overcap_POSITIVE_CONTROL_fires_on_induced_overcap(
+        tmp_path, monkeypatch):
+    store = tmp_path / "induced.jsonl"
+    _write(store, [{"i": i} for i in range(20)])          # 20 records, cap 4 → 5.0x
+    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=4)])
+
+    first = jh.detect_overcap()
+    assert str(store) in first["over_now"]
+    assert first["over_now"][str(store)]["ratio"] == 5.0
+    # One reading is a LEVEL, not a trend -- a first run must never fire.
+    assert first["first_run"] is True and first["fired"] is False
+
+    second = jh.detect_overcap()
+    assert second["first_run"] is False
+    assert second["fired"] is True
+    assert second["repeat_offenders"] == [str(store)]
+    # Dry-run throughout: the detector measures, it must never rotate.
+    assert len(_read(store)) == 20
+
+
+def test_detect_overcap_NEGATIVE_CONTROL_clean_run_does_not_fire(
+        tmp_path, monkeypatch):
+    # Same fixture, one variable flipped: under the cap the detector stays
+    # silent across BOTH runs, so the positive control above is not just
+    # "the detector always fires".
+    store = tmp_path / "clean.jsonl"
+    _write(store, [{"i": i} for i in range(3)])           # 3 records, cap 4
+    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=4)])
+
+    first = jh.detect_overcap()
+    second = jh.detect_overcap()
+    assert first["over_now"] == {} and second["over_now"] == {}
+    assert second["fired"] is False and second["repeat_offenders"] == []
+    # The population is still reported -- a clean run must be distinguishable
+    # from a run that measured nothing at all (guard-2298).
+    assert second["line_bounded"] == 1
+
+
+def test_detect_overcap_single_reading_does_not_fire(tmp_path, monkeypatch):
+    # Over-cap on run 1, brought back under before run 2: the consecutive
+    # requirement means this never fires.
+    store = tmp_path / "transient.jsonl"
+    _write(store, [{"i": i} for i in range(20)])
+    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=4)])
+
+    first = jh.detect_overcap()
+    assert str(store) in first["over_now"]
+    _write(store, [{"i": i} for i in range(3)])           # swept back under
+    second = jh.detect_overcap()
+    assert second["over_now"] == {}
+    assert second["fired"] is False
+
+
+def test_detect_overcap_threshold_is_honoured(tmp_path, monkeypatch):
+    store = tmp_path / "mild.jsonl"
+    _write(store, [{"i": i} for i in range(6)])           # cap 4 → 1.5x
+    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=4)])
+    assert jh.detect_overcap()["over_now"] == {}           # 1.5 < 2.0
+    assert str(store) in jh.detect_overcap(threshold=1.5)["over_now"]
+
+
+# ── the population is reported beside the filtered count (guard-2273) ────────
+def test_line_bounded_population_is_reported_beside_the_over_count(
+        tmp_path, monkeypatch):
+    over = tmp_path / "over.jsonl"
+    under = tmp_path / "under.jsonl"
+    aged = tmp_path / "aged.jsonl"
+    _write(over, [{"i": i} for i in range(20)])
+    _write(under, [{"i": i} for i in range(2)])
+    _write(aged, [{"i": i, "created": "2020-01-01T00:00:00"} for i in range(9)])
+    _detector_world(tmp_path, monkeypatch, [
+        _store_entry(over, max_lines=4),
+        _store_entry(under, max_lines=4),
+        {"path": str(aged), "enabled": True, "mode": "cap",
+         "by": "age", "retention_days": 3650000},
+    ])
+    res = jh.detect_overcap()
+    assert res["swept"] == 3          # everything the registry resolved
+    assert res["line_bounded"] == 2   # the population the ratio is defined over
+    assert len(res["over_now"]) == 1  # the filtered count
+
+
+# ── state log: per-box, self-bounded, and never a silent write ──────────────
+def test_no_record_leaves_the_state_log_untouched(tmp_path, monkeypatch):
+    store = tmp_path / "probe.jsonl"
+    _write(store, [{"i": i} for i in range(20)])
+    world = _detector_world(tmp_path, monkeypatch, [_store_entry(store)])
+
+    res = jh.detect_overcap(record=False)
+    assert res["recorded"] is False
+    assert not (world / jh.OVERCAP_LOG_REL).exists()
+    # ...and because nothing was recorded, the next run is STILL a first run.
+    assert jh.detect_overcap(record=False)["first_run"] is True
+
+
+def test_state_log_self_truncates_to_keep(tmp_path, monkeypatch):
+    store = tmp_path / "loud.jsonl"
+    _write(store, [{"i": i} for i in range(20)])
+    world = _detector_world(tmp_path, monkeypatch, [_store_entry(store)])
+
+    for _ in range(jh.OVERCAP_LOG_KEEP + 5):
+        jh.detect_overcap()
+    rows = _read(world / jh.OVERCAP_LOG_REL)
+    # An unbounded state file inside a store-hygiene detector would be an
+    # instance of the defect it detects.
+    assert len(rows) == jh.OVERCAP_LOG_KEEP
+    assert all("at" in r and "over" in r for r in rows)
+
+
+def test_state_log_basename_keeps_its_machine_local_suffix():
+    # The `-log` suffix is what owncloud_sync classifies machine-local
+    # (`prefix == "world" and fnmatch(basename, "*-log.jsonl")`). Consecutive-run
+    # state is a PER-BOX fact; a synced state file would let each box overwrite
+    # every other box's history. Renaming this silently breaks that.
+    assert jh.OVERCAP_LOG_REL.endswith("-log.jsonl")
+
+
+def test_unreadable_state_log_is_treated_as_no_prior_run(tmp_path, monkeypatch):
+    store = tmp_path / "s.jsonl"
+    _write(store, [{"i": i} for i in range(20)])
+    world = _detector_world(tmp_path, monkeypatch, [_store_entry(store)])
+    (world / jh.OVERCAP_LOG_REL).write_text("{not json\n", encoding="utf-8")
+    res = jh.detect_overcap(record=False)
+    assert res["first_run"] is True and res["fired"] is False
+
+
+# ── an unreadable classifier is UNKNOWN, never "synced" ─────────────────────
+def test_machine_local_failure_returns_none_not_false(monkeypatch):
+    import storage_backend
+
+    def _boom():
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(storage_backend, "get_backend", _boom)
+    ml, err = jh._machine_local("/tmp/whatever.jsonl")
+    # False would be a confident answer manufactured from an error, and would
+    # read as "this store is shared" -- the opposite of unknown.
+    assert ml is None
+    assert "RuntimeError" in err
+
+
+# ── dry-run parity with the recovery-layer gate () ──────────────────
+# The apply-side gate landed in  and the dry run did NOT learn about
+# it, so `hygiene_one(apply=False)` and detect_overcap both reported `would-cap`
+# for a store whose every apply returns refused-no-recovery-layer. Measured on
+# cc-07 2026-09-06: world/presence/alpha.jsonl at 30.1x its registered bound of
+# 500, reported as `would-cap` by the detector while the sweep could never act.
+# That is the guard-1802 shape -- an audit predicate WIDER than the acting
+# gate's -- and it reads as "the sweep is behind" rather than "the sweep cannot".
+
+def test_dry_run_predicts_the_refusal_instead_of_would_cap(tmp_path, monkeypatch):
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    _force_blacklist(monkeypatch, tmp_path, True)
+    rep = jh.hygiene_one(p, mode="cap", by="lines", max_lines=4, apply=False)
+    assert rep["action"] == "refused-no-recovery-layer"
+    assert "snapshot-blacklisted" in rep["refused_reason"]
+    assert "rotate" in rep["refused_reason"]              # names the remedy
+    assert [r["i"] for r in _read(p)] == list(range(10))  # still a dry run
+
+
+def test_CONTROL_dry_run_still_says_would_cap_when_a_snapshot_would_be_taken(
+        tmp_path, monkeypatch):
+    # Identical fixture, one variable flipped: the dry-run gate must not be
+    # inert, and must not spread to stores that DO have a recovery layer.
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    _force_blacklist(monkeypatch, tmp_path, False)
+    rep = jh.hygiene_one(p, mode="cap", by="lines", max_lines=4, apply=False)
+    assert rep["action"] == "would-cap"
+    assert "refused_reason" not in rep
+
+
+def test_dry_run_refusal_PRESERVES_the_overcap_ratio_inputs(tmp_path, monkeypatch):
+    """The refusal must not zero `dropped`/`kept` the way the apply branch does.
+
+    detect_overcap derives the ratio as total/kept (_overcap_ratio), so mirroring
+    the apply branch's (0, total) here would compute exactly 1.0 and drop the
+    store BELOW the over-cap threshold -- silently hiding the one store that can
+    never be brought down. The refusal has to change the VERDICT while leaving
+    the measurement intact.
+    """
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(20)])
+    _force_blacklist(monkeypatch, tmp_path, True)
+    rep = jh.hygiene_one(p, mode="cap", by="lines", max_lines=4, apply=False)
+    assert rep["action"] == "refused-no-recovery-layer"
+    assert rep["dropped"] == 16 and rep["kept"] == 4
+    assert jh._overcap_ratio(rep) == 5.0                  # NOT 1.0
+
+
+def test_rotate_dry_run_is_unaffected_by_the_gate(tmp_path, monkeypatch):
+    # rotate is archive-FIRST, so it has a recovery layer regardless of
+    # .history. The dry-run gate must stay scoped to cap, exactly as the
+    # apply-side one is.
+    p = tmp_path / "gate-firings.jsonl"
+    _write(p, [{"i": i} for i in range(10)])
+    _force_blacklist(monkeypatch, tmp_path, True)
+    rep = jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=False)
+    assert rep["action"] == "would-rotate"
+    assert "refused_reason" not in rep
+
+
+def test_detect_overcap_reports_a_refused_store_as_structurally_unbounded(
+        tmp_path, monkeypatch):
+    """The consumer half, driven through the REAL sweep (not a mocked report).
+
+    Two things are asserted together because either alone would pass against
+    the defect: the store must still be IN over_now with its true ratio (it was
+    never hidden), AND it must be named in unbounded_by_refusal (the reader is
+    told the sweep cannot act, not that it is merely behind).
+    """
+    store = tmp_path / "blacklisted.jsonl"
+    _write(store, [{"i": i} for i in range(20)])          # 20 records, cap 4 -> 5.0x
+    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=4)])
+    _force_blacklist(monkeypatch, tmp_path, True)
+
+    out = jh.detect_overcap()
+    assert str(store) in out["over_now"], "a refused store must not vanish"
+    assert out["over_now"][str(store)]["ratio"] == 5.0
+    assert out["over_now"][str(store)]["action"] == "refused-no-recovery-layer"
+    assert out["unbounded_by_refusal"] == [str(store)]
+    assert "structurally unable to act" in out["unbounded_by_refusal_note"]
+    assert len(_read(store)) == 20                        # still a dry run

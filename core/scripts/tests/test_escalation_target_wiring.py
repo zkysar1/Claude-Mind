@@ -79,11 +79,11 @@ ALLOWLIST = {
     # DOC. This script IS the add-goal CLI; the literal is a usage example
     # inside its own --help heredoc, not a filing call.
     "core/scripts/aspirations-add-goal.sh": "doc: usage example in the --help heredoc",
-    # QUARANTINED — real hardcodes with non-asp-115 literals, owned by .
-    "core/scripts/stall-goal-filer.py": "quarantined: TARGET_ASP_ID='asp-240' (g-115-4216)",
-    "core/scripts/insight-trigger-gate.py": "quarantined: files into 'asp-001' (g-115-4216)",
-    "core/scripts/inactivity-detector.py": "quarantined: DEFAULT_TARGET_ASP='asp-001' (g-115-4216)",
-    "core/scripts/cargo-cult-detector.py": "quarantined: target_asp='asp-001' (g-115-4216)",
+    # The four QUARANTINE entries that stood here (stall-goal-filer,
+    # insight-trigger-gate, inactivity-detector, cargo-cult-detector) were
+    # deleted 2026-09-07 when  wired all four through the resolver.
+    # Deleting them is the point: the predicate tightens on its own, so this
+    # ALLOWLIST now holds only the two sites that must NEVER be wired.
 }
 
 

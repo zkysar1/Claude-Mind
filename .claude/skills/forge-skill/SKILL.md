@@ -418,6 +418,26 @@ threshold, was then blocked by the capability gate, and delivered no skill.
    now required by the process.)
 
 4. **Register in Forged Skills** (`world/forged-skills.yaml` + git-commit the body):
+   - **BODY GATE FIRST — the registry row may not be written until this exits 0**
+     (g-115-9043; the gate, not this sentence, is what enforces it — guard-399):
+     ```bash
+     bash core/scripts/forged-skill-body-gate.sh --skill {new-skill-name}
+     ```
+     rc=0 → proceed. rc=1 → **STOP**: do not add the row, do not post to the
+     board, do not report the forge done. Write the body at
+     `.claude/skills/{new-skill-name}/SKILL.md` and re-run. rc=2 → you passed no
+     skill name; a usage error is NOT approval.
+     WHY: measured on coach-mind 2026-09-05 11:55Z — `mkdir -p` succeeded, the
+     `Write` of SKILL.md was refused by the L1 hook, and registration proceeded
+     anyway: registry row written, skill dir EMPTY, a test goal filed to
+     exercise a skill with no body, two "forge-skill,complete" board posts, and
+     the model declared SUCCESS. A row pointing at an absent body is a PHANTOM
+     registration — it advertises a trigger fleet-wide that dispatches to
+     nothing (guard-2242 "a pointer field is not evidence until its REFERENT is
+     confirmed to exist"; rb-10227). The gate checks DISK PRESENCE at the load
+     path, deliberately not catalog listing: a skill forged mid-session cannot
+     appear in its own session's catalog on Claude Code (guard-2335), so a
+     catalog assertion would refuse every correct forge.
    - Add entry under `skills:` with `parent`, `type`, `forged_date`, `forged_by: {agent-name}`, `gap_ref`, `triggers`
    - **AMENDING an EXISTING row (adding a trigger, fixing a `companion_scripts`
      path, appending a `note`): you MUST also set `amended_at` to the current
@@ -745,3 +765,21 @@ skill registry while the actual capability remains missing.
 See `.claude/rules/return-protocol.md` — last action must be a tool call, not text.
 The terminal action is the last `aspirations-add-goal.sh` (test goal) or
 `skill-relations.sh` write. Never end with a text summary of the forge.
+
+**Before reporting the forge done, re-run the body gate** (g-115-9043). Step 4
+gated the registry write; this re-run gates the CLAIM OF COMPLETION, and they
+are not the same moment — the coach incident ended with a model announcing
+success over an empty skill directory, so "I registered it" and "a body exists"
+must be established separately:
+
+```bash
+bash core/scripts/forged-skill-body-gate.sh --skill {new-skill-name}
+```
+
+rc≠0 → the forge is NOT done. Say so plainly, leave the validation goal open,
+and do not post a "forge-skill,complete" board message. Note what this can and
+cannot prove: it confirms a loadable body at the path the runtime reads, NOT
+that the skill will trigger — Claude Code loads skill descriptions at STARTUP,
+so trigger behaviour is only testable in a session that started after the forge
+commit (guard-2335). Never revise a description because the new skill did not
+fire in its own session.

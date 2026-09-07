@@ -35,6 +35,7 @@ CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 from _daemon_fixture import DaemonFixture  # noqa: E402
+from _rt import _api_token  # noqa: E402
 
 
 def _make_world(tmp: Path) -> Path:
@@ -91,8 +92,17 @@ def _seed_heartbeat_config(project_root: Path):
 def _complete_by(port: int, goal_id: str, agent: str, sid: str):
     url = (f"http://127.0.0.1:{port}/v1/aspirations/complete-by"
            f"?goal_id={goal_id}&source=world&agent_name={agent}&sid={sid}")
-    req = urllib.request.Request(url, method="POST",
-                                 headers={"X-Mind-Agent": agent})
+    # FR-4 bearer () — see the twin comment in test_cross_lane_claim.py.
+    # Raw-urllib callers get no Authorization header for free, so once
+    # MIND_API_TOKEN is set on the daemon this file failed 0/3 with 401 before
+    # reaching a single assertion. _rt._api_token is the SAME resolver the
+    # production clients use (env first, else .env.local); fail-open when no
+    # token is configured.
+    _headers = {"X-Mind-Agent": agent}
+    _tok = _api_token()
+    if _tok:
+        _headers["Authorization"] = "Bearer " + _tok
+    req = urllib.request.Request(url, method="POST", headers=_headers)
     with urllib.request.urlopen(req, timeout=20) as resp:
         return json.loads(resp.read().decode("utf-8"))
 

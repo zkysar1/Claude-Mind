@@ -32,6 +32,7 @@ import json
 from typing import Any, Dict, List
 
 from ..jsonl_cache import cache
+from ._jsonl_common import parse_int_param
 
 
 # --- Output shaping --------------------------------------------------------
@@ -166,6 +167,26 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             items = jc.get(archive_path)
             result = _find_by_id(items, asp_id)
         if result is None:
+            # A LOCALLY-ABSENT RECORD AND AN AUTHORITATIVELY-ABSENT RECORD MUST
+            # NOT SHARE ONE MESSAGE ( item 2; the guard-1555 shape
+            # `_archived_aspiration_hint` already pins one file over). When the
+            # agent queue belongs to a dir this box does not own, its mirror is
+            # structurally behind the store of record and the rows it is missing
+            # are the newest ones — so "not found" here may simply mean "never
+            # reached this box." Same HTTP status (no caller's rc changes); the
+            # ERROR KEY and the body are what carry the distinction, which is
+            # what a consumer actually reads.
+            if source == "agent":
+                from ..peer_queue_read import (agent_queue_unverified,
+                                               unverified_detail)
+                unverified_agent = agent_queue_unverified(live_path)
+                if unverified_agent is not None:
+                    return Response.error(
+                        404, "not_found_unverified",
+                        f"Aspiration {asp_id} not found LOCALLY — this is NOT a "
+                        f"verified absence. "
+                        + unverified_detail(unverified_agent, "the queried"),
+                    )
             return Response.error(404, "not_found", f"Aspiration {asp_id} not found")
         return Response.text(
             json.dumps(result[1], indent=2, ensure_ascii=False),
@@ -196,7 +217,13 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         )
 
     if _flag(q, "stepping_stones"):
-        limit = int(q.get("limit", "5"))
+        # positive_only=False preserves this site's pre-existing raw-int slice
+        # (`?limit=-3` means archived[:-3]); the other four sites clamp to their
+        # default. Only the UNPARSEABLE case changes here — it was an uncaught
+        # ValueError and therefore an HTTP 500, now a 400 ().
+        limit, err = parse_int_param(q.get("limit"), "limit", 5, positive_only=False)
+        if err is not None:
+            return err
         # list() wrap is load-bearing: jc.get returns the SHARED cache copy
         # (see jsonl_cache.JsonlCache.get docstring). Sorting the original
         # would corrupt the cache for every other reader. Do NOT remove.

@@ -1182,3 +1182,106 @@ class TestAnchoredMarkerMatch:
         written = argv[argv.index("outcome_note") + 1]
         assert "SUPERSEDES" in written, (
             f"a genuinely marked note stopped being supersedable: {written!r}")
+
+
+# ─── : a FAILED probe must not read as "no existing note" ──────────
+
+class TestProbeFailureFailsClosed:
+    """The probe pipes into a bare `python3` and discards the pipeline status, so
+    a python3 that cannot run produces EMPTY output — which, before this fix, the
+    caller could not distinguish from a goal with no note. It then took the
+    write-if-empty branch and CLOBBERED the note that was there.
+
+    The goal that filed this (g-115-9315) measured the trigger on Git-bash, where
+    /usr/bin carries no python3. That box-specific repro is NOT what these tests
+    use: stubbing `python3` to exit 127 with everything else intact reproduces the
+    same EMPTY-output state on any OS, so this file goes red on pre-fix code
+    everywhere rather than only where the PATH quirk lives. Two prior Bodies
+    released this goal unproven for exactly that reason.
+
+    MUTATION-PROVED against pre-fix HEAD on Linux 6.8.0-138-generic 2026-09-07:
+    arm `note PRESENT + python3 rc=127` produced ONE write whose argv replaced a
+    35-char note with the 20-char verify summary, at rc=0, announcing
+    "outcome_note written".
+    """
+
+    SUMMARY = "short verify summary"
+    NOTE = "the hand-written note on the record"
+
+    @staticmethod
+    def _break_python3(tmp_path, env):
+        """Shadow `python3` with a stub that exits 127, first on PATH.
+
+        Only the HELPER's bare `python3` is affected: the query stub reaches its
+        interpreter through the absolute $PY_REAL, so the probe's INPUT is still
+        a well-formed record and the only thing that changes is whether the
+        parsing half can run at all. That isolation is what makes this a
+        mutation of one mechanism rather than of the whole harness.
+        """
+        bad = tmp_path / "badbin"
+        bad.mkdir()
+        stub = bad / "python3"
+        stub.write_text("#!/usr/bin/env bash\nexit 127\n", encoding="utf-8")
+        stub.chmod(0o755)
+        env = dict(env)
+        env["PATH"] = str(bad) + os.pathsep + env["PATH"]
+        return env
+
+    def _run_broken(self, tmp_path, existing_note):
+        script = _stage(tmp_path)
+        env = self._break_python3(tmp_path, _env(tmp_path, existing_note=existing_note))
+        proc = subprocess.run(
+            [BASH, Path(script).as_posix(),
+             "--goal", GID, "--source", "world", "--summary", self.SUMMARY],
+            capture_output=True, text=True, env=env, timeout=120)
+        return proc, _note_writes(tmp_path)
+
+    def test_a_failed_probe_does_not_clobber_an_existing_note(self, tmp_path):
+        proc, writes = self._run_broken(tmp_path, self.NOTE)
+        assert writes == [], (
+            "a failed probe was read as 'no existing note' and the note was "
+            f"overwritten: {writes}")
+
+    def test_a_failed_probe_declines_rather_than_writing_into_the_void(self, tmp_path):
+        """Fail-CLOSED applies even with NO note staged, and that is deliberate:
+        the whole point is that after a failed probe the script does not KNOW
+        whether a note is there, so 'absent' is not an available conclusion."""
+        proc, writes = self._run_broken(tmp_path, "")
+        assert writes == [], f"wrote a note on a probe it could not read: {writes}"
+
+    def test_the_refusal_is_announced_and_still_exits_zero(self, tmp_path):
+        """NON-FATAL BY CONTRACT (this script's header): callers must not branch
+        on the rc, so the refusal has to be loud rather than fatal."""
+        proc, _ = self._run_broken(tmp_path, self.NOTE)
+        assert proc.returncode == 0, (
+            f"the fail-closed branch broke the non-fatal contract: rc={proc.returncode}")
+        assert "fail-closed" in (proc.stdout + proc.stderr), (
+            "the refusal was silent; a caller reading the logs cannot tell a "
+            f"declined write from a successful one: {proc.stdout + proc.stderr!r}")
+
+    def test_the_fail_closed_branch_is_reachable_both_ways(self, tmp_path):
+        """TWO-WAY CONTROL (guard-1220 shape). Everything above would also pass
+        against a script that never writes anything at all, which would re-open
+        g-115-7377 from the other side. With python3 WORKING and no note staged,
+        the normal write path must still fire."""
+        script = _stage(tmp_path)
+        proc, writes = _run(tmp_path, script,
+                            ["--goal", GID, "--source", "world",
+                             "--summary", self.SUMMARY],
+                            existing_note="")
+        assert len(writes) == 1, (
+            f"the fail-closed guard suppressed the normal write path: {writes}")
+
+    def test_the_refusal_message_avoids_the_shape_pinned_token(self):
+        """A refusal naming `aspirations-query.sh` breaks
+        test_the_probe_passes_no_flag_aspirations_query_refuses, which isolates
+        lines by exactly that token (the guard-2921 shape pin). A prior Body hit
+        this and fixed it; this test keeps the fix from being undone by someone
+        making the message more helpful."""
+        body = HELPER.read_text(encoding="utf-8")
+        i = body.index("fail-closed, g-115-9315")
+        line_start = body.rindex("\n", 0, i) + 1
+        line_end = body.index("\n", i)
+        assert "aspirations-query.sh" not in body[line_start:line_end], (
+            "the fail-closed refusal message names aspirations-query.sh, which "
+            "collides with the shape pin in the probe-flag test")

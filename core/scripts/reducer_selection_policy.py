@@ -52,6 +52,8 @@ import collections
 import datetime
 from typing import Optional
 
+from _dt import parse_naive_iso  # shared tzinfo-stripping naive-ISO parse ()
+
 #: Roles this module distinguishes. UNKNOWN is a first-class answer, not an
 #: error: an observer session is genuinely neither, and saying so is what keeps
 #: it out of the reducer branch.
@@ -96,10 +98,7 @@ def _parse_ts(value) -> Optional[datetime.datetime]:
     """Naive ISO-8601, the fleet's one timestamp format. Unparseable -> None."""
     if not isinstance(value, str) or not value.strip():
         return None
-    try:
-        return datetime.datetime.fromisoformat(value.strip().replace("Z", ""))
-    except ValueError:
-        return None
+    return parse_naive_iso(value)
 
 
 def live_worker_count(team_state: dict, now: datetime.datetime,

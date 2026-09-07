@@ -80,6 +80,62 @@ imperative there and route the reasoning to an on-demand home — which is this
 file. A reader who needs only "what do I do" never loads this; a reader asking
 "why does Phase 2.9 exist" gets the whole story.
 
+## The second unread field: `release_negatives` (g-115-8163)
+
+Phase 2.9's enumeration named four narrative fields — `outcome_note`,
+`outcome_notes`, `progress_note`, `description`. It did not name
+`release_negatives`, and that omission has the same shape as the one this whole
+file exists to document, one field over.
+
+`release_negatives` is written by `release()` in
+`mind_api/src/endpoints/aspirations_write.py` straight onto the goal record
+(`goal["release_negatives"] = negatives[-20:]`), so a claim response carries it
+whenever the goal was previously released. It is the TYPED record of why the
+last Body let go:
+
+| field | meaning |
+|---|---|
+| `kind` | `locus` (host/checkout barrier — another box CAN run it) · `capability` (credential barrier — another box probably cannot) · `role` (a worker holding reducer-only work) · `not-due` (a recurring goal that was not actually due) · `progress` (partial advance, nothing blocking) · `other` |
+| `reason` | prose; deliberately NOT classified back into `kind` (an over-matching locus regex measured 62.5% false positives over 52 live rows, 2026-09-02) |
+| `by` / `box` / `at` | releasing agent, hostname, timestamp |
+
+Absence is not a member of the vocabulary: rows written before the field existed
+carry no `kind`, so a consumer reads absent as UNMEASURED, never as a barrier.
+
+**It had zero readers.** `core/scripts/_goal_fields.py` annotates it `# 0`, and
+that count was accurate — nothing in `.claude/skills/` named it. A releasing
+Body was writing a typed explanation that the next claimant structurally could
+not see.
+
+Measured cost (`g-326-256`, 2026-09-05): an alpha worker Body recorded outcome
+O4 as MET at 20:16:48 and released; the SAME agent on the SAME box claimed the
+goal at 21:14:19 and re-derived the identical conclusion. Fifty-eight minutes.
+The releasing Body's own note was on the record the whole time. It was noticed
+only because `aspirations-update-goal` happened to echo the full record back
+when the defer was written — by accident, not by protocol.
+
+`kind: not-due` deserves specific mention because it is cheap to act on and
+expensive to ignore: it says a recurring goal was picked before its cadence
+elapsed. A claimant that reads it can check `lastAchievedAt` against
+`interval_hours` and release in seconds instead of re-running the work.
+
+### Why the fix is also a warning about enumerations
+
+The relayed lesson was not "add one field". It was that **an enumerated
+read-list reads as COMPLETE, so the field it omits is never looked for**. Phase
+2.9 exists precisely to stop a claiming Body repeating finished work, and its
+own enumeration is what defeated it — a list is a snapshot of which fields
+existed when someone wrote it, and it goes stale silently because a missing
+field produces no error and no gap in the output, just a confident reader. This
+is the same class as `guard-3512`, which added `outcome_notes` to that very list
+after the singular form missed prior work — the second time this list has been
+patched for omitting a field rather than for being wrong.
+
+The durable remedy is to enumerate from the RECORD rather than from prose: print
+every key whose value is a non-trivial string/list/dict and read those, so a
+field added later is read the first time. `guard-2283` states the general form
+(a document's claim about its own completeness is an unverified claim).
+
 ## Cross-references
 
 - `g-115-6695` — this goal; relayed from `g-115-6468` by a worker Body (cc-07)

@@ -286,10 +286,27 @@ def _blocker_age_hours() -> str:
 
 
 def _run_bash(argv, timeout):
-    """Run a core/scripts bash script. Return (rc, stdout, err_or_None).
+    """Run a core/scripts bash script. Return (rc, stdout, err_or_None, lane_stderr).
 
     err set == the lane could not be RUN at all (timeout / spawn failure). That
     is a BLIND lane, not a clean one -- the caller must not fold it into a zero.
+
+    The 4th slot is the LANE's OWN stderr, and it is load-bearing for triage.
+    Most lanes here are daemon-only wrappers whose entire failure path is
+    `rt_no_daemon_error`: a diagnostic on STDERR, NOTHING on stdout, rc=1. With
+    stderr dropped, every such blip reported as `unparseable output (rc=1):
+    Expecting value: line 1 column 1 (char 0)` -- a string that names the JSON
+    parser and never the cause, so a daemon outage and a genuine wrapper-API
+    break are byte-identical in the report (guard-2586: a fallback path and a
+    failure path must not emit the same message). Measured 2026-09-06:
+    aspirations-recover-recurring came back BLIND with exactly that reason while
+    the same lane, re-run through this same invocation shape, returned rc=0 and
+    clean JSON -- so the blindness was transient and its one diagnostic was
+    discarded here. Sibling instance of the same class, different file:
+    g-115-7946 (deploy-hold-check queue fetch).
+
+    Injected runners (tests, lane_runner=) may still return 3-tuples; the caller
+    unpacks defensively, so this stays backward-compatible.
     """
     from _runtime_bash import bash_cmd  # guard-580 + guard-581
 
@@ -299,9 +316,9 @@ def _run_bash(argv, timeout):
             full, cwd=str(PROJECT_ROOT),
             capture_output=True, text=True, timeout=timeout,
         )
-        return r.returncode, r.stdout, None
+        return r.returncode, r.stdout, None, r.stderr
     except Exception as exc:
-        return None, "", f"{argv[0]}: {exc}"
+        return None, "", f"{argv[0]}: {exc}", ""
 
 
 def _is_worker_body(env=None):
@@ -337,7 +354,12 @@ def _meter(action, runner, sweep=None):
     if _is_worker_body():
         return None
     argv = [_METER, action] + ([sweep] if sweep else [])
-    rc, out, err = runner(argv, 30)
+    # Same defensive unpack as the lane loop: _run_bash returns 4 slots, injected
+    # runners may return 3. This is the SECOND call site of `runner` and it is
+    # easy to miss -- a 3-only unpack here raises `too many values to unpack`
+    # on the real runner and takes down every meter decision.
+    _res = runner(argv, 30)
+    rc, out, err = _res[0], _res[1], _res[2]
     if err is not None:
         return None
     return (out or "").strip() or None
@@ -451,7 +473,12 @@ def run(as_json=False, apply=False, lane_runner=None) -> int:
                 argv.append("--apply")
 
             label = lane["name"] + (f" {' '.join(variant)}" if variant else "")
-            rc, out, err = runner(argv, _LANE_TIMEOUT_S)
+            # Defensive unpack: _run_bash yields 4 slots (the 4th is the lane's
+            # own stderr, see its docstring), while injected runners in tests
+            # return the historical 3. Never index [3] unconditionally.
+            _res = runner(argv, _LANE_TIMEOUT_S)
+            rc, out, err = _res[0], _res[1], _res[2]
+            lane_err = _res[3] if len(_res) > 3 else ""
             if err is not None:
                 report["blind"].append(
                     {"name": label, "phase": lane["phase"], "reason": err}
@@ -467,6 +494,12 @@ def run(as_json=False, apply=False, lane_runner=None) -> int:
             except Exception as exc:
                 # Unparseable output is BLIND, never clean.
                 reason = f"unparseable output (rc={rc}): {exc}"
+                # Name the CAUSE, not just the parser. Empty stdout + rc=1 is the
+                # daemon-only wrappers' signature and their diagnostic lives on
+                # stderr; without this the report cannot distinguish a daemon
+                # blip from a wrapper-API break (guard-2586).
+                if lane_err and lane_err.strip():
+                    reason += f" | lane stderr: {lane_err.strip()[-300:]}"
                 report["blind"].append(
                     {"name": label, "phase": lane["phase"], "reason": reason}
                 )

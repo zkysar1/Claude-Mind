@@ -352,3 +352,48 @@ def test_blocker_age_falls_back_rather_than_raising(monkeypatch):
         mb, "PROJECT_ROOT", Path("/nonexistent-project-root-for-this-test")
     )
     assert mb._blocker_age_hours() == "2"
+
+
+def test_blind_reason_carries_the_lane_stderr_tail():
+    """A daemon-only wrapper fails by printing its diagnostic to STDERR with
+    NOTHING on stdout and rc=1. Before g-115-8163 that stderr was discarded, so
+    the BLIND reason named the JSON parser ("Expecting value: line 1 column 1")
+    and never the cause -- a daemon blip and a wrapper-API break rendered
+    identically (guard-2586). Measured live 2026-09-06 on
+    aspirations-recover-recurring."""
+    diag = "aspirations-recover-recurring.sh: daemon unreachable at /v1/aspirations"
+
+    def runner(argv, timeout):
+        if argv[0].endswith("budget-meter.sh"):
+            return 0, "run", None, ""
+        return 1, "", None, diag
+
+    rep = {}
+    mb._emit = lambda r, j: rep.update(r)
+    mb.run(as_json=True, apply=False, lane_runner=runner)
+
+    assert rep["blind"], "rc=1 with empty stdout must be BLIND"
+    reasons = " ".join(b["reason"] for b in rep["blind"])
+    assert "daemon unreachable" in reasons, (
+        "the lane's own stderr must reach the BLIND reason, else the report "
+        "names the parser and not the cause"
+    )
+    assert "unparseable output" in reasons, "the parser detail is still useful"
+    assert rep["executed"] == [], "a blind lane did not execute"
+
+
+def test_three_tuple_runners_still_work():
+    """Injected runners predate the 4th slot. The defensive unpack must keep
+    them working -- a signature change that silently breaks every existing fake
+    runner would be a worse defect than the one being fixed."""
+    def runner(argv, timeout):
+        if argv[0].endswith("budget-meter.sh"):
+            return 0, "run", None
+        return 0, "not json at all", None
+
+    rep = {}
+    mb._emit = lambda r, j: rep.update(r)
+    mb.run(as_json=True, apply=False, lane_runner=runner)
+
+    assert rep["blind"], "unparseable output must still be BLIND"
+    assert rep["completeness"] == "partial"

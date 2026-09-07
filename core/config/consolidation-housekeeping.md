@@ -131,7 +131,22 @@ The script is fail-open: malformed entries yield `no_action` with a reason rathe
 
 ```
 # Reads from experience archive, NOT WM queues — independent of encoding state
-Bash: experience-read.sh --type goal_execution --recent 30 --summary
+Bash: experience-read.sh --type goal_execution --recent 30
+# NO --summary (g-115-5730) — two independent reasons, both measured:
+#   1. --summary renders "id: [type] category - summary" lines carrying NO
+#      tree_nodes_related, so the grouping on the next line cannot be done
+#      from its output at all. This step json.load'ed it, which also raised:
+#      --summary is plain text BY DESIGN (--summary ALONE returns the same
+#      lines), so that half was never a combination defect.
+#   2. Until 2026-09-05 /v1/experience/read was a first-match-wins if/return
+#      chain, so the `summary` branch returned BEFORE `type` and `recent` were
+#      read. This call therefore rendered the LIFETIME store on every
+#      consolidation on every box, and "since last distillation" had never
+#      been what was measured. Measured at filing: 13 clusters reached the 3+
+#      threshold lifetime vs 0 when correctly scoped to that session's 14.
+# Filters now COMPOSE with selectors, so the JSON form is scoped and groupable.
+# Do not re-add --summary here; see the endpoint docstring's composition
+# contract in mind_api/src/endpoints/experience.py.
 Group experiences by tree_nodes_related field.
 
 FOR EACH tree node with 3+ related experiences since last distillation:
@@ -208,7 +223,9 @@ IF stop_mode != true:
   7. Read meta/skill-gaps.yaml
      Report: new gaps, forge-ready gaps, dismissed gaps
 
-  7.5. Bash: experience-read.sh --type goal_execution --recent 30 --summary
+  7.5. Bash: experience-read.sh --type goal_execution --recent 30
+# NO --summary (g-115-5730): the grouping below keys on category AND skill,
+# and the --summary line carries neither `skill` nor the full record.
        Read meta/skill-gaps.yaml + core/config/skill-gaps.yaml
        Group by category+skill. Clusters of 3+ → register new gaps (max 3 per pass)
        Report: "{N} scanned, {M} new gaps, {K} strengthened"

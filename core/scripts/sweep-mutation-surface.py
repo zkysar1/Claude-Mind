@@ -76,7 +76,29 @@ SWEEP_LOGS = {
 #: refusal rows existed across all 14,630 lines of the three then-registered
 #: logs, so the mis-render was LATENT, never live. It stops being latent the
 #: moment any guarded sweep actually refuses.
-REFUSAL_TYPE_MARKER = "refused"
+#: g-115-6448: was `REFUSAL_TYPE_MARKER = "refused"`, substring-matched. guard-1923
+#: forbids a bare common-English word in a matcher vocabulary, and the error
+#: direction is what makes it worth fixing while still latent (guard-2860): an
+#: exact-list UNDER-match reports a phantom status change, which is loud and
+#: correctable, while a substring OVER-match SILENTLY DROPS a real mutation type
+#: that merely contains the word -- defeating guard-1231, whose whole purpose is
+#: that a terminal-status mutation reaches the goal's filer. Enumerated in-tree
+#: 2026-09-07: the two genuine refusal types both END with this suffix
+#: (monitor_stale_*, parent_supersession_*), while FOUR other real types carry the
+#: bare word and mean something else entirely -- addressing_refused, grant_refused,
+#: interior_node_refused, out_of_window_digest_refused. A suffix keeps the original
+#: intent (a future guarded sweep joins the surface without an edit here) while
+#: making that join DELIBERATE rather than an accident of vocabulary.
+REFUSAL_TYPE_SUFFIX = "_refused_stale_candidate"
+
+
+def is_refusal_type(rec_type) -> bool:
+    """True when a metrics row records a sweep REFUSING a stale candidate.
+
+    Such rows are not status changes and must not be surfaced as mutations.
+    Total over any input: a None/empty/non-string type is not a refusal.
+    """
+    return str(rec_type or "").endswith(REFUSAL_TYPE_SUFFIX)
 DEFAULT_WINDOW_HOURS = 24  # first-run lookback when no watermark exists
 MAX_DISPLAY = 6            # cap the header line so a big batch stays one line
 
@@ -153,7 +175,7 @@ def _collect_new_mutations(metrics_dir, watermark):
             # future guarded sweep naming its own refusal type is covered
             # without an edit here (the three registered sweeps all name theirs
             # `*_refused_stale_candidate`).
-            if REFUSAL_TYPE_MARKER in str(rec.get("type") or ""):
+            if is_refusal_type(rec.get("type")):
                 continue
             gid = rec.get("goal_id")
             if not gid:

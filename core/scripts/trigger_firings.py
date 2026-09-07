@@ -45,8 +45,39 @@ from _fileops import (  # noqa: E402
     release_lock,
 )
 
+# Own-cloud spool lane () — a PORT of the lane _gate_log.py has run in
+# production since , not a new design. Under STORAGE_BACKEND=own-cloud
+# a direct locked_append_jsonl here is a whole-object S3 read-modify-write, AND
+# (unlike gate-firings, which is in _fileops._SNAPSHOT_BLACKLIST) it also writes
+# a whole-file .history snapshot per record — locked_append_jsonl is
+# "lock -> history -> append -> changelog". Measured cost of that on this store:
+# 810 MB of PUT bytes per 24h / 672 object versions, for a store with zero
+# readers of the churn.
+#
+# The spool makes the hot path O(1): one lockless O_APPEND of a sub-4KB line to
+# a machine-local file (same idiom as _gate_log and _fileops._record_fallback_hit
+# — a torn line is harmless, the flusher skips it), drained by
+# trigger-firings-flush.py into ONE locked RMW per flush.
+#
+# _spool_active is IMPORTED, never re-implemented: it resolves the backend the
+# same way get_backend() will, because a bare subprocess on a registry-native box
+# starts with STORAGE_BACKEND unset and an env-only test silently takes the
+# expensive lane (measured 2026-08-18, the dominant writer of the legacy 68 MB
+# object). One copy of that reasoning, not two (guard-2190 / guard-1885).
+from _gate_log import _spool_active  # noqa: E402
+
 FIRINGS_PATH = META_DIR / "trigger-firings.jsonl" if META_DIR else None
 TRIGGER_FIRINGS_CAP = 5000
+
+# Dotted, matching the gate-firings lane exactly. The hyphenated form
+# (`trigger-firings-spool.jsonl`) is deliberately NOT used: _gate_log's reader
+# glob once admitted a hyphenated spool while its name-prefix check keyed on the
+# dotted production name, so the exclusion silently protected a file that never
+# existed. Keep writer, flusher and sync-exclusion on this one string.
+SPOOL_NAME = "trigger-firings.spool.jsonl"
+FLUSHING_NAME = "trigger-firings.spool.flushing.jsonl"
+SPOOL_PATH = META_DIR / SPOOL_NAME if META_DIR else None
+FLUSHING_PATH = META_DIR / FLUSHING_NAME if META_DIR else None
 
 
 def record_firing(trigger_id, context=None):
@@ -81,6 +112,18 @@ def record_firing(trigger_id, context=None):
             row["context"] = {"_unserializable": True}
     try:
         FIRINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _spool_active():
+            # O(1) hot path: one lockless local append. trigger-firings-flush.py
+            # batches the spool into the shared store with ONE locked RMW.
+            with open(SPOOL_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=True) + "\n")
+            # Cap enforcement is the FLUSHER's job on this lane, deliberately.
+            # _enforce_cap() does a locked read of the whole shared store, which
+            # is the exact whole-object RMW the spool exists to avoid — running
+            # it here would reintroduce the cost on 1-in-50 firings and make the
+            # lane pointless. The flusher already holds one open, so it enforces
+            # the cap there.
+            return
         locked_append_jsonl(FIRINGS_PATH, row)
     except Exception as e:
         print(f"[trigger-firings] append failed for {trigger_id}: {e}",
@@ -94,17 +137,23 @@ def record_firing(trigger_id, context=None):
         _enforce_cap()
 
 
-def _enforce_cap():
+def _enforce_cap(path=None):
     """If trigger-firings.jsonl exceeds TRIGGER_FIRINGS_CAP, rewrite with the
     trailing N entries. Locked to avoid concurrent append clobbering.
+
+    `path` overrides the module-level store (g-358-79). The flusher calls this
+    after a batch lands and resolves its own store from --meta-dir, so without
+    the parameter a --meta-dir run would cap the REAL store instead of the one
+    it just wrote — silently, and only under the flag tests use.
     """
-    if FIRINGS_PATH is None or not FIRINGS_PATH.exists():
+    target = path if path is not None else FIRINGS_PATH
+    if target is None or not target.exists():
         return
-    lock_path = FIRINGS_PATH.with_suffix(".lock")
+    lock_path = target.with_suffix(".lock")
     try:
         acquire_lock(lock_path)
         try:
-            with open(FIRINGS_PATH, encoding="utf-8") as f:
+            with open(target, encoding="utf-8") as f:
                 rows = []
                 for line in f:
                     line = line.strip()
@@ -118,11 +167,11 @@ def _enforce_cap():
                 rows = rows[-TRIGGER_FIRINGS_CAP:]
                 # Write inside the SAME lock — locked_write_jsonl would try
                 # to re-acquire, so write directly.
-                tmp = FIRINGS_PATH.with_suffix(".tmp")
+                tmp = target.with_suffix(".tmp")
                 with open(tmp, "w", encoding="utf-8") as f:
                     for r in rows:
                         f.write(json.dumps(r, ensure_ascii=True) + "\n")
-                os.replace(str(tmp), str(FIRINGS_PATH))
+                os.replace(str(tmp), str(target))
         finally:
             release_lock(lock_path)
     except Exception as e:
@@ -147,18 +196,67 @@ def _parse_since(s):
         sys.exit(2)
 
 
+def _iter_lines(path):
+    """Yield stripped non-empty lines, tolerating a torn tail.
+
+    Reads bytes and decodes with errors="replace" rather than opening in text
+    mode: the spool is written by lockless O_APPEND, so its last line can be a
+    partial UTF-8 sequence from an append still in flight. A strict decode
+    there raises and would take the whole report down over one torn tail.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line:
+            yield line
+
+
+def _read_sources():
+    """Every file a firing can currently live in, oldest lane first.
+
+    THE READER MUST SPAN THE SPOOL (g-358-79). Once the own-cloud hot path
+    writes to a machine-local spool, a reader that opens only the shared store
+    under-reports by everything not yet flushed — up to --min-interval-seconds
+    of firings, or a whole session on a box whose flush never ran. That is
+    guard-4348 read from the consumer side: while a spool is interposed, the
+    destination store is not the whole population.
+
+    `.flushing` is included because a flush that died between its store-append
+    and its unlink leaves records there; the dedup below makes the overlap
+    harmless rather than double-counted.
+    """
+    out = []
+    for p in (FIRINGS_PATH, FLUSHING_PATH, SPOOL_PATH):
+        if p is not None and p.exists():
+            out.append(p)
+    return out
+
+
 def _load_firings(since_dt=None, trigger_filter=None, agent_filter=None):
-    if FIRINGS_PATH is None or not FIRINGS_PATH.exists():
+    sources = _read_sources()
+    if not sources:
         return []
     out = []
-    with open(FIRINGS_PATH, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
+    # Dedup identity = the serialized line, the same key trigger-firings-flush
+    # and merge_append_only_jsonl dedup by, so a record that is mid-flush
+    # (present in BOTH the store and .flushing) is counted exactly once.
+    seen = set()
+    for src in sources:
+        for line in _iter_lines(src):
+            if line in seen:
                 continue
+            seen.add(line)
             try:
                 row = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                # A torn append can land on a valid JSON scalar (`7`), which
+                # parses fine and then kills every reader doing row.get().
+                # Same write-side lesson as gate-firings; guard here too.
                 continue
             if since_dt:
                 try:

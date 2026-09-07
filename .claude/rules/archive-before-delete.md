@@ -63,6 +63,18 @@ its owner, tmp files this session created, or append-only writes.
    snapshot commit for tracked files, or an offline tarball. Where
    noncurrent-version expiry rules exist, current-version copies are the
    retention-immune form.
+   **(c) STAGING is part of the choice, and the obvious spot is the worst
+   one.** `agents/<agent>/temp/` is git-ignored ENTIRELY (`agents/*/temp/*`,
+   only `.gitkeep` re-included), so nothing staged there is tracked at ANY
+   depth; and `temp-drain-purge.sh` recursively deletes every top-level stray
+   dir older than `--age-min` (default **120 minutes**). An archive staged
+   there is untracked and gone inside two hours while looking like a
+   deliberate durable location. If you stage there anyway, write the sentinel
+   FIRST: `_has_archive_receipt` preserves a dir carrying `.archive-marker` or
+   a top-level `RECEIPT` / `RECEIPT.*` (any extension, any case). Staging is
+   never archiving — step 4 still applies to the copy that survives.
+   (ZDS g-001-349: two live instances 2026-08-03, one of them IAM-policy
+   rollback material 10h into a deletion window.)
 4. **Verify the archive against the enumeration**: object count, total
    bytes, and per-object checksums must ALL match. A sampled spot-check is
    not verification.
@@ -79,11 +91,10 @@ its owner, tmp files this session created, or append-only writes.
    **Name it `RECEIPT.*` at the archive's TOP LEVEL, and if you write a READER
    for it, match extension- and case-insensitively.** Until 2026-08-08
    (g-115-3397) this step named no filename, so writers and readers disagreed:
-   `_seed_engine.py` writes `RECEIPT.json`, `history_vacuum_archive.py` writes
-   lowercase `receipt.json`, and the one reader in the tree
-   (`temp-drain-purge.sh` Lane 3) required `RECEIPT.md` **exactly** — a name **zero** producers write, so the
-   protection fired only on hand-named receipts; a live archive carrying
-   `RECEIPT.json` survived a drain purge only because someone hand-marked it.
+   producers write `RECEIPT.json` (`_seed_engine.py`) and lowercase
+   `receipt.json` (`history_vacuum_archive.py`), while the one reader
+   (`temp-drain-purge.sh`) required `RECEIPT.md` **exactly** — a name zero
+   producers write, so the protection fired only on hand-named receipts.
 
    The asymmetry is what makes this a rule rather than a preference: a missed
    sentinel DESTROYS a recovery layer, while an over-match merely retains a

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""inbound-drain-run — audited entry point for the `inbound-drain` hook slot.
+
+Pattern B executable slot (core/config/conventions/domain-hooks.md). Core names
+the SLOT — `world/scripts/inbound-drain.sh` — and never the domain script behind
+it; naming a specific world artifact from core is the anti-pattern that
+convention opens with. Sibling of `outcome-observation-run.sh`, and for the same
+reason: an audited entry point is what makes a hook's absence VISIBLE. That slot
+rotted (g-115-4879) precisely because a caller invoked the collector directly and
+skipped the audit layer, leaving a healthy output concealing a dead hook.
+
+WHY A FLATTENER EXISTS HERE AT ALL. The precheck battery reads findings from
+TOP-LEVEL keys of a lane's JSON (`_findings_for` does `payload.get(k)`), while
+the domain drain reports per-environment counts NESTED under `environments[]`. A
+lane wired straight to it would find no top-level key, report clean forever, and
+be indistinguishable from a lane that genuinely found nothing — the exact shape
+this whole feature exists to avoid. So the counts are summed to the top level
+here, in core, where the battery's contract lives.
+
+ABSENCE IS NOT ZERO, and the status word is how you tell which world you are in:
+  no-slot        this world has no inbound-drain slot. A supported configuration
+                 (fresh worlds have none) and a silent no-op by contract.
+  not-a-vessel   the slot ran and declined: no instance token, no root, or no
+                 spool for this environment. NOT a drain of zero.
+  unparseable    the slot printed something that is not JSON. A MALFUNCTION, and
+                 it is reported as a finding rather than swallowed — an exit-0
+                 with unreadable output is guard-1091's shape and must never
+                 reach the battery as clean.
+  ok             the drain ran. `drained` is then a real number.
+
+FAIL-OPEN BY CONTRACT: always exit 0. An always-run precheck lane may never block
+the loop (guard-614).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from _runtime_bash import BASH  # noqa: E402
+
+SLOT_NAME = "inbound-drain"
+
+
+def _world_path() -> Path | None:
+    """Resolve WORLD_PATH the way every other core consumer does — via _paths."""
+    try:
+        import _paths  # noqa: WPS433
+        w = getattr(_paths, "world_path", None)
+        if callable(w):
+            return Path(w())
+        for attr in ("WORLD_PATH", "WORLD_DIR"):
+            v = getattr(_paths, attr, None)
+            if v:
+                return Path(v)
+    except Exception:
+        pass
+    v = os.environ.get("WORLD_PATH") or os.environ.get("WORLD_DIR")
+    return Path(v) if v else None
+
+
+def run(apply: bool = False, slot_override: Path | None = None) -> dict:
+    slot = slot_override
+    if slot is None:
+        wp = _world_path()
+        if wp is None:
+            return {"status": "no-slot", "slot": SLOT_NAME, "drained": 0, "failed": [],
+                    "note": "WORLD_PATH unresolvable — cannot locate the slot"}
+        slot = wp / "scripts" / f"{SLOT_NAME}.sh"
+
+    # Pattern B requirement 3: missing convention = silent no-op, never an error.
+    if not slot.is_file():
+        return {"status": "no-slot", "slot": slot.as_posix(), "drained": 0, "failed": [],
+                "note": "this world does not fill the inbound-drain slot — supported"}
+
+    argv = [BASH, slot.as_posix(), "--json"]   # guard-580: BASH resolved, never bare "bash"
+    if apply:
+        argv.append("--apply")
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "unparseable", "slot": slot.as_posix(), "drained": 0,
+                "failed": [{"file": "-", "reason": f"slot did not run: {exc}"}]}
+
+    out = (proc.stdout or "").strip()
+    if not out:
+        return {"status": "unparseable", "slot": slot.as_posix(), "drained": 0,
+                "failed": [{"file": "-", "reason":
+                            "slot printed ZERO bytes at rc=%s — a malfunction, not a "
+                            "result; every branch of the slot emits JSON" % proc.returncode}]}
+    try:
+        payload = json.loads(out)
+    except ValueError:
+        return {"status": "unparseable", "slot": slot.as_posix(), "drained": 0,
+                "failed": [{"file": "-", "reason":
+                            "slot output is not JSON: %s" % out[:200]}]}
+
+    if payload.get("not_a_vessel"):
+        return {"status": "not-a-vessel", "slot": slot.as_posix(), "drained": 0,
+                "failed": [], "note": payload.get("reason") or "slot declined"}
+
+    envs = payload.get("environments") or []
+    res = {
+        "status": "ok",
+        "slot": slot.as_posix(),
+        "root": payload.get("root"),
+        "apply": bool(apply),
+        "environments_seen": len(envs),
+        "drained": sum(int(e.get("processed") or 0) for e in envs),
+        "claimed": sum(int(e.get("claimed") or 0) for e in envs),
+        "rejected": sum(int(e.get("rejected") or 0) for e in envs),
+        "quarantined": sum(int(e.get("quarantined") or 0) for e in envs),
+        "skipped_tmp": sum(int(e.get("skipped_tmp") or 0) for e in envs),
+        "unconfigured": sum(int(e.get("unconfigured") or 0) for e in envs),
+        "failed": [],
+    }
+    # `failed` is the battery's UNIVERSAL finding key, so a per-env failure count
+    # has to become a list entry or it is invisible to _findings_for.
+    for e in envs:
+        n = int(e.get("failed") or 0)
+        if n:
+            res["failed"].append({"file": e.get("environment") or "?",
+                                  "reason": f"{n} record(s) failed and stayed claimed"})
+    # UNCONFIGURED must reach the same finding key, or a STUCK member directive is
+    # reported as a healthy empty spool (measured 2026-09-07, , cc-07: an
+    # empty inbound/ and one undrained directive both printed
+    # `status=ok drained=0 failed=0` at rc=0 — byte-identical). The drain counts it
+    # and exits 2 precisely because "an undrained spool must never report success",
+    # but the slot ends `|| true; exit 0` so that rc never survives, and this dict
+    # was the only other channel. Concealing a dead hook behind a healthy output is
+    # the exact class this runner's docstring exists to prevent.
+    for e in envs:
+        n = int(e.get("unconfigured") or 0)
+        if n:
+            res["failed"].append({"file": e.get("environment") or "?",
+                                  "reason": f"{n} directive(s) left queued: no target "
+                                            "aspiration configured (SIDECAR_DIRECTIVE_ASP_ID)"})
+    return res
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Run the inbound-drain hook slot.")
+    ap.add_argument("--apply", action="store_true", help="perform the moves and writes")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--slot", help="explicit slot path (tests)")
+    args = ap.parse_args(argv)
+
+    res = run(apply=args.apply, slot_override=Path(args.slot) if args.slot else None)
+
+    if args.json:
+        print(json.dumps(res))
+    else:
+        print(f"[inbound-drain] status={res['status']} drained={res.get('drained', 0)} "
+              f"failed={len(res.get('failed', []))} apply={res.get('apply', False)}")
+        if res.get("note"):
+            print(f"  note: {res['note']}")
+        for f in res.get("failed", []):
+            print(f"  FAILED {f['file']}: {f['reason']}")
+    return 0   # fail-open by contract
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -163,7 +163,7 @@ Agent directories are resolved through a centralized helper, never hardcoded
 `SESSIONS_DIRNAME` (`"sessions"` — per-session dirs under each agent) and
 `SESSION_DIRNAME` (`"session"` — the agent-wide cross-session state dir).
 
-Those constants are mirrored at **12 constant-named sites, 5 inlined copies and
+Those constants are mirrored at **12 constant-named sites (5 inlined) and
 2 literal-string hardcoders**, and every **cross-agent glob consumer**
 (`agents_root().glob("*/...")`) must route through the helper or it silently
 scans NOTHING after a relocation — a depth-1 redrift is invisible to every

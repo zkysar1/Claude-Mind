@@ -255,3 +255,85 @@ nodes:
     # affects no comparison. Do not "fix" this by inventing a placeholder agent name:
     # a value that is not a live roster agent makes _roster_parity emit a permanent
     # INFO calling it a retired node, which is false and trains readers to skim INFO.
+
+  # ── Body boxes, second wave (added 2026-09-06, g-115-9272) ───────────────────
+  # Same class and the SAME BAR as the cc-07 / cc-08 rows above, registered for the
+  # same reason: _box_parity had been reporting all three as
+  # LIVE-BOX-NOT-IN-MANIFEST, so their config drift was invisible to every lane.
+  # EVERY field is MEASURED — collected from cc-13 over this checker's own ssh
+  # transport (BatchMode=yes, StrictHostKeyChecking=no, ConnectTimeout=8), with
+  # cc-08 and cc-04 collected FIRST as a POSITIVE CONTROL, so an UNREACHABLE here
+  # would have been distinguishable from a broken route on the measuring box.
+  # Each `host` is the `hostname` the box ITSELF returned over that connection,
+  # never its tailnet node name (guard-1574 — one machine routinely carries several
+  # nodes); `shape` is its own `systemd-detect-virt`; `user` is `whoami` on the far
+  # side; `root` is proven by `[ -d /opt/ayoai-mind ]`. All three self-report
+  # MACHINE_ID == host, so none needs a machine_id_check skip. Vantage point named
+  # per guard-1412: measured FROM cc-13 (uname -r 6.8.0-138-generic), 2026-09-06.
+  #
+  # NONE OF THE THREE CARRIES AN `agent` KEY, and that is MEASURED, not an omission
+  # — it is the cc-08 encoding, not the cc-07 one. The discriminator the cc-07 row
+  # states ("exactly one agent dir carries a local-paths.conf here") was re-run on
+  # each: cc-07 has 1 (alpha), while cc-08, cc-09, cc-10 and cc-13 each carry ALL
+  # FIVE (alpha bravo echo foxtrot zeta). Their body-heartbeat carriers all name
+  # agent `alpha`, so inferring the resident agent from the carrier would have
+  # written `agent: alpha` on all three — exactly the invisible wrong data the cc-08
+  # note warns about. An absent key is the honest encoding AND the supported one:
+  # _roster_parity builds its node set with `if n.get("agent")`, so these rows are
+  # skipped there by construction, while _box_parity keys on `host` alone and so
+  # measures each box fully.
+  - host: cc-09
+    addr: 100.109.19.91
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+  - host: cc-10
+    addr: 100.110.125.125
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+  - host: cc-13
+    addr: 100.86.103.27
+    shape: lxc
+    user: root
+    root: /opt/ayoai-mind
+    # cc-13 IS the box the rows above were measured from, so its own row could not
+    # be proven by a self-probe: `ssh root@100.86.103.27` FROM cc-13 returns
+    # `Permission denied (publickey)` — the documented self-ssh failure `_is_self`
+    # exists to route around, and NOT evidence about the peer route. Proven instead
+    # by a TWO-HOP non-self collection: run FROM cc-09, `ssh root@100.86.103.27`
+    # returned `host=cc-13 root_exists=yes virt=lxc whoami=root`. That is a real
+    # peer collection over the same transport, so addr/user/shape meet the same bar
+    # as every other row here. (The checker collects cc-13 LOCALLY whenever it runs
+    # ON cc-13 — `_is_self` — so these ssh fields are exercised only when a PEER
+    # measures this box, which is exactly why they had to be proven from a peer.)
+
+# ── Live boxes deliberately NOT registered (2026-09-06, g-115-9272) ────────────
+# _box_parity has no exclusion mechanism: it diffs the live box set against
+# `nodes[].host` and nothing else, so a box that is live, measured, and correctly
+# unregistered still emits LIVE-BOX-NOT-IN-MANIFEST on every sweep. This block is
+# the stated reason a reader would otherwise re-derive from scratch; it does not
+# and cannot silence that line.
+#
+#   DESKTOP-O91DLK2 — Zachary's personal Windows machine, not a provisioned fleet
+#   box. `world/conventions/fleet-topology.md` classes it `*(user)*`, the same row
+#   group as the android handset, and the sessions run there are attended (bravo
+#   worked from it 2026-08-21 and 2026-08-23), which is why it writes a
+#   body-heartbeat carrier at all. It cannot meet this file's registration bar from
+#   any vantage point available today: measured from cc-13 on 2026-09-06, its
+#   tailnet node 100.107.201.118 is the WINDOWS host, whose sshd answers but
+#   refuses every identity tried (root, zkysa, zkysar1 — all `Permission denied
+#   (publickey,password,keyboard-interactive)`); and unlike foxtrot — one machine
+#   with TWO tailnet nodes, whose WSL2 guest `foxtrot` @100.73.115.66 is what the
+#   LAPTOP-3IOFCNEO row above actually addresses — this desktop has NO separate
+#   linux/WSL tailnet node, so nothing exposes the Mind's root. addr/user/shape/
+#   root are therefore unmeasurable from here, and a row would be precisely the
+#   guessed-fields trade `_box_parity`'s docstring refuses.
+#
+#   cc-14 — outside the filing goal's scope and left unregistered on purpose, but
+#   it WAS measured green in the same sweep (`ssh root@100.66.86.34` →
+#   `host=cc-14 root_exists=yes virt=lxc whoami=root`; 5 agent confs; carrier
+#   MACHINE_ID cc-14), so whoever registers it need not re-measure. It reads as
+#   INFO rather than DRIFT today only because its last body-heartbeat
+#   (2026-09-05T14:41:17) is past _BOX_LIVE_WINDOW_HOURS; it flips to DRIFT the
+#   moment a Mind runs there again.

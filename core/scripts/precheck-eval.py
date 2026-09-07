@@ -37,7 +37,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone  # noqa: F401 — timedelta used by hypothesis-health
+from datetime import date, datetime, timedelta, timezone  # noqa: F401 — timedelta used by hypothesis-health
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -1166,6 +1166,83 @@ def cmd_user_goals(args, config, compact):
 # (;  / rb-3452 "assert the mechanism, not the case").
 
 
+# Hard scan cap for the full-depth footprint below. NOT a tuning knob: it is a
+# COST bound. temp-drain-purge.sh:629 measured 153,453 files under ONE scratch
+# dir (npmci-probe/, worker-box local-only) — and that dir is not a git repo, so
+# the clone-prune alone does not bound it. A precheck advisory runs every
+# iteration and must never become an unbounded walk.
+_FOOTPRINT_FILE_CAP = 50000
+
+
+def _temp_footprint(temp_dir, file_cap=_FOOTPRINT_FILE_CAP):
+    """Full-depth files+bytes under temp/, clone subtrees EXCLUDED, scan capped.
+
+    REPORTED ONLY — this NEVER feeds a threshold, and the separation is the
+    whole design (g-115-7121). Read `## WHY THIS DOES NOT REPLACE
+    pressure_count` in cmd_temp_pressure before wiring it into one.
+
+    WHY BYTES AND NOT JUST FILES: the count and the mass answer different
+    questions and neither describes the problem alone — measured twice.
+    guard-3260 (foxtrot, 2026-08-09): purging 484MB of 837MB moved the .json
+    count only 1025 -> 1007, because the COUNT is dominated by small payloads
+    while the BYTES are dominated by a few huge ones. g-115-7121 (alpha, cc-09,
+    2026-09-05): 811 depth-1 files carrying 368,237,093 B — a count of 811 says
+    nothing about a third of a gigabyte.
+
+    CLONE EXCLUSION uses Lane 3's OWN predicate, `(<dir>/.git).exists()`
+    (temp-drain-purge.sh:615, `-e` so it catches both .git dirs and .git files
+    for worktrees/submodules). Deliberately the same test, not a similar one:
+    Lane 3 PRESERVES such dirs (unpushed-work guard g-115-3648), so they persist
+    indefinitely and a recursive count that included them would be dominated by
+    a subtree no lane will ever remove — the exact hazard g-115-7121 constraint
+    (1) names. Pruned subtrees are counted and NAMED in `clone_dirs` rather than
+    silently skipped.
+
+    Fail-open by contract: any error returns what was gathered plus `error`, and
+    the caller must never branch on it. `truncated` is reported so a capped scan
+    is never mistaken for a whole one (guard-1760: a checker must not report
+    what it declined to look at as complete).
+    """
+    fp = {"files": 0, "bytes": 0, "depth1_files": 0, "depth1_bytes": 0,
+          "deeper_files": 0, "deeper_bytes": 0, "clone_dirs_excluded": 0,
+          "clone_dirs": [], "truncated": False, "error": None}
+    if temp_dir is None or not temp_dir.is_dir():
+        return fp
+    root_str = str(temp_dir)
+    try:
+        for dirpath, dirnames, filenames in os.walk(root_str, topdown=True):
+            for d in list(dirnames):
+                try:
+                    if (Path(dirpath) / d / ".git").exists():
+                        dirnames.remove(d)
+                        fp["clone_dirs_excluded"] += 1
+                        if len(fp["clone_dirs"]) < 20:
+                            fp["clone_dirs"].append(
+                                os.path.relpath(os.path.join(dirpath, d), root_str))
+                except OSError:
+                    continue
+            at_root = os.path.abspath(dirpath) == os.path.abspath(root_str)
+            for name in filenames:
+                if fp["files"] >= file_cap:
+                    fp["truncated"] = True
+                    return fp
+                try:
+                    sz = os.path.getsize(os.path.join(dirpath, name))
+                except OSError:
+                    continue  # vanished mid-walk — temp/ is live
+                fp["files"] += 1
+                fp["bytes"] += sz
+                if at_root:
+                    fp["depth1_files"] += 1
+                    fp["depth1_bytes"] += sz
+                else:
+                    fp["deeper_files"] += 1
+                    fp["deeper_bytes"] += sz
+    except Exception as e:  # fail open — an advisory must not break the loop
+        fp["error"] = f"{type(e).__name__}: {e}"
+    return fp
+
+
 def cmd_temp_pressure(args, config, compact):
     """Count undrained working docs in the bound agent's temp/ store and flag
     accumulation pressure, so temp/ never becomes the new slush directory.
@@ -1264,6 +1341,7 @@ def cmd_temp_pressure(args, config, compact):
     # counting them toward the drain threshold would fire drain goals that cannot
     # drain them. Visibility is the fix; changing threshold semantics is not.
     unclassified_count = 0
+    dotfile_doc_count = 0
     # WHY NOT rglob (): the originating goal's verification proposed
     # reconciling against "an independent rglob enumeration". That is the WRONG
     # denominator and would be a regression — rglob picks up drained/ (195 files
@@ -1275,6 +1353,24 @@ def cmd_temp_pressure(args, config, compact):
     if temp_dir is not None and temp_dir.is_dir():
         for f in temp_dir.iterdir():
             if not f.is_file():
+                continue
+            # DOTFILES ARE UNREACHABLE BY EVERY REMEDY LANE, so they must not
+            # drive the scheduling count (guard-5329: a metric that schedules a
+            # remedy must MOVE when the remedy runs, else metric and remedy are
+            # measuring different populations and the goal re-files forever).
+            # /drain-temp Phase 1 globs temp/*.md + temp/*.json and a glob cannot
+            # match a leading dot; temp-drain-purge Lane 1 exempts `! -name '.*'`
+            # outright, leaving Lane 0 to REPORT them and delete nothing. Counting
+            # them in `count` raised temp_drain_needed for a population no drain
+            # pass can ever clear. Measured 2026-09-05 (echo, cc-03): all 6
+            # "undrained docs" were dotfiles (4 .md/2 .json) immediately after a
+            # full drain took temp/ from 127 -> 10 top-level files. Reported
+            # separately and excluded from thresholds — the same treatment
+            # `unclassified_count` already gets. NOTE the drain-temp SKILL.md
+            # Lane 0 comment claimed dotfiles were "never counted by the
+            # temp-pressure metric"; that was false until this branch existed.
+            if f.name.startswith("."):
+                dotfile_doc_count += 1
                 continue
             if f.suffix in (".md", ".json"):
                 count += 1
@@ -1327,6 +1423,50 @@ def cmd_temp_pressure(args, config, compact):
             pass  # fail open — see comment above
 
     pressure_count = count + ephemera_count
+
+    # ── full-depth footprint () — REPORTED, NEVER THRESHOLDED ──
+    #
+    # ## WHY THIS DOES NOT REPLACE pressure_count
+    #  asked for "one full-depth truth metric" to REPLACE the depth-1
+    # count. Replacing it would be a REGRESSION and guard-5329 is the reason: a
+    # metric that SCHEDULES a remedy must MOVE when the remedy runs, or metric
+    # and remedy are measuring different populations and the goal re-files
+    # forever. `count` is in exact agreement with the lane it triggers —
+    # /drain-temp Phase 1 enumerates `ls temp/*.md temp/*.json` (depth 1, no
+    # dotfiles) — so a full-depth `count` would schedule a drain against files
+    # the drain cannot reach, which is the same defect three times over
+    # (guard-5329 classifier mismatch, guard-3497 disjoint tool/metric
+    # populations, guard-3674 scratch-.json domination). The footprint answers a
+    # DIFFERENT question — how much mass is here — and no lane currently acts on
+    # its answer, so thresholding it would manufacture an unactionable flag.
+    # This is the treatment `unclassified_count` and `dotfile_doc_count` already
+    # get, under 's rule: "Visibility is the fix; changing threshold
+    # semantics is not."
+    #
+    # ## WHAT IT IS FOR
+    # The depth-1 count is a good proxy for the FILE population and a bad one
+    # for MASS, and the split is box-dependent — so neither a reader nor a
+    # future redesign can reason about temp/ without both numbers side by side.
+    # Measured 2026-09-05 (alpha, cc-09, uname -r 6.8.0-138-generic): local
+    # temp/ held 1,022 files / 443,640,148 B with 811 files / 368,237,093 B at
+    # depth 1 — i.e. 79.4% of files AND 83.0% of bytes are depth-1 here, so the
+    # "most of the tree is invisible" premise does NOT hold on this box. On
+    # bravo/cc-05 (2026-08-26) it did: ~1.1 GB sat at depth 2+ under drained/.
+    # Both are true; that is exactly why the metric must report the split
+    # instead of asserting one shape.
+    #
+    # ## THE LIMIT OF THIS NUMBER, STATED SO IT IS NOT OVER-READ
+    # It measures the LOCAL tree. Under own-cloud the local tree is a
+    # read-through cache (guard-980) and the BACKEND is what bills: measured the
+    # same day, S3 `ayoai-mind/agents/alpha/temp/` held 14,653 objects /
+    # 3,052,602,158 B against 1,022 / 443,640,148 locally — 14.4x the objects
+    # and 6.9x the bytes, with 75.4% of S3 bytes at depth 2+ where only 17.0% of
+    # local bytes are. The prefix is the UNION of every Body of this agent on
+    # every box; the local tree is one box's slice. A network call per precheck
+    # is the wrong cost model for a hot-path advisory, so the backend side is
+    # deliberately NOT read here — it belongs with the housekeeping census
+    # (Lane C already records per-agent files/bytes/depth1_files/subdirs).
+    footprint = _temp_footprint(temp_dir)
 
     # Dedup: if a drain-temp ACTION goal is already open, do NOT re-suggest filing —
     # else every iteration above threshold would spawn a duplicate HIGH goal.
@@ -1481,7 +1621,30 @@ def cmd_temp_pressure(args, config, compact):
     # part a reader reliably sees; a count that exists only in the JSON is the
     # same invisibility this fix exists to remove. Named "not-drainable" rather
     # than a bare number so it cannot be misread as additional drain pressure.
-    if pressure_count or unclassified_count:
+    # Footprint clause built OUTSIDE the branch, because BOTH branches need it.
+    # It lived inside the pressure branch for one revision and the Q1.5 checklist
+    # caught what that costs: a tree with mass at depth 3 and ZERO depth-1 docs
+    # printed a bare "temp-pressure: clean" while 5,000,000 B sat under drained/
+    # — which is precisely the shape this metric was added to make visible
+    # (bravo/cc-05, ~1.1 GB under drained/), reappearing on the one surface a
+    # reader actually reads. The JSON carried it the whole time; that is exactly
+    # the invisibility  rejects. Labelled "advisory" inline so it can
+    # never be misread as additional drain pressure — the counts are the
+    # scheduling signal, this is mass.
+    _fp = footprint or {}
+    _fp_clause = ""
+    if _fp.get("files"):
+        _fp_clause = (
+            f"; footprint(advisory, not thresholded): {_fp['files']} file(s)/"
+            f"{_fp['bytes']} B full-depth, {_fp['depth1_files']}/"
+            f"{_fp['depth1_bytes']} B at depth 1"
+            + (f", {_fp['clone_dirs_excluded']} clone dir(s) excluded"
+               if _fp.get("clone_dirs_excluded") else "")
+            + (f", SCAN CAPPED at {_FOOTPRINT_FILE_CAP} — partial"
+               if _fp.get("truncated") else "")
+            + (f", walk error: {_fp['error']}" if _fp.get("error") else ""))
+
+    if pressure_count or unclassified_count or dotfile_doc_count:
         _breakdown = f"{count} undrained doc(s)[{md_count} .md/{json_count} .json]"
         if ephemera_count:
             # DERIVED from EPHEMERA_SUFFIXES, never re-typed: this literal was a
@@ -1494,6 +1657,9 @@ def cmd_temp_pressure(args, config, compact):
         if unclassified_count:
             _breakdown += (f" + {unclassified_count} not-drainable"
                            "(other suffixes, excluded from thresholds)")
+        if dotfile_doc_count:
+            _breakdown += (f" + {dotfile_doc_count} dotfile(s)"
+                           "(no lane drains these, excluded from thresholds)")
         if ephemera_tracked_excluded:
             _breakdown += (f" [{ephemera_tracked_excluded} git-tracked file(s) "
                            "reclassified out of purge scope]")
@@ -1503,10 +1669,14 @@ def cmd_temp_pressure(args, config, compact):
             + (f"; open drain goal {existing}" if existing else "")
             + (f"; STALLED {escalation['age_hours']}h > "
                f"{drain_goal_max_age_h}h — escalate"
-               if "temp_drain_stalled" in flags else "") + ")"
+               if "temp_drain_stalled" in flags else "")
+            + _fp_clause + ")"
         )
     else:
-        summary = "temp-pressure: clean"
+        # "clean" means NOTHING IS SCHEDULED, never that temp/ is empty — so the
+        # mass still has to be said out loud here (see the clause comment above).
+        summary = "temp-pressure: clean" + (
+            f" ({_fp_clause.lstrip('; ')})" if _fp_clause else "")
     return {
         "subcommand": "temp-pressure",
         "summary": summary,
@@ -1517,8 +1687,13 @@ def cmd_temp_pressure(args, config, compact):
         "ephemera_count": ephemera_count,
         "pressure_count": pressure_count,
         "unclassified_count": unclassified_count,
+        "dotfile_doc_count": dotfile_doc_count,
         "ephemera_tracked_excluded": ephemera_tracked_excluded,
         "temp_root_total": count + ephemera_count + unclassified_count,
+        # Full-depth mass, clone-pruned and scan-capped. Advisory only — see
+        # "## WHY THIS DOES NOT REPLACE pressure_count" above before any future
+        # change wires this into a threshold ( / guard-5329).
+        "footprint": footprint,
         "existing_drain_goal": existing,
         "escalation": escalation if "temp_drain_stalled" in flags else None,
         "thresholds": {"warn_threshold": warn_threshold,
@@ -1565,6 +1740,24 @@ def cmd_run_all(args, config, compact):
         f"run-all: {len(all_flags)} flag(s): {', '.join(all_flags)}"
         if all_flags else "run-all: clean"
     )
+
+    # The deadline clock rides the TOP LINE, not a flag ().
+    # run-all's consumer contract is flag-driven: aspirations-precheck Phase
+    # 0.5.0 keys EVERY documented action on a flags[] entry, and nothing there
+    # directs a reader to a subcommand's `summary`. So a no-flag check would
+    # sit in `results` correctly computed and never read -- built-and-invisible,
+    # which is the exact defect a visibility goal must not ship. A flag is the
+    # wrong lever for it (guard-4794: a `deadline_near` would re-present
+    # identically every iteration for the whole week before a deadline, with no
+    # discharge path), so the nearest clock is appended where the reader already
+    # looks. Silent when no active aspiration carries a `deadline`, so this adds
+    # nothing to the common line.
+    nearest = (results.get("deadline-proximity") or {}).get("clocked") or []
+    if nearest:
+        summary += (
+            f" | deadline: {nearest[0]['asp_id']} {nearest[0]['days_remaining']}d"
+        )
+
     return {
         "subcommand": "run-all",
         "summary": summary,
@@ -1782,7 +1975,135 @@ def cmd_claim_integrity(args, config, compact):
 SUBCMDS.append(("peer-thread-relay", cmd_peer_thread_relay))
 SUBCMDS.append(("claim-integrity", cmd_claim_integrity))
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# Deadline proximity () — iteration-header surface, never a gate
+# ─────────────────────────────────────────────────────────────────────────
+
+# Mirrors goal-selector.py's `deadline_urgency` ramp, which ALREADY scores
+# these goals (+3 <=1d, +2 <=3d, +1 <=7d, then the long-horizon +0.5 <=30d /
+# +0.25 <=90d, with aspiration inheritance). This surface EXPLAINS a ranking
+# the scorer is already applying — it does not introduce a second notion of
+# "near", which would put header and ranking in visible disagreement. If the
+# scorer's tiers move, move this with them or delete it.
+_DEADLINE_WARN_DAYS = 7
+
+
+def _days_until(date_str):
+    """Whole days until an ISO-8601 (YYYY-MM-DD) date; negative once past.
+
+    Returns None for BOTH absent and unparseable, deliberately: the caller
+    separates them, because they warrant opposite reports. Absent is silence
+    (nothing was promised); unparseable is a deadline that exists in the
+    record and is invisible to every consumer — the g-115-8906 date-gate
+    defect class one surface over, so it gets a flag rather than a shrug
+    (guard-3024: the fallback errs toward keeping the signal ON).
+    """
+    if not date_str:
+        return None
+    try:
+        return (date.fromisoformat(str(date_str)) - date.today()).days
+    except (ValueError, TypeError):
+        return None
+
+
+def cmd_deadline_proximity(args, config, compact):
+    """Days-to-deadline for each active aspiration carrying a `deadline`.
+
+    Report-only, no mutation, fail-open — the same contract as the partner /
+    boredom / stash one-liners it sits beside in the iteration header.
+
+    COVERAGE IS REPORTED UNCONDITIONALLY, and that is the load-bearing half
+    (guard-963 partial-coverage corollary). Measured 2026-09-06: exactly 1 of
+    25 active aspirations carries a machine-readable `deadline`, so a bare
+    "asp-326 43d" line would read as complete deadline coverage while the
+    24 uncovered aspirations — including the ARC-clocked verticals, whose
+    2026-11-02 date lives only in PROSE — are silently absent from both this
+    surface and the scorer's `deadline_urgency` term, which computes 0 for
+    every one of them. Printing "1 of 25" keeps "checked one" distinguishable
+    from "checked all", which is the difference the reader needs.
+    """
+    active = _active_aspirations(compact)
+    clocked, malformed = [], []
+
+    for asp in active:
+        raw = asp.get("deadline")
+        if not raw:
+            continue
+        remaining = _days_until(raw)
+        if remaining is None:
+            malformed.append({"asp_id": asp.get("id"), "deadline": str(raw)})
+            continue
+        clocked.append({
+            "asp_id": asp.get("id"),
+            "title": (asp.get("title") or "")[:40],
+            "deadline": str(raw),
+            "days_remaining": remaining,
+        })
+
+    clocked.sort(key=lambda e: e["days_remaining"])  # nearest first
+
+    # NO FLAGS, DELIBERATELY — this lane is pure visibility (the goal's own
+    # instruction: "prefer visibility first"), and a flag here would be the
+    # guard-4794 shape: a `deadline_near` would re-present IDENTICALLY on
+    # every iteration for the whole week before a deadline, with no discharge
+    # path, training the reader to skim the flag list. `near` and `malformed`
+    # ride in the PAYLOAD instead, so a future consumer can act on them
+    # without re-deriving — and so adding the flag stays a deliberate choice
+    # rather than something this surface imposed on run-all's flag list.
+    flags = []
+    near = [e for e in clocked if e["days_remaining"] <= _DEADLINE_WARN_DAYS]
+
+    covered = len(clocked) + len(malformed)
+    head = ", ".join(
+        f"{e['asp_id']} {e['days_remaining']}d ({e['deadline']})" for e in clocked[:3]
+    ) or "none"
+    summary = (
+        f"deadline-proximity: {head} | coverage {covered} of {len(active)} "
+        f"active aspiration(s) carry a `deadline`"
+    )
+    if malformed:
+        summary += (
+            " | UNPARSEABLE: "
+            + ", ".join(f"{m['asp_id']}={m['deadline']!r}" for m in malformed)
+        )
+
+    return {
+        "subcommand": "deadline-proximity",
+        "summary": summary,
+        "flags": flags,
+        "clocked": clocked,
+        "near": near,
+        "malformed": malformed,
+        "coverage": {
+            "clocked": covered,
+            "active": len(active),
+            "uncovered": len(active) - covered,
+        },
+    }
+
+
+# BOTH registries, per the warning above: SUBCMDS is what gives this its CALL
+# SITE (run-all, Phase 0.5.0 — before Phase 1 SELECT, which is the property
+# that matters), DISPATCH is what makes it independently invocable. Every
+# other check is in both; a SUBCMDS-only entry would have no CLI name and a
+# DISPATCH-only entry would never fire.
+#
+# WHY NOT THE 0-pre.0 HEADER CLUSTER, which  literally asked for
+# ("beside the existing partner/boredom/stash one-liners"): those are
+# LLM-invoked Bash one-liners written as SKILL.md prose, and
+# .claude/skills/aspirations-precheck/SKILL.md is hot-path-budgeted AND the
+# LARGEST file in that corpus (132,324 B of 3,933,232 B at b4e6912f11).
+# core/githooks/commit-msg refuses a commit that grows a budgeted file, so
+# the literal placement costs a measured harm the framework actively
+# prevents. run-all already runs in the same precheck, ahead of selection,
+# and its summaries already surface — so the goal's INTENT (the clock is
+# visible before the pick) is met at zero prose cost. The verb is refused on
+# purpose; recorded here so a later reader does not "fix" the placement.
+SUBCMDS.append(("deadline-proximity", cmd_deadline_proximity))
+
 DISPATCH = {
+    "deadline-proximity": cmd_deadline_proximity,
     "run-all": cmd_run_all,
     "peer-thread-relay": cmd_peer_thread_relay,
     "claim-integrity": cmd_claim_integrity,

@@ -358,9 +358,9 @@ Bash: py -3 core/scripts/product-repo-freshness.py --pull
 # second orchestrator.
 #
 # WHAT IT COVERS, stated plainly because partial coverage read as total is the
-# failure this goal was filed about. The tick runs the five BOX-LEVEL probes:
-# daemon-health, mirror-wedge, freshness, clock-skew, memory-headroom. On a
-# worker box those had zero monitoring before this line existed.
+# failure this goal was filed about. The tick runs the six BOX-LEVEL probes in
+# WORKER_SAFE_PROBES (its banner prints the live set): daemon-health,
+# mirror-wedge, freshness, clock-skew, memory-headroom, git-drift.
 #
 # WHAT IT DOES NOT COVER — do not let this line be mistaken for stall detection:
 #   - The five reducer-shaped probes are FILTERED OUT, not merely inert. A worker
@@ -405,6 +405,10 @@ Bash: py -3 core/scripts/agent-watchdog.py --tick
 Bash: bash core/scripts/gate-firings-flush.sh
 # Fail-open; never branch on this rc. VERIFY IN THE SPOOL, never in the shared
 # firings store — an unmoved destination mtime is not evidence (guard-4040).
+# SIBLING LANE, same defect, same contract (g-358-79). Wired at BOTH
+# orchestrators because productivity-check is reducer-only, so a flush wired
+# there alone is dead on every worker box (guard-3448: assert reachability).
+Bash: bash core/scripts/trigger-firings-flush.sh
 
 # Phase 0.5 — REDUCER-LIVENESS POLL (g-306-125 mechanism 2). Runs at the top of
 # EVERY select cycle, before any claim. A worker whose reducer has died keeps
@@ -583,8 +587,13 @@ IF this Body's manifest reads `parked` (either trigger): the claim IS the resume
 # response IS the full goal record. The loop's only OTHER prompt to touch
 # these fields is the one that WRITES them (3.9), so skipping it puts the read
 # after work it would prevent. Workers are MOST claims.
-READ EVERY narrative field: `outcome_note`, `outcome_notes` (plural, guard-3512),
-  `progress_note`, `description`. An empty outcome_note is NOT an untouched goal
+READ EVERY narrative field, WHOLE: `outcome_note`, `outcome_notes` (plural,
+  guard-3512), `progress_note`, `description`, `release_negatives` when present
+  (typed: why the last Body let go; `kind: not-due` → check the cadence before
+  spending a pass; g-115-8163). Enumerate from the RECORD, not from this list —
+  it goes stale silently (guard-2283). They are APPEND-ORDERED — print
+  len() first and read to it; the corrective block sits at the END, which is what
+  a head read drops (guard-2043). An empty outcome_note is NOT an untouched goal
   — prior work hides in progress_note (g-364-54). Treat it as a measurement to
   VERIFY, not repeat; if it landed, close or release per Phase 4a.
 # Rationale: core/config/rationale/worker-claim-outcome-note-read.md

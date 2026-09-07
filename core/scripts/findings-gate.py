@@ -111,6 +111,112 @@ def _strip_leading_label(reference):
     reference. Applied to every signal's reference — harmless where absent."""
     return _LEADING_LABEL_RE.sub("", reference or "").strip()
 
+
+# ---------------------------------------------------------------------------
+# Title minting ()
+# ---------------------------------------------------------------------------
+# The DETECTION half of this gate is deliberately untouched by everything in
+# this section. What was wrong was the MINTING half: the title was a raw
+# `match_text[:50]` slice that begins AT the trigger keyword, so a sentence
+# REPORTING a finished diagnosis became an imperative HIGH blocker —
+# "Unblock: Fix ROOT CAUSE, measured not assumed: core/config/veri…".
+# Measured population (, world queue): 26 gate-filed goals, 22 HIGH,
+# 10 (38%) terminally `skipped`.
+TITLE_MAX_CHARS = 50
+TITLE_MIN_SUBSTANCE_ALNUM = 10
+
+HIGH_SIGNAL_TYPES = frozenset({"root_cause", "bug_identified", "investigation_finding"})
+
+# Connectives left dangling once the trigger phrase is removed ("root cause
+# ->is that<- the handler drops the fence").
+_LEADING_CONNECTIVE_RE = re.compile(r"^[\s,;:.\-—]+")
+_LEADING_COPULA_RE = re.compile(r"^(?:is|was|were|are)\s+(?:that\s+)?", re.IGNORECASE)
+
+# A diagnosis already ESTABLISHED is not an open blocker. These verbs standing
+# immediately after the trigger mark a note reporting a FINISHED diagnosis
+# ("root cause identified exactly", "ROOT CAUSE, measured not assumed") rather
+# than one naming live work. This is deliberately trigger-LOCAL: 
+# measured that a note-level veto (e.g. "the note cites a guardrail id") is far
+# too broad and trades this precision defect for a recall one. A genuinely open
+# finding reads "root cause IS x" / "root cause: x", which no verb here matches.
+_ESTABLISHED_RE = re.compile(
+    r"^(identified|confirmed|measured|established|found|traced|determined"
+    r"|diagnosed|isolated|located|understood|known|proven|verified)\b",
+    re.IGNORECASE,
+)
+
+
+def _truncate_on_word_boundary(text, limit=TITLE_MAX_CHARS):
+    """Truncate to `limit` WITHOUT cutting a token in half.
+
+    `text[:50]` split "core/config/verification-checklist.md" into
+    "core/config/veri…" — a title ending mid-token, which reads as corrupt and
+    is unsearchable. Cut back to the last space instead, dropping the token that
+    straddles the boundary.
+
+    NO RATIO GUARD. An earlier form kept the hard cut when cutting back would
+    discard more than half the budget, on the theory that such a text is one
+    long token. That is wrong whenever a SHORT phrase is followed by a LONG
+    token: "The loader reads core/config/verification-checklist.md" cut back to
+    "The loader reads" (16 of 50) tripped the ratio and shipped
+    "...core/config/verification-checklis…" — the exact defect, via the
+    investigation-override path, measured after the first fix landed. A shorter
+    title is a cost; a corrupt one is the bug. The only hard cut left is a text
+    with no space inside the budget at all, where nothing else is possible.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if not text[limit].isspace():  # the boundary lands inside a token
+        space = cut.rfind(" ")
+        if space > 0:
+            cut = cut[:space]
+    return cut.rstrip(" ,;:.-—") + "…"
+
+
+def _strip_leading_connective(text):
+    """Strip punctuation and copulas the trigger removal left dangling."""
+    out = (text or "").strip()
+    prev = None
+    while out != prev:
+        prev = out
+        out = _LEADING_COPULA_RE.sub("", _LEADING_CONNECTIVE_RE.sub("", out)).strip()
+    return out
+
+
+def mint_title(signal, match, source_goal):
+    """Return (title, priority, origin_prefix) for one signal.
+
+    The title is AUTHORED from the finding's substance — the match minus the
+    trigger phrase that detected it — never the raw slice that opens on the
+    keyword. Three shapes are refused as HIGH `Unblock: Fix …` titles:
+
+      * a slice truncated mid-token (fixed by `_truncate_on_word_boundary`);
+      * a bare trigger with nothing after it ("Unblock: Fix Root cause");
+      * a past-tense ESTABLISHED diagnosis, which reports closed work.
+
+    The refused ones are NOT dropped — dropping them would be the recall loss
+    g-115-9247 warns against. They file as MEDIUM `Investigate:` naming the
+    source goal, so a reader can open the note and decide. The raw match rides
+    along in that title to keep it distinguishable for `_title_similar` dedup.
+    """
+    if signal["type"] not in HIGH_SIGNAL_TYPES:
+        return f"Idea: {match}", "MEDIUM", "idea:"
+
+    substance = _strip_leading_connective(
+        _sanitize_fragment(signal.get("substance") or "") or match
+    )
+    nameable = len(re.sub(r"[^A-Za-z0-9]", "", substance)) >= TITLE_MIN_SUBSTANCE_ALNUM
+    if nameable and not _ESTABLISHED_RE.match(substance):
+        return f"Unblock: Fix {_truncate_on_word_boundary(substance)}", "HIGH", "unblock:"
+    return (
+        f"Investigate: {source_goal} outcome note reports "
+        f"{_truncate_on_word_boundary(match)}",
+        "MEDIUM",
+        "investigate:",
+    )
+
 # Five structural signal patterns. Each is (name, match_pattern, resolution_filter_pattern).
 # match_pattern is compiled case-insensitive. resolution_filter_pattern is also
 # case-insensitive and checked in the RESOLUTION_SUPPRESSION_CHARS window
@@ -283,9 +389,30 @@ def scan_signals(insight_text):
                     extra={"decision_path": "degenerate-match"},
                 )
                 continue
-            if len(reference) > 50:
-                reference = reference[:50].rstrip() + "…"
-            signals.append({"type": name, "match": reference})
+            # Title-minting inputs (). DETECTION IS UNCHANGED — these
+            # are additional fields on an already-emitted signal, read only by
+            # mint_title. `substance` is the match MINUS its trigger phrase, so
+            # the title can be authored from what the finding SAYS instead of
+            # opening on the keyword that detected it.
+            #
+            # The trigger span is derived from the pattern's OWN last capturing
+            # group, never from a second hand-kept copy of the trigger words: a
+            # re-listed copy drifts out of sync with SIGNAL_PATTERNS the moment
+            # either side changes, and nothing fails when it does (guard-2190).
+            # The five patterns close their trigger alternation at group 1 or 2;
+            # a groupless pattern (deferred_idea) yields "" and mint_title falls
+            # back to the full match, which is correct — it is not a HIGH type.
+            substance = (
+                match_text[m.end(match_re.groups) - m.start():]
+                if match_re.groups
+                else ""
+            )
+            reference = _truncate_on_word_boundary(reference)
+            signals.append({
+                "type": name,
+                "match": reference,
+                "substance": _sanitize_fragment(substance),
+            })
             # Pattern matched + resolution filter passed → this becomes a
             # child goal. "block" in telemetry semantics = gate fired and
             # caller acted on it ().
@@ -391,15 +518,10 @@ def make_child_goal(signal, source_goal, source_category, insight_text):
     # title carrying an embedded newline breaks display, token-overlap dedup, and
     # every line-oriented consumer downstream.
     match = _strip_leading_label(_sanitize_fragment(signal["match"]))
-    high_signal_types = {"root_cause", "bug_identified", "investigation_finding"}
-    if signal["type"] in high_signal_types:
-        title = f"Unblock: Fix {match}"
-        priority = "HIGH"
-        origin_prefix = "unblock:"
-    else:
-        title = f"Idea: {match}"
-        priority = "MEDIUM"
-        origin_prefix = "idea:"
+    # Title authoring lives in mint_title () — see its docstring for
+    # which fragment shapes are refused a HIGH `Unblock: Fix …` title and why
+    # they are re-routed rather than dropped.
+    title, priority, origin_prefix = mint_title(signal, match, source_goal)
     return {
         "title": title,
         "status": "pending",

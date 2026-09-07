@@ -21,6 +21,9 @@ all functions take explicit `world_dir` / `agent_dir` Path args so the
 daemon can pass per-request ctx paths (see .claude/rules/path-resolution.md
 "Standard for daemon endpoints").
 """
+
+from __future__ import annotations
+
 import json
 import os
 import sys

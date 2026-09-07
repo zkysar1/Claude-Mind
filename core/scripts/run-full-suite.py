@@ -1975,7 +1975,9 @@ def main(argv=None):
     if not argfile_ok:
         print("  @argfile unsupported by this pytest (fromfile_prefix_chars "
               "unset) -- chunk paths go on argv as REPO-RELATIVE paths "
-              "instead (fine on POSIX; see _pytest_expands_argfile, g-115-8876)")
+              "instead (fine on POSIX; see _pytest_expands_argfile -- the probe "
+              "and this fallback landed under g-115-8634 / a52c3ad6f; this "
+              "message was refined under g-115-8876)")
 
     combined = []
     tot_p = tot_f = tot_e = 0

@@ -27,7 +27,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS))
 
-from ground_truth_citation import analyze  # noqa: E402
+from ground_truth_citation import analyze, source_tokens  # noqa: E402
 
 GATE = SCRIPTS / "ground-truth-citation-gate.py"
 PROJECT_ROOT = SCRIPTS.parent.parent
@@ -274,7 +274,8 @@ def _load_entry_module():
     return mod
 
 
-def test_CONTROL_entry_returns_None_when_the_provenance_manifest_is_unreadable():
+def test_CONTROL_entry_returns_None_when_the_provenance_manifest_is_unreadable(
+        tmp_path):
     """guard-1760 at the ENTRY, not just in analyze().
 
     The unit control above proves `analyze` skips the decorative check when handed
@@ -287,7 +288,23 @@ def test_CONTROL_entry_returns_None_when_the_provenance_manifest_is_unreadable()
 
     Mutant that survived without this: `except Exception: return lambda: True`."""
     mod = _load_entry_module()
-    assert mod._retrieved_predicate("pytest-no-such-session") is None
+
+    # STUB the manifest empty rather than trusting the live filesystem to be
+    # empty (). Passing a never-existed sid does NOT isolate this:
+    # tracker_path falls back to the agent-wide session/context-reads.txt,
+    # whose existence varies by box and by compaction cycle -- so the live-fs
+    # form passed on one Body and failed on another, neither of them wrong.
+    stub = tmp_path / "context-reads.py"
+    stub.write_text(
+        "def read_provenance(session_id=None):\n    return []\n"
+        "def read_tracker(session_id=None):\n    return set()\n",
+        encoding="utf-8")
+    saved_scripts = mod.SCRIPTS
+    try:
+        mod.SCRIPTS = tmp_path
+        assert mod._retrieved_predicate("pytest-no-such-session") is None
+    finally:
+        mod.SCRIPTS = saved_scripts
 
     class _Boom:
         class util:
@@ -387,3 +404,100 @@ def test_CONTROL_a_fully_retrieved_citation_still_passes():
     """Without this, the three tests above are consistent with a gate that
     flags everything."""
     assert analyze(_PARTIAL_TEXT, retrieved=lambda k, v: True) == []
+
+
+def test_a_pass_count_ratio_is_not_a_source_token():
+    """A slash-joined run of bare numbers is a ratio, not a citation.
+
+    _NODE_KEY's segment class is ``[a-z0-9]+``, which admits all-digit segments,
+    so "suites 6/6 green" was extracted as a node-key and then adjudicated. It
+    names no file, no tree node and no URL, so it could only ever come back
+    uncited. Measured over the live world store BEFORE the fix (g-115-9059,
+    guard-3086): 3,033 goals / 1,584 outcome+progress notes yielded 11,507
+    node-key tokens, of which 2,055 (17.86%, 939 distinct) were this shape.
+
+    The exclusion must NOT rescue the claim. An entity-bearing fact line whose
+    only slash token is a ratio is genuinely uncited, so it stays flagged -- as
+    ``missing-citation``, the honest verdict, rather than as a decorative
+    citation of "6/6". Before the fix this returned decorative-citation.
+    """
+    line = ("Acme Corporation reported revenue of $4.2 billion in 2024, "
+            "suites 6/6 green.")
+    # non-vacuity: the ratio is the ONLY slash token, and it is now dropped.
+    assert source_tokens(line) == [], source_tokens(line)
+    text = "## Findings\n\n" + line + "\n"
+    # Same verdict either way -- nothing checkable is left to adjudicate.
+    for r in (True, False):
+        findings = analyze(text, retrieved=lambda k, v: r)
+        assert _kinds(findings) == ["missing-citation"], (r, findings)
+
+
+def test_CONTROL_a_ratio_does_not_suppress_a_real_node_key_beside_it():
+    """The exclusion is per-TOKEN, not per-line.
+
+    Tightening an extractor weakens a negative assertion (guard-1901): a dropped
+    token can take a cluster from a blocking finding to "no checkable token, no
+    finding", which is alarm suppression. This pins that a genuine node key
+    sitting on the same line as a ratio still satisfies the gate, so the
+    exclusion cannot widen into the neighbouring token.
+    """
+    line = ("Acme Corporation reported revenue of $4.2 billion in 2024 "
+            "(6/6 green), per system/daemon-only-architecture.")
+    # the neighbouring key survives extraction; the ratio does not.
+    assert source_tokens(line) == [
+        ("node-key", "system/daemon-only-architecture")], source_tokens(line)
+    text = "## Findings\n\n" + line + "\n"
+    assert analyze(text, retrieved=lambda k, v: True) == []
+    # NON-VACUITY CONTROL: a bare "== []" also passes when NO cluster forms at
+    # all -- the first draft of this test did exactly that and proved nothing.
+    assert _kinds(analyze(text, retrieved=lambda k, v: False)) == [
+        "decorative-citation"]
+
+
+def test_CONTROL_digit_bearing_paths_are_not_mistaken_for_ratios():
+    """Only an ENTIRELY numeric run is excluded.
+
+    Real citations carry digits all the time -- an API path, a versioned key, a
+    hyphenated slug with a number in it. If the exclusion keyed on "contains a
+    digit" instead of "is all digits and slashes" it would delete genuine
+    citations, which is the direction this gate must never fail in.
+    """
+    for token in ("runs/32023260302", "core/scripts/q4-provenance-sample",
+                  "system/asp-115-tail", "v1/watch-2026"):
+        line = (f"Globex Industries reported revenue of $2.1 billion in "
+                f"2025. [{token}]")
+        assert source_tokens(line) == [("node-key", token)], (
+            token, source_tokens(line))
+        text = "## Findings\n\n" + line + "\n"
+        assert analyze(text, retrieved=lambda k, v: True) == [], token
+        # NON-VACUITY: flipping retrieved must CHANGE the verdict, proving a
+        # real cluster was adjudicated rather than none forming at all.
+        assert _kinds(analyze(text, retrieved=lambda k, v: False)) == [
+            "decorative-citation"], token
+
+
+def test_a_ratio_beside_a_goal_id_falls_back_to_the_corpus_wide_policy():
+    """The measured consequence of the ratio exclusion, pinned deliberately.
+
+    Diffing findings pre/post across all 1,587 live notes at retrieved=False
+    (the worst case for suppression) found 18 notes that lose a blocking
+    finding. Every one of the 32 affected clusters retained ONLY goal-id (x28)
+    or board-msg+goal-id (x4) -- zero retained a url or node-key.
+
+    ``checkable`` is url/node-key only, so ``if not checkable: continue``
+    already declines to adjudicate goal-id-only clusters corpus-wide. The
+    phantom ratio was pulling these clusters OUT of that pre-existing policy
+    and into a verdict that could only ever fail. This pins the fall-back as
+    intended behaviour so a future reader does not "fix" it back into a
+    phantom -- and so that changing ``checkable`` breaks a test that explains
+    why, rather than silently shifting 18 verdicts.
+    """
+    line = ("Acme Corporation reported revenue of $4.2 billion in 2024, "
+            "suites 6/6 green, per g-115-9059.")
+    # the goal-id survives; the ratio does not; nothing checkable remains.
+    assert source_tokens(line) == [("goal-id", "g-115-9059")], source_tokens(line)
+    text = "## Findings\n\n" + line + "\n"
+    # NOT missing-citation: the cluster HAS a source token, so the
+    # `not cl.source_tokens` branch does not fire either.
+    for r in (True, False):
+        assert analyze(text, retrieved=lambda k, v: r) == [], r

@@ -888,10 +888,24 @@ _rt_record_elapsed() {
 # into every process environment.
 #
 # The file read is cached in this shell for the life of the sourcing script,
-# INCLUDING the negative result -- with no token configured (today's default on
-# every box) that is one failed open per script, not one per daemon call.
+# INCLUDING the negative result -- on a box with no token configured that is one
+# failed open per script, not one per daemon call.
 # Fail-open: unreadable or token-less .env.local yields "" -> no header ->
-# byte-identical to today's loopback behavior. Never echoes the value.
+# byte-identical to the loopback behavior of a token-less box. Never echoes the
+# value.
+#
+# THE TOKEN IS NOT UNSET EVERYWHERE, AND THIS COMMENT USED TO SAY IT WAS
+# (). It read "today's default on every box", which is a claim about the
+# FLEET, not about this function -- and it is false: measured 2026-09-05, cc-03
+# had MIND_API_TOKEN SET (every raw-urllib caller there 401'd) while cc-09 had it
+# in neither the ambient env nor .env.local. Both states are live at once.
+# The fail-open design above is correct and unchanged; what the stale premise did
+# was hide the consequence, because a reader checking "does my caller need a
+# bearer?" was told the answer is no everywhere. Three pytest-invisible tests
+# built raw urllib.request calls with no Authorization header on exactly that
+# reasoning and were dark on any token-set box. Read this function as
+# per-box conditional, never as a fleet default, and never treat a green run on a
+# token-less box as evidence that a caller needs no bearer.
 _rt_api_token() {
     if [ -n "${MIND_API_TOKEN:-}" ]; then
         printf '%s' "$MIND_API_TOKEN"

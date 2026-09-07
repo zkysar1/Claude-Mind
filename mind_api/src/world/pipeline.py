@@ -34,7 +34,7 @@ What this endpoint does NOT do:
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 from .. import file_locks  # noqa: F401 — installs core/scripts on sys.path at module load (rb-3868); explicit, NOT transitive
 from ..jsonl_cache import cache
@@ -44,6 +44,13 @@ from ..endpoints._jsonl_common import (
 
 
 VALID_STAGES = {"discovered", "active", "measurement-pending", "resolved", "archived"}
+
+# Spaced-repetition window, in days. Authoritative source is replay/SKILL.md Step 1
+# ("Skip if replayed within last 7 days") and Step 4.5, which stamps
+# next_review_date = today + 7. Named here because replay_candidates now enforces
+# the SAME window from `last_replayed`, and two hardcoded 7s that must agree is
+# how the pair silently drifts apart.
+REPLAY_WINDOW_DAYS = 7
 
 # The order the branches in read() are tried, and therefore the order in which a
 # caller passing two selectors gets one silently chosen for it. Declared here as
@@ -383,6 +390,30 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                     continue
             except (TypeError, ValueError):
                 pass
+            #  / guard-6125: the exclusion reads the FIELD PAIR, not
+            # next_review_date alone. A record stamped with last_replayed but a
+            # NULL next_review_date satisfies no date comparison, so the old
+            # single-field test could not hold it back at all and it re-entered
+            # the pool on every cycle regardless of how recently it was replayed.
+            # Measured 2026-09-06 on the live corpus (union 1651): 22 records
+            # carry last_replayed with next_review_date NULL, 0 carry the
+            # reverse, and 5 of the 22 were inside the window that day — i.e. the
+            # defense was one honor-system layer (Step 1's LLM-side skip), not
+            # the two "defense-in-depth" that replay/SKILL.md claims.
+            #
+            # Each field gets its OWN branch. Never `if next_review is None or
+            # <comparison>` — that hands the undefined case to whichever operator
+            # happens to sit beside it, so null's meaning flips when a neighbour
+            # is edited for an unrelated reason (guard-2024). Here an absent field
+            # simply contributes no exclusion, and the other field still gets its
+            # independent chance to exclude.
+            #
+            # Both reads are nested under replay_metadata; `replay` already is
+            # that dict. Reading either at top level would match every record and
+            # produce a large healthy-looking population rather than a zero
+            # (guard-5676).
+            excluded = False
+
             next_review = replay.get("next_review_date")
             if next_review:
                 try:
@@ -391,9 +422,26 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                     # ValueError would silently defeat the 7-day exclusion.
                     review_date = date.fromisoformat(str(next_review)[:10])
                     if review_date > today:
-                        continue
+                        excluded = True
                 except ValueError:
                     pass
+
+            if not excluded:
+                last_replayed = replay.get("last_replayed")
+                if last_replayed:
+                    try:
+                        # Same [:10] tolerance: last_replayed is written in BOTH
+                        # bare-date and ISO-timestamp form across the corpus, and
+                        # format is not a defect marker in either direction
+                        # (guard-6125) — so parse both rather than screening on shape.
+                        replayed_date = date.fromisoformat(str(last_replayed)[:10])
+                        if replayed_date > today - timedelta(days=REPLAY_WINDOW_DAYS):
+                            excluded = True
+                    except ValueError:
+                        pass
+
+            if excluded:
+                continue
             candidates.append(r)
         return json_response_pretty(candidates)
 

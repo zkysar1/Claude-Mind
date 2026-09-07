@@ -277,6 +277,34 @@ def _structured_gates(goal: dict) -> list:
     return gates
 
 
+def _prose_gates(goal: dict) -> list:
+    """The preconditions `_structured_gates` DROPS — plain strings.
+
+    `_structured_gates` keeps only dicts carrying a "type", because that is what
+    `predicate.evaluate_all` can evaluate. A STRING precondition is therefore
+    discarded, and for a string-only-gated goal `gates` comes back empty, so
+    `_is_shelved` takes its `if not gates` early return and reports NOT shelved —
+    no matter how definitively the precondition fails. `shelved` is then a
+    structural constant for that goal rather than a measurement (guard-1665
+    check 2: a filter that discards every record unconditionally).
+
+    This function does NOT fix that — a string is still unevaluatable, and
+    converting these to structured predicates is a separate and NOT-free change
+    (a naive `command_succeeds` wrapper around an existing reader exits 0 on the
+    empty case and silently INVERTS the gate; measured on both a null slot and an
+    empty list). What it enables is REPORTING the difference between "evaluated
+    and passing" and "could not evaluate", which is exactly what the sibling
+    sweep `precondition-defer-recheck.py` already does under `skipped_free_form`.
+
+    Measured population (g-115-4159, two live queues in one pass): of 11 recurring
+    goals declaring any precondition, 9 (82%) were all-prose — and the three
+    shortest intervals in the set were all in it, so the blindness concentrates
+    where re-selection frequency is highest.
+    """
+    return [p for p in ((goal.get("verification") or {}).get("preconditions") or [])
+            if isinstance(p, str) and p.strip()]
+
+
 def _is_shelved(goal: dict) -> tuple[bool, str | None]:
     """(shelved, failing_gate_type) — a currently-failing gate means parked.
 
@@ -373,6 +401,7 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
     """Return (starved_rows, stats). Pure enough to unit-test via `breaks`."""
     starved: list = []
     stats = {"examined": 0, "shelved": 0, "cadence_parked": 0,
+             "gates_unevaluatable": 0,
              "no_interval": 0, "basis_suppressed": 0,
              "unreadable_anchor": 0, "sources_seen": 0, "sources_unreadable": 0,
              "sources_empty_or_absent": 0, "sources_backend_fallback": 0,
@@ -479,12 +508,26 @@ def scan(multiplier: float, breaks: dict | None = None) -> tuple[list, dict]:
                     stats["shelved"] += 1
                     continue
 
+                # This goal is about to be reported STARVED. If it carries a
+                # prose precondition, nothing in this sweep evaluated it, so
+                # "starved" here means "past its time gate and not shelved by a
+                # gate we can read" — NOT "definitely has work to do". Count and
+                # carry the strings so the reader can tell the two apart; the
+                # classification is deliberately unchanged ( remedy a).
+                prose = _prose_gates(goal)
+                if prose:
+                    stats["gates_unevaluatable"] += 1
+
                 starved.append({
                     "goal_id": goal.get("id"),
                     "aspiration_id": asp.get("id"),
                     "source": source,
                     "title": (goal.get("title") or "")[:70],
                     "age_hours": round(age_h, 1),
+                    # The preconditions this sweep could NOT evaluate (plain
+                    # strings). Empty for a goal whose gates were all readable.
+                    # Non-empty means "starved" is an upper bound for this row.
+                    "unevaluatable_preconditions": prose,
                     "anchor_field": anchor_field,
                     # The anchor VALUE, not just its field name: it is the
                     # EPISODE identity the dedup key is built from
@@ -1035,11 +1078,28 @@ def main() -> int:
     print(f"[recurring-starvation] {len(starved)} starved of {stats['examined']} "
           f"examined (shelved={stats['shelved']} "
           f"cadence_parked={stats.get('cadence_parked', 0)} "
+          f"gates_unevaluatable={stats.get('gates_unevaluatable', 0)} "
           f"basis_suppressed={stats['basis_suppressed']} N={args.multiplier} "
           f"basis_sources={stats.get('sources_seen', 0)}){caveat}")
     for row in starved[:10]:
+        # basis_reason=="interval" means TWO different things and this line used
+        # to render them identically — the same conflation  fixed for
+        # the NOTIFICATION path (basis_note, ~L750) and missed here, on the line
+        # an operator actually reads. Measured cost (, 2026-09-06): a
+        # reviewer saw "basis 18.0h (interval)" beside basis_sources=5 and 128
+        # streak-break rows for  and filed a HIGH Unblock for a defect
+        # that does not exist — the p50 was 13.61h, BELOW the 18.0h declared
+        # cadence, so keeping the interval is correct and is pinned by
+        # test_streak_break_canary_basis L107-110. Same default-to-old-rendering
+        # posture as basis_note: rows are hand-built by tests, and a missing
+        # field must degrade to the old text, never to a wrong claim.
+        if row.get("basis_measured", True):
+            basis_tag = ("; demonstrated p50 <= declared"
+                         if row.get("basis_reason") == "interval" else "")
+        else:
+            basis_tag = "; UNMEASURED"
         print(f"    {row['goal_id']:<14} {row['age_hours']:>7}h = {row['ratio']:>6}x "
-              f"basis {row['basis_hours']}h ({row['basis_reason']}) "
+              f"basis {row['basis_hours']}h ({row['basis_reason']}{basis_tag}) "
               f"[declared {row['interval_hours']}h -> {row['declared_ratio']}x] "
               f"{row['title'][:44]}")
     if len(starved) > 10:

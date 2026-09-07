@@ -271,8 +271,10 @@ def test_unreadable_heartbeat_refuses(hb):
 
 
 def test_daemon_error_is_two_not_four():
-    """ok:false is a DAEMON ERROR (block exit 2 -> wrapper exit 1), which the
-    contract keeps distinct from REFUSE."""
+    """Per core/scripts/runner-claim.sh, ok:false is a DAEMON ERROR — that file's
+    summary block exits 2 on `not r.get("ok")` and its case arm maps that 2 to
+    wrapper exit 1 — which the contract keeps distinct from REFUSE.
+    """
     body = json.dumps({"backend": "own-cloud", "ok": False, "error": "AccessDenied Scan"})
     rc, out = _run("status", body)
     assert rc == 2, f"daemon error must be 2, got {rc}: {out!r}"
@@ -442,3 +444,165 @@ def test_the_real_emitter_output_is_readable_by_the_real_parser():
     _, old = _run("status", _claims_body(age=60, machine="cc-02"))
     assert _parse_machine(old) == "cc-02"
     assert _parse_token_fp(old) is None
+
+
+# ---------------------------------------------------------------------------
+# : python rc=1 (ANY uncaught exception) must be OP-AWARE.
+#
+# Every test above drives the extracted summary block and asserts the rc IT
+# returns. This fix lives one layer out — in the wrapper's `case $pyrc` mapping,
+# where rc=1 used to fall into the `*)` catch-all and become "raw echo, exit 0".
+# That mapping is correct for the three MUTATING ops (the daemon call succeeded;
+# only the summary rendering crashed) and is the fail-OPEN direction for
+# `status`, whose exit code IS the answer — a stack trace would be reported to
+# the caller as a live runner.
+#
+# So two things need pinning, and the first is what makes the second more than
+# decorative: that the crash is REACHABLE at all (the block really returns 1 on
+# a plausible shape), and that the wrapper then routes it by op.
+# ---------------------------------------------------------------------------
+
+def _resolved_bash() -> str:
+    """The bash binary, resolved the way every framework caller resolves it.
+
+    Never a bare "bash" argv[0]: on win32 CreateProcess searches System32 before
+    PATH, so it binds the WSL launcher and blocks forever on a dead LxssManager
+    (rb-5255 / the bare-bash-authoring gate).
+    """
+    if str(_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS))
+    from _runtime_bash import BASH
+    return BASH
+
+
+def _case_block() -> str:
+    """Extract the wrapper's live `case $pyrc in ... esac` rc-mapping block.
+
+    Read from the wrapper on every run, exactly as _summary_block() is, so this
+    test cannot drift from a stale copy of the mapping.
+    """
+    src = _WRAPPER.read_text(encoding="utf-8")
+    m = re.search(r"^(case \$pyrc in$.*?^esac$)", src, re.S | re.M)
+    assert m, "could not locate the `case $pyrc` mapping in runner-claim.sh"
+    return m.group(1)
+
+
+def _run_case(pyrc, op, response='{"raw":true}', summary="summary-text",
+              agent="alpha"):
+    """Drive the REAL extracted case block with a given python rc and op.
+
+    `agent=None` runs with AGENT ABSENT from the environment. The mapping must
+    not depend on it -- AGENT is consumed inside the summary block, never by the
+    case arms -- and the goal's own criterion asks for the sibling ops to be
+    proven in exactly that shape, matching the existing python-level
+    test_sibling_ops_unchanged_without_agent_env.
+    """
+    import shlex
+    script = (
+        "pyrc=%d\nOP=%s\nRESPONSE=%s\nSUMMARY=%s\n%s\n"
+        % (pyrc, shlex.quote(op), shlex.quote(response),
+           shlex.quote(summary), _case_block())
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("AGENT", "MIND_AGENT")}
+    if agent is not None:
+        env["AGENT"] = agent
+    p = subprocess.run([_resolved_bash(), "-s"], input=script,
+                       capture_output=True, text=True, env=env)
+    return p.returncode, (p.stdout + p.stderr)
+
+
+# MEASURED, not assumed: a probe over 10 response shapes run against this same
+# extracted block from core/scripts/runner-claim.sh on 2026-09-06 (hostname
+# cc-13, uname -r 6.8.0-138-generic,
+# both read verbatim in that session -- a nickname alone has named two different
+# machines before). The
+# goal named three expected triggers; TWO were FALSE. `claims` arriving as a
+# dict and `claims` entries as bare strings do NOT crash — the
+# `runner_stale_seconds is None` guard fires first and already refuses at rc=4,
+# as do claims-as-string, int entries, a string stale value and a string
+# heartbeat age. The one real trigger generalises WIDER than the goal described:
+# it is not about `claims` at all, it is TOP-LEVEL NOT A DICT, where `r.get`
+# raises before any claims handling is reached.
+@pytest.mark.parametrize("body,shape", [
+    ('[{"ok":true,"backend":"own-cloud"}]', "top-level JSON array"),
+    ('"just a string"', "top-level JSON string"),
+    ('42', "top-level JSON number"),
+])
+def test_toplevel_not_a_dict_reaches_rc1(body, shape):
+    """The TRIGGER must be reachable, or the wrapper arm below is decorative.
+
+    Source for every claim here: the summary block of core/scripts/runner-claim.sh,
+    which _summary_block() extracts and runs directly below -- so each statement is
+    re-checked against that file on every run rather than asserted from memory.
+    json.loads() succeeds on any of these, so the unparseable-body path (already
+    closed by g-306-118-b) never fires; the AttributeError lands on the very
+    first `r.get` in core/scripts/runner-claim.sh. This is the residue that arm
+    could not cover.
+    """
+    rc, out = _run("status", body)
+    assert rc == 1, f"expected an uncaught exception (rc=1) for {shape}; got {rc}: {out!r}"
+    assert "AttributeError" in out, f"expected the crash to surface: {out!r}"
+
+
+@pytest.mark.parametrize("body,shape", [
+    ('{"ok":true,"backend":"own-cloud","claims":{"alpha":{"state":"RUNNING"}}}',
+     "claims as a dict"),
+    ('{"ok":true,"backend":"own-cloud","claims":["alpha","bravo"]}',
+     "claims entries as bare strings"),
+    ('{"ok":true,"backend":"own-cloud","claims":"alpha"}', "claims as a string"),
+    ('{"ok":true,"backend":"own-cloud","claims":[1,2,3]}', "claims as ints"),
+])
+def test_claims_level_malformations_already_refuse_without_crashing(body, shape):
+    """BOUNDARY control: these were expected to crash and DO NOT.
+
+    Pinned deliberately. It records which half of the malformed-shape space was
+    already safe before the rc=1 arm existed, so a future reader does not re-file
+    this ground, and it fails loudly if the freshness guard that catches them is
+    ever moved below the claims handling.
+    """
+    rc, out = _run("status", body)
+    assert rc == 4, f"{shape} should already REFUSE at rc=4, got {rc}: {out!r}"
+    assert "REFUSE" in out, f"{shape} must refuse explicitly: {out!r}"
+
+
+def test_wrapper_maps_crash_to_refuse_for_status():
+    """`status` is the ASSERTING op: a crashed summary must refuse, never affirm.
+
+    rb-6448 is the governing lesson — for an asserting op over a polymorphic
+    backend the question is not what the siblings return, but whether silence
+    reads as YES or NO in the caller's hands. g-306-118-b applied exactly this to
+    three other fail-open status paths (the shared noop branch, an unparseable
+    body, a missing python launcher) and missed this one.
+    """
+    rc, out = _run_case(1, "status")
+    assert rc == 4, f"a crashed status must REFUSE with 4, got {rc}: {out!r}"
+    assert "REFUSE" in out, f"the refusal must be diagnosed, not silent: {out!r}"
+    assert "NOTHING" in out, f"diagnostic must say the result asserts nothing: {out!r}"
+
+
+@pytest.mark.parametrize("agent", ["alpha", None], ids=["agent-set", "agent-absent"])
+@pytest.mark.parametrize("op", ["acquire", "heartbeat", "release"])
+def test_wrapper_keeps_raw_echo_exit0_for_mutating_ops_on_crash(op, agent):
+    """The three MUTATING ops stay deliberately unchanged.
+
+    Their daemon call already succeeded and only the summary rendering crashed,
+    so degrading to a raw echo with exit 0 remains correct — the mutation
+    happened. Pinned so the status fix is not later over-applied to them.
+    """
+    rc, out = _run_case(1, op, agent=agent)
+    label = f"op={op} agent={'set' if agent else 'ABSENT'}"
+    assert rc == 0, f"{label} must stay exit 0 on a crashed summary, got {rc}: {out!r}"
+    assert "(raw)" in out, f"{label} must still raw-echo the response: {out!r}"
+
+
+@pytest.mark.parametrize("pyrc,op,want", [
+    (0, "status", 0),      # verdict rendered
+    (2, "status", 1),      # daemon op-level failure
+    (4, "acquire", 4),     # acquire held
+    (5, "release", 5),     # release unconfirmed
+    (3, "status", 0),      # unenumerated rc still hits the catch-all
+])
+def test_wrapper_other_rc_mappings_unchanged(pyrc, op, want):
+    """Regression: adding the rc=1 arm must not disturb any other mapping."""
+    rc, _ = _run_case(pyrc, op)
+    assert rc == want, f"pyrc={pyrc} op={op} mapped to {rc}, want {want}"

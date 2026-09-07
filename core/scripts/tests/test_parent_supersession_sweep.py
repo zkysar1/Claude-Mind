@@ -515,11 +515,24 @@ def _run_apply_capturing_metrics(monkeypatch, capsys, tmp_path,
     mod = _import_sweep()
     rows = []
     fields_written = []
+    scripts_used = []
     metrics_log = tmp_path / "metrics.jsonl"
 
     def _fake_py(args, input_text=None):
-        # [aspirations.py, --source, SRC, update-goal, GOAL, FIELD, VALUE]
-        field = args[5] if len(args) > 5 else ""
+        # TWO production argv shapes, and the field sits at a DIFFERENT index in
+        # each — so key on the SCRIPT, never on a fixed position ():
+        #   goal-field-append.py [--source SRC] GOAL FIELD MARKER TEXT
+        #   aspirations.py       [--source SRC] update-goal GOAL FIELD VALUE
+        # When the note write moved to the append helper, an index-5 fake read
+        # the idempotency MARKER as the field name and every arm below fell
+        # through to the best-effort branch — green code, wrong test. guard-920:
+        # a fake must replicate the literal production arg shape.
+        script = Path(str(args[0])).name
+        scripts_used.append(script)
+        if script == "goal-field-append.py":
+            field = args[4] if len(args) > 4 else ""
+        else:
+            field = args[5] if len(args) > 5 else ""
         fields_written.append(field)
         if field == "outcome_note":
             return (rc1, "", "child refused the note write" if rc1 else "")
@@ -549,6 +562,15 @@ def _run_apply_capturing_metrics(monkeypatch, capsys, tmp_path,
         "--output", "json", "--apply",
     ])
     assert mod.main() == 0
+    # ANTI-REGRESSION PIN (): the outcome_note write MUST go through
+    # the append helper, never a REPLACE via aspirations.py update-goal. The
+    # REPLACE is what `field_shrink_blocked` refused 27 times against one goal
+    # (, note 9,246 → 13,460 chars) across 5 agents on 2026-09-03/04,
+    # holding `applied` at 0 through 150 apply-runs that had candidates. Asserted
+    # here rather than per-test so every arm below inherits it.
+    if "outcome_note" in fields_written:
+        assert scripts_used[fields_written.index("outcome_note")] == \
+            "goal-field-append.py", scripts_used
     out = json.loads(capsys.readouterr().out)
     return out, rows, fields_written, metrics_log
 

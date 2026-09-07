@@ -200,3 +200,110 @@ def test_definition_forwards_if_goal_to_the_writer():
     assert "|| true" in body, (
         "|| true must stay — the writer's refusal path exits 0 by contract, and "
         "a nonzero rc from update means ITERATION failure")
+
+
+# ── : the pin above counted the WRONG THING ─────────────────────────
+# test_all_three_call_sites_forward_the_goal_id has a COUNT assertion, but its
+# predicate is `^\s*_checkpoint_refresh\s+\S` -- it counts REFRESH calls, not
+# `loop-state-save.sh update` invocations.  guarded ONE of SIX update
+# sites and this pin reported full coverage of all three of the sites it knew
+# about, forever. That is guard-1802's shape (a pin narrower than the population
+# it guards) turning on the fix itself. The pins below count the WRITER's
+# invocations instead, which is the population that can actually stamp a
+# checkpoint.
+
+
+def _raw_update_invocations():
+    """Every raw `loop-state-save.sh" update` invocation in iteration-close.sh,
+    each flattened across its line continuations so a trailing --if-goal on a
+    continued line is visible to a substring test."""
+    lines = ITERATION_CLOSE.read_text(encoding="utf-8").splitlines()
+    out = []
+    for i, ln in enumerate(lines):
+        if 'loop-state-save.sh" update' not in ln:
+            continue
+        buf, j = [ln], i
+        while lines[j].rstrip().endswith("\\") and j + 1 < len(lines):
+            j += 1
+            buf.append(lines[j])
+        out.append(" ".join(x.strip() for x in buf))
+    return out
+
+
+def _function_body(name):
+    text = ITERATION_CLOSE.read_text(encoding="utf-8")
+    return text.split(f"\n{name}() {{", 1)[1].split("\n}", 1)[0]
+
+
+def test_every_raw_update_invocation_forwards_an_identity():
+    """THE widened pin. A new `loop-state-save.sh update` added to this file
+    without --if-goal must fail HERE -- that is the whole protection, because
+    the guard in cmd_update is inert unless the caller passes the flag."""
+    invocations = _raw_update_invocations()
+    assert len(invocations) == 2, (
+        "expected exactly 2 raw `loop-state-save.sh update` invocations in "
+        "iteration-close.sh (_checkpoint_refresh and _checkpoint_update); found "
+        f"{len(invocations)}. A new raw call site must route through "
+        "_checkpoint_update instead, so it cannot omit the goal identity:\n"
+        + "\n".join(invocations))
+    for inv in invocations:
+        assert "--if-goal" in inv, (
+            f"raw update invocation does not forward a goal identity: {inv}")
+
+
+def test_checkpoint_update_takes_its_identity_as_a_mandatory_positional():
+    """The identity must be positional, not an optional flag: an optional
+    identity reproduces the defect the moment a caller forgets it."""
+    body = _function_body("_checkpoint_update")
+    assert 'local goal_id="${1-}"' in body, "the identity is not captured from $1"
+    assert "shift" in body, "the remaining args are not forwarded"
+    assert '--if-goal "$goal_id"' in body, "the writer is not given the identity"
+    assert "|| true" in body, (
+        "|| true must stay -- the writer's refusal path exits 0 by contract, and "
+        "a nonzero rc from update means ITERATION failure")
+
+
+def test_all_checkpoint_update_call_sites_pass_a_shell_expanded_identity():
+    """Every caller passes a variable, never a literal or an empty string."""
+    lines = [ln.strip() for ln in ITERATION_CLOSE.read_text(encoding="utf-8").splitlines()
+             if ln.strip().startswith("_checkpoint_update ")]
+    assert len(lines) == 5, (
+        f"expected 5 _checkpoint_update call sites, found {len(lines)}: {lines}")
+    for ln in lines:
+        arg = ln.split("_checkpoint_update ", 1)[1].split()[0]
+        assert arg.startswith('"$') and arg.endswith('"'), (
+            f"call site does not pass a shell-expanded identity: {ln}")
+
+
+def test_do_recover_scopes_to_the_checkpoint_gid_not_the_iteration_goal():
+    """guard-2373 mutation pin for a DELIBERATE split -- do not 'harmonize' it.
+
+    do_recover derives its goal entirely from the checkpoint ($_gid) and never
+    reads $GOAL_ID, which per g-306-161 "is empty or belongs to some other
+    iteration" when --phase recover runs. So the tempting single-identity fix
+    (one env var every site inherits) would REFUSE do_recover's own legitimate
+    writes and break recovery. This test goes red if someone rewrites either
+    do_recover site to "$GOAL_ID".
+    """
+    body = _function_body("do_recover")
+    calls = [ln.strip() for ln in body.splitlines()
+             if ln.strip().startswith("_checkpoint_update ")]
+    assert len(calls) == 2, f"expected 2 checkpoint writes in do_recover, got {calls}"
+    for ln in calls:
+        assert '_checkpoint_update "$_gid"' in ln, (
+            "do_recover must scope its checkpoint write to the goal it read OUT "
+            f"of the checkpoint, not to the iteration's $GOAL_ID: {ln}")
+    assert '_checkpoint_update "$GOAL_ID"' not in body, (
+        "do_recover must never scope a checkpoint write to $GOAL_ID")
+
+
+def test_do_verify_intent_complete_is_scoped():
+    """The site that motivated : intent_state=complete is what
+    do_recover keys on to commit or ROLL BACK, so an unscoped write here lets a
+    stale checkpoint's goal be rolled back on a later --phase recover."""
+    body = _function_body("do_verify")
+    assert '_checkpoint_update "$GOAL_ID" \\' in body or \
+           '_checkpoint_update "$GOAL_ID"' in body, "do_verify writes are unscoped"
+    assert 'loop-state-save.sh" update' not in body, (
+        "do_verify must not call the writer raw -- route through _checkpoint_update")
+    assert "intent_state=complete" in body, "the intent marker write vanished"

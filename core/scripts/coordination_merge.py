@@ -3136,7 +3136,7 @@ def _dump_tree_yaml(data) -> bytes:
                      allow_unicode=True, width=200).encode("utf-8")
 
 
-def _canonicalize_for_merge(obj):
+def _canonicalize_for_merge(obj, coerce_int_floats: bool = False):
     """Deep-canonicalize a merged _tree.yaml value so the serialized bytes are a
     pure function of CONTENT, independent of argument order (guard-907). Three
     normalizations, applied recursively BEFORE _dump_tree_yaml:
@@ -3145,12 +3145,22 @@ def _canonicalize_for_merge(obj):
          depending on which arg's object survived a _canon-tie dedup (Defect 1 —
          top-level, node-level, entity_index values, cross_references list-dicts,
          tree_growth_log entries, maintenance nested dicts all shared this).
-      2. integral float -> int (10.0 -> 10) — a count-like field carries the same
-         VALUE but different bytes as int vs float (Defect 2). A real tree.write_tree
-         file only ever has int counts (len(nodes)), so this is a no-op on canonical
-         input; it defends against a non-standard writer / hand-edit. Non-integral
-         floats (0.72 confidence) and bool (not a float) pass through untouched;
-         nan/inf raise on int() and are left as-is.
+      2. integral float -> int (10.0 -> 10) — OPT-IN via `coerce_int_floats`, and
+         OFF by default (g-115-4413). A count-like field carries the same VALUE but
+         different bytes as int vs float (Defect 2). The justification is TREE-SPECIFIC
+         and does not travel: a real tree.write_tree file only ever has int counts
+         (len(nodes)), so this is a no-op on canonical input there and defends against
+         a non-standard writer / hand-edit. It is NOT a no-op for the meta-index
+         handlers, whose stores carry genuine float lists and float scores —
+         backpressure.yaml active_monitors[].imp_k_samples is appended from
+         meta-backpressure.py and a learning_value of exactly 0.0 is common. MEASURED
+         before the fix: [1.0, 0.0, 0.5] -> [1, 0, 0.5], types [int, int, float]; and
+         the same silent coercion hit step_attribution clarity 1.0, audit_baselines
+         ratio 1.0 and skill_gaps score 1.0. So merge_tree opts IN and every meta-index
+         handler takes the default. Non-integral floats (0.72 confidence) and bool (not
+         a float) pass through untouched; nan/inf raise on int() and are left as-is.
+         Key sorting (1) and the date fold (3) stay UNCONDITIONAL — they are the actual
+         commutativity cure and no defect was measured in either.
       3. date/datetime -> isoformat str (Defect 3) — an UNQUOTED YAML date parses to
          datetime.date while the quoted form parses to str; both stringify to the
          same ISO text. tree.write_tree always quotes (str), so also a no-op on
@@ -3160,11 +3170,18 @@ def _canonicalize_for_merge(obj):
     so node-level dicts + scalars (b's helpers) are normalized without re-touching
     them. List ORDER is preserved (only dict keys sort) — tree_growth_log stays
     chronological. Idempotent: canonicalize(canonical) == canonical."""
+    # The flag MUST thread through both recursive arms. Every value this helper
+    # actually coerces is reached by recursion (a float lives inside a dict or a
+    # list, never at the top level of a merged doc), so dropping it here would
+    # leave the parameter provably inert while reading as a complete fix.
     if isinstance(obj, dict):
-        return {k: _canonicalize_for_merge(obj[k]) for k in sorted(obj)}
+        return {k: _canonicalize_for_merge(obj[k], coerce_int_floats)
+                for k in sorted(obj)}
     if isinstance(obj, list):
-        return [_canonicalize_for_merge(v) for v in obj]
+        return [_canonicalize_for_merge(v, coerce_int_floats) for v in obj]
     if isinstance(obj, float):
+        if not coerce_int_floats:
+            return obj
         try:
             if obj == int(obj):
                 return int(obj)
@@ -3297,7 +3314,8 @@ def merge_tree(local: bytes, remote: bytes) -> bytes:
         # raw input bytes, so two byte-differing-but-content-equal non-dicts
         # still converge either arg order (Defect 4).
         chosen = a if _canon(a) >= _canon(b) else b
-        return _dump_tree_yaml(_canonicalize_for_merge(chosen))
+        return _dump_tree_yaml(
+            _canonicalize_for_merge(chosen, coerce_int_floats=True))
     win, _lose = _order_by_ts(a, b, "last_updated")
     out = dict(win)  # LWW base — winner's key order + opaque top-level keys ride along
     # nodes: a/b per-node + structural reconcile
@@ -3336,7 +3354,10 @@ def merge_tree(local: bytes, remote: bytes) -> bytes:
     # when a value differs only in dict-key insertion order (survived a _canon-tie
     # dedup) or scalar TYPE. One pass normalizes the whole tree incl. node-level
     # dicts + scalars from a/b's helpers, so those need no per-site sort.
-    return _dump_tree_yaml(_canonicalize_for_merge(out))
+    # coerce_int_floats=True: merge_tree is the ONE caller the float->int fold was
+    # justified for (int counts from len(nodes)); the meta-index handlers take the
+    # default and keep their genuine floats ().
+    return _dump_tree_yaml(_canonicalize_for_merge(out, coerce_int_floats=True))
 
 
 # byte-deterministic without matching the domain writer's dump style.
@@ -4089,11 +4110,25 @@ def merge_backpressure(local: bytes, remote: bytes) -> bytes:
                 row["imp_k_samples"] = sa if len(sa) >= len(sb) else sb
             rebuilt[k] = row
         loose_m = {_canon(x): x for x in (la + lb)}  # content-keyed: order-free
+        # The loose half gets the writer's OWN status filter too ().
+        # Without it a row carrying no meta_change_id could never graduate, never
+        # be rolled back and never drain -- measured pre-fix, a loose
+        # {'note':'no-id','status':'graduated'} SURVIVED in the same run where the
+        # id-keyed {'meta_change_id':'m9','status':'graduated'} was correctly
+        # dropped. Only the STATUS half transfers: the tombstone check is keyed on
+        # meta_change_id, which is by definition what a loose row lacks, so there
+        # is nothing to look up for it. A non-dict loose row has no status to read
+        # and is kept -- dropping it would be a silent data loss this goal did not
+        # measure a need for.
         out["active_monitors"] = [
             rebuilt[k] for k in sorted(rebuilt, key=str)
             if str(rebuilt[k].get("status", "monitoring")) == "monitoring"
             and k not in tombstoned
-        ] + [loose_m[c] for c in sorted(loose_m)]
+        ] + [
+            loose_m[c] for c in sorted(loose_m)
+            if not isinstance(loose_m[c], dict)
+            or str(loose_m[c].get("status", "monitoring")) == "monitoring"
+        ]
 
     # Terminal canonicalization — the house cure for the sort_keys=False
     # key-order gap (; merge_tree applies it identically at both its
@@ -4582,6 +4617,23 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # (citation-credit-sweep.py, locked_append_jsonl claim-first rows) and no
     # prune/trim/rotate/rewrite path exists.
     "citation-credit-ledger.jsonl": merge_append_only_jsonl,
+    # utilization-correction audit ledger (): one row per correction
+    # filed through utilization-correct.sh, on any box. Multi-writer by design --
+    # every Body may correct a mis-credit on the shared reasoning-bank/guardrails
+    # records -- so unregistered it would safe-freeze on the first both-diverged
+    # conflict (rb-3150 class) and corrections would go unattributable, which is
+    # the whole thing this ledger exists to prevent.
+    #
+    # Append-only BY CONSTRUCTION rather than by later audit (guard-1816 asks for
+    # the certainty, not the ritual): the store is new, `_utilization_correct.py`
+    # is its only writer, it writes solely through `locked_append_jsonl`, and no
+    # prune/trim/rotate/rewrite path exists anywhere. Every row carries a random
+    # `correction_id`, so two genuinely distinct corrections can never be
+    # byte-identical -- the one way a line-union could silently collapse a real
+    # event. Deliberately NOT named `*-log.jsonl`: that basename pattern
+    # classifies a world file as MACHINE-LOCAL in `owncloud_sync`, which would
+    # keep each box's corrections to itself and make this registration moot.
+    "utilization-corrections.jsonl": merge_append_only_jsonl,
     # per-agent skill-invocation telemetry ledger (-e). Its SIBLING
     # store, the per-date health ledger, cannot appear in this basename-keyed
     # table at all -- see the third path-pattern branch in merge_handler_for.
@@ -4730,6 +4782,33 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # stub-expiry rewrite), so it takes the same handler rather than staying
     # the lone freeze-prone sibling.
     "program-evolution.jsonl": merge_evolution_stream,
+    # script-evolution-archive.jsonl (): the rotation sink store-hygiene
+    # creates the first time world/script-evolution.jsonl is swept. Registered in
+    # the SAME commit as that registry entry, per guard-1055 — the store is 2.7x
+    # over its new bound (13,337 lines vs max_lines 5000, measured cc-09
+    # 2026-09-05), so the sink is created on the FIRST sweep rather than someday,
+    # and an unregistered new shared own-cloud store wedges permanently at the
+    # both-diverged 412 (merge_handler_for returned None for this basename before
+    # this line). Same lesson the changelog/changelog-archive pair above records.
+    #
+    # merge_evolution_stream, NOT the merge_append_only_jsonl the 
+    # archive sinks take, and the divergence is deliberate: rotation MOVES a
+    # record between these two files at an arbitrary moment, so a record must
+    # merge identically wherever it currently sits. The rid-keyed handler is also
+    # the strictly safer half of the accepted rotate+union tradeoff — where the
+    # board/changelog comments accept "a both-diverged merge resurrects a
+    # rotated-out line, the next sweep re-archives it, at most a DUPLICATE in the
+    # archive", this one COLLAPSES that duplicate by revision_id instead of
+    # keeping both lines. It is a pure record-keyed merge with no live-file
+    # assumption, and stays commutative (guard-907): output sorted by
+    # (ts, revision_id, canon), a pure function of the merged content set.
+    # In practice archived records are immutable — the two rewriters
+    # (evolution-stub-expiry.py _STREAMS, evolution-complete.py) name only the
+    # LIVE basenames, and a stub cannot reach the archive anyway while the
+    # 5,000-line window (27 days at the measured rate) exceeds the 24h expiry
+    # deadline by ~27x. That invariant is the entry's, not this handler's: this
+    # handler is correct even if it stops holding.
+    "script-evolution-archive.jsonl": merge_evolution_stream,
     # meta/l1-pick-log.jsonl (): NOW writer-verified append-only —
     # _l1_pick.py open('a') + l1-domain-rename.py (self-documented "append");
     # leaves the DEFERRED list below.

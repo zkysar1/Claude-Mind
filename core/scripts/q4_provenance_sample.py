@@ -233,6 +233,65 @@ def sample_clusters(text: str, goal_id: str, artifact: str, n: int = DEFAULT_SAM
     return [c for _k, c in keyed[:max(0, int(n))]], len(clusters)
 
 
+def added_line_numbers(diff_text: str) -> set:
+    """NEW-side line numbers that a unified diff ADDS. Pure; no git, no I/O.
+
+    Split out from the CLI on purpose: the git invocation is environment, the
+    hunk arithmetic is the part that can be wrong, and only the second half is
+    worth pinning with fixtures.
+
+    Counts ONLY '+' lines. A context or removed line is not something this goal
+    authored, and the whole point of the scope is "lines this unit produced".
+    """
+    added, new_ln = set(), None
+    for line in (diff_text or "").splitlines():
+        if line.startswith("@@"):
+            # @@ -a,b +c,d @@  -- c is the NEW-side start; d defaults to 1.
+            try:
+                plus = [t for t in line.split() if t.startswith("+")][0]
+            except IndexError:
+                new_ln = None
+                continue
+            body = plus[1:].split(",")[0]
+            try:
+                new_ln = int(body)
+            except ValueError:
+                new_ln = None
+            continue
+        if new_ln is None:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added.add(new_ln)
+            new_ln += 1
+        elif line.startswith("-"):
+            pass                      # removed: consumes no NEW-side number
+        elif line.startswith("\\"):
+            pass                      # "\ No newline at end of file"
+        else:
+            new_ln += 1               # context line
+
+    return added
+
+
+def scope_text_to_lines(text: str, allowed: set) -> str:
+    """``text`` with every line NOT in ``allowed`` (1-based) blanked to "".
+
+    BLANKED, NOT DELETED, and that is the load-bearing choice: every finding
+    carries start_line/end_line, and deleting lines would renumber them so the
+    reported location pointed at the wrong place in the file a reviewer opens.
+    Blanking also breaks cluster CONTIGUITY at each boundary, which is exactly
+    the intent -- an authored claim must not absorb a neighbouring line some
+    earlier commit wrote.
+    """
+    if not allowed:
+        return ""
+    out = [ln if (i + 1) in allowed else ""
+           for i, ln in enumerate((text or "").splitlines())]
+    return "\n".join(out)
+
+
 def retrieved_predicate(session_id: Optional[str]) -> Optional[Callable]:
     """(kind, value) -> retrieved this session? None when unanswerable.
 
@@ -335,8 +394,120 @@ def retrieved_predicate(session_id: Optional[str]) -> Optional[Callable]:
     return _retrieved
 
 
+# Findings that make the verdict FAIL. `unadjudicable-citation` is deliberately
+# ABSENT: it reports a citation the provenance manifest structurally cannot record,
+# which is a check that never ran, not a check that failed ().
+BLOCKING_FINDING_KINDS = (
+    "missing-citation", "decorative-citation", "direction-contradiction")
+
+
+def expressible_predicate(session_id: Optional[str] = None) -> Optional[Callable]:
+    """(kind, value) -> COULD the manifest ever have recorded this citation?
+
+    Distinct from `retrieved_predicate`, which answers "was it recorded". This
+    answers "was the question even askable", and the split exists because the two
+    were conflated into one FAIL: a citation outside the recorder's scope reported
+    `decorative-citation`, asserting the session never fetched a source when in
+    truth nothing was ever asked. Measured 2026-09-05: 76.9% of git-tracked files
+    (9,727 / 12,657) are outside `is_in_scope_advisory`, `.claude/rules/*.md`
+    included -- a LOWER bound, since product repos and most of world/ are not in
+    the repo at all.
+
+    EVERY UNCERTAIN CASE RETURNS True (expressible), because True keeps the
+    decorative check ON. A citation is demoted only where the token positively
+    resolves to a real file that the recorder's own scope predicate excludes. In
+    particular a bare tree-node key ("system/daemon-only-architecture") resolves to
+    no file and therefore stays adjudicable -- it is recordable via a `#prov: node`
+    row, so demoting it would suppress a real alarm. Non-`node-key` kinds are all
+    recordable (`PROVENANCE_KINDS` carries url / search / node / board, fed by the
+    WebFetch/WebSearch-bound hook) and are never demoted.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_ctx_reads_expr_q4", SCRIPTS / "context-reads.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)                      # type: ignore
+        # Same guard-2138 defensive cancel as retrieved_predicate: context-reads.py
+        # arms a module-scope threading.Timer(10, os._exit(0)) that would kill any
+        # long-running host with status 0 and no traceback.
+        _t = getattr(mod, "_timer", None)
+        if _t is not None:
+            try:
+                _t.cancel()
+            except Exception:
+                pass
+        in_scope = getattr(mod, "is_in_scope_advisory", None)
+        if in_scope is None:
+            return None
+    except Exception:
+        return None
+
+    root = SCRIPTS.parent.parent
+    # The SAME WORLD_DIR the scope predicate itself was built from -- context-reads.py
+    # derives its world-side TRACKED_PREFIXES from this exact value, so resolution and
+    # scope can never disagree about where `world/` is (one source of truth, not two).
+    # None on an UNINITIALIZED first run; `_candidates` skips the world forms then.
+    world = getattr(mod, "WORLD_DIR", None)
+
+    def _candidates(tok):
+        """Every on-disk path this token could name, across BOTH governed roots.
+
+        THE WORLD ROOT IS NOT OPTIONAL, and omitting it is why an entire measured
+        citation class kept blocking. `world/` is an EXTERNAL path (it is NOT under
+        the repo), so `root / "world/telemetry/x.jsonl"` does not exist however real
+        the file is -- resolution found nothing, the token fell through to the
+        default-True fail-safe, and the citation reported `decorative-citation`.
+        Measured g-306-401: a `world/telemetry/**` file read IN FULL (15,804 B) and
+        cited for a claim it directly supports was still reported decorative.
+        """
+        yield root / tok
+        yield root / ("." + tok)
+        if world is not None and tok.startswith("world/"):
+            yield world / tok[len("world/"):]
+        # DELIBERATELY NOT a `world/knowledge/tree/<tok>` candidate for a BARE node
+        # key. It would resolve `system/daemon-only-architecture` to a real in-scope
+        # file and return True -- the SAME answer the default already gives, so it
+        # buys no verdict and no test could tell the two apart (guard-1866: a control
+        # returning the test's own value has no resolving power). It would also
+        # falsify this predicate's docstring, which explains that case as staying
+        # adjudicable BECAUSE it resolves to nothing. Left out on purpose.
+
+    def _expressible(kind, value):
+        if kind != "node-key":
+            return True
+        tok = str(value).strip().rstrip("/.,);")
+        if not tok or tok.startswith("/"):
+            return True
+        # The dotted candidate is not an edge case. `_NODE_KEY` starts at a \b, so a
+        # citation to `.claude/rules/read-before-edit` is tokenized WITHOUT its
+        # leading dot -- and `.claude/rules/**` is both outside advisory scope and
+        # among the most-cited evidence classes in framework goals, so skipping the
+        # dotted retry would leave the single largest demotable class undemoted while
+        # the code looked correct.
+        hits = []
+        for cand in _candidates(tok):
+            try:
+                if cand.exists():
+                    hits.append(cand)
+                elif cand.parent.is_dir():
+                    # _NODE_KEY does not capture a non-.md extension, so a citation
+                    # to `core/scripts/context-reads.py` arrives as
+                    # `core/scripts/context-reads`. Resolve the stem first.
+                    hits.extend(sorted(cand.parent.glob(cand.name + ".*")))
+            except OSError:
+                return True
+        if not hits:
+            return True
+        try:
+            return any(in_scope(str(h).replace("\\", "/")) for h in hits)
+        except Exception:
+            return True
+    return _expressible
+
+
 def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
-        session_id: Optional[str] = None, source_text: Optional[str] = None) -> dict:
+        session_id: Optional[str] = None, source_text: Optional[str] = None,
+        authored_ranges: Optional[dict] = None) -> dict:
     """Sample each artifact and resolve the sampled clusters' citations.
 
     Verdicts:
@@ -349,6 +520,7 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
                 and only one of them is evidence.
     """
     retrieved = retrieved_predicate(session_id)
+    expressible = expressible_predicate(session_id)
     result = {
         "goal_id": goal_id,
         "session_id": session_id,
@@ -359,6 +531,8 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
         "sampled_count": 0,
         "provenance_manifest": "readable" if retrieved else "unreadable-or-empty",
         "findings": [],
+        "unadjudicable_count": 0,
+        "authored_scoped": [],
         "direction": None,
         "verdict": "skipped",
         "skip_reason": None,
@@ -372,6 +546,20 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
             result["artifacts_missing"].append(str(a))
             continue
         result["artifacts_read"].append(str(a))
+        # AUTHORED SCOPE (class 5, ). `--artifact` means "a produced
+        # artifact", but for a code-change goal the produced thing is a HUNK, not
+        # the whole long-lived file -- so on any established file the sampler
+        # graded every prior author's lines as this goal's. Measured on :
+        # a one-hunk change at @@ -462,6 +462,28 @@ drew a FAIL on line 153, written
+        # two weeks earlier by a different goal. This is the SAME trust model the
+        # module already has -- the caller picks the artifacts, and "a caller that
+        # names a clean file gets a clean sample" -- narrowed from file to line.
+        # OPT-IN ONLY: absent `authored_ranges`, every byte below is unchanged.
+        allowed = (authored_ranges or {}).get(str(a))
+        if allowed is not None:
+            text = scope_text_to_lines(text, allowed)
+            result["authored_scoped"].append(
+                {"artifact": str(a), "authored_lines": len(allowed)})
         texts.append(text)
         lines = text.splitlines()
         sampled, total = sample_clusters(text, goal_id, str(a), n)
@@ -388,7 +576,8 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
             # reported uncited. A check that is wrong in the ALARM direction is how
             # a check gets switched off, so this slice is load-bearing, not tidiness.
             blob = "\n".join(lines[cl.start_line - 1:cl.end_line])
-            for f in analyze(blob, retrieved=retrieved):
+            for f in analyze(blob, retrieved=retrieved,
+                             expressible=expressible):
                 result["findings"].append({
                     "artifact": str(a), "kind": f.kind,
                     "start_line": cl.start_line, "end_line": cl.end_line,
@@ -408,14 +597,31 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
         # whose whole contract is to return a verdict.
         result["direction"] = direction_fidelity(source_text, "\n".join(texts))
 
-    if result["findings"]:
+    blocking = [f for f in result["findings"]
+                if f.get("kind") in BLOCKING_FINDING_KINDS]
+    unadjudicable = [f for f in result["findings"]
+                     if f.get("kind") == "unadjudicable-citation"]
+    result["unadjudicable_count"] = len(unadjudicable)
+    if blocking:
         result["verdict"] = "fail"
     elif result["sampled_count"] == 0:
         result["verdict"] = "skipped"
-        result["skip_reason"] = (
-            "no entity-bearing fact clusters in the artifact(s)"
-            if result["artifacts_read"] else
-            "no artifact could be read")
+        if not result["artifacts_read"]:
+            result["skip_reason"] = "no artifact could be read"
+        elif result["authored_scoped"]:
+            # Say SCOPING did this. A scoped-empty sample and a genuinely
+            # clean one are the two answers most easily confused, and the
+            # caller chose the narrowing -- so the reason has to name it or
+            # the narrowing becomes an invisible way to empty the check.
+            result["skip_reason"] = (
+                "no entity-bearing fact clusters in the AUTHORED lines of the "
+                "artifact(s) (%s). The sample was scoped to lines this goal "
+                "produced, so this is NOT a statement about the rest of the "
+                "file and NOT a pass (guard-1760)."
+                % ", ".join("%s: %d line(s)" % (d["artifact"], d["authored_lines"])
+                            for d in result["authored_scoped"]))
+        else:
+            result["skip_reason"] = "no entity-bearing fact clusters in the artifact(s)"
     elif retrieved is None:
         result["verdict"] = "skipped"
         result["skip_reason"] = (
@@ -423,6 +629,23 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
             "test could not run, so this is NOT a pass (guard-1760). Note that "
             "reads performed with `cat` in a Bash call are invisible to the "
             "manifest by construction (guard-4407).")
+    elif unadjudicable:
+        # NEITHER pass NOR fail, and the asymmetry is the whole point of the
+        # third verdict. Not FAIL: nothing was adjudicated, so "the source went
+        # unread" was never measured. Not PASS either: guard-1760 forbids
+        # reporting what a checker declined to look at as a pass, and that is the
+        # ORIGINAL direction of the guard, unchanged here. `skipped` is the
+        # module's existing name for "nothing checkable", and it exits 0, so an
+        # unrecordable citation stops blocking closes without ever being called
+        # verified ().
+        result["verdict"] = "skipped"
+        result["skip_reason"] = (
+            "%d of the sampled citation(s) are NOT ADJUDICABLE from the "
+            "provenance manifest -- the manifest structurally cannot record that "
+            "citation class, so the decorative test could not run on them. This is "
+            "NOT a pass (guard-1760) and NOT evidence any source went unread. "
+            "Read the unadjudicable-citation finding(s) for which tokens."
+            % len(unadjudicable))
     else:
         result["verdict"] = "pass"
     return result

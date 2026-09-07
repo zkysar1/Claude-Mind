@@ -174,6 +174,17 @@ GOAL_KNOWN_FIELDS = frozenset({
     'release_negatives',                 # 0  (g-115-8163 — see release() in
                                          #     mind_api/src/endpoints/aspirations_write.py)
     'requires_capability',               # 8
+    # g-115-8482: READER is goal-selector.py (_requires_fresh_session, wired
+    # symmetrically into collect_candidates and collect_blocked); WRITER is
+    # whoever marks a goal whose terminal step is a mandatory destructive
+    # cleanup, which is unsafe to BEGIN mid-session. Documented in
+    # goal-schemas.md 'Fresh-Session-Only Marker', so it qualifies under BOTH
+    # rules (a) and (b) above. 0 at introduction BY CONSTRUCTION — the reader
+    # ships first and the field is inert until a goal carries it. Registering
+    # it here is NOT optional bookkeeping: the update endpoint REFUSES an
+    # unknown field name, so without this line the marker cannot be set at all
+    # and the suppressor is shipped-but-unreachable (guard-1943 class).
+    'requires_fresh_session',            # 0 (new)
     'resolves_by',                       # 196
     'resolves_no_earlier_than',          # 194
     'revenue_link',                      # 29

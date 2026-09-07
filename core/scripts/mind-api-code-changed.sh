@@ -25,6 +25,7 @@
 #                                            core/scripts/aspirations.py
 #                                            core/scripts/peer_surface.py
 #                                            core/scripts/git_ref_claim.py
+#                                            core/scripts/liveness_check.py
 #
 #      peer_surface.py added 2026-08-14 (): board_write.py's post
 #      handler now imports suspected_routing_tags from it for the routing-tag
@@ -33,6 +34,16 @@
 #      import — without this entry a commit touching ONLY peer_surface.py
 #      would diff clean, post-commit would skip the restart, and the daemon
 #      would serve the old matcher.
+#
+#      liveness_check.py added 2026-09-05 (, reducer carrier drain on
+#      hostname cc-04). Same shape as peer_surface above and found the same way:
+#      core/scripts/gates/reallocation_exempt.py:223 does `import liveness_check
+#      as _lc`, and core/scripts/gates IS in the pathspec — so the GATE triggers a
+#      restart while the module it imports does not. A commit touching ONLY
+#      liveness_check.py therefore diffs clean, post-commit skips the restart, and
+#      the daemon keeps serving the OLD partner-liveness verdicts that
+#      check-team-state-before-silent.md depends on. Surfaced by
+#      test_daemon_import_surface.py as an UNOWNED red during an unrelated merge.
 #
 #      predicate.py + aspirations.py added 2026-08-08 (, reducer pass on
 #      hostname cc-04, uname -r 6.8.0-136-generic). Both entered the daemon surface
@@ -183,6 +194,7 @@ DAEMON_PATHSPEC=(
     core/scripts/aspirations.py
     core/scripts/peer_surface.py
     core/scripts/git_ref_claim.py
+    core/scripts/liveness_check.py
 )
 
 # --print-pathspec: emit the boundary, one entry per line, exit 0. For consumers

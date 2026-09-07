@@ -69,6 +69,8 @@ never a prefix slice (guard-3712).
 import re
 from datetime import datetime
 
+from _dt import parse_naive_iso  # shared tzinfo-stripping naive-ISO parse ()
+
 # Mirrors insight-trigger-sweep.TERMINAL_GOAL_STATES, itself synced to the SSOT
 # aspirations.TERMINAL_GOAL_STATUSES (). A goal in any of these is done
 # with; only non-terminal goals can be stranded.
@@ -239,9 +241,8 @@ def build_peer_ack_index(board_rows, registry, self_env, roster):
 
 
 def _age_days(created_at, now=None):
-    try:
-        ts = datetime.fromisoformat(str(created_at).replace("Z", ""))
-    except (ValueError, TypeError):
+    ts = parse_naive_iso(created_at)
+    if ts is None:
         return None
     return round(((now or datetime.now()) - ts).total_seconds() / 86400.0, 1)
 

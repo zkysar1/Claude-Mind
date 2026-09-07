@@ -103,7 +103,16 @@ def test_custom_valid_scopes():
 
 def test_canonical_scope_set_unchanged():
     """If the canonical set ever changes, this test reminds the author to
-    update aspirations.py's duplicate VALID_USER_LEG_SCOPES constant."""
+    update aspirations.py's duplicate VALID_USER_LEG_SCOPES constant.
+
+    THE `==` IS EXACT ON PURPOSE — do not relax it to a subset/superset check
+    to clear a red. An exact set assertion catches TWO classes: a rename/drop,
+    AND an addition nobody intended. Relaxing it keeps the first and silently
+    retires the second forever, and because the test then passes, nothing ever
+    surfaces what was given up (guard-4223). When a legitimate addition lands,
+    RESTATE this literal at its new size instead: print the running set, diff
+    it into added/renamed/dropped, and stop if dropped is non-empty.
+    """
     assert VALID_USER_LEG_SCOPES == frozenset({
         "commit", "push", "deployment-approval",
         "architecture-decision", "credential-grant",
@@ -112,4 +121,10 @@ def test_canonical_scope_set_unchanged():
         # aspirations.py VALID_USER_LEG_SCOPES was updated in the same change —
         # which is exactly what this pin exists to remind the author to do.
         "principal-identity",
+        # Added 2026-08-28 (50e45661cf, ), landed on main 2026-09-07
+        # by the  worker-ref drain. BOTH modules were synced in that
+        # change (user_leg_scope.py and aspirations.py each read 9, identical
+        # sets — measured) and this pin was the third site, missed. Restated
+        # per guard-4223: added=['human-window'], dropped=[] at restate time.
+        "human-window",
     })

@@ -526,8 +526,48 @@ cap_log_file() {
     return 0
 }
 
+# --- platform / shell resolution (MEMOIZED) --------------------------------
+# The block below produces exactly ONE durable value -- MIND_SHELL -- out of
+# `uname -s` plus up to three `cygpath` calls. Those inputs are MACHINE
+# CONSTANT, but this file is sourced by all eleven PreToolUse[Bash] hooks on
+# EVERY Bash tool call, so the cost was paid eleven times per call.
+#
+# Measured 2026-09-06 (alpha, DESKTOP-O91DLK2, 5 runs each): `uname -s`
+# 843-1318 ms, `cygpath` 325-772 ms, `dirname` 172-752 ms. That is ~10 s of
+# pure `uname` per Bash tool call, and a large part of why a Bash call on this
+# box appears to hang.
+#
+# The memo stores the verdict so a repeat source costs ZERO subprocesses.
+# NOTHING IS REMOVED: a missing memo, a memo older than this file, a memo whose
+# recorded shell no longer exists, or MIND_SKIP_PLATFORM_MEMO=1 all fall
+# through to the original detection, unchanged, below. Delete
+# core/scripts/.platform-memo.sh to force re-detection.
+_MIND_PLAT_MEMO="$SCRIPT_DIR/.platform-memo.sh"
+_MIND_PLAT_DONE=0
+if [ -n "${MIND_SHELL:-}" ]; then
+    _MIND_PLAT_DONE=1        # caller already exported it -- nothing to detect
+elif [ "${MIND_SKIP_PLATFORM_MEMO:-}" != "1" ] \
+     && [ -r "$_MIND_PLAT_MEMO" ] \
+     && [ "$_MIND_PLAT_MEMO" -nt "${BASH_SOURCE[0]}" ]; then
+    source "$_MIND_PLAT_MEMO" 2>/dev/null || true
+    # Revalidate with a BUILTIN test. The memo carries the POSIX form for
+    # exactly this purpose, so confirming the binary still exists costs no
+    # cygpath spawn. A moved or removed Git install fails here and re-detects.
+    if [ "${_MIND_PLAT_KIND:-}" = "other" ]; then
+        _MIND_PLAT_DONE=1
+    elif [ -n "${MIND_SHELL:-}" ] && [ -n "${_MIND_PLAT_POSIX:-}" ] \
+         && [ -x "$_MIND_PLAT_POSIX" ]; then
+        _MIND_PLAT_DONE=1
+    else
+        unset MIND_SHELL     # stale memo -- fall through to full detection
+    fi
+fi
+
+if [ "$_MIND_PLAT_DONE" = "0" ]; then
+_MIND_PLAT_KIND=other
 case "$(uname -s 2>/dev/null)" in
     MINGW*|MSYS*|CYGWIN*)
+        _MIND_PLAT_KIND=windows
         if [ -z "${MIND_SHELL:-}" ] && command -v cygpath &>/dev/null; then
             _bash_abs="$(cygpath -m "$(command -v bash)" 2>/dev/null)"
             # rb-1472: prefer the login-launcher bin/bash.exe over the raw
@@ -543,8 +583,14 @@ case "$(uname -s 2>/dev/null)" in
             if [ "$_bash_bin" != "$_bash_abs" ] && [ -x "$(cygpath -u "$_bash_bin" 2>/dev/null)" ]; then
                 _bash_abs="$_bash_bin"
             fi
-            if [ -n "$_bash_abs" ] && [ -x "$(cygpath -u "$_bash_abs" 2>/dev/null)" ]; then
-                export MIND_SHELL="$_bash_abs"
+            # Same test as before; the POSIX form is now KEPT (not discarded
+            # inside the test) so the memo can revalidate it later with a
+            # builtin -x instead of re-spawning cygpath.
+            if [ -n "$_bash_abs" ]; then
+                _MIND_PLAT_POSIX="$(cygpath -u "$_bash_abs" 2>/dev/null)"
+                if [ -n "$_MIND_PLAT_POSIX" ] && [ -x "$_MIND_PLAT_POSIX" ]; then
+                    export MIND_SHELL="$_bash_abs"
+                fi
             fi
             unset _bash_abs _bash_bin
         fi
@@ -557,3 +603,21 @@ case "$(uname -s 2>/dev/null)" in
         fi
         ;;
 esac
+
+    # Memoize ONLY a conclusive verdict: a resolved shell, or a platform where
+    # there is genuinely nothing to resolve. A FAILED Windows detection is
+    # deliberately NOT memoized -- it must retry on the next source, and the
+    # TTY warning above must keep firing rather than being cached into silence.
+    if [ "${MIND_SKIP_PLATFORM_MEMO:-}" != "1" ] \
+       && { [ "$_MIND_PLAT_KIND" = "other" ] || [ -n "${MIND_SHELL:-}" ]; }; then
+        {
+            printf '_MIND_PLAT_KIND=%q\n' "$_MIND_PLAT_KIND"
+            [ -n "${MIND_SHELL:-}" ] && \
+                printf 'export MIND_SHELL=%q\n' "$MIND_SHELL"
+            [ -n "${_MIND_PLAT_POSIX:-}" ] && \
+                printf '_MIND_PLAT_POSIX=%q\n' "$_MIND_PLAT_POSIX"
+            :
+        } > "$_MIND_PLAT_MEMO" 2>/dev/null || true
+    fi
+fi
+unset _MIND_PLAT_MEMO _MIND_PLAT_DONE _MIND_PLAT_KIND _MIND_PLAT_POSIX

@@ -409,3 +409,258 @@ def test_allcommon_waiver_is_not_green_by_default(monkeypatch):
     assert r["decision"] == "FILE", (
         "with the waiver disabled the all-common owner should not be cited; it "
         "was: %s" % r["cited_goal_id"])
+
+
+# --- BATCH MODE (): ONE corpus read, N records, and a DECLINE
+#     against a terminal-but-not-done owner is a READING ASSIGNMENT ----------
+#
+# gap-162's encounter log states the requirement this section pins, verbatim:
+# "a DECLINE has to be re-read against the cited owner's STATUS and CLAIM,
+# never accepted on rc=3 alone - both real work items were hiding behind a
+# well-formed decline". In that encounter two live observations were suppressed
+# by a decline citing , whose own outcome_note asserts the OPPOSITE
+# claim to the observations it was suppressing; both were real, unowned work
+# (filed as  and ). guard-5147: a false DECLINE is the
+# silent, PERMANENT failure direction -- nothing ever re-opens it.
+#
+# guard-4166 governs here exactly as it does above: every MUST-READ assertion
+# runs in the SAME batch against the SAME corpus as a FILE control, so an
+# implementation that flagged everything would fail these tests rather than
+# pass them silently.
+
+SKIPPED_OWNER = dict(COMPLETED_OWNER, id="g-115-7803", status="skipped")
+
+
+# --- extract_subject: the slot has NO schema (guard-4044) -------------------
+
+def test_extract_subject_reads_every_alternate_key():
+    """The spark_capture slot is schemaless, so `observation` is one of several
+    shapes that actually occur. Reading the literal key only is how records go
+    missing without anything erroring -- an empty sweep and a blind one are
+    indistinguishable afterwards."""
+    for key in sq.OBSERVATION_KEYS:
+        text, used = sq.extract_subject({key: "  a real observation  "})
+        assert text == "a real observation", (key, text)
+        assert used == key, (key, used)
+
+
+def test_extract_subject_prefers_the_declared_key_order():
+    """Deterministic precedence, so the reported key distribution is a fact
+    about the records rather than about dict iteration order."""
+    rec = {"content": "second choice", "observation": "first choice"}
+    assert sq.extract_subject(rec) == ("first choice", "observation")
+
+
+def test_extract_subject_handles_bare_string_and_unreadable_shapes():
+    """A bare string IS its own subject (that shape occurs in the slot). Blank
+    and non-mapping shapes return (None, None) so the caller counts them as
+    unreadable instead of scoring an empty subject against the whole corpus."""
+    assert sq.extract_subject("bare relay text") == ("bare relay text",
+                                                     "<bare-string>")
+    assert sq.extract_subject({"goal_id": "g-1"}) == (None, None)
+    assert sq.extract_subject({"observation": "   "}) == (None, None)
+    assert sq.extract_subject("   ") == (None, None)
+    assert sq.extract_subject(None) == (None, None)
+    assert sq.extract_subject(42) == (None, None)
+
+
+# --- the reading assignment -------------------------------------------------
+
+def test_batch_flags_terminal_owner_must_read_while_control_still_files():
+    """THE REGRESSION ( outcome 3 / check 2). Both records ride the
+    SAME batch against the SAME corpus, so an implementation that flagged
+    everything fails on the second row rather than passing silently."""
+    res = sq.batch_decide([{"observation": RELAY}, {"observation": UNOWNED}],
+                          [SKIPPED_OWNER], NOW, SESSION_START)
+    flagged, control = res["rows"]
+    assert flagged["verdict"] == "MUST-READ", flagged
+    assert flagged["must_read"] is True, flagged
+    assert control["verdict"] == "FILE", control
+    assert control["must_read"] is False, control
+    assert res["must_read_count"] == 1, res
+    assert res["file_count"] == 1, res
+
+
+def test_batch_must_read_row_carries_owner_status_and_title():
+    """Outcome 3 literally: the output "surfaces each cited owner's STATUS and
+    TITLE". A bare file/decline verdict FAILS check 2 of the goal -- the reader
+    cannot re-derive the owner's claim from a verdict alone."""
+    row = sq.batch_decide([{"observation": RELAY}], [SKIPPED_OWNER],
+                          NOW, SESSION_START)["rows"][0]
+    assert row["cited_goal_id"] == "g-115-7803", row
+    assert row["cited_status"] == "skipped", row
+    assert row["cited_title"] == SKIPPED_OWNER["title"], row
+
+
+def test_batch_must_read_test_is_not_green_by_default(monkeypatch):
+    """MUTATION PROOF (guard-2903). Empty the must-read set and the same row
+    must fall back to a plain DECLINE -- proving the flag, and not some other
+    path, is what produced MUST-READ in the two tests above."""
+    monkeypatch.setattr(sq, "MUST_READ_STATUSES", ())
+    row = sq.batch_decide([{"observation": RELAY}], [SKIPPED_OWNER],
+                          NOW, SESSION_START)["rows"][0]
+    assert row["verdict"] == "DECLINE", (
+        "with the must-read set emptied this row should be a plain DECLINE; it "
+        "was %s, so the tests above pass for some other reason" % row["verdict"])
+
+
+def test_batch_completed_owner_declines_without_a_reading_assignment():
+    """The boundary that keeps MUST-READ meaningful. A COMPLETED owner is a
+    LEGITIMATE decline -- that is the g-115-8007 fix this file opens with -- so
+    only terminal-but-NOT-done statuses become reading assignments. Widening
+    must-read to every terminal status would re-open the duplicate-filing hole
+    that fix closed."""
+    row = sq.batch_decide([{"observation": RELAY}], [COMPLETED_OWNER],
+                          NOW, SESSION_START)["rows"][0]
+    assert row["verdict"] == "DECLINE", row
+    assert row["must_read"] is False, row
+    assert row["cited_status"] == "completed", row
+
+
+# --- the walk survives its own inputs --------------------------------------
+
+def test_batch_malformed_record_is_counted_and_the_walk_continues():
+    """guard-1512: one malformed record must not abort the store walk. The
+    record AFTER the bad one is the assertion that matters -- a walk that dies
+    mid-list silently disables the sweep for everything downstream, and reports
+    a shorter table rather than an error."""
+    res = sq.batch_decide([{"goal_id": "g-bad"}, {"observation": UNOWNED}],
+                          [SKIPPED_OWNER], NOW, SESSION_START)
+    bad, good = res["rows"]
+    assert bad["verdict"] == "UNREADABLE", bad
+    assert good["verdict"] == "FILE", good
+    assert res["population"]["records_unreadable"] == 1, res["population"]
+    assert res["population"]["records_scored"] == 1, res["population"]
+
+
+def test_batch_emits_one_unclipped_row_per_input_record():
+    """guard-5893: a dedup probe clipped to the first N is not a dedup probe --
+    the records it drops are exactly the ones nobody then reads."""
+    records = [{"observation": UNOWNED + " variant %d" % i} for i in range(25)]
+    res = sq.batch_decide(records, [SKIPPED_OWNER], NOW, SESSION_START)
+    assert len(res["rows"]) == 25, len(res["rows"])
+    assert [r["index"] for r in res["rows"]] == list(range(25))
+
+
+def test_render_batch_prints_every_row_and_states_the_population():
+    """guard-5893 (no clipping) + guard-3696 (state the POPULATION behind a
+    corpus measurement). Without the population line a clean sweep and a sweep
+    that scanned nothing render identically."""
+    records = [{"observation": UNOWNED + " variant %d" % i} for i in range(25)]
+    res = sq.batch_decide(records, [SKIPPED_OWNER], NOW, SESSION_START)
+    text = sq.render_batch(res)
+    for i in range(25):
+        assert ("[%d]" % i) in text, "row %d missing from the rendered table" % i
+    assert "POPULATION: 25 record(s) in, 25 scored, 0 unreadable" in text, text
+    assert "against 1 corpus goal(s)" in text, text
+
+
+def test_render_batch_names_the_owner_and_the_reading_obligation():
+    """The rendered table is what a reader actually acts on, so the STATUS, the
+    TITLE and the obligation must survive rendering -- not merely exist in the
+    returned dict."""
+    res = sq.batch_decide([{"observation": RELAY}], [SKIPPED_OWNER],
+                          NOW, SESSION_START)
+    text = sq.render_batch(res)
+    assert "MUST-READ" in text, text
+    assert "g-115-7803" in text, text
+    assert "STATUS=skipped" in text, text
+    assert SKIPPED_OWNER["title"] in text, text
+    assert "guard-5147" in text, text
+
+
+# --- the positive control must be ALIEN, not merely odd-sounding -----------
+
+def test_positive_control_subject_is_alien_not_merely_nonsense_sounding():
+    """guard-5889: ordinary English like 'resurfacing' or 'audit' IS corpus
+    vocabulary and will match. The control only proves this probe can still say
+    FILE if its tokens cannot appear in any corpus -- so it must FILE even
+    against the sponge, a record built to overlap everything."""
+    r = sq.decide(sq.POSITIVE_CONTROL_SUBJECT,
+                  _big_corpus() + [_sponge_record()], NOW, SESSION_START)
+    assert r["decision"] == "FILE", r
+
+
+# --- exit codes -------------------------------------------------------------
+
+def test_batch_exit_code_4_separates_must_read_from_decline(monkeypatch,
+                                                            capsys, tmp_path):
+    """4 = "N records need READING before any disposition", distinct from 3 =
+    "an owner exists" and 0 = file. Collapsing them makes each readable as the
+    other -- the same reason DECLINE is 3 and not 1 above."""
+    import json as _json
+    subjects = tmp_path / "subjects.json"
+
+    subjects.write_text(_json.dumps([{"observation": RELAY}]), encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(_json.dumps([SKIPPED_OWNER])))
+    assert sq.main(["--subjects-file", str(subjects), "--now", NOW.isoformat(),
+                    "--session-start", SESSION_START.isoformat()]) == 4
+    capsys.readouterr()
+
+    subjects.write_text(_json.dumps([{"observation": UNOWNED}]),
+                        encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(_json.dumps([SKIPPED_OWNER])))
+    assert sq.main(["--subjects-file", str(subjects), "--now", NOW.isoformat(),
+                    "--session-start", SESSION_START.isoformat()]) == 0
+    capsys.readouterr()
+
+
+def test_main_requires_exactly_one_subject_source(capsys, tmp_path):
+    """required=True on --subject would make batch mode unreachable; no check
+    at all lets a caller silently take the single-subject path while believing
+    it ran a batch, and get one verdict where it expected N rows. The refusal
+    fires BEFORE stdin is read, so neither call needs a corpus."""
+    import json as _json
+    subjects = tmp_path / "s.json"
+    subjects.write_text(_json.dumps([{"observation": UNOWNED}]),
+                        encoding="utf-8")
+    assert sq.main([]) == 2
+    capsys.readouterr()
+    assert sq.main(["--subject", RELAY, "--subjects-file", str(subjects)]) == 2
+    capsys.readouterr()
+
+
+def test_batch_unreadable_or_empty_subjects_file_refuses_to_report_clean(
+        monkeypatch, capsys, tmp_path):
+    """verify-before-assuming rule 4. An unreadable input has told you nothing;
+    rendering it as a clean sweep would convert a broken probe into confident
+    permission to duplicate every record it failed to read."""
+    import json as _json
+    corpus = _json.dumps([SKIPPED_OWNER])
+
+    missing = tmp_path / "does-not-exist.json"
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(corpus))
+    assert sq.main(["--subjects-file", str(missing)]) == 2
+    capsys.readouterr()
+
+    empty = tmp_path / "empty.json"
+    empty.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(corpus))
+    assert sq.main(["--subjects-file", str(empty)]) == 2
+    capsys.readouterr()
+
+    garbage = tmp_path / "garbage.json"
+    garbage.write_text("not json at all", encoding="utf-8")
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(corpus))
+    assert sq.main(["--subjects-file", str(garbage)]) == 2
+    capsys.readouterr()
+
+
+def test_key_widening_is_proven_not_assumed():
+    """guard-2041: an unchanged count cannot distinguish "widened correctly"
+    from "did nothing at all" — both produce the identical number. So prove a
+    widening with a DISCRIMINATING probe: the OLD form here was a literal
+    record["observation"] read, and two numbers that differ are the evidence.
+    Without this, every test above would still pass if extract_subject only
+    ever looked at `observation`, because that is the key the other fixtures
+    use."""
+    records = [{"observation": UNOWNED}, {"content": UNOWNED},
+               {"finding": UNOWNED}, {"proposed_work": UNOWNED}]
+    old_form = [r for r in records if r.get("observation")]
+    new_form = [r for r in records if sq.extract_subject(r)[0]]
+    assert len(old_form) == 1, old_form
+    assert len(new_form) == 4, new_form
+    # ...and the newly-visible records reach a real verdict, not merely a parse
+    res = sq.batch_decide(records, [SKIPPED_OWNER], NOW, SESSION_START)
+    assert res["population"]["records_scored"] == 4, res["population"]
+    assert res["population"]["records_unreadable"] == 0, res["population"]

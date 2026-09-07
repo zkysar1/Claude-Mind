@@ -233,11 +233,16 @@ def test_should_encode_requires_env_and_allowlist_together():
     ("world/guardrails.jsonl", True),
     ("world/guardrails-2026-08.jsonl", True),
     ("world/pipeline.jsonl", True),
+    ("world/retrieval-trace.jsonl", True),           # 
     ("meta/gate-firings.jsonl", True),
     ("meta/gate-firings-2026-08-17.jsonl", True),
     # NOT on the list — written exactly as before.
     ("world/aspirations-archive.jsonl", False),
     ("world/pipeline-archive.jsonl", False),
+    # retrieval-trace is admitted as an EXACT name, not a glob — so neither a
+    # date segment nor an archive sibling rides in on it ().
+    ("world/retrieval-trace-2026-09-05.jsonl", False),
+    ("world/retrieval-trace-archive.jsonl", False),
     # DEFERRED (inbound cross-deployment writers, see BOARD_PATTERN_DEFERRED):
     ("world/board/coordination.jsonl", False),
     ("world/board/general.jsonl", False),
@@ -271,6 +276,33 @@ def test_board_pattern_is_deferred_not_forgotten():
                                  allowlist=(codec.BOARD_PATTERN_DEFERRED,)) is False
     assert codec.should_encode("world/board/coordination.jsonl", "ayoai-mind",
                                env={"OWNCLOUD_GZIP_STORES": "*"}) is False
+
+
+def test_retrieval_trace_admission_is_pinned():
+    """. retrieval-trace.jsonl was the largest single-key cost lever
+    measured in asp-358 (9.74x, ~6.1 GB/day) and was uncompressed only because
+    it had never been admitted — should_encode() is env AND allowlist, so a
+    missing entry makes rel_allowlisted structurally False and EVERY put runs
+    uncompressed. Pin the admission so a future allowlist edit cannot silently
+    drop it and re-open the leak with no test going red.
+
+    Asserted through should_encode(), not just the tuple: the tuple is what a
+    careless edit changes, but should_encode is what the writer actually calls
+    (owncloud_backend.py -> _codec_should_encode), so this is the gate that
+    matters."""
+    assert "world/retrieval-trace.jsonl" in codec.DEFAULT_ALLOWLIST
+    assert codec.rel_allowlisted("world/retrieval-trace.jsonl") is True
+    assert codec.should_encode("world/retrieval-trace.jsonl", "ayoai-mind",
+                               env={"OWNCLOUD_GZIP_STORES": "ayoai-mind"}) is True
+    # Env-scoping still governs it like every other admitted store: admission
+    # is necessary, never sufficient.
+    assert codec.should_encode("world/retrieval-trace.jsonl", "ayoai-mind",
+                               env={}) is False
+    assert codec.should_encode("world/retrieval-trace.jsonl", "claude-mind",
+                               env={"OWNCLOUD_GZIP_STORES": "ayoai-mind"}) is False
+    # Admitted as an exact name, so it must NOT behave like the reasoning-bank
+    # segment glob — a sibling must not ride in on this entry.
+    assert codec.rel_allowlisted("world/retrieval-trace-2026-09-05.jsonl") is False
 
 
 def test_gzip_level_parse_and_bounds():
