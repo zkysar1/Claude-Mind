@@ -11614,3 +11614,42 @@ moves it back.
 
 **Net: nothing routed.** One inference recorded: coverage is no longer a competing
 explanation for the confound.
+
+## 2026-09-07T12:1x — zeta, `hostname` cc-02, `uname -r` 6.8.0-138-generic, own-cloud, world=ayoai-mind, `time_cadence` (read-only except S4.5 `--apply`)
+
+**Reproduction pass — nothing routed, no owner note appended.** Every headline
+number was already in this ledger before I measured it: S2a **5 of 33** (same 5
+members as foxtrot's 07:1x row), S4a **13 of 72 = 18.1%**, S2b 50/54 = 92.6%,
+S3 axis1/1b/2 = **32.5 / 62.0 / 83.3%** on the FULL corpus (n=2420, asp-115=2017;
+summary omitted 2335 of 2436 = 95.9%, so it was refused per the S3 marker). All
+controls passed: S2a opened 33/33, S4a reached 1581/1581, S2b `depth>=2` inert at
+54/54.
+
+**S4.6 — 0 candidates at BOTH `--min-failures` 2 and 1 (undecidable), at
+`ceiling_ratio` 0.1012** (3081 of 30445). Ordinary continuation of the
+0.0972/0.0974/0.1001/0.1005 rows already here. Span table: alpha
+`08-01T23:29..09-07T04:26`, 24 windows, **2937/5982 in-span (49.1%) = 95.3% of the
+whole ceiling**; bravo/echo/foxtrot on the batched `08-01T23:3x` seed (0.5–0.8%);
+zeta resident live (0.4%). `failing_count: 6` at the ledger level against 0
+surfaced — coverage, never suppression working.
+
+**Two method notes worth more than the numbers, both from guardrails that fired
+during the pass, not from the readings:**
+
+1. **The ~0.0026–0.087 band quoted in `aspirations-strategic-scan/SKILL.md` is
+   STALE against this ledger.** I read 0.1012 as "outside the band, 12x the
+   nearest prior" and it is neither — four rows here already sit at 0.097–0.1005.
+   The marker's prose band and this ledger diverged, and the prose is the one that
+   loses. Read the band off the LEDGER; the marker warns about expired reasons
+   (rb-5818) and its own band is now one.
+2. **`guard-5900` is load-bearing here specifically.** `tail` on this file returned
+   a row that is neither the newest nor representative — row order is MERGE order.
+   Sorting timestamps found foxtrot's 07:1x S2a row and bravo's 11:33 S4.6 row that
+   a positional read missed, which is the only reason this pass identified itself as
+   a reproduction instead of appending its fourteenth duplicate to g-115-5462.
+
+**S2a cluster refinement (the one genuinely additive line):** the 2→5 numerator
+move is **two events, not three**. `v2-directed-steering-ship-log` and
+`v2-directed-steering-wiring` both carry `last_updated: 2026-07-12` — the same-age
+same-trigger `node_split` pair the S2a block tells you to look for — so only
+`env-agnostic-exploration-primitives` (2026-07-30) is an independent arrival.
