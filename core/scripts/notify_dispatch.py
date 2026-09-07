@@ -95,7 +95,19 @@ def _category_from_payload(d: dict) -> str:
     m = {"notification": "info", "completion report": "completion", "aspiration update": "update",
          "infrastructure alert": "blocker", "decision needed": "decision-needed", "user digest": "user-digest",
          "fleet digest": "user-digest", "goals waiting on you": "user-digest",
-         "reply": "reply"}
+         "reply": "reply",
+         # A SCHEDULED daily instrument, not a fleet digest (). It reaches
+         # here via a payload-stdin re-entry (world/scripts/daily-cost-report.sh pipes
+         # into email-send.sh, which has no --category flag for info payloads), so
+         # without this entry the category derives "" -> the 168h _default window,
+         # non-digest, matched by subject Jaccard. Measured over the whole ledger
+         # 2026-08-17..09-05: 15 attempts, 3 delivered -- exactly one per 168h.
+         # NOT "user-digest": that pool dedups by CATEGORY alone fleet-wide at 20h,
+         # so any peer's fleet digest suppresses the spend report. Counterfactual on
+         # the real ledger: 6/15. No peer digest carries this report's spend
+         # figures, so the one-consolidated-digest-per-window rationale, which
+         # assumes several agents each produce the SAME digest, does not apply.
+         "dailycostreport": "cost-report"}
     if it in m:
         return m[it]
     return "blocker" if ("ErrorMessage" in d or "ErrorFrom" in d) else ""

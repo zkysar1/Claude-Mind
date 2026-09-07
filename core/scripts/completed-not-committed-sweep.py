@@ -722,7 +722,7 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
                       min_age_minutes=30.0, lookback_hours=168.0,
                       min_pr_age_hours=24.0, goalid_status=None,
                       merge_default_status=None, sha_goalid_owners=None,
-                      deploy_hold_status=None):
+                      deploy_hold_status=None, backport_status=None):
     """Pure second-tier test: the goal's commit reached origin, but only on a
     NON-DEFAULT branch. Returns a stranded entry or None. g-115-3471.
 
@@ -793,6 +793,17 @@ def classify_stranded(goal, now, sha_status, default_status, pr_status,
     if not landed:
         return None  # tier-1's lane (nothing landed) or ineligible — not ours
     off_default = [s for s in landed if default_status.get(s) is False]
+    #  defect C: a BACKPORT MERGE (target->source, e.g. main->dev) can
+    # never appear as a new commit on the target, so "is it on the default
+    # branch?" has exactly one possible answer and a False there is a category
+    # error, not a finding. Drop those shas before any verdict is formed.
+    # Only a definite True drops a sha: None (undeterminable) and False both keep
+    # the existing behaviour, which is the conservative direction this function
+    # is built around. Defaulting the map to None keeps every pre-
+    # caller byte-identical, exactly as merge_default_status does.
+    if backport_status:
+        off_default = [s for s in off_default
+                       if backport_status.get(s) is not True]
     if not off_default:
         # On the default branch, or undeterminable. Either way the deliverable
         # is not PROVABLY stranded — stay silent.
@@ -1452,6 +1463,74 @@ def probe_sha_on_default(sha, candidate_repos, default_refs):
             return None  # probe error — undeterminable, never a flag
         return bool(out.strip())
     return None  # not a real commit anywhere we can see
+
+
+def probe_sha_backport_merge(sha, candidate_repos, default_refs):
+    """True when SHA is a BACKPORT MERGE — a merge commit whose SECOND parent is
+    already contained by the repo's default branch. False when it is not (a
+    non-merge, or a merge bringing in genuinely new work). None when
+    undeterminable. Impure. g-115-9060 defect C.
+
+    WHY THIS IS A CATEGORY ERROR AND NOT A TUNING MISS. A merge whose direction
+    is target->source (e.g. main->dev) can NEVER appear as a new commit on the
+    target: its content is already there, which is precisely what made it
+    mergeable in that direction. So asking "is this commit on the default
+    branch?" about a backport merge is asking a question with exactly one
+    possible answer, and the sweep then flags a goal whose work is fully shipped.
+    Measured on g-115-9021: the flagged commit was a main->dev backport, the two
+    files it touched were byte-identical between origin/main and origin/dev, and
+    the content had shipped via PR #412 (merged to main 2026-08-31T12:03:21Z,
+    mergeCommit 23a049d7). The remedy the sweep prescribed for it was to MERGE a
+    named pull request into an auto-deploying branch — see the module note on why
+    that makes this class HIGH rather than cosmetic (guard-5389, guard-5514).
+
+    THE SECOND parent, not the first, and not "any parent". On a merge commit the
+    FIRST parent is the branch being merged INTO (dev, here) and the second is the
+    branch being merged FROM (main). A backport is exactly the case where that
+    second parent is already on the target. Testing "any parent is contained"
+    would swallow ordinary feature merges once dev itself reached main, which is
+    the true-positive path this must not touch (outcome 3).
+
+    Uses the same `git branch -r --contains ... --list <ref>` family as
+    probe_sha_on_default, and for the same reason recorded there: `merge-base
+    --is-ancestor` reports "not an ancestor" and an internal error with the SAME
+    nonzero rc, which would silently convert a probe failure into a verdict. Here
+    the failure direction matters even more than it does there — a None must not
+    become a False, because False means "keep flagging"."""
+    for repo in candidate_repos:
+        rc, _ = _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+        if rc != 0:
+            continue  # not in this repo
+        ref = default_refs.get(str(repo))
+        if not ref:
+            return None  # default branch unknown here — cannot judge
+        rc2, out = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+        if rc2 != 0:
+            return None  # probe error — undeterminable, never a verdict
+        parts = out.split()
+        # `rev-list --parents -n 1` prints "<sha> <parent1> [<parent2> ...]", so a
+        # merge commit needs at least 3 fields. Fewer means a normal commit, which
+        # is a definite False rather than an unknown.
+        if len(parts) < 3:
+            return False
+        second_parent = parts[2]
+        rc3, out3 = _git(repo, "branch", "-r", "--contains", second_parent,
+                         "--list", ref)
+        if rc3 != 0:
+            return None  # probe error — undeterminable, never a verdict
+        return bool(out3.strip())
+    return None  # not a real commit anywhere we can see
+
+
+def build_backport_status(shas, candidate_repos, default_refs):
+    """Probe each SHA once for backport-merge shape. {sha: True|False|None}.
+    Impure. g-115-9060 defect C. Mirrors build_default_status."""
+    status = {}
+    for sha in shas:
+        if sha not in status:
+            status[sha] = probe_sha_backport_merge(sha, candidate_repos,
+                                                   default_refs)
+    return status
 
 
 def build_default_status(shas, candidate_repos, default_refs):
@@ -2335,6 +2414,12 @@ def main():
         [os.environ["PRODUCT_REPO_ROOT"]]
         if os.environ.get("PRODUCT_REPO_ROOT") else [])
     deploy_hold_status = build_deploy_hold_status(pr_status, repo_roots)
+    #  defect C. Staged narrowest-last like every other probe in this
+    # sweep: keyed on the OFF-DEFAULT shas only, so a fleet whose commits are all
+    # on their default branch pays nothing for it.
+    backport_status = build_backport_status(
+        sorted({s for s, st in default_status.items() if st is False}),
+        candidate_repos, default_refs)
 
     stranded_all = []
     for g in all_goals:
@@ -2344,7 +2429,8 @@ def main():
             args.min_pr_age_hours, goalid_status=goalid_status,
             merge_default_status=merge_default_status,
             sha_goalid_owners=sha_goalid_owners,
-            deploy_hold_status=deploy_hold_status)
+            deploy_hold_status=deploy_hold_status,
+            backport_status=backport_status)
         if entry is not None:
             stranded_all.append(entry)
     stranded_all.sort(key=lambda e: e["age_hours"], reverse=True)

@@ -246,6 +246,28 @@ UTILIZATION_COUNTERS = {
     "retrieval_count", "times_helpful", "times_noise", "times_active", "times_skipped",
     "times_inferred_helpful", "times_inferred_unknown", "times_cited",
 }
+
+# g-115-4349. A CORRECTION IS A SEPARATE, MONOTONE COUNTER -- NOT A NEGATIVE
+# DELTA. Every layer below the merge already accepts a signed delta
+# (`_utilization_store.record_increment` does `int(delta)`;
+# `utilization-flush.apply_deltas` does `base + delta`), so a `--by -1` looks
+# implementable and works on ONE box. It is silently reverted at the next
+# cross-box merge: `coordination_merge.merge_utilization_counters` takes a
+# per-counter MAX, whose own docstring states "MAX never loses an increment, it
+# can only fail to gain one". A decrement is exactly the thing MAX discards, and
+# it discards it with no error anywhere -- the silent-failure shape the
+# originating goal was filed to prevent.
+#
+# `<counter>__corrected` only ever INCREASES, so MAX reconciles it correctly and
+# the correction survives every box. `utilization_of` subtracts it to yield the
+# effective count. DELIBERATELY NOT ADDED TO UTILIZATION_COUNTERS: that set is
+# the required-key contract and the flush's materialisation list, and an absent
+# correction key already means "no corrections", so pre-materialising eight zero
+# keys per record would cost sidecar bytes on every record to say nothing.
+UTILIZATION_CORRECTION_SUFFIX = "__corrected"
+UTILIZATION_CORRECTION_COUNTERS = {
+    c + UTILIZATION_CORRECTION_SUFFIX for c in UTILIZATION_COUNTERS
+}
 # times_cited is intentionally excluded from utilization_score — citation during
 # encoding is a weaker signal than explicit times_helpful attestation. Track in
 # parallel for diagnostics per g-001-109 design.

@@ -70,6 +70,27 @@ from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-IS
 from _paths import ENVIRONMENT_ID  # noqa: E402  ( world identity)
 from peer_surface import routing_tag_targets_agent  # noqa: E402  ()
 
+# The aspiration auto-filed Investigates land on is RESOLVED per deployment,
+# never hardcoded. This is a FRAMEWORK file that travels the promotion chain, so
+# a deployment-specific literal either breaks downstream or is clobbered by the
+# next sync (). The pinned pair was ("", source="agent").
+# MEASURED HERE 2026-09-07: that pair is CORRECT on this deployment (agent
+#  "Maintain Agent Health" is live), so this site was not live-broken —
+# it was the only one of the four with BOTH halves pinned, and the id and the
+# --source must agree or the add fails aspiration_not_found (see
+# _escalation_target.source_flag).  is RETIRED in the upstream world, so
+# the pair is an assumption about queue layout that this deployment happens to
+# satisfy. Resolving both together keeps them in agreement ().
+try:
+    from _paths import WORLD_DIR as _WORLD_DIR, AGENT_DIR as _AGENT_DIR  # noqa: E402
+    from _escalation_target import (  # noqa: E402
+        resolve as _resolve_asp, source_flag as _asp_source)
+    ESCALATION_ASP, _ASP_VIA = _resolve_asp(CORE_ROOT, _WORLD_DIR, _AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, _WORLD_DIR, _AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ASP_VIA, ESCALATION_SOURCE = (
+        "asp-001", "fallback:import-failed", "agent")
+
 
 #  / rb-1150: terminal statuses that mean "no Investigate needed
 # - target already resolved". Mirrors insight-trigger-sweep.py ()
@@ -533,7 +554,8 @@ def _act_on_trigger(trigger, dry_run):
             "origin_signal": "board_post:{fid}".format(fid=finding.get("id") or "unknown"),
         }
         try:
-            _rt.aspirations_add_goal("asp-001", goal_payload, source="agent")
+            _rt.aspirations_add_goal(
+                ESCALATION_ASP, goal_payload, source=ESCALATION_SOURCE)
             ok = True
             err_text = None
         except _rt.RtError as e:

@@ -23,6 +23,8 @@ than silently returning empty matches — silent empties produce false
 all-clear signals at every caller.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

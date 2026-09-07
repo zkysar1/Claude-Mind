@@ -107,6 +107,9 @@ core/scripts/tests/_tmp_*/
 # Python interpreter shim (auto-created by _paths.sh on Windows; may land at repo root or in core/scripts/ depending on cwd when the shim bootstraps)
 .python-shim/
 core/scripts/.python-shim/
+core/scripts/.platform-memo.sh
+# (same cwd-dependent bootstrap as the shim above: the memo can land at the repo root too)
+/.platform-memo.sh
 
 # Node artifacts
 node_modules/
@@ -332,3 +335,9 @@ logs.log
 # committed by a `git add -A` on a Body-run deployment (2026-08-30, coach).
 /.busy
 /.zakcode/
+
+# Same memo as core/scripts/.platform-memo.sh (line 110), but SCRIPT_DIR can
+# resolve to the repo root for some callers, dropping a second copy here that the
+# path-anchored entry does not cover. Regenerable cache; blocks iteration-commit
+# via check-repo-root-entries when it appears (g-350-350 close, 2026-09-07).
+/.platform-memo.sh

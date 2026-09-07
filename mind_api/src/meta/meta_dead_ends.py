@@ -54,7 +54,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 from .. import file_locks, history, changelog
 from ..jsonl_cache import cache as _jsonl_cache
@@ -81,11 +81,23 @@ def _path(ctx) -> Path:
     return ctx.paths.meta / "dead-ends.jsonl"
 
 
-def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+def _read_jsonl(path: Path, force_fresh: bool = False) -> List[Dict[str, Any]]:
     """Mirror meta-dead-ends.py:read_all (line 33) — strip + json.loads each
-    non-empty line, no lock."""
+    non-empty line, no lock.
+
+    force_fresh=True force-pulls the latest remote object AND records its ETag
+    as the If-Match fence token, so a locked_rmw retry re-reads the peer's
+    landed write and re-fences each attempt. Without it a stale local mirror
+    fences every PUT against an etag the remote no longer has, and the 412
+    repeats forever against a remote that never changes — the per-object
+    stale-IfMatch DEADLOCK (rb-2639), not transient contention. Mirrors
+    meta_backpressure._read_yaml. Default False keeps the read-only callers
+    (check/read) on the cache-TTL ensure_local (no extra S3 GET per read)."""
     from storage_backend import get_backend
-    get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
+    if force_fresh:
+        get_backend().refresh(path)  # force-pull latest + set If-Match fence (rb-2639)
+    else:
+        get_backend().ensure_local(path)  # own-cloud read-path fix 2026-07-02: materialize an S3-only file on a fresh box before the local read; no-op on LocalBackend and for out-of-root/git-shipped paths (keystone in owncloud_backend._refresh)
     items: List[Dict[str, Any]] = []
     if not path.exists():
         return items
@@ -124,44 +136,58 @@ def _next_id(records: List[Dict[str, Any]]) -> str:
     return f"de-{max_num + 1:03d}"
 
 
-def _persist(ctx, items: List[Dict[str, Any]]) -> Optional["Response"]:  # type: ignore[name-defined]
-    """Locked snapshot -> atomic JSONL rewrite -> changelog -> cache invalidate.
+def _persist_unlocked(ctx, items: List[Dict[str, Any]]) -> None:
+    """_persist's body WITHOUT the lock, for callers already inside a
+    locked_rmw cycle. file_locks.locked is NOT reentrant (it takes a plain
+    threading.Lock), so nesting it inside locked_rmw deadlocks the daemon
+    thread. Mirrors meta_backpressure._persist_unlocked.
 
     Replicates _fileops.locked_write_jsonl (the inner of write_all / the tail of
-    locked_modify_jsonl) with header-agent attribution and NO summary. Returns a
-    Response on OSError, else None.
+    locked_modify_jsonl) with header-agent attribution and NO summary.
 
-    KNOWN-UNCURED class-(b) bare lock — tracked by g-115-4017, NOT exempt.
-    Measured 2026-07-30 (g-115-3834) on both axes the write-class convention
-    requires: coordination_merge.merge_handler_for("dead-ends.jsonl") returns
-    None (fence-only, nothing reconciles below the write), AND this module goes
-    through the fenced path — _atomic_write_jsonl delegates to
-    _atomic_write_with_fallback while _read_jsonl uses ensure_local rather than
-    refresh. That is the rb-2639 stale-If-Match shape with both halves present,
-    so it does NOT get the raw-write exemption that working-memory.yaml and
-    experience-meta.json have. This site and add() both need locked_rmw with a
-    force_fresh read inside the cycle; the cured siblings in meta_backpressure /
-    meta_experiment / meta_transfer / strategy_apply are the reference.
+    WHY dead-ends.jsonl needs the locked_rmw treatment at all (g-115-3834
+    discovered it, g-115-4017 cured it; measured — do not re-derive from shape):
+    coordination_merge.merge_handler_for("dead-ends.jsonl") returns None, so it
+    is write-class (b) FENCE-ONLY. Nothing reconciles below the write, which
+    makes a stale If-Match fence a PERMANENT per-object per-box wedge with no
+    self-recovery (rb-2639). AND this module goes through the fenced path —
+    _atomic_write_jsonl delegates to _atomic_write_with_fallback — so it does
+    NOT get the raw-write exemption working-memory.yaml and experience-meta.json
+    have. Every write path in this module is _path(ctx) == dead-ends.jsonl, so
+    the class is UNIFORM here (unlike meta_transfer/strategy_apply, whose
+    _persist helpers take a MIX of (a) and (b) paths). Classify by PATH, never
+    by the helper or by a sibling module (guard-1733).
+
+    The bare-lock `_persist` that used to live here is DELETED, not retained —
+    same call as meta_backpressure. With one uniform class-(b) path, a bare-lock
+    persist is not merely unused, it is ALWAYS the wrong call, and leaving it in
+    place arms the next editor to reach for the shorter name.
+
+    RETRY-IDEMPOTENCE OF WHAT ELSE THIS TOUCHES (the audit g-115-4017 left
+    explicitly unmeasured). Of the five effects below, three are idempotent
+    (_validate_no_surrogates, _atomic_write_jsonl — a 412 means the PUT was
+    rejected and NOTHING landed, and _jsonl_cache().invalidate). The remaining
+    two, history.snapshot and changelog.append, are NOT: a retried cycle leaves
+    one extra pre-write snapshot and one extra "edit" changelog line per
+    absorbed conflict, for a single landed write. That is inherited from the
+    cured siblings verbatim (meta_backpressure._persist_unlocked has the same
+    two calls in the same position) and is deliberately NOT special-cased here
+    — a module-local divergence would break the uniformity guard-1733 asks the
+    next reader to rely on. Recorded rather than silently accepted; it is a
+    property of the shared pattern, not of this module.
     """
-    from ..server import Response
-
     live_path = _path(ctx)
     base_dir = ctx.paths.meta
     agent = _agent_name(ctx)
-    try:
-        assert_not_cruft(live_path.parent, "mkdir (meta_dead_ends)")
-        live_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_locks.locked(live_path):
-            for item in items:
-                _validate_no_surrogates(item, live_path)
-            history.snapshot(live_path, base_dir, agent)
-            _atomic_write_jsonl(live_path, items)
-            changelog.append(base_dir, agent, live_path, "edit",
-                             lines_changed=len(items))
-            _jsonl_cache().invalidate(live_path)
-    except OSError as e:
-        return Response.error(500, "write_failed", str(e))
-    return None
+    assert_not_cruft(live_path.parent, "mkdir (meta_dead_ends)")
+    live_path.parent.mkdir(parents=True, exist_ok=True)
+    for item in items:
+        _validate_no_surrogates(item, live_path)
+    history.snapshot(live_path, base_dir, agent)
+    _atomic_write_jsonl(live_path, items)
+    changelog.append(base_dir, agent, live_path, "edit",
+                     lines_changed=len(items))
+    _jsonl_cache().invalidate(live_path)
 
 
 # ---------------------------------------------------------------------------
@@ -203,63 +229,72 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
             return Response.error(
                 400, "missing_field", f"Missing required field '{field}'")
 
-    outcome: Dict[str, Any] = {"status": None, "id": None}
     live_path = _path(ctx)
-    base_dir = ctx.paths.meta
-    agent = _agent_name(ctx)
+
+    def _cycle():
+        # force_fresh read INSIDE the cycle. Each retry re-reads the peer's
+        # landed write and re-takes the If-Match fence, which is what breaks the
+        # rb-2639 deadlock; retrying against a stale token conflicts identically
+        # forever.
+        records = _read_jsonl(live_path, force_fresh=True)
+
+        # PER-ATTEMPT STATE — both of these were hoisted outside the lock before
+        # , and locked_rmw re-runs this whole body:
+        #   * `item` is the request payload. Stamping the allocated id onto it
+        #     made attempt 2 see `"id" in item` and SKIP re-allocation, so the
+        #     retry re-wrote the id computed from the PRE-CONFLICT snapshot —
+        #     exactly guard-5322 (a CAS fence proves no lost update, never that
+        #     a value DERIVED from the read is unique). A local copy re-derives
+        #     the id from the fresh records on every attempt.
+        #   * `outcome` accumulated attempt 1's verdict; rebuilt per attempt so
+        #     a merged-then-retried call cannot report the earlier branch.
+        rec: Dict[str, Any] = dict(item)
+        outcome: Dict[str, Any] = {"status": None, "id": None}
+
+        # Allocate id inside the lock (meta-dead-ends.py:111).
+        if "id" not in rec:
+            rec["id"] = _next_id(records)
+
+        # Overlapping-range merge (meta-dead-ends.py:116-136).
+        merged = False
+        for existing in records:
+            if (existing.get("strategy_file") == rec.get("strategy_file") and
+                    existing.get("field") == rec.get("field") and
+                    existing.get("status") in ("active", "reviewed")):
+                existing_range = existing.get("value_range")
+                new_range = rec.get("value_range")
+                if existing_range and new_range:
+                    if (new_range[0] <= existing_range[1] and
+                            new_range[1] >= existing_range[0]):
+                        existing["value_range"] = [
+                            min(existing_range[0], new_range[0]),
+                            max(existing_range[1], new_range[1]),
+                        ]
+                        existing["evidence"] = list(set(
+                            existing.get("evidence", []) +
+                            rec.get("evidence", [])))
+                        existing["failure_pattern"] = rec.get(
+                            "failure_pattern", existing["failure_pattern"])
+                        outcome["status"] = "merged"
+                        outcome["id"] = existing["id"]
+                        merged = True
+                        break
+
+        if not merged:
+            records.append(rec)
+            outcome["status"] = "added"
+            outcome["id"] = rec["id"]
+
+        _persist_unlocked(ctx, records)
+        return Response.text(json.dumps(outcome) + "\n",
+                             content_type="application/json")
 
     try:
         assert_not_cruft(live_path.parent, "mkdir (meta_dead_ends)")
         live_path.parent.mkdir(parents=True, exist_ok=True)
-        with file_locks.locked(live_path):
-            records = _read_jsonl(live_path)
-
-            # Allocate id inside the lock (meta-dead-ends.py:111).
-            if "id" not in item:
-                item["id"] = _next_id(records)
-
-            # Overlapping-range merge (meta-dead-ends.py:116-136).
-            merged = False
-            for existing in records:
-                if (existing.get("strategy_file") == item.get("strategy_file") and
-                        existing.get("field") == item.get("field") and
-                        existing.get("status") in ("active", "reviewed")):
-                    existing_range = existing.get("value_range")
-                    new_range = item.get("value_range")
-                    if existing_range and new_range:
-                        if (new_range[0] <= existing_range[1] and
-                                new_range[1] >= existing_range[0]):
-                            existing["value_range"] = [
-                                min(existing_range[0], new_range[0]),
-                                max(existing_range[1], new_range[1]),
-                            ]
-                            existing["evidence"] = list(set(
-                                existing.get("evidence", []) +
-                                item.get("evidence", [])))
-                            existing["failure_pattern"] = item.get(
-                                "failure_pattern", existing["failure_pattern"])
-                            outcome["status"] = "merged"
-                            outcome["id"] = existing["id"]
-                            merged = True
-                            break
-
-            if not merged:
-                records.append(item)
-                outcome["status"] = "added"
-                outcome["id"] = item["id"]
-
-            for rec in records:
-                _validate_no_surrogates(rec, live_path)
-            history.snapshot(live_path, base_dir, agent)
-            _atomic_write_jsonl(live_path, records)
-            changelog.append(base_dir, agent, live_path, "edit",
-                             lines_changed=len(records))
-            _jsonl_cache().invalidate(live_path)
+        return file_locks.locked_rmw(live_path, _cycle)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
-
-    return Response.text(json.dumps(outcome) + "\n",
-                         content_type="application/json")
 
 
 # ---------------------------------------------------------------------------
@@ -367,25 +402,37 @@ def increment(ctx) -> "Response":  # type: ignore[name-defined]
     if not rec_id:
         return Response.error(400, "missing_param", "query parameter 'id' required")
 
-    records = _read_jsonl(_path(ctx))
-    found = False
-    for rec in records:
-        if rec["id"] == rec_id:
-            rec["times_matched"] = rec.get("times_matched", 0) + 1
-            found = True
-            break
+    live_path = _path(ctx)
 
-    if not found:
+    def _cycle():
+        # The READ moves INSIDE the cycle (). Before, it ran here at
+        # module scope — outside the lock entirely — so the increment was
+        # computed from a snapshot taken before any serialisation and re-applied
+        # blind by _persist. force_fresh re-takes the If-Match fence per attempt.
+        # `found` is derived per attempt, so a retry re-decides against the
+        # peer's landed records rather than replaying attempt 1's verdict.
+        records = _read_jsonl(live_path, force_fresh=True)
+        found = False
+        for rec in records:
+            if rec["id"] == rec_id:
+                rec["times_matched"] = rec.get("times_matched", 0) + 1
+                found = True
+                break
+
+        if not found:
+            return Response.text(
+                json.dumps({"error": f"Dead end {rec_id} not found"}) + "\n",
+                content_type="application/json")
+
+        _persist_unlocked(ctx, records)
         return Response.text(
-            json.dumps({"error": f"Dead end {rec_id} not found"}) + "\n",
+            json.dumps({"status": "incremented", "id": rec_id}) + "\n",
             content_type="application/json")
 
-    err = _persist(ctx, records)
-    if err is not None:
-        return err
-    return Response.text(
-        json.dumps({"status": "incremented", "id": rec_id}) + "\n",
-        content_type="application/json")
+    try:
+        return file_locks.locked_rmw(live_path, _cycle)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -404,26 +451,36 @@ def review(ctx) -> "Response":  # type: ignore[name-defined]
     if not rec_id:
         return Response.error(400, "missing_param", "query parameter 'id' required")
 
-    records = _read_jsonl(_path(ctx))
-    found = False
-    for rec in records:
-        if rec["id"] == rec_id:
-            rec["status"] = "reviewed"
-            rec["reviewed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            found = True
-            break
+    live_path = _path(ctx)
 
-    if not found:
+    def _cycle():
+        # Read INSIDE the cycle, force_fresh per attempt — same cure as
+        # increment (). reviewed_at is stamped per attempt, so the
+        # landed timestamp is the one that actually won the fence rather than
+        # one computed before a conflict.
+        records = _read_jsonl(live_path, force_fresh=True)
+        found = False
+        for rec in records:
+            if rec["id"] == rec_id:
+                rec["status"] = "reviewed"
+                rec["reviewed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                found = True
+                break
+
+        if not found:
+            return Response.text(
+                json.dumps({"error": f"Dead end {rec_id} not found"}) + "\n",
+                content_type="application/json")
+
+        _persist_unlocked(ctx, records)
         return Response.text(
-            json.dumps({"error": f"Dead end {rec_id} not found"}) + "\n",
+            json.dumps({"status": "reviewed", "id": rec_id}) + "\n",
             content_type="application/json")
 
-    err = _persist(ctx, records)
-    if err is not None:
-        return err
-    return Response.text(
-        json.dumps({"status": "reviewed", "id": rec_id}) + "\n",
-        content_type="application/json")
+    try:
+        return file_locks.locked_rmw(live_path, _cycle)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
 
 
 # ---------------------------------------------------------------------------

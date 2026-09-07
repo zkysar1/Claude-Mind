@@ -336,3 +336,135 @@ def test_scan_outcome_note_only_is_accepted(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "findings_count=0 created=0" in result.stdout
+
+
+# --------------------------------------------------------------------------
+# Title minting — fragment titles are refused at mint time ()
+# --------------------------------------------------------------------------
+# Measured population (, world queue, provenance-string query):
+# 26 gate-filed goals, 22 HIGH, 10 (38%) terminally `skipped`. The skipped ones
+# carry titles that are raw mid-sentence slices opening on the trigger keyword:
+#
+#   "Unblock: Fix Root cause"
+#   "Unblock: Fix Root cause identified exactly, not inferred"
+#   "Unblock: Fix ROOT CAUSE, from CloudTrail paged EXHAUSTIVELY ov"   <- mid-token
+#
+# Those three titles are VERBATIM from the  measurement. The source
+# sentences that produced them are not recoverable from that record, so the
+# fixtures below are sentences of the same shape; each assertion targets the
+# structural property (mid-token cut / bare trigger / past-tense report), never
+# a reconstructed string.
+
+ESTABLISHED_DIAGNOSIS_NOTES = [
+    # Past-tense reports that a cause WAS found — closed work, not a blocker.
+    "ROOT CAUSE, measured not assumed: core/config/verification-checklist.md "
+    "line 88 names a script renamed in May.",
+    "Root cause identified exactly, not inferred: the reducer never read the "
+    "new surface.",
+    "Root cause confirmed by reading code.",
+]
+
+
+@pytest.mark.parametrize("note", ESTABLISHED_DIAGNOSIS_NOTES)
+def test_established_diagnosis_never_mints_a_high_unblock(note):
+    """A sentence REPORTING a finished diagnosis must not become an open HIGH
+    blocker. It is re-routed to MEDIUM Investigate, never dropped — dropping it
+    would be the recall trade g-115-9247 measured and rejected."""
+    signals = fg.scan_signals(note)
+    assert signals, "DETECTION must be unchanged — the signal still fires"
+    goal = fg.make_child_goal(signals[0], "g-src", "framework", note)
+    assert goal["priority"] == "MEDIUM"
+    assert goal["title"].startswith("Investigate:")
+    assert not goal["title"].startswith("Unblock: Fix Root cause")
+
+
+def test_bare_trigger_never_mints_unblock_fix_root_cause():
+    """The verbatim production title "Unblock: Fix Root cause" — a trigger with
+    no substance after it — must be unreachable."""
+    goal = fg.make_child_goal(
+        {"type": "root_cause", "match": "Root cause", "substance": ""},
+        "g-src", "framework", "Root cause.",
+    )
+    assert goal["title"] != "Unblock: Fix Root cause"
+    assert goal["priority"] == "MEDIUM"
+
+
+def test_minted_title_never_ends_mid_token():
+    """The verbatim production title ended "...paged EXHAUSTIVELY ov" — a hard
+    character cut through a word. A truncated title must end on a whole token."""
+    note = (
+        "The root cause is that the loader reads core/config/"
+        "verification-checklist.md before the shim is on PATH."
+    )
+    signals = fg.scan_signals(note)
+    assert signals
+    title = fg.make_child_goal(signals[0], "g-src", "framework", note)["title"]
+    assert title.endswith("…"), "this fixture is long enough to truncate"
+    assert "core/config/veri…" not in title
+    last_token = title[:-1].strip().rsplit(" ", 1)[-1]
+    assert last_token in note, f"title ends mid-token: {last_token!r}"
+
+
+def test_genuine_open_defect_still_mints_high_unblock():
+    """RECALL CONTROL. The refusals above must not be reachable by breaking
+    detection or by demoting every finding — a real open defect stays HIGH."""
+    note = (
+        "The root cause is that the merge handler drops the fence on a stale "
+        "read, so writes are lost."
+    )
+    signals = fg.scan_signals(note)
+    assert signals
+    goal = fg.make_child_goal(signals[0], "g-src", "framework", note)
+    assert goal["priority"] == "HIGH"
+    assert goal["title"].startswith("Unblock: Fix ")
+    assert goal["origin_signal"] == "unblock:g-src"
+    # Authored from the finding, not sliced from the keyword onward.
+    assert "root cause" not in goal["title"].lower()
+
+
+def test_refused_titles_stay_distinguishable_for_dedup():
+    """Two refused findings from DIFFERENT source goals must not collapse into
+    one another under _title_similar, or the second would be silently dropped."""
+    a = fg.make_child_goal(
+        {"type": "root_cause", "match": "Root cause confirmed by reading code",
+         "substance": " confirmed by reading code"},
+        "g-100-01", "framework", "x",
+    )["title"]
+    b = fg.make_child_goal(
+        {"type": "root_cause", "match": "Root cause traced to the stale lock file",
+         "substance": " traced to the stale lock file"},
+        "g-200-02", "framework", "x",
+    )["title"]
+    assert not fg._title_similar(a, b), f"refused titles collapsed: {a!r} vs {b!r}"
+
+
+def test_investigation_override_title_never_ends_mid_token():
+    """The investigation-override path builds its fragment with a hard
+    `stripped[:limit]` character cut in _first_prose_fragment, so it is the one
+    producer that can hand mint_title a token already sliced in half. Measured
+    after the first g-115-9265 fix landed: a short phrase followed by a long
+    token ("The loader reads core/config/verification-checklist.md") tripped the
+    ratio guard and shipped "...core/config/verification-checklis…"."""
+    text = (
+        "The loader reads core/config/verification-checklist.md before the "
+        "shim is on PATH and dies."
+    )
+    frag = fg._first_prose_fragment(text)
+    assert frag.endswith("…"), "fixture must be long enough to truncate"
+    goal = fg.make_child_goal(
+        {"type": "investigation_finding", "match": frag}, "g-src", "framework", text
+    )
+    title = goal["title"]
+    assert "verification-checklis…" not in title
+    last = title[:-1].rstrip().rsplit(" ", 1)[-1]
+    assert last in text.split(), f"title ends mid-token: {last!r}"
+
+
+def test_truncate_keeps_hard_cut_only_when_no_space_exists():
+    """The one legitimate hard cut: a single unbroken token longer than the
+    budget, where no word boundary exists to cut back to."""
+    one_token = "a" * 80
+    assert fg._truncate_on_word_boundary(one_token).endswith("…")
+    assert len(fg._truncate_on_word_boundary(one_token)) == fg.TITLE_MAX_CHARS + 1
+    # A boundary landing exactly on a space is not a mid-token cut.
+    assert not fg._truncate_on_word_boundary("x" * 50 + " tail").endswith("x…x…")

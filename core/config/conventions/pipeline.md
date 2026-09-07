@@ -87,6 +87,48 @@ Consequences for readers: `stage=archived` records in the LIVE file are
 normal (not corruption); an id may exist in BOTH files by design —
 `compute_meta` (CLI + daemon) dedups the join by id so nothing double-counts.
 
+## The outcome enum — and why there is no REFUTED (g-115-399, 2026-09-05)
+
+`VALID_OUTCOMES = {"CONFIRMED", "CORRECTED", "EXPIRED", "UNRESOLVABLE"}`
+(`core/scripts/pipeline.py:42`). **There is no `REFUTED`, and no lowercase
+form** — either is rejected `validation_failed` at the writer.
+
+A prediction that was simply WRONG therefore has no dedicated value. Record it
+as **`CORRECTED`** and state the mapping in `outcome_detail` ("REFUTED on the
+stated criteria; maps to CORRECTED here"), so a later reader is not left
+inferring which sense was meant.
+
+**Consequence for anyone ANALYSING this store — this is the load-bearing half.**
+`CORRECTED` is an OVERLOADED bucket. It holds both "prediction wrong, and here
+is the replacement model" and "prediction disconfirmed, nothing replaced". Any
+analysis that reads `CORRECTED` as *"a correction was learned"* over-counts, and
+the two senses are not separable by any field — only by reading
+`outcome_detail`. Measured 2026-09-05 (zeta, cc-02, union of `resolved` +
+`archived` = 1,644 records): **52 records (3.2%) carry a hand-written REFUTED
+note**, 30 of them filed `CORRECTED`, written by **all five agents** (alpha 12,
+zeta 10, echo 6, bravo 6, foxtrot 2, +16 unattributed), spanning to that same
+day — five agents independently rediscovering one enum gap because the
+convention they were told to load did not state it.
+
+A second consequence, for anyone filtering on `surprise`: **`surprise >= 4` is a
+NO-OP on `CORRECTED`.** Surprise is DERIVED, not caller-supplied
+(`_surprise.apply_derived_surprise`, g-115-3801), and no CORRECTED record scores
+below 4 — measured same run, 98 of 98 in-window CORRECTED records passed it. The
+discriminating cut is `>= 7` (6 of those 98). A `surprise >= 4` filter over
+CORRECTED selects the whole population while reading like a quality bar.
+
+Related: `guard-5065` (check the token is in `VALID_OUTCOMES` BEFORE
+pre-registering a resolution criterion that names one) and `guard-5709`
+(uppercase only). `guard-5065` already existed through every one of the 52
+rediscoveries — the gap was never the missing rule, it was that this file, which
+callers are explicitly told to load rather than guess from, omitted the fact
+(`guard-1984`: a guardrail cannot outvote the instrument it guards).
+
+Adding `REFUTED` to the enum is deliberately NOT done here: `guard-334` requires
+identifying every consumer of `VALID_OUTCOMES` first (accuracy stats, calibration
+bands, `/reflect` reflectable-outcome sets, dashboards), which is a separate
+change with its own migration for the 30 existing CORRECTED-as-REFUTED records.
+
 ## Resolution-Evidence Requirement (g-303-27)
 
 A move INTO the `resolved` stage with `outcome` of `CONFIRMED` or `CORRECTED`

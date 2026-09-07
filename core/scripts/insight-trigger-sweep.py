@@ -173,6 +173,32 @@ ACTION_TYPE_RE = re.compile(r"^action_type:(.+)$")
 SEVERITY_RE = re.compile(r"^severity:(.+)$")
 AFFECTS_RE = re.compile(r"^affects:(g-\d+-\d+)$")
 
+#  (MODE 2). A board post carrying `requires_action_by:` but NO
+# `action_type:` used to return None here and vanish without trace, so the goal
+# queue carried the UNCORRECTED text with nothing anywhere indicating a
+# correction existed. Measured: msg-20260906-090253-zeta-5063 (tags addendum,
+# correction, affects:, requires_action_by:alpha@ayoai-mind) was found
+# only by running the board supersession check BY HAND.
+#
+# WHY A TAG SET AND NOT "require action_type: everywhere": the fresh-eyes-code
+# contract DELIBERATELY emits no `action_type:` — on its β path it posts
+# `requires_action_by:{reviewed_agent}` with none, because it writes for
+# insight-trigger-gate.py, not for this sweep (fresh-eyes-code/SKILL.md:249-257).
+# So "target, no action" is a LEGITIMATE shape for one consumer and a silent
+# drop for the other, and any fix that forces the tag breaks fresh-eyes-code.
+# These two tags are the discriminator: fresh-eyes-code posts carry NEITHER, so
+# this branch cannot reach it.
+#
+# EITHER tag suffices, not both together. The filing goal's phrase is "the
+# correction/addendum tag pair", which reads both ways; matching only the pair
+# would re-create this very defect one tag over (a post tagged `correction`
+# alone would still vanish silently), and each tag independently denotes
+# corrective intent. The cost of the looser read is a possible surplus goal,
+# which is visible and closable; the cost of the stricter read is another
+# invisible drop, which is not.
+CORRECTION_INTENT_TAGS = {"correction", "addendum"}
+INFERRED_ACTION = "correction"
+
 # : terminal statuses that mean "no Apply needed — target already
 # resolved". Mirrors unblock-parent-status-sweep.py:112 (rb-908 lineage).
 # Audit-time -> apply-time staleness gap (rb-1150): zeta's 06:37 audit
@@ -258,13 +284,19 @@ def board_channels():
     )
 
 
-def load_triggers():
+def load_triggers(dropped=None):
     """Read every live board channel, yield candidate insight_triggers.
 
     A candidate satisfies all of:
       - message has `requires_action_by:<agent>` tag
-      - message has `action_type:<verb>` tag
+      - message has `action_type:<verb>` tag, OR carries a correction-intent
+        tag (`correction` / `addendum`) from which the action is inferred
+        (g-115-9224 MODE 2)
       - message timestamp is within WINDOW_HOURS and older than GRACE_HOURS
+
+    `dropped` is an optional list passed straight through to
+    `_parse_trigger_msg`; addressed posts that are still declined are appended
+    to it so the caller can report them instead of losing them silently.
     """
     now = datetime.now()
     win_cutoff = now - timedelta(hours=WINDOW_HOURS)
@@ -289,14 +321,14 @@ def load_triggers():
                 continue
             if ts < win_cutoff or ts > grace_cutoff:
                 continue
-            rec = _parse_trigger_msg(msg, channel, now, ts)
+            rec = _parse_trigger_msg(msg, channel, now, ts, dropped=dropped)
             if rec is None:
                 continue
             out.append(rec)
     return out
 
 
-def _parse_trigger_msg(msg, channel, now, ts):
+def _parse_trigger_msg(msg, channel, now, ts, dropped=None):
     """Both-tagged? -> trigger dict. Else None.
 
     Extracted (g-115-754) so the CONVERSION scan (`load_triggers`) and the
@@ -304,6 +336,18 @@ def _parse_trigger_msg(msg, channel, now, ts):
     of "is this an insight_trigger". Two live call sites today — the audit
     half is only trustworthy if it recognises exactly what the conversion half
     would have recognised, so a second copy of this parse would be the defect.
+
+    `dropped` (g-115-9224) is an optional OUT-param: a list this function
+    appends one record to for every ADDRESSED post it declines to convert, so
+    the drop is observable instead of silent. It is optional precisely so both
+    existing call sites keep working unchanged and the single shared definition
+    above is preserved — a second parse that reported drops would be the very
+    defect this function's extraction prevents.
+
+    Only posts carrying `requires_action_by:` are reported. A post with NO
+    target is not addressed to anyone and was never a trigger candidate;
+    reporting those would emit a line for essentially every board message and
+    bury the signal this out-param exists to surface.
     """
     tags = msg.get("tags") or []
     target = None
@@ -326,11 +370,46 @@ def _parse_trigger_msg(msg, channel, now, ts):
         m = AFFECTS_RE.match(t)
         if m:
             affects_goal = m.group(1).strip()
-    if not target or not action:
+    if not target:
+        # Not addressed to anyone — never a trigger candidate. Silent by
+        # design (see the docstring): reporting these would emit a line per
+        # board post.
         return None
+    action_inferred = False
+    if not action:
+        if set(tags) & CORRECTION_INTENT_TAGS:
+            # MODE 2 (): a correction that carries no `action_type:`
+            # used to vanish here, leaving the queue holding ONLY the
+            # uncorrected text with nothing anywhere indicating a correction
+            # existed. Corrective intent is explicit in the tags, so honour it.
+            action = INFERRED_ACTION
+            action_inferred = True
+        else:
+            # Still dropped — but no longer silently. The fresh-eyes-code β
+            # shape lands here BY DESIGN (it addresses a reviewer and emits no
+            # `action_type:` because it writes for insight-trigger-gate.py),
+            # so this list is expected to be non-empty on a healthy fleet and
+            # is a REPORT, not an error.
+            if dropped is not None:
+                dropped.append({
+                    "msg_id": msg.get("id"),
+                    "author": msg.get("author"),
+                    "channel": channel,
+                    "target": target,
+                    "tags": tags,
+                    "timestamp": msg.get("timestamp"),
+                    "reason": "requires_action_by without action_type "
+                              "and no correction-intent tag",
+                })
+            return None
     return {
         "msg_id": msg.get("id"),
         "author": msg.get("author"),
+        # : True when `action` was INFERRED from a correction-intent
+        # tag rather than read from an explicit `action_type:`. Carried so a
+        # filed goal's provenance distinguishes the two, and so a future reader
+        # can measure how often the inference fires before widening it.
+        "action_inferred": action_inferred,
         # Where the trigger was READ from, not msg["channel"] — the board
         # pointer in the filed goal must name the file a reader can open. A
         # row's self-reported channel can disagree with the file holding it
@@ -1033,7 +1112,12 @@ def main():
 
     dry_run = args.dry_run
 
-    raw_triggers = load_triggers()
+    #  outcome 3: collect the addressed-but-declined posts so a drop
+    # that DOES still occur is reported rather than silent. Expected non-empty
+    # on a healthy fleet (the fresh-eyes-code β shape lands here by design), so
+    # it is reported as a count + sample, never as an error.
+    untyped_dropped = []
+    raw_triggers = load_triggers(dropped=untyped_dropped)
     # : addressing resolution BEFORE dedup/filing — a refused target
     # must never reach the filing loop, and refusal-first beats dedup (the
     # safety verdict outranks the bookkeeping one).
@@ -1340,6 +1424,19 @@ def main():
             "scanned": len(raw_triggers),
             "holds": _conservation_sum == len(raw_triggers),
         },
+        #  outcome 3: addressed posts declined for want of an
+        # `action_type:` and any correction-intent tag. NOT a term of the
+        # conservation identity (these were never `scanned` triggers) and NOT
+        # an error — the fresh-eyes-code β shape lands here by design. The
+        # count existing at all is the point: before this, the drop left no
+        # trace anywhere and was found only by a hand-run supersession check.
+        "untyped_dropped": len(untyped_dropped),
+        "untyped_dropped_sample": [
+            {k: d[k] for k in ("msg_id", "author", "channel", "target")}
+            for d in untyped_dropped[:5]
+        ],
+        "action_inferred": sum(
+            1 for t in raw_triggers if t.get("action_inferred")),
         # --- audit half (). NOT terms of the conservation identity. ---
         "audit_window_hours": AUDIT_WINDOW_HOURS,
         "out_of_window": len(oow),

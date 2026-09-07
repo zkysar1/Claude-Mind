@@ -84,6 +84,16 @@ _STATS = {
     "hits": 0, "misses_fetched": 0, "misses_unfetchable": 0,
     "bad_request": 0, "bytes_served": 0, "bytes_fetched": 0,
     "evictions": 0, "started_at": time.time(),
+    # : superseded-version reclaim. Entries are addressed by
+    # (key, etag), so every write to a high-churn key mints a NEW entry and
+    # strands the old one — dead by construction, because a caller only ever
+    # asks for the etag its own S3 HEAD just returned. Nothing reclaimed those
+    # but LRU, so they competed with live entries for the cap. Counted
+    # separately from `evictions` on purpose: eviction means "the cap was too
+    # small", purge means "this was garbage", and folding them would make the
+    # cap-thrash diagnosis unreadable (guard-3992 — a counter that cannot
+    # distinguish two causes reports neither).
+    "superseded_purged": 0, "superseded_bytes_reclaimed": 0,
 }
 
 _ETAG_SAFE = re.compile(r"[^A-Za-z0-9._-]")
@@ -202,6 +212,51 @@ def _fetch_from_s3(key: str, etag: str, project_root: Path) -> Optional[bytes]:
     return body
 
 
+def _purge_superseded(dest: Path) -> None:
+    """Drop every OTHER etag of this key; `dest` is the one just written.
+
+    `dest.parent` is the key's own sha256 directory, so its only co-tenants are
+    other etags OF THE SAME KEY. Those are dead by construction: a caller passes
+    the etag its own S3 HEAD just returned, so it can never ask for a superseded
+    one, and on any miss the client falls through to S3 anyway (the fail-open
+    contract). Measured on cc-03 2026-09-07 before this existed: 89 distinct
+    keys occupying 592 entries, 95.4% of 4.38 GB held by superseded versions —
+    `world/aspirations.jsonl` alone kept 130 copies for 3.68 GB, 84% of the whole
+    cache. That is why the hit ratio sat at 0.60 with 1,290 evictions in 2.42h:
+    the cap was not too small for the working set, it was full of garbage.
+
+    Safe against a concurrent reader: POSIX keeps an unlinked file alive for any
+    already-open descriptor, so a `read_bytes()` in flight completes from its fd.
+    Safe against a concurrent writer for a different etag: worst case that entry
+    is re-fetched once, which is the same cost as the miss it would otherwise
+    have been. Fail-quiet throughout — a purge failure must never fail a request
+    that was already served correctly.
+
+    `.tmp*` siblings are skipped: another process's `os.replace` may be in
+    flight, and deleting its staging file would turn a correct write into a
+    silent loss.
+    """
+    purged = 0
+    reclaimed = 0
+    try:
+        for p in dest.parent.iterdir():
+            if p.name == dest.name or ".tmp" in p.name:
+                continue
+            try:
+                size = p.stat().st_size
+                p.unlink()
+            except OSError:
+                continue
+            purged += 1
+            reclaimed += size
+    except OSError:
+        return
+    if purged:
+        with _LOCK:
+            _STATS["superseded_purged"] += purged
+            _STATS["superseded_bytes_reclaimed"] += reclaimed
+
+
 def _store(root: Path, key: str, etag: str, body: bytes) -> None:
     """Write the entry atomically. Fail-quiet: a cache that cannot persist
     still served a correct body this request."""
@@ -218,6 +273,9 @@ def _store(root: Path, key: str, etag: str, body: bytes) -> None:
         except OSError:
             pass
         return
+    # Reclaim BEFORE the cap check: purging garbage is free and often removes
+    # the pressure entirely, so evicting live entries first would be backwards.
+    _purge_superseded(dest)
     _evict_if_oversize(root)
 
 

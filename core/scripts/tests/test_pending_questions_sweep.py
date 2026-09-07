@@ -318,3 +318,135 @@ def test_inert_half_is_protected_by_TWO_independent_mechanisms(tmp_path):
     applied = mod._apply_auto_resolve(
         p, {r["id"] for r in rows}, {r["id"]: {"reason": "x"} for r in rows})
     assert applied == 0, "writer must refuse terminal-status entries outright"
+
+
+# --- Carrier-presence axis () ----------------------------------
+#
+# The forward direction: given an OPEN question, is there a goal that will ever
+# ACT on it? Both pre-existing checks point the other way (_h_source_goal_completed
+# maps a question BACK to its origin goal; the verify-learning check is
+# goal-to-question), so nothing asked this until now.
+
+def _carrier_ctx(carriers, goals_scanned=100):
+    return {"carriers": carriers, "goals_scanned": goals_scanned}
+
+
+def _goal(gid, status="pending", user_leg=False, via=("description",), link=False):
+    return {
+        "id": gid, "status": status, "has_user_leg": user_leg,
+        "via": list(via), "link_evidence": link,
+    }
+
+
+def test_carrier_skips_closed_questions():
+    mod = _import_sweep()
+    for status in ("resolved", "superseded", "retired", "closed", "done"):
+        entry = {"id": "pq-x", "status": status}
+        assert mod._carrier_verdict(entry, _carrier_ctx({})) is None, status
+
+
+def test_carrier_skips_ANSWERED_via_is_closed_not_is_settled():
+    """`answered` is closed for the ASKER and must not read as an orphan.
+
+    The module aliases SWEEP_SETTLED as TERMINAL_STATUSES, which EXCLUDES
+    {answered, agent_answered}. Using that alias here would report an answered
+    question as an uncarried orphan and manufacture work. _pending_question_status
+    names this exact substitution as the bug that made a blocked signal citing an
+    answered question undischargeable, so it gets its own test.
+    """
+    mod = _import_sweep()
+    assert "answered" not in mod.TERMINAL_STATUSES  # the trap is real
+    for status in ("answered", "agent_answered"):
+        entry = {"id": "pq-x", "status": status}
+        assert mod._carrier_verdict(entry, _carrier_ctx({})) is None, status
+
+
+def test_carrier_uncarried_when_no_goal_references_it():
+    mod = _import_sweep()
+    entry = {"id": "pq-orphan", "status": "pending"}
+    verdict, reason = mod._carrier_verdict(entry, _carrier_ctx({}))
+    assert verdict == "uncarried"
+    assert "no goal" in reason
+
+
+def test_carrier_terminal_is_NOT_folded_into_uncarried():
+    """guard-2526: a non-terminal-only filter cannot distinguish 'never filed'
+    from 'already finished'. Terminal carriers get their own verdict."""
+    mod = _import_sweep()
+    entry = {"id": "pq-done", "status": "pending"}
+    ctx = _carrier_ctx({"pq-done": [_goal("g-1", status="completed")]})
+    verdict, reason = mod._carrier_verdict(entry, ctx)
+    assert verdict == "carrier_terminal"
+    assert verdict != "uncarried"
+    assert "g-1" in reason
+
+
+def test_carrier_no_user_leg_is_its_own_verdict():
+    """The 2026-08-24 shape: a carrier exists but the question cannot reach the
+    user, because the digest keys on `user` in participants, not on the carrier
+    link. A carrier-presence-only check scores this clean."""
+    mod = _import_sweep()
+    entry = {"id": "pq-unreachable", "status": "pending"}
+    ctx = _carrier_ctx({"pq-unreachable": [_goal("g-2", user_leg=False)]})
+    verdict, reason = mod._carrier_verdict(entry, ctx)
+    assert verdict == "carrier_no_user_leg"
+    assert "user" in reason
+
+
+def test_carrier_requires_the_CONJUNCTION_live_and_user_leg():
+    mod = _import_sweep()
+    entry = {"id": "pq-ok", "status": "pending"}
+    ctx = _carrier_ctx({"pq-ok": [_goal("g-3", user_leg=True)]})
+    verdict, _ = mod._carrier_verdict(entry, ctx)
+    assert verdict == "carried"
+    # A terminal goal WITH a user leg is not a live carrier.
+    ctx2 = _carrier_ctx({"pq-ok": [_goal("g-3", status="completed", user_leg=True)]})
+    assert mod._carrier_verdict(entry, ctx2)[0] == "carrier_terminal"
+
+
+def test_carrier_empty_goal_index_yields_unknown_NOT_uncarried():
+    """Fail-safe: with no goal index there is no evidence of absence. Emitting
+    `uncarried` for every open question would be a fleet-wide false positive
+    built out of a failed read."""
+    mod = _import_sweep()
+    entry = {"id": "pq-x", "status": "pending"}
+    verdict, reason = mod._carrier_verdict(entry, _carrier_ctx({}, goals_scanned=0))
+    assert verdict == "unknown"
+    assert "not determined" in reason
+
+
+def test_describe_carriers_names_the_matched_field():
+    """The `via` clause is what lets a reader separate a structural link from a
+    passing prose mention without opening the goal."""
+    mod = _import_sweep()
+    out = mod._describe_carriers([_goal("g-9", via=("description", "progress_note"))])
+    assert "g-9" in out and "description" in out and "progress_note" in out
+
+
+def test_describe_carriers_sorts_link_evidence_first():
+    mod = _import_sweep()
+    rows = [
+        _goal("g-prose", via=("description",), link=False),
+        _goal("g-link", via=("origin_signal",), link=True),
+    ]
+    assert mod._describe_carriers(rows).index("g-link") < \
+        mod._describe_carriers(rows).index("g-prose")
+
+
+def test_goal_and_question_vocabularies_are_DECOUPLED_not_disjoint():
+    """guard-1127: a constant serving two subsystems is decoupled at the
+    consumer, never widened into one shared value.
+
+    Decoupled, NOT disjoint — `superseded` is legitimately a member of both, and
+    an earlier version of this test asserted disjointness and failed on exactly
+    that. The invariant that matters is that neither set is usable as the other:
+    a goal is never `answered`/`resolved`, a question is never `completed`.
+    """
+    mod = _import_sweep()
+    assert mod.GOAL_TERMINAL_STATUSES != mod.TERMINAL_STATUSES
+    # Question-only states must not leak into the goal vocabulary.
+    assert not ({"answered", "resolved", "retired"} & mod.GOAL_TERMINAL_STATUSES)
+    # Goal-only states must not leak into the question vocabulary.
+    assert not ({"completed", "expired", "decomposed"} & mod.TERMINAL_STATUSES)
+    # The overlap is real and intentional; pin it so a future widening is loud.
+    assert mod.GOAL_TERMINAL_STATUSES & mod.TERMINAL_STATUSES == {"superseded"}

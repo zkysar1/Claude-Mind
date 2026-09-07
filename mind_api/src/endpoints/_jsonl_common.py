@@ -112,6 +112,52 @@ def missing_flag_error(flags: List[str]):
     return Response.error(400, "missing_flag", f"Specify one of: {label}")
 
 
+def parse_int_param(value: Optional[str], name: str, default: int,
+                    *, positive_only: bool = True):
+    """Coerce a query-string integer, or refuse with a 400 ().
+
+    Returns `(n, None)` on success and `(None, <400 Response>)` on unparseable
+    input, so every call site reads the same way::
+
+        n, err = parse_int_param(q.get("recent"), "recent", 5)
+        if err is not None:
+            return err
+
+    ABSENT (None) and EMPTY ("") both yield `default`. Absent and unparseable
+    are DIFFERENT cases and only the second is an error — that distinction is
+    the whole point of the helper, and collapsing it back into a silent default
+    is the defect it replaces.
+
+    `positive_only` preserves a per-site difference that predates this helper
+    and is deliberately NOT normalised here — normalising it would be a second,
+    unmeasured behaviour change riding a refactor:
+
+      True  — a parsed value <= 0 falls back to `default`. This is what the two
+              byte-identical `_parse_n` copies did (experience.py, journal.py).
+      False — any parsed int is returned as-is, including 0 and negatives.
+              aspirations `stepping_stones` slices with a raw int, so `?limit=-3`
+              keeps meaning `archived[:-3]`. Surprising, but pre-existing and
+              out of scope.
+
+    Composing the refusal cannot itself throw (guard-3803: a bug while building
+    a deny message silently converts the refusal into a pass) — `name` is a
+    caller literal and `value` is a query-string str, so `!r` is total.
+    """
+    from ..server import Response
+    if value is None or value == "":
+        return default, None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None, Response.error(
+            400, "invalid_param",
+            f"{name} must be an integer, got {value!r}",
+        )
+    if positive_only and n <= 0:
+        return default, None
+    return n, None
+
+
 def flag(q: Dict[str, str], name: str) -> bool:
     """True iff query string `name` is present with a truthy value (1/true/yes)."""
     v = q.get(name)

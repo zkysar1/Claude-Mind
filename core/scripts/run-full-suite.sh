@@ -122,6 +122,34 @@ if [ "$_TL_SKIP" -eq 0 ] && [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
     # correct fail-open behaviour -- a suite must not be refused because a hook
     # dropped an env var -- but it means the lock's coverage is exactly the set of
     # runs whose env was injected. (The miss itself is  / .)
+    #
+    # HOW TO LAUNCH SO THE VARS ARE ACTUALLY THERE -- AND WHY THE OBVIOUS FORM IS
+    # A NO-OP (). guard-5124's remedy reads "export MIND_AGENT and
+    # MIND_SID INSIDE the backgrounded command". Written literally as
+    # `export MIND_AGENT MIND_SID`, that CREATES NOTHING: export on an UNSET
+    # name only marks the name for export, so the child's environment still has
+    # no such variable -- and unset is exactly the state a hook miss leaves you
+    # in, so that form fails in precisely the case it was written for. (The
+    # sibling `export STORAGE_BACKEND=local` in the same hint DOES work, because
+    # it carries a VALUE -- which is why the whole line reads as correct.)
+    # Measured on cc-09 2026-09-06 with a positive control: `unset X; export X`
+    # -> child sees X: False; `X=bar; export X` -> True; `env X=bar` -> True.
+    # USE LITERAL VALUES:
+    #     nohup env MIND_AGENT=<agent> MIND_SID=<sid> STORAGE_BACKEND=local \
+    #          bash core/scripts/run-full-suite.sh > <log> 2>&1 &
+    # (STORAGE_BACKEND=local is guard-955 on an own-cloud box.)
+    #
+    # DO NOT READ ANY OF THIS AS "BACKGROUNDING STRIPS THE INJECTION" -- guard-4048
+    # formed that hypothesis and REFUTED it by probe: a backgrounded call measured
+    # MIND_AGENT present, as did every foreground call. The hook fires PER CALL
+    # and can FAIL OPEN transiently, so a FOREGROUND shell can lack the vars too.
+    # That is why the remedy is to pass literal values, not to avoid `&`.
+    #
+    # THE DISCRIMINATOR IS TWO SIGNALS, NOT ONE. run-full-suite.py derives the log
+    # dir as "ayoai-suite-run-" + (agent or "shared"), so a run that really got the
+    # vars writes to <tmp>/ayoai-suite-run-<agent> while one that did not writes to
+    # <tmp>/ayoai-suite-run-shared. Check the WARN line AND the log dir: a change
+    # that only silences the warning has not fixed anything.
     # 2>&1 with NO `>/dev/null`: tree_lock.py `print`s its verdict to STDOUT, so
     # capturing stderr alone would yield an empty string and reprint nothing --
     # re-creating the same silent refusal in a new shape.
@@ -136,6 +164,19 @@ if [ "$_TL_SKIP" -eq 0 ] && [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
         echo "=== tree-lock: could not take the working tree ===" >&2
         echo "    ${_TL_ERR:-(acquire gave no reason)}" >&2
         echo "    Proceeding anyway -- this run is UNPROTECTED; a peer's merge may VOID its verdict." >&2
+        # Only the no-sid refusal is a launch-shape problem; a peer HOLDING the
+        # lock is a different condition and must not be answered with this advice
+        # ().
+        case "$_TL_ERR" in
+            *no-sid*)
+                echo "    REMEDY (g-115-9183): relaunch passing LITERAL values -- a bare export is a no-op here." >&2
+                echo "      nohup env MIND_AGENT=<agent> MIND_SID=<sid> STORAGE_BACKEND=local \\" >&2
+                echo "           bash core/scripts/run-full-suite.sh > <log> 2>&1 &" >&2
+                echo "    \`export MIND_AGENT MIND_SID\` on UNSET names creates nothing, so it cannot fix this." >&2
+                echo "    Confirm the relaunch worked by the LOG DIR (<tmp>/ayoai-suite-run-<agent>, not -shared)," >&2
+                echo "    not by the warning going quiet." >&2
+                ;;
+        esac
     fi
 fi
 

@@ -29,6 +29,8 @@ Design notes:
   - Grep uses Python regex, not subprocess, for portability and glob allowlist matching.
 """
 
+from __future__ import annotations
+
 import argparse
 import fnmatch
 import json
@@ -98,11 +100,19 @@ def resolve_store_path(virtual_path: str) -> Path | None:
 # ────────────────────────────── live-field probe ──────────────────────────────
 
 def _get_dotted(record, dotted: str):
-    """Identical semantic to audit-schema-gate.py and jsonl-field-probe.py.
+    """Same NULL-TERMINAL semantic as audit-schema-gate.py and jsonl-field-probe.py.
 
     A field is "present" only if every intermediate key exists AND the terminal
     value is non-null. A key written as null counts as absent — we want the
     registry to catch "schema declares this but nobody writes it."
+
+    NO LONGER identical to jsonl-field-probe.py in TRAVERSAL: that one descends
+    lists as of g-115-9120 (`goals.id` reaches every element of a `goals`
+    array); this copy and audit-schema-gate.py still stop at the first list and
+    report absent. Left as-is deliberately — a registry sweep asking "does
+    anyone write this declared field" over dict paths is not the same question
+    — but a dotted path through a list registered here WILL read as drifted.
+    Widen this before registering one, not after.
     """
     cur = record
     for part in dotted.split("."):

@@ -690,8 +690,22 @@ Did the chat-session changes touch framework files where regressions need a chec
        - New file expected      → existence check (test -f / test -d)
        - New behavior           → command_check + expected output
        - New convention         → assertion that the documented rule holds
-     PROPOSE adding to .claude/skills/verify-learning/SKILL.md Step 3
-     (the AUTHORITATIVE CHECK SOURCE per Step 3's comment).
+     PROPOSE adding to the check REGISTRY `core/config/verify-learning-checks.jsonl`
+     via `bash core/scripts/verify-check-registry.sh add --section <CODE>
+     --check '<text>' --why '<rationale>'` (--dry-run first, then `verify`, then
+     `show --section <CODE>` and PAGE to your text). NOT inline in SKILL.md.
+     # The checks LEFT that file on 2026-08-18 (g-115-6689): inline they hit
+     # 1,208,153 B against a 63,515 B skill-injection ceiling, so a run received
+     # ~5% plus a truncation marker. A check written inline today is installed,
+     # committed, greppable and NEVER RUN (guard-4767).
+     # THIS LANE ITSELF SENT READERS THERE until 2026-09-07 — it said "SKILL.md
+     # Step 3 (the AUTHORITATIVE CHECK SOURCE)". guard-4767 names the goal-level
+     # form of this hazard; a SKILL is the worse form, because it re-issues the
+     # stale destination on every run instead of once. Measured that day on this
+     # very lane: the dedup grep for "iteration-close" returned 0 against
+     # SKILL.md (10,183 B, holds no checks) while the registry holds 97, and a
+     # goal was nearly filed on that false zero. A stale SOURCE path fails
+     # LOUDLY; a stale DESTINATION fails SILENTLY — the write succeeds.
      Do NOT auto-edit verify-learning/SKILL.md without showing the user the
      diff first — verify-learning is a high-trust file.
      File the proposal as a Maintain-style goal under this world's

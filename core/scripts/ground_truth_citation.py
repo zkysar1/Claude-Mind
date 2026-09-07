@@ -75,12 +75,80 @@ _ASSERTION_PATTERNS = (_COPULA, _REPORTING, _COMPARISON)
 _URL = re.compile(r"https?://[^\s<>()\[\]]+")
 _BOARD_MSG = re.compile(r"\bmsg-\d{8}-\d{6}-[a-z0-9]+-\d+\b")
 _GOAL_ID = re.compile(r"\bg-\d{3}-\d{1,4}\b")
+# The framework's OWN durable rule ids (). A line whose only citation
+# was `guard-2024` reported `missing-citation` -- so citing the governing rule
+# for a disposition read as UNCITED, which is the alarm direction: the author
+# did the right thing and the gate punished it. A guardrail / reasoning-bank id
+# is a durable, retrievable record (`guardrails-read.sh --id`,
+# `reasoning-bank-read.sh --id`), which is exactly the property that separates a
+# source token from "a bare publication name" in the module docstring.
+#
+# THIS DELIBERATELY DOES NOT MAKE THEM `checkable`. `analyze` adjudicates only
+# url / node-key, so a rule-id-only cluster now falls into `if not checkable:
+# continue` -- the SAME treatment goal-id-only clusters already get, which the
+# _RATIO_RUN note below records as pre-existing policy rather than a new hole.
+# Making them checkable would be WORSE: `retrieved_predicate` matches manifest
+# values, retrieve.sh writes `#prov:` rows carrying the QUERY text and not the
+# ids it returned, so every rule-id would come back unretrieved and BLOCK --
+# re-creating this defect one layer down.
+#
+# THE GAMING VECTOR, stated rather than left for a reader to find: an author can
+# now silence `missing-citation` by appending "(guard-NNNN)". That is true of
+# `g-NNN-NN` today and is the same pre-existing question about `checkable`;
+# this change adds no new class of evasion, it removes an asymmetry where the
+# framework's own ids were the one durable id shape that did not count.
+# No overlap with _GOAL_ID: `\bg-\d{3}` cannot match inside "guard-2024".
+_RULE_ID = re.compile(r"\b(?:guard|rb)-\d{2,6}\b")
 # A tree-node key is a slash-joined slug ("system/daemon-only-architecture"),
 # optionally the full store path. Anchored on the slug shape so ordinary prose
 # containing a slash ("and/or") cannot satisfy a citation requirement.
 _NODE_KEY = re.compile(
     r"\b(?:world/knowledge/tree/)?[a-z0-9]+(?:-[a-z0-9]+)*"
     r"(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+(?:\.md)?\b")
+
+# A slash-joined run of BARE NUMBERS is a ratio, not a citation -- "6/6 suites
+# passed", "124/125", "20/40/80", "0/0/0". _NODE_KEY's segment class is
+# [a-z0-9]+, which admits all-digit segments, so every pass-count in every
+# closure note was being extracted as a node-key and then adjudicated: it names
+# no file, no tree node and no URL, so it could only ever come back uncited.
+#
+# MEASURED before tightening (, guard-3086 -- a pattern specified from
+# the few instances one author saw encodes those instances, not the defect):
+# over the live world store, 3,033 goals / 1,584 outcome+progress notes yielding
+# 11,507 node-key tokens, 2,055 of them (17.86%, 939 distinct) are this shape.
+#
+# THE EXCLUSION IS SAFE IN THE guard-1901 DIRECTION, which is the only reason it
+# is done at extraction rather than by demoting to `unadjudicable`. Tightening an
+# extractor weakens a negative assertion: a dropped token can take a cluster from
+# a blocking finding to `if not checkable: continue` -- no finding at all. That
+# is alarm suppression, and it is why the broader "require a hyphen or a known
+# root" tightening was REJECTED here: it would also drop genuine unhyphenated
+# node keys (guard-6054 tells authors to cite path-qualified keys, and 3,585
+# path-ish-but-unresolved tokens were measured). An all-digit run is different in
+# kind, not degree: no file path, tree-node key or URL can consist only of digits
+# and slashes, so the excluded set provably contains no GENUINE citation.
+#
+# THAT LAST CLAUSE USED TO READ "and no negative assertion is weakened", AND THE
+# MEASUREMENT FALSIFIED IT -- recorded here rather than quietly reworded, because
+# the overclaim is the more instructive half. Diffing FINDINGS (not token counts;
+# the risk is a lost alarm, so tokens are the wrong unit) pre/post across all
+# 1,587 notes at retrieved=False -- the worst case for suppression -- gives
+# 1,321 identical, 248 changed-kind, and 18 notes that lose a blocking finding
+# entirely. The 248 are strict improvements: decorative-citation -> the honest
+# missing-citation, since the ratio was the only thing being "cited".
+#
+# The 18 are NOT guard-1901 suppression, and the reason is measured, not argued:
+# every one of the 32 affected clusters retains ONLY (goal-id x28, board-msg +
+# goal-id x4) -- zero retain a url or node-key. `checkable` is url/node-key only,
+# so `if not checkable: continue` already declines to adjudicate goal-id-only
+# clusters CORPUS-WIDE. The phantom ratio was pulling these 18 OUT of that
+# pre-existing policy and into a verdict that could only ever fail. Removing it
+# returns them to the same treatment every other goal-id-only cluster gets. The
+# alarm lost was never real; that is the defect this fix exists to remove.
+#
+# Whether goal-id-only clusters SHOULD escape adjudication is a separate,
+# pre-existing question about `checkable` -- deliberately not touched here.
+_RATIO_RUN = re.compile(r"^\d+(?:/\d+)+$")
 _UNVERIFIED = re.compile(r"\[\s*UNVERIFIED\b", re.IGNORECASE)
 
 # Structural lines that can never be a fact line.
@@ -116,6 +184,7 @@ PARTIAL = "partial"
 
 class Finding(NamedTuple):
     kind: str                # "missing-citation" | "decorative-citation"
+                             # | "unadjudicable-citation" (advisory, )
     start_line: int
     end_line: int
     detail: str
@@ -147,13 +216,22 @@ def source_tokens(text: str) -> list:
     for m in _URL.finditer(text):
         found.append(("url", m.group(0)))
     masked = _URL.sub(" ", masked)
-    for kind, pat in (("board-msg", _BOARD_MSG), ("goal-id", _GOAL_ID)):
+    for kind, pat in (("board-msg", _BOARD_MSG), ("goal-id", _GOAL_ID),
+                      ("rule-id", _RULE_ID)):
         for m in pat.finditer(masked):
             found.append((kind, m.group(0)))
     masked = _BOARD_MSG.sub(" ", masked)
     masked = _GOAL_ID.sub(" ", masked)
+    # Masked BEFORE the node-key scan for the same reason as the two above: an
+    # unmasked "guard-2024" is harmless to _NODE_KEY (which requires a slash),
+    # but leaving it in place would make the ordering contract depend on that
+    # accident rather than on the rule every other id kind follows.
+    masked = _RULE_ID.sub(" ", masked)
     for m in _NODE_KEY.finditer(masked):
-        found.append(("node-key", m.group(0)))
+        tok = m.group(0)
+        if _RATIO_RUN.match(tok):
+            continue          # a pass-count, not a citation
+        found.append(("node-key", tok))
     return found
 
 
@@ -212,7 +290,7 @@ def iter_clusters(text: str) -> Iterable[Cluster]:
         yield c
 
 
-def analyze(text: str, retrieved=None) -> list:
+def analyze(text: str, retrieved=None, expressible=None) -> list:
     """Findings for ``text``.
 
     ``retrieved`` is a predicate ``(kind, value) -> bool`` answering "was this
@@ -220,6 +298,25 @@ def analyze(text: str, retrieved=None) -> list:
     this module stays pure and testable with no manifest on disk. When it is
     None the decorative-citation check is SKIPPED rather than assumed-true: a
     check that cannot run must not manufacture a pass (guard-1760).
+
+    ``expressible`` is an optional predicate ``(kind, value) -> bool`` answering a
+    DIFFERENT question: "could the provenance manifest EVER have recorded this
+    citation?" It exists because guard-1760's contrapositive binds just as hard as
+    guard-1760 itself -- a check that could not run must not report a FAIL either,
+    and calling an unrecordable citation `decorative-citation` asserts the session
+    never fetched a source when the truth is that nothing was ever asked. This
+    convention names the FALSE-POSITIVE rate as the binding constraint ("a lint
+    that fires on ordinary writes gets switched off"), and that is exactly the rate
+    this raises. Measured 2026-09-05: 9,727 of 12,657 git-tracked files (76.9%) sit
+    outside the manifest's advisory scope and can never clear the check, .claude/
+    rules/*.md among them -- a lower bound, since product repos and most of world/
+    are not in the repo at all (g-115-9059).
+
+    It is OPTIONAL and DEFAULTS TO EXPRESSIBLE, which is the fail-safe direction:
+    passing nothing preserves the old behaviour exactly, and a citation is demoted
+    only when the caller can POSITIVELY show the manifest could never hold it.
+    Demoting on doubt would suppress alarms, which is the one direction this gate
+    must never fail in.
     """
     findings = []
     for cl in iter_clusters(text):
@@ -263,6 +360,26 @@ def analyze(text: str, retrieved=None) -> list:
                 f"{cited}. A ranged peek is not evidence for the claim -- "
                 "re-read the region that supports it. Same severity as "
                 "uncited; the difference is what to DO about it.", sample))
+        elif expressible is not None and not any(
+                expressible(k, v) for k, v in checkable):
+            # THE THIRD VERDICT (). Not a softer decorative-citation --
+            # a different QUESTION. `decorative-citation` asserts the session never
+            # fetched the source; that assertion is only available when the manifest
+            # COULD have held the answer. Where it structurally could not, nothing
+            # was adjudicated, and saying "NOT retrieved" states as measured fact
+            # something never measured.
+            # NOTE THE ORDER: this branch sits AFTER the PARTIAL branch on purpose.
+            # A ranged read is EXPRESSIBLE and WAS expressed -- the manifest holds a
+            # #partial row -- so the check RAN and answered "only in part". That is
+            # an answer, not a silence, and it keeps its original severity. Only
+            # genuine silence is demoted here.
+            findings.append(Finding(
+                "unadjudicable-citation", cl.start_line, cl.end_line,
+                f"cited, and NOT ADJUDICABLE from the provenance manifest: {cited}. "
+                "The manifest structurally cannot record this citation class, so "
+                "this is NOT evidence the source went unread -- the check could not "
+                "run. Advisory: it does NOT fail the verdict (guard-1760 read in "
+                "the FAIL direction; g-115-9059).", sample))
         else:
             findings.append(Finding(
                 "decorative-citation", cl.start_line, cl.end_line,

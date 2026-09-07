@@ -924,6 +924,112 @@ def _analyze_node_body(text):
     return line_count, int(char_count / CHARS_PER_TOKEN), refresh_sections
 
 
+#: Goal statuses that mean "nobody is on this any more". A terminal owner still
+#: answers "has anyone looked at this?", so it is reported — but an OPEN goal
+#: outranks it, because the two answer different reader questions.
+_OWNER_TERMINAL_STATUSES = frozenset(
+    ("completed", "skipped", "expired", "superseded", "decomposed"))
+
+
+def _distill_owner_index(stems):
+    """Map each node stem -> an owning goal id, or None. ANNOTATION ONLY.
+
+    Answers the one question `--distill-candidates` could never answer: a
+    reader of tree-debt output cannot tell "nobody has looked at this" from
+    "g-115-8284 owns it, pending". The disposition record already exists — it
+    is the per-node goal — and what had never been run is the JOIN. Twice the
+    reader re-derived it instead and filed a fresh census: an in-code census of
+    ELEVEN on 2026-07-30 and another of ELEVEN on 2026-08-30, 31 days and ~43
+    cadence firings apart, same population, two full investigations (sig-229 —
+    a contract audit censuses BOTH sides completely and never runs the JOIN).
+
+    Three correctness constraints, each measured rather than assumed:
+
+    * **Read the ARCHIVE too, not just the live store** (guard-1555). A
+      completed aspiration is archived and every goal inside it disappears from
+      the live store, so a live-only join reports a false ``owned_by: null``.
+      Measured 2026-09-07: 3,097 live goals against 2,480 archived — a
+      live-only scan is blind to 44% of the corpus.
+    * **Match DESCRIPTION as well as TITLE** (guard-2228). An owner names the
+      SYMPTOM in its title and the artifact only in its description, so a
+      title-only probe is structurally incapable of finding owners that are
+      sitting right there, and its empty result reads as "unowned, file it".
+    * **Two token sets per stem** — hyphenated and spaced. A stem spelled with
+      a space is missed by a hyphenated match and vice versa; that exact miss
+      (g-115-4454, whose title spells the stem with a space) is what made a
+      3-of-10 "no owner" reading a probe artifact rather than a fact.
+
+    ANNOTATE, NEVER SUPPRESS. The return value is annotation and nothing else:
+    no caller may use it to drop or filter a candidate row. ``distill_exempt``
+    deliberately does not suppress the read-cap arm (pinned by
+    ``test_distill_exemption_does_NOT_suppress_the_readcap_arm``), and an
+    ``owned_by`` that filtered would hide genuinely over-cap nodes behind stale
+    goals — the opposite of what this exists to do.
+
+    FAIL-OPEN: any read or parse failure yields all-None rather than raising.
+    Candidate production must never depend on the aspiration store being
+    readable; a missing owner is a weaker annotation, an exception is a broken
+    producer.
+    """
+    owners = {stem: None for stem in stems}
+    if not stems:
+        return owners
+    try:
+        # Late import, deliberately: the daemon imports this module on its load
+        # path and only a read-cap candidate needs the aspiration store, so the
+        # cost (~0.09s) is paid on the rare branch instead of every import.
+        import aspirations as _asp  # noqa: PLC0415
+
+        variants = {}
+        for stem in stems:
+            low = stem.lower()
+            variants[stem] = {low, low.replace("-", " "), low.replace("_", " ")}
+
+        best = {}
+        for path in (_asp.LIVE_PATH, _asp.ARCHIVE_PATH):
+            try:
+                records = _asp.read_jsonl(path)
+            except Exception:
+                continue
+            for record in records or []:
+                for goal in (record.get("goals") or []):
+                    gid = goal.get("id")
+                    if not gid:
+                        continue
+                    title = (goal.get("title") or "").lower()
+                    body = (goal.get("description") or "").lower()
+                    is_open = (goal.get("status") or "") not in _OWNER_TERMINAL_STATUSES
+                    for stem, forms in variants.items():
+                        in_title = any(form in title for form in forms)
+                        in_body = in_title or any(form in body for form in forms)
+                        if not in_body:
+                            continue
+                        # RANK, do not first-match. Measured 2026-09-07 on this
+                        # corpus: description matching is what lifts recall from
+                        # 3/6 to 6/6 (guard-2228 — a title-only probe is a null
+                        # instrument), but it also lets a CENSUS goal that merely
+                        # ENUMERATES node names claim ownership of every node it
+                        # counted. 's own addendum lists seven node
+                        # stems, so an unranked scan named that goal as the owner
+                        # of nodes it only tallied, and picked  over the
+                        #  an independent census had identified.
+                        # A TITLE hit is a claim ABOUT the node; a description hit
+                        # may be a claim about a LIST containing it. So title
+                        # outranks description, then open outranks terminal, and
+                        # a description-only hit is reported only when nothing
+                        # better exists — where the alternative is a false "nobody
+                        # has looked at this".
+                        rank = (1 if in_title else 0, 1 if is_open else 0)
+                        prior = best.get(stem)
+                        if prior is None or rank > prior[1]:
+                            best[stem] = (gid, rank)
+        for stem, hit in best.items():
+            owners[stem] = hit[0]
+    except Exception:
+        return {stem: None for stem in stems}
+    return owners
+
+
 def get_distill_candidates(tree, include_skipped=False, *,
                            config_dir=None, resolve_path=None):
     """Return nodes eligible for DISTILL based on utility + structural thresholds.
@@ -1160,6 +1266,12 @@ def get_distill_candidates(tree, include_skipped=False, *,
                 "file": file_path,
                 "trigger": trigger,
                 "recommended_action": recommended_action,
+                # Filled in AFTER the loop for read-cap rows only (see the
+                # annotation block below). Present on every row so the emitted
+                # schema is stable for consumers — `trigger` and
+                # `recommended_action` are emitted unconditionally and this is
+                # the same shape.
+                "owned_by": None,
             })
         elif include_skipped:
             # Attribute the skip to the most specific gate that failed.
@@ -1201,6 +1313,32 @@ def get_distill_candidates(tree, include_skipped=False, *,
     # leaf would re-create the invisibility the arm-split just fixed — the arm
     # would fire and then never surface within a per-invocation cap.
     _READ_CAP_TRIGGERS = ("oversized_append_grown", "oversized_not_append_grown")
+    # OWNERSHIP ANNOTATION ( scope addendum). Read-cap rows only: they
+    # are the ones a reader triages against the goal queue, and scoping the join
+    # to them keeps it off the common path (the store scan is skipped entirely
+    # when no read-cap candidate fired). ANNOTATE, NEVER SUPPRESS — this adds a
+    # field and removes no row; `distill_exempt` already declines to suppress
+    # this arm, and an owner-based filter would hide genuinely over-cap nodes
+    # behind stale goals.
+    _readcap_rows = [c for c in candidates if c["trigger"] in _READ_CAP_TRIGGERS]
+    if _readcap_rows:
+        # FAIL-OPEN AT THE CALL SITE, not only inside the helper. The helper
+        # already swallows store errors, but "candidate production must never
+        # depend on the aspiration store" is a property of THIS function, and a
+        # guarantee that lives only in the callee is one refactor away from
+        # being gone. Pinned by
+        # test_a_raising_join_does_not_break_candidate_production, which caught
+        # exactly this: the first cut annotated outside a try and a raising join
+        # took the whole producer down with it.
+        try:
+            _owners = _distill_owner_index(
+                sorted({str(c["key"]).rsplit("/", 1)[-1] for c in _readcap_rows}))
+            for _c in _readcap_rows:
+                _c["owned_by"] = _owners.get(str(_c["key"]).rsplit("/", 1)[-1])
+        except Exception:
+            # Rows keep the `owned_by: None` they were emitted with. A weaker
+            # annotation is the correct degradation; a broken producer is not.
+            pass
     candidates.sort(key=lambda x: (0 if x["trigger"] in _READ_CAP_TRIGGERS else 1, x["utility_ratio"]))
     if include_skipped:
         return {"candidates": candidates, "skipped": skipped}
@@ -2168,6 +2306,22 @@ def cmd_read(args):
                 # .
                 "last_updated": node.get("last_updated"),
                 "article_count": node.get("article_count", 0),
+                # retrieval_count + utility_ratio: same defect as last_updated /
+                # article_count above, one consumer over. The tree index carries
+                # both on every node; dropping them from this projection made a
+                # RETIRE-style scan written as `.get("retrieval_count") or 0`
+                # default the WHOLE population to zero — and zero IS the RETIRE
+                # trigger. Measured on prod 2026-08-30: 195 of 195 childless
+                # leaves reported eligible for a DESTRUCTIVE archive when the
+                # true count was ONE (194/195 were nonzero in the index). Only
+                # the body-read gate stopped it.
+                # Do NOT "fix" this by telling callers to read per-node instead:
+                # that costs one call per node, so it gets SAMPLED, and the
+                # sampled answer (n=25 -> "zero candidates") was ALSO wrong while
+                # reading as more authoritative for coming from the corrected
+                # path. .
+                "retrieval_count": node.get("retrieval_count", 0),
+                "utility_ratio": node.get("utility_ratio"),
                 "children": node.get("children", []),
             }
         print(json.dumps({"nodes": compact, "total": len(compact)},

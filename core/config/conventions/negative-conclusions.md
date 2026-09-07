@@ -441,3 +441,45 @@ built" verified rather than assumed. Same root as
 goal-creation-time gate that flags build-verb goals lacking a prior-search
 note is a possible future hardening, deferred until the cycle detector shows
 the pattern is frequent enough to warrant it (g-305-10 scope decision).
+
+### A measured absence is scoped to the REF it was measured against (g-115-8884)
+
+Every negative conclusion above asks whether the PROBE was sound. This one asks
+a question none of them do: **which tree did it run against?** A probe can be
+correct, positive-controlled, and honestly reported, and still be false about
+the shipping branch — because the answer was true of a different revision.
+
+`git grep` and `grep -r` without a ref search the WORKING TREE, which on a
+long-lived checkout is an arbitrary point in history. A stale local `dev` is
+byte-indistinguishable from a current one: same command, same clean rc, same
+plausible zero, no warning anywhere.
+
+**Rule**: any goal, defer, or note whose premise is a measured absence MUST
+record the ref it was measured against — `git fetch` then
+`git rev-parse origin/<branch>`, and the sha beside the finding. Prefer the ref
+form of the probe (`git grep <pattern> origin/dev -- <path>`) over the
+working-tree form. A premise with no sha is not re-checkable: the next reader
+cannot tell a fresh negative from an inherited one, so they either re-run it
+(paying the cost again) or trust it (inheriting the error).
+
+**A POSITIVE CONTROL CANNOT CATCH THIS, and that is the whole reason this
+section exists.** Measured on g-368-43 (2026-09-06): echo ran
+`git grep -c control -- .../modules/` at dev `4462144`, got a real zero, ran the
+prescribed positive control (`generateIntent` → 4 files) and it PASSED exactly as
+predicted — so the reading was reported as a fresh negative. But `4462144`
+predates the merge that created the consumer (`af9e964`, PR #376) by ~32 hours;
+`git merge-base --is-ancestor 4462144 af9e964` returns YES. The zero was correct
+FOR THAT TREE and said nothing about the tree the claim governed. The control
+was chosen from long-stable code, so it validated the INSTRUMENT (the grep
+resolves on this path) while being blind to the REVISION by construction.
+
+So: to discriminate a revision, either (a) state the sha and verify it is current
+(fetch + rev-parse — one extra command), or (b) choose a control that CHANGED
+across the revision in question. A control that exists at both revisions cannot
+distinguish them, however well it passes.
+
+Two further reproductions in one session, both from the same shape: g-369-51
+(a feature measured NOT built off a WIP branch ~3h after it shipped to
+origin/dev) and g-115-8855 (a complete duplicate built against a stale tree).
+Sibling of `exhaustive-search-before-negation.md`, which governs WHERE to search;
+this governs WHEN — i.e. at which revision — the search was valid.

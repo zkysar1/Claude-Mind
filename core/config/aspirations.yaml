@@ -2481,7 +2481,28 @@ reducer_promotion:
   # match later on some box's disk. Laptop / on-demand / WSL boxes stay OFF the
   # list deliberately — a box that sleeps is a box whose claim goes stale.
   # Empty list = nothing is eligible, which is the correct default.
-  eligible_machines: []
+  # DECISION 2026-09-06 (alpha, owner-proxy under the 2026-09-05 mandate, for the
+  # 2026-09-07 quiet-window kill-test lane --  outcome 3, runbook §2):
+  # the long-lived lxc containers on zakbox1 that carry THIS world's Mind checkout
+  # and were observed as live fleet Bodies on 2026-09-06 (fleet-live-bodies.sh),
+  # plus cc-10 (the agent-agnostic rehearsal box the runbook was rehearsed on).
+  # Ids are the runner-claim `machine_id` strings (short hostnames, e.g. 'cc-04').
+  # Deliberately OFF the list: LAPTOP-3IOFCNEO / DESKTOP-O91DLK2 (sleep, WSL),
+  # zakpod1 (GPU host, no Mind), cc-06 / cc-11 / cc-12 (ZDS world), zc-0N (no
+  # checkout), cc-14 (not observed as a fleet Body; add when it hosts one).
+  # Populating this arms NOTHING: G1 `enabled` stays false and G2
+  # `fence_verified_at` stays null; it only lets kill-test 2's dry_run() reach
+  # G3/G4/G6 and produce evidence.
+  eligible_machines:
+    - cc-02
+    - cc-03
+    - cc-04
+    - cc-05
+    - cc-07
+    - cc-08
+    - cc-09
+    - cc-10
+    - cc-13
 
 # --- Recovery gate (script-gated crashed-runner auto-recovery) ---
 # core/scripts/recovery-gate.sh fires from the SessionStart hook when ALL FOUR

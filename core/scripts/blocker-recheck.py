@@ -60,6 +60,8 @@ Exit codes: always 0 (reporting tool). Use the JSON output's `actions_taken`
 field to determine what changed.
 """
 
+from __future__ import annotations
+
 import argparse
 import datetime as dt
 import json

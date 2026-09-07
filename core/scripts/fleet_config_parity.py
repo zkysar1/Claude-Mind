@@ -141,6 +141,8 @@ if hasattr(sys.stderr, "reconfigure"):
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, g-115-3030)
+
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 MANIFEST = PROJECT_ROOT / "core" / "config" / "fleet-manifest.yaml"
 
@@ -444,7 +446,19 @@ for p in "$HOME"/.ssh/*.pub; do
     [ "$fe" = "$PRIV" ] && IS_CFG=yes
   done
   case "$SSHCMD" in *"$PRIV"*) IS_CFG=yes ;; esac
-  [ "$IS_CFG" = yes ] && say configured_pubkey "$BODY"
+  # `if`, NOT `[ ... ] && say ...`. This is the LAST command of the LAST loop of
+  # this collector, so a short-circuited `&&` makes the whole script exit 1
+  # whenever the final *.pub is not the git-configured key -- which is the NORMAL
+  # arrangement on any node carrying a stale deploy key alongside its read-write
+  # one. `_collect` treats rc!=0 as fatal and returns ({}, "local collect rc=1"),
+  # DISCARDING complete, correct stdout, and the caller then reports the node
+  # UNREACHABLE and skips every parity check for it. An `if` whose branch is not
+  # taken exits 0, so the script's status no longer carries an incidental test
+  # result. (g-115-3803; the red test was a correct tripwire, so the fix is here
+  # and the `assert p.returncode == 0` positive control stays untouched.)
+  if [ "$IS_CFG" = yes ]; then
+    say configured_pubkey "$BODY"
+  fi
 done
 """
 
@@ -1314,12 +1328,13 @@ def _age_hours(ts, now):
     """
     if not ts:
         return None
-    try:
-        parsed = datetime.fromisoformat(str(ts).strip().replace("Z", ""))
-    except (TypeError, ValueError):
+    # parse_naive_iso always returns naive-or-None, so no tzinfo branch is
+    # needed here. It also CONVERTS an offset (.astimezone) where the branch
+    # this replaced DISCARDED it, so an offset-bearing stamp now yields the
+    # right instant instead of the wall-clock reading (guard-1398/guard-4372).
+    parsed = parse_naive_iso(ts)
+    if parsed is None:
         return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.replace(tzinfo=None)
     return (now - parsed).total_seconds() / 3600.0
 
 
@@ -1529,6 +1544,20 @@ def run(nodes_filter=None, want_json=False, file_investigate=False, strict=False
 
     if file_investigate and drifted:
         _file_investigate(drifted, payload, kind="drift")
+    if file_investigate and box_drift:
+        # g-115-9213: box drift is a THIRD exit-1 population and it filed NOTHING.
+        # The two branches around it gate on `drifted` and `blackout`; `box_drift`
+        # belongs to neither, so a run could print BOX DRIFT, exit 1, and leave no
+        # goal behind for anyone to pick up. Measured 2026-09-06 with
+        # --file-investigate wired: five live boxes unmeasured, reported every
+        # sweep, owned by nobody.
+        # Its own kind, so its own origin_signal — a standing node-drift
+        # Investigate must never dedup away a coverage gap, nor the reverse. Same
+        # argument the blackout arm already makes.
+        # STILL UNFILED, deliberately out of this goal's scope and named so the
+        # next reader does not have to re-derive it: roster_drift and mid_drift
+        # also set exit 1 (below) and also file nothing.
+        _file_investigate(box_drift, payload, kind="box-drift")
     if file_investigate and blackout:
         # NON-self only: the blackout report calls these "peer nodes", and a
         # self-collect failure listed among them inflates the count and buries the
@@ -1618,9 +1647,17 @@ def _file_investigate(nodes, payload, kind="drift"):
     SEPARATE origin_signal so the two never dedup against each other: they have
     different causes and different fixes, and a standing drift Investigate must not
     swallow a blackout (nor the reverse).
+    kind="box-drift" — live boxes with no manifest node (g-115-9213). Third signal,
+    same argument: a coverage gap and a misconfigured node are different findings
+    with different fixes, so neither may dedup the other away. NOTE the argument
+    shape differs here — `nodes` is the list of already-rendered drift LINES from
+    _box_parity, not node dicts, because this population by definition has no node
+    record: it IS the set of live boxes the manifest does not describe.
     """
-    signal = ("investigate:fleet-config-blackout" if kind == "blackout"
-              else "investigate:fleet-config-drift")
+    signal = {
+        "blackout": "investigate:fleet-config-blackout",
+        "box-drift": "investigate:fleet-box-not-in-manifest",
+    }.get(kind, "investigate:fleet-config-drift")
     try:
         from _runtime_bash import bash_cmd  # guard-580 + guard-581
         q = subprocess.run(
@@ -1643,7 +1680,41 @@ def _file_investigate(nodes, payload, kind="drift"):
         return
 
     lines = []
-    if kind == "blackout":
+    if kind == "box-drift":
+        for d in nodes:
+            lines.append("- %s" % d)
+        desc = (
+            "Filed automatically by core/scripts/fleet-config-parity.sh at %s from %s.\n\n"
+            "COVERAGE GAP: %d live box(es) run a Mind and have NO fleet-manifest node, "
+            "so this checker has never measured them. Their config drift is invisible "
+            "to the entire sweep — the per-node totals count MANIFEST nodes, so a clean "
+            "'N PASS / 0 DRIFT' line says nothing whatever about these boxes. This is "
+            "the coverage half of the gap, not a misconfiguration: nothing is known to "
+            "be wrong on them, and nothing could be.\n\n%s\n\n"
+            "CLASSIFY EACH BOX — register it, or exclude it with a stated reason. Do "
+            "not assume one homogeneous class; check what each box actually is first. "
+            "Its newest body-heartbeat carrier names the resident agent and the "
+            "MACHINE_ID it self-reports, which is enough to tell a fleet node from a "
+            "workstation.\n\n"
+            "REGISTERING NEEDS MEASURED FIELDS AND A VANTAGE POINT. A manifest node "
+            "carries addr / shape / user / root and no carrier supplies any of them — "
+            "_box_parity deliberately does NOT auto-append for exactly this reason: "
+            "appending guessed fields trades a visible gap for invisible wrong data. "
+            "The bar the existing rows meet is a successful non-self collection over "
+            "ssh (which proves addr/user/shape) plus root_exists (which proves root). "
+            "So this must be run from a box that can reach these hosts: from a box "
+            "with no ssh route every node reports UNREACHABLE and nothing can be "
+            "measured.\n\n"
+            "Re-run: bash core/scripts/fleet-config-parity.sh --json\n"
+            "Manifest: core/config/fleet-manifest.yaml (add the node rows there).\n"
+            "No secret VALUE appears above or anywhere in this checker's output paths — "
+            "env vars are compared by key NAME only."
+            % (payload["checked_at"], payload["checked_from"], len(nodes),
+               "\n".join(lines))
+        )
+        title = ("Investigate: %d live box(es) have no fleet-manifest node — never "
+                 "measured" % len(nodes))
+    elif kind == "blackout":
         for r in nodes:
             lines.append("- %s (%s): %s" % (_node_label(r), r["host"],
                                             r.get("detail") or "UNREACHABLE"))

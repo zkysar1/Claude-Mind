@@ -409,3 +409,213 @@ def test_live_git_merge_brand_new_meta_index_does_not_wedge(tmp_path):
     scores = {m["id"]: m["score"] for m in got["monitors"]}
     assert scores == {"m1": 0.11, "m2": 0.20, "m3": 0.33}, (
         f"both boxes' edits must survive the merge, got {scores}")
+
+
+# ── : the id-union RESURRECTED removals; %O now decides ────────────
+#
+# The .gitattributes rationale that routed these three basenames here claimed a
+# record-keyed union "unions them by record/counter rather than by line -- so
+# they self-heal like the union files without resurrecting pruned/edited
+# history". That premise was measured FALSE: id-keying changes what counts as a
+# DUPLICATE, never whether a one-sided record SURVIVES. These pin the corrected
+# semantics AND the degradation property that keeps the change neutral.
+# Constraints honoured: guard-1068 (never naive union-by-id on these stores),
+# guard-1005 (match the strategy to the mutation model), guard-907 (commutative,
+# BYTE-identical).
+
+def test_removal_is_applied_not_resurrected():
+    """archive_sweep removed exp-A on our side; a stale peer still holds it."""
+    base = _jsonl({"id": "exp-A"}, {"id": "exp-B"})
+    ours = _jsonl({"id": "exp-B"})
+    theirs = _jsonl({"id": "exp-A"}, {"id": "exp-B"})
+    out = _lines(drv.merge_bytes("agents/x/experience.jsonl", ours, theirs, base))
+    assert [r["id"] for r in out] == ["exp-B"], "exp-A was resurrected"
+
+
+def test_journal_rotation_is_applied_not_resurrected():
+    """journal.jsonl has no id, so it is canon-keyed -- rotation must still apply."""
+    j1, j2, j3 = {"ts": "1", "e": "j1"}, {"ts": "2", "e": "j2"}, {"ts": "3", "e": "j3"}
+    out = _lines(drv.merge_bytes("agents/x/journal.jsonl",
+                                 _jsonl(j3), _jsonl(j1, j2, j3), _jsonl(j1, j2, j3)))
+    assert [r["e"] for r in out] == ["j3"], "rotated entries were resurrected"
+
+
+def test_archive_mutation_survives_instead_of_reverting():
+    """set_field edited our side; theirs is untouched and equals the base.
+
+    The pre-fix union kept the lexicographically larger canonical form, which
+    silently REVERTED the edit -- data loss with no error and no detection."""
+    base = _jsonl({"id": "exp-A", "status": "archived"})
+    ours = _jsonl({"id": "exp-A", "status": "archived", "reviewed": True})
+    out = _lines(drv.merge_bytes("agents/x/experience-archive.jsonl",
+                                 ours, base, base))
+    assert out == [{"id": "exp-A", "status": "archived", "reviewed": True}]
+
+
+def test_one_sided_add_is_kept_not_mistaken_for_a_delete():
+    """The load-bearing negative: a record absent from the base is an ADD.
+
+    If this ever fails the rule has become too aggressive and is eating real
+    work -- the failure direction that would be far worse than the resurrection
+    it replaces."""
+    base = _jsonl({"id": "exp-A"})
+    out = _lines(drv.merge_bytes("agents/x/experience.jsonl",
+                                 _jsonl({"id": "exp-A"}),
+                                 _jsonl({"id": "exp-A"}, {"id": "exp-N"}), base))
+    assert sorted(r["id"] for r in out) == ["exp-A", "exp-N"]
+
+
+def test_three_way_is_byte_identical_commutative_with_base():
+    """guard-907: both machines must compute the SAME bytes from either vantage.
+
+    Exercised with a base in play and a deletion on one side, so every branch of
+    the 3-way rule participates -- not just the trivially-symmetric union."""
+    base = _jsonl({"id": "exp-A"}, {"id": "exp-B"})
+    ours = _jsonl({"id": "exp-B"}, {"id": "exp-O"})
+    theirs = _jsonl({"id": "exp-A"}, {"id": "exp-B"}, {"id": "exp-T"})
+    p = "agents/x/experience.jsonl"
+    assert drv.merge_bytes(p, ours, theirs, base) == drv.merge_bytes(p, theirs, ours, base)
+
+
+def test_empty_base_degrades_exactly_to_the_old_union():
+    """git supplies an empty %O on add/add, where nothing can have been deleted.
+
+    Every record then takes the not-in-base arm, so the result is byte-identical
+    to the historical union -- this is what makes the change safe to ship."""
+    ours = _jsonl({"id": "exp-A"}, {"id": "exp-B"})
+    theirs = _jsonl({"id": "exp-B"}, {"id": "exp-C"})
+    p = "agents/x/experience.jsonl"
+    legacy = drv._dump_jsonl(drv.cm._union_dict_list(
+        drv._parse_jsonl(ours), drv._parse_jsonl(theirs), key_fields=("id",)))
+    assert drv.merge_bytes(p, ours, theirs, b"") == legacy
+
+
+@pytest.mark.skipif(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                    reason="git not available")
+def test_live_git_merge_applies_a_removal_end_to_end(tmp_path):
+    """END-TO-END: real git, real driver, a real archive-sweep removal.
+
+    The pre-existing live tests have BOTH sides appending, so none of them ever
+    puts a removal in front of the driver -- they are no-regression evidence,
+    not evidence the 3-way rule works on the path that actually RUNS (guard-5867:
+    a clean reading is evidence about a conditional mechanism only if the
+    triggering condition occurred in the sample).
+
+    Models the real cross-box shape: box A runs an archive sweep and drops exp-A
+    while box B, unaware, records exp-C. Both sides changed, so git genuinely
+    conflicts and routes to the driver -- and the correct result needs BOTH arms
+    at once: apply the deletion AND keep the concurrent add. A plain union
+    returns exp-A as well, which is the defect this pins.
+    """
+    repo = _init_ledger_repo(tmp_path, "agents/*/experience.jsonl merge=ayoai-ledger\n")
+    ledger = repo / "agents" / "x" / "experience.jsonl"
+    res = _diverge(
+        repo, ledger,
+        base=_jsonl({"id": "exp-A"}, {"id": "exp-B"}),
+        ours=_jsonl({"id": "exp-B"}),
+        theirs=_jsonl({"id": "exp-A"}, {"id": "exp-B"}, {"id": "exp-C"}),
+    )
+    assert res.returncode == 0, f"merge aborted (driver not invoked?): {res.stderr}"
+    ids = sorted(r["id"] for r in _lines(ledger.read_bytes()))
+    assert ids == ["exp-B", "exp-C"], (
+        f"expected the swept exp-A to stay deleted and the concurrent exp-C to "
+        f"survive; got {ids}")
+
+
+# ── : base-aware delete propagation on the two ledger-routed AGENT
+# stores that reach the merge_handler_for FALL-THROUGH rather than the
+# _JSONL_ID_UNION branch. Each test below is falsified by a DISTINCT wrong
+# implementation:
+#
+#   * ship nothing (the shipped defect)  -> one_sided_removal_stays_removed
+#   * key by id only                     -> changelog_trim_stays_trimmed
+#   * drop unconditionally, as
+#     _three_way_id_merge does           -> a_concurrent_edit_beats_a_removal
+#   * key by BASENAME instead of path    -> world_queue_is_untouched
+#   * apply with no base                 -> empty_base_is_handler_identical
+#   * let a bad parse remove records     -> unparseable_base_degrades_open
+#
+# The load-bearing trio is the first (the defect), the concurrent-edit guard and
+# the world-scope guard: without the latter two the "fix" silently discards a
+# reopened aspiration, and changes the FLEET queue's merge semantics, which
+# coordination_merge.merge_aspirations documents as a deliberate decision.
+
+_AGENT_ASP = "agents/x/aspirations.jsonl"
+_AGENT_CHG = "agents/x/changelog.jsonl"
+
+
+def test_agent_aspirations_one_sided_removal_stays_removed():
+    """THE DEFECT. A record the base held, one side retired and the other never
+    touched must NOT come back."""
+    base = _jsonl({"id": "asp-1", "status": "active"},
+                  {"id": "asp-2", "status": "completed"})
+    ours = _jsonl({"id": "asp-1", "status": "active"})     # retired asp-2
+    theirs = base                                           # stale peer
+    out = _lines(drv.merge_bytes(_AGENT_ASP, ours, theirs, base))
+    assert sorted(r["id"] for r in out) == ["asp-1"]
+
+
+def test_agent_changelog_one_sided_trim_stays_trimmed():
+    """The changelog's records carry NO id, and its handler dedups by SERIALIZED
+    LINE — so the drop key must fall back to the whole record. An id-only
+    implementation drops nothing here and this test fails."""
+    r1 = {"timestamp": "2026-01-01T00:00:00", "agent": "x", "file": "a"}
+    r2 = {"timestamp": "2026-01-02T00:00:00", "agent": "x", "file": "b"}
+    base = _jsonl(r1, r2)
+    ours = _jsonl(r2)                                       # rotation trimmed r1
+    out = _lines(drv.merge_bytes(_AGENT_CHG, ours, base, base))
+    assert [r["file"] for r in out] == ["b"]
+
+
+def test_agent_ledger_delete_filter_is_commutative():
+    """Both boxes must converge on identical BYTES whichever side is 'ours'."""
+    base = _jsonl({"id": "asp-1"}, {"id": "asp-2"})
+    ours = _jsonl({"id": "asp-1"})
+    ab = drv.merge_bytes(_AGENT_ASP, ours, base, base)
+    ba = drv.merge_bytes(_AGENT_ASP, base, ours, base)
+    assert ab == ba
+
+
+def test_a_concurrent_edit_beats_a_removal():
+    """INVERSION GUARD. An aspiration may legitimately REOPEN after archival —
+    _aspirations_resurrection.classify exempts that as post_archive_work. So a
+    record EDITED on the surviving side is kept, not dropped. A blanket
+    'one side + in base -> drop' (the _three_way_id_merge rule) fails here."""
+    base = _jsonl({"id": "asp-1"}, {"id": "asp-2", "status": "completed"})
+    ours = _jsonl({"id": "asp-1"}, {"id": "asp-2", "status": "active"})  # reopened
+    theirs = _jsonl({"id": "asp-1"})                                      # archived
+    out = {r["id"]: r for r in _lines(drv.merge_bytes(_AGENT_ASP, ours, theirs, base))}
+    assert "asp-2" in out
+    assert out["asp-2"]["status"] == "active"
+
+
+def test_world_queue_is_untouched_by_the_agent_scope():
+    """SCOPE GUARD. The same basename names the FLEET queue, which reaches this
+    driver via the .mind-data/world/** route and whose out-of-band removal
+    remedy is deliberate. A basename-keyed implementation changes it and this
+    test fails."""
+    import coordination_merge as cm
+    world = ".mind-data/world/" + _AGENT_ASP.split("/")[-1]
+    base = _jsonl({"id": "asp-1"}, {"id": "asp-2"})
+    ours = _jsonl({"id": "asp-1"})
+    assert drv.merge_bytes(world, ours, base, base) == cm.merge_handler_for(world)(ours, base)
+
+
+def test_empty_base_is_handler_identical():
+    """git supplies an empty %O on an add/add — no record can be in the base, so
+    the result must be the handler's own output, byte for byte."""
+    import coordination_merge as cm
+    ours = _jsonl({"id": "asp-1"})
+    theirs = _jsonl({"id": "asp-2"})
+    assert (drv.merge_bytes(_AGENT_ASP, ours, theirs, b"")
+            == cm.merge_handler_for(_AGENT_ASP)(ours, theirs))
+
+
+def test_unparseable_base_degrades_open():
+    """The filter can only REMOVE records, so every parse failure must fail
+    toward removing NOTHING."""
+    import coordination_merge as cm
+    ours = _jsonl({"id": "asp-1"})
+    theirs = _jsonl({"id": "asp-1"}, {"id": "asp-2"})
+    out = drv.merge_bytes(_AGENT_ASP, ours, theirs, b"{not json at all\n")
+    assert out == cm.merge_handler_for(_AGENT_ASP)(ours, theirs)

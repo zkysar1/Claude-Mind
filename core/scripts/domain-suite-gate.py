@@ -74,9 +74,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -248,16 +250,89 @@ def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], s
     env["STORAGE_BACKEND"] = "local"  # guard-955: any test runner, always
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env.pop("PYTEST_ADDOPTS", None)
+    # : isolate the suite's DAEMON RUNTIME. RUNTIME_DIR is the B16
+    # override (`RT_DIR="${RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"` in
+    # mind-api-start.sh, and lifecycle.runtime_dir). Without it, a suite child
+    # that reaches ANY daemon-backed wrapper hits rt_ensure_running -> rt_spawn,
+    # claims the SHARED mind_api/state/daemon.port, and force-kills the live
+    # daemon. MEASURED 2026-09-05/06 on DESKTOP-O91DLK2: NINETEEN daemon starts
+    # in 57 minutes, each on a new port and a new parent_pid, wedging every
+    # in-flight wrapper with "daemon is unreachable" — one close printed its
+    # probe URL literally as `127.0.0.1:?` because daemon.port was EMPTY
+    # mid-rewrite when the wrapper read it.
+    #
+    # The existing  chokepoint does NOT cover this path. It refuses a
+    # shared-runtime claim only when PYTEST_CURRENT_TEST is set (_runtime.sh:411,
+    # mind-api-start.sh:481), and the domain runner is a BASH aggregator —
+    # runner_command() returns bash_cmd(hook) for the world's run-domain-tests.sh
+    # — so that variable is unset in the child and the refusal never fires.
+    # Isolation also contains guard-1144: the STORAGE_BACKEND=local pin above is
+    # INHERITED by any daemon the suite respawns, so a shared-port respawn hands
+    # the live fleet a LocalBackend split-brain on top of the port churn.
+    #
+    # This bounds the BLAST RADIUS of an orphan, not its existence: a suite that
+    # outlives its parent still runs (see the guard-4375 note below), but it can
+    # no longer touch the shared daemon. Reaping the child is the goal's separate
+    # outcome and is not attempted here.
+    # BOTH names are required, and setting only one silently covers half the
+    # surface. There are TWO spawn paths with TWO different variable names:
+    #   _runtime.sh:33      RT_DIR="${RT_DIR:-$PROJECT_ROOT/mind_api/state}"
+    #   mind-api-start.sh:52 RT_DIR="${RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"
+    # A wrapper reaches EITHER (rt_ensure_running -> rt_spawn, or the launcher
+    # directly), and _runtime.sh never reads RUNTIME_DIR at all — grep it: the
+    # only occurrences are comments. Its own note at :397 states the split
+    # ("via RT_DIR here ... or RUNTIME_DIR in mind-api-start.sh") and records
+    # that fixtures "set RT_DIR and never RUNTIME_DIR". So RUNTIME_DIR alone
+    # isolates the launcher path and leaves rt_spawn claiming the shared dir —
+    # which is the MORE common path, since it is what an ordinary daemon-backed
+    # wrapper call takes. Setting both is what actually closes it.
+    rt_dir = tempfile.mkdtemp(prefix="domain-suite-rt-")
+    env["RUNTIME_DIR"] = rt_dir
+    env["RT_DIR"] = rt_dir
+    # guard-4375: `timeout` is DECORATIVE against a Git-Bash child whenever
+    # stdout or stderr is a PIPE. The kill fires on schedule; what blocks is the
+    # post-kill communicate() reap inside subprocess.run — it takes no timeout,
+    # and a surviving descendant of the runner still holds the inherited pipe
+    # write handle, so the reader threads never see EOF. MEASURED on this box
+    # 2026-09-05: `--goal ` ran 51 min against timeout=900 while the
+    # runner kept spawning children, wedging three Bodies' closes. capture_output
+    # is not an option here because the verdict READS the output (guard-4375:
+    # "parameterize the helper" rather than DEVNULL when the caller reads it), so
+    # redirect to a file — the idiom run-full-suite.py and framework_pull.py
+    # already use — and read it back. Positive control, same box: pipes hung
+    # >37s at timeout=3 with no exception; the file redirect raised at 3.1s.
+    fd, log_path = tempfile.mkstemp(prefix="domain-suite-gate-", suffix=".log")
+    os.close(fd)
+    rc: int | None = None
+    timed_out = False
     try:
-        proc = subprocess.run(cmd, cwd=str(scripts_dir), env=env, capture_output=True,
-                              text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as e:
-        out = (e.stdout or b"")
-        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
-        return None, text.splitlines()[-TAIL_LINES:], set()
-    text = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        with open(log_path, "w", encoding="utf-8", errors="replace") as fh:
+            try:
+                proc = subprocess.run(cmd, cwd=str(scripts_dir), env=env,
+                                      stdout=fh, stderr=subprocess.STDOUT,
+                                      timeout=timeout, check=False)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    finally:
+        # A timed-out runner's descendants may still hold the file open; on
+        # Windows that makes the unlink fail. Leaking one temp file beats
+        # raising over cleanup.
+        try:
+            os.unlink(log_path)
+        except OSError:
+            pass
+        # Same reasoning for the isolated runtime dir, and more so: an orphaned
+        # suite's daemon holds daemon.pid/port open under it, so on Windows the
+        # tree is often UNREMOVABLE here. ignore_errors keeps cleanup from
+        # raising over a leaked tmp dir — the isolation has already done its job
+        # by the time we get here, and a stale tmp dir harms nobody.
+        shutil.rmtree(rt_dir, ignore_errors=True)
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    return proc.returncode, lines[-TAIL_LINES:], failing_ids(lines)
+    if timed_out:
+        return None, lines[-TAIL_LINES:], set()
+    return rc, lines[-TAIL_LINES:], failing_ids(lines)
 
 
 _PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)")

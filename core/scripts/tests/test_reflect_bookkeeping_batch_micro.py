@@ -184,28 +184,41 @@ def test_surprise_confirmed_inverts():
     assert MOD.compute_surprise("CONFIRMED", 0.95) == 1
 
 
-def test_surprise_rounding_is_bankers_at_the_promotion_boundary():
-    # MEASURED behavior, pinned deliberately — NOT an endorsement of it.
-    # Python round() is round-half-to-EVEN, and .x5 confidences are common in
-    # the live store (0.45/0.55/0.65/0.75/0.85 all appear). The result is a
-    # boundary that reads as inconsistent: CORRECTED at 0.65 scores 6 while
-    # 0.75 scores 8 — because 6.5 rounds DOWN to 6 and 7.5 rounds UP to 8.
+def test_surprise_rounding_is_half_up_at_the_promotion_boundary():
+    # THE CHANGE BELOW IS INTENTIONAL AND DATED: 2026-09-07, .
+    # This test previously pinned round-half-to-EVEN and was named
+    # ...is_bankers_at_the_promotion_boundary. It was NOT wrong then — it
+    # pinned the real behaviour on purpose while the semantic question was
+    # open. The question is now CLOSED in favour of half-UP, and the pin was
+    # updated in the SAME commit as the arithmetic, exactly so a later reader
+    # does not conclude the old pin had always been a mistake.
     #
-    # This is load-bearing, not trivia: surprise >= 7 is the promotion
-    # threshold (promote_reason "high_surprise") and the Step 3.5 broad
-    # re-retrieve trigger. A half-UP rule would score 0.65 CORRECTED as 7 and
-    # fire both; banker's rounding scores 6 and fires neither.
+    # WHY HALF-UP. Nothing in any SKILL.md, config or convention ever specified
+    # half-to-even; it was an artifact of reaching for Python round(), whose
+    # name reads as ordinary half-up to most readers. .x5 confidences are
+    # common in the live store (0.45/0.55/0.65/0.75/0.85 all appear), so the
+    # old rule made the boundary read as inconsistent by hand: CORRECTED at
+    # 0.65 scored 6 while 0.75 scored 8.
     #
-    #  LIFTED this arithmetic into one helper without altering it —
-    # the values below are byte-identical to the previous inline batch-micro
-    # code. Whether half-up is the INTENDED rule is a separate semantic
-    # question, tracked as its own goal. Until then this test guarantees the
-    # behavior cannot drift silently in either direction.
-    assert MOD.compute_surprise("CORRECTED", 0.65) == 6   # 6.5 -> 6 (down, to even)
-    assert MOD.compute_surprise("CORRECTED", 0.75) == 8   # 7.5 -> 8 (up, to even)
-    assert MOD.compute_surprise("CORRECTED", 0.45) == 4   # 4.5 -> 4
-    assert MOD.compute_surprise("CORRECTED", 0.55) == 6   # 5.5 -> 6
-    assert MOD.compute_surprise("CONFIRMED", 0.15) == 8   # 8.5 -> 8
+    # STILL LOAD-BEARING: surprise >= 7 is the promotion threshold
+    # (promote_reason "high_surprise") and the Step 3.5 broad re-retrieve
+    # trigger. 0.65 CORRECTED now scores 7 and fires both.
+    #
+    # SCOPE, so this is not over-read: measured over 555 scoreable records the
+    # rule alone moves 10 across >= 7 — a correctness fix, NOT a fix to tier
+    # starvation. The tier is one-armed for an independent reason (the
+    # CONFIRMED@conf<=0.30 arm is unreachable; min confidence ever written is
+    # 0.35). See _surprise.compute_surprise's docstring.
+    assert MOD.compute_surprise("CORRECTED", 0.65) == 7   # 6.5 -> 7 (was 6)
+    assert MOD.compute_surprise("CORRECTED", 0.75) == 8   # 7.5 -> 8 (unchanged)
+    assert MOD.compute_surprise("CORRECTED", 0.45) == 5   # 4.5 -> 5 (was 4)
+    assert MOD.compute_surprise("CORRECTED", 0.55) == 6   # 5.5 -> 6 (unchanged)
+    assert MOD.compute_surprise("CONFIRMED", 0.15) == 9   # 8.5 -> 9 (was 8)
+    # The float-error case the  filing named: (1.0 - 0.95) * 10 is
+    # 0.5000000000000004, genuinely ABOVE the tie, so it scores 1 under either
+    # rule. Pinned because `int(x + 0.5)` — the idiom the filing warned against
+    # — is what a later "simplification" would reach for.
+    assert MOD.compute_surprise("CONFIRMED", 0.95) == 1
 
 
 def test_surprise_is_case_insensitive():
@@ -247,7 +260,7 @@ def test_batch_micro_uses_the_shared_helper_not_a_second_copy(tmp_path, monkeypa
     # Independent of payload shape: the helper must be the one deciding
     # promotion at the >=7 boundary.
     assert MOD.compute_surprise("corrected", 0.9) == 9    # promotes
-    assert MOD.compute_surprise("confirmed", 0.15) == 8   # promotes (8.5 -> 8)
+    assert MOD.compute_surprise("confirmed", 0.15) == 9   # promotes (8.5 -> 9 under half-up, ; was 8)
 
 
 # ── cmd_surprise CLI contract (fresh-eyes findings, ) ──────────────

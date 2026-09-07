@@ -446,6 +446,20 @@ UTILIZATION_COUNTERS = {
     "times_cited",
 }
 
+# . Correction counters, derived here for the same reason
+# UTILIZATION_COUNTERS is duplicated rather than imported (daemon-import-safety,
+# see the header). Kept in parity with core/scripts/reasoning-bank.py by
+# test_utilization_correction_counters_parity_with_reasoning_bank -- the same
+# two-copy hazard the wm.py / wm_write.py ARRAY_SLOTS pair carries, where
+# editing one file alone changes nothing at runtime while reading as correct.
+# WHY a monotone sibling counter and not a signed delta: see the long note on
+# the reasoning-bank copy. Short form -- the sidecar merge takes a per-counter
+# MAX, so a decrement is silently reverted cross-box.
+UTILIZATION_CORRECTION_SUFFIX = "__corrected"
+UTILIZATION_CORRECTION_COUNTERS = {
+    c + UTILIZATION_CORRECTION_SUFFIX for c in UTILIZATION_COUNTERS
+}
+
 # Experience-ref regex — lifted from experience.py (^exp-[a-z0-9._-]+$).
 # Do NOT `from experience import` — daemon-import-unsafe.
 EXPERIENCE_REF_RE = re.compile(r"^exp-[a-z0-9._-]+$")
@@ -957,7 +971,7 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         # it is the payload the per-field amended_fields tier exists to order.
         immutable_fields=frozenset({"created", "title"}),
         increment_prefix="utilization.",
-        increment_counters=UTILIZATION_COUNTERS,
+        increment_counters=UTILIZATION_COUNTERS | UTILIZATION_CORRECTION_COUNTERS,
         amend_stamp_field="amended_fields",
         # . NAME CHOSEN BY KEY CENSUS ON SEMANTICS, not on which
         # existing name is best populated (rb-6166). Measured 2026-08-01 across
@@ -1000,7 +1014,7 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         # path agree with the merge design instead of silently disagreeing.
         immutable_fields=frozenset({"created", "rule"}),
         increment_prefix="utilization.",
-        increment_counters=UTILIZATION_COUNTERS,
+        increment_counters=UTILIZATION_COUNTERS | UTILIZATION_CORRECTION_COUNTERS,
         amend_stamp_field="amended_fields",
         #  — see the census rationale on the reasoning-bank spec above.
         # This is the one store with a strict unknown-field gate, so the name is

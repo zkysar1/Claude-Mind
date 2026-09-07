@@ -278,6 +278,86 @@ _MEMBER_PAUSED_PREFIX = "member_paused:"
 # the two sites below. SYMMETRY: collect_candidates and collect_blocked both use this.
 _NEVER_EXPIRING_DEFER_PREFIXES = (_HUMAN_BLOCKED_PREFIX, _MEMBER_PAUSED_PREFIX)
 
+# . A goal whose terminal step is a mandatory destructive cleanup (a
+# live EC2 terminate, a bulk archive-then-delete) is unsafe to BEGIN at the tail
+# of a spent context, because losing context MID-UNIT orphans the resource.
+# guard-5683 encoded that as behaviour, and behaviour alone changed nothing
+# structurally: four agents claimed and declined  in one day, and
+# RELEASING refreshes the scorer's recency terms, so each principled decline
+# made the next re-offer STRONGER (18.90 -> 19.18, measured 2026-08-31). This is
+# the structural half — the selector can finally see the property.
+#
+# NOT expressed as a defer_reason, deliberately (the filing's constraint 2): a
+# defer re-probes and auto-clears on a clock, and this is not a world condition
+# that can become true. The discriminator recorded by the 5th claimant: is there
+# a world-state change that would make the goal safe? If yes it is a defer; if
+# the only thing that must change is WHO IS LOOKING AT IT and WHEN, it is this
+# marker.
+_FRESH_SESSION_FIELD = "requires_fresh_session"
+
+_SESSION_HAS_CLOSED_GOALS = None
+
+
+def _session_has_closed_goals():
+    """True when THIS session has already closed at least one goal.
+
+    Deliberately the IN-SESSION `goals_completed_this_session` list and NOT
+    load_recent_class_completions() — that one is a CROSS-session rolling
+    window, so it would report True on essentially every box forever and
+    suppress a marked goal permanently rather than deferring it to a fresh
+    session.
+
+    KNOWN RESIDUAL HOLE, written down rather than hidden (g-115-8482
+    progress_note item 4, the 5th claimant): the property that actually matters
+    is REMAINING CONTEXT, not goals closed. A long session that has closed
+    nothing is still context-spent, and this predicate will offer a marked goal
+    to it. That is the one direction this proxy is wrong in. It is used anyway
+    because the available context sensor is not trustworthy — it read `fresh`
+    with 479,998 tokens of headroom straight through a measured exhaustion
+    (g-115-8310) — and a suppressor keyed on a lying sensor is worse than one
+    keyed on an honest proxy whose gap is documented.
+
+    Fail-open on an unreadable working memory (treated as a fresh session, so
+    nothing is suppressed), matching this module's convention everywhere else:
+    a filter that cannot read its input must not silently hide work.
+
+    Cached module-wide (mirrors _get_runner_capabilities) so collect_candidates
+    and collect_blocked cannot disagree within one run — which is exactly the
+    desync the SYMMETRY invariant below exists to prevent.
+    """
+    global _SESSION_HAS_CLOSED_GOALS
+    if _SESSION_HAS_CLOSED_GOALS is not None:
+        return _SESSION_HAS_CLOSED_GOALS
+    closed = []
+    try:
+        wm = read_wm()
+        raw = wm.get("goals_completed_this_session", [])
+        if isinstance(raw, list):
+            closed = raw
+    except Exception:
+        closed = []
+    _SESSION_HAS_CLOSED_GOALS = bool(closed)
+    return _SESSION_HAS_CLOSED_GOALS
+
+
+def _requires_fresh_session(goal):
+    """True only when the goal carries the marker AND this session has already
+    closed a goal.
+
+    The marker test comes FIRST and short-circuits, so an unmarked goal never
+    reaches the session probe and ranking degrades exactly to pre-g-115-8482
+    behaviour — the filing's constraint 3 and its second verification outcome.
+
+    SYMMETRY: collect_candidates and collect_blocked BOTH call this and must
+    stay logical complements. A suppressor wired into only ONE site makes the
+    goal fall out of BOTH lists — not a candidate there, not blocked here —
+    which is the g-115-3150 defect whose trace lives in
+    _has_future_deferred_until's docstring. Change both or neither.
+    """
+    if not goal.get(_FRESH_SESSION_FIELD):
+        return False
+    return _session_has_closed_goals()
+
 
 def _is_handoff_gated_defer(goal):
     """A STRUCTURED defer on a goal that is ROUTED ELSEWHERE ().
@@ -547,8 +627,20 @@ def _synth_blocker_ref_from_structured_defer(goal):
     # fully-COMPLETED blocked_by would get a "dependency:" external_id here rather
     # than "not-my-lane:" — cosmetic only (both type=resource, identical C2/C3/C4;
     # 0 current collisions verified ).
-    blocked_by = goal.get("blocked_by") or []
-    if isinstance(blocked_by, list) and blocked_by:
+    # NORMALIZE, do not isinstance-gate (). `blocked_by` is polymorphic
+    # in live data -- aspirations.py parse_value() applies no per-field typing, so
+    # `aspirations-update-goal.sh <id> blocked_by "g-NNN-NN"` writes a BARE STRING
+    # (measured 2026-09-05, still ungated). A raw isinstance(list) test skipped
+    # those, returning None here, and the collect_blocked DEPENDENCY branch is the
+    # one branch with no _synth_block_ref fallback -> blocker_ref=None -> quiescence
+    # C2 fails -> B7 backoff churn. Measured whole-branch-set audit (guard-961):
+    # this was the ONLY real C2 hole -- every other unguarded branch is covered by
+    # construction because its branch-firing field is the same field a synth path
+    # reads. _ensure_list is what the two OTHER blocked_by read sites already use
+    # (collect_candidates and collect_blocked branch 3), so this also restores the
+    # symmetry branch 3's own comment demands ("if you change one, change the other").
+    blocked_by = _ensure_list(goal.get("blocked_by"))
+    if blocked_by:
         _now_d = datetime.now()
         _key_d = "dependency:" + ",".join(str(x) for x in sorted(blocked_by))
         _h_d = hashlib.md5(_key_d.encode("utf-8", errors="replace")).hexdigest()[:12]
@@ -1772,6 +1864,146 @@ def read_jsonl(path):
     return items
 
 
+def _refresh_declined(backend, path) -> bool:
+    """Did the _refresh that just ran DECLINE, and hand back local bytes?
+
+    WHY THIS EXISTS (g-115-9276). ``read_text(force_fresh=True)`` has exactly
+    one failure shape that raises and one that does not. ``OwnCloudBackend._refresh``
+    returns the LOCAL path unchanged in the ``no_clobber`` (both-diverged) state
+    -- local holds unpushed writes AND a peer wrote -- so the call succeeds, the
+    caller reads bytes, and the bytes are the very stale snapshot the refresh
+    was added to replace. The refresh's own docstring already names this hole
+    and calls it rare; MEASURED on this box (cc-10, 2026-09-06) FOUR of five
+    peer aspiration queues met its precondition (local md5 != sync-manifest
+    baseline) while two actually diverged, so the silent surface is wider than
+    the observable damage and "rare" is not a reason to stay quiet about it.
+
+    The predicate is the backend's OWN verdict, not a re-derivation: ``_refresh``
+    adds the key to ``_diverged_keys`` in the no_clobber branch and discards it
+    on every other outcome, so immediately after a force_fresh read the set is
+    an exact record of what that read decided. Re-deriving it here (comparing
+    md5 against the manifest baseline) would be a second implementation of the
+    decision and would drift (guard-2676).
+
+    NOT A REFUSAL, and deliberately so: the caller stays fail-open (guard-1562).
+    This only converts silence into a signal.
+
+    KNOWN LIMIT, stated because guard-5596 measured it on this very script: the
+    warning it enables rides STDERR, and callers pipe -- ``2>/dev/null |``
+    discards it and ``2>&1 |`` corrupts the JSON parse. cmd_select's payload is
+    a bare JSON ARRAY, so there is no envelope to carry the signal on the
+    payload stream, and inventing one (an error object where success returns a
+    list) is the exact trade guard-5596 warns against. So a piped caller still
+    sees nothing; the return value is the signal that survives, and carrying it
+    further is a separate change.
+
+    Defensive by design: LocalBackend has neither attribute (the local file IS
+    the store, so nothing can diverge) and returns False on the first check.
+    """
+    keys = getattr(backend, "_diverged_keys", None)
+    if not keys:
+        return False
+    to_key = getattr(backend, "_s3_key", None)
+    if to_key is None:
+        return False
+    try:
+        return to_key(str(path)) in keys
+    except Exception:
+        # Out-of-root / unmapped paths raise ValueError from _s3_key; they are
+        # never on the remote store, so they can never have declined.
+        return False
+
+
+def refresh_aspiration_caches(paths=None):
+    """Pull the authoritative aspiration stores into the local cache before scoring.
+
+    WHY THIS EXISTS (g-115-9264). Every aspiration WRITE goes through the daemon
+    to the authoritative backend; the reads in this file do NOT -- they are plain
+    ``read_jsonl(WORLD_ASP_PATH)`` opens. Under STORAGE_BACKEND=own-cloud the
+    local tree is a read-through cache (guard-980, rb-2636), so between a peer's
+    completion and this box's next sync the selector scores a snapshot in which
+    that goal is still pending. MEASURED (zeta, cc-02, own-cloud, 2026-09-06):
+    26 terminal goals inside a 1604-candidate pool with ranked_goals[0] =
+    g-115-9106, already skipped four hours earlier; after the local store
+    refreshed, 26 -> 0. Same code, same box, five minutes apart. rank #1 is
+    authoritative under scorer sovereignty, so the agent executes an
+    already-terminal goal -- silently, because the pool looks healthy.
+
+    WHY A CACHE REFRESH RATHER THAN A DAEMON-ROUTED READ. Refreshing the cache
+    IN PLACE fixes every reader in this process at once -- cmd_select's own read,
+    its all-blocked retry re-read, and ``load_recent_class_completions``, which
+    reopens the same two files later in the same run. Routing one read through
+    the daemon would leave the others on the stale snapshot: rb-9476's shape, a
+    fix that is present, correct-looking, and inert across most of the population
+    it was written for. Same pattern as ``unit_claim._refresh_board_cache`` -- a
+    scoped CALL into the shared backend, never a second reader (guard-2676).
+
+    WHY NOT A STALENESS CHECK, the other option the goal offered: guard-980
+    forbids deciding ANYTHING -- explicitly including "freshness/staleness" --
+    from a raw local read of a backend-routed store. A local mtime comparison IS
+    that decision, so option (b) cannot be built without violating the very
+    guardrail that motivates the fix.
+
+    KNOWN HOLE, stated because guard-980 states it: ``force_fresh`` is NOT a
+    give-me-current-bytes guarantee. ``_refresh`` returns the LOCAL path in the
+    both-diverged (``no_clobber``) state -- local holds unpushed writes AND a
+    peer has written -- so this call degrades to today's behaviour there instead
+    of curing it. That state is rare (1 wedged file of 90,057 scanned) and its
+    remedy is a three-way-hash merge, not a pull; curing it is out of scope here.
+    ``read_authoritative_bytes`` would dodge that hole but reads only to memory
+    and never refreshes the cache, so it cannot fix the other readers above.
+
+    FAIL-OPEN, and DELIBERATELY the opposite of unit_claim's REFUSE. There a
+    stale cache reports "the unit is free" and produces a duplicate build, so
+    refusing is cheap and correct. Here a refusal would stop goal selection for
+    every Body on the box, while the worst outcome it prevents is one wasted goal
+    execution -- and stopping a healthy loop on a plumbing fault is worse than
+    the disease (guard-1562). So a failure WARNS loudly on stderr, names the
+    consequence, and scoring continues on the cache.
+
+    On LocalBackend ``force_fresh`` is a documented no-op (the local file IS the
+    store), so STORAGE_BACKEND=local runs are byte-identically unaffected and pay
+    no additional I/O.
+    """
+    if paths is None:
+        paths = [WORLD_ASP_PATH, AGENT_ASP_PATH]
+    try:
+        import storage_backend
+        backend = storage_backend.get_backend()
+    except Exception as exc:
+        print(f"[goal-selector] aspiration cache refresh UNAVAILABLE "
+              f"({type(exc).__name__}: {exc}) -- scoring from the local cache; "
+              f"terminal goals may be ranked (g-115-9264).", file=sys.stderr)
+        return False
+    ok = True
+    for p in paths:
+        if not p:
+            continue
+        try:
+            backend.read_text(str(p), force_fresh=True)
+        except Exception as exc:
+            ok = False
+            print(f"[goal-selector] aspiration cache refresh FAILED for {p} "
+                  f"({type(exc).__name__}: {exc}) -- scoring from the local "
+                  f"cache; terminal goals may be ranked (g-115-9264).",
+                  file=sys.stderr)
+            continue
+        # : a read_text that RETURNS is not a refresh that HAPPENED.
+        # See _refresh_declined above -- the both-diverged branch hands back the
+        # local file and reports success, so without this consult the one state
+        # in which the cache is guaranteed stale is the one state that warns
+        # about nothing.
+        if _refresh_declined(backend, p):
+            ok = False
+            print(f"[goal-selector] aspiration cache refresh DECLINED for {p} "
+                  f"-- both-diverged (local holds unpushed writes AND a peer "
+                  f"wrote): the backend returned the LOCAL file and reported "
+                  f"success. Scoring from a snapshot that is NOT authoritative; "
+                  f"terminal goals may be ranked (g-115-9276 / g-115-9264).",
+                  file=sys.stderr)
+    return ok
+
+
 def read_yaml_file(path):
     """Read a YAML file via PyYAML."""
     p = Path(path)
@@ -2753,6 +2985,15 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
             # (: prior `else: continue` unconditionally blocked goals with both fields,
             # leaving 5 goals with deferred_until in the past permanently blocked because they
             # never reached the time gate at L678-685.)
+
+            # Fresh-session-only marker (). Sits OUTSIDE the
+            # defer_reason arm below on purpose — the filing's constraint 2
+            # forbids expressing this as a defer, because a defer re-probes and
+            # fail-opens on a clock while this property is durably true.
+            # SYMMETRY: collect_blocked has the twin. Change both.
+            if _requires_fresh_session(goal):
+                continue
+
             if goal.get("defer_reason"):
                 # Only a FUTURE deferred_until defers to the time gate below. A
                 # PAST (or corrupt) one must NOT bypass the defer_reason
@@ -3004,12 +3245,106 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
         siblings = list(agents_parent.iterdir())
     except Exception:
         return []  # fail-open at parent
+    sib_queues = []
     for sib_dir in siblings:
         if not sib_dir.is_dir() or sib_dir == agent_dir:
             continue
         sib_q = sib_dir / "aspirations.jsonl"
         if not sib_q.exists():
             continue  # non-agent dir (no aspirations.jsonl)
+        sib_queues.append((sib_dir, sib_q))
+
+    # : the read_jsonl below is a PLAIN LOCAL read, and under
+    # STORAGE_BACKEND=own-cloud the local tree is a read-through cache
+    # (guard-980, rb-2636) -- so a peer's queue here can be arbitrarily behind
+    # the authoritative object and this lane scores that snapshot. Measured on
+    # cc-08 2026-09-06: zeta's mirror 2,604 B behind and echo's 30 B behind,
+    # 2 of 5 peer queues; on cc-05 the same zeta mirror sat >5h unchanged while
+    # an already-terminal peer goal held rank 1 for six consecutive iterations.
+    #
+    # Reuse refresh_aspiration_caches rather than adding a second reader
+    # (guard-2676, the no-transcription contract). It refreshes the cache IN
+    # PLACE, so the read_jsonl below -- and any later reader of the same file in
+    # this process -- sees the refreshed bytes. ONE round trip per sibling per
+    # SELECTION: never per read, never per candidate.
+    #
+    # COST, MEASURED ON THE EXECUTING BOX BEFORE LANDING (this goal's third
+    # outcome, which forbids adding a backend fetch on an unmeasured cost).
+    # cc-08, Linux 6.8.0-138-generic, own-cloud: an authoritative round trip per
+    # sibling queue is 560-721 ms (mean ~629, n=5, via backend-cat.sh) against an
+    # unpatched goal-selector.sh wall time of 39,844 ms -- ~2.5 s for 4 siblings,
+    # ~6.3%. One misdirected iteration costs minutes, so the trade is heavily
+    # favourable. NOTE the timing is of an authoritative round trip to the same
+    # object, not of force_fresh itself; it bounds the added latency, and the
+    # per-call shape (one GET per sibling) is the same.
+    #
+    # NOT a staleness check, and that is forced rather than chosen: guard-980
+    # forbids deciding ANYTHING -- freshness explicitly included -- from a raw
+    # local read of a backend-routed store, so there is no guard-980-clean
+    # "refresh only the stale ones" variant to be cheaper with. Unconditional is
+    # the same shape refresh_aspiration_caches already argues for its own paths.
+    #
+    # THE DECLINE IS A DECISION, NOT JUST A MESSAGE ( item 3,
+    # outcome 1). A peer queue whose refresh DECLINED may still hold a record
+    # that is terminal in the authoritative store and pending in this mirror --
+    # and the missing rows are always the NEWEST, i.e. exactly the closes
+    # (guard-6156). Ranking such a candidate is the measured incident: rank 1 of
+    # 1,573 at score 16.77, six consecutive iterations, on an already-closed
+    # goal. So a peer queue whose refresh declined contributes NO candidates
+    # this selection.
+    #
+    # NOT a guard-1562 violation ("stopping a healthy loop on a plumbing fault
+    # is worse than the disease"). Nothing here stops selection: the world and
+    # own-agent lanes are untouched and only THIS peer's cross-agent candidates
+    # are withheld, for one selection, retried on the next. What tips it is that
+    # the write-side gate does NOT backstop these: aspirations-claim.sh's no_claim
+    # refusal is absent for any cross-agent goal whose disposition needs no
+    # peer-queue write -- an investigation, a re-measure, a report -- which runs
+    # to completion against a closed record (guard-6156).
+    #
+    # PER-QUEUE, not batched. refresh_aspiration_caches returns ONE bool for a
+    # whole path list, so a single unrefreshable peer would suppress EVERY peer's
+    # candidates. One call per queue costs the same number of backend round trips
+    # (one GET per queue either way) and keeps the decision scoped to the queue
+    # it is about.
+    #
+    # guard-2302 is served either way: after a clean refresh a locally-absent and
+    # an authoritatively-absent record coincide; when the refresh declines, the
+    # stderr line says so AND the queue is withheld rather than silently scored.
+    #
+    # Costs nothing where it buys nothing: on LocalBackend force_fresh is a
+    # documented no-op, and a single-agent box has no siblings, so sib_queues is
+    # empty and the call never fires.
+    #
+    # The try/except is NOT redundant with the helper's own fail-open contract.
+    # The helper documents that it never raises, and this lane must not DEPEND
+    # on that: it runs once per selection for EVERY Body on the box, so a future
+    # edit that lets an exception escape would stop the whole fleet selecting.
+    # Pinned by test_a_raising_refresh_does_not_wedge_selection, which caught
+    # exactly this in the first draft of this change.
+    refreshed = {}
+    for _sib_dir, _sib_q in sib_queues:
+        try:
+            refreshed[_sib_q] = bool(refresh_aspiration_caches([_sib_q]))
+        except Exception as exc:  # pragma: no cover - defensive, pinned by test
+            # The helper documents that it never raises; this lane must not
+            # DEPEND on that (it runs once per selection for every Body on the
+            # box). A raise is treated exactly like a decline.
+            refreshed[_sib_q] = False
+            print(f"[goal-selector] cross-agent queue refresh RAISED "
+                  f"({type(exc).__name__}: {exc}) for {_sib_q} -- that peer's "
+                  f"queue is WITHHELD from this selection (g-115-9276).",
+                  file=sys.stderr)
+
+    for sib_dir, sib_q in sib_queues:
+        if not refreshed.get(sib_q, False):
+            print(f"[goal-selector] cross-agent lane WITHHELD "
+                  f"{sib_dir.name}: its queue could not be refreshed "
+                  f"authoritatively, so a record that is terminal in the store "
+                  f"of record can still read pending here (guard-6156). No "
+                  f"cross-agent candidates from this peer this selection; "
+                  f"retried next selection (g-115-9276).", file=sys.stderr)
+            continue
         try:
             sib_aspirations = read_jsonl(sib_q)
         except Exception:
@@ -3053,6 +3388,8 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
       infrastructure   — goal.skill in known_blockers affected_skills
       dependency       — blocked_by contains unmet prerequisite IDs
       deferred         — deferred_until is in the future
+      fresh_session_only — requires_fresh_session is set and this session
+                         has already closed a goal (g-115-8482)
       hypothesis_gate  — resolves_no_earlier_than is in the future
       precondition_unmet — a structured verification.preconditions predicate failed
       routed_to_agent  — intended_agent names another agent and no escape applies
@@ -3268,6 +3605,20 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             # above; this block only handles goals WITHOUT a structural gate.
             # (: prior `else: append blocked + continue` marked goals
             # with both fields as "deferred" even when deferred_until had passed.)
+
+            # Fresh-session-only twin of the collect_candidates guard
+            # (). Routed to blocked[] rather than dropped, so
+            # all_blocked stays assertable and quiescence can still fire — the
+            # same reason the human_blocked: and handoff-gated guards do it.
+            if _requires_fresh_session(goal):
+                entry["block_reason"] = "fresh_session_only"
+                entry["block_detail"] = (
+                    "Fresh-session-only: marked requires_fresh_session and this "
+                    "session has already closed a goal; its terminal step is a "
+                    "mandatory destructive cleanup (guard-5683)")
+                blocked.append(entry)
+                continue
+
             if goal.get("defer_reason"):
                 # SYMMETRY (): identical guard to collect_candidates —
                 # only a FUTURE deferred_until defers to the time gate. A past one
@@ -3351,8 +3702,34 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 failed = [r for r in results if not r.passed]
                 if failed:
                     failed_ids = [r.predicate_id or r.type for r in failed]
+                    # : split the PERMANENT half out of the failures.
+                    # `evaluable=False` (predicate.py) means the evaluator never
+                    # MEASURED the condition — a malformed predicate, an
+                    # unsupported mode, or an allowlist refusal. No world change
+                    # will ever clear it, and both re-probe sweeps re-derive the
+                    # same false every 2h forever, so the remedy is to EDIT the
+                    # predicate, never to wait. This is the one consumer a human
+                    # is told to read (`goal-selector.sh blocked` -> block_reason),
+                    # so it is where the distinction has to be visible.
+                    # block_reason KEEPS its literal value on purpose: consumers
+                    # match that string, and the discriminator rides in a sibling
+                    # field + the detail text instead (rb-2148 — add an optional
+                    # sibling, never break the locked field; guard-3328 — the
+                    # branch nobody wrote inherits today's behaviour, which here
+                    # is exactly right).
+                    unevaluable = [r for r in failed if not getattr(r, "evaluable", True)]
                     entry["block_reason"] = "precondition_unmet"
-                    entry["block_detail"] = "Preconditions unmet: " + ", ".join(failed_ids)
+                    if unevaluable:
+                        un_ids = [r.predicate_id or r.type for r in unevaluable]
+                        also = [i for i in failed_ids if i not in un_ids]
+                        entry["precondition_unevaluable"] = un_ids
+                        entry["block_detail"] = (
+                            "Preconditions NOT EVALUABLE (PERMANENT — the evaluator "
+                            "cannot run these as written; they will never self-clear, "
+                            "fix the predicate): " + ", ".join(un_ids)
+                            + (" | also unmet: " + ", ".join(also) if also else ""))
+                    else:
+                        entry["block_detail"] = "Preconditions unmet: " + ", ".join(failed_ids)
                     entry["precondition_unmet"] = failed_ids
                     # C2 coverage (, bravo msg-2949): a goal whose
                     # preconditions fail LIVE here but which carries no defer fields
@@ -6374,6 +6751,10 @@ def cmd_select(args):
 
     Output: JSON array sorted by score desc, each entry tagged with source.
     """
+    # : pull the authoritative stores into the local cache BEFORE the
+    # first read. Must precede every read below -- this refresh is what makes
+    # them current, so moving a read above it silently restores the defect.
+    refresh_aspiration_caches()
     # Read from both aspiration queues
     world_aspirations = read_jsonl(WORLD_ASP_PATH)
     agent_aspirations = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
@@ -6493,6 +6874,13 @@ def cmd_select(args):
         # fresh read) and log the discrepancy for root-cause evidence. The three
         # collect_* calls below intentionally MIRROR the initial collection above
         # -- keep them in sync; test_goal_selector_allblocked_reread guards this.
+        #
+        # : refresh the cache FIRST, or this "re-read fresh" re-reads
+        # the SAME bytes under own-cloud and the second signal is not
+        # independent of the first -- the retry would confirm the all-blocked
+        # negative it was added to falsify. On LocalBackend this is a no-op, so
+        # the original OneDrive-settling rationale above is unchanged.
+        refresh_aspiration_caches()
         world_retry = read_jsonl(WORLD_ASP_PATH)
         agent_retry = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []
         all_aspirations_retry = world_retry + agent_retry
@@ -6812,6 +7200,10 @@ def cmd_blocked(args):
     except Exception:
         pass
 
+    # : same stale-cache exposure as cmd_select -- a blocked-goal
+    # report built from a lagging snapshot names goals that are already
+    # terminal, and reads as a real bottleneck.
+    refresh_aspiration_caches()
     # Read from both aspiration queues
     world_aspirations = read_jsonl(WORLD_ASP_PATH)
     agent_aspirations = read_jsonl(AGENT_ASP_PATH) if AGENT_ASP_PATH else []

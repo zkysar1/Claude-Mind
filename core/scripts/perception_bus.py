@@ -53,6 +53,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import enum
+import hashlib
 import json
 import re
 import subprocess
@@ -560,7 +561,10 @@ class PerceptionBus:
 
 
 # ---------------------------------------------------------------------------
-# Reference modules -- one listen-signal, one exec-script (convention S2)
+# Reference modules -- one per perception kind (convention S2):
+#   FileTouchModule     S2.1 listen-signal
+#   ScriptPollModule    S2.2 exec-script
+#   StateDocumentModule S2.3 read-file
 # ---------------------------------------------------------------------------
 
 class FileTouchModule(PerceptionModule):
@@ -646,4 +650,116 @@ class ScriptPollModule(PerceptionModule):
             # reported with reduced confidence rather than swallowed, because
             # "the probe failed" is itself something cognition needs to see.
             confidence=1.0 if proc.returncode == 0 else 0.5,
+            ttl=self.ttl)
+
+
+_UNREAD = object()   # sentinel digest input for "no document was readable"
+
+
+class StateDocumentModule(PerceptionModule):
+    """CONTINUOUS: forwards a structured state document. Convention S2.3.
+
+    The read-file reference, and the third of the convention's three perception
+    kinds. S2.3's distinguishing clause is the ABSENCE of computation -- "the
+    observation IS the file's contents, not the result of processing them" --
+    so this module reads, parses and forwards. It never derives. A module that
+    computed a summary would be exec-script (S2.2) wearing a read-file label.
+
+    WHY CHANGE DETECTION IS A CONTENT HASH AND NOT AN mtime. S2.3 permits
+    "mtime, content hash, or sequence number"; only the hash is correct for a
+    high-rate producer. mtime fails in BOTH directions here. It fires when a
+    writer rewrites byte-identical content (a tick loop republishing an
+    unchanged reading), which manufactures percepts out of a world that did not
+    change -- the same defect FileTouchModule's docstring calls "a poll-driven
+    event source manufacturing events". And its resolution is coarse -- 1s on
+    some filesystems -- so at 3 Hz it also MISSES changes, silently. mtime is
+    the right primitive for FileTouchModule, whose whole payload IS the mtime;
+    it is the wrong one for a module whose payload is the content.
+
+    WHY THE SOURCE IS INJECTED (`path` OR `reader`, exactly one). Identical
+    reasoning to FileTouchModule's explicit path: the bus is stdlib-only and
+    must never learn a layout. It also keeps this module's transport an OPEN
+    question rather than a decided one -- a `reader` may read a file today and
+    an endpoint later without touching this class. That matters because the bus
+    is a PER-RUNTIME decoupling boundary (module docstring), so a producer in
+    another runtime necessarily reaches it through some reader, and hardcoding
+    a filesystem path here would silently make that architecture decision.
+
+    WHY AN UNREADABLE DOCUMENT IS AN OBSERVATION, NOT A SILENCE. The bus keeps
+    per-module error counts precisely because "a silently-skipped sensor reads
+    exactly like a sensor with nothing to report". A missing or malformed
+    document says something true about the world -- the producer is not
+    publishing -- so it is reported at reduced confidence rather than swallowed,
+    exactly as ScriptPollModule reports a non-zero rc. It is still subject to
+    change detection: an absent document that STAYS absent is not a new
+    observation, so the unreadable state gets its own digest and repeats
+    return None.
+    """
+
+    cadence = CadenceType.CONTINUOUS
+
+    def __init__(self, module_id, pack, path=None, reader=None,
+                 throttle_ticks=1, ttl=None, cost=None):
+        if (path is None) == (reader is None):
+            raise ValueError(
+                "StateDocumentModule needs exactly one of path= or reader=, "
+                "got path=%r reader=%r" % (path, reader))
+        self.module_id = module_id
+        self.pack = pack
+        self.path = str(path) if path is not None else None
+        self.reader = reader
+        self.throttle_ticks = max(1, int(throttle_ticks))
+        self.ttl = ttl
+        self._cost = cost or ResourceBudget()
+        self._last_digest = None
+
+    def cost_estimate(self):
+        return self._cost
+
+    @property
+    def source_label(self):
+        return self.path if self.path is not None else "reader:%s" % (self.module_id,)
+
+    def _read_text(self):
+        """Return the document text, or None when nothing is readable."""
+        if self.reader is not None:
+            return self.reader()
+        try:
+            with open(self.path, encoding="utf-8") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def perceive(self, trigger):
+        error = None
+        content = None
+        try:
+            text = self._read_text()
+        except Exception as exc:                      # a reader is caller code
+            text, error = None, "%s: %s" % (type(exc).__name__, exc)
+        if text is None and error is None:
+            error = "unreadable: %s" % (self.source_label,)
+        elif text is not None:
+            try:
+                content = json.loads(text)
+            except ValueError as exc:
+                error = "%s: %s" % (type(exc).__name__, exc)
+
+        # Digest the STATE, so an unreadable document that stays unreadable is
+        # not re-reported every tick. The error string is part of the state:
+        # a producer that changes HOW it is failing has changed.
+        basis = error if error is not None else text
+        digest = hashlib.sha256(
+            ("E" if error is not None else "C").encode("utf-8")
+            + basis.encode("utf-8", "replace")).hexdigest()
+        if digest == self._last_digest:
+            return None
+        self._last_digest = digest
+
+        return Percept(
+            source_module=self.module_id, source_pack=self.pack,
+            payload={"source": self.source_label, "content": content,
+                     "readable": error is None, "error": error},
+            provenance=ProvenanceTag.DIRECT,
+            confidence=1.0 if error is None else 0.5,
             ttl=self.ttl)

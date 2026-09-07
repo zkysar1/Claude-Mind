@@ -94,9 +94,25 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
    (tree-moved)` outranks every other verdict and voids the entire run, and
    HEAD moves for reasons that are not a peer merge: your OWN `git commit`
    counts, and so does your own loop's turn-end iteration-push merge. The tree
-   lock does NOT cover you -- it returns 0 for your own sid, and a BACKGROUNDED
-   run inherits no MIND_SID at all so it takes no lock while still printing
-   authoritative-looking chunk counts. FIRST, THOUGH: IF THIS BOX HAS A LIVE
+   lock does NOT cover you -- it returns 0 for your own sid, and a run whose
+   PreToolUse bash-inject hook MISSED carries no MIND_SID at all, so it takes
+   no lock while still printing authoritative-looking chunk counts. DO NOT READ
+   THAT AS "BACKGROUNDING STRIPS THE INJECTION" -- guard-4048 formed exactly
+   that hypothesis and REFUTED it by probe (a backgrounded call measured
+   MIND_AGENT present, as did every foreground call): the hook fires PER CALL
+   and fails open TRANSIENTLY, so a FOREGROUND launch reaches the same state.
+   The remedy is to pass the values, not to avoid `&`, and to pass them
+   LITERALLY:
+       nohup env MIND_AGENT=<agent> MIND_SID=<sid> STORAGE_BACKEND=local bash core/scripts/run-full-suite.sh > <log> 2>&1 &
+   `export MIND_AGENT MIND_SID` IS THE TRAP AND DOES NOTHING (g-115-9183):
+   export on an UNSET name creates no variable, so it is a no-op in precisely
+   the case that needs it -- while the `export STORAGE_BACKEND=local` beside it
+   DOES work, because it carries a value, which is why the whole line reads as
+   correct. CONFIRM BY THE LOG DIR, NOT BY THE WARNING GOING QUIET:
+   <tmp>/ayoai-suite-run-<agent> means the vars arrived,
+   <tmp>/ayoai-suite-run-shared means they did not. Measured cc-09 2026-09-06:
+   the export form yields -shared, byte-identical to passing nothing at all.
+   FIRST, THOUGH: IF THIS BOX HAS A LIVE
    mind_api DAEMON, DO NOT PIN A WORKTREE AT ALL (guard-5866) -- it is worse
    than the contention it avoids. The worktree spawns its OWN daemon, and
    mind-api-start.sh _sweep_orphan_daemons matches mind_api.src processes by

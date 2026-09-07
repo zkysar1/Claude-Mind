@@ -69,27 +69,53 @@ def sample(tmp_path):
 
 
 class TestExistenceModeUnchanged:
-    """The default path must be byte-identical to the pre-frequency script."""
+    """The existence path is unchanged by the frequency mode ().
+
+    ONE deliberate exception, added by g-115-9120: an UNSET `--sample-count`
+    now reads the whole file rather than one record. That default was
+    laundering the very rb-245 negation this probe exists to gate — on a
+    10,851-record store with the field on 10,779 of them, reading record 1
+    returned `field_present: false`. Every EXPLICIT value still behaves
+    exactly as before, which is what the parametrised test below pins; the
+    changed default gets its own named test so the break is legible rather
+    than buried in a loosened expectation.
+    """
 
     def test_no_frequency_key_without_the_flag(self, sample):
         r = _run("--file", sample, "--field", "u.t")
         assert r.returncode == 0
         assert "frequency" not in json.loads(r.stdout)
 
-    @pytest.mark.parametrize("sc", [None, 0, -3, 1, 2, 5, 99])
-    def test_sample_count_semantics_are_preserved_per_value(self, sample, sc):
-        """`max(1, n)`: values below 1 read exactly ONE record.
+    @pytest.mark.parametrize("sc", [0, -3, 1, 2, 5, 99])
+    def test_explicit_sample_count_semantics_are_preserved_per_value(self, sample, sc):
+        """`max(1, n)`: EXPLICIT values below 1 still read exactly ONE record.
 
         Parameterised per value rather than spot-checked because the one
         regression this file exists to prevent lived at a single value (0)
         while every neighbouring value was correct.
+
+        `None` is deliberately NOT in this list any more — see
+        test_unset_sample_count_reads_the_whole_file. The `max(1, n)` floor is
+        a property of an explicitly-passed value, and g-115-9120 changed only
+        what happens when nothing is passed at all.
         """
-        args = ["--file", sample, "--field", "u.t"]
-        if sc is not None:
-            args += ["--sample-count", sc]
-        out = json.loads(_run(*args).stdout)
-        expected = 1 if (sc is None or sc < 1) else min(sc, 5)
-        assert out["records_sampled"] == expected
+        out = json.loads(_run("--file", sample, "--field", "u.t",
+                              "--sample-count", sc).stdout)
+        assert out["records_sampled"] == (1 if sc < 1 else min(sc, 5))
+
+    def test_unset_sample_count_reads_the_whole_file(self, sample):
+        """: the DEFAULT is now the whole file, not one record.
+
+        This is the one deliberate break with the pre-g-115-9120 baseline (see
+        the class docstring). Pinned as its own test rather than as a
+        parametrise case so the intent is legible: a future reader diffing
+        against the old `expected = 1 if sc is None ...` sees a named change,
+        not a silently-loosened assertion.
+        """
+        out = json.loads(_run("--file", sample, "--field", "u.t").stdout)
+        assert out["records_sampled"] == 5
+        assert out["records_in_file"] == 5
+        assert out["sample_is_complete"] is True
 
     def test_explicit_null_terminal_still_reads_absent(self, sample):
         """verification-checklist item 45 — the probe and audit-schema-gate
@@ -213,3 +239,136 @@ class TestValueKey:
         f = json.loads(_run("--file", p, "--field", "v",
                             "--frequency").stdout)["frequency"]
         assert f["distinct_values"] == 2
+
+
+class TestHeterogeneousStore:
+    """ — the two independent ways this probe returned a FALSE
+    `field_present: false` on a store where the field plainly exists.
+
+    Both must be pinned, and the second is the one a careless fix misses:
+    "a regression test whose fixture is only a heterogeneous tail will pass
+    while this half stays broken." So each mechanism carries a POSITIVE
+    CONTROL proving its fixture actually reproduces the defect — without one,
+    a test can pass against a probe that never had the bug (the C13-at-0.50
+    trap: probe where the implementations genuinely diverge).
+
+    Why it matters more than an ordinary off-by-one: this probe is the
+    EVIDENCE half of rb-245. `zero-count-gate.py` consumes `field_present` to
+    decide whether a "no records have X" claim may stand, so a false negative
+    here does not merely mislead a reader — it certifies the exact negation
+    the gate exists to refuse.
+    """
+
+    @pytest.fixture
+    def tail_gap(self, tmp_path):
+        """The field is on the OLD records and absent from the NEWEST three.
+
+        Shape of the live store that produced the defect: 10,779 of 10,851
+        records carried the field, and the probe read `false` — because the
+        window it read was the tail, and the tail was the 72 that did not.
+        """
+        return _write(tmp_path, [
+            {"id": "a1", "u": {"t": 1}},
+            {"id": "a2", "u": {"t": 2}},
+            {"id": "a3", "u": {"t": 3}},
+            {"id": "b1"},
+            {"id": "b2"},
+            {"id": "b3"},
+        ], "tail.jsonl")
+
+    @pytest.fixture
+    def nested(self, tmp_path):
+        """`goals` is a LIST of dicts — the shape of `aspirations.jsonl`.
+
+        r3 is deliberately PARTIAL (3 elements, 2 carrying `id`) so the
+        element hit-count has a value that is neither the list length nor 1.
+        """
+        return _write(tmp_path, [
+            {"top": {"name": "a"},
+             "goals": [{"id": "g1"}, {"id": "g2"}, {"id": "g3"}]},
+            {"top": {"name": "b"}},
+            {"top": {"name": "c"},
+             "goals": [{"id": "g4"}, {"id": "g5"}, {"nope": 1}]},
+        ], "nested.jsonl")
+
+    # --- mechanism 1: the heterogeneous tail --------------------------------
+
+    def test_default_finds_a_field_absent_from_the_newest_records(self, tail_gap):
+        out = json.loads(_run("--file", tail_gap, "--field", "u.t").stdout)
+        assert out["field_present"] is True
+        assert out["record_index"] == -4        # first hit, scanning backwards
+        assert out["records_sampled"] == 6
+        assert out["sample_is_complete"] is True
+
+    def test_positive_control_the_tail_window_still_reports_absent(self, tail_gap):
+        """The fixture REPRODUCES the defect — proof the test above can fail.
+
+        Same file, same field: a tail window of 1 or 3 records sees only the
+        `b*` records and answers `false`. That answer is not a bug (the window
+        genuinely holds no hit); it was a bug as a DEFAULT, because the caller
+        asked "is this field in the schema" and was answered about 1 record.
+        """
+        for window in (1, 3):
+            out = json.loads(_run("--file", tail_gap, "--field", "u.t",
+                                  "--sample-count", window).stdout)
+            assert out["field_present"] is False, window
+            # guard-2298: the population sits beside the filtered count, so
+            # this `false` is legible as partial rather than as a scan result.
+            assert out["records_in_file"] == 6
+            assert out["sample_is_complete"] is False
+
+    # --- mechanism 2: descent through a list --------------------------------
+
+    def test_default_descends_a_list_to_reach_a_nested_leaf(self, nested):
+        """Dict-only descent returns not-found here; this is the mutation."""
+        out = json.loads(_run("--file", nested, "--field", "goals.id").stdout)
+        assert out["field_present"] is True
+        assert out["sample_value"] == "g4"
+
+    def test_element_hit_count_makes_a_partial_visible(self, nested):
+        """2 of r3's 3 elements carry `id` — report 2, not the list length and
+        not a bare boolean. Scoped to `record_index`'s record: r1's three hits
+        are NOT added in, because the scan stops at the first matching record.
+        """
+        out = json.loads(_run("--file", nested, "--field", "goals.id").stdout)
+        assert out["record_index"] == -1
+        assert out["match_count_in_record"] == 2
+
+    def test_a_terminal_list_is_one_value_not_exploded(self, nested):
+        """Boundary: the path STOPS at the list, so the list IS the value."""
+        out = json.loads(_run("--file", nested, "--field", "goals").stdout)
+        assert out["field_present"] is True
+        assert out["match_count_in_record"] == 1
+        assert out["sample_value"] == [{"id": "g4"}, {"id": "g5"}, {"nope": 1}]
+
+    def test_descent_does_not_manufacture_a_missing_leaf(self, nested):
+        """The inverse control: list descent must not turn absent into found."""
+        out = json.loads(_run("--file", nested, "--field", "goals.absent").stdout)
+        assert out["field_present"] is False
+        assert out["match_count_in_record"] == 0
+        assert out["record_index"] is None
+
+    def test_positive_control_scalar_paths_are_unaffected(self, nested):
+        """Descent changed the traversal for every path, so the paths that
+        already worked need a control too — a fix that only satisfied the list
+        case while breaking plain dicts would pass every assertion above."""
+        out = json.loads(_run("--file", nested, "--field", "top.name").stdout)
+        assert out["field_present"] is True
+        assert out["sample_value"] == "c"
+        assert out["match_count_in_record"] == 1
+
+    def test_frequency_conservation_holds_on_RECORDS_not_values(self, nested):
+        """One record yields several values under list descent, so the
+        conservation invariant hangs on `records_with_field` — NOT on
+        `values_found`, which legitimately EXCEEDS the records scanned.
+
+        TestFrequencyMode's conservation test asserts the `values_found` form;
+        that is correct there only because its fixture contains no list paths.
+        This is the general invariant.
+        """
+        f = json.loads(_run("--file", nested, "--field", "goals.id",
+                            "--frequency").stdout)["frequency"]
+        assert f["records_with_field"] + f["records_missing_field"] == f["records_scanned"]
+        assert f["values_found"] == 5           # 3 from r1 + 2 from r3
+        assert f["values_found"] > f["records_scanned"]
+        assert f["records_with_field"] == 2     # r2 has no `goals` key at all

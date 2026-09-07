@@ -34,11 +34,11 @@ USAGE
 NAME=""; TOOL=""; PURPOSE=""; GOAL=""; RULE=""; WRITE=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --name) NAME="${2:-}"; shift 2 ;;
-    --tool) TOOL="${2:-}"; shift 2 ;;
-    --purpose) PURPOSE="${2:-}"; shift 2 ;;
-    --goal-id) GOAL="${2:-}"; shift 2 ;;
-    --rule-name) RULE="${2:-}"; shift 2 ;;
+    --name) NAME="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --tool) TOOL="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --purpose) PURPOSE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --goal-id) GOAL="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+    --rule-name) RULE="${2:-}"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     --write) WRITE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;

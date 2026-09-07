@@ -74,6 +74,7 @@ OUTCOME=""
 SOURCE=""
 SUMMARY=""
 OVERRIDE_UNCOMMITTED=""
+OVERRIDE_DOMAIN_SUITE=""
 # : § STATE-UPDATE quality flags. iteration-close.sh has parsed these
 # since , but this wrapper did not — so `--artifacts-count` et al. exited
 # rc=2 "unknown flag" and a recurring deep close could never carry them.
@@ -139,6 +140,7 @@ while [[ $# -gt 0 ]]; do
         # completion gates fire here — that inference is what makes the
         # add-the-other-two "fix" look right.
         --override-uncommitted) OVERRIDE_UNCOMMITTED="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        --override-domain-suite) OVERRIDE_DOMAIN_SUITE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         -*) echo "recurring-close: unknown flag $1" >&2; exit 2 ;;
         *)
             if [[ -z "$GOAL_ID" ]]; then
@@ -536,6 +538,7 @@ trap 'exit 130' INT
 # Empty OVERRIDE_UNCOMMITTED preserves normal gate enforcement.
 VERIFY_EXTRA=()
 [[ -n "$OVERRIDE_UNCOMMITTED" ]] && VERIFY_EXTRA+=(--override-uncommitted "$OVERRIDE_UNCOMMITTED")
+[[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && VERIFY_EXTRA+=(--override-domain-suite "$OVERRIDE_DOMAIN_SUITE")
 
 # Build state-update-specific arg array — only this phase consumes the four
 # § STATE-UPDATE quality flags (). Each is appended only when the

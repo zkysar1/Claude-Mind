@@ -27,7 +27,12 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _framework_origin import framework_origin, is_framework_path, self_env_id  # noqa: E402
+from _framework_origin import (  # noqa: E402
+    framework_origin,
+    is_forged_skill_body,
+    is_framework_path,
+    self_env_id,
+)
 
 GATE_ID = "check-framework-origin-writes"
 OVERRIDE_ENV = "FRAMEWORK_WRITE_OVERRIDE"
@@ -43,11 +48,29 @@ def _git(root: Path, *args: str) -> tuple[int, str]:
 
 
 def staged_framework_paths(root: Path) -> list[str]:
-    """Every staged path (any status) the promotion train owns."""
+    """Every staged path (any status) the promotion train owns.
+
+    A destination-owned forged skill body is EXEMPT (is_forged_skill_body): the
+    train does not carry one, so committing it is local work rather than drift —
+    and the body travels to this deployment's other agents by git, so refusing the
+    commit would strand it (guard-5291, g-115-9043).
+
+    DELETIONS are never exempt. At a staged delete the body is already gone from
+    the working tree, so the predicate's "absent means new" branch cannot tell a
+    forged skill being retired from a BASE skill being removed — and un-forging is
+    meant to be a deliberate act, never a side effect
+    (_seed_engine._is_protected_dest_skill). Removing either needs the override.
+    """
     rc, out = _git(root, "diff", "--cached", "--name-only", "-z")
     if rc != 0:
         return []
-    return [p for p in out.split("\0") if p and is_framework_path(p)]
+    staged = [p for p in out.split("\0") if p and is_framework_path(p)]
+    rc_d, out_d = _git(root, "diff", "--cached", "--name-only", "--diff-filter=D", "-z")
+    # An unreadable delete-set means every staged path is treated as a deletion, so
+    # nothing is exempt and the gate refuses — the safe direction here (see
+    # is_forged_skill_body on why this module's fail directions differ by helper).
+    deleted = {p for p in out_d.split("\0") if p} if rc_d == 0 else set(staged)
+    return [p for p in staged if p in deleted or not is_forged_skill_body(p, root)]
 
 
 def _log(root: Path, decision: str, trigger: str, reason: str = "") -> None:

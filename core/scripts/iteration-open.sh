@@ -93,7 +93,28 @@ else
     _bytes=-1
 fi
 
-if [ "$_DRY" = "1" ]; then exit "$_rc"; fi
+if [ "$_DRY" = "1" ]; then
+    # . --dry-run PRESERVES the rc because it is a VERIFICATION check,
+    # and a check that always exits 0 can never fail (, see header).
+    # THE BYTE COUNT IS PART OF THAT VERDICT, and until now it was not consulted
+    # here at all: this branch returned _rc before ever reaching the byte check
+    # below, so a zero-byte dry-run reported success. dry_run() prints its lane
+    # table (text) or its JSON object on EVERY success path, and its one early
+    # return prints to stderr and returns 1 — so ZERO bytes at rc=0 is not a
+    # clean parse, it is a check that produced NO VERDICT AT ALL, and calling
+    # that a pass is the same defect in a new place.
+    # Exit 3 is deliberate and distinct: 0 clean, 1 tier table unreadable (the
+    # .py's own hard error), 2 argparse usage, 3 no verdict — so a caller can
+    # tell them apart instead of matching a bare non-zero (guard-2066).
+    # _bytes=-1 means NOT MEASURED (mktemp unavailable) and must never raise this
+    # alarm — an alarm invented from a failed measurement is the defect in the
+    # other direction (guard-1091). Only a literal 0 qualifies.
+    if [ "$_rc" = "0" ] && [ "$_bytes" = "0" ]; then
+        echo "[iteration-open] DRY-RUN PRODUCED NO VERDICT — ZERO bytes of output at rc=0. dry_run() prints its lane table on every success path, so this is a check that never ran, not a clean parse. Exiting 3." >&2
+        exit 3
+    fi
+    exit "$_rc"
+fi
 [ "$_rc" -ne 0 ] && echo "[iteration-open] wrapper_failed — fall back to the batteries directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
 [ "$_bytes" = "0" ] && echo "[iteration-open] SILENT RUN — ZERO bytes of output at rc=$_rc. This is NOT an all-clear: iteration-open.py always prints a STAGE table, so no output means the report was never emitted. Treat the always-run stage as BLIND and run the fallbacks directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
 exit 0

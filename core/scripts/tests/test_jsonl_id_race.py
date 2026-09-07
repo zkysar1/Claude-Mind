@@ -38,6 +38,7 @@ sys.path.insert(0, str(CORE_SCRIPTS))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from _daemon_fixture import DaemonFixture  # noqa: E402
+from _rt import _api_token  # noqa: E402
 
 RACERS_PER_STORE = 8
 TEST_TAG = "id-race-test"
@@ -49,6 +50,15 @@ def _post_append(port: int, store: str, record: dict) -> tuple[int, str]:
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-Mind-Agent", "alpha")
+    # FR-4 bearer () — third instance of the raw-urllib exposure, found
+    # by the population sweep rather than by a red run. This file is ALSO red
+    # for an unrelated cause owned by ; only the missing Authorization
+    # header is addressed here, and the two must not be folded together. Same
+    # canonical resolver as the production clients (_rt._api_token), fail-open
+    # when no token is configured.
+    _tok = _api_token()
+    if _tok:
+        req.add_header("Authorization", "Bearer " + _tok)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return resp.status, resp.read().decode("utf-8")

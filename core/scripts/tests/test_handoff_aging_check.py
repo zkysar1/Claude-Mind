@@ -398,6 +398,180 @@ def test_inbound_absent_when_disabled_and_outbound_keys_intact():
         assert k in result, "outbound key %r must survive the inbound addition" % k
 
 
+# ---------------------------------------------------------------------------
+#  — recurring goals aged on lastAchievedAt, and the two ways that
+# fix can silence the very rows this detector exists to surface.
+#
+# Each test below is falsified by a DISTINCT wrong implementation:
+#   age every goal on created_at            -> test_recurring_ages_from_last_achieved_at
+#   age every recurring on lastAchievedAt   -> test_shelved_recurring_is_not_silenced
+#   treat achievedCount==0 as achieved      -> test_never_achieved_recurring_ages_from_created_at
+#   omit the new basis from the tally       -> test_age_basis_breakdown_counts_last_achieved_at
+#   exclude every structured defer prefix   -> test_human_blocked_defer_keeps_ageing
+#   exclude shelved recurring rows too      -> test_shelved_recurring_survives_the_defer_exclusion
+#   hardcode a prefix that later moves      -> test_self_clearing_defer_prefix_still_exists_in_ssot
+# ---------------------------------------------------------------------------
+
+def _make_recurring(goal_id, created_hours_ago, achieved_hours_ago=None,
+                    achieved_count=5, shelved=False, defer_reason=None,
+                    intended_agent="bravo"):
+    """A recurring INBOUND goal.
+
+    `shelved` sets last_shelved_at == lastAchievedAt, which is guard-2197's
+    single-read test for "the precondition sweep advanced this stamp, no close
+    did".
+    """
+    g = {
+        "id": goal_id,
+        "title": "Recurring: sensor %s" % goal_id,
+        "status": "pending",
+        "priority": "MEDIUM",
+        "intended_agent": intended_agent,
+        "participants": ["agent"],
+        "recurring": True,
+        "achievedCount": achieved_count,
+        "created_at": _iso(created_hours_ago),
+    }
+    if achieved_hours_ago is not None:
+        stamp = _iso(achieved_hours_ago)
+        g["lastAchievedAt"] = stamp
+        if shelved:
+            g["last_shelved_at"] = stamp
+    if defer_reason is not None:
+        g["defer_reason"] = defer_reason
+    return g
+
+
+def test_recurring_ages_from_last_achieved_at():
+    """THE DEFECT. A recurring goal returns to pending on close and never
+    leaves, so created_at never advances and its reported age grows without
+    bound. Measured 2026-09-06: g-353-02 fired ~6h before the scan and was
+    reported at 1174.72h / HIGH on a created_at basis."""
+    mod = _import_module()
+    g = _make_recurring("g-test-700", created_hours_ago=1174.0,
+                        achieved_hours_ago=6.0, achieved_count=23)
+    _install_mock_goals(mod, [g])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert ib["matched_count"] == 1, ib
+    assert ib["aged_count"] == 0, (
+        "a sensor that achieved 6h ago must not be aged at all: %r" % ib)
+    age, basis = mod._inbound_age(g, dt.datetime.now())
+    assert basis == "lastAchievedAt", basis
+    assert age < 7.0, age
+
+
+def test_shelved_recurring_is_not_silenced():
+    """guard-2197: recurring-precondition-sweep.py advances lastAchievedAt on a
+    FAILING precondition and never writes achievedCount, so a fresh stamp is not
+    evidence of achievement. A shelved sensor is exactly what this detector must
+    surface, so it keeps ageing on created_at. Measured live: g-115-105
+    (achievedCount 386, shelved, 3258.87h) must stay reported."""
+    mod = _import_module()
+    g = _make_recurring("g-test-701", created_hours_ago=3258.0,
+                        achieved_hours_ago=0.5, achieved_count=386,
+                        shelved=True)
+    _install_mock_goals(mod, [g])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    age, basis = mod._inbound_age(g, dt.datetime.now())
+    assert basis == "created_at", (
+        "a SHELVED recurring goal must not age from lastAchievedAt: %r" % basis)
+    assert age > 3000.0, age
+    assert "g-test-701" in [r["goal_id"] for r in ib["reported"]], ib
+
+
+def test_never_achieved_recurring_ages_from_created_at():
+    """achievedCount == 0 means never achieved, which is genuinely aged since
+    birth — the goal's own outcome 1 keeps those on created_at."""
+    mod = _import_module()
+    g = _make_recurring("g-test-702", created_hours_ago=900.0,
+                        achieved_hours_ago=2.0, achieved_count=0)
+    _, basis = mod._inbound_age(g, dt.datetime.now())
+    assert basis == "created_at", basis
+
+
+def test_non_recurring_chain_is_unchanged():
+    """The recurring branch must not disturb the existing fallback order."""
+    mod = _import_module()
+    g = _make_inbound("g-test-703", hours_ago=300.0,
+                      age_field="handoff_created_at")
+    _, basis = mod._inbound_age(g, dt.datetime.now())
+    assert basis == "handoff_created_at", basis
+
+
+def test_age_basis_breakdown_counts_last_achieved_at():
+    """The tally hardcodes its bases, so a basis missing from that tuple is
+    counted by nothing and the breakdown silently under-reports the population
+    it claims to describe."""
+    mod = _import_module()
+    _install_mock_goals(mod, [
+        _make_recurring("g-test-704", created_hours_ago=1000.0,
+                        achieved_hours_ago=500.0, achieved_count=9),
+    ])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+    assert ib["age_basis_breakdown"].get("lastAchievedAt") == 1, \
+        ib["age_basis_breakdown"]
+
+
+def test_self_clearing_defer_is_excluded_and_counted():
+    """A precondition_unmet: row re-probes on its own cadence, so escalating it
+    as un-attended is noise on a shared surface. Excluded — and COUNTED, so the
+    exclusion is never silent (guard-1802)."""
+    mod = _import_module()
+    g = _make_inbound("g-test-705", hours_ago=800.0)
+    g["defer_reason"] = "precondition_unmet: waiting on a live env-server"
+    _install_mock_goals(mod, [g])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert ib["matched_count"] == 0, ib
+    assert ib["excluded_self_clearing_defer"] == 1, ib
+    assert "g-test-705" not in [r["goal_id"] for r in ib["reported"]], ib
+
+
+def test_human_blocked_defer_keeps_ageing():
+    """human_blocked: NEVER auto-clears, so ageing it toward a human is exactly
+    the intended behaviour. Excluding every structured prefix would bury it."""
+    mod = _import_module()
+    g = _make_inbound("g-test-706", hours_ago=800.0)
+    g["defer_reason"] = "human_blocked: needs an approval click"
+    _install_mock_goals(mod, [g])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert ib["excluded_self_clearing_defer"] == 0, ib
+    assert "g-test-706" in [r["goal_id"] for r in ib["reported"]], ib
+
+
+def test_shelved_recurring_survives_the_defer_exclusion():
+    """THE INTERACTION BETWEEN THIS GOAL'S TWO HALVES. A shelved recurring goal
+    shelves BECAUSE its precondition keeps failing, so it also carries a
+    precondition_unmet: defer — and a blanket exclusion drops the very row the
+    recurring branch deliberately kept ageing. Measured live 2026-09-06 before
+    the carve-out existed: g-115-105 left the reported set."""
+    mod = _import_module()
+    g = _make_recurring("g-test-707", created_hours_ago=3258.0,
+                        achieved_hours_ago=0.5, achieved_count=386,
+                        shelved=True,
+                        defer_reason="precondition_unmet: gate still failing")
+    _install_mock_goals(mod, [g])
+    ib = mod.run(_make_args(agent="bravo"))["inbound"]
+
+    assert mod._has_self_clearing_defer(g) is False, \
+        "a shelved recurring goal is not attended work on a cadence"
+    assert ib["excluded_self_clearing_defer"] == 0, ib
+    assert "g-test-707" in [r["goal_id"] for r in ib["reported"]], ib
+
+
+def test_self_clearing_defer_prefix_still_exists_in_ssot():
+    """The predicate writes 'precondition_unmet:' literally, because importing
+    the whole set would wrongly exclude human_blocked: too. The cost of the
+    literal is that a RENAME leaves it silently matching nothing — so assert
+    against the SSOT that owns the prefix list."""
+    from gates.defer_classifier import STRUCTURED_DEFER_PREFIXES
+    assert "precondition_unmet:" in STRUCTURED_DEFER_PREFIXES, \
+        STRUCTURED_DEFER_PREFIXES
+
+
 if __name__ == "__main__":
     import tempfile
     test_no_aged_handoff_noop()
@@ -426,7 +600,16 @@ if __name__ == "__main__":
                 test_inbound_fresh_goal_not_reported,
                 test_inbound_high_is_never_truncated_by_the_cap,
                 test_inbound_cap_bounds_non_high_and_reports_suppression,
-                test_inbound_absent_when_disabled_and_outbound_keys_intact):
+                test_inbound_absent_when_disabled_and_outbound_keys_intact,
+                test_recurring_ages_from_last_achieved_at,
+                test_shelved_recurring_is_not_silenced,
+                test_never_achieved_recurring_ages_from_created_at,
+                test_non_recurring_chain_is_unchanged,
+                test_age_basis_breakdown_counts_last_achieved_at,
+                test_self_clearing_defer_is_excluded_and_counted,
+                test_human_blocked_defer_keeps_ageing,
+                test_shelved_recurring_survives_the_defer_exclusion,
+                test_self_clearing_defer_prefix_still_exists_in_ssot):
         _fn()
         print("PASS %s" % _fn.__name__)
-    print("OK: 15/15 passed")
+    print("OK: 24/24 passed")

@@ -19,6 +19,35 @@
 #
 # DO NOT re-inline this arithmetic anywhere. A second copy is precisely the
 # defect this module was extracted to end — see the  census below.
+#
+# THE ZERO-IMPORTS CONTRACT ABOVE STILL HOLDS AS WRITTEN. `decimal` is stdlib,
+# pure, and has no module-level side effects, so it does not reintroduce the
+# hazard that guard-547 is about: the danger was importing the CLI modules,
+# which pull `_paths` at module top and RAISE when the path constants are
+# unset. A stdlib numeric import cannot do that. Do NOT read this import as a
+# licence to add project imports here ().
+from decimal import ROUND_HALF_UP, Decimal
+
+
+def _round_half_up(value):
+    """Round a float to the nearest int, ties going AWAY from zero.
+
+    Built on Decimal rather than `int(value + 0.5)`, which the g-115-3740
+    filing named specifically: that idiom mishandles the float-error cases in
+    this exact corpus. CONFIRMED at conf 0.95 computes `(1.0 - 0.95) * 10` ==
+    0.5000000000000004, not 0.5 — a value that is genuinely above the tie and
+    must score 1 under ANY rule. Decimal quantization over the actual binary
+    float gives the mathematically correct answer for the number we really
+    have; the +0.5 idiom gives the right answer here by luck and the wrong one
+    elsewhere.
+
+    Measured on every .x5 confidence in the live store (2026-09-07):
+      CORRECTED 0.45 -> 5 (was 4), 0.65 -> 7 (was 6), 0.85 -> 9 (was 8)
+      CONFIRMED 0.15 -> 9 (was 8), 0.35 -> 7 (was 6), 0.55 -> 5 (was 4)
+    Every other value in that sweep is unchanged, including the 0.95 float-error
+    case above.
+    """
+    return int(Decimal(value).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
 def compute_surprise(outcome, confidence):
@@ -44,27 +73,67 @@ def compute_surprise(outcome, confidence):
     re-retrieve. Any outcome that is neither (e.g. UNRESOLVABLE, EXPIRED)
     scores 0, which is correct: those are excluded from calibration.
 
-    ROUNDING: round() is round-half-to-EVEN, and .x5 confidences are common in
-    the live store (0.45/0.55/0.65/0.75/0.85 all appear). So the boundary reads
-    as inconsistent -- CORRECTED at 0.65 scores 6 while 0.75 scores 8, because
-    6.5 rounds DOWN and 7.5 rounds UP. That straddles the surprise >= 7
-    promotion threshold: a half-UP rule would score 0.65 CORRECTED as 7 and
-    fire both the "high_surprise" promotion and the Step 3.5 broad re-retrieve;
-    half-to-even scores 6 and fires neither. g-115-3594 LIFTED this arithmetic
-    into one place WITHOUT altering it -- the values are byte-identical to the
-    previous inline batch-micro code. Whether half-up is the intended rule is a
-    separate semantic question; the behavior is pinned by
-    test_surprise_rounding_is_bankers_at_the_promotion_boundary so it cannot
-    drift silently in either direction while that question is open. g-115-3801
-    MOVED this function again, also without altering it: same rounding, same
-    case handling, same 0 for non-calibrated outcomes.
+    ROUNDING — DECIDED 2026-09-07 (g-115-3740): **HALF-UP**, ties away from
+    zero, via `_round_half_up` below. This replaces Python `round()`, which is
+    round-half-to-EVEN. The question is CLOSED; do not re-open it a third time.
+
+    WHY. .x5 confidences are common in the live store (0.45/0.55/0.65/0.75/0.85
+    all appear) and half-to-even made the boundary read as inconsistent to
+    anyone checking by hand: CORRECTED at 0.65 scored 6 while 0.75 scored 8,
+    because 6.5 rounded DOWN and 7.5 rounded UP. Nothing in any SKILL.md,
+    config or convention ever specified half-to-even; it was an artifact of
+    reaching for `round()`, whose name reads as ordinary half-up to most
+    readers. Half-up is what the prose "round(confidence * 10)" always meant.
+
+    WHAT IT IS NOT. This is a CORRECTNESS fix and NOT a fix to high-surprise
+    tier starvation — do not close any goal believing the >= 7 tier now works.
+    Measured over the 588-record replay-candidate pool (555 scoreable,
+    2026-08-19, by another agent — inherited, not re-measured here) the rounding
+    rule alone moved 10 records across >= 7, all sitting at raw 6.5. Best case
+    after this change on that pool is ~11 of 555 (2.0%). The tier is also
+    lopsided for an INDEPENDENT reason: it fires on CORRECTED@conf>=0.70 or
+    CONFIRMED@conf<=0.30, and the low arm is almost never populated.
+
+    ⚠ DO NOT RESTATE THAT LOW ARM AS "STRUCTURALLY UNREACHABLE". This docstring
+    said exactly that on 2026-09-07, sourced from the filing's "minimum
+    confidence ever written was 0.35 (0.40 in the later n=86 sweep)", and the
+    same unit's own Q2 check FALSIFIED it before the goal closed. Re-measured
+    the SAME DAY over the live pipeline (619 records, 198 scoreable with a
+    numeric confidence, alpha worker cc-08, uname -r 6.8.0-138-generic):
+    min confidence 0.30, max 0.95, ONE record at conf <= 0.30 and 21 at
+    conf >= 0.70. So the low arm is REACHABLE and holds one record — sparse,
+    not impossible — and the floor has moved DOWN since the figure that was
+    quoted as a bound. Note the two populations differ (live pipeline here vs
+    the replay-candidate pool there), so this does not refute the earlier
+    census; it does show the floor is a moving observation and not a structural
+    property. guard-1659: a number stated inside a goal's description is a
+    hypothesis, and this one reached a durable docstring before being checked.
+
+    The remaining instrument questions
+    — thresholding on the RAW score rather than a rounded one, and whether a
+    single FLEET-wide threshold is right when per-resolver confidence means
+    span 0.0931 — are deliberately NOT settled here and are not blocked by
+    this change.
+
+    COMPARABILITY. Historical stored scores were computed under half-to-even
+    and are NOT rewritten by this change. At the .x5 points a score written
+    before 2026-09-07 can be one lower than the same input scores today. The
+    write path DERIVES surprise (g-115-3801), so any record re-normalized after
+    this date carries the new rule; treat a cross-era comparison at a .x5
+    confidence as a one-point band, not an exact match.
+
+    g-115-3594 LIFTED this arithmetic into one place without altering it and
+    g-115-3801 MOVED it again, also without altering it. This change is the
+    first alteration since it was written, and the boundary pin in
+    test_surprise_rounding_is_half_up_at_the_promotion_boundary was updated in
+    the same commit.
     """
     conf = float(confidence or 0.0)
     normalized = (outcome or "").strip().lower()
     if normalized == "corrected":
-        return round(conf * 10)
+        return _round_half_up(conf * 10)
     if normalized == "confirmed":
-        return round((1.0 - conf) * 10)
+        return _round_half_up((1.0 - conf) * 10)
     return 0
 
 

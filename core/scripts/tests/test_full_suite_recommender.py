@@ -670,5 +670,109 @@ class TestPytestSuiteMutex(unittest.TestCase):
         self.assertIn("FULL-SUITE TEST RECOMMENDER", buf.getvalue())
 
 
+class TestUntrackedArtifactsNotCodeChanges(unittest.TestCase):
+    """: an untracked build/env DIRECTORY is not a code change.
+
+    Measured 5x on 3 boxes: a single stray `?? __pycache__/` (or `.venv/`, or a
+    `.venv.*` backup) made its repo permanently "changed", so every deep close
+    got a product full-suite banner for a repo nobody had touched.
+
+    These tests drive the REAL `_git_changed_paths` against REAL git repos
+    (guard-920: pin the production shape, not the contract-ideal one) rather
+    than mocking it as the classifier tests above do.
+    """
+
+    def setUp(self):
+        self.mod = _load_recommender()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tmp.name) / "repo"
+        self.repo.mkdir()
+        self._git("init", "-q")
+        self._git("config", "user.email", "t@example.invalid")
+        self._git("config", "user.name", "t")
+        (self.repo / "src.py").write_text("x = 1\n", encoding="utf-8")
+        self._git("add", "src.py")
+        self._git("commit", "-q", "-m", "init")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _git(self, *args):
+        import subprocess
+        return subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+
+    def _porcelain(self):
+        return self._git("status", "--porcelain").stdout
+
+    def _make_untracked_dir(self, name):
+        d = self.repo / name
+        d.mkdir()
+        (d / "junk.bin").write_text("cache\n", encoding="utf-8")
+        return d
+
+    # --- the three measured production shapes -----------------------------
+    def test_untracked_pycache_dir_is_not_a_change(self):
+        self._make_untracked_dir("__pycache__")
+        self.assertIn("?? __pycache__/", self._porcelain())  # production shape
+        self.assertEqual(self.mod._git_changed_paths(self.repo), [])
+
+    def test_untracked_venv_dir_is_not_a_change(self):
+        self._make_untracked_dir(".venv")
+        self.assertIn("?? .venv/", self._porcelain())
+        self.assertEqual(self.mod._git_changed_paths(self.repo), [])
+
+    def test_untracked_venv_backup_dir_is_not_a_change(self):
+        # bravo, cc-05, 2026-08-24: untracked AND unignored, 18 days stale.
+        self._make_untracked_dir(".venv.bravo-backup-20260806")
+        self.assertEqual(self.mod._git_changed_paths(self.repo), [])
+
+    def test_nested_untracked_artifact_dir_is_not_a_change(self):
+        # `?? ops/mind-sidecar/tests/__pycache__/` -- the nested measured shape.
+        d = self.repo / "ops" / "mind-sidecar" / "tests" / "__pycache__"
+        d.mkdir(parents=True)
+        (d / "m.pyc").write_text("b\n", encoding="utf-8")
+        self.assertEqual(self.mod._git_changed_paths(self.repo), [])
+
+    # --- POSITIVE CONTROLS (guard-2421: never trust an empty from a filter) --
+    def test_tracked_modification_is_still_detected(self):
+        (self.repo / "src.py").write_text("x = 2\n", encoding="utf-8")
+        self.assertIn("src.py", self.mod._git_changed_paths(self.repo))
+
+    def test_staged_new_file_is_still_detected(self):
+        (self.repo / "added.py").write_text("y = 1\n", encoding="utf-8")
+        self._git("add", "added.py")
+        self.assertIn("added.py", self.mod._git_changed_paths(self.repo))
+
+    def test_real_change_beside_an_artifact_still_reported(self):
+        # The filter must remove ONLY the artifact, never the real edit with it.
+        self._make_untracked_dir("__pycache__")
+        (self.repo / "src.py").write_text("x = 3\n", encoding="utf-8")
+        got = self.mod._git_changed_paths(self.repo)
+        self.assertIn("src.py", got)
+        self.assertNotIn("__pycache__/", got)
+
+    # --- MUTATION PROOF (guard-1475: assert the fix fails without the fix) ---
+    def test_removing_the_filter_reintroduces_the_defect(self):
+        spec_path = CORE_SCRIPTS / "full-suite-recommender.py"
+        src = spec_path.read_text(encoding="utf-8")
+        needle = '        if s[:2] == "??":\n            continue\n'
+        mutated = src.replace(needle, "", 1)
+        # If the anchor ever drifts, this test must FAIL loudly rather than
+        # silently degrade into a no-op that always passes.
+        self.assertNotEqual(src, mutated, "mutation anchor not found -- filter moved?")
+        ns = {"__name__": "full_suite_recommender_mutated", "__file__": str(spec_path)}
+        exec(compile(mutated, str(spec_path), "exec"), ns)
+        self._make_untracked_dir("__pycache__")
+        self.assertEqual(
+            ns["_git_changed_paths"](self.repo), ["__pycache__/"],
+            "unfiltered collector should still see the artifact -- if it does not, "
+            "this test is no longer proving anything",
+        )
+        self.assertEqual(self.mod._git_changed_paths(self.repo), [])
+
+
 if __name__ == "__main__":
     unittest.main()

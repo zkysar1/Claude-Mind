@@ -549,6 +549,17 @@ IF understated:
 # their numbers are stale by construction (rb-5818), and a fresh count is worth
 # more to whoever executes them than a sixth queue entry. Route nothing to S5.
 #
+# ⛔ STOP CONDITION ON THE ATTACH — READ THE NOTE BEFORE APPENDING TO IT.
+# "Differs materially" is satisfiable on nearly every pass, so gate on TOKEN
+# PRESENCE, not judgment: grep the note for YOUR OWN tokens — the numerator
+# (`STRUCTURAL: N`), each member key, your `hostname`. ALL present = this is a
+# REPRODUCTION, not news: APPEND NOTHING, and route one row to
+# `core/config/strategic-scan-readings.md` (where this phase already sends every
+# other reading) instead. Append ONLY a NEW member key, a numerator that moved,
+# or a falsified prior — never a histogram that advanced one day per calendar day.
+# Rationale (WHY mechanical + the 13-append measurement behind it):
+# core/config/rationale/s2a-attach-stop-condition.md
+#
 # AND READ THE SPLIT, NOT THE RAW COUNT, BEFORE JUDGING SEVERITY: the re-verify
 # cohort is content DELIBERATELY re-verified, so those dates are the most
 # trustworthy in the list, not the least (see the rise-reading paragraph above).
@@ -878,47 +889,49 @@ This is the "intrinsic motivation" engine. Rather than reacting to problems
 drive to explore and discover, not just maintain and fix.
 
 ```
-# S4a: Unexplored territory
-# Identify tree categories that have zero or minimal recent work.
+# S4a: Unexplored territory — RECALIBRATED 2026-09-06 (g-115-3996)
+# Identify tree areas that have zero or minimal recent work.
 #
-# ⛔ THIS PREDICATE IS KNOWN-BROKEN AND ALREADY OWNED — DO NOT RE-FILE IT.
-# It set-differences two DISJOINT VOCABULARIES: `node.key` values are tree node
-# keys, `categories` keys are free-text goal-category strings. They were never
-# designed to align, so the difference measures vocabulary mismatch, not
-# unexplored territory. Measured 2026-08-11 (zeta, hostname cc-02, uname -r
-# 6.8.0-136-generic): 65 L2 tree keys vs 159 active goal categories ->
-# **57 of 65 = 88% "unexplored"** — the same non-discriminating signature the
-# g-115-1410 calibration already removed from S2a (93%) and S2b (96%), which
-# left S4a untouched.
+# The old predicate set-differenced two DISJOINT VOCABULARIES (`node.key` tree
+# keys MINUS free-text goal-category strings), so it measured vocabulary
+# mismatch, not exploration: 88% flagged (zeta 2026-08-11), 83.3% = 60 of 72
+# (echo 2026-09-06) — the non-discriminating signature g-115-1410 removed from
+# S2a/S2b and left here. It now asks the question IN THE TREE'S OWN NAMESPACE
+# (an L2 subtree nobody has touched), so no cross-namespace difference remains.
+# Same run: 30.6% at 30d, 18.1% at 90d — every window a minority.
+# An S4a fire is now a FINDING, not a confound; route it as S4b is routed.
+# Do NOT re-derive this, re-tune the window, or "fix" it by token-matching
+# categories to keys — measured, that flags almost NOTHING (guard-2499).
+# Rationale (WHY subtree staleness; why token-matching was rejected; the
+# traversal trap): core/config/rationale/s4a-unexplored-territory-recalibration.md
+# g-115-4840 still owns collapsing the duplicate S4a/S4b goal pile; this
+# retires the DEFECT those goals describe, not the goals.
 #
-# OPEN OWNERS, verified live at that measurement: g-115-3246, g-115-4600,
-# g-115-5435 (all pending, all describing exactly this), plus g-115-3996 and
-# g-115-4537; g-115-4840 is open specifically to **consolidate 5 duplicate
-# S4a/S4b goals into one**. g-115-3154 was already skipped as a duplicate.
-#
-# So the honest reading is: an S4a fire is a CONFOUND, not a finding. Report it
-# as such if you report it at all, and route nothing to S5. Filing another goal
-# makes you instance #7 of the population g-115-4840 exists to collapse — the
-# ritual has re-derived this at least six times because each scan honestly
-# recomputes it and nothing in this block said it was known. That is why the
-# note lives HERE and not only in the goals (guard-1984: a guardrail cannot
-# outvote the instrument it guards; guard-2177: coverage-check before filing).
-# S4b WAS the same family — RECALIBRATED 2026-08-30 (g-115-3853), so unlike S4a
-# above an S4b fire is now a FINDING, not a confound. Both the old predicate and
-# the remedy the goal preferred admit ~100% of the corpus; the SAMPLE, not the
-# metric, was the load-bearing half. Do not re-derive this or re-widen the
-# window — the measurement is written up once, here:
+# S4b WAS the same family — RECALIBRATED 2026-08-30 (g-115-3853). Both the old
+# predicate and the remedy that goal preferred admit ~100% of the corpus; the
+# SAMPLE, not the metric, was the load-bearing half.
 # Rationale (WHY category sampling + utilization_score_v2): core/config/rationale/s4b-cross-pollination-recalibration.md
-# g-115-3246 / g-115-4537 / g-115-4840 still own the S4a half and the duplicate
-# pile; this note retires only the S4b limb of it.
-explored_cats = set(categories.keys())  # from S3
-all_L2_cats = set(node.key for node in node_list if node.depth <= 2)
-unexplored = all_L2_cats - explored_cats
+#
+# Window DEFAULTS rather than raising (guard-4653 promotion-coupling): S4a is a
+# LOW observational signal, so a lagging config must degrade, never brick S4.
+stale_days = strategic_scan.get("subtree_staleness_days") or (
+             strategic_scan.knowledge_staleness_days * 3)   # 90d on this config
+l2_roots = [n for n in node_list if n.depth <= 2]
+# WALK DOWN VIA `children` — the summary carries NO `parent`, so a parent-chain
+# walk silently collapses every subtree to its root (measured: all 72 size 1 on
+# a 1576-node tree). POSITIVE CONTROL, print it: nodes reached == len(node_list).
+subtree(k) = {k} | union(subtree(c) for c in node_list[k].children)
+unexplored = [r for r in l2_roots
+              if min(days_since(m.last_updated) for m in subtree(r.key)
+                     if m.last_updated) > stale_days]
 
-IF unexplored:
-    # Emit ONLY as an observation. Do not create work from it while the
-    # vocabulary mismatch above stands.
-    Output: ">> S4a (CONFOUND, owned by g-115-3246/4600/5435): {len(unexplored)}/{len(all_L2_cats)} L2 keys absent from goal-category strings — disjoint vocabularies, not unexplored territory. Not routed to S5."
+IF len(unexplored) > 3:
+    signals.append({
+        type: "unexplored_territory",
+        description: "{len(unexplored)}/{len(l2_roots)} L2 subtrees untouched for {stale_days}+ days: {[r.key for r in unexplored[:5]]}",
+        severity: "LOW",
+        nodes: [r.key for r in unexplored[:5]]
+    })
 
 # S4b: Cross-pollination opportunities  (RECALIBRATED g-115-3853 — see above)
 # An entry RETRIEVED many times but credited helpful almost never is the real

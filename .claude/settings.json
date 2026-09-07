@@ -72,7 +72,9 @@
     "GATE_FIRINGS_SEGMENTED": "1",
     "PRODUCTIVITY_SNAPSHOTS_SEGMENTED": "1",
     "OWNCLOUD_GZIP_STORES": "ayoai-mind",
-    "UTILIZATION_COUNTERS_SPOOLED": "1"
+    "UTILIZATION_COUNTERS_SPOOLED": "1",
+    "NO_PROXY": "localhost,127.0.0.1,10.0.0.241,100.76.251.73,100.100.100.100,.ts.net,example.com,.example.com",
+    "no_proxy": "localhost,127.0.0.1,10.0.0.241,100.76.251.73,100.100.100.100,.ts.net,example.com,.example.com"
   },
   "skillListingBudgetFraction": 0.05,
   "hooks": {
@@ -132,6 +134,11 @@
           },
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/xtrace-credential-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/full-suite-imperative-gate.sh",
             "timeout": 15
           },
@@ -163,6 +170,11 @@
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/embedded-block-extraction-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/mutation-proof-hand-roll-gate.sh",
             "timeout": 15
           }
         ]
@@ -520,6 +532,11 @@
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/deploy-detect-hook.sh",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/context-reads-record-bash-fetch.sh",
             "timeout": 10
           }
         ]

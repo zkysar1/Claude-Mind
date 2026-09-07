@@ -70,6 +70,68 @@ for m in plan.get('mutations', []):
                 fi
             done <<< "$MUTS"
         fi
+        # 3. TRUTH-EVENT CAPTURE for the confidence-calibration ledger — the
+        #    SECOND surface required by  outcome 2, after
+        #    adjudication-lane.py::cmd_resolve. A scoped CALL into the shared
+        #    recorder (`_confidence_ledger.record_truth_event`), never a second
+        #    ledger writer (guard-2676).
+        #
+        #    WHY HERE AND NOT IN THE ENGINE, which is where it looks like it
+        #    belongs: `apply()` computes a mutation PLAN and returns it — it
+        #    never writes (guard-832, and its own docstring). A recorder placed
+        #    there would log verdicts that were merely COMPUTED, including plans
+        #    this wrapper then failed to execute, manufacturing exactly the
+        #    fiction this ledger exists to measure. That is guard-4238's adjacent
+        #    trap: a recorder ahead of the mutator it depends on. So capture sits
+        #    AFTER the mutation loop and requires exec_rc=0.
+        #
+        #    APPLY ONLY, never `restore`: un-retiring is an UNDO of a prior
+        #    verdict, not a fresh judgement about the entry's claim.
+        #
+        #    THE `retire`-WITHOUT-`--reason` EXCLUSION IS THE GOAL'S, NOT A
+        #    PREFERENCE:  excludes utilization-only retirements
+        #    ("popularity is not truth"), and this lane's retire verdict is
+        #    driven by staleness + `effective_relevance` scoring. A retire
+        #    carrying an explicit --reason is a CONTENT judgement and is kept;
+        #    a bare one is the utilization-only shape and is dropped.
+        #    keep/refresh/revise are always content judgements about a live
+        #    entry, so they are always recorded — and they are the SURVIVED rows
+        #    the calibration table needs, without which it has no denominator.
+        if [ "$CMD" = "apply" ] && [ "$exec_rc" = "0" ] && [ -n "$MUTS" ]; then
+            _gr_id="${1:-}"; _gr_verdict="${2:-}"; _gr_reason=""; _gr_prev=""
+            for _gr_a in "$@"; do
+                [ "$_gr_prev" = "--reason" ] && _gr_reason="$_gr_a"
+                _gr_prev="$_gr_a"
+            done
+            # Values travel by ENV, never interpolated into the python source:
+            # a --reason carrying a quote or a $( would otherwise break or
+            # execute (guard-165). Terminal `py -3 -c` like every other python
+            # call in this file, so no python->bash->python hop (rb-225/rb-247).
+            MIND_GR_ID="$_gr_id" \
+            MIND_GR_VERDICT="$_gr_verdict" \
+            MIND_GR_REASON="$_gr_reason" \
+            $_PY -c "
+import os, sys
+sys.path.insert(0, os.path.join(os.environ['PROJECT_ROOT'], 'core', 'scripts'))
+gid = os.environ.get('MIND_GR_ID') or ''
+verdict = os.environ.get('MIND_GR_VERDICT') or ''
+reason = os.environ.get('MIND_GR_REASON') or ''
+try:
+    from guardrail_retire import truth_event_for
+    from _confidence_ledger import record_truth_event
+except Exception:
+    sys.exit(0)
+ev = truth_event_for(verdict, reason)
+if ev is None or not gid:
+    sys.exit(0)
+mapped, evidence_ref = ev
+record_truth_event(gid, 'guardrails', mapped,
+                   source='guardrail-retire',
+                   evidence_ref=evidence_ref,
+                   extra={'verdict_raw': verdict,
+                          'reason_given': evidence_ref is not None})
+" || true
+        fi
         exit "$exec_rc"
         ;;
     *)

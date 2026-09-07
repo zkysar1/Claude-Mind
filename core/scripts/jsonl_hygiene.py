@@ -76,6 +76,8 @@ USAGE
     ... --apply
   Sweep the registry (core/config/store-hygiene.yaml):
     MIND_AGENT=<a> py -3 core/scripts/jsonl_hygiene.py sweep --apply
+  Report stores stuck over cap across consecutive runs (never writes a store):
+    MIND_AGENT=<a> py -3 core/scripts/jsonl_hygiene.py detect-overcap
 """
 from __future__ import annotations
 
@@ -446,6 +448,30 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
         rep["archive"] = str(archive)
 
     if not apply:
+        # The dry run must predict what apply WILL do, not what it would do if
+        # the recovery-layer gate below () did not exist. Reporting
+        # `would-cap` for a store whose cap is refused on every apply is the
+        # guard-1802 shape -- an audit whose predicate is WIDER than the acting
+        # gate's -- and it sends the reader to wait on a fix that never runs.
+        # Measured 2026-09-06: world/presence/<agent>.jsonl sat at 30.1x its
+        # bound while BOTH this dry run and detect_overcap reported `would-cap`,
+        # and every apply returned refused-no-recovery-layer.
+        #
+        # `dropped`/`kept` are DELIBERATELY left at their would-be values rather
+        # than mirrored from the apply branch's (0, total): detect_overcap
+        # derives the over-cap ratio as total/kept (_overcap_ratio), so zeroing
+        # the drop here would yield a ratio of exactly 1.0 and drop the store
+        # out of the over-cap report -- hiding the very store this surfaces.
+        if mode == "cap":
+            _no_recovery, _why = _recovery_layer_absent(path)
+            if _no_recovery:
+                rep["action"] = "refused-no-recovery-layer"
+                rep["refused_reason"] = (
+                    f"{_why}; a cap here would drop {n_drop} record(s) with no "
+                    f"archive and no snapshot, so apply WILL refuse. Use "
+                    f"mode=rotate (archive-FIRST) to bound this store instead."
+                )
+                return rep
         rep["action"] = ("would-cap" if mode == "cap" else "would-rotate")
         return rep
 
@@ -610,6 +636,219 @@ def sweep(apply: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Over-cap detector ()
+# ---------------------------------------------------------------------------
+# `sweep()` already computes an action and a live-vs-bound size for every store
+# on every run, and nothing consumed them -- so a store sitting far over its cap
+# was visible only to whoever happened to read a dry-run by hand. Measured on one
+# box: 37 line-capped stores, one of them at 19.98x its cap and another at 2.68x,
+# with a third store of the SAME kind sitting at 1.00x in the same sweep. This
+# surfaces that for free (learning-philosophy.md: know asap if something is
+# wrong).
+#
+# THE STATE-FILE NAME IS LOAD-BEARING -- do not rename it. Consecutive-run state
+# is a PER-BOX fact: several capped stores are machine-local, so one box's sweep
+# says nothing about another's, and a SYNCED state file would let every box
+# overwrite every other box's history. `world/*-log.jsonl` is ALREADY classified
+# machine-local by owncloud_sync's
+# `prefix == "world" and fnmatch(basename, "*-log.jsonl")` rule, so this basename
+# gets per-box status with no sync-policy change. Verified against the
+# sync-candidacy SSOT `owncloud_sync.refresh_would_clobber` -- which unions
+# _EXCLUDE_DIRS with _is_machine_local, neither predicate alone being the answer
+# -- in BOTH directions: this basename classifies machine-local, and the same
+# name WITHOUT the `-log` suffix classifies synced.
+#
+# The log SELF-TRUNCATES to the last OVERCAP_LOG_KEEP runs. An unbounded state
+# file inside a store-hygiene detector would be an instance of the defect it
+# detects.
+OVERCAP_LOG_REL = "store-hygiene-overcap-log.jsonl"
+OVERCAP_THRESHOLD = 2.0
+OVERCAP_LOG_KEEP = 20
+
+
+def _overcap_ratio(rep: dict):
+    """Live records as a multiple of the store's configured line bound, or None.
+
+    Only a `by: lines` store has a bound to be a multiple OF. For `by: age`,
+    `kept` is whatever fell inside the retention window, so total/kept there
+    measures CHURN, not over-cap -- returning a ratio for it would report a
+    busy store as an unbounded one. `mode` is deliberately not filtered:
+    cap/rotate/compact all bound by lines when `by == "lines"`.
+
+    When a line-bounded store is under its cap, `kept == total` and the ratio is
+    exactly 1.0, so the same expression covers both sides without a branch.
+    """
+    if rep.get("by") != "lines":
+        return None
+    kept = rep.get("kept")
+    total = rep.get("total")
+    if not isinstance(kept, int) or not isinstance(total, int) or kept <= 0:
+        return None
+    return total / kept
+
+
+def _machine_local(path) -> tuple:
+    """(is_machine_local, error) for one store path -- never raises.
+
+    Routed through `owncloud_sync.refresh_would_clobber`, the sync-candidacy
+    SSOT, rather than `_is_machine_local` alone: the latter returns False for
+    directory-excluded paths that ARE per-box, so calling it directly
+    misclassifies exactly the stores this detector cares most about.
+
+    On any failure this returns (None, reason) -- NEVER False. An unreadable
+    classifier is unknown, not "synced"; collapsing it to a bool would be a
+    confident answer manufactured from an error (verify-before-assuming rule 4).
+    """
+    try:
+        from storage_backend import get_backend
+        import owncloud_sync
+        be = get_backend()
+        return bool(owncloud_sync.refresh_would_clobber(be, Path(path))), None
+    except Exception as e:  # noqa: BLE001 - classification is enrichment, not the verdict
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _overcap_log_path() -> Path:
+    return Path(WORLD_DIR) / OVERCAP_LOG_REL
+
+
+def _read_prev_overcap():
+    """The most recent recorded run, or None if there is no readable one."""
+    p = _overcap_log_path()
+    if not p.exists():
+        return None
+    try:
+        lines = [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(rec, dict):
+            return rec
+    return None
+
+
+def _append_overcap_run(entry: dict) -> None:
+    from _fileops import locked_modify_jsonl
+
+    def _fn(cur):
+        rows = list(cur or [])
+        rows.append(entry)
+        return rows[-OVERCAP_LOG_KEEP:]
+
+    locked_modify_jsonl(_overcap_log_path(), _fn)
+
+
+def detect_overcap(threshold: float = OVERCAP_THRESHOLD, record: bool = True) -> dict:
+    """Report line-bounded stores at or past `threshold` x their cap.
+
+    FIRES only on a store that was over-threshold on the PREVIOUS recorded run
+    too -- a single over-cap reading is the normal state of a store between
+    sweeps, so one reading is a level and two consecutive readings are a store
+    the sweep is not bringing back down.
+
+    Always DRY-RUN: `sweep(apply=False)`. This measures; it never rotates.
+
+    Two limits a reader must carry:
+
+    * `machine_local: false` means the same store exists on every box, so its
+      ratio here is one box's reading of a shared object -- and under an
+      own-cloud backend the local tree is a read-through cache, so a stale local
+      copy can under- or over-state it (guard-3992). `machine_local: true`
+      stores are authoritative by construction, and `null` means the classifier
+      itself was unreadable.
+    * `line_bounded` is printed beside `over_now` deliberately: an over-cap
+      count means nothing without the population it came from (guard-2273).
+    """
+    res = sweep(apply=False)
+    reports = res.get("reports") or []
+
+    ratios = {}
+    for rep in reports:
+        r = _overcap_ratio(rep)
+        if r is None:
+            continue
+        ratios[str(rep.get("path"))] = {
+            "ratio": round(r, 4),
+            "total": rep.get("total"),
+            "bound": rep.get("kept"),
+            "mode": rep.get("mode"),
+            "action": rep.get("action"),
+            "owner_goal": rep.get("owner_goal"),
+        }
+
+    over_now = {}
+    for path, info in sorted(ratios.items()):
+        if info["ratio"] >= threshold:
+            ml, ml_err = _machine_local(path)
+            row = dict(info)
+            row["machine_local"] = ml
+            if ml_err:
+                row["machine_local_error"] = ml_err
+            over_now[path] = row
+
+    prev = _read_prev_overcap()
+    prev_over = sorted((prev or {}).get("over") or {})
+    repeat = sorted(p for p in over_now if p in set(prev_over))
+
+    out = {
+        "threshold": threshold,
+        "swept": res.get("swept"),          # every store the registry resolved
+        "line_bounded": len(ratios),        # the population the ratio is defined over
+        "over_now": over_now,
+        "over_prev": prev_over,
+        "prev_run_at": (prev or {}).get("at"),
+        "first_run": prev is None,
+        "repeat_offenders": repeat,
+        "fired": bool(repeat),
+        "recorded": False,
+    }
+    if any(over_now[p].get("machine_local") is not True for p in over_now):
+        out["caveat"] = (
+            "at least one over-cap store is not machine-local (or was "
+            "unclassifiable): its size here is THIS box's reading of a shared "
+            "object, which an own-cloud read-through cache can misstate"
+        )
+    _refused = sorted(p for p in over_now
+                      if over_now[p].get("action") == "refused-no-recovery-layer")
+    if _refused:
+        out["unbounded_by_refusal"] = _refused
+        out["unbounded_by_refusal_note"] = (
+            "these stores are over cap AND their registered mode=cap is refused "
+            "by the recovery-layer gate on every apply, so no sweep can bring "
+            "them down -- they stay unbounded until store-hygiene.yaml's mode or "
+            "the _fileops snapshot blacklist is reconciled. A repeat_offenders "
+            "entry here is NOT a sweep that is falling behind; it is a sweep "
+            "that is structurally unable to act."
+        )
+    if prev is None:
+        out["note"] = (
+            "first recorded run on this box -- nothing can FIRE yet by design; "
+            "the next run has a predecessor to compare against"
+        )
+
+    if record:
+        try:
+            _append_overcap_run({
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "threshold": threshold,
+                "swept": out["swept"],
+                "line_bounded": out["line_bounded"],
+                "over": {p: over_now[p]["ratio"] for p in over_now},
+                "fired": out["fired"],
+                "repeat_offenders": repeat,
+            })
+            out["recorded"] = True
+        except Exception as e:  # noqa: BLE001 - a state-write failure must not lose the reading
+            out["record_error"] = f"{type(e).__name__}: {e}"
+
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main() -> int:
@@ -642,7 +881,23 @@ def main() -> int:
     s = sub.add_parser("sweep", help="bound every enabled store in store-hygiene.yaml")
     s.add_argument("--apply", action="store_true", help="perform writes (default: dry-run)")
 
+    d = sub.add_parser(
+        "detect-overcap",
+        help="report line-bounded stores at/past N x their cap on consecutive runs")
+    d.add_argument("--threshold", type=float, default=OVERCAP_THRESHOLD,
+                   help=f"multiple of the cap that counts as over (default {OVERCAP_THRESHOLD})")
+    d.add_argument("--no-record", action="store_true",
+                   help="do not append this run to the per-box state log "
+                        "(a probe; leaves the consecutive-run comparison untouched)")
+    d.add_argument("--exit-on-hits", action="store_true",
+                   help="exit 1 when the detector fires (default: report-only, exit 0)")
+
     args = ap.parse_args()
+
+    if args.cmd == "detect-overcap":
+        result = detect_overcap(threshold=args.threshold, record=not args.no_record)
+        print(json.dumps(result, indent=2, default=str))
+        return 1 if (result["fired"] and args.exit_on_hits) else 0
 
     if args.cmd == "sweep":
         result = sweep(apply=args.apply)

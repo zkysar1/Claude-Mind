@@ -818,6 +818,57 @@ def _assert_intended_agent_vocab(goal: Dict[str, Any], *, ctx=None) -> None:
         raise ValueError(verdict["message"])
 
 
+def _agent_queue_routing_violation(goal: Dict[str, Any], source: str,
+                                   queue_owner: Optional[str]) -> Optional[str]:
+    """Refusal message when a goal is filed into an agent's PRIVATE queue while
+    routed AWAY from that queue's owner, else None (g-115-9234, remedy (b) of
+    g-115-9193).
+
+    Such a row is unclaimable BY CONSTRUCTION and permanently so: the routed
+    agent cannot write another agent's store (the own-cloud backend raises
+    NoClaimError from the PUT path, keyed on the path with no goal-level or
+    routing-level condition), while the owning agent's own selector routes it
+    away. The result is permanently visible, permanently rankable, permanently
+    unexecutable — measured at RANK 1 for two consecutive iterations on one box.
+
+    ROW-INTRINSIC AND ROLE-AGNOSTIC BY CONSTRUCTION. The verdict is a function of
+    (source, queue owner, intended_agent) alone; nothing here reads BODY_ROLE,
+    so a reducer and a worker get byte-identical behavior. That is what
+    guard-2783 requires and is exactly what remedy (a) — a selector-side filter
+    — could not offer, which is why it is documented-forbidden. Do not add a
+    role branch to this function.
+
+    NO OVERRIDE FLAG, deliberately: the refusal names a remedy that is already a
+    legal filing (`--source world` keeps `intended_agent` intact and the world
+    store is writable from every box), so an escape hatch would only preserve the
+    stranded shape. The fix redirects the QUEUE and never the routing.
+
+    Fail-open when the queue owner is unresolvable (rb-1028, never refuse on
+    absent evidence) — the same conservative direction `_routes_away_from` takes
+    on an unreadable roster.
+    """
+    if (source or "").strip() != "agent":
+        return None
+    if not queue_owner:
+        return None
+    intended = goal.get("intended_agent")
+    if not _routes_away_from(intended, queue_owner):
+        return None
+    return (
+        f"Goal {goal.get('id') or '<unassigned>'}: refusing to file into the "
+        f"private queue of agent {queue_owner!r} while intended_agent is "
+        f"{str(intended)!r}, which routes the goal AWAY from that agent. Such a "
+        f"row is unclaimable by construction — the routed agent cannot write "
+        f"another agent's store, and the owning agent's selector routes it away, "
+        f"so it stays visible and rankable forever without ever being executable. "
+        f"REMEDY: file with --source world instead. The world store is writable "
+        f"from every box, so the routing becomes reachable, and intended_agent is "
+        f"preserved exactly as given (this redirects the QUEUE, not the routing). "
+        f"An agent-queue filing whose intended_agent is unset, 'either', or "
+        f"{queue_owner!r} itself is unaffected."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Aspiration lookup
 # ---------------------------------------------------------------------------
@@ -1743,6 +1794,32 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
                 "curriculum permits allow_forge_skill (Growth+)."
             )
 
+    # === Phase D.6: agent-queue routing blocker () ===
+    # Refuse a --source agent filing whose intended_agent routes AWAY from the
+    # queue owner: that row is unclaimable by construction and stays rankable
+    # forever. See _agent_queue_routing_violation for the full rationale.
+    #
+    # ORDER IS LOAD-BEARING — this MUST stay after Phase D, which is the
+    # capability-route MUTATOR that SETS intended_agent. Placed before Phase D
+    # it would read the pre-mutation value and miss every goal whose routing the
+    # router assigns, which is the majority of them. That is guard-4238's
+    # adjacent trap (the first gate to return hides every gate behind it) in its
+    # other form: a gate placed before the mutator it depends on reads a field
+    # that does not exist yet and silently passes.
+    aqr_message = _agent_queue_routing_violation(goal, source, ctx.paths.agent_name)
+    if aqr_message:
+        return Response.json({
+            "error": "agent_queue_routing_blocked",
+            "gate": "agent-queue-routing-gate",
+            "gate_output": {
+                "would_block": True,
+                "source": source,
+                "queue_owner": ctx.paths.agent_name,
+                "intended_agent": goal.get("intended_agent"),
+                "message": aqr_message,
+            },
+        }, status=400), warnings, None
+
     # === Phase E: goal-duplication blocker ===
     dup_result = _goal_duplication_eval(
         goal,
@@ -2117,11 +2194,15 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
     # returns None — dropping the escalation SILENTLY, with no error anywhere.
     asp_id = str(invest_spec.get("aspiration_id") or "asp-115")
     store_live, store_base = _resolve_paths(ctx, "world")
+    # : which store this resolved to decides whether a foreign
+    # intended_agent below would strand the row. See the mint site.
+    filed_into_agent_queue = False
     try:
         if _find_aspiration(_read_jsonl(store_live), asp_id) is None:
             agent_live, agent_base = _resolve_paths(ctx, "agent")
             if _find_aspiration(_read_jsonl(agent_live), asp_id) is not None:
                 store_live, store_base = agent_live, agent_base
+                filed_into_agent_queue = True
     except (OSError, ValueError):
         pass  # fail-open to world — preserves the prior behaviour exactly
     # This probe is deliberately outside the lock: it only SELECTS a store. If
@@ -2147,6 +2228,25 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
                             "pending", "in-progress")):
                     return None
 
+            # : reconcile the route against the queue THIS function
+            # selected. The Phase D.6 blocker cannot see this site -- it appends
+            # directly rather than routing through _run_add_goal_pipeline -- and
+            # a gate is only as broad as its entry points (guard-3448), so the
+            # same reconciliation is applied here at mint time instead.
+            #
+            # The agent-store branch above is a PRIVATE queue: no other agent
+            # can write it, and its owner's selector routes a foreign
+            # intended_agent away, so a foreign name there mints exactly the
+            # permanently-unclaimable row the blocker refuses on the add path.
+            # Degrading to "either" leaves the row claimable by the one agent
+            # that can reach it. The predicate is the blocker's, not a second
+            # rule. The world-store path -- the normal one -- is unchanged.
+            invest_route = ("bravo" if "bravo" in _valid_intended_agents()
+                            else "either")
+            if filed_into_agent_queue and _routes_away_from(
+                    invest_route, agent):
+                invest_route = "either"
+
             invest_goal: Dict[str, Any] = {
                 "id": _allocate_goal_id(asp),
                 "title": invest_spec.get("title", ""),
@@ -2165,10 +2265,9 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
                 "alloc_nonce": uuid.uuid4().hex,
                 # Roster-aware: this direct append bypasses the add-path vocab
                 # gate, and a literal "bravo" is off-vocab on deployments
-                # without one (e.g. single-agent prod).
-                "intended_agent": (
-                    "bravo" if "bravo" in _valid_intended_agents()
-                    else "either"),
+                # without one (e.g. single-agent prod). Queue-reconciled just
+                # above ().
+                "intended_agent": invest_route,
                 "work_class": "framework",
             }
             try:
@@ -2177,6 +2276,17 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
                 return None
 
             asp.setdefault("goals", []).append(invest_goal)
+            # progress.total_goals must be recomputed on APPEND, not only on
+            # close (). recompute_progress fired on goal COMPLETE
+            # only, so an aspiration accumulating appends without a close
+            # drifted until its next close reset it — worst on aspirations
+            # that never close (asp-360: 0 of 11, largest fleet deficit).
+            # This audit path is the second of the two unrecomputed appends;
+            # patching only add_goal would leave it drifting, and it fires
+            # from an AUDIT into exactly the never-closing aspirations that
+            # maximise drift. MUST precede _atomic_write_jsonl or the new
+            # value never reaches disk.
+            _recompute_progress(asp)
             history.snapshot(
                 store_live, store_base, agent,
                 summary=f"add-goal {invest_goal['id']} (routing-audit)")
@@ -2405,6 +2515,13 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # asp is the same dict object as items[asp_idx] (see _find_aspiration);
             # mutating asp's goals list is sufficient — no rebind needed.
             asp.setdefault("goals", []).append(goal)
+            # Recompute progress on APPEND (). add_goal is the main
+            # goal-append endpoint and never recomputed; update_goal did, which
+            # is why the counter tracked closes correctly while total_goals went
+            # stale. Verified 2026-09-07 that add_goal reaches no _recompute_
+            # progress indirectly via any helper, so this is a fix, not a
+            # double-count. MUST precede _atomic_write_jsonl.
+            _recompute_progress(asp)
 
             # History snapshot BEFORE write so a daemon crash leaves a
             # recoverable copy.

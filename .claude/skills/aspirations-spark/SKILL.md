@@ -158,15 +158,15 @@ ELSE:
             check the source goal's outcome_note for an id it filed OR a fix it
             SHIPPED (g-306-360), guard-3738. STATUS (guard-5176, guard-4938):
             an OPEN-ONLY scan is blind to the owner that COMPLETED minutes ago,
-            which is the most expensive duplicate there is. Run:
+            which is the most expensive duplicate there is. Run ONCE per
+            slot — batch, one corpus read, NOT one per record:
               bash core/scripts/aspirations-query.sh --goal-status \
                    pending,in-progress,completed,skipped --full \
-                | py -3 core/scripts/sq013-dedup-probe.py \
-                      --subject "<entry.observation>" --session-start <ISO>
-            rc 3 = DECLINE (owner exists), 0 = FILE, 2 = probe broke and is
-            NEVER permission to file. On DECLINE cite the id AND the
-            status it names, so a reader can tell "already done" from "never
-            filed". Otherwise file
+                | py -3 core/scripts/sq013-dedup-probe.py --positive-control \
+                     --subjects-file <slot as JSON> --session-start <ISO>
+            rc 0 = FILE, 2 = broke (NEVER file), 3 = owner exists, 4 =
+            MUST-READ: a DECLINE citing a skipped/expired owner is a reading
+            assignment — open it, test its claim (guard-5147). Else file
             with the sq-013 origin_signal mapping and put
             "relayed by <agent> worker Body (spark_capture from <entry.goal_id>),
             filed at reducer spark replay" in the description so the provenance
@@ -904,12 +904,48 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
         one on "sharpness" grounds trades power for comfort — the mix
         measurement is the one that can embarrass you, which is exactly why it
         is the informative one. Unambiguity is not discriminating power.
-     f. Record the pre-mortem in the experience archive (Step 2.5 content).
+     f. Two-sided reachability (guard-2674; guard-3242 for the discount half;
+        siblings guard-1931 degenerate-branch, guard-2200 already-satisfied).
+        For each objection you pre-register, name the OUTCOME BRANCH it can
+        fire on AND whether that branch is reachable in the window you are
+        pre-registering over. Tell: a DIRECTIONAL quantity — scarcity, supply
+        floor, availability cap, ceiling/floor effect — moves the measured
+        value one way only, so it guards one branch. Either write the mirror
+        objection or state explicitly which direction is left unguarded. A
+        one-sided objection earns NO discount under (c): it cannot change the
+        verdict, so paying for it manufactures underconfidence. Where a
+        criterion needs a DETECTOR TO FIRE, add a second quiet-case-measurable
+        criterion beside it — a positive control that it WOULD fire, or a
+        distance-to-threshold reading — because X-not-happening is the normal
+        case for a working guard, so the race alone is unobservable.
+     g. Sample provenance (guard-2684). When the artifact that MEASURES the
+        phenomenon also SUPPRESSES it — gate, check, test, lint rule, CI
+        assertion — every reading comes from the INTERVENED world.
+        Pre-register only inferences that sample can support: "does not recur
+        under enforcement" is reachable; "enforcement was unnecessary" is not.
+        On a re-scope, re-derive which inferences the NEW design can reach;
+        never carry the old ones forward on "it tests the same question".
+     h. Substrate survival (rb-6767). Name the artifact your channel will READ
+        at resolution, then query the live goal queue for THAT ARTIFACT'S own
+        nouns — not your hypothesis's topic — for anything queued to rotate,
+        migrate, overwrite or delete it before the window opens. Tell: a
+        contaminated channel stays runnable and returns a well-formed answer
+        about a DIFFERENT object, so nothing at resolution flags it. If the
+        substrate is mutable and shared, pre-record a value that DISCRIMINATES
+        this instance from its successor — a full identifier, never a
+        truncated prefix (guard-1226's 12 chars is what made one case
+        unrecoverable).
+     i. Record the pre-mortem in the experience archive (Step 2.5 content).
+     Measured incidents behind (f)-(h), and why each is independent of the
+     others: core/config/rationale/premortem-clause-reachability.md
      SKIP this step only if the prediction is about external systems
      (AWS behavior, third-party APIs) rather than project code quality —
      and even then, clause (d) still applies to the claim's own quantifiers,
-     and clause (e) still applies to any claim that an intervention changed
-     something.
+     clause (e) still applies to any claim that an intervention changed
+     something, and clauses (f)-(h) ALL still apply: every one of the three
+     was measured on an external-system or CI hypothesis (a CI ceiling test,
+     a CI lint gate, rotating cloud credentials), so this carve-out would
+     otherwise exempt each clause from the very case that produced it.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
    PUT THE ACTIVE-STAGE CONTRACT IN THIS PAYLOAD if you will move to active (2.4):
    `claim` (>=20 chars), `resolution_criteria`|`resolution_method`|`rationale` (>=10),
@@ -1108,11 +1144,10 @@ When sq-012 fires after goal completion:
 
 When sq-c05 fires after goal completion:
 1. Bash: world-cat.sh knowledge/tree/_tree.yaml  # scan node summaries for data source references
-2. Read entity_index — look for external system references (SSH endpoints, file paths, APIs, databases)
-3. Identify accessible but unaccessed data sources
-4. IF found:
+2. Identify accessible but unaccessed data sources
+3. IF found:
    invoke /create-aspiration from-self (Phase B will pick up the data acquisition opportunity)
-5. Increment `sparks_generated` on the spark question
+4. Increment `sparks_generated` on the spark question
 
 #### Memory Curation Spark Handlers
 

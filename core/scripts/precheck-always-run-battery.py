@@ -165,6 +165,32 @@ LANES = (
         "finds": {"counts": ("candidate_count",), "lists": (), "false": ()},
     },
     {
+        "name": "inbound-drain",
+        "phase": "0.5b.1e",
+        # Explicit, per the meter-name trap above: sweep_tier()'s always-run arm
+        # knows this exact string, and a stem-derived name would WARN-default to
+        # `medium` -- which on this lane means a member's queued instruction sits
+        # undrained on whichever iterations the budget is tight.
+        "meter_name": "inbound-drain",
+        # The audited entry point for the `inbound-drain` Pattern B executable
+        # hook slot -- NOT the domain drain itself. Core names the slot, never a
+        # world artifact (core/config/conventions/domain-hooks.md). A world that
+        # does not fill the slot reports `no-slot` and this lane is a silent
+        # no-op, which is the supported fresh-world configuration.
+        "script": "inbound-drain-run.sh",
+        # --apply IS the lane. A report-only registration would leave the drain
+        # with no call site, which at rest is indistinguishable from a drain that
+        # runs and finds nothing -- the defect this wiring exists to close.
+        "apply_flag": True,
+        "extra_args": ("--json",),
+        # `drained` is a finding because it is NEWS: goals just entered the queue
+        # from outside the loop. `quarantined` flags residue a human should look
+        # at. Per-environment failure counts are folded into the universal
+        # `failed` list by the runner -- nested counts are invisible to
+        # _findings_for, which reads TOP-LEVEL keys only (guard-3531).
+        "finds": {"counts": ("drained", "rejected", "quarantined"), "lists": (), "false": ()},
+    },
+    {
         "name": "completed-not-closed-drain",
         "phase": "0.5g.7",
         # NOT derived from `script` -- see the module docstring. The meter's

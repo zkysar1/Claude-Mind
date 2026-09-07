@@ -85,7 +85,24 @@ so it fails loudly: if a REDUCER ever gains a `sessions/<sid>/working-memory.yam
 this predicate misclassifies it as a worker and `/stop` becomes a no-op on the box
 that owns the state.
 
-Bash: `if [ -n "$MIND_SID" ] && [ -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" ]; then echo "worker"; else echo "reducer-or-single"; fi`
+THE EMPTY-`MIND_SID` CASE IS A THIRD ANSWER, NOT THE NEGATIVE ONE (g-115-9320,
+guard-6178). Written as a single `[ -n "$MIND_SID" ] && [ -f ... ]`, this predicate
+returns the ELSE label when the variable is merely ABSENT — so a guard that CANNOT
+EVALUATE reports `reducer-or-single`, the branch that writes the AGENT-WIDE
+`session/stop-requested` a worker is forbidden to touch. The asymmetry is what makes
+it a defect rather than a default: the two branches do not have equal blast radii, so
+guessing toward the destructive one converts a failed hook into the dangerous action.
+MEASURED 2026-09-07 (DESKTOP-O91DLK2, SID 1c4a1179): the PreToolUse inject hook fired
+with BOTH `MIND_SID` and `MIND_AGENT` empty, and this step printed `reducer-or-single`
+for a Body whose `sessions/<SID>/body-manifest.yaml` reads `role: worker,
+body_state: active`. Re-running with an explicit SID printed `worker`.
+Per `guard-341` an empty `MIND_SID` means the hook did not fire and is an ERROR — so
+the correct third answer is to REFUSE, never to recover by guessing. Do NOT "fix" this
+by globbing `sessions/*/body-manifest.yaml` for an active worker: with more than one
+Body on a box that re-introduces the same guess one layer down, and the operator can
+supply the SID in one keystroke.
+
+Bash: `if [ -z "$MIND_SID" ]; then echo "indeterminate"; elif [ -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" ]; then echo "worker"; else echo "reducer-or-single"; fi`
 
 IF output is "worker":
 
@@ -107,12 +124,28 @@ IF output is "worker":
    keyed to THIS SID, and never reaches the reducer. (guard-4900 documents the trap;
    this step is its fix.)
 
-2. Stage + push this worker's own per-session state so a machine-move right after the
-   stop cannot strand it. This is the same call graceful-stop D6.7 makes for the same
-   reason — it pushes owned-agent `session/` continuity files (working-memory.yaml,
-   execution-diary.jsonl, ...) to the backend now instead of at the sweep thread's next
-   tick. Fire-and-forget: a flush failure must not block the stop.
+2. Flush pending backend writes. Same call graceful-stop D6.7 makes, moved ahead of
+   the sweep thread's next tick. Fire-and-forget: a flush failure must not block the
+   stop.
    Bash: `bash core/scripts/owncloud-flush.sh || true`
+
+   ⚠ **THIS STEP DOES NOT PUSH THIS WORKER'S AGENT DIR, AND CANNOT** (g-115-9319).
+   It read "stage + push this worker's own per-session state so a machine-move right
+   after the stop cannot strand it" until 2026-09-07, which is the one thing it is
+   structurally unable to do. Per guard-1579, every write under `agents/<name>/` is
+   local-only from a box holding no live RUNNING claim for that agent — and a stopping
+   worker IS exactly that box, since the reducer holds the claim elsewhere and this box
+   reads agent-state IDLE. So the scenario the step named is precisely the scenario
+   where it is inert.
+   MEASURED TWICE, two boxes, two OSes: DESKTOP-O91DLK2 (Windows) `pruned_agents=12`
+   with `alpha` among them, `pushed=1`; cc-07 (Linux 6.8.0-138-generic)
+   `pruned_agents=11`, `alpha` among them, **`pushed=0`**. Read a non-zero `pushed`
+   carefully — on the Windows run it referred to a DIFFERENT owned path, not to the
+   agent dir; the cc-07 `pushed=0` removes that ambiguity.
+   NOT a data-loss report: the state is on local disk and a later `/start` on THIS SAME
+   box resumes the SID. What is absent is OFF-BOX durability, so a machine-move after a
+   worker stop does strand the per-session state. If an artifact must reach the fleet,
+   encode it to a `world/` or `meta/` store — those are not claim-gated. (rb-10330.)
 
 3. Close this session's telemetry record. The worker got a WP1 `active` record at
    `/start` and never reaches the IDLE branch's WP2, so without this it orphans as
@@ -136,8 +169,26 @@ blast radii — `session/stop-requested` is agent-wide and stops the REDUCER whe
 it runs; `sessions/<SID>/stop-requested` is scoped to this Body on this box. Only
 the first is forbidden here.
 
+IF output is "indeterminate": STOP. Do NOT continue to Step 1, and do NOT treat this
+as the single-box case — that is the whole defect (g-115-9320). `MIND_SID` is empty,
+which per `guard-341` means the PreToolUse inject hook did not fire; the role is
+UNKNOWN, not "not a worker". Tell the operator verbatim:
+
+> `/stop` cannot determine whether this session is a worker Body or the reducer:
+> `MIND_SID` is empty, so the inject hook did not fire. Re-run with the SID set
+> explicitly — `MIND_SID=<sid> MIND_AGENT=<agent> /stop <agent-name>` — where
+> `<sid>` is the directory name under `agents/<agent-name>/sessions/` for this
+> session. Proceeding blind would risk writing the agent-wide stop signal that
+> stops the reducer on another machine.
+
+Refusing is the safe direction here and a wrong guess is not: the operator recovers
+in one keystroke, whereas the agent-wide branch stops a DIFFERENT Body on a DIFFERENT
+box and nothing downstream detects it.
+
 IF output is "reducer-or-single": continue to Step 1 unchanged. This is the ordinary
-single-box case and behaves exactly as it did before this step existed.
+single-box case and behaves exactly as it did before this step existed. Note this now
+means "evaluated, and this is not a worker" — it is no longer reachable by a failed
+evaluation, which is what the `indeterminate` branch above took away from it.
 
 **Step 1: Check State** -- Bash: `session-state-get.sh`
 (Step 0.5 has already rebound this session to `<agent-name>`, so the PreToolUse hook auto-injects `MIND_AGENT=<agent-name>` and this read targets the correct agent.)

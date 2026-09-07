@@ -142,6 +142,36 @@ def test_predicate_discriminates(label: str, should_flag: bool, preamble: str, a
     )
 
 
+# MEASURED RUNTIME (2026-09-05, DESKTOP-O91DLK2 / Windows, Git-Bash, box under
+# peer load). peer-surface.sh --window is the slow member: 9 samples spanning
+# 16.6-27.3s, median 17.9s — it scans two board channels over a 168h window,
+# while its own header advertises ~1.5s on Linux with a warm daemon. The
+# previous 20s bound sat INSIDE that spread, so 3 of those 9 runs would have
+# failed as a "hang" on a script that terminated normally. 120s is deliberately
+# loose: the defect under test is an INFINITE loop, so ANY finite bound detects
+# it, and a loose bound costs nothing on the healthy path because run() returns
+# as soon as the child exits.
+#
+# OUTPUT IS DISCARDED, NOT CAPTURED, AND THAT IS LOAD-BEARING (guard-4375). On
+# Windows a subprocess.run timeout is decorative against a Git-Bash child
+# whenever stdout or stderr is a pipe: the kill fires, but the post-kill
+# communicate() reap has no timeout of its own, so run() blocks until the child
+# closes its pipes. Measured on this box with a `sleep 30` child and timeout=5 —
+# capture_output=True: 30.11s then TimeoutExpired (the bound was ignored; the
+# exception reports when the CHILD finished, not when the budget expired); both
+# DEVNULL: 5.03s then TimeoutExpired; a Python child under capture_output:
+# 5.03s, the control proving this is Git-Bash-specific rather than general. So
+# under capture this test could not detect a genuine hang at all — it would sit
+# on the pipe for the whole faulthandler window and report INVALID instead of
+# failing cleanly. Nothing here reads stdout or stderr, so DEVNULL is free.
+#
+# The two defects MASKED each other: the decorative timeout hid the too-tight
+# bound, so fixing only the bound leaves a dead detector, and fixing only the
+# pipes turns a dead detector into a ~33%-flaky false-hang generator at 20s.
+# Both halves have to land together.
+_TERMINATE_TIMEOUT_S = 120
+
+
 @pytest.mark.parametrize("name,flag", sorted(LIVE_PROBE.items()))
 def test_trailing_value_flag_terminates(name: str, flag: str):
     """Behavioural half: a trailing value-flag must terminate, not spin.
@@ -157,13 +187,23 @@ def test_trailing_value_flag_terminates(name: str, flag: str):
     try:
         p = subprocess.run(
             [BASH, str(script), flag],
-            capture_output=True, text=True, timeout=20,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=_TERMINATE_TIMEOUT_S,
             stdin=subprocess.DEVNULL, cwd=SCRIPTS.parents[1],
         )
     except subprocess.TimeoutExpired:
         pytest.fail(
-            f"{name} {flag} did not terminate within 20s — the argv loop is "
-            f"re-processing $1 forever (guard-1224)."
+            f"{name} {flag} did not terminate within {_TERMINATE_TIMEOUT_S}s. "
+            f"TWO different causes produce this symptom and they need different "
+            f"fixes, so discriminate before assuming the first. (1) ARGV HANG: "
+            f"the loop is re-processing $1 forever (guard-1224). Confirm with "
+            f"the static half of this file — test_no_bare_shift2_argv_hang"
+            f"[{name}] flags the offending arm without executing anything, and "
+            f"a real hang holds for the FULL bound. (2) SLOWNESS: the script "
+            f"legitimately outgrew this bound. Confirm by timing it by hand and "
+            f"comparing against the measured range in the comment above this "
+            f"test; slowness lands just over the bound, not at infinity. Do NOT "
+            f"raise the bound to silence case 1."
         )
     # Any exit status is fine; a usage error is the correct outcome for a
     # value-flag with no value. Only non-termination is the defect.

@@ -638,3 +638,175 @@ def test_dedup_does_not_mutate_its_input():
     before = [dict(r) for r in items]
     us.dedup_by_id(items)
     assert items == before
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 5. Corrections () — a mis-credit has to be REMOVABLE, and the
+#    removal has to survive a cross-box merge.
+#
+#    The originating goal named `--by <signed-int>` on the increment wrappers as
+#    the minimal fix. The two merge tests at the end of this block are why that
+#    shape was rejected: they are a matched pair — the SAME correction, once as a
+#    bare decrement and once as a monotone `__corrected` sibling — run through
+#    the real handler. The decrement is silently reverted. Without the negative
+#    half the positive one proves nothing, because a reader has no way to see
+#    that the obvious alternative fails.
+# ──────────────────────────────────────────────────────────────────────────
+
+def test_apply_corrections_is_a_passthrough_when_no_correction_key_exists():
+    """The overwhelmingly common case must cost nothing and copy nothing.
+
+    Asserts identity, not equality: every read seam calls this, and returning a
+    fresh dict per call on the hot path would be a real cost for no benefit.
+    """
+    import _utilization_store as us
+    counters = {"times_helpful": 3, "times_noise": 1}
+    assert us.apply_corrections(counters) is counters
+
+
+def test_apply_corrections_nets_out_and_strips_the_correction_key():
+    import _utilization_store as us
+    out = us.apply_corrections(
+        {"times_helpful": 3, "times_helpful__corrected": 1, "times_noise": 2}
+    )
+    assert out == {"times_helpful": 2, "times_noise": 2}
+
+
+def test_apply_corrections_floors_at_zero_rather_than_going_negative():
+    """A correction can reach a box whose base count has not caught up.
+
+    Spools flush independently, so MAX can deliver `__corrected: 2` beside a
+    base of 0. A transient negative would read as a live signal to every
+    consumer; `endpoints/utilization.py::_is_candidate` turns zero evidence into
+    a RETIREMENT PROPOSAL, so under-reporting to 0 merely delays a decision
+    where a negative would corrupt one.
+    """
+    import _utilization_store as us
+    assert us.apply_corrections(
+        {"times_helpful": 0, "times_helpful__corrected": 2}
+    ) == {"times_helpful": 0}
+
+
+def test_apply_corrections_does_not_mutate_its_input():
+    """`load_counters` hands out the live map and `retrieve.py` reads it twice."""
+    import _utilization_store as us
+    counters = {"times_helpful": 3, "times_helpful__corrected": 1}
+    before = dict(counters)
+    us.apply_corrections(counters)
+    assert counters == before
+
+
+def test_apply_corrections_leaves_non_numeric_and_bool_values_alone():
+    """`last_retrieved` is a string and sits in the same dict as the counters.
+
+    Booleans are excluded explicitly because `True - 1 == 0` in Python: a bool
+    that silently arithmetic'd would be a corrupted field, not a corrected one.
+    """
+    import _utilization_store as us
+    out = us.apply_corrections({
+        "last_retrieved": "2026-09-05T00:00:00",
+        "last_retrieved__corrected": 1,
+        "flag": True,
+        "flag__corrected": 1,
+    })
+    assert out == {"last_retrieved": "2026-09-05T00:00:00", "flag": True}
+
+
+def test_utilization_of_nets_corrections_from_the_sidecar():
+    counters = {"guard-352": {"times_helpful": 3, "times_helpful__corrected": 1}}
+    assert utilization_of({"id": "guard-352"}, counters) == {"times_helpful": 2}
+
+
+def test_utilization_of_nets_corrections_from_the_embedded_block():
+    """A correction can be filed against a record untouched since the cutover."""
+    rec = {"id": "guard-352",
+           "utilization": {"times_helpful": 3, "times_helpful__corrected": 1}}
+    assert utilization_of(rec) == {"times_helpful": 2}
+
+
+def _merged(local_util, remote_util):
+    """Run the REAL registered handler over one record on two boxes."""
+    from coordination_merge import merge_utilization_counters
+    def blob(util):
+        return (json.dumps({"id": "guard-352", "utilization": util}) + "\n").encode()
+    out = json.loads(merge_utilization_counters(blob(local_util),
+                                                blob(remote_util)).decode())
+    return out["utilization"]
+
+
+def test_NEGATIVE_CONTROL_a_bare_decrement_does_not_survive_the_cross_box_merge():
+    """The rejected design, proved rejected. THIS TEST DOCUMENTS A DEFECT.
+
+    Box A applies `--by -1` (3 -> 2). Box B has not flushed and still carries 3.
+    `merge_utilization_counters` takes a per-counter MAX, so the merge restores
+    3 and the correction is gone with no error anywhere — the silent failure the
+    originating goal was filed to prevent. Every layer BELOW this merge already
+    accepts a signed delta, which is exactly what makes the bare form look
+    correct in review: it works perfectly on one box.
+    """
+    assert _merged({"times_helpful": 2}, {"times_helpful": 3}) == {"times_helpful": 3}
+
+
+def test_POSITIVE_CONTROL_a_correction_counter_does_survive_the_cross_box_merge():
+    """The chosen design, under the identical conditions as the control above.
+
+    `__corrected` only ever increases, so MAX carries it instead of eating it,
+    and `apply_corrections` nets it out at read time on every box.
+    """
+    merged = _merged({"times_helpful": 3, "times_helpful__corrected": 1},
+                     {"times_helpful": 3})
+    assert merged == {"times_helpful": 3, "times_helpful__corrected": 1}
+    import _utilization_store as us
+    assert us.apply_corrections(merged) == {"times_helpful": 2}
+
+
+def test_correction_counter_names_are_in_parity_across_both_copies():
+    """`UTILIZATION_COUNTERS` is duplicated verbatim in the daemon's registry
+    for import-safety, so the derived correction set is duplicated too.
+
+    This is the wm.py / wm_write.py hazard: editing one copy changes NOTHING at
+    runtime while reading as entirely correct in the diff. Nothing pinned the
+    two copies before this test — the parity was asserted only by a comment.
+    """
+    import importlib.util
+    from mind_api.src import store_registry as SR
+
+    spec = importlib.util.spec_from_file_location(
+        "_rb_for_parity", Path(__file__).resolve().parents[1] / "reasoning-bank.py")
+    rb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rb)
+
+    assert rb.UTILIZATION_COUNTERS == SR.UTILIZATION_COUNTERS
+    assert rb.UTILIZATION_CORRECTION_SUFFIX == SR.UTILIZATION_CORRECTION_SUFFIX
+    assert rb.UTILIZATION_CORRECTION_COUNTERS == SR.UTILIZATION_CORRECTION_COUNTERS
+    # Derived, never hand-listed: a name added to the base set must appear.
+    assert rb.UTILIZATION_CORRECTION_COUNTERS == {
+        c + rb.UTILIZATION_CORRECTION_SUFFIX for c in rb.UTILIZATION_COUNTERS}
+
+
+def test_corrections_are_not_added_to_the_required_key_contract():
+    """Deliberate: `UTILIZATION_COUNTERS` is the validator's required-key set and
+    the flush's materialisation list. Folding corrections in would force eight
+    extra zero keys onto every touched record across the whole corpus to say
+    nothing — an absent correction key already means zero.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_rb_for_required", Path(__file__).resolve().parents[1] / "reasoning-bank.py")
+    rb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rb)
+    assert not (rb.UTILIZATION_CORRECTION_COUNTERS & rb.UTILIZATION_COUNTERS)
+
+
+def test_increment_endpoint_whitelists_corrections_and_still_refuses_garbage():
+    """The endpoint gates on `spec.increment_counters`; without the union a
+    correction is a 400 `invalid_counter` and the wrapper cannot write at all.
+    The garbage half is the control — widening must not have opened the gate.
+    """
+    from mind_api.src.store_registry import STORE_REGISTRY
+    for name in ("reasoning-bank", "guardrails"):
+        allowed = STORE_REGISTRY[name].increment_counters
+        assert "times_helpful" in allowed
+        assert "times_helpful__corrected" in allowed
+        assert "nonexistent_counter" not in allowed
+        assert "nonexistent_counter__corrected" not in allowed

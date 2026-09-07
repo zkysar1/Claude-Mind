@@ -197,9 +197,11 @@ def test_gate_refuses_staged_framework_modification_with_routing(tmp_path):
 
 
 def test_gate_refuses_framework_addition_and_deletion(tmp_path):
+    # The ADDITION case deliberately uses a non-skill framework path: a NEW
+    # .claude/skills/<name>/ is a destination-owned forged body and is exempt by
+    # design () — pinned separately below.
     root = _repo(tmp_path)
-    (root / ".claude" / "skills" / "x").mkdir(parents=True)
-    (root / ".claude" / "skills" / "x" / "SKILL.md").write_text("# x\n", encoding="utf-8")
+    (root / "core" / "scripts" / "added.py").write_text("print(3)\n", encoding="utf-8")
     _git(root, "add", "-A")
     assert _gate(root).returncode == 1
     _git(root, "reset", "-q")
@@ -242,3 +244,120 @@ def test_gate_is_wired_into_pre_commit_and_plant_carries_override():
     assert "check-framework-origin-writes.py" in hook
     plant = (REPO / "core" / "scripts" / "seed-transplant.sh").read_text(encoding="utf-8")
     assert 'FRAMEWORK_WRITE_OVERRIDE="seed-transplant plant' in plant
+
+
+# ------------------------------------------- forged-skill carve-out ()
+#
+# The promotion train does not carry forged skill bodies — seed-manifest.yaml
+# excludes them, _seed_engine._is_protected_dest_skill refuses to delete them as
+# orphans, promotion-preflight.py buckets .claude/skills/** out of blocking drift.
+# The blanket ".claude/" refusal disagreed, so a forged skill had no home on any
+# framework_origin deployment (measured 2026-09-05, coach@zc-03: the Write refused,
+# the registry row written anyway, zero skill forged — rb-10227).
+#
+# Every ALLOW case below is paired with the base-skill DENY that must NOT flip:
+# the carve-out's whole risk is re-opening the worksheet hole the refusal closed
+# (guard-4166 — a fix whose effect is an absence needs its positive control).
+
+def _forged_skill(root: Path, name: str, tag: str = "forged: true") -> Path:
+    d = root / ".claude" / "skills" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(f"---\nname: {name}\n{tag}\n---\n# body\n", encoding="utf-8")
+    return d / "SKILL.md"
+
+
+@pytest.mark.parametrize("setup,rel,expected", [
+    # a skill upstream does not have: nothing to clobber
+    ("none", ".claude/skills/brand-new/SKILL.md", True),
+    # the `mkdir -p` residue the measured run left behind is still "new"
+    ("empty-dir", ".claude/skills/brand-new/SKILL.md", True),
+    # a body this deployment forged: revising it is local work
+    ("forged", ".claude/skills/brand-new/SKILL.md", True),
+    ("forged", ".claude/skills/brand-new/reference.md", True),
+    # a BASE skill the train owns — the measured worksheet target
+    ("base", ".claude/skills/brand-new/SKILL.md", False),
+    ("base", ".claude/skills/brand-new/notes.md", False),
+    # not a skill path at all
+    ("none", "core/scripts/aspirations.py", False),
+    ("none", "CLAUDE.md", False),
+    ("none", ".claude/skills/", False),
+    ("none", ".claude/skills/../../etc/passwd", False),
+])
+def test_is_forged_skill_body(tmp_path, setup, rel, expected):
+    from _framework_origin import is_forged_skill_body
+    (tmp_path / ".claude" / "skills").mkdir(parents=True)  # a real checkout has one
+    if setup == "empty-dir":
+        (tmp_path / ".claude" / "skills" / "brand-new").mkdir(parents=True)
+    elif setup == "forged":
+        _forged_skill(tmp_path, "brand-new")
+    elif setup == "base":
+        _forged_skill(tmp_path, "brand-new", tag="description: a base skill")
+    assert is_forged_skill_body(rel, tmp_path) is expected
+
+
+def test_is_forged_skill_body_fails_toward_refusal(tmp_path):
+    """Fail direction is REFUSE here, unlike framework_origin()'s fail-open — a wrong
+    ALLOW re-opens the worksheet hole, a wrong refusal only asks for another name."""
+    from _framework_origin import is_forged_skill_body
+    # unusable project_root: Path(None) raises, and the except must not allow
+    assert is_forged_skill_body(".claude/skills/x/SKILL.md", None) is False
+    # a root with no .claude/skills at all is not a checkout — every skill path
+    # would otherwise read as brand-new and exempt the whole surface
+    assert is_forged_skill_body(".claude/skills/x/SKILL.md", tmp_path) is False
+
+
+def test_path_resolution_hook_allows_a_new_forged_skill_body(tmp_path):
+    root = _project(tmp_path)
+    _registry(root)
+    r = _hook(root, str(root / ".claude/skills/query-scouting-matchups/SKILL.md"), tool="Write")
+    assert r["decision"] == "approve", r
+
+
+def test_path_resolution_hook_allows_revising_a_forged_skill_body(tmp_path):
+    root = _project(tmp_path)
+    _registry(root)
+    body = _forged_skill(root, "query-scouting-matchups")
+    assert _hook(root, str(body))["decision"] == "approve"
+
+
+def test_path_resolution_hook_still_denies_the_base_skill_worksheet_edit(tmp_path):
+    """Positive control for the carve-out: the measured 2026-08-30 edit stays denied."""
+    root = _project(tmp_path)
+    _registry(root)
+    r = _hook(root, str(root / ".claude/skills/curriculum-gates/SKILL.md"))
+    assert r["decision"] == "deny", r
+    # ... and so does a NEW file smuggled into a base skill's dir, which the
+    # "does it exist yet" question alone would have let through.
+    r2 = _hook(root, str(root / ".claude/skills/curriculum-gates/results.md"), tool="Write")
+    assert r2["decision"] == "deny", r2
+
+
+def test_path_resolution_hook_deny_text_names_the_real_forged_home(tmp_path):
+    root = _project(tmp_path)
+    _registry(root)
+    reason = _hook(root, str(root / ".claude/skills/curriculum-gates/SKILL.md"))["reason"]
+    assert ".claude/skills/<new-name>/SKILL.md IS " in reason
+    assert "no writable home" not in reason
+
+
+def test_gate_allows_a_forged_skill_addition_but_not_a_base_skill_edit(tmp_path):
+    root = _repo(tmp_path)
+    _forged_skill(root, "query-scouting-matchups")
+    _git(root, "add", "-A")
+    first = _gate(root)
+    assert first.returncode == 0, first.stderr
+    # positive control: a base skill in the same commit still refuses
+    _forged_skill(root, "curriculum-gates", tag="description: a base skill")
+    _git(root, "add", "-A")
+    assert _gate(root).returncode == 1
+
+
+def test_gate_still_refuses_deleting_a_forged_skill_body(tmp_path):
+    """Un-forging is a deliberate act — and at a staged delete the body is already
+    gone, so 'absent means new' cannot tell a forged retirement from a base removal."""
+    root = _repo(tmp_path)
+    _forged_skill(root, "query-scouting-matchups")
+    _git(root, "add", "-A")
+    assert _git(root, "commit", "-q", "-m", "forge").returncode == 0
+    _git(root, "rm", "-q", ".claude/skills/query-scouting-matchups/SKILL.md")
+    assert _gate(root).returncode == 1

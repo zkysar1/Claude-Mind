@@ -31,7 +31,13 @@ from typing import Iterable, Optional
 
 
 # Canonical set — duplicated from aspirations.py for the standalone module.
-# If the set changes, both copies must update; a parity test could enforce.
+# If the set changes, both copies must update, and a parity test DOES enforce
+# it: tests/test_allowlist_parity_batch3.py::test_2b_user_leg_scopes_equal
+# asserts EQUALITY against the aspirations.py SSOT, so editing one copy alone
+# reddens the suite. (This comment read "a parity test could enforce" until
+# 2026-09-07; the test has existed for some time and the stale wording had
+# already caused one agent to file a false "parity check is MISSING" claim,
+# caught by a grep before filing — .)
 VALID_USER_LEG_SCOPES = frozenset({
     "commit", "push", "deployment-approval",
     "architecture-decision", "credential-grant",
@@ -45,6 +51,12 @@ VALID_USER_LEG_SCOPES = frozenset({
     # both — the user is not supplying data to the agent, they are being the
     # legal person. grant-010 retains exactly this class.
     "principal-identity",
+    # A quiesced or scheduled WINDOW only the principal can open (fleet
+    # stop/kill/start, or being at the terminal). Added 2026-09-07 (alpha,
+    # cc-13, ). Registers the token defer_scope.py's DEFER_SCOPES
+    # ALREADY carried for this exact shape rather than minting a synonym; see
+    # the SSOT copy in aspirations.py for the full rationale and blast radius.
+    "human-window",
 })
 
 # Scopes where the user's JUDGMENT is the deliverable (approval, architectural
@@ -65,6 +77,18 @@ DECISION_LIKE_SCOPES = frozenset({
     # _DECISION_SCOPE_SUBSTRINGS ("decision"/"approval"/"grant"), so this
     # explicit membership is load-bearing, not belt-and-braces.
     "principal-identity",
+    # SYNC OBLIGATION discharged for "human-window": decision-like YES.
+    # The literal criterion above is "the user's JUDGMENT is the deliverable",
+    # and a window request sits at the edge of it — what the principal supplies
+    # is their TIME and presence. It is admitted anyway because the judgment IS
+    # WHEN, and because the failure this set exists to prevent is precisely a
+    # human-gated goal folded into a collapsed bucket where "the user found out
+    # later" (the 2026-08-04  incident): a quiet window blocks the
+    # whole fleet while it waits, so it must surface individually. Like
+    # principal-identity it does NOT match _DECISION_SCOPE_SUBSTRINGS
+    # ("decision"/"approval"/"grant"), so this membership is load-bearing.
+    # Reversible in one line if /open-questions proves noisier for it.
+    "human-window",
 })
 
 # Title prefixes that imply a decision even when user_leg_scope is unset —

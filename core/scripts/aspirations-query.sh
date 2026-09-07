@@ -106,6 +106,11 @@ while [[ $# -gt 0 ]]; do
             argv_strict_help "$(basename "$0")" "<at least one filter> [--full]" \
                 "$_ACCEPTED_FLAGS" \
 "  Default projection emits SIX keys: goal_id, asp_id, source, title, status, category.
+  A row with source=agent additionally carries read_from=peer-mirror-unverified when
+  this box does not hold that agent dir's runner claim (g-115-9276): the row came from
+  a mirror that is structurally behind the store of record, whose MISSING rows are
+  always the newest — read it authoritatively with backend-cat.sh before deciding on it.
+  Its ABSENCE means 'not known to be unverifiable', never 'verified'.
   Anything else (created_at, priority, defer_reason, claimed_by, ...) requires --full.
   --goal-field matches the RAW record, so it filters on fields the projection does
   not show; the identifier there is \`id\`, and \`goal_id\` is accepted as an alias.

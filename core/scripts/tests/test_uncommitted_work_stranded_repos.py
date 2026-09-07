@@ -368,3 +368,140 @@ def test_complete_refspec_reports_the_flag_and_keeps_blocking(tmp_path, framewor
                    repo_path=framework_repo, world_dir=world)
     assert res["stranded_would_block"] is True, res["stranded_repos"]
     assert res["stranded_repos"][0]["refspec_complete"] is True
+
+
+# ── : content-free history divergence ─────────────────────────────
+# The lane reasons over the commit GRAPH and never compared TREES, so a
+# divergence carrying no content read as undelivered work and blocked EVERY
+# subsequent close on that box. Measured 2026-08-19 closing :
+# one delivery repo reported 7 stranded commits, 4 of them merges whose
+# tree was byte-identical to origin/main.
+#
+# WHY THE OBVIOUS FIXTURE IS VACUOUS, and why this one is not. An *empty*
+# commit also has a tree identical to upstream, but for it
+# merge-base(@{u}, HEAD) == @{u}, so a three-dot diff is already empty and the
+# UNFIXED code returns the same answer — the case certifies nothing. The defect
+# needs the merge-base to be STRICTLY OLDER than upstream, which is what makes
+# the three-dot diff report files that are in fact already delivered. Both
+# helpers below assert that precondition rather than assuming it, so the test
+# cannot silently decay into the vacuous shape.
+
+
+def _content_free_divergence(tmp_path: Path, name: str = "product") -> Path:
+    """A clone whose local default has diverged from origin's WITHOUT content.
+
+    Shape: local commits A2 (app.py -> v2); a second clone pushes B1 with the
+    SAME bytes so origin moves ahead by another route; the first clone merges,
+    resolving to a tree byte-identical to origin's. HEAD and origin/master are
+    then different commits with the same tree.
+    """
+    clone = _mk_origin_and_clone(tmp_path, name)
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "A2 local only")
+
+    other = tmp_path / f"{name}-other"
+    subprocess.run(["git", "clone", "-q", _git(clone, "remote", "get-url", "origin"),
+                    str(other)], capture_output=True, check=True)
+    _git(other, "config", "user.email", "t@t"); _git(other, "config", "user.name", "t")
+    (other / "app.py").write_text("v2\n")          # identical bytes, other route
+    _git(other, "add", "-A"); _git(other, "commit", "-m", "B1 same content")
+    _git(other, "push", "-q", "origin", "master")
+
+    _git(clone, "fetch", "-q", "origin")
+    _git(clone, "merge", "--no-edit", "-q", "origin/master")
+
+    # PRECONDITIONS, asserted rather than assumed. Three separate ways this
+    # fixture could stop modelling the defect while still passing.
+    head_tree = _git(clone, "rev-parse", "HEAD^{tree}")
+    up_tree = _git(clone, "rev-parse", "origin/master^{tree}")
+    assert head_tree == up_tree, "setup failed: trees are not identical"
+    assert _git(clone, "rev-parse", "HEAD") != _git(clone, "rev-parse", "origin/master"), \
+        "setup failed: no divergence at all, so nothing would be reported"
+
+    # THE ANTI-VACUITY CONDITION FOR *THIS* LANE, and it is not the same as the
+    # framework lane's. That lane diffs three-dot `@{u}...HEAD`, so its vacuous
+    # case is merge-base == upstream. Here the population comes from
+    # `rev-list --branches --remotes=origin --not <default>`, and merging
+    # upstream necessarily makes it an ancestor of HEAD — so merge-base ==
+    # upstream ALWAYS holds after a merge and asserting otherwise would reject
+    # every valid fixture. What makes THIS case non-vacuous is that the
+    # divergent commits are reported at all AND are local-only, which is what
+    # puts them in the blocking set (`fresh_local_only`) rather than in the
+    # reported-only `unattributed_unmerged`.
+    off_default = _git(clone, "rev-list", "--branches", "--remotes=origin",
+                       "--not", "refs/remotes/origin/master").split()
+    assert off_default, (
+        "setup failed: nothing is off-default, so there is nothing to release "
+        "and the test would pass against the unfixed code")
+    contained = _git(clone, "branch", "-r", "--contains", off_default[0])
+    assert contained.strip() == "", (
+        "setup failed: the divergent commit is on a remote ref, so it would be "
+        "reported as another goal's open PR and never blocked — the unfixed "
+        f"code would pass too. contained-in: {contained!r}")
+    return clone
+
+
+def test_content_free_divergence_is_released_and_still_reported(tmp_path, framework_repo):
+    """Outcomes 2 and 3: the identical-tree case does not block, and it is
+    surfaced rather than silently dropped.
+
+    Reported matters as much as released here: a stranding that stops blocking
+    invisibly is indistinguishable from a gate someone deleted (guard-1760),
+    and equal trees at the TIP do not prove the intervening commits are
+    worthless — a revert pair has an identical tree too.
+    """
+    clone = _content_free_divergence(tmp_path)
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-6872", override=None,
+                   repo_path=framework_repo, world_dir=world)
+
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    assert res["would_block"] is False, res
+
+    # Released, NOT invisible — the repo must still reach the payload.
+    assert res["stranded_repos"], "the repo vanished from the payload entirely"
+    finding = res["stranded_repos"][0]
+    assert finding["content_free_stranded_commits"], finding
+    assert not finding["stranded_commits"], finding
+
+
+def test_content_free_release_does_not_reach_real_work_on_a_side_branch(tmp_path, framework_repo):
+    """THE MUTATION KILL (guard-3126). Equal trees prove only that HEAD's
+    content is already delivered; the off-default population is drawn from ALL
+    branches, so a HEAD-only proof must not release a side branch's real work.
+
+    Same repo as the test above — the one proven released — plus one genuinely
+    undelivered commit on a feature branch. It must still block.
+    """
+    clone = _content_free_divergence(tmp_path)
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "real.py").write_text("genuinely undelivered\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6872b): real work")
+    _git(clone, "checkout", "-q", "master")
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-6872b", override=None,
+                   repo_path=framework_repo, world_dir=world)
+
+    assert res["stranded_would_block"] is True, (
+        "the tree-identity release swallowed real undelivered work on a side "
+        f"branch: {res['stranded_repos']}")
+    finding = res["stranded_repos"][0]
+    # Both categories at once: the split is a partition, not a whole-repo verdict.
+    assert finding["stranded_commits"], finding
+    assert finding["content_free_stranded_commits"], finding
+
+
+def test_dirty_tracked_still_blocks_under_an_identical_tree(tmp_path, framework_repo):
+    """Second mutation kill. `dirty_tracked` is uncommitted work in the working
+    tree; the tree-identity proof is about COMMITTED content at HEAD and says
+    nothing about it. A dirty file must keep blocking even when HEAD's tree
+    matches upstream exactly."""
+    clone = _content_free_divergence(tmp_path)
+    (clone / "app.py").write_text("uncommitted edit on top\n")
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-6872c", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+    assert res["stranded_repos"][0]["dirty_tracked"], res["stranded_repos"]

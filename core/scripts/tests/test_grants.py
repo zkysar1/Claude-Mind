@@ -304,3 +304,152 @@ def test_readable_scopes_are_normalized_and_deduped():
               _grant("world-a", "world-b", grant_id="g3", scope="performance")]
     assert G.readable_scopes(grants, "world-a", "world-b") == [
         "intelligence/agent", "performance"]
+
+
+# ── Membership (, asp-368 P3) ───────────────────────────────────────
+# An agent's base world holds grants INTO environment-worlds, and holding one IS
+# membership. Every test here therefore reads the SAME rows the G1-G5 tests
+# above read — if membership ever needed its own fixture shape, that would be
+# the parallel store outcome[2] forbids.
+
+def test_memberships_resolves_several_environments_from_one_base():
+    """Outcome[1]: multi-environment membership, resolved from the base."""
+    grants = [_grant("alpha-base", "vinheim-env"),
+              _grant("alpha-base", "lodestar-env"),
+              _grant("other-base", "vinheim-env")]
+    envs = G.memberships(grants, "alpha-base")
+    # ANTI-VACUITY FLOOR (guard-1638): assert the SIZE as well as the contents,
+    # so a resolver that returned everything, or nothing, cannot pass. The
+    # third row is the discriminator — a resolver ignoring from_env would
+    # return it too and the membership set would be indistinguishable from
+    # "every environment anyone is a member of".
+    assert envs == ["lodestar-env", "vinheim-env"]
+    assert len(envs) == 2
+    assert G.memberships(grants, "other-base") == ["vinheim-env"]
+
+
+def test_memberships_is_empty_for_a_base_holding_no_grants():
+    """G1 default-private, membership side: zero grants == zero memberships.
+
+    Positive control lives in the test above; without it an always-empty
+    resolver would pass this one.
+    """
+    grants = [_grant("alpha-base", "vinheim-env")]
+    assert G.memberships(grants, "unknown-base") == []
+    assert G.memberships([], "alpha-base") == []
+    assert G.memberships(grants, "") == []
+
+
+def test_memberships_dedupes_several_scoped_grants_into_one_environment():
+    """Membership is a SET question, not an edge count: one base may hold
+    several grants into one environment at different scopes."""
+    grants = [_grant("alpha-base", "vinheim-env", grant_id="g1", scope="/"),
+              _grant("alpha-base", "vinheim-env", grant_id="g2",
+                     scope="intelligence/ayoai-architecture")]
+    assert G.memberships(grants, "alpha-base") == ["vinheim-env"]
+    # ...while both scopes remain visible through the scope query, so the
+    # dedupe loses no authorization detail.
+    assert G.readable_scopes(grants, "alpha-base", "vinheim-env") == [
+        "/", "intelligence/ayoai-architecture"]
+
+
+def test_revoking_a_grant_revokes_the_membership():
+    """Membership expressed AS grants means status is not a separate lifecycle:
+    a revoked grant is a revoked membership, same row, same event."""
+    grants = [_grant("alpha-base", "vinheim-env"),
+              _grant("alpha-base", "lodestar-env", status="revoked")]
+    assert G.memberships(grants, "alpha-base") == ["vinheim-env"]
+    # status=None is the audit read — it must still SEE the revoked edge,
+    # otherwise revocation would be indistinguishable from deletion.
+    assert G.memberships(grants, "alpha-base", status=None) == [
+        "lodestar-env", "vinheim-env"]
+
+
+def test_membership_and_the_influence_gate_read_the_same_rows():
+    """Outcome[2]: no parallel truth. Whatever `memberships` reports, the gate
+    must answer about the SAME edges — so a membership the gate denies is
+    visible rather than silent."""
+    grants = [_grant("alpha-base", "vinheim-env"),
+              _grant("alpha-base", "lodestar-env", approved_by=None)]
+    envs = G.memberships(grants, "alpha-base")
+    assert envs == ["lodestar-env", "vinheim-env"]
+    verdicts = {e: G.check_influence("alpha-base", e, grants)["verdict"]
+                for e in envs}
+    # The asymmetry is REAL and is pinned here deliberately rather than hidden:
+    # validate_new_grant requires a human approver only for the FIRST grant out
+    # of a source, while check_influence requires one on EVERY grant. So an
+    # edge can be a legitimate membership and still be denied influence. It
+    # fails CLOSED, which is the safe direction; this test exists so a future
+    # change to either rule cannot move that line without a test going red.
+    assert verdicts["vinheim-env"] == G.ALLOW
+    assert verdicts["lodestar-env"] == G.DENY
+
+
+def test_default_store_path_names_the_canonical_file_under_a_given_world(tmp_path):
+    """The FILENAME is fleet-canonical; the DIRECTORY is the caller's, because
+    `world/` is an external per-agent path and a module constant would be wrong
+    on every box but one."""
+    assert G.default_store_path(tmp_path).name == "grants.jsonl"
+    assert G.default_store_path(tmp_path) == tmp_path / G.STORE_FILENAME
+
+
+# ---------------------------------------------------------------------------
+# reach() — membership joined against the deployment registry (, P4)
+# ---------------------------------------------------------------------------
+
+
+def test_reach_splits_membership_registry_and_dangling():
+    """The three-way join is the point: which registered peers this base holds,
+    which it does NOT (the seed list), and which grants name nothing addressable."""
+    grants = [_grant("alpha-base", "vinheim-env"),
+              _grant("alpha-base", "retired-env")]
+    r = G.reach(grants, "alpha-base",
+                ["vinheim-env", "lodestar-env", "alpha-base"])
+    assert r["member_of"] == ["vinheim-env"]
+    assert r["ungranted"] == ["lodestar-env"]
+    assert r["dangling"] == ["retired-env"]
+    # ANTI-VACUITY FLOOR: a reach that returned three empty lists would satisfy
+    # any "no unexpected env" assertion. Every bucket must be non-empty here, or
+    # this test cannot tell a working join from an inert one.
+    assert all(r[k] for k in ("member_of", "ungranted", "dangling"))
+
+
+def test_reach_excludes_the_base_from_every_list():
+    """A world is not its own peer. The base appears in the registry (it is a
+    registered deployment) and can appear in a self-grant, so both directions
+    must be excluded or a base reports membership in itself."""
+    grants = [_grant("alpha-base", "alpha-base"),
+              _grant("alpha-base", "vinheim-env")]
+    r = G.reach(grants, "alpha-base", ["alpha-base", "vinheim-env"])
+    assert "alpha-base" not in r["member_of"]
+    assert "alpha-base" not in r["ungranted"]
+    assert "alpha-base" not in r["dangling"]
+    # Positive control: the exclusion must not eat the real membership beside it.
+    assert r["member_of"] == ["vinheim-env"]
+
+
+def test_revoking_a_grant_returns_the_environment_to_the_seed_list():
+    """Membership IS the grant, so revocation is not a separate lifecycle — the
+    env must move from member_of back to ungranted, not merely vanish."""
+    grants = [_grant("alpha-base", "vinheim-env", status="revoked")]
+    r = G.reach(grants, "alpha-base", ["vinheim-env"])
+    assert r["member_of"] == []
+    assert r["ungranted"] == ["vinheim-env"], \
+        "a revoked membership must reappear as needing a seed, not disappear"
+    # The audit read still SEES the revoked edge, so revocation stays
+    # distinguishable from deletion (same contract as memberships()).
+    audit = G.reach(grants, "alpha-base", ["vinheim-env"], status=None)
+    assert audit["member_of"] == ["vinheim-env"]
+
+
+def test_reach_never_counts_an_unaddressable_grant_as_membership():
+    """member_of INTERSECTS rather than reporting grants, because a grant naming
+    a world the registry cannot address is not reach. Overstating reach is the
+    expensive direction: it is what would make an arming decision look safe."""
+    grants = [_grant("alpha-base", "ghost-env")]
+    r = G.reach(grants, "alpha-base", ["vinheim-env"])
+    assert r["member_of"] == []
+    assert r["dangling"] == ["ghost-env"]
+    # And the ungranted seed list is unaffected by the dangling grant — a ghost
+    # edge must not silently satisfy a registered peer's seed requirement.
+    assert r["ungranted"] == ["vinheim-env"]

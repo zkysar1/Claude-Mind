@@ -190,7 +190,7 @@ def test_main_loop_constructs_override_just_from_warning():
         return "g-test-003"
 
     # Build minimal sandbox: synthetic warnings file in tmpdir,
-    # asp-240 stub with empty goals list returned by read_asp,
+    # resolved-target stub with empty goals list returned by read_asp,
     # and rate-limit/skip checks bypassed via monkey patches.
     import tempfile
     tmpdir = Path(tempfile.mkdtemp(prefix="stall_filer_test_"))
@@ -211,13 +211,13 @@ def test_main_loop_constructs_override_just_from_warning():
         warn_path.parent.mkdir(parents=True, exist_ok=True)
         warn_path.write_text(json.dumps(warning) + "\n", encoding="utf-8")
 
-        # Stub asp read to return empty asp-240
-        empty_asp = {"id": "asp-240", "goals": []}
+        # Stub asp read to return the RESOLVED target with no goals
+        empty_asp = {"id": mod.TARGET_ASP_ID, "goals": []}
         # Stub PROJECT_ROOT and _paths.agent_dir so warn_path resolves to our sandbox
         with patch.object(mod, "PROJECT_ROOT", tmpdir), \
              patch.object(mod._paths, "agent_dir", side_effect=lambda name: tmpdir / name), \
              patch.object(mod, "read_asp", return_value=empty_asp), \
-             patch.object(mod, "resolve_world_aspirations_path",
+             patch.object(mod, "resolve_target_aspirations_path",
                           return_value=tmpdir / "world" / "aspirations.jsonl"), \
              patch.object(mod, "infer_last_goal", return_value="g-mock-99: stub"), \
              patch.object(mod, "rewrite_warnings"), \
@@ -235,7 +235,17 @@ def test_main_loop_constructs_override_just_from_warning():
             f"expected exactly 1 file_goal invocation, got {len(captured_args)}"
         )
         asp_id, goal, override_just = captured_args[0]
-        assert asp_id == "asp-240"
+        # Deployment-INDEPENDENT on purpose. This asserted the literal "asp-240"
+        # until , which is the very defect that goal fixed — the id is
+        # now RESOLVED per deployment, so a literal here passes on exactly one
+        # box and fails everywhere else. Do NOT "fix" a future red by re-pinning
+        # a number; that reintroduces the bug inside the regression test.
+        # What this pins is the WIRING (main() files on the module's resolved
+        # target, not on some other id) — it deliberately says nothing about
+        # WHICH id is correct, because reading the constant out of the module
+        # under test could never answer that (guard-1628). The id itself is
+        # pinned corpus-wide by test_escalation_target_wiring.py.
+        assert asp_id == mod.TARGET_ASP_ID
         assert override_just is not None, (
             "main() must pass override_just to file_goal — without it, "
             "the duplication gate consumes stall warnings silently"
