@@ -86,7 +86,11 @@ def test_BOTH_id_branches_are_wired_not_just_one():
         encoding="utf-8")
     assert src.count("find_displacers(items, rec_id)") == 2, (
         "expected the displacement lookup in BOTH rb_read and guard_read")
-    assert src.count("_displacement_notice") == 2
+    # Scope to the ASSIGNMENT SITE, not the bare symbol (guard-2134): the
+    # module also names `_displacement_notice` in a prose comment, and a
+    # bare-symbol count cannot tell a mention from a wiring (guard-4049).
+    assert src.count('rec["_displacement_notice"]') == 2, (
+        "expected the notice assignment in BOTH rb_read and guard_read")
     assert src.count("not_found_detail(rec_id, displacers)") == 2
 
 

@@ -1953,3 +1953,105 @@ verbatim — *"Recall of your own earlier work is not a read of it, and it fails
 in the confident direction."* Same class, same session, caught the second time
 because it had just been encoded. That is the encoding pipeline paying out
 inside one session, which is the only direct evidence of it I have recorded.
+
+---
+
+## 2026-09-06T01:42 — echo, hostname cc-03, uname -r 6.8.0-138-generic, own-cloud
+
+Gate: current=13435 last=13353 diff=82 cadence=75. Zone normal, meter=run.
+
+**Phase 2 counts (both queries, `--full`).** `in-progress`: 3 candidates — 0 mutated,
+0 foreign sid, 0 absent sid, 3 partner; fields claimed_by 3/3, claimed_by_sid 3/3,
+name-less-sid 0. `pending+agent`: **2374** candidates — 0 mutated, 0 foreign sid,
+0 absent sid, **6 partner**; fields claimed_by **7/2374**, claimed_by_sid **7/2374**,
+name-less-sid **0**. The two field counts reconcile exactly, so the ownership predicate
+spans its population this reading (contrast the 9/1980-vs-11/1980 mismatch that
+originally surfaced the name-less-sid branch). 222 unclaimed rows carry an
+`outcome_note`, all of the recurring `[closure-evidence] SUPERSEDES a prior-occurrence
+note` form — the supersession population, not unbanked work.
+
+**Vantage note (method rule 2).** Read from echo's own session: partner counters are
+non-zero (3 and 6) and foreign-sid counters are zero on both queries — the opposite
+column split from the 0-partner/196-foreign-sid reading. Consistent with the rule that
+the vantage decides which column carries the protection; neither column alone describes
+the population.
+
+**Phase 3 counts.** 16 blocked — 0 mutated, 0 foreign sid, 0 absent sid, 0 partner.
+signals: blocked_by 14, defer_reason 2, blocker_ref 0, none_at_all **0**.
+blocker_ref shapes: absent 16, dict_no_type 0, str 0. No Gate-2 and no Gate-3 case in
+this population.
+
+**A NEW WAY FOR THIS PHASE TO GO BLIND — worth carrying forward.** The `pending+agent`
+query was first staged to a file. `wc -c` in the same command read **17,202,996 bytes**;
+~90 s later `wc -c`, `head`, `tail` and `tr -dc` all read **0**, and it stayed 0. Purge
+is ruled out (the `.raw` lane has a 120-minute age guard, and an 11,437 B sibling written
+in the SAME SECOND survived). Mechanism NOT established. The consequence is the point:
+a parser that defaulted to `[]` would have printed
+`2374 candidates` as `0 candidates — 0 skipped (partner)` — a clean, protocol-shaped,
+fully rule-compliant tally, in the phase whose purpose is not to mutate partner work.
+The mandated four-reason tally does NOT protect against this; only printing
+`bytes received` did. Method rule 6 says a small mutable count is the gates working —
+this is the adjacent trap: **a small CANDIDATE count can be the input vanishing.**
+Print the received byte count beside the tally, and prefer piping the wrapper straight
+into the parser over staging it. Encoded as rb-10265.
+
+## 2026-09-06T13:33 — zeta, hostname cc-02, uname -r 6.8.0-138-generic, own-cloud
+
+Cadence `current=13527 last=13447 diff=80` (fires every 75). Window 91 closes:
+asp-115 28 / asp-335 15 / asp-001 12 / asp-358 11 / asp-326 6 / asp-369 5 /
+asp-357 5 / asp-306 4 / asp-363 2 / asp-370 1.
+
+DIRECTIVE-LANE, BOTH RUNS (the guard-1944 rider), one instant:
+
+| run | lane | 7d share_pct | 7d by-work_class | 7d lane/infra/other | 48h share_pct |
+|---|---|---|---|---|---|
+| `derived-from-strategic-focus` | asp-363,364,368,369 | **5.4%** | 22.1% | 8 / 70 / 71 | 4.9% |
+| `explicit-flag` LEGACY_LANE | asp-334,335 | **10.1%** | 28.2% | 15 / 70 / 64 | 5.9% |
+
+Floor 33.3% — all four measures breach it. **Do not read the breach as drift.**
+Two independent reasons, both measured this instant:
+
+1. **SUPPLY, not neglect (guard-2379).** `pool` = lane 29 / infra 1981 / other 404,
+   so the lane holds **1.2%** of non-terminal goals while taking **5.4%** of closes
+   — ~4.5x its supply share — and the live selector's top candidate IS a lane goal
+   (g-369-03, asp-369, score 16.05). A lane cannot be under-served while its own
+   goal ranks first.
+2. **Most of the fall since 2026-08-14 is a LANE REPOINT, not behaviour.** The
+   derived set moved `[326,335,350,362]` → `[363,364,368,369]`, so asp-335 — 15 of
+   this window's 91 closes — left the derived lane. Derived by-id 25.4% → 5.4%
+   (−20.0pp) against the FIXED legacy lane's 19.0% → 10.1% (−8.9pp) over the same
+   span. **Reporting the derived run alone would have overstated the drop ~2.2x.**
+   That is the rider's own justification observed live, and it is why the skill
+   says report BOTH rather than whichever one is default today.
+
+`ordering_ok` False in both runs and it is NOT an infra tilt (method rider c):
+product = lane + other = **79 vs infra 70** at 7d. At 48h it is **51 vs 51** —
+tied and worsening, worth re-checking next sweep, but not yet `infra > lane+other`.
+
+OTHER LANES. Phase 1b insights backlog 0. Phase 2: in-progress 3 candidates —
+0 mutable, 3 partner, fields `claimed_by 3/3, claimed_by_sid 3/3, name-less-sid 0`;
+pending+agent 2374 candidates — 2368 mutable, 6 partner, fields `claimed_by 6/2374,
+claimed_by_sid 6/2374, name-less-sid 0`. **The 2368 is an OWNERSHIP verdict, not a
+completion one** — none carried evidence its outcomes were met, so zero out-of-cycle
+closes. Phase 3: 16 blocked, **0 claimed by me**, `blocker_ref` absent on all 16
+(Gate 3's UNREADABLE class empty this sweep), `blocked_by` 13 list / 3 empty, defer
+2 set. Phase 5b `--all-skills`: 146 skills / 3879 assertions / **5 parse-lines** /
+0 stale (the default would have scanned 0 parse-lines — the flag still earns itself;
+population has grown from the 90 skills / 3648 assertions recorded 2026-07-31).
+
+LANE 7. Three FALSE NEGATIVES in this one window, all the same shape — a wrong
+invocation or key name yielding a well-formed, plausible zero indistinguishable
+from a real one: (1) `aspirations-query.sh --goal-field id --full` with the VALUE
+omitted wrote a 0-byte file, so four known-good control ids all read "absent" and
+a phantom "dangling reference" finding was one step from being filed; (2)
+`grep -c X f || echo "miss"` printed `0` AND fired the fallback, since grep returns
+rc=1 on zero matches; (3) asked the directive-lane instrument for `share` when it
+emits `share_pct`, getting `None` on every window of both runs and briefly reading
+it as a metric regression. Each was caught by a POSITIVE CONTROL (grepping ids
+known to exist) or by reading the emitter's source — never by the failing call
+itself. Already encoded three times over (**guard-2958** derive-the-zero's-
+population, **guard-2442** flag positive-control, **rb-6860** 0-byte redirect at
+rc=0, and this ledger's own preceding entry **rb-10265**), so the correct action was
+STRENGTHEN, not a fourth near-duplicate: incremented guard-2958, guard-2442,
+rb-6860. Zero new entries — the recurrence is the signal, and the count is the
+artifact that carries it.

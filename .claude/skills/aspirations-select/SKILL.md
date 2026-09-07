@@ -511,11 +511,22 @@ IF capability_level < auto_designate_below_capability threshold:
 # defer_reason naming the hard gap, never a lane abstention. The intended_agent
 # stamp IS the tasking.
 IF goal requires capabilities outside agents/<agent>/self.md "What I Do" section:
-    IF goal.abstained_by is set AND goal.abstained_by != AGENT_NAME:
-        # Both agents can't do this goal — defer with timestamp for expiry
+    # LOCUS-GATED EXEMPTION (g-115-9179): the defer below is right for a SKILL gap and
+    # STRANDS a LOCUS gap — when a capability lives on ONE box, N-1 correct abstentions
+    # read as impossibility (guard-2937/4310/2361).
+    # Rationale (WHY conditional; why no abstained_by write; measured):
+    #   core/config/rationale/locus-gated-abstention.md
+    locus_gated = goal.requires_capability is non-empty
+                  OR (goal.intended_agent is set AND != "either")
+                  OR the gap is a HOST / MACHINE / live-session gap, not a skill gap
+    IF goal.abstained_by is set AND goal.abstained_by != AGENT_NAME AND NOT locus_gated:
+        # Genuine double SKILL-gap — the original case, unchanged.
         Bash: aspirations-update-goal.sh --source {source} <goal-id> defer_reason "Both agents abstained — needs user attention or capability expansion"
         Bash: aspirations-update-goal.sh --source {source} <goal-id> defer_reason_set_at "$(date +%Y-%m-%dT%H:%M:%S)"
         Log: "DOUBLE-ABSTENTION: ${goal.id} — deferring (${goal.abstained_by} also abstained)"
+    ELIF goal.abstained_by is set AND goal.abstained_by != AGENT_NAME AND locus_gated:
+        # NO defer_reason and NO abstained_by (scalar field; see rationale).
+        Log: "LOCUS-GATED ABSTENTION: ${goal.id} — NOT deferring; stays visible to the locus holder (intended_agent=${goal.intended_agent})."
     ELSE:
         Bash: aspirations-update-goal.sh --source {source} <goal-id> abstained_by <AGENT_NAME>
         Bash: aspirations-update-goal.sh --source {source} <goal-id> abstained_at "$(date +%Y-%m-%dT%H:%M:%S)"
@@ -526,7 +537,8 @@ IF goal requires capabilities outside agents/<agent>/self.md "What I Do" section
 # Self-abstention expires after abstention_timeout_hours (default 72h).
 # goal-selector.py checks abstained_at timestamp — expired abstentions fall through.
 # If the original reason still holds, the agent will re-abstain with a fresh timestamp.
-# If both agents abstain, the goal is deferred to prevent ping-pong.
+# Both abstain on a SKILL gap -> deferred (ping-pong guard). On a LOCUS gap -> NOT
+# deferred; it stays visible to the box holding the locus (see the exemption above).
 ```
 
 ### Determine effort_level
@@ -582,6 +594,11 @@ goal = find by goal_id in returned aspiration's goals array
 
 # THEN READ, IN THIS ORDER, BEFORE ANY SCOPE REASONING:
 #   goal.outcome_note · goal.outcome_notes (PLURAL — a real second field, guard-3512) · goal.progress_note
+# READ EACH ONE WHOLE. A truncated read of a narrative field is NOT a read of it
+# (guard-2043): these fields are APPEND-ORDERED, so the corrective block — work
+# already done, or scope the verification never listed — lands at the END, which
+# is exactly what a head-truncated read drops. Print the field's len() FIRST and
+# read until you have consumed it; the read ends at the LAST appended block.
 # Live population, asp-335 (bravo, hostname cc-05, uname -r 6.8.0-137-generic,
 # 2026-08-13): outcome_note on 520 of 1212 goals, progress_note on 13,
 # outcome_notes on 2. This is not a rare field — it is present on 43% of the
@@ -594,24 +611,23 @@ goal = find by goal_id in returned aspiration's goals array
 # split a worker finishes a goal and hands it back pending, because verify is a
 # reducer-only phase (guard-2803).
 #
-# THE COST LANDS HERE, ONE PHASE BEFORE guard-2803's OWN TRIGGER. That guardrail
-# fires after aspirations-claim.sh returns, which is correct and still too late:
-# selection is where "this goal is bigger than it says" gets decided, and that
-# decision is made from the description while the answer sits unread in the same
-# record. Three occurrences of exactly that, escalating, and guard-2803 was
-# already written and active (times_active 763) for all three:
+# THE COST LANDS HERE, ONE PHASE BEFORE guard-2803's OWN TRIGGER: it fires after
+# aspirations-claim.sh returns — correct, and still too late, because selection
+# is where "this goal is bigger than it says" gets decided, from the description,
+# while the answer sits unread in the same record. Three escalating occurrences,
+# guard-2803 already written and active (times_active 763) for all three:
 #   2026-08-05 g-335-818  (bravo) caught AT claim — worked as designed
 #   2026-08-13 g-335-1173 (alpha) ~15 min re-deriving scope already written down
 #   2026-08-13 g-335-1201 (bravo) FULL duplicate implementation of a partner's
 #                                 open PR (#193 vs #194), merged before discovery
-# A guardrail cannot outvote the instrument it guards (guard-1984), which is why
-# the fix is these lines and not a fourth guardrail.
+# A guardrail cannot outvote the instrument it guards (guard-1984) — hence these
+# lines, not a fourth guardrail.
 #
-# TELL, and it is counter-intuitive: a re-derived conclusion arriving CORRECT is
-# not reassurance — it is the signature. It matched because it was already
-# recorded. In g-335-1201 two independent implementations converged on
-# byte-compatible wire formats, which read as strong validation of the design and
-# was ALSO the proof that one of them never needed writing.
+# TELL, counter-intuitive: a re-derived conclusion arriving CORRECT is not
+# reassurance, it is the signature — it matched because it was already recorded.
+# g-335-1201's two independent implementations converged on byte-compatible wire
+# formats, reading as strong validation of the design and ALSO proving that one
+# of them never needed writing.
 ```
 
 ## Phase 2.94: Scorer-Divergence Deviation Code (Scorer Sovereignty Layer B, g-115-2812)

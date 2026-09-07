@@ -225,10 +225,54 @@ class PredicateResult:
     predicate_id: Optional[str] = None
     observed_value: Any = None
     reason: str = ""
+    # THE THIRD VERDICT (). `passed` alone conflated two different
+    # things: "I evaluated the condition and it is not met" (transient, and it
+    # self-clears when the world changes) and "I cannot evaluate this condition
+    # at all" (PERMANENT — no world change will ever flip it). Both surfaced as
+    # passed:false, so every consumer — the selector filter, the two defer
+    # sweeps, a human reading `goal-selector.sh blocked` — read them
+    # identically. MEASURED 2026-09-05: 3 live goals (2 HIGH, one in the
+    # standing strategic-focus lane) carried a command_succeeds precondition
+    # whose command was not in ALLOWED_COMMAND_PREFIXES; the refusal returned
+    # passed:false, the goals were filtered with block_reason=precondition_unmet
+    # forever, and both re-probe sweeps re-derived the same false every 2h.
+    # This is the guard-1760 / rb-245 class: a probe that CANNOT LOOK reports
+    # identically to one that looked and found nothing.
+    #
+    # `evaluable=False` is set ONLY where the verdict was reached WITHOUT any
+    # measurement of the world: static validation of the predicate itself
+    # (missing/invalid required fields, unsupported type / condition / extract
+    # mode), an allowlist policy refusal, or an unresolvable reference. Runtime
+    # probe failures — timeout, OSError, non-zero rc, "goal not found yet" —
+    # stay evaluable=True on purpose: they ARE measurements of a transient
+    # world and they do self-clear.
+    #
+    # FAIL DIRECTION IS UNCHANGED, DELIBERATELY: an unevaluable predicate still
+    # returns passed=False (fail closed). This field makes the difference
+    # VISIBLE without moving the gate — so a consumer that reads only `passed`
+    # is exactly as safe as it was before this field existed (guard-3328: the
+    # branch nobody wrote inherits the pre-existing behaviour, and here that
+    # inheritance is correct), while a consumer that reads `evaluable` learns
+    # the gate is permanent and the fix is to EDIT the predicate, not to wait.
+    evaluable: bool = True
     evaluated_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%dT%H:%M:%S"))
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+def _unevaluable(ptype: str, pid: Optional[str], *, reason: str,
+                 observed_value: Any = None) -> PredicateResult:
+    """A predicate the evaluator CANNOT evaluate as written ().
+
+    Fails closed (passed=False — unchanged from before this helper existed)
+    but flags `evaluable=False` so consumers can tell a PERMANENT gate from a
+    transient one. Use it only where no world measurement was taken; see the
+    `evaluable` field comment above for the line.
+    """
+    return PredicateResult(passed=False, type=ptype, predicate_id=pid,
+                           observed_value=observed_value, reason=reason,
+                           evaluable=False)
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +372,12 @@ def _eval_file_exists_after(p: dict) -> PredicateResult:
     min_count = int(p.get("min_count", 1))
 
     if not path_pattern or not after_ref:
-        return PredicateResult(False, "file_exists_after", pid,
+        return _unevaluable("file_exists_after", pid,
                                reason="missing required field: path and after_ref")
 
     cutoff = resolve_after_ref(after_ref)
     if cutoff is None:
-        return PredicateResult(False, "file_exists_after", pid,
+        return _unevaluable("file_exists_after", pid,
                                reason=f"unresolvable after_ref: {after_ref}")
 
     grace_cutoff_ts = cutoff.timestamp() - CLOCK_SKEW_GRACE_SECONDS
@@ -360,10 +404,10 @@ def _eval_command_succeeds(p: dict) -> PredicateResult:
     timeout_s = min(int(p.get("timeout_seconds", DEFAULT_COMMAND_TIMEOUT)), MAX_COMMAND_TIMEOUT)
 
     if not command:
-        return PredicateResult(False, "command_succeeds", pid, reason="missing command")
+        return _unevaluable("command_succeeds", pid, reason="missing command")
 
     if not _command_allowed(command):
-        return PredicateResult(False, "command_succeeds", pid,
+        return _unevaluable("command_succeeds", pid,
                                reason=f"command not in allowlist (must start with one of: {ALLOWED_COMMAND_PREFIXES})")
 
     # shell=True is required on Windows Git Bash: the python3 shim under
@@ -380,6 +424,27 @@ def _eval_command_succeeds(p: dict) -> PredicateResult:
         script_abs = str(Path(WORLD_DIR) / script_rel)
         run_command = "bash " + shlex.quote(script_abs) + ((" " + rest) if rest else "")
 
+    # On POSIX, shell=True selects /bin/sh -- which is dash on Debian/Ubuntu,
+    # where `source` is NOT a builtin. So the exact shape path-resolution.md
+    # MANDATES for world scripts (`source core/scripts/_paths.sh && bash
+    # "$WORLD_PATH/scripts/<name>.sh"`), which is also an explicit
+    # ALLOWED_COMMAND_PREFIXES entry, dies rc=127 having run NOTHING -- a silent
+    # instant false-negative that freezes every command-gated defer forever.
+    # Measured on cc-02 2026-09-05 (): `/bin/sh: 1: source: not found`.
+    #  was filed as Windows-only; it reproduces identically on every
+    # box where /bin/sh is not bash, i.e. the whole Linux fleet.
+    # Name bash explicitly, preferring MIND_SHELL (world/conventions/
+    # windows-shell-config.md, auto-set by _paths.sh).
+    # Windows is deliberately NOT given executable=: guard-133 requires cmd.exe
+    # intermediation there or the core/scripts/.python-shim python3 shim breaks.
+    # If bash is absent we fall back to the previous behaviour rather than
+    # raising -- a missing interpreter must not be worse than the bug.
+    run_kwargs = {}
+    if os.name == "posix":
+        _shell_exe = os.environ.get("MIND_SHELL") or "/bin/bash"
+        if os.path.exists(_shell_exe):
+            run_kwargs["executable"] = _shell_exe
+
     try:
         out = subprocess.run(
             run_command,
@@ -387,6 +452,7 @@ def _eval_command_succeeds(p: dict) -> PredicateResult:
             cwd=str(PROJECT_ROOT),
             capture_output=True,
             timeout=timeout_s,
+            **run_kwargs,
         )
         passed = out.returncode == 0
         return PredicateResult(
@@ -409,12 +475,12 @@ def _eval_goal_completed_after(p: dict) -> PredicateResult:
     after_ref = p.get("after_ref", "")
 
     if not goal_id or not after_ref:
-        return PredicateResult(False, "goal_completed_after", pid,
+        return _unevaluable("goal_completed_after", pid,
                                reason="missing required field: goal_id and after_ref")
 
     cutoff = resolve_after_ref(after_ref)
     if cutoff is None:
-        return PredicateResult(False, "goal_completed_after", pid,
+        return _unevaluable("goal_completed_after", pid,
                                reason=f"unresolvable after_ref: {after_ref}")
 
     goal = _lookup_goal_record(goal_id)
@@ -463,9 +529,9 @@ def _eval_file_check(p: dict) -> PredicateResult:
     condition = p.get("condition", "exists")
 
     if not path_pattern:
-        return PredicateResult(False, "file_check", pid, reason="missing required field: path")
+        return _unevaluable("file_check", pid, reason="missing required field: path")
     if condition not in ("exists", "not_exists"):
-        return PredicateResult(False, "file_check", pid,
+        return _unevaluable("file_check", pid,
                                reason=f"unsupported condition '{condition}' (expected exists|not_exists)")
 
     abs_pattern = str(resolve_file_path(path_pattern))
@@ -499,15 +565,15 @@ def _eval_metric_threshold(p: dict) -> PredicateResult:
     min_val = p.get("min")
     max_val = p.get("max")
     if min_val is None and max_val is None:
-        return PredicateResult(False, "metric_threshold", pid,
+        return _unevaluable("metric_threshold", pid,
                                reason="must specify at least one of min, max")
     if not command:
-        return PredicateResult(False, "metric_threshold", pid, reason="missing command")
+        return _unevaluable("metric_threshold", pid, reason="missing command")
     if not _command_allowed(command):
-        return PredicateResult(False, "metric_threshold", pid,
+        return _unevaluable("metric_threshold", pid,
                                reason=f"command not in allowlist (must start with one of: {ALLOWED_COMMAND_PREFIXES})")
     if extract not in ("stdout_int", "json_length", "exit_code"):
-        return PredicateResult(False, "metric_threshold", pid,
+        return _unevaluable("metric_threshold", pid,
                                reason=f"unsupported extract mode '{extract}' (expected stdout_int|json_length|exit_code)")
 
     run_command = command
@@ -578,13 +644,13 @@ def _eval_after_time(p: dict) -> PredicateResult:
     anchor_str = p.get("anchor")
     delay = p.get("delay_seconds")
     if not isinstance(anchor_str, str) or not anchor_str:
-        return PredicateResult(False, "after_time", pid, reason="missing anchor (ISO timestamp)")
+        return _unevaluable("after_time", pid, reason="missing anchor (ISO timestamp)")
     if not isinstance(delay, (int, float)) or delay < 0:
-        return PredicateResult(False, "after_time", pid, reason="missing or invalid delay_seconds (non-negative number)")
+        return _unevaluable("after_time", pid, reason="missing or invalid delay_seconds (non-negative number)")
     try:
         anchor = _to_local_naive(datetime.fromisoformat(anchor_str))
     except (ValueError, TypeError) as e:
-        return PredicateResult(False, "after_time", pid, reason=f"invalid anchor: {e}")
+        return _unevaluable("after_time", pid, reason=f"invalid anchor: {e}")
     now = datetime.now()
     available_at = datetime.fromtimestamp(anchor.timestamp() + float(delay))
     passed = now.timestamp() >= available_at.timestamp() - CLOCK_SKEW_GRACE_SECONDS
@@ -645,10 +711,10 @@ def _eval_vcs_commits_since(p: dict) -> PredicateResult:
     elif after_ref:
         cutoff = resolve_after_ref(after_ref)
         if cutoff is None:
-            return PredicateResult(False, "vcs_commits_since", pid,
+            return _unevaluable("vcs_commits_since", pid,
                                    reason=f"unresolvable after_ref: {after_ref}")
     else:
-        return PredicateResult(False, "vcs_commits_since", pid,
+        return _unevaluable("vcs_commits_since", pid,
                                reason="must specify since_goal_last_achieved or after_ref")
 
     cmd = ["git", "-C", str(repo_path), "log", "--format=%cI"]
@@ -751,10 +817,10 @@ def _eval_pr_merged(p: dict) -> PredicateResult:
     repo = p.get("repo")
     pr = p.get("pr")
     if not isinstance(repo, str) or "/" not in repo:
-        return PredicateResult(False, "pr_merged", pid,
+        return _unevaluable("pr_merged", pid,
                                reason="missing/invalid repo (need owner/name)")
     if not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0:
-        return PredicateResult(False, "pr_merged", pid,
+        return _unevaluable("pr_merged", pid,
                                reason="missing/invalid pr (need positive int)")
     ttl_open = float(p.get("cache_ttl_minutes", 30)) * 60
     ttl_closed = 24 * 3600
@@ -858,7 +924,7 @@ PREDICATE_TYPES: Dict[str, Callable[[dict], PredicateResult]] = {
 def evaluate(predicate: dict) -> PredicateResult:
     """Evaluate one structured precondition. Never raises."""
     if not isinstance(predicate, dict):
-        return PredicateResult(False, "invalid", None,
+        return _unevaluable("invalid", None,
                                reason=f"not a dict: {type(predicate).__name__}")
     # Vocabulary normalization happens HERE, at the single dispatch chokepoint,
     # so every caller (selector filter, pre-claim recheck, verify-check-eval)
@@ -868,12 +934,12 @@ def evaluate(predicate: dict) -> PredicateResult:
     ptype = predicate.get("type", "")
     handler = PREDICATE_TYPES.get(ptype)
     if handler is None:
-        return PredicateResult(False, ptype or "missing", predicate.get("id"),
+        return _unevaluable(ptype or "missing", predicate.get("id"),
                                reason="unknown predicate type")
     try:
         return handler(predicate)
     except Exception as e:
-        return PredicateResult(False, ptype, predicate.get("id"),
+        return _unevaluable(ptype, predicate.get("id"),
                                reason=f"evaluator error: {type(e).__name__}: {e}")
 
 

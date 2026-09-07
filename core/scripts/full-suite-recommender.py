@@ -117,6 +117,23 @@ def _git_changed_paths(repo: Path) -> list[str]:
         s = ln.rstrip("\n")
         if len(s) < 4:
             continue
+        # UNTRACKED (`??`) is not a change relative to HEAD -- which is the only
+        # question this recommender asks. Porcelain collapses an untracked
+        # DIRECTORY to a single `?? dir/` line, so one stray build/env artifact
+        # made its repo permanently "changed" and emitted a suite recommendation
+        # on EVERY deep close, forever, for a repo nobody had touched. Measured
+        # 5x on 3 boxes: `__pycache__/`, `ops/mind-sidecar/tests/__pycache__/`,
+        # `.venv/`, `tests/__pycache__/`, `.venv.bravo-backup-20260806/`.
+        # Filtering the STATUS CLASS rather than denylisting artifact NAMES is
+        # deliberate -- a name-keyed fix closes one instance of an open-ended
+        # family (`node_modules/`, `.gradle/`, `build/`, `.pytest_cache/`, every
+        # future tool cache) and each would look like a fresh bug. guard-4377:
+        # fix the detector INPUT, do not add another content check. The blind
+        # spot this creates (a never-staged NEW source file) is disclosed in the
+        # banner -- see CANNOT_SEE (rb-4502: a fix removing one direction of
+        # error must re-score the other). .
+        if s[:2] == "??":
+            continue
         rest = s[3:].strip()
         # Handle renames "old -> new" by taking the new path
         if " -> " in rest:
@@ -371,6 +388,14 @@ def _product_recommendation(repo: Path, repo_type: str) -> str:
 # --- Banner emission --------------------------------------------------------
 BANNER_TOP = "═" * 64
 BANNER_TITLE = "▸ FULL-SUITE TEST RECOMMENDER (g-115-858)"
+CANNOT_SEE = (
+    "SCOPE -- what this tool CANNOT see. Silence here is NOT evidence that",
+    "nothing changed:",
+    "  * untracked files (git status '??'), skipped since g-115-4439 -- a NEW",
+    "    source file you have not staged will NOT be listed above",
+    "  * changes already committed -- detection diffs against HEAD by construction",
+    "  * world/** and meta/** -- external and gitignored, 0 tracked (guard-1947)",
+)
 
 
 def _emit_banner(goal_id: str, mind_buckets: dict, mind_recs: list[str],
@@ -442,6 +467,9 @@ def _emit_banner(goal_id: str, mind_buckets: dict, mind_recs: list[str],
     else:
         print("Product workspace: no uncommitted product code detected.")
 
+    print()
+    for _cs in CANNOT_SEE:
+        print(_cs)
     print()
     print("Targeted new tests are necessary but not sufficient. Run the above")
     print("full-suite invocations and confirm exit code 0 BEFORE claiming")

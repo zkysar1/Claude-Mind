@@ -966,7 +966,22 @@ class OwnCloudBackend:
             url = (base.rstrip("/") + "/v1/cache/object?"
                    + urllib.parse.urlencode({"key": key, "etag": etag}))
             headers = {"X-Runtime-Client": "owncloud-backend"}
-            token = os.environ.get("MIND_API_TOKEN", "").strip()
+            # g-358-40 item 5, DECIDED (option B — decouple). The cache client
+            # carries its OWN credential key, falling back to MIND_API_TOKEN so
+            # every box that has not set the new one behaves byte-identically.
+            # WHY a second key instead of reusing MIND_API_TOKEN on clients:
+            # putting MIND_API_TOKEN in a CLIENT box's .env.local does two
+            # unrelated things — it supplies this Bearer (wanted), AND it flips
+            # THAT box's own daemon to FR-4 auth-required at its next start
+            # (server.py:298, which reads the same key server-side). The second
+            # effect is a fleet-wide security-posture change no goal decided,
+            # and under daemon-only architecture its blast radius is a total
+            # agent wedge rather than degradation. With this key a client gets
+            # the credential and its own daemon's posture is untouched, so the
+            # per-box worst case drops from "daemon wedge" to "cache fails
+            # open" — which is already this function's contract.
+            token = (os.environ.get("OWNCLOUD_OBJECT_CACHE_TOKEN", "").strip()
+                     or os.environ.get("MIND_API_TOKEN", "").strip())
             if token:
                 headers["Authorization"] = "Bearer " + token
             timeout = float(os.environ.get("OWNCLOUD_OBJECT_CACHE_TIMEOUT", "2"))
@@ -1348,6 +1363,33 @@ class OwnCloudBackend:
         try:
             key = self._s3_key(path)
         except ValueError:
+            # _rel raises for BOTH a genuinely out-of-root (git-shipped) path
+            # and a merely RELATIVE one -- they are indistinguishable there, but
+            # they need OPPOSITE handling. Out-of-root is never on S3, so the
+            # local read below is correct and deliberate (see docstring); do not
+            # delete it. A RELATIVE path is a CALLER BUG, and swallowing it here
+            # hands back local-mirror bytes from the one API whose contract is
+            # "NEVER touches the local mirror" -- a false all-clear produced by
+            # the very API built to prevent false all-clears (guard-980 class,
+            # inside the guard-980 remedy).
+            #
+            # Measured on cc-02 2026-07-31 (g-115-4256): a fleet probe built on
+            # Path('agents')/name/... reported local==authoritative for all 5
+            # agents; the same probe with .resolve() showed 4 of 5 DIVERGED,
+            # confirmed by s3.head_object. Re-measured 2026-09-05, unchanged.
+            #
+            # Fail loud instead. Resolving here would be worse than raising: it
+            # would silently mint an S3 key from the process CWD, so the same
+            # relative path would read different objects from different working
+            # directories.
+            if not Path(path).is_absolute():
+                raise ValueError(
+                    f"read_authoritative_bytes requires an ABSOLUTE path; got the "
+                    f"relative {path!r}. A relative path cannot be mapped to an "
+                    f"S3 key and would silently return LOCAL mirror bytes, which "
+                    f"this API promises never to do. Resolve it first "
+                    f"(Path(...).resolve(), or join it to the governed root)."
+                ) from None
             return self._local(path).read_bytes()
         try:
             obj = self.s3.get_object(Bucket=self.bucket, Key=key)

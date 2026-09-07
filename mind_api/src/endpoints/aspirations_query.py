@@ -32,7 +32,12 @@ empty (g-115-5752 failure (a): date-filtering on `created_at` matched nothing,
 including the caller's own goals filed that day):
     goal_id, asp_id, source, title, status, category
 Anything else — created_at, priority, claimed_by, description, verification —
-requires `full=true`. Note the asymmetry that makes this easy to trip over:
+requires `full=true`. ONE CONDITIONAL SEVENTH KEY exists in BOTH projections:
+`read_from` is stamped on a row whose `source` is "agent" when this box does not
+hold the runner claim for that agent dir, i.e. when the row came from a mirror
+that is structurally behind the store of record (g-115-9276, guard-6166). It is
+ABSENT on every other row — its absence is not a claim that the read was
+verified, only that it was not known to be unverifiable. Note the asymmetry that makes this easy to trip over:
 `goal_field_name=created_at` filters SERVER-side against the raw record and
 works fine; it is filtering the RETURNED ROWS that silently fails.
 
@@ -80,6 +85,11 @@ import json
 from typing import Any, Dict, List, Tuple
 
 from ..jsonl_cache import cache
+from ..peer_queue_read import (
+    UNVERIFIED,
+    agent_queue_unverified,
+    unverified_detail,
+)
 
 
 VALID_GOAL_STATUSES = {
@@ -260,11 +270,17 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
     probed.append(str(world_path))
     if world_path.exists():
         sources.append(("world", jc.get(world_path)))
+    # The agent leg may be a PEER's queue read from a box that is structurally
+    # behind it ( item 2). Resolved once per request, from a TTL-cached
+    # consult of the SAME ownership SSOT the write-side no_claim gate uses — see
+    # peer_queue_read for why divergence itself is not measured here.
+    unverified_agent = None
     if ctx.paths.agent is not None:
         agent_path = ctx.paths.agent / "aspirations.jsonl"
         probed.append(str(agent_path))
         if agent_path.exists():
             sources.append(("agent", jc.get(agent_path)))
+            unverified_agent = agent_queue_unverified(agent_path)
 
     # ZERO READABLE STORES IS NOT AN EMPTY RESULT — it is an unanswerable query
     # (). Without this, both `.exists()` checks failing left `sources`
@@ -300,6 +316,17 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
                     field_key_seen = True
                 if _goal_matches(goal, status_filter, field_filter, raw_title,
                                  raw_desc):
+                    # STAMPED ON THE ROW, NOT SHOUTED ON STDERR. This endpoint's
+                    # entire response body is the JSON array, and a caller pipes
+                    # it — `2>/dev/null |` discards a warning, `2>&1 |` corrupts
+                    # the parse, and a pipeline's exit status is the LAST
+                    # command's, so a distinct rc vanishes too (guard-5596,
+                    # guard-1150). A key on the row rides the payload stream, is
+                    # additive (a consumer that ignores it is no worse off than
+                    # before), and cannot change the array shape any existing
+                    # reader depends on.
+                    row_unverified = (source_name == "agent"
+                                      and unverified_agent is not None)
                     if full_mode:
                         # Full-record read (): raw goal dict + {asp_id,
                         # source} metadata. Returns the canonical record
@@ -318,17 +345,20 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
                         # the guard possible was the flag that nullified a goal_id-keyed
                         # implementation of it. Emitted last, like asp_id/source, so a
                         # stray goal key cannot shadow it.
-                        results.append({**goal, "goal_id": goal.get("id", ""),
-                                        "asp_id": asp_id, "source": source_name})
+                        row = {**goal, "goal_id": goal.get("id", ""),
+                               "asp_id": asp_id, "source": source_name}
                     else:
-                        results.append({
+                        row = {
                             "goal_id": goal.get("id", ""),
                             "asp_id": asp_id,
                             "source": source_name,
                             "title": goal.get("title", ""),
                             "status": goal.get("status", ""),
                             "category": goal.get("category", ""),
-                        })
+                        }
+                    if row_unverified:
+                        row["read_from"] = UNVERIFIED
+                    results.append(row)
 
     # A FIELD NAME NO RECORD CARRIES IS A VACUOUS FILTER, NOT A CLEAN RESULT
     # (). Before this, `--goal-field goal_id ` returned `[]`
@@ -390,6 +420,36 @@ def query(ctx) -> "Response":  # type: ignore[name-defined]
         # became unreachable, and an unreachable branch reads as coverage while
         # signalling nothing. Its wording moved into that early refusal.
         return Response.error(400, "unknown_goal_field", detail)
+
+    # A ZERO FROM AN UNVERIFIABLE QUEUE IS NOT A MEASUREMENT ( item 2).
+    # The row stamp above covers every row that comes BACK; it cannot cover the
+    # answer that is dangerous precisely because it has no rows. "No such goal"
+    # and "the newest rows never reached this box" imply OPPOSITE actions, and
+    # this endpoint already refuses rather than answers in both of the other
+    # places that distinction arises (`no_aspiration_store` 404,
+    # `unknown_goal_field` 400) for the same stated reason: the whole response
+    # body is the array, so there is nowhere a warning could go that a caller
+    # would read. This is the third.
+    #
+    # NARROWED TO AN IDENTITY LOOKUP ON PURPOSE (guard-1562 — enumerate what
+    # would NEWLY fire). On a worker Body this box owns ZERO agent dirs, so the
+    # unverified condition holds for essentially every `source=agent` read here;
+    # refusing every empty result would refuse the ordinary dedup and status
+    # sweeps whose empty answer is both common and legitimate, which is worse
+    # than the defect. An identity lookup is different in kind: it names a
+    # record the caller believes exists, its zero is already exceptional, and
+    # its zero is the measured incident — bravo's premise-supersession check
+    # read "CANNOT CHECK: no goal record returned for  (query
+    # succeeded, 0 rows)" against a goal that existed and had been CLOSED.
+    #
+    # A caller that genuinely wants the empty answer can still get it: filter by
+    # any other field, or read the queue authoritatively per the message.
+    if unverified_agent is not None and not results and field_key == "id":
+        return Response.error(
+            409, "agent_queue_unverified_empty",
+            f"no goal matched {raw_field_value!r} — but this is NOT a verified "
+            f"absence. " + unverified_detail(unverified_agent, "the queried"),
+        )
 
     # cmd_query uses ensure_ascii=True — match byte-for-byte.
     return Response.text(

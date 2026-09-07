@@ -58,6 +58,11 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
         --jsonl-path "$WORLD_DIR/guardrails.jsonl" \
         --field-names "utilization.times_helpful,utilization.times_cited,utilization.retrieval_count"
 
+# WHOLE-STORE READ BY DESIGN (g-115-3570) — NOT an unbounded-retrieval defect.
+# A RETIREMENT sweep must see every active guardrail: anything outside a bounded
+# top-K would be structurally exempt from retirement forever. Do NOT re-route this
+# through retrieve.sh; its caps (SUPPLEMENTARY_CAPS 20/40/80) are for RELEVANCE
+# ranking at decision time, which is the opposite of a corpus sweep.
 Bash: guardrails-read.sh --active
 For each guardrail with status: active:
   # Value-density criterion (guard-841) -- NOT bare v1 utilization_score (<0.20).
@@ -83,6 +88,8 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/audit-schema-gate.sh \
         --jsonl-path "$WORLD_DIR/reasoning-bank.jsonl" \
         --field-names "utilization.times_helpful,utilization.times_cited,utilization.retrieval_count"
 
+# WHOLE-STORE READ BY DESIGN (g-115-3570) — same contract as 1b above: a retirement
+# sweep needs the full active corpus, not a relevance-ranked slice.
 Bash: reasoning-bank-read.sh --active
 For each reasoning bank entry with status: active:
   # Value-density criterion (guard-841) -- NOT bare v1 utilization_score (<0.20).

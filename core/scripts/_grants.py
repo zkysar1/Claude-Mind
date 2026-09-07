@@ -343,6 +343,89 @@ def readable_scopes(grants: Sequence[Dict[str, Any]], from_env: str,
                    for g in query_grants(grants, from_env=from_env, to_env=to_env)})
 
 
+# ── Membership (,  P3) ───────────────────────────────────────
+# An agent's BASE is a world, and "being in an environment" IS holding a grant
+# into that environment-world -- so membership is DERIVED from the grant edges,
+# never stored beside them. That is the whole point: a second membership store
+# would be a parallel truth to drift against, and the drift would be silent
+# because both copies look authoritative (communication-clarity.md rule 5).
+#
+# Multi-environment membership therefore needs no new mechanism at all: N active
+# grants out of one base ARE membership in N environments. The resolver below is
+# a projection of the store, which is why it takes grants as DATA like every
+# other function here and cannot disagree with `check_influence` about who may
+# reach what.
+#
+# STATUS IS PART OF THE ANSWER, not a filter bolted on: a revoked grant is a
+# revoked membership, and `status="active"` (the default) is what makes those
+# the same event. Pass status=None for an audit read that wants revoked edges too.
+
+
+def memberships(grants: Sequence[Dict[str, Any]], base_env: str,
+                *, status: Optional[str] = "active") -> List[str]:
+    """Environment-worlds `base_env` is a member of, as normalized env ids.
+
+    Sorted and de-duplicated: one base may hold SEVERAL grants into the same
+    environment (different scopes), and membership is a set question, not a
+    count of edges.
+    """
+    if not base_env:
+        return []
+    return sorted({g.get("to_env")
+                   for g in query_grants(grants, from_env=base_env, status=status)
+                   if g.get("to_env")})
+
+
+# ---------------------------------------------------------------------------
+# Reach: membership joined against the deployment registry
+# ---------------------------------------------------------------------------
+#
+# THE REGISTRY IS PASSED IN, NEVER READ HERE. `core/config/environments/*.yaml`
+# is the deployment registry, and reading it needs a YAML parser plus a path
+# resolver -- both of which would end this module's purity (json + typing only),
+# and that purity is exactly what lets a gate import this module without binding
+# the caller's storage backend. The JOIN is policy and belongs here; the READ is
+# IO and belongs in grants.py. Same split as `memberships` vs `cmd_memberships`.
+
+
+def reach(grants: Sequence[Dict[str, Any]], base_env: str,
+          registered_envs: Iterable[str],
+          *, status: Optional[str] = "active") -> Dict[str, List[str]]:
+    """This base's multi-environment reach, joined against the registry.
+
+    TWO sources describe which environments a base relates to -- the grant store
+    (membership) and the deployment registry (addressability) -- and until they
+    are joined, nothing reports where they DISAGREE. Returns three sorted lists:
+
+      member_of  registered environments this base holds a grant into. This is
+                 the real multi-environment membership: a grant that names a
+                 world this deployment can actually address.
+      ungranted  registered peers with NO grant. This is the SEED LIST -- the
+                 relationships that exist operationally but are not yet recorded
+                 as grants. `world-contract.md` fixes the order as "seed the
+                 grants that describe existing relationships, THEN arm", so
+                 refusal cannot be switched on while this list is non-empty
+                 without severing channels that are already live.
+      dangling   grants naming environments the registry does not list. NOT an
+                 error: a peer can be retired from the registry while its grant
+                 survives. But it is not addressable, so counting it as
+                 membership would overstate reach -- which is the whole reason
+                 `member_of` intersects rather than just reporting the grants.
+
+    `base_env` is excluded from all three -- a world is not its own peer. That
+    rule lives HERE and not in the caller so there is exactly one place it can
+    be got wrong.
+    """
+    held = set(memberships(grants, base_env, status=status))
+    held.discard(base_env)
+    registered = {e for e in (registered_envs or []) if e and e != base_env}
+    return {
+        "member_of": sorted(held & registered),
+        "ungranted": sorted(registered - held),
+        "dangling": sorted(held - registered),
+    }
+
+
 def stamp_provenance(payload: Dict[str, Any], origin_env: str,
                      *, chain: Optional[Sequence[str]] = None,
                      source_trace_ids: Optional[Sequence[str]] = None,
@@ -360,6 +443,20 @@ def stamp_provenance(payload: Dict[str, Any], origin_env: str,
     out["source_trace_ids"] = list(source_trace_ids or [])
     out["contributor_ids"] = list(contributor_ids or [])
     return out
+
+
+# The store's FILENAME is canonical; its DIRECTORY is not knowable here.
+# `world/` is an external, per-agent configured path (path-resolution.md), so a
+# module constant holding a directory would be wrong on every box but one. The
+# caller passes the world dir it already resolved; this keeps the module pure
+# (no _paths import, no backend binding) while still giving the fleet ONE name.
+STORE_FILENAME = "grants.jsonl"
+
+
+def default_store_path(world_dir):
+    """The canonical grant store inside an already-resolved world directory."""
+    from pathlib import Path
+    return Path(world_dir) / STORE_FILENAME
 
 
 def load_grants(path) -> Tuple[List[Dict[str, Any]], Optional[str]]:

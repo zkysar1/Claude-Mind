@@ -89,7 +89,7 @@ done
 # "temp" for guard 6 — hence a nested temp/ inside this agent's own temp store,
 # which also keeps it self-cleaning and out of live agents/.
 echo "main() lane-2 file-list wiring (g-306-102):"
-TW="$(cd "$SCRIPT_DIR/../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wiretest-$$"
+TW="$(cd "$SCRIPT_DIR/../../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wiretest-$$"
 mkdir -p "$TW/temp/drained"
 : > "$TW/temp/drained/wire-old.md"
 touch -d '40 days ago' "$TW/temp/drained/wire-old.md"
@@ -133,7 +133,7 @@ echo "main() third-class watermark wiring (file default + flag override — guar
 # always-passed test argument leaves the code's DEFAULT untested — the default
 # here is reading temp/.drain-watermark, which is what every production caller
 # uses). Same MIND_AGENT_DIR fixture idiom as the lane-2 wiretest above.
-WT="$(cd "$SCRIPT_DIR/../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wmtest-$$"
+WT="$(cd "$SCRIPT_DIR/../../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wmtest-$$"
 mkdir -p "$WT/temp"
 printf 'x\n' > "$WT/temp/wmtest-orphan.jsonl"
 touch -d '200 minutes ago' "$WT/temp/wmtest-orphan.jsonl"

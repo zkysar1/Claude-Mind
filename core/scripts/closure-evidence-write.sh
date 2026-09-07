@@ -60,6 +60,17 @@ _SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_SELF/../.." && pwd)"
 SCRIPT_DIR="$PROJECT_ROOT/core/scripts"
 
+#  BELT: resolve `python3` independently of the CALLER's PATH. The
+# probe below pipes into a bare `python3`, and on a box where that name does not
+# resolve (measured: Git-bash, where /usr/bin is C:\Program Files\Git\usr\bin and
+# carries no python3) the probe emits NOTHING — which the caller could not tell
+# from "this goal has no note". One PATH prepend, guarded on the dir existing,
+# keeps the deliberate no-_paths.sh posture above intact. This is the belt; the
+# fail-CLOSED branch at the probe consumer is the braces, and it is the half that
+# must hold when python3 fails for a reason a shim cannot fix (a poisoned
+# PYTHONHOME, a daemon refusal, a timeout).
+[[ -d "$SCRIPT_DIR/.python-shim" ]] && PATH="$SCRIPT_DIR/.python-shim:$PATH"
+
 GOAL_ID=""
 SOURCE=""
 SUMMARY=""
@@ -176,6 +187,26 @@ else:
     sys.stdout.write("recurring=0 achieved=0\n")
 ' 2>/dev/null
     return 0
+}
+
+# . EMPTY PROBE OUTPUT IS PROOF OF PROBE FAILURE, and it needs no rc
+# plumbing: EVERY success path of the embedded Python above writes a
+# `recurring=N achieved=N` line FIRST — the parse-error path, the match path, and
+# the not-found for/else. So a run that produced no output at all cannot have
+# reached any of them. That makes the discriminator box-independent, which the
+# original trigger (a PATH with no python3) is not.
+#
+# WHY THIS IS NOT COVERED BY THE FAIL-OPEN COMMENT ON _probe_record. That comment
+# defends the fail-open direction on the SUPERSEDE branch only: a present note
+# with unreadable metadata yields recurring=0 and therefore REFUSES. It says
+# nothing about the WRITE-IF-EMPTY branch, and that is the branch a failed probe
+# lands in — the caller sees an empty note, concludes there is nothing to
+# protect, and overwrites whatever is actually on the record. Measured on Linux
+# 2026-09-07 by stubbing `python3` to exit 127 with everything else intact: a
+# 35-char note on the record was replaced by a 20-char verify summary, at rc=0,
+# under the message "outcome_note written".
+_probe_failed() {
+    [[ -z "${1//[[:space:]]/}" ]]
 }
 
 _probe_note() {
@@ -319,6 +350,21 @@ _ce_marker_ach() {
 }
 
 _record="$(_probe_record)"
+
+#  FAIL-CLOSED. Placed BEFORE the record is split, because after the
+# split a failed probe is indistinguishable from an absent note and the
+# write-if-empty branch below fires and CLOBBERS. Fail-closed is correct here and
+# the asymmetry is the whole argument: a declined write loses a narrative that is
+# still recoverable from the execution diary and the board, while a clobber
+# destroys a hand-written one irrecoverably.
+# rc stays 0 — this script is NON-FATAL BY CONTRACT (see the header) and callers
+# must not branch on it. What changed is only that it no longer fails open into a
+# destructive write.
+if _probe_failed "$_record"; then
+    echo "$PREFIX the record probe for $GOAL_ID produced no output, so an existing note cannot be ruled out — verify summary NOT written (fail-closed, g-115-9315). It is in the execution diary and the board." >&2
+    exit 0
+fi
+
 _meta="$(printf '%s\n' "$_record" | head -n 1)"
 _existing="$(printf '%s\n' "$_record" | tail -n +2)"
 

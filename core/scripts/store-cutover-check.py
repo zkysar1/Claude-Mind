@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _paths import PROJECT_ROOT  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402  (guard-580/581)
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
 ATTESTATION_MAX_AGE_DAYS = 30
 
@@ -250,8 +251,7 @@ def _live_body_sids(bodies: dict | None, now: datetime) -> list[str]:
     for sid, row in sorted(bodies.items()):
         if not isinstance(row, dict) or not isinstance(sid, str) or not sid:
             continue
-        when = _parse_ts(str(row.get("claimed_at") or "")
-                         .split("+")[0].split("Z")[0])
+        when = _parse_ts(str(row.get("claimed_at") or ""))
         if when is None:
             continue
         # A FUTURE stamp passes. Negative age means clock skew between boxes,
@@ -290,7 +290,10 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
     all, so a reader can always tell which predicate carried a verdict. Never
     make them equal.
     """
-    when = _parse_ts(ciso.split("+")[0].split("Z")[0])
+    # ciso is git's %cI, which always carries an offset. Hand-splitting it off
+    # kept the wall-clock reading (12:00+02:00 -> 12:00); _parse_ts CONVERTS to
+    # the real instant (-> 10:00). Identical on this UTC fleet, correct off it.
+    when = _parse_ts(ciso)
     if when is None:
         return {"proven": False, "reason": "unparseable_commit_date",
                 "commit": commit[:9]}
@@ -442,10 +445,7 @@ def derive_proof(agent: str, seam_commit: str, consumers: list[str],
 def _parse_ts(value):
     if not isinstance(value, str) or not value.strip():
         return None
-    try:
-        return datetime.fromisoformat(value.strip().replace("Z", ""))
-    except ValueError:
-        return None
+    return parse_naive_iso(value)
 
 
 # Diagnostic keys derive_proof already computes and the roster verdict used to

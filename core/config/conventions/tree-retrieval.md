@@ -141,6 +141,11 @@ results IS honest signal — do not pad). At deep:
 
 - **Sibling inclusion** (`_include_siblings` in `tree_match.py`): direct-match
   nodes (`exact_key`, `substring`, `entity_index`, `word_prefix`, `concept`)
+  — note `entity_index` is INERT (permanently `{}`, g-115-2047); it is listed
+  because the code path exists, but it contributes no matches. `embedding` was
+  expected to cover the same ground; measured 2026-09-05 it does NOT reach
+  title-absent declared entities (0 of 3 declaring nodes in the top 15), so that
+  retrieval capability is currently absent rather than relocated (g-115-6601).
   at depth ≥ 3 add their siblings. Parent- or sibling-included matches do
   NOT recursively pull more siblings.
 - **Parent inclusion** (`_include_parents`): every matched node adds its

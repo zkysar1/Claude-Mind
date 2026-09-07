@@ -153,12 +153,64 @@ def test_predicates_normalise_case_and_whitespace(messy):
 # ── the wiring: each consumer imports the RIGHT set ────────────────────────
 
 def test_the_sweep_imports_the_SETTLED_set_not_the_closed_one():
-    """The sweep's pipeline must not treat the transition backlog as done."""
+    """The sweep's PIPELINE must not treat the transition backlog as done.
+
+    NARROWED 2026-09-07 (g-115-3714), and the narrowing is the point rather than
+    a concession. This asserted a bare `"CLOSED_STATUSES" not in src` over the
+    WHOLE file, comments included. That is a proxy for the real invariant, and it
+    fails in both directions: it refused a prose mention of the name (which
+    changes no behaviour), while permitting `is_closed` to be called from inside
+    a heuristic (which would BE the regression, since the chain would then treat
+    `answered` as settled). The carrier axis added by g-115-3714 legitimately
+    needs the CLOSER's notion — "is anyone still owed an answer?" — and getting
+    it from the SSOT is exactly what the SSOT is for; the alternative is
+    re-inlining a literal set, which the next test forbids.
+
+    So the assertions below pin the behaviour instead of the token: the settled
+    set is what the pipeline imports, the closer's SET is never imported, and no
+    heuristic consults the closer's predicate.
+    """
     src = (SCRIPTS / "pending-questions-sweep.py").read_text(encoding="utf-8")
     assert "from _pending_question_status import SWEEP_SETTLED as TERMINAL_STATUSES" in src
-    assert "CLOSED_STATUSES" not in src, (
+    # The original regression shape: importing the closer's wider SET.
+    assert "import CLOSED_STATUSES" not in src, (
         "the sweep must not import the closer's wider set — that is the "
         "regression this goal measured")
+    assert "CLOSED_STATUSES as" not in src
+
+    # The invariant the token-grep could not express: the heuristic chain runs on
+    # the SETTLED notion only. `is_closed` may be used elsewhere in the file (the
+    # carrier axis), but never inside a heuristic, or the transition backlog
+    # silently reads as done.
+    import re as _re
+    heuristics = list(
+        _re.finditer(r"^def (_h_[a-z_]+)\(.*?(?=^def |\Z)", src, _re.S | _re.M)
+    )
+    # POSITIVE CONTROL, and it is not optional: a regex that matches nothing
+    # makes every assertion below vacuously true, so the check would report a
+    # pass on a population it never looked at. BOTH sides are derived from the
+    # code — the chain from the module's own HEURISTIC_CHAIN, the scanned set
+    # from the regex — never a hand-written count (guard-1638): a literal lower
+    # bound goes stale in the permissive direction the moment the chain grows.
+    sys.path.insert(0, str(SCRIPTS))
+    spec = importlib.util.spec_from_file_location(
+        "_pq_sweep_for_ssot", SCRIPTS / "pending-questions-sweep.py")
+    sweep = importlib.util.module_from_spec(spec)
+    sys.modules["_pq_sweep_for_ssot"] = sweep
+    spec.loader.exec_module(sweep)
+    chain_names = {h.__name__ for h in sweep.HEURISTIC_CHAIN}
+    scanned_names = {m.group(1) for m in heuristics}
+    assert chain_names, "HEURISTIC_CHAIN is empty — nothing to scan"
+    assert chain_names <= scanned_names, (
+        f"the body scan missed chain member(s) "
+        f"{sorted(chain_names - scanned_names)} — its silence on them is not "
+        f"evidence")
+    for match in heuristics:
+        body = match.group(0)
+        assert "is_closed" not in body, (
+            f"{match.group(1)} consults the CLOSER's predicate; heuristics must "
+            f"use TERMINAL_STATUSES (the settled set) so the transition backlog "
+            f"is not treated as done")
 
 
 def test_the_closer_imports_the_CLOSED_set():

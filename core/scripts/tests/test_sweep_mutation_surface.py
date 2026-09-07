@@ -252,3 +252,68 @@ def test_manual_fallback_derivation_is_project_rooted():
 
 if __name__ == "__main__":
     sys.exit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-v"]))
+
+
+def _load_sms_module():
+    """Load sweep-mutation-surface.py by path (hyphenated name is not importable)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_sms_g6448", str(SCRIPT))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# --------------------------------------------------------------------------
+#  DEFECT 2 -- the refusal filter must not be a bare-substring match
+#
+# REFUSAL_TYPE_MARKER was "refused", tested with `in`. guard-1923: never put a
+# bare common-English word in a matcher vocabulary. The error direction is the
+# point (guard-2860): an exact-list UNDER-match reports a phantom status change,
+# which is loud and correctable; a substring OVER-match SILENTLY DROPS a real
+# mutation type that happens to contain the word -- defeating guard-1231, which
+# exists so a terminal-status mutation reaches the goal's filer.
+#
+# NOT hypothetical. Enumerated in-tree 2026-09-07: the two genuine refusal types
+# both end in `_refused_stale_candidate` (monitor_stale_*, parent_supersession_*),
+# but FOUR other real types contain the bare word -- addressing_refused,
+# grant_refused, interior_node_refused, out_of_window_digest_refused. Any of them
+# joining a registered sweep log would vanish from the surface with no error.
+# --------------------------------------------------------------------------
+
+def test_genuine_refusal_types_are_still_skipped():
+    """The behaviour being preserved: both real refusal types must stay out."""
+    mod = _load_sms_module()
+    for t in ("monitor_stale_refused_stale_candidate",
+              "parent_supersession_refused_stale_candidate"):
+        assert mod.is_refusal_type(t), f"{t} must be treated as a refusal"
+
+
+def test_a_non_refusal_type_containing_the_word_is_NOT_dropped():
+    """THE REGRESSION PIN. Under the substring form every one of these was
+    silently skipped and never reached the filer."""
+    for t in ("addressing_refused", "grant_refused", "interior_node_refused",
+              "out_of_window_digest_refused"):
+        mod = _load_sms_module()
+        assert not mod.is_refusal_type(t), (
+            f"{t} is a real in-tree mutation type that does NOT mean 'this sweep "
+            "refused a stale candidate' -- a substring match drops it silently "
+            "(guard-1231 / guard-1923)")
+    # POSITIVE CONTROL: the naive predicate this replaces would swallow all four.
+    assert all("refused" in t for t in
+               ("addressing_refused", "grant_refused", "interior_node_refused",
+                "out_of_window_digest_refused"))
+
+
+def test_the_marker_is_no_longer_a_bare_english_word():
+    """guard-1923 directly: the token must be specific enough that a new type
+    joins the refusal surface deliberately, not by accident of vocabulary."""
+    mod = _load_sms_module()
+    assert mod.REFUSAL_TYPE_SUFFIX == "_refused_stale_candidate"
+    assert not hasattr(mod, "REFUSAL_TYPE_MARKER"), (
+        "the bare-substring marker is back")
+
+
+def test_empty_and_missing_types_are_not_refusals():
+    mod = _load_sms_module()
+    for t in ("", None):
+        assert not mod.is_refusal_type(t)

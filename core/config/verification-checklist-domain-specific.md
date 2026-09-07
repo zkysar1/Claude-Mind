@@ -9,7 +9,8 @@ reference catalog).
 `/verify-learning` Step 1 loads three files in order:
 
 1. `core/config/verification-checklist.md` — framework reference catalog
-   (active checks live inline in `verify-learning/SKILL.md` Step 3)
+   (active checks live in the registry `core/config/verify-learning-checks.jsonl`,
+   moved out of `verify-learning/SKILL.md` on 2026-08-18 — g-115-6689, guard-4767)
 2. `core/config/verification-checklist-domain-specific.md` — **this file**:
    universal starter checks + commented-out examples of deployment-specific
    shapes

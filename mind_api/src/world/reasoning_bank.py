@@ -98,6 +98,73 @@ def _counters(ctx, kind):
         return {}
 
 
+def _live_util(rec, counters):
+    """Return `rec` with `utilization` replaced by the LIVE sidecar view ().
+
+    THE EMBEDDED BLOCK IS A FROZEN PRE-SPLIT SNAPSHOT and the sidecar wins by
+    design (`_utilization_store.utilization_of`). Every read surface an agent
+    actually uses emitted the frozen copy: this module returned the stored
+    record verbatim, and `endpoints/retrieve.py` computes the merged value at
+    :487 but spends it on RANKING and never puts it on the emitted record. So
+    the counters were loaded, used to sort, and discarded before the response
+    was written — correct-looking code producing a stale answer.
+
+    MEASURED 2026-09-06 (cc-10) on guard-4956, one call apart: embedded read
+    times_active 7 / times_helpful 0 / retrieval_count 0 against a live sidecar
+    of 12 / 14 / 21. Corpus-wide, 5,559 of 5,600 active guardrails (99.3%)
+    disagree between the two surfaces, and they disagree in BOTH directions —
+    guard-3419 reads times_active 16 embedded against 8 live while its
+    retrieval_count reads 21 against 29 — so "the embedded copy looks too low"
+    is not available as a tell.
+
+    WHY THIS MATTERS MORE THAN A DISPLAY BUG: `retrieve-before-deciding.md`
+    makes this the pre-decision consult, `code-review-protocol.md` step 4 then
+    says to increment `times_helpful` on reinforcing entries, and guard-1652
+    says to read the utilization block before building enforcement. The
+    prescribed CREDIT action and the prescribed VERIFY surface disagreed, in
+    the most-travelled consultation path in the loop (guard-4956).
+
+    MERGE RATHER THAN STRIP. Stripping would also satisfy "stop emitting stale
+    counters", but three standing instructions tell a reader to READ this block;
+    removing it breaks them all and leaves the reader to discover the sidecar
+    unaided. Merging keeps the instruction working and makes it true.
+
+    COPY, NEVER MUTATE — `_load` returns the SHARED jsonl cache list, so writing
+    onto a record in place leaks the merged block into every later reader of
+    that cache entry (the same hazard the `_displacement_notice` branch below
+    already copies to avoid).
+
+    Fail-open in every direction: an import failure, a raising `utilization_of`,
+    a non-dict record, or an empty merged view all yield the record UNCHANGED —
+    i.e. exactly today's behaviour. `utilization_of` already falls through to
+    the embedded field when the sidecar has no entry, so an absent sidecar is
+    not a regression, and a cosmetic counter must never take down a read.
+    """
+    if not isinstance(rec, dict):
+        return rec
+    try:
+        from _utilization_store import utilization_of
+    except ImportError:
+        return rec
+    try:
+        live = utilization_of(rec, counters)
+    except Exception:
+        return rec
+    if not isinstance(live, dict) or not live:
+        return rec
+    out = dict(rec)
+    out["utilization"] = live
+    return out
+
+
+def _live_util_many(recs, counters):
+    """`_live_util` over a list, preserving order. Counters are loaded ONCE by
+    the caller — `load_counters` re-reads a 1.7 MB sidecar on a cold process
+    (measured 0.454s cold, 0.018s warm), so loading per record would turn a
+    list read into thousands of reloads."""
+    return [_live_util(r, counters) for r in recs]
+
+
 def _store_paths(ctx, kind):
     """Ordered content-store paths for `kind`, legacy ALWAYS first.
 
@@ -187,7 +254,9 @@ def rb_read(ctx) -> "Response":  # type: ignore[name-defined]
 
     if flag(q, "active"):
         items = _load(jc, paths)
-        return json_response_pretty([r for r in items if r.get("status") == "active"])
+        return json_response_pretty(_live_util_many(
+            [r for r in items if r.get("status") == "active"],
+            _counters(ctx, "reasoning-bank")))
 
     rec_id = q.get("id")
     if rec_id:
@@ -207,12 +276,14 @@ def rb_read(ctx) -> "Response":  # type: ignore[name-defined]
             # or the notice leaks into every later reader of this record.
             rec = dict(rec)
             rec["_displacement_notice"] = displacement_notice(rec_id, displacers)
-        return json_response_pretty(rec)
+        return json_response_pretty(_live_util(rec, _counters(ctx, "reasoning-bank")))
 
     category = q.get("category")
     if category:
         items = _load(jc, paths)
-        return json_response_pretty([r for r in items if r.get("category") == category])
+        return json_response_pretty(_live_util_many(
+            [r for r in items if r.get("category") == category],
+            _counters(ctx, "reasoning-bank")))
 
     if flag(q, "universal"):
         items = _load(jc, paths)
@@ -221,8 +292,12 @@ def rb_read(ctx) -> "Response":  # type: ignore[name-defined]
         # sort_universal_rbs mutates the list in place — make a private copy
         # because items came from the shared cache.
         filtered = list(filtered)
-        sort_universal_rbs(filtered, _counters(ctx, "reasoning-bank"))
-        return json_response_pretty(filtered)
+        # One load, both uses: this path already loaded counters to SORT by
+        # them, which is exactly the  seam — the live values were
+        # computed, spent on ordering, then discarded before emission.
+        _ctrs = _counters(ctx, "reasoning-bank")
+        sort_universal_rbs(filtered, _ctrs)
+        return json_response_pretty(_live_util_many(filtered, _ctrs))
 
     tag = q.get("tag")
     if tag:
@@ -237,7 +312,8 @@ def rb_read(ctx) -> "Response":  # type: ignore[name-defined]
                 continue
             if any(tag_lower == str(t).lower() for t in tags):
                 out.append(r)
-        return json_response_pretty(out)
+        return json_response_pretty(
+            _live_util_many(out, _counters(ctx, "reasoning-bank")))
 
     if flag(q, "summary"):
         items = _load(jc, paths)
@@ -262,7 +338,8 @@ def rb_read(ctx) -> "Response":  # type: ignore[name-defined]
         active = [r for r in items if r.get("status") == "active"]
         # Make a copy before sort — items is the shared cache list.
         active = sorted(active, key=lambda r: r.get("created", ""), reverse=True)
-        return json_response_pretty(active[:n])
+        return json_response_pretty(
+            _live_util_many(active[:n], _counters(ctx, "reasoning-bank")))
 
     # COUNT — the cheap answer to "how many records are in this store".
     # Added for : agent-completion-report step 7 wanted three integers
@@ -295,7 +372,9 @@ def guard_read(ctx) -> "Response":  # type: ignore[name-defined]
 
     if flag(q, "active"):
         items = _load(jc, paths)
-        return json_response_pretty([r for r in items if r.get("status") == "active"])
+        return json_response_pretty(_live_util_many(
+            [r for r in items if r.get("status") == "active"],
+            _counters(ctx, "guardrails")))
 
     rec_id = q.get("id")
     if rec_id:
@@ -315,12 +394,14 @@ def guard_read(ctx) -> "Response":  # type: ignore[name-defined]
             # or the notice leaks into every later reader of this record.
             rec = dict(rec)
             rec["_displacement_notice"] = displacement_notice(rec_id, displacers)
-        return json_response_pretty(rec)
+        return json_response_pretty(_live_util(rec, _counters(ctx, "guardrails")))
 
     category = q.get("category")
     if category:
         items = _load(jc, paths)
-        return json_response_pretty([r for r in items if r.get("category") == category])
+        return json_response_pretty(_live_util_many(
+            [r for r in items if r.get("category") == category],
+            _counters(ctx, "guardrails")))
 
     severity = q.get("severity")
     if severity:
@@ -334,10 +415,11 @@ def guard_read(ctx) -> "Response":  # type: ignore[name-defined]
         # non-canonical straggler written by an unmigrated box.
         want = str(severity).upper()
         items = _load(jc, paths)
-        return json_response_pretty([
+        return json_response_pretty(_live_util_many([
             r for r in items
             if r.get("status") == "active"
-            and str(r.get("severity") or "").upper() == want])
+            and str(r.get("severity") or "").upper() == want],
+            _counters(ctx, "guardrails")))
 
     if flag(q, "summary"):
         items = _load(jc, paths)

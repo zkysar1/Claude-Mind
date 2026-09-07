@@ -36,11 +36,28 @@ if hasattr(sys.stdout, "reconfigure"):
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
+from _paths import CORE_ROOT, WORLD_DIR, AGENT_DIR  # noqa: E402
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 DEFAULT_SILENCE_HOURS = 6
-DEFAULT_TARGET_ASP = "asp-001"   # framework-maintenance home
+# The framework-maintenance home is RESOLVED per deployment, never hardcoded:
+# this is a FRAMEWORK file that travels the promotion chain, so a
+# deployment-specific literal either breaks downstream or is clobbered by the
+# next sync (). MEASURED HERE 2026-09-07: this site was NOT live-broken —
+#  is in the world ARCHIVE and live in the agent queue, and
+# _source_for_aspiration() scans LIVE stores only, so it correctly returned
+# "agent". The defect is portability plus a latent ordering hazard: that scan is
+# world-first with NO status filter, so a deployment whose LIVE world store
+# carries a retired  resolves to "world" and files into a queue nothing
+# selects from. resolve() applies the liveness filter this one lacks
+# (). Only the id is resolved here — _source_for_aspiration() below
+# derives the --source and must keep doing so for an operator-supplied
+# --target-asp.
+try:
+    from _escalation_target import resolve as _resolve_asp  # noqa: E402
+    DEFAULT_TARGET_ASP, _ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+except Exception:
+    DEFAULT_TARGET_ASP, _ASP_VIA = "asp-001", "fallback:import-failed"
 DEFAULT_PRIORITY = "MEDIUM"
 DEFAULT_CATEGORY = "framework-maintenance"
 

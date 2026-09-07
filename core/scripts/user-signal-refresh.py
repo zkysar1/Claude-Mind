@@ -75,6 +75,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+# Binds only the FUNCTION name; the module-level `_dt` alias above (stdlib
+# datetime) is untouched by a `from _dt import ...` form.
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
+
 # Matches the framework's goal-id format (2-4 digit tail per CLAUDE.md "ID Formats").
 GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,4}\b")
 SILENCE_HOURS = 48
@@ -94,10 +98,7 @@ def _parse_date(val) -> _dt.datetime | None:
             return _dt.datetime.strptime(s[:len(fmt) + 2].strip(), fmt)
         except ValueError:
             continue
-    try:
-        return _dt.datetime.fromisoformat(s.replace("Z", ""))
-    except Exception:
-        return None
+    return parse_naive_iso(s)
 
 
 def extract_goal_ids(entry: dict) -> list:

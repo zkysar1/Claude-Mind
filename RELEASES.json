@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.64",
+    "previous_version": "2.12.63",
+    "date": "2026-09-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fix: vessel daemons bricked on Python 3.9 by PEP 604 unions in runtime annotations (ec14f563bf, 8 modules, future-import added); ships the inbound-drain family (member directives reach a stopped Mind); Pearl B2c critical path",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.63",
     "previous_version": "2.12.62",
     "date": "2026-09-05",

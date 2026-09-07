@@ -89,6 +89,13 @@ CORPUS_STEPS = ("Step 3: Evidence Check", "Step 4: Summary Report")
 # the record they belong to. No state machine, nothing to get out of sync.
 RECORD_MIN_INDENT = 1
 
+# The kinds that can OWN a body line. Extracted to a constant for the same
+# reason `_classify_record` was (): `parse` and `load_registry` both
+# derive `parent_seq` from "the most recent record-kind line", and if the two
+# ever disagree about which kinds those are, `verify`'s fixed point breaks with
+# a divergence that looks like data corruption rather than a code split.
+_RECORD_KINDS = ("check", "bash_named", "bash_bare")
+
 
 def _indent(line: str) -> int | None:
     """None for a blank line; otherwise the leading-whitespace width."""
@@ -171,7 +178,7 @@ def parse(text: str):
             if k:
                 kind, cid = k, c
 
-        if kind in ("check", "bash_named", "bash_bare"):
+        if kind in _RECORD_KINDS:
             last_record = seq
 
         blocks.append({"seq": seq, "kind": kind, "step": step,
@@ -205,22 +212,47 @@ _CODE_STEP = {c: s for s, c in _STEP_CODE.items()}
 
 
 def _slim(b: dict) -> dict:
-    out = {"q": b["seq"], "k": b["kind"], "raw": b["raw"]}
+    # `seq` and `parent_seq` are DERIVED, never stored. Both are pure functions
+    # of record ORDER — `parse` increments seq on every line through every
+    # branch without exception, and parent_seq is only ever the index of the
+    # most recent _RECORD_KINDS line — so storing them adds no information and
+    # costs the entire file on every insertion: each new record renumbered every
+    # later one, turning a 2-record addition into a 1322-insertion /
+    # 1320-deletion diff. A huge SYMMETRIC diff on a store nobody bulk-edited is
+    # the documented tell for this mutation class (guard-1005, the "positionally
+    # indexed regenerated corpus" model).
+    #
+    # That is not cosmetic. This store is fence-only — `merge_handler_for`
+    # returns None, so there is no reconciler below the write and git resolves
+    # it line-by-line. Two boxes adding a check in the same window therefore
+    # conflicted on nearly every line, and the losing box could not push AT ALL:
+    # measured 2026-09-05, `behind` grew 40 -> 85 in 26 minutes while `ahead`
+    # sat at 5, stranding every unrelated store write that session.
+    #
+    # Deriving on read also makes the fields incorruptible. The stored `p` had
+    # already drifted on 83 records — a hand-splice renumbered `q` but not `p` —
+    # which broke `verify`'s own fixed point (seq 9689 claimed parent 9686, an
+    # unrelated `Check:` line, instead of the `Bash (...)` line it continues).
+    # A field that is recomputed cannot drift from its source.
+    out = {"k": b["kind"], "raw": b["raw"]}
     if b.get("step") in _STEP_CODE:
         out["s"] = _STEP_CODE[b["step"]]
     elif b.get("step"):
         out["S"] = b["step"]
-    for src, dst in (("section", "x"), ("id", "i"), ("parent_seq", "p")):
+    for src, dst in (("section", "x"), ("id", "i")):
         if b.get(src) is not None:
             out[dst] = b[src]
     return out
 
 
-def _fat(o: dict) -> dict:
+def _fat(o: dict, seq: int, parent: int | None) -> dict:
+    # Any `q`/`p` still present from a pre-migration registry is IGNORED rather
+    # than trusted: position and parentage come from the record's place in the
+    # file, so an old — or a merge-staled — stored value cannot mislead a reader.
     return {
-        "seq": o["q"], "kind": o["k"], "raw": o["raw"],
+        "seq": seq, "kind": o["k"], "raw": o["raw"],
         "step": _CODE_STEP.get(o["s"]) if "s" in o else o.get("S"),
-        "section": o.get("x"), "id": o.get("i"), "parent_seq": o.get("p"),
+        "section": o.get("x"), "id": o.get("i"), "parent_seq": parent,
     }
 
 
@@ -230,8 +262,20 @@ def load_registry(path: Path = None):
     # this at another file — a test, a positive control, an archived copy —
     # silently reads the real registry and reports a pass. Measured: four
     # deliberate corruptions all "verified OK" through that path.
-    return [_fat(json.loads(l)) for l in
-            (path or REGISTRY).read_text(encoding="utf-8").splitlines() if l.strip()]
+    raw = [json.loads(l) for l in
+           (path or REGISTRY).read_text(encoding="utf-8").splitlines() if l.strip()]
+    # Derive seq + parent_seq with the SAME walk `parse` uses, so the two are
+    # one function of one ordering and `verify`'s fixed point cannot drift.
+    # `last` is deliberately not reset at a step header or on leaving the corpus
+    # region, because `parse` does not reset it either — a body line may point
+    # back to a record in an earlier step, and reproducing that exactly is the
+    # whole point of deriving rather than re-inventing.
+    blocks, last = [], None
+    for i, o in enumerate(raw):
+        blocks.append(_fat(o, i, last if o["k"] == "body" else None))
+        if o["k"] in _RECORD_KINDS:
+            last = i
+    return blocks
 
 
 def regenerate(blocks) -> str:
@@ -469,25 +513,28 @@ def cmd_add(args) -> int:
     kind, cid = _classify_record(raw)
     new.append({"kind": kind, "raw": raw, "id": cid})
 
-    shift = len(new)
+    n_new = len(new)
     base = blocks[at - 1]["seq"]
-    for i, n in enumerate(new):
+    for n in new:
         # `id` is the bash_named capture from _classify_record — preserve it.
         # This used to hardcode None, which erased the id even when the kind
         # was right, so `verify`'s round trip could not reconstruct the line.
-        n.update({"seq": base + 1 + i, "step": base and blocks[at - 1]["step"],
-                  "section": args.section, "id": n.get("id"), "parent_seq": None})
+        # `seq`/`parent_seq` are deliberately NOT set: nothing between here and
+        # the write reads them, and `_slim` no longer stores them.
+        n.update({"step": base and blocks[at - 1]["step"],
+                  "section": args.section, "id": n.get("id")})
 
+    # No tail renumbering. The loop that used to sit here rewrote `seq` (and
+    # `parent_seq`) on every later block, which is precisely what turned a
+    # 1-record insertion into a whole-file diff and wedged concurrent boxes on a
+    # store with no merge handler. Both fields are derived at load, so an
+    # insertion now costs exactly the lines it inserts.
     tail = blocks[at:]
-    for b in tail:
-        b["seq"] += shift
-        if b.get("parent_seq") is not None:
-            b["parent_seq"] += shift
 
     out = blocks[:at] + new + tail
     if args.dry_run:
-        print(f"DRY RUN — would insert {shift} block(s) after seq {base} in section "
-              f"{args.section}, shifting {len(tail):,} later block(s) by {shift}")
+        print(f"DRY RUN — would insert {n_new} block(s) after seq {base} in section "
+              f"{args.section}; {len(tail):,} later block(s) unchanged")
         for n in new:
             print(f"  + {n['raw']}")
         return 0
@@ -496,7 +543,7 @@ def cmd_add(args) -> int:
         "".join(json.dumps(_slim(b), ensure_ascii=False) + "\n" for b in out),
         encoding="utf-8")
     c = sum(1 for b in out if b["kind"] in ("check", "bash_named"))
-    print(f"added {shift} block(s) to section {args.section}; corpus_checks now {c:,} "
+    print(f"added {n_new} block(s) to section {args.section}; corpus_checks now {c:,} "
           f"({len(out):,} blocks). Run `verify` to confirm the round trip.")
     return 0
 

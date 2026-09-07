@@ -46,14 +46,42 @@ fi
 # it falls back to a trimmed exact-string compare so a non-JSON edge never
 # crashes the gate. python3 here is sanctioned -- this .sh sources _paths.sh
 # (CLAUDE.md python-invocation rule; matches fresh-eyes-record-tick.sh:89).
+#
+# : the READ-BACK side is ALWAYS JSON (wm-read.sh --json encodes it),
+# the WRITTEN side is the raw stdin value. So a plain string round-trips as
+# 16:30:30 -> "16:30:30", json.loads(a) RAISES on the bare token, and the old
+# except-branch fell through to a trimmed EXACT-STRING compare of 16:30:30
+# against "16:30:30" -- a guaranteed mismatch for every non-JSON-scalar value.
+# Values that happen to be valid JSON (42, true) compared fine, which is why the
+# false ERROR looked intermittent rather than total; it fired on exactly the
+# plain-string cadence stamps this wrapper exists to guard.
+# That except-branch is guard-3970's shape: a fallback chain is an ENUMERATION
+# CLAIM ("if it is not JSON, exact-compare is the right test"), not a safe
+# default. The normalizer is now TOTAL over both sides (rb-1915) -- decode the
+# read-back first, then accept a match on decoded==decoded, decoded==raw, or
+# raw==raw, so a genuine drop still fails while a healthy write no longer does.
 _values_match() {
     python3 -c '
 import json, sys
 a, b = sys.argv[1], sys.argv[2]
-try:
-    print("1" if json.loads(a) == json.loads(b) else "0")
-except Exception:
-    print("1" if a.strip() == b.strip() else "0")
+
+def dec(s):
+    try:
+        return json.loads(s), True
+    except Exception:
+        return s.strip(), False
+
+rb, _ = dec(b)          # read-back: JSON by construction
+va, a_was_json = dec(a) # written value: raw stdin, JSON only by coincidence
+
+if a_was_json and va == rb:
+    print("1")
+elif isinstance(rb, str) and rb == a.strip():
+    print("1")           # the plain-string case the old branch got wrong
+elif a.strip() == b.strip():
+    print("1")           # both sides unparseable: the original fallback
+else:
+    print("0")
 ' "$1" "$2"
 }
 

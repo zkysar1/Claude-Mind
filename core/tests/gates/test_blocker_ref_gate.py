@@ -174,6 +174,69 @@ def test_non_string_state_hash_fails():
 
 
 # ---------------------------------------------------------------------------
+# Independent-failure accumulation ()
+# ---------------------------------------------------------------------------
+
+def test_independent_failures_are_reported_together():
+    """One rejection names EVERY independent defect, not just the first.
+
+    The defect this pins: validate() used to return on the FIRST failure, so
+    filing one malformed record took four successive rejections (measured
+    2026-07-29, g-335-513). Each message was already good; they just arrived
+    one at a time, so a caller could not fix the record in a single pass.
+    """
+    ok, err = validate({
+        "type": "made-up",        # 2. type enum
+        "blocker_type": "x",      # 1. unrecognized key
+        "state_hash": 99,         # 4. non-string state_hash
+        # 3. external_id absent entirely
+    })
+    assert ok is False
+    # Each message preserved VERBATIM as its own line — the substring pins in
+    # this file and in the two sibling test files depend on that.
+    assert "blocker_type" in err
+    assert "type must be one of" in err
+    assert "external_id must be a non-empty string" in err
+    assert "state_hash must be a string or null" in err
+    assert len(err.split("\n")) == 4, (
+        "one line per independent defect, so the caller sees all of them at "
+        f"once; got {err.split(chr(10))!r}"
+    )
+
+
+def test_single_defect_message_is_unchanged_by_accumulation():
+    """POSITIVE CONTROL for the change above (guard-4166).
+
+    The accumulation's effect is that extra round-trips STOP happening, and an
+    absence proves nothing on its own. This pins the other direction: a
+    single-defect input must still produce EXACTLY the original one-line
+    message — no join artifact, no trailing newline, no leading blank.
+    """
+    ok, err = validate({"type": "infrastructure", "external_id": 42})
+    assert ok is False
+    assert err == "blocker_ref.external_id must be a non-empty string"
+    assert "\n" not in err
+
+
+def test_short_circuit_checks_never_accumulate():
+    """The two checks that MUST short-circuit still return alone.
+
+    A non-JSON string and a non-dict cannot be key-iterated at all, so they
+    must not be folded into the accumulator — doing so would report defects
+    derived from a shape the caller never supplied.
+    """
+    ok, err = validate("[]")
+    assert ok is False
+    assert err == "blocker_ref must be a JSON object, got list"
+    assert "\n" not in err
+
+    ok, err = validate("{not json")
+    assert ok is False
+    assert "not valid JSON" in err
+    assert "\n" not in err
+
+
+# ---------------------------------------------------------------------------
 # log_unstructured_override — best-effort audit ledger
 # ---------------------------------------------------------------------------
 

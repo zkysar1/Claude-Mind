@@ -8,6 +8,7 @@ orphan-respawn cascade (g-115-764). These tests pin the four cases.
 """
 from __future__ import annotations
 
+import contextlib
 import gc
 import os
 import subprocess
@@ -101,3 +102,90 @@ def test_clear_is_noop_when_absent(project_root):
     pid_p, port_p = _files(project_root)
     assert not pid_p.exists()
     assert not port_p.exists()
+
+
+# --- : the finally clause must release the SOCKET before the FILES ---
+#
+# Defect (guard-6154, echo/cc-03 2026-09-06): Server.start()'s finally cleared
+# the discovery files while the listening socket was still bound. serve_forever()
+# returning does not mean the process is dying — it runs in a background thread,
+# and server.stop() (the only server_close() caller) runs LATER in the main
+# thread. Result: alive process + held port + no pid/port/parent.pid = the
+# guard-5681 orphan, and on a pinned port one orphan wedges every later restart.
+
+def _wait_published(project_root, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if lifecycle.is_daemon_alive(project_root):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_finally_releases_listening_socket_before_clearing_files(project_root):
+    """Normal exit: the port is genuinely re-bindable and the files are gone.
+
+    Re-binding the exact port is the arbiter — an assertion that the files were
+    removed says nothing about whether the socket was released, which is the
+    half that manufactures the orphan.
+    """
+    import socket
+    import threading
+    from mind_api.src.server import Server
+
+    srv = Server(project_root=project_root, port=0)
+    t = threading.Thread(target=srv.start, daemon=True)
+    t.start()
+    assert _wait_published(project_root), "daemon never published pid/port"
+    port = lifecycle.read_port(project_root)
+
+    srv._http.shutdown()          # make serve_forever() return -> finally runs
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "server thread did not exit"
+
+    pid_p, port_p = _files(project_root)
+    assert not pid_p.exists() and not port_p.exists(), "files should be cleared"
+
+    # THE POSITIVE CONTROL: the port must actually be free now.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))   # raises EADDRINUSE if still held
+    finally:
+        probe.close()
+
+
+def test_runtime_files_retained_when_socket_release_fails(project_root):
+    """THE NEW INVARIANT: if the socket cannot be confirmed released, the
+    discovery files are KEPT so the process stays findable.
+
+    An unreachable-but-findable daemon is recoverable — daemon-orphan-sweep.sh
+    builds its keep-set from exactly these files. An unfindable one holding a
+    pinned port is the total-work-stoppage class (guard-6154). If this
+    assertion ever flips back to "cleared", the orphan factory is reopened.
+    """
+    import threading
+    from mind_api.src.server import Server
+
+    srv = Server(project_root=project_root, port=0)
+    t = threading.Thread(target=srv.start, daemon=True)
+    t.start()
+    assert _wait_published(project_root), "daemon never published pid/port"
+
+    real_close = srv._http.server_close
+
+    def _boom():
+        raise OSError(9, "simulated close failure")
+
+    srv._http.server_close = _boom
+    try:
+        srv._http.shutdown()      # serve_forever() returns -> finally runs
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "server thread did not exit"
+
+        pid_p, port_p = _files(project_root)
+        assert pid_p.exists(), "pid file must be RETAINED when release is unconfirmed"
+        assert port_p.exists(), "port file must be RETAINED when release is unconfirmed"
+    finally:
+        srv._http.server_close = real_close
+        with contextlib.suppress(Exception):
+            real_close()

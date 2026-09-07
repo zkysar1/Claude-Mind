@@ -29,9 +29,17 @@ core/githooks/* text eol=lf
 # rewrites), changelog.jsonl (pruning), experience.jsonl (archival), and
 # aspirations.jsonl (RMW status updates) are NOT union-safe — a union there
 # would resurrect pruned/edited lines. Those RMW ledgers instead route to the
-# record-aware merge=ayoai-ledger driver below (g-115-2767), which unions them
-# by record/counter rather than by line — so they self-heal like the union
-# files without resurrecting pruned/edited history.
+# record-aware merge=ayoai-ledger driver below (g-115-2767).
+# CORRECTED IN PLACE (g-115-4357): this paragraph used to say the driver "unions
+# them by record/counter rather than by line — so they self-heal like the union
+# files without resurrecting pruned/edited history". That premise was measured
+# FALSE. Record-keying changes what counts as a DUPLICATE, never whether a
+# ONE-SIDED record SURVIVES, so an id-union resurrects exactly as thoroughly as a
+# line-union: reproduced on all three routed basenames (an archive sweep removal
+# and a journal rotation both came back; an experience-archive set_field edit was
+# silently REVERTED to its pre-edit form). What actually applies a removal is the
+# driver reading %O and dropping a record the BASE holds that one side no longer
+# does — which is why this routing is safe now and was not before.
 agents/*/skill-invocations.jsonl merge=union
 agents/*/health/*.jsonl merge=union
 
@@ -44,8 +52,26 @@ agents/*/health/*.jsonl merge=union
 # investigation: experience/changelog/meta conflicts stranded MIND commits
 # g-335-157..159). Driver registered per-clone by install-git-hooks.sh (git
 # driver config is NOT version-controlled, same mechanism as core.hooksPath).
-# NOT union — union resurrects pruned/archived/edited records (the exact reason
-# these are excluded from the union block above).
+# NOT union — a union resurrects pruned/archived/edited records (the exact reason
+# these are excluded from the union block above), and that is true of a
+# RECORD-keyed union as much as a line-keyed one. The driver is base-aware for
+# precisely this reason: %O is what separates "the peer never had this record"
+# from "the peer DELETED it" (g-115-4357).
+# SCOPE CORRECTED IN PLACE (g-115-9132): "the driver is base-aware" was true of
+# the driver but NOT of all six paths it routes. %O reaches merge_bytes and is
+# used by the _JSONL_ID_UNION branch, which covers experience / experience-archive
+# / journal (plus the counter file). changelog.jsonl and aspirations.jsonl have no entry in that
+# set: they resolve through coordination_merge.merge_handler_for, whose handler
+# signature is (local, remote) -> bytes and which therefore never sees the base at
+# all. Measured 2026-09-06 (alpha worker Body, cc-10) by driving merge_bytes with
+# a real base: a record the base held and one side retired came back on BOTH of
+# those paths, while the experience path correctly dropped it — the same
+# positive-controlled probe in one run. The driver now composes a base-aware
+# delete filter over the registry handler for exactly those two agent paths, so
+# the handler keeps its field-level merge and the removal still propagates. The
+# world queue is deliberately NOT in scope: its removal is represented out of band
+# (archive record + the daemon archive_sweep reconciler), which
+# coordination_merge.merge_aspirations documents at length.
 agents/*/experience.jsonl merge=ayoai-ledger
 agents/*/experience-archive.jsonl merge=ayoai-ledger
 agents/*/experience-meta.json merge=ayoai-ledger

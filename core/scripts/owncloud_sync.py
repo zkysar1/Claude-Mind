@@ -158,6 +158,22 @@ _EXCLUDE_NAMES = {
     "gate-firings.spool.jsonl",
     "gate-firings.spool.flushing.jsonl",
     "gate-firings.spool.last-flush",
+    # trigger-firings spool lane (g-358-79): the same shape and the same reason
+    # as gate-firings directly above — a per-box buffer drained into the SHARED
+    # meta/trigger-firings.jsonl by trigger-firings-flush.py. Syncing it would
+    # clobber peers' spools and re-create the franken-copy class the spool
+    # exists to avoid. The .flush.lock companion rides the *.lock glob below;
+    # the last-flush stamp needs an exact entry.
+    #
+    # Duplication direction matters here: a synced trigger spool duplicates
+    # telemetry LINES (the flusher dedups by serialized line, so the damage is
+    # bounded), not counter DELTAS — so this is the gate-firings severity, not
+    # the utilization severity described below. It goes in with the writer
+    # regardless, because "bounded" is not "harmless" and the entry costs
+    # nothing.
+    "trigger-firings.spool.jsonl",
+    "trigger-firings.spool.flushing.jsonl",
+    "trigger-firings.spool.last-flush",
     # utilization-counter spool lane (g-358-05): the same shape and the same
     # reason as gate-firings above, one lane per kind. Drained into the SHARED
     # world/<kind>-utilization.jsonl sidecars by utilization-flush.py.

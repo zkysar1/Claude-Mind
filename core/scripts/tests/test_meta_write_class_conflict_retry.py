@@ -55,6 +55,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import json
 import pytest
 import yaml
 
@@ -66,6 +67,7 @@ for _p in (str(_SCRIPTS), str(_ROOT)):
 
 import _conflict_fixture as CF  # noqa: E402  (shared conflict seam, )
 from mind_api.src.meta import meta_backpressure as BP   # noqa: E402
+from mind_api.src.meta import meta_dead_ends as DE      # noqa: E402  ()
 from mind_api.src.meta import meta_experiment as EX     # noqa: E402
 from mind_api.src.meta import meta_transfer as TR       # noqa: E402
 from mind_api.src.meta import strategy_apply as SA      # noqa: E402
@@ -144,7 +146,7 @@ def backend(monkeypatch):
 @pytest.fixture(autouse=True)
 def _quiet_side_effects(monkeypatch):
     """history/changelog/cruft-guard write outside the tmp tree; not under test."""
-    for mod in (BP, EX, TR, SA):
+    for mod in (BP, DE, EX, TR, SA):
         monkeypatch.setattr(mod.history, "snapshot", lambda *a, **k: None)
         monkeypatch.setattr(mod.changelog, "append", lambda *a, **k: None)
         monkeypatch.setattr(mod, "assert_not_cruft", lambda *a, **k: None)
@@ -618,6 +620,241 @@ def test_transfer_export_retry_preserves_a_peer_bundle(meta_dir, backend, monkey
 
 
 # ---------------------------------------------------------------------------
+# meta_dead_ends — the EIGHTH site, cured by  after 's own
+# structural check found it. dead-ends.jsonl is class (b) on both axes, and this
+# module is the first JSONL one in this suite (its siblings are all YAML), so the
+# force_fresh seam is _read_jsonl(force_fresh=True) rather than _read_yaml.
+#
+# It carries TWO shapes the YAML siblings do not:
+#   * increment/review read at MODULE SCOPE, outside the lock entirely — a
+#     strictly wider lost-update window than a bare in-lock read.
+#   * add DERIVES an id from the read (_next_id), and stamped it onto the
+#     request payload `item`, which is retry-visible state (guard-5322).
+# ---------------------------------------------------------------------------
+
+def _de_path(meta_dir):
+    return meta_dir / "dead-ends.jsonl"
+
+
+def _de_records(meta_dir):
+    p = _de_path(meta_dir)
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+
+
+def _seed_de(meta_dir, records):
+    _de_path(meta_dir).write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+
+
+def _de_rec(rid, strategy_file="a.yaml", field="f", status="active"):
+    return {"id": rid, "strategy_file": strategy_file, "field": field,
+            "failure_pattern": "seeded", "status": status, "times_matched": 0,
+            "category": "meta_weight", "registered": "2026-01-01T00:00:00"}
+
+
+def _de_body(strategy_file="z.yaml", field="zf", pattern="widget churn"):
+    return {"strategy_file": strategy_file, "field": field,
+            "failure_pattern": pattern}
+
+
+def test_dead_ends_add_refreshes_the_fence(meta_dir, backend):
+    """Invariant 1: the add cycle force-pulls instead of trusting the mirror."""
+    resp = DE.add(_ctx(meta_dir, _de_body()))
+
+    assert resp.status == 200, "add failed: {}".format(resp.body)
+    assert backend.refresh_calls >= 1, (
+        "add's cycle never called refresh() — it is fencing against the local "
+        "mirror, which is the rb-2639 stale-IfMatch wedge")
+    assert [r["id"] for r in _de_records(meta_dir)] == ["de-001"]
+
+
+def test_dead_ends_add_retries_a_conflict_and_lands_exactly_once(
+        meta_dir, backend, monkeypatch):
+    """Invariants 2+3: a conflict is absorbed, re-fenced, and applied ONCE."""
+    flaky, calls = _flaky(DE, fail_on={1})
+    monkeypatch.setattr(DE, "_atomic_write_with_fallback", flaky)
+
+    resp = DE.add(_ctx(meta_dir, _de_body()))
+
+    assert resp.status == 200, "conflict was not absorbed: {}".format(resp.body)
+    assert calls["n"] == 2, "conflict was not retried — add is still bare-locked"
+    assert backend.refresh_calls >= 2, (
+        "the retry did not RE-fence — retrying against the same stale token "
+        "conflicts identically forever (the deadlock, not a transient)")
+    ids = [r["id"] for r in _de_records(meta_dir)]
+    assert ids == ["de-001"], (
+        "the retry must apply the append exactly once: {}".format(ids))
+
+
+def test_dead_ends_add_read_happens_inside_the_lock(meta_dir, backend, monkeypatch):
+    """Invariant 3, at the assertion point that actually discriminates.
+
+    Hoisting the read out of the cycle while leaving refresh() and locked_rmw
+    intact leaves every other test here GREEN — a hoisted read still WRITES
+    under the lock, so only a READ-time assertion catches the revert.
+    """
+    events = []
+    real_refresh = backend.refresh
+    real_write = DE._atomic_write_with_fallback
+
+    def spy_refresh(p):
+        events.append(("read", bool(backend._held)))
+        return real_refresh(p)
+
+    def spy_write(path, write_fn, **kw):
+        events.append(("write", bool(backend._held)))
+        return real_write(path, write_fn, **kw)
+
+    monkeypatch.setattr(backend, "refresh", spy_refresh)
+    monkeypatch.setattr(DE, "_atomic_write_with_fallback", spy_write)
+
+    DE.add(_ctx(meta_dir, _de_body()))
+
+    kinds = [k for k, _ in events]
+    assert "write" in kinds, "nothing was written"
+    first_write = kinds.index("write")
+    rmw_reads = [held for k, held in events[:first_write] if k == "read"]
+
+    assert len(rmw_reads) >= 1, (
+        "no force_fresh read preceded the write — the cycle is not re-fencing")
+    assert all(rmw_reads), (
+        "a force_fresh READ happened with NO lock held ({}) — the read has been "
+        "hoisted out of the locked_rmw cycle".format(rmw_reads))
+    assert events[first_write][1], "the WRITE happened with no lock held"
+
+
+def test_dead_ends_add_retry_re_mints_id_against_peer_write(
+        meta_dir, backend, monkeypatch):
+    """guard-5322: the allocated id is DERIVED from the read, so it must be
+    re-derived per attempt.
+
+    This is the shape unique to add(). The pre-cure code stamped the id onto the
+    request payload `item`, which outlives the cycle — so attempt 2 saw
+    `"id" in item`, SKIPPED re-allocation, and re-wrote the id computed from the
+    PRE-CONFLICT snapshot. A CAS fence proves no lost update; it never proves a
+    derived value is unique.
+    """
+    _seed_de(meta_dir, [_de_rec("de-001")])
+
+    def peer_lands(path):
+        recs = _de_records(meta_dir)
+        recs.append(_de_rec("de-002", strategy_file="peer.yaml", field="pf"))
+        path.write_text("".join(json.dumps(r) + "\n" for r in recs),
+                        encoding="utf-8")
+
+    flaky, calls = _flaky(DE, fail_on={1}, side_effect=peer_lands)
+    monkeypatch.setattr(DE, "_atomic_write_with_fallback", flaky)
+
+    resp = DE.add(_ctx(meta_dir, _de_body()))
+
+    assert resp.status == 200, "conflict was not absorbed: {}".format(resp.body)
+    assert calls["n"] == 2, "conflict was not retried"
+    ids = [r["id"] for r in _de_records(meta_dir)]
+    assert "de-002" in ids, (
+        "THE PEER'S RECORD WAS LOST ({}) — the retry rewrote the file from a "
+        "pre-conflict snapshot".format(ids))
+    assert "de-003" in ids, (
+        "the id was NOT re-minted against the peer's landed write ({}) — the "
+        "allocation was carried across the retry on the request payload, so it "
+        "collides with the peer's de-002 (guard-5322)".format(ids))
+    assert len(ids) == len(set(ids)), "duplicate ids in the store: {}".format(ids)
+    assert json.loads(resp.body.decode("utf-8"))["id"] == "de-003", (
+        "the response reported the pre-conflict id, so `outcome` was "
+        "accumulated outside the cycle")
+
+
+def test_dead_ends_increment_read_moves_inside_the_cycle(
+        meta_dir, backend, monkeypatch):
+    """increment/review read at MODULE SCOPE before the cure — fully unlocked.
+
+    Asserted at READ time for the same reason as add: the pre-cure code still
+    WROTE under a lock (inside _persist), so a write-time assertion passes the
+    very revert it exists to catch.
+    """
+    _seed_de(meta_dir, [_de_rec("de-001")])
+    events = []
+    real_refresh = backend.refresh
+    real_write = DE._atomic_write_with_fallback
+
+    def spy_refresh(p):
+        events.append(("read", bool(backend._held)))
+        return real_refresh(p)
+
+    def spy_write(path, write_fn, **kw):
+        events.append(("write", bool(backend._held)))
+        return real_write(path, write_fn, **kw)
+
+    monkeypatch.setattr(backend, "refresh", spy_refresh)
+    monkeypatch.setattr(DE, "_atomic_write_with_fallback", spy_write)
+
+    resp = DE.increment(_ctx(meta_dir, query={"id": "de-001"}))
+
+    assert resp.status == 200, "increment failed: {}".format(resp.body)
+    kinds = [k for k, _ in events]
+    first_write = kinds.index("write")
+    rmw_reads = [held for k, held in events[:first_write] if k == "read"]
+    assert len(rmw_reads) >= 1, (
+        "increment never force-refreshed — its read is still the unlocked "
+        "module-scope _read_jsonl(ensure_local)")
+    assert all(rmw_reads), (
+        "increment READ with no lock held ({}) — the read is still outside the "
+        "cycle, which is a WIDER lost-update window than a bare in-lock read "
+        "because nothing serialises it at all".format(rmw_reads))
+    assert _de_records(meta_dir)[0]["times_matched"] == 1
+
+
+def test_dead_ends_review_retry_preserves_a_peer_write(
+        meta_dir, backend, monkeypatch):
+    """The lost-update pin for review: a peer's record must survive our retry."""
+    _seed_de(meta_dir, [_de_rec("de-001")])
+
+    def peer_lands(path):
+        recs = _de_records(meta_dir)
+        recs.append(_de_rec("de-009", strategy_file="peer.yaml", field="pf"))
+        path.write_text("".join(json.dumps(r) + "\n" for r in recs),
+                        encoding="utf-8")
+
+    flaky, calls = _flaky(DE, fail_on={1}, side_effect=peer_lands)
+    monkeypatch.setattr(DE, "_atomic_write_with_fallback", flaky)
+
+    resp = DE.review(_ctx(meta_dir, query={"id": "de-001"}))
+
+    assert resp.status == 200, "conflict was not absorbed: {}".format(resp.body)
+    assert calls["n"] == 2, "review did not retry the conflict"
+    recs = {r["id"]: r for r in _de_records(meta_dir)}
+    assert "de-009" in recs, (
+        "THE PEER'S RECORD WAS LOST ({}) — review's retry rewrote the file from "
+        "a pre-conflict snapshot".format(sorted(recs)))
+    assert recs["de-001"]["status"] == "reviewed", "our own review did not land"
+
+
+def test_dead_ends_read_only_callers_stay_on_ensure_local(meta_dir, backend):
+    """The default MUST stay ensure_local: check/read are hot read-only paths.
+
+    force_fresh defaults to False precisely so a probe read does not pay an S3
+    GET. Flipping the default would make every check() force-pull — correct but
+    expensive, and silently so. Pinned as an explicit COUNT, since a data-level
+    assertion cannot tell the two reads apart.
+    """
+    _seed_de(meta_dir, [_de_rec("de-001")])
+    before_refresh = backend.refresh_calls
+    before_ensure = backend.ensure_local_calls
+
+    DE.check(_ctx(meta_dir, query={"file": "a.yaml", "field": "f", "value": "1"}))
+    DE.read(_ctx(meta_dir, query={}))
+
+    assert backend.refresh_calls == before_refresh, (
+        "a read-only caller force-pulled ({} refreshes) — check/read must stay "
+        "on the cache-TTL ensure_local".format(
+            backend.refresh_calls - before_refresh))
+    assert backend.ensure_local_calls > before_ensure, (
+        "read-only callers did not go through ensure_local at all")
+
+
+# ---------------------------------------------------------------------------
 # SCOPE. These pin the DISCRIMINATOR behind leaving four class-(a) stores on a
 # bare lock, so a future audit reading only "these helpers look identical" does
 # not "complete" this goal by converting them.
@@ -635,7 +872,13 @@ def test_scope_write_classes_are_what_the_cure_assumed():
     fence_only = ["active-experiments.yaml",
                   "completed-experiments.yaml", "_index.yaml",
                   "reflection-strategy.yaml", "encoding-strategy.yaml",
-                  "aspiration-generation-strategy.yaml"]
+                  "aspiration-generation-strategy.yaml",
+                  # The eighth site, cured by . It was in the census
+                  # table and correctly classified all along — the parent goal
+                  # simply did not carry it into its target list, which is why
+                  # its own structural check found it and the enumeration did
+                  # not (guard-1715: read the COUNT, not the word "all").
+                  "dead-ends.jsonl"]
     # backpressure.yaml MOVED (b) -> (a) on 2026-07-31, when 's
     # f6d6bd7eb registered merge_backpressure. This test fired exactly as its
     # docstring intends and the re-derivation was done (): the handler

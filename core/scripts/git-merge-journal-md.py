@@ -21,8 +21,17 @@ WHY NOT merge=union. ``.gitattributes`` states the union scope is
 EVIDENCE-GATED: only files with ZERO historical deleted lines qualify, because
 union resurrects pruned/edited lines. Probing this path family over 6185
 commits found 1980 deleted content lines, so union is unsafe by the project's
-own stated rule. This driver unions by SECTION rather than by line, mirroring
-how git-merge-ayoai-ledger.py unions by record rather than by line.
+own stated rule. This driver merges by SECTION rather than by line, mirroring
+how git-merge-ayoai-ledger.py merges by RECORD rather than by line.
+
+CORRECTED 2026-09-06 (g-115-4357): this sentence used to say the ledger driver
+"unions by record", and until that goal it did — which is why record-keyed
+stores were laundered past the same evidence gate the paragraph above applies
+to line-keyed ones. A union RESURRECTS whatever the peer deleted, and the unit
+of resurrection (line vs record) does not change that. The ledger driver now
+does a base-aware 3-way merge on ``id``, so the mirroring below is TIGHTER than
+it was, not looser: both drivers read %O for exactly the same reason — to tell
+a DELETED entry from a never-present one.
 
 THE MODEL. The file is a sequence of ``## <heading>`` sections (in practice
 ``## HH:MM — Goal: ...``) under an optional preamble. Sections are keyed by

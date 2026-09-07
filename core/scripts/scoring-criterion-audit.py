@@ -248,10 +248,18 @@ def _get_dotted(record, dotted):
     """Walk dotted path through dicts. Present-but-null returns missing.
 
     Mirrors `jsonl-field-probe._get_dotted` AND `audit-schema-gate._get_dotted`
-    semantics — a field whose terminal value is None counts as ABSENT
-    (rb-245: "key present but never written" is operationally identical
-    to "key not in schema"). DO NOT change this — three call sites depend
-    on it.
+    on the NULL-TERMINAL rule only — a field whose terminal value is None
+    counts as ABSENT (rb-245: "key present but never written" is operationally
+    identical to "key not in schema"). DO NOT change that — three call sites
+    depend on it.
+
+    It no longer mirrors jsonl-field-probe's TRAVERSAL: that one descends lists
+    as of g-115-9120, this one stops at the first list. Deliberate — the
+    divergence is documented at the probe, and this file's return shape
+    (bool, single value) has no way to express N hits without changing all
+    three call sites. If a scored criterion ever needs a path through a list,
+    that is the change to make; until then the limitation is that such a path
+    reads as missing.
     """
     cur = record
     for seg in dotted.split("."):

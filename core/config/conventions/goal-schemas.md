@@ -1263,3 +1263,73 @@ Note `_dependency_graph.TERMINAL_STATUSES` must also list every terminal status,
 or `build_graph` keeps a closed goal in the adjacency map and it blocks its
 dependents forever — `superseded` and `decomposed` were both missing until
 2026-08-27.
+
+---
+
+### Fresh-Session-Only Marker (`requires_fresh_session`)
+
+A boolean goal field that keeps a goal OUT of the candidate pool once the
+current session has already closed a goal, and routes it to `blocked[]` with
+`block_reason: fresh_session_only` instead. Landed g-115-8482.
+
+**What it is for.** A goal whose terminal step is a MANDATORY destructive
+cleanup — terminating a live cloud instance, a bulk archive-then-delete — is
+unsafe to *begin* at the tail of a spent context, because losing context
+mid-unit orphans the resource. `guard-5683` states that as behaviour, and
+behaviour alone changed nothing structurally: four agents claimed and declined
+`g-368-28` for the same stewardship reason in one day (2026-08-31), and
+RELEASING refreshes the scorer's recency terms, so the goal returned at TOP
+eight minutes later with a HIGHER score (18.90 → 19.18). Each principled
+decline made the next re-offer stronger, and every claimant paid a full re-read
+first. This marker is the structural half.
+
+**Field**
+
+```yaml
+requires_fresh_session: true      # withheld once this session has closed a goal
+                                  # absent / false — no effect whatsoever
+```
+
+**Why not a `defer_reason`.** A defer re-probes on a cadence and fail-opens on
+a clock. That is right for a premise which is a WORLD condition ("is the
+service up yet?") and wrong here: nothing will ever become true. The
+discriminator, from the goal's own field evidence — *is there a world-state
+change that would make this goal safe? If yes it is a defer; if the only thing
+that must change is WHO IS LOOKING AT IT and WHEN, it is this marker.*
+`g-115-5735` demonstrated the failure from the other end: it HAD the nearest
+available suppressor (`deferred_until`) and the re-offer re-armed the moment
+that clock lapsed.
+
+**Selector behavior.** `goal-selector.py::_requires_fresh_session` is called
+from BOTH `collect_candidates` and `collect_blocked`, immediately before each
+`defer_reason` arm — outside it, deliberately. The marker test short-circuits,
+so an unmarked goal never reaches the session probe and ranking is unchanged.
+**SYMMETRY (g-115-3150): the two call sites must stay logical complements.** A
+suppressor wired into only one makes the goal fall out of BOTH lists — not a
+candidate there, not blocked here. Pinned by
+`core/scripts/tests/test_goal_selector_fresh_session_marker.py`, whose
+`test_marked_goal_is_in_exactly_one_list` fails on either one-site mutation.
+
+**Session signal, and its one known hole.** "Has this session closed a goal?"
+reads the IN-SESSION `goals_completed_this_session` working-memory list (never
+`load_recent_class_completions()`, which is a cross-session window and would
+suppress forever). The property that actually matters is REMAINING CONTEXT, not
+goals closed — so a long session that has closed nothing is still context-spent
+and will still be offered a marked goal. That gap is documented rather than
+papered over: the available context sensor is not trustworthy (it read `fresh`
+with 479,998 tokens of headroom through a measured exhaustion, g-115-8310), and
+a suppressor keyed on a lying sensor is worse than one keyed on an honest proxy
+whose limits are written down.
+
+**Set via**
+
+```
+bash core/scripts/aspirations-update-goal.sh --source world <goal-id> requires_fresh_session true
+```
+
+Registered in `core/scripts/_goal_fields.py::GOAL_KNOWN_FIELDS` — without that
+registration the update endpoint refuses the field and the suppressor is
+shipped-but-unreachable.
+
+**Backward compatibility.** Optional, default absent. Every goal without the
+marker collects, ranks and blocks exactly as before.

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Convert loop-stall-warnings.jsonl entries into Unblock: goals on .
+"""Convert loop-stall-warnings.jsonl entries into Unblock: goals.
 
 Closes the observability-to-backlog gap: stop-hook-analyze.sh writes
 <agent>/session/loop-stall-warnings.jsonl when it detects BLOCK streaks,
 but nothing reads that file. This filer reads unprocessed entries, files
-a HIGH-priority Unblock goal per entry on asp-240 (Cognitive-core hook
-reliability follow-ups), and marks the entry goal_filed so we don't
+a HIGH-priority Unblock goal per entry on the deployment's resolved
+escalation aspiration, and marks the entry goal_filed so we don't
 refile on the next sweep.
 
 Dedup rules:
-- Skip entry if asp-240 already has a goal tagged with matching
+- Skip entry if the target aspiration already has a goal tagged with matching
   stall:<sid>:<first_block_ts>.
 - Skip entry if another auto-filed stall goal was created for this agent
   within the last 24h (rate limit to avoid flood during a single session).
@@ -38,7 +38,25 @@ sys.path.insert(0, str(HERE))  # so `import _paths` finds the sibling module
 import _paths  # noqa: E402  — single source of truth for WORLD_DIR resolution
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
-TARGET_ASP_ID = "asp-240"
+# The escalation aspiration is RESOLVED per deployment, never hardcoded. This is
+# a FRAMEWORK file that travels the promotion chain, so a deployment-specific
+# constant either breaks downstream or is clobbered by the next sync ().
+#  was retired to the archive HERE, and read_asp() below scans only the
+# LIVE store, so main() returned rc=3 on every sweep of any box that had ever
+# written a warnings row — while stop-hook-analyze.sh:262-263 ||-swallowed that
+# rc into a clean exit. Stall observability failed closed exactly when it fired.
+# Repointing at a second literal would only move the breakage to the next lane
+# rotation; resolve() returns an aspiration that ACTUALLY EXISTS in whichever
+# queue holds it (, measured on two boxes).
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    TARGET_ASP_ID, _ASP_VIA = _resolve_asp(
+        _paths.CORE_ROOT, _paths.WORLD_DIR, _paths.AGENT_DIR)
+    TARGET_ASP_SOURCE = _asp_source(
+        TARGET_ASP_ID, _paths.WORLD_DIR, _paths.AGENT_DIR)
+except Exception:
+    TARGET_ASP_ID, _ASP_VIA, TARGET_ASP_SOURCE = (
+        "asp-240", "fallback:import-failed", "world")
 RATE_LIMIT_HOURS = 24
 DEFAULT_PRIORITY = "HIGH"
 DEFAULT_CATEGORY = "framework-patterns"
@@ -46,9 +64,16 @@ TAG_PREFIX = "stall:"
 AGENT_TAG_PREFIX = "stall-agent:"  # per-agent rate-limit key; every filed goal carries one
 
 
-def resolve_world_aspirations_path() -> Path:
-    """Delegate to _paths.WORLD_DIR — do not re-parse local-paths.conf here."""
-    return _paths.WORLD_DIR / "aspirations.jsonl"
+def resolve_target_aspirations_path(source: str = TARGET_ASP_SOURCE) -> Path:
+    """Delegate to _paths — do not re-parse local-paths.conf here.
+
+    The store must follow the RESOLVED source. Scanning the world store for an
+    agent-queue aspiration returns None and refuses rc=3 — the same
+    aspiration_not_found bug in a new costume (see _escalation_target
+    .source_flag). g-115-4216.
+    """
+    base = _paths.AGENT_DIR if source == "agent" else _paths.WORLD_DIR
+    return base / "aspirations.jsonl"
 
 
 def read_asp(world_asp_path: Path, asp_id: str) -> dict | None:
@@ -201,7 +226,8 @@ def build_goal(agent: str, warning: dict, last_goal_hint: str | None, now: datet
     }
 
 
-def file_goal(asp_id: str, goal: dict, override_just: str | None = None) -> str | None:
+def file_goal(asp_id: str, goal: dict, override_just: str | None = None,
+              source: str = TARGET_ASP_SOURCE) -> str | None:
     """File a goal via the daemon; returns the new goal id.
 
     Returns None only if the daemon returned an error (real framework break,
@@ -218,7 +244,7 @@ def file_goal(asp_id: str, goal: dict, override_just: str | None = None) -> str 
     overrides = {"Duplication": override_just} if override_just else None
     try:
         record = _rt.aspirations_add_goal(
-            asp_id, goal, source="world", overrides=overrides)
+            asp_id, goal, source=source, overrides=overrides)
     except _rt.RtError as e:
         sys.stderr.write(
             f"add-goal failed: {(e.body or str(e)).strip()[:400]}\n")
@@ -257,10 +283,12 @@ def main() -> int:
         print(f"stall-goal-filer: no warnings file at {warn_path}")
         return 0
 
-    world_asp_path = resolve_world_aspirations_path()
-    asp = read_asp(world_asp_path, TARGET_ASP_ID)
+    target_asp_path = resolve_target_aspirations_path()
+    asp = read_asp(target_asp_path, TARGET_ASP_ID)
     if asp is None:
-        sys.stderr.write(f"stall-goal-filer: {TARGET_ASP_ID} not found in {world_asp_path}\n")
+        sys.stderr.write(
+            f"stall-goal-filer: {TARGET_ASP_ID} not found in {target_asp_path} "
+            f"(resolved via {_ASP_VIA}, source={TARGET_ASP_SOURCE})\n")
         return 3
 
     warnings = []

@@ -1175,6 +1175,26 @@ solo 14/14 → environmental; the owned set is the same g-115-8698 / g-115-7127 
 `test_wrapper_aspirations_complete_needle`). Zero reds in the change's blast radius. HEAD did not move during the run
 (launched at 2ba6bc3b7, no commit or pull until the VERDICT was read).
 
+### 2026-09-06T13:58 — alpha WORKER Body, `hostname` cc-08, `uname -r` 6.8.0-138-generic, STORAGE_BACKEND=local pin, live fleet, LIVE DAEMON, chunk rung 16, for the g-358-62 outcome-5 gate (HEAD 2573504acd)
+`TOTAL: 21672 passed, 27 failed, 0 errors` / `VERDICT: GENUINE`; invisible-suites 128/128 files, 0 quarantined; domain half
+87/87 units, 1 skipped, 2440 passed / 0 failed (8/8 chunks); **zero `^FAIL` lines in either non-chunked half.** `--triage`:
+**0 environmental | 16 genuine-owned | 0 genuine-UNOWNED** — *"Nothing to file: every genuine red already has an owning
+goal"*; every file reported `recent commits (7d): none`. Wall clock ~49 min (13:58:22 → 14:47). Largest `passed` total
+recorded in this ledger to date (21,672 vs the 20,083 of 09-03), consistent with the `mind_api/tests` fold plus corpus growth
+— note item 5's warning that the TOTAL is not a cross-run comparison metric, so judge by the failing FILE SET, which is the
+same g-115-8698 / g-115-4336 / g-115-7218 population as the 09-03 rows.
+
+Two things worth carrying from this run. **(a) The distribution was SPREAD, not chunk-confined** — 12 of 16 chunks carried at
+least one failure (06 dominant at 10, 09 at 4, chunks 10/11/12 clean between them), which is the cc-08 2026-08-16 shape rather
+than the chunk-09-confined signature; the chunk-confinement tell would have UNDER-fired here, and `--triage`'s per-file solo
+re-runs are what carried the call instead (every one returned GENUINE, so the 0-environmental verdict is measured, not
+inferred). **(b) `guard-4774` and `guard-5866` are in DIRECT TENSION on a live-daemon box, and both came back from the same
+mandated MECHANISM query.** guard-4774 says a busy fleet box cannot gate a deep-code close from the live tree and prescribes a
+pinned worktree; guard-5866 says never pin a worktree where a `mind_api` daemon is live. An agent that retrieves guard-4774
+and stops does the harmful thing while believing it followed a guardrail. This run took the daemon-safe MAIN-REPO route and
+the live daemon was never disturbed — no worktree, no daemon kill, 0 errors — which is the empirical resolution: on a
+live-daemon box guard-5866 wins and guard-4774's remedy clause does not apply.
+
 ---
 
 **2026-09-03 (g-115-8738 — the worktree route DISTURBS the shared daemon; bravo cc-05 control + zeta cc-02 mechanism).** A pinned-worktree full-suite run (zeta, during g-115-8638) killed the live fleet daemon 3x (03:19:52 / 03:25:03 / 03:31:26, ~chunk boundaries) and threw 12 stale-port ERRORS in chunk 02. **Pre-registered one-variable control (bravo, cc-05, 04:00):** the SAME suite in the MAIN REPO — same commit/runner/4-chunk-split/box/live-daemon — killed the daemon **0x** and threw **0 errors**. Exact contrast: worktree chunk 02 `5617p/5f/12E` vs main-repo chunk 02 `5631p/5f/0E`. The worktree is the measured differentiator for BOTH symptoms, predicted in advance not fitted after. **Kill mechanism (zeta, CODE-confirmed, not real-time-traced):** `mind-api-start.sh:303 _sweep_orphan_daemons` matches `mind_api.src` processes purely by COMMAND LINE (`pgrep -f 'python.* -m mind_api\.src'` POSIX / `CommandLine -match 'mind_api\.src'` Windows) with NO runtime-dir/cwd filter, killing any PID not in the current spawn's {child,parent} pair (empty keep-args = "kill them all"). A worktree daemon spawn therefore reaps the live fleet daemon in any directory — so item 3's leading hypothesis is confirmed at the code path, though the kill itself was not caught in a live trace. **Stale-port half (measured):** the copied `daemon.port` is a one-time snapshot (guard-5702); when the live daemon recycles, the port changes and nothing refreshes the copy → probes hit an empty port → in-pytest spawn refusal (the 12 errors). **RECONCILES the alpha entry directly above** (which recommended the worktree-with-`daemon.port` route to avoid a *bare-solo-rerun* spawn storm): that remedy holds only while the copied port stays fresh — once it goes stale the worktree spawns its own daemon and the orphan sweep kills the live one. Neither non-main-repo route is safe on a live-daemon box. **REMEDY:** the daemon-safe MAIN-REPO route (`STORAGE_BACKEND=local`, chunked, `-m 'not daemon_integration'`) spawns no daemon, so it neither hijacks nor kills the live one — bravo's control IS that route. Behavioral rail: **guard-5866**. Bonus (bravo): failure COUNTS were identical across both environments (chunk 00: 5/5, 01: 14/14, 02: 5/5) — those 24 failures are environment-independent; only the 12 ERRORS were worktree artifacts, so a reader who dismissed the whole run as "worktree noise" would have discarded 24 real signals.

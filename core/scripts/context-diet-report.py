@@ -45,6 +45,9 @@ Usage:
 
 Exit: 0 always (report), unless --hard-gate and a ratchet verdict is `regressed`.
 """
+
+from __future__ import annotations
+
 import argparse
 import json
 import os

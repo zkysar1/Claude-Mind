@@ -92,7 +92,9 @@ _N3_ALLOWED_EXACT = frozenset({
     # server.start() unless MIND_API_TOKEN is set.
     "MIND_API_TOKEN", "MIND_API_BIND",
     # : the LAN object cache's CLIENT half. `OwnCloudBackend._cache_fetch`
-    # reads both (core/scripts/owncloud_backend.py:959,972) and the daemon IS the
+    # reads both (core/scripts/owncloud_backend.py, `_cache_fetch` — anchored by
+    # function name because the line numbers this cited had already drifted once,
+    # in the very change that added the TOKEN key below) and the daemon IS the
     # client on every box — but neither key was here, so setting the documented
     # flag in .env.local silently did nothing and the cache could only ever be
     # enabled by exporting into the launch env, "which is not where any other
@@ -103,6 +105,18 @@ _N3_ALLOWED_EXACT = frozenset({
     # allowed here, so backend-read OWNCLOUD_* keys belonging in this list is
     # established practice, not a new precedent. guard-1900 / guard-3485.
     "OWNCLOUD_OBJECT_CACHE", "OWNCLOUD_OBJECT_CACHE_TIMEOUT",
+    #  item 5, DECIDED (option B — decouple): the cache client's own
+    # Bearer credential, read in `OwnCloudBackend._cache_fetch` with a fallback
+    # to MIND_API_TOKEN. It exists so a CLIENT box can hold the cache credential
+    # WITHOUT setting MIND_API_TOKEN, which would additionally flip that box's
+    # own daemon to FR-4 auth-required at its next start — a fleet-wide posture
+    # change no goal decided, whose blast radius under daemon-only architecture
+    # is a total agent wedge. SECRET (a bearer token), so `_is_secret_env_key`
+    # below names it too; unlike the two non-secret keys above, this one's VALUE
+    # must never be printed. Same shared value as the host's MIND_API_TOKEN, so
+    # it is deliberately UNSCOPED (no `__AGENT` suffix): every client presents
+    # the same token to the one cache host.
+    "OWNCLOUD_OBJECT_CACHE_TOKEN",
     # : MIND_API_PORT pins the daemon's LISTEN port. Default-absent =>
     # 0 => the OS-assigned port this daemon has always used, so adding the key
     # changes nothing until someone sets it. It belongs on THIS surface for the
@@ -116,6 +130,22 @@ _N3_ALLOWED_EXACT = frozenset({
     # allowlist never receives the value; this defect's first three instances
     # were OWNCLOUD_PULL_EVERY_N and the OBJECT_CACHE pair right above).
     "MIND_API_PORT",
+    #  outcome 4: the LAN object cache's own size knobs, read at MODULE
+    # IMPORT in mind_api/src/endpoints/cache_object.py (_MAX_BYTES 4 GiB default,
+    # _MAX_OBJECT_BYTES 256 MiB). FIFTH instance of the guard-3485 class in this
+    # one feature — and the first found on the ENDPOINT surface rather than the
+    # entry point or the backend, which is why the pin missed it twice over: its
+    # ENV_READ_SOURCES did not scan mind_api/src/endpoints at all, AND its regex
+    # matched only OWNCLOUD_*, so this MIND_API_* pair escaped on BOTH axes.
+    # Both widened in mind_api/tests/test_owncloud_sync_controls.py this change;
+    # measured blast radius of the widening was exactly these two keys across all
+    # 24 endpoint modules, zero collateral (guard-1562/guard-2499).
+    # Not academic: measured live on cc-03 2026-09-07, the cache sat at 4.28 GB
+    # against a 4.29 GB cap (99.65%) with 1290 evictions in 2.42h holding
+    # hit_ratio at 0.60, on a box with 118G free — i.e. the one control that
+    # relieves the thrash was unreachable through .env.local, the documented
+    # channel. Non-secret integers, same class as MIND_API_PORT above.
+    "MIND_API_CACHE_MAX_BYTES", "MIND_API_CACHE_MAX_OBJECT_BYTES",
 })
 
 
@@ -124,7 +154,8 @@ _N3_ALLOWED_EXACT = frozenset({
 # loads is non-secret storage/config wiring. Same posture as fleet-config-parity,
 # which compares env by key NAME only and emits no secret value.
 def _is_secret_env_key(key: str) -> bool:
-    return key == "MIND_API_TOKEN" or key.startswith("MIND_AWS_")
+    return (key in ("MIND_API_TOKEN", "OWNCLOUD_OBJECT_CACHE_TOKEN")
+            or key.startswith("MIND_AWS_"))
 
 
 def _warn_if_inherited_overrides(key: str, file_val: str) -> None:
@@ -654,6 +685,22 @@ def _resolve_bind_port(cli_port, environ) -> int:
     (communication-clarity rule 5 — fail visibly over a silent inconsistent
     source). An EMPTY value is treated as unset, matching how ``_load_env_local``
     already treats a blank `.env.example`-style line.
+
+    CHOOSING THE VALUE: pin BELOW the OS ephemeral range, never inside it.
+    ``/proc/sys/net/ipv4/ip_local_port_range`` (Linux default 32768-60999) is the
+    band the kernel hands to OUTBOUND connections, so a port pinned inside it can
+    be transiently held by an unrelated socket at the moment this daemon
+    restarts -- and because the value is now PINNED rather than OS-assigned, the
+    bind FAILS instead of quietly landing elsewhere. That trades the fail-open
+    miss this key removes for a fail-to-start, which is worse. The trap is that
+    the natural value to reach for is the port the daemon already has: measured
+    2026-09-06 across a 10-box fleet, every OS-assigned daemon port observed
+    (34361, 34401, 34845, 36169, 37527, 38289, 38539, 38827, 43027, 43217) fell
+    inside that range, so "whatever it is listening on today" is never a safe
+    thing to pin. Derive one port per box from that box's own identity and keep
+    the whole block below the floor. Read the floor rather than assuming the
+    Linux default -- it is a tunable. The per-box assignment table is deployment
+    state, not framework state, and belongs in the deployment's own conventions.
 
     Pure (environ is passed in, never read from the module) so the precedence
     rules are pinnable without starting a daemon.

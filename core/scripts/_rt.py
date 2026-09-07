@@ -60,13 +60,21 @@ _ENV_LOCAL_TOKEN = _ENV_LOCAL_TOKEN_UNRESOLVED
 def _env_local_token():
     """MIND_API_TOKEN read from the gitignored .env.local, cached per process.
 
-    The negative result is cached too, deliberately: with no token configured
-    anywhere -- today's default on every box -- this costs ONE failed open per
-    process instead of one per daemon call, and every store read/write on the
-    box goes through rt_call.
+    The negative result is cached too, deliberately: on a box with no token
+    configured this costs ONE failed open per process instead of one per daemon
+    call, and every store read/write on the box goes through rt_call.
 
     Fail-open by contract: an absent, unreadable, or token-less .env.local
     yields "". Never raises and never logs the value.
+
+    NOT a fleet default (g-358-71). This docstring read "today's default on every
+    box" -- the same false premise its shell twin carried (_runtime.sh
+    ::_rt_api_token, corrected in the same change). Measured 2026-09-05: cc-03
+    had MIND_API_TOKEN SET while cc-09 had it in neither the ambient env nor
+    .env.local, so both states are live simultaneously and the token-set box is
+    the one where a missing Authorization header 401s. The caching rationale is
+    unchanged; only the claim about the fleet was wrong, and it mattered because
+    it answered "does my caller need a bearer?" with a confident no.
     """
     global _ENV_LOCAL_TOKEN
     if _ENV_LOCAL_TOKEN is not _ENV_LOCAL_TOKEN_UNRESOLVED:

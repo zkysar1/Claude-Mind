@@ -336,6 +336,42 @@ def _load_config():
     return cfg
 
 
+def truth_event_for(verdict, reason=""):
+    """(ledger_verdict, evidence_ref) for an APPLIED verdict, or None to skip.
+
+    The confidence-calibration ledger's vocabulary (g-306-399 outcome 2, this
+    lane being the SECOND truth-event surface after adjudication-lane). PURE and
+    importable on purpose: the same shape as adjudication-lane.py::entry_verdict,
+    so the mapping is testable without a daemon, a world, or a mutation. The
+    wrapper calls it only AFTER its mutation loop succeeds -- see
+    guardrail-retire.sh step 3 for why capture cannot live in `apply()`, which
+    returns a PLAN and never writes.
+
+    None means "not a truth event for this ledger", and there is exactly ONE
+    such case: a `retire` carrying no reason. g-306-399 excludes utilization-only
+    retirements ("popularity is not truth"), and this lane's retire verdict is
+    driven by staleness + `effective_relevance` scoring, so a bare retire IS that
+    shape. A retire with a stated reason is a content judgement and is kept.
+
+    keep/refresh -> survived: a reviewer looked and the claim stood. These are
+    the rows a calibration table needs for its DENOMINATOR -- a ledger that
+    records only refutations can only ever report total miscalibration, which is
+    the inverse of the defect g-115-9063 found on the sibling surface (a ledger
+    100% "survived" could only ever report perfect calibration).
+    revise -> revised, NOT refuted: `_verdict_mutations` calls that verdict
+    "still relevant, just stale-worded", so the CLAIM stood and the wording did
+    not. `revised` is a distinct ledger verdict precisely for that case.
+    """
+    reason = (reason or "").strip()
+    mapped = {"keep": "survived", "refresh": "survived",
+              "revise": "revised", "retire": "refuted"}.get(verdict)
+    if mapped is None:
+        return None
+    if verdict == "retire" and not reason:
+        return None
+    return mapped, (reason or None)
+
+
 def is_dormant(cfg=None):
     """Natural gate (guard-348): retires_per_pass <= 0 => dormant (no retire
     verdicts auto-applied). Scan/keep/refresh remain available."""

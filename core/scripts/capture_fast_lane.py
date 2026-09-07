@@ -224,6 +224,17 @@ def fast_lane(agent: str, project_root: Path | None = None,
         "flagged_seen": 0,       # flagged entries found across all Bodies
         "merged": 0,             # flagged entries NEW to the reducer WM this run
         "already_present": 0,    # flagged but already merged (the steady state)
+        #  — PROVENANCE FOR `already_present`. _read_yaml returns {}
+        # for an ABSENT file, so on any box that is not the reducer this field
+        # computes a confident 0 from a file that was never there. That zero
+        # was read as "not one of the 2611 has ever been merged" and produced a
+        # HIGH goal premised on broken delivery. None until the read happens;
+        # False means `already_present` is NOT a measurement (guard-3612: an
+        # empty field is not a measurement until you read its writer's
+        # normalization; guard-346: a wrong-process instrument supports no
+        # conclusion in EITHER direction, so this must not be read as evidence
+        # that delivery works either).
+        "reducer_wm_present": None,
         #  — the DENOMINATOR. `flagged_seen` on its own cannot say
         # whether the flag still discriminates, and that is the whole failure
         # mode: the flag buys eviction-exemption AND fast-lane priority, so as
@@ -267,6 +278,7 @@ def fast_lane(agent: str, project_root: Path | None = None,
         return summary
 
     backend = bmg._get_backend()
+    summary["reducer_wm_present"] = reducer_wm_path.is_file()
     reducer_wm = bmg._read_yaml(reducer_wm_path)
     if not isinstance(reducer_wm, dict):
         reducer_wm = {}
@@ -515,8 +527,14 @@ def format_line(summary: dict) -> str:
     """The one-line form for the reducer's existing iteration-close output."""
     if summary.get("role_refused"):
         return "[capture-fast-lane] SKIPPED — worker Body (reducer-only pass)"
+    warn = ""
+    if summary.get("reducer_wm_present") is False:
+        warn = ("[capture-fast-lane] UNMEASURABLE — no reducer working memory at "
+                "the expected path; an absent file reads as empty, so "
+                "`already_present` below is NOT a measurement. Run this on the "
+                "reducer box before concluding anything about delivery.\n")
     if not summary.get("merged"):
-        return ("[capture-fast-lane] 0 load-bearing captures to merge "
+        return (warn + "[capture-fast-lane] 0 load-bearing captures to merge "
                 f"({summary.get('bodies_scanned', 0)} Bodies scanned, "
                 f"{summary.get('already_present', 0)} already merged)"
                 + _ratio_fragment(summary))
@@ -533,7 +551,7 @@ def format_line(summary: dict) -> str:
     if carried:
         tail += (f", {carried} via carrier from "
                  f"{summary.get('carrier_bodies') or 0} remote Body(s)")
-    return ("[capture-fast-lane] merged "
+    return (warn + "[capture-fast-lane] merged "
             f"{summary['merged']} load-bearing capture(s) from "
             f"{summary['bodies_contributing']}/{summary['bodies_scanned']} Bodies "
             f"— median flag-to-merge {med_s}, max "

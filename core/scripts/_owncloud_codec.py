@@ -132,6 +132,11 @@ DEFAULT_ALLOWLIST = (
     "world/guardrails.jsonl",
     "world/guardrails-*.jsonl",
     "world/pipeline.jsonl",
+    "world/retrieval-trace.jsonl",       # g-358-68: 9.74x measured (13,763,662 -> 1,413,219 B
+                                         # at DEFAULT_LEVEL), ~6.1 GB/day on one key. Local
+                                         # instrumentation with no peer-read surface, so it
+                                         # falls in g-358-13's safe class — unlike the board
+                                         # below, no other deployment reads it.
     "meta/gate-firings.jsonl",
     "meta/gate-firings-*.jsonl",         # date segments (GATE_FIRINGS_SEGMENTED)
 )

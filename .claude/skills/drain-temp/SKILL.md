@@ -150,8 +150,10 @@ SKIP this phase entirely when invoked with --file (targeted single-doc drain).
 #   Lane 0 — REPORT-ONLY, deletes nothing (g-115-3397). Hidden dotfiles directly
 #     under temp/ are matched by NO lane: Phase 1 below enumerates temp/*.md and
 #     temp/*.json (globs that cannot match a leading dot) and Lane 1 exempts
-#     `! -name '.*'`, so a dotfile is never drained, never purged, and never
-#     counted by the temp-pressure metric — permanent invisible residue, and the
+#     `! -name '.*'`, so a dotfile is never drained and never purged. It WAS
+#     counted by temp-pressure until 2026-09-05, which scheduled a drain goal for
+#     a population no lane can clear (guard-5329); it is now `dotfile_doc_count`,
+#     reported and excluded from thresholds — permanent invisible residue, and the
 #     originating case was a 221-byte .launch-payload.json holding an api_key and
 #     three other secrets. This lane makes it VISIBLE without adding a way to
 #     destroy live state: purging is the wrong correction because the exemption

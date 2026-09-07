@@ -11,13 +11,22 @@ This is a DIAGNOSTIC tool (always exits 0). It is NOT a gate. Pairs with
 `--file-probed`, `--field-probed`, and `--probe-result`.
 
 Design notes:
-- Dotted field paths traverse dicts only (e.g., `utilization.times_active`).
-  Array indexing is not supported — JSONL records are records, not nested
-  collections, and zero-count audits probe scalar counter fields.
-- The probe reads the LAST N records (via a tail-from-end scan) because
-  append-only JSONL stores accumulate records over time and the tail reflects
-  the current schema; the head may contain legacy records from a pre-migration
-  era. Exactly the schema-drift condition rb-245 describes.
+- Dotted field paths traverse dicts AND descend lists (e.g.,
+  `utilization.times_active`, and `goals.id` across every element of a `goals`
+  array). Positional indexing is still not supported — you cannot ask for
+  `goals.3.id`. The old dict-only traversal is the g-115-9120 list-descent
+  defect; see `_descend`.
+- BY DEFAULT THE EXISTENCE CHECK READS EVERY RECORD, not the tail. The tail is
+  the right window for "what does the CURRENT schema look like" and the wrong
+  one for "does this field exist at all", which is the question rb-245 actually
+  asks — and the two only diverge in the direction that hurts: a heterogeneous
+  tail manufactures a false ABSENT that the downstream gate then consumes as
+  evidence FOR the negation. Measured on core/config/verify-learning-checks.jsonl
+  (g-115-9120): field `x` present on 10,779 of 10,851 records, yet the old
+  default returned field_present:false because the single final record carries
+  a different shape. Pass an explicit `--sample-count N` when you deliberately
+  want the tail window; `records_in_file` and `sample_is_complete` say which
+  population any given answer is about.
 - Fail-open on file errors: print a diagnostic message and exit 0. The caller
   (typically the LLM preparing a zero-count claim) sees the error and should
   NOT proceed as if the field were confirmed present.
@@ -37,24 +46,58 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _path_helpers import normalize_msys_path  # noqa: E402
 
 
-def _get_dotted(record, dotted):
-    """Traverse `record` by dotted path. Return (found: bool, value).
+def _descend(node, segs):
+    """Every non-null value `segs` resolves to under `node`, as a list.
 
-    Only dict traversal is supported. A missing segment at any level returns
-    (False, None). An explicit null terminal ALSO returns (False, None) — for
-    rb-245, a field that has never been populated is operationally identical to
-    a field that isn't in the schema. This keeps this probe aligned with
-    audit-schema-gate.py's _get_dotted (same semantic for the same question)."""
-    cur = record
-    for seg in dotted.split("."):
-        if not isinstance(cur, dict):
-            return (False, None)
-        if seg not in cur:
-            return (False, None)
-        cur = cur[seg]
-    if cur is None:
-        return (False, None)
-    return (True, cur)
+    A LIST IS TRANSPARENT, NOT TERMINAL — this is the g-115-9120 fix. The
+    previous version traversed dicts only, so the first list on the path
+    returned "not found" and NO --sample-count could cure it. Measured on
+    world/aspirations.jsonl at full sample: `goals` read present and `goals.id`
+    read ABSENT in the same run over the same 24 records, because traversal
+    reached the goals ARRAY and stopped instead of descending into its
+    elements. That false-absent then fed zero-count-gate as the rb-245
+    schema-probe half and PASSED the negation the gate exists to refuse.
+
+    A list mid-path is mapped over with the SAME remaining segments, so
+    `goals.id` collects the id of every element. A list as the TERMINAL value
+    is returned as itself (unchanged from before) — `--field goals` still
+    reports the array."""
+    if not segs:
+        # An explicit null terminal is ABSENT, not present: for rb-245 a field
+        # that was never populated is operationally identical to one that is
+        # not in the schema.
+        return [] if node is None else [node]
+    if isinstance(node, list):
+        out = []
+        for item in node:
+            out.extend(_descend(item, segs))
+        return out
+    seg = segs[0]
+    if not isinstance(node, dict) or seg not in node:
+        return []
+    return _descend(node[seg], segs[1:])
+
+
+def _get_dotted(record, dotted):
+    """Traverse `record` by dotted path. Return (found: bool, values: list).
+
+    `values` holds EVERY value the path resolves to — one entry for an ordinary
+    dict path, N for a path that descends a list of N elements. Callers take
+    values[0] as the sample and len(values) as the hit count; an empty list
+    means absent.
+
+    DELIBERATE DIVERGENCE FROM audit-schema-gate.py's _get_dotted (g-115-9120).
+    This docstring used to claim the two were aligned "same semantic for the
+    same question", and the null-terminal semantic IS still identical — but the
+    list descent above is NOT, and the sibling is a private copy in that file
+    rather than a shared import, so it keeps the old dict-only traversal. The
+    divergence is intentional and the roles differ: that one is a GATE (it
+    BLOCKS on a missing field, so a false-absent fails toward refusing) while
+    this is a DIAGNOSTIC whose false-absent is consumed downstream as evidence
+    FOR a negation. Do not "re-align" them by reverting this; the sibling's own
+    list-descent limitation is a separate finding against that file."""
+    values = _descend(record, dotted.split("."))
+    return (bool(values), values)
 
 
 def _tail_records(path, n):
@@ -111,20 +154,31 @@ def _frequency(records, field, top_n, min_repeat):
     """Value-frequency distribution of `field` across `records`.
 
     Read-only and total: a record missing the field is counted as missing, not
-    skipped silently, so `values_found + records_missing_field` always equals
-    `records_scanned` and a reader can tell a concentrated field from a mostly
-    absent one (guard-2298: report the population beside the filtered count)."""
+    skipped silently, so `records_with_field + records_missing_field` always
+    equals `records_scanned` and a reader can tell a concentrated field from a
+    mostly absent one (guard-2298: report the population beside the filtered
+    count).
+
+    RECORDS AND VALUES ARE COUNTED SEPARATELY because they are no longer the
+    same number (g-115-9120). A path that descends a list yields N values from
+    ONE record, so `values_found` can exceed `records_scanned` and the
+    conservation invariant has to hang on `records_with_field` instead. On an
+    ordinary dict path the two are equal, which is why the distinction was
+    invisible while traversal stopped at the first list."""
     counter = Counter()
     date_only = 0
     values_found = 0
+    records_with_field = 0
     for rec in records:
-        found, value = _get_dotted(rec, field)
+        found, values = _get_dotted(rec, field)
         if not found:
             continue
-        values_found += 1
-        counter[_value_key(value)] += 1
-        if isinstance(value, str) and _DATE_ONLY_RE.match(value):
-            date_only += 1
+        records_with_field += 1
+        for value in values:
+            values_found += 1
+            counter[_value_key(value)] += 1
+            if isinstance(value, str) and _DATE_ONLY_RE.match(value):
+                date_only += 1
 
     def _share(n):
         return round(n / values_found, 4) if values_found else None
@@ -134,7 +188,8 @@ def _frequency(records, field, top_n, min_repeat):
     return {
         "records_scanned": len(records),
         "values_found": values_found,
-        "records_missing_field": len(records) - values_found,
+        "records_with_field": records_with_field,
+        "records_missing_field": len(records) - records_with_field,
         "distinct_values": len(counter),
         "top_values": [
             {"value": k, "count": c, "share": _share(c)} for k, c in top
@@ -154,8 +209,10 @@ def _frequency(records, field, top_n, min_repeat):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description=(
-            "Diagnostic probe: verify a dotted field path exists in the last N "
-            "records of a JSONL file. Pair with zero-count-gate.py before "
+            "Diagnostic probe: verify a dotted field path exists in a JSONL "
+            "file. BY DEFAULT IT READS EVERY RECORD, so field_present:false "
+            "is a statement about the whole store; pass --sample-count N to "
+            "restrict it to the last N. Pair with zero-count-gate.py before "
             "claiming any zero-count / missing-field conclusion (rb-245)."
         )
     )
@@ -163,21 +220,28 @@ def main(argv=None):
                     help="Path to the JSONL file to probe.")
     ap.add_argument("--field", required=True,
                     help="Dotted field path (e.g., utilization.times_active). "
-                         "Dict traversal only; arrays not supported.")
+                         "Traverses dicts and DESCENDS lists, so goals.id "
+                         "resolves across every element of a goals array. "
+                         "Positional indexing (goals.3.id) is not supported.")
     ap.add_argument("--sample-count", type=int, default=None,
-                    help="Number of trailing records to read (default: 1). "
-                         "Unchanged in the existence check, where values below "
-                         "1 still read exactly 1 record. Under --frequency the "
-                         "default is instead ALL records, and 0 or negative "
-                         "also means all — a histogram of one record is not a "
-                         "histogram.")
+                    help="Number of TRAILING records to read. Default: ALL "
+                         "records, in both modes — the existence question is "
+                         "about the whole store, and a tail-only default "
+                         "manufactures a false ABSENT on any store whose last "
+                         "record differs in shape (g-115-9120). An explicit "
+                         "value below 1 still reads exactly 1 record in the "
+                         "existence check, unchanged, and still means ALL "
+                         "under --frequency. Read records_sampled beside "
+                         "records_in_file to see which population any answer "
+                         "is about.")
     ap.add_argument("--output", default="json", choices=["json", "human"],
                     help="Output format.")
     ap.add_argument("--frequency", action="store_true",
                     help="ADDITIVE mode: also report the VALUE-FREQUENCY "
                          "distribution of --field (top values by count, "
                          "distinct-value count, repeated clusters, and the "
-                         "bare-date/midnight share). Satisfies the histogram "
+                         "share of bare-date and midnight values). Satisfies "
+                         "the histogram "
                          "step guard-3265 and guard-2144 prescribe. Off by "
                          "default: without it the output is byte-identical to "
                          "the pre-existing existence check.")
@@ -197,8 +261,21 @@ def main(argv=None):
         "file": args.file,
         "field": args.field,
         "records_sampled": 0,
+        # The population the answer is about, beside the filtered count
+        # (guard-2298). A `field_present: false` from a PARTIAL sample is not
+        # the same claim as one from a complete scan, and before 
+        # nothing in this output let a reader tell them apart.
+        "records_in_file": 0,
+        "sample_is_complete": False,
         "field_present": False,
         "sample_value": None,
+        # Deliberately NOT named `match_count`. That token already means a
+        # POPULATION-wide tally elsewhere in this fleet (npc-composition-sweep
+        # step2, capability-gate), and this one is scoped to the single record
+        # `record_index` names — printing it beside `records_sampled: 10851`
+        # under the fleet's existing reading would be a 1-vs-10851 lie. For a
+        # whole-file tally use --frequency (`values_found` / `records_with_field`).
+        "match_count_in_record": 0,
         "record_index": None,
         "probe_error": None,
     }
@@ -221,21 +298,34 @@ def main(argv=None):
             result["probe_error"] = f"file not found: {args.file}"
             return _emit(result, args.output)
 
-        # The existence path keeps `max(1, n)` EXACTLY as it was, for every
-        # value of --sample-count including 0 and negatives. The first draft
-        # made 0 mean "all records" in both modes, which silently changed what
-        # `--sample-count 0` did for existing callers — caught by diffing this
-        # script against its own HEAD baseline (guard-3274: do not redefine an
-        # existing argument value while adding a mode).
+        # ONE read of the file; the window is a slice of it, so the total
+        # population is known without a second pass.
+        all_records = _tail_records(path, 0)
+        result["records_in_file"] = len(all_records)
+
+        # THE DEFAULT CHANGED (): unset now means ALL records in BOTH
+        # modes. It used to mean exactly 1 here, which answered a question
+        # nobody asked — "is this field on the LAST record" — while the caller
+        # read it as "is this field in the schema" and fed the difference to
+        # zero-count-gate as evidence FOR a negation.
+        #
+        # An EXPLICIT value keeps its old meaning exactly, including 0 and
+        # negatives, which still read one record in the existence check
+        # (guard-3274: do not redefine an existing argument value). That corner
+        # is now the unsafe one rather than the default, and `records_sampled`
+        # vs `records_in_file` makes it visible in the output.
         if args.frequency:
-            # New mode, so no prior behaviour to preserve: unset, 0 or negative
-            # all mean every record. A histogram of one record is not a histogram.
+            # Unset, 0 or negative all mean every record here — a histogram of
+            # one record is not a histogram.
             n = 0 if args.sample_count is None else args.sample_count
-            records = _tail_records(path, n if n > 0 else 0)
+            records = all_records if n <= 0 else all_records[-n:]
         else:
-            n = 1 if args.sample_count is None else args.sample_count
-            records = _tail_records(path, max(1, n))
+            if args.sample_count is None:
+                records = all_records
+            else:
+                records = all_records[-max(1, args.sample_count):]
         result["records_sampled"] = len(records)
+        result["sample_is_complete"] = len(records) == len(all_records)
         if not records:
             result["probe_error"] = "no parseable records in file"
             return _emit(result, args.output)
@@ -244,10 +334,16 @@ def main(argv=None):
         # if ANY sampled record has it — a single hit refutes the zero-count
         # claim, which is the anti-pattern rb-245 targets.
         for offset, rec in enumerate(reversed(records)):
-            found, value = _get_dotted(rec, args.field)
+            found, values = _get_dotted(rec, args.field)
             if found:
                 result["field_present"] = True
-                result["sample_value"] = value
+                result["sample_value"] = values[0]
+                # >1 when the path descended a list: the number of elements in
+                # THIS record that carry it, so a partial match is visible
+                # rather than collapsing to a bare boolean. Scoped to this one
+                # record BY CONSTRUCTION — the loop breaks here, so records
+                # older than `record_index` are never examined.
+                result["match_count_in_record"] = len(values)
                 # record_index: -1 = last, -2 = second-to-last, etc.
                 result["record_index"] = -(offset + 1)
                 break
@@ -275,6 +371,11 @@ def _emit(result, output_format):
         if result["field_present"]:
             print(f"Sample value: {result['sample_value']!r} "
                   f"(at record_index={result['record_index']})")
+            if result["match_count_in_record"] > 1:
+                # A list-descent partial is invisible in human mode otherwise —
+                # the sample value alone reads as the single value of the field.
+                print(f"Matches in that record: "
+                      f"{result['match_count_in_record']} (path descends a list)")
         freq = result.get("frequency")
         if freq:
             print(f"Distinct values: {freq['distinct_values']} "

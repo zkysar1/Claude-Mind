@@ -616,7 +616,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 2.9. Experience Distillation (compile experiences into tree wiki):
    # Reads from experience archive, NOT WM queues — runs on both full and lean paths.
    # Experiences are raw data. The tree is the compiled wiki.
-   Bash: experience-read.sh --type goal_execution --recent 30 --summary
+   Bash: experience-read.sh --type goal_execution --recent 30
    Group experiences by tree_nodes_related field.
    
    FOR EACH tree node with 3+ related experiences since last distillation:
@@ -743,7 +743,7 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 7.5. Experience-to-Skill Mining (skip in stop_mode):
    IF stop_mode != true:
      # Mine experience records for repeated procedures that should be skills
-     Bash: experience-read.sh --type goal_execution --recent 30 --summary
+     Bash: experience-read.sh --type goal_execution --recent 30
      Bash: meta-read.sh skill-gaps.yaml
      Read core/config/skill-gaps.yaml (experience_mining config)
 

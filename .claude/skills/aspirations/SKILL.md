@@ -421,9 +421,11 @@ IF displacement_seen:
 
 # Phase -0.5c.2: Pending Phase-6 Spark Sentinel (g-115-1174)
 # Consumes the `pending_phase_6_spark` WM slot written by TWO producers:
-# (1) recurring-close.sh at end-of-script — AFTER the four iteration-close
-# phases, just before the terminal imperative (NOT during Block C/D, which
-# runs earlier); (2) iteration-close.sh do_state_update for NON-recurring deep
+# (1) recurring-close.sh EARLY (line 372/1359, right after OUTCOME
+# classification, BEFORE the four phases) — deliberate: an aborted close costs
+# one TTL-bounded redundant spark, a lost one is silent. PRESENCE IS NOT
+# COMPLETION: test a close with achievedCount, never this slot (occ127).
+# (2) iteration-close.sh do_state_update for NON-recurring deep
 # completions (g-115-2416 origin — script-enforced parity; the sentinel WRITE
 # was MOVED from do_verify to do_state_update by g-115-2848 because do_verify's
 # --outcome is optional and an omission silently no-op'd the write, g-115-2839
@@ -431,9 +433,6 @@ IF displacement_seen:
 # Phase 6 for non-recurring deep closes rode on LLM memory alone and drifted,
 # observed miss g-115-2404). Both producers emit a stdout imperative AND the sentinel;
 # spark-fire-dedup makes in-turn firing + sentinel consumption idempotent.
-# Corollary:
-# a NULL read here while the bg recurring-close is still mid-phase is EXPECTED,
-# not a bug — the sentinel lands only once the bg reaches end-of-script.
 # When recurring-close.sh's wall-clock
 # exceeds the Bash 2-minute timeout the call backgrounds, the harness fires
 # the stop hook before bg completes, and the LLM re-enters /aspirations loop

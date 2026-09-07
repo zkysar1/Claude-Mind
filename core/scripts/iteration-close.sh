@@ -826,7 +826,49 @@ fi
 
 if [[ -z "$PHASE" ]]; then
     echo "usage: iteration-close.sh --phase {verify|state-update|learning-gate|productivity-check|recover} [--goal <id>] [--status <s>] [--source <w|a>] [--outcome <deep|routine|d|r>] [--summary <t> | --summary-file <path>] [--tree-updated] [--tree-updated-override] [--artifacts-count <n>] [--encoding-score <0.0-1.0>] [--findings-count <n>]" >&2
+    echo "       quality flags (--tree-updated / --artifacts-count / --encoding-score / --findings-count) are read ONLY by --phase state-update; passing them to any other phase is a silent no-op (g-115-3270)" >&2
     exit 2
+fi
+
+# ----------- quality-flag / phase-mismatch WARN (g-115-3270) -----------
+# The four STATE-UPDATE quality flags are parsed globally in the loop above but
+# READ in exactly two places, BOTH state-update: do_state_update's audit_args /
+# GATE_ARGS assembly, and the `state-update)` arm of _print_recovery_instructions
+# via _quality_flag_suffix (its only call site -- the `verify)` arm builds its own
+# retry line and deliberately omits them). Every other phase parses them, stores
+# them, and never looks again: a SILENT no-op that still exits 0. guard-3893 --
+# a flag the script ACCEPTS is not a flag the script WIRES.
+#
+# --phase verify is the LIKELY wrong call, not an edge case: verify is where
+# --outcome deep is declared and where the closer is already thinking about
+# outcome quality, so that is where the flags get attached. The cost is not
+# cosmetic -- do_state_update then prints "deep close UNMEASURED ... imp@k
+# snapshot SKIPPED" and the close never enters the learning-velocity series
+# (hit twice in consecutive closes: g-306-96, then g-306-95).
+#
+# WARN, do NOT forward, do NOT exit. Forwarding would HIDE the mistake and the
+# whole point is to make a silent no-op loud. guard-4475: triage by what the flag
+# CONTROLS -- these are MEASUREMENT inputs, so the harm is a missing measurement
+# the caller can still inspect, not a mode flag that changes what the operation
+# DOES; that asymmetry is why this warns rather than refuses, the same guard-2760
+# reasoning the forward-precondition block above records for itself. stderr is
+# the right channel: iteration-close.sh is invoked as a Bash tool call, so its
+# stderr lands in tool output (see that block's note). Fail-open by construction
+# -- this can only echo.
+if [[ "$PHASE" != "state-update" ]]; then
+    _QF_IGNORED=""
+    [[ "$TREE_UPDATED" == "true" ]] && _QF_IGNORED+=" --tree-updated"
+    [[ -n "$ARTIFACTS_COUNT" ]]     && _QF_IGNORED+=" --artifacts-count"
+    [[ -n "$ENCODING_SCORE" ]]      && _QF_IGNORED+=" --encoding-score"
+    [[ -n "$FINDINGS_COUNT" ]]      && _QF_IGNORED+=" --findings-count"
+    if [[ -n "$_QF_IGNORED" ]]; then
+        echo "[iteration-close] WARN --phase $PHASE IGNORES the quality flag(s):${_QF_IGNORED}" >&2
+        echo "  They are read ONLY by --phase state-update. This call parsed them and discards them with no other effect, which is exactly why the mistake is otherwise invisible (g-115-3270)." >&2
+        echo "  Pass them on the state-update call instead:" >&2
+        echo "    bash core/scripts/iteration-close.sh --phase state-update --goal ${GOAL_ID:-<id>} --source ${SOURCE:-world} --outcome ${OUTCOME:-deep}$(_quality_flag_suffix)" >&2
+        echo "  If state-update ALREADY ran without them, do NOT re-run it -- that double-bumps the loop counters. Recover the measurement alone:" >&2
+        echo "    bash core/scripts/state-update-audit.sh velocity --goal ${GOAL_ID:-<id>} --category <category>$(_quality_flag_suffix)" >&2
+    fi
 fi
 
 AGENT="${MIND_AGENT:-}"
@@ -863,6 +905,47 @@ _checkpoint_refresh() {
     bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
         --set "phase_completed=$phase_name" \
         --set "last_updated=$NOW_ISO" \
+        --if-goal "$goal_id" || true
+}
+
+# Identity-scoped checkpoint update — the general-purpose sibling of
+# _checkpoint_refresh, for the writes that are NOT phase_completed/last_updated
+# (intent_state, intent_outcome, outcome_class).
+#
+# $1 is the goal this write belongs to and is MANDATORY BY POSITION. That is the
+# whole point of the helper: g-357-84 forwarded --if-goal at one call site and
+# left five raw `loop-state-save.sh update` invocations unguarded, and the most
+# damaging of them (do_verify's intent_state=complete) is the field do_recover
+# later reads to decide whether to commit or ROLL BACK a goal. A stale checkpoint
+# anchored to goal A therefore received goal B's intent, and a later
+# `--phase recover` rolled back A while printing "split-brain detected for A"
+# about a goal that was never in flight (g-357-109).
+#
+# WHY A MANDATORY POSITIONAL RATHER THAN AN ENV VAR THE PHASES EXPORT ONCE.
+# That was the filed suggestion and it is FALSIFIED by do_recover: its two write
+# sites are scoped to $_gid, the goal read OUT OF the checkpoint, and NOT to
+# $GOAL_ID -- which, as the comment at that call site records (g-306-161), "is
+# empty or belongs to some other iteration" when --phase recover runs. A single
+# inherited identity would have refused do_recover's own legitimate writes and
+# broken recovery outright, which is guard-2485's shape exactly: where a call
+# site knows something the others do not, pass it explicitly instead of
+# averaging it away. Three sites own $GOAL_ID, two own $_gid; the helper takes
+# whichever its caller owns.
+#
+# The identity is non-empty at every current call site by construction --
+# do_verify/do_state_update hard-require a non-empty $GOAL_ID at phase entry,
+# and do_recover returns early on an empty $_gid -- so no caller relies on the
+# writer's empty-means-no-compare back-compat path. That path stays for the
+# LLM-invoked `loop-state-save.sh update` sites in the verify/execute SKILL.md
+# files, which carry no goal identity and are deliberately untouched here.
+#
+# `|| true` is inside the helper for the same reason it is inside
+# _checkpoint_refresh: the writer's refusal path exits 0 by contract, and a
+# nonzero rc from `update` means ITERATION failure.
+_checkpoint_update() {
+    local goal_id="${1-}"
+    shift
+    bash "$CORE_ROOT/scripts/loop-state-save.sh" update "$@" \
         --if-goal "$goal_id" || true
 }
 
@@ -1193,9 +1276,9 @@ do_verify() {
     # completed status with an --outcome — for blocked/skipped the protocol's
     # transitional invariant (intent→committed) is irrelevant.
     if [[ "$GOAL_STATUS" == "completed" && -n "$OUTCOME" ]]; then
-        bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
+        _checkpoint_update "$GOAL_ID" \
             --set "intent_state=complete" \
-            --set "intent_outcome=$OUTCOME" || true
+            --set "intent_outcome=$OUTCOME"
     fi
 
     # CRITICAL — recurring goals MUST go through aspirations-complete-by.sh (cmd_complete_by).
@@ -1780,8 +1863,7 @@ print(json.dumps({
     # committed marker tells the recovery hook that this iteration's verify
     # finished cleanly — no retry needed.
     if [[ "$GOAL_STATUS" == "completed" && -n "$OUTCOME" ]]; then
-        bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
-            --set "intent_state=committed" || true
+        _checkpoint_update "$GOAL_ID" --set "intent_state=committed"
     fi
 
     # ── Close-time dependent-defer recheck (g-115-2572, rb-3946 — ADVISORY) ──
@@ -2692,8 +2774,7 @@ print(sha)
     # key in loop-state-save.py; writer is wired here. Fail-open via
     # `|| true` matches existing iteration-close convention — audit is
     # non-fatal observability, must never block state-update.
-    bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
-        --set "outcome_class=$OUTCOME" || true
+    _checkpoint_update "$GOAL_ID" --set "outcome_class=$OUTCOME"
 
     _checkpoint_refresh state_update "$GOAL_ID"
 
@@ -3049,9 +3130,17 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
     [[ -n "$ARTIFACTS_COUNT" ]] && audit_args+=(--artifacts-count "$ARTIFACTS_COUNT")
     [[ -n "$ENCODING_SCORE" ]]  && audit_args+=(--encoding-score "$ENCODING_SCORE")
     [[ -n "$FINDINGS_COUNT" ]]  && audit_args+=(--findings-count "$FINDINGS_COUNT")
-    # Exit-code contract (state-update-audit.py:484, header line 23):
-    # 0=clean, 1=FLAGS RAISED (audit ran fully; snapshot recorded; advisory
-    # signal on stdout), 2=input error. The previous form treated ANY nonzero
+    # Exit-code contract (state-update-audit.py main() / HARD_FAIL_FLAGS):
+    # 0=clean OR informational flags only, 1=a HARD_FAIL_FLAGS member was
+    # raised, 2=input error.
+    # CORRECTED g-115-5086: this comment read "1=FLAGS RAISED (audit ran fully;
+    # snapshot recorded)". That was true only BEFORE the HARD_FAIL_FLAGS
+    # partition (when the script did `exit(1 if flags else 0)`); afterwards rc=1
+    # means precisely the opposite — HARD_FAIL_FLAGS is documented in that file
+    # as "flags that mean the audit could NOT complete". So every rc=1 was being
+    # announced as a completed, recorded audit. Do NOT mirror the flag set here;
+    # state-update-audit.py owns it.
+    # The previous form treated ANY nonzero
     # as failure and swallowed stdout — every flagged close (rollbacks_applied,
     # dead_ends_registered, …) lost its advisory signal and misreported
     # "snapshot not recorded" (g-115-1945: 2+ consecutive false WARNs on
@@ -3066,7 +3155,29 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
     audit_out="$(bash "$SCRIPT_DIR/state-update-audit.sh" "${audit_args[@]}")" || audit_rc=$?
     if [[ $audit_rc -eq 1 ]]; then
         audit_flags="$(printf '%s' "$audit_out" | python3 -c 'import json,sys; print(",".join(json.load(sys.stdin).get("flags",[])))' 2>/dev/null || echo "unparsable")"
-        echo "[iteration-close] state-update-audit flags (advisory, audit ran + snapshot recorded): ${audit_flags}" >&2
+        if [[ "$audit_flags" == "unparsable" ]]; then
+            # g-115-5086. rc=1 with UNPARSEABLE stdout is a CRASH, not a flagged
+            # run: an uncaught raise makes Python print a traceback and exit 1,
+            # and that 1 COLLIDES with this script's designed rc=1. The old
+            # single-line form printed this case under "audit ran + snapshot
+            # recorded", so a swallowed exception was rendered as coverage while
+            # the enclosing phase still returned 0 -- the guard-1760 shape
+            # (reporting what it declined to look at as a pass). Observed live:
+            # cmd_backpressure raised TypeError on dict-valued failed_values,
+            # which also aborted cmd_run_all, so temporal-credit and
+            # relative-advantage never ran either.
+            # state-update-audit.py main() now catches and emits a structured
+            # check_failed, so reaching THIS branch means the failure was
+            # earlier still (argparse, import, or an external kill). Either way
+            # nothing was measured: say so.
+            echo "[iteration-close] WARN: state-update-audit rc=1 with NON-JSON stdout -- the audit CRASHED; no velocity/backpressure snapshot was recorded for $GOAL_ID. Re-run for the traceback: bash core/scripts/state-update-audit.sh ${audit_args[*]}" >&2
+        else
+            # rc=1 means a HARD_FAIL_FLAGS member was raised. state-update-audit.py
+            # owns that set (deliberately NOT mirrored here) and documents it as
+            # "flags that mean the audit could not complete", so this line reports
+            # what the audit said and must NOT assert that it ran or recorded.
+            echo "[iteration-close] WARN: state-update-audit rc=1 -- hard-fail flag(s), audit did NOT complete for $GOAL_ID: ${audit_flags}" >&2
+        fi
     elif [[ $audit_rc -ne 0 ]]; then
         echo "[iteration-close] WARN: state-update-audit.sh failed rc=${audit_rc} (non-fatal — velocity/backpressure snapshot not recorded for $GOAL_ID)" >&2
     fi
@@ -4031,6 +4142,16 @@ do_productivity_check() {
     # is safe: a missed tick just leaves the spool for the next iteration.
     python3 "$(_winpath "$SCRIPT_DIR/gate-firings-flush.py")" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Sibling lane for meta/trigger-firings.jsonl (g-358-79). Same protocol,
+    # same self-gating, same duplicate-safety as the gate-firings flush above —
+    # it is a port of that script, not a second design. Kept adjacent so the two
+    # cannot drift apart unnoticed.
+    #
+    # This store had it WORSE than gate-firings: it is not in
+    # _fileops._SNAPSHOT_BLACKLIST, so every direct append also wrote a
+    # whole-file .history snapshot (810 MB of PUT bytes / 672 versions per 24h).
+    python3 "$(_winpath "$SCRIPT_DIR/trigger-firings-flush.py")" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # Citation-credit sweep (g-115-6948): converts commit-message rb-/guard-
     # citations (measured 84/day fleet-wide vs 1-7 explicit helpful events/day)
     # into times_inferred_helpful increments — the mechanical consultation-
@@ -4490,16 +4611,22 @@ print("")
         # wrong — the row we are entitled to clear is $_gid's and only that.
         bash "$SCRIPT_DIR/team-state-clear-in-flight.sh" --agent "$AGENT" --if-goal "$_gid" \
             || echo "[iteration-close] WARN: team-state-clear-in-flight failed during recovery" >&2
-        bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
-            --set "intent_state=committed" || true
+        # --if-goal "$_gid", NOT "$GOAL_ID" — same scoping rule as the
+        # clear-in-flight call above, and for the same g-306-161 reason. Here it
+        # is also a compare-and-swap against the very checkpoint this branch read
+        # its verdict from: if anything re-anchored the file since, the write is
+        # refused rather than stamping a goal we never probed (g-357-109).
+        _checkpoint_update "$_gid" --set "intent_state=committed"
     else
         # Case A — roll back. Aspirations didn't catch the completion.
         # intent_state=rolled_back preserves audit trail and is excluded from
         # do_recover's "INTENT_COMPLETE" trigger so subsequent recover invocations
         # are no-ops. The next iteration's verify runs normally.
         echo "[iteration-close] recover: split-brain detected for $_gid (intent=complete, status=${_status:-unknown}) — rolling back intent" >&2
-        bash "$CORE_ROOT/scripts/loop-state-save.sh" update \
-            --set "intent_state=rolled_back" || true
+        # --if-goal "$_gid", NOT "$GOAL_ID" (g-306-161 / g-357-109) — see the
+        # forward-recovery branch above. A rollback is the destructive half, so
+        # the scoping matters most here.
+        _checkpoint_update "$_gid" --set "intent_state=rolled_back"
     fi
 }
 

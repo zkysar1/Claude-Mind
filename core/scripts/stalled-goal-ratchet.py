@@ -113,6 +113,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
+
 METRIC_KEY = "stalled_goals"
 # Second key, same file, same lock — see the human_blocked section of the module
 # docstring. Its existence is what stops a relabel from erasing debt.
@@ -140,10 +142,7 @@ def _parse_ts(value):
     """Parse an ISO-ish timestamp, tolerating a trailing Z. None on anything else."""
     if not value:
         return None
-    try:
-        return dt.datetime.fromisoformat(str(value).strip().replace("Z", ""))
-    except (ValueError, TypeError):
-        return None
+    return parse_naive_iso(value)
 
 
 def stall_age_days(goal, now):

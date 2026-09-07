@@ -1609,6 +1609,89 @@ def test_selfheal_durable_crossagent_differs_from_both_still_defers(tmp_path):
     assert (a / "agents/bravo/aspirations.jsonl").read_text() == REAL_EDIT
 
 
+def test_selfheal_durable_crossagent_comparator_failure_defers_without_claiming_content(tmp_path):
+    """: when the semantic comparator CANNOT RUN, the defer must not
+    assert a CONTENT difference it never measured.
+
+    Pre-fix, `_ip_semantic_verdict` normalised BOTH "the comparator said it
+    could not parse" and "the comparator did not run at all" to `unparseable`,
+    and `unparseable` shares the defer branch with `different` -- so the log
+    line read "differs in CONTENT from BOTH HEAD and $UPSTREAM" whenever the
+    comparator had simply failed. That is guard-2390's shape exactly: a sentinel
+    returned to FORCE a control-flow branch reaching an audit record as if it
+    were measured data. The consequence is not a wrong answer but a PERMANENT
+    one -- every durable cross-agent file defers every cycle, the box wedges,
+    and the log reads like normal conservative operation.
+
+    THE FIXTURE IS CHOSEN SO THE OLD LOG LINE IS PROVABLY FALSE, not merely
+    unproven. The working-tree bytes here are REORDERED -- semantically
+    IDENTICAL to HEAD, differing only in key order. With a working comparator
+    this exact input CLEARS (see
+    test_selfheal_durable_crossagent_serialization_only_still_clears, which
+    asserts rc==0 on it). So a run that defers AND claims a content difference
+    is asserting something the neighbouring test disproves.
+
+    THE FORCED FAILURE IS THE FLEET'S REAL ONE, not an arbitrary stub: a
+    `python3` that RESOLVES but yields no verdict. On the native-Windows boxes
+    that is the Microsoft Store stub, which exits 49 with empty stdout, and the
+    comparator's `2>/dev/null` hides it.
+
+    SCOPE OF THE SHADOW, measured rather than assumed. `python3` is invoked
+    exactly once DIRECTLY in iteration-push.sh (the comparator), but the script
+    shells out to sibling scripts that use it too, so the shadow reaches them
+    as well: a pre-fix run of this test emits
+    `tree-lock: check failed rc=49 (plumbing, not a lock) -- proceeding
+    unguarded`. That degradation is fail-open by design and touches none of the
+    assertions below, but do NOT describe this stub as comparator-only -- an
+    earlier draft of this docstring did, and the run's own output disproved it.
+
+    MUTATION-PROVED, not assumed (guard-3534): with the pre-fix
+    iteration-push.sh swapped in, this test FAILS on the `comparator
+    UNAVAILABLE` assertion (rc=1); with the fix it passes. Verified 2026-09-06.
+    Use `bash core/scripts/mutation-proof-test.sh` to re-run that control --
+    guard-1621 -- rather than hand-rolling the copy-aside/restore, whose safety
+    depends on the turn surviving to run the restore.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/bravo/aspirations.jsonl": CANON})
+    _commit_file(b, "agents/bravo/aspirations.jsonl",
+                 '{"id":"e7","kind":"note","n":7}\n', "B: bravo asp v2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/dur6637.sh", "echo dur\n", "A: framework work")
+    (a / "agents/bravo/aspirations.jsonl").write_text(
+        REORDERED, encoding="utf-8", newline="\n")
+
+    shim = tmp_path / "py-stub"
+    shim.mkdir()
+    stub = shim / "python3"
+    stub.write_text("#!/bin/sh\nexit 49\n", encoding="utf-8", newline="\n")
+    stub.chmod(0o755)
+
+    r = subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(a), *_default_flags("--strict")],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "MIND_AGENT": "alpha",
+             "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"},
+    )
+
+    # 1. FAIL-SAFE DIRECTION UNCHANGED. A blind comparator must still defer and
+    #    must still never clear -- a wrong `identical` destroys partner work.
+    assert r.returncode == 1, f"comparator failure must still defer: {r.stderr}"
+    assert "merge DEFERRED" in r.stderr, r.stderr
+    assert (a / "agents/bravo/aspirations.jsonl").read_text() == REORDERED
+
+    # 2. THE REGRESSION ASSERTION. This pair is what makes the test a check on
+    #    the fix rather than a restatement of behaviour that already existed:
+    #    the run must SAY the comparator was unavailable, and must NOT claim the
+    #    content difference it could not have measured.
+    assert "comparator UNAVAILABLE" in r.stderr, (
+        "defer did not distinguish a failed comparator from a real difference: "
+        + r.stderr)
+    assert "differs in CONTENT" not in r.stderr, (
+        "asserted a CONTENT difference on bytes that are semantically IDENTICAL "
+        "to HEAD, while the comparator never ran: " + r.stderr)
+
+
 # ---------------------------------------------------------------------------
 # : a defer must not abandon self-namespace churn already collected.
 #

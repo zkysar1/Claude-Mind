@@ -748,7 +748,14 @@ _ip_blocking_paths_from_merge_out() {
 # behind, unable to push, on two files whose parsed content was byte-for-byte
 # equal to HEAD (672 vs 672 record ids, zero records differing on any field).
 #
-# Echoes exactly one of: identical | different | unparseable.
+# Echoes exactly one of: identical | different | unparseable | unavailable.
+# `unavailable` means THE COMPARATOR ITSELF DID NOT RUN (no tempfile, or
+# python3/semantic_identity.py produced no recognisable verdict) — as opposed to
+# `unparseable`, which is the comparator RUNNING and reporting it could not parse
+# either side. Both defer, so the fail-safe direction is unchanged; the split
+# exists so the defer sites stop ASSERTING a content difference they never
+# measured (). guard-2390: a sentinel returned to force a branch must
+# never reach a log line as if it were measured data.
 # ONLY `identical` licenses a restore. Both other verdicts mean defer, and the
 # asymmetry is the whole design: a wrong `different` costs one retried merge,
 # a wrong `identical` destroys a partner's uncommitted work permanently.
@@ -759,8 +766,8 @@ _ip_blocking_paths_from_merge_out() {
 # and could license a restore over a file nobody had actually compared.
 _ip_semantic_verdict() {
   local _lpfx="$1" _rpfx="$2" _rel="$3" _lf _rf _v
-  _lf="$(mktemp 2>/dev/null)" || { echo unparseable; return 0; }
-  _rf="$(mktemp 2>/dev/null)" || { rm -f "$_lf"; echo unparseable; return 0; }
+  _lf="$(mktemp 2>/dev/null)" || { echo unavailable; return 0; }
+  _rf="$(mktemp 2>/dev/null)" || { rm -f "$_lf"; echo unavailable; return 0; }
   _ip_extract_side() {   # $1 = prefix, $2 = destination
     if [ -z "$1" ]; then cat -- "$REPO/$_rel" > "$2" 2>/dev/null
     else git -C "$REPO" show "$1$_rel" > "$2" 2>/dev/null; fi
@@ -776,8 +783,9 @@ _ip_semantic_verdict() {
   _v="$(python3 "$SCRIPT_DIR/semantic_identity.py" \
           "$_lf" "$_rf" --name "$_rel" 2>/dev/null)"
   rm -f "$_lf" "$_rf"
-  # An absent/garbled verdict means the comparator itself failed. Fail SAFE.
-  case "$_v" in identical|different|unparseable) : ;; *) _v=unparseable ;; esac
+  # An absent/garbled verdict means the comparator itself failed. Fail SAFE —
+  # `unavailable` is NOT identical, so every caller still defers exactly as before.
+  case "$_v" in identical|different|unparseable) : ;; *) _v=unavailable ;; esac
   echo "$_v"
 }
 
@@ -1015,9 +1023,15 @@ _selfheal_cross_agent_churn_remerge() {
           # clear set — a file identical to HEAD still clears exactly as
           # /6145 made it, and a file differing from BOTH still
           # defers untouched, which is the property  exists to hold.
+          # Capture the two verdicts instead of discarding them: the defer log below
+          # must not assert a CONTENT difference when the comparator never ran
+          # (, guard-2390). The `{ ...; [ ... ]; }` form preserves the
+          # original short-circuit exactly — the $UPSTREAM comparison still runs
+          # only when the HEAD one was non-identical.
+          _vh=""; _vu=""
           if _ip_durable_crossagent "$rel" \
-             && [ "$(_ip_semantic_verdict "" "HEAD:" "$rel")" != identical ] \
-             && [ "$(_ip_semantic_verdict "" "$UPSTREAM:" "$rel")" != identical ]; then
+             && { _vh="$(_ip_semantic_verdict "" "HEAD:" "$rel")"; [ "$_vh" != identical ]; } \
+             && { _vu="$(_ip_semantic_verdict "" "$UPSTREAM:" "$rel")"; [ "$_vu" != identical ]; }; then
             # MERGE RESOLUTION 2026-08-18 ( + , resolved on
             # cc-08). The two fixes landed concurrently on the same block and
             # are COMPLEMENTARY, not competing — they act at different levels of
@@ -1041,7 +1055,11 @@ _selfheal_cross_agent_churn_remerge() {
               log "self-heal: DURABLE cross-agent file $rel differs from HEAD and $UPSTREAM, but git has a configured commutative merge driver — COMMIT it, the driver reconciles at the merge (g-115-6572)"
               mergeable_cross+=("$rel"); continue
             fi
-            log "self-heal: DURABLE cross-agent file $rel differs in CONTENT from BOTH HEAD and $UPSTREAM — defer, never clear (g-115-6145/g-115-6538)"
+            if [ "$_vh" = unavailable ] || [ "$_vu" = unavailable ]; then
+              log "self-heal: DURABLE cross-agent file $rel — semantic comparator UNAVAILABLE (HEAD=$_vh, $UPSTREAM=$_vu) — deferring BLIND; no content difference was measured (g-115-6637)"
+            else
+              log "self-heal: DURABLE cross-agent file $rel differs in CONTENT from BOTH HEAD and $UPSTREAM — defer, never clear (g-115-6145/g-115-6538)"
+            fi
             # Record the CAUSE so the streak alarm can name this shape instead of
             # prescribing "clear it" (). Accumulates across paths; the
             # alarm reads it ~350 lines below, in the same shell.
@@ -1095,11 +1113,17 @@ _selfheal_cross_agent_churn_remerge() {
           # HEAD carries nothing to lose, so restoring it discards no work.
           # Only `identical` takes this branch; `different` and `unparseable`
           # both fall through to the defer below, unchanged.
-          if [ "$(_ip_semantic_verdict "" "HEAD:" "$rel")" = identical ]; then
+          _vh="$(_ip_semantic_verdict "" "HEAD:" "$rel")"
+          if [ "$_vh" = identical ]; then
             log "self-heal: shared file $rel differs from HEAD only by serialization — restoring, not deferring (g-115-5717)"
             cross_dirty+=("$rel")
           else
-            log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
+            # Same split as the durable arm: only claim a difference we measured.
+            if [ "$_vh" = unavailable ]; then
+              log "self-heal: blocking file outside agents/* ($rel) — semantic comparator UNAVAILABLE — deferring BLIND; no content difference was measured (g-115-6637)"
+            else
+              log "self-heal: blocking file outside agents/* ($rel) — defer (never clear core/world/shared work)"
+            fi
             _heal_defer=1; continue
           fi
         fi

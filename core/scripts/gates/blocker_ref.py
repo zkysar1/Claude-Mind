@@ -370,13 +370,38 @@ def validate(raw: Any, *, now: Optional[datetime] = None,
     # BLOCKER_REF_PASSTHROUGH_KEYS for why both halves are load-bearing.
     allowed = (set(BLOCKER_REF_CORE_KEYS) | set(BLOCKER_REF_OPTIONAL_KEYS)
                | set(BLOCKER_REF_PASSTHROUGH_KEYS))
+    # --- independent-failure accumulation () ---------------------
+    # The four checks below are INDEPENDENT: none reads a value an earlier one
+    # validated, so all four can be evaluated against the same input and
+    # reported together. Returning on the FIRST cost the caller one round-trip
+    # PER DEFECT — measured 2026-07-29 (), filing one malformed record
+    # took four successive rejections (unrecognized keys -> type enum ->
+    # external_id -> accepted). Each individual message was already good; the
+    # only defect was that they arrived one at a time.
+    #
+    # EVERY MESSAGE IS PRESERVED BYTE-FOR-BYTE as its own line rather than
+    # reworded or merged. The test corpus pins these strings by SUBSTRING from
+    # three files — core/tests/gates/test_blocker_ref_gate.py,
+    # core/scripts/tests/test_blocker_ref_write_path_normalization.py and
+    # mind_api/tests/test_runtime_update_goal_cascade.py — and retrieval cannot
+    # reach a test corpus, so those pins are invisible to the mandated
+    # pre-apply consultation (guard-5025). Because every pin is an `in msg`
+    # containment check, joining is PURELY ADDITIVE and each one still holds;
+    # rewording any line is what would break them.
+    #
+    # The checks ABOVE this block must keep short-circuiting: a non-JSON string
+    # and a non-dict cannot be key-iterated at all, and an alias collision
+    # leaves `ref` half-normalized, so continuing past it would report
+    # downstream errors derived from a state the caller never supplied.
+    errors = []
+
     unknown = [k for k in ref if k not in allowed]
     if unknown:
         hints = []
         for k in sorted(unknown):
             hint = BLOCKER_REF_REJECTED_KEYS.get(k)
             hints.append(f"{k} ({hint})" if hint else k)
-        return False, (
+        errors.append(
             "blocker_ref carries unrecognized key(s): " + ", ".join(hints)
             + f". Allowed: {sorted(allowed)}. Unknown keys are REFUSED rather "
               "than silently dropped so the vocabulary cannot grow a second "
@@ -385,18 +410,25 @@ def validate(raw: Any, *, now: Optional[datetime] = None,
 
     btype = ref.get("type")
     if btype not in BLOCKER_REF_TYPES:
-        return False, (
+        errors.append(
             f"blocker_ref.type must be one of {list(BLOCKER_REF_TYPES)}, "
             f"got {btype!r}"
         )
 
     ext_id = ref.get("external_id")
     if not isinstance(ext_id, str) or not ext_id.strip():
-        return False, "blocker_ref.external_id must be a non-empty string"
+        errors.append("blocker_ref.external_id must be a non-empty string")
 
     state_hash = ref.get("state_hash")
     if state_hash is not None and not isinstance(state_hash, str):
-        return False, "blocker_ref.state_hash must be a string or null"
+        errors.append("blocker_ref.state_hash must be a string or null")
+
+    if errors:
+        # One line per defect, so a caller can fix the record in a single pass.
+        # Returning here is also what keeps the derivation below safe: it reads
+        # BLOCKER_REF_TTL_HOURS[btype] and ext_id.strip(), both of which are
+        # only well-defined once the checks above have all passed.
+        return False, "\n".join(errors)
 
     now_dt = now if now is not None else datetime.now()
     created_at = ref.get("created_at") or now_dt.isoformat(timespec="seconds")

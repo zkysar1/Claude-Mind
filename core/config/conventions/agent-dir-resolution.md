@@ -110,8 +110,28 @@ layout.
 (need NO edit), but they are invisible to all THREE greps above — they neither
 define the constant, write a literal `agents/*`, nor use `.parent` — so a
 depth-1 redrift (`PROJECT_ROOT.glob("*/...")`, which matches NOTHING
-post-relocation) escapes every audit grep. This table is their only audit
-surface; check it on rename:
+post-relocation) escapes every audit grep.
+
+**This table was their only audit surface until 2026-09-06, and it had silently
+fallen 19 consumers behind — a hand-maintained list standing in for an invariant
+the language cannot see.** The audit surface is now
+`core/scripts/cross-agent-glob-audit.py`, which DERIVES the consumer set from the
+code (AST, so a comment warning about the drift pattern is not mistaken for the
+pattern) and fails when code and record disagree. Run it on rename, and after
+adding any cross-agent glob:
+
+```
+py -3 core/scripts/cross-agent-glob-audit.py          # exit 1 on drift/undocumented
+py -3 core/scripts/cross-agent-glob-audit.py --write  # regenerate the derived block below
+```
+
+The rows below stay hand-written because each is an INCIDENT RECORD — which
+drift zeroed which source, for how long, what guards it now. That prose is the
+value and no generator can produce it. The machine half (the file SET, which is
+what actually drifted) lives in the generated block at the end of this file.
+`test_cross_agent_glob_audit.py::test_live_repo_is_clean` fails the suite if a
+new depth-1 consumer appears, so the invariant no longer depends on someone
+remembering to check a table:
 
 | File(s) | Glob | Status |
 |---------|------|--------|
@@ -139,3 +159,52 @@ Helper API (available after sourcing `_paths.sh` or importing from `_paths`):
 **Rule**: Never write `PROJECT_ROOT / agent_name` or `$PROJECT_ROOT/$AGENT`
 directly. Use `agent_dir(name)` or `$(agent_dir "$AGENT")` instead. For
 per-session paths use `agent_session_dir(name, sid)`.
+
+<!-- BEGIN GENERATED cross-agent-glob-consumers -->
+<!-- Derived from code by core/scripts/cross-agent-glob-audit.py.
+     DO NOT HAND-EDIT: regenerate with
+       py -3 core/scripts/cross-agent-glob-audit.py --write
+     The PROSE table above carries the incident history and IS
+     hand-maintained; this block carries only the file SET, which
+     is what silently drifted (19 consumers missing, 2026-09-06). -->
+
+Derived cross-agent glob consumers (36 sites, 28 files):
+
+- `core/scripts/_frontier.py:183` — `root.glob('*/sessions/*/body-manifest.yaml')`
+- `core/scripts/_paths.py:56` — `agents_root().glob('*/local-paths.conf')`
+- `core/scripts/_paths.py:354` — `agents_root().glob('*/local-paths.conf')`
+- `core/scripts/_seed_engine.py:879` — `agents_dir.glob('*/local-paths.conf')`
+- `core/scripts/_seed_engine.py:913` — `agents_dir.glob('*/local-paths.conf')`
+- `core/scripts/checks/temp_durability_invariant.py:165` — `Path(agents_root()).glob('*/temp/*')`
+- `core/scripts/claim_artifact_sweep.py:297` — `agents_root().glob('*/aspirations.jsonl')`
+- `core/scripts/counted-close-revert-census.py:221` — `root.glob('*/session/working-memory.yaml')`
+- `core/scripts/counted-close-revert-census.py:223` — `root.glob('*/sessions/*/working-memory.yaml')`
+- `core/scripts/defer-scope-coverage.py:169` — `agents_root().glob('*/')`
+- `core/scripts/durability-property-check.py:203` — `root.glob('*/temp')`
+- `core/scripts/gates/defer_target_existence.py:104` — `r.glob('*/aspirations.jsonl')`
+- `core/scripts/gates/defer_target_existence.py:105` — `r.glob('*/aspirations-archive.jsonl')`
+- `core/scripts/housekeeping-tick.py:304` — `Path(ar()).glob('*/experience.jsonl')`
+- `core/scripts/human-blocked-defer-join.py:140` — `agents_root().glob('*/session/pending-questions.yaml')`
+- `core/scripts/inbound-reference-census.py:218` — `agents_root().glob('*/local-paths.conf')`
+- `core/scripts/learning-routing-repair.py:82` — `agents_root().glob('*/experience.jsonl')`
+- `core/scripts/learning-routing-repair.py:83` — `agents_root().glob('*/experience-archive.jsonl')`
+- `core/scripts/repo-hygiene-sweep.py:204` — `Path(agents_root()).glob('*/aspirations.jsonl')`
+- `core/scripts/skill-analytics.py:349` — `agents_root().glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-coinvocation-discovery.py:129` — `base.glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-discovery.py:224` — `agents_root().glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-discovery.py:271` — `agents_root().glob('*/journal.jsonl')`
+- `core/scripts/skill-freshness-report.py:148` — `base.glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-latency-report.py:111` — `root.glob('*/local-paths.conf')`
+- `core/scripts/skill-retire-candidates.py:153` — `agents_root().glob('*/skill-invocations.jsonl')`
+- `core/scripts/team-contribution-report.py:241` — `Path(agents_root).glob('*/aspirations.jsonl')`
+- `core/scripts/utilization-stats.py:485` — `_agents_root().glob('*/local-paths.conf')`
+- `core/scripts/worker_stall.py:662` — `agents_root.glob('*/session')`
+- `mind_api/src/__main__.py:383` — `resolver._agents_root().glob('*/local-paths.conf')`
+- `mind_api/src/agent_paths.py:286` — `self._agents_root().glob('*/local-paths.conf')`
+- `mind_api/src/agent_paths.py:311` — `self._agents_root().glob('*/local-paths.conf')`
+- `mind_api/src/endpoints/skill_analytics.py:398` — `agents_root.glob('*/skill-invocations.jsonl')`
+- `mind_api/src/endpoints/skill_discovery.py:165` — `ctx.paths.agents_root.glob('*/journal.jsonl')`
+- `mind_api/src/endpoints/skill_discovery.py:206` — `ctx.paths.agents_root.glob('*/skill-invocations.jsonl')`
+- `mind_api/src/endpoints/utilization.py:375` — `agents_root.glob('*/local-paths.conf')`
+
+<!-- END GENERATED cross-agent-glob-consumers -->

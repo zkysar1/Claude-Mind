@@ -114,6 +114,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5b.1c | user-blocker-escalation-check | always-run | same battery → Phase 0.5b.1c section; standalone fallback `bash core/scripts/user-blocker-escalation-check.sh --apply` |
 | 0.5b.2 | dependency-timeout-check | always-run | same battery → Phase 0.5b.2 section; standalone fallback `bash core/scripts/dependency-timeout-check.sh --apply` |
 | 0.5b.1d | directive-mix-check | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e); standalone fallback `bash core/scripts/directive-mix-check.sh`. Read-only, no --apply. Surfaces directive-vs-actual close mix; finding is `on_directive_ok=false`. OBSERVABILITY ONLY — never a selection override (scorer sovereignty; rb-5003 surfacing != eliciting) |
+| 0.5b.1e | inbound-drain | always-run | dispatched by the ALWAYS-RUN battery (Phase 0-pre.0e); standalone fallback `bash core/scripts/inbound-drain-run.sh --apply --json`. Audited entry point for the `inbound-drain` Pattern B executable hook slot; reports `no-slot` / `not-a-vessel`, never a bare 0 |
 | 0.5b.2b | handoff-aging-check | always-run | same battery → Phase 0.5b.2b section; standalone fallback `bash core/scripts/handoff-aging-check.sh --apply` |
 | 0.5b.3 | precondition-defer-recheck | medium | `bash core/scripts/precondition-defer-recheck.sh --max-age-hours 2 --apply` |
 | 0.5b.4 | defer-recheck | medium | `bash core/scripts/defer-recheck.sh --max-age-hours 2 --apply` |

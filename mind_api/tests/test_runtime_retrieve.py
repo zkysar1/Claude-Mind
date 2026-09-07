@@ -54,9 +54,15 @@ def test_retrieve_basic_returns_full_shape(running_daemon):
     data = json.loads(body)
 
     # Top-level shape mirrors retrieve.py main() — see lines 1305-1315.
+    # forged_skills is in this tuple deliberately and is NOT flag-gated
+    # (endpoints/retrieve.py: the load call, the items_returned counter, and
+    # the result-dict key). Until  all 15 forged-skills tests called
+    # load_forged_skills() DIRECTLY and none went through the endpoint, so the
+    # three wiring lines could be deleted with the whole suite green while
+    # retrieve.sh silently stopped returning the lane.
     for key in ("meta", "tree_nodes", "reasoning_bank", "meta_lessons",
                 "guardrails", "pattern_signatures", "experiences", "beliefs",
-                "experiential_index"):
+                "experiential_index", "forged_skills"):
         assert key in data, f"missing key: {key}"
 
     # Meta block carries the request echo + counters.
@@ -183,6 +189,42 @@ def test_retrieve_include_framework_surfaces_rules(running_daemon):
     assert "framework_rules" in data["meta"]["items_returned"]
     # Cap at FRAMEWORK_RULES_CAP=15.
     assert len(data["framework_rules"]) <= 15
+
+
+def test_retrieve_forged_skills_lane_is_wired_and_counted(running_daemon):
+    """The forged_skills lane reaches the wire, and meta counts it ().
+
+    Pins the three endpoint edits that put the lane on the wire — the
+    load_forged_skills() call, the items_returned counter, and the result-dict
+    key. The pre-existing 15 tests in test_forged_skills_retrieval_lane.py all
+    call the loader DIRECTLY, so every one of them stays green if any of those
+    three lines is deleted; this is the integration path they cannot see.
+
+    The list is asserted only for SHAPE, never for contents: the conftest
+    fixture seeds no forged-skills registry, so an empty list is the correct
+    and stable outcome. An emptiness assertion here would couple this test to
+    fixture data it does not own — the wiring is what is under test.
+
+    NOT flag-gated on purpose, unlike framework_rules: the endpoint's own
+    comment gives the reason (a flag the caller must know to set reproduces
+    the discoverability problem the lane exists to fix), so this request sends
+    no include_framework and still expects the key.
+    """
+    _, port = running_daemon
+    _, body = _get(port, "/v1/retrieve",
+                   {"category": "alpha", "depth": "deep", "read_only": "1"})
+    data = json.loads(body)
+
+    assert "forged_skills" in data
+    assert isinstance(data["forged_skills"], list)
+    # The counter is a separate endpoint line from the result-dict key, so it
+    # needs its own assertion — deleting either one alone must fail this test.
+    items = data["meta"]["items_returned"]
+    assert "forged_skills" in items
+    assert items["forged_skills"] == len(data["forged_skills"])
+    # Positive control that the lane is not being read off a flag-gated path:
+    # framework_rules IS gated and must be absent from this same response.
+    assert "framework_rules" not in data
 
 
 def test_retrieve_multi_category(running_daemon):

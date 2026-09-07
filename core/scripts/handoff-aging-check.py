@@ -327,6 +327,52 @@ def _post_board(goal: dict, handoff_to: str, age_hours: float, no_board: bool) -
         return False, "board_post_exception:%s" % exc.__class__.__name__
 
 
+def _has_self_clearing_defer(g: dict) -> bool:
+    """True when the goal carries an ACTIVE defer that re-probes on its own.
+
+    Only `precondition_unmet:` qualifies. It is the one structured prefix whose
+    whole contract is that a sweep re-evaluates it and clears it without a human
+    (aspirations-precheck Phase 0.5b), so a row carrying it is attended work on a
+    cadence, not an un-attended aged handoff.
+
+    `human_blocked:` is deliberately NOT self-clearing — it never auto-clears by
+    design — so it keeps ageing here, which is the behaviour that surfaces it to
+    a person. Narrative (unprefixed) defers also keep ageing: an unstructured
+    defer has no re-probe contract at all.
+
+    This deliberately matches ONE prefix, not the whole structured set, so it is
+    written literally rather than imported: `gates/defer_classifier.py` owns
+    STRUCTURED_DEFER_PREFIXES and importing it here would exclude
+    `human_blocked:` too, which is the opposite of what this predicate wants. The
+    cost of the literal is that a RENAME of that prefix leaves this silently
+    matching nothing — so `test_self_clearing_defer_prefix_still_exists_in_ssot`
+    asserts the string is still a member of that tuple.
+
+    ONE CARVE-OUT, AND IT IS LOAD-BEARING: a SHELVED recurring goal is never
+    treated as self-clearing, however its defer reads. Such a goal shelves
+    BECAUSE its precondition keeps failing, so the very contract that makes
+    `precondition_unmet:` benign elsewhere is the thing that is not happening
+    here — the re-probe runs and fails, forever, silently. guard-2197's own
+    specimen (g-115-15) sat 17+ days unattended in exactly this state.
+
+    Without this carve-out the two halves of g-115-7833 cancel: the recurring
+    branch in `_inbound_age` deliberately keeps shelved rows ageing on
+    `created_at` so they stay visible, and a blanket defer exclusion would then
+    drop them anyway. Measured live 2026-09-06 (DESKTOP-O91DLK2) before the
+    carve-out existed: g-115-105 (recurring, shelved, achievedCount 386,
+    3258.87h) LEFT the reported set, which is precisely the silencing goal
+    outcome 2 forbids. Of 107 pending recurring goals, 5 are shelved and 1 is in
+    both states — small, and exactly the row that must not vanish.
+    """
+    raw = g.get("defer_reason")
+    if not raw:
+        return False
+    if g.get("recurring") and g.get("last_shelved_at") \
+            and g.get("lastAchievedAt") == g.get("last_shelved_at"):
+        return False
+    return str(raw).lower().startswith("precondition_unmet:")
+
+
 def _inbound_age(g: dict, now: dt.datetime) -> tuple:
     """Age of an INBOUND goal, with an explicit fallback chain.
 
@@ -345,7 +391,42 @@ def _inbound_age(g: dict, now: dt.datetime) -> tuple:
     MEANS: on 194 of those 196 the age is a created_at proxy (how long the goal
     has existed) and NOT how long it has been routed to this agent. Reporting
     the number without the basis would silently overstate routing age.
+
+    RECURRING GOALS AGE FROM `lastAchievedAt`, NOT `created_at` (g-115-7833).
+    A recurring goal returns to status:pending on close and NEVER leaves, so its
+    `created_at` never advances and its reported age grows without bound forever
+    — it is permanently, maximally "aged". Measured 2026-09-06 (DESKTOP-O91DLK2):
+    373 of 378 aged inbound rows reached the list on a `created_at` basis, so the
+    lane was ~1% signal by its own basis field, and the top of the HIGH list —
+    where a reader looks first — was structurally guaranteed noise.
+
+    BUT A FRESH `lastAchievedAt` IS NOT EVIDENCE OF ACHIEVEMENT (guard-2197).
+    `recurring-precondition-sweep.py` advances `lastAchievedAt` on every
+    iteration where the goal is past its time gate and a structured precondition
+    FAILS — deliberately, to stop overdue_ratio inflating — and it never writes
+    `achievedCount`. So a SHELVED goal (genuinely stuck, exactly what this
+    detector exists to surface) would read as freshly achieved and drop out of
+    the list entirely. `achievedCount > 0` does NOT protect against this: a goal
+    can carry 43 real past closes and still be shelved right now.
+
+    The discriminator guard-2197 names is the single-read test
+    `lastAchievedAt == last_shelved_at => shelved, not achieved`. Measured on the
+    live queue the same day: of 107 pending recurring goals, `lastAchievedAt` is
+    present on 107 and `last_shelved_at` on 5 — and all 5 are currently shelved,
+    including g-115-15 (the goal guard-2197 was itself measured on) and g-115-105
+    (3258.76h, on this box's HIGH list). Those five keep aging from `created_at`
+    so the fix cannot silence a genuinely stale sensor (goal outcome 2,
+    guard-1562 / guard-2499).
     """
+    if g.get("recurring") and (g.get("achievedCount") or 0) > 0:
+        last_achieved = g.get("lastAchievedAt")
+        # Shelved (stamp advanced by the precondition sweep, not by a close) —
+        # fall through to created_at so the row keeps aging. guard-2197.
+        if last_achieved and last_achieved != g.get("last_shelved_at"):
+            age = _age_hours(last_achieved, now)
+            if age is not None:
+                return age, "lastAchievedAt"
+
     for field, basis in (("handoff_created_at", "handoff_created_at"),
                          ("created_at", "created_at"),
                          ("started", "started")):
@@ -386,6 +467,7 @@ def _inbound_pass(goals: list, self_agent: str, escalate_hours: float,
     count is reported so a bounded view is never mistaken for the whole queue.
     """
     scanned_pending = 0
+    excluded_self_clearing = 0
     matched = []
     for g in goals:
         if not isinstance(g, dict):
@@ -396,6 +478,18 @@ def _inbound_pass(goals: list, self_agent: str, escalate_hours: float,
         if not self_agent:
             continue  # unresolved self: no row can be inbound — say nothing
         if g.get("intended_agent") != self_agent and g.get("handoff_to") != self_agent:
+            continue
+        # A row with an ACTIVE self-clearing defer is NOT un-attended work
+        # (). `precondition_unmet:` re-probes on its own cadence
+        # (aspirations-precheck Phase 0.5b), so board-escalating it as an aged
+        # handoff is noise on a shared surface — strictly worse than a silent
+        # stall, because it trains other agents to discount the tag.
+        # `human_blocked:` is deliberately NOT excluded: it never auto-clears, so
+        # ageing it toward a human is exactly what should happen. Measured
+        # 2026-09-06 (DESKTOP-O91DLK2): of 378 inbound rows, 24 carry a defer —
+        # 22 precondition_unmet:, 2 human_blocked:.
+        if _has_self_clearing_defer(g):
+            excluded_self_clearing += 1
             continue
         age, basis = _inbound_age(g, now)
         if age is None:
@@ -437,12 +531,20 @@ def _inbound_pass(goals: list, self_agent: str, escalate_hours: float,
         "aged_count": len(aged),
         "high_count": len(high),
         "undateable_count": len(undateable),
+        # Reported, never silent: a row this pass DECLINED to age is a row a
+        # reader would otherwise assume was scanned and found clean (guard-1802).
+        "excluded_self_clearing_defer": excluded_self_clearing,
         "reported": reported,
         "suppressed_count": max(0, len(aged) - len(reported)),
         "max_report": int(max_report),
+        # `lastAchievedAt` MUST appear here (). This tally hardcodes its
+        # bases, so a basis missing from this tuple is counted by nothing and the
+        # breakdown silently under-reports the population it claims to describe —
+        # the same vacuous-reporting shape the basis field exists to prevent.
         "age_basis_breakdown": {
             b: sum(1 for m in matched if m["age_basis"] == b)
-            for b in ("handoff_created_at", "created_at", "started")
+            for b in ("handoff_created_at", "lastAchievedAt", "created_at",
+                      "started")
         },
     }
 

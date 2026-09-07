@@ -220,7 +220,7 @@ table's own instruction. Corrected 2026-07-28 by the fresh-eyes pass on this fil
 | `meta/meta_transfer.py` | `transfer/_index.yaml` (b), `reflection-` (b), `encoding-strategy.yaml` (b), **`goal-selection-strategy.yaml` (a)** | **MIXED — 3 FIXED, 1 correctly left bare** |
 | `meta/meta_experiment.py` | `active-experiments.yaml`, `completed-experiments.yaml` | **(b) — FIXED** (both, 2 handlers) |
 | `meta/strategy_apply.py` | `aspiration-generation-strategy.yaml` (b), **`goal-selection-strategy.yaml` (a)** | **MIXED — FIXED, routed per-basename at run time** |
-| `meta/meta_dead_ends.py` | `dead-ends.jsonl` | (b) — **UN-CURED, 2 sites, tracked by g-115-4017** (confirmed on BOTH axes: no handler, AND it writes via `_atomic_write_with_fallback` while reading via `ensure_local` — the wedged shape, no raw-write exemption) |
+| `meta/meta_dead_ends.py` | `dead-ends.jsonl` | **(b) — FIXED 2026-09-07 (g-115-4017)**, all 3 mutating handlers (`add`, `increment`, `review`); `check`/`read` are read-only and stay on `ensure_local`. Was the eighth site (see §4). Class re-confirmed at cure time on BOTH axes. **Two shapes its YAML siblings did not have** — see below |
 | `meta/meta_impk.py` | `improvement-velocity.yaml` | **(a)** — `merge_improvement_velocity`; already carries the cure regardless. Its one apparent "bare lock" is a COMMENT describing the idiom it replaced, not a call — grep the executable line. |
 
 #### Reclassification: `backpressure.yaml` (b) -> (a), 2026-07-31 (g-115-4310, alpha, cc-04/Linux)
@@ -312,6 +312,40 @@ Regression-guarded by `core/scripts/tests/test_meta_write_class_conflict_retry.p
 (stub backend; each invariant proven RED under reversion, including the
 mixed-class routing in both directions).
 
+#### The eighth site's cure, and the two shapes it added (2026-09-07, g-115-4017)
+
+`meta_dead_ends.py` is now FIXED. It is the first **JSONL** module in this
+family — its siblings are all YAML — so the force_fresh seam is
+`_read_jsonl(path, force_fresh=True)` rather than `_read_yaml`. Two things it
+carried that none of the seven before it did, both worth recognising elsewhere:
+
+1. **The read was outside the lock ENTIRELY, not merely un-refreshed.**
+   `increment` and `review` read at module scope and handed the mutated list to
+   a `_persist` that locked only the WRITE. That is a strictly wider lost-update
+   window than a bare in-lock read, and it is invisible to a write-time
+   assertion because such code still writes under a lock. Proven by mutation:
+   hoisting the read back out turns the read-time test RED with
+   `increment READ with no lock held ([False])`.
+
+2. **An id DERIVED from the read was stamped onto retry-visible state.**
+   `add` allocated `_next_id(records)` onto the request payload `item`, which
+   outlives the cycle — so a retry saw `"id" in item`, SKIPPED re-allocation,
+   and re-wrote the id computed from the pre-conflict snapshot. This is
+   `guard-5322` (a CAS fence proves no lost update, never that a DERIVED value
+   is unique) meeting constraint 3 above (hoisted accumulators). It is a real
+   duplicate, not a theoretical one: the mutation proof reverting `dict(item)`
+   to `item` lands **`['de-001', 'de-002', 'de-002']`** — our record colliding
+   with the peer's. The cure rebuilds BOTH `rec` and `outcome` per attempt.
+
+**What was NOT changed, deliberately.** `history.snapshot` and
+`changelog.append` sit inside the cycle and are non-idempotent: an absorbed
+conflict leaves one extra pre-write snapshot and one extra `edit` changelog line
+per retry, for a single landed write. That is inherited verbatim from the cured
+siblings (`meta_backpressure._persist_unlocked` has the same two calls in the
+same position), so it is a property of the shared pattern rather than of this
+module, and a module-local divergence would break the uniformity `guard-1733`
+asks the next reader to rely on. Recorded here rather than silently accepted.
+
 `meta_yaml.py` is FIXED: `set_field`/`append_item` (g-115-3177) and
 `_create_backpressure_monitor`/`_trigger_generation_transition` (g-115-3295).
 Its `_persist` is retained but has **no callers** — treat a new call to any
@@ -383,6 +417,69 @@ evidence: `archive_sweep` phase 2 rewrites live as
 union-by-id handler would restore archived records to live while the archive also
 holds them, which `_check_no_duplicate_id` treats as a corrupt state. So the
 writers were converted to `locked_rmw` instead.
+
+**Two corrections to the paragraph above, both measured (g-115-4357, 2026-09-05).**
+It said the resurrected duplicate makes "every subsequent experience-add fail".
+`add(ctx)` calls `_check_no_duplicate_id(items, rec["id"], archive)`, which raises
+for **that one id**, not for every add — and that id was ALREADY blocked by its
+ARCHIVE membership before any resurrection, so resurrection adds no new add-path
+failure. (`_uniquify_id`, the auto-suffix path, is reached only from
+`archive_goal(ctx)`.) The harm is real but sits elsewhere: archived records
+re-enter LIVE and are served as current by retrieval, journal rotation stops
+binding, and an `experience-archive` `set_field` edit is silently REVERTED —
+undetected data loss, the worst of the three.
+
+#### The GIT lane routed the same three basenames to a union, and why that is now consistent
+
+This section refuses registration for `experience.jsonl` and
+`experience-archive.jsonl`. Independently, `.gitattributes` routes those two plus
+`journal.jsonl` to the `merge=ayoai-ledger` git driver, which until 2026-09-05
+applied `_union_dict_list(key_fields=("id",))` — **precisely the union refused
+here**. That was not an oversight; it rested on a written premise, stated twice in
+`.gitattributes`, that unioning "by record/counter rather than by line" avoids
+resurrection. Reproduced against the real driver, that premise is FALSE: id-keying
+changes what counts as a DUPLICATE, never whether a ONE-SIDED record SURVIVES.
+All three basenames resurrected.
+
+The driver is now base-aware (`_three_way_id_merge`): keep a record iff it is on
+BOTH sides OR absent from the base, so a record the base holds and one side has
+dropped is DELETED rather than restored. An empty `%O` degrades exactly to the old
+union, which is the add/add shape the union was always right about.
+
+**The asymmetry that lets the two lanes differ legitimately — and it is a
+CONTRACT difference, not a judgement call.** `merge_handler_for` is
+`Optional[Callable[[bytes, bytes], bytes]]`, called `handler(body, remote_bytes)`
+— **two** arguments, no base, and this convention already records that for the
+mirror "no base exists, and none can" (history is per-box; the mirror needs both
+machines to compute identical bytes). Git ALWAYS supplies `%O`. So the base-aware
+cure is available to the git driver and structurally unavailable to a registered
+`_HANDLERS` entry. Registration stays REFUSED for these stores. Anyone tempted to
+port `_three_way_id_merge` into `coordination_merge` should stop at the arity.
+
+**Scope the safety claim to the arm, never to "the git lane"** (measured
+2026-09-06 while closing g-115-4357, as the Q2 negative check on that very fix).
+`merge_bytes` has FOUR dispatch arms and the arity asymmetry above is not a clean
+lane boundary, because arm 3 calls `merge_handler_for` **from inside the git
+driver**:
+
+| arm | basenames | base-aware? |
+|---|---|---|
+| 1 `_JSONL_ID_UNION` | `experience.jsonl`, `experience-archive.jsonl`, `journal.jsonl` | YES (g-115-4357) |
+| 2 `_COUNTER_JSON` | counter files | n/a — monotone combine, resurrection is not the shape |
+| 3 `cm.merge_handler_for(pathname)` → `handler(ours, theirs)` | every registered `_HANDLERS` store reached through git, incl. `reasoning-bank.jsonl` and `guardrails.jsonl` (`coordination_merge.py:137`, `:431`, both commented "union by record id") | **NO — and here the base EXISTS** |
+| 4 `_validated_text_merge` | everything else | YES |
+
+Arm 3 is the residual: git hands the driver a real `%O` and the 2-arg handler
+contract discards it, so the id-keyed union those two stores get through git is
+base-blind for the same reason arm 1's was — and *not* for the mirror's reason,
+which is that no base exists at all. The mirror's constraint is structural; arm
+3's is a signature that predates anyone needing a base. So the arity is a correct
+stop sign for porting `_three_way_id_merge` INTO `coordination_merge`, and NOT a
+reason arm 3 must stay base-blind. Whether to widen the handler contract (an
+optional third parameter, defaulted, so mirror callers are unaffected) is a
+separate decision with its own blast radius across every `_HANDLERS` entry — it
+was deliberately left out of g-115-4357's scope rather than overlooked. Until it
+is made, do not read arm 1's fix as covering the lane.
 
 The general test, before reaching for the cheaper cure: **does any writer of this
 store delete, filter, OR MUTATE records?** If yes, registration is not merely more

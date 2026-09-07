@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import sys
 import types
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -39,14 +40,19 @@ from mind_api.src.world import pipeline  # noqa: E402
 
 
 def _rec(rid, stage, reflected=True, encoded=None, next_review=None,
-         outcome="CORRECTED", replay_count=3):
+         outcome="CORRECTED", replay_count=3, last_replayed=None):
     """Build a pipeline record. encoded=None omits encoded_via_chronic entirely
-    (the common case); encoded=True/False sets it explicitly."""
+    (the common case); encoded=True/False sets it explicitly. last_replayed=None
+    omits the field — the partially-stamped defect class (g-115-9221) is exactly
+    last_replayed SET with next_review omitted, so both must be independently
+    controllable."""
     rm = {"replay_count": replay_count}
     if encoded is not None:
         rm["encoded_via_chronic"] = encoded
     if next_review is not None:
         rm["next_review_date"] = next_review
+    if last_replayed is not None:
+        rm["last_replayed"] = last_replayed
     return {
         "id": rid, "stage": stage, "reflected": reflected,
         "outcome": outcome, "category": "npc-cognition", "replay_metadata": rm,
@@ -235,6 +241,131 @@ def test_dual_present_live_freshness_can_include(tmp_path):
     archive = [_rec(rid, "archived", next_review="2999-01-01", replay_count=2)]  # deferred (stale)
     ids = _read_candidates(tmp_path, live, archive)
     assert rid in ids, "live copy's past next_review must win → included when genuinely due (g-115-2773)"
+
+
+# --------------------------------------------------------------------------
+#  / guard-6125 — the exclusion must read the FIELD PAIR.
+#
+# THE BUG: the exclusion tested next_review_date ALONE, under `if next_review:`.
+# A record stamped with last_replayed but a NULL next_review_date therefore
+# satisfied no comparison at all and re-entered the pool every cycle, however
+# recently it had been replayed. replay/SKILL.md claims two layers of
+# defense-in-depth; for this population there was ONE, and it was the
+# honor-system LLM-side skip in Step 1.
+#
+# MEASURED 2026-09-06 against the live endpoint: 784 candidates before, 774
+# after, 10 removed, 0 newly added — all 10 partially stamped and inside the
+# window. Five carried a bare date and five an ISO timestamp, which is why
+# test_last_replayed_datetime_form_tolerated below is not hypothetical.
+# --------------------------------------------------------------------------
+
+def _days_ago(n):
+    return (date.today() - timedelta(days=n)).isoformat()
+
+
+def test_last_replayed_within_window_excluded_when_next_review_null(tmp_path):
+    # THE FIX. next_review_date absent, last_replayed 1 day old → must be held
+    # back. Before the fix this record was returned on every single cycle.
+    ids = _read_candidates(
+        tmp_path,
+        live=[_rec("partial-fresh", "resolved", next_review=None,
+                   last_replayed=_days_ago(1), replay_count=1)],
+        archive=[],
+    )
+    assert "partial-fresh" not in ids, (
+        "a record replayed 1 day ago must be excluded even with next_review_date "
+        "NULL — this is the g-115-9221 leak"
+    )
+
+
+def test_last_replayed_outside_window_included_when_next_review_null(tmp_path):
+    # The other side of the boundary, and the over-correction guard: once the
+    # 7-day window has passed the record is genuinely due again and MUST return.
+    # A fix that excluded on last_replayed presence alone would strand it forever.
+    ids = _read_candidates(
+        tmp_path,
+        live=[_rec("partial-stale", "resolved", next_review=None,
+                   last_replayed=_days_ago(30), replay_count=1)],
+        archive=[],
+    )
+    assert "partial-stale" in ids, (
+        "a record last replayed 30 days ago is due again — excluding it would "
+        "convert a leak into a permanent strand"
+    )
+
+
+def test_last_replayed_window_boundary(tmp_path):
+    # Pin the boundary explicitly so a future edit to REPLAY_WINDOW_DAYS or to
+    # the comparison operator fails loudly rather than shifting silently by a day.
+    ids = _read_candidates(
+        tmp_path,
+        live=[
+            _rec("inside-6d", "resolved", next_review=None, last_replayed=_days_ago(6)),
+            _rec("outside-8d", "resolved", next_review=None, last_replayed=_days_ago(8)),
+        ],
+        archive=[],
+    )
+    assert "inside-6d" not in ids
+    assert "outside-8d" in ids
+
+
+def test_last_replayed_datetime_form_tolerated(tmp_path):
+    # guard-6125: last_replayed is written in BOTH bare-date and ISO-timestamp
+    # form, and format screens IN a bad writer without ever screening one OUT —
+    # 5 of the 10 live leaks carried the timestamp form. A bare
+    # date.fromisoformat() raises on it, and the swallowed ValueError would mean
+    # INCLUDE, silently restoring the exact bug for half the population.
+    ids = _read_candidates(
+        tmp_path,
+        live=[
+            _rec("dt-fresh", "resolved", next_review=None,
+                 last_replayed=_days_ago(1) + "T17:58:15"),
+            _rec("dt-stale", "resolved", next_review=None,
+                 last_replayed=_days_ago(30) + "T17:58:15"),
+        ],
+        archive=[],
+    )
+    assert "dt-fresh" not in ids
+    assert "dt-stale" in ids
+
+
+def test_last_replayed_unparseable_falls_through(tmp_path):
+    # Fail-open, matching the replay_count and next_review_date branches: an
+    # unparseable stamp must not exclude the record.
+    ids = _read_candidates(
+        tmp_path,
+        live=[_rec("bad-lr", "resolved", next_review=None,
+                   last_replayed="not-a-date")],
+        archive=[],
+    )
+    assert "bad-lr" in ids
+
+
+def test_next_review_clause_still_independent(tmp_path):
+    # Regression guard on the OTHER clause: a future next_review_date must still
+    # exclude on its own, even when last_replayed is old enough to pass. The two
+    # branches are independent by design (guard-2024 — neither field's absence is
+    # fused into the other's comparison), so each must be able to exclude alone.
+    ids = _read_candidates(
+        tmp_path,
+        live=[_rec("future-nr-old-lr", "resolved", next_review="2999-01-01",
+                   last_replayed=_days_ago(30))],
+        archive=[],
+    )
+    assert "future-nr-old-lr" not in ids
+
+
+def test_neither_field_set_still_included(tmp_path):
+    # A never-replayed record carries neither field and must remain a candidate.
+    # Reading either field at the wrong nesting level would match every record
+    # and silently empty the pool (guard-5676), so pin the both-absent case.
+    ids = _read_candidates(
+        tmp_path,
+        live=[_rec("never-replayed", "resolved", next_review=None,
+                   last_replayed=None, replay_count=0)],
+        archive=[],
+    )
+    assert "never-replayed" in ids
 
 
 if __name__ == "__main__":

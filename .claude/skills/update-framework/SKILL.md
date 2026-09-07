@@ -96,6 +96,15 @@ State the shape and the evidence (the tag, or its absence) before proceeding.
    - rc=0 (clear) → Bash: `bash core/scripts/framework-pull.sh --adopt`. It
      copies, verifies in a worktree pinned at the adopt commit (C4), rolls back
      on red, records `world/installed-release.yaml`, and recycles the daemon.
+     ⚠ QUIESCE THE DAEMON FIRST ON A LIVE-DAEMON BOX. That C4 worktree is
+     exactly what guard-5866 forbids there, and `framework_pull.py` carries NO
+     live-daemon precondition (measured: its only daemon logic is the recycle
+     predicate and the `daemon.port` symlink at :489 — which mitigates the
+     stale-port half, not the kill half). The worktree spawns its own daemon,
+     whose `_sweep_orphan_daemons` matches `mind_api.src` by command line with
+     zero runtime-dir scoping, so it kills the daemon every agent on the box is
+     using. Step 4 already carries this caveat for the MANUAL suite; the adopt
+     path needs it too because its worktree is internal and invisible here.
    - rc=2 (blocked) → Bash: `bash core/scripts/promotion-plan-triage.sh`.
      Record a decision per flagged file in `world/promotion-decisions.yaml`
      (§a: keep-prod-ahead / back-port-filed / KERNEL-escalate). Never adopt

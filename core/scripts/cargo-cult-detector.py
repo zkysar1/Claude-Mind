@@ -48,6 +48,22 @@ from _owner_qualified_signal import qualified_signal  # noqa: E402  (guard-2107,
 
 from _gate_log import log as _gate_log
 
+# The batch-Idea's target aspiration is RESOLVED per deployment, never
+# hardcoded. This is a FRAMEWORK file that travels the promotion chain, so a
+# deployment-specific literal either breaks downstream or is clobbered by the
+# next sync (). See cmd_audit_all for why the local existence scan this
+# replaced was not equivalent ().
+try:
+    from _escalation_target import (  # noqa: E402
+        resolve as _resolve_asp, source_flag as _asp_source)
+    ESCALATION_ASP, _ASP_VIA = _resolve_asp(
+        _paths.CORE_ROOT, _paths.WORLD_DIR, _paths.AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(
+        ESCALATION_ASP, _paths.WORLD_DIR, _paths.AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ASP_VIA, ESCALATION_SOURCE = (
+        "asp-001", "fallback:import-failed", "world")
+
 DEFAULT_PRIORITY = "MEDIUM"
 DEFAULT_CATEGORY = "framework-maintenance"
 
@@ -1049,30 +1065,26 @@ def cmd_audit_all(args, cfg) -> int:
         "created_at": now.replace(microsecond=0).isoformat(),
     }
 
-    # File on the framework-maintenance aspiration ( by convention).
-    # When it doesn't exist, fall back to the highest-cons_routine goal's
-    # parent — at least the batch lands somewhere readable.
-    target_asp = "asp-001"
-    target_source = "world"
-    # Verify  exists in the world queue before using it.
-    world_src = source_path("world")
-    if world_src.exists():
-        found_asp = False
-        with world_src.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    a = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if a.get("id") == target_asp:
-                    found_asp = True
-                    break
-        if not found_asp:
-            target_asp = top[0]["asp_id"]
-            target_source = top[0]["source"]
+    # File on the deployment's resolved framework-maintenance home. When nothing
+    # resolves, fall back to the highest-cons_routine goal's parent — at least
+    # the batch lands somewhere readable.
+    #
+    # THE MISS PATH IS SPLIT ON PURPOSE (guard-4781). The scan this replaced
+    # asked one question — "is this id anywhere in the WORLD store?" — and fed
+    # two different answers into one branch. That conflated a wrong-queue hit
+    # with a genuine absence. MEASURED here 2026-09-07:  is in the world
+    # ARCHIVE and live in the AGENT queue, so the world-only test MISSED a live
+    # record and silently fell through to top[0]; and per _escalation_target's
+    # _DEAD_STATUSES note the upstream world carries a RETIRED  in its
+    # live store, where the same test would TARGET a dead record. Either way
+    # `target_source` stayed pinned to "world". resolve() answers the id question
+    # across both queues WITH a liveness filter, and reports HOW it answered;
+    # only `fallback:none-exist` means nothing resolved, which is the one case
+    # the top[0] fallback was written for ().
+    target_asp, target_source = ESCALATION_ASP, ESCALATION_SOURCE
+    if _ASP_VIA == "fallback:none-exist":
+        target_asp = top[0]["asp_id"]
+        target_source = top[0]["source"]
 
     if args.dry_run:
         print("[cargo-cult audit-all] DRY-RUN — would file:")

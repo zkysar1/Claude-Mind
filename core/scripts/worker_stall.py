@@ -3,10 +3,16 @@
 
 WHY THIS EXISTS, and why it is NOT "wire the watchdog into the worker loop".
 
-`agent-watchdog.py --tick` has exactly one invoker, `iteration-close.sh`, which
-the WORKER loop deliberately skips -- so no probe has ever run on a worker box.
-The obvious fix is to call the tick from `worker-loop` Phase -0.4. That fix is
-necessary and INSUFFICIENT, for two measured reasons:
+`agent-watchdog.py --tick` HAD exactly one invoker when this landed,
+`iteration-close.sh`, which the WORKER loop deliberately skips -- so no probe
+had ever run on a worker box. The obvious fix is to call the tick from the
+worker loop. THAT FIX SHIPPED in the same goal: `worker-loop/SKILL.md`
+Phase -0.2 invokes it at the top of every worker cycle, so a worker DOES tick
+now -- corrected 2026-09-07 (g-115-9324), because the stale present tense here
+was cited as live evidence for the opposite conclusion and helped produce a
+HIGH goal on a false premise. The argument below is UNAFFECTED and is why this
+module exists: wiring the tick was necessary and INSUFFICIENT, for two measured
+reasons:
 
   1. FOUR of the ten probes are structurally INERT in worker shape. A worker box
      is `agent-state: IDLE` BY DESIGN (worker-loop/SKILL.md L125-127, L316).

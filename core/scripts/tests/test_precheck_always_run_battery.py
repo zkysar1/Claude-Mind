@@ -246,15 +246,30 @@ def test_report_only_lane_never_receives_apply(capsys):
     assert "--json" in slate
 
 
-def test_apply_reaches_the_four_notification_lanes(capsys):
+def test_apply_reaches_every_lane_that_declares_it(capsys):
     """The complement of the test above — if --apply stopped propagating, the
-    loop's escalation lanes would become silent no-ops with no error anywhere."""
+    loop's escalation lanes would become silent no-ops with no error anywhere.
+
+    ANCHORED BY NAME, NOT BY COUNT. This read ``len(applied) == 4`` until a fifth
+    apply-lane was registered (sidecar-inbound-drain, g-369-31) and went red on an
+    addition it had no business objecting to — the spelled-out count the module
+    docstring one file over explicitly warns about, in the test that was supposed
+    to be watching for drift.
+
+    The exact-equality line STAYS (guard-3948: an exact-equality test is what
+    catches the entry you missed). The count is replaced rather than merely
+    deleted because equality against a comprehension over the same table is
+    tautological — it restates the source and would pass just as happily if every
+    lane lost ``apply_flag`` at once (guard-1836: a coverage assertion has zero
+    discriminating power against over-matching). The named subset is the part with
+    teeth, and unlike a count it survives every future registration."""
     calls = []
     bat.run(as_json=True, apply=True,
             lane_runner=make_runner(_clean_payloads(), calls=calls))
     applied = {c[0] for c in calls if "--apply" in c}
     assert applied == {l["script"] for l in bat.LANES if l["apply_flag"]}
-    assert len(applied) == 4
+    assert applied >= {"inbox-alert-age-check.sh", "user-blocker-escalation-check.sh",
+                       "dependency-timeout-check.sh", "handoff-aging-check.sh"}
 
 
 def test_mode_is_always_reported(capsys):

@@ -224,6 +224,52 @@ def test_path_d_empty_blocked_by_no_synth():
     assert synth_ref(g) is None
 
 
+# ── Path (d) POLYMORPHISM () ──
+# `blocked_by` is polymorphic in live data: aspirations.py parse_value() applies
+# no per-field typing, so `aspirations-update-goal.sh <id> blocked_by "g-NNN-NN"`
+# writes a BARE STRING. Path (d) used to isinstance(list)-gate and skip those,
+# returning None -- and the collect_blocked DEPENDENCY branch is the ONLY branch
+# with no _synth_block_ref fallback, so the None survived to blocked.append() and
+# quiescence C2 (blocker_ref_required, needs a dict) failed -> B7 backoff churn.
+# These pin the normalization. They FAIL on the pre-fix isinstance gate.
+
+def test_path_d_string_blocked_by_synthed():
+    # The bare-STRING form must synth exactly like the list form.
+    g = _goal("g-d-str", blocked_by="g-pred-1")
+    ref = synth_ref(g)
+    assert isinstance(ref, dict), "bare-string blocked_by must not return None"
+    assert ref["type"] == "resource"
+    assert str(ref["external_id"]).startswith("dependency:")
+    assert ref["synthesized"] is True
+    assert _is_future(ref)
+
+
+def test_path_d_string_and_list_external_id_identical():
+    # C4 hysteresis hashes external_ids, so the SAME dependency expressed as a
+    # string and as a list must hash identically -- otherwise a shape change
+    # (or this very fix landing) would look like a new blocker.
+    g_str = _goal("g-d-s", blocked_by="g-pred-1")
+    g_list = _goal("g-d-l", blocked_by=["g-pred-1"])
+    assert synth_ref(g_str)["external_id"] == synth_ref(g_list)["external_id"]
+
+
+def test_path_d_string_blocked_by_outranks_narrative_defer():
+    # Evaluation order is (d) before (e). A machine-readable dependency is the
+    # better classification than free text, and the LIST form already won that
+    # way -- the string form must not be classified as a narrative defer.
+    g = _goal("g-d-both", blocked_by="g-pred-1", defer_reason="waiting on upstream")
+    ref = synth_ref(g)
+    assert str(ref["external_id"]).startswith("dependency:")
+
+
+def test_path_d_malformed_blocked_by_no_synth():
+    # Normalization must not manufacture a confident wrong id from a shape that
+    # is neither list nor str (_ensure_list drops these to []), and the
+    # collect_candidates/collect_blocked read sites agree by using the same helper.
+    for bad in (5, {"g": 1}, True):
+        assert synth_ref(_goal("g-bad", blocked_by=bad)) is None, f"shape {bad!r} must not synth"
+
+
 # ── Path (a) C3 roll-forward () ──
 
 def test_path_a_rollforward_stale_structured_defer_is_future():

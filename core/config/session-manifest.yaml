@@ -223,15 +223,20 @@ files:
     required_when_running: false
 
   # ── Agent watchdog (per-agent observability — periodic tick) ────────
-  # agent-watchdog.py runs as a periodic probe from iteration-close.sh
-  # productivity-check via `agent-watchdog.py --tick`. State persists
-  # across iterations in watchdog-prev-state.json. No daemon, no PID
-  # file, no /start spawn — cross-platform tick model that survives the
-  # Git-Bash-on-Windows daemon-detachment issue (asp-280 era). Probe
-  # transitions log to core/logs/watchdog-<agent>.jsonl.
+  # agent-watchdog.py runs as a periodic probe from TWO call sites (corrected
+  # 2026-09-07,  — naming only the first was cited as evidence a
+  # worker box never ticks, and produced a HIGH goal on a false premise):
+  # iteration-close.sh productivity-check (REDUCER-only), and
+  # worker-loop/SKILL.md Phase -0.2, at the top of every worker cycle since
+  # . State persists across iterations in watchdog-prev-state.json.
+  # No daemon, no PID file, no /start spawn — cross-platform tick model that
+  # survives the Git-Bash-on-Windows daemon-detachment issue (asp-280 era).
+  # Probe transitions log to core/logs/watchdog-<agent>.jsonl ON A STATE
+  # CHANGE ONLY, so that log going stale is NOT evidence the tick stopped —
+  # this file's mtime is the liveness instrument.
   - file: watchdog-prev-state.json
     purpose: agent-watchdog tick-mode prev-state (snapshots per probe; diffed by next tick)
-    writer: agent-watchdog.py --tick (invoked from iteration-close.sh)
+    writer: agent-watchdog.py --tick (iteration-close.sh productivity-check on a reducer; worker-loop Phase -0.2 on a worker)
     recovery_action: clear
     sync_tier: machine_local
     required_when_idle: false

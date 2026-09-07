@@ -417,6 +417,55 @@ def load_counters(kind, world_dir=None):
     return out
 
 
+CORRECTION_SUFFIX = "__corrected"
+
+
+def apply_corrections(counters):
+    """Subtract each `<c>__corrected` from `<c>` (floored at 0) and drop the
+    correction keys from the returned view.
+
+    THE CORRECTION IS A SEPARATE MONOTONE COUNTER, NOT A NEGATIVE DELTA
+    (g-115-4349). Every layer below the merge already accepts a signed delta --
+    `record_increment` does `int(delta)`, `utilization-flush.apply_deltas` does
+    `base + delta` -- so a `--by -1` looks implementable and is correct on ONE
+    box. `coordination_merge.merge_utilization_counters` then takes a per-counter
+    MAX across boxes, and its own docstring says why that eats it: "MAX never
+    loses an increment, it can only fail to gain one." A decrement is exactly
+    what MAX discards, silently, at the next cross-box merge. An ever-increasing
+    `<c>__corrected` is reconciled correctly by the same MAX, so the correction
+    survives every box with no change to the endpoint, the spool, the flush or
+    the merge handler.
+
+    Floored at 0 rather than allowed negative: a correction is a claim that N
+    credits were mis-attributed, and MAX can deliver the correction to a box
+    whose base count has not caught up yet (spools flush independently). A
+    transient negative would read as a live signal to every consumer;
+    `endpoints/utilization.py::_is_candidate` turns a zero-evidence record into
+    a RETIREMENT PROPOSAL, so under-reporting to 0 is the direction that merely
+    delays a decision instead of destroying a record.
+
+    Returns a NEW dict; the input is never mutated (`load_counters` hands out the
+    live map, and `retrieve.py` reads the same blob more than once per request).
+    """
+    if not isinstance(counters, dict):
+        return {}
+    if not any(
+        isinstance(k, str) and k.endswith(CORRECTION_SUFFIX) for k in counters
+    ):
+        return counters
+    out = {}
+    for key, value in counters.items():
+        if isinstance(key, str) and key.endswith(CORRECTION_SUFFIX):
+            continue
+        corrected = counters.get(key + CORRECTION_SUFFIX) if isinstance(key, str) else None
+        if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and isinstance(corrected, (int, float)) and not isinstance(corrected, bool):
+            out[key] = max(0, value - corrected)
+        else:
+            out[key] = value
+    return out
+
+
 def utilization_of(rec, counters=None):
     """Counters for one record: the sidecar's entry when present, else embedded.
 
@@ -451,15 +500,22 @@ def utilization_of(rec, counters=None):
     fresh-eyes finding on the reader seam, 2026-08-18, and closed as
     already-defended after reading the writer — the cross-reference above is
     what was actually missing.)
+
+    Whichever side wins, the result passes through `apply_corrections` so a
+    mis-credit recorded as `<c>__corrected` is netted out here rather than at
+    every call site (g-115-4349). That subtraction is orthogonal to the
+    sidecar-vs-embedded choice above: it applies to both, because a correction
+    can be filed against a record whose counters have not been touched since
+    the cutover.
     """
     if not isinstance(rec, dict):
         return {}
     if counters:
         found = counters.get(rec.get("id"))
         if isinstance(found, dict):
-            return found
+            return apply_corrections(found)
     embedded = rec.get("utilization")
-    return embedded if isinstance(embedded, dict) else {}
+    return apply_corrections(embedded) if isinstance(embedded, dict) else {}
 
 
 def load_all_counters(world_dir=None):

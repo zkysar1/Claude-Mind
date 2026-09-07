@@ -955,3 +955,116 @@ def test_guard_is_negative_so_custom_named_meta_roots_still_work():
 def test_shard_branch_still_precedes_the_config_guard():
     assert cm.merge_handler_for(
         ".mind-data/world/team-state/agents/bravo.yaml") is cm.merge_team_state_shard
+
+
+# --- : the float fold is TREE-specific and must not travel ---------
+#
+# _canonicalize_for_merge bundles three normalizations and merge_backpressure
+# imported all three. The float->int fold is justified in the helper's own
+# docstring by a TREE-SPECIFIC argument ("a real tree.write_tree file only ever
+# has int counts"), which is false for backpressure.yaml: imp_k_samples is a
+# genuine float list appended by meta-backpressure.py, and a learning_value of
+# exactly 0.0 is common. Measured pre-fix: [1.0, 0.0, 0.5] -> [1, 0, 0.5].
+#
+# Nothing broke at the time (no consumer type-checks, and the only arithmetic is
+# a mean where int 0 and float 0.0 agree), so this is a silent type change in a
+# cross-box merge path -- exactly the shape that has no failing symptom to
+# regress against later. Hence a pin rather than a fix alone.
+
+
+def test_backpressure_preserves_float_imp_k_samples():
+    """THE REGRESSION PIN. Pre-fix these round-tripped as [int, int, float]."""
+    doc = {"active_monitors": [{"meta_change_id": "m1", "status": "monitoring",
+                                "imp_k_samples": [1.0, 0.0, 0.5]}]}
+    blob = _y(doc)
+    out = _load(cm.merge_backpressure(blob, blob))
+    samples = out["active_monitors"][0]["imp_k_samples"]
+    assert samples == [1.0, 0.0, 0.5]
+    assert all(isinstance(x, float) for x in samples), (
+        f"integral floats were folded to int: {[type(x).__name__ for x in samples]} "
+        "-- the tree-specific coercion has leaked back into a meta handler")
+
+
+def test_merge_tree_still_folds_integral_floats():
+    """BREADTH CONTROL, and the one that makes the fix falsifiable in the other
+    direction. The cure is an OPT-IN parameter, so deleting the fold outright --
+    or forgetting to thread coerce_int_floats=True through merge_tree's returns --
+    would make the pin above pass while silently reverting guard-907's scalar-type
+    commutativity cure for the tree. A non-integral float must still survive."""
+    doc = {"nodes": {"n1": {"count": 5.0, "confidence": 0.72}}}
+    blob = _y(doc)
+    node = _load(cm.merge_tree(blob, blob))["nodes"]["n1"]
+    assert node["count"] == 5 and isinstance(node["count"], int), (
+        "merge_tree stopped folding integral floats -- the opt-in flag is not "
+        "reaching its returns")
+    assert isinstance(node["confidence"], float), "non-integral float was damaged"
+
+
+def test_backpressure_float_fold_is_off_for_every_meta_index_handler():
+    """The float fold reached FIVE meta handlers, not just backpressure, and the
+    other four carry float scores of their own (measured: step_attribution
+    clarity 1.0, audit_baselines ratio 1.0, skill_gaps score 1.0 all folded to
+    int pre-fix). Pinning only backpressure would leave a fix that is correct,
+    correct-looking, and inert across most of its population."""
+    for fn, doc, path in (
+        (cm.merge_step_attribution,
+         {"entries": [{"goal_id": "g-1", "clarity": 1.0}]}, ("entries", "clarity")),
+        (cm.merge_audit_baselines,
+         {"baselines": [{"id": "b1", "ratio": 1.0}]}, ("baselines", "ratio")),
+        (cm.merge_skill_gaps,
+         {"gaps": [{"id": "sg-1", "score": 1.0}]}, ("gaps", "score")),
+    ):
+        blob = _y(doc)
+        got = _load(fn(blob, blob))[path[0]][0][path[1]]
+        assert isinstance(got, float), (
+            f"{fn.__name__} folded {path[1]} 1.0 -> {got!r} ({type(got).__name__})")
+
+
+# ---  part B: the loose half needs the writer's status filter -------
+
+
+def test_backpressure_loose_row_with_terminal_status_is_filtered():
+    """The loose half of active_monitors (rows with no meta_change_id) was
+    concatenated AFTER the status/tombstone comprehension with no filter of its
+    own, so a loose monitor could never graduate, never be rolled back and never
+    drain. The id-keyed control in the same doc is what makes this a real
+    asymmetry rather than a preference: pre-fix the loose 'graduated' row
+    SURVIVED in the same run where the id-keyed one was correctly dropped."""
+    doc = {"active_monitors": [
+        {"note": "no-id", "status": "graduated"},          # loose + terminal
+        {"meta_change_id": "m9", "status": "graduated"},   # id-keyed control
+        {"meta_change_id": "m2", "status": "monitoring"},  # survivor
+    ]}
+    blob = _y(doc)
+    out = _load(cm.merge_backpressure(blob, blob))
+    assert out["active_monitors"] == [{"meta_change_id": "m2",
+                                       "status": "monitoring"}], (
+        "a loose terminal row survived the rebuild while the id-keyed row with "
+        "the same status was dropped -- the two halves still disagree")
+
+
+def test_backpressure_keeps_loose_rows_that_are_still_live():
+    """BREADTH CONTROL. Dropping the loose list wholesale would satisfy the test
+    above and silently discard live monitors plus any row with no status field
+    at all -- data loss dressed as a filter. Only TERMINAL loose rows may go."""
+    doc = {"active_monitors": [{"note": "no-id", "status": "monitoring"},
+                               {"note": "no-status-field"}]}
+    blob = _y(doc)
+    out = _load(cm.merge_backpressure(blob, blob))
+    assert len(out["active_monitors"]) == 2, (
+        f"a live or status-less loose row was dropped: {out['active_monitors']}")
+
+
+def test_backpressure_stays_commutative_across_both_fixes():
+    """Both fixes sit inside the handler's canonical return path, which exists
+    for guard-907 byte-commutativity. Asymmetric inputs, both arg orders."""
+    x = {"active_monitors": [{"meta_change_id": "m1", "status": "monitoring",
+                              "imp_k_samples": [1.0, 0.5]},
+                             {"z": 1, "status": "monitoring"}],
+         "rollback_history": [{"meta_change_id": "r1", "v": 2.0}]}
+    y = {"active_monitors": [{"meta_change_id": "m1", "status": "monitoring",
+                              "imp_k_samples": [1.0, 0.5, 0.0]},
+                             {"a": 2, "status": "graduated"}],
+         "rollback_history": [{"meta_change_id": "r2", "v": 3.0}]}
+    xb, yb = _y(x), _y(y)
+    assert cm.merge_backpressure(xb, yb) == cm.merge_backpressure(yb, xb)

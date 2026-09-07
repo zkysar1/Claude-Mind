@@ -83,6 +83,7 @@ The LLM NEVER reads or edits `world/reasoning-bank.jsonl` directly. All operatio
 | `reasoning-bank-add.sh` | Validate + append new entry | JSON |
 | `reasoning-bank-update-field.sh <id> <field> <value>` | Update single field | — |
 | `reasoning-bank-increment.sh <id> <field>` | Atomic increment of utilization field | — |
+| `utilization-correct.sh --store <s> --id <id> --counter <c> --reason <why> [--by N]` | Correct a MIS-CREDITED utilization counter (both stores) — see “Correcting a mis-credit” below | — |
 
 All backed by `core/scripts/reasoning-bank.py` (Python 3, stdlib only).
 
@@ -144,8 +145,56 @@ The LLM NEVER reads or edits `world/guardrails.jsonl` directly. All operations g
 | `guardrails-add.sh` | Validate + append new guardrail | JSON |
 | `guardrails-update-field.sh <id> <field> <value>` | Update single field | — |
 | `guardrails-increment.sh <id> <field>` | Atomic increment of utilization/trigger field | — |
+| `utilization-correct.sh --store <s> --id <id> --counter <c> --reason <why> [--by N]` | Correct a MIS-CREDITED utilization counter (both stores) — see “Correcting a mis-credit” below | — |
 
 All backed by the `core/scripts/guardrails-*.sh` wrappers above (Python 3, stdlib only). Direct read/write of `world/guardrails.jsonl` is prohibited — use the wrappers exclusively.
+
+## Correcting a mis-credit (g-115-4349)
+
+Counters are increment-only. A wrong `times_helpful` / `times_cited` credit
+therefore used to be **permanently uncorrectable through the sanctioned API** —
+`*-update-field.sh` refuses a dotted path (`utilization` is a nested dict), and
+these counters feed retirement scoring (`utilization_score_v2`), so a mis-credit
+is not cosmetic.
+
+```bash
+bash core/scripts/utilization-correct.sh --store guardrails --id guard-352 \
+    --counter times_helpful --by 1 \
+    --reason "credited on a citation that named the wrong entry"
+```
+
+One wrapper serves BOTH stores (`--store reasoning-bank|guardrails`); the counter
+name comes from `UTILIZATION_COUNTERS`, and `--by` is the POSITIVE number of
+credits to remove. Unknown flags, unknown counters and a non-positive `--by` are
+each refused with exit 2 and a reason — deliberately unlike the sibling
+`*-increment.sh` wrappers, whose catch-all flag branch discards flags silently.
+
+**A correction is an increment of a monotone `<counter>__corrected` sibling, not
+a negative delta, and that is measured rather than stylistic.**
+`coordination_merge.merge_utilization_counters` reconciles the sidecar by taking
+a per-counter **MAX** across boxes — "MAX never loses an increment, it can only
+fail to gain one", per its own docstring. A decrement is exactly what MAX
+discards, silently, at the next cross-box merge. Every layer *below* that merge
+already accepts a signed delta (`_utilization_store.record_increment`,
+`utilization-flush.apply_deltas`), which is what makes `--by -1` look correct in
+review: it works perfectly on one box and is reverted everywhere else.
+`_utilization_store.apply_corrections` subtracts the sibling at read time, so
+`utilization_of()` returns the netted value and no consumer changes.
+
+Each correction appends a who/why row to `world/utilization-corrections.jsonl`
+(append-only, merge-registered, one random `correction_id` per row). The ledger
+is written BEFORE the counter write: a row with no counter change is visible and
+self-correcting, whereas an applied-but-unaudited correction is invisible
+forever — a counter that can be freely decremented is a counter that can be
+quietly laundered.
+
+**Reading the result: `guardrails-read.sh --id <id>` will NOT show it.** The
+record's embedded `utilization` block is FROZEN by design post-cutover
+(g-358-05); counters live in the `<kind>-utilization.jsonl` sidecar. Read the
+effective value through `_utilization_store.utilization_of(rec, counters)`, which
+applies the correction. And the endpoint whitelist lives in daemon code, so a
+freshly-added counter name is only live after the daemon reloads — which happens
+on COMMIT, not on edit (guard-4804).
 
 ---
 

@@ -518,11 +518,16 @@ def main():
                 try:
                     from _framework_origin import (
                         framework_origin as _fw_origin,
+                        is_forged_skill_body as _is_forged_body,
                         is_framework_path as _is_fw_path,
                         self_env_id as _self_env,
                     )
                     fw_rel = target[len(pr_norm) + 1:] if target.startswith(pr_norm + "/") else ""
-                    if fw_rel and _is_fw_path(fw_rel):
+                    # A destination-owned forged skill body is NOT part of the unit
+                    # the promotion train carries (seed-manifest excludes it,
+                    # orphan-removal protects it, preflight buckets it aside), so
+                    # refusing it left forged skills homeless downstream — .
+                    if fw_rel and _is_fw_path(fw_rel) and not _is_forged_body(fw_rel, project_root):
                         fw_origin = _fw_origin(project_root)
                 except Exception:
                     fw_origin = None
@@ -548,10 +553,13 @@ def main():
                         f"--shared  (lands in the origin's queue; a person reviews it there)\n"
                         f"  - domain code, conventions -> the world "
                         f"({fw_world}/scripts, {fw_world}/conventions), which IS writable here\n"
-                        f"  - a FORGED SKILL body has no writable home on this deployment yet: "
-                        f"no runtime loads a SKILL.md from the world path, and .claude/skills/ "
-                        f"is framework-owned here (g-115-9043). Do not write it anywhere else; "
-                        f"register the need upstream with cross-world-inject-goal.sh as above\n"
+                        f"  - a NEW forged skill -> .claude/skills/<new-name>/SKILL.md IS "
+                        f"writable here: both runtimes load skills from that root and the "
+                        f"promotion train does not carry forged bodies (seed-manifest excludes "
+                        f"them, orphan-removal protects them). Seeing this deny on a skill path "
+                        f"means the target is an EXISTING skill this deployment did not forge "
+                        f"-- a base skill the train owns; forge under a new name instead "
+                        f"(g-115-9043)\n"
                         f"  - a change already made with a shell command -> revert it: "
                         f"git checkout HEAD -- <path>"
                     )

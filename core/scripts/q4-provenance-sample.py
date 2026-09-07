@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -28,7 +29,8 @@ SCRIPTS = Path(__file__).resolve().parent
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from q4_provenance_sample import DEFAULT_SAMPLE_N, run  # noqa: E402
+from q4_provenance_sample import (  # noqa: E402
+    DEFAULT_SAMPLE_N, run, added_line_numbers)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -46,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
                          "(default: $MIND_SID — required for a worker Body)")
     ap.add_argument("--source-file", default=None,
                     help="cited source text; enables the direction-fidelity check")
+    ap.add_argument("--authored-since", default=None, metavar="REF",
+                    help="scope the sample to lines each --artifact ADDS relative to "
+                         "REF (a git ref/sha), so a code-change goal is graded on the "
+                         "hunk it produced rather than on lines earlier commits wrote. "
+                         "Omit for the previous whole-file behaviour.")
     ap.add_argument("--json", action="store_true",
                     help="emit the full result as JSON instead of the summary")
     return ap
@@ -65,8 +72,32 @@ def main(argv=None) -> int:
                   file=sys.stderr)
             return 2
 
+    authored_ranges = None
+    if args.authored_since:
+        authored_ranges = {}
+        for a in args.artifact:
+            # -U0: no context lines, so every non-@@ body line is a real
+            # add/remove. Failure is FAIL-LOUD, not fail-open: silently
+            # falling back to whole-file would hand back the very verdict
+            # the caller asked to narrow, and they would read it as scoped.
+            try:
+                out = subprocess.run(
+                    ["git", "diff", "-U0", args.authored_since, "--", str(a)],
+                    capture_output=True, text=True, timeout=60)
+            except (OSError, subprocess.SubprocessError) as exc:
+                print("q4-provenance-sample: --authored-since: git diff failed "
+                      "for %s: %s" % (a, exc), file=sys.stderr)
+                return 2
+            if out.returncode != 0:
+                print("q4-provenance-sample: --authored-since: git diff rc=%d "
+                      "for %s: %s" % (out.returncode, a, out.stderr.strip()[:200]),
+                      file=sys.stderr)
+                return 2
+            authored_ranges[str(a)] = added_line_numbers(out.stdout)
+
     result = run(args.goal, args.artifact, n=args.sample_n,
-                 session_id=session_id, source_text=source_text)
+                 session_id=session_id, source_text=source_text,
+                 authored_ranges=authored_ranges)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -28,6 +28,7 @@ import json
 import os
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -306,6 +307,34 @@ def cmd_velocity(args):
 
 # ─────────────────────────── Step 8.85 backpressure ───────────────────────────
 
+def _numeric_range(values):
+    """[min, max] over the NUMERIC elements of `values`; [None, None] if none.
+
+    `failed_values` holds unconstrained meta values, so an element can be a
+    dict, list or string alongside numbers. A bare `min(values)` then raises
+    `TypeError: '<' not supported between instances of 'dict' and 'dict'`
+    (g-115-5086, observed live on a real close). That raise propagated out of
+    cmd_backpressure and aborted cmd_run_all, so temporal-credit and
+    relative-advantage — sequenced AFTER it — never ran either: one bad value
+    cost THREE audits, not one.
+
+    A "range" is only meaningful over numbers, so non-numeric entries are
+    EXCLUDED rather than coerced or stringified; coercion would invent an
+    ordering the data does not have. When nothing numeric remains the result is
+    [None, None], which is byte-identical to the shape the empty-list case
+    already produced, so downstream consumers see no new variant.
+
+    bool is excluded deliberately: it is an int subclass, so True/False would
+    otherwise land in a value range as 1/0 — a coercion artefact, not a
+    measurement.
+    """
+    nums = [v for v in values
+            if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if not nums:
+        return [None, None]
+    return [min(nums), max(nums)]
+
+
 def cmd_backpressure(args):
     bp_out, bp_err, bp_rc = _run([
         "meta-backpressure.sh", "check",
@@ -383,7 +412,7 @@ def cmd_backpressure(args):
         payload = json.dumps({
             "strategy_file": cand.get("strategy_file", ""),
             "field": cand.get("field", ""),
-            "value_range": [min(failed) if failed else None, max(failed) if failed else None],
+            "value_range": _numeric_range(failed),
             "evidence": cand.get("evidence"),
             "failure_pattern": f"Rolled back {cand.get('rollback_count', 0)} times",
             "category": "meta_weight",
@@ -759,7 +788,34 @@ def main():
     p.add_argument("--notes", type=str, default=None)
     args = p.parse_args()
 
-    result = DISPATCH[args.subcommand](args)
+    try:
+        result = DISPATCH[args.subcommand](args)
+    except Exception as exc:  # noqa: BLE001 — deliberate: see below
+        # . An uncaught raise here used to leave stdout EMPTY: Python
+        # printed a traceback and exited 1 — and that 1 COLLIDES with this
+        # script's designed rc=1 (a HARD_FAIL_FLAGS member). iteration-close.sh
+        # read rc=1, failed to parse the empty stdout, and printed
+        # "audit ran + snapshot recorded: unparsable" — a crash rendered as
+        # coverage, with the enclosing phase still rc=0. That is the guard-1760
+        # shape: reporting what it declined to look at as a pass.
+        #
+        # Emitting a STRUCTURED check_failed instead keeps stdout parseable, so
+        # the caller can name the failure rather than guess at it. `check_failed`
+        # is an existing HARD_FAIL_FLAGS member ("a sub-check raised"), so the
+        # exit code stays 1 and the contract is unchanged — only the visibility
+        # improves. Reusing that flag rather than inventing one keeps
+        # HARD_FAIL_FLAGS the single source of truth.
+        #
+        # The traceback still goes to stderr; it is the diagnostic, and stdout
+        # stays pure JSON for the caller.
+        traceback.print_exc(file=sys.stderr)
+        result = {
+            "subcommand": args.subcommand,
+            "summary": (f"{args.subcommand}: CRASHED — "
+                        f"{type(exc).__name__}: {exc}"),
+            "flags": ["check_failed"],
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }
     log_script_decision("state-update-audit", {
         "subcommand": args.subcommand,
         "flags": result.get("flags", []),

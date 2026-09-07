@@ -45,6 +45,28 @@ Verdicts assigned per entry (priority order — see HEURISTIC_CHAIN below):
   flag_for_review   — pending > 30d (catch-all to bound growth)
   no_action         — entry is fresh / pending / no signal yet
 
+Carrier axis (g-115-3714) — a SECOND, ORTHOGONAL field on each OPEN entry,
+`carrier` + `carrier_reason`, tallied separately in `carrier_counts`. The
+verdicts above all answer "should this question be CLOSED?"; this answers "will
+any goal ever ACT on it?", the forward direction neither pre-existing check
+covers (_h_source_goal_completed maps a question BACK to its origin goal; the
+verify-learning check is goal-to-question). It is deliberately NOT a member of
+HEURISTIC_CHAIN, which is first-match-wins and would let the two axes suppress
+each other. Closed questions carry no `carrier` field at all — absence means not
+applicable, which is why carrier_counts are taken over `open_total` rather than
+`counts["total"]`.
+  carried             — a live carrier goal that also lists `user` in participants
+  carrier_no_user_leg — live carrier, no user leg: present in the queue and still
+                        absent from the user digest, which keys on participants
+  carrier_terminal    — every referencing goal is terminal (guard-2526: this must
+                        not be folded into `uncarried`, or "never filed" and
+                        "already finished" become indistinguishable)
+  uncarried           — no goal in either queue references the question id
+  unknown             — the goal index did not load; NOT evidence of absence
+READ-ONLY: this axis never writes. Nothing auto-files a carrier, because ~11 of
+the 24 questions in the originating audit correctly need none, so auto-filing
+would manufacture queue noise at roughly a 2:1 wrong-to-right ratio.
+
 Usage:
   pending-questions-sweep.sh sweep [--pq-path PATH]
   pending-questions-sweep.sh stats [--pq-path PATH]
@@ -91,6 +113,41 @@ except ImportError:
 # `closed` and `done` -- states that are settled but were in NEITHER script's set,
 # so a retired question stayed eligible for staleness flagging forever (g-115-4276).
 from _pending_question_status import SWEEP_SETTLED as TERMINAL_STATUSES  # noqa: F401
+# `is_closed` is CLOSED_STATUSES, which is TERMINAL_STATUSES *plus* the
+# TRANSITION_PENDING pair {answered, agent_answered}. The carrier check below
+# needs "is anyone still owed an answer?", which is the CLOSER's notion, NOT the
+# sweep's — an `answered` question is finished for the asker and only owes a
+# canonicalisation pass, so counting it as an orphan would manufacture work. The
+# SSOT names this exact confusion as the bug that made a blocked signal citing an
+# answered question undischargeable; do not substitute TERMINAL_STATUSES here.
+from _pending_question_status import is_closed  # noqa: F401
+
+# Goal statuses meaning "this goal will never act again." Deliberately NOT the
+# pending-question vocabulary (guard-1127: a constant serving two subsystems is
+# decoupled at the consumer, never widened into one shared value) — a goal is
+# never "answered" and a question is never "completed".
+GOAL_TERMINAL_STATUSES = frozenset({
+    "completed", "skipped", "expired", "archived", "superseded", "decomposed",
+})
+
+# Matches a pending-question id wherever it appears in a serialized goal record.
+# Ids in live data range from `pq-034` through `pq-027-01` to
+# `pq-g-326-591-upstream-filing`, so the tail is permissive.
+PQ_ID_RE = re.compile(r"\bpq-[A-Za-z0-9][A-Za-z0-9_-]*")
+
+# Fields where a question id expresses a STRUCTURAL link rather than prose that
+# merely mentions it. A match here is strong carrier evidence; a match only in
+# description/progress_note/outcome_note is weak, because audit and measurement
+# narratives routinely enumerate question ids they will never act on. The sweep
+# reports both and does not silently drop either — narrowing the match to these
+# fields alone would have scored the live "Apply: close-pending-questions" chore
+# as a non-carrier, turning a real carrier into a false orphan, which is the
+# more expensive direction of the two.
+LINK_FIELDS = frozenset({
+    "origin_signal", "blocker_ref", "blocked_by", "defer_reason",
+    "source_goal", "title", "pending_question", "pending_questions",
+})
+
 INFRA_PATTERN = re.compile(
     r"PID \d+|port \d+|VRAM|GPU|SSH.*host.?key|\.exe|Lambda",
     re.IGNORECASE,
@@ -165,7 +222,41 @@ def _load_completed_goal_ids():
     that left pq-g-115-305-roblox-publish lingering 12d after both source
     goals completed (g-115-485 finding).
     """
+    return _load_goal_index()["completed_goal_ids"]
+
+
+def _load_goal_index():
+    """One pass over both aspiration queues; two indexes out.
+
+    Split out of `_load_completed_goal_ids` (which now delegates here) because
+    the carrier check needs a SECOND projection of the same records, and the
+    world queue is multi-megabyte — walking it twice to build two dicts is pure
+    waste. Returns:
+
+      completed_goal_ids — unchanged semantics, for `_h_source_goal_completed`.
+      carriers           — {pq_id: [{id, status, has_user_leg, via,
+                           link_evidence}, ...]}, every goal in EITHER queue
+                           that mentions that question id in any field; `via`
+                           names the field(s), `link_evidence` is whether any
+                           of them is in LINK_FIELDS.
+      goals_scanned      — the unfiltered population, so a caller can tell
+                           "nothing references this question" from "the index
+                           never loaded" (guard-2298: a zero is reported beside
+                           the population it was drawn from, never alone).
+
+    TERMINAL GOALS ARE INDEXED, NOT FILTERED OUT, and that is load-bearing:
+    guard-2526 measured that a query filtered to non-terminal status cannot
+    answer "has work been queued for X?" — it excludes the already-done
+    population by construction, so an empty result is ambiguous between "never
+    filed" and "finished". Keeping terminal carriers lets `_carrier_verdict`
+    report that third state instead of collapsing it into `uncarried`.
+
+    Fail-open at every layer, as before: a missing file or a bad line yields a
+    smaller index rather than aborting the sweep.
+    """
     ids = set()
+    carriers = {}
+    goals_scanned = 0
     candidates = []
     if WORLD_DIR:
         candidates.append(Path(WORLD_DIR) / "aspirations.jsonl")
@@ -191,6 +282,7 @@ def _load_completed_goal_ids():
                         status = goal.get("status")
                         if not gid:
                             continue
+                        goals_scanned += 1
                         if status == "completed":
                             ids.add(gid)
                         elif status == "skipped":
@@ -200,13 +292,64 @@ def _load_completed_goal_ids():
                             ).lower()
                             if "supersed" in note:
                                 ids.add(gid)
+                        # Carrier projection. Scan FIELD BY FIELD rather than one
+                        # serialized blob, and keep only the pq ids plus the
+                        # field names that mentioned them — never the text
+                        # itself, which would hold the whole queue in memory.
+                        #
+                        # The field name is the JUDGMENT SIGNAL, and recording it
+                        # is why this is not a blob scan. A literal id match
+                        # cannot tell "this goal will act on the question" from
+                        # "this goal's prose happens to cite the id", and both
+                        # occur in live data: g-115-9049 ("Apply: close-pending-
+                        # questions") enumerates 8 ids in its description and IS
+                        # a carrier, while g-115-3714 cites 2 of the same ids as
+                        # measurement evidence and is NOT. No predicate separates
+                        # them, so the sweep reports WHERE it matched and a
+                        # reader decides — which is the goal's own stated design
+                        # ("surface for judgment; do not automate the fix").
+                        # LINK_FIELDS below is the strong half of that evidence.
+                        by_field = {}
+                        for key, value in goal.items():
+                            if isinstance(value, str):
+                                text = value
+                            elif isinstance(value, (list, dict)):
+                                try:
+                                    text = json.dumps(value, default=str)
+                                except (TypeError, ValueError):
+                                    continue
+                            else:
+                                continue
+                            if "pq-" not in text:
+                                continue
+                            for pq_id in PQ_ID_RE.findall(text):
+                                by_field.setdefault(pq_id, set()).add(key)
+                        if not by_field:
+                            continue
+                        participants = goal.get("participants") or []
+                        has_user_leg = (
+                            isinstance(participants, list)
+                            and "user" in participants
+                        )
+                        for pq_id, fields in by_field.items():
+                            carriers.setdefault(pq_id, []).append({
+                                "id": gid,
+                                "status": status,
+                                "has_user_leg": has_user_leg,
+                                "via": sorted(fields),
+                                "link_evidence": bool(fields & LINK_FIELDS),
+                            })
         except OSError as e:
             print(
                 f"[pending-questions-sweep] could not read {path}: {e}",
                 file=sys.stderr,
             )
             continue
-    return ids
+    return {
+        "completed_goal_ids": ids,
+        "carriers": carriers,
+        "goals_scanned": goals_scanned,
+    }
 
 
 def _parse_date(s):
@@ -238,9 +381,10 @@ def _is_decision_log(entry):
 
     Decision-logs are FILED at goal completion with the decision already
     executed (default_action prefixed "Already executed:") so the user can
-    review and override retroactively (self.md "Decision Authority"). They are
-    MEANT to outlive their source goal — auto-resolving them the same iteration
-    the source goal completes silently defeats the oversight mechanism.
+    review and override retroactively (.claude/rules/self.md "Decision
+    Authority"). They are MEANT to outlive their source goal — auto-resolving
+    them the same iteration the source goal completes silently defeats the
+    oversight mechanism.
 
     Either signal suffices:
       - default_action begins with the "Already executed:" marker (primary;
@@ -444,6 +588,95 @@ HEURISTIC_CHAIN = [
 ]
 
 
+def _describe_carriers(rows, limit=3):
+    """Render carrier rows as `g-115-9049 (via description)`, strongest first.
+
+    The `via` clause is the whole reason the index stores field names: it is what
+    lets a reader tell a structural link from a passing prose mention without
+    opening the goal. Rows carrying LINK_FIELDS evidence sort first so the
+    strongest evidence survives the truncation.
+    """
+    ordered = sorted(
+        rows,
+        key=lambda r: (not r.get("link_evidence"), str(r.get("id"))),
+    )
+    parts = []
+    for r in ordered[:limit]:
+        via = ", ".join(r.get("via") or []) or "unknown field"
+        parts.append(f"{r.get('id')} (via {via})")
+    if len(ordered) > limit:
+        parts.append(f"+{len(ordered) - limit} more")
+    return "; ".join(parts)
+
+
+def _carrier_verdict(entry, ctx):
+    """Forward-direction check: does an OPEN question have a goal that will act?
+
+    Deliberately NOT a member of HEURISTIC_CHAIN (design record: g-115-3714).
+    That chain is priority-ordered and first-match-wins (`_evaluate` below), and
+    its verdicts all answer "should this question be CLOSED?". Carrier-presence
+    answers "will anyone ACT on it?" — an orthogonal axis, so putting it in the
+    chain would make the two suppress each other (a stale question would hide
+    its own orphanhood, or vice versa). It rides alongside the verdict as its
+    own field, which is also what g-115-3714 asked for: "emit uncarried as a
+    distinct flag".
+
+    Returns (carrier_verdict, reason) or None when not applicable.
+
+      uncarried           — no goal in either queue mentions this question id.
+                            The 2026-07-28 orphan shape: real work, no goal,
+                            structurally invisible to the goal selector.
+      carrier_terminal    — every referencing goal is terminal. The work ran;
+                            the question was never closed. Reported separately
+                            because guard-2526 measured that folding this into
+                            "uncarried" makes "never filed" and "already
+                            finished" indistinguishable.
+      carrier_no_user_leg — a live carrier exists but none carries a user leg.
+                            Measured 2026-08-24 (foxtrot): user-blocker-
+                            escalation-check keys on `user` in participants, not
+                            on the carrier link, so such a question is absent
+                            from the user digest — present in the queue and
+                            still unreachable. Two of four rows had this shape,
+                            and a carrier-presence-only check scores both clean.
+      carried             — a live carrier WITH a user leg.
+
+    The conjunction is the point (reclaim-routed-work.md rule 7 / guard-1802): a
+    predicate narrower than the population's creator reports clean forever.
+    """
+    if is_closed(entry.get("status")):
+        return None
+    pq_id = entry.get("id")
+    if not pq_id:
+        return None
+    # Fail-safe: with no goal index there is no evidence of absence, and
+    # emitting `uncarried` for every open question would be a fleet-wide false
+    # positive built out of a failed read.
+    if not ctx.get("goals_scanned"):
+        return ("unknown", "goal index empty or unavailable — carrier state not determined")
+    refs = (ctx.get("carriers") or {}).get(pq_id) or []
+    if not refs:
+        return ("uncarried", "no goal in either queue references this question id")
+    live = [r for r in refs if r.get("status") not in GOAL_TERMINAL_STATUSES]
+    if not live:
+        return (
+            "carrier_terminal",
+            f"all {len(refs)} referencing goal(s) are terminal "
+            f"[{_describe_carriers(refs)}]; work finished but the question is "
+            f"still open",
+        )
+    with_user_leg = [r for r in live if r.get("has_user_leg")]
+    if not with_user_leg:
+        return (
+            "carrier_no_user_leg",
+            f"live carrier(s) {_describe_carriers(live)} exist but none lists "
+            f"`user` in participants, so the question is absent from the user digest",
+        )
+    return (
+        "carried",
+        f"live carrier(s) {_describe_carriers(with_user_leg)} with a user leg",
+    )
+
+
 def _evaluate(entry, now, ctx):
     """Run heuristics in priority order. First match wins."""
     for h in HEURISTIC_CHAIN:
@@ -572,12 +805,32 @@ def cmd_sweep(args):
     path = _resolve_pq_path(args)
     entries = _load_questions(path)
     now = datetime.now()
+    goal_index = _load_goal_index()
     ctx = {
         "all_entries": entries,
-        "completed_goal_ids": _load_completed_goal_ids(),
+        "completed_goal_ids": goal_index["completed_goal_ids"],
+        "carriers": goal_index["carriers"],
+        "goals_scanned": goal_index["goals_scanned"],
     }
 
     results = [_evaluate(e, now, ctx) for e in entries]
+
+    # Carrier axis, attached alongside each verdict rather than folded into it.
+    # Closed questions get no carrier field at all — absence means "not
+    # applicable", which is why the counts below are taken over the open set.
+    for entry, result in zip(entries, results):
+        try:
+            carrier = _carrier_verdict(entry, ctx)
+        except Exception as e:  # noqa: BLE001 — fail-open, matching _evaluate
+            print(
+                f"[pending-questions-sweep] carrier check failed on "
+                f"{entry.get('id')}: {e}",
+                file=sys.stderr,
+            )
+            continue
+        if carrier is not None:
+            result["carrier"] = carrier[0]
+            result["carrier_reason"] = carrier[1]
 
     counts = {
         "total": len(results),
@@ -602,6 +855,29 @@ def cmd_sweep(args):
     # point of the split (g-115-3753 / g-115-5025).
     counts["cleanup_only"] = counts["already_terminal"] + counts["needs_transition"]
 
+    # Carrier counts are a SEPARATE block, not merged into `counts`: they are
+    # taken over the OPEN subset while every count above is over all entries,
+    # and summing across two different denominators is how a tally starts lying.
+    # `open_total` and `goals_scanned` ride along as the unfiltered populations
+    # so a reader can never take `uncarried: 0` as clean without seeing whether
+    # anything was examined at all (guard-2298 / guard-2448).
+    carrier_counts = {
+        "open_total": 0,
+        "carried": 0,
+        "carrier_no_user_leg": 0,
+        "carrier_terminal": 0,
+        "uncarried": 0,
+        "unknown": 0,
+        "goals_scanned": ctx["goals_scanned"],
+    }
+    for r in results:
+        c = r.get("carrier")
+        if c is None:
+            continue
+        carrier_counts["open_total"] += 1
+        if c in carrier_counts:
+            carrier_counts[c] += 1
+
     flags = []
     if counts["auto_resolve"]:
         flags.append("auto_resolvable")
@@ -616,6 +892,18 @@ def cmd_sweep(args):
         flags.append("candidates_for_resolution")
     if counts["flag_for_review"]:
         flags.append("stale_entries_need_review")
+    # Surfaced for JUDGMENT, never auto-filed. About 11 of the 24 questions in
+    # the originating audit correctly need no carrier (pure decisions awaiting a
+    # human), so auto-filing carriers would manufacture queue noise at roughly a
+    # 2:1 wrong-to-right ratio. The sweep reports; a reader decides.
+    if carrier_counts["uncarried"]:
+        flags.append("uncarried_questions")
+    if carrier_counts["carrier_no_user_leg"]:
+        flags.append("carrier_missing_user_leg")
+    if carrier_counts["carrier_terminal"]:
+        flags.append("carrier_terminal_only")
+    if carrier_counts["unknown"]:
+        flags.append("carrier_index_unavailable")
 
     summary = (
         f"sweep: {counts['auto_resolve']} auto, "
@@ -624,6 +912,14 @@ def cmd_sweep(args):
         f"{counts['likely_resolved'] + counts['likely_stale']} likely, "
         f"{counts['flag_for_review']} review, {counts['no_action']} no-action "
         f"out of {counts['total']} total"
+    )
+    summary = (
+        f"{summary}; carrier: {carrier_counts['uncarried']} uncarried, "
+        f"{carrier_counts['carrier_no_user_leg']} no-user-leg, "
+        f"{carrier_counts['carrier_terminal']} terminal-only, "
+        f"{carrier_counts['carried']} carried "
+        f"of {carrier_counts['open_total']} open "
+        f"({carrier_counts['goals_scanned']} goals scanned)"
     )
 
     applied = 0
@@ -649,6 +945,7 @@ def cmd_sweep(args):
         "summary": summary,
         "flags": flags,
         "counts": counts,
+        "carrier_counts": carrier_counts,
         "entries": results,
         "applied": applied,
         "thresholds": {
