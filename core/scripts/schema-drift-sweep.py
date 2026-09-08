@@ -385,11 +385,28 @@ def create_fix_goals(all_results: list, aspiration_id: str = ESCALATION_ASP) -> 
         # the shared queue visible to everyone, rather than naming a target
         # that may not exist. Tree node: drop-without-inverse-pattern.
         handoff_target = peers[0] if peers else None
-    except Exception:
+    except Exception as e:
         # fail-open to "alpha" — preserves prior behaviour when the roster is
         # unreadable. Distinct from the empty-peers path above: an exception
         # means we do not KNOW the roster, not that we know it is empty.
+        # F-001: bind and PRINT it. Every sibling error path in this file
+        # prints WARN to stderr; this one printed nothing, so a broken roster
+        # import degraded routing permanently with no trace — the failure and
+        # the healthy path are byte-identical from outside.
+        print(f"WARN: active-agent roster unreadable ({e}); "
+              f"falling back to handoff target 'alpha'", file=sys.stderr)
         handoff_target = ""
+
+    # F-002: enforce the self-exclusion ONCE, where every assignment branch
+    # meets it. The comprehension's `!= self_agent` guards only its OWN path,
+    # so the fail-open literal above bypassed the invariant entirely and named
+    # the runner as its own recipient whenever the roster raised on the box
+    # whose agent IS that literal. The adjacent empty-peers branch already
+    # names nobody; this makes every branch agree with it. Unset beats
+    # self-routed: an unrouted goal sits in the shared queue visible to
+    # everyone, while a self-routed one is a handoff that never hands off.
+    if handoff_target == self_agent:
+        handoff_target = None
 
     for r in all_results:
         if not r["drift_hits"]:
@@ -414,7 +431,7 @@ def create_fix_goals(all_results: list, aspiration_id: str = ESCALATION_ASP) -> 
             # handoff_to alone does not fix that: handoff_to is the routing
             # PREFERENCE (a selector bonus), intended_agent is the gate.
             "intended_agent": "either",
-            "handoff_from": os.environ.get("MIND_AGENT", "unknown"),
+            "handoff_from": self_agent or "unknown",
             "source": "world",
             # origin-signal-gate: schema-drift-sweep IS a signal source.
             # Cite the drifted store so audits can reconstruct the scan.

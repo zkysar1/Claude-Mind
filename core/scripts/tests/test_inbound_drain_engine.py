@@ -273,6 +273,10 @@ class TestDirectiveDispositions(DrainTestBase):
         self.assertEqual(call["record"]["participants"], ["agent"])
         self.assertIn("env-under-test", call["record"]["description"],
                       "provenance must survive into the goal")
+        # The daemon's origin-signal gate refuses agent-sourced filings that
+        # carry no registered signal — measured as 400 origin_signal_blocked on
+        # a real vessel (). The member is the user.
+        self.assertEqual(call["record"]["origin_signal"], "user_directive")
 
     def test_daemon_failure_is_transient_and_keeps_the_record(self):
         sys.modules["_rt"].aspirations_add_goal = _FakeRt(fail=True).aspirations_add_goal
@@ -281,6 +285,31 @@ class TestDirectiveDispositions(DrainTestBase):
 
         self.assertEqual(res["failed"], 1)
         self.assertEqual(len(self.lane_files("processing")), 1)
+
+    def test_daemon_refusal_body_is_surfaced_in_the_failure_detail(self):
+        # A 4xx from the daemon carries its reason in the body; the drain must
+        # report it, not just the status. A paid vessel run was diagnosed blind
+        # because only "daemon HTTP 400" surfaced ().
+        class _Refused(RuntimeError):
+            def __init__(self):
+                super().__init__("daemon HTTP 400 for POST /v1/aspirations/add-goal")
+                self.status = 400
+                self.body = '{"error": "origin_signal_blocked", "gate": "origin-signal-gate"}'
+
+        def refuse(asp_id, record, source="world", overrides=None):
+            raise _Refused()
+
+        sys.modules["_rt"].aspirations_add_goal = refuse
+        self.write_record("20260907T080000000000-a.json", self.directive())
+        res = self.run_drain()
+
+        self.assertEqual(res["failed"], 1)
+        failed = [r for r in res["records"] if r.get("disposition") == "failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertIn("origin_signal_blocked", failed[0]["detail"])
+        self.assertIn("daemon HTTP 400", failed[0]["detail"])
+        self.assertEqual(len(self.lane_files("processing")), 1,
+                         "a refused record stays claimed and visible, never lost")
 
     def test_empty_text_is_rejected_without_calling_the_daemon(self):
         self.write_record("20260907T080000000000-a.json", self.directive(text="   "))

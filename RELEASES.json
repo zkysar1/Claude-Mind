@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.68",
+    "previous_version": "2.12.67",
+    "date": "2026-09-08",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "inbound-drain: member directives file with origin_signal user_directive + surfaced daemon refusal body (g-369-155); 75 commits since v2.12.67",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.67",
     "previous_version": "2.12.66",
     "date": "2026-09-08",

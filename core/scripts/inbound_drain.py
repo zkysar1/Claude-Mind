@@ -300,11 +300,25 @@ def _apply_directive(record: dict, source: str, asp_id: str, *,
         ),
         "priority": "MEDIUM",
         "participants": ["agent"],
+        # The member IS the user: a queued directive is user-originated work,
+        # and the daemon's origin-signal gate (add-goal Phase C) refuses every
+        # agent-sourced filing that carries no registered signal. Without this
+        # line the vessel daemon answered 400 origin_signal_blocked and the
+        # member's directive stayed claimed in processing/ (measured on the
+        # 2026-09-08T06:06Z cold start of pearl-test-20260904-g3351459,
+        # ). "Assigned directive:" is not a Layer-D auto-derive title
+        # prefix, so the signal has to be explicit here.
+        "origin_signal": "user_directive",
     }
     try:
         resp = _rt.aspirations_add_goal(asp_id, goal, source=source)
     except Exception as exc:  # noqa: BLE001 - RtError and transport errors alike
-        return FAILED, f"add-goal failed: {type(exc).__name__}: {exc}"
+        # Surface the daemon's OWN reason. RtError carries the response body
+        # ({"error": "origin_signal_blocked", ...}); reporting only
+        # "daemon HTTP 400" cost a paid vessel run its diagnosis.
+        body = getattr(exc, "body", None)
+        detail = f" body={str(body).strip()[:300]}" if body else ""
+        return FAILED, f"add-goal failed: {type(exc).__name__}: {exc}{detail}"
     gid = ""
     if isinstance(resp, dict):
         gid = str(resp.get("goal_id") or resp.get("id") or "")

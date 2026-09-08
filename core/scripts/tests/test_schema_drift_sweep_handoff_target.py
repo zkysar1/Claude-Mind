@@ -144,3 +144,75 @@ def test_intended_agent_is_always_set_explicitly(monkeypatch, filed):
     assert goal["intended_agent"] == "either"
     assert goal["handoff_from"] == "echo"
     assert goal["participants"] == ["agent"]
+
+
+def test_roster_exception_on_the_fallback_agents_own_box_files_unrouted(
+        monkeypatch, filed, capsys):
+    """F-002: the bypass branch the suite above leaves open ().
+
+    `test_unreadable_roster_fails_open_to_alpha` runs as "echo", so the
+    fail-open literal and the runner differ and the self-exclusion is never
+    exercised on that path. On the alpha box the same exception named alpha as
+    its OWN recipient: a handoff goal that hands off to nobody, sitting in the
+    filer's queue with a handoff_to that reads as routed.
+
+    The exclusion used to live inside the peer comprehension, which the
+    except branch never reaches. It is now a post-assignment guard, so every
+    branch meets it.
+
+    POSITIVE CONTROL IS IN THIS TEST BY DESIGN (guard-4166): the expected
+    outcome is an ABSENCE, and an absence assertion passes just as happily
+    against a create_fix_goals that filed nothing, a broken fixture, or a
+    typo'd key. The control below fires the SAME exception on a DIFFERENT box
+    and must still produce handoff_to == "alpha" — if it ever stops doing so,
+    this test is passing for the wrong reason.
+    """
+    def boom():
+        raise RuntimeError("team-state unreadable")
+
+    monkeypatch.setattr(_agents, "get_active_agents", boom)
+
+    # --- the defect case: runner IS the fail-open literal ---
+    monkeypatch.setenv("MIND_AGENT", "alpha")
+    assert sds.create_fix_goals(_drift()) == 1
+    goal = filed[0]
+    assert "handoff_to" not in goal, (
+        "the fail-open literal named the running agent as its own recipient")
+    assert "handoff_created_at" not in goal
+    # unrouted, not unfiled — the goal still reaches the shared queue
+    assert goal["intended_agent"] == "either"
+    assert goal["handoff_from"] == "alpha"
+
+    # --- F-001: the roster failure must leave a trace (guard-5501: prove the
+    # diagnostic can actually fire, rather than trusting that a print exists) ---
+    err = capsys.readouterr().err
+    assert "WARN" in err and "roster unreadable" in err, err
+    assert "team-state unreadable" in err, (
+        "the bound exception itself must reach stderr, not just a generic line")
+
+    # --- POSITIVE CONTROL: same exception, different box, still routes ---
+    filed.clear()
+    monkeypatch.setenv("MIND_AGENT", "echo")
+    assert sds.create_fix_goals(_drift()) == 1
+    assert filed[0]["handoff_to"] == "alpha", (
+        "control flipped: the absence above is not evidence of the guard")
+    assert filed[0]["handoff_from"] == "echo"
+
+
+def test_handoff_from_is_derived_not_a_second_env_read(monkeypatch, filed):
+    """One derived value instead of a second os.environ read ().
+
+    handoff_from read MIND_AGENT again rather than reusing self_agent, so the
+    recipient guard and the stamped sender could disagree about who is running
+    if the two reads ever diverged. Pinned as one value with one source.
+    """
+    monkeypatch.setenv("MIND_AGENT", "bravo")
+    monkeypatch.setattr(_agents, "get_active_agents",
+                        lambda: ("alpha", "bravo", "echo"))
+
+    assert sds.create_fix_goals(_drift()) == 1
+    goal = filed[0]
+    assert goal["handoff_from"] == "bravo"
+    # the sender is never also the recipient
+    assert goal.get("handoff_to") != goal["handoff_from"]
+    assert goal["handoff_to"] == "alpha"
