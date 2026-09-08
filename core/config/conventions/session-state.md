@@ -1003,7 +1003,7 @@ them via recurring goals and collect results on completion. Complements `pending
 
 | Subcommand | Purpose |
 |-----------|---------|
-| `register --id <id> --type <type> --goal <goal-id> --pid <pid> --monitor-goal <id> --completion-check <cmd> [--metadata <json>]` | Register job before launch |
+| `register --id <id> --type <type> --goal <goal-id> --pid <pid> --monitor-goal <id> --completion-check <cmd> [--metadata <json>]` | Register job before launch. Exit 0 = the row now names YOUR pid (fresh, an idempotent same-pid re-arm, or a dead incumbent reaped); exit 2 = REFUSED, the id is held by a DIFFERENT and LIVE pid and nothing was written — deregister the finished job or pick a distinct `--id` (g-115-8341) |
 | `deregister --id <id>` | Remove completed/failed job |
 | `check --id <id>` | Check job status: PID alive → running; PID dead → run completion_check |
 | `list [--json]` | Show all registered jobs |

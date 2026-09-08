@@ -94,12 +94,22 @@ RECURRING GOALS ARE IN SCOPE -- measured, against the obvious guess
 ------------------------------------------------------------------
 It looks like recurring closes should be excluded, since they run through
 recurring-close.sh and get their signal mutation from recurring-loop-state-
-mutate.py. They are NOT excluded, on two measurements: recurring-close.sh:389
-runs `iteration-close.sh --phase state-update`, which reaches the bump; and the
-counted-list append at loop-state-bump-counters.py:486 is unconditional on
---recurring (only the Block A/B/D streak mutation is gated). Excluding them
-would have blinded the check to every recurring close for a reason that reads
-plausible and is false.
+mutate.py. They are NOT excluded, on two measurements -- both RE-DERIVED BY
+SYMBOL 2026-09-07 (g-115-4366) after their line citations drifted. GREP THE
+SYMBOLS, NOT THE NUMBERS; :389 and :486 now land on unrelated lines, and the
+conclusion below survives the correction unchanged (guard-3503):
+
+  1. recurring-close.sh's `run_phase state-update` line (cited :389, now ~:557)
+     runs `iteration-close.sh --phase state-update`, which reaches the bump.
+  2. the counted-list append in loop-state-bump-counters.py -- the pair
+     `counted.append(args.goal_id)` / `loop_state["counted_goals_this_session"]
+     = counted` (cited :486, now ~:628) -- is guarded ONLY by
+     `if args.goal_id:`, and do_state_update passes `--goal-id "$GOAL_ID"`
+     unconditionally. So the append is unconditional on --recurring; only the
+     Block A/B/D streak mutation is gated, via iteration-close's `_rec_flag`.
+
+Excluding them would have blinded the check to every recurring close for a
+reason that reads plausible and is false.
 """
 
 from __future__ import annotations
@@ -123,7 +133,126 @@ def classify(goal_id, membership, bump_failures):
     return BUMP_NOOP if goal_id in (bump_failures or ()) else SKIPPED
 
 
-def decide(closed_goals, membership, bump_failures=(), *, role="reducer"):
+# ── Close-PATH classification () ────────────────────────────────────
+# `classify()` above answers WHY a goal is uncounted (phase skipped vs bump
+# no-op). This answers a different question the check could not previously ask:
+# was the close SANCTIONED — i.e. taken by a path that legitimately runs no
+# iteration — and if so, should the missing state-update be EXCLUDED or CREDITED?
+#
+# WHY A CLASSIFIER RATHER THAN ANOTHER CAVEAT PARAGRAPH (guard-4649). Before
+# this, every newly-discovered sanctioned path was answered by appending a
+# numbered cause to render()'s text. That string reached FIVE causes and ~4,000
+# characters, two of which end by telling the reader to confirm and open
+# nothing — a detector instructing its reader to ignore it. A caveat in a
+# detector's output is not a filter on the output: the firings continued at
+# full rate and every reader paid the discrimination cost by hand (measured:
+# one iteration spent an 11.1 MB changelog grep, two diary reads and three
+# record reads re-deriving a cause that had already been established 7h
+# earlier).
+#
+# WHY THE CHANGELOG AND NOT THE RECORD. Four record-derived discriminators were
+# measured to failure across three boxes (key_finding present: 2 of 10, and one
+# of those was NOT a drain; no live claim at close: claimed_by None on ALL TEN
+# including both loss candidates; completed_by != executed_by: does not
+# separate; `Maintain:` title prefix: 40 of 83 completed Maintain goals carry
+# outcome_class, so excluding them would suppress ~40 genuine losses to save 1
+# false alarm). They fail for one structural reason: every one of them describes
+# what the goal WAS ABOUT or WHO touched it, while the sanctioned-vs-lost split
+# is a fact about HOW THE GOAL WAS CLOSED — which lane called which script. Only
+# the changelog records that.
+#
+# THE SEPARATOR IS QUANTITATIVE. A sanctioned non-executing close writes
+# `complete-by <id>` and then `update-goal <id> outcome_class` SECONDS apart
+# with no other row naming that goal between them. Measured gaps: 2s, 4s, 4s,
+# 5s, 6s, 10s, 10s, 22s (n=8, four boxes). The shape it must not be confused
+# with — an autocompact resume that re-entered after the close write — puts its
+# lone outcome_class row 15m28s later (). Two orders of magnitude
+# apart. The threshold below sits 2.7x above the largest observed sanctioned gap
+# and ~15x below the observed resume gap.
+SANCTIONED_GAP_SECONDS = 60
+
+PATH_SANCTIONED_DISPOSAL = "sanctioned-disposal"  # closer executed nothing -> EXCLUDE
+PATH_SANCTIONED_SELF = "sanctioned-self"          # closer DID work -> CREDIT (real gap)
+PATH_UNCLASSIFIED = "unclassified"                # stays a finding
+
+
+def _ts_seconds(stamp):
+    """Naive `YYYY-MM-DDTHH:MM:SS` -> epoch-ish seconds. Returns None if
+    unparseable — an unreadable stamp must never render as a small gap."""
+    try:
+        from datetime import datetime
+        return datetime.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def classify_close_path(rows, closing_agent=None):
+    """Classify HOW one goal was closed, from that goal's changelog rows.
+
+    rows: chronological list of dicts for ONE goal id, each {ts, agent, op,
+        field}. `op` is one of claim | release | complete-by | update-goal |
+        add-goal; `field` is set only for update-goal.
+    closing_agent: the agent whose session is being checked.
+
+    Returns one of the PATH_* constants. Every ambiguous input returns
+    PATH_UNCLASSIFIED, because under-matching is the safe direction here: a
+    wrongly-suppressed real loss is invisible, while one extra reported row
+    costs a reader thirty seconds (this goal's own stated criterion).
+    """
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if not rows:
+        return PATH_UNCLASSIFIED
+
+    complete_by = next((r for r in rows if r.get("op") == "complete-by"), None)
+    if complete_by is None:
+        # No complete-by at all: a bare-status close or a resume. Not sanctioned
+        # by anything this function can see.
+        return PATH_UNCLASSIFIED
+
+    t0 = _ts_seconds(complete_by.get("ts"))
+    oc = next((r for r in rows
+               if r.get("op") == "update-goal" and r.get("field") == "outcome_class"
+               and (_ts_seconds(r.get("ts")) or -1) >= (t0 or 0)), None)
+    if oc is None or t0 is None:
+        return PATH_UNCLASSIFIED
+    t1 = _ts_seconds(oc.get("ts"))
+    if t1 is None or (t1 - t0) > SANCTIONED_GAP_SECONDS:
+        return PATH_UNCLASSIFIED
+
+    # Nothing else naming this goal may sit between the pair. Rows for other
+    # files (team-state, presence) never name the goal, so they are already
+    # absent from `rows` and correctly do not break the fingerprint.
+    for r in rows:
+        t = _ts_seconds(r.get("ts"))
+        if t is None or r is complete_by or r is oc:
+            continue
+        if t0 < t < t1:
+            return PATH_UNCLASSIFIED
+
+    # Sanctioned fingerprint confirmed. EXCLUDE vs CREDIT now turns on whether
+    # the CLOSING agent did the work, which is what the claim history records.
+    claims = [r for r in rows if r.get("op") == "claim"]
+    if not claims:
+        # Never claimed by anyone, yet closed through a real close path: the
+        # closer did the work without a claim cycle (the measured instance is a
+        # hypothesis-resolution close, whose learning landed in the pipeline
+        # record). Work HAPPENED, so the absent counter bump, journal append and
+        # tree-drift reset are a real accounting gap -> CREDIT.
+        return PATH_SANCTIONED_SELF
+    if closing_agent and all(r.get("agent") and r.get("agent") != closing_agent
+                             for r in claims):
+        # Every claim belongs to somebody else: this is a disposal of another
+        # Body's finished-but-unbanked unit. The closer executed nothing, so
+        # crediting it would book work that did not happen here -> EXCLUDE.
+        return PATH_SANCTIONED_DISPOSAL
+    # Claimed by the closing agent at some point. The fingerprint says the close
+    # ran no iteration, but a same-agent claim cannot separate "disposed my own
+    # stale row" from "executed and lost the close". Leave it to a reader.
+    return PATH_UNCLASSIFIED
+
+
+def decide(closed_goals, membership, bump_failures=(), *, role="reducer",
+           close_path=None):
     """Return the skip report.
 
     closed_goals:  list of dicts, each needing at least `id`. The caller has
@@ -159,6 +288,7 @@ def decide(closed_goals, membership, bump_failures=(), *, role="reducer"):
         }
 
     skipped, bump_noop, indeterminate = [], [], []
+    sanctioned_excluded, sanctioned_credited = [], []
     seen = 0
     for g in closed_goals:
         gid = (g or {}).get("id")
@@ -167,6 +297,17 @@ def decide(closed_goals, membership, bump_failures=(), *, role="reducer"):
         seen += 1
         verdict = classify(gid, membership, bump_failures)
         if verdict == SKIPPED:
+            # An uncounted close is a FINDING only if it was not taken by a path
+            # that legitimately runs no iteration. Absent oracle => every
+            # uncounted close stays a finding, so behaviour without a changelog
+            # read is byte-identical to before this split ().
+            path = close_path(gid) if close_path else PATH_UNCLASSIFIED
+            if path == PATH_SANCTIONED_DISPOSAL:
+                sanctioned_excluded.append(gid)
+                continue
+            if path == PATH_SANCTIONED_SELF:
+                sanctioned_credited.append(gid)
+                continue
             skipped.append(gid)
         elif verdict == BUMP_NOOP:
             bump_noop.append(gid)
@@ -185,10 +326,17 @@ def decide(closed_goals, membership, bump_failures=(), *, role="reducer"):
         # condition that already recorded itself and already re-fired. Counting
         # it here would re-alarm on something handled, and the population it
         # would add is exactly the population the ledger exists to own.
-        "status": "findings" if skipped else "clean",
+        "status": "findings" if (skipped or sanctioned_credited) else "clean",
         "completeness": "partial" if indeterminate else "complete",
         "population": seen,
         "skipped": skipped,
+        # EXCLUDE: the closer executed nothing (disposal of another Body's
+        # unbanked unit), so a counter bump would book work that did not happen.
+        "sanctioned_excluded": sanctioned_excluded,
+        # CREDIT: the closer DID work through a path that runs no iteration, so
+        # the absent bump / journal append / tree-drift reset is a real
+        # accounting gap. Reported separately, never silently suppressed.
+        "sanctioned_credited": sanctioned_credited,
         "bump_noop": bump_noop,
         "indeterminate": indeterminate,
     }
@@ -208,80 +356,12 @@ def render(report):
             f"close-phase-skip: {len(skipped)} of {pop} close(s) this session had "
             f"NO state-update — {', '.join(skipped)}. The counter bump, journal "
             "append, iteration commit and tree-drift reset did not happen for "
-            "these. ESTABLISH THE CAUSE PER GOAL — do not inherit one. The shape "
-            "this check was built from is an autocompact resume that re-entered "
-            "the loop at the close sequence; g-326-447 is the goal that was BEING "
-            "CLOSED when that happened (the incident VICTIM, evidence not "
-            "analysis — its title is about a units guard and explains nothing). "
-            "A batch close through a direct path leaves the IDENTICAL fingerprint "
-            "(absent outcome_class + completed_by_role), so the fingerprint alone "
-            "cannot tell the two apart. THIRD CAUSE, measured 2026-09-03 "
-            "(bravo, cc-05, 6.8.0-138-generic) on g-326-802: a bare "
-            "`aspirations-update-goal.sh <id> status completed` on an "
-            "already-released, unclaimed goal. No close path runs at all, yet the "
-            "status write still stamps completed_at/completed_by, so it lands the "
-            "SAME fingerprint as both shapes above while being neither — it is not "
-            "a resume (there was no close sequence) and not a batch (it was one "
-            "goal). FOURTH CAUSE, and it is CORRECT BEHAVIOUR rather than an "
-            "incident — measured 2026-09-06 (echo, cc-03, 6.8.0-138-generic) on "
-            "g-115-3758: a cross-agent CNC-drain close. aspirations-precheck "
-            "Phase 0.5g.7 PRESCRIBES exactly `aspirations-complete-by.sh "
-            "--key-finding` then `aspirations-update-goal.sh <id> outcome_class`, "
-            "with no iteration-close phases, because the draining reducer "
-            "EXECUTED NOTHING — it is disposing another agent's finished-but-"
-            "unbanked unit (here foxtrot's, holder verified DORMANT). Its "
-            "changelog fingerprint is `complete-by <id>` then `update-goal <id> "
-            "outcome_class` SECONDS apart with nothing else between (measured: 5s), "
-            "and that gap is the discriminator against the resume shape directly "
-            "below, whose lone outcome_class row lands MINUTES later (g-115-4138: "
-            "15m28s). guard-2523 is NOT violated by this shape: its DETECT is a "
-            "NULL outcome_class plus a stale in_flight plus an unreleased claim, "
-            "and the drain writes outcome_class as its second step on a goal that "
-            "was never in this box's in_flight at all. This lane runs on EVERY "
-            "reducer on a cadence, so it will keep flagging; confirm the two rows "
-            "and the seconds-gap, record it as drained, and open nothing. "
-            "FIFTH CAUSE, and it is a REAL interrupted close whose RECORD "
-            "LIES — measured 2026-09-06 (echo, cc-03, 6.8.0-138-generic) on "
-            "g-115-1968, across THREE investigations that each read the record, "
-            "found it healthy, and stopped. On a RECURRING goal the record "
-            "CANNOT discriminate: aspirations-complete-by.sh itself bumps "
-            "achievedCount / lastAchievedAt / currentStreak and persists "
-            "key_finding, and the PRIOR cycle's outcome_class and outcome_note "
-            "SURVIVE the cycle bump — so advanced counters, a populated "
-            "key_finding, a released claim and an `outcome_class: deep` are "
-            "exactly what an interrupted close looks like. Its changelog "
-            "fingerprint is a LONE `complete-by <id>` with NOTHING after it "
-            "(control, same agent same session: healthy recurring close "
-            "g-115-8393 shows complete-by then outcome_class, outcome_note and "
-            "the consecutive_routine/consecutive_deep/last_outcome_origin "
-            "siblings within 4 minutes). Two readings this FALSIFIES before you "
-            "reach for them: it is NOT a detector blind spot for recurring "
-            "closes (the control proves the check sees them), and it is NOT "
-            "changelog retention (both rows return in the same --limit 20000 "
-            "read). guard-3511 owns the repair procedure, but its step (a) says "
-            "to measure from the goal record — which is precisely what misleads "
-            "here, and its `rule` field is immutable so the caveat lives here. "
-            "Read the changelog sequence FIRST. "
-            "Distinct from guard-2660, which is the INVERSE (a REFUSED "
-            "close: siblings land, status does not). "
-            "THE DISCRIMINATOR IS THE CHANGELOG, NOT THE RECORD — one grep "
-            "separates all three: `changelog-read.sh --limit 20000 | grep <goal-id>`. "
-            "A bare-status close shows a lone `update-goal <id> status` (on "
-            "g-326-802, with `update-goal <id> outcome_class` hand-backfilled 3h07m "
-            "later); a real close shows `complete-by <id>`; an interrupted resume "
-            "shows the close sequence's sibling writes without it. "
-            "BUT `complete-by` PRESENT DOES NOT RULE OUT A RESUME — it locates "
-            "WHERE the interruption landed, it does not exclude one. Measured "
-            "2026-09-03 (alpha, cc-04, 6.8.0-138-generic) on g-115-4138: "
-            "complete-by at 14:26:22 preceded by its normal siblings "
-            "(progress_note, priority, outcome_note), then a LONE `update-goal "
-            "<id> outcome_class` at 14:41:50 with no state-update writes between "
-            "— a resume that re-entered AFTER the close write rather than before "
-            "it. Reading only for the presence of `complete-by` scores that case "
-            "'a real close' and stops, which is the misattribution this sentence "
-            "used to invite. Read the SEQUENCE and the gaps in it, never the "
-            "presence of any single row. Do that grep "
-            "before attributing any cause here."
+            "these. These are the closes the classifier could NOT attribute to a "
+            "sanctioned non-executing path, so establish the cause per goal: "
+            "`changelog-read.sh --limit 20000 | grep <goal-id>` and read the "
+            "SEQUENCE and its gaps, never the presence of any single row. The six "
+            "measured close shapes and which are sanctioned: "
+            "core/config/rationale/close-phase-skip-causes.md."
         )
     else:
         base = f"close-phase-skip: clean — {pop} close(s) this session, all counted"
@@ -289,6 +369,16 @@ def render(report):
     if noop:
         base += (f" ({len(noop)} uncounted but ledger-attributed to a bump no-op, "
                  f"not a skipped phase: {', '.join(noop)})")
+    excl = report.get("sanctioned_excluded") or []
+    cred = report.get("sanctioned_credited") or []
+    if excl:
+        base += (f" [{len(excl)} EXCLUDED: closed via a sanctioned path that "
+                 f"executed no iteration, so no counter was owed: "
+                 f"{', '.join(excl)}]")
+    if cred:
+        base += (f" [{len(cred)} ACCOUNTING GAP: sanctioned close path, but work "
+                 f"WAS done — the bump/journal/tree-drift reset is genuinely "
+                 f"owed and did not happen: {', '.join(cred)}]")
     if ind:
         base += (f" INCOMPLETE: {len(ind)} goal(s) indeterminate (WM unreadable) — "
                  f"not evidence of health: {', '.join(ind)}")

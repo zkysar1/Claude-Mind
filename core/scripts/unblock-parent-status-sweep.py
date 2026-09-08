@@ -1152,6 +1152,7 @@ def main():
 
     scanned = 0
     eligible = 0
+    skipped_age_uncomputable = 0
     candidates = []
     applied = 0
     details = []
@@ -1201,6 +1202,7 @@ def main():
                                "defer_reason_set_at / started — this goal can "
                                "never age into eligibility"),
                 })
+                skipped_age_uncomputable += 1
                 continue
             if age_h < args.max_age_hours:
                 details.append({
@@ -1418,6 +1420,7 @@ def main():
         "eligible": eligible,
         "candidates": candidates,
         "applied": applied,
+        "skipped_age_uncomputable": skipped_age_uncomputable,
         # guard-1890: when the archive read degraded, an "absent" parent is
         # ambiguous (archived vs unreadable). Callers MUST NOT read the
         # dangling-reference entries in `details` as authoritative on a
@@ -1431,11 +1434,23 @@ def main():
         print(f"unblock-parent-status-sweep: scanned={scanned} "
               f"eligible={eligible} candidates={len(candidates)} "
               f"applied={applied} mode={'apply' if args.apply else 'report'}")
+        print(f"  skipped_age_uncomputable={skipped_age_uncomputable}")
         for c in candidates:
             print(f"  {c['goal_id']} → parent {c['parent_id']} "
                   f"(status={c['parent_status']})")
     else:
         print(json.dumps(result, indent=2))
+
+    # An uncomputable age hits `continue` BEFORE the swept-marking, so the
+    # row is re-scanned and re-skipped every precheck iteration forever.
+    # A count buried in details[] is invisible; say it where the operator
+    # reads. Mirrors user-blocker-escalation-check.py's `unknown_age`.
+    if skipped_age_uncomputable:
+        sys.stderr.write(
+            "unblock-parent-status-sweep: %d goal(s) carry no parseable "
+            "created_at / defer_reason_set_at / started — they can never age "
+            "into eligibility and are re-skipped every sweep\n"
+            % skipped_age_uncomputable)
 
     return 0
 

@@ -137,7 +137,37 @@ _SH_COMPARE = re.compile(r"[=!]=?\s*[\"']?(--[A-Za-z][A-Za-z0-9-]*)")
 _ARM_REFUSES = re.compile(r"\bexit\s+[1-9]")
 # Any sign the arm CONSUMES the flag rather than dying on it: consuming argv,
 # appending to a passthrough array, or assigning a variable.
+#
+# APPLY IT VIA _strip_quoted, NEVER TO A RAW ARM BODY (). The
+# `[A-Za-z_][A-Za-z0-9_]*=` alternative matches an assignment token anywhere,
+# including inside a quoted error MESSAGE — so a refusal arm that says
+# `echo "expected key=value"` or `echo "use --field=X instead"` reads as
+# evidence the arm CONSUMES the flag, and the arm flips from refused to
+# accepted. That is a guard INVERSION, and in the direction sh_flag_surface's
+# own docstring calls the worse one: an under-report makes you look further, an
+# over-report makes you confident. Measured on synthetic arms — `not allowed`
+# classifies refusal correctly, `expected key=value` and `use --field=X
+# instead` both classified WRONG before this change.
 _ARM_ACCEPTS = re.compile(r"\bshift\b|\+=|[A-Za-z_][A-Za-z0-9_]*=")
+
+#: Single- and double-quoted spans, non-greedy, with backslash escapes honoured.
+#: Used to blank out string literals before scanning an arm body for
+#: accept-signals, so text a script PRINTS can never be read as code it RUNS.
+_QUOTED_SPAN = re.compile(r"'(?:\\.|[^'\\])*'" r'|"(?:\\.|[^"\\])*"')
+
+
+def _strip_quoted(s: str) -> str:
+    """Blank the CONTENTS of quoted spans, preserving length and line structure.
+
+    Newlines inside a span are kept so line-oriented callers do not shift, and
+    the quote characters themselves are kept so an unterminated quote cannot
+    silently swallow the rest of the body. Only the interior is erased.
+    """
+    def _blank(m: "re.Match[str]") -> str:
+        inner = m.group(0)[1:-1]
+        return m.group(0)[0] + "".join(
+            "\n" if ch == "\n" else " " for ch in inner) + m.group(0)[-1]
+    return _QUOTED_SPAN.sub(_blank, s)
 # Help flags are never "refused": a `--help)` arm that prints usage and exits
 # non-zero is the flag WORKING, not the flag being rejected. `platform-check.sh:70`
 # (`-h|--help) usage; exit 2 ;;`) is the shape — exit status is a style choice
@@ -231,8 +261,13 @@ def sh_flag_surface(path: Path) -> tuple[set[str], set[str]] | None:
         if m:
             body = _arm_body(lines, i)
             # body is None => arm extent unknown => treat as accepting (status quo).
+            # _ARM_ACCEPTS runs over the QUOTE-STRIPPED body so an `=` inside
+            # a printed message is not read as the arm consuming the flag
+            # (). _ARM_REFUSES stays on the raw body: it is scoped to
+            # this goal's finding, and `exit N` is not a token that appears
+            # incidentally inside error prose the way `key=` does.
             is_refusal = bool(body) and bool(_ARM_REFUSES.search(body)) \
-                and not _ARM_ACCEPTS.search(body)
+                and not _ARM_ACCEPTS.search(_strip_quoted(body))
             for alt in m.group(1).split("|"):
                 alt = alt.strip()
                 if not alt.startswith("-"):
@@ -531,10 +566,27 @@ RATCHET_KEY = "skillmd_flag_mismatches"
 def _ratchet(result: dict, output: str) -> int:
     """Advisory baseline ratchet, mirroring eviction-conservation-ratchet.py.
 
-    Baselines rather than hard-gates because the drift PRE-DATES the check
-    (11 real mismatches at seed time, each needing its own verified fix), which
-    is exactly the case audit-baselines.md says to baseline. The tripwire the
-    goal wanted still fires: any NEW mismatch reads REGRESSED.
+    Baselines rather than hard-gates because the drift PRE-DATES the check,
+    which is exactly the case audit-baselines.md says to baseline. The tripwire
+    the goal wanted still fires: any NEW mismatch reads REGRESSED.
+
+    THE `note` FIELD WRITTEN BELOW IS THE SINGLE SOURCE OF TRUTH for what the
+    baseline number means and what to do about it. No count is restated here,
+    deliberately.
+
+    This docstring used to carry its own seed count, describing every mismatch
+    as real and each needing its own verified fix, while the note written fifty
+    lines down in this same function said the baseline had since been re-seeded
+    and that the remaining findings are a FLOOR of prose false positives that
+    must NOT be driven to zero. Those are opposite instructions, and the
+    docstring is what a maintainer reads first — so the reader most likely to
+    act would have set out to chase false positives as bugs.
+
+    It survived because the edit that re-seeded the baseline targeted the note
+    STRING and never re-read the enclosing function: the same stale-documentation
+    class g-115-3122 corrected in two other places. Carrying the number in
+    exactly ONE place is what stops that recurring, which is why this paragraph
+    describes the hazard without repeating the figure. (g-115-5701)
 
     Imports are local so the plain audit path stays dependency-free (it must run
     in a bare checkout and under tests without _paths/_fileops resolving).

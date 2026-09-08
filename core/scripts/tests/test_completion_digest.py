@@ -199,3 +199,61 @@ def test_cost_hook_slot_feeds_the_spend_card_and_failures_omit_it(world):
     # no slot at all: same
     slot.unlink()
     assert cd.gather(world, "alpha", SINCE, NOW, 10)["cost"] == {}
+
+
+def test_window_clamp_is_visible_when_queue_retention_is_shorter_than_since(world):
+    """The digest counts only the LIVE queue, which is retention-pruned (guard-4085).
+
+    Pre-fix, the Window label and the /day denominator both used the REQUESTED
+    window while the rows came from whatever the queue still retained, so a
+    301h-labelled report over 76h of data understated every rate ~4x and a quiet
+    agent whose closes had archived read as idle (g-115-9405). The clamp must be
+    ANNOUNCED, not applied silently -- a silent clamp is worse than the original
+    bug, because the number stops being wrong and starts being unfalsifiable
+    (guard-2131: never present a window whose recency you have not measured).
+    """
+    oldest = NOW - timedelta(hours=6)
+    _write(world, [{
+        "id": "asp-1", "title": "Retention", "status": "active", "goals": [
+            _goal("g-1-1", "completed", completed_at=oldest.isoformat(),
+                  completed_by="alpha", outcome_class="deep", completed_by_sid="aaaa1111"),
+            _goal("g-1-2", "completed", completed_at=(NOW - timedelta(hours=2)).isoformat(),
+                  completed_by="bravo", outcome_class="deep", completed_by_sid="bbbb2222"),
+        ]}])
+    # SINCE is 48h back; the queue retains nothing older than 6h.
+    data = cd.gather(world, "alpha", SINCE, NOW, 10)
+    cov = data["coverage"]
+    assert cov["clamped"] is True
+    assert cov["queue_oldest_completed"] == oldest.isoformat()
+    assert cov["covered_from"] == oldest.isoformat()
+    # THE PIN: covered span must be the data's, not the request's.
+    assert 5.9 < cov["covered_hours"] < 6.1, cov["covered_hours"]
+    assert cov["covered_hours"] < cd._hours(SINCE, NOW)
+    # The unread archive is stated at every call site, not left to be inferred.
+    assert "archive" in cov["source"]
+
+    md = cd.render(data, agent="alpha", since=SINCE, now=NOW, notes="", max_items=10)
+    assert "DATA COVERS ONLY" in md, "clamp applied silently -- the number is now unfalsifiable"
+    # 2 closes over ~6h is ~8/day; over the requested 48h it would read ~1/day.
+    assert "/day" in md and "(~1.0/day)" not in md
+
+
+def test_fully_covered_window_does_not_clamp(world):
+    """Negative control: an unconditional clamp would pass the test above alone."""
+    _write(world, [{
+        "id": "asp-1", "title": "Covered", "status": "active", "goals": [
+            _goal("g-1-1", "completed", completed_at=(NOW - timedelta(hours=3)).isoformat(),
+                  completed_by="alpha", outcome_class="deep", completed_by_sid="aaaa1111"),
+        ]}])
+    # Ask for 2h of window; the only close is 3h old, so nothing is IN window and
+    # the queue floor does not predate the request in the clamping direction.
+    since = NOW - timedelta(hours=48)
+    data = cd.gather(world, "alpha", since, NOW, 10)
+    assert data["coverage"]["clamped"] is True  # floor (3h) is newer than since (48h)
+
+    # Now a request the queue genuinely covers end-to-end.
+    since_covered = NOW - timedelta(hours=1)
+    data2 = cd.gather(world, "alpha", since_covered, NOW, 10)
+    assert data2["coverage"]["clamped"] is False, "clamp fired on a fully-covered window"
+    md = cd.render(data2, agent="alpha", since=since_covered, now=NOW, notes="", max_items=10)
+    assert "DATA COVERS ONLY" not in md

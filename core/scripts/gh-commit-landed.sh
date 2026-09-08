@@ -24,6 +24,31 @@
 # absent, unauthenticated, network down, repo/sha unknown - resolves to
 # UNVERIFIED and exits non-zero. Read the printed VERDICT, not just the code.
 #
+# THE ONE EXCEPTION TO "A FALSE NOT-LANDED COSTS ONE MORE LOOK", AND IT IS THE
+# REASON TO STOP BEFORE USING THIS SCRIPT (, guard-5076):
+# ON A LANE THAT SQUASH-MERGES, THIS PROBE IS WRONG BY CONSTRUCTION AND CANNOT
+# SELF-CORRECT. A squash merge writes a NEW commit; the dev sha is therefore
+# never an ancestor of the base ref, so an ancestry check can only ever return
+# not-landed - for a change that landed perfectly, forever, on every re-probe.
+# That is not "one more look": it is a permanent false negative that freezes the
+# goal, and the re-probe sweeps re-derive the same wrong answer every 2h.
+#
+# SELF-CONCEALING, which is why a warning belongs HERE rather than only in the
+# guardrail: the wrong tool returns a REAL, correctly-computed answer to a
+# question the lane does not ask, so nothing looks broken. Measured twice in one
+# day (2026-09-07): a  gate declared "still fails" with a selector-leak
+# attribution that had to be WITHDRAWN, and  read a merged PR as
+# unlanded. Both goal records already forbade a sha check in terms (bravo,
+# 2026-09-05: "DO NOT REVERT TO A SHA CHECK", citing two goals frozen 2 days on
+# this same error) and it was reached for anyway - prose in a goal cannot reach
+# the hand already typing the command.
+#
+# THE DISCRIMINATOR: if the lane squashes, probe by CONTENT, not by sha. Verify
+# the symbol/behaviour is present at the base ref - e.g.
+# `promotion-lane-probe.sh --repo <repo> --symbol <symbol>` for a promotion lane
+# - and capture the rc with NO pipe (guard-1150). Where the goal record names a
+# specific command, run THAT command.
+#
 # Usage:  gh-commit-landed.sh <owner/repo> <base-ref> <sha>
 #   e.g.  gh-commit-landed.sh acme/widget-service main a1b2c3d
 # Exit 0 = LANDED (compare status is `identical` or `behind`, i.e. <sha> is an

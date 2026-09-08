@@ -49,12 +49,17 @@ unreadable, which is its own kind of failure.
 """
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
 
-CONV = Path("core/config/conventions/domain-hooks.md")
+# F1 (): every path here was cwd-RELATIVE, so the checker ran only
+# from PROJECT_ROOT. From anywhere else it printed "FAIL: <registry> not
+# found" and exited 2 — blaming the REGISTRY for what is a cwd fault, which
+# is the most misleading direction a contract checker can fail in. Sibling
+# scripts derive the root from __file__ or _paths.sh; this does the same.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONV = PROJECT_ROOT / "core/config/conventions/domain-hooks.md"
 HEADING = "## Canonical Hook Slots"
 
 
@@ -75,8 +80,16 @@ def parse_slots(text: str):
             started, _ = True, rows.append(line)
         elif started and not line.strip():
             break
-    return [r for r in rows
-            if not re.match(r"^\|\s*[-: ]+\|", r) and "Slot name" not in r]
+    # F4 (): the header row used to be dropped by matching the literal
+    # "Slot name". Renaming that column in the convention turned the header into a
+    # phantom slot named "Slot" that then failed "consumer path unparseable" — a
+    # checker reporting a defect in the registry's PROSE as a broken contract.
+    # The header is simply the first non-separator row, so drop it by position;
+    # that holds under any column name. (Same phantom-row class the docstring
+    # already describes for the later tables, now solved the same structural way
+    # rather than by a second, literal-matching mechanism.)
+    body = [r for r in rows if not re.match(r"^\|\s*[-: ]+\|", r)]
+    return body[1:]
 
 
 # Extensions a Consumer-column token may carry to count as a consumer. Derived
@@ -87,6 +100,100 @@ def parse_slots(text: str):
 # reclassifies the row as a finding, which is the direction that inflated this
 # checker's own FAIL count).
 CONSUMER_EXTS = (".md", ".sh", ".py")
+
+
+# F3 (): the existence gate used to accept ONLY `test -f`. The bracket
+# forms `[ -f ... ]` and `[[ -f ... ]]` are the more common bash idiom and were
+# reported as "references the slot but does NOT existence-gate it" — i.e. the
+# checker punished a correct implementation, which is how a checker teaches
+# people to ignore it. All three forms satisfy requirement 2 identically.
+#
+# This is a WIDENING over a live corpus, so per guard-2201 it was landed by
+# computing the OLD vs NEW verdict delta on ONE snapshot and asserting the
+# REMOVED set is empty — no row that passed the gate before may fail after.
+GATE_RE_PREFIX = r"(?:test\s+-f|\[\[?\s+-f)\s+[\"\']?[^\"\'\s]*conventions/"
+
+
+# F4 (): requirement 2 is written in BASH (`test -f`), but 7 of the 11
+# consumers are MARKDOWN — SKILL.md pseudocode and digests — whose "code" is not
+# bash and which legitimately express the same absence-handling three other ways.
+# Grading pseudocode against a bash syntax rule reported 3 of 3 such rows as
+# "breaks every fresh world" when ALL THREE were measured returning rc=0 with the
+# slot absent (zeta, cc-02, 2026-09-07):
+#   domain-calendar     generation_phase_gate.py -> decision:"fail-open", rc=0
+#   commons-retrieval   load-conventions.sh <absent name> -> rc=0, 0 bytes
+#   outcome-observation outcome-observation-run.sh on a bare fresh world -> rc=0
+# That is a 100% false-positive rate on this bucket, and it is the direction the
+# module docstring already names as the most misleading a contract checker can
+# fail in — the same lesson F3 landed for the `[ -f ]` bracket forms.
+#
+# These rows are NOT folded into `ok`. They go to a distinct `delegated` bucket
+# that PRINTS ITS EVIDENCE, so relaxing the verdict does not hide the row
+# (guard-1914: do not silently drop a guard that decides whether a call happens).
+# A consumer with none of the four forms is still `broken` at rc=1 — the
+# true-positive path is untouched.
+#
+# WINDOW sized from MEASURED gaps, not guessed (guard-1451): the largest observed
+# distance between a slot reference and its evidence is 5 lines
+# (domain-calendar ref@116 -> "Fail-open in both directions"@121); commons-retrieval
+# is 0 (same line) and outcome-observation is 3. 12 lines is that max with margin.
+DELEGATION_WINDOW = 12
+
+# (B) pseudocode conditional consumption — the SKILL.md idiom for an existence gate
+_PSEUDO_GATE_RE = re.compile(
+    r"IF\s+path\s+returned|IF\s+output\s+(?:is\s+)?non-empty|IF\s+\w+\s+returned"
+    r"|if\s+present|IF\s+EXISTS|if\s+the\s+file\s+exists", re.I)
+# (D) an explicitly documented fail-open contract
+_FAILOPEN_RE = re.compile(r"fails?[-\s]open", re.I)
+# (C) delegation to a repo script — bare name or repo-relative path
+_INVOKE_RE = re.compile(r"(?:(?:core|world)/scripts/)?([A-Za-z0-9_.-]+\.(?:sh|py))")
+
+
+def _script_exists(name: str, project_root) -> bool:
+    """A named callee resolves to a real file under core/ or world/ scripts."""
+    base = name.rsplit("/", 1)[-1]
+    for cand in (project_root / "core" / "scripts" / base,
+                 project_root / "world" / "scripts" / base):
+        if cand.exists():
+            return True
+    return False
+
+
+def delegation_evidence(body: str, slot: str, project_root):
+    """Return a one-line evidence string if the consumer handles slot-absence in
+    a non-bash form, else None. Only lines within DELEGATION_WINDOW of a slot
+    reference count — an unbounded scan would match any fail-open note anywhere
+    in a long SKILL.md and make the check unfalsifiable.
+    """
+    lines = body.splitlines()
+    ref_idx = [i for i, ln in enumerate(lines) if slot in ln]
+    if not ref_idx:
+        return None
+    for i in ref_idx:
+        lo = max(0, i - DELEGATION_WINDOW)
+        hi = min(len(lines), i + DELEGATION_WINDOW + 1)
+        window = "\n".join(lines[lo:hi])
+        m = _PSEUDO_GATE_RE.search(window)
+        if m:
+            return "pseudocode existence gate {!r} at line {}".format(
+                m.group(0).strip(), i + 1)
+        m = _FAILOPEN_RE.search(window)
+        if m:
+            return "documented fail-open contract {!r} near line {}".format(
+                m.group(0).strip(), i + 1)
+        for j in range(lo, hi):
+            line = lines[j]
+            for cand in _INVOKE_RE.findall(line):
+                if not _script_exists(cand, project_root):
+                    continue
+                base = cand.rsplit("/", 1)[-1]
+                if slot in line or slot in base:
+                    return ("delegates to {} (exists) at line {}, tied to the "
+                            "slot by {}".format(
+                                cand, j + 1,
+                                "the invocation line" if slot in line
+                                else "the callee name"))
+    return None
 
 
 def consumer_tokens(cell: str):
@@ -118,7 +225,7 @@ def main() -> int:
               "changed and this checker no longer parses it")
         return 2
 
-    broken, ok, unchecked = [], [], []
+    broken, ok, unchecked, delegated = [], [], [], []
     for row in rows:
         cells = [c.strip() for c in row.strip("|").split("|")]
         # The slot NAME is the FIRST backticked token, never the whole cell:
@@ -141,11 +248,30 @@ def main() -> int:
         # executable and only the exists+references half is applicable.
         md_consumers = [t for t in toks if t.endswith(".md")]
         consumer = md_consumers[0] if md_consumers else toks[0]
-        if not os.path.exists(consumer):
+        # F1: consumer paths are registry-relative (repo-root), so resolve them
+        # against PROJECT_ROOT rather than the caller's cwd.
+        consumer_path = PROJECT_ROOT / consumer
+        if not consumer_path.exists():
             broken.append("{}: consumer file {} does not exist — the slot is "
                           "documented but can never fire".format(slot, consumer))
             continue
-        body = Path(consumer).read_text(encoding="utf-8")
+        # F2 (): an uncaught OSError/UnicodeDecodeError here exited 1,
+        # and 1 is this script's "contract broken" verdict — so a permissions or
+        # encoding fault on ONE consumer was reported to verify-learning as a
+        # hook-slot VIOLATION. A checker crash and a contract failure must never
+        # share an exit code. rc=2 is already "the checker itself cannot run".
+        try:
+            body = consumer_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            print("FAIL: cannot read consumer {} for slot {} ({}) — this is a "
+                  "CHECKER fault, not a contract verdict; no slot verdict below "
+                  "can be trusted".format(consumer, slot, exc))
+            return 2
+        except UnicodeDecodeError as exc:
+            print("FAIL: consumer {} for slot {} is not valid UTF-8 ({}) — this "
+                  "is a CHECKER fault, not a contract verdict".format(
+                      consumer, slot, exc))
+            return 2
         if slot not in body:
             broken.append("{}: registered in the table but {} never references "
                           "it — a documented hook with no consumer".format(
@@ -156,13 +282,21 @@ def main() -> int:
                              "there is no `conventions/{}.md` to existence-gate "
                              "and requirement 2 does not apply".format(
                                  slot, consumer, slot, slot))
-        elif not re.search(r"test\s+-f\s+[\"']?[^\"'\s]*conventions/"
-                           + re.escape(slot) + r"\.md", body):
-            broken.append("{}: {} references the slot but does NOT "
-                          "existence-gate it (`test -f "
-                          "\"$WORLD_DIR/conventions/{}.md\"`) — works on a "
-                          "configured box, breaks every fresh world".format(
-                              slot, consumer, slot))
+        elif not re.search(GATE_RE_PREFIX + re.escape(slot) + r"\.md", body):
+            ev = delegation_evidence(body, slot, PROJECT_ROOT)
+            if ev:
+                delegated.append("{}: {} has no bash existence gate, but "
+                                 "handles absence another way — {}".format(
+                                     slot, consumer, ev))
+            else:
+                broken.append("{}: {} references the slot but does NOT "
+                              "existence-gate it (`test -f "
+                              "\"$WORLD_DIR/conventions/{}.md\"`) and no "
+                              "delegation, pseudocode gate or documented "
+                              "fail-open was found within {} lines of any "
+                              "reference — works on a configured box, breaks "
+                              "every fresh world".format(
+                                  slot, consumer, slot, DELEGATION_WINDOW))
         else:
             ok.append(slot)
 
@@ -170,12 +304,21 @@ def main() -> int:
     # all three is a parse defect, and it would otherwise shrink the
     # denominator silently — report it as a checker fault (rc 2), not as a
     # contract verdict (guard-541: assert the buckets sum to the population).
-    if len(broken) + len(unchecked) + len(ok) != len(rows):
+    if len(broken) + len(unchecked) + len(ok) + len(delegated) != len(rows):
         print("FAIL: internal accounting error — {} broken + {} unchecked + {} "
-              "ok != {} table rows. The checker dropped a row, so no verdict "
-              "below can be trusted.".format(
-                  len(broken), len(unchecked), len(ok), len(rows)))
+              "ok + {} delegated != {} table rows. The checker dropped a row, "
+              "so no verdict below can be trusted.".format(
+                  len(broken), len(unchecked), len(ok), len(delegated),
+                  len(rows)))
         return 2
+
+    if delegated:
+        print("DELEGATED: {} of {} slot(s) handle absence outside a bash "
+              "existence gate — evidence named per row; verify by running the "
+              "path with the slot absent (guard-6239):".format(
+                  len(delegated), len(rows)))
+        for d in delegated:
+            print("  - {}".format(d))
 
     if unchecked:
         print("UNCHECKED: {} of {} slot(s) are executable — consumer verified, "
@@ -195,8 +338,10 @@ def main() -> int:
     print("PASS: {} of {} Pattern B hook slots have a real consumer that both "
           "references the slot and existence-gates it ({}){}".format(
               len(ok), len(rows), ", ".join(ok),
-              "" if not unchecked else
-              "; {} executable slot(s) unchecked above".format(len(unchecked))))
+              ("" if not unchecked else
+               "; {} executable slot(s) unchecked above".format(len(unchecked)))
+              + ("" if not delegated else
+                 "; {} delegated slot(s) listed above".format(len(delegated)))))
     return 0
 
 

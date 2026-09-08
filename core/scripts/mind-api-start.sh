@@ -777,9 +777,58 @@ if [ -f "$DAEMON_LOG" ]; then
 fi
 
 if [ -n "$wedged_port" ]; then
+    # ── OPT-IN AUTO-REAP + SINGLE RETRY ( outcome 2) ────────────
+    # DEFAULT OFF. With MIND_API_AUTO_REAP=1 the wrapper reaps the orphan with
+    # the CROSS-REPO-SAFE standalone sweeper and retries the spawn exactly once,
+    # turning the permanent wedge into a self-clearing one on boxes that opt in.
+    # With the var unset this whole block is skipped and the failure path below
+    # is unchanged, byte for byte.
+    #
+    # It still does NOT call the in-wrapper _sweep_orphan_daemons: that one
+    # takes empty args and kills every mind_api.src process box-wide, colliding
+    # with sibling deployments. The "DELIBERATELY no implicit" refusal above
+    # stands unmodified, and test_daemon_pinned_port_wedge.py pins it. The
+    # standalone sweeper is safe here because its keep-set is built from EVERY
+    # deployment's published pair (), so it never reaps a sibling.
+    #
+    # THE EXEC HAZARD: `exec` does NOT run the EXIT trap, and this script holds
+    # `trap '_release_spawn_lock' EXIT` at the sole trap site (guard-5820 — bash
+    # keeps exactly one handler per signal, so there is no second one to catch
+    # this). A naive re-exec therefore LEAKS the wrapper mutex, and every later
+    # spawn waits the full 10s for a lock nobody will ever release. Release it
+    # explicitly and disarm the trap BEFORE exec.
+    #
+    # RECURSION GUARD: MIND_API_AUTO_REAP_ATTEMPTED is exported across the exec,
+    # so the reap-and-retry can happen at most once no matter how deep the
+    # wedge. A still-wedged port after the retry falls through to the loud
+    # message below, which then also reports that the auto-reap was already
+    # tried — a reader must never mistake a post-reap wedge for an un-swept one.
+    if [ "${MIND_API_AUTO_REAP:-}" = "1" ] && [ -z "${MIND_API_AUTO_REAP_ATTEMPTED:-}" ]; then
+        _log "port $wedged_port WEDGED; MIND_API_AUTO_REAP=1 — reaping via standalone sweeper, then retrying the spawn ONCE"
+        echo "[daemon-start] port $wedged_port wedged; MIND_API_AUTO_REAP=1 — reaping orphans and retrying the spawn once." >&2
+        # MIND_API_ORPHAN_SWEEP exists so a TEST can exercise this exec path
+        # without firing a real `--clean` at this box's live fleet daemon.
+        # Production never sets it; the default IS the real cross-repo-safe
+        # sweeper. Do not repurpose it as a general "pick your reaper" knob —
+        # the cross-repo safety argument above holds for THAT script only.
+        _sweeper="${MIND_API_ORPHAN_SWEEP:-$PROJECT_ROOT/core/scripts/daemon-orphan-sweep.sh}"
+        if bash "$_sweeper" --clean >> "$SPAWN_LOG" 2>&1; then
+            _log "orphan sweep succeeded; re-exec'ing for the single retry"
+        else
+            _log "orphan sweep exited non-zero; re-exec'ing for the single retry anyway (the retry is the real test, not the sweep's rc)"
+        fi
+        _release_spawn_lock
+        trap - EXIT
+        export MIND_API_AUTO_REAP_ATTEMPTED=1
+        exec bash "$PROJECT_ROOT/core/scripts/mind-api-start.sh" "$@"
+    fi
+
     alive_list="$(bash "$PROJECT_ROOT/core/scripts/proc-match.sh" 'mind_api.src' 2>/dev/null || true)"
     alive_n="$(printf '%s' "$alive_list" | grep -c . || true)"
     echo "[daemon-start] ERROR: daemon did not become ready within 10s — PORT $wedged_port IS WEDGED (bind_failed: address already in use)." >&2
+    if [ -n "${MIND_API_AUTO_REAP_ATTEMPTED:-}" ]; then
+        echo "[daemon-start]   MIND_API_AUTO_REAP already reaped and retried once, and the port is STILL wedged — the holder is not an orphan this sweeper can reap. Diagnose the holder before retrying." >&2
+    fi
     if [ -n "$alive_list" ]; then
         echo "[daemon-start]   $alive_n mind_api.src process(es) alive; one holds $wedged_port but is NOT published, so nothing can reach it and EVERY restart fails identically. Retrying this command will NOT help." >&2
     else

@@ -796,7 +796,25 @@ def _emit_audit_stale_note(trigger, target_status):
              "post", "--channel", "coordination", "--type", "status", "--tags", tags],
             input=text, capture_output=True, text=True, timeout=10,
         )
-        return {"posted": proc.returncode == 0, "msg_id": proc.stdout.strip() if proc.returncode == 0 else None}
+        if proc.returncode != 0:
+            # SYMMETRY WITH THE except BRANCH BELOW (). This path used
+            # to return {"posted": False} and DISCARD proc.stderr, so an exception
+            # was loud and carried a reason while a non-zero exit was silent and
+            # carried none — and capture_output=True eats board.py's own stderr,
+            # so nothing reached the operator either. No DATA was lost (a failed
+            # post writes no tags, so the next cadence retries), but the REASON
+            # was: a systematic failure (auth, lock contention, a board schema
+            # change) retried silently every cadence forever with zero diagnostic.
+            # That is verify-before-assuming.md Rule 4 — a command whose error
+            # output is discarded is ZERO signals, not one.
+            _err = (proc.stderr or "").strip() or f"rc={proc.returncode}, no stderr"
+            # BOTH surfaces, deliberately: guard-772 — a fail-open WARN written
+            # ONLY to stderr is invisible when this runs in a backgrounded
+            # subprocess, so the reason must also ride the returned dict.
+            print(f"[insight-trigger-sweep] WARN: audit-stale board-post failed "
+                  f"(rc={proc.returncode}): {_err}", file=sys.stderr)
+            return {"posted": False, "msg_id": None, "error": _err}
+        return {"posted": True, "msg_id": proc.stdout.strip()}
     except Exception as e:
         print(f"[insight-trigger-sweep] WARN: audit-stale board-post failed: {e}", file=sys.stderr)
         return {"posted": False, "msg_id": None, "error": str(e)}
@@ -909,8 +927,17 @@ def _emit_out_of_window_digest(target, triggers):
              "post", "--channel", "coordination", "--type", "status", "--tags", tags],
             input=text, capture_output=True, text=True, timeout=15,
         )
-        return {"posted": proc.returncode == 0,
-                "msg_id": proc.stdout.strip() if proc.returncode == 0 else None,
+        if proc.returncode != 0:
+            # Same asymmetry, same fix as _emit_audit_stale_note ().
+            # This emitter is additionally the LAST routing chance for aged-out
+            # triggers, so a silent failure here strands them with no diagnostic.
+            _err = (proc.stderr or "").strip() or f"rc={proc.returncode}, no stderr"
+            print(f"[insight-trigger-sweep] WARN: out-of-window digest for {target} "
+                  f"failed (rc={proc.returncode}): {_err}", file=sys.stderr)
+            return {"posted": False, "msg_id": None,
+                    "count": len(triggers), "error": _err}
+        return {"posted": True,
+                "msg_id": proc.stdout.strip(),
                 "count": len(triggers)}
     except Exception as e:
         print(f"[insight-trigger-sweep] WARN: out-of-window digest for {target} failed: {e}",

@@ -46,7 +46,9 @@ and that live leg is not reproducible in this file.
 
 ALSO MEASURED, NOT TESTED HERE: recurring goals ARE in scope. It looks like they
 should be excluded (they close through recurring-close.sh and get their signal
-mutation from recurring-loop-state-mutate.py), but recurring-close.sh:389 runs
+mutation from recurring-loop-state-mutate.py), but recurring-close.sh's
+`run_phase state-update` line (cited :389 until 2026-09-07, when re-derivation
+under g-115-4366 found that number stale -- grep the symbol) runs
 `iteration-close.sh --phase state-update`, which reaches the bump, and the
 counted-list append at loop-state-bump-counters.py is unconditional on
 --recurring. Excluding them would have blinded the check to every recurring
@@ -367,3 +369,159 @@ def test_a_torn_store_line_does_not_blind_the_whole_sweep():
             encoding="utf-8")
         pop, total, _ = cli._closed_this_session(p, "S", 25, "me")
     assert [r["id"] for r in pop] == ["g-1"]
+
+
+# ── The close-PATH classifier () ────────────────────────────────────
+# `classify()` answers WHY a close is uncounted. `classify_close_path()` answers
+# whether the close was SANCTIONED — taken by a path that legitimately runs no
+# iteration — and if so whether the missing state-update is owed (CREDIT) or not
+# (EXCLUDE). Two sanctioned paths produce a BYTE-IDENTICAL changelog fingerprint
+# (a CNC-drain and a hypothesis-resolution close), so the split cannot key on
+# drain-ness; it keys on the claim history.
+#
+# ANTI-VACUITY (guard-5163): the first test asserts the four measured-dead
+# record signals really do collapse the two cases, so the second test — that the
+# classifier separates them — proves something.
+
+def _row(ts, op, agent="bravo", field=None):
+    return {"ts": ts, "agent": agent, "op": op, "field": field}
+
+
+_DRAIN_ROWS = [                                    # cause 4: CNC-drain
+    _row("2026-08-25T14:02:36", "claim", "foxtrot"),
+    _row("2026-09-06T06:41:58", "complete-by", "echo"),
+    _row("2026-09-06T06:42:02", "update-goal", "echo", "outcome_class"),
+]
+_HYPRES_ROWS = [                                   # cause 6: hypothesis-resolution
+    _row("2026-09-07T04:30:14", "add-goal", "bravo"),
+    _row("2026-09-07T14:36:00", "complete-by", "bravo"),
+    _row("2026-09-07T14:36:04", "update-goal", "bravo", "outcome_class"),
+]
+
+
+def test_the_two_sanctioned_closes_collapse_on_every_dead_record_signal():
+    """Both are: uncounted, complete-by present, outcome_class present seconds
+    later, and claimed_by None at close. Every record-derived discriminator
+    measured across three boxes reads the SAME for both."""
+    for rows in (_DRAIN_ROWS, _HYPRES_ROWS):
+        assert any(r["op"] == "complete-by" for r in rows)
+        assert any(r["field"] == "outcome_class" for r in rows)
+        # no `release` and no live claim at close time in either
+        assert not any(r["op"] == "release" for r in rows)
+
+
+def test_but_the_classifier_separates_exclude_from_credit():
+    assert cps.classify_close_path(_DRAIN_ROWS, "echo") == cps.PATH_SANCTIONED_DISPOSAL
+    assert cps.classify_close_path(_HYPRES_ROWS, "bravo") == cps.PATH_SANCTIONED_SELF
+
+
+def test_the_resume_shape_is_never_suppressed():
+    """: complete-by then a LONE outcome_class 15m28s later. This is
+    the incident shape the whole check exists for — suppressing it would be the
+    worst possible regression."""
+    rows = [_row("2026-09-03T14:26:22", "complete-by"),
+            _row("2026-09-03T14:41:50", "update-goal", field="outcome_class")]
+    assert cps.classify_close_path(rows, "alpha") == cps.PATH_UNCLASSIFIED
+
+
+def test_a_bare_status_close_has_no_complete_by_and_stays_a_finding():
+    rows = [_row("2026-09-03T10:00:00", "update-goal", field="status")]
+    assert cps.classify_close_path(rows, "alpha") == cps.PATH_UNCLASSIFIED
+
+
+def test_a_same_agent_claim_under_matches_rather_than_suppressing():
+    """A same-agent claim cannot separate 'disposed my own stale row' from
+    'executed and lost the close'. Under-matching is the safe direction."""
+    rows = [_row("2026-09-07T10:00:00", "claim", "bravo")] + _HYPRES_ROWS[1:]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_a_row_interposed_between_the_pair_breaks_the_fingerprint():
+    rows = [_row("2026-09-07T14:36:00", "complete-by"),
+            _row("2026-09-07T14:36:02", "update-goal", field="outcome_note"),
+            _row("2026-09-07T14:36:04", "update-goal", field="outcome_class")]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_an_unparseable_stamp_never_reads_as_a_small_gap():
+    rows = [_row("not-a-timestamp", "complete-by"),
+            _row("2026-09-07T14:36:04", "update-goal", field="outcome_class")]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_no_rows_at_all_is_a_finding_not_a_suppression():
+    assert cps.classify_close_path([], "bravo") == cps.PATH_UNCLASSIFIED
+    assert cps.classify_close_path(None, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_the_gap_threshold_separates_the_two_measured_distributions():
+    """Sanctioned gaps measured 2-22s (n=8, four boxes); the resume shape 928s."""
+    def gap(seconds):
+        base = "2026-09-07T14:36:"
+        return [_row(base + "00", "complete-by"),
+                _row(base + f"{seconds:02d}", "update-goal", field="outcome_class")]
+    assert cps.classify_close_path(gap(22), "bravo") == cps.PATH_SANCTIONED_SELF
+    assert cps.classify_close_path(gap(59), "bravo") == cps.PATH_SANCTIONED_SELF
+    # 61s is past the bound and must fall back to the finding side
+    rows = [_row("2026-09-07T14:36:00", "complete-by"),
+            _row("2026-09-07T14:37:01", "update-goal", field="outcome_class")]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_decide_without_a_close_path_oracle_is_unchanged():
+    """No changelog read (or an unreadable one) must behave exactly as the check
+    did before the classifier existed: every uncounted close stays a finding."""
+    r = cps.decide([{"id": "g-1"}, {"id": "g-2"}], lambda _g: "absent")
+    assert r["skipped"] == ["g-1", "g-2"]
+    assert r["sanctioned_excluded"] == [] and r["sanctioned_credited"] == []
+    assert r["status"] == "findings"
+
+
+def test_an_excluded_close_leaves_the_sweep_clean():
+    r = cps.decide([{"id": "g-1"}], lambda _g: "absent",
+                   close_path=lambda _g: cps.PATH_SANCTIONED_DISPOSAL)
+    assert r["skipped"] == [] and r["sanctioned_excluded"] == ["g-1"]
+    assert r["status"] == "clean"
+
+
+def test_a_credited_close_is_still_a_finding():
+    """CREDIT means work HAPPENED and the bump is genuinely owed — it must never
+    render as health just because the close path was sanctioned."""
+    r = cps.decide([{"id": "g-1"}], lambda _g: "absent",
+                   close_path=lambda _g: cps.PATH_SANCTIONED_SELF)
+    assert r["skipped"] == [] and r["sanctioned_credited"] == ["g-1"]
+    assert r["status"] == "findings"
+
+
+def test_the_classifier_only_reclassifies_skips_never_bump_noops():
+    """A ledger-attributed bump no-op must stay attributed to the bump; the
+    close-path oracle is consulted only for SKIPPED."""
+    seen = []
+
+    def oracle(gid):
+        seen.append(gid)
+        return cps.PATH_SANCTIONED_DISPOSAL
+
+    r = cps.decide([{"id": "g-1"}], lambda _g: "absent", ("g-1",), close_path=oracle)
+    assert r["bump_noop"] == ["g-1"] and seen == []
+
+
+def test_render_names_both_sanctioned_buckets_distinctly():
+    r = cps.decide([{"id": "g-1"}, {"id": "g-2"}, {"id": "g-3"}], lambda _g: "absent",
+                   close_path=lambda g: {"g-1": cps.PATH_UNCLASSIFIED,
+                                         "g-2": cps.PATH_SANCTIONED_DISPOSAL,
+                                         "g-3": cps.PATH_SANCTIONED_SELF}[g])
+    out = cps.render(r)
+    assert "EXCLUDED" in out and "g-2" in out
+    assert "ACCOUNTING GAP" in out and "g-3" in out
+
+
+def test_the_emitted_prose_did_not_grow_into_a_sixth_caveat(): 
+    """guard-4649 / this goal's outcome 2: the discrimination is a classifier in
+    the code, not another paragraph in the output. The five-cause catalog moved
+    to core/config/rationale/close-phase-skip-causes.md, so the findings line
+    must stay short and point there."""
+    r = cps.decide([{"id": "g-1"}], lambda _g: "absent")
+    out = cps.render(r)
+    assert len(out) < 1200, f"findings line regrew to {len(out)} chars"
+    assert "close-phase-skip-causes.md" in out
