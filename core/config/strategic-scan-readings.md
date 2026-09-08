@@ -11706,3 +11706,49 @@ version yet of "the ratio is span-width news, in either direction, and is not pr
 invocation count" — and it sharpens it: the width that matters can belong to ONE peer.
 It does NOT make this a skill-quality measurement. 6.1% coverage with the four non-resident starts
 frozen on 08-05 still cannot see the fleet; **routed nothing.**
+
+## 2026-09-08T00:4x — zeta, `hostname` cc-02, `uname -r` 6.8.0-138-generic, own-cloud, live fleet
+
+**S4.6 `ceiling_ratio` = 0.102 (3118 of 30578) — ABOVE the recorded band (~0.0026–0.087), a new
+top — at the HIGHEST invocation count ever recorded here.** That is a second, stronger
+falsification of "the ratio trends DOWN as the fleet accumulates invocations": the denominator hit
+its maximum and the ratio hit its maximum in the same reading.
+
+The mechanism is the previous row's, one step further: **one peer's span now supplies 95.6% of the
+whole ceiling.** alpha `08-01T23:29..09-07T20:48` — a **37-DAY** span, 2982 of 6016 in-span =
+**49.6%** — against bravo 0.8% (`08-02T00:05..07:42`), echo 0.7%, foxtrot 0.5%, zeta (resident,
+live) 0.3% (`09-07T16:13..09-08T00:32`). Prior rows had every agent at 0.3–1.1%; this is the first
+reading where any agent is well-covered, and 2982 of 3118 classifiable rows are that one agent's.
+
+Two consequences. **(1) A 10x ratio is not 10x coverage** — it is one 49.6% averaged with four
+~0.6%, so the fleet-wide claim is no better supported than at 0.0072; only alpha's is. **(2) The
+resident-is-live heuristic is falsified here**: zeta is resident and live and has the LOWEST
+coverage of the five (0.3%), while the widest span belongs to a non-resident peer. Read span WIDTH,
+never residency.
+
+`--min-failures 2` → 0 candidates; positive control `--min-failures 1` → **also 0**, distinct
+members 0 (`failing_count: 2` at ledger level). Formally the undecidable case, so **routed
+nothing** — but note this zero is better-founded than any prior one: alpha's 37-day window is
+genuinely wide and still produced no failures. It is a claim about ALPHA, not about the fleet.
+
+Other lanes, same scan: **S2a** 33 stale EXPLORE of 54 (30d), opened 33/33, `STRUCTURAL: 5` —
+`solver-v0-audits` (distill, 72d), `infrastructure-performance` (decompose, 59d),
+`env-agnostic-exploration-primitives` (distill, 40d), `v2-directed-steering-{ship-log,wiring}`
+(node_split, 58d); split 33 raw / 6 re-verify / 27 suspect; histogram carries a 16-node cohort at
+58–59d. Stop-condition on the attach FIRED — all 8 tokens (numerator, all 5 members, hostname,
+kernel) already present in g-115-5462's 44,722 B note, so this is a REPRODUCTION and nothing was
+appended there. **Method note for the next reader: the SKILL file's inline prior said 2 members
+(dated 08-20) while the goal note already carried `STRUCTURAL: 5`. The inline prior is the stale
+one. Run the token check before trusting the marker's stated prior — judging "the numerator moved"
+against the SKILL text alone produces a false new-finding.**
+**S2b** 50 of 54 EXPLORE thin = 92.6% (reproduces echo's 92.2%); `depth>=2` admits 54/54, still
+inert. Routed nothing (g-115-4840). **S3** full corpus (`goals_omitted` absent on all 25, n=2419,
+compact mtime 00:36:48): axis1 32.2% framework-architecture / axis1b 61.8% `framework-*` across 40
+labels / **axis2 83.3% asp-115 (2014/2419) FIRES**. Both terms up vs the 08-16 row (1642→2014
+absolute, 80.3%→83.3% share) — not dilution. Note the axes are DIVERGING: axis1 fell 39.9%→32.2%
+while distinct categories grew 186→243, so the category axis gives more false comfort over time as
+the same pile fragments across more labels (rb-4502, sharpened). S3c: HIGH 12/25 = 48%,
+completed_unarchived 0 → no signal. **S1** 98 sensors pass the `achievedCount>=2` gate; cross-agent
+census on the top 10 shows **5 DROPPED at `mine<2`**, including the two highest-cadence ones
+(`g-326-85` ach=184, 0 local/111 fleet; `g-115-105` ach=386, 0 local/20 fleet) — g-115-3215's
+blindness, worse than its own example. Routed nothing.

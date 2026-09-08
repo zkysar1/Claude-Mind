@@ -137,11 +137,18 @@ IF output is "worker":
    worker IS exactly that box, since the reducer holds the claim elsewhere and this box
    reads agent-state IDLE. So the scenario the step named is precisely the scenario
    where it is inert.
-   MEASURED TWICE, two boxes, two OSes: DESKTOP-O91DLK2 (Windows) `pruned_agents=12`
-   with `alpha` among them, `pushed=1`; cc-07 (Linux 6.8.0-138-generic)
-   `pruned_agents=11`, `alpha` among them, **`pushed=0`**. Read a non-zero `pushed`
-   carefully — on the Windows run it referred to a DIFFERENT owned path, not to the
-   agent dir; the cc-07 `pushed=0` removes that ambiguity.
+   MEASURED THREE TIMES, two boxes, two OSes: DESKTOP-O91DLK2 (Windows)
+   `pruned_agents=12` with `alpha` among them, `pushed=1`; cc-07 (Linux
+   6.8.0-138-generic) `pruned_agents=11` with `alpha` among them, `pushed=0` on
+   2026-09-07 but **`pushed=1`** on 2026-09-08 (three flushes, same box, same
+   kernel, `alpha` pruned every time). **`pushed` IS NOT THE DISCRIMINATOR, IN
+   EITHER DIRECTION.** It counts OTHER owned paths and is box- *and*
+   run-contingent, so a zero proves nothing and a non-zero does not mean the agent
+   dir moved. This sentence used to claim the cc-07 `pushed=0` "removes that
+   ambiguity" — the 2026-09-08 re-measurement on that same box falsified it. The
+   tell is `pruned_agents=N` plus the WARN line naming the pruned agents; read
+   those. (guard-6254 carries the same correction against guard-1579, whose `rule`
+   field is immutable.)
    NOT a data-loss report: the state is on local disk and a later `/start` on THIS SAME
    box resumes the SID. What is absent is OFF-BOX durability, so a machine-move after a
    worker stop does strand the per-session state. If an artifact must reach the fleet,
@@ -157,7 +164,16 @@ IF output is "worker":
    stopped worker. Idempotent.
    Bash: `rm -f ".active-agent-$MIND_SID"`
 
-5. Output: `"Worker Body stopped on this box. The reducer was NOT signalled — its claim, canonical working memory, and session state are untouched. This worker's session state has been staged and pushed. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+5. Output: `"Worker Body stopped on this box. The reducer was NOT signalled — its claim, canonical working memory, and session state are untouched. This worker's per-session state is on LOCAL DISK ONLY — step 2 prunes the agent dir rather than pushing it — so a later /start on THIS box resumes the SID, and a machine-move strands it. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+
+   The "local disk only" wording is load-bearing and must track step 2. Until
+   2026-09-08 this string said the session state "has been staged and pushed",
+   contradicting the ⚠ block directly above it — the block was corrected by
+   g-115-9319 on 2026-09-07 and this user-facing sentence was not, so every
+   worker `/stop` reported a push that cannot happen (observed being repeated
+   verbatim to the user, alpha/cc-07, 2026-09-08). A prose warning and the
+   string the operator actually reads are two artifacts; fixing one is not
+   fixing the other (guard-4282).
 
 DONE. Do NOT continue to Step 1. Do NOT write `stop-target-mode`. Do NOT set the
 AGENT-WIDE `session/stop-requested`. Do NOT chain into the aspirations loop.
