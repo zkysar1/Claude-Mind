@@ -565,6 +565,53 @@ except Exception:
         fi
         unset _role_verdict
     fi
+
+    # ── READ-SURFACE BANNER () ────────────────────────────────────
+    # STDERR, never stdout: this script's stdout is the goal JSON that every
+    # caller parses (worker-loop Phase 2.9, aspirations-execute). A human banner
+    # on stdout would corrupt the payload for all of them — guard-3189/guard-1963
+    # (banner on stderr, machine payload on stdout).
+    #
+    # SIZE-GATED, NOT PRESENCE-GATED, and that distinction is measured rather
+    # than assumed. The presence predicate was censused over 2,403 open goals
+    # (alpha/cc-04 2026-09-07): progress_note OR outcome_note non-empty fires on
+    # 715 (29.75%), while the combined read surface exceeds the ~25k-token read
+    # cap on 16 (0.67%). Those two populations need OPPOSITE actions from the
+    # claimer — read the 3.2 KB note, versus budget-or-leave the 304 KB one —
+    # and one flag cannot express both, so the MESSAGE is size-dependent.
+    # progress_note distribution: median 3,269 B, p90 13,263 B, max 303,820 B.
+    #
+    # The threshold is BYTES because the read cap is TOKENS and this corpus
+    # measures ~2.5 B/token (id-dense: goal ids, shas, timestamps) — NOT the
+    # ~4 B/token prose figure in self.md, which understates tokens ~1.6x here.
+    # Combined, not progress_note alone: on 2 of the top 12 the DESCRIPTION
+    # dominates, and description is the field a claimer is already told to read.
+    printf '%s' "$response" | $(rt_python_launcher) -c "
+import json, sys
+try:
+    resp, _ = json.JSONDecoder().raw_decode(sys.stdin.read())
+    g = resp.get('goal') or {}
+except Exception:
+    sys.exit(0)                      # fail-open: never block a claim on this
+if not isinstance(g, dict):
+    sys.exit(0)
+FIELDS = ('description', 'progress_note', 'outcome_note')
+sizes = {f: len((g.get(f) or '').encode('utf-8', 'replace')) for f in FIELDS}
+total = sum(sizes.values())
+notes = sizes['progress_note'] + sizes['outcome_note']
+CAP = 62500                          # ~25k tokens at 2.5 B/tok, measured
+gid = g.get('goal_id') or g.get('id') or '?'
+def kb(n): return '%.1f KB' % (n / 1024.0)
+if total >= CAP:
+    print('[aspirations-claim] READ-SURFACE OVER CAP (g-115-8461): %s carries %s across description+notes (~%dk tokens at 2.5 B/tok) and CANNOT be read whole in one context.'
+          % (gid, kb(total), round(total / 2500.0)), file=sys.stderr)
+    print('    description %s | progress_note %s | outcome_note %s'
+          % (kb(sizes['description']), kb(sizes['progress_note']), kb(sizes['outcome_note'])), file=sys.stderr)
+    print('    Budget for it or RELEASE IT UNSTARTED now — deciding after you have read half is the expensive order. Notes are APPEND-ORDERED: the corrective block is at the END (guard-2043).', file=sys.stderr)
+elif notes > 0:
+    print('[aspirations-claim] READ THESE BEFORE ANALYSING (g-115-8461, guard-4576/guard-4499): %s carries progress_note %s, outcome_note %s. Prior work hides there — an empty outcome_note is NOT an untouched goal.'
+          % (gid, kb(sizes['progress_note']), kb(sizes['outcome_note'])), file=sys.stderr)
+" || true
     # Skip when the response carried no claimed_by. READ THE NEXT SENTENCE BEFORE
     # RELYING ON THIS: the guard no longer separates agent-queue from world-queue
     # claims. It was written when claim() answered agent-queue goals 400 and only

@@ -514,3 +514,53 @@ def test_diagnostic_parent_guard_fires_through_main():
             assert not unblock.get("outcome_note"), (
                 f"guard-vetoed Unblock must have no outcome_note; "
                 f"got {unblock.get('outcome_note')!r}")
+
+
+# ── : properties (3) and (4) of the documented fix shape ──────────
+# The test above asserts the details[] ROW, so it passes with or without a
+# summary counter — which is how properties 3 (own counter) and 4 (stderr when
+# non-zero) shipped missing while 1 and 2 landed. These pin the counter and the
+# stderr line. An uncomputable row hits `continue` BEFORE swept-marking, so it
+# is re-scanned and re-skipped every precheck iteration forever; buried in
+# details[] it is invisible in --output human entirely.
+
+def test_uncomputable_increments_the_summary_counter_and_says_so_on_stderr():
+    """Property 3 + property 4. Positive control for both.
+
+    The live queue yields zero uncomputable rows, so a non-zero count is only
+    reachable from a fixture — the same reason the row test above exists.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        world, agent_dir = _make_world_with_pair(
+            tmp, parent_status="skipped", unblock_extra={"created_at": None})
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep failed rc={rc}: {err}"
+            result = json.loads(out)
+
+            assert "skipped_age_uncomputable" in result, (
+                "the summary dict must carry its own counter — a lone details[] "
+                f"row is invisible in human mode; got keys {sorted(result)}")
+            assert result["skipped_age_uncomputable"] == 1, (
+                f"expected exactly the one fixture Unblock to be counted; got "
+                f"{result['skipped_age_uncomputable']} (details={result.get('details')})")
+            assert "no parseable" in err, (
+                f"a non-zero count must reach stderr, where the precheck "
+                f"operator reads; stderr was {err!r}")
+
+
+def test_timestamped_unblock_leaves_the_counter_at_zero_and_stderr_quiet():
+    """Negative control: the counter must count the branch, not every skip."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        world, agent_dir = _make_world_with_pair(tmp, parent_status="skipped")
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep failed rc={rc}: {err}"
+            result = json.loads(out)
+            assert result.get("skipped_age_uncomputable") == 0, (
+                f"a goal with a parseable timestamp must not be counted as "
+                f"uncomputable; got {result.get('skipped_age_uncomputable')}")
+            assert "no parseable" not in err, (
+                f"stderr must stay quiet at zero; got {err!r}")

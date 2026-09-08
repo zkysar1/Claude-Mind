@@ -47,16 +47,22 @@ BIND_FAILED = (
 )
 
 
-def _stub_launcher(tmp_path: Path) -> Path:
-    """A PATH dir whose python3 refuses `-m mind_api.src` and passes the rest."""
+def _stub_launcher(tmp_path: Path, counter: Path | None = None) -> Path:
+    """A PATH dir whose python3 refuses `-m mind_api.src` and passes the rest.
+
+    When `counter` is given the stub appends one line per refused daemon spawn,
+    so a caller can count how many times the wrapper actually tried to start the
+    daemon — that count is how the single-retry guarantee is measured.
+    """
     real = shutil.which("python3") or sys.executable
     binv = tmp_path / "stub-bin"
     binv.mkdir(parents=True, exist_ok=True)
     stub = binv / "python3"
+    tally = f'echo x >> "{counter}"; ' if counter is not None else ""
     stub.write_text(
         "#!/usr/bin/env bash\n"
         'for a in "$@"; do\n'
-        '  if [ "$a" = "mind_api.src" ]; then exit 1; fi\n'
+        f'  if [ "$a" = "mind_api.src" ]; then {tally}exit 1; fi\n'
         "done\n"
         f'exec "{real}" "$@"\n',
         encoding="utf-8",
@@ -65,7 +71,7 @@ def _stub_launcher(tmp_path: Path) -> Path:
     return binv
 
 
-def _run_start(tmp_path: Path, daemon_log):
+def _run_start(tmp_path: Path, daemon_log, extra_env=None, counter: Path | None = None):
     rt = tmp_path / "state"
     rt.mkdir(parents=True, exist_ok=True)
     if daemon_log is not None:
@@ -78,7 +84,12 @@ def _run_start(tmp_path: Path, daemon_log):
     env = dict(os.environ)
     env["RUNTIME_DIR"] = str(rt)
     env["STORAGE_BACKEND"] = "local"          # guard-955
-    env["PATH"] = f"{_stub_launcher(tmp_path)}{os.pathsep}" + env.get("PATH", "")
+    env["PATH"] = f"{_stub_launcher(tmp_path, counter)}{os.pathsep}" + env.get("PATH", "")
+    # Never inherit an opt-in from the box running the suite.
+    env.pop("MIND_API_AUTO_REAP", None)
+    env.pop("MIND_API_AUTO_REAP_ATTEMPTED", None)
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         bash_cmd(str(START_SH)),
         cwd=str(PROJECT_ROOT), env=env,
@@ -155,4 +166,109 @@ def test_start_wrapper_still_refuses_an_implicit_system_wide_sweep():
         "mind-api-start.sh must not invoke _sweep_orphan_daemons — an empty-args "
         "sweep kills every mind_api.src process on the box, including sibling "
         f"deployments' live daemons. Found: {invocations}"
+    )
+
+
+# ──  outcome 2: the opt-in auto-reap ────────────────────────────────
+
+
+def _stub_sweeper(tmp_path: Path, marker: Path) -> Path:
+    """A stand-in for daemon-orphan-sweep.sh that records the call instead of reaping.
+
+    The real sweeper with `--clean` kills orphaned mind_api.src processes on the
+    whole box. Running it from a test would put this box's LIVE fleet daemon in
+    the blast radius of a unit test, so the wrapper reads its sweeper path from
+    MIND_API_ORPHAN_SWEEP and this stub takes that slot. What is under test is
+    the wrapper's control flow — did it sweep, did it retry exactly once, did it
+    release the lock — not the sweeper's reaping logic, which has its own tests.
+    """
+    s = tmp_path / "stub-sweep.sh"
+    s.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{marker}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    s.chmod(0o755)
+    return s
+
+
+def test_auto_reap_is_off_by_default(tmp_path):
+    """Unset MIND_API_AUTO_REAP must leave the failure path exactly as it was.
+
+    The opt-in is worthless if it changes the default: a box that never sets the
+    var must still get the loud named-recovery message and nothing else. This is
+    the control for every assertion in the opt-in test below.
+    """
+    marker = tmp_path / "swept.txt"
+    proc, _rt = _run_start(
+        tmp_path, BIND_FAILED % 19003,
+        extra_env={"MIND_API_ORPHAN_SWEEP": str(_stub_sweeper(tmp_path, marker))},
+    )
+
+    assert proc.returncode != 0
+    err = proc.stderr
+    assert "WEDGED" in err.upper(), f"the default diagnostic must survive; got:\n{err}"
+    assert "daemon-orphan-sweep.sh" in err, "the default must still NAME the recovery"
+
+    # The reap must not have fired, and its two messages must not appear.
+    assert not marker.exists(), "the sweeper ran without MIND_API_AUTO_REAP=1"
+    assert "MIND_API_AUTO_REAP" not in err, (
+        f"the default path must not mention the opt-in; got:\n{err}"
+    )
+
+
+def test_auto_reap_opt_in_sweeps_retries_once_and_never_leaks_the_spawn_lock(tmp_path):
+    """MIND_API_AUTO_REAP=1: sweep, retry EXACTLY once, hold the lock invariant.
+
+    Three properties in one run, because they are only true together:
+
+    * the sweeper is invoked (the wedge is actually acted on);
+    * the daemon spawn is attempted exactly TWICE — the original plus one retry.
+      The recursion guard is the whole safety story: without it a permanently
+      wedged port would re-exec forever;
+    * the wrapper mutex is NOT leaked. `exec` does not run the EXIT trap, and
+      this script's only trap is `_release_spawn_lock` (guard-5820), so a naive
+      re-exec would leave `daemon.wrapper.lock` behind and every later spawn
+      would block the full 10s waiting for a holder that no longer exists.
+
+    The stub launcher refuses every spawn, so the retry fails too — which is the
+    case worth pinning: the reader must be told the reap already happened rather
+    than being sent to run it again.
+    """
+    marker = tmp_path / "swept.txt"
+    counter = tmp_path / "spawn-attempts.txt"
+    proc, rt = _run_start(
+        tmp_path, BIND_FAILED % 19003,
+        extra_env={
+            "MIND_API_AUTO_REAP": "1",
+            "MIND_API_ORPHAN_SWEEP": str(_stub_sweeper(tmp_path, marker)),
+        },
+        counter=counter,
+    )
+    err = proc.stderr
+
+    assert marker.exists(), f"the sweeper was never invoked; stderr:\n{err}"
+    assert "--clean" in marker.read_text(encoding="utf-8"), "the sweeper must be reaping, not reporting"
+
+    attempts = counter.read_text(encoding="utf-8").split() if counter.exists() else []
+    assert len(attempts) == 2, (
+        f"expected exactly 2 daemon spawn attempts (original + ONE retry), got "
+        f"{len(attempts)}; stderr:\n{err}"
+    )
+
+    # The exec hazard, measured directly rather than inferred from the message.
+    assert not (rt / "daemon.wrapper.lock").exists(), (
+        "the spawn lock leaked across the re-exec — `exec` skips the EXIT trap, "
+        "so the lock must be released explicitly before it"
+    )
+    # A leaked lock also changes what the retry says; pin the symptom too.
+    assert "concurrent spawn did not publish" not in err, (
+        f"the retry blocked on a leaked wrapper mutex; got:\n{err}"
+    )
+
+    # Still wedged after the reap: say so, do not send the reader round again.
+    assert proc.returncode != 0
+    assert "already reaped and retried once" in err, (
+        f"a post-reap wedge must report that the reap already ran; got:\n{err}"
     )

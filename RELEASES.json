@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.67",
+    "previous_version": "2.12.66",
+    "date": "2026-09-08",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "g-369-155: the vessel mints its own 'Assigned by the member' directive aspiration on the first drain pass (inbound_directive_asp.py + slot wiring)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.66",
     "previous_version": "2.12.65",
     "date": "2026-09-07",

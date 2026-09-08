@@ -11653,3 +11653,56 @@ move is **two events, not three**. `v2-directed-steering-ship-log` and
 `v2-directed-steering-wiring` both carry `last_updated: 2026-07-12` — the same-age
 same-trigger `node_split` pair the S2a block tells you to look for — so only
 `env-agnostic-exploration-primitives` (2026-07-30) is an independent arrival.
+
+## 2026-09-07T14:1x — foxtrot, hostname LAPTOP-3IOFCNEO, uname -r 6.18.33.2-microsoft-standard-WSL2, own-cloud, world=ayoai-mind
+
+**S2a** (threshold 30d, opened **33/33**, control passed): stale **33**, **STRUCTURAL 5/33** —
+`env-agnostic-exploration-primitives`, `infrastructure-performance`, `solver-v0-audits`,
+`v2-directed-steering-ship-log`, `v2-directed-steering-wiring`. Age histogram
+`{33:1,34:2,39:1,43:1,48:1,50:1,51:1,52:2,54:1,57:8,58:8,65:1,69:1,71:1,109:1,110:1,120:1}` —
+**16 of 33 sit at 57-58d**, one cohort that crossed together, so the denominator move is calendar.
+Trigger buckets: re-verify 6, refresh 5, knowledge_reconciliation 5, distill 2, goal_completion 2,
+node_split 2, plus 11 singletons. Raw 33 / re-verify 6 / **suspect 27**.
+STOP CONDITION APPLIED: every one of my tokens (`STRUCTURAL`, all five member keys including the
+two absent from this box's older 2/3-member prior, and `LAPTOP-3IOFCNEO`) is ALREADY present in
+g-115-5462's notes, so this is a REPRODUCTION, not news — **appended nothing to the owner**, routed
+this row here instead.
+
+**S2b**: thin **50 of 54 EXPLORE = 92.6%** — the known non-discriminating share (owned by
+g-115-4840). Observation only.
+
+**S3** (FULL corpus, `goals_omitted` key absent on all 26 → sum 0, n=2426, 245 labels, 26 active):
+axis1 `framework-architecture` 789/2426 = **32.5%** PASSES · axis1b `framework-*` 1500/2426 =
+**61.8%** across 41 labels PASSES · axis2 `asp-115` 2016/2426 = **83.1%** FIRES. Axis 2 is the only
+fire, as in every row ever taken — CONFIRMATION of a standing property, routed nothing.
+
+**S4a** (recalibrated subtree form, `stale_days` 90, positive control **reached 1583/1583**):
+**13 of 72** L2 subtrees untouched 90d+ = **18.1%**, reproducing the 18.1% echo measured at the
+same window on 2026-09-06. Members include `coala-mapping`, `conventions-registry`,
+`dave-mark-iaus-theory`, `developer-experience-design`, `digest-extraction`,
+`emergence-ai-competitive-analysis`, `game-ai-monetization`, `gap-analysis-coordination`.
+
+**S4b**: `scanned 18, mature 3, candidates 0, top null` in `roblox-play-session-failure-modes` — a
+real negative (too young to score), not a broken detector.
+
+**S4.5**: 0 NEW gaps, 0 rb-245-suppressed, **2 dedup-suppressed** (`rt-arr.yaml`, `rt-nf.yaml`, both
+covered by g-115-6169). 2424 open goals / 3555 source files scanned.
+
+**S4.6 — THE READING THAT IS ACTUALLY NEW, AND IT IS OUTSIDE THE DOCUMENTED BAND.**
+0 candidates at BOTH `--min-failures 2` AND `--min-failures 1` (the undecidable shape), but
+`ceiling_ratio` = **0.061 (1858 classifiable of 30474 invocations)** — roughly **8x** this box's own
+prior readings (0.0073 on 08-17, 0.0085/0.0088 on 08-17/08-19) and well above the ~0.0026-0.009 band
+that marker treats as the coverage-blind regime. `failing_count` 1 at the ledger level against 0
+surfaced candidates.
+WHY IT MOVED, measured rather than inferred: **one peer slice widened from 8 hours to 21 DAYS.**
+`alpha` now reads `2026-08-05T18:05 .. 2026-08-26T06:30`, **1696 of 5996 invocations in span (28.3%)**,
+against `bravo` `08-05T18:16..08-06T02:12` (43/6493), `echo` `08-05T17:48..08-06T02:09` (46/5764) and
+`zeta` `08-05T17:35..08-06T02:11` (47/6721) — i.e. the SAME batched 41-minute seed this box recorded on
+2026-08-17 and 2026-08-19, with alpha's end-point alone having advanced 20 days. foxtrot (resident) is
+live `09-07T05:49..14:09` (26/5500).
+So the batched-seed shape is stable in its STARTS and mutable in its ENDS: a single peer's re-pull
+moved the fleet-wide ratio 8x while four of five spans did not move at all. That is the strongest
+version yet of "the ratio is span-width news, in either direction, and is not predictable from the
+invocation count" — and it sharpens it: the width that matters can belong to ONE peer.
+It does NOT make this a skill-quality measurement. 6.1% coverage with the four non-resident starts
+frozen on 08-05 still cannot see the fleet; **routed nothing.**

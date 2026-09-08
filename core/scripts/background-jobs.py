@@ -296,11 +296,48 @@ def check_job(job):
 def cmd_register(args):
     """Add a job entry to the tracking file."""
     data = read_data()
-    # Prevent duplicate registration
-    for job in data["jobs"]:
-        if job.get("job_id") == args.id:
-            log(f"already registered: {args.id}")
+    # ID COLLISION (). This used to log "already registered" and
+    # return rc=0 WITHOUT updating the row or tracking the live pid, so a caller
+    # checking only rc read a silent no-op as success and the live job went
+    # untracked -- stop-hook Gate 2.6 then does not hold the turn open for it.
+    # The systematically-exposed population is RECURRING goals: a deterministic
+    # job id collides with its OWN orphaned row from the previous cycle every
+    # time (measured , alpha/cc-04 2026-08-30: an 8.8h-old STOPPED row
+    # with a confirmed-dead pid swallowed the registration of a live suite, and
+    # the ONLY tell was register saying rc=0 while has-pending said rc=1).
+    # Three cases, because they want opposite answers and the old code gave all
+    # three the same one:
+    for i, job in enumerate(data["jobs"]):
+        if job.get("job_id") != args.id:
+            continue
+        existing_pid = job.get("pid")
+        if str(existing_pid) == str(args.pid):
+            # Same id, same pid: a genuine idempotent re-arm. Nothing to change,
+            # and nothing is untracked -- the row already names this process.
+            log(f"already registered: {args.id} (same pid {args.pid}) — no change")
             return
+        if not pid_alive(existing_pid):
+            # Stale orphan: the incumbent is provably dead, so the id is free in
+            # every sense that matters and the LIVE job must own it. Reap and
+            # fall through to the normal append. This is the case that made
+            # roblox-bridge.py::_register_self's docstring ("register upserts")
+            # false, and the case the recurring-goal population hits every cycle.
+            log(f"reaping stale row for {args.id}: pid {existing_pid} is not alive; "
+                f"re-registering with live pid {args.pid}")
+            data["jobs"].pop(i)
+            break
+        # Same id, DIFFERENT pid, incumbent ALIVE. Two live jobs cannot share one
+        # id: silently ignoring loses the new one, and upserting loses the old
+        # one. Neither is ours to pick, so refuse LOUDLY -- rc=2, matching the
+        # REFUSED convention heartbeat-tick.sh uses and leaving rc=1 free.
+        # Safe to add: no shell caller branches on this rc (every call site is
+        # LLM prose in a SKILL.md, and roblox-bridge.py runs it check=False
+        # inside try/except) -- checked in both directions per guard-775.
+        log(f"REFUSED: {args.id} is already registered to a DIFFERENT and LIVE "
+            f"pid {existing_pid} (you passed {args.pid}). Registering would lose "
+            f"one of the two jobs. Deregister the finished one, or use a distinct "
+            f"--id. Verify with `background-jobs.sh check --id {args.id}`.")
+        sys.exit(2)
     entry = {
         "job_id": args.id,
         "type": args.type,

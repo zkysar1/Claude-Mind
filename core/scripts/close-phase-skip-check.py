@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
 import close_phase_skip as cps  # noqa: E402
+from _runtime_bash import BASH as _BASH  # noqa: E402
 
 _BUMP = _HERE / "loop-state-bump-counters.py"
 # The window is deliberately SMALL. The actionable question this lane answers is
@@ -184,6 +186,59 @@ def _membership_oracle(goal_ids):
     return lambda g: cps.COUNTED if g in counted else "absent"
 
 
+# One changelog line: "[TS] AGENT edit FILE (N lines) — OPERATION".
+# The em-dash tail is the operation; its vocabulary (measured over a live
+# window: 4,464 rows) is claim | release | complete-by | add-goal |
+# update-goal <field>.
+_CL_LINE = re.compile(
+    r"^\[(?P<ts>[^\]]+)\]\s+(?P<agent>\S+)\s+\S+\s+\S+.*?\s+[—-]\s+"
+    r"(?P<op>claim|release|complete-by|add-goal|update-goal)\s+"
+    r"(?P<gid>g-\d+-\d+)(?:\s+(?P<field>\S+))?\s*$"
+)
+_CHANGELOG = _HERE / "changelog-read.sh"
+# Deep enough to reach a drained row's ORIGINAL claim (measured: one drain
+# disposed work executed 9 days earlier), bounded so the read stays affordable
+# on a per-iteration lane.
+_CHANGELOG_LIMIT = 20000
+
+
+def _close_path_oracle(goal_ids, agent):
+    """callable(goal_id) -> a close_phase_skip.PATH_* verdict.
+
+    Reads the changelog ONCE through its canonical wrapper (guard-2676 — never
+    a hand-rolled read of the store) and buckets every row naming a goal under
+    test.
+
+    FAIL-OPEN TO `UNCLASSIFIED`, WHICH IS THE FINDING SIDE. If the changelog
+    cannot be read or parsed, every uncounted close stays a finding and this
+    check behaves exactly as it did before the classifier existed. A read
+    failure must never be able to SUPPRESS a report — that is the direction in
+    which a mistake is invisible.
+    """
+    ids = {g for g in (goal_ids or []) if g}
+    if not ids:
+        return lambda _g: cps.PATH_UNCLASSIFIED
+    rows = {g: [] for g in ids}
+    try:
+        proc = subprocess.run(
+            [_BASH, str(_CHANGELOG), "--limit", str(_CHANGELOG_LIMIT)],
+            capture_output=True, text=True, timeout=120,
+        )
+        for line in (proc.stdout or "").splitlines():
+            m = _CL_LINE.match(line.strip())
+            if not m or m.group("gid") not in ids:
+                continue
+            rows[m.group("gid")].append({
+                "ts": m.group("ts"), "agent": m.group("agent"),
+                "op": m.group("op"), "field": m.group("field"),
+            })
+    except (subprocess.SubprocessError, OSError):
+        return lambda _g: cps.PATH_UNCLASSIFIED
+    for g in rows:
+        rows[g].sort(key=lambda r: r["ts"])
+    return lambda g: cps.classify_close_path(rows.get(g) or [], agent)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="emit the report as JSON")
@@ -221,9 +276,11 @@ def main(argv=None):
                   if args.json else f"close-phase-skip: store unreadable — {exc}",
                   file=sys.stderr)
             return 2
-        oracle = _membership_oracle([r["id"] for r in population if r.get("id")])
+        gids = [r["id"] for r in population if r.get("id")]
+        oracle = _membership_oracle(gids)
         report = cps.decide(population, oracle,
-                            _bump_failures(agent, project_root), role="reducer")
+                            _bump_failures(agent, project_root), role="reducer",
+                            close_path=_close_path_oracle(gids, agent))
         report["population_total_this_session"] = total
         report["population_bound"] = args.limit
         if foreign:

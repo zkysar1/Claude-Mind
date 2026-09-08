@@ -80,6 +80,12 @@ from _cadence_anchor import is_deliberate_raise as _is_deliberate_raise  # noqa:
 # leaf, resolvable via the same core/scripts sys.path entry file_locks adds.
 from _goal_census import effective_counts as _effective_counts, census_completed as _census_completed  # noqa: E402
 from _goal_census import all_evicted_ids as _all_evicted_ids  # noqa: E402  #  mint-site tombstone awareness
+#  FINDING 2: the terminal-status set, imported rather than re-typed.
+# _goal_census.TERMINAL_STATUSES is drift-tested against its definition sites by
+# tests/test_goal_eviction_invariance.py::test_abandoned_status_set_no_drift; the
+# local literal this replaces was pinned by nothing. Aliased (not used directly)
+# so all 13 existing `_TERMINAL_GOAL_STATUSES` references stay untouched.
+from _goal_census import TERMINAL_STATUSES as _CENSUS_TERMINAL_STATUSES  # noqa: E402
 # : the goal-field allowlist. Imported (never re-typed) so this LIVE
 # daemon path and aspirations.py::cmd_update_goal share one list — a hand-copied
 # twin here would drift silently while the CLI-side list still looked correct,
@@ -264,10 +270,19 @@ _VALID_GOAL_STATUSES = {
 # Mirror of aspirations.py::TERMINAL_GOAL_STATUSES (line 44). Drives the
 # terminal-status cascade (completed_at stamp, _clear_stale_blockers,
 # claim clearing) — when this set diverges from upstream, the cascade
-# desyncs. Parity is enforced by visual mirror only; no automated test
-# yet (could be added — see _VALID_GOAL_STATUSES note above).
-_TERMINAL_GOAL_STATUSES = {"completed", "skipped", "expired",
-                           "decomposed", "superseded"}
+# desyncs. THE MIRROR IS RETIRED (): this is now an alias for the
+# drift-tested _goal_census.TERMINAL_STATUSES imported above, so there is one
+# definition and nothing left to keep in sync by eye. The comment that stood
+# here said "parity is enforced by visual mirror only; no automated test yet"
+# — true when written, and exactly the shape that tells you nothing when it
+# breaks. Contents were verified IDENTICAL before the swap (both
+# {completed, skipped, expired, decomposed, superseded}), so this is a pure
+# subtraction, not a behaviour change. frozenset vs set is immaterial: all 13
+# use sites in this module are `in` / `not in` membership tests.
+# guard-5564 discharged: the name is module-private, no other module imports
+# it, and test_goal_eviction_invariance::test_abandoned_status_set_no_drift
+# never named this file — which is precisely why the literal drifted unowned.
+_TERMINAL_GOAL_STATUSES = _CENSUS_TERMINAL_STATUSES
 _ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (mirrors aspirations.py::ASP_ID_RE; companion to _GOAL_ID_RE xw branch below)
 _GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit: asp-115 hit  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 

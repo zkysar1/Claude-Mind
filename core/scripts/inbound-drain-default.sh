@@ -51,5 +51,23 @@ if [ -z "$_ROOT" ]; then _emit_skip "INBOUND_SPOOL_ROOT unset — no spool confi
 if [ ! -d "$_ROOT" ]; then _emit_skip "spool root does not exist: $_ROOT"; fi
 if [ ! -d "$_ROOT/$_ENVKEY" ]; then _emit_skip "no spool dir for environment '$_ENVKEY' under $_ROOT"; fi
 
+# ── The directive aspiration () ─────────────────────────────────
+# Resolved HERE, after the guards above, so only a box that declares itself
+# an environment host can ever mint: the env var, then .env.local, then the
+# world queue by exact title, then a one-time mint through this vessel's own
+# daemon (inbound_directive_asp.py). The provisioner cannot do it — no daemon
+# is bound to the vessel at provision time (provision-env.sh,
+# wire_assigned_lane) — so it writes INBOUND_DIRECTIVE_ASP_ID only when the
+# aspiration already exists, and the first loop pass on a fresh vessel is
+# where it comes to exist. Passed to the engine EXPLICITLY: the daemon loaded
+# .env.local at ITS start, so a write-back made this pass is not in this
+# process's environment yet. An empty id means "still unwired": the engine
+# leaves directives UNCLAIMED and reports unconfigured>0 — never a guessed
+# aspiration. A caller's own --aspiration still wins (argparse keeps the last).
+_ROOTDIR="$(cd "$_SELF/../.." && pwd)"
+_ENVLOCAL="${INBOUND_ENV_LOCAL:-$_ROOTDIR/.env.local}"
+_ASP="$(python3 "$_SELF/inbound_directive_asp.py" --env-local "$_ENVLOCAL" || true)"
+if [ -n "$_ASP" ]; then set -- --aspiration "$_ASP" "$@"; fi
+
 python3 "$_ENGINE" --root "$_ROOT" --environment-key "$_ENVKEY" "$@" || true
 exit 0

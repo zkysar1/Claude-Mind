@@ -222,6 +222,42 @@ def test_summary_reports_channels_scanned(board, monkeypatch, capsys):
     assert summary["scanned"] == 2
 
 
+def test_empty_channel_is_scanned_and_contributes_nothing(board, monkeypatch, capsys):
+    """An EXISTING channel with ZERO rows must still appear in channels_scanned.
+
+    This is the empty-channel control g-115-754's outcome 1 calls "genuinely
+    UNCONTROLLED", filed as g-115-7958. Every other assertion in this file
+    writes at least one row, so nothing pins the one case where the two
+    readings diverge: without it, "this channel exists and produced nothing"
+    and "this channel was never opened" are the SAME observation on the field
+    the criterion reads to prove scope (guard-2930 — when an empty result is
+    the finding, the control must show the tool can tell the two apart).
+
+    `general` is deliberately the empty one and `findings` the populated one:
+    the pair proves scanned-count includes the empty channel while `scanned`
+    counts only real triggers, so a regression that silently dropped empty
+    channels from discovery would fail here and nowhere else.
+
+    NOT the stray `__nonexistent__.jsonl` that sits in the live board dir.
+    That file holds one message, arrived from a typo'd board-post on
+    2026-08-15, and was never a control. The remedy must not recreate it
+    (g-115-7958) — the control belongs here, on the sandboxed BOARD_DIR, where
+    it costs nothing and cannot pollute a governed store.
+    """
+    _write(board, "findings", _msg("msg-f-empty-ctl"))
+    _write(board, "general")  # exists, zero rows
+
+    names = [p.name for p in its.board_channels()]
+    assert "general.jsonl" in names, f"empty channel dropped from discovery: {names}"
+
+    monkeypatch.setattr(sys, "argv", ["insight-trigger-sweep.py", "--dry-run", "--json"])
+    assert its.main() == 0
+    summary = json.loads(capsys.readouterr().out)
+
+    assert summary["channels_scanned"] == ["findings", "general"], summary["channels_scanned"]
+    assert summary["scanned"] == 1, summary["scanned"]
+
+
 # ---------------------------------------------------------------------------
 # 6 — SPECIFICITY control (guard-1660)
 # ---------------------------------------------------------------------------

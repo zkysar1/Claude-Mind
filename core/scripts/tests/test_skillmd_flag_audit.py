@@ -623,3 +623,87 @@ def test_show_skips_reports_counts():
         out = _run(tmp / "skills", meta, "--show-skips")
         assert out["finding_count"] == 0, out
         assert out["skipped"].get("multiple-wrappers-on-line") == 1, out
+
+
+# ── : _ARM_ACCEPTS must not fire on an `=` inside a quoted span ─────
+#
+# The bug was a guard INVERSION: _ARM_ACCEPTS was applied to the RAW arm body,
+# and its `[A-Za-z_][A-Za-z0-9_]*=` alternative matches an assignment token
+# anywhere — including inside an error MESSAGE the arm merely prints. So a
+# refusal arm saying `expected key=value` classified as ACCEPTING the flag.
+#
+# These tests compose the predicate exactly as the production consumer does
+# (guard-920: replicate the literal production call shape, not the contract-
+# ideal one) rather than asserting on _strip_quoted alone, because the defect
+# lived in the COMPOSITION and a _strip_quoted-only test would pass against the
+# old, broken call site.
+
+def _is_refusal(mod, body: str) -> bool:
+    """The production predicate, composed as sh_flag_surface composes it."""
+    return bool(mod._ARM_REFUSES.search(body)) and not mod._ARM_ACCEPTS.search(
+        mod._strip_quoted(body))
+
+
+def test_the_three_measured_arms_classify_correctly():
+    """The exact three synthetic arms measured in the  finding.
+
+    Before the fix: arm 1 correct, arms 2 and 3 WRONG (they matched `key=` and
+    `field=` inside their own error text and so read as accepting the flag).
+    """
+    mod = _fresh()
+    correct_before_and_after = 'echo "not allowed" >&2; exit 2'
+    wrong_before = 'echo "expected key=value" >&2; exit 2'
+    wrong_before_2 = 'echo "use --field=X instead" >&2; exit 2'
+    assert _is_refusal(mod, correct_before_and_after) is True
+    assert _is_refusal(mod, wrong_before) is True, (
+        "an `=` inside a printed message is not evidence the arm consumes the flag")
+    assert _is_refusal(mod, wrong_before_2) is True
+
+
+def test_a_real_assignment_outside_quotes_still_reads_as_ACCEPTING():
+    """POSITIVE CONTROL (guard-1220 / guard-2421).
+
+    The test above is a set of not-flagged assertions, and a _strip_quoted that
+    erased the WHOLE body would satisfy every one of them while destroying the
+    detector. These pin the other direction: real accept-signals must survive.
+    """
+    mod = _fresh()
+    assert _is_refusal(mod, 'SOURCE="$2"; shift 2; exit 1') is False
+    assert _is_refusal(mod, 'PASSTHROUGH+=("$1"); exit 1') is False
+    assert _is_refusal(mod, 'shift; exit 1') is False
+    # And an arm with no refusal signal at all is not a refusal either.
+    assert _is_refusal(mod, 'echo "hello"') is False
+
+
+def test_strip_quoted_preserves_length_and_lines():
+    """Line-oriented callers must not shift, and quotes must not be swallowed."""
+    mod = _fresh()
+    src = 'a="key=value"\nb=2\n'
+    out = mod._strip_quoted(src)
+    assert len(out) == len(src), (len(out), len(src))
+    assert out.count("\n") == src.count("\n")
+    assert "key=" not in out
+    assert out.startswith('a="') and 'b=2' in out
+
+
+def test_strip_quoted_handles_escapes_and_single_quotes():
+    mod = _fresh()
+    assert "key=" not in mod._strip_quoted("""echo 'expected key=value'""")
+    assert "key=" not in mod._strip_quoted(r'echo "a \" key=value"')
+    # An apostrophe inside a double-quoted span must not open a single-quote span.
+    assert "key=" not in mod._strip_quoted('echo "it\'s key=value"')
+
+
+def test_the_ratchet_docstring_no_longer_carries_a_contradicting_count():
+    """Outcome 1. The note field is the single source of truth for the baseline.
+
+    Asserted on the DOCSTRING rather than the file so a count appearing in the
+    note string itself (where it belongs) cannot fail this.
+    """
+    mod = _fresh()
+    doc = mod._ratchet.__doc__ or ""
+    assert "single source of truth" in doc.lower()
+    assert "11 real mismatches at seed time, each needing its own verified fix" \
+        not in " ".join(doc.split()), (
+            "the docstring is again asserting its own seed count; the note field "
+            "it writes says the baseline was RE-SEEDED at 5 and is a FLOOR")

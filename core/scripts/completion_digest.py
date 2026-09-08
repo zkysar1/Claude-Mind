@@ -151,6 +151,31 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
                          "title": g.get("title") or "", "by": g.get("completed_by") or g.get("executed_by") or "?",
                          "deep": (g.get("outcome_class") == "deep"), "at": ct.isoformat() if ct else "",
                          "sid": str(g.get("completed_by_sid") or "")[:8], "batch": False})
+    # Coverage floor (). `done` above is drawn ONLY from the live world
+    # queue, which is retention-pruned: completed goals are archived out on a lag.
+    # So the requested `since` can predate anything the queue still holds, and the
+    # window label + /day denominator would then describe a span the data does not
+    # cover -- reporting EVICTION as a low rate (guard-4085). Record the oldest
+    # completed_at the queue actually retains so render() can bound the denominator
+    # by the covered span and SAY it is doing so (guard-2131: never present a window
+    # whose recency you have not measured; a silent clamp is worse than the bug).
+    _all_completed_ts = [
+        _ts(g.get("completed_at"))
+        for asp in asps for g in (asp.get("goals") or [])
+        if g.get("status") == "completed" and _ts(g.get("completed_at"))
+    ]
+    _queue_oldest = min(_all_completed_ts) if _all_completed_ts else None
+    _covered_from = max(since, _queue_oldest) if (since and _queue_oldest) else (_queue_oldest or since)
+    coverage = {
+        "requested_since": since.isoformat() if since else None,
+        "queue_oldest_completed": _queue_oldest.isoformat() if _queue_oldest else None,
+        "covered_from": _covered_from.isoformat() if _covered_from else None,
+        "clamped": bool(since and _queue_oldest and _queue_oldest > since),
+        "covered_hours": (round((now - _covered_from).total_seconds() / 3600.0, 2)
+                          if _covered_from else None),
+        "source": "live world queue only; archive sibling not read",
+    }
+
     for a in active_asps:
         a["window_done"] = sum(1 for d in done if d["asp"] == a["id"])
     # Batch closes: the reducer formally closing many worker-executed goals in one
@@ -349,7 +374,7 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
 
     return {"done": done, "batches": batches, "recurring": recurring, "needs": needs, "pqs": pqs, "blocked": blocked,
             "blocked_total": blocked_total, "by_cause": by_cause, "active_asps": active_asps, "hyp": hyp,
-            "pulse": pulse, "outcome": outcome, "cost": cost}
+            "pulse": pulse, "outcome": outcome, "cost": cost, "coverage": coverage}
 
 
 COST_SLOT = "scripts/digest-cost.sh"
@@ -384,6 +409,18 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     L = []
     win_h = _hours(since, now) if since else None
     win_label = f"last {int(win_h)}h ({since:%Y-%m-%d %H:%M} → {now:%Y-%m-%d %H:%M} UTC)" if since else "lifetime"
+    # : the counted rows come only from the retention-pruned live queue,
+    # so when `since` predates what the queue retains, the requested window is NOT
+    # covered. Bound the /day denominator by the span actually covered and make the
+    # clamp VISIBLE -- a silent clamp is worse than the original overstatement.
+    _cov = data.get("coverage") or {}
+    rate_h = win_h
+    if _cov.get("clamped") and _cov.get("covered_hours"):
+        rate_h = _cov["covered_hours"]
+        win_label += (f" — DATA COVERS ONLY last {int(rate_h)}h "
+                      f"(from {_cov.get('covered_from', '?')[:16]}; live queue retains no "
+                      f"completed_at older than that, archive not read) — rates below use the "
+                      f"COVERED span, not the requested one")
     done, needs, pqs, blocked = data["done"], data["needs"], data["pqs"], data["blocked"]
     deep = sum(1 for d in done if d["deep"])
     quiet = [p["agent"] for p in data["pulse"] if p["age_h"] is not None and p["age_h"] > 6]
@@ -394,7 +431,7 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     L.append("## TL;DR")
     organic = [d for d in done if not d["batch"]]
     n_batch = len(done) - len(organic)
-    rate = f" (~{round(len(organic) / (win_h / 24), 1)}/day)" if win_h and win_h > 0 else ""
+    rate = f" (~{round(len(organic) / (rate_h / 24), 1)}/day)" if rate_h and rate_h > 0 else ""
     by_agent = {}
     for d in organic:
         by_agent[d["by"]] = by_agent.get(d["by"], 0) + 1

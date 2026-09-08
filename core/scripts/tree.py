@@ -888,10 +888,38 @@ CHARS_PER_TOKEN = 2.3
 # append-grown nodes in this tree (directive-lane-series 19 sections, arc-agi-3
 # 27, env-agnostic-exploration-primitives 23) name their sections by GOAL ID and
 # so scored refresh_sections 0-2 against a >=3 bar — invisible to the very
-# detector built to catch them. Precision holds on the same measurement: the
-# non-append-grown large nodes score 0-1 (framework-guardrails-and-gates 0,
-# product-world-model 1, test-coverage-illusions 0).
+# detector built to catch them. Precision holds on the same measurement for
+# framework-guardrails-and-gates (0) and test-coverage-illusions (0).
+#
+# product-world-model USED TO BE CITED HERE as a third precision example ("1").
+# It was a FALSE NEGATIVE offered as proof of accuracy, which is the worst kind
+# of citation: it is what persuades the next reader to trust the number instead
+# of re-measuring. That node delimits every refresh block with a line-start BOLD
+# run, not a heading, so the heading-only scan saw 1 — and the one it saw was
+# `## Refresh-Log Retention Policy`, the policy ABOUT the log rather than any
+# refresh block. Composed entirely of a false positive while missing every true
+# one. (; found by .)
+#
+# HENCE THE BOLD ARM BELOW. A section marker is counted whether it is delimited
+# by a heading or by a line-start bold run — the delimiter is a formatting
+# accident, the STAMP is the signal, and both arms apply the identical test.
+# Re-measured over the whole live tree 2026-09-07 (3,065 nodes, alpha/cc-07):
+# 366 nodes scored append_grown under heading-only, 423 under heading+bold, so
+# 57 nodes move; ZERO of them are over the read cap today, which is why this is
+# a latent-correctness fix and not a behaviour change. Precision on the two
+# surviving cited negatives holds under the new predicate (both score 2, still
+# under the >=3 bar). Nodes flipping on the bold arm ALONE (>=3 bold, <3
+# headings): 10.
 _APPEND_SECTION_STAMP = re.compile(r"g-\d+-\d+|\d{4}-\d{2}-\d{2}")
+
+#: A line-start bold run used as a section delimiter: `**Refresh 2026-08-04 ...**`.
+#: LINE-BOUNDED AND NON-GREEDY ON PURPOSE. The obvious `^\*\*([^*]{0,200})\*\*`
+#: is wrong twice: a negated character class MATCHES NEWLINES, so it spans lines
+#: and harvests stamps from following ones, and the 200-char bound drops the very
+#: node that motivated this (its header is longer). Measured both forms on a
+#: two-line fixture — this one is correct. Matched against the RAW line so the
+#: run must genuinely start the line.
+_APPEND_BOLD_SECTION = re.compile(r"\*\*(.{1,4000}?)\*\*")
 
 
 def _analyze_node_body(text):
@@ -916,10 +944,17 @@ def _analyze_node_body(text):
         line_count += 1
         char_count += len(line)
         s = line.lstrip()
+        marker = None
         if s.startswith("#"):
-            low = s.lower()
+            marker = s
+        else:
+            bold = _APPEND_BOLD_SECTION.match(line)
+            if bold:
+                marker = bold.group(1)
+        if marker is not None:
+            low = marker.lower()
             if ("refresh" in low or "verified values" in low
-                    or _APPEND_SECTION_STAMP.search(s)):
+                    or _APPEND_SECTION_STAMP.search(marker)):
                 refresh_sections += 1
     return line_count, int(char_count / CHARS_PER_TOKEN), refresh_sections
 
