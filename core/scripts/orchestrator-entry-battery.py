@@ -57,6 +57,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -152,7 +153,63 @@ def _payload_str(payload) -> str:
     return s
 
 
+def _context_line() -> str:
+    """The context-pressure banner, once per iteration, from a RUNNER.
+
+    WHY THIS LIVES HERE (g-115-9588). The harness injects
+    `<total_tokens>N tokens left</total_tokens>` into EVERY turn, and it can read
+    0 while the framework's own sensor reads zone=normal with 200,000 tokens of
+    headroom — measured 2026-09-09, alpha, cc-04, SID ed7229e3 (guard-6380). An
+    agent that believes the marker narrows its own scope: it releases claims,
+    declines to select, abbreviates obligations and ends turns early. The
+    falsifier for that belief already existed and was reachable only through
+    PROSE: `context-budget-banner.sh` had ZERO script callers anywhere in the
+    tree (measured cc-10, 2026-09-10), and exactly 1 of alpha's 163 journal
+    entries carried its line. A misleading signal present on every turn cannot be
+    beaten by a correct signal that depends on someone remembering to look.
+
+    This battery already runs once per iteration from a literal Bash line, so
+    emitting the banner here costs one 0.02s subprocess and puts the sensor value
+    beside the marker in the same context window, every iteration.
+
+    A SCOPED CALL, NEVER A RE-FORMAT (guard-2676). The banner's exact text is a
+    contract with BANNER_RE in abbreviated-obligation-audit.py and banner_re in
+    context-citation-audit.sh. Parsing context-budget.json and building the line
+    here would be a second formatter that drifts from both silently, and the
+    banner already owns the `CTX: unavailable (...)` degradation shape.
+
+    Returns a line, never raises: this battery must never block the loop.
+    """
+    try:
+        # bash_cmd, never a bare ["bash", ...] argv (guard-580/guard-581): on
+        # win32 CreateProcess searches SYSTEM32 before PATH, so bare "bash"
+        # resolves to the WSL stub, which cannot read a Windows-side script path
+        # and fails rc=127 — silently, at a callsite like this one that swallows
+        # exceptions. bash_cmd also passes the path through .as_posix(), whose
+        # backslashes bash would otherwise strip. Imported lazily to match this
+        # file's existing style and so an import failure lands in the same
+        # fail-open except below.
+        from _runtime_bash import bash_cmd  # type: ignore
+
+        proc = subprocess.run(
+            bash_cmd(SCRIPT_DIR / "context-budget-banner.sh"),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        lines = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        if lines:
+            return lines[0].strip()
+        return "CTX: unavailable (banner produced no output)"
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract
+        return f"CTX: unavailable (banner call failed: {type(exc).__name__})"
+
+
 def _emit(report: dict, as_json: bool) -> None:
+    # Set BEFORE the json branch so both output modes carry it, and because
+    # _fail_open() routes through here -- an errored battery must still emit the
+    # sensor (guard-614: structured output on EVERY exit path).
+    report["context_line"] = _context_line()
     if as_json:
         print(json.dumps(report, ensure_ascii=False))
         return
@@ -169,6 +226,10 @@ def _emit(report: dict, as_json: bool) -> None:
         print(f"[entry-battery] all {n_chk} entry checks clean — no dispatches")
     else:
         print(f"[entry-battery] {n_act} actionable / {n_chk} checks{err}")
+    # UNPREFIXED AND ON ITS OWN LINE, deliberately: abbreviated-obligation-audit
+    # anchors BANNER_RE at `^CTX:`, so any prefix makes this line unquotable as a
+    # valid citation under that audit.
+    print(report["context_line"])
     print(PROTOCOL_FOOTER)
 
 

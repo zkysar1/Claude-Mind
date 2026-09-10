@@ -118,6 +118,12 @@ DIRECTIVE_ASP_ENV = "INBOUND_DIRECTIVE_ASP_ID"
 INBOUND = "inbound"
 PROCESSING = "processing"
 PROCESSED = "processed"
+
+# A record sitting in processing/ older than this is reported as STRANDED.
+# Chosen against the measured population (): a legitimately in-flight
+# record is seconds old, and the one real stranding ran 2h. 30m is far above
+# the former and far below the latter.
+STRANDED_AGE_MIN_DEFAULT = 30
 REJECTED = "rejected"
 FAILED = "failed"
 QUARANTINE = "quarantine"
@@ -313,11 +319,21 @@ def _apply_directive(record: dict, source: str, asp_id: str, *,
     try:
         resp = _rt.aspirations_add_goal(asp_id, goal, source=source)
     except Exception as exc:  # noqa: BLE001 - RtError and transport errors alike
-        # Surface the daemon's OWN reason. RtError carries the response body
-        # ({"error": "origin_signal_blocked", ...}); reporting only
-        # "daemon HTTP 400" cost a paid vessel run its diagnosis.
+        # Surface the daemon's OWN reason. RtError CARRIES the structured error
+        # payload on .body (core/scripts/_rt.py reads err_body off the HTTPError
+        # and passes body=), but its __str__ is only "daemon HTTP <code> for
+        # <method> <path>". Rendering {exc} alone discarded the one field naming
+        # WHICH of add-goal's six 400 paths fired (missing_param / invalid_asp_id
+        # / invalid_source / invalid_body / validation_failed /
+        # unknown_goal_field) — measured 2026-09-08 (), where a real
+        # member directive failed with a bare "daemon HTTP 400" that cost a paid
+        # vessel run its diagnosis. The reason turned out to be
+        # {"error": "origin_signal_blocked", ...}, fixed by the explicit
+        # "origin_signal" in the payload above.
+        # guard-1661: a write path must return caller-verifiable evidence, not
+        # a bare status.
         body = getattr(exc, "body", None)
-        detail = f" body={str(body).strip()[:300]}" if body else ""
+        detail = f" body={str(body).strip()[:400]}" if body else ""
         return FAILED, f"add-goal failed: {type(exc).__name__}: {exc}{detail}"
     gid = ""
     if isinstance(resp, dict):
@@ -385,9 +401,46 @@ def _tmp_residue(inbound: Path, age_min: int) -> list[Path]:
     return sorted(out, key=lambda p: p.name)
 
 
+def stranded_records(env_dir: Path, age_min: int = STRANDED_AGE_MIN_DEFAULT) -> list[dict]:
+    """Report — never move — records a PRIOR run left claimed in processing/.
+
+    Read-only by construction: this function has no call to ``_move`` and no
+    write of any kind, so it cannot re-apply a member's instruction. The
+    never-silently-re-apply property documented above (``--requeue-stale`` is a
+    deliberate operator act) is therefore unchanged; this only makes the word
+    "visible" in that contract true for someone who is not listing the
+    directory by hand.
+
+    Reports IDENTITY, not just a count (g-369-166 outcome 2, correcting the
+    environment-granularity aggregation of rb-10397): each entry carries the
+    environment key, the filename and the age, which is what an operator needs
+    to act.
+    """
+    processing = env_dir / PROCESSING
+    if not processing.is_dir():
+        return []
+    cutoff = time.time() - (age_min * 60)
+    out: list[dict] = []
+    for name in sorted(os.listdir(processing)):
+        p = processing / name
+        try:
+            st = p.stat()
+            if not p.is_file() or st.st_mtime >= cutoff:
+                continue
+        except OSError:
+            continue
+        out.append({
+            "environment": env_dir.name,
+            "file": name,
+            "age_minutes": int((time.time() - st.st_mtime) // 60),
+        })
+    return out
+
+
 def drain_environment(env_dir: Path, *, apply: bool, source: str, asp_id: str,
                       max_records: int, tmp_age_min: int,
-                      spool_root: Path | None = None) -> dict:
+                      spool_root: Path | None = None,
+                      stranded_age_min: int = STRANDED_AGE_MIN_DEFAULT) -> dict:
     """Drain one environment's inbound spool. Returns a result dict."""
     inbound = env_dir / INBOUND
     res = {
@@ -397,6 +450,11 @@ def drain_environment(env_dir: Path, *, apply: bool, source: str, asp_id: str,
         "records": [],
         "dry_run": not apply,
     }
+
+    # Scan BEFORE this run claims anything, or this run's own in-flight records
+    # would read as stranded. Everything found here was left by a PRIOR run —
+    # the case the wrapper cannot report, because that run already ended.
+    res["stranded"] = stranded_records(env_dir, stranded_age_min)
 
     for stale in _tmp_residue(inbound, tmp_age_min):
         res["quarantined"] += 1
@@ -491,11 +549,33 @@ def drain_environment(env_dir: Path, *, apply: bool, source: str, asp_id: str,
 
 
 def requeue_stale(env_dir: Path, *, apply: bool, age_min: int) -> dict:
-    """Move processing/ entries older than age_min back to inbound/."""
+    """Move processing/ entries older than age_min back to inbound/.
+
+    IDEMPOTENT ON THE RECORD STEM (g-369-163 outcome 3). ``_move`` never
+    deletes, so a collision is suffixed with a millisecond stamp — which is
+    correct for its own contract and wrong here: re-queueing a record whose
+    stem is ALREADY in ``inbound/`` produced a second copy of one member's
+    instruction (measured 2026-09-08 on pearl-test-20260904-g3351459: the
+    original plus ``...1788847706970.json``), and the drain would then apply
+    it twice. A duplicate stem therefore goes to ``rejected/`` instead of
+    being re-filed. The never-delete invariant is untouched — the duplicate
+    is moved aside, not removed, so it stays inspectable.
+
+    The stem is the record id (``<ts>-<uuid>``); ``_move``'s own suffixing is
+    what makes a naive stem comparison necessary rather than sufficient, so
+    compare against the stem of every inbound file, not just exact names.
+    """
     processing = env_dir / PROCESSING
-    res = {"environment": env_dir.name, "requeued": 0, "files": [], "dry_run": not apply}
+    res = {"environment": env_dir.name, "requeued": 0, "duplicates": 0,
+           "files": [], "duplicate_files": [], "dry_run": not apply}
     if not processing.is_dir():
         return res
+    inbound = _lane(env_dir, INBOUND)
+    try:
+        existing_stems = {Path(n).stem.split(".")[0]
+                          for n in os.listdir(inbound)} if inbound.is_dir() else set()
+    except OSError:
+        existing_stems = set()
     cutoff = time.time() - (age_min * 60)
     for name in sorted(os.listdir(processing)):
         p = processing / name
@@ -504,10 +584,19 @@ def requeue_stale(env_dir: Path, *, apply: bool, age_min: int) -> dict:
                 continue
         except OSError:
             continue
+        stem = p.stem.split(".")[0]
+        if stem in existing_stems:
+            # Already queued — re-filing would apply one instruction twice.
+            res["duplicates"] += 1
+            res["duplicate_files"].append(name)
+            if apply:
+                _move(p, _lane(env_dir, REJECTED))
+            continue
         res["requeued"] += 1
         res["files"].append(name)
+        existing_stems.add(stem)
         if apply:
-            _move(p, _lane(env_dir, INBOUND))
+            _move(p, inbound)
     return res
 
 
@@ -580,12 +669,21 @@ def main(argv: list[str] | None = None) -> int:
     else:
         for r in results:
             if "requeued" in r:
-                print(f"{r['environment']}: requeued={r['requeued']}"
+                print(f"{r['environment']}: requeued={r['requeued']} "
+                      f"duplicates={r.get('duplicates', 0)}"
                       + ("   (dry run — pass --apply)" if r["dry_run"] else ""))
                 continue
+            # stranded= is NOT decoration: a run with processed=0 and a record
+            # stuck in processing/ is indistinguishable from an empty spool
+            # without it, and that is the exact misread this line exists to stop
+            # ( outcome 2; guard-3865 — a summary's own accounting
+            # fields are not the run's telemetry). The JSON payload has carried
+            # `stranded` since ; only this human-readable path omitted
+            # it, so a `--json`-less operator run still read clean.
             print(f"{r['environment']}: processed={r['processed']} rejected={r['rejected']} "
                   f"failed={r['failed']} quarantined={r['quarantined']} "
-                  f"unconfigured={r.get('unconfigured', 0)}"
+                  f"unconfigured={r.get('unconfigured', 0)} "
+                  f"stranded={len(r.get('stranded') or [])}"
                   + ("   (dry run — pass --apply)" if r["dry_run"] else ""))
             for e in r["records"]:
                 print(f"    {e['file']}: {e.get('disposition')} — {e.get('detail','')}")

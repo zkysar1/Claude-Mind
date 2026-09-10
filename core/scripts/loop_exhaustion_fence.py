@@ -103,6 +103,22 @@ VERDICT_STOP = "stop"
 # rc mirrors the verdict so a shell caller can branch without parsing JSON.
 RC_BY_VERDICT = {VERDICT_HOLD: 0, VERDICT_PAUSE: 1, VERDICT_STOP: 2}
 
+#: Every verdict stop-hook.sh writes at a turn-end.  Built from the EMITTER's
+#: format strings, not from prose (guard-4285): the hook writes
+#: `<ts> BLOCK sid=<sid> ...` (no gate= field) and
+#: `<ts> ALLOW gate=<name> sid=<sid> ...`, so both tokens are space-delimited
+#: and this pair is the complete vocabulary (measured over the live log:
+#: 815 BLOCK / 535 ALLOW, no third value).
+#:
+#: WHY BOTH, and not BLOCK alone ().  The fence's own pause rung
+#: prescribes ending the turn on a REGISTERED external-wait sleep, and a
+#: registered Tier-A job makes Gate 2.6 ALLOW the turn-end instead of BLOCKing
+#: it.  Counting BLOCKs alone therefore meant that an agent which ADOPTED the
+#: remedy stopped emitting the only observable the ladder counted -- unreachable
+#: from below, forever.  Measured: a 10.5h stall produced 9 turn-ends and ZERO
+#: BLOCKs, and the fence never fired.
+TURN_END_VERDICTS = (" BLOCK ", " ALLOW ")
+
 
 def decide(
     streak,
@@ -187,11 +203,15 @@ def decide(
 
 
 def compute_streak(log_path, sid, diary_path, now=None):
-    """Consecutive BLOCKs for `sid` since the diary last advanced.
+    """Consecutive TURN-ENDS for `sid` since the diary last advanced.
 
-    MIRROR of stop-hook.sh's inline advisory block (g-115-8745) -- same log,
-    same " BLOCK " match, same trailing-space sid anchor, same phase-advance
-    anchor on the diary's mtime.  Kept in step by a parity test.
+    PARTIAL mirror of stop-hook.sh's inline advisory block (g-115-8745) -- same
+    log, same trailing-space sid anchor, same phase-advance anchor on the
+    diary's mtime.  The VERDICT MATCH DELIBERATELY DIVERGES since g-115-9467:
+    the hook's inline copy stays BLOCK-scoped because it is message-only and
+    runs only while composing the BLOCK payload, whereas this copy drives a
+    DECISION and must count every turn-end (see TURN_END_VERDICTS).  The parity
+    test pins both halves of that relationship, including the divergence.
 
     Returns (streak, stalled_seconds); (None, None) when either source is
     unreadable, so `decide()` holds.
@@ -210,7 +230,9 @@ def compute_streak(log_path, sid, diary_path, now=None):
     needle = "sid=" + sid + " "
     streak = 0
     for line in text.splitlines():
-        if " BLOCK " not in line or needle not in line:
+        if needle not in line:
+            continue
+        if not any(v in line for v in TURN_END_VERDICTS):
             continue
         try:
             when = datetime.datetime.fromisoformat(line.split(" ", 1)[0])

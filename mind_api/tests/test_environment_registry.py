@@ -86,6 +86,36 @@ def test_unknown_environment_id_refuses_startup():
         assert vid in msg, f"valid id {vid} not listed in refusal message"
 
 
+def test_unregistered_id_with_explicit_local_backend_warns_and_continues(capsys):
+    """A deployment that pins STORAGE_BACKEND=local explicitly (a hosted
+    per-customer workspace whose ENVIRONMENT_ID is its own product id) must not
+    be refused: local storage cannot mix state across environments, so the
+    fail-loud rule has nothing to protect. One WARNING on stderr, no raise, and
+    no cloud keys invented."""
+    _clear_derived()
+    os.environ["ENVIRONMENT_ID"] = "does-not-exist-zzz"
+    os.environ["STORAGE_BACKEND"] = "local"
+    _apply_environment_registry(PROJECT_ROOT)  # must not raise
+    assert os.environ["STORAGE_BACKEND"] == "local"
+    assert os.environ.get("STORAGE_S3_BUCKET") is None
+    assert os.environ.get("STORAGE_DDB_LOCK_TABLE") is None
+    err = capsys.readouterr().err
+    assert "WARNING" in err
+    assert "does-not-exist-zzz" in err
+
+
+def test_unregistered_id_with_own_cloud_backend_still_refuses():
+    """The fail-open above is scoped to an EXPLICIT local backend. With
+    own-cloud set (or unset, covered by test_unknown_environment_id_refuses_startup)
+    an unknown id still refuses startup -- that is the state-mixing case."""
+    _clear_derived()
+    os.environ["ENVIRONMENT_ID"] = "does-not-exist-zzz"
+    os.environ["STORAGE_BACKEND"] = "own-cloud"
+    with pytest.raises(RuntimeError) as exc:
+        _apply_environment_registry(PROJECT_ROOT)
+    assert "does-not-exist-zzz" in str(exc.value)
+
+
 def test_deprecation_warning_and_legacy_precedence(capsys):
     """Outcome 5: a legacy STORAGE_* set alongside the registry emits a
     DEPRECATION warning; setdefault keeps the explicit legacy value winning so

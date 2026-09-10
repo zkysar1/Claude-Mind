@@ -62,7 +62,21 @@ _TRIGGER_PATTERNS = [
     # "0 records have ...", "no records have ..."
     re.compile(r"\b(?:0|zero|no)\s+records?\s+(?:have|has|with|contain|containing|showing)\b", re.IGNORECASE),
     # "all/every/none/no X are|have zero|null|empty|missing"
+    # NOTE the single \S+: this admits only a ONE-TOKEN subject, so
+    # "All six candidate brand terms are ..." cannot match however it ends.
+    # Deliberately NOT widened to (?:\S+\s+){1,N} — an arbitrary token budget
+    # buys recall by making the pattern loose, and the measured miss is better
+    # served by the two narrow compounds below ( encode pass).
     re.compile(r"\b(?:all|every|none|no)\s+\S+\s+(?:are|is|have|has)\s+(?:zero|0|null|empty|missing)\b", re.IGNORECASE),
+    # "0 hits", "zero hits", "no hits" — the ordinary phrasing of a
+    # set-membership audit negation ("0 hits each"), which no pattern above
+    # reaches. A count noun in a qualified compound, not a bare token.
+    re.compile(r"\b(?:0|zero|no)\s+hits?\b", re.IGNORECASE),
+    # "is/are absent from" — the same claim without a count. guard-1923 bars
+    # adding bare "absent" to a vocabulary (polysemous); this is its prescribed
+    # narrowing to the referent form, so the adjective only counts when it
+    # governs a source set.
+    re.compile(r"\b(?:is|are)\s+absent\s+from\b", re.IGNORECASE),
     # "N/M records missing ..."
     re.compile(r"\b\d+\s*/\s*\d+\s+records?\s+(?:missing|without|lack(?:ing)?)\b", re.IGNORECASE),
     # "zero-utilization", "0 utilization", "low-utilization claim"

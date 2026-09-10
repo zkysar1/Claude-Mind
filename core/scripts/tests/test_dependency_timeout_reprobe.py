@@ -203,6 +203,11 @@ def _drive(defer_reason, probe_module, participants=None):
     saved = (M._read_blocked, M._read_goal_index, M._read_recent_escalations,
              M._load_threshold_hours, M._resolve_self_agent,
              M._post_board, M._clear_defer, M._cred_probe_module)
+    # Plain view dict -- an ABSENT UNMEASURED_KEY == a real measurement
+    # (). Two independent fixes for that goal landed (zeta's on main,
+    # this Body's on carrier ref 78777e3c); the merge kept the carrier's, whose
+    # _read_blocked returns the view alone rather than (view, reason), because
+    # only it emits the `blocked_view_measured` key the always-run battery reads.
     M._read_blocked = lambda: {"blocked_goals": [
         {"goal_id": "g-1", "block_reason": "dependency"}]}
     M._read_goal_index = lambda: {

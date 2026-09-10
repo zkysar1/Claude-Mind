@@ -17,6 +17,7 @@ whole argument and are pinned here:
      size-only assertion.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -282,3 +283,108 @@ def test_unreadable_file_is_reported_not_silently_dropped(tmp_path, monkeypatch)
     assert len(entries) == 1
     assert "error" in entries[0]
     assert "simulated unreadable" in entries[0]["error"]
+
+
+# ---- the per-writer endpoint policy () ------------------------------
+#
+# STORAGE_S3_ENDPOINT_URL repoints every get_backend() caller at once; this
+# writer is the one that must NOT follow it. The decision is pure over an env
+# mapping, so every branch is pinned here without boto or a store.
+
+def _env(**kw):
+    base = {"STORAGE_BACKEND": "own-cloud", "STORAGE_S3_BUCKET": "live-bkt"}
+    base.update(kw)
+    return base
+
+
+_FAMILY = {"COLD_SNAPSHOT_S3_BUCKET": "dr-bkt",
+           "COLD_SNAPSHOT_AWS_ACCESS_KEY_ID": "AKIDR",
+           "COLD_SNAPSHOT_AWS_SECRET_ACCESS_KEY": "s3cr3t"}
+
+
+def test_cold_target_pre_cutover_shares_the_live_aws_store():
+    t = cs.resolve_cold_target(_env())
+    assert t["mode"] == "live"
+    assert t["endpoint"] == cs.AWS_REGIONAL and t["bucket"] == "live-bkt"
+
+
+def test_cold_target_refuses_to_follow_a_live_endpoint_flip():
+    """The silent-relocation failure, made loud: a flipped live store with no
+    dedicated target is a refusal, never a write onto the basement box."""
+    t = cs.resolve_cold_target(_env(STORAGE_S3_ENDPOINT_URL="http://basement:9000"))
+    assert t["mode"] == "refused"
+    assert t["verdict"] == "refused-colocated"
+    assert "COLD_SNAPSHOT_S3_BUCKET" in t["reason"]
+
+
+def test_cold_target_pins_to_regional_aws_when_the_family_is_set():
+    t = cs.resolve_cold_target(_env(STORAGE_S3_ENDPOINT_URL="http://basement:9000",
+                                    **_FAMILY))
+    assert t["mode"] == "pinned"
+    assert t["endpoint"] == cs.AWS_REGIONAL
+    assert t["bucket"] == "dr-bkt"
+    assert t["live_endpoint"] == "http://basement:9000"
+
+
+def test_cold_target_honours_an_explicit_second_store():
+    t = cs.resolve_cold_target(_env(STORAGE_S3_ENDPOINT_URL="http://basement:9000",
+                                    COLD_SNAPSHOT_S3_ENDPOINT_URL="http://offsite:9000",
+                                    **_FAMILY))
+    assert t["mode"] == "pinned" and t["endpoint"] == "http://offsite:9000"
+
+
+def test_cold_target_refuses_the_live_endpoint_whatever_the_bucket():
+    t = cs.resolve_cold_target(_env(STORAGE_S3_ENDPOINT_URL="http://basement:9000",
+                                    COLD_SNAPSHOT_S3_ENDPOINT_URL="http://basement:9000",
+                                    **_FAMILY))
+    assert t["mode"] == "refused" and t["verdict"] == "refused-colocated"
+
+
+def test_cold_target_refuses_a_partial_family():
+    partial = dict(_FAMILY)
+    del partial["COLD_SNAPSHOT_AWS_SECRET_ACCESS_KEY"]
+    t = cs.resolve_cold_target(_env(**partial))
+    assert t["mode"] == "refused" and t["verdict"] == "refused-partial-config"
+    assert "COLD_SNAPSHOT_AWS_SECRET_ACCESS_KEY" in t["reason"]
+
+
+def test_cold_target_local_backend_is_skipped_not_refused():
+    t = cs.resolve_cold_target({"STORAGE_BACKEND": "local",
+                                "STORAGE_S3_ENDPOINT_URL": "http://basement:9000"})
+    assert t["mode"] == "local"
+
+
+def test_target_line_names_every_value_that_selects_the_destination():
+    t = cs.resolve_cold_target(_env(STORAGE_S3_ENDPOINT_URL="http://basement:9000",
+                                    **_FAMILY))
+    line = cs.target_line(t)
+    assert line.startswith("[target] mode=pinned")
+    for needle in ("cold_endpoint=aws-regional", "cold_bucket=dr-bkt",
+                   "live_endpoint=http://basement:9000", "live_bucket=live-bkt"):
+        assert needle in line, line
+
+
+def test_main_refuses_before_reading_or_uploading_anything(tmp_path, monkeypatch, capsys):
+    """A refusal is decided and reported BEFORE the tree walk and before any
+    backend is built: rc 2, JSON verdict on stdout, the [target] line on
+    stderr as the first line of output (guard-5551)."""
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setenv("STORAGE_S3_BUCKET", "live-bkt")
+    monkeypatch.setenv("STORAGE_S3_ENDPOINT_URL", "http://basement:9000")
+    for v in _FAMILY:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr(cs, "WORLD_DIR", tmp_path / "nonexistent-world")
+    monkeypatch.setattr(cs, "META_DIR", tmp_path / "nonexistent-meta")
+    monkeypatch.setattr(cs, "AGENTS_DIR", None)
+
+    def _no_backend(*_a, **_k):
+        raise AssertionError("a refused target must never build a backend")
+    monkeypatch.setattr(cs, "build_cold_backend", _no_backend)
+    monkeypatch.setattr(sys, "argv", ["cold_snapshot.py", "--output", "json"])
+    rc = cs.main()
+    out, err = capsys.readouterr()
+    assert rc == 2
+    assert err.splitlines()[0].startswith("[target] mode=refused")
+    body = json.loads(out)
+    assert body["verdict"] == "refused-colocated"
+    assert body["target"]["mode"] == "refused"

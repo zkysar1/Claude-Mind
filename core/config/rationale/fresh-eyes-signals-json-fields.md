@@ -46,3 +46,21 @@ is not current drift-pressure.
 - g-115-1680 — the lever; g-115-1742 — the treadmill incident
 - `.claude/skills/fresh-eyes-review/SKILL.md` Phase 5.5 — consumer
 - `core/config/rationale/fresh-eyes-self-assess-axes.md` — sibling extraction
+
+## Why ANSWERED is a CONFIRMING disjunct, and why its absence cost three fires
+
+Relocated from `.claude/skills/fresh-eyes-review/SKILL.md`'s signals envelope
+under the on-demand-skill injection ceiling (g-115-6690, 2026-09-10) — nothing
+deleted; the envelope keeps the rule, this keeps the history.
+
+An **ANSWERED** belief (`answered_by` non-null, carrying a durable answering
+record dated after `last_observed`) is CONFIRMING. That disjunct was stated only
+in `guard-5863` for three consecutive fires while this instrument kept counting
+the belief as divergent — the guard-1984 class: a guardrail cannot outvote the
+instrument it guards, so the operative half must live in the envelope spec, which
+is where the counting happens.
+
+An AFFIRMING partner-belief is **stability evidence, not change-pressure**.
+Counting it toward `act_later` was a measured false-positive treadmill
+(g-115-1742): the ritual re-filed a follow-up Idea every review on signals that
+said the agent was on-lane.

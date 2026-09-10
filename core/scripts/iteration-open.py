@@ -484,6 +484,25 @@ def _emit(report, as_json):
             print("[iteration-open] every goal is blocked — route to the "
                   "all-blocked handler (Skill(aspirations-all-blocked)), not to "
                   "a claim.")
+        elif cands.get("error"):
+            # NEVER RENDER AN UNREAD STAGE AS A CANDIDATE COUNT ().
+            # `count` is None on every _selection() error path -- deliberately,
+            # so a failed measurement stays distinguishable from a measured
+            # zero -- but `.get("count", "?")` returns that None rather than
+            # the "?" default (the key is PRESENT), so the format string
+            # rendered it as `SELECTION: None candidate(s); top: (none)`: a
+            # line whose shape says "the selector ran and there is no work".
+            # The MEASURED zero still prints its `0 candidate(s)` in the
+            # branch below and MUST keep doing so -- that is the positive
+            # control this branch is defined against (guard-4166), not a case
+            # to fold in here.
+            print("\nSELECTION: BLIND -- the selector stage did not return: %s"
+                  % cands["error"])
+            print("[iteration-open] the candidate list is UNMEASURED, not "
+                  "empty. Do NOT read it as 'no work' and do NOT route to the "
+                  "all-blocked handler. Re-run goal-selector.sh directly -- "
+                  "raising the bound if it timed out (it is O(queue size)) -- "
+                  "before disposing anything.")
         else:
             top = cands.get("top") or "(none)"
             print("\nSELECTION: %s candidate(s); top: %s"
@@ -755,6 +774,22 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
     _crumb(f"   selection done {_sel_ms}ms")
     if report["candidates"].get("error"):
         errors.append("selector: " + report["candidates"]["error"])
+        # A SELECTOR THAT COULD NOT BE READ IS A BLIND STAGE, NOT A QUIET
+        # QUEUE (). Selection runs OUTSIDE the STAGES loop, so
+        # nothing routes it through _blind_from() and report["blind"] stayed
+        # empty on every selector failure -- which meant the guard-4093 line
+        # below read completeness=complete off that empty list while the
+        # single most decisive stage of the run never returned. Measured
+        # 2026-09-09 (foxtrot, LAPTOP-3IOFCNEO): a 180s rc=124 printed
+        # `SELECTION: None candidate(s); top: (none)` beside
+        # completeness=complete and status=clean, with the whole explanation
+        # on a stderr line no caller parses. guard-1091: a FAILED
+        # measurement is not a measurement of zero.
+        report["blind"].append({
+            "stage": "selection",
+            "name": "goal-selector",
+            "reason": report["candidates"]["error"],
+        })
 
     # --keep-state (): write the precheck-end SUMMARY stamp here --
     # precheck-gap-check reads it and start-without-end is the abbreviated-

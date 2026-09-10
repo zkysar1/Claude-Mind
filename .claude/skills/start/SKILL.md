@@ -720,7 +720,7 @@ DONE.
      Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; echo "ACQUIRE_RC=$?"`
 
      **ACQUIRE_RC=4 + `reducer_only` → HALT and display the refusal.**
-     **ACQUIRE_RC=4 otherwise →
+     **ACQUIRE_RC!=4 → PROCEED (fail-open). ACQUIRE_RC=4 otherwise →
 
      > Reducer for `<agent-name>` is alive on `<machine_id>` (heartbeat <age>s) —
      > joining as a SECOND BODY from this box. This worker executes goals; the

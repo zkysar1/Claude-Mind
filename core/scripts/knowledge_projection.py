@@ -498,8 +498,19 @@ def goal_handle(goal_id: str, secret: str, environment_id: str = "") -> str:
       (:func:`resolve_goal_handle`), so there is no side table to keep in sync, migrate,
       or leak.
 
-    Returns ``""`` on an empty id or an empty secret — fail closed, so an unprovisioned
-    box publishes a board with no handles rather than one with a guessable token.
+    Returns ``""`` on an empty id, an empty secret, **or an empty ``environment_id``** —
+    fail closed, so an unprovisioned box publishes a board with no handles rather than one
+    with a guessable token.
+
+    The ``environment_id`` arm is the one that is easy to leave out, and leaving it out is
+    what guard-6312 names as the dangerous shape: a fail-closed guard covering only SOME of
+    the message inputs. The covered fields refuse loudly while the uncovered one degrades
+    into a well-formed token that matches nothing. Worse, it silently retires the property
+    this component exists to carry — with ``environment_id`` empty under one fleet-wide
+    secret, every environment publishes IDENTICAL handles and the no-cross-environment-
+    correlation promise two bullets up fails open with nothing logged. There is no
+    "no environment" mode: the parameter defaults to ``""`` for call-site convenience only,
+    and that default now yields ``""`` rather than a correlatable handle.
 
     ⚠ OPERATIONAL: every box serving one ``environment_id`` must hold the SAME secret.
     The export can run on one box and the write can land on another; with divergent
@@ -508,10 +519,13 @@ def goal_handle(goal_id: str, secret: str, environment_id: str = "") -> str:
     """
     gid = str(goal_id or "").strip()
     key = str(secret or "")
-    if not gid or not key:
+    env = str(environment_id or "").strip()
+    # EVERY component of the message gets an emptiness guard, not just the obvious secret
+    # (guard-6312). `env` is hoisted so the guard and the message read the same value.
+    if not gid or not key or not env:
         return ""
     # NUL-separated so ("env", "g-1-2") and ("envg", "-1-2") cannot collide.
-    msg = f"{str(environment_id or '').strip()}\x00{gid}".encode("utf-8")
+    msg = f"{env}\x00{gid}".encode("utf-8")
     return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:_GOAL_HANDLE_HEX]
 
 
@@ -566,8 +580,12 @@ def resolve_goal_handle(
       exposable (status moved out of :data:`_GOAL_PUBLIC_STATUS`, work_class re-tagged)
       also stops resolving, by the same predicate that stopped publishing it;
     * two exposed goals sharing a handle → ``None``, never an arbitrary pick;
-    * empty handle or unconfigured secret → ``None``, so an unprovisioned box refuses
-      every addressed write instead of resolving them all to the same goal.
+    * empty handle, unconfigured secret, or unconfigured ``environment_id`` → ``None``, so
+      an unprovisioned box refuses every addressed write instead of resolving them all to
+      the same goal. The ``environment_id`` arm is enforced inside :func:`goal_handle`
+      rather than by the early return below, so an unprovisioned box still walks the goal
+      list before refusing — correct, but see that function's docstring before assuming a
+      resolve implies a configured environment.
 
     Comparison is :func:`hmac.compare_digest` rather than ``==``: a dict lookup keyed on
     the handle would be shorter, and would also hand an attacker a timing oracle over the

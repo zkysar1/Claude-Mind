@@ -85,3 +85,63 @@ def test_goal_id_key_variant_accepted():
     g["goal_id"] = g.pop("id")
     kind, _ = verdict(_asp([g]), "alpha", "g-115-1")
     assert kind == "LIVE"
+
+
+# ── Wiring: WHICH claim the gate reads () ──────────────────────────
+# Everything above pins the CLASSIFIER, and all of it stayed green through a
+# scope defect in the one call site that consumes it — guard-1943's lesson that
+# pinning a decision says nothing about the wiring. mind-api-start.sh read
+# `agent_status.<agent>.in_flight.goal_id`, a row team-state-in-flight.sh stamps
+# ONLY for the Body holding this box's running-session-id. One agent NAME runs on
+# many machines, so on every worker box that row named the REDUCER's goal on
+# ANOTHER machine and the gate refused a MACHINE-LOCAL daemon recycle from a
+# FLEET-WIDE claim. Measured cc-09 2026-09-03 (refused citing , held by
+# alpha on cc-04) and re-measured cc-08 2026-09-10 (read , held by sid
+# d647fb30 on cc-04 at status=pending -> STALE -> --restart exited 3, daemon
+# untouched, while this Body's OWN claim read LIVE).
+#
+# INVARIANT: the Body-keyed row is read FIRST, and the agent-keyed row — the
+# reducer's — may be read only under a running-session-id locality guard
+# (running-session-id is sync_tier machine_local, so its presence IS the test).
+_START_SH = _SCRIPTS / "mind-api-start.sh"
+
+_AGENT_ROW_READ = "agent_status.${MIND_AGENT}.in_flight.goal_id"
+_BODY_ROW_READ = "agent_status.${MIND_AGENT}.in_flight_bodies.${MIND_SID}.goal_id"
+
+
+def _claim_gate_scope(text):
+    """(ok, reason) — is the claim-liveness gate's claim read box-scoped?"""
+    if _BODY_ROW_READ not in text:
+        return False, "no Body-keyed in_flight_bodies.<sid> read: the gate cannot see its own claim"
+    body_at = text.index(_BODY_ROW_READ)
+    agent_at = text.find(_AGENT_ROW_READ)
+    if agent_at == -1:
+        return True, "Body-keyed read only"
+    if agent_at < body_at:
+        return False, "agent-keyed row read BEFORE the Body-keyed one: a peer's claim wins"
+    guard_at = text.find("running-session-id", body_at)
+    if guard_at == -1 or guard_at > agent_at:
+        return False, "agent-keyed row read with no running-session-id locality guard"
+    return True, "Body-keyed first; agent-keyed row guarded by running-session-id"
+
+
+def test_claim_gate_reads_a_box_scoped_claim():
+    ok, reason = _claim_gate_scope(_START_SH.read_text(encoding="utf-8"))
+    assert ok, "mind-api-start.sh claim gate is not box-scoped: " + reason
+
+
+def test_claim_gate_scope_check_rejects_the_pre_fix_shape():
+    """Positive control: the checker must FAIL the shape that actually shipped.
+
+    Without this, a checker that silently matched nothing would pass forever —
+    the same always-green failure the classifier tests above demonstrated.
+    """
+    pre_fix = (
+        'if [ -n "${MIND_AGENT:-}" ]; then\n'
+        '    _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" '
+        '--field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json)\n'
+        "fi\n"
+    )
+    ok, reason = _claim_gate_scope(pre_fix)
+    assert not ok, "the checker passed the pre-fix agent-keyed read"
+    assert "in_flight_bodies" in reason

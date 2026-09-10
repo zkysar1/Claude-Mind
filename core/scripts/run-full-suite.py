@@ -1633,15 +1633,21 @@ def rotate_prior_logs(out):
     return moved
 
 # ── Constraint 4: never run pinned-in-a-worktree beside a live daemon ────────
-# guard-5866. The worktree spawns its OWN daemon, and mind-api-start.sh
-# _sweep_orphan_daemons matches mind_api.src processes by COMMAND LINE with
-# ZERO runtime-dir scoping -- so its spawn-time sweep KILLS the fleet's live
-# daemon, once per chunk gap. The copied daemon.port then goes stale and every
-# daemon-backed test fails `REFUSED: recycle/spawn requested from inside
-# pytest`: a large, authoritative-looking count that is PURE ENVIRONMENT.
-# Measured as a one-variable pre-registered control (bravo cc-05 2026-09-03:
-# 3 daemon kills + 12 stale-port errors in the worktree vs 0 and 0 for the SAME
-# suite/commit/box in the main repo); reproduced alpha cc-04 2026-09-04.
+# guard-6394 (supersedes retired guard-5866). A worktree run KILLS the
+# fleet's live daemon; every daemon-backed
+# test then fails `REFUSED: recycle/spawn requested from inside pytest`: a
+# large, authoritative-looking count that is PURE ENVIRONMENT. Measured as a
+# one-variable pre-registered control (bravo cc-05 2026-09-03: 3 daemon kills +
+# 12 stale-port errors in the worktree vs 0 and 0 for the SAME suite/commit/box
+# in the main repo); reproduced alpha cc-04 2026-09-04.
+#
+# WHICH PROCESS KILLS IS UNKNOWN (, 2026-09-10). This comment named
+# mind-api-start.sh _sweep_orphan_daemons; that function has had ZERO
+# executable call sites since 8ef51809b8 (2026-05-22), 104 days BEFORE the
+# guardrail was written, pinned green by test_daemon_pinned_port_wedge.py --
+# and mind_api/state/ is fully gitignored, so a worktree inherits no PID files
+# for _force_kill_tree either. The EFFECT is measured; the cause is not. The
+# check below is unaffected: it keys on the observed harm, not the mechanism.
 #
 # WHY A CHECK AND NOT PROSE (). The guardrail existed 12h before the
 # run that tripped it; what lagged was _full_suite_imperative.py, the always-on

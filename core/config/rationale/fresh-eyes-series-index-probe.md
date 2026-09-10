@@ -105,6 +105,100 @@ fixing only the first leaves the collision intact:
    sees it. That is exactly how the 89a/89b collision was minted. (guard-5322,
    guard-1876: a measured verdict about mutable data has a shelf life.)
 
+## Historical: the alpha shard's in-file ORDERING block (relocated 2026-09-10, N=148)
+
+Relocated VERBATIM out of the header of
+`world/knowledge/tree/system/directive-lane-compliance/directive-lane-series-alpha.md`
+(5,586 B), where it had been paying rent on every fire of a size-budgeted shard while
+this file was already its documented home. The N=146 and N=147 handoffs both named this
+relocation as the cheapest structural trim available; N=148 executed it. This is a MOVE,
+not a deletion — nothing below is new, and the shard now carries a one-line pointer here.
+
+Its lasting value is a worked catalogue of four different wrong-but-well-formed N probes,
+each of which read as plausible rather than as an error. Note the `N&#61;` escapes are
+deliberate and load-bearing: they keep this text from matching the very probes it
+documents (`guard-1238` — never probe with a pattern the probe itself contains).
+
+> **⚠ ORDERING — still take the MAX, but the two-region hazard is GONE.**
+> **One command, unchanged and still correct:**
+> `grep -oE 'N=[0-9]+' <this-file> | sed 's/N=//' | sort -n | tail -1`
+>
+> **SUPERSEDED 2026-08-05 (alpha, cc-04) by the keep-newest-6 rollup below.** The
+> warning this block replaced described **TWO append regions in OPPOSITE orders**
+> (head newest-first N=35…N=8; tail oldest-first N=20…N=30) and told you to page to
+> EOF for the tail. **That tail region no longer exists** — the rollup archived
+> N=32 and older, leaving ONE region, newest-first, N=38…N=33. Its stated size
+> (136,763 bytes / 1,948 lines / 2.27× the Read cap, "a Read returns lines 1–728
+> and stops") is likewise stale: the file now reads whole. Following the old text
+> today would send you hunting for N=20–N=30 in a file that no longer holds them.
+> The full pre-rollup text survives verbatim in
+> `world/knowledge/archive/directive-lane-series-alpha-2026-08-05.md`.
+>
+> **⚠ CANONICAL READ — PARENTHETICAL-ANCHORED. Corrected 2026-08-12 (alpha, N=66);
+> the 2026-08-11 heading-anchored form below it is BROKEN and was broken on its own
+> first real test.**
+> **`grep -oE '^### Reading at [^(]*\(alpha, N&#61;[0-9]+' <file> | grep -oE '[0-9]+$' | sort -n | tail -1`**
+>
+> Substitute your own agent name for `alpha`. `[^(]*` cannot cross the opening paren,
+> so the match stops at the FIRST `N&#61;` — the one inside the provenance parenthetical
+> `(alpha, N&#61;NN, since ...)`, which is the only place an entry's own index appears.
+>
+> **The superseded form was:**
+> `grep -oE '^### Reading at .*N&#61;[0-9]+' <file> | grep -oE '[0-9]+$' | sort -n | tail -1`
+>
+> **It fails because `.*` is GREEDY, so it matches the LAST `N&#61;` on the heading line,
+> not the entry's own.** Measured 2026-08-12 the moment N=66 was appended: that heading
+> cited the prior index twice in its summary (`N&#61;66 N&#61;65 N&#61;65` in line order), and the
+> command returned **65** — the entry that had just been superseded. The failure direction
+> is the OPPOSITE of the whole-file form's and worse: the whole-file form reads too HIGH
+> (skipping an index), this one reads too LOW, so the next fire numbers itself 66 again,
+> collides with a live entry, or concludes a fire already happened that never did.
+>
+> **This falsifies the sentence the 2026-08-11 fix rested on** — *"The heading-anchored
+> form reads only entry HEADINGS, so prose cannot reach it."* Prose INSIDE a heading
+> reaches it, and every entry in this series writes a summary into its own heading, so
+> the exposure is structural rather than incidental. The fix narrowed WHICH LINES are
+> read and left the within-line greediness untouched; `guard-1238`'s class (never probe
+> with a pattern the probe itself contains) applies to the line as much as to the file.
+> The parenthetical anchor closes both, and its one dependency — the
+> `### Reading at ... (agent, N&#61;NN, since ...)` provenance shape — is a shape every
+> entry already writes.
+>
+> Cross-check by eye against the newest heading when it matters. Positive control on
+> this file at the time of the correction: the fixed form returns `66 65 64 62` for the
+> four newest entries; the broken form returned `65` as the max.
+>
+> The whole-file MAX below (`grep -oE 'N&#61;[0-9]+' <file>`) is **not reliable and cannot
+> be made reliable by discipline.** It matches the token ANYWHERE, and this file is a prose
+> series *about* N-numbers — so any entry that cites a future, hypothetical, or partner's
+> index silently raises the answer. Measured in one sitting: this fire wrote a forward
+> reference to the next index in its own narrative and the command returned **one too high**;
+> the warning written to prevent that recurrence cited two indices as examples and drove the
+> answer **two too high**. The fix that removes the citation removes the warning's own
+> teaching value — which is the proof the predicate, not the prose, is what is broken.
+> This is `guard-1238`'s class (never probe with a pattern the probe itself contains), the
+> same shape as needing the bracket in `pgrep -af "[r]un-full-suite"`.
+>
+> Consequence if you use the old form: you number yourself one or more past the real newest
+> entry, **skipping an index silently**, or conclude a fire already happened that never did.
+> The heading-anchored form reads only entry HEADINGS, so prose cannot reach it. Its one
+> dependency is that the `### Reading at ...` heading shape holds — keep writing headings in
+> that shape, and cross-check against the newest heading by eye when it matters.
+>
+> **Why the MAX command is kept anyway:** it was never a workaround for the two
+> regions — it is the only read that cannot be fooled by *which end grew last*, and
+> that hazard returns the moment anyone appends at the wrong end. The incidents it
+> was forged from stand: N=34 took a tail read and was one edit from recording a
+> phantom "~5 fires unrecorded, 129-goal hole in the series"; N=32 took the index
+> from the cadence counter; N=33's remedy ("derive it from the FILE") was necessary
+> and not sufficient. Before 2026-08-03 a truncated Read handed back **N=19 sitting
+> where the newest point belongs**, so a successor obeying Phase 2.0 exactly read
+> its own prior point **6.2pp too high, in the direction that hides a decline**.
+> `guard-2288` and the normalization goal **g-115-4382** both still apply —
+> g-115-4382's job is now to keep this file single-order, not to merge two.
+>
+> **Append new readings directly under `## Series — alpha`, newest-first.**
+
 ## Cross-references
 
 - guard-1922, guard-3487 — shard divergence and vacuous ordering classifiers

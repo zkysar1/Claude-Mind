@@ -309,6 +309,27 @@ def _apply_environment_registry(project_root: Path) -> None:
         return  # legacy N-var mode -- registry not in play
     reg_file = _environments_dir(project_root) / f"{env_id}.yaml"
     if not reg_file.is_file():
+        # A hosted deployment that pins STORAGE_BACKEND=local EXPLICITLY (a
+        # per-customer workspace whose ENVIRONMENT_ID is its own product id, so
+        # it can never appear in the peer-deployment registry) has nothing for
+        # the fail-loud rule to protect: local storage cannot mix state with any
+        # other environment. Refusing here left such workspaces with NO daemon
+        # at all -- every daemon-only wrapper (runner-claim, stores) then fails
+        # and the agent can never reach RUNNING (measured 2026-09-09: 11/11
+        # spawns died on one workspace). Warn and continue, the same fail-open
+        # shape core/scripts/storage_backend.py already uses for the CLI lane.
+        # Unset or own-cloud keeps the refusal: those are the cases where a
+        # typo'd id could silently point at another environment's store.
+        if os.environ.get("STORAGE_BACKEND", "").strip().lower() == "local":
+            print(
+                f"[environment-registry] WARNING: ENVIRONMENT_ID={env_id!r} has "
+                f"no registry entry at {reg_file}; STORAGE_BACKEND=local is set "
+                "explicitly, so the id is treated as a local-storage deployment "
+                "(no cross-environment state to mix) and startup continues. Add "
+                "a registry file for this id to silence this warning.",
+                file=sys.stderr,
+            )
+            return
         valid = _valid_environment_ids(project_root)
         raise RuntimeError(
             f"_apply_environment_registry: ENVIRONMENT_ID={env_id!r} has no "

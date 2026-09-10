@@ -22,24 +22,100 @@ tree mid-iteration. Two corrections:
      encoding arrives. In the originating incident (g-115-3115) it was stamped
      20:37:37, one second before the partner node that actually changed —
      checking it first short-circuited the whole scan on a partner's write.
-  2. A candidate .md must be attributable to THIS session. Node front matter
-     carries `session:` (measured 2026-07-26: 1197 of 1259 nodes, 96%);
-     a node stamped with another session is a partner's encoding and is
-     skipped. Nodes carrying no attribution at all (the residual ~4%) are
-     FAIL-OPEN — kept — so the g-273-20 auto-detect is never weakened below
-     its prior behavior for that class.
+  2. A candidate .md must be attributable to THIS session. A node stamped with
+     another session is a partner's encoding and is skipped; a node carrying no
+     attribution the regex can see is FAIL-OPEN — kept — so the g-273-20
+     auto-detect is never weakened below its prior behavior for that class.
+
+     COVERAGE, AND IT IS NOT A RESIDUAL ANY MORE (re-measured 2026-09-09,
+     g-115-9470, alpha/cc-10, over all 3,079 nodes with THIS module's own
+     `_front_matter` + `_SESSION_RE` — a hand-rolled `^session:` grep answers
+     wrongly because the real regex allows leading whitespace):
+
+         BLOCK  — `_SESSION_RE` sees the stamp      1,461   47.5%
+         INVIS  — stamped, but the anchored regex
+                  cannot see it (mid-line, almost
+                  all `last_update_trigger: {...}`)    44    1.4%
+         NONE   — no `session:` anywhere           1,574   51.1%
+         => FAIL-OPEN population (INVIS + NONE)    1,618   52.5%
+
+     This block previously read "measured 2026-07-26: 1197 of 1259 nodes, 96%"
+     and called the fail-open population "the residual ~4%". Both are stale by
+     an order of magnitude: the corpus grew 1,259 -> 3,079 while the stamped
+     fraction HALVED, so the fail-open silently went from admitting a 4%
+     residual to admitting a 52.5% MAJORITY (guard-5996 caught the same
+     inversion at 3,045 nodes on 2026-09-04).
+
+     Per guard-1835 / guard-5996: this figure carries its DATE and N because a
+     fail-open whose safety argument rests on a measured residual is only as
+     good as that measurement's age. Re-measure before relying on it —
+     `agents/<agent>/temp/g1159470-measure.py` is the predicate-identical
+     probe, and re-measure over the SUBSET the caller actually filters on
+     (recent-mtime), whose rate can differ sharply from the corpus.
+
+     WHY THE DECAY IS *NOT* THE INLINE-FORM AUTO-FILL GAP (measured, g-115-9470;
+     recorded because that hypothesis is the obvious one and chasing it is
+     wasted work). tree-front-matter-sync.py deliberately skips the session
+     auto-fill for the inline `last_update_trigger: {...}` form (guard-1817 —
+     skills emitting it inline set it themselves), so it is a real gap. It is
+     just not this one: decomposing the 1,574 NONE nodes gives 1,399 (88.9%)
+     with NO `last_update_trigger` key AT ALL, 67 with no front matter, 57
+     block-form, 35 scalar-form, and only 16 (1.0%) carrying the inline form.
+     The INVIS population has also been FLAT at 44 across 2026-09-04 -> 09-09
+     while NONE grew. Closing the inline gap would move ~16 nodes; the decay is
+     driven by nodes written by paths that stamp no attribution at all.
 
 Deliberately NOT routed through `_cross_agent_attribution_filter.filter_paths`:
 that helper's partner-log source only covers git-tracked working-tree paths
 (tree nodes live in the gitignored external world dir), and its mtime sources
-skip the concurrent check whenever a file's mtime lands at/after this agent's
+skip the concurrent check whenever a file's mtime lands at or after this agent's
 own claim — which is exactly when a partner node syncs down. Measured
-2026-07-26: it KEEPS a partner-authored node whose mtime is now.
+2026-07-26: it KEEPS a partner-authored node whose mtime is now. RE-VERIFIED
+against source 2026-09-09 (g-115-9470): core/scripts/_cross_agent_attribution_filter.py
+sets `skip_concurrent = (self_claimed_at > 0) and (mtime + CLOCK_SKEW_SEC >=
+self_claimed_at)` and gates Source 1 on `not skip_concurrent`, so a node whose
+mtime is at or after this agent's claim never reaches the concurrent-partner
+check and is kept.
 
 Directional bias is deliberate. A false positive silently disables the
 encoding-drift counter (the g-115-3115 defect); a false negative merely
 increments it, which routes to the lightweight log-and-clear path in
 aspirations-precheck Phase 0-pre. Prefer the cheap, self-limiting error.
+
+DECISION 2026-09-09 (g-115-9470): `attributable_to_session` KEEPS FAIL-OPEN.
+Recorded here rather than left implicit, because the argument above was
+calibrated at a 4% residual and now runs against a 52.5% majority, which
+inverts its own premise — at this coverage the fail-open produces the
+EXPENSIVE direction (silently disabling the counter) by default, so the
+paragraph above no longer justifies the branch on its own terms and something
+had to be decided rather than inherited.
+
+Flipping to fail-closed was REJECTED on the measurement, not on preference: it
+refuses the SAME 1,618 nodes, so it converts over-crediting the majority into
+under-crediting the majority — the auto-detect would then fail for every
+genuine encoding on an unstamped node and the drift counter would fire almost
+continuously, which is the louder failure but not the smaller one. Nor can a
+backfill rescue the flip: 1,399 of the 1,574 unstamped nodes carry no
+`last_update_trigger` key at all, so nothing on disk records who wrote them and
+stamping them would FABRICATE attribution — the one outcome worse than either
+error. A flip only becomes correct once stamped coverage is high enough that
+the refused set is genuinely residual again, and nothing measured here shows it
+recovering. Do NOT read that as "no path raises coverage" — one does, and the
+distinction is what a repair would start from: tree-front-matter-sync.py
+auto-fills `last_update_trigger.session`, and `_set_nested_scalar` CREATES the
+whole block when the key is absent rather than skipping the node, so even a
+trigger-less node gets stamped once it passes through that sync. Coverage still
+fell 96% -> 47.5% while that path was running, so the population growing here is
+the population that never reaches it. WHICH write paths bypass the sync is
+UNMEASURED — this goal did not close that, and it is the question a coverage
+repair has to answer first.
+
+So the branch is unchanged and the CLAIM is what narrows. This detector answers
+"modified after T and NOT PROVABLY another session's" — never "encoded by this
+session" (guard-5996's action hint, and the /encode-session Lane 5 incident in
+g-115-9470 where `--list` returned 188 nodes for a window that encoded zero).
+Callers that need real authorship must check the node's front matter for their
+own sid, accepting BOTH the block and inline-dict forms.
 
 LIST MODE (g-115-4714). `--list` answers the question /encode-session Lane 5
 actually has — WHICH nodes did I encode — instead of the boolean the

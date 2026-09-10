@@ -1520,6 +1520,27 @@ def test_bundle_carries_no_handle_when_the_secret_is_unset(tmp_path: Path, monke
         assert set(row) == {"title", "status", "updated"}, sorted(row)
 
 
+def test_bundle_carries_no_handle_when_the_environment_id_is_unset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """FAIL CLOSED on the OTHER message component (, guard-6312).
+
+    environment_id is mixed into the handle MESSAGE, so an unprovisioned one does not
+    merely weaken the handle -- it makes every environment publish IDENTICAL handles for
+    the same goal id under one fleet-wide secret, silently retiring the
+    no-cross-environment-correlation property. The provisioned-secret case is what makes
+    this reachable, so the secret stays SET here and only ENVIRONMENT_ID is removed.
+    """
+    _goal_world_with_secret(tmp_path, monkeypatch)
+    monkeypatch.delenv("ENVIRONMENT_ID", raising=False)
+    out = tmp_path / "bundle.json"
+    assert M.main(["-o", str(out)]) == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["goals"], "positive control: the export still emitted goal rows"
+    for row in payload["goals"]:
+        assert set(row) == {"title", "status", "updated"}, sorted(row)
+
+
 def test_resolve_handle_round_trips_the_published_handle(tmp_path: Path, monkeypatch) -> None:
     """OUTCOME 2: the handle the BUNDLE published resolves back to exactly one goal id.
 

@@ -155,6 +155,7 @@ def run(apply: bool = False, slot_override: Path | None = None) -> dict:
         "skipped_tmp": sum(int(e.get("skipped_tmp") or 0) for e in envs),
         "unconfigured": sum(int(e.get("unconfigured") or 0) for e in envs),
         "failed": [],
+        "stranded": [],
     }
     # `failed` is the battery's UNIVERSAL finding key, so a per-env failure count
     # has to become a list entry or it is invisible to _findings_for.
@@ -177,6 +178,28 @@ def run(apply: bool = False, slot_override: Path | None = None) -> dict:
             res["failed"].append({"file": e.get("environment") or "?",
                                   "reason": f"{n} directive(s) left queued: no target "
                                             "aspiration configured (SIDECAR_DIRECTIVE_ASP_ID)"})
+    # STRANDED records (): a record a PRIOR run claimed into processing/
+    # and never completed. The drain deliberately leaves it there — re-applying a
+    # member's half-applied instruction is an operator judgment, not a sweep's
+    # (inbound_drain L47-51) — so this reports and NEVER re-queues.
+    #
+    # Two keys on purpose. `stranded` carries the structured identity for a
+    # dashboard read; `failed` is the battery's UNIVERSAL finding key, and an
+    # entry must land there or _findings_for cannot see it at all — the same
+    # reason `unconfigured` is routed there above.
+    #
+    # ONE ENTRY PER RECORD, never a per-environment count: environment-granularity
+    # aggregation is the defect being corrected (rb-10397). A count cannot be
+    # acted on; "which file, in which environment, how old" can.
+    for e in envs:
+        for st in (e.get("stranded") or []):
+            res["stranded"].append(st)
+            res["failed"].append({
+                "file": f"{st.get('environment')}/{st.get('file')}",
+                "reason": f"member directive claimed but unapplied for "
+                          f"{st.get('age_minutes')}m — report only; "
+                          f"--requeue-stale is the operator's act",
+            })
     return res
 
 

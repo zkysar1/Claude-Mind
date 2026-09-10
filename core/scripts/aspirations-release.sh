@@ -371,6 +371,41 @@ _clear_iteration_checkpoint() {
     return 0
 }
 
+# --- Context sensor BEFORE the release fires () -----------------
+# A release is the most expensive scope-narrowing action an agent takes: the
+# goal goes back to the queue unfinished. The measured 2026-09-09 incident
+# behind guard-6380 released  on the harness `<total_tokens>N tokens
+# left</total_tokens>` marker reading 0, while the framework's own sensor read
+# zone=normal with 200,000 tokens of headroom — two instruments 200k apart.
+#
+# WHY A RUNNER AND NOT ANOTHER PROSE LINE. Every existing instruction to consult
+# that sensor lives in a .md and is executed by a READER. Measured on cc-10
+# 2026-09-10: `context-budget-banner.sh` had ZERO script callers anywhere in the
+# tree, and exactly 1 of alpha's 163 journal entries carried its line, against 6
+# abbreviation claims citing context/tight. Adding a seventh prose instruction
+# would have changed the FORM of an instruction, not who executes it — the same
+# reasoning core/config/execute-protocol-digest.md Step 4a records for the
+# commons-retrieval slot. This call runs whether or not anyone remembered to.
+#
+# INDEPENDENT WRITER IS THE WHOLE POINT (guard-6255): context-budget.json is
+# written by the statusLine hook, so it can falsify the harness marker; the
+# marker cannot corroborate itself, and re-reading it is the error re-deriving
+# itself. `zone` is the authority — fresh/normal/tight.
+#
+# STDERR, NEVER STDOUT: stdout carries the goal JSON and has parsers.
+# UNPREFIXED, AND THAT IS LOAD-BEARING: abbreviated-obligation-audit.py's
+# BANNER_RE anchors `^CTX:` at line start, so a `[aspirations-release] ` prefix
+# would make this line unquotable as a valid citation under that audit.
+# Fail-open and cheap: measured 0.02s on this box; the banner emits its own
+# `CTX: unavailable (...)` line when the budget file is absent, and the `||`
+# covers the case where the script itself cannot run. Never blocks a release.
+_ctx_line="$(bash "$CORE_ROOT/scripts/context-budget-banner.sh")" \
+    || _ctx_line="CTX: unavailable (banner call failed)"
+if [ -n "$_ctx_line" ]; then
+    printf '%s\n' "$_ctx_line" >&2
+    printf '%s\n' "[aspirations-release] sensor above has an INDEPENDENT writer (statusLine hook). If you are releasing on context grounds, zone is the authority — the harness token marker is not an input (guard-6380)." >&2
+fi
+
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY")" || rc=$?
 

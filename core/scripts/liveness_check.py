@@ -345,7 +345,6 @@ def fetch_owncloud_shard_lastmodified(agent, world_dir):
     Fail-quiet: any error (no creds, boto3 missing, key absent) returns None so
     the caller degrades to UNKNOWN rather than a false verdict."""
     try:
-        import boto3  # noqa: local import — only the own-cloud path needs it
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
             sys.path.insert(0, here)
@@ -354,7 +353,11 @@ def fetch_owncloud_shard_lastmodified(agent, world_dir):
         shard = os.path.join(world_dir, "team-state", "agents", f"{agent}.yaml")
         key = be._s3_key(shard)
         bucket = os.environ["STORAGE_S3_BUCKET"]
-        head = boto3.client("s3").head_object(Bucket=bucket, Key=key)
+        # The backend's OWN client, never a fresh boto3.client: that one used
+        # the default credential chain and ignored the endpoint override, so
+        # after a store cutover it would keep heading the old store (the
+        # stale-caller class, g-372-01).
+        head = be.s3.head_object(Bucket=bucket, Key=key)
         return head["LastModified"].astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
     except Exception as e:  # noqa: BLE001 — fail-quiet by design
         sys.stderr.write(f"[liveness-check] own-cloud fresh-signal unavailable: {type(e).__name__}\n")

@@ -138,7 +138,10 @@ def test_many_eligible_goals_produce_exactly_one_email(tmp_path):
     mod = _load_module()
     calls = []
 
-    def fake_send(agent, batch, cadence_hours, no_email):
+    # 5th arg added 2026-09-10 with the stalled-detector-findings section.
+    # The double must carry the production arg shape, not the contract-ideal
+    # one (guard-920) — this test is what caught the mismatch.
+    def fake_send(agent, batch, cadence_hours, no_email, stalled=None):
         calls.append(len(batch))
         return True, "sent"
 
@@ -850,3 +853,87 @@ def test_dispatcher_rc4_means_superseded_by_the_fleet_digest_not_failed(tmp_path
     cand = {"goal": g, "aspiration_id": "asp-999", "shape": "agent-user", "deliberate": False}
     ok, why = mod._send_digest_email("t", [(cand, g, 100.0, "blocked_since")], 72.0, False)
     assert (ok, why) == (True, "superseded_by_fleet_digest"), (ok, why)
+
+
+def _subject(gid, achieved, last_at):
+    return {"id": gid, "title": "subject " + gid, "status": "pending",
+            "recurring": True, "achievedCount": achieved,
+            "lastAchievedAt": last_at, "participants": ["agent"],
+            "description": "d" * 50}
+
+
+def test_stalled_detector_findings_exclude_terminal_and_carry_the_subject_state(tmp_path):
+    """The section that carries AGENT work into the USER's digest (2026-09-10).
+
+    WHY THIS EXISTS. The digest's own membership predicate is `"user" in
+    participants`; a detector finding carries `participants: ["agent"]`, so the
+    two sets never intersect and no detector finding could reach the one channel
+    that reaches the user on a schedule. Measured that day: `/reflect`
+    (g-001-01) was 147.5h dark, correctly detected, correctly filed HIGH, and
+    invisible to the user for six days.
+
+    THE TERMINAL EXCLUSION IS THE HALF THAT ROTS QUIETLY. Drop it and the
+    section reports every starvation finding ever filed — 41 against 15 live on
+    the day it shipped — which reads as a catastrophe and trains the reader to
+    skip the section, a louder silence than not sending at all.
+
+    `stamp_moved` is asserted because it is the guard-2197 discriminator:
+    `recurring-precondition-sweep.py` advances `lastAchievedAt` on a goal whose
+    precondition FAILS while never touching `achievedCount`, so a shelved goal
+    can look freshly-achieved. Membership is deliberately structural (the
+    finding is open) rather than a re-run of the detector's own predicate, which
+    would go quiet on exactly that case.
+    """
+    import datetime as dt
+    mod = _load_module()
+    q = tmp_path / "world.jsonl"
+    _write_queue(q, [
+        _subject("g-900-01", 7, "2026-09-01T00:00:00"),
+        _subject("g-900-02", 3, "2026-09-02T00:00:00"),
+        _goal("g-999-01", 30, participants=("agent",), status="pending",
+              origin_signal="unblock:recurring-starved-alpha-g-900-01-20260901000000",
+              title="Unblock: recurring goal g-900-01 has stopped firing"),
+        # TERMINAL — must not appear.
+        _goal("g-999-02", 30, participants=("agent",), status="completed",
+              origin_signal="unblock:recurring-starved-alpha-g-900-02-20260902000000",
+              title="Unblock: recurring goal g-900-02 has stopped firing"),
+    ])
+
+    found = mod._find_stalled_detector_findings([("world", q)], dt.datetime.now())
+    assert [f["finding_id"] for f in found] == ["g-999-01"], \
+        "terminal findings must be excluded: %r" % [f["finding_id"] for f in found]
+
+    f = found[0]
+    assert f["subject_id"] == "g-900-01"
+    assert f["achieved_count"] == 7
+    assert f["stamp_moved"] is False, "anchor equals lastAchievedAt — nothing ran"
+
+    text = "\n".join(mod._compose_detector_section(found))
+    assert "g-900-01" in text
+    assert "nothing needed from you" in text, \
+        "the section must say it is not an ask — this email caused anxiety once"
+    assert "stamp UNCHANGED" in text
+
+
+def test_detector_section_is_not_gated_on_a_populated_batch(tmp_path):
+    """The all-clear must carry the section too.
+
+    Same regression shape as `test_empty_list_sends_an_all_clear_not_a_noop`:
+    guarding the section with `if batch` is a one-token change that is invisible
+    from outside, because a suppressed section and a genuinely empty one produce
+    the identical email — and the all-clear sweep is precisely when a reader has
+    the attention to notice something stuck.
+    """
+    src = SCRIPT.read_text(encoding="utf-8")
+    compose = src[src.index("    body = (_compose_digest_body"):]
+    compose = compose[:compose.index("tmp_path = None")]
+    assert "_compose_detector_section" in compose, \
+        "the section must be composed on the shared body path"
+    # Indentation IS the assertion: at 4 spaces the call sits in the
+    # function body and runs on BOTH the digest and the all-clear paths.
+    # Wrapping it in `if batch:` -- the regression this pins -- would
+    # indent it to 8. Matching the bare substring "if batch" cannot work:
+    # the correct line above is a ternary that legitimately contains it,
+    # which is how the first draft of this test failed against good code.
+    assert "\n    _section = _compose_detector_section" in compose, \
+        "the section must be composed unconditionally, not gated on batch"

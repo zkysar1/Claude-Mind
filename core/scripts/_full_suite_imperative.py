@@ -113,20 +113,24 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
    <tmp>/ayoai-suite-run-shared means they did not. Measured cc-09 2026-09-06:
    the export form yields -shared, byte-identical to passing nothing at all.
    FIRST, THOUGH: IF THIS BOX HAS A LIVE
-   mind_api DAEMON, DO NOT PIN A WORKTREE AT ALL (guard-5866) -- it is worse
-   than the contention it avoids. The worktree spawns its OWN daemon, and
-   mind-api-start.sh _sweep_orphan_daemons matches mind_api.src processes by
-   COMMAND LINE with ZERO runtime-dir scoping, so its spawn-time sweep KILLS
-   the fleet's live daemon (every agent on the box loses it, once per chunk
-   gap). The copied daemon.port then goes stale on that recycle and every
-   daemon-backed test fails `REFUSED: recycle/spawn requested from inside
-   pytest` -- a large authoritative-looking count that is PURE ENVIRONMENT.
-   Measured as a one-variable pre-registered control (bravo cc-05 2026-09-03:
+   mind_api DAEMON, DO NOT PIN A WORKTREE AT ALL (guard-6394, which
+   supersedes the retired guard-5866) -- it is worse
+   than the contention it avoids: a worktree run KILLS the fleet's live daemon,
+   and every daemon-backed test then fails `REFUSED: recycle/spawn requested
+   from inside pytest` -- a large authoritative-looking count that is PURE
+   ENVIRONMENT. One-variable pre-registered control (bravo cc-05 2026-09-03):
    3 daemon kills + 12 stale-port errors in the worktree vs 0 and 0 for the
-   SAME suite/commit/box in the main repo); reproduced alpha cc-04 2026-09-04,
-   22 failures across 8 files, every one of them environment. Copying the port
-   does NOT fix this and a symlink does not either -- the kill is the defect,
-   the stale port is only its most visible symptom. Use the daemon-safe
+   SAME suite/commit/box in the main repo; reproduced alpha cc-04 2026-09-04,
+   22 failures across 8 files, every one of them environment.
+   WHICH PROCESS KILLS IS UNKNOWN (g-115-9602, 2026-09-10). This block named
+   mind-api-start.sh _sweep_orphan_daemons; that function has had ZERO
+   executable call sites since 8ef51809b8 (2026-05-22), 104 days BEFORE the
+   guardrail was written, pinned green by test_daemon_pinned_port_wedge.py --
+   and mind_api/state/ is fully gitignored, so a worktree inherits no PID
+   files for _force_kill_tree either. The EFFECT is measured; the cause is
+   not. Do NOT go fix the sweep, and do not inherit "copying the port cannot
+   help" -- that inference rested on the dead mechanism. If you reproduce
+   this, capture WHO kills, at kill time. Meanwhile use the daemon-safe
    MAIN-REPO route: STORAGE_BACKEND=local, chunked, `-m 'not
    daemon_integration'`, and simply do not commit while it runs.
    OTHERWISE (no live daemon on this box), remedy: `git worktree add --detach

@@ -26,12 +26,32 @@ direction: the shapes real callers actually use, taken from the live call
 sites, must still be accepted. Without them this file would pass against a
 one-line `exit 2` at the top of the script.
 
-ISOLATION. Every case points BODY_WM_PATH at a tmp file (honored by
-wm.py:51), so no live cadence stamp is touched — which is the very hazard the
-goal is about. Driving the real .sh through subprocess is deliberate: this is
-a bug in shell argument parsing, so a test that imported anything would
-measure a different code path than the one that broke (guard-920).
+ISOLATION IS PARTIAL, AND THIS PARAGRAPH USED TO CLAIM OTHERWISE. Every case
+points BODY_WM_PATH at a tmp file (honored by wm.py:51) and sets
+STORAGE_BACKEND=local, and BOTH GUARDS DIE AT THE DAEMON HOP: the four
+ACCEPTED_SHAPES cases run the real script to SUCCESS, and its write goes
+`fresh-eyes-record-tick.sh:138` -> `wm-set.sh:75` -> POST /v1/wm/set, whose
+request carries only the slot name. The daemon is a separate long-lived
+process that never sees this test's environment, so the stamp lands in LIVE
+working memory and -- via the --claim shape -- in the shared team-state
+store's `shared_cadences` map. MEASURED TWICE ON TWO BOXES: cc-13 2026-09-05
+and cc-05 2026-09-10 (canary seeded, single file run, canary gone, both
+cadence slots advanced to the live goal count, third sibling untouched, no
+ritual run; on cc-05 it additionally overwrote `fired_by: alpha` with `bravo`
+and stole alpha's in-flight claim on the fleet-shared tree cadence).
+
+Do NOT re-derive that this file is safe from its own env-var setup -- the env
+vars are real and the process that performs the write never reads them. The
+defect and the restore path are `g-115-6065`; until it lands, running this
+file consumes a fresh-eyes review window silently. The prior wording here was
+quoted as evidence in that goal's candidate (b) and caused the reproducer to
+be excluded from its own investigation for ~3.5 weeks.
+
+Driving the real .sh through subprocess is deliberate: this is a bug in shell
+argument parsing, so a test that imported anything would measure a different
+code path than the one that broke (guard-920).
 """
+
 from __future__ import annotations
 
 import os

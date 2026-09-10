@@ -67,10 +67,35 @@ ALLOWED_COMMAND_PREFIXES = (
     #  * source _paths.sh && bash "$WORLD_PATH/... — .claude/rules/path-resolution.md
     #    REQUIRES this shape for world scripts, because the PreToolUse[Bash]
     #    hooks do NOT rewrite the `world/` virtual prefix; a bare
-    #    `bash world/scripts/x.sh` dies rc=127. So the pre-existing
-    #    "bash world/scripts/" entry is itself unreachable by the only
-    #    invocation the rules permit — a SECOND dead allowlist entry,
-    #    sibling to the guard-955 one and not previously recorded.
+    #    `bash world/scripts/x.sh` typed into a Bash tool call dies rc=127.
+    #    That is why this entry was added, and it is still the right entry.
+    #
+    #    WHAT IT IS NOT: a second dead allowlist entry. This comment said
+    #    exactly that until , and the claim is FALSE INSIDE THIS
+    #    MODULE — which is the only place ALLOWED_COMMAND_PREFIXES is
+    #    consulted. `_eval_command_succeeds` rewrites `bash world/X Y` to
+    #    `bash <quoted absolute WORLD_DIR/X> Y` before running it, so the
+    #    evaluator performs for itself the rewrite the hooks decline to do,
+    #    and "bash world/scripts/" is not merely reachable here — it is the
+    #    form that WORKS. Read the two layers apart: DEAD at the shell/hook
+    #    layer, LIVE at the evaluator layer, same string.
+    #
+    #    MEASURED, not reasoned (alpha, hostname DESKTOP-O91DLK2, uname -s
+    #    MINGW64_NT-10.0-19045, Python 3.12.10, 2026-09-07T11:38Z, recorded
+    #    on ): through this evaluator at timeout_seconds=120, the
+    #    literal `bash world/scripts/` form returned lodestar-ranked-
+    #    retrieval-gate.sh in 0.13s exit 2 and gate-d-outcome-stream-ready.sh
+    #    in 0.28s exit 1 — the SCRIPTS' own verdicts, not path failures.
+    #    Control in the same run: `bash core/scripts/platform-check.sh --os
+    #    windows`, 0.27s exit 0.
+    #
+    #    The sibling entry above it has the OPPOSITE history and is worth
+    #    keeping straight: `source core/scripts/_paths.sh && bash ` is the
+    #    shape the rules mandate, and it was the one silently dying rc=127 —
+    #    on POSIX, under dash, where `source` is not a builtin (,
+    #    fixed; see the comment in `_eval_command_succeeds`). So of the two,
+    #    the entry this block called dead was working and the entry it called
+    #    live was not.
     "python3 -m pytest",
     "python -m pytest",
     "py -3 -m pytest",

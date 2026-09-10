@@ -492,7 +492,7 @@ class OwnCloudBackend:
                  region: str = "us-east-2",
                  runner_stale_seconds: int = DEFAULT_RUNNER_STALE_SECONDS,
                  aws_access_key_id: str = None, aws_secret_access_key: str = None,
-                 s3=None, ddb=None):
+                 s3=None, ddb=None, s3_endpoint_url=None):
         self.env_id = env_id.strip("/")
         self.bucket = bucket
         self.lock_table = lock_table
@@ -545,13 +545,36 @@ class OwnCloudBackend:
         # deployment are the root keys used for unrelated lambda access and must
         # NOT be reused for the daemon. When unset, fall back to the default
         # boto3 chain (env AWS_*, shared config, instance role).
+        # Optional object-store endpoint override (g-372-01, Phase 1 of the
+        # storage exit): point the S3 client at a self-hosted S3-compatible
+        # store by URL. Unset/blank = today's client construction byte-for-byte
+        # (no endpoint_url kwarg at all); reversible by unsetting the var. S3
+        # ONLY — the DynamoDB client keeps its regional endpoint on purpose
+        # (Phase 1a leaves the lock/session tables where they are). botocore
+        # addresses a custom endpoint path-style by default (measured on
+        # botocore 1.43.39), so no addressing_style config is needed.
+        # `s3_endpoint_url` is an EXPLICIT override of that env read (g-372-13):
+        # None = read the env exactly as before; "" = the regional AWS endpoint
+        # even when the env override is set; a URL = that store. The env var
+        # repoints EVERY caller that resolves through this factory at once, and
+        # one caller — the cold-snapshot DR archive — exists to be somewhere
+        # else (guard-6373), so it needs a way to say so per instance.
+        if s3_endpoint_url is None:
+            s3_endpoint_url = os.environ.get("STORAGE_S3_ENDPOINT_URL", "")
+        _s3_endpoint = str(s3_endpoint_url).strip()
+        _s3_kw = {"endpoint_url": _s3_endpoint} if _s3_endpoint else {}
+        self.s3_endpoint_url = _s3_endpoint or None
         if (s3 is None or ddb is None) and aws_access_key_id and aws_secret_access_key:
             _cred_sess = boto3.Session(aws_access_key_id=aws_access_key_id,
                                        aws_secret_access_key=aws_secret_access_key,
                                        region_name=region)
-            _mk = lambda svc: _cred_sess.client(svc, region_name=region, config=_cfg)
+            _mk = lambda svc: _cred_sess.client(
+                svc, region_name=region, config=_cfg,
+                **(_s3_kw if svc == "s3" else {}))
         else:
-            _mk = lambda svc: boto3.client(svc, region_name=region, config=_cfg)
+            _mk = lambda svc: boto3.client(
+                svc, region_name=region, config=_cfg,
+                **(_s3_kw if svc == "s3" else {}))
         self.s3 = s3 if s3 is not None else _mk("s3")
         self.ddb = ddb if ddb is not None else _mk("dynamodb")
         # ETag observed at the most recent read of each key — the If-Match fence
@@ -587,7 +610,7 @@ class OwnCloudBackend:
 
     # --- env wiring --------------------------------------------------------
     @classmethod
-    def from_env(cls) -> "OwnCloudBackend":
+    def from_env(cls, env=None) -> "OwnCloudBackend":
         """Build from env vars. Required: STORAGE_S3_BUCKET, STORAGE_DDB_LOCK_TABLE,
         STORAGE_DDB_SESSIONS_TABLE, and at least one of MIND_WORLD/WORLD_PATH or
         MIND_META/META_PATH (so a governed path can resolve to a root). Also
@@ -601,9 +624,14 @@ class OwnCloudBackend:
         daemon-context wiring (routing these through the per-request ctx.paths
         resolver instead of process env) is the s3-integration follow-up; the
         env form here is correct for CLI invocation and is fully test-controllable."""
+        # `env` (g-372-13): the mapping to read from, default the process env.
+        # A caller that must talk to a DIFFERENT store than the box's live one
+        # (the cold-snapshot DR archive) passes an overlaid copy here instead of
+        # mutating os.environ, which would also repoint get_backend()'s cache.
+        env = os.environ if env is None else env
         missing = [v for v in ("STORAGE_S3_BUCKET", "STORAGE_DDB_LOCK_TABLE",
                                "STORAGE_DDB_SESSIONS_TABLE")
-                   if not os.environ.get(v)]
+                   if not env.get(v)]
         if missing:
             raise RuntimeError(
                 "OwnCloudBackend.from_env: missing required env var(s): "
@@ -618,9 +646,9 @@ class OwnCloudBackend:
         # instance-role / ECS task-role case where no static keys exist and the
         # chain resolves a scoped role. communication-clarity.md rule 5: prefer
         # failing visibly over silently falling back to an inconsistent source.
-        akid = os.environ.get("MIND_AWS_ACCESS_KEY_ID")
-        asec = os.environ.get("MIND_AWS_SECRET_ACCESS_KEY")
-        allow_default_chain = os.environ.get(
+        akid = env.get("MIND_AWS_ACCESS_KEY_ID")
+        asec = env.get("MIND_AWS_SECRET_ACCESS_KEY")
+        allow_default_chain = env.get(
             "MIND_AWS_ALLOW_DEFAULT_CHAIN", "").strip().lower() in (
                 "1", "true", "yes")
         if not (akid and asec) and not allow_default_chain:
@@ -645,7 +673,7 @@ class OwnCloudBackend:
         # fail-visible posture as the creds guard above; communication-clarity.md
         # rule 5). One line in .env.local (MACHINE_ID=<hostname>) satisfies it
         # — and the machine-2 bring-up runbook sets it on every machine.
-        machine_id = os.environ.get("MACHINE_ID", "").strip()
+        machine_id = env.get("MACHINE_ID", "").strip()
         if not machine_id or machine_id.lower() == "unknown":
             raise RuntimeError(
                 "OwnCloudBackend.from_env: MACHINE_ID is not set (or is "
@@ -661,28 +689,29 @@ class OwnCloudBackend:
         # lock-break (reclaim_if_stale) always used the constructor default,
         # so the two consumers could disagree on staleness. Parse it here so
         # ONE value governs both.
-        _stale_env = os.environ.get("OWNERSHIP_STALE_SECONDS", "").strip()
+        _stale_env = env.get("OWNERSHIP_STALE_SECONDS", "").strip()
         try:
             runner_stale = (int(_stale_env) if _stale_env
                             else DEFAULT_RUNNER_STALE_SECONDS)
         except ValueError:
             runner_stale = DEFAULT_RUNNER_STALE_SECONDS
         return cls(
-            env_id=os.environ.get("ENVIRONMENT_ID", "ayoai-mind"),
-            bucket=os.environ["STORAGE_S3_BUCKET"],
-            lock_table=os.environ["STORAGE_DDB_LOCK_TABLE"],
-            sessions_table=os.environ["STORAGE_DDB_SESSIONS_TABLE"],
+            env_id=env.get("ENVIRONMENT_ID", "ayoai-mind"),
+            bucket=env["STORAGE_S3_BUCKET"],
+            lock_table=env["STORAGE_DDB_LOCK_TABLE"],
+            sessions_table=env["STORAGE_DDB_SESSIONS_TABLE"],
             root_map=cls._resolve_root_map(),
-            cache_ttl=int(os.environ.get("OWNCLOUD_CACHE_TTL",
+            cache_ttl=int(env.get("OWNCLOUD_CACHE_TTL",
                                          str(DEFAULT_CACHE_TTL_SECONDS))),
             machine_id=machine_id,
-            region=os.environ.get("AWS_DEFAULT_REGION", "us-east-2"),
+            region=env.get("AWS_DEFAULT_REGION", "us-east-2"),
             runner_stale_seconds=runner_stale,
             # Scoped least-privilege creds (Zak_first_test), separate from the
             # root AWS_* keys. Both-None is only reached when the operator set
             # MIND_AWS_ALLOW_DEFAULT_CHAIN=1 above -> __init__ default chain.
             aws_access_key_id=akid,
             aws_secret_access_key=asec,
+            s3_endpoint_url=env.get("STORAGE_S3_ENDPOINT_URL", ""),
         )
 
     @staticmethod

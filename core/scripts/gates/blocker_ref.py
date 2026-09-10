@@ -208,6 +208,33 @@ def _parse_iso(value: Any) -> Optional[datetime]:
         return None
 
 
+def is_live_lease(ref: Any, *, now: Optional[datetime] = None) -> bool:
+    """True iff `ref` is a blocker_ref carrying an UNEXPIRED explicit expiry.
+
+    The one predicate both defer-clear sites consult before dropping a
+    blocker_ref (g-115-9535). It lives here, beside `validate`, because
+    `gates.blocker_ref` is already the single source of truth both writers
+    import — a second copy in either caller would drift silently, and the
+    daemon copy is the one that actually runs (`.claude/rules/
+    no-python-cli-fallback.md`), so a drifted CLI copy would look correct in
+    the diff while changing nothing at runtime.
+
+    FAIL-CLOSED, deliberately: a non-dict, a missing `expires_at`, or an
+    unparseable one all return False, so the caller pops exactly as it did
+    before this predicate existed. Only a ref that can PROVE it is still
+    within its lease is preserved. This mirrors `_parse_iso`'s contract above
+    (an unparseable expiry is a refusal, never a pass) and the domain rule
+    that governs these leases: "a lease nobody renewed has ended"
+    (`world/conventions/deploy-holds.md`).
+    """
+    if not isinstance(ref, dict):
+        return False
+    expires = _parse_iso(ref.get("expires_at"))
+    if expires is None:
+        return False
+    return expires > (now or datetime.now())
+
+
 def _check_deploy_hold_reservation(ref: dict, ext_id: str, created_at: Any,
                                    expires_at: Any, *,
                                    allow_long_hold: bool = False

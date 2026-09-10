@@ -719,6 +719,11 @@ def test_project_wires_program_through_and_defaults_it_empty():
 
 _HANDLE_SECRET = "unit-test-handle-secret-not-a-real-key"
 _OTHER_SECRET = "unit-test-handle-secret-a-different-one"
+#: Every handle below is computed under a REAL environment id, because that is the only
+#: shape production uses: both live call sites (project_goals, resolve_goal_handle) pass
+#: one explicitly. The default "" is a call-site convenience that now fails closed
+#: (guard-6312), so a test omitting it would assert against "" and pass vacuously.
+_ENV = "unit-test-env"
 
 
 def test_project_goals_emits_no_handle_without_a_secret() -> None:
@@ -735,7 +740,9 @@ def test_project_goals_emits_no_handle_without_a_secret() -> None:
 
 def test_project_goals_emits_a_fourth_handle_field_under_a_secret() -> None:
     """The one shape change, and it is opt-in: a fourth key appears ONLY with a secret."""
-    out = project_goals([_g(id="g-369-119")], Redactor(), handle_secret=_HANDLE_SECRET)
+    out = project_goals(
+        [_g(id="g-369-119")], Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+    )
     assert len(out) == 1
     assert set(out[0]) == {"title", "status", "updated", "handle"}, sorted(out[0])
     handle = str(out[0]["handle"])
@@ -758,17 +765,23 @@ def test_published_handle_does_not_leak_the_goal_id_or_the_secret() -> None:
     without it cannot compute the mapping to invert.
     """
     gid = "g-369-119"
-    row = project_goals([_g(id=gid)], Redactor(), handle_secret=_HANDLE_SECRET)[0]
+    row = project_goals(
+        [_g(id=gid)], Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+    )[0]
     blob = " ".join(str(v) for v in row.values())
     for fragment in (gid, "369-119", "g-369", _HANDLE_SECRET):
         assert fragment not in blob, fragment
-    assert goal_handle(gid, _HANDLE_SECRET) != goal_handle(gid, _OTHER_SECRET)
+    assert goal_handle(gid, _HANDLE_SECRET, _ENV) != goal_handle(gid, _OTHER_SECRET, _ENV)
 
 
 def test_goal_handle_is_stable_per_goal_and_distinct_between_goals() -> None:
     """Stable, because resolve RECOMPUTES rather than reading a stored mapping."""
-    assert goal_handle("g-369-119", _HANDLE_SECRET) == goal_handle("g-369-119", _HANDLE_SECRET)
-    assert goal_handle("g-369-119", _HANDLE_SECRET) != goal_handle("g-369-30", _HANDLE_SECRET)
+    assert goal_handle("g-369-119", _HANDLE_SECRET, _ENV) == goal_handle(
+        "g-369-119", _HANDLE_SECRET, _ENV
+    )
+    assert goal_handle("g-369-119", _HANDLE_SECRET, _ENV) != goal_handle(
+        "g-369-30", _HANDLE_SECRET, _ENV
+    )
 
 
 def test_goal_handle_is_per_environment_even_under_one_shared_secret() -> None:
@@ -787,9 +800,58 @@ def test_goal_handle_is_per_environment_even_under_one_shared_secret() -> None:
 
 def test_goal_handle_is_empty_without_an_id_or_a_secret() -> None:
     """Both inputs are required; an empty return is what suppresses the field."""
-    assert goal_handle("", _HANDLE_SECRET) == ""
-    assert goal_handle("g-369-119", "") == ""
-    assert goal_handle("   ", _HANDLE_SECRET) == ""
+    assert goal_handle("", _HANDLE_SECRET, _ENV) == ""
+    assert goal_handle("g-369-119", "", _ENV) == ""
+    assert goal_handle("   ", _HANDLE_SECRET, _ENV) == ""
+
+
+def test_goal_handle_is_empty_without_an_environment_id() -> None:
+    """The THIRD arm of the fence, and the one guard-6312 exists for.
+
+    ``environment_id`` is mixed into the HMAC message, so an empty value does not merely
+    weaken the handle — it retires the property the component carries. Two environments
+    sharing one fleet-wide secret would publish IDENTICAL handles for the same goal, and
+    nothing logs it: the docstring's no-cross-environment-correlation promise fails open.
+
+    The positive control is load-bearing, not ceremony. Every assertion here is
+    ``== ""``, so without it the test would still pass if ``goal_handle`` returned ""
+    unconditionally — the observational-equivalence hole of guard-2219.
+
+    Both the OMITTED and the explicitly-empty shape are pinned. In Python they reach the
+    same branch (the default IS ``""``), so this is not two behaviours — it is one
+    behaviour asserted through the two call shapes a caller can actually write, which is
+    what stops a later signature change from silently reopening the omitted path.
+
+    No child process is needed here, and that is a deliberate departure from the goal's
+    stated verification method: guard-2337 requires child-process env planting only for an
+    env-derived IMPORT-TIME invariant, and exempts an injectable parameter. Measured —
+    ``knowledge_projection.py`` contains zero ``os.environ``/``getenv`` reads, and
+    ``environment_id`` arrives purely as an argument.
+    """
+    # Positive control FIRST: this exact call is non-empty with a real environment.
+    assert goal_handle("g-369-119", _HANDLE_SECRET, _ENV) != ""
+
+    assert goal_handle("g-369-119", _HANDLE_SECRET) == ""          # omitted
+    assert goal_handle("g-369-119", _HANDLE_SECRET, "") == ""      # explicitly empty
+    assert goal_handle("g-369-119", _HANDLE_SECRET, "   ") == ""   # whitespace only
+
+
+def test_project_goals_emits_no_handle_without_an_environment_id() -> None:
+    """The fence reaches the BOARD: a secret alone is not enough to publish a handle.
+
+    This is the assertion that actually protects members. A box provisioned with a secret
+    but no environment id previously published a full board of well-formed handles keyed
+    on "" — correlatable across environments and matching no resolver holding a real id.
+    """
+    plain = project_goals([_g(id="g-369-119")], Redactor(), handle_secret=_HANDLE_SECRET)
+    assert len(plain) == 1
+    assert set(plain[0]) == {"title", "status", "updated"}, sorted(plain[0])
+
+    # Positive control: the same call WITH an environment does publish the fourth key.
+    keyed = project_goals(
+        [_g(id="g-369-119")], Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+    )
+    assert "handle" in keyed[0], sorted(keyed[0])
 
 
 def test_project_goals_publishes_an_id_less_goal_without_a_handle() -> None:
@@ -797,7 +859,9 @@ def test_project_goals_publishes_an_id_less_goal_without_a_handle() -> None:
 
     Dropping the row instead would let one bad store line silently shrink the board.
     """
-    out = project_goals([_g()], Redactor(), handle_secret=_HANDLE_SECRET)
+    out = project_goals(
+        [_g()], Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+    )
     assert len(out) == 1 and "handle" not in out[0], sorted(out[0])
 
 
@@ -808,24 +872,33 @@ def test_resolve_round_trips_the_handle_the_board_actually_published() -> None:
     it would pass even if the projection published a different value.
     """
     goals = [_g(id="g-369-119", title="A"), _g(id="g-369-30", title="B")]
-    rows = project_goals(goals, Redactor(), handle_secret=_HANDLE_SECRET)
+    rows = project_goals(
+        goals, Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+    )
     for row, goal in zip(rows, goals):
         assert resolve_goal_handle(
-            str(row["handle"]), goals, _HANDLE_SECRET, Redactor()
+            str(row["handle"]), goals, _HANDLE_SECRET, Redactor(), _ENV
         ) == goal["id"]
 
 
 def test_resolve_returns_none_for_unknown_wrong_secret_and_wrong_environment() -> None:
     """Every miss is None. An unknown handle must never fall back to a nearest match."""
     goals = [_g(id="g-369-119")]
-    handle = str(project_goals(goals, Redactor(), handle_secret=_HANDLE_SECRET)[0]["handle"])
+    handle = str(
+        project_goals(
+            goals, Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+        )[0]["handle"]
+    )
 
-    assert resolve_goal_handle("deadbeefdeadbeef", goals, _HANDLE_SECRET, Redactor()) is None
-    assert resolve_goal_handle(handle, goals, _OTHER_SECRET, Redactor()) is None
+    assert resolve_goal_handle("deadbeefdeadbeef", goals, _HANDLE_SECRET, Redactor(), _ENV) is None
+    assert resolve_goal_handle(handle, goals, _OTHER_SECRET, Redactor(), _ENV) is None
     assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor(), "env-b") is None
-    assert resolve_goal_handle(handle, goals, "", Redactor()) is None
-    assert resolve_goal_handle("", goals, _HANDLE_SECRET, Redactor()) is None
-    assert resolve_goal_handle(handle, [], _HANDLE_SECRET, Redactor()) is None
+    assert resolve_goal_handle(handle, goals, "", Redactor(), _ENV) is None
+    assert resolve_goal_handle("", goals, _HANDLE_SECRET, Redactor(), _ENV) is None
+    assert resolve_goal_handle(handle, [], _HANDLE_SECRET, Redactor(), _ENV) is None
+    # The environment_id arm of the same fence: an unprovisioned resolver matches nothing
+    # rather than matching a handle keyed on "" (guard-6312).
+    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor(), "") is None
 
 
 def test_resolve_refuses_a_goal_the_board_never_published() -> None:
@@ -840,9 +913,14 @@ def test_resolve_refuses_a_goal_the_board_never_published() -> None:
         _g(id="g-369-202", status="blocked"),         # gate 2 — status not published
         _g(id="g-369-203", title="   "),              # title survives nothing
     ):
-        assert project_goals([hidden], Redactor(), handle_secret=_HANDLE_SECRET) == []
-        handle = goal_handle(str(hidden["id"]), _HANDLE_SECRET)
-        assert resolve_goal_handle(handle, [hidden], _HANDLE_SECRET, Redactor()) is None
+        assert project_goals(
+            [hidden], Redactor(), handle_secret=_HANDLE_SECRET, environment_id=_ENV
+        ) == []
+        handle = goal_handle(str(hidden["id"]), _HANDLE_SECRET, _ENV)
+        # Non-empty by construction: without _ENV this handle would be "" and the assertion
+        # below would hold trivially, testing nothing about the exposure predicate.
+        assert handle, hidden["id"]
+        assert resolve_goal_handle(handle, [hidden], _HANDLE_SECRET, Redactor(), _ENV) is None
 
 
 def test_resolve_returns_none_when_two_exposed_goals_share_a_handle(monkeypatch) -> None:
@@ -859,7 +937,7 @@ def test_resolve_returns_none_when_two_exposed_goals_share_a_handle(monkeypatch)
     seen: dict[str, str] = {}
     pair = None
     for gid in ids:
-        h = goal_handle(gid, _HANDLE_SECRET)
+        h = goal_handle(gid, _HANDLE_SECRET, _ENV)
         if h in seen:
             pair = (seen[h], gid, h)
             break
@@ -867,21 +945,23 @@ def test_resolve_returns_none_when_two_exposed_goals_share_a_handle(monkeypatch)
     assert pair is not None, "no collision at 1 hex char over 200 ids — widen the search"
     first, second, handle = pair
     goals = [_g(id=first), _g(id=second)]
-    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor()) is None
+    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor(), _ENV) is None
 
 
 def test_resolve_treats_a_repeated_record_for_one_id_as_unambiguous() -> None:
     """Two records, ONE id, is duplication — not ambiguity. It must still resolve."""
     goals = [_g(id="g-369-119", title="A"), _g(id="g-369-119", title="A again")]
-    handle = goal_handle("g-369-119", _HANDLE_SECRET)
-    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor()) == "g-369-119"
+    handle = goal_handle("g-369-119", _HANDLE_SECRET, _ENV)
+    assert resolve_goal_handle(handle, goals, _HANDLE_SECRET, Redactor(), _ENV) == "g-369-119"
 
 
 def test_resolve_accepts_the_handle_with_surrounding_whitespace_and_uppercase() -> None:
     """An inbound handle crosses a URL/JSON boundary before it gets here."""
-    handle = goal_handle("g-369-119", _HANDLE_SECRET)
+    handle = goal_handle("g-369-119", _HANDLE_SECRET, _ENV)
     goals = [_g(id="g-369-119")]
-    assert resolve_goal_handle(f"  {handle.upper()}  ", goals, _HANDLE_SECRET, Redactor()) == "g-369-119"
+    assert resolve_goal_handle(
+        f"  {handle.upper()}  ", goals, _HANDLE_SECRET, Redactor(), _ENV
+    ) == "g-369-119"
 
 
 def test_project_wires_the_handle_secret_through_and_defaults_it_off() -> None:

@@ -731,8 +731,13 @@ def _setup_release_repo(tmp_path, version="0.2.0"):
     # Keep the py-shim + bytecode cache from dirtying the tree: release.sh Step 1
     # hard-fails on a dirty tree, and sourcing _paths.sh may create
     # core/scripts/.python-shim/ on a machine whose `python3` is a Store stub.
+    # _paths.sh also writes core/scripts/.platform-memo.sh (its platform memo)
+    # beside itself on first source; untracked there, it reads as `??` to
+    # release.sh Step 1 and the cut refuses "working tree is dirty" (measured
+    # cc-13 2026-09-10, 3 ledger tests red on every Linux run).
     (repo / ".gitignore").write_text(
-        "core/scripts/.python-shim/\ncore/.pycache/\n", encoding="utf-8")
+        "core/scripts/.python-shim/\ncore/scripts/.platform-memo.sh\ncore/.pycache/\n",
+        encoding="utf-8")
     _git(repo, "init", "-q")
     _git(repo, "config", "user.email", "release-test@example.com")
     _git(repo, "config", "user.name", "Release Test")

@@ -43,6 +43,19 @@ production call site passes, not the contract-ideal shape) and `rb-245` (verify
 the population exists before believing a zero) — measure the real thing, not the
 convenient stand-in.
 
+**And check the PREDICATE before you check the number.** Everything above assumes
+the shipped check is correct and only the seed is in question. A goal that
+commissions a ratchet usually names its check in prose, and that phrasing has
+typically never been executed — it was written to describe the defect, not to
+bound a population. Measured g-115-9541: the goal prescribed "grep for
+BASH_SOURCE or `rev-parse --show-toplevel` under the world scripts dir", which
+matches **174 files** on the live corpus, because nearly every script
+legitimately uses BASH_SOURCE to locate ITSELF. Seeding that faithfully would
+have shipped a permanently-red check (`guard-329`, `guard-574`) whose first
+honest reading is "everything is broken". The narrowed four-condition predicate
+that shipped reports 8. One `--list` run against the real corpus separates a
+wrong number from a wrong question (`guard-5994`).
+
 ## Schema
 
 ```yaml
@@ -93,6 +106,8 @@ pattern-signatures, and the knowledge tree. Baseline seeded 2026-04-23 at 0.
 - Baselining a ratio or continuous metric (wrong tool — use a gate)
 - Seeding from an exploratory measurement instead of the shipped predicate's own
   output (see § Seeding — a narrower stand-in seeds GREEN and hides the drift)
+- Seeding a predicate the commissioning goal NAMED but nobody RAN — that is a
+  wrong question, not a wrong number, and it ships permanently red (`guard-5994`)
 - Letting the baseline grow on regression (defeats the ratchet)
 - Keeping unbounded history (current cap: 50 entries, enforced by writer)
 - Using this file as a dashboard replacement (it's a guard, not a feed)

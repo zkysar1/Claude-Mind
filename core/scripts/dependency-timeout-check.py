@@ -205,22 +205,69 @@ def _read_goal_index() -> dict:
     return index
 
 
+UNMEASURED_KEY = "_unmeasured_reason"
+
+
 def _read_blocked() -> dict:
-    """goal-selector blocked view. Returns {} on any failure (fail-open)."""
+    """goal-selector blocked view. Returns {} on any failure (fail-open).
+
+    On failure the returned dict carries UNMEASURED_KEY -> a short reason
+    string. Callers that care read it via `_blocked_unmeasured(view)`; callers
+    that do not are unaffected, because the key is internal (same convention as
+    the `_source` / `_archived` keys this module already stamps on goal dicts)
+    and `.get("blocked_goals")` still yields nothing.
+
+    THE RETURN TYPE IS DELIBERATELY STILL A dict. The first version of this fix
+    returned a (view, reason) TUPLE, which is a cleaner signature and broke NINE
+    existing tests across two files — every one of them patches this function
+    with a plain `lambda: {"blocked_goals": [...]}`, and a signature change makes
+    each of those a silent wrong-shape. The internal key carries the same
+    information at zero cost to the contract: a patched plain dict simply has no
+    such key and is correctly read as MEASURED.
+
+    WHY THE SECOND ELEMENT EXISTS (g-115-9447). This returned a bare {} on any
+    failure, which the caller could not tell from a genuinely empty blocked
+    view, so the run emitted `scanned: 0, eligible: 0` identically whether the
+    sweep saw nothing or saw NOTHING AT ALL. That is guard-2298's class — an
+    except-branch converting a failure into a confident zero — and it lands on
+    the always-run tier, whose signal is not optional precisely because this is
+    the fleet's only automated path from a stale dependency to a human.
+    Measured by foxtrot on LAPTOP-3IOFCNEO 2026-09-09: the inner goal-selector
+    call timed out at 180s and the lane reported scanned:0/eligible:0, while a
+    run ~40 minutes earlier on the same box reported scanned:12. The coverage is
+    nondeterministic and the zero is not a result.
+
+    THE FAIL-OPEN BEHAVIOUR IS DELIBERATE AND UNCHANGED — an unreadable view
+    must not stop the sweep. What changes is only that it can no longer RENDER
+    as a clean measurement.
+    """
     try:
         proc = subprocess.run(
             bash_cmd(SCRIPT_DIR / "goal-selector.sh", "blocked"),
             capture_output=True, text=True, timeout=180)
         if proc.returncode != 0:
+            reason = "goal-selector blocked rc=%s" % proc.returncode
             sys.stderr.write(
-                "dependency-timeout-check: goal-selector blocked rc=%s — fail-open\n"
-                % proc.returncode)
-            return {}
+                "dependency-timeout-check: %s — fail-open, blocked view UNMEASURED\n"
+                % reason)
+            return {UNMEASURED_KEY: reason}
         return json.loads(proc.stdout)
     except Exception as e:
+        reason = "goal-selector blocked failed (%s)" % e
         sys.stderr.write(
-            "dependency-timeout-check: goal-selector blocked failed (%s) — fail-open\n" % e)
-        return {}
+            "dependency-timeout-check: %s — fail-open, blocked view UNMEASURED\n" % reason)
+        return {UNMEASURED_KEY: reason}
+
+
+def _blocked_unmeasured(view) -> str:
+    """The reason the blocked view could not be read, or None if it was.
+
+    A view that is not a dict is ALSO unmeasured — never assume a shape you did
+    not check just because the common case has it.
+    """
+    if not isinstance(view, dict):
+        return "blocked view is %s, not a dict" % type(view).__name__
+    return view.get(UNMEASURED_KEY)
 
 
 def _window_str(hours: float) -> str:
@@ -705,6 +752,7 @@ def run(args) -> dict:
     self_agent = _resolve_self_agent(args)
 
     blocked = _read_blocked()
+    blocked_unmeasured = _blocked_unmeasured(blocked)
     dep_entries = [e for e in (blocked.get("blocked_goals") or [])
                    if isinstance(e, dict) and e.get("block_reason") == "dependency"]
     index = _read_goal_index()
@@ -714,6 +762,29 @@ def run(args) -> dict:
     stale_dependency = []
     reprobe_suppressed = []
     skipped_cooldown, skipped_young, skipped_no_ts, failed = [], [], [], []
+
+    # WIRE THE UNMEASURED VERDICT TO THE PRODUCTION CONSUMER (,
+    # fresh-eyes-code F-001, msg-20260909-141457-zeta-5899). The summary's
+    # `blocked_view_unmeasured` / `verdict` fields AND main()'s rc=2 are both
+    # INERT at the real caller. precheck-always-run-battery.py classifies a
+    # lane by PARSING STDOUT and never consults rc (it appears only inside an
+    # f-string error message), and this lane's `finds` predicate reads only
+    # ("candidates", "escalated", "needs_user_notification") — none of which a
+    # fail-open populates. Measured via the battery's own _findings_for:
+    # UNMEASURED -> [] and HONEST-EMPTY -> [] (positive control candidates=1
+    # -> ['candidates=1']), i.e. the lane still reported CLEAN while blind,
+    # which is the exact defect  existed to remove. The green suite
+    # missed it because all 85 tests bind at run(), never at the caller
+    # (guard-1943 / rb-5828 — a green suite certifies the FUNCTION, not the
+    # WIRING). `failed` is the ONE field _findings_for reads UNIVERSALLY ("a
+    # lane that recorded its own failures is never clean") and a fail-open IS
+    # a recorded failure, so routing through it needs NO change to the shared
+    # battery and no new bucket type.
+    if blocked_unmeasured:
+        failed.append({
+            "goal_id": None,
+            "detail": "blocked view UNMEASURED: %s" % blocked_unmeasured,
+        })
 
     for entry in dep_entries:
         gid = entry.get("goal_id")
@@ -871,6 +942,14 @@ def run(args) -> dict:
         "threshold_hours": round(threshold, 1),
         "scanned": len(dep_entries),
         "eligible": len(candidates),
+        # . False means the blocked view could not be read, so every
+        # count above is a NON-MEASUREMENT and not a clean sweep. The always-run
+        # battery reports a finding when this key is False (its `finds.false`
+        # tuple, the same mechanism the sibling lane uses for `all_clear`), which
+        # is what stops an unmeasured run rendering as clean on the one tier
+        # whose signal is not optional.
+        "blocked_view_measured": blocked_unmeasured is None,
+        "unmeasured_reason": blocked_unmeasured,
         "candidates": candidates,
         "stale_dependency": stale_dependency,
         "prose_only_dependencies": _prose_only_dependency_census(index),
@@ -898,9 +977,16 @@ def main():
     p.add_argument("--no-board", action="store_true",
                    help="Test-only: skip board-post.sh and pretend it succeeded.")
     args = p.parse_args()
-    json.dump(run(args), sys.stdout, indent=2)
+    result = run(args)
+    json.dump(result, sys.stdout, indent=2)
     sys.stdout.write("\n")
-    return 0
+    # rc=2 is INCONCLUSIVE — never "failed" and never "clean" (the
+    # roblox-classname-check posture, rb-245): the sweep ran, but its blocked
+    # view was unreadable so its counts measure nothing. The always-run battery
+    # ignores rc whenever stdout parses, so this rc exists for the DIRECT
+    # callers — the standalone fallback aspirations-precheck documents, and any
+    # hand run.
+    return 0 if result.get("blocked_view_measured", True) else 2
 
 
 if __name__ == "__main__":
