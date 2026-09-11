@@ -561,7 +561,18 @@ def build_bundle(
         # is the one place it may be used (as an HMAC KEY, never as output). "" when
         # unprovisioned, which suppresses the handle field entirely — see
         # :data:`_GOAL_HANDLE_SECRET_VAR`.
-        goal_handle_secret=env.get(_GOAL_HANDLE_SECRET_VAR, ""),
+        # An empty ENVIRONMENT_ID is as disqualifying as an empty secret. It is a MESSAGE
+        # component of the handle (guard-6312), not a decoration: publishing with it empty
+        # keys every environment's handles on the same empty string, retiring the
+        # no-cross-environment-correlation property goal_handle's own docstring promises —
+        # and it fails OPEN, with nothing logged. Suppressing the SECRET here reuses the
+        # existing fail-closed path (project_goals omits the handle key entirely, leaving
+        # the documented unaddressable-board shape) instead of adding a second one.
+        goal_handle_secret=(
+            env.get(_GOAL_HANDLE_SECRET_VAR, "")
+            if env.get("ENVIRONMENT_ID", "").strip()
+            else ""
+        ),
         environment_id=env.get("ENVIRONMENT_ID", ""),
     )
 
@@ -582,9 +593,11 @@ def resolve_handle(
     (:func:`_build_redactor`), so "resolvable" and "published" are the same set.
 
     Returns ``None`` — never a guess — for an unknown handle, an ambiguous one, a goal
-    that has stopped being exposable, or an unprovisioned secret. The caller MUST treat
-    ``None`` as "do nothing"; there is no partial or best-effort match to fall back to,
-    by design (a near-miss would mutate the wrong member's goal).
+    that has stopped being exposable, an unprovisioned secret, or an unprovisioned
+    ``ENVIRONMENT_ID`` (the last is enforced in :func:`knowledge_projection.goal_handle`,
+    which refuses every message component that is empty — guard-6312). The caller MUST
+    treat ``None`` as "do nothing"; there is no partial or best-effort match to fall back
+    to, by design (a near-miss would mutate the wrong member's goal).
     """
     env = dict(os.environ if env is None else env)
     return resolve_goal_handle(

@@ -145,6 +145,44 @@ count.
 **Safety:** same allowlist as `command_succeeds` (`bash core/scripts/`,
 `bash world/scripts/` prefix only). No field interpolation into the command.
 
+### `after_time`
+
+Passes once `anchor + delay_seconds` is in the past. Registered in
+`PREDICATE_TYPES` since before this section existed and undocumented until
+2026-09-09 (g-115-9468) — an omission with teeth, because the copy-a-date
+anti-pattern below is the shape an author reaches for when nothing tells them
+what this type is *for*.
+
+```yaml
+- type: after_time
+  id: census-window-7d
+  anchor: "2026-09-07T09:57:59"   # ISO 8601; tz-aware is converted to naive local
+  delay_seconds: 604800
+```
+
+Clock-skew grace is applied, so a peer box a few seconds behind does not read
+the window as still open.
+
+**Use it for a WINDOW — an interval that must simply elapse.** Every legitimate
+live use anchors on an event whose timestamp is immutable once it happened: a
+deploy's `LastModified`, a DNS change's `SubmittedAt`, a provisioning
+completion, the start of a soak.
+
+> ⚠ **Never use it to proxy a MUTABLE external state.** The tell is that the
+> anchor is a value *copied out of something that can change*. A copied value
+> has no feedback path to its source, so it drifts silently in **both**
+> directions — stuck long after the source cleared, and open before the source
+> actually permits, which is the fail-dangerous one. Measured on deploy holds,
+> both directions inside three hours (g-115-9468): frozen 25.75h past a release,
+> and would have opened 16h before a re-armed window on a repo that
+> auto-deploys on push. The remedy is always the same shape — a
+> `command_succeeds` predicate that ASKS the live source. For deploy holds
+> specifically that is
+> `bash world/scripts/deploy-hold-check.sh --target-only <target>`; see
+> `world/conventions/deploy-holds.md` § "Waiting on a hold from a goal".
+> An `after_time` anchor is honest only when re-reading its source could not
+> change the answer.
+
 ### `vcs_commits_since`
 
 Passes when a git repo has at least `min_count` commits committed **strictly

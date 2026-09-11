@@ -48,13 +48,18 @@ def _world(tmp_path: Path, tests: dict[str, str] | None = None, hook: str | None
     return world
 
 
-def _run(tmp_path: Path, world: Path, *args: str):
+def _run(tmp_path: Path, world: Path, *args: str, log_dir: Path | None = None):
     env = dict(os.environ)
     env.update({
         "MIND_WORLD": str(world),
         "MIND_META": str(tmp_path / "meta"),
         "MIND_AGENT": "testagent",
         "STORAGE_BACKEND": "local",
+        # A NON-CLEAN run now retains its log (), so every test here
+        # is a potential writer. Point that at THIS test's tmp dir: a gate's own
+        # suite must not leave artifacts in the live tree. Measured before this
+        # pin existed — 7 stray -*.log files in core/logs/.
+        "DOMAIN_SUITE_LOG_DIR": str(log_dir or (tmp_path / "retained")),
     })
     proc = subprocess.run(
         [sys.executable, str(GATE), "--goal", "g-999-01", "--source", "world", *args],
@@ -447,6 +452,60 @@ def test_a_failing_world_runner_hook_seeds_then_refuses_a_new_red(tmp_path):
     assert doc["decision"] == "block"
     assert "tests/test_y.sh" in doc["reason"] and "tests/test_x.sh" not in doc["reason"].split(":")[-1]
     assert any("FAIL tests/test_y.sh" in ln for ln in doc["tail"])
+
+
+# ─── the retained run log () ────────────────────────────────────
+#
+# The gate used to write its run to a mktemp file, read it once, and unlink it in
+# a `finally` — so on a red run the ONLY surviving evidence was `tail`, the last
+# 25 lines. The live domain runner emits one line per unit over ~97 units, so a
+# failure partway through fell outside that window and was destroyed before
+# anyone read the refusal. Measured 2026-09-09 on cc-04: one real red, at
+# [17/93], whose failure text no longer existed. These two tests pin the fix and
+# its control; the control is the load-bearing half, because retaining on EVERY
+# run would trade a lost diagnostic for an unbounded log directory.
+
+_MANY_LINE_HOOK = (
+    "#!/usr/bin/env bash\n"
+    "echo 'EARLY-MARKER-line-1'\n"
+    "for i in $(seq 2 60); do echo \"[$i/60] PASS filler_$i.sh\"; done\n"
+    "echo '[61/61] FAIL tests/test_late.sh (rc=1)'\n"
+    "exit 1\n"
+)
+
+
+def test_a_red_run_retains_its_full_log_and_names_it(tmp_path):
+    log_dir = tmp_path / "retained"
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=_MANY_LINE_HOOK)
+    _run(tmp_path, world, "--since", OLD, log_dir=log_dir)   # seeds the baseline
+    (world / "scripts" / "run-domain-tests.sh").write_text(
+        _MANY_LINE_HOOK.replace("test_late.sh", "test_new_red.sh"), encoding="utf-8")
+    rc, doc, err = _run(tmp_path, world, "--since", OLD, log_dir=log_dir)
+    assert rc == 1 and doc["decision"] == "block"
+
+    retained = Path(doc["log"])
+    assert retained.is_file(), f"the block named a log that does not exist: {doc['log']}"
+    body = retained.read_text(encoding="utf-8")
+
+    # The discriminator: the retained log holds a line the tail CANNOT hold.
+    # Asserting only that the file exists would pass against a file containing
+    # nothing but the same 25 lines, which is the defect wearing a new name.
+    assert "EARLY-MARKER-line-1" in body
+    assert not any("EARLY-MARKER-line-1" in ln for ln in doc["tail"]), \
+        "fixture too small — the marker must fall outside the tail for this to discriminate"
+    assert "[61/61] FAIL tests/test_new_red.sh" in body
+    assert f"FULL RUN LOG (retained): {retained}" in err
+
+
+def test_a_green_run_retains_no_log(tmp_path):
+    # The control. Retention is for runs a human must diagnose; a clean run has
+    # nothing to diagnose and must leave the directory empty.
+    log_dir = tmp_path / "retained"
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST})
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD, log_dir=log_dir)
+    assert rc == 0 and doc["decision"] == "pass"
+    assert doc.get("log") is None
+    assert not log_dir.exists() or not list(log_dir.iterdir())
 
 
 def test_the_runner_is_pinned_to_the_local_backend(tmp_path):

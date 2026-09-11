@@ -585,8 +585,57 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
             # fixed in quiescence-gate.py (see its _GOAL_ID_TAG_RE comment) and
             # already correct in goal-pickup-coordination-check.py — this was the
             # remaining site. guard-1161: keep the digit groups open-ended.
-            _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json 2>/dev/null \
-                | grep -oE 'g-[0-9]+-[0-9]+(-[a-z])?' | head -n1) || _clc_gid=""
+            #
+            # BOX-SCOPED, NOT AGENT-SCOPED (). The field this used to
+            # read — agent_status.<agent>.in_flight — is stamped ONLY by the Body
+            # holding this box's running-session-id (team-state-in-flight.sh is
+            # the writer SSOT; every other Body writes in_flight_bodies.<sid>
+            # instead and skips the agent row loudly). One agent NAME runs on many
+            # machines, so on every worker box that row names the REDUCER's goal on
+            # ANOTHER box — and this gate, whose own rationale is "do not recycle a
+            # HEALTHY daemon mid-goal", a statement about THIS box's work, was
+            # deciding a MACHINE-LOCAL recycle from a FLEET-WIDE claim.
+            # MEASURED cc-09 2026-09-03: a restart after committing 64825ce62 was
+            # refused citing , claimed by alpha on cc-04, while cc-09 had
+            # agent-state IDLE, no running-session-id and exactly one Body.
+            # RE-MEASURED cc-08 2026-09-10 (this fix, uname -r 6.8.0-139-generic):
+            # the pre-fix read returned , held by sid d647fb30 on cc-04 at
+            # status=pending, so claim-liveness returned STALE and --restart exited
+            # 3 with the daemon untouched — while this Body's OWN claim read LIVE.
+            # Same defect class as guard-1460 one layer over: exclusion keyed on the
+            # AGENT NAME when the discriminator is the SID.
+            #
+            # The claim this gate is ABOUT is the INVOKING Body's own ("when the
+            # invoking agent has an in_flight goal"), and a Body runs on exactly one
+            # box, so Body-scoping IS box-scoping and needs no hostname compare.
+            # Read the inverse of the writer's two branches, in the writer's order:
+            #   worker Body  -> in_flight_bodies.<MIND_SID>   (keyed per Body)
+            #   reducer Body -> in_flight                      (only that Body stamps it)
+            # A claim belonging to NEITHER is a peer's and is ignored — no gate,
+            # byte-identical to today's behaviour when the field is null. Fail-open
+            # is unchanged and deliberate. Do NOT widen this back to the agent row
+            # once  makes worker claims genuinely live: that is precisely
+            # what would turn an accident-of-compliance refusal into a PERMANENT one.
+            _clc_gid=""
+            if [ -n "${MIND_SID:-}" ]; then
+                _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight_bodies.${MIND_SID}.goal_id" --json 2>/dev/null \
+                    | grep -oE 'g-[0-9]+-[0-9]+(-[a-z])?' | head -n1) || _clc_gid=""
+            fi
+            if [ -z "$_clc_gid" ]; then
+                # in_flight is the reducer's row, so read it ONLY when the reducer
+                # is THIS box. running-session-id is sync_tier machine_local
+                # (core/config/session-manifest.yaml), so its presence here IS the
+                # locality test — a cross-box reducer leaves no copy behind. When
+                # MIND_SID is unset we cannot key a body row, but a local
+                # running-session-id still proves the agent row is this box's.
+                _clc_rsid_file="$(agent_state_dir "$MIND_AGENT")/running-session-id"
+                _clc_rsid=""
+                [ -f "$_clc_rsid_file" ] && _clc_rsid="$(tr -d '[:space:]' < "$_clc_rsid_file" 2>/dev/null || true)"
+                if [ -n "$_clc_rsid" ] && { [ -z "${MIND_SID:-}" ] || [ "$_clc_rsid" = "$MIND_SID" ]; }; then
+                    _clc_gid=$(bash "$SCRIPT_DIR/team-state-read.sh" --field "agent_status.${MIND_AGENT}.in_flight.goal_id" --json 2>/dev/null \
+                        | grep -oE 'g-[0-9]+-[0-9]+(-[a-z])?' | head -n1) || _clc_gid=""
+                fi
+            fi
             if [ -n "$_clc_gid" ]; then
                 if ! bash "$SCRIPT_DIR/claim-liveness-check.sh" "$_clc_gid"; then
                     _log "REFUSED --restart: claim on in-flight goal $_clc_gid is STALE (superseded/released while executing — guard-1151). The daemon is HEALTHY; a recycle now is the redundant-restart shape. Re-read your goal + the coordination board. Override: MIND_RESTART_FORCE_STALE_CLAIM=1 bash core/scripts/mind-api-start.sh --restart"

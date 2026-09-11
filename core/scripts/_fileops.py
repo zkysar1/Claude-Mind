@@ -14,6 +14,7 @@ Imported by all write scripts to provide:
 
 import fnmatch
 import gzip
+import copy
 import json
 import os
 import random
@@ -2283,6 +2284,99 @@ def log_script_decision(script_name, record):
             release_lock(lock_path)
     except Exception:
         return
+
+
+def locked_modify_json(path, modifier_fn, initial=None):
+    """Atomic read-modify-write on a JSON file. Holds the lock across the
+    ENTIRE cycle, closing the race where two writers read the same baseline
+    and the second clobbers the first.
+
+    The JSON sibling of ``locked_modify_yaml`` / ``locked_modify_jsonl``, and
+    the primitive a **class (b) fence-only** store requires: a stale If-Match
+    fence on such a store is a PERMANENT wedge, not transient contention, so
+    the writer MUST pair ``locked_rmw`` with an in-cycle ``force_fresh`` read
+    (``core/config/conventions/governed-store-write-classes.md``). ``_cycle``
+    below begins with ``get_backend().refresh(path)`` for exactly that reason.
+
+    Added for the close-review verdict ledger (g-357-41 / finding F11), whose
+    writer was a raw ``Path.write_text`` — the call guard-996 names — over a
+    one-object-per-goal key. A re-review therefore ERASED the prior reviewer's
+    verdict with no version check, no merge and no warning, on the
+    REJECT -> rework -> re-review path the gate is built around. Measured
+    2026-09-03: a 9-finding REJECT survived only because it had been
+    hand-archived beforehand.
+
+    Args:
+      path: Path to the JSON file.
+      modifier_fn: Callable accepting the current data and returning the new
+        data to write. May mutate in place and return the same object.
+      initial: Value to use as the starting state when the file does not exist
+        (or is empty). If None and the file is missing, the modifier
+        receives {}.
+
+    Returns:
+      The data written to the file (modifier_fn's return value).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = resolve_base_dir(path)
+    lock_path = path.with_suffix(".lock")
+    acquire_lock(lock_path)
+    try:
+        agent = _agent_name()
+
+        def _cycle():
+            # force-fresh the local cache from the backend BEFORE the in-lock
+            # read, so the cycle sees the latest remote state and a remote-only
+            # file materializes. No-op on LocalBackend.
+            get_backend().refresh(path)
+            data = None
+            if path.exists():
+                read_retries = 5
+                for attempt in range(read_retries):
+                    try:
+                        raw = path.read_text(encoding="utf-8")
+                        data = json.loads(raw) if raw.strip() else None
+                        break
+                    except (PermissionError, OSError) as e:
+                        if attempt == read_retries - 1:
+                            raise
+                        wait = 0.05 * (2 ** attempt) + random.uniform(0, 0.1)
+                        print(f"locked_modify_json read-retry {attempt+1}/"
+                              f"{read_retries}: {e} (waiting {wait:.2f}s)",
+                              file=sys.stderr)
+                        time.sleep(wait)
+                # An empty or whitespace-only file yields None above; treat it
+                # as absent rather than handing None to modifier_fn.
+                if data is None:
+                    data = copy.deepcopy(initial) if initial is not None else {}
+            else:
+                data = copy.deepcopy(initial) if initial is not None else {}
+
+            new_data = modifier_fn(data)
+            if new_data is None:
+                new_data = data
+
+            _validate_no_surrogates(new_data, path)
+
+            if base_dir:
+                save_history(path, base_dir, agent)
+
+            def _write(handle):
+                json.dump(new_data, handle, indent=2, sort_keys=True,
+                          ensure_ascii=True)
+                handle.write("\n")
+            _atomic_write_with_fallback(
+                path, _write, fallback_counter_key="locked_modify_json")
+            return new_data
+
+        new_data = _rmw_with_conflict_retry(path, _cycle)
+
+        if base_dir:
+            append_changelog(base_dir, agent, path, "edit")
+        return new_data
+    finally:
+        release_lock(lock_path)
 
 
 def locked_write_yaml(path, data):

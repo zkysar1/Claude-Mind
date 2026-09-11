@@ -106,6 +106,20 @@ reproducing Phases 3.9–4.5.
 ## The loop
 
 ```
+# Phase -0-stop: USER STOP STANDS DOWN — FIRST, before role, closure and the
+# park orbit (g-115-9461). A worker /stop arms sessions/<SID>/stop-requested;
+# nothing on the RE-ENTRY path read it, so an armed wakeup resumed a stopped
+# Body. Incident, measurements, and why park-due needs no second copy:
+# core/config/rationale/worker-stop-standdown.md
+Bash: test -n "$MIND_SID" && test -f "agents/$MIND_AGENT/sessions/$MIND_SID/stop-requested" && echo "user-stop" || echo "no-stop-or-unreadable:sid=${MIND_SID:-EMPTY}"
+IF `user-stop`: END THE TURN on a Bash echo naming the file read. Do NOT re-arm
+  the net, do NOT poll, do NOT SELECT, do NOT run a work unit. stop-hook.sh:387
+  ALLOWs it (gate=worker-net-stop-requested-session), so it is not trapped.
+IF `no-stop-or-unreadable`: continue below — but `sid=EMPTY` means the predicate
+  COULD NOT EVALUATE, not that no stop exists (guard-6178); the two labels differ
+  so an un-evaluatable check can never read as an all-clear. Continuing is still
+  right (CLOSED-SET: an unrecognised state resolves toward RUNNING).
+
 # Phase -0: confirm this Body is a worker, not the reducer — AND still OPEN.
 # A worker has a forked body-WM-file (sessions/<unitKey>/working-memory.yaml);
 # the reducer does not (it stays on the agent-wide WM). If this Body has no
@@ -473,7 +487,8 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 
 # Phase 1 — SELECT (reuse the existing scorer; a worker selects like the reducer)
 Bash: goal-selector.sh
-Pick the top eligible unclaimed goal (drop any goal a partner is in_flight on).
+Pick the top eligible unclaimed goal; drop any in a partner's in_flight OR
+in_flight_bodies — a WORKER partner is in the LATTER ONLY (g-306-276).
 #
 # ROLE + SKILL ELIGIBILITY (g-115-5664, g-306-440). "Eligible" includes the
 # goal's ROLE and its SKILL, and the scorer knows neither. Four measured

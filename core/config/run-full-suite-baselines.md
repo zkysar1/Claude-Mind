@@ -1197,4 +1197,133 @@ live-daemon box guard-5866 wins and guard-4774's remedy clause does not apply.
 
 ---
 
-**2026-09-03 (g-115-8738 — the worktree route DISTURBS the shared daemon; bravo cc-05 control + zeta cc-02 mechanism).** A pinned-worktree full-suite run (zeta, during g-115-8638) killed the live fleet daemon 3x (03:19:52 / 03:25:03 / 03:31:26, ~chunk boundaries) and threw 12 stale-port ERRORS in chunk 02. **Pre-registered one-variable control (bravo, cc-05, 04:00):** the SAME suite in the MAIN REPO — same commit/runner/4-chunk-split/box/live-daemon — killed the daemon **0x** and threw **0 errors**. Exact contrast: worktree chunk 02 `5617p/5f/12E` vs main-repo chunk 02 `5631p/5f/0E`. The worktree is the measured differentiator for BOTH symptoms, predicted in advance not fitted after. **Kill mechanism (zeta, CODE-confirmed, not real-time-traced):** `mind-api-start.sh:303 _sweep_orphan_daemons` matches `mind_api.src` processes purely by COMMAND LINE (`pgrep -f 'python.* -m mind_api\.src'` POSIX / `CommandLine -match 'mind_api\.src'` Windows) with NO runtime-dir/cwd filter, killing any PID not in the current spawn's {child,parent} pair (empty keep-args = "kill them all"). A worktree daemon spawn therefore reaps the live fleet daemon in any directory — so item 3's leading hypothesis is confirmed at the code path, though the kill itself was not caught in a live trace. **Stale-port half (measured):** the copied `daemon.port` is a one-time snapshot (guard-5702); when the live daemon recycles, the port changes and nothing refreshes the copy → probes hit an empty port → in-pytest spawn refusal (the 12 errors). **RECONCILES the alpha entry directly above** (which recommended the worktree-with-`daemon.port` route to avoid a *bare-solo-rerun* spawn storm): that remedy holds only while the copied port stays fresh — once it goes stale the worktree spawns its own daemon and the orphan sweep kills the live one. Neither non-main-repo route is safe on a live-daemon box. **REMEDY:** the daemon-safe MAIN-REPO route (`STORAGE_BACKEND=local`, chunked, `-m 'not daemon_integration'`) spawns no daemon, so it neither hijacks nor kills the live one — bravo's control IS that route. Behavioral rail: **guard-5866**. Bonus (bravo): failure COUNTS were identical across both environments (chunk 00: 5/5, 01: 14/14, 02: 5/5) — those 24 failures are environment-independent; only the 12 ERRORS were worktree artifacts, so a reader who dismissed the whole run as "worktree noise" would have discarded 24 real signals.
+**2026-09-03 (g-115-8738 — the worktree route DISTURBS the shared daemon; bravo cc-05 control + zeta cc-02 mechanism).** A pinned-worktree full-suite run (zeta, during g-115-8638) killed the live fleet daemon 3x (03:19:52 / 03:25:03 / 03:31:26, ~chunk boundaries) and threw 12 stale-port ERRORS in chunk 02. **Pre-registered one-variable control (bravo, cc-05, 04:00):** the SAME suite in the MAIN REPO — same commit/runner/4-chunk-split/box/live-daemon — killed the daemon **0x** and threw **0 errors**. Exact contrast: worktree chunk 02 `5617p/5f/12E` vs main-repo chunk 02 `5631p/5f/0E`. The worktree is the measured differentiator for BOTH symptoms, predicted in advance not fitted after. **Kill mechanism (zeta, CODE-confirmed, not real-time-traced):** `mind-api-start.sh:303 _sweep_orphan_daemons` matches `mind_api.src` processes purely by COMMAND LINE (`pgrep -f 'python.* -m mind_api\.src'` POSIX / `CommandLine -match 'mind_api\.src'` Windows) with NO runtime-dir/cwd filter, killing any PID not in the current spawn's {child,parent} pair (empty keep-args = "kill them all"). A worktree daemon spawn therefore reaps the live fleet daemon in any directory — so item 3's leading hypothesis is confirmed at the code path, though the kill itself was not caught in a live trace. **[CORRECTED 2026-09-10 (echo, cc-03, g-115-9602): this attribution is FALSIFIED. `_sweep_orphan_daemons` has had ZERO executable call sites since 8ef51809b8 (2026-05-22, g-115-764) — 104 days BEFORE this entry — and the refusal is pinned green by `test_daemon_pinned_port_wedge.py`; `rt_sweep_orphan_daemons` has none either; and `mind_api/state/` is gitignored in full, so a worktree inherits no PID files for `_force_kill_tree` to use. The code read was of a function nothing calls — which is exactly how 'CODE-confirmed, not real-time-traced' fails. The MEASURED kills and the pre-registered control above are UNTOUCHED; only the attribution falls. Which process kills is UNKNOWN — capture it AT KILL TIME on the next reproduction. Behavioral rail is now guard-6394.]** **Stale-port half (measured):** the copied `daemon.port` is a one-time snapshot (guard-5702); when the live daemon recycles, the port changes and nothing refreshes the copy → probes hit an empty port → in-pytest spawn refusal (the 12 errors). **RECONCILES the alpha entry directly above** (which recommended the worktree-with-`daemon.port` route to avoid a *bare-solo-rerun* spawn storm): that remedy holds only while the copied port stays fresh — once it goes stale the worktree spawns its own daemon and the orphan sweep kills the live one. Neither non-main-repo route is safe on a live-daemon box. **REMEDY:** the daemon-safe MAIN-REPO route (`STORAGE_BACKEND=local`, chunked, `-m 'not daemon_integration'`) spawns no daemon, so it neither hijacks nor kills the live one — bravo's control IS that route. Behavioral rail: **guard-5866**. Bonus (bravo): failure COUNTS were identical across both environments (chunk 00: 5/5, 01: 14/14, 02: 5/5) — those 24 failures are environment-independent; only the 12 ERRORS were worktree artifacts, so a reader who dismissed the whole run as "worktree noise" would have discarded 24 real signals.
+
+---
+
+### 2026-09-08T22:57 — zeta, `hostname` cc-02, `uname -r` 6.8.0-138-generic, own-cloud, live fleet, LIVE DAEMON + LIVE REDUCER (same sid), chunk rung 4, HEAD 64ebabd346 (pre-change baseline for g-369-194)
+
+`TOTAL: 22355 passed, 62 failed, 0 errors` / `VERDICT: GENUINE failures -- trustworthy, act on them`. `--triage`:
+**1 environmental | 22 genuine-owned | 0 genuine-UNOWNED**. Wall clock **47.5 min** (22:57:53Z `chunk-00.args` →
+23:45:27Z `halves.jsonl`); log dir `/tmp/ayoai-suite-run-zeta`, i.e. the env vars arrived.
+
+**THIS ROW EXISTS FOR ONE REASON: it is the first entry that measures the HEAD-STILL WINDOW ALONGSIDE the run
+duration, and that pairing — not the daemon/reducer predicate — is what decides whether a verdict is valid.**
+
+`guard-6242` (bravo, 2026-09-07, from cc-05) states that on a box with BOTH a live `mind_api` daemon AND a live
+reducer loop the full suite "CANNOT produce a valid verdict", because the reducer's own turn-end `iteration-push`
+moves HEAD under the same `MIND_SID` and `run-full-suite` voids a run whose tree moved. Both halves of that
+predicate held on cc-02 during this run — `daemon.port` present (19002), `running-session-id == MIND_SID` — and the
+run still produced a usable, triage-confirmed GENUINE verdict.
+
+The mechanism is not wrong; the DURATION premise is. Measured on this box the same night
+(`git reflog --date=unix -40 --format='%cd'`, which is guard-6242's own `action_hint`): 40 moves over 12 h, **median
+inter-move gap 668 s (11.1 min)**, p90 2686 s, max 4399 s (1.22 h), **0 of 39 gaps ≥ 3 h** — essentially bravo's cc-05
+profile (median 443 s / 7.4 min, 0/39 ≥ 3 h) reproduced on a third box. What differs is that guard-6242 assumes the
+run "needs 3-5h". At `--chunks 4` it needed **47.5 minutes**, and it landed inside a single **3322 s (55.4 min)**
+still-window: **ZERO reflog moves strictly inside 22:57:53Z–23:45:27Z**, nearest move 11 s BEFORE the start and 457 s
+AFTER the end. So the verdict was valid because the tree provably did not move — verified, not assumed, and worth
+verifying before leaning on any GENUINE from a busy box.
+
+**Operative predicate: `run duration > HEAD-still window`, not `live daemon + live reducer`.** Note this does NOT
+invert the decision on cc-02 — 11.1 min median < 47.5 min run, so guard-6242's own hint still says DO NOT LAUNCH here,
+and a fresh launch is a gamble that happened to pay off once. It makes the call a COMPARISON rather than a foregone
+conclusion, and the comparison needs YOUR chunk rung: the 3-5 h figure appears to come from a 16-chunk rung, and rung
+4 on this corpus is ~6x faster. **Measure your own duration before quoting anyone's.**
+
+Cost of the overstated reading, recorded because it was paid: two agents (bravo cc-05, alpha cc-04) deferred
+g-369-194 to a scarce owner-committed quiet window on this predicate. Each correctly probed the predicate on their own
+box; neither ran the `action_hint`. The goal closed opportunistically mid-loop in ~20 min using guard-6242's own
+prescribed alternative — a scoped set over every consumer of the changed module (201 tests, rc=0), with
+`git rev-parse HEAD` captured either side and unchanged. guard-6242's `action_hint` now carries this correction
+(its `rule` is immutable by design); see also rb-10448 and guard-6327.
+
+### 2026-09-09T02:23 — alpha (assistant-mode chat, loop IDLE), `hostname` cc-07, `uname -r` 6.8.0-138-generic, STORAGE_BACKEND=local pin, live fleet (5 agent dirs), LIVE DAEMON on the box, MAIN REPO, `nohup env MIND_AGENT=alpha MIND_SID=<sid> …` launch (log dir `ayoai-suite-run-alpha` — the vars arrived), runner-default 4 chunks, for the g-372-01 closure (commit 2459d47107)
+
+`TOTAL: 22365 passed, 55 failed, 0 errors` / `VERDICT: GENUINE`. Per chunk 00–03: 7 / 14 / 31 / 3 failed, ~7.5 min each. Invisible half 131/132 (the one red, `test_aspirations_update_goal_source_value.sh`, re-ran solo 6/6 green); domain half 89/89, 1 skipped.
+`--triage` (run after committing a leftover store append, tree clean): **1 environmental | 19 genuine-owned | 0 genuine-UNOWNED — nothing to file.** Every red is pre-owned (the g-115-8698 batch, g-115-6760 for the 22 `test_promote.py`, g-115-9296, g-115-7127, g-115-6967, g-115-8300); the environmental one was `test_learning_routing_world_scope.py` (3/3 solo). Two readings worth keeping: (1) the chunked run printed `[promote] ERROR: working tree is dirty` 21× while `agents/alpha/aspirations.jsonl` was modified, yet `test_promote.py` still failed 22 solo on the CLEAN tree — the dirty tree was incidental, not the cause; do not stop at the first cause a log names. (2) Zero failures in the owncloud / liveness / lease / storage-backend families, which is what this run existed to establish. Wall clock: chunked half 02:23 → ~03:03, invisible + domain halves to 03:11, triage 03:11 → 03:14.
+
+## Chunk-09 GENUINE-but-false signature (folded from `.claude/rules/run-full-suite-after-deep-code.md` 2026-09-10, g-115-9602)
+
+Four dated per-box reproduction blocks of ONE incident, moved here verbatim when its root cause closed (g-115-5651 — the memoized `_ACTIVE_BACKEND` poisoning; reset fixture landed in both conftests). The rule keeps the METHOD; this ledger keeps the EVIDENCE. A FRESH occurrence is a REGRESSION: re-run solo and file a NEW goal.
+
+REPRODUCED ON A SECOND BOX, and the chunk INDEX repeated — 2026-08-15 (echo,
+`hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud, live fleet, 16
+chunks): `TOTAL: 13016 passed, 29 failed, 0 errors` / `VERDICT: GENUINE`, with
+all 29 in **chunk 09** and chunks 10–15 clean after it. Three files
+(`test_pipeline_tombstone_archival` 15, `test_pipeline_provenance_stamps` 8,
+`test_pending_questions_close` 6), **44/44 green solo** in 0.12s. So the
+false-GENUINE call is not one box's quirk, and 29 is twice the count that fooled
+a reader last time — do not treat a bigger number as more credible. Two things
+this adds. The `rc=4` tell above did NOT apply here (these are ordinary
+assertions, not a bare process rc), so a single tell is not a filter: the
+CHUNK-CONFINEMENT tell carried it alone. And chunk 09 landing twice out of two
+is worth noting rather than explaining — with `--chunks 16` the same index is a
+similar slice of a sorted file list, so a chunk-local resource collision is a
+better first hypothesis than progressive exhaustion, which would load the TAIL.
+Do not infer a cause from n=2; do check chunk 09 first.
+
+**FOURTH OCCURRENCE, and the chunk-local-collision hypothesis directly above is
+now FALSIFIED — stop reaching for it** (2026-08-17, alpha, `hostname` cc-04,
+`uname -r` 6.8.0-137-generic, own-cloud, live fleet, 16 chunks): `TOTAL: 13800
+passed, 29 failed, 0 errors` / `VERDICT: GENUINE`, all 29 in **chunk 09**, the
+same three files at the same **15 / 8 / 6**, chunks 10–15 clean, 44/44 green
+solo. Four boxes now, byte-identical counts — the signature is stable enough to
+recognise on sight, which is exactly why the tempting inference needs killing.
+
+The advice "check chunk 09 first" is GOOD and I followed it. What it does not
+license is the chunk-local reading. Reconstructed chunk 09's exact 59-file list
+from the runner's own `_chunk()` and re-ran it **in the same order, same
+process, same pin: 0 failures.** Two narrower controls also passed
+(`test_owncloud_backend.py` first, then all 14 `owncloud` files first — the
+obvious poisoner, since sorted order does put them immediately before the
+failing `test_p*` files). So the collision is NOT reproducible from the chunk's
+file set, which means it is not a property of the chunk, the ordering, or the
+index. **Chunk 09 recurring across boxes is the alphabet, not the cause** — it
+is simply where the handful of tmp-world-plus-lock tests sort to.
+
+**CAUSE FOUND AND FIXED (g-115-5651, 2026-08-19).** `ValueError: <tmp>/world/pipeline.lock
+is not under any configured root` meant `get_backend()`'s process-wide `_ACTIVE_BACKEND`
+had frozen an EARLIER test's tmp-world root map into the cached instance — conftest
+restored the env VAR, not the derived object. The fixture now resets it —
+mutation-proved, and all three victims ran together cleanly: the trio is
+verified, not inferred.
+Reproducing needs FOUR conditions, not two: cache empty, `own-cloud` in-process,
+`MIND_WORLD`/`MIND_META` SET (else `from_env()` raises and nothing caches), and a
+later test on a DIFFERENT tmp world — why ordered chunk replays and solo re-runs
+read green against a live defect.
+
+THIRD BOX, and the three files reproduce with IDENTICAL counts — 2026-08-16
+(alpha WORKER Body, `hostname` cc-08, `uname -r` 6.8.0-137-generic, own-cloud,
+live fleet, 16 chunks, logs via `--out` outside the synced tree): `TOTAL: 13190
+passed, 59 failed, 0 errors` / `VERDICT: GENUINE`, chunk 09 carrying **33 of
+59**. The same three files came back in the same sizes as the cc-03 row above —
+`test_pipeline_tombstone_archival` 15, `test_pipeline_provenance_stamps` 8,
+`test_pending_questions_close` 6 — and all three were **green solo** (21/15/8).
+An exact count-for-count reproduction across three boxes makes this a stable
+signature you can recognise on sight, not a coincidence to re-derive each time.
+
+Two refinements, both of which cut against reading chunk 09 as the whole story.
+**Failures were NOT chunk-confined here**: 02(2) 03(1) 08(7) 09(33) 11(3)
+13(13), with 10/12/14/15 clean after the peak. So the chunk-confinement tell
+that carried the cc-03 call alone would have UNDER-fired here — a spread
+distribution does not exonerate a run, and chunk 09 dominating inside a spread
+is still the tell. And the split was genuinely mixed: `--triage` returned **4
+environmental | 6 genuine-owned | 0 genuine-unowned**, so 30 of the 59 were real
+reds that simply already had owners. Do not let a confirmed-environmental
+majority talk you out of triaging the rest; run `--triage` and let it separate
+them rather than judging the whole run by its largest cluster.
+
+### 2026-09-10T14:48 — bravo (assistant-mode chat, loop IDLE, NO reducer and NO worker Body on the box), `hostname` cc-13, `uname -r` 6.8.0-139-generic, 20 cores / 4 GB RAM, STORAGE_BACKEND=local pin, LIVE DAEMON, MAIN REPO, `nohup env MIND_AGENT=bravo MIND_SID=<sid> …` launch (log dir `ayoai-suite-run-bravo` — the vars arrived), runner-default 4 chunks, HEAD f5965d6625 (= origin/main: 9746b4d1c9 cold-snapshot storage-backend change for g-372-13, echo's fast tier d2a56feb0a / 044a959ddd / 585c2af134 landed via g-115-9620, and 4238c46598 for g-115-8820)
+
+`TOTAL: 22456 passed, 59 failed, 0 errors` / `VERDICT: GENUINE failures -- trustworthy, act on them`. Per chunk 00–03: 8 / 14 / 32 / 5 failed. Wall clock 14:48:39Z → 15:23:37Z = **35 min chunked** (chunks 7.5 / 4.3 / 5.3 / **17.8** min — chunk 03 carries mind_api/tests, which sorts last), invisible half 132/132 (~5 min), domain half 96/96 + 1 skipped, **47 min total**, runner rc=1 (framework half). Tree provably still: this session was the only committer on the box and made no commit between launch and exit; the only dirt at exit was `agents/alpha/aspirations.jsonl` (own-cloud mirror churn at 15:32Z, restored with `git checkout --`). No HEAD-still window to compare against — there is no loop on this box, which is the point of running it here.
+
+`--triage` (2.5 min): **1 environmental | 22 genuine-owned | 0 genuine-UNOWNED — read the next paragraph before believing that zero.** Environmental: `test_learning_routing_world_scope.py` (3/3 solo; the same file cc-07 09-09 classified the same way). Owned: g-115-6760 `test_promote.py` 22, g-115-9181 `test_iteration_close_quality_flag_carry.py` 9, and the g-115-8698 / g-115-9296 / g-115-6805 / g-115-8624 / g-115-8004 / g-115-6967 / g-115-8300 / g-115-8407 / g-115-8544 set.
+
+TWO REDS THE OWNERSHIP PROBE MIS-CLASSIFIED AS OWNED — the g-115-9425 defect class in the OTHER direction, over-matching on a subsystem word ('release', 'promotion') and counting 79 WEAK hits as ownership:
+1. `test_release.py` (3, the Section-8 ledger tests) + `test_release_atomicity.py` (2, same fixture) = 5 reds with 79 weak owners and no real one. Root cause measured with `--basetemp`: the fixture repo's only dirt was `?? core/scripts/.platform-memo.sh` — `_paths.sh` writes its platform memo beside itself on first source since fe4df6c6fe (2026-09-06), the fixture's `.gitignore` predates it, and release.sh Step 1 refuses "working tree is dirty". Red on every Linux run since 09-06 and invisible under weak ownership (cc-07 09-09's "0 unowned" included them). FIXED in the fixture — one `.gitignore` line, commit 2a5c43786c: both files green solo, 0 FAILED.
+2. `test_reducer_promotion.py::test_shipped_config_is_default_off` (1): the shipped `reducer_promotion` block has listed 9 eligible machines since 2fe2da761a0 (2026-09-06 owner-proxy decision) while the test pins `()`; `enabled: false` and `fence_verified_at: null` still hold, so the kill switch is off and only the pin is stale. OWNED by g-306-294 — alpha recorded exactly this there on 2026-09-07 ([appended:alpha-occ182-pin-stale-20260907]); the probe missed it because that goal never names the test file.
+
+Honest split: **1 environmental | 23 genuine-owned (22 by probe + g-306-294 by hand) | 5 fixture-defect, fixed | 0 unowned**. No failure traces to cold_snapshot.py, owncloud_backend.py, cold-snapshot-tick.py, run-scoped-suite.* or the g-115-8820 evolution files (test_cold_snapshot*, test_owncloud_endpoint_override, test_run_scoped_suite all green in-suite; no test_evolution* in the failed set). DISCHARGES: the g-372-13 full-suite obligation (storage-backend change = FULL-REQUIRED under the two-tier rule), the g-115-9620 obligation for the fast-tier commits, and g-115-8820.
+
+For the owner's "four hours" question: this is the third Linux rung-4 run in three days inside 36–48 min on ~4 GB boxes (cc-02 47.5, cc-07 ~30 + halves, cc-13 47 total). The 3–5 h figure is the Windows rung-16 form. Chunk 03's 17.8 min is mind_api/tests (daemon HTTP), not file count (360 files, 5724 passed); the other three chunks average 5.7 min. Concurrent chunks (g-115-9624) would bound the chunked half by chunk 03 alone, ~18 min.

@@ -25,8 +25,10 @@ prior fires (N=44/45/47) each booked it as robustness and none re-examined it. T
 valid form: hold every other axis at a value that CANNOT produce the verdict, then
 sweep, and report the neutralized flip point rather than the constancy. On this
 helper those boundaries are `drift` flips at **0.40** with `confirming = 1.00`, and
-`confirming` flips to `no_change` where **`N·(1−confirming) < 2.0`** with
-`drift = 0.05` — an inequality in `N`, NOT a fixed fraction.
+`confirming` flips to `no_change` where **`N − confirming_count < 2`** with
+`drift = 0.05` — an inequality in `N`, NOT a fixed fraction. (That subtraction was
+a float product `N·(1−confirming)` until g-115-9566; see "The arithmetic went
+integer" below for what moved and what did not.)
 
 ⚠ This line read "`confirming` flips to `no_change` at **0.75**" until 2026-09-01
 (echo, N=120, `hostname` cc-03, `uname -r` 6.8.0-137-generic). 0.75 is only that
@@ -90,13 +92,21 @@ The `confirming_signal_fraction` spec declares `pq_signals + board_signals`
 > `net_divergent = N − confirming_count >= N − B = P`, for **every** possible
 > classification of **every** belief.
 
-The helper fires `act_later` at `net >= 2.0`. So `P >= 3` forces `act_later`
+The helper fires `act_later` at `net >= 2`. So `P >= 2` forces `act_later`
 before a single belief is read, and `P <= 1` is the only regime where Phase 2.6b
 decides anything (and then only while `drift < 0.40`, which is independently
 sufficient). Verified across the full `(P, B)` grid at max-honest
 `confirming = B/N` with drift neutralized: `P=0,1` → `no_change` at every `B`;
-`P=2,3` → `act_later`, with one boundary cell (below). This **supersedes** the
-single-instance form N=56 recorded ("`no_change` was unreachable this fire").
+`P=2,3` → `act_later`. This **supersedes** the single-instance form N=56
+recorded ("`no_change` was unreachable this fire").
+
+⚠ **This section read `P >= 3` forces, with `P == 2` as "one boundary cell",
+until 2026-09-10 (g-115-9566).** The cell existed only because the float product
+put `net` at EXACTLY 2.0 there, so typed precision decided it — the knife-edge
+the section below documents. With an integer bar, `confirming_count <= B` gives
+`net = N − confirming_count >= P` exactly, and `P == 2` fires like any other
+value. The derivation was always stated in COUNT space; only the implementation
+was not, which is why it and the float path disagreed at this one cell.
 
 This is a **recipe** constraint, not a helper bug — the helper accepts
 `confirming = 1.00` happily; the never-confirming rule is what makes `net >= P`
@@ -108,7 +118,49 @@ supersede-not-grow) while `P >= 2` is the ordinary case, since board counts
 own-authored ritual output and pq counts any own-scope decision in 30d. The step
 is usually inert, not usually decisive.
 
-## Why the printed `net` cannot be quoted as a margin
+## The arithmetic went integer (g-115-9566, 2026-09-10)
+
+Measured alpha, `hostname` cc-10, `uname -r` Linux 6.8.0-139-generic.
+
+The two sections below this one describe a helper that no longer exists, and
+they are kept because their measurements are what motivated the change. **Read
+them as history, not as current behaviour** — a citation of either that does not
+carry this paragraph is now wrong.
+
+`confirming_signal_fraction` is a LOSSY ENCODING OF A COUNT. Every caller
+computes it as `confirming_beliefs / self_evolution_signals_count`, i.e. divides
+two integers, and the helper then multiplied it back out in floating point and
+compared against `2.0`. At `net == 2` that round trip put the verdict at the
+mercy of typed decimal precision. The helper now accepts
+`confirming_signal_count` directly and, when only the fraction is given,
+recovers the numerator by **half-up rounding** (`floor(N·f + 0.5)`, clamped to
+`[0, N]`), so the gate is `N − confirming_count >= 2` between two integers.
+
+Three consequences, all measured against the live helper:
+
+1. **The knife-edge is gone.** The four spellings of 4/6 in the next section
+   (`0.6666` / `0.6667` / `0.666667` / `0.6666666666666666`) now ALL return
+   `act_later`. They also now agree with the `P >= 2` derivation above, which
+   the float path had been quietly contradicting: `P = 2` forces `act_later` for
+   every classification of every belief, yet two of those four spellings
+   returned `no_change`.
+2. **The flip in FRACTION space moved from `1 − 2.0/N` to `1 − 1.5/N`** — 0.625
+   at `N=4` (measured: 0.62 → `act_later`, 0.625 → `no_change`), 0.50 at `N=3`
+   (0.49 → `act_later`, 0.50 → `no_change`). `guard-3311` carries the old
+   formula and its `rule` is immutable; the superseding record is `guard-6428`.
+   The move is confined to fractions that name no whole number of signals: for
+   every `k/n` a real caller can emit, half-up returns `k` exactly, pinned over
+   `n = 1..12, k = 0..n` by `test_exact_integer_ratio_recovers_its_own_numerator`.
+3. **Half-up is the documented tie-break, and it is chosen over `ceil` on
+   robustness grounds.** `ceil` would have preserved the old boundary exactly,
+   but `ceil` is sensitive to the ±1e-16 error in the very ratios callers emit
+   (`49 · (7/49)` evaluates to `7.000000000000001`, which `ceil`s to 8 and
+   invents a confirming signal). Half-up tolerates that error by half a signal
+   in both directions, which is the whole point of the change.
+
+Emit `confirming_signal_count` and none of this applies to you.
+
+## Why the printed `net` cannot be quoted as a margin (HISTORICAL — pre-g-115-9566)
 
 **`P == 2` is a knife-edge: `net` is then EXACTLY 2.0, so the verdict is decided
 by the decimal precision you type.** Measured at `P=2, B=4, N=6`, the same true
@@ -144,6 +196,11 @@ you is that the margin was ±0.05 rather than exact.
 
 ## Why the `confirming` boundary is an inequality, not a fraction
 
+The inequality survives g-115-9566; only its float form does not. Current form:
+`N − confirming_count >= 2`, i.e. `1 − 1.5/N` in fraction space. The measurement
+below is the pre-change float form, retained because it is what established that
+the boundary depends on `N` at all.
+
 Same run as the rounding measurement: at `N = 4` the flip is at
 `confirming > 0.50` (4·0.50 = 2.0 fires, 4·0.49 = 1.96 does not), which is
 `N·(1−confirming) < 2.0` and neither 0.75 nor 5/7. At `N = 7`, `confirming` flips
@@ -160,5 +217,9 @@ depends on `N`, so quote it as that inequality rather than as a fixed fraction.
   operative half of each finding stays inline in Phase 5.5 rather than living
   only in its guardrail)
 - guard-1421 / guard-2043 — read beliefs to full length when acting on content
+- guard-3311 — the pre-g-115-9566 flip formula `1 − 2.0/N`; superseded by
+  guard-6428 (`1 − 1.5/N`, or just pass `confirming_signal_count`)
 - `.claude/skills/fresh-eyes-review/SKILL.md` Phase 5.5 — consumer
+- `.claude/skills/fresh-eyes-program/SKILL.md` Phase 5 — second consumer
 - `core/scripts/self-assess-and-decide.sh` — the helper these axes describe
+- `core/scripts/tests/test_self_assess_and_decide.py` — the boundary pins

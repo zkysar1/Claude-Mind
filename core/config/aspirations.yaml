@@ -428,7 +428,15 @@ anticipatory_reflection:
 # forces callers onto --override and manufactures false ledger records (guard-1532).
 close_review_gate:
   # Tier-2 goals refuse to close without an APPROVE verdict artifact at
-  # agents/<agent>/session/close-reviews/<goal-id>.json.
+  # world/audit-reports/close-reviews/<goal-id>.json — GOAL-keyed and WORLD-scoped,
+  # resolved by close-review-gate.py::verdict_path (CLOSE_REVIEW_LEDGER_DIR or WORLD_DIR).
+  # This comment named agents/<agent>/session/close-reviews/<goal-id>.json until
+  # 2026-09-09: TRUE WHEN WRITTEN, superseded by  (fdb7ebbd0, 2026-09-02), which
+  # world-scoped the artifact so an INDEPENDENT reviewer can write it. That commit touched
+  # coordination.md, the gate and its tests but MISSED this comment, so it named the
+  # superseded path for a week while the gate resolved the new one. Corrected 2026-09-09.
+  # HAZARD: repairing the CODE back to the old closer-keyed path would let the closer write
+  # their own approval — reintroducing exactly the self-review defect this gate prevents.
   # PRECONDITION TO ENABLE: the fresh-eyes close reviewer (the verdict PRODUCER,
   # sibling goal ) exists and is invocable. Until then the refusal text
   # names a remedy nobody can run.
@@ -1819,6 +1827,25 @@ fan_in_boost:
 #   score = (1 - routine_ratio) * 0.4 + encoding_ratio * 0.3 + deep_ratio * 0.3
 # Trigger: goals_completed >= min_iterations AND score < stop_threshold
 #          AND no stop-requested signal already pending.
+session_end_notice:
+  # The shutdown completion report — read by aspirations-consolidate Step 9.7.
+  #
+  # OWNER DIRECTIVE 2026-09-10, verbatim: "as the agent is shutting down, it
+  # should send [a] completion report naturally, whether that be vinheim or
+  # not! let the agent do it.. that way the agent can choose not to do it, or
+  # the user can alter how it does it". This key is the "alter how it does it"
+  # half; the deciding half lives in the skill, where the agent can read what
+  # the owner has already been told and decline.
+  #
+  # WHY IT EXISTS: he was getting two summaries per wind-down — the daily fleet
+  # digest and this note — each individually justified and jointly redundant.
+  # The remedy is judgement plus a knob, NOT another dedup rule; the fleet
+  # already has three and their independence is what produced the overlap.
+  mode: auto                      # auto = the agent decides per Step 9.7(a) and
+                                  #        declines when the owner already knows
+                                  # always = send at every stop, no judgement
+                                  # never = never send (absence of this key = auto)
+
 productivity_gate:
   min_iterations: 10              # session must have ≥N completed goals before gate arms
   stop_threshold: 0.25            # score strictly below this triggers self-stop

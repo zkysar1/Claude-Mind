@@ -415,6 +415,39 @@ class TestRequeueStale(DrainTestBase):
 
         self.assertEqual(res["requeued"], 1)
         self.assertEqual(os.listdir(self.inbound), [], "dry run must not move")
+        self.assertIn("duplicates", res,
+                      "the key must be present even at 0 — a caller asserting "
+                      "payload shape must not see it appear only on a hit")
+
+    def test_requeue_duplicate_stem_goes_to_rejected(self):
+        """ outcome 3: a stem already queued must not be re-filed.
+
+        ``_move`` suffixes a collision with a millisecond stamp, which is right
+        for its own never-delete contract and wrong here — it puts a SECOND copy
+        of one member's instruction in inbound/ and the drain then applies it
+        twice. Measured 2026-09-08: hand re-queueing left the original plus
+        ``...1788847706970.json``. The duplicate is moved aside to rejected/,
+        never deleted, so it stays inspectable.
+        """
+        proc = self.env / "processing"
+        proc.mkdir(parents=True)
+        stem = "20260907T080000000000-a"
+        (self.inbound / f"{stem}.json").write_text(
+            json.dumps(self.verb()), encoding="utf-8")
+        dup = proc / f"{stem}.json"
+        dup.write_text(json.dumps(self.verb()), encoding="utf-8")
+        old = time.time() - (200 * 60)
+        os.utime(dup, (old, old))
+
+        res = drain.requeue_stale(self.env, apply=True, age_min=60)
+
+        self.assertEqual(res["requeued"], 0, "a duplicate stem must not be requeued")
+        self.assertEqual(res["duplicates"], 1)
+        self.assertEqual(os.listdir(self.inbound), [f"{stem}.json"],
+                         "inbound must still hold exactly one copy")
+        self.assertEqual(self.lane_files("rejected"), [f"{stem}.json"],
+                         "the duplicate is moved aside, never deleted")
+        self.assertEqual(self.lane_files("processing"), [])
 
 
 class TestCliContract(DrainTestBase):

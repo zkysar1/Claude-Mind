@@ -262,9 +262,41 @@ def main() -> int:
     # cross-ritual drift. Stderr explains the fix; exit 1 still fail-opens the
     # precheck so the loop itself is never blocked.
     if args.config_block not in cfg or not isinstance(cfg[args.config_block], dict):
+        # guard-2947: hand over the DISCRIMINATOR, not a candidate cause. The two
+        # causes the old text offered ("typo? new ritual missing block?") both
+        # point at the CONFIG being wrong, and the likelier cause is that the
+        # CALLER is: a wm_slot value passed where a block key belongs. The slot
+        # contains the block key as a substring (fresh_eyes_program ->
+        # last_fresh_eyes_program_review), so they are easy to swap, and the
+        # resulting line then reads as "this ritual was retired". Measured
+        # 2026-09-10 (bravo, cc-05): probing `--config-block
+        # fresh_eyes_program_review` produced this message and both sibling
+        # rituals were recorded as unwired; both are wired and correctly
+        # noop'ing (program on the team-aware gate, tree at diff 169 < 200).
+        known = sorted(
+            k for k, v in cfg.items()
+            if isinstance(v, dict) and v.get("wm_slot")
+        )
+        # Key on BOTH the full slot and the slot with its `last_` prefix
+        # stripped: the measured swap was `fresh_eyes_program_review` against a
+        # slot of `last_fresh_eyes_program_review`, so an exact-match table
+        # misses the very instance this branch exists to name.
+        by_slot = {}
+        for k in known:
+            slot = str(cfg[k]["wm_slot"])
+            by_slot[slot] = k
+            if slot.startswith("last_"):
+                by_slot.setdefault(slot[len("last_"):], k)
+        if args.config_block in by_slot:
+            hint = (
+                f"that is the wm_slot VALUE of block '{by_slot[args.config_block]}' "
+                f"— pass the block key instead"
+            )
+        else:
+            hint = "cadence blocks present: " + ", ".join(known)
         print(
             f"fresh-eyes-cadence-check: config block '{args.config_block}' not found "
-            f"in aspirations.yaml (typo? new ritual missing block?) — noop",
+            f"in aspirations.yaml — {hint} — noop",
             file=sys.stderr,
         )
         return 1

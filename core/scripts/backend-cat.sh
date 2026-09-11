@@ -166,8 +166,47 @@ elif sub == "head":
             lst = resolved.stat()
             local_md5 = hashlib.md5(resolved.read_bytes()).hexdigest()
             etag = st.version.strip('"')
-            if "-" in etag:
+            #  / : a TRANSPORT-ENCODED object (gzip at rest —
+            # _owncloud_codec.DEFAULT_ALLOWLIST) carries an ETag over the
+            # COMPRESSED bytes, so `local_md5 == etag` cannot hold for ANY
+            # content. That made DRIFT structurally unconditional on the
+            # fleet's four largest shared stores (aspirations / reasoning-bank
+            # / guardrails / pipeline) — a verdict guaranteed by the storage
+            # representation rather than by the data, whose printed remedy
+            # steers toward a whole-object push over the central queue. The
+            # encoded writer records the PLAINTEXT md5 in object metadata and
+            # stat() already surfaces it as FileStat.plain_md5, so compare
+            # against THAT when present: a genuine divergence still reports
+            # rc=3. Same shape as the multipart carve-out below — when no
+            # meaningful compare exists we report indeterminate rather than
+            # diagnosing a transport fault we never measured.
+            #
+            # Is the object EXPECTED to be encoded? Same predicate the backend's
+            # own write path uses (owncloud_backend.py:1694), imported rather
+            # than re-derived so the allowlist stays single-source.
+            expect_encoded = False
+            try:
+                from _owncloud_codec import should_encode as _bc_should_encode
+                expect_encoded = bool(
+                    _bc_should_encode(b._rel(resolved), getattr(b, "env_id", None)))
+            except Exception:
+                expect_encoded = False
+            plain_md5_meta = getattr(st, "plain_md5", None)
+            if plain_md5_meta:
+                if local_md5 == plain_md5_meta:
+                    verdict = "match (plaintext md5 from object metadata; stored encoded)"
+                    drift_rc = 0
+                else:
+                    verdict = "DRIFT — local mirror differs from store (plaintext md5)"
+                    drift_rc = 3
+            elif "-" in etag:
                 verdict = "multipart ETag — md5 compare n/a"
+                drift_rc = 4
+            elif expect_encoded:
+                # Allowlisted for encoding but no plaintext md5 recorded — a
+                # pre- writer. The ETag digests bytes we cannot
+                # reconstruct, so there is nothing to compare against.
+                verdict = "stored encoded, no plaintext md5 recorded — md5 compare n/a"
                 drift_rc = 4
             elif local_md5 == etag:
                 verdict = "match"

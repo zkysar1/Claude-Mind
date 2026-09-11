@@ -149,7 +149,20 @@ def _backend():
     try:
         from storage_backend import get_backend
         b = get_backend()
-        return b if hasattr(b, "s3") else None
+        if not hasattr(b, "s3"):
+            return None
+        # The marker lives WITH the archive (): when cold_snapshot.py
+        # resolves a dedicated DR target, the cadence lease goes there too. A
+        # `live` target shares the live backend as before. A REFUSED target
+        # deliberately keeps the live backend for the marker alone, so the
+        # cadence still fires and the run itself refuses loudly — returning
+        # None here would skip the tick silently, which is the failure mode
+        # the refusal exists to make audible.
+        import cold_snapshot as cs
+        target = cs.resolve_cold_target(os.environ)
+        if target["mode"] == "pinned":
+            return cs.build_cold_backend(target)
+        return b
     except Exception:
         return None
 

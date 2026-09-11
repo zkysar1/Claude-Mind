@@ -147,6 +147,7 @@ from gates.defer_classifier import (  # noqa: E402
 from gates.blocker_ref import (  # noqa: E402
     validate as _validate_blocker_ref,
     log_unstructured_override as _log_unstructured_override,
+    is_live_lease as _is_live_lease,
 )
 from gates.credential_enum import (  # noqa: E402
     check as _check_credential_enum,
@@ -3671,8 +3672,17 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 else:
                     goal["defer_reason_set_at"] = None
                     # Clearing defer_reason drops its structured companion.
-                    # Keep the pair consistent.
-                    goal.pop("blocker_ref", None)
+                    # Keep the pair consistent -- EXCEPT when that ref is a
+                    # still-live LEASE (). Mirror of cmd_update_goal's
+                    # branch; read its comment there for the full rationale.
+                    # THIS is the copy that runs for every
+                    # aspirations-update-goal.sh call (the wrapper is
+                    # daemon-only, no CLI fallback), so a fix applied only to
+                    # aspirations.py would be inert while looking correct.
+                    # Both sites call the SAME gates.blocker_ref predicate so
+                    # they cannot drift apart.
+                    if not _is_live_lease(goal.get("blocker_ref")):
+                        goal.pop("blocker_ref", None)
 
             # 3. recurring=false cascade (PR 7g).
             # Mirror of cmd_update_goal lines 2183-2185. When recurring flips

@@ -28,7 +28,7 @@ follow the Steps 1-4 + 7r path below — that is a scope-of-work distinction,
 NOT the abbreviated pattern.) When abbreviating, log TWO lines in the
 journal entry (in this order):
   `OBLIGATION ABBREVIATED: state — {condition}`
-  `CTX: raw N% | of-autocompact N% | zone tight | headroom N tokens | env ... | updated ...`
+  `CTX: raw N% | of-autocompact N% | zone tight | to-compact N tokens | env ... | updated ...`
 The banner line must be the actual output captured from the banner script.
 `core/scripts/context-citation-audit.sh` audits the pair. Then satisfy
 `minimum_inline`.

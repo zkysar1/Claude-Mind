@@ -352,11 +352,35 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
     dropped on the wrong key, 28 on `text`.** No error and no empty result to
     notice; the count just comes back inflated by 28, which forces a false
     `act_later` forever.
+  → ⚠ **THE `--since 30d` ABOVE IS A NO-OP — this step has never had the 30-day
+    window every rule below assumes.** Measured 2026-09-10: `30d` returns the
+    ENTIRE channel and a date-only value returns 0, both silently at exit 0; only
+    a full naive timestamp filters. Owned by **g-115-9651**; numbers in the
+    rationale file. Until it lands, read the row set as "whole channel".
+  → **RUN THE BASELINE FIRST — do not hand-apply (a-pre) and (a0) (guard-399).**
+```
+Bash: board-read.sh --channel findings --since 30d --unread-only --json \
+        | py -3 core/scripts/board-signal-classify.py --agent "$MIND_AGENT"
+```
+    It applies (a-pre)'s regex verbatim and (a0)'s tag arithmetic through
+    `peer_surface.routing_tag_targets_agent`, and returns `receipts_dropped`,
+    `excluded_other_agents_signal`, `untagged`, `directed` and
+    `subject_test_required`. It does NOT decide the SUBJECT TEST — only reading a
+    post answers whose self it is evidence about — so `subject_test_required` is
+    the population that owes you a verdict, one per name. `board_signals_upper_bound`
+    is the count if EVERY verdict came back "about me": an upper bound, never the
+    value to paste into the Phase 5.5 envelope. `untagged` still falls to (a1)/(b).
   → filter to findings WHERE ('self_evolution' in tags OR 'self-drift' in tags)
     AND directed at this agent. **EVALUATE THE TESTS IN THIS ORDER — an
     explicit agent ROUTING TAG outranks a loose prose mention** (the same
     precedence `aspirations-select` Phase 2.07 states for directives). Taking
     (a)'s prose disjunct before (b)'s exclusion is what inflates the count:
+    ⚠ **DIRECTION IS ONE-SIGNED FOR EVERY FILTER BELOW, WHICH IS WHY NO MISS HERE
+    IS HARMLESS:** every post that escapes any of them INFLATES
+    `self_evolution_signals_count`, which Phase 5.5 reads as change-pressure, so
+    each failure pushes toward a false `act_later` and never toward a missed one.
+    Five near-misses in this step have shared that sign (guard-2019, the
+    guard-1877 tag-form family, guard-6056).
       (a-pre) **CADENCE-RECEIPT EXCLUSION — runs FIRST, before any tag or author
            test, and applies REGARDLESS of author.** Drop any finding whose text
            opens with this ritual's own post shape: `Fresh-eyes <n>-><n>`,
@@ -381,16 +405,9 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
            A substantive non-ritual correction still SURVIVES — the
            `[^\n]{0,80}?` leash requires the opening clause to NAME the ritual,
            which is what keeps this a receipt filter and not a correction filter.
-           **The sentence above says "match the SUFFIXED forms too"; that invites
-           building the suffix INTO the pattern — do NOT.** The bare
-           `Fresh-eyes <n>-><n>` / `Fresh-eyes N=<k>` shapes carry no suffix at
-           all, so a suffix-requiring regex misses MOST of what this block exists
-           to catch, and the fleet writes the opening token in at least four
-           casings — implementing the shape list LITERALLY catches ~12% of them.
-           **Direction, which is why no variant of this is harmless:** every
-           escaped receipt INFLATES `self_evolution_signals_count`, which Phase
-           5.5 reads as change-pressure, so the failure always pushes toward a
-           false `act_later` and never toward a missed one.
+           **Do NOT build the suffix INTO the pattern** — the bare shapes carry
+           none, so a suffix-requiring regex misses most of this block's
+           population (~12%: rationale file, § "Measured evidence").
            **Why this shape test sits ABOVE (a0):** (a0) short-circuits on the
            agent tag, and a receipt's tag is the AUTHOR'S OWN name — so for
            exactly the agent that posted them this is the ONLY test that can
@@ -407,34 +424,36 @@ Bash: board-read.sh --channel findings --since 30d --unread-only --json
       (a0) tags carry ANY agent name → that tag DECIDES. MIND_AGENT among them
            → directed. Another agent's name and not MIND_AGENT → it is THAT
            agent's own signal → EXCLUDE, and do not consult the text at all.
-           **Match BOTH tag forms — the bare name (`alpha`) AND the qualified
-           `agent:<name>` form.** Neither is documented as canonical in
-           `board.md` / `coordination.md`; board tags are free-form and agents
-           demonstrably write both. Measured 2026-07-31 (echo, 26 self_evolution
-           /self-drift findings in 30d): 25 bare, 1 `agent:alpha`. A bare-name
-           membership test silently drops the qualified form out of (a0) — the
-           post then falls through to (a1)/(b), which is exactly the loose prose
-           branch guard-1877 was written to keep it out of. In the measured case
-           (b)'s author-check happened to exclude it anyway, so the count was
-           unaffected; do not read that as the hole being harmless — it means
-           the failure is invisible when it fires. Normalize the prefix before
-           the membership test.
-           **THIRD FORM: @env-QUALIFIED (`<name>@<env-id>`)** — g-115-4188.
-           Same defect, one step further out: a qualified tag matches NEITHER
-           the bare test NOR the `agent:` prefix test, so it falls through to
-           (a1)/(b) exactly as the `agent:` form did. Normalize by splitting on
-           the FIRST `@` (every registry env-id contains a hyphen, so a
-           hyphen-joined form cannot be split back unambiguously), then decide
-           on the agent part — and on the env part, which carries real meaning
-           HERE: `<name>@<this deployment's ENVIRONMENT_ID>` is that agent,
-           while `<name>@<some other env-id>` is a PEER DEPLOYMENT's same-named
-           agent and is neither MIND_AGENT nor a local partner. Do NOT compare
-           only the text before the `@` (guard-2860 — never relax an ownership
-           test to a pattern); that reads a peer's agent as the local one.
-           Measured 2026-08-06 over 9110 board records: 353 bare routing tags
-           vs 7 qualified, and all 7 named a peer deployment — so this form is
-           rare-but-live today, and the convention actively recommends it.
-           Canonical implementation: `peer_surface.routing_tag_targets_agent`.
+           **MATCH ALL THREE TAG FORMS — bare (`alpha`), `agent:<name>`, and
+           @env-QUALIFIED (`<name>@<env-id>`) — by CALLING the canonical
+           predicate, never by re-deriving one: `peer_surface.routing_tag_targets_agent`
+           (g-115-4188).** A form the predicate misses falls through to (a1)/(b),
+           the loose prose branch guard-1877 exists to keep tagged posts OUT of,
+           and does so INVISIBLY. On the qualified form the env component carries
+           real meaning: `<name>@<other env-id>` is a PEER DEPLOYMENT's same-named
+           agent, neither MIND_AGENT nor a local partner, so never compare only
+           the text before the `@` (guard-2860). Measurements for all three forms:
+           the rationale file, § "Why all three tag forms must be matched".
+           **SUBJECT TEST — (a0) ESTABLISHES DIRECTEDNESS, NOT AUTHORSHIP, so ask
+           WHOSE SELF THE POST IS ABOUT before counting it (guard-6056).** A tag
+           says who should READ a post, never whose identity it is EVIDENCE about.
+           So when the tag test returns `directed`, apply ONE more test: if
+           `author != MIND_AGENT` **AND** the SUBJECT is the AUTHOR'S OWN self —
+           its `self.md`, its goal/purpose/lane, its fresh-eyes verdict, or an
+           answer/resolution notice about a belief held ABOUT THE AUTHOR — it is
+           the AUTHOR'S signal whoever it is routed to → **EXCLUDE**. A post
+           genuinely ABOUT this agent still counts, however it is tagged.
+           **The test lives INSIDE (a0): do NOT move (a0) below (b) or make it
+           fall through** — (a0)'s precedence is load-bearing (guard-1877) and (b)
+           is reachable only for untagged posts, so that trade swaps this defect
+           for the one guard-1877 was written against.
+           **THE THREE REGRESSION FIXTURES — live board records, two scoring 0 and
+           one still scoring 1 — are in the rationale file, § "The subject test
+           and its three fixtures". Read them before narrowing this predicate:**
+           two share a tag SHAPE and have OPPOSITE verdicts, so no tag-count rule
+           can work.
+           Fourth near-miss in this one step; the first three each patched a
+           PREDICATE, and this one patches what (a0) is allowed to CONCLUDE.
       (a1) no agent tag, and the finding's SUBJECT is this agent (a claim ABOUT
            it — not merely a row in a cross-agent comparison table, and not an
            @-broadcast mention) → directed.
@@ -707,7 +726,8 @@ SIGNALS_JSON='{
   "portfolio_drift_score":          {0..1 — degree the portfolio has drifted from Self emphasis since last review},
   "completion_health":              {0..1 — mean completion ratio across active aspirations, EXCLUDING single-goal `asp-xw-` cross-world imports (guard-2829, guard-2804). Each such import is one goal wearing an aspiration's clothes: a hard 0.0 weighted like an 897-goal aspiration, so it dilutes portfolio health rather than measuring it. Measured swing 0.5025 raw -> 0.7537 filtered; two consecutive passes still shipped the RAW figure. Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
   "self_evolution_signals_count":   {int — count of recent self-evolution indicators in last 30d = len(pq_signals from Phase 2.3) + len(board_signals from Phase 2.3b, g-115-1214) + len(belief_signals from Phase 2.6b, g-306-28). A partner's belief ABOUT this agent is an external self-evolution signal even when pending-questions.yaml AND the findings board are both empty},
-  "confirming_signal_fraction":     {0..1 — = confirming_beliefs / self_evolution_signals_count. A belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14) OR **ANSWERED** (`answered_by` is non-null — a durable answering record dated after `last_observed`; guard-5863, and the disjunct whose ABSENCE here left the rule stated only in a guardrail for three fires while this instrument kept counting the belief, guard-1984) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND UNANSWERED AND suggesting drift/contradiction. pq_signals + board_signals are genuine change-indicators, NEVER confirming. Emit 0.0 only when self_evolution_signals_count == 0. An affirming partner-belief is STABILITY evidence, not change-pressure — counting it toward act_later was a measured false-positive treadmill (g-115-1742). Rationale: core/config/rationale/fresh-eyes-signals-json-fields.md},
+  "confirming_signal_fraction":     {0..1 — = confirming_beliefs / self_evolution_signals_count; superseded in preference by the count above. A belief_signal (Phase 2.6b) is CONFIRMING if STALE (staleness_days > 14) OR **ANSWERED** (`answered_by` non-null and dated after `last_observed`; guard-5863) OR AFFIRMING (its claim matches this agent's current Self focus + active-aspiration lane); DIVERGENT only when FRESH AND UNANSWERED AND suggesting drift/contradiction. pq_signals + board_signals are genuine change-indicators, NEVER confirming. Emit 0.0 only when self_evolution_signals_count == 0. Why an affirming partner-belief is STABILITY and not change-pressure, and why the ANSWERED disjunct's absence here cost three fires: core/config/rationale/fresh-eyes-signals-json-fields.md},
+  "confirming_signal_count":        {int — PREFERRED over the fraction (g-115-9566). The confirming NUMERATOR itself, before you divide. It makes the `>= 2` bar an exact integer comparison, so no verdict turns on typed decimal precision. You computed the fraction from two counts, so you have it — emit it},
   "self_last_updated_days":         {int — days_since_self_updated from Phase 2.1},
   "explicit_user_directive":        {true|false — outstanding /respond about purpose or portfolio},
   "signal_actionable_score":        {0..1 — how clearly the signals map to a specific Self edit}
@@ -717,33 +737,37 @@ Bash: echo "$SIGNALS_JSON" | bash core/scripts/self-assess-and-decide.sh --revie
 ```
 
 **NEUTRALIZE ALL THREE SUFFICIENT AXES BEFORE SWEEPING ANY ONE OF THEM**
-(guard-3295). `drift >= 0.40`, `net_divergent >= 2.0`, and
+(guard-3295). `drift >= 0.40`, `net_divergent >= 2`, and
 `signal_actionable_score >= 0.40` EACH fire `act_later` ALONE, so a sweep that
-leaves the others at firing values returns a constant and measures the HELD axes,
-not the swept one — three prior fires (N=44/45/47) each booked exactly that as
-"robustness". Neutralize to `drift = 0.05`, `confirming = 1.00`,
-`actionable <= 0.35`, sweep, and report the flip point rather than the constancy.
+leaves the others firing returns a constant and measures the HELD axes — three
+prior fires booked exactly that as "robustness". Neutralize to `drift = 0.05`,
+`confirming = 1.00`, `actionable <= 0.35`, then report the FLIP POINT, never the
+constancy.
 
-Boundaries: `confirming` fires where **`N·(1−confirming) >= 2.0`** — an inequality
-in `N`, not a fixed fraction (0.50/N=4, 0.60/N=5, 0.7143/N=7). The two `>= 0.40`
-cutoffs above are plain bounds, NEVER intervals — `(0.35, 0.40]` drifted twice.
+Boundaries: `confirming` fires where **`N − confirming_count >= 2`** — an INTEGER
+comparison since g-115-9566, so the fraction-space flip is `1 − 1.5/N` (0.625 at
+N=4), NOT guard-3311's `1 − 2.0/N`; guard-6428 supersedes. Emit
+`confirming_signal_count` and it does not arise. The two `>= 0.40` cutoffs above
+are plain bounds, NEVER intervals — `(0.35, 0.40]` drifted twice.
 
 **COMPUTE `P = len(pq_signals) + len(board_signals)` BEFORE YOU READ THE BELIEFS,
-AND SAY WHAT IT WAS** (guard-3390). `pq_signals + board_signals` are spec'd
-never-confirming, so `net_divergent >= P` for EVERY possible classification of
-EVERY belief: `P >= 3` forces `act_later` before a belief is read, and `P <= 1`
-is the only regime where Phase 2.6b decides anything. The step is usually inert,
-not usually decisive — but keep reading beliefs to full length when you will ACT
-on their content (guard-1421/2043 still bind); just do not report the
-classification as having determined a verdict it could not reach.
+AND SAY WHAT IT WAS** (guard-3390). Those are spec'd never-confirming, so
+`net_divergent >= P` for EVERY classification of EVERY belief: `P >= 2` forces
+`act_later` before a belief is read (it was `P >= 3` until g-115-9566 made the
+bar integral — `P == 2` was a precision knife-edge, and is not one now), and
+`P <= 1` is the only regime where Phase
+2.6b decides anything. Keep reading beliefs to full length when you will ACT on
+their content (guard-1421/2043 still bind); just never report the classification
+as having determined a verdict it could not reach.
 
-⚠ **NEVER QUOTE A PRINTED `net` AS THE MARGIN — IT IS ROUNDED, AT ANY `N`.**
-`net=2.0` prints across true_net ∈ **[1.95, 2.05]**, spanning BOTH verdicts, and
-`confirming` is rounded too — so two runs with OPPOSITE decisions emit
-byte-identical `net=2.0 @50%conf`. Recompute `N·(1−confirming)` yourself before
-believing any `net`, including one this helper just printed. At `P == 2` (`net`
-exactly 2.0) the typed decimal precision of `confirming` IS the verdict: pass
-full float precision, or declare the boundary explicitly.
+⚠ **`net` IS AN INTEGER SINCE g-115-9566 AND NOW DISCRIMINATES THE VERDICT —
+BUT THE `%conf` BESIDE IT IS RE-DERIVED, NOT AN ECHO OF YOUR INPUT.** `net=2`
+fired and `net=1` did not, nothing between. The `@NN%conf` is
+`confirming_count / N`, so it can differ from what you passed (`N=4` with
+`confirming=0.62` prints `50%conf`). **This warning read the OPPOSITE way before
+g-115-9566 and a stale citation of it is now wrong** — the rounding band and the
+`P == 2` precision knife-edge are gone; see the rationale file's "The arithmetic
+went integer".
 
 # Rationale (WHY three sufficient axes, the P>=2 derivation, the rounding band,
 # and the per-box replications): core/config/rationale/fresh-eyes-self-assess-axes.md

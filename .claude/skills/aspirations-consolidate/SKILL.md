@@ -1170,20 +1170,32 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 9.7. **Notify the User About Session End** (stop_mode ONLY):
 
    IF stop_mode != true: SKIP (mid-loop consolidations recur every few
-   iterations — emailing each one floods the user's inbox, and the subject
-   would include a changing goal count so notify-user's 30-min rate limiter
-   cannot dedupe. Progress reporting mid-session is the job of
-   /agent-completion-report Phase 5.5, not consolidation.)
+   iterations; mid-session progress reporting belongs to
+   /agent-completion-report Phase 5.5, not here.)
 
    ELSE (session is actually ending — /stop or productivity-stop-gate):
-     Notify the user about the session end.
+     # Rationale (WHY the agent decides, and why the subject must carry an
+     # identity): core/config/rationale/session-end-notice.md
+
+     THE AGENT'S OWN ACT, NOT A FRAMEWORK EMISSION (owner directive 2026-09-10).
+     DECIDE, don't emit: read what he has already been told
+     (`notification-outreach-gate.sh list --since-hours 24 --json`) and if a
+     digest already carried this session and you add nothing, DECLINE — record
+     `declined (already covered)`, say why in the journal. Declining is an
+     outcome, not a skipped step. Owner's knob — RUN it, never assume:
+     `bash core/scripts/session-end-notice-mode.sh` → auto|always|never
+     (`never` = record `skipped (disabled)`, send nothing).
+
+     Then notify the user about the session end.
      (Check `world/forged-skills.yaml` for a skill whose triggers match
      "notify the user" and invoke it with:
-     - subject: "Session ended — <goals_completed_this_session parameter> goals closed"
-       # The PARAMETER, not a working-memory read (g-115-4935). Same post-reset
-       # staleness as Step 8.87, and NOT among the siblings that goal named —
-       # it is the most user-visible one, since the count lands in the subject
-       # line of the session-end email at every /stop.
+     - subject: "<agent> session <session_number> ended — <goals_completed_this_session parameter> goals closed"
+       # The PARAMETER, not a working-memory read (g-115-4935) — same post-reset
+       # staleness as Step 8.87, and the most user-visible instance of it.
+       # AGENT + SESSION ARE LOAD-BEARING: without them the outreach gate reads
+       # every agent's shutdown as ONE topic for 168h, so the first to stop mutes
+       # the rest. Subject TEXT, never a "[Agent]" prefix (strip_agent_prefix
+       # deletes those). Pinned by test_session_end_subject_identity.py.
      - message: a concise wrap-up — goals completed, aspirations
        completed/archived, tree nodes encoded, knowledge debt delta, any
        blockers surfacing in the handoff, and the fact that the loop has
@@ -1191,13 +1203,9 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
 
      The message MUST be a real multi-line body built via
      `core/scripts/notify-build-payload.py` (notify-user Step 2). NEVER
-     hand-write the email-send.sh JSON here — the 2026-07-07 delta stop
-     email delivered as title + border + EMPTY body because a Title-only
-     payload was hand-built at the transport: the SendInfoAlert renderer
-     IGNORES InfoMessage whenever Title is present (structured mode renders
-     Body/Sections only). email-send.sh now refuses bodyless payloads
-     (exit 2, empty-body guard); on refusal use the fallback below — do
-     not retry with a thinner payload.
+     hand-write the email-send.sh JSON here (2026-07-07: a hand-built
+     Title-only payload delivered an EMPTY body). On the empty-body refusal
+     use the fallback below — never retry with a thinner payload.
 
      If no matching skill is registered, fall back to a
      `participants: [agent, user]` goal via `aspirations-add-goal.sh`
@@ -1243,7 +1251,7 @@ CONSOLIDATION CHECKLIST:
   Step 9  Handoff:                 {done}
   Step 9  Phase Cost Report:       {done|skipped (no markers)}
   Step 9.5 Transfer Profile:       {done|skipped (file missing)}
-  Step 9.7 Notify User (stop_mode): {done|skipped (mid-loop)|skipped (no matching forged skill)}
+  Step 9.7 Notify User (stop_mode): {done|declined (already covered)|skipped (mid-loop)|skipped (disabled)|skipped (no matching forged skill)}
 ```
 
 10. Restart Loop Cycle (skip in stop_mode):

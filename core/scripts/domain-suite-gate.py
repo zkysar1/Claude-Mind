@@ -99,6 +99,14 @@ FALLBACK_WINDOW = timedelta(hours=6)
 SLACK_SECONDS = 60
 DEFAULT_TIMEOUT = 900
 TAIL_LINES = 25
+# Where a NON-CLEAN run's full output is preserved (). Gitignored,
+# and already the home of this gate's own stderr, so a reader chasing a refusal
+# looks in one place. See `_retain_log` for why `tail` alone was not enough.
+# DOMAIN_SUITE_LOG_DIR redirects it — the gate's own tests must not write into
+# the live tree, which is the "point the tests at a tmp path" pattern this
+# script's refusal text already prescribes to others (guard-5541).
+RETAINED_LOG_DIR = Path(os.environ.get("DOMAIN_SUITE_LOG_DIR")
+                        or PROJECT_ROOT / "core" / "logs" / "domain-suite-gate")
 
 # ─── credential tripwire () ────────────────────────────────────────
 # The suite this gate demands as the price of a close is also a process running
@@ -213,8 +221,11 @@ def claimed_at(goal_id: str, source: str) -> datetime | None:
     """The goal's claimed_at through aspirations-read.sh (daemon-routed).
 
     Returns None when the record or the stamp is unreadable — the caller
-    falls back to a bounded window and says so; the gate never reads the
-    store file directly.
+    falls back to a bounded window (FALLBACK_WINDOW, 6h) and says so; the gate
+    never reads the store file directly. Both behaviours are this gate's
+    founding contract, stated in the commit that built it (g-353-75,
+    109b9f2725: "noop without ... a code file newer than the goal's claimed_at
+    (aspirations-read.sh; fallback 6h)").
     """
     parts = goal_id.split("-")
     if len(parts) < 3 or parts[0] != "g":
@@ -243,8 +254,56 @@ def runner_command(scripts_dir: Path) -> tuple[list[str], str]:
     return [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--color=no"], "python -m pytest (cwd=scripts)"
 
 
-def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], set[str]]:
-    """(rc, last lines, failing ids). rc None means the run exceeded `timeout`."""
+def _retain_log(log_path: str, goal_id: str) -> str | None:
+    """Copy a NON-CLEAN run's log somewhere a human can read it later; None on failure.
+
+    g-115-9560: this function is the whole of that goal's third outcome. The run
+    log was written to a mktemp file, read once, and unlinked in the `finally`
+    below — so on a red run the ONLY surviving evidence was `tail` (25 lines).
+    The domain runner reports one line per unit, and the suite is ~97 units, so a
+    failure at [17/97] and every assertion line under it fell outside that window
+    and was destroyed. Measured 2026-09-09 on cc-04: exactly one real red,
+    `[17/93] FAIL test_deploy_hold_check_freshness.sh (rc=1)`, whose failure text
+    no longer existed by the time anyone read the refusal. A red whose only
+    evidence is auto-deleted is close to unfixable by anyone who was not watching
+    it live — and this gate BLOCKS every close on the box while it stands, so the
+    cost of not being able to diagnose it is paid by every agent here.
+
+    Clean runs still delete: the point is to keep what a reader needs, not to
+    accumulate a log per close. `core/logs/` is the established home for this
+    class of file — this gate's own stderr already lands there, redirected by
+    `iteration-close.sh:1224` into `core/logs/iteration-close-stderr.log` — and
+    the whole dir is gitignored (`.gitignore:199`, measured g-115-9560).
+
+    NOTHING PRUNES THESE, DELIBERATELY (g-115-9560). Measured while adding this:
+    no reaper covers `core/logs/` — `housekeeping-tick.py` Lane A drains
+    `agents/<agent>/temp/`, not this tree. That is the intended state, because a
+    retained log is written ONLY when the suite did not come back clean, and per
+    the gate's own contract (g-353-75) that is the case that BLOCKS every close
+    on the box until someone fixes it. So the population is bounded by how often
+    a close is blocked, not by close volume. A reaper here would be a second
+    thing that can delete the one copy of a failing run — the defect this
+    function exists to remove. If the dir ever does grow enough to matter, that
+    growth is itself the finding.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", goal_id or "unknown")
+    dest = RETAINED_LOG_DIR / f"{safe}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    try:
+        RETAINED_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(log_path, dest)
+        return str(dest)
+    except OSError as e:  # fail-open: a gate must never wedge a close over a log
+        print(f"domain-suite-gate: could not retain run log: {e}", file=sys.stderr)
+        return None
+
+
+def run_suite(scripts_dir: Path, timeout: int,
+              goal_id: str) -> tuple[int | None, list[str], set[str], str | None]:
+    """(rc, last lines, failing ids, retained log path). rc None = exceeded `timeout`.
+
+    The fourth element is the path a NON-CLEAN run's full output was preserved at,
+    or None (clean run, or the copy failed). See `_retain_log`.
+    """
     cmd, _ = runner_command(scripts_dir)
     env = dict(os.environ)
     env["STORAGE_BACKEND"] = "local"  # guard-955: any test runner, always
@@ -305,6 +364,7 @@ def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], s
     os.close(fd)
     rc: int | None = None
     timed_out = False
+    retained: str | None = None
     try:
         with open(log_path, "w", encoding="utf-8", errors="replace") as fh:
             try:
@@ -316,6 +376,12 @@ def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], s
                 timed_out = True
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     finally:
+        # PRESERVE BEFORE DELETING, and only when the run was not clean
+        # (). The ordering is the whole point: the old code read the
+        # text into memory and unlinked, so the file every later reader wanted
+        # was gone before the verdict was even computed.
+        if timed_out or rc not in (0, 5):
+            retained = _retain_log(log_path, goal_id)
         # A timed-out runner's descendants may still hold the file open; on
         # Windows that makes the unlink fail. Leaking one temp file beats
         # raising over cleanup.
@@ -331,8 +397,8 @@ def run_suite(scripts_dir: Path, timeout: int) -> tuple[int | None, list[str], s
         shutil.rmtree(rt_dir, ignore_errors=True)
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if timed_out:
-        return None, lines[-TAIL_LINES:], set()
-    return rc, lines[-TAIL_LINES:], failing_ids(lines)
+        return None, lines[-TAIL_LINES:], set(), retained
+    return rc, lines[-TAIL_LINES:], failing_ids(lines), retained
 
 
 _PYTEST_FAILED = re.compile(r"^(?:FAILED|ERROR)\s+(\S+)")
@@ -468,14 +534,14 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     _, runner_label = runner_command(scripts_dir)
     roots = private_roots(world_dir)
     before = private_files(roots)
-    rc, tail, failing = run_suite(scripts_dir, timeout)
+    rc, tail, failing, log = run_suite(scripts_dir, timeout, goal_id)
     clobbered = rewritten_private_files(before, private_files(roots))
     if clobbered:
         why = (f"the domain suite REWROTE {len(clobbered)} credential-shaped file(s) outside its own tree: "
                + ", ".join(clobbered[:4]) + (" ..." if len(clobbered) > 4 else "")
                + " — a test wrote through to a live credential path")
         _emit("block", goal_id, override, reason=why, runner=runner_label, rc=rc, touched=touched,
-              clobbered=clobbered, tail=tail)
+              clobbered=clobbered, tail=tail, log=log)
         print("", file=sys.stderr)
         print(f"[domain-suite-gate] ✖ REFUSED status=completed for {goal_id}: {why}.", file=sys.stderr)
         print("  Restore each file from its backup or upstream source of truth FIRST (the run may have", file=sys.stderr)
@@ -496,8 +562,14 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     if rc is None or rc in (3, 4):
         why = f"domain suite exceeded {timeout}s" if rc is None else f"pytest rc={rc} (internal/usage error)"
         _emit("error", goal_id, override, reason=why + " — not a verdict on this close; fail-open",
-              runner=runner_label, rc=rc, touched=touched, tail=tail)
+              runner=runner_label, rc=rc, touched=touched, tail=tail, log=log)
         print(f"[domain-suite-gate] WARN {why}; the domain suite was NOT verified for {goal_id}", file=sys.stderr)
+        # A fail-open fault is the case where the tail says LEAST — a timeout's
+        # last 25 lines are wherever the run happened to be when the clock ran
+        # out, which is not where it went wrong. So name the retained log here
+        # too, not only on the block path ().
+        if log:
+            print(f"  Full run log (retained): {log}", file=sys.stderr)
         return 0
 
     baseline = load_baseline(world_dir)
@@ -559,10 +631,10 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
             "baseline_recorded_at": (baseline or {}).get("recorded_at"),
         })
         _emit("override", goal_id, override, reason=why + " — overridden: " + override,
-              runner=runner_label, rc=rc, touched=touched, tail=tail)
+              runner=runner_label, rc=rc, touched=touched, tail=tail, log=log)
         return 0
 
-    _emit("block", goal_id, override, reason=why, runner=runner_label, rc=rc, touched=touched, tail=tail)
+    _emit("block", goal_id, override, reason=why, runner=runner_label, rc=rc, touched=touched, tail=tail, log=log)
     print("", file=sys.stderr)
     print(f"[domain-suite-gate] ✖ REFUSED status=completed for {goal_id}: {why}, and "
           f"{len(touched)} domain script(s) changed since this goal's claim "
@@ -574,6 +646,14 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     print(f"  Runner: {runner_label}. Last lines of the run:", file=sys.stderr)
     for ln in tail[-12:]:
         print("    " + ln[:200], file=sys.stderr)
+    # NAME THE FULL LOG (). The tail above is 25 lines of a ~97-unit
+    # run, so a failure partway through is not in it. Until this line existed the
+    # only copy was deleted at the end of run_suite and the reader had no way to
+    # know more had ever existed.
+    if log:
+        print(f"  FULL RUN LOG (retained): {log}", file=sys.stderr)
+    else:
+        print("  Full run log could NOT be retained — the tail above is all there is.", file=sys.stderr)
     print("  Fix the suite, then close again. A collection error is almost always an import that", file=sys.stderr)
     print("  no longer resolves: restore the symbol in the module, or update the test if the rename", file=sys.stderr)
     print("  was deliberate and every importer moved. Re-run it yourself first:", file=sys.stderr)

@@ -393,7 +393,7 @@ Output: "Agent has not been started yet. Type `/start <name>` to begin."
 - Sets: `stop-target-mode` file, `stop-requested` signal
 - Sets NEITHER of the above on the **worker-Body path** (Step 0.6): a `/stop` typed on
   a worker box arms its SESSION-SCOPED `sessions/<SID>/stop-requested` (g-115-7309),
-  stages+pushes its own per-session state, closes its telemetry, cleans its binding,
+  does NOT push its per-session state, closes its telemetry, cleans its binding,
   and exits without touching any agent-wide file. The reducer is not signalled and
   keeps running (g-306-125). The session-scoped file is what lets the turn END: it
   fires the stop-hook's `worker-net-stop-requested-session` valve. It does NOT retire

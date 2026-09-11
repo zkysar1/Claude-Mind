@@ -91,8 +91,10 @@ from typing import Optional
 
 try:  # pragma: no cover - import shim, exercised by both callers
     from gates.defer_date import extract as _extract_date
+    from gates import defer_date as _defer_date
 except Exception:  # pragma: no cover
     from defer_date import extract as _extract_date  # type: ignore
+    import defer_date as _defer_date  # type: ignore
 
 try:  # pragma: no cover
     from _gate_log import log as _gate_log
@@ -203,6 +205,69 @@ def _audit_override(world_dir, agent_name: str, reason: str, payload: dict) -> N
         return
 
 
+def _suggest_ceiling(text: str, now: Optional[datetime] = None) -> Optional[str]:
+    """Resolve a CEILING date from deadline-bearing text.
+
+    `_extract_date` is `defer_date.extract`, which answers a DIFFERENT question
+    — "when may this goal RESUME?" — and two of its policies are correct for a
+    FLOOR and inverted for a CEILING. Both null the suggestion exactly where the
+    deadline is most urgent (measured 2026-09-09, g-115-9516):
+
+      1. DUE-BY SUPPRESSION (g-115-1783). `extract` deliberately discards a date
+         governed by due-by language so a due date never becomes a
+         `deferred_until` floor. This gate fires ONLY on deadline cues, so it was
+         querying the resolver on precisely the text the resolver exists to
+         discard. Measured: "submit by September 12 2026" -> None, bare
+         "September 12 2026" -> 2026-09-12; likewise a trailing "deadline".
+      2. STRICTLY-FUTURE. Dates parse at 00:00 and only strictly-future matches
+         survive, so a deadline falling TODAY is always None. Measured at
+         now=2026-09-09T17:55: "September 9 2026" -> None,
+         "September 10 2026" -> 2026-09-10.
+
+    Together they are why 3 of 5 refused owner directives carried
+    `suggested=null` while the 2 that resolved were both tomorrow-dated: the
+    suggestion that would discharge the refusal was ANTI-CORRELATED with
+    urgency. That is the guard-3179 class this module's own docstring warns
+    about, committed in its suggestion path.
+
+    So reuse defer_date's PATTERNS (one source for the regexes) without its
+    defer-specific POLICY: collect every absolute date in the text and return
+    the earliest that has not already passed. Same-day is KEPT — a deadline
+    today is the case the gate exists for. Returns an ISO string or None.
+
+    Suggestion-only. It never decides whether the gate fires (`find_cue` does
+    that, unchanged), so a wrong parse here can only weaken a message, never
+    admit a record the gate would otherwise refuse.
+    """
+    if not text:
+        return None
+    ref = now or datetime.now()
+    floor = ref.replace(hour=0, minute=0, second=0, microsecond=0)
+    months = getattr(_defer_date, "MONTHS", {})
+    cands = []
+
+    def _add(y, mo, d):
+        try:
+            dt = datetime(int(y), int(mo), int(d))
+        except (ValueError, TypeError):
+            return
+        if dt >= floor:
+            cands.append(dt)
+
+    for name in ("ISO_DATE", "MONTH_DAY_YEAR", "DAY_MONTH_YEAR"):
+        pat = getattr(_defer_date, name, None)
+        if pat is None:
+            continue
+        for m in pat.finditer(text):
+            g = m.groupdict()
+            mo = g.get("month")
+            if mo is not None and not str(mo).isdigit():
+                mo = months.get(str(mo).lower())
+            _add(g.get("year"), mo, g.get("day"))
+
+    return min(cands).isoformat() if cands else None
+
+
 def evaluate(payload: dict, *, override_deadline: Optional[str] = None,
              agent_name: str = "", world_dir=None,
              now: Optional[datetime] = None) -> dict:
@@ -231,8 +296,7 @@ def evaluate(payload: dict, *, override_deadline: Optional[str] = None,
                     "cue": None, "suggested": None}
 
         cue, matched = hit
-        got = _extract_date(text, now=now) or {}
-        suggested = got.get("deferred_until") if got.get("matched") else None
+        suggested = _suggest_ceiling(text, now=now)
 
         floor = _has_floor(payload)
         parts = [

@@ -68,11 +68,24 @@ def table(tmp_path):
 
 def make_runner(responses, record=None):
     """(argv, timeout) -> (rc, stdout, elapsed_ms, err). `responses` is keyed on
-    the script name (argv[0]); the default is a clean empty battery report."""
+    the script name (argv[0]); the default is a clean empty battery report.
+
+    THE SELECTOR GETS ITS OWN DEFAULT, and it is not cosmetic (g-115-9528).
+    goal-selector.sh emits a ranked LIST, not a battery {findings, blind}
+    dict, so under the single shared default every test that did not
+    override it ran with _selection() erroring "expected a list, got dict".
+    That was INVISIBLE while a failed selection could not reach
+    report["blind"] -- the very defect this goal fixes -- so the fixture
+    named "a clean run" was never one. Fixing the fixture is what makes the
+    completeness assertions mean what their names say.
+    """
     def runner(argv, timeout):
         if record is not None:
             record.append(list(argv))
-        r = responses.get(argv[0], (0, json.dumps({"findings": [], "blind": []}), None))
+        if argv[0] == "goal-selector.sh":
+            r = responses.get(argv[0], (0, "[]", None))
+        else:
+            r = responses.get(argv[0], (0, json.dumps({"findings": [], "blind": []}), None))
         rc, out, err = r
         return rc, out, 5, err
     return runner
@@ -739,3 +752,63 @@ def test_breadcrumbs_go_to_stderr_so_the_wrappers_stdout_capture_cannot_eat_them
     assert "[iteration-open] ->" in cap.err
     assert "[iteration-open] ->" not in cap.out, "breadcrumbs must never touch stdout"
     json.loads(cap.out)  # stdout stays a single parseable JSON object
+
+
+# --- : a BLIND selection is not an empty one -----------------------
+#
+# The selector runs OUTSIDE the STAGES loop, so nothing routed a failed
+# selection into report["blind"], and `_selection()`'s deliberate `count: None`
+# (guard-1091 -- a failed measurement is not a measurement of zero) was rendered
+# by "%s candidate(s)" as the literal word None. MEASURED 2026-09-09 (foxtrot,
+# LAPTOP-3IOFCNEO) BEFORE the fix, on a real 180s rc=124:
+#     SELECTION: None candidate(s); top: (none)
+#     completeness = complete   status = clean   blind = []
+# The stage row's rc=1 and the stderr line were the only signals, and no caller
+# parses either. Two pins below and they are a PAIR: the second is the positive
+# control guard-4166 requires, because the fix's effect is that something STOPS
+# being printed -- a mutation that reverts the fix must flip the first WITHOUT
+# flipping the second, or the pin is just asserting that selection prints.
+
+def test_a_timed_out_selector_reads_as_blind_not_as_zero_candidates(table, capsys):
+    runner = make_runner({"goal-selector.sh": (124, "", "goal-selector.sh: timeout after 110s")})
+    io_mod.run(runner=runner, md_path=table)
+    out = capsys.readouterr().out
+    assert "SELECTION: BLIND" in out, out
+    assert "timeout after 110s" in out, "the blind line must name WHY it is blind"
+    assert "None candidate(s)" not in out, (
+        "the exact measured regression: a stage that never returned rendered as "
+        "a candidate COUNT"
+    )
+    assert "UNMEASURED, not " in out, "the reader must be told not to act on it"
+
+
+def test_a_blind_selector_makes_the_whole_entry_partial(table, capsys):
+    """guard-4093 in the file's own words: ANY blind -> partial. The selector is
+    the most decisive stage of the run, so a run that could not read it is the
+    LAST one that may report completeness=complete."""
+    runner = make_runner({"goal-selector.sh": (124, "", "goal-selector.sh: timeout after 110s")})
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    d = json.loads(capsys.readouterr().out)
+    assert d["completeness"] == "partial", d["completeness"]
+    assert any(b["stage"] == "selection" for b in d["blind"]), d["blind"]
+    assert d["candidates"]["count"] is None, "a failed read is not a measured zero"
+
+
+def test_a_measured_zero_still_prints_its_count(table, capsys):
+    """POSITIVE CONTROL for the two pins above (guard-4166).
+
+    The selector RAN and legitimately found nothing. That is a measurement, and
+    it must keep rendering as `0 candidate(s)` on a COMPLETE run -- folding it
+    into the blind branch would trade one unreadable verdict for another.
+    """
+    runner = make_runner({"goal-selector.sh": (0, "[]", None)})
+    io_mod.run(runner=runner, md_path=table)
+    out = capsys.readouterr().out
+    assert "SELECTION: 0 candidate(s)" in out, out
+    assert "SELECTION: BLIND" not in out, "a measured zero is not blindness"
+
+    io_mod.run(as_json=True, runner=make_runner({"goal-selector.sh": (0, "[]", None)}),
+               md_path=table)
+    d = json.loads(capsys.readouterr().out)
+    assert d["completeness"] == "complete"
+    assert not any(b["stage"] == "selection" for b in d["blind"])

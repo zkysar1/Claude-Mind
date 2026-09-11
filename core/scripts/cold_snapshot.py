@@ -108,6 +108,119 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _paths import META_DIR, WORLD_DIR, agents_root  # noqa: E402
 
+
+# ---------------------------------------------------------------------------
+# WHERE THE ARCHIVE GOES — the per-writer endpoint policy ()
+#
+# STORAGE_S3_ENDPOINT_URL is read by the client factory, so every writer that
+# resolves through get_backend() follows an object-store cutover at once. This
+# writer must NOT: its whole purpose is a copy held OUTSIDE the live store's
+# blast radius, and after a flip to a self-hosted store the "outside" copy would
+# land on the same disk as the thing it protects — silently, reporting success
+# every run (guard-6373). So the target is resolved HERE, as a pure decision
+# over the environment, and the resolved values are printed before anything
+# else happens (guard-5551):
+#
+#   live store is AWS (no override)        -> share the live bucket, as before
+#   live store flipped, no COLD_SNAPSHOT_*  -> REFUSE (refused-colocated, rc 2)
+#   COLD_SNAPSHOT_* fully set              -> a dedicated backend on that target
+#   COLD_SNAPSHOT_* partially set          -> REFUSE (refused-partial-config)
+#   COLD_SNAPSHOT endpoint == live endpoint -> REFUSE (same hardware)
+#
+# A refusal is a FAILED run on purpose: cold-snapshot-tick.py files an
+# Investigate on any verdict that is not ok, which is exactly the loudness the
+# silent-relocation failure lacked.
+# ---------------------------------------------------------------------------
+COLD_TARGET_VARS = ("COLD_SNAPSHOT_S3_BUCKET",
+                    "COLD_SNAPSHOT_AWS_ACCESS_KEY_ID",
+                    "COLD_SNAPSHOT_AWS_SECRET_ACCESS_KEY")
+COLD_ENDPOINT_VAR = "COLD_SNAPSHOT_S3_ENDPOINT_URL"
+AWS_REGIONAL = "aws-regional"
+
+
+def resolve_cold_target(env) -> dict:
+    """Pure: decide where the archive goes from an env MAPPING (never IO).
+
+    Returns a dict with `mode` in {local, live, pinned, refused}; a refusal
+    carries `verdict` (the run's verdict string) and `reason`.
+    """
+    def _get(k):
+        return (env.get(k) or "").strip()
+
+    live_endpoint = _get("STORAGE_S3_ENDPOINT_URL")
+    live_bucket = _get("STORAGE_S3_BUCKET")
+    kind = (_get("STORAGE_BACKEND") or "local").lower()
+    base = {"backend": kind, "live_bucket": live_bucket,
+            "live_endpoint": live_endpoint or AWS_REGIONAL}
+    if kind != "own-cloud":
+        return {**base, "mode": "local",
+                "reason": "STORAGE_BACKEND is not own-cloud: no remote "
+                          "retention clock to protect against"}
+    present = {v: bool(_get(v)) for v in COLD_TARGET_VARS}
+    n_set = sum(present.values())
+    if n_set == 0:
+        if live_endpoint:
+            return {**base, "mode": "refused", "verdict": "refused-colocated",
+                    "reason": "STORAGE_S3_ENDPOINT_URL is set (the live store is "
+                              "not AWS) and no COLD_SNAPSHOT_* target is "
+                              "configured, so the DR archive would land on the "
+                              "store it exists to protect. Set "
+                              + ", ".join(COLD_TARGET_VARS)
+                              + f" (+ optional {COLD_ENDPOINT_VAR})."}
+        return {**base, "mode": "live", "endpoint": AWS_REGIONAL,
+                "bucket": live_bucket,
+                "reason": "live store is AWS: the archive shares its bucket at "
+                          "a never-overwritten key (pre-cutover posture)"}
+    if n_set != len(COLD_TARGET_VARS):
+        missing = sorted(v for v, ok in present.items() if not ok)
+        return {**base, "mode": "refused", "verdict": "refused-partial-config",
+                "reason": "COLD_SNAPSHOT_* is partially configured; missing "
+                          + ", ".join(missing)}
+    cold_endpoint = _get(COLD_ENDPOINT_VAR)
+    if live_endpoint and cold_endpoint == live_endpoint:
+        return {**base, "mode": "refused", "verdict": "refused-colocated",
+                "reason": f"{COLD_ENDPOINT_VAR} names the live store's own "
+                          "endpoint: same hardware is not outside the blast "
+                          "radius, whatever the bucket"}
+    return {**base, "mode": "pinned", "endpoint": cold_endpoint or AWS_REGIONAL,
+            "bucket": _get("COLD_SNAPSHOT_S3_BUCKET"),
+            "reason": "dedicated DR target, independent of the live store"}
+
+
+def target_line(target: dict) -> str:
+    """The guard-5551 first line: every value that selects the destination."""
+    return (f"[target] mode={target['mode']} "
+            f"cold_endpoint={target.get('endpoint', '-')} "
+            f"cold_bucket={target.get('bucket', '-')} "
+            f"live_endpoint={target['live_endpoint']} "
+            f"live_bucket={target['live_bucket'] or '-'} "
+            f"backend={target['backend']}")
+
+
+def build_cold_backend(target: dict):
+    """The backend the archive is written through, or None for `local`.
+
+    `live` reuses the process-wide backend. `pinned` builds a SEPARATE
+    OwnCloudBackend from an overlaid copy of the env — never by mutating
+    os.environ, which would also repoint get_backend()'s cached instance.
+    """
+    if target["mode"] == "local":
+        return None
+    from storage_backend import get_backend
+    live = get_backend()
+    if not hasattr(live, "s3"):
+        return None
+    if target["mode"] == "live":
+        return live
+    from owncloud_backend import OwnCloudBackend
+    env = dict(os.environ)
+    env["STORAGE_S3_BUCKET"] = target["bucket"]
+    env["STORAGE_S3_ENDPOINT_URL"] = (
+        "" if target["endpoint"] == AWS_REGIONAL else target["endpoint"])
+    env["MIND_AWS_ACCESS_KEY_ID"] = os.environ["COLD_SNAPSHOT_AWS_ACCESS_KEY_ID"]
+    env["MIND_AWS_SECRET_ACCESS_KEY"] = os.environ["COLD_SNAPSHOT_AWS_SECRET_ACCESS_KEY"]
+    return OwnCloudBackend.from_env(env=env)
+
 try:
     AGENTS_DIR = agents_root()
 except Exception:  # unresolvable agents root -- world/meta still snapshot
@@ -286,6 +399,23 @@ def main() -> int:
     args = ap.parse_args()
 
     stamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+
+    # Resolve and PRINT the destination before the first read or request
+    # (guard-5551). The bootstrap fills STORAGE_* from .env.local for a bare
+    # subprocess exactly as get_backend() would have (), so the
+    # decision sees the same env the upload will use. Under pytest it is a
+    # no-op by design.
+    from storage_backend import _bootstrap_env_defaults
+    _bootstrap_env_defaults()
+    target = resolve_cold_target(os.environ)
+    print(target_line(target), file=sys.stderr)
+    if target["mode"] == "refused":
+        result = {"stamp": stamp, "target": target, "verdict": target["verdict"],
+                  "error": target["reason"], "dry_run": bool(args.dry_run),
+                  "files": 0, "unreadable": 0, "source_bytes": 0}
+        _emit(result, args.output, [])
+        return 2
+
     if args.dry_run:
         # Enumerate only -- no archive is produced, so there is nothing for the
         # manifest to be consistent WITH and the cheaper hash-only walk is right.
@@ -302,6 +432,7 @@ def main() -> int:
         "unreadable": len(failed),
         "source_bytes": total,
         "dry_run": bool(args.dry_run),
+        "target": target,
     }
 
     if args.dry_run:
@@ -312,9 +443,8 @@ def main() -> int:
     result["archive_bytes"] = len(blob)
     result["archive_sha256"] = hashlib.sha256(blob).hexdigest()
 
-    from storage_backend import get_backend
-    backend = get_backend()
-    if not hasattr(backend, "s3"):
+    backend = build_cold_backend(target)
+    if backend is None:
         # LocalBackend (tests, or a local-only deployment): nothing to protect
         # against a remote retention clock. Say so rather than silently passing.
         result["verdict"] = "skipped-local-backend"
@@ -339,6 +469,7 @@ def main() -> int:
             "bucket lifecycle: no current-version Expiration rule exists."
         ),
         "archive_key": archive_key,
+        "target": target,
         "archive_bytes": len(blob),
         "archive_sha256": result["archive_sha256"],
         "file_count": len(ok),
@@ -383,8 +514,12 @@ def _emit(result, fmt, entries):
     if fmt == "json":
         print(json.dumps(result, indent=2))
         return
+    if result.get("target"):
+        print(target_line(result["target"]))
     print(f"[cold-snapshot] {result['verdict']}: "
           f"{result['files']} files, {result['source_bytes'] / 1024 / 1024:.1f}MB source")
+    if result.get("error"):
+        print(f"[cold-snapshot] REFUSED: {result['error']}")
     if result.get("archive_bytes"):
         print(f"[cold-snapshot] archive {result['archive_bytes'] / 1024 / 1024:.1f}MB "
               f"sha256={result.get('archive_sha256', '')[:16]}...")

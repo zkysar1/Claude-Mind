@@ -654,7 +654,41 @@ fi
 # argument, which this fail-open shape reads as "no pending jobs" — so a
 # partial deploy in either order lands on BLOCK-proceeds, never on a wrong ALLOW.
 if bash "$CORE_ROOT/scripts/background-jobs.sh" has-pending --body-sid "$HOOK_SID" 2>/dev/null; then
+    # Consult the loop-exhaustion fence BEFORE exiting (). This ALLOW
+    # exits 137 lines before the fence's other call site on the BLOCK path, so
+    # until now a session pacing indefinitely on registered sleeps was never
+    # evaluated at all: measured on a 10.5h stall, all 9 turn-ends took this
+    # path and THE FENCE DID NOT RUN A SINGLE TIME.
+    #
+    # Only the `stop` rung can act from here, and that is the point: this path
+    # exits without emitting a payload to the model, so the `pause` rung's
+    # directive string could not reach anyone anyway -- and a session on this
+    # path is ALREADY pacing on a registered sleep, i.e. already doing what
+    # `pause` would ask. `stop` writes stop-target-mode + stop-requested, which
+    # Phase -1.4 picks up at the next loop entry.
+    #
+    # Output is discarded and errors swallowed: the fence is fail-safe by
+    # construction (every unreadable input HOLDS) and this branch's ALLOW
+    # decision is unchanged either way -- exactly like the BLOCK-path call, this
+    # is additive and can never flip the verdict.
     echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=background-jobs sid=$HOOK_SID agent=$HOOK_AGENT runner_token=$RUNNER_TOKEN_LOG" >> "$LOG" 2>/dev/null || true
+    # THE ORDER IS LOAD-BEARING: the fence runs AFTER the append above, never
+    # before it. compute_streak counts the turn-ends already IN the log, so
+    # calling it first excludes THIS turn-end and the ALLOW path reads N-1
+    # where the BLOCK path reads N -- that one writes its line (~:690) and
+    # calls the fence ~126 lines later, so it always counts the turn-end it is
+    # deciding about. The first cut of this branch () had the call
+    # above the echo and shipped exactly that off-by-one; it was caught by the
+    # fresh-eyes pass on its own commit, not by the tests, because the test
+    # written alongside it pinned the wrong order too.
+    # Cost of the skew, measured on the session that introduced it: 27 of 40
+    # turn-ends took THIS path at a median 536s apart, so one uncounted
+    # turn-end is ~9 minutes of extra latency per rung -- on the very path the
+    # branch exists to cover. Do not "tidy" this call back above the echo.
+    if [ -n "$HOOK_AGENT" ]; then
+        MIND_AGENT="$HOOK_AGENT" HOOK_SID="$HOOK_SID" HOOK_LOG="$LOG" \
+            bash "$CORE_ROOT/scripts/loop-exhaustion-fence.sh" >/dev/null 2>&1 || true
+    fi
     exit 0
 fi
 _T_AFTER_GATES=$(date +%s%3N)

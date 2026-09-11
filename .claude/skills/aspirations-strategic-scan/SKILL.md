@@ -1401,7 +1401,7 @@ coverage, never as suppression working.
 (echo, `hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud, read-only): 0
 candidates at BOTH `--min-failures 2` and `1`, distinct members 0, `failing_count`
 0, `ceiling_ratio` **0.0026 (61 of 23792)** — below every prior reading, so quote
-the band ~0.0026-0.087 (top 08-25: a 23d peer span).** Its one addition is the
+the band ~0.0026-0.104 (top 09-10: a 40d peer span).** Its one addition is the
 cleanest instance of the decline claim available: this box read **0.0035 with the
 SAME 3-live/2-seeded shape** on 08-17T01:1x, so a same-box, same-shape pair one day
 apart shows the ratio falling (0.0035 -> 0.0026) purely as `invocations` grew

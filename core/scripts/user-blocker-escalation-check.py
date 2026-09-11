@@ -155,6 +155,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -395,6 +396,183 @@ def _read_last_digest_age(cadence_hours: float, now: dt.datetime,
     return read_ok, newest
 
 
+# ───────────────────── stalled detector findings (2026-09-10, ) ────
+# WHY THIS SECTION EXISTS. The digest above carries goals that need the USER.
+# A detector finding needs the AGENT — so it is invisible here by construction,
+# and that is the gap this section closes. Measured 2026-09-10: `/reflect`
+# () had not fired for 147.5h; `recurring-starvation-check` DID detect
+# it and DID file a HIGH Unblock, but that Unblock carries
+# `participants: ["agent"]` while this digest's membership predicate is
+# `"user" in participants` (imported SSOT, `audit-user-to-agent.py`). The two
+# sets never intersect, so no detector finding about agent work could ever
+# reach the one channel that reaches the user on a schedule. Six days dark; it
+# surfaced only because someone ran `git status` for an unrelated reason.
+#
+# It is NOT folded into the predicate above. That predicate answers "who is this
+# waiting ON", and widening it would both break guard-1802's fix and turn the
+# comfort email into a list of things the user cannot action.
+DETECTOR_ORIGIN_PREFIX = "unblock:recurring-starved-"
+_NON_TERMINAL_STATUSES = ("pending", "in-progress", "blocked")
+_SUBJECT_ID_RE = re.compile(r"(g-\d+-\d+)")
+_ANCHOR_RE = re.compile(r"-(\d{14})$")
+# How many findings the email lists in full. The COUNT is always exact;
+# this bounds only the rendered detail.
+MAX_DETECTOR_ITEMS = 5
+
+
+def _load_goal_reader():
+    """Import `_load_jsonl` from audit-user-to-agent.py.
+
+    Deliberately a SEPARATE loader from `_load_population_predicate` rather than
+    a refactor of it: that function resolves the SSOT for the user-participant
+    population, and this lane must not be able to perturb it. A second module
+    exec on a 72h-cadence script costs nothing.
+
+    FAIL-OPEN: returns None, and the caller degrades to zero findings.
+    """
+    target = SCRIPT_DIR / "audit-user-to-agent.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_aut_reader", target)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, "_load_jsonl", None)
+    except Exception as exc:
+        sys.stderr.write(
+            "user-blocker-escalation: could not load goal reader from %s (%s) "
+            "— fail-open, zero detector findings this sweep\n" % (target, exc))
+        return None
+
+
+def _find_stalled_detector_findings(sources, now) -> list:
+    """Open detector-filed findings, each rendered with its subject's LIVE state.
+
+    MEMBERSHIP IS STRUCTURAL — "a detector finding is still open" — and is NOT a
+    re-run of the detector's own predicate. That choice is load-bearing, not
+    laziness (guard-2197): `recurring-starvation-check` measures staleness from
+    `lastAchievedAt`, and `recurring-precondition-sweep.py` ADVANCES
+    `lastAchievedAt` on every iteration where a structured precondition fails,
+    while never writing `achievedCount`. So a SHELVED goal — the worst case, the
+    one most worth surfacing — stops looking starved to the detector. Had
+    membership been "re-run the detector, keep what still fires", this section
+    would go quiet exactly when the subject was most stuck, which is the silent
+    failure it exists to catch.
+
+    So: an open finding is IN, and the discriminator is RENDERED for the reader
+    rather than compiled into a predicate that can go dark (guard-4649 — a
+    caveat in prose is not a filter; and its converse, do not bury a judgment
+    the reader needs inside a filter that cannot express it).
+
+    Returns a list of dicts; never raises.
+    """
+    load_jsonl = _load_goal_reader()
+    if load_jsonl is None:
+        return []
+    findings, subjects = [], {}
+    for label, path in sources:
+        try:
+            records = load_jsonl(Path(path))
+        except Exception as exc:
+            sys.stderr.write(
+                "user-blocker-escalation: detector-finding scan failed for %s (%s) "
+                "— continuing\n" % (label, exc))
+            continue
+        for asp in records:
+            for goal in (asp.get("goals") or []):
+                gid = goal.get("id") or ""
+                if gid:
+                    subjects[gid] = goal
+                origin = str(goal.get("origin_signal") or "")
+                if not origin.startswith(DETECTOR_ORIGIN_PREFIX):
+                    continue
+                if (goal.get("status") or "") not in _NON_TERMINAL_STATUSES:
+                    continue
+                tail = origin[len(DETECTOR_ORIGIN_PREFIX):]
+                m = _SUBJECT_ID_RE.search(tail)
+                a = _ANCHOR_RE.search(tail)
+                findings.append({
+                    "finding_id": gid,
+                    "source": label,
+                    "status": goal.get("status"),
+                    "title": (goal.get("title") or "").strip(),
+                    "subject_id": m.group(1) if m else None,
+                    "anchor": a.group(1) if a else None,
+                    "open_hours": _goal_age_hours(goal, now)[0],
+                })
+    # Second pass attaches each subject's CURRENT state. Subjects were collected
+    # during the same walk, so this costs no extra read.
+    for f in findings:
+        subj = subjects.get(f["subject_id"] or "")
+        if not subj:
+            f["subject_found"] = False
+            continue
+        f["subject_found"] = True
+        f["achieved_count"] = subj.get("achievedCount")
+        f["last_achieved_at"] = subj.get("lastAchievedAt")
+        f["subject_status"] = subj.get("status")
+        anchor, last = f.get("anchor"), f.get("last_achieved_at")
+        if anchor and last:
+            # The anchor IS the subject's `lastAchievedAt` as captured when the
+            # finding was filed, formatted YYYYmmddHHMMSS.
+            f["stamp_moved"] = re.sub(r"\D", "", str(last))[:14] != anchor
+        else:
+            f["stamp_moved"] = None
+    return findings
+
+
+def _compose_detector_section(findings: list) -> list:
+    """Render the stalled-findings section. Returns [] when there is nothing.
+
+    TONE IS A CONSTRAINT here, not styling. This email once "caused anxiety"
+    (g-115-4815) because the reader could not tell what was being asked of them.
+    Nothing in this section is an ask, so it says so on its first line and sits
+    BELOW the user-facing asks — a reader who stops at the top has lost nothing.
+    """
+    if not findings:
+        return []
+    ordered = sorted(findings, key=lambda x: -(x.get("open_hours") or 0.0))
+    shown, hidden = ordered[:MAX_DETECTOR_ITEMS], ordered[MAX_DETECTOR_ITEMS:]
+    out = [
+        "",
+        "— Also: stalled on our side (nothing needed from you) —",
+        "",
+        "%d detector finding(s) are still open. These are agent work, listed"
+        % len(findings),
+        "because they have been sitting — not because they need you.",
+    ]
+    if hidden:
+        # CAP, not a filter. The full count is stated above and the oldest are
+        # shown, because age is the best available proxy for genuinely stuck.
+        # An uncapped list is the failure this email already had once: a wall
+        # of text trains the reader to skip it, which is a louder silence than
+        # not sending at all ().
+        out.append("Showing the %d oldest; %d more are open."
+                   % (MAX_DETECTOR_ITEMS, len(hidden)))
+    for f in shown:
+        oh = f.get("open_hours")
+        age = ("open %.1fd" % (oh / 24.0)) if oh else "open (age unknown)"
+        out += ["", "  [%s] %s" % (f.get("finding_id") or "?", f.get("title") or "")]
+        if not f.get("subject_found"):
+            out.append("    subject %s — not found in the queues"
+                       % (f.get("subject_id") or "?"))
+            out.append("    %s" % age)
+            continue
+        out.append("    subject %s: achievedCount=%s, last stamp %s"
+                   % (f.get("subject_id"), f.get("achieved_count"),
+                      f.get("last_achieved_at")))
+        if f.get("stamp_moved") is True:
+            # guard-2197: the stamp advances without the goal ever achieving.
+            out.append("    NOTE: stamp moved since filing but the finding is"
+                       " still open — trust achievedCount,")
+            out.append("    not the stamp (a failing precondition advances the"
+                       " stamp on its own).")
+        elif f.get("stamp_moved") is False:
+            out.append("    stamp UNCHANGED since filing — nothing has run.")
+        out.append("    %s" % age)
+    return out
+
+
 def _compose_all_clear_body(cadence_hours: float) -> str:
     """The SHORT all-clear (D3). Sent when the list is empty — never skipped.
 
@@ -583,7 +761,7 @@ def _compose_digest_body(batch: list, cadence_hours: float) -> str:
 
 
 def _send_digest_email(agent: str, batch: list, cadence_hours: float,
-                       no_email: bool) -> tuple:
+                       no_email: bool, stalled: list | None = None) -> tuple:
     """Deliver ONE digest — or the all-clear when the batch is empty.
 
     Returns (ok, detail). THERE IS NO EARLY RETURN ON AN EMPTY BATCH: D3 makes
@@ -659,6 +837,10 @@ def _send_digest_email(agent: str, batch: list, cadence_hours: float,
 
     body = (_compose_digest_body(batch, cadence_hours) if batch
             else _compose_all_clear_body(cadence_hours))
+    _section = _compose_detector_section(stalled or [])
+    if _section:
+        body = body + "\n" + "\n".join(_section)
+        fenced = True
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
@@ -806,21 +988,21 @@ def main() -> int:
     agent = args.agent or "unknown"
 
     find_pop = _load_population_predicate()
+    sources = []
+    if args.world_aspirations:
+        sources.append(("world", Path(args.world_aspirations)))
+    if args.agent_aspirations:
+        sources.append(("agent", Path(args.agent_aspirations)))
+    if not sources:
+        try:
+            import _paths  # noqa: PLC0415
+            sources.append(("world", Path(_paths.WORLD_DIR) / "aspirations.jsonl"))
+            sources.append(("agent", Path(_paths.AGENT_DIR) / "aspirations.jsonl"))
+        except Exception as exc:
+            sys.stderr.write(
+                "user-blocker-escalation: path resolution failed (%s) — fail-open\n" % exc)
     candidates = []
     if find_pop is not None:
-        sources = []
-        if args.world_aspirations:
-            sources.append(("world", Path(args.world_aspirations)))
-        if args.agent_aspirations:
-            sources.append(("agent", Path(args.agent_aspirations)))
-        if not sources:
-            try:
-                import _paths  # noqa: PLC0415
-                sources.append(("world", Path(_paths.WORLD_DIR) / "aspirations.jsonl"))
-                sources.append(("agent", Path(_paths.AGENT_DIR) / "aspirations.jsonl"))
-            except Exception as exc:
-                sys.stderr.write(
-                    "user-blocker-escalation: path resolution failed (%s) — fail-open\n" % exc)
         for label, path in sources:
             try:
                 candidates.extend(find_pop(label, path))
@@ -910,12 +1092,14 @@ def main() -> int:
     # that silently reverts this goal, because the regression is invisible from
     # the outside: a skipped send and a genuinely quiet window produce the same
     # empty inbox. `test_empty_list_sends_an_all_clear_not_a_noop` is the pin.
+    stalled = _find_stalled_detector_findings(sources, now)
+
     ok_mail = None
     mail_detail = board_detail = None
     ok_board = None
     if args.apply and due:
         ok_mail, mail_detail = _send_digest_email(agent, batch, cadence_hours,
-                                                  args.no_email)
+                                                  args.no_email, stalled)
         if ok_mail:
             # The board record is the schedule marker, so it is written ONLY on
             # successful delivery: marking the schedule for an email that never
@@ -944,6 +1128,7 @@ def main() -> int:
         "agent": agent,
         "now": now.strftime("%Y-%m-%dT%H:%M:%S"),
         "cadence_hours": cadence_hours,
+        "stalled_detector_findings": stalled,
         "schedule": {
             "due": due,
             "reason": schedule_reason,

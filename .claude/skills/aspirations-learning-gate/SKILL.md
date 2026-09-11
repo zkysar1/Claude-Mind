@@ -33,7 +33,7 @@ core/scripts/context-budget-banner.sh` and quote its output; the banner line
 is the evidence that makes the "tight" claim verifiable. When abbreviating,
 log TWO lines in the journal entry (in this order):
   `OBLIGATION ABBREVIATED: learn — {condition}`
-  `CTX: raw N% | of-autocompact N% | zone tight | headroom N tokens | env ... | updated ...`
+  `CTX: raw N% | of-autocompact N% | zone tight | to-compact N tokens | env ... | updated ...`
 The banner line must be the actual output captured from the banner script in
 this iteration. `core/scripts/context-citation-audit.sh` scans for the pair
 and reports any tight-zone claim that lacks its banner line. Then satisfy

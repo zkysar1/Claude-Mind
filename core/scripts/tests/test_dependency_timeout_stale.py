@@ -257,6 +257,10 @@ class _Args:
 
 
 def _drive(monkeypatch, index, dep_ids):
+    # Plain view dict -- an ABSENT UNMEASURED_KEY == a real measurement
+    # (). See the sibling note in test_dependency_timeout_reprobe.py:
+    # the merge kept the carrier's dict-returning _read_blocked over main's
+    # tuple-returning one, so these stubs return the view alone.
     monkeypatch.setattr(M, "_read_blocked", lambda: {
         "blocked_goals": [{"goal_id": g, "block_reason": "dependency"}
                           for g in dep_ids]})

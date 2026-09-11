@@ -49,12 +49,12 @@ or has to be undone. In particular:
    See `encode-stable-facts.md`.
 10. **Editing or modifying an existing file** — you must have Read the file
    in this session before any Edit/MultiEdit. See `read-before-edit.md`.
-11. **Filing a discovered-work goal that prescribes a fix** — the sibling of
-   #5 and the one most often skipped. A goal filed the moment a problem lands
-   splits into a measured DIAGNOSIS and an unmeasured REMEDY, and whoever
-   executes it inherits the remedy as scope. Retrieve against the *remedy*
-   before writing it down — the cheaper fix is often already encoded
-   (rb-5669, guard-1719).
+11. **Prescribing a fix to anyone else — in a goal, a note, or a post.**
+   Each splits into a measured DIAGNOSIS and an unmeasured REMEDY, and whoever
+   reads it inherits the remedy as scope. Retrieve against the *remedy* before
+   publishing — the cheaper fix, or the HAZARD in the one you recommend, is
+   often encoded (rb-5669, guard-1719, rb-9087). A note or post is ungated —
+   nothing is filed or edited.
 12. **Running a probe whose EMPTY result will authorize an action** — an
    ownership check before filing, a duplicate scan, a "does this exist yet"
    grep, a suppression gate's lookup. A probe whose zero authorizes a write
@@ -132,8 +132,8 @@ knowledge.
   recently-failed aspirations in the same category
 - Re-probing a blocker by running the canonical script alone
 - Applying a framework-file fix without the pre-apply consultation
-- Filing a goal whose description prescribes a fix, having retrieved
-  against the problem but never against the proposed remedy
+- Prescribing a fix in a goal, note or post, having retrieved against
+  the problem but never the remedy
 - Retrieving on what a census is ABOUT and never on the act of counting —
   the tell is a clean-looking number nobody positive-controlled
 

@@ -13,6 +13,52 @@ not implementations. The substrate determines how perception, physics, rendering
 and input work; the contract sits above that line and governs what every world
 exposes to the cognitive engine running inside it.
 
+## Two Senses of "World" (2026-09-09 correction, g-115-9596)
+
+This document uses "world" as a stand-in for "environment" throughout, and
+that conflation makes a claim below FALSE for one real architecture even
+though it is TRUE and load-bearing for another. Two senses must stay apart:
+
+- **world-as-knowledge-base** (the Mind sense) -- a knowledge tree
+  (`world/knowledge/tree/`) plus its sibling stores (pipeline, guardrails,
+  reasoning bank, pattern signatures, team state): the accumulated memory a
+  set of agents reads from and writes to. This is what every element in the
+  Seven Elements table below, and every Rule under "World Identity:
+  `ENVIRONMENT_ID`", actually describes.
+- **world-as-environment** (the substrate sense) -- the bounded execution
+  environment itself: a 3D game world, a 2D puzzle grid, a business
+  workflow. Perception, physics, rendering and input live here, "below the
+  contract line" (see "What the contract does NOT prescribe" above). An
+  environment never owns a knowledge base by itself -- it is a substrate
+  that agents perceive and act in.
+
+**In the current Mind-fleet deployments (ayoai-mind, claude-mind, zds-mind),
+these two senses collapse onto each other by construction**: one
+`ENVIRONMENT_ID` names one deployment, that deployment has exactly one
+`WORLD_PATH`/knowledge tree, and every agent the deployment hosts
+(`agents/<name>/`) shares that one world-as-knowledge-base. Six agents on one
+box (alpha, bravo, echo, foxtrot, omni, zeta) point at one `WORLD_PATH`, and
+zds-mind registers two agents against one world. **This shape is real,
+current, and remains fully valid and supported below -- nothing in this
+section deprecates it.**
+
+The two senses DIVERGE in the per-character portable-mind architecture (see
+`world/knowledge/tree/intelligence/ayoai-architecture/platform-capabilities/portable-agent-mind-architecture.md`,
+"the pearl"): there, the environment is explicitly **NOT** a knowledge base
+and never participates in the knowledge-grant graph, while each CHARACTER
+inside that environment is its own portable mind with its own
+world-as-knowledge-base (its own `world` + `meta` tree). One
+world-as-environment can therefore group many independently-minded
+world-as-knowledge-bases -- the inverse of the Mind-fleet shape, where one
+world-as-knowledge-base is shared by many agents inside one environment.
+
+**So: "one `ENVIRONMENT_ID` per world" (the Rule below) is a true and
+necessary statement about world-as-knowledge-base identity. It is not a
+universal law that one environment implies one knowledge base** -- that
+stronger claim is false for the per-character architecture, and this
+document does not assert it. Read every "world" below as "a
+world-as-knowledge-base instance" unless a clause says otherwise.
+
 ## The Seven Elements
 
 | Element | What it is | Framework realization (claude-mind) |
@@ -87,7 +133,12 @@ Step 3.1) and the cross-world provenance chain (guardrail G5).
 ### Rules
 
 1. **One `ENVIRONMENT_ID` per world.** A world's env-id is set once at creation
-   time and never changes. Renaming requires a migration.
+   time and never changes. Renaming requires a migration. This is a claim
+   about world-as-knowledge-base identity (see "Two Senses of 'World'"
+   above) -- it does not say how many characters/agents an environment's
+   SUBSTRATE hosts, and it is not violated by one substrate-environment
+   grouping several independently-minded characters, each its own
+   world-as-knowledge-base.
 2. **Format**: lowercase kebab-case, max 64 characters. Must be unique across
    all worlds that share infrastructure (DDB tables, S3 buckets).
 3. **Not a secret.** `ENVIRONMENT_ID` appears in `.env.example` with its real
@@ -306,6 +357,7 @@ example file shows the canonical values for this world.
 | `aspirations.md` | Aspirations and goals are the framework realization of the contract's Tasks element. |
 | `experience.md` | Experience archive is the framework realization of the contract's Execution history element. |
 | `learning-routing.md` | The ten stores described in learning-routing are the framework realization of the contract's Memory/context element, spread across world/ and agents/<name>/. |
+| `portable-agent-mind-architecture.md` (knowledge tree, `intelligence/ayoai-architecture/platform-capabilities/`) | The per-character portable-mind architecture ("the pearl") that motivated the "Two Senses of 'World'" split above: it names the environment as world-as-environment ONLY (never a knowledge base), with each character as its own world-as-knowledge-base. That tree node cross-references this file in turn (its Ontology and Cross-refs sections). |
 
 ## Anti-patterns
 
@@ -324,3 +376,8 @@ example file shows the canonical values for this world.
   satisfies the contract even if its perception module is unbuilt (the
   contract elements are populated by the cognitive engine, not by
   perception).
+- Reading "one `ENVIRONMENT_ID` per world" as a universal law that one
+  substrate-environment can hold only one knowledge base. It is a claim
+  about world-as-knowledge-base identity, not about how many
+  independently-minded characters an environment's substrate groups. See
+  "Two Senses of 'World'" above.

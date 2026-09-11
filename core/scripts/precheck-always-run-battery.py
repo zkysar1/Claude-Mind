@@ -136,7 +136,13 @@ LANES = (
         "finds": {
             "counts": (),
             "lists": ("candidates", "escalated", "needs_user_notification"),
-            "false": (),
+            # : the lane's inner goal-selector call can time out and
+            # fail open, which used to render as scanned:0/eligible:0 with all
+            # three lists empty -- byte-indistinguishable from a clean sweep on
+            # the tier whose signal is not optional. The lane now reports
+            # blocked_view_measured=False in that case; reading it here is what
+            # turns the silent zero into a finding.
+            "false": ("blocked_view_measured",),
         },
     },
     {

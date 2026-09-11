@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.69",
+    "previous_version": "2.12.68",
+    "date": "2026-09-10",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "restore vessel daemon startup: tolerate unregistered ENVIRONMENT_ID under STORAGE_BACKEND=local, plus /start acquire fail-open for non-refusing exit codes",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.68",
     "previous_version": "2.12.67",
     "date": "2026-09-08",

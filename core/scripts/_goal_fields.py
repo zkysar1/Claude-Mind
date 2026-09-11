@@ -142,6 +142,15 @@ GOAL_KNOWN_FIELDS = frozenset({
     'last_substantive_at',               # 65
     'longestStreak',                     # 82
     'longestWindowStreak',               # 81
+    # 0 observed — and the zero is the POINT, not a reason to omit it. The
+    # reader shipped without the field ever being registered, so every attempt
+    # to opt a goal in was refused by this very gate and the census could only
+    # ever count zero. Reader of record: planned_verbs.plan_verb(), which
+    # refuses `not_addressable` when the resolved goal lacks a truthy
+    # member_writable (core/scripts/planned_verbs.py:81 MEMBER_WRITE_OPT_IN_FIELD,
+    # shipped in PR #505 / merge b25e6b43). Registered by g-369-167, which is
+    # the change that ships the writer, per the RULE OF THUMB above.
+    'member_writable',                   # 0 — see above
     'notes',                             # 4
     'offload_decision',                  # 30
     'ohs_axis',                          # 10

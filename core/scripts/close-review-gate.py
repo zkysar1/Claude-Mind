@@ -235,12 +235,32 @@ def independence_defect(verdict: dict | None, closer: str) -> str | None:
 
 
 def read_verdict(path: Path | None) -> dict | None:
+    """Return the goal's CURRENT verdict, or None.
+
+    TWO ON-DISK SHAPES, both live:
+      * list  -- the append-only audit trail (g-357-41 / F11). The ledger keeps
+                 EVERY verdict so a re-review cannot erase its predecessor.
+      * dict  -- a single verdict written before the ledger became append-only.
+                 Still present on disk, so this leg is load-bearing, not legacy
+                 politeness.
+
+    THE LAST ENTRY WINS, and that is deliberate: REJECT -> rework -> re-review is
+    the path this gate exists to drive, so an APPROVE recorded after a REJECT
+    must be able to clear it. A gate that honoured the earliest verdict would
+    make rework structurally unable to close the goal. Append order IS
+    chronological (the writer only ever appends), so the last element is the
+    newest without needing to sort on `reviewed_at` and invent a tie-break.
+    """
     if path is None or not path.is_file():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if isinstance(data, list):
+        # An empty trail is "no verdict", not a malformed one.
+        return data[-1] if data else None
+    return data
 
 
 # ─── ledger + telemetry ────────────────────────────────────────────────────

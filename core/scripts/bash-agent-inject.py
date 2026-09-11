@@ -15,6 +15,7 @@ Invoked by bash-agent-inject.sh, which handles Python discovery on Windows.
 """
 
 import sys
+import os
 import json
 import re
 from datetime import datetime
@@ -45,6 +46,91 @@ from hook_helpers import approve_no_mutation, stdin_json_or_approve, emit_deny  
 # measured single work unit is 92 min -- while rejecting the days-stale
 # agent-wide mirror described at the injection site below.
 GOAL_ID_MAX_AGE_SEC = 6 * 3600
+
+# ---------------------------------------------------------------------------
+# ARGV TRUNCATION GATE (, 2026-09-07)
+#
+# On Windows, a NATIVE parent process spawning MSYS2/Git-Bash with the command
+# as one `-c` argument hits a fixed buffer in the MSYS2 runtime that SILENTLY
+# TRUNCATES that argument. Measured: the cut lands at 8186 bytes; environment
+# size does not move it (held identical across 5.6 KB / 13.6 KB / 69.6 KB
+# environments), so it is a fixed buffer and not a shared budget. It is NOT
+# imposed by the tool harness -- a plain Python subprocess spawn of the same
+# bash truncates at the identical byte with no harness involved.
+#
+# Why this is worth a gate rather than a docs note: the failure MISATTRIBUTES.
+# The harness wraps the command in `eval '<...>'`, so a cut landing inside the
+# command leaves that quote unterminated and bash reports `unexpected EOF while
+# looking for matching '` against a line number INSIDE the caller's own correct
+# content. A cut landing past the closing quote instead truncates the harness's
+# own trailing redirect, and the command runs to completion with no error at
+# all. Both readings send the caller hunting a quoting bug that does not exist.
+#
+# POSIX is unaffected: there is no MSYS argv-reconstruction layer, and a single
+# argv element is bounded far higher. The gate is platform-gated to Windows and
+# is a no-op everywhere else -- a Linux agent must NOT inherit this budget.
+#
+# Cost: one encode + one compare on a string already built. No new process, no
+# new file read. The tunables resolve once at import, not per call.
+#
+# Escape hatch: set MIND_ARGV_CAP in the environment Claude Code is launched
+# from -- a byte count overrides the measured cap, and 0 disables the gate
+# entirely (the truncation still happens; only the warning goes away).
+# ---------------------------------------------------------------------------
+ARGV_CAP_BYTES = 8186
+# Composed length = len(new_command) + this. Derived by measurement rather than
+# assumed: total composed minus the caller's own command = 743 wrapper bytes,
+# of which this hook's injected exports are already counted inside
+# new_command, leaving the harness preamble plus its trailing redirect.
+ARGV_WRAPPER_BYTES = 424
+# Absorbs per-session variation in the wrapper (temp-dir path length, shell
+# snapshot filename) so the gate fires slightly early rather than slightly late.
+ARGV_SAFETY_MARGIN = 128
+
+try:
+    _ARGV_CAP = int((os.environ.get("MIND_ARGV_CAP") or "").strip()
+                    or ARGV_CAP_BYTES)
+except (ValueError, TypeError):
+    _ARGV_CAP = ARGV_CAP_BYTES
+# sys.platform is 'win32' under Windows Python, 'msys'/'cygwin' under an MSYS
+# interpreter. Any of the three means the native-parent boundary is in play.
+_ARGV_GATE_ON = _ARGV_CAP > 0 and sys.platform.startswith(("win", "cygwin", "msys"))
+_ARGV_MAX_COMMAND = _ARGV_CAP - ARGV_WRAPPER_BYTES - ARGV_SAFETY_MARGIN
+
+
+def _argv_gate_reason(new_command: str, injected: int) -> str:
+    """Return a deny reason if new_command would be truncated, else ''.
+
+    Pure and side-effect free so it is unit-testable without a hook envelope.
+    """
+    if not _ARGV_GATE_ON:
+        return ""
+    size = len(new_command.encode("utf-8", "replace"))
+    if size <= _ARGV_MAX_COMMAND:
+        return ""
+    budget = _ARGV_MAX_COMMAND - injected
+    return (
+        f"Bash argv gate: this command is {size} bytes, over the "
+        f"{_ARGV_MAX_COMMAND} usable on this platform.\n\n"
+        f"Windows/MSYS SILENTLY truncates a `-c` argument at {_ARGV_CAP} bytes "
+        f"when a native parent spawns Git Bash. Environment size does not "
+        f"change it. Truncation is silent and misattributing: your command is "
+        f"wrapped in `eval '...'`, so a cut inside it reports `unexpected EOF "
+        f"while looking for matching '` at a line number inside your own "
+        f"CORRECT content, and a cut past the closing quote lets the command "
+        f"run with no error at all.\n\n"
+        f"Budget: cap {_ARGV_CAP} - wrapper {ARGV_WRAPPER_BYTES} - margin "
+        f"{ARGV_SAFETY_MARGIN} = {_ARGV_MAX_COMMAND}, minus {injected} bytes "
+        f"of injected exports, leaves ~{budget} bytes for your command.\n\n"
+        f"Fix -- keep the payload out of the argv:\n"
+        f"  1. Write each long body with the Write tool, then send a SHORT "
+        f"Bash call that consumes those files.\n"
+        f"  2. Pass it on stdin:      printf %s \"$P\" | bash -s\n"
+        f"  3. Or via an env var:     BIGV=\"$(cat f)\" bash -c 'use $BIGV'\n"
+        f"Routes 2 and 3 are measured intact at 20,037 bytes.\n\n"
+        f"This gate is Windows-only and does not apply on POSIX. To disable, "
+        f"set MIND_ARGV_CAP=0 in the environment the CLI is launched from."
+    )
 
 
 def _sanitize_reason(reason: str) -> str:
@@ -410,8 +496,14 @@ def main():
             f"path or invoke a helper that resolves it)."
         )
 
-    # Without a session_id we have nothing useful to inject. Approve as-is.
+    # Without a session_id we have nothing useful to inject. Approve as-is --
+    # but measure FIRST: truncation does not care whether a binding resolved,
+    # and an unbound call carries no injected prefix, so it is measured raw.
+    # Same reasoning as the F4 gate above: cover all Bash invocations.
     if not sid:
+        _argv_reason = _argv_gate_reason(command, 0)
+        if _argv_reason:
+            emit_deny(_argv_reason)
         approve_no_mutation()
 
     # CRITICAL (do not "simplify" back to bare .as_posix()): MSYS bash's
@@ -658,6 +750,14 @@ def main():
         approve_no_mutation()
 
     new_command = f"{expected_prefix} {command}"
+
+    # ARGV truncation gate (). Placed HERE, after new_command is
+    # assembled, because the injected exports are part of what gets truncated
+    # -- measuring the caller's raw command would under-count by the prefix
+    # length and let a command through that still gets cut. No-op off Windows.
+    _argv_reason = _argv_gate_reason(new_command, len(expected_prefix) + 1)
+    if _argv_reason:
+        emit_deny(_argv_reason)
 
     # updatedInput replaces the whole tool_input per Claude Code's hook
     # contract, so preserve any other fields the LLM set.

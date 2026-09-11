@@ -277,6 +277,22 @@ def _verdict_file(tmp_path: Path, goal_id: str) -> Path:
     return tmp_path / "audit-reports" / "close-reviews" / f"{goal_id}.json"
 
 
+def _latest_verdict(tmp_path: Path, goal_id: str) -> dict:
+    """The goal's CURRENT verdict, read the way the gate reads it.
+
+    The ledger is an append-only TRAIL (a JSON list) since g-357-41 / F11 — a
+    re-review must not erase its predecessor — so a test asserting on "the
+    verdict" wants the LAST entry, not the whole file. Mirrors
+    close_review_gate.read_verdict, including its tolerance for the pre-F11
+    single-object shape that still exists on disk.
+    """
+    data = json.loads(_verdict_file(tmp_path, goal_id).read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        assert data, "verdict trail is empty"
+        return data[-1]
+    return data
+
+
 def _producer_module():
     """close-review-verdict.py by path — its filename is hyphenated."""
     import importlib.util
@@ -408,7 +424,7 @@ def test_reviewed_at_is_stamped_on_every_written_verdict(tmp_path):
              "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)),
              "--approve", "--write")
     assert r.returncode == 0, r.stdout + r.stderr
-    rec = json.loads(_verdict_file(tmp_path, "g-9-9").read_text(encoding="utf-8"))
+    rec = _latest_verdict(tmp_path, "g-9-9")
     # naive ISO-8601 to the second, the repo-wide stamp shape
     assert len(rec["reviewed_at"]) == 19 and rec["reviewed_at"][10] == "T"
 
@@ -434,7 +450,7 @@ def test_approve_with_notes_releases_the_close_AND_routes_its_notes(tmp_path, mo
                  "--approve-with-notes", "--finding", "naming is inconsistent",
                  "--write", "--route-to-goal", "world"])
     assert rc == 0, "an approval is an approval — it must not exit like a REJECT"
-    rec = json.loads(_verdict_file(tmp_path, "g-9-9").read_text(encoding="utf-8"))
+    rec = _latest_verdict(tmp_path, "g-9-9")
     assert rec["verdict"] == "APPROVE_WITH_NOTES"
     assert len(calls) == 1, "notes that reach only the ledger reach nobody"
     assert calls[0][1]["verdict"] == "APPROVE_WITH_NOTES"
@@ -495,7 +511,7 @@ def test_a_reviewer_may_REJECT_their_own_close(tmp_path):
              "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
              "--reject", "--write")
     assert r.returncode == 3, r.stdout + r.stderr
-    rec = json.loads(_verdict_file(tmp_path, "g-9-9").read_text(encoding="utf-8"))
+    rec = _latest_verdict(tmp_path, "g-9-9")
     assert rec["verdict"] == "REJECT"
 
 
@@ -511,3 +527,61 @@ def test_self_APPROVAL_is_still_refused_in_both_approving_forms(tmp_path):
         assert r.returncode == 1, (extra, r.stdout + r.stderr)
         assert "self-review" in r.stderr
         assert not _verdict_file(tmp_path, "g-9-9").exists()
+
+
+# ─── F11: the ledger is an append-only audit trail () ───────────────
+#
+# The producer used to be a raw Path.write_text over a ONE-OBJECT-PER-GOAL key
+# (the call guard-996 names): no version check, no merge, no warning. A second
+# reviewer therefore ERASED the first. That is not an ordinary lost update --
+# REJECT -> rework -> re-review is the NORMAL path this gate is built around, so
+# the trail destroyed its own history by construction, and the override RATE
+# read off this store (rb-4452, the documented precondition for enabling the
+# gate) under-counted exactly the goals that needed the most review.
+#
+# Measured 2026-09-03: a 9-finding REJECT survived only because its author had
+# hand-archived it first. These tests exist so that stops being luck.
+
+def test_F11_a_second_verdict_APPENDS_and_does_not_erase_the_first(tmp_path):
+    r1 = _run(tmp_path, "--goal", "g-f11-1", "--reviewer", "alice", "--closer", "carol",
+              "--source-file", str(_source(tmp_path)),
+              "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+              "--reject", "--write")
+    assert r1.returncode == 3, r1.stdout + r1.stderr
+
+    r2 = _run(tmp_path, "--goal", "g-f11-1", "--reviewer", "bob", "--closer", "carol",
+              "--source-file", str(_source(tmp_path)),
+              "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+              "--reject", "--write")
+    assert r2.returncode == 3, r2.stdout + r2.stderr
+
+    trail = json.loads(_verdict_file(tmp_path, "g-f11-1").read_text(encoding="utf-8"))
+    assert isinstance(trail, list), "ledger must be an append-only list, not a single object"
+    assert len(trail) == 2, f"second verdict erased the first: {trail}"
+    assert [v["reviewer"] for v in trail] == ["alice", "bob"], trail
+
+
+def test_F11_a_pre_existing_single_object_ledger_migrates_without_loss(tmp_path):
+    """The pre-F11 shape is still on disk in production, so this leg is live.
+
+    Migration must PRESERVE the old verdict as entry 0 -- destroying it while
+    fixing the destroy-the-prior-verdict bug would be the same defect wearing
+    the fix's clothes.
+    """
+    legacy = _verdict_file(tmp_path, "g-f11-2")
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(json.dumps(
+        {"verdict": "REJECT", "reviewer": "prior-reviewer", "findings": ["kept"]}),
+        encoding="utf-8")
+
+    r = _run(tmp_path, "--goal", "g-f11-2", "--reviewer", "newcomer", "--closer", "carol",
+             "--source-file", str(_source(tmp_path)),
+             "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+             "--reject", "--write")
+    assert r.returncode == 3, r.stdout + r.stderr
+
+    trail = json.loads(legacy.read_text(encoding="utf-8"))
+    assert isinstance(trail, list) and len(trail) == 2, trail
+    assert trail[0]["reviewer"] == "prior-reviewer", "legacy verdict destroyed by migration"
+    assert trail[0]["findings"] == ["kept"]
+    assert trail[1]["reviewer"] == "newcomer"

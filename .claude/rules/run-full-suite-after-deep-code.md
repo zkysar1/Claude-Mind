@@ -113,6 +113,44 @@ The rule does NOT apply to pure documentation goals (changelog, journal,
 tree node edits without script behavior changes) or routine closures
 (simple presence checks).
 
+## Which tier satisfies this rule (g-115-9602, 2026-09-10)
+
+This rule says a deep-code closure owes more than its targeted tests. It never
+said the only way to pay is the ~187-minute full run — and that reading is what
+has been stopping agents for hours. USER DIRECTIVE, verbatim: *"We need it much
+smaller, and self serve for each agent. WE cannot have each of our agents
+pausing for 4 hours after each deep goal... I will find 3 or 4 agents all
+running this test and doing nothing while waiting."*
+
+There are two tiers. Choose with the rule below, not by reflex.
+
+**FAST — `bash core/scripts/run-scoped-suite.sh`.** Runs only the tests that
+reference what changed. Self-serve: your own box, no quiet window, no tree lock,
+no queue, no peer coordination — safe beside a live daemon and from a worker
+Body (it pins `STORAGE_BACKEND=local` itself and logs outside the synced tree).
+The verdict is TRI-STATE and **an empty selection is NOT a pass**: `0 PASS |
+1 FAIL | 2 INCONCLUSIVE | 3 setup`. Measured on a live box with the fleet
+running: 5 of 1,442 test files in 0.3s, 22 of 1,443 in 8.2s.
+
+**THE FAST TIER SUFFICES when ALL FOUR hold:**
+(a) verdict is PASS — a NON-EMPTY selection ran green;
+(b) `unmapped_files` is empty — every changed file mapped to at least one test
+    (`PASS_WITH_GAPS` does NOT qualify, which is why it exits 2);
+(c) `selected_share_pct` is small — a hub change fanning out to a large share is
+    the tier telling you to run the full one;
+(d) the change touches none of the machinery in the next paragraph.
+
+**THE FULL RUN IS GENUINELY REQUIRED when ANY holds:** the tier returns
+INCONCLUSIVE for any reason (empty selection, an unmapped file, timeout); the
+change touches `pytest.ini`, a `conftest.py`, `_paths.{py,sh}`, the storage
+backend, or the runner scripts THEMSELVES (`run-full-suite.*`,
+`run-scoped-suite.*`) — **a tier cannot certify a change to itself**; or a
+release/promotion is being cut.
+
+Record WHICH tier you ran and why, exactly as you would record a full run. A
+fast PASS cited while `unmapped_files` is non-empty is a false closure claim in
+precisely the way "all tests pass" from targeted tests alone is.
+
 ## Scope: THREE testpaths, not one (g-115-3748, 2026-07-31)
 
 Every `pytest core/scripts/tests` invocation written below names **one of the
@@ -226,72 +264,12 @@ exactly how a reader spends an hour on a daemon blip. Two free tells before
 triaging anything: are the failures confined to one chunk, and is the assertion
 a LOGIC mismatch or a bare process rc?
 
-REPRODUCED ON A SECOND BOX, and the chunk INDEX repeated — 2026-08-15 (echo,
-`hostname` cc-03, `uname -r` 6.8.0-137-generic, own-cloud, live fleet, 16
-chunks): `TOTAL: 13016 passed, 29 failed, 0 errors` / `VERDICT: GENUINE`, with
-all 29 in **chunk 09** and chunks 10–15 clean after it. Three files
-(`test_pipeline_tombstone_archival` 15, `test_pipeline_provenance_stamps` 8,
-`test_pending_questions_close` 6), **44/44 green solo** in 0.12s. So the
-false-GENUINE call is not one box's quirk, and 29 is twice the count that fooled
-a reader last time — do not treat a bigger number as more credible. Two things
-this adds. The `rc=4` tell above did NOT apply here (these are ordinary
-assertions, not a bare process rc), so a single tell is not a filter: the
-CHUNK-CONFINEMENT tell carried it alone. And chunk 09 landing twice out of two
-is worth noting rather than explaining — with `--chunks 16` the same index is a
-similar slice of a sorted file list, so a chunk-local resource collision is a
-better first hypothesis than progressive exhaustion, which would load the TAIL.
-Do not infer a cause from n=2; do check chunk 09 first.
-
-**FOURTH OCCURRENCE, and the chunk-local-collision hypothesis directly above is
-now FALSIFIED — stop reaching for it** (2026-08-17, alpha, `hostname` cc-04,
-`uname -r` 6.8.0-137-generic, own-cloud, live fleet, 16 chunks): `TOTAL: 13800
-passed, 29 failed, 0 errors` / `VERDICT: GENUINE`, all 29 in **chunk 09**, the
-same three files at the same **15 / 8 / 6**, chunks 10–15 clean, 44/44 green
-solo. Four boxes now, byte-identical counts — the signature is stable enough to
-recognise on sight, which is exactly why the tempting inference needs killing.
-
-The advice "check chunk 09 first" is GOOD and I followed it. What it does not
-license is the chunk-local reading. Reconstructed chunk 09's exact 59-file list
-from the runner's own `_chunk()` and re-ran it **in the same order, same
-process, same pin: 0 failures.** Two narrower controls also passed
-(`test_owncloud_backend.py` first, then all 14 `owncloud` files first — the
-obvious poisoner, since sorted order does put them immediately before the
-failing `test_p*` files). So the collision is NOT reproducible from the chunk's
-file set, which means it is not a property of the chunk, the ordering, or the
-index. **Chunk 09 recurring across boxes is the alphabet, not the cause** — it
-is simply where the handful of tmp-world-plus-lock tests sort to.
-
-**CAUSE FOUND AND FIXED (g-115-5651, 2026-08-19).** `ValueError: <tmp>/world/pipeline.lock
-is not under any configured root` meant `get_backend()`'s process-wide `_ACTIVE_BACKEND`
-had frozen an EARLIER test's tmp-world root map into the cached instance — conftest
-restored the env VAR, not the derived object. The fixture now resets it —
-mutation-proved, and all three victims ran together cleanly: the trio is
-verified, not inferred.
-Reproducing needs FOUR conditions, not two: cache empty, `own-cloud` in-process,
-`MIND_WORLD`/`MIND_META` SET (else `from_env()` raises and nothing caches), and a
-later test on a DIFFERENT tmp world — why ordered chunk replays and solo re-runs
-read green against a live defect.
-
-THIRD BOX, and the three files reproduce with IDENTICAL counts — 2026-08-16
-(alpha WORKER Body, `hostname` cc-08, `uname -r` 6.8.0-137-generic, own-cloud,
-live fleet, 16 chunks, logs via `--out` outside the synced tree): `TOTAL: 13190
-passed, 59 failed, 0 errors` / `VERDICT: GENUINE`, chunk 09 carrying **33 of
-59**. The same three files came back in the same sizes as the cc-03 row above —
-`test_pipeline_tombstone_archival` 15, `test_pipeline_provenance_stamps` 8,
-`test_pending_questions_close` 6 — and all three were **green solo** (21/15/8).
-An exact count-for-count reproduction across three boxes makes this a stable
-signature you can recognise on sight, not a coincidence to re-derive each time.
-
-Two refinements, both of which cut against reading chunk 09 as the whole story.
-**Failures were NOT chunk-confined here**: 02(2) 03(1) 08(7) 09(33) 11(3)
-13(13), with 10/12/14/15 clean after the peak. So the chunk-confinement tell
-that carried the cc-03 call alone would have UNDER-fired here — a spread
-distribution does not exonerate a run, and chunk 09 dominating inside a spread
-is still the tell. And the split was genuinely mixed: `--triage` returned **4
-environmental | 6 genuine-owned | 0 genuine-unowned**, so 30 of the 59 were real
-reds that simply already had owners. Do not let a confirmed-environmental
-majority talk you out of triaging the rest; run `--triage` and let it separate
-them rather than judging the whole run by its largest cluster.
+Four dated per-box reproduction blocks of that signature — 2026-08-15 (cc-03),
+2026-08-16 (cc-08), 2026-08-17 (cc-04), and the g-115-5651 root-cause note —
+were FOLDED into `core/config/run-full-suite-baselines.md` § "Chunk-09
+GENUINE-but-false signature" on 2026-09-10 (g-115-9602). Moved, not deleted:
+the cause is CLOSED and their lasting method is item 2 above, so open the
+ledger only if a FRESH occurrence needs the prior counts to compare against.
 
 ## Live-Daemon Exception (own-cloud, 2026-05-31)
 

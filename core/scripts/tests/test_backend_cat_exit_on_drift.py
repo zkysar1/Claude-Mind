@@ -125,6 +125,7 @@ def test_drift_maps_to_three_and_match_to_zero(src):
 
 @pytest.mark.parametrize("marker", [
     'verdict = "multipart ETag',          # md5 compare not possible
+    'verdict = "stored encoded, no plaintext md5',  # : encoded, nothing to compare
     'print("local:    (no local mirror file)")',
     'print(f"local:    (probe failed:',
 ])
@@ -137,12 +138,53 @@ def test_every_indeterminate_branch_maps_to_four_never_zero(src, marker):
     assert "drift_rc = 4" in src[i:i + 260], f"{marker!r} does not map to rc 4"
 
 
-def test_all_three_indeterminate_branches_are_still_present(src):
+def test_all_indeterminate_branches_are_still_present(src):
     """Positive control for the parametrized test above: if a branch is renamed
     or removed, `src.index` raises there and the test fails loudly — but if the
     whole block were deleted, the parametrize list would still need updating,
-    so pin the count here too."""
-    assert src.count("drift_rc = 4") == 3
+    so pin the count here too.
+
+    Was 3 until g-115-9406 added the fourth: an object the codec allowlist says
+    is stored gzip-encoded but which carries no writer-recorded plaintext md5
+    (a pre-g-358-11 writer). Its ETag digests compressed bytes we cannot
+    reconstruct, so there is nothing to compare against — "I declined to look",
+    exactly like the multipart case beside it, and NOT the confident false
+    DRIFT it used to report."""
+    assert src.count("drift_rc = 4") == 4
+
+
+def test_encoded_objects_compare_against_the_plaintext_md5_not_the_etag(src):
+    """. For a transport-encoded (gzip-at-rest) object the ETag
+    digests the COMPRESSED bytes, so `local_md5 == etag` cannot hold for ANY
+    content — the DRIFT verdict was structurally guaranteed rather than
+    evidence, and it fired on the fleet's four largest shared stores while
+    their content was byte-identical to the store.
+
+    The writer records the plaintext md5 in object metadata and stat() surfaces
+    it as FileStat.plain_md5, so the compare must PREFER it. Pin three things:
+    the branch reads plain_md5, it is consulted BEFORE the raw-etag equality,
+    and it can still return a real rc=3 (this is a corrected compare, not a
+    blanket suppression — a genuine divergence must still report)."""
+    assert "plain_md5" in src, "the encoded compare must read FileStat.plain_md5"
+    i_plain = src.index("plain_md5_meta = getattr(st,")
+    i_etag = src.index('elif local_md5 == etag:')
+    assert i_plain < i_etag, "plaintext-md5 compare must precede the raw-ETag compare"
+    seg = src[i_plain:i_etag]
+    assert "drift_rc = 0" in seg and "drift_rc = 3" in seg, (
+        "the plaintext compare must be able to return BOTH match and a real "
+        "DRIFT — suppressing it to a permanent match would rebuild the same "
+        "blind spot pointing the other way")
+
+
+def test_the_encode_predicate_is_imported_not_reimplemented(src):
+    """The allowlist deciding which paths are stored encoded lives in
+    _owncloud_codec and is what the backend's own write path consults
+    (owncloud_backend.py `should_encode(self._rel(path), self.env_id)`).
+    Re-deriving it here would put two copies of one policy in the tree and let
+    them drift silently — the verdict would then be right or wrong depending on
+    which copy a reader happened to update."""
+    assert "from _owncloud_codec import should_encode" in src
+    assert "_rel(" in src and "env_id" in src
 
 
 def test_the_remedy_is_named_at_the_point_of_failure(src):

@@ -62,6 +62,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from _fileops import locked_modify_json  # noqa: E402
 from goal_close_risk_tier import named_entities  # noqa: E402
 from q4_provenance_sample import (  # noqa: E402
     direction_fidelity, direction_findings)
@@ -321,13 +322,47 @@ def route_findings(goal_id: str, source: str, reviewer: str, findings: list,
 
 
 def write_verdict(goal_id: str, payload: dict) -> Path:
+    """APPEND this verdict to the goal's ledger. NEVER replace a prior one.
+
+    The ledger is an AUDIT TRAIL, not a last-writer cache. This function used to
+    be a raw ``Path.write_text`` over a one-object-per-goal key -- the exact call
+    guard-996 names -- with no version check, no merge and no warning, so a
+    SECOND reviewer silently erased the first (finding F11, g-357-41).
+
+    That matters more than an ordinary lost update because REJECT -> rework ->
+    re-review is the NORMAL path this gate is built around: the trail destroyed
+    its own history by construction. It also corrupted the measurement that
+    decides whether the gate ships -- the override RATE (rb-4452) is computed off
+    this store, and keeping only the LAST verdict per goal under-counts exactly
+    the goals that needed the most review. Measured 2026-09-03: a 9-finding
+    REJECT survived only because it had been hand-archived first, which is not a
+    property of the system.
+
+    ``world/audit-reports/close-reviews/*.json`` is a **class (b) fence-only**
+    store (``coordination_merge.merge_handler_for`` -> None, checked per path,
+    never by grep) and it DOES reach S3, so a stale fence wedges it permanently
+    rather than degrading. That is why the write goes through
+    ``locked_modify_json``: locked read-modify-write with an in-cycle force-fresh
+    read, per ``core/config/conventions/governed-store-write-classes.md``. It
+    also buys the history snapshot + changelog row the raw write skipped.
+    """
     p = _gate().verdict_path(goal_id)
     if p is None:
         raise SystemExit("close-review-verdict: cannot resolve the verdict path "
                          "(no CLOSE_REVIEW_LEDGER_DIR and no WORLD_DIR)")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
-                 encoding="utf-8")
+
+    def _append(current):
+        # Legacy shape: a bare verdict object, written before this ledger became
+        # append-only. PRESERVE it as entry 0 -- migrating must not destroy the
+        # prior reviewer's record, which is the very defect being fixed.
+        if isinstance(current, dict):
+            current = [current] if current else []
+        elif not isinstance(current, list):
+            current = []
+        current.append(payload)
+        return current
+
+    locked_modify_json(p, _append, initial=[])
     return p
 
 

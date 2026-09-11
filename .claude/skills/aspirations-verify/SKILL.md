@@ -34,7 +34,7 @@ core/scripts/context-budget-banner.sh` and quote its output before claiming
 the condition. When abbreviating on the tight-zone condition, log TWO lines
 in the iteration journal entry (in this order):
   `OBLIGATION ABBREVIATED: verify — {condition}`
-  `CTX: raw N% | of-autocompact N% | zone tight | headroom N tokens | env ... | updated ...`
+  `CTX: raw N% | of-autocompact N% | zone tight | to-compact N tokens | env ... | updated ...`
 The banner line must be the actual output captured from the banner script.
 `core/scripts/context-citation-audit.sh` audits the pair. For other
 conditions (routine outcome), the banner line is not required.

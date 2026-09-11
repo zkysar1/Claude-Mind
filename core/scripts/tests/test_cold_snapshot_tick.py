@@ -288,3 +288,41 @@ def test_read_marker_returns_age_and_body():
     age, body = TICK._read_marker(_B(), "k")
     assert 3 * 3600 - 60 < age < 3 * 3600 + 60
     assert body["status"] == "ok"
+
+
+# ---- the marker follows the archive () ------------------------------
+
+def _live_backend():
+    class _B:
+        s3 = object()
+    return _B()
+
+
+def _wire(monkeypatch, target_mode, pinned=None):
+    import types
+    live = _live_backend()
+    fake_cs = types.SimpleNamespace(
+        resolve_cold_target=lambda env: {"mode": target_mode},
+        build_cold_backend=lambda target: pinned)
+    fake_sb = types.SimpleNamespace(get_backend=lambda: live)
+    monkeypatch.setitem(__import__("sys").modules, "cold_snapshot", fake_cs)
+    monkeypatch.setitem(__import__("sys").modules, "storage_backend", fake_sb)
+    return live
+
+
+def test_backend_uses_the_pinned_target_so_the_marker_lives_with_the_archive(monkeypatch):
+    pinned = object()
+    _wire(monkeypatch, "pinned", pinned)
+    assert TICK._backend() is pinned
+
+
+def test_backend_keeps_the_live_store_for_the_marker_when_the_target_is_refused(monkeypatch):
+    """A refused target must NOT read as 'no object store': the cadence has to
+    keep firing so the run itself refuses loudly and files the Investigate."""
+    live = _wire(monkeypatch, "refused")
+    assert TICK._backend() is live
+
+
+def test_backend_shares_the_live_store_pre_cutover(monkeypatch):
+    live = _wire(monkeypatch, "live")
+    assert TICK._backend() is live

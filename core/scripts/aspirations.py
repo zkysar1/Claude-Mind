@@ -260,7 +260,7 @@ from gates.defer_classifier import STRUCTURED_DEFER_PREFIXES  # noqa: E402,F401
 # surfaced by test_defer_to_unblock_integration.py cases 1/5/7; found during
 # ). gates.blocker_ref is the single source of truth, same import
 # create-blocker.py uses.
-from gates.blocker_ref import BLOCKER_REF_TYPES  # noqa: E402
+from gates.blocker_ref import BLOCKER_REF_TYPES, is_live_lease  # noqa: E402
 from gates.field_shrink import evaluate as _field_shrink_eval  # noqa: E402
 
 
@@ -2795,8 +2795,23 @@ def cmd_update_goal(args):
                 goal["defer_reason_set_at"] = None
                 # Clearing defer_reason drops its structured companion.
                 # Keep the pair consistent so goal-selector and quiescence-gate
-                # never see an orphan blocker_ref on an un-deferred goal.
-                goal.pop("blocker_ref", None)
+                # never see an orphan blocker_ref on an un-deferred goal --
+                # EXCEPT when that ref is a still-live LEASE ().
+                # A deploy-hold reservation is declared on a PENDING,
+                # NON-DEFERRED goal BY DESIGN (world/conventions/deploy-holds.md),
+                # and deploy-hold-check.sh reads exactly that shape as the gate
+                # standing between an unvalidated change and an auto-deploying
+                # production repo. So the "orphan" premise above is false for
+                # that one consumer, and popping here silently disarms a live
+                # safety gate with no log line.
+                # An expired or expiry-less ref STILL pops -- "a lease nobody
+                # renewed has ended" -- so orphan cleanup is unchanged for
+                # every ref that cannot prove it is still within its lease.
+                # The sibling pop in _normalize_terminal_goal is deliberately
+                # NOT gated: a TERMINAL goal's ref is finished whatever its
+                # expiry says.
+                if not is_live_lease(goal.get("blocker_ref")):
+                    goal.pop("blocker_ref", None)
         # CRITICAL — root-cause fix for the recurring-shape-leak bug. Do NOT remove this
         # cascade or move it to a caller. When recurring flips to falsy, interval_hours
         # and lastAchievedAt MUST drop here, at the data primitive, so any future caller
