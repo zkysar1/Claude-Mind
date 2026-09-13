@@ -525,9 +525,32 @@ class TestAspirationHasNoSilentDefault(DrainTestBase):
         self.assertIn("no target aspiration", detail)
 
     def test_unconfigured_directive_sets_exit_2(self):
+        # THE ONLY TEST IN THIS CLASS THAT REACHES main(), AND THEREFORE THE ONLY ONE
+        # THE AMBIENT ENVIRONMENT CAN REACH. Its siblings go through run_drain(), which
+        # calls drain_environment() with an explicit asp_id and is isolated by
+        # construction; main() resolves the target from INBOUND_DIRECTIVE_ASP_ID at
+        # parse time (the `--aspiration` default), and a VESSEL-CONFIGURED box carries
+        # that key in .env.local. So this test read the BOX's config, not the code.
+        # Measured on alpha/cc-07 2026-09-13, one variable moved both ways: ambient
+        # INBOUND_DIRECTIVE_ASP_ID=asp-371 -> the record was FILED ("filed ")
+        # and main() returned 0; `env -u INBOUND_DIRECTIVE_ASP_ID` -> rc 2, green.
+        # A test asserting the ABSENCE of a configuration must ENFORCE that absence
+        # (guard-4425, guard-2710, rb-3208), or it reports the box and reads as a real
+        # defect in the one refusal path this class exists to guard.
+        # The ASSERTION below is deliberately unchanged — the fix is the precondition,
+        # not the expectation (rb-9217: a green won by editing the assertion is not a
+        # fix). Restoring the variable is sufficient here because nothing memoizes it:
+        # main() builds its parser per call, so os.environ is read at call time and
+        # there is no process-global to reset beside it (guard-4358, checked).
+        prev = os.environ.get("INBOUND_DIRECTIVE_ASP_ID")
+        os.environ.pop("INBOUND_DIRECTIVE_ASP_ID", None)
         self.write_record("20260907T080000000000-a.json", self.directive())
-        rc = drain.main(["--root", str(self.root), "--environment-key", "env-under-test",
-                         "--apply", "--json"])
+        try:
+            rc = drain.main(["--root", str(self.root), "--environment-key", "env-under-test",
+                             "--apply", "--json"])
+        finally:
+            if prev is not None:
+                os.environ["INBOUND_DIRECTIVE_ASP_ID"] = prev
         self.assertEqual(rc, 2, "an undrained spool must never report success")
 
     def test_env_var_supplies_the_target_when_the_flag_is_absent(self):

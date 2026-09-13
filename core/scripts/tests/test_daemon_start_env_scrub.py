@@ -117,7 +117,8 @@ def _env_keys(captured: str) -> set:
 
 
 STORAGE_KEYS = {
-    "STORAGE_BACKEND", "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE",
+    "STORAGE_BACKEND", "STORAGE_S3_BUCKET", "STORAGE_S3_ENDPOINT_URL",
+    "STORAGE_DDB_SESSIONS_TABLE",
     "STORAGE_DDB_LOCK_TABLE", "ENVIRONMENT_ID", "MACHINE_ID", "MACHINE_MULTI",
     "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL", "MIND_API_TOKEN",
     "MIND_API_BIND",
@@ -132,6 +133,7 @@ def test_pytest_parent_scrubs_storage_config():
         "PYTEST_CURRENT_TEST": "core/scripts/tests/test_x.py::test_y",
         "STORAGE_BACKEND": "local",
         "STORAGE_S3_BUCKET": "pytest-fake-bucket",
+        "STORAGE_S3_ENDPOINT_URL": "http://pytest-fake-store:9000",
         "ENVIRONMENT_ID": "test-env",
         "MACHINE_ID": "pytest-machine",
         "MIND_ALLOW_TMP_OWNCLOUD_PUT": "1",

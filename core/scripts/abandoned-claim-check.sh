@@ -53,7 +53,7 @@ fi
 
 # The in-progress population. A failure here yields an empty scan, which the
 # detector reports loudly rather than treating as clean.
-bash "$SCRIPT_DIR/aspirations-query.sh" --goal-status in-progress --full \
+bash "$SCRIPT_DIR/aspirations-query.sh" --goal-status pending,in-progress --full \
     > "$GOALS_FILE" 2>/dev/null || true
 
 OUT_FILE="$TMPDIR_RUN/report.txt"

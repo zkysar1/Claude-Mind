@@ -120,6 +120,28 @@ RC_BY_VERDICT = {VERDICT_HOLD: 0, VERDICT_PAUSE: 1, VERDICT_STOP: 2}
 TURN_END_VERDICTS = (" BLOCK ", " ALLOW ")
 
 
+def _cause_note(budget_zone):
+    """What a firing DOES and does NOT establish, carried in the reason string.
+
+    The streak+frozen-diary predicate proves the loop is NOT ADVANCING.  It does
+    not prove WHY.  "Exhaustion" in this module's name is the one cause it was
+    built from (bravo/cc-05, context genuinely at zero) -- not a finding about
+    any later firing.  Measured counter-case: alpha/cc-04 2026-09-11 fired the
+    stop rung at 307 BLOCKs with the diary frozen since 06:29:19 while the
+    session's context was only ~half consumed.  The stop was CORRECT (a loop
+    that has not advanced in 307 turn-ends cannot execute); the cause everyone
+    read off the name was not, and that misread sends the next diagnosis at the
+    context budget instead of at whatever actually froze the diary.
+
+    So the reason names the recorded zone and states the limit of the claim.
+    Still never decisive -- see the module docstring and
+    `test_budget_zone_is_recorded_but_never_decisive`.
+    """
+    return " [proven: no phase advance. cause NOT established -- context budget zone: %s]" % (
+        budget_zone or "unrecorded"
+    )
+
+
 def decide(
     streak,
     stalled_seconds,
@@ -132,7 +154,8 @@ def decide(
 ):
     """Pure decision.  Returns a dict; never raises, never touches the disk.
 
-    `budget_zone` is RECORDED and never decisive -- see the module docstring.
+    `budget_zone` is RECORDED and NAMED IN THE REASON, never decisive -- see the
+    module docstring and `_cause_note`.
     """
     result = {
         "verdict": VERDICT_HOLD,
@@ -189,16 +212,19 @@ def decide(
     if streak >= stop_threshold:
         return _out(
             VERDICT_STOP,
-            "BLOCK #%d for this session with the execution diary frozen %.0fs "
-            "(>= stop_threshold %d): the pause rung did not restore phase "
-            "advance, so this loop cannot execute" % (streak, stalled_seconds, stop_threshold),
+            "turn-end #%d for this session (BLOCK **or ALLOW** -- see TURN_END_VERDICTS) "
+            "with the execution diary frozen %.0fs (>= stop_threshold %d): the pause "
+            "rung did not restore phase advance, so this loop cannot execute"
+            % (streak, stalled_seconds, stop_threshold)
+            + _cause_note(budget_zone),
         )
 
     return _out(
         VERDICT_PAUSE,
-        "BLOCK #%d for this session with the execution diary frozen %.0fs "
-        "(>= pause_threshold %d): pause instead of re-entering immediately"
-        % (streak, stalled_seconds, pause_threshold),
+        "turn-end #%d for this session (BLOCK **or ALLOW** -- see TURN_END_VERDICTS) "
+        "with the execution diary frozen %.0fs (>= pause_threshold %d): pause instead "
+        "of re-entering immediately" % (streak, stalled_seconds, pause_threshold)
+        + _cause_note(budget_zone),
     )
 
 

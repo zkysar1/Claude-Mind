@@ -34,10 +34,29 @@ So the discrimination moved into `classify_close_path()` and the prose shrank.
 | 4 | **CNC-drain** (precheck Phase 0.5g.7) disposing another Body's finished-but-unbanked unit | `complete-by` then `outcome_class` **seconds** apart; claim rows belong to a DIFFERENT agent | **EXCLUDE** — the closer executed nothing |
 | 5 | **Interrupted recurring close** whose RECORD LIES | a LONE `complete-by` with nothing after it | FINDING (guard-3511) |
 | 6 | **Hypothesis-resolution close** | `complete-by` then `outcome_class` seconds apart; NO claim row in the goal's entire lifetime | **CREDIT** — work happened, so the absent bump is a real accounting gap |
+| 7 | **Finding-disposition close at iteration open** — a precheck finding whose correct disposition IS closing the subject goal (premise cleared / moot) | **identical to (3)**: a lone `update-goal <id> status`, no `complete-by` | **EXCLUDE** in principle — the closer executed no iteration — but see below: it is NOT separable, so it reports as (3) |
 
 Causes 4 and 6 produce a **byte-identical** fingerprint, which is why the
 classifier keys on `sanctioned path that executed no iteration` and then splits
 EXCLUDE from CREDIT on the claim history — never on drain-ness.
+
+Cause 7 is the harder one, and it is listed to be *recognised by a reader*, not
+classified: it shares cause 3's fingerprint exactly. A bare-status close is a
+bare-status close whether an LLM typed it to dispose a precheck finding or typed
+it to shortcut a real execution, and no changelog row separates the two — the
+lane lives only in the closer's intent. Cause 4 escapes this because its closer
+is a SCRIPT with a distinguishable claim history; cause 7's closer is the
+orchestrator's own hand. So do not add a discriminator for it: by the section
+below, a content-derived one will fail, and there is no changelog-derived one to
+find. Confirm the shape from the goal's `outcome_note`, which on this lane states
+the disposition verbatim, and move on.
+
+**Do not "repair" a cause-7 row with `--phase state-update`** — that is the
+g-115-8289 remedy for a genuine skip, and applying it to a close that executed no
+iteration corrupts the session counters it is meant to fix. Measured instance:
+`g-326-880`, closed bravo/cc-05 2026-09-11T18:02 while disposing a
+user-blocker-escalation finding, reported by this check the next morning as the
+single unattributed close of five.
 
 ## Why the record cannot do this, measured
 

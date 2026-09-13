@@ -24,6 +24,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 CORE_SCRIPTS = Path(__file__).resolve().parent.parent      # core/scripts/
@@ -39,6 +40,25 @@ def _load(modname: str, filename: str):
 
 
 merge = _load("body_merge_wr", "body-merge.py")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world ().
+
+    Load-bearing: `generalize_down` resolves the world-rooted staging dir
+    through `_paths.WORLD_DIR`, so without this the test reaches into the LIVE
+    world and consumes whatever is staged there. This file uses the agent name
+    `solo`, so on a box where no `solo` Body stages it creates a stray live
+    directory rather than draining real payload — a smaller blast radius than
+    its three siblings, and still not one to leave open. Evidence is in
+    `test_capture_lane_chain.py`'s fixture docstring.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
 import worker_retrospective as wr  # noqa: E402
 
 

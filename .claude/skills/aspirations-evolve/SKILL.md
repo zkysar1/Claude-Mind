@@ -381,16 +381,21 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        Log: "PORTFOLIO REVIEW: triggered with scan signal — inflation:{signal.priority_inflation} unarchived:{signal.completed_unarchived}"
        Bash: wm-clear.sh portfolio_health_signal  # consumed — clear for next cycle
 
+   # ⚠ 2.75a/b/c POPULATION IS THE STORE, NEVER Step 1's `asp.goals` — that is
+   # aspirations-compact-SUMMARY.json, a goal-capped ACTIVITY projection carrying only
+   # recurring/started/blocked goals, so "all non-recurring terminal" reads TRUE for any
+   # un-started backlog and 2.75a archives it unguarded. Measured 2026-09-11 echo/cc-03:
+   # 21 of 27 active flagged archive from the summary (asp-335: 0 in array vs 33 live in
+   # store) incl. every product lane; 0 archive/demote/relocate from store. guard-4963/3694.
+   Bash: aspirations-read.sh --source world --active (then --source agent)
+   nonrec_drained(asp) := STORE record has >=1 non-recurring goal AND none non-terminal
+       (terminal = completed|skipped|expired|decomposed|superseded); recurring_of(asp) too
    # --- 2.75a: Archive Sweep ---
-   # Find aspirations where all non-recurring goals are terminal (completed/skipped/expired)
-   # but the aspiration itself hasn't been archived yet. This catches cases missed by
-   # per-goal completion review (e.g., goals completed across sessions or by other agents).
+   # Drained but not yet archived — catches goals closed across sessions or by other agents.
    FOR EACH active aspiration:
-       non_recurring = [g for g in asp.goals if not g.recurring]
-       terminal = [g for g in non_recurring if g.status in (completed, skipped, expired)]
-       IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
+       IF nonrec_drained(asp):
            # All non-recurring goals are done — check for recurring goals
-           recurring = [g for g in asp.goals if g.recurring]
+           recurring = recurring_of(asp)
            IF len(recurring) == 0:
                Log: "PORTFOLIO ARCHIVE: {asp.id} '{asp.title}' — all goals terminal, archiving"
                Bash: aspirations-complete.sh --source {asp.source} {asp.id}
@@ -402,9 +407,7 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # Aspirations whose only remaining work is recurring goals don't need HIGH priority.
    # Recurring urgency scoring ensures they execute on cadence at any priority level.
    FOR EACH active aspiration where priority == "HIGH":
-       non_recurring = [g for g in asp.goals if not g.recurring]
-       terminal = [g for g in non_recurring if g.status in (completed, skipped, expired)]
-       IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
+       IF nonrec_drained(asp):
            # All non-recurring goals done, only recurring remain
            Log: "PORTFOLIO DEMOTE: {asp.id} '{asp.title}' — HIGH→MEDIUM (recurring-only)"
            Demote priority — field-merge, single positional call (daemon merges only this field):
@@ -415,10 +418,8 @@ Trigger evolution check — the system evaluates its own strategy and generates 
    # maintenance aspiration (asp-001 pattern). They prevent archival and inflate
    # active aspiration count.
    FOR EACH active aspiration where scope in (sprint, project):
-       non_recurring = [g for g in asp.goals if not g.recurring]
-       terminal = [g for g in non_recurring if g.status in (completed, skipped, expired)]
-       IF len(non_recurring) > 0 AND len(terminal) == len(non_recurring):
-           recurring = [g for g in asp.goals if g.recurring]
+       IF nonrec_drained(asp):
+           recurring = recurring_of(asp)
            IF len(recurring) > 0:
                Log: "PORTFOLIO RELOCATE: {asp.id} has {len(recurring)} recurring goals preventing archival"
                # Find the agent's maintenance aspiration (asp-001 or equivalent)

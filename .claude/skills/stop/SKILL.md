@@ -124,7 +124,37 @@ IF output is "worker":
    keyed to THIS SID, and never reaches the reducer. (guard-4900 documents the trap;
    this step is its fix.)
 
-2. Flush pending backend writes. Same call graceful-stop D6.7 makes, moved ahead of
+2. Write this session's summary. Same call graceful-stop D6.5 makes, SID-scoped, so a
+   stopped Body leaves the same continuity artifact a stopped reducer does. Runs BEFORE
+   the flush in step 5 because that flush must carry it -- graceful-stop D6.7 depends on
+   every continuity file being written first.
+   Bash: `bash core/scripts/session-summary-write.sh --sid "$MIND_SID" --agent <agent-name> --reason worker-stop || true`
+
+3. Commit this box's agent-dir churn. Same call graceful-stop D6.62 makes.
+   Bash: `source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --goal-id worker-stop --title "worker Body stop on this box" --outcome deep --type chore --repo "$PROJECT_ROOT" || true`
+
+   `source core/scripts/_paths.sh &&` IS LOAD-BEARING, not decoration: `$PROJECT_ROOT` is
+   UNSET in a bare Bash call, so `--repo` would pass EMPTY and the script exits 1 naming
+   all four flags you DID pass. That error reads as a broken script rather than a missing
+   variable, and is how D6.62 sat inert for months (rb-9907). `--outcome deep` is also
+   load-bearing: `routine` is a documented no-op that commits nothing.
+   VERDICT ON `git status --porcelain`, NEVER ON THE rc -- the `|| true` discards it.
+
+4. Push what step 3 committed. Same call graceful-stop D6.65 makes.
+   Bash: `bash core/scripts/iteration-push.sh --min-commits 0 --max-age-min 0 --fetch-interval-min 0 || true`
+
+   All three zeroes are required together: they convert iteration-push's rate-limited
+   batch decision into "push whatever is ahead, now". D6.65 exists because a session whose
+   final commits sit under both thresholds leaves them stranded with no later iteration to
+   flush them -- and a STOPPED worker has no later iteration BY DEFINITION, so the case
+   D6.65 was written for is strictly worse here than on the reducer. MEASURED 2026-09-10 on
+   cc-09 (SID a30b1a3e): after the worker stop completed, agent store churn was still
+   uncommitted and unpushed, and it took a user-invoked `/encode-session` to ship it.
+   Do NOT add `--strict`: without it soft_exit returns 0 on every path, so an rc-gated
+   branch here would be dead code (guard-775); with it a transient network blip aborts the
+   stop.
+
+5. Flush pending backend writes. Same call graceful-stop D6.7 makes, moved ahead of
    the sweep thread's next tick. Fire-and-forget: a flush failure must not block the
    stop.
    Bash: `bash core/scripts/owncloud-flush.sh || true`
@@ -150,23 +180,49 @@ IF output is "worker":
    those. (guard-6254 carries the same correction against guard-1579, whose `rule`
    field is immutable.)
    NOT a data-loss report: the state is on local disk and a later `/start` on THIS SAME
-   box resumes the SID. What is absent is OFF-BOX durability, so a machine-move after a
-   worker stop does strand the per-session state. If an artifact must reach the fleet,
+   box resumes the SID. What is absent is OFF-BOX durability FOR THE PER-SESSION HALF only
+   -- narrowed by g-306-477, which added steps 3-4 above: the GIT-TRACKED half of the agent
+   dir (journal, experience, changelog) is now committed and pushed by those steps and does
+   reach the remote. `sessions/<SID>/` is carried by `**/sessions/` in .gitignore, so that
+   half is still untracked and still local-only, and a machine-move after a worker stop
+   still strands it. If an artifact must reach the fleet,
    encode it to a `world/` or `meta/` store — those are not claim-gated. (rb-10330.)
 
-3. Close this session's telemetry record. The worker got a WP1 `active` record at
+6. Park this Body instead of leaving it `active` (g-306-477).
+   Bash: `py -3 core/scripts/body-manifest.py park --sid "$MIND_SID" --agent <agent-name> || true`
+
+   Returns `parked` | `already-parked` | `no-forked-wm` | `not-active`. Treat EVERY
+   non-`parked` return as a no-op and CONTINUE -- never fail the stop on it.
+
+   WHY PARK RATHER THAN LEAVE IT ACTIVE, and why this does NOT stage the WM. A /stop-ed
+   Body intends to resume by construction, so it must NOT be queued for merge -- staging
+   here would lose every turn of divergence after the reducer marks it merged, which is
+   exactly the argument park_body's own docstring makes. What parking buys over `active`
+   is the thing `active` lacks: a park clock and an EXPIRY path that runs the ORDINARY
+   genuine close, which stages and pushes through the single existing writer. An `active`
+   stopped Body that is never restarted stages its learning payload NEVER; a parked one
+   eventually does. No new state and no new staging logic.
+
+   A PARKED+STOPPED BODY DOES NOT RESUME POLLING, and both halves of that were VERIFIED
+   in source rather than inherited from this text: `park` advances the park orbit, but
+   worker-loop Phase -0-stop reads `sessions/<SID>/stop-requested` FIRST (SKILL.md:114),
+   ahead of the park-due gate (SKILL.md:145), so the stopped Body stands down instead of
+   re-polling (g-115-9461); and `stop-hook.sh:470` carries the ALLOW gate
+   `worker-net-body-parked`, so the turn-end is not trapped.
+
+7. Close this session's telemetry record. The worker got a WP1 `active` record at
    `/start` and never reaches the IDLE branch's WP2, so without this it orphans as
    permanently-`active` and pollutes the live-sessions query. Keyed on the WORKER's own
    `$MIND_SID`. guard-165: SID/agent via ENV, python source single-quoted.
    Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop")' >/dev/null 2>&1 || true`
 
-4. Clean this session's SID binding so PROJECT_ROOT does not accumulate one file per
+8. Clean this session's SID binding so PROJECT_ROOT does not accumulate one file per
    stopped worker. Idempotent.
    Bash: `rm -f ".active-agent-$MIND_SID"`
 
-5. Output: `"Worker Body stopped on this box. The reducer was NOT signalled — its claim, canonical working memory, and session state are untouched. This worker's per-session state is on LOCAL DISK ONLY — step 2 prunes the agent dir rather than pushing it — so a later /start on THIS box resumes the SID, and a machine-move strands it. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+9. Output: `"Worker Body stopped and PARKED on this box. The reducer was NOT signalled — its claim, canonical working memory, and agent-wide session state are untouched. This box's git-tracked agent state was committed and pushed by steps 3-4, so that half is durable off-box; the per-session state under sessions/<SID>/ is gitignored and remains on LOCAL DISK ONLY, so a later /start on THIS box resumes the SID and a machine-move still strands that half. The Body is now body_state=parked rather than active: it stays resumable, and if it is never restarted the park expires and the ordinary genuine close stages its learning payload. To stop the whole agent, run /stop <agent-name> on the reducer box."`
 
-   The "local disk only" wording is load-bearing and must track step 2. Until
+   The "local disk only" wording is load-bearing and must track step 5. Until
    2026-09-08 this string said the session state "has been staged and pushed",
    contradicting the ⚠ block directly above it — the block was corrected by
    g-115-9319 on 2026-09-07 and this user-facing sentence was not, so every

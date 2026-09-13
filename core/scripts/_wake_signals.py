@@ -18,11 +18,23 @@ Signal contract (must match interruptible-sleep.sh + session.py VALID_SIGNALS):
   email-received         inbox poll found new mail
   goal-claim-released    aspirations cmd_release ran
 
-Renaming any of these requires coordinated edits to:
-  - this file
-  - core/scripts/interruptible-sleep.sh
-  - core/scripts/session.py VALID_SIGNALS
-  - core/config/session-manifest.yaml (recovery_action: clear entry)
+NOT WRITTEN HERE, and listed precisely so the omission does not read as a gap:
+  perception-received    an environment CHANGE envelope reached /observe on a
+                         vessel (g-373-10). Its writer is the vessel runtime
+                         (Zak-Code), not this helper — these three are touched
+                         by MIND-side producers, and that one is produced
+                         outside the Mind entirely. The receiver side is shared:
+                         interruptible-sleep.sh polls it like any other, BLOCKER
+                         class.
+
+Renaming or adding a signal is a SEVEN-site change, not the four this list used
+to name (and not the three guard-374 names). Both undercounts were measured
+2026-09-13 (zeta, cc-02) against three existing signals as positive controls.
+The authoritative enumeration lives in ONE place — the `SIGNAL SYNC SITES` block
+in `core/scripts/interruptible-sleep.sh`, beside the *_FILE declarations. It is
+deliberately NOT copied here: this docstring having its own stale list is how a
+reader gets a confident four and misses the two cache modules, whose omission is
+silent (the sleep still looks right and simply never wakes).
 """
 
 import os as _os

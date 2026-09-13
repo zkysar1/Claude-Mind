@@ -4,8 +4,9 @@
 #
 # Verifies that interruptible-sleep.sh splits wake signals into two classes
 # and demotes informational signals during QUIESCENCE_SLEEP=1 mode:
-#   - blocker class (blocker-cleared, pq-resolved, email-received): always
-#     exits 2 outside the debounce window, regardless of QUIESCENCE_SLEEP.
+#   - blocker class (blocker-cleared, pq-resolved, email-received,
+#     perception-received): always exits 2 outside the debounce window,
+#     regardless of QUIESCENCE_SLEEP.
 #   - informational class (board-activity, goal-claim-released): exits 2
 #     when QUIESCENCE_SLEEP unset/0; consumes file but exits 0 (sleep
 #     completes) when QUIESCENCE_SLEEP=1.
@@ -101,6 +102,14 @@ run_case "pq-resolved-default"       "pq-resolved"     ""  2 "yes"
 run_case "pq-resolved-quiescent"     "pq-resolved"     "1" 2 "yes"
 run_case "email-received-default"    "email-received"  ""  2 "yes"
 run_case "email-received-quiescent"  "email-received"  "1" 2 "yes"
+# perception-received (). The QUIESCENT case is the load-bearing one
+# and is the whole reason this signal is BLOCKER rather than informational:
+# quiescence demotion exists because a PARTNER's activity does not change a
+# structurally user-gated queue, and a change to the resident's OWN WORLD is
+# the opposite of that. If someone later "tidies" this into the informational
+# group, the default case still passes and only this line fails.
+run_case "perception-received-default"   "perception-received" ""  2 "yes"
+run_case "perception-received-quiescent" "perception-received" "1" 2 "yes"
 
 # ── Informational class: exits 2 in default mode, demoted in quiescent ──
 run_case "board-activity-default"    "board-activity"      ""  2 "yes"
@@ -117,5 +126,5 @@ if [ "$FAIL_COUNT" -gt 0 ]; then
   echo "$FAIL_COUNT/$((PASS_COUNT + FAIL_COUNT)) test(s) failed"
   exit 1
 fi
-echo "All $PASS_COUNT signal-class cases verified (6 blocker, 4 informational, including 2 demoted)."
+echo "All $PASS_COUNT signal-class cases verified (8 blocker, 4 informational, including 2 demoted)."
 exit 0

@@ -601,8 +601,19 @@ def run_lane_e(cfg: dict, state_path: Path | None = None,
         return {"verdict": "unparseable", "rc": proc.returncode,
                 "stderr": (proc.stderr or "").strip()[-400:],
                 "head": (proc.stdout or "")[:200]}
+    # The content_* keys are carried through DELIBERATELY ( F5). The
+    # detector gained a content assertion beside its age assertion, and this
+    # tuple is a fixed allow-list: a key the script emits and this line does not
+    # name is dropped in silence, so the new verdict would never reach the lane
+    # record and nothing would be able to see it (the F6 lesson from that same
+    # goal — the consumer edit is part of the fix, not a follow-up).
+    # content_sha is included because a sha frozen across many ticks is exactly
+    # the F5 defect made visible; content_note carries the reason an unverified
+    # verdict was reached, which is the difference between "content is fine" and
+    # "nothing was compared".
     out = {k: r.get(k) for k in (
-        "age_hours", "threshold_hours", "last_modified", "bucket", "key")}
+        "age_hours", "threshold_hours", "last_modified", "bucket", "key",
+        "content_verdict", "content_sha", "content_entries", "content_note")}
     out["rc"] = proc.returncode
     # The SCRIPT's exit code is the contract, not its verdict string — the
     # string is for humans and the code is what this lane branches on.
@@ -614,6 +625,11 @@ def run_lane_e(cfg: dict, state_path: Path | None = None,
         out["verdict"] = "unreachable"
     else:
         out["verdict"] = "unknown-rc"
+    # NO content branch here, deliberately: the script folds a content mismatch
+    # into rc=1 rather than inventing a fourth code (its header explains why), so
+    # the mapping above already covers it. And an `unverified` content probe on an
+    # rc=0 run still STAMPS — the age question was measured and answered; the
+    # content probe merely declined to guess.
     if sp is not None and out["verdict"] in ("ok", "stale"):
         # Stamp only on a MEASURED answer. unreachable/timeout/spawn-error left
         # unstamped so the next tick retries rather than waiting the interval.

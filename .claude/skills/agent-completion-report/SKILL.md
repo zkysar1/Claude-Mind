@@ -144,29 +144,15 @@ All data comes from framework scripts — no direct JSONL reads.
    # APPEND YOUR READING HERE; do not add another dated paragraph. Five had
    # accumulated by 2026-08-21 and the sixth would have cost more to read than
    # the number is worth (learning-philosophy.md rule 5):
-   #   08-04 2d 100% (n≈?) · 08-15 2d 62.9% (n=35) · 08-18 39h 71.1% (n=38)
-   #   08-19 79.6h 73.5% (n=68) · 08-21 20.2h 81.1% (n=37, split 44/1261)
-   #   08-21 9.7h 65.0% (n=20, split 48/1262)  <- SECOND 08-21 reading, ~8h later
-   #   08-21 9.5h 75.0% (n=28, split 56/1262)  <- THIRD 08-21 reading, ~2h later
-   #   08-22 25h(date-floored) 100% (n=22, split 60/1262)
-   #   08-22 15.2h(date-floored 16.2h) 100% (n=14, split 62/1278)
-   #   08-24 32.5h(date-floored 48.8h) 86.2% (n=29, split 73/1279)  <- 3 CALENDAR DAYS
-   #   08-24 34.8h(date-floored 48.8h) 87.5% (n=32, split 76/1279)  <- SAME DAY, ~13min later, DIFFERENT BOX
-   #   08-24 63.3h(date-floored 83.9h) 83.3% (n=66, split 78/1279)
-   #   08-25 13.3h(date-floored 25.3h) 63.0% (n=27, split 40/1335)  <- BACKLOG DRAINED 78->40, COVERAGE FELL WITH IT
-   #   08-29 49.4h(date-floored 3 calendar days) 90.3% (n=31, split 50/1397)
-   #   08-30 99.94h(date-floored 5 calendar days) 93.3% (n=60, split 58/1397)  <- WIDEST WINDOW *AND* HIGHEST NON-100%, TOGETHER
-   #   08-31 102.5h 48.7% (n=39, split 22/1554)  <- WIDER THAN 08-30 AND HALF ITS COVERAGE, ONE DAY LATER
-   #   08-31 29.9h(date-floored 46.8h) 100% (n=14, split 22/1554)  <- SAME BOX-DAY, IDENTICAL STORE SPLIT, NARROWER WINDOW
-   #   09-02 27.85h(date-floored 2 calendar days) 100% (n=16, split 24/1577)  <- NEAR-EXACT REPLICATION OF THE ROW ABOVE, 2 DAYS LATER
-   #   09-02 21.2h(date-floored 37.2h) 100% (n=16, split 24/1577)  <- SMALLEST BACKLOG SINCE 08-31 (24), STILL 100% ON A ~1-DAY WINDOW; consistent with the 08-31 narrow row, not with the wide one
-   #   09-02 9.76h(date-floored 1 calendar day) 100% (n=20, split 31/1577)  <- THIRD 09-02 READING. Backlog GREW 24->31 and coverage HELD at 100%; the within-window backlog model predicts UP and 100% is the ceiling, so this row is SATURATED and tests nothing. Same-day window, so guard-2303 discounts it too. Recorded for the denominator, not as evidence.
-   #   09-05 28.06h(date-floored 2 calendar days) 100% (n=21, split 57/1588)  <- FOURTH consecutive 100%. Backlog GREW 31->57 (largest since 08-24's 78) and coverage HELD at the ceiling, which the within-window backlog model already predicts -- so this row is SATURATED and tests nothing, exactly like the 09-02 row above. Window spans 2 calendar days, so guard-2303's date-floor discount does NOT excuse it. Recorded for the denominator.
-   #   09-07 21.5h(date-floored 2 calendar days) 100% (n=7, split 35/1619)  <- FIFTH consecutive 100%, and the FIRST row where the backlog DRAINED (57->35) without coverage falling with it. Both prior drains fell (08-25 78->40 -> 63.0%; 08-31 58->22 -> 48.7%), so this is counter-evidence to the within-window backlog model -- but n=7 is the SMALLEST denominator in the series and one archival sweep moves it tens of points. Recorded for the denominator, NOT as a refutation.
-   #   09-08 25.6h(date-floored 2 calendar days) 100% (n=6, split 41/1619)  <- SIXTH consecutive 100% and the SMALLEST denominator in the series (n=6, under 09-07 n=7). Backlog GREW 35->41, and the within-window backlog model already predicts UP for a growing backlog, so this row is SATURATED and tests nothing -- in particular it does NOT corroborate the 09-07 row above, whose counter-evidence needed a DRAIN to say anything. Window spans 2 calendar days so guard-2303 does not excuse it either. Recorded for the denominator.
-   #   09-08 8.29h(date-floored 1 calendar day) 100% (n=4, split 16/1651)  <- SEVENTH consecutive 100% and the SMALLEST denominator in the whole series (n=4, under the 09-08 n=6 above and 09-07 n=7). Two discounts, both pointing the same way: the window is SAME-DAY so guard-2303's date-floor discount applies in full, and n=4 is one archival sweep away from anything. The one NON-saturated fact here: the resolved backlog DRAINED 41->16 (61%, the largest drain in the series by ratio) while archived grew 1619->1651, and coverage HELD at 100%. Both earlier drains fell hard WITH the backlog (08-25 78->40 -> 63.0%; 08-31 58->22 -> 48.7%) and 09-07 was the first hold (57->35, n=7). So this is the SECOND consecutive drain-hold -- recorded as a second WEAK counter-example to the within-window backlog model, never as a refutation: a date-floored n=4 is the weakest evidence the series can carry.
-   #   09-09 21.7h(date-floored 2 calendar days) 100% (n=6, split 18/1651)  <- EIGHTH consecutive 100%. Backlog GREW 16->18, and the within-window backlog model already predicts UP for a growing backlog, so this row is SATURATED and tests nothing -- in particular it does NOT corroborate the two drain-holds above, whose counter-evidence needed a DRAIN to say anything. Window spans 2 calendar days so guard-2303's date-floor discount does NOT excuse it either. Recorded for the denominator.
-   #   09-09 266.5h 11.6% (n=86, split 15/1658)  <- BREAKS THE EIGHT-ROW 100% RUN, and it is the strongest row in the series: the LARGEST denominator ever recorded here (n=86, vs the n=4/6/7 rows it follows) on the WIDEST window (266.5h, 2.6x the prior widest 102.5h), at the LOWEST coverage. The resolved backlog DRAINED 18->15 and coverage collapsed WITH it -- so this is a third drain-FALL (matching 08-25 78->40 -> 63.0% and 08-31 58->22 -> 48.7%) and it OUTWEIGHS the two n=7/n=4 drain-holds of 09-07/09-08 that were recorded as weak counter-evidence to the within-window backlog model: those rows are one archival sweep wide, this one is not. Consistent with the 08-31 WIDE row (102.5h, 48.7%), not with its narrow same-day twin. Window mix matters and is recorded: 227 in-window records but only 86 SCOREABLE (55 CONFIRMED, 31 CORRECTED) against 141 EXPIRED+UNRESOLVABLE -- an all-records count would have reported 4.4% and silently entered a different quantity into this series.
+   # > **The dated coverage readings that used to sit here — all 25, verbatim —
+   # > moved to `core/config/completion-report-coverage-readings.md` on 2026-09-11.**
+   # > Nothing was deleted. They had grown this skill to 68,622 B against a 65,536 B
+   # > injection ceiling, so the file was arriving TRUNCATED and the rows below the
+   # > cut were unreachable by the ritual that appends to them. **Append new readings
+   # > THERE, never here** — that is exactly the instruction the two prior instances
+   # > (felt-sense-readings.md, run-full-suite-baselines.md) had to add after the
+   # > same growth, and this is the third. The METHOD stays here, where it is needed
+   # > at the moment of use; the EVIDENCE lives in the ledger.
    # THE 08-30/08-31 PAIR IS THE CLEANEST WIDTH-CONTROLLED TEST IN THIS SERIES AND IT
    # SETTLES THE ARGUMENT: 99.94h -> 93.3%, then 102.5h -> 48.7% ONE DAY LATER. The
    # window got WIDER and coverage HALVED, so width cannot be the driver in either
@@ -446,6 +432,31 @@ All data comes from framework scripts — no direct JSONL reads.
         # field at once. Set substantive = false when the move is an artifact of
         # collection rather than of the product. The discriminator is the
         # DENOMINATOR (same one guard-2049 uses for the mirror case):
+        #   - FIRST, AND IT CAN SETTLE THE QUESTION ALONE (guard-3461): compare
+        #     the SNAPSHOT INTERVAL (since -> now; you already computed
+        #     snapshot_mtime for the baseline assertion above) against the
+        #     source's OWN WINDOW LENGTH. That length is MACHINE-READABLE — the
+        #     file declares `window_hours` at TOP LEVEL (24 on both sides here),
+        #     so this is a computed test, not a reading assignment: refuse the
+        #     comparison when (now - snapshot_mtime) > window_hours. `sources.ci`
+        #     is the rolling counter it governs (outcome-metrics-collect.sh runs
+        #     `gh run list --limit 50` and keeps the last 24h), so on ANY report
+        #     window wider than window_hours the two samples share NO MEMBER and
+        #     the delta is not movement at all.
+        #     Do not report it as a bigger, smaller or unchanged number. This is
+        #     categorically different from the bullets below, which say DECOMPOSE
+        #     the number: here decomposition cannot help, so REFUSE the
+        #     comparison. Note the shape — this test asks about the SAMPLE, while
+        #     every bullet below asks about a FIELD (guard-5947), which is why a
+        #     field-only reading passes them all and is still wrong.
+        #     Found during g-001-04 2026-08-11 at THIS site (interval 46h38m vs
+        #     window 24h, reported as "one additional green CI run"); RECURRED
+        #     here 2026-09-11, interval 51.1h, ci runs_total 23 -> 1 pass_rate
+        #     0.957 -> 1.0, which trips NO bullet below (no zero crossing, no
+        #     shape change, nothing landed on zero) yet is pure window turnover.
+        #     The guardrail existed both times and the discriminator did not
+        #     carry it — that gap is why this bullet is here and not only in
+        #     guard-3461.
         #   - the source's own denominator (runs_total, row count, sample size)
         #     crossed zero in EITHER direction — 2->0 or 0->6 alike; a window
         #     that empties and a window that refills are both the collector
@@ -713,6 +724,29 @@ Since: {since_timestamp} ({hours}h {min}m ago)
      g-001-04 is 22/76 = 28.9% (last catch 2026-09-06) against its 5/40 = 13% row -- the
      rate more than DOUBLED as the denominator grew, so a low row is not a durable
      property of a goal. Re-measure before quoting any row above.
+     ⚠⚠ THE ROW ABOVE IS A CROSS-AGENT COMPARISON, NOT A TIME SERIES — annotated
+     2026-09-10 (echo, cc-03), and this is a mis-ATTRIBUTION from the start, not a figure
+     that went stale (guard-6138: measure WHEN it went wrong before writing the
+     correction). `g-001-04` is a PER-AGENT goal id: five agents each carry their own
+     under their own `asp-001` with independent counters. All five dirs read at ONE
+     instant: agents/echo 40/100 = 40.0% (ac=125) · agents/zeta 23/77 = 29.9% (ac=95) ·
+     agents/alpha 9/47 = 19.1% (ac=115) · agents/bravo 3/20 = 15.0% (ac=134) ·
+     agents/foxtrot 9/71 = 12.7% (ac=76). So the `22/76 = 28.9%` above is ZETA's row
+     (23/77 today, +1/+1 after one firing) and the `5/40 = 13%` it is compared against is
+     a DIFFERENT agent's; echo's own row was already 39/99 = 39.4% two days before this
+     annotation and is 40/100 now, i.e. FLAT. The instruction "re-measure before quoting"
+     is correct and is exactly what caught this; the evidence offered for it was a
+     12.7%-40.0% spread at one moment read as one goal's history. **ALWAYS PRINT THE
+     OWNING AGENT DIR BESIDE ANY PER-AGENT RATE, AND NEVER COMPARE TWO DATED READINGS
+     UNLESS BOTH NAME THE SAME DIR.** (Echo's g-001-04 trap (28) carries the same
+     correction from the report side.)
+     ⚠⚠ FLEET BAND RE-MEASURED 2026-09-10 (echo, cc-03): **1,129 hits / 2,878 runs =
+     39.2%** across 107 recurring rows, 103 carrying a run history — against the
+     2026-08-22 census's 652/1,939 = 33.6%. Two of that census's named landmarks have
+     MOVED and the replacements are measured, not inferred: the recorded FLOOR
+     (g-115-105 at 10/175 = 5.7%) is superseded by **g-115-151 at 3/59 = 5.1%**, and the
+     recorded CEILING (g-326-85 at 96/130 = 74%) by **g-306-284 at 128/146 = 87.7%**.
+     The spread is the meaning; the aggregate is a BAND, never a target.
      ⚠ AND TREAT IT AS AN UPPER BOUND, NOT A POINT ESTIMATE (guard-3232). A
      recurring close killed mid-sequence lands lastAchievedAt/achievedCount inside
      do_verify but never reaches recurring-close.sh's own counter heredoc, so

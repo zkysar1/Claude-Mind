@@ -102,9 +102,22 @@ _CONF_RANK = {"deterministic": 2, "heuristic": 1, "none": 0}
 PQ_RE = re.compile(r"\bpq-[A-Za-z0-9][A-Za-z0-9_.-]*")
 _PQ_TRAILING = ".-_,;:)]}"
 # A defer's premise "resource" for the guard-1249 shared-premise grouping: the first
-# snake_case-ish token after the prefix, which is how these defers are conventionally
-# written (`human_blocked: wsl2_localhost_relay_down on the Studio host`).
-PREMISE_RE = re.compile(r"^human_blocked:\s*([a-z0-9]+(?:_[a-z0-9]+){1,})")
+# SLUG token after the prefix. BOTH separators are accepted, and the second one is the
+# load-bearing half. This was written snake_case-only, asserting that is "how these
+# defers are conventionally written" — measured 2026-09-13 (zeta, cc-02) that claim is
+# FALSE: 0 of 19 live human_blocked defers matched, so `shared_premise_clusters` had
+# been permanently `{}`, which reads exactly like the healthy answer "no shared premises
+# exist". The live convention is KEBAB-case, per CLAUDE.md "lowercase, kebab-case
+# (hyphens, no spaces, no underscores)" — the writers followed the house rule and the
+# regex did not. Four defers declare `quiet-window` membership of  in plain
+# text (, , , and the master handle itself) and the join
+# could not see a single one. Blast radius enumerated BEFORE the change (guard-2499):
+# widening to [_-] newly matches exactly those 4, forming one cluster, zero singletons
+# and zero prose false positives — a prose defer cannot be caught by it, because its
+# first two words are separated by a SPACE, which is in neither character class.
+# Positive control for any future edit here: `human_blocked: dev_pool_session ...`
+# must match with group(1) == "dev_pool_session".
+PREMISE_RE = re.compile(r"^human_blocked:\s*([a-z0-9]+(?:[_-][a-z0-9]+){1,})")
 
 
 def _read_goals(source: str) -> tuple[list[dict], str | None]:

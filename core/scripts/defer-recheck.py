@@ -686,8 +686,11 @@ def _run(argv, input_text=None):
     return result.returncode, result.stdout, result.stderr
 
 
-def _py(args, input_text=None):
-    return _run([sys.executable] + args, input_text=input_text)
+# (g-115-9621) _py deleted with its last caller, _clear_defer, which now routes
+# through _rt.aspirations_update_goal. `_run` above STAYS — it is still used for
+# read-only `git log` / merge-base probes, which are not daemon-migrated
+# operations and are the legitimate use of a subprocess here. What must not come
+# back is a sys.executable hop into a migrated core/scripts CLI.
 
 
 def _read_goals(source):
@@ -803,18 +806,35 @@ def _age_hours(ts):
 
 
 def _clear_defer(source, goal_id):
-    """Clear defer_reason via aspirations.py update-goal.
+    """Clear defer_reason via the typed daemon client.
 
-    INVARIANT: uses sys.executable directly (not a bash subprocess). Shelling
-    through bash for core/scripts/*.sh wrappers has been unreliable from
-    Python on Windows — bash can resolve to WSL bash.exe with different PATH
-    resolution. Same rationale as blocker-recheck.py _py(). The shell wrapper
-    aspirations-update-goal.sh just sources _paths.sh + execs aspirations.py,
-    so calling aspirations.py directly loses nothing functional."""
-    rc, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
-                    "--source", source, "update-goal",
-                    goal_id, "defer_reason", "null"])
-    return rc == 0
+    Returns (ok, detail) — detail is None on success, else the daemon's own
+    error body. Callers MUST surface detail, never reduce it to a boolean
+    (rb-10397).
+
+    THE DELETED "INVARIANT" (g-115-9621). This docstring used to assert: "The
+    shell wrapper aspirations-update-goal.sh just sources _paths.sh + execs
+    aspirations.py, so calling aspirations.py directly loses nothing
+    functional." That was true before the 2026-05-14 daemon cutover and has
+    been FALSE since: the wrapper is daemon-aware and its real body is
+    `rt_call POST /v1/aspirations/update-goal`, so calling aspirations.py
+    direct loses the entire daemon path. It survived four months because it
+    reads as a reasoned invariant rather than a dated claim (rb-8970: an
+    in-file comment asserting its own context is not evidence).
+
+    The half of it that is STILL TRUE — do not shell out to the .sh wrapper
+    from Python — is now enforced by guard-1322 / guard-555 and satisfied by
+    this typed client, which reaches the daemon over urllib with no bash in
+    the path at all. Measured 2026-09-11: the old CLI call failed on cc-13
+    ('NoneType' object has no attribute 'get', every eligible goal
+    clear_failed) while succeeding on cc-02 — same own-cloud backend. Box-
+    dependent silence is the failure mode this replaces."""
+    try:
+        _rt.aspirations_update_goal(goal_id, "defer_reason", None,
+                                    source=source)
+    except _rt.RtError as e:
+        return False, str(e.body or e)
+    return True, None
 
 
 def main():
@@ -922,8 +942,13 @@ def main():
                              "pattern": new_match["pattern"]}
                     would_clear.append(g["id"])
                     if args.apply:
-                        ok = _clear_defer(g["_source"], g["id"])
+                        ok, clear_error = _clear_defer(g["_source"], g["id"])
                         entry["action"] = "cleared" if ok else "clear_failed"
+                        if not ok:
+                            # Surface the daemon body, not just a count (rb-10397).
+                            entry["clear_error"] = clear_error
+                            print("defer-recheck: clear FAILED for %s: %s"
+                                  % (g["id"], clear_error), file=sys.stderr)
                         if ok:
                             cleared += 1
                             _append_metric(metrics_path, {
@@ -998,8 +1023,13 @@ def main():
         would_clear.append(g["id"])
 
         if args.apply:
-            ok = _clear_defer(g["_source"], g["id"])
+            ok, clear_error = _clear_defer(g["_source"], g["id"])
             entry["action"] = "cleared" if ok else "clear_failed"
+            if not ok:
+                # Surface the daemon body, not just a count (rb-10397).
+                entry["clear_error"] = clear_error
+                print("defer-recheck: clear FAILED for %s: %s"
+                      % (g["id"], clear_error), file=sys.stderr)
             if ok:
                 cleared += 1
                 # LOAD-BEARING: log ONLY after the clear succeeds. Reordering

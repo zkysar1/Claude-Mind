@@ -340,6 +340,22 @@ stale_sentinel:
 stale_cadence:
   threshold_iterations: 3   # consecutive canary runs with a cadence still FIRING (dispatch skipped) before filing Investigate
 
+# Signal-liveness canary () — the THIRD member of the canary family, and
+# the one asking a different question. stale_sentinel and stale_cadence ask whether
+# a RITUAL is being skipped; this one asks whether an INSTRUMENT can still produce a
+# NON-CLEAR answer at all. A detector that has silently lost that ability renders
+# identically to one reporting all-clear, so nothing downstream can tell them apart.
+# Counts consecutive DEAD verdicts per registered signal and files an Investigate at
+# threshold; an assertion that cannot be EVALUATED resets the counter and never fires
+# (always-ALARM is the same defect as always-CLEAR). Read by
+# core/scripts/signal-liveness-canary.py::_read_threshold, whose in-code fallback is
+# the SAME 3 — so this section makes the documented knob real without changing
+# behaviour (guard-4282: the value and the prose that justifies it are two artifacts).
+# WHY its own cadence here rather than a baseline in meta/audit-baselines.yaml:
+# core/config/rationale/signal-liveness-cadence.md
+signal_liveness:
+  threshold_iterations: 3   # consecutive canary runs with a signal DEAD before filing Investigate
+
 # --- PRECHECK BUDGET CAP (Magic Wand 2 — ) ---
 # Budget cap on aspirations-precheck wall-clock cost. When cumulative precheck
 # elapsed-ms exceeds budget_pct of iteration_budget_ms, deferrable sweeps are
@@ -785,6 +801,55 @@ strategic_scan:
 # core/scripts/fresh-eyes-cadence-check.sh.
 
 fresh_eyes_review:
+  # team_aware is deliberately ABSENT (i.e. false) — justified, not overlooked
+  # (2026-09-11). Both sibling rituals below carry `team_aware: true`, so the
+  # absence HERE reads as an oversight, and has now been proposed more than once
+  # as a one-line fix. It is not a gap. The siblings review SHARED resources —
+  # fresh_eyes_program targets program.md, fresh_eyes_tree the world knowledge
+  # tree — where a second agent's pass genuinely IS a duplicate. This ritual
+  # targets agents/<agent>/self.md, which is PER-AGENT (see min_session_goals
+  # below, whose own comment says "per-agent Self briefing"). bravo reviewing
+  # bravo's identity is not a duplicate of alpha reviewing alpha's, so there is
+  # nothing to suppress.
+  #
+  # WHY THE ONE-LINE FIX IS ACTIVELY HARMFUL, not merely unnecessary: team
+  # suppression keys on the SLOT NAME ALONE. team_stamp_value(slot_name) reads
+  # the shared team-state file's shared_cadences.<slot_name> with NO agent
+  # dimension (fresh-eyes-cadence-check.py:118-134), and the predicate that
+  # consumes it (:528) compares only the fleet-global world-goal count.
+  # `fired_by` IS written into the stamp but is consulted NOWHERE in that
+  # predicate — it appears only in report/message text (:580, :613) — so it
+  # cannot scope suppression per agent without new code. Setting team_aware:
+  # true therefore makes the FIRST agent to fire suppress EVERY other agent for
+  # the next `goal_cadence` WORLD goals: on an N-agent fleet each agent's own
+  # identity audit fires ~N times LESS often, the exact inverse of this
+  # ritual's purpose.
+  #
+  # TRIGGER TO REVISIT: only if self.md becomes a shared artifact, or if
+  # suppression gains an agent dimension (stamp keyed <slot>__<agent>, or the
+  # predicate actually reading fired_by). Neither is true today. Precedent for
+  # documenting a justified absence this way: l1_skew_check below ().
+  #
+  # THIS IS NOT A CLEAN BILL OF HEALTH — there IS a real defect here, and
+  # team_aware is simply not its fix. The stamp (`wm_slot` below) lives in
+  # agents/<agent>/session/working-memory.yaml, which .gitignore:149
+  # (`**/session/`) makes BOX-LOCAL, while the counter it is diffed against
+  # sums the SHARED world queues (fresh-eyes-cadence-check.py:68-105). So one
+  # AGENT moving between boxes carries no stamp with it: measured 2026-09-11,
+  # alpha read diff=785 against goal_cadence=25 on cc-14 (31x over, gate
+  # permanently open) having already fired four times that day on two other
+  # boxes. THREE boxes, one agent, one afternoon, three different gate
+  # readings — cc-14 diff=785 (31x), DESKTOP-O91DLK2 diff=8 (under), cc-04
+  # diff=59 (2.36x, fresh-eyes N=157) — is the spread this paragraph predicts,
+  # and it is why no single box's reading can be quoted as "the" cadence state.
+  # It fails OPEN — more ritual, never less, so no error and no alarm.
+  # The stamp is keyed by BOX where it should be keyed by AGENT; team_aware
+  # would key it by NEITHER. The correct home already exists and is neither of
+  # the two options a sibling comparison offers: world/team-state/agents/
+  # <name>.yaml is per-agent, under the shared world path, and NOT gitignored.
+  # Not built here: framework-lane, no product outcome to name, so the standing
+  # generation brake applies. Encoded rb-10628 / guard-6523 (which supersede
+  # rb-10614 / guard-6505 — those prescribed the team_aware fix and are wrong).
   goal_cadence: 25              # Every N completed goals — goal-count cadence only
   wm_slot: last_fresh_eyes_review
   report_glob: "fresh-eyes-[0-9]*.md"  # g-115-1308 auto-reconcile: glob for THIS

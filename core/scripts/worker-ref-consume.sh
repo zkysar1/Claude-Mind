@@ -277,15 +277,35 @@ print("")' 2>/dev/null)"
   safe_just="${FORCE_RETIRE_LIVE_JUST//\"/\'}"
   liveness_override_field=""
   [ -n "$safe_just" ] && liveness_override_field=",\"liveness_override\":\"$safe_just\""
-  printf '{"ref":"%s","tip_sha":"%s","retired_at":"%s","retired_by_agent":"%s","verified_ancestor_of_origin_main":"%s","body_row":"%s"%s,"recreate_with":"git push origin %s:%s"}\n' \
+  # : the receipt is written BEFORE the destructive push and stays that
+  # way (archive-before-delete.md: a receipt for an undeleted ref is harmless, a
+  # deleted ref with no receipt is unrecoverable). So this line can only ever
+  # mean "a retirement was ATTEMPTED" — `retired_at` is the attempt time, not a
+  # completion claim. It says so now, and a SECOND append below records which
+  # way the push actually went. Append-only, one write per line, both ways.
+  # READING THE LEDGER: a record with NO `outcome` field predates this change
+  # (71 such records at the time it landed) and its disposition is UNKNOWN —
+  # never read an absent marker as success.
+  printf '{"ref":"%s","tip_sha":"%s","retired_at":"%s","retired_by_agent":"%s","verified_ancestor_of_origin_main":"%s","body_row":"%s"%s,"outcome":"attempted","recreate_with":"git push origin %s:%s"}\n' \
     "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}" "$main_sha" "${body_row_state//\"/\'}" "$liveness_override_field" "$tip_sha" "$RETIRE_REF" \
     >> "$receipt_dir/worker-ref-retirements.jsonl"
   if git -C "$REPO" push origin ":$RETIRE_REF" >/dev/null 2>&1; then
     git -C "$REPO" update-ref -d "$RETIRE_REF" 2>/dev/null || true
+    printf '{"ref":"%s","tip_sha":"%s","outcome":"delete_succeeded","at":"%s"}\n' \
+      "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" \
+      >> "$receipt_dir/worker-ref-retirements.jsonl"
     log "retired $RETIRE_REF (tip $tip_sha reachable from origin/main $main_sha)"
     log "receipt: core/logs/worker-ref-retirements.jsonl — recreate with: git push origin $tip_sha:$RETIRE_REF"
     exit 0
   fi
+  # The push lost. Mark the attempt so the ledger cannot be read as a completed
+  # retirement — this is the record the  defect was losing. Reachable,
+  # not theoretical: two agents seeing the same stale carrier both pass the
+  # reachability and liveness gates, the first deletes, and this push fails
+  # "remote ref does not exist" with a receipt already on disk.
+  printf '{"ref":"%s","tip_sha":"%s","outcome":"delete_failed","at":"%s"}\n' \
+    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" \
+    >> "$receipt_dir/worker-ref-retirements.jsonl"
   log "remote delete FAILED for $RETIRE_REF — receipt written but the ref still exists on origin; retry later" >&2
   exit 1
 fi
@@ -426,6 +446,131 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   fw_count="$(printf '%s' "$fw_all" | grep -c . || true)"
   fw="$(printf '%s' "$fw_all" | head -50)"
   fw_more=$(( fw_count > 50 ? fw_count - 50 : 0 ))
+  # DEMAND-SIGNAL CONTENT TEST ( occ188, 2026-09-12, alpha cc-04).
+  # `fw_count` above answers "what framework paths did this ref's commits
+  # TOUCH" — a three-dot question, and three-dot is the RIGHT instrument for
+  # it (guard-3094 / guard-4573: a two-dot range attributes main's own advance
+  # to the ref, sign-inverted). Do NOT "fix" that line to two-dot.
+  # But `fw_count` ALSO gates pull_tip_count below, and that is a different
+  # question: "would merging this ref change a framework path HEAD lacks?"
+  # Content that reached main by ANY OTHER ROUTE — a sibling ref's merge, or a
+  # hunk-carry landing the same blobs under a different commit — leaves this
+  # ref's own commits unreachable, so the three-dot list keeps naming those
+  # paths forever while merging them is a no-op.
+  # MEASURED occ188: ref ddcd6db0 reported framework_files=4 naming
+  # _split_repo.py, completed-not-committed-sweep.py, gates/uncommitted_work.py
+  # and test_split_repo_shared.py. All four blobs were byte-identical at HEAD,
+  # origin/main AND the ref — occ187 carried those hunks and landed them as
+  # 34173042b7. three-dot=4, two-dot=0, merge-tree=0. echo/cc-03 read the 4,
+  # raised a pull_signal naming "4 framework file(s)", and re-promoted this
+  # goal out of cadence (+4.00) on a payload that did not exist.
+  # WHY THE EXISTING DISCRIMINATOR MISSES IT: the occ165 correction tests
+  # merge-tree over the WHOLE ref. This ref's agent-store delta is genuinely
+  # outstanding, so the whole-ref test correctly returns NOT-phantom while the
+  # framework half is entirely phantom. Per-path is the resolution — same
+  # instrument, finer granularity.
+  # `mt_total` is the SAME merge-tree read, UNFILTERED: how many paths of ANY
+  # kind merging would change. It exists because fw_real=0 and "merging is a
+  # no-op" are DIFFERENT CLAIMS, and occ188's own fix stated the second while
+  # measuring only the first (occ189, 2026-09-12, alpha cc-04). A ref whose
+  # framework half is 100% phantom can still carry a live agent-store delta —
+  # that is not hypothetical, it is the state ddcd6db0 was in at 02:29 on the
+  # very firing that shipped the fw_real gate: four phantom framework blobs
+  # beside a genuinely outstanding experience.jsonl. Telling an operator "do
+  # NOT merge, this yields a no-op merge commit" on that ref discards real
+  # content on the strength of a measurement that never looked at it.
+  # mt_total is DELIBERATELY NOT a second pull-signal gate — the demand signal
+  # is framework-only by design and stays keyed on fw_real. This value governs
+  # WORDING only: which of the two claims --check is entitled to make.
+  # -1 = UNMEASURED (old-format merge-tree / unresolvable tree). Where that
+  # value actually surfaces is the `merge_paths_real` JSON field and the
+  # fail-open note on the merge recommendation below — NOT a third phantom
+  # message. This comment claimed the opposite for one hour (occ190,
+  # 2026-09-12): an unreadable merge-tree also leaves fw_real at fw_count>0,
+  # so the phantom block is not entered at all and no fallback sentence there
+  # can ever print. Proved by running it, not by reading it (guard-3478):
+  # a PATH shim returning a blob oid from `git merge-tree` — the exact
+  # "unresolvable tree" cause named above — printed `merge with:`.
+  # THE ENTRY CONDITION WAS `fw_count > 0` AND THAT LEFT THE ONE CLASS mt_total
+  # EXISTS FOR PERMANENTLY UNMEASURED (occ191, 2026-09-12, alpha cc-04). A ref
+  # with framework_files=0 and commits_ahead>0 is PURE agent-store — no
+  # framework half at all — so it skipped the block entirely and reported
+  # merge_paths_real=-1 forever, while the report block below (gated on the
+  # same `fw_count > 0`) printed NO detail line for it at all. That is exactly
+  # the trap guard-6539 was written for on THIS ref: "framework_files=0 means
+  # carries nothing under core/ or .claude/ — it does NOT mean safe to merge."
+  # A guardrail cannot outvote the instrument it guards (guard-1984), so the
+  # measurement moves into the instrument.
+  # MEASURED occ191, ref faec5e55 (ahead=4, fw_count=0): merge-tree says
+  # merging changes ONE path, agents/alpha/changelog.jsonl, as 0 insertions /
+  # 99 DELETIONS — 99 append-only audit records from 04:36-04:38 that exist at
+  # HEAD and not in the carrier's snapshot. The old report said nothing at all.
+  # WIDENING CANNOT RAISE THE DEMAND SIGNAL, which is why this direction is
+  # safe: fw_real filters the merge-tree result to framework prefixes, and the
+  # merge result vs HEAD is a SUBSET of the three-dot touch list, so
+  # fw_real <= fw_count always — at fw_count=0 the new branch leaves fw_real 0
+  # and pull_fw_total/pull_tip_count are untouched. It adds a measurement, not
+  # a signal (guard-2499's widening rule, measured over all 4 live refs).
+  # mt_add/mt_del carry DIRECTION. "merging would change N path(s)" reads as N
+  # paths of NEW content, which is the occ189 overclaim one level down: a
+  # carrier is a SNAPSHOT of a moving set, so its delta is routinely a LOSS.
+  # This is the numstat guard-6539 prescribes, taken from the merge-tree result
+  # rather than the three-dot touch list (occ188: three-dot answers "what did
+  # these commits touch", never "what would merging change").
+  fw_real="$fw_count"
+  mt_total=-1
+  mt_add=-1
+  mt_del=-1
+  mt_conf=-1
+  mt_conf_paths=""
+  if [ "$fw_count" -gt 0 ] || [ "$ahead" -gt 0 ]; then
+    # ONE read, THEN split it three ways. The `| head -1` that extracts the tree
+    # oid is correct and stays (guard-6648 clause 1) — but as the ONLY consumer
+    # of this command it also discarded the CONFLICT report on lines 2..N, and,
+    # because `$?` after a pipeline is the LAST stage's, merge-tree's own rc as
+    # well (guard-1473 / guard-696 / guard-1150; guard-5244 is this same defect
+    # one context over, on `git merge` output). That is guard-6648 clause 2 —
+    # "read the conflict report as signal" — which was never implemented.
+    # MEASURED occ192 (2026-09-13, alpha cc-04, uname 6.8.0-139-generic) on ref
+    # faec5e55: merge-tree rc=1, 11 lines, "CONFLICT (add/add)" on an agent
+    # experience file — and --check printed "append-only (+171 / -0): safe
+    # shape. Merge only if the content is wanted". Both halves were wrong, not
+    # just the verdict: new-mode merge-tree still WRITES a tree for a conflicted
+    # merge, with conflict markers embedded in the conflicting blob, so every
+    # count below was taken over a tree that can never be committed as-is — that
+    # one path carried 3 markers and contributed 79 of the 171 "added" lines.
+    # NEGATIVE CONTROL, same run, ref ddcd6db0: rc=0, 1 line, no CONFLICT.
+    # Both discriminators are free and already in this output.
+    _mtout="$(git -C "$REPO" merge-tree HEAD "$ref" 2>/dev/null)"; _mtrc=$?
+    _mt="$(printf '%s\n' "$_mtout" | head -1)"
+    mt_conf_paths="$(printf '%s\n' "$_mtout" | sed -n 's/^CONFLICT ([^)]*): Merge conflict in //p')"
+    if [ -n "$_mt" ] && git -C "$REPO" rev-parse --verify -q "$_mt^{tree}" >/dev/null 2>&1; then
+      # Only inside this branch is a 0 a MEASUREMENT rather than an absence —
+      # outside it the merge-tree read did not resolve, and mt_conf stays -1
+      # (UNMEASURED) under the same convention mt_total/mt_add/mt_del use.
+      mt_conf="$(printf '%s' "$mt_conf_paths" | grep -c . || true)"
+      case "$mt_conf" in ''|*[!0-9]*) mt_conf=0;; esac
+      # rc!=0 with no parsed CONFLICT line is still a conflicted merge — trust
+      # the status over the parse, and never let a wording change silently
+      # downgrade the disclosure to "clean".
+      [ "$_mtrc" -ne 0 ] && [ "$mt_conf" = 0 ] && mt_conf=1
+      fw_real="$(git -C "$REPO" diff --name-only HEAD "$_mt" 2>/dev/null \
+                 | grep -cE '^(core/|\.claude/|CLAUDE\.md|mind_api/src/|mind_api/tests/)' || true)"
+      case "$fw_real" in ''|*[!0-9]*) fw_real="$fw_count";; esac
+      mt_total="$(git -C "$REPO" diff --name-only HEAD "$_mt" 2>/dev/null | grep -c . || true)"
+      case "$mt_total" in ''|*[!0-9]*) mt_total=-1;; esac
+      _ns="$(git -C "$REPO" diff --numstat HEAD "$_mt" 2>/dev/null \
+             | awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {a+=$1; d+=$2} END {printf "%d %d", a+0, d+0}')"
+      case "$_ns" in
+        [0-9]*' '[0-9]*) mt_add="${_ns% *}"; mt_del="${_ns#* }" ;;
+        *) mt_add=-1; mt_del=-1 ;;
+      esac
+    fi
+    # Else: old-format merge-tree, or an unresolvable tree — FAIL OPEN to
+    # fw_count (set above). Under-signalling is the worse error here: a
+    # suppressed pull signal strands framework work silently, while a false
+    # one costs one extra drain pass (guard-3660's asymmetry, same direction).
+  fi
   # Goal ids NAMED by the unlanded commits (). `commits_ahead` and
   # `framework_files` say HOW MUCH is stranded; nothing said WHAT WORK it is,
   # so a reader deciding "drain now or later?" had no way to see that a ref
@@ -474,8 +619,8 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   if [ "$ahead" -gt 0 ] && [ "$is_self" = 0 ] && [ -z "$superseded_by" ]; then
     is_tip=1
     n_outstanding=$((n_outstanding+1))
-    if [ "$fw_count" -gt 0 ]; then
-      pull_fw_total=$((pull_fw_total+fw_count))
+    if [ "$fw_real" -gt 0 ]; then
+      pull_fw_total=$((pull_fw_total+fw_real))
       pull_tip_count=$((pull_tip_count+1))
       [ -z "$pull_first_ref" ] && pull_first_ref="$ref"
     fi
@@ -502,11 +647,28 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   if [ "$AS_JSON" = 1 ]; then
     [ "$first" = 0 ] && printf ','
     first=0
-    printf '{"ref":"%s","agent":"%s","sid":"%s","commits_ahead":%s,"framework_files":%s,"is_self":%s,"superseded_by":"%s","oldest_unlanded_age_h":%s,"unreadable":%s,"sync_merges":%s,"goal_ids":"%s"}' \
-      "$ref" "$agent" "$sid" "$ahead" "$fw_count" "$is_self" "$superseded_by" "$age_h" "$unreadable" "$sync_merges" "$goal_ids"
+    # merge_paths_real is the machine half of the occ189 correction: -1 means
+    # UNMEASURED (never 0 — a consumer reading -1 as "no-op" inverts the
+    # fail-open direction the fw_real block is built on). merge_added_real /
+    # merge_deleted_real carry DIRECTION under the same -1 convention (occ191):
+    # a path count alone cannot distinguish content arriving from content being
+    # dropped by a stale carrier, and on an append-only store the second is the
+    # common case. merge_conflicts_real (occ192) is the machine half of the
+    # CONFLICT disclosure, same -1 convention: a consumer reading -1 as "clean"
+    # makes exactly the claim the human line refuses to make. 0 means MEASURED
+    # clean — it is set only inside the resolved-tree branch.
+    printf '{"ref":"%s","agent":"%s","sid":"%s","commits_ahead":%s,"framework_files":%s,"is_self":%s,"superseded_by":"%s","oldest_unlanded_age_h":%s,"unreadable":%s,"sync_merges":%s,"goal_ids":"%s","framework_files_real":%s,"merge_paths_real":%s,"merge_added_real":%s,"merge_deleted_real":%s,"merge_conflicts_real":%s}' \
+      "$ref" "$agent" "$sid" "$ahead" "$fw_count" "$is_self" "$superseded_by" "$age_h" "$unreadable" "$sync_merges" "$goal_ids" "$fw_real" "$mt_total" "$mt_add" "$mt_del" "$mt_conf"
   else
     tag=""; [ "$is_self" = 1 ] && tag="  (this body — nothing to consume)"
     [ "$sync_merges" -gt 0 ] && tag="$tag  (+$sync_merges content-free sync merge(s) of origin/main — not counted)"
+    # A PHANTOM framework payload and a real one rendered IDENTICALLY until
+    # occ188 — the number the reader acts on is framework_files, so say so on
+    # the same line rather than leaving it to be re-derived (guard-1984: the
+    # instrument has to carry the correction, not only the guardrail).
+    # "contributes nothing" was the same occ189 overclaim as the merge line
+    # below: fw_real=0 means no FRAMEWORK payload, not an empty merge.
+    [ "$fw_count" -gt 0 ] && [ "$fw_real" = 0 ] && tag="$tag  [PHANTOM framework payload: all $fw_count file(s) already at HEAD by another route — no framework payload, no pull signal raised]"
     echo "  $ref"
     echo "      agent=$agent sid=$sid  commits_ahead=$ahead  framework_files=$fw_count  oldest_unlanded=${age_h}h$tag"
     # WHAT work is stranded, not just how much (). Printed for every
@@ -522,7 +684,100 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
     elif [ "$fw_count" -gt 0 ] && [ "$is_self" = 0 ]; then
       printf '%s\n' "$fw" | sed 's/^/        /'
       [ "$fw_more" -gt 0 ] && echo "        ... and $fw_more more (display capped at 50; framework_files above is the FULL count)"
-      echo "      merge with: bash core/scripts/worker-ref-consume.sh --merge $ref"
+      if [ "$fw_real" = 0 ]; then
+        # Recommending a merge whose content is already at HEAD is precisely
+        # the redundant no-op merge step (0) of  exists to prevent.
+        # The file list above still prints — those ARE the paths this ref's
+        # commits touched, which is worth seeing — but the ACTION must follow
+        # the content test, not the touch list (occ188).
+        # THREE MESSAGES, NOT ONE (occ189): fw_real=0 licenses only the
+        # FRAMEWORK claim. Whether the merge is a no-op is a WIDER claim that
+        # needs mt_total, or the reader is told to discard a live agent-store
+        # delta on the strength of a framework-only reading (guard-5122: a
+        # proposed remedy carries the evidentiary standing of its diagnosis).
+        # The no-op claim is the STRONGEST claim in this file, so it carries the
+        # conflict conjunct even though mt_total=0 nearly implies mt_conf=0 (an
+        # equal tree cannot hold markers). "Nearly" is the whole point: mt_conf
+        # is also forced to 1 by a non-zero merge-tree rc whose CONFLICT line
+        # this parse missed, and that is precisely the state in which "genuine
+        # no-op" must not be asserted (occ192).
+        if [ "$mt_total" = 0 ] && [ "$mt_conf" = 0 ]; then
+          echo "      do NOT merge: every framework path above is already at HEAD (landed by another route), and the WHOLE-ref merge-tree equals HEAD's tree — merging yields a genuine no-op merge commit. Disposition = CARRY; retirability is decided by the live in_flight_bodies row + ancestry, never by this reading (guard-3660)."
+        elif [ "$mt_total" -gt 0 ] 2>/dev/null; then
+          echo "      no FRAMEWORK payload: all $fw_count framework path(s) above are already at HEAD, so no pull signal is raised (that gate is framework-only). This is NOT a no-op merge — merging would still change $mt_total path(s), which is agent-store content. Decide on THAT content, not on the framework count."
+        else
+          # UNREACHABLE RESIDUAL, kept only so the numeric branch is total.
+          # fw_real=0 here implies the merge-tree block ran, and that block
+          # always leaves mt_total a non-negative integer — so mt_total=-1 and
+          # fw_real=0 cannot hold together (occ190). The UNMEASURED disclosure
+          # a reader needs lives on the merge branch below, which is where an
+          # unreadable merge-tree actually lands.
+          echo "      no FRAMEWORK payload: all $fw_count framework path(s) above are already at HEAD, so no pull signal is raised (that gate is framework-only). Whether merging is a no-op overall is UNMEASURED here (merge-tree unreadable) — do not read this line as either."
+        fi
+      else
+        echo "      merge with: bash core/scripts/worker-ref-consume.sh --merge $ref"
+        # Same disclosure on the FRAMEWORK branch (occ192). An operator handed
+        # a ready-to-paste --merge command is owed the fact that it will stop
+        # mid-merge; the recommendation itself stands (the payload is real).
+        if [ "$mt_conf" -gt 0 ] 2>/dev/null; then
+          echo "        ⚠ CONFLICT: that merge does NOT apply cleanly — $mt_conf conflicted path(s):"
+          printf '%s\n' "$mt_conf_paths" | sed -n '1,20p' | sed 's/^/            /'
+          echo "        Budget the resolution before starting; --merge will stop and leave the tree mid-merge."
+        fi
+        # TWO CONDITIONS REACH THIS LINE and until occ190 they printed the
+        # SAME sentence: (a) the content test RAN and found real framework
+        # payload, and (b) the content test could NOT run, so fw_real stayed
+        # at the three-dot touch count and the payload is ASSUMED. An operator
+        # cannot act differently on readings it cannot tell apart
+        # (guard-2586: a fallback path and a failure path must never emit the
+        # same message; guard-4719: compute the cause or the message lies on
+        # every other path). mt_total=-1 with fw_count>0 IS the "did not
+        # measure" signal — nothing else sets it.
+        [ "$mt_total" = -1 ] && echo "        (FAIL-OPEN, not a measurement: merge-tree was unreadable, so the phantom content test never ran — those $fw_count path(s) are ASSUMED outstanding from the three-dot touch list. Under-signalling is the worse error, so the recommendation stands; re-run --check once merge-tree resolves before citing this as a measured payload.)"
+      fi
+    elif [ "$ahead" -gt 0 ] && [ "$is_self" = 0 ]; then
+      # AGENT-STORE-ONLY REF (occ191). fw_count=0 with commits outstanding used
+      # to print NOTHING here, so the whole report for such a ref was two
+      # numbers whose safe-looking half (framework_files=0) is the one readers
+      # generalise into "harmless churn" — the exact trap guard-6539 names.
+      if [ "$mt_total" = 0 ] && [ "$mt_conf" = 0 ]; then
+        echo "      no outstanding content: the whole-ref merge-tree equals HEAD's tree, so merging yields a genuine no-op merge commit despite commits_ahead=$ahead (already landed by another route). Disposition = CARRY; retirability is decided by the live in_flight_bodies row + ancestry, never by this reading (guard-3660)."
+      elif [ "$mt_total" -gt 0 ] 2>/dev/null; then
+        git -C "$REPO" diff --name-only HEAD "$_mt" 2>/dev/null | head -50 | sed 's/^/        /'
+        echo "      no FRAMEWORK payload (framework_files=0 means 'nothing under core/ or .claude/', NOT 'safe to merge' — guard-6539). Merging would change $mt_total path(s) of AGENT-STORE content: +$mt_add / -$mt_del lines."
+        if [ "$mt_conf" -gt 0 ] 2>/dev/null; then
+          # THE SHAPE LADDER IS SUPPRESSED, NOT SUPPLEMENTED (occ192). Its three
+          # arms all describe a CLEAN merge result, and none of them is true of
+          # a conflicted one: new-mode merge-tree writes a tree with conflict
+          # markers embedded, so the +/- counts above are taken over content
+          # that can never be committed as-is. Printing "safe shape" beside a
+          # conflict is the exact failure this block exists to remove.
+          echo "      ⚠ CONFLICT: merging this ref does NOT apply cleanly — git merge-tree reports $mt_conf conflicted path(s):"
+          printf '%s\n' "$mt_conf_paths" | sed -n '1,20p' | sed 's/^/          /'
+          echo "      The +$mt_add / -$mt_del above is measured over the CONFLICTED tree (conflict markers included), so it is NOT the post-merge line count and the shape verdict is withheld. Resolve by hand or carry; --merge will stop mid-merge."
+        elif [ "$mt_del" -gt 0 ] 2>/dev/null && [ "$mt_add" = 0 ]; then
+          echo "      ⚠ DELETION-ONLY: this merge REMOVES $mt_del line(s) and adds none. A carrier is a SNAPSHOT of a moving append-only store, so this is the carrier being STALE, not content to recover. Default disposition = CARRY, do NOT merge; if you merge anyway, name the records being dropped first."
+        elif [ "$mt_del" -gt 0 ] 2>/dev/null; then
+          echo "      ⚠ MIXED: +$mt_add / -$mt_del. On a one-record-per-line store a paired count is a full-record OVERWRITE, not an append (guard-6539). Diff the paths above before merging."
+        elif [ "$mt_add" -ge 0 ] 2>/dev/null && [ "$mt_del" = 0 ]; then
+          echo "      append-only (+$mt_add / -$mt_del): safe shape. Merge only if the content is wanted; the ref's Body may still be pushing."
+        else
+          # THREE STATES REACHED THIS `else` AND IT ASSERTED SAFETY FOR ALL THREE
+          # (occ192). It fires whenever mt_del is not >0 — which is 0 (genuine
+          # append-only) but ALSO -1, the "numstat never parsed" value, printed
+          # as the nonsense "+-1 / -0" beside the word "safe"; and the
+          # all-binary case, where `git diff --numstat` emits `-\t-\tpath` and
+          # the awk filter drops every row, summing a real binary overwrite to
+          # "+0 / -0". The literal `-0` in the old string could not contradict
+          # itself no matter what mt_del held. Same rule the mt_total branch
+          # above already applies (guard-2586: a fallback path and a failure
+          # path must never emit the same message) — carried one level down to
+          # the parse that has its own failure mode.
+          echo "      line-direction UNMEASURED (numstat unparsed, or every changed path is binary) despite $mt_total changed path(s) — do NOT read this as append-only. Diff the paths above before merging."
+        fi
+      else
+        echo "      merge impact UNMEASURED (merge-tree unreadable) despite commits_ahead=$ahead. Do NOT read framework_files=0 as 'safe to merge' (guard-6539) — re-run --check once merge-tree resolves, or diff by hand from the merge-base."
+      fi
     fi
   fi
 done

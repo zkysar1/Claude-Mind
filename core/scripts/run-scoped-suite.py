@@ -97,8 +97,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # § "THREE testpaths").
 PYTEST_INI = PROJECT_ROOT / "pytest.ini"
 
-# Source roots whose files this tier can map. A change outside these is reported
-# as unmapped rather than silently ignored.
+# Source roots whose files this tier can map. A change OUTSIDE these is DROPPED
+# before selection — it is NOT reported as unmapped. `unmapped` can only ever hold
+# files that SURVIVED the filter in main(), because select() never sees the rest.
+# This comment said the opposite until 2026-09-13 (). The drops are now
+# recorded in `dropped_inputs` so the loss is visible instead of inferred.
 SOURCE_PREFIXES = ("core/scripts/", "mind_api/src/", "core/tests/", "world/scripts/")
 
 SOURCE_SUFFIXES = (".py", ".sh")
@@ -255,10 +258,21 @@ def main() -> int:
         print("[setup] --changed and --since are mutually exclusive", file=sys.stderr)
         return 3
 
-    changed = args.changed if args.changed else discover_changed(args.since)
-    changed = [c for c in changed
+    supplied = args.changed if args.changed else discover_changed(args.since)
+    changed = [c for c in supplied
                if c.startswith(SOURCE_PREFIXES) and c.endswith(SOURCE_SUFFIXES)
                and "/tests/" not in c]
+    # THE FILTER IS CORRECT AND IS NOT CHANGED HERE — what changes is that its
+    # removals are now REPORTED. A caller passing a test file, or a path outside
+    # SOURCE_PREFIXES, previously saw only `changed_count: 0` and an INCONCLUSIVE
+    # reading "no changed source file found", which says "you changed nothing"
+    # when the truth is "I discarded everything you gave me". Same shape as the
+    # silent-signal class this goal audits: the runner reports what it RAN and
+    # never what it declined to look at (guard-1760). Order-preserving, and a
+    # duplicate in `supplied` is deliberately kept in both lists rather than
+    # de-duplicated, so the two counts always reconcile against the input.
+    _kept = set(changed)
+    dropped = [c for c in supplied if c not in _kept]
 
     roots = _testpaths()
     idx = _index_tests(roots)
@@ -275,6 +289,8 @@ def main() -> int:
         "verdict": None,
         "changed_files": changed,
         "changed_count": len(changed),
+        "dropped_inputs": dropped,
+        "dropped_count": len(dropped),
         "unmapped_files": unmapped,
         "selected_count": len(selected),
         "corpus_count": len(idx),          # population control beside every count
@@ -289,8 +305,18 @@ def main() -> int:
     # ── The tri-state gate, BEFORE any run ────────────────────────────────────
     if not changed:
         result["verdict"] = "INCONCLUSIVE"
-        result["reason"] = ("no changed source file found — nothing was verified. "
-                            "Pass --changed explicitly, or --since <ref>.")
+        if dropped:
+            result["reason"] = (
+                f"every one of the {len(dropped)} supplied path(s) was DROPPED before "
+                "selection — nothing was verified. This is not 'you changed nothing'. "
+                f"Dropped: {', '.join(dropped)}. A path is dropped unless it starts with "
+                f"one of {SOURCE_PREFIXES}, ends with one of {SOURCE_SUFFIXES}, and "
+                "contains no '/tests/' segment. Test files are excluded BY DESIGN (this "
+                "tier maps source->test, so a test file is a selector, never a subject); "
+                "pass the SOURCE file it covers instead.")
+        else:
+            result["reason"] = ("no changed source file found — nothing was verified. "
+                                "Pass --changed explicitly, or --since <ref>.")
         _emit(result, args.json)
         return 2
     if not selected:
@@ -349,6 +375,9 @@ def _emit(result: dict, as_json: bool, tail: str = "") -> None:
     print(f"  changed: {result['changed_count']} file(s)  "
           f"selected: {result['selected_count']} of {result['corpus_count']} "
           f"({result['selected_share_pct']}% of corpus)")
+    if result.get("dropped_inputs"):
+        print(f"  DROPPED before selection (not verified, not unmapped): "
+              f"{', '.join(result['dropped_inputs'])}")
     if result["unmapped_files"]:
         print(f"  UNMAPPED (no test references these): {', '.join(result['unmapped_files'])}")
     if result["elapsed_s"] is not None:

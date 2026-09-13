@@ -39,6 +39,8 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 
 CORE_SCRIPTS = Path(__file__).resolve().parent.parent          # core/scripts/
@@ -62,6 +64,23 @@ def _load(modname: str, filename: str):
 
 
 merge = _load("body_merge_spark", "body-merge.py")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world ().
+
+    Load-bearing: `generalize_down` resolves the world-rooted staging dir
+    through `_paths.WORLD_DIR`, so without this the test merges every OTHER
+    Body's real staged WM into its tmp reducer and then CONSUMES them. Measured
+    in `test_capture_lane_chain.py`, whose fixture docstring carries the
+    evidence — 10 real triples drained from the live world in one run.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
 
 
 def _entry(goal_id: str, observation: str, category: str = "cross-box-bodies",

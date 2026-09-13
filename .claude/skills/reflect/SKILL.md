@@ -340,7 +340,19 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # 1 on 2026-08-22 (2026-08-09_prose-mandate-rate-generalizes, CONFIRMED,
    # stage=resolved, resolved_by zeta 6 min before that pass reached this step),
    # and 0 again on 2026-08-23 (echo, cc-03; payload 418, all stage=archived,
-   # UNRESOLVABLE 188 / EXPIRED 183 / none 47, conservation 418).
+   # UNRESOLVABLE 188 / EXPIRED 183 / none 47, conservation 418),
+   # and 1 again on 2026-09-11 (echo, cc-03; payload 581, archived 578 /
+   # resolved 3, UNRESOLVABLE 204 / EXPIRED 328 / none 48 / CONFIRMED 1 —
+   # 2026-08-12_deploy-identity-can-create-lambda-functions, resolved_by bravo
+   # 23 min before that pass reached this step).
+   # READ THE TWO NONZEROS TOGETHER: both were a PEER's resolution landing
+   # minutes earlier (zeta 6 min, bravo 23 min). That is not coincidence — on a
+   # live multi-agent fleet the control is nonzero precisely when a partner has
+   # just resolved something, which is most of the time. So "expect zero" is a
+   # QUIET-BOX expectation; on a busy fleet expect a peer's fresh resolution and
+   # budget for an ABC chain here. The instruction is unchanged either way: RUN
+   # THE CONTROL. The expectation is what this paragraph is correcting, not the
+   # procedure.
    # A nonzero value means genuine ABC input is going unreflected and IS the
    # work; a large `--unreflected` count means nothing on its own. The two
    # numbers move independently — the mass above grew 405 -> 418 across the same
@@ -376,6 +388,21 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    #             (CONFIRMED 463 + CORRECTED 360) -> 0 unreflected
    #   resolved:   67 records, `reflected` present   67/67,  57 scoreable
    #             (CONFIRMED 41 + CORRECTED 16)   -> 0 unreflected
+   #
+   # RUN THE THREE SURFACES AS THREE SEPARATE CALLS, EACH AGGREGATED IN-PROCESS.
+   # Piping all three into one parser TRUNCATES and dies as a JSON error that is
+   # one read away from being scored as a clean zero. Measured 2026-09-13 (echo,
+   # cc-03, uname -r 6.8.0-139-generic, fire #131): `--stage archived` alone is
+   # 8,892,028 bytes of stdout for 1678 records; the 3-in-1 pipe cut off at
+   # 3,376,687 bytes and raised `Unterminated string starting at line 41572`.
+   # That is guard-2236's mirror arriving through a NEW door — output SIZE rather
+   # than predicate scope — so the existing fix does not cover it. Re-run alone:
+   # archived 1678 records, `reflected` present 1678/1678, 1026 scoreable
+   # (CONFIRMED 586 + CORRECTED 440), 0 unreflected, conservation 1026+652=1678.
+   # NEVER report a parse failure as a surface count (rb-9627 is the same class at
+   # a different layer: an output cap yields unparseable JSON, not a small number).
+   # The store only grows — archived was 1279 records on 2026-08-23 and is 1678
+   # now — so the durable fix is a count-only flag in the reader, not a wider pipe.
    # Clean on both stages. Note WHY the primary control cannot substitute: all
    # 418 rows it returned are the NON-scoreable mass, so on a healthy box it
    # never sees the 823 records that carry ABC input at all.

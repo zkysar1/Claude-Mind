@@ -30,9 +30,14 @@ FAILING branch and never passes --apply (it asserts cleared == 0 throughout),
 so no existing test drove a PASSING predicate through to the clear.
 
 Hermetic: `_read_goals` is monkeypatched (no daemon, no live store),
-`_clear_defer` is monkeypatched (it shells to aspirations.py against the REAL
-world store), `--metrics-log ""` disables the metrics JSONL. No world/meta
-writes.
+`_clear_defer` is monkeypatched (it writes defer_reason through the daemon
+against the REAL world store), `--metrics-log ""` disables the metrics JSONL.
+No world/meta writes.
+
+`_clear_defer` returns `(ok, detail)` as of g-115-9621 — it no longer shells to
+`aspirations.py update-goal` (that CLI hop was box-dependently broken: it
+exited 0 after printing an Error on cc-13 while succeeding on cc-02). Stubs
+here must return the 2-tuple.
 
 Run: STORAGE_BACKEND=local py -3 -m pytest \
     core/scripts/tests/test_worker_set_defer_clears.py -v
@@ -94,8 +99,11 @@ def _run_main(monkeypatch, capsys, goals, apply=False, clear_calls=None):
     if clear_calls is not None:
         def fake_clear(source, goal_id):
             clear_calls.append((source, goal_id))
-            return True
-        # NEVER let the real one run: it shells to aspirations.py update-goal
+            # (ok, detail) since  — detail carries the daemon's error
+            # body on failure so callers can surface it (rb-10397). Returning a
+            # bare bool here raises "cannot unpack non-iterable bool object".
+            return True, None
+        # NEVER let the real one run: it writes defer_reason through the daemon
         # against the LIVE world store.
         monkeypatch.setattr(M, "_clear_defer", fake_clear)
 

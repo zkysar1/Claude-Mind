@@ -52,6 +52,9 @@ from typing import List, Optional
 # wrapper has sys.path set up to find it; daemon callers do too via
 # `mind_api/src/file_locks.py`'s sys.path insertion.
 from _fileops import locked_append_jsonl  # type: ignore
+# Split-Repo Registry: ONE parse, shared with completed-not-committed-sweep.py
+# (). Same sys.path story as _fileops above — both live in our parent.
+from _split_repo import is_split_repo  # type: ignore
 
 
 # Framework-code patterns — paths matching ANY of these regexes block
@@ -260,6 +263,48 @@ def _repo_default_ref(repo: Path) -> Optional[str]:
     return None
 
 
+def _repo_landing_ref(repo: Path) -> Optional[str]:
+    """The ref correctly-merged work is EXPECTED TO REACH: origin/dev on a
+    registry-listed SPLIT repo, else the repo's default branch (g-115-9675).
+
+    WHY THIS IS NOT `_repo_default_ref`. On the registry-listed repos the
+    DEFAULT branch (`main`) is the PROD branch and the charter states verbatim
+    "Nothing merges to `main` directly" — feature PRs merge to `dev`, and
+    dev->main travels only on the weekly promotion PR (asp-370). Asking
+    containment against the default branch therefore asks a question whose
+    answer is "no" for up to a week BY DESIGN, so every correctly-merged commit
+    read as stranded debt and this gate demanded an --override-uncommitted on
+    every fresh close in those repos. A commit on `dev` but not `main` is
+    PROMOTION BACKLOG owned by asp-370, not debt owned by the goal's author.
+
+    The sibling `completed-not-committed-sweep.py` was fixed for this in
+    g-115-9040; this gate was left registry-BLIND (measured: zero references to
+    the registry against a 24-hit positive control for `origin` in this file).
+    Both now share one registry parse via `_split_repo.split_repo_names`.
+
+    Returns a FULL ref (`refs/remotes/origin/dev`) because that is this module's
+    convention and `default_ref` flows on into a `git diff`, a `rev-list`, an
+    emitted field and an operator message. The sweep's short-ref spelling is
+    deliberately NOT imported — see `_split_repo`'s module docstring.
+
+    Falls back to `_repo_default_ref` whenever the repo is not registry-listed
+    OR `refs/remotes/origin/dev` does not exist locally, so a repo listed before
+    its dev branch is cut keeps behaving exactly as it does today. Fail-closed:
+    an unreadable registry yields the empty set and every repo takes the
+    fallback, which is the pre-g-115-9675 behaviour."""
+    try:
+        if is_split_repo(repo):
+            dev = "refs/remotes/origin/dev"
+            rc = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+                 dev], capture_output=True, text=True, timeout=10)
+            if rc.returncode == 0:
+                return dev
+    except (subprocess.TimeoutExpired, OSError):
+        pass  # fall through to the default branch — never widen on an error
+    return _repo_default_ref(repo)
+
+
 def _refspec_covers_all_heads(repo: Path) -> bool:
     """Can this clone's refs/remotes/* actually SEE every remote branch?
 
@@ -393,7 +438,7 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
 
 def _check_one_repo(repo: Path, fresh_hours: int,
                     goal_id: str = "") -> Optional[dict]:
-    default_ref = _repo_default_ref(repo)
+    default_ref = _repo_landing_ref(repo)
     if default_ref is None:
         print(f"[uncommitted-gate] {repo}: no origin default ref — skipping",
               file=sys.stderr)

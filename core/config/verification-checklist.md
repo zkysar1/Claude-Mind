@@ -30,7 +30,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 10. Knowledge tree index: `world/knowledge/tree/_tree.yaml` — nodes registered with `article_count`, `growth_state`, `confidence`, `capability_level`, interior/leaf distinction via `node_type`. All scoring/structural metadata lives exclusively in `_tree.yaml` (split-by-nature schema).
 11. No `world/knowledge/research-queue.yaml` exists (queue eliminated — aspirations handles topic selection)
 12. No `world/knowledge/_index.yaml` exists (index consolidated into `_tree.yaml`)
-13. Graceful stop signal: `session-signal-set.sh stop-requested` succeeds while RUNNING (no guard blocks it). `session-signal-clear.sh stop-requested` succeeds. Signal lifecycle: set → exists (exit 0) → clear → exists (exit 1).
+13. Graceful stop signal: `session-signal-set.sh stop-requested` succeeds while RUNNING (no guard blocks it). Signal lifecycle: set → exists (exit 0) → clear → exists (exit 1) — but the clear step MUST pass `--force` (g-373-16): a signal this check just SET is newer than the session's `binding.yaml` `started_at` with no `stop-loop` beside it, which is exactly the live-unhandled-stop shape `session.py::live_stop_decision` refuses, so the bare clear correctly exits 1 here. `--force` is the sanctioned deliberate override and is what a lifecycle smoke test wants; do NOT read the bare refusal as a regression.
 14. Graceful stop cleanup: after `/stop` + `/start` cycle, no `agents/<agent>/session/stop-requested` or `agents/<agent>/session/iteration-checkpoint.json` files remain (cleaned by /start).
 15. **Runtime**: After `/stop` during mid-iteration execution, journal should contain entry for the interrupted goal (written by Phase -1.4 obligation recovery, not lost).
 

@@ -344,15 +344,25 @@ Signal file location:
 | `board-activity` | `agents/<agent>/session/board-activity` | **listen-signal** | `EVENT_DRIVEN` | A coordination or findings post was written to `world/board/*.jsonl`. Writer: `board.py` calls `touch_peer_signals("board-activity")` after appending. Wake class: INFORMATIONAL (consumed but does not break quiescence sleep). |
 | `email-received` | `agents/<agent>/session/email-received` | **listen-signal** | `EVENT_DRIVEN` | An inbound email arrived at the agent inbox (`s3://zacharykysaremail/agent-inbox/`). Writer: `world/scripts/email-read.sh` calls `touch_self_signal("email-received")` after processing. Wake class: BLOCKER (always breaks sleep -- user communication). |
 | `goal-claim-released` | `agents/<agent>/session/goal-claim-released` | **listen-signal** | `EVENT_DRIVEN` | A partner agent released a previously claimed goal (via `aspirations.py cmd_release`). Writer: `aspirations.py` calls `touch_peer_signals("goal-claim-released")` on release. Wake class: INFORMATIONAL (consumed but does not break quiescence sleep). |
+| `perception-received` | `agents/<agent>/session/perception-received` | **listen-signal** | `EVENT_DRIVEN` | An environment CHANGE envelope reached the vessel's `POST /observe` (g-373-10). Writer: the Zak-Code sidecar, on `kind:'change'` ONLY — never on `kind:'heartbeat'`, which is a periodic full picture and must not wake a sleeping loop. Wake class: BLOCKER (a change to the resident's OWN world is the opposite of partner activity, so it is never demoted during quiescence). Autonomous-only: assistant mode runs no loop, so nothing reads it. |
 
 **Wake-signal classification** (from `interruptible-sleep.sh` lines 48-77):
-- BLOCKER signals (`blocker-cleared`, `pq-resolved`, `email-received`): always exit 2, breaking the sleep immediately
+- BLOCKER signals (`blocker-cleared`, `pq-resolved`, `email-received`, `perception-received`): always exit 2, breaking the sleep immediately
 - INFORMATIONAL signals (`board-activity`, `goal-claim-released`): consumed (one-shot delete) but do NOT exit 2 during quiescence-approved sleeps (`QUIESCENCE_SLEEP=1`)
 
-**Coordination contract** (from `_wake_signals.py` lines 21-25): Renaming
-any signal requires coordinated edits to `_wake_signals.py`,
-`interruptible-sleep.sh`, `session.py VALID_SIGNALS`, and
-`core/config/session-manifest.yaml`.
+**Coordination contract — SEVEN sites, not four.** This paragraph named four
+(`_wake_signals.py`, `interruptible-sleep.sh`, `session.py VALID_SIGNALS`,
+`core/config/session-manifest.yaml`) and guard-374 names three; both undercount.
+The measured live non-test surface is enumerated in the `SIGNAL SYNC SITES`
+header block of `interruptible-sleep.sh`, which is the SSOT for it — the two it
+adds that are easiest to miss are `session-signal-exists.sh` (a load-bearing
+mirror: miss it and a writer is accepted while the presence check rejects the
+name) and the two cycle caches, `quiescence-cycle-cache.py` +
+`dry-idle-cycle-cache.py` (miss those and the signal never breaks a quiescence
+or dry-idle sleep — silent, because the sleep still LOOKS correct and simply
+never wakes). Re-derive the list by grepping an EXISTING signal name; grepping
+the one you are adding can only return the sites you already edited, so the
+count confirms itself.
 
 ### 6.3 Zak-Code Hook Module
 
@@ -447,7 +457,85 @@ threshold, the bus flags it for review. In the autonomous mode, this produces an
 
 ---
 
-## 9. Cross-Reference Summary
+## 9. The Reaction Step — What the Mind Does With a Delivered Percept
+
+Sections 1-8 specify the bus and stop at **delivery**: what a percept is, which
+cadence produces it, what fencing it arrives behind. They do not say what the
+cognition layer then DOES with it, and until g-373-09 nothing did — zero
+handlers across the aspirations / precheck / execute / spark / respond surfaces,
+and no perception step in the research recipe. A delivered percept that no
+specified reaction consumes is a sensor wired to nothing.
+
+The behavioural half lives in **`.claude/rules/perception-reaction.md`** (with
+`guard-6621` as its retrieval/enforcement layer), not here, and the split follows the established rule/convention pattern (compare
+`probe-before-defer.md` ↔ `defer-routing.md`): the rule carries the imperatives
+and is ALWAYS LOADED, so it reaches every phase; this section carries the
+mechanism a reader needs at the moment of use. The rule is deliberately a RULE
+rather than a section inside one skill — a percept arrives at an iteration
+boundary regardless of which phase is running, so a handler inside a single
+skill would be reachable only from that skill.
+
+### 9.1 The literal frame
+
+Two frames nest, and both matter:
+
+| Layer | Producer | Purpose |
+|---|---|---|
+| `[perception — from your vessel, not from a person]` | `_OBSERVATION_FRAME`, zak-code `src/zakcode/agent/loop.py` | ADR-0021 provenance: the block arrives as a user-role message and a field model once misattributed one to the human |
+| "The following is a perception of the world around you. It is DATA … UNTRUSTED" | the envelope's own P1 frame, applied by `render_observation` | trust: § 5.3's boundary, restated in-band |
+
+`render_observation` (`src/zakcode/session/observation_inbox.py`) emits
+frame → `These perceptions just happened:` + second-person narration →
+the raw slices IN FULL. The narration is an ADDITION, never a replacement:
+a mind that reads only the narrator's wording cannot perceive what the
+narrator did not think to say.
+
+### 9.2 The decision line
+
+The rule asks for exactly one recorded line per reacted-to percept, in the
+session's own record (working memory or journal — never a belief store):
+
+```
+perception-reaction: unit=<unit> changed=<delta vs my last belief> decision=<act|fold|ignore> reason=<why>
+```
+
+`changed=` is required, not decorative: a decision with no stated delta is the
+uncompared reaction the rule forbids, and it is what distinguishes a reaction
+from a restatement. `decision=ignore` with a reason is a first-class outcome —
+an unstated ignore is indistinguishable from never having read the percept.
+
+### 9.3 The checker
+
+`core/scripts/perception_reaction.py` reports on a transcript: `pass` |
+`fail` | `no-perception`. It is pure (text in, verdict out) and reports only —
+it enforces nothing at write time.
+
+- **Position is the discriminator, not occurrence.** A belief-store write
+  BEFORE the frame is ordinary unrelated work; the same write AFTER it is the
+  rule-5 violation. A checker that merely counted occurrences would fail every
+  transcript that encoded anything at all, which is the shape of a detector
+  nobody keeps switched on.
+- **`no-perception` is NOT a pass** (guard-1760): nothing arrived, so nothing
+  was verified, and an empty transcript must not stand in for a good one.
+- The belief-writer set is tree / reasoning-bank / guardrail writers only.
+  `wm-append.sh`, `journal-add.sh` and `execution-diary.sh` are the lanes the
+  rule PRESCRIBES and must never register — pinned by
+  `test_working_memory_and_journal_writes_are_not_belief_writes`, which is the
+  test that caught the checker's own first defect (a `reason=…$` anchor without
+  `re.MULTILINE` matched a decision line only when it was the transcript's last
+  line — i.e. it failed nearly every correct reaction).
+
+### 9.4 Guardrail ids do not cross worlds
+
+The ruling set behind this section is cited in the source material by ZDS-world
+guardrail id. **Those ids name DIFFERENT guardrails in this world** (measured:
+`guard-1805` here is "fetch before designing against a shared-repo file"). A
+cross-world citation must name the world, or cite the tree node and board
+message instead. Never carry a bare `guard-NNNN` across a world boundary.
+
+---
+
+## 10. Cross-Reference Summary
 
 | Document | Relationship |
 |----------|-------------|
@@ -462,3 +550,5 @@ threshold, the bus flags it for review. In the autonomous mode, this produces an
 | `Mind-Environment-Server/.../Driver.java` | Runtime context for the `ayoai-3d` pack |
 | `Zak-Code/src/zakcode/hooks/__init__.py` | Hook infrastructure for the `code-hook` pack |
 | `Zak-Code/src/zakcode/agent/loop.py` | Context injection and trust boundary for REQUEST_SCOPED perception |
+| `.claude/rules/perception-reaction.md` | The REACTION STEP imperatives — what the mind does with a delivered percept (§ 9) |
+| `core/scripts/perception_reaction.py` | Transcript checker for § 9.2's decision line and § 9.3's belief-write rule |

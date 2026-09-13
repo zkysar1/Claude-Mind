@@ -244,3 +244,112 @@ def test_owner_is_accepted_on_an_ordinary_ref_without_being_required():
     )
     assert ok is True, out
     assert out["owner"] == "bravo"
+
+
+# --- : the owner's per-branch RELEASE -----------------------------
+#
+# FIFTH property, and the only one in this file that governs a CLEAR rather
+# than a HELD. Every check above refuses an over-broad HOLD, where being wrong
+# costs a delay. These govern a DOWNGRADE, where being wrong authorises the
+# deploy the hold exists to stop — on a repo where the merge IS the deploy
+# (guard-6258). So the asymmetry runs the other way here, and each case below
+# reads the refusal text for the same guard-3803 reason as the rest of the file.
+
+def _rel(by="alpha", at="2026-09-01T18:00:00"):
+    return {"released_by": by, "released_at": at}
+
+
+def test_an_owner_signed_branch_release_is_valid_and_is_carried_out():
+    """The write path accepts it AND emits it — a dropped key is an inert fix.
+
+    The second assertion is the load-bearing one: validate() REBUILDS its
+    output from CORE + OPTIONAL keys, so a key that is accepted but not
+    promoted validates cleanly and is then invisible to the reader that is the
+    entire point of the field.
+    """
+    ok, out = validate(_ref(released_branches={"dev": _rel()}))
+    assert ok, out
+    assert out["released_branches"] == {"dev": _rel()}
+
+
+def test_absent_released_branches_is_not_a_defect():
+    """The regression pin: a hold that releases nothing is an ordinary hold."""
+    ok, out = validate(_ref())
+    assert ok, out
+    assert "released_branches" not in out or out["released_branches"] is None
+
+
+@pytest.mark.parametrize("branch", ["main", "master", "MAIN", "Master"])
+def test_the_default_branch_can_never_be_released(branch):
+    """Releasing the held surface would authorise exactly the held deploy.
+
+    Case-insensitive on purpose: a gate that accepts `Main` while refusing
+    `main` is not a gate, and the reader lowercases too.
+    """
+    ok, msg = validate(_ref(released_branches={branch: _rel()}))
+    assert not ok
+    assert "IS the deploy surface this hold protects" in msg
+
+
+def test_a_release_by_someone_other_than_the_owner_is_refused():
+    """The identity keying — the whole safety story of this field.
+
+    Without it any agent clears any hold by writing one field. Mutation-proven
+    at the reader too (test_deploy_hold_check_branch_release.sh B4).
+    """
+    ok, msg = validate(_ref(owner="foxtrot",
+                            released_branches={"dev": _rel(by="alpha")}))
+    assert not ok
+    assert "who is not the hold owner" in msg
+    assert "identity-keyed" in msg
+
+
+def test_a_release_list_is_refused_because_it_cannot_carry_provenance():
+    ok, msg = validate(_ref(released_branches=["dev"]))
+    assert not ok
+    assert "is not an object" in msg
+
+
+def test_a_release_with_no_provenance_object_is_refused():
+    ok, msg = validate(_ref(released_branches={"dev": "yes"}))
+    assert not ok
+    assert "no provenance object" in msg
+
+
+def test_a_release_with_no_released_by_is_refused():
+    ok, msg = validate(_ref(released_branches={"dev": {"released_at": "2026-09-01T18:00:00"}}))
+    assert not ok
+    assert "without naming `released_by`" in msg
+
+
+def test_a_release_whose_timestamp_cannot_be_parsed_is_refused():
+    """An undatable release cannot be audited against the hold it modifies."""
+    ok, msg = validate(_ref(released_branches={"dev": _rel(at="soon")}))
+    assert not ok
+    assert "not a parseable ISO-8601" in msg
+
+
+def test_an_unparseable_branch_name_is_refused():
+    ok, msg = validate(_ref(released_branches={"dev branch!": _rel()}))
+    assert not ok
+    assert "is not a plain branch" in msg
+
+
+def test_a_grandfathered_ref_bypasses_the_release_checks_entirely():
+    """NOT a gap in this gate — a fact the READER has to defend against.
+
+    The grandfather clause (guard-2400) returns before every reservation check,
+    so a pre-cutoff ref can carry any released_branches at all. That is why
+    deploy-hold-check.sh re-adjudicates the release itself and refuses one on a
+    ref with no owner (branch_released_by_owner; pinned by
+    test_deploy_hold_check_branch_release.sh B5/B5b). Pinned here so nobody
+    "hardens" this gate and concludes the reader's duplicate check is redundant.
+    """
+    ok, out = validate({
+        "type": "infrastructure",
+        "external_id": "deploy-hold:Some-Repo:2026-08-01",
+        "created_at": "2026-08-01T00:00:00",
+        "expires_at": "2026-08-25T00:00:00",
+        "released_branches": {"main": _rel(by="nobody-in-particular")},
+    })
+    assert ok, "grandfathered refs must stay writable (guard-2400)"

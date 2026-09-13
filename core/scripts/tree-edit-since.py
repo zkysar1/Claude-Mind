@@ -65,6 +65,50 @@ tree mid-iteration. Two corrections:
      while NONE grew. Closing the inline gap would move ~16 nodes; the decay is
      driven by nodes written by paths that stamp no attribution at all.
 
+     A THIRD POPULATION, AND IT IS THE ONE THAT FAILS *CLOSED* (g-115-9689,
+     measured 2026-09-12 by alpha on box cc-08). The two classes above are "stamp seen"
+     (skip if foreign) and "no stamp" (keep). A third exists: a stamp that is
+     present, parseable, and STALE — because `session` and `source` are rotated
+     by different writers on different triggers.
+
+       - `session` is rotated by tree-front-matter-sync.py (Layer A), whose
+         `_set_nested_scalar` OVERWRITES the existing child line unconditionally
+         (tree-front-matter-sync.py:341; its docstring says "always ensure").
+         But Layer A runs only from tree-sync-check.sh, and that hook is
+         registered in .claude/settings.json as PostToolUse on matcher
+         Write | Edit | MultiEdit — the TOOL path and nothing else. Verified
+         2026-09-12: those are the only three matchers it carries.
+       - `source` is rotated by the authoring SKILL, inside the content it
+         writes, by whatever mechanism it writes with. Layer A fills `source`
+         only when it is MISSING ("source preserved" otherwise).
+
+     So a node written by `sed -i`, a heredoc, an in-place python rewrite, a
+     daemon endpoint, a merge handler, or an own-cloud pull gets a NEW `source`
+     and KEEPS the OLD `session`. It then reports a foreign session, this
+     detector skips it, and real encoding goes uncredited — while the node's own
+     front matter names the goal that just encoded it. Note the inline-form gap
+     above is a SEPARATE and much smaller thing (~16 nodes, neither field
+     auto-filled); this one hits the 1,461-node BLOCK population, the class the
+     coverage table counts as covered.
+
+     Canonical instance (g-115-9689, from the 2026-09-11 incident on bravo, box cc-05):
+     world/…/billing-architecture/vinheim-retail-settlement.md carried
+     `session: 0720c4fe…` (zeta, g-369-248) beside `source: g-369-256` (bravo).
+     The detector emitted its "attributed to another session" note,
+     iteration-close IGNORED --tree-updated, and learning_value credited no
+     tree-encoding work for an iteration that had done it.
+
+     THE FIX IS NOT IN THIS DETECTOR, and that is a property of the data, not a
+     scoping preference: a single last-writer-wins `session:` key cannot carry
+     per-encoder attribution on a multi-writer node even in principle. On such a
+     node the key answers "which SID last wrote this file THROUGH THE EDIT
+     TOOL" — strictly narrower than "who encoded `source`". So the skip branch
+     is UNUSABLE as an authorship verdict on any multi-writer node: read it as
+     evidence about the tool path, never about the encoder. The caller's escape
+     hatch is `iteration-close.sh --tree-updated-override`, and that caller now
+     prints this script's own stderr reason (it used to discard it, guard-438)
+     so an authorship skip is distinguishable from a genuine no-change.
+
 Deliberately NOT routed through `_cross_agent_attribution_filter.filter_paths`:
 that helper's partner-log source only covers git-tracked working-tree paths
 (tree nodes live in the gitignored external world dir), and its mtime sources

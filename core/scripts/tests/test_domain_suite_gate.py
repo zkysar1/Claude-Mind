@@ -260,7 +260,9 @@ def test_a_green_suite_that_rewrites_a_credential_file_refuses_the_close(tmp_pat
     assert doc["decision"] == "block"
     assert doc["rc"] == 0
     assert doc["clobbered"] == [str(secret)]
-    assert "REWROTE" in doc["reason"]
+    # : the refusal now names what the instrument can support — CONTENTS
+    # differ, established by sha256 rather than by an mtime bump.
+    assert "CHANGED CONTENT" in doc["reason"] and "sha256" in doc["reason"]
     assert "guard-5541" in err and "does not apply" in err
 
 
@@ -638,3 +640,135 @@ def test_scope_comment_no_longer_asserts_the_falsified_premise():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ─── : touch vs clobber ─────────────────────────────────────────
+#
+# The gate hard-refused every world/scripts close on a (size, mtime_ns) window diff
+# that cannot tell a destructive rewrite from a bare touch, cannot tell the suite
+# from a concurrent writer, and offered no override. Two investigations (cc-04, 86
+# tests; cc-08, 82 tests + a full canonical runner pass under a 1s watcher) found no
+# domain test writing the live credential file, both times with contents byte-
+# identical. These pin the split that makes the refusal falsifiable.
+
+def _gate_mod(name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, GATE)
+    mod = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(CORE_SCRIPTS))
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_classify_content_change_blocks(tmp_path):
+    """POSITIVE CONTROL (guard-2421): the protection that matters must still fire.
+    A real content change is content_changed — the only class that hard-refuses."""
+    mod = _gate_mod("dsg_cls_1")
+    f = tmp_path / ".env.local"
+    f.write_text("KEY=aaa", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    f.write_text("KEY=bbb", encoding="utf-8")
+    got = mod.classify_private_changes(before, mod.private_files([tmp_path]))
+    assert got["content_changed"] == [str(f)]
+    assert got["touched"] == [] and got["unverifiable"] == []
+
+
+def test_classify_touch_does_not_block(tmp_path):
+    """A bare touch — mtime moves, sha256 identical — is `touched`, never
+    content_changed. This is the measured case that produced the wedge."""
+    mod = _gate_mod("dsg_cls_2")
+    f = tmp_path / ".env.local"
+    f.write_text("KEY=aaa", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    st = f.stat()
+    os.utime(f, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+    after = mod.private_files([tmp_path])
+    assert after[str(f)][:2] != before[str(f)][:2], "mtime must actually move"
+    got = mod.classify_private_changes(before, after)
+    assert got["touched"] == [str(f)]
+    assert got["content_changed"] == []
+
+
+def test_classify_identical_rewrite_is_a_touch(tmp_path):
+    """A byte-identical round-trip rewrite (a provisioner writing the same values
+    back) must not block — both observed incidents were exactly this shape."""
+    mod = _gate_mod("dsg_cls_3")
+    f = tmp_path / "api-token.json"
+    f.write_text("KEY=same", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    st = f.stat()
+    f.write_text("KEY=same", encoding="utf-8")          # same bytes, new mtime
+    os.utime(f, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+    got = mod.classify_private_changes(before, mod.private_files([tmp_path]))
+    assert got["content_changed"] == []
+    assert got["touched"] == [str(f)]
+
+
+def test_classify_vanished_is_content_changed(tmp_path):
+    """A credential file that disappears during the window is unambiguous."""
+    mod = _gate_mod("dsg_cls_4")
+    f = tmp_path / ".env.local"
+    f.write_text("KEY=aaa", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    f.unlink()
+    got = mod.classify_private_changes(before, mod.private_files([tmp_path]))
+    assert got["content_changed"] == [str(f)]
+
+
+def test_classify_unhashable_is_unverifiable_not_clean(tmp_path):
+    """When the digest cannot be established the answer is UNKNOWN, and it must not
+    silently fold into `touched` — an unreadable file is exactly where a confident
+    'unchanged' would be wrong."""
+    mod = _gate_mod("dsg_cls_5")
+    mod.PRIVATE_HASH_MAX_BYTES = 0          # every non-empty file is past the ceiling
+    f = tmp_path / ".env.local"
+    f.write_text("KEY=aaa", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    assert before[str(f)][2] is None, "precondition: digest declined"
+    st = f.stat()
+    os.utime(f, ns=(st.st_atime_ns + 10**9, st.st_mtime_ns + 10**9))
+    got = mod.classify_private_changes(before, mod.private_files([tmp_path]))
+    assert got["unverifiable"] == [str(f)]
+    assert got["content_changed"] == [] and got["touched"] == []
+
+
+def test_classify_unmoved_file_is_in_no_class(tmp_path):
+    """NEGATIVE CONTROL: a file nobody touched appears in none of the three lists."""
+    mod = _gate_mod("dsg_cls_6")
+    f = tmp_path / ".env.local"
+    f.write_text("KEY=aaa", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    got = mod.classify_private_changes(before, mod.private_files([tmp_path]))
+    assert got == {"content_changed": [], "touched": [], "unverifiable": []}
+
+
+def test_digest_is_never_emitted_in_a_message(tmp_path):
+    """guard-724 / guard-1563: the digest is compared, never surfaced. The classifier
+    returns PATHS only — no digest, no file content, reaches a caller."""
+    mod = _gate_mod("dsg_cls_7")
+    f = tmp_path / ".env.local"
+    f.write_text("SECRET=hunter2", encoding="utf-8")
+    before = mod.private_files([tmp_path])
+    f.write_text("SECRET=changed", encoding="utf-8")
+    got = mod.classify_private_changes(before, mod.private_files([tmp_path]))
+    flat = repr(got)
+    assert "hunter2" not in flat and "changed" not in flat.replace("content_changed", "")
+    for bucket in got.values():
+        assert all(isinstance(p, str) for p in bucket)
+
+
+def test_a_suite_that_only_touches_a_credential_file_no_longer_blocks(tmp_path):
+    """THE WEDGE, end to end (). A hook that rewrites the credential file
+    with IDENTICAL bytes moves (size, mtime_ns) exactly as a clobber would. Under the
+    old shape-only predicate this hard-refused the close with no override and no
+    reproducible cause — the state that blocked every world/scripts close. Contents
+    are provably intact, so it must warn and PASS."""
+    secret = _private_file(tmp_path)
+    identical = "#!/usr/bin/env bash\nprintf 'TOKEN=real\\n' > %s\nexit 0\n" % secret
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=identical)
+    rc, doc, err = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0, "a byte-identical rewrite must not refuse the close"
+    assert doc["decision"] == "pass"
+    assert "clobbered" not in doc
+    assert "TOUCHED" in err and "sha256 UNCHANGED" in err
+    assert secret.read_text(encoding="utf-8") == "TOKEN=real\n"

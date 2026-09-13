@@ -289,16 +289,24 @@ _SNAPSHOT_BLACKLIST = {
                                 # which would be the same audit-tail class anyway.
     ),
     "agent": (
-        # Both are append-only telemetry ledgers on HOT paths, added when their
-        # writers moved off bare open(...,"a") onto locked_append_jsonl
-        # (-e). Same class as meta/gate-firings.jsonl above: the file IS
-        # the history, and a full-file snapshot per append is O(N^2) — these fire
-        # once per skill invocation and once per loop iteration respectively, so
-        # unblacklisted they would snapshot a multi-thousand-line file thousands
-        # of times. No .history subtree to delete alongside this addition: the
-        # prior writers were bare appends, so neither store ever had one.
+        # All three are append-only ledgers on HOT paths, added when their
+        # writers moved onto locked_append_jsonl (the first two -e, the
+        # third ). Same class as meta/gate-firings.jsonl above: the
+        # file IS the history, and a full-file snapshot per append is O(N^2) —
+        # these fire once per skill invocation, once per loop iteration and once
+        # per evicted capture entry respectively, so unblacklisted they would
+        # snapshot a multi-thousand-line file thousands of times. No .history
+        # subtree to delete alongside any of these additions: each prior writer
+        # was a bare append or did not exist, so none of the three stores ever
+        # had one — verified at each addition, not assumed.
         "skill-invocations.jsonl",  # one append per skill fire (2 hook writers)
         "health/",                  # per-date self-health ledger, one append per iteration
+        # . The strongest form of the no-restore-value argument, and
+        # worth stating because this sink is itself a RECOVERY layer: it is
+        # append-only and never mutated, so the live file is a strict SUPERSET
+        # of every snapshot of it. Restoring one could only ever LOSE archived
+        # rows — the exact opposite of what a snapshot is for.
+        "capture-evictions-archive.jsonl",
     ),
 }
 

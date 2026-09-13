@@ -713,6 +713,57 @@ def test_resolve_version_path_returns_none_for_missing():
 # Runner
 # ---------------------------------------------------------------------------
 
+@with_sandbox
+def test_capture_eviction_archive_blacklisted_under_agent_base(
+        sandbox, meta_sandbox, _fileops):
+    """ — the sink wm-prune archives evicted captures to.
+
+    Predicate-level, like the utilization-sidecar test above: an agent base is
+    resolved from agents_root() rather than a tmp dir, because _classify_base
+    keys on containment under agents_root() and a tmp sandbox can never
+    classify as "agent". The path need not EXIST — the predicate is pure path
+    classification — so this stays hermetic and touches no real agent dir.
+
+    Blacklisted for the usual guard-2415 reason (locked_append_jsonl calls
+    save_history on EVERY append), but the no-restore-value argument is
+    stronger here than anywhere else in this table and is worth pinning
+    precisely because the file is itself a RECOVERY layer and so invites the
+    opposite reflex: the sink is append-only and never mutated, so the live
+    file is a strict superset of every snapshot of it.
+    """
+    from _paths import agents_root
+
+    agent_base = agents_root() / "nonexistent-test-agent"
+    assert_eq(_fileops._classify_base(agent_base), "agent",
+              "an agents_root() child must classify as the agent base kind, "
+              "or the assertions below are testing the wrong blacklist key")
+
+    assert_true(
+        _fileops._is_snapshot_blacklisted(
+            agent_base, "capture-evictions-archive.jsonl"),
+        "capture-evictions-archive.jsonl must be blacklisted under the agent "
+        "base — an unblacklisted sink snapshots the whole growing archive on "
+        "every evicted entry (O(N^2), guard-2415)")
+
+    # Near-misses: the entry is an EXACT basename, not a glob, so neither of
+    # these may match. Without this half the assertion above would still pass
+    # against a pattern that over-matches every capture-eviction-ish name.
+    for near_miss in ("capture-evictions-archive.txt",
+                      "capture-evictions.jsonl",
+                      "capture-evictions-archive-2026-09-11.jsonl"):
+        assert_true(
+            not _fileops._is_snapshot_blacklisted(agent_base, near_miss),
+            f"{near_miss} must NOT match the exact-basename agent entry")
+
+    # Base discrimination, mirroring test_save_history_does_not_skip_same_name_
+    # in_wrong_base: the agent key must not leak into world or meta.
+    for other_base, label in ((sandbox, "world"), (meta_sandbox, "meta")):
+        assert_true(
+            not _fileops._is_snapshot_blacklisted(
+                other_base, "capture-evictions-archive.jsonl"),
+            f"the agent-base entry must not apply under the {label} base")
+
+
 TESTS = [
     test_save_history_skips_blacklisted_presence_dir,
     test_save_history_skips_blacklisted_board_dir,
@@ -726,6 +777,7 @@ TESTS = [
     test_save_history_skips_blacklisted_utilization_sidecars_world,
     test_utilization_blacklist_widening_is_exactly_two_names,
     test_save_history_does_not_skip_same_name_in_wrong_base,
+    test_capture_eviction_archive_blacklisted_under_agent_base,
     test_save_history_writes_gzip_compressed_snapshot,
     test_save_history_gzip_reduces_size_meaningfully,
     test_parse_snapshot_name_strips_gz_suffix,

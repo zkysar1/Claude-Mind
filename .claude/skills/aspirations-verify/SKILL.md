@@ -342,7 +342,7 @@ APPEARED to succeed but actually failed? Did I check for that?"
 **Q4 ENTITY-FACT PROVENANCE** (g-357-44): "Do the artifact's factual claims rest
 on sources this session actually fetched?" Runs only when Q1 named a concrete
 file artifact; skip otherwise.
-- `IF prior_checks.q4_passed`: log `"Q4 skipped (prior checkpoint)"`; proceed.
+- `IF prior_checks.q4_passed`: log `"Q4 reused (prior checkpoint)"`; proceed.
 - Else run the sampler. You do NOT choose which claims it checks — that is the
   point. Add `--source-file` when the goal cites a source the artifact must be
   faithful to:
@@ -352,15 +352,15 @@ file artifact; skip otherwise.
 - Exit `1` = FAIL (a sampled claim is uncited, decoratively cited, or reversed
   against its source) → `all_passed = false`, status → pending, append each
   finding to sensory_buffer as a `verification_gap`. Exit `0` is `pass` OR
-  `skipped` — **not the same answer**; read the verdict and never count
-  `skipped` as evidence. No override flag, by design.
-- **On Q4 assessed**:
+  `skipped` — **not the same answer**; never count `skipped` as evidence.
+  No override flag, by design.
+- **On Q4 assessed** (record BOTH keys):
   ```bash
-  bash core/scripts/loop-state-save.sh update --set "phase_progress.q4_passed=true"
+  bash core/scripts/loop-state-save.sh update --set "phase_progress.q4_passed=<true|false>" --set "phase_progress.q4_verdict=<pass|fail|skipped>"
   echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q4 provenance: <verdict>, <sampled>/<total> cluster(s)"}' | bash core/scripts/execution-diary.sh append
   ```
-  Why the sample is scripted, why `--session-id` must stay defaulted on a worker
-  Body, and why a `cat`-read file reads as uncited:
+  Why the sample is scripted, its three traps (worker `--session-id`, `cat`-read
+  files, the bool that cannot hold `skipped`):
   `core/config/rationale/verify-check-unevaluatable.md` § Q4.
 
 ### Standard Checks

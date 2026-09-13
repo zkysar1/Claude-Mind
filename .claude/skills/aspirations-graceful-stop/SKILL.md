@@ -217,72 +217,23 @@ IF agents/<agent>/session/iteration-checkpoint.json EXISTS:
         Output: "  Obligations complete."
 ELSE:
     # No checkpoint — check for orphaned in-progress goals.
-    # Partner-claim filter: read every OTHER agent's in_flight goal_id first
-    # and skip those — they belong to that agent's live execution, not ours.
-    # Without this filter the revert loop will set partner-claimed goals back
-    # to pending mid-execution (2026-05-11 bravo nearly reverted alpha's
-    # g-250-57 at phase=4). Same partner-skip pattern aspirations-select uses
-    # at the candidate-rank stage.
-    Bash: team-state-read.sh --field agent_status --json
-    partner_claimed = set of agent_status[name].in_flight.goal_id
-                      for every name != <agent> where in_flight is non-null
-    # --full is REQUIRED: the default projection returns only six keys
-    # (asp_id, category, goal_id, source, status, title), so `goal.id` below
-    # resolves to nothing and the revert would pass an empty goal-id to a
-    # status mutation. --full widens the projection to include `id`.
-    Bash: aspirations-query.sh --goal-status in-progress --full
-    # OWNERSHIP CASCADE (g-115-5719). Revert ONLY what THIS Body owns. Take the
-    # most specific ownership signal the goal carries; in_flight is the LAST
-    # resort, never the primary, because it holds AT MOST ONE goal per agent —
-    # so as a filter it protects one goal and exposes every other one the
-    # partner holds. That is guard-1802's narrow-predicate class inverted: the
-    # protective predicate is narrower than the population it must protect, so
-    # the blast radius GROWS the harder partners are working.
-    #
-    # claimed_by_sid FIRST, not claimed_by — the discriminator is the BODY, not
-    # the agent. One agent runs many Bodies (Mind/Body split), and they all
-    # write the SAME claimed_by. Measured 2026-08-11 on cc-08 (alpha, worker
-    # Body, SID 7f7f3513): `--goal-status in-progress --full` returned 240 rows,
-    # claimed_by == "alpha" on ALL 240, spread across FIVE distinct
-    # claimed_by_sid values (182/37/19/1 belonging to other live alpha Bodies,
-    # and exactly 1 mine). An agent-name comparison is `alpha != alpha` there —
-    # it matches nothing and reverts 239 of a partner Body's goals. The sibling
-    # stranded-claim-sweep already compares claimed_by_sid for this reason
-    # (g-115-3176 / g-115-4004); GS-1 is inheriting that fix here.
-    #
-    # Both fields ARE in the --full projection (verified live, non-null on
-    # 240/240) — check that before trusting this cascade, because a missing key
-    # makes every test below false, skips nothing, and reverts EVERYTHING. The
-    # default projection carries neither (guard-1242 class).
-    #
-    # A goal claimed by an EARLIER, now-dead Body of this agent is deliberately
-    # NOT reverted here: its sid is not ours, so the first test skips it. That
-    # is the safe direction and it is not a gap — reclaiming genuinely stranded
-    # claims needs a liveness/age judgement, which is stranded-claim-sweep's
-    # job, not a stop path's. GS-1 reverts what it owns and leaves the rest.
-    # Written as ONE decision point on purpose. An earlier draft of this fix
-    # nested the sid test inside an `IF sid is non-null` and then continued with
-    # `ELSE IF claimed_by ...` at the outer level — which reads two ways
-    # depending on which IF the ELSE binds to, and one of those readings reverts
-    # everything. Never leave a dangling-else ambiguity in a destructive branch:
-    # select the signal first, decide once, act once.
-    FOR EACH returned goal:
-        # Pick the MOST SPECIFIC ownership signal this goal carries. Exactly one
-        # arm fires, and each arm answers the same question: is this goal MINE?
-        IF goal.claimed_by_sid is non-null:
-            ours   = (goal.claimed_by_sid == <this session's SID, $MIND_SID>)
-            reason = "claimed by another Body {goal.claimed_by_sid}"
-        ELSE IF goal.claimed_by is non-null:
-            ours   = (goal.claimed_by == <agent>)
-            reason = "claimed by {goal.claimed_by}"
-        ELSE:
-            ours   = (goal.id NOT in partner_claimed)
-            reason = "partner-claimed"
-        IF NOT ours:
-            Output: "  Skipped {goal.id} ({reason} — not ours to revert)"
-            CONTINUE
-        Bash: aspirations-update-goal.sh --source {goal.source} {goal.id} status pending
-        Output: "  Reverted {goal.id} to pending (execution interrupted)"
+    # OWNERSHIP (g-115-5719; collapsed to ONE arm g-115-9717). Revert ONLY what
+    # this Body can PROVE it owns: claimed_by_sid == our SID. There is no fallback
+    # arm, so a projection missing the ownership keys reverts NOTHING instead of
+    # everything, and the rule is branch-tested rather than prose that drifts.
+    # --full is REQUIRED (guard-1424): the default projection returns six keys and
+    # none of them is a claim field — exactly the degraded shape the gate reports.
+    # Rationale (WHY one arm, not three): core/config/rationale/gs1-ownership-fail-closed.md
+    Bash: bash core/scripts/aspirations-query.sh --goal-status in-progress --full \
+            | bash core/scripts/gs1-ownership.sh
+    decision = the printed JSON — revert[], sources{}, skip[], degraded, counts{}
+    IF decision.degraded is true:
+        Output: "  Ownership fields absent — reverted nothing: {decision.degraded_reason}"
+    FOR EACH entry in decision.skip:
+        Output: "  Skipped {entry.goal_id} ({entry.reason} — not ours to revert)"
+    FOR EACH goal_id in decision.revert:
+        Bash: aspirations-update-goal.sh --source {decision.sources[goal_id]} {goal_id} status pending
+        Output: "  Reverted {goal_id} to pending (execution interrupted)"
     # Clear team-state in_flight on revert (g-284-03). Called unconditionally —
     # not per-goal, because in_flight holds at most one entry per agent. The
     # script is idempotent. Same rationale as the stale-checkpoint branch above:

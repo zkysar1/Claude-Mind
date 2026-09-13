@@ -137,6 +137,12 @@ _WORLD_CARRIER_DIRNAME = "body-carriers"
 # `read_carriers`). Deliberately the same literal `body-merge._STAGED_DIRNAME`
 # uses, because it is the same directory — the staged `<unit>-wm.yaml` files and
 # the old `<unit>-fastlane.jsonl` carriers were co-tenants there.
+#
+# THAT CO-TENANCY IS NOW HISTORICAL ONLY (): the staged-WM lane made
+# the same move this carrier made, to `body-manifest.world_staged_dir()` under
+# `world/body-staged-wm/<agent>/`. Both legacy paths still point at this one
+# directory and both readers still scan it, so the sentence above stays true of
+# what is ON DISK; it is no longer true of where either lane WRITES.
 _LEGACY_CARRIER_DIRNAME = "pending-body-merges"
 
 

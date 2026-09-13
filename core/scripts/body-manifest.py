@@ -68,15 +68,101 @@ _BASELINE_FILENAME = "forked-wm-baseline.yaml"
 # only when it is present, then consumes it.
 _CLOSE_SENTINEL_FILENAME = "body-closing"
 # -b: cross-box WM transport staging. body-merge.py is the READER of
-# this contract (_STAGED_DIRNAME L108, _STAGED_HASH_SUFFIX L109); it globs
-# "*-wm.yaml" under state_dir/_STAGED_DIRNAME and derives unitKey by stripping
-# that suffix. Keep these four in sync with it. The baseline suffix is
+# this contract (_STAGED_HASH_SUFFIX, _STAGED_BASELINE_SUFFIX); it globs
+# "*-wm.yaml" and derives unitKey by stripping that suffix. Keep these in sync
+# with it.
+#
+#  SPLIT THE DIRECTORY IN TWO, and the reader knows about both: the
+# PRODUCER now writes to `world_staged_dir()` (world-rooted, claim-EXEMPT —
+# see its docstring for why the agent tree cannot work), while
+# `_STAGED_DIRNAME` below is the LEGACY agent-tree path, kept because it still
+# holds unmerged payload on at least three boxes. body-merge._consume_staged
+# scans the UNION of the two and prefers the world copy when a unitKey appears
+# in both. Do NOT "tidy" this back to one directory until the legacy dirs are
+# measured empty fleet-wide. The baseline suffix is
 # deliberately "-wm-baseline.yaml": it does NOT match the reader's "*-wm.yaml"
 # glob, so a baseline can never be mis-consumed as a Body WM.
 _STAGED_DIRNAME = "pending-body-merges"
+# : LEGACY destination, now READ-ONLY. Kept because three boxes hold
+# real unmerged payload under it (cc-09 13 files / 26,975,224 B / 4 Bodies,
+# cc-08 21 / 14,336,845 / 6, cc-10 10 / 1,230,605 / 3, all measured
+# first-person) and body-merge._consume_staged still unions it. Do NOT delete
+# it or the files under it: cc-08 established that NONE of its six staged SIDs
+# still has a session dir, so the staged triple is those Bodies' SOLE SURVIVING
+# TRACE and archive-before-delete.md applies with full force.
+_WORLD_STAGED_DIRNAME = "body-staged-wm"
 _STAGED_WM_SUFFIX = "-wm.yaml"
 _STAGED_BASELINE_SUFFIX = "-wm-baseline.yaml"
 _STAGED_HASH_SUFFIX = "-wm.hash"
+#  outcome 3: the CONSUMED TOMBSTONE. Written by
+# body-merge._consume_staged (on the REDUCER) before it deletes a triple, read
+# here (on the ORIGIN box) before re-staging or re-pushing one.
+#
+# WHY IT IS NEEDED, and why nothing before it closed the door: `_delete_staged`
+# removes the store object AND a local file, but that local unlink runs on the
+# REDUCER's filesystem. The origin box's own legacy copy is untouched by a
+# remote consume, so a later `push-staged` for that unitKey finds no world-side
+# copy, relocates the legacy one again, re-pushes it, and the reducer merges the
+# SAME divergence twice — and a 3-way delta applied twice double-counts every
+# counter. Before the destination moved to world/ that door was closed BY
+# ACCIDENT: the push simply failed NoClaimError, so nothing ever reached the
+# store to be resurrected. Fixing the push opened it.
+#
+# It does NOT end in "-wm.yaml", so the readers' `*-wm.yaml` glob and the
+# `endswith("-wm.yaml")` listing filter cannot mis-consume a tombstone as a Body
+# WM — the same disjointness the baseline suffix relies on. guard-2616 says to
+# MEASURE that rather than assume it; test_body_staged_consumed_tombstone.py
+# asserts it against both readers.
+_STAGED_CONSUMED_SUFFIX = "-wm.consumed"
+
+
+def world_staged_dir(agent_dir, world_dir=None) -> Path:
+    """The staged-WM destination. Derived from the agent NAME, not the PATH.
+
+    WHY THIS MOVED OUT OF THE AGENT TREE (g-115-9750). The original destination
+    was `agents/<agent>/session/pending-body-merges/`, chosen because `session`
+    (singular) is NOT walk-pruned by `owncloud_sync._EXCLUDE_DIRS` while
+    `sessions` (plural) is — so it solved the SYNC problem, and the
+    session-manifest registers all three globs `sync_tier: continuity`
+    accordingly. It then ran straight into a SECOND, entirely separate guard:
+    every write under `agents/<agent>/` is refused by the own-cloud claim fence
+    unless this box holds the live runner claim, and a worker Body by definition
+    never does. `push_staged_files` therefore raised `NoClaimError` on every
+    push from every non-reducer box, forever — so the sync tier was correct and
+    irrelevant, which is why four Bodies read the registration and still could
+    not explain the stranding.
+
+    The two in-tree candidates DEADLOCK, which is why no path under
+    `agents/<agent>/` can work:
+      - `session/`  (singular) — syncable, but CLAIM-FENCED.
+      - `sessions/` (plural)   — claim-EXEMPT, but sync-excluded (machine-local).
+    Neither is both. `world/` is both.
+
+    THIS IS THE SAME MOVE g-306-420 ALREADY MADE FOR THE FASTLANE CARRIER, and
+    deliberately so: `body_capture_carrier._world_carrier_dir` is the proven
+    sibling, measured byte-identical at the new destination. The staged-WM lane
+    simply never got it. Keep the two shaped alike.
+
+    NOT COVERED BY THE PRIOR REJECTION. `body_capture_carrier.py` L47 records
+    "WHY NOT SIMPLY SYNC sessions/ — rejected twice (g-306-119-b, g-115-6240)".
+    That rejection is about syncing the PLURAL `sessions/` tree WHOLESALE, and
+    neither of its reasons reaches here: the staged triple is not a second copy
+    of a live file but the merge payload itself, which is MEANT to travel, and
+    the per-box closure record is `sessions/<SID>/body-manifest.yaml`, which
+    this does not touch.
+
+    MIGRATION IS BY UNION, NOT BY MOVE. The legacy dir stays readable and
+    `body-merge._consume_staged` scans BOTH, so nothing already staged is
+    stranded and no box needs to migrate in lockstep. A box that has this
+    commit has the producer AND the consumer; a box without it has neither. The
+    one mixed state — producer updated, reducer not yet — is exactly the case
+    where the old push ALREADY failed, so it cannot regress anything.
+    """
+    if world_dir is None:
+        from _paths import WORLD_DIR
+        world_dir = WORLD_DIR
+    return Path(world_dir) / _WORLD_STAGED_DIRNAME / Path(agent_dir).name
+
 
 VALID_ROLES = ("reducer", "worker", "observer")
 # : `parked` is a RESUMABLE state and is deliberately NOT a close.
@@ -460,9 +546,87 @@ def read_manifest(sid: str, agent: str, project_root: Path | None = None) -> dic
     return data or {}
 
 
+def _push_carrier(carrier: Path) -> bool:
+    """Deliver the carrier to the backend NOW, rather than leaving it to the
+    periodic sweep (g-115-9607).
+
+    RETURNS WHETHER DELIVERY ACTUALLY LANDED, and this return is the ORIGIN of
+    the delivery signal the whole chain above it reports (g-115-9607 unit 28).
+    This function has always KNOWN the answer -- it catches the failure -- and
+    threw it away, returning None and printing to stderr. That print is real but
+    it is not a value: both call sites in cleanup-stale-bindings.sh redirect
+    stderr (one `2>&1`) and branch on rc, which `main` pins at 0 for every
+    outcome, so the diagnostic was unreachable by construction (guard-5501).
+    Unit 26 measured the consequence on a worker box -- the reconcile fires, the
+    push is refused `no_claim`, and rc=0 with empty stdout and empty stderr
+    reports that as success. Returning the bool is what lets
+    `_mirror_state_to_carrier` -> `_reconcile_orphan_carrier` ->
+    `close_body_late` express it as a verdict a caller can read.
+
+    THE FAIL-OPEN IS UNCHANGED AND MUST STAY UNCHANGED. This still swallows the
+    exception, still prints, and still never raises into a closing caller; only
+    the REPORTING is added. Each layer's fail-open is separately justified in its
+    own comments (guard-373), and unit 26 declined to collapse them for that
+    reason -- so this threads a value through them rather than removing them.
+
+    THE LOCAL WRITE IS NOT DELIVERY, and a close is the one moment where that
+    distinction is terminal. The carrier reaches peers only when the own-cloud
+    daemon's periodic sync next runs (120s, rb-1464) -- but a Body's LAST tick
+    happens before its close, so nothing on this Body ever writes again. If the
+    box goes quiet before that sweep (a power-down, an lxc stop, a killed pane
+    -- the exact population this goal is about), the close is written locally
+    and the STORE keeps the last heartbeat-pushed value, `active`, forever.
+    Every consumer then reads a phantom live Body, which is precisely the
+    false-alert flood `_mirror_state_to_carrier` exists to prevent: the mirror
+    was correct and simply never arrived.
+
+    MEASURED 2026-09-11 on cc-07, by direct GetObject (not a read-through, which
+    returns the local copy and cannot see this): Body 1dc6fc35 has read
+    `closed-pending-merge` locally since 2026-09-01T20:05:02 while the store
+    still returns `active` stamped 2026-08-27T16:47:56, object LastModified
+    16:48:07. cc-08's 9a35daca reproduces it exactly, against a positive control
+    (cd5fd3b9) that matches on both sides.
+
+    The asymmetry this closes: the SAME close already pushes its staged WM
+    explicitly, via `push_staged_files`, for this identical reason -- the state
+    mirror was the half left to a daemon that may never run again. Cost is
+    bounded and small: the three callers (set_state / park / resume) are a
+    handful of transitions per Body lifetime, and heartbeat-tick.sh does NOT
+    route through here -- it writes the carrier itself, on a box that is by
+    construction still alive to be swept.
+
+    Fail-open by contract, like every other step on a close path: a failure here
+    degrades to today's behaviour (the sweep remains the backstop whenever the
+    box stays up), never to a failed close. Broad `Exception` matches
+    `push_staged_files`, whose contract is the same -- transport must never
+    raise into a caller that is closing.
+    """
+    try:
+        from storage_backend import get_backend
+        get_backend().write_bytes(carrier, carrier.read_bytes())
+        return True
+    except Exception as exc:  # noqa: BLE001 — transport must never raise here
+        print(f"body-manifest: carrier push FAILED for {carrier} "
+              f"({type(exc).__name__}: {exc}) — body_state mirrored LOCALLY "
+              "only; peers will keep reading this Body's previous state until "
+              "the periodic sync runs, and never if this box goes quiet first",
+              file=sys.stderr)
+        return False
+
+
 def _mirror_state_to_carrier(sid: str, agent: str, new_state: str,
-                             project_root: Path | None = None) -> None:
+                             project_root: Path | None = None) -> bool:
     """Mirror body_state into the SYNCABLE per-Body heartbeat carrier ().
+
+    RETURNS True ONLY WHEN THE NEW STATE REACHED PEERS -- written locally AND
+    delivered by `_push_carrier` (g-115-9607 unit 28). False covers both "there
+    was nothing to mirror" (absent/unreadable/non-object carrier) and "mirrored
+    locally, delivery refused". Those are deliberately NOT distinguished here
+    because the one caller that reads this value, `_reconcile_orphan_carrier`,
+    has ALREADY established that the carrier exists and reads `active` before it
+    calls -- so under that caller a False can only mean a failed delivery. Any
+    future caller that needs the distinction must establish it the same way or
+    ask for a richer return; do not infer "delivery refused" from False alone.
 
     THIS WRITE IS WHAT KEEPS THE PEER-SIDE STALL PROBE FROM FLOODING, and it is
     the half that is easy to omit. heartbeat-tick.sh stamps the state on every
@@ -474,6 +638,11 @@ def _mirror_state_to_carrier(sid: str, agent: str, new_state: str,
     exact flood the split exists to prevent. The two writers ship together or
     neither ships.
 
+    THE WRITE IS ONLY HALF OF IT -- writing the field locally is not the same as
+    a peer being able to read it, and for five months it was treated as though
+    it were. `_push_carrier` below delivers it; see there for the measurement
+    (g-115-9607) showing a correctly-mirrored close that never left its box.
+
     Fail-open by contract, and narrowly (guard-373): a carrier that is absent,
     unreadable, or not a JSON object leaves the field alone. The reader renders
     a missing/stale state as `stale_state_unknown`, which never alerts, so a
@@ -484,17 +653,18 @@ def _mirror_state_to_carrier(sid: str, agent: str, new_state: str,
         _, _, state_dir = _agent_paths(agent, sid, project_root)
         carrier = state_dir / f"body-heartbeat-{sid}.json"
         if not carrier.is_file():
-            return
+            return False
         doc = json.loads(carrier.read_text(encoding="utf-8"))
         if not isinstance(doc, dict):
-            return
+            return False
         doc["body_state"] = new_state
         _write_atomic(carrier, json.dumps(doc) + "\n")
+        return _push_carrier(carrier)
     except (OSError, ValueError, TypeError):
         # json.JSONDecodeError subclasses ValueError; FileNotFoundError
         # subclasses OSError. Narrow on purpose -- a NameError or AttributeError
         # here is a logic bug and must not be swallowed as a benign skip.
-        return
+        return False
 
 
 def set_state(sid: str, agent: str, new_state: str,
@@ -695,7 +865,10 @@ def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
         print("body-manifest: cannot stage — manifest has no unitKey",
               file=sys.stderr)
         return False
-    staged_dir = state_dir / _STAGED_DIRNAME
+    # : world-rooted so the push is not refused by the claim
+    # fence on a non-claim-holding box. state_dir is agents/<name>/session,
+    # so its parent is the agent dir the resolver takes.
+    staged_dir = world_staged_dir(state_dir.parent)
     # (basename-suffix, bytes) for each file this Body owes the reducer.
     #
     # ORDER IS LOAD-BEARING — THE -wm.yaml TRIGGER MUST BE LAST. body-merge.py
@@ -745,6 +918,130 @@ def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
     return push_staged_files(staged_dir, unit_key) and ok
 
 
+def unit_already_consumed(world_staged: Path, unit_key: str,
+                          backend=None) -> bool:
+    """True when a reducer has recorded `unit_key` as CONSUMED ().
+
+    `world_staged` is the WORLD-ROOTED staged dir the tombstone lives in — the
+    same directory the triple was pushed to. It is taken as a parameter rather
+    than re-derived from a state_dir because the two callers hold different
+    paths (relocate has `state_dir`, push has the world dir already), and
+    re-deriving from the wrong one silently resolves to a directory that never
+    contains a tombstone — a check that always answers "not consumed" and is
+    indistinguishable from a working one (guard-5501).
+
+    The tombstone lives beside the staged triple in the world-rooted dir, which
+    is the only directory both boxes can reach: claim-EXEMPT so a worker may
+    write it, syncable so a reducer's write is visible here.
+
+    AUTHORITATIVE FIRST, LOCAL ONLY AS A FALLBACK. Under own-cloud the local
+    tree is a read-through cache, so a bare `Path.exists()` answers a question
+    about THIS box's cache rather than about the store — the same local-read
+    mistake that made the pre-g-306-420 carrier look delivered while it was
+    stranded (guard-980). The reducer that wrote this tombstone is on another
+    box, so its write reaches here through the store or not at all.
+
+    FAIL-OPEN, DELIBERATELY, AND THE DIRECTION IS THE WHOLE ARGUMENT. When the
+    store is unreachable this returns False, i.e. "not consumed, go ahead and
+    push". The two error directions are NOT symmetric: a false False re-pushes a
+    triple and risks ONE double-merge, which `merge_wm`'s 3-way baseline already
+    bounds to a counter re-add; a false True SILENTLY DROPS a Body's only copy of
+    its divergence, which nothing recovers. Never invert this to fail-closed.
+    """
+    if backend is None:
+        try:
+            from storage_backend import get_backend
+            backend = get_backend()
+        except Exception:  # noqa: BLE001 — a missing backend is not consumed-ness
+            backend = None
+    marker = Path(world_staged) / f"{unit_key}{_STAGED_CONSUMED_SUFFIX}"
+    if backend is not None:
+        try:
+            if marker.name in backend.list_dir(marker.parent.resolve()):
+                return True
+        except Exception:  # noqa: BLE001 — store listing is additive, never fatal
+            pass
+    return marker.is_file()
+
+
+def relocate_legacy_staging(state_dir: Path, unit_key: str) -> list:
+    """COPY a legacy-staged triple into the world-rooted destination.
+
+    WHY THIS EXISTS (g-115-9750). `cleanup-stale-bindings.sh` is annotated
+    IRREDUCIBLY LOCAL and stages in pure bash to
+    `agents/<agent>/session/pending-body-merges/` — it has no `_paths.sh` and
+    hand-mirrors `AGENTS_PARENT_DIR` rather than sourcing one, so resolving
+    `WORLD_DIR` there would mean a third reimplementation of the
+    env->conf->fallback chain in a second language (the SSOT failure
+    `communication-clarity.md` rule 5 names). Moving the destination in
+    `push-staged` alone would have left the bash staging in one directory
+    while the push read another: `push_staged_files` skips an absent file and
+    returns True, so the crash-preserve path would have reported success while
+    transporting ZERO BYTES, and the bash `||` warning — the only signal that a
+    Body's WM failed to reach the reducer — would never fire. A silent no-op is
+    strictly worse than the loud NoClaimError it replaced.
+
+    So the relocation happens HERE, inside the python3 subprocess the bash is
+    already spending on this rare path, and the bash stays untouched. A LOCAL
+    write is never claim-fenced (the fence lives in the backend's PUT), so
+    staging locally to either directory always works; only the PUSH has to
+    originate from a claim-exempt path.
+
+    COPY, NEVER MOVE. A move is a delete of the original
+    (archive-before-delete.md), and the legacy copy is some Bodies' sole
+    surviving trace. The duplicate is not debt: it lands in exactly the
+    shadowed-duplicate branch `body-merge._consume_staged` implements — world
+    outranks legacy, and the legacy triple is retired on the SAME disposition
+    as the copy actually read, never as a standalone delete.
+
+    An existing world-side file is never overwritten: `close_body_on_genuine`
+    stages the authoritative copy there, and it is the fresher writer.
+
+    ORDER IS LOAD-BEARING — sidecars first, the `-wm.yaml` TRIGGER last, for
+    the same reason every other stager in this module does it: a concurrent
+    `_consume_staged` globs `*-wm.yaml`, so a trigger visible before its
+    sidecars is silently consumed down a degraded path (no baseline -> 2-way
+    union+SUM double-count; no hash -> the never-diverged no-op is skipped).
+
+    Returns the basenames copied (empty when there was nothing to relocate).
+    """
+    legacy = state_dir / _STAGED_DIRNAME
+    if not legacy.is_dir():
+        return []
+    #  outcome 3: a consumed unitKey is never re-staged. Checked HERE
+    # as well as in push_staged_files, not redundantly: without this the legacy
+    # triple is copied back into the world dir, and a box that later runs as
+    # reducer globs that local copy and re-merges it WITHOUT any push at all.
+    # Gating only the push would leave that second, purely-local resurrection
+    # path open.
+    world = world_staged_dir(state_dir.parent)
+    if unit_already_consumed(world, unit_key):
+        print(f"body-manifest: {unit_key} was already consumed by a reducer — "
+              "not re-staging it (g-115-9750 re-push-after-consume guard)",
+              file=sys.stderr)
+        return []
+    copied = []
+    for suffix in (_STAGED_BASELINE_SUFFIX, _STAGED_HASH_SUFFIX,
+                   _STAGED_WM_SUFFIX):
+        src = legacy / f"{unit_key}{suffix}"
+        if not src.is_file():
+            continue
+        dst = world / f"{unit_key}{suffix}"
+        if dst.exists():
+            continue
+        try:
+            world.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+            copied.append(dst.name)
+        except OSError as exc:
+            # Never fatal: the caller still pushes whatever DID land, and the
+            # legacy copy is untouched, so nothing is lost by a failed copy.
+            print(f"body-manifest: could not relocate {src.name} to the "
+                  f"world-rooted staging dir ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+    return copied
+
+
 def push_staged_files(staged_dir: Path, unit_key: str) -> bool:
     """Explicitly push every staged file present for `unit_key`. Returns True
     iff all of them reached the backend (a file that does not exist is skipped,
@@ -770,6 +1067,18 @@ def push_staged_files(staged_dir: Path, unit_key: str) -> bool:
         print(f"body-manifest: storage backend unavailable, staged files NOT "
               f"pushed ({type(exc).__name__}: {exc})", file=sys.stderr)
         return False
+    #  outcome 3: THE SHARED CHOKEPOINT. Both stagers reach the store
+    # through this one function, so gating here covers close_body_on_genuine and
+    # cleanup-stale-bindings' crash-preserve path with one predicate.
+    # Returns True, not False: the unit's content IS durably accounted for (a
+    # reducer merged it), so this is a satisfied push, not a failed one. False
+    # would make the bash caller print its "WM will not reach the reducer"
+    # warning about a WM that already did.
+    if unit_already_consumed(staged_dir, unit_key, backend=be):
+        print(f"body-manifest: {unit_key} was already consumed by a reducer — "
+              "skipping re-push (g-115-9750 re-push-after-consume guard)",
+              file=sys.stderr)
+        return True
     ok = True
     # ORDER IS LOAD-BEARING — THE -wm.yaml TRIGGER IS PUSHED LAST, for the same
     # reason _stage_and_push WRITES it last (see the rationale there). The
@@ -858,17 +1167,181 @@ def close_body_on_genuine(sid: str, agent: str,
     # and the close would report as a benign no-op. `not-active` still means what
     # it says (a Body already closed or merged must never be re-queued); it simply
     # no longer means "not the string active".
-    # FIX 1+2 (-b): a REMOTE Body's reducer lives on another box and
-    # can never see this Body's sessions/<sid>/ dir (walk-pruned by
-    # _EXCLUDE_DIRS), so marking alone strands the WM. Stage into session/
-    # (singular, syncable) and push explicitly. Staged BEFORE set_state so a
-    # staging failure cannot leave a manifest claiming closed-pending-merge
-    # with nothing for the reducer to merge.
+    pushed = _mark_pending_merge(sid, agent, data, session_dir, state_dir,
+                                 project_root)
+    _unlink_quiet(sentinel)
+    return "marked" if pushed else "marked-push-failed"
+
+
+def _mark_pending_merge(sid: str, agent: str, data: dict, session_dir: Path,
+                        state_dir: Path, project_root: Path | None) -> bool:
+    """The ordinary close of a forked worker Body: stage if remote, then mark.
+
+    Shared by close_body_on_genuine and close_body_late (g-115-9607) so a late
+    close is the SAME close, not a second implementation of it. Returns False
+    iff a remote Body's staging or explicit push failed.
+
+    FIX 1+2 (g-306-119-b): a REMOTE Body's reducer lives on another box and
+    can never see this Body's sessions/<sid>/ dir (walk-pruned by
+    _EXCLUDE_DIRS), so marking alone strands the WM. Stage into session/
+    (singular, syncable) and push explicitly. Staged BEFORE set_state so a
+    staging failure cannot leave a manifest claiming closed-pending-merge
+    with nothing for the reducer to merge.
+    """
     pushed = True
     if data.get("remote_body"):
         pushed = _stage_and_push(session_dir, state_dir, data)
     set_state(sid, agent, "closed-pending-merge", project_root)
-    _unlink_quiet(sentinel)
+    return pushed
+
+
+def _reconcile_orphan_carrier(sid: str, agent: str, truth_state: str | None,
+                              project_root: Path | None = None) -> str | None:
+    """Repair a CARRIER left reading `active` when the manifest no longer says so.
+
+    RETURNS A VERDICT, not a bool (g-115-9607 unit 28), because a repair has
+    THREE outcomes and the middle one was invisible:
+      None                   — not a candidate; nothing was written.
+      'repaired'             — written locally AND delivered to peers.
+      'repaired-push-failed' — written locally, delivery REFUSED. On a worker
+                               box this is the STEADY STATE, not an edge: the
+                               carrier lives in the claim-fenced agent tree and
+                               a non-claim-holding box is refused `no_claim`
+                               (unit 22), so every repair here is local-only.
+    It used to `return True` unconditionally once it decided to repair, which
+    made the delivered and refused cases indistinguishable to every caller. That
+    is the layer unit 26 identified as having to change FIRST: a caller taught to
+    read a verdict that does not exist yet reads success and warns about nothing.
+    A verdict string rather than a second bool matches this module's own idiom
+    ('marked' / 'marked-push-failed' below) and leaves room for further outcomes.
+
+    WHY THE LOCAL WRITE STILL HAPPENS ON A REFUSED PUSH: the manifest is the
+    record of truth and it already says closed; the local carrier agreeing with
+    it is correct in itself. What was wrong was reporting that as delivery. Note
+    the consequence this does NOT fix, deliberately (unit 26 measured it): after
+    the local write the carrier no longer reads `active`, so the call site's
+    pre-filter skips it forever and there is no retry. Making it visible is this
+    unit's scope; making it retry is not.
+
+    The two early returns in close_body_late below — 'no-manifest' and
+    'not-active' — were the only paths that touched nothing, and they are exactly
+    the two states an orphan carrier is in. The manifest lives INSIDE the session
+    dir and is deleted with it; the carrier lives in session/ (singular) and
+    SURVIVES, so the file that keeps alerting is precisely the one those returns
+    skipped. Measured cc-03 2026-09-12 (g-115-9607 unit 23): 3 carriers reading
+    `active` with their session dir gone, one minted AFTER the g-306-430 publish
+    fix — so this residue is made HERE, not by the ownership fence that unit 22
+    root-caused.
+
+    ONLY an `active` carrier is repaired, and that narrowness IS the safety
+    argument. A carrier reading closed-* or parked is already correct or diverges
+    harmlessly; overwriting those would let a `parked` manifest resurrect a closed
+    reading, the one direction that can un-finish a Body.
+
+    STALENESS IS PRESERVED BY CONSTRUCTION, and without that this change would be
+    a net regression: worker_stall.classify_body returns V_ALIVE on FRESHNESS
+    BEFORE it ever reads body_state, so a repair that looked like a tick would
+    trade a false stall for a phantom LIVE Body — and fleet-live-bodies plus
+    reducer_promotion's only_fresh_carrier_is_mine both ACT on that. Both read age
+    from the DOC's `ts` (worker_stall.py ~776, reducer_promotion.py ~543), never
+    the file mtime, and _mirror_state_to_carrier rewrites `body_state` alone, so
+    `ts` survives untouched and the repaired carrier classifies V_STALE_NO_CLAIM
+    (benign, never alerts) — which is the whole intended effect.
+
+    Fail-open exactly like its callee (guard-373): an absent, unreadable or
+    non-object carrier, or a state this module does not recognise, is a no-op
+    and returns None.
+    """
+    if truth_state not in VALID_STATES or truth_state == "active":
+        return None
+    try:
+        _, _, state_dir = _agent_paths(agent, sid, project_root)
+        carrier = state_dir / f"body-heartbeat-{sid}.json"
+        if not carrier.is_file():
+            return None
+        doc = json.loads(carrier.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict) or doc.get("body_state") != "active":
+            return None
+    except (OSError, ValueError, TypeError):
+        return None
+    # The carrier is proven present and `active` above, so a False here is a
+    # DELIVERY refusal and never "nothing to mirror" — the precondition
+    # _mirror_state_to_carrier's docstring requires before reading it that way.
+    delivered = _mirror_state_to_carrier(sid, agent, truth_state, project_root)
+    return "repaired" if delivered else "repaired-push-failed"
+
+
+def _with_repair_verdict(base: str, repair: str | None) -> str:
+    """Suffix a close_body_late verdict when its orphan repair did not deliver.
+
+    Shared by the two early returns below so they cannot drift apart — they are
+    the same case (an orphan carrier repaired on the way out) reached through
+    two different manifest states, and unit 24 kept their return strings stable
+    precisely because callers and three test files branch on them.
+
+    ONLY the failure case changes the string. A repair that delivered, and a path
+    where no repair was attempted at all, both return `base` unchanged, so every
+    existing equality test and caller keeps its current behaviour.
+    """
+    return f"{base}-push-failed" if repair == "repaired-push-failed" else base
+
+
+def close_body_late(sid: str, agent: str,
+                    project_root: Path | None = None) -> str:
+    """Close a Body whose session already ENDED without closing it ().
+
+    The close above runs only in the turn-ending session's own stop hook, so a
+    power-down, an lxc stop or a killed pane leaves `body_state: active` with no
+    writer left alive to change it. This is that same close, run late. It does
+    NOT decide that the session is gone — the caller must already have proved
+    that on the box that ran it (abandoned_sessions.py owns the definition).
+    Nothing is deleted: the session dir, its WM and its baseline all stay.
+
+    Returns one of:
+      'no-manifest' / 'bad-manifest' — nothing to close
+      'not-active'  — parked or already closed: untouched. A park is RESUMABLE by
+                      contract (g-306-291) and ends only through its own expiry,
+                      so a late close never converts one into a close.
+      'no-manifest-push-failed' / 'not-active-push-failed' — as the two above,
+                      AND the orphan-carrier repair those paths perform was
+                      written locally but REFUSED delivery (g-115-9607 unit 28).
+                      The manifest side is identical; only the carrier's reach
+                      differs, which is the whole point — the unsuffixed verdict
+                      used to be returned in both cases, so a caller could not
+                      tell a repair that reached peers from one that did not.
+                      The SUFFIX is deliberate and is why existing callers keep
+                      working: the success path still returns the bare string, so
+                      only the failure case is new. A caller that must treat both
+                      alike should test `.startswith('no-manifest')`, never
+                      equality (guard-3274: enumerate before narrowing).
+      'marked' / 'marked-push-failed' — a forked worker, closed exactly as
+                      close_body_on_genuine closes one (staged if remote, then
+                      closed-pending-merge, carrier mirrored). A leftover
+                      body-closing sentinel is consumed with it.
+      'marked-stale' — no forked WM (a reducer or observer Body). There is no
+                      divergence to stage and nothing for a merge to consume, so
+                      closed-pending-merge would be a false claim; closed-stale
+                      is the closed value that says a sweep closed it.
+    """
+    _, session_dir, state_dir = _agent_paths(agent, sid, project_root)
+    try:
+        data = read_manifest(sid, agent, project_root)
+    except FileNotFoundError:
+        repair = _reconcile_orphan_carrier(sid, agent, "closed-stale",
+                                           project_root)
+        return _with_repair_verdict("no-manifest", repair)
+    except ManifestParseError:
+        return "bad-manifest"
+    if data.get("body_state") != "active":
+        repair = _reconcile_orphan_carrier(sid, agent, data.get("body_state"),
+                                           project_root)
+        return _with_repair_verdict("not-active", repair)
+    if not (session_dir / _WM_FILENAME).is_file():
+        set_state(sid, agent, "closed-stale", project_root)
+        return "marked-stale"
+    pushed = _mark_pending_merge(sid, agent, data, session_dir, state_dir,
+                                 project_root)
+    _unlink_quiet(session_dir / _CLOSE_SENTINEL_FILENAME)
     return "marked" if pushed else "marked-push-failed"
 
 
@@ -876,7 +1349,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("write", "read", "set-state", "is-reducer",
-                 "close-body-on-genuine", "push-staged",
+                 "close-body-on-genuine", "close-body-late", "push-staged",
                  "park", "resume", "park-expired", "park-due"):
         sp = sub.add_parser(name)
         sp.add_argument("--sid", required=True)
@@ -912,6 +1385,12 @@ def main(argv=None):
             print("true" if is_reducer(args.sid, args.agent) else "false")
         elif args.cmd == "close-body-on-genuine":
             print(close_body_on_genuine(args.sid, args.agent))
+        elif args.cmd == "close-body-late":
+            # Exposed for the BASH reap ( item c). The function had
+            # one in-process caller (abandoned_sessions.py) and no verb, so
+            # cleanup-stale-bindings.sh — which is bash — could not reach it and
+            # every reap left a permanent carrier reading active.
+            print(close_body_late(args.sid, args.agent))
         elif args.cmd == "park":
             print(park_body(args.sid, args.agent))
         elif args.cmd == "resume":
@@ -946,7 +1425,19 @@ def main(argv=None):
             # distinct from the validation (2) and io (3) codes so a caller can
             # tell "nothing to do" from "transport is down".
             _, _, state_dir = _agent_paths(args.agent, args.sid)
-            ok = push_staged_files(state_dir / _STAGED_DIRNAME, args.sid)
+            # : same world-rooted destination as _stage_and_push.
+            # This is cleanup-stale-bindings.sh's crash-preserve entry, which
+            # runs on whatever box owned the dead Body — usually a worker, so
+            # a push from the legacy agent-tree path is refused NoClaimError.
+            # The bash stages in the legacy dir and cannot resolve WORLD_DIR
+            # (IRREDUCIBLY LOCAL), so bridge it here before pushing — see
+            # relocate_legacy_staging for why this is a copy and why it is not
+            # done in the bash.
+            relocated = relocate_legacy_staging(state_dir, args.sid)
+            ok = push_staged_files(world_staged_dir(state_dir.parent), args.sid)
+            if relocated:
+                print(f"relocated {len(relocated)} legacy-staged file(s) to the "
+                      f"world-rooted staging dir", file=sys.stderr)
             print("pushed" if ok else "push-failed")
             return 0 if ok else 4
     except (ValueError, FileNotFoundError) as e:

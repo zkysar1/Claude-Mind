@@ -198,3 +198,100 @@ def test_pass_path_runs_pytest_for_real_and_returns_zero():
     # a PASS must never be reachable on an empty selection — the tri-state's
     # whole point; assert the selection was non-empty in the same breath
     assert "0 test file(s) selected" not in r.stdout
+
+
+# ──  F3: the filter's removals are REPORTED, not silent ──────────────
+# The filter itself is unchanged and must stay unchanged — a test file is a
+# SELECTOR in this tier, never a subject, so excluding it is correct. What was
+# wrong is that a caller saw only `changed_count: 0` and an INCONCLUSIVE reading
+# "no changed source file found", which asserts the caller changed nothing when
+# the truth is the runner discarded everything it was handed. Same silent-signal
+# class the parent goal audits (guard-1760: a runner reports what it RAN, never
+# what it declined to look at).
+
+def test_a_supplied_test_file_is_reported_as_dropped_not_as_nothing_changed():
+    import json
+    r = _run_cli("--changed", "core/scripts/tests/test_release.py",
+                 "--list-only", "--json")
+    assert r.returncode == 2, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["changed_count"] == 0
+    assert payload["dropped_count"] == 1
+    assert payload["dropped_inputs"] == ["core/scripts/tests/test_release.py"]
+    # The reason must say what happened, not merely that nothing was found.
+    assert "DROPPED" in payload["reason"]
+    assert "core/scripts/tests/test_release.py" in payload["reason"]
+    assert "/tests/" in payload["reason"], (
+        "the reason must NAME the filter that removed the path, or the caller "
+        "cannot tell a dropped input from an absent one")
+
+
+def test_a_real_source_file_is_not_dropped_positive_control():
+    """The drop pin must be able to fail in BOTH directions.
+
+    A generated name is used for the same reason the empty-selection test uses
+    one: the selection map is TEXTUAL, so a literal source path written here
+    would self-match this very file. The generated path is a legitimate source
+    path (prefix + suffix, no '/tests/' segment), so it must survive the filter
+    and select nothing — dropped_count 0 beside changed_count 1.
+    """
+    import json
+    import uuid
+    probe = f"core/scripts/zz-{uuid.uuid4().hex}.py"
+    r = _run_cli("--changed", probe, "--list-only", "--json")
+    assert r.returncode == 2, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["dropped_count"] == 0, (
+        "a valid source path must never be reported as dropped")
+    assert payload["changed_count"] == 1
+    assert payload["dropped_inputs"] == []
+
+
+def test_kept_and_dropped_reconcile_against_the_supplied_list():
+    """changed_count + dropped_count == what the caller passed.
+
+    Without this the two counts can drift apart silently and a caller auditing
+    its own inputs would have no way to notice a third, unreported outcome.
+    """
+    import json
+    import uuid
+    kept = f"core/scripts/zz-{uuid.uuid4().hex}.py"
+    supplied = [kept, "core/scripts/tests/test_release.py", "CLAUDE.md"]
+    r = _run_cli("--changed", *supplied, "--list-only", "--json")
+    payload = json.loads(r.stdout)
+    assert payload["changed_count"] + payload["dropped_count"] == len(supplied)
+    assert payload["dropped_count"] == 2
+    assert "CLAUDE.md" in payload["dropped_inputs"]
+
+
+def test_human_readable_output_separates_dropped_from_unmapped():
+    """DROPPED and UNMAPPED are different findings and must not share a line.
+
+    UNMAPPED means 'this file survived the filter and no test references it' —
+    a coverage finding. DROPPED means 'this file never reached selection at
+    all'. Collapsing them would re-hide exactly what this change exposes.
+    """
+    import uuid
+    kept = f"core/scripts/zz-{uuid.uuid4().hex}.py"
+    r = _run_cli("--changed", kept, "core/scripts/tests/test_release.py",
+                 "--list-only")
+    out = r.stdout
+    assert "DROPPED before selection" in out
+    assert "core/scripts/tests/test_release.py" in out.split("DROPPED before selection")[1]
+
+
+def test_unmapped_can_never_contain_a_dropped_path(mod):
+    """The comment above SOURCE_PREFIXES claimed the opposite until 2026-09-13.
+
+    select() is only ever handed the SURVIVORS, so a path outside the source
+    prefixes cannot appear in `unmapped`. Pinned at the unit level because the
+    claim was a comment, and a comment that contradicts its code is the exact
+    silent signal this goal audits.
+    """
+    idx = {Path("core/scripts/tests/test_zzz.py"): "nothing references anything"}
+    per_file, unmapped = mod.select(["CLAUDE.md"], idx)
+    # select() does not filter — main() does — so this proves the ORDER matters:
+    # handed a non-source path directly, select() reports it unmapped, which is
+    # precisely why main() must record its own drops separately.
+    assert unmapped == ["CLAUDE.md"]
+    assert per_file["CLAUDE.md"] == set()

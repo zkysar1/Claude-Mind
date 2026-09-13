@@ -312,10 +312,9 @@ def emit_directive(sleep_seconds, marker, streak):
         "one -- so the all-blocked handler must NOT be reloaded (that is the dry\n"
         f"spin this guard exists to stop). Dry-idle streak is now {streak}.\n"
         "DO NOT load the all-blocked handler. DO NOT run selection or execution.\n"
-        "Emit exactly ONE tool call:\n"
-        f"  Bash(\"MIND_AGENT={agent} DRY_SLEEP=1 bash core/scripts/interruptible-sleep.sh {sleep_seconds}\", run_in_background=true)\n"
-        "When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.\n"
-        + _harness_caps.no_notify_hint(sleep_seconds) +
+        # Harness-keyed yield block, one owner ( leg c) — see
+        # _harness_caps.sleep_directive for why the hardcoded pair was a defect.
+        + _harness_caps.sleep_directive(sleep_seconds, agent, "DRY_SLEEP=1") +
         "The sleep is registered as a Tier-A background job by interruptible-sleep.sh,\n"
         "so stop-hook Gate 2.6 ALLOWs this turn-end (guard-967 / guard-1230).\n"
         "======================"

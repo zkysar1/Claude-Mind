@@ -301,7 +301,26 @@ def _build_backend(bucket: str, region: str):
         cache_root=os.environ.get("TMPDIR", "/tmp"),
         region=region,
         machine_id=os.environ.get("MACHINE_ID", "conformance"),
+        # The SCOPED pair, exactly as from_env selects it. Without these two
+        # the client factory falls to the SDK's default credential chain, which
+        # on a fleet box resolves the ROOT key from the exported env — a
+        # different principal from the one the daemon runs as, and one the
+        # basement store does not know at all (InvalidAccessKeyId measured
+        # 2026-09-11 while the daemon-path probe succeeded). Refuse rather than
+        # fall back (guard-1208: say which credential tier answered).
+        aws_access_key_id=_scoped_pair()[0],
+        aws_secret_access_key=_scoped_pair()[1],
     )
+
+
+def _scoped_pair() -> "tuple[str, str]":
+    akid = os.environ.get("MIND_AWS_ACCESS_KEY_ID", "").strip()
+    asec = os.environ.get("MIND_AWS_SECRET_ACCESS_KEY", "").strip()
+    if not (akid and asec):
+        raise SystemExit("conformance: MIND_AWS_ACCESS_KEY_ID / MIND_AWS_SECRET_ACCESS_KEY are "
+                         "not set -- refusing to fall back to the default credential "
+                         "chain (that is a different principal from production's)")
+    return akid, asec
 
 
 def main() -> int:

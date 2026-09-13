@@ -35,8 +35,9 @@ a signal to stop.
    Parameters: `core/config/aspirations.yaml` → `productivity_gate`
    (`min_iterations`, `stop_threshold`). This was the ONLY authorized caller of
    `session-signal-set.sh stop-requested` outside `/stop` until 2026-08-05;
-   `reducer-self-fence.sh` is the second and `loop-exhaustion-fence.sh` the
-   third (both below). Whoever adds a fourth must correct this sentence in the
+   `reducer-self-fence.sh` is the second, `loop-exhaustion-fence.sh` the third,
+   and the vessel sidecar (`zakcode`, out-of-repo) the fourth — all below.
+   Whoever adds a fifth must correct this sentence in the
    same change — an authoritative-sounding count that has silently gone stale
    is worse than no count at all. Count `stop-requested` WRITERS here: the
    recovery-gate / recovery-yank pair below move `agent-state` instead and are
@@ -98,6 +99,21 @@ a signal to stop.
    NOTHING and only directs the turn to end on a REGISTERED external-wait
    sleep; `stop` at 10 writes the signal. Every unreadable input HOLDS —
    stopping a healthy loop is worse than the disease (guard-1562).
+
+   <!-- exception added 2026-09-12 for the vessel sidecar (g-373-16) -->
+   **Exception**: the **vessel sidecar** (`zakcode`, Zak-Code repo — the first
+   authorized caller that is NOT a framework script) is authorized to write
+   `stop-target-mode` then set `stop-requested` when a SERVED run ends: the
+   human's `/run/stop`, or the run's own duration cap. Vinheim decides WHEN a run
+   ends; the MIND decides what its ending IS — and before this it could not. The
+   conductor severed the in-flight turn and spent the reserve on an injected recap
+   prompt, so consolidation and handoff never ran at all (guard-1807, user's
+   ruling: never WHAT the agent does; no injected prompts). Same two-write shape,
+   same order, same revert-on-failure as its three siblings above
+   (`zakcode.session.framework_stop`), and ADDRESSED rather than discretionary: no
+   `run_stop_agent` configured = no signal, so a non-seed workspace is untouched.
+   The LLM MUST NOT invoke it. Rationale + grace sizing:
+   `core/config/rationale/vessel-sidecar-stop-caller.md`.
 
    <!-- exception added 2026-04-19 for recovery-gate (cross-agent visibility plan) -->
    **Exception**: `core/scripts/recovery-gate.sh` (invoked only by the

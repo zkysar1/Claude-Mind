@@ -41,18 +41,57 @@ def _team_state(**agents):
 # ---- check 1: abandoned claim is reported, with the population ----------------
 
 def test_abandoned_claim_is_reported_with_population():
+    # `g-1` is PENDING + claimed + past threshold + accounted for by no
+    # in-flight row — an abandoned claim, and the shape the fleet actually
+    # produces (aspirations-claim.sh leaves status at pending). This fixture
+    # asserted it was NOT reported until 2026-09-12, which pinned the blind
+    # predicate as correct behaviour: measured that day, `in-progress` was zero
+    # across all 3058 live records, so the lane scanned an empty set on every
+    # run of its life. See SCANNED_STATUSES in _abandoned_claim.py.
     report = find_abandoned(
-        [_goal("g-369-08"), _goal("g-1", status="pending"), {"id": "g-2"}],
+        [
+            _goal("g-369-08"),
+            _goal("g-1", status="pending"),
+            _goal("g-blocked", status="blocked"),
+            {"id": "g-2"},
+        ],
         _team_state(alpha={"in_flight": None, "in_flight_bodies": {}}),
         NOW,
     )
-    assert report["abandoned_count"] == 1
-    assert report["abandoned"][0]["goal_id"] == "g-369-08"
-    assert report["abandoned"][0]["releasable"] is True
+    assert report["abandoned_count"] == 2
+    assert [r["goal_id"] for r in report["abandoned"]] == ["g-369-08", "g-1"]
+    assert all(r["releasable"] is True for r in report["abandoned"])
     # The population must travel with the count — a bare "1" cannot be told
     # apart from a scan that read almost nothing (guard-3830).
-    assert report["scanned_goals"] == 3
-    assert report["claimed_in_progress"] == 1
+    assert report["scanned_goals"] == 4
+    assert report["claimed_open"] == 2
+
+
+# ---- check 1b: a BLOCKED claim is never reported (the widening's safe edge) ----
+
+def test_blocked_claim_is_excluded():
+    """The load-bearing half of the 2026-09-12 widening (guard-2499).
+
+    Widening to "any non-terminal" was measured before shipping and is
+    DANGEROUS: all four blocked+claimed rows live that day were held by ALIVE
+    partners (foxtrot x3, bravo — every agent's last_active inside six minutes)
+    and all four cleared the 180m threshold, so the naive predicate reported
+    them RELEASABLE. A blocked goal's claim is the holder's deliberate state
+    while its blocker is worked; no Body is executing it, so no in-flight row
+    exists, and that is normal rather than abandonment.
+    """
+    report = find_abandoned(
+        [_goal("g-blocked", status="blocked", age_minutes=9999)],
+        _team_state(alpha={"in_flight": None, "in_flight_bodies": {}}),
+        NOW,
+    )
+    assert report["abandoned_count"] == 0
+    assert report["releasable_count"] == 0
+    # Scanned but deliberately not counted — the exclusion is in the predicate,
+    # not in an empty input (guard-1715: an all-clear over an empty population
+    # is indistinguishable from one that examined everything).
+    assert report["scanned_goals"] == 1
+    assert report["claimed_open"] == 0
 
 
 # ---- check 2: a live body row means NOT abandoned -----------------------------
@@ -148,7 +187,7 @@ def test_unclaimed_and_terminal_goals_are_ignored():
         NOW,
     )
     assert report["abandoned_count"] == 0
-    assert report["claimed_in_progress"] == 0
+    assert report["claimed_open"] == 0
 
 
 if __name__ == "__main__":  # pragma: no cover

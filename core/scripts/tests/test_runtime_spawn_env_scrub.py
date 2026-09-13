@@ -137,6 +137,7 @@ def test_storage_config_scrubbed():
     captured = _run_spawn(
         'export STORAGE_BACKEND="local"\n'
         'export STORAGE_S3_BUCKET="pytest-fake-bucket"\n'
+        'export STORAGE_S3_ENDPOINT_URL="http://pytest-fake-store:9000"\n'
         'export STORAGE_DDB_SESSIONS_TABLE="fake-sessions"\n'
         'export STORAGE_DDB_LOCK_TABLE="fake-locks"\n'
         'export ENVIRONMENT_ID="test-env"\n'
@@ -150,7 +151,8 @@ def test_storage_config_scrubbed():
     )
     keys = _env_keys(captured)
     scrub_set = {
-        "STORAGE_BACKEND", "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE",
+        "STORAGE_BACKEND", "STORAGE_S3_BUCKET", "STORAGE_S3_ENDPOINT_URL",
+        "STORAGE_DDB_SESSIONS_TABLE",
         "STORAGE_DDB_LOCK_TABLE", "ENVIRONMENT_ID", "MACHINE_ID",
         "MACHINE_MULTI", "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
         "MIND_API_TOKEN", "MIND_API_BIND", "MIND_API_PORT",

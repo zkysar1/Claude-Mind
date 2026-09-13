@@ -30,9 +30,33 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+import pytest
 from pathlib import Path
 
 import yaml
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world for every test in this file.
+
+    Load-bearing, not tidiness (g-115-9750, same reasoning as the g-306-420
+    carrier fixture). `_consume_staged` now resolves the world-rooted staging
+    dir through `_paths.WORLD_DIR`, so without this fixture a test would scan —
+    and a producer test would WRITE into — the LIVE `world/`, which on an
+    own-cloud box is the guard-955 production-key collision class. MEASURED,
+    not hypothetical: the first run of this change (before this fixture
+    existed) left three synthetic files in the live
+    `world/body-staged-wm/test_stage_and_push_writes_tri0/`.
+
+    Patching the module ATTRIBUTE works because `world_staged_dir` does its
+    `from _paths import WORLD_DIR` inside the function body.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
+
 
 TESTS_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = TESTS_DIR.parent  # core/scripts/
@@ -63,7 +87,16 @@ class FakeStore:
     """
 
     def __init__(self, files: dict[str, bytes] | None = None,
-                 fail_reads: bool = False):
+                 fail_reads: bool = False,
+                 dir_name: str | None = "pending-body-merges"):
+        # : `dir_name` is the basename of the ONE directory this stub
+        # answers `list_dir` for. It DEFAULTS to the legacy staging dir because
+        # every test in this file predates the world-rooted destination and
+        # stages there; a world-rooted test passes the agent name (the basename
+        # of world/body-staged-wm/<agent>). Pass None to restore the old
+        # path-blind behaviour — but note that makes every unit look present in
+        # BOTH dirs, which is the shadowed-duplicate branch, not a no-op.
+        self.dir_name = dir_name
         self.files = dict(files or {})
         self.deleted: list[str] = []
         self.fail_reads = fail_reads
@@ -81,6 +114,16 @@ class FakeStore:
     def list_dir(self, path):
         p = Path(path)
         assert p.is_absolute(), f"list_dir called with relative path {p}"
+        # : DIRECTORY-AWARE. The real backend lists ONE prefix; this
+        # stub used to answer every path with the same flat basename set, which
+        # was harmless while exactly one staging dir existed. _consume_staged
+        # now scans TWO (world-rooted + legacy), and a path-blind stub makes
+        # every unit look like it is present in BOTH — which is the genuine
+        # "shadowed duplicate" branch, so the double-consume it reported was an
+        # artifact of the double, not a defect in the code under test. Answer
+        # only for the dir these files were staged into.
+        if self.dir_name is not None and p.name != self.dir_name:
+            return []
         return sorted(self.files)
 
     def read_authoritative_bytes(self, path) -> bytes:

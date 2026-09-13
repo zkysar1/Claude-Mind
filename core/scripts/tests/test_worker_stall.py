@@ -1245,3 +1245,141 @@ def test_known_ids_report_the_WEAKEST_provenance(tmp_path):
 def test_known_ids_with_no_stores_is_an_unanswered_census():
     """Empty args is not an empty world."""
     assert ws.read_known_goal_ids() == (set(), "none")
+
+
+# --- reading_is_valid: the measurement gate ( unit 35) -------------
+#
+#  outcome 4 states a four-part validity gate in prose. Two
+# independent hand-parses of the same report have produced a WRONG verdict from
+# it -- unit 34 guessed the row key names, unit 35 looked for all four terms
+# under `enumeration` when two of them sit at the top level. Both failures were
+# in the permissive direction or read a healthy fleet as broken; neither was
+# caught by the report itself, because a valid-reading gate validates the READ
+# and cannot validate the parser above it.
+
+def _gate_report(complete=True, read_via="authoritative", degraded=False, dropped=0):
+    """A scan()-shaped report carrying ONLY the gate's four terms, at the two
+    levels scan() really puts them at."""
+    return {
+        "enumeration": {"complete": complete, "read_via": read_via},
+        "degraded_read": degraded,
+        "rows_dropped": dropped,
+    }
+
+
+def test_reading_is_valid_accepts_an_authoritative_complete_scan():
+    v = ws.reading_is_valid(_gate_report())
+    assert v["valid"] is True
+    assert v["reasons"] == []
+    assert v["absent"] == []
+
+
+@pytest.mark.parametrize("kwargs,term", [
+    ({"complete": False}, "enumeration.complete"),
+    ({"read_via": "local-mirror"}, "enumeration.read_via"),
+    ({"degraded": True}, "degraded_read"),
+    ({"dropped": 3}, "rows_dropped"),
+])
+def test_reading_is_valid_rejects_each_term_independently(kwargs, term):
+    v = ws.reading_is_valid(_gate_report(**kwargs))
+    assert v["valid"] is False
+    assert any(term in r for r in v["reasons"]), (term, v["reasons"])
+
+
+def test_the_two_top_level_terms_are_not_read_from_enumeration():
+    """THE REGRESSION TEST FOR THE MEASURED DEFECT.
+
+    A caller that assumes all four terms are nested puts `degraded_read` and
+    `rows_dropped` under `enumeration`. Read at the wrong level they are
+    ABSENT, and this gate must call that INVALID -- never sail through on a
+    permissive default, which is what `report.get("rows_dropped") or 0` does.
+    """
+    wrong_level = {
+        "enumeration": {"complete": True, "read_via": "authoritative",
+                        "degraded_read": False, "rows_dropped": 0},
+    }
+    v = ws.reading_is_valid(wrong_level)
+    assert v["valid"] is False
+    assert set(v["absent"]) == {"degraded_read", "rows_dropped"}
+    assert all("ABSENT" in r for r in v["reasons"] if "is ABSENT" in r)
+
+
+def test_absent_terms_are_invalid_not_permissive():
+    v = ws.reading_is_valid({})
+    assert v["valid"] is False
+    # all four terms missing, each named
+    assert len(v["absent"]) == 4
+    assert "enumeration.complete" in v["absent"]
+    assert "rows_dropped" in v["absent"]
+
+
+def test_an_absent_term_says_ABSENT_and_never_leaks_the_sentinel_repr():
+    """What the absent-term pass UNIQUELY buys, isolated so it is testable.
+
+    The per-term comparisons already reject a missing key (a sentinel is not
+    True and is not "authoritative"), so `valid` cannot distinguish the absent
+    pass being present from it being gone -- mutation-proofing measured exactly
+    that and called the first version of this test vacuous. What the pass does
+    buy is the READER's half of guard-2223: without it a missing key renders as
+    `<object object at 0x...>, not True`, which reads as a corrupt value rather
+    than an absent field and sends the next debugger to the wrong place.
+    """
+    v = ws.reading_is_valid({})
+    assert any("is ABSENT from the report" in r for r in v["reasons"]), v["reasons"]
+    assert not any("object object" in r for r in v["reasons"]), \
+        "a missing term must be reported as ABSENT, not as its sentinel repr"
+    for term in ("enumeration.complete", "enumeration.read_via",
+                 "degraded_read", "rows_dropped"):
+        assert any(term in r and "ABSENT" in r for r in v["reasons"]), term
+
+
+def test_a_false_verdict_always_carries_a_reason(monkeypatch):
+    """guard-2223: a gate consumed by a decision must say WHY, not just no."""
+    for kwargs in ({"complete": False}, {"read_via": "none"},
+                   {"degraded": True}, {"dropped": 1}):
+        v = ws.reading_is_valid(_gate_report(**kwargs))
+        assert v["valid"] is False
+        assert v["reasons"], kwargs
+
+
+def test_measurement_gate_is_stricter_than_the_watchdog_blind_predicate():
+    """PINS A DELIBERATE DIVERGENCE (guard-2485/guard-1506).
+
+    agent-watchdog's `blind` asks "can this probe bound the fleet enough to
+    ALERT?" and omits read_via/degraded_read. This gate asks "may this count be
+    COMPARED TO A BASELINE?" and requires an authoritative read. A local-mirror
+    read that is otherwise clean is NOT blind to the watchdog but IS invalid
+    here. If a later change fuses the two, this test fails -- which is the
+    point: fusing them would add a read_via requirement to live alerting.
+    """
+    report = _gate_report(read_via="local-mirror")
+    report["enumeration_lost_everything"] = False
+    report["all_carriers_unreadable"] = False
+
+    # the watchdog's predicate, transcribed from agent-watchdog.py
+    enum = report["enumeration"]
+    watchdog_blind = (
+        not enum.get("complete", False)
+        or report.get("enumeration_lost_everything")
+        or (report.get("rows_dropped") or 0) > 0
+        or report.get("all_carriers_unreadable")
+    )
+    assert watchdog_blind is False, "watchdog would NOT call this blind"
+    assert ws.reading_is_valid(report)["valid"] is False, \
+        "the measurement gate MUST reject a non-authoritative read"
+
+
+def test_reading_is_valid_accepts_a_real_scan_report_shape():
+    """Shape-contract test against scan()'s own output, not a hand fixture --
+    so a future rename of a gate term inside scan() fails HERE rather than
+    silently making every measurement invalid (probe-with-canonical-code-path).
+    """
+    import inspect
+    rows, meta = _enum([])
+    # scan() needs real paths, so assert the CONTRACT rather than calling it:
+    # every term this gate reads must be a key scan() actually emits.
+    src = inspect.getsource(ws.scan)
+    for term in ws._GATE_TOPLEVEL:
+        assert '"%s"' % term in src, "scan() no longer emits top-level %r" % term
+    for term in ws._GATE_NESTED:
+        assert term in str(meta), "enumerate_carriers meta lacks %r" % term

@@ -189,15 +189,19 @@ else
   fi
 fi
 
-# --- Test 10: Commit retry on transient failure () ---
-# Verifies the retry loop succeeds when a pre-commit hook fails first then
-# passes. Uses a hook that increments a counter; fails on attempt 1, passes
-# on attempt 2. The script's retry-3x loop must observe success on attempt 2
-# and emit an INFO message naming the retry attempt number.
-echo "Test 10: commit retry on transient failure"
+# --- Test 10: A deterministic hook refusal is NOT retried () -------
+# CONTRACT AMENDMENT (, ratifying ). This test previously
+# pinned "a repeatedly-failing pre-commit HOOK is retried 3 times" ().
+# That contract keyed on REPETITION; it now keys on TRANSIENCE. A commit-msg /
+# pre-commit refusal is a pure function of the staged tree plus the message, so
+# a retry cannot change the verdict -- it only triples the gate's telemetry and
+# buries the remediation text under three WARN repetitions. 's retry
+# half is NOT deleted: it moved to Test 11 (transient exhaustion) and is also
+# pinned by test_iteration_commit_gate_refusal.py.
+echo "Test 10: deterministic hook refusal → one attempt, no retry"
 repo=$(fresh_repo)
 echo "test-change" > "$repo/feature.txt"
-# Install a pre-commit hook that fails the first invocation, passes second.
+# A hook that always refuses, with a message carrying NO transient signature.
 mkdir -p "$repo/.git/hooks"
 cat > "$repo/.git/hooks/pre-commit" <<'HOOK'
 #!/usr/bin/env bash
@@ -205,66 +209,84 @@ counter_file=".git/hook-counter"
 count=$(cat "$counter_file" 2>/dev/null || echo 0)
 count=$((count + 1))
 echo "$count" > "$counter_file"
-if [[ "$count" -lt 2 ]]; then
-  echo "pre-commit: transient failure attempt $count" >&2
-  exit 1
-fi
-exit 0
+echo "pre-commit: policy refusal (deterministic)" >&2
+exit 1
 HOOK
 chmod +x "$repo/.git/hooks/pre-commit"
-out=$(bash "$ITERATION_COMMIT" --goal-id g-280-04 --title "Apply: retry test" --outcome deep --repo "$repo" 2>&1)
+# guard-568: under `set -e` a bare `out=$(cmd)` ABORTS THE WHOLE FILE when the
+# subject exits non-zero -- no FAIL line, no summary, and every later test
+# silently never runs. That is how this file's true red surface stayed unknown
+# (). `|| rc=$?` is the idiom the subject itself uses.
+rc=0
+out=$(bash "$ITERATION_COMMIT" --goal-id g-280-04 --title "Apply: refusal test" --outcome deep --repo "$repo" 2>&1) || rc=$?
 final_count=$(cat "$repo/.git/hook-counter" 2>/dev/null || echo 0)
-if echo "$out" | grep -q "commit succeeded on retry 2/3"; then
-  pass "retry succeeded on attempt 2"
+if [[ "$rc" -eq 2 ]]; then
+  pass "deterministic refusal → exit 2"
 else
-  fail "no 'commit succeeded on retry 2/3' marker in output: $out"
+  fail "wrong exit code: $rc (expected 2). Output: $out"
 fi
-if echo "$out" | grep -q '"commit_sha"'; then
-  pass "JSON output emitted after retry success"
+if echo "$out" | grep -q "NOT retried (g-115-9807)"; then
+  pass "refusal message states it was not retried"
 else
-  fail "no commit_sha in retry output: $out"
+  fail "no 'NOT retried (g-115-9807)' marker in output: $out"
 fi
-if [[ "$final_count" -eq 2 ]]; then
-  pass "pre-commit hook invoked exactly 2 times (1 fail + 1 success)"
+if [[ "$final_count" -eq 1 ]]; then
+  pass "pre-commit hook invoked exactly 1 time (no retry burned)"
 else
-  fail "wrong invocation count: $final_count (expected 2)"
+  fail "wrong invocation count: $final_count (expected 1)"
+fi
+if [[ "$(git -C "$repo" rev-list HEAD --count)" -eq 1 ]]; then
+  pass "no commit produced on a deterministic refusal (initial seed only)"
+else
+  fail "unexpected commit count after refusal"
 fi
 rm -rf "$repo"
 
-# --- Test 11: Commit retry exhaustion exits non-zero () ---
-# Verifies that when all 3 retries fail, the script exits 2 with the last
-# error message in stderr (matching the original error path's contract).
-echo "Test 11: retry exhaustion → exit 2"
+# --- Test 11: Transient-failure retry exhausts, then exits 2 () ------
+# This is where 's retry contract now lives. The loop still makes
+# MAX_RETRIES attempts and still exits 2 on exhaustion -- but only for a failure
+# _commit_failure_is_transient() recognises. The hook is simply a convenient way
+# to inject a chosen failure SIGNATURE into the commit output; the classifier
+# reads that output, not whatever produced it.
+echo "Test 11: transient retry exhaustion → exit 2"
 repo=$(fresh_repo)
 echo "test-change" > "$repo/feature.txt"
 mkdir -p "$repo/.git/hooks"
 cat > "$repo/.git/hooks/pre-commit" <<'HOOK'
 #!/usr/bin/env bash
-echo "pre-commit: always fails" >&2
+counter_file=".git/hook-counter"
+count=$(cat "$counter_file" 2>/dev/null || echo 0)
+count=$((count + 1))
+echo "$count" > "$counter_file"
+echo "fatal: Unable to create '.git/index.lock': File exists." >&2
+echo "Another git process seems to be running in this repository." >&2
 exit 1
 HOOK
 chmod +x "$repo/.git/hooks/pre-commit"
-# Capture both rc and output
-set +e
-out=$(bash "$ITERATION_COMMIT" --goal-id g-280-04 --title "Apply: retry exhaustion" --outcome deep --repo "$repo" 2>&1)
-rc=$?
-set -e
+rc=0
+out=$(bash "$ITERATION_COMMIT" --goal-id g-280-04 --title "Apply: retry exhaustion" --outcome deep --repo "$repo" 2>&1) || rc=$?
+final_count=$(cat "$repo/.git/hook-counter" 2>/dev/null || echo 0)
 if [[ "$rc" -eq 2 ]]; then
-  pass "exhausted retries → exit 2"
+  pass "exhausted transient retries → exit 2"
 else
   fail "wrong exit code: $rc (expected 2). Output: $out"
 fi
-if echo "$out" | grep -q "git commit failed after 3 attempts"; then
+if echo "$out" | grep -q "git commit failed after 3/3 transient attempts"; then
   pass "exhaustion error message includes attempt count"
 else
-  fail "missing 'after 3 attempts' message: $out"
+  fail "missing 'after 3/3 transient attempts' message: $out"
+fi
+if [[ "$final_count" -eq 3 ]]; then
+  pass "commit attempted exactly 3 times before exhaustion"
+else
+  fail "wrong attempt count: $final_count (expected 3)"
 fi
 # Verify NO commit landed
-final_count=$(git -C "$repo" rev-list HEAD --count)
-if [[ "$final_count" -eq 1 ]]; then
+final_commits=$(git -C "$repo" rev-list HEAD --count)
+if [[ "$final_commits" -eq 1 ]]; then
   pass "no extra commit produced on exhaustion (initial seed only)"
 else
-  fail "unexpected commit count: $final_count"
+  fail "unexpected commit count: $final_commits"
 fi
 rm -rf "$repo"
 
@@ -353,8 +375,11 @@ MIND_AGENT=bravo ITERATION_COMMIT_LOCK_WAIT_S=10 bash "$ITERATION_COMMIT" \
   --goal-id g-bravo-12 --title "Apply: bravo concurrent" --outcome deep --repo "$repo" \
   > "$TMPLOG/bravo.out" 2>&1 &
 B_PID=$!
-wait $A_PID; A_RC=$?
-wait $B_PID; B_RC=$?
+# guard-568 again, in the `wait` form: under `set -e` a non-zero `wait` is a
+# failing simple command and aborts the file BEFORE `A_RC=$?` runs, so the
+# diagnostic below never prints. Same dead-handler shape as Test 10 ().
+A_RC=0; wait $A_PID || A_RC=$?
+B_RC=0; wait $B_PID || B_RC=$?
 if [[ "$A_RC" -eq 0 && "$B_RC" -eq 0 ]]; then
   pass "both concurrent invocations returned rc=0 (no deadlock, no acquire timeout)"
 else

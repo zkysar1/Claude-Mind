@@ -226,6 +226,111 @@ ARRAY_SLOTS = {
 # capture". .
 CAPTURE_SLOTS = ("spark_capture", "exp_capture", "hyp_capture", "encoding_capture")
 
+
+# ── ARCHIVE BEFORE DELETE, AND SAY WHAT WAS DROPPED () ────────────
+#
+# One incident, two defects, on a routine MAINTAIN call: enforcing
+# array_limits.spark_capture destroyed 2,198 worker observations (4,453,737 ->
+# 121,862 bytes) with NO archive — and the destruction log recorded every one
+# of them as the literal string '?'. The loss was therefore both unrecoverable
+# AND unauditable, and it landed on a backlog a goal was deliberately holding
+# open, which a maintenance script cannot see.
+#
+# '?' WAS NOT A PLACEHOLDER. It was the last term of a `claim -> reason -> '?'`
+# fallback naming fields the CAPTURE lanes do not carry. The item_stale path a
+# few lines below already had the longer chain including `observation`; the
+# array_limit path simply never grew one. Hence ONE shared summariser rather
+# than a fourth hand-rolled chain that can drift again.
+#
+# This is a "bulk store rewrite that DROPS records" — named in
+# .claude/rules/archive-before-delete.md's own Scope list — so the protocol
+# binds the SCRIPT, not only an agent doing it by hand.
+
+# Ordered by specificity: the first field an entry actually carries wins. Every
+# capture lane's own headline field is present, so a capture entry can never
+# fall through to the keys fallback.
+_EVICT_SUMMARY_FIELDS = (
+    "claim",              # micro_hypotheses
+    "reason",             # known_blockers, recent_violations
+    "observation",        # spark_capture, encoding_queue
+    "execution_summary",  # exp_capture
+    "evidence_summary",   # hyp_capture
+    "fact",               # encoding_capture
+    "content",
+    "note",
+)
+
+
+def evicted_summary(removed):
+    """One line naming WHAT was dropped. NEVER the bare '?' ().
+
+    The final fallback names the KEYS the entry carried instead of collapsing
+    it to a question mark. That matters more than it looks: a lane whose shape
+    _EVICT_SUMMARY_FIELDS does not yet cover stays auditable, and the omission
+    announces itself in the very record that reports the loss — which is
+    exactly what '?' denied the reader of the original incident.
+    """
+    if not isinstance(removed, dict):
+        return str(removed)[:120]
+    goal_id = removed.get("goal_id")
+    prefix = "[%s] " % goal_id if isinstance(goal_id, str) and goal_id else ""
+    for field in _EVICT_SUMMARY_FIELDS:
+        value = removed.get(field)
+        if isinstance(value, str) and value.strip():
+            return (prefix + " ".join(value.split()))[:120]
+    keys = ",".join(sorted(str(k) for k in removed if not str(k).startswith("_")))
+    return (prefix + "(no summary field; keys: %s)" % (keys or "none"))[:120]
+
+
+# Append-only sink, one JSON row per evicted capture entry. Sits beside the
+# agent's other durable archives rather than under temp/, which
+# temp-drain-purge deletes recursively after 120 minutes — staging is never
+# archiving.
+CAPTURE_EVICTION_ARCHIVE = "capture-evictions-archive.jsonl"
+
+
+def archive_evicted_capture(agent_dir, slot_name, removed, reason):
+    """Append ONE evicted capture entry to the durable sink. True iff it landed.
+
+    THE RETURN VALUE IS A CONTRACT, NOT A STATUS LINE: False means the caller
+    MUST KEEP the entry. Fail-open here would restore the exact defect this
+    function exists to remove — a silent destroy — so the failure direction is
+    deliberately "the cap stays exceeded" rather than "the data is gone". A
+    lane over its cap costs memory and is visible in the next prune report; a
+    destroyed capture is unrecoverable: the WM store is git-untracked and the
+    own-cloud recovery config is unreadable from the fleet identity, which
+    archive-before-delete step 2 says to treat as ABSENT.
+
+    Routed through locked_append_jsonl, the declared SSOT for the append path,
+    for a reason that is invisible locally: it appends through the active
+    STORAGE BACKEND. A bare open(...,"a") writes only the own-cloud
+    read-through CACHE, so the archive would look perfect on this box and
+    never leave it (guard-980) — an archive that is not outside the blast
+    radius is not an archive. It locks the archive's own .lock sibling, never
+    the WM lock the caller already holds, so there is no re-entrancy.
+
+    The sink is on _fileops._SNAPSHOT_BLACKLIST["agent"]: locked_append_jsonl
+    calls save_history() on EVERY append, and a full-file snapshot per append
+    of a growing archive is O(N^2) (guard-2415).
+    """
+    if not agent_dir:
+        return False
+    try:
+        from _fileops import locked_append_jsonl
+        locked_append_jsonl(Path(agent_dir) / CAPTURE_EVICTION_ARCHIVE, {
+            "archived_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "slot": slot_name,
+            "eviction_reason": reason,
+            "summary": evicted_summary(removed),
+            "entry": removed,
+        })
+        return True
+    except Exception:
+        # Deliberately broad: ANY failure to archive must read as "do not
+        # delete". Narrowing to the errors imagined today would let an
+        # unimagined one through as a successful destroy.
+        return False
+
 #  — APPEND-CREATABLE LANE REGISTRY.
 #
 # WHY IT EXISTS: resolve_slot() returns (slots_dict, name, False) for ANY
@@ -1108,6 +1213,15 @@ def cmd_append(args):
     # read it on every path — the same NameError trap the _evicted counter
     # documents in the daemon twin.
     _carrier_path = None
+    #  F6: three-valued, None meaning "no carrier write was attempted".
+    # See the daemon twin in wm_write.py::append_slot for why None must stay
+    # distinct from False. NOTE the shapes differ BY CONSTRUCTION and that is not
+    # a parity break: the daemon returns a JSON response a caller parses, while
+    # this path has no response object and prints diagnostics to stderr — and the
+    # eviction notice below is emitted INSIDE the lock, before the push has run,
+    # so the value cannot ride along in it. What guard-2323 requires here is the
+    # LOGIC (assign the return; never a bare statement), which is what this does.
+    _carrier_pushed = None
 
     with wm_lock():
         data = read_wm()
@@ -1276,9 +1390,22 @@ def cmd_append(args):
     if _carrier_path is not None:
         try:
             import body_capture_carrier as _bcc
-            _bcc.push(_carrier_path)
+            # ASSIGN, never a bare statement (guard-5324) — the twin of the
+            # daemon change. push() swallows its transport failure and returns a
+            # bool, so discarding it left a total delivery failure
+            # byte-indistinguishable from total success. True means the store
+            # write returned without raising: an ATTEMPT, not a verified
+            # delivery (only an authoritative read-back settles presence).
+            _carrier_pushed = bool(_bcc.push(_carrier_path))
         except Exception:  # noqa: BLE001
-            pass
+            _carrier_pushed = False
+    if _carrier_pushed is False:
+        # Say it POSITIVELY and once, rather than leaving the caller to infer
+        # health from the absence of the carrier's own once-per-process line.
+        print("[wm] carrier push did not deliver — this load-bearing capture "
+              "entry is in the local carrier only and will reach the reducer "
+              "at the close-time full merge, not through the priority lane.",
+              file=sys.stderr)
 
 def cmd_clear(args):
     """Clear (null out) a slot. RMW protected by wm_lock — see ."""
@@ -1463,7 +1590,7 @@ def _do_prune(args):
                 removed = slot_val.pop(i)
                 report["pruned_items"].append({
                     "slot": slot_name,
-                    "item_summary": str(removed.get("claim", removed.get("reason", removed.get("observation", "?"))))[:80],
+                    "item_summary": evicted_summary(removed),
                     "reason": "item_stale",
                 })
 
@@ -1488,11 +1615,28 @@ def _do_prune(args):
                 _n = 0
                 slot_val.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
                 while len(slot_val) > limit:
+                    # ARCHIVE BEFORE DELETE (). PEEK, archive, and only
+                    # then pop: a capture entry leaves the lane only once a
+                    # durable copy of it exists outside this file. A failed
+                    # archive BREAKS rather than dropping the entry — the cap
+                    # stays exceeded, which is recoverable and is reported right
+                    # here, instead of the data being destroyed, which is not.
+                    # break, NOT continue: the loop re-tests the same
+                    # over-limit condition, so continue would spin forever.
+                    if slot_name in CAPTURE_SLOTS and not args.dry_run:
+                        if not archive_evicted_capture(
+                                AGENT_DIR, slot_name, slot_val[0], "array_limit"):
+                            report.setdefault("archive_failures", []).append({
+                                "slot": slot_name,
+                                "kept_over_cap": len(slot_val) - limit,
+                                "reason": "archive_failed_entries_kept",
+                            })
+                            break
                     removed = slot_val.pop(0)
                     _n += 1
                     report["pruned_items"].append({
                         "slot": slot_name,
-                        "item_summary": str(removed.get("claim", removed.get("reason", "?")))[:80] if isinstance(removed, dict) else "?",
+                        "item_summary": evicted_summary(removed),
                         "reason": "array_limit",
                     })
                 if not args.dry_run:
@@ -1516,7 +1660,7 @@ def _do_prune(args):
             removed = eq.pop(0)
             report["pruned_items"].append({
                 "slot": "encoding_queue",
-                "item_summary": str(removed.get("observation", "?"))[:80] if isinstance(removed, dict) else "?",
+                "item_summary": evicted_summary(removed),
                 "reason": "array_limit",
             })
 

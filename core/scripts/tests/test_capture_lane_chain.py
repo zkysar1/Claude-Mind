@@ -37,6 +37,7 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 CORE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -57,6 +58,43 @@ def _load(modname: str, filename: str):
 
 merge = _load("body_merge", "body-merge.py")
 retro = _load("worker_retrospective_mod", "worker_retrospective.py")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world for every test in this file.
+
+    LOAD-BEARING, NOT TIDINESS — and this file is where it was MEASURED
+    (g-115-9750, 2026-09-12, alpha/cc-07). `generalize_down` resolves the
+    world-rooted staging dir through `_paths.WORLD_DIR`, so without this fixture
+    it scans the LIVE world, merges every OTHER Body's real staged WM into this
+    test's tmp reducer, and then CONSUMES them.
+
+    Both halves were measured, not reasoned about:
+
+      * POLLUTION — `test_every_capture_lane_survives_merge_into_an_empty_reducer_lane`
+        asserts a reducer lane holds EXACTLY the one entry this test staged. With
+        10 real staged WMs sitting in the live world it failed in-suite and
+        passed SOLO, and the solo pass is the trap: it passed only because the
+        in-suite run had already drained the pollution source. A green solo
+        re-run cannot clear this class.
+
+      * DESTRUCTION — those 10 triples were unlinked from the local tree.
+        Nothing was lost ONLY because the runner pins `STORAGE_BACKEND=local`
+        and LocalBackend has no `delete_object`, so the authoritative copies
+        survived. That is guard-955 containment doing exactly its job, not luck
+        to rely on again: under own-cloud the same code path deletes the store
+        object too, and for some Bodies the staged triple is the SOLE SURVIVING
+        TRACE (archive-before-delete.md).
+
+    Patching the module ATTRIBUTE works because `world_staged_dir` does its
+    `from _paths import WORLD_DIR` inside the function body.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
 
 SID_A = "11111111-1111-4111-8111-111111111111"
 SID_B = "22222222-2222-4222-8222-222222222222"

@@ -3,7 +3,7 @@
 MEASURED DEFECT, 2026-09-07 (alpha worker Body, cc-07). Through the audited
 entry point `core/scripts/inbound-drain-run.py`, a spool holding one directive
 that could not be filed -- because no target aspiration is configured
-(`SIDECAR_DIRECTIVE_ASP_ID`) -- printed
+(`INBOUND_DIRECTIVE_ASP_ID`) -- printed
 
     [inbound-drain] status=ok drained=0 failed=0 apply=True
 
@@ -93,7 +93,7 @@ def test_unconfigured_directive_is_surfaced_as_a_finding(tmp_path):
         "an unconfigured directive must become a finding -- `failed` is the "
         "battery's universal finding key, so anything not in it is invisible"
     )
-    assert "SIDECAR_DIRECTIVE_ASP_ID" in _findings(res), (
+    assert "INBOUND_DIRECTIVE_ASP_ID" in _findings(res), (
         "the finding must name the missing config, or a reader cannot act on it"
     )
     assert "env-under-test" in res["failed"][0]["file"]
@@ -191,7 +191,7 @@ def test_genuine_failure_and_unconfigured_both_reported(tmp_path):
     reasons = _findings(res)
     assert len(res["failed"]) == 2, reasons
     assert "failed and stayed claimed" in reasons
-    assert "SIDECAR_DIRECTIVE_ASP_ID" in reasons
+    assert "INBOUND_DIRECTIVE_ASP_ID" in reasons
 
 
 def test_missing_unconfigured_key_is_treated_as_zero(tmp_path):

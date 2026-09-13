@@ -58,7 +58,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 from _bash_helpers import BASH  # noqa: E402
 
-SCRIPT = Path(__file__).resolve().parents[1] / "mutation-proof-test.sh"
+# The subject REFUSES to be its own --target (mutation-proof-test.sh:129, an
+# _abs BASH_SOURCE comparison), so the only way to prove these tests red by
+# mutation is to point them at a mutated COPY. Default is the real script;
+# the override exists for that proof and for nothing else.
+SCRIPT = Path(os.environ.get("MUTATION_PROOF_SCRIPT")
+              or Path(__file__).resolve().parents[1] / "mutation-proof-test.sh")
 
 BODY = "alpha = 1\nbeta = 2\n"
 CHECK = "grep -q '^alpha = 1$' target.txt\n"
@@ -318,3 +323,69 @@ def test_restore_still_leaves_the_target_byte_identical(bed):
     before = (bed / "target.txt").read_bytes()
     run(bed, SUB)
     assert (bed / "target.txt").read_bytes() == before
+
+
+# --- 5. the residue matcher is LITERAL, not a newline-split alternation ----
+#
+#  unit 7. `grep -qF -- "$SAB_NEW" "$TARGET"` looked like a fixed-string
+# test and was not: GNU grep -F reads a MULTI-LINE pattern as a LIST OF
+# ALTERNATIVES, so a two-line --sabotage-new was "found" whenever ANY ONE of its
+# lines appeared. The entry refusal then fired over residue that did not exist —
+# rc=2, no verdict, on a perfectly clean target. This is the always-ALARM twin of
+# the always-CLEAR class  catalogues, and it is worse in practice: the
+# fleet's only sanctioned mutation-proof tool appears broken, so the next agent
+# hand-rolls the cp/pytest/cp-back mutation guard-1621 forbids (observed doing
+# exactly that before catching it).
+#
+# The tests below are written in BOTH directions on purpose. A matcher hardwired
+# to "no residue" would satisfy the two false-alarm tests perfectly and is the
+# same defect pointing the other way, so the genuine-residue test is the positive
+# control that licenses them (guard-2421).
+
+MULTI = ["--sabotage-old", "alpha = 1",
+         "--sabotage-new", "alpha = 99\ngamma = 3"]
+
+
+def test_first_line_of_a_multiline_payload_is_not_residue(bed):
+    """THE REGRESSION. Only line 1 of the two-line payload is in the target."""
+    (bed / "target.txt").write_text(
+        "alpha = 1\nbeta = 2\n# stale: alpha = 99\n", encoding="utf-8")
+    proc = run(bed, MULTI)
+    assert proc.returncode != 2, (
+        "a target carrying only the FIRST line of a multi-line payload is NOT "
+        f"residue; stderr={proc.stderr[-400:]}")
+    assert "already contains" not in proc.stderr
+    v = verdict(proc)
+    assert v["verdict"] == "PASS", v
+    assert v["residue_check"] == "clean", v
+
+
+def test_last_line_of_a_multiline_payload_is_not_residue(bed):
+    """The same defect from the other end — grep -F alternation is per-line."""
+    (bed / "target.txt").write_text(
+        "alpha = 1\nbeta = 2\n# gamma = 3 was dropped\n", encoding="utf-8")
+    proc = run(bed, MULTI)
+    assert proc.returncode != 2, proc.stderr[-400:]
+    assert "already contains" not in proc.stderr
+    assert verdict(proc)["verdict"] == "PASS"
+
+
+def test_a_genuine_multiline_residue_is_still_refused(bed):
+    """POSITIVE CONTROL. Without this, both tests above pass against a matcher
+    that can never report residue at all — which is the always-CLEAR half of the
+    very class this fix belongs to."""
+    (bed / "target.txt").write_text(
+        "alpha = 99\ngamma = 3\nbeta = 2\n", encoding="utf-8")
+    proc = run(bed, MULTI)
+    assert proc.returncode == 2
+    assert "already contains" in proc.stderr
+    assert stored_backups(bed) == [], "refused before the backup was taken"
+
+
+def test_multiline_residue_must_be_contiguous_and_in_order(bed):
+    """Both lines present, but not as the literal payload. Still not residue."""
+    (bed / "target.txt").write_text(
+        "alpha = 1\n# gamma = 3\nbeta = 2\n# alpha = 99\n", encoding="utf-8")
+    proc = run(bed, MULTI)
+    assert proc.returncode != 2, proc.stderr[-400:]
+    assert verdict(proc)["verdict"] == "PASS"

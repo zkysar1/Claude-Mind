@@ -72,7 +72,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --outcome-note --outcome-note-file"
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --override-narrative-replace --outcome-note --outcome-note-file"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
@@ -181,6 +181,13 @@ while [[ $# -gt 0 ]]; do
             ALLOW_NEW_FIELD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-narrative-replace)
+            # : justification-bearing bypass of the narrative-replace
+            # refusal below. Takes an argument like every other override on this
+            # wrapper, so `shift $(( $# >= 2 ? 2 : 1 ))` (guard-1224) — NOT the
+            # bare shift the flagless --value-stdin arm uses.
+            OVERRIDE_NARRATIVE_REPLACE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
         --value-stdin)
             # : take VALUE from stdin so it never enters argv. A
             # composed prose value passed as an argv element is bounded by the
@@ -248,6 +255,58 @@ if [ -n "$VALUE_STDIN" ]; then
     VALUE="$(cat; printf x)"
     VALUE="${VALUE%x}"
 fi
+
+# ── --value-stdin ON A NARRATIVE FIELD: REFUSE () ─────────────────
+# `--value-stdin` is a flag on TWO scripts with OPPOSITE semantics: here it
+# REPLACES the field, on goal-field-append.sh it APPENDS. Same store, same flag
+# name, same argument position. That makes the DESTRUCTIVE call look like the
+# APPENDING one at the call site, which is the narrow re-opening of exactly the
+# confusion the separate-script design (see this file's header) exists to close.
+#
+# MEASURED COST, not hypothetical: 2026-09-12T08:40 this shape destroyed a
+# 9,789-char accumulated progress_note on  carrying three boxes'
+# first-person machine-local measurements that no other Body could re-derive.
+# Recovered field-level from a .history blob; a whole-store restore was rejected
+# because it would have reverted an unrelated live lane.
+#
+# WHY A REFUSAL AND NOT A BETTER BANNER. The banner already existed — it names
+# these three fields, names the sibling script, and says the shrink guard does
+# not cover this — and the clobber happened anyway. The two other candidates
+# were weighed: renaming the flag breaks callers on both scripts for a defect
+# that is really about the TARGET, and "the banner is sufficient" is falsified
+# by the measurement above.
+#
+# SCOPED TO --value-stdin DELIBERATELY. The POSITIONAL replace is guard-4876's
+# already-owned class (both its measured instances are positional); this is the
+# gap that guardrail does not name. Widening the refusal to every form would
+# refuse the documented general-purpose path (implementation-discipline: touch
+# only what the goal requires).
+#
+# FIELD-NAME KEYED, so there is no daemon round-trip: a read-then-refuse would
+# add a request to every --value-stdin call to learn something argv already
+# carries. A legitimate whole-field replacement still exists (the recovery above
+# wrote a verified union), which is what the override is for.
+case "$FIELD" in
+    progress_note|outcome_note|description)
+        if [ -n "$VALUE_STDIN" ] && [ -z "${OVERRIDE_NARRATIVE_REPLACE:-}" ]; then
+            cat >&2 <<EOF
+Error: --value-stdin REPLACES '${FIELD}' on this wrapper — it does not append.
+  goal-field-append.sh takes the SAME flag name and APPENDS, so this call shape
+  reads like the appending one and is not (g-115-9835; measured clobber of a
+  9,789-char progress_note on 2026-09-12).
+
+  To APPEND (almost always what you want):
+    bash core/scripts/goal-field-append.sh --source ${SOURCE:-world} ${GOAL_ID} ${FIELD} <marker> --value-stdin
+  It adds a CAS conflict check, post-state verification and marker-keyed
+  idempotency that a replace cannot.
+
+  To genuinely REPLACE the whole field, say why:
+    --override-narrative-replace "<justification>"
+EOF
+            exit 6
+        fi
+        ;;
+esac
 
 # Missing positionals → error
 if [ -z "$GOAL_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then

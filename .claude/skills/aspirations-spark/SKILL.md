@@ -570,17 +570,18 @@ doubt between framework and domain, pick domain.
     # happened to be a stub).
     IF session.goal_id != the id of the goal being closed:
         SKIP this block   # treat the manifest as ABSENT, not as this goal's
-                          # (guard-3968 ACTION, verbatim). Silent, exactly like
-                          # the file-absent branch above — it is the same case.
+                          # (guard-3968 ACTION, verbatim). Silent, like the
+                          # file-absent branch above — the same case.
                           # Do NOT fall through to the retrieved_sigs read
                           # below (guard-137: no ambiguous fall-through).
-    # WHY SKIP RATHER THAN FAIL LOUD — this was the one open question in
-    # g-115-5278, and the two consumers are not symmetric: the sibling GATE's
-    # mismatch costs a skipped consult (recoverable, next iteration re-fires),
-    # while THIS block's costs a MISATTRIBUTED outcome in
+                          # Mismatch ALSO = no tied retrieval; on a
+                          # diagnostic goal retrieve BEFORE diagnosing
+                          # (rb-10745, g-115-8751).
+    # WHY SKIP RATHER THAN FAIL LOUD (g-115-5278) — the two consumers are not
+    # symmetric: the sibling GATE's mismatch costs a skipped consult
+    # (recoverable), while THIS block's costs a MISATTRIBUTED outcome in
     # pattern-signatures.jsonl, which is durable. Skipping is fail-safe for the
-    # durable store; a louder branch here would also be the only non-silent SKIP
-    # among the three in this block, for no gain.
+    # durable store.
     # `retrieval_performed` IS a live key — but ONLY on the no-retrieval STUB that
     # iteration-close.sh writes (`"retrieval_performed": False`, L2506). The real
     # daemon-written manifest OMITS it, and ABSENT MEANS PERFORMED. That asymmetry

@@ -160,12 +160,43 @@ if command -v python3 >/dev/null 2>&1; then PY="python3"; else PY="py -3"; fi
 # reported as `residue_check: unavailable` rather than silently passing, because
 # an unchecked lane that renders identically to a checked one is how this defect
 # stayed invisible (guard-1760).
+#  unit 7: LITERAL containment, NOT `grep -qF`. GNU grep -F treats a
+# MULTI-LINE pattern as a LIST OF ALTERNATIVES, so a two-line --sabotage-new
+# matched a target containing only its FIRST line, and this script refused at
+# entry (rc=2) over residue that was not there. That made the fleet's only
+# sanctioned mutation-proof tool a permanent false ALARM on multi-line payloads
+# and pushed callers into the hand-rolled cp/pytest/cp-back mutation guard-1621
+# forbids. Positive-controlled 2026-09-13 (alpha, hostname cc-07, uname -r
+# 6.8.0-139-generic): `grep -qF -- $'LINE_A\nLINE_B'` MATCHED a file whose only
+# content was `LINE_A`; the replacement below did not, and still matched a file
+# genuinely carrying both lines.
+#
+# SUBSTRING SEMANTICS ARE PRESERVED ON PURPOSE. The obvious repair -- anchoring
+# to whole lines, `grep -x`/`-w` -- would break the pin that residue appearing
+# only inside a COMMENT is still residue (test_mutation_proof_residue_check.py::
+# test_the_refusal_survives_the_string_appearing_only_in_a_comment). Bash `==`
+# against a QUOTED needle is a literal, newline-respecting substring test, so it
+# fixes the split without touching what "residue" means.
+#
+# rc 0 = present | 1 = absent | 2 = target unreadable. The third is NOT folded
+# into "absent": a check that could not look must never render as a pass
+# (guard-1760), which is the same posture `residue_check: unavailable` already
+# takes for the --sabotage-sed lane.
+contains_literal() {  # $1 = needle, $2 = file
+  local _hay
+  _hay="$(cat -- "$2" 2>/dev/null)" || return 2
+  [[ "$_hay" == *"$1"* ]]
+}
+
 RESIDUE_CHECK="unavailable"
 if [[ -n "${SAB_NEW:-}" ]]; then
-  RESIDUE_CHECK="clean"
-  if grep -qF -- "$SAB_NEW" "$TARGET" 2>/dev/null; then
+  _residue_rc=0
+  contains_literal "$SAB_NEW" "$TARGET" || _residue_rc=$?
+  if [[ "$_residue_rc" == "0" ]]; then
     echo "ERROR: --target already contains the --sabotage-new string before this run started, so a backup taken now would capture RESIDUE and every verdict below would be about the wrong baseline. This is what a previous interrupted/concurrent run leaves behind; it is self-perpetuating and each run deletes the evidence. Remove the residue from '$TARGET' and re-run. Offending string: $SAB_NEW" >&2
     exit 2
+  elif [[ "$_residue_rc" == "1" ]]; then
+    RESIDUE_CHECK="clean"
   fi
 fi
 
@@ -210,7 +241,7 @@ restore() {
     # overlapping runs on one target produced a false `sabotage_red:false`
     # "vacuous test" verdict and a false baseline-red "broken test" verdict in
     # the same pair).
-    if [[ "$RESIDUE_CHECK" != "unavailable" ]] && grep -qF -- "$SAB_NEW" "$TARGET" 2>/dev/null; then
+    if [[ "$RESIDUE_CHECK" != "unavailable" ]] && contains_literal "$SAB_NEW" "$TARGET"; then
       RESIDUE_CHECK="RESIDUE"
       RESTORE_STATUS="FAILED"
       echo "CRITICAL: restore wrote a backup that ITSELF contains the sabotage string — '$TARGET' matches its backup but is NOT clean. SABOTAGE IS LIVE. The backup at '$BACKUP' is retained deliberately; it is the residue, not the recovery." >&2

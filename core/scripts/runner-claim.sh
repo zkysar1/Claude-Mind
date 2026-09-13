@@ -233,8 +233,33 @@ if op == "status":
     mid = c.get("machine_id") or "unknown-machine"
     hb = c.get("heartbeat_at")
     if state != "RUNNING":
-        print(f"[runner-claim] status: NOT-RUNNING (backend={backend}) — '{agent}' has "
-              f"a claim row on '{mid}' but agent_state={state or '?'}; no live runner")
+        # machine_id IS A TOMBSTONE ON A NON-RUNNING ROW, NOT A LOCATION
+        # (). It is written ONLY by a successful acquire, which sets
+        # agent_state=RUNNING in the SAME conditional update (owncloud_backend.py
+        # acquire_runner, attempt 2); every IDLE-producing write — release_runner,
+        # reclaim_if_stale — leaves machine_id untouched. So on this branch it
+        # names the LAST box that HELD the claim, and two consecutive readings
+        # naming different boxes show two successive stand-downs, NOT a claim
+        # migrating between live boxes. This line said "has a claim row on '{mid}'",
+        # which reads as a present-tense location; on 2026-09-10 that produced a
+        # false "the fleet is down" report to the owner while a Body was merging
+        # PRs and writing the world store.
+        # SCOPE: agent_state here is the REDUCER LEASE and nothing else — only
+        # acquire/release/reclaim write it, and a worker Body executes goals
+        # without ever holding this claim (which is precisely why
+        # worker_reducer_liveness.py polls this row to ask about its REDUCER).
+        # An unheld lease is NOT evidence the agent is idle.
+        # rc stays 4 and the literal NOT-RUNNING token is preserved: both
+        # consumers (worker_reducer_liveness.py, reducer_self_fence.py) branch on
+        # rc and scope their machine/token parsers to LIVE_MARKER, so this branch
+        # is human-facing only. That was also the whole blast radius of the defect.
+        print(f"[runner-claim] status: NOT-RUNNING (backend={backend}) — no live "
+              f"runner CLAIM for '{agent}': the row reads agent_state="
+              f"{state or '?'}, last holder '{mid}' (TOMBSTONE — machine_id is "
+              f"written only by acquire, so that is where the claim was LAST "
+              f"held, not where '{agent}' is now). SCOPE: the reducer lease only. "
+              f"This is NOT evidence that '{agent}' is idle — a worker Body "
+              f"executes without holding this claim.")
         sys.exit(4)
     if not isinstance(hb, int):
         print(f"[runner-claim] status: REFUSE (backend={backend}) — '{agent}' claim on "

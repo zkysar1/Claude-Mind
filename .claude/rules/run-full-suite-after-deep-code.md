@@ -503,10 +503,10 @@ before you kill a run or file a false "suite hangs" blocker:
    unbuffered flushes so per-test dots land immediately:
    ```
    STORAGE_BACKEND=local PYTHONUNBUFFERED=1 python -u -m pytest core/scripts/tests -m "not daemon_integration" \
-     > agents/<agent>/temp/suite.log 2>&1
+     > /tmp/suite-$MIND_AGENT.log 2>&1
    ```
-   Then Read `agents/<agent>/temp/suite.log` to watch progress (add `-v` for one
-   line per test instead of dots).
+   Then Read `/tmp/suite-$MIND_AGENT.log` — NEVER a synced path (guard-6416).
+   `-v` gives one line per test.
 3. **A backgrounded run persists — don't trust a waiter or empty task-stdout to
    say otherwise.** Under g-115-1496 the suite was backgrounded and ran to
    completion (1916s) across turns — it was NOT killed. But a bounded waiter

@@ -488,12 +488,11 @@ IF rc == 0 (approved):
          failure — proceed to the sleep branches below regardless.)
 
     # Magic Wand #2 (alpha session-60): set QUIESCENCE_SLEEP=1 so
-    # interruptible-sleep.sh demotes informational wake signals
-    # (board-activity, goal-claim-released — partner activity) without
-    # exiting 2. Blocker-class signals (blocker-cleared, pq-resolved,
-    # email-received) still break the sleep early — those are real
-    # state changes that unblock work. See interruptible-sleep.sh
-    # "Wake-signal classes" header for the contract.
+    # interruptible-sleep.sh demotes INFORMATIONAL signals (partner activity)
+    # without exiting 2, while BLOCKER ones — including perception-received,
+    # an environment CHANGE reaching a vessel — still break the sleep early.
+    # Never re-enumerate the classes here: interruptible-sleep.sh's
+    # "Wake-signal classes" header is the SSOT, and this copy went stale.
     quiescence_sleep_env = "QUIESCENCE_SLEEP=1"
 
     # B6.8 (g-303-28): symmetric drainable-debt branch. When the queue is

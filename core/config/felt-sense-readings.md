@@ -1,3 +1,4 @@
+<!-- domain-leak-exempt: dated felt-sense Phase-2 readings ledger — domain measurement data (e.g. the g-326-876 Roblox-PLACE false-positive analysis at the `Reopened` token) is kept byte-verbatim as extracted from felt-sense-checkin/SKILL.md so cross-reading diffs stay exact; genericizing would corrupt the evidence. A detector run over a corpus that documents its own findings re-flags every correction it causes (guard-2096). Sibling of strategic-scan-readings.md, which carries this same marker and names THIS file as a sibling of the same class. NOT in scope of marker-placement-gate.py (IN_SCOPE_PATTERNS cover `.claude/skills/*/SKILL.md` and `core/config/conventions/*.md`; this file is neither). -->
 # Felt-Sense Phase 2 Reading Ledger
 
 Extracted 2026-08-19 (g-115-5766) from `.claude/skills/felt-sense-checkin/SKILL.md`,
@@ -2055,3 +2056,70 @@ rc=0, and this ledger's own preceding entry **rb-10265**), so the correct action
 STRENGTHEN, not a fourth near-duplicate: incremented guard-2958, guard-2442,
 rb-6860. Zero new entries — the recurrence is the signal, and the count is the
 artifact that carries it.
+
+---
+
+**2026-09-10T18:59 — foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r`
+6.18.33.2-microsoft-standard-WSL2, own-cloud.** Gate: current=13978 last=13779
+diff=199 cadence=75 (**2.65x — 2.5 days starved**). Phase 2 in-progress: **1 row**,
+holder alpha, `claimed_by 1/1, claimed_by_sid 1/1, name-less-sid 0`, liveness
+**alive** (last_active 1.3m, `row_updated_by: alpha` — so not a guard-3604
+cross-agent bump). Depth of 1 is this box's reducer-drain reading, not a fleet fact.
+
+**THE SECOND QUERY'S OWNERSHIP TALLY HAS NO DISCRIMINATING POWER HERE, AND THE
+LEDGER'S "small mutable count is the gates working" NOTE INVERTS.** `--goal-status
+pending --goal-field participants agent --full` returned **2532 of ~2881 goals** —
+`participants: [agent]` is near-universal, so the predicate is the whole pending
+queue, and the gates passed **2531** of them. Prior points recorded 141/180/201 rows
+returning 2/1/0 mutable; this is 2532 returning 2531. Those are not comparable
+readings of one population, they are two different predicates, and reading this 2531
+as a backlog would be a 2531-row error. **Doneness, not ownership, is the real
+bound**: `outcome_note` present on **225/2532 (8.9%)**, and the completed-not-closed
+lane already owns that set with a better predicate (fleet 231 non-terminal carrying
+completion evidence, **held by foxtrot: 0**). Out-of-cycle closes: **0**. When the
+mutable count approaches the population, measure the PREDICATE before the queue.
+
+Phase 3: **18 blocked**, `blocker_ref` **none on 18/18** (Gate 3's UNREADABLE class
+empty), `blocked_by` **14 list:1 / 2 list:0 / 1 list:2 / 1 list:4 — zero bare
+strings**, so guard-5479's polymorphism trap did not arise. RULE axis run BEFORE the
+premise probe per Step 3.0: no grant in the table retires any of these 18 defer
+texts. PREMISE axis: resolved all **17 distinct dependency ids — 7 blocked, 10
+pending, ZERO terminal**, so no row qualifies on either axis. `18 candidates - 0
+mutated, 0 skipped (foreign sid), 0 skipped (absent sid), 1 skipped (partner)`.
+**g-250-124 fourth waypoint:** still the defer-only shape recorded 2026-08-30 —
+`blocked_by []`, `blocker_ref None`, one `precondition_unmet:` set
+2026-08-29T23:27:06, unchanged 12 days. Held across two sweeps; still not an end state.
+Phase 5b `--all-skills`: 146 skills / **3888** assertions / 5 parse-lines / 0 stale.
+
+**LANE 7 — THE LANE DEFINITION MOVES THE VERDICT ACROSS THE FLOOR, ON THE SAME
+INSTANT.** 7d, 94 closes, floor 33.3%: derived-from-strategic-focus (`['asp-363',
+'asp-364', 'asp-368', 'asp-369']`) **3/94 = 3.2%** by aspiration / **30.9%** by
+work_class; LEGACY_LANE asp-334,asp-335 **5.3% / 33.0%**; **PINNED asp-326,asp-350
+(pin-001, the actual standing mandate) 14/94 = 14.9% / 36.2%**. By work_class the
+pinned reading CLEARS the floor; by aspiration-id it is a third of it. Note the
+derived lane does **not contain foxtrot's pinned aspirations at all**, so the default
+run measures a lane this agent is not assigned to — read `lane_source`, then measure
+your own.
+
+Rider (c) confirmed again from a new direction: `ordering_ok: false` on all five
+windows of all three definitions, and it means nothing here. The meaningful test
+`infra > lane + other`, pinned lane: **7d 52 vs 42 TILT · days3_7 39 vs 23 TILT ·
+48h 13 vs 19 no tilt · 24h 9 vs 8 marginal · 12h 9 vs 6 TILT**. Pinned share TRENDS
+UP (11.3% -> 21.9% -> 23.5% by aspiration; 29.0% -> 50.0% -> 52.9% by work_class) —
+a recovery in progress, not a live regression. **NOT MATERIAL: the Self is already
+correct and the behavior is what drifts**, so the remedy is executing the standing
+item, not editing self.md. The sharpest evidence was the sweep's own iteration —
+precheck plus a 31-lane deferrable tier plus this sweep, while g-326-85 came due at
+18:57. The tilt happened in real time inside the lane that measures it.
+
+Lane 1: **one write, and it was a STRENGTHEN.** guard-6197 already carried my
+trigger and my verdict; its MECHANISM was different (marker quoted from an OLDER
+`progress_note`). Mine came from the **`outcome_note` itself at pos 0/head**, where
+"compare the two fields" cannot reach, and the false positive is **semantic** — the
+verb's OBJECT was a Roblox PLACE, not the goal (g-326-876, token `Reopened`,
+guard-5395 EditPlace URI). Appended to `action_hint`, the amendable surface;
+`rule` left byte-identical at 947 chars per guard-6210/5747. Expect recurrence:
+reopen is this domain's literal fix verb for a closed place. Also quantified from
+the instrument: `history_recoverability` = recurring_closes_lost **5001/5108
+(97.9%)**, overall_recoverable_pct **6.7%** — guard-2692's `--series` hazard with a
+number on it. The hand-recorded points in this file are the only series there is.

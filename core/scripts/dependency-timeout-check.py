@@ -692,17 +692,46 @@ def _reprobe_line(reprobe):
 
 
 def _clear_defer(root_id, source):
-    """Clear a falsified defer_reason. Mirrors _boost_priority's shape."""
-    try:
-        proc = subprocess.run(
-            bash_cmd(SCRIPT_DIR / "aspirations-update-goal.sh",
-                     root_id, "defer_reason", "", "--source", source),
-            capture_output=True, text=True, timeout=120)
-        if proc.returncode == 0:
-            return True, "cleared defer on %s" % root_id
-        return False, "clear rc=%s %s" % (proc.returncode, (proc.stderr or "")[:160])
-    except Exception as e:
-        return False, "clear raised: %s" % e
+    """Clear a falsified defer_reason (+ its _set_at twin) via the daemon.
+
+    DO NOT reintroduce `bash_cmd(... "defer_reason", "", ...)` here. That was
+    this function's shape from 2026-08-28 until 2026-09-12 and it never once
+    cleared a defer (g-115-8314): aspirations-update-goal.sh refuses an EMPTY
+    value before the engine is reached (`[ -z "$VALUE" ]`), so every falsified
+    defer this sweep correctly identified stayed frozen for the full
+    defer_reason_timeout_hours while the re-probe half worked fine -- a quiet
+    failure whose board post still announced the correction.
+
+    Two things are load-bearing about the replacement:
+
+      * `None`, not the string "null". The shell wrapper needs a non-empty
+        argv token so it passes the literal "null"; from Python we hand the
+        typed value to _rt and let json.dumps produce the JSON null
+        (guard-5211). Sending the STRING "null" through this path would store
+        that text as the defer reason.
+      * `_rt`, not a subprocess. guard-1322 forbids invoking an
+        agent-binding-dependent wrapper through subprocess.run() from Python
+        (the PreToolUse[Bash] MIND_AGENT injection fires only on Bash TOOL
+        calls, so the child resolves the WRONG AGENT), and guard-555 names the
+        typed _rt client as the preferred form where one exists. It does here.
+        The deleted-by-cutover `aspirations.py update-goal` CLI is the other
+        trap: it could print an Error and still exit 0, so an rc-reading caller
+        saw a silent no-op (g-115-9621).
+
+    RtError carries the daemon's body; surface it in the note rather than
+    collapsing it to a bare False (rb-10397). Mirrors the sibling
+    precondition-defer-recheck.py::_clear_defer, which is the working
+    reference implementation -- keep the two in step.
+    """
+    for field in ("defer_reason", "defer_reason_set_at"):
+        try:
+            _rt.aspirations_update_goal(root_id, field, None, source=source)
+        except _rt.RtError as e:
+            return False, "clear %s on %s failed: %s" % (
+                field, root_id, (e.body or e))
+        except Exception as e:
+            return False, "clear %s raised: %s" % (field, e)
+    return True, "cleared defer on %s" % root_id
 
 
 def _participants(goal):

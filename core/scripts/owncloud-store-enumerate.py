@@ -92,7 +92,9 @@ Usage:
     copy       --dest-endpoint URL [--source-endpoint URL] [--prefix P]
                [--dest-bucket B] [--limit N] [--dry-run] [--progress-every N]
     diff       --source A.jsonl --dest B.jsonl
-               [--source-strip P] [--dest-strip P] [--deep] [--json]
+               [--source-strip P] [--dest-strip P] [--deep] [--workers N]
+               [--source-endpoint URL] [--dest-endpoint URL]
+               [--baseline-source M] [--baseline-dest M] [--baseline-report J] [--json]
 """
 from __future__ import annotations
 
@@ -168,7 +170,26 @@ def _build_backend(bucket: str, region: str):
         cache_root=os.environ.get("TMPDIR", "/tmp"),
         region=region,
         machine_id=os.environ.get("MACHINE_ID", "enumerate"),
+        # The SCOPED pair, exactly as from_env selects it. Without these two
+        # the client factory falls to the SDK's default credential chain, which
+        # on a fleet box resolves the ROOT key from the exported env — a
+        # different principal from the one the daemon runs as, and one the
+        # basement store does not know at all (InvalidAccessKeyId measured
+        # 2026-09-11 while the daemon-path probe succeeded). Refuse rather than
+        # fall back (guard-1208: say which credential tier answered).
+        aws_access_key_id=_scoped_pair()[0],
+        aws_secret_access_key=_scoped_pair()[1],
     )
+
+
+def _scoped_pair() -> "tuple[str, str]":
+    akid = os.environ.get("MIND_AWS_ACCESS_KEY_ID", "").strip()
+    asec = os.environ.get("MIND_AWS_SECRET_ACCESS_KEY", "").strip()
+    if not (akid and asec):
+        raise SystemExit("enumerate: MIND_AWS_ACCESS_KEY_ID / MIND_AWS_SECRET_ACCESS_KEY are "
+                         "not set -- refusing to fall back to the default credential "
+                         "chain (that is a different principal from production's)")
+    return akid, asec
 
 
 # --------------------------------------------------------------------------
@@ -278,10 +299,10 @@ def cmd_enumerate(args) -> int:
 # --------------------------------------------------------------------------
 
 def _dest_state(s3, bucket: str, key: str):
-    """(size, etag) at the destination, or None when absent."""
+    """(size, etag, last_modified) at the destination, or None when absent."""
     try:
         h = s3.head_object(Bucket=bucket, Key=key)
-        return int(h["ContentLength"]), _etag(h.get("ETag", ""))
+        return int(h["ContentLength"]), _etag(h.get("ETag", "")), h.get("LastModified")
     except Exception as exc:                                      # noqa: BLE001
         code = str((getattr(exc, "response", {}).get("Error") or {}).get("Code") or "")
         if code in ("404", "NoSuchKey", "NotFound"):
@@ -329,21 +350,33 @@ def cmd_copy(args) -> int:
         botocore clients are thread-safe, so both sides share one client."""
         key, size = obj["Key"], int(obj["Size"])
         etag = _etag(obj.get("ETag", ""))
+        src_lm = obj.get("LastModified")
 
         # Resume: skip when the destination already holds this object. Size must
         # match always; the ETag is additionally required only when it is
         # COMPARABLE -- a multipart ETag legitimately differs across stores, so
         # demanding equality there would re-copy those objects on every run,
-        # forever.
+        # forever. For a NON-comparable object a same-size REWRITE at the source
+        # would be invisible to the size check, so the timestamps decide too:
+        # the destination copy is written after the source version it copied, so
+        # a source LastModified newer than the destination's means the source
+        # moved on -- re-copy. (Hardening added 2026-09-11 while chasing a deep
+        # mismatch that turned out to be the source GROWING between the manifest
+        # snapshot and the deep read -- see ``changed_during_read`` below -- not
+        # a same-size rewrite; the same-size case stays real and unmeasured.)
         try:
             state = _dest_state(dst.s3, dst_bucket, key)
         except Exception as exc:                                  # noqa: BLE001
             return "failed", 0, {"key": key, "phase": "head",
                                  "error": f"{type(exc).__name__}: {exc}"}
         if state is not None:
-            d_size, d_etag = state
+            d_size, d_etag, d_lm = state
             comparable = not _is_multipart(etag) and not _is_multipart(d_etag)
-            if d_size == size and (d_etag == etag or not comparable):
+            if comparable:
+                same = d_etag == etag
+            else:
+                same = not (src_lm and d_lm and src_lm > d_lm)
+            if d_size == size and same:
                 return "skipped", size, None
 
         if args.dry_run:
@@ -437,12 +470,35 @@ def _load(path: str, strip: str | None) -> tuple[dict, dict]:
     return summary, by_rel
 
 
-def _deep_md5(backend, bucket: str, key: str) -> str:
+def _deep_md5(backend, bucket: str, key: str) -> tuple[str, str]:
+    """(content md5, ETag the GET actually served). The ETag is compared with the
+    manifest row by the caller: on a LIVE store an object can change between the
+    enumeration and this read, and then the md5 describes a version the manifest
+    never listed -- that is churn, not a mismatch (measured 2026-09-11: a
+    transcript grew 65.25 -> 68.48 MB between the snapshot and the read)."""
     h = hashlib.md5()
-    body = backend.s3.get_object(Bucket=bucket, Key=key)["Body"]
+    resp = backend.s3.get_object(Bucket=bucket, Key=key)
+    body = resp["Body"]
     for chunk in iter(lambda: body.read(1024 * 1024), b""):
         h.update(chunk)
-    return h.hexdigest()
+    return h.hexdigest(), _etag(resp.get("ETag", ""))
+
+
+def _deep_endpoint(side: str, summary: dict, override: str | None) -> str | None:
+    """The endpoint one manifest side is read through for --deep: the endpoint
+    the manifest itself records (``(incumbent)`` = the regional default =
+    unset). An explicit flag may CONFIRM it; a flag that contradicts a recorded
+    endpoint is refused, because the manifest is the record of where those
+    ETags came from (guard-1857)."""
+    recorded = summary.get("endpoint") or ""
+    rec = None if recorded in ("", "(incumbent)") else recorded
+    if override is None:
+        return rec
+    ov = None if override in ("", "(incumbent)") else override
+    if recorded and ov != rec:
+        raise ValueError(f"--{side}-endpoint {override!r} contradicts the {side} "
+                         f"manifest, which was enumerated through {recorded!r}")
+    return ov
 
 
 def cmd_diff(args) -> int:
@@ -473,7 +529,8 @@ def cmd_diff(args) -> int:
         else:
             checksum_bad.append({"rel": rel, "source": a["etag"], "dest": b["etag"]})
 
-    deep_ok, deep_bad, deep_err = [], [], []
+    deep_ok, deep_bad, deep_err, deep_baseline, deep_changed = [], [], [], [], []
+    src_ep = dst_ep = None
     if args.deep and unverifiable:
         bucket_s = src_sum.get("bucket")
         bucket_d = dst_sum.get("bucket")
@@ -481,20 +538,91 @@ def cmd_diff(args) -> int:
             print("FATAL: --deep needs both manifests to carry a _summary line "
                   "with a bucket.", file=sys.stderr)
             return 2
-        # Each side is read through its OWN endpoint, so a cross-store deep
-        # compare needs the tool run twice. Resolve the reachable one here and
-        # say plainly which side could not be read rather than guessing.
-        backend = _build_backend(bucket_s, args.region)
+        # Each side is read through the endpoint ITS OWN manifest was
+        # enumerated from. Reading both sides through one endpoint compares
+        # every object with itself whenever the two stores reuse a bucket
+        # name -- and this deployment's basement store deliberately does
+        # (guard-4592; caught 2026-09-11 before the first verification run).
+        try:
+            src_ep = _deep_endpoint("source", src_sum, args.source_endpoint)
+            dst_ep = _deep_endpoint("dest", dst_sum, args.dest_endpoint)
+        except ValueError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            return 2
+        if src_ep == dst_ep and bucket_s == bucket_d:
+            print("FATAL: --deep would read BOTH sides through the same endpoint "
+                  f"({src_ep or '(incumbent)'}) and bucket ({bucket_s}) -- that "
+                  "compares each object with itself and proves nothing. Enumerate "
+                  "each side through its own endpoint (or pass --source-endpoint / "
+                  "--dest-endpoint).", file=sys.stderr)
+            return 2
+        with _endpoint(src_ep):
+            src_be = _build_backend(bucket_s, args.region)
+        with _endpoint(dst_ep):
+            dst_be = _build_backend(bucket_d, args.region)
+
+        # A baseline is the manifest PAIR from an earlier VERIFIED run. Within
+        # ONE store an unchanged (size, ETag) pair means unchanged bytes, so an
+        # object unchanged on BOTH sides since that run inherits its verdict
+        # instead of being re-read: the cutover-night delta verify then costs
+        # what changed, not the whole multipart population.
+        base_src: dict[str, dict] = {}
+        base_dst: dict[str, dict] = {}
+        base_ok: set[str] = set()
+        if args.baseline_source or args.baseline_dest or args.baseline_report:
+            if not (args.baseline_source and args.baseline_dest and args.baseline_report):
+                print("FATAL: --baseline-source, --baseline-dest and --baseline-report go "
+                      "together.", file=sys.stderr)
+                return 2
+            _, base_src = _load(args.baseline_source, args.source_strip)
+            _, base_dst = _load(args.baseline_dest, args.dest_strip)
+            with open(args.baseline_report, encoding="utf-8") as fh:
+                base_rep = json.load(fh)
+            # Only what the baseline RUN actually proved carries over: the rels it
+            # lists as content-verified. Its overall verdict does not matter (a
+            # live fleet's churn can fail the verdict while every stable object
+            # verified), and a rel it found MISMATCHED or never read is re-read
+            # here however unchanged it is -- otherwise a bad copy inherits a
+            # good verdict forever.
+            base_ok = set((base_rep.get("deep") or {}).get("content_md5_match_rels") or [])
+        todo = []
         for rel in unverifiable:
-            try:
-                ma = _deep_md5(backend, bucket_s, src[rel]["key"])
-                mb = _deep_md5(backend, bucket_d, dst[rel]["key"])
-                (deep_ok if ma == mb else deep_bad).append(rel)
-            except Exception as exc:                              # noqa: BLE001
-                deep_err.append({"rel": rel, "error": f"{type(exc).__name__}: {exc}"})
+            bs, bd = base_src.get(rel), base_dst.get(rel)
+            if (rel in base_ok and bs and bd
+                    and (bs["size"], bs["etag"]) == (src[rel]["size"], src[rel]["etag"])
+                    and (bd["size"], bd["etag"]) == (dst[rel]["size"], dst[rel]["etag"])):
+                deep_baseline.append(rel)
+            else:
+                todo.append(rel)
+
+        def _both(rel: str):
+            ma, ea = _deep_md5(src_be, bucket_s, src[rel]["key"])
+            mb, eb = _deep_md5(dst_be, bucket_d, dst[rel]["key"])
+            changed = (ea and ea != src[rel]["etag"]) or (eb and eb != dst[rel]["etag"])
+            return ma, mb, bool(changed)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            futures = {pool.submit(_both, rel): rel for rel in todo}
+            for fut in as_completed(futures):
+                rel = futures[fut]
+                try:
+                    ma, mb, changed = fut.result()
+                except Exception as exc:                          # noqa: BLE001
+                    deep_err.append({"rel": rel, "error": f"{type(exc).__name__}: {exc}"})
+                    continue
+                if ma == mb:
+                    deep_ok.append(rel)
+                elif changed:
+                    # The GET served a different version from the one the manifest
+                    # listed: the object moved under us. Not verified, not corrupt.
+                    deep_changed.append(rel)
+                else:
+                    deep_bad.append(rel)
+        deep_err.sort(key=lambda e: e["rel"])
 
     verified = (not missing and not extra and not size_mismatch
-                and not checksum_bad and not deep_bad and not deep_err
+                and not checksum_bad and not deep_bad and not deep_err and not deep_changed
                 and (not unverifiable or (args.deep and not deep_err)))
 
     report = {
@@ -523,6 +651,15 @@ def cmd_diff(args) -> int:
     if args.deep:
         report["deep"] = {"content_md5_match": len(deep_ok),
                           "content_md5_mismatch": len(deep_bad),
+                          "content_md5_mismatch_rels": sorted(deep_bad),
+                          "changed_during_read": len(deep_changed),
+                          "changed_during_read_rels": sorted(deep_changed),
+                          "content_md5_match_rels": sorted(deep_ok) + sorted(deep_baseline),
+                          "inherited_from_baseline": len(deep_baseline),
+                          "objects_read": len(deep_ok) + len(deep_bad) + len(deep_err),
+                          "read_through": {"source": src_ep or "(incumbent)",
+                                           "dest": dst_ep or "(incumbent)"},
+                          "workers": args.workers,
                           "errors": deep_err[:20]}
 
     if unverifiable and not args.deep:
@@ -589,6 +726,24 @@ def main() -> int:
     d.add_argument("--deep", action="store_true",
                    help="download and md5 the objects whose ETags are not "
                         "comparable (multipart); required for a full verdict")
+    d.add_argument("--source-endpoint", default=None,
+                   help="endpoint the SOURCE manifest's objects are read through "
+                        "for --deep; defaults to the endpoint that manifest records "
+                        "and may not contradict it")
+    d.add_argument("--dest-endpoint", default=None,
+                   help="same, for the DEST manifest")
+    d.add_argument("--baseline-source", default=None,
+                   help="source manifest from an earlier deep run; with "
+                        "--baseline-dest and --baseline-report, objects that run "
+                        "content-verified and that are unchanged on BOTH sides "
+                        "inherit its verdict instead of a re-read")
+    d.add_argument("--baseline-dest", default=None,
+                   help="dest manifest from that same earlier run")
+    d.add_argument("--baseline-report", default=None,
+                   help="that run's diff --json report; only rels it lists under "
+                        "deep.content_md5_match_rels can inherit")
+    d.add_argument("--workers", type=int, default=8,
+                   help="parallel object reads for --deep (default 8)")
     d.add_argument("--region", default=os.environ.get("AWS_DEFAULT_REGION", "us-east-2"))
     d.add_argument("--json", dest="as_json", action="store_true")
     d.set_defaults(func=cmd_diff)

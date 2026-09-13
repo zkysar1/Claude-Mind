@@ -26,6 +26,12 @@ def test_health_ok(running_daemon):
     assert isinstance(body["uptime_s"], (int, float))
     assert body["uptime_s"] >= 0.0
     assert isinstance(body["version"], str)
+    # Self-published object-store target (): both keys are always
+    # present. Under the suite's local pin the backend is LocalBackend or not
+    # yet built, and neither carries an endpoint override.
+    assert "storage_backend" in body and "storage_endpoint" in body
+    assert body["storage_backend"] in (None, "LocalBackend")
+    assert body["storage_endpoint"] is None
     # git_head_sha is None when not in a git repo (test fixtures), or a 40-char
     # hex string when the daemon is running inside a git checkout. Both shapes
     # are valid — wrappers treat None as "no comparison possible."

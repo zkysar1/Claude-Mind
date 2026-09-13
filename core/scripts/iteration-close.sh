@@ -48,6 +48,8 @@
 # Returns exit 0 on success, non-zero on error. set -e means any sub-step failure
 # aborts the phase — the checkpoint file retains phase_completed, and the
 # existing crash-recovery path (Phase -1.4 + aspirations-graceful-stop) handles it.
+# The posture that sentence describes is RECONCILED WITH guard-614 at the `set`
+# line below; read that block before changing it.
 #
 # The LLM must still do the LLM-residue work documented in
 # core/config/iteration-close-digest.md at each phase. This script is the bash half;
@@ -62,6 +64,42 @@
 # `python3` resolves via core/scripts/.python-shim/ once _paths.sh is sourced below. See
 # core/config/conventions/python-invocation.md. Don't flip back to `py -c` — this file
 # was swept to a single form specifically so mixed use doesn't return.
+#
+# INVARIANT — GUARD-614 RECONCILIATION: `set -e` IS DELIBERATE HERE, AND FLIPPING
+# THIS LINE TO `set -uo pipefail` IS A REGRESSION, NOT A FIX (g-115-9659).
+# guard-614 prescribes `set -uo pipefail` for wrappers that must emit structured
+# output on EVERY exit path, and its sibling recurring-close.sh correctly carries
+# that posture — its run_phase prints `PHASE FAILED` and CONTINUES, so the outer
+# wrapper degrades loudly. This file is the documented EXCEPTION, for one reason:
+# do_verify's status write (`"${update_cmd[@]}"`, the one call whose failure means
+# THE CLOSE DID NOT HAPPEN) is invoked BARE precisely so it is fatal. Under
+# `set -uo pipefail` that refusal would print and the function would CARRY ON into
+# the outcome_class / completed_by_role stamps, the `Completed:` COORDINATION BOARD
+# POST and the team-state in_flight clear — announcing to the reducer and every
+# partner Body a completion that never landed. A loud abort is strictly better than
+# a false completion, so the `-e` stays.
+#
+# THE ABORT IS NOT SILENT, which is the other half of the reconciliation and the
+# half that is easy to miss because it lives 4.5k lines away: the EXIT trap
+# registered immediately before the dispatch `case` calls
+# `_print_recovery_instructions`, which prints `[iteration-close] RECOVERY (rc=...,
+# phase=..., goal=...)` to stderr, PROBES the goal's live status, and says which of
+# the three states it is in (never landed / already landed / unreadable) plus the
+# retry command. It fires on a `set -e` abort exactly as on any other non-zero exit.
+#
+# THE BLAST RADIUS IS EXACTLY ONE COMMAND. Every write ordered AFTER that status
+# write is already non-fatal with a named WARN (g-115-7663,
+# test_post_status_stamps_are_non_fatal.py), so `-e` can no longer strand a close
+# midway through its bookkeeping — the case that motivated the complaint.
+#
+# Measured 2026-09-11 (alpha, cc-08) against the shape guard-4544 names: a
+# standalone `[[ test ]] && cmd` whose test is FALSE does NOT abort mid-function or
+# at top level under `set -e` — only in TAIL position of a bare-called function,
+# where the function's own rc becomes the caller's. This file has ZERO such tails,
+# so that class is not live here; do not "fix" it by appending `|| true` to the 52
+# mid-position AND-lists.
+#
+# Pinned by core/scripts/tests/test_iteration_close_shell_posture.py.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -3068,8 +3106,39 @@ for e in list(d.get('stranded') or []) + list(d.get('stranded_no_pr') or []):
     if [[ "$TREE_UPDATED" == "true" ]] && [[ "$TREE_UPDATED_OVERRIDE" != "true" ]] && [[ -f "$AGENT_DIR/session/iteration-checkpoint.json" ]]; then
         VAL_SELECTED_AT=$(python3 -c "import json,sys; d=json.load(open(r'$AGENT_DIR/session/iteration-checkpoint.json',encoding='utf-8')); print(d.get('selected_at',''))" 2>/dev/null || true)
         if [[ -n "$VAL_SELECTED_AT" ]]; then
-            if ! python3 "$CORE_ROOT/scripts/tree-edit-since.py" "$VAL_SELECTED_AT" >/dev/null 2>&1; then
-                echo "[iteration-close] WARN: --tree-updated passed but no tree-file change detected since $VAL_SELECTED_AT — IGNORING flag (use --tree-updated-override to force; tree-encoding-drift-gate counter will increment normally and learning_value will not credit tree-encoding work)" >&2
+            # KEEP THE DETECTOR'S OWN STDERR (guard-438). rc=1 has TWO causes
+            # and this WARN used to conflate them: (a) genuinely nothing
+            # changed, and (b) nodes that DID change and were skipped as
+            # "attributed to another session". (b) is a FALSE NEGATIVE whenever
+            # the node was written OFF the Write|Edit|MultiEdit tool path:
+            # `session:` is rotated only by the PostToolUse Layer A hook
+            # (tree-front-matter-sync.py), while `source:` is rotated by the
+            # authoring skill in its own content — so a sed / heredoc / daemon /
+            # merge / pull write leaves a stale stamp on a node it genuinely
+            # encoded. Measured g-115-9689 (bravo, box cc-05, 2026-09-11): a node
+            # carrying zeta's session beside bravo's source was skipped here and
+            # a real encoding iteration got no learning_value credit. Mechanism
+            # in tree-edit-since.py's AUTHORSHIP docstring. Naming the reason is
+            # what tells an operator that --tree-updated-override is the correct
+            # response here rather than a rubber stamp.
+            # `set -euo pipefail` is active (line 103), and rc=1 is this
+            # detector's NORMAL no-edit answer — so the capture must stay inside
+            # a `||` list or the common path aborts do_state_update outright.
+            # The original `if ! python3 ...` was exempt by being a condition;
+            # moving it to a bare assignment silently removes that exemption.
+            # Newlines are flattened with parameter expansion, not `| tr`: a
+            # pipe inside a command substitution re-arms pipefail in a spot
+            # where a failure would abort the same way.
+            local tes_err tes_rc tes_why
+            tes_err=""
+            tes_rc=0
+            tes_err="$(python3 "$CORE_ROOT/scripts/tree-edit-since.py" "$VAL_SELECTED_AT" 2>&1 >/dev/null)" || tes_rc=$?
+            if [[ $tes_rc -ne 0 ]]; then
+                tes_why=""
+                if [[ -n "$tes_err" ]]; then
+                    tes_why=" DETECTOR SAID: ${tes_err//$'\n'/ }"
+                fi
+                echo "[iteration-close] WARN: --tree-updated passed but no tree-file change detected since $VAL_SELECTED_AT — IGNORING flag (use --tree-updated-override to force; tree-encoding-drift-gate counter will increment normally and learning_value will not credit tree-encoding work).${tes_why}" >&2
                 TREE_UPDATED=""
             fi
         fi
@@ -4384,6 +4453,25 @@ do_productivity_check() {
     # (default 3). Fail-open: any error is non-fatal and routed to
     # iteration-close-stderr.log. --quiet suppresses the JSON when nothing fired.
     python3 "$(_winpath "$SCRIPT_DIR/cadence-stale-canary.py")" --quiet \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
+    # Signal-liveness canary (g-318-156 outcome 3) — the THIRD member of the
+    # canary family. The two above ask whether a RITUAL is being skipped; this
+    # one asks whether an INSTRUMENT can still report at all. A detector that has
+    # silently lost the ability to produce a non-clear answer renders identically
+    # to one reporting all-clear, so nothing downstream can tell them apart —
+    # the g-318-156 class. Counts consecutive DEAD verdicts per registered signal
+    # and files an Investigate at threshold; an assertion that cannot be
+    # EVALUATED resets the counter and never fires (always-ALARM is the same
+    # defect as always-CLEAR). First registered signal is agent-watchdog's own
+    # tick liveness, read from watchdog-prev-state.json's mtime because the
+    # watchdog log is TRANSITION-ONLY and its silence is not evidence either way.
+    # Runs here, on the reducer, because a process cannot witness its own death.
+    # Threshold: signal_liveness.threshold_iterations in core/config/aspirations.yaml
+    # (default 3). Fail-open: any error is non-fatal and routed to
+    # iteration-close-stderr.log. --quiet suppresses the JSON when nothing fired.
+    # Rationale (WHY its own cadence and not an audit-baselines row): core/config/rationale/signal-liveness-cadence.md
+    python3 "$(_winpath "$SCRIPT_DIR/signal-liveness-canary.py")" --quiet \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # History-store vacuum tick (g-115-2792-b; design g-115-2792-a) — cadence

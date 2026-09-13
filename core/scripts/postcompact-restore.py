@@ -400,6 +400,15 @@ def main():
                 "compact-checkpoint.yaml missing — only iteration anchor available.",
                 "",
             ]
+            # Above the anchor, not below it (2026-09-13). The anchor is the
+            # first ACTIONABLE line in this banner, so an imperative printed
+            # after it is read after the model has already reached for the goal
+            # — the same ordering defect the full path carried, found here only
+            # because the pin covers both emit paths (guard-4392).
+            minimal.append("MANDATORY FIRST CALL: emit ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\",")
+            minimal.append("  delaySeconds=600) BEFORE any other tool call — a compaction resume reaches no")
+            minimal.append("  terminal pair, so the deadman net must be restored first (rb-4345/g-115-5834).")
+            minimal.append("")
             minimal.extend(_format_iteration_ckpt_block(iter_ckpt))
             minimal.append("ACTION: Re-enter /aspirations loop. Phase -0.5c will skip")
             minimal.append("(no checkpoint). Phase 0 precheck + Phase 2 select still run.")
@@ -425,9 +434,34 @@ def main():
                  f"Session: {checkpoint.get('session_id', 'unknown')}")
     lines.append("")
 
+    # --- Deadman re-arm imperative (LEADS the banner) ---
+    # rb-9750: when several messages are joined, the first clause IS the reason
+    # to a reader — its fix inserted the blocking message at index 0 for exactly
+    # this cause. Until 2026-09-13 this block sat ~85% down the banner, below the
+    # goal anchor, loop state, completed-goal list, execution diary and reasoning
+    # snapshot. That satisfied the old pin (it preceded the ACTION line) and the
+    # failure kept happening anyway: FOUR consecutive compaction resumes on
+    # alpha/cc-04 opened on a batched Bash entry-protocol call instead of the
+    # re-arm (2026-09-11 x2, 2026-09-12, 2026-09-13, the last one first-person).
+    # "Before ACTION" is not the contract that matters; "before anything the
+    # reader can act on" is — so it goes above the goal anchor too, which is the
+    # first line in this banner a resuming model can reach for.
+    lines.append("MANDATORY FIRST CALL: before ANY other tool call this turn, emit")
+    lines.append('  ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)')
+    lines.append("  — the deadman net. A compaction resume re-enters the loop MID-iteration and")
+    lines.append("  reaches no terminal pair, so the whole iteration runs on whatever net already")
+    lines.append("  existed — none, if the compaction landed before a close. Re-arm FIRST, then")
+    lines.append("  read the rest of this banner. Double-arming is a harmless no-op; skipping it")
+    lines.append("  has produced 7h and 7h47m silent loop deaths (rb-4345 / g-115-5834).")
+    lines.append("  This is ONE tool call, and it is NOT batchable with the entry protocol.")
+    lines.append("")
+
     # --- In-flight goal anchor (from aspirations-select Phase 2.95) ---
-    # Highest priority — printed FIRST so the model sees the pre-compact
-    # goal selection before any narrative context that could drift it.
+    # Printed before every narrative section (loop state, diary, snapshot) so the
+    # model sees the pre-compact goal selection before anything that could drift
+    # it. It is SECOND overall since 2026-09-13 — only the re-arm imperative above
+    # outranks it, because a missed net costs hours and a drifted anchor costs one
+    # iteration.
     # iter_ckpt was already read at top of main() for degraded-path handling.
     if iter_ckpt is not None:
         lines.extend(_format_iteration_ckpt_block(iter_ckpt))

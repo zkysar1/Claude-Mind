@@ -58,7 +58,10 @@ Safety (why a short-circuit cannot strand executable work or mask drift):
     checked: once it has arrived, a goal may now be executable -> MISS. Catches the
     elapsed-recurring false HIT the fresh-scan check alone missed.
   - pending wake signal (blocker-cleared / pq-resolved / email-received /
-    board-activity / goal-claim-released) -> MISS.
+    board-activity / goal-claim-released / perception-received) -> MISS.
+    Keep this list in step with DRY_WAKE_SIGNAL_FILES below — it drifted once
+    (perception-received was in the tuple and missing here, g-373-10), and a
+    docstring that under-reports the set is what makes a later census wrong.
   - cap (default 3): after N consecutive short-circuits, force one full cycle so
     slow drift the cheap checks miss is still caught.
 
@@ -118,6 +121,7 @@ DEFER_REMAINING_S = 60
 DRY_WAKE_SIGNAL_FILES = (
     "blocker-cleared", "pq-resolved", "email-received",
     "board-activity", "goal-claim-released",
+    "perception-received",
 )
 
 # _DEFAULT_DEFER_TIMEOUT_H, _ABSTENTION_TIMEOUT_H, _DEFAULT_RECURRING_INTERVAL_H
@@ -319,10 +323,9 @@ def _emit_hit_directive(cache, current_earliest_wake_at, now, cap):
         "pending wake signal -- skipping the precheck/select/create-aspiration\n"
         "reload for this cycle.\n"
         "DO NOT load Skill(aspirations). DO NOT run selection or execution.\n"
-        "Emit exactly ONE tool call:\n"
-        f"  Bash(\"MIND_AGENT={agent} DRY_SLEEP=1 bash core/scripts/interruptible-sleep.sh {sleep_seconds}\", run_in_background=true)\n"
-        "When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.\n"
-        + _harness_caps.no_notify_hint(sleep_seconds) +
+        # Harness-keyed yield block, one owner ( leg c) — see
+        # _harness_caps.sleep_directive for why the hardcoded pair was a defect.
+        + _harness_caps.sleep_directive(sleep_seconds, agent, "DRY_SLEEP=1") +
         f"After {cap} consecutive short-circuits a full cycle is forced for drift detection.\n"
         "================="
     )

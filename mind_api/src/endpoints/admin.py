@@ -263,6 +263,29 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.json(
             {"backend": backend, "ok": False, "path": str(target),
              "error": f"sync failed: {e}"}, status=500)
+    _ALWAYS = ("pushed", "would_push", "in_sync", "conflicts",
+               "diverged_skipped", "errors")
+    # ANY OTHER non-zero scalar counter _sync_one set, reported generically.
+    # : the six-key whitelist below is exhaustive only for the
+    # outcomes someone remembered to list, and _sync_one has SEVEN more
+    # (stale_skipped / stale_pulled / stale_would_pull / nobaseline_skipped /
+    # nobaseline_reconciled / multipart_deferred / multipart_merged). TWO of
+    # them OVERWRITE THE LOCAL FILE FROM S3 — stale_pulled and
+    # nobaseline_reconciled both call be.refresh(), and both had their
+    # per-file stderr print removed as a flood fix (). So a call that
+    # silently reverted a just-written local file returned
+    # {ok:true, pushed:0, would_push:0, in_sync:0, conflicts:0,
+    #  diverged_skipped:0, errors:0} and said nothing — measured on
+    # bravo (box cc-05) 2026-09-11 05:35-05:40 on a tree node, where that
+    # all-zero payload was the ONLY diagnostic available and carried none of
+    # the information that existed at the time. A _skip() sets "reason" and is
+    # surfaced below, so all-zeros-with-no-reason meant exactly one of these
+    # seven fired. Generic, not a longer list, so the NEXT counter cannot go
+    # silent the same way (same defect class as the error_paths whitelist
+    # below, , and as rb-4868).
+    _extra = {k: v for k, v in stats.items()
+              if k not in _ALWAYS and k != "scanned"
+              and isinstance(v, int) and not isinstance(v, bool) and v}
     return Response.json({
         "backend": backend, "ok": rc == 0, "path": str(target),
         "dry_run": dry_run,
@@ -272,6 +295,7 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
         "conflicts": stats.get("conflicts", 0),
         "diverged_skipped": stats.get("diverged_skipped", 0),
         "errors": stats.get("errors", 0),
+        **_extra,
         # WHICH object failed and why, not just how many ().
         # _record_error has stored {path, phase, exc, msg} since 2026-08-11;
         # this payload hand-enumerates counters, so it dropped the one field

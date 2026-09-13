@@ -355,9 +355,21 @@ def main(argv=None) -> int:
     # by ordering — a value beginning with '-' cannot be read as a flag when it is not
     # in argv at all — and sidesteps guard-5633 (Windows argv silently truncates on an
     # embedded double quote), which composed prose can trip at any length.
+    # --override-narrative-replace is REQUIRED here, not optional ().
+    # That wrapper now REFUSES --value-stdin on progress_note/outcome_note/
+    # description, because the same flag name APPENDS on this script and
+    # REPLACES there, and the destructive call reads like the appending one.
+    # This call IS the appending one: `new` is the composed read-modify-write
+    # result, and the CAS conflict check, marker idempotency and post-state
+    # verification this script owns have already run. Without the override the
+    # refusal fires on its own sanctioned remedy — measured immediately on the
+    # first append after the refusal landed, which is how it was caught.
     res = _run(bash_cmd(
         SCRIPTS / "aspirations-update-goal.sh",
-        "--source", args.source, "--value-stdin", args.goal_id, args.field,
+        "--source", args.source, "--value-stdin",
+        "--override-narrative-replace",
+        "delegated append via goal-field-append.sh (CAS + marker idempotency applied)",
+        args.goal_id, args.field,
     ), input=new)
     if res.returncode != 0:
         # The wrapper's rc is NOT the store of record (, rb-2648): its

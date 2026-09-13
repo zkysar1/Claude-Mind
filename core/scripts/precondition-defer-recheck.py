@@ -26,10 +26,19 @@ explicitly avoiding.
 
 When the pre-filtered list is non-empty, evaluate via predicate.evaluate_all
 in-process (not a subprocess). In-process avoids the CLI-exit-code-0-on-empty
-collision AND avoids the Windows bash subprocess unreliability documented in
-defer-recheck.py _clear_defer (sys.executable direct, never shell out).
+collision.
 
-Dry-run by default; --apply actually clears via aspirations.py update-goal.
+Dry-run by default; --apply clears via the typed daemon client
+(_rt.aspirations_update_goal), which is the live write path.
+
+The "sys.executable direct, never shell out" rationale this docstring used to
+cite from defer-recheck.py _clear_defer WENT FALSE at the 2026-05-14 daemon
+cutover and is deleted rather than reworded (g-115-9621). It read as a
+deliberate reasoned invariant, which is exactly why nobody re-checked it for
+four months: an in-file comment asserting its own context is not evidence
+(rb-8970). Shelling out is still forbidden here (guard-1322 / guard-555) --
+but the conclusion "so call aspirations.py directly" does not follow from it,
+and that is the inference this deletion removes.
 
 Exit: always 0 (reporting tool). JSON output:
   {
@@ -51,7 +60,7 @@ import argparse
 import datetime as dt
 import json
 import os
-import subprocess
+# import subprocess  # removed with _run/_py ()
 import sys
 from pathlib import Path
 
@@ -93,16 +102,12 @@ def _append_metric(path, record):
               file=sys.stderr)
 
 
-# --- Subprocess helpers (mirror defer-recheck.py — sys.executable direct) ---
-
-def _run(argv, input_text=None):
-    result = subprocess.run(argv, input=input_text, capture_output=True,
-                            text=True, encoding="utf-8", errors="replace")
-    return result.returncode, result.stdout, result.stderr
-
-
-def _py(args, input_text=None):
-    return _run([sys.executable] + args, input_text=input_text)
+# --- () _run/_py deleted with the last caller. They existed only to
+# invoke `aspirations.py update-goal` from _clear_defer, which now routes
+# through _rt.aspirations_update_goal. Leaving an unused sys.executable
+# subprocess helper here would be a loaded gun for the next reader who needs
+# to call a migrated wrapper -- the shape is forbidden (guard-1322/guard-555),
+# so it should not be sitting in the file looking sanctioned.
 
 
 def _tolerant_decode(source, raw):
@@ -177,15 +182,33 @@ def _age_hours(ts):
 def _clear_defer(source, goal_id):
     """Clear both defer_reason and defer_reason_set_at on a goal.
 
-    Two separate update-goal calls (the script doesn't support multi-field
-    writes in one invocation; matches defer-recheck.py's clear semantics)."""
-    rc1, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
-                     "--source", source, "update-goal",
-                     goal_id, "defer_reason", "null"])
-    rc2, _, _ = _py([str(SCRIPT_DIR / "aspirations.py"),
-                     "--source", source, "update-goal",
-                     goal_id, "defer_reason_set_at", "null"])
-    return rc1 == 0 and rc2 == 0
+    Returns (ok, detail) — detail is None on success, else the daemon's own
+    error body. Callers MUST surface detail rather than reducing this to a
+    boolean (rb-10397: aggregating per-record failures into a count hides the
+    body that says why).
+
+    Routed through the typed daemon client, NOT `aspirations.py update-goal`
+    (g-115-9621). Three separate reasons, each sufficient:
+      - no-python-cli-fallback.md: the migrated CLI path is not a fallback to
+        keep, and the daemon is the live write path.
+      - The CLI is BOX-DEPENDENT. Measured 2026-09-11: on cc-13 it printed
+        `Error: 'NoneType' object has no attribute 'get'` and the sweep
+        reported clear_failed for every eligible goal, while on cc-02
+        (also STORAGE_BACKEND=own-cloud) the identical argv succeeded and the
+        write landed. A path that works on one box and silently no-ops on
+        another is worse than one that fails everywhere.
+      - guard-1322 / guard-555 forbid the other tempting repair — shelling out
+        to aspirations-update-goal.sh from Python. The PreToolUse MIND_AGENT
+        injection fires only on Bash TOOL calls, so a Python-spawned subprocess
+        resolves the WRONG AGENT: quieter than the bug being fixed.
+
+    Two calls because update-goal is single-field; matches defer-recheck.py."""
+    for field in ("defer_reason", "defer_reason_set_at"):
+        try:
+            _rt.aspirations_update_goal(goal_id, field, None, source=source)
+        except _rt.RtError as e:
+            return False, "%s: %s" % (field, e.body or e)
+    return True, None
 
 
 # --- Main --------------------------------------------------------------------
@@ -300,8 +323,13 @@ def main():
         would_clear.append(g["id"])
 
         if args.apply:
-            ok = _clear_defer(g["_source"], g["id"])
+            ok, clear_error = _clear_defer(g["_source"], g["id"])
             entry["action"] = "cleared" if ok else "clear_failed"
+            if not ok:
+                # Surface the daemon body, not just the count (rb-10397).
+                entry["clear_error"] = clear_error
+                print("precondition-defer-recheck: clear FAILED for %s: %s"
+                      % (g["id"], clear_error), file=sys.stderr)
             if ok:
                 cleared += 1
                 # LOAD-BEARING: log ONLY after the clear succeeds — same

@@ -440,6 +440,57 @@ fi
 # Reset the moment an integrate succeeds or none is needed. State lives in
 # .git/ for the same reason as the log (see log() comment). Fail-open; alarm
 # only, never blocks or defers anything itself.
+# --- Staged-set evidence for the defer-streak alarm () -------------
+# A defer whose staged set is 100% SELF-OWNED is a different finding from one
+# holding a partner's work, and the streak message could not tell them apart:
+# it named "a partner's staged entries (guard-741)" as a cause and sent every
+# reader into partner forensics. Measured 2026-09-12 (foxtrot): the staged set
+# held 17 paths and ZERO belonged to a partner -- guard-741 was protecting
+# nothing while blocking everything, and the actual cause (this box's own commit
+# refused by a commit-msg gate) was not on the list at all.
+#
+# Emit the split plus the paths so the reader sees WHOSE work is staged without
+# running a single command, and surface the refusal signal iteration-commit
+# leaves behind when it stops on a deterministic refusal.
+_ip_staged_evidence() {
+  local staged self_n=0 partner_n=0 partner_names="" p top shown refusal="" sig
+  staged="$(git -C "$REPO" diff --cached --name-only 2>/dev/null || true)"
+  if [ -z "$staged" ]; then
+    printf '%s' "index is EMPTY -- this defer is NOT a staged-index shape, so neither guard-741 nor a refused commit explains it"
+    return 0
+  fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    top=""
+    case "$p" in
+      agents/*) top="${p#agents/}"; top="${top%%/*}" ;;
+    esac
+    if [ -n "$top" ] && [ "$top" != "${MIND_AGENT:-}" ]; then
+      partner_n=$((partner_n + 1))
+      case " $partner_names " in
+        *" $top "*) : ;;
+        *) partner_names="$partner_names $top" ;;
+      esac
+    else
+      self_n=$((self_n + 1))
+    fi
+  done <<EOF
+$staged
+EOF
+  shown="$(printf '%s' "$staged" | head -12 | tr '\n' ' ')"
+  sig="$REPO/agents/${MIND_AGENT:-}/session/commit-refused.json"
+  if [ -n "${MIND_AGENT:-}" ] && [ -f "$sig" ]; then
+    refusal=" || REFUSED-COMMIT SIGNAL PRESENT at agents/${MIND_AGENT}/session/commit-refused.json -- READ IT FIRST; this defer is almost certainly your own gate-refused commit (g-115-9807)"
+  fi
+  if [ "$partner_n" -eq 0 ]; then
+    printf 'self=%s partner=0 -- the staged set is 100%% SELF-OWNED, so guard-741 is protecting nothing here; the usual cause is your OWN commit refused by a commit-msg gate (g-115-9807). paths: %s%s' \
+      "$self_n" "$shown" "$refusal"
+  else
+    printf 'self=%s partner=%s (%s) -- a partner has unpushed staged work and guard-741 is protecting it; do NOT clear those paths. paths: %s%s' \
+      "$self_n" "$partner_n" "${partner_names# }" "$shown" "$refusal"
+  fi
+}
+
 IP_DEFER_STREAK_ALARM="${ITERATION_PUSH_DEFER_STREAK_ALARM:-3}"
 case "$IP_DEFER_STREAK_ALARM" in ''|*[!0-9]*) IP_DEFER_STREAK_ALARM=3;; esac
 
@@ -572,7 +623,7 @@ _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort), $2 = blo
     # (guard-1985). Naming dirty-tree causes on a content conflict sends the
     # reader hunting staged entries and dirty files that are not there — and a
     # conflict is the one shape that retrying can NEVER clear on its own.
-    _hint="read the defer reason above — a partner's staged entries (guard-741), index.lock contention, or dirty shared files — and clear it"
+    _hint="read the defer reason above — YOUR OWN COMMIT REFUSED BY A COMMIT-MSG GATE, which leaves the index staged and defers every push thereafter (g-115-9807; check the staged-set line below and agents/<agent>/session/commit-refused.json), a partner's staged entries (guard-741), index.lock contention, or dirty shared files — and clear it"
     if [ "${1:-}" = "conflict-abort" ]; then
       _hint="this is a TRUE cross-machine content conflict, NOT a dirty tree — resolve it by hand (git merge ${UPSTREAM}) and commit the resolution; retrying alone will never clear it"
     elif [ "${1:-}" = "durable-crossagent-defer" ]; then
@@ -588,6 +639,7 @@ _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort), $2 = blo
       _hint="DURABLE cross-agent file(s) differing from BOTH HEAD and ${UPSTREAM}, with no commutative git merge driver: ${_IP_DEFER_DURABLE:-see the defer line above}. Do NOT clear them — that DISCARDS a partner's unpushed work (g-115-6145) — and do NOT wait, as this shape never self-clears. SANCTIONED PROCEDURE (hand-derived 3x, g-115-6632): prove the local side safe by comparing record-id SETS across local / HEAD / ${UPSTREAM} — safe when local is a SUPERSET, or when the whole delta is one field rolling across a recurring occurrence with local the newer side — then COMMIT the partner file with that proof in the message and let the merge reconcile it. If you cannot prove it, post a coordination-board escalation naming the path(s) and leave the file untouched; never clear on a hunch"
     fi
     log "⚠ INTEGRATE-DEFER STREAK: ${n} consecutive integrate failure(s) (${1:-unknown}) since ${since} — behind=${behind}, ahead=${ahead}. The merge keeps failing, so this box CANNOT push (non-fast-forward) and is stranding (g-115-4484 class; every defer line is persisted in .git/iteration-push.log). ACT NOW: ${_hint}; do NOT wait for the stranded-depth alarm at ${ITERATION_PUSH_BULK_ALARM:-25} commits."
+    log "   staged-set evidence: $(_ip_staged_evidence)"
     if [ -n "${MIND_AGENT:-}" ] && [ -d "$REPO/agents/${MIND_AGENT}" ]; then
       local hd="$REPO/agents/${MIND_AGENT}/health"
       { mkdir -p "$hd" && printf '{"ts":"%s","source":"iteration-push","event":"integrate_defer_streak","streak":%s,"since":"%s","shape":"%s","behind":"%s","ahead":"%s"}\n' \
@@ -991,6 +1043,7 @@ _selfheal_cross_agent_churn_remerge() {
   local rel name
   local self_paths=() cross_dirty=() cross_untracked=() storage_paths=()
   local mergeable_cross=()   # : durable cross-agent paths git can union
+  local mergeable_shared=()  # : blocking SHARED paths git can union
   local _heal_defer=0
   local _backend; _backend="$(_ip_storage_backend)"
   # blocks(): does git say THIS path blocks the merge? An empty blocking set
@@ -1118,6 +1171,38 @@ _selfheal_cross_agent_churn_remerge() {
             log "self-heal: shared file $rel differs from HEAD only by serialization — restoring, not deferring (g-115-5717)"
             cross_dirty+=("$rel")
           else
+            # , remedy (b). A BLOCKING shared file that git can merge
+            # COMMUTATIVELY is an append-only ledger (a cadence-written roster
+            # row), so committing it is provably lossless — the driver unions it
+            # on the way in — and it breaks the wedge at its ROOT instead of
+            # merely relabelling it. Mirrors the  arm one path-class
+            # over, and its "worst case is strictly better" reasoning carries:
+            # a driver that cannot merge exits 1 and git keeps the conflict,
+            # which is self-announcing, where the status quo is a file that can
+            # be neither cleared nor committed and whose T_recovery is INFINITY.
+            #
+            # THE `union` LEG IS NOT REDUNDANT WITH _ip_git_mergeable AND MUST
+            # NOT BE COLLAPSED INTO IT. That helper additionally requires a
+            # driver registered in .git/config — correct for CUSTOM drivers,
+            # wrong for `union`, which is a git BUILT-IN that is never
+            # registered. Measured cc-08 2026-09-12 on the exact file from this
+            # goal's incident: `git check-attr merge -- core/config/
+            # strategic-scan-readings.md` reports `merge: union` while
+            # `git config --get merge.union.driver` is EMPTY, so _ip_git_mergeable
+            # alone returns FALSE and this arm would never fire. Only
+            # ayoai-ledger and ayoai-journal-md are registered on this box.
+            #
+            # DELIBERATELY NARROW (the goal's own remedy-(c) veto): with no
+            # commutative driver the file still defers untouched. Auto-committing
+            # a half-finished shared core/ edit is worse than the wedge, so this
+            # must never widen to shared files generally.
+            local _drv_s
+            _drv_s="$(git -C "$REPO" check-attr merge -- "$rel" 2>/dev/null)"
+            _drv_s="${_drv_s##*: }"
+            if [ "$_drv_s" = union ] || _ip_git_mergeable "$rel"; then
+              log "self-heal: blocking shared file $rel outside agents/* is git-commutative (merge=${_drv_s}) — COMMIT it, the driver reconciles at the merge (g-115-9744)"
+              mergeable_shared+=("$rel"); continue
+            fi
             # Same split as the durable arm: only claim a difference we measured.
             if [ "$_vh" = unavailable ]; then
               log "self-heal: blocking file outside agents/* ($rel) — semantic comparator UNAVAILABLE — deferring BLIND; no content difference was measured (g-115-6637)"
@@ -1183,6 +1268,9 @@ _selfheal_cross_agent_churn_remerge() {
   # paths classified above is what keeps guard-741/836 intact — a partner's
   # stage racing in after classification is still excluded from the commit.
   [ "${#mergeable_cross[@]}" -gt 0 ] && { _heal_stage+=("${mergeable_cross[@]}"); _heal_spec+=("${mergeable_cross[@]}"); }
+  # : same EXACT-file-list rule, same reason — this arm does not own
+  # the shared namespace either, so the commit may never widen to a directory.
+  [ "${#mergeable_shared[@]}" -gt 0 ] && { _heal_stage+=("${mergeable_shared[@]}"); _heal_spec+=("${mergeable_shared[@]}"); }
   if [ "${#_heal_stage[@]}" -gt 0 ]; then
     # Keep the ORIGINAL wording when there is no storage churn: the 
     # regression tests assert on it, and with storage_paths empty the extended
@@ -1199,6 +1287,12 @@ _selfheal_cross_agent_churn_remerge() {
     if [ "${#mergeable_cross[@]}" -gt 0 ]; then
       log "self-heal: + ${#mergeable_cross[@]} git-mergeable durable cross-agent file(s) committed rather than deferred (g-115-6572)"
     fi
+    # A SEPARATE line from the cross-agent one above, not a widened count:
+    # the two causes are different and one sentence naming a single cause
+    # would lie on the other path (guard-4719).
+    if [ "${#mergeable_shared[@]}" -gt 0 ]; then
+      log "self-heal: + ${#mergeable_shared[@]} git-commutative SHARED file(s) outside agents/* committed rather than deferred (g-115-9744)"
+    fi
     if ! git -C "$REPO" add -- "${_heal_stage[@]}" 2>/dev/null; then
       log "self-heal: git add of self-namespace churn failed — defer"
       return 1
@@ -1211,6 +1305,16 @@ _selfheal_cross_agent_churn_remerge() {
     fi
     if [ "${#mergeable_cross[@]}" -gt 0 ]; then
       _heal_msg="chore($self): pre-merge churn + ${#mergeable_cross[@]} git-mergeable cross-agent ledger(s) (iteration-push self-heal, g-115-6572)"
+    fi
+    # Only ever WIDENS when this arm actually contributed, so with
+    # mergeable_shared empty every subject above stays byte-identical and the
+    #  /  substring assertions keep holding (guard-695).
+    if [ "${#mergeable_shared[@]}" -gt 0 ]; then
+      if [ "${#mergeable_cross[@]}" -gt 0 ]; then
+        _heal_msg="chore($self): pre-merge churn + ${#mergeable_cross[@]} git-mergeable cross-agent ledger(s) + ${#mergeable_shared[@]} git-commutative shared ledger(s) (iteration-push self-heal, g-115-6572/g-115-9744)"
+      else
+        _heal_msg="chore($self): pre-merge churn + ${#mergeable_shared[@]} git-commutative shared ledger(s) (iteration-push self-heal, g-115-9744)"
+      fi
     fi
     if ! git -C "$REPO" commit -q -m "$_heal_msg" \
          -- "${_heal_spec[@]}" 2>/dev/null; then

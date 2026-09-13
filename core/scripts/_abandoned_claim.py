@@ -27,8 +27,15 @@ None of the three is wrong. The population simply falls between them, which is
 why this is a separate lane rather than a widened predicate on any of them.
 
 THE PREDICATE IS ONE LINE:
-    claimed_by is set AND status == "in-progress" AND the goal id appears in no
-    agent_status[*].in_flight_bodies[*].goal_id (nor any legacy in_flight.goal_id)
+    claimed_by is set AND status is in SCANNED_STATUSES AND the goal id appears
+    in no agent_status[*].in_flight_bodies[*].goal_id (nor any legacy
+    in_flight.goal_id)
+
+    Read SCANNED_STATUSES below before quoting that line: it is {pending,
+    in-progress}, NOT "in-progress" alone (which is what shipped and which
+    scanned an empty set on every run — see the constant's measurement) and NOT
+    "any non-terminal" (which reports live partners' blocked claims as
+    releasable — measured, and the reason `blocked` is excluded).
 
 BOTH IN-FLIGHT SHAPES ARE REQUIRED, and reading only `in_flight` opens this
 detector completely (g-306-276). `in_flight` is REDUCER-owned —
@@ -73,6 +80,30 @@ DEFAULT_THRESHOLD_MINUTES = 180  # mirrors DEFAULT_REAP_STALE_MINUTES
 TERMINAL_STATUSES = frozenset(
     {"completed", "skipped", "expired", "superseded", "decomposed"}
 )
+
+# THE STATUSES A LIVE CLAIM ACTUALLY SITS AT. This module shipped scanning
+# `status == "in-progress"` ALONE, which is the shape the 2026-09-04 incident
+# wore — and the fleet stopped producing it. Measured 2026-09-12 (zeta, cc-02,
+# uname -r 6.8.0-139-generic): `in-progress` is ZERO across all 3058 records
+# (histogram pending 2657 / blocked 21 / completed 315 / skipped 65), while ten
+# non-terminal goals carried `claimed_by` — six pending, four blocked, held by
+# four different agents. So the lane scanned an empty set on every run of its
+# life and said so honestly (`scanned=0 ... An empty scan is not a clean
+# result`) while nothing acted on the warning. guard-1802 exactly: the audit's
+# predicate was narrower than the creating gate's, because aspirations-claim.sh
+# sets `claimed_by` and LEAVES the status at pending.
+#
+# `blocked` IS DELIBERATELY EXCLUDED, and that exclusion is the load-bearing
+# half — widening to "any non-terminal" was measured first and is DANGEROUS
+# (guard-2499: enumerate what NEWLY fires before shipping a widened predicate).
+# All four blocked+claimed rows that day were held by LIVE partners (foxtrot x3,
+# bravo; every agent's last_active inside six minutes) and all four cleared the
+# 180m threshold, so the naive widening reported them RELEASABLE. A blocked
+# goal's claim is the holder's deliberate state while its blocker is worked —
+# there is no in-flight row because no Body is executing it, which is normal and
+# not abandonment. The blocker/defer lanes own that population; releasing it
+# here would strip a live holder's claim on work they are managing.
+SCANNED_STATUSES = frozenset({"pending", "in-progress"})
 
 
 def _parse_ts(value: Any) -> datetime | None:
@@ -142,19 +173,19 @@ def find_abandoned(
     """
     held = held_goal_ids(team_state)
     scanned = 0
-    claimed_in_progress = 0
+    claimed_open = 0
     rows: list[dict] = []
 
     for goal in goals:
         if not isinstance(goal, dict):
             continue
         scanned += 1
-        if goal.get("status") != "in-progress":
+        if goal.get("status") not in SCANNED_STATUSES:
             continue
         claimed_by = goal.get("claimed_by")
         if not claimed_by:
             continue
-        claimed_in_progress += 1
+        claimed_open += 1
         goal_id = str(goal.get("id") or "")
         if goal_id in held:
             continue  # a live row accounts for it — not abandoned
@@ -196,7 +227,7 @@ def find_abandoned(
     rows.sort(key=lambda r: (r["age_minutes"] is None, -(r["age_minutes"] or 0)))
     return {
         "scanned_goals": scanned,
-        "claimed_in_progress": claimed_in_progress,
+        "claimed_open": claimed_open,
         "in_flight_rows": sum(len(v) for v in held.values()),
         "held_goal_ids": sorted(held),
         "abandoned_count": len(rows),

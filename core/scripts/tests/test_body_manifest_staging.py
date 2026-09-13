@@ -63,6 +63,34 @@ def _build(tmp_path, *, remote_body=True, manifest_body=None, baseline=True,
     return sess, state
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_world(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world for every test in this file.
+
+    Load-bearing, not tidiness (g-115-9750, inherited verbatim from the
+    g-306-420 carrier fixture). The staged triple now resolves through
+    `_paths.WORLD_DIR` via `bm.world_staged_dir`, so without this fixture a
+    producer test would stage into the LIVE `world/` — and on an own-cloud box
+    that is the guard-955 production-key collision class, from a test that
+    looks hermetic because every path it constructs itself is under tmp_path.
+
+    Patching the module ATTRIBUTE works because `world_staged_dir` does its
+    `from _paths import WORLD_DIR` inside the function body; a module-level
+    import there would have frozen the real path at collection time and this
+    fixture would silently do nothing.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
+
+
+def _staged_dir(tmp_path):
+    """Where close_body_on_genuine stages now (): world-rooted."""
+    return tmp_path / "world" / "body-staged-wm" / AGENT
+
+
 @pytest.fixture
 def captured_puts(monkeypatch):
     """Capture every explicit backend push _stage_and_push performs."""
@@ -83,7 +111,7 @@ def captured_puts(monkeypatch):
 def test_remote_body_stages_wm_baseline_and_hash(tmp_path, captured_puts):
     sess, state = _build(tmp_path)
     assert bm.close_body_on_genuine(SID, AGENT, tmp_path) == "marked"
-    staged = state / "pending-body-merges"
+    staged = _staged_dir(tmp_path)
     assert (staged / f"{SID}-wm.yaml").read_text(encoding="utf-8") == "slots: {}\n"
     assert (staged / f"{SID}-wm-baseline.yaml").is_file()
     # Hash sidecar carries the manifest's forked_wm_hash, newline-terminated;
@@ -99,7 +127,7 @@ def test_staged_names_match_what_body_merge_derives(tmp_path, captured_puts):
     """
     sess, state = _build(tmp_path)
     bm.close_body_on_genuine(SID, AGENT, tmp_path)
-    staged = state / "pending-body-merges"
+    staged = _staged_dir(tmp_path)
     hits = sorted(p.name for p in staged.glob("*-wm.yaml"))
     assert hits == [f"{SID}-wm.yaml"]
     assert hits[0][: -len("-wm.yaml")] == SID
@@ -113,7 +141,7 @@ def test_baseline_is_not_mis_consumed_as_a_body_wm(tmp_path, captured_puts):
     """
     sess, state = _build(tmp_path)
     bm.close_body_on_genuine(SID, AGENT, tmp_path)
-    staged = state / "pending-body-merges"
+    staged = _staged_dir(tmp_path)
     assert (staged / f"{SID}-wm-baseline.yaml").is_file()
     assert not any(p.name.endswith("-wm-baseline.yaml")
                    for p in staged.glob("*-wm.yaml"))
@@ -124,7 +152,7 @@ def test_local_body_does_not_stage(tmp_path, captured_puts):
     duplicate work and risk a double-merge."""
     sess, state = _build(tmp_path, remote_body=False)
     assert bm.close_body_on_genuine(SID, AGENT, tmp_path) == "marked"
-    assert not (state / "pending-body-merges").exists()
+    assert not _staged_dir(tmp_path).exists()
     assert captured_puts == []
 
 
@@ -133,7 +161,7 @@ def test_missing_baseline_degrades_to_wm_plus_hash(tmp_path, captured_puts):
     existing 2-way union+SUM fallback still applies."""
     sess, state = _build(tmp_path, baseline=False)
     assert bm.close_body_on_genuine(SID, AGENT, tmp_path) == "marked"
-    staged = state / "pending-body-merges"
+    staged = _staged_dir(tmp_path)
     assert (staged / f"{SID}-wm.yaml").is_file()
     assert (staged / f"{SID}-wm.hash").is_file()
     assert not (staged / f"{SID}-wm-baseline.yaml").exists()
@@ -174,7 +202,7 @@ def test_push_failure_is_visible_and_still_closes(tmp_path, monkeypatch):
     assert bm.read_manifest(SID, AGENT, tmp_path)["body_state"] == "closed-pending-merge"
     assert not (sess / "body-closing").exists()
     # ...and the bytes are on local disk for recovery.
-    assert (state / "pending-body-merges" / f"{SID}-wm.yaml").is_file()
+    assert (_staged_dir(tmp_path) / f"{SID}-wm.yaml").is_file()
 
 
 # -------------------- FIX 2 shared push (cleanup-stale-bindings path)
@@ -213,7 +241,8 @@ def test_push_staged_cli_exits_4_when_transport_down(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "storage_backend", mod)
 
     _build(tmp_path)
-    staged = tmp_path / "agents" / AGENT / "session" / "pending-body-merges"
+    # : the CLI pushes from the WORLD-rooted dir now, so seed there.
+    staged = _staged_dir(tmp_path)
     staged.mkdir(parents=True)
     (staged / f"{SID}-wm.yaml").write_text("slots: {}\n", encoding="utf-8")
     monkeypatch.setattr(bm, "_project_root", lambda: tmp_path)
@@ -269,3 +298,154 @@ def test_sentinel_consumed_on_every_close_branch(tmp_path, captured_puts):
     (sess2 / "body-manifest.yaml").unlink()
     assert bm.close_body_on_genuine(SID, AGENT, tmp_path / "nomanifest") == "no-manifest"
     assert not (sess2 / "body-closing").exists()
+
+
+# ---------------------------------------------------------------- 
+
+def test_staged_destination_is_out_of_the_claim_fence_reach(tmp_path):
+    """The whole point of the move, pinned by the FENCE'S OWN predicate.
+
+    `owncloud_backend` decides whether a write is claim-fenced by resolving the
+    path and asking `relative_to(agents_root())`: success means the write is
+    under some agent's dir and is refused unless this box holds that agent's
+    live runner claim; a `ValueError` means `_agent = None` and the fence is
+    never consulted at all. A worker Body never holds the claim, so "outside
+    `agents_root()`" is precisely the property that makes `push_staged_files`
+    able to succeed from a worker box.
+
+    Asserting a string shape ("the path contains 'world'") would pass just as
+    happily on a path that still sat under the agent tree. Running the real
+    predicate is the only assertion that tracks the real gate.
+
+    The legacy destination is the POSITIVE CONTROL (guard-2298): it must still
+    resolve INSIDE `agents_root()`, or this test would pass for the trivial
+    reason that the predicate never matches anything.
+    """
+    from _paths import agents_root
+    root = Path(agents_root()).resolve()
+
+    world_staged = bm.world_staged_dir(tmp_path / "agents" / AGENT).resolve()
+    with pytest.raises(ValueError):
+        world_staged.relative_to(root)
+
+    # POSITIVE CONTROL — the destination this change moved AWAY from is inside
+    # the fence, so the predicate above genuinely discriminates.
+    legacy = (root / AGENT / "session" / "pending-body-merges").resolve()
+    assert legacy.relative_to(root).parts[0] == AGENT
+
+
+def test_world_staged_dir_keys_on_agent_name_not_path_depth(tmp_path):
+    """Derived from the agent NAME, so a caller passing any agent dir shape
+    lands in the same per-agent bucket. Pins the contract `_consume_staged`
+    relies on when it calls `bm.world_staged_dir(state_dir.parent)` — the
+    reducer and the producer must compute the identical directory or the
+    union scan silently reads an empty one.
+    """
+    a = bm.world_staged_dir(tmp_path / "agents" / AGENT)
+    b = bm.world_staged_dir(Path("/somewhere/else/entirely") / AGENT)
+    assert a.name == b.name == AGENT
+    assert a.parent.name == b.parent.name == "body-staged-wm"
+    # and it honours an explicit world_dir override (the seam the tests use)
+    c = bm.world_staged_dir(tmp_path / "agents" / AGENT, world_dir=tmp_path / "w2")
+    assert c == tmp_path / "w2" / "body-staged-wm" / AGENT
+
+
+# ------------------------------------- : the bash/CLI staging bridge
+
+def _legacy_dir(tmp_path):
+    """Where cleanup-stale-bindings.sh stages, in pure bash (IRREDUCIBLY
+    LOCAL, so it cannot resolve WORLD_DIR and still writes here)."""
+    return tmp_path / "agents" / AGENT / "session" / "pending-body-merges"
+
+
+def _seed_legacy(tmp_path, sid=SID, *, wm=True, baseline=True, hash_=True):
+    d = _legacy_dir(tmp_path)
+    d.mkdir(parents=True, exist_ok=True)
+    if baseline:
+        (d / f"{sid}-wm-baseline.yaml").write_text("slots: {}\n", encoding="utf-8")
+    if hash_:
+        (d / f"{sid}-wm.hash").write_text("deadbeef", encoding="utf-8")
+    if wm:
+        (d / f"{sid}-wm.yaml").write_text("slots: {bash: staged}\n", encoding="utf-8")
+    return d
+
+
+def test_cli_push_staged_transports_what_the_bash_staged(tmp_path, captured_puts,
+                                                         monkeypatch):
+    """THE DEFECT PIN, and the one the pre-existing tests could not catch.
+
+    `test_push_staged_files_pushes_bash_staged_files` hands `push_staged_files`
+    a directory of its own making, so it pins the push IMPLEMENTATION and says
+    nothing about which directory the CLI CHOOSES (guard-1943: pinning the
+    writer says nothing about the wiring). When the CLI's destination moved
+    world-rooted and the bash kept staging in the agent tree, that test stayed
+    green while the crash-preserve path transported ZERO BYTES — and because
+    `push_staged_files` skips absent files and returns True, the bash `||`
+    warning never fired either. Silent success is worse than the loud
+    NoClaimError it replaced.
+
+    This test goes through `main(["push-staged", ...])` with the files seeded
+    where the BASH actually puts them, so the two halves must agree.
+    """
+    _build(tmp_path)
+    _seed_legacy(tmp_path)
+    monkeypatch.setattr(bm, "_project_root", lambda: tmp_path)
+    assert bm.main(["push-staged", "--sid", SID, "--agent", AGENT]) == 0
+    assert sorted(n for n, _ in captured_puts) == sorted([
+        f"{SID}-wm.yaml", f"{SID}-wm-baseline.yaml", f"{SID}-wm.hash"]), \
+        "the CLI pushed a different set than the bash staged"
+    # and the bytes that went out are the bytes the bash wrote
+    sent = dict(captured_puts)
+    assert sent[f"{SID}-wm.yaml"] == b"slots: {bash: staged}\n"
+
+
+def test_relocate_copies_and_never_moves(tmp_path):
+    """COPY, not move: the legacy triple is some Bodies' SOLE SURVIVING TRACE
+    (archive-before-delete.md), and the duplicate is retired later by
+    `_consume_staged`'s shadowed-duplicate branch on the same disposition as
+    the copy actually merged."""
+    _build(tmp_path)
+    legacy = _seed_legacy(tmp_path)
+    state_dir = tmp_path / "agents" / AGENT / "session"
+    copied = bm.relocate_legacy_staging(state_dir, SID)
+    assert sorted(copied) == sorted([
+        f"{SID}-wm.yaml", f"{SID}-wm-baseline.yaml", f"{SID}-wm.hash"])
+    world = _staged_dir(tmp_path)
+    for n in copied:
+        assert (world / n).read_bytes() == (legacy / n).read_bytes()
+        assert (legacy / n).is_file(), "the legacy copy must SURVIVE the relocation"
+
+
+def test_relocate_writes_the_trigger_last(tmp_path):
+    """`_consume_staged` globs '*-wm.yaml', so the WM is the CONSUMER'S
+    TRIGGER. A trigger visible before its sidecars is silently consumed down a
+    degraded path (no baseline -> 2-way double-count; no hash -> the
+    never-diverged no-op is skipped) — no error, no log, wrong number."""
+    _build(tmp_path)
+    _seed_legacy(tmp_path)
+    state_dir = tmp_path / "agents" / AGENT / "session"
+    copied = bm.relocate_legacy_staging(state_dir, SID)
+    assert copied[-1] == f"{SID}-wm.yaml", \
+        f"the -wm.yaml TRIGGER must be written LAST; observed order {copied}"
+
+
+def test_relocate_never_overwrites_the_world_copy(tmp_path):
+    """close_body_on_genuine stages the authoritative copy world-rooted and is
+    the fresher writer; a stale legacy duplicate must not clobber it."""
+    _build(tmp_path)
+    _seed_legacy(tmp_path)
+    world = _staged_dir(tmp_path)
+    world.mkdir(parents=True, exist_ok=True)
+    (world / f"{SID}-wm.yaml").write_text("slots: {genuine: close}\n", encoding="utf-8")
+    state_dir = tmp_path / "agents" / AGENT / "session"
+    copied = bm.relocate_legacy_staging(state_dir, SID)
+    assert f"{SID}-wm.yaml" not in copied
+    assert (world / f"{SID}-wm.yaml").read_text(encoding="utf-8") == \
+        "slots: {genuine: close}\n"
+
+
+def test_relocate_is_a_noop_without_a_legacy_dir(tmp_path):
+    """The common case on a box that never staged under the old code."""
+    _build(tmp_path)
+    state_dir = tmp_path / "agents" / AGENT / "session"
+    assert bm.relocate_legacy_staging(state_dir, SID) == []

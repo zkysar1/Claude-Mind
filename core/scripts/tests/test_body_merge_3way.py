@@ -20,9 +20,33 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
+import pytest
 from pathlib import Path
 
 import yaml
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world for every test in this file.
+
+    Load-bearing, not tidiness (g-115-9750, same reasoning as the g-306-420
+    carrier fixture). `_consume_staged` now resolves the world-rooted staging
+    dir through `_paths.WORLD_DIR`, so without this fixture a test would scan —
+    and a producer test would WRITE into — the LIVE `world/`, which on an
+    own-cloud box is the guard-955 production-key collision class. MEASURED,
+    not hypothetical: the first run of this change (before this fixture
+    existed) left three synthetic files in the live
+    `world/body-staged-wm/test_stage_and_push_writes_tri0/`.
+
+    Patching the module ATTRIBUTE works because `world_staged_dir` does its
+    `from _paths import WORLD_DIR` inside the function body.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
+
 
 CORE_SCRIPTS = Path(__file__).resolve().parent.parent      # core/scripts/
 if str(CORE_SCRIPTS) not in sys.path:

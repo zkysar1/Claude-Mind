@@ -25,6 +25,30 @@ design rather than being retrofitted onto whatever it happens to emit — the or
 `close-review-gate.py` used against its own producer (rb-4452). It is not idle in the
 meantime: every check runs against fields worker closures carry TODAY.
 
+**That bet LOST, and the loss is the lesson — recorded beside the original claim
+rather than replacing it (guard-1710).** The producer landed (g-306-417 wired
+Phase 4a), and it emitted the Q-keys `iteration-close.sh` stamps out of the
+loop-state `phase_progress` dict — `q1_passed`, `q1_5_passed`, `q2_passed`,
+`q3_scope`, `q4_passed` and their note fields. It never emitted a `verdict` key,
+which is the only key `self_verdict_of` read. Shipping first did not constrain
+the producer's design; it simply meant nobody re-read the consumer when the
+producer arrived. Measured 2026-09-11 (alpha, cc-08): `jsonl-field-probe.py
+--field goals.verify_verdict.verdict` reads every record of the store and
+answers `field_present: false`, and the baseline run read
+`{agree: 0, disagree: 0, not_comparable: 52}` — the compensating control above,
+returning "cannot compare" for every closure it exists to check, for as long as
+it has had anything to check.
+
+The paragraph above is why that was invisible: read from here, `not_comparable`
+across the board was INDISTINGUISHABLE from correct, expected state. So the
+ordering pattern carries a second obligation this file did not state — **when the
+producer lands, re-read the consumer against what it actually emits.** The repair
+(g-115-9618) derives the verdict from the gating Q-keys and keeps the explicit
+`verdict` branch for a future writer, so the original design is preserved rather
+than discarded. It also splits Q4 out into a tri-state, because the sampler exits
+0 for both `pass` and `skipped` and the recorded key was a bool: see
+`verify-check-unevaluatable.md` § Q4 Trap 3.
+
 ## Why it sits after Phase 7.6 rather than inside Phase 7.5
 
 Phase 7.5 is where goal data is already gathered, so 7.5 looks like the natural home.

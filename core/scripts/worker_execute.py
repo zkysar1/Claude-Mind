@@ -294,6 +294,8 @@ CANONICAL_LIFECYCLE_STAGES = (
     "compact-restore",
     "stop-hook-gates",
     "close-staging",
+    "user-stop",
+    "park-resume",
     "consolidate-merge",
     "replay",
     "reducer-iteration",
@@ -377,6 +379,31 @@ LIFECYCLE_DISPOSITIONS = {
             "stop obligations to discharge -- it stages its divergent WM for the reducer and "
             "stops. The sentinel is written ONLY on a genuine close (SELECT found no work, or "
             "reducer-liveness wind-down), never at end of a work unit (g-306-70)."),
+    "user-stop": LifecycleDisposition(
+        kind=SCOPED_CALL, target="aspirations-graceful-stop D6.5 / D6.62 / D6.65 / D6.7",
+        mode="the BOX- and SID-scoped half only: session-summary-write --sid, iteration-commit, "
+             "iteration-push with all three rate limits zeroed, owncloud-flush -- then park. "
+             "NEVER D1/D2/D3/D6/D7, which write agent-wide state (agent-state, agent-mode, "
+             "stop-loop, session/stop-requested, running-session-id) the reducer owns and may be "
+             "holding on another machine; NEVER D4, which is consolidate-merge below.",
+        why="A user /stop on a worker box is a real lifecycle stage and was undeclared here, which "
+            "is why its asymmetry surfaced as a measurement rather than at import (g-306-477). The "
+            "split is not 'a worker has no stop obligations' -- it has the SID-scoped ones and had "
+            "been running only two of five. D6.65's stranding case is strictly WORSE on a worker: "
+            "a stopped Body has no later iteration to flush its commits, measured 2026-09-10 on "
+            "cc-09 (SID a30b1a3e) where the stop left agent store churn uncommitted and unpushed "
+            "until a user-invoked /encode-session shipped it."),
+    "park-resume": LifecycleDisposition(
+        kind=WORKER_ONLY, target="body-manifest.py park / resume / park-due / park-expired",
+        why="The reducer has no parked state at all -- it stops or it runs. A worker parks to stay "
+            "RESUMABLE while its reducer or its work supply is gone, and now also at user /stop. "
+            "Parking is deliberately NOT a close and deliberately does NOT stage the Body's WM "
+            "(park_body's docstring): a Body that intends to resume must not be queued for merge, "
+            "or it loses every turn of divergence after the reducer marks it merged. What park "
+            "buys over leaving the Body 'active' is a park clock and an EXPIRY path that runs the "
+            "ordinary genuine close -- so the learning payload gets a terminal staging guarantee "
+            "it otherwise never has, because an 'active' stopped Body that is never restarted "
+            "stages NEVER."),
     "consolidate-merge": LifecycleDisposition(
         kind=REDUCER_ONLY_BY_DESIGN, target="aspirations-consolidate Step -1 (body-merge.py)",
         why="Generalize-down is the definition of the reducer role: one Body merges ALL "

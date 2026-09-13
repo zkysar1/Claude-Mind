@@ -329,15 +329,16 @@ IF opened < len(stale_nodes):
 # "N of M" cannot separate those, and reading 3-of-18 against 2-of-8 as drift
 # would send the next pass re-reading a parser that is right.
 #
-# CURRENT PRIOR — **numerator 3, members fixed; the DENOMINATOR is not part of
-# the prior.** Members are `solver-v0-audits` (distill),
-# `adoption-strategy-patterns` (backfill), `infrastructure-performance`
-# (decompose) — identical by NAME on every box below, with each node's age
-# advancing exactly one day per calendar day, which is the tell that they are the
-# same three nodes rather than a coincidence of counts.
+# CURRENT PRIOR — **numerator 5; the DENOMINATOR is not part of the prior. WHEN
+# THIS PARAGRAPH AND THE OWNER GOAL'S NOTE DISAGREE, THE NOTE WINS** — it tracks
+# the tree, this tracks the skill, so a stale prior sends you to APPEND a
+# duplicate (near-miss 2026-09-11 cc-04: all 5 already in g-115-5462). Grep the
+# stop condition FIRST. Members `env-agnostic-exploration-primitives`,
+# `infrastructure-performance`, `solver-v0-audits`,
+# `v2-directed-steering-ship-log`, `v2-directed-steering-wiring`.
 # Roster (all opened N/N, so the control passed in every row):
 #   ROSTER ROWS 2026-08-11 .. 2026-08-18T01:4x (22 rows, 20,110 B) moved VERBATIM to core/config/strategic-scan-readings.md (hot-path budget g-115-7444) — the roster is WHOLLY in that ledger now, together with the two rows named below. Prose further down cites these rows by date ("zeta's 08-13 buckets", "18 -> 26 in ~24h"); those resolve THERE, one hop. ADD YOUR BOX AS ONE ROSTER ROW IN THE LEDGER, NEVER HERE.
-#   READINGS 2026-08-19T15:2x (3 of 32) AND 2026-08-20T12:4x (**2 of 31**) moved VERBATIM to core/config/strategic-scan-readings.md (hot-path budget g-115-6470) — APPEND ALL FUTURE S2a READINGS THERE, NEVER HERE. Operational prior from the 08-20 reading: THE NUMERATOR FELL 3->2 for the first time in this roster, via a STAMP-BUMP EXIT (adoption-strategy-patterns auto-bumped by tree-front-matter-sync.py Layer A on a metadata-only edit; content_verified null, content still ~104d stale) — a fall is work OR a stamp artifact, indistinguishable in the count; discriminator = the exited member's front matter (last_updated_before_* / content_age_note / null content_verified), one read. Prior is now 2 members (solver-v0-audits 53d distill, infrastructure-performance 40d decompose); a next-pass 2 is NOT a parser regression. Re-verify cohort 8 — fifteenth consecutive day; total 1447, EXPLORE 55.
+#   READINGS 2026-08-19T15:2x (3 of 32) AND 2026-08-20T12:4x (**2 of 31**) moved VERBATIM to core/config/strategic-scan-readings.md (hot-path budget g-115-6470) — APPEND ALL FUTURE S2a READINGS THERE, NEVER HERE. Operational prior from the 08-20 reading: THE NUMERATOR FELL 3->2 for the first time in this roster, via a STAMP-BUMP EXIT (adoption-strategy-patterns auto-bumped by tree-front-matter-sync.py Layer A on a metadata-only edit; content_verified null, content still ~104d stale) — a fall is work OR a stamp artifact, indistinguishable in the count; discriminator = the exited member's front matter (last_updated_before_* / content_age_note / null content_verified), one read. Prior: see CURRENT PRIOR above (numerator 5). Re-verify cohort 8 — fifteenth consecutive day; total 1447, EXPLORE 55.
 # A DENOMINATOR CAN GROW BY A NODE THAT WAS ALREADY PAST THRESHOLD — a FOURTH
 # mechanism, and the paragraph below does not cover it. My histogram is zeta's
 # 08-13 buckets +1 on every bucket PLUS an extra {41:1}. Aging cannot produce
@@ -1409,9 +1410,17 @@ apart shows the ratio falling (0.0035 -> 0.0026) purely as `invocations` grew
 same-box pair had. Live spans here: alpha `08-17T22:23..08-18T06:45`, bravo
 `08-17T16:27..08-18T00:32`, echo (resident) `08-17T23:19..07:22`; seeded: foxtrot
 `08-07T15:20`, zeta `08-07T22:13` — the SAME 08-07 pair echo recorded on 08-17,
-i.e. those two peer slices have not been re-pulled in 11 days. `diary_windows` is
-the field to read next time (4/2/7/12/25 here): a span can look wide while holding
-almost no windows.
+i.e. those two peer slices have not been re-pulled in 11 days. ⛔ **THE BAND IS A
+SPAN ARTIFACT, NOT A COVERAGE GAUGE — read `diary_windows` and in_span/windows
+BEFORE interpreting any ratio** (4/2/7/12/25 here). `classifiable_ceiling` counts by
+diary SPAN (`skill-attribution.py:288`) while classification counts by WINDOW, so a
+sparse-wide diary inflates the ratio with NO classifiable capacity behind it
+(**guard-4566**, which was filed ABOUT this passage on 2026-08-20 and never edited
+it — guard-1984). Measured 2026-09-10T23:3x (bravo, cc-05): ratio **0.0826**, and
+alpha's **27.8d / 2-window** diary alone supplied **69.7%** of the fleet ceiling at
+907 in_span-per-window against a 2.2-38 fleet range. A HIGH reading is span news,
+not coverage news; the in-band/out-of-band test above is void whenever any peer
+span is non-contiguous.
 
 ⛔ **THE RATIO DOES NOT ONLY DECLINE — "trends DOWN as the fleet accumulates
 invocations, regardless of fleet health" is FALSIFIED by a same-box, same-day

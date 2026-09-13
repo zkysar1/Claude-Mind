@@ -41,10 +41,10 @@ name="$1"
 # mind_api/tests/test_runtime_tier_c.py has the same mirrored list and
 # locks against silent drift in the test suite itself.
 case "$name" in
-    loop-active|stop-loop|stop-requested|blocker-cleared|pq-resolved|board-activity|email-received|goal-claim-released)
+    loop-active|stop-loop|stop-requested|blocker-cleared|pq-resolved|board-activity|email-received|goal-claim-released|perception-received)
         ;;
     *)
-        echo "ERROR: Invalid signal name '$name'. Must be one of: blocker-cleared, board-activity, email-received, goal-claim-released, loop-active, pq-resolved, stop-loop, stop-requested" >&2
+        echo "ERROR: Invalid signal name '$name'. Must be one of: blocker-cleared, board-activity, email-received, goal-claim-released, loop-active, perception-received, pq-resolved, stop-loop, stop-requested" >&2
         exit 2;;
 esac
 

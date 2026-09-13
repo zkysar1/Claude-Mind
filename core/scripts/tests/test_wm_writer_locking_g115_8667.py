@@ -39,6 +39,7 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
 import yaml
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -64,6 +65,23 @@ def _load(modname: str, filename: str):
 
 
 merge = _load("body_merge_lock", "body-merge.py")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world ().
+
+    Load-bearing: `generalize_down` resolves the world-rooted staging dir
+    through `_paths.WORLD_DIR`, so without this the test merges every OTHER
+    Body's real staged WM into its tmp reducer and then CONSUMES them. Measured
+    in `test_capture_lane_chain.py`, whose fixture docstring carries the
+    evidence — 10 real triples drained from the live world in one run.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
 contam = _load("wm_contamination_lock", "wm-contamination-check.py")
 
 SID = "55555555-5555-4555-8555-555555555555"

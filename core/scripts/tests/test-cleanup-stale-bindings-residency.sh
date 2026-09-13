@@ -333,6 +333,92 @@ assert_equals "non-resident closed-body orphan SURVIVES" \
 # copy of an existing pin adds no discriminating power.
 
 echo
+# ─── Orphan-carrier reconcile pass ( unit 25) ──────────────────────
+# These pin WHICH carriers the pass hands to close-body-late. The repair itself
+# is pinned by test_abandoned_sessions.py, so a stub records invocations instead
+# of dragging the real closer (and its push path) into the sandbox.
+#
+# guard-1790 / guard-4166: one case must FIRE and four must REFUSE. A pass that
+# repaired everything would satisfy scenario 16 alone, and one that repaired
+# nothing would satisfy 17-20 alone, so neither degenerate version passes.
+
+install_bm_stub() {
+    mkdir -p "$SANDBOX/core/scripts"
+    cat > "$SANDBOX/core/scripts/body-manifest.py" <<'PYSTUB'
+import os, sys
+log = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bm-calls.log")
+with open(os.path.normpath(log), "a", encoding="utf-8") as f:
+    f.write(" ".join(sys.argv[1:]) + "\n")
+PYSTUB
+    rm -f "$SANDBOX/bm-calls.log"
+}
+
+make_carrier() {   # agent sid state touch-date
+    local a="$1" sid="$2" st="$3" age="$4"
+    mkdir -p "$SANDBOX/agents/$a/session"
+    printf '{"sid": "%s", "host": "box-a", "ts": "2026-09-01T00:00:00", "body_state": "%s"}\n' \
+        "$sid" "$st" > "$SANDBOX/agents/$a/session/body-heartbeat-$sid.json"
+    touch -d "$age" "$SANDBOX/agents/$a/session/body-heartbeat-$sid.json"
+}
+
+reconciled() {     # sid -> yes|no
+    grep -q -- "--sid $1" "$SANDBOX/bm-calls.log" 2>/dev/null && echo yes || echo no
+}
+
+echo "Scenario 16: RESIDENT agent, carrier reads active, session dir GONE, carrier old"
+echo "  (the population the dir-iterating sweep can never revisit — must RECONCILE)"
+reset_sandbox
+install_bm_stub
+make_agent localagent resident
+make_carrier localagent sid-orphan-016 active '3 days ago'
+run_sweep
+assert_equals "orphan carrier IS reconciled" "$(reconciled sid-orphan-016)" "yes"
+
+echo "Scenario 17: same carrier, but its SESSION DIR still exists"
+echo "  (a live or parked Body — the other sweep's business, never this pass's)"
+reset_sandbox
+install_bm_stub
+make_agent localagent resident
+make_session_dir localagent sid-live-017
+# A FRESH file keeps signal 1 from admitting the dir, so the sweep above leaves
+# it standing — otherwise that sweep reaps it and calls close-body-late itself,
+# and the stub cannot tell the two callers apart (the first version of this
+# scenario failed for exactly that reason, not because the pass misbehaved).
+touch "$SANDBOX/agents/localagent/sessions/sid-live-017/scratch-fresh"
+make_carrier localagent sid-live-017 active '3 days ago'
+run_sweep
+assert_equals "precondition: the session dir survived the sweep above" \
+    "$(exists "$SANDBOX/agents/localagent/sessions/sid-live-017")" "yes"
+assert_equals "carrier WITH a session dir is left alone" "$(reconciled sid-live-017)" "no"
+
+echo "Scenario 18: orphan carrier written in the last hour"
+echo "  (THE SAFETY GATE: a live Body rewrites its carrier every tick, so a fresh"
+echo "   carrier means something is still running even if its dir went missing)"
+reset_sandbox
+install_bm_stub
+make_agent localagent resident
+make_carrier localagent sid-fresh-018 active 'now'
+run_sweep
+assert_equals "FRESH orphan carrier is refused" "$(reconciled sid-fresh-018)" "no"
+
+echo "Scenario 19: orphan carrier that already reads closed-stale"
+echo "  (idempotence: a reconciled carrier must cost no subprocess on every turn-end)"
+reset_sandbox
+install_bm_stub
+make_agent localagent resident
+make_carrier localagent sid-done-019 closed-stale '3 days ago'
+run_sweep
+assert_equals "already-reconciled carrier spawns nothing" "$(reconciled sid-done-019)" "no"
+
+echo "Scenario 20: NON-RESIDENT agent's orphan carrier"
+echo "  (Signal 0 rules here too — a foreign-sid push is fenced no_claim by design)"
+reset_sandbox
+install_bm_stub
+make_agent foreignagent nonresident
+make_carrier foreignagent sid-foreign-020 active '3 days ago'
+run_sweep
+assert_equals "non-resident orphan carrier is refused" "$(reconciled sid-foreign-020)" "no"
+
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

@@ -240,6 +240,60 @@ def is_worker_closure(goal: dict) -> bool:
     return (goal.get("completed_by_role") or "").strip().lower() == "worker"
 
 
+# The verify contract closes `completed` only when these pass, so they ARE the
+# worker's self-verdict. Derived from what the WRITER emits, never from a key we
+# wish it emitted (guard-4091): iteration-close.sh stamps the loop-state
+# `phase_progress` dict VERBATIM, so a record carries q1_passed / q1_artifact /
+# q1_5_passed / q1_5_checklist / q2_passed / q2_failure_mode_checked / q3_scope /
+# q4_passed and nothing else. Measured 2026-09-11 (alpha, cc-08) over 's
+# 77 worker closures: 50 carry a derivable verdict and ZERO carry a "verdict"
+# key -- and `jsonl-field-probe.py --field goals.verify_verdict.verdict` over
+# the WHOLE store (26 aspirations, every record read) returns
+# field_present:false, so the key this module used to read has never existed.
+#
+# q3_scope is excluded because it is a LABEL (unit|integration), not a gate.
+# q4 is excluded for a sharper reason -- see q4_state_of.
+GATING_Q_KEYS = ("q1_passed", "q1_5_passed", "q2_passed")
+
+_Q4_TRI = ("pass", "fail", "skipped")
+
+
+def q4_state_of(goal: dict) -> str:
+    """pass | fail | skipped | unknown | absent -- a tri-state+, NEVER a bool.
+
+    Q4 (provenance sampling) has THREE outcomes and only ever had a BOOLEAN key
+    to record them in. Its runner exits 0 for both `pass` and `skipped`, and the
+    verify contract says in as many words that those "are not the same answer".
+    So a Body that reads a SKIPPED verdict as non-blocking writes
+    `q4_passed: true` -- and a later reader cannot distinguish that from a
+    genuine pass. Measured 2026-09-11: g-115-8163 closed on this box with Q4
+    returning exit 0 verdict SKIPPED, recorded as a bare boolean; and across
+    asp-115's 77 worker closures this tally reports skipped=0 -- not because no
+    Q4 was ever skipped, but because no record could SAY so.
+
+    Hence `unknown` for a bare boolean true. Reading it as `pass` is the one
+    move that would make wiring this reader WORSE than leaving it blind: it
+    converts silent blindness into confident wrong agreement. A reader must
+    distinguish "could not resolve" from "resolved and found nothing"
+    (guard-1753), and an existence predicate over an ambiguous source must
+    return tri-state rather than collapsing to a bool (guard-2223).
+
+    `q4_verdict` is the unambiguous key writers emit going forward; when it is
+    present it wins outright.
+    """
+    v = goal.get("verify_verdict")
+    if not isinstance(v, dict):
+        return "absent"
+    tri = v.get("q4_verdict")
+    if isinstance(tri, str) and tri.strip().lower() in _Q4_TRI:
+        return tri.strip().lower()
+    if "q4_passed" not in v:
+        return "absent"
+    if v.get("q4_passed") is False:
+        return "fail"
+    return "unknown"
+
+
 def self_verdict_of(goal: dict):
     """The worker's OWN declared verdict, or None when it never recorded one.
 
@@ -249,15 +303,29 @@ def self_verdict_of(goal: dict):
     field is what makes the module's stated job ("records agreement or
     disagreement" on self-grading) literally true rather than aspirational.
 
-    None is the honest answer for every closure written before the field
+    g-115-9618: reading it was not enough. This function asked for a "verdict"
+    key that NO writer has ever emitted, so it returned None for every closure
+    including the ones carrying a full verdict, and agreement_for reported
+    not_comparable across the whole corpus -- an unconsumed detector, which
+    learning-philosophy.md ranks strictly worse than an unconsumed attributor.
+    The fix derives the verdict from the gating Q-keys the writer really writes.
+
+    None is still the honest answer for every closure written before the field
     landed, and it must NEVER be read as agreement (guard-963: an aggregator
     must not report a clean verdict over zero compared items).
     """
     v = goal.get("verify_verdict")
     if not isinstance(v, dict):
         return None
+    # An explicit verdict string still wins, so a future writer that emits one
+    # needs no change here.
     verdict = v.get("verdict")
-    return verdict.strip().lower() if isinstance(verdict, str) and verdict.strip() else None
+    if isinstance(verdict, str) and verdict.strip():
+        return verdict.strip().lower()
+    present = [k for k in GATING_Q_KEYS if k in v]
+    if not present:
+        return None
+    return "completed" if all(v.get(k) is True for k in present) else "incomplete"
 
 
 def agreement_for(goal: dict, fired: list[dict]) -> str:
@@ -267,12 +335,23 @@ def agreement_for(goal: dict, fired: list[dict]) -> str:
     closures and flood the report (guard-3343 -- adding a check to a multi-check
     reporter changes what its summary means). This is a per-row READING, so an
     absent verdict costs nothing and is counted separately.
+
+    A closure whose Q4 EXPLICITLY records `skipped` is not_comparable: the
+    worker's own provenance leg verified nothing, so there is no self-assessment
+    on that axis to agree with. A bare legacy boolean resolves to `unknown` and
+    does NOT block agreement -- it cannot, because 35 of the 44 asp-115 worker
+    closures carrying a q4 key at all carry the bare boolean (2026-09-11), and
+    treating them as blockers would re-zero the very detector this repairs. The
+    ambiguity is reported instead, per-row and in the q4_states tally, so it is
+    countable rather than invisible.
     """
     self_v = self_verdict_of(goal)
     if self_v is None:
         return "not_comparable"
     if self_v == "completed" and any(f["confidence"] == "high" for f in fired):
         return "disagree"
+    if self_v == "completed" and q4_state_of(goal) == "skipped":
+        return "not_comparable"
     return "agree"
 
 
@@ -360,6 +439,9 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
     closures = [g for g in goals if is_worker_closure(g)]
     rows, counts = [], {"AGREE": 0, "DISAGREE": 0, "REVIEW": 0}
     agree_counts = {"agree": 0, "disagree": 0, "not_comparable": 0}
+    # Reported, never gating: `unknown` is the legacy bare-boolean population,
+    # and it must be COUNTABLE rather than silently folded into `pass`.
+    q4_states = {"pass": 0, "fail": 0, "skipped": 0, "unknown": 0, "absent": 0}
     for g in closures:
         take, why = sampled(g, fraction)
         if not take:
@@ -368,6 +450,7 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
         v = verdict_for(fired)
         counts[v] += 1
         agree_counts[agreement_for(g, fired)] += 1
+        q4_states[q4_state_of(g)] += 1
         rows.append({
             "audited_at": now,
             "aspiration": asp_id,
@@ -380,6 +463,7 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
             "sample_reason": why,
             "verdict": v,
             "self_verdict": self_verdict_of(g),
+            "q4_state": q4_state_of(g),
             "agreement": agreement_for(g, fired),
             "checks_fired": fired,
             "reviewer": reviewer,
@@ -392,6 +476,7 @@ def audit(goals: list[dict], fraction: float, asp_id: str, reviewer: str) -> dic
         "fraction": fraction,
         "counts": counts,
         "agreement_counts": agree_counts,
+        "q4_states": q4_states,
         "rows": rows,
     }
 
@@ -443,7 +528,13 @@ def main() -> int:
     print(f"  record-consistency: AGREE={c['AGREE']}  DISAGREE={c['DISAGREE']}  REVIEW={c['REVIEW']}")
     a = result["agreement_counts"]
     print(f"  worker-vs-auditor: agree={a['agree']}  disagree={a['disagree']}  "
-          f"not_comparable={a['not_comparable']} (no verify_verdict recorded)")
+          f"not_comparable={a['not_comparable']} (no self-verdict, or Q4 explicitly skipped)")
+    q = result["q4_states"]
+    print(f"  q4-provenance: pass={q['pass']}  fail={q['fail']}  skipped={q['skipped']}  "
+          f"unknown={q['unknown']}  absent={q['absent']}")
+    if q["unknown"]:
+        print(f"  NOTE: {q['unknown']} closure(s) carry a bare q4_passed boolean, which "
+              "cannot distinguish a PASS from a SKIPPED run — counted `unknown`, never `pass`.")
     if a["agree"] == 0 and a["disagree"] == 0 and a["not_comparable"]:
         print("  NOTE: ZERO closures carried a self-verdict, so NO agreement was "
               "measured — this is not evidence of agreement (guard-963).")

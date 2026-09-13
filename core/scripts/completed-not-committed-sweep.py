@@ -131,6 +131,7 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
+from _split_repo import split_repo_names as _shared_split_repo_names  # noqa: E402  (: one registry parse, shared with gates/uncommitted_work.py)
 from _owner_qualified_signal import (  # noqa: E402  (guard-2107, )
     qualified_signal, signal_candidates)
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
@@ -1352,42 +1353,17 @@ def split_repo_names(world_path=None):
     """Repo names the Split-Repo Registry marks as split. Impure (reads the
     domain convention). g-115-9040.
 
-    The registry table IS the test for whether a repo is split — "named
-    somewhere in the convention" is explicitly NOT the test (g-370-15, which
-    exists because the rule was stated in two places and found in neither). So
-    this parses the one `## Split-Repo Registry` table and nothing else.
-
-    FAILS CLOSED, matching this module's no-flag direction: a missing world
-    path, an unreadable file, an absent section or an unparseable table all
-    return the EMPTY set, which makes resolve_landing_ref fall through to the
-    default branch — i.e. exactly the behaviour before this function existed. A
-    registry we cannot read must never silently widen what counts as landed."""
+    LIFTED to `core/scripts/_split_repo.py` (g-115-9675) so this sweep and
+    `gates/uncommitted_work.py` share ONE registry parse — the same defect lived
+    in both consumers and only this one was fixed. This wrapper stays because it
+    is this module's published name and preserves the `WORLD_DIR` module-global
+    fallback, which the shared helper deliberately does not carry (it has no
+    module-global to read). The fail-closed contract is unchanged and is
+    enforced in the shared module: every unreadable input yields frozenset(),
+    so resolve_landing_ref falls through to the default branch."""
     world = (world_path or os.environ.get("WORLD_PATH")
              or globals().get("WORLD_DIR"))
-    if not world:
-        return frozenset()
-    path = os.path.join(str(world), "conventions", "sdlc-environments.md")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except OSError:
-        return frozenset()
-    names, in_section = set(), False
-    for line in lines:
-        if line.startswith("## "):
-            if in_section:
-                break  # the next heading ends the table
-            in_section = line.startswith("## Split-Repo Registry")
-            continue
-        if not in_section or not line.startswith("|"):
-            continue
-        cols = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cols) < 2 or "YES" not in cols[1].upper():
-            continue
-        name = cols[0].strip().strip("`").strip()
-        if name and not name.startswith("("):  # skip the placeholder row
-            names.add(name)
-    return frozenset(names)
+    return _shared_split_repo_names(world)
 
 
 def resolve_landing_ref(repo, split_names):

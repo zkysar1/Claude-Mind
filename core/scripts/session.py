@@ -13,6 +13,7 @@ Manages:
 """
 
 import argparse
+import datetime
 import os
 import sys
 from pathlib import Path
@@ -37,6 +38,15 @@ VALID_PERSONA = {"true", "false"}
 VALID_SIGNALS = {
     "loop-active", "stop-loop", "stop-requested", "blocker-cleared", "pq-resolved",
     "board-activity", "email-received", "goal-claim-released",
+    # perception-received (): an environment CHANGE envelope reached
+    # /observe on a vessel. BLOCKER class — an environment change unblocks work
+    # even inside an approved quiescence sleep, which is the whole point: a
+    # resident that cannot wake on its world changing is not perceiving it.
+    # Written ONLY by the vessel's /observe on kind:'change' (never a heartbeat)
+    # and never in assistant mode, where no loop sleeps and nothing reads it
+    # (guard-1806). Adding a signal here is a 7-site change, NOT the 3 guard-374
+    # names — see the SIGNAL SYNC SITES block in interruptible-sleep.sh.
+    "perception-received",
 }
 # Runtime session modes — values written to session/agent-mode and read by
 # session-mode-get/set. Strict triad. NOTE: skill-structure-gate.py declares
@@ -231,6 +241,56 @@ def cmd_mode_set(args):
 # Subcommand: signal
 # ---------------------------------------------------------------------------
 
+# Live-stop guard decision (). PURE: no filesystem, no env — so every
+# branch is testable without staging an agent dir. Mirrors the shape the three
+# sibling stop-gates use (`reducer_self_fence.decide`,
+# `loop_exhaustion_fence.decide`): the predicate is script-owned, never
+# LLM-discretionary (guard-399 — changing an instruction's FORM does not change
+# WHO executes it; only moving it into code does).
+CLEAR = "clear"
+REFUSE = "refuse"
+CLEAR_UNDETERMINED = "clear-undetermined"
+
+
+def live_stop_decision(signal_exists, stop_loop_exists, signal_mtime, started_at, force):
+    """Decide whether clearing `stop-requested` is safe.
+
+    REFUSE only when all of: the signal is present, nobody has completed the
+    stop (`stop-loop` absent), the session start is KNOWN, and the signal was
+    raised after that start. Everything else clears — `CLEAR_UNDETERMINED`
+    clears too, but names itself so an un-evaluatable check can never be read
+    as a verdict that the signal was stale (guard-6178 shape).
+    """
+    if force or not signal_exists or stop_loop_exists:
+        return CLEAR
+    if started_at is None:
+        return CLEAR_UNDETERMINED
+    return REFUSE if signal_mtime > started_at else CLEAR
+
+
+def _session_started_at():
+    """Return this session's start time (epoch float) from its binding, or None.
+
+    The binding (`agents/<agent>/sessions/<SID>/binding.yaml`, written by /start)
+    carries a semantic `started_at` — preferred over any file mtime, which drifts
+    when the binding is rewritten (`--retire-legacy`). None means UNDETERMINED,
+    never "old": callers must not read it as an all-clear.
+    """
+    sid = os.environ.get("MIND_SID", "").strip()
+    if not sid or AGENT_DIR is None:
+        return None
+    binding = AGENT_DIR / SESSIONS_DIRNAME / sid / "binding.yaml"
+    try:
+        for line in binding.read_text(encoding="utf-8").splitlines():
+            if not line.startswith("started_at:"):
+                continue
+            raw = line.split(":", 1)[1].strip().strip("'\"")
+            return datetime.datetime.fromisoformat(raw).timestamp()
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def cmd_signal_set(args):
     """Create an empty marker file."""
     require_agent()
@@ -263,6 +323,63 @@ def cmd_signal_clear(args):
     if name not in VALID_SIGNALS:
         print(f"ERROR: Invalid signal name '{name}'. Must be one of: {', '.join(sorted(VALID_SIGNALS))}", file=sys.stderr)
         sys.exit(1)
+
+    # Guard: NEVER destroy a stop-requested that was raised during THIS session
+    # and that nobody has acted on yet ().
+    #
+    # /start Step 2.5 clears stop-requested unconditionally, on the stated
+    # premise that "state is already IDLE, so no loop polling could be
+    # interrupted; clearing is purely hygienic". That premise held while /stop
+    # was the ONLY writer. It is now false: stop-hook-compliance.md authorizes
+    # four programmatic writers, and the newest — the vessel sidecar — raises the
+    # signal from OUTSIDE the session at a moment it chooses (a served run's
+    # duration cap). On a vessel that raise can land while /start is still
+    # onboarding, and this unlink would then delete the run's only ending.
+    #
+    # Measured 2026-09-13 on i-022f74084032d8c56: the sidecar raised at 16:49:25
+    # and /start ran this clear at 16:45:35 — 3m50s apart, so the race did not
+    # fire. It is not hypothetical, and it TIGHTENS as the reserve grows:
+    # turn_deadline = T0 + SOFT_S - RESERVE, so a LARGER consolidation reserve
+    # moves the raise EARLIER, toward this clear. At RESERVE≈590 on that run the
+    # raise would have preceded the clear and the stop would have been erased.
+    #
+    # Two conditions, both required, so the legitimate clears still pass:
+    #   * the signal is NEWER than this session's start -> it was raised now,
+    #     not left behind by a partial /stop in a previous session; and
+    #   * `stop-loop` is ABSENT -> nobody has completed the stop yet.
+    # aspirations-graceful-stop sets stop-loop at D2 and clears this signal at
+    # D3, in that order, so its clear is always permitted. A stale signal from
+    # an earlier session is older than started_at, so /start's hygiene still
+    # works. UNDETERMINED start time fails toward TODAY'S behaviour (clear) but
+    # says so out loud — an un-evaluatable check must never read as an
+    # all-clear (guard-6178 shape).
+    if name == "stop-requested":
+        target = SESSION_DIR / name
+        verdict = live_stop_decision(
+            signal_exists=target.exists(),
+            stop_loop_exists=(SESSION_DIR / "stop-loop").exists(),
+            signal_mtime=(target.stat().st_mtime if target.exists() else None),
+            started_at=_session_started_at(),
+            force=args.force,
+        )
+        if verdict == CLEAR_UNDETERMINED:
+            print(
+                "[session-signal-clear] WARNING: live-stop guard COULD NOT EVALUATE "
+                "(no MIND_SID, or binding.yaml unreadable / carries no started_at) — "
+                "clearing anyway. This is NOT a verdict that the signal is stale.",
+                file=sys.stderr,
+            )
+        elif verdict == REFUSE:
+            print(
+                "REJECTED: stop-requested was raised AFTER this session started and "
+                "stop-loop is not set, so the stop has not been handled yet — clearing "
+                "it would silently discard a live stop (g-373-16). Handle the stop "
+                "(Phase -1.4 / /stop sets stop-loop, then clears), or pass --force to "
+                "override deliberately.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     (SESSION_DIR / name).unlink(missing_ok=True)
 
 
@@ -355,6 +472,10 @@ def build_parser():
 
     sig_clear = signal_sub.add_parser("clear", help="Remove signal marker")
     sig_clear.add_argument("name", help="Signal name: loop-active or stop-loop")
+    sig_clear.add_argument(
+        "--force", action="store_true",
+        help="Clear stop-requested even when it was raised during this session and "
+             "is unhandled (bypasses the live-stop guard; g-373-16).")
 
     sig_exists = signal_sub.add_parser("exists", help="Check if signal exists")
     sig_exists.add_argument("name", help="Signal name: loop-active or stop-loop")

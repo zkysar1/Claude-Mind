@@ -1227,6 +1227,63 @@ fi
 # hold (any doubt -> 1, caller surfaces the original failure). It MUST NOT clear
 # a LIVE lock (a partner's in-progress commit) -- that corrupts the index
 # (guard-853/guard-883). Every branch errs toward NOT clearing.
+# --- Commit-failure classification + refusal signal () -------------
+# ONE source of truth for "is this git-commit failure worth retrying?". The
+# retry loop below and the stale-lock recovery it guards both key on THIS
+# predicate, so the two can never drift apart into disagreeing opinions about
+# what "transient" means.
+#
+# The signature list is deliberately unchanged from what the stale-lock
+# recovery already used () -- that was this script's existing encoded
+# belief about the one transient failure mode a commit hits here; the fix is to
+# stop retrying everything ELSE, not to widen this.
+_commit_failure_is_transient() {
+  printf '%s' "${1:-}" | grep -qi -e "index\.lock" -e "Another git process"
+}
+
+# Persistent, machine-readable record of a DETERMINISTIC commit refusal
+# ( outcome 2). The refusal already printed one stderr line, but that
+# line lands inside iteration-close's long output and scrolls past -- which is
+# precisely how a box stranded 52 commits behind for 1h47m without the cause
+# ever being visible. This file survives to the next iteration so
+# iteration-push's INTEGRATE-DEFER STREAK message can name the real cause and
+# print the staged set (outcome 3).
+_commit_refusal_signal_path=""
+_record_commit_refusal() {
+  local dir sig
+  [[ -n "${MIND_AGENT:-}" ]] || return 0
+  dir="$REPO/agents/$MIND_AGENT/session"
+  [[ -d "$dir" ]] || return 0
+  sig="$dir/commit-refused.json"
+  _commit_refusal_signal_path="$sig"
+  # Values travel by ENV, never interpolated into the heredoc (guard-165): the
+  # refusal output is arbitrary hook text and would otherwise be a quoting hole.
+  # stderr is deliberately NOT silenced (guard-114) -- a signal that failed to
+  # write is exactly the thing an operator must be told about.
+  CR_RC="${1:-}" CR_OUT="${2:-}" CR_REPO="$REPO" CR_SIG="$sig" CR_AGENT="${MIND_AGENT:-}" \
+  CR_STAGED="$(git -C "$REPO" diff --cached --name-only 2>/dev/null | head -40 | tr '\n' '\f' || true)" \
+  CR_TS="$(date +%Y-%m-%dT%H:%M:%S)" \
+  py -3 - <<'CRPYEOF' || true
+import json, os
+staged = [s for s in os.environ.get("CR_STAGED", "").split("\f") if s]
+rec = {
+    "ts": os.environ.get("CR_TS", ""),
+    "source": "iteration-commit",
+    "event": "commit_refused_deterministic",
+    "goal": "g-115-9807",
+    "agent": os.environ.get("CR_AGENT", ""),
+    "repo": os.environ.get("CR_REPO", ""),
+    "rc": os.environ.get("CR_RC", ""),
+    "refusal_output": os.environ.get("CR_OUT", "")[:4000],
+    "staged_paths": staged,
+    "staged_count": len(staged),
+}
+with open(os.environ["CR_SIG"], "w", encoding="utf-8") as fh:
+    json.dump(rec, fh, indent=1)
+    fh.write("\n")
+CRPYEOF
+}
+
 GIT_LOCK_STALE_S="${ITERATION_COMMIT_GIT_LOCK_STALE_S:-30}"
 clear_stale_git_lock_if_dead() {
   local gitdir="$REPO/.git"
@@ -1370,35 +1427,86 @@ fi
 # orphan-IN-staged_files case (indistinguishable from own work, so detect-only).
 # staged_files[] is guaranteed non-empty here (both-empty cases exit 0 at the
 # filter-skip guards ~L882/L992 before reaching this commit).
+# RETRY ONLY A KNOWN-TRANSIENT FAILURE (). A commit-msg or pre-commit
+# HOOK refusal is a deterministic policy decision: the same input refuses
+# identically every time, so spending the retry budget on it is pure cost AND
+# misframes a content-policy refusal as an infrastructure blip. Measured
+# 2026-09-12 (foxtrot, LAPTOP-3IOFCNEO): a hot-path-size-gate refusal burned all
+# three attempts, printed ONE stderr line inside iteration-close's long output,
+# and left the index STAGED -- after which every iteration-push deferred under
+# guard-741 forever. 9 defers over 1h47m, ending 52 commits behind.
+#
+# THE PREDICATE IS INVERTED, and that inversion is what makes it gate-agnostic:
+# retry ONLY on the known-transient signature, and treat every other non-zero rc
+# as deterministic. A NEW commit-msg gate inherits the right handling for free
+# because it simply is not on the transient whitelist -- no gate's message is
+# ever string-matched, which is the goal's outcome 1. It also satisfies
+# guard-3878: the predicate runs ONLY on the failure branch, so it can never
+# match output that the success path also emits.
+#
+# MEASURED rc DISCRIMINATOR (2026-09-12, throwaway repo, this box): a commit-msg
+# hook refusal and a pre-commit hook refusal BOTH exit 1; an index.lock
+# collision exits 128 with "Another git process seems to be running". So rc
+# alone is suggestive but NOT sufficient -- "nothing to commit" is also rc=1 --
+# and the signature match stays the operative test, with rc recorded as evidence
+# in the refusal signal.
+#
+# CONSIDERED AND REJECTED: a third arm for an UNCLASSIFIABLE failure. rb-9071 is
+# a same-shaped discriminator that needed exactly such an arm, so the question is
+# real rather than hypothetical. The safe direction is opposite here: a wrong
+# RETRY burns the budget on a deterministic refusal and re-creates this very
+# defect, while a wrong STOP surfaces a genuine error one attempt early with its
+# full output preserved. Two arms, chosen deliberately -- not by omission.
 MAX_RETRIES=3
 RETRY_BACKOFF_S=1
 commit_attempt=0
 commit_success=0
 commit_last_output=""
+commit_rc=0
+commit_deterministic=0
 while [[ $commit_attempt -lt $MAX_RETRIES ]]; do
   commit_attempt=$((commit_attempt + 1))
-  commit_last_output=$(echo "$commit_msg" | git -C "$REPO" commit -F - -- "${staged_files[@]}" 2>&1) && {
+  commit_rc=0
+  # `$?` captured via `|| commit_rc=$?` is the command substitution's status,
+  # i.e. the LAST command of the pipeline (git commit) -- the value wanted here,
+  # so this is not the guard-1473 trap of reading $? for an EARLIER stage. The
+  # `||` form is also what keeps `set -e` from aborting on a failed attempt.
+  commit_last_output=$(echo "$commit_msg" | git -C "$REPO" commit -F - -- "${staged_files[@]}" 2>&1) || commit_rc=$?
+  if [[ $commit_rc -eq 0 ]]; then
     commit_success=1
     if [[ $commit_attempt -gt 1 ]]; then
       echo "[$SCRIPT_NAME] INFO: commit succeeded on retry $commit_attempt/$MAX_RETRIES" >&2
     fi
     break
-  }
+  fi
+  if ! _commit_failure_is_transient "$commit_last_output"; then
+    commit_deterministic=1
+    break
+  fi
   if [[ $commit_attempt -lt $MAX_RETRIES ]]; then
     # Stale-lock auto-recovery (): an index.lock-collision failure may
     # be a crashed holder's stale lock -- clear it (only if verifiably dead) so
-    # the next retry can proceed. Never clears a live lock (guard-883).
-    if printf '%s' "$commit_last_output" | grep -qi -e "index.lock" -e "Another git process"; then
-      clear_stale_git_lock_if_dead || true
-    fi
+    # the next retry can proceed. Never clears a live lock (guard-883). The
+    # signature test that used to guard this call is now the loop's own retry
+    # predicate above, so reaching here already establishes the lock shape.
+    clear_stale_git_lock_if_dead || true
     echo "[$SCRIPT_NAME] WARN: commit attempt $commit_attempt/$MAX_RETRIES failed (will retry in ${RETRY_BACKOFF_S}s): $commit_last_output" >&2
     sleep "$RETRY_BACKOFF_S"
   fi
 done
 
 if [[ $commit_success -eq 0 ]]; then
-  echo "[$SCRIPT_NAME] ERROR: git commit failed after $MAX_RETRIES attempts in $REPO" >&2
-  echo "[$SCRIPT_NAME] last error: $commit_last_output" >&2
+  if [[ $commit_deterministic -eq 1 ]]; then
+    _record_commit_refusal "$commit_rc" "$commit_last_output"
+    echo "[$SCRIPT_NAME] ERROR: git commit was REFUSED in $REPO (rc=$commit_rc) after 1 attempt — NOT retried (g-115-9807)." >&2
+    echo "[$SCRIPT_NAME] This is a deterministic policy refusal (a commit-msg/pre-commit hook), not an infrastructure fault; retrying can never clear it." >&2
+    echo "[$SCRIPT_NAME] THE INDEX IS LEFT STAGED, so every subsequent iteration-push will DEFER under guard-741 until this is resolved." >&2
+    echo "[$SCRIPT_NAME] refusal output: $commit_last_output" >&2
+    [[ -n "$_commit_refusal_signal_path" ]] && echo "[$SCRIPT_NAME] persistent signal: $_commit_refusal_signal_path" >&2
+  else
+    echo "[$SCRIPT_NAME] ERROR: git commit failed after $commit_attempt/$MAX_RETRIES transient attempts in $REPO" >&2
+    echo "[$SCRIPT_NAME] last error: $commit_last_output" >&2
+  fi
   exit 2
 fi
 

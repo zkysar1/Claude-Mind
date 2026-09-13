@@ -559,9 +559,26 @@ IF yes:
   IF gap exists for this procedure:
     Increment times_encountered, append to encounter_log
   ELSE:
-    Register new gap: id: gap-{next}, status: registered, times_encountered: 1,
-                      procedure_name, estimated_value,
-                      type: <utility|analytical>   # REQUIRED (g-115-3131)
+    Register new gap — WRITE THE WHOLE OBJECT IN ONE CALL. Either form works:
+      Bash: meta-set.sh skill-gaps.yaml "gaps[<len>]" '<full gap JSON object>'
+      Bash: cat <<'EOF' | py -3 core/scripts/meta-yaml.py append skill-gaps.yaml gaps
+      {"id":"gap-{next}","status":"registered","times_encountered":1,
+       "procedure_name":"...","estimated_value":"...","description":"...",
+       "type":"<utility|analytical>","encounter_log":[{...}]}
+      EOF
+    # THE TRAP IS THE LEAF DOTPATH, NOT meta-set.sh (measured 2026-09-11,
+    # g-115-9761). meta-set.sh DOES create a new gap when the index equals the
+    # current length AND the value is the whole object (meta-yaml.py:450-455).
+    # What fails is `gaps[<len>].<field>`: navigate() raises "list index N out
+    # of range" at :122 before the append branch is ever reached. Eight such
+    # leaf calls errored cleanly (nothing partial) on this pass, because the
+    # ELSE branch here described the fields to set without showing a command —
+    # guard-2466's shape exactly, so both working commands are now written out.
+    # NOTE FOR THE NEXT EDITOR: `aspirations-spark` sq-008 (this lane's mirror,
+    # per the header rule) already carried the correct whole-object form at its
+    # lines 367/384. Read the sibling BEFORE diagnosing the tool — the fix was
+    # already written down one file over.
+                      # type: REQUIRED (g-115-3131)
     # `type` gates the forge developmental bar — absent hands that decision to
     # a default instead of you. Per core/config/skill-gaps.yaml gap_types:
     # utility = mechanizes an ALREADY-DERIVED procedure -> CALIBRATE;
