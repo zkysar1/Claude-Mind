@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.71",
+    "previous_version": "2.12.70",
+    "date": "2026-09-13",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "seed publishability: domain-leak-exempt marker on the felt-sense readings ledger + core/agents path-resolution cruft removed (g-373-16)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.70",
+    "previous_version": "2.12.69",
+    "date": "2026-09-13",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "PreToolUse[Bash] surfaces a pending stop so a vessel run ends as the mind's own /stop (g-373-16)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.69",
     "previous_version": "2.12.68",
     "date": "2026-09-10",

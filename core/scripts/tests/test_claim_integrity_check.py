@@ -303,3 +303,99 @@ def test_result_publishes_in_progress_so_the_verdict_is_re_derivable():
                            res["findings"],
                            in_progress=res["in_progress"],
                            scanned=res["scanned_non_terminal"]) == res["verdict"]
+
+
+# --- claim-clock skew () -------------------------------------------
+# The SECOND defect class. Its whole point is that the pre-existing census
+# reported verdict=clean over a store carrying three live instances, so these
+# tests must prove the detector FIRES (not merely that it stays quiet) and that
+# it can still say zero on a healthy claim -- a check that cannot go red is not
+# evidence (rb-5828), and one that can never go green is not an invariant.
+
+def _scan_stats(tmp_path, goals):
+    """Like _scan but threads the `stats` bag the clock census rides in."""
+    import datetime as dt
+    presence, findings, stats = {}, [], {}
+    cic._scan_store(_write_store(tmp_path, goals), "world",
+                    dt.datetime.now(), presence, findings, stats)
+    return stats.get("clock_violations", [])
+
+
+def _claim(goal_id, last_modified, claimed_at, **over):
+    g = {"id": goal_id, "status": "pending", "claimed_by": "alpha",
+         "claimed_by_sid": "sid-1", "claimed_at": claimed_at,
+         "last_modified": last_modified}
+    g.update(over)
+    return g
+
+
+def test_claim_clock_skew_fires_when_last_modified_predates_claimed_at(tmp_path):
+    viol = _scan_stats(tmp_path, [
+        _claim("g-1", "2026-09-13T05:43:57", "2026-09-13T07:33:13")])
+    assert len(viol) == 1
+    assert viol[0]["goal_id"] == "g-1"
+    assert viol[0]["last_modified"] < viol[0]["claimed_at"]
+
+
+def test_claim_clock_skew_positive_control_a_healthy_claim_is_not_flagged(tmp_path):
+    """NON-VACUITY (guard-2166). Measured on the live store the day this
+    landed: 9 live claims, 3 skewed and 6 HOLDING -- so a holding claim is the
+    common case and must not be reported, or the check is a constant."""
+    viol = _scan_stats(tmp_path, [
+        _claim("g-ok", "2026-09-13T07:40:00", "2026-09-13T07:33:13")])
+    assert viol == []
+
+
+def test_claim_clock_skew_skips_a_record_missing_either_stamp(tmp_path):
+    """An absent stamp is not evidence of skew -- it is no reading at all."""
+    no_lm = _claim("g-nolm", None, "2026-09-13T07:33:13")
+    del no_lm["last_modified"]
+    no_cat = _claim("g-nocat", "2026-09-13T05:00:00", None)
+    del no_cat["claimed_at"]
+    assert _scan_stats(tmp_path, [no_lm, no_cat]) == []
+
+
+def test_claim_clock_skew_only_considers_claims_carrying_a_VALUE(tmp_path):
+    """A present-null claimed_by is the OTHER defect class (reconcile damage).
+    Counting it here too would double-report one record under two headings."""
+    g = _claim("g-null", "2026-09-13T05:00:00", "2026-09-13T07:00:00")
+    g["claimed_by"] = None
+    assert _scan_stats(tmp_path, [g]) == []
+
+
+def test_unmigrated_five_arg_caller_collects_no_clock_census(tmp_path):
+    """Fail-safe parity with the in-progress census: a caller that passes no
+    `stats` simply does not collect the signal, and must not crash."""
+    import datetime as dt
+    presence, findings = {}, []
+    cic._scan_store(_write_store(tmp_path, [
+        _claim("g-1", "2026-09-13T05:00:00", "2026-09-13T07:00:00")]),
+        "world", dt.datetime.now(), presence, findings)
+    assert presence.get("value") == 1
+
+
+def test_clock_skew_does_not_add_a_verdict_value(tmp_path):
+    """PINS THE DESIGN DECISION, deliberately. The skew is reported BESIDE the
+    verdict, never as a new one, because the consumer branches on a closed set
+    and an unknown verdict would yield NO flag -- detected and then silent,
+    which is the exact class this detector was added to remove. If someone
+    later returns a new verdict here, this fails and they must update
+    precheck-eval.cmd_claim_integrity in the same change."""
+    assert cic.verdict_for(1, [], in_progress=0, scanned=10) == "clean"
+    assert set(("BLIND", "no-live-claims", "damaged", "clean")) >= {
+        cic.verdict_for(0, [], in_progress=1, scanned=10),
+        cic.verdict_for(0, [], in_progress=0, scanned=10),
+        cic.verdict_for(1, [{"reconcile_damage": True}], in_progress=0, scanned=10),
+        cic.verdict_for(1, [], in_progress=0, scanned=10),
+    }
+
+
+def test_consumer_APPENDS_the_clock_flag_rather_than_assigning_it():
+    """SHAPE PIN (honest about being one): asserts the source composes flags
+    instead of racing them. A store can be BLIND *and* skewed, and an `elif`
+    or a bare `flags = [...]` would hide whichever lost. Not a behavioural
+    test -- cmd_claim_integrity scans the real stores -- but it pins the one
+    line most likely to be 'tidied' back into an assignment."""
+    src = (_SCRIPTS / "precheck-eval.py").read_text(encoding="utf-8")
+    assert 'flags.append("claim_clock_skew")' in src
+    assert 'flags = ["claim_clock_skew"]' not in src

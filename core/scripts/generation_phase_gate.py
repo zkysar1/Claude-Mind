@@ -9,9 +9,11 @@ fails when it does).
   1. PHASE  -- is this candidate's work category valid for the domain's
                CURRENT declared phase? Work built for a phase that has already
                passed is waste, not supply.
-  2. DEMAND -- is unconsumed actionable demand sitting on the board? Consuming
-               demand outranks inventing supply, so generation defers while
-               real requests go unanswered.
+  2. DEMAND -- is unconsumed actionable demand ADDRESSED TO THE CALLER sitting
+               on the board? Consuming demand outranks inventing supply, so
+               generation defers while requests routed to this agent go
+               unanswered (addressed = requires_action_by tag / reply to the
+               caller's post / caller ADDRESSED in the first line -- g-115-9721).
 
 Both are FAIL-OPEN. A world that declares no calendar gets no gate at all: the
 `domain-calendar` hook slot is opt-in (Pattern B, `domain-hooks.md`) and its
@@ -250,19 +252,105 @@ def _author_agent(author: str) -> str:
     return (author or "").split("@", 1)[0].strip().lower()
 
 
+def _tag_addressee(tag) -> str:
+    """Agent a routing tag addresses. `requires_action_by:<agent>[@<env>]` ->
+    `<agent>` (the ONLY recognised routing prefix -- guard-3884; board.py's own
+    WARN names it), a bare `<agent>` tag -> itself (board.py: "a bare '<who>'
+    also routes"). Anything else -> '' (a `target:`/`g-NNN`/free-form tag is
+    never an address)."""
+    t = str(tag or "").strip().lower()
+    if not t:
+        return ""
+    if t.startswith("requires_action_by:"):
+        return _author_agent(t.split(":", 1)[1])
+    if ":" in t or "@" in t or " " in t:
+        return ""
+    return t
+
+
+_ID_TOKEN_RE = re.compile(
+    r"msg-\d{8}-\d{6}-[a-z0-9]+-\d+"      # a board message id CARRIES its author's name
+    r"|g-\d{1,4}-\d{1,4}|asp-\d{1,4}"      # goal / aspiration ids
+    r"|[a-z0-9_.\-]+@[a-z0-9\-]+"           # an `<agent>@<env>` author token is a reference, not an address
+)
+
+
+def _first_line_addresses(text, me: str) -> bool:
+    """True when the post's FIRST line ADDRESSES `me`: a vocative at the head of
+    the line (`bravo -- ...`, `bravo: ...`, `URGENT, bravo -- you ...`, `@bravo`)
+    or an explicit routing phrase (`addressed to bravo`, `routed to bravo`,
+    `-> bravo`). A bare MENTION is not an address: measured on the 2026-09-11
+    export, 2 of 3 first-line mentions of one agent were a message id that
+    contained its name and a line that named it to EXCLUDE it ("NOT alpha and
+    NOT bravo"). Later lines never count -- a body that DISCUSSES an agent is
+    not addressed to it."""
+    if not me:
+        return False
+    first = _ID_TOKEN_RE.sub(" ", str(text or "").split("\n", 1)[0].lower())
+    name = re.escape(me)
+    vocative = re.search(
+        r"^\W*(?:[a-z0-9 '\-]{0,40}?[,;:\u2014\u2013]\s*)?@?" + name
+        + r"\s*(?:[:,\u2014\u2013]|-{1,2}|\s(?:you|your|please)\b)",
+        first,
+    )
+    routed = re.search(
+        r"(?:addressed to|routed to|handing to|->|\u2192|@)\s*" + name + r"(?![a-z0-9_])",
+        first,
+    )
+    return bool(vocative or routed)
+
+
+def addressed_reason(post: dict, me: str, my_post_ids: "set[str]") -> "str | None":
+    """Why `post` is addressed to `me` -- 'requires_action_by', 'bare-agent-tag',
+    'reply-to-mine' or 'first-line-address' -- or None when it is not."""
+    if not me:
+        return None
+    for t in post.get("tags") or []:
+        if _tag_addressee(t) == me:
+            return ("requires_action_by"
+                    if str(t).strip().lower().startswith("requires_action_by:")
+                    else "bare-agent-tag")
+    if post.get("reply_to") and str(post.get("reply_to")) in my_post_ids:
+        return "reply-to-mine"
+    if _first_line_addresses(post.get("text"), me):
+        return "first-line-address"
+    return None
+
+
 def demand_check(posts, author: str, calendar: "dict | None" = None) -> dict:
-    """Defer generation while unconsumed actionable demand sits on the board.
+    """Defer generation while unconsumed actionable demand ADDRESSED TO THIS
+    AGENT sits on the board.
 
-    A post counts as unconsumed demand when its `type` is in the actionable
-    set, it was not written by this agent, and this agent has posted no reply
-    to it. Every predicate keys on a field that EXISTS on live posts
-    (`type`, `author`, `reply_to`, `id` -- all 12,147/12,147) rather than on
-    the absent `severity` (guard-159).
+    A post counts as this agent's unconsumed demand when ALL hold: its `type`
+    is in the actionable set; it was not written by this agent; it is
+    ADDRESSED to this agent -- a `requires_action_by:<me>` tag (the only
+    routing prefix, guard-3884) or a bare `<me>` tag, OR a reply to a post
+    this agent authored, OR the FIRST line of the text ADDRESSES this agent by
+    name (vocative / "addressed to", not a bare mention);
+    and this agent has posted no reply to it. Every predicate keys on a field
+    that EXISTS on live posts (`type`, `author`, `reply_to`, `id`, `tags`,
+    `text`) rather than on the absent `severity` (guard-159).
 
-    LIMITATION, stated rather than hidden: consumption is judged only from the
-    posts the CALLER passed in. A reply that falls outside the caller's window
-    is invisible here, so a long-answered post can read unconsumed. If a defer
-    looks wrong, widen the `--since` window before treating it as a finding.
+    WHY ADDRESSED, NOT ANY (g-115-9721, measured 2026-09-11): the previous
+    predicate counted every actionable post by anyone as demand for everyone.
+    At ~102 actionable posts per 7 days (88 unconsumed in one 168h window, 3 of
+    them carrying requires_action_by:bravo) it deferred for EVERY agent on
+    EVERY firing, so the recurring generation goal was structurally dead while
+    the boosted product lanes sat empty -- a gate whose answer is always defer
+    has retired the skill it guards (guard-1922 class). Fleet-wide directives
+    that carry no routing tag are consumed by the aspirations-select
+    directive-honor path, not by replies, and deliberately do NOT count here.
+    The pre-narrowing count is still reported as `actionable_total`, with the
+    per-reason `addressed_reasons`, so a skip or a defer stays auditable.
+
+    LIMITATION, stated rather than hidden: consumption AND authorship are
+    judged only from the posts the CALLER passed in. A reply (or the post a
+    reply answers) that falls outside the caller's window is invisible here,
+    so a long-answered post can read unconsumed and a reply to an older post
+    of mine can read unaddressed. If a defer looks wrong, widen the `--since`
+    window before treating it as a finding. With NO caller identity the gate
+    cannot attribute demand and FAILS OPEN (allow), like the rest of this
+    module -- the reason names it.
     """
     cfg = (calendar or {}).get("demand") or {}
     actionable = _norm(cfg.get("actionable_types")) or set(DEFAULT_ACTIONABLE_TYPES)
@@ -272,21 +360,24 @@ def demand_check(posts, author: str, calendar: "dict | None" = None) -> dict:
         max_unconsumed = DEFAULT_MAX_UNCONSUMED
     me = _author_agent(author)
 
-    replied_to = {
-        str(p.get("reply_to"))
-        for p in posts
-        if isinstance(p, dict)
-        and p.get("reply_to")
-        and (not me or _author_agent(str(p.get("author", ""))) == me)
-    }
+    dict_posts = [p for p in posts if isinstance(p, dict)]
+    mine = [p for p in dict_posts if me and _author_agent(str(p.get("author", ""))) == me]
+    my_post_ids = {str(p.get("id")) for p in mine}
+    replied_to = {str(p.get("reply_to")) for p in mine if p.get("reply_to")}
+
+    actionable_total = 0
+    reasons: "dict[str, int]" = {}
     outstanding = []
-    for p in posts:
-        if not isinstance(p, dict):
-            continue
+    for p in dict_posts:
         if str(p.get("type", "")).strip().lower() not in actionable:
             continue
         if me and _author_agent(str(p.get("author", ""))) == me:
             continue
+        actionable_total += 1
+        why = addressed_reason(p, me, my_post_ids)
+        if why is None:
+            continue
+        reasons[why] = reasons.get(why, 0) + 1
         if str(p.get("id")) in replied_to:
             continue
         outstanding.append(
@@ -295,26 +386,39 @@ def demand_check(posts, author: str, calendar: "dict | None" = None) -> dict:
                 "type": p.get("type"),
                 "author": p.get("author"),
                 "timestamp": p.get("timestamp"),
+                "addressed_by": why,
                 "text": (str(p.get("text", "")) or "")[:160],
             }
         )
-    decision = "defer" if len(outstanding) > max_unconsumed else "allow"
+    if not me:
+        decision = "allow"
+        reason = (
+            "no caller identity (--author / MIND_AGENT empty) -- demand cannot be "
+            f"attributed to anyone; fail-open ({actionable_total} actionable post(s) seen)"
+        )
+    else:
+        decision = "defer" if len(outstanding) > max_unconsumed else "allow"
+        reason = (
+            f"{len(outstanding)} unconsumed actionable post(s) ADDRESSED to {me} > max_unconsumed"
+            f"={max_unconsumed} (of {actionable_total} actionable by others); consume demand before inventing supply"
+            if decision == "defer"
+            else f"{len(outstanding)} unconsumed actionable post(s) addressed to {me} <= max_unconsumed={max_unconsumed}"
+            f" ({actionable_total} actionable by others, {sum(reasons.values())} addressed)"
+        )
     return {
         "gate": "generation-phase-gate",
         "check": "demand",
         "decision": decision,
-        "reason": (
-            f"{len(outstanding)} unconsumed actionable post(s) > max_unconsumed"
-            f"={max_unconsumed}; consume demand before inventing supply"
-            if decision == "defer"
-            else f"{len(outstanding)} unconsumed actionable post(s) <= max_unconsumed={max_unconsumed}"
-        ),
+        "reason": reason,
+        "caller": me,
         "unconsumed_count": len(outstanding),
+        "addressed_count": sum(reasons.values()),
+        "addressed_reasons": reasons,
+        "actionable_total": actionable_total,
         "max_unconsumed": max_unconsumed,
         "actionable_types": sorted(actionable),
         "outstanding": outstanding[:20],
     }
-
 
 def _read_posts(path: "str | None"):
     """Read board-read.sh --json output (JSONL, one post per line)."""

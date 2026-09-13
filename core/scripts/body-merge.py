@@ -122,6 +122,10 @@ _STAGED_HASH_SUFFIX = "-wm.hash"  # : forked_wm_hash sidecar staged with an orph
 # never be mistaken for a staged WM. Mirrored by hand in cleanup-stale-bindings.sh
 # (the producer) — the same bash/python boundary _STAGED_HASH_SUFFIX carries.
 _STAGED_BASELINE_SUFFIX = "-wm-baseline.yaml"
+#  outcome 3: the CONSUMED TOMBSTONE this module WRITES and
+# body-manifest.unit_already_consumed READS. Mirrors the suffix constant there
+# (the same hand-mirroring the three above already carry across this boundary).
+_STAGED_CONSUMED_SUFFIX = "-wm.consumed"
 # The fork-time WM snapshot (the 3-way-delta common ancestor) filename is owned
 # by body-manifest.py (the fork writer); read here as bm._BASELINE_FILENAME.
 
@@ -179,13 +183,19 @@ def _dedup_append(reducer_list: list, body_list: list, extra_seen=None) -> list:
     return out
 
 
-def _merge_value(key: str, r_val, b_val, base_val=None):
+def _merge_value(key: str, r_val, b_val, base_val=None, extra_seen=None):
     """Merge one reducer value with the corresponding body value per policy.
 
     `base_val` is the fork-time BASELINE value (the common ancestor) when a
     `forked-wm-baseline` is available — it enables a true 3-way delta on numeric
     counters. `None` (no baseline content) falls back to the 2-way policy, so
     callers without a baseline behave exactly as before (backward-compatible).
+
+    `extra_seen` is threaded to `_dedup_append` for the ARRAY branch only, and
+    only `merge_wm`'s per-slot loop passes it (for `wm.CAPTURE_SLOTS`). Default
+    `None` keeps every other caller — notably `_merge_dict`'s recursion — on the
+    previous behaviour byte-for-byte, which is the opt-in property `_dedup_append`
+    documents and guard-2485 requires of a shared helper.
     """
     # Absence rules first: a side that has nothing contributes nothing.
     if r_val is None:
@@ -198,7 +208,7 @@ def _merge_value(key: str, r_val, b_val, base_val=None):
     # Arrays: append + content-hash dedup. The union policy is baseline-immune —
     # dedup already drops body copies of baseline-shared items, so 2-way == 3-way.
     if isinstance(r_val, list) and isinstance(b_val, list):
-        return _dedup_append(r_val, b_val)
+        return _dedup_append(r_val, b_val, extra_seen=extra_seen)
     # Bools are NOT counters — never SUM them (True+True == 2). Reducer-wins.
     if isinstance(r_val, bool) or isinstance(b_val, bool):
         return r_val
@@ -265,11 +275,48 @@ def merge_wm(reducer: dict, body: dict, baseline: dict | None = None) -> dict:
     r_slots = reducer.get("slots") or {}
     b_slots = body.get("slots") or {}
     m_slots = dict(r_slots)
+
+    # CONSUMED-WATERMARK (, wired into THIS path by ). The
+    # watermark was wired into capture_fast_lane.py only; generalize-down —
+    # the path aspirations-spark names as how a worker's captures reach the
+    # reducer — referenced it ZERO times, so a consumed-and-cleared capture slot
+    # had an EMPTY dedup basis and every source Body re-offered its full set.
+    # Measured 2026-09-08: spark_capture held 399 live entries against 2000
+    # recorded consumed hashes.
+    #
+    # The slot name is spelled here rather than imported because the dependency
+    # runs the OTHER way: capture_fast_lane.py imports this module as `bmg`, so
+    # importing it back would be circular. Its twin literal is
+    # capture_fast_lane.py:108 (`CONSUMED_HASHES_SLOT`); the two must agree, and
+    # test_body_merge_consumed_watermark.py pins that agreement rather than
+    # trusting the comment.
+    _consumed = r_slots.get("capture_consumed_hashes")
+    if not isinstance(_consumed, dict):
+        _consumed = {}
+
+    def _watermark_for(slot_name):
+        """Consumed hashes for a CAPTURE slot, else None (the opt-in default)."""
+        if slot_name not in wm.CAPTURE_SLOTS:
+            return None
+        prior = _consumed.get(slot_name)
+        return prior if isinstance(prior, list) else None
+
     for sk, b_val in b_slots.items():
         if sk in r_slots:
-            m_slots[sk] = _merge_value(sk, r_slots[sk], b_val, base_slots.get(sk))
+            m_slots[sk] = _merge_value(sk, r_slots[sk], b_val, base_slots.get(sk),
+                                       extra_seen=_watermark_for(sk))
         else:
-            m_slots[sk] = b_val
+            # ABSENT-KEY BRANCH, and it is a SECOND re-delivery path, not a
+            # harmless default: assigning b_val wholesale applies no dedup at
+            # all. A slot cleared to `[]` reaches the branch above and is
+            # filtered; a slot whose KEY was removed lands here unfiltered, so
+            # the watermark must be applied against an empty reducer list too or
+            # the fix holds for one clear-shape and silently misses the other.
+            _extra = _watermark_for(sk)
+            if _extra and isinstance(b_val, list):
+                m_slots[sk] = _dedup_append([], b_val, extra_seen=_extra)
+            else:
+                m_slots[sk] = b_val
     merged["slots"] = m_slots
 
     # Enforce array_limits on the MERGED slots (). Cap enforcement used
@@ -520,6 +567,52 @@ def _read_staged_yaml(backend, path: Path):
         return None
 
 
+def _mark_consumed(backend, world_staged: Path, unit_key: str) -> None:
+    """Record `unit_key` as CONSUMED so the ORIGIN box never re-stages it.
+
+    g-115-9750 outcome 3. `_delete_staged` removes the store object and a local
+    file, but that unlink lands on the REDUCER's filesystem — the origin box's
+    legacy copy survives, so its next `push-staged` would relocate and re-push
+    the same triple and this reducer would merge the same divergence twice.
+
+    IT GATES THE PRODUCER, NEVER THE CONSUMER, and that asymmetry is what makes
+    it safe to write EARLY (at the disposition decision, before the deferred
+    delete). A tombstone whose triple still exists is re-globbed and re-merged
+    normally by the next drain, so a crash between this write and the delete
+    costs nothing. Writing it AFTER the delete would leave the real gap: triple
+    gone, no tombstone, origin free to resurrect it.
+
+    Best-effort and silent on failure: no tombstone simply restores the previous
+    behaviour, which is the status quo this guard improves on — never a reason
+    to abort a drain that has already merged real content.
+    """
+    # Local imports: this module keeps its import surface small for the hot
+    # read paths, and this helper runs only on a rare disposition.
+    import datetime
+    import socket
+    marker = world_staged / f"{unit_key}{_STAGED_CONSUMED_SUFFIX}"
+    try:
+        host = socket.gethostname()
+    except Exception:  # noqa: BLE001 — provenance is nice-to-have, never fatal
+        host = "unknown"
+    payload = json.dumps({
+        "unit_key": unit_key,
+        "consumed_at": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "consumed_by": host,
+    }).encode("utf-8") + b"\n"
+    try:
+        world_staged.mkdir(parents=True, exist_ok=True)
+        marker.write_bytes(payload)
+    except OSError:
+        pass
+    if backend is None:
+        return
+    try:
+        backend.write_bytes(marker, payload)
+    except Exception:  # noqa: BLE001 — the local marker still helps same-box
+        pass
+
+
 def _delete_staged(backend, *paths: Path) -> None:
     """Consume staged files exactly once: local unlink + authoritative delete.
 
@@ -613,40 +706,77 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
     In single-runner no Body forks -> the staging dir is absent locally and
     empty in the store -> no-op (dormant).
     """
-    staged_dir = state_dir / _STAGED_DIRNAME
+    # : TWO destinations are scanned, and the union IS the migration.
+    # WORLD is where the producer writes now (claim-EXEMPT, so a worker's push
+    # actually lands); LEGACY is the claim-fenced agent-tree path every
+    # pre- box wrote to, which still holds real unmerged payload
+    # (measured first-person: cc-09 13 files / 26,975,224 B / 4 Bodies, cc-08
+    # 21 / 14,336,845 / 6, cc-10 10 / 1,230,605 / 3). Scanning both means no box
+    # migrates in lockstep and nothing already staged is stranded.
+    legacy_staged_dir = state_dir / _STAGED_DIRNAME
+    world_staged = bm.world_staged_dir(state_dir.parent)
     backend = _get_backend()
-    staged_names: set = set()
-    if staged_dir.is_dir():
-        staged_names.update(p.name for p in staged_dir.glob("*-wm.yaml"))
-    if backend is not None:
-        # UNION with the authoritative listing, never replace: a local-only
-        # staging (cleanup-stale-bindings on THIS box, never pushed) must
-        # still drain when the store errors or lags. `.resolve()` is
-        # load-bearing — a relative path makes _s3_key raise inside the
-        # backend and the listing silently degrades (the _fleet_diary.py
-        # lesson). The baseline sidecar ends "-wm-baseline.yaml", which does
-        # NOT match endswith("-wm.yaml") — same disjointness the local glob
-        # relies on (see _STAGED_BASELINE_SUFFIX comment above).
-        try:
-            staged_names.update(
-                n for n in backend.list_dir(staged_dir.resolve())
-                if n.endswith("-wm.yaml"))
-        except Exception:  # noqa: BLE001 — store listing is additive, never fatal
-            pass
+
+    def _staged_names_in(d: Path) -> set:
+        """Local glob UNION the authoritative listing, never replace: a
+        local-only staging (cleanup-stale-bindings on THIS box, never pushed)
+        must still drain when the store errors or lags. `.resolve()` is
+        load-bearing — a relative path makes _s3_key raise inside the backend
+        and the listing silently degrades (the _fleet_diary.py lesson). The
+        baseline sidecar ends "-wm-baseline.yaml", which does NOT match
+        endswith("-wm.yaml") — same disjointness the local glob relies on (see
+        _STAGED_BASELINE_SUFFIX comment above).
+        """
+        found: set = set()
+        if d.is_dir():
+            found.update(p.name for p in d.glob("*-wm.yaml"))
+        if backend is not None:
+            try:
+                found.update(
+                    n for n in backend.list_dir(d.resolve())
+                    if n.endswith("-wm.yaml"))
+            except Exception:  # noqa: BLE001 — store listing is additive, never fatal
+                pass
+        return found
+
+    world_names = _staged_names_in(world_staged)
+    legacy_names = _staged_names_in(legacy_staged_dir)
+    staged_names: set = world_names | legacy_names
     if not staged_names:
         return
     pending_merges: list = []  # (body_wm, baseline_wm) -- applied under the lock
     merged_files: list = []  # authoritative deletes deferred past the WM write
     for name in sorted(staged_names):
+        # A unitKey in BOTH means this box staged it under the old code and
+        # again under the new. Prefer WORLD (written later, and the only copy a
+        # worker's push can have delivered); the legacy triple is SHADOWED and
+        # is deleted only on the SAME disposition as the copy that was actually
+        # read — never as a standalone delete, which is what
+        # archive-before-delete.md forbids here: cc-08 established the staged
+        # triple is some Bodies' SOLE SURVIVING TRACE (none of its six staged
+        # SIDs still has a session dir).
+        in_world = name in world_names
+        staged_dir = world_staged if in_world else legacy_staged_dir
         staged_path = staged_dir / name
         unit_key = name[: -len("-wm.yaml")]
         summary["scanned"] += 1
         hash_path = staged_dir / f"{unit_key}{_STAGED_HASH_SUFFIX}"
         baseline_path = staged_dir / f"{unit_key}{_STAGED_BASELINE_SUFFIX}"
+        shadowed_triple = None
+        if in_world and name in legacy_names:
+            shadowed_triple = (
+                legacy_staged_dir / name,
+                legacy_staged_dir / f"{unit_key}{_STAGED_HASH_SUFFIX}",
+                legacy_staged_dir / f"{unit_key}{_STAGED_BASELINE_SUFFIX}",
+            )
+            summary.setdefault("staged_shadowed", []).append(unit_key)
         # Guard 1: already merged from sessions/ this run -> consume, don't merge.
         if unit_key in already:
             summary["staged_dedup"].append(unit_key)
+            _mark_consumed(backend, world_staged, unit_key)
             _delete_staged(backend, staged_path, hash_path, baseline_path)
+            if shadowed_triple is not None:
+                _delete_staged(backend, *shadowed_triple)
             continue
         body_bytes, transient = _read_staged_bytes(backend, staged_path)
         if transient:
@@ -663,7 +793,10 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
             baseline_hash = _read_staged_text(backend, hash_path)
             if baseline_hash and hashlib.sha256(body_bytes).hexdigest() == baseline_hash:
                 summary["noop"].append(unit_key)
+                _mark_consumed(backend, world_staged, unit_key)
                 _delete_staged(backend, staged_path, hash_path, baseline_path)
+                if shadowed_triple is not None:
+                    _delete_staged(backend, *shadowed_triple)
             else:
                 # Guard 3: 3-way when the baseline CONTENT was staged, else the
                 # retained 2-way fallback. None (not {}) collapses an empty or
@@ -679,10 +812,19 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
                 baseline_wm = _read_staged_yaml(backend, baseline_path)
                 pending_merges.append((body_wm, baseline_wm))
                 summary["staged_merged"].append(unit_key)
+                # Tombstoned at the DISPOSITION DECISION, not beside the
+                # deferred delete below: see _mark_consumed on why early is the
+                # safe direction (it gates the producer, never this consumer).
+                _mark_consumed(backend, world_staged, unit_key)
                 merged_files.append((staged_path, hash_path, baseline_path))
+            if shadowed_triple is not None:
+                merged_files.append(shadowed_triple)
         else:
             summary["skipped"].append(unit_key)
+            _mark_consumed(backend, world_staged, unit_key)
             _delete_staged(backend, staged_path, hash_path, baseline_path)
+            if shadowed_triple is not None:
+                _delete_staged(backend, *shadowed_triple)
     if pending_merges:
         # : the read AND the write happen inside ONE lock hold, and
         # the read is taken fresh HERE rather than before the loop -- the loop

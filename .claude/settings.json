@@ -72,9 +72,7 @@
     "GATE_FIRINGS_SEGMENTED": "1",
     "PRODUCTIVITY_SNAPSHOTS_SEGMENTED": "1",
     "OWNCLOUD_GZIP_STORES": "ayoai-mind",
-    "UTILIZATION_COUNTERS_SPOOLED": "1",
-    "NO_PROXY": "localhost,127.0.0.1,10.0.0.241,100.76.251.73,100.100.100.100,.ts.net,example.com,.example.com",
-    "no_proxy": "localhost,127.0.0.1,10.0.0.241,100.76.251.73,100.100.100.100,.ts.net,example.com,.example.com"
+    "UTILIZATION_COUNTERS_SPOOLED": "1"
   },
   "skillListingBudgetFraction": 0.05,
   "hooks": {

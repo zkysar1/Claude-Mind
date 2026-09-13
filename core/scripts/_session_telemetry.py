@@ -221,6 +221,48 @@ def _duration_seconds(started_at, ended_at):
         return -1
 
 
+def _stop_requested_at(agent, project_root=None):
+    """Local ISO-8601 mtime of the `stop-target-mode` sentinel, or None.
+
+    THE STOP-START ANCHOR (g-373-16 unit 9). Nothing recorded WHEN a stop was
+    requested, so the graceful stop's wall clock — the number
+    `mind-serve@.service`'s TimeoutStopSec and the env-server's 240s run-stop
+    grace must both be sized to — was unmeasurable from any durable store. Two
+    stores were checked and neither carries it: `session-summary.yaml` is
+    gitignored and per-box, and this module's own `duration_seconds` is the
+    SESSION's length (measured: 654,047 s on one record), not the stop's.
+
+    `stop-target-mode` is the anchor because the stop protocol already forces
+    it into existence at exactly the right instant: every authorized setter of
+    `stop-requested` MUST write this file immediately BEFORE the signal
+    (stop-hook-compliance.md), so its mtime is when the stop was requested.
+
+    guard-1504 (enumerate every writer before reading an mtime as evidence) is
+    satisfied by enumeration, not assumption — the writers are `/stop` and the
+    four authorized callers (productivity-stop-gate, reducer-self-fence,
+    loop-exhaustion-fence, the vessel sidecar). Each writes it EXACTLY ONCE per
+    stop, and loop-exhaustion-fence.sh:33 explicitly declines to re-write it to
+    avoid racing /stop. One write per stop ⇒ the mtime is unambiguous. It is
+    also written-at-entry-and-never-touched, which is precisely the property
+    guard-2507 says makes an mtime a valid START time (that guard's warning is
+    against reading such a file as LIVENESS, which nothing here does).
+
+    Reads the file only — D3 clears `stop-requested` long before this runs, but
+    `stop-target-mode` survives through D7 (D6.6 and D7 both read it).
+    """
+    try:
+        pr = _resolve_project_root(project_root)
+        if pr is None:
+            return None
+        p = pr / AGENTS_PARENT_DIR / agent / SESSION_DIRNAME / "stop-target-mode"
+        if not p.exists():
+            return None
+        return datetime.datetime.fromtimestamp(
+            p.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return None
+
+
 def write_open(sid, agent, mode, started_by, env_id=None, world_dir=None):
     """WP1 — create the initial active record. Idempotent: returns None without
     overwriting if a record for this SID already exists. Returns Path or None."""
@@ -308,6 +350,27 @@ def write_close(sid, agent, status, ended_reason, mode_at_end=None,
         record["end_machine_id"] = _machine_id()
         record["mode_at_end"] = mode_at_end
         record["duration_seconds"] = _duration_seconds(record.get("started_at"), ended_at)
+        # The graceful stop's OWN wall clock, distinct from the session's
+        # (g-373-16 unit 9). None when no stop sentinel exists — a crash close
+        # or a recovery-gate close never had one, and that absence must stay
+        # distinguishable from the -1 "uncomputable" sentinel.
+        #
+        # BOTH timestamps are produced on THIS box by this same process, so the
+        # subtraction is single-clock and the stored NUMBER is timezone-immune
+        # (rb-3741: the fleet is TZ-split — cc-0x stamps UTC, one peer stamps
+        # EDT — so never re-derive this by subtracting two records' strings
+        # across boxes; read `stop_duration_seconds`, which already did it).
+        #
+        # ⚠ THIS SAMPLE IS CENSORED, AND SIZING A TIMEOUT OFF ITS MAXIMUM WILL
+        # UNDER-SIZE IT (guard-2352 — a recorder whose failure mode correlates
+        # with the event it records). This line runs at D6.6, INSIDE the stop:
+        # a stop that overran its budget and was SIGKILLed never reaches it, so
+        # the longest stops are exactly the ones missing from the data. Treat
+        # the observed spread as a floor on the true tail, never as its shape.
+        stop_at = _stop_requested_at(agent, project_root)
+        record["stop_requested_at"] = stop_at
+        record["stop_duration_seconds"] = (
+            _duration_seconds(stop_at, ended_at) if stop_at else None)
         record["iterations_completed"] = iterations_completed
         record["goals_completed"] = goals_completed
         record["goals_filed"] = goals_filed

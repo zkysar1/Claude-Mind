@@ -109,6 +109,26 @@ def test_budget_zone_is_recorded_but_never_decisive():
     assert fresh["budget_zone"] == "fresh"
 
 
+def test_reason_states_the_limit_of_the_claim_and_names_the_zone():
+    """A firing proves the loop is not ADVANCING, never WHY.
+
+    alpha/cc-04 2026-09-11: the stop rung fired at 307 BLOCKs with the diary
+    frozen since 06:29:19 while context sat around half consumed, and the
+    firing was read -- off this module's NAME -- as context exhaustion.  The
+    stop was right; the inherited cause was not.  The reason must therefore
+    carry both halves, and must stay non-decisive either way.
+    """
+    for zone in ("normal", "fresh", None):
+        for streak, rung in (
+            (fence.DEFAULT_STOP_THRESHOLD, "stop"),
+            (fence.DEFAULT_PAUSE_THRESHOLD, "pause"),
+        ):
+            r = fence.decide(streak, FAR_PAST, budget_zone=zone)
+            assert r["verdict"] == rung, "the note must not move the verdict"
+            assert "cause NOT established" in r["reason"]
+            assert (zone or "unrecorded") in r["reason"]
+
+
 def test_decide_never_raises_on_hostile_input():
     for bad in (object(), [], {}, -1, 1e308):
         assert fence.decide(bad, FAR_PAST)["verdict"] in ("hold", "pause", "stop")

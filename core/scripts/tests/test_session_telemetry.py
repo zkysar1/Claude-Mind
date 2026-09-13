@@ -671,3 +671,79 @@ def test_reap_wrapper_exits_0_when_there_is_no_backlog(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "BACKLOG:" not in proc.stderr
     assert json.loads(proc.stdout)["backlog_total"] == 0
+
+
+# ──  unit 9: the graceful stop's OWN wall clock ──────────────────
+# Nothing recorded when a stop was REQUESTED, so the duration that
+# mind-serve@.service's TimeoutStopSec and the env-server's 240s run-stop
+# grace must both be sized to could not be measured from any durable store.
+# stop-target-mode's mtime is the anchor (stop-hook-compliance.md forces every
+# authorized caller to write it immediately before the signal).
+
+def _set_stop_sentinel(project_root, agent, seconds_ago):
+    """Write stop-target-mode with its mtime a known offset from now."""
+    d = project_root / st.AGENTS_PARENT_DIR / agent / st.SESSION_DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "stop-target-mode"
+    p.write_text("assistant", encoding="utf-8")
+    when = datetime.datetime.now().timestamp() - seconds_ago
+    os.utime(p, (when, when))
+    return p
+
+
+def test_stop_duration_measures_the_stop_not_the_session(tmp_path):
+    """THE POINT OF THE FIELD. duration_seconds is the SESSION's length —
+    measured at 654,047 s on a real record — which is why sizing a stop timeout
+    off this store was impossible before. stop_duration_seconds must track the
+    SENTINEL, not started_at, and the two must be visibly different here."""
+    st.write_open("sid-1", "alpha", "autonomous", "claude-code",
+                  world_dir=tmp_path)
+    r = _read(tmp_path, "alpha", "sid-1")
+    r["started_at"] = "2026-09-02T06:48:50"          # a week-long session
+    (tmp_path / "telemetry" / "session-records" / "alpha" / "sid-1.json"
+     ).write_text(json.dumps(r), encoding="utf-8")
+    _set_stop_sentinel(tmp_path, "alpha", seconds_ago=42)
+
+    st.write_close("sid-1", "alpha", "completed", "graceful-stop",
+                   world_dir=tmp_path, project_root=tmp_path)
+    out = _read(tmp_path, "alpha", "sid-1")
+    assert 40 <= out["stop_duration_seconds"] <= 46, out["stop_duration_seconds"]
+    assert out["stop_requested_at"] is not None
+    # The session figure is still there and is a completely different quantity.
+    assert out["duration_seconds"] > 100000
+    assert out["duration_seconds"] != out["stop_duration_seconds"]
+
+
+def test_stop_fields_are_none_not_minus_one_without_a_sentinel(tmp_path):
+    """A crash / recovery-gate close never had a stop-target-mode. That absence
+    must stay distinguishable from _duration_seconds' -1 'uncomputable'
+    sentinel, or a reader averaging the column silently folds in -1s."""
+    st.write_open("sid-2", "alpha", "autonomous", "claude-code",
+                  world_dir=tmp_path)
+    st.write_close("sid-2", "alpha", "crashed", "recovery-gate",
+                   world_dir=tmp_path, project_root=tmp_path)
+    out = _read(tmp_path, "alpha", "sid-2")
+    assert out["stop_requested_at"] is None
+    assert out["stop_duration_seconds"] is None
+    assert out["stop_duration_seconds"] != -1
+
+
+def test_stop_sentinel_in_the_future_clamps_to_zero(tmp_path):
+    """Clock skew must not manufacture a negative that reads as a -1 sentinel.
+    _duration_seconds floors at 0; this pins that the new field inherits it."""
+    st.write_open("sid-3", "alpha", "autonomous", "claude-code",
+                  world_dir=tmp_path)
+    _set_stop_sentinel(tmp_path, "alpha", seconds_ago=-600)   # 10 min ahead
+    st.write_close("sid-3", "alpha", "completed", "graceful-stop",
+                   world_dir=tmp_path, project_root=tmp_path)
+    assert _read(tmp_path, "alpha", "sid-3")["stop_duration_seconds"] == 0
+
+
+def test_stop_requested_at_is_fail_open(tmp_path):
+    """Every public function in this module is total. The helper must return
+    None — never raise — on an unresolvable root, a missing agent dir, and a
+    None agent, because it runs inside a fire-and-forget `|| true` caller where
+    a raise would be invisible."""
+    assert st._stop_requested_at("alpha", project_root=tmp_path / "nope") is None
+    assert st._stop_requested_at("no-such-agent", project_root=tmp_path) is None
+    assert st._stop_requested_at(None, project_root=tmp_path) is None

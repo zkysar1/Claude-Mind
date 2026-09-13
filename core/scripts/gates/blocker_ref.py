@@ -41,6 +41,7 @@ Daemon safety:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -107,6 +108,26 @@ BLOCKER_REF_OPTIONAL_KEYS = (
                       # disturbed. Note the module rule above — a promoted key
                       # earns its place by having a live reader, not by being
                       # useful in principle.
+    "released_branches",
+                      # deploy-hold reservations: the owner's explicit
+                      # per-branch RELEASE (). Read by
+                      # world/scripts/deploy-hold-check.sh, which downgrades
+                      # HELD -> CLEAR when DHC_PUSH_TARGET names a released
+                      # branch. Shape: {"<branch>": {"released_by": "<owner>",
+                      # "released_at": "<iso>"}} -- a dict, not a list, so each
+                      # release carries its own provenance and a reader can
+                      # answer "who released dev, and when?" without opening
+                      # the goal.
+                      #
+                      # WHY A BRANCH AND NOT A LIST OF PRs (guard-3491): a
+                      # release issued as an enumeration of artifacts silently
+                      # skips every artifact created after the list was
+                      # written -- measured, 3 further days of hold on a
+                      # green PR. A branch IS the predicate ("anything
+                      # targeting dev"), so a PR opened tomorrow inherits the
+                      # release automatically. Releasing by predicate is what
+                      # guard-3491 prescribes; do not "simplify" this into a
+                      # PR list.
 )
 
 
@@ -139,6 +160,16 @@ BLOCKER_REF_OPTIONAL_KEYS = (
 # The cutoff is honest rather than airtight: a writer that back-dates created_at
 # dodges the check. That is accepted deliberately — this is an internal fleet
 # contract, and a forgeable field is a far smaller cost than a wedged store.
+# A branch the hold owner may never release while the hold is live. The gate
+# protects a deploy SURFACE, and these are the branches that ARE that surface:
+# releasing one would authorise the exact deploy the hold exists to stop, so it
+# is refused at the write path rather than trusted to the reader. The reader
+# refuses them independently (deploy-hold-check.sh already declines to parse
+# main/master as a push target at all) -- two layers, because this is the
+# fail-DANGEROUS direction and a single check is a single point of failure.
+DEPLOY_HOLD_NEVER_RELEASABLE = ("main", "master")
+_DEPLOY_HOLD_BRANCH_RE = re.compile(r"[A-Za-z0-9._/-]{1,255}")
+
 DEPLOY_HOLD_PREFIX = "deploy-hold:"
 DEPLOY_HOLD_MAX_HOURS = 48
 DEPLOY_HOLD_CONTRACT_EFFECTIVE_FROM = "2026-08-26T00:00:00"
@@ -312,6 +343,78 @@ def _check_deploy_hold_reservation(ref: dict, ext_id: str, created_at: Any,
             "re-declare with the audited long-hold override. See "
             "world/conventions/deploy-holds.md."
         )
+
+    # --- the owner's per-branch RELEASE () ------------------------
+    # Absent is the overwhelming case and is NOT a defect: a hold that releases
+    # nothing is an ordinary hold. Only a PRESENT field is validated, so every
+    # existing writer is undisturbed (the regression pin this goal declares).
+    #
+    # THIS IS THE FAIL-DANGEROUS DIRECTION. Every other check in this function
+    # refuses an over-broad HOLD, where the error costs a delay. This one
+    # governs a CLEAR, where the error authorises the deploy the hold exists to
+    # stop -- on a repo where the merge IS the deploy, unrecoverable by the time
+    # anything downstream could object (guard-6258). So it refuses on anything
+    # it cannot read, and the reader re-checks independently.
+    released = ref.get("released_branches")
+    if released is not None:
+        if not isinstance(released, dict):
+            return False, (
+                "blocker_ref '" + ext_id + "' has a `released_branches` that "
+                "is not an object. The shape is {\"<branch>\": "
+                "{\"released_by\": \"<owner>\", \"released_at\": "
+                "\"<iso>\"}} -- a bare list cannot carry the provenance that "
+                "makes a release auditable, so it is refused rather than "
+                "guessed at. See world/conventions/deploy-holds.md."
+            )
+        for branch, prov in released.items():
+            label = str(branch)
+            if (not isinstance(branch, str)
+                    or not _DEPLOY_HOLD_BRANCH_RE.fullmatch(branch.strip())):
+                return False, (
+                    "blocker_ref '" + ext_id + "' releases a branch name that "
+                    "is not a plain branch ('" + label[:60] + "'). An "
+                    "unparseable branch cannot be compared against a push "
+                    "target, so honouring it would be guessing."
+                )
+            if branch.strip().lower() in DEPLOY_HOLD_NEVER_RELEASABLE:
+                return False, (
+                    "blocker_ref '" + ext_id + "' tries to release '"
+                    + branch.strip() + "', which IS the deploy surface this "
+                    "hold protects. The default branch can never be released "
+                    "while the hold is live -- releasing it would authorise "
+                    "exactly the deploy being held. Let the hold expire, or "
+                    "clear it outright, but do not release its own surface."
+                )
+            if not isinstance(prov, dict):
+                return False, (
+                    "blocker_ref '" + ext_id + "' releases '" + branch.strip()
+                    + "' with no provenance object. A release with no "
+                    "attributable author and time is indistinguishable from a "
+                    "typo, and it downgrades a safety gate."
+                )
+            released_by = prov.get("released_by")
+            if not isinstance(released_by, str) or not released_by.strip():
+                return False, (
+                    "blocker_ref '" + ext_id + "' releases '" + branch.strip()
+                    + "' without naming `released_by`."
+                )
+            if released_by.strip() != owner.strip():
+                return False, (
+                    "blocker_ref '" + ext_id + "' releases '" + branch.strip()
+                    + "' as '" + released_by.strip() + "', who is not the "
+                    "hold owner ('" + owner.strip() + "'). Only the owner may "
+                    "release a branch of their own hold -- the release is "
+                    "identity-keyed to the reservation, never granted by a "
+                    "prose pattern (guard-2860). If ownership genuinely moved, "
+                    "re-declare the hold with the new owner first."
+                )
+            if _parse_iso(prov.get("released_at")) is None:
+                return False, (
+                    "blocker_ref '" + ext_id + "' releases '" + branch.strip()
+                    + "' with a `released_at` that is not a parseable ISO-8601 "
+                    "timestamp. A release that cannot be dated cannot be "
+                    "audited against the hold it modifies."
+                )
 
     return True, None
 

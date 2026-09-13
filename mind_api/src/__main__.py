@@ -74,6 +74,11 @@ def _project_root() -> Path:
 _N3_ALLOWED_EXACT = frozenset({
     "MACHINE_ID", "MACHINE_MULTI", "RUNTIME_DIR", "STORAGE_BACKEND",
     "STORAGE_S3_BUCKET", "STORAGE_DDB_SESSIONS_TABLE", "STORAGE_DDB_LOCK_TABLE",
+    #  object-store endpoint override (a non-secret URL; blank/unset =
+    # the regional cloud endpoint). Until 2026-09-11 it was absent here, so a
+    # flipped .env.local reached the daemon ONLY through get_backend()'s
+    # best-effort _bootstrap_env_defaults self-heal ( readiness check).
+    "STORAGE_S3_ENDPOINT_URL",
     "OWNCLOUD_SYNC_INTERVAL", "OWNCLOUD_CACHE_TTL",
     # : OWNCLOUD_PULL_EVERY_N is READ at _start_owncloud_sync_thread
     # (0 disables the pull half) and is documented as an override at the constant

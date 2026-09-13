@@ -104,9 +104,9 @@ output (`suite-*.log`), tool dumps (`leak-check.txt`), one-shot scratch
 scripts (`build-*.py`, `orphan-*.py`, `restart-poller.sh`, `gs.err`), raw
 command-output dumps (`selector.raw`, `probe.out` — stdout redirects), backup
 copies (`*.bak`), and 0-byte empties left by an interrupted redirect. These are
-NOT drainable working docs: the framework's own guidance writes them here (see
-`.claude/rules/run-full-suite-after-deep-code.md` — "redirect to
-`agents/<agent>/temp/suite.log`"), but they have nothing to encode. Left alone
+NOT drainable working docs — they have nothing to encode. (The suite log no
+longer lands here: guard-6416 moved long-running redirects off the synced
+tree.) Left alone
 they accumulate indefinitely — the slush-directory failure mode for a file class
 Phase 1's `.md`/`.json` glob deliberately never touches (g-115-1727, g-115-2947).
 

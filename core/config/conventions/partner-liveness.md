@@ -153,6 +153,78 @@ shape above remains the way to read signals the helper does not wrap
 a `head_object` returns an OBJECT time, so it corroborates that the box is
 active, not that the agent's mind is.
 
+## 3b. The third failure mode the two branches do NOT cover: a FRESH, CORRECT signal read at the wrong SCOPE (g-115-9599)
+
+Both branches above are predicated on a **stale** signal. There is a third
+way a liveness reading produces a false "that agent is down", and neither
+branch can fire on it, because the signal is fresh, accurate, and answering a
+**narrower question than the reader asked**.
+
+**The incident (2026-09-10, alpha observer seat).** Four readings of
+`runner-claim.sh status --agent alpha`, from one box that itself never goes
+RUNNING:
+
+| time | verdict | row |
+|---|---|---|
+| 23:33Z | LIVE | cc-04, heartbeat 379s |
+| 00:16Z | NOT-RUNNING | cc-04, `agent_state=IDLE` |
+| 00:41Z | NOT-RUNNING | cc-09, `agent_state=IDLE` |
+| 01:13Z | LIVE | cc-09, heartbeat 255s |
+
+Spanning the NOT-RUNNING window, two independent writers proved an alpha Body
+was working: PR #543 merged 00:37Z, and `g-369-208` written to the world store
+at 00:39:47Z (`executed_by_sid` e133d607, neither the observer's SID nor the
+local Body's). The reading reached the owner as "all five agents are down", and
+a collision with the live Body was avoided by re-reading git before writing
+code — not by the liveness signal.
+
+**The verdict was not wrong. Its SCOPE was unstated.** `agent_state` on a
+runner-claim row is the **reducer LEASE**, and nothing else. The only three
+writers are `owncloud_backend.py` `acquire_runner` / `release_runner` /
+`reclaim_if_stale` — all lease operations. A **worker Body executes goals
+without ever holding this claim**; that is exactly why
+`worker_reducer_liveness.py` polls this row, to ask about its *reducer*. So an
+unheld lease is a true statement about the lease and **no evidence at all**
+about whether the agent is executing.
+
+**And `machine_id` on a non-RUNNING row is a TOMBSTONE, not a location.** It is
+written only by `acquire_runner` attempt 2, which sets `agent_state=RUNNING` in
+the same conditional update; every IDLE-producing write leaves it untouched
+(`release_runner`'s docstring: "the row persists at IDLE (NOT a DeleteItem)").
+So the cc-04 → cc-09 change between the two NOT-RUNNING readings was **two
+successive stand-downs, not one claim migrating between live boxes** — the
+migration reading was itself an artifact of the message's present tense
+("`'alpha' has a claim row on 'cc-04'`").
+
+**Blast radius was exactly one surface: the human-readable line.** Both
+programmatic consumers were correct by construction — `_parse_machine` /
+`parse_machine` in `worker_reducer_liveness.py` and `reducer_self_fence.py`
+scope their reads to `LIVE_MARKER = "is RUNNING on "`, and both treat rc=4 as
+non-decisive, so a tombstone `machine_id` can never reach
+`reducer_self_fence`'s `different-holder` trigger. The only reader misled was
+the human one — and that is the reader who reported to the owner.
+
+**The rule this yields.** Before treating ANY liveness verdict as a statement
+about an agent, name the QUESTION the instrument answers:
+
+| instrument | actually answers | does NOT answer |
+|---|---|---|
+| `runner-claim.sh status` | is the **reducer lease** held, fresh, by whom | whether any Body of that agent is executing |
+| `team-state` `last_active` | when this box last **merged** that peer's shard | whether the peer's mind is alive (rule 5/6 above) |
+| `liveness-check.sh --agent X` | composite verdict over the above | your OWN reducer (guard-6259) |
+
+A fresh signal is not a broad signal. When the question you are asking is
+"is this agent working?", the lease is the wrong instrument entirely — read a
+writer with an independent hand (execution-diary HEAD, the goal store's
+`last_modified`, git) exactly as Branch 2 prescribes, even though no branch
+obliged you to.
+
+Fix landed in `core/scripts/runner-claim.sh` (the NOT-RUNNING branch now labels
+`machine_id` a last holder and states its scope; rc unchanged at 4) and pinned
+by five tests in `core/scripts/tests/test_runner_claim_status.py`, including
+the observer-seat case and a structural pin that the summary block reads no
+local state file at all.
+
 ## 4. Status and the 2026-07-14 incident (g-115-2181)
 
 Audit on 2026-04-19 found NO committed "partner silent" branches in

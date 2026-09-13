@@ -256,24 +256,146 @@ def test_cli_requires_a_source():
 # before the field landed carries no verdict at all.
 
 
-def test_self_verdict_is_read_off_the_record():
+# ── : the fixtures below are REAL, and that is the repair ────────
+#
+# Both objects are VERBATIM `verify_verdict` values lifted from live
+# world/aspirations records on 2026-09-11 (alpha, cc-08) — not shapes invented
+# in this file. The module used to ask for a `verdict` key that no writer has
+# ever emitted — `jsonl-field-probe.py --field goals.verify_verdict.verdict`
+# reads every record of the store and answers field_present:false — so the
+# baseline run read {agree: 0, disagree: 0, not_comparable: 52} over 52 sampled
+# closures: the only independent check on worker self-grading, returning
+# "cannot compare" for every closure. The suite stayed green because every
+# fixture here was hand-written to the shape the READER wanted. A test corpus
+# that never holds a producer's actual output cannot tell a working consumer
+# from a blind one (guard-1943 class: pinning a writer says nothing about the
+# wiring).
+
+REAL_Q4_TRUE = {            #  — the full 8-key shape, bare q4 boolean
+    "q1_passed": True,
+    "q1_artifact": "world/audit-reports/agent-inbox-dispositions-2026-09-11-run251.txt",
+    "q1_5_passed": True,
+    "q1_5_checklist": "10/10",
+    "q2_passed": True,
+    "q2_failure_mode_checked": "a machine-alert classification could have destroyed "
+                               "fleet-addressed mail whose only copy was the manifest",
+    "q3_scope": "integration",
+    "q4_passed": True,
+}
+
+REAL_Q4_FALSE = {           #  — same shape, Q4 recorded a FAILURE
+    "q1_passed": True,
+    "q1_artifact": "cnc.log(97916B,SWEEP_EXIT=0)+g-115-2571.outcome_note(7548)",
+    "q1_5_passed": True,
+    "q1_5_checklist": "abbreviated-routine-3/3",
+    "q2_passed": True,
+    "q2_failure_mode_checked": "sweep-ran-but-measured-nothing: refuted by in-chain rc=0",
+    "q3_scope": "integration",
+    "q4_passed": False,
+}
+
+
+def test_the_pre_fix_reader_returns_nothing_on_both_real_records():
+    """Positive control (guard-1475). `self_verdict_of` WAS `v.get("verdict")`.
+
+    Run that exact predicate against the same fixtures every test below asserts
+    on: it yields None for both. So these fixtures discriminate the repaired
+    reader from the blind one — without this control, a green suite would prove
+    only that the tests and the code agree with each other.
+    """
+    for real in (REAL_Q4_TRUE, REAL_Q4_FALSE):
+        assert real.get("verdict") is None, "the pre-fix predicate found nothing"
+        assert wca.self_verdict_of(goal(verify_verdict=real)) == "completed"
+
+
+def test_self_verdict_is_derived_from_the_keys_the_writer_actually_writes():
+    assert wca.self_verdict_of(goal(verify_verdict=REAL_Q4_TRUE)) == "completed"
+    assert wca.self_verdict_of(goal(verify_verdict=REAL_Q4_FALSE)) == "completed", (
+        "q4_passed is NOT a gating key — the verdict comes from q1/q1_5/q2")
+    partial = {k: v for k, v in REAL_Q4_TRUE.items() if k != "q1_5_passed"}
+    assert wca.self_verdict_of(goal(verify_verdict=partial)) == "completed", (
+        "live records do omit Q-keys; read the keys present, do not discard")
+    failed = {**REAL_Q4_TRUE, "q2_passed": False}
+    assert wca.self_verdict_of(goal(verify_verdict=failed)) == "incomplete"
+
+
+def test_an_explicit_verdict_string_still_wins():
+    """Kept so a future writer that emits one needs no change to this module."""
     assert wca.self_verdict_of(goal(verify_verdict={"verdict": "completed"})) == "completed"
     assert wca.self_verdict_of(goal(verify_verdict={"verdict": "  SKIPPED "})) == "skipped"
+    assert wca.self_verdict_of(
+        goal(verify_verdict={**REAL_Q4_TRUE, "verdict": "incomplete"})) == "incomplete"
 
 
 @pytest.mark.parametrize("bad", [
     None,                          # field absent entirely (every legacy closure)
     "completed",                   # a string where a dict belongs
-    {},                            # dict with no verdict key
+    {},                            # dict with no keys at all
     {"verdict": None},             # explicit null
     {"verdict": "   "},            # whitespace only
-    {"q1_passed": True},           # partial verdict, no overall call
+    {"q3_scope": "unit"},          # a LABEL key only — nothing was gated
+    {"q4_passed": True},           # a q4-only record: carries no gating key
 ])
 def test_absent_or_malformed_verdict_is_none_never_a_pass(bad):
     """Fail-open: a shape this module cannot read is UNKNOWN, not agreement."""
     g = goal() if bad is None else goal(verify_verdict=bad)
     assert wca.self_verdict_of(g) is None
     assert wca.agreement_for(g, []) == "not_comparable"
+
+
+@pytest.mark.parametrize("vv,expected", [
+    (None, "absent"),                                      # no verify_verdict
+    ("completed", "absent"),                               # not a dict
+    ({}, "absent"),
+    ({"q1_passed": True}, "absent"),                       # Q4 never ran
+    (REAL_Q4_TRUE, "unknown"),                             # THE legacy population
+    (REAL_Q4_FALSE, "fail"),
+    ({"q4_verdict": "pass"}, "pass"),
+    ({"q4_verdict": "fail"}, "fail"),
+    ({"q4_verdict": " SKIPPED "}, "skipped"),
+    ({"q4_verdict": "skipped", "q4_passed": True}, "skipped"),   # tri-state wins
+    ({"q4_verdict": "nonsense", "q4_passed": True}, "unknown"),  # unreadable -> bool path
+])
+def test_q4_state_is_tri_state_over_a_key_that_could_only_hold_a_bool(vv, expected):
+    g = goal() if vv is None else goal(verify_verdict=vv)
+    assert wca.q4_state_of(g) == expected
+
+
+def test_a_bare_q4_passed_true_is_never_read_as_a_pass():
+    """The goal's explicit constraint. Q4 exits 0 for BOTH `pass` and `skipped`,
+    so a Body that correctly read a SKIPPED verdict as non-blocking wrote
+    `q4_passed: true`. Reading that as a pass would convert this module's silent
+    blindness into CONFIDENT WRONG AGREEMENT — worse than the defect repaired
+    here (guard-1753: "could not resolve" is not "resolved and found nothing").
+    """
+    g = goal(verify_verdict=REAL_Q4_TRUE)
+    assert wca.q4_state_of(g) == "unknown"
+    assert wca.q4_state_of(g) != "pass"
+
+
+def test_an_explicitly_skipped_q4_is_not_counted_as_agreement():
+    """The goal's second check. A closure whose provenance leg verified NOTHING
+    offers no self-assessment on that axis, so it is not_comparable — and the
+    SAME record carrying an explicit `pass` does compare, which is what makes
+    this a distinction rather than a blanket downgrade."""
+    skipped = goal(verify_verdict={**REAL_Q4_TRUE, "q4_verdict": "skipped"})
+    assert wca.self_verdict_of(skipped) == "completed"
+    assert wca.agreement_for(skipped, wca.run_checks(skipped)) == "not_comparable"
+    passed = goal(verify_verdict={**REAL_Q4_TRUE, "q4_verdict": "pass"})
+    assert wca.agreement_for(passed, wca.run_checks(passed)) == "agree"
+
+
+def test_the_legacy_bare_boolean_does_NOT_block_agreement():
+    """The other half of the design, and the one that keeps the repair honest.
+
+    35 of the 44 asp-115 worker closures that carry a q4 key at all carry the
+    bare boolean (measured 2026-09-11). Treating that ambiguity as a
+    blocker would re-zero `agreement_counts` — reinstating the exact defect this
+    goal exists to remove, while LOOKING more rigorous. The ambiguity is
+    reported in `q4_states` instead, so it is countable rather than invisible."""
+    g = goal(verify_verdict=REAL_Q4_TRUE)
+    assert wca.q4_state_of(g) == "unknown"
+    assert wca.agreement_for(g, wca.run_checks(g)) == "agree"
 
 
 def test_agreement_disagrees_when_worker_self_graded_over_a_high_defect():
@@ -310,3 +432,43 @@ def test_cli_says_no_agreement_was_measured_when_none_was(tmp_path):
     assert r.returncode == 0
     assert "not_comparable=2" in r.stdout
     assert "not evidence of agreement" in r.stdout
+
+
+def _mixed_corpus():
+    """One goal per q4 state, each carrying a real writer shape where one exists."""
+    return [
+        goal(id="g-1-01", verify_verdict=REAL_Q4_TRUE),
+        goal(id="g-1-02", verify_verdict=REAL_Q4_FALSE),
+        goal(id="g-1-03", verify_verdict={**REAL_Q4_TRUE, "q4_verdict": "skipped"}),
+        goal(id="g-1-04"),                                   # legacy, no field at all
+    ]
+
+
+def test_audit_measures_agreement_on_a_corpus_that_carries_verdicts():
+    """Outcome 1, stated as the goal states it: agree + disagree > 0.
+
+    The pre-fix module returned {0, 0, N} here — an unconsumed DETECTOR, which
+    learning-philosophy.md ranks strictly worse than an unconsumed attributor.
+    """
+    res = wca.audit(_mixed_corpus(), 1.0, "asp-t", "tester")
+    a = res["agreement_counts"]
+    assert a["agree"] + a["disagree"] > 0
+    assert a == {"agree": 2, "disagree": 0, "not_comparable": 2}
+    assert res["q4_states"] == {"pass": 0, "fail": 1, "skipped": 1,
+                                "unknown": 1, "absent": 1}
+    assert [r["q4_state"] for r in res["rows"]] == ["unknown", "fail", "skipped", "absent"]
+
+
+def test_cli_prints_the_q4_tally_and_names_the_ambiguous_population(tmp_path):
+    p = tmp_path / "goals.json"
+    p.write_text(json.dumps(_mixed_corpus()), encoding="utf-8")
+    env = {**os.environ, "STORAGE_BACKEND": "local"}
+    r = subprocess.run([sys.executable, str(SCRIPT), "--goals-json", str(p),
+                        "--asp", "t", "--dry-run", "--fraction", "1.0"],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0
+    assert "agree=2" in r.stdout and "not_comparable=2" in r.stdout
+    assert "q4-provenance: pass=0  fail=1  skipped=1  unknown=1  absent=1" in r.stdout
+    assert "cannot distinguish a PASS from a SKIPPED run" in r.stdout
+    assert "not evidence of agreement" not in r.stdout, (
+        "agreement WAS measured here — the guard-963 note must not fire")

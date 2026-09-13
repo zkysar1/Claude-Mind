@@ -84,7 +84,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from _paths import AGENT_DIR, WORLD_DIR  # type: ignore
+from _paths import AGENT_DIR, WORLD_DIR, agents_root  # type: ignore
 from _fileops import log_script_decision  # type: ignore
 
 try:
@@ -801,8 +801,41 @@ def _resolve_pq_path(args):
     return Path(AGENT_DIR) / "session" / "pending-questions.yaml"
 
 
-def cmd_sweep(args):
-    path = _resolve_pq_path(args)
+def _all_agent_pq_paths():
+    """Every agent's pending-questions.yaml, discovered through the agent-dir
+    helper (g-115-9715).
+
+    ROUTED THROUGH agents_root(), NOT a depth-1 PROJECT_ROOT scan. This is a
+    cross-agent glob consumer, the class that silently scans NOTHING after an
+    AGENTS_PARENT_DIR relocation while remaining invisible to every audit grep
+    (guard-1318, guard-653, `agent-dir-resolution.md`). The derived audit
+    surface is `core/scripts/cross-agent-glob-audit.py`, which finds this site
+    by AST.
+
+    Globs the TARGET FILE rather than enumerating agents via
+    enumerate_agent_confs(): `local-paths.conf` is gitignored and per-box, so a
+    conf-keyed enumeration silently narrows on any box where one is missing —
+    which is the same under-reporting failure this flag exists to fix. Widen the
+    READ (reclaim-routed-work rule 7). Measured on cc-09 2026-09-12: both
+    enumerations return the same five agents, so the wider one costs nothing
+    here and cannot narrow elsewhere.
+    """
+    try:
+        root = Path(agents_root())
+    except Exception:  # noqa: BLE001 — fail-open; a broken root yields no paths
+        return []
+    try:
+        return sorted(root.glob("*/session/pending-questions.yaml"))
+    except OSError:
+        return []
+
+
+def _sweep_one(path, args, allow_apply=True):
+    """Sweep ONE pending-questions file. Returns the single-agent result dict.
+
+    `allow_apply=False` suppresses the write half only; the read half and every
+    count are unchanged, so a non-writable agent still contributes findings.
+    """
     entries = _load_questions(path)
     now = datetime.now()
     goal_index = _load_goal_index()
@@ -924,12 +957,12 @@ def cmd_sweep(args):
 
     applied = 0
     apply_ids = set()
-    if getattr(args, "apply", False):
+    if allow_apply and getattr(args, "apply", False):
         apply_ids |= {
             r.get("id") for r in results
             if r.get("verdict") == "auto_resolve" and r.get("id")
         }
-    if getattr(args, "apply_cleanup", False):
+    if allow_apply and getattr(args, "apply_cleanup", False):
         apply_ids |= {
             r.get("id") for r in results
             if r.get("verdict") == "needs_transition" and r.get("id")
@@ -957,7 +990,154 @@ def cmd_sweep(args):
     }
 
 
+def cmd_sweep(args):
+    """Sweep the bound agent's file, or — with --all-agents — every agent's.
+
+    WHY THE FLEET FORM EXISTS (g-115-9715). The sweep read ONE file, and precheck
+    lane 0.5b.5 invoked it with no --pq-path, so on any box it covered 1/N of the
+    fleet corpus while reporting a clean-looking zero. The tell was that its
+    reported total tracked the bound agent's own record count EXACTLY on every
+    box (bravo 47/47, alpha 60/60, echo 29/29, foxtrot 29/29, zeta 29/29) — a
+    correct tool on the wrong population, failing in ONE direction only: always
+    under-reporting work.
+
+    WHY --apply IS CONFINED TO THE BOUND AGENT. Writing another agent's dir is
+    not merely discouraged, it is mechanically refused: the backend raises
+    NoClaimError ("this box does not hold the live runner claim for agent dir X.
+    The write did NOT land, and NO retry or refresh can EVER succeed from
+    here ... STRUCTURAL, not a race"). So the fleet form READS everywhere and
+    WRITES only where it legitimately can, and marks each row `writable` so a
+    reader can tell a finding it may act on from one it must relay. Discovering
+    that fence at write time instead would leave a half-applied sweep behind
+    (guard-3050: a fix applied to your own copy of a per-agent store reaches no
+    other agent — the propagation half needs the relay the error itself names).
+    """
+    if not getattr(args, "all_agents", False):
+        return _sweep_one(_resolve_pq_path(args), args)
+
+    bound = None
+    if AGENT_DIR is not None:
+        try:
+            bound = (Path(AGENT_DIR) / "session" / "pending-questions.yaml").resolve()
+        except OSError:
+            bound = None
+
+    paths = _all_agent_pq_paths()
+    per_agent = []
+    counts = {}
+    carrier_counts = {}
+    flags = set()
+    applied = 0
+    bound_total = 0
+
+    for path in paths:
+        try:
+            writable = bound is not None and path.resolve() == bound
+        except OSError:
+            writable = False
+        one = _sweep_one(path, args, allow_apply=writable)
+        agent_name = path.parent.parent.name
+        per_agent.append({
+            "agent": agent_name,
+            "path": str(path),
+            "writable": writable,
+            "summary": one["summary"],
+            "flags": one["flags"],
+            "counts": one["counts"],
+            "carrier_counts": one["carrier_counts"],
+            "applied": one["applied"],
+            "entries": one["entries"],
+        })
+        for k, v in one["counts"].items():
+            counts[k] = counts.get(k, 0) + v
+        for k, v in one["carrier_counts"].items():
+            carrier_counts[k] = carrier_counts.get(k, 0) + v
+        flags.update(one["flags"])
+        applied += one["applied"]
+        if writable:
+            bound_total += one["counts"].get("total", 0)
+
+    # POSITIVE CONTROL, emitted rather than left to the reader (guard-2298): the
+    # defect's signature was fleet_total == bound_agent_total, so the two numbers
+    # ride together and a regression to one-file coverage is visible in the
+    # summary itself instead of needing a separate census to detect.
+    counts.setdefault("total", 0)
+    fleet_control = {
+        "agents_swept": len(per_agent),
+        "agent_names": [a["agent"] for a in per_agent],
+        "fleet_total": counts["total"],
+        "bound_agent_total": bound_total,
+        "covers_more_than_bound_agent": counts["total"] > bound_total,
+        "writable_agents": [a["agent"] for a in per_agent if a["writable"]],
+    }
+    if not per_agent:
+        flags.add("no_agent_files_found")
+
+    summary = (
+        f"fleet sweep: {len(per_agent)} agent file(s) "
+        f"({', '.join(fleet_control['agent_names']) or 'none'}); "
+        f"{counts['total']} entries fleet-wide vs {bound_total} for the bound agent; "
+        f"{counts.get('auto_resolve', 0)} auto, "
+        f"{counts.get('needs_transition', 0)} needs-transition, "
+        f"{counts.get('likely_resolved', 0) + counts.get('likely_stale', 0)} likely, "
+        f"{counts.get('flag_for_review', 0)} review; applied={applied} "
+        f"(writes confined to {', '.join(fleet_control['writable_agents']) or 'no agent — none writable from this box'})"
+    )
+
+    return {
+        "subcommand": "sweep",
+        "scope": "all-agents",
+        "summary": summary,
+        "flags": sorted(flags),
+        "counts": counts,
+        "carrier_counts": carrier_counts,
+        "fleet_control": fleet_control,
+        "per_agent": per_agent,
+        "applied": applied,
+        "thresholds": {
+            "staleness_days": STALENESS_DAYS,
+            "infra_staleness_days": INFRA_STALENESS_DAYS,
+            "agent_answer_grace_days": AGENT_ANSWER_GRACE_DAYS,
+            "noop_auto_resolve_days": NOOP_AUTO_RESOLVE_DAYS,
+        },
+    }
+
+
 def cmd_stats(args):
+    if getattr(args, "all_agents", False):
+        per_agent = []
+        by_status = {}
+        by_type = {}
+        total = 0
+        for path in _all_agent_pq_paths():
+            entries = _load_questions(path)
+            total += len(entries)
+            statuses = {}
+            for e in entries:
+                s = e.get("status", "unknown")
+                statuses[s] = statuses.get(s, 0) + 1
+                by_status[s] = by_status.get(s, 0) + 1
+                t = e.get("type", "general")
+                by_type[t] = by_type.get(t, 0) + 1
+            per_agent.append({
+                "agent": path.parent.parent.name,
+                "path": str(path),
+                "total": len(entries),
+                "by_status": statuses,
+            })
+        return {
+            "subcommand": "stats",
+            "scope": "all-agents",
+            "summary": (
+                f"{total} entries across {len(per_agent)} agent file(s); "
+                f"statuses={by_status}"
+            ),
+            "flags": [],
+            "counts": {"total": total},
+            "by_status": by_status,
+            "by_type": by_type,
+            "per_agent": per_agent,
+        }
     path = _resolve_pq_path(args)
     entries = _load_questions(path)
     by_status = {}
@@ -1003,6 +1183,19 @@ def main(argv=None):
         help="Override default <agent>/session/pending-questions.yaml path",
     )
     parser.add_argument(
+        "--all-agents",
+        action="store_true",
+        help=(
+            "Sweep EVERY agent's pending-questions.yaml in one invocation, "
+            "discovered through the agent-dir helper. Reads all of them; "
+            "--apply/--apply-cleanup still write ONLY the bound agent's file, "
+            "because the backend mechanically refuses a write to another "
+            "agent's dir (NoClaimError). Each per_agent row carries `writable` "
+            "so a reader can tell an actionable finding from one that must be "
+            "relayed. Mutually exclusive with --pq-path."
+        ),
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
         help=(
@@ -1026,6 +1219,22 @@ def main(argv=None):
         ),
     )
     args = parser.parse_args(argv)
+
+    # REFUSED rather than silently resolved either way: --pq-path names ONE file
+    # and --all-agents names every file, so any precedence we picked would be a
+    # silent narrowing or a silent widening. Silent narrowing is the exact defect
+    # this flag was added to fix (g-115-9715), so it must not be reintroduced at
+    # the CLI. Exit 2 = input error, per this script's documented contract.
+    if getattr(args, "all_agents", False) and args.pq_path:
+        print(json.dumps({
+            "error": "--all-agents and --pq-path are mutually exclusive",
+            "detail": (
+                "--pq-path names one file; --all-agents names every agent's. "
+                "Pass one or the other."
+            ),
+            "exit": 2,
+        }))
+        sys.exit(2)
 
     try:
         result = DISPATCH[args.subcommand](args)

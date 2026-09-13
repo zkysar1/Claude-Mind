@@ -51,14 +51,18 @@ def _summary_block() -> str:
     return m.group(1)
 
 
-def _run(op: str, response: str, agent: str = "alpha"):
+def _run(op: str, response: str, agent: str = "alpha", extra_env=None):
     """Drive the real summary block in the production env shape.
 
     STORAGE_BACKEND is pinned local (guard-955): this block never touches a
     store, but no test in this tree may run unpinned on an own-cloud box.
+
+    `extra_env` overlays additional env vars LAST, so a test can drive the block
+    from a hostile caller environment (g-115-9599: an observer seat with no
+    running session) without disturbing the pins above.
     """
     env = {**os.environ, "RESPONSE": response, "OP": op, "AGENT": agent,
-           "STORAGE_BACKEND": "local"}
+           "STORAGE_BACKEND": "local", **(extra_env or {})}
     p = subprocess.run([sys.executable, "-"], input=_summary_block(),
                        capture_output=True, text=True, env=env)
     return p.returncode, (p.stdout + p.stderr)
@@ -606,3 +610,107 @@ def test_wrapper_other_rc_mappings_unchanged(pyrc, op, want):
     """Regression: adding the rc=1 arm must not disturb any other mapping."""
     rc, _ = _run_case(pyrc, op)
     assert rc == want, f"pyrc={pyrc} op={op} mapped to {rc}, want {want}"
+
+
+# ---------------------------------------------------------------------------
+#  — THE OBSERVER SEAT, and the tombstone machine_id
+#
+# 2026-09-10: an observer box (no running session; its own
+# agents/alpha/session/agent-state had read IDLE since Aug 5) probed alpha and
+# got NOT-RUNNING at 00:16Z and again at 00:41Z — while that alpha Body merged
+# PR #543 at 00:37Z and wrote the world store at 00:39:47Z. The reading reached
+# the owner as "the fleet is down". Two things had to be pinned:
+#
+#   (a) the verdict is sourced ENTIRELY from the claim row the daemon returns,
+#       never from the probing box — so an IDLE observer seat must still be able
+#       to report LIVE for a holder on another machine. (The original
+#       local-composition hypothesis was falsified by a 01:13Z LIVE reading from
+#       that same seat; this pins the falsification structurally so the
+#       hypothesis cannot be re-introduced as a "fix".)
+#   (b) on a non-RUNNING row, `machine_id` is a TOMBSTONE. It is written only by
+#       acquire_runner (which sets agent_state=RUNNING in the same conditional
+#       update); release_runner and reclaim_if_stale leave it untouched. The old
+#       message rendered it present-tense ("has a claim row on 'cc-04'"), so two
+#       successive stand-downs read as one live claim migrating between boxes.
+# ---------------------------------------------------------------------------
+
+def test_observer_seat_reports_live_for_a_holder_on_another_machine():
+    """(a) An IDLE box probing a RUNNING claim held elsewhere must read LIVE.
+
+    This is the observer-seat case in the goal's own words: a box with no
+    running session probing an agent whose claim row lives on another machine.
+    The verdict must come from the ROW, so the probing box's own state is
+    irrelevant — including when it is emphatically IDLE.
+    """
+    env_hostile = {"MIND_SID": "", "MIND_RUNNING": ""}
+    rc, out = _run("status", _claims_body(machine="cc-09", state="RUNNING", age=255),
+                   extra_env=env_hostile)
+    assert rc == 0, f"observer seat must still read the holder's RUNNING row: {out!r}"
+    assert "LIVE" in out and "cc-09" in out
+
+
+def test_status_verdict_never_consults_local_box_state():
+    """(a, structural) The summary block must not read any local state file.
+
+    A behavioural pin alone cannot prove the absence of a local read — it only
+    shows one input did not change the answer. Assert the block contains no
+    filesystem read and no reference to the local agent-state surface, so a
+    future "read our own agent-state too" edit fails here rather than in
+    production on a watcher box.
+    """
+    block = _summary_block()
+    # POSITIVE CONTROL BEFORE THE ABSENCES ( fresh-eyes F-001). Every
+    # assertion below is an ABSENCE, and an absence over the wrong string passes
+    # trivially -- an empty block satisfies all six. `_summary_block`'s own
+    # `assert m` covers only the NO-MATCH case; a TRUNCATED match does not raise,
+    # because `(.*?)` is non-greedy and stops at the FIRST later `PYEOF` line. So
+    # a second heredoc, a marker rename, or the literal PYEOF appearing inside the
+    # block would silently shrink what is searched and this test would stay green
+    # while the regression it exists to catch had landed. Assert the block is the
+    # real one first, and the zero below has only one explanation.
+    assert "NOT-RUNNING" in block and 'if op == "status":' in block, (
+        "the extracted PYEOF block is not the status summary block -- the "
+        "absence assertions below would pass vacuously")
+    for forbidden in ("agent-state", "agent_state_dir", "open(", "Path(",
+                      "read_text", "MIND_SID"):
+        assert forbidden not in block, (
+            f"status summary block references {forbidden!r} — the verdict must be "
+            f"sourced from the daemon's claim row only (g-115-9599)")
+
+
+def test_not_running_line_labels_machine_id_as_a_last_holder_not_a_location():
+    """(b) The tombstone must not be rendered as where the agent is now."""
+    rc, out = _run("status", _claims_body(state="IDLE", machine="cc-04", age=10))
+    assert rc == 4
+    assert "NOT-RUNNING" in out
+    assert "cc-04" in out
+    assert "last holder" in out, f"machine_id must be labelled a last holder: {out!r}"
+    assert "has a claim row on" not in out, (
+        f"present-tense location phrasing is the g-115-9599 defect: {out!r}")
+
+
+def test_not_running_line_states_that_it_covers_only_the_reducer_lease():
+    """(b) An unheld lease is not evidence the agent is idle — say so.
+
+    A worker Body executes goals without ever holding this claim, which is why
+    worker_reducer_liveness.py polls this row to ask about its REDUCER. The line
+    that a human reads at decision time must carry that scope.
+    """
+    rc, out = _run("status", _claims_body(state="IDLE", age=10))
+    assert rc == 4
+    assert "SCOPE" in out and "lease" in out
+    assert "worker Body" in out
+
+
+def test_not_running_line_cannot_be_mistaken_for_the_live_line_by_the_parsers():
+    """Both consumers scope their machine/token parsers to LIVE_MARKER.
+
+    `worker_reducer_liveness._parse_machine` and `reducer_self_fence.parse_machine`
+    both locate the holder by searching for the literal "is RUNNING on ". If that
+    phrase ever appeared on the NOT-RUNNING line, a TOMBSTONE machine id would be
+    parsed as a live holder — and in reducer_self_fence that is the input to the
+    `different-holder` trigger, which sets stop-requested. Pin the separation.
+    """
+    _, out = _run("status", _claims_body(state="IDLE", machine="cc-04", age=10))
+    assert "is RUNNING on " not in out, (
+        f"NOT-RUNNING output must never carry the LIVE_MARKER phrase: {out!r}")

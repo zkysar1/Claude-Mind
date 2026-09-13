@@ -618,3 +618,120 @@ def test_manifest_is_written_before_the_mirror(tmp_path):
 
     assert seen.get("manifest_state") == "merged", (
         "the mirror ran before the manifest write landed")
+
+
+# ---------------------------------------------------------------------------
+# THE DELIVERY HALF (). The block above proves the state reaches the
+# carrier FILE. That is not the same as a peer being able to read it, and the
+# gap between those two claims ran for five months.
+#
+# The carrier is published only by the own-cloud daemon's periodic sync (120s,
+# rb-1464) -- and a Body's last heartbeat tick happens BEFORE its close, so
+# after a close nothing on that Body ever writes again. On a box that goes quiet
+# before the next sweep (power-down, lxc stop, killed pane -- the exact
+# population  is about) the mirror is written locally and the STORE
+# keeps `active` forever.
+#
+# MEASURED on cc-07 by direct GetObject (a read-through returns the local copy
+# and structurally cannot see this): Body 1dc6fc35 has read
+# `closed-pending-merge` locally since 2026-09-01T20:05:02 while the store still
+# returns `active` stamped 2026-08-27T16:47:56. Every one of these tests is RED
+# without `_push_carrier`.
+
+class _FakeBackend:
+    """Records deliveries. `write_bytes` is the one method _push_carrier uses."""
+
+    def __init__(self, fail: bool = False):
+        self.writes: list[tuple[str, bytes]] = []
+        self.fail = fail
+
+    def write_bytes(self, target, data):
+        if self.fail:
+            raise OSError("simulated transport failure")
+        self.writes.append((Path(target).name, data))
+
+
+def _install_fake_backend(monkeypatch, backend):
+    """`_push_carrier` does a LOCAL `from storage_backend import get_backend`,
+    so the fake must live in sys.modules at CALL time."""
+    import sys
+    import types
+    mod = types.ModuleType("storage_backend")
+    mod.get_backend = lambda: backend
+    monkeypatch.setitem(sys.modules, "storage_backend", mod)
+    return backend
+
+
+def test_close_DELIVERS_the_carrier_it_does_not_only_write_it(tmp_path, monkeypatch):
+    """The close must PUSH the carrier, not leave delivery to a sweep that will
+    never run again on this Body."""
+    be = _install_fake_backend(monkeypatch, _FakeBackend())
+    _mk_agent(tmp_path, "alpha", running_sid=SID_B)
+    bm.write_manifest(SID_A, "alpha", role="worker", project_root=tmp_path)
+    _write_carrier(tmp_path, "alpha", SID_A, body_state="active")
+
+    bm.set_state(SID_A, "alpha", "closed-pending-merge", project_root=tmp_path)
+
+    pushed = [w for w in be.writes if w[0].startswith("body-heartbeat-")]
+    assert pushed, (
+        "the close mirrored body_state locally but never DELIVERED it — a peer "
+        "keeps reading the pre-close state (the 1dc6fc35 defect)")
+    # The BYTES delivered must be the post-close ones. Pushing the file is
+    # worthless if it carries the value the store already had (guard-6374: a
+    # field is not wired until the thing that consumes it sees the new value).
+    import json as _json
+    assert _json.loads(pushed[-1][1])["body_state"] == "closed-pending-merge"
+
+
+def test_genuine_close_delivers_end_to_end(tmp_path, monkeypatch):
+    """Through the REAL entry point the stop-hook calls, not set_state directly."""
+    be = _install_fake_backend(monkeypatch, _FakeBackend())
+    _mk_agent(tmp_path, "alpha", running_sid=SID_B, wm_text="slots: {}\n")
+    bm.write_manifest(SID_A, "alpha", role="worker", project_root=tmp_path)
+    sd = tmp_path / "agents" / "alpha" / "sessions" / SID_A
+    (sd / bm._CLOSE_SENTINEL_FILENAME).write_text("", encoding="utf-8")
+    _write_carrier(tmp_path, "alpha", SID_A, body_state="active")
+
+    assert bm.close_body_on_genuine(SID_A, "alpha", project_root=tmp_path) == "marked"
+    assert any(w[0].startswith("body-heartbeat-") for w in be.writes)
+
+
+def test_POSITIVE_CONTROL_absent_carrier_still_delivers_nothing(tmp_path, monkeypatch):
+    """guard-4166: this fix's effect is that a stale `active` STOPS appearing, so
+    the proof needs a control that must NOT flip.
+
+    When there is no carrier there is nothing to mirror and nothing to deliver.
+    A push here would CREATE a carrier for a Body that never published one,
+    manufacturing a record out of an absence — so `zero deliveries` in this test
+    is the assertion, and it must stay zero while the test above goes from zero
+    to one. If both move together the fix is pushing unconditionally and the
+    measurement above proves nothing.
+    """
+    be = _install_fake_backend(monkeypatch, _FakeBackend())
+    _mk_agent(tmp_path, "alpha", running_sid=SID_B)
+    bm.write_manifest(SID_A, "alpha", role="worker", project_root=tmp_path)
+    # deliberately NO _write_carrier
+
+    bm.set_state(SID_A, "alpha", "closed-pending-merge", project_root=tmp_path)
+
+    assert be.writes == [], (
+        "delivery fired with no carrier present — it would fabricate one")
+    # Positive marker that the close path really ran (guard-2536).
+    assert _read(tmp_path, "alpha", SID_A)["body_state"] == "closed-pending-merge"
+
+
+def test_delivery_failure_never_breaks_a_close(tmp_path, monkeypatch, capsys):
+    """Fail-open, like every other step on a close path. A transport fault must
+    leave the close landed in the record of truth and say so on stderr — silence
+    would make a stranded close indistinguishable from a delivered one, which is
+    the defect this whole block is about."""
+    _install_fake_backend(monkeypatch, _FakeBackend(fail=True))
+    _mk_agent(tmp_path, "alpha", running_sid=SID_B)
+    bm.write_manifest(SID_A, "alpha", role="worker", project_root=tmp_path)
+    _write_carrier(tmp_path, "alpha", SID_A, body_state="active")
+
+    bm.set_state(SID_A, "alpha", "merged", project_root=tmp_path)
+
+    assert _read(tmp_path, "alpha", SID_A)["body_state"] == "merged"
+    assert _carrier_doc(tmp_path, "alpha", SID_A)["body_state"] == "merged"
+    assert "carrier push FAILED" in capsys.readouterr().err

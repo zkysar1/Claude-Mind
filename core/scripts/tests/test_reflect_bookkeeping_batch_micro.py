@@ -124,6 +124,40 @@ def test_stats_delta_counts_only_settled(tmp_path, monkeypatch):
     assert "DERIVED" in d["rule"] and "+= total" in d["rule"]
 
 
+MICROS_UPPERCASE = [
+    {"claim": "settled-yes", "confidence": 0.8, "outcome": "CONFIRMED",
+     "category": "cat-a"},
+    {"claim": "settled-no", "confidence": 0.6, "outcome": "CORRECTED",
+     "category": "cat-a"},
+    {"claim": "still-pending", "confidence": 0.5, "outcome": None,
+     "category": "cat-b"},
+]
+
+
+def test_stats_delta_counts_the_uppercase_outcome_case(tmp_path, monkeypatch):
+    #  fire #118 regression pin (c777c74352). EVERY other fixture in
+    # this file is lowercase, which is exactly why the suite could not see the
+    # defect: cmd_batch_micro compared against bare lowercase literals while
+    # the writeback filter prunes on `outcome is None` (case-AGNOSTIC), so a
+    # micro written in the UPPERCASE case that _reflectable.REFLECTABLE_OUTCOMES
+    # documents was counted as ZERO by one predicate and PRUNED as settled by
+    # the other, in the same rc=0 pass — the lenient predicate disposing of
+    # what the strict one failed to count.
+    #
+    # This fixture exists because the DIAGNOSIS was not the missing piece. The
+    # same defect was measured on 2026-08-16 (total=18, corrected=0,
+    # unresolved=17) and encoded as guard-4051, but the remedy applied was to
+    # RECASE THE DATA, so the code stayed broken for 26 days and destroyed the
+    # accuracy signal again on 09-11. A detection rule is not a repair; this
+    # test is. (guard-4319: a regression fixture must differ from the case the
+    # fix was built against by at least one dimension — here, the case itself.)
+    out = _run_batch(tmp_path, monkeypatch, MICROS_UPPERCASE)
+    d = out["stats_delta"]
+    assert d["confirmed_delta"] == 1, "uppercase CONFIRMED was not counted"
+    assert d["corrected_delta"] == 1, "uppercase CORRECTED was not counted"
+    assert d["pending_now"] == 1
+
+
 def test_writeback_prunes_settled_keeps_pending(tmp_path, monkeypatch):
     # Counted-once guarantee: settled micros leave the slot at the pass that
     # counted them; ONLY the pending micro survives into the writeback array.

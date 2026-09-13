@@ -185,8 +185,40 @@ _emit_notice() {
     if [ -n "${_n:-}" ] && [ "$_n" != "0" ]; then
         _plural="entries"
         [ "$_n" = "1" ] && _plural="entry"
-        echo "[wm-append] '$SLOT' is at its cap — $_n older $_plural evicted to make room. Victim selection is floor-aware (g-306-316) and this wrapper sees only the COUNT, not the class: if flagged entries exceed (cap - unflagged_floor) the oldest FLAGGED one goes, and it is carrier-backed — which makes delivery POSSIBLE, not certain: the entry reaches the reducer only if this Body's carrier PUSH is working. That used to be structurally impossible on a non-reducer Body, because the carrier lived inside the claim-protected agent tree and a worker never holds the runner claim (measured: 101 undelivered rows on one worker box). g-306-420 moved it to world/body-carriers/<agent>/, which is claim-EXEMPT, so a worker push now WORKS — verified from a worker Body on 2026-09-03, 15,742 B present under that key in the authoritative store. It is still a precondition and not a guarantee: a transport failure, or a Body still running pre-g-306-420 code, leaves the entry undelivered. The tell is '[body-capture-carrier] push FAILED', and WHERE it lands depends on the write path: from the CLI it reaches your stderr, but this wrapper writes through the DAEMON, so there it goes to the daemon's log and NOT to your terminal — and only once per daemon LIFETIME, which can be days. Absence of that line in your terminal is therefore NOT evidence the carrier is delivering (g-306-420). Otherwise the oldest UNFLAGGED one goes, and that IS an unrecoverable loss on any box (the WM slot is its only copy). On a REDUCER, do not route around this lane on the assumption that every eviction destroys undelivered mail — there, on a lane saturated with flagged entries, it does not (g-306-353)." >&2
+        echo "[wm-append] '$SLOT' is at its cap — $_n older $_plural evicted to make room. Victim selection is floor-aware (g-306-316) and this wrapper sees only the COUNT, not the class: if flagged entries exceed (cap - unflagged_floor) the oldest FLAGGED one goes, and it is carrier-backed — which makes delivery POSSIBLE, not certain: the entry reaches the reducer only if this Body's carrier PUSH is working. That used to be structurally impossible on a non-reducer Body, because the carrier lived inside the claim-protected agent tree and a worker never holds the runner claim (measured: 101 undelivered rows on one worker box). g-306-420 moved it to world/body-carriers/<agent>/, which is claim-EXEMPT, so a worker push now WORKS — verified from a worker Body on 2026-09-03, 15,742 B present under that key in the authoritative store. It is still a precondition and not a guarantee: a transport failure, or a Body still running pre-g-306-420 code, leaves the entry undelivered. The tell is '[body-capture-carrier] push FAILED', and WHERE it lands depends on the write path: from the CLI it reaches your stderr, but this wrapper writes through the DAEMON, so there it goes to the daemon's log and NOT to your terminal — and only once per daemon LIFETIME, which can be days. Absence of that line in your terminal is therefore NOT evidence the carrier is delivering (g-306-420) -- but you no longer have to infer it from an absence: since g-318-156 F6 the daemon reports carrier_pushed on every append (true = the store write returned without raising, false = local-only, null = no carrier write attempted) and this wrapper prints it in both directions. Otherwise the oldest UNFLAGGED one goes, and that IS an unrecoverable loss on any box (the WM slot is its only copy). On a REDUCER, do not route around this lane on the assumption that every eviction destroys undelivered mail — there, on a lane saturated with flagged entries, it does not (g-306-353)." >&2
     fi
+    #  F6: DELIVERY, stated positively. The carrier's own failure
+    # message is written ONCE PER PROCESS to stderr, and on this wrapper's path
+    # that stderr is the DAEMON's log — not your terminal — so a caller's only
+    # available evidence of health used to be the ABSENCE of a string it could
+    # never have seen anyway. rb-5828: a green check that cannot be shown to go
+    # red is not evidence. The daemon now reports `carrier_pushed` on every
+    # append and this branch is the consumer that makes it visible — a producer
+    # nobody displays is not shipped (the  lesson, one layer out).
+    #
+    # Printed in BOTH directions on purpose, exactly as `placement` is: a reader
+    # who has never seen the healthy line cannot read anything into its absence,
+    # so the true case is what gives the false case meaning. It fires only on a
+    # load_bearing capture append, so it is rare by construction.
+    #
+    # Extract a BARE WORD ([a-z]) — this value is an unquoted JSON literal
+    # (true/false/null), unlike "placement" whose value is a quoted string.
+    _cp="$(printf '%s\n' "$RESP" \
+        | sed -n 's/.*"carrier_pushed"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p' | head -1)"
+    # `case`, never an `&&` chain: this file runs under `set -e` and a trailing
+    # `&&` whose final test fails returns non-zero from this function, aborting
+    # the wrapper before its `exit 0` — the lesson the two branches above record.
+    # null / absent prints NOTHING, deliberately: "no carrier write was
+    # attempted for this append" is a THIRD FACT, not a failed delivery, and
+    # collapsing it into the false branch would alarm on every ordinary append.
+    case "$_cp" in
+        true)
+            echo "[wm-append] carrier: pushed — this load-bearing entry reached the store, so capture_fast_lane can deliver it to the reducer without waiting for consolidation. 'pushed' means the store write returned without raising; it is an ATTEMPT, not a verified read-back." >&2
+            ;;
+        false)
+            echo "[wm-append] carrier: NOT delivered — the push failed, so this load-bearing entry exists only in the local carrier and will reach the reducer at the close-time full merge instead of through the priority lane. It is not lost; it loses the acceleration. A NoClaimError here is STRUCTURAL, not transient (g-306-420) — check the daemon log for '[body-capture-carrier] push FAILED', which names the exception class." >&2
+            ;;
+    esac
 }
 
 case $rc in

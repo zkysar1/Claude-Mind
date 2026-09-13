@@ -42,10 +42,21 @@ VALID_TYPES = {"high-conviction", "calibration", "exploration", "contrarian"}
 VALID_OUTCOMES = {"CONFIRMED", "CORRECTED", "EXPIRED", "UNRESOLVABLE"}
 ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$")
 
-# Single source of truth for the `add` schema — used as both the argparse
-# epilog (visible via --help) AND the schema dump on validation error /
-# explicit --schema flag. Eliminates the discover-by-failure round-trips
-# the LLM hits when authoring pipeline records (rb-512 pattern).
+# Single source of truth for the `add` schema.
+#
+# ⚠ IT CURRENTLY HAS NO CONSUMERS, and the claim it carried until 2026-09-12
+# ("used as both the argparse epilog AND the schema dump on validation error /
+# explicit --schema flag") was false on all three counts: this name is
+# referenced nowhere but its own definition, `--schema` answers "no longer
+# available. See mind_api/src/endpoints/", and validation failures return a
+# one-line JSON error carrying none of this. So it eliminates the
+# discover-by-failure round-trips it was written for (rb-512 pattern) ONLY for
+# someone reading this source — which is how the CONDITIONALLY REQUIRED block
+# below came to be written, after four such round-trips in one sitting.
+#
+# Keep it accurate for that reader, and treat re-wiring it to the validation
+# error path as real work rather than a docstring tidy: the validation now runs
+# behind the daemon, so the error text a caller sees is produced there.
 PIPELINE_ADD_SCHEMA_TEXT = (
     "Stdin JSON fields:\n"
     "  REQUIRED:\n"
@@ -63,6 +74,21 @@ PIPELINE_ADD_SCHEMA_TEXT = (
     "  AUTO-DEFAULTED if absent: stage='discovered', slug, rationale,\n"
     "    outcome, evidence_for, evidence_against, mitigations, links,\n"
     "    notes, last_reviewed\n"
+    "  CONDITIONALLY REQUIRED — these are enforced by validation but were\n"
+    "  absent from this text until 2026-09-12, which cost four\n"
+    "  discover-by-failure round-trips in one sitting (the exact cost this\n"
+    "  block exists to prevent):\n"
+    "    claim               — any stage except 'discovered'; >=20 chars\n"
+    "    resolves_by         — horizon short|long at any stage except\n"
+    "                          'discovered'; a resolution date\n"
+    "    resolution method   — horizon short|long, same stages: populate ONE of\n"
+    "                          resolution_criteria / resolution_method /\n"
+    "                          rationale with >=10 chars saying HOW the outcome\n"
+    "                          gets decided\n"
+    "    measurement_channel — horizon 'short' AND stage 'active'; >=5 chars\n"
+    "                          naming the artifact/log/script/metric that will\n"
+    "                          settle it (or verification_channel /\n"
+    "                          resolution_source)\n"
     "\n"
     "Example:\n"
     "  echo '{\"id\":\"2026-04-25_foo\",\"title\":\"...\",\"stage\":\"discovered\",\n"

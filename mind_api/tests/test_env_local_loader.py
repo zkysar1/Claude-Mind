@@ -49,13 +49,17 @@ def test_loads_allowlisted_storage_keys_and_region(tmp_path):
     body = (
         "STORAGE_BACKEND=own-cloud\n"
         "STORAGE_S3_BUCKET=zds-data\n"
+        "STORAGE_S3_ENDPOINT_URL=http://store.internal:9000\n"
         "AWS_DEFAULT_REGION=us-east-2\n"
     )
     env = _run_loader(tmp_path, body,
                       clear_keys=("STORAGE_BACKEND", "STORAGE_S3_BUCKET",
-                                  "AWS_DEFAULT_REGION"))
+                                  "STORAGE_S3_ENDPOINT_URL", "AWS_DEFAULT_REGION"))
     assert env["STORAGE_BACKEND"] == "own-cloud"
     assert env["STORAGE_S3_BUCKET"] == "zds-data"
+    # The endpoint override must ride the deliberate loader, not only the
+    # best-effort get_backend() self-heal: a flipped box's daemon reads it here.
+    assert env["STORAGE_S3_ENDPOINT_URL"] == "http://store.internal:9000"
     assert env["AWS_DEFAULT_REGION"] == "us-east-2"
 
 

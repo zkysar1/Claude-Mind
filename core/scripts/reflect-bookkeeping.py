@@ -593,6 +593,22 @@ def cmd_surprise(args):
     )
 
 
+def _micro_outcome(m):
+    """Micro-hypothesis outcome, normalised to lower case.
+
+    The sibling pipeline reader (`_reflectable.is_reflectable`) upper-cases
+    before comparing, so it accepts either case. This module compared against
+    bare lowercase literals while the settled/pending split at the writeback
+    filter keys on `is None`, which is case-AGNOSTIC. So a micro written with
+    the uppercase outcome that `_reflectable.REFLECTABLE_OUTCOMES` documents was
+    PRUNED as settled by one predicate and counted as ZERO by the other --
+    destroying the accuracy signal with no error and no weird number
+    (guard-4695; rb-301 filter-predicate divergence). Measured 2026-09-11
+    (zeta, cc-02): 2 settled micros scored 0 confirmed / 0 corrected.
+    """
+    return str(m.get("outcome") or "").lower()
+
+
 def cmd_batch_micro(args):
     """Process the entire micro_hypotheses array as one batch."""
     micros = _read_micro_hypotheses()
@@ -605,8 +621,8 @@ def cmd_batch_micro(args):
         }, 0)
 
     total = len(micros)
-    confirmed = sum(1 for m in micros if m.get("outcome") == "confirmed")
-    corrected = sum(1 for m in micros if m.get("outcome") == "corrected")
+    confirmed = sum(1 for m in micros if _micro_outcome(m) == "confirmed")
+    corrected = sum(1 for m in micros if _micro_outcome(m) == "corrected")
     unresolved = sum(1 for m in micros if m.get("outcome") is None)
 
     resolved = confirmed + corrected
@@ -618,9 +634,9 @@ def cmd_batch_micro(args):
         b = by_category.setdefault(
             cat, {"total": 0, "confirmed": 0, "corrected": 0, "accuracy_pct": None})
         b["total"] += 1
-        if m.get("outcome") == "confirmed":
+        if _micro_outcome(m) == "confirmed":
             b["confirmed"] += 1
-        elif m.get("outcome") == "corrected":
+        elif _micro_outcome(m) == "corrected":
             b["corrected"] += 1
     for cat, b in by_category.items():
         res = b["confirmed"] + b["corrected"]
@@ -628,18 +644,18 @@ def cmd_batch_micro(args):
 
     overconfident_misses = sum(
         1 for m in micros
-        if (m.get("confidence") or 0) >= 0.80 and m.get("outcome") == "corrected"
+        if (m.get("confidence") or 0) >= 0.80 and _micro_outcome(m) == "corrected"
     )
     underconfident_hits = sum(
         1 for m in micros
-        if (m.get("confidence") or 0) <= 0.40 and m.get("outcome") == "confirmed"
+        if (m.get("confidence") or 0) <= 0.40 and _micro_outcome(m) == "confirmed"
     )
 
     # Surprise + promotion
     surprises = []
     for idx, m in enumerate(micros):
         conf = m.get("confidence") or 0.0
-        outcome = m.get("outcome")
+        outcome = _micro_outcome(m) or None
         surprise = compute_surprise(outcome, conf)
         m["surprise"] = surprise
 
@@ -678,7 +694,7 @@ def cmd_batch_micro(args):
 
     oc_by_cat = {}
     for m in micros:
-        if (m.get("confidence") or 0) >= 0.80 and m.get("outcome") == "corrected":
+        if (m.get("confidence") or 0) >= 0.80 and _micro_outcome(m) == "corrected":
             oc_by_cat[m.get("category", "uncategorized")] = (
                 oc_by_cat.get(m.get("category", "uncategorized"), 0) + 1)
     for cat, n in oc_by_cat.items():

@@ -33,6 +33,7 @@ every tmp-repo invocation in this file is structurally incapable of writing.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -236,7 +237,12 @@ def test_retire_deletes_merged_ref_and_writes_receipt(repo, tmp_path):
     assert "sid-bbbb" in ls, "unconsumed sibling ref must be untouched"
     receipts = work / "core" / "logs" / "worker-ref-retirements.jsonl"
     assert receipts.exists()
-    rec = json.loads(receipts.read_text().strip().splitlines()[-1])
+    lines = [json.loads(l) for l in receipts.read_text().strip().splitlines()]
+    # : a retirement now writes TWO append-only lines — the receipt
+    # (outcome "attempted", written BEFORE the destructive push) and a terminal
+    # outcome line. Select the receipt by its marker rather than by position;
+    # this assertion block is about the receipt's recovery fields.
+    rec = next(r for r in lines if r.get("outcome") == "attempted")
     assert rec["ref"] == "refs/workers/alpha/sid-aaaa"
     assert rec["tip_sha"] == repo["sha_a"], (
         "receipt must carry the tip SHA (rb-7598 discipline) — it is the "
@@ -247,6 +253,65 @@ def test_retire_deletes_merged_ref_and_writes_receipt(repo, tmp_path):
     assert "liveness_override" not in rec, (
         "no override was used — the receipt must not carry the field"
     )
+    # The terminal line is what makes the ledger readable without a second
+    # source: the receipt alone can only ever say "attempted".
+    term = [r for r in lines if r.get("outcome") in ("delete_succeeded", "delete_failed")]
+    assert len(term) == 1, f"expected exactly one terminal outcome line, got {term}"
+    assert term[0]["outcome"] == "delete_succeeded"
+    assert term[0]["ref"] == "refs/workers/alpha/sid-aaaa"
+    assert term[0]["tip_sha"] == repo["sha_a"], (
+        "the terminal line must carry the tip SHA so it joins to its receipt"
+    )
+
+
+def test_retire_failed_remote_delete_marks_ledger(repo, tmp_path):
+    """: when the remote delete FAILS the ledger must say so.
+
+    Reachable, not theoretical: two agents seeing the same stale carrier both
+    pass the reachability and liveness gates, the first deletes the ref, and the
+    second's `git push origin :<ref>` fails 'remote ref does not exist' with its
+    receipt ALREADY on disk. Before the fix that receipt was the only line, and
+    it asserted a retired_at timestamp — one retirement, two completion records.
+
+    --no-fetch is load-bearing here, not incidental: the default fetch is
+    `--prune`, so once origin's ref is gone a fetching run prunes the LOCAL ref
+    too and exits at the earlier 'no such ref locally' guard — a different path
+    that never reaches the push.
+    """
+    work = _merge_and_push_a(repo)
+    # Acquire the refs/workers/* name locally (the fixture clone has the commit
+    # but not the ref) via a plain report run, which fetches.
+    _consume(work)
+    assert "sid-aaaa" in _git(work, "ls-remote", "origin", "refs/workers/*")
+    # Make origin REFUSE the delete. The goal's proposed trigger -- another agent
+    # already deleted the ref -- does NOT work: measured on git 2.43.0, `git push
+    # origin :<ref>` exits 0 when the remote ref is already gone (and
+    # receive.denyDeletes did not change that either). A pre-receive hook is the
+    # deterministic way in, and it stands for the real-world class this path
+    # guards: a ref-protection rule or a server-side refusal.
+    hooks = repo["origin"] / "hooks"
+    hooks.mkdir(parents=True, exist_ok=True)
+    hook = hooks / "pre-receive"
+    hook.write_text("#!/bin/sh\necho 'deletes refused by test hook' >&2\nexit 1\n")
+    hook.chmod(0o755)
+
+    r = _consume(work, "--no-fetch", "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")})
+    assert r.returncode == 1, (
+        "a failed remote delete must still exit non-zero: " + r.stderr + r.stdout
+    )
+    receipts = work / "core" / "logs" / "worker-ref-retirements.jsonl"
+    assert receipts.exists(), "the receipt must be written BEFORE the push (fail-safe order)"
+    lines = [json.loads(l) for l in receipts.read_text().strip().splitlines()]
+    rec = next(r for r in lines if r.get("outcome") == "attempted")
+    assert rec["ref"] == "refs/workers/alpha/sid-aaaa"
+    term = [r for r in lines if r.get("outcome") in ("delete_succeeded", "delete_failed")]
+    assert len(term) == 1, f"expected one terminal line, got {term}"
+    assert term[0]["outcome"] == "delete_failed", (
+        "the whole point of g-306-479: a reader must be able to tell this "
+        "retirement did NOT complete, without consulting any other source"
+    )
+    assert term[0]["ref"] == "refs/workers/alpha/sid-aaaa"
 
 
 def test_retire_refuses_when_live_body_row_names_ref(repo, tmp_path):
@@ -292,7 +357,9 @@ def test_force_retire_live_overrides_and_logs_to_receipt(repo, tmp_path):
     ls = _git(work, "ls-remote", "origin", "refs/workers/*")
     assert "sid-aaaa" not in ls
     receipts = work / "core" / "logs" / "worker-ref-retirements.jsonl"
-    rec = json.loads(receipts.read_text().strip().splitlines()[-1])
+    rec = next(r for r in (json.loads(l) for l in
+               receipts.read_text().strip().splitlines())
+               if r.get("outcome") == "attempted")  # : not [-1] any more
     assert rec["liveness_override"] == "body killed manually during incident drill"
     assert rec["body_row"].startswith("LIVE-OVERRIDDEN goal=g-999-9")
 
@@ -359,8 +426,10 @@ def test_retire_proceeds_for_an_agent_that_simply_has_no_live_bodies(repo, tmp_p
                      status_payload='{"alpha": {}, "bravo": {"in_flight_bodies": {}}}')})
     assert r.returncode == 0, (r.stderr + r.stdout)
     assert "sid-aaaa" not in _git(work, "ls-remote", "origin", "refs/workers/*")
-    rec = json.loads((work / "core" / "logs" / "worker-ref-retirements.jsonl")
-                     .read_text().strip().splitlines()[-1])
+    rec = next(r for r in (json.loads(l) for l in
+               (work / "core" / "logs" / "worker-ref-retirements.jsonl")
+               .read_text().strip().splitlines())
+               if r.get("outcome") == "attempted")  # : not [-1] any more
     assert rec["body_row"] == "absent"
 
 
@@ -374,8 +443,10 @@ def test_schema_drift_refusal_is_overridable(repo, tmp_path):
                  env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
                      tmp_path, "null", status_payload="null")})
     assert r.returncode == 0, (r.stderr + r.stdout)
-    rec = json.loads((work / "core" / "logs" / "worker-ref-retirements.jsonl")
-                     .read_text().strip().splitlines()[-1])
+    rec = next(r for r in (json.loads(l) for l in
+               (work / "core" / "logs" / "worker-ref-retirements.jsonl")
+               .read_text().strip().splitlines())
+               if r.get("outcome") == "attempted")  # : not [-1] any more
     assert rec["liveness_override"] == "team-state schema migration in flight"
     assert "DRIFT" in rec["body_row"].upper(), rec["body_row"]
 
@@ -583,6 +654,251 @@ def test_content_bearing_merge_still_counts_as_unlanded_work(repo):
     assert e["commits_ahead"] == 1, e
     assert e["sync_merges"] == 0, e
     assert data["outstanding"] == 2, "sid-evil and sid-bbbb are both real tips"
+
+
+def _land_same_content_on_main_by_another_route(work):
+    """Put sid-bbbb's framework blob on main under a DIFFERENT commit.
+
+    This is the hunk-carry shape: the reducer copied the hunks onto main
+    instead of merging the ref, so the CONTENT is landed while the ref's own
+    commits stay unreachable. Same blob, different commit — which is exactly
+    what `commits_ahead` and the three-dot file list cannot see.
+    """
+    _git(work, "checkout", "main")
+    (work / "core").mkdir(exist_ok=True)
+    (work / "core" / "x.sh").write_text("echo x\n")   # byte-identical to sid-bbbb's
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "carry sid-bbbb's framework hunks onto main directly")
+    _git(work, "push", "origin", "main")
+    return _git(work, "rev-parse", "HEAD")
+
+
+def test_phantom_framework_payload_is_not_a_demand_signal(repo):
+    """ occ188. A ref whose framework blobs are ALREADY at HEAD by
+    another route must not raise the pull signal, however loudly the three-dot
+    file list still names those paths.
+
+    The three-dot count is RIGHT for what it reports ("what did these commits
+    touch" — guard-3094 / guard-4573 forbid switching it to two-dot). It is
+    the wrong question for the DEMAND signal, which asks "would merging bring
+    a framework path HEAD lacks". `framework_files_real` answers that one.
+
+    Note the shape deliberately kept here: sid-bbbb ALSO carries a.txt, a
+    non-framework path that is genuinely outstanding. So the ref is a PARTIAL
+    phantom, and the whole-ref merge-tree discriminator (occ165) correctly
+    returns not-phantom while the framework half is entirely phantom — which
+    is why the test is per-path.
+    """
+    work = repo["work"]
+    _land_same_content_on_main_by_another_route(work)
+    r = _consume(work, "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    b = by_sid["sid-bbbb"]
+    assert b["framework_files"] == 1, (
+        "the three-dot list must STILL name the path — it reports what the "
+        "ref's commits touched, and that is unchanged", b)
+    assert b["framework_files_real"] == 0, (
+        "merging contributes no framework content: the blob is already at "
+        "HEAD under a different commit", b)
+
+    assert b["merge_paths_real"] == 1, (
+        "occ189: the framework half is phantom but a.txt is genuinely "
+        "outstanding, so the WHOLE-ref merge is not empty", b)
+
+    txt = _consume(work, "--check")
+    assert txt.returncode == 0, txt.stderr
+    assert "PHANTOM framework payload" in txt.stdout, txt.stdout
+    assert "merge with:" not in txt.stdout, (
+        "recommending a merge whose FRAMEWORK content is already at HEAD is "
+        "the redundant no-op merge the drain protocol exists to prevent",
+        txt.stdout)
+    # occ189: this fixture is the MIXED case (phantom framework half + live
+    # agent-store half), so --check must make the NARROW claim only. Until
+    # 2026-09-12 it said "merging yields a no-op merge commit" here, which
+    # would have told an operator to discard a.txt on the strength of a
+    # framework-only measurement (guard-5122).
+    assert "This is NOT a no-op merge" in txt.stdout, txt.stdout
+    assert "merging would still change 1 path(s)" in txt.stdout, txt.stdout
+    assert "no-op merge commit" not in txt.stdout, (
+        "the whole-ref no-op claim is not licensed by fw_real alone",
+        txt.stdout)
+
+
+def test_real_framework_payload_still_raises_the_demand_signal(repo):
+    """Positive control for the test above — WITHOUT it a fix that hard-coded
+    framework_files_real=0 would pass. Same ref, same instrument, no main-side
+    carry: the payload is genuinely outstanding and must read that way."""
+    work = repo["work"]
+    r = _consume(work, "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    b = by_sid["sid-bbbb"]
+    assert b["framework_files"] == 1, b
+    assert b["framework_files_real"] == 1, (
+        "nothing landed this blob on main, so merging DOES bring it", b)
+
+    txt = _consume(work, "--check")
+    assert txt.returncode == 0, txt.stderr
+    assert "merge with:" in txt.stdout, txt.stdout
+    assert "PHANTOM framework payload" not in txt.stdout, txt.stdout
+    # occ190 NEGATIVE CONTROL for the test below. The merge-tree read SUCCEEDED
+    # here, so the payload is MEASURED and the fail-open note must be absent.
+    # Without this assertion a fix that printed the note unconditionally would
+    # pass the positive test while restoring the very indistinguishability
+    # guard-2586 forbids.
+    assert "FAIL-OPEN, not a measurement" not in txt.stdout, txt.stdout
+
+
+def _git_merge_tree_shim(tmp_path, blob_oid):
+    """PATH shim whose `git merge-tree` prints a BLOB oid instead of a tree.
+
+    This is the "unresolvable tree" cause worker-ref-consume.sh names for
+    mt_total=-1: `rev-parse --verify <blob>^{tree}` cannot peel a blob, so the
+    phantom content test is skipped and fw_real/mt_total keep their fail-open
+    values. No repository state can produce it — real merge-tree emits a tree
+    or nothing — so shimming the binary is the only way to exercise the branch,
+    and leaving it unexercised is how the branch's own comment stayed wrong for
+    an hour (occ190). Every other subcommand execs the real git unchanged.
+    """
+    real_git = shutil.which("git")
+    assert real_git, "no git on PATH to delegate to"
+    d = tmp_path / "gitshim"
+    d.mkdir(exist_ok=True)
+    p = d / "git"
+    p.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "merge-tree" ]; then printf \'%s\\n\' '
+        f'"{blob_oid}"; exit 0; fi\n'
+        "done\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    p.chmod(0o755)
+    return d
+
+
+def test_unreadable_merge_tree_is_named_on_the_merge_recommendation(repo, tmp_path):
+    """ occ190. `merge with:` is reached by TWO conditions and until
+    2026-09-12 printed one sentence for both: (a) the content test RAN and
+    found real framework payload, and (b) the content test could NOT run, so
+    fw_real stayed at the three-dot touch count and the payload is ASSUMED.
+
+    An operator cannot act differently on two readings that are byte-identical
+    (guard-2586 — a fallback path and a failure path must never emit the same
+    message; guard-4719 — compute the cause or the message lies on every other
+    path). The fail-open BEHAVIOUR is correct and deliberately unchanged; what
+    was missing is that it says so.
+    """
+    work = repo["work"]
+    src = tmp_path / "notatree.txt"
+    src.write_text("not a tree\n")
+    blob = _git(work, "hash-object", "-w", str(src))
+    shim = _git_merge_tree_shim(tmp_path, blob)
+
+    txt = _consume(
+        work, "--check",
+        env={"PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"},
+    )
+    assert txt.returncode == 0, txt.stderr
+    assert "merge with:" in txt.stdout, (
+        "fail-open is the intended behaviour — under-signalling strands "
+        "framework work silently (guard-3660 asymmetry)", txt.stdout)
+    assert "FAIL-OPEN, not a measurement" in txt.stdout, (
+        "an unreadable merge-tree must SAY the payload was assumed from the "
+        "three-dot touch list, not measured", txt.stdout)
+
+
+def _land_the_WHOLE_ref_on_main_by_another_route(work):
+    """Put BOTH of sid-bbbb's blobs on main under a different commit.
+
+    Sibling of `_land_same_content_on_main_by_another_route`, which lands only
+    the framework blob and therefore produces the MIXED case. This one lands
+    the agent-store blob too, so merging sid-bbbb really would change nothing
+    — the only state in which --check may say "no-op merge commit".
+    """
+    _git(work, "checkout", "main")
+    (work / "core").mkdir(exist_ok=True)
+    (work / "core" / "x.sh").write_text("echo x\n")   # byte-identical to sid-bbbb's
+    (work / "a.txt").write_text("a\n")                # byte-identical to sid-aaaa's
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "carry ALL of sid-bbbb's hunks onto main directly")
+    _git(work, "push", "origin", "main")
+    return _git(work, "rev-parse", "HEAD")
+
+
+def test_whole_ref_no_op_is_the_only_state_that_earns_the_no_op_claim(repo):
+    """ occ189. The DISCRIMINATOR between the two phantom messages.
+
+    occ188 gated the demand signal on a per-path content test (`fw_real`) and
+    then used that same number to assert "merging yields a no-op merge
+    commit". Those are different claims: `fw_real` looks only at framework
+    paths, so it says nothing about an agent-store delta riding the same ref.
+    The sibling test above pins the MIXED case; this one pins the case where
+    the wide claim is actually earned, and the pair is what makes either
+    assertion meaningful — without this one a fix that simply deleted the
+    "no-op" sentence would pass.
+
+    Not hypothetical: ddcd6db0 was in the mixed state at 02:29 on the very
+    firing that shipped `fw_real` — four phantom framework blobs beside a
+    genuinely outstanding experience.jsonl.
+    """
+    work = repo["work"]
+    _land_the_WHOLE_ref_on_main_by_another_route(work)
+    r = _consume(work, "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    b = by_sid["sid-bbbb"]
+    assert b["framework_files"] == 1, (
+        "the three-dot touch list is unchanged by any of this", b)
+    assert b["framework_files_real"] == 0, b
+    assert b["merge_paths_real"] == 0, (
+        "both blobs are at HEAD, so the whole-ref merge-tree equals HEAD's "
+        "tree", b)
+
+    txt = _consume(work, "--check")
+    assert txt.returncode == 0, txt.stderr
+    assert "PHANTOM framework payload" in txt.stdout, txt.stdout
+    assert "do NOT merge" in txt.stdout, txt.stdout
+    assert "genuine no-op merge commit" in txt.stdout, txt.stdout
+    assert "merge with:" not in txt.stdout, txt.stdout
+    assert "This is NOT a no-op merge" not in txt.stdout, (
+        "the wide claim IS licensed here — mt_total is 0", txt.stdout)
+
+
+def test_no_op_claim_is_gated_on_the_whole_ref_count_in_source():
+    """Source pin for the occ189 discriminator (sibling of the fw_real pin
+    below). The two counts must stay SEPARATE: `fw_real` gates the pull
+    signal, `mt_total` gates the no-op wording. Folding either into the other
+    re-creates one of the two defects — a framework-only signal that fires on
+    agent-store churn, or a no-op claim made from a framework-only reading.
+    """
+    src = CONSUME.read_text(encoding="utf-8")
+    assert 'if [ "$mt_total" = 0 ] && [ "$mt_conf" = 0 ]; then' in src, (
+        "the no-op sentence must be gated on the UNFILTERED merge-tree count "
+        "(occ189) AND on a measured-clean merge (occ192) — a non-zero "
+        "merge-tree rc must not be able to ride under a 'genuine no-op' claim")
+    assert "This is NOT a no-op merge" in src, (
+        "the mixed case needs its own message, not silence")
+    assert 'mt_total=-1' in src, (
+        "-1 is the UNMEASURED sentinel; a 0 default would make an unreadable "
+        "merge-tree assert the strongest claim available")
+    assert '"merge_paths_real":%s' in src, (
+        "machine consumers need the same discrimination the text has")
+    # The occ188 gate must be untouched by the occ189 fix.
+    assert 'if [ "$fw_real" -gt 0 ]; then' in src
+    assert "pull_fw_total=$((pull_fw_total+fw_real))" in src
+
+
+def test_demand_signal_gate_reads_the_content_count_in_source():
+    """Source pin: pull_tip_count must be gated on the CONTENT count, not the
+    touch count. A future edit reverting the gate to fw_count restores the
+    false out-of-cadence promotion measured at occ188 (echo/cc-03 raised a
+    pull_signal naming 4 framework files that were all already on main)."""
+    src = CONSUME.read_text(encoding="utf-8")
+    assert 'if [ "$fw_real" -gt 0 ]; then' in src, (
+        "the pull-signal gate must key on fw_real (content), not fw_count")
+    assert "pull_fw_total=$((pull_fw_total+fw_real))" in src
 
 
 def test_content_not_commits_source_pin():
@@ -965,3 +1281,333 @@ def test_daemon_only_ref_counts_as_framework_and_is_pullable(repo):
     assert h.returncode == 0, h.stderr
     out = h.stdout + h.stderr
     assert "mind_api/src/d.py" in out, out
+
+
+# ── occ191: agent-store-only carrier refs (fw_count=0, commits_ahead>0) ──────
+# The class `mt_total` exists for was the one class it never measured. The
+# merge-tree block was gated on `fw_count > 0`, and so was the whole per-ref
+# detail report — so a PURE agent-store ref reported two numbers and nothing
+# else, the safe-looking one being framework_files=0. guard-6539 was written
+# for exactly that misreading ("means nothing under core/ — NOT safe to
+# merge") and a guardrail cannot outvote the instrument it guards
+# (guard-1984). Measured live on ref faec5e55: merging would have dropped 99
+# append-only changelog records and added none, with the report silent.
+
+
+def _agentstore_repo(tmp_path):
+    """main carrying a 5-line append-only agent store, plus two SIBLING
+    carrier refs branched from it — one STALE (rewrote the store shorter, so
+    merging deletes) and one APPENDING (added lines, so merging adds).
+
+    Siblings, not a chain: neither is an ancestor of the other, so both are
+    TIPs and both reach the new report branch. Every path is under agents/,
+    so framework_files is 0 for both by construction — that is the point.
+    """
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    r = _run(["git", "init", "--bare", "--initial-branch=main", str(origin)])
+    assert r.returncode == 0, r.stderr
+    r = _run(["git", "clone", str(origin), str(work)])
+    assert r.returncode == 0, r.stderr
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    store = work / "agents" / "alpha"
+    store.mkdir(parents=True)
+    (store / "log.jsonl").write_text("".join(f'{{"n": {i}}}\n' for i in range(1, 6)))
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base: 5-line append-only agent store")
+    _git(work, "push", "origin", "main")
+    base = _git(work, "rev-parse", "HEAD")
+
+    # STALE carrier: a Body whose snapshot predates the last 3 appends and
+    # which committed that shorter file back. Merging it DELETES 3 records.
+    (store / "log.jsonl").write_text("".join(f'{{"n": {i}}}\n' for i in range(1, 3)))
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "stale body snapshot of the agent store")
+    sha_stale = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_stale}:refs/workers/alpha/sid-stale")
+    _git(work, "reset", "--hard", base)
+
+    # APPENDING carrier: the ordinary healthy shape. Merging it ADDS 2.
+    (store / "log.jsonl").write_text("".join(f'{{"n": {i}}}\n' for i in range(1, 8)))
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "body appended two records")
+    sha_append = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_append}:refs/workers/alpha/sid-append")
+    _git(work, "reset", "--hard", base)
+    return {"origin": origin, "work": work}
+
+
+@pytest.fixture()
+def agentstore_repo(tmp_path):
+    return _agentstore_repo(tmp_path)
+
+
+def test_agent_store_only_ref_is_measured_not_left_unmeasured(agentstore_repo):
+    """occ191. fw_count=0 must no longer imply merge_paths_real=-1.
+
+    Before the fix both refs below reported merge_paths_real=-1 (UNMEASURED)
+    forever, because the merge-tree block only ran when fw_count>0 — i.e. the
+    sentinel that exists to stop a framework-only reading being generalised
+    was itself unavailable for every ref that has NO framework half.
+    """
+    work = agentstore_repo["work"]
+    r = _consume(work, "--json")
+    assert r.returncode == 0, r.stderr
+    by_sid, _ = _refs_by_sid(r.stdout)
+    for sid in ("sid-stale", "sid-append"):
+        row = by_sid[sid]
+        assert row["framework_files"] == 0, row
+        assert row["commits_ahead"] == 1, row
+        assert row["merge_paths_real"] == 1, (
+            "the content test must RUN for an agent-store-only ref; -1 here "
+            "is the pre-occ191 blind spot", row)
+
+
+def test_deletion_only_merge_is_named_as_a_stale_carrier_not_as_content(agentstore_repo):
+    """The measured faec5e55 case: merging removes records and adds none.
+
+    A path COUNT cannot distinguish this from content arriving, and the count
+    is what the operator sees. Direction is what makes the line actionable.
+    """
+    work = agentstore_repo["work"]
+    by_sid, _ = _refs_by_sid(_consume(work, "--json").stdout)
+    row = by_sid["sid-stale"]
+    assert row["merge_added_real"] == 0, row
+    assert row["merge_deleted_real"] == 3, row
+
+    txt = _consume(work, "--check")
+    assert txt.returncode == 0, txt.stderr
+    assert "DELETION-ONLY" in txt.stdout, txt.stdout
+    assert "Default disposition = CARRY" in txt.stdout, txt.stdout
+    assert "guard-6539" in txt.stdout, (
+        "the line must name the guardrail whose trap it closes", txt.stdout)
+    assert "merge with:" not in txt.stdout, (
+        "a deletion-only carrier must never carry a merge recommendation",
+        txt.stdout)
+
+
+def test_appending_agent_store_ref_is_the_positive_control(agentstore_repo):
+    """Both directions in one fixture, or an always-warns bug reads as a find.
+
+    Same code path, same store, opposite delta: this ref must NOT get the
+    deletion warning, and must be named as the safe append shape.
+    """
+    work = agentstore_repo["work"]
+    by_sid, _ = _refs_by_sid(_consume(work, "--json").stdout)
+    row = by_sid["sid-append"]
+    assert row["merge_added_real"] == 2, row
+    assert row["merge_deleted_real"] == 0, row
+
+    txt = _consume(work, "--check")
+    assert "append-only (+2 / -0)" in txt.stdout, txt.stdout
+
+
+def test_widening_the_content_test_cannot_raise_the_demand_signal(agentstore_repo):
+    """The safety argument for widening, asserted rather than reasoned.
+
+    `fw_real` filters the merge-tree result to framework prefixes and the
+    merge result vs HEAD is a SUBSET of the three-dot touch list, so
+    fw_real <= fw_count always. At fw_count=0 the newly-reachable branch must
+    therefore leave fw_real at 0 and contribute nothing to the pull signal —
+    the widening adds a measurement, never a signal (guard-2499).
+    """
+    work = agentstore_repo["work"]
+    by_sid, _ = _refs_by_sid(_consume(work, "--json").stdout)
+    for sid in ("sid-stale", "sid-append"):
+        assert by_sid[sid]["framework_files_real"] == 0, by_sid[sid]
+
+
+def test_content_test_entry_condition_covers_agent_store_refs_in_source():
+    """Source pin. Narrowing the guard back to `fw_count > 0` restores the
+    blind spot silently — every agent-store-only ref would go back to
+    reporting -1 with no detail line, and no test that reads only framework
+    refs would notice."""
+    src = CONSUME.read_text(encoding="utf-8")
+    assert 'if [ "$fw_count" -gt 0 ] || [ "$ahead" -gt 0 ]; then' in src, (
+        "the merge-tree content test must run for refs with commits but no "
+        "framework payload (occ191)")
+    assert 'elif [ "$ahead" -gt 0 ] && [ "$is_self" = 0 ]; then' in src, (
+        "the report needs its own branch for agent-store-only refs; without "
+        "it the measurement is taken and never shown")
+    assert '"merge_added_real":%s' in src and '"merge_deleted_real":%s' in src, (
+        "machine consumers need direction, not only a path count")
+    assert "mt_add=-1" in src and "mt_del=-1" in src, (
+        "-1 stays the UNMEASURED sentinel for the direction fields too")
+
+
+# ── occ192: the CONFLICTING merge-tree, the one shape the suite never had ────
+# Everything above pins the merge-tree read for CLEAN results — phantom
+# framework payload (occ188), the whole-ref no-op (occ165), direction on an
+# agent store (occ191), and an UNREADABLE tree via a PATH shim (occ190, a state
+# no repository can produce). The reachable conflicted state had no fixture at
+# all, and it was live on cc-04 while all 59 of those tests were green: ref
+# faec5e55 merged with `CONFLICT (add/add)` on an experience file while --check
+# printed "append-only (+171 / -0): safe shape. Merge only if the content is
+# wanted". New-mode `git merge-tree` still WRITES a tree for a conflicted merge
+# (markers embedded in the conflicting blob) and signals the conflict two ways
+# the script was discarding: a non-zero rc, destroyed by the `| head -1`
+# pipeline (guard-1473), and a `CONFLICT ...` report on lines 2..N, dropped by
+# the same `head`. Both are free and already in that output.
+
+
+def _conflict_repo(tmp_path):
+    """main and a carrier ref that ADD THE SAME PATH with different content.
+
+    add/add is the shape measured live, and it is the one a snapshot carrier
+    reaches naturally: two Bodies writing the same experience file from a
+    common base neither of them had it in.
+
+    A CLEAN sibling ref is built in the same fixture deliberately. An
+    always-warns regression and a working discriminator are textually
+    identical when only the conflicting ref is asserted — the negative control
+    is what makes a green run mean something (self.md: run a positive control
+    before believing a zero, and its converse here).
+    """
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    r = _run(["git", "init", "--bare", "--initial-branch=main", str(origin)])
+    assert r.returncode == 0, r.stderr
+    r = _run(["git", "clone", str(origin), str(work)])
+    assert r.returncode == 0, r.stderr
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    store = work / "agents" / "alpha"
+    (store / "experience").mkdir(parents=True)
+    (store / "log.jsonl").write_text('{"n": 1}\n')
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base: agent store, no experience file yet")
+    _git(work, "push", "origin", "main")
+    base = _git(work, "rev-parse", "HEAD")
+
+    # CONFLICTING carrier: adds exp-x.md with the Body's content.
+    (store / "experience" / "exp-x.md").write_text("written by the body\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "body wrote its experience file")
+    sha_conf = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_conf}:refs/workers/alpha/sid-conflict")
+    _git(work, "reset", "--hard", base)
+
+    # CLEAN carrier: appends to a file HEAD does not touch. Merges cleanly.
+    (store / "log.jsonl").write_text('{"n": 1}\n{"n": 2}\n')
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "body appended one record")
+    sha_clean = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_clean}:refs/workers/alpha/sid-clean")
+    _git(work, "reset", "--hard", base)
+
+    # HEAD adds the SAME path with DIFFERENT content -> add/add against the
+    # conflicting carrier, and no interaction at all with the clean one.
+    # The mkdir is load-bearing: `reset --hard base` above removed exp-x.md and
+    # with it the now-empty experience/ dir (git tracks no empty directory), so
+    # the write below lands in a path that no longer exists.
+    (store / "experience").mkdir(parents=True, exist_ok=True)
+    (store / "experience" / "exp-x.md").write_text("written at head\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "head wrote the same experience file")
+    _git(work, "push", "origin", "main")
+    return {"origin": origin, "work": work}
+
+
+@pytest.fixture()
+def conflict_repo(tmp_path):
+    return _conflict_repo(tmp_path)
+
+
+def _ref_block(stdout, sid):
+    """The --check lines belonging to ONE ref.
+
+    Scoping matters here for the same reason it mattered in the subject: the
+    fixture deliberately reports a CLEAN sibling in the same run, which
+    legitimately prints "safe shape", so a whole-stdout negative assertion
+    measures the wrong population and fails against correct output. (Caught by
+    this very test on its first run — the defect class the subject had.)
+    """
+    lines, block, seen = stdout.splitlines(), [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("refs/workers/"):
+            if seen:
+                break
+            seen = stripped.endswith("/" + sid)
+            continue
+        if seen:
+            block.append(line)
+    return "\n".join(block)
+
+
+def test_conflicting_merge_is_named_and_the_shape_verdict_is_withheld(conflict_repo):
+    """The live faec5e55 case. --check must SAY the merge conflicts, name the
+    path, and NOT emit a reassuring shape verdict over a conflicted tree."""
+    work = conflict_repo["work"]
+    txt = _consume(work, "--check")
+    assert txt.returncode == 0, txt.stderr
+    block = _ref_block(txt.stdout, "sid-conflict")
+    assert block, ("the conflicting ref must appear in the report", txt.stdout)
+    assert "CONFLICT" in block, (
+        "a conflicting merge must be disclosed; merge-tree signals it by rc "
+        "AND by a CONFLICT line, and the script reads that output already",
+        block)
+    assert "agents/alpha/experience/exp-x.md" in block, (
+        "naming the count without the path leaves the operator nowhere to "
+        "start", block)
+    assert "safe shape" not in block, (
+        "the +/- counts are taken over the CONFLICTED tree (markers "
+        "included), so no shape verdict may be asserted from them", block)
+    assert "Merge only if the content is wanted" not in block, (
+        "that sentence invites a merge that will stop mid-way", block)
+
+
+def test_clean_sibling_block_still_gets_its_shape_verdict(conflict_repo):
+    """The suppression must be SCOPED to the conflicting ref. A regression that
+    withholds the verdict everywhere would pass the test above."""
+    work = conflict_repo["work"]
+    block = _ref_block(_consume(work, "--check").stdout, "sid-clean")
+    assert "append-only (+1 / -0): safe shape" in block, block
+    assert "CONFLICT" not in block, (
+        "a clean merge must not be warned about", block)
+
+
+def test_clean_sibling_ref_is_the_negative_control(conflict_repo):
+    """Same fixture, same run, no conflict: an always-warns bug must not read
+    as a working discriminator."""
+    work = conflict_repo["work"]
+    by_sid, _ = _refs_by_sid(_consume(work, "--json").stdout)
+    assert by_sid["sid-clean"]["merge_conflicts_real"] == 0, (
+        "0 is MEASURED clean and is only set inside the resolved-tree branch",
+        by_sid["sid-clean"])
+    assert by_sid["sid-conflict"]["merge_conflicts_real"] == 1, (
+        by_sid["sid-conflict"])
+
+
+def test_merge_conflicts_real_keeps_the_unmeasured_sentinel(conflict_repo):
+    """-1 means UNMEASURED, never 'clean'. A consumer reading -1 as 0 makes
+    exactly the claim the human line refuses to make — the same inversion
+    merge_paths_real's -1 convention exists to prevent (occ189)."""
+    src = CONSUME.read_text(encoding="utf-8")
+    assert "mt_conf=-1" in src, "-1 is the UNMEASURED initial value"
+    assert '"merge_conflicts_real":%s' in src, (
+        "machine consumers need the conflict signal too, not only the report")
+    # A ref with no commits ahead never enters the merge-tree block, so its
+    # conflict state is genuinely unmeasured and must report as such.
+    work = conflict_repo["work"]
+    _git(work, "push", "origin", "HEAD:refs/workers/alpha/sid-behind")
+    by_sid, _ = _refs_by_sid(_consume(work, "--json").stdout)
+    assert by_sid["sid-behind"]["merge_conflicts_real"] == -1, (
+        "no commits ahead => the content test never ran => UNMEASURED",
+        by_sid["sid-behind"])
+
+
+def test_conflict_disclosure_survives_a_reworded_conflict_line(conflict_repo):
+    """Source pin on the belt-and-braces half. The CONFLICT line is parsed by
+    text, so a git wording change would silently downgrade the disclosure to
+    'clean'; the non-zero rc is the independent signal that must keep it."""
+    src = CONSUME.read_text(encoding="utf-8")
+    assert '_mtrc=$?' in src, (
+        "merge-tree's own rc must be captured off the UNPIPED command "
+        "(guard-1473) — a trailing `| head -1` reports head's 0")
+    assert '[ "$_mtrc" -ne 0 ] && [ "$mt_conf" = 0 ] && mt_conf=1' in src, (
+        "a non-zero rc with no parsed CONFLICT line is still a conflict; "
+        "trust the status over the parse")

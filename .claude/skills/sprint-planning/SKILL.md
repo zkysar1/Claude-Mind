@@ -183,7 +183,13 @@ FOR each proposed change (canonical scripts ONLY — never edit stores):
    while X sits at MEDIUM/either is a contradiction shipped to the fleet.
 
 2. Decisions board (required outcome of the recurring goal):
-   Bash: echo '{"subject":"Sprint planning YYYY-MM-DD: <tallies + verdicts>","text":"<D-verdicts, apply tallies, per-agent top 2-3 for ~3 days>","tags":["sprint-planning"]}' | board-post.sh --channel decisions
+   Bash: printf '%s' "Sprint planning YYYY-MM-DD: <tallies + verdicts>
+
+   <D-verdicts, apply tallies, per-agent top 2-3 for ~3 days>" | bash core/scripts/board-post.sh --channel decisions --tags sprint-planning
+   # Message TEXT on stdin (first line = subject); no --subject/--text flag and
+   # NO JSON payload form — the script's json-body guard REFUSES one
+   # (guard-1036/guard-1531; the prior JSON-shaped example here failed rc=1 on
+   # 2026-09-11 and cost the run a turn).
 
 3. Coordination heads-up when writes touched other agents' lanes or claims:
    what closed, what moved, what each agent should pick up next. Routing

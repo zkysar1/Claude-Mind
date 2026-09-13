@@ -177,7 +177,19 @@ def run(apply: bool = False, slot_override: Path | None = None) -> dict:
         if n:
             res["failed"].append({"file": e.get("environment") or "?",
                                   "reason": f"{n} directive(s) left queued: no target "
-                                            "aspiration configured (SIDECAR_DIRECTIVE_ASP_ID)"})
+                                            "aspiration configured (INBOUND_DIRECTIVE_ASP_ID)"})
+    # THE NAME IS LOAD-BEARING AND IT WAS WRONG (, measured 2026-09-12 echo/cc-03).
+    # This finding read `SIDECAR_DIRECTIVE_ASP_ID` until now; that name is set by NOTHING and
+    # read by NOTHING -- the engine's only target var is inbound_drain.DIRECTIVE_ASP_ENV =
+    # "INBOUND_DIRECTIVE_ASP_ID", and `grep -rn SIDECAR_DIRECTIVE_ASP_ID` over this repo AND
+    # Ayoai-Environment-Server@origin/main returned only this string and the test pinning it.
+    # So the one channel that survives the slot's `|| true; exit 0` told every reader to go
+    # look for a variable that cannot exist. Cost, measured:  was picked up TWELVE
+    # times across five Bodies, each recording "SIDECAR_DIRECTIVE_ASP_ID still UNSET" as the
+    # one true remaining blocker, while the vessel carried INBOUND_DIRECTIVE_ASP_ID set
+    # (value_len=7) and its minted "Assigned by the member" aspiration all along. A finding
+    # that names a phantom is worse than silence: it is actionable-looking and unactionable.
+    # rb-2515 class ("reported absent may be PRESENT under a different env-var name").
     # STRANDED records (): a record a PRIOR run claimed into processing/
     # and never completed. The drain deliberately leaves it there — re-applying a
     # member's half-applied instruction is an operator judgment, not a sweep's

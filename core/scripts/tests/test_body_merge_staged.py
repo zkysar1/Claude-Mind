@@ -28,9 +28,33 @@ import shutil
 import subprocess
 import sys
 import types
+import pytest
 from pathlib import Path
 
 import yaml
+
+@pytest.fixture(autouse=True)
+def _hermetic_world_staged(tmp_path, monkeypatch):
+    """Point the staged-WM root at a TMP world for every test in this file.
+
+    Load-bearing, not tidiness (g-115-9750, same reasoning as the g-306-420
+    carrier fixture). `_consume_staged` now resolves the world-rooted staging
+    dir through `_paths.WORLD_DIR`, so without this fixture a test would scan —
+    and a producer test would WRITE into — the LIVE `world/`, which on an
+    own-cloud box is the guard-955 production-key collision class. MEASURED,
+    not hypothetical: the first run of this change (before this fixture
+    existed) left three synthetic files in the live
+    `world/body-staged-wm/test_stage_and_push_writes_tri0/`.
+
+    Patching the module ATTRIBUTE works because `world_staged_dir` does its
+    `from _paths import WORLD_DIR` inside the function body.
+    """
+    import _paths
+    w = tmp_path / "world"
+    w.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(_paths, "WORLD_DIR", w, raising=False)
+    return w
+
 
 TESTS_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = TESTS_DIR.parent                # core/scripts/
@@ -557,6 +581,111 @@ def test_stage_and_push_writes_trigger_last(tmp_path, monkeypatch):
     assert len(written) == 3, f"expected all three staged, got {written}"
     assert written[-1] == f"{uk}-wm.yaml", (
         f"the -wm.yaml TRIGGER must be WRITTEN LAST; observed order {written}")
+
+
+# ───────── : the world-rooted lane, and the two-dir union ─────────
+#
+# The producer now stages into `world/body-staged-wm/<agent>/` because that is
+# the only destination that is BOTH syncable AND claim-exempt (the in-tree pair
+# deadlocks: `session/` is syncable but claim-fenced, `sessions/` is claim-exempt
+# but sync-excluded). `_consume_staged` therefore scans BOTH dirs and the UNION
+# is the migration — nothing already staged under the legacy path is stranded,
+# and no box has to migrate in lockstep.
+#
+# Every OTHER consumer test in this file still stages via `_stage()` into the
+# LEGACY dir, so the legacy half of the union is covered by all of them at once;
+# these add the world half and the overlap.
+
+
+def _stage_world(pr: Path, sid: str, body_wm: dict, name: str = "alpha",
+                 baseline: dict | None = None, wm_hash: str | None = None) -> Path:
+    """Stage into the world-rooted destination the producer writes to now."""
+    staged = merge.bm.world_staged_dir(pr / "agents" / name)
+    staged.mkdir(parents=True, exist_ok=True)
+    p = staged / f"{sid}-wm.yaml"
+    with open(p, "w", encoding="utf-8") as f:
+        yaml.dump(body_wm, f, default_flow_style=False, sort_keys=False)
+    if baseline is not None:
+        with open(staged / f"{sid}-wm-baseline.yaml", "w", encoding="utf-8") as f:
+            yaml.dump(baseline, f, default_flow_style=False, sort_keys=False)
+    if wm_hash is not None:
+        (staged / f"{sid}-wm.hash").write_text(wm_hash + "\n", encoding="utf-8")
+    return p
+
+
+def test_world_staged_orphan_merged_and_consumed(tmp_path):
+    """The new lane drains at all — the half that did not exist before."""
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"active_context": {"a": 1}}})
+    staged_file = _stage_world(pr, SID, {"slots": {"body_only_slot": {"from": "world"}}})
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert SID in summary["staged_merged"]
+    red = _read_reducer(pr)
+    assert red["slots"].get("body_only_slot") == {"from": "world"}
+    assert red["slots"].get("active_context") == {"a": 1}
+    assert not staged_file.exists(), "world-staged file must be consumed exactly once"
+
+
+def test_both_lanes_drain_in_one_pass(tmp_path):
+    """Two DIFFERENT units, one in each dir. The union must carry both.
+
+    A regression that scanned only one dir would still pass a single-lane test;
+    it fails here, which is the point of using two distinct unitKeys.
+    """
+    other = "55555555-5555-4555-8555-555555555555"
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {}})
+    legacy_file = _stage(pr, SID, {"slots": {"from_legacy": 1}})
+    world_file = _stage_world(pr, other, {"slots": {"from_world": 1}})
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert sorted(summary["staged_merged"]) == sorted([SID, other])
+    red = _read_reducer(pr)["slots"]
+    assert red.get("from_legacy") == 1 and red.get("from_world") == 1
+    assert not legacy_file.exists() and not world_file.exists()
+
+
+def test_shadowed_legacy_triple_loses_to_world_and_is_deleted_with_it(tmp_path):
+    """SAME unitKey in BOTH dirs — the overlap branch.
+
+    WORLD WINS because it is the copy written later and the only copy a
+    worker's push can have delivered. Asserted on a COUNTER, not on "a merge
+    happened": with baseline 10 and reducer 10, the world body's 15 gives
+    10 + (15-10) = 15, while the legacy body's 99 would give 99. A test that
+    only checked `staged_merged` would pass whichever copy won.
+
+    The legacy triple is then deleted on the SAME disposition as the copy that
+    was actually read — never as a standalone delete (archive-before-delete.md:
+    cc-08 established the staged triple is some Bodies' SOLE SURVIVING TRACE).
+    """
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    legacy_file = _stage(pr, SID, {"slots": {"goals": 99}})
+    _stage_baseline(pr, SID, {"slots": {"goals": 10}})
+    world_file = _stage_world(pr, SID, {"slots": {"goals": 15}},
+                              baseline={"slots": {"goals": 10}})
+
+    summary = merge.generalize_down("alpha", project_root=pr)
+
+    assert SID in summary["staged_merged"]
+    assert summary.get("staged_shadowed") == [SID], \
+        "the overlap must be RECORDED, not silently resolved"
+    assert _read_reducer(pr)["slots"]["goals"] == 15, \
+        "the LEGACY copy won (99) or neither did — world must outrank legacy"
+    assert not world_file.exists()
+    assert not legacy_file.exists(), \
+        "the shadowed legacy copy must not survive to re-merge next pass"
+    assert not (pr / "agents" / "alpha" / "session" / "pending-body-merges"
+                / f"{SID}-wm-baseline.yaml").exists()
+    # counted ONCE, not once per directory
+    assert summary["staged_merged"].count(SID) == 1
+    assert summary["scanned"] == 1
+
+
+def test_no_shadow_recorded_when_the_unit_is_in_one_dir_only(tmp_path):
+    """Negative control for the branch above: the ordinary single-lane case
+    must NOT report a shadow, or `staged_shadowed` means nothing."""
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {}})
+    _stage_world(pr, SID, {"slots": {"x": 1}})
+    summary = merge.generalize_down("alpha", project_root=pr)
+    assert SID in summary["staged_merged"]
+    assert summary.get("staged_shadowed", []) == []
 
 
 if __name__ == "__main__":

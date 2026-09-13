@@ -642,8 +642,23 @@ def _render(result: Dict[str, Any]) -> None:
               " Unclaimed rows are keyed by executed_by; '(unattributed)' has no drainer at all.")
     if not result["slate"]:
         if pop["mine_noted"]:
-            print("[cnc-slate] slate EMPTY but population non-zero — the age gate is "
-                  "holding fresh rows back; this is NOT a drained backlog.")
+            # guard-4719: this branch is reachable by FOUR independent suppressors,
+            # so naming one of them unconditionally misreports the cause. Measured
+            # 2026-09-11 (zeta, cc-02): held_back_fresh=0 and note_unchanged=17,
+            # and the line still blamed the age gate — sending a reader to inspect
+            # a gate that had held back nothing. Compute the cause instead.
+            _sup = [(label, pop.get(key, 0)) for label, key in (
+                ("the age gate (rows under the claim-age floor)", "mine_held_back_fresh"),
+                ("own-sid exclusion", "mine_held_back_own_sid"),
+                ("a recent hold (< hold TTL)", "mine_held_back_recent_hold"),
+                ("an UNCHANGED note (already judged not-cnc)",
+                 "mine_held_back_note_unchanged"),
+            ) if pop.get(key, 0)]
+            _why = ("; ".join(f"{label}: {n}" for label, n in _sup) if _sup
+                    else "NO suppressor counter is non-zero — that is itself a "
+                         "finding, investigate before trusting this empty slate")
+            print("[cnc-slate] slate EMPTY but population non-zero — suppressed by "
+                  f"{_why}; this is NOT a drained backlog.")
         else:
             print("[cnc-slate] no completed-not-closed goals held by this agent.")
         return

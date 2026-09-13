@@ -257,3 +257,63 @@ errors=0` (plus the expected 11-pruned-agent WARN, which `errors=0` disposes). A
 than its author; it worked as written and saved a re-read cycle.
 
 | 2026-09-07 | foxtrot | N=103 | LAPTOP-3IOFCNEO | 93036 | 101249 | pre/post append. Read WHOLE twice, tail intact — item 9 "at or past the cap" FALSIFIED; g-115-8597's 285,382 B claim for this file is unreconciled, do not inherit. Write-time re-probe max=102 unchanged, no peer in a 61.7h gap. Mirror-ahead −543 B → flush pushed=2, delta 0 verified |
+
+---
+
+## 2026-09-12 (alpha, `hostname` cc-04, `uname -r` 6.8.0-139-generic, own-cloud) — THE "SHARD IS 35 B FROM A CEILING" PREMISE IS FALSE, AND IT BLOCKED THREE CONSECUTIVE PASSES
+
+**Read this before deferring an alpha-shard cut for budget again.** A cut was
+carried as "the largest debt" across three windows — refused by N=158 at ~80k
+context, then twice more by the N=159 window — on the premise that
+`directive-lane-series-alpha.md` sat at **62,465 B against a 62,500 B ceiling,
+headroom 35 B, so a cut is FORCED before any append**. Measured today: **no such
+ceiling exists.**
+
+- `grep -rn '62500\|62,500' core/config core/scripts .claude/skills/fresh-eyes-review`
+  returns exactly ONE hit fleet-wide: `core/scripts/aspirations-claim.sh:602`,
+  `CAP = 62500  # ~25k tokens at 2.5 B/tok, measured` — the **claim-note** cap,
+  which has nothing to do with this shard. There is no shard byte ceiling in
+  `core/config/*.yaml`, none in the skill, and none in this file.
+- The number is refuted by this file's own record: the **N=135 row above measures
+  this same shard at 65,705 B** and cuts it normally. 62,465 is not near a limit;
+  it is 3,240 B BELOW a size the shard has already operated at.
+- Mechanism of the error: a bare 5-digit number matched in an unrelated file and
+  was carried forward as a governing constant. Nothing downstream contradicts a
+  plausible number, and the 35 B "headroom" it implies is alarming enough to
+  suppress the very re-measurement that would kill it. Same shape this file
+  already records at N=127/128/130 — a self-authored size claim that nothing
+  checks — but pointing the other way: there the claim flattered the writer, here
+  it manufactured an emergency.
+
+**THE REAL INVARIANT IS `keep-newest-4`, AND IT IS CURRENTLY SATISFIED.** Live
+state measured 2026-09-12 08:2x: shard **62,465 B**, md5
+`cd59e279a28ee5d3e0b556ae3be9ddba`, holding **exactly four** `### Reading at` rows —
+N=154 (L117), N=155 (L143), N=156 (L167), N=157 (L199), oldest-first. Four of four.
+**Nothing is owed right now.**
+
+**So the cut is not overdue — it is due AT THE MOMENT N=158 IS WRITTEN, as part of
+that write**, because the invariant must hold AFTER the write (the N=135 row above).
+From four rows, writing one row means cutting exactly ONE: evict **N=154**
+(lines 117-142) leaving N=155/156/157 + the new N=158 = four. This is the ordinary
+one-row eviction the N=150..154 archives all show, NOT the two-row catch-up N=135
+needed from five.
+
+**NAMING, NOW SETTLED EMPIRICALLY (5/5).** First `### Reading at` heading of each
+archive: `-pre-n150`→N=149, `-pre-n151`→N=150, `-pre-n152`→N=151, `-pre-n153`→N=152,
+`-pre-n154`→N=153. So `-pre-nNNN.md` holds **the row evicted when row NNN was
+written** — under keep-newest-4 with a 4-row shard that is row NNN-4+... no: it is
+simply the OLDEST row at write time, which in an unbroken sequence is NNN-1 shifted
+by the backlog. Do not derive it; the operative rule is **name the archive after the
+row you are WRITING**. Writing N=158 therefore evicts N=154 into
+**`directive-lane-series-alpha-pre-n158.md`** — the target N=158's own handoff named,
+which was CORRECT. A mid-window "correction" of that name to `-pre-n155.md` was
+wrong and is retracted here; `-pre-n154.md` is already taken and holds N=153.
+
+**WHAT THE NEXT WRITER SHOULD DO:** fold `agents/alpha/temp/fresh-eyes-2026-09-12T06-18-48.md`
+in as the N=158 point (it carries its own correction block — observation (1) in it is
+FALSIFIED, do not fold that one), re-probe N at WRITE time against the authoritative
+store per g-115-8055 (max was 157 at 08:2x), archive N=154 with an md5 receipt, prove
+the cut by ROUND TRIP (cut-file + archived-block reconstructs the pre-cut file
+byte-for-byte — stronger than a size check, and the N=135 row explains why), then
+append. Budget needed is ordinary, not exceptional. **Do not defer this for context
+again on the ceiling premise; there is no ceiling.**

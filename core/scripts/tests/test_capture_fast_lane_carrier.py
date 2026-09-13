@@ -897,3 +897,104 @@ def test_nothing_is_ever_written_to_the_legacy_location(tmp_path):
     assert written is not None
     assert CARRIER_DIRNAME not in written.parts, written
     assert not (agent_dir / "session" / CARRIER_DIRNAME).exists()
+
+
+# ---------------------------------------------------------------------------
+#  F6 — the CALL SITE, which is the half the helper's own tests cannot
+# reach. push()'s bool contract is pinned five ways above; guard-5324 is the
+# lesson that this proves nothing about whether anyone READS it, and a discarded
+# return made a total delivery failure byte-indistinguishable from total
+# success. These are STRUCTURAL pins by source, for the same reason the wiring
+# test above is: mind_api's package-relative imports make a standalone load of
+# wm_write.py fail.
+# ---------------------------------------------------------------------------
+
+def _repo_root() -> Path:
+    # SCRIPT_DIR is core/scripts, so the repo root is TWO levels up — the same
+    # arithmetic test_both_wm_writers_are_wired_to_the_carrier uses. Written as
+    # .parent once first, which the is_file() assertion below caught immediately
+    # instead of letting four tests read as a missing fix.
+    return SCRIPT_DIR.parent.parent
+
+
+def _src(rel: str) -> str:
+    path = _repo_root() / rel
+    assert path.is_file(), (
+        f"{rel} not found at {path} — this test's own path arithmetic is wrong; "
+        "a missing file must not read as a missing assignment")
+    return path.read_text(encoding="utf-8")
+
+
+def test_both_wm_writers_assign_the_push_return_rather_than_discarding_it():
+    """Neither writer may call push() as a bare statement (guard-5324).
+
+    The negative half is the load-bearing one, exactly as it is in
+    precheck-eval's `flags.append(...)` pin: asserting only that the assigning
+    form is PRESENT would still pass if a second, discarding call sat beside it,
+    and the discarding call is the defect.
+    """
+    import re
+    for rel, var in (("core/scripts/wm.py", "_bcc"),
+                     ("mind_api/src/endpoints/wm_write.py", "_cm")):
+        src = _src(rel)
+        assert f"_carrier_pushed = bool({var}.push(" in src, (
+            f"{rel} does not ASSIGN the carrier push result — a discarded "
+            "return makes a failed delivery indistinguishable from a "
+            "successful one (guard-5324)")
+        bare = [ln for ln in src.splitlines()
+                if re.match(rf"\s*{re.escape(var)}\.push\(", ln)]
+        assert not bare, (
+            f"{rel} still calls push() as a bare statement, discarding the "
+            f"bool: {bare!r}")
+
+
+def test_carrier_pushed_is_three_valued_and_never_collapses_none_into_false():
+    """None (no carrier write attempted) must stay distinct from False (it failed).
+
+    Collapsing them rebuilds the always-reports-clear defect pointing the other
+    way: every ordinary non-capture append would report a delivery failure. Both
+    writers must therefore INITIALISE the name to None outside the branch that
+    sets it — the same NameError trap `_evicted` and `_carrier_path` document.
+    """
+    for rel in ("core/scripts/wm.py", "mind_api/src/endpoints/wm_write.py"):
+        src = _src(rel)
+        assert "_carrier_pushed = None" in src, (
+            f"{rel} never initialises _carrier_pushed to None — a capture-less "
+            "append would NameError, or the third state would be lost")
+        assert "_carrier_pushed = False\n_carrier_pushed = None" not in src
+
+
+def test_daemon_append_response_always_carries_carrier_pushed():
+    """Always present, like `evicted` and `placement`, so a caller can branch
+    on it without a key-existence check. The daemon is the LIVE path
+    (wm-append.sh is daemon-routed), so this is the one that reaches production.
+    """
+    src = _src("mind_api/src/endpoints/wm_write.py")
+    assert '"carrier_pushed": _carrier_pushed' in src, (
+        "the append response builder does not emit carrier_pushed — a producer "
+        "that never reaches a caller is not shipped")
+    # In the SAME dict literal as evicted/placement, not a conditional add:
+    # a key present only on some paths forces the key-existence check the
+    # evicted/placement precedent exists to remove.
+    assert '"placement": _placement, "carrier_pushed": _carrier_pushed' in src
+
+
+def test_wm_append_wrapper_displays_carrier_pushed_in_both_directions():
+    """A fix is shipped when a CONSUMER displays it (the  lesson).
+
+    Both branches are required: a reader who has never seen the healthy line
+    cannot read anything into its absence, so the true case is what gives the
+    false case meaning. The null/absent case must print NOTHING — "no carrier
+    write was attempted" is a third fact, not a failed delivery.
+    """
+    src = _src("core/scripts/wm-append.sh")
+    assert '"carrier_pushed"' in src, "the wrapper never reads carrier_pushed"
+    assert "carrier: pushed" in src, "the wrapper never reports a DELIVERED push"
+    assert "carrier: NOT delivered" in src, (
+        "the wrapper never reports a FAILED push — the actionable direction")
+    # The value is an unquoted JSON literal, so the extractor must match a bare
+    # word. A quoted-string extractor (the `placement` shape) silently returns
+    # empty here and the branch would never fire — an always-quiet emitter that
+    # ships looking correct (guard-2421).
+    assert '\\([a-z][a-z]*\\)' in src or '([a-z][a-z]*)' in src, (
+        "carrier_pushed must be extracted as a BARE WORD, not a quoted string")

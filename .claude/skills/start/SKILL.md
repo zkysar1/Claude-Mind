@@ -273,8 +273,11 @@ W-pre. **Ex-Worker Same-Terminal Guard** (g-306-210 — the RUNNING-branch half 
 
     Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
 
-    IF output is `EX_WORKER_FORK_PRESENT`: STOP. Do NOT proceed to W0. Display
-    the same fresh-terminal message as 0-pre2.
+    IF output is `EX_WORKER_FORK_PRESENT`: run 0-pre2's daemon hoist FIRST —
+    `bash core/scripts/mind-api-start.sh || echo "[start-worker] daemon-start
+    failed (non-fatal)" >&2` — then STOP. Do NOT proceed to W0. Display the
+    same fresh-terminal message as 0-pre2. (Reuses that MESSAGE, not its STEPS,
+    so the hoist repeats here — guard-3448, g-115-9671.)
 
 
     IF output is `no-fork`: continue to W0.
@@ -426,8 +429,12 @@ DONE.
 
    Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
 
-   IF output is `EX_WORKER_FORK_PRESENT`: STOP. Do NOT proceed to Step 0. Display
-   the same fresh-terminal message as 0-pre2. Placement before Step 0 is
+   IF output is `EX_WORKER_FORK_PRESENT`: run 0-pre2's daemon-start hoist
+   FIRST — `bash core/scripts/mind-api-start.sh || echo "[start] daemon-start
+   failed (non-fatal)" >&2` — then STOP. Do NOT proceed to Step 0. Display
+   the same fresh-terminal message as 0-pre2. (Reuses 0-pre2's MESSAGE, not its
+   STEPS, so the hoist is repeated here — guard-3448, g-115-9671.)
+   Placement before Step 0 is
    load-bearing for the same reason as W-pre (guard-1813): the manifest reset at
    Step 0.4 is the destructive write, so a refusal after it protects nothing.
 
@@ -557,8 +564,15 @@ DONE.
 
    Bash: `test -f "agents/<agent-name>/sessions/$MIND_SID/working-memory.yaml" && echo "EX_WORKER_FORK_PRESENT" || echo "no-fork"`
 
-   IF output is `EX_WORKER_FORK_PRESENT`: STOP. Do NOT proceed to Step 0.
-   Display:
+   IF output is `EX_WORKER_FORK_PRESENT`: ACT on the half this guard does not
+   own, THEN STOP. Do NOT proceed to Step 0. The guard refuses the PROMOTION,
+   not the PROCESS — the daemon is box-level and cannot promote a fork.
+   Fail-open; never let it block the refusal. Why + incident:
+   `core/config/rationale/start-daemon-hoist.md` (g-115-9671).
+
+   Bash: `bash core/scripts/mind-api-start.sh || echo "[start] daemon-start failed (non-fatal)" >&2`
+
+   Display, naming which half was handled:
    > ⚠ This terminal's session (SID `$MIND_SID`) previously ran as a WORKER
    > Body for `<agent-name>`. Its fork file still exists, and the Bash hook
    > keys `BODY_ROLE=worker` on that file for the lifetime of this session —
@@ -641,8 +655,8 @@ DONE.
 
    Hoisted here so a partial /stop that left `stop-requested` on disk (e.g., the
    session was closed after graceful-stop D1 ran but before D3 cleared it)
-   doesn't survive into reader or assistant mode. State is already IDLE, so no
-   loop polling could be interrupted; clearing is purely hygienic. Do NOT also
+   doesn't survive into reader or assistant mode. Clear is REFUSED (rc=1) on a live
+   stop: core/config/rationale/vessel-stop-clear-guard.md. Do NOT also
    do this clear in the autonomous sub-path below — it's already done HERE.
    Do NOT add this clear to the RUNNING observer branch above — observers MUST
    NOT touch signal files (that's the observer contract).
@@ -897,7 +911,9 @@ DONE.
      no PID file, no /start spawn. Add new probes to `build_probes()` in
      `core/scripts/agent-watchdog.py`.)
    - Output: "Agent resumed. Learning loop starting."
-   - Invoke `/boot`
+   - Bash (deterministic hand-off marker — mirrors `iteration-close.sh`'s loop-reentry imperative):
+     `echo "═══ /start COMPLETE — <agent-name> RUNNING (autonomous) ═══"; echo "NEXT ACTION REQUIRED: invoke Skill(boot) NOW — the non-optional terminal step of autonomous /start. Do NOT summarize what /start did and do NOT ask the user to confirm booting; invoking /start WAS the authorization. /boot hands off into the aspirations loop."`
+   - **Invoke `/boot` now — this turn's terminal action, not an offer.** Autonomous `/start` from IDLE ALWAYS chains straight into `/boot` with no confirmation step (unlike UNINITIALIZED first-boot, which alone gates on Self confirmation — `start-phase-c.md` C1.9). Ending the turn on a text summary or a "shall I boot?" question leaves the agent RUNNING-but-not-looping — the failure observed 2026-09-11 (agent `bobby`: /start set RUNNING, then stopped and asked to boot, so the loop never started and the user had to re-run /start). If state is RUNNING, the only valid next action is the `Skill(boot)` call.
 
 ### UNINITIALIZED (agent-state doesn't exist or <agent>/ doesn't exist)
 

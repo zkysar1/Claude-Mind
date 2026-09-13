@@ -263,6 +263,34 @@ def test_unclustered_premise_is_not_reported_as_a_cluster(monkeypatch, capsys):
     assert res["records"][0]["shared_premise_count"] == 1
 
 
+def test_kebab_case_premise_clusters(monkeypatch, capsys):
+    """The separator the fleet actually writes. MEASURED 2026-09-13 (zeta, cc-02):
+    across 19 signalled live defers the snake_case-only pattern matched ZERO, so
+    `shared_premise_clusters` was permanently `{}` — indistinguishable from the
+    healthy answer "no shared premises exist", which is why it survived. Four
+    defers were declaring `quiet-window` membership of g-326-565 in plain text
+    and the join could not see one of them. CLAUDE.md's naming rule is
+    kebab-case ("no underscores"), so the writers were following the house style
+    and the regex was not; the sibling test above pins the snake form, and only
+    this one pins the form anybody uses."""
+    goals = [_goal(g, "human_blocked: quiet-window member of g-326-565 per pq-fox.")
+             for g in ("g-306-128", "g-306-294", "g-326-565", "g-372-08")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-fox": "retired"})
+    assert res["shared_premise_clusters"] == {"quiet-window": 4}
+    assert all(r["premise_resource"] == "quiet-window" for r in res["records"])
+
+
+def test_prose_defer_is_not_mined_for_a_premise(monkeypatch, capsys):
+    """The other direction, which is what makes accepting `-` safe (guard-1636 —
+    a widening must be measured BOTH ways). A prose defer's first two words are
+    separated by a SPACE, which is in neither character class, so no premise is
+    extracted and no false cluster forms — even when a LATER word is hyphenated."""
+    goals = [_goal("g-1", "human_blocked: the last agent-side path closed per pq-fox.")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-fox": "answered"})
+    assert res["records"][0]["premise_resource"] is None
+    assert res["shared_premise_clusters"] == {}
+
+
 # ── rb-245: a read failure must never render as a clean zero ──────────────
 
 def test_unreadable_source_is_not_clean(monkeypatch, capsys):

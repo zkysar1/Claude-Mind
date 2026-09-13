@@ -206,6 +206,19 @@ files:
     required_when_idle: false
     required_when_running: false
 
+  - file: perception-received
+    purpose: >-
+      wake signal — an environment CHANGE envelope reached /observe on a vessel
+      (g-373-10). BLOCKER class: a change to the resident's own world breaks even
+      an approved quiescence sleep. Never written on a heartbeat envelope, and
+      never in assistant mode, where no loop sleeps and nothing reads it
+      (guard-1806).
+    writer: vessel /observe on kind='change' (session-signal-set.sh)
+    recovery_action: clear
+    sync_tier: machine_local
+    required_when_idle: false
+    required_when_running: false
+
   - file: .wake-debounce-mtime
     purpose: wake-signal debounce timestamp (epoch seconds) — coalesces bursty partner signals into single wake (g-001-230)
     writer: interruptible-sleep.sh
@@ -641,6 +654,34 @@ files:
   # its forked WM to a reducer on ANOTHER box. `sessions/` (plural) is
   # walk-pruned by _EXCLUDE_DIRS, which is exactly why the Body's WM is
   # COPIED here (session/, singular) to become syncable at all.
+  #
+  # ── : THIS REGISTRATION IS NECESSARY AND WAS NEVER SUFFICIENT ──
+  # Everything above is true and was never the whole story. `continuity` buys
+  # a file the RIGHT to sync; it says nothing about the own-cloud CLAIM FENCE,
+  # which refuses every store PUT under `agents/<agent>/` from a box that does
+  # not hold that agent's live runner claim — and a worker Body never holds
+  # one. So `push_staged_files` raised NoClaimError from every worker box for
+  # the transport's entire life, while these three entries sat here reading
+  # correct. FOUR Bodies read this block and still could not explain the
+  # stranding; that is the cost of a registration that documents one of two
+  # independent gates. Measured first-person on cc-09 2026-09-11T18:51:42
+  # (core/logs/abandoned-sessions.log): three NoClaimErrors, result
+  # `marked-push-failed`, 13 files / 26,975,224 B across 4 Bodies left behind.
+  #
+  # The two in-tree candidates DEADLOCK — `session/` is syncable but
+  # claim-fenced, `sessions/` is claim-exempt but sync-excluded — so the
+  # PRODUCERS now stage to `world/body-staged-wm/<agent>/`, which is both.
+  # That path is under `world/` and therefore OUT OF THIS MANIFEST'S SCOPE
+  # entirely: this file classifies `agents/<agent>/session/` basenames, and
+  # nothing here governs it. Do NOT add world-rooted entries below.
+  #
+  # These three entries STAY, and are NOT legacy bookkeeping: the bash
+  # crash-preserve path in cleanup-stale-bindings.sh is IRREDUCIBLY LOCAL,
+  # cannot resolve WORLD_DIR, and still stages here — `body-manifest.py`'s
+  # `push-staged` relocates the triple world-rooted before pushing. Three
+  # boxes also hold real unmerged payload under this path, and
+  # `body-merge._consume_staged` scans BOTH directories; that union IS the
+  # migration. Deleting these entries would unsync a live lane.
   #
   # Registering all three is load-bearing, not bookkeeping. Unregistered
   # basenames fall through _session_file_machine_local's extension

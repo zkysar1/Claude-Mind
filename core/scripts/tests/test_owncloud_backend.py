@@ -580,7 +580,17 @@ def test_reclaim_stale_runner(cloud):
     _set_heartbeat(cloud, "alpha", time.time() - 10_000)   # crash: heartbeat stale
     assert other.reclaim_if_stale("alpha") is True
     assert a.get_runner_state("alpha")["agent_state"] == "IDLE"
+    # TOMBSTONE INVARIANT, reclaim half ( fresh-eyes F-002). A PEER on
+    # machine "B" broke the stale claim, and machine_id STILL reads "A" -- the
+    # crashed holder, not the reclaimer. That asymmetry is exactly why the
+    # NOT-RUNNING line calls machine_id a last holder rather than a location:
+    # reclaim_if_stale writes agent_state only. See the dependent-artifact list
+    # in test_release_runner_clean before changing this.
+    assert a.get_runner_state("alpha")["machine_id"] == "A"
     assert other.acquire_runner("alpha", "tokB") is True   # reclaimed -> acquirable
+    # ...and the acquire DOES move it, which is the positive control proving the
+    # two asserts above measure a real invariant rather than an inert field.
+    assert a.get_runner_state("alpha")["machine_id"] == "B"
 
 
 def test_fresh_runner_not_reclaimed(cloud):
@@ -670,8 +680,21 @@ def test_heartbeat_wrong_token_rejected(cloud):
 def test_release_runner_clean(cloud):
     a = _backend(cloud, machine_id="A")
     assert a.acquire_runner("alpha", "tokA") is True
+    # POSITIVE CONTROL for the tombstone assertion below: acquire is the ONLY
+    # writer of machine_id, so it must be "A" here or the next assert proves
+    # nothing ( fresh-eyes F-002; a naive `UpdateExpression=[^,]*`
+    # grep of this invariant returns a confident FALSE for acquire itself,
+    # because it stops at the first comma inside the multi-line string).
+    assert a.get_runner_state("alpha")["machine_id"] == "A"
     assert a.release_runner("alpha", "tokA") is True        # we held it -> released
     assert a.get_runner_state("alpha")["agent_state"] == "IDLE"
+    # THE TOMBSTONE INVARIANT. release_runner sets agent_state=:idle and touches
+    # NOTHING else, so machine_id survives as the LAST holder. Three artifacts
+    # now tell readers this at decision time and would silently start lying if
+    # it changed: runner-claim.sh's NOT-RUNNING branch ("last holder ...
+    # TOMBSTONE"), core/config/conventions/partner-liveness.md section 3b, and
+    # guard-6475. If you redden this line, fix those three in the same change.
+    assert a.get_runner_state("alpha")["machine_id"] == "A"
 
 
 def test_release_runner_idempotent_second_call(cloud):

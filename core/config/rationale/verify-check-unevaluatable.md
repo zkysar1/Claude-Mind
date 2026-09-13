@@ -114,6 +114,33 @@ why `retrieved_predicate` returns None — never a permissive lambda — on an
 unreadable or empty manifest, so `analyze` skips the decorative test rather than
 manufacturing a pass (guard-1760).
 
+**Trap 3 — the recorded key is a BOOL and Q4 has THREE outcomes.** The sampler
+exits `0` for both `pass` and `skipped` (no artifact, nothing samplable), and the
+skill has always said in as many words that those "are not the same answer". But
+`phase_progress.q4_passed` could only ever be `true` or `false`, so a Body that
+correctly read a SKIPPED verdict as non-blocking wrote `q4_passed: true` — and
+from that record no later reader can tell a verified provenance pass from a run
+that verified nothing. Measured 2026-09-11 (alpha, cc-08) across asp-115's 77
+worker closures: 44 carry a `q4_passed` key, 35 of those carry a bare `true`
+whose pass-vs-skipped meaning is UNRECOVERABLE — and the tri-state tally reports
+`skipped=0`, not because no Q4 was ever skipped but because no record could
+SAY so.
+
+Hence `phase_progress.q4_verdict` (`pass` | `fail` | `skipped`), written
+alongside the bool rather than replacing it — `prior_checks.q4_passed` is what
+the graceful-stop handler threads back on resume, so dropping the bool would
+break mid-verify recovery. The bool stays the RESUME key; the tri-state is the
+EVIDENCE key.
+
+The consumer is `core/scripts/worker-closure-audit.py::q4_state_of`, which
+resolves an explicit `q4_verdict` first and falls back to the legacy boolean as
+`unknown` — never as `pass`. That direction is the whole point: reading a bare
+`true` as a pass would convert the audit's silent blindness into confident wrong
+agreement, which is strictly worse than no reading at all. `unknown` is reported
+in the audit's `q4_states` tally so the ambiguous population stays countable
+while it drains. (g-115-9618; guard-1753 "could not resolve" != "resolved and
+found nothing"; guard-2223 tri-state over a collapsed bool.)
+
 ## Cross-references
 
 - `core/scripts/verify-check-eval.py` — `_disposition`, and the only place the

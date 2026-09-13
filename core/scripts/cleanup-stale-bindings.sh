@@ -143,6 +143,21 @@ _should_delete_binding() {
 # `*-wm.yaml` drain glob, so it can never be drained as if it were a staged WM.
 # IRREDUCIBLY LOCAL: body_state + forked_wm_hash read via grep + bash
 # param-expansion, no python3.
+#
+#  — WHERE THESE FILES END UP IS NO LONGER WHERE THIS FUNCTION PUTS
+# THEM. Staging stays in `session/pending-body-merges/` here because this
+# function has no `_paths.sh` (it hand-mirrors AGENTS_PARENT_DIR as $_APD) and
+# resolving WORLD_DIR in bash would be a third reimplementation of the
+# env->conf->fallback chain. But a PUSH from the agent tree is refused
+# NoClaimError on any box without the live runner claim -- which is every
+# worker box, i.e. exactly where dead Bodies are reaped. So the `push-staged`
+# subprocess below COPIES the triple to the claim-exempt world-rooted
+# `world/body-staged-wm/<agent>/` first and pushes from there
+# (body-manifest.py::relocate_legacy_staging). A local write is never fenced;
+# only the store PUT is. Do NOT "simplify" by making the push read this
+# directory again -- that reinstates the stranding, and because
+# push_staged_files skips absent files and returns True, it would do so
+# SILENTLY, with the `||` warning below never firing.
 _preserve_unmerged_body_wm() {
     local _BA="$1" _SD="$2" _SID="$3"
     local _WMF="$_SD/working-memory.yaml"
@@ -317,8 +332,128 @@ for _ASR in "$(_agents_root)"/*; do
         _BIND_SID="${_SD##*/}"
         if _should_delete_binding "$_BA" "$_BIND_SID"; then
             _preserve_unmerged_body_wm "$_BA" "$_SD" "$_BIND_SID"
+            # Stamp the Body CLOSED before its dir goes ( item c).
+            # NOT for the manifest's sake -- that file is inside $_SD and about
+            # to be deleted, so closing it is pointless. The load-bearing effect
+            # is the CARRIER MIRROR in session/ (singular, syncable), which
+            # SURVIVES this rm -rf and is what worker_stall.py actually reads.
+            # Without this, every reap mints a permanent orphan carrier reading
+            # `active` that the stall probe counts as a live stall forever
+            # (measured: 78777e3c and a7fe3fd4 on cc-10, which unit 1 correctly
+            # noted have "no manifest left to close").
+            #
+            # Safe by three properties of close_body_late, each read from its
+            # source rather than assumed: it NEVER deletes (its docstring: "the
+            # session dir, its WM and its baseline all stay"); it returns
+            # 'not-active' for a parked Body, so a late close can never convert
+            # a RESUMABLE park into a close (); and where the carrier
+            # push is fenced it degrades to 'marked-push-failed' rather than
+            # erroring, so a worker box lands a no-op instead of a failure.
+            #
+            # Ordered AFTER _preserve deliberately: that is the proven
+            # learning-preservation path and its trigger-last staging must not
+            # be re-ordered. The manifest guard keeps this off the common path,
+            # the same way the `[ -f "$_WMF" ]` guard does inside _preserve --
+            # a reader/assistant session dir has no manifest and needs no
+            # subprocess to tell us so.
+            #  unit 23: this guard is a COST guard — a reader or
+            # assistant session dir has no manifest and needs no subprocess to
+            # say so — but it ALSO skipped the one population that still
+            # alerts. The manifest lives inside $_SD and dies with it; the
+            # CARRIER lives in session/ (singular), survives this rm -rf, and is
+            # what worker_stall actually reads. So a session whose manifest was
+            # already gone got no carrier repair at all, which is exactly unit
+            # 1's own "no manifest left to close" note (78777e3c, a7fe3fd4 on
+            # cc-10) and the 3 `active` orphans measured on cc-03 2026-09-12.
+            # Widening to EITHER file reaches close-body-late's carrier-
+            # reconcile path while keeping the cost intent: a non-Body session
+            # has neither file, so it still spawns nothing.
+            if [ -f "$_SD/body-manifest.yaml" ] || \
+               [ -f "$(_agent_dir "$_BA")/session/body-heartbeat-${_BIND_SID}.json" ]; then
+                # READ THE VERDICT, not the rc: the handler is `print(...)` and
+                # exits 0 on EVERY outcome, so the `||` arm below is unreachable
+                # on its own (guard-5501, measured unit 26). A `*-push-failed`
+                # verdict means the carrier repair was written locally and
+                # REFUSED delivery — the steady state on a box that does not
+                # hold this agent's runner claim — which used to be reported as
+                # success. Substring test, never equality: the suffix rides on
+                # whichever base verdict the manifest state produced.
+                _CBL_OUT="$(py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" close-body-late \
+                    --sid "$_BIND_SID" --agent "$_BA" 2>/dev/null)" || \
+                    echo "[cleanup-stale-bindings] WARN: late close failed for ${_BIND_SID}; its carrier may still read active" >&2
+                # `marked-push-failed` matches too, and SHOULD: its own docstring
+                # says that string exists so a silent transport failure is
+                # visible rather than reading as success, and until now no
+                # caller ever read it. Same failure, one verdict earlier.
+                case "$_CBL_OUT" in
+                    *-push-failed) echo "[cleanup-stale-bindings] WARN: ${_BIND_SID} (${_BA}) closed LOCALLY but its push did NOT reach peers (${_CBL_OUT}); peers keep reading the old state and nothing retries" >&2 ;;
+                esac
+            fi
             rm -rf "$_SD"
         fi
+    done
+done
+
+# ─── Orphan-carrier reconcile pass ( unit 25) ──────────────────────
+# The sweep above iterates SESSION DIRS, so it can only repair a carrier whose
+# dir still exists at reap time. A carrier whose dir is ALREADY gone is never
+# revisited by it — and that is the steady state, because the carrier lives in
+# session/ (singular) and deliberately SURVIVES the rm -rf. Measured on cc-03
+# 2026-09-12: 3 carriers reading `active` with no session dir, the oldest 20
+# days, all three permanently invisible to the loop above while the stall probe
+# counted each as a live stall. unit 24 taught close_body_late to repair them and
+# then asked six other boxes to hand-run a loop; a sweep whose only call site is
+# a board post is indistinguishable from one that never runs
+# (reclaim-routed-work.md), so this is that call site.
+#
+# WHY HERE: this script already runs at every turn-end on every box
+# (session-save-id.sh:57, stop-hook.sh:221) and already owns the residency
+# predicate. The repair must land on the box holding that agent's live runner
+# claim — the  carve-out exempts only a session's OWN sid, so a
+# foreign-sid push is refused `no_claim` from anywhere else, correctly, because
+# that is the peer-clobber gate. A RESIDENT agent on its claim-holding box is
+# precisely the case where the ownership consult never fires and the push lands.
+#
+# COST: one `[ -d ]` per carrier, plus a find+grep only for orphans, plus python
+# ONLY for one that genuinely reads `active`. Once the backlog is clear every
+# carrier either has a live dir or no longer reads `active`, so the steady state
+# spawns nothing and the IRREDUCIBLY LOCAL annotation at the top still holds.
+for _ASR in "$(_agents_root)"/*; do
+    [ -d "$_ASR" ] || continue
+    _CA="${_ASR##*/}"
+    _has_residency_marker "$_CA" || continue          # Signal 0, same gate as above
+    for _HB in "$_ASR/session"/body-heartbeat-*.json; do
+        [ -f "$_HB" ] || continue
+        _HB_SID="${_HB##*/body-heartbeat-}"; _HB_SID="${_HB_SID%.json}"
+        # A carrier whose session dir still exists belongs to a live or parked
+        # Body — that is the sweep above's business, never this pass's.
+        [ -d "$_ASR/$_SDN/$_HB_SID" ] && continue
+        # FRESHNESS REFUSAL, and it is the safety gate, not an optimisation: a
+        # live Body rewrites its carrier every tick, so a recently-written
+        # carrier means something is still running even if its dir went missing
+        # (the "over-sweeping rm -rf's a live session dir" hazard this script
+        # warns about twice). Refuse it and let the next tick speak.
+        [ -n "$(find "$_HB" -mmin -60 -print -quit 2>/dev/null)" ] && continue
+        # Pre-filter so an already-reconciled carrier costs no subprocess. Only a
+        # filter: close_body_late re-reads and no-ops on anything not `active`,
+        # so a false positive costs one spawn and a wrong shape cannot mis-write.
+        grep -Eq '"body_state"[[:space:]]*:[[:space:]]*"active"' "$_HB" || continue
+        # READ THE VERDICT ( unit 28). This is THE call site unit 26
+        # measured: it fired on 3 cc-09 carriers, every push was refused
+        # `no_claim`, and it reported rc=0 with empty stdout and empty stderr —
+        # because stdout went to /dev/null, stderr was folded into it, and the
+        # handler exits 0 on every outcome. The local write then clears the
+        # `active` pre-filter above, so this orphan is never revisited: the box
+        # looks clean locally and is untouched authoritatively, FOREVER. That
+        # silence is what this reads. Warning here does not repair it — only a
+        # claim-holding box can (units 12/22) — but it makes the gap reportable
+        # instead of invisible, which is the whole of this unit's scope.
+        _CBL_OUT="$(py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" close-body-late \
+            --sid "$_HB_SID" --agent "$_CA" 2>/dev/null)" || \
+            echo "[cleanup-stale-bindings] WARN: orphan-carrier reconcile failed for ${_HB_SID} (${_CA}); it may still read active" >&2
+        case "$_CBL_OUT" in
+            *-push-failed) echo "[cleanup-stale-bindings] WARN: orphan carrier ${_HB_SID} (${_CA}) repaired LOCALLY but NOT delivered (${_CBL_OUT}); this box cannot push it (no runner claim for ${_CA}) and the local write means nothing will retry" >&2 ;;
+        esac
     done
 done
 

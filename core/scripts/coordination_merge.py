@@ -5445,7 +5445,7 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for EIGHT path-pattern branches that run
+    Dispatch is by basename EXCEPT for NINE path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
@@ -5465,7 +5465,11 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
       8. productivity-snapshot date segments
          ``productivity-snapshots-<YYYY-MM-DD>.jsonl`` -- routed to the legacy
          file's append-only handler (g-358-49)
-    Branches 1-4, 7 and 8 register stores whose basenames are DYNAMIC and therefore
+      9. per-sweep audit reports ``world/audit-reports/*.jsonl`` -- line-union
+         (g-115-9645). EXTENSION-DISCRIMINATED and IMMEDIATE-PARENT-matched:
+         the directory also holds 14 non-.jsonl files, and the
+         ``close-reviews/`` subdir is a class (b) fence-only store
+    Branches 1-4 and 7-9 register stores whose basenames are DYNAMIC and therefore
     unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
     entry (1-4, 7, 8) and NO despite one (5) -- always resolve through this function,
@@ -5584,6 +5588,76 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     # is a reader, a docstring, or a config mention, so a segment is append-only
     # for its whole life and a line-union can never resurrect a deletion.
     if _is_productivity_snapshot_segment(parts[-1]):
+        return merge_append_only_jsonl
+    # NINTH path-pattern case (): the per-sweep audit reports under
+    # `world/audit-reports/*.jsonl`. Dynamic basenames like branches 1-4, 7 and
+    # 8 — repo-hygiene is date-stamped (`repo-hygiene-YYYY-MM-DD.jsonl`), so a
+    # basename entry could only ever cover the days someone enumerated.
+    #
+    # WITHOUT THIS BRANCH THE FILE WEDGES AND THEN LOSES HALF ITS ROWS. Measured
+    # 2026-09-10 on one live file: local 61 lines / 132,859 B vs store 60 lines /
+    # 127,679 B with only 8 lines SHARED (52 store-only + 53 local-only). The
+    # own-cloud sweep saw both-diverged with no handler and SKIPPED it every pass
+    # — 36/50/39 sweeps reported to three different agents for that one file —
+    # and whichever side pushed next would have destroyed ~52 rows silently.
+    # These reports are what a PR-merge readiness check reads across 61 repos,
+    # so silent loss makes that gate report clean on stale data. FOURTH
+    # recurrence of guard-1055 (after rb-3150, rb-3388, ).
+    #
+    # EXTENSION-DISCRIMINATED, never a bare directory prefix — the same
+    # directory holds 14 non-.jsonl files (README.md, dated .txt disposition
+    # logs, .md classifications, alert-sweep-seen-backlog.json).
+    #
+    # IMMEDIATE-PARENT (parts[-2]), not a recursive prefix: the `close-reviews/`
+    # subdirectory is a **class (b) fence-only** goal-keyed store whose own
+    # module docstring forbids treating it as mergeable. It holds .json today so
+    # the extension test already excludes it, but matching the immediate parent
+    # means a future nested store of a different shape cannot be swept in by
+    # accident. Verified 2026-09-11: 0 nested .jsonl under audit-reports/.
+    #
+    # BYTE-COMMUTATIVE, which is the constraint that actually binds here
+    # (guard-4641). merge_append_only_jsonl dedups on the serialized line and
+    # emits sorted(by_line.values(), key=(_log_ts, _canon)) — a deterministic
+    # total order over CONTENT, so md5(merge(a,b)) == md5(merge(b,a)). A
+    # union that converged only on set-equality would pass every content test
+    # and still re-diverge in production, because each box would write different
+    # bytes and the next compare would see divergence again.
+    #
+    # NO REMOVAL PATH (guard-1816), verified by walking the write sites:
+    # worker-closure-audit.py uses locked_append_jsonl, s3-churn-alarm.sh uses
+    # `>>`, and no entry in core/config/store-hygiene.yaml names audit-reports
+    # (19 entries present, so the absence is a measured zero). A line-union
+    # therefore cannot resurrect a deletion.
+    #
+    # RESIDUAL, stated rather than discovered later: repo-hygiene-<date>.jsonl is
+    # NOT append-only in the strict sense — repo-hygiene-sweep.py builds its
+    # records fresh and TRUNCATE-writes (`out_path.open("w")`), never reading the
+    # existing file. Rows are keyed by an absolute `repo` path and carry NO
+    # timestamp, so the union is exactly right ACROSS boxes (different roots
+    # never collide; measured on the live file: 57 rows, 57 distinct repo keys,
+    # two box roots already coexisting) but a same-box same-date RE-RUN whose
+    # repo state changed keeps both the stale and the fresh row, with no
+    # timestamp to disambiguate them. That is bounded — only repos that changed
+    # between two same-day sweeps on one box — and strictly better than the
+    # wedge it replaces, which destroys half the rows outright. A timestamp or a
+    # per-box run id on the row would let an id-keyed handler retire the stale
+    # one; that is a writer change, filed separately rather than inlined here.
+    #
+    # alert-sweep-seen.jsonl ALREADY routes to this same handler by basename, so
+    # this branch changes nothing for it.
+    #
+    # `.history` IS EXCLUDED, and the exclusion is the reason this branch tests
+    # for it rather than trusting the parent-dir match alone: the copy-on-write
+    # version store keeps its own `.history/snapshots/audit-reports/` tree whose
+    # files carry these exact basenames and parent name. A snapshot is an
+    # IMMUTABLE point-in-time copy — unioning two boxes' snapshots would corrupt
+    # the very artifact the history store exists to preserve, which is the
+    # opposite of the divergence this branch repairs. (The pre-existing BASENAME
+    # entry for alert-sweep-seen.jsonl already reaches its .history twin; that
+    # over-match predates this branch and is left alone rather than widened.)
+    if (len(parts) >= 2 and parts[-2] == "audit-reports"
+            and parts[-1].endswith(".jsonl")
+            and ".history" not in parts):
         return merge_append_only_jsonl
     # Second PATH-PATTERN case (), for the opposite reason to the
     # shard branch above: that one exists because the basenames are DYNAMIC,

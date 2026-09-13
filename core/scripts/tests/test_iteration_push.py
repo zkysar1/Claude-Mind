@@ -1007,6 +1007,74 @@ def test_selfheal_retry_conflict_reports_conflict_shape_not_dirty_defer(tmp_path
     assert '"shape":"conflict-abort"' in health[0].read_text(encoding="utf-8")
 
 
+def test_blocking_shared_file_with_union_driver_is_committed_not_deferred(tmp_path):
+    """A BLOCKING shared file outside agents/* that git can merge COMMUTATIVELY
+    is COMMITTED, so the wedge never forms.
+
+    g-115-9744. The self-heal rightly refuses to CLEAR core/world/shared work
+    (clearing destroys a cadence-written append whose only copy is the working
+    tree) and nothing commits it, so the same file re-defers every iteration
+    forever — two individually-correct conservatisms composing into a permanent
+    per-box wedge (guard-4153). Live blocker: core/config/strategic-scan-
+    readings.md, re-armed by aspirations-strategic-scan on every run.
+
+    This is the goal's remedy (b), mirroring the g-115-6572 cross-agent arm one
+    path-class over. The `union` leg is load-bearing and is why the sibling
+    helper could not simply be reused: _ip_git_mergeable also demands a driver
+    registered in .git/config, and `union` is a git BUILT-IN that is never
+    registered — measured on the real repo, that file reports `merge: union`
+    with an EMPTY `merge.union.driver`, so the helper alone returns False for
+    the exact file this goal is about.
+
+    The negative control is test_ordinary_dirty_defer_still_gets_the_clear_it_
+    hint: a shared blocker with NO driver must still defer untouched, so this
+    fix cannot degenerate into "commit every shared file" (guard-4166), which
+    is the goal's explicitly rejected remedy (c).
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    # .gitattributes is version-controlled, so the union attribute reaches both
+    # clones exactly as it does in the real repo.
+    _seed_and_sync(a, b, {
+        ".gitattributes": "core/config/readings.md merge=union\n",
+        "core/config/readings.md": "row 1\n",
+    })
+    # B appends its own roster row at origin, so A's dirty copy blocks the merge.
+    _commit_file(b, "core/config/readings.md", "row 1\nrow 2 from B\n",
+                 "B: append a roster row")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "agents/alpha/note.md", "note\n", "A: own work")
+    # The cadence-written append with no second copy anywhere.
+    (a / "core/config/readings.md").write_text(
+        "row 1\nrow 3 written locally by the strategic scan\n",
+        encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags())
+    assert r.returncode == 0, r.stderr
+    err = r.stderr
+
+    # the new arm fired, and named the driver it actually resolved
+    assert "is git-commutative (merge=union)" in err, err
+    assert "COMMIT it, the driver reconciles at the merge (g-115-9744)" in err, err
+    assert "git-commutative SHARED file(s) outside agents/*" in err, err
+
+    # ...so the wedge never forms: no defer, and the integrate completed
+    assert "merge DEFERRED" not in err, err
+    assert "blocking file outside agents/* (core/config/readings.md)" not in err, err
+
+    # NOTHING WAS LOST — the union driver kept BOTH sides. This is the assertion
+    # that distinguishes the fix from `git checkout --` (remedy (c)), which
+    # would have silently dropped the local row.
+    merged = (a / "core/config/readings.md").read_text(encoding="utf-8")
+    assert "row 3 written locally by the strategic scan" in merged, merged
+    assert "row 2 from B" in merged, merged
+
+    # the shared file is committed, not left dirty for the next iteration
+    assert _git(a, "status", "--porcelain", "core/config/readings.md").stdout.strip() == "", \
+        "shared file still dirty — the wedge would re-form next iteration"
+    subj = _must(a, "log", "--format=%s", "-n", "20")
+    assert "git-commutative shared ledger(s)" in subj, subj
+
+
 def test_defer_streak_survives_dry_run(tmp_path):
     """--dry-run proves nothing about the merge, so it must not reset a real
     streak (the reset is guarded by DRY_RUN)."""

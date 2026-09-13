@@ -42,13 +42,39 @@ PQ_RESOLVED_FILE="$AGENT_DIR/session/pq-resolved"
 BOARD_ACTIVITY_FILE="$AGENT_DIR/session/board-activity"
 EMAIL_RECEIVED_FILE="$AGENT_DIR/session/email-received"
 CLAIM_RELEASED_FILE="$AGENT_DIR/session/goal-claim-released"
+PERCEPTION_RECEIVED_FILE="$AGENT_DIR/session/perception-received"
+
+# ─── SIGNAL SYNC SITES — MEASURED, NOT THREE () ───────────────────
+# guard-374 says a new wake signal is a THREE-site change (session.py
+# VALID_SIGNALS, session-manifest.yaml recovery_action, the consuming script).
+# That undercounts. Measured 2026-09-13 (zeta, cc-02, uname -r 6.8.0-139-generic)
+# by grepping three EXISTING signals as positive controls — email-received,
+# goal-claim-released, blocker-cleared — the live non-test surface is SEVEN:
+#   1. core/scripts/session.py                 VALID_SIGNALS (the writer gate)
+#   2. core/scripts/session-signal-exists.sh   case stmt + error text
+#                                              (its own header calls itself a
+#                                              "LOAD-BEARING MIRROR"; guard-374
+#                                              does not name it at all)
+#   3. core/config/session-manifest.yaml       recovery_action: clear
+#   4. THIS FILE                               *_FILE var + poll line + class
+#   5. core/scripts/quiescence-cycle-cache.py  BLOCKER_SIGNAL_FILES
+#   6. core/scripts/dry-idle-cycle-cache.py    the pending-signal tuple
+#   7. core/scripts/_wake_signals.py           the signal contract docstring
+# Plus tests: tests/test_interruptible_sleep_signal_class.sh,
+# mind_api/tests/test_runtime_tier_c.py.
+# Miss #2 and a writer is accepted while the presence check rejects the name;
+# miss #5/#6 and the signal never breaks a quiescence or dry-idle sleep — which
+# is silent, because the sleep still LOOKS correct and simply never wakes.
+# Re-derive rather than trust this list: grep an existing signal name, do not
+# grep the one you are adding (it is absent by construction, so it can only
+# ever return the sites you already edited — the count confirms itself).
 
 HEARTBEAT_TICK_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/heartbeat-tick.sh"
 
 # ─── Wake-signal classes (Magic Wand #2, alpha session-60) ───────────────
 #
 # WAKE_BLOCKER_SIGNALS (always exit 2 once outside debounce window):
-#   blocker-cleared, pq-resolved, email-received
+#   blocker-cleared, pq-resolved, email-received, perception-received
 #   These represent state changes that genuinely unblock work — a goal
 #   waiting on a blocker can now run, a pending question got answered, the
 #   user replied. Sleeping past these wastes wall-clock the agent could be
@@ -111,7 +137,8 @@ HEARTBEAT_TICK_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/heartbeat-tick.sh"
 # consecutive 0-byte exit-2 sleeps within seconds). The debounce coalesces
 # wake signals within WAKE_DEBOUNCE_SECONDS into a single wake. Set to 0
 # to disable. Affects ALL wake signals (blocker-cleared,
-# pq-resolved, board-activity, email-received, goal-claim-released);
+# pq-resolved, board-activity, email-received, goal-claim-released,
+# perception-received);
 # stop signals (stop-loop, stop-requested) bypass debounce entirely.
 #
 # DEFAULT SCALES WITH SLEEP DURATION ():
@@ -329,6 +356,11 @@ for (( i=0; i<SECONDS_TO_SLEEP; i++ )); do
   [ -f "$BLOCKER_CLEARED_FILE" ] && handle_wake_signal "$BLOCKER_CLEARED_FILE" blocker
   [ -f "$PQ_RESOLVED_FILE" ]     && handle_wake_signal "$PQ_RESOLVED_FILE"     blocker
   [ -f "$EMAIL_RECEIVED_FILE" ]  && handle_wake_signal "$EMAIL_RECEIVED_FILE"  blocker
+  # perception-received (): an environment CHANGE reached the vessel.
+  # BLOCKER, not informational — the informational demotion exists because
+  # partner activity does not change a structurally user-gated quiescence, and
+  # a change to the resident's OWN WORLD is the opposite of that.
+  [ -f "$PERCEPTION_RECEIVED_FILE" ] && handle_wake_signal "$PERCEPTION_RECEIVED_FILE" blocker
   # Class "informational" — partner activity, demoted during quiescence.
   [ -f "$BOARD_ACTIVITY_FILE" ]  && handle_wake_signal "$BOARD_ACTIVITY_FILE"  informational
   [ -f "$CLAIM_RELEASED_FILE" ]  && handle_wake_signal "$CLAIM_RELEASED_FILE"  informational

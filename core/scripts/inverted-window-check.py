@@ -83,6 +83,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
 NON_TERMINAL = ("pending", "in-progress", "blocked")
 
@@ -106,10 +107,11 @@ def _parse(value):
             return dt.datetime.strptime(text[:width], fmt)
         except ValueError:
             continue
-    try:
-        return dt.datetime.fromisoformat(text.replace("Z", ""))
-    except ValueError:
-        return None
+    # guard-1398: .replace("Z","") strips the UTC designator but leaves a
+    # numeric offset attached, yielding a tz-AWARE datetime that raises
+    # TypeError against a naive now(). parse_naive_iso strips tzinfo AFTER
+    # parsing and never raises, returning None exactly as this fallback did.
+    return parse_naive_iso(text)
 
 
 def classify(goal):

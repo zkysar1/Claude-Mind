@@ -118,7 +118,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5b.2b | handoff-aging-check | always-run | same battery → Phase 0.5b.2b section; standalone fallback `bash core/scripts/handoff-aging-check.sh --apply` |
 | 0.5b.3 | precondition-defer-recheck | medium | `bash core/scripts/precondition-defer-recheck.sh --max-age-hours 2 --apply` |
 | 0.5b.4 | defer-recheck | medium | `bash core/scripts/defer-recheck.sh --max-age-hours 2 --apply` |
-| 0.5b.5 | pending-questions-sweep | deferrable | `bash core/scripts/pending-questions-sweep.sh sweep --apply` (subcommand REQUIRED; note --apply governs auto_resolve, --apply-cleanup governs needs_transition) |
+| 0.5b.5 | pending-questions-sweep | deferrable | `bash core/scripts/pending-questions-sweep.sh sweep --all-agents --apply` (subcommand REQUIRED; --apply governs auto_resolve, --apply-cleanup needs_transition). `--all-agents` is load-bearing: without it the lane sweeps ONE agent and reports a clean fleet zero (g-115-9715). Writes stay bound-agent-only; a `per_agent` row with `writable:false` is RELAY-only. |
 | 0.5b.6 | parent-supersession-sweep | deferrable | `bash core/scripts/parent-supersession-sweep.sh --max-age-hours 24 --min-siblings 2 --apply` |
 | 0.5b.7 | unblock-parent-status-sweep | deferrable | `bash core/scripts/unblock-parent-status-sweep.sh --apply` |
 | 0.5b.8 | routing-audit-target-status-sweep | deferrable | `bash core/scripts/routing-audit-target-status-sweep.sh --apply` |

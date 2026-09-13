@@ -265,6 +265,35 @@ def aspirations_complete_by(goal_id, source="world", agent_name=None,
         rt_call("POST", "/v1/aspirations/complete-by", query=query))
 
 
+def aspirations_update_goal(goal_id, field, value, source="world"):
+    """POST /v1/aspirations/update-goal. Returns the parsed daemon response.
+
+    `value` is a PYTHON value, JSON-encoded into the raw body exactly as
+    aspirations-update-goal.sh does -- so `None` sends the body `null`, which
+    is how a field is CLEARED (guard-5211: the shell form passes the literal
+    string "null"; from Python pass None and let json.dumps produce it). The
+    shell wrapper's string->type coercion heuristic is deliberately NOT
+    duplicated here: it exists to recover types from argv strings, and a
+    Python caller already holds the typed value (guard-547 -- do not grow a
+    second copy of logic that can drift from the first).
+
+    FAILURE IS LOUD BY CONSTRUCTION. rt_call raises RtError on any non-2xx and
+    on an unreachable daemon, and RtError carries the daemon's response body.
+    This is the whole point of the function: the deleted-by-cutover
+    `aspirations.py update-goal` CLI could print an Error line and still exit
+    0 on some boxes, so callers reading only an rc saw a silent no-op
+    (g-115-9621). Callers must let RtError propagate or surface `.body` --
+    never reduce it to a boolean (rb-10397).
+    """
+    query = "id=%s&field=%s&source=%s" % (_q(goal_id), _q(field), _q(source))
+    sid = os.environ.get("MIND_SID")
+    if sid:
+        query += "&sid=%s" % _q(sid)
+    return json.loads(
+        rt_call("POST", "/v1/aspirations/update-goal",
+                query=query, body=json.dumps(value)))
+
+
 def wm_read(slot=None, as_json=True):
     """GET /v1/wm/read. Returns the raw body the deleted `wm.py read` CLI
     printed (JSON when as_json, else YAML)."""

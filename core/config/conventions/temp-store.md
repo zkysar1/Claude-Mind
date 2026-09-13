@@ -330,10 +330,10 @@ payloads are refused-draft residue that the drain lane must never encode and
 cannot archive — a file class with no exit. Correct naming at write time is the
 only place this is cheap to fix. (g-001-84)
 
-Pure ephemera lands in temp/ legitimately — the framework's own guidance
-redirects test-suite output here (`.claude/rules/run-full-suite-after-deep-code.md`
-writes `agents/<agent>/temp/suite.log`), and one-shot tool dumps (`leak-check.txt`)
-follow the same path. These files have nothing to encode, so `/drain-temp`
+Pure ephemera lands in temp/ legitimately — one-shot tool dumps
+(`leak-check.txt`) and the like. LONG-RUNNING output does not: guard-6416
+moved the suite-log guidance off the synced tree, because the sync layer
+replaces a file under a live fd. These files have nothing to encode, so `/drain-temp`
 DELETES them rather than archiving to `drained/`: all of `temp/` (including
 `drained/`) is gitignored (g-115-1765), so archiving untracked ephemera into
 `drained/` would only relocate slush between two ignored paths. Deletion loses

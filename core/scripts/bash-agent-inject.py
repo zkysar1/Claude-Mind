@@ -18,6 +18,7 @@ import sys
 import os
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -46,6 +47,12 @@ from hook_helpers import approve_no_mutation, stdin_json_or_approve, emit_deny  
 # measured single work unit is 92 min -- while rejecting the days-stale
 # agent-wide mirror described at the injection site below.
 GOAL_ID_MAX_AGE_SEC = 6 * 3600
+
+# Re-surface a pending stop at most this often (). Not a cadence the
+# signal needs -- it is a NOISE bound on a hook that runs on every Bash call.
+# 20s re-surfaces ~16x across the 324s detection window measured on the live
+# vessel, which is many chances to be seen and few enough to stay readable.
+STOP_SURFACE_INTERVAL_S = 20
 
 # ---------------------------------------------------------------------------
 # ARGV TRUNCATION GATE (, 2026-09-07)
@@ -463,6 +470,87 @@ def _maybe_tick_heartbeat(agent: str, sid: str, project_root: Path) -> None:
         pass
 
 
+def _maybe_surface_stop(agent: str, sid: str, project_root: Path) -> str:
+    """Surface a PENDING STOP at TOOL-CALL cadence (). Returns the
+    advisory text, or "" when there is nothing to say.
+
+    `stop-requested` is read at exactly ONE place in the loop --
+    aspirations/SKILL.md Phase -1.4's `session-signal-exists.sh stop-requested`
+    -- so detection is keyed to loop STRUCTURE, and a mind that is not yet at
+    that gate cannot see the signal however long it has been set. Measured on a
+    live vessel 2026-09-13 (instance i-022f74084032d8c56, reserve 350s): the
+    sidecar raised the signal at 16:49:25 and the mind first probed it at
+    16:54:49 -- 324s later, with 26s of grace left. The split is the argument
+    for putting the check HERE rather than earlier in the loop: 213s of that was
+    /start still finishing, and only 111s was the loop's own preamble, so
+    reordering /aspirations recovers at most a third and still misses. Raising
+    the reserve does not help either -- turn_deadline = T0 + SOFT_S - RESERVE,
+    so a larger reserve moves the raise EARLIER, into /start's own clear.
+
+    THE PRECEDENT IS `_maybe_tick_heartbeat` ABOVE, same file, same reasoning
+    one surface over: every other caller of that signal was keyed to loop
+    structure too, and this hook is the only chokepoint that is both
+    script-executed (guard-399: not a model electing to run a line) and
+    independent of which skill is running. Detection here is ONE Bash call.
+
+    ADVISORY, NEVER A DENY. A hook that blocked Bash on a pending stop would
+    wedge the very consolidation the stop is asking for -- the mind needs tool
+    calls to consolidate and hand off. The message rides the structured allow
+    payload, which is the only channel that reaches the model.
+
+    NOT COVERED, deliberately: a WORKER Body's per-session
+    `sessions/<sid>/stop-requested`. worker-loop reads that at Phase -0-stop,
+    FIRST on every re-entry, so its detection latency is one turn rather than
+    324s and there is no gap here to close.
+
+    Fail-open on every path, like every other clause in this hook.
+    """
+    try:
+        if not agent:
+            return ""
+        state_dir = _agent_dir(project_root, agent) / "session"
+        if not (state_dir / "stop-requested").is_file():
+            return ""
+        # stop-loop means the stop has already been sanctioned to exit; the
+        # obligation is discharged and re-announcing it would be noise.
+        if (state_dir / "stop-loop").exists():
+            return ""
+        safe_sid = sid if sid and not any(
+            c in sid for c in ("/", "\\", "\n", "\r", " ")) and ".." not in sid else "nosid"
+        stamp = project_root / "core" / "logs" / "stop-surface-hook" / safe_sid
+        now = time.time()
+        try:
+            if now - stamp.stat().st_mtime < STOP_SURFACE_INTERVAL_S:
+                return ""
+        except OSError:
+            pass
+        # Stamp BEFORE building the message, the same order _maybe_tick_heartbeat
+        # uses, so a failure below cannot re-fire on every subsequent call.
+        try:
+            stamp.parent.mkdir(parents=True, exist_ok=True)
+            stamp.touch()
+        except OSError:
+            return ""
+        try:
+            age = int(now - (state_dir / "stop-requested").stat().st_mtime)
+            age_txt = f"{age}s ago"
+        except OSError:
+            age_txt = "at an unreadable time"
+        return (
+            f"[stop-pending] `agents/{agent}/session/stop-requested` was set {age_txt} "
+            "and `stop-loop` is not set, so the stop has NOT yet been honored. This is "
+            "surfaced from the PreToolUse[Bash] hook because the loop reads that signal "
+            "at ONE gate (aspirations Phase -1.4) and you may not be near it -- measured "
+            "324s of detection latency on a live vessel against a 350s grace (g-373-16). "
+            "Finish the tool call in flight, then go to Phase -1.4 and complete the "
+            "in-flight obligations (consolidate + handoff) rather than starting new work. "
+            "Do NOT clear the signal yourself -- only /stop and Phase -1.4 may write "
+            "stop-loop (stop-hook-compliance.md rule 2)."
+        )
+    except Exception:
+        return ""
+
+
 def main():
     data = stdin_json_or_approve()
 
@@ -741,8 +829,12 @@ def main():
     # Liveness at tool-call cadence (). After the role/goal clauses so
     # it reuses the same resolved agent name; before the emit so it costs the
     # hook one stat per call and a detached spawn once per interval.
+    _stop_advisory = ""
     if _agent_m:
         _maybe_tick_heartbeat(_agent_m.group(1), sid, project_root)
+        # Pending-stop detection at the same cadence and for the same reason
+        # (). Computed here, emitted with the payload below.
+        _stop_advisory = _maybe_surface_stop(_agent_m.group(1), sid, project_root)
 
     expected_prefix = (f'export PATH="{shim_path}:$PATH"; '
                        f'{agent_clause}{body_clause}{goal_clause}export MIND_SID={sid};')
@@ -766,13 +858,23 @@ def main():
         if key in tool_input:
             updated[key] = tool_input[key]
 
-    print(json.dumps({
+    payload = {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "allow",
             "updatedInput": updated,
         }
-    }))
+    }
+    if _stop_advisory:
+        # The DELIVERED advisory shape, not a guess: `allow` +
+        # permissionDecisionReason ALONE was probed and did not reach the model
+        # (; the five-probe table lives in trailing-echo-exit-gate.py).
+        # The decision stays `allow` -- nothing is blocked, updatedInput is
+        # preserved, and the injection this hook exists for is untouched.
+        payload["hookSpecificOutput"]["permissionDecisionReason"] = _stop_advisory
+        payload["hookSpecificOutput"]["additionalContext"] = _stop_advisory
+        payload["systemMessage"] = _stop_advisory
+    print(json.dumps(payload))
 
 
 # Guard module-level execution so the helpers above are importable for tests

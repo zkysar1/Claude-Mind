@@ -199,6 +199,54 @@ def _scan_store(path: Path, source: str, now: dt.datetime, presence: dict,
                 stats["in_progress"] = stats.get("in_progress", 0) + 1
             state = _key_state(goal, "claimed_by")
             presence[state] = presence.get(state, 0) + 1
+            # ── CLAIM-CLOCK SKEW () ─────────────────────────────────
+            # A SECOND, independent defect class, deliberately NOT folded into
+            # the partial-survival findings below and deliberately NOT given a
+            # new `verdict` value: `last_modified` OLDER than `claimed_at` means
+            # the record's own modification clock never advanced when the claim
+            # was written. coordination_merge._merge_goal picks its LWW base as
+            # the newer-`last_modified` snapshot and moves the claim triple as a
+            # UNIT, so a record in this state CANNOT win base selection -- any
+            # peer snapshot still carrying the old claim state overwrites it.
+            #
+            # MEASURED 2026-09-13 (alpha, hostname cc-09):  was released
+            # twice, each release verified clean by an in-turn read-back, and
+            # each reverted within ~15 min with claimed_at back at its
+            # pre-release value -- while the append-only release_negatives array
+            # unioned correctly and kept both release entries. That scalar-
+            # reverts/array-survives asymmetry is exactly what this skew
+            # predicts, and it is the signature to look for.
+            # Whole-population scan the same hour: 3083 non-terminal world
+            # goals, 9 carrying a live claim, 3 skewed and 6 HOLDING -- so the
+            # invariant is real and NOT vacuous (guard-2166) -- agent queue 0
+            # claimed. The pre-existing census reported verdict=clean with
+            # present_value=9 and findings=0 across all three, because partial
+            # field survival (its only predicate) was genuinely absent: the
+            # `clean` was correct for its own defect class and silent about this
+            # one. Pairing a release with any write that bumps `last_modified`
+            # moved the record from skewed to holding and the release then stuck
+            # across a merge cycle -- the interim workaround until the claim
+            # writers advance the field themselves.
+            #
+            # Lexicographic compare is chronological here: every stamp in these
+            # stores is naive ISO-8601 in UTC wall time by fiat (CLAUDE.md
+            # "Naming Rules"), so same-format strings order correctly. Both
+            # fields are read from ONE record, so no cross-store clock is
+            # involved. Records missing either field are skipped rather than
+            # counted -- an absent stamp is not evidence of skew.
+            if stats is not None and state == "value":
+                _lm, _cat = goal.get("last_modified"), goal.get("claimed_at")
+                if _lm and _cat and str(_lm) < str(_cat):
+                    stats.setdefault("clock_violations", []).append({
+                        "goal_id": goal.get("id"),
+                        "asp_id": asp.get("id"),
+                        "source": source,
+                        "status": goal.get("status"),
+                        "claimed_by": goal.get("claimed_by"),
+                        "claimed_by_sid": goal.get("claimed_by_sid"),
+                        "last_modified": _lm,
+                        "claimed_at": _cat,
+                    })
             if state != "null":
                 continue
             survivors = {f: goal.get(f) for f in SIBLING_FIELDS
@@ -382,6 +430,19 @@ def main_result(since_hours=None) -> dict:
         "findings_total": len(findings),
         "findings_reported": len(reported),
         "reconcile_damage_count": len(damaged),
+        # ADDITIVE KEYS, and that is deliberate (). The claim-clock
+        # skew is reported BESIDE the existing verdict rather than as a new
+        # `verdict` value, because the one consumer
+        # (precheck-eval.cmd_claim_integrity) branches on verdict over a CLOSED
+        # set -- BLIND and damaged -- and a value it does not know would be
+        # detected here and then silently carry NO flag, which is the
+        # always-reports-clear defect this goal exists to remove. Two layers had
+        # to change together for that reason; flagging in one only would have
+        # reproduced the class. `since_hours` deliberately does NOT filter these:
+        # skew is a structural property of the record, not an event with an age,
+        # and a live claim is by definition current.
+        "claim_clock_violations": stats.get("clock_violations", []),
+        "claim_clock_violation_count": len(stats.get("clock_violations", [])),
         "per_agent": by_agent,
         "since_hours": since_hours,
         "stores_scanned": stores,
@@ -410,10 +471,25 @@ def main(argv=None):
         kp = result["key_presence"]
         print(f"[claim-integrity] verdict={verdict} provenance=local-mirror "
               f"scanned={scanned} in_progress={result['in_progress']}")
+        # The CENSUS prints on every run and in every verdict (docstring above,
+        # guard-1419/guard-2298) -- the ANNOTATION does not, and used to. Printed
+        # unconditionally it asserted "present_value==0 is never clean" even when
+        # present_value was NONZERO: a caveat about a state that was not occurring,
+        # so the healthy and the degraded line read identically right where a reader
+        # looks to tell them apart. A line that never changes is one a reader learns
+        # to skip -- this file's own 58-63 argument against the permanent BLIND,
+        # turned on its own output -- and guard-4649: when the only consumer of a
+        # caveat is a human, put the discriminator in the CODE, not in prose the
+        # emitter always emits. In the case it describes the annotation was also
+        # redundant: verdict_for() returns BLIND or no-live-claims for EVERY
+        # present_value==0, so one of the two blocks below always fires with the
+        # full explanation. It now points AT that block instead of restating it,
+        # and is silent when it does not apply. ()
+        zero_note = ("   <- this zero is NEVER clean -- see the verdict line below"
+                     if kp["present_value"] == 0 else "")
         print(f"  key_presence: absent={kp['absent']} "
               f"present_null={kp['present_null']} "
-              f"present_value={kp['present_value']}"
-              "   <- present_value==0 is never clean: BLIND, or no-live-claims")
+              f"present_value={kp['present_value']}" + zero_note)
         if verdict == "BLIND":
             print("  BLIND: no live claim carries a value anywhere in the "
                   "scanned stores, AND either something is marked in-progress "
@@ -431,6 +507,26 @@ def main(argv=None):
                   "goes in-progress without a claim. (g-115-7876)")
         print(f"  findings: {len(reported)} reported "
               f"({len(damaged)} with partial field survival = reconcile damage)")
+        clock = result["claim_clock_violations"]
+        if clock:
+            print(f"  CLAIM-CLOCK SKEW: {len(clock)} live claim(s) carry a "
+                  "last_modified OLDER than claimed_at. The record's own "
+                  "modification clock did not advance when the claim was "
+                  "written, so coordination_merge._merge_goal -- which picks "
+                  "its LWW base by last_modified and moves the claim triple as "
+                  "a UNIT -- CANNOT see the claim, and any peer snapshot "
+                  "carrying the old claim state overwrites it. A release on "
+                  "one of these REVERTS (measured twice, g-373-38, 2026-09-13) "
+                  "and the in-turn read-back still looks clean. WORKAROUND: "
+                  "pair the write with anything that bumps last_modified.")
+            for c in clock:
+                print(f"    {str(c['goal_id']):<14} [{c['source']}] "
+                      f"status={c['status']} by={c['claimed_by']} "
+                      f"last_modified={c['last_modified']} < "
+                      f"claimed_at={c['claimed_at']}")
+        else:
+            print("  claim-clock skew: 0 (of the live claims above; a record "
+                  "missing either stamp is skipped, not counted clean)")
         for f in reported:
             surv = ",".join(f["surviving_siblings"]) or "-"
             print(f"    {f['goal_id']:<14} [{f['source']}] status={f['status']} "

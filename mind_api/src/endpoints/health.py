@@ -78,6 +78,30 @@ def health(ctx) -> "Response":  # type: ignore[name-defined]
         utilization_spooled = _us.spooled_enabled()
     except Exception:  # never 500 the health probe over a diagnostic field
         utilization_spooled = None
+    # Which object store THIS process resolved ( cutover readiness).
+    # The endpoint override travels via .env.local and is read ONCE at backend
+    # construction, so a flipped box whose daemon predates the flip keeps
+    # answering for the old store — the same guard-559/rb-2022 class as
+    # git_head_sha above: in-process state diverged from disk truth, remedy
+    # is a restart. Reported from the ALREADY-constructed backend only; this
+    # never constructs one (a health probe must not raise on a misconfigured
+    # box). storage_endpoint: the override URL; "" = the client library's
+    # default regional endpoint; None = no backend built yet / not an
+    # object-store backend.
+    try:
+        import storage_backend as _sb
+        _be = _sb._ACTIVE_BACKEND
+        storage_backend = None if _be is None else type(_be).__name__
+        # The backend keeps an unset override as None/"" — both mean "the
+        # client library's default regional endpoint", reported as "" so a
+        # reader can tell "own-cloud on the default endpoint" from "no
+        # object-store backend at all" (None).
+        if _be is not None and hasattr(_be, "s3_endpoint_url"):
+            storage_endpoint = str(getattr(_be, "s3_endpoint_url") or "")
+        else:
+            storage_endpoint = None
+    except Exception:  # never 500 the health probe over a diagnostic field
+        storage_backend = storage_endpoint = None
     return Response.json(
         {
             "ok": True,
@@ -87,6 +111,8 @@ def health(ctx) -> "Response":  # type: ignore[name-defined]
             "port": ctx.port,
             "git_head_sha": _STARTUP_SHA,
             "utilization_spooled": utilization_spooled,
+            "storage_backend": storage_backend,
+            "storage_endpoint": storage_endpoint,
             **clock_posture(),
         }
     )

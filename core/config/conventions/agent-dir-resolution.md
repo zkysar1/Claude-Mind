@@ -188,6 +188,7 @@ Derived cross-agent glob consumers (36 sites, 28 files):
 - `core/scripts/inbound-reference-census.py:218` — `agents_root().glob('*/local-paths.conf')`
 - `core/scripts/learning-routing-repair.py:82` — `agents_root().glob('*/experience.jsonl')`
 - `core/scripts/learning-routing-repair.py:83` — `agents_root().glob('*/experience-archive.jsonl')`
+- `core/scripts/pending-questions-sweep.py:828` — `root.glob('*/session/pending-questions.yaml')` (`root = Path(agents_root())`; the `--all-agents` fleet form, g-115-9715 — the single-file default under-reported the fleet corpus by N-1 agents while reporting a clean zero)
 - `core/scripts/repo-hygiene-sweep.py:204` — `Path(agents_root()).glob('*/aspirations.jsonl')`
 - `core/scripts/skill-analytics.py:349` — `agents_root().glob('*/skill-invocations.jsonl')`
 - `core/scripts/skill-coinvocation-discovery.py:129` — `base.glob('*/skill-invocations.jsonl')`

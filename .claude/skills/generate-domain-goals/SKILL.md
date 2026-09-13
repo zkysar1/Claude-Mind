@@ -115,27 +115,50 @@ IF exit 0:
 
 Which post types count as demand comes from the `domain-calendar` slot's
 `demand.actionable_types` (default: directive / escalation / question /
-request / review-request / decision-needed / blocker). A post is consumed when
-THIS agent has replied to it — a peer's reply does not discharge demand
-addressed here. Fail-open in both directions: no calendar means the default
-set, and an unreadable board yields zero posts, which allows.
+request / review-request / decision-needed / blocker). A post is DEMAND FOR
+THIS AGENT only when it is ADDRESSED here (g-115-9721): a `requires_action_by:
+<me>` tag (the one routing prefix, guard-3884 — a bare `<me>` tag also routes),
+OR a reply to a post this agent authored, OR a first line that addresses this
+agent by name (`bravo —`, `bravo:`, `addressed to bravo`; a bare mention, a
+message id carrying the name, or "NOT bravo" does not count). It is consumed
+when THIS agent has replied to it — a peer's reply does not discharge it.
+Fleet-wide directives with no routing tag are consumed by the aspirations-select
+directive-honor path, never by replies, and do not count here. The JSON reports
+`actionable_total` (every actionable post by others) and `addressed_reasons`
+beside `unconsumed_count`, so a defer or a skip stays auditable — before this
+fix the predicate counted all ~100 actionable posts per week as everyone's
+demand and deferred every agent on every firing. Fail-open in every direction:
+no calendar means the default set, an unreadable board yields zero posts, and
+no caller identity cannot attribute demand — all allow.
 
 ## Phase 1: Supply Governor (do NOT flood the queue)
 
 Consolidate-before-expand applies to generation itself: new supply is only
 warranted when the available backlog is thin.
 
-1. Measure available supply: count goals across the brief's lanes with
-   `status: pending`, no `defer_reason`, no blocker, matching the brief's
-   target work_class. (`aspirations-query.sh` per lane; the brief names the
-   exact query.)
-2. IF available ≥ brief.high_water_mark:
-   → Post a one-line board tick ("supply healthy: N available ≥ M, no
-   generation this cycle") to the coordination channel, type `status`.
-   → DONE. This is the cheap recurring path — a healthy queue costs one
-   query and one post.
-3. ELSE set `batch_target = min(brief.batch_cap, high_water_mark - available)`.
-   Generation proceeds sized to the actual gap.
+1. Measure available supply PER LANE: for each lane in the brief's table,
+   count goals with `status: pending`, no `defer_reason`, no blocker, no
+   `user` participant, matching the brief's target work_class (ONE query, the
+   brief names its exact shape; filter in the consumer). Print the per-lane
+   table beside the total — the total alone is the lane-blind reading this
+   step was measured to give (g-115-8699: 94 available, 8 of them in the
+   boosted lanes, asp-368 = 0, and the governor said "healthy").
+2. LANE FLOOR (g-115-8699): read the boosted lane set from
+   `team-state-read.sh --field strategic_focus --json` — every `asp-<digits>`
+   token in `primary`; fail-open to the brief's whole lane table when the
+   field is absent. A boosted lane with available < brief.lane_floor is
+   STARVED, whatever the aggregate reads.
+3. IF no boosted lane is starved AND total available ≥ brief.high_water_mark:
+   → Post a one-line board tick ("supply healthy: N available ≥ M; per-lane
+   asp-…=k …; no lane under floor F") to the coordination channel, type
+   `status`. → DONE. The cheap recurring path — one query, one post — and the
+   per-lane counts in the tick are what make a skip auditable.
+4. ELSE set `batch_target = min(brief.batch_cap, Σ_starved (lane_floor −
+   available))`, or `min(batch_cap, high_water_mark − total)` when nothing is
+   starved and only the total is thin. Generation is AIMED: the lens recon and
+   the Candidate Contract's `lane` field target the starved lanes first, and a
+   candidate for an un-starved lane counts against the batch only once every
+   starved lane has at least one verified survivor.
 
 ## Phase 2: Recon — read the REAL surfaces
 

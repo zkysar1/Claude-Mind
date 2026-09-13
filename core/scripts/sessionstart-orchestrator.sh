@@ -189,6 +189,33 @@ bash "$SCRIPT_DIR/local-backend-staleness-check.sh" || true
 # hygiene must never perturb session start.
 bash "$SCRIPT_DIR/history-vacuum-tick.sh" >/dev/null 2>&1 || true
 
+# ─── Step 2.8: late close of abandoned Body manifests () ─────────
+# A manifest leaves `active` only through its own session's stop hook, so a
+# power-down, an lxc stop or a killed pane leaves it `active` forever and the
+# peer stall probe grades it a live stall forever. Session start is the moment
+# a box that lost sessions is running again, and the box that ran a session is
+# the only one entitled to close it — sessions/ never syncs, so every manifest
+# this scans is this box's own.
+# `--hook` does a cheap local scan and returns; only when another session's
+# manifest still reads `active` does it spawn the pass DETACHED (the Step 2.7
+# pattern), and that pass waits for THIS session's own harness registry entry
+# before judging anything, so session start never pays for the wait. The pass
+# closes nothing unless the harness registry proves the session gone, and it
+# deletes nothing — see abandoned_sessions.py for the definition of abandoned.
+# Unconditional like Step 2.75: an autocompact resume is also a session start
+# on a box whose other sessions may have died meanwhile. stderr goes to the
+# pass's own log, not /dev/null: both callers of this chain discard console
+# output, so a sunk diagnostic would be invisible (guard-1680).
+(
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
+  _ab="$SCRIPT_DIR/abandoned_sessions.py"
+  command -v cygpath >/dev/null 2>&1 && _ab="$(cygpath -w "$_ab" 2>/dev/null || echo "$_ab")"
+  mkdir -p "$SCRIPT_DIR/../logs" 2>/dev/null || true
+  printf '%s' "$STDIN_JSON" | python3 "$_ab" --hook \
+      >/dev/null 2>>"$SCRIPT_DIR/../logs/abandoned-sessions.log"
+) || true
+
 # ─── Steps 3+4: source=compact only ────────────────────────────────────────
 if [ "$SOURCE" = "compact" ]; then
     # ─── Step 2.9: clear the context-reads manifest () ───────────

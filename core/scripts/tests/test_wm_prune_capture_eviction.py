@@ -361,3 +361,247 @@ def test_endpoint_dry_run_prune_leaves_the_counter_untouched():
         f"dry_run moved capture_evictions[{LANE}] to "
         f"{after.get('capture_evictions', {}).get(LANE)!r} — a preview must not "
         f"inflate the counter that sizes future caps")
+
+
+# ---------------------------------------------------------------------------
+#  — ARCHIVE BEFORE DELETE on the prune path, and an eviction record
+# that NAMES what it destroyed.
+#
+# The incident this section pins: a routine MAINTAIN call enforced
+# array_limits.spark_capture and destroyed 2,198 worker observations
+# (4,453,737 -> 121,862 bytes) with no archive, logging every one of them as
+# the literal string '?'. Unrecoverable AND unauditable, from one call.
+#
+# The tests are ordered by how much each would have caught: the summary units
+# catch the '?', the archive tests catch the destruction, and
+# test_a_failed_archive_keeps_the_entries catches the regression that would
+# quietly re-arm it — a fail-OPEN archive, which looks like robustness and is
+# the defect.
+# ---------------------------------------------------------------------------
+
+# The two capture shapes that mattered, plus the shape that produced the '?'.
+SPARK_ENTRY = {"observation": "selector has no per-role filter",
+               "goal_id": "g-115-1", "_item_ts": "0001"}
+EXP_ENTRY = {"execution_summary": "ran the census end to end",
+             "_item_ts": "0002"}
+NO_TEXT_ENTRY = {"goal_id": "g-115-3", "load_bearing": True, "_item_ts": "0003"}
+
+
+def _old_array_limit_summary(removed):
+    """The pre-fix expression, verbatim from the array_limit record.
+
+    Kept as the POSITIVE CONTROL: without it, an assertion that the new
+    summariser returns something useful cannot show that the old one did not,
+    and this whole section would pass just as well against unchanged code.
+    """
+    return (str(removed.get("claim", removed.get("reason", "?")))[:80]
+            if isinstance(removed, dict) else "?")
+
+
+@pytest.mark.parametrize("entry,expected_fragment", [
+    (SPARK_ENTRY, "selector has no per-role filter"),
+    (EXP_ENTRY, "ran the census end to end"),
+])
+def test_evicted_summary_names_the_capture_it_dropped(entry, expected_fragment):
+    """A capture entry's own headline field reaches the eviction record.
+
+    The control is the point: both shapes returned a bare '?' from the pre-fix
+    expression, which is how 2,198 destroyed observations left an audit trail
+    that named none of them.
+    """
+    assert _old_array_limit_summary(entry) == "?", (
+        "positive control failed: the pre-fix expression no longer returns '?' "
+        "for this shape, so this test proves nothing about the fix")
+    assert expected_fragment in wm.evicted_summary(entry), (
+        f"evicted_summary({entry!r}) = {wm.evicted_summary(entry)!r} — the "
+        f"record must name what was dropped")
+
+
+def test_evicted_summary_never_returns_a_bare_question_mark():
+    """An entry carrying NO known text field still names its keys.
+
+    This is the half that keeps the fix from going stale. A capture lane whose
+    shape _EVICT_SUMMARY_FIELDS does not yet cover is exactly the case the '?'
+    hid; here the omission announces itself in the record reporting the loss.
+    """
+    assert _old_array_limit_summary(NO_TEXT_ENTRY) == "?", "positive control failed"
+    summary = wm.evicted_summary(NO_TEXT_ENTRY)
+    assert summary != "?" and "?" not in summary, (
+        f"evicted_summary fell back to a question mark: {summary!r}")
+    assert "g-115-3" in summary, "the goal_id is the one identifier this shape has"
+    assert "load_bearing" in summary, (
+        f"the keys fallback must name the keys actually present: {summary!r}")
+
+
+def test_evicted_summary_is_bounded_and_single_line():
+    """A 10 KB observation cannot turn the eviction report into the payload."""
+    fat = {"observation": "x" * 10_000 + "\n\nsecond para", "_item_ts": "0004"}
+    summary = wm.evicted_summary(fat)
+    assert len(summary) <= 120, f"summary is {len(summary)} chars, cap is 120"
+    assert "\n" not in summary, "an eviction record is one line per entry"
+
+
+def test_archive_refuses_and_reports_false_when_the_sink_is_unwritable():
+    """THE FAIL-CLOSED CONTRACT, at the unit level.
+
+    False is not a status line — it is the caller's instruction to KEEP the
+    entry. A regression that makes this return True on failure re-arms the
+    silent destroy, and every other test in this file would still pass.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpd:
+        agent_dir = pathlib.Path(tmpd)
+        # A DIRECTORY where the sink file belongs: the append raises, and the
+        # helper must absorb it as "do not delete" rather than propagate.
+        (agent_dir / wm.CAPTURE_EVICTION_ARCHIVE).mkdir()
+        assert wm.archive_evicted_capture(
+            agent_dir, "spark_capture", SPARK_ENTRY, "array_limit") is False, (
+            "an unwritable sink must report False so the caller keeps the entry")
+    assert wm.archive_evicted_capture(
+        None, "spark_capture", SPARK_ENTRY, "array_limit") is False, (
+        "an unresolved agent dir must report False, never silently skip the "
+        "archive and return success")
+
+
+# --- the END-TO-END half: the live daemon path (wm-prune.sh is daemon-only) ---
+
+ARCHIVE_NAME = "capture-evictions-archive.jsonl"
+
+
+def _archive_rows(project_root):
+    import json as _json
+
+    path = project_root / "agents" / "alpha" / ARCHIVE_NAME
+    # is_file(), not exists(): the sabotage case puts a DIRECTORY at this path,
+    # and exists() is True for it — read_text would then raise IsADirectoryError
+    # and the fail-closed test would error out instead of measuring.
+    if not path.is_file():
+        return []
+    return [_json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _run_prune_observing_archive(sabotage_sink=False):
+    """Fresh daemon over a fresh tmp world; prune an over-cap capture lane and
+    return (response body, on-disk wm dict, archived rows).
+
+    Seeds the same over-cap lane as _run_prune above but with a text field per
+    entry, so the archived CONTENT can be compared against what was in the lane
+    rather than merely counted.
+    """
+    import tempfile
+
+    import yaml
+
+    from _daemon_fixture import DaemonFixture
+
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = pathlib.Path(tmpd) / "world"
+        world.mkdir()
+        with DaemonFixture(world, agent="alpha") as df:
+            cfg = df.project_root / "core" / "config"
+            cfg.mkdir(parents=True, exist_ok=True)
+            (cfg / "memory-pipeline.yaml").write_text(
+                yaml.safe_dump(PRUNING_CONFIG), encoding="utf-8")
+
+            now_iso = datetime.datetime.now().isoformat()
+            wm_path = (df.project_root / "agents" / "alpha" / "session"
+                       / "working-memory.yaml")
+            items = [{"goal_id": f"g-000-{i:02d}",
+                      "observation": f"worker capture {i}",
+                      "_item_ts": f"2026-08-22T10:{i:02d}:00"}
+                     for i in range(SEEDED_ITEMS)]
+            wm_path.write_text(
+                yaml.safe_dump({
+                    "session_start": now_iso,
+                    "slots": {LANE: items},
+                    "slot_meta": {LANE: {"updated_at": now_iso,
+                                         "accessed_at": now_iso,
+                                         "update_count": 1}},
+                }),
+                encoding="utf-8",
+            )
+            if sabotage_sink:
+                (df.project_root / "agents" / "alpha" / ARCHIVE_NAME).mkdir(
+                    parents=True, exist_ok=True)
+
+            body = _post_prune(df.port, dry_run=False)
+            after = yaml.safe_load(wm_path.read_text(encoding="utf-8"))
+            return body, after, _archive_rows(df.project_root)
+
+
+def test_prune_archives_every_capture_entry_before_removing_it():
+    """The headline outcome: nothing leaves the lane without a copy landing.
+
+    Count, CONTENT and order are all pinned. A count alone passes against an
+    archive of 7 empty rows — the original defect wearing a receipt.
+    """
+    body, after, rows = _run_prune_observing_archive()
+
+    assert _array_limit_prunes(body) == EXPECTED_EVICTED, (
+        "the seeded cap did not take effect — nothing below is a measurement")
+    assert len(after["slots"][LANE]) == SEEDED_CAP, (
+        f"{LANE} left at {len(after['slots'][LANE])}, expected the cap")
+    assert len(rows) == EXPECTED_EVICTED, (
+        f"{len(rows)} rows archived against {EXPECTED_EVICTED} entries "
+        f"evicted — archive-before-delete means the two are equal, always")
+    assert [r["entry"]["goal_id"] for r in rows] == [
+        f"g-000-{i:02d}" for i in range(EXPECTED_EVICTED)], (
+        "the archive must hold the OLDEST entries — the ones FIFO dropped")
+    assert all(r["entry"]["observation"] == f"worker capture {i}"
+               for i, r in enumerate(rows)), (
+        "the archived row must carry the ENTRY, not just a note that one existed")
+    for r in rows:
+        assert r["slot"] == LANE and r["eviction_reason"] == "array_limit"
+        assert "?" not in r["summary"], f"archived summary is a '?': {r!r}"
+
+
+def test_a_failed_archive_keeps_the_entries():
+    """THE LOAD-BEARING TEST: fail CLOSED, and terminate.
+
+    When the sink cannot be written, the cap stays exceeded. That is the
+    deliberate direction: a lane over its cap costs memory and says so in this
+    very response, while a destroyed capture is unrecoverable — the WM store is
+    git-untracked and the own-cloud recovery config is unreadable from the
+    fleet identity, which archive-before-delete step 2 says to treat as ABSENT.
+
+    The termination property is not padding. The eviction loop re-tests the
+    same over-limit condition every pass, so a `continue` where the code says
+    `break` spins forever on a failing sink — and what catches it is this test
+    hanging rather than any assertion in it.
+    """
+    body, after, rows = _run_prune_observing_archive(sabotage_sink=True)
+
+    assert rows == [], "the sabotaged sink must not have produced rows"
+    assert len(after["slots"][LANE]) == SEEDED_ITEMS, (
+        f"{LANE} left at {len(after['slots'][LANE])} entries — a prune that "
+        f"cannot archive MUST NOT delete; keeping the lane over its cap is the "
+        f"recoverable direction and destroying captures is not")
+    assert _array_limit_prunes(body) == 0, (
+        "nothing was evicted, so nothing may be reported as evicted")
+    failures = body["report"].get("archive_failures") or []
+    assert any(f.get("slot") == LANE for f in failures), (
+        f"a refused eviction must be VISIBLE in the report, not silent: "
+        f"{body['report']!r}")
+    assert after.get("capture_evictions", {}).get(LANE) in (None, 0), (
+        "nothing was destroyed, so the destruction tally must not move")
+
+
+@pytest.mark.parametrize("path", [CLI, DAEMON])
+def test_both_twins_archive_before_deleting_a_capture(path):
+    """Structural parity: the daemon is the LIVE path and the CLI is its twin.
+
+    A behavioural test can only reach the daemon copy (wm-prune.sh is
+    daemon-only), so without this the CLI twin could lose the archive call and
+    every other test in this file would stay green.
+    """
+    block, _ = _prune_block(path, "")
+    assert "archive_evicted_capture(" in block, (
+        f"{path.name}: the prune eviction loop must archive before it deletes")
+    assert "evicted_summary(" in block, (
+        f"{path.name}: the eviction record must name what was dropped")
+    src = path.read_text(encoding="utf-8")
+    assert "def archive_evicted_capture(" in src and "def evicted_summary(" in src, (
+        f"{path.name}: must DEFINE the helpers it calls, not import them from "
+        f"its twin — these two files are deliberate copies (guard-742)")

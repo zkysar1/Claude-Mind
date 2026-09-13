@@ -48,11 +48,17 @@ Body forks (Phase 2, g-306-65).
 **Lifecycle:** `active` (written by FORK-BODY — Phase 1B, landed) ->
 `closed-pending-merge` (written by `stop-hook.sh` on body close — Phase 1C) ->
 `merged` (written by the Phase 1C generalize-down merge in `aspirations-consolidate`
-Step -1) | `closed-stale` (written by `cleanup-stale-bindings.sh` when a Body's dir
-is swept before merge — deferred to Phase 1D stale-Body preservation, g-306-64).
-As of Phase 1C the `active`, `closed-pending-merge`, and `merged` writes are all
-wired (`closed-stale` remains the Phase 1D sweep). All are dormant until a 2nd
-worker Body forks.
+Step -1) | `closed-stale` (a Body closed by a sweep rather than by itself, with no
+forked WM to merge).
+**Late close (g-115-9607).** The stop hook is the only close a session runs for
+itself, so a power-down, lxc stop or killed pane leaves `active` forever. At every
+SessionStart, `abandoned_sessions.py` (orchestrator Step 2.8) closes, on the box
+that ran them, the manifests reading `active` whose session the harness's own
+process registry proves gone: a forked worker through the ORDINARY close
+(`body-manifest.close_body_late` — staged if remote, `closed-pending-merge`), a
+Body with no forked WM (reducer, observer) to `closed-stale`. It deletes nothing
+and never touches `parked`. The Phase 1D sweep (`cleanup-stale-bindings.sh`)
+still stages a stale dir's WM and removes the dir; it writes no state.
 
 **`parked` is a CYCLE, not a step on that chain** (g-306-291, 2026-08-16):
 `active` <-> `parked`, written by `body-manifest.py park` / `resume` when the
@@ -165,11 +171,16 @@ for cross-box Bodies (harmless — a store-only unit reads `None` and is skipped
 
 This is a decision, not a gap, and it was made twice on evidence — do not re-open it
 by syncing `sessions/`: (1) g-306-119-b — a REMOTE Body's genuine close STAGES its
-WM + fork baseline + hash into `session/pending-body-merges/` (singular `session/`,
-syncable) and pushes each file EXPLICITLY (`body-manifest.py::_stage_and_push`;
+WM + fork baseline + hash and pushes each file EXPLICITLY
+(`body-manifest.py::_stage_and_push`;
 `owncloud-flush` cannot do it because `sweep()` pushes only claim-owning agent dirs
 and a worker box owns none); the reducer's `_consume_staged` reads authoritative-first
-and enumerates the store listing (g-306-187). (2) g-115-6240 deliberately REJECTED
+and enumerates the store listing (g-306-187). **The destination moved out of the
+agent tree in g-115-9750**: `session/` (singular) is syncable but CLAIM-FENCED, and
+`sessions/` (plural) is claim-exempt but sync-excluded — neither is both, so the
+triple now lands in `world/body-staged-wm/<agent>/`, which is. The push had been
+refused `NoClaimError` from every worker box since the transport shipped;
+`_consume_staged` scans BOTH destinations and that union IS the migration. (2) g-115-6240 deliberately REJECTED
 pushing `sessions/<unitKey>/` files ("a SECOND copy of the same bytes in the store …
 redundancy in a merge path is where later double-counting comes from"). The manifest
 is a per-box DURABLE CLOSURE RECORD for that box's stop-hook / deadman / cleanup —

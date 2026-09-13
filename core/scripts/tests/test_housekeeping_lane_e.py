@@ -158,3 +158,86 @@ def test_lane_e_config_default_is_present_and_inside_the_detector_threshold():
     """
     assert hk.DEFAULTS["mind_seed_freshness_interval_hours"] == 24
     assert hk.DEFAULTS["mind_seed_freshness_interval_hours"] < 72
+
+
+# ── content attribution carried through the lane ( F5) ─────────────
+# The detector gained a CONTENT assertion beside its age assertion, because an
+# age-only check cannot tell a real publish from a truncated one or from a live
+# key overwritten with nothing behind it — all three render "fresh". `out` in
+# `run_lane_e` is a fixed allow-list, so a key the script emits and
+# that tuple does not name is dropped in SILENCE: these pin the wiring, not the
+# predicate (the predicate's own both-directions control is the domain test
+# world/scripts/tests/test-mind-seed-content-attribution.sh).
+
+CONTENT_PAYLOAD = dict(
+    PAYLOAD,
+    content_verdict="attributed",
+    content_sha="7af1d1017ec3f346002eca171e00eb245d79c7cf",
+    content_entries="3302",
+    content_note="",
+)
+
+
+def test_content_fields_reach_the_lane_record():
+    r = hk.run_lane_e(CFG, state_path=_statepath(),
+                                   check_cmd=_fake(0, CONTENT_PAYLOAD))
+    assert r["verdict"] == "ok"
+    assert r["content_verdict"] == "attributed"
+    assert r["content_sha"] == "7af1d1017ec3f346002eca171e00eb245d79c7cf"
+    assert r["content_entries"] == "3302"
+
+
+def test_content_mismatch_rides_rc1_and_still_stamps():
+    """A content fault uses the EXISTING rc=1 rather than a fourth code.
+
+    Lane E maps any unrecognised rc to `unknown-rc` and stamps only on rc 0/1, so
+    a new exit code would retry every tick forever — the guard-6347 shape this
+    detector has already suffered once ("a silence detector that was itself
+    silent"). rc=1 keeps it a measured, stamped answer; the `content_verdict`
+    field is what distinguishes a content fault from an age fault.
+    """
+    sp = _statepath()
+    r = hk.run_lane_e(
+        CFG, state_path=sp,
+        check_cmd=_fake(1, dict(CONTENT_PAYLOAD, content_verdict="mismatch",
+                                content_note="live ContentLength=1 but manifest bytes=2")))
+    assert r["verdict"] == "stale"
+    assert r["content_verdict"] == "mismatch"
+    assert "manifest bytes" in (r["content_note"] or "")
+    assert sp.exists(), "a content mismatch is a MEASURED answer and must stamp"
+
+
+def test_unverified_content_on_a_fresh_run_still_stamps():
+    """`unverified` means nothing was COMPARED — it must not degrade the age answer.
+
+    The age question was measured and answered; only the secondary content probe
+    declined to guess. Withholding the stamp here would make a permissions change
+    on the manifest object silently convert the lane into a per-tick retry loop,
+    which is the disease, not the cure (guard-1562).
+    """
+    sp = _statepath()
+    r = hk.run_lane_e(
+        CFG, state_path=sp,
+        check_cmd=_fake(0, dict(CONTENT_PAYLOAD, content_verdict="unverified",
+                                content_sha="", content_entries="",
+                                content_note="changelog unparseable")))
+    assert r["verdict"] == "ok"
+    assert r["content_verdict"] == "unverified"
+    assert sp.exists(), "an unverified CONTENT probe must not withhold the AGE stamp"
+
+
+def test_a_detector_with_no_content_keys_is_still_handled():
+    """Backward compatibility across deployments, not a hypothetical.
+
+    This file is FRAMEWORK and promotes downstream (Ayoai-Mind -> Claude-Mind ->
+    ZDS-Mind); the detector it shells out to is a DOMAIN script living under an
+    external, gitignored world path, so it does NOT travel with this change. A
+    downstream Mind will therefore run the new consumer against the OLD detector,
+    which emits no content_* keys at all. That must read as "not reported",
+    never as a crash and never as a content failure.
+    """
+    r = hk.run_lane_e(CFG, state_path=_statepath(),
+                                   check_cmd=_fake(0, PAYLOAD))
+    assert r["verdict"] == "ok"
+    assert r["content_verdict"] is None
+    assert r["content_sha"] is None

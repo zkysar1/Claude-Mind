@@ -87,11 +87,15 @@ fi
 # Mandatory: interruptible-sleep.sh (not plain `sleep`). The 1s-granularity
 # stop-signal check lets /stop respond within seconds instead of waiting for
 # a 30-minute plain sleep to exit.
-# Harness branch (): "the harness notifies you" is a Claude Code fact.
-# On a harness that cannot notify on background-job exit the wake-up IS the
-# re-entry, so the directive carries the sized ScheduleWakeup arm (empty on a
-# notifying harness; one shared text in _harness_caps.no_notify_hint).
-NO_NOTIFY_HINT="$(bash "$CORE_ROOT/scripts/harness-capabilities.sh" --hint "$SLEEP_DURATION" 2>/dev/null)"
+# Harness branch ( +  leg c): "the harness notifies you" is a
+# Claude Code fact, and so is "one backgrounded call at the FULL duration". Both
+# were hardcoded below with the hint appended, which CONTRADICTED them on every
+# capped harness (zakcode and unknown are both capped AND no-notify). The whole
+# yield block is now keyed on the harness by its one owner,
+# _harness_caps.sleep_directive, reached from shell through the same wrapper the
+# --hint call used. Uncapped+notifying output is byte-identical to before.
+SLEEP_DIRECTIVE="$(bash "$CORE_ROOT/scripts/harness-capabilities.sh" \
+  --sleep-directive "$SLEEP_DURATION" "$AGENT_NAME" QUIESCENCE_SLEEP=1 2>/dev/null)"
 cat <<EOF
 === IDLE TICK ===
 Blocked-sleep timer active: ${REMAINING}s remaining (wake at ${VAL}).
@@ -100,11 +104,9 @@ precheck pass (completion runners, blocker resolution, capability recheck)
 even if the timer is further out. This cycle sleeps ${SLEEP_DURATION}s.
 CHECKPOINT_SLEEP=${CHECKPOINT_SLEEP} (0=final, 1=midway — run light precheck then re-enter backoff).
 DO NOT load Skill(aspirations). DO NOT run any selection or execution.
-Emit exactly ONE tool call:
-  Bash("MIND_AGENT=${AGENT_NAME} QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh ${SLEEP_DURATION}", run_in_background=true)
-When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.
-${NO_NOTIFY_HINT}
-If you see this directive again after an autocompact, re-emit the Bash call
-for the NEW ${SLEEP_DURATION} printed above (this script recomputes on each invocation).
+${SLEEP_DIRECTIVE}
+If you see this directive again after an autocompact, re-emit the Bash call EXACTLY as
+printed above — this script recomputes on every invocation, so the duration in it is
+already the current one (on a capped harness that is one CHUNK, not the whole remainder).
 =================
 EOF

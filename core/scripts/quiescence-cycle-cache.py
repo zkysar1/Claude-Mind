@@ -85,7 +85,8 @@ DEFER_REMAINING_S = 60
 # that implies the blocker state may have changed). Informational signals
 # (board-activity, goal-claim-released) are demoted under QUIESCENCE_SLEEP and
 # are intentionally NOT included.
-BLOCKER_SIGNAL_FILES = ("blocker-cleared", "pq-resolved", "email-received")
+BLOCKER_SIGNAL_FILES = ("blocker-cleared", "pq-resolved", "email-received",
+                        "perception-received")
 
 
 def _cache_path():
@@ -231,10 +232,10 @@ def _emit_hit_directive(cache, cap, earliest_wake_at=None):
         "Blocker set unchanged, no blocker expired, no new work, no pending signal --\n"
         "skipping the precheck/select/all-blocked reload for this cycle.\n"
         "DO NOT load Skill(aspirations). DO NOT run selection or execution.\n"
-        "Emit exactly ONE tool call:\n"
-        f"  Bash(\"MIND_AGENT={agent} QUIESCENCE_SLEEP=1 bash core/scripts/interruptible-sleep.sh {sleep_seconds}\", run_in_background=true)\n"
-        "When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.\n"
-        + _harness_caps.no_notify_hint(sleep_seconds) +
+        # The yield block is harness-keyed and owned by _harness_caps.sleep_directive
+        # ( leg c). It used to be hardcoded here for Claude Code with
+        # no_notify_hint appended, which CONTRADICTED it on every capped harness.
+        + _harness_caps.sleep_directive(sleep_seconds, agent, "QUIESCENCE_SLEEP=1") +
         f"After {cap} consecutive short-circuits a full cycle is forced for drift detection.\n"
         "================="
     )

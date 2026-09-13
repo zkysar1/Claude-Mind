@@ -124,6 +124,36 @@ def test_undecodable_side_REFUSES_and_is_never_read_as_empty():
     assert H(good, lossy_would_merge) is None
 
 
+def test_an_ADDITIVE_section_does_NOT_survive_a_conflict_ELSEWHERE():
+    """The refusal is WHOLE-FILE, not per-section: one diverged shared heading
+    discards the other side's purely-additive section along with it.
+
+    Measured against the handler directly in g-115-9816, after the sibling
+    docstring's "same heading diverged on both sides" wording was read as a
+    per-section collision test -- under which a side that only ADDS a heading
+    nobody else touched should still merge. It does not. `merge_sections` is
+    called with an EMPTY base, so the handler has no per-section authority to
+    keep one hunk and drop another; any conflict refuses the whole file, and a
+    one-sided edit is indistinguishable from a two-sided one at this layer.
+    Both prior readings of this handler (content-indifferent; refuses only when
+    both sides moved the SAME heading) were falsified by this case (guard-6585).
+
+    The positive control is in-test on purpose: with Alpha left alone the
+    IDENTICAL addition merges, so the refusal is attributable to the conflict
+    elsewhere in the file and not to the addition itself.
+    """
+    ours_additive = b"# N\n\n## Alpha\nv1\n\n## Brand New\nonly on our side\n"
+    theirs_edited = b"# N\n\n## Alpha\nv2 -- edited here\n"
+    assert H(ours_additive, theirs_edited) is None
+    assert H(theirs_edited, ours_additive) is None, \
+        "refusal must not depend on argument order (the canonical side-sort)"
+
+    # POSITIVE CONTROL -- same addition, Alpha byte-identical on both sides.
+    theirs_clean = b"# N\n\n## Alpha\nv1\n"
+    out = H(ours_additive, theirs_clean)
+    assert out is not None and b"only on our side" in out
+
+
 # ------------------------------------------------------------ known residual --
 def test_KNOWN_RESIDUAL_a_deliberate_section_eviction_resurrects():
     """A deleted section comes BACK. This is the accepted cost of section-union.

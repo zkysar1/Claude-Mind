@@ -117,6 +117,10 @@ PARKED_BODY_STATE = "parked"
 
 ALERTING_VERDICTS = frozenset({V_STALLED_WITH_CLAIM, V_STALLED_NO_CLOSE})
 
+# Distinguishes "present and wrong" from "not in the report at all";
+# None is a legal value for several of these fields, so it cannot serve.
+_MISSING = object()
+
 
 def classify_body(
     carrier_age_minutes: Optional[float],
@@ -200,6 +204,94 @@ def is_alerting(verdict: str) -> bool:
     re-derive this with their own string comparison -- that is how a verdict
     added later silently starts or stops alerting."""
     return verdict in ALERTING_VERDICTS
+
+
+# Keys the measurement gate needs, AND THE LEVEL EACH ONE LIVES AT. This split
+# is the entire reason this helper exists: `complete` and `read_via` come from
+# enumerate_carriers and are nested under `enumeration`, while `degraded_read`
+# and `rows_dropped` are computed by scan() and sit at the TOP level. Two
+# independent hand-parses of this one report have already produced a wrong
+# verdict by flattening them ( units 34 and 35) -- the first guessed
+# the row keys, the second looked for all four under `enumeration` and read a
+# healthy fleet as invalid.
+_GATE_NESTED = ("complete", "read_via")
+_GATE_TOPLEVEL = ("degraded_read", "rows_dropped")
+
+
+def reading_is_valid(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Is this scan() report a MEASUREMENT, or merely an output? ()
+
+    Single source of truth for the four-part validity gate that g-115-9607
+    outcome 4 states in prose. Callers must not re-derive it -- same reasoning
+    as `is_alerting` above, with a sharper edge: the terms live at two
+    different nesting levels, so every hand-rolled version so far has been
+    wrong in the PERMISSIVE direction.
+
+    RETURNS A REASONED VERDICT, NEVER A BARE BOOL (guard-2223). `valid: False`
+    with no reason is unactionable, and this gate's whole job is to be read by
+    something deciding whether to trust a number -- so it must say which term
+    failed. Shape: {valid, reasons, checked}.
+
+    A MISSING TERM IS INVALID, NOT VALID. `report.get("rows_dropped") or 0`
+    reads an absent key as a clean zero, which is the permissive-default trap
+    guard-6258 names: the gate's constraint is absent and the verdict comes
+    back "ok". An older report, a different producer, or a renamed field must
+    therefore read INVALID here and force a look, not sail through.
+
+    THIS IS NOT agent-watchdog's `blind` PREDICATE AND MUST NOT BE FUSED WITH
+    IT. That one asks "can this probe bound the fleet well enough to ALERT?"
+    and deliberately omits `read_via`/`degraded_read` while adding
+    `enumeration_lost_everything` and `all_carriers_unreadable`. This one asks
+    "may this count be COMPARED AGAINST A BASELINE?" and requires an
+    authoritative read. Unifying them would add a read_via=='authoritative'
+    requirement to live alerting -- a production behaviour change on every box
+    whose read legitimately falls back to the local mirror (guard-2485: the
+    call sites do not carry the same context; guard-1506: test the decision
+    before reusing the gate).
+    """
+    enum = report.get("enumeration")
+    if not isinstance(enum, dict):
+        enum = {}
+    checked: Dict[str, Any] = {}
+    reasons = []
+
+    for key in _GATE_NESTED:
+        checked["enumeration." + key] = enum.get(key, _MISSING)
+    for key in _GATE_TOPLEVEL:
+        checked[key] = report.get(key, _MISSING)
+
+    # ABSENCE IS CHECKED FIRST AND SHORT-CIRCUITS THE COMPARISON FOR THAT TERM.
+    # The order is load-bearing, not cosmetic: comparing a sentinel renders the
+    # reason as "<object object at 0x...>, not True", which reads as a CORRUPT
+    # VALUE and sends the next reader hunting a parse bug instead of an absent
+    # field. Measured -- mutation-proofing this helper's own absent-term test
+    # came back baseline-RED on exactly that leak ( unit 35).
+    def _present(name):
+        if checked[name] is _MISSING:
+            reasons.append("%s is ABSENT from the report -- an absent term is "
+                           "read as INVALID, never as a clean default" % name)
+            return False
+        return True
+
+    if _present("enumeration.complete") and checked["enumeration.complete"] is not True:
+        reasons.append("enumeration.complete is %r, not True -- the report does "
+                       "not bound the fleet" % (checked["enumeration.complete"],))
+    if _present("enumeration.read_via") and checked["enumeration.read_via"] != "authoritative":
+        reasons.append("enumeration.read_via is %r, not 'authoritative' -- a "
+                       "local-mirror read sees only carriers this box pulled"
+                       % (checked["enumeration.read_via"],))
+    if _present("degraded_read") and checked["degraded_read"] is not False:
+        reasons.append("degraded_read is %r, not False"
+                       % (checked["degraded_read"],))
+    if _present("rows_dropped") and checked["rows_dropped"] != 0:
+        reasons.append("rows_dropped is %r, not 0" % (checked["rows_dropped"],))
+
+    return {
+        "valid": not reasons,
+        "reasons": reasons,
+        "checked": {k: (None if v is _MISSING else v) for k, v in checked.items()},
+        "absent": sorted(k for k, v in checked.items() if v is _MISSING),
+    }
 
 
 TERMINAL_STATUSES = {"completed", "skipped", "expired"}

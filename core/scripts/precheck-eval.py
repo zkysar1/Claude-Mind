@@ -1945,12 +1945,27 @@ def cmd_claim_integrity(args, config, compact):
     elif verdict == "damaged":
         flags = ["claim_pair_damaged"]
 
+    # CLAIM-CLOCK SKEW () -- APPENDED, never assigned, so it composes
+    # with the verdict flags above instead of racing them: a store can be both
+    # BLIND and skewed, and an `elif` here would have hidden whichever came
+    # second. Carried as its own flag rather than a new `verdict` value for the
+    # same reason the producer kept the verdict vocabulary closed -- a verdict
+    # this function does not recognise yields NO flag at all, which is the
+    # always-reports-clear failure the detector was added to remove. Measured
+    # 2026-09-13: the census reported verdict=clean with present_value=9 and
+    # findings=0 while 3 of those 9 live claims were skewed, and a release on
+    # one of them reverted twice.
+    if res.get("claim_clock_violation_count"):
+        flags.append("claim_clock_skew")
+
     summary = (
         f"claim-integrity: {verdict} — {res['findings_total']} damaged "
         f"({res['reconcile_damage_count']} with partial field survival) of "
         f"{res['scanned_non_terminal']} non-terminal "
         f"[key_presence absent={kp['absent']} null={kp['present_null']} "
         f"value={kp['present_value']}]"
+        f" | claim-clock skew {res.get('claim_clock_violation_count', 0)}"
+        f" of {kp['present_value']} live claim(s)"
     )
     return {
         "subcommand": "claim-integrity",

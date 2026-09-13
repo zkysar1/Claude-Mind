@@ -169,7 +169,7 @@ def main() -> int:
     # apart from a scan that read nothing (guard-2298, guard-3830).
     print(
         f"[abandoned-claim] scanned={report['scanned_goals']} "
-        f"claimed_in_progress={report['claimed_in_progress']} "
+        f"claimed_open={report['claimed_open']} "
         f"in_flight_rows={report['in_flight_rows']} "
         f"abandoned={report['abandoned_count']} "
         f"releasable={report['releasable_count']} "

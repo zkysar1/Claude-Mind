@@ -71,6 +71,7 @@ exit:   0 on noop/pass/override/error; 1 on block.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -126,6 +127,12 @@ RETAINED_LOG_DIR = Path(os.environ.get("DOMAIN_SUITE_LOG_DIR")
 # and docs (.jsonl/.md) are skipped for the same reason even when named.
 PRIVATE_NAME_RE = re.compile(r"(?i)^\.env|token|secret|credential|\.pem$|\.key$|\.p12$|^id_(rsa|ed25519|ecdsa)")
 PRIVATE_SKIP_SUFFIXES = {".lock", ".pid", ".port", ".sock", ".log", ".tmp", ".bak", ".jsonl", ".md"}
+# Ceiling on the content read behind the sha256 (). A credential file is
+# small — the live .env.local that motivated this is ~2 KB — so anything past this
+# is not one, and the gate declines to read it rather than pulling an arbitrarily
+# large file into memory. Over the ceiling the digest is None, which classifies as
+# `unverifiable` and warns, never as a silent "unchanged".
+PRIVATE_HASH_MAX_BYTES = 1 << 20  # 1 MiB
 
 
 def private_roots(world_dir: Path | None) -> list[Path]:
@@ -139,10 +146,41 @@ def private_roots(world_dir: Path | None) -> list[Path]:
     return roots
 
 
-def private_files(roots: list[Path]) -> dict[str, tuple[int, int]]:
-    """{path: (size, mtime_ns)} of the credential-shaped files DIRECTLY under each
-    root. Shape only — the contents are never read."""
-    out: dict[str, tuple[int, int]] = {}
+def _content_digest(p: Path, size: int) -> str | None:
+    """sha256 of a credential-shaped file, or None when it cannot be established.
+
+    The DIGEST, never the value: it is compared against another digest and never
+    logged, emitted or carried into a message (guard-724 / guard-1563 — read a
+    credential store by shape, never by content). A digest is not reversible and
+    is not a value, which is what makes this the one content read the gate may do.
+
+    None means "could not establish", and every caller must treat that as UNKNOWN
+    rather than as 'unchanged' — an unreadable file is exactly the case where a
+    confident answer would be wrong.
+    """
+    if size > PRIVATE_HASH_MAX_BYTES:
+        return None          # not a credential file at that size; do not read it
+    try:
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            h.update(fh.read(PRIVATE_HASH_MAX_BYTES + 1))
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def private_files(roots: list[Path]) -> dict[str, tuple[int, int, str | None]]:
+    """{path: (size, mtime_ns, sha256|None)} of the credential-shaped files DIRECTLY
+    under each root.
+
+    The digest was added by g-115-9346. Shape alone (size, mtime_ns) CANNOT tell a
+    destructive clobber from a bare `touch` or a byte-identical round-trip rewrite,
+    so a gate keying on it hard-refuses every close over an event that may have
+    changed nothing — measured twice, contents byte-identical both times, with a
+    refusal that states `--override-domain-suite does not apply`. The digest is what
+    lets the two be separated; see classify_private_changes.
+    """
+    out: dict[str, tuple[int, int, str | None]] = {}
     for root in roots:
         try:
             entries = list(root.iterdir())
@@ -156,12 +194,60 @@ def private_files(roots: list[Path]) -> dict[str, tuple[int, int]]:
             if not stat.S_ISREG(st.st_mode) or p.suffix.lower() in PRIVATE_SKIP_SUFFIXES:
                 continue
             if PRIVATE_NAME_RE.search(p.name):
-                out[str(p)] = (st.st_size, st.st_mtime_ns)
+                out[str(p)] = (st.st_size, st.st_mtime_ns, _content_digest(p, st.st_size))
     return out
 
 
+def classify_private_changes(before: dict, after: dict) -> dict[str, list[str]]:
+    """Split the credential-shaped files that moved across the suite window into
+    what the instrument can actually support (g-115-9346).
+
+    Returns {"content_changed": [...], "touched": [...], "unverifiable": [...]},
+    each a sorted path list:
+
+      content_changed — the file VANISHED, or its sha256 differs. The only class
+                        that justifies a hard refusal: contents really are not what
+                        they were.
+      touched         — the (size, mtime_ns) signature moved but the sha256 is
+                        IDENTICAL. Nothing was lost. A `touch`, a restore, or a
+                        provisioner re-writing the same values all land here.
+      unverifiable    — the signature moved and the digest could not be established
+                        on one side or the other. NOT silently folded into either
+                        class: the caller says so out loud.
+
+    WHY THIS SPLIT EXISTS, stated so it is not "simplified" back: the predicate
+    brackets a TIME WINDOW on a live multi-agent box, so it measures co-occurrence
+    and never causation — any concurrent writer satisfies it exactly as a test
+    would. Two independent investigations (cc-04, 86 tests; cc-08, 82 tests plus a
+    full canonical runner pass under a 1-second watcher) found NO domain test that
+    writes the live credential file, while the refusal it produced was hard and
+    unoverridable. A guard that cannot be satisfied by any action available to the
+    blocked agent is a wedge, not a guard — so only `content_changed` may block.
+    """
+    out = {"content_changed": [], "touched": [], "unverifiable": []}
+    for path, sig in before.items():
+        post = after.get(path)
+        if post == sig:
+            continue
+        if post is None:
+            out["content_changed"].append(path)     # vanished
+            continue
+        before_digest, after_digest = sig[2], post[2]
+        if before_digest is None or after_digest is None:
+            out["unverifiable"].append(path)
+        elif before_digest != after_digest:
+            out["content_changed"].append(path)
+        else:
+            out["touched"].append(path)
+    return {k: sorted(v) for k, v in out.items()}
+
+
 def rewritten_private_files(before: dict, after: dict) -> list[str]:
-    """Paths whose size or mtime changed, or that vanished, across the suite run."""
+    """Paths whose signature changed, or that vanished, across the suite run.
+
+    Retained as the raw any-movement predicate; the CLOSE decision now routes
+    through classify_private_changes, which says WHICH KIND of movement it was.
+    """
     return sorted(p for p, sig in before.items() if after.get(p) != sig)
 
 
@@ -535,11 +621,15 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     roots = private_roots(world_dir)
     before = private_files(roots)
     rc, tail, failing, log = run_suite(scripts_dir, timeout, goal_id)
-    clobbered = rewritten_private_files(before, private_files(roots))
+    changes = classify_private_changes(before, private_files(roots))
+    clobbered = changes["content_changed"]
     if clobbered:
-        why = (f"the domain suite REWROTE {len(clobbered)} credential-shaped file(s) outside its own tree: "
+        # CONTENTS really differ (or the file vanished). This is the case the hard
+        # refusal was always meant for, and now the only one that reaches it.
+        why = (f"{len(clobbered)} credential-shaped file(s) outside the suite's own tree CHANGED CONTENT "
+               "during the domain-suite window: "
                + ", ".join(clobbered[:4]) + (" ..." if len(clobbered) > 4 else "")
-               + " — a test wrote through to a live credential path")
+               + " — verified by sha256, not by mtime")
         _emit("block", goal_id, override, reason=why, runner=runner_label, rc=rc, touched=touched,
               clobbered=clobbered, tail=tail, log=log)
         print("", file=sys.stderr)
@@ -547,9 +637,29 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         print("  Restore each file from its backup or upstream source of truth FIRST (the run may have", file=sys.stderr)
         print("  replaced a live token with a fixture), then make the persistence path overridable and", file=sys.stderr)
         print("  point the tests at a tmp path (guard-5541). --override-domain-suite does not apply here:", file=sys.stderr)
-        print("  a rewritten credential is never pre-existing. (If another process legitimately", file=sys.stderr)
-        print("  refreshed the file during the run, the file is intact — just re-run the close.)", file=sys.stderr)
+        print("  a rewritten credential is never pre-existing.", file=sys.stderr)
+        print("  ATTRIBUTION CAVEAT: this brackets a TIME WINDOW, so it establishes that the contents", file=sys.stderr)
+        print("  changed while the suite ran — NOT that the suite changed them. On a live multi-agent", file=sys.stderr)
+        print("  box a concurrent writer satisfies it identically. Confirm before repointing a test.", file=sys.stderr)
         return 1
+    # Signature moved but the CONTENTS did not (or could not be compared). Warn with
+    # what was actually observed and let the close proceed: a hard refusal here is
+    # the  wedge — unoverridable, unreproducible by the bisect it implies,
+    # and raised over a file that is provably intact.
+    if changes["touched"] or changes["unverifiable"]:
+        if changes["touched"]:
+            print(f"[domain-suite-gate] ⚠ {len(changes['touched'])} credential-shaped file(s) were TOUCHED "
+                  "during the suite window — sha256 UNCHANGED, so nothing was lost: "
+                  + ", ".join(changes["touched"][:4])
+                  + (" ..." if len(changes["touched"]) > 4 else ""), file=sys.stderr)
+        if changes["unverifiable"]:
+            print(f"[domain-suite-gate] ⚠ {len(changes['unverifiable'])} credential-shaped file(s) moved and "
+                  "their contents could NOT be compared (unreadable, or past the hash ceiling); this is "
+                  "UNKNOWN, not a clean bill: "
+                  + ", ".join(changes["unverifiable"][:4])
+                  + (" ..." if len(changes["unverifiable"]) > 4 else ""), file=sys.stderr)
+        print("  Not blocking the close. Who wrote it is NOT measured — the predicate brackets a time "
+              "window, not a cause.", file=sys.stderr)
     if rc in (0, 5):
         note = "" if rc == 0 else " (pytest collected no tests)"
         save_baseline(world_dir, set(), rc, runner_label)

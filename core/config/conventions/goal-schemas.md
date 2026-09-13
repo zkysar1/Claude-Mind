@@ -496,6 +496,12 @@ blocker_ref:
   # --- promoted optional keys (present only when supplied) ---
   unblock_goal: <goal-id or board-msg ref — the thing whose completion clears this>
   why:          <free text — human-readable rationale>
+  owner:        <agent name — deploy-hold reservations ONLY: who is accountable for
+                 renewing or clearing this hold. REQUIRED on deploy-hold:* refs
+                 declared after the 2026-08-26 cutoff; optional elsewhere>
+  released_branches:
+                <map, deploy-hold reservations ONLY — the owner's explicit per-branch
+                 release: {"<branch>": {"released_by": "<owner>", "released_at": "<iso>"}}>
 ```
 
 **Key vocabulary is closed (g-115-3532).** `validate()` accepts exactly the keys
@@ -512,6 +518,29 @@ spellings, which is exactly how this schema got into the state described below.
 consumes them — `blocked-signal-resolution-check._resolve_blocker_ref` resolves
 a ref via `unblock_goal`, so stripping it would convert a resolvable block into
 an opaque one.
+
+`owner` and `released_branches` are the deploy-hold reservation pair, and both are
+read by `world/scripts/deploy-hold-check.sh` (the promotion rule above — a key
+earns its place by having a live reader — is what admits them).
+
+`released_branches` (g-115-9768) is how a hold OWNER releases one branch of their
+own hold without clearing it. The check downgrades HELD -> CLEAR when
+`DHC_PUSH_TARGET` names a released branch, and refuses to otherwise: a release
+whose `released_by` is not the ref's `owner` is IGNORED by the reader and REFUSED
+by this gate, and `main`/`master` can never be released at all because that branch
+IS the deploy surface the hold protects. It is a map keyed by BRANCH rather than a
+list of PRs deliberately — a branch is a PREDICATE ("anything targeting dev"), so an
+artifact created after the release still inherits it, which is the enumeration trap
+guard-3491 exists to prevent.
+
+> **`owner` was absent from the field-shape block above until 2026-09-12**, having
+> been promoted on 2026-08-26 without the doc half landing. That mattered more than
+> a missing line usually would, because this block is NORMATIVE and closed — it is
+> immediately followed by "Any other key is REFUSED, not silently dropped" — so the
+> omission actively told a reader that `owner` would be refused, when in fact it is
+> REQUIRED on a post-cutoff `deploy-hold:*` ref. Corrected in passing while adding
+> `released_branches`; the pre-existing gap is noted rather than quietly folded in,
+> because the two keys were added by different goals.
 
 > **AUTO-POPULATION CAVEAT — RESOLVED for the write path (g-115-3532,
 > 2026-07-27).** "Auto-populated" was previously a claim about ONE write path
