@@ -37,9 +37,10 @@ Bash: bash core/scripts/iteration-open.sh --apply
 It SUBSUMES Step 0a and both the always-run AND medium phase bodies below — do
 NOT also run them, or the `--apply` lanes escalate twice. Dispose what it prints,
 then resume at the first `deferrable` sweep. Run the standalone fallback
-(tier table) on `wrapper_failed`, on a BLIND stage, and on a KILLED run — which
-reports NEITHER, so judge by rc AND bytes, not output: empty stdout at rc≠0 is
-BLIND, not clean, and stderr's last `->` crumb names the stage in flight
+(tier table) on `wrapper_failed` or a BLIND stage. NEVER judge a KILLED run by
+rc+bytes — a severed capture reads identical; a `precheck-end` in
+`precheck-drops.jsonl` at/after its `start_ms` means it FINISHED, so
+re-running double-applies (guard-6634). Empty stdout at rc≠0 is BLIND
 (g-115-7844). `--dry-run` lists lanes and wiring status; an undispatched one
 prints `not-yet-wired`, not nothing. The **deferrable** tier is NOT yet
 wired (strangler step 3).
@@ -703,6 +704,12 @@ signal = Phase 0-pre.0d battery payload for fresh_eyes_dispatch_pending
 IF signal is not null AND signal.fired == true:
     Output: "▸ FRESH-EYES-CODE GATE: fresh_eyes_dispatch_pending set ({signal.core_count} core files, {signal.loc_changed} LOC, reason={signal.reason}) — invoking /fresh-eyes-code before goal selection"
     invoke /fresh-eyes-code with files = signal.files
+    # EPHEMERAL TARGET — sanctioned non-dispatch branch: this sentinel snapshots a
+    # PATH, not content. VALIDATE with `ls` first; if none exists, publish the
+    # `informs` finding naming the absent target (that post IS the record) and fall
+    # through to the stamp/gate-log/clear below — never leave it set, never force
+    # the skill onto a proven-absent target. Sibling of 0-pre4's guard-655 clause;
+    # measured trace: `core/config/rationale/precheck-gates.md` § Ephemeral fresh-eyes target.
     # Stamp consumer-dispatch timestamp BEFORE clearing — canary requires advancing
     # timestamp to detect bypass vs. keeping-up. Stamp FIRST for interrupt safety.
     # Rationale (WHY fresh_eyes_last_dispatch stamp): core/config/rationale/precheck-gates.md

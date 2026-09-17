@@ -233,7 +233,10 @@ def cmd_check(args):
     all_aspirations = read_jsonl(ASP_PATH)
     active = [a for a in all_aspirations if a.get("status") == "active"]
 
-    # Read archive for novelty history
+    # Read archive for novelty history. The eager pull never re-pulls an
+    # archive, so refresh it first ().
+    from _fresh_read import refresh_for_read
+    refresh_for_read(ASP_ARCHIVE_PATH, label="work-alignment")
     archive = read_jsonl(ASP_ARCHIVE_PATH)
 
     # Determine covered vs uncovered priorities

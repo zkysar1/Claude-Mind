@@ -25,6 +25,16 @@ What it does:
     never a loss, and a concurrent daemon write is never clobbered. The source removal
     re-verifies each goal is byte-identical to the copy that was moved; a goal that changed
     meanwhile is left in place and reported (``source_changed``) for a reader to resolve.
+  - the SOURCE copy is never removed: it is TOMBSTONED in place (status
+    ``superseded``, ``recurring=false``, ``moved_to``/``moved_as``/``moved_at``, an
+    ``outcome_note`` naming the new id). The live store is union-merged across
+    boxes with no deletion semantics (coordination_merge._merge_goals, guard-1072),
+    so a popped record is RESURRECTED by any peer that still holds it — measured
+    2026-09-17: 24 goals moved out of the closing lanes on 09-16 were all back as
+    duplicates by the next day. A terminal mark survives the merge, and the
+    evictor (aspirations-evict-completed.py) turns it into a sticky eviction
+    tombstone after its age window. ``superseded`` is the same shape the daemon's
+    same-id recurring rehome writes (aspirations_write._rehome_recurring_goals).
 
 Safety:
   - Dry-run by default: prints the JSON report (the old→new id map, both records' progress
@@ -41,6 +51,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import json
 import re
 import sys
@@ -52,7 +63,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import _paths  # type: ignore  # noqa: E402,F401
 from _fileops import locked_modify_jsonl, read_jsonl_with_recovery  # noqa: E402
+from storage_backend import get_backend  # noqa: E402
 from aspirations import recompute_progress  # noqa: E402
+from _goal_census import all_evicted_ids  # noqa: E402
 
 _GOAL_ID = re.compile(r"^g-(\d{3,})-(\d{2,})$")
 
@@ -73,9 +86,14 @@ def _find(items: list[dict], asp_id: str) -> tuple[int, dict] | None:
 
 
 def _next_seq(target: dict, to_num: str) -> int:
+    """max+1 over the target's live goals AND its evicted ids. An evicted seq is
+    allocated forever: a goal re-minted onto one is dropped by the next cross-box
+    merge as a resurrection (coordination_merge._merge_goals, g-115-2430) — the same
+    rule the daemon's own allocator follows."""
     top = 0
-    for g in target.get("goals", []) or []:
-        m = _GOAL_ID.match(_goal_id(g))
+    ids = [_goal_id(g) for g in target.get("goals", []) or []] + list(all_evicted_ids(target))
+    for gid in ids:
+        m = _GOAL_ID.match(gid)
         if m and m.group(1) == to_num:
             top = max(top, int(m.group(2)))
     return top + 1
@@ -106,6 +124,25 @@ def _frozen(goal: Any) -> str:
     return json.dumps(goal, sort_keys=True, ensure_ascii=True)
 
 
+def _tombstone(goal: dict, new_id: str, to_asp: str, now: str) -> dict:
+    """Mark a moved goal's SOURCE copy terminal in place. Never pop it: the live store
+    is union-merged across boxes with no deletion semantics (guard-1072), so a popped
+    goal comes back at the next merge and a terminal mark does not."""
+    goal["status"] = "superseded"
+    goal["recurring"] = False
+    goal["moved_to"] = to_asp
+    goal["moved_as"] = new_id
+    goal["moved_at"] = now
+    goal["last_modified"] = now
+    goal["claimed_by"] = None
+    goal["claimed_at"] = None
+    goal["outcome_note"] = (
+        f"MOVED {now} to {to_asp} as {new_id} (aspirations-move-goals.py). This record is a "
+        f"tombstone, kept so the cross-box union merge cannot resurrect the goal here "
+        f"(guard-1072); the live copy is {new_id}.")
+    return goal
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--from-file", required=True)
@@ -127,6 +164,12 @@ def main(argv: list[str] | None = None) -> int:
     src_path, dst_path = Path(args.from_file), Path(args.to_file)
     same_file = src_path.resolve() == dst_path.resolve()
 
+    # Plan from the store of record, not a stale local cache: under own-cloud the
+    # local file is a read-through mirror (rb-2636), and a plan built on a stale
+    # copy reports every goal as source_changed at write time (the write cycle
+    # refreshes on its own). LocalBackend.refresh is a no-op.
+    for _p in {src_path.resolve(), dst_path.resolve()}:
+        get_backend().refresh(_p)
     src_items = read_jsonl_with_recovery(src_path)
     dst_items = src_items if same_file else read_jsonl_with_recovery(dst_path)
     src = _find(src_items, args.from_asp)
@@ -147,6 +190,22 @@ def main(argv: list[str] | None = None) -> int:
     missing = [g for g in args.goal if g not in by_id]
     if missing:
         print(json.dumps({"error": f"{args.from_asp} does not hold: {', '.join(missing)}"}))
+        return 1
+    in_flight = [g for g in args.goal if isinstance(by_id[g], dict)
+                 and (by_id[g].get("claimed_by") or by_id[g].get("status") == "in-progress")]
+    if in_flight:
+        # A goal someone is executing is never moved: its completion would land on
+        # the tombstone while the copy stays pending — duplicate work, wrong count.
+        print(json.dumps({"error": f"{args.from_asp} goals in flight (claimed or in-progress), "
+                                   f"refusing to move: {', '.join(in_flight)}"}))
+        return 1
+    already = [g for g in args.goal if isinstance(by_id[g], dict)
+               and (by_id[g].get("moved_as") or by_id[g].get("rehomed_to"))]
+    if already:
+        # A tombstone is a pointer, not a goal: moving it again mints a third copy.
+        print(json.dumps({"error": f"{args.from_asp} goals already moved (tombstones), "
+                                   f"refusing to move: " + ", ".join(
+                                       f"{g}->{by_id[g].get('moved_as') or by_id[g].get('rehomed_to')}" for g in already)}))
         return 1
 
     to_num = _asp_num(args.to_asp)
@@ -175,8 +234,12 @@ def main(argv: list[str] | None = None) -> int:
         recompute_progress(rec)
         return rec.get("progress") or {}
 
+    now = _dt.datetime.now().isoformat(timespec="seconds")
     src_after = json.loads(json.dumps(src_rec))
-    src_after["goals"] = [g for g in src_after.get("goals", []) if _goal_id(g) not in mapping]
+    src_after["goals"] = [
+        _tombstone(g, mapping[_goal_id(g)], args.to_asp, now)
+        if isinstance(g, dict) and _goal_id(g) in mapping else g
+        for g in src_after.get("goals", []) or []]
     dst_after = json.loads(json.dumps(dst_rec))
     dst_after["goals"] = list(dst_after.get("goals", []) or []) + moved
 
@@ -195,43 +258,55 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # TARGET first (a failure between the two writes leaves a duplicate, never a loss).
-    def _append(items: list[dict]) -> list[dict]:
+    def _append(items: list[dict], copies: list[Any]) -> list[dict]:
         found = _find(items, args.to_asp)
         if found is None:
             raise RuntimeError(f"{dst_path}: {args.to_asp} vanished before the write")
         _, rec = found
         held = {_goal_id(g) for g in rec.get("goals", []) or []}
-        clash = [_goal_id(g) for g in moved if _goal_id(g) in held]
+        clash = [_goal_id(g) for g in copies if _goal_id(g) in held]
         if clash:
             raise RuntimeError(f"{args.to_asp} already holds {', '.join(clash)}")
-        rec["goals"] = list(rec.get("goals", []) or []) + moved
+        rec["goals"] = list(rec.get("goals", []) or []) + list(copies)
         recompute_progress(rec)
         return items
 
-    def _remove(items: list[dict]) -> list[dict]:
+    def _remove(items: list[dict], skip: set[str] = frozenset()) -> list[dict]:
+        # "remove" = tombstone in place. A popped goal comes back at the next
+        # cross-box union merge (guard-1072); a terminal mark does not.
         found = _find(items, args.from_asp)
         if found is None:
             raise RuntimeError(f"{src_path}: {args.from_asp} vanished before the write")
         _, rec = found
-        keep = []
         for g in rec.get("goals", []) or []:
             gid = _goal_id(g)
-            if gid in mapping:
-                if _frozen(g) != frozen[gid]:
-                    report["source_changed"].append(gid)
-                    keep.append(g)
+            if gid not in mapping or gid in skip or not isinstance(g, dict):
                 continue
-            keep.append(g)
-        rec["goals"] = keep
+            if _frozen(g) != frozen[gid]:
+                report["source_changed"].append(gid)
+                continue
+            _tombstone(g, mapping[gid], args.to_asp, now)
         recompute_progress(rec)
         return items
 
     if same_file:
         def _both(items: list[dict]) -> list[dict]:
-            return _remove(_append(items))
+            # ONE cycle: decide from the FRESH read which goals still match the plan,
+            # then copy and tombstone exactly that set. A goal edited since the plan
+            # is neither copied nor marked (reported in source_changed) — never
+            # duplicated, which the two-cycle cross-file path cannot promise.
+            found = _find(items, args.from_asp)
+            if found is None:
+                raise RuntimeError(f"{src_path}: {args.from_asp} vanished before the write")
+            fresh = {_goal_id(g): g for g in found[1].get("goals", []) or []}
+            changed = [old for old in args.goal
+                       if old not in fresh or _frozen(fresh[old]) != frozen[old]]
+            report["source_changed"] = list(changed)
+            copies = [m for old, m in zip(args.goal, moved) if old not in changed]
+            return _remove(_append(items, copies), skip=set(changed))
         locked_modify_jsonl(src_path, _both)
     else:
-        locked_modify_jsonl(dst_path, _append)
+        locked_modify_jsonl(dst_path, lambda items: _append(items, moved))
         locked_modify_jsonl(src_path, _remove)
     report["applied"] = True
     print(json.dumps(report, indent=2))

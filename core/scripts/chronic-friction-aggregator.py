@@ -79,6 +79,10 @@ def _iter_aspiration_files():
 
 
 def _read_aspirations(path: Path):
+    if path.name == "aspirations-archive.jsonl":
+        # The eager pull never re-pulls an archive ().
+        from _fresh_read import refresh_for_read
+        refresh_for_read(path, label="chronic-friction-aggregator")
     if not path.exists():
         return
     with open(path, "r", encoding="utf-8") as f:

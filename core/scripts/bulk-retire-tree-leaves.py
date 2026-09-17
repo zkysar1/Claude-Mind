@@ -193,6 +193,22 @@ def main():
 
     with open(TREE_YAML, "r", encoding="utf-8") as f:
         tree = yaml.safe_load(f) or {}
+    # : fold un-flushed spooled retrieval deltas before classifying.
+    # `_is_dead_candidate` retires on `retrieval_count == 0` — the literal
+    # guard-731 predicate — and since the retrieval bump began spooling, a node
+    # retrieved since the last STRUCTURAL tree write holds that proof only in
+    # the spool. Measured cadence leaves that window HOURS wide, so an
+    # index-only read here would hand the slate a FALSE ZERO on a node that is
+    # demonstrably alive. This script only REPORTS (it never writes the tree),
+    # so the merge cannot double-count against write_tree's drain.
+    try:
+        import _tree_retrieval_spool as _trs
+        _pending = _trs.pending_deltas(TREE_YAML)
+        if _pending:
+            _trs.apply_pending(tree, _pending)
+    except Exception as _exc:  # noqa: BLE001 - a census must never fail closed
+        print(f"[bulk-retire-tree-leaves] retrieval-spool read-merge "
+              f"skipped: {_exc}", file=sys.stderr)
     nodes = tree.get("nodes", {})
     today = date.today()
 

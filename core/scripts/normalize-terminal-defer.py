@@ -37,7 +37,56 @@ sys.path.insert(0, str(_here))
 
 from _paths import WORLD_DIR, AGENT_DIR
 from _fileops import acquire_lock, release_lock, _atomic_write_with_fallback
+from storage_backend import get_backend
 from aspirations import TERMINAL_GOAL_STATUSES, _normalize_terminal_goal
+
+
+def _refresh(path: Path) -> None:
+    """Pull the store's current bytes into the local cache before reading it.
+
+    g-358-124. Every target of this script is an eager-pull EXCLUDED store on a
+    remote-backed box: `owncloud_sync._EAGER_PULL_EXCLUDE_GLOBS` is
+    `("*-archive.jsonl",)` over `_EAGER_PULL_ROOTS = ("world", "meta")`, so an
+    archive under those roots is never re-pulled once materialized and a box's
+    local copy can lag the store by days (g-358-117 measured a board archive
+    2,143 records / 5.7 days stale). A plain `open()` of that path is a raw
+    local read of a backend-routed store, which guard-980 / guard-1169 forbid
+    for exactly this reason.
+
+    WHAT THIS IS *NOT* FIXING, measured rather than assumed (2026-09-17, alpha,
+    cc-04, uname -r 6.8.0-139-generic, remote backend live): a stale-base
+    rewrite here was NOT a data-loss path. All four targets carry the
+    `merge_aspirations` handler -- resolved through
+    `owncloud_backend._coordination_merge_handler`, the function `_put` itself
+    calls, never a grep of the handler dict -- so `_put`'s fence-None branch
+    dispatches to `_merge_reconcile_put`, which GETs the remote-authoritative
+    bytes, unions them with ours, PUTs fenced on the remote version, and writes
+    the MERGED bytes back to the local cache. Fixture measurement with the real
+    handler: zero aspirations and zero goals lost, against a positive control
+    (unfenced overwrite with the same stale body) that lost one whole
+    aspiration and two goals. Do NOT delete this call on the strength of that:
+    the protection is the merge REGISTRY, not this script, and 4 of the 17
+    eager-pull-excluded archives under the two shared roots have no handler at
+    all.
+
+    WHAT IT *IS* FIXING is the READ, which stays stale either way, and both
+    consequences are detector blindness (guard-6878): `--check` is the
+    /verify-learning TGD regression guard and can print PASS while records only
+    the store holds carry anomalies; and `normalize_file` gates its write on
+    `before > 0` computed locally, so an anomaly living only in the newer remote
+    records is never healed -- the merge preserves it UNHEALED.
+
+    Zero cost on the local backend: `LocalBackend.refresh` is a documented no-op
+    that reads nothing. Best-effort by design -- a transport fault must not wedge
+    a backfill that could previously run against the local copy; the scan then
+    reports on whatever is local, exactly as it did before this call existed.
+    """
+    try:
+        get_backend().refresh(path)
+    except Exception as e:  # noqa: BLE001 - see docstring: never wedge on transport
+        print(f"warning: could not refresh {path} before reading it "
+              f"({type(e).__name__}: {e}); scanning the local copy, which may "
+              f"lag the store", file=sys.stderr)
 
 
 def _count_anomalies(aspirations):
@@ -75,7 +124,15 @@ def _count_anomalies(aspirations):
 
 
 def scan_file(path: Path) -> dict:
-    """Read-only scan: count anomalies. No lock, no write."""
+    """Read-only scan: count anomalies. No lock, no write.
+
+    The refresh below is a READ side effect (it materialises the store's current
+    bytes into the local cache) and is deliberate: without it this scan -- the
+    /verify-learning TGD regression guard -- counts anomalies in a copy the
+    eager pull never refreshes. No lock is taken, matching this function's
+    contract; a refresh needs none.
+    """
+    _refresh(path)
     if not path.exists():
         return {"path": str(path), "exists": False, "before": 0}
     aspirations = []
@@ -93,13 +150,23 @@ def scan_file(path: Path) -> dict:
 
 
 def normalize_file(path: Path) -> dict:
-    """Lock + read + normalize + atomic write. Idempotent."""
-    if not path.exists():
-        return {"path": str(path), "exists": False, "before": 0, "after": 0}
-
+    """Lock + refresh + read + normalize + atomic write. Idempotent."""
     lock_path = path.with_suffix(".lock")
     try:
         acquire_lock(lock_path)
+
+        # INSIDE the lock, before the read -- the ordering is the whole point.
+        # A refresh taken outside it can be overtaken by a peer write between
+        # the pull and the open, which is the same stale base with extra steps.
+        # It also populates the backend's compare-and-swap fence for this key,
+        # so the write below is fenced on the version we actually read instead
+        # of on a head fetched at write time (owncloud_backend._put, fence-None
+        # branch). The existence check FOLLOWS the refresh rather than preceding
+        # it: on a cold box an eager-pull-excluded archive may exist ONLY in the
+        # store, and checking first would silently skip the whole file.
+        _refresh(path)
+        if not path.exists():
+            return {"path": str(path), "exists": False, "before": 0, "after": 0}
 
         aspirations = []
         with open(path, "r", encoding="utf-8") as f:

@@ -230,6 +230,27 @@ class StorageBackend(Protocol):
     def atomic_write(self, target: PathLike, write_to_handle,
                      *, max_retries: int = 10) -> WriteResult: ...
 
+    # --- deletes -----------------------------------------------------------
+    # Remove `path` from EVERY lane this backend owns, then VERIFY it is gone
+    # from all of them before returning. On a remote backend that is two
+    # independent operations — the store object and the local mirror — and
+    # neither implies the other (guard-1493). Each half fails silently in its
+    # own direction: a local-only unlink is re-materialized by read-through on
+    # the next read, and a store-only delete leaves a file that still reads
+    # present on disk. Worse, each single-lane check is TRUTHFUL, so a caller
+    # that chains the pair by hand and verifies the lane it happened to call
+    # gets a green reading over a surviving file. This method owns the chain
+    # and both read-backs, which is what makes that failure unreachable from
+    # the outside: callers MUST NOT hand-roll it.
+    # Returns True when something was removed, False when the path was already
+    # absent from every lane — idempotent, so a second call is a no-op rather
+    # than an error. Raises OSError if ANY lane still reports the path present
+    # afterwards; it never returns True over a partial delete.
+    # NOT an archive, and not a substitute for one. `archive-before-delete.md`
+    # still governs the CALLER: enumerate, verify the recovery layers, copy
+    # outside the blast radius, verify the copy, and only then call this.
+    def delete(self, path: PathLike) -> bool: ...
+
     # --- locking (operates on the LITERAL lock-file path the caller passes) -
     def acquire_lock(self, lock_path: PathLike, timeout: int = 10,
                      stale_seconds: int = 30) -> None: ...
@@ -523,6 +544,29 @@ class LocalBackend:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         return self._atomic_write(p, lambda h: h.write(content), binary=True)
+
+    # --- deletes -----------------------------------------------------------
+    def delete(self, path: PathLike) -> bool:
+        """Remove the file, then read back that it is gone. See the
+        ``StorageBackend.delete`` contract.
+
+        LocalBackend owns exactly ONE lane, so the two-lane hazard the
+        contract describes cannot arise here — but the read-back still runs,
+        because a caller must get the same verified answer from whichever
+        backend it happens to hold. The asymmetry worth knowing is the other
+        direction: there is no versioning under this backend, so a local
+        delete is FINAL, where a remote backend's store side leaves a delete
+        marker with recoverable noncurrent versions behind it.
+
+        Directories are not removed — a caller that empties one prunes it
+        itself, bottom-up and only when genuinely empty (guard-1493 step 4)."""
+        p = Path(path)
+        existed = p.exists()
+        if existed:
+            p.unlink(missing_ok=True)
+        if p.exists():
+            raise OSError(f"delete incomplete for {p}: still present locally")
+        return existed
 
     # --- record-level JSONL (whole-file; byte-identical to _fileops) --------
     def read_jsonl(self, path: PathLike) -> List[dict]:

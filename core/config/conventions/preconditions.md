@@ -183,6 +183,30 @@ completion, the start of a soak.
 > An `after_time` anchor is honest only when re-reading its source could not
 > change the answer.
 
+> ⚠ **It is a ONE-SHOT: it opens once and NEVER re-closes, so it cannot gate a
+> RECURRING event.** This is a separate defect from the mutable-anchor one
+> above and survives a perfectly honest, immutable anchor. A goal gated on "the
+> NEXT <periodic thing>" is correctly gated until the first occurrence and then
+> **permanently ungated** — which is worse than having no precondition at all,
+> because the record still displays one and reads as protected. Measured
+> 2026-09-13 (g-369-300): a 72h-cadence digest gate fired at 14:22:32, gated
+> that day's send correctly, then sat open; with its only gate spent the goal
+> ranked **#1 of 1832 at 18.79** while having no agent-side move left, and each
+> agent that picked it paid a multi-MB read to rediscover that. **Re-anchoring
+> at the next occurrence is not a fix** — it buys exactly one cycle and then
+> fails identically. Ask at authoring time whether the event happens ONCE or
+> REPEATS; if it repeats, this is the wrong type.
+>
+> The remedy is again `command_succeeds` asking the live source — but **verify
+> the command can actually FAIL before trusting it.** Measured on the same
+> goal: the natural candidate script had no schedule-only mode and returned 0
+> whether or not the event was due, so the predicate would have ALWAYS PASSED.
+> An inert gate is worse than an absent one (`guard-6571`), and "always passes"
+> renders identically to "correctly passes" — run the two-directional control
+> (`guard-1636`). Where no command can discriminate, use a
+> `precondition_unmet:` `defer_reason`, which re-probes on the precheck cadence
+> instead of pretending to be structural.
+
 ### `vcs_commits_since`
 
 Passes when a git repo has at least `min_count` commits committed **strictly

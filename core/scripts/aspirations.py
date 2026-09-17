@@ -300,7 +300,7 @@ def _emit_description_length_warning(goal, source):
 
 VALID_SCOPES = {"sprint", "project", "initiative"}
 ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (companion to GOAL_ID_RE xw branch below)
-GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit:  hit  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,5}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 5-digit:  hit  (2026-09-15), 4-digit:  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Single source of truth for the `add` (aspiration) and `add-goal` schemas —
@@ -382,6 +382,10 @@ def _check_not_archived(asp_id, *, action="modify"):
     If the ID exists in both archive and live file (ID collision between
     two different aspirations), allow modification of the live copy.
     """
+    # The eager pull never re-pulls an archive, so refresh before reading
+    # ().
+    from _fresh_read import refresh_for_read
+    refresh_for_read(ARCHIVE_PATH, label="aspirations")
     archived = read_jsonl(ARCHIVE_PATH)
     if any(a.get("id") == asp_id for a in archived):
         if action == "add":
@@ -515,7 +519,7 @@ def validate_goal(goal):
     if "id" not in goal:
         raise ValueError("Goal missing 'id' field")
     if not GOAL_ID_RE.match(goal["id"]):
-        raise ValueError(f"Invalid goal ID format: {goal['id']} (expected g-NNN-NN[N[N]] or g-NNN-NN-a)")
+        raise ValueError(f"Invalid goal ID format: {goal['id']} (expected g-NNN-NN[N[N[N]]] or g-NNN-NN-a)")
     if "status" not in goal:
         raise ValueError(f"Goal {goal['id']} missing 'status' field")
     if goal["status"] not in VALID_GOAL_STATUSES:
@@ -1505,7 +1509,7 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
     # any goal carrying an evicted id.
     live_ids = [g.get("id", "") for g in target_asp.get("goals", [])]
     for gid in live_ids + _all_evicted_ids(target_asp):
-        match = re.match(r"^g-\d{3}-(\d{2,4})", gid)
+        match = re.match(r"^g-\d{3}-(\d{2,5})", gid)
         if match:
             max_seq = max(max_seq, int(match.group(1)))
     new_goal_id = f"g-{asp_num}-{max_seq + 1:02d}"
@@ -1697,6 +1701,42 @@ def cmd_update_goal(args):
             sys.exit(1)
         print(f"[update-goal] --allow-new-field: writing unregistered field "
               f"{field!r} on {goal_id} — {justification}", file=sys.stderr)
+
+    # user_leg_scope MEMBERSHIP REFUSAL ( / guard-6104). CLI twin of the
+    # refusal in mind_api/src/endpoints/aspirations_write.py
+    # ::_run_update_goal_gates — read that comment for the full rationale. In one
+    # line: the field is an exact-membership key, `_validate_goal` already RAISES
+    # on a non-canonical value at ADD, and this path validated nothing, so the
+    # identical value was refused at add and accepted in silence at update
+    # (guard-330 — "update-field paths are backdoors"). The daemon half is the
+    # live one under no-python-cli-fallback; this copy exists so the two write
+    # paths cannot drift (guard-2323/guard-742), and both read
+    # VALID_USER_LEG_SCOPES rather than a hand-typed copy.
+    #
+    # Placed beside the unknown-field gate, BEFORE the lock, for that gate's own
+    # stated reason: a bad value should cost no I/O. Clearing stays open (null /
+    # "") — retiring a user leg must not require a vocabulary token.
+    #
+    # DOTTED NAMES ARE DELIBERATELY NOT MINE, exactly as the sibling gate above
+    # explains: the dedicated dotted-path check further down owns that case and
+    # emits the `BLOCKED:` contract message tests/test_dotted_path_rejection.sh
+    # pins, so answering first here would refuse correctly with the wrong error.
+    # (The daemon twin keeps a dot-prefix arm per guard-354; there it is
+    # defence-in-depth, because that path runs its dotted check first.)
+    if field == "user_leg_scope" and value not in (None, ""):
+        if value not in VALID_USER_LEG_SCOPES:
+            print(
+                f"REFUSED: user_leg_scope is an exact-membership key, not a "
+                f"description field. {value!r:.120} classifies as `undeclared` "
+                f"-- identically to leaving the field empty -- so no standing "
+                f"grant can key it and no reclaim sweep can re-derive it. Write "
+                f"the BARE token and put every word of explanation in "
+                f"progress_note. Valid: "
+                f"{', '.join(sorted(VALID_USER_LEG_SCOPES))}. To CLEAR it, pass "
+                f"null. (guard-6104)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Full-cycle lock: read + archive cross-check + write are atomic
     from _fileops import acquire_lock, release_lock
@@ -2078,7 +2118,7 @@ def cmd_update_goal(args):
                         _rw_live_ids = [g.get("id", "")
                                         for g in _rw_target.get("goals", [])]
                         for gid in _rw_live_ids + _all_evicted_ids(_rw_target):
-                            m = re.match(r"^g-\d{3}-(\d{2,4})", gid)
+                            m = re.match(r"^g-\d{3}-(\d{2,5})", gid)
                             if m:
                                 _rw_max_seq = max(_rw_max_seq,
                                                   int(m.group(1)))
@@ -3101,6 +3141,18 @@ def _clear_stale_blockers(items, resolved_goal_ids, delivery_gate=True):
                     goal["blocked_by"] = cleaned
                     if not cleaned:
                         goal["blocked_since"] = None
+                        #  — MIRROR of the same restore in
+                        # mind_api/src/endpoints/aspirations_write.py
+                        # ::_clear_stale_blockers_inline (guard-547/guard-2323:
+                        # port the twin in the same change). Rationale and the
+                        # guard triple are spelled out there and in
+                        # dependent-unblock.py Step 1b; keep all three in sync.
+                        # Note `cleaned` is empty here only when nothing was held
+                        # by the delivery gate, which is correct: a held blocker
+                        # is still a live block and must not restore status.
+                        if (goal.get("status") == "blocked"
+                                and not goal.get("blocker_ref")):
+                            goal["status"] = "pending"
 
 def _load_intent_satisfaction_config():
     """Load intent_satisfaction config block from core/config/aspirations.yaml.

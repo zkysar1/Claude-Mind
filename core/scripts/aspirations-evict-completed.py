@@ -166,7 +166,7 @@ def _eligible(goal: dict, cutoff: datetime) -> bool:
 # Widths are fully open-ended per guard-1161: a bounded form (\d{3}, \d{2,4})
 # silently drops both legacy low-end ids and any aspiration that outgrows the
 # ceiling. This pattern held `\d{3}-\d{2,4}` until , which left
-#  one mint (0) away from the goal ids in its own queue
+#  one mint () away from the goal ids in its own queue
 # becoming invisible to the conservation guard.
 _GOAL_SEQ_RE = re.compile(r"^g-(\d+)-(\d+)(-[a-z])?$")
 

@@ -207,7 +207,7 @@ EXP_NARRATIVE_FIELDS = ("execution_summary", "summary", "note", "lesson", "outco
 # never auto-filled. See the module docstring.
 REPORT_LANES = ("verification", "execution_feedback", "user_notable")
 
-_GOAL_ID_RE = re.compile(r"^g-(\d{1,4})-\d{1,4}$")
+_GOAL_ID_RE = re.compile(r"^g-(\d{1,4})-\d{1,5}$")
 
 SKIP_ALREADY = "already-retrospected"
 SKIP_NO_RECORD = "goal-record-not-found"

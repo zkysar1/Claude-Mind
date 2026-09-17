@@ -341,3 +341,16 @@ logs.log
 # path-anchored entry does not cover. Regenerable cache; blocks iteration-commit
 # via check-repo-root-entries when it appears (g-350-350 close, 2026-09-07).
 /.platform-memo.sh
+
+# git's own merge temp copies. `git merge` writes `.merge_file_XXXXXX` at the
+# repo root when it materialises a side of a conflict for a large file — here
+# the ~2 MB agents/*/experience.jsonl stores (first record of each is an
+# `exp-*` row). They are regenerable byproducts, never authored data, but a
+# `git add -A` stages them and check-repo-root-entries then REFUSES the commit,
+# leaving the index staged so every later iteration-push DEFERs under guard-741
+# (measured 2026-09-13, g-326-863 close: 6 of them wedged the committer).
+# Same failure and same remedy as /.platform-memo.sh above.
+# NOTE: three older copies (.merge_file_fcD2ZJ, oNQ5XW, xpL0Rb, 2026-08-29) are
+# ALREADY TRACKED in HEAD, so this pattern does not untrack them — that removal
+# is owned by g-115-9594. Being in HEAD, they do not trip the new-entry gate.
+/.merge_file_*

@@ -73,6 +73,7 @@ except ImportError:  # pragma: no cover
     sys.exit(1)
 
 from _paths import CONFIG_DIR, WORLD_DIR, agents_root
+from _fresh_read import read_text_authoritative
 
 BASE_RELATIONS_PATH = CONFIG_DIR / "skill-relations.yaml"
 WORLD_RELATIONS_PATH = WORLD_DIR / "skill-relations.yaml"
@@ -127,18 +128,21 @@ def read_ledger(root=None):
     base = root if root is not None else agents_root()
     records = []
     for f in sorted(base.glob("*/skill-invocations.jsonl")):
+        # Store bytes, not the local mirror: a PEER's ledger mirror can be short
+        # of the store (). Pair support is a COUNT, so ONE copy, never
+        # the membership union ().
         try:
-            with open(f, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
+            text = read_text_authoritative(f, label="skill-coinvocation-discovery")
         except OSError:
             continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return records
 
 

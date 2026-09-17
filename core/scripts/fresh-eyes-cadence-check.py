@@ -83,7 +83,11 @@ def count_completed_goals(world_only: bool = False) -> int:
             _paths.agent_dir(agent) / "aspirations-archive.jsonl",
         ])
     total = 0
+    from _fresh_read import refresh_for_read
     for p in candidates:
+        if p.name == "aspirations-archive.jsonl":
+            # The eager pull never re-pulls an archive ().
+            refresh_for_read(p, label="fresh-eyes-cadence-check")
         if not p.exists():
             continue
         try:

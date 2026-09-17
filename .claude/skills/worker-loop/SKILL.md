@@ -855,6 +855,9 @@ Bash: py -3 core/scripts/worker_execute.py check-outputs <class> [<class>...]
 # The check is a scoped CALL into the shared component, never a transcription of
 # its logic (guard-2676): the table lives in worker_execute.py, and a copy of its
 # contents here would drift the first time a carrier lands.
+Bash: py -3 core/scripts/worker_execute.py check-capture-carrier
+# rc 1 undelivered / 3 unchecked: act on what it prints, never hold the goal (g-115-9852).
+# Rationale (WHY a store content read, not an mtime): core/config/rationale/capture-carrier-delivery-check.md
 
 # Phase 3.8 — CARRIER PUSH (g-306-264). Phase 3.7 asks whether this unit's output
 # can reach the reducer; this is the step that MAKES it reach for the two classes

@@ -50,6 +50,59 @@ TESTS_DIR = PROJECT_ROOT / "core" / "scripts" / "tests"
 WM_WRITER_NAMES = {"WM_SET_SH", "WM_APPEND_SH"}
 WM_WRITER_PATHS = ("wm-set.sh", "wm-append.sh")
 
+# --- The wm.py DIRECT route () -------------------------------------
+# The two wrappers above were the whole writer vocabulary, so a test that spawns
+# `python wm.py set <slot>` wrote a LIVE agent's working memory while this check
+# reported PASS over it — for at least two days, re-corrupting alpha's WM on
+# every suite run (lock_stress_a/b/c, update_count 3/4/1). Both halves of the
+# predicate failed at once: the route was unrecognised AND the agent name was
+# invisible, because it is bound as `os.environ.get("MIND_AGENT", "bravo")` —
+# a Call, so the literal sat in an argument the `bound` collector never read.
+#
+# THE VOCABULARY IS DERIVED AT CHECK TIME, NEVER HARDCODED — the same rule the
+# roster follows, and for the same reason. A frozen list goes stale the moment
+# wm.py grows a subcommand, and would then classify a real write as "not a
+# write" while still printing PASS: the vacuous green this module exists to
+# prevent, reproduced one level down. Only `ages` is read-only; everything else
+# wm.py exposes mutates, so the read-only set is what we enumerate and the
+# write set is the remainder (fail-safe direction — a NEW subcommand counts as
+# a writer until someone deliberately says otherwise).
+WM_READONLY_SUBCOMMANDS = {"ages"}
+
+
+def wm_write_subcommands() -> set[str]:
+    """wm.py's mutating subcommands, parsed from its own CLI declaration.
+
+    Raises so main() can fail LOUD (exit 2) rather than scan with an empty
+    vocabulary — a check that cannot see what a write LOOKS like has no opinion
+    about whether one happened, exactly as a check that cannot see the roster
+    has no opinion about who was written to.
+    """
+    wm_py = PROJECT_ROOT / "core" / "scripts" / "wm.py"
+    try:
+        tree = ast.parse(wm_py.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError) as exc:
+        raise RuntimeError(f"could not parse {wm_py}: {exc}") from exc
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_parser" and node.args):
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.add(first.value)
+    if not names:
+        raise RuntimeError(
+            "wm.py declared no add_parser subcommands — the write vocabulary is "
+            "underivable, so every write route would read as unrecognised"
+        )
+    writes = names - WM_READONLY_SUBCOMMANDS
+    if not writes:
+        raise RuntimeError(
+            f"every wm.py subcommand {sorted(names)} is classified read-only — "
+            "WM_READONLY_SUBCOMMANDS is stale and this check would pass vacuously"
+        )
+    return writes
+
 # --- Shell surface () ---------------------------------------------
 # The .py glob below used to be the whole check, so all 36 shell tests under
 # this directory were structurally invisible: not scanned, not parsed, never
@@ -115,7 +168,46 @@ def _docstring_nodes(tree: ast.AST) -> set[int]:
     return out
 
 
-def analyze(path: Path, roster: set[str]) -> list[str]:
+def _wm_py_write_call(tree: ast.AST, write_subcommands: set[str]) -> bool:
+    """True when the file builds an argv that runs a wm.py WRITE subcommand.
+
+    DELIBERATELY NARROWER THAN "mentions wm.py", and the narrowing is measured,
+    not guessed (the module docstring's RED-ON-ARRIVAL rule). Of 1,346 python
+    tests, 23 mention `wm.py` at all — including `test_wm_body_routing.py`,
+    which imports AGENT_DIR purely to ASSERT `wm.wm_path()` and writes only
+    under tmp_path. A mention-level predicate flags it on day one. Requiring an
+    argv list that references a wm.py path AND carries a write subcommand
+    separates them: 3 files build such a list, and only the offender also binds
+    a live-roster name.
+    """
+    wm_py_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(c, ast.Constant) and isinstance(c.value, str)
+            and c.value.endswith("wm.py") for c in ast.walk(node.value)
+        ):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    wm_py_vars.add(tgt.id)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.List, ast.Tuple)):
+            continue
+        refs_wm_py = any(
+            (isinstance(e, ast.Name) and e.id in wm_py_vars)
+            or (isinstance(e, ast.Constant) and isinstance(e.value, str)
+                and e.value.endswith("wm.py"))
+            for e in ast.walk(node)
+        )
+        if refs_wm_py and any(
+            isinstance(e, ast.Constant) and e.value in write_subcommands
+            for e in ast.walk(node)
+        ):
+            return True
+    return False
+
+
+def analyze(path: Path, roster: set[str], write_subcommands: set[str]) -> list[str]:
     """Return the live-roster agent names this file binds, if it also writes WM."""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
@@ -123,7 +215,7 @@ def analyze(path: Path, roster: set[str]) -> list[str]:
         return []
     docs = _docstring_nodes(tree)
 
-    writes_wm = False
+    writes_wm = _wm_py_write_call(tree, write_subcommands)
     bound: set[str] = set()
 
     for node in ast.walk(tree):
@@ -149,6 +241,20 @@ def analyze(path: Path, roster: set[str]) -> list[str]:
                         and isinstance(node.value, ast.Constant)
                         and isinstance(node.value.value, str)):
                     bound.add(node.value.value)
+        # AMBIENT binding with a live-roster FALLBACK: os.environ.get("MIND_AGENT", "x").
+        # The name is the second ARGUMENT of a Call, so every branch above — all of
+        # which require `node.value` to be an ast.Constant — steps straight past it.
+        # That is how the offender kept a literal live-roster name in plain sight and
+        # still measured as binding nothing (). The fallback is the WEAKER
+        # half of the hazard, too: under the suite the ambient value wins, so the write
+        # follows whoever is bound and the default names a DIFFERENT victim than the
+        # one actually corrupted. Collecting it is what makes the file visible at all.
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and len(node.args) == 2):
+            key, default = node.args
+            if (isinstance(key, ast.Constant) and key.value == "MIND_AGENT"
+                    and isinstance(default, ast.Constant) and isinstance(default.value, str)):
+                bound.add(default.value)
 
     return sorted(bound & roster) if writes_wm else []
 
@@ -206,11 +312,21 @@ def main(argv: list[str]) -> int:
         print("  A check that cannot see its population must not report success.")
         return 2
 
+    # Same fail-loud contract as the roster, one axis over (): the
+    # roster says WHO a write could reach, this says what a write LOOKS like.
+    # Neither can be missing without the PASS below becoming vacuous.
+    try:
+        write_subcommands = wm_write_subcommands()
+    except Exception as exc:
+        print(f"FAIL: could not derive wm.py's write vocabulary — {exc}")
+        print("  An unrecognised write route must not read as 'no write happened'.")
+        return 2
+
     offenders = []
     scanned = 0
     for p in sorted(scan_dir.glob("*.py")):
         scanned += 1
-        bad = analyze(p, roster)
+        bad = analyze(p, roster, write_subcommands)
         if bad:
             offenders.append((p, bad))
 

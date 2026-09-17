@@ -121,7 +121,7 @@ ALL_REDUCER_PROBES = {
     "stop-hook-block", "daemon-health", "clock-skew", "freshness",
     "mirror-wedge", "memory-headroom", "claim-heartbeat", "git-drift",
     "infra-component", "dependency-funnel", "retrieval-index",
-    "peer-liveness",
+    "peer-liveness", "store-overcap",
 }
 
 # Excluded from workers because they read REDUCER-SHAPED STATE a worker
@@ -178,6 +178,30 @@ EXCLUDED_DUPLICATE_SUPPRESSED = {"infra-component", "retrieval-index"}
 # every Body then claims. A worker never reaches this tick at all; registering
 # the probe there would be coverage in appearance only (the  shape).
 EXCLUDED_QUEUE_OWNER = {"dependency-funnel"}
+
+# The FIFTH bucket (), named rather than forced into bucket 4 above.
+# store-overcap shares bucket 4's CLASS — a correctness problem, not a trust one
+# — but not its reason, and recording it as "the queue has one owner" would be
+# false of it: it never touches the goal queue.
+#
+# It is not bucket 1 (the store registry and its log are perfectly readable on a
+# worker), not bucket 2 (it watches this box's own stores, not peer Bodies), and
+# not bucket 3 (the cost of a second runner is not a duplicated alert).
+#
+# It is excluded because its detector WRITES, and its write is a single-writer
+# per-box state machine. detect_overcap fires only on a store that was over cap
+# on the PREVIOUS RECORDED RUN, and the ratchet that keeps known debt quiet is
+# carried forward through those same records. Two Bodies on one box ticking it
+# would interleave their runs into one consecutive-run history, so "the previous
+# run" would sometimes be the other Body's — silently corrupting the comparison
+# BOTH the fire rule and the ratchet are computed from. That is a wrong answer,
+# not a noisy one. One writer per box, and the reducer is the Body that is
+# always present.
+#
+# The cost is bounded, known, and stated rather than papered over: on a box
+# running only a worker, no reading is taken at all, because the worker loop
+# skips iteration-close and never reaches the tick (the  shape).
+EXCLUDED_SINGLE_WRITER_STATE = {"store-overcap"}
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +289,8 @@ def test_excluded_probes_are_accounted_for_by_reason(tmp_path):
     all_names = {p.name for p in wd.build_probes(_ctx("reducer", tmp_path))}
     excluded = all_names - set(wd.WORKER_SAFE_PROBES)
     buckets = (EXCLUDED_REDUCER_SHAPED, EXCLUDED_PEER_SIDE,
-               EXCLUDED_DUPLICATE_SUPPRESSED, EXCLUDED_QUEUE_OWNER)
+               EXCLUDED_DUPLICATE_SUPPRESSED, EXCLUDED_QUEUE_OWNER,
+               EXCLUDED_SINGLE_WRITER_STATE)
     assert excluded == set().union(*buckets)
     # The buckets are genuinely disjoint — a probe excluded for two reasons
     # would mean one of the rationales is wrong about it.

@@ -309,5 +309,51 @@ def test_get_backend_unknown_raises(monkeypatch):
     reset_backend_for_tests()
 
 
+# ---------------------------------------------------------------------------
+# delete () — the StorageBackend.delete contract on the single-lane
+# backend. The two-lane hazard the contract exists for lives in
+# test_owncloud_backend.py; what matters here is that the SAME verified answer
+# comes back whichever backend a caller happens to hold.
+# ---------------------------------------------------------------------------
+
+def test_delete_removes_and_reads_back_absent(tmp_path):
+    b = LocalBackend()
+    p = tmp_path / "sub" / "doomed.txt"
+    b.write_text(p, "bye")
+    assert b.exists(p) is True
+    assert b.delete(p) is True
+    assert b.exists(p) is False
+    assert p.exists() is False
+
+
+def test_delete_is_idempotent_and_returns_false_when_absent(tmp_path):
+    b = LocalBackend()
+    p = tmp_path / "never-written.txt"
+    assert b.delete(p) is False          # absent to begin with
+    b.write_text(p, "x")
+    assert b.delete(p) is True
+    assert b.delete(p) is False          # second call is a no-op, not an error
+
+
+def test_delete_leaves_the_parent_directory(tmp_path):
+    """guard-1493 step 4 — pruning emptied directories is the CALLER's job,
+    bottom-up and only when genuinely empty. delete() must not do it silently,
+    or a caller loses the chance to decide."""
+    b = LocalBackend()
+    p = tmp_path / "keepme" / "gone.txt"
+    b.write_text(p, "x")
+    b.delete(p)
+    assert (tmp_path / "keepme").is_dir()
+
+
+def test_delete_is_part_of_the_protocol_surface():
+    """A Protocol member with no implementation on a concrete backend is the
+    defect this goal exists to prevent, one level up: the caller type-checks
+    against StorageBackend and crashes on whichever backend forgot it. The
+    runtime_checkable isinstance below fails if either half is missing."""
+    assert hasattr(StorageBackend, "delete")
+    assert isinstance(LocalBackend(), StorageBackend)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

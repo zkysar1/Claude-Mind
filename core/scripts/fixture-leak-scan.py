@@ -265,31 +265,8 @@ def _snapshot(path: Path) -> list[dict]:
     read can trail the S3 copy by seconds (rb-3205), so a hygiene scan must read
     through the backend to avoid scanning a stale mirror. Best-effort refresh
     (skips per-machine stores that refresh would clobber). Empty list if absent."""
-    try:
-        from storage_backend import get_backend
-        import owncloud_sync
-        be = get_backend()
-        if not owncloud_sync.refresh_would_clobber(be, path):
-            be.refresh(path)
-    except Exception as e:  # noqa: BLE001 - refresh is best-effort
-        print(f"[fixture-leak-scan] (refresh skipped for {path.name}: {e})",
-              file=sys.stderr)
-    if not path.exists():
-        return []
-    try:
-        from _fileops import read_jsonl_with_recovery
-        return read_jsonl_with_recovery(path)
-    except Exception:  # noqa: BLE001 - fall back to a plain skip-malformed parse
-        out = []
-        for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                out.append(json.loads(ln))
-            except json.JSONDecodeError:
-                continue
-        return out
+    from _fresh_read import read_jsonl_fresh
+    return read_jsonl_fresh(path, label="fixture-leak-scan")
 
 
 def _scan_aspirations(path: Path, store_label: str) -> list[dict]:

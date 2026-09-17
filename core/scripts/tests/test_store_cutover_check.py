@@ -340,20 +340,45 @@ def test_missing_consumer_file_is_unreadable_not_silently_ok(tmp_path, monkeypat
 
 
 def test_a_store_without_seam_symbols_is_unaffected(tmp_path, monkeypatch):
-    """The predicate is OPT-IN. `gzip` declares no seam_symbols, so the absorbed
-    check must not start gating it — a silent tightening of an unrelated cutover
-    would be exactly the drift this migration must avoid.
+    """The predicate is OPT-IN: a store declaring no seam_symbols keeps
+    byte-identity as its SOLE predicate and must not start being gated by the
+    symbol check — a silent tightening of an unrelated cutover would be exactly
+    the drift this migration must avoid.
 
-    Re-pointed from `utilization` at g-358-28: that store now DECLARES symbols,
-    which is the whole point of the change. `gzip` is the remaining exemplar and
-    the reason this pin still has a subject."""
+    SUBJECT HISTORY — read before re-pointing this again. It was `utilization`
+    until g-358-28, then `gzip` until g-358-95; both re-points happened because
+    the store then DECLARED symbols, which each time was the point of the
+    change. As of g-358-95 EVERY store in the registry declares symbols, so
+    there is no real exemplar left and the subject is now a SYNTHETIC fixture.
+    That is deliberate: the fail-closed opt-in default is a property of the
+    CODE, not of whichever store happens not to have opted in yet, and pinning
+    it to a live store is what made this test need re-pointing twice. Do not
+    delete it for want of a real subject — a registry with no un-opted store is
+    precisely when nothing else covers this path."""
     monkeypatch.setattr(scc, "PROJECT_ROOT", tmp_path)   # no consumer files
     monkeypatch.setattr(scc, "_git", lambda *a, **k: _Proc(0, ""))
-    cfg = scc.STORES["gzip"]
+    cfg = {"seam_commit": "0" * 40,
+           "consumers": ["core/scripts/does-not-matter.py"]}
     assert "seam_symbols" not in cfg
     r = scc._local_report(cfg["seam_commit"], cfg["consumers"],
                           cfg.get("seam_symbols"))
+    # seam_present despite the consumer file being absent from PROJECT_ROOT:
+    # with no symbols declared the symbol loop never runs, which IS the opt-in
+    # default under test. A store that HAD declared symbols would fail here on
+    # the unreadable consumer.
     assert r["seam_present"] is True
+
+
+def test_every_registry_store_declares_seam_symbols():
+    """Companion to the pin above (). The synthetic fixture proves the
+    CODE path; this proves the REGISTRY has in fact fully opted in, so a future
+    store added without symbols is a deliberate choice someone must make rather
+    than an oversight this suite stays silent about."""
+    missing = [k for k, v in scc.STORES.items() if not v.get("seam_symbols")]
+    assert missing == [], (
+        f"stores without seam_symbols: {missing} — byte-identity across every "
+        f"consumer is their sole predicate, which is unsatisfiable on a tier "
+        f"that moves (guard-5488). Declare symbols, or record why not.")
 
 
 def test_registry_carries_the_gate_firings_cutover():
@@ -869,10 +894,53 @@ def test_calls_symbol_refuses_an_unknown_kind():
 
 
 def test_symbol_spec_normalizes_both_declaration_forms():
-    assert scc._symbol_spec("firings_paths") == ("firings_paths", "call")
+    """Third element is the consumer SCOPE (); None == every consumer,
+    which is what both historical declaration forms still yield."""
+    assert scc._symbol_spec("firings_paths") == ("firings_paths", "call", None)
     assert scc._symbol_spec(
-        {"name": "FLAG", "kind": "name"}) == ("FLAG", "name")
-    assert scc._symbol_spec({"name": "FLAG"}) == ("FLAG", "call")
+        {"name": "FLAG", "kind": "name"}) == ("FLAG", "name", None)
+    assert scc._symbol_spec({"name": "FLAG"}) == ("FLAG", "call", None)
+
+
+def test_symbol_spec_normalizes_a_scoped_declaration():
+    name, kind, scope = scc._symbol_spec(
+        {"name": "plain_md5", "kind": "name", "consumers": ["a/b.py"]})
+    assert (name, kind) == ("plain_md5", "name")
+    assert scope == frozenset({"a/b.py"})
+
+
+def test_symbol_spec_refuses_a_malformed_consumer_scope():
+    import pytest
+    # A bare string is the tempting shorthand and is REFUSED: frozenset("a.py")
+    # would silently become a set of CHARACTERS, matching nothing, and a scope
+    # that matches nothing makes its spec permanently inert.
+    with pytest.raises(ValueError):
+        scc._symbol_spec({"name": "F", "kind": "name", "consumers": "a/b.py"})
+    with pytest.raises(ValueError):
+        scc._symbol_spec({"name": "F", "kind": "name", "consumers": []})
+
+
+def test_a_scoped_symbol_does_not_leak_onto_other_consumers():
+    """The whole point of scoping (, guard-6244).
+
+    A `name`-kind spec is the WEAKER predicate. Declared store-wide it matched
+    a consumer whose CALL had been reverted — the token survived as the
+    argument to the very call that was removed — so the widened bucket could
+    not go red on an injected defect. Scoped, it applies only where declared.
+    """
+    specs = scc._symbol_specs(
+        [{"name": "plain_md5", "kind": "name",
+          "consumers": ["core/scripts/storage_backend.py"]}])
+    src = "x = compare(st.plain_md5, other)\n"
+    # Inside the scope: matches.
+    assert scc._calls_any_symbol(
+        src, specs, "core/scripts/storage_backend.py") == "plain_md5"
+    # Outside the scope: does NOT match, even though the token is present.
+    assert scc._calls_any_symbol(
+        src, specs, "core/scripts/owncloud_sync.py") is None
+    # No path at all: fail-closed — a caller that cannot name the file gets no
+    # file-specific exemption.
+    assert scc._calls_any_symbol(src, specs, None) is None
 
 
 def test_symbol_spec_refuses_a_malformed_entry():
@@ -1037,9 +1105,15 @@ def test_tier2_matches_a_bare_CONSTANT_via_kind_name(monkeypatch):
 def test_symbol_specs_normalizes_every_declared_shape():
     assert scc._symbol_specs(None) == []
     assert scc._symbol_specs([]) == []
-    assert scc._symbol_specs("f") == [("f", "call")]           # historical form
-    assert scc._symbol_specs(["f", "g"]) == [("f", "call"), ("g", "call")]
-    assert scc._symbol_specs([{"name": "C", "kind": "name"}]) == [("C", "name")]
+    # Third element is the consumer SCOPE (); None == every consumer.
+    assert scc._symbol_specs("f") == [("f", "call", None)]      # historical form
+    assert scc._symbol_specs(["f", "g"]) == [("f", "call", None),
+                                             ("g", "call", None)]
+    assert scc._symbol_specs(
+        [{"name": "C", "kind": "name"}]) == [("C", "name", None)]
+    assert scc._symbol_specs(
+        [{"name": "C", "kind": "name", "consumers": ["a.py"]}]) == [
+            ("C", "name", frozenset({"a.py"}))]
 
 
 def test_calls_any_symbol_is_calls_AT_LEAST_ONE_not_calls_all():
@@ -1056,7 +1130,10 @@ def test_utilization_declares_the_seven_measured_reader_symbols():
     """Registry pin (step 2). The flag is kind=name; the other six are calls."""
     specs = scc._symbol_specs(scc.STORES["utilization"]["seam_symbols"])
     assert len(specs) == 7
-    assert dict(specs)["UTILIZATION_COUNTERS_SPOOLED"] == "name"
-    assert {n for n, k in specs if k == "call"} == {
+    assert {n: k for n, k, _ in specs}["UTILIZATION_COUNTERS_SPOOLED"] == "name"
+    assert {n for n, k, _ in specs if k == "call"} == {
         "load_counters", "utilization_of", "store_paths",
         "load_all_counters", "counters_path", "segment_name"}
+    # This store is UNSCOPED — every spec applies to every consumer. Scoping
+    # () is opt-in per SPEC, and nothing here opted in.
+    assert all(s is None for _, _, s in specs)

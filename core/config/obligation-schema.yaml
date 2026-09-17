@@ -46,6 +46,27 @@
 # obligation-schema.yaml in the corresponding SKILL.md "Mandatory writes"
 # section. Keep the vocabulary short — this file is read at audit time.
 
+# PRODUCER LABEL -> SCHEMA KEY (, measured 2026-09-17).
+# Two vocabularies name the same obligations. The journal line the loop writes is
+# `OBLIGATION ABBREVIATED: <phase> — <condition>`, and the phase there is the LOOP's
+# name for it; the `obligations:` keys below are this file's. They agree on `verify`
+# and `spark` and disagree on the other two, and nothing mapped between them — so
+# `obligations.get("state-update")` was None in BOTH auditors and every abbreviation
+# claim on those two phases scored invalid regardless of its condition or the runtime
+# state. Those false verdicts are what filed the `Investigate: false-abbreviation-claims`
+# goals. Positive control, same call/schema/runtime: `state` and `learn` validate
+# `context_budget.zone == tight` at zone tight, where `state-update`/`learning-gate` did not.
+#
+# This map lives HERE, not in either script, because BOTH `obligation-audit.py` (from
+# iteration-close do_learning_gate) and `abbreviated-obligation-audit.py` (from the
+# learning-gate skill) validate claims and both had the defect independently — a copy in
+# each is the drift that produced it. A label with no entry passes through unchanged and
+# still fails the `obligations.get()` lookup, so an unrecognised phase surfaces rather
+# than being rubber-stamped (rb-1915: normalizers total onto the vocabulary).
+phase_aliases:
+  state-update: state
+  learning-gate: learn
+
 obligations:
 
   verify:

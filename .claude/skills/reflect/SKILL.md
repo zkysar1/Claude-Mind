@@ -345,7 +345,50 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # resolved 3, UNRESOLVABLE 204 / EXPIRED 328 / none 48 / CONFIRMED 1 —
    # 2026-08-12_deploy-identity-can-create-lambda-functions, resolved_by bravo
    # 23 min before that pass reached this step).
-   # READ THE TWO NONZEROS TOGETHER: both were a PEER's resolution landing
+   # AND 11 ON 2026-09-16 (echo, cc-03, fire #134) — AN ORDER OF MAGNITUDE
+   # ABOVE EVERY PRIOR READING, AND ABOVE THE 0-1 THIS BLOCK TEACHES YOU TO
+   # EXPECT. Reconciled against an INDEPENDENT instrument in the same
+   # iteration: after that pass reflected the 2 CORRECTED, iteration-close's
+   # learning-gate reported "9 reflectable unreflected hypothesis/es" at
+   # 04:58 — 11 minus 2, exactly. Two different code paths, one arithmetic
+   # identity, so the 11 is MEASURED, not a mis-parse of the kind this block
+   # warns about twice above. The 9 were resolved by bravo and foxtrot,
+   # landing 2026-09-15T21:0x..2026-09-16T01:07.
+   # THE TWO-NONZERO PATTERN BELOW DOES NOT COVER THAT READING. Those were ONE
+   # peer resolution each, minutes old; 09-16 was NINE, across TWO peers, over
+   # four hours. Do not budget a single ABC chain here on a busy fleet; size the
+   # step against the control you just ran. And when the count is large, the
+   # ownership paragraph two below is the binding one, not this one: on 09-16 all
+   # 9 were owned five times over (g-115-4335, g-115-4558, g-115-6338,
+   # g-115-6543, g-001-08), so the correct action was to chain NOTHING further
+   # and file NO tenth goal. A large control reading is not automatically a
+   # large amount of work.
+   #
+   # ⚠ AND 0 ON 2026-09-17 (echo, cc-03, fire #137) — WHICH FALSIFIED THE REGIME
+   # CLAIM THIS PARAGRAPH USED TO MAKE, ON A PRE-REGISTERED FALSIFIER. The 09-16
+   # edit read "the fleet resolves in BATCHES, so a quiet-box expect-zero and a
+   # busy-fleet expect-one BOTH under-predict it" — a standing regime inferred
+   # from one high reading. It was filed the same iteration as micro sq-009
+   # (g-001-01, conf 0.62): "at the next fire the control will read >= 2 ... a
+   # 0-1 reading means 2026-09-16 was an outlier and the paragraph must be
+   # softened". The next fire read 0 on all three surfaces (634 / 68 / 1757
+   # records; 2,313,978 / 543,864 / 9,483,159 B; `reflected` present on all of
+   # each; scoreable 0 / 56 / 1049), so the prediction is CORRECTED and this is
+   # the softening it pre-authorised.
+   # BATCHING ITSELF IS NOT REFUTED — the inference from ONE READING TO A REGIME
+   # is. Batches are real and independently visible (09-16's 9 came from two
+   # peers over four hours). What is false is that the CONTROL still shows them,
+   # because DRAINAGE is as fast as batching: alpha drained all 11 at fire #135
+   # the same morning, and foxtrot's fire earlier on 09-17 read 1 and reflected
+   # it on the spot. So THIS CONTROL IS A RACE between peer resolution and peer
+   # drainage, and one reading tells you which side of that race your pass landed
+   # on — never the regime. That cuts BOTH ways, which is the whole lesson: the
+   # 11 no more established a standing expectation than the 0 refutes one. Read
+   # the number, size the step to it, and do not rewrite the expectation for the
+   # next pass from it (guard-5609 — a series carrying a model in its prose must
+   # test each new row against that model; guard-5815 — never narrate a
+   # single-step delta as a direction).
+   # READ THE 08-22 AND 09-11 NONZEROS TOGETHER: both were a PEER's resolution landing
    # minutes earlier (zeta 6 min, bravo 23 min). That is not coincidence — on a
    # live multi-agent fleet the control is nonzero precisely when a partner has
    # just resolved something, which is most of the time. So "expect zero" is a
@@ -600,9 +643,30 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # contribute"), rb-7831 (the general mechanism: an AND-threshold silently
      # becomes unreachable as its sources are individually and CORRECTLY
      # retired), and goal g-115-5115. With source 2 retired (g-115-2141) and
-     # this one inert, only sources 1 and 4 can fire, so the `>= 2` synthesis
-     # gate below needs BOTH — which is why passes routinely end at 1 signal and
-     # synthesise nothing. That is the known state, not a fresh discovery.
+     # this one inert, only sources 1 and 4 can fire. That much is the known
+     # state, not a fresh discovery.
+     #
+     # BUT DO NOT READ IT AS "the >= 2 gate needs BOTH" - THAT INFERENCE IS
+     # ARITHMETICALLY WRONG, and it stood in this comment until 2026-09-14.
+     # Both surviving sources append ONE SIGNAL PER ITEM: source 1 one per
+     # flagged signature, source 4 one per rollback inside the 14d window. So
+     # EITHER source alone satisfies >= 2 as soon as it has two items, and the
+     # gate is not an AND across sources at all - rb-7831 AND-threshold shape
+     # describes the SOURCES going inert, never the counting.
+     # MEASURED fire #132 (echo, cc-03, uname -r 6.8.0-139-generic): signature
+     # signals 0, backpressure rollbacks inside 14d FOUR -> len(signals)=4, gate
+     # OPEN on source 4 alone with source 1 contributing nothing. So "passes
+     # routinely end at 1 signal" is not a property of the gate; it is a property
+     # of a quiet backpressure window, and it flips without anything being fixed.
+     #
+     # AND COUNT EVENTS, NOT ROWS, BEFORE SYNTHESISING. Three of those four were
+     # mc-1060 / mc-1093 / mc-1094 stamped 2026-09-07T08:14:03 / :06 / :08 - one
+     # batch rollback five seconds wide - so the raw 4 collapses to 2 distinct
+     # events. The per-row append inflates EVENT multiplicity into SIGNAL
+     # multiplicity, which is the direction that manufactures a "weakness" out of
+     # a single backpressure incident. Cluster by timestamp before believing a
+     # count here, and pair it with fire #104 lesson (the micros slot is the
+     # fix-date index that says whether a rollback is still current state).
      Bash: experience-read.sh --recent 20
      negative_experiences = filter WHERE relative_advantage < -0.1
      IF len(negative_experiences) >= 3:

@@ -381,6 +381,106 @@ def test_terminal_goal_is_not_in_population(tmp_path):
     assert out["scanned"] == 0
 
 
+# ═══ : the second population leg, a live `human_blocked:` defer ═══
+
+
+def _hb_goal(gid, participants=("agent",), status="pending", reason=None, **kw):
+    g = _goal(gid, 500, participants=participants, status=status, **kw)
+    g["defer_reason"] = reason or "human_blocked: owner must supply the key value"
+    return g
+
+
+def test_human_blocked_defer_without_user_joins_the_population(tmp_path):
+    """A goal waiting on a human by DEFER reaches the digest with no `user` leg.
+
+    Measured at filing (2026-09-13): 23 goals carried a `human_blocked:` defer and
+    14 of them (7 HIGH) had no `user` in participants, so this digest could not
+    list them, and with an empty first leg it would have sent "Nothing needs you
+    right now" over all 14. `all_clear` is asserted for that reason. The fixture
+    is g-350-108's live shape: participants ['agent'], status pending.
+    """
+    out = _run(tmp_path, [_hb_goal("g-hb")], "--apply")
+    rec = [r for r in out["results"] if r["goal_id"] == "g-hb"]
+    assert rec and rec[0]["action"] == "escalated", rec
+    assert rec[0]["shape"] == "human-blocked-defer"
+    # `owner_decided_predicate_loaded` joined this block with . It is the
+    # sibling of `human_blocked_predicate_loaded` and carries the same signal: the
+    # guarded import succeeded, so the exemption is live rather than degraded-open.
+    # Asserted by exact dict on purpose — a silently DROPPED loaded-flag is how a
+    # degraded sweep passes for a stranger reading only the counts.
+    assert out["population"] == {"user_participant": 0, "human_blocked_defer": 1,
+                                 "human_blocked_only": 1,
+                                 "human_blocked_predicate_loaded": True,
+                                 "owner_decided_predicate_loaded": True}
+    assert out["scanned"] == 1 and out["all_clear"] is False
+
+
+def test_goal_in_both_legs_is_listed_once(tmp_path):
+    out = _run(tmp_path, [_hb_goal("g-both", participants=("agent", "user"))],
+               "--apply")
+    assert [r["goal_id"] for r in out["results"]] == ["g-both"]
+    assert out["population"]["user_participant"] == 1
+    assert out["population"]["human_blocked_defer"] == 1
+    assert out["population"]["human_blocked_only"] == 0
+
+
+def test_deliberate_park_with_a_human_blocked_defer_stays_a_park(tmp_path):
+    """The defer leg must not re-admit a TRUE PARK the first leg already skipped."""
+    out = _run(tmp_path,
+               [_hb_goal("g-park-hb", participants=("user",),
+                         origin_signal="user_directive")],
+               "--apply")
+    assert out["skipped"]["deliberate"] == 1
+    assert [r["action"] for r in out["results"]] == ["skip"]
+    assert out["applied"] == 0
+
+
+def test_human_blocked_mentioned_inside_another_defer_is_not_a_member(tmp_path):
+    """Membership is the PREFIX. A `precondition_unmet:` defer whose prose names
+    human_blocked waits on the fleet, not the user (live shape: g-373-71)."""
+    out = _run(tmp_path,
+               [_hb_goal("g-pc", reason="precondition_unmet: not human_blocked yet")],
+               "--apply")
+    assert out["scanned"] == 0
+    assert out["population"]["human_blocked_defer"] == 0
+
+
+def test_terminal_goal_with_a_human_blocked_defer_is_not_a_member(tmp_path):
+    out = _run(tmp_path, [_hb_goal("g-hb-done", status="completed")], "--apply")
+    assert out["scanned"] == 0
+
+
+def test_unavailable_human_blocked_predicate_keeps_the_first_leg_and_says_so(
+        tmp_path, monkeypatch, capsys):
+    """Fail-open to the first leg, never a crash, and never a silent narrowing."""
+    mod = _load_module()
+    mod._load_human_blocked_predicate = lambda: None
+    wq, aq, blog = (tmp_path / "w.jsonl", tmp_path / "a.jsonl",
+                    tmp_path / "board.json")
+    _write_queue(wq, [_goal("g-user", 500), _hb_goal("g-hb")])
+    aq.write_text("", encoding="utf-8")
+    blog.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "x", "--agent", "t", "--world-aspirations", str(wq),
+        "--agent-aspirations", str(aq), "--board-escalation-log", str(blog),
+        "--no-email", "--no-board"])
+    assert mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [r["goal_id"] for r in out["results"]] == ["g-user"]
+    assert out["population"]["human_blocked_predicate_loaded"] is False
+
+
+def test_human_blocked_predicate_is_imported_from_lane_h_not_reimplemented():
+    mod = _load_module()
+    fn = mod._load_human_blocked_predicate()
+    assert fn is not None, "predicate must load from human-blocked-defer-join.py"
+    assert fn.__name__ == "is_live_human_blocked"
+    src = SCRIPT.read_text(encoding="utf-8")
+    assert "human-blocked-defer-join.py" in src
+    assert "def is_live_human_blocked" not in src, \
+        "predicate must be imported, never redefined here"
+
+
 # ═══ D2: the trigger is a fixed schedule, not an age crossing ═══
 
 

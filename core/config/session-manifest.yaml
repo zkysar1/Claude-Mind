@@ -228,7 +228,7 @@ files:
     required_when_running: false
 
   - file: crash-marker
-    purpose: context-exhaustion breadcrumb written by StopFailure hook; consumed + deleted by /boot on next session
+    purpose: API-error breadcrumb written by StopFailure hook (records the payload's error.error_type; hardcoded `context_exhaustion` until 2026-09-15); consumed + deleted by /boot on next session
     writer: stop-failure-hook.sh (StopFailure hook)
     recovery_action: clear
     sync_tier: machine_local
@@ -723,6 +723,24 @@ files:
     glob: true
     purpose: forked_wm_hash integrity sidecar — drives _consume_staged's never-diverged no-op short-circuit
     writer: body-manifest.py close_body_on_genuine / cleanup-stale-bindings.sh
+    recovery_action: preserve
+    sync_tier: continuity
+    required_when_idle: false
+    required_when_running: false
+
+  # : a FOURTH staged file, and NOT a merge input. The append path
+  # copies each evicted capture to sessions/<unitKey>/capture-evictions-archive.jsonl
+  # before removing it; the crash-preserve reaper stages that file here as
+  # <unitKey>-capture-evictions-archive.jsonl for EVERY body_state (merged
+  # included) and push-staged relocates it world-rooted. body-merge neither reads
+  # nor deletes it, so the staged copy is the archive's durable home. It would
+  # sync unregistered (.jsonl is in _SESSION_DATA_EXTS — measured 2026-09-14,
+  # alpha, cc-08: _is_machine_local False); it is registered for `preserve`,
+  # because it holds the only copy of the captures it archived.
+  - file: '*-capture-evictions-archive.jsonl'
+    glob: true
+    purpose: staged capture-eviction archive of a Body WM — evicted capture entries copied before removal (g-115-9852)
+    writer: cleanup-stale-bindings.sh
     recovery_action: preserve
     sync_tier: continuity
     required_when_idle: false

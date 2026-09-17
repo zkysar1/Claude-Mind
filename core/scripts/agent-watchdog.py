@@ -4336,6 +4336,133 @@ class RetrievalIndexProbe(Probe):
         self.drifted = sorted(d) if isinstance(d, list) else []
 
 
+class StoreOvercapProbe(Probe):
+    """Line-bounded stores drifting past their cap ().
+
+    THE CLOCK IS THE POINT. `jsonl_hygiene.detect_overcap` shipped working and
+    with ZERO production callers -- measured 2026-09-17 across core/scripts,
+    .claude/, mind_api/src and $WORLD_PATH/scripts, and across the goal queue
+    (guard-1067): the only store-hygiene recurring goal is g-115-1651, the sweep
+    itself. With no caller it recorded no run, and because it fires only on a
+    store over cap on the PREVIOUS recorded run too, it could never fire at all.
+
+    It must not be hung off that sweep. The drift it exists to catch comes from
+    the sweep NOT RUNNING -- g-115-1651 declares interval_hours 16 and had gone
+    ~38.5h when this was filed -- and a detector invoked from the process it
+    monitors goes silent exactly when that process starves (guard-1962). So it
+    rides the tick that already fires from iteration-close.sh: a LOOP clock,
+    which is running whenever anything is running. detect_overcap does its own
+    `sweep(apply=False)`, so it needs nothing from g-115-1651 to take a reading.
+
+    What it would have caught: the coordination board channel object reached
+    10,799,074 B on 2026-09-15, ~2.5x its at-cap size, before rotation cut it
+    back. Every board post re-PUTs the whole object, so that multiple was paid
+    as churn bytes on every write in the window.
+
+    FIRES ON `surfaced`, NOT ON `repeat_offenders`. The ratchet lives in the
+    detector (its per-box log is the single source of truth, so there is no
+    second copy here to drift), and it is what makes this wiring survivable:
+    four machine-local stores sit permanently over cap on an unswept box, and
+    an alarm that names them every run is one readers learn to skip (guard-6508,
+    rb-8533). `ratcheted_quiet` rides in the payload so the carried debt stays
+    visible without being the alarm.
+
+    REDUCER-ONLY, so NOT in WORKER_SAFE_PROBES. Not for RetrievalIndexProbe's
+    reason -- this is a per-BOX condition, not a fleet one, so a worker could
+    legitimately read it. The constraint is the WRITE: `record=True` appends to
+    one per-box state log, and two Bodies on the same box ticking it would
+    interleave runs into a single consecutive-run history, corrupting the very
+    comparison the ratchet is computed from. One writer per box. The honest
+    cost: a worker-only box takes no reading at all, because the worker loop
+    skips iteration-close (g-306-240) -- that is a gap, not coverage, and it is
+    recorded here rather than papered over.
+
+    PACED. detect_overcap sweeps every registered store; the tick fires every
+    iteration, and cap drift is a slow condition, so an unpaced probe would
+    re-sweep the whole registry every few minutes to restate a number that moves
+    over hours. The interval is well inside any cadence the loop actually meets,
+    so it does not become a declared cadence the fleet never reaches (guard-5202).
+    """
+
+    name = "store-overcap"
+    INTERVAL_MIN = 60
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.last_polled: Optional[float] = None
+
+    def check(self) -> list[Event]:
+        now = time.time()
+        if self.last_polled is not None:
+            elapsed = now - self.last_polled
+            # Negative elapsed means the clock moved backwards; re-poll rather
+            # than trust it (the InfraComponentProbe/RetrievalIndexProbe rule).
+            if 0 <= elapsed < self.INTERVAL_MIN * 60:
+                return []
+        self.last_polled = now
+        try:
+            # Lazy import inside check(), the FreshnessProbe convention: an
+            # import or syntax error in the hygiene module must never crash the
+            # tick that carries every other probe.
+            import jsonl_hygiene
+            rep = jsonl_hygiene.detect_overcap(record=True)
+        except Exception as exc:  # advisory probe — degrade, never raise
+            sys.stderr.write("[watchdog] store-overcap detect failed: %s\n" % exc)
+            return []
+
+        surfaced = list(rep.get("surfaced") or [])
+        cleared = list(rep.get("ratchet_cleared") or [])
+        if not surfaced and not cleared:
+            return []
+
+        over_now = rep.get("over_now") or {}
+        payload = {
+            "surfaced": surfaced,
+            "newly_over": rep.get("newly_over"),
+            "regressed": rep.get("regressed"),
+            "ratcheted_quiet": rep.get("ratcheted_quiet"),
+            "ratchet_cleared": cleared,
+            "repeat_offenders": rep.get("repeat_offenders"),
+            "threshold": rep.get("threshold"),
+            "regress_factor": rep.get("regress_factor"),
+            "line_bounded": rep.get("line_bounded"),
+            "swept": rep.get("swept"),
+            "recorded": rep.get("recorded"),
+            "record_error": rep.get("record_error"),
+            "ratios": {p: (over_now.get(p) or {}).get("ratio") for p in surfaced},
+            # Both caveats the detector attaches travel with the alarm: a
+            # non-machine-local ratio is one box's reading of a shared object,
+            # and a refused store is one no sweep can bring down.
+            "caveat": rep.get("caveat"),
+            "unbounded_by_refusal": rep.get("unbounded_by_refusal"),
+        }
+        if surfaced:
+            detail = ", ".join(
+                "%s(%.2fx)" % (p, (over_now.get(p) or {}).get("ratio") or 0.0)
+                for p in surfaced)
+            return [Event(
+                probe=self.name, event="store_overcap", severity="critical",
+                payload=payload,
+                summary=("store-overcap: %s at/past %sx cap on consecutive runs "
+                         "and new-or-regressed against the ratchet (%d known "
+                         "over-cap store(s) carried quietly)"
+                         % (detail, rep.get("threshold"),
+                            len(rep.get("ratcheted_quiet") or []))))]
+        return [Event(
+            probe=self.name, event="store_overcap_cleared", severity="info",
+            payload=payload,
+            summary=("store-overcap cleared: %s back under cap — ratchet mark "
+                     "dropped, so a recurrence will surface again"
+                     % ", ".join(cleared)))]
+
+    def to_dict(self) -> dict:
+        return {"last_polled": self.last_polled}
+
+    def from_dict(self, state: dict) -> None:
+        lp = state.get("last_polled")
+        self.last_polled = lp if isinstance(lp, (int, float)) else None
+
+
 class PeerLivenessProbe(Probe):
     """Cross-agent liveness paging (owner directive 2026-09-05; foxtrot ~9h dark).
 
@@ -4708,6 +4835,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         InfraComponentProbe(ctx),
         DependencyFunnelProbe(ctx),
         RetrievalIndexProbe(ctx),
+        StoreOvercapProbe(ctx),
     ]
     if ctx.body_role == "worker":
         return [p for p in probes if p.name in WORKER_SAFE_PROBES]

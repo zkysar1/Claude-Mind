@@ -39,7 +39,7 @@ plus metacognitive assessment (model judgment on familiarity, value, cost, infra
 - `selection_context`: Raw parsed output from goal-selector.sh (includes `by_reason`, `blocked_goals`, `blocked_count` when all_blocked)
 - `selection_reason`: Why no goal was returned (`"all_blocked"`, `"all_blocked_by_gate"`, or absent when goal selected)
 - `source`: Queue origin of the selected goal (`"world"` or `"agent"`) — from goal-selector output. Pass to all downstream `aspirations-*.sh` calls via `--source {source}`.
-- `deviation_code`: Scorer Sovereignty Layer B (g-115-2812) — the sanctioned-deviation enum code when the selected goal is NOT the scorer's top pick (`ranked_goals[0]`), else `""`. Phase 4's world-goal claim forwards it via `aspirations-claim.sh {goal.id} --deviation {deviation_code}`. Computed in Phase 2.94.
+- `deviation_code`: Scorer Sovereignty Layer B (g-115-2812) — the sanctioned-deviation enum code when the selected goal is NOT `ranked_goals[0]`, else `""`. Phase 4's world-goal claim forwards it via `aspirations-claim.sh {goal.id} --deviation {deviation_code}`. Computed in Phase 2.94.
 
 ## Phase 2: Select Next Goal
 
@@ -221,7 +221,7 @@ FOR EACH finding WITH "insight_trigger" in tags:
     Parse required action (requires_action_by:<agent>, action_type:<type>)
 
     IF requires_action_by does not match this agent: SKIP
-    IF already processed (check for reply from this agent): SKIP
+    IF replied by me (re-read WITHOUT --type; guard-6755): SKIP
 
     # Stale-trigger guard (g-115-2969 / rb-4860): a trigger whose affects:<goal-id>
     # target has ALREADY gone terminal is moot — acting on it decides about
@@ -634,18 +634,19 @@ goal = find by goal_id in returned aspiration's goals array
 
 The claim chokepoint (`scorer-verdict-gate.py`, invoked inside
 `aspirations-claim.sh`) REFUSES a world-goal claim that diverges from the
-scorer's fresh top pick unless a `--deviation <code>` names the sanctioned
-reason. `goal-selector.py` writes the verdict sidecar (`top_goal_id` =
-`ranked_goals[0]`); compute `deviation_code` here so Phase 4 can forward it.
-This is a single-point computation (compare the finalized selection to the
-scorer top) — NOT a variable threaded through the divergence phases above — so
-a sanctioned divergence can never silently reach the claim without a code.
+sidecar's fresh `top_goal_id` unless a `--deviation <code>` names the sanctioned
+reason. `ranked_goals[0]` is the selector's CHOSEN pick, NOT the argmax: a hoist
+stamps a marker key on it and only indices >=1 are score-ordered — guard-5135,
+`core/config/rationale/selector-index-0-is-a-hoist.md`.
+Compute `deviation_code` here for Phase 4.
+Single-point: compare the finalized selection to `top_goal_id`; never thread a
+variable through the divergence phases above.
 
 ```
 IF goal is None:
     deviation_code = ""          # no claim will happen
 ELIF ranked_goals is empty OR goal.goal_id == ranked_goals[0].goal_id:
-    deviation_code = ""          # HAPPY PATH: claiming the scorer's top pick — no flag needed
+    deviation_code = ""          # HAPPY PATH: claiming ranked_goals[0] — no flag needed
 ELSE:
     # Selection diverged from the scorer top via a sanctioned phase above. Set
     # the enum code matching the phase that caused THIS divergence (the gate

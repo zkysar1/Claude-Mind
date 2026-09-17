@@ -270,7 +270,7 @@ def _tag_addressee(tag) -> str:
 
 _ID_TOKEN_RE = re.compile(
     r"msg-\d{8}-\d{6}-[a-z0-9]+-\d+"      # a board message id CARRIES its author's name
-    r"|g-\d{1,4}-\d{1,4}|asp-\d{1,4}"      # goal / aspiration ids
+    r"|g-\d{1,4}-\d{1,5}|asp-\d{1,4}"      # goal / aspiration ids
     r"|[a-z0-9_.\-]+@[a-z0-9\-]+"           # an `<agent>@<env>` author token is a reference, not an address
 )
 

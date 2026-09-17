@@ -28,7 +28,7 @@ import re
 from typing import Dict, List, Optional
 
 # g-NNN-NN through g-NNN-NNNN (CLAUDE.md ID Formats; widened 2026-05-19).
-GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{2,4}\b", re.IGNORECASE)
+GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{2,5}\b", re.IGNORECASE)
 
 ACTION_COMPLETE = "complete"
 ACTION_DROP_USER_LEG = "drop_user_leg"

@@ -1,6 +1,6 @@
 ---
 name: aspirations-graceful-stop
-description: "Handles the graceful-stop path for the aspirations loop: recovers in-flight iteration checkpoints, completes pending verify/state-update obligations, and runs the deferred stop sequence D1-D7. Use whenever {agent}/session/stop-requested is detected at Phase -1.4 of the aspirations loop, or the loop needs to exit cleanly without dropping in-flight work. Internal handler — only /aspirations invokes it; the user-facing /stop command writes stop-requested which this handler then reads."
+description: "Handles the graceful-stop path for the aspirations loop: recovers in-flight iteration checkpoints, completes pending verify/state-update obligations, and runs the deferred stop sequence D1-D7. Use whenever {agent}/session/stop-requested is pending (Phase -1.4, or /start or /boot before the loop), or the loop needs to exit cleanly without dropping in-flight work. Internal handler, never user-invoked; the user-facing /stop command writes stop-requested which this handler then reads."
 user-invocable: false
 parent-skill: aspirations
 conventions: [aspirations, compact-recovery, session-state]
@@ -21,11 +21,11 @@ previous_revision_id: null
 Detects `stop-requested` signal (set by `/stop`) and completes in-flight obligations
 before running the full stop sequence. This ensures no learning is lost.
 
-**Invocation contract.** The caller (aspirations orchestrator Phase -1.4) has already
-verified `session-signal-exists.sh stop-requested` returned exit 0. This skill MUST
+**Invocation contract.** The caller (Phase -1.4, `/start`'s hand-off, or the stop-pending
+Bash hook) has verified `stop-requested` exists. This skill MUST
 end its execution by returning control to the harness (not to the orchestrator) —
 after the deferred stop sequence completes, state is IDLE and mode has been updated,
-so the orchestrator's iteration loop MUST NOT continue.
+so neither the loop nor /boot may continue.
 
 **Mode invariant.** This skill runs at the RUNNING→IDLE transition. D1 sets IDLE,
 D7 sets the target mode. The `minimum_mode: autonomous` front matter is evaluated
@@ -245,8 +245,8 @@ ELSE:
 
 ## Phase GS-2: Deferred Stop Sequence (D1-D7)
 
-This replaces the old /stop steps 1-7. Runs here because state is still
-RUNNING (mode still autonomous) at entry, so consolidation can run with full permissions.
+This replaces the old /stop steps 1-7. Runs here because mode is still
+autonomous at entry, so consolidation can run with full permissions.
 
 Output: "▸ Running stop sequence..."
 
@@ -313,6 +313,9 @@ Bash: rm -f agents/<agent>/session/running-session-id agents/<agent>/session/asp
 # 0 silently. Goal/tree counts are 0 here because graceful-stop doesn't have a
 # rolling counter; future enhancement is to seed them from team-state intel.
 Bash: MIND_AGENT=<agent> SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && bash core/scripts/session-summary-write.sh --sid "$SID" --agent "<agent>" --reason graceful-stop >/dev/null || true
+# D6.55 (g-115-9957): close THIS Body's carrier; no forked WM = every other
+# close skips it. Rationale (WHY): core/config/rationale/reducer-carrier-graceful-close.md
+Bash: MIND_AGENT=<agent> SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && py -3 core/scripts/body-manifest.py close-body-late --sid "$SID" --agent "<agent>" --graceful >/dev/null 2>&1 || true
 # D6.6 (session-telemetry WP3, 2026-06-03): Finalize the durable per-session
 # telemetry record at world/telemetry/session-records/<agent>/<SID>.json with
 # status=completed, ended_reason=graceful-stop. The record lives under world/
@@ -494,7 +497,7 @@ which produces no user-visible output when the file exists).
 
 ## Chaining
 
-- **Called by**: `/aspirations` orchestrator Phase -1.4 (fresh stop, when `stop-requested` exists); the Session Start Protocol IDLE branch with `--resume` (FW-11, when a `stop-checkpoint.json` is detected after an autocompact-interrupted stop)
+- **Called by**: `/aspirations` orchestrator Phase -1.4 (fresh stop, when `stop-requested` exists); `/start`'s hand-off; the stop-pending Bash hook; the Session Start Protocol IDLE branch with `--resume` (FW-11, when a `stop-checkpoint.json` is detected after an autocompact-interrupted stop)
 - **Calls**: `aspirations-verify`, `aspirations-state-update` (for in-flight obligation completion); `aspirations-consolidate` OR `load-consolidation-housekeeping.sh` (D4); `stop-checkpoint.sh` (write at GS-0 / clear at D7.1); many scripts for D1-D7
 - **Reads**: iteration-checkpoint.json, stop-checkpoint.json, stop-target-mode, handoff context
 - **Writes**: agent-state (IDLE), agent-mode (target), stop-checkpoint.json (write/clear), various session signals

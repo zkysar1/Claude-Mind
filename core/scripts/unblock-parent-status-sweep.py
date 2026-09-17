@@ -831,6 +831,65 @@ SUCCESSOR_MARKER_PATTERN = re.compile(
 SUCCESSOR_MARKER_FIELDS = ("description", "title", "origin_signal")
 
 
+def _live_defer_guard(g):
+    """A LIVE `defer_reason` says the work is PARKED, and parked is not moot.
+
+    The sweep's premise is that a terminal parent discharges the Unblock. A
+    goal carrying a defer_reason asserts the opposite on its own record: the
+    work is still WANTED and is waiting on a named condition that some OTHER
+    lane already owns and re-probes -- precondition-defer-recheck (precheck
+    0.5b.3), defer-recheck (0.5b.4), credential-defer-recheck (0.5b.9),
+    human-blocked-defer-join (0.5b.15). Two lanes deciding one row means the
+    row is decided by whichever happens to run first.
+
+    THE COST OF THE MISSING GUARD IS NOT A MISLABEL, IT IS A PERMANENT LOSS
+    (guard-1690). The mark writes status=skipped, and a skipped goal holding a
+    live dependency sits in a DEAD ZONE: invisible to completion math (skipped
+    is not outstanding) AND invisible to the blocked-signal sweeps (0.5b.11 /
+    0.5b.12 scan status=blocked, not skipped), so nothing ever resurfaces it
+    when the condition lands. The same mark REPLACES outcome_note with this
+    sweep's own 326-char string, destroying the text that names the condition
+    -- so afterwards there is no record of what it was waiting for.
+
+    MEASURED INSTANCE (2026-09-14, zeta, hostname cc-02, uname -r
+    6.8.0-139-generic): g-326-917, a live product goal in foxtrot's game-platform
+    lane, `defer_reason: "precondition_unmet: g-326-918 ..."`, outcomes 1/2/4
+    verified on ppe, 6,831-char outcome_note holding that evidence. Its parent
+    g-326-913 is completed, so it was this sweep's ONE candidate of 121
+    scanned / 21 eligible. Only the UNRELATED field-shrink guard refused the
+    note write (6831 -> 326 chars, 5% against a 25% floor), leaving applied=0
+    and the status untouched -- a guard built for read-modify-write errors
+    catching a semantic one by luck. It re-fires every iteration on every box,
+    and a single --override-shrink discharges it.
+
+    WORSE THAN MERELY UNGUARDED: `defer_reason_set_at` is already read here as
+    an AGE BASIS (the `ref_ts` fallback in the scan loop), so a defer does not
+    just fail to protect the goal -- its timestamp AGES the goal INTO
+    eligibility. The one field that says "another lane owns this row" was
+    wired to the threshold that admits it.
+
+    ANY non-empty defer_reason, not just the structured prefixes: every prefix
+    has an owning lane, and a prefix taxonomy here would drift out of sync
+    with `gates/defer_classifier.py` (the SSOT). This matches the
+    completed-not-closed slate, which excludes deferred rows for the identical
+    reason. A stale defer is not a permanent exclusion -- the owning lane
+    clears it and this sweep sees the row on its next run (guard-3419: a defer
+    must be a lease with a release path, never a permanent exclusion).
+
+    Like `_successor_marker_guard`, a hit here causes INACTION, so breadth is
+    the safe direction and a false NEGATIVE is what kills work.
+    """
+    dr = g.get("defer_reason")
+    if not dr:
+        return None
+    head = str(dr).strip().replace("\n", " ")[:120]
+    return ("carries a LIVE defer_reason — parked work is not moot, and the "
+            "defer lane that owns it re-probes it (precheck 0.5b.3 / 0.5b.4 / "
+            "0.5b.9 / 0.5b.15). Marking it skipped would put a goal holding a "
+            "live condition into guard-1690's dead zone AND clobber the note "
+            f"naming that condition: \"{head}\"")
+
+
 def _successor_marker_guard(g):
     """ + . A SUCCESSOR's parent being terminal is why it EXISTS.
 
@@ -1331,6 +1390,24 @@ def main():
             # passes every timestamp test;  did). Placed on the shared
             # path so BOTH lanes into the mark — the terminal-parent lane and
             # the recurring-cadence-resumed lane — pass through it.
+            # Runs before the successor guard: it is the cheapest signal
+            # (one field, no timestamp reach, no index lookup) and the only
+            # one whose miss is UNRECOVERABLE — the successor guard's miss
+            # writes a wrong note on a findable goal, this one's miss hides
+            # the goal from every sweep that could resurface it (guard-1690).
+            # Shared path, so both lanes into the mark pass through it.
+            defer_reason_skip = _live_defer_guard(g)
+            if defer_reason_skip:
+                details.append({
+                    "goal_id": g.get("id"),
+                    "aspiration_id": asp.get("id"),
+                    "parent_id": parent_id,
+                    "parent_status": parent_status,
+                    "age_hours": round(age_h, 1),
+                    "action": "skipped",
+                    "reason": defer_reason_skip,
+                })
+                continue
             succ_reason = _successor_marker_guard(g)
             if succ_reason:
                 details.append({

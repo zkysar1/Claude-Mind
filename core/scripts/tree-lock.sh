@@ -11,10 +11,12 @@
 #   tree-lock.sh release
 #   tree-lock.sh check          # the GATE: rc 0 = proceed, rc 1 = someone else holds it
 #   tree-lock.sh status         # human read; NEVER refuses (always rc 0)
+#   tree-lock.sh held-by-me     # PREDICATE: rc 0 = THIS sid holds a LIVE lock, rc 1 = anything else
 #
 # EXIT CODES: 0 = proceed / acquired / released, 1 = refused (acquire, check),
 # 2 = plumbing failure. `check` never returns 2 — for the gate, an indeterminate
-# state must still mean PROCEED (see tree_lock.py's fail-safe section).
+# state must still mean PROCEED (see tree_lock.py's fail-safe section). Neither
+# does `held-by-me`: an indeterminate state reads "not mine" ().
 #
 # Identity comes from MIND_SID, not the agent name: a worker Body and its
 # reducer are both the same agent, so an agent comparison cannot separate them

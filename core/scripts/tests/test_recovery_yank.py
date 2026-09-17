@@ -471,11 +471,21 @@ def test_state_mismatch_landing_is_wired_before_both_iteration_complete_imperati
         assert call < imperative, name
 
 
-def _run_landing(root: Path, sid=SID, body_role=None):
+_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
+
+
+def _run_landing(root: Path, sid=SID, body_role=None, harness=None):
     env = dict(os.environ)
     env.update({"MIND_AGENT": AGENT, "STORAGE_BACKEND": "local", "RT_NO_AUTOSPAWN": "1",
                 "RUNTIME_DIR": str(root / "rt")})
     env.pop("MIND_SID", None)
+    # Harness pin (2026-09-17): the imperative is spelled in the hosting
+    # harness's tool names, read from the CLAUDECODE / ZAKCODE_* markers. Pin
+    # Claude Code so the Skill(...) pins in this family hold on a box that runs
+    # the suite under a vessel; a test names another harness via `harness`.
+    for k in _HARNESS_MARKERS:
+        env.pop(k, None)
+    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
     # BODY_ROLE decides whether the landing may fire at all (), and the
     # PreToolUse bash hook injects it into every Bash call — so on a WORKER box
     # dict(os.environ) silently carries BODY_ROLE=worker and every landing test
@@ -505,6 +515,16 @@ def test_landing_prints_the_consolidate_directive_when_the_yank_cannot_be_revers
     assert "STATE MISMATCH" in r.stdout and "aspirations-consolidate" in r.stdout
     assert "do NOT call Skill(aspirations)" in r.stdout
     assert "ITERATION COMPLETE" not in r.stdout
+
+
+def test_landing_on_a_zakcode_vessel_names_the_vessels_loop_tool(tmp_path):
+    """2026-09-17: the landing's do-NOT-call line names the loop skill in the
+    hosting harness's vocabulary; a vessel model reads use_skill(aspirations)."""
+    root, _ = _sandbox(tmp_path, entries=[_recent_yank()])
+    r = _run_landing(root, sid=OTHER_SID, harness={"ZAKCODE_SESSION": "x"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "do NOT call use_skill(aspirations)" in r.stdout
+    assert "Skill(aspirations)" not in r.stdout.replace("use_skill(aspirations)", "")
 
 
 def test_landing_is_silent_on_a_worker_body_whose_idle_state_is_by_design(tmp_path):

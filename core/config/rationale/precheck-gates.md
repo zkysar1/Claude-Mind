@@ -378,3 +378,39 @@ the user owns the file's intent — never at detection time.
 - `core/scripts/runner-dead-check.sh` — SSOT for runner-dead conditions; DO NOT modify via goals in ZDS-Mind
 - `.claude/skills/aspirations-precheck/SKILL.md` — pointer source for all sections above
 - `core/config/conventions/health-ledger.md` §8–§11 — health-regression subsystem spec
+
+
+## Ephemeral fresh-eyes target — the Phase 0-pre3 non-dispatch branch
+
+Measured bravo / cc-05 / Linux 6.8.0-139-generic, 2026-09-13 (g-001-05 occurrence-134
+close; finding published at board `msg-20260913-224554-bravo-6800`).
+
+The NEW_SCRIPT lane of `post-state-update-gate.sh` enumerates untracked files by PATH
+(`git ls-files --others --exclude-standard`, :270) and writes that path into
+`fresh_eyes_dispatch_pending`. It snapshots a NAME, never CONTENT. When the enumerated
+file is EPHEMERAL, the target is already gone by the time Phase 0-pre3 consumes the
+sentinel, and the obligation cannot be discharged by dispatching.
+
+The firing: `{"fired":true,"core_count":1,"loc_changed":26,"commits_scanned":4,
+"reason":"new_script=core/scripts/.close-check-g00105.sh;"}`. Target state, four
+independent signals, all negative — `ls`, `find -name '.close-check-*'`,
+`git log --all -- 'core/scripts/.close-check-*'` (never tracked), and
+`git ls-files --others --exclude-standard core/scripts` (0 untracked now). PRODUCER:
+zero. A recursive grep for `close-check` over `core/` + `.claude/` + `$WORLD_PATH/scripts`
+returned 0 files, with a 336-file positive control on the identical sweep; split-name
+forms (`\.close-`, `close_check`, `closecheck`) returned 2 hits, both an unrelated
+`test_iteration_close_checkpoint_goal_id.py`. So the earlier working hypothesis — "a temp
+probe script iteration-close creates and deletes" — is FALSIFIED, and the producer is
+UNIDENTIFIED. Stated as unidentified rather than narrated into a cause.
+
+TOOL CONTROL, and it fired: `type -t grep` reports `function` in an interactive shell and
+`file` inside a script on this box — the live g-115-3794 shadowed-grep condition. Controls
+run through the same shadowed grep returned 191, 4 and 336, so the zeros above are
+measurements, not artifacts (guard-2099 / guard-2421).
+
+WHAT IS NOT WRONG: the gate fired correctly. A new untracked script under `core/scripts`
+is exactly what the NEW_SCRIPT lane exists to catch, and `/fresh-eyes-code` already handles
+an absent target correctly — its Phase 1 validates each path with `ls`, its Phase 4 emits a
+single `informs` finding for an empty target set, and its Phase 5 publishes that as the
+durable record the review ran. The only thing missing was the SKILL.md sentence saying so,
+and its absence made the correct action read as a skipped obligation.

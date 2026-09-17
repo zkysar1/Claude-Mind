@@ -48,6 +48,31 @@ sys.path.insert(0, str(HERE))
 
 from _paths import WORLD_DIR, PROJECT_ROOT, agents_root  # noqa: E402
 
+# The owner-decided park exemption () — the SAME predicate the 72h
+# escalation digest uses. Two consumers put human-gated goals in front of the
+# owner; guard-4015's measured corollary is that two correct-looking copies of
+# one exemption set diverge in their MATCHING SEMANTICS, not their inputs, so
+# the predicate is imported here rather than re-derived (guard-2275).
+# GUARDED: this script emails the owner and must never die on an import; the
+# fallback returns None, which renders every human-gated goal exactly as before.
+# The degraded mode is ANNOUNCED, not silent — a dead predicate here would render
+# every park as an ordinary ask, i.e. the pre-fix behaviour restored on the
+# owner-facing report, and a reader could not tell that from "the owner has no
+# parked goals". Same shape as `owner_decided_predicate_loaded` in the 72h
+# escalation check, so the two consumers of this predicate degrade alike.
+try:
+    from gates.owner_decided_park import owner_decided_ref  # noqa: E402
+    _OWNER_DECIDED_LOADED = True
+except Exception as _exc:  # noqa: BLE001
+    sys.stderr.write(
+        "completion-digest: could not import gates.owner_decided_park (%s) — "
+        "fail-open, owner-decided parks will render as ordinary asks\n" % (_exc,))
+
+    def owner_decided_ref(goal):  # type: ignore[misc]
+        return None
+
+    _OWNER_DECIDED_LOADED = False
+
 TERMINAL = {"completed", "skipped", "expired", "archived", "retired"}
 BATCH_CLOSE_MIN = 30  # >= this many closes by one session inside ~10 min = a batch close
 
@@ -249,9 +274,24 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
             if dr.lower().startswith("human_blocked") and g.get("id") not in seen:
                 seen.add(g.get("id"))
                 created = _ts(g.get("created_at") or g.get("created"))
+                # An owner-decided park is STILL LISTED — this report is the
+                # status summary the owner asked for, not an unsolicited nag, and
+                # hiding it would make the report disagree with the queue. What
+                # changes is the FRAMING: "deliberately parked with you", citing
+                # the decision record, instead of a NEEDS FROM YOU line that
+                # re-asks a settled question (guard-6754). `deliberate: True`
+                # selects that existing tag in both renderers, so no render
+                # branch is added for this ().
+                od_ref = owner_decided_ref(g)
+                if od_ref:
+                    scope = "parked on your own decision — see %s. Nothing needed from you." % od_ref
+                else:
+                    scope = _clip(dr.split(":", 1)[-1], 140)
                 needs.append({"id": g.get("id"), "title": g.get("title") or "", "asp": asp.get("id"),
-                              "scope": _clip(dr.split(":", 1)[-1], 140), "age_h": _hours(created, now),
-                              "kind": "human-gated", "deliberate": False, "priority": g.get("priority") or "",
+                              "scope": scope, "age_h": _hours(created, now),
+                              "kind": "human-gated" if not od_ref else "owner-decided-park",
+                              "deliberate": bool(od_ref), "priority": g.get("priority") or "",
+                              "owner_decision_ref": od_ref,
                               "new": bool(created and since and created >= since)})
     needs.sort(key=lambda x: -(x["age_h"] or 0))
 
@@ -374,7 +414,10 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
 
     return {"done": done, "batches": batches, "recurring": recurring, "needs": needs, "pqs": pqs, "blocked": blocked,
             "blocked_total": blocked_total, "by_cause": by_cause, "active_asps": active_asps, "hyp": hyp,
-            "pulse": pulse, "outcome": outcome, "cost": cost, "coverage": coverage}
+            "pulse": pulse, "outcome": outcome, "cost": cost, "coverage": coverage,
+            # Degraded-mode visibility, not a renderer input: presence in the
+            # structured output is what makes a dead exemption auditable.
+            "owner_decided_predicate_loaded": _OWNER_DECIDED_LOADED}
 
 
 COST_SLOT = "scripts/digest-cost.sh"

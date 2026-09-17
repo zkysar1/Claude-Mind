@@ -234,6 +234,13 @@ GATE_ROWS = (
     "verify-before-assuming-gate-trigger",
     "zero-count-gate-trigger",
     "positive-state-gate-trigger",
+    # V-6, added 2026-09-13. It was registered in SIGNALS on 2026-09-13 and NOT added
+    # here, so every tuple-driven test below silently skipped it — see
+    # test_every_registry_row_is_covered_by_exactly_one_test_family for the guard that
+    # now makes that omission loud. It fits this family rather than the hook one because
+    # capability-gate.py is rc-shaped: measured rc=1 with a populated `matches` on a
+    # must-block reason, rc=0 with `matches: []` on a genuinely-human one.
+    "capability-gate-trigger",
 )
 
 
@@ -389,6 +396,142 @@ def test_gate_row_unevaluatable_when_the_probe_raises(monkeypatch):
         dead, detail = _row(name)["assertion"]()
         assert dead is None and "could not run" in detail
 
+
+# ---- V-5 + V-7: the hook-shaped pair, and the factory they share --------------
+# THESE TWO ROWS HAD ZERO TESTS IN EITHER DIRECTION until 2026-09-13, and the way
+# that was measured is the point: greping the registry names against this file gave
+# 1 hit each for the four GATE_ROWS names and 0 for marker-placement-gate-deny-channel
+# and capability-gate-trigger, with the four hits serving as the positive control that
+# the grep discriminates. So the fleet's detector for always-reports-clear instruments
+# had 2 of its 9 rows with no positive control — an instance of its own class. V-6 is
+# now in GATE_ROWS and the pair below covers the hook shape.
+#
+# The injector is SEPARATE from _inject on purpose: the hook factory calls _probe with
+# a stdin_text KEYWORD, so _inject's one-positional lambda raises TypeError against it
+# — which would read as a test failure about the factory rather than about the stub.
+
+HOOK_GATE_ROWS = (
+    "marker-placement-gate-deny-channel",
+    "schedule-wakeup-gate-deny-channel",
+)
+
+# Rows with their own named tests above rather than a tuple-driven family.
+SELF_TESTED_ROWS = (
+    "agent-watchdog-tick",
+    "aspirations-query-read-channel",
+    "aspirations-query-refusal-channel",
+)
+
+_DENY_JSON = '{"hookSpecificOutput": {"hookEventName": "PreToolUse", ' \
+             '"permissionDecision": "deny", "permissionDecisionReason": "no"}}'
+
+
+def _inject_hook(monkeypatch, rc, out, err):
+    monkeypatch.setattr(canary, "_probe",
+                        lambda argv, stdin_text=None: (rc, out, err), raising=True)
+
+
+def test_every_registry_row_is_covered_by_exactly_one_test_family():
+    """THE DRIFT GUARD, and the reason it exists is measured rather than imagined.
+
+    capability-gate-trigger (V-6) was added to SIGNALS without being added to
+    GATE_ROWS, so every tuple-driven test silently skipped it and nothing said so —
+    a row with no positive control inside the instrument whose whole job is finding
+    signals that cannot report non-clear. This assertion makes the next such omission
+    fail at test time instead of never firing in production.
+    """
+    registered = {s["name"] for s in canary.SIGNALS}
+    covered = set(GATE_ROWS) | set(HOOK_GATE_ROWS) | set(SELF_TESTED_ROWS)
+    assert registered == covered, (
+        "every SIGNALS row must sit in exactly one test family. "
+        f"uncovered={sorted(registered - covered)} "
+        f"named-but-unregistered={sorted(covered - registered)}"
+    )
+    assert not (set(GATE_ROWS) & set(HOOK_GATE_ROWS)), (
+        "a row cannot be both rc-shaped and stdout-shaped — the two families assert "
+        "opposite things about rc"
+    )
+
+
+def test_hook_gate_rows_are_live_against_the_real_gates():
+    """No injection: drive both real hook gates with their real must-deny payloads.
+
+    The plumbing half of the pair — path, interpreter, stdin shape, payload keys.
+    """
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is False, f"{name} is not live: {detail}"
+        assert "still denies" in detail
+
+
+def test_hook_gate_row_dead_on_empty_stdout_at_rc_zero(monkeypatch):
+    """POSITIVE CONTROL, the load-bearing direction: rc=0 with no stdout is exactly
+    what an APPROVING hook emits, so a gate that has stopped denying is
+    indistinguishable from a healthy one by rc alone."""
+    _inject_hook(monkeypatch, 0, "", "")
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is True, f"{name}: {detail}"
+        assert "stdout was EMPTY" in detail
+
+
+def test_hook_gate_row_dead_on_a_non_deny_decision(monkeypatch):
+    """The other DEAD shape: the hook still speaks the JSON contract but now says
+    allow. Distinct from empty stdout, and it must not be mistaken for a parse error."""
+    _inject_hook(monkeypatch, 0,
+                 '{"hookSpecificOutput": {"permissionDecision": "allow"}}', "")
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is True, f"{name}: {detail}"
+        assert "decision='allow'" in detail
+
+
+def test_hook_gate_row_live_when_the_decision_is_deny(monkeypatch):
+    """The injected ALIVE direction, so the two stubs are proven to discriminate
+    rather than the row being read as live by accident of the real gate's health."""
+    _inject_hook(monkeypatch, 0, _DENY_JSON, "")
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is False, f"{name}: {detail}"
+
+
+def test_hook_gate_row_nonzero_rc_is_unevaluatable_not_dead(monkeypatch):
+    """The PreToolUse contract is exit 0 always, so a non-zero rc means the hook
+    CRASHED. A crash is a real defect but not THIS row's defect; naming it DEAD would
+    send the remedy reader to the wrong file."""
+    _inject_hook(monkeypatch, 1, "", "Traceback ...")
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is None, f"{name}: {detail}"
+        assert "rc=1" in detail and "exit 0 always" in detail
+
+
+def test_hook_gate_row_unparseable_stdout_is_unevaluatable_not_dead(monkeypatch):
+    """The narrowing this factory introduced over the plain function it replaced,
+    pinned so it cannot be quietly reverted: off-contract stdout says NOTHING about
+    whether the gate would deny, so it is unevaluatable, not an approval."""
+    _inject_hook(monkeypatch, 0, "not json at all", "")
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is None, f"{name}: {detail}"
+        assert "not the PreToolUse JSON contract" in detail
+
+
+def test_hook_gate_row_absent_script_is_unevaluatable_not_dead(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=False)
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is None, f"{name}: {detail}"
+        assert "absent at" in detail
+
+
+def test_hook_gate_row_unevaluatable_when_the_probe_raises(monkeypatch):
+    def _boom(argv, stdin_text=None):
+        raise OSError("interpreter vanished")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    for name in HOOK_GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is None and "could not run" in detail
 
 # ---- the two inventory members deliberately NOT registered -------------------
 

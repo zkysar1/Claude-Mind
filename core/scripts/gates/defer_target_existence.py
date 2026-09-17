@@ -110,9 +110,14 @@ def sources_for(world_dir, agents_root) -> List[Path]:
 
 def known_goal_ids(sources: Iterable[Path]) -> Set[str]:
     """Every declared goal id across `sources`. Unreadable files are skipped."""
+    from _fresh_read import refresh_for_read
     known: Set[str] = set()
     for p in sources or []:
         try:
+            if Path(p).name.endswith("-archive.jsonl"):
+                # The eager pull never re-pulls an archive; a stale copy would
+                # report an archived dependency as a phantom ().
+                refresh_for_read(Path(p), label="defer-target-existence")
             if not Path(p).exists():
                 continue
             with open(p, encoding="utf-8") as fh:

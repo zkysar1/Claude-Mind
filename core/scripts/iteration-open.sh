@@ -16,6 +16,9 @@
 #                entry gate that can refuse entry is worse than the drift it
 #                corrects. A wrapper-level failure still prints a structured
 #                line (guard-614) naming the fallback.
+#                ONE EXCEPTION, exit 4: a stage was dispatched and never returned
+#                (). That refuses nothing -- no caller branches on it to
+#                stop -- it is what keeps a half-run from reading as rc=0 success.
 #   --dry-run  — PRESERVE the rc. This mode is a VERIFICATION check (it asserts
 #                the lane count matches the tier table), and a check that always
 #                exits 0 can never fail — the exact defect found in ,
@@ -77,6 +80,12 @@ for _a in "$@"; do [ "$_a" = "--dry-run" ] && _DRY=1; done
 # mid-run death LOUD instead of pretending to cure it (guard-4093 / guard-1715 — a quiet run is not
 # a clean one). Capture costs no interactivity: this is a ~2 KB batch report and
 # python block-buffers to a pipe regardless.
+# : the .py writes the stage in flight to this file and clears it when
+# the stage returns (_mark_in_flight). Read back only AFTER the process exits, so
+# it reports what the program did, not what a caller's capture happened to keep.
+# Empty path (mktemp unavailable) = the check is not armed, and nothing is claimed.
+_MARK="$(mktemp 2>/dev/null)" || _MARK=""
+export ITERATION_OPEN_STAGE_MARKER="$_MARK"
 _OUT="$(mktemp 2>/dev/null)" || _OUT=""
 if [ -n "$_OUT" ]; then
     python3 "$_SELF/iteration-open.py" "$@" > "$_OUT"
@@ -91,6 +100,11 @@ else
     python3 "$_SELF/iteration-open.py" "$@"
     _rc=$?
     _bytes=-1
+fi
+_unfinished=""
+if [ -n "$_MARK" ]; then
+    _unfinished="$(cat "$_MARK" 2>/dev/null)"
+    rm -f "$_MARK"
 fi
 
 if [ "$_DRY" = "1" ]; then
@@ -117,4 +131,8 @@ if [ "$_DRY" = "1" ]; then
 fi
 [ "$_rc" -ne 0 ] && echo "[iteration-open] wrapper_failed — fall back to the batteries directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
 [ "$_bytes" = "0" ] && echo "[iteration-open] SILENT RUN — ZERO bytes of output at rc=$_rc. This is NOT an all-clear: iteration-open.py always prints a STAGE table, so no output means the report was never emitted. Treat the always-run stage as BLIND and run the fallbacks directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
+if [ -n "$_unfinished" ]; then
+    echo "[iteration-open] STAGE UNFINISHED -- '$_unfinished' was dispatched and never returned (python rc=$_rc). '$_unfinished' and every stage after it are BLIND: this run is PARTIAL, not clean. Run the fallbacks from that stage on, skipping any lane precheck-budget-state.json already records as executed -- a stage that dies mid-run can leave lanes that already applied (guard-6634). Exiting 4."
+    exit 4
+fi
 exit 0

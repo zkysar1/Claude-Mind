@@ -290,8 +290,12 @@ class _NotFound(Exception):
 
 
 class _FakeSrcS3:
-    def __init__(self, listing: list[dict], bodies: dict[str, bytes]):
+    def __init__(self, listing: list[dict], bodies: dict[str, bytes],
+                 attrs: dict[str, dict] | None = None):
         self.listing, self.bodies = listing, bodies
+        # key -> extra GET-response fields (ContentEncoding / Metadata), as the
+        # real GET carries them. Default empty: an object with neither.
+        self.attrs = attrs or {}
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -303,20 +307,25 @@ class _FakeSrcS3:
         return _P()
 
     def get_object(self, Bucket, Key):  # noqa: N803
-        return {"Body": io.BytesIO(self.bodies[Key])}
+        return {"Body": io.BytesIO(self.bodies[Key]), **self.attrs.get(Key, {})}
 
 
 class _FakeDstS3:
     def __init__(self, heads: dict[str, dict]):
         self.heads, self.uploads = heads, []
+        # key -> the ExtraArgs the tool passed (None when it passed none). This
+        # is the only surface on which the carry is observable: the copy reports
+        # success either way ().
+        self.upload_extra: dict[str, dict | None] = {}
 
     def head_object(self, Bucket, Key):  # noqa: N803
         if Key not in self.heads:
             raise _NotFound()
         return self.heads[Key]
 
-    def upload_fileobj(self, body, bucket, key):
+    def upload_fileobj(self, body, bucket, key, ExtraArgs=None):  # noqa: N803
         self.uploads.append(key)
+        self.upload_extra[key] = ExtraArgs
         body.read()
 
 
@@ -351,3 +360,54 @@ def test_copy_skip_rule_recopies_a_same_size_multipart_rewrite(tmp_path, monkeyp
     assert rc == 0
     assert sorted(dst.uploads) == ["p/new", "p/rewritten"]
     assert (rep["scanned"], rep["copied"], rep["skipped_already_present"], rep["failed"]) == (4, 2, 2, 0)
+
+
+def test_copy_carries_content_encoding_and_metadata_to_the_destination(
+        tmp_path, monkeypatch, capsys, mod):
+    """The copy must forward the source's ContentEncoding and user Metadata.
+
+    ``upload_fileobj`` sends the BODY and nothing else, so before g-372-21 a
+    gzip-encoded object landed at the destination with no ``ContentEncoding:
+    gzip`` -- every later reader got compressed bytes it did not know to
+    decompress -- and the plain-md5 sidecar the integrity checks compare against
+    was absent (rb-10944: a post-codec size mismatch on a copy diff IS this, not
+    corruption). Measured in the 2026-09-14 cutover window.
+
+    It is silent in both directions: the copy reports ``copied`` and the object
+    is present either way, so the assertion has to be on the ARGUMENTS reaching
+    the destination call -- never on the copy's own verdict.
+
+    guard-919: these fakes stand in for boto3. This pins what the tool PASSES;
+    it is not evidence about a real endpoint's behaviour.
+    """
+    listing = [
+        {"Key": "p/gz", "Size": 4, "ETag": '"' + _md5(b"gzip") + '"', "LastModified": _T0},
+        {"Key": "p/plain", "Size": 5, "ETag": '"' + _md5(b"plain") + '"', "LastModified": _T0},
+    ]
+    src = _FakeSrcS3(
+        listing,
+        {"p/gz": b"gzip", "p/plain": b"plain"},
+        attrs={"p/gz": {"ContentEncoding": "gzip",
+                        "Metadata": {"plain-md5": _md5(b"the plaintext")}}},
+    )
+    dst = _FakeDstS3({})          # nothing at the destination -> both copy
+
+    def fake_build(bucket, region):
+        return _FakeBackend(dst if os.environ.get("STORAGE_S3_ENDPOINT_URL") == DEST_URL else src)
+    monkeypatch.setattr(mod, "_build_backend", fake_build)
+    monkeypatch.setattr(sys, "argv", ["owncloud-store-enumerate.py", "copy", "--bucket", "b",
+                                      "--dest-endpoint", DEST_URL, "--prefix", "p/", "--workers", "2",
+                                      "--progress-every", "0"])
+    monkeypatch.delenv("STORAGE_S3_ENDPOINT_URL", raising=False)
+    rc = mod.main()
+    rep = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert (rep["scanned"], rep["copied"], rep["failed"]) == (2, 2, 0)
+    assert dst.upload_extra["p/gz"] == {
+        "ContentEncoding": "gzip",
+        "Metadata": {"plain-md5": _md5(b"the plaintext")},
+    }
+    # The other branch: an object carrying neither must not be given an empty
+    # Metadata map it did not have. Without this arm a fix that always passes
+    # ``ExtraArgs={...}`` would satisfy the assertion above.
+    assert dst.upload_extra["p/plain"] is None

@@ -1291,6 +1291,14 @@ echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
 # pre-deadman imperative). See aspirations/SKILL.md Return Protocol +
 # core/config/rationale/deadman-switch.md.
 #
+# The tool names in the imperative come from the harness vocabulary
+# (_harness_vocab.sh, 2026-09-17): a zakcode vessel reads use_skill(...) and
+# schedule_wakeup(...), the names in ITS tool list; Claude Code reads the
+# byte-identical lines it always did (pinned by
+# test_recurring_close_failure_imperative.py, which sources this same helper
+# around the extracted block).
+source "$SCRIPT_DIR/_harness_vocab.sh"
+#
 # The proceed text is COMPUTED ONCE into _next_action and then either printed
 # on its own (clean close) or folded in as the LAST step of the repair sequence
 # (failed close). Deliberately not duplicated across the two paths: a second
@@ -1300,15 +1308,15 @@ echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
 if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
     _dm_tag=""
     if [[ "$OUTCOME" == "deep" ]]; then
-        _next_action="Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN Skill(aspirations) with args='loop'."
+        _next_action="Call $HC_SPARK_REF FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN $HC_LOOP_CALL."
     else
-        _next_action="Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+        _next_action="Call $HC_LOOP_CALL as your VERY NEXT tool call."
     fi
 else
     _dm_tag=" (deadman-switch ON)"
-    _dm_pair="emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600), the self-resurrection net, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' (the LAST call). Skill ALONE keeps THIS iteration alive but leaves the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
+    _dm_pair="emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) — (1) $HC_DEADMAN_ARM, the self-resurrection net, do NOT omit it; THEN (2) $HC_LOOP_CALL (the LAST call). $HC_SKILL_TOOL ALONE keeps THIS iteration alive but leaves the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
     if [[ "$OUTCOME" == "deep" ]]; then
-        _next_action="Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN ${_dm_pair}."
+        _next_action="Call $HC_SPARK_REF FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN ${_dm_pair}."
     else
         _next_action="${_dm_pair}."
     fi

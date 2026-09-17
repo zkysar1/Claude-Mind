@@ -35,4 +35,12 @@ case " $* " in
     *) SID_ARGS=(--sid "${MIND_SID:-}") ;;
 esac
 
-exec python3 "$SCRIPT_DIR/gs1_ownership.py" "${SID_ARGS[@]}" "$@"
+#  fix: under Git Bash on Windows, $(cd ... && pwd) returns POSIX
+# form /c/... that Windows python3 misreads as C:\c\... Convert to the
+# native form before exec; Linux/macOS lack cygpath and fall through.
+if command -v cygpath >/dev/null 2>&1; then
+    SCRIPT_DIR_NATIVE="$(cygpath -w "$SCRIPT_DIR")"
+else
+    SCRIPT_DIR_NATIVE="$SCRIPT_DIR"
+fi
+exec python3 "$SCRIPT_DIR_NATIVE/gs1_ownership.py" "${SID_ARGS[@]}" "$@"

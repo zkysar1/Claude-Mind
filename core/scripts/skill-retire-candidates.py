@@ -49,6 +49,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 from _paths import PROJECT_ROOT, WORLD_DIR, META_DIR, agents_root  # noqa: E402
+from _fresh_read import read_text_authoritative  # noqa: E402
 import _skill_md  # noqa: E402
 
 try:
@@ -147,7 +148,11 @@ def enumerate_skills():
 
 def load_invocation_counts(cutoff):
     """Count Skill-tool invocations per skill name at/after cutoff, across all
-    agents' skill-invocations.jsonl ledgers. Returns {skill_name: count}."""
+    agents' skill-invocations.jsonl ledgers. Returns {skill_name: count}.
+
+    Reads each ledger from the STORE, not the local mirror (g-358-140): a peer's
+    mirror can sit short of the store with no refresh able to move it, and a
+    short count puts a live skill on the retirement slate."""
     counts = {}
     try:
         ledgers = sorted(agents_root().glob("*/skill-invocations.jsonl"))
@@ -155,21 +160,21 @@ def load_invocation_counts(cutoff):
         ledgers = []
     for ledger in ledgers:
         try:
-            with ledger.open(encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except Exception:
-                        continue
-                    name = rec.get("skill")
-                    ts = _parse_ts(rec.get("ts") or rec.get("timestamp") or rec.get("date"))
-                    if not name or ts is None:
-                        continue
-                    if ts >= cutoff:
-                        counts[name] = counts.get(name, 0) + 1
+            text = read_text_authoritative(ledger, label="skill-retire-candidates")
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                name = rec.get("skill")
+                ts = _parse_ts(rec.get("ts") or rec.get("timestamp") or rec.get("date"))
+                if not name or ts is None:
+                    continue
+                if ts >= cutoff:
+                    counts[name] = counts.get(name, 0) + 1
         except Exception:
             continue
     return counts

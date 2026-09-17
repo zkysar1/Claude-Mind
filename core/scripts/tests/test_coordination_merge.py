@@ -1078,13 +1078,17 @@ def test_torn_tolerance_does_not_leak_to_id_keyed_handlers():
 def test_handler_registration_board_and_override_g115_2006():
     # The non-default board channels + the Phase 4 bulk-override ledger are
     # shared append-only stores that were unregistered and wedged on
-    # both-diverged. They MUST now route to merge_append_only_jsonl. Dispatch is
-    # by BASENAME, so the leading board/ path segment is irrelevant.
-    for path in ["board/reasoning.jsonl", "board/directives.jsonl",
-                 "board/events.jsonl", "board/feedback.jsonl",
-                 "override-bypass-ledger.jsonl"]:
+    # both-diverged. They MUST route to a line-union handler. Under board/ that
+    # is the rotation-aware variant since  (merge_handler_for branch 10);
+    # the basename registration it keys on is unchanged.
+    for path in ["reasoning.jsonl", "directives.jsonl", "events.jsonl",
+                 "feedback.jsonl", "override-bypass-ledger.jsonl"]:
         assert cm.merge_handler_for(path) is cm.merge_append_only_jsonl, \
             f"{path} not registered to the append-only handler"
+    for path in ["board/reasoning.jsonl", "board/directives.jsonl",
+                 "board/events.jsonl", "board/feedback.jsonl"]:
+        assert cm.merge_handler_for(path) is cm.merge_rotated_board_jsonl, \
+            f"{path} not routed to the rotation-aware board handler"
 
 
 def test_handler_registration_excludes_pruned_stores_g115_2006():
@@ -1828,8 +1832,9 @@ def test_handler_registry_append_only_basenames():
                  "unblock-parent-status-sweep-metrics.jsonl",
                  "routing-audit-target-status-sweep-metrics.jsonl"):
         assert cm.merge_handler_for(f"world/{base}") is cm.merge_append_only_jsonl, base
-    # basename resolution ignores the directory (board channels live under board/)
-    assert cm.merge_handler_for("world/board/coordination.jsonl") is cm.merge_append_only_jsonl
+    # under board/ the same registration resolves to the rotation-aware variant
+    # (merge_handler_for branch 10, )
+    assert cm.merge_handler_for("world/board/coordination.jsonl") is cm.merge_rotated_board_jsonl
     assert cm.merge_handler_for("meta/gate-firings.jsonl") is cm.merge_append_only_jsonl
 
 

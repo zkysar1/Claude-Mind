@@ -1006,3 +1006,49 @@ if __name__ == "__main__":
     test_g1151426_audit_silent_when_all_neutral_attributed()
     test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit()
     print("All 16 concurrent-partner tests passed (7 g-115-692 + 3 g-115-828 + 1 g-115-1413 + 1 g-115-697/914 + 1 g-115-1620 + 2 g-115-1426 + 1 g-115-1498).")
+
+
+def test_g11510015_new_untracked_directory_is_exempted_by_member_file_authorship():
+    """: git reports a NEW UNTRACKED DIRECTORY as the DIRECTORY
+    (`?? a/b/c/`), never as its members, while uncommitted-edits.jsonl records
+    FILES. The exemption was an EXACT associative-array key lookup, so the two
+    sides could never meet and a first-person-authored new directory was
+    dropped from the committer's own commit (measured 2026-09-15, echo/cc-03,
+    on g-369-345's own deliverable — the goal's deliverable was the casualty).
+
+    The fixture is a NEW DIRECTORY, not a new file: that is the whole point,
+    and a file-shaped fixture passes against the unfixed code.
+    """
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit_multi(tmp, {
+            "alpha": "2026-05-13T09:00:00",
+            "zeta": "2026-05-13T09:17:00",
+        })
+        edit_epoch = _iso_to_epoch("2026-05-13T09:20:00")
+
+        # A NEW untracked DIRECTORY whose member file alpha authored.
+        newdir = repo / "core" / "scripts" / "g10015-newdir"
+        newdir.mkdir(parents=True, exist_ok=True)
+        member = newdir / "MEMBER.md"
+        member.write_text("# alpha's own new-directory deliverable\n")
+        os.utime(member, (edit_epoch, edit_epoch))
+        os.utime(newdir, (edit_epoch, edit_epoch))
+
+        # The own-log records the FILE, exactly as uncommitted-edits-record.sh does.
+        _seed_own_uncommitted_log(
+            repo, "alpha", ["core/scripts/g10015-newdir/MEMBER.md"]
+        )
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-10015-01", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+
+        assert "filtered (concurrent-partner): core/scripts/g10015-newdir" not in combined, \
+            ("A new untracked directory whose member file the committer authored was "
+             f"DROPPED from its own commit. combined={combined!r}")

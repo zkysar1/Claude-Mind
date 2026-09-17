@@ -298,6 +298,48 @@ def _restore_env_per_test():
 
 
 @pytest.fixture(autouse=True)
+def _scrub_daemon_client_env():
+    """Clear MIND_API_TOKEN / MIND_API_BIND / MIND_API_PORT before every test
+    (g-115-10006).
+
+    THE DEFECT THIS REMOVES. `mind_api/src/server.py` reads MIND_API_TOKEN from
+    os.environ on EVERY request and refuses anything without a matching
+    `Authorization: Bearer` header, before any handler runs. The in-process
+    fixture daemons start inside the pytest process and so inherit whatever the
+    launching shell exported, while the test clients (urllib POSTs, wrapper
+    subprocesses) send no header at all. On a box whose shell carries the
+    variable, every fixture-backed test therefore fails 401 upstream of the code
+    under test. Measured on cc-03 2026-09-15: a scoped-suite run reported 432
+    failures with 1130 `missing or invalid bearer token` lines; the identical
+    selection under `env -u MIND_API_TOKEN -u MIND_API_BIND -u MIND_API_PORT`
+    failed 8 times with ZERO bearer lines, and 7 of those 8 were pre-existing
+    reds. The suite was not broken — it was unauthenticated.
+
+    WHY POP RATHER THAN SNAPSHOT-AND-RESTORE, unlike its siblings above. Those
+    fixtures protect a value tests are ENTITLED to see; this one removes an
+    ambient credential the test process must never hold. Restoring it between
+    tests would re-open the window for any fixture daemon that starts there, so
+    the scrub is one-way for the life of the process. Nothing is lost: pytest
+    exits with the shell's own environment untouched.
+
+    COMPATIBLE WITH THE TESTS THAT DO EXERCISE BEARER AUTH. They set the
+    variable themselves inside the test body (monkeypatch.setenv), which runs
+    AFTER this fixture, so their value stands. That is the contract the
+    regression test in test_conftest_daemon_env_scrub.py pins from both sides.
+
+    Sibling scrubs already exist one layer out — test_daemon_start_env_scrub.py
+    (daemon start) and test_runtime_spawn_env_scrub.py (runtime spawn). This is
+    the same defence for the TEST PROCESS itself, which neither of those covers.
+    Duplicated verbatim in mind_api/tests/conftest.py: the two test packages
+    load independently and neither imports the other's conftest, so a shared
+    helper would need a third importable home for three lines of pops.
+    """
+    for _var in ("MIND_API_TOKEN", "MIND_API_BIND", "MIND_API_PORT"):
+        os.environ.pop(_var, None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _redirect_sweep_stats_sink(tmp_path_factory):
     """Redirect the owncloud_sync sweep-telemetry sink away from the REAL
     core/logs/owncloud-sweep-stats.jsonl for every test (g-115-2468).

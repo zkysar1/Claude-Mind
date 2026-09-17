@@ -123,7 +123,12 @@ def load_board_ids(world: Path) -> set[str]:
     board = world / "board"
     if not board.is_dir():
         return ids
+    from _fresh_read import refresh_for_read
     for f in sorted(board.glob("*.jsonl")):
+        if f.name.endswith("-archive.jsonl"):
+            # The eager pull never re-pulls an archive; a stale copy makes a
+            # citation to an archived post read DANGLING (g-358-130).
+            refresh_for_read(f, label="board-citation-check")
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:

@@ -194,6 +194,10 @@ def count_agent_completions(world_dir: Path, agent_dir: Path, agent_name: str) -
     behaviour caused. Measured on cc-08 2026-08-26: 2,372 completed goals in the
     archive against 555 live -- a live-only count sees 19% of the history.
     """
+    # The eager pull never re-pulls an archive, so refresh before counting
+    # ().
+    from _fresh_read import refresh_for_read
+    refresh_for_read(world_dir / "aspirations-archive.jsonl", label="competence")
     return (
         count_completed_goals_by(world_dir / "aspirations.jsonl", agent_name)
         + count_completed_goals_by(world_dir / "aspirations-archive.jsonl", agent_name)

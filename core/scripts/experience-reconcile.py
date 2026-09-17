@@ -159,6 +159,7 @@ def load_goal_index() -> dict:
     for goals that exist but lack their own `category` field (e.g., some
     asp-001 recurring goals).
     """
+    from _fresh_read import refresh_for_read
     queues = []
     agents = discover_agents()
     for agent in agents:
@@ -166,6 +167,8 @@ def load_goal_index() -> dict:
         if p.exists():
             queues.append(p)
         p = _agent_dir(agent) / "aspirations-archive.jsonl"
+        # The eager pull never re-pulls an archive ().
+        refresh_for_read(p, label="experience-reconcile")
         if p.exists():
             queues.append(p)
     for agent in agents:
@@ -178,6 +181,8 @@ def load_goal_index() -> dict:
                 world_root = Path(line.split("=", 1)[1].strip().strip('"'))
                 for fname in ("aspirations.jsonl", "aspirations-archive.jsonl"):
                     wp = world_root / fname
+                    if fname == "aspirations-archive.jsonl" and wp not in queues:
+                        refresh_for_read(wp, label="experience-reconcile")
                     if wp.exists() and wp not in queues:
                         queues.append(wp)
                 break

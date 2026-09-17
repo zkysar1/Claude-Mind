@@ -71,6 +71,71 @@ local tag, and a fleet box carries many that are not releases: measured 2026-09-
 sole tag creator and never pushes; an untracked file (an agent health ledger, a
 scratch note) counts as DIRTY to its dry-run — commit it as a `chore:` first.
 
+### Who cuts, and WHEN (g-373-82, decided 2026-09-15 — this was previously unowned)
+
+**WHO: the fleet. Any agent. This is not a human-reserved step.** `release.sh`'s
+own header says "the human decides when to `git push origin main --tags`" — that
+sentence is a **stale reservation** and must not be read as a live gate. It
+predates `grant-014` (2026-08-27, *"i approeve everytbing this fleet recomends.
+lets ship fast and break things!"*) and is contradicted by `grant-001`
+(2026-04-20, **commit + push, all repos, all branches**, *"go ahead with commit
+and push, don't have to ask me"*) — a tag push IS a push — and by Phase 2 above,
+which already hands `git push origin main vX.Y.Z` to the agent running the
+promotion. None of grant-014's surviving carve-outs (credentials the agent does
+not hold, legal attestations, physical/new-resource actions, IAM **user**-policy
+changes, the constitutional anchor, net-new recurring spend) covers cutting a
+tag. **Retired as valid `defer_reason` / blocker texts:** "release.sh reserves
+the push to a human"; "waiting for the human to cut a dev tag"; "blocked on a
+routine release"; "clears on the next routine release with no intervention".
+
+This is a RULE-axis reclaim (`.claude/rules/reclaim-routed-work.md`): the
+premise — that the header sentence exists — stayed true and was re-probed
+correctly on a cadence, while the standing grant that retired it as a *reason*
+went unread. Re-probing the tag state can never free work frozen this way.
+
+**WHEN — two triggers, either one fires:**
+
+1. **Demand-pull (primary).** A goal's verification needs a seed carrying a
+   specific dev commit. Cut as soon as that commit is on `origin/main`. This is
+   the trigger that matters: measured tag → Claude-Mind → `publish-mind-seed` →
+   S3 → vessel latency is **~13.4h end to end**, so the cut is the long pole in
+   front of every downstream measurement.
+2. **Time-push (the staleness cutoff).** **A gap of `>= 24h` since the newest
+   `v*` tag, with one or more commits on `main` past it, is a FINDING** — not an
+   automatic cut, but a state someone must dispose of rather than pass over.
+
+**Why 24h, and what it is NOT.** Over all 71 inter-tag gaps of the v2.12 series
+(v2.12.0 2026-08-23T02:56Z → v2.12.71 2026-09-13T21:09Z, measured 2026-09-15 on
+cc-04): median **0.81h**, p75 3.31h, p90 13.78h, p95 55.54h, max 97.01h. The
+distribution is strongly **bimodal** — a dense burst cluster of sub-hour cuts
+(v2.12.70 → v2.12.71 is 0.07h) and a thin multi-day tail. So the median is a
+property of the bursts and **a median-keyed threshold would fire almost always**
+(`guard-5202`: a cadence nothing meets trains its reader to skip the alarm).
+24h sits at ~1.7x p90: 64 of 71 gaps (90.1%) fall under it, and every one of the
+7 genuine stalls (13.78 / 31.81 / 38.06 / 46.20 / 64.89 / 69.60 / 97.01h) is
+above it. Note 18h and 24h select the **same 7 gaps** — nothing in the series
+lands between them — so the choice inside that band costs nothing in
+sensitivity, which is the honest reason for taking the rounder number.
+It bounds worst-case merge→vessel at ~24 + 13.4 ≈ **37.4h**.
+
+**24h is a JUDGMENT, not a measurement** (`guard-5202` clause c — do not set
+declared = measured, that is a rubber stamp). What would refine it: a
+measurement of what a merged dev commit actually COSTS while it cannot be
+observed downstream. That cost is unmeasured today; only the 13.4h pipeline
+latency is measured. Until it is, do not ratchet this number down on a single
+stall.
+
+State it as the cutoff `>= 24h`, never as an interval — a sampled point below a
+quoted `lo` is not a lower bound, and writing one manufactures a phantom that
+ratchets upward once per reader (`guard-5724`).
+
+**Correcting the basis on record.** `g-373-82` was filed citing "median 3.08h,
+8 of 11 gaps under 10h". That is the last **11** gaps only; over the full 71 the
+median is 0.81h and 63 of 71 are under 10h. The filing's instruction — key to
+the median, not to the outlier-dominated 0.08–70h range — was right to reject
+the range and wrong about the median. Both halves of the distribution are needed
+and neither alone gives a usable threshold.
+
 ## Phase 3 — Hop: promote one step down
 
 **Worktree-at-tag method (required on an active frontier).** The fleet moves

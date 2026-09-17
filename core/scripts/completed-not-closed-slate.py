@@ -128,7 +128,7 @@ _NOTE_HEAD_CHARS = 240
 # Named because it is now read in three places (holder_of, the undrainable
 # sub-count in build_slate, and the render line that explains it).
 _UNATTRIBUTED = "(unattributed)"
-_GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,4}\b")
+_GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,5}\b")
 
 
 def _load_config() -> Dict[str, Any]:

@@ -80,7 +80,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
 # Matches the framework's goal-id format (2-4 digit tail per CLAUDE.md "ID Formats").
-GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,4}\b")
+GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,5}\b")
 SILENCE_HOURS = 48
 
 

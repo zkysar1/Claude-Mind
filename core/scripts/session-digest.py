@@ -45,6 +45,11 @@ try:
 except Exception:  # pragma: no cover - only on a broken env
     yaml = None
 
+try:
+    from _board_paths import channel_paths, read_paths  # reader seam, 
+except Exception:  # pragma: no cover - degrades the board section to its error stub
+    channel_paths = read_paths = None
+
 _OPEN_STATUSES = {"pending", "in-progress"}
 
 
@@ -213,7 +218,12 @@ def section_board(world_path, now, since_hours, max_items):
     for ch in ("coordination", "findings"):
         items = []
         if world_path:
-            for o in _load_jsonl(Path(world_path) / "board" / f"{ch}.jsonl"):
+            # Every file of the channel's live half, through the reader seam
+            # (): a segmented writer appends to <channel>-<date>.jsonl.
+            # Display only, so a path read_paths reports missing is not surfaced.
+            records, _missing = read_paths(channel_paths(
+                Path(world_path) / "board", ch, include_archive=False))
+            for o in records:
                 dt = _parse_ts(o.get("timestamp"))
                 if dt is None or dt < cutoff:
                     continue

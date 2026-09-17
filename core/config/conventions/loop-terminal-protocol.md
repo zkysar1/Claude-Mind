@@ -106,6 +106,38 @@ does NOT re-enter after ScheduleWakeup, the worst case is a SLOW loop
 self-arming — NOT a dead loop. The change cannot make survival worse than
 the status quo.
 
+### 4.1 The imperative is spelled in the VESSEL's tool names (2026-09-17)
+
+Every terminal imperative above -- the stop hook's BLOCK reason, `ITERATION
+COMPLETE` (iteration-close, recurring-close), the state-mismatch landing and
+the PostToolUse reminder -- was written in Claude Code's vocabulary:
+`Skill(aspirations) with args='loop'`, `ScheduleWakeup(prompt=...,
+delaySeconds=600)`. Promoted unchanged to a Mind whose vessel is zakcode, those
+lines name tools the model's tool list does not show (its tools are
+`use_skill(name, args)` and `schedule_wakeup(prompt, delaySeconds)`). Measured
+on a downstream vessel running a small model: it answered the imperative in
+PROSE ("Verdict: ... loop resurrected"), the stop hook BLOCKed in the same
+foreign names, and the two spun for hours.
+
+The spelling now has ONE owner, `core/scripts/_harness_caps.py`
+(`skill_call`, `skill_ref`, `wakeup_call`, `hook_wakeup`, `loop_vocab`), keyed
+on the same env markers as every other harness capability (`CLAUDECODE` ->
+claude-code; `ZAKCODE_MODEL` / `ZAKCODE_SESSION` -> zakcode; else unknown,
+which keeps Claude Code's spelling -- a vessel is never guessed). Shell sites
+`source core/scripts/_harness_vocab.sh` and interpolate `$HC_LOOP_CALL`,
+`$HC_DEADMAN_ARM`, `$HC_SPARK_REF`, `$HC_LOOP_REF` ...; Python sites import
+the module. Contract: on Claude Code every line is BYTE-IDENTICAL to what it
+was (pinned by `test_recurring_close_failure_imperative.py`,
+`test_stop_hook_vessel_vocabulary.py`, `test_harness_caps.py`), and the
+helper fails open to that spelling when the resolver cannot run. On zakcode
+the stop hook's BLOCK payload also carries `"wakeup": {"prompt":
+"<<autonomous-loop-dynamic>>", "delay_seconds": 600}` so the harness arms the
+deadman net itself before it reads the veto (Zak-Code ADR-0102) -- the
+re-arm-first rule of §4 made mechanical -- and the vessel's turn-end seam
+delivers a hook-named skill without asking the model (Zak-Code ADR-0187).
+The text layer still matters: a vessel on an older build acts on what it
+reads, and a model acts on a name it can see in its own tool list.
+
 ## 5. Origin of the slash-prefix rule (2026-05-18)
 
 Discovered 2026-05-18 from zeta session f1f3066e: four consecutive

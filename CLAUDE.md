@@ -306,7 +306,7 @@ guardrails, reasoning bank, knowledge tree, forged skills (`world/forged-skills.
 - ISO 8601 dates everywhere. Timestamps: naive format (no zone suffix) via `$(date +%Y-%m-%dT%H:%M:%S)`, in **UTC wall time on every box** — enforced by `.claude/settings.json` env `TZ=UTC` (all boxes) plus box TZ=Etc/UTC where the OS allows (Linux). "Local system time" and UTC converged by fiat 2026-07 (g-115-2546): a multi-box fleet comparing naive stamps (board `--since`, `last_active` staleness, LWW merges) needs one shared wall clock, and mixed domains silently corrupt every comparison. Long-lived processes keep the TZ env they started with — after changing TZ posture, restart daemons or stamps stay in the old zone.
 
 ### ID Formats
-- Aspirations: `asp-NNN` | Goals: `g-NNN-NN` (supports 2-4 digit: `g-NNN-NNNN`; expanded 2026-05-19 after asp-115 hit g-115-999) | Prep tasks: `pt-NNN`
+- Aspirations: `asp-NNN` | Goals: `g-NNN-NN` (2-5 digit seq; widened twice as asp-115 filled — g-306-486) | Prep tasks: `pt-NNN`
 - Guardrails: `guard-NNN` | Reasoning bank: `rb-NNN` | Beliefs: `bel-NNN`
 - Transitions: `trans-NNN` | Spark questions: `sq-NNN`, candidates: `sq-cNN`
 - Pattern signatures: `sig-NNN` | Strategy archive: `sa-NNN`

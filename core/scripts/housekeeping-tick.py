@@ -33,7 +33,8 @@ LANES
      clean: the purge's own header says a low would_purge under a failed
      lookup is "unmeasured, not clean" (guard-2298 silent-zero class), and a
      tick that logged it as ok would be exactly that class with a cadence.
-  B  harness scratchpad GC (<system-temp>/claude — the surface measured
+  B  harness scratchpad GC (<system-temp>/claude-<uid>, else the older
+     <system-temp>/claude — the surface measured
      2026-08-21 at 2,192 project dirs, oldest 2025-12-17, no cleaner at any
      horizon). Three sub-passes, risk-graded:
        (1) recursively-EMPTY project dirs idle past
@@ -64,7 +65,11 @@ LANES
 
 One JSONL record per EXECUTED tick → core/logs/housekeeping-<agent>.jsonl
 (not-due ticks write nothing). Self-gating via
-<agent>/session/housekeeping-tick-state.json (monitor-tick's sibling file).
+<agent>/session/housekeeping-tick-state.json (monitor-tick's sibling file)
+when bound, and via core/logs/housekeeping-tick-state-unbound.json — one
+BOX-LOCAL stamp, per machine — when AGENT_DIR is unset. The unbound branch
+is not a nicety: until 2026-09-17 it was `return None`, which made every
+interval gate in this file disengage on the unbound path (g-358-179).
 Two callers, one interval: iteration-close productivity-check (autonomous
 boxes) and sessionstart-orchestrator (assistant boxes — this box's whole
 backlog accrued because it never reaches iteration-close). A lost stamp race
@@ -91,8 +96,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+# NOT dead, despite no call site since  routed Lane B's base to
+# _node_tmpdir(): test_housekeeping_tick.py patches `HK.tempfile` (the
+# gettempdir tripwire in _default_root_env) and loads a mutated copy of this
+# file whose pre-fix form calls tempfile.gettempdir(). Dropping this import
+# fails those tests with AttributeError/NameError, not with a clean signal.
 import tempfile
 import time
 from pathlib import Path
@@ -114,9 +125,16 @@ except Exception:                                    # satellite / test boxes
     ASP_ID, _ASP_VIA, ASP_SOURCE = "asp-115", "fallback:import-failed", "world"
 
 from _dt import parse_naive_iso  # shared tolerant naive-ISO parse ()
+from _fresh_read import read_text_for_membership
 
 ORIGIN_SIGNAL = "investigate:housekeeping-tick"
+SKIP_STREAK_ORIGIN_SIGNAL = "investigate:housekeeping-tick-skip-streak"
+MIND_SEED_STALE_ORIGIN_SIGNAL = "investigate:housekeeping-tick-mind-seed-stale"
+# The string-valued keys a lane uses to say it did NOT do its work, and why.
+SKIP_REASON_KEYS = ("skipped", "sessions_skipped")
 DEDUP_HOURS = 48
+# An allow-list, so an unknown status files rather than suppresses (rb-4350).
+OPEN_STATUSES = ("pending", "in-progress", "blocked")
 LANE_A_TIMEOUT = int(os.environ.get("HK_LANE_A_TIMEOUT") or 300)
 LANE_D_TIMEOUT = int(os.environ.get("HK_LANE_D_TIMEOUT") or 1800)
 LANE_E_TIMEOUT = int(os.environ.get("HK_LANE_E_TIMEOUT") or 120)
@@ -131,6 +149,9 @@ DEFAULTS = {
     # freeze is caught inside one window rather than at its edge ().
     # 0 disables the lane, the same off-switch shape lane D uses.
     "mind_seed_freshness_interval_hours": 24,
+    # A lane whose skip reason is identical on this many consecutive records
+    # is flagged (). 0 disables.
+    "skip_streak_ticks": 20,
 }
 
 
@@ -160,13 +181,44 @@ def load_config(config_path: Path | None = None) -> dict | None:
     return merged
 
 
-def _state_path() -> Path | None:
+def _state_path() -> Path:
     env = os.environ.get("HK_STATE_PATH")
     if env:
         return Path(env)
     if AGENT_DIR:
         return Path(AGENT_DIR) / "session" / "housekeeping-tick-state.json"
-    return None
+    # UNBOUND TICK — a BOX-LOCAL stamp, never None. Returning None here made
+    # load_state() answer {} and save_state() a silent no-op, so EVERY interval
+    # gate this file owns disengaged on the unbound path at once — THREE, not
+    # the two the filing goal named: do_tick's `interval_hours`, Lane D's
+    # `transcript_archive_interval_hours`, and Lane E's
+    # `mind_seed_freshness_interval_hours` (measured on cc-04 closing
+    #  — the post-fix stamp carries all three keys). Nothing errored:
+    # an ungated tick is byte-identical to a due one, which is why a
+    # gate-by-gate audit would have missed it and a stamp-file read finds it
+    # in one look. Measured on cc-05 over 2026-09-16T11:42..09-17T11:42:
+    # 57 executed unbound ticks, lane_d on all 57, re-PUTting the one growing
+    # transcript for 8,109,400,693 bytes; the BOUND path on the SAME box ran
+    # lane_d twice and returned not-due twice. sessionstart-orchestrator.sh
+    # Step 2.7 spawns exactly this shape and its own comment claims the 6h
+    # self-gating that this line withheld.
+    #
+    # PER-MACHINE, and that is the correct scope rather than a convenience:
+    # Lane D archives transcripts/<machine>/, so its effect is a property of
+    # the BOX, while even the bound stamp above is per-AGENT — an N-agent box
+    # still archives up to N times per interval (guard-2585, guard-6523). The
+    # unbound lane is the one place the stamp can match the effect exactly.
+    # core/logs/ is gitignored and outside every governed root, so this stays
+    # box-local and is never synced (guard-599 — persistent state does not
+    # belong under an ephemeral agent dir either).
+    #
+    # Deliberately NOT resolved through the agent fall-through: on a
+    # multi-agent box that would bind an unbound tick to whichever agent dir
+    # sorts first, silently (guard-4048). Absolute by construction via
+    # SCRIPT_DIR (guard-552); the filename names the fallback so it can never
+    # be misread as the bound file (guard-2586). Mirrors _log_path()'s
+    # `housekeeping-unbound.jsonl` so the stamp sits beside the log it gates.
+    return SCRIPT_DIR.parent / "logs" / "housekeeping-tick-state-unbound.json"
 
 
 def load_state(p: Path | None) -> dict:
@@ -302,8 +354,18 @@ def build_cited_blob(world_dir=None, agents_root_fn=None) -> str | None:
     if ar is not None:
         try:
             for conf in sorted(Path(ar()).glob("*/experience.jsonl")):
+                # BOTH copies when they diverge (), not the store alone
+                # (). A peer's mirror can lag the store with no refresh
+                # able to move it, so a SID cited only in the missing tail reads
+                # as uncited and the dir is deleted. But experience.jsonl is
+                # REWRITTEN by the store, not only appended, so the mirror can
+                # equally hold lines the store lacks — store-wins dropped those.
+                # This blob is consumed by `x in blob`, where duplicate text is
+                # inert and a missing line is destructive, so the union is the
+                # safe read here. Counting readers must NOT use it; see
+                # _fresh_read.read_text_for_membership.
                 try:
-                    chunks.append(conf.read_text(encoding="utf-8", errors="replace"))
+                    chunks.append(read_text_for_membership(conf, label="housekeeping-tick"))
                     read_any = True
                 except OSError:
                     continue
@@ -323,6 +385,93 @@ def project_slug(root: Path | None = None) -> str:
     return re.sub(r"[:\\/]+", lambda m: "-" * len(m.group()), str(root or PROJECT_ROOT))
 
 
+def _node_tmpdir() -> str:
+    """The OS temp dir the way Node's `os.tmpdir()` resolves it ().
+
+    NOT `tempfile.gettempdir()`, and the difference is not cosmetic. Lane B
+    sweeps a root the HARNESS created, and the harness is Node -- so the only
+    correct base is the one Node would have picked. Python's resolver differs
+    from Node's on BOTH axes that matter here (probed on cc-05, bravo, fresh-eyes
+    msg-20260917-062455-bravo-5481):
+
+      ORDER    -- with TMPDIR unset and TEMP and TMP both set, Python takes TEMP
+                  and Node takes TMP. Python's list is TMPDIR, TEMP, TMP; Node's
+                  is TMPDIR, TMP, TEMP. The middle two are SWAPPED.
+      WRITABILITY -- `gettempdir()` probes each candidate and silently falls
+                  through to /tmp when it cannot write there. Node performs NO
+                  such check and keeps an unwritable TMPDIR. So on a box with an
+                  unwritable TMPDIR the two resolvers disagree even though the
+                  env is unambiguous.
+
+    On such a box Lane B looked under a root the harness never created and
+    returned `skipped: no-scratch-root` -- the silent-skip class g-358-143
+    closed, reopened one layer down. It fails SAFE (a wrong root is missing, not
+    mistakenly deleted), which is exactly why nothing surfaced it.
+
+    Deliberately NO writability check, NO `os.path.isdir` filter: the goal is to
+    agree with Node, not to pick a usable directory. An "improvement" here that
+    skips an unwritable candidate silently restores the bug.
+
+    Order per Node's documented `os.tmpdir()`:
+      POSIX   -- TMPDIR, TMP, TEMP, else "/tmp"
+      Windows -- TEMP, TMP, else %SystemRoot%\\temp (falling back to %windir%)
+    Node strips trailing separators unless the path IS a root, which is why the
+    strip below is guarded rather than a bare rstrip.
+    """
+    if os.name == "nt":
+        names = ("TEMP", "TMP")
+        fallback = os.path.join(
+            os.environ.get("SystemRoot") or os.environ.get("windir") or "C:\\Windows",
+            "temp")
+    else:
+        names = ("TMPDIR", "TMP", "TEMP")
+        fallback = "/tmp"
+    for name in names:
+        val = os.environ.get(name)
+        if val:
+            return _strip_trailing_sep(val)
+    return fallback
+
+
+def _strip_trailing_sep(path: str) -> str:
+    """Drop trailing separators the way Node does -- but never reduce a ROOT to
+    the empty string ("/" must stay "/", "C:\\" must stay "C:\\").
+
+    TWO root shapes, and an emptiness test catches only ONE of them. "/" strips
+    to "" and the falsy branch restores it; "C:\\" strips to "C:", which is
+    TRUTHY, so that branch never fires for the Windows drive root. "C:" is not
+    a root -- it is DRIVE-RELATIVE: PureWindowsPath("C:") / "claude-0" is
+    "C:claude-0" with is_absolute() False, resolving against the process's
+    per-drive working directory instead of the drive root, so Lane B would
+    sweep somewhere other than the root it reports. Measured against the
+    pre-fix form 2026-09-17 (alpha, cc-04, uname -r 6.8.0-139-generic).
+
+    DELIBERATELY WIDER than Node's win32 rule (`!path.endsWith(':\\')`), which
+    matches the BACKSLASH spelling only. Both drive-root spellings normalise
+    back to an absolute drive root here -- measured 2026-09-17 (alpha, cc-04,
+    uname -r 6.8.0-139-generic), impl vs. a literal transcription of that rule:
+
+        'C:\\'  -> 'C:\\'  (Node agrees)      'C:/'  -> 'C:\\'  (Node: 'C:')
+        'C:'    -> 'C:'    (Node agrees)      'C:\\\\' -> 'C:\\'  (Node: 'C:')
+
+    The widening is the POINT, not an oversight: `TEMP=C:/...` is ordinary under
+    Git-Bash/MSYS, so the forward-slash drive root reaches _node_tmpdir in
+    practice, and the narrower rule would hand back the drive-RELATIVE "C:" --
+    the exact defect the paragraph above describes. Do not "fix" this to match
+    Node literally; that re-introduces it.
+
+    What IS Node's rule is the untouched bare "C:": a drive letter that carried
+    no trailing separator is returned as-is, because Node strips nothing there
+    either. That is what the `stripped != path` conjunct buys.
+    """
+    stripped = path.rstrip("/\\")
+    if not stripped:
+        return path[:1] or path
+    if stripped != path and len(stripped) == 2 and stripped[1] == ":":
+        return stripped + "\\"
+    return stripped
+
+
 def run_lane_b(shadow: bool, cfg: dict, scratch_root: Path | None = None,
                cited_blob: str | None = "UNSET",
                now: float | None = None) -> dict:
@@ -332,8 +481,25 @@ def run_lane_b(shadow: bool, cfg: dict, scratch_root: Path | None = None,
                  "other_projects_nonempty": 0, "other_projects_bytes": 0,
                  "cited_blob": "ok", "shadow": shadow}
     try:
-        root = scratch_root or Path(os.environ.get("HK_SCRATCH_ROOT")
-                                    or Path(tempfile.gettempdir()) / "claude")
+        if scratch_root or os.environ.get("HK_SCRATCH_ROOT"):
+            root = Path(scratch_root or os.environ["HK_SCRATCH_ROOT"])
+        else:
+            # The harness root is PER-UID: `claude-${process.getuid?.()??0}`
+            # under CLAUDE_CODE_TMPDIR, else the OS temp dir, read from the CLI
+            # source (); a platform with no getuid gets 0. A bare
+            # `claude` root skipped every run on cc-05 (762 of 762) while the
+            # per-uid root existed. The old bare name stays as the fallback.
+            # Never a `claude-*` glob: another uid's root is not this
+            # process's to delete.
+            base = os.environ.get("CLAUDE_CODE_TMPDIR") or _node_tmpdir()
+            tmp = Path(base)
+            uid = os.getuid() if hasattr(os, "getuid") else 0
+            candidates = [tmp / f"claude-{uid}", tmp / "claude"]
+            existing = [c for c in candidates if c.is_dir()]
+            root = existing[0] if existing else candidates[0]
+            out["root_candidates"] = [str(c) for c in candidates]
+            if len(existing) > 1:
+                out["unswept_roots"] = [str(c) for c in existing[1:]]
         out["root"] = str(root)
         if not root.is_dir():
             out["skipped"] = "no-scratch-root"
@@ -613,7 +779,10 @@ def run_lane_e(cfg: dict, state_path: Path | None = None,
     # "nothing was compared".
     out = {k: r.get(k) for k in (
         "age_hours", "threshold_hours", "last_modified", "bucket", "key",
-        "content_verdict", "content_sha", "content_entries", "content_note")}
+        "content_verdict", "content_sha", "content_entries", "content_note",
+        # : why an aged key is or is not stale (no = the source has not
+        # moved since the served sha; yes = a publish was due and did not land).
+        "publish_due", "source_head")}
     out["rc"] = proc.returncode
     # The SCRIPT's exit code is the contract, not its verdict string — the
     # string is for humans and the code is what this lane branches on.
@@ -651,6 +820,25 @@ def _log_path() -> Path:
     return SCRIPT_DIR.parent / "logs" / f"housekeeping-{agent}.jsonl"
 
 
+def _filer_id() -> str:
+    """Who filed this goal, and from WHICH BOX — resolved, never a placeholder.
+
+    An unbound tick (MIND_AGENT unset) is the ordinary case for the cadence
+    runner, not an edge case, and it used to render as a self-referential
+    placeholder telling the reader to consult the very description that was
+    asking them to identify the box. (The retired placeholder token is
+    deliberately NOT quoted here: this file is inside the scan surface of the
+    test that asserts the token is gone, so quoting it would make this
+    docstring a standing violation and force a self-exclusion — guard-1855.)
+    On a multi-box fleet the reader then cannot
+    tell which machine's ledger to open, and the triage step that says to read
+    the ledger "on the filing box" has no referent (g-358-150; first live
+    instance g-115-10153, filed by the unbound tick 2026-09-17).
+    """
+    agent = os.environ.get("MIND_AGENT") or "unbound"
+    return f"{agent}@{socket.gethostname()}"
+
+
 def append_record(record: dict, log_path: Path | None = None) -> None:
     p = log_path or _log_path()
     try:
@@ -661,10 +849,20 @@ def append_record(record: dict, log_path: Path | None = None) -> None:
         print(f"[housekeeping-tick] record append failed: {exc}", file=sys.stderr)
 
 
-def _recent_investigate_exists() -> bool:
+def _recent_investigate_exists(origin_signal: str = ORIGIN_SIGNAL) -> bool:
     """Deduped-filing gate — cold-snapshot-tick's read_any idiom verbatim:
     fails CLOSED (True = suppress) when the queues cannot actually be READ,
-    guard-487; an absent file counts as unread, not as no-duplicate."""
+    guard-487; an absent file counts as unread, not as no-duplicate.
+
+    Suppresses while a goal with the origin_signal is still OPEN, or was created
+    in the last DEDUP_HOURS (g-358-153). The window alone let a persistent
+    condition re-file every 48h beside its open twin; the add-goal duplication
+    gate refused that attempt (measured rc=1), so every later tick paid a daemon
+    round trip to record a failure. Closing the goal releases the suppression
+    (guard-3419), so a condition that outlives its goal can still re-file.
+    Lane E rides the same predicate (g-358-151): a frozen seed stays stale on
+    every tick, so its open goal must suppress at any age. One predicate, not a
+    per-caller flag (reconciled g-358-156)."""
     cutoff = _dt.datetime.now() - _dt.timedelta(hours=DEDUP_HOURS)
     if WORLD_DIR is None and AGENT_DIR is None:
         return True
@@ -677,15 +875,17 @@ def _recent_investigate_exists() -> bool:
         except OSError:
             continue
         for line in text.splitlines():
-            if ORIGIN_SIGNAL not in line:
+            if origin_signal not in line:
                 continue
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
             for g in (rec.get("goals") or []):
-                if (g.get("origin_signal") or "") != ORIGIN_SIGNAL:
+                if (g.get("origin_signal") or "") != origin_signal:
                     continue
+                if g.get("status") in OPEN_STATUSES:
+                    return True
                 created = g.get("created_at") or ""
                 try:
                     if _dt.datetime.fromisoformat(str(created)) > cutoff:
@@ -699,7 +899,7 @@ def file_investigate(reason: str, detail: str) -> dict:
     """ONE deduped Investigate for a degraded/failed armed run."""
     if _recent_investigate_exists():
         return {"filed": False, "suppressed": "recent-duplicate"}
-    filer = os.environ.get("MIND_AGENT") or "<see description>"
+    filer = _filer_id()
     payload = {
         "title": f"Investigate: housekeeping tick reported {reason} — the "
                  f"cadence purge ran unmeasured or not at all",
@@ -710,7 +910,7 @@ def file_investigate(reason: str, detail: str) -> dict:
             f"cited set (citation_lookup!=ok): Lane 1 degraded to the legacy "
             f"allow-list and Lane 2 was skipped — its numbers are UNMEASURED, "
             f"not clean, per the purge's own header. Triage: (1) read the last "
-            f"record in core/logs/housekeeping-<agent>.jsonl; (2) run "
+            f"record in {_log_path()} on {socket.gethostname()}; (2) run "
             f"`python3 core/scripts/temp-citation-ratchet.py --cited-paths` by "
             f"hand and read its stderr; (3) re-run "
             f"`bash core/scripts/temp-drain-purge.sh --dry-run` and check "
@@ -724,6 +924,47 @@ def file_investigate(reason: str, detail: str) -> dict:
         "intended_agent": "either",
         "tags": ["housekeeping-tick", "temp-store", "citation-integrity"],
     }
+    return _add_goal(payload)
+
+
+def file_mind_seed_stale_investigate(reason: str, detail: str) -> dict:
+    """ONE deduped Investigate for a MEASURED lane E stale verdict ().
+
+    On its OWN origin signal: the shared ORIGIN_SIGNAL let a lane A Investigate
+    suppress this one for 48h (and the reverse). Dedups on an open goal at any
+    age too (the shared OPEN_STATUSES predicate), because a frozen seed stays stale on every tick."""
+    if _recent_investigate_exists(MIND_SEED_STALE_ORIGIN_SIGNAL):
+        return {"filed": False, "suppressed": "recent-or-open-duplicate"}
+    filer = _filer_id()
+    payload = {
+        "title": "Investigate: mind-seed publish key measured STALE with a "
+                 "publish due — live environments may be frozen on an old seed",
+        "description": (
+            f"housekeeping-tick.py lane E ({filer}) measured the published "
+            f"mind-seed key STALE ({reason}). Since g-358-151 the detector "
+            f"returns stale only when the key is past its age threshold AND the "
+            f"source repo's main HEAD is not the served source_sha "
+            f"(publish_due=yes) or could not be read (publish_due=unknown), so "
+            f"this is not an idle staging branch. Lane E record: {detail}\n\n"
+            f"Triage: (1) run the detector by hand and read its PUBLISH-DUE "
+            f"line; (2) check that the publish workflow is enabled, its paths: "
+            f"filter still matches, its OIDC trust is intact and its branch was "
+            f"not renamed (world convention mind-seed-rollout.md); (3) a publish "
+            f"that is due and did not run is the silent-freeze class — the "
+            f"workflow's own failure alert cannot fire on it."
+        ),
+        "priority": "HIGH",
+        "participants": ["agent"],
+        "category": "infrastructure",
+        "origin_signal": MIND_SEED_STALE_ORIGIN_SIGNAL,
+        "work_class": "framework",
+        "intended_agent": "either",
+        "tags": ["housekeeping-tick", "mind-seed", "silence-detector"],
+    }
+    return _add_goal(payload)
+
+
+def _add_goal(payload: dict) -> dict:
     try:
         from _runtime_bash import bash_cmd               # guard-580
         script_path = (SCRIPT_DIR / "aspirations-add-goal.sh").as_posix()
@@ -739,6 +980,88 @@ def file_investigate(reason: str, detail: str) -> dict:
     return {"filed": True}
 
 
+def _tail_records(path: Path, n: int) -> list[dict]:
+    """The parseable records among the ledger's last `n` lines, oldest first. A
+    malformed line is dropped, not back-filled from older lines, so a torn record
+    shortens the window and a streak check fails quiet. Reads from the end, so
+    the cost stays flat as the unrotated ledger grows."""
+    if n <= 0:
+        return []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos, buf = fh.tell(), b""
+            while pos > 0 and buf.count(b"\n") <= n:
+                step = min(65536, pos)
+                pos -= step
+                fh.seek(pos)
+                buf = fh.read(step) + buf
+    except OSError:
+        return []
+    records = []
+    for line in buf.decode("utf-8", errors="replace").splitlines()[-(n + 1):]:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue                    # also drops a partial first line
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records[-n:]
+
+
+def _skip_reasons(record: dict) -> dict:
+    return {(lane, key): val
+            for lane, body in record.items()
+            if lane.startswith("lane_") and isinstance(body, dict)
+            for key in SKIP_REASON_KEYS
+            if isinstance((val := body.get(key)), str) and val}
+
+
+def skip_streaks(record: dict, history: list[dict], ticks: int) -> list[dict]:
+    """Lanes whose skip reason in `record` is identical on the `ticks - 1`
+    records before it (g-358-148).
+
+    Every skipped tick writes a correct record, so the ledger alone cannot tell
+    a lane that never runs from a quiet one: Lane B skipped on 762 of 762 runs
+    over 27 days and nothing noticed (g-358-143). Only lane-body skip keys are
+    read, so this detector's own fields in the record can never count as a skip
+    (guard-2316)."""
+    if ticks <= 0 or len(history) < ticks - 1:
+        return []
+    window = history[len(history) - (ticks - 1):]
+    return [{"lane": lane, "field": key, "reason": reason, "ticks": ticks}
+            for (lane, key), reason in sorted(_skip_reasons(record).items())
+            if all(_skip_reasons(r).get((lane, key)) == reason for r in window)]
+
+
+def file_skip_streak_investigate(reason: str, detail: str) -> dict:
+    """ONE deduped Investigate for a lane that skips for the same reason every tick."""
+    if _recent_investigate_exists(SKIP_STREAK_ORIGIN_SIGNAL):
+        return {"filed": False, "suppressed": "recent-duplicate"}
+    filer = _filer_id()
+    return _add_goal({
+        "title": f"Investigate: housekeeping tick lane skipped for the same "
+                 f"reason on every recent tick ({reason}) — the lane is not running",
+        "description": (
+            f"housekeeping-tick.py ({filer}) found a lane whose skip reason was "
+            f"identical on consecutive ledger records. Detail: {detail}\n\n"
+            f"A skipped tick records correctly, so this reads like a quiet lane "
+            f"while the lane does no work at all (g-358-143: Lane B skipped 762 "
+            f"of 762 runs over 27 days). Triage: (1) read the last records in "
+            f"{_log_path()} on the filing box {socket.gethostname()}; (2) find "
+            f"where the named lane sets that reason in housekeeping-tick.py and "
+            f"re-check its precondition by hand on that box."
+        ),
+        "priority": "MEDIUM",
+        "participants": ["agent"],
+        "category": "infrastructure",
+        "origin_signal": SKIP_STREAK_ORIGIN_SIGNAL,
+        "work_class": "framework",
+        "intended_agent": "either",
+        "tags": ["housekeeping-tick", "skip-streak"],
+    })
+
+
 # ── entry points ────────────────────────────────────────────────────────────
 
 def do_run(cfg: dict, source: str, investigate_fn=None,
@@ -749,7 +1072,16 @@ def do_run(cfg: dict, source: str, investigate_fn=None,
     """Execute the lanes synchronously and append one record."""
     shadow = bool(cfg.get("shadow", True))
     started = time.time()
-    lane_a = run_lane_a(shadow, purge_cmd=purge_cmd)
+    if purge_cmd is None and not os.environ.get("MIND_AGENT"):
+        # temp-drain-purge.sh purges ONE agent's temp/ and refuses with no
+        # AGENT_DIR, so an unbound tick can never run it: 819 of 819 unbound
+        # records were purge-error (). Not a skip key on purpose — the
+        # lane is inapplicable here by design, and the skip-streak detector
+        # must not flag it.
+        lane_a = {"verdict": "not-applicable-unbound",
+                  "note": "no bound agent, so no temp/ to purge"}
+    else:
+        lane_a = run_lane_a(shadow, purge_cmd=purge_cmd)
     lane_b = run_lane_b(shadow, cfg, scratch_root=scratch_root)
     lane_c = run_lane_c()
     lane_d = run_lane_d(cfg, archive_cmd=archive_cmd)
@@ -782,7 +1114,7 @@ def do_run(cfg: dict, source: str, investigate_fn=None,
               f"transcripts NOT fully archived this tick "
               f"({lane_d.get('error') or lane_d.get('failed_count')})",
               file=sys.stderr)
-    if verdict != "ok":
+    if verdict not in ("ok", "not-applicable-unbound"):
         print(f"[housekeeping-tick] WARN — lane A verdict={verdict}; this run "
               f"is UNMEASURED, not clean", file=sys.stderr)
         if not shadow:
@@ -797,33 +1129,47 @@ def do_run(cfg: dict, source: str, investigate_fn=None,
     # that field drives lane A's WARN + Investigate path, whose message names
     # lane A specifically. Two branches, because the whole point of the lane is
     # that they are different findings:
-    #   stale  = a MEASURED customer-facing freeze -> Investigate (armed only)
+    #   stale  = a MEASURED customer-facing freeze -> Investigate, shadow or not
     #   others = the probe could not answer -> WARN, no Investigate. Filing on
     #            an unreadable probe would file on every creds/network blip.
     lane_e_verdict = lane_e.get("verdict")
     if lane_e_verdict == "stale":
         print(f"[housekeeping-tick] WARN — lane E: mind-seed publish key is "
               f"STALE (age_hours={lane_e.get('age_hours')}, threshold="
-              f"{lane_e.get('threshold_hours')}). Live customer environments "
-              f"may be frozen on an old artifact and the publish lane's own "
-              f"failure alert CANNOT fire on silence.", file=sys.stderr)
-        if not shadow:
-            # KNOWN AND ACCEPTED: file_investigate dedups on the single shared
-            # ORIGIN_SIGNAL over 48h, so a lane-A Investigate filed in that
-            # window SUPPRESSES this one (and vice versa). Not silently lost —
-            # the stderr WARN above is ungated and the `lane_e` block is in
-            # every log record, which are the durable surfaces. Splitting the
-            # origin signal would change lane A's dedup semantics too, which is
-            # outside this goal; stated here so a reader finds it rather than
-            # rediscovering it from a missing goal.
-            fi = investigate_fn if investigate_fn is not None else file_investigate
-            record["investigate_lane_e"] = fi(
-                "mind-seed-publish-stale", json.dumps(lane_e)[:400])
+              f"{lane_e.get('threshold_hours')}, publish_due="
+              f"{lane_e.get('publish_due')}). Live customer environments may be "
+              f"frozen on an old artifact and the publish lane's own failure "
+              f"alert CANNOT fire on silence.", file=sys.stderr)
+        # FILES IN SHADOW TOO (), like skip streaks (): shadow
+        # arms DELETERS and filing deletes nothing. Under the old `if not shadow`
+        # this alarm could file nowhere, because every box runs shadow, and the
+        # WARN above is invisible when --tick spawns this run with stderr sent to
+        # DEVNULL. It measured stale on 24 of 30 cc-02 ticks and filed nothing.
+        # Its own origin signal, so lane A's 48h dedup no longer swallows it.
+        fi = (investigate_fn if investigate_fn is not None
+              else file_mind_seed_stale_investigate)
+        record["investigate_lane_e"] = fi(
+            "mind-seed-publish-stale", json.dumps(lane_e)[:400])
     elif lane_e_verdict not in ("ok", "not-due", "disabled",
                                 "skipped-under-pytest"):
         print(f"[housekeeping-tick] WARN — lane E verdict={lane_e_verdict}; "
               f"mind-seed freshness UNMEASURED this run (not a clean result)",
               file=sys.stderr)
+    # Skip streaks (). Files in SHADOW mode too, unlike lanes A and E:
+    # shadow gates DELETERS and filing deletes nothing, and a lane that skips
+    # every shadow tick leaves the soak with no evidence to arm from. The WARN
+    # is invisible when --tick spawns this run (stdout/stderr to DEVNULL), so the
+    # record field and the filed goal are what surface it.
+    ticks = int(cfg.get("skip_streak_ticks") or 0)
+    streaks = skip_streaks(record, _tail_records(log_path or _log_path(), ticks - 1),
+                           ticks)
+    if streaks:
+        record["skip_streaks"] = streaks
+        summary = ", ".join(f"{s['lane']}.{s['field']}={s['reason']}" for s in streaks)
+        print(f"[housekeeping-tick] WARN — skipped for the same reason on "
+              f"{ticks} consecutive ticks: {summary}", file=sys.stderr)
+        fi = investigate_fn if investigate_fn is not None else file_skip_streak_investigate
+        record["investigate_skip_streak"] = fi(summary, json.dumps(streaks)[:400])
     append_record(record, log_path=log_path)
     return record
 

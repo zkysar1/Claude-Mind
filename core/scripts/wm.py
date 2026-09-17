@@ -331,6 +331,77 @@ def archive_evicted_capture(agent_dir, slot_name, removed, reason):
         # unimagined one through as a successful destroy.
         return False
 
+
+# ── THE APPEND PATH ARCHIVES TOO — LOCALLY, BESIDE THE BODY WM () ──
+#
+#  left the APPEND path popping capture victims with no copy anywhere,
+# and on a worker Body that path fires on EVERY capture append once a lane is
+# saturated (measured 2026-09-14 on alpha/cc-08: spark 50/50, exp 20/20, hyp
+# 10/10). It cannot reuse the prune sink above, for two independent reasons:
+# agents/<agent>/ is refused NoClaimError on every box without the runner claim,
+# which is every worker box; and that sink appends through the storage backend,
+# which would put store I/O inside the stale-breakable WM lock the append holds
+# (guard-1965 — a slow store would read as a crashed writer).
+#
+# So a Body WM's victims go to sessions/<unit>/capture-evictions-archive.jsonl,
+# a plain local append under the lock the caller already holds. sessions/ is
+# machine-local: never synced, never rewritten by a PUT, never fenced. The file
+# shares the blast radius of the WM the entry was evicted from, and it leaves
+# the box on the same route that WM does — staged beside it at a remote Body's
+# genuine close (body-manifest.py) and at every reap (cleanup-stale-bindings.sh).
+#
+# Flag-neutral on purpose. An UNFLAGGED capture never reaches the carrier, so the
+# Body WM is its only copy whatever the carrier's state (guard-6181), and a flagged
+# one can miss the carrier without any push failing (the  progress note,
+# item 5). Archiving only "while the carrier is undelivered" would defer the loss.
+#
+# The agent-wide WM is deliberately out of scope: a local file there is swept by
+# the own-cloud sync, whose post-PUT rewrite of the local copy can erase a row
+# appended mid-push. Its victims are reported, never silently described as kept.
+
+# Keep-on-failure needs a bound or a broken sink grows the lane forever. Past
+# limit * this ratio a victim that still cannot be archived is popped anyway, and
+# the caller reports it as an eviction with no archived copy.
+EVICTION_ARCHIVE_CEILING = 2
+
+
+def archive_evicted_capture_local(archive_file, slot_name, removed, reason):
+    """Append ONE evicted capture entry to a LOCAL archive file. True iff it landed.
+
+    Same contract as archive_evicted_capture: False means the caller MUST KEEP the
+    entry. Same row schema, so one reader serves both sinks. Local and fsync'd
+    rather than backend-routed — see the block above for why the append path
+    cannot take a store round trip inside the WM lock.
+
+    A write that fails part-way is truncated back to the size it started from, so
+    a torn row never fuses with the next good one into two unparseable lines.
+    """
+    path = Path(archive_file)
+    start = None
+    try:
+        line = json.dumps({
+            "archived_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "slot": slot_name,
+            "eviction_reason": reason,
+            "summary": evicted_summary(removed),
+            "entry": removed,
+        }, ensure_ascii=False, default=str) + "\n"
+        start = path.stat().st_size if path.is_file() else 0
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return True
+    except Exception:
+        # Broad for the reason archive_evicted_capture gives: any failure must
+        # read as "keep", never as a successful destroy.
+        if start is not None and path.is_file():
+            try:
+                os.truncate(path, start)
+            except OSError:
+                pass
+        return False
+
 #  — APPEND-CREATABLE LANE REGISTRY.
 #
 # WHY IT EXISTS: resolve_slot() returns (slots_dict, name, False) for ANY
@@ -475,9 +546,16 @@ def _unflagged_floor(limit: int) -> int:
     return min(limit - 1, max(1, int(limit * UNFLAGGED_FLOOR_RATIO)))
 
 
-def enforce_slot_limit(arr, limit, item=None) -> int:
+def enforce_slot_limit(arr, limit, item=None, may_evict=None) -> int:
     """Evict from `arr` IN PLACE until it fits `limit`; return how many were
     dropped. Zero when `limit` is falsy or the list already fits.
+
+    `may_evict`, when given, is asked about each victim BEFORE it is popped and
+    must return True for the pop to happen (g-115-9852). A False stops eviction
+    for this call — `break`, never `continue`: the loop re-tests the same
+    over-limit condition, so skipping would ask about the same victim forever.
+    The append path uses it to archive a capture victim before it is destroyed;
+    the merge path passes nothing and is unchanged.
 
     `item`, when given, is the entry the CALLER just added and must survive
     this call (g-306-308 / g-115-6541): an unflagged newcomer sorts to index 0
@@ -542,6 +620,8 @@ def enforce_slot_limit(arr, limit, item=None) -> int:
         _victim = n_unflagged if (len(arr) - n_unflagged) > limit - floor else 0
         if item is not None and arr[_victim] is item and len(arr) > 1:
             _victim = _victim + 1 if _victim + 1 < len(arr) else _victim - 1
+        if may_evict is not None and not may_evict(arr[_victim]):
+            break
         if _victim < n_unflagged:
             n_unflagged -= 1
         arr.pop(_victim)
@@ -1337,7 +1417,33 @@ def cmd_append(args):
         # That daemon copy is the LIVE path (wrappers are daemon-only), so an
         # edit here alone would be inert at runtime; both halves must move
         # together (guard-742/547, the  bug class).
-        _evicted = enforce_slot_limit(arr, limit, item=item)
+        # : on a worker Body WM a capture victim is archived beside the
+        # WM BEFORE it is popped (see archive_evicted_capture_local). None = no
+        # archive applies to this append — a different fact from 0 archived.
+        # TWIN of the daemon loop in wm_write.py::append_slot, the LIVE path.
+        _archived = None
+        _may_evict = None
+        if limit and len(arr) > limit and root_slot in CAPTURE_SLOTS:
+            try:
+                import body_capture_carrier as _bcc
+                _is_body_wm = _bcc.split_body_wm_path(wm_path())[0] is not None
+            except Exception:  # noqa: BLE001 — classification never fails an append
+                _is_body_wm = False
+            if _is_body_wm:
+                _archived = 0
+                _archive_file = wm_path().parent / CAPTURE_EVICTION_ARCHIVE
+
+                def _may_evict(victim):
+                    nonlocal _archived
+                    if archive_evicted_capture_local(_archive_file, root_slot,
+                                                     victim, "append_array_limit"):
+                        _archived += 1
+                        return True
+                    # Keep an unarchivable victim, until the ceiling says the
+                    # lane has grown far enough that the bound must win.
+                    return len(arr) > limit * EVICTION_ARCHIVE_CEILING
+        _evicted = enforce_slot_limit(arr, limit, item=item, may_evict=_may_evict)
+        _deferred = len(arr) - limit if limit and len(arr) > limit else 0
         if _evicted:
             # : mirror of the daemon counter in wm_write.py::append_slot.
             # The DAEMON copy is the live one (wrappers are daemon-only), so this
@@ -1376,8 +1482,9 @@ def cmd_append(args):
                     wm_path(), root_slot_for_validation, item)
             except Exception:  # noqa: BLE001 — never fail a WM append
                 _carrier_path = None
-        if _evicted:
-            _out = {"ok": True, "slot": args.slot, "evicted": _evicted}
+        if _evicted or _deferred:
+            _out = {"ok": True, "slot": args.slot, "evicted": _evicted,
+                    "evicted_archived": _archived, "eviction_deferred": _deferred}
             if _healed_int is not None:
                 _out["healed_from"] = f"{type(_healed_int).__name__}:{_healed_int}"
             print(json.dumps(_out),

@@ -24,9 +24,20 @@ if str(_SD) not in sys.path:
     sys.path.insert(0, str(_SD))
 import _rt  # canonical Python -> daemon client (post-cutover)
 
-from _paths import AGENT_DIR  # noqa: E402
+from _paths import agent_dir  # noqa: E402
 
-WM_PATH = AGENT_DIR / "session" / "working-memory.yaml"
+# OFF-ROSTER BY CONSTRUCTION (). This bound `MIND_AGENT` from the
+# AMBIENT environment with a `"bravo"` fallback, so under the suite it wrote the
+# working memory of whichever LIVE agent was running — measured on alpha/cc-04,
+# where lock_stress_a/b/c sat in the live file for two days with update_count
+# 3/4/1 across separate suite runs. The `clear` at the end of main() is not a
+# defence: it leaves slot_meta behind, and any failed or interrupted run skips it
+# entirely. The lock semantics under test are unchanged — still the agent-wide
+# WM, still disjoint slots, still a concurrent burst — only the victim moves off
+# the live roster, which is the remedy check-tests-no-live-agent-wm.py names.
+TEST_AGENT = "testagent"
+
+WM_PATH = agent_dir(TEST_AGENT) / "session" / "working-memory.yaml"
 
 
 WM_PY = _SD / "wm.py"
@@ -34,7 +45,10 @@ WM_PY = _SD / "wm.py"
 
 def _env() -> dict:
     env = os.environ.copy()
-    env["MIND_AGENT"] = os.environ.get("MIND_AGENT", "bravo")
+    # NOT os.environ.get(..., default): inheriting the ambient binding is the
+    # defect. Bind unconditionally so the writer subprocesses and the daemon
+    # reader below both resolve the same off-roster agent.
+    env["MIND_AGENT"] = TEST_AGENT
     # guard-862 / guard-3375 (): on a worker Body the inherited
     # BODY_WM_PATH routes the wm.py WRITER subprocesses to the per-Body WM
     # while the daemon READER (_rt.wm_read) resolves the agent-wide WM — so

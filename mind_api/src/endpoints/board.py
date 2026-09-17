@@ -29,15 +29,189 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from ..jsonl_cache import cache
-from ..agent_paths import assert_not_cruft
+from ..agent_paths import assert_not_cruft  # also puts core/scripts on sys.path
+
+# READER-SIDE PATH-LIST SEAM (). Imported AFTER agent_paths, which is
+# what adds core/scripts/ to sys.path at module load. One definition of "which
+# files make up a channel", shared by every reader, so a future segmented writer
+# cannot silently starve one of them.
+import _board_paths  # noqa: E402
 
 
 def _channel_path(ctx, channel: str):
     return ctx.paths.world / "board" / f"{channel}.jsonl"
+
+
+# --- Archive reach () ----------------------------------------------
+#
+# Rotation MOVES posts to <channel>-archive.jsonl and deletes nothing, but this
+# endpoint read only the live file — so any `since` window older than the live
+# file's earliest retained post was cut SILENTLY. Measured 2026-09-16 (bravo,
+# cc-05): fresh-eyes-program asks coordination for 60 days and was getting ~8.2;
+# findings' live window is 21.4 days against 30d/60d readers. guard-6252 (a
+# msg-id search returning zero is a window artifact) is the same defect from the
+# search side.
+#
+# THE ARCHIVE IS READ FROM ITS TAIL, AND THAT IS NOT AN OPTIMISATION — it is the
+# only shape whose cost scales with the REQUEST instead of with archive size
+# (rb-3803). coordination-archive.jsonl is 34 MB today and only grows. Rotation
+# APPENDS, so the tail holds the NEWEST archived posts, which is exactly the
+# window adjacent to the live file's earliest post — the direction a widened
+# `since` reaches into first.
+#
+# THE TAIL EXTENDS WITH THE REQUEST (). A fixed tail made the reachable
+# window "live bytes + 4 MiB", so lowering a channel's rotate cap still shortened
+# every long-window reader (findings at 2800 lines: 21.2d against a 30d reader).
+# The read now steps backward one budget at a time until the record at the read
+# boundary predates the requested cutoff — so a 30d request costs what 30 days
+# of archive weighs — under a HARD ceiling of budget x _ARCHIVE_TAIL_MAX_STEPS.
+_ARCHIVE_TAIL_BYTES_DEFAULT = 4 * 1024 * 1024   # 4 MiB
+_ARCHIVE_TAIL_MAX_STEPS = 8                      # ceiling 32 MiB at the default
+
+
+def _archive_tail_budget() -> int:
+    """Byte budget for one archive tail read. Env-overridable for tests."""
+    raw = os.environ.get("BOARD_ARCHIVE_TAIL_BYTES")
+    if raw:
+        try:
+            v = int(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _ARCHIVE_TAIL_BYTES_DEFAULT
+
+
+def _archive_path(ctx, channel: str):
+    return ctx.paths.world / "board" / f"{channel}-archive.jsonl"
+
+
+# --- Segment freshness and discovery ( U3) --------------------------
+#
+# The base file is refreshed on every read (jsonl_cache.get -> ensure_local), but
+# channel_paths() enumerates segments off LOCAL disk. On own-cloud, a segment a
+# PEER minted reaches this box only when pull_sweep's LIST materialises it, and
+# pull_sweep runs every OWNCLOUD_PULL_EVERY_N push ticks (default 5 x 120s, about
+# 10 min). A segment already on disk is refreshed on that same cadence and no
+# faster. So without this step a reader could miss up to ~10 min of a peer's
+# posts, while the base file beside them is at most one cache TTL old.
+#
+# ONLY TODAY'S AND YESTERDAY'S NAMES ARE REFRESHED, and that bound is deliberate.
+# Those are the only segments that still take appends: today's, plus yesterday's
+# for posts written or merged around the UTC day boundary. An older segment is
+# closed by its date, and pull_sweep still covers it. Refreshing every enumerated
+# segment would make the cost grow with retention, not with the request.
+#
+# A NAME ABSENT FROM THE STORE IS RE-PROBED AT MOST ONCE PER CACHE TTL. The
+# backend's TTL shortcut needs a local file, so without this throttle every read
+# before the first segment is minted would pay two HEADs that find nothing.
+_SEGMENT_ABSENT_PROBED_AT: dict = {}
+
+
+def _segment_probe_ttl() -> float:
+    """How long a store-absent segment name stays un-re-probed: the backend's own
+    cache TTL. A backend without one (local) makes the refresh free, so nothing
+    needs throttling there. On error, return 0: probing every read is correct,
+    only more expensive."""
+    try:
+        from storage_backend import get_backend
+        return float(getattr(get_backend(), "cache_ttl", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _refresh_recent_segments(board_dir, channel: str, today=None):
+    """Refresh today's and yesterday's date segments of `channel` from the store,
+    materialising either one that exists remotely but not yet locally.
+
+    MUST run BEFORE channel_paths(), which lists local disk only. Returns one
+    "<name>: <error>" string per refresh that failed. Fail-open like the archive
+    refresh: the read still serves the local copies, but the caller must not
+    claim the window is covered."""
+    import time
+    from storage_backend import ensure_local_before_append
+
+    today = today or datetime.now().date()
+    ttl = _segment_probe_ttl()
+    errors = []
+    for day in (today - timedelta(days=1), today):
+        path = Path(board_dir) / _board_paths.segment_name(channel, day)
+        key = str(path)
+        if not path.exists():
+            probed = _SEGMENT_ABSENT_PROBED_AT.get(key)
+            if probed is not None and time.monotonic() - probed < ttl:
+                continue
+        err = ensure_local_before_append(path, op="board_segment_refresh")
+        if err:
+            errors.append(f"{path.name}: {err}")
+        elif path.exists():
+            _SEGMENT_ABSENT_PROBED_AT.pop(key, None)
+        else:
+            _SEGMENT_ABSENT_PROBED_AT[key] = time.monotonic()
+    return errors
+
+
+def _read_archive_tail(path, budget: int, cutoff=None):
+    """Parse the tail of an archive file: the last `budget` bytes, or with
+    `cutoff`, as many `budget`-sized steps back as it takes for the record at
+    the read boundary to be at or before `cutoff` — never more than
+    budget x _ARCHIVE_TAIL_MAX_STEPS bytes (g-358-118).
+
+    Returns (records, truncated, bytes_read). `truncated` is True when the file
+    was larger than what was read — i.e. there are OLDER archived posts this
+    read did not look at. The caller MUST surface that: a partial window
+    presented as a whole one is the very defect this function exists to fix.
+
+    Deliberately does NOT use jsonl_cache: caching a 34 MB archive to serve a
+    tail would hand the memory cost straight back.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], False, 0
+    ceiling = budget * (_ARCHIVE_TAIL_MAX_STEPS if cutoff is not None else 1)
+    want = budget
+    try:
+        with open(path, "rb") as fh:
+            while want < size and want < ceiling:
+                fh.seek(size - want)
+                fh.readline()   # the partial record at the seek point
+                try:
+                    ts = _parse_ts(json.loads(fh.readline()).get("timestamp"))
+                except (ValueError, AttributeError):
+                    ts = None
+                if ts is not None and ts <= cutoff:
+                    break
+                want = min(want + budget, ceiling)
+            if size <= want:
+                start, truncated = 0, False
+            else:
+                start, truncated = size - want, True
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return [], False, 0
+    if truncated:
+        # The seek landed mid-record; drop the partial first line.
+        nl = blob.find(b"\n")
+        blob = b"" if nl < 0 else blob[nl + 1:]
+    recs = []
+    for line in blob.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            recs.append(obj)
+    return recs, truncated, len(blob)
 
 
 def _reads_sidecar_path(ctx, channel: str):
@@ -181,7 +355,27 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                               "query parameter 'channel' is required")
 
     ch_path = _channel_path(ctx, channel)
-    if not ch_path.exists():
+    # Refresh the two segments that still take appends BEFORE enumerating, so a
+    # peer's segment that exists only in the store is on disk when
+    # channel_paths() lists it ( U3; see _refresh_recent_segments).
+    segment_note = None
+    _seg_errors = _refresh_recent_segments(ch_path.parent, channel)
+    if _seg_errors:
+        segment_note = (f"segment refresh FAILED ({'; '.join(_seg_errors)}) — local "
+                        f"segment(s) may be stale, window NOT verified covered")
+        print(f"[board/read] WARN channel={channel}: {segment_note}", file=sys.stderr)
+
+    # PATH-LIST SEAM (). The "live half" of a channel is its base file
+    # PLUS any date segments — a set that CHANGES OVER TIME once a segmented
+    # writer lands. Enumerating it here, fresh on every read, is what makes this
+    # endpoint safe BEFORE that writer exists: today `channel_paths` returns
+    # exactly `[<channel>.jsonl]`, so this is byte-identical to the previous
+    # behaviour, and it stays correct the day a segment appears. The archive is
+    # excluded here and handled below on its own tail-read budget — a window that
+    # lies inside the live half must still never open the 46 MB archive.
+    live_paths = _board_paths.channel_paths(ch_path.parent, channel,
+                                            include_archive=False)
+    if not live_paths:
         # Match the CLI: prints a single human-readable line. JSON mode still
         # gets the same text — the CLI doesn't branch on json_output here.
         return Response.text(
@@ -189,7 +383,24 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             content_type="text/plain",
         )
 
-    messages = list(cache().get(ch_path))
+    live = []
+    seam_missing = []
+    for _lp in live_paths:
+        if _lp == ch_path:
+            # Hot path unchanged: the base file keeps its mtime-keyed cache.
+            live.extend(cache().get(_lp))
+        else:
+            # Segments go through read_paths, NOT the cache, because
+            # jsonl_cache.get() returns [] for a missing file. Under a rolling
+            # window that silence is the false all-clear this seam exists to
+            # prevent: an evicted segment would read as an empty one, and the
+            # footer would assert a window it did not cover.
+            _recs, _miss = _board_paths.read_paths([_lp])
+            live.extend(_recs)
+            seam_missing.extend(_miss)
+    messages = live
+    archive_note = None
+    archive_unverified = False
 
     since = q.get("since")
     if since:
@@ -200,6 +411,84 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
                 "query parameter 'since' must be a duration (<int><m|h|d>, "
                 "e.g. '24h') or a timestamp (YYYY-MM-DDTHH:MM:SS); "
                 f"got {since!r}")
+
+        # ARCHIVE REACH (). Consult the archive ONLY when the requested
+        # cutoff predates the live file's earliest retained post. A window that
+        # lies inside the live file must not stat, open or read the archive at
+        # all — that is what keeps the common read exactly as cheap as before.
+        _live_stamps = [t for t in (_parse_ts(m.get("timestamp")) for m in live) if t]
+        _earliest_live = min(_live_stamps) if _live_stamps else None
+        if _earliest_live is None or cutoff < _earliest_live:
+            arch_path = _archive_path(ctx, channel)
+            # REFRESH BEFORE THE TAIL READ (). *-archive.jsonl is excluded
+            # from the own-cloud eager pull (), which relies on reads going
+            # through ensure_local; this read opened the local file directly, so a
+            # box that did not run the channel's last rotation served a FROZEN
+            # archive (cc-02 findings: 8,075 local ids against 10,218 in the store).
+            # Cheap by construction: board/* is plaintext and range-tail eligible,
+            # so a stale mirror pulls only the appended bytes, and a current one
+            # costs at most a HEAD per cache TTL. It stays inside this branch, so an
+            # in-window read still never touches the archive. Fail-open by return
+            # value: a failed refresh still serves the local copy, but the reply must
+            # not claim the window is covered.
+            from storage_backend import ensure_local_before_append
+            arch_refresh_err = ensure_local_before_append(arch_path, op="board_archive_refresh")
+            if arch_refresh_err:
+                archive_unverified = True
+                archive_note = (f"archive refresh FAILED ({arch_refresh_err}) — local "
+                                f"archive may be stale, window NOT verified covered")
+                print(f"[board/read] WARN channel={channel} since={since}: "
+                      f"{archive_note}", file=sys.stderr)
+            if arch_path.exists():
+                budget = _archive_tail_budget()
+                arch_recs, arch_truncated, arch_bytes = _read_archive_tail(arch_path, budget, cutoff)
+                # DEDUP BY id, LIVE WINS (guard-3523). The archive holds
+                # re-archived duplicates of its own —  measured 4,728 on
+                # coordination — so the archive side is deduped against itself
+                # too, keeping the FIRST (oldest-positioned) copy.
+                live_ids = {m.get("id") for m in live if m.get("id")}
+                seen_arch = set()
+                extra = []
+                for m in arch_recs:
+                    mid = m.get("id")
+                    if mid and (mid in live_ids or mid in seen_arch):
+                        continue
+                    if mid:
+                        seen_arch.add(mid)
+                    extra.append(m)
+                extra.sort(key=lambda m: m.get("timestamp") or "")
+                # Prepending keeps the merged list chronological AND leaves
+                # the live half in its original file order, because rotation
+                # moves the OLDEST posts out. Measured 2026-09-16 on both
+                # rotated channels: coordination archive ends 2026-08-29 against
+                # a live file starting 2026-09-07; findings ends 2026-08-14
+                # against 2026-08-26. Should that ever stop holding, the cost is
+                # display ORDER only — the `>= cutoff` filter below still admits
+                # exactly the requested window.
+                messages = extra + live
+                _arch_stamps = sorted(m.get("timestamp", "") for m in extra if m.get("timestamp"))
+                _oldest_arch = _arch_stamps[0] if _arch_stamps else None
+                # A truncated tail whose OLDEST record is still newer than the
+                # requested cutoff means the window is NOT fully covered. Say so
+                # — silently returning the covered part is the same class of
+                # wrong answer as the bug being fixed.
+                _short = bool(arch_truncated and _oldest_arch
+                              and _parse_ts(_oldest_arch)
+                              and _parse_ts(_oldest_arch) > cutoff)
+                archive_note = (
+                    (archive_note + "; " if archive_note else "")
+                    + f"archive={len(extra)} record(s) merged, tail {arch_bytes}B"
+                    f" of budget {budget * _ARCHIVE_TAIL_MAX_STEPS}B"
+                    + (f", oldest {_oldest_arch}" if _oldest_arch else "")
+                    + (", TRUNCATED AT BUDGET — window NOT fully covered" if _short
+                       else (", tail truncated (older posts unread, but the "
+                             "requested window is covered)" if arch_truncated else ""))
+                )
+                if _short:
+                    print(f"[board/read] WARN channel={channel} since={since}: "
+                          f"{archive_note}. Raise BOARD_ARCHIVE_TAIL_BYTES or "
+                          f"narrow --since.", file=sys.stderr)
+
         messages = [
             m for m in messages
             if _parse_ts(m.get("timestamp")) and _parse_ts(m.get("timestamp")) >= cutoff
@@ -277,11 +566,32 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             _filters.append(f"{_k}={_v}")
     if unread_only:
         _filters.append("unread_only=1")
+    if archive_note:
+        _filters.append(archive_note)
+    if segment_note:
+        _filters.append(segment_note)
+    # DISCONTINUITY, not merely path enumeration (). "window covered
+    # X .. Y" is computed from oldest/newest below, so it asserts coverage ACROSS
+    # a hole. Enumerating paths cannot detect a MISSING segment — that is the
+    # eviction case seen from the other side — and one day-bucket pass is the
+    # only check that can tell a clean hand-off from two stores that have
+    # diverged past each other (guard-6871). Empty string on a healthy read, so
+    # this adds nothing to the common footer.
+    _seam_note = _board_paths.coverage_note(messages, seam_missing)
+    if _seam_note:
+        _filters.append(_seam_note)
     _fstr = " ".join(_filters)
     if messages:
         _stamps = sorted(m.get("timestamp", "") for m in messages if m.get("timestamp"))
         _extent = f"{_stamps[0]} .. {_stamps[-1]}" if _stamps else "unknown"
-        out.append(f"-- {len(messages)} message(s); window covered {_extent}; filters: {_fstr}")
+        _failed = [name for name, bad in (("archive refresh failed", archive_unverified),
+                                          ("segment refresh failed", bool(segment_note)))
+                   if bad]
+        if _failed:
+            out.append(f"-- {len(messages)} message(s); extent {_extent} NOT verified "
+                       f"covered ({', '.join(_failed)}); filters: {_fstr}")
+        else:
+            out.append(f"-- {len(messages)} message(s); window covered {_extent}; filters: {_fstr}")
     else:
         out.append(f"-- 0 messages matched; filters: {_fstr}")
         out.append("   (empty is scoped to these filters - not proof the record is absent)")

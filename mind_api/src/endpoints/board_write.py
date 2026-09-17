@@ -54,6 +54,7 @@ from ..jsonl_cache import cache as _jsonl_cache
 from ..agent_paths import assert_not_cruft
 
 from _fileops import _validate_no_surrogates  # noqa: E402
+from _board_paths import group_by_channel, post_in_live_half, write_name  # noqa: E402
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
 
 DEFAULT_CHANNELS = ["general", "findings", "coordination", "decisions"]
@@ -68,10 +69,6 @@ _CITE_RE = re.compile(r"(?:guard|rb)-\d{3,}")
 # ---------------------------------------------------------------------------
 # Paths + small helpers
 # ---------------------------------------------------------------------------
-
-def _channel_path(ctx, channel: str) -> Path:
-    return ctx.paths.world / "board" / f"{channel}.jsonl"
-
 
 def _reads_sidecar_path(ctx, channel: str) -> Path:
     return ctx.paths.world / "board" / f"{channel}-reads.jsonl"
@@ -174,7 +171,10 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
     tags = [t.strip() for t in tags_raw.split(",")] if tags_raw else []
     session_id = (ctx.headers.get("x-mind-sid") or "").strip()
 
-    ch_path = _channel_path(ctx, channel)
+    # The shared writer rule (): today's date segment when this channel
+    # is named in BOARD_SEGMENTED_CHANNELS, the live file otherwise. board.py
+    # cmd_post imports the same rule, so the two lanes cannot disagree.
+    ch_path = ctx.paths.world / "board" / write_name(channel)
     base = ctx.paths.world
     agent = _agent_name(ctx)
     msg: dict = {}
@@ -193,8 +193,9 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
             # Fail-open: any error skips the check. Twin: board.py cmd_post.
             if reply_to:
                 try:
-                    if reply_to not in {it.get("id") for it in items
-                                        if isinstance(it, dict)}:
+                    # The whole live half, not only the held file: a segment
+                    # holds one day, so most parents are in another file.
+                    if not post_in_live_half(ch_path, channel, reply_to, items):
                         reply_warnings.append(
                             f"reply_to '{reply_to}' not found in channel "
                             f"'{channel}' ({len(items)} messages) — thread "
@@ -374,24 +375,31 @@ def channels(ctx) -> "Response":  # type: ignore[name-defined]
     board_dir = ctx.paths.world / "board"
     result = []
     if board_dir.exists():
-        for ch in sorted(board_dir.glob("*.jsonl")):
-            name = ch.stem
+        # Fold date segments into their parent channel () — see
+        # _board_paths.group_by_channel. SHARED with core/scripts/board.py
+        # cmd_channels so the parity this docstring claims is structural rather
+        # than two hand-synced copies of the rule.
+        groups = group_by_channel(sorted(board_dir.glob("*.jsonl")))
+        for name in sorted(groups):
             count = 0
             last_ts = None
-            try:
-                with ch.open("r", encoding="utf-8") as f:
-                    last_line = ""
-                    for line in f:
-                        if line.strip():
-                            count += 1
-                            last_line = line
-                if last_line:
-                    try:
-                        last_ts = json.loads(last_line).get("timestamp")
-                    except (json.JSONDecodeError, KeyError):
-                        last_ts = None
-            except OSError:
-                pass
+            for ch in groups[name]:
+                try:
+                    with ch.open("r", encoding="utf-8") as f:
+                        last_line = ""
+                        for line in f:
+                            if line.strip():
+                                count += 1
+                                last_line = line
+                    if last_line:
+                        try:
+                            ts = json.loads(last_line).get("timestamp")
+                        except (json.JSONDecodeError, KeyError):
+                            ts = None
+                        if ts and (last_ts is None or ts > last_ts):
+                            last_ts = ts
+                except OSError:
+                    pass
             result.append({"name": name, "count": count, "last_timestamp": last_ts})
 
     return Response.json({"ok": True, "channels": result})

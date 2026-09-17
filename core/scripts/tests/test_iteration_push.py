@@ -470,6 +470,12 @@ def test_real_repo_union_scope_is_evidence_gated():
         "agents/alpha/changelog.jsonl": "ayoai-ledger",     # pruning
         "agents/alpha/experience.jsonl": "ayoai-ledger",    # archival
         "agents/alpha/aspirations.jsonl": "ayoai-ledger",   # RMW status updates
+        # Multi-writer readings ledgers that had NO routing → exact append-ledger
+        # driver (): union interleaves blocks sharing a line, the
+        # section driver conflicts on appends that open no `## ` section.
+        "core/config/replay-instrument-readings.md": "ayoai-append-ledger",
+        "core/config/completion-report-coverage-readings.md": "ayoai-append-ledger",
+        "core/config/fresh-eyes-shard-readings.md": "ayoai-append-ledger",
     }
     r = subprocess.run(
         ["git", "-C", str(PROJECT_ROOT), "check-attr", "merge", "--",
@@ -2017,3 +2023,148 @@ def test_held_lock_still_refuses_every_merge_mode(tmp_path):
             assert _tip(a) == before, f"{flags} merged under a peer lock"
     finally:
         _unlock_as_peer(a)
+
+
+# --------------------------------------------------------------------------- #
+# tree-lock: SELF-held publish-only degrade ()
+# --------------------------------------------------------------------------- #
+# The foreign branch above cannot see the loop's OWN push: run-full-suite.sh takes the
+# lock under the launching session's sid, the close-path push runs under that same sid,
+# and `check` rightly returns 0 for a self-held lock -- so the merge sailed through and
+# voided the run (VERDICT: INVALID (tree-moved)). Like the foreign pair, every degrade
+# test asserts BOTH halves -- the publish lands AND HEAD does not move -- and the
+# parametrized control runs the identical scenario with the lock STALE, proving the
+# fixture really would have moved HEAD. Without that control, "HEAD unchanged" could
+# come from a fixture that never merges at all.
+SUITE_SID = "suite-launcher-sid"
+
+
+def _lock_as_self(project_root: Path, holder_pid: int, ttl: str = "600"):
+    """Acquire in run-full-suite.sh's production shape: reason + a LONG-LIVED holder pid."""
+    env = dict(os.environ, MIND_SID=SUITE_SID)
+    env.pop("BODY_WM_PATH", None)
+    return subprocess.run(
+        [BASH, str(LOCK_SH), "acquire", "--project-root", str(project_root),
+         "--reason", "full-suite run", "--holder-pid", str(holder_pid), "--ttl", ttl],
+        capture_output=True, text=True, timeout=60, env=env,
+    )
+
+
+def _origin_ahead_of(a: Path, b: Path) -> None:
+    """Give origin a commit `a` lacks, so any integrate on `a` WOULD move HEAD."""
+    _commit_file(b, "upstream.txt", "up\n", "upstream commit")
+    _must(b, "push", "-q", "origin", "main")
+
+
+def test_self_held_live_lock_publishes_carrier_and_does_not_move_head(tmp_path):
+    """out1 + out4, worker lane: the carrier ref ADVANCES while HEAD stays put."""
+    origin, a, b = _clone_pair(tmp_path)
+    carrier = f"refs/workers/alpha/{SUITE_SID}"
+    _must(a, "push", "-q", "origin", f"HEAD:{carrier}")   # carrier already at an OLDER sha
+    old_ref = _tip(a)
+    _commit_file(a, "unit.txt", "unit work\n", "unit commit")
+    _origin_ahead_of(a, b)
+
+    before = _tip(a)
+    assert _lock_as_self(a, os.getpid()).returncode == 0
+    r = _run_push_as(a, "alpha", SUITE_SID, "--push-worker-ref", "--fetch-interval-min", "0")
+    out = r.stdout + r.stderr
+    assert "held by THIS session" in out and "to PUBLISH-ONLY" in out, out
+    ls = _must(a, "ls-remote", "origin", carrier)
+    assert ls.split()[0] == before != old_ref, f"carrier did not ADVANCE to HEAD: {ls}"
+    assert _tip(a) == before, "self-held degrade moved HEAD (tree-moved hazard)"
+    assert "integrating" not in out, out
+    assert not (a / "upstream.txt").exists(), out
+
+
+def test_self_held_live_lock_plain_push_lands_without_moving_head(tmp_path):
+    """out1 + out4, reducer lane: the close-path push still publishes as a fast-forward."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "close.txt", "deep close\n", "reducer close commit")
+    before = _tip(a)
+    assert _lock_as_self(a, os.getpid()).returncode == 0
+    r = _run_push_as(a, "alpha", SUITE_SID, *_default_flags())
+    out = r.stdout + r.stderr
+    assert "DEGRADING to PUBLISH-ONLY: pushing main" in out, out
+    assert "publish-only push OK" in out, out
+    assert _tip(origin, "main") == before, f"reducer commit never reached origin: {out}"
+    assert _tip(a) == before, out
+
+
+def test_self_held_live_lock_rejected_push_does_not_fetch_or_recover_by_merging(tmp_path):
+    """The push-race recovery MERGES, so the degrade must not reach it -- nor fetch."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "close.txt", "deep close\n", "reducer close commit")
+    _origin_ahead_of(a, b)   # after a's last fetch: a's tracking ref is stale
+    before, origin_before, tracking_before = _tip(a), _tip(origin, "main"), _tip(a, "origin/main")
+    assert _lock_as_self(a, os.getpid()).returncode == 0
+    r = _run_push_as(a, "alpha", SUITE_SID, *_default_flags())
+    out = r.stdout + r.stderr
+    assert "NOT recovering" in out, out
+    assert "in-invocation recovery" not in out and "integrating" not in out, out
+    assert _tip(a) == before, "a rejected publish-only push merged anyway"
+    assert _tip(origin, "main") == origin_before, out
+    assert _tip(a, "origin/main") == tracking_before, "publish-only FETCHED (tracking ref moved)"
+
+
+def test_self_held_live_lock_defers_a_push_that_cannot_fast_forward(tmp_path):
+    """Known-behind: no doomed push attempt, no merge, one line saying why."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "close.txt", "deep close\n", "reducer close commit")
+    _origin_ahead_of(a, b)
+    _must(a, "fetch", "-q", "origin", "main")   # a KNOWS it is behind; nothing merged
+    before, origin_before = _tip(a), _tip(origin, "main")
+    assert _lock_as_self(a, os.getpid()).returncode == 0
+    r = _run_push_as(a, "alpha", SUITE_SID, *_default_flags())
+    out = r.stdout + r.stderr
+    assert "deferred until the lock releases" in out, out
+    assert "pushing main" not in out, out
+    assert _tip(a) == before and _tip(origin, "main") == origin_before, out
+
+
+def test_self_held_live_lock_no_push_does_not_integrate(tmp_path):
+    """The worker's Phase -0.3 pull under its own suite: nothing it may do, so nothing."""
+    origin, a, b = _clone_pair(tmp_path)
+    _origin_ahead_of(a, b)
+    before = _tip(a)
+    assert _lock_as_self(a, os.getpid()).returncode == 0
+    r = _run_push_as(a, "alpha", SUITE_SID, "--no-push", "--fetch-interval-min", "0")
+    out = r.stdout + r.stderr
+    assert "held by THIS session" in out and "--no-push has nothing" in out, out
+    assert _tip(a) == before, out
+
+
+@pytest.mark.parametrize("flags", [["--push-worker-ref"], [], ["--no-push"]],
+                         ids=["worker-ref", "plain", "no-push"])
+@pytest.mark.parametrize("stale", ["dead-holder", "expired"])
+def test_control_a_stale_self_lock_takes_the_normal_path_and_merges(tmp_path, flags, stale):
+    """Positive control: the SAME scenario moves HEAD once the self-lock stops protecting."""
+    origin, a, b = _clone_pair(tmp_path)
+    _origin_ahead_of(a, b)
+    before = _tip(a)
+    pid, ttl = (999999, "600") if stale == "dead-holder" else (os.getpid(), "0")
+    assert _lock_as_self(a, pid, ttl).returncode == 0
+    r = _run_push_as(a, "alpha", SUITE_SID, *flags, "--min-commits", "1",
+                     "--fetch-interval-min", "0")
+    out = r.stdout + r.stderr
+    assert "held by THIS session" not in out, out
+    assert _tip(a) != before and (a / "upstream.txt").exists(), (
+        f"control never merged, so the degrade tests would prove nothing: {out}")
+
+
+def test_a_foreign_lock_never_reaches_the_self_held_branch(tmp_path):
+    """out2: with a live FOREIGN holder the foreign branch answers, word for word."""
+    origin, a, b = _clone_pair(tmp_path)
+    _origin_ahead_of(a, b)
+    before = _tip(a)
+    assert _lock_as_self(a, os.getpid()).returncode == 0   # held by SUITE_SID ...
+    for flags, expect in ((["--push-worker-ref"],
+                           "tree-lock: held — DEGRADING --push-worker-ref to PUBLISH-ONLY"),
+                          ([], "tree-lock: a co-resident Body holds this working tree"),
+                          (["--no-push"], "tree-lock: a co-resident Body holds this working tree")):
+        r = _run_push_as(a, "alpha", "a-different-sid", *flags,   # ... pushed by another
+                         "--fetch-interval-min", "0")
+        out = r.stdout + r.stderr
+        assert expect in out, (flags, out)
+        assert "held by THIS session" not in out, (flags, out)
+        assert _tip(a) == before, (flags, out)

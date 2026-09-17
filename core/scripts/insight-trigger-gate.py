@@ -67,6 +67,7 @@ from _fileops import locked_append_jsonl  # noqa: E402
 from _paths import agent_dir as _agent_dir  # noqa: E402
 from _paths import enumerate_agent_confs as _enumerate_agent_confs  # noqa: E402
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, /)
+from _board_paths import channel_paths, read_paths  # noqa: E402  (reader-side path-list seam, )
 from _paths import ENVIRONMENT_ID  # noqa: E402  ( world identity)
 from peer_surface import routing_tag_targets_agent  # noqa: E402  ()
 
@@ -238,33 +239,46 @@ def _already_filed_in_aspirations(msg_id):
 def _load_findings(since_hours):
     # DO NOT route this through `bash core/scripts/board-read.sh` — the
     # WSL-bash CRLF subprocess bug (rb-350) produces empty output and silently
-    # bypasses the whole gate. Read findings.jsonl directly.
+    # bypasses the whole gate. Read the channel's files directly, through the
+    # path-list seam below.
     world = _world_dir()
     if world is None:
         return None, "no WORLD_PATH"
-    fp = world / "board" / "findings.jsonl"
-    if not fp.exists():
+    # ENUMERATED THROUGH THE READER SEAM, never a hardcoded filename
+    # ( OUT2). `channel_paths(..., include_archive=False)` returns
+    # exactly `[findings.jsonl]` until a segment exists, so this is
+    # byte-identical TODAY -- which IS the "reader lands before any writer
+    # change" property: a segmented writer would otherwise silently starve
+    # this gate, and a gate reading a partial board emits a false all-clear,
+    # the worst available failure direction.
+    # include_archive stays False DELIBERATELY: this gate has only ever read
+    # the live half, and widening the population is a behaviour change this
+    # goal does not license.
+    paths = channel_paths(world / "board", "findings", include_archive=False)
+    if not paths:
         return [], None
-    cutoff = dt.datetime.now() - dt.timedelta(hours=since_hours)
-    results = []
     try:
-        with open(fp, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
-                if ts:
-                    rec_time = parse_naive_iso(ts)
-                    if rec_time is not None and rec_time < cutoff:
-                        continue
-                results.append(rec)
+        records, missing = read_paths(paths)
     except Exception as e:
         return None, "read error: " + str(e)
+    # Warn ONLY on "unreadable" (a real I/O fault someone should chase), never
+    # on "evicted" (routine archival under segmentation). Conflating the two is
+    # itself a false all-clear -- the exact distinction `read_paths` exists to
+    # preserve, and the only thing its mutation control can measure.
+    faults = [m for m in (missing or []) if m.get("reason") == "unreadable"]
+    if faults:
+        print("warning: findings channel window shortened by %d unreadable path(s): %s"
+              % (len(faults), "; ".join(str(m.get("path")) for m in faults)),
+              file=sys.stderr)
+    cutoff = dt.datetime.now() - dt.timedelta(hours=since_hours)
+    results = []
+    for rec in records:
+        ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
+        if ts:
+            rec_time = parse_naive_iso(ts)
+            if rec_time is not None and rec_time < cutoff:
+                continue
+        results.append(rec)
     return results, None
 
 

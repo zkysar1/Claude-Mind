@@ -94,7 +94,7 @@ from _goal_census import census_evicted_ids, TERMINAL_STATUSES  # noqa: E402
 
 TREE_DIR = WORLD_DIR / "knowledge" / "tree"
 
-GOAL_RE = re.compile(r"\bg-\d{1,4}-\d{1,4}\b")
+GOAL_RE = re.compile(r"\bg-\d{1,4}-\d{1,5}\b")
 FM_RE = re.compile(r"\A---\s*\n(.*?)\n---", re.DOTALL)
 
 # ---------------------------------------------------------------------------

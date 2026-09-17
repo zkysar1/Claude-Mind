@@ -10,8 +10,16 @@
 #   pending-questions-close.sh --pq-path <abs-path> --id <qid> \
 #       --answered-by <who> [--rationale <text>] [--dry-run]   # test hook
 #
-# Exit: 0 closed/already-terminal/dry-run · 2 input error · 3 not found ·
-#       4 lock failure · 5 wrote-but-verify-failed.
+# --amend rewrites the answer of an ALREADY-TERMINAL question (requires
+# --rationale); the prior answer is appended to `superseded_answers` and is
+# never destroyed. Without it a terminal question returns action=already_terminal
+# and writes NOTHING — so an rc=0 is not evidence an amendment was recorded.
+# Use only when the governing decision POSTDATES the stored answer (guard-5868);
+# a resolved question is an answer store later readers trust (guard-6282).
+#
+# Exit: 0 closed/amended/already-terminal/dry-run · 2 input error (incl. --amend
+#       without --rationale) · 3 not found · 4 lock failure ·
+#       5 wrote-but-verify-failed.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091

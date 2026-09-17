@@ -10,7 +10,9 @@ whose semantic twin was already PENDING (not completed, not in-flight, not
 yet in git, not the subject of an active insight_trigger) slipped cleanly.
 
 Match strategies covered:
-  P1 origin_signal exact match            → BLOCK (symptom-keyed identity)
+  P1 origin_signal exact + co-signal      → BLOCK (symptom-keyed identity)
+  P1d origin_signal exact, NO co-signal   → PASS  (shared PROVENANCE is not
+                                            duplication; g-115-6334)
   P2 file-path overlap                    → BLOCK (structural co-signal)
   P3 plain-words overlap                  → DEMOTE (advisory only — mirrors
                                             recent_completions structural-
@@ -201,11 +203,23 @@ def main() -> int:
         # filer (e.g., alert-sweep, sq-013 handler) emits the same
         # symptom-keyed origin_signal twice across iterations because the
         # other 5 corpora don't see the first filing yet.
+        #  made this a TRUE-POSITIVE control (guard-4315: when you
+        # narrow a gate predicate, adversarially probe the true positives the
+        # discarded breadth was catching). Strategy 1 now requires a specific
+        # co-signal, so the pair shares ONE directory-qualified work-target
+        # path and nothing else. That is deliberate on both sides: the shared
+        # path is what a genuine re-file of the same finding carries, and ONE
+        # hit keeps Strategy 2 below MIN_UNIQUE_HITS=2 — so origin_signal is
+        # still proven to block ON ITS OWN, exactly as before the narrowing.
+        # The zero-co-signal shape this fixture used to assert BLOCK on is now
+        # P1d, which asserts PASS.
         existing_origin = f"idea:{TAG}-p1-origin-gap"
+        shared_p1_path = f"core/scripts/{TAG}-p1-shared.py"
         seed_p1 = _mk_aspiration("asp-pendq-p1", [{
             "id": "g-pendq-p1-existing",
             "title": "Idea: pendq p1 placeholder unrelated prose",
-            "description": "Some pending work description text here.",
+            "description": (f"Some pending work description text here, in "
+                            f"{shared_p1_path}."),
             "status": "pending",
             "origin_signal": existing_origin,
             "participants": ["agent"],
@@ -214,9 +228,10 @@ def main() -> int:
 
         case_p1 = {
             "title": "Idea: pendq p1 completely different title prose",
-            "description": ("Different description body to ensure ONLY "
-                            "the origin_signal match strategy fires, not "
-                            "the structural overlap path."),
+            "description": (f"Different description body, sharing only the "
+                            f"work target {shared_p1_path}, to ensure the "
+                            f"origin_signal match strategy fires and not "
+                            f"the structural overlap path."),
             "participants": ["agent"],
             "source": "world",
             "origin_signal": existing_origin,
@@ -250,11 +265,17 @@ def main() -> int:
         # verify-before-assuming (git log the finding id, rb-5047) rather than
         # re-implement. Structural/fuzzy Strategy-2 stays pending-only, so a
         # completed goal alone can only block via this EXACT-origin path.
+        # Also a true-positive control since  — same shape as P1:
+        # ONE shared directory-qualified work target, which is what a genuine
+        # re-file of the SAME board-post finding carries. The zero-co-signal
+        # completed shape is P1e.
         completed_origin = f"board_post:{TAG}-p1c-completed-twin"
+        shared_p1c_path = f"core/scripts/{TAG}-p1c-shared.py"
         seed_p1c = _mk_aspiration("asp-pendq-p1c", [{
             "id": "g-pendq-p1c-completed",
             "title": "Fix: pendq p1c already-done work",
-            "description": "This finding was already converted and completed.",
+            "description": (f"This finding was already converted and "
+                            f"completed in {shared_p1c_path}."),
             "status": "completed",
             "origin_signal": completed_origin,
             "participants": ["agent"],
@@ -263,9 +284,10 @@ def main() -> int:
 
         case_p1c = {
             "title": "Fix: pendq p1c re-filed duplicate of completed work",
-            "description": ("A later same-origin_signal filing that must be "
-                            "blocked against the COMPLETED twin, not slip "
-                            "through the pending-only Strategy-1 blind spot."),
+            "description": (f"A later same-origin_signal filing against "
+                            f"{shared_p1c_path} that must be blocked against "
+                            f"the COMPLETED twin, not slip through the "
+                            f"pending-only Strategy-1 blind spot."),
             "participants": ["agent"],
             "source": "world",
             "origin_signal": completed_origin,
@@ -288,6 +310,104 @@ def main() -> int:
                     f"P1c: expected origin_signal_completed in match_strategy "
                     f"set, got strategies={strategies}"
                 )
+
+        # ── P1d: origin_signal exact, ZERO co-signal → PASS ──────────
+        # . SHARED PROVENANCE IS NOT DUPLICATION. One directive, one
+        # alert, one board post, one recurring parent legitimately spawns N
+        # DISTINCT findings, and each inherits the same origin_signal; the key
+        # names the PARENT EVENT, not the symptom. Measured live 2026-09-15
+        # (alpha, cc-04) against the world queue: a synthetic goal about
+        # greenhouse humidity sensors was refused as a duplicate of a
+        # credential-blocker goal on a shared user_directed:<directive> key
+        # alone, file_path_hits and keyword_hits both empty. guard-1058 clause
+        # (d) + (j) had been instructing agents to override exactly this by
+        # hand (times_active 2124; clause (j) measured it FOUR TIMES IN ONE DAY
+        # on this box). The demoted row must still be VISIBLE as an advisory —
+        # guard-1773: refuting the stated match is not a proof of novelty, so
+        # the filer must still learn that a same-origin goal exists.
+        fp1_origin = f"user_directed:{TAG}-p1d-one-directive-many-findings"
+        seed_p1d = _mk_aspiration("asp-pendq-p1d", [{
+            "id": "g-pendq-p1d-existing",
+            "title": "Unblock: renew the expired mailbox credential",
+            "description": ("The operator mailbox credential expired and the "
+                            "poller cannot authenticate."),
+            "status": "pending",
+            "origin_signal": fp1_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p1d])
+
+        case_p1d = {
+            "title": "Investigate: overnight greenhouse humidity sensor drift",
+            "description": ("Humidity readings diverge from the reference "
+                            "hygrometer after midnight; find the drift."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": fp1_origin,
+        }
+        rp1d = _run_gate(case_p1d, tmp_world)
+        pq1d = _find_check(rp1d, "pending_queue")
+        if pq1d is None:
+            failures.append("P1d: pending_queue check missing from result")
+        elif pq1d.get("passed") is not True:
+            failures.append(
+                f"P1d: distinct goals sharing ONLY an origin_signal (no "
+                f"file-path, no identifier co-signal) should PASS. "
+                f"reason={pq1d.get('reason')} matches={pq1d.get('matches')}"
+            )
+        elif not any(a.get("origin_only_no_cosignal")
+                     for a in pq1d.get("advisories") or []):
+            failures.append(
+                f"P1d: the demoted origin match must stay VISIBLE as an "
+                f"origin_only_no_cosignal advisory, got "
+                f"advisories={pq1d.get('advisories')}"
+            )
+
+        # ── P1e: origin_signal_completed exact, ZERO co-signal → PASS ────
+        # The completed-corpus half of P1d — the exact shape guard-1058 clause
+        # (d) names verbatim ("treat an origin_signal_completed-only block with
+        # empty file_path_hits as a false positive"). Clause (d-bis) records the
+        # structural form: alert-sweep files one goal per alert email, so an
+        # alert-derived FIX goal can only cite alert-email:<key> — the same
+        # value its own completed parent carries — and the two gates could not
+        # both be satisfied.
+        fp1e_origin = f"alert-email:{TAG}-p1e-one-alert-two-findings"
+        seed_p1e = _mk_aspiration("asp-pendq-p1e", [{
+            "id": "g-pendq-p1e-completed",
+            "title": "Triage: diagnose the nightly batch fault from the alert",
+            "description": ("Read the alert envelope and classify the fault "
+                            "that stopped the nightly batch."),
+            "status": "completed",
+            "origin_signal": fp1e_origin,
+            "participants": ["agent"],
+        }])
+        _seed_world(tmp_world, [seed_p1e])
+
+        case_p1e = {
+            "title": "Raise the retention window on the quarterly ledger export",
+            "description": ("Quarterly ledger exports age out before the "
+                            "auditor collects them; lengthen the window."),
+            "participants": ["agent"],
+            "source": "world",
+            "origin_signal": fp1e_origin,
+        }
+        rp1e = _run_gate(case_p1e, tmp_world)
+        pq1e = _find_check(rp1e, "pending_queue")
+        if pq1e is None:
+            failures.append("P1e: pending_queue check missing from result")
+        elif pq1e.get("passed") is not True:
+            failures.append(
+                f"P1e: distinct goals sharing ONLY an origin_signal with a "
+                f"COMPLETED twin should PASS. reason={pq1e.get('reason')} "
+                f"matches={pq1e.get('matches')}"
+            )
+        elif not any(a.get("origin_only_no_cosignal")
+                     for a in pq1e.get("advisories") or []):
+            failures.append(
+                f"P1e: the demoted origin_signal_completed match must stay "
+                f"VISIBLE as an advisory, got "
+                f"advisories={pq1e.get('advisories')}"
+            )
 
         # ── P2: file-path overlap → BLOCK ────────────────────────────────
         # No origin_signal collision; structural co-signal via shared
@@ -1339,7 +1459,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PASS (24/24 cases)")
+    print("PASS (26/26 cases)")
     return 0
 
 

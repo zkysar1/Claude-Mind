@@ -55,6 +55,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
+# The board segment predicate is defined exactly once, in _board_paths
+# (). Importing it here keeps the MERGER's answer to "is this a
+# segment, and of what" identical to the reader's and the writer's.
+from _board_paths import live_name, segment_parent
+
 # Ring-buffer ceiling for team-state.recent_completions. Kept in sync with
 # core/scripts/team-state.py MAX_RECENT_COMPLETIONS (not imported — that module
 # pulls in _paths.WORLD_DIR at import, which this pure/side-effect-free helper
@@ -2082,8 +2087,9 @@ def _parse_jsonl_lossy(data: bytes) -> Tuple[List[dict], List[str]]:
 
     Scope guard: id-keyed / field-merge handlers MUST keep the strict parse —
     there a parse failure can mean real corruption of an editable record and
-    the safe response is the freeze, not a silent skip. Only
-    ``merge_append_only_jsonl`` may call this.
+    the safe response is the freeze, not a silent skip. Only the append-only
+    handlers ``merge_append_only_jsonl`` and its rotation-aware variant
+    ``merge_rotated_board_jsonl`` may call this.
     """
     records: List[dict] = []
     torn: List[str] = []
@@ -2156,6 +2162,107 @@ def merge_append_only_jsonl(local: bytes, remote: bytes) -> bytes:
     by_line: Dict[str, dict] = {}   # serialized line -> record (identical collapse)
     for rec in combined:
         by_line[json.dumps(rec, ensure_ascii=True)] = rec
+    ordered = sorted(by_line.values(), key=lambda r: (_log_ts(r), _canon(r)))
+    return _dump_jsonl(ordered)
+
+
+# Fewest records a side must hold before merge_rotated_board_jsonl will read it
+# as a ROTATED window (). Every board rotate cap sits far above it
+# (store-hygiene.yaml: the board glob 5000, decisions 2700), and no board writer
+# sends a partial body, so a shorter side is a fragment or a truncated copy --
+# never a rotation -- and must keep the plain union.
+_ROTATED_WINDOW_MIN_RECORDS = 1000
+
+
+def _front_evicted_lines(stale: List[str], rotated: List[str]) -> set:
+    """Serialized lines at the FRONT of ``stale`` that a front-slice rotation
+    removed from ``rotated``, or an empty set when the pair lacks that exact
+    shape. The shape: ``rotated`` holds at least _ROTATED_WINDOW_MIN_RECORDS,
+    its first record sits in ``stale`` at a position > 0, and EVERY ``stale``
+    line before that position is absent from ``rotated`` (one clean contiguous
+    block). A missing head, a head already first, or any prefix line that
+    ``rotated`` still holds is not a rotation, and returns nothing."""
+    if len(rotated) < _ROTATED_WINDOW_MIN_RECORDS or not stale:
+        return set()
+    try:
+        cut = stale.index(rotated[0])
+    except ValueError:
+        return set()
+    if cut == 0:
+        return set()
+    held = set(rotated)
+    block = stale[:cut]
+    if any(line in held for line in block):
+        return set()
+    # Only a DATED block is a rotation (). The merge sorts by _log_ts
+    # and an undated line sorts FIRST whatever its age, so a fresh undated line
+    # the other side has not received yet sits exactly where a rotated-out slice
+    # sits -- and it was never archived. Every -reads sidecar record is undated
+    # (`read_at` is not a _LOG_TS_FIELDS member), so those stores keep the plain
+    # union: a resurrected read receipt is a duplicate, an evicted one is a loss.
+    if any(not _log_ts(json.loads(line)) for line in block):
+        return set()
+    return set(block)
+
+
+def merge_rotated_board_jsonl(local: bytes, remote: bytes) -> bytes:
+    """merge_append_only_jsonl, minus the block one side ROTATED OUT ().
+
+    The board channels are append-only per record but NOT append-only as files:
+    jsonl_hygiene rotates them, moving the oldest front slice to
+    ``<channel>-archive.jsonl`` and then dropping it from the live file. A plain
+    line-union cannot see a drop, so when a rotation's write collides with a
+    peer's write -- either order, through the 412 / both-diverged / sync paths
+    that all end in the registered handler -- the side still holding the
+    pre-rotation copy puts the whole archived slice back into the live window.
+    Proven on the plain handler with a reciprocal control (5 of 5 evicted lines
+    resurrected, 0 of 5 in the one-variable control).
+
+    This handler removes exactly that slice and nothing else. A line is dropped
+    only when the OTHER side's first record appears later in this side, every
+    line before it is absent from the other side, and the other side holds at
+    least _ROTATED_WINDOW_MIN_RECORDS -- which is what a front-slice rotation
+    leaves behind and what no append, fragment or truncated copy produces. The
+    dropped slice is already in the archive: rotation archives FIRST and drops
+    second. Every other shape -- no rotation, a recreated or short file, a
+    prefix line the other side still holds, or torn lines on the side that would
+    vouch for the cut -- falls back to the plain union, so the failure mode of a
+    misread is today's resurrection, never a loss.
+
+    Commutative (guard-907): each direction is tested with the same rule and the
+    result is a set union over both sides, so argument order cannot change it.
+
+    Rotators are NOT serialized (g-358-119). jsonl_hygiene.sweep holds no lease,
+    so two boxes can rotate one channel inside one merge window by different
+    amounts. That is safe only because a rotation archives before it drops and
+    drops only records it archived (jsonl_hygiene._drop_front), so the larger
+    cut is always in the larger rotation's archive. An UNDATED front block is
+    never cut (see _front_evicted_lines). The shape still unguarded is a DATED
+    line older than the other side's first record that the other side never
+    received (a backdated append); measured 0 records out of order by more than
+    1h across the five live board channels, 2026-09-17.
+    """
+    local_recs, local_torn = _parse_jsonl_lossy(local)
+    remote_recs, remote_torn = _parse_jsonl_lossy(remote)
+    if local_torn:
+        _warn_torn_lines(local_torn, "first")
+    if remote_torn:
+        _warn_torn_lines(remote_torn, "second")
+    local_lines = [json.dumps(r, ensure_ascii=True) for r in local_recs]
+    remote_lines = [json.dumps(r, ensure_ascii=True) for r in remote_recs]
+    # A side that lost a torn line never vouches for a cut: a dropped first line
+    # would make its second record look like a rotation boundary.
+    cut_local = (set() if remote_torn
+                 else _front_evicted_lines(local_lines, remote_lines))
+    cut_remote = (set() if local_torn
+                  else _front_evicted_lines(remote_lines, local_lines))
+    # At most one is non-empty: a cut in one direction needs this side's first
+    # line ABSENT from the other side, the opposite cut needs it PRESENT.
+    evicted = cut_local | cut_remote
+    by_line: Dict[str, dict] = {}
+    for line, rec in zip(local_lines + remote_lines, local_recs + remote_recs):
+        if line not in evicted:
+            by_line[line] = rec
     ordered = sorted(by_line.values(), key=lambda r: (_log_ts(r), _canon(r)))
     return _dump_jsonl(ordered)
 
@@ -4692,6 +4799,10 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     # data loss (board.py reads the LIVE file only, never the archive -- see
     # store-hygiene.yaml G11 note), so the registration STANDS on the accepted
     # tradeoff -- the same basis as the canonical 4, which are likewise rotated.
+    # SUPERSEDED (): under world/board/ these entries no longer resolve
+    # to the plain union -- merge_handler_for branch 10 swaps in
+    # merge_rotated_board_jsonl, which removes the rotated-out slice instead of
+    # accepting it back. The entries stay because branch 10 keys on them.
     "reasoning.jsonl": merge_append_only_jsonl,
     "directives.jsonl": merge_append_only_jsonl,
     "events.jsonl": merge_append_only_jsonl,
@@ -5445,7 +5556,7 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for NINE path-pattern branches that run
+    Dispatch is by basename EXCEPT for TEN path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
@@ -5469,11 +5580,15 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
          (g-115-9645). EXTENSION-DISCRIMINATED and IMMEDIATE-PARENT-matched:
          the directory also holds 14 non-.jsonl files, and the
          ``close-reviews/`` subdir is a class (b) fence-only store
+      10. rotated board stores ``world/board/<registered>.jsonl`` -- a basename
+          registered to the plain line-union is SWAPPED for its rotation-aware
+          variant, merge_rotated_board_jsonl (g-358-81)
     Branches 1-4 and 7-9 register stores whose basenames are DYNAMIC and therefore
     unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
     entry (1-4, 7, 8) and NO despite one (5) -- always resolve through this function,
-    never through a grep of the dict.
+    never through a grep of the dict. Branch 10 changes WHICH handler, never
+    whether one exists, so for it a dict grep names the wrong function.
 
     Shard detail: basenames are dynamic (alpha.yaml/bravo.yaml/...) and so cannot
     be enumerated in _HANDLERS. Those
@@ -5659,6 +5774,42 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
             and parts[-1].endswith(".jsonl")
             and ".history" not in parts):
         return merge_append_only_jsonl
+    # TENTH path-pattern case (): the ROTATED board stores. Every
+    # *.jsonl under world/board/ is rotated by the store-hygiene glob, and the
+    # ones registered below to merge_append_only_jsonl (the channels and their
+    # -reads sidecars) would otherwise put a rotated-out slice back into the live
+    # file whenever the rotation's write collides with a peer's. Keyed on the
+    # IMMEDIATE parent plus the EXISTING registration, so the same basenames
+    # elsewhere keep the plain union and the unregistered -archive files stay
+    # fence-only. See merge_rotated_board_jsonl for why only a front-slice
+    # rotation is removed.
+    # `.history` is excluded for branch 9's reason (): a snapshot is an
+    # immutable point-in-time copy, never a rotated live window.
+    if (len(parts) >= 2 and parts[-2] == "board"
+            and ".history" not in parts):
+        # A DATE SEGMENT INHERITS ITS PARENT CHANNEL'S REGISTRATION ().
+        # This test keyed on the EXACT basename, so the live `coordination.jsonl`
+        # resolved and every `coordination-<YYYY-MM-DD>.jsonl` segment resolved to
+        # None. A board store is class (b) fence-only (governed-store-write-classes
+        # .md): there is no reconciler below the write, so a handler-less segment
+        # under six concurrent cross-box writers is a PERMANENT WEDGE, not a
+        # retryable conflict (guard-6883; rb-2639 records own-cloud CAS
+        # write_conflict as exactly a per-object stale-IfMatch deadlock).
+        # The segment predicate is IMPORTED from _board_paths and never
+        # re-derived here, so merger, writer, reader and discovery cannot drift
+        # apart about what a segment IS (guard-5940, guard-2108 -- the same
+        # one-definition discipline  applied on the reader side).
+        # Inheritance is deliberately one level and parent-registration-gated: an
+        # unregistered channel's segment still resolves to None, and an archive
+        # returns None from segment_parent by construction ("archive" is not a
+        # date), so neither is widened by this branch.
+        _registered = _HANDLERS.get(parts[-1])
+        if _registered is None:
+            _parent = segment_parent(parts[-1])
+            if _parent is not None:
+                _registered = _HANDLERS.get(live_name(_parent))
+        if _registered is merge_append_only_jsonl:
+            return merge_rotated_board_jsonl
     # Second PATH-PATTERN case (), for the opposite reason to the
     # shard branch above: that one exists because the basenames are DYNAMIC,
     # this one because a basename can be AMBIGUOUS. A name registered in

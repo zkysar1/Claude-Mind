@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Scan world+agent queues for goals carrying `user` in participants and
+# Scan world+agent queues for goals carrying `user` in participants or a live
+# `human_blocked:` defer () and
 # (optionally) EMAIL THE USER ONE DIGEST on a FIXED CADENCE (default 72h), plus
 # post a coordination-board record that doubles as the shared schedule marker.
 # An EMPTY list still sends — the short all-clear. See

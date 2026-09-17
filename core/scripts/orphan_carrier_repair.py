@@ -54,13 +54,15 @@ import datetime as dt
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import carrier_push_retry as cpr  # noqa: E402
 import worker_stall as ws  # noqa: E402
 from _fileops import durable_write_text  # noqa: E402
-from _paths import WORLD_DIR, agents_root  # noqa: E402
+from _paths import WORLD_DIR, agent_state_dir, agents_root  # noqa: E402
 
 # A wide default. The population's own distribution justifies it: at >3d the
 # set is 20 rows and every one of them is independently graded `stalled_no_close`
@@ -71,6 +73,11 @@ from _paths import WORLD_DIR, agents_root  # noqa: E402
 DEFAULT_MIN_AGE_DAYS = 3.0
 
 REPAIR_STATE = "closed-stale"
+
+# Records that a WIRED pass ran, so a quiet clean pass is never
+# indistinguishable from a pass that never happened -- the exact ambiguity
+# that let this module sit with zero call sites while reading healthy.
+MARKER_NAME = ".orphan-carrier-repair-last-run"
 
 # The claim map must cover the SAME stores scan() covers, or a Body that claimed
 # into its own agent queue reads as claimless here and becomes eligible. scan()
@@ -88,6 +95,28 @@ def live_body_state(state: str | None) -> bool:
     """
     s = (state or "").strip()
     return bool(s) and s not in ws.CLOSED_BODY_STATES and s != ws.PARKED_BODY_STATE
+
+
+def within_interval(marker, min_interval_hours: float, now: float):
+    """Hours since the last recorded pass if it falls INSIDE the window, else None.
+
+    Pure given the filesystem, and separated from main() for the same reason
+    select_rows is: a gate that can silently skip work must be directly
+    testable, not only observable through a 7-second enumeration.
+
+    EVERY failure path returns None, i.e. RUN. An unreadable or missing marker
+    must be able to cost an extra pass, never to skip one -- the failure this
+    module exists to fix is a repair that never runs.
+    """
+    if min_interval_hours <= 0:
+        return None
+    try:
+        if not marker.exists():
+            return None
+        age_h = (now - marker.stat().st_mtime) / 3600.0
+    except OSError:
+        return None
+    return age_h if age_h < min_interval_hours else None
 
 
 def select_rows(facts, min_age_minutes: float, writable_agent: str):
@@ -189,6 +218,10 @@ def main(argv=None) -> int:
                     help="actually write; default is a dry run")
     ap.add_argument("--min-age-days", type=float, default=DEFAULT_MIN_AGE_DAYS)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--quiet", action="store_true",
+                    help="print nothing when the pass selects nothing")
+    ap.add_argument("--min-interval-hours", type=float, default=0.0,
+                    help="skip if a pass ran within this window; 0 = ungated")
     args = ap.parse_args(argv)
 
     agent = os.environ.get("MIND_AGENT", "").strip()
@@ -196,6 +229,53 @@ def main(argv=None) -> int:
         print("orphan-carrier-repair: MIND_AGENT is unset -- refusing "
               "(the bound agent IS the writer scope)", file=sys.stderr)
         return 3
+
+    # G4 RETRY LANE (), run BEFORE the interval gate and before the
+    # enumeration, and deliberately not subject to either. It is cheap -- one
+    # small local file read, and a backend read only when a row is actually
+    # pending -- and it must not inherit the 3.0-day selection bar that governs
+    # the repair below: the rows it retries have ALREADY been repaired locally,
+    # so their delivery gap is open from the moment the push was refused and
+    # nothing else in the tree can close it. Its own report carries every
+    # verdict; a pass with nothing pending is `pending: 0`, never silence.
+    retry_report = cpr.retry_pending(agent, apply=args.apply)
+
+    # INTERVAL GATE, deliberately checked BEFORE the enumeration, because the
+    # enumeration IS the cost: ~7.0s of authoritative fleet-wide carrier reads,
+    # measured twice on cc-05 against 78 carriers. Gating after it saves nothing.
+    # Opt-in -- default 0.0 leaves every hand-run ungated, so this can never
+    # silently swallow a deliberate manual pass.
+    # WHY A WINDOW AT ALL: selection requires DEFAULT_MIN_AGE_DAYS = 3.0, so a
+    # per-iteration cadence oversamples the detected condition by ~500x and
+    # cannot surface anything an hourly pass would miss.
+    # The marker records the ATTEMPT and is written BEFORE the work, so a crash
+    # mid-pass cannot produce a hot retry loop (embedding-index-freshness.py
+    # uses this shape for the same reason). Every failure path here FALLS
+    # THROUGH TO THE REPAIR: an unreadable or unwritable marker must never be
+    # able to skip a pass, only to cost an extra one.
+    marker = agent_state_dir(agent) / MARKER_NAME
+    if args.min_interval_hours > 0:
+        age_h = within_interval(marker, args.min_interval_hours, time.time())
+        if age_h is not None:
+            # The retry lane already ran above and is NOT interval-gated, so an
+            # interval skip must still surface what it did -- otherwise the one
+            # lane that is allowed to act on every pass would be the only one
+            # nobody can see acting.
+            if retry_report.get("pending") or retry_report.get("expired"):
+                print("orphan-carrier-repair: push-retry " + json.dumps(
+                    retry_report, default=str))
+            elif not args.quiet:
+                print("orphan-carrier-repair: last pass %.1fh ago, within the "
+                      "%.1fh window -- skipping"
+                      % (age_h, args.min_interval_hours))
+            return 0
+        try:
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(
+                dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S") + "\n",
+                encoding="utf-8")
+        except OSError:
+            pass
 
     agents_dir = agents_root()
     rows, meta = ws.enumerate_carriers(agents_dir)
@@ -223,7 +303,8 @@ def main(argv=None) -> int:
 
     out = {"agent": agent, "carriers_found": len(rows), "enumeration": meta,
            "min_age_days": args.min_age_days, "selected": len(selected),
-           "applied": bool(args.apply), "results": []}
+           "applied": bool(args.apply), "results": [],
+           "push_retry": retry_report}
 
     if args.apply and selected:
         import importlib.util  # noqa: PLC0415
@@ -234,7 +315,33 @@ def main(argv=None) -> int:
         spec.loader.exec_module(bm)
         for f in selected:
             _, _, state_dir = bm._agent_paths(f["agent"], f["sid"], None)
-            out["results"].append(repair_one(f["sid"], f["doc"], state_dir))
+            res = repair_one(f["sid"], f["doc"], state_dir)
+            # G4 RETRY BREADCRUMB (). repair_one's own local write
+            # clears `body_state: active`, so select_rows' live-state clause can
+            # never re-select this row and a refused push is permanent. Record
+            # the independently-written refusal signal the retry lane keys on.
+            # Fail-open -- telemetry must not change the repair verdict.
+            if res.get("verdict") == cpr.REFUSAL_VERDICT:
+                try:
+                    cpr.record_push_failure(
+                        f["agent"], f["sid"], ts=(f["doc"] or {}).get("ts"),
+                        body_state=REPAIR_STATE, error=res.get("push_error"),
+                        state_dir=state_dir)
+                except Exception:  # noqa: BLE001
+                    pass
+            out["results"].append(res)
+
+    # QUIET belongs to the wired call site, which runs on a cadence and is
+    # EXPECTED to find nothing on almost every pass. A summary line on every
+    # clean pass trains the reader to filter the stream, so the one pass that
+    # actually repairs something arrives somewhere already ignored
+    # (guard-2418 class). Silence is safe ONLY because the marker above is the
+    # durable record that the pass ran; without it this would recreate the very
+    # silent-all-clear the module exists to end.
+    if (args.quiet and not selected and not out["results"]
+            and not retry_report.get("pending")
+            and not retry_report.get("expired")):
+        return 0
 
     if args.json:
         print(json.dumps(out, indent=2, default=str))
@@ -253,6 +360,13 @@ def main(argv=None) -> int:
               + ", ".join("%s=%d" % (k, reasons[k]) for k in sorted(reasons)))
         for r in out["results"]:
             print("  -> %s %s" % (r["sid"], r["verdict"]))
+        print("  PUSH-RETRY: pending=%d retired=%d kept=%d expired=%d%s"
+              % (retry_report.get("pending", 0), retry_report.get("retired", 0),
+                 retry_report.get("kept", 0), len(retry_report.get("expired") or []),
+                 "" if not retry_report.get("error")
+                 else " error=%s" % retry_report["error"]))
+        for r in retry_report.get("results") or []:
+            print("    -> %s %s" % (r.get("sid"), r.get("verdict")))
     return 0
 
 

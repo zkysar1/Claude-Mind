@@ -393,6 +393,12 @@ re-introduces the clobber class g-115-1561 fixed.
               Checkpoint: phase_completed=verify, started_at preserved.
   Phase 5.3.  Attribution — IF completed: aspirations-complete-by.sh --source {source}
               ELIF non-terminal: aspirations-release.sh --source {source}
+              # RELEASED PARTIAL UNIT → SKIP Phase 8 AND Phase 12; go straight to
+              # productivity-check (g-115-9994). Both call _assert_verify_landed, which
+              # REFUSES a released unit — correctly, it did not close, so its counters
+              # must not bump. Do NOT force the goal terminal to satisfy the refusal:
+              # that drops its remaining units from the selector (guard-6733). Answer
+              # the Phase 12 residue by hand, then productivity-check, then terminal pair.
               # SOURCE-AGNOSTIC since g-306-249 — this is the RELEASE half that
               # HAS to move with the Phase 4 claim guard above. A claim protocol
               # with no matching release strands a claim on every recurring

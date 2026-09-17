@@ -32,4 +32,14 @@ source "$SCRIPT_DIR/_paths.sh"
 # code is grants.py's own — `check` returns 0 allow / 3 deny / 4 unavailable,
 # and a wrapper that swallowed those would collapse the DENY-vs-UNAVAILABLE
 # split the gate depends on.
-exec python3 "$SCRIPT_DIR/grants.py" "$@"
+#  fix: under Git Bash on Windows, $(cd ... && pwd) returns POSIX
+# form /c/... Windows python3 misinterprets that as drive C: with a literal
+# subdir c/, yielding FileNotFoundError on C:\c\...\grants.py.
+# Convert to Windows-native form before exec. Linux/macOS lack cygpath and
+# fall through with SCRIPT_DIR unchanged (POSIX paths work natively).
+if command -v cygpath >/dev/null 2>&1; then
+    SCRIPT_DIR_NATIVE="$(cygpath -w "$SCRIPT_DIR")"
+else
+    SCRIPT_DIR_NATIVE="$SCRIPT_DIR"
+fi
+exec python3 "$SCRIPT_DIR_NATIVE/grants.py" "$@"

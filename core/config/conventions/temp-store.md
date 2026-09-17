@@ -95,7 +95,7 @@ consumed within the current step, write to `session/scratch/`.
 ### The harness scratchpad is neither (2026-08-21)
 
 There is a THIRD temp-shaped surface, and it is banned: the Claude Code
-per-session scratchpad at `<system-temp>/claude/<project-slug>/<sid>/`, which
+per-session scratchpad at `<system-temp>/claude-<uid>/<project-slug>/<sid>/`, which
 the platform's system prompt actively tells the model to use. It sits outside
 every governed root, so nothing in this table applies to it — no drain, no
 receipts, no citation protection, no S3 durability, no other agent can even

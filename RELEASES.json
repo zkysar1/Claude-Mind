@@ -1,5 +1,38 @@
 [
   {
+    "version": "2.12.74",
+    "previous_version": "2.12.73",
+    "date": "2026-09-17",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "seed publishability fix: genericize two vendor-named comments in monitor-probes.yaml; carries v2.12.73 (sidecar-signed stop survives /start, exhaustion fence counts a diary-less session, g-373-16 R3)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.73",
+    "previous_version": "2.12.72",
+    "date": "2026-09-17",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "vessel stop guard keeps a sidecar-signed stop; exhaustion fence counts a diary-less session; carries g-373-16 R3 (start hand-off routes a pending stop to its handler)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.72",
+    "previous_version": "2.12.71",
+    "date": "2026-09-15",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Dev frontier cut for downstream measurement: carries e79dcf1674 (g-373-16 vessel-sidecar stop-routing) and 469 commits since v2.12.71. First cut under the g-373-82 trigger — demand-pull plus the >=24h staleness cutoff (gap was 34.8h).",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.71",
     "previous_version": "2.12.70",
     "date": "2026-09-13",

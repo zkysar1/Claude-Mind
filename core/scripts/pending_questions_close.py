@@ -71,7 +71,8 @@ def _split(doc):
     return False, (doc or [])
 
 
-def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None):
+def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None,
+                   amend=False):
     if pq_path:
         path = Path(pq_path).resolve()
     else:
@@ -120,9 +121,37 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None):
             res.update(action="not_found")
             return res, 3
         cur = str(q.get("status", "pending")).lower()
-        if cur in TERMINAL:
+        if cur in TERMINAL and not amend:
             res.update(action="already_terminal", status=cur)
             return res, 0  # idempotent
+        if cur in TERMINAL and amend:
+            # AMEND (). A terminal pending-question is an ANSWER STORE, not
+            # an archive (guard-6282): the next reader treats it as the authoritative
+            # record of a user-set decision. When the GOVERNING decision POSTDATES the
+            # stored answer (guard-5868), leaving the superseded text in place can
+            # drive a revert of already-shipped work — measured on
+            # -ayoai-welcome-email-vinheim-cta, resolved 2026-09-15 by an
+            # agent-side reclaim whose answer the owner overturned on 2026-09-17.
+            # Without this branch an rc=0 `already_terminal` is NOT evidence the
+            # amendment was recorded, and there was no other write path.
+            # NON-DESTRUCTIVE BY CONSTRUCTION: the prior answer is appended to
+            # `superseded_answers` before the new one is written, so amending never
+            # destroys the record it corrects.
+            if not rationale:
+                res.update(action="amend_needs_rationale", status=cur)
+                return res, 2
+            prior = {k: q.get(k) for k in
+                     ("status", "answer", "answered_by", "resolved_at") if k in q}
+            prior["superseded_at"] = datetime.datetime.now().strftime(
+                "%Y-%m-%dT%H:%M:%S")
+            prior["superseded_by"] = answered_by
+            hist = q.get("superseded_answers")
+            if not isinstance(hist, list):
+                hist = []
+            hist.append(prior)
+            q["superseded_answers"] = hist
+            res["amended"] = True
+            res["superseded"] = prior
         # archive-before-overwrite: capture the pre-image of the record we touch
         res["pre_image"] = {k: q.get(k) for k in
                             ("id", "status", "question", "text", "default_action")
@@ -142,7 +171,9 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None):
         new_content = yaml.safe_dump(out, sort_keys=False, allow_unicode=True,
                                      default_flow_style=False)
         if dry_run:
-            res.update(action="would_close", status="answered", dry_run=True)
+            res.update(action=("would_amend" if res.get("amended")
+                               else "would_close"),
+                       status="answered", dry_run=True)
             return res, 0
         be.write_text(path, new_content)
         # verify from the authoritative store (re-read under the same lock)
@@ -150,7 +181,8 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None):
         _, vqs = _split(vdoc)
         _, vq = _find(vqs if isinstance(vqs, list) else [], qid)
         ok = vq is not None and str(vq.get("status", "")).lower() == "answered"
-        res.update(action="closed", status="answered", verified=bool(ok))
+        res.update(action=("amended" if res.get("amended") else "closed"),
+                   status="answered", verified=bool(ok))
         return res, (0 if ok else 5)
 
     # LocalBackend.conflict_error is () (empty tuple) → the except below matches
@@ -196,12 +228,20 @@ def main():
                     "configured root")
     ap.add_argument("--dry-run", action="store_true",
                     help="report what would change without writing")
+    ap.add_argument("--amend", action="store_true",
+                    help="rewrite the answer of an ALREADY-TERMINAL question "
+                    "(requires --rationale). The prior answer is preserved "
+                    "under `superseded_answers`, never destroyed. Use only "
+                    "when the governing decision POSTDATES the stored answer "
+                    "(guard-5868); a resolved question is an answer store a "
+                    "later reader trusts (guard-6282).")
     args = ap.parse_args()
     if not args.agent and not args.pq_path:
         print(json.dumps({"error": "need --agent or --pq-path"}))
         sys.exit(2)
     res, code = close_question(args.agent or "?", args.id, args.answered_by,
-                               args.rationale, args.dry_run, args.pq_path)
+                               args.rationale, args.dry_run, args.pq_path,
+                               args.amend)
     print(json.dumps(res, ensure_ascii=False))
     sys.exit(code)
 

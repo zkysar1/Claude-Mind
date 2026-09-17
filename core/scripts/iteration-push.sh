@@ -386,6 +386,75 @@ if [ -f "$SCRIPT_DIR/tree-lock.sh" ]; then
   elif [ "$_TL_RC" -ne 0 ]; then
     log "tree-lock: check failed rc=${_TL_RC} (plumbing, not a lock) — proceeding unguarded. ${_TL_OUT}"
   fi
+  # SELF-HELD: THE SAME DEGRADE FOR THIS SESSION'S OWN SUITE (). `check`
+  # returns 0 for a lock this sid holds -- right for a GATE, since a Body must never
+  # deadlock against itself -- and that left the one HEAD-mover the gate cannot see
+  # unguarded: the loop's OWN push. run-full-suite.sh takes the lock under the
+  # launching session's MIND_SID, a reducer's close-path push runs under that same
+  # sid, and a merge here voids the run (VERDICT: INVALID (tree-moved) outranks every
+  # verdict).  measured the median HEAD-still window at 7.1-7.4 min on two
+  # boxes against ~47 min for a --chunks 4 run. (The close path's deep-close COMMIT
+  # moves HEAD too; that is a separate lever, not something this branch can fix.)
+  #
+  # `held-by-me` answers 0 only for a LIVE lock this sid holds -- the foreign
+  # branch's own test: unexpired, holder pid not provably gone -- so a suite that died
+  # or overran its TTL releases its session at once. Any other answer, a plumbing
+  # fault included, is non-zero and leaves this invocation on its normal path, which
+  # is today's behaviour (guard-1562).
+  #
+  # Each mode keeps only the half that cannot move HEAD and exits ABOVE every merge
+  # site, so all of them stay gated by construction, exactly as in the foreign branch:
+  #   --push-worker-ref  the carrier push;
+  #   --no-push          nothing -- a pull-only call has nothing left it may do;
+  #   plain              a fast-forward push against the LAST-KNOWN origin ref, with no
+  #                      fetch and no push-race recovery (recovery merges). Not
+  #                      throttled: a fast-forward lands only while origin has not
+  #                      moved, so waiting for the batch thresholds would mostly turn
+  #                      a landable push into a deferred one.
+  # Skipping the plain push instead would strand a reducer's commits for the whole run
+  # (: "Do NOT implement by skipping the push entirely"). Nothing is lost;
+  # only fetch+merge wait for the lock to release.
+  if [ "$_TL_RC" -eq 0 ] && _TL_SELF="$(bash "$SCRIPT_DIR/tree-lock.sh" held-by-me --project-root "$REPO" 2>&1)"; then
+    if [ "$PUSH_WORKER_REF" = 1 ]; then
+      log "tree-lock: held by THIS session (its own suite is in flight) — DEGRADING --push-worker-ref to PUBLISH-ONLY (carrier push only; no fetch, no merge, HEAD not moved). ${_TL_SELF}"
+      _ip_push_worker_ref; _TL_WREF_RC=$?
+      soft_exit "$_TL_WREF_RC"
+    fi
+    if [ "$NO_PUSH" = 1 ]; then
+      log "tree-lock: held by THIS session (its own suite is in flight) — --no-push has nothing it may do without moving HEAD; skip, retry next iteration. ${_TL_SELF}"
+      soft_exit 0
+    fi
+    _TL_BR="${BRANCH_OVERRIDE:-$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")}"
+    if [ -z "$_TL_BR" ] || [ "$_TL_BR" = "HEAD" ] \
+       || ! git -C "$REPO" rev-parse --verify "origin/$_TL_BR" >/dev/null 2>&1; then
+      log "tree-lock: held by THIS session — PUBLISH-ONLY has no branch or origin ref to publish against; skip. ${_TL_SELF}"
+      soft_exit 0
+    fi
+    _TL_AHEAD="$(git -C "$REPO" rev-list --count "origin/$_TL_BR..$_TL_BR" 2>/dev/null || echo 0)"
+    _TL_BEHIND="$(git -C "$REPO" rev-list --count "$_TL_BR..origin/$_TL_BR" 2>/dev/null || echo 0)"
+    case "$_TL_AHEAD" in ''|*[!0-9]*) _TL_AHEAD=0;; esac
+    case "$_TL_BEHIND" in ''|*[!0-9]*) _TL_BEHIND=0;; esac
+    if [ "$_TL_BEHIND" -gt 0 ]; then
+      log "tree-lock: held by THIS session — PUBLISH-ONLY: origin/${_TL_BR} has ${_TL_BEHIND} commit(s) this tree lacks, so a push cannot fast-forward without the merge its own suite forbids; deferred until the lock releases. ${_TL_SELF}"
+      soft_exit 0
+    fi
+    if [ "$_TL_AHEAD" -eq 0 ]; then
+      log "tree-lock: held by THIS session — PUBLISH-ONLY: origin/${_TL_BR} up to date (0 ahead), nothing to publish. ${_TL_SELF}"
+      soft_exit 0
+    fi
+    if [ "$DRY_RUN" = 1 ]; then
+      log "tree-lock: held by THIS session — dry-run: WOULD push ${_TL_BR} -> origin as a fast-forward (${_TL_AHEAD} ahead); no fetch, no merge"
+      soft_exit 0
+    fi
+    log "tree-lock: held by THIS session (its own suite is in flight) — DEGRADING to PUBLISH-ONLY: pushing ${_TL_BR} -> origin (${_TL_AHEAD} ahead) as a fast-forward; no fetch, no merge, no race recovery, HEAD not moved. ${_TL_SELF}"
+    _TL_PUSH_OUT="$(GIT_TERMINAL_PROMPT=0 $IP_TMO git -C "$REPO" push origin "$_TL_BR" 2>&1)"; _TL_PUSH_RC=$?
+    if [ "$_TL_PUSH_RC" -eq 0 ]; then
+      log "publish-only push OK: origin/${_TL_BR} now at $(git -C "$REPO" rev-parse --short "origin/$_TL_BR" 2>/dev/null || echo '?')"
+      soft_exit 0
+    fi
+    log "publish-only push FAILED (rc=${_TL_PUSH_RC}) — NOT recovering, because recovery merges; retry next iteration: $(printf '%s' "$_TL_PUSH_OUT" | tail -n 1)"
+    soft_exit 1
+  fi
 fi
 
 # Current branch (skip detached HEAD).

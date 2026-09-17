@@ -68,6 +68,28 @@ def test_rotate_appends_to_existing_archive(tmp_path):
     assert [r["i"] for r in _read(p)] == [4, 5]
 
 
+def test_a_rotation_on_a_stale_snapshot_drops_only_what_it_archived(tmp_path, monkeypatch):
+    """: a second rotation whose snapshot predates the first rotation's
+    drop (another box, one sync window) archives the OLD front again. The live
+    drop used to count n_drop off the FRESH front, which by then starts past the
+    first rotation's cut -- so it removed records that no rotation archived."""
+    p = tmp_path / "ch.jsonl"
+    pre = [{"i": i} for i in range(10)]
+    _write(p, pre)
+    rep_a = jh.hygiene_one(p, mode="rotate", by="lines", max_lines=6, apply=True)  # A: 0-3
+    _write(p, _read(p) + [{"i": 10}, {"i": 11}])                          # live 4..11
+    stale = pre + [{"i": 10}]                          # B read before A dropped
+    monkeypatch.setattr(jh, "_snapshot", lambda path: list(stale))
+    rep_b = jh.hygiene_one(p, mode="rotate", by="lines", max_lines=6, apply=True)  # B: 0-4
+    live = [r["i"] for r in _read(p)]
+    archived = [r["i"] for r in _read(tmp_path / "ch-archive.jsonl")]
+    assert set(live) | set(archived) == set(range(12))     # nothing in no store
+    assert live == [5, 6, 7, 8, 9, 10, 11]                 # dropped only 4
+    # archived vs what actually left live are reported apart (guard-2603)
+    assert (rep_a["dropped"], rep_a["live_dropped"]) == (4, 4)
+    assert (rep_b["dropped"], rep_b["live_dropped"]) == (5, 1)
+
+
 def test_rotate_custom_archive_path(tmp_path):
     p = tmp_path / "log.jsonl"
     custom = tmp_path / "sink.jsonl"
@@ -413,6 +435,62 @@ def test_rotate_live_lock_exhausted_raises_and_archives_once(tmp_path, monkeypat
     assert state["live"] == jh._ROTATE_LIVE_LOCK_RETRIES       # every window used
     assert [r["i"] for r in _read(p)] == list(range(10))       # live untouched
     assert [r["i"] for r in _read(tmp_path / "j-archive.jsonl")] == [0, 1, 2, 3, 4, 5]
+
+
+def test_failed_phase2_then_clean_rerun_archives_each_record_once(tmp_path, monkeypatch):
+    # . The test above stops at the FAILED sweep. The defect lives in
+    # what the NEXT sweep does: the slice is still live, so Phase 1 re-derives
+    # the same `oldest` and -- before the fix -- appended it a second time,
+    # archiving a record twice that sat in the live file ONCE. Assert by ID SET
+    # and by CONTENT, never by count: a count alone cannot tell a duplicated
+    # record from a lost-and-replaced one (guard-5894 resolves JSONL claims to
+    # the record level), and byte-identical twins are exactly the residue shape
+    # this fix stops producing.
+    import _fileops
+    import pytest
+    real = _fileops.locked_modify_jsonl
+    p = tmp_path / "j.jsonl"
+    arch = tmp_path / "j-archive.jsonl"
+    recs = [{"id": f"m-{i}", "body": f"payload-{i}"} for i in range(10)]
+    _write(p, recs)
+    fail_live = {"on": True}
+
+    def maybe_timeout_live(path, fn):
+        if Path(path).name == "j.jsonl" and fail_live["on"]:
+            raise TimeoutError(f"Could not acquire lock: {path}")
+        return real(path, fn)
+
+    monkeypatch.setattr(_fileops, "locked_modify_jsonl", maybe_timeout_live)
+    monkeypatch.setattr(jh.time, "sleep", lambda *_a, **_k: None)
+
+    # Sweep 1: every Phase-2 window times out. Archive-FIRST already ran.
+    with pytest.raises(TimeoutError):
+        jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert _read(p) == recs                                    # live untouched
+    assert _read(arch) == recs[:6]
+
+    # Sweep 2: the live lock is free. Phase 1 must recognise its own prior
+    # append at the archive tail and add nothing.
+    fail_live["on"] = False
+    rep = jh.hygiene_one(p, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert rep["action"] == "rotated" and rep["applied"] is True
+    assert rep["archive_skipped"] == 6      # the whole re-derived slice, skipped
+    assert _read(p) == recs[6:]             # live now holds only the tail
+
+    archived = _read(arch)
+    ids = [r["id"] for r in archived]
+    assert sorted(ids) == sorted(r["id"] for r in recs[:6])   # ID SET: each once
+    assert len(ids) == len(set(ids))                          # no twin of any id
+    assert archived == recs[:6]                               # CONTENT + order
+
+    # Positive control: a rotation with no prior failed attempt skips NOTHING,
+    # so the assertion above is testing the retry path and not a skip that
+    # fires on every rotation.
+    q = tmp_path / "k.jsonl"
+    _write(q, recs)
+    rep2 = jh.hygiene_one(q, mode="rotate", by="lines", max_lines=4, apply=True)
+    assert rep2["archive_skipped"] == 0
+    assert _read(tmp_path / "k-archive.jsonl") == recs[:6]
 
 
 def test_rotate_front_shift_runtimeerror_not_retried(tmp_path, monkeypatch):
@@ -762,10 +840,10 @@ def test_detect_overcap_single_reading_does_not_fire(tmp_path, monkeypatch):
 
 def test_detect_overcap_threshold_is_honoured(tmp_path, monkeypatch):
     store = tmp_path / "mild.jsonl"
-    _write(store, [{"i": i} for i in range(6)])           # cap 4 → 1.5x
-    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=4)])
-    assert jh.detect_overcap()["over_now"] == {}           # 1.5 < 2.0
-    assert str(store) in jh.detect_overcap(threshold=1.5)["over_now"]
+    _write(store, [{"i": i} for i in range(6)])           # cap 5 → 1.2x
+    _detector_world(tmp_path, monkeypatch, [_store_entry(store, max_lines=5)])
+    assert jh.detect_overcap()["over_now"] == {}           # 1.2 < 1.25
+    assert str(store) in jh.detect_overcap(threshold=1.2)["over_now"]
 
 
 # ── the population is reported beside the filtered count (guard-2273) ────────

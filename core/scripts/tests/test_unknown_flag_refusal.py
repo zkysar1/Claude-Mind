@@ -32,7 +32,7 @@ passthrough form, run with the first case's argv, exited **1** — so
 `assert rc != 0` would have stayed GREEN. Its stderr is the defect itself,
 verbatim:
 
-    {"error": "invalid_goal_id", "detail": "expected g-NNN-NN[N[N]], got 'SLID'"}
+    {"error": "invalid_goal_id", "detail": "expected g-NNN-NN[N[N[N]]], got 'SLID'"}
 
 `SLID` is the token that FOLLOWED the unknown flag. It reached the GOAL_ID slot,
 one position left of where the caller put it. Only `aspirations-update-goal.sh`

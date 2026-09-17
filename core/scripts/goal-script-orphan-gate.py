@@ -177,6 +177,10 @@ def main():
     orphan_refs: list = []
     total_refs = 0
     for path, label in sources:
+        if label.endswith("-archive"):
+            # The eager pull never re-pulls an archive ().
+            from _fresh_read import refresh_for_read
+            refresh_for_read(path, label="goal-script-orphan-gate")
         for ref in _scan_aspirations(
                 path, label, args.include_completed_goals):
             total_refs += 1

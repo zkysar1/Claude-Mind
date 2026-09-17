@@ -35,6 +35,22 @@ if [ -z "$REC_ID" ] || [ -z "$FIELD" ]; then
     exit 1
 fi
 
+# : REFUSE A CROSS-STORE ID BEFORE IT SPOOLS. Mirror of the check in
+# guardrails-increment.sh — read the rationale there. This is the side the
+# damage actually landed on: 7 of the 8 measured misrouted rows are guard-* ids
+# spooled through THIS wrapper into reasoning-bank-utilization.jsonl, where
+# utilization_of() for those guardrails never reads them (measured 2026-09-17,
+# echo, cc-03). Every one of 10,634 rb ids starts with `rb-`, so no ordinary
+# increment is refused — but ONE legitimate call is, and it lands on THIS side:
+# utilization-correct.sh zeroing an already-misrouted guard-* row routes here by
+# STORE and is refused. Read the scoped note in the sibling wrapper before
+# acting on that; the credit-restoration path is open, only the cleanup is not.
+case "$REC_ID" in
+    rb-*) ;;
+    *)  printf '{"error": "wrong_store_id", "detail": "reasoning-bank-increment.sh takes an rb-* id, got: %s — a cross-store id spools to the wrong sidecar and its credit becomes unreadable (g-115-6903)."}\n' "$REC_ID" >&2
+        exit 1;;
+esac
+
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"

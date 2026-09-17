@@ -77,6 +77,7 @@ except Exception:  # pragma: no cover - defensive stdio fallback
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from _paths import PROJECT_ROOT, agents_root
+from _fresh_read import read_text_authoritative
 
 SKILLS_DIR = PROJECT_ROOT / ".claude" / "skills"
 TS_FMT = "%Y-%m-%dT%H:%M:%S"
@@ -146,32 +147,35 @@ def read_ledger_invocations(root=None):
     per_skill = {}
     all_ts = []
     for f in sorted(base.glob("*/skill-invocations.jsonl")):
+        # Store bytes, not the local mirror: a PEER's ledger mirror can be short
+        # of the store (). `count` is a tally, so ONE copy, never the
+        # membership union ().
         try:
-            with open(f, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if not isinstance(r, dict):
-                        continue
-                    skill = r.get("skill")
-                    ts = _parse_ts(r.get("ts", ""))
-                    if not skill or ts is None:
-                        continue
-                    all_ts.append(ts)
-                    cur = per_skill.get(skill)
-                    if cur is None:
-                        per_skill[skill] = {"last": ts, "count": 1}
-                    else:
-                        cur["count"] += 1
-                        if ts > cur["last"]:
-                            cur["last"] = ts
+            text = read_text_authoritative(f, label="skill-freshness-report")
         except OSError:
             continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(r, dict):
+                continue
+            skill = r.get("skill")
+            ts = _parse_ts(r.get("ts", ""))
+            if not skill or ts is None:
+                continue
+            all_ts.append(ts)
+            cur = per_skill.get(skill)
+            if cur is None:
+                per_skill[skill] = {"last": ts, "count": 1}
+            else:
+                cur["count"] += 1
+                if ts > cur["last"]:
+                    cur["last"] = ts
     window = (min(all_ts), max(all_ts)) if all_ts else (None, None)
     return per_skill, window
 

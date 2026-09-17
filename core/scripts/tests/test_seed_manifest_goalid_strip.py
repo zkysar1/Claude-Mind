@@ -10,8 +10,10 @@ Background (2026-07-22, g-115-2919):
   only the first 3 digits: `g-115-2397` -> matched `g-115-239`, stripped it,
   and left a bare `7` FRAGMENT. Every downstream sync (Claude-Mind, ZDS-Mind)
   carried corrupted cross-references like `# (7, mirrors _merge_goal)`.
-  Fix: pattern MUST match the canonical goal-id regex `g-\\d{3}-\\d{2,4}`
-  (aspirations.py:1301).
+  Fix: pattern MUST match the canonical goal-id regex `g-\\d{3}-\\d{2,5}`
+  (aspirations.py GOAL_ID_RE). Widened again 2026-09-15 (g-306-486): asp-115
+  reached g-115-9999, so the seq is now 5 digits and \\d{2,4} would strip
+  g-115-10000 to a `1000` fragment -- the same defect one digit out.
 
 These tests load the REAL G13 rule from core/config/seed-manifest.yaml and run
 it through the REAL transform engine, so a revert to `\\d{1,3}` (or any
@@ -108,7 +110,7 @@ def test_g13_only_strips_in_comment_context():
 def test_g13_pattern_is_canonical_goalid_regex():
     """Pin the pattern string itself to the canonical form so a future edit that
     re-narrows the second group is caught even if no strip case exercises it."""
-    assert _g13_rule()["pattern"] == r"g-\d{3}-\d{2,4}"
+    assert _g13_rule()["pattern"] == r"g-\d{3}-\d{2,5}"
 
 
 # ---------------------------------------------------------------------------

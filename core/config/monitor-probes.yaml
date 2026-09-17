@@ -19,7 +19,30 @@
 #
 # Ships inert. Phase-3 (Apply-3) migrates Bucket-A pure-probes first
 # (/03/106/151/831) one id at a time.
-enabled_probes: []
+# FIRST PROBE ENABLED 2026-09-16 (echo, cc-03, ). The registry is no
+# longer inert on this deployment.
+#
+# THE PROMOTION HAZARD IS ACCEPTED IN WRITING, not overlooked ( /
+#  named it and the goal required an explicit decision). This file is
+# a FRAMEWORK path carrying DEPLOYMENT-OWNED state: ZDS prod already has enabled
+# probes whose values cannot back-port, so every plant flags this file prod-ahead
+# and a hand-restore has stood between ZDS and losing its probes across at least
+# three promotions. Adding a row here adds to that recurring cost.
+#
+# ACCEPTED ANYWAY, and the reasoning is specific rather than "monitoring is
+# good": the thing being watched is the least-watched tick in the estate AND the
+# one that mails real customers about money, and its failure mode is silent by
+# construction — the once-only `runReceiptAt` claim is set BEFORE the send and
+# stays set if the send throws, so a broken transport burns the receipt with
+# `ok:true` and `errors:[]` on the way out. Waiting for the world-overlay fix
+# () or seed-manifest preservation () means running that
+# exposure unwatched for however long those take. This row does not create a new
+# hazard CLASS — the file is already prod-ahead and already hand-restored; it
+# adds one row to a cost that is being paid regardless. The standing 2026-08-11
+# user directive ("we need to know asap if there is something wrong") is the tie
+# breaker, and it points at detection.
+enabled_probes:
+  - vinheim-settlement-tick
 
 # Probe definitions. A probe is a script that exits 0 when clean and NON-ZERO
 # when it trips; its combined stdout+stderr is captured as the trip evidence.
@@ -66,4 +89,35 @@ enabled_probes: []
 #     priority: MEDIUM
 #     category: infrastructure
 #     description: "Demoted from recurring  (operator health)."
-probes: []
+probes:
+  - id: vinheim-settlement-tick
+    script: world/scripts/probe-vinheim-settlement-tick.sh
+    interval_hours: 1
+    on_trip: file_goal
+    target_asp: asp-369
+    origin_signal_prefix: monitor-probe
+    title: "Unblock: Vinheim settlement tick — run-receipt detector tripped"
+    priority: HIGH
+    category: product-infrastructure
+    # 0 = clean, 1 = TRIP, 3 = PROBE ERROR (fail-open). 3 is clean-listed on
+    # purpose: "I could not read the log store" must never be filed as "the
+    # settlement tick is broken" — a transport fault about the PROBE would
+    # otherwise page about the TICK, and the resulting noise is how a real trip
+    # gets ignored.
+    clean_exit_codes: [0, 3]
+    # false (the default, stated explicitly because it is load-bearing here): a
+    # probe killed at the timeout boundary is a LOGGED ERROR, not a trip. The
+    # log-store query is bounded server-side and runs in ~1s against a 60s
+    # bound, so a timeout means the probe is sick, not the tick.
+    timeout_is_trip: false
+    description: >-
+      g-369-342. Watches the main Vinheim gateway settlement tick (10-minute
+      cadence), which mails run receipts to EVERY member. Trips on ok:false,
+      non-empty errors[], runReceiptTransport:false, no tick within 1500s, and —
+      the functional condition a liveness flag cannot provide — receipts DUE with
+      none SENT, or deferral persisting across consecutive ticks. rb-7003:
+      runReceiptTransport:true is never read as evidence receipts are working.
+      guard-4327: reads the tick's OWN emitted fields, never a re-implementation
+      of the send path. All 10 conditions (7 trips, 2 negative controls, 1
+      probe-error) exercised against mutations of a real captured payload,
+      2026-09-16.

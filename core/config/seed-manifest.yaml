@@ -511,11 +511,11 @@ transformations:
 
   - id: G13
     type: global_regex
-    pattern: 'g-\d{3}-\d{2,4}'
+    pattern: 'g-\d{3}-\d{2,5}'
     replacement: ''
     applies_to: ["core/**/*.py", "core/**/*.sh", "core/**/*.md", "core/**/*.yaml", "mind_api/**/*.py"]
     when_in_context: "comment"
-    reason: "Production goal IDs in comments (~30 hits). Pattern MUST match the canonical goal-id regex g-\\d{3}-\\d{2,4} (aspirations.py:1301). Do NOT narrow the second group back to \\d{1,3}: goal sequences expanded to 4 digits 2026-05-19 (g-115-999+), and \\d{1,3} greedily matched only the first 3 digits of a 4-digit seq — stripping g-115-2397 to a bare '7' fragment in every downstream seed (g-115-2919)."
+    reason: "Production goal IDs in comments (~30 hits). Pattern MUST match the canonical goal-id regex g-\\d{3}-\\d{2,5} (aspirations.py GOAL_ID_RE). Do NOT narrow the second group: goal sequences expanded to 4 digits 2026-05-19 (g-115-999+) and to 5 digits 2026-09-15 (g-115-9999+, g-306-486), and a too-narrow bound greedily matches only the leading digits of a longer seq — \\d{1,3} stripped g-115-2397 to a bare '7' fragment in every downstream seed (g-115-2919), and \\d{2,4} would do the same to g-115-10000."
 
   - id: G14
     type: global_regex

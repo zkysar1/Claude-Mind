@@ -5,7 +5,9 @@ into the world's unrelated aspiration because ``add-goal asp-002`` resolved the 
 first. The guards that matter: ids renumber into the target family (continuing after its
 highest), references among the moved goals follow the map, progress is recomputed on both
 records with the daemon's formula, the target is written BEFORE the source, and dry-run
-writes nothing.
+writes nothing. The source copy is TOMBSTONED, never removed: the live store is union-merged
+across boxes with no deletion semantics (guard-1072), so a popped goal is resurrected by any
+peer still holding it (measured 2026-09-17, 24 of 24 moved goals back as duplicates).
 """
 from __future__ import annotations
 
@@ -77,7 +79,10 @@ def test_dry_run_reports_the_map_and_progress_and_writes_nothing(tmp_path: Path)
     assert report["applied"] is False
     assert report["id_map"] == {"g-002-03": "g-004-12", "g-002-04": "g-004-13"}
     # Progress with the daemon's formula: recurring goals never count.
-    assert report["from"]["progress_after"]["total_goals"] == 0
+    # The two moved non-recurring goals stay in the source as superseded tombstones,
+    # and the daemon's formula counts abandoned goals in total_goals.
+    assert report["from"]["progress_after"]["total_goals"] == 2
+    assert report["from"]["progress_after"]["completed_goals"] == 0
     assert report["from"]["progress_after"]["recurring_goals"] == 1
     assert report["to"]["progress_after"]["total_goals"] == 4
     assert report["to"]["progress_after"]["completed_goals"] == 3
@@ -94,8 +99,16 @@ def test_apply_moves_renumbers_and_rewrites_references(tmp_path: Path) -> None:
     assert report["applied"] is True and report["source_changed"] == []
     assert report["scan_hits"] == {str(scan): [1]}
     (src,) = _read(world)
-    assert [g["id"] for g in src["goals"]] == ["g-002-01"]
-    assert src["progress"] == {"completed_goals": 0, "total_goals": 0, "recurring_goals": 1,
+    assert [g["id"] for g in src["goals"]] == ["g-002-01", "g-002-03", "g-002-04"]
+    stones = {g["id"]: g for g in src["goals"][1:]}
+    assert stones["g-002-03"]["status"] == "superseded" and stones["g-002-04"]["status"] == "superseded"
+    assert stones["g-002-03"]["moved_as"] == "g-004-12" and stones["g-002-04"]["moved_as"] == "g-004-13"
+    assert stones["g-002-03"]["moved_to"] == "asp-004" and stones["g-002-03"]["recurring"] is False
+    assert stones["g-002-03"]["moved_at"] == stones["g-002-03"]["last_modified"]
+    assert "g-004-12" in stones["g-002-03"]["outcome_note"] and "guard-1072" in stones["g-002-03"]["outcome_note"]
+    # The untouched goal is byte-identical; the tombstones are the only source change.
+    assert src["goals"][0] == {"id": "g-002-01", "title": "Sprint planning", "status": "pending", "recurring": True}
+    assert src["progress"] == {"completed_goals": 0, "total_goals": 2, "recurring_goals": 1,
                                "fan_out_ratio": None}
     (dst,) = _read(agent)
     ids = [g["id"] for g in dst["goals"]]
@@ -128,4 +141,69 @@ def test_same_file_move_between_two_records(tmp_path: Path) -> None:
                       "--to-asp", "asp-002", "--goal", "g-001-01", "--apply")
     assert rc == 0, report
     a, b = _read(store)
-    assert a["goals"] == [] and [g["id"] for g in b["goals"]] == ["g-002-01"]
+    assert [(g["id"], g["status"], g.get("moved_as")) for g in a["goals"]] == [("g-001-01", "superseded", "g-002-01")]
+    assert [(g["id"], g["status"]) for g in b["goals"]] == [("g-002-01", "pending")]
+
+
+def test_tombstone_survives_the_cross_box_union_merge(tmp_path: Path) -> None:
+    """The property the tombstone exists for: merged against a peer's STALE pre-move
+    copy (still pending, older last_modified), the source record stays superseded.
+    A popped record has no side to win from — the union simply keeps the stale copy."""
+    sys.path.insert(0, str(SCRIPT.parent))
+    from coordination_merge import _merge_goals  # noqa: E402
+
+    world, agent = _stores(tmp_path)
+    stale = [json.loads(json.dumps(g)) for g in _read(world)[0]["goals"]]
+    for g in stale:
+        g.setdefault("last_modified", "2026-09-16T00:00:00")
+    # A peer copy that was never edited carries NO last_modified at all — the common
+    # shape for a freshly filed idea; the merge sorts a missing stamp oldest.
+    unstamped = [{k: v for k, v in g.items() if k != "last_modified"} for g in stale]
+    rc, _report = _run(*_args(world, agent, "g-002-03"), "--apply")
+    assert rc == 0
+    tombstoned = _read(world)[0]["goals"]
+    for peer in (stale, unstamped):
+        for a_side, b_side in ((peer, tombstoned), (tombstoned, peer)):
+            merged = {g["id"]: g for g in _merge_goals(a_side, b_side, "002")}
+            assert merged["g-002-03"]["status"] == "superseded", merged["g-002-03"]
+            assert merged["g-002-03"]["moved_as"] == "g-004-12"
+            assert merged["g-002-04"]["status"] == "completed"  # untouched goal unaffected
+    # Contrast: the pre-fix behaviour. A side that simply LACKS the goal loses it back.
+    without = [g for g in tombstoned if g["id"] != "g-002-03"]
+    merged = {g["id"]: g for g in _merge_goals(without, stale, "002")}
+    assert merged["g-002-03"]["status"] == "pending"  # resurrected — exactly what the tombstone prevents
+
+
+def test_refuses_a_claimed_or_in_progress_goal(tmp_path: Path) -> None:
+    world, agent = _stores(tmp_path)
+    recs = _read(world)
+    recs[0]["goals"][1]["claimed_by"] = "alpha"
+    _write(world, recs)
+    rc, report = _run(*_args(world, agent, "g-002-03", "g-002-04"), "--apply")
+    assert rc == 1 and "in flight" in report["error"] and "g-002-03" in report["error"]
+    assert _read(world) == recs                      # nothing written on either side
+    assert [g["id"] for g in _read(agent)[0]["goals"]] == ["g-004-01", "g-004-11"]
+
+
+def test_target_ids_skip_the_evicted_seqs(tmp_path: Path) -> None:
+    """An evicted seq is allocated forever: a goal re-minted onto one would be dropped
+    by the next merge as a resurrection (g-115-2430). The daemon's allocator counts
+    evicted ids toward max+1; so must the mover."""
+    world, agent = _stores(tmp_path)
+    recs = _read(agent)
+    recs[0]["archived_census"] = {"evicted_ids": {"completed": ["g-004-12", "g-004-20"],
+                                                  "skipped": ["g-004-13"]}}
+    _write(agent, recs)
+    rc, report = _run(*_args(world, agent, "g-002-03", "g-002-04"), "--apply")
+    assert rc == 0, report
+    assert report["id_map"] == {"g-002-03": "g-004-21", "g-002-04": "g-004-22"}
+    assert [g["id"] for g in _read(agent)[0]["goals"]] == ["g-004-01", "g-004-11", "g-004-21", "g-004-22"]
+
+
+def test_refuses_to_move_a_tombstone_again(tmp_path: Path) -> None:
+    world, agent = _stores(tmp_path)
+    rc, _ = _run(*_args(world, agent, "g-002-03"), "--apply")
+    assert rc == 0
+    rc, report = _run(*_args(world, agent, "g-002-03"), "--apply")      # second move of the tombstone
+    assert rc == 1 and "already moved" in report["error"] and "g-002-03->g-004-12" in report["error"]
+    assert [g["id"] for g in _read(agent)[0]["goals"]] == ["g-004-01", "g-004-11", "g-004-12"]  # no third copy

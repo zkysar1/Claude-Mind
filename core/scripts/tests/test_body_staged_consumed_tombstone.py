@@ -375,3 +375,166 @@ def test_the_tombstone_is_invisible_to_both_staged_WM_readers(tmp_path, ws):
     assert f"{UNIT}-wm.consumed" not in listed
     # POSITIVE CONTROL: both matchers DO see the real staged WM.
     assert f"{UNIT}-wm.yaml" in globbed and f"{UNIT}-wm.yaml" in listed
+
+
+# ------------------------------------------- the ORDERING half ()
+#
+# The tests above prove the tombstone is WRITTEN. These prove WHEN. The
+# tombstone is the ACK the origin box reads, and the reducer-WM persist is a
+# SEPARATE durable write that can fail while the drain keeps going — so a
+# tombstone written at the disposition decision ACKs a delivery that has not
+# happened. Measured 2026-09-12T11:19: one cc-07 reducer drain tombstoned 10
+# cross-box units and persisted nothing; the triples survived (a later drain
+# can still re-merge them) but all 10 PRODUCERS were permanently gated from
+# re-pushing. guard-953 is the general form: an ACK follows the durable write.
+#
+# TWO-SIDED BY CONSTRUCTION, because "no tombstone" is the PASS condition of
+# the failure case and is also what a completely inert _consume_staged looks
+# like (guard-2903 / guard-4166). Both directions therefore assert
+# summary["staged_merged"] == [UNIT] — proof the MERGED branch actually ran —
+# and the success case asserts the tombstone IS there, so the failure case
+# cannot be passing because tombstoning stopped working altogether.
+#
+# SCOPE, stated so the pin is not over-read: this pins the ORDERING, i.e. that
+# a persist which RAISES leaves no ACK. It does not and cannot pin a persist
+# that returns successfully and is later lost (an own-cloud write conflict —
+# rb-3636 / guard-3209). That is the other branch of the same outcome and needs
+# a durability barrier, not an ordering change.
+
+
+class _ReadableRecordingBackend(RecordingBackend):
+    """RecordingBackend plus the authoritative read `_consume_staged` prefers.
+
+    Without it the drain falls back to the local read, which also works here —
+    but that fallback shares its except-branch with the transport-error path
+    that DEFERS a unit, and a deferred unit never reaches the merged branch.
+    The test would then pass while measuring nothing.
+    """
+
+    def read_authoritative_bytes(self, path):
+        return Path(path).read_bytes()
+
+
+class _OrderWitnessBackend(_ReadableRecordingBackend):
+    """Records, for every delete, whether the tombstone was already on disk.
+
+    Ordering cannot be read off the final filesystem state — tombstone-then-
+    delete and delete-then-tombstone leave byte-identical trees. It has to be
+    witnessed AT the delete.
+    """
+
+    def __init__(self, marker: Path):
+        super().__init__()
+        self._marker = marker
+        self.tombstone_present_at_delete: list[bool] = []
+
+    def delete_object(self, path):
+        self.tombstone_present_at_delete.append(self._marker.is_file())
+        super().delete_object(path)
+
+
+def _stage_world(ws: Path, unit_key: str):
+    """A world-staged triple whose hash sidecar deliberately does NOT match, so
+    guard 2 (unchanged-from-baseline) misses and the unit takes the MERGED
+    branch — the only branch with a deferred persist."""
+    (ws / f"{unit_key}-wm.yaml").write_text("counter: 3\n", encoding="utf-8")
+    (ws / f"{unit_key}-wm.hash").write_text("notthehash", encoding="utf-8")
+    (ws / f"{unit_key}-wm-baseline.yaml").write_text("counter: 1\n", encoding="utf-8")
+
+
+def _fresh_summary() -> dict:
+    return {"scanned": 0, "staged_merged": [], "staged_dedup": [],
+            "staged_deferred": [], "noop": [], "skipped": []}
+
+
+def _drive_consume(monkeypatch, tmp_path, agent, ws, *, persist_raises: bool,
+                   backend=None):
+    """Run a real _consume_staged over one merged unit. Returns (summary, be)."""
+    be = backend if backend is not None else _ReadableRecordingBackend()
+    monkeypatch.setattr(bmerge, "_get_backend", lambda: be)
+
+    # Deliberately NOT given the reducer WM's production basename: the function
+    # takes this path as a PARAMETER and derives nothing from its name, while
+    # that basename trips the framework's direct-store-write gate even inside a
+    # tmp fixture. The pin is unaffected and the live store stays untouched.
+    reducer_wm = tmp_path / "reducer-wm-fixture.yaml"
+    reducer_wm.write_text("counter: 10\n", encoding="utf-8")
+
+    import contextlib
+    # The lock is pinned by test_wm_lock_spans_read_write_g115_8667; here it is
+    # only noise, and a real lockfile adds a failure mode this pin does not own.
+    monkeypatch.setattr(bmerge.wm, "wm_lock_for",
+                        lambda p: contextlib.nullcontext(), raising=False)
+
+    if persist_raises:
+        def _boom(path, data):
+            raise RuntimeError("simulated non-persisting reducer (cc-07 shape)")
+        monkeypatch.setattr(bmerge, "_write_yaml_atomic", _boom)
+
+    _stage_world(ws, UNIT)
+    summary = _fresh_summary()
+    if persist_raises:
+        with pytest.raises(RuntimeError):
+            bmerge._consume_staged(agent, reducer_wm, summary, set())
+    else:
+        bmerge._consume_staged(agent, reducer_wm, summary, set())
+    return summary, be
+
+
+def test_a_failed_persist_leaves_NO_tombstone_and_the_triple_intact(
+        tmp_path, agent, ws, monkeypatch):
+    """THE LOAD-BEARING DIRECTION. No delivery, therefore no ACK."""
+    summary, _be = _drive_consume(monkeypatch, tmp_path, agent, ws,
+                                  persist_raises=True)
+
+    assert summary["staged_merged"] == [UNIT], (
+        "precondition: the unit must have taken the MERGED branch — a deferred "
+        "or noop unit never reaches the persist, so the assertions below would "
+        "hold vacuously")
+
+    assert not (ws / f"{UNIT}-wm.consumed").exists(), (
+        "a persist that never landed must not tell the origin box the unit was "
+        "consumed — that is the g-115-9876 defect: 10 producers gated against a "
+        "delivery that never happened")
+    assert (ws / f"{UNIT}-wm.yaml").is_file(), (
+        "and the triple must survive, so a later drain from a box that CAN "
+        "persist still delivers it")
+    assert (ws / f"{UNIT}-wm.hash").is_file()
+    assert (ws / f"{UNIT}-wm-baseline.yaml").is_file()
+
+
+def test_a_successful_persist_DOES_tombstone_and_deletes_the_triple(
+        tmp_path, agent, ws, monkeypatch):
+    """THE POSITIVE CONTROL. Without it the test above is satisfied by a
+    _consume_staged that never tombstones anything at all."""
+    summary, _be = _drive_consume(monkeypatch, tmp_path, agent, ws,
+                                  persist_raises=False)
+
+    assert summary["staged_merged"] == [UNIT]
+    assert (ws / f"{UNIT}-wm.consumed").is_file(), (
+        "a durably-merged unit MUST be tombstoned, or the origin box re-pushes "
+        "it and the 3-way delta is applied twice (g-115-9750 outcome 3)")
+    assert not (ws / f"{UNIT}-wm.yaml").exists(), (
+        "and the triple is consumed exactly once")
+
+
+def test_the_tombstone_still_precedes_the_delete_after_the_reorder(
+        tmp_path, agent, ws, monkeypatch):
+    """Moving the tombstone past the PERSIST must not move it past the DELETE.
+
+    Tombstone-then-delete is the invariant `_mark_consumed`'s docstring
+    protects: delete-first leaves triple gone / no tombstone, and the origin
+    resurrects it. Witnessed at the delete, because the final tree is identical
+    under either order.
+    """
+    be = _OrderWitnessBackend(ws / f"{UNIT}-wm.consumed")
+    summary, _ = _drive_consume(monkeypatch, tmp_path, agent, ws,
+                                persist_raises=False, backend=be)
+
+    assert summary["staged_merged"] == [UNIT]
+    assert be.tombstone_present_at_delete, (
+        "precondition: no authoritative delete was witnessed at all, so this "
+        "test measured nothing")
+    assert all(be.tombstone_present_at_delete), (
+        "every delete on the merged path must find the tombstone already "
+        "written; a False here is a regression to delete-first")

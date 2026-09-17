@@ -106,7 +106,8 @@ V_UNREADABLE = "unreadable"          # present but no usable ts
 # caught LOUDLY at test time instead -- test_state_partition_matches_body_manifest
 # importlib-loads the real module and asserts these agree, the same
 # pin-the-divergence technique test_reducer_self_fence.py uses on its sibling.
-CLOSED_BODY_STATES = frozenset({"closed-pending-merge", "merged", "closed-stale"})
+CLOSED_BODY_STATES = frozenset({"closed-pending-merge", "merged", "closed-stale",
+                                "closed-graceful"})
 # `parked` is a LIVE but deliberately dormant Body (body-manifest.park_body;
 # capped at PARK_MAX_HOURS=60 with an hourly reducer re-poll). Excluded from the
 # alert on purpose: its re-poll cadence is ~= this module's staleness threshold,

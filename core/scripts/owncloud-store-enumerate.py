@@ -374,6 +374,22 @@ def cmd_copy(args) -> int:
             comparable = not _is_multipart(etag) and not _is_multipart(d_etag)
             if comparable:
                 same = d_etag == etag
+            elif args.multipart_compare == "size":
+                # SIZE ONLY for the non-comparable bucket. The timestamp arm
+                # below assumes the destination was written FROM this source, so
+                # `src_lm > d_lm` means "the source moved on". That assumption
+                # INVERTS on a reverse-direction copy: after the 2026-09-14
+                # cutover every object in the basement store carries the
+                # LastModified of the migration that wrote it, which is newer
+                # than the AWS original it came from — so every multipart object
+                # re-copies on every run, forever. Measured 2026-09-16 (bravo,
+                # cc-13, g-372-24): 615 objects / 19.8 GiB "to copy" against a
+                # true delta of 423 objects / 0.85 GiB. Size equality is NOT
+                # content verification (guard-6371) and this mode does not claim
+                # it is: it is the right predicate for an append-only archive,
+                # where a key is written once and only ever grows, and it is
+                # wrong for any source that rewrites objects in place.
+                same = True
             else:
                 same = not (src_lm and d_lm and src_lm > d_lm)
             if d_size == size and same:
@@ -383,8 +399,30 @@ def cmd_copy(args) -> int:
             return "copied", size, None
 
         try:
-            body = src.s3.get_object(Bucket=src_bucket, Key=key)["Body"]
-            dst.s3.upload_fileobj(body, dst_bucket, key)
+            # CARRY ContentEncoding AND Metadata (g-372-21, 2026-09-14 window).
+            # `upload_fileobj` sends the BODY and nothing else, so before this a
+            # gzip-encoded object landed at the destination with no
+            # `ContentEncoding: gzip` -- every later reader got compressed bytes
+            # it did not know to decompress -- and the plain-md5 sidecar metadata
+            # that the integrity checks compare against was simply absent
+            # (rb-10944: a post-codec size mismatch on a copy diff IS this, not
+            # corruption). The source GET response already carries both, so no
+            # extra HEAD round trip is needed -- and on a 79k-object copy whose
+            # cost is round trips (see the threading note above), that matters.
+            # Silent in BOTH directions: the copy returns success and the object
+            # looks present, which is why the pin asserts the DESTINATION's
+            # stored kwargs rather than this call's return value.
+            resp = src.s3.get_object(Bucket=src_bucket, Key=key)
+            body = resp["Body"]
+            extra = {}
+            if resp.get("ContentEncoding"):
+                extra["ContentEncoding"] = resp["ContentEncoding"]
+            if resp.get("Metadata"):
+                extra["Metadata"] = dict(resp["Metadata"])
+            if extra:
+                dst.s3.upload_fileobj(body, dst_bucket, key, ExtraArgs=extra)
+            else:
+                dst.s3.upload_fileobj(body, dst_bucket, key)
             return "copied", size, None
         except Exception as exc:                                  # noqa: BLE001
             return "failed", 0, {"key": key, "phase": "transfer",
@@ -430,6 +468,7 @@ def cmd_copy(args) -> int:
                    "endpoint": args.source_endpoint or "(incumbent)"},
         "dest": {"bucket": dst_bucket, "endpoint": args.dest_endpoint},
         "prefix": prefix,
+        "multipart_compare": args.multipart_compare,
         "scanned": scanned,
         "copied": copied,
         "skipped_already_present": skipped,
@@ -714,6 +753,16 @@ def main() -> int:
                         "keeps the first copy inside the cutover window")
     c.add_argument("--progress-every", type=int, default=1000,
                    help="emit a progress line to stderr every N objects (0 = off)")
+    c.add_argument("--multipart-compare", choices=("timestamp", "size"),
+                   default="timestamp",
+                   help="how to decide whether a MULTIPART object (whose ETag is "
+                        "not comparable across stores, guard-6371) already "
+                        "matches at the destination. timestamp (default): a "
+                        "source newer than the destination means re-copy — "
+                        "correct when the destination was written from this "
+                        "source. size: same size means present — correct for a "
+                        "reverse-direction or append-only copy, where the "
+                        "timestamp rule re-copies every large object forever")
     c.set_defaults(func=cmd_copy)
 
     d = sub.add_parser("diff", help="compare a destination manifest to a source")

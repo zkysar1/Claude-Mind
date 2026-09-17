@@ -145,8 +145,19 @@ def evaluate(record: dict | None, my_sid: str, now: float | None = None) -> dict
         return {"blocked": False, "reason": "lock has no holder_sid — malformed, treated as free",
                 "state": "malformed"}
     if my_sid and holder == my_sid:
-        return {"blocked": False, "reason": "lock is held by THIS body", "state": "mine",
-                "holder_sid": holder}
+        # `live` is the blocking branch's own test -- usable timestamps, unexpired,
+        # holder pid not provably gone -- with only the sid comparison inverted.
+        # `blocked` stays False, so nothing `check` decides changes; iteration-push
+        # reads `live` through `held-by-me` so it stops moving HEAD under this
+        # session's OWN suite (). A stale self-lock protects nothing.
+        acquired = record.get("acquired_at")
+        ttl = record.get("ttl_seconds")
+        live = (isinstance(acquired, (int, float)) and isinstance(ttl, (int, float))
+                and now - acquired <= ttl
+                and _pid_alive(record.get("holder_pid")) is not False)
+        return {"blocked": False, "state": "mine", "holder_sid": holder, "live": live,
+                "reason": "lock is held by THIS body" + (
+                    "" if live else " (STALE: expired, holder gone, or malformed)")}
 
     acquired = record.get("acquired_at")
     ttl = record.get("ttl_seconds")
@@ -254,7 +265,7 @@ def release(project_root: Path, my_sid: str) -> tuple[int, dict]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("verb", choices=["acquire", "release", "check", "status"])
+    ap.add_argument("verb", choices=["acquire", "release", "check", "status", "held-by-me"])
     ap.add_argument("--reason", default="unspecified",
                     help="what is holding the tree (shown to whoever is blocked)")
     ap.add_argument("--ttl", type=int, default=DEFAULT_TTL_SECONDS)
@@ -289,6 +300,12 @@ def main(argv=None) -> int:
                            holder_pid=args.holder_pid)
     elif args.verb == "release":
         rc, info = release(root, sid)
+    elif args.verb == "held-by-me":
+        # A PREDICATE, not a gate: 0 only for a LIVE lock this sid holds, 1 for
+        # everything else. Never 2 -- an unreadable lock must read "not mine",
+        # which leaves iteration-push on its normal path (the fail-safe direction).
+        info = evaluate(read_lock(root), sid)
+        rc = RC_OK if (info["state"] == "mine" and info.get("live") is True) else 1
     else:  # check | status
         info = evaluate(read_lock(root), sid)
         # `check` is the gate iteration-push calls; `status` is for a human and

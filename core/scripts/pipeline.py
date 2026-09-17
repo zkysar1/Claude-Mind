@@ -411,7 +411,7 @@ def validate_formation_quality(rec):
 
 # Recognized evidence-pointer shapes in free-text resolution fields.
 _EVIDENCE_PATTERNS = (
-    re.compile(r"\bg-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2})\b"),  # goal-id (incl xw, )
+    re.compile(r"\bg-(?:\d{3}-\d{2,5}|xw-\d{8}T\d{6}-\d{2})\b"),  # goal-id (incl xw, )
     re.compile(r"\b(?:rb|guard|sig|sa|bel)-\d+\b"),             # rb/guardrail/sig/...
     re.compile(r"\bexp-[a-z0-9][\w-]+", re.I),                  # experience-ref
     re.compile(r"\bmsg-\d{8}-"),                                # board message id

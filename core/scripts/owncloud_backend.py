@@ -1491,6 +1491,55 @@ class OwnCloudBackend:
             raise
         return True
 
+    def delete(self, path: PathLike) -> bool:
+        """Remove `path` from BOTH lanes and verify both. The
+        ``StorageBackend.delete`` contract; ``delete_object`` above is the
+        store-only HALF of it.
+
+        The two operations are independent and neither implies the other
+        (guard-1493): ``delete_object`` drops the S3 object and leaves the
+        local mirror, while a bare ``unlink`` drops the mirror and is silently
+        RE-MATERIALIZED by read-through on the next read. Until this method
+        existed every caller had to chain them by hand — and the failure is
+        self-concealing, because verifying only the lane you happened to call
+        returns a truthful green while the file survives in the other. So the
+        chain and BOTH read-backs live here, once, and no consumer repeats
+        them.
+
+        Two asymmetries a caller should know. The store side is a TOMBSTONE,
+        not an erasure: the bucket is versioned, so ``delete_object`` writes a
+        delete marker and noncurrent versions survive until lifecycle expiry —
+        that is the recovery layer, and per archive-before-delete it counts as
+        one only for as long as the retention config says it does. The local
+        side has no such layer and is final.
+
+        Returns True when either lane held something, False when the path was
+        already absent from both (idempotent). Raises OSError when either lane
+        still reports present afterwards — never a True over a half-delete."""
+        local = self._local(path)
+        removed_remote = self.delete_object(path)
+        removed_local = local.exists()
+        if removed_local:
+            local.unlink(missing_ok=True)
+        # Drop the freshness stamp with the file — HYGIENE, not a correctness
+        # guard, and the distinction is worth stating because the obvious
+        # reading is wrong. _refresh's freshness-window short-circuit is gated
+        # on `local.exists()` FIRST (see _refresh), and the unlink above has
+        # just made that False, so the stamp could not have caused a later read
+        # to skip its HEAD whether or not it was popped. The verify below does
+        # not depend on it either: exists() issues a raw head_object and never
+        # consults this dict. What the pop actually buys is that the dict does
+        # not accumulate entries for paths that no longer exist across
+        # delete/recreate cycles.
+        self._cache_check.pop(str(local), None)
+        still_remote = self.exists(path)
+        still_local = local.exists()
+        if still_remote or still_local:
+            raise OSError(
+                f"delete incomplete for {path}: store_present={still_remote} "
+                f"local_present={still_local}")
+        return removed_remote or removed_local
+
     def iter_paths_under(self, path: PathLike):
         """Yield the LOCAL-shaped absolute Path for every S3 object whose key
         sits under `path`'s prefix, recursively. Read-only companion to

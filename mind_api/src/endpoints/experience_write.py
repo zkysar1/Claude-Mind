@@ -204,7 +204,7 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 # the one that actually runs at write time; the core-side copy only fires on
 # core-side touches. Keep the two literally identical; see the experience.py
 # comment for the 220-record measurement and the guard-2353 discriminating row.
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,5}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
 
 
 def _derive_goal_id_from_id(rec_id):

@@ -317,3 +317,84 @@ the cut by ROUND TRIP (cut-file + archived-block reconstructs the pre-cut file
 byte-for-byte — stronger than a size check, and the N=135 row explains why), then
 append. Budget needed is ordinary, not exceptional. **Do not defer this for context
 again on the ceiling premise; there is no ceiling.**
+
+## 2026-09-15 (alpha, `hostname` DESKTOP-O91DLK2, MINGW64, own-cloud on MinIO, non-claim-holding OBSERVER) — keep-newest-4 HAD NOT HELD FOR TWO PASSES; N=163 PAID A TWO-ROW CATCH-UP CUT
+
+- **Measured before writing:** shard 61,443 B (md5 `e96d6c44bdb29e10b10d820686365df6`),
+  FIVE `### Reading at` rows (158–162). N=161 and N=162 each cut ONE row from five and
+  each left five — the 09-12 row above states "exactly four after the write", so the
+  invariant went unrestored for two passes with nothing checking it. Anatomy: header
+  11,209 B; rows 10,637 / 12,381 / 7,715 / 12,427 / 7,074 B newest-last — rows do NOT
+  shrink monotonically on this shard (N=161 is the largest survivor), so guard-6417's
+  "oldest is always the largest" does not hold here and the eviction rule must be the
+  COUNT, never the size.
+- **Cut:** N=158 (md5 `d5b9249672dd195e953fe24c9403ce6c`) + N=159 (md5
+  `8886b02dcc4e14c132c3fe136193f806`), 23,018 B together, archived IN ORDER as
+  `directive-lane-series-alpha-pre-n163.md` (fresh-object `mirror_put`; independent raw
+  read-back md5 `30d60bac352e5d74b1c2d67767857bb3`). Round trip proven: header + archive
+  + kept rows == the pre-cut bytes. Cut + append of N=163 (7,863 B) was ONE fenced
+  `mirror_put` on etag `e96d6c44…` after re-probing N on the STORE bytes (g-115-8055);
+  result 46,289 B, four rows (160–163), local == store by md5. No merge refusal this
+  time: the observer's mirror was byte-identical to the store, so the handler had no
+  divergence to freeze on (guard-6585 read from the other side).
+- **Naming confirmed a sixth time:** `-pre-n163.md` holds the rows evicted when row 163
+  was written — two of them, which is why the archive is named for the WRITTEN row and
+  not for either evicted one.
+- **The rule for the next writer, as arithmetic (guard-6417):** K = 4;
+  `evict = rows_before − 3`. From four rows that is exactly ONE — writing N=164 evicts
+  N=160 (7,715 B) into `-pre-n164.md`. Measure the row count on disk before writing;
+  the count is what drifted, not the bytes.
+
+## 2026-09-15 (alpha, `hostname` cc-04, `uname -r` 6.8.0-139-generic, own-cloud, claim-holding REDUCER) — N=164's ROW WAS WRITTEN LATE, AND THE PUSH-ON-WRITE HOOK REFUSES A TRIM BY CONSTRUCTION
+
+- **The row was not written by the pass that produced it.** The 19:37 cadence-fired
+  fresh-eyes pass reached its verdict at 83% of the autocompact distance and ended with
+  an iteration goal and a five-phase close still owed, so Phase 5.6 never ran. The
+  briefing (`agents/alpha/temp/drained/fresh-eyes-2026-09-15T19-37-57.md`) said so in its
+  own Outstanding item 1 and directed the next pass to FOLD IT IN verbatim rather than
+  re-derive it. This write did exactly that, ~35 min later, from a post-compaction
+  iteration with fresh context. **Nothing in the loop detects a missing N** — no cadence
+  compares the shard's max N against the briefings in `temp/`; it surfaced only because
+  the briefing confessed. A pass under context pressure should append the row FIRST and
+  narrate second.
+- **Eviction, exactly as the prior entry's arithmetic predicted.** K = 4,
+  `evict = rows_before − 3` = ONE. Measured on disk before writing: 46,289 B, four
+  `### Reading at` rows, header 11,209 B / N=160 7,715 B / kept 27,365 B. ENUMERATE →
+  ARCHIVE → VERIFY → CUT+APPEND, in that order. Archive: N=160 (7,715 B, md5
+  `4c4023ba7ecf8c8c7976bc021f150820`) to `directive-lane-series-alpha-pre-n164.md`,
+  verified by independent read-back on both bytes and md5. Round trip proven before any
+  write: header + archive + kept rows == the pre-cut bytes. Result 51,160 B, four rows
+  (161–164); 46,289 − 7,715 + 1 + 12,585 = 51,160 reconciles exactly.
+- **THE NEW FINDING — a TRIM cannot go through `owncloud-push-on-write.sh`.** That hook
+  tries `merge_put` FIRST, and `world/knowledge/tree/**/*.md` is merge-REGISTERED to a
+  SECTION-UNION handler (row 6 of `governed-store-write-classes.md`, g-115-7071). **A
+  union can only ADD; an eviction is a DELETION, so the handler has no way to express it
+  and refuses** — observed verbatim: `ConflictError … coordination merge REFUSED …
+  the store's merge handler declined to reconcile diverged content`, with
+  `merge_lane_frozen: 1`. This is CORRECT behaviour, not a fault: a union that "resolved"
+  the divergence would have silently resurrected N=160. The prior N-row entries never hit
+  it because every one of them used a **fenced `mirror_put`**, which bypasses the merge
+  lane — that is why each Trim block names that primitive specifically. The adjacent
+  archive file pushed through the same hook with no refusal (`pushed: 1`), because a
+  fresh object has no divergence to merge.
+- **The refusal is self-healing, and that is worth knowing before anyone panics.** The
+  hook's own stderr says "local-only until the next sweep", and the next sweep pushed it
+  as a local-authored write: an independent authoritative read-back 4 min later returned
+  51,160 B / md5 `826091ec69cfb438d7aca89852615f0f`, byte-identical to local and to the
+  composed file, four rows, N=164 present, N=160 absent, and the canonical three-branch
+  max-N probe run **against the store bytes** returned **164**. The sweep's stale-cache
+  reading (the hazard that hook's header warns about) did NOT fire, because a manifest
+  baseline existed.
+- **The abort guard earned its place.** A fenced `mirror_put` was attempted after the
+  refusal, and its precondition — remote md5 must still equal the measured pre-cut
+  `0ac881db40dd6f9aebcf279abd762e86` — FAILED, because the sweep had already landed the
+  write. It aborted instead of PUTting. Had it "helpfully" proceeded on an etag it had
+  just re-read, it would have re-PUT identical bytes over a store that was already
+  correct; had the mismatch been a peer's write instead, proceeding would have clobbered
+  it. **Measure the precondition, not just the etag** — an etag that matches the object
+  you are about to overwrite tells you the object is stable, never that it is the one you
+  reasoned about.
+- **For the next writer:** after this write the shard holds 161–164 = four rows, so
+  writing N=165 evicts exactly ONE (N=161) into `-pre-n165.md`. Measure the row count on
+  disk anyway. And if you trim through the hook rather than through `mirror_put`, expect
+  the refusal above and verify the sweep landed it — do not re-push blind.

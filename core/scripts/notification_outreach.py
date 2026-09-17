@@ -54,6 +54,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from _paths import WORLD_DIR, ENVIRONMENT_ID, PROJECT_ROOT  # noqa: E402
+from _board_paths import channel_paths, read_paths  # noqa: E402  (reader seam, )
 
 LEDGER_NAME = "notifications-sent.jsonl"
 BOARD_TAG = "user-outreach"
@@ -66,6 +67,44 @@ WINDOW_HOURS = {
     # fleet digests, which carry no spend. 20h < the 24h cadence, so tomorrow's report
     # passes while a genuine same-day re-send is still refused.
     "cost-report": 20,
+    # A LIVENESS ALARM, NOT A QUESTION (). Sized to the PRODUCER's own
+    # re-alert cadence: agent-watchdog.PeerLivenessProbe.REALERT_DEFAULT_SECONDS is
+    # 6*3600, i.e. it deliberately re-pages every 6h and its own alert body promises
+    # the owner "this alert re-arms after 6h". Falling through to `_default` made the
+    # gate refuse 27 of every 28 of those pages.
+    #
+    # MEASURED 2026-09-16 (zeta, cc-02) on world/notifications-sent.jsonl, 6,623 rows:
+    # NINE "Fleet: <agent> looks STALLED" notifications for one agent, ALL nine rc=4 /
+    # transport=none, every one suppressed against ONE alpha send from 2026-09-09 --
+    # the most recent three refused against a prior 6.94 DAYS old, raised independently
+    # by three different agents, none of whom could reach the owner.
+    #
+    # WHY THE DEFAULT WAS INHERITED SILENTLY, and it is not simply a missing key: this
+    # category IS in notification_routing_gate.ALWAYS_SEND_CATEGORIES, and the watchdog
+    # send site says so in its own comment as the reason the alert is safe. That belief
+    # is true of the ROUTING gate and false here -- this module contains zero references
+    # to ALWAYS_SEND, so the two enforcement layers disagreed about the same category and
+    # the honest-looking comment documented only the half that agreed with it.
+    #
+    # Do NOT "fix" this by importing ALWAYS_SEND_CATEGORIES and bypassing the window for
+    # every member: `user-digest` is in that set AND carries a deliberate 20h window here,
+    # so a blanket bypass would delete a rule that exists on purpose. The windows are the
+    # per-category decision; ALWAYS_SEND is a different question (may it be sent at all).
+    #
+    # The argument outcome 1 asks for, stated plainly: 7 days is defensible for a QUESTION
+    # ("asked once a week is one question, not three" -- this module's own docstring) and
+    # indefensible for an alarm whose entire value is timeliness. Normalising the subject
+    # strips the timestamp, so "STALLED since <A>" and "STALLED since <B>" collapse to one
+    # subject_norm -- correct for a question, wrong for a SECOND EPISODE.
+    #
+    # SECOND SENDER, NAMED RATHER THAN DISCOVERED LATER: evolution-complete.py also
+    # routes as `decision-needed`. Its notifications now re-send after 6h instead of 7
+    # days, which is MORE permissive than before -- a real consequence of keying the
+    # window on category, and the honest cost of the narrow fix. Scoping by subject shape
+    # instead would confine it to stall alerts and is materially more machinery; if that
+    # second sender starts producing owner noise, THAT is the trigger to build it, not a
+    # speculative pre-emption now.
+    "decision-needed": 6,
     "_default": 24 * 7,
 }
 # Digest categories are matched by CATEGORY alone, fleet-wide: any digest sent
@@ -78,7 +117,7 @@ SUBJECT_JACCARD = 0.6
 BODY_JACCARD = 0.7
 BODY_FP_CHARS = 400
 
-_ID_RE = re.compile(r"\b(?:g-\d{1,3}-\d{1,4}|asp-\d+|guard-\d+|rb-\d+|pq-[a-z0-9-]+|sq-\d+|hyp-[a-z0-9-]+)\b", re.I)
+_ID_RE = re.compile(r"\b(?:g-\d{1,3}-\d{1,5}|asp-\d+|guard-\d+|rb-\d+|pq-[a-z0-9-]+|sq-\d+|hyp-[a-z0-9-]+)\b", re.I)
 _STOP = {
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
     "was", "were", "be", "it", "this", "that", "with", "from", "by", "at", "as",
@@ -223,10 +262,26 @@ def _append(path: Path, row: dict) -> None:
 def _board_outreach_rows(world: Path, since: datetime) -> list:
     """Rows synthesised from board posts tagged `user-outreach` -- the surface
     where PEER worlds' mirrors land (and where our own mirror would land on
-    theirs). Author `<agent>@<env>` is parsed back into env/agent."""
+    theirs). Author `<agent>@<env>` is parsed back into env/agent.
+
+    Every file of each channel's live half is read, enumerated through the
+    reader seam (g-358-183): a segmented writer appends to
+    `<channel>-<date>.jsonl`, and a mirror there is invisible to a base-file-only
+    read, so the same topic would reach the user again. Read one file at a time
+    so each row keeps its `source` file; `read_paths` reports a segment evicted
+    mid-read as data, and a file present but unreadable is warned about."""
     out = []
-    for name in ("coordination.jsonl", "findings.jsonl", "general.jsonl"):
-        for m in _read_jsonl(world / "board" / name):
+    paths = [p for ch in ("coordination", "findings", "general")
+             for p in channel_paths(world / "board", ch, include_archive=False)]
+    for path in paths:
+        records, missing = read_paths([path])
+        for miss in missing:
+            if miss["reason"] == "unreadable":
+                print(f"[notification-outreach] WARN {miss['path']} unreadable "
+                      f"({miss['error']}); prior outreach in it is not seen",
+                      file=sys.stderr)
+        name = path.name
+        for m in records:
             tags = m.get("tags") or []
             if isinstance(tags, str):
                 tags = re.findall(r"[a-z0-9\-]+", tags.lower())

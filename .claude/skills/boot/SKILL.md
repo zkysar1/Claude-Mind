@@ -41,12 +41,12 @@ This gate means boot can ONLY run when /start has set agent-state to RUNNING.
 
 ## Phase -2.5: Crash Recovery Detection
 
-Check for crash marker left by StopFailure hook (context exhaustion in previous session):
+Check for crash marker left by StopFailure hook (an API error ended the previous session):
 
 ```
 IF file exists agents/<agent>/session/crash-marker:
-  Read content (format: "<timestamp> context_exhaustion sid=<session-id>")
-  Log: "⚠ Previous session ended abnormally — context exhaustion detected"
+  Read content (format: "<timestamp> <error_type> sid=<session-id>")
+  Log: "⚠ Previous session ended abnormally — <error_type>"
   Log the crash-marker content for diagnostics
   Delete agents/<agent>/session/crash-marker
 ```

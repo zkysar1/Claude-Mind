@@ -30,7 +30,7 @@
 #   --goal <id>              required (except productivity-check)
 #   --status <status>        required for verify (completed|blocked|skipped|...)
 #   --source <world|agent>   required (except productivity-check which is agent-scoped)
-#   --outcome <deep|routine> required for state-update and learning-gate
+#   --outcome <deep|routine> required for verify, state-update and learning-gate
 #   --summary "<text>"       optional; journal entry + dependent unblock + the
 #                            goal record's outcome_note (g-115-5157). MULTI-
 #                            PARAGRAPH IS EXPECTED — this field read "<one-line>"
@@ -457,7 +457,31 @@ _quality_flag_suffix() {
 #         recurring-starvation-check.sh, which runs every precheck, anchors on
 #         the cadence rather than on this close, and is shelve-aware
 #         (_is_shelved).
-#     ... recurring false                -> REFUSE.
+#     ... recurring false, claim HELD    -> REFUSE, existing message. verify did
+#         not run and the claim is still live: this is the abandoned close the
+#         g-115-5104 evidence is drawn from, and re-running verify IS the fix.
+#     ... recurring false, no claim, outcome_note PRESENT
+#                                        -> REFUSE, RELEASE-PATH message (g-115-9994).
+#         The refusal is right — a released unit did not close, so its counters
+#         must not bump — but the message above it was written for the abandoned
+#         branch and is FALSE here twice over: it asserts the record has "no
+#         outcome_note" (a release carries one), and its remedy — a verify re-run
+#         forcing the goal terminal, DELIBERATELY NOT REPRODUCED HERE so no reader
+#         copies the shape out of the explanation of why it is wrong (guard-3333;
+#         git carries the verbatim text) — would mark unfinished multi-unit work
+#         completed and drop the remaining units from the selector with no
+#         signal. A gate's remedy carries the gate's authority (guard-2237), so a
+#         destructive one is copied precisely because a gate prescribed it;
+#         guard-6733 was filed to tell readers by hand not to obey this one, and
+#         this branch is that warning moved into the emitter. Discriminator is
+#         guard-6733's, unchanged: pending + not recurring + no claim + non-empty
+#         outcome_note. The extra outcome_note probe costs one round trip and
+#         runs ONLY on this already-halting branch, never on the healthy path.
+#     ... recurring false, no claim, outcome_note ABSENT OR UNREADABLE
+#                                        -> REFUSE, existing message. _probe_goal_outcome_note
+#         is fail-open (empty on any error), so an unreadable note lands here
+#         deliberately: an empty read is "unknown or absent", never "verified
+#         absent", and the unchanged message is the conservative direction.
 #
 # There is no "recurring unknown while status known" branch: the record probe
 # prints nothing unless it found a record with a non-empty status, and a found
@@ -519,6 +543,26 @@ _assert_verify_landed() {
         echo "  direction and PROCEEDING (a refusal must never rest on an ambiguous read)." >&2
         echo "" >&2
         return 0
+    fi
+
+    if [[ "$claim_held" != "true" ]] && [[ -n "$(_probe_goal_outcome_note)" ]]; then
+        echo "" >&2
+        echo "[iteration-close] ✖ REFUSED — FORWARD PRECONDITION FAILED (g-115-5573), RELEASE PATH (g-115-9994):" >&2
+        echo "  Goal ${GOAL_ID:-?} is status=$live at the ENTRY of $phase, is NOT recurring, holds NO" >&2
+        echo "  claim, and CARRIES an outcome_note. That is a unit RELEASED as partial on purpose," >&2
+        echo "  not a close that went missing." >&2
+        echo "  Refusing is still correct — the unit did not close, so $phase must not bump its counters." >&2
+        echo "  Do NOT re-run verify to force this goal terminal. Its remaining units are" >&2
+        echo "  unfinished; closing it would drop them from the selector with no signal." >&2
+        echo "  Correct continuation for a released partial unit:" >&2
+        echo "    1. skip state-update and learning-gate — this refusal IS that skip" >&2
+        echo "    2. answer the learning-gate residue by hand (meta-signal question, periodic reflection)" >&2
+        echo "    3. bash core/scripts/iteration-close.sh --phase productivity-check" >&2
+        echo "    4. then the terminal pair" >&2
+        echo "  The released unit's outcome_note is the only record the next executor inherits —" >&2
+        echo "  if this unit's measurement is not in it yet, write that first." >&2
+        echo "" >&2
+        return 1
     fi
 
     echo "" >&2
@@ -2019,6 +2063,9 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
         # non-recurring close rather than only when the caller remembered the
         # flag. do_state_update's sentinel remains the backstop for the case this
         # stdout line is emitted but not acted on.
+        # $HC_SPARK_REF: the spark skill as THIS harness names it (_harness_vocab.sh,
+        # 2026-09-17) -- Skill(aspirations-spark) on Claude Code, byte-identical.
+        source "$SCRIPT_DIR/_harness_vocab.sh"
         if [[ "${BODY_ROLE:-}" == "worker" ]]; then
             # A WORKER Body reaches this close via worker-loop Phase 4a and
             # its spark obligation is Phase 3.5 spark_capture (replayed by
@@ -2027,9 +2074,9 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
             # imperative here would contradict worker-loop Phase 4c and
             # invite a worker to run a phase it must skip (2026-08-16,
             # g-115-6337 review). Say what the worker's next step IS.
-            echo "[iteration-close] NEXT (worker Body): spark for $GOAL_ID was captured in worker-loop Phase 3.5 (spark_capture; the reducer replays it) — do NOT invoke Skill(aspirations-spark). Continue to worker-loop Phase 4b (hand-off row) then Phase 5 (re-enter for the next unit)."
+            echo "[iteration-close] NEXT (worker Body): spark for $GOAL_ID was captured in worker-loop Phase 3.5 (spark_capture; the reducer replays it) — do NOT invoke $HC_SPARK_REF. Continue to worker-loop Phase 4b (hand-off row) then Phase 5 (re-enter for the next unit)."
         else
-            echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
+            echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke $HC_SPARK_REF BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
         fi
     fi
     # ── End Phase-6 spark imperative ──────────────────────────────────────────
@@ -4276,6 +4323,48 @@ do_productivity_check() {
     python3 "$(_winpath "$SCRIPT_DIR/agent-watchdog.py")" --tick \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
+    # Orphan-carrier repair lane (g-115-9607) — the wired caller for
+    # orphan_carrier_repair.py, which landed 2026-09-13 with ZERO call sites:
+    # five greps, every hit a self-reference, and no .sh wrapper. Same defect as
+    # the worker-ref lane below, one store over. It bites harder here because
+    # the population REGROWS at runtime — the module docstring records it going
+    # 23 -> 24 while three units debated it — so a hand-run can only make the
+    # fleet MOMENTARILY clean, never durably so (reclaim-routed-work.md: "a
+    # sweep with no call site is indistinguishable from a sweep that always
+    # returns clean").
+    #
+    # PLACED HERE, NOT INSIDE WorkerStallProbe. That probe enumerates this same
+    # population one call above, so folding the write into it would cost no new
+    # enumeration — but its docstring states "Advisory only: it reports and
+    # never mutates. That is deliberate", and that split is the whole point of
+    # the goal that built it. Paying ~7s to keep reporting and acting separate
+    # is the cheaper trade. The deferrable precheck tier was the other
+    # candidate and is strictly worse: it sat dark 94-208h on two boxes
+    # (g-115-7847), reproducing the built-but-never-invoked defect being fixed.
+    #
+    # --apply is EXPLICIT (the module defaults to dry-run and must keep doing
+    # so). The write is bound-agent-only, so no box ever declares a peer dead
+    # (guard-5587 / guard-4180), and it mutates body_state alone with ts
+    # asserted byte-identical on read-back (guard-6558). --quiet keeps a clean
+    # pass silent, while a repair prints one line per carrier to THIS stdout,
+    # where the agent reads it (guard-1227 loudness); the marker file is the
+    # durable proof that a quiet pass actually ran. 6h interval: selection
+    # needs >=3.0d of carrier age and the enumeration costs ~7.0s measured, so
+    # a per-iteration pass would oversample ~500x and surface nothing extra.
+    # Fail-open: never aborts productivity-check.
+    # MIND_AGENT passed EXPLICITLY, not inherited. The module REFUSES
+    # without it (rc=3, "the bound agent IS the writer scope") and that
+    # refusal would be swallowed by the `|| true` below and buried in the
+    # stderr log -- a wired lane that is permanently inert while reading
+    # healthy, which is the exact defect this lane was added to fix. $AGENT
+    # is validated non-empty at the top of this script. Mirrors
+    # agent-watchdog.py:3862 (env={**os.environ, "MIND_AGENT": agent}).
+    MIND_AGENT="$AGENT" \
+    python3 "$(_winpath "$SCRIPT_DIR/orphan_carrier_repair.py")" \
+        --apply --quiet \
+        --min-interval-hours "${ORPHAN_CARRIER_REPAIR_INTERVAL_H:-6}" \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
     # Worker-ref consumption lane (g-306-283) — the wired executable caller for
     # worker-ref-consume.sh, which had ZERO call sites from its landing
     # (g-306-264, 2026-08-06) until 2026-08-13: workers pushed carrier refs and
@@ -4586,10 +4675,17 @@ do_productivity_check() {
     # (deadman-arm-audit ARMED-OK); fail-safe worst case is a slow loop, never a
     # dead one. See aspirations/SKILL.md Return Protocol +
     # core/config/rationale/deadman-switch.md.
+    # The tool names in the imperative come from the harness vocabulary
+    # (_harness_vocab.sh, 2026-09-17): a zakcode vessel reads use_skill(name=
+    # 'aspirations', args='loop') and schedule_wakeup(...), the names in ITS tool
+    # list; Claude Code reads the byte-identical lines it always did. Measured
+    # 2026-09-17: a small model on a vessel answered the Claude Code names in
+    # prose for hours while the stop hook BLOCKed in the same foreign names.
+    source "$SCRIPT_DIR/_harness_vocab.sh"
     if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
-        echo "[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
+        echo "[iteration-close] NEXT ACTION REQUIRED: Call $HC_LOOP_CALL as your VERY NEXT tool call."
     else
-        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600) — the self-resurrection net; this call is MANDATORY, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' — the primary re-entry and the LAST call, which continues the loop NOW. Emitting Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
+        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) $HC_DEADMAN_ARM — the self-resurrection net; this call is MANDATORY, do NOT omit it; THEN (2) $HC_LOOP_CALL — the primary re-entry and the LAST call, which continues the loop NOW. Emitting $HC_LOOP_REF ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
     fi
     echo "[iteration-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 

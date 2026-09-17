@@ -18,6 +18,7 @@ So these tests pin the WIRING, which is the half no pure-logic test can reach
 (guard-1943: pinning the writer says nothing about the wiring).
 """
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -67,7 +68,7 @@ def test_the_refresh_actually_passes_force_fresh(trace):
     """A refresh that omits force_fresh re-reads the same cache: a no-op gate."""
     unit_claim._read_board(4)
     flags = [f for k, f in trace if k == "refresh"]
-    assert flags == [True], f"force_fresh flags were {flags!r}, expected [True]"
+    assert flags and all(flags), f"force_fresh flags were {flags!r}, expected all True"
 
 
 def test_release_does_not_pay_the_refresh(trace):
@@ -97,6 +98,78 @@ def test_a_failed_refresh_refuses_rather_than_deciding_from_a_stale_cache(monkey
     monkeypatch.setattr(unit_claim.subprocess, "run",
                         lambda *a, **k: pytest.fail("decided from a stale cache"))
 
+    with pytest.raises(SystemExit) as exc:
+        unit_claim._read_board(4)
+    assert exc.value.code == 2, f"exited {exc.value.code}, expected 2"
+
+
+# ── date segments () ────────────────────────────────────────────────
+# board-read.sh reads the channel's base file AND its date segments from local
+# disk. A segmented writer puts a peer's claim in <channel>-<date>.jsonl, so a
+# refresh of the base file alone leaves that claim out of the decision.
+
+class _AtHalfPastTwo(datetime):
+    """02:30, so the 5h board-read window reaches back into the previous day."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 9, 17, 2, 30, 0)
+
+
+def _refresh_trace(monkeypatch, fail_for=None):
+    """Record each refreshed basename; raise fail_for[name] for a name in it."""
+    seen = []
+
+    class FakeBackend:
+        def read_text(self, path, encoding="utf-8", *, force_fresh=False):
+            name = Path(path).name
+            seen.append((name, force_fresh))
+            if fail_for and name in fail_for:
+                raise fail_for[name]
+            return ""
+
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: FakeBackend())
+    monkeypatch.setattr(unit_claim, "datetime", _AtHalfPastTwo)
+    return seen
+
+
+def test_every_segment_the_window_touches_is_refreshed_before_the_read(monkeypatch):
+    seen = _refresh_trace(monkeypatch)
+    refreshed_at_first_read = []
+
+    def fake_run(*_a, **_k):
+        refreshed_at_first_read.append(len(seen))
+        return _FakeProc()
+
+    monkeypatch.setattr(unit_claim.subprocess, "run", fake_run)
+    unit_claim._read_board(4)
+    assert seen == [("coordination.jsonl", True),
+                    ("coordination-2026-09-16.jsonl", True),
+                    ("coordination-2026-09-17.jsonl", True)]
+    assert refreshed_at_first_read[0] == 3, "the board was read before every refresh ran"
+
+
+def test_a_day_with_no_segment_is_not_a_refresh_failure(monkeypatch):
+    """Until a segmented writer lands no segment file exists anywhere, so
+    FileNotFoundError is the true state of the board, not a fault. Refusing
+    on it would refuse every unit claim."""
+    absent = FileNotFoundError("no segment for that day")
+    _refresh_trace(monkeypatch, fail_for={"coordination-2026-09-16.jsonl": absent,
+                                          "coordination-2026-09-17.jsonl": absent})
+    reads = []
+    monkeypatch.setattr(unit_claim.subprocess, "run",
+                        lambda *a, **k: reads.append(a) or _FakeProc())
+    unit_claim._read_board(4)
+    assert len(reads) == 2, "an absent segment stopped the claim/release reads"
+
+
+def test_a_segment_that_cannot_be_refreshed_refuses(monkeypatch):
+    """Any other error leaves that segment's cache possibly missing a peer's
+    claim, so the decision refuses exactly as it does for the base file."""
+    _refresh_trace(monkeypatch, fail_for={
+        "coordination-2026-09-17.jsonl": RuntimeError("store unreachable")})
+    monkeypatch.setattr(unit_claim.subprocess, "run",
+                        lambda *a, **k: pytest.fail("decided from a stale segment cache"))
     with pytest.raises(SystemExit) as exc:
         unit_claim._read_board(4)
     assert exc.value.code == 2, f"exited {exc.value.code}, expected 2"

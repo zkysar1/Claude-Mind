@@ -100,6 +100,26 @@ if [ "$_CUR_JOURNAL_MD_DRIVER" != "$_JOURNAL_MD_DRIVER" ]; then
     fi
 fi
 
+# Append-ledger merge driver for the multi-writer core/config readings ledgers
+# (merge=ayoai-append-ledger in .gitattributes). Same registration mechanism as
+# the two drivers above. Two boxes appending a reading between pushes is an
+# insertion-vs-insertion conflict at end of file; this driver writes ours then
+# theirs verbatim. NOT merge=union: union's zealous refinement emits lines the
+# two blocks share ONCE and interleaves them (measured in production, merge
+# 10069ea4c0). NOT ayoai-journal-md: it conflicts on appends that open no new
+# `## ` section (). Idempotent + fail-open.
+_APPEND_LEDGER_DRIVER='bash core/scripts/git-merge-append-ledger.sh %O %A %B %P'
+_CUR_APPEND_LEDGER_DRIVER="$(git config --local --get merge.ayoai-append-ledger.driver 2>/dev/null || echo "")"
+if [ "$_CUR_APPEND_LEDGER_DRIVER" != "$_APPEND_LEDGER_DRIVER" ]; then
+    git config --local merge.ayoai-append-ledger.name \
+        "the framework append-ledger merge (ours then theirs verbatim for concurrent appends; real rewrites still conflict)" 2>/dev/null || true
+    if git config --local merge.ayoai-append-ledger.driver "$_APPEND_LEDGER_DRIVER" 2>/dev/null; then
+        echo "[install-git-hooks] merge.ayoai-append-ledger driver registered (cross-box readings-ledger appends now self-heal)" >&2
+    else
+        echo "[install-git-hooks] WARN: could not register merge.ayoai-append-ledger driver (non-fatal; readings-ledger conflicts fall back to manual resolution)" >&2
+    fi
+fi
+
 # REGISTERING THE DRIVER IS NOT THE SAME AS THE DRIVER BEING USED ().
 # Everything above writes .git/config. But .git/info/attributes -- per-clone and
 # UNTRACKED, so invisible to git status, ls-files and every review -- OUTRANKS

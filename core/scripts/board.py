@@ -23,6 +23,7 @@ from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
 from _paths import WORLD_DIR
+from _board_paths import group_by_channel, post_in_live_half, write_name  # noqa: E402
 
 BOARD_DIR = WORLD_DIR / "board"
 DEFAULT_CHANNELS = ["general", "findings", "coordination", "decisions"]
@@ -113,7 +114,10 @@ def cmd_post(args):
     # Structured message type (optional, defaults to "status" for backward compat)
     msg_type = getattr(args, "type", None) or "status"
 
-    ch_path = channel_path(channel)
+    # The shared writer rule (): today's date segment when this channel
+    # is named in BOARD_SEGMENTED_CHANNELS, the live file otherwise. Twin of
+    # board_write.py post, which imports the same rule.
+    ch_path = BOARD_DIR / write_name(channel)
     from _fileops import locked_append_jsonl_with_allocator
 
     # Build msg INSIDE the lock so the count component of msg-id reflects
@@ -130,8 +134,9 @@ def cmd_post(args):
         # the check. Twin: board_write.py daemon post handler.
         if args.reply_to:
             try:
-                if args.reply_to not in {it.get("id") for it in items
-                                         if isinstance(it, dict)}:
+                # The whole live half, not only the held file: a segment holds
+                # one day, so most parents are in another file.
+                if not post_in_live_half(ch_path, channel, args.reply_to, items):
                     print(f"[board-post] WARN: reply_to '{args.reply_to}' not "
                           f"found in channel '{channel}' ({len(items)} "
                           f"messages) — thread linkage may dangle (cross-box "
@@ -324,32 +329,38 @@ def cmd_channels(args):
         print("No board directory yet.")
         return
 
-    channels = sorted(BOARD_DIR.glob("*.jsonl"))
-    if not channels:
+    files = sorted(BOARD_DIR.glob("*.jsonl"))
+    if not files:
         print("No channels yet.")
         return
 
+    # Fold date segments into their parent channel (). A bare `.stem`
+    # made findings-2026-09-17.jsonl a channel of its own beside findings, so the
+    # per-row counts stopped showing real depth. group_by_channel is SHARED with
+    # the daemon twin so the parity this module's docstring claims is structural.
+    groups = group_by_channel(files)
+
     print("Channels:")
-    for ch in channels:
-        name = ch.stem
+    for name in sorted(groups):
         count = 0
-        if ch.exists():
-            with open(ch, "r", encoding="utf-8") as f:
-                count = sum(1 for line in f if line.strip())
-        # Get last message timestamp
-        last_ts = ""
-        if count > 0:
+        newest = ""
+        for ch in groups[name]:
+            if not ch.exists():
+                continue
             with open(ch, "r", encoding="utf-8") as f:
                 last_line = ""
                 for line in f:
                     if line.strip():
+                        count += 1
                         last_line = line
-                if last_line:
-                    try:
-                        last_msg = json.loads(last_line)
-                        last_ts = f" (last: {last_msg['timestamp']})"
-                    except (json.JSONDecodeError, KeyError):
-                        pass
+            if last_line:
+                try:
+                    ts = json.loads(last_line)["timestamp"]
+                except (json.JSONDecodeError, KeyError):
+                    continue
+                if ts > newest:
+                    newest = ts
+        last_ts = f" (last: {newest})" if newest else ""
         print(f"  {name}: {count} messages{last_ts}")
 
 # ---------------------------------------------------------------------------

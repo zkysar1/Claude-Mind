@@ -111,12 +111,16 @@ def world_owns_agent_corpus():
         return False
 
 
-def _read_jsonl(path, active_only=False):
-    """Load a JSONL file into a list of records. Skips blank lines and malformed records."""
-    if not path.exists():
-        return []
+def _parse_jsonl_text(text, active_only=False):
+    """Parse JSONL TEXT into records. Skips blank lines and malformed records.
+
+    Shared by `_read_jsonl` (local mirror) and `_read_agent_jsonl_fresh`
+    (authoritative bytes) so the two readers cannot drift into different
+    skip-malformed semantics — a divergence there would move records in and
+    out of the corpus depending only on which reader ran.
+    """
     records = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -128,6 +132,13 @@ def _read_jsonl(path, active_only=False):
             continue
         records.append(rec)
     return records
+
+
+def _read_jsonl(path, active_only=False):
+    """Load a JSONL file into a list of records. Skips blank lines and malformed records."""
+    if not path.exists():
+        return []
+    return _parse_jsonl_text(path.read_text(encoding="utf-8"), active_only=active_only)
 
 
 def _segment_paths(path, kind):
@@ -174,24 +185,53 @@ def _read_store_jsonl(path, kind, active_only=False):
     fixing it here costs one no-op call on LocalBackend, where `ensure_local` is
     the identity.
 
-    Fail-soft in the SAFE direction at every step: an unavailable backend, an
-    import failure, or a per-path error all degrade to the direct read this
-    module already did, never to a short corpus.
+    Fail-soft at every step: an unavailable backend, an import failure, or a
+    per-path error all degrade to the direct read this module already did. That
+    read is SHORT when the path is not on local disk (`_read_jsonl` returns []),
+    so that case is RECORDED in AUTHORITATIVE_READ_FALLBACKS and
+    learning-routing-repair refuses --apply (g-358-147): these stores are the
+    ref TARGETS, and every id missing from them turns a valid ref into a
+    "dangling" one that --apply would null. A FileNotFoundError from
+    `ensure_local` means the store holds no such object, so the local read is
+    the superset and nothing is recorded (as in `_read_agent_jsonl_fresh`).
     """
-    try:
-        from storage_backend import get_backend  # type: ignore
-        backend = get_backend()
-    except Exception:
-        backend = None
+    backend_pair = _backend_or_error()
     records = []
     for p in _segment_paths(path, kind):
-        if backend is not None:
-            try:
-                p = Path(backend.ensure_local(p))
-            except Exception:
-                pass
-        records.extend(_read_jsonl(p, active_only=active_only))
+        records.extend(_read_through_backend(p, active_only, backend_pair))
     return records
+
+
+def _backend_or_error():
+    """(backend, None), or (None, the exception) when no backend is available."""
+    try:
+        from storage_backend import get_backend  # type: ignore
+        return get_backend(), None
+    except Exception as exc:
+        return None, exc
+
+
+def _read_through_backend(path, active_only=False, backend_pair=None):
+    """Materialize ONE world store path through the backend, then read it.
+
+    Records the path in AUTHORITATIVE_READ_FALLBACKS when the backend was
+    unavailable or `ensure_local` failed, WHETHER OR NOT a local copy exists: a
+    present copy can be stale, and a stale ref-target corpus makes valid refs read
+    dangling, which --apply would null (g-358-147, g-358-157). FileNotFoundError is
+    not a failure: the store holds no such object. See `_read_store_jsonl`.
+    """
+    backend, failure = backend_pair if backend_pair is not None else _backend_or_error()
+    if backend is not None:
+        try:
+            path = Path(backend.ensure_local(path))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            failure = exc
+    if failure is not None:
+        AUTHORITATIVE_READ_FALLBACKS.append(str(path))
+        _note_local_fallback(path, failure, "materialize")
+    return _read_jsonl(path, active_only=active_only)
 
 
 def load_reasoning_bank():
@@ -205,12 +245,90 @@ def load_guardrails():
     return _read_store_jsonl(GUARDRAILS_JSONL, "guardrails", active_only=True)
 
 
+# Pipeline and pattern signatures are ref TARGETS too (source_hypothesis,
+# hypothesis_id, related_patterns), so they read through the backend and record
+# a degraded read like the other world stores (). They are NOT
+# segmented, so they take the single-path reader, never _read_store_jsonl.
 def load_pipeline():
-    return _read_jsonl(PIPELINE_JSONL)
+    return _read_through_backend(PIPELINE_JSONL)
 
 
 def load_pattern_signatures():
-    return _read_jsonl(SIGNATURES_JSONL)
+    return _read_through_backend(SIGNATURES_JSONL)
+
+
+def _note_local_fallback(path, exc, stage):
+    """Say on stderr that `_read_agent_jsonl_fresh` served the LOCAL read instead.
+
+    The fallback is the safe direction, but a silent one restores the g-358-131
+    defect with nothing to show for it: an expired credential sends every agent
+    store back to the known-stale mirror while the code, tests and tree node all
+    still say it is fixed (g-358-138). Same shape as `_fresh_read.refresh_for_read`,
+    except it names the FULL path, because every agent's store has the same basename.
+
+    A store that reports the object ABSENT never reaches here: the caller returns
+    the local read quietly, because a mirror cannot be short of an object the store
+    does not hold (g-358-145). A store that FAILS with no local file still notes,
+    because that [] may be short of the store.
+    """
+    detail = str(exc).replace("\n", " ")
+    print(f"[learning-routing-audit] (authoritative {stage} failed for {path}: "
+          f"{type(exc).__name__}: {detail}; using the local mirror, which may be "
+          f"SHORT of the store)", file=sys.stderr)
+
+
+def _read_agent_jsonl_fresh(path):
+    """Read a PER-AGENT store from the AUTHORITATIVE bytes, not the local mirror.
+
+    `_read_store_jsonl` materializes with `backend.ensure_local`, and that is
+    enough for the shared world/meta stores because the periodic pull sweep
+    refreshes them too. It is NOT enough here. The sweep's roots are world and
+    meta only, so an agent dir has exactly ONE refresh path — the per-read one —
+    and for these objects that path does not fire:
+
+      MEASURED 2026-09-17, one own-cloud box, 12 peer objects (g-358-131).
+      5 of the 12 local mirrors were SHORT of the store by 97 to 4,728 bytes.
+      `backend.refresh()` — the force-fresh call that `_fresh_read.refresh_for_read`
+      makes — left all 5 unchanged, because the backend's overwrite decision
+      returned `no_clobber` for every one of them. That guard exists to protect
+      unpushed local writes; a box does not write a PEER's experience store, so
+      what it is actually seeing is a stale baseline, but it cannot tell the two
+      apart and freezes the mirror either way.
+
+    So read the stream, never the cache (guard-6107). Fail-soft in the SAFE
+    direction at every step — an unavailable backend, an import failure, or a
+    per-path error all degrade to the local read this module already did, and
+    never to a SHORT corpus. That direction is the whole point: a silently-short
+    experience corpus is the exact input that turned into 17,466 wrongly-nulled
+    fields (see `load_all_experiences`), because everything missing from it is
+    reported dangling and then nulled. Every degradation says so on stderr
+    (`_note_local_fallback`), so a safe fallback is never also a silent one.
+    """
+    try:
+        from storage_backend import get_backend  # type: ignore
+
+        raw = get_backend().read_authoritative_bytes(path)
+    except FileNotFoundError:
+        # The store has no such object, so the local file is this box's own
+        # unpushed write: the local read is the SUPERSET, not a degraded one.
+        return _read_jsonl(path)
+    except Exception as exc:
+        AUTHORITATIVE_READ_FALLBACKS.append(str(path))
+        _note_local_fallback(path, exc, "read")
+        return _read_jsonl(path)
+    try:
+        return _parse_jsonl_text(raw.decode("utf-8", errors="replace"))
+    except Exception as exc:
+        AUTHORITATIVE_READ_FALLBACKS.append(str(path))
+        _note_local_fallback(path, exc, "parse")
+        return _read_jsonl(path)
+
+
+# Paths whose authoritative read FAILED and fell back to the local mirror in this
+# process. The mirror can be SHORT, and a short corpus reports valid refs as
+# dangling. learning-routing-repair refuses --apply while this is non-empty
+# (), because its writes null those refs.
+AUTHORITATIVE_READ_FALLBACKS: list = []
 
 
 def load_all_experiences():
@@ -249,6 +367,11 @@ def load_all_experiences():
     (a further -46%). Live-only reads would leave every reference to a rotated
     experience reported as dangling — the same false-positive class, one rotation
     later.
+
+    A THIRD defect of the same class was measured 2026-09-17 (g-358-131): the
+    read was reaching the local MIRROR of each peer's store, which no sweep and
+    no refresh call can keep current. `_read_agent_jsonl_fresh` carries the
+    measurement and why the obvious refresh remedy does not work.
     """
     global _AGENT_CORPUS_OWNED
     _AGENT_CORPUS_OWNED = world_owns_agent_corpus()
@@ -260,7 +383,7 @@ def load_all_experiences():
     root = agents_root()
     for name in ("experience.jsonl", "experience-archive.jsonl"):
         for exp_path in sorted(root.glob("*/" + name)):
-            records.extend(_read_jsonl(exp_path))
+            records.extend(_read_agent_jsonl_fresh(exp_path))
     return records
 
 

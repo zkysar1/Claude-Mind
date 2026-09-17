@@ -34,6 +34,7 @@ except ImportError:
 import datetime
 
 from _paths import META_DIR, AGENT_DIR, CONFIG_DIR, WORLD_DIR, PROJECT_ROOT, agents_root
+from _fresh_read import read_text_authoritative
 
 # Meta-strategies (meta/) — domain-agnostic
 QUALITY_PATH = META_DIR / "skill-quality.yaml"
@@ -347,7 +348,21 @@ def cmd_usage_report(args):
 
     all_invocations = []
     for inv_path in sorted(agents_root().glob("*/skill-invocations.jsonl")):
-        for rec in read_jsonl(inv_path):
+        # Store bytes, not the local mirror: a PEER's ledger mirror can be short
+        # of the store and a refresh leaves it short (). COUNTING
+        # reader, so ONE copy, never the membership union ().
+        try:
+            text = read_text_authoritative(inv_path, label="skill-analytics")
+        except FileNotFoundError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             if isinstance(rec, dict) and rec.get("ts", "")[:10] >= cutoff:
                 all_invocations.append(rec)
 

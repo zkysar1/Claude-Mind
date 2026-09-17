@@ -459,3 +459,104 @@ def test_the_floor_honours_an_injected_clock(monkeypatch):
         "injected clock was ignored -- freshness compared against the wall clock")
     assert status["branch"] == R.BRANCH_PREFER_REDUCER_ONLY
     assert picked is not None and picked["goal_id"] == "g-1-1"
+
+
+# ─── the SINGLE-EXIT emit: one record per call, on EVERY exit () ────
+#
+# These two pin the  shape. The defect they guard against is a single
+# refactor: hoisting the `_append_policy_diary` call back ABOVE the four returns
+# so it can be "unconditional" again. At that position `picked` and `yielded` do
+# not exist yet, so the row names the BRANCH and never the CONSEQUENCE — which
+# made six consecutive above-threshold iterations byte-identical between "the
+# reducer took reducer-only work" and "the floor yielded and something else was
+# picked" (, measured 2026-09-14). The existing tripwire at
+# test_worker_skill_eligibility.py:284 is a source grep and cannot express the
+# raise case, which is the one that discriminates.
+
+
+def _record_sink(monkeypatch):
+    """Capture emitted rows. Overrides the autouse `_isolate` no-op stub, which
+    still guarantees nothing reaches the live agent's append-only store."""
+    seen = []
+    monkeypatch.setattr(gs, "_append_policy_diary",
+                        lambda entry, agent_dir: seen.append(entry))
+    return seen
+
+
+def test_every_return_path_emits_exactly_one_record(monkeypatch):
+    """All four returns, asserted after EACH call rather than once at the end.
+
+    A single end-of-loop total would let a path that emits twice be cancelled by
+    a path that emits none — the two failure modes this is meant to separate.
+    """
+    seen = _record_sink(monkeypatch)
+    cases = (
+        # label, live workers, rows, prior_hoist, branch, picked, yielded
+        ("below-threshold", 1, _rows(("g-1-1", None, "reducer")), False,
+         R.BRANCH_BELOW_THRESHOLD, None, False),
+        ("not-scored", 4, [], False,
+         R.BRANCH_PREFER_REDUCER_ONLY, None, False),
+        ("no-nominees-inert", 4, _rows(("g-1-1", None, None)), False,
+         R.BRANCH_PREFER_REDUCER_ONLY, None, False),
+        ("prior-hoist-yielded", 4, _rows(("g-1-1", None, "reducer")), True,
+         R.BRANCH_PREFER_REDUCER_ONLY, None, True),
+        ("picked", 4, _rows(("g-1-1", None, "reducer")), False,
+         R.BRANCH_PREFER_REDUCER_ONLY, "g-1-1", False),
+    )
+    for label, n, rows, prior, branch, picked, yielded in cases:
+        del seen[:]
+        _floor(monkeypatch, body_role=None, sid=SID, running_sid=SID,
+               team_state=_team_state(*[("a", f"s{i}", 1) for i in range(n)]),
+               rows=rows, prior_hoist=prior)
+        assert len(seen) == 1, (
+            f"{label}: expected exactly ONE record per call, got {len(seen)}")
+        entry = seen[0]
+        rsp = entry["reducer_selection_policy"]
+        assert entry["entry_type"] == "decision", label
+        assert rsp["branch"] == branch, label
+        assert rsp["picked"] == picked, label
+        assert rsp["yielded"] is yielded, label
+
+
+def test_a_record_is_written_even_when_the_body_RAISES(monkeypatch):
+    """THE discriminating case, and the reason a source grep will not do.
+
+    On an early raise the locals (`detail`, `decision`, `nominees`, `picked`)
+    never come into existence. An emit that read them would itself raise inside
+    `finally`, destroying BOTH the record and the original traceback. Reading
+    every value off the accumulated `status` dict is what makes the row
+    survivable, and only this test can tell the two implementations apart.
+
+    The raise PROPAGATES from this function by design: the call site wraps the
+    whole block in `except Exception` and prints a defensive diagnostic, so
+    fail-open is the CALLER's property, not this function's. Pinning the
+    propagation here keeps a future in-function swallow from silently removing
+    that diagnostic.
+    """
+    seen = _record_sink(monkeypatch)
+    monkeypatch.setattr(gs, "_reducer_policy_inputs",
+                        lambda agent_dir: (None, SID, SID))
+    monkeypatch.setattr(gs, "REDUCER_SELECTION_CONFIG", dict(R.DEFAULTS))
+
+    def _explode():
+        raise RuntimeError("team-state read exploded")
+
+    # _load_team_state_cached() runs AFTER status["role"] is assigned (so the
+    # emit's role guard passes) and BEFORE any other status field is populated —
+    # exactly the window where the row must fall back on initialised values.
+    monkeypatch.setattr(gs, "_load_team_state_cached", _explode)
+
+    with pytest.raises(RuntimeError, match="team-state read exploded"):
+        gs.apply_reducer_only_floor(_rows(("g-1-1", None, "reducer")), None,
+                                    now=NOW)
+
+    assert len(seen) == 1, (
+        "the finally-block emit must survive an escaping exception")
+    entry = seen[0]
+    rsp = entry["reducer_selection_policy"]
+    assert entry["entry_type"] == "decision"
+    assert rsp["branch"] is None, "no branch was decided before the raise"
+    assert rsp["picked"] is None and rsp["yielded"] is False
+    assert rsp["live_workers"] == 0
+    assert rsp["stale_rows_ignored"] is None
+    assert rsp["undated_rows_ignored"] is None

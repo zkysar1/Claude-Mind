@@ -194,8 +194,34 @@ bash core/scripts/hot-path-size-gate.sh --explain <path> # which set / cap a pat
 
 `--check` measures HEAD blobs (committed truth, identical on every box) and
 prints one `PASS:`/`FAIL:` line, which the `/verify-learning` check
-`hot-path-size-ratchet` greps. `FAIL` means an override or a merge added prose
-since the baseline — route it out.
+`hot-path-size-ratchet` greps. `FAIL` means the corpus grew since the baseline,
+and **two doors grow it while only ONE leaves a trace** — so read the verdict
+line's door list rather than stopping at the ledger:
+
+- **Door 1 — override / merge.** Writes a row to
+  `world/override-bypass-ledger.jsonl` under gate `hot-path-size-gate`. Grep it
+  and route the prose out (rationale / conventions / tree / a data registry).
+- **Door 2 — deliberate adoption.** A NEW `.claude/rules/*.md`, or a documented
+  exception block added to an existing one, enters the Tier-1 corpus by
+  MATCHING A GLOB — nothing registers it and **no ledger row is written**. An
+  empty ledger is therefore the EXPECTED reading for door 2, never evidence of
+  a bypass.
+
+Confirm door 2 by diffing the run's per-set bytes against the baseline's
+`per_set` map in `meta/audit-baselines.yaml`, then `git log -p` the set that
+moved. When the growth is deliberate and confirmed at either door, **leave the
+baseline alone** and let the advisory stand — `audit-baselines.md` names
+re-seeding on regression as the anti-pattern that defeats a ratchet, and
+`coordination_merge.merge_audit_baselines` merges `baseline` by MIN, so a hand
+re-seed reads STABLE locally and is silently reverted at the next merge.
+
+Measured 2026-09-16 (echo, cc-03): the entire +6,780 B Tier-1 regression was
+door 2 — `.claude/rules/perception-reaction.md` newly adopted (+6,222 B,
+g-373-09) plus the vessel-sidecar exception block in
+`.claude/rules/stop-hook-compliance.md` (+1,123 B, g-373-16) — against **0**
+ledger rows. The concurrent file-count move 190 → 193 was unrelated: two of
+those three files are new `.claude/skills/*/SKILL.md`, which sit in Tier 2 and
+contribute zero Tier-1 bytes. Do not join the file delta to the byte delta.
 
 **The two tiers are counted and ratcheted SEPARATELY**, and the line reports
 both: `hot <N> B + on-demand <M> B = <total> B`. `hot_path_total_bytes` in
