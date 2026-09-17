@@ -1977,6 +1977,16 @@ def cmd_claim_integrity(args, config, compact):
         "reconcile_damage_count": res["reconcile_damage_count"],
         "per_agent": res["per_agent"],
         "findings": res["findings"][:5],
+        # : FORWARD THE ROWS, not just their count. The summary string
+        # above carries claim_clock_violation_count, and a bare number cannot be
+        # acted on -- a reader sees "verdict clean, 0 damaged | claim-clock skew 3"
+        # and correctly reads it as a rounding detail, because nothing names WHICH
+        # claims are skewed. Measured 2026-09-14: bravo disposed this flag four
+        # times in one session on exactly that basis, while three live claims were
+        # invisible to coordination_merge._merge_goal the whole time.
+        # claim-integrity-check.py:444 already exports the list; it was dropped
+        # here, one layer above the producer. Capped at 5 to match `findings`.
+        "claim_clock_violations": res.get("claim_clock_violations", [])[:5],
     }
 
 

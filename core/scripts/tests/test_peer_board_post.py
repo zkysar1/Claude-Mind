@@ -137,6 +137,19 @@ def test_real_writes_reparse_with_unique_ids(peer_world):
     assert len(set(ids)) == 3, f"duplicate ids: {ids}"
 
 
+def test_segmented_writer_flag_never_reaches_a_peer_board(peer_world):
+    """: BOARD_SEGMENTED_CHANNELS moves THIS world's writers onto date
+    segments. The peer's readers run the peer's checkout, which may not understand
+    segments, so this lane must keep writing the live file whatever the flag says."""
+    r = run(["--peer", "zds-mind", "--channel", "coordination"],
+            env_extra={"PEER_WORLD_ZDS_MIND": str(peer_world),
+                       "BOARD_SEGMENTED_CHANNELS": "coordination"})
+    assert r.returncode == EXIT_OK, r.stderr
+    assert (peer_world / "board" / "coordination.jsonl").exists()
+    minted = sorted(p.name for p in (peer_world / "board").glob("coordination-*.jsonl"))
+    assert minted == [], f"peer lane wrote a segment: {minted}"
+
+
 def test_empty_stdin_is_rejected(peer_world):
     r = run(["--peer", "zds-mind", "--channel", "coordination"], stdin="   ",
             env_extra={"PEER_WORLD_ZDS_MIND": str(peer_world)})

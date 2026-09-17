@@ -204,7 +204,7 @@ _ISO_DATE_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})")
 # --- Referent classification --------------------------------------------------
 
 _ASP_RE = re.compile(r"^asp-\d{3,}$")
-_GOAL_RE = re.compile(r"^g-\d{3,}-\d{2,4}$")
+_GOAL_RE = re.compile(r"^g-\d{3,}-\d{2,5}$")
 _MSG_RE = re.compile(r"^msg-\d{8}-\d{6}-[a-z0-9-]+$")
 _RB_RE = re.compile(r"^rb-\d+$")
 _GUARD_RE = re.compile(r"^guard-\d+$")
@@ -330,11 +330,16 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 def load_existing(world_dir: Path, *, agent_dirs: Iterable[Path] = ()) -> List[Dict[str, Any]]:
     """Live ∪ archive aspirations of the world queue (+ optional agent queues)."""
+    # The eager pull never re-pulls an archive, so refresh each one before
+    # reading it ().
+    from _fresh_read import refresh_for_read
     world_dir = Path(world_dir)
     recs = read_jsonl(world_dir / "aspirations.jsonl")
+    refresh_for_read(world_dir / "aspirations-archive.jsonl", label="aspiration-supply")
     recs += read_jsonl(world_dir / "aspirations-archive.jsonl")
     for ad in agent_dirs:
         recs += read_jsonl(Path(ad) / "aspirations.jsonl")
+        refresh_for_read(Path(ad) / "aspirations-archive.jsonl", label="aspiration-supply")
         recs += read_jsonl(Path(ad) / "aspirations-archive.jsonl")
     return recs
 

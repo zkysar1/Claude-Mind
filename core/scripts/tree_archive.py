@@ -286,6 +286,25 @@ def scan(today=None, scope_keys=None, cfg=None):
     # apply_defaults so last_relevant_at / node_type are present in-memory.
     raw_nodes = tree.get("nodes", {})
     tree = {"nodes": {k: apply_defaults(v) for k, v in raw_nodes.items()}}
+    # : fold un-flushed spooled retrieval deltas before deciding.
+    # `effective_relevance` reads `last_retrieved`, and a node retrieved since
+    # the last STRUCTURAL tree write carries that proof only in the spool —
+    # measured cadence is ~15 structural writes per 24h against 186 counter
+    # bumps, so the un-drained window is HOURS, not seconds. Reading the index
+    # alone here would age a live node into an archive candidate on evidence
+    # that exists but has not landed yet (guard-731: never retire on the
+    # counter alone). scan() writes nothing, so this merge cannot double-count
+    # against write_tree's drain — the read-only contract is what makes it safe
+    # HERE and is why the same fold is not repeated in apply().
+    try:
+        import _tree_retrieval_spool as _trs
+        from tree import _tree_path
+        _pending = _trs.pending_deltas(_tree_path())
+        if _pending:
+            _trs.apply_pending(tree, _pending)
+    except Exception as _exc:  # noqa: BLE001 - a scan must never fail closed
+        print("[tree_archive] retrieval-spool read-merge skipped: {}".format(
+            _exc), file=sys.stderr)
     leaves, fm_map = _leaves_and_frontmatter(tree)
 
     threshold = cfg["archive_threshold_days"]

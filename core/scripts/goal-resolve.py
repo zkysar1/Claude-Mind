@@ -95,6 +95,11 @@ def _iter_aspirations(world, fname):
 def resolve(goal_id, world=None):
     """-> dict with disposition/status/source. Never raises on a missing store."""
     world = world or _world()
+    # The eager pull never re-pulls an archive, so a stale copy would turn an
+    # archived goal into "unknown", a false negative ().
+    from pathlib import Path
+    from _fresh_read import refresh_for_read
+    refresh_for_read(Path(world, "aspirations-archive.jsonl"), label="goal-resolve")
     out = {"goal_id": goal_id, "disposition": "unknown", "status": None,
            "aspiration_id": None, "source": None, "title": None}
 

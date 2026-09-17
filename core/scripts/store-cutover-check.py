@@ -183,10 +183,41 @@ STORES = {
     # after the seam) also covers the DAEMON in practice:  auto-
     # restarts a stale-code daemon on the next wrapper call after a pull, and an
     # iteration cannot complete without wrapper calls.
+    # seam_symbols added  (2026-09-16). WHY it was needed: with
+    # byte-identity as the sole predicate across EIGHT consumers on a dev tier,
+    # SAFE was unreachable — foxtrot was reported unattested on a file whose
+    # ONLY divergence was , a manifest-baseline sync-lane change with
+    # nothing to do with reader capability, while `merge-base --is-ancestor`
+    # proved it carried the seam. guard-5488: a gate that refuses on a
+    # precondition with no path to satisfy it.
+    #
+    # WHY `plain_md5` is SCOPED rather than declared store-wide — read this
+    # before widening it. storage_backend.py has NO call site (it references the
+    # codec only in a docstring and carries the contract as a field), so it
+    # needs the weaker name-kind spec or the fleet-level veto fires. But
+    # owncloud_sync.py passes that same field as the ARGUMENT to the codec call,
+    # so a store-wide name spec kept matching it after its call was REVERTED:
+    # measured, the widening could not go red on an injected defect, which is
+    # guard-6244's permanent-pass shape. Scoping confines the weak read to the
+    # one file that cannot satisfy the strong one; every other consumer stays on
+    # the call predicate and a revert there still goes red.
+    #
+    # Do NOT "simplify" this by dropping storage_backend.py from consumers
+    # instead — that is a NARROWING (guard-4315) and it genuinely carries the
+    #  contract.
     "gzip": {
         "seam_commit": "ad2ae3207f7f9f56ae21b6e5468d9a9584492a94",
         "field": "owncloud_gzip_seam",
         "flag": "OWNCLOUD_GZIP_STORES",
+        "seam_symbols": [
+            "decode_response",
+            "content_matches",
+            "head_plain_md5",
+            "should_encode",
+            "put_kwargs",
+            {"name": "plain_md5", "kind": "name",
+             "consumers": ["core/scripts/storage_backend.py"]},
+        ],
         "consumers": [
             "core/scripts/_owncloud_codec.py",
             "core/scripts/owncloud_backend.py",
@@ -337,7 +368,7 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
                 unreadable.append({"consumer": path,
                                    "error": out.stderr.strip()[:160]})
                 continue
-            matched = _calls_any_symbol(out.stdout, specs)
+            matched = _calls_any_symbol(out.stdout, specs, path)
             if matched:
                 routed.append({"consumer": path, "symbol": matched})
             else:
@@ -611,8 +642,8 @@ def _strip_comments(text: str) -> str:
 SYMBOL_KINDS = ("call", "name")
 
 
-def _symbol_spec(declared: str | dict) -> tuple[str, str]:
-    """Normalize a declared `seam_symbol` into (name, kind).
+def _symbol_spec(declared: str | dict) -> tuple[str, str, frozenset | None]:
+    """Normalize a declared `seam_symbol` into (name, kind, consumers).
 
     A STORES entry may declare a bare STRING (the historical form, always a
     CALL) or a DICT {"name": ..., "kind": "call"|"name"}. The dict form exists
@@ -621,18 +652,41 @@ def _symbol_spec(declared: str | dict) -> tuple[str, str]:
     call-only predicate makes a flag-named seam PERMANENTLY UNSATISFIABLE
     (g-358-27 defect b). One key rather than two so the name and its mode
     cannot drift apart.
+
+    `consumers` (g-358-95) SCOPES a spec to named files; omitted/None means
+    every consumer, which is the historical behaviour and what a bare string
+    still yields. It exists because `kind: "name"` is the WEAKER predicate — a
+    bare token, not a call — and declaring it store-wide leaks that weakness
+    onto consumers that DO have a call site and must be held to the stricter
+    read. MEASURED 2026-09-16 on STORES['gzip']: `storage_backend.py` carries
+    the seam as a FIELD and has no call site at all, so it needs the name-kind
+    spec; but `owncloud_sync.py` passes that same field as the ARGUMENT to the
+    codec call, so a store-wide name spec kept matching it after its call was
+    reverted — the widened bucket could not go red on an injected defect, which
+    is guard-6244's permanent-pass shape. Scoping the weak spec to the one file
+    that cannot satisfy the strong one restores discrimination everywhere else.
+
+    Scoping only ever NARROWS: a scoped spec is skipped for files it does not
+    name, so it can remove a match and never add one.
     """
     if isinstance(declared, dict):
         name, kind = declared.get("name"), declared.get("kind", "call")
+        scope = declared.get("consumers")
     else:
-        name, kind = declared, "call"
+        name, kind, scope = declared, "call", None
     if not name or kind not in SYMBOL_KINDS:
         raise ValueError(f"bad seam_symbol spec: {declared!r}")
-    return name, kind
+    if scope is not None:
+        if isinstance(scope, str) or not hasattr(scope, "__iter__"):
+            raise ValueError(f"bad seam_symbol consumers: {declared!r}")
+        scope = frozenset(scope)
+        if not scope:
+            raise ValueError(f"empty seam_symbol consumers: {declared!r}")
+    return name, kind, scope
 
 
-def _symbol_specs(declared) -> list[tuple[str, str]]:
-    """Normalize a declared `seam_symbols` into a list of (name, kind).
+def _symbol_specs(declared) -> list[tuple[str, str, frozenset | None]]:
+    """Normalize a declared `seam_symbols` into a list of (name, kind, consumers).
 
     Accepts None/empty (-> []), a bare string or dict (the historical SINGULAR
     form, normalized to a one-element list), or any sequence of those. One
@@ -651,7 +705,8 @@ def _symbol_specs(declared) -> list[tuple[str, str]]:
     return [_symbol_spec(d) for d in declared]
 
 
-def _calls_any_symbol(text: str, specs: list[tuple[str, str]]) -> str | None:
+def _calls_any_symbol(text: str, specs: list[tuple[str, str, frozenset | None]],
+                      path: str | None = None) -> str | None:
     """The FIRST declared symbol this source routes to, or None.
 
     "calls >= 1", not "calls ALL" — measured on the 17 `utilization` consumers,
@@ -659,8 +714,16 @@ def _calls_any_symbol(text: str, specs: list[tuple[str, str]]) -> str | None:
     different parts of one reader API on purpose. Returns the matching NAME
     rather than a bool so a report can state WHICH symbol carried a consumer;
     a verdict nobody can attribute is the shape this whole change exists to fix.
+
+    `path` is the consumer being read, and a spec SCOPED to a consumer set
+    (g-358-95) applies only to the files it names. A scoped spec is SKIPPED
+    when `path` is None — the fail-closed reading: a caller that cannot say
+    which file it is looking at must not receive a file-specific exemption.
+    Every in-tree call site passes `path`.
     """
-    for name, kind in specs:
+    for name, kind, scope in specs:
+        if scope is not None and (path is None or path not in scope):
+            continue
         if _calls_symbol(text, name, kind):
             return name
     return None
@@ -776,13 +839,15 @@ def _symbol_report(symbol: str, consumers: list[str], ref: str) -> dict:
             unreadable.append({"consumer": path,
                                "error": out.stderr.strip()[:160]})
             continue
-        matched = _calls_any_symbol(out.stdout, specs)
+        matched = _calls_any_symbol(out.stdout, specs, path)
         if matched:
             ok.append({"consumer": path, "symbol": matched})
         else:
             missing.append(path)
     return {"symbol_present": not missing and not unreadable,
-            "symbols": [{"name": n, "kind": k} for n, k in specs],
+            "symbols": [{"name": n, "kind": k,
+                         "consumers": (sorted(s) if s else None)}
+                        for n, k, s in specs],
             "ref": ref, "ok": ok, "missing": missing, "unreadable": unreadable}
 
 
@@ -825,12 +890,12 @@ def _local_report(seam_commit: str, consumers: list[str],
                 except OSError as exc:
                     unreadable.append({"consumer": path, "error": str(exc)})
                     continue
-                if not _calls_any_symbol(text, specs):
+                if not _calls_any_symbol(text, specs, path):
                     missing.append(path)
             if missing or unreadable:
                 return {"seam_present": False,
                         "reason": "consumers_do_not_route_to_any_seam_symbol",
-                        "symbols": [n for n, _ in specs],
+                        "symbols": [n for n, _, _ in specs],
                         "missing": missing, "unreadable": unreadable}
         return {"seam_present": True}
     except Exception as exc:

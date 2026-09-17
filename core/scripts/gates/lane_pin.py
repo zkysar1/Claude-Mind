@@ -48,6 +48,30 @@ including the description. See `_goal_headline` for the measurement behind that
 split — descriptions cite file paths procedurally, so a lone noun found there
 says nothing about the work.
 
+CARVE-OUTS (g-115-9853)
+-----------------------
+A carve-out grants ONE named system back into the lane from inside a broad
+out-of-lane rule, so the registry names it twice: granted in the in-lane column
+and EXCEPTED in the out-of-lane one ("ALL CODE work EXCEPT <system>: ...").
+Neither mention is an enumeration item. Measured on the live pin-001 row: the
+grant is one 17-word fragment and the EXCEPT a 5-word one, both over
+_MAX_ITEM_WORDS, so the system's name was harvested on NEITHER side. Its only
+evidence was a verbatim 17-word phrase no goal title contains, so a goal about
+that system was refused whenever its title tripped any out-of-lane word (the
+measured refusal matched "server"). The set
+difference cancelled nothing (the shared set was empty) — but a name short
+enough to harvest on both sides WOULD be cancelled there, so both routes are
+closed below.
+
+A name is carve-out evidence when the out-of-lane column EXCEPTS it AND the
+in-lane column names it: excepted-but-not-granted says "not out of lane", which
+is not "in lane". It is kept out of the out-of-lane set and the set difference.
+A hyphenated name also contributes each component the in-lane column uses as a
+word of its own ("... using the <component> to ..."), because goals use the
+short name, not the identifier. Measured over 2,697 non-terminal goals: taking
+EVERY component turned 13 refusals into allows, mostly unrelated work sharing a
+generic name component; the corroborated component turned 3.
+
 Public API:
     parse_pins(text) -> list[dict]
     evaluate(agent, goal, *, registry_text=None, world_dir=None,
@@ -235,6 +259,39 @@ def _build_matcher(cell: str, exclude_tokens=frozenset()):
     return phrases, tokens
 
 
+# The object of an EXCEPT clause ends at the first clause delimiter. The em dash
+# counts: registry prose uses it as one ("... inline — except inside X, ...").
+_EXCEPT_RE = re.compile(r"\bexcept\s+([^:;,.()—]+)")
+
+
+def _carve_out_tokens(in_cell: str, out_cell: str, exclude_tokens=frozenset()):
+    """Tokens for a name the out-of-lane column EXCEPTS and the in-lane column
+    grants. See CARVE-OUTS in the module docstring.
+
+    A name counts only where the in-lane column uses it as a word of its own:
+    appearing inside a longer hyphenated name does not count, which is what
+    keeps a generic component of the full identifier out.
+    """
+    in_text = _norm(_strip_markdown(in_cell))
+
+    def _named_in_lane(term):
+        return re.search(r"(?<![a-z0-9-])" + re.escape(term) + r"(?![a-z0-9-])",
+                         in_text)
+
+    carve = set()
+    for obj in _EXCEPT_RE.findall(_norm(_strip_markdown(out_cell))):
+        obj = obj.strip()
+        # A prose clause after "except" is commentary, not a name.
+        if not obj or len(obj.split()) > _MAX_ITEM_WORDS or not _named_in_lane(obj):
+            continue
+        for tok in _WORD_RE.findall(obj):
+            tok = tok.strip(".,;:/-")
+            names = {tok} | {part for part in tok.split("-") if _named_in_lane(part)}
+            carve |= {n for n in names
+                      if len(n) >= _MIN_TOKEN_LEN and n not in exclude_tokens}
+    return carve
+
+
 def parse_pins(text: str):
     """Parse the ``## Standing Lane Pins`` markdown table.
 
@@ -277,6 +334,11 @@ def parse_pins(text: str):
             exclude = set(_roster()) | {agent}
             in_phrases, in_tokens = _build_matcher(in_cell, exclude)
             out_phrases, out_tokens = _build_matcher(out_cell, exclude)
+            # A carve-out's name is in-lane evidence only, so it is never
+            # cancelled below (see CARVE-OUTS in the module docstring).
+            carve = _carve_out_tokens(in_cell, out_cell, exclude)
+            in_tokens |= carve
+            out_tokens -= carve
             # A token in BOTH columns discriminates nothing — drop it from both.
             shared = in_tokens & out_tokens
             pin = {
@@ -569,6 +631,15 @@ def evaluate(agent, goal, *, registry_text=None, world_dir=None,
                     "evidence": out_hits[:4], "override": None}
 
         # A pin exists for this agent but nothing matched its out-of-lane column.
+        # Name the in-lane evidence when there is some (): with an
+        # empty evidence list, a lane item that never matches anything looked
+        # exactly like one that works.
+        for pin in pins:
+            in_hits = _hits(haystack, headline, pin["in_phrases"], pin["in_tokens"])
+            if in_hits:
+                return {"would_block": False, "fired": True, "reason": "in-lane",
+                        "pin_id": pin["id"], "verdict": "in-lane",
+                        "evidence": in_hits[:4], "override": None}
         return {"would_block": False, "fired": True, "reason": "in-lane-or-unmatched",
                 "pin_id": pins[0]["id"], "verdict": "in-lane", "evidence": [],
                 "override": None}

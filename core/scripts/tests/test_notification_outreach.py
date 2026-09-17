@@ -86,12 +86,24 @@ def test_body_fingerprint_catches_reworded_subject(world):
 
 
 def test_windows_blocker_24h_default_7d(world):
+    """Per-category windows: a listed one uses its own, an UNLISTED one takes `_default`.
+
+    This used `decision-needed` as the unlisted stand-in until 2026-09-17, when that
+    category got an explicit 6h entry (g-115-10056 — it is a liveness ALARM, and
+    inheriting the 7-day question window made nine real stall pages unreachable). The
+    default arm now uses a category that is genuinely absent from the table, so this test
+    keeps pinning what it was always about — the FALLBACK — instead of silently becoming a
+    test of one category's configured value.
+    """
     _rec(world, subject="[Alpha] Bridge outage g-999-01", category="blocker")
-    _rec(world, subject="[Alpha] Question about asp-777 scope", category="decision-needed")
+    _rec(world, subject="[Alpha] Question about asp-777 scope", category="planning")
     late = NOW + timedelta(hours=30)
     assert no.find_prior("[Bravo] Bridge outage g-999-01", "", "blocker", world=world, now=late) == []
-    assert no.find_prior("[Bravo] Question about asp-777 scope", "", "decision-needed", world=world, now=late)
-    assert no.find_prior("[Bravo] Question about asp-777 scope", "", "decision-needed", world=world, now=NOW + timedelta(days=8)) == []
+    assert no.find_prior("[Bravo] Question about asp-777 scope", "", "planning", world=world, now=late)
+    assert no.find_prior("[Bravo] Question about asp-777 scope", "", "planning", world=world, now=NOW + timedelta(days=8)) == []
+    # POSITIVE CONTROL on the premise: `planning` really is unlisted, so the arms above
+    # exercise `_default` and not a second configured value.
+    assert "planning" not in no.WINDOW_HOURS
 
 
 def test_suppressed_rows_do_not_count_as_prior(world):
@@ -173,3 +185,70 @@ def test_digest_and_specific_asks_never_suppress_each_other(world):
     _rec(world, subject="[Bravo] Your call on g-2-2", category="decision-needed", body="Decision needed on g-2-2")
     # and that ask does not block tomorrow's digest
     assert no.find_prior("[Echo] Fleet digest — 2026-08-17 (from echo)", "Needs you: g-2-2", "user-digest", world=world, now=NOW + timedelta(hours=22)) == []
+
+
+# ------------------------------------------------- peer-stall alarm window ()
+
+
+def _stall(agent: str, since_iso: str) -> str:
+    """The watchdog's literal subject shape (agent-watchdog.py PeerLivenessProbe)."""
+    return (f"Fleet: {agent} looks STALLED since {since_iso} UTC "
+            f"(no heartbeat, diary, board or goal activity)")
+
+
+def test_peer_stall_subject_normalises_across_episodes(world):
+    """The premise the window has to survive: two DIFFERENT stall episodes are ONE topic.
+
+    normalize_subject strips the timestamp, so the only thing separating episode 2 from
+    episode 1 is elapsed time against the window. If this ever stops holding, the two
+    tests below are testing nothing, so it is asserted rather than assumed.
+    """
+    assert (no.normalize_subject(_stall("zeta", "2026-09-09T14:03"))
+            == no.normalize_subject(_stall("zeta", "2026-09-16T01:26")))
+
+
+def test_second_stall_episode_past_the_window_reaches_the_owner(world):
+    """ outcome 2: a later episode must not be refused as a duplicate.
+
+    MEASURED 2026-09-16 (zeta, cc-02) before the fix: nine stall notifications for one
+    agent, all nine rc=4 / transport=none, every one suppressed against a single send
+    6.94 DAYS earlier, raised independently by three agents. The producer
+    (PeerLivenessProbe.REALERT_DEFAULT_SECONDS) re-pages every 6h, so 27 of every 28
+    pages were unreachable.
+    """
+    _rec(world, subject=_stall("zeta", "2026-09-09T14:03"))
+    later = NOW + timedelta(hours=7)          # one producer re-alert cycle, plus slack
+    assert no.find_prior(_stall("zeta", "2026-09-09T21:10"), "", "decision-needed",
+                         world=world, now=later) == [], (
+        "a stall episode past the alarm window must reach the owner — this is the exact "
+        "shape that was refused nine times, and a liveness alarm nobody can receive is "
+        "indistinguishable from no alarm at all")
+
+
+def test_stall_repage_inside_the_window_is_still_suppressed(world):
+    """CONTROL. Without it the test above would pass on a window of ZERO, which would
+    re-page the owner on every watchdog tick — the opposite defect, and the reason the
+    dedup exists at all."""
+    _rec(world, subject=_stall("zeta", "2026-09-09T14:03"))
+    soon = NOW + timedelta(hours=5)           # inside one producer re-alert cycle
+    assert no.find_prior(_stall("zeta", "2026-09-09T19:00"), "", "decision-needed",
+                         world=world, now=soon) != [], (
+        "a re-page inside the window must still be deduped")
+
+
+def test_the_alarm_window_is_not_the_default(world):
+    """The defect was INHERITANCE, not a wrong number: `decision-needed` carried no entry
+    and silently took `_default`. Pin that it is explicitly configured and strictly
+    shorter, so deleting the entry fails here instead of going quiet again.
+
+    Deliberately NOT asserted: that every ALWAYS_SEND category is short. `user-digest` is
+    in notification_routing_gate.ALWAYS_SEND_CATEGORIES and carries a deliberate 20h
+    window HERE — the two gates answer different questions, and collapsing them would
+    delete a rule that exists on purpose.
+    """
+    assert "decision-needed" in no.WINDOW_HOURS
+    assert no.window_for("decision-needed") < no.window_for("_no_such_category_")
+    # reply is ALSO ALWAYS_SEND and carries no entry — measured, not fixed here: it is a
+    # different category with a different argument, and widening this change to cover it
+    # would be scope the goal did not ask for.
+    assert no.window_for("reply") == no.window_for("_no_such_category_")

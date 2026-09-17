@@ -109,6 +109,48 @@ def test_unknown_start_with_stop_loop_set_is_a_plain_clear():
                   signal_mtime=LATER, started_at=None, force=False) == CLEAR
 
 
+# ------------------------------------------------- sidecar signature ------
+# Measured 2026-09-17 on prod vessel debc47de (run B): the sidecar raised at
+# 20:29:29, /start wrote the binding at 20:31:43, Step 2.5 cleared at 20:32:09.
+# EARLIER-than-start is exactly that shape, and the signature must beat it.
+
+def test_sidecar_signed_stop_is_refused_even_when_older_than_the_binding():
+    assert decide(True, False, EARLIER, T0, False, raised_by_sidecar=True) == REFUSE
+
+
+def test_sidecar_signed_stop_is_refused_when_start_is_unknown():
+    assert decide(True, False, EARLIER, None, False, raised_by_sidecar=True) == REFUSE
+
+
+def test_sidecar_signed_stop_still_clears_once_stop_loop_is_set():
+    # graceful-stop D2 (stop-loop) then D3 (clear): the handled shape stays permitted
+    assert decide(True, True, EARLIER, T0, False, raised_by_sidecar=True) == CLEAR
+
+
+def test_force_overrides_a_sidecar_signed_stop():
+    assert decide(True, False, EARLIER, T0, True, raised_by_sidecar=True) == CLEAR
+
+
+def test_unsigned_stale_signal_is_still_permitted():
+    # the control: same inputs, signature flipped off -> the mtime rule decides
+    assert decide(True, False, EARLIER, T0, False, raised_by_sidecar=False) == CLEAR
+
+
+def test_signature_reader_matches_only_the_first_line(tmp_path):
+    reader = session_mod._signal_raised_by_sidecar
+    signed = tmp_path / "signed"
+    signed.write_text(session_mod.SIDECAR_RAISE_MARKER + "\nraised_at: 2026-09-17T20:29:29Z\n",
+                      encoding="utf-8")
+    assert reader(signed) is True
+    empty = tmp_path / "empty"
+    empty.touch()                                   # the framework's own writers
+    assert reader(empty) is False
+    buried = tmp_path / "buried"
+    buried.write_text("note\n" + session_mod.SIDECAR_RAISE_MARKER + "\n", encoding="utf-8")
+    assert reader(buried) is False
+    assert reader(tmp_path / "absent") is False
+
+
 # ------------------------------------------------------------ real wiring -----
 
 @pytest.fixture()
@@ -154,6 +196,20 @@ def test_cli_refuses_a_live_stop_and_leaves_the_file(staged_agent):
     assert r.returncode == 1, r.stderr
     assert "REJECTED" in r.stderr
     assert sig.exists(), "the live stop signal must survive a refused clear"
+
+
+def test_cli_refuses_a_sidecar_signed_stop_older_than_the_binding(staged_agent):
+    """The run-B shape end to end: signature present, mtime before started_at."""
+    agent, sid, sess = staged_agent
+    sig = sess / "stop-requested"
+    sig.write_text(session_mod.SIDECAR_RAISE_MARKER + "\nraised_at: 2026-09-13T11:00:00Z\n",
+                   encoding="utf-8")
+    old = 1_757_760_000                     # 2026-09-13T10:40Z, before started_at 12:00
+    os.utime(sig, (old, old))
+    r = _clear(agent, sid)
+    assert r.returncode == 1, r.stderr
+    assert "REJECTED" in r.stderr and "signature" in r.stderr
+    assert sig.exists(), "a sidecar-signed stop must survive /start's hygiene clear"
 
 
 def test_cli_permits_the_graceful_stop_shape(staged_agent):

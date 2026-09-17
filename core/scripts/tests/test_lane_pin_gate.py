@@ -257,6 +257,110 @@ def test_tokens_present_in_both_columns_are_dropped_from_both(tmp_path):
     assert "trace" not in pin["in_tokens"]
 
 
+# ── Carve-outs: a name granted in-lane and EXCEPTED out-of-lane () ──
+# Same row shape as the live pin: the grant is one long bold prose item closing
+# the in-lane enumeration, and the out-of-lane column opens with the EXCEPT and
+# repeats it inside a commentary sentence. Neither mention is short enough to be
+# an enumeration item — that is the defect, so a fixture that listed the name
+# as a short item would test a registry nobody wrote.
+_CARVE_IN_CELL = _IN_CELL[:-1] + (
+    "; **`Acme-Render-Engine` improvement — code included — plus using the "
+    "Engine to evaluate how well the widgets run (carve-out, see pin-t01a)**.")
+_CARVE_OUT_CELL = (
+    "ALL CODE work **EXCEPT `Acme-Render-Engine`**: server scripts, client "
+    "scripts, workflows, analyzers, env-server, framework scripts, trace log "
+    "analysis/measurement, web-API probes runnable from any box, doc trims. "
+    "Pinnedagent FILES code defects with evidence (error text, session id, "
+    "storage path) and never root-causes or fixes them inline — except inside "
+    "the Render Engine, which it now owns and fixes directly. Selector score is "
+    "NOT a justification for an out-of-lane claim.")
+
+
+def _carve_registry(in_cell=_CARVE_IN_CELL, out_cell=_CARVE_OUT_CELL):
+    return _registry(rows=f"| pin-t01 | {PIN_AGENT} | {in_cell} | {out_cell} | "
+                          f"2026-08-06 | user directive | user directive only |\n")
+
+
+def test_carve_out_name_is_in_lane_evidence_and_never_out_of_lane():
+    pin = lp.parse_pins(_carve_registry())[0]
+    assert {"acme-render-engine", "engine"} <= pin["in_tokens"]
+    assert not {"acme-render-engine", "engine"} & pin["out_tokens"]
+    # A component the in-lane column never uses on its own contributes nothing,
+    # and the rest of the out-of-lane enumeration is untouched.
+    assert "render" not in pin["in_tokens"]
+    assert {"server", "framework", "workflows"} <= pin["out_tokens"]
+
+
+def test_carve_out_goal_naming_an_out_of_lane_word_is_not_refused(tmp_path):
+    """The measured refusal: carve-out work whose title says "server"."""
+    result = _evaluate(PIN_AGENT,
+                       _goal("Engine runs SERIAL against a 16-slot server — "
+                             "about 5 percent of the pool used"),
+                       tmp_path, registry_text=_carve_registry())
+    assert result["would_block"] is False
+    assert result["verdict"] == "ambiguous"
+    assert {"server", "engine"} <= set(result["evidence"])
+
+
+def test_carve_out_goal_reports_positive_in_lane_evidence(tmp_path):
+    """Enforced, not merely uncontradicted: the evidence list names the match."""
+    result = _evaluate(PIN_AGENT, _goal("Engine: batch the render calls"),
+                       tmp_path, registry_text=_carve_registry())
+    assert result["would_block"] is False
+    assert result["verdict"] == "in-lane"
+    assert result["reason"] == "in-lane"
+    assert "engine" in result["evidence"]
+
+
+def test_carve_out_does_not_loosen_genuinely_out_of_lane_work(tmp_path):
+    """Control: must stay refused with the carve-out present, and under every
+    mutant of the carve-out code."""
+    result = _evaluate(PIN_AGENT,
+                       _goal("Fix the framework scripts that ship the client "
+                             "scripts"),
+                       tmp_path, registry_text=_carve_registry())
+    assert result["would_block"] is True
+    assert result["verdict"] == "out-of-lane"
+
+
+def test_carve_out_excepted_but_never_granted_is_not_evidence(tmp_path):
+    """"Not out of lane" is not "in lane": without the in-lane grant, an
+    EXCEPT alone must not turn a refusal into an allow."""
+    registry = _carve_registry(in_cell=_IN_CELL)
+    assert not {"acme-render-engine", "engine"} & lp.parse_pins(registry)[0]["in_tokens"]
+    result = _evaluate(PIN_AGENT,
+                       _goal("Acme-Render-Engine runs SERIAL against a 16-slot "
+                             "server"),
+                       tmp_path, registry_text=registry)
+    assert result["would_block"] is True
+
+
+def test_carve_out_name_harvested_in_both_columns_is_not_cancelled(tmp_path):
+    """A SHORT carve-out name is an enumeration item on BOTH sides, which is
+    exactly what the set difference cancels — leaving the carve-out with no
+    evidence by the other route."""
+    registry = _carve_registry(
+        in_cell="Run widget sessions; engine tuning; host-only provisioning.",
+        out_cell="Code work (except engine), workflows, analyzers, framework "
+                 "scripts.")
+    pin = lp.parse_pins(registry)[0]
+    assert "engine" in pin["in_tokens"]
+    assert "engine" not in pin["out_tokens"]
+    result = _evaluate(PIN_AGENT, _goal("Speed up the engine workflows"),
+                       tmp_path, registry_text=registry)
+    assert result["would_block"] is False
+
+
+def test_carve_out_unmatched_goal_still_reports_unmatched(tmp_path):
+    """Control for the evidence report: no match on either column keeps the old
+    reason and an empty list, so "in-lane" always means something matched."""
+    result = _evaluate(PIN_AGENT, _goal("Tidy the release notes"), tmp_path,
+                       registry_text=_carve_registry())
+    assert result["would_block"] is False
+    assert result["reason"] == "in-lane-or-unmatched"
+    assert result["evidence"] == []
+
+
 # ── Ambiguity and fail-open: the reason a false refusal cannot happen ──────
 
 def test_matching_both_columns_allows_as_ambiguous(tmp_path):

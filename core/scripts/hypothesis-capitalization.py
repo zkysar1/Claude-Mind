@@ -103,8 +103,13 @@ def load_corpus(world_dir=None):
     if base is None:
         diag["missing"].append("<WORLD_DIR unresolved>")
         return records, diag
+    from _fresh_read import refresh_for_read
     for name in STORE_FILES:
         path = base / name
+        if name.endswith("-archive.jsonl"):
+            # The eager pull never re-pulls an archive, so an unrefreshed read
+            # drops records from the corpus with no error ().
+            refresh_for_read(path, label="hypothesis-capitalization")
         if not path.is_file():
             diag["missing"].append(name)
             continue

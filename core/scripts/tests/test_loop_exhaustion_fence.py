@@ -260,7 +260,6 @@ def test_compute_streak_sid_anchor_rejects_a_longer_sid(tmp_path):
 @pytest.mark.parametrize("sid,log,diary", [
     ("", "hook.log", "diary.jsonl"),
     ("S1", "missing.log", "diary.jsonl"),
-    ("S1", "hook.log", "missing-diary.jsonl"),
 ])
 def test_compute_streak_returns_none_on_any_unreadable_source(tmp_path, sid, log, diary):
     _write_log(tmp_path, ["2026-09-04T14:00:00 BLOCK agent=alpha sid=S1 x"])
@@ -268,6 +267,62 @@ def test_compute_streak_returns_none_on_any_unreadable_source(tmp_path, sid, log
     streak, stalled = fence.compute_streak(tmp_path / log, sid, tmp_path / diary)
     assert (streak, stalled) == (None, None)
     assert fence.decide(streak, stalled)["verdict"] == "hold"
+
+
+def test_compute_streak_absent_diary_anchors_at_the_first_turn_end(tmp_path):
+    """A session with turn-ends and NO diary has never advanced a phase.
+
+    Measured 2026-09-17 on a prod vessel (debc47de, run A): 85 consecutive
+    BLOCKs from 19:38:36 to 19:59:39, every one answered by prose, and no
+    execution diary was ever written because no iteration ever ran.  The fence
+    HELD on all 85 -- an absent diary read as an unreadable input.  It is not
+    ambiguous: the diary is appended at every phase start/end, so its absence
+    beside a streak of turn-ends is the strongest form of "cannot execute".
+    Anchor = the FIRST turn-end for the sid, so the wall-clock floor still
+    applies from that moment.
+    """
+    lines = [
+        "2026-09-17T19:38:36 BLOCK agent=a sid=S1 x",
+        "2026-09-17T19:38:50 BLOCK agent=a sid=S1 x",
+        "2026-09-17T19:39:05 BLOCK agent=a sid=OTHER x",   # other sid
+        "2026-09-17T19:39:20 ALLOW gate=g sid=S1 x",
+        "2026-09-17T19:39:35 RECOVERY gate=x sid=S1 x",     # no verdict token
+    ]
+    log = _write_log(tmp_path, lines)
+    streak, stalled = fence.compute_streak(
+        log, "S1", tmp_path / "never-written.jsonl",
+        now=datetime.datetime(2026, 9, 17, 19, 59, 39))
+    assert streak == 3
+    assert stalled == pytest.approx(21 * 60 + 3, abs=1)
+
+
+def test_compute_streak_absent_diary_with_no_turn_ends_is_a_zero_not_a_hold(tmp_path):
+    log = _write_log(tmp_path, ["2026-09-17T19:38:36 BLOCK agent=a sid=OTHER x"])
+    assert fence.compute_streak(log, "S1", tmp_path / "never-written.jsonl") == (0, 0.0)
+    assert fence.decide(0, 0.0)["verdict"] == "hold"
+
+
+def test_absent_diary_is_the_one_absence_that_does_not_hold(tmp_path):
+    """The measured run-A shape reaches the STOP rung under the DEFAULT thresholds
+    once the wall-clock floor has passed, and a diary that exists but cannot be
+    read still holds (the fail-safe direction is unchanged for unreadables)."""
+    t0 = datetime.datetime(2026, 9, 17, 19, 38, 36)
+    lines = ["%s BLOCK agent=a sid=S1 x" % (t0 + datetime.timedelta(seconds=15 * i)).isoformat()
+             for i in range(12)]
+    log = _write_log(tmp_path, lines)
+    streak, stalled = fence.compute_streak(
+        log, "S1", tmp_path / "never-written.jsonl", now=t0 + datetime.timedelta(minutes=16))
+    assert fence.decide(streak, stalled)["verdict"] == "stop"
+    unreadable = tmp_path / "diary-as-dir"
+    unreadable.mkdir()
+    (unreadable / "x").touch()
+    # a directory stats fine (mtime) -- that is a readable anchor, not an absence;
+    # the genuinely unreadable case is a path whose stat raises something other
+    # than FileNotFoundError, e.g. a component that is a file, not a directory
+    not_a_dir = tmp_path / "file-as-dir"
+    not_a_dir.write_text("x", encoding="utf-8")
+    streak, stalled = fence.compute_streak(log, "S1", not_a_dir / "diary.jsonl")
+    assert (streak, stalled) == (None, None)
 
 
 # --------------------------------------------------------------------------

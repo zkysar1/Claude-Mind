@@ -411,6 +411,118 @@ def test_wrapper_calls_a_silent_run_blind_instead_of_passing_it_off_as_clean(tmp
     assert "SILENT RUN" not in noisy.stdout, "output present must never be called silent"
 
 
+
+# --- a stage that dies mid-run cannot exit 0 () --------------------
+
+def test_wrapper_exits_4_naming_a_stage_that_was_dispatched_and_never_returned(tmp_path):
+    """rc=0 over a stage that never returned is how a half-run reads as success.
+
+    The check is evaluated from the program's OWN stage returns (a marker it
+    writes at dispatch and clears after the `done` crumb), never from captured
+    output: measured on cc-04 2026-09-13, six runs of `--apply > LOG` all showed a
+    log cut mid-stage while the meter proved every one COMPLETED, so an
+    output-side check would have refused six healthy runs (guard-6058).
+
+    The stub drives the REAL `_mark_in_flight`, so a renamed env var or a changed
+    marker format breaks this test instead of letting the wrapper and the .py
+    silently disagree about what "in flight" means.
+    """
+    from _bash_helpers import BASH  # guard-580: never a bare "bash" argv[0]
+
+    wrapper = tmp_path / "iteration-open.sh"
+    wrapper.write_bytes((SCRIPTS / "iteration-open.sh").read_bytes())
+    stub = tmp_path / "iteration-open.py"
+    stage = io_mod.STAGES[-1]["key"]
+    prelude = (
+        "import importlib.util, os, sys\n"
+        f"spec = importlib.util.spec_from_file_location('io', {(SCRIPTS / 'iteration-open.py').as_posix()!r})\n"
+        "io = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(io)\n"
+        "print('STAGE  rc  elapsed  note')\n"
+        "sys.stdout.flush()\n"
+    )
+
+    def run_stub(body):
+        stub.write_text(body, encoding="utf-8")
+        return subprocess.run(
+            [BASH, wrapper.as_posix(), "--apply"],
+            capture_output=True, text=True, timeout=120,
+        )
+
+    # os._exit: an abrupt death with no cleanup, as a kill would leave it.
+    died = run_stub(prelude + f"io._mark_in_flight({stage!r})\nos._exit(137)\n")
+    assert died.returncode == 4, died.stdout + died.stderr
+    assert "STAGE UNFINISHED" in died.stdout
+    assert f"'{stage}'" in died.stdout, "the refusal must NAME the stage that never returned"
+    assert "BLIND" in died.stdout, "must reach the fallback wording the precheck SKILL disposes"
+
+    # NEGATIVE CONTROL 1 -- the same stage dispatched AND returned is the normal
+    # fail-open 0. Without it the half above would pass against a wrapper that
+    # exited 4 unconditionally (guard-3534).
+    ok = run_stub(prelude + f"io._mark_in_flight({stage!r})\nio._mark_in_flight('')\n")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "STAGE UNFINISHED" not in ok.stdout
+
+    # NEGATIVE CONTROL 2 -- a death before ANY stage was dispatched keeps the
+    # existing wrapper_failed contract; this change widens only the case it names.
+    early = run_stub("import sys\nsys.exit(1)\n")
+    assert early.returncode == 0
+    assert "wrapper_failed" in early.stdout
+    assert "STAGE UNFINISHED" not in early.stdout
+
+
+def test_the_marker_names_each_stage_only_while_it_is_in_flight(table, monkeypatch, tmp_path):
+    """Pins the .py half against the REAL stage registry, selection included."""
+    marker = tmp_path / "in-flight"
+    marker.write_text("", encoding="utf-8")
+    monkeypatch.setenv(io_mod._STAGE_MARKER_ENV, str(marker))
+    expected = {s["script"]: s["key"] for s in io_mod.STAGES}
+    expected["goal-selector.sh"] = "selection"
+    seen = {}
+    base = make_runner({})
+
+    def runner(argv, timeout):
+        if argv[0] in expected:
+            seen[argv[0]] = marker.read_text(encoding="utf-8")
+        return base(argv, timeout)
+
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    for script, key in expected.items():
+        assert seen.get(script) == key, (
+            f"{script} ran while the marker read {seen.get(script)!r}, not {key!r}")
+    assert marker.read_text(encoding="utf-8") == "", "a finished run must leave nothing in flight"
+
+
+class _Killed(BaseException):
+    """Not an Exception, so main()'s fail-open handler cannot absorb it -- like a signal."""
+
+
+@pytest.mark.parametrize("death", [_Killed, RuntimeError])
+def test_a_death_mid_stage_leaves_that_stage_in_the_marker(table, monkeypatch, tmp_path, death):
+    """RuntimeError is the case main() used to turn into rc=0: it catches the
+    exception, prints a report and returns 0, so only the marker still says which
+    stage never came back."""
+    marker = tmp_path / "in-flight"
+    monkeypatch.setenv(io_mod._STAGE_MARKER_ENV, str(marker))
+    dying = io_mod.STAGES[-1]
+    base = make_runner({})
+
+    def runner(argv, timeout):
+        if argv[0] == dying["script"]:
+            raise death("stage died mid-run")
+        return base(argv, timeout)
+
+    with pytest.raises(death):
+        io_mod.run(runner=runner, md_path=table)
+    assert marker.read_text(encoding="utf-8") == dying["key"]
+
+
+def test_an_unwritable_marker_says_the_check_is_blind(table, monkeypatch, tmp_path, capsys):
+    """A marker that cannot be written must not read as "nothing was in flight"."""
+    monkeypatch.setenv(io_mod._STAGE_MARKER_ENV, str(tmp_path / "no-such-dir" / "in-flight"))
+    assert io_mod.run(runner=make_runner({}), md_path=table) == 0, "still fail-open"
+    assert "unfinished-stage check is BLIND" in capsys.readouterr().err
+
 # ── stage-registry parity () ───────────────────────────────────────
 
 def _battery_lane_names(filename):

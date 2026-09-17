@@ -467,7 +467,13 @@ and no perception step in the research recipe. A delivered percept that no
 specified reaction consumes is a sensor wired to nothing.
 
 The behavioural half lives in **`.claude/rules/perception-reaction.md`** (with
-`guard-6621` as its retrieval/enforcement layer), not here, and the split follows the established rule/convention pattern (compare
+`guard-6621@ayoai-mind` as its retrieval/enforcement layer — a guard id is a
+PER-WORLD sequence, so a downstream reader must match that guardrail by its
+opening words "COMPARE BEFORE YOU REACT, AND NEVER WRITE THE PERCEPTION INTO A
+BELIEF STORE" rather than by the number, which will dangle or resolve to an
+unrelated row; §9.4 of this file states the general rule. It is indexed as a
+guardrail as well as a rule so it also surfaces on an encoding decision, not
+only on a perception), not here, and the split follows the established rule/convention pattern (compare
 `probe-before-defer.md` ↔ `defer-routing.md`): the rule carries the imperatives
 and is ALWAYS LOADED, so it reaches every phase; this section carries the
 mechanism a reader needs at the moment of use. The rule is deliberately a RULE
@@ -517,7 +523,101 @@ it enforces nothing at write time.
   nobody keeps switched on.
 - **`no-perception` is NOT a pass** (guard-1760): nothing arrived, so nothing
   was verified, and an empty transcript must not stand in for a good one.
-- The belief-writer set is tree / reasoning-bank / guardrail writers only.
+- **Shape is the discriminator, not spelling** (g-373-87). Each predicate was
+  once a substring search, and each fired on MENTIONS. Measured on cc-03,
+  100 of 105 frame-bearing transcript records failed, every one a mention: the
+  frame quoted in a diff, in a goal title, or in the rule's own example, which
+  ships in every seeded vessel's always-loaded rule set. So:
+  - a perception is a **user-role message that opens with the frame** (§ 9.1).
+    The frame anywhere else, in any role, is a mention;
+  - a decision line or a belief write counts only when **the mind authored
+    it**: its own text or its own tool call. World text, tool output and
+    injected reminders never count — **so on a STRUCTURED transcript a
+    perception cannot forge its reaction. On PLAIN TEXT it can, in both
+    directions** (g-373-101 F5): authorship is read from roles and plain text
+    has none, so a decision line sitting inside the perceived body forges a
+    `pass` and a writer line sitting inside it forges a `fail`. Neither is
+    detectable from the text. Pass a structured transcript whenever one exists
+    and read a plain-text verdict as advisory; the limitation is pinned, with
+    its structured control, by
+    `test_plain_text_cannot_stop_a_perception_forging_its_reaction`.
+  - the frame's ASCII-hyphen tolerance excludes the RULE's own name: a line or
+    user message opening `[perception-reaction` is a citation, not a delivery
+    (g-373-101 F4). A BOM'd `.jsonl` is still read as `jsonl` — a UTF-8 BOM is
+    not whitespace, so it used to push the whole transcript onto the plain-text
+    branch and return `no-perception` on a transcript full of them (F3).
+  - **one reaction is one decision LINE.** A mind that notes its decision in its
+    own text AND pipes the same line to the working-memory writer has reacted
+    once; counting both let the copy silently answer a second perception nobody
+    reacted to (g-373-101 F2). **The collapse is scoped to ONE perception's
+    answer window, never the whole transcript (g-373-110).** This clause read
+    "Distinct lines still answer distinct perceptions" and that was FALSE as
+    shipped: the identity is `(unit, changed, decision)`, so two heartbeats
+    answered honestly with the same delta collapsed to one credit while
+    `_unreacted` — which collapses only CONSECUTIVE IDENTICAL frame text —
+    still demanded two, and a correct reaction to the same-kind run rule 3
+    explicitly sanctions FAILED. One line for the run failed and two identical
+    lines failed; the only passing shape was to vary the delta, i.e. to write
+    something untrue. The `seen` set now resets at every frame offset.
+    And only the lanes the rule PRESCRIBES can carry the line — a shell command,
+    or an edit aimed at the journal or working memory. A decision-shaped string
+    inside any other tool input (an `Edit`'s `new_string` in a test fixture) is
+    something the mind wrote ABOUT, not something it decided.
+  - Roles exist only in a structured transcript, so pass one: the Claude Code
+    `.jsonl` line shape (zak-code's `render_claude_code_transcript` projects
+    the same), a zak-code session document, or a list of messages. Plain text
+    has no roles. There the frame must open a line and a writer must sit at a
+    command position. That still rejects prose, but it cannot tell a frame
+    quoted on a line of its own from a delivered one. `input_format` in the
+    verdict names the predicate that ran.
+- **Every perception needs its own decision line after it.** One line answers
+  at most one perception, oldest first, and consecutive deliveries of identical
+  text are one perception (rule 3: unchanged needs no line). Until g-373-87
+  only the first frame was checked, so a second perception nobody reacted to
+  read as clean. A changed perception the mind chose not to act on still needs
+  `decision=ignore` (§ 9.2). The checker cannot judge relevance, so rule 3's
+  "changed-but-irrelevant needs no line" is not checkable, and a transcript
+  that relies on it fails.
+- **The belief-writer set** is what the checker can see of rule 5's stores: the
+  tree, the reasoning bank and guardrails. That means the writer scripts in
+  `BELIEF_WRITER_SCRIPTS` (tree-update / tree-propagate / tree-archive,
+  reasoning-bank-add / -update-field, guardrails-add / -update-field),
+  `tree.py update`, the `/tree` skill with add / edit / set / decompose /
+  maintain, and a file-edit tool aimed at a tree node or at either JSONL store.
+  Each must be INVOKED, not named: "do NOT call guardrails-add.sh" is prose.
+  Invoked means a command position: a line start, after `;` `&` `|` or `$(`,
+  past any shell keyword that OPENS a command without being one (`do`, `if`,
+  `elif`, `then`, `else`, `while`, `until`, `time`, `exec`, `!`, `{`), any
+  `VAR=value` prefixes, any exec wrappers with their options and option
+  ARGUMENTS (timeout, env, nice, nohup, xargs, `sudo -u <user>`), and any
+  interpreter options (`bash -x`, `python3 -u`). None of that is decoration,
+  and each layer was measured over a real Bash-call corpus before shipping
+  (guard-6850): 172 writer invocations sat behind `timeout` alone, and the
+  keyword layer recovers loop-body and condition calls — `for …; do bash
+  …reasoning-bank-add.sh` (one such line wrote six entries) and `if bash
+  …guardrails-update-field.sh …` — which read as a pass until g-373-101.
+  **One exclusion is load-bearing:** `bash -n <writer>` is a syntax check and
+  writes nothing, so any option bundle containing `n` is refused — and that is
+  the false positive the review's own broad probe produced. It has its own
+  scope-control test, mutation-proved.
+  `for` and `in` are simply absent, and the reason is worth recording because
+  the first draft got it wrong: they are NOT a false-positive guard. A command
+  never follows either directly (a loop variable does), and admitting both
+  changes detections by **0 over 4,637 writer-naming lines** on a 3.05 GB
+  corpus. Loop DATA (`for s in tree-update.sh …`) is protected by the
+  command-position and path-prefix requirements, which it fails on its own. The
+  claim that admitting them "would turn every such list into a false write" was
+  asserted, mutation-proved FALSE, and corrected — the omission stands, its
+  stated reason does not.
+  A test pins that every listed script exists, because tree-add.sh, tree-set.sh
+  and tree-decompose.sh sat in the set naming no file while tree-propagate,
+  tree-archive and both update-field writers went unseen. **Not seen:**
+  convention or rule edits, goal-outcome prose, a writer launched from
+  inside a program (`subprocess.run([... "reasoning-bank-add.sh"])` — 40 such
+  call lines in the same corpus), and **a write made by a delegated sub-agent**
+  (g-373-101 F6): a task or Agent call returns a SUMMARY, never the child's
+  transcript, so nothing the delegate wrote is in this text to find. Rule 5
+  forbids all of those too, so a `pass` is not evidence they did not happen.
   `wm-append.sh`, `journal-add.sh` and `execution-diary.sh` are the lanes the
   rule PRESCRIBES and must never register — pinned by
   `test_working_memory_and_journal_writes_are_not_belief_writes`, which is the

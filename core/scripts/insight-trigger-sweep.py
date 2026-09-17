@@ -80,6 +80,9 @@ from _peer_registry import load_env_registry as _shared_load_env_registry  # noq
 # with a stale-break, and it routes through the storage backend, which is what
 # makes the run mutex work ACROSS BOXES rather than only on this one.
 from _fileops import acquire_lock, release_lock  # noqa: E402
+# : the board channel path seam. Reading a channel means enumerating
+# its FILES, and after segmentation that is no longer one filename.
+from _board_paths import channel_paths, read_paths, is_segment  # noqa: E402
 
 BOARD_DIR = WORLD_DIR / "board"
 WORLD_ASPS = WORLD_DIR / "aspirations.jsonl"
@@ -228,16 +231,11 @@ def _refresh(path):
     and is a no-op on LocalBackend. Fail-open: a bare subprocess without daemon
     env cannot resolve the backend — degrade to the raw read rather than abort
     this advisory routing sweep (matches core/scripts/aspirations-evict-completed.py).
+    Routed through _fresh_read.refresh_for_read (g-358-130), which keeps that
+    fail-open contract, reports a failure on stderr, and skips per-machine stores.
     """
-    try:
-        from storage_backend import get_backend
-        get_backend().refresh(path)
-    except Exception as e:
-        try:  # report, never raise — see note_swallowed_backend_error ()
-            from storage_backend import note_swallowed_backend_error
-            note_swallowed_backend_error("refresh", path, e)
-        except Exception:
-            pass
+    from _fresh_read import refresh_for_read
+    refresh_for_read(path, label="insight-trigger-sweep")
 
 
 def _parse_ts(ts_str):
@@ -249,6 +247,69 @@ def _parse_ts(ts_str):
     time").
     """
     return datetime.fromisoformat(ts_str.rstrip("Z"))
+
+
+# . A date SEGMENT of a channel is not a channel, and the glob below
+# cannot tell them apart on its own: `findings-2026-09-17.jsonl` ends in neither
+# excluded suffix, so under segmentation it would be discovered as a brand-new
+# channel named "findings-2026-09-17". That is this function's own documented
+# failure class arriving from the opposite direction -- discovery was adopted so
+# a channel could never go UNSWEPT, and a segment admitted as a channel gets
+# swept TWICE: once on its own and once as part of its parent, since
+# `_channel_records` now enumerates a channel's segments through the seam.
+# Double-filing a routed trigger is worse than the allowlist gap discovery
+# replaced, so the predicate is exclusion here plus inclusion there, never one
+# without the other.
+_SEG_TAIL_RE = re.compile(r"^(?P<base>.+)-\d{4}-\d{2}-\d{2}\.jsonl$")
+
+
+def _looks_like_segment(name: str) -> bool:
+    """True when `name` is a date segment of some channel.
+
+    Routed through `_board_paths.is_segment` rather than re-deciding the
+    pattern locally: the reader and this discovery filter must agree about what
+    a segment IS, or a file lands in both sets or neither.
+    """
+    m = _SEG_TAIL_RE.match(name)
+    return bool(m) and is_segment(m.group("base"), name)
+
+
+def _channel_records(channel: str):
+    """Every record of one channel, through the path-list seam ().
+
+    Replaces a raw `channel_path.read_text().splitlines()`. Three things change
+    and all three are the seam's point:
+      * the channel's date SEGMENTS are read, so a segmented writer cannot
+        silently starve this sweep -- an unswept routed trigger is a request
+        from another agent that is never answered and never reported;
+      * each file is parsed SEPARATELY (guard-6846: board JSONL does not
+        reliably end with a newline, so byte-concatenating N files loses
+        everything after the first boundary);
+      * a path that vanishes between enumeration and open is reported as
+        `evicted`, not raised -- routine archival must not become a read outage.
+
+    `include_archive=False` preserves today's behaviour exactly: every archived
+    row is older than the rotation and therefore older than WINDOW_HOURS by
+    construction, which is why CHANNEL_EXCLUDE_SUFFIXES excludes archives in the
+    first place.
+
+    COLD-BOX LIMIT, stated rather than hidden: `_refresh` runs per ENUMERATED
+    path, and `channel_paths` enumerates by `is_file()`, so a segment that
+    exists only in the store is not seen and not pulled. That is exactly
+    today's behaviour for the live file, so this is not a regression -- but it
+    is not a fix either, and a store-only segment would need the refresh to
+    precede enumeration (the shape `normalize-terminal-defer.py` uses).
+    """
+    paths = channel_paths(BOARD_DIR, channel, include_archive=False)
+    for fp in paths:
+        _refresh(fp)  # guard-980: never read a stale git-sync mirror
+    records, missing = read_paths(paths)
+    faults = [m for m in (missing or []) if m.get("reason") == "unreadable"]
+    if faults:
+        print("warning: channel %s shortened by %d unreadable path(s): %s"
+              % (channel, len(faults),
+                 "; ".join(str(m.get("path")) for m in faults)), file=sys.stderr)
+    return records
 
 
 def board_channels():
@@ -281,6 +342,7 @@ def board_channels():
     return sorted(
         p for p in BOARD_DIR.glob("*.jsonl")
         if not p.name.endswith(CHANNEL_EXCLUDE_SUFFIXES)
+        and not _looks_like_segment(p.name)
     )
 
 
@@ -303,18 +365,8 @@ def load_triggers(dropped=None):
     grace_cutoff = now - timedelta(hours=GRACE_HOURS)
     out = []
     for channel_path in board_channels():
-        # guard-980: avoid a stale git-sync mirror of the channel file.
-        _refresh(channel_path)
-        if not channel_path.is_file():
-            continue
         channel = channel_path.stem
-        for line in channel_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for msg in _channel_records(channel):
             try:
                 ts = _parse_ts(msg["timestamp"])
             except (KeyError, ValueError):
@@ -453,17 +505,8 @@ def load_out_of_window_triggers():
     routed_ids = set()
     truncated = 0
     for channel_path in board_channels():
-        _refresh(channel_path)  # guard-980
-        if not channel_path.is_file():
-            continue
         channel = channel_path.stem
-        for line in channel_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+        for msg in _channel_records(channel):
             # Harvest prior routing notes from ANY age — a note posted 8 days
             # ago must still suppress a re-post today, so this lookup is
             # deliberately not bounded by the audit window.

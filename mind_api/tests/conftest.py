@@ -201,6 +201,39 @@ def _pin_intended_agent_roster(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _scrub_daemon_client_env():
+    """Clear MIND_API_TOKEN / MIND_API_BIND / MIND_API_PORT before every test
+    (g-115-10006).
+
+    THE DEFECT THIS REMOVES, and this directory is where it bites hardest —
+    every daemon here is in-process. `mind_api/src/server.py` reads
+    MIND_API_TOKEN from os.environ on EVERY request and refuses anything
+    without a matching `Authorization: Bearer` header, before any handler runs.
+    The fixture daemons inherit whatever the launching shell exported; the test
+    clients send no header. On a box whose shell carries the variable, every
+    fixture-backed test fails 401 upstream of the code under test. Measured on
+    cc-03 2026-09-15: 432 failures with 1130 `missing or invalid bearer token`
+    lines, against 8 failures and ZERO bearer lines for the same selection run
+    under `env -u`. The suite was not broken — it was unauthenticated.
+
+    POPPED, NOT SNAPSHOT-AND-RESTORED, unlike `_restore_env_per_test` below:
+    that fixture protects values tests are entitled to see, while this removes
+    an ambient credential the test process must never hold. Restoring between
+    tests would re-open the window for the next fixture daemon. The variables
+    are deliberately NOT added to _BOOTSTRAP_ENV for the same reason.
+
+    Tests that genuinely exercise bearer auth set the variable themselves in
+    the test body (monkeypatch.setenv), which runs after this fixture, so their
+    value stands. Duplicated verbatim in core/scripts/tests/conftest.py — the
+    two test packages load independently and neither imports the other's
+    conftest, so sharing three lines of pops would need a third importable home.
+    """
+    for _var in ("MIND_API_TOKEN", "MIND_API_BIND", "MIND_API_PORT"):
+        os.environ.pop(_var, None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _restore_env_per_test():
     """Re-pin the session env before every test in this directory.
 

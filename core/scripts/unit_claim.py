@@ -232,7 +232,7 @@ def load_lease_hours(project_root=PROJECT_ROOT):
         return DEFAULT_LEASE_HOURS
 
 
-def _refresh_board_cache():
+def _refresh_board_cache(since):
     """Pull the coordination channel from the store of record before deciding.
 
     THE READ HALF IS CACHED WHILE THE WRITE HALF IS WRITE-THROUGH, AND THAT
@@ -273,14 +273,32 @@ def _refresh_board_cache():
     On ``LocalBackend`` ``force_fresh`` is a documented no-op (the local file IS
     the store), so ``STORAGE_BACKEND=local`` runs are byte-identically
     unaffected.
+
+    DATE SEGMENTS TOO (g-358-183). ``board-read.sh`` reads the base file AND the
+    channel's date segments, so a segmented writer's peer claim sits in
+    ``<channel>-<date>.jsonl`` and a base-only refresh leaves it out. Every
+    segment whose UTC date the ``since`` window touches is refreshed BY NAME: a
+    force_fresh read also pulls a segment this box has never had, which is what
+    lets the daemon's local enumeration list it. ``FileNotFoundError`` on a
+    segment means no segment exists for that day (every day, until a segmented
+    writer lands), so it is not a failure. Any other error still refuses.
     """
     try:
         from _paths import WORLD_DIR
         import storage_backend
+        from _board_paths import live_name, segment_name
 
-        storage_backend.get_backend().read_text(
-            str(Path(WORLD_DIR) / "board" / f"{CHANNEL}.jsonl"), force_fresh=True
-        )
+        board = Path(WORLD_DIR) / "board"
+        backend = storage_backend.get_backend()
+        backend.read_text(str(board / live_name(CHANNEL)), force_fresh=True)
+        day, today = since.date(), datetime.now().date()
+        while day <= today:
+            try:
+                backend.read_text(str(board / segment_name(CHANNEL, day)),
+                                  force_fresh=True)
+            except FileNotFoundError:
+                pass
+            day += timedelta(days=1)
     except Exception as exc:
         print(f"[unit-claim] board cache refresh failed "
               f"({type(exc).__name__}: {exc}) -- REFUSING rather than deciding "
@@ -295,8 +313,9 @@ def _read_board(since_hours, *, fresh=True):
     Both ``claim`` and ``release`` types are needed, and ``board-read.sh``
     filters to ONE type per call, so this makes two calls and concatenates.
     """
+    window_hours = int(since_hours) + 1
     if fresh:
-        _refresh_board_cache()
+        _refresh_board_cache(datetime.now() - timedelta(hours=window_hours))
 
     from _runtime_bash import bash_cmd
 
@@ -305,7 +324,7 @@ def _read_board(since_hours, *, fresh=True):
     for msg_type in ("claim", "release"):
         proc = subprocess.run(
             bash_cmd(script, "--channel", CHANNEL, "--type", msg_type,
-                     "--tag", TAG, "--since", f"{int(since_hours) + 1}h", "--json"),
+                     "--tag", TAG, "--since", f"{window_hours}h", "--json"),
             capture_output=True, text=True, cwd=str(PROJECT_ROOT),
         )
         if proc.returncode != 0:

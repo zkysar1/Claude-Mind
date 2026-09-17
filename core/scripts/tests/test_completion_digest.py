@@ -96,10 +96,17 @@ def test_blocked_shows_cause_and_what_it_holds_up(world):
 def test_notes_are_bounded_and_nothing_waiting_is_said_plainly(world):
     _write(world, [{"id": "asp-4", "title": "Quiet", "status": "active", "goals": [_goal("g-4-1", "pending")]}])
     data = cd.gather(world, "alpha", SINCE, NOW, 10)
-    notes = "\n".join(f"note line {i}" for i in range(30))
+    # 50 > _NOTES_MAX_LINES (40), so the bound is actually exercised. This pinned
+    # 30-vs-12 until 2026-09-16:  RAISED the cap 12 -> 40 after a
+    # production email truncated mid-word, and left this assertion behind — so the
+    # test was red on HEAD and pinning a bound the code had deliberately retired.
+    # Both halves are asserted now, because guard-3976/guard-3698 made the MARKER
+    # the load-bearing half: an unannounced cut is the defect, not the cut itself.
+    notes = "\n".join(f"note line {i}" for i in range(50))
     md = cd.render(data, agent="alpha", since=SINCE, now=NOW, notes=notes, max_items=10)
     assert "Nothing is waiting on you right now." in md
-    assert "note line 11" in md and "note line 12" not in md  # <=12 lines
+    assert "note line 39" in md and "note line 40" not in md  # <=40 lines
+    assert "TRUNCATED" in md  # the cut is announced, never silent
 
 
 def test_cli_writes_out_file_and_wrapper_exists(world, tmp_path):

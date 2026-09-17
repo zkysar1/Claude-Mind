@@ -909,6 +909,52 @@ _check_wedged_loop() {
     # defect-detecting test cannot see it.
     if [[ "$turn_rc" -ne 1 || "$turn_json" != \{*'"verdict"'*\} ]]; then
         echo "[recovery-gate] Path D suppressed for $agent by assistant-turn liveness: ${turn_json:-<probe emitted nothing; died before its own emit>} (rc=$turn_rc)" >&2
+        # DURABLE ROW FOR EVERY SUPPRESSION THAT WAS NOT A POSITIVE LIVENESS
+        # VERDICT (). The stderr line above reaches no file --
+        # sessionstart-orchestrator.sh pipes this hook with no redirect -- so
+        # before this block a probe that died before its own emit disabled
+        # Path D for the whole box leaving NO trace. That is what made "zero
+        # Path D rows" unreadable: it is ambiguous between "no wedge ever
+        # occurred" (hypothesis 2026-08-15_path-d-veto-holds-where-three-
+        # narrowings-failed CONFIRMED) and "Path D was silently off the whole
+        # time". An absence is only evidence once the suppressions are
+        # themselves recorded (guard-3802: a suppressed alarm must carry the
+        # severity it suppressed).
+        #
+        # MEASURED rc contract of assistant-turn-freshness.py check():
+        #   recent_assistant_turn      -> 0  (the ONLY verdict with suppress=True)
+        #   unreadable                 -> 2
+        #   no_running_session_id / no_transcript /
+        #     no_assistant_turn_in_tail / no_recent_assistant_turn -> 1
+        # So rc=0 WITH a well-shaped payload is the one HEALTHY suppression --
+        # the agent is provably alive -- and logging it would drown the signal
+        # (foxtrot, msg-20260815-202037-foxtrot-5262). Every other suppression
+        # is a could-not-measure and earns a row. Note this is deliberately
+        # WIDER than foxtrot's "-z branch only": this file's own round-2
+        # finding above records that emptiness was one shape of "could not
+        # measure", never the invariant -- a non-JSON message at rc=49 and a
+        # truncated payload at rc=1 both defeated that narrowing.
+        #
+        # NOT one-shot and NOT deduplicated, deliberately (guard-5678): a sink
+        # that records only the FIRST occurrence makes its own absence
+        # unreadable again, which is precisely the defect this repairs.
+        #
+        # Routed through _recovery_log_entry rather than a hand-built JSON
+        # string: the probe payload is arbitrary text and the builder passes
+        # everything via the environment (guard-165, guard-4151).
+        if [[ "$turn_rc" -ne 0 || "$turn_json" != \{*'"verdict"'*\} ]]; then
+            local _sup_entry
+            _sup_entry="$(_recovery_log_entry path_d_suppressed_probe_error \
+                "$(date +%Y-%m-%dT%H:%M:%S)" "$agent" \
+                "Path D suppressed before evaluation: the assistant-turn probe returned no usable verdict (turn_rc=$turn_rc). Path D was inert for this agent on this box for this SessionStart." \
+                "" D "${turn_json:-}")"
+            if [[ -n "$_sup_entry" ]]; then
+                # rc-checked, but STILL fail-open: a logging failure must never
+                # break the recovery gate, so the miss is announced and swallowed.
+                printf '%s\n' "$_sup_entry" >> "$_adir/session/recovery-log.jsonl" \
+                    || echo "[recovery-gate] WARN: could not append path_d_suppressed_probe_error row to $_adir/session/recovery-log.jsonl" >&2
+            fi
+        fi
         return 0
     fi
 

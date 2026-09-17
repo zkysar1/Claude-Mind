@@ -264,14 +264,23 @@ _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",
 # permanently. `refresh_would_clobber` would likewise start returning True and
 # block the pre-read refresh.
 #
-# What this policy does NOT touch, and why that is the whole point: reads go
-# through OwnCloudBackend.ensure_local -> _refresh, which never consults this
+# What this policy does NOT touch, and why that is the whole point: reads that
+# go through OwnCloudBackend.ensure_local -> _refresh never consult this
 # module's exclusion policy. So an excluded archive still materializes on
-# demand the first time something actually opens it — it just stops riding
-# along on every cold start and every sweep tick, which is where the egress
-# was being spent (changelog-archive.jsonl measured at 231,212,152 bytes,
-# the single largest object in the store, read by nothing on a normal
-# iteration).
+# demand when such a reader opens it — it just stops riding along on every
+# cold start and every sweep tick, which is where the egress was being spent
+# (changelog-archive.jsonl measured at 231,212,152 bytes, the single largest
+# object in the store, read by nothing on a normal iteration).
+#
+# THAT HOLDS ONLY FOR READERS THAT REFRESH ON EVERY READ (g-358-120). Once a
+# box has materialized an archive, pull_sweep never refreshes it again, so a
+# reader that refreshes only the first time, or that opens the local file
+# directly (path.exists() + open()), reads a copy frozen at that box's last
+# pull. Measured: board.py's archive reach served cc-02 a findings archive
+# frozen at 2026-09-06 (8,075 local ids against 10,218 in the store) until
+# g-358-117 refreshed on every read. The 2026-09-17 audit found 24 direct-local
+# readers of world/meta archives in core/scripts; the classification and the
+# follow-up goals are recorded in g-358-120's outcome_note.
 #
 # Keep this list narrow. A file belongs here only when it is (a) large,
 # (b) genuinely cold on the normal loop path, and (c) still required to be
@@ -1304,6 +1313,16 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # changing sync_file: teaching it to stamp manifest baselines is a
             # behavioural change to a loss-sensitive path and belongs to its own
             # goal, whereas the argument it was cited for is sound as restated.
+            # UPDATED 2026-09-15 (g-115-8029): sync_file now READS the manifest
+            # baseline and passes it to _sync_one (it still does not stamp one
+            # itself — the backend's _stamp_manifest_baseline does that after
+            # every successful put). The reasoning above is unchanged: a
+            # no-baseline divergence reaching the periodic sweep is still a stale
+            # cache, because the hook lane pushes. What changed is WHICH lane the
+            # hook push takes: with the baseline, an in-place edit under an
+            # unchanged remote takes the fenced mirror_put instead of the
+            # base-less union merge that refused it (7 of 8 tree-node Edits on
+            # cc-13, 2026-09-15).
             #
             # g-328-22 deterministic reconcile (root cause #3 of the 2026-07-04
             # own-cloud fleet-wedge): the pre-g-328-22 behavior returned None here,
@@ -2417,10 +2436,39 @@ def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
              "conflicts": 0, "errors": 0, "stale_skipped": 0,
              "diverged_skipped": 0, "nobaseline_skipped": 0,
              "multipart_deferred": 0, "push_paths": [], "error_paths": []}
+    # g-115-8029 (2026-09-15): pass the manifest baseline. Without it
+    # `s3_at_baseline` is structurally False inside _sync_one, so the terminal
+    # push gate routed EVERY push of an object S3 already held into the
+    # union-merge lane — and the tree-node section-union has no base, so any
+    # in-place edit under an UNCHANGED remote was refused as a same-heading
+    # divergence (measured bravo/cc-13 2026-09-15: 7 of 8 Edit-tool writes to
+    # one node refused, 54 of 111 hook pushes since 09-04; the 120 s sweep,
+    # which does pass the baseline, landed every one of them two minutes later
+    # through the fenced mirror_put). With the baseline this lane classifies
+    # exactly as the sweep does:
+    #   remote == baseline, local changed  -> fenced mirror_put (lands now)
+    #   both moved since the baseline      -> union merge, as before
+    #   local == baseline, remote moved    -> stale skip (never clobber a peer)
+    #   no manifest entry / unreadable     -> baseline None, behaviour unchanged
+    # sync_file still does not STAMP a baseline itself: the backend's
+    # _stamp_manifest_baseline does that after every successful put, which is
+    # what makes the fast path self-sustaining across rapid successive edits.
+    # Same key shape as sweep()'s rel_key and the backend's _rel(). Pinned by
+    # tests/test_sync_file_baseline_fast_path_g115_8029.py.
+    baseline_md5 = None
+    if matched_root is not None:
+        try:
+            rel_key = f"{prefix}/{target.relative_to(matched_root).as_posix()}"
+            _, baseline_md5 = _manifest_entry(_load_manifest().get(rel_key))
+        except Exception as e:  # noqa: BLE001 — fail-open: no baseline == pre-fix lane
+            _sync_print(f"[sync] WARN: manifest baseline unreadable for {target}: "
+                        f"{e} (taking the no-baseline lane)", file=sys.stderr)
+            baseline_md5 = None
     # Single-file mode fires from the PostToolUse hook AFTER this machine wrote
     # the file -> local IS authoritative -> push (multi_machine=False so the
     # no-baseline conservative skip never suppresses a genuine local write).
-    _sync_one(be, target, dry_run=dry_run, stats=stats, multi_machine=False)
+    _sync_one(be, target, dry_run=dry_run, stats=stats,
+              baseline_md5=baseline_md5, multi_machine=False)
     if stats["pushed"]:
         _sync_print(f"[sync] pushed {target}")
     elif stats["would_push"]:

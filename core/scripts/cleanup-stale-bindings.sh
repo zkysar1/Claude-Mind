@@ -175,9 +175,32 @@ _preserve_unmerged_body_wm() {
         _FHASH="${_FHASH//\"/}"
         _FHASH="${_FHASH//\'/}"
     fi
-    [ "$_STATE" = "merged" ] && return 0  # already consolidated -> no double-merge
     local _STAGE_DIR
     _STAGE_DIR="$(_agent_dir "$_BA")/session/pending-body-merges"
+    # : the capture-eviction ARCHIVE (wm_write.py append_slot copies each
+    # evicted capture beside the Body WM) must leave with it, because the rm -rf
+    # after this function is otherwise its delete. Staged BEFORE the merged return:
+    # a merged Body's WM is already consolidated, but nothing ever folded its
+    # archive. Not a merge input — body-merge never reads it — so it only needs to
+    # land before the trigger to keep "trigger last" true of everything staged.
+    local _ARCH_STAGED=""
+    if [ -f "$_SD/capture-evictions-archive.jsonl" ]; then
+        if mkdir -p "$_STAGE_DIR" 2>/dev/null \
+           && cp "$_SD/capture-evictions-archive.jsonl" \
+                 "$_STAGE_DIR/${_SID}-capture-evictions-archive.jsonl" 2>/dev/null; then
+            _ARCH_STAGED=1
+        fi
+    fi
+    if [ "$_STATE" = "merged" ]; then
+        # already consolidated -> no double-merge: the WM is NOT re-staged. Only a
+        # staged archive still has to leave this box (push-staged relocates it).
+        if [ -n "$_ARCH_STAGED" ]; then
+            py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" push-staged \
+                --sid "$_SID" --agent "$_BA" >/dev/null || \
+                echo "[cleanup-stale-bindings] WARN: staged capture-eviction archive for ${_SID} was NOT pushed; it is on local disk only" >&2
+        fi
+        return 0
+    fi
     mkdir -p "$_STAGE_DIR" 2>/dev/null || return 0
     # ORDER IS LOAD-BEARING: SIDECARS FIRST, TRIGGER LAST (-c fresh-eyes).
     # body-merge._consume_staged globs `*-wm.yaml` -- so the WM file is the
@@ -223,7 +246,7 @@ _preserve_unmerged_body_wm() {
     # WM failed to reach the reducer.
     py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" push-staged \
         --sid "$_SID" --agent "$_BA" >/dev/null || \
-        echo "[cleanup-stale-bindings] WARN: staged Body WM for ${_SID} was NOT pushed; it is on local disk only" >&2
+        echo "[cleanup-stale-bindings] WARN: staged Body WM set for ${_SID} (WM, sidecars, eviction archive) was NOT fully pushed; it is on local disk only" >&2
 }
 
 # Legacy sweep: .active-agent-<SID> at PROJECT_ROOT (pre-Phase-2.6).

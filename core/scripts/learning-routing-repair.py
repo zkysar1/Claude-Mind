@@ -59,6 +59,81 @@ STORE_PATHS = {
 }
 
 
+# (agents_root_str, {record_id: Path}) — rebuilt when the root changes.
+# KEYED ON THE ROOT, not a bare one-shot flag. A bare flag is correct for this
+# script's production shape (main() resolves one root, once) and silently wrong
+# everywhere else: the module-level memo outlives any caller that re-points
+# agents_root, and returns the FIRST root's answers forever. Caught by
+# test_learning_routing_glob_routing.py's two pre-existing resolver pins, which
+# share a process with an earlier test that had already built the index against
+# a different tmp root — both went from green to None-returning on the bare-flag
+# version. Keying costs one string compare and removes the whole class.
+_EXPERIENCE_INDEX = None
+
+
+def _build_experience_index():
+    """Map every per-agent experience record id to the file that holds it.
+
+    BUILT ONCE, AND FROM THE AUTHORITATIVE BYTES. Two changes from the
+    per-lookup local scan this replaces, and each is required by the other.
+
+    WHY AUTHORITATIVE (g-358-139). `agents/` is outside
+    `owncloud_sync._EAGER_PULL_ROOTS`, so a per-agent store is never
+    eager-pulled at all — the archive exclusion does not even apply to it.
+    A peer-owned mirror on this box can therefore sit short of the store
+    indefinitely, and a record present in the store but missing from the
+    mirror resolves to None here. The caller reads None as "could not resolve
+    file" and skips the repair with a WARN, which is fail-safe but reports a
+    mirror lag as if it were a corrupt record. The asymmetry became real when
+    g-358-131 routed the AUDIT's corpus through the authoritative read: the
+    audit can now see records this resolver could not. Same store, two
+    readers, two answers.
+
+    WHY MEMOIZED, and why the two are inseparable. The read this replaces was
+    local and cheap, so re-scanning every file per dangling ref merely wasted
+    CPU. An authoritative read is a network read, so doing it inside an
+    O(dangling-refs) loop would turn one local pass into hundreds of remote
+    GETs. Building the index once makes the authoritative read strictly
+    cheaper than the local scan it replaces, not merely safer.
+
+    NOT `refresh_for_read` — MEASURED, not preferred. That helper wraps
+    `backend.refresh()`, which has two silent skips: `refresh_would_clobber`
+    ahead of it, and the backend's own `no_clobber` overwrite decision inside
+    it. Measured 2026-09-17 (g-358-131): `refresh()` left all five divergent
+    peer objects unchanged because `_overwrite_decision` returned
+    `no_clobber` for every one. `read_authoritative_bytes` is the call that
+    actually returns store bytes on a frozen mirror.
+
+    LIVE FILE FIRST, then the archive — an id present in both belongs to the
+    live one, which a rotation would have written most recently. The archive
+    is unioned in for a reason specific to THIS file rather than its audit
+    twin: a repair is a WRITE, and resolving to None means "not found", which
+    is indistinguishable from "not mine".
+
+    SCOPE CAVEAT — AUTHORITATIVE PER FILE, LOCAL PER FILE *SET*. The two
+    globs below are `Path.glob` over the local filesystem, so the
+    authoritative read only ever corrects the CONTENTS of files this box
+    already has. An agent directory (or an `experience-archive.jsonl`) that
+    exists in the store and was never pulled here is not enumerated at all,
+    and its records resolve to None exactly as before. Do not read the
+    paragraphs above as "fully store-authoritative" — that residual is the
+    g-358-132 class and is tracked there, not fixed here. Measured on this
+    box 2026-09-17: 7 agent dirs, 7 live + 7 archive files enumerated, so
+    the gap is currently empty and the caveat is about the NEXT box.
+    """
+    index = {}
+    live = sorted(agents_root().glob("*/experience.jsonl"))
+    archived = sorted(agents_root().glob("*/experience-archive.jsonl"))
+    # Archive first, live second, so a live hit OVERWRITES an archive hit for
+    # the same id — that is the precedence above, expressed as insertion order.
+    for exp_path in archived + live:
+        for rec in audit._read_agent_jsonl_fresh(exp_path):
+            rec_id = rec.get("id")
+            if rec_id:
+                index[rec_id] = exp_path
+    return index
+
+
 def _resolve_store_path(store, record_id):
     """experience records live in per-agent files; all others in world/.
 
@@ -69,29 +144,18 @@ def _resolve_store_path(store, record_id):
     learning-routing-audit.load_all_experiences() was the destructive half:
     this module imports that function, so a zero-record corpus there made the
     audit call EVERY experience_ref dangling and this script nulled them.
+
+    The lookup now goes through `_build_experience_index` (g-358-139) so this
+    resolver and the audit corpus read the same bytes; see that docstring for
+    why the read is authoritative rather than a local scan or a refresh.
     """
+    global _EXPERIENCE_INDEX
     if store != "experience":
         return STORE_PATHS[store]
-    # find which agent's experience file contains this record ID.
-    #
-    # The ARCHIVE is unioned in for a reason specific to THIS file rather than
-    # its audit twin: a repair is a WRITE, and resolving a record to None here
-    # means "not found", which is indistinguishable from "not mine". Live file
-    # first — an id present in both should resolve to the live one, which a
-    # rotation would have written most recently.
-    for exp_path in sorted(agents_root().glob("*/experience.jsonl")) + \
-            sorted(agents_root().glob("*/experience-archive.jsonl")):
-        for line in exp_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if rec.get("id") == record_id:
-                return exp_path
-    return None
+    root_key = str(agents_root())
+    if _EXPERIENCE_INDEX is None or _EXPERIENCE_INDEX[0] != root_key:
+        _EXPERIENCE_INDEX = (root_key, _build_experience_index())
+    return _EXPERIENCE_INDEX[1].get(record_id)
 
 
 def _apply_null_to_field(record, field, ref):
@@ -231,6 +295,23 @@ def main():
     if not dangling:
         print("CLEAN — no dangling refs to repair.")
         return 0
+
+    # A read that fell back to the local mirror can be SHORT of the store, and
+    # every record missing from it makes a VALID ref read as dangling, which
+    # --apply would null. Per-agent experience reads () and world
+    # ref-target reads with no local copy () both record here. Fail
+    # closed on --apply. rc=3, not 0, so tree.py's post-remove sweep prints this
+    # instead of discarding it with the rest of a clean run's stderr.
+    degraded = sorted(set(audit.AUTHORITATIVE_READ_FALLBACKS))
+    if degraded:
+        verdict = "REFUSED --apply, nothing written" if args.apply else "WARNING"
+        print(f"[learning-routing-repair] {verdict}: {len(degraded)} "
+              f"store read(s) fell back to a possibly SHORT local mirror, so "
+              f"some of the {len(dangling)} dangling refs may be valid: "
+              f"{', '.join(degraded[:3])}{' ...' if len(degraded) > 3 else ''}",
+              file=sys.stderr)
+        if args.apply:
+            return 3
 
     # Group repairs by (store, file_path)
     grouped = {}

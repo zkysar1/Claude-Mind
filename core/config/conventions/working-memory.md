@@ -189,7 +189,17 @@ Configured in `core/config/memory-pipeline.yaml` under `working_memory_pruning`:
 
 - **Stale threshold** (30 min): Slots not updated in 30 minutes are flagged
 - **Evict threshold** (120 min): Non-protected scalar slots auto-nulled after 2 hours
-- **Array limits**: Per-slot max items (oldest evicted first by `_item_ts`)
+- **Array limits**: Per-slot max items. An append over the cap evicts unflagged
+  entries (`load_bearing` false) before flagged ones, oldest first by `_item_ts`,
+  keeps a reserved unflagged floor, and never evicts the entry it just added
+  (g-306-293/308/316). On a worker **Body WM**, each capture-lane victim is first
+  copied to `sessions/<unitKey>/capture-evictions-archive.jsonl`, which is staged
+  with the Body WM at close and at reap and lands in `world/body-staged-wm/<agent>/`.
+  A failed copy KEEPS the victim until the lane reaches 2x its cap. The append
+  response reports `evicted`, `evicted_archived` (null = no archive applies) and
+  `eviction_deferred` (g-115-9852). The agent-wide WM's append path archives nothing.
+  wm-prune's capture evictions archive to `agents/<agent>/capture-evictions-archive.jsonl`
+  (g-115-9662).
 - **Item staleness**: Per-slot age thresholds for array items
 - **Protected slots**: `known_blockers` (only prune resolved), `knowledge_debt` (only prune resolved)
 

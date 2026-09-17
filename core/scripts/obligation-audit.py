@@ -117,8 +117,57 @@ def _parse_abbreviations(section: str) -> list[tuple[str, str]]:
     return out
 
 
+# Two vocabularies name the same four obligations, and nothing mapped between them
+# (, measured 2026-09-17). The journal/loop label the phases
+# `verify` / `state-update` / `learning-gate` / `spark`; obligation-schema.yaml keys them
+# `verify` / `state` / `learn` / `spark`. `_parse_abbreviations` passes the journal label
+# straight through, so `obligations.get("state-update")` was always None and the `if not
+# spec` arm below returned False for EVERY claim on two of the four phases — regardless of
+# the condition text or the runtime state. Positive control on the same call, same schema,
+# same runtime: `state` and `learn` return True on `context_budget.zone == tight` with
+# budget_zone == "tight", while `state-update` and `learning-gate` return False. So the
+# "false abbreviation claims" this module files Investigate goals about were its own false
+# positives — both live rows on cc-05 claimed zone==tight with runtime_zone=="tight", which
+# both `state` and `learn` explicitly allow.
+# Per rb-1915, the normalizer is a TOTAL function onto the schema vocabulary: a label with
+# no alias passes through unchanged and still fails at `if not spec`, so an unrecognised
+# phase surfaces rather than being rubber-stamped — the safe direction is preserved.
+# Fallback only. The map is declared in obligation-schema.yaml `phase_aliases:` so that
+# this module and `abbreviated-obligation-audit.py` — which validate the same claims and
+# had this defect INDEPENDENTLY — cannot drift apart again. This literal keeps the
+# normalizer working if the schema is unreadable at audit time.
+_PHASE_ALIASES = {
+    "state-update": "state",
+    "learning-gate": "learn",
+}
+
+
+def _normalize_phase(phase: str, schema: dict | None = None) -> str:
+    phase = (phase or "").strip()
+    aliases = ((schema or {}).get("phase_aliases") or {}) or _PHASE_ALIASES
+    return aliases.get(phase, phase)
+
+
+def _normalize_condition(condition: str) -> str:
+    """Strip a trailing parenthetical from a claimed condition.
+
+    The journal line is `OBLIGATION ABBREVIATED: <phase> — <condition>`, and an agent
+    that also records WHAT it did inline writes the canonical token followed by a
+    parenthetical: `context_budget.zone == tight (tree node updated; findings routed)`.
+    `condition not in allowed` is exact membership, so the more informative claim was
+    scored invalid while a bare token passed. Only a trailing parenthetical is removed —
+    the canonical tokens carry no parentheses of their own — so a claim naming a
+    genuinely different condition still fails.
+    """
+    cond = (condition or "").strip()
+    head, sep, _rest = cond.partition(" (")
+    return head.strip() if sep else cond
+
+
 def _validate(phase: str, condition: str, budget_zone: str, outcome_class: str | None, schema: dict) -> bool:
     obligations = (schema or {}).get("obligations") or {}
+    phase = _normalize_phase(phase, schema)
+    condition = _normalize_condition(condition)
     spec = obligations.get(phase)
     if not spec:
         return False

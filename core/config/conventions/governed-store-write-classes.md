@@ -206,7 +206,7 @@ table's own instruction. Corrected 2026-07-28 by the fresh-eyes pass on this fil
 |---|---|---|
 | `changelog.py` | `changelog.jsonl` | (a) |
 | `endpoints/aspirations_write.py` | `aspirations.jsonl`, `-archive.jsonl`, `-meta.json` | (a) |
-| `endpoints/board_write.py` | the five board channels + `*-reads.jsonl` | (a) |
+| `endpoints/board_write.py` | the five board channels + `*-reads.jsonl` | (a) — but a ROTATED (a): the hygiene glob archives and drops their front slice, which is the removal path guard-1816 disqualifies for a plain union. The cure chosen was to keep the registration and swap the handler, not to convert to `locked_rmw` (g-358-81). Under `board/`, `merge_handler_for` returns `merge_rotated_board_jsonl`, which removes a clean rotated-out front slice and otherwise unions. Why not `locked_rmw`: every box appends to these stores, so un-registering them brings back the both-diverged freeze the registration cured. A handler that drops only a slice the rotation already archived keeps the no-freeze property and closes the resurrection. |
 | `world/pipeline_write.py` | `pipeline.jsonl`, `-archive.jsonl`, `-meta.json` | (a) |
 | `world/tree_write.py` | `_tree.yaml`, `tree-debt.jsonl` | (a) |
 | `world/pattern_signatures_write.py` | `pattern-signatures.jsonl` | (a) |
@@ -734,6 +734,18 @@ commutativity tests, not on observation.
 > 1 F; drop the canonical order → 2 F; widen dispatch to a catch-all → 3 F).
 > **Still NOT verified:** no two-box live convergence run — same caveat the
 > paragraph above this section records for the other handlers.
+>
+> **Hook lane (g-115-8029, 2026-09-15, bravo, cc-13):** the union is the right lane
+> only when the remote MOVED since this box's baseline. `sync_file` (the PostToolUse
+> push and `--file`) passed NO baseline to `_sync_one`, so every push of an object S3
+> already held was forced into the base-less union, and every in-place edit was
+> refused as a same-heading divergence — 7 of 8 Edit-tool writes to one node, 54 of
+> 111 hook pushes on cc-13 since 09-04 — while the 120 s sweep, which passes the
+> baseline, landed each one two minutes later through the fenced `mirror_put`.
+> `sync_file` now passes the manifest baseline and classifies as the sweep does:
+> remote-at-baseline takes the fenced put, both-moved still unions, a stale local
+> skips, no manifest entry degrades to the old lane. Pins:
+> `core/scripts/tests/test_sync_file_baseline_fast_path_g115_8029.py`.
 
 **1,555 live nodes** under `world/knowledge/tree/` are unregistered, so every one
 is class (b): a both-diverged 412 freezes it permanently with no operator step.
@@ -747,7 +759,12 @@ section. Detection worked; nothing cured it.
 (`coordination_merge.py:5021`), called as `handler(body, remote_bytes)`
 (`owncloud_backend.py:1632`) — **two** arguments. `.history` holds 111,264 files but
 **ZERO** snapshots for tree-node `.md` (positive control: 1,555 live nodes; the 5,229
-files under `.history/knowledge/tree/` are all `_tree.yaml`). And a recovered base
+files under `.history/knowledge/tree/` are all `_tree.yaml`) — as measured 2026-08-21.
+Re-measured 2026-09-15 on cc-13 (g-115-10044): `.history/snapshots/knowledge/tree/` now
+holds 15,020 snapshot files under 32 tree-node `.md/` directories (14,997 written by the
+own-cloud sync's `_snapshot_before_pull`, oldest 2026-08-18), beside 291 index snapshots —
+so the ZERO no longer holds, but every one is still PER-BOX, which is the disqualifying
+property, so the verdict below stands as written. And a recovered base
 would not help even if it existed: history is **per-box**, and the mirror requires both
 machines to independently compute *identical bytes*. Git converges on one commit; the
 mirror does not. A per-box base is disqualifying by construction, not merely awkward.

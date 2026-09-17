@@ -120,6 +120,21 @@ _PQ_TRAILING = ".-_,;:)]}"
 PREMISE_RE = re.compile(r"^human_blocked:\s*([a-z0-9]+(?:[_-][a-z0-9]+){1,})")
 
 
+def is_live_human_blocked(goal: dict) -> bool:
+    """True when `goal` is live and carries a `human_blocked` defer — this lane's population.
+
+    A function rather than an inline filter so the 72h user digest can import the
+    SAME computation for its second population leg (g-115-9894) instead of copying
+    the prefix and status set, which would be a second predicate free to drift
+    (guard-1802). Adopters: this script's main() and user-blocker-escalation-check.py.
+    NOT a fleet-wide SSOT (guard-4622): goal-selector.py, stalled-goal-ratchet.py,
+    credential-defer-recheck.py, completion_digest.py and gates/defer_classifier.py
+    each still carry their own copy of the prefix.
+    """
+    return (goal.get("status") in LIVE_STATUSES
+            and str(goal.get("defer_reason") or "").startswith(DEFER_PREFIX))
+
+
 def _read_goals(source: str) -> tuple[list[dict], str | None]:
     """Return (goals, error). Never raises -- the caller renders `unreadable`."""
     try:
@@ -227,11 +242,7 @@ def main() -> int:
             errors.append(err)
         goals.extend(g)
 
-    deferred = [
-        g for g in goals
-        if g.get("status") in LIVE_STATUSES
-        and str(g.get("defer_reason") or "").startswith(DEFER_PREFIX)
-    ]
+    deferred = [g for g in goals if is_live_human_blocked(g)]
 
     pq_status, pq_err = _read_pending_questions()
     if pq_err:

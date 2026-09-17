@@ -94,6 +94,14 @@ _WORLD_STAGED_DIRNAME = "body-staged-wm"
 _STAGED_WM_SUFFIX = "-wm.yaml"
 _STAGED_BASELINE_SUFFIX = "-wm-baseline.yaml"
 _STAGED_HASH_SUFFIX = "-wm.hash"
+# : the append path's capture-eviction archive, written beside the Body
+# WM (wm_write.py append_slot). Staged WITH the WM so a close or reap never
+# strands it. NOT a merge input: body-merge._consume_staged globs "*-wm.yaml" and
+# deletes only its triple, so this file stays in the staged dir as the durable
+# copy. Mirrors wm.CAPTURE_EVICTION_ARCHIVE and the bash reaper's literal; one
+# test pins all of them.
+_EVICTIONS_FILENAME = "capture-evictions-archive.jsonl"
+_STAGED_EVICTIONS_SUFFIX = "-capture-evictions-archive.jsonl"
 #  outcome 3: the CONSUMED TOMBSTONE. Written by
 # body-merge._consume_staged (on the REDUCER) before it deletes a triple, read
 # here (on the ORIGIN box) before re-staging or re-pushing one.
@@ -184,7 +192,7 @@ VALID_ROLES = ("reducer", "worker", "observer")
 #   - the stop-hook's closed-state grep. `parked` matching there would stand the
 #     worker-net down as though the Body were finished; it gets its own valve.
 VALID_STATES = ("active", "parked", "closed-pending-merge", "merged",
-                "closed-stale")
+                "closed-stale", "closed-graceful")
 # The park's own upper bound. A reducer absent this long is a human matter and
 # the wind-down board post already went out, so the Body closes durably for real.
 PARK_MAX_HOURS = 60.0
@@ -236,7 +244,8 @@ def park_backoff_seconds(park_count: int) -> int:
 # CLOSEABLE, not "active": a park is a live Body that may legitimately be closed
 # (its cap expired, or a user stopped it) and MUST stage its WM when that happens.
 CLOSEABLE_STATES = ("active", "parked")
-CLOSED_STATES = ("closed-pending-merge", "merged", "closed-stale")
+CLOSED_STATES = ("closed-pending-merge", "merged", "closed-stale",
+                 "closed-graceful")
 # -a: the ONLY accepted --reducer-sid value. Not a SID and never one —
 # a cross-box reducer's SID cannot be read from this machine (running-session-id
 # is machine_local; the DDB claim stores a runner-token, not a SID). Rejecting
@@ -905,6 +914,15 @@ def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
     if forked_hash:
         items.append((_STAGED_HASH_SUFFIX,
                       f"{forked_hash}\n".encode("utf-8")))
+    evictions_src = session_dir / _EVICTIONS_FILENAME
+    if evictions_src.is_file():
+        try:
+            items.append((_STAGED_EVICTIONS_SUFFIX, evictions_src.read_bytes()))
+        except OSError as exc:
+            # Non-fatal: the session dir is left in place at close, so the
+            # reaper's crash-preserve path stages the archive on its way out.
+            print(f"body-manifest: eviction archive unreadable, not staged at "
+                  f"close: {exc}", file=sys.stderr)
     items.append((_STAGED_WM_SUFFIX, wm_bytes))  # TRIGGER LAST — see above
     ok = True
     for suffix, body in items:
@@ -1022,7 +1040,7 @@ def relocate_legacy_staging(state_dir: Path, unit_key: str) -> list:
         return []
     copied = []
     for suffix in (_STAGED_BASELINE_SUFFIX, _STAGED_HASH_SUFFIX,
-                   _STAGED_WM_SUFFIX):
+                   _STAGED_EVICTIONS_SUFFIX, _STAGED_WM_SUFFIX):
         src = legacy / f"{unit_key}{suffix}"
         if not src.is_file():
             continue
@@ -1088,7 +1106,7 @@ def push_staged_files(staged_dir: Path, unit_key: str) -> bool:
     # round trips before its sidecars land — and either of those can fail
     # independently, leaving the trigger published without them.
     for suffix in (_STAGED_BASELINE_SUFFIX, _STAGED_HASH_SUFFIX,
-                   _STAGED_WM_SUFFIX):
+                   _STAGED_EVICTIONS_SUFFIX, _STAGED_WM_SUFFIX):
         target = staged_dir / f"{unit_key}{suffix}"
         if not target.is_file():
             continue
@@ -1268,7 +1286,25 @@ def _reconcile_orphan_carrier(sid: str, agent: str, truth_state: str | None,
     # DELIVERY refusal and never "nothing to mirror" — the precondition
     # _mirror_state_to_carrier's docstring requires before reading it that way.
     delivered = _mirror_state_to_carrier(sid, agent, truth_state, project_root)
-    return "repaired" if delivered else "repaired-push-failed"
+    if delivered:
+        return "repaired"
+    # G4 RETRY BREADCRUMB (). The local write above has just destroyed
+    # the `body_state == "active"` pre-filter this function opens with, so no
+    # pass keyed on that value can ever re-select this carrier and the refusal
+    # is permanent -- which is what the docstring above records as designed and
+    # out of THIS module's scope. The breadcrumb is the second, independently
+    # written signal that `carrier_push_retry` keys on instead (guard-5708), and
+    # `ts` is the carrier's own, left untouched by the mirror (guard-6558), so
+    # it serves as the divergence key that retry diffs the destination against
+    # (guard-3849). Fail-open: a breadcrumb that cannot be written must never
+    # change this function's verdict.
+    try:
+        from carrier_push_retry import record_push_failure  # noqa: PLC0415
+        record_push_failure(agent, sid, ts=doc.get("ts"),
+                            body_state=truth_state, state_dir=state_dir)
+    except Exception:  # noqa: BLE001 -- breadcrumb is telemetry, never a gate
+        pass
+    return "repaired-push-failed"
 
 
 def _with_repair_verdict(base: str, repair: str | None) -> str:
@@ -1287,7 +1323,8 @@ def _with_repair_verdict(base: str, repair: str | None) -> str:
 
 
 def close_body_late(sid: str, agent: str,
-                    project_root: Path | None = None) -> str:
+                    project_root: Path | None = None, *,
+                    no_wm_state: str = "closed-stale") -> str:
     """Close a Body whose session already ENDED without closing it ().
 
     The close above runs only in the turn-ending session's own stop hook, so a
@@ -1337,8 +1374,20 @@ def close_body_late(sid: str, agent: str,
                                            project_root)
         return _with_repair_verdict("not-active", repair)
     if not (session_dir / _WM_FILENAME).is_file():
-        set_state(sid, agent, "closed-stale", project_root)
-        return "marked-stale"
+        # : WHICH closed value this writes is the caller's to say.
+        # A stale-binding sweep reaching a Body that died ungracefully means
+        # "closed-stale" -- the historical default, and byte-identical to
+        # orphan_carrier_repair.REPAIR_STATE, which is what lets that module's
+        # own specimens stay recognisable. A GRACEFUL /stop is a different fact
+        # about the same population and must not be masked among them, so the
+        # graceful-stop caller passes "closed-graceful". Both are CLOSED_STATES
+        # members, so every consumer of the partition already grades them
+        # benign; only the reason differs. set_state raises on any value outside
+        # VALID_STATES, so a typo here fails loudly rather than writing a state
+        # no reader knows.
+        set_state(sid, agent, no_wm_state, project_root)
+        return ("marked-stale" if no_wm_state == "closed-stale"
+                else f"marked-{no_wm_state.removeprefix('closed-')}")
     pushed = _mark_pending_merge(sid, agent, data, session_dir, state_dir,
                                  project_root)
     _unlink_quiet(session_dir / _CLOSE_SENTINEL_FILENAME)
@@ -1354,6 +1403,13 @@ def main(argv=None):
         sp = sub.add_parser(name)
         sp.add_argument("--sid", required=True)
         sp.add_argument("--agent", required=True)
+        if name == "close-body-late":
+            # : the graceful-stop caller is bash (aspirations-
+            # graceful-stop D6.5), so the distinction has to be reachable from
+            # the CLI or it cannot be used where it matters.
+            sp.add_argument("--graceful", action="store_true",
+                            help="write closed-graceful instead of closed-stale "
+                                 "on the no-forked-WM (reducer/observer) branch")
         if name == "write":
             sp.add_argument("--env-id", default="local")
             sp.add_argument("--role", default="worker", choices=VALID_ROLES)
@@ -1390,7 +1446,14 @@ def main(argv=None):
             # one in-process caller (abandoned_sessions.py) and no verb, so
             # cleanup-stale-bindings.sh — which is bash — could not reach it and
             # every reap left a permanent carrier reading active.
-            print(close_body_late(args.sid, args.agent))
+            # Pass the kwarg ONLY for --graceful. The default call stays the
+            # literal two-positional-arg form it has always been, so the reap's
+            # behaviour is unchanged by construction rather than by assertion --
+            # and test_close_body_late_is_reachable_from_bash, which pins this
+            # dispatch with a two-arg stub, keeps guarding what it was written
+            # to guard instead of being widened to accommodate this change.
+            _late_kw = {"no_wm_state": "closed-graceful"} if args.graceful else {}
+            print(close_body_late(args.sid, args.agent, **_late_kw))
         elif args.cmd == "park":
             print(park_body(args.sid, args.agent))
         elif args.cmd == "resume":

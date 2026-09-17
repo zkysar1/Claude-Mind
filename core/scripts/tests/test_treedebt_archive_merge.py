@@ -5,9 +5,13 @@ coordination_merge._HANDLERS:
   * world/aspirations-archive.jsonl -> merge_aspirations   (by-id union)
 
 tree-debt.jsonl is PURE append-only (verified per rb-245 by reading both
-writers: CLI tree.py _write_tree_debt_entry unlocked "a" append + daemon
-tree_write.py _write_tree_debt_entry locked "a" append; zero rewriters, no
+writers: CLI tree.py _write_tree_debt_entry + daemon
+tree_write.py _write_tree_debt_entry; zero rewriters, no
 hygiene cap, no drain), so the both-diverged reconcile is the line-union.
+BOTH writers now take the LOCKED append. The CLI one was a bare
+open(..., "a") until g-358-174 rerouted it onto _fileops.locked_append_jsonl
+— that reroute is what registers the audit-trail row, and it is pinned below
+by test_tree_debt_write_registers_audit_trail_row (g-358-178).
 The writers dump ensure_ascii=False while the union normalizes to
 ensure_ascii=True — dedup keys on the PARSED record, so a raw-UTF-8 line and
 its \\uXXXX twin collapse to one.
@@ -25,6 +29,8 @@ Governing invariant stays BYTE commutativity (guard-907):
 merge(a, b) == merge(b, a) exactly, plus multiround convergence.
 """
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -107,6 +113,119 @@ def test_tree_debt_multiround_convergence():
     m2 = _merged_pair(cm.merge_append_only_jsonl, m1, b)
     m3 = _merged_pair(cm.merge_append_only_jsonl, m1, a)
     assert m1 == m2 == m3
+
+
+# --- tree-debt WRITE path: the audit-trail row () --------------------
+#
+# Everything above exercises the MERGE handler; nothing above reaches the
+# WRITER. So until this section existed the store's reconcile was pinned while
+# the property that makes a write reconcilable AT ALL — that it enters the
+# locked read-modify-write cycle and registers an audit-trail row — was not.
+# A regression to a bare open(..., "a") would be SILENT in exactly the way the
+# original  defect was: the debt store keeps filling, its rows keep
+# parsing, and only the trail goes quiet.
+#
+# The write runs in a SUBPROCESS against an isolated tmp world. tree.py
+# resolves WORLD_DIR at IMPORT time, so the redirect has to be in place before
+# the import — not arrangeable in-process without reloading tree into this
+# pytest process, which would additionally expose the memoized-backend
+# poisoning class (). STORAGE_BACKEND is pinned local EXPLICITLY
+# rather than inherited: a subprocess doing os.environ.copy() under own-cloud
+# derives its S3 key from the customer prefix, NOT from the MIND_WORLD
+# override, so an "isolated" tmp write would land on the PRODUCTION key
+# (guard-955, rb-2983 — that is how world/aspirations.jsonl was truncated on
+# 2026-07-09).
+
+_DEBT_WRITE_PROBE = r'''
+import os, sys
+from pathlib import Path
+
+world, meta, scripts = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+os.environ["MIND_WORLD"] = str(world)
+os.environ["MIND_META"] = str(meta)
+os.environ["STORAGE_BACKEND"] = "local"
+sys.path.insert(0, scripts)
+
+import tree  # env MUST be set before this line — WORLD_DIR resolves at import
+
+# Refuse to proceed if the redirect did not take. Without this guard a broken
+# redirect would not fail the test, it would append to the REAL debt store.
+if str(tree.WORLD_DIR) != str(world):
+    print("ABORT: tmp world did not take effect, refusing to write",
+          file=sys.stderr)
+    raise SystemExit(2)
+
+tree._write_tree_debt_entry({
+    "timestamp": "2026-09-17T00:00:00",
+    "parent": "g-358-178-probe",
+    "capability_level": "CALIBRATE",
+    "limit": 7,
+    "current": 8,
+    "context": "audit-trail-pin",
+    "justification": "isolated tmp-world probe",
+    "source_agent": "test",
+})
+'''
+
+
+def _write_one_debt_entry(tmp_path):
+    """Run the REAL CLI writer once against an isolated tmp world."""
+    world = tmp_path / "world"
+    meta = tmp_path / "meta"
+    world.mkdir()
+    meta.mkdir()
+    scripts = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    env["STORAGE_BACKEND"] = "local"  # guard-955 — never inherit own-cloud
+    proc = subprocess.run(
+        [sys.executable, "-c", _DEBT_WRITE_PROBE,
+         str(world), str(meta), scripts],
+        cwd=str(Path(__file__).resolve().parents[3]),
+        env=env, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, (
+        f"debt-write probe failed rc={proc.returncode}\n"
+        f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
+    )
+    return world
+
+
+def test_tree_debt_write_registers_audit_trail_row(tmp_path):
+    """'s fix, pinned: a debt write must register an audit-trail row.
+
+    This is the assertion that goes RED when the writer reverts to a bare
+    open(..., "a"). Proved non-vacuous with core/scripts/mutation-proof-test.sh
+    rather than by inference (g-358-178, guard-1595).
+    """
+    world = _write_one_debt_entry(tmp_path)
+    debt_name = "tree-debt.jsonl"
+    debt = world / debt_name
+    trail = world / "changelog.jsonl"
+
+    # Positive control FIRST: prove the write happened at all. Without it an
+    # empty trail below is ambiguous between "no trail row was registered"
+    # (the regression) and "no write occurred" (a broken probe) — two causes,
+    # one symptom.
+    assert debt.exists(), "the debt store was never written — probe is broken"
+    rows = [ln for ln in debt.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+    assert len(rows) == 1, f"expected exactly 1 debt row, got {len(rows)}"
+    # guard-5469: verify by TYPE, not by count alone. A list handed to the
+    # append writes ONE valid JSON line that every per-record consumer then
+    # mis-handles, so a line count cannot tell the two apart.
+    assert [type(json.loads(ln)).__name__ for ln in rows] == ["dict"]
+
+    # THE PINNED PROPERTY.
+    assert trail.exists(), (
+        "no audit trail was created — the debt write never entered the locked "
+        "read-modify-write cycle (g-358-174 regression)"
+    )
+    mentions = [ln for ln in trail.read_text(encoding="utf-8").splitlines()
+                if debt_name in ln]
+    assert mentions, (
+        "the audit trail exists but carries no row naming the debt store — "
+        "the write bypassed the locked append (g-358-174 regression)"
+    )
 
 
 # --- aspirations-archive by-id union ------------------------------------------

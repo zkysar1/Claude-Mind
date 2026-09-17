@@ -151,6 +151,28 @@ _N3_ALLOWED_EXACT = frozenset({
     # relieves the thrash was unreachable through .env.local, the documented
     # channel. Non-secret integers, same class as MIND_API_PORT above.
     "MIND_API_CACHE_MAX_BYTES", "MIND_API_CACHE_MAX_OBJECT_BYTES",
+    # : the utilization counter-spool cutover flag, read at CALL TIME
+    # by `_utilization_store.spooled_enabled()` and branched on in BOTH daemon
+    # write lanes — `endpoints/store.py` (the increment endpoint) and
+    # `retrieve.py` (the retrieval_count bump). SIXTH instance of the guard-3485
+    # class, and the first whose reader is the CUTOVER GATE itself, which is why
+    # it stayed invisible: the flip was declared in `.claude/settings.json` env
+    # ("FLIP — UTILIZATION_COUNTERS_SPOOLED=1 fleet-wide", 2026-08-19), and that
+    # block reaches Claude Code's own Bash calls but NOT a detached daemon. So
+    # every CLI read saw the flag ON while the daemon that performs every write
+    # saw it OFF — the flip never took effect where the writes happen.
+    # MEASURED 2026-09-15 on cc-09: daemon pid 745 (parent=init) carried 20 env
+    # keys and 10 of settings.json's 12 were absent, this one among them;
+    # `spooled_enabled()` returned False in that env and True in a Bash call,
+    # positive-controlled both directions. Consequence: increments took the
+    # legacy RMW lane into the record's EMBEDDED utilization block, while every
+    # reader goes through `utilization_of`, which is sidecar-wins-wholesale and
+    # does NOT gate on this flag — so a credit was written somewhere no reader
+    # looks, and no flush reconciles it (the flusher drains spool -> sidecar,
+    # and with nothing spooling there was no spool: both `.spool.last-flush`
+    # stamps sat 6.5h older than the daemon's own start).
+    # Non-secret boolean, same class as the cadence knobs above.
+    "UTILIZATION_COUNTERS_SPOOLED",
 })
 
 

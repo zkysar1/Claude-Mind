@@ -887,7 +887,29 @@ PYEOF
             fi
           done
           if [[ -n "$matched_partner" ]]; then
+            # PATH-SHAPE MISMATCH, and the two sides genuinely disagree
+            # (, measured 2026-09-15 echo/cc-03 on 's own
+            # deliverable). `$path` comes from git porcelain, which reports a
+            # NEW UNTRACKED DIRECTORY as the DIRECTORY (`?? a/b/c/`) and never
+            # as its members; uncommitted-edits.jsonl records FILES
+            # (`a/b/c/SKILL.md`). So the exact associative-array lookup below
+            # CANNOT match a newly-created directory, and a first-person
+            # authored new skill dir was dropped from the committer's own
+            # commit while the mtime-coincident partner signal stood.
+            # Fall back to a prefix match ONLY for a trailing-slash path, so
+            # every file lookup keeps its exact-key semantics unchanged.
+            authored_hit=""
             if [[ -n "${committer_authored_paths["$path"]:-}" ]]; then
+              authored_hit="exact"
+            elif [[ "$path" == */ ]]; then
+              for _authored_p in "${!committer_authored_paths[@]}"; do
+                if [[ "$_authored_p" == "$path"* ]]; then
+                  authored_hit="dir-prefix"
+                  break
+                fi
+              done
+            fi
+            if [[ -n "$authored_hit" ]]; then
               # : the committer's OWN uncommitted-edits.jsonl
               # recorded this neutral path — first-person authorship proof
               # overrides the mtime-coincident partner in_flight signal

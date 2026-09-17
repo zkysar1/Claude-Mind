@@ -2081,3 +2081,119 @@ def test_g115_2178_unpushed_local_still_no_clobber(cloud, tmp_path):
                              b'{"peer":"s3"}\n', b'{"unpushed":"local-newer"}\n')
     _write_sync_manifest(tmp_path, {b._rel(p): {"mtime": 1, "md5": "0" * 32}})
     assert b._overwrite_decision(p, p, etag) == "no_clobber"
+
+
+# --- delete: the two-lane contract () -------------------------------
+# delete_object is the STORE-ONLY half and always was. delete() is the whole
+# thing, and these tests are about the half that used to be every caller's
+# problem: proving absence from the AUTHORITATIVE store rather than from the
+# local mirror, which is precisely the reading that cannot tell the two apart.
+
+def _head_raises_404(s3, key):
+    """Absence proved by an INDEPENDENT instrument — a raw head_object on the
+    moto client, not through the backend under test. b.exists() is also a HEAD,
+    but routing the proof through the code being tested is how a lane-specific
+    bug certifies itself."""
+    try:
+        s3.head_object(Bucket=BUCKET, Key=key)
+    except ClientError as e:
+        return e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound")
+    return False
+
+
+def test_delete_removes_from_authoritative_store_not_just_the_mirror(cloud):
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "doomed.jsonl"
+    b.write_text(p, "payload\n")
+    key = b._s3_key(p)
+
+    # Both lanes populated before the delete — otherwise the assertions after
+    # it are vacuous (a delete of nothing also leaves nothing).
+    assert _head_raises_404(cloud["s3"], key) is False
+    assert p.exists() is True
+
+    assert b.delete(p) is True
+
+    # 1. AUTHORITATIVE: raw HEAD on the store, independent of the backend.
+    assert _head_raises_404(cloud["s3"], key) is True
+    # 2. AUTHORITATIVE: a listing shows no surviving object under that key.
+    listed = cloud["s3"].list_objects_v2(Bucket=BUCKET, Prefix=key).get(
+        "Contents", [])
+    assert [o["Key"] for o in listed] == []
+    # 3. The store-read primitive agrees.
+    with pytest.raises(FileNotFoundError):
+        b.read_authoritative_bytes(p)
+    # 4. And only THEN the local mirror — the weakest signal, checked last so
+    #    it can never be mistaken for the proof.
+    assert p.exists() is False
+
+
+def test_delete_raises_when_the_store_lane_survives(cloud, monkeypatch):
+    """guard-1493's failure mode, made unreachable. A store delete that
+    silently does nothing while the local unlink succeeds is the shape that
+    reads GREEN on every local check. delete() must refuse to report success.
+    """
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "survivor.jsonl"
+    b.write_text(p, "payload\n")
+    # delete_object reports success and removes nothing — the silent-failure
+    # store lane, simulated.
+    monkeypatch.setattr(type(b), "delete_object", lambda self, path: True)
+
+    with pytest.raises(OSError) as exc:
+        b.delete(p)
+    assert "store_present=True" in str(exc.value)
+    # The object really did survive, so the raise was right, not paranoid.
+    assert _head_raises_404(cloud["s3"], b._s3_key(p)) is False
+
+
+def test_delete_raises_when_the_local_lane_survives(cloud, monkeypatch):
+    """The mirror image: the store delete lands, the unlink does not. A caller
+    checking only the store would read absent while the file is still on disk
+    and still served by read-through."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "local-survivor.jsonl"
+    b.write_text(p, "payload\n")
+    monkeypatch.setattr(Path, "unlink",
+                        lambda self, missing_ok=False: None)
+
+    with pytest.raises(OSError) as exc:
+        b.delete(p)
+    assert "local_present=True" in str(exc.value)
+
+
+def test_delete_is_idempotent_across_both_lanes(cloud):
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "twice.jsonl"
+    assert b.delete(p) is False          # never existed in either lane
+    b.write_text(p, "x")
+    assert b.delete(p) is True
+    assert b.delete(p) is False          # no-op, not an error
+
+
+def test_delete_removes_a_mirror_with_no_store_object(cloud):
+    """A local-only file (never PUT, or excluded from sync) still has to go.
+    delete_object returns False for the absent key and the local lane carries
+    the whole result — the case a store-only delete primitive cannot serve."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "local-only.txt"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("never pushed\n", encoding="utf-8")
+    assert _head_raises_404(cloud["s3"], b._s3_key(p)) is True
+
+    assert b.delete(p) is True
+    assert p.exists() is False
+
+
+def test_delete_drops_the_freshness_stamp(cloud):
+    """_refresh short-circuits its HEAD inside the freshness window. A stamp
+    left behind for a deleted path is a cached assertion that the local copy
+    is current — about a file that no longer exists in either lane."""
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "stamped.txt"
+    b.write_text(p, "x")
+    b.read_text(p)                       # warms _cache_check for this path
+    assert str(p) in b._cache_check
+
+    b.delete(p)
+    assert str(p) not in b._cache_check

@@ -165,7 +165,11 @@ def _build_runner_root(tmp: Path, world: Path, meta: Path, state: str) -> Path:
     return root
 
 
-def _run_hook_as_runner(root: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
+_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
+
+
+def _run_hook_as_runner(root: Path, extra_env: dict | None = None,
+                        harness: dict | None = None) -> subprocess.CompletedProcess:
     """Fire the hook in the environment a Stop event actually provides.
 
     See the module docstring: MIND_SID / MIND_AGENT are scrubbed because
@@ -177,6 +181,13 @@ def _run_hook_as_runner(root: Path, extra_env: dict | None = None) -> subprocess
     env.pop("MIND_SID", None)
     env.pop("MIND_AGENT", None)
     env["STORAGE_BACKEND"] = "local"
+    # Harness pin (2026-09-17): the imperative is spelled in the hosting
+    # harness's tool names, read from the CLAUDECODE / ZAKCODE_* markers. Pin
+    # Claude Code so the Skill(...) pins in this family hold on a box that runs
+    # the suite under a vessel; a test names another harness via `harness`.
+    for k in _HARNESS_MARKERS:
+        env.pop(k, None)
+    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
     # RUNNER_PROC_ID is the SAME seam the shell suite uses at three sites
     # (test-runner-identity-check.sh:248/274/329), not a new one invented here
     # (guard-1885). It is REQUIRED, not a convenience: _resolve_owner_proc walks

@@ -139,7 +139,10 @@ from gates.approval_reference import evaluate as _approval_ref_eval  # noqa: E40
 from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
 from gates.verification_outcomes import evaluate as _verification_outcomes_eval  # noqa: E402
 from gates.check_schema import evaluate as _check_schema_eval  # noqa: E402
-from gates.user_leg_scope import evaluate as _user_leg_scope_eval  # noqa: E402
+from gates.user_leg_scope import (  # noqa: E402
+    evaluate as _user_leg_scope_eval,
+    VALID_USER_LEG_SCOPES as _VALID_USER_LEG_SCOPES,
+)
 from gates.defer_classifier import (  # noqa: E402
     is_narrative_defer as _is_narrative_defer,
     STRUCTURED_DEFER_PREFIXES as _STRUCTURED_DEFER_PREFIXES,
@@ -285,7 +288,7 @@ _VALID_GOAL_STATUSES = {
 # never named this file — which is precisely why the literal drifted unowned.
 _TERMINAL_GOAL_STATUSES = _CENSUS_TERMINAL_STATUSES
 _ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (mirrors aspirations.py::ASP_ID_RE; companion to _GOAL_ID_RE xw branch below)
-_GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,4}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 4-digit: asp-115 hit  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+_GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,5}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 5-digit: asp-115 hit  (2026-09-15), 4-digit:  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 
 
 def _goals_field_problem(value) -> "str | None":
@@ -686,7 +689,7 @@ def _validate_goal(goal: Dict[str, Any], *, require_id: bool = True) -> None:
     if require_id and "id" not in goal:
         raise ValueError("Goal missing 'id' field")
     if "id" in goal and not _GOAL_ID_RE.match(goal["id"]):
-        raise ValueError(f"Invalid goal ID format: {goal['id']} (expected g-NNN-NN[N[N]])")
+        raise ValueError(f"Invalid goal ID format: {goal['id']} (expected g-NNN-NN[N[N[N]]])")
     if "status" not in goal:
         raise ValueError(f"Goal {gid} missing 'status' field")
     if goal["status"] not in _VALID_GOAL_STATUSES:
@@ -1084,6 +1087,34 @@ def _clear_stale_blockers_inline(items: List[Dict[str, Any]],
                     goal["blocked_by"] = cleaned
                     if not cleaned:
                         goal["blocked_since"] = None
+                        # : emptying blocked_by must also RESTORE the
+                        # status the field's emptiness was supposed to release.
+                        # Clearing the reference without it manufactures the
+                        # reason-less-blocked state — status="blocked" with
+                        # blocked_by=[], blocked_since=None, no blocker_ref —
+                        # which is invisible to the selector and to every sweep
+                        # keyed on blocked_by. This path fires on EVERY terminal
+                        # transition, so it is the one that actually runs on most
+                        # closes; dependent-unblock.py Step 1b had the restore and
+                        # runs only when verify Phase 5 calls it (a gate is only as
+                        # broad as its entry points).
+                        #
+                        # Same guard triple as dependent-unblock.py Step 1b, and
+                        # each is a goal that must NOT be flipped:
+                        #   1. blocked_by now empty — enforced by this branch.
+                        #   2. status == "blocked" — never touch completed /
+                        #      skipped / in-progress / expired; only `blocked` is
+                        #      ours to undo.
+                        #   3. no blocker_ref — a structured blocker is a SEPARATE
+                        #      suppression axis owned by CREATE_BLOCKER and its
+                        #      re-probe sweep. blocked_by going empty says nothing
+                        #      about whether THAT blocker cleared.
+                        # `defer_reason` is deliberately NOT a condition: defer and
+                        # status are orthogonal axes, and gating on it would
+                        # re-strand exactly the goals that carry both.
+                        if (goal.get("status") == "blocked"
+                                and not goal.get("blocker_ref")):
+                            goal["status"] = "pending"
 
 
 def _find_existing_unblock_for(items: List[Dict[str, Any]],
@@ -1412,7 +1443,7 @@ def _allocate_goal_id(asp: Dict[str, Any]) -> str:
     max_seq = 0
     live_ids = [g.get("id", "") for g in asp.get("goals", [])]
     for gid in live_ids + _all_evicted_ids(asp):
-        m = re.match(r"^g-\d{3}-(\d{2,4})", gid)
+        m = re.match(r"^g-\d{3}-(\d{2,5})", gid)
         if m:
             max_seq = max(max_seq, int(m.group(1)))
     return f"g-{asp_num}-{max_seq + 1:02d}"
@@ -1982,6 +2013,65 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
                 ),
                 "received_type": type(value).__name__,
                 "received_preview": repr(value)[:200],
+            }, status=400), None, None
+
+    # user_leg_scope MEMBERSHIP REFUSAL ( / guard-6104). The field is
+    # an EXACT-MEMBERSHIP key, not a description field: every consumer tests
+    # whole-value membership (`audit-user-to-agent.py::_assess_user_leg` does
+    # `if scope not in VALID_USER_LEG_SCOPES`), so a canonical head followed by
+    # prose -- "principal-identity: a VirusTotal free-tier key. Creating the
+    # account requires..." -- classifies as `undeclared`, IDENTICALLY to an
+    # empty field. No standing grant can key it and no reclaim sweep can
+    # re-derive it (reclaim-routed-work.md rule 4).
+    #
+    # WHY THIS IS THE PLACE. add-goal ALREADY raises on a non-canonical value
+    # (`aspirations.py::_validate_goal`); this generic field-update path
+    # validated NOTHING, so the identical value was refused at add and accepted
+    # in silence at update. That asymmetry IS the defect -- guard-330: "Every
+    # write path on a JSONL store MUST call its full-record validator... Add-path
+    # validation alone is insufficient, update-field paths are backdoors."
+    # The framework is daemon-only, so every real invocation arrives HERE; the
+    # CLI twin in core/scripts/aspirations.py::cmd_update_goal carries the same
+    # refusal in this same change (guard-2323/guard-742), and both read the one
+    # SSOT set rather than a hand-typed copy.
+    #
+    # WHY A REFUSAL AND NOT AN ADVISORY -- the blocker_ref reasoning above,
+    # applied to this field, plus a measured RECURRENCE. guard-6104 was written
+    # 2026-09-06 against a live population of 2 undeclared of 13 [agent,user]
+    # goals. On 2026-09-15 the same audit read 3 undeclared of 16 -- the
+    # guardrail was active the whole nine days and the defect came back, because
+    # the field gives NO SIGNAL AT WRITE TIME: it accepts arbitrary prose with no
+    # error, and the goals most likely to carry it are the ones whose author took
+    # the trouble to EXPLAIN the human leg. An advisory has already been tried
+    # here (the missing-scope WARN on participants writes, ~30 lines below) and
+    # does not reach this case at all. Refuse at the write, and the backfill
+    # becomes a consequence rather than the remedy.
+    #
+    # Clearing stays open (None / "") -- retiring a user leg must not need a
+    # vocabulary token. The dot-prefix form is matched too (guard-354): bare
+    # equality is bypassable by a dotted path that writes the same key. Here
+    # that arm is defence-in-depth rather than live — this path runs its
+    # dotted-path check FIRST — and the CLI twin deliberately omits it so the
+    # dedicated dotted check keeps emitting the `BLOCKED:` contract message.
+    if (field == "user_leg_scope" or field.startswith("user_leg_scope.")) \
+            and value not in (None, ""):
+        if value not in _VALID_USER_LEG_SCOPES:
+            return Response.json({
+                "error": "user_leg_scope_not_canonical",
+                "gate": "user-leg-scope-membership-gate",
+                "detail": (
+                    f"user_leg_scope is an exact-membership key, not a "
+                    f"description field. Every consumer tests whole-value "
+                    f"membership, so this value classifies as `undeclared` -- "
+                    f"identically to leaving the field empty -- and no standing "
+                    f"grant can key it and no reclaim sweep can re-derive it. "
+                    f"Write the BARE token and put every word of explanation in "
+                    f"progress_note. Valid: "
+                    f"{', '.join(sorted(_VALID_USER_LEG_SCOPES))}. To CLEAR it, "
+                    f"pass null. (guard-6104)"
+                ),
+                "received_preview": repr(value)[:200],
+                "valid_scopes": sorted(_VALID_USER_LEG_SCOPES),
             }, status=400), None, None
 
     if field == "status" and value == "completed":
@@ -2637,7 +2727,7 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     if not goal_id:
         return Response.error(400, "missing_param", "query parameter 'id' required")
     if not _GOAL_ID_RE.match(goal_id):
-        return Response.error(400, "invalid_goal_id", f"expected g-NNN-NN[N[N]], got {goal_id!r}")
+        return Response.error(400, "invalid_goal_id", f"expected g-NNN-NN[N[N[N]]], got {goal_id!r}")
 
     field = (ctx.query.get("field") or "").strip()
     if not field:
@@ -6433,8 +6523,16 @@ def _body_carrier_is_fresh(ctx, agent_name: str, holder_sid: str,
         # CLOSED SET, never "not active" — `parked` is RESUMABLE and a parked
         # Body is alive (). Testing "not active" here would treat a
         # live parked Body as takeable.
+        # SIXTH partition site (). `closed-graceful` joined the closed
+        # half in , which enumerated the five sites under core/scripts
+        # and never swept mind_api -- so a gracefully-stopped Body read LIVE here
+        # for the whole freshness window and its claims stayed un-takeable.
+        # Pinned against body-manifest.CLOSED_STATES by
+        # core/scripts/tests/test_graceful_body_close.py so site six stops being
+        # re-derived by hand (guard-1127: enumerate consumers REPO-WIDE).
         if str(doc.get("body_state") or "") in (
-                "closed-pending-merge", "merged", "closed-stale"):
+                "closed-pending-merge", "merged", "closed-stale",
+                "closed-graceful"):
             return False
         ts = doc.get("ts")
         if not ts:

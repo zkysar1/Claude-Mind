@@ -119,21 +119,30 @@ Bash: bash core/scripts/wm-read.sh spark_capture --json
 IF the slot is null or an empty list:
     No worker capture this window (the common case on a single-Body agent —
     this bridge is dormant until a 2nd Body forks).
-    # PROVENANCE RECORD, empty branch (g-306-251). This write is the LOAD-BEARING
-    # half and must NOT be skipped as "nothing happened" — it is what makes a
-    # later absence readable. A recorder placed only on the fire path is absent
-    # exactly on the population you most need to account for (guard-2352), so
-    # without this line a zero-hit grep cannot distinguish "the consumer ran and
-    # had nothing to replay" from "the consumer never ran at all". Measured
-    # 2026-08-07 (zeta, cc-02): that exact ambiguity made the question
-    # undecidable — 0 hits fleet-wide across every journal, experience file and
-    # execution diary, with no way to tell which zero it was.
-    # Its own command, never &&-chained to a sidecar (guard-409).
+    # PROVENANCE RECORD, empty branch (g-306-251) — the LOAD-BEARING half; never
+    # skip it as "nothing happened". It is what makes a later ABSENCE readable
+    # (guard-2352). Its own command, never &&-chained to a sidecar (guard-409).
+    # Rationale (WHY both branches record): core/config/rationale/worker-spark-replay-bounded-drain.md
     Bash: printf '{"entry_type":"observation","goal_id":"<closing-goal-id>","content":"worker-spark-replay: checked, 0 observations"}' | bash core/scripts/execution-diary.sh append
     Continue to the normal Phase 6.5 body below.
 ELSE:
     Output: "▸ Worker spark replay: {N} captured observation(s) from {distinct goal_ids}"
-    FOR EACH entry in the slot:
+    # BOUNDED BATCH — drain k GOALS per pass, never the whole slot (g-115-10001).
+    # ⚠ "THE k OLDEST" IS NOT slot[:k]. merge_wm appends each Body's batch whole
+    # and nothing re-sorts across them, so the slot is ~41 ascending runs
+    # concatenated — measured, POSITIONAL slot[:20] overlapped the TRUE oldest-20
+    # by ZERO, so a positional drain starves the oldest cohort forever while
+    # reporting honest rising counts. SORT BY `_item_ts` defaulting to "0000" —
+    # the key wm._eviction_sort_key uses (wm.py:336-339). And the batch unit is
+    # the GOAL, not the entry, because the drain below subtracts by goal_id.
+    # Rationale (WHY bounded + WHY this sort key): core/config/rationale/worker-spark-replay-bounded-drain.md
+    k = 25 at zone fresh | 10 at normal | 3 at tight   # a close-sized bound
+    batch_goal_ids = the k oldest distinct non-null entry.goal_id,
+                     ranked by min(entry._item_ts or "0000") within each goal
+    batch = every entry whose goal_id is in batch_goal_ids
+    IF len(batch) < len(slot):
+        Output: "▸ bounded drain: {len(batch)} entr(ies) / {len(batch_goal_ids)} goal(s) this pass, {len(slot) - len(batch)} left"
+    FOR EACH entry in batch:
         Run the SAME handlers below (reasoning bank, guardrails, operational
         gotcha, forge awareness, pattern outcome) over entry.observation,
         using entry.goal_id / entry.category in place of the current goal's —
@@ -174,28 +183,45 @@ ELSE:
             the observation also produced an rb entry — a lesson and a work item
             are different artifacts (worker-loop Phase 3.5 vs 3.66 draw the
             same line).
-    # PROVENANCE RECORD, fire branch (g-306-251). Written BEFORE the clear, on
-    # the same crash-safety reasoning the next comment gives: a crash here leaves
-    # the slot intact to re-replay (safe) plus a record already written (a
-    # harmless over-count), whereas recording after the clear could lose the
-    # batch AND leave no trace it ever existed. Name the source goal_ids — that
-    # is what makes an artifact attributable to the replay path rather than to an
-    # ordinary reducer close, since source_goal and encoded_by are exactly the
-    # two fields an ordinary close already writes and neither marks a replay.
+    # PROVENANCE RECORD, fire branch (g-306-251). Written BEFORE the drain
+    # (crash-safety) and NAMING the source goal_ids — that is what makes the
+    # artifact attributable to the replay path rather than to an ordinary close.
     # Its own command, never &&-chained to a sidecar (guard-409).
     Bash: printf '{"entry_type":"observation","goal_id":"<closing-goal-id>","content":"worker-spark-replay: FIRED, %s observation(s) from %s"}' "<N>" "<distinct goal_ids>" | bash core/scripts/execution-diary.sh append
-    # One-shot consume. Clear only AFTER the handlers have run: a crash between
-    # read and clear re-replays on the next close (duplicate-checked by the
-    # existing semantic-overlap gates below, which strengthen rather than
-    # duplicate), whereas clearing first would lose the batch outright.
-    Bash: bash core/scripts/wm-clear.sh spark_capture
+    # BOUNDED SUBTRACT, not a blanket clear (g-115-10001). wm-drain-goals.sh
+    # (g-115-7366) removes every entry whose goal_id is in the posted set, keeps
+    # the rest, and re-asserts the predicate INSIDE the write lock — which a
+    # read-filter-then-wm-set.sh here cannot do and which silently loses any
+    # concurrent append (guard-3881). Subtract only AFTER the handlers have run:
+    # a crash between read and drain re-replays that batch on the next close
+    # (duplicate-checked by the semantic-overlap gates below), whereas
+    # subtracting first would lose it outright.
+    Bash: printf '%s' '<batch_goal_ids as a JSON array>' | bash core/scripts/wm-drain-goals.sh spark_capture
+    Read the {"removed":N,"kept":M} verdict. `kept` > 0 is EXPECTED — the
+    remainder for the next close, not a failure. The terminating condition is a
+    RE-READ that comes back empty, NEVER exhaustion of the opening enumeration
+    (guard-5718). Never re-write the remainder yourself: `wm-set` does not stamp
+    `_item_ts` (guard-6289), which is what this wrapper exists to avoid.
 ```
 
-Do NOT skip the clear. The slot is in `RESET_SURVIVING_SLOTS` — it deliberately
+Do NOT skip the drain. The slot is in `RESET_SURVIVING_SLOTS` — it deliberately
 outlives the consolidate Step-5 `wm-reset` that would otherwise wipe it between
 its Step -1 delivery and this consumer — so this block is the ONLY thing that
-drains it. Skipping the clear replays the same observations every close until
-the 50-item `array_limits` cap starts dropping the oldest.
+drains it, and a skipped drain re-replays the same batch every close.
+
+⚠ **Do NOT restore the blanket `wm-clear.sh` here** — above all not when the slot
+looks too big to drain, the exact condition it is wrong for. Measured
+(g-115-10001): the 50-item cap is **INERT**, not merely unenforced (~100% of
+entries are eviction-EXEMPT via `load_bearing`), and a verified archive-then-clear
+of 3,187 entries was **undone inside the hour** by `merge_wm`'s union from a Body's
+stale baseline. Whether a bounded subtract survives that merge is UNMEASURED —
+assume it does not: a non-decreasing `kept` across two passes is the restore
+signal, so stop draining and fix the baseline. **Residue**: entries with
+`goal_id: null` cannot appear in the drain's goal-id set and are excluded from the
+batch deliberately, so progress stays monotonic and the residue stays countable.
+
+Rationale (WHY not a clear, both measurements in full, the second-box reading):
+`core/config/rationale/worker-spark-replay-bounded-drain.md`
 
 PLACEMENT CHECK (before creating ANY guardrail or rb entry below): if the
 prescriptive rule's `applies_to` is `domain` — i.e., it names a brand, a

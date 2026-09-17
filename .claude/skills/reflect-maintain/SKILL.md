@@ -331,29 +331,27 @@ Where:
 
 When any skill reads a knowledge article during active use (not just indexing):
 ```
-Update article's YAML front matter:
+retrieve.py updates the node's INDEX entry (_tree.yaml), not its front matter:
   retrieval_count += 1
   last_retrieved = today
 This resets days_since_reinforcement to 0 — the hippocampal "retrieval practice" effect.
 Frequently-used knowledge persists; unused knowledge decays.
 ```
 
-### Active Pruning (run during /aspirations evolve)
+### Active Pruning — SUPERSEDED by Step 2.7
 
-```
-For each leaf node article:
-  Calculate retention score using decay model
-
-  If retention >= 0.7 → ACTIVE: use freely
-  If retention 0.4-0.7 → AGING: flag for reinforcement or re-research
-  If retention < 0.4:
-    If article has validated evidence (statistical significance):
-      → ARCHIVE to world/knowledge/archived/ (don't delete validated work)
-    Else:
-      → DEPRECATE: move to world/knowledge/deprecated/
-      → bash core/scripts/tree-update.sh --remove-child <parent-key> <child-key>
-      → Log: "ACTIVE FORGETTING: {article} pruned (retention {score})"
-```
+The per-leaf "retention < 0.4 → archive or deprecate" sketch that stood here (headed
+"run during /aspirations evolve") is RETIRED. Step 2.7 (`tree-archive.sh`, D2 / rb-2338)
+is the ONLY tree-leaf pruning engine: 180d past effective relevance (`last_retrieved`,
+`last_relevant_at`, `last_updated`), cluster-resurgence refresh, default-to-keep, and
+dormant while `tree_archival.archives_per_pass == 0`. The two disagree: measured
+2026-09-16 (bravo, `hostname` cc-05, `uname -r` 6.8.0-139-generic), the sketch put 54
+of 1203 leaves below 0.4 — no leaf carries `importance` or `encoding_score`, so it
+reduces to e^(-days/30) — while `tree-archive.sh scan` returned 0 candidates.
+Read the reinforcement fields from `tree-read.sh --leaves` or `--node`: `--summary`
+(0 of 1617 nodes) and node front matter (0 of 1203 leaves) carry no `last_retrieved`,
+so a retention computed from either reads every leaf as never retrieved and flags
+844 of 1203 (70.2%).
 
 ### Interference Detection
 

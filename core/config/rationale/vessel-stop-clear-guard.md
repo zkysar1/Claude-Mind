@@ -74,6 +74,49 @@ stop signal at all. So "just raise the reserve" is not merely an ineffective
 remedy for a mind that detects the stop too late; past a threshold it converts a
 late-detection failure into a total signal loss.
 
+## The binding-time hole, and the sidecar's signature (measured 2026-09-17)
+
+The mtime rule assumed "this session's start" is close to the moment /start
+began. On a vessel it is not: `started_at` is written by /start's binding
+site, pages into the ceremony, and a slow model takes minutes to get there.
+Prod vessel debc47de (user's Alien 2, run B, seed v2.12.71 — the guard
+above was DEPLOYED and ran): the sidecar raised at 20:29:29, /start wrote
+`binding.yaml started_at: 20:31:43`, Step 2.5 ran the clear at 20:32:09.
+`signal_mtime < started_at` read as "stale", the verdict was CLEAR, and the
+run's only ending was deleted; the Mind booted on until the sidecar's 350s
+window ran out. The race the section above measured at 3m50s of headroom is
+the same race with the headroom gone — a short cap, or a human `/run/stop`
+inside the first minutes, lands the raise before the binding exists.
+
+The fix does not move the timestamp; it stops consulting it for the one
+writer that needs no clock. The sidecar (`zakcode.session.framework_stop`)
+now writes its signature as the signal's first line —
+`raised_by: vessel-sidecar`, then `raised_at: <utc>` — and
+`live_stop_decision` REFUSES a signed signal outright (still subject to
+`stop-loop` and `--force`, so the graceful-stop D2/D3 shape and the smoke
+test's override are untouched). The framework's own writers leave the marker
+EMPTY, so nothing else is affected; an unsigned signal takes the mtime rule
+exactly as before, and the two halves ship independently (a signed signal
+under the old guard, or the new guard over an unsigned one, is today's
+behaviour).
+
+Why a signed signal can be trusted without a clock: a sidecar raise is by
+construction from the current run. The sidecar retires its own unconsumed
+pair when its grace expires (g-373-92, `abandon_framework_stop`), and since
+this change also at its next start when a signed raise is older than the
+grace (`retire_expired_sidecar_stop`) — so a signed signal that survives to
+/start was raised now, by the process that is still waiting on it.
+
+## What a refusal leads to
+
+A refused clear leaves the live signal on disk for the rest of `/start`, on
+purpose. Keeping it is only half the job: something has to act on it before a
+loop exists, because Phase -1.4 is unreachable from `/start`. Two readers do
+that. The PreToolUse[Bash] advisory fires on every Bash call and names
+`Skill(aspirations-graceful-stop)`. `/start`'s hand-off marker names the same
+handler instead of `/boot` while the signal is present. Measured case and the
+reasoning: `start-handoff-stop-route.md` (g-373-16 R3).
+
 ## Cross-references
 
 - `guard-399` — an instruction's form vs. who executes it

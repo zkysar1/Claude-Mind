@@ -252,20 +252,52 @@ REFUSE = "refuse"
 CLEAR_UNDETERMINED = "clear-undetermined"
 
 
-def live_stop_decision(signal_exists, stop_loop_exists, signal_mtime, started_at, force):
+#: First line the vessel sidecar writes INTO `stop-requested` when it raises a
+#: served run's ending (zakcode.session.framework_stop). The framework's own
+#: writers leave the marker empty, so the line is the sidecar's signature.
+SIDECAR_RAISE_MARKER = "raised_by: vessel-sidecar"
+
+
+def live_stop_decision(signal_exists, stop_loop_exists, signal_mtime, started_at, force,
+                       raised_by_sidecar=False):
     """Decide whether clearing `stop-requested` is safe.
 
-    REFUSE only when all of: the signal is present, nobody has completed the
-    stop (`stop-loop` absent), the session start is KNOWN, and the signal was
-    raised after that start. Everything else clears — `CLEAR_UNDETERMINED`
-    clears too, but names itself so an un-evaluatable check can never be read
-    as a verdict that the signal was stale (guard-6178 shape).
+    REFUSE when the signal is present, nobody has completed the stop
+    (`stop-loop` absent), and EITHER the vessel sidecar signed it OR the
+    session start is KNOWN and the signal was raised after that start.
+    Everything else clears — `CLEAR_UNDETERMINED` clears too, but names
+    itself so an un-evaluatable check can never be read as a verdict that the
+    signal was stale (guard-6178 shape).
+
+    The sidecar branch does not consult time at all. Measured 2026-09-17 on
+    prod vessel debc47de (user's Alien 2 run B): the sidecar raised at
+    20:29:29, /start wrote binding.yaml `started_at` at 20:31:43 — two minutes
+    of onboarding on a slow model — and Step 2.5 ran this guard at 20:32:09.
+    mtime < started_at read as "stale" and the run's only ending was deleted.
+    A sidecar raise is by construction from the CURRENT run: the sidecar
+    retires its own unconsumed pair at grace expiry (g-373-92) and at its next
+    start, so a signed signal that survives to /start was raised now.
     """
     if force or not signal_exists or stop_loop_exists:
         return CLEAR
+    if raised_by_sidecar:
+        return REFUSE
     if started_at is None:
         return CLEAR_UNDETERMINED
     return REFUSE if signal_mtime > started_at else CLEAR
+
+
+def _signal_raised_by_sidecar(path):
+    """True when the signal file's first line is the sidecar's signature.
+
+    Reads a few bytes only; any read failure is "not signed" — the mtime rule
+    then decides, exactly as before the marker existed.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.readline().strip() == SIDECAR_RAISE_MARKER
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _session_started_at():
@@ -361,6 +393,7 @@ def cmd_signal_clear(args):
             signal_mtime=(target.stat().st_mtime if target.exists() else None),
             started_at=_session_started_at(),
             force=args.force,
+            raised_by_sidecar=_signal_raised_by_sidecar(target),
         )
         if verdict == CLEAR_UNDETERMINED:
             print(
@@ -371,11 +404,12 @@ def cmd_signal_clear(args):
             )
         elif verdict == REFUSE:
             print(
-                "REJECTED: stop-requested was raised AFTER this session started and "
-                "stop-loop is not set, so the stop has not been handled yet — clearing "
-                "it would silently discard a live stop (g-373-16). Handle the stop "
-                "(Phase -1.4 / /stop sets stop-loop, then clears), or pass --force to "
-                "override deliberately.",
+                "REJECTED: stop-requested was raised AFTER this session started "
+                "(or carries the vessel sidecar's signature, which never reads as "
+                "stale) and stop-loop is not set, so the stop has not been handled "
+                "yet — clearing it would silently discard a live stop (g-373-16). "
+                "Handle the stop (Phase -1.4 / /stop sets stop-loop, then clears), "
+                "or pass --force to override deliberately.",
                 file=sys.stderr,
             )
             sys.exit(1)

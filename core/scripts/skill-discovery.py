@@ -49,6 +49,7 @@ except ImportError:
     sys.exit(1)
 
 from _paths import META_DIR, WORLD_DIR, PROJECT_ROOT, agents_root
+from _fresh_read import read_text_authoritative, read_text_for_membership
 from _dt import parse_naive_iso  # shared tzinfo-stripping naive-ISO parse ()
 from _fleet_diary import read_fleet_diaries  # roster+authoritative diary scan ()
 
@@ -222,23 +223,26 @@ def collect_ledger_skill_dates(skill_names):
         return out
     wanted = set(skill_names)
     for ledger_path in agents_root().glob("*/skill-invocations.jsonl"):
-        with open(ledger_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                name = rec.get("skill")
-                if name not in wanted:
-                    continue
-                dt = parse_iso(rec.get("ts") or rec.get("timestamp"))
-                if dt:
-                    out[name].append(dt)
+        # Store bytes, not the local mirror: a PEER's ledger mirror can be short
+        # of the store (). `sources["ledger"]` reports a raw count, so
+        # ONE copy, never the membership union ().
+        text = read_text_authoritative(ledger_path, label="skill-discovery")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            name = rec.get("skill")
+            if name not in wanted:
+                continue
+            dt = parse_iso(rec.get("ts") or rec.get("timestamp"))
+            if dt:
+                out[name].append(dt)
     return out
 
 
@@ -269,26 +273,33 @@ def collect_journal_skill_dates(skill_names):
     # _paths SSOT agents_root() — NEVER PROJECT_ROOT.glob("*/...") (depth-1 matches
     # nothing post-relocation; the agents/ glob-drift bug class, CLAUDE.md sync-list).
     for journal_path in agents_root().glob("*/journal.jsonl"):
-        with open(journal_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(rec, dict):
-                    continue
-                blob = json.dumps(rec, ensure_ascii=False)
-                matches = set(name_pattern.findall(blob))
-                if not matches:
-                    continue
-                dt = parse_iso(rec.get("timestamp") or rec.get("date"))
-                if not dt:
-                    continue
-                for m in matches:
-                    out[m].append(dt)
+        # MEMBERSHIP read (). A peer's journal mirror and store can each
+        # hold lines the other lacks (1 of 5 diverged on cc-02, ), and a
+        # missing line can drop a skill's only journal corroboration, which feeds
+        # the silent verdict. The union repeats every line both copies share, so
+        # exact repeats are dropped: `sources["journal"]` is reported as a raw
+        # count, and a byte-identical line is one event (the same-second collapse
+        # in collect_invocation_dates).
+        text = read_text_for_membership(journal_path, label="skill-discovery")
+        for line in dict.fromkeys(text.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            blob = json.dumps(rec, ensure_ascii=False)
+            matches = set(name_pattern.findall(blob))
+            if not matches:
+                continue
+            dt = parse_iso(rec.get("timestamp") or rec.get("date"))
+            if not dt:
+                continue
+            for m in matches:
+                out[m].append(dt)
     return out
 
 

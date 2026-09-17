@@ -2,7 +2,8 @@
 """User-Blocker Escalation — the delivery-channel sibling of the aged-blocker family ().
 
 Scan the world + agent goal queues for non-terminal goals that carry `user` in
-`participants` and DELIVER ONE DIGEST EMAIL TO THE USER ON A FIXED CADENCE
+`participants` OR a live `human_blocked:` defer (the second leg, g-115-9894 — see
+main) and DELIVER ONE DIGEST EMAIL TO THE USER ON A FIXED CADENCE
 (`user_blocker_escalation.cadence_hours`, default 72) — plus one
 coordination-board record per digest that doubles as the shared schedule marker.
 
@@ -89,6 +90,7 @@ design error, so this script copies the siblings wherever they agree:
     `participants == ["user"]` to `"user" in participants` (the guard-1802 fix;
     the narrow form had a live candidate set of ZERO against 28 real goals).
     Duplicating it here would re-open exactly that hole on a second predicate.
+    The defer leg is imported the same way, from lane H's `is_live_human_blocked`.
   - COOLDOWN: shared + durable board scan, copied from handoff-aging-check.py
     (g-115-1531). The escalation's board record IS the cooldown record — one
     artifact, no ledger to keep in sync (communication-clarity rule 5). This
@@ -140,6 +142,27 @@ Two things the delivery path must get right, both load-bearing:
      refusing on provenance silences the user's own request. One tag, two
      consumers, opposite correct predicates.
 
+  3. THE SECOND LEG HAS ITS OWN PARK FAMILY, AND IT IS NOT REACHABLE THROUGH
+     ITEM 2 (g-353-102). Item 2 reads `shape == "user-only" and deliberate`, both
+     off the CANDIDATE. The second leg (item below) appends every member with
+     `deliberate: False` HARDCODED, so a goal the owner explicitly parked through
+     a `human_blocked:` defer could not hit that branch by construction and was
+     emailed every cadence. Measured 2026-09-15 (bravo, cc-05): 4 of 9 second-leg
+     members were owner-decided parks, one carrying the owner's verbatim "Do not
+     re-ask, re-file or re-email" (board msg-20260902-231119-alpha-599).
+     Re-derived on the live queue 2026-09-16 (echo, cc-03): 10 members, same 4
+     parks, the new member a genuine ask.
+
+     THE EXEMPTION IS A DECLARED MARKER — `[owner-decided: <record-id>]` inside
+     the defer — read through `gates/owner_decided_park.py`, which
+     `completion_digest.py` imports too. Never a prose match: guard-4015 measured
+     that an exemption harvested from free text fails as a silent MISS that
+     DISABLES the protection. And unlike item 2 it tests the GOAL, not the
+     candidate, so it still holds when a leg-1 scan exception re-admits a park
+     through the second leg (bravo's fresh-eyes finding
+     msg-20260915-092345-bravo-7135). Every failure of the predicate emails the
+     goal, so this exemption fails toward telling the owner.
+
 Called by aspirations-precheck. Dry-run by default; --apply to actually send.
 
 Usage:
@@ -169,6 +192,30 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _runtime_bash import bash_cmd  # guard-580: never hand-author a bare "bash" argv[0]
+
+# The owner-decided park exemption (). Imported, never re-derived —
+# completion_digest.py reads the SAME predicate, and two correct-looking copies
+# of one exemption set is guard-4015's measured corollary (guard-2275).
+#
+# GUARDED because this module's whole posture is fail-open + exit 0 (see the
+# docstring's FAIL-OPEN bullet). A bare module-level import that raised would
+# kill the digest entirely, which is a fail-CLOSED on DELIVERY — strictly worse
+# than the problem the exemption solves. On failure the fallback returns None
+# for every goal, i.e. everything is emailed, and `owner_decided_predicate_loaded`
+# in the JSON makes the degraded sweep visible instead of silent — the same
+# shape as `human_blocked_predicate_loaded` next door.
+try:
+    from gates.owner_decided_park import owner_decided_ref
+    _OWNER_DECIDED_LOADED = True
+except Exception as _exc:  # noqa: BLE001
+    sys.stderr.write(
+        "user-blocker-escalation: could not import gates.owner_decided_park (%s) — "
+        "fail-open, owner-decided parks will be EMAILED this sweep\n" % (_exc,))
+
+    def owner_decided_ref(goal):  # type: ignore[misc]
+        return None
+
+    _OWNER_DECIDED_LOADED = False
 
 DEFAULT_CADENCE_HOURS = 72.0  # D2: every 3 days, fixed schedule
 BOARD_TAG = "user-blocker-escalated"   # kept so existing peer greps still match
@@ -205,6 +252,32 @@ def _load_population_predicate():
         sys.stderr.write(
             "user-blocker-escalation: could not load population predicate from %s (%s) "
             "— fail-open, zero candidates this sweep\n" % (target, exc))
+        return None
+
+
+def _load_human_blocked_predicate():
+    """Import `is_live_human_blocked` from human-blocked-defer-join.py (lane H, 0.5b.15).
+
+    The SECOND population leg (g-115-9894): goals that wait on a human through a
+    `human_blocked:` defer while carrying no `user` in participants. Imported for
+    the same reason as `_load_population_predicate` — a copied prefix/status set
+    would be a second predicate free to drift from the lane that owns it.
+
+    FAIL-OPEN: returns None; the caller runs the first leg alone and reports
+    `human_blocked_predicate_loaded: false` so the narrower sweep is visible.
+    """
+    target = SCRIPT_DIR / "human-blocked-defer-join.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_hbdj_population", target)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return getattr(mod, "is_live_human_blocked", None)
+    except Exception as exc:
+        sys.stderr.write(
+            "user-blocker-escalation: could not load human_blocked predicate from %s "
+            "(%s) — fail-open, first population leg only this sweep\n" % (target, exc))
         return None
 
 
@@ -751,7 +824,8 @@ def _compose_digest_body(batch: list, cadence_hours: float) -> str:
         "WHY YOU ARE HEARING ABOUT IT NOW (background, moved below the asks",
         "2026-08-03 — you told us this email led with our archaeology instead of",
         "your action):",
-        "These goals carry `user` in participants, so part of each needs a human.",
+        "These goals carry `user` in participants or a `human_blocked:` defer, so",
+        "part of each needs a human.",
         "Until g-115-3926 no escalation path covered this population at all — the",
         "three existing aged-work sweeps all post to the coordination board, which",
         "is agent-to-agent, so a block whose condition is a HUMAN action could",
@@ -1010,6 +1084,43 @@ def main() -> int:
                 sys.stderr.write(
                     "user-blocker-escalation: population scan failed for %s (%s) — "
                     "continuing with other sources\n" % (label, exc))
+    user_participant_count = len(candidates)
+
+    # SECOND LEG: goals waiting on a human by DEFER, not by participants
+    # (). Measured 2026-09-13: 23 goals carried a `human_blocked:` defer
+    # and only 9 carried `user`, so 14 (7 HIGH) could never reach this digest, and
+    # an empty first leg would have sent the all-clear over them. The daily fleet
+    # digest (completion_digest.py) already lists this union. The first leg is
+    # deliberately NOT widened: lane P consumes `_find_user_participant_goals` too,
+    # and a defer-only goal has no user leg to drop (guard-4392). Same sources, and
+    # the aspiration filter mirrors `_find_user_participant_goals`
+    # (audit-user-to-agent.py), so the union is one snapshot; deduped by goal id.
+    hb_pred = _load_human_blocked_predicate()
+    load_jsonl = _load_goal_reader() if hb_pred is not None else None
+    human_blocked_count = 0
+    seen_ids = {(c.get("goal") or {}).get("id") for c in candidates}
+    if load_jsonl is not None:
+        for label, path in sources:
+            try:
+                for asp in load_jsonl(Path(path)):
+                    if asp.get("status") in ("archived", "retired", "completed"):
+                        continue
+                    for g in (asp.get("goals") or []):
+                        if not hb_pred(g):
+                            continue
+                        human_blocked_count += 1
+                        if g.get("id") in seen_ids:
+                            continue
+                        seen_ids.add(g.get("id"))
+                        candidates.append({
+                            "source": label, "aspiration_id": asp.get("id"),
+                            "goal": g, "file_path": str(path),
+                            "shape": "human-blocked-defer", "deliberate": False,
+                        })
+            except Exception as exc:
+                sys.stderr.write(
+                    "user-blocker-escalation: human_blocked scan failed for %s (%s) — "
+                    "continuing with other sources\n" % (label, exc))
 
     # THE SCHEDULE GATE — the only trigger. Read BEFORE the population loop so
     # the JSON reports it even on a not-due sweep, which is the common case.
@@ -1022,6 +1133,8 @@ def main() -> int:
     scanned = len(candidates)
     eligible, applied, results = 0, 0, []
     skipped_deliberate = 0
+    skipped_owner_decided = 0
+    owner_decided_refs = []
     unknown_age = 0
     batch = []  # every goal waiting on the user — delivered as ONE digest
 
@@ -1056,6 +1169,49 @@ def main() -> int:
             skipped_deliberate += 1
             results.append({"goal_id": gid, "action": "skip",
                             "reason": "deliberate_user_routing",
+                            "age_hours": age})
+            continue
+
+        # THE OWNER-DECIDED PARK (). The branch above is leg 1's park:
+        # `user-only and deliberate`, both halves read off the CANDIDATE. The
+        # second leg admits its goals with `deliberate: False` HARDCODED and
+        # `shape: "human-blocked-defer"`, so a goal the owner explicitly parked
+        # through a `human_blocked:` defer could not reach that branch by
+        # construction — it was emailed every cadence. Measured 2026-09-15
+        # (bravo, cc-05): 4 of the 9 second-leg members were owner-decided
+        # parks, one of them carrying the owner's verbatim "Do not re-ask,
+        # re-file or re-email". Re-derived on the live queue 2026-09-16 (echo,
+        # cc-03): population now 10, the same 4 parks, the 6th ask being new.
+        #
+        # THIS TESTS THE GOAL, NOT THE CANDIDATE, AND THAT IS LOAD-BEARING.
+        # bravo's fresh-eyes pass (msg-20260915-092345-bravo-7135) showed the
+        # leg-1 park skip is only reachable when leg 1 SUCCEEDS: an exception
+        # anywhere in `_find_user_participant_goals` loses that source's whole
+        # first leg, and the second leg then re-admits the same goals as
+        # `human-blocked-defer` / `deliberate: False`, bypassing the branch
+        # above. A predicate that reads `goal` alone cannot be bypassed that
+        # way, so this branch holds in the degraded case too — which is why it
+        # is not folded into the candidate-shaped test above.
+        #
+        # DECLARED MARKER, NEVER A PROSE MATCH (guard-4015, named as binding by
+        # this goal's own description): the exemption is honoured only for the
+        # literal `[owner-decided: <record-id>]` token. A defer that merely SAYS
+        # "do not re-ask" is still emailed. Every failure of the predicate —
+        # absent marker, malformed ref, import failure — returns None and the
+        # goal IS emailed, so this exemption fails toward telling the owner.
+        owner_ref = owner_decided_ref(goal)
+        if owner_ref:
+            # Reported, never emailed, and COUNTED — a silent skip is
+            # indistinguishable from a clean sweep, which is the failure this
+            # whole lane exists to correct (guard-3752). The ref rides in the
+            # result so a reader can open the decision record instead of
+            # taking the suppression on trust.
+            skipped_owner_decided += 1
+            owner_decided_refs.append({"goal_id": gid, "ref": owner_ref})
+            results.append({"goal_id": gid, "action": "skip",
+                            "reason": "owner_decided_park",
+                            "owner_decision_ref": owner_ref,
+                            "shape": cand.get("shape"),
                             "age_hours": age})
             continue
 
@@ -1141,6 +1297,18 @@ def main() -> int:
         },
         "dry_run": not args.apply,
         "predicate_loaded": find_pop is not None,
+        # `scanned` is the deduped UNION of both legs; the leg counts overlap.
+        "population": {
+            "user_participant": user_participant_count,
+            "human_blocked_defer": human_blocked_count,
+            "human_blocked_only": scanned - user_participant_count,
+            "human_blocked_predicate_loaded": load_jsonl is not None,
+            # False means gates.owner_decided_park did not import, so EVERY
+            # owner-decided park was emailed this sweep. Reported for the same
+            # reason as the line above it: a degraded sweep that looks clean is
+            # the failure mode this lane exists to correct.
+            "owner_decided_predicate_loaded": _OWNER_DECIDED_LOADED,
+        },
         "scanned": scanned,
         "eligible": eligible,
         "applied": applied,
@@ -1159,7 +1327,13 @@ def main() -> int:
             "board": board_detail,
             "board_ok": ok_board,
         },
-        "skipped": {"deliberate": skipped_deliberate},
+        "skipped": {"deliberate": skipped_deliberate,
+                    "owner_decided": skipped_owner_decided},
+        # The decision record behind each owner-decided suppression, so the
+        # skip is auditable from the sweep's own output rather than by
+        # re-reading ten defer_reasons (guard-3752: a reported, not-sent item
+        # was NOT told to the owner — keep the skip visible with a reason).
+        "owner_decided_parks": owner_decided_refs,
         "unknown_age": unknown_age,
         "results": results,
     }, indent=2))

@@ -249,8 +249,16 @@ def _write_tree_debt_entry(entry):
                   file=sys.stderr)
             return
         debt_path = os.path.join(str(WORLD_DIR), "tree-debt.jsonl")
-        with open(debt_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        # Locked append: takes the lock, snapshots history, and registers an
+        # audit-trail row — as the sibling store tree-maintenance-log.jsonl
+        # already does. A bare open(...,"a") never enters the backend
+        # read-modify-write cycle, so this merge-protected store's handler
+        # cannot reconcile a write it never saw, and under own-cloud the row
+        # lives only in the local read-through mirror (). Every
+        # debt_entry value is a str or int at the sole call site, so dropping
+        # the old json.dumps(default=str) loses nothing.
+        from _fileops import locked_append_jsonl
+        locked_append_jsonl(debt_path, entry)
     except Exception as e:
         print(f"[tree-debt] debt write failed ({e}) — accept-overflow honored anyway",
               file=sys.stderr)
@@ -387,6 +395,24 @@ def write_tree(data):
     acquire_lock(lock_path)
     try:
         agent = _agent_name()
+        # : fold any spooled retrieval-counter deltas into THIS write.
+        # This is the structural funnel every tree op routes through, and it is
+        # already paying a whole-object PUT on an own-cloud box — so draining
+        # here costs nothing extra, which is the entire reason the retrieval
+        # bump can stop taking a 1.84 MB PUT of its own per retrieval.
+        # Inside the lock, before the dump, so the fold lands in the same PUT.
+        # Fail-open by construction: an unavailable helper or an empty spool
+        # leaves `data` untouched and the write proceeds exactly as before.
+        _spool_deltas = {}
+        try:
+            import _tree_retrieval_spool as _trs
+            _spool_deltas = _trs.take_for_flush(path)
+            if _spool_deltas:
+                _trs.apply_pending(data, _spool_deltas)
+        except Exception as _exc:  # noqa: BLE001 - never block a structural write
+            print("[write_tree] retrieval-spool flush skipped: {}".format(_exc),
+                  file=sys.stderr)
+            _spool_deltas = {}
         if base_dir:
             save_history(path, base_dir, agent)
         max_retries = 5
@@ -407,6 +433,20 @@ def write_tree(data):
                 time.sleep(wait)
         if base_dir:
             append_changelog(base_dir, agent, path, "edit")
+        # : retire the drained residue ONLY now — the dump above has
+        # landed, so those deltas are durable in the index. Doing this before
+        # the write and then crashing would lose them outright; doing it after
+        # can at worst double-count on a crash in this window, and a
+        # double-counted advisory retrieval counter is strictly less harmful
+        # than a lost one (guard-731 reads that counter to decide retirement).
+        if _spool_deltas:
+            try:
+                import _tree_retrieval_spool as _trs
+                _trs.commit_flush(path, data.get("last_updated"))
+            except Exception as _exc:  # noqa: BLE001
+                print("[write_tree] retrieval-spool commit skipped: {} — "
+                      "residue stays readable via pending_deltas".format(_exc),
+                      file=sys.stderr)
     finally:
         release_lock(lock_path)
 
@@ -3012,9 +3052,16 @@ def _post_remove_sweep_dangling(removed_slugs):
         # Repair exit codes: 0 = clean OR applied. Anything else is a real
         # error worth surfacing; --apply never returns 1 (that's dry-run only).
         if result.returncode != 0:
+            # Lead with the repair's REFUSED line: stderr opens with unrelated
+            # backend notes, so a bare head slice cut the reason off ().
+            # Otherwise print the TAIL, where a crash puts its exception
+            # ().
+            stderr = (result.stderr or "").strip()
+            refused = [ln for ln in stderr.splitlines() if "REFUSED" in ln]
             print(
                 "[tree.py] post-remove sweep failed (exit {}): {}".format(
-                    result.returncode, (result.stderr or "").strip()[:200]),
+                    result.returncode,
+                    " | ".join(refused) if refused else stderr[-200:]),
                 file=sys.stderr,
             )
     except (subprocess.SubprocessError, FileNotFoundError, OSError) as exc:

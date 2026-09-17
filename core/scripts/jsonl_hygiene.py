@@ -190,44 +190,14 @@ def _glob_or_single(p: Path) -> list[Path]:
 # ---------------------------------------------------------------------------
 def _snapshot(path: Path) -> list[dict]:
     """Force-fresh-from-backend then parse the store with the SAME reader
-    locked_modify_jsonl uses inside its lock (read_jsonl_with_recovery). Reading
-    consistently is load-bearing: the rotate live-drop modifier verifies its
-    fresh in-lock read's front equals this snapshot's front, so any divergence in
-    how malformed lines are handled would spuriously abort the rotate. Both views
-    skip unparseable lines identically; the original bytes survive in .history.
-    Empty list if absent."""
-    try:
-        from storage_backend import get_backend
-        import owncloud_sync
-        be = get_backend()
-        # guard-881 / : refresh() force-pulls the remote copy over the
-        # local file. For a per-machine store (only-local writers, never pushed
-        # to S3) that overwrites the only good copy with stale/empty remote data
-        # -- a data-loss path. Skip refresh for any file owncloud_sync would
-        # never sync (presence/.history/sessions dirs + the basename machine-
-        # local policy); SYNCED stores (reasoning-bank, guardrails, ...) still
-        # refresh unchanged.
-        if not owncloud_sync.refresh_would_clobber(be, path):
-            be.refresh(path)
-    except Exception as e:  # noqa: BLE001 - refresh is best-effort
-        print(f"[jsonl-hygiene] (refresh skipped for {path.name}: {e})",
-              file=sys.stderr)
-    if not path.exists():
-        return []
-    try:
-        from _fileops import read_jsonl_with_recovery
-        return read_jsonl_with_recovery(path)
-    except Exception:  # noqa: BLE001 - fall back to a plain skip-malformed parse
-        out = []
-        for ln in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                out.append(json.loads(ln))
-            except json.JSONDecodeError:
-                continue
-        return out
+    locked_modify_jsonl uses inside its lock (read_jsonl_with_recovery, via
+    _fresh_read.read_jsonl_fresh).
+    Reading consistently is load-bearing: the rotate live-drop modifier verifies
+    its fresh in-lock read's front equals this snapshot's front, so any
+    divergence in how malformed lines are handled would spuriously abort the
+    rotate. Empty list if absent."""
+    from _fresh_read import read_jsonl_fresh
+    return read_jsonl_fresh(path, label="jsonl-hygiene")
 
 
 def _ts(rec: dict, ts_field: str):
@@ -528,27 +498,70 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
     # mode == rotate: archive-FIRST, then drop from live.
     archive = Path(archive_path) if archive_path else _default_archive(path)
     # Phase 1: append the oldest n_drop to the archive (locked; creates if absent).
-    locked_modify_jsonl(archive, lambda arch: (arch or []) + oldest)
-    # Phase 2: drop the oldest n_drop from the live file. Drop by COUNT from
-    # the fresh in-lock read — do NOT compare content against the outside-lock
-    # snapshot. The content-equality check (`fresh[:n_drop] != oldest`) was
-    # designed to abort if a concurrent rotation rearranged the front, but it
-    # spuriously raises RuntimeError when the backend re-fetch inside
-    # locked_modify_jsonl returns a slightly different byte sequence than
-    # _snapshot() pulled (e.g. OwnCloud eventual-consistency, write-through
-    # cache lag, or per-machine vs remote serialization). Since changelog.jsonl
-    # is append-only (writes only add to the END), the front records can only
-    # change through another hygiene rotation. The `len(fresh) < n_drop` guard
-    # below catches that case safely (another agent rotated first → no-op).
-    # Archive-FIRST (Phase 1) already holds: the records to drop are in the
-    # archive before we touch the live file, so a crash here leaves a
-    # recoverable duplicate in the archive, never a live loss.
+    # IDEMPOTENT SINCE . A Phase-2 live-drop that exhausts its lock
+    # retries re-raises (:below) with the slice STILL IN THE LIVE FILE, so the
+    # next sweep re-derives the SAME `oldest` front slice and, before this
+    # guard, appended it to the archive a second time -- a record archived
+    # twice while it sat in the live file ONCE. (That is also why guard-1816's
+    # action_hint (e) overstates its tell: "a record can only be archived twice
+    # if it was in the live file twice" is false across two sweeps.)
+    # The skip matches on the CANONICAL SERIALIZED FORM -- the same key Phase 2
+    # uses below -- and never on id: an id match would keep a stale copy
+    # (guard-3092). It is anchored at the archive's TAIL and takes the MAXIMAL
+    # overlap, so a re-run after a failed Phase 2 is a no-op append, while a
+    # re-run whose n_drop has since GROWN appends only the new remainder.
+    # Not a general dedup: it cannot and must not collapse duplicates already
+    # sitting in the archive (guard-2941 -- a writer-side dedup that touches
+    # only one twin is inert on a dirty store). Existing residue is a separate,
+    # deliberately-untouched population; see this goal's outcome note.
+    oldest_keys = [json.dumps(rec, sort_keys=True) for rec in oldest]
+    archive_skipped = [0]
+
+    def _append_new_tail(arch):
+        arch = arch or []
+        window = min(len(oldest_keys), len(arch))
+        tail_keys = [json.dumps(r, sort_keys=True) for r in arch[-window:]] if window else []
+        overlap = 0
+        for k in range(window, 0, -1):
+            if tail_keys[window - k:] == oldest_keys[:k]:
+                overlap = k
+                break
+        archive_skipped[0] = overlap
+        return arch + oldest[overlap:]
+
+    locked_modify_jsonl(archive, _append_new_tail)
+    # Phase 2: drop from the fresh in-lock read ONLY the leading records Phase 1
+    # archived, matched as parsed records in canonical form (). Never
+    # compare BYTES against the outside-lock snapshot: the backend re-fetch can
+    # serialize differently (OwnCloud eventual-consistency, cache lag), which is
+    # why the old byte-equality check raised spuriously. Never drop by COUNT
+    # either: nothing serializes rotators (sweep holds no lease), so when another
+    # rotation dropped the front after this snapshot was taken, the fresh front
+    # starts past that cut and a count removes records NO rotation archived --
+    # measured loss, test_a_rotation_on_a_stale_snapshot_drops_only_what_it_archived.
+    # A front another rotation already removed makes this a partial or empty
+    # drop; the archive keeps a recoverable duplicate, never a live loss.
+    archived = {}
+    for rec in oldest:
+        key = json.dumps(rec, sort_keys=True)
+        archived[key] = archived.get(key, 0) + 1
+
+    # `dropped` stays the archived count; `live_dropped` is what actually left
+    # the live file, which is smaller when another rotation got there first
+    # (guard-2603). Last write wins: a 412 re-run of the body is the one persisted.
+    live_cut = [0]
+
     def _drop_front(fresh):
-        if len(fresh) < n_drop:
-            # Another concurrent rotation already removed these records.
-            # Archive holds a recoverable duplicate; live is clean. No-op.
-            return fresh
-        return fresh[n_drop:]
+        left = dict(archived)
+        cut = 0
+        for rec in fresh:
+            key = json.dumps(rec, sort_keys=True)
+            if left.get(key, 0) <= 0:
+                break
+            left[key] -= 1
+            cut += 1
+        live_cut[0] = cut
+        return fresh[cut:]
     # Phase 2 live-drop, with hot-store lock-contention retry (). Catch
     # ONLY TimeoutError (the acquire_lock failure: "Could not acquire lock").
     # Phase 1 (archive append) is NOT re-run on retry, so a busy window never
@@ -572,7 +585,14 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
         raise last_timeout
     rep["action"] = "rotated"
     rep["applied"] = True
+    rep["live_dropped"] = live_cut[0]
     rep["live_lock_attempts"] = _attempt + 1
+    # Non-zero means Phase 1 recognised its own prior append at the archive tail
+    # and skipped it -- i.e. this sweep is retrying a rotation whose Phase 2
+    # failed. It is the observable for the idempotency above; a rotation that
+    # silently did the right thing is otherwise indistinguishable from one that
+    # never needed to.
+    rep["archive_skipped"] = archive_skipped[0]
     return rep
 
 
@@ -662,8 +682,38 @@ def sweep(apply: bool = False) -> dict:
 # file inside a store-hygiene detector would be an instance of the defect it
 # detects.
 OVERCAP_LOG_REL = "store-hygiene-overcap-log.jsonl"
-OVERCAP_THRESHOLD = 2.0
+# 1.25, lowered from 2.0 (). A rotated store only drifts over its cap
+# while the sweep that bounds it is not landing, and 2.0 waited for a whole
+# second cap of growth: 8 days for coordination (613 posts/day on 5000), ~24 for
+# findings. On a 16h sweep cadence the shared rotated stores sit at 1.02-1.15x
+# between sweeps, so 1.25 still reads a healthy cadence as quiet. Measured on
+# one box before the change: the stores over 1.25x were the same four as over
+# 2.0x (all machine-local, 7.9-38x), so the new default flags nothing new today.
+OVERCAP_THRESHOLD = 1.25
 OVERCAP_LOG_KEEP = 20
+# Ratchet (). Four machine-local stores sit permanently over cap on an
+# unswept box -- meta/history-save-telemetry 38.2x, world/changelog 18.7x,
+# world/presence/<agent> 11.6x, meta/changelog 7.9x -- because per-box
+# enforcement is sequenced behind , not because a sweep is falling
+# behind. Wired to a clock without a ratchet, this detector would name those
+# four on EVERY run forever. An alarm that cannot be driven quiet is one readers
+# learn to skip, and the newly-starved SYNCED store it exists to catch would
+# arrive buried in a list that never changes (guard-6508). rb-8533 states the
+# split this implements: fixable-danger detectors hard-alarm, unfixable-debt
+# detectors ratchet.
+#
+# A store SURFACES once when it first becomes a repeat offender, then goes quiet
+# at the ratio it surfaced at. It surfaces AGAIN only when it regresses past that
+# level by this factor, and its ratchet entry is DROPPED the moment it falls back
+# under threshold -- so the alarm can clear and can then fire again, which is the
+# property guard-6508 asks a detector to demonstrate rather than assert.
+#
+# 1.5 is chosen against the measured spread, not picked round: the synced stores
+# ride 1.02-1.15x between sweeps (a 13% band), so a factor inside that band would
+# re-fire on ordinary sweep jitter once a store had surfaced. 1.5 sits well clear
+# of it while still catching the doubling-class growth that made this goal: the
+# coordination board object reached ~2.5x its at-cap size before rotation.
+OVERCAP_REGRESS_FACTOR = 1.5
 
 
 def _overcap_ratio(rep: dict):
@@ -750,6 +800,14 @@ def detect_overcap(threshold: float = OVERCAP_THRESHOLD, record: bool = True) ->
     sweeps, so one reading is a level and two consecutive readings are a store
     the sweep is not bringing back down.
 
+    AND only on a store the RATCHET has not already surfaced (g-358-115). A
+    repeat offender surfaces once, at the ratio it surfaced at, then goes quiet;
+    it surfaces again only on regressing past that mark by
+    OVERCAP_REGRESS_FACTOR, and loses its mark entirely once it falls back under
+    threshold. Read `fired` with `surfaced` (what is new or worse) beside
+    `ratcheted_quiet` (known debt being carried) -- `repeat_offenders` is still
+    the raw consecutive-run set and is NOT the alarm.
+
     Always DRY-RUN: `sweep(apply=False)`. This measures; it never rotates.
 
     Two limits a reader must carry:
@@ -794,6 +852,31 @@ def detect_overcap(threshold: float = OVERCAP_THRESHOLD, record: bool = True) ->
     prev_over = sorted((prev or {}).get("over") or {})
     repeat = sorted(p for p in over_now if p in set(prev_over))
 
+    # RATCHET (). Composed WITH the consecutive-run rule above, not in
+    # place of it: only a repeat offender is eligible to surface at all, so a
+    # single over-cap reading between sweeps is still silent. Among the
+    # eligible, a store surfaces when it is NEW to the ratchet or has regressed
+    # past the level it last surfaced at; otherwise it is carried quietly.
+    prev_ratchet = dict((prev or {}).get("ratchet") or {})
+    eligible = set(repeat)
+    newly_over, regressed, carried = [], [], []
+    for path in sorted(eligible):
+        now_ratio = over_now[path]["ratio"]
+        marked = prev_ratchet.get(path)
+        if not isinstance(marked, (int, float)):
+            newly_over.append(path)
+        elif now_ratio >= marked * OVERCAP_REGRESS_FACTOR:
+            regressed.append(path)
+        else:
+            carried.append(path)
+    surfaced = sorted(newly_over + regressed)
+    # A store that fell back under threshold loses its mark entirely, so a later
+    # recurrence surfaces again. This is the half that lets the alarm CLEAR.
+    ratchet_cleared = sorted(p for p in prev_ratchet if p not in over_now)
+    next_ratchet = {p: over_now[p]["ratio"] for p in surfaced}
+    for path in carried:
+        next_ratchet[path] = prev_ratchet[path]
+
     out = {
         "threshold": threshold,
         "swept": res.get("swept"),          # every store the registry resolved
@@ -803,7 +886,17 @@ def detect_overcap(threshold: float = OVERCAP_THRESHOLD, record: bool = True) ->
         "prev_run_at": (prev or {}).get("at"),
         "first_run": prev is None,
         "repeat_offenders": repeat,
-        "fired": bool(repeat),
+        # `fired` is RATCHET-AWARE as of  and is deliberately no longer
+        # `bool(repeat_offenders)`. repeat_offenders is retained unchanged beside
+        # it as the raw consecutive-run reading, so a reader can still see the
+        # full over-cap set that is being carried quietly.
+        "surfaced": surfaced,
+        "newly_over": sorted(newly_over),
+        "regressed": sorted(regressed),
+        "ratcheted_quiet": sorted(carried),
+        "ratchet_cleared": ratchet_cleared,
+        "regress_factor": OVERCAP_REGRESS_FACTOR,
+        "fired": bool(surfaced),
         "recorded": False,
     }
     if any(over_now[p].get("machine_local") is not True for p in over_now):
@@ -840,6 +933,10 @@ def detect_overcap(threshold: float = OVERCAP_THRESHOLD, record: bool = True) ->
                 "over": {p: over_now[p]["ratio"] for p in over_now},
                 "fired": out["fired"],
                 "repeat_offenders": repeat,
+                # Carried forward on EVERY recorded run, so the self-truncation
+                # to the last OVERCAP_LOG_KEEP runs can never drop the ratchet:
+                # the newest record always holds the whole current mark set.
+                "ratchet": next_ratchet,
             })
             out["recorded"] = True
         except Exception as e:  # noqa: BLE001 - a state-write failure must not lose the reading

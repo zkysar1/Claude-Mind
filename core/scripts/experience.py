@@ -299,7 +299,7 @@ def validate_record(rec):
 # exactly what happened to the  `xw-` widening, lost for months until
 #  found the two had diverged under a comment claiming they were
 # "lifted VERBATIM". A green core-side test proves nothing about the write path.
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,4}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,5}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
 
 
 def derive_goal_id_from_id(rec_id):

@@ -135,6 +135,33 @@ def _crumb(msg):
     """
     print(f"[iteration-open] {msg}", file=sys.stderr, flush=True)
 
+
+# THE UNFINISHED-STAGE MARKER (). iteration-open.sh passes a temp-file
+# path in this env var and reads it back after this process exits. A stage key is
+# written immediately before the stage is dispatched and cleared only after its
+# `done` crumb, so a process that dies mid-stage leaves the key behind and the
+# wrapper exits 4 naming it, instead of passing a half-run off as rc=0 success.
+# Deliberately a file THIS PROCESS writes from its own stage returns, never a scan
+# of captured output: a severed caller capture looks exactly like a death on the
+# output side, so an output-side check would fire on runs that completed
+# (guard-6058, guard-6060). Unset (a direct python run, the unit tests) = off.
+_STAGE_MARKER_ENV = "ITERATION_OPEN_STAGE_MARKER"
+
+
+def _mark_in_flight(stage_key):
+    """Record `stage_key` as the stage in flight ("" = none). Never raises."""
+    import os
+    path = os.environ.get(_STAGE_MARKER_ENV)
+    if not path:
+        return
+    try:
+        Path(path).write_text(stage_key, encoding="utf-8")
+    except OSError as exc:
+        # An unwritable marker is a BLIND check, not a clean one (guard-1091): say
+        # so, rather than let a later death read as "nothing was in flight".
+        if stage_key:
+            _crumb(f"stage marker unwritable ({exc}) -- the unfinished-stage check is BLIND this run")
+
 _METER = "aspirations-precheck-budget-meter.sh"
 
 
@@ -719,8 +746,10 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
         if apply and stage["apply_flag"]:
             argv.append("--apply")
         _crumb(f"-> {stage['key']}")
+        _mark_in_flight(stage["key"])
         rc, out, ms, err = runner(argv, _STAGE_TIMEOUT_S)
         _crumb(f"   {stage['key']} done rc={rc} {ms}ms")
+        _mark_in_flight("")
         row = {"key": stage["key"], "rc": rc, "elapsed_ms": ms, "note": stage["note"]}
 
         if err is not None:
@@ -762,6 +791,7 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
     # five return paths stay untouched.
     _sel_t0 = time.perf_counter()
     _crumb("-> selection (goal-selector.sh)")
+    _mark_in_flight("selection")
     report["candidates"] = _selection(runner)
     _sel_ms = int((time.perf_counter() - _sel_t0) * 1000)
     report["candidates"]["elapsed_ms"] = _sel_ms
@@ -772,6 +802,7 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
         "note": "goal-selector.sh candidates (outside the STAGES registry)",
     })
     _crumb(f"   selection done {_sel_ms}ms")
+    _mark_in_flight("")
     if report["candidates"].get("error"):
         errors.append("selector: " + report["candidates"]["error"])
         # A SELECTOR THAT COULD NOT BE READ IS A BLIND STAGE, NOT A QUIET

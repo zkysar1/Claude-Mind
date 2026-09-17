@@ -127,6 +127,40 @@ TITLE_MIN_SUBSTANCE_ALNUM = 10
 
 HIGH_SIGNAL_TYPES = frozenset({"root_cause", "bug_identified", "investigation_finding"})
 
+# The `--scan-outcome-note` (idea-capture) lane scans ONLY this set. .
+#
+# A COMPLETED goal's outcome_note is a RETROSPECTIVE: its defect language
+# describes work the goal DID, not work that remains. The other four patterns
+# name a defect in the PRESENT and are written for the `--insight-file` lane
+# (a finding authored DURING execution), so on a retrospective their meaning is
+# inverted — and the more thorough the retrospective, the more phantom goals it
+# generates. Three places already say this lane is for recommendations: the
+# deferred_idea comment below ("the recommendation an agent writes into
+# outcome_notes and then forgets"), iteration-close.sh do_state_update, and that
+# caller's own IDEA-CAPTURE log line. Only the pattern set disagreed.
+#
+# MEASURED 2026-09-17 (echo, cc-03) over the live completed corpus — 247 goals,
+# 307 note fields, 2,840,431 bytes: 75 signals fired, of which root_cause 30 and
+# bug_identified 30 (80%, both HIGH-minting) against deferred_idea 9. Only 2
+# goals fired deferred_idea ALONE. Sampling the 60 HIGH-minting signals' minted
+# titles: 26 of 26 read as sentence fragments, several self-refuting —
+# "Unblock: Fix THE SIBLING WORK — it is complete and correctly…",
+# "Unblock: Fix MY OWN EARLIER FIX, FOUND AND REPAIRED THIS UNIT",
+# "Unblock: Fix NOT a missing writer". Three had already been filed live.
+#
+# NOT a wider RESOLUTION_SUPPRESSION_CHARS — that was measured and REJECTED.
+# Widening 50 -> 300 suppresses the first match and the scan then walks to the
+# next already-resolved defect sentence in the same retrospective and fires on
+# that instead (measured on : the match moved from "defect in my own
+# predicate: `_board_paths" to "DEFECT IN MY FIX, and this is the part worth…").
+# The window is not the lever; the lane's pattern set is.
+#
+# This EXTENDS  (see TITLE_MAX_CHARS above) rather than contradicting
+# it: that goal repaired title MINTING for this same class and its repair holds,
+# but the 26/26 sample shows minting repair alone could not fix a lane whose
+# inputs are categorically wrong.
+OUTCOME_NOTE_LANE_TYPES = frozenset({"deferred_idea"})
+
 # Connectives left dangling once the trigger phrase is removed ("root cause
 # ->is that<- the handler drops the fence").
 _LEADING_CONNECTIVE_RE = re.compile(r"^[\s,;:.\-—]+")
@@ -314,14 +348,41 @@ SIGNAL_PATTERNS = [
 ]
 
 
-def scan_signals(insight_text):
+def scan_signals(insight_text, allowed_types=None):
     """Return list of {type, match} dicts for signals present in insight_text.
 
     Each signal type is emitted at most once — the first non-suppressed match
     wins, then we move to the next pattern.
+
+    `allowed_types` restricts which SIGNAL_PATTERNS rows are considered. None
+    (the default) means ALL of them, so every existing caller is unchanged; the
+    `--scan-outcome-note` lane passes OUTCOME_NOTE_LANE_TYPES. Filtering here
+    rather than at the call site keeps the skip inside the telemetry-emitting
+    loop, so a lane-skip is recorded the same way a resolution-skip is.
+
+    CAVEAT, MEASURED 2026-09-17 and NOT an argument against the placement:
+    "recorded the same way" is currently "recorded the same way as nothing".
+    This function's `_gate_log` calls are not reaching `meta/gate-firings.jsonl`
+    — 66 findings-gate rows total, the newest dated 2026-08-16, while the gate
+    demonstrably ran today (three goals filed, see core/logs/findings-gate.log);
+    `resolution-suppression-in-match`, `negation-suppression` and
+    `degenerate-match` are all at ZERO occurrences. So the retirement evaluator
+    that reads this store cannot currently distinguish never-matched from
+    not-scanned for ANY decision path here, lane-excluded included. Pre-existing
+    and NOT caused by the lane change; filed as its own goal. Do not read the
+    sentence above as a live guarantee until that lands.
     """
     signals = []
     for name, match_re, resolution_re in SIGNAL_PATTERNS:
+        if allowed_types is not None and name not in allowed_types:
+            _gate_log(
+                "findings-gate",
+                "noop",
+                trigger_matched=f"{name}:lane-excluded",
+                caller="findings-gate.py:scan_signals",
+                extra={"decision_path": "lane-scope-suppression"},
+            )
+            continue
         for m in match_re.finditer(insight_text):
             # Negation disqualifier (). Look at the text immediately
             # before the match, confined to the CURRENT sentence — a negation in
@@ -680,7 +741,20 @@ def main():
         return
 
     # Step 1: keyword scan.
-    signals = scan_signals(insight_text)
+    #
+    # LANE SCOPE (). The outcome-note lane scans only
+    # OUTCOME_NOTE_LANE_TYPES — see that constant for the measurement. The
+    # restriction applies ONLY when the outcome note is the sole source: an
+    # --insight-file is a finding authored DURING execution, which is exactly
+    # what the present-tense patterns are for, so a caller supplying both keeps
+    # the full set. Neither live caller passes both today (iteration-close.sh
+    # do_state_update and worker_retrospective._lane_findings pass
+    # --scan-outcome-note alone; aspirations-state-update passes --insight-file
+    # alone), so this branch is the whole behaviour change.
+    if args.scan_outcome_note and not args.insight_file:
+        signals = scan_signals(insight_text, allowed_types=OUTCOME_NOTE_LANE_TYPES)
+    else:
+        signals = scan_signals(insight_text)
 
     # Step 2: investigation override.
     if args.is_investigation and len(signals) == 0 and args.investigation_needs_action:

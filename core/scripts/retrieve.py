@@ -792,6 +792,27 @@ def load_tree_nodes(categories, depth, read_only=False):
     if not nodes:
         return [], set()
 
+    # g-358-173 READ-MERGE — the half that makes the spool safe rather than a
+    # counter-losing optimisation. Between a spooled bump and the next
+    # structural write that drains it, the on-disk index under-reports
+    # `retrieval_count`; a node that has genuinely been retrieved can read back
+    # its pre-spool value, and if that value is 0 the reader is handed a FALSE
+    # ZERO on live work. guard-731 forbids retiring a node on
+    # `retrieval_count == 0` alone, so the false zero is exactly the input that
+    # must never reach a retirement decision (the g-115-5859 clobber class).
+    # Folding here — into the in-memory copy only, never back to disk — is the
+    # tree-shaped equivalent of `utilization_of` merging the sidecar for the
+    # JSONL kinds. Fail-open: no helper or no pending deltas leaves `nodes`
+    # exactly as read.
+    try:
+        import _tree_retrieval_spool as _trs
+        _pending = _trs.pending_deltas(TREE_PATH)
+        if _pending:
+            _trs.apply_pending(tree, _pending)
+    except Exception as _exc:  # noqa: BLE001 - retrieval must never block
+        print("[retrieve] tree retrieval-spool read-merge skipped: {}".format(
+            _exc), file=sys.stderr)
+
     limit = DEPTH_LIMITS.get(depth, 50)
 
     # Build concept index once (shared across multi-category). WORLD_DIR is
@@ -934,12 +955,39 @@ def load_tree_nodes(categories, depth, read_only=False):
     # inside the lock, so bumps land on top of any concurrent structural
     # write rather than overwriting it.
     if matched_keys_to_bump:
-        from _fileops import locked_modify_yaml
         today = today_str()
+
+        # g-358-173 WRITE-SIDE SWITCH. The legacy path below is a whole-object
+        # PUT of the entire index on an own-cloud box — measured 804 versions /
+        # 1,479,642,382 summed PUT bytes in 24h, average PUT 1,840,351 B against
+        # a 1,854,264 B file, with 92.5% of changelog rows carrying
+        # `lines_changed=0` because they only rewrite integers in place. That is
+        # the exact cost g-358-22 already removed for the sidecar-covered JSONL
+        # kinds (~L577-600 above); this is the tree-shaped twin.
+        #
+        # Narrowing, not skipping, on failure: `record_bump` never raises and
+        # returns False for the keys it could not append, so the legacy RMW
+        # still runs for EXACTLY those — the cheap path must never lose a
+        # counter, since guard-731 reads this number to decide retirement.
+        # `TREE_RETRIEVAL_SPOOLED` defaults FALSE, so `keys_to_write` is the
+        # full list and behaviour is unchanged until the flag is set
+        # deliberately.
+        keys_to_write = matched_keys_to_bump
+        try:
+            import _tree_retrieval_spool as _trs
+            if _trs.spooled_enabled():
+                keys_to_write = [k for k in matched_keys_to_bump
+                                 if not _trs.record_bump(TREE_PATH, k, today)]
+        except Exception as _exc:  # noqa: BLE001 - fall back, never lose a bump
+            print("[retrieve] tree retrieval-spool bump unavailable, using "
+                  "legacy in-index write: {}".format(_exc), file=sys.stderr)
+            keys_to_write = matched_keys_to_bump
+
+        from _fileops import locked_modify_yaml
 
         def _bump_counters(data):
             data_nodes = (data or {}).get("nodes", {})
-            for k in matched_keys_to_bump:
+            for k in keys_to_write:
                 n = data_nodes.get(k)
                 if not n:
                     # Node may have been removed (PRUNE/RETIRE/MERGE) between
@@ -952,7 +1000,12 @@ def load_tree_nodes(categories, depth, read_only=False):
             data["last_updated"] = today
             return data
 
-        locked_modify_yaml(TREE_PATH, _bump_counters)
+        # Guarded, not early-returned: when every key spooled, `keys_to_write`
+        # is empty and the lock + whole-object PUT is skipped entirely — which
+        # is the whole point of the change. A second exit here would silently
+        # skip anything a later edit adds below.
+        if keys_to_write:
+            locked_modify_yaml(TREE_PATH, _bump_counters)
 
     return results, retrieval_channels_used
 

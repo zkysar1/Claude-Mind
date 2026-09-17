@@ -166,3 +166,68 @@ def test_a_repaired_carrier_classifies_benign_and_never_alive(tmp_path):
     assert ocr.ws.is_alerting(before) is True
     assert ocr.ws.is_alerting(after) is False
     assert after != ocr.ws.V_ALIVE
+
+
+# ---------------------------------------------------------------------------
+# The interval gate (, wiring unit). This gate can SKIP the repair,
+# so its failure directions are asymmetric and are tested as such: skipping a
+# needed pass reintroduces the never-runs defect the wiring exists to fix,
+# while an extra pass costs ~7 seconds. Every ambiguous input must therefore
+# resolve to RUN.
+# ---------------------------------------------------------------------------
+
+class _UnreadableMarker:
+    """A marker whose stat() raises, i.e. the disk answering badly."""
+
+    def exists(self):
+        return True
+
+    def stat(self):
+        raise OSError("simulated unreadable marker")
+
+
+def _marker(tmp_path, age_hours):
+    import os
+    import time
+    m = tmp_path / ".orphan-carrier-repair-last-run"
+    m.write_text("stamp\n", encoding="utf-8")
+    past = time.time() - age_hours * 3600.0
+    os.utime(m, (past, past))
+    return m
+
+
+def test_a_zero_window_never_skips_so_a_hand_run_is_always_ungated(tmp_path):
+    """The default. A manual invocation must never be silently swallowed by a
+    marker that some wired pass happened to leave behind."""
+    m = _marker(tmp_path, age_hours=0.0)
+    assert ocr.within_interval(m, 0.0, __import__("time").time()) is None
+
+
+def test_a_missing_marker_runs(tmp_path):
+    missing = tmp_path / "nope"
+    assert ocr.within_interval(missing, 6.0, __import__("time").time()) is None
+
+
+def test_a_pass_inside_the_window_skips_and_reports_its_age(tmp_path):
+    m = _marker(tmp_path, age_hours=2.0)
+    age = ocr.within_interval(m, 6.0, __import__("time").time())
+    assert age is not None and 1.9 < age < 2.1
+
+
+def test_a_pass_outside_the_window_runs(tmp_path):
+    m = _marker(tmp_path, age_hours=7.0)
+    assert ocr.within_interval(m, 6.0, __import__("time").time()) is None
+
+
+def test_the_boundary_runs_rather_than_skips(tmp_path):
+    """At exactly the window the gate must RUN. Ties go to doing the work."""
+    m = _marker(tmp_path, age_hours=6.0)
+    assert ocr.within_interval(m, 6.0, __import__("time").time()) is None
+
+
+def test_an_unreadable_marker_runs_rather_than_skipping():
+    """THE LOAD-BEARING DIRECTION. A disk that cannot answer must cost an extra
+    pass, never a skipped one -- a gate that fails closed would recreate the
+    zero-call-sites defect while looking healthy."""
+    assert ocr.within_interval(_UnreadableMarker(), 6.0,
+                               __import__("time").time()) is None

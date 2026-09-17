@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from _bash_helpers import BASH  # guard-580: never a bare "bash" argv[0]
 
@@ -77,7 +80,12 @@ def test_no_notify_hint_is_empty_on_notifying_harness_and_sized_otherwise():
     hint = hc.no_notify_hint(1800, {"ZAKCODE_MODEL": "x"})
     assert "delaySeconds=1860" in hint
     assert "<<autonomous-loop-dynamic>>" in hint
-    assert "END THE TURN" in hint and "no Skill(aspirations)" in hint
+    # The re-entry the hint forbids is named in the VESSEL's vocabulary (2026-09-17).
+    assert "END THE TURN" in hint and "no use_skill(aspirations)" in hint
+    assert "Skill(aspirations)" not in hint.replace("use_skill(aspirations)", "")
+    # Positive control: a no-notify CLAUDE CODE (override) keeps Claude Code's spelling.
+    cc_silent = hc.no_notify_hint(1800, {"CLAUDECODE": "1", "MIND_HARNESS_BG_NOTIFY": "0"})
+    assert "no Skill(aspirations)" in cc_silent and "ScheduleWakeup(" in cc_silent
     assert hint.endswith("\n")
     assert "delaySeconds=3600" in hc.no_notify_hint(7200, {})
 
@@ -271,7 +279,11 @@ def test_no_notify_hint_output_is_unchanged_by_the_wake_phrase_extraction():
     hc = _mod()
     zak = _clean_env(ZAKCODE_MODEL="x")
     text = hc.no_notify_hint(1200, zak)
-    assert "then arm ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\"" in text
+    # Since 2026-09-17 the arm is spelled in the vessel's vocabulary (schedule_wakeup
+    # on zakcode, ScheduleWakeup on Claude Code); the SHAPE around it is unchanged.
+    assert "then arm schedule_wakeup(prompt=\"<<autonomous-loop-dynamic>>\"" in text
+    cc_silent = hc.no_notify_hint(1200, _clean_env(CLAUDECODE="1", MIND_HARNESS_BG_NOTIFY="0"))
+    assert "then arm ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\"" in cc_silent
     assert text.endswith("(g-357-89, rb-9668).\n")
     assert "launch the sleep ONCE with a trailing &" in text
 
@@ -301,3 +313,214 @@ def test_every_directive_printer_routes_through_the_one_owner():
     sh = (SCRIPTS / "idle-tick.sh").read_text(encoding="utf-8")
     assert "--sleep-directive" in sh
     assert "run_in_background=true)" not in sh
+
+
+# ── Tool vocabulary (2026-09-17): the re-entry as the VESSEL spells it ────────
+#
+# Every terminal imperative (stop-hook BLOCK reason, ITERATION COMPLETE, the
+# recurring close, the state-mismatch landing, the PostToolUse reminder) named
+# Claude Code's tools -- Skill(aspirations) with args='loop', ScheduleWakeup(...).
+# Promoted to a zakcode vessel, a small model answered those names in prose for
+# hours. One owner for the spelling; these pin it per harness, the shell reach,
+# the fail-open defaults, and that no printing site re-grew a vocabulary.
+
+_CC, _ZAK, _UNK = {"CLAUDECODE": "1"}, {"ZAKCODE_SESSION": "x"}, {}
+_HC_KEYS = ("HC_HARNESS", "HC_SKILL_TOOL", "HC_WAKEUP_TOOL", "HC_LOOP_CALL", "HC_LOOP_REF",
+            "HC_LOOP_REF_Q", "HC_SPARK_REF", "HC_WORKER_REF", "HC_WORKER_CALL_Q", "HC_DEADMAN_ARM")
+
+
+def test_vocabulary_table_per_harness_and_unknown_never_guesses_a_vessel():
+    hc = _mod()
+    assert (hc.skill_tool(_CC), hc.wakeup_tool(_CC)) == ("Skill", "ScheduleWakeup")
+    assert (hc.skill_tool(_ZAK), hc.wakeup_tool(_ZAK)) == ("use_skill", "schedule_wakeup")
+    assert (hc.skill_tool(_UNK), hc.wakeup_tool(_UNK)) == ("Skill", "ScheduleWakeup")
+    assert hc.skill_tool({"ZAKCODE_MODEL": "m"}) == "use_skill"
+    assert hc.skill_tool({"CLAUDECODE": "1", "ZAKCODE_SESSION": "x"}) == "Skill"  # precedence
+
+
+def test_skill_call_keeps_both_claude_code_spellings_and_uses_the_vessels_schema():
+    hc = _mod()
+    assert hc.skill_call("aspirations", "loop", _CC) == "Skill(aspirations) with args='loop'"
+    assert hc.skill_call("aspirations", "loop", _CC, quoted=True) == "Skill('aspirations') with args='loop'"
+    assert hc.skill_call("worker-loop", env=_CC, quoted=True) == "Skill('worker-loop')"
+    assert hc.skill_call("aspirations-spark", env=_CC) == "Skill(aspirations-spark)" == hc.skill_ref("aspirations-spark", _CC)
+    assert hc.skill_call("aspirations", "loop", _ZAK) == "use_skill(name='aspirations', args='loop')"
+    assert hc.skill_call("aspirations", "loop", _ZAK, quoted=True) == "use_skill(name='aspirations', args='loop')"
+    assert hc.skill_call("worker-loop", env=_ZAK, quoted=True) == "use_skill(name='worker-loop')"
+    assert hc.skill_ref("aspirations", _ZAK) == "use_skill(aspirations)"
+
+
+def test_wakeup_call_differs_only_in_the_tool_name():
+    hc = _mod()
+    assert hc.wakeup_call(env=_CC) == "ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600)"
+    assert hc.wakeup_call(env=_ZAK) == "schedule_wakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600)"
+    assert hc.wakeup_call("check the deploy", 270, _ZAK, quote='"') == 'schedule_wakeup(prompt="check the deploy", delaySeconds=270)'
+    assert hc.wakeup_call(env=_UNK) == hc.wakeup_call(env=_CC)
+
+
+def test_hook_wakeup_is_armed_only_for_a_harness_that_honours_it():
+    hc = _mod()
+    assert hc.hook_wakeup(_CC) == {} and hc.hook_wakeup(_UNK) == {}
+    assert hc.hook_wakeup(_ZAK) == {"wakeup": {"prompt": "<<autonomous-loop-dynamic>>", "delay_seconds": 600}}
+
+
+def _source_vocab(env, path=None):
+    """Source _harness_vocab.sh (or a copy) under `env` and read the HC_* set back."""
+    vocab = (path or (SCRIPTS / "_harness_vocab.sh")).as_posix()
+    script = f'source "{vocab}"; for k in {" ".join(_HC_KEYS)}; do printf "%s\\n" "${{!k}}"; done'
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=env, cwd=str(REPO))
+    assert r.returncode == 0, r.stderr
+    return dict(zip(_HC_KEYS, r.stdout.split("\n")))
+
+
+@pytest.mark.parametrize("markers", [_CC, _ZAK, _UNK])
+def test_vocab_sh_round_trips_the_python_table_through_bash_eval(markers):
+    hc = _mod()
+    env = _clean_env(**markers)
+    assert _source_vocab(env) == hc.loop_vocab(env)
+
+
+def test_vocab_sh_fail_open_defaults_are_the_claude_code_spelling(tmp_path):
+    """A copy with no resolver beside it: the defaults must equal the module's
+    claude-code output byte for byte -- the two copies cannot drift silently."""
+    hc = _mod()
+    copy = tmp_path / "_harness_vocab.sh"
+    copy.write_bytes((SCRIPTS / "_harness_vocab.sh").read_bytes())
+    got = _source_vocab(_clean_env(**_ZAK), path=copy)  # a vessel env, and STILL Claude Code names
+    expected = dict(hc.loop_vocab(_clean_env(**_CC)), HC_HARNESS="unknown")
+    assert got == expected
+
+
+def test_vocab_sh_is_idempotent_and_the_second_source_is_free():
+    script = ('source core/scripts/_harness_vocab.sh; a="$HC_LOOP_CALL"; HC_LOOP_REF=sentinel; '
+              'source core/scripts/_harness_vocab.sh; printf "%s|%s" "$a" "$HC_LOOP_REF"')
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                       env=_clean_env(**_ZAK), cwd=str(REPO))
+    assert r.stdout == "use_skill(name='aspirations', args='loop')|sentinel", r
+
+
+def test_cli_skill_call_and_wakeup_call_follow_the_harness_and_guard_arity():
+    script = SCRIPTS / "harness-capabilities.sh"
+    zak, cc = _clean_env(**_ZAK), _clean_env(**_CC)
+    r = subprocess.run([BASH, str(script), "--skill-call", "aspirations", "loop"], capture_output=True, text=True, env=zak)
+    assert r.stdout.strip() == "use_skill(name='aspirations', args='loop')", r
+    r = subprocess.run([BASH, str(script), "--skill-call", "aspirations", "loop"], capture_output=True, text=True, env=cc)
+    assert r.stdout.strip() == "Skill(aspirations) with args='loop'", r
+    r = subprocess.run([BASH, str(script), "--wakeup-call"], capture_output=True, text=True, env=zak)
+    assert r.stdout.strip() == "schedule_wakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600)", r
+    r = subprocess.run([BASH, str(script), "--wakeup-call", "poll the run", "270"], capture_output=True, text=True, env=cc)
+    assert r.stdout.strip() == "ScheduleWakeup(prompt='poll the run', delaySeconds=270)", r
+    for bad in (["--skill-call"], ["--wakeup-call", "p", "not-a-number"], ["--wakeup-call", "a", "b", "c"]):
+        r = subprocess.run([BASH, str(script), *bad], capture_output=True, text=True, env=cc)
+        assert r.returncode == 2 and "usage:" in r.stderr, bad
+
+
+def test_the_existing_directive_owners_speak_the_vessels_vocabulary():
+    """_wake_arm_phrase / sleep_directive route through the same table, and the
+    Claude Code output is byte-identical to before (the _UNCAPPED_EXPECTED pin
+    above already holds the uncapped line; this holds the arm)."""
+    hc = _mod()
+    assert hc._wake_arm_phrase(1200, _clean_env(**_CC)).startswith(
+        'arm ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=1260) as the TERMINAL')
+    zak = hc._wake_arm_phrase(1200, _clean_env(**_ZAK))
+    assert zak.startswith('arm schedule_wakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=1260) as the TERMINAL')
+    assert "no use_skill(aspirations)" in zak and "Skill(aspirations)" not in zak.replace("use_skill(aspirations)", "")
+
+
+def test_every_terminal_imperative_site_routes_through_the_vocabulary():
+    """SHAPE PIN (same pattern as the sleep-directive owner pin above): if a
+    site re-grows a Claude Code literal, this fails."""
+    hook = (SCRIPTS / "stop-hook.sh").read_text(encoding="utf-8")
+    assert '_hc.skill_call("aspirations", "loop", quoted=True)' in hook
+    assert 'print(json.dumps({"decision": "block", "reason": reason, **_wakeup}))' in hook
+    assert '"$HC_WORKER_REF" "$HC_WORKER_CALL_Q" "$HC_LOOP_REF_Q"' in hook
+    assert "Your FIRST action MUST be: Skill('aspirations')" not in hook
+    close = (SCRIPTS / "iteration-close.sh").read_text(encoding="utf-8")
+    assert "Call $HC_LOOP_CALL as your VERY NEXT tool call" in close
+    assert "(1) $HC_DEADMAN_ARM" in close and "THEN (2) $HC_LOOP_CALL" in close
+    # two echo sites (worker / reducer NEXT lines); the comment above them also names it
+    assert close.count("invoke $HC_SPARK_REF") == 2
+    assert "ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600)" not in close
+    rec = (SCRIPTS / "recurring-close.sh").read_text(encoding="utf-8")
+    assert "(1) $HC_DEADMAN_ARM" in rec and "$HC_SKILL_TOOL ALONE keeps" in rec
+    assert rec.count("$HC_SPARK_REF FIRST") == 2 and "$HC_LOOP_CALL" in rec
+    assert "Skill(aspirations) with args='loop'" not in rec
+    landing = (SCRIPTS / "state-mismatch-landing.sh").read_text(encoding="utf-8")
+    assert "do NOT call $HC_LOOP_REF" in landing
+    reminder = (SCRIPTS / "iteration-close-reminder.py").read_text(encoding="utf-8")
+    assert '_hc.skill_call("aspirations", "loop")' in reminder
+    assert "Skill(aspirations) with args='loop'" not in reminder
+    assert 'ScheduleWakeup(prompt=' not in reminder
+    for name in ("stop-hook.sh", "iteration-close.sh", "recurring-close.sh", "state-mismatch-landing.sh"):
+        assert "_harness_vocab.sh" in (SCRIPTS / name).read_text(encoding="utf-8"), name
+
+
+def test_stop_hook_fallback_tuple_equals_the_modules_claude_code_output():
+    """The reducer payload's except-branch literals are the fail-open copy of the
+    module's claude-code spelling; pin them together so neither drifts alone."""
+    hc = _mod()
+    hook = (SCRIPTS / "stop-hook.sh").read_text(encoding="utf-8")
+    m = re.search(r'_loop_ref, _loop_call, _skill_tool, _wakeup = \(\n\s*"([^"]+)", "([^"]+)", "([^"]+)", \{\}\)', hook)
+    assert m, "fallback tuple not found in stop-hook.sh"
+    cc = _clean_env(**_CC)
+    assert m.groups() == (hc.skill_ref("aspirations", cc),
+                          hc.skill_call("aspirations", "loop", cc, quoted=True),
+                          hc.skill_tool(cc))
+    assert hc.hook_wakeup(cc) == {}
+
+
+_ITER_CLOSE_IMPERATIVE_START = 'source "$SCRIPT_DIR/_harness_vocab.sh"\n    if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then'
+_ITER_CLOSE_PRE_CHANGE_PAIR = (
+    "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be "
+    "EXACTLY these TWO batched tool calls, in this order — (1) ScheduleWakeup(prompt="
+    "'<<autonomous-loop-dynamic>>', delaySeconds=600) — the self-resurrection net; this call is "
+    "MANDATORY, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' — the primary "
+    "re-entry and the LAST call, which continues the loop NOW. Emitting Skill(aspirations) ALONE "
+    "keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death "
+    "— so arm the net EVERY iteration. Both calls, every time."
+)
+_ITER_CLOSE_PRE_CHANGE_BARE = (
+    "[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your "
+    "VERY NEXT tool call."
+)
+
+
+def _run_iteration_close_imperative(markers, deadman_disabled, tmp_path):
+    """EXECUTE iteration-close.sh's ITERATION COMPLETE conditional (extracted
+    verbatim, never re-typed) under a pinned harness env."""
+    src = (SCRIPTS / "iteration-close.sh").read_text(encoding="utf-8")
+    i = src.find(_ITER_CLOSE_IMPERATIVE_START)
+    assert i >= 0, "the productivity-check imperative block moved"
+    j = src.find("\n    fi\n", i)
+    block = src[i:j + len("\n    fi\n")]
+    agent_dir = tmp_path / f"agent-{'off' if deadman_disabled else 'on'}"
+    (agent_dir / "session").mkdir(parents=True, exist_ok=True)
+    if deadman_disabled:
+        (agent_dir / "session" / "deadman-disabled").write_text("")
+    script = f'SCRIPT_DIR={SCRIPTS.as_posix()!r}\nAGENT_DIR={agent_dir.as_posix()!r}\n' + block
+    r = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
+                       env=_clean_env(**markers), cwd=str(REPO))
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_iteration_close_imperative_is_byte_identical_on_claude_code(tmp_path):
+    """REGRESSION PIN for the live Claude Code fleet: the two ITERATION COMPLETE
+    lines (deadman on / off) are exactly what iteration-close.sh printed before
+    the vocabulary extraction."""
+    assert _run_iteration_close_imperative(_CC, False, tmp_path) == _ITER_CLOSE_PRE_CHANGE_PAIR + "\n"
+    assert _run_iteration_close_imperative(_CC, True, tmp_path) == _ITER_CLOSE_PRE_CHANGE_BARE + "\n"
+    # unknown harness: the same bytes -- a vessel is never guessed.
+    assert _run_iteration_close_imperative(_UNK, False, tmp_path) == _ITER_CLOSE_PRE_CHANGE_PAIR + "\n"
+
+
+def test_iteration_close_imperative_names_the_vessels_tools_on_zakcode(tmp_path):
+    """THE FIX, executed: on a zakcode vessel the same block names use_skill and
+    schedule_wakeup -- the tools in that model's own list -- and nothing else."""
+    pair = _run_iteration_close_imperative(_ZAK, False, tmp_path)
+    assert "(1) schedule_wakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600) — the self-resurrection net" in pair
+    assert "THEN (2) use_skill(name='aspirations', args='loop') — the primary re-entry" in pair
+    assert "Emitting use_skill(aspirations) ALONE keeps THIS iteration alive" in pair
+    assert "Skill(" not in pair.replace("use_skill(", "") and "ScheduleWakeup" not in pair
+    bare = _run_iteration_close_imperative(_ZAK, True, tmp_path)
+    assert bare == "[iteration-close] NEXT ACTION REQUIRED: Call use_skill(name='aspirations', args='loop') as your VERY NEXT tool call.\n"

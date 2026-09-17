@@ -90,7 +90,7 @@ GIT = shutil.which("git") or "git"
 GH = shutil.which("gh") or "gh"
 
 # A branch whose name embeds a goal id. Covers g-NNN-NN.. and asp-NNN.
-GOAL_ID_RE = re.compile(r"\b(g-\d{1,4}-\d{1,4}|asp-\d{1,4})\b")
+GOAL_ID_RE = re.compile(r"\b(g-\d{1,4}-\d{1,5}|asp-\d{1,4})\b")
 
 # Names that are never candidates for anything, in any lane.
 PROTECTED_BRANCHES = {"main", "master", "HEAD", "develop"}

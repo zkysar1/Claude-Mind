@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # IRREDUCIBLY LOCAL -- per-Bash-call latency budget / hook / session-state critical path. Keep local: never add MCP or remote-service indirection here (a localhost daemon hop, where already present, is the maximum).
-# StopFailure hook — crash recovery breadcrumb for context exhaustion
+# StopFailure hook — crash recovery breadcrumb for an API-error turn end
 #
-# Fires when the session cannot continue (context exhaustion, API error).
+# Fires when a turn ends on an API error (rate limit, overload, 5xx, auth,
+# billing, max_output_tokens, ...). NOT a context-window signal: the payload's
+# error.error_type is what gets recorded (see the crash-marker write below).
 # StopFailure is NOTIFICATION-ONLY: stdout and exit code are ignored.
 # Cannot block the stop — but can save state for the next session to detect.
 #
@@ -46,10 +48,20 @@ fi
 # stop-hook.sh:35.
 
 # --- Write crash marker ---
+# The StopFailure payload carries error.error_type (rate_limit | overloaded |
+# authentication_failed | server_error | max_output_tokens | billing_error |
+# invalid_request | ... | unknown). Until 2026-09-15 this line hardcoded the
+# literal `context_exhaustion` for EVERY StopFailure, so /boot announced
+# "context exhaustion detected" after a rate limit or a 500 -- a label the fleet
+# then repeated as a diagnosis. Record what the harness actually said. One
+# sanitized token, so the marker keeps its "<ts> <type> sid=<sid>" shape.
+ERR_TYPE=$(printf '%s' "$STDIN_JSON" | python3 -c "import sys,json; e=(json.load(sys.stdin).get('error') or {}); print(((e.get('error_type') if isinstance(e,dict) else '') or 'unknown'))" 2>/dev/null || echo "unknown")
+ERR_TYPE=${ERR_TYPE//[^A-Za-z0-9_-]/}
+[ -n "$ERR_TYPE" ] || ERR_TYPE=unknown
 if [ -n "$HOOK_AGENT" ]; then
     AGENT_SESSION_DIR="$(agent_dir "$HOOK_AGENT")/session"
     if [ -d "$AGENT_SESSION_DIR" ]; then
-        echo "$(date +%Y-%m-%dT%H:%M:%S) context_exhaustion sid=$HOOK_SID" > "$AGENT_SESSION_DIR/crash-marker"
+        echo "$(date +%Y-%m-%dT%H:%M:%S) $ERR_TYPE sid=$HOOK_SID" > "$AGENT_SESSION_DIR/crash-marker"
     fi
     # Best-effort insight capture
     printf '%s' "$STDIN_JSON" | MIND_AGENT="$HOOK_AGENT" python3 "$CORE_ROOT/scripts/capture-insights.py" 2>/dev/null || true

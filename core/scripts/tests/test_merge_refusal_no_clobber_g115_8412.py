@@ -26,6 +26,7 @@ machines, two cache roots, ONE shared S3 key. Sibling coverage
 (test_owncloud_sync_merge_lanes.py) drives the lanes on a FakeBackend and
 has no refusal-path test; this file is the real-backend refusal pin.
 """
+import os
 import sys
 from pathlib import Path
 
@@ -42,6 +43,13 @@ LOCKS = "zds-locks"
 SESSIONS = "zds-sessions"
 REGION = "us-east-2"
 ENV_ID = "ayoai-mind"
+# : sync_file now READS the per-box sync manifest (its baseline).
+# Two simulated machines must NOT share one RUNTIME_DIR, or B inherits A's
+# baseline for a key B never reconciled and the classifier sees "remote
+# unchanged since MY last sync" — a state no real box can be in (each box
+# has its own mind_api/state). One runtime dir per machine; _push switches
+# to the pushing machine's dir before each call.
+_RUNTIME: dict = {}
 
 NODE_REL = "knowledge/tree/system/g8412-two-writer-node.md"
 BASE = b"# Node\n\n## Section\nA line v1\n"
@@ -92,6 +100,7 @@ def _machine(cloud, machine_id):
         sessions_table=SESSIONS, root_map=[(world_root, "world")],
         machine_id=machine_id, region=REGION,
         s3=cloud["s3"], ddb=cloud["ddb"])
+    _RUNTIME[id(be)] = cloud["root"] / machine_id / "_owncloud_rt"
     return be, world_root
 
 
@@ -102,6 +111,7 @@ def _s3_body(cloud, be, path) -> bytes:
 
 def _push(be, path) -> tuple[int, dict]:
     from owncloud_sync import sync_file
+    os.environ["RUNTIME_DIR"] = str(_RUNTIME[id(be)])  # this machine's manifest
     stats: dict = {}
     rc = sync_file(be, path, dry_run=False, stats_out=stats)
     return rc, stats

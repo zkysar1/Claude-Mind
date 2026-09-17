@@ -470,7 +470,9 @@ def _maybe_tick_heartbeat(agent: str, sid: str, project_root: Path) -> None:
         pass
 
 
-def _maybe_surface_stop(agent: str, sid: str, project_root: Path) -> str:
+def _maybe_surface_stop(agent: str, sid: str, project_root: Path, *,
+                        worker_body: bool = False,
+                        binding_mode: "str | None" = None) -> str:
     """Surface a PENDING STOP at TOOL-CALL cadence (). Returns the
     advisory text, or "" when there is nothing to say.
 
@@ -503,10 +505,31 @@ def _maybe_surface_stop(agent: str, sid: str, project_root: Path) -> str:
     FIRST on every re-entry, so its detection latency is one turn rather than
     324s and there is no gap here to close.
 
+    IT NAMES THE HANDLER, NOT THE PHASE (g-373-16 R3). The text used to say "go
+    to Phase -1.4". Measured 2026-09-14 on dev vessel i-058c0073c76d79e18: the
+    stop was raised while the mind was still on /start's last page. It read that
+    sentence, declined to boot, and ended the turn with neither consolidation
+    nor handoff -- and Phase -1.4 is not reachable from inside /start.
+    Phase -1.4 does exactly one thing with the signal: it invokes
+    Skill(aspirations-graceful-stop). That skill needs no loop context, so
+    naming it gives /start, /boot and mid-iteration the same executable route.
+
+    SILENT FOR A SESSION THAT DOES NOT OWN THE AGENT-LEVEL STOP, because the
+    handler must never run there: a worker Body (`worker_body`, the forked-WM
+    predicate main() already computes; its own stop is the per-session file
+    above), and a reader/assistant session (`binding_mode`, which includes a
+    RUNNING-branch observer). An UNBOUND session (`binding_mode` None) still
+    hears it. On that same vessel the drive session's SID had NO binding at all,
+    so unbound is the population this route exists for (rb-9476). The residual,
+    stated: an unbound fleet terminal that names an agent in its command line
+    hears it too.
+
     Fail-open on every path, like every other clause in this hook.
     """
     try:
         if not agent:
+            return ""
+        if worker_body or (binding_mode or "").strip() in ("reader", "assistant"):
             return ""
         state_dir = _agent_dir(project_root, agent) / "session"
         if not (state_dir / "stop-requested").is_file():
@@ -538,14 +561,14 @@ def _maybe_surface_stop(agent: str, sid: str, project_root: Path) -> str:
             age_txt = "at an unreadable time"
         return (
             f"[stop-pending] `agents/{agent}/session/stop-requested` was set {age_txt} "
-            "and `stop-loop` is not set, so the stop has NOT yet been honored. This is "
-            "surfaced from the PreToolUse[Bash] hook because the loop reads that signal "
-            "at ONE gate (aspirations Phase -1.4) and you may not be near it -- measured "
-            "324s of detection latency on a live vessel against a 350s grace (g-373-16). "
-            "Finish the tool call in flight, then go to Phase -1.4 and complete the "
-            "in-flight obligations (consolidate + handoff) rather than starting new work. "
-            "Do NOT clear the signal yourself -- only /stop and Phase -1.4 may write "
-            "stop-loop (stop-hook-compliance.md rule 2)."
+            "and `stop-loop` is not set, so the stop has NOT yet been honored. Finish the "
+            "tool call in flight, then invoke Skill(aspirations-graceful-stop) -- the "
+            "handler aspirations Phase -1.4 calls. It works from anywhere, including "
+            "inside /start or /boot, so do not wait to reach the loop and do not start "
+            "/boot or new work first: it consolidates, writes the handoff and sets the "
+            "target mode. Do NOT clear the signal yourself -- only /stop and that handler "
+            "may write stop-loop (stop-hook-compliance.md rule 2). (PreToolUse[Bash] "
+            "hook, g-373-16.)"
         )
     except Exception:
         return ""
@@ -833,8 +856,12 @@ def main():
     if _agent_m:
         _maybe_tick_heartbeat(_agent_m.group(1), sid, project_root)
         # Pending-stop detection at the same cadence and for the same reason
-        # (). Computed here, emitted with the payload below.
-        _stop_advisory = _maybe_surface_stop(_agent_m.group(1), sid, project_root)
+        # (). Computed here, emitted with the payload below. Both role
+        # facts are ones this function already holds: no extra I/O ( R3).
+        _stop_advisory = _maybe_surface_stop(
+            _agent_m.group(1), sid, project_root,
+            worker_body=_body_state_dir is not None,
+            binding_mode=getattr(binding, "mode", None) if binding is not None else None)
 
     expected_prefix = (f'export PATH="{shim_path}:$PATH"; '
                        f'{agent_clause}{body_clause}{goal_clause}export MIND_SID={sid};')

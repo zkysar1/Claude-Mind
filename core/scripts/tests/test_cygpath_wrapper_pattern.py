@@ -23,6 +23,7 @@ Refs: g-115-892 (this fix), .claude/rules/no-python-cli-fallback.md
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 CORE_SCRIPTS = Path(__file__).resolve().parent.parent
@@ -70,8 +71,9 @@ def test_wrappers_use_cygpath_conversion() -> None:
         assert 'SCRIPT_DIR_NATIVE="$SCRIPT_DIR"' in src, (
             f"{wrapper}: missing Linux/macOS fallthrough"
         )
-        # exec must use the converted variable, NOT raw SCRIPT_DIR.
-        assert 'exec python3 "$SCRIPT_DIR_NATIVE/' in src, (
+        # exec must use the converted variable, NOT raw SCRIPT_DIR. Interpreter
+        # flags may sit between python3 and the path (run-scoped-suite.sh: -u).
+        assert re.search(r'exec python3(?: -\S+)* "\$SCRIPT_DIR_NATIVE/', src), (
             f"{wrapper}: exec must use $SCRIPT_DIR_NATIVE not raw $SCRIPT_DIR"
         )
         # Regression guard: no exec line may use the raw form.

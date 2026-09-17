@@ -122,9 +122,44 @@ def _iteration_banner_zone(section_lines):
     return None
 
 
+# Fallback only — the map is declared in obligation-schema.yaml `phase_aliases:`, shared
+# with obligation-audit.py so the two auditors cannot drift apart ().
+_PHASE_ALIASES_FALLBACK = {"state-update": "state", "learning-gate": "learn"}
+
+
+def _normalize_phase(phase, schema):
+    """Producer label -> schema key; TOTAL onto the vocabulary (rb-1915).
+
+    The journal writes `state-update` / `learning-gate`; the schema keys them `state` /
+    `learn`. Without this, `obligations.get(phase)` was None and the `unknown obligation
+    phase` arm below fired for EVERY claim on those two phases — never reading the
+    condition, never reading the runtime. An unmapped label passes through unchanged and
+    still fails that arm, so an unrecognised phase surfaces rather than being
+    rubber-stamped.
+    """
+    phase = (phase or "").strip()
+    aliases = ((schema or {}).get("phase_aliases") or {}) or _PHASE_ALIASES_FALLBACK
+    return aliases.get(phase, phase)
+
+
+def _normalize_condition(condition):
+    """Strip a TRAILING parenthetical from a claimed condition.
+
+    `condition not in allowed` is exact membership, so a claim naming the canonical token
+    AND recording what was done inline — the more informative claim — failed where a bare
+    token passed. The canonical tokens carry no parentheses of their own, so a claim
+    naming a genuinely different condition still fails.
+    """
+    cond = (condition or "").strip()
+    head, sep, _rest = cond.partition(" (")
+    return head.strip() if sep else cond
+
+
 def _validate_claim(phase, condition, schema, iter_outcome_class, claim_zone):
     """Returns (valid: bool, failure_reason: str|None)."""
     obligations = (schema or {}).get("obligations") or {}
+    phase = _normalize_phase(phase, schema)
+    condition = _normalize_condition(condition)
     spec = obligations.get(phase)
     if spec is None:
         return False, "unknown obligation phase"

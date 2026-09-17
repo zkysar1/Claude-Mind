@@ -268,6 +268,96 @@ stores:
     max_lines: 5000
     owner_goal: g-333-11
 
+  # ── : byte-derived caps for the DENSE board channels ──────────────
+  # The glob above caps every channel at 5000 LINES, but the write cost is BYTES
+  # (each post re-PUTs the whole object), and line density is a property of each
+  # channel's purpose, so one line cap is unevenly loose (guard-5993).
+  # MEASURED 2026-09-16 (bravo, hostname cc-05, uname -r 6.8.0-139-generic;
+  # local-mirror wc for density, board-read 7d counts for rate):
+  #   coordination    871 B/line  613 posts/day  5000 lines =  4.36 MB (glob)
+  #   general       1,054 B/line   11 posts/day  5000 lines =  5.27 MB (glob)
+  #   reasoning     1,458 B/line   11 posts/day  5000 lines =  7.29 MB (glob; ~1y to cap)
+  #   decisions     2,049 B/line   17 posts/day  5000 lines = 10.2 MB -> 2700 = 5.53 MB
+  #   findings      1,970 B/line  211 posts/day  5000 lines =  9.85 MB (derived 2800 = 5.52 MB, HELD)
+  # decisions at 2700 keeps ~159 days live, past the 720h grant scan.
+  #
+  # findings is NO LONGER HELD. The hold above was ARITHMETIC -- an EMPTY SET
+  # between OUT 3 (<= ~1.3x coordination at-cap) and OUT 4 (the 30d reader stays
+  # covered) -- and it was empty ONLY because reachable bytes were live-at-cap
+  # plus a FIXED 4 MiB archive tail.  removed that fixed term: the tail
+  # now STEPS BACK with the requested window under a ceiling of
+  # _ARCHIVE_TAIL_BYTES_DEFAULT * _ARCHIVE_TAIL_MAX_STEPS = 32 MiB
+  # (mind_api/src/endpoints/board.py:73-74, verified present at the origin/main
+  # blob; d7d3d544d0 is an ancestor of origin/main). Reader reach is therefore no
+  # longer a function of the live cap until the ceiling binds, and the empty set
+  # closes. NOT a hand-raised BOARD_ARCHIVE_TAIL_BYTES (guard-3560).
+  #
+  # RE-MEASURED 2026-09-17 (echo, hostname cc-03, uname -r 6.8.0-139-generic) on
+  # the STORE OF RECORD via backend-cat.sh, with reader reach read through
+  # board-read.sh itself rather than simulated, on a daemon started 03:30:16 --
+  # i.e. AFTER d7d3d544d0 (02:02:32), which is the precondition for the reach
+  # numbers below being about the extending tail at all (guard-6874):
+  #   findings      5,434 lines / 10,766,122 B = 1,981 B/line
+  #   coordination  5,082 lines /  4,422,955 B =   870 B/line   (spread 2.277x)
+  #   decisions       850 lines /  1,742,970 B = 2,050 B/line
+  #   reasoning     1,208 lines /  1,768,841 B = 1,464 B/line
+  #   general       1,663 lines /  1,751,334 B = 1,053 B/line
+  # OUT 3: coordination at 5000 = 4.35 MB, so the 1.3x bar allows findings
+  #   max_lines <= 2,854. At 2,800 findings is 5.55 MB = 1.275x. PASSES.
+  # OUT 4: reader reach TODAY, measured not modelled --
+  #   --since 30d -> 6,867 rec / 13,686,047 B / oldest 2026-08-18 = 30.0d
+  #   --since 60d -> 11,890 rec / 26,492,526 B / oldest 2026-07-19 = 60.0d
+  #   --since 90d -> 13,394 rec / 28,518,691 B / oldest 2026-06-19 = 90.0d
+  #   Lowering the live cap moves records from live to archive; it does not
+  #   delete them, and the same window costs the same bytes either way. At
+  #   cap 2,800 (live 5,546,800 B) the ARCHIVE must supply 7.8 MiB for 30d,
+  #   20.0 MiB for 60d, 21.9 MiB for 90d -- all under the 32 MiB ceiling.
+  #   POSITIVE CONTROL that the tail really walks that deep on this box, rather
+  #   than arithmetic alone: coordination --since 60d returned 31,131,640 B
+  #   against a 4,422,955 B live file, i.e. ~26.7 MB served from the archive --
+  #   deeper than the 21.9 MiB findings needs at 2,800. PASSES.
+  # Consumers whose windows this protects: fresh-eyes-review 2.3b (30d) and
+  # fresh-eyes-program 2.6b (60d). Both covered at 2,800.
+  #
+  # BOX CAVEAT, do not inherit these windows (guard-6879): the reach above holds
+  # on a daemon running d7d3d544d0 or later. A box that has pulled but not yet
+  # restarted its daemon still holds the pre- module and sees the fixed
+  # 4 MiB tail, where cap 2,800 gives a 30d reader ~21.4d until it restarts. The
+  # exposure is daemon-restart lag, not an open-ended regression: this config and
+  # that code travel in the SAME repo, so a box rotating findings at 2,800 is by
+  # construction a box that already has the extending-tail code on disk.
+  #
+  # Also, rotation did not hold on board channels:  measured 858 records
+  # in both the live file and the archive. The union-merge half of that is now
+  # closed (): world/board/*.jsonl resolve to merge_rotated_board_jsonl,
+  # which removes a rotated-out slice instead of merging it back. A rotation
+  # whose live drop FAILS after its archive append still leaves the same
+  # both-places signature, so a live/archive overlap is not by itself proof of
+  # a merge (guard-6871: a zero live/archive intersection is ambiguous too).
+  # sweep() applies EVERY matching entry in turn, so the tightest cap wins in any
+  # order, and an explicit cap looser than the glob's 5000 does nothing.
+  # Re-measure before retuning; rates drift (coordination was ~117 posts/day in the
+  # 2026-06-26 note above).
+  - path: world/board/decisions.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2700
+    owner_goal: g-358-66
+
+  # 2,800 is BYTE-DERIVED, not a round number: 5,546,800 B at 1,981 B/line =
+  # 1.275x coordination's 4.35 MB at the glob's 5000, just inside the 1.3x bar.
+  # Re-derive it from a fresh density before retuning -- density is a property of
+  # what the channel is FOR (long analysis writeups), so it drifts with usage,
+  # and the whole point of this entry is that the cap tracks BYTES, which is what
+  # own-cloud re-PUTs and egress actually charge for.
+  - path: world/board/findings.jsonl
+    enabled: true
+    mode: rotate
+    by: lines
+    max_lines: 2800
+    owner_goal: g-358-66
+
   # ── : the six recheck / auto-close sweep metrics logs ────────────
   # guard-586 violation, all six: neither of its two named branches is present
   # (no cleanup-stale-bindings.sh entry, no inline rotation at write time), and

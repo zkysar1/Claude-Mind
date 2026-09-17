@@ -271,6 +271,37 @@ def test_worker_branch_invokes_each_scoped_obligation(call):
     assert call in _worker_branch(), f"worker /stop branch no longer invokes: {call}"
 
 
+def test_summary_call_as_written_is_accepted_and_writes(tmp_path, monkeypatch):
+    """The call-site assertion above passed for five days while this step was INERT:
+    the branch passed `--reason worker-stop`, the writer's argparse `choices` did not
+    contain it, argparse exited 2 before any write, and `|| true` hid the rc
+    (g-306-477, measured live 2026-09-14 and re-probed 2026-09-16). A substring
+    cannot see that. So run the LITERAL flags from the skill line against the real
+    parser (guard-920), and require the FILE, because main() also returns 0 when it
+    writes nothing (an absent session dir is a silent no-op)."""
+    import shlex
+
+    branch = _worker_branch()
+    idx = branch.index("session-summary-write.sh")
+    line = branch[idx:branch.index("\n", idx)]
+    argv = shlex.split(line.split("||")[0].rstrip(" `"))[1:]
+    argv = [{"$MIND_SID": SID_WORKER, "<agent-name>": "alpha"}.get(a, a) for a in argv]
+
+    ssw = _load("session_summary_write", "session-summary-write.py")
+    monkeypatch.setattr(ssw, "_project_root", lambda: tmp_path)
+    session_dir = tmp_path / "agents" / "alpha" / "sessions" / SID_WORKER
+    session_dir.mkdir(parents=True)
+    try:
+        rc = ssw.main(argv)
+    except SystemExit as exc:  # argparse rejects a flag value by exiting 2
+        rc = exc.code
+    assert rc == 0, f"session-summary-write rejects the skill's own call: {argv}"
+    summary = session_dir / "session-summary.yaml"
+    assert summary.is_file(), f"the skill's call wrote no summary: {argv}"
+    reason = argv[argv.index("--reason") + 1]
+    assert f"ended_reason: {reason}\n" in summary.read_text(encoding="utf-8")
+
+
 def test_push_call_keeps_all_three_rate_limits_zeroed():
     """The three zeroes are one semantic unit — they convert a rate-limited batch
     decision into 'push whatever is ahead, now'. Dropping any one silently restores

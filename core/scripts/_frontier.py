@@ -44,8 +44,10 @@ from _fileops import _parse_jsonl_skip_corrupt  # noqa: E402
 FUNNEL_SIGNAL_PREFIX = "investigate:dependency-funnel-"
 
 # body-manifest.yaml `body_state` values that mean "this Body is done".
-# Mirrors stop-hook.sh's closed set (closed-pending-merge|merged|closed-stale).
-CLOSED_BODY_STATES = frozenset({"closed-pending-merge", "merged", "closed-stale"})
+# Mirrors stop-hook.sh's closed set
+# (closed-pending-merge|merged|closed-stale|closed-graceful).
+CLOSED_BODY_STATES = frozenset({"closed-pending-merge", "merged", "closed-stale",
+                                "closed-graceful"})
 ACTIVE_BODY_STATES = frozenset({"active", "parked"})
 
 _BODY_STATE_RE = re.compile(r"^body_state:\s*['\"]?([\w-]+)['\"]?\s*$", re.MULTILINE)
@@ -91,7 +93,12 @@ def load_goal_index(world_dir, agents_root_path) -> tuple[dict, list, dict]:
                     continue
                 stores.append((d.name, d / "aspirations-archive.jsonl", True))
                 stores.append((d.name, d / "aspirations.jsonl", False))
+    from _fresh_read import refresh_for_read
     for source, path, archived in stores:
+        if archived:
+            # The eager pull never re-pulls an archive. Refresh first, which
+            # also materializes a store-only one ().
+            refresh_for_read(path, label="frontier")
         if not path.exists():
             continue
         items, errors, _total = _parse_jsonl_skip_corrupt(path)

@@ -85,6 +85,26 @@ def test_pending_stop_is_surfaced_and_names_the_signal_age_and_obligation(tmp_pa
         "-1.4 may write stop-loop (stop-hook-compliance.md rule 2)")
 
 
+def test_the_route_names_the_handler_and_says_it_works_outside_the_loop(tmp_path):
+    """ R3. "Go to Phase -1.4" was the whole instruction, and a mind
+    still inside /start cannot reach Phase -1.4. Measured on dev vessel
+    i-058c0073c76d79e18: the mind read it on /start's last page, declined to
+    boot, and ended the turn with no consolidation and no handoff. The phase does
+    one thing with the signal -- it invokes the handler -- so the handler is what
+    the message must name, together with the fact that it needs no loop."""
+    sd = _session_dir(tmp_path)
+    (sd / "stop-requested").write_text("1", encoding="utf-8")
+
+    msg = bai._maybe_surface_stop(AGENT, "sid-route", tmp_path)
+
+    assert "Skill(aspirations-graceful-stop)" in msg, (
+        "the executable route must be named, not only the phase that calls it")
+    assert "/start" in msg and "/boot" in msg, (
+        "the message must say the route works from inside /start and /boot")
+    assert "go to Phase -1.4" not in msg, (
+        "the unreachable instruction is exactly what stranded the measured vessel")
+
+
 # --- the predicate: when it is SILENT (the load-bearing half) ---------------
 
 def test_no_stop_requested_is_silent(tmp_path):
@@ -118,6 +138,56 @@ def test_second_call_inside_the_interval_is_throttled(tmp_path):
         "is an unmet obligation, not a one-time notice")
 
 
+def test_a_worker_body_is_silent_while_the_same_stop_speaks_to_its_reducer(tmp_path):
+    """The agent-level signal belongs to the reducer. A worker Body must never be
+    told to run the graceful stop -- its own stop is sessions/<sid>/stop-requested,
+    read at worker-loop Phase -0-stop. The positive control uses the SAME signal
+    file, so the silence is the role and not a missing fixture (guard-4166)."""
+    sd = _session_dir(tmp_path)
+    (sd / "stop-requested").write_text("1", encoding="utf-8")
+
+    assert bai._maybe_surface_stop(AGENT, "sid-w", tmp_path, worker_body=True) == ""
+    assert bai._maybe_surface_stop(AGENT, "sid-r", tmp_path, worker_body=False), (
+        "control: the same pending stop must still reach a non-worker session")
+
+
+def test_reader_and_assistant_sessions_are_silent(tmp_path):
+    """An observer (the RUNNING-branch reader/assistant session) and an assistant
+    session hold no loop whose stop this is, and the handler refuses below
+    autonomous. Telling either to invoke it would misroute the runner's ending."""
+    sd = _session_dir(tmp_path)
+    (sd / "stop-requested").write_text("1", encoding="utf-8")
+
+    for mode in ("reader", "assistant", " assistant\n"):
+        assert bai._maybe_surface_stop(
+            AGENT, "sid-obs", tmp_path, binding_mode=mode) == "", mode
+    assert bai._maybe_surface_stop(AGENT, "sid-auto", tmp_path, binding_mode="autonomous"), (
+        "control: an autonomous binding owns the stop and must hear the route")
+
+
+def test_an_unbound_session_still_hears_the_route(tmp_path):
+    """THE POPULATION THIS ROUTE EXISTS FOR (rb-9476). On the measured vessel the
+    drive session's SID had NO binding.yaml, so binding_mode arrives None there.
+    A predicate that required a binding would be correct-looking and inert on the
+    one deployment that needed it."""
+    sd = _session_dir(tmp_path)
+    (sd / "stop-requested").write_text("1", encoding="utf-8")
+
+    msg = bai._maybe_surface_stop(AGENT, "sid-unbound", tmp_path, binding_mode=None)
+    assert "Skill(aspirations-graceful-stop)" in msg
+
+
+def test_a_silent_session_does_not_consume_the_throttle(tmp_path):
+    """A silenced call must not stamp: the stamp is per-SID, and a role that is
+    told nothing has nothing to rate-limit. Stamping would also make the silence
+    look like a throttle to anyone reading core/logs."""
+    sd = _session_dir(tmp_path)
+    (sd / "stop-requested").write_text("1", encoding="utf-8")
+
+    assert bai._maybe_surface_stop(AGENT, "sid-s", tmp_path, worker_body=True) == ""
+    assert not (tmp_path / "core" / "logs" / "stop-surface-hook" / "sid-s").exists()
+
+
 def test_missing_agent_is_silent(tmp_path):
     """The hook resolves the agent before calling this; an unresolved binding
     must not raise and must not guess an agent dir."""
@@ -137,13 +207,21 @@ def test_a_path_bearing_sid_cannot_escape_the_stamp_directory(tmp_path):
 
 # --- the payload wiring: it must REACH the model, and cost nothing ---------
 
-def _run_hook(monkeypatch, advisory: str) -> dict:
-    """Drive main() with a resolved binding; return the parsed stdout JSON."""
+def _run_hook(monkeypatch, advisory: str, binding=None, calls=None) -> dict:
+    """Drive main() with a resolved binding; return the parsed stdout JSON.
+    `calls`, when a list, records the keyword arguments main() hands the
+    predicate -- the role facts are only wired if main() actually passes them."""
+    binding = binding if binding is not None else SimpleNamespace(agent=AGENT)
+
+    def _fake_surface(a, s, p, **kw):
+        if calls is not None:
+            calls.append(kw)
+        return advisory
+
     monkeypatch.setattr(
-        bai, "resolve_binding_with_diagnostics",
-        lambda sid, root: (SimpleNamespace(agent=AGENT), None))
+        bai, "resolve_binding_with_diagnostics", lambda sid, root: (binding, None))
     monkeypatch.setattr(bai, "_maybe_tick_heartbeat", lambda a, s, p: None)
-    monkeypatch.setattr(bai, "_maybe_surface_stop", lambda a, s, p: advisory)
+    monkeypatch.setattr(bai, "_maybe_surface_stop", _fake_surface)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
         "session_id": "test-sid-stop-surface",
         "tool_name": "Bash",
@@ -189,6 +267,39 @@ def test_advisory_never_denies_and_never_costs_the_injection(monkeypatch):
     assert hs["updatedInput"]["command"].endswith("echo hi")
     assert hs["updatedInput"]["description"] == "d", "sibling tool_input keys survive"
     assert hs["updatedInput"]["timeout"] == 5000
+
+
+def test_main_hands_the_predicate_the_bindings_mode(monkeypatch):
+    """The role facts are wired only if main() actually passes them (guard-6374).
+    A predicate that reads a mode main() never supplies is green in its own tests
+    and still speaks to every observer session in production. The control is the
+    modeless binding: the kwarg must track the binding, not be a constant."""
+    calls = []
+    _run_hook(monkeypatch, "", binding=SimpleNamespace(agent=AGENT, mode="reader"),
+              calls=calls)
+    assert calls and calls[-1].get("binding_mode") == "reader"
+    assert calls[-1].get("worker_body") is False
+
+    _run_hook(monkeypatch, "", calls=calls)
+    assert calls[-1].get("binding_mode") is None, (
+        "control: a binding with no mode must arrive as None, the unbound route")
+
+
+def test_main_marks_a_forked_wm_session_as_a_worker_body(monkeypatch, tmp_path):
+    """The worker fact is the SAME forked-WM stat that exports BODY_ROLE=worker,
+    so the advisory and the store rails can never disagree about what a Body is.
+    The BODY_ROLE assertion is the control that the stat really classified it."""
+    monkeypatch.setattr(bai, "_agent_dir", lambda root, name: tmp_path / "agents" / name)
+    fork = (tmp_path / "agents" / AGENT / bai._SESSIONS_DIRNAME
+            / "test-sid-stop-surface" / "working-memory.yaml")
+    fork.parent.mkdir(parents=True)
+    fork.write_text("{}", encoding="utf-8")
+
+    calls = []
+    doc = _run_hook(monkeypatch, "", calls=calls)
+
+    assert calls and calls[-1].get("worker_body") is True
+    assert "BODY_ROLE=worker" in doc["hookSpecificOutput"]["updatedInput"]["command"]
 
 
 def test_without_an_advisory_the_payload_is_byte_for_byte_the_old_shape(monkeypatch):

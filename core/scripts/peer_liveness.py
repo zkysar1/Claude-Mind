@@ -52,6 +52,8 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+from _board_paths import channel_paths, live_name, segment_name  # noqa: E402  (reader seam, )
+
 DEFAULT_STALE_HOURS = 3.0
 STALE_HOURS_ENV = "AGENT_WATCHDOG_PEER_STALE_HOURS"
 
@@ -388,7 +390,20 @@ def read_diary_signal(agent: str, agents_root: Optional[Path] = None) -> dict:
 
 
 def read_board_signals(world_dir: Path, agents: Iterable[str]) -> Dict[str, dict]:
-    texts = {ch: _read_store_text(Path(world_dir) / "board" / f"{ch}.jsonl") for ch in BOARD_CHANNELS}
+    """Every file of each channel's live half, each read from the store ().
+
+    A segmented writer appends to `<channel>-<date>.jsonl`, so reading the base
+    file alone makes a peer that posts only there look silent. The base file and
+    today's segment are read by NAME: `channel_paths` lists only what is on local
+    disk, and a segment a peer minted since this box's last pull sweep is not
+    there yet. Keyed by file so each keeps its own provenance."""
+    board = Path(world_dir) / "board"
+    texts = {}
+    for ch in BOARD_CHANNELS:
+        names = {live_name(ch), segment_name(ch)}
+        names.update(p.name for p in channel_paths(board, ch, include_archive=False))
+        for name in sorted(names):
+            texts[name] = _read_store_text(board / name)
     return _board_signals_from_texts(texts, agents)
 
 

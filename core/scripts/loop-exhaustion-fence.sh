@@ -62,10 +62,24 @@ else
     PYRUN=(python3)
 fi
 
+# Budget zone: RECORDED in the reason, never decisive (module docstring and
+# _cause_note). Until 2026-09-15 this wrapper passed nothing, so every firing
+# printed "context budget zone: unrecorded" and readers filled the blank with
+# the module's NAME -- two agents (alpha 09-11, zeta 09-15) narrated "ran out
+# of context" over a verdict that had disclaimed exactly that. The sensor has an
+# independent writer (statusLine hook, guard-6255). Fail-open: an absent or
+# unparseable sensor file passes no flag and the reason says "unrecorded".
+BUDGET_ZONE="$("${PYRUN[@]}" -c \
+    "import json,sys;print((json.load(open(sys.argv[1],encoding='utf-8')).get('zone') or '').strip())" \
+    "$SESSION_DIR/context-budget.json" 2>/dev/null || true)"
+ZONE_ARGS=()
+[ -n "$BUDGET_ZONE" ] && ZONE_ARGS=(--budget-zone "$BUDGET_ZONE")
+
 VERDICT_JSON="$("${PYRUN[@]}" "$SCRIPT_DIR/loop_exhaustion_fence.py" \
     --sid "${HOOK_SID:-}" \
     --log "${HOOK_LOG:-}" \
     --diary "$SESSION_DIR/execution-diary.jsonl" \
+    ${ZONE_ARGS[@]+"${ZONE_ARGS[@]}"} \
     2>/dev/null || true)"
 [ -z "$VERDICT_JSON" ] && exit 0
 
@@ -80,7 +94,7 @@ case "$VERDICT" in
     # REGISTERED external-wait sleep (stop-hook Gate 2.6 ALLOWs a turn-end that
     # has one) instead of re-entering immediately.  Reversible by construction —
     # if room frees up, the next wake resumes the ordinary loop.
-    echo "LOOP-EXHAUSTION PAUSE: ${REASON}. Do NOT re-enter the loop immediately. End this turn on 'EXTERNAL_WAIT=1 bash core/scripts/interruptible-sleep.sh 600', which registers a background job so this turn-end is ALLOWed, then resume normally."
+    echo "LOOP-STALL PAUSE: ${REASON}. Do NOT re-enter the loop immediately. End this turn on 'EXTERNAL_WAIT=1 bash core/scripts/interruptible-sleep.sh 600', which registers a background job so this turn-end is ALLOWed, then resume normally."
     exit 1
     ;;
   stop)
@@ -95,7 +109,7 @@ case "$VERDICT" in
     printf '%s loop-exhaustion-fence stop agent=%s sid=%s verdict=%s\n' \
         "$(date +%Y-%m-%dT%H:%M:%S)" "$AGENT" "${HOOK_SID:-}" "$VERDICT_JSON" \
         >> "$SESSION_DIR/loop-exhaustion-fence.log" 2>/dev/null || true
-    echo "LOOP-EXHAUSTION STOP: ${REASON}. stop-requested is now SET (target mode: assistant). Your next action is the ordinary graceful stop at Phase -1.4 — complete in-flight obligations and stop. This was decided by a script gate, not by you."
+    echo "LOOP-STALL STOP: ${REASON}. stop-requested is now SET (target mode: assistant). Your next action is the ordinary graceful stop at Phase -1.4 — complete in-flight obligations and stop. This was decided by a script gate, not by you."
     exit 2
     ;;
   *)

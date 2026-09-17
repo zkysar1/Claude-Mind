@@ -351,80 +351,105 @@ def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hin
     return _assert
 
 
-def _assert_marker_placement_gate_denies() -> tuple[bool | None, str]:
-    """V-5: can marker-placement-gate.py still REFUSE anything?
+def _hook_gate_deny_assertion(script_name: str, payload: dict, what_permitted: str):
+    """ONE shape, two rows (V-5, V-7): a PreToolUse hook gate whose rc is 0 whether it
+    DENIES or APPROVES, so only the STDOUT DECISION can tell the two apart.
 
-    A DELIBERATELY PLAIN FUNCTION, NOT A SECOND FACTORY. _gate_trigger_assertion
-    above serves four rows because four gates share one shape; this gate is the
-    only hook-shaped one registered, so a factory here would be a single-use
-    abstraction (implementation-discipline rule 3). Make it a factory when a
-    SECOND hook gate is registered, not before.
+    THE SECOND HOOK GATE IS WHAT LICENSED THIS FACTORY, and that was this file's own
+    written instruction rather than a preference. The plain function this replaces
+    carried a docstring reading "A DELIBERATELY PLAIN FUNCTION, NOT A SECOND FACTORY
+    ... Make it a factory when a SECOND hook gate is registered, not before." V-7 is
+    that second gate, so the extraction is now the sanctioned move, and leaving two
+    near-identical plain functions side by side is the drift that instruction exists
+    to prevent (implementation-discipline rule 3 cuts BOTH ways).
 
-    WHY IT CANNOT REUSE _gate_trigger_assertion, measured rather than assumed
-    (alpha/cc-07 2026-09-13, all four cases driven in one pass):
-        must-deny payload          -> rc=0, 1242 stdout bytes, decision "deny"
-        marker carries an override -> rc=0, 0 stdout bytes
-        path out of scope          -> rc=0, 0 stdout bytes
-        path on the ALLOWLIST      -> rc=0, 0 stdout bytes
-    The rc is 0 in ALL FOUR. This is the PreToolUse contract, not a bug —
-    hook_helpers.emit_deny prints JSON and exits 0, so a non-zero rc would mean
-    the hook CRASHED. But it makes rc worthless as a liveness read, and the
-    sibling helper treats rc=1 as "still refuses": pointed at this gate it would
-    report DEAD on a perfectly healthy gate, every run. The discriminator is the
-    STDOUT DECISION, so that is what this asserts.
+    THE CONTRACT IS MEASURED PER GATE AND NEVER INHERITED — the third time this check
+    has changed the answer (V-5 stdout, V-6 rc, now V-7 stdout). Driven both ways for
+    schedule-wakeup-gate.py on alpha/cc-08 2026-09-13:
+        prompt "/aspirations loop"                -> rc=0, 1110 stdout bytes, decision "deny"
+        prompt "Parked worker Body: re-enter ..."  -> rc=0, 0 stdout bytes
+    and for marker-placement-gate.py the four-case table preserved in the V-5 factory
+    call below. rc=0 in EVERY case: hook_helpers.emit_deny prints JSON and exits 0, so
+    a non-zero rc means the hook CRASHED. Pointing the rc-shaped
+    _gate_trigger_assertion at either gate would report DEAD on a perfectly healthy
+    gate every single run — the always-ALARM twin of the defect this canary hunts.
 
-    WHY THIS GATE EARNED A ROW. It is a live Layer-B precommit-path gate
-    (skill-edit-precommit-gate.py calls it) whose refusal rests on the
-    IN_SCOPE_PATTERNS table, and NOTHING anywhere positive-controls it: measured
-    zero mentions across core/scripts/tests, core/tests/gates and mind_api/tests,
-    against a control query for a covered gate that returned one. Its structure is
-    the always-reports-clear shape in concentrated form — SEVEN early
-    approve_no_mutation() exits plus a bottom `except: sys.exit(0)` catch-all, so
-    every way it can fail, it fails toward allow, silently.
+    A NON-EMPTY BUT UNPARSEABLE STDOUT IS UNEVALUATABLE, NOT DEAD. This is a
+    deliberate narrowing of the plain function it replaces, which mapped a JSON error
+    to decision "" and thus to DEAD. A hook that prints something off-contract has
+    said NOTHING about whether it would deny; calling that "the gate now permits
+    everything" misnames one real defect as a different real defect and sends the
+    remedy reader to the wrong file. Same fail direction the sibling already takes for
+    an absent script and a crash.
 
-    The probe payload names a file that does not exist and is never written: a
-    PreToolUse hook only inspects the proposed write.
+    Uses sys.executable rather than the spec's literal `py -3`: these gates have no
+    .sh wrapper and the direct interpreter call avoids the shim/PATH surface, which is
+    the sibling factory's stated reason and keeps one invocation style in this file.
     """
-    path = SCRIPT_DIR / "marker-placement-gate.py"
-    if not path.is_file():
-        # ABSENT is unevaluatable, never DEAD — same reasoning as the sibling.
-        return None, f"marker-placement-gate.py absent at {path}"
-    probe_file = SCRIPT_DIR.parent / "config" / "conventions" / _CANARY_PROBE_NODE
-    payload = json.dumps({
-        "tool_name": "Write",
-        "tool_input": {
-            "file_path": probe_file.as_posix(),
-            # Split so this canary's own source never carries the literal token
-            # it probes for — otherwise the gate would refuse edits to THIS file
-            # and the instrument would block its own maintenance.
-            "content": "# signal-liveness canary probe\n\n" + _MARKER_TOKEN + " probe\n",
-        },
-    })
-    try:
-        rc, out, err = _probe([sys.executable, path.as_posix()], stdin_text=payload)
-    except Exception as exc:
-        return None, f"marker-placement-gate.py could not run: {exc}"
-    if rc != 0:
-        # A crash is a real defect but NOT this row's defect, and calling it DEAD
-        # would misname it. Unevaluatable, surfaced.
-        return None, (f"marker-placement-gate.py exited rc={rc} on the probe payload; "
-                      f"the PreToolUse contract is exit 0 always. {(err or out).strip()[:200]}")
-    decision = ""
-    if out.strip():
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            # ABSENT is unevaluatable, never DEAD — a merge-wedged box legitimately
+            # lacks a recently-added script, and alarming there would report a tree
+            # problem as a dead detector.
+            return None, f"{script_name} absent at {path}"
+        try:
+            rc, out, err = _probe([sys.executable, path.as_posix()],
+                                  stdin_text=json.dumps(payload))
+        except Exception as exc:
+            return None, f"{script_name} could not run: {exc}"
+        if rc != 0:
+            # A crash is a real defect but NOT this row's defect, and calling it DEAD
+            # would misname it. Unevaluatable, surfaced.
+            return None, (f"{script_name} exited rc={rc} on the probe payload; the "
+                          f"PreToolUse contract is exit 0 always. "
+                          f"{(err or out).strip()[:200]}")
+        if not out.strip():
+            return True, (
+                f"{script_name} returned NO deny — stdout was EMPTY — for a payload it "
+                f"exists to refuse. Every caller reads that as approval, so this gate "
+                f"now permits {what_permitted}."
+            )
         try:
             decision = (json.loads(out).get("hookSpecificOutput", {})
                         .get("permissionDecision", ""))
-        except Exception:
-            decision = ""
-    if decision == "deny":
-        return False, "marker-placement-gate.py still denies its must-deny payload"
-    return True, (
-        "marker-placement-gate.py returned NO deny for a write that puts "
-        f"{_MARKER_TOKEN!r} into an in-scope, non-allowlisted conventions file. "
-        "Every caller reads that as approval, so this gate now permits every "
-        f"marker placement it exists to refuse. stdout_bytes={len(out.strip())} "
-        f"decision={decision!r}"
-    )
+        except Exception as exc:
+            return None, (f"{script_name} printed {len(out.strip())} byte(s) that are not "
+                          f"the PreToolUse JSON contract ({exc}); whether it would deny "
+                          f"is unreadable from here, so this is unevaluatable.")
+        if decision == "deny":
+            return False, f"{script_name} still denies its must-deny payload"
+        return True, (
+            f"{script_name} returned decision={decision!r} instead of 'deny' for a "
+            f"payload it exists to refuse, so this gate now permits {what_permitted}. "
+            f"stdout_bytes={len(out.strip())}"
+        )
+    return _assert
+
+
+def _marker_placement_probe_payload() -> dict:
+    """V-5's must-deny payload, extracted so the registry row stays one readable line.
+
+    Called at registry-construction time, so the path is resolved from the real
+    SCRIPT_DIR once at import — which is correct because the factory checks the script
+    for absence BEFORE it ever reads the payload, so a test that repoints SCRIPT_DIR
+    returns unevaluatable without this path mattering. Stated rather than left implicit
+    because "built by a function" reads like lazy resolution and is not.
+
+    The payload names a file that does not exist and is never written: a PreToolUse
+    hook only inspects the PROPOSED write.
+    """
+    probe_file = SCRIPT_DIR.parent / "config" / "conventions" / _CANARY_PROBE_NODE
+    return {
+        "tool_name": "Write",
+        "tool_input": {
+            "file_path": probe_file.as_posix(),
+            # Split so this canary's own source never carries the literal token it
+            # probes for — otherwise the gate would refuse edits to THIS file and the
+            # instrument would block its own maintenance.
+            "content": "# signal-liveness canary probe\n\n" + _MARKER_TOKEN + " probe\n",
+        },
+    }
 
 
 SIGNALS: list[dict] = [
@@ -534,7 +559,28 @@ SIGNALS: list[dict] = [
         "name": "marker-placement-gate-deny-channel",
         "what": "marker-placement-gate.py, the Layer-B gate on domain-marker placement (inventory V-5)",
         "evidence": "stdout permissionDecision for a must-deny PreToolUse payload (the rc cannot tell)",
-        "assertion": _assert_marker_placement_gate_denies,
+        # FIRST use of the hook-shaped factory, and the reason it exists. The measured
+        # four-case table that put this row on stdout rather than rc, preserved from the
+        # plain function this replaced (alpha/cc-07 2026-09-13, all four driven in one
+        # pass) — it is the EVIDENCE for the contract choice and must not be lost in the
+        # move:
+        #     must-deny payload          -> rc=0, 1242 stdout bytes, decision "deny"
+        #     marker carries an override -> rc=0, 0 stdout bytes
+        #     path out of scope          -> rc=0, 0 stdout bytes
+        #     path on the ALLOWLIST      -> rc=0, 0 stdout bytes
+        # WHY THIS GATE EARNED A ROW: a live Layer-B precommit-path gate
+        # (skill-edit-precommit-gate.py calls it) whose refusal rests on the
+        # IN_SCOPE_PATTERNS table, and NOTHING anywhere positive-controls it — measured
+        # zero mentions across core/scripts/tests, core/tests/gates and mind_api/tests,
+        # against a control query for a covered gate that returned one. Its structure is
+        # the always-reports-clear shape in concentrated form: SEVEN early
+        # approve_no_mutation() exits plus a bottom `except: sys.exit(0)` catch-all, so
+        # every way it can fail, it fails toward allow, silently.
+        "assertion": _hook_gate_deny_assertion(
+            "marker-placement-gate.py",
+            _marker_placement_probe_payload(),
+            "every marker placement it exists to refuse",
+        ),
         "remedy": (
             "An empty stdout means the gate approved a placement it exists to refuse. Check "
             "IN_SCOPE_PATTERNS first (a path-shape drift silently takes every file out of "
@@ -577,6 +623,43 @@ SIGNALS: list[dict] = [
             "usage error that also exits 1 would read as healthy: if this row never goes "
             "DEAD across a corpus change you expected it to catch, check the invocation "
             "before trusting the green."
+        ),
+    },
+    {
+        "name": "schedule-wakeup-gate-deny-channel",
+        "what": (
+            "schedule-wakeup-gate.py, the PreToolUse gate on ScheduleWakeup prompts "
+            "(inventory V-7)"
+        ),
+        "evidence": "stdout permissionDecision for a must-deny prompt (the rc cannot tell)",
+        # SECOND hook-shaped row, and the one that licensed the factory above. It earns a
+        # row on the same argument V-5 did: its refusal is the ONLY thing standing between
+        # the loop and two measured loop-killers — a slash-prefix prompt that fires as USER
+        # input and is rejected at the user-invocable gate (the 2026-05-18 origin incident),
+        # and a `stop: true` cancel of the deadman net on a RUNNING agent, which converts a
+        # recoverable text-death into a hard stop needing a human. It is also the gate EVERY
+        # worker turn in this fleet passes through, since the worker net arms a
+        # natural-language prompt THROUGH it.
+        #
+        # THE OTHER REFUSAL IS DELIBERATELY NOT THE PROBE. The stop:true-while-RUNNING
+        # branch depends on live agent-state, so it cannot be a deterministic canary input —
+        # a row whose verdict moves with the box's own state is the always-ALARM twin of
+        # this defect. One row, one argument-driven predicate.
+        "assertion": _hook_gate_deny_assertion(
+            "schedule-wakeup-gate.py",
+            {"tool_name": "ScheduleWakeup",
+             "tool_input": {"prompt": "/aspirations loop", "delaySeconds": 600}},
+            "every slash-prefix prompt it exists to refuse",
+        ),
+        "remedy": (
+            "An empty stdout means the gate would now APPROVE a slash-prefix prompt it "
+            "exists to refuse, which re-arms the 2026-05-18 loop-killer: the prompt fires as "
+            "user input and the slash-command resolver rejects it, burning the turn the loop "
+            "needed to continue. Check _swakeup_predicate.py FIRST — it is the SSOT shared "
+            "with the Layer-C detective aspirations-rejection-audit.py, so one predicate "
+            "drift kills BOTH layers at once and neither says so. Then check whether the "
+            "payload keys this gate reads (tool_name / tool_input.prompt) still match what "
+            "the harness sends. Do NOT read rc: this hook exits 0 on deny AND on approve."
         ),
     },
 ]

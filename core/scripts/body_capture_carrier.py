@@ -63,6 +63,15 @@ reconciliation state. The residual is the LAST entry before a Body goes quiet:
 if its push failed, that entry reaches the reducer only via the close-time full
 merge. It loses the acceleration; it is never lost.
 
+THE KEY HAS TWO WRITERS, SO A LOST RACE IS RETRIED IN PLACE (g-115-9852). The
+daemon's own sync sweep mirrors `world/` and `body-carriers` is not excluded, so
+this push races the sweep for the same key. Measured on cc-09 (2026-09-14): the
+daemon log held both race shapes, `ConflictError` (412, a fence gone stale
+underneath) and a raw `ConditionalRequestConflict` (409, two conditional PUTs in
+flight). Waiting for the next append leaves the newest entry undelivered for as
+long as the Body stays quiet, so `push` retries a lost race — and ONLY a lost
+race — on a fresh fence. See `push`.
+
 BEST-EFFORT BY CONTRACT. Every function here swallows its own failures and
 returns a falsy value. This sits on the `wm append` hot path, and a carrier
 problem must never fail the working-memory write that produced it — the WM is
@@ -72,7 +81,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import random
 import sys
+import time
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -99,6 +110,24 @@ def _bm():
         "body_manifest", SCRIPT_DIR / "body-manifest.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["body_manifest"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _body_merge():
+    """body-merge.py — the owner of `_content_hash` and `_read_staged_bytes`.
+
+    Same lazy, cached shape as `_bm()`. Raises on a load failure, because its
+    two callers need different fallbacks: `read_carriers` returns what it has so
+    far, and `verify_delivery` reports that it could not check.
+    """
+    cached = sys.modules.get("body_merge")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(
+        "body_merge", SCRIPT_DIR / "body-merge.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["body_merge"] = mod
     spec.loader.exec_module(mod)
     return mod
 
@@ -248,12 +277,75 @@ def record_local(wm_path, slot: str, item, world_dir=None) -> Path | None:
 
 _PUSH_FAILURE_REPORTED = False
 
+# : the plain PUT plus up to three re-fenced PUTs. Worst case adds
+# ~1.75 s of backoff to an append that is already losing races, against the
+# wrapper's 90 s request timeout; the common (winning) path adds nothing.
+_CONFLICT_ATTEMPTS = 4
+_CONFLICT_BACKOFF_BASE_S = 0.25
+
+
+def _conflict_backoff(attempt: int) -> float:
+    """Full-jitter backoff (seconds) before re-fenced attempt `attempt` (0-based).
+
+    Full jitter, like `owncloud_backend._conflict_backoff`, because the other
+    writer is a sweep that PUTs on its own cadence: a fixed delay can re-collide
+    with it in lockstep, a uniform draw decorrelates.
+    """
+    return random.uniform(0.0, _CONFLICT_BACKOFF_BASE_S * (2 ** attempt))
+
+
+def _lost_race(be, exc) -> bool:
+    """True when `exc` says another writer won this key, and never otherwise.
+
+    Two shapes. The backend's own `conflict_error` — the 412 `OwnCloudBackend
+    ._put` raises for a stale If-Match (an empty tuple on LocalBackend, which
+    matches nothing). And S3's 409 `ConditionalRequestConflict`, which `_put`
+    leaves unmapped, so it arrives as a raw ClientError. Anything else — a
+    transport error, a permission gap, the structural NoClaimError — is not a
+    race, and retrying it would only delay the report.
+    """
+    conflict = getattr(be, "conflict_error", ())
+    if conflict and isinstance(exc, conflict):
+        return True
+    response = getattr(exc, "response", None)
+    return (isinstance(response, dict)
+            and (response.get("Error") or {}).get("Code")
+            == "ConditionalRequestConflict")
+
+
+def _put_whole_carrier(be, p: Path, attempt: int) -> None:
+    """One PUT of the current local carrier. Attempt 0 uses the fence this
+    process already holds; a retry re-HEADs and fences on what it just read.
+
+    The retry cannot reuse the old fence: that fence is exactly what went stale,
+    and re-PUTting on it 412s deterministically (rb-2639, guard-908).
+    `stat` + `mirror_put(expected_version=)` is the sync sweep's own
+    local->store mirror primitive, so a retry adds no new write shape — and it
+    never downloads, so the local carrier (the only copy of an undelivered line)
+    is never overwritten by an older remote. Backends without those two (they
+    are own-cloud-only, not on the Protocol) retry the plain PUT.
+    """
+    data = p.read_bytes()
+    stat = getattr(be, "stat", None)
+    mirror_put = getattr(be, "mirror_put", None)
+    if attempt == 0 or stat is None or mirror_put is None:
+        be.write_bytes(p, data)
+        return
+    st = stat(p)
+    mirror_put(p, data, expected_version=st.version if st is not None else None)
+
 
 def push(path) -> bool:
     """Push the WHOLE carrier to the authoritative store. Never raises.
 
     Whole-file rather than delta: see the module docstring. This is what makes a
     failed push self-repairing instead of requiring a retry queue.
+
+    A LOST RACE IS RETRIED, bounded and jittered, on a fresh fence (g-115-9852).
+    Each retry re-reads the local carrier, so an append that lands during the
+    backoff rides along. A conflict that survives every attempt is not a race any
+    more, it is a wedge — the report names the attempt count so the two can be
+    told apart (guard-908's persistence discriminator).
 
     A FAILURE IS REPORTED ONCE PER PROCESS, and the never-raises contract is
     unchanged (g-306-420). This except used to discard the cause entirely, so a
@@ -278,23 +370,34 @@ def push(path) -> bool:
     global _PUSH_FAILURE_REPORTED
     if path is None:
         return False
+    attempts = 0
     try:
         from storage_backend import get_backend
         be = get_backend()
         p = Path(path)
-        be.write_bytes(p, p.read_bytes())
-        return True
+        for attempt in range(_CONFLICT_ATTEMPTS):
+            if attempt:
+                time.sleep(_conflict_backoff(attempt - 1))
+            attempts = attempt + 1
+            try:
+                _put_whole_carrier(be, p, attempt)
+                return True
+            except Exception as exc:  # noqa: BLE001 — a lost race retries, the rest is reported below
+                if attempts == _CONFLICT_ATTEMPTS or not _lost_race(be, exc):
+                    raise
     except Exception as exc:  # noqa: BLE001 — transport must never fail a WM append
         if not _PUSH_FAILURE_REPORTED:
             _PUSH_FAILURE_REPORTED = True
             try:
                 sys.stderr.write(
-                    "[body-capture-carrier] push FAILED (%s: %s) — capture "
-                    "entries are accumulating in the local carrier and are NOT "
-                    "reaching the reducer. Reported once per process; further "
-                    "failures are silent. A NoClaimError here is STRUCTURAL, "
-                    "not transient (g-306-420).\n"
-                    % (type(exc).__name__, exc)
+                    "[body-capture-carrier] push FAILED (%s: %s) after %d "
+                    "attempt(s) — capture entries are accumulating in the local "
+                    "carrier and are NOT reaching the reducer. Reported once per "
+                    "process; further failures are silent. A NoClaimError here is "
+                    "STRUCTURAL, not transient (g-306-420); a lost race is retried "
+                    "on a fresh fence, so a conflict that survived %d attempts is "
+                    "a WEDGE, not a race (g-115-9852).\n"
+                    % (type(exc).__name__, exc, attempts, _CONFLICT_ATTEMPTS)
                 )
             except Exception:  # noqa: BLE001 — reporting must never fail the push
                 pass
@@ -398,16 +501,10 @@ def read_carriers(state_dir, backend, world_dir=None) -> dict:
     except Exception:  # noqa: BLE001
         return out
 
-    bmg = sys.modules.get("body_merge")
-    if bmg is None:
-        try:
-            spec = importlib.util.spec_from_file_location(
-                "body_merge", SCRIPT_DIR / "body-merge.py")
-            bmg = importlib.util.module_from_spec(spec)
-            sys.modules["body_merge"] = bmg
-            spec.loader.exec_module(bmg)
-        except Exception:  # noqa: BLE001
-            return out
+    try:
+        bmg = _body_merge()
+    except Exception:  # noqa: BLE001
+        return out
 
     for cdir, name in [(d, n) for d in cdirs
                        for n in _iter_carrier_names(d, backend)]:
@@ -439,3 +536,140 @@ def read_carriers(state_dir, backend, world_dir=None) -> dict:
                 continue
             out.setdefault(unit_key, {}).setdefault(slot, []).append(entry)
     return out
+
+
+def _carrier_pairs(raw: bytes, unit_key: str, content_hash) -> set:
+    """{(slot, content hash)} for one Body's rows in a carrier's bytes.
+
+    Malformed lines and other units' rows are skipped, as in `read_carriers`.
+    """
+    pairs: set = set()
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(rec, dict) and rec.get("unit_key") == unit_key
+                and isinstance(rec.get("entry"), dict)):
+            pairs.add((rec.get("slot"), content_hash(rec["entry"])))
+    return pairs
+
+
+def verify_delivery(wm_path, backend=None, world_dir=None) -> "tuple[str, str]":
+    """Is every capture THIS Body flagged present in the STORE copy of its carrier?
+
+    (g-115-9852 outcome 3.) `push()` returning True means only that the store
+    write returned without raising: an attempt, not a delivery. This function
+    reads the store back. worker-loop Phase 3.7 calls it once per work unit,
+    after the capture lanes have appended, so the unit that wedged the lane is
+    the one that gets told.
+
+    Returns (verdict, detail):
+      "n/a"          not a forked Body WM, or nothing flagged since the fork
+      "delivered"    every capture flagged since the fork is in the store copy
+      "undelivered"  at least one is absent, or the store holds no carrier
+      "unverified"   the check could not run; never an all-clear (guard-1760)
+
+    Three choices shape the answer.
+
+    It compares CONTENT, never mtime or bytes. The local carrier is written
+    whether or not the push lands, and it can be refreshed from a stale store
+    copy, so its mtime proves nothing. A size or ETag comparison with the store
+    can show DRIFT on identical content (guard-2245). So the store copy is read
+    through `read_authoritative_bytes`, which decodes, and entries are matched on
+    `body-merge._content_hash`, the identity the consumer dedups on.
+
+    It subtracts the fork BASELINE. A Body's WM starts as a byte copy of the
+    agent-wide WM, flagged entries included, and none of those were this Body's
+    to carry. Measured on cc-09 (2026-09-14): 1,395 flagged entries in one Body's
+    WM, 1,245 of them inherited. Without the subtraction, a healthy carrier
+    reports 1,245 missing. With no baseline the two populations cannot be told
+    apart, so the verdict is "unverified", not a guess.
+
+    On a miss, the detail says how many of the missing entries the LOCAL carrier
+    holds. If it holds them, the push is failing. If it does not, the local file
+    lost them as well, and no later push can deliver them.
+
+    Never raises. Why a per-unit check and not a per-append read-back:
+    core/config/rationale/capture-carrier-delivery-check.md
+    """
+    try:
+        # Load body-manifest FIRST: split_body_wm_path swallows a load failure
+        # as "not a Body", which would turn a broken check into an n/a.
+        bm = _bm()
+        agent_dir, unit_key = split_body_wm_path(wm_path)
+        if agent_dir is None:
+            return "n/a", (f"{wm_path} is not a forked Body WM; the reducer's "
+                           "own WM has no carrier")
+        wm_path = Path(wm_path)
+        baseline = wm_path.parent / bm._BASELINE_FILENAME
+        if not wm_path.is_file():
+            return "unverified", f"no Body WM at {wm_path}"
+        if not baseline.is_file():
+            return "unverified", (
+                f"no fork baseline at {baseline}, so the captures this Body "
+                "flagged cannot be told apart from the ones it inherited")
+        import yaml
+        bmg = _body_merge()
+        loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+        def _captures(path: Path, flagged_only: bool) -> set:
+            data = yaml.load(path.read_text(encoding="utf-8"), Loader=loader)
+            slots = data.get("slots") if isinstance(data, dict) else None
+            found: set = set()
+            for slot in bmg.wm.CAPTURE_SLOTS:
+                arr = slots.get(slot) if isinstance(slots, dict) else None
+                for e in arr if isinstance(arr, list) else ():
+                    if isinstance(e, dict) and (e.get("load_bearing")
+                                                or not flagged_only):
+                        found.add((slot, bmg._content_hash(e)))
+            return found
+
+        inherited = _captures(baseline, flagged_only=False)
+        own = [k for k in _captures(wm_path, flagged_only=True)
+               if k not in inherited]
+        if not own:
+            return "n/a", ("nothing flagged since the fork; the carrier holds "
+                           "flagged captures only (guard-6181)")
+        path = carrier_path(agent_dir, unit_key, world_dir).resolve()
+        if backend is None:
+            from storage_backend import get_backend
+            backend = get_backend()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — a check that cannot run says so
+        return "unverified", (f"could not read this Body's captures "
+                              f"({type(exc).__name__}: {exc})")
+
+    try:
+        raw = backend.read_authoritative_bytes(path)
+    except FileNotFoundError:
+        raw = None
+    except Exception as exc:  # noqa: BLE001
+        return "unverified", (f"store read of {path.name} failed "
+                              f"({type(exc).__name__}: {exc})")
+
+    stored = (_carrier_pairs(raw, unit_key, bmg._content_hash)
+              if raw is not None else set())
+    missing = [k for k in own if k not in stored]
+    if not missing:
+        return "delivered", (f"all {len(own)} capture(s) flagged since the fork "
+                             f"are in the store copy of {path.name}")
+    try:
+        local = (_carrier_pairs(path.read_bytes(), unit_key, bmg._content_hash)
+                 if path.is_file() else set())
+    except OSError:
+        local = set()
+    by_slot: dict = {}
+    for slot, _h in missing:
+        by_slot[slot] = by_slot.get(slot, 0) + 1
+    if raw is None:
+        head = (f"the store holds NO carrier at {path}, so all {len(missing)} "
+                f"capture(s) flagged since the fork are undelivered")
+    else:
+        head = (f"{len(missing)} of {len(own)} capture(s) flagged since the fork "
+                f"are absent from the store copy of {path.name}")
+    return "undelivered", (
+        f"{head} ({', '.join(f'{s}={n}' for s, n in sorted(by_slot.items()))}); "
+        f"the local carrier holds {sum(1 for k in missing if k in local)} of them")

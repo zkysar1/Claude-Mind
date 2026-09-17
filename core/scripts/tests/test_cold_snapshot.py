@@ -388,3 +388,46 @@ def test_main_refuses_before_reading_or_uploading_anything(tmp_path, monkeypatch
     body = json.loads(out)
     assert body["verdict"] == "refused-colocated"
     assert body["target"]["mode"] == "refused"
+
+
+def test_archive_marker_matches_gate_firings_segments():
+    """: the marker is the STEM, so DATE SEGMENTS are excluded too.
+
+    `_ARCHIVE_MARKERS` read `gate-firings.jsonl` and matches by SUBSTRING. Once
+    GATE_FIRINGS_SEGMENTED flipped the writer to
+    `gate-firings-YYYY-MM-DD.jsonl` (`_gate_log.segment_name`), that literal
+    stopped matching the files the store actually grows, so every segment was
+    INCLUDED in every snapshot — ~1 MB/day of the exact audit tail the marker
+    exists to exclude (31 segments / 88 MB measured on cc-03, 2026-09-16).
+
+    The segment case is the regression pin. The rest are the blast radius: the
+    sibling store `trigger-firings.jsonl` and every ordinary store must stay
+    INCLUDED, or widening this marker would silently drop live data from the
+    backup — the one direction a snapshot must never fail in.
+    """
+    # Excluded: the legacy file, every date segment, and the machine-local
+    # spool pair (not part of the shared store — `_gate_log.firings_paths`
+    # excludes them for the same reason).
+    for name in (
+        "gate-firings.jsonl",
+        "gate-firings-2026-08-17.jsonl",
+        "gate-firings-2026-09-04.jsonl",
+        "meta/gate-firings-2026-09-04.jsonl",
+        "gate-firings.spool.jsonl",
+        "gate-firings.spool.last-flush",
+        "changelog-archive.jsonl",
+    ):
+        assert cs._is_archive(name) is True, name
+
+    # Included: the sibling firings store and the ordinary live stores. A
+    # substring marker is exactly the shape that over-matches, so this half is
+    # not decoration.
+    for name in (
+        "trigger-firings.jsonl",
+        "changelog.jsonl",
+        "aspirations.jsonl",
+        "reasoning-bank.jsonl",
+        "guardrails.jsonl",
+        "pipeline.jsonl",
+    ):
+        assert cs._is_archive(name) is False, name

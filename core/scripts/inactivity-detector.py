@@ -114,7 +114,11 @@ def _latest_goal_completion() -> tuple[datetime | None, str | None]:
     """
     latest_dt = None
     latest_id = None
+    from _fresh_read import refresh_for_read
     for path in _iter_files():
+        if path.name == "aspirations-archive.jsonl":
+            # The eager pull never re-pulls an archive ().
+            refresh_for_read(path, label="inactivity-detector")
         if not path.exists():
             continue
         with open(path, "r", encoding="utf-8") as f:

@@ -35,6 +35,11 @@ from collections import Counter
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
+# : board channels are enumerated through the reader seam, never by
+# hardcoding one filename per channel -- a citation audit that misses a segment
+# under-reports, and an under-report here reads exactly like a clean audit.
+from _board_paths import channel_paths
+
 TEXT_KEYS = ("rule", "title", "content", "text", "summary", "description",
              "failure_lesson", "name")
 # An id claimed by >=SENTINEL_MIN_CLAIMS distinct records is a template default
@@ -47,6 +52,14 @@ UNRELATED_SIM = 0.25
 # A never-displaced id that MUST be found, or the citation regex is broken and
 # every zero below is meaningless (guard-2298: never trust an unverified zero).
 CONTROL_ID = "guard-321"
+# The archives of the only stores the collision-reid merge re-keys
+# (coordination_merge merge_reasoning_bank / merge_guardrails /
+# merge_pattern_signatures). Only these can hold a displaced record or the
+# record now at its old id, so only these are refreshed before the scan. The
+# other world/meta archives (changelog, board, pipeline, aspirations: 237 MB
+# measured on cc-05) carry neither ().
+REID_ARCHIVES = ("reasoning-bank-archive.jsonl", "guardrails-archive.jsonl",
+                 "pattern-signatures-archive.jsonl")
 
 
 def _roots():
@@ -79,12 +92,16 @@ def _sim(a: str, b: str) -> float:
 
 def collect(world, meta):
     """-> (pairs, occupancy, stats). Streams; never loads a store whole."""
+    from _fresh_read import refresh_for_read  # noqa: PLC0415
     pairs, occ = [], {}
     n_rec = n_byte = 0
     for root in (world, meta):
         for p in sorted(root.rglob("*.jsonl")):
             if _skip(p):
                 continue
+            if p.name in REID_ARCHIVES:
+                # The eager pull never re-pulls an archive ().
+                refresh_for_read(p, label="displaced-id-audit")
             try:
                 n_byte += p.stat().st_size
             except OSError:
@@ -129,12 +146,19 @@ def surfaces(world, repo):
     if claude_md.is_file():
         yield "CLAUDE.md", claude_md
     for name in ("guardrails.jsonl", "reasoning-bank.jsonl",
-                 "aspirations.jsonl", "pipeline.jsonl",
-                 "board/findings.jsonl", "board/coordination.jsonl",
-                 "board/general.jsonl"):
+                 "aspirations.jsonl", "pipeline.jsonl"):
         p = world / name
         if p.is_file():
             yield "records", p
+    # Board channels: one NAME can be several FILES. `channel_paths` already
+    # filters to files that exist, so no `is_file()` re-check is needed.
+    # `include_archive=False` preserves today's scanned set exactly -- the
+    # archives were never scanned here, and widening the corpus of a citation
+    # audit is a different decision from making it segment-correct.
+    for channel in ("findings", "coordination", "general"):
+        for bp in channel_paths(world / "board", channel,
+                                include_archive=False):
+            yield "records", bp
 
 
 def main() -> int:

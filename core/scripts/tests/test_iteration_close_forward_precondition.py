@@ -105,8 +105,15 @@ def _extract(func: str) -> str:
 
 def _run_predicate(status: str, phase: str = "state-update",
                    recurring: str = "false", claim_held: str = "false",
-                   raw: str | None = None):
+                   raw: str | None = None, outcome_note: str = ""):
     """Source the real function with _probe_goal_record stubbed.
+
+    `outcome_note` stubs _probe_goal_outcome_note, which the non-recurring
+    branch consults to separate a RELEASED partial unit from an abandoned
+    close (g-115-9994). It defaults to EMPTY, which is both the pre-existing
+    behaviour every test above was written against and the fail-open direction
+    the real probe guarantees (empty on any error, meaning "unknown or absent"
+    and never "verified absent").
 
     The stub emits the wide "<status>\\t<recurring>\\t<claim_held>" line the real
     probe now returns (g-115-5216). `raw` overrides the whole line so the
@@ -120,6 +127,7 @@ def _run_predicate(status: str, phase: str = "state-update",
 set -uo pipefail
 GOAL_ID="g-999-1"; GOAL_STATUS="completed"; SOURCE="world"; OUTCOME="deep"
 _probe_goal_record() {{ printf '%s' "{line}"; }}
+_probe_goal_outcome_note() {{ printf '%s' "{outcome_note}"; }}
 {_extract(FUNC)}
 {FUNC} "{phase}"
 echo "RC=$?"
@@ -337,6 +345,118 @@ def test_predicate_is_not_the_terminal_set():
             f"'blocked' nor a not-terminal test that is safe here — see the "
             f"module docstring")
     assert "pending" in body and "in-progress" in body
+
+
+# ── : the release path must not be handed the abandoned remedy ───
+
+DESTRUCTIVE_REMEDY = "--status completed"
+
+
+@pytest.mark.parametrize("phase", ["state-update", "learning-gate"])
+def test_released_partial_unit_refuses_without_the_destructive_remedy(phase):
+    """The whole point: refuse, but never prescribe closing unfinished work.
+
+    Measured 2026-09-15 (bravo, cc-05) on g-373-12 and seven more times on
+    2026-09-16 (echo, cc-03) on g-373-27. A unit released as partial reads
+    pending + not recurring + no claim + non-empty outcome_note. Both phases
+    refused — correctly, the unit did not close — and both printed
+    `--phase verify --status completed`, which on this branch marks unfinished
+    multi-unit work completed and drops its remaining units from the selector
+    with no signal. guard-6733 exists only to tell readers by hand to disobey
+    that line; this test pins the emitter so the hint is never printed here.
+    """
+    r = _run_predicate("pending", phase=phase, claim_held="false",
+                       outcome_note="measured unit 1 of 3; released for unit 2")
+    assert REFUSE_MARKER in r.stderr, "a released unit must still be refused"
+    assert "RC=1" in r.stdout, "counters must not bump for a unit that did not close"
+    assert DESTRUCTIVE_REMEDY not in r.stderr, (
+        "the release branch prescribed --status completed; that closes "
+        "unfinished work and silently drops its remaining units (g-115-9994)")
+    assert "no outcome_note" not in r.stderr, (
+        "the release branch asserts the record has no outcome_note, which is "
+        "false by the very predicate that selected this branch (guard-5593 class)")
+    assert "productivity-check" in r.stderr, (
+        "the release branch must name the continuation that IS correct")
+
+
+@pytest.mark.parametrize("status", ["pending", "in-progress"])
+def test_abandoned_close_keeps_its_remedy(status):
+    """Outcome 2: a live claim means verify never ran — re-running it IS the fix.
+
+    The narrowing is the guard-2760 discipline in the other direction: the
+    g-115-5104 field evidence behind the refusal is an abandoned close, so that
+    branch's message and remedy must survive this change untouched.
+    """
+    r = _run_predicate(status, claim_held="true",
+                       outcome_note="a note that must NOT reroute this branch")
+    assert REFUSE_MARKER in r.stderr
+    assert "RC=1" in r.stdout
+    assert "--phase verify" in r.stderr, (
+        "the abandoned branch lost its verify-first remedy, which is the "
+        "correct fix when the claim is still held")
+
+
+def test_absent_outcome_note_keeps_the_existing_refusal():
+    """Fail-open: an empty note read is 'unknown or absent', never 'verified absent'.
+
+    _probe_goal_outcome_note returns "" on every error path, so an unreadable
+    record must land on the unchanged, conservative message rather than be
+    reclassified as a release.
+    """
+    r = _run_predicate("pending", claim_held="false", outcome_note="")
+    assert REFUSE_MARKER in r.stderr
+    assert "RC=1" in r.stdout
+    assert "--phase verify" in r.stderr
+
+
+def test_release_path_hint_carries_no_destructive_shape():
+    """guard-2237, at the source level: a gate's remedy is a propagation vector.
+
+    An author who trips a gate reads its hint at the exact moment they are
+    looking for a shape to copy, so a remedy that is wrong for the branch that
+    printed it spreads under that gate's authority. The behavioural test above
+    proves today's emitter; this one pins that nobody re-adds the shape to the
+    release block while refactoring the message.
+    """
+    body = _extract(FUNC)
+    marker = "RELEASE PATH (g-115-9994)"
+    assert marker in body, (
+        f"{FUNC} no longer emits the release-path branch; g-115-9994's whole "
+        f"deliverable is that this branch exists")
+    start = body.index(marker)
+    end = body.index("return 1", start)
+    block = body[start:end]
+    assert DESTRUCTIVE_REMEDY not in block, (
+        "the release-path hint contains --status completed (guard-2237: the "
+        "hint is source code, executed by a human)")
+
+
+def test_release_path_EXPLANATION_also_carries_no_destructive_shape():
+    """guard-3333: a file's own explanation of a ban is a violation of the ban.
+
+    Found by a fresh-eyes pass over this very change (2026-09-17). The test above
+    scans the function BODY, and `_extract` starts at the `() {` line — so the
+    comment block ABOVE the function, which explains WHY the release branch
+    exists, sat outside every scan. Its first draft quoted the destructive remedy
+    verbatim while describing it as wrong, which is exactly the shape guard-3333
+    names: a reader hunting for a command copies the shape, not the sentence
+    around it, and the explanation is the most likely place to find it.
+
+    Scanned narrowly — this file legitimately contains the destructive form in
+    the ABANDONED branch's remedy, its recurring sibling, and its usage strings.
+    Only the release branch's own explanation is banned from carrying it.
+    """
+    src = SCRIPT.read_text(encoding="utf-8")
+    start_marker = "recurring false, no claim, outcome_note PRESENT"
+    end_marker = "recurring false, no claim, outcome_note ABSENT"
+    assert start_marker in src and end_marker in src, (
+        "the release-path fail-ladder rows are gone; if the ladder was reworded, "
+        "re-anchor this scan rather than deleting it")
+    region = src[src.index(start_marker):src.index(end_marker)]
+    assert DESTRUCTIVE_REMEDY not in region, (
+        "the release branch's EXPLANATION quotes the remedy it exists to stop "
+        "(guard-3333: paraphrase the banned form, never reproduce it — git "
+        "carries the verbatim text)")
 
 
 # ── structural pins: the wiring the extraction cannot see ──────────────────

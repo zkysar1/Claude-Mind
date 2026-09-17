@@ -317,6 +317,20 @@ def test_partial_read_failure_with_hits_still_reports_hits(monkeypatch, capsys):
 
 # ── Scope + posture ──────────────────────────────────────────────────────
 
+def test_live_human_blocked_predicate_is_the_population_filter():
+    """The 72h user digest imports this function as its second leg (),
+    so it must stay exactly this lane's filter: live status AND the prefix."""
+    mod = _import()
+    pred = mod.is_live_human_blocked
+    for status in ("pending", "in-progress", "blocked"):
+        assert pred({"status": status, "defer_reason": "human_blocked: owner"})
+    assert not pred({"status": "completed", "defer_reason": "human_blocked: owner"})
+    assert not pred({"status": "pending",
+                     "defer_reason": "precondition_unmet: human_blocked later"})
+    assert not pred({"status": "pending", "defer_reason": None})
+    assert not pred({"status": "pending"})
+
+
 def test_only_human_blocked_defers_are_examined(monkeypatch, capsys):
     """The agent-provisionable classes have their own re-probe sweeps (0.5b.4 /
     0.5b.9); double-covering them here would duplicate their findings."""

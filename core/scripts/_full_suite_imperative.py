@@ -93,9 +93,10 @@ means anything (.claude/rules/run-full-suite-after-deep-code.md):
 6. ON A BUSY BOX, PIN THE TREE BEFORE YOU LAUNCH. `VERDICT: INVALID
    (tree-moved)` outranks every other verdict and voids the entire run, and
    HEAD moves for reasons that are not a peer merge: your OWN `git commit`
-   counts, and so does your own loop's turn-end iteration-push merge. The tree
-   lock does NOT cover you -- it returns 0 for your own sid, and a run whose
-   PreToolUse bash-inject hook MISSED carries no MIND_SID at all, so it takes
+   counts, and the tree lock NEVER covers that. Your own loop's turn-end
+   iteration-push merge is held off ONLY while the run holds a LIVE lock under
+   your sid (g-115-9827) -- not past its TTL, and not at all for a run whose
+   PreToolUse bash-inject hook MISSED: it carries no MIND_SID, so it takes
    no lock while still printing authoritative-looking chunk counts. DO NOT READ
    THAT AS "BACKGROUNDING STRIPS THE INJECTION" -- guard-4048 formed exactly
    that hypothesis and REFUTED it by probe (a backgrounded call measured

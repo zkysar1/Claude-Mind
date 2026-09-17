@@ -279,6 +279,47 @@ def archive_evicted_capture(agent_dir, slot_name, removed, reason):
         # unimagined one through as a successful destroy.
         return False
 
+
+#  — logic-identical mirror of wm.py EVICTION_ARCHIVE_CEILING and
+# archive_evicted_capture_local. THIS copy is the LIVE one (append_slot below
+# calls it; wm-append.sh is daemon-only). Why the append path archives to a
+# LOCAL sessions/<unit>/ file rather than the sink above lives on the wm.py
+# definition. A raw append is not a guard-996 bypass here: sessions/ is
+# _EXCLUDE_DIRS-pruned and OwnCloudBackend._machine_local treats it as never on
+# the store, so there is no remote copy or fence for a local write to diverge from.
+EVICTION_ARCHIVE_CEILING = 2
+
+
+def archive_evicted_capture_local(archive_file, slot_name, removed, reason):
+    """Append ONE evicted capture entry to a LOCAL archive file. True iff it landed.
+
+    Same contract as archive_evicted_capture: False means the caller MUST KEEP the
+    entry. A write that fails part-way is truncated back to its starting size.
+    """
+    path = Path(archive_file)
+    start = None
+    try:
+        line = json.dumps({
+            "archived_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            "slot": slot_name,
+            "eviction_reason": reason,
+            "summary": evicted_summary(removed),
+            "entry": removed,
+        }, ensure_ascii=False, default=str) + "\n"
+        start = path.stat().st_size if path.is_file() else 0
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return True
+    except Exception:
+        if start is not None and path.is_file():
+            try:
+                os.truncate(path, start)
+            except OSError:
+                pass
+        return False
+
 #  — mirror of wm.py APPEND_CREATABLE_EXTRA. THIS copy is the LIVE
 # one: wm-append.sh is daemon-only, so it routes here and the refusal below is
 # what actually runs; the wm.py twin exists for parity and is pinned by
@@ -960,6 +1001,10 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
     # A name defined only inside the array branch would NameError on a scalar
     # append — a failure landing in the one place nobody is watching.
     _evicted = 0
+    # : same reason. None = no archive applies to this append (not a
+    # capture lane, not a Body WM, or under cap), a different fact from 0 archived.
+    _evicted_archived = None
+    _eviction_deferred = 0
     # : same reason, and the same trap — the post-lock push below reads
     # this on EVERY append, including the scalar and error paths that never
     # reach the branch that sets it.
@@ -1131,6 +1176,18 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 # definition check while changing nothing at runtime (the
                 #  class). One level of indirection defeats that
                 # textual guard, and the guard is worth more than the tidiness.
+                # : on a Body WM a capture victim is archived beside the
+                # WM BEFORE it is popped. An archive that fails KEEPS the victim
+                # (break) until the lane passes limit * EVICTION_ARCHIVE_CEILING;
+                # past that the bound wins and the pop is reported unarchived.
+                # Routed-to-Body is decided exactly as _wm_path decides it. TWIN
+                # of wm.py enforce_slot_limit(may_evict=) + cmd_append.
+                _sid = (ctx.headers.get("x-mind-sid") or "").strip()
+                _archive_file = None
+                if (root_slot in CAPTURE_SLOTS and _sid
+                        and _wm_path(ctx) == ctx.paths.body_wm_path(_sid)):
+                    _archive_file = _wm_path(ctx).parent / CAPTURE_EVICTION_ARCHIVE
+                    _evicted_archived = 0
                 arr.sort(key=_eviction_sort_key)
                 _floor = _unflagged_floor(limit)
                 # Sorted (flag, ts) => unflagged are the PREFIX, so this count is
@@ -1143,10 +1200,18 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                     if arr[_victim] is item and len(arr) > 1:
                         _victim = (_victim + 1 if _victim + 1 < len(arr)
                                    else _victim - 1)
+                    if _archive_file is not None:
+                        if archive_evicted_capture_local(
+                                _archive_file, root_slot, arr[_victim],
+                                "append_array_limit"):
+                            _evicted_archived += 1
+                        elif len(arr) <= limit * EVICTION_ARCHIVE_CEILING:
+                            break
                     if _victim < _n_unflagged:
                         _n_unflagged -= 1
                     arr.pop(_victim)
                     _evicted += 1
+                _eviction_deferred = len(arr) - limit if len(arr) > limit else 0
                 # : this eviction used to be entirely silent — rc=0,
                 # {"ok": true}, nothing recorded. Measured on one worker Body:
                 # 215 capture entries destroyed (exp_capture 115, spark_capture
@@ -1225,7 +1290,12 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
     # only moment the answer is free. true = the store write returned without
     # raising, false = it failed and this entry is local-only until the
     # close-time full merge, null = no carrier write was attempted.
+    # : `evicted_archived` (null = no archive applies, else how many of
+    # `evicted` have a copy) and `eviction_deferred` (victims KEPT because their
+    # archive failed, so the lane is over cap by this much) are always present too.
     out = {"ok": True, "slot": slot, "evicted": _evicted,
+           "evicted_archived": _evicted_archived,
+           "eviction_deferred": _eviction_deferred,
            "placement": _placement, "carrier_pushed": _carrier_pushed}
     if _healed_scalar is not None:
         # Surface the heal in the SAME response as the write, never silently:

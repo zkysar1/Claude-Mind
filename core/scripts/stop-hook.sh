@@ -485,7 +485,7 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
             # slash command (schedule-wakeup-correctness.md).
             printf '%s\n' '{"wakeup": {"prompt": "Parked worker Body: re-enter /worker-loop at Phase -0 (the manifest reads parked = RESUMABLE), re-run the Phase 0.5 reducer poll and SELECT; a claim resumes this Body, no eligible goal re-parks it.", "delay_seconds": 3600}}'
             exit 0
-        elif grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale)'?[[:space:]]*$" \
+        elif grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale|closed-graceful)'?[[:space:]]*$" \
                 "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
             # 4th safety valve (2026-08-09, cc-08 04:39->04:49): a GENUINELY-
             # CLOSED Body's later turn-ends must stand the net down. After a
@@ -511,7 +511,12 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         else
             echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK gate=worker-net sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
             unset _BODY_WM _CLOSE_SENTINEL
-            printf '%s\n' '{"decision": "block", "reason": "Worker Body turn ended without a Skill(worker-loop) re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: Skill('"'"'worker-loop'"'"') — NOT Skill('"'"'aspirations'"'"'), which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. If this Body genuinely has no more work, write the body-closing sentinel in your per-session dir and end the turn — that is the sanctioned close path and this net will stand down."}'
+            # The re-entry names come from the harness vocabulary (_harness_vocab.sh,
+            # 2026-09-17): a zakcode vessel reads use_skill(name='worker-loop'); Claude
+            # Code reads the byte-identical Skill('worker-loop') line it always did.
+            # Sourced HERE, on the BLOCK branch only, so the ALLOW paths pay nothing.
+            source "$CORE_ROOT/scripts/_harness_vocab.sh"
+            printf '{"decision": "block", "reason": "Worker Body turn ended without a %s re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: %s — NOT %s, which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. If this Body genuinely has no more work, write the body-closing sentinel in your per-session dir and end the turn — that is the sanctioned close path and this net will stand down."}\n' "$HC_WORKER_REF" "$HC_WORKER_CALL_Q" "$HC_LOOP_REF_Q"
             exit 0
         fi
     fi
@@ -806,6 +811,18 @@ _T_AFTER_TTD=$(date +%s%3N)
 # uniform "call Skill(aspirations); here is the checkpoint" form is enough —
 # the LLM resolves phase semantics from the checkpoint + Phase -1 logic.
 #
+# --- Driver mode (deterministic loop driver, opt-in via session/driver-mode) ---
+# When present, aspirations-driver.py sequences the loop in CODE: it encodes the step that just
+# finished (findings.json -> knowledge tree) and emits the NEXT bounded execute step as this hook's
+# decision payload, replacing the model-navigated Skill(aspirations) re-entry below. Fail-safe: on
+# any driver error, fall through to the default payload so a runner is never stranded.
+if [[ -f "$HOOK_AGENT_DIR/session/driver-mode" ]]; then
+    if HOOK_AGENT_DIR="$HOOK_AGENT_DIR" HOOK_AGENT="$HOOK_AGENT" HOOK_SID="$HOOK_SID" \
+        py -3 "$(cd "$(dirname "$0")" && pwd)/aspirations-driver.py"; then
+        exit 0
+    fi
+fi
+
 # Python generates the full JSON so string content from the checkpoint (goal
 # IDs, phase values) cannot corrupt the decision payload via shell escaping.
 # --- Loop-exhaustion ladder (, USER DIRECTIVE) ---------------------
@@ -829,15 +846,59 @@ if [ -n "$HOOK_AGENT" ]; then
         bash "$CORE_ROOT/scripts/loop-exhaustion-fence.sh" 2>/dev/null || true)"
 fi
 
+# --- Context sensor beside the harness marker (guard-6380) -------------------
+# The harness injects `<total_tokens>N tokens left</total_tokens>` into every
+# turn, and it can read 0 while the framework's own sensor reads zone=normal
+# with 200k headroom (measured 2026-09-09 alpha/cc-04; recurred 2026-09-15
+# zeta/cc-02: "out of token budget, so no goal work" -> diary frozen -> the
+# fence's stop rung -> a half-finished graceful stop). The falsifier already
+# existed (context-budget-banner.sh; independent writer = the statusLine hook,
+# guard-6255) but ran INSIDE the iteration battery -- downstream of the "no work
+# this tick" decision it exists to falsify. This hook fires at EVERY turn-end,
+# including the wakeup ticks the battery never sees, so the true number rides
+# beside the false one in the same context window, every time.
+# A SCOPED CALL, NEVER A RE-FORMAT (guard-2676): the banner text is a contract
+# with BANNER_RE in abbreviated-obligation-audit.py. Fail-open: empty on any
+# error, and it only appends to the reason string -- never to the decision.
+CTX_MSG=""
+if [ -n "$HOOK_AGENT" ]; then
+    CTX_MSG="$(MIND_AGENT="$HOOK_AGENT" \
+        bash "$CORE_ROOT/scripts/context-budget-banner.sh" 2>/dev/null || true)"
+fi
+
 HOOK_AGENT_DIR="$HOOK_AGENT_DIR" HOOK_AGENT="$HOOK_AGENT" \
 TTD_MARKER="$TTD_MARKER" TTD_SEVERITY="$TTD_SEVERITY" \
 HOOK_LOG="$LOG" HOOK_SID="$HOOK_SID" STALL_THRESHOLD="${STALL_THRESHOLD:-3}" \
-EXHAUSTION_MSG="$EXHAUSTION_MSG" \
+EXHAUSTION_MSG="$EXHAUSTION_MSG" CTX_MSG="$CTX_MSG" \
+HOOK_SCRIPTS_DIR="$CORE_ROOT/scripts" \
 $PY - <<'PYEOF'
-import datetime, json, os, pathlib
+import datetime, json, os, pathlib, sys
 
 agent_dir = pathlib.Path(os.environ["HOOK_AGENT_DIR"])
 agent     = os.environ["HOOK_AGENT"]
+
+# Vessel vocabulary (2026-09-17). The re-entry this reason demands is spelled the
+# way THIS harness names its tools -- Skill('aspirations') with args='loop' on
+# Claude Code (byte-identical to what this hook always said), use_skill(name=
+# 'aspirations', args='loop') on a zakcode vessel, whose model never sees the
+# name "Skill" in its tool list and answered the old line in prose for hours.
+# On zakcode the payload also carries the deadman `wakeup` (hook_wakeup): the
+# harness arms the net itself before it reads the veto (Zak-Code ADR-0102), so
+# resurrection no longer depends on the model re-arming. ONE owner for the
+# spelling: _harness_caps.py, imported in-process (no extra spawn on this
+# latency-budgeted path). FAIL-OPEN: an unreachable module leaves Claude Code's
+# spelling and no wakeup key -- the pre-change payload, byte for byte; the
+# fallback tuple is pinned to the module's claude-code output by test.
+try:
+    sys.path.insert(0, os.environ.get("HOOK_SCRIPTS_DIR") or ".")
+    import _harness_caps as _hc
+    _loop_ref = _hc.skill_ref("aspirations")
+    _loop_call = _hc.skill_call("aspirations", "loop", quoted=True)
+    _skill_tool = _hc.skill_tool()
+    _wakeup = _hc.hook_wakeup()
+except Exception:
+    _loop_ref, _loop_call, _skill_tool, _wakeup = (
+        "Skill(aspirations)", "Skill('aspirations') with args='loop'", "Skill", {})
 
 # Checkpoint context — just the raw goal_id + phase_completed. Let the LLM
 # interpret; do not add per-phase narrative. Fail-open on corrupt checkpoint.
@@ -949,20 +1010,26 @@ except Exception:
 _em = (os.environ.get("EXHAUSTION_MSG") or "").strip()
 exhaustion_msg = (" " + _em) if _em else ""
 
+# Context sensor line (guard-6380): the falsifier for the harness token marker,
+# computed OUTSIDE this payload by context-budget-banner.sh. Reason-only.
+_cm = (os.environ.get("CTX_MSG") or "").strip()
+ctx_msg = (" " + _cm) if _cm else ""
+
 reason = (
-    "Turn ended without a Skill(aspirations) re-entry (autocompact OR a text "
-    "summary terminated the turn). Your FIRST action MUST be: Skill('aspirations') "
-    "with args='loop'. Do NOT manually select goals. Do NOT run Bash commands "
-    "first. Call the Skill tool IMMEDIATELY."
+    f"Turn ended without a {_loop_ref} re-entry (autocompact OR a text "
+    f"summary terminated the turn). Your FIRST action MUST be: {_loop_call}. "
+    "Do NOT manually select goals. Do NOT run Bash commands "
+    f"first. Call the {_skill_tool} tool IMMEDIATELY."
     + cp_context
     + f" Agent: {agent}. Prefix all Bash with MIND_AGENT={agent}."
     + compact_msg
     + ttd_msg
     + streak_msg
     + exhaustion_msg
+    + ctx_msg
 )
 
-print(json.dumps({"decision": "block", "reason": reason}))
+print(json.dumps({"decision": "block", "reason": reason, **_wakeup}))
 PYEOF
 
 # --- Emit timing record (, fail-open) ---

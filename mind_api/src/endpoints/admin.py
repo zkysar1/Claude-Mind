@@ -217,11 +217,15 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
     deployments, where the bare-CLI fallback lacks the daemon-only creds.
 
     SSOT: invokes the SAME `owncloud_sync.sync_file()` the CLI `--file` mode
-    runs (multi_machine=False → local IS authoritative → push). It does NOT
-    stamp a manifest baseline, and this docstring claimed twice that it did
-    until g-115-5356 measured it: sync_file calls _sync_one without
-    baseline_md5, discards the md5 it returns, and never opens the manifest.
-    Callers must not treat a 200 here as proof a baseline now exists.
+    runs (multi_machine=False → local IS authoritative → push). Since
+    g-115-8029 (2026-09-15) sync_file READS the manifest baseline and passes
+    it to _sync_one, so an in-place edit under an unchanged remote takes the
+    fenced mirror_put instead of the base-less union merge that refused it
+    (7 of 8 tree-node Edits on cc-13 that day). It still does NOT stamp a
+    baseline itself — the backend's _stamp_manifest_baseline does that after
+    every successful put (g-115-5356 measured the pre-fix state: no baseline
+    read, returned md5 discarded). Callers must not treat a 200 here as proof
+    of a push: read `pushed` / `errors` in the body.
     Safe against arbitrary paths: sync_file's own governed-root /
     machine-local / peer-agent filters decide skips; this endpoint reports
     the skip reason rather than second-guessing them. `dry_run=1` maps to

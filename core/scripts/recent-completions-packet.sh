@@ -8,5 +8,6 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
+#  fix: native SCRIPT_DIR for Windows python3 (see insight-trigger-sweep.sh).
 if command -v cygpath >/dev/null 2>&1; then SCRIPT_DIR_NATIVE="$(cygpath -w "$SCRIPT_DIR")"; else SCRIPT_DIR_NATIVE="$SCRIPT_DIR"; fi
 exec python3 "$SCRIPT_DIR_NATIVE/recent_completions_packet.py" "$@"

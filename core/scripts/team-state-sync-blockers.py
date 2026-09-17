@@ -61,7 +61,11 @@ def _candidate_sources():
 def load_goal_statuses():
     """Return {goal_id: status} map from all candidate aspiration files."""
     statuses = {}
+    from _fresh_read import refresh_for_read
     for path in _candidate_sources():
+        if path.name == "aspirations-archive.jsonl":
+            # The eager pull never re-pulls an archive ().
+            refresh_for_read(path, label="team-state-sync-blockers")
         if not path.exists():
             continue
         with open(path, encoding="utf-8") as f:

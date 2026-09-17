@@ -372,6 +372,14 @@ def _cadence_gate():
       zero-guard (guard-1091) — _count_completed_goals returns 0 as a SILENT
       FAILURE SENTINEL. Re-baselining on it would persist a transient failure as
       the new basis. Noop WITHOUT re-stamping so the next check retries.
+
+      stale-watermark heal — a watermark ABOVE the live count pins diff negative
+      forever, so --cadence exits 0 silently for good. Re-baseline (preserving
+      the dedup seen-set) and noop. This file carried the other two guards but
+      NOT this one until 2026-09-16: the two-level `if diff < 0:` / `if current
+      == 0:` test of scar-tissue-check.py:489, l1-skew-check.py:455 and
+      completed-not-closed-triage.py:636 had been flattened here into a single
+      `and`, which silently dropped the else-branch that does the healing.
     """
     cfg = _load_cadence_config()
     current = _count_completed_goals()
@@ -386,10 +394,39 @@ def _cadence_gate():
     if last_count == 0:
         diff = min(diff, cfg["goal_cadence"])
 
-    if diff < 0 and current == 0:
-        print(f"[guardrail-protocol-conflict] negative diff ({diff}) with "
-              f"current=0 vs last={last_count} — FAILED MEASUREMENT, not a real "
-              f"basis; noop WITHOUT re-stamp — retries next check", file=sys.stderr)
+    if diff < 0:
+        if current == 0:
+            print(f"[guardrail-protocol-conflict] negative diff ({diff}) with "
+                  f"current=0 vs last={last_count} — FAILED MEASUREMENT, not a real "
+                  f"basis; noop WITHOUT re-stamp — retries next check", file=sys.stderr)
+            return False, current, cfg, last
+        # STALE-WATERMARK HEAL (/ lineage). Without this the
+        # gate cannot distinguish "not due" from "never again": a watermark above
+        # the live count makes diff permanently negative, so --cadence exits 0
+        # SILENTLY forever and the goal that polls it keeps closing green while
+        # the detector is dead. Measured 2026-09-16 (alpha, cc-04): this slot held
+        # 25927 against a live count of 14717 (three sibling slots read 14686 and a
+        # fourth 14646, so the shared counter definition was fine) — diff -11210,
+        # needing ~11310 more completed goals before it could fire again.
+        # Re-stamp and do NOT fire: firing on a basis correction trades a starved
+        # ritual for banner fatigue (guard-1090), and a re-baseline is not a fire,
+        # so the last REAL timestamp is preserved.
+        rebase = {
+            "timestamp": last.get("timestamp", "0000-00-00T00:00:00"),
+            "goals_count_at_last_fire": current,
+            "rebaselined_from": last_count}
+        # Preserve the dedup seen-set across a re-baseline. A count-basis
+        # correction says nothing about WHICH conflicts were already disposed,
+        # and dropping it would re-report every seen row on the next fire — the
+        #  shape l1-skew-check records for its `shares` baseline.
+        if isinstance(last.get("seen_guardrails"), list):
+            rebase["seen_guardrails"] = last["seen_guardrails"]
+        if last.get("novel_at_last_fire") is not None:
+            rebase["novel_at_last_fire"] = last["novel_at_last_fire"]
+        _wm_set(cfg["wm_slot"], rebase)
+        print(f"[guardrail-protocol-conflict] negative diff ({diff}) — count basis "
+              f"moved backward (last={last_count} > current={current}); re-baselined "
+              f"to {current} — noop this iter")
         return False, current, cfg, last
 
     return diff >= cfg["goal_cadence"], current, cfg, last

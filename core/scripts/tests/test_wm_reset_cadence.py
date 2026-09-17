@@ -232,6 +232,11 @@ SHARED_WM_CONSTANTS = (
     # value ABSENT (guard-2616). Joins this list rather than getting a bespoke
     # check, per the CAPTURE_SLOTS note above.
     "TOP_LEVEL_KEYS",
+    # : the append path's archive-before-pop. A drift in the basename
+    # strands the archive (the reaper stages one name, the writer writes another);
+    # a drift in the ceiling makes CLI and daemon keep different amounts over cap.
+    "CAPTURE_EVICTION_ARCHIVE",
+    "EVICTION_ARCHIVE_CEILING",
 )
 
 

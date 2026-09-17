@@ -393,16 +393,38 @@ All data comes from framework scripts — no direct JSONL reads.
             # fires on every healthy run trains its reader to skip it, which is
             # precisely how the real 3-day case below would get missed.
             # MTIME is the right signal because it records when the snapshot was
-            # TAKEN. It matched `since` to the second here (20:23:35.714 vs
-            # 20:23:35), and it still catches the foxtrot failure case
-            # decisively (mtime Aug 21 03:53 vs since 2026-08-22T16:53 = 37h).
+            # TAKEN, and it still catches the foxtrot failure case decisively
+            # (mtime Aug 21 03:53 vs since 2026-08-22T16:53 = 37h).
+            # THE TOLERANCE IS 30 MINUTES, NOT 60s — recalibrated 2026-09-16
+            # (echo, cc-03, run 131) on this gate's SECOND live firing, which is
+            # what exposed it. 60s was calibrated on ONE sample whose two writes
+            # landed in the same second (20:23:35.714 vs 20:23:35), so the gap
+            # looked like zero. It is not: the snapshot is written at PHASE 4 and
+            # `last-report-timestamp` at PHASE 5, so a healthy run separates them
+            # by its own report-generation tail. Measured here — snapshot
+            # 18:59:41 vs since 19:01:52 = 131s, the gate FIRING on a CORRECT
+            # baseline, i.e. the exact "fires on every healthy run" failure the
+            # paragraph above says it was fixed to stop doing. A 60s threshold
+            # against a 133,200s signal is not a tight bound, it is a different
+            # quantity.
+            # BOTH JOBS AS INEQUALITIES, written before picking the number
+            # (guard-3352): (A) pass normal traffic → T > max Phase4→Phase5
+            # latency (observed 0s, 131s); (B) catch the known-bad → T < the
+            # smallest REAL gap, which is one MISSED report cadence — this goal's
+            # interval_hours floor is 4h = 14,400s and the foxtrot case was
+            # 133,200s. Intersection 131s < T < 14,400s is two orders wide, so it
+            # is NOT empty; T = 1800s sits 13.7x above (A) and 8x below (B).
+            # Raising an AGE threshold normally discards the members whose age is
+            # UNDERSTATED (guard-2805); that mechanism CANNOT apply here, because
+            # the single writer below rewrites content and mtime TOGETHER, so no
+            # structural trigger can advance mtime without re-taking the snapshot.
             # Writers enumerated before trusting an mtime (guard-1504, rb-190):
             # session-manifest.yaml:898 names exactly ONE writer
             # (agent-completion-report Phase 4) at sync_tier machine_local, so no
             # sync layer and no background writer can move it. If that ever gains
             # a second writer, this gate is void — re-enumerate before trusting it.
             snapshot_mtime = mtime of agents/<agent>/session/last-outcome-snapshot.yaml
-            IF since is not null AND snapshot_mtime is more than 60s BEFORE since:
+            IF since is not null AND snapshot_mtime is more than 30 MINUTES (1800s) BEFORE since:
                 # The snapshot was not taken at the last report: a prior run wrote
                 # the timestamp and skipped the copy. The delta spans MORE than the
                 # report window, so every "moved" is over-stated.

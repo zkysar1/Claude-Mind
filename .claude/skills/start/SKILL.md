@@ -910,10 +910,10 @@ DONE.
      `agents/<agent>/session/watchdog-prev-state.json`. Cross-platform; no daemon,
      no PID file, no /start spawn. Add new probes to `build_probes()` in
      `core/scripts/agent-watchdog.py`.)
-   - Output: "Agent resumed. Learning loop starting."
    - Bash (deterministic hand-off marker — mirrors `iteration-close.sh`'s loop-reentry imperative):
-     `echo "═══ /start COMPLETE — <agent-name> RUNNING (autonomous) ═══"; echo "NEXT ACTION REQUIRED: invoke Skill(boot) NOW — the non-optional terminal step of autonomous /start. Do NOT summarize what /start did and do NOT ask the user to confirm booting; invoking /start WAS the authorization. /boot hands off into the aspirations loop."`
-   - **Invoke `/boot` now — this turn's terminal action, not an offer.** Autonomous `/start` from IDLE ALWAYS chains straight into `/boot` with no confirmation step (unlike UNINITIALIZED first-boot, which alone gates on Self confirmation — `start-phase-c.md` C1.9). Ending the turn on a text summary or a "shall I boot?" question leaves the agent RUNNING-but-not-looping — the failure observed 2026-09-11 (agent `bobby`: /start set RUNNING, then stopped and asked to boot, so the loop never started and the user had to re-run /start). If state is RUNNING, the only valid next action is the `Skill(boot)` call.
+     `if MIND_AGENT=<agent-name> bash core/scripts/session-signal-exists.sh stop-requested; then echo "═══ /start COMPLETE — <agent-name> STOP PENDING ═══"; echo "NEXT ACTION REQUIRED: invoke Skill(aspirations-graceful-stop) NOW, not Skill(boot) — a stop was raised during /start."; else echo "═══ /start COMPLETE — <agent-name> RUNNING (autonomous) ═══"; echo "NEXT ACTION REQUIRED: invoke Skill(boot) NOW — the non-optional terminal step of autonomous /start. Do NOT summarize what /start did and do NOT ask the user to confirm booting; invoking /start WAS the authorization."; fi`
+   - **Invoke the Skill the marker names — this turn's terminal action, not an offer.** Autonomous `/start` from IDLE ALWAYS chains into it, unconfirmed (only UNINITIALIZED first-boot gates — `start-phase-c.md` C1.9). Ending on a summary or a question strands the agent RUNNING-but-not-looping, or its stop unhonored.
+# Rationale (WHY it branches): core/config/rationale/start-handoff-stop-route.md
 
 ### UNINITIALIZED (agent-state doesn't exist or <agent>/ doesn't exist)
 

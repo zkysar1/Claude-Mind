@@ -202,7 +202,7 @@ DISPOSITION_KINDS = frozenset({
 # accepted as a valid goal id. \Z anchors at true end-of-string. Probed on both
 # tables that share this regex, so a stray newline from a captured command
 # substitution can no longer enter either as a well-formed id.
-_GOAL_ID_RE = re.compile(r"^g-\d{1,4}-\d{2,4}[a-z]?(-[a-z])?\Z")
+_GOAL_ID_RE = re.compile(r"^g-\d{1,4}-\d{2,5}[a-z]?(-[a-z])?\Z")
 
 
 # DELIBERATELY namedtuple, NOT @dataclass. This module is loaded by
@@ -1459,6 +1459,19 @@ def _main(argv=None) -> int:
                             "is legitimately ahead of the ref, so it would always fire. "
                             "Without this flag the check reads the carrier TABLE only "
                             "and says so (g-115-6368).")
+    # A SEPARATE verb, not a check-outputs class or flag: the fast lane is not an
+    # output class (the Body WM still carries every capture at close), and its
+    # pushes happen DURING Phases 3.5-3.66, while --verify-delivery is contracted
+    # to run after the Phase 3.8 push. One flag with two timing contracts would
+    # be right at one moment and wrong at the other.
+    p_cap = sub.add_parser("check-capture-carrier",
+                           help="is every capture this Body flagged since its fork "
+                                "in the STORE copy of its fast-lane carrier? exit 0 "
+                                "delivered or nothing to deliver, 1 undelivered, 3 "
+                                "could not check (worker-loop Phase 3.7, g-115-9852)")
+    p_cap.add_argument("--wm-path", default=None,
+                       help="the Body WM to check (default: $BODY_WM_PATH, else "
+                            "this agent and SID's worker_wm_path)")
     p_skill = sub.add_parser("skill-eligible",
                              help="exit 0 (+'eligible') if a WORKER Body may claim a "
                                   "goal carrying <skill>, exit 1 (+'reducer-only') if "
@@ -1646,6 +1659,46 @@ def _main(argv=None) -> int:
               "the reducer. Record the stranding in the goal's outcome_note and "
               "leave the goal in-progress.", file=sys.stderr)
         return 1
+    if args.cmd == "check-capture-carrier":
+        wm = args.wm_path or os.environ.get("BODY_WM_PATH", "").strip()
+        if not wm:
+            agent = os.environ.get("MIND_AGENT") or AGENT_NAME
+            sid = os.environ.get("MIND_SID")
+            if not agent or not sid:
+                print(f"unverified: cannot name this Body's WM (BODY_WM_PATH unset, "
+                      f"MIND_AGENT={agent!r}, MIND_SID={sid!r})")
+                return 3
+            wm = str(worker_wm_path(agent, sid))
+        import body_capture_carrier  # lazy: only this verb needs the carrier module
+        verdict, detail = body_capture_carrier.verify_delivery(wm)
+        print(f"{verdict}: {detail}")
+        if verdict == "undelivered":
+            # Loud, but it does NOT hold the goal: unlike a stranded output class,
+            # these entries still reach the reducer at close via the staged Body WM.
+            print(
+                "The capture fast lane is NOT delivering. The entries are not lost: "
+                "they stay in this Body's WM, evictions are archived, and the staged "
+                "WM carries them at close. What is broken is delivery BEFORE close, "
+                "which is the whole point of load_bearing (guard-6181). Do NOT hold "
+                "the goal open for this; check-outputs judges its outputs. DO: (1) "
+                "post ONE coordination-board escalation per Body session, because the "
+                "capture relay is the broken lane (guard-997): board-post.sh --channel "
+                "coordination --type escalation --tags carrier-wedge,body-capture-carrier, "
+                "naming the carrier key, the counts above, and the hostname. Read the "
+                "board first and skip the post if this SID already escalated. (2) Name "
+                "it in this unit's closure narrative. If the local carrier holds the "
+                "missing entries, the push is failing; the daemon log names the "
+                "exception once per process. If it does not, the local file lost them "
+                "too, and no later push can deliver them.",
+                file=sys.stderr,
+            )
+            return 1
+        if verdict == "unverified":
+            print("NOT an all-clear: the check could not run, so nothing is known "
+                  "about delivery. Name it in this unit's closure narrative "
+                  "(guard-1760).", file=sys.stderr)
+            return 3
+        return 0
     if args.cmd == "skill-eligible":
         verdict = skill_eligibility(" ".join(args.skill))
         print(_verdict_word(verdict))

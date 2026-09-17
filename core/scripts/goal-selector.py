@@ -117,6 +117,7 @@ from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter
 from _drain_title import is_drain_action_title  # noqa: E402  ( owner-scope drain SSOT)
 import reducer_selection_policy  # noqa: E402  ( reducer selection policy)
 from _dependency_graph import supersession_satisfied_ids  # noqa: E402  ( SSOT, guard-547)
+from _board_paths import channel_paths, read_paths  # noqa: E402  ( reader seam)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
 ABANDONED_STATUSES = TERMINAL_GOAL_STATUSES - {"completed"}            # terminal but not "done"
 
@@ -4101,6 +4102,60 @@ def _resolve_category(goal, asp):
 BOARD_COORD_PATH = WORLD_DIR / "board" / "coordination.jsonl"
 
 
+def _coord_paths(base=None):
+    """The files comprising the coordination channel, oldest-first ().
+
+    Derives `(board_dir, channel)` FROM the path rather than taking them as
+    arguments, which is what lets this land in the highest-blast-radius file in
+    the repo without disturbing either existing seam: tests monkeypatch
+    `BOARD_COORD_PATH` and tests pass `board_path=<tmp>/coordination.jsonl`, and
+    both keep working unchanged while segments beside that file are now picked
+    up. Reading a channel is enumerating its FILES; after segmentation that is
+    no longer one name, and a selector reading a shrinking live file would drop
+    directives silently -- the failure this seam exists to make impossible.
+
+    `include_archive=False` keeps the population byte-identical today: every
+    archived row predates the rotation, and `parse_directive_admission` drops
+    expired directives anyway.
+
+    Falls back to the bare path if the seam yields nothing but the file is
+    there, so an unusual channel name can never make the selector blind.
+    """
+    p = Path(base) if base is not None else BOARD_COORD_PATH
+    try:
+        paths = channel_paths(p.parent, p.stem, include_archive=False)
+    except Exception:  # pragma: no cover - fail-open; selection must not die
+        paths = []
+    if not paths and p.exists():
+        return [p]
+    return paths
+
+
+def _coord_rows(base=None):
+    """Every record of the coordination channel, through the seam.
+
+    Parses each file SEPARATELY (guard-6846: board JSONL does not reliably end
+    with a newline, so byte-concatenating N files loses everything after the
+    first boundary) and SKIPS a malformed line instead of raising. That last
+    part is a deliberate change from `read_jsonl`, which calls `json.loads`
+    unguarded: one corrupt row on the coordination board currently takes down
+    goal selection entirely. A corrupt row should cost that row, not the loop.
+    """
+    records, missing = read_paths(_coord_paths(base))
+    # Warn ONLY on "unreadable" (a real I/O fault someone should chase), never on
+    # "evicted" (routine archival under segmentation). Conflating the two is itself
+    # a false all-clear -- the distinction `read_paths` exists to preserve, and the
+    # only thing its mutation control can measure. Pattern copied verbatim from
+    # insight-trigger-gate.py:261-268 so all consumers of the seam agree ().
+    faults = [m for m in (missing or []) if m.get("reason") == "unreadable"]
+    if faults:
+        print("warning: coordination channel window shortened by %d unreadable "
+              "path(s): %s -- goal selection is deciding on a SHORT window"
+              % (len(faults), "; ".join(str(m.get("path")) for m in faults)),
+              file=sys.stderr)
+    return records
+
+
 # Raw weight applied to a targeted directive that carries no explicit `weight:`
 # tag. Raw, i.e. BEFORE WEIGHTS["directive_boost"] = 1.5, so the default lands at
 # +1.5 final -- deliberately the same magnitude strategic_focus_boost already
@@ -4247,11 +4302,9 @@ def load_active_directives():
     Admission is delegated to parse_directive_admission -- the SAME predicate
     emit_directive_honor_banner uses, so scoring and the banner cannot diverge.
     """
-    if not BOARD_COORD_PATH.exists():
-        return []
     directives = []
     now = datetime.now()
-    for msg in read_jsonl(BOARD_COORD_PATH):
+    for msg in _coord_rows():
         d = parse_directive_admission(msg, now)
         if d is None:
             continue
@@ -4581,11 +4634,10 @@ def emit_directive_honor_banner(scored, agent_name, board_path=None):
     """
     if not agent_name or not scored:
         return []
-    bp = board_path if board_path is not None else BOARD_COORD_PATH
     try:
-        if not bp.exists():
+        rows = _coord_rows(board_path)
+        if not rows:
             return []
-        rows = list(read_jsonl(bp))
     except Exception as e:  # pragma: no cover - fail-open guard
         print(f"[goal-selector] directive-honor banner skipped "
               f"({type(e).__name__}: {e})", file=sys.stderr)
@@ -5891,9 +5943,33 @@ def overdue_exemption_level(ratio, interval_hours, config):
     Returns 1.0 when fully exempt — either the pure-ratio bar
     (substantive_demotion_overdue_exempt_ratio) or the interval-scoped
     monitor-class bar (g-115-3922) is met. Below that, the larger of the two
-    normalized fractions, so relief phases in rather than switching on. Callers
-    wanting the original binary test use `>= 1.0`, which is exactly how
-    apply_substantive_demotion consumes it — behavior there is unchanged.
+    normalized fractions, so relief phases in rather than switching on.
+
+    CONSUMER MAP — FOUR call sites, not two (measured against live code
+    2026-09-16, zeta/cc-02; the "TWO consumers" line this paragraph replaced was
+    stale and was the thing an implementer sizing blast radius would trust):
+      * recurring_saturation relief in score_goal   — CONTINUOUS, `*= (1.0 - level)`
+      * apply_substantive_demotion (below)          — BINARY `>= 1.0`. This is
+        the cliff g-358-30 describes (at 0.99 of the bar a goal loses the whole
+        escape valve, so a demoted recurring goal cannot earn its way out) and
+        it is DELIBERATELY still here. The obvious repair — scale the demotion
+        DISTANCE by `(1.0 - level)`, mirroring the recurring_saturation relief
+        above — was implemented and MEASURED on 2026-09-16 (alpha/cc-04) and is
+        WRONG: it lets a NON-exempt recurring row cross the substantive leader.
+        On the g-306-284 tiebreak fixture the demoted cluster came back at
+        {13.68, 13.80, 14.30, 14.38} against a substantive leader of 14.16, so
+        the row ranked FIRST. That is the exact recurring domination FW-1 was
+        built to stop (six of seven agents, 2026-05-25) and it is the same
+        relaxation the flat absolute-hours variants got wrong. Any real escape
+        valve here must be CLAMPED at the cap, or it is that relaxation wearing
+        a ramp. Do not re-derive this; see g-358-30's progress_note.
+      * apply_drain_lane admission                  — BINARY `>= 1.0`
+      * the drain-lane eligibility COUNTER feeding emit_drain_lane_banner —
+        BINARY `>= 1.0`, re-derived INLINE rather than through a shared helper.
+    The last two are a COUPLED PAIR: the counter must answer the same test as
+    admission or emit_drain_lane_banner's eligible_count silently disagrees with
+    which rows are actually admitted. Making either continuous requires changing
+    both together; g-358-30 deliberately did not touch them.
 
     WHY THE SECOND ARM IS INTERVAL-SCOPED AND NOT FLAT ABSOLUTE HOURS
     (carried from the g-115-3922 site this predicate absorbed). The pure ratio
@@ -5973,16 +6049,120 @@ def apply_substantive_demotion(scored, config):
             continue
         ratio = float(s.get("recurring_overdue_ratio", 0.0))
         iv = float(s.get("recurring_interval_hours", 0.0))
-        # Both exemption arms now come from the shared predicate () so
-        # this and the recurring_saturation relief cannot diverge. `>= 1.0` is the
-        # binary form and is behavior-identical to the two inline tests it
-        # replaced; see overdue_exemption_level for why they were joined.
+        # Both exemption arms come from the shared predicate () so this
+        # and the recurring_saturation relief cannot diverge.
+        #
+        # CONSUMED CONTINUOUSLY (, 2026-09-16). This was `>= 1.0` — a
+        # cliff — and that is the loop the goal describes: substantive_demotion
+        # penalises a recurring goal for non-substantive closes, a demoted goal
+        # is not selected, so it cannot produce a substantive close, so the
+        # demotion never lifts. Overdue grew without bound and could not win
+        # until 6x the declared interval (exempt_ratio 5.0 means elapsed >= 6x),
+        # because `score = cap` is an ASSIGNMENT that also destroys the row's
+        # ordering information — every demoted row lands on the same number.
+        # Scaling the demotion DISTANCE by (1.0 - level) mirrors the
+        # recurring_saturation relief's existing shape rather than inventing a
+        # new waiver, and is exact at both ends: level 0.0 assigns `cap` to the
+        # cent (today's behaviour), level 1.0 leaves the score untouched (the
+        # old `continue`). In between the row keeps a distinct score, so the
+        # tie the cap used to manufacture no longer erases ordering.
         if overdue_exemption_level(ratio, iv, config) >= 1.0:
             continue  # genuinely-stale monitoring must surface
         s.setdefault("breakdown", {})["substantive_demotion"] = round(cap - s["score"], 2)
         s.setdefault("raw", {})["substantive_demotion_pre_score"] = s["score"]
         s["raw"]["substantive_demotion_applied"] = True
         s["score"] = cap
+    return scored
+
+
+def reapply_substantive_demotion_cap(scored, config):
+    """: re-derive the FW-1 cap after the boost passes have run.
+
+    THE DEFECT. `apply_substantive_demotion` freezes `cap = top_sub - margin`,
+    and FOUR boost passes then run before the sort (cell_return, starvation,
+    pull, fan_in). Every substantive row they lift raises the true top without
+    moving the cap, so the bound actually delivered is `top_sub_post - cap`,
+    not `margin`. Measured three times, three boxes:
+
+        alpha cc-08 2026-09-10  gap 3.32   (2018 candidates)
+        echo  cc-03 2026-09-16  gap 3.45 = 6.9x  (1867 candidates)
+        alpha cc-04 2026-09-16  gap 4.08 = 8.2x  (2283 candidates)
+
+    The direction is one-signed and it is the harmful one: recurring rows are
+    bound FURTHER below substantive work than the contract says, so monitors
+    are over-suppressed. program.md makes that a product cost — "Detection
+    stays hot ... the never-break-them backstop" — against a PROD with live
+    paying users.
+
+    WHY THIS IS A SECOND PASS AND NOT A REORDER — the four counter-rationales,
+    adjudicated rather than inverted. Each boost documents that it runs AFTER
+    the demotion deliberately: cell_return "so the bonus reflects the
+    post-demotion baseline", starvation "AFTER the other boosts and BEFORE the
+    sort", pull "LAST among the boosts". Moving the demotion below them would
+    invert all four at once. It is also unnecessary: what is stale is the
+    ANCHOR, not the placement. `apply_substantive_demotion` already records
+    `raw.substantive_demotion_pre_score`, so the pre-cap value survives the
+    first pass and the correct score is recoverable without re-running
+    anything (rb-4451 — separate the operative value from the immutable
+    recompute-anchor). The boosts keep their post-demotion baseline; only the
+    bound is re-derived from the scores that actually exist at sort time.
+
+    RELAX-ONLY, deliberately. `cap` can only RISE here, because the boost
+    passes only add. So this pass restores demoted rows toward
+    `min(pre_score, new_cap)` and never lowers any row, and it never newly
+    demotes a recurring row that a boost lifted past the cap. That second
+    restraint is the load-bearing one: newly demoting a boosted row would put
+    this pass in direct opposition to the boost that just fired, which is the
+    anti-correlated-terms failure guard-5601 measures (two terms sized against
+    different references cancelling exactly, both rationales reading as
+    rigorous). A boost is an instruction to lift; this pass does not argue
+    with it.
+
+    Consequences that follow from relax-only, and are worth stating because
+    they bound the blast radius: no row's score decreases against today's
+    behaviour, so nothing that ranks now can be displaced downward by anything
+    except a recurring row rising to its CONTRACTED bound. The exemption arms
+    are untouched — an exempt row was never demoted, carries no
+    `substantive_demotion_applied`, and is therefore invisible here.
+
+    Pure w.r.t. `config`; mutates and returns `scored` in place. No-ops when
+    the feature is disabled, when nothing was demoted, or when the same floor
+    and substantive-candidate guards the first pass applies now fail.
+    """
+    if not config.get("substantive_demotion_enabled"):
+        return scored
+    if len(scored) < 2:
+        return scored
+    demoted = [s for s in scored if (s.get("raw") or {}).get("substantive_demotion_applied")]
+    if not demoted:
+        return scored
+    margin = float(config["substantive_demotion_margin"])
+    floor = float(config["substantive_demotion_floor"])
+    # Same "substantive" predicate as the first pass, evaluated on the
+    # post-boost scores. Kept literal rather than factored out: the two passes
+    # must agree, and a shared helper that drifts is harder to spot than two
+    # adjacent identical comprehensions.
+    substantive = [
+        s for s in scored
+        if not s.get("recurring")
+        and (s.get("raw") or {}).get("agent_executable", 0) > 0
+    ]
+    if not substantive:
+        return scored
+    top_sub = max(s["score"] for s in substantive)
+    if top_sub < floor:
+        return scored
+    cap = round(top_sub - margin, 2)
+    for s in demoted:
+        pre = float(s["raw"]["substantive_demotion_pre_score"])
+        new_score = round(min(pre, cap), 2)
+        if new_score <= s["score"]:
+            continue  # RELAX-ONLY: never lower a row here
+        s["raw"]["substantive_demotion_recap_from"] = s["score"]
+        s["raw"]["substantive_demotion_recap_cap"] = cap
+        s["raw"]["substantive_demotion_recap_applied"] = True
+        s["score"] = new_score
+        s.setdefault("breakdown", {})["substantive_demotion"] = round(new_score - pre, 2)
     return scored
 
 
@@ -6464,94 +6644,126 @@ def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False,
     the very next invocation. A standing user directive and a starving recurring
     goal both outrank a policy preference.
 
-    Fail-open throughout: never raises, never blocks selection.
+    NEVER BLOCKS SELECTION — but FAIL-OPEN IS THE CALL SITE'S PROPERTY, NOT THIS
+    FUNCTION'S. This line read "Fail-open throughout: never raises" until
+    2026-09-14 and that was false here: the sentence is inherited from
+    apply_strategic_focus_floor (which this function's opening line says it
+    mirrors), and that sibling really does carry an `except`. This one does NOT
+    — it has `try`/`finally` and no `except`, because the single-exit emit
+    (g-306-485) needed `finally` — so an exception PROPAGATES. The caller wraps
+    the whole block in `except Exception` and prints a diagnostic; that is where
+    the fail-open actually lives, and system behaviour is unchanged. The
+    `finally` emit below still runs on the raising path, reading `status` and
+    never locals, and test_a_record_is_written_even_when_the_body_RAISES pins
+    both halves. If you add an `except` here that test goes red ON PURPOSE:
+    swallowing the exception silently removes the caller's diagnostic. Fix this
+    docstring, not the test (g-306-484).
     """
     status = {"role": None, "branch": None, "live_workers": 0, "detail": {},
               "reducer_only_rows": 0, "picked": None, "yielded": False}
-    body_role, sid, running_sid = _reducer_policy_inputs(agent_dir)
-    role = reducer_selection_policy.role_of(body_role, sid, running_sid)
-    status["role"] = role
 
-    cfg = REDUCER_SELECTION_CONFIG
-    # `now` is INJECTABLE and defaults to the wall clock ( follow-up).
-    # live_worker_count already takes `now` as a parameter deliberately -- it
-    # compares `claimed_at` against a freshness cutoff, so a caller that hardcodes
-    # datetime.now() SEVERS that seam and makes every threshold behaviour
-    # untestable except against the real clock. It did, and the cost was a TIME
-    # BOMB: test_reducer_selection_policy.py anchors its fixture rows to a frozen
-    # NOW (2026-09-03 12:00), so rows written as "1 hour ago" aged past the 6h
-    # cutoff at ~17:00 that same day and four tests flipped from green to red
-    # PERMANENTLY -- 25/25 passing when authored that morning, 4 failing by
-    # evening, with no code change between. A date-dependent red reads as a real
-    # regression to everyone who meets it later (it cost one reducer a baseline
-    # run against a pristine worktree to rule out). Restoring the seam is the
-    # module's own pattern, not a new one.
-    detail = reducer_selection_policy.live_worker_count(
-        _load_team_state_cached() or {}, now or datetime.now(),
-        cfg.get("claim_fresh_hours", 6.0), exclude_sid=sid)
-    status["detail"] = detail
-    status["live_workers"] = detail["live"]
+    try:
+        body_role, sid, running_sid = _reducer_policy_inputs(agent_dir)
+        role = reducer_selection_policy.role_of(body_role, sid, running_sid)
+        status["role"] = role
 
-    decision = reducer_selection_policy.decide(
-        role=role, live_workers=detail["live"], config=cfg)
-    status["branch"] = decision.branch
-    status["reason"] = decision.reason
-    status["threshold"] = cfg.get("worker_threshold")
+        cfg = REDUCER_SELECTION_CONFIG
+        # `now` is INJECTABLE and defaults to the wall clock ( follow-up).
+        # live_worker_count already takes `now` as a parameter deliberately -- it
+        # compares `claimed_at` against a freshness cutoff, so a caller that hardcodes
+        # datetime.now() SEVERS that seam and makes every threshold behaviour
+        # untestable except against the real clock. It did, and the cost was a TIME
+        # BOMB: test_reducer_selection_policy.py anchors its fixture rows to a frozen
+        # NOW (2026-09-03 12:00), so rows written as "1 hour ago" aged past the 6h
+        # cutoff at ~17:00 that same day and four tests flipped from green to red
+        # PERMANENTLY -- 25/25 passing when authored that morning, 4 failing by
+        # evening, with no code change between. A date-dependent red reads as a real
+        # regression to everyone who meets it later (it cost one reducer a baseline
+        # run against a pristine worktree to rule out). Restoring the seam is the
+        # module's own pattern, not a new one.
+        detail = reducer_selection_policy.live_worker_count(
+            _load_team_state_cached() or {}, now or datetime.now(),
+            cfg.get("claim_fresh_hours", 6.0), exclude_sid=sid)
+        status["detail"] = detail
+        status["live_workers"] = detail["live"]
 
-    # Outcome 1: the reducer logs the count and the branch EVERY iteration --
-    # including the branches that change nothing. A record that only appears when
-    # the policy fires cannot distinguish "did not fire" from "did not run".
-    if role == reducer_selection_policy.ROLE_REDUCER:
-        _append_policy_diary({
-            "entry_type": "decision",
-            "content": (f"reducer_selection_policy: {decision.branch} "
-                        f"({decision.reason})"),
-            "reducer_selection_policy": {
-                "branch": decision.branch,
-                "live_workers": detail["live"],
-                "threshold": cfg.get("worker_threshold"),
-                "stale_rows_ignored": detail["stale"],
-                "undated_rows_ignored": detail["undated"],
-            },
-        }, agent_dir)
+        decision = reducer_selection_policy.decide(
+            role=role, live_workers=detail["live"], config=cfg)
+        status["branch"] = decision.branch
+        status["reason"] = decision.reason
+        status["threshold"] = cfg.get("worker_threshold")
 
-    if not decision.prefer_reducer_only or not scored:
-        return None, status
 
-    # THE GOAL FIELD ONLY. `test_selection_stays_role_blind` forbids this file
-    # from naming the worker-side eligibility module AT ALL -- it asserts by raw
-    # source grep, so even a comment mentioning it trips the pin, which is why
-    # this one does not. The fence is right:
-    # LIFECYCLE_DISPOSITIONS["select"] says "there is no worker-specific selection
-    # logic and there must not be one", and reaching for that module here would
-    # put the WORKER's routing code inside the component both roles run. This
-    # floor needs none of it -- `executable_by_role` is a plain field on the goal
-    # record, so the selector reads DATA, not a role module, and the fence stands
-    # unmodified.
-    #
-    # CONSEQUENCE, STATED PLAINLY: this is INERT until 's commit
-    # (e62c24033) is merged off refs/workers/alpha/2fda1f3e... and goals are
-    # stamped -- `executable_by_role` is registered in _goal_fields.py THERE, and
-    # writes are gated on registration, so no goal can carry it yet. Shipping the
-    # mechanism ahead of its data is the same shape as the close-review gate
-    # (), and it is strictly better than making a tested architectural
-    # fence go green by deleting it (guard-4618).
-    nominees = [r for r in scored
-                if reducer_selection_policy.is_reducer_only_row(r)]
-    status["reducer_only_rows"] = len(nominees)
-    if not nominees:
-        return None, status  # nothing reducer-only in the pool -- the inert case
-    if prior_hoist_fired:
-        status["yielded"] = True
-        return None, status
+        if not decision.prefer_reducer_only or not scored:
+            return None, status
 
-    picked = nominees[0]  # `scored` is already sorted, so this is the best one
-    if scored[0] is not picked:
-        scored.remove(picked)
-        scored.insert(0, picked)
-    picked["reducer_only_pick"] = True
-    status["picked"] = picked.get("goal_id")
-    return picked, status
+        # THE GOAL FIELD ONLY. `test_selection_stays_role_blind` forbids this file
+        # from naming the worker-side eligibility module AT ALL -- it asserts by raw
+        # source grep, so even a comment mentioning it trips the pin, which is why
+        # this one does not. The fence is right:
+        # LIFECYCLE_DISPOSITIONS["select"] says "there is no worker-specific selection
+        # logic and there must not be one", and reaching for that module here would
+        # put the WORKER's routing code inside the component both roles run. This
+        # floor needs none of it -- `executable_by_role` is a plain field on the goal
+        # record, so the selector reads DATA, not a role module, and the fence stands
+        # unmodified.
+        #
+        # CONSEQUENCE, STATED PLAINLY: this is INERT until 's commit
+        # (e62c24033) is merged off refs/workers/alpha/2fda1f3e... and goals are
+        # stamped -- `executable_by_role` is registered in _goal_fields.py THERE, and
+        # writes are gated on registration, so no goal can carry it yet. Shipping the
+        # mechanism ahead of its data is the same shape as the close-review gate
+        # (), and it is strictly better than making a tested architectural
+        # fence go green by deleting it (guard-4618).
+        nominees = [r for r in scored
+                    if reducer_selection_policy.is_reducer_only_row(r)]
+        status["reducer_only_rows"] = len(nominees)
+        if not nominees:
+            return None, status  # nothing reducer-only in the pool -- the inert case
+        if prior_hoist_fired:
+            status["yielded"] = True
+            return None, status
+
+        picked = nominees[0]  # `scored` is already sorted, so this is the best one
+        if scored[0] is not picked:
+            scored.remove(picked)
+            scored.insert(0, picked)
+        picked["reducer_only_pick"] = True
+        status["picked"] = picked.get("goal_id")
+        return picked, status
+    finally:
+        # ONE record per call, emitted AFTER status is fully populated. The write
+        # used to sit ABOVE all four returns so it could be unconditional -- but
+        # `picked` and `yielded` do not EXIST yet at that point, so the row could
+        # name the BRANCH and never the CONSEQUENCE. Six consecutive
+        # above-threshold iterations were therefore equally consistent with "the
+        # reducer took reducer-only work" and with "the floor yielded and
+        # something else was picked", and nothing durable told them apart
+        # (; measured by zeta 2026-09-14). `finally` keeps the
+        # unconditional guarantee the old placement was bought with -- every
+        # return path, and an escaping exception too -- while emitting exactly
+        # once, late enough to be informative.
+        #
+        # READ EVERY VALUE OFF `status`, NEVER OFF A LOCAL: on an early raise the
+        # locals do not exist, while `status` still carries its initialised Nones.
+        if status.get("role") == reducer_selection_policy.ROLE_REDUCER:
+            _append_policy_diary({
+                "entry_type": "decision",
+                "content": (f"reducer_selection_policy: {status['branch']} "
+                            f"({status.get('reason')}) "
+                            f"picked={status['picked']} "
+                            f"yielded={status['yielded']}"),
+                "reducer_selection_policy": {
+                    "branch": status["branch"],
+                    "live_workers": status["live_workers"],
+                    "threshold": status.get("threshold"),
+                    "stale_rows_ignored": status["detail"].get("stale"),
+                    "undated_rows_ignored": status["detail"].get("undated"),
+                    "reducer_only_rows": status["reducer_only_rows"],
+                    "picked": status["picked"],
+                    "yielded": status["yielded"],
+                },
+            }, agent_dir)
 
 
 def emit_reducer_only_floor_banner(picked, status):
@@ -6792,6 +7004,10 @@ def cmd_select(args):
 
     # Load resolved hypotheses for evidence_backing
     pipeline = read_jsonl(PIPELINE_PATH)
+    # The eager pull never re-pulls an archive, so a local read goes stale
+    # (). Refresh costs 1 HEAD when current.
+    from _fresh_read import refresh_for_read
+    refresh_for_read(PIPELINE_ARCHIVE_PATH, label="goal-selector")
     archive = read_jsonl(PIPELINE_ARCHIVE_PATH)
     resolved = [r for r in pipeline + archive
                 if r.get("outcome") in ("CONFIRMED", "CORRECTED")]
@@ -7055,6 +7271,15 @@ def cmd_select(args):
     # pulled set. See apply_pull_boost.
     apply_pull_boost(scored, PULL_CONFIG)
     apply_fan_in_boost(scored, all_aspirations, FAN_IN_CONFIG)
+
+    # FW-1 anchor repair (): the cap frozen above is stale by the time
+    # the four boost passes have run — measured gap 3.32 / 3.45 / 4.08 against a
+    # contracted margin of 0.5, three boxes. Re-derive it from the post-boost
+    # scores and relax the demoted rows toward their recorded pre-score. Runs
+    # AFTER every boost (it must see the final substantive top) and BEFORE the
+    # sort (its result drives the ranking). Relax-only, so it cannot fight the
+    # boosts that just fired. See reapply_substantive_demotion_cap.
+    reapply_substantive_demotion_cap(scored, RECURRING_CONFIG)
 
     # Sort: highest score first, then MOST OVERDUE first among equal scores, then
     # lower aspiration id, then lower goal id. See candidate_sort_key for why

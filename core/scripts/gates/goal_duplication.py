@@ -76,6 +76,9 @@ _DUP_LOG_WALK_MAX = 3000
 from _gate_log import log as _gate_log  # type: ignore
 from _paths import agents_root as _agents_root  # type: ignore
 from _dt import parse_naive_iso  # type: ignore  (shared tzinfo-stripping naive-ISO parse, /)
+# : board channels are read through the path-list seam, never by
+# hardcoding `<channel>.jsonl`. See `_board_channel_records` below.
+from _board_paths import channel_paths, read_paths  # type: ignore
 from _target_state import (  # type: ignore
     _FILE_PATH_RE,
     _resolve_search_roots,
@@ -311,6 +314,30 @@ def _is_structural_identifier(token: str) -> bool:
     needed removing to fix g-248-115 — this is the minimal shape change.
     """
     return bool(re.search(r"[_0-9]", token)) or bool(_FILE_EXT_RE.search(token))
+
+
+def _has_specific_cosignal(hit_paths, hit_kws, idf, idf_floor, source_name):
+    """True iff the overlap carries a SPECIFIC co-signal — a directory-qualified
+    file path, or a structural identifier keyword at/above the IDF floor.
+
+    Extracted from _check_pending_queue Strategy 2 (g-115-6334) so Strategy 1
+    can apply the SAME predicate. Two definitions of "is this real duplicate
+    evidence" in one gate would drift, and every measured false positive in this
+    file is a variant of one drifting apart from another. The measured incidents
+    behind each clause stay at the Strategy-2 call site, which is where a reader
+    tracing a structural block arrives:
+      * bare filename (SKILL.md, retrieve.sh) is shared VOCABULARY, not a
+        work target — only a "/"-qualified path qualifies (g-115-2563);
+      * a PROSE-sourced proposal requires the path outright, because prose
+        shares TOPIC identifiers rather than work-target files (g-115-1821);
+      * hyphen-only compounds are not identifiers (g-248-117).
+    """
+    qualified = [fp for fp in hit_paths if "/" in fp]
+    if source_name == "prose":
+        return bool(qualified)
+    return bool(qualified) or any(
+        _is_structural_identifier(k) and idf.get(k, idf_floor) >= idf_floor
+        for k in hit_kws)
 
 
 # : a file-path named ONLY in a NEGATIVE / exclusion context
@@ -1582,32 +1609,31 @@ def _check_insight_triggers(goal, file_paths, self_agent, world_dir,
                        "not duplication; g-115-2685 / g-115-2477 family)"),
             "matches": [],
         }
-    findings_path = world_dir / "board" / "findings.jsonl"
-    if not findings_path.exists():
+    # Enumerated through the reader seam, never a hardcoded filename
+    # (). `include_archive=False` preserves today's population: the
+    # window below is 48h and every archived row predates the rotation.
+    findings_paths = channel_paths(world_dir / "board", "findings",
+                                   include_archive=False)
+    if not findings_paths:
+        # An empty enumeration means neither the live file nor any segment is
+        # present, so naming the live file stays TRUE -- but say both, because
+        # "no findings.jsonl" alone would send a reader looking for one file
+        # when the channel may simply not have been segmented here yet.
         return {
             "name": "insight_triggers",
             "passed": True,
-            "reason": "skipped (no findings.jsonl)",
+            "reason": "skipped (no findings channel — no findings.jsonl and no segments)",
             "matches": [],
         }
     cutoff = dt.datetime.now() - dt.timedelta(hours=48)
     entries = []
     try:
-        with open(findings_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
-                if ts:
-                    rec_time = parse_naive_iso(ts)
-                    if rec_time is not None and rec_time < cutoff:
-                        continue
-                entries.append(rec)
+        records, missing = read_paths(findings_paths)
+        faults = [m for m in (missing or []) if m.get("reason") == "unreadable"]
+        if faults:
+            print("warning: findings channel window shortened by %d unreadable "
+                  "path(s): %s" % (len(faults),
+                  "; ".join(str(m.get("path")) for m in faults)), file=sys.stderr)
     except Exception as e:
         return {
             "name": "insight_triggers",
@@ -1615,6 +1641,13 @@ def _check_insight_triggers(goal, file_paths, self_agent, world_dir,
             "reason": "skipped (read error: " + str(e) + ")",
             "matches": [],
         }
+    for rec in records:
+        ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
+        if ts:
+            rec_time = parse_naive_iso(ts)
+            if rec_time is not None and rec_time < cutoff:
+                continue
+        entries.append(rec)
 
     expected = expected_paths or set()
 
@@ -1669,41 +1702,69 @@ def _check_insight_triggers(goal, file_paths, self_agent, world_dir,
     }
 
 
-def _scan_affects_tags(jsonl_path: Path, type_filter, required_tag,
-                       self_agent: str, cutoff):
-    """Scan a board JSONL file for non-self posts within `cutoff` whose tags
+def _board_channel_records(world_dir: Optional[Path], channel: str):
+    """Every record of one board channel, through the path-list seam ().
+
+    Replaces three hardcoded `world_dir / "board" / "<channel>.jsonl"` opens.
+    `include_archive=False` keeps today's population exactly: both callers
+    window to 24-48h and every archived row predates the rotation, so the
+    archive can only cost bytes. Segments are picked up, which is the point --
+    a segmented writer would otherwise leave this gate reading a shrinking
+    live file and silently losing the triggers that suppress duplicate filings.
+
+    FAIL-OPEN, matching both call sites: an unreadable channel contributes
+    nothing rather than blocking a filing. That is deliberate here and is the
+    opposite of the choice `insight-trigger-gate` makes, because this gate
+    REFUSES work on a hit -- a read fault must not manufacture a refusal.
+    """
+    if world_dir is None:
+        return []
+    try:
+        paths = channel_paths(Path(world_dir) / "board", channel,
+                              include_archive=False)
+        if not paths:
+            return []
+        records, missing = read_paths(paths)
+        faults = [m for m in (missing or []) if m.get("reason") == "unreadable"]
+        if faults:
+            print("warning: %s channel window shortened by %d unreadable path(s): %s"
+                  % (channel, len(faults),
+                     "; ".join(str(m.get("path")) for m in faults)), file=sys.stderr)
+        return records
+    except Exception:
+        return []
+
+
+def _scan_affects_tags(world_dir: Optional[Path], channel: str, type_filter,
+                       required_tag, self_agent: str, cutoff):
+    """Scan one board CHANNEL for non-self posts within `cutoff` whose tags
     contain `affects:<path>`. Returns lowercased set of paths. Fail-open
-    (any error → empty contribution)."""
-    if not jsonl_path.exists():
-        return set()
+    (any error → empty contribution).
+
+    Takes a channel NAME, not a path: the channel's files are enumerated by
+    `_board_channel_records` through the reader seam (g-358-110), so this stays
+    correct when a channel stops being one file.
+    """
     expected = set()
     try:
-        with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+        for rec in _board_channel_records(world_dir, channel):
+            if type_filter and rec.get("type") != type_filter:
+                continue
+            ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
+            if ts:
+                rec_time = parse_naive_iso(ts)
+                if rec_time is not None and rec_time < cutoff:
                     continue
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if type_filter and rec.get("type") != type_filter:
-                    continue
-                ts = rec.get("timestamp") or rec.get("posted_at") or rec.get("created")
-                if ts:
-                    rec_time = parse_naive_iso(ts)
-                    if rec_time is not None and rec_time < cutoff:
-                        continue
-                if rec.get("author") == self_agent:
-                    continue
-                tags = rec.get("tags") or []
-                if required_tag and required_tag not in tags:
-                    continue
-                for t in tags:
-                    if isinstance(t, str) and t.startswith("affects:"):
-                        path = t.split(":", 1)[1]
-                        if path:
-                            expected.add(path.lower())
+            if rec.get("author") == self_agent:
+                continue
+            tags = rec.get("tags") or []
+            if required_tag and required_tag not in tags:
+                continue
+            for t in tags:
+                if isinstance(t, str) and t.startswith("affects:"):
+                    path = t.split(":", 1)[1]
+                    if path:
+                        expected.add(path.lower())
     except Exception:
         return set()
     return expected
@@ -1727,7 +1788,7 @@ def _expected_coverage_paths(goal: dict, self_agent: str,
     expected = set()
 
     expected |= _scan_affects_tags(
-        world_dir / "board" / "findings.jsonl",
+        world_dir, "findings",
         type_filter=None,
         required_tag="insight_trigger",
         self_agent=self_agent,
@@ -1735,7 +1796,7 @@ def _expected_coverage_paths(goal: dict, self_agent: str,
     )
 
     expected |= _scan_affects_tags(
-        world_dir / "board" / "coordination.jsonl",
+        world_dir, "coordination",
         type_filter="review-request",
         required_tag=None,
         self_agent=self_agent,
@@ -2154,10 +2215,14 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
     through cleanly.
 
     Match strategies (any one blocks):
-      1. origin_signal exact match — STRONG; symptom-keyed identity
-         (the goal description: "keyed on symptom/origin-signal not
+      1. origin_signal exact match WITH a specific co-signal — symptom-keyed
+         identity (the goal description: "keyed on symptom/origin-signal not
          title prose"). Only fires when both proposed and existing
-         origin_signal are non-empty.
+         origin_signal are non-empty AND the pair shares a directory-qualified
+         file path or a structural identifier. A shared origin with NO
+         co-signal is shared PROVENANCE (one directive, one alert, one board
+         post spawning N distinct findings) and demotes to a visible advisory
+         (g-115-6334).
       2. Structural overlap with co-signal — mirrors
          _check_recent_completions: weighted >= 1.5, unique_hits >= 2,
          structural co-signal (file-path hit OR keyword with -_0-9).
@@ -2262,20 +2327,24 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
     # bare tags immediately above: they identify the LANE that filed the goal,
     # not the symptom it addresses, so exact-matching them blocks every Nth
     # filing against its N-1 unrelated predecessors ().
-    origin_matches = []
+    # (record, candidate) pairs, not two parallel lists: zip() TRUNCATES to the
+    # shorter one, so a future append that updated only one list would silently
+    # drop an origin match from the co-signal decision below — i.e. stop blocking,
+    # with no error anywhere ( fresh-eyes F-001).
+    origin_pairs = []
     if (proposed_origin and proposed_origin not in _GENERIC_BARE_ORIGINS
             and proposed_origin not in _LANE_CONSTANT_ORIGINS
             and not proposed_origin.startswith(_SIBLING_SHARED_ORIGIN_PREFIXES)):
         for c in candidates:
             if c["origin_signal"] and c["origin_signal"] == proposed_origin:
-                origin_matches.append({
+                origin_pairs.append(({
                     "source": c["source"],
                     "asp_id": c["asp_id"],
                     "goal_id": c["goal_id"],
                     "title": c["title"][:120],
                     "origin_signal": c["origin_signal"],
                     "match_strategy": "origin_signal",
-                })
+                }, c))
         # : completed twins carrying the same origin_signal (the
         # exact match is precise + low-FP, so it is safe to extend to the
         # completed corpus where fuzzy overlap would not be). A distinct
@@ -2285,14 +2354,16 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
         #  dup'd completed  (both board_post:msg-4248).
         for c in completed_candidates:
             if c["origin_signal"] and c["origin_signal"] == proposed_origin:
-                origin_matches.append({
+                origin_pairs.append(({
                     "source": c["source"],
                     "asp_id": c["asp_id"],
                     "goal_id": c["goal_id"],
                     "title": c["title"][:120],
                     "origin_signal": c["origin_signal"],
                     "match_strategy": "origin_signal_completed",
-                })
+                }, c))
+
+    origin_matches = [m for m, _c in origin_pairs]
 
     # Completed-Maintain restriction (, extending  /
     # ). A status=completed Maintain record documents work that
@@ -2461,18 +2532,13 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
         # qualified-path / [_0-9]-identifier co-signals). Bare names still count
         # toward strong (unique_hits/weighted) — only their HARD-BLOCK power is
         # removed.
-        qualified_hit_paths = [fp for fp in hit_paths if "/" in fp]
-        if source_name == "prose":
-            has_specific = bool(qualified_hit_paths)
-        else:
-            # : same structured-identifier shape as recent_completions
-            # (_is_structural_identifier). Keeps the snake_case/goal-id co-signal
-            # ([_0-9], e.g. board_write) and now also recognizes file-names; a
-            # bare hyphen-compound never qualified here (this branch was already
-            # [_0-9], not [-_0-9]) so behavior for generic compounds is unchanged.
-            has_specific = bool(qualified_hit_paths) or any(
-                _is_structural_identifier(k) and idf.get(k, idf_floor) >= idf_floor
-                for k in hit_kws)
+        # : same structured-identifier shape as recent_completions
+        # (_is_structural_identifier). Keeps the snake_case/goal-id co-signal
+        # ([_0-9], e.g. board_write) and now also recognizes file-names; a
+        # bare hyphen-compound never qualified here (this branch was already
+        # [_0-9], not [-_0-9]) so behavior for generic compounds is unchanged.
+        has_specific = _has_specific_cosignal(
+            hit_paths, hit_kws, idf, idf_floor, source_name)
         if strong and has_specific:
             # : the candidate's own lineage necessarily shares its
             # vocabulary — demote to a visible advisory instead of blocking.
@@ -2516,8 +2582,61 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
                 "weighted_score": round(weighted, 2),
             })
 
-    matches = origin_matches + structural_matches
-    advisories.sort(key=lambda a: (not a.get("lineage_exempt"),
+    #  — SHARED PROVENANCE IS NOT DUPLICATION. A Strategy-1 origin
+    # exact match is duplicate evidence only when a SPECIFIC co-signal
+    # corroborates it (the same has_specific predicate Strategy 2 applies).
+    #
+    # Measured 2026-08-15 (bravo) and re-measured live 2026-09-15 (alpha,
+    # cc-04) against the world queue: a synthetic goal about greenhouse
+    # humidity sensors was REFUSED as a duplicate of a credential-blocker goal,
+    # on a shared `user_directed:<directive>` key alone, with file_path_hits
+    # empty and keyword_hits empty. One directive legitimately produces N
+    # distinct findings; the key names the PARENT EVENT, not the symptom. This
+    # is the identical false-positive class the three exemptions above already
+    # fix by NAME (bare tags, lane constants, decomposition/parent_aspiration
+    # siblings) -- guard-6368: an allowlist built from names is not an
+    # allowlist, and `user_directed:`/`alert-email:<key>`/`board_post:<msg>`
+    # kept arriving as the next name nobody had added. guard-1058 clause (d)
+    # has been instructing agents to override exactly this by hand, 2124 times.
+    #
+    # The evidence test subsumes all three name lists as special cases and
+    # needs no maintenance as new shared-parent keys appear. A TRUE duplicate
+    # is unaffected: it shares the work target, so it carries the co-signal
+    # here, and it independently trips Strategy 2, Strategy 0 (exact title), or
+    # the lineage checks. guard-6704's cross-box twins are byte-identical and
+    # so are caught by all three. The demoted rows stay VISIBLE as advisories,
+    # sorted first so the 5-row cap never hides them -- a filer must still learn
+    # that a same-origin goal exists (guard-1773: refuting the stated match is
+    # not a novelty proof).
+    #
+    # SCOPE: the completed-Maintain carve-out above returns BEFORE this site and
+    # keeps its own deliberately-exact matching () -- narrowing it
+    # needs its own evidence, and this goal measured neither FP there.
+    origin_blocking = []
+    for _m, _c in origin_pairs:
+        _hit_paths = sorted(fp for fp in file_paths if fp.lower() in _c["text"])
+        _hit_kws = sorted(kw for kw in keywords if kw in _c["text"])
+        _m["file_path_hits"] = _hit_paths
+        _m["keyword_hits"] = _hit_kws[:5]
+        if _has_specific_cosignal(_hit_paths, _hit_kws, idf, idf_floor,
+                                  source_name):
+            origin_blocking.append(_m)
+        else:
+            advisories.append({
+                "source": _m["source"],
+                "goal_id": _m["goal_id"],
+                "origin_signal": _m["origin_signal"],
+                "file_path_hits": _hit_paths,
+                "keyword_hits": _hit_kws[:5],
+                "unique_hits": len(_hit_paths) + len(_hit_kws),
+                "match_strategy": _m["match_strategy"],
+                "origin_only_no_cosignal": True,
+            })
+    origin_demoted = len(origin_matches) - len(origin_blocking)
+
+    matches = origin_blocking + structural_matches
+    advisories.sort(key=lambda a: (not a.get("origin_only_no_cosignal"),
+                                    not a.get("lineage_exempt"),
                                     not a.get("strong_keyword_only"),
                                     -a.get("weighted_score", 0.0)))
     strong_only = sum(1 for a in advisories if a.get("strong_keyword_only"))
@@ -2550,7 +2669,11 @@ def _check_pending_queue(goal, file_paths, keywords, source_name,
                    " sub-threshold advisories"
                    + (", " + str(strong_only) +
                       " strong keyword-only demoted (no file-path/identifier co-signal)"
-                      if strong_only else "") + ")"),
+                      if strong_only else "")
+                   + (", " + str(origin_demoted) +
+                      " origin_signal exact-match demoted (shared provenance, no "
+                      "co-signal; g-115-6334)"
+                      if origin_demoted else "") + ")"),
         "matches": [],
         "advisories": advisories[:5],
     }
@@ -2858,7 +2981,7 @@ _STRONG_STRATEGIES = frozenset({
     "target_state", "structural_overlap", "title_exact",
     "origin_signal", "origin_signal_completed",
 })
-_GOAL_ID_HIT_RE = re.compile(r"\bg-\d{2,4}-\d{1,4}\b")
+_GOAL_ID_HIT_RE = re.compile(r"\bg-\d{2,4}-\d{1,5}\b")
 
 # The one caveat no signal can settle, so it is stated on every shape.
 _VERIFICATION_PATH_CAVEAT = (

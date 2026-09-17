@@ -162,7 +162,7 @@ def find_cycles(edges):
 
 # A goal id: g-NNN-NN, widened to 2-4 digits on both halves (CLAUDE.md ID
 # Formats —  hit  on 2026-05-19).
-_GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,4}\b")
+_GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,5}\b")
 
 # The migration fallback's marker. Rows closed BEFORE `superseded_by` existed
 # (the ..80 shape) carry their supersession only as prose in

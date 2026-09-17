@@ -6,6 +6,7 @@ The loop ONLY stops for these reasons:
 
 These are NOT stop conditions (the loop MUST continue through them):
 - Context filling up → autocompact handles it
+- The harness `<total_tokens>N tokens left</total_tokens>` marker reading low or 0 → NOT a sensor (guard-6380): it drains across a hook-extended turn while the window is healthy. `bash core/scripts/context-budget-banner.sh` — `zone` is the authority. A budget reading never licenses a registered sleep, a claim release, or "no work this tick"; the only sanctioned pauses are the loop-stall fence's own pause rung (`LOOP-STALL PAUSE` in the stop-hook reason) and a genuine external wait
 - No agent-executable goals → gap analysis → generate new goals
 - All aspirations complete → evolve → create new aspirations
 - All goals blocked → constraint-aware aspiration generation → evolution gap analysis → research → reflection → wait 5 min only as last resort (precheck reprobes blockers each cycle)

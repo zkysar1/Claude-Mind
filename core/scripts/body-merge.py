@@ -249,7 +249,8 @@ def _merge_dict(reducer: dict, body: dict, baseline: dict | None = None) -> dict
     return merged
 
 
-def merge_wm(reducer: dict, body: dict, baseline: dict | None = None) -> dict:
+def merge_wm(reducer: dict, body: dict, baseline: dict | None = None,
+             *, archive_victim=None) -> dict:
     """Merge a Body's WM dict into the reducer's WM dict under per-slot policies.
 
     Preserves the reducer's structure (`slots`, `slot_meta`, top-level keys).
@@ -257,6 +258,14 @@ def merge_wm(reducer: dict, body: dict, baseline: dict | None = None) -> dict:
     `baseline` is the Body's fork-time WM (the common ancestor). When provided,
     numeric counters use a 3-way delta (no baseline double-count); when None the
     merge is the original 2-way union+SUM (backward-compatible / dormant case).
+
+    `archive_victim(slot_name, victim) -> bool` is an OPT-IN emitter consulted
+    before a capture-slot entry is evicted by the cap enforcement below; it must
+    return True only once a durable copy of that entry exists. Default `None`
+    leaves this function byte-for-byte as it was -- the same opt-in property
+    `extra_seen` documents below. The emitter is INJECTED rather than resolved
+    here because this function takes dicts and no paths, and because only the
+    caller knows which lock it is holding and for how long (g-115-9876).
     """
     merged = dict(reducer)
     base = baseline or {}
@@ -338,10 +347,25 @@ def merge_wm(reducer: dict, body: dict, baseline: dict | None = None) -> dict:
     _evicted: dict[str, int] = {}
     for sk, lim in _limits.items():
         val = m_slots.get(sk)
-        if isinstance(val, list):
-            n = wm.enforce_slot_limit(val, lim)
-            if n:
-                _evicted[sk] = n
+        if not isinstance(val, list):
+            continue
+        # ARCHIVE BEFORE DELETE on this path (). The test that pins the
+        # enforcement above states the harm it fixed as unbounded growth, "NOT
+        # data loss ... precisely because nothing evicted". That stopped being
+        # true the moment it evicted: enforce_slot_limit's `may_evict` seam --
+        # the SSOT's own opt-in hook, which the append path passes -- was left
+        # unpassed here, so a capture victim was popped with no copy anywhere,
+        # on the one path that concentrates EVERY Body's captures onto the
+        # reducer. False KEEPS the victim (enforce_slot_limit breaks), leaving
+        # the lane over cap: recoverable, and visible in the next prune report.
+        # Destroying it is neither.
+        _hook = None
+        if archive_victim is not None and sk in wm.CAPTURE_SLOTS:
+            def _hook(victim, _sk=sk):
+                return bool(archive_victim(_sk, victim))
+        n = wm.enforce_slot_limit(val, lim, may_evict=_hook)
+        if n:
+            _evicted[sk] = n
     if _evicted:
         # TOP-LEVEL `capture_evictions`, matching cmd_append. It is deliberately
         # not slot_meta: slot_meta is reducer-wins just below, so a counter there
@@ -386,6 +410,84 @@ def _write_yaml_atomic(path: Path, data: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
     os.replace(tmp, path)
+
+
+# Machine-local write-ahead journal for capture victims evicted during
+# generalize-down (). Same row schema as the durable sink, so one
+# reader serves both -- see wm.archive_evicted_capture_local's contract.
+_CAPTURE_EVICTION_JOURNAL = "capture-evictions-journal.jsonl"
+
+
+def _capture_eviction_journal(state_dir: Path) -> Path:
+    """Path of the WAL a capture victim is written to BEFORE merge_wm pops it.
+
+    Under `agents/<agent>/sessions/`, NOT beside the reducer WM. Two measured
+    reasons, both load-bearing:
+
+    * merge_wm runs INSIDE `wm.wm_lock_for(reducer_wm_path)`, which breaks at
+      stale_seconds=10, and both call sites already state that store I/O stays
+      outside that lock (guard-1965). ONE append to the durable sink measured
+      0.968s against an 18,185,861-byte archive on own-cloud (alpha, hostname
+      cc-04, uname -r 6.8.0-139-generic, 2026-09-15) -- ten victims would break
+      the lock and a real drain evicts thousands. A local fsync'd append costs
+      no round trip at all.
+    * `sessions/` is machine-local and gitignored (`.gitignore` `**/sessions/`);
+      a journal beside the agent-wide WM would sit in the synced tree, whose
+      post-PUT rewrite of the local copy can erase a row appended mid-push --
+      the reason wm.py puts the agent-wide WM out of scope for its own local
+      archive.
+
+    The WAL is transient by construction: `_drain_capture_eviction_journal`
+    moves every row to the durable sink in ONE backend round trip once the lock
+    is released, and unlinks it only after that write returns.
+    """
+    return state_dir.parent / bm._SESSIONS_DIRNAME / _CAPTURE_EVICTION_JOURNAL
+
+
+def _drain_capture_eviction_journal(journal: Path, agent_dir: Path) -> dict:
+    """Move every journalled victim to the durable sink. Call OUTSIDE the lock.
+
+    ONE `locked_modify_jsonl` cycle for the whole batch rather than one
+    `locked_append_jsonl` per row: the sink is append-only and grows without
+    bound, so per-row appends are O(N) each and quadratic over a drain.
+
+    The journal is unlinked only after the sink write returns. A crash before
+    that leaves the rows in BOTH files, and the sink rows are content-identical,
+    so a re-drain DUPLICATES a row rather than losing one -- the correct
+    direction for an archive (archive-before-delete.md). An unparseable row is
+    kept too: leaving it is recoverable, parsing past it is not.
+    """
+    result = {"journalled": 0, "archived": 0, "drain_error": None}
+    if not journal.is_file():
+        return result
+    rows = []
+    try:
+        lines = journal.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        result["drain_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            result["drain_error"] = "unparseable_row_kept"
+    result["journalled"] = len(rows)
+    if not rows:
+        return result
+    try:
+        from _fileops import locked_modify_jsonl
+        locked_modify_jsonl(Path(agent_dir) / wm.CAPTURE_EVICTION_ARCHIVE,
+                            lambda items: (items or []) + rows)
+    except Exception as exc:  # noqa: BLE001 -- any failure must KEEP the journal
+        result["drain_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+    result["archived"] = len(rows)
+    if result["drain_error"] is None:
+        journal.unlink(missing_ok=True)
+    return result
 
 
 def _enumerate_pending(sessions_root: Path, already: set, backend=None) -> list:
@@ -575,12 +677,27 @@ def _mark_consumed(backend, world_staged: Path, unit_key: str) -> None:
     legacy copy survives, so its next `push-staged` would relocate and re-push
     the same triple and this reducer would merge the same divergence twice.
 
-    IT GATES THE PRODUCER, NEVER THE CONSUMER, and that asymmetry is what makes
-    it safe to write EARLY (at the disposition decision, before the deferred
-    delete). A tombstone whose triple still exists is re-globbed and re-merged
-    normally by the next drain, so a crash between this write and the delete
-    costs nothing. Writing it AFTER the delete would leave the real gap: triple
-    gone, no tombstone, origin free to resurrect it.
+    IT GATES THE PRODUCER, NEVER THE CONSUMER. That asymmetry makes it safe to
+    write before the DELETE — a tombstone whose triple still exists is
+    re-globbed and re-merged normally by the next drain, so a crash between
+    this write and the delete costs nothing, while writing it AFTER the delete
+    would leave the real gap: triple gone, no tombstone, origin free to
+    resurrect it. So: always tombstone, then delete.
+
+    IT DOES NOT MAKE IT SAFE TO WRITE BEFORE THE PERSIST, and this docstring
+    said the opposite until g-115-9876 (2026-09-13). The asymmetry argument
+    reasons about the CONSUMER re-reading a surviving triple; the PRODUCER's
+    gate (`body-manifest.unit_already_consumed`) is unconditional, so an early
+    tombstone ACKs a delivery that has not happened yet. The reducer-WM persist
+    is a SEPARATE durable write that can fail while the drain keeps going.
+    Measured 2026-09-12T11:19: one cc-07 reducer drain tombstoned 10 cross-box
+    units whose persist did not land — triples still in the store, WOULD-MERGE
+    10 of 10 on a read-only replay of this module's guards, and 10 producers
+    permanently gated from re-pushing them. Callers on the MERGED path
+    therefore call this only after `_write_yaml_atomic` has returned
+    (guard-953: an ACK may only follow the synchronous durable write). The
+    three immediate-disposition paths (dedup / noop / skipped) delete in the
+    same breath with no deferred persist, so they still call it inline.
 
     Best-effort and silent on failure: no tombstone simply restores the previous
     behaviour, which is the status quo this guard improves on — never a reason
@@ -689,11 +806,14 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
     stop/start cycle un-consumed, 2026-08-04). All three surfaces now route
     through the backend: ENUMERATE (list_dir union'd with the local glob),
     READ (read_authoritative_bytes first, local fallback), DELETE
-    (delete_object beside each unlink). Merged units delete only AFTER the
-    merged reducer WM is durably written: array slots (spark_capture — the
-    learning payload) re-merge idempotently via content-hash dedup, so a
-    crash between write and delete costs at worst a bounded counter re-add,
-    while delete-first would let a crash destroy the divergence outright.
+    (delete_object beside each unlink). Merged units are TOMBSTONED AND
+    DELETED only AFTER the merged reducer WM is durably written (g-115-9876
+    moved the tombstone here from the disposition decision): array slots
+    (spark_capture — the learning payload) re-merge idempotently via
+    content-hash dedup, so a crash between write and delete costs at worst a
+    bounded counter re-add, while delete-first would let a crash destroy the
+    divergence outright and tombstone-first gates the producer against a
+    delivery that never landed.
 
     Each staged WM (+ its hash and baseline sidecars) is deleted after
     processing so it is consumed exactly once (malformed/empty ones dropped,
@@ -745,7 +865,10 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
     if not staged_names:
         return
     pending_merges: list = []  # (body_wm, baseline_wm) -- applied under the lock
-    merged_files: list = []  # authoritative deletes deferred past the WM write
+    # (unit_key, paths) — the TOMBSTONE and the authoritative delete are both
+    # deferred past the WM write (); unit_key rides along so the
+    # deferred loop can tombstone what it is about to delete.
+    merged_files: list = []
     for name in sorted(staged_names):
         # A unitKey in BOTH means this box staged it under the old code and
         # again under the new. Prefer WORLD (written later, and the only copy a
@@ -812,13 +935,17 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
                 baseline_wm = _read_staged_yaml(backend, baseline_path)
                 pending_merges.append((body_wm, baseline_wm))
                 summary["staged_merged"].append(unit_key)
-                # Tombstoned at the DISPOSITION DECISION, not beside the
-                # deferred delete below: see _mark_consumed on why early is the
-                # safe direction (it gates the producer, never this consumer).
-                _mark_consumed(backend, world_staged, unit_key)
-                merged_files.append((staged_path, hash_path, baseline_path))
+                # : deliberately NOT tombstoned here. The tombstone is
+                # the ACK the ORIGIN box reads, and the persist below is a
+                # SEPARATE durable write that can fail while this drain keeps
+                # going — so a disposition-time tombstone ACKs a delivery that
+                # has not happened. It moves to the deferred loop after the
+                # persist, still BEFORE the delete, preserving _mark_consumed's
+                # tombstone-then-delete invariant. See that docstring.
+                merged_files.append(
+                    (unit_key, (staged_path, hash_path, baseline_path)))
             if shadowed_triple is not None:
-                merged_files.append(shadowed_triple)
+                merged_files.append((unit_key, shadowed_triple))
         else:
             summary["skipped"].append(unit_key)
             _mark_consumed(backend, world_staged, unit_key)
@@ -836,14 +963,36 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
         # stale_seconds=10 and an S3 drain can exceed that, which would make
         # this a stale-break GENERATOR rather than a mutex (guard-1965 -- audit
         # the whole cycle body, not just the read and the persist).
+        # : a capture victim gets a durable copy BEFORE it is popped.
+        # The journal append is local and fsync'd, so it adds no store round
+        # trip to the lock hold below; the drain that follows is the store I/O
+        # and is deliberately outside it, for the reason the block above gives.
+        _journal = _capture_eviction_journal(state_dir)
+        _journal.parent.mkdir(parents=True, exist_ok=True)
+
+        def _archive_victim(slot_name, victim):
+            return wm.archive_evicted_capture_local(
+                _journal, slot_name, victim, "generalize_down_array_limit")
+
         with wm.wm_lock_for(reducer_wm_path):
             reducer_wm = _read_yaml(reducer_wm_path)
             for _body_wm, _baseline_wm in pending_merges:
-                reducer_wm = merge_wm(reducer_wm, _body_wm, _baseline_wm)
+                reducer_wm = merge_wm(reducer_wm, _body_wm, _baseline_wm,
+                                      archive_victim=_archive_victim)
             _write_yaml_atomic(reducer_wm_path, reducer_wm)
+        _archived = _drain_capture_eviction_journal(_journal, state_dir.parent)
+        summary.setdefault("capture_eviction_archive", []).append(_archived)
     # Consume merged units only now — after their content is durably in the
     # reducer WM (see the CROSS-BOX docstring paragraph for the crash trade).
-    for files in merged_files:
+    # TOMBSTONE FIRST, THEN DELETE, and both only after the persist above
+    # (). The tombstone now means "durably merged", never "decided to
+    # merge". A crash between the persist and this loop leaves a triple with no
+    # tombstone: the next drain re-merges it idempotently (content-hash dedup)
+    # and the origin may re-push it, both harmless. A crash BEFORE the persist
+    # now also leaves no tombstone, which is the whole repair — previously it
+    # left one, gating the producer against a delivery that never happened.
+    for unit_key, files in merged_files:
+        _mark_consumed(backend, world_staged, unit_key)
         _delete_staged(backend, *files)
 
 
@@ -1032,11 +1181,24 @@ def generalize_down(agent: str, project_root: Path | None = None,
             # a pre-loop WM read is stale at write time and reverts a concurrent
             # daemon set. Store I/O stays outside the lock (see _consume_staged
             # for the stale_seconds argument).
+            # : same archive-before-delete wiring as _consume_staged,
+            # for the same reason -- this is the lane the 10 cross-box staged
+            # units actually arrive through.
+            _journal = _capture_eviction_journal(state_dir)
+            _journal.parent.mkdir(parents=True, exist_ok=True)
+
+            def _archive_victim(slot_name, victim):
+                return wm.archive_evicted_capture_local(
+                    _journal, slot_name, victim, "generalize_down_array_limit")
+
             with wm.wm_lock_for(reducer_wm_path):
                 reducer_wm = _read_yaml(reducer_wm_path)
                 for _body_wm, _baseline in pass_merges:
-                    reducer_wm = merge_wm(reducer_wm, _body_wm, _baseline)
+                    reducer_wm = merge_wm(reducer_wm, _body_wm, _baseline,
+                                          archive_victim=_archive_victim)
                 _write_yaml_atomic(reducer_wm_path, reducer_wm)  # copy-back
+            _archived = _drain_capture_eviction_journal(_journal, state_dir.parent)
+            summary.setdefault("capture_eviction_archive", []).append(_archived)
 
     # /: drain staged orphans, skipping any unit_key already
     # merged in the sessions-pass above (the concurrent-double-merge guard).

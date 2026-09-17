@@ -80,10 +80,8 @@ Trigger evolution check — the system evaluates its own strategy and generates 
      # AND the rb-3171 silent-drift class this delegation eliminated. Evolve's
      # write surface here is the schema_operations narrative alone.
 
-   Run active forgetting pruning:
-     Read core/config/memory-pipeline.yaml forgetting config
-     For each leaf node, calculate retention score
-     If retention < 0.4: archive (if validated) or deprecate
+   Active forgetting (tree leaves) is NOT run here: its one engine is
+     /reflect-maintain Step 2.7 (tree-archive.sh). Never hand-compute retention.
    ```
 
 0.5. **Config Parameter Tuning**:

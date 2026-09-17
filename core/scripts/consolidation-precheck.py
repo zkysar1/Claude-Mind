@@ -122,8 +122,12 @@ def main():
     # reflectable filter, which is what Step 0.1 applies to the endpoint's
     # array. Same corpus + same predicate = same count (outcome 1).
     _by_id = {}
+    from _fresh_read import refresh_for_read
     for _pname in ("pipeline-archive.jsonl", "pipeline.jsonl"):  # live second: live wins
         pipeline_path = WORLD_DIR / _pname
+        if _pname == "pipeline-archive.jsonl":
+            # The eager pull never re-pulls an archive ().
+            refresh_for_read(pipeline_path, label="consolidation-precheck")
         if not pipeline_path.exists():
             continue
         with open(pipeline_path, "r", encoding="utf-8") as f:

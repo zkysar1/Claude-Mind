@@ -116,7 +116,11 @@ elif [ "$v_kind" = "user-stop" ]; then
 else
     echo "No recovery-gate yank on record — the state was changed by /stop from another window or by hand."
 fi
-echo "NEXT ACTION REQUIRED — land gracefully; do NOT call Skill(aspirations) (its entry gate refuses at IDLE):"
+# $HC_LOOP_REF: the loop re-entry as THIS harness names it (_harness_vocab.sh,
+# 2026-09-17) -- Skill(aspirations) on Claude Code, use_skill(aspirations) on a
+# zakcode vessel. Sourced on the landing path only; the rc=1 fast path pays nothing.
+source "$SCRIPT_DIR/_harness_vocab.sh"
+echo "NEXT ACTION REQUIRED — land gracefully; do NOT call $HC_LOOP_REF (its entry gate refuses at IDLE):"
 echo "  1. Invoke /aspirations-consolidate in stop mode — handoff + working-memory flush, so this iteration's learning survives the landing."
 echo "  2. END the turn on a Bash echo. The stop hook allows a turn-end at IDLE; a human /start relaunches the loop."
 exit 0

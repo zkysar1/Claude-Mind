@@ -281,7 +281,18 @@ _SKIP_SUFFIXES = ("-telemetry.jsonl", "-metrics.jsonl", ".tmp", ".lock")
 # how a backup silently stops running. Excluded by DEFAULT, never
 # unconditionally: --include-archives produces the complete set when a
 # migration or audit needs it.
-_ARCHIVE_MARKERS = ("-archive.jsonl", "gate-firings.jsonl")
+# `gate-firings` is the STEM, not the legacy basename, and that is load-bearing
+# (). Since GATE_FIRINGS_SEGMENTED flipped on, the store is written as
+# `gate-firings-YYYY-MM-DD.jsonl` date segments (see `_gate_log.segment_name`,
+# the one writer rule). The marker read `gate-firings.jsonl` and matches by
+# SUBSTRING, so it stopped matching the files the store actually grows: every
+# segment was being INCLUDED in every cold snapshot — ~1 MB/day of exactly the
+# audit tail this marker exists to exclude, 31 segments / 88 MB measured on
+# cc-03 2026-09-16. The stem also excludes `gate-firings.spool.jsonl` and its
+# `.last-flush` pointer, which is correct: both are machine-local drain state
+# (`owncloud_sync._EXCLUDE_NAMES`), not part of the shared store, and
+# `_gate_log.firings_paths` excludes them from the store for the same reason.
+_ARCHIVE_MARKERS = ("-archive.jsonl", "gate-firings")
 
 
 def _is_archive(rel: str) -> bool:
@@ -320,6 +331,11 @@ def build_manifest(include_archives: bool = False):
     total = 0
     for root, prefix in _roots():
         for path, rel in _iter_precious(root, include_archives):
+            if _is_archive(rel):
+                # The eager pull never re-pulls an archive, so snapshot the
+                # store copy, not a stale mirror ().
+                from _fresh_read import refresh_for_read
+                refresh_for_read(path, label="cold-snapshot")
             try:
                 data = path.read_bytes()
             except OSError as exc:  # unreadable file is a reported gap, not a crash

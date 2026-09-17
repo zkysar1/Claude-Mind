@@ -204,6 +204,82 @@ def test_board_signals_do_not_match_a_longer_name_prefix():
     assert sig["alpha"]["ts"] is None
 
 
+# ── read_board_signals: every file of the live half () ─────────────
+# A segmented writer appends to <channel>-<date>.jsonl. A read of the base file
+# alone leaves a peer that posts only there looking silent, and the board is one
+# of the signals that must ALL freeze before the owner is paged.
+
+class _Store:
+    """The store of record, keyed by basename. An absent object raises
+    FileNotFoundError, the contract both storage backends give."""
+
+    def __init__(self, blobs):
+        self.blobs = blobs
+
+    def read_authoritative_bytes(self, path):
+        name = Path(path).name
+        if name not in self.blobs:
+            raise FileNotFoundError(str(path))
+        return self.blobs[name].encode("utf-8")
+
+
+def _post(mid):
+    return json.dumps({"id": mid}) + "\n"
+
+
+def _single_file_join(board_dir, channel, include_archive=True):
+    """The pre-routing read: one hardcoded `<channel>.jsonl`. The control."""
+    p = Path(board_dir) / f"{channel}.jsonl"
+    return [p] if p.exists() else []
+
+
+@pytest.fixture
+def seg_board(tmp_path, monkeypatch):
+    """foxtrot's OLD post in the base file, its RECENT one in a 2026-09-10
+    segment, identical on local disk and in the store."""
+    import storage_backend
+    board = tmp_path / "board"
+    board.mkdir()
+    blobs = {"coordination.jsonl": _post("msg-20260910-010000-foxtrot-1"),
+             "coordination-2026-09-10.jsonl": _post("msg-20260910-093000-foxtrot-2")}
+    for name, text in blobs.items():
+        (board / name).write_text(text, encoding="utf-8")
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: _Store(blobs))
+    return tmp_path
+
+
+def test_board_signal_reads_date_segments_through_the_seam(seg_board):
+    sig = pl.read_board_signals(seg_board, ["foxtrot"])["foxtrot"]
+    assert sig["ts"] == dt.datetime(2026, 9, 10, 9, 30, 0)
+    assert sig["readable"] is True
+
+
+def test_control_board_signal_starves_on_the_base_file_alone(seg_board, monkeypatch):
+    """Without the seam the same reader must MISS the segment, or the test
+    above is not measuring the routing."""
+    monkeypatch.setattr(pl, "channel_paths", _single_file_join)
+    sig = pl.read_board_signals(seg_board, ["foxtrot"])["foxtrot"]
+    assert sig["ts"] == dt.datetime(2026, 9, 10, 1, 0, 0)
+
+
+def test_board_signal_reads_todays_segment_this_box_has_not_pulled(tmp_path, monkeypatch):
+    """Nothing on local disk: the base file and today's segment exist only in
+    the store, as on a box whose pull sweep has not run since a peer minted the
+    segment. Both are read by NAME, so the local enumeration cannot hide them."""
+    import storage_backend
+    (tmp_path / "board").mkdir()
+    today = dt.datetime.now().date()
+    store = _Store({
+        "coordination.jsonl": _post("msg-20260910-010000-foxtrot-1"),
+        f"coordination-{today.isoformat()}.jsonl":
+            _post(f"msg-{today.strftime('%Y%m%d')}-000001-foxtrot-2"),
+    })
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: store)
+    sig = pl.read_board_signals(tmp_path, ["foxtrot"])["foxtrot"]
+    assert sig["ts"] == dt.datetime.combine(today, dt.time(0, 0, 1))
+    assert sig["readable"] is True
+
+
 def test_goal_signals_take_the_newest_claim_or_completion_per_agent():
     lines = [
         json.dumps({"id": "asp-1", "goals": [

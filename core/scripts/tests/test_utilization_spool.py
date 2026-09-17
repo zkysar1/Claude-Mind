@@ -20,10 +20,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+
+from _bash_helpers import BASH  # guard-580: never a bare "bash" argv[0]
 
 _SCRIPTS = Path(__file__).resolve().parent.parent
 if str(_SCRIPTS) not in sys.path:
@@ -673,6 +676,80 @@ def test_without_the_stamp_last_retrieved_would_freeze(bump_store, monkeypatch):
         {"guard-1": {"times_helpful": 41, "retrieval_count": 100}},
         ["times_helpful", "retrieval_count"])   # no last_ts — pre-fix shape
     assert "last_retrieved" not in merged["guard-1"]
+
+
+# --- Cross-store id refusal () ----------------------------------
+# Pins the wrapper-side half of the split. The tests above cover what happens
+# to a delta once it is spooled; these cover which deltas are allowed to spool
+# at all, which nothing pinned before 2026-09-17.
+
+_WRAPPERS = (
+    ("guardrails-increment.sh", "guard-", "rb-4037"),
+    ("reasoning-bank-increment.sh", "rb-", "guard-1836"),
+)
+
+
+@pytest.mark.parametrize("script,good_prefix,wrong_id", _WRAPPERS)
+def test_cross_store_id_is_refused_before_it_spools(script, good_prefix, wrong_id):
+    """A REAL record's id handed to the WRONG store's wrapper must be refused.
+
+    The harmful case is not a bogus id — nothing ever looks one up — but a
+    cross-store one: it spools, flushes, and lands as a permanent row in a
+    sidecar that `utilization_of` never consults for that record, so the credit
+    is UNREADABLE rather than merely delayed. Measured 2026-09-17 (g-115-6903):
+    8 such rows across the two sidecars, both ids below among them. guard-514
+    is the cost — it read times_helpful=0 while holding a genuine credit in the
+    other store, which is the exact signal scar-tissue-check and
+    bulk-retire-dead-entries use to nominate an entry for retirement.
+
+    Hermetic by construction: the refusal sits ABOVE `source _runtime.sh`, so
+    it needs no daemon and writes nothing anywhere.
+    """
+    proc = subprocess.run([BASH, str(_SCRIPTS / script), wrong_id,
+                           "utilization.times_helpful"],
+                          capture_output=True, text=True)
+    assert proc.returncode != 0, (
+        f"{script} ACCEPTED cross-store id {wrong_id} (rc=0) — it spools to the "
+        "wrong sidecar and that record's credit becomes unreadable")
+    assert "wrong_store_id" in proc.stderr, (
+        f"{script} refused {wrong_id} but not as a cross-store id; "
+        f"stderr={proc.stderr!r}")
+
+
+@pytest.mark.parametrize("script,good_prefix,wrong_id", _WRAPPERS)
+def test_same_store_id_is_not_refused_by_the_prefix_check(script, good_prefix,
+                                                          wrong_id):
+    """Positive control: the prefix check must not swallow a legitimate id.
+
+    Paired with an INVALID FIELD deliberately, so nothing is ever spooled — the
+    daemon refuses it downstream. The assertion is only that the refusal is not
+    OURS, which holds whatever the daemon does (invalid_field when it is up, a
+    transport error when it is not), so this is independent of daemon state and
+    writes nothing either way.
+    """
+    proc = subprocess.run([BASH, str(_SCRIPTS / script), good_prefix + "1",
+                           "not_a_utilization_field"],
+                          capture_output=True, text=True)
+    assert "wrong_store_id" not in proc.stderr, (
+        f"{script} rejected a legitimate {good_prefix}* id as cross-store; "
+        f"stderr={proc.stderr!r}")
+
+
+@pytest.mark.parametrize("script,good_prefix,wrong_id", _WRAPPERS)
+def test_the_refusal_stays_above_the_daemon_source(script, good_prefix, wrong_id):
+    """Ordering guard for the two tests above.
+
+    If the check ever sinks below `source _runtime.sh` it starts requiring a
+    reachable daemon: the wrapper would then exit on a transport error rather
+    than on the id, so the refusal test could pass for the wrong reason on a
+    healthy box and fail spuriously on a quiet one. Cheap to assert, and it is
+    the property that makes this whole block hermetic.
+    """
+    body = (_SCRIPTS / script).read_text(encoding="utf-8")
+    assert "wrong_store_id" in body, f"{script} lost its cross-store refusal"
+    assert body.index("wrong_store_id") < body.index("_runtime.sh"), (
+        f"{script}: the cross-store refusal sank below `source _runtime.sh` — "
+        "it now needs a daemon in order to refuse a bad id")
 
 
 if __name__ == "__main__":

@@ -35,6 +35,42 @@ if [ -z "$REC_ID" ] || [ -z "$FIELD" ]; then
     exit 1
 fi
 
+# : REFUSE A CROSS-STORE ID BEFORE IT SPOOLS. The spool lane
+# deliberately does not resolve the id against the content store — that read is
+# the ~51 GB/day cost  removed — so nothing downstream notices an rb-*
+# id handed to this wrapper, or a guard-* id handed to its sibling. The delta
+# spools, flushes, and lands as a permanent row in the WRONG sidecar, where
+# utilization_of() for that record never reads it. MEASURED 2026-09-17 (echo,
+# cc-03): 8 such rows already exist — 7 guard-* in reasoning-bank-utilization
+# .jsonl and 1 rb-* here. guard-514 is the cost: one genuine times_helpful
+# credit stranded in the other store, so it reads times_helpful=0 — the exact
+# signal the retirement sweeps use to propose deleting an entry.
+# A PREFIX check is the whole fix and costs one string compare: 6,549/6,549
+# guardrail ids start with `guard-` and 10,634/10,634 rb ids with `rb-`
+# (measured, zero exceptions), so no ordinary increment is refused. It
+# deliberately does NOT check that the id EXISTS — that needs the content read
+# this lane exists to avoid, and a bogus SAME-store id is inert because nothing
+# ever looks it up (guard-5619).
+# ONE LEGITIMATE CALL *IS* REFUSED, and this comment claimed none was until a
+# fresh-eyes pass measured it (2026-09-17, echo, cc-03): utilization-correct.sh
+# picks its wrapper by STORE and passes the record id through unchecked
+# (_utilization_correct.py INCREMENT_WRAPPER + run_correction), so ZEROING an
+# already-misrouted row is `--store reasoning-bank --id guard-514`, which lands
+# in the SIBLING wrapper and is refused (measured rc=1). Scope that precisely
+# before acting on it: the CREDIT-RESTORATION path is open — `guardrails-
+# increment.sh guard-514 utilization.times_helpful` passes this check and is
+# what actually recovers the stranded credit — so only the cosmetic cleanup of
+# the 8 phantom rows is closed, and those rows are inert for reading anyway
+# (utilization_of never consults the other store's sidecar). Whoever decides to
+# clean them must change this check, not route around it. guard-3164 is the
+# general form: before adding a refusal, trace what the newly-failing call
+# returns to its CALLER, not only which call sites will newly error.
+case "$REC_ID" in
+    guard-*) ;;
+    *)  printf '{"error": "wrong_store_id", "detail": "guardrails-increment.sh takes a guard-* id, got: %s — a cross-store id spools to the wrong sidecar and its credit becomes unreadable (g-115-6903)."}\n' "$REC_ID" >&2
+        exit 1;;
+esac
+
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"

@@ -78,6 +78,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+from _board_paths import channel_paths, read_paths  # noqa: E402  ()
 
 # ARRAY_SLOTS / MAP_SLOTS mirror wm.py's structural constants (the authoritative
 # source). Kept in sync by hand -- they change rarely. slot_types itself is NOT
@@ -235,7 +236,12 @@ def _build_ownership_index(world_dir: Path | None, agent_dir: Path) -> dict:
     files.append(agent_dir / "aspirations.jsonl")
     files.append(agent_dir / "aspirations-archive.jsonl")
 
+    # The eager pull never re-pulls an archive, so refresh before reading
+    # ().
+    from _fresh_read import refresh_for_read
     for fp in files:
+        if fp.name == "aspirations-archive.jsonl":
+            refresh_for_read(fp, label="wm-contamination-check")
         try:
             with open(fp, "r", encoding="utf-8") as f:
                 for line in f:
@@ -268,37 +274,45 @@ def _board_involved_goals(world_dir: Path | None, agent: str, goal_ids: set,
     for (claim/complete/release/handoff/...). The false-positive guard."""
     if world_dir is None or not goal_ids:
         return set()
-    board = world_dir / "board" / "coordination.jsonl"
+    # Enumerated through the reader seam, never a hardcoded filename
+    # (). This function is the FALSE-POSITIVE GUARD: it subtracts
+    # goals the agent demonstrably worked on. A short read therefore makes it
+    # under-report involvement, and the check then reports contamination that
+    # is not there -- the failure direction runs toward a false ALARM here,
+    # the opposite of most board consumers, which is why it is worth routing.
     cutoff = _now() - timedelta(days=since_days)
     involved: set = set()
     try:
-        with open(board, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+        paths = channel_paths(world_dir / "board", "coordination",
+                              include_archive=False)
+        records, missing = read_paths(paths)
+        # This check SUBTRACTS goals the agent posted about, so a short window
+        # fails toward a false ALARM (not a false all-clear like its siblings).
+        faults = [m for m in (missing or []) if m.get("reason") == "unreadable"]
+        if faults:
+            print("warning: coordination window shortened by %d unreadable path(s): "
+                  "%s -- involvement set may be UNDER-counted, inflating contamination"
+                  % (len(faults), "; ".join(str(m.get("path")) for m in faults)),
+                  file=sys.stderr)
+        for msg in records:
+            if msg.get("author") != agent:
+                continue
+            if msg.get("type") not in _INVOLVEMENT_TYPES:
+                continue
+            ts = msg.get("timestamp", "")
+            try:
+                when = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+                if when < cutoff:
                     continue
-                try:
-                    msg = json.loads(line)
-                except Exception:
+            except Exception:
+                pass  # undated/odd -> do not exclude on age (conservative)
+            tags = msg.get("tags") or []
+            text = msg.get("text") or ""
+            for gid in goal_ids:
+                if gid in involved:
                     continue
-                if msg.get("author") != agent:
-                    continue
-                if msg.get("type") not in _INVOLVEMENT_TYPES:
-                    continue
-                ts = msg.get("timestamp", "")
-                try:
-                    when = datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
-                    if when < cutoff:
-                        continue
-                except Exception:
-                    pass  # undated/odd -> do not exclude on age (conservative)
-                tags = msg.get("tags") or []
-                text = msg.get("text") or ""
-                for gid in goal_ids:
-                    if gid in involved:
-                        continue
-                    if gid in tags or gid in text:
-                        involved.add(gid)
+                if gid in tags or gid in text:
+                    involved.add(gid)
     except FileNotFoundError:
         return set()
     except Exception:

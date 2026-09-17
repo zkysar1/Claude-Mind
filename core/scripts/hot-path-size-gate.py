@@ -559,9 +559,25 @@ def run_check(repo: Path, no_ratchet: bool, hard_gate: bool, as_json: bool, out=
                 else:
                     now = hot_total if key == RATCHET_KEY else ondemand_total
                     parts.append(f"{key} GREW to {now:,} B (baseline {r.get('baseline'):,} B)")
+            # TWO doors grow this number and only ONE writes a ledger row, so a
+            # one-door hint points every reader at the alarming branch and an
+            # empty ledger then reads as a dead end (guard-4203: an error
+            # message's stated CAUSE is authored text, not a measurement).
+            # Measured 2026-09-16: the whole +6,780 B was door 2 — a new
+            # .claude/rules/perception-reaction.md (+6,222, ) and a
+            # documented exception block in stop-hook-compliance.md (+1,123,
+            # ) — with 0 ledger rows, exactly as door 2 predicts.
             verdict = (f"FAIL: {TAG} " + "; ".join(parts) +
-                       f" — an override or a merge added prose; grep world/override-bypass-ledger.jsonl "
-                       f"for gate {GATE_ID} and route it out (rationale/conventions/tree/a data registry)")
+                       f" — TWO DOORS, and only one leaves a trace. DOOR 1 (override / merge): "
+                       f"grep world/override-bypass-ledger.jsonl for gate {GATE_ID} and route it "
+                       f"out (rationale/conventions/tree/a data registry). DOOR 2 (deliberate "
+                       f"adoption — a NEW .claude/rules/*.md, or a documented exception block "
+                       f"added to one) writes NO ledger row, so an EMPTY LEDGER IS THE EXPECTED "
+                       f"READING FOR DOOR 2, never evidence of a bypass. Confirm door 2 by diffing "
+                       f"this run's per-set bytes against the baseline's per_set in "
+                       f"meta/audit-baselines.yaml, then `git log -p` the set that moved. When the "
+                       f"growth is deliberate and confirmed at EITHER door, LEAVE THE BASELINE "
+                       f"ALONE and let this advisory stand.")
             rc = 1 if hard_gate else 0
         else:
             verdict = (f"PASS: {TAG} {RATCHET_KEY} {ratchet.get('verdict')} at {hot_total:,} B "

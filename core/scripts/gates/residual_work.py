@@ -237,7 +237,7 @@ _WORK_CONTEXT_RE = re.compile(
 )
 
 
-GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,4}\b")
+GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,5}\b")
 
 # Vocabulary that marks a nearby goal id as a CARRIER citation rather than an
 # incidental cross-reference. Window below is ±120 chars — wider than the

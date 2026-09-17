@@ -302,3 +302,105 @@ class TestIterationPushWiring:
         # machine's real lock, so test_iteration_push.py would pass or fail on
         # whether a co-resident Body happened to be running a suite.
         assert 'check --project-root "$REPO"' in self._src
+
+    def test_the_self_held_branch_runs_only_after_check_said_proceed(self):
+        # . `held-by-me` is consulted only on rc 0: on a FOREIGN rc 1 the
+        # foreign branch has already exited, and on a plumbing rc it would degrade
+        # on a lock `check` could not even read. Scoped to $REPO for the same reason
+        # as the gate above.
+        assert ('if [ "$_TL_RC" -eq 0 ] && _TL_SELF="$(bash "$SCRIPT_DIR/tree-lock.sh" '
+                'held-by-me --project-root "$REPO"') in self._src
+
+    def test_the_self_held_branch_sits_after_the_foreign_one_and_before_any_fetch_or_merge(self):
+        # Exiting ABOVE every merge site is what keeps all of them gated by
+        # construction. Moved below the fetch, the degrade would still say
+        # PUBLISH-ONLY while the tree had already been touched.
+        src = self._src
+        foreign = src.index('if [ "$_TL_RC" -eq 1 ]; then')
+        selfheld = src.index('held-by-me --project-root "$REPO"')
+        assert foreign < selfheld
+        assert selfheld < src.index('fetch origin "$BRANCH"')
+        assert selfheld < src.index('merge --no-edit "$UPSTREAM"')
+
+
+# ── self-held liveness: the predicate iteration-push degrades on () ──
+
+
+class TestSelfHeldLiveness:
+    """`live` on a lock THIS sid holds. `blocked` stays False on every row -- a
+    Body must never deadlock against itself -- so nothing `check` decides moves.
+    """
+
+    def test_a_fresh_self_lock_with_a_live_holder_is_live(self):
+        v = tl.evaluate(_rec(holder_sid=MINE), MINE)
+        assert v["state"] == "mine" and v["blocked"] is False
+        assert v["live"] is True
+
+    def test_an_expired_self_lock_is_not_live(self):
+        v = tl.evaluate(_rec(holder_sid=MINE, acquired_at=time.time() - 5000,
+                             ttl_seconds=600), MINE)
+        assert v["live"] is False and v["blocked"] is False
+        assert "STALE" in v["reason"]
+
+    def test_a_self_lock_whose_holder_died_is_not_live(self):
+        # The suite was killed: its own session gets its merges back at once,
+        # not after the 90-minute TTL.
+        assert tl.evaluate(_rec(holder_sid=MINE, holder_pid=999999), MINE)["live"] is False
+
+    def test_a_self_lock_with_no_pid_is_live_until_its_ttl(self):
+        # Unknown liveness is not death -- the same rule the foreign branch keeps.
+        rec = _rec(holder_sid=MINE)
+        del rec["holder_pid"]
+        assert tl.evaluate(rec, MINE)["live"] is True
+
+    @pytest.mark.parametrize("over", [{"acquired_at": "x"}, {"ttl_seconds": None}])
+    def test_a_self_lock_with_unusable_timestamps_is_not_live(self, over):
+        assert tl.evaluate(_rec(holder_sid=MINE, **over), MINE)["live"] is False
+
+    @pytest.mark.parametrize("over", [
+        {}, {"acquired_at": time.time() - 5000}, {"holder_pid": 999999},
+        {"holder_pid": None}, {"acquired_at": "x"}, {"ttl_seconds": None},
+    ])
+    def test_live_is_exactly_the_blocking_test_with_the_sid_inverted(self, over):
+        # THE PARITY PIN. The degrade must not invent its own notion of "held": a
+        # lock that would BLOCK a foreign Body is exactly a lock that is LIVE for
+        # its holder, row for row. If they diverge, the two iteration-push branches
+        # act on locks the other one ignores.
+        rec = _rec(holder_sid=MINE, **over)
+        assert tl.evaluate(rec, MINE)["live"] is tl.evaluate(rec, THEIRS)["blocked"]
+
+
+class TestHeldByMeCli:
+    """The predicate verb iteration-push calls: rc 0 ONLY for a live self-lock."""
+
+    def _rc(self, monkeypatch, capsys, root, sid):
+        monkeypatch.setenv("MIND_SID", sid)
+        rc = tl.main(["held-by-me", "--project-root", str(root)])
+        capsys.readouterr()
+        return rc
+
+    def test_a_live_self_lock_answers_0(self, tmp_path, monkeypatch, capsys):
+        tl.acquire(tmp_path, MINE, "alpha", "full-suite run", holder_pid=os.getpid())
+        assert self._rc(monkeypatch, capsys, tmp_path, MINE) == 0
+
+    def test_a_foreign_live_lock_answers_1(self, tmp_path, monkeypatch, capsys):
+        # A foreign lock belongs to `check`. It must never ALSO read as self-held,
+        # or two branches would claim one invocation.
+        tl.acquire(tmp_path, THEIRS, "alpha", "full-suite run", holder_pid=os.getpid())
+        assert self._rc(monkeypatch, capsys, tmp_path, MINE) == 1
+
+    def test_a_free_tree_answers_1(self, tmp_path, monkeypatch, capsys):
+        assert self._rc(monkeypatch, capsys, tmp_path, MINE) == 1
+
+    def test_a_dead_self_lock_answers_1(self, tmp_path, monkeypatch, capsys):
+        tl.acquire(tmp_path, MINE, "alpha", "full-suite run", holder_pid=999999)
+        assert self._rc(monkeypatch, capsys, tmp_path, MINE) == 1
+
+    def test_an_unbound_session_answers_1(self, tmp_path, monkeypatch, capsys):
+        tl.acquire(tmp_path, THEIRS, "alpha", "full-suite run", holder_pid=os.getpid())
+        assert self._rc(monkeypatch, capsys, tmp_path, "") == 1
+
+    def test_a_garbage_lock_answers_1_never_2(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / "mind_api" / "state").mkdir(parents=True)
+        (tmp_path / "mind_api" / "state" / tl.LOCK_FILENAME).write_text("~~", encoding="utf-8")
+        assert self._rc(monkeypatch, capsys, tmp_path, MINE) == 1

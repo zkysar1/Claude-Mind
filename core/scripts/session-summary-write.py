@@ -9,7 +9,7 @@ Schema:
   session_id: <SID>
   agent: <name>
   ended_at: <iso-timestamp>
-  ended_reason: graceful-stop|consolidate|crash-recovered|unknown
+  ended_reason: graceful-stop|worker-stop|consolidate|crash-recovered|unknown
   iterations_completed: <int>          # goals finished this session
   goals_filed: <int>                   # new goals created this session
   tree_writes: <int>                   # knowledge-tree edits
@@ -46,7 +46,10 @@ from _session_binding import (  # noqa: E402
     _valid_sid_shape,
 )
 
-VALID_REASONS = ("graceful-stop", "consolidate", "crash-recovered", "unknown")
+# "worker-stop" is what the worker branch of /stop passes (stop/SKILL.md step 2).
+# It was missing from 2026-09-11 (a5b4389) to 's fix, so argparse exited 2
+# before any write, `|| true` hid the rc, and no worker /stop wrote this summary.
+VALID_REASONS = ("graceful-stop", "worker-stop", "consolidate", "crash-recovered", "unknown")
 
 
 def _project_root() -> Path:

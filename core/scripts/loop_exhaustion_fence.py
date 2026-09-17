@@ -57,8 +57,14 @@ Cheap-first-then-decisive mirrors reducer_self_fence.py, whose
 `sustained-renewal-gap` trigger likewise waits out a duration before acting on
 an ambiguous signal and acts at once on an unambiguous one.
 
-FAIL-SAFE DIRECTION: every unreadable, absent, or unparseable input HOLDS.
-Stopping a healthy loop is worse than the disease (guard-1562).  Note this is
+FAIL-SAFE DIRECTION: every unreadable or unparseable input HOLDS.  Stopping a
+healthy loop is worse than the disease (guard-1562).  ONE absence is not
+ambiguous and does not hold: a session with turn-ends and NO diary at all.
+The diary is appended at every phase start/end, so "no diary" means "no
+phase ever ran", and the streak is anchored at that session's FIRST turn-end.
+Measured 2026-09-17 on a prod vessel (debc47de, run A): 85 consecutive BLOCKs
+over 21 minutes, every one answered by prose, no diary ever written -- and
+this fence HELD on all 85 because an absent diary read as unreadable.  Note this is
 the OPPOSITE direction from the worker-side reducer-liveness poll, deliberately
 and for the same reason as that pair: there, an unobservable reducer means work
 nobody will merge; here, an unobservable stall means a loop that is probably
@@ -246,6 +252,12 @@ def compute_streak(log_path, sid, diary_path, now=None):
         return (None, None)
     try:
         advanced = datetime.datetime.fromtimestamp(pathlib.Path(diary_path).stat().st_mtime)
+    except FileNotFoundError:
+        # No diary was ever written: the loop has never advanced a phase, so
+        # every turn-end for this sid counts and the anchor is the first one
+        # (see FAIL-SAFE DIRECTION in the module docstring).  Any OTHER
+        # failure to read the diary still holds, below.
+        advanced = None
     except (OSError, ValueError, TypeError):
         return (None, None)
     try:
@@ -255,6 +267,7 @@ def compute_streak(log_path, sid, diary_path, now=None):
 
     needle = "sid=" + sid + " "
     streak = 0
+    first_turn_end = None
     for line in text.splitlines():
         if needle not in line:
             continue
@@ -264,8 +277,16 @@ def compute_streak(log_path, sid, diary_path, now=None):
             when = datetime.datetime.fromisoformat(line.split(" ", 1)[0])
         except ValueError:
             continue
-        if when >= advanced:
+        if advanced is None:
+            first_turn_end = when if first_turn_end is None else min(first_turn_end, when)
             streak += 1
+        elif when >= advanced:
+            streak += 1
+
+    if advanced is None:
+        if first_turn_end is None:
+            return (0, 0.0)
+        advanced = first_turn_end
 
     now = now or datetime.datetime.now()
     return (streak, max(0.0, (now - advanced).total_seconds()))

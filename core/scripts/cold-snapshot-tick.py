@@ -81,8 +81,20 @@ MODES
   --tick (default)  decide, claim, spawn `--run` DETACHED, exit immediately.
                     Never waits: the snapshot is minutes of walk+compress+upload
                     and must not become the loop's iteration time.
-  --run             execute cold-snapshot.sh, write the verdict back into the
-                    marker, file a deduped Investigate on any non-ok verdict.
+  --run             execute cold-snapshot.sh AND the transcripts DR copy, write
+                    both verdicts back into the marker, file ONE deduped
+                    Investigate naming whichever legs were not ok.
+
+TWO LEGS, ONE CLAIM (g-372-24, 2026-09-16)
+------------------------------------------
+`--run` drives two independent pushes of irreplaceable state to the SAME pinned
+AWS DR target: the local-filesystem tarball (`cold-snapshot.sh`) and the
+object-store `transcripts/` prefix (`transcripts-dr-copy.sh`), which the tarball
+structurally cannot reach because that prefix sits under no governed root. They
+share this script's claim because the fleet-wide-once-per-interval problem is
+the same problem, and it is the expensive one to solve twice. See
+`_transcripts_leg` for the bounded-coupling argument and
+`transcripts_dr_copy.py` for the lane's own measurement.
   --dry-run         report the decision only; claims nothing, spawns nothing.
 
 All paths fail-open: any error prints to stderr and returns 0, because this
@@ -104,7 +116,16 @@ sys.path.insert(0, str(SCRIPT_DIR))
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 RUN_LOG = SCRIPT_DIR.parent / "logs" / "cold-snapshot.log"
 
-DEFAULT_INTERVAL_HOURS = 168.0   # weekly — inside the bucket's 14-day noncurrent net
+# DAILY since 2026-09-16 (, owner-approved DR posture). It read 168.0
+# "weekly -- inside the bucket's 14-day noncurrent net", and that reason died at
+# the 09-14 cutover: the LIVE store is now the basement MinIO, whose lifecycle
+# expires noncurrent versions at SEVEN days (minio-standup.sh
+# NONCURRENT_EXPIRE_DAYS=7), not fourteen. A weekly snapshot therefore sat AT the
+# edge of the undo window instead of inside it, and the worst-case loss of
+# world+meta+agents was a full 7 days. Daily bounds it to 1 and puts the cadence
+# back inside the net it was sized against. Cost is one ~142 MB upload per day
+# (2026-09-13 run), which S3 ingress does not charge for.
+DEFAULT_INTERVAL_HOURS = 24.0    # daily -- inside the basement store's 7-day noncurrent net
 DEFAULT_STUCK_HOURS = 2.0        # a claim still "running" past this is a dead run
 DEFAULT_PREFIX = "cold-snapshots"
 
@@ -383,8 +404,51 @@ def do_tick(args) -> int:
     return 0
 
 
+def _transcripts_leg() -> dict:
+    """Copy the `transcripts/` prefix to the pinned DR target, as a SECOND leg
+    of this one daily claim.
+
+    WHY IT RIDES HERE rather than on a tick of its own. Both legs push
+    irreplaceable state to the same pinned AWS target on the same cadence, and
+    the hard part of a shared-store cadence is the fleet-wide claim this script
+    already solves (see THE CADENCE STAMP IS SHARED above): a per-box tick would
+    fire ~11x per interval. A second tick would need a second marker, a second
+    stuck-detector and a second call site to re-derive all of it.
+
+    The coupling is one-directional and bounded: this runs AFTER the snapshot's
+    own verdict is computed, every failure is caught here, and nothing it returns
+    can change `ok`. A transcripts failure is reported in the marker and in the
+    combined Investigate — it can never mark the snapshot failed, and it can
+    never abort the run.
+
+    `transcripts_dr_copy.py` carries the rationale for the lane itself.
+    """
+    try:
+        from _runtime_bash import bash_cmd
+        proc = subprocess.run(
+            bash_cmd((SCRIPT_DIR / "transcripts-dr-copy.sh").as_posix(),
+                     "--output", "json"),
+            capture_output=True, text=True, timeout=3600, cwd=str(PROJECT_ROOT),
+        )
+        try:
+            out = json.loads((proc.stdout or "").strip() or "{}")
+        except json.JSONDecodeError:
+            out = {}
+        verdict = out.get("verdict") or ("error" if proc.returncode else "unknown")
+        detail = (proc.stderr or "").strip()[-500:] or f"rc={proc.returncode}"
+    except Exception as exc:
+        out, verdict = {}, "error"
+        detail = str(exc)[:500]
+    # The two skip verdicts are correct no-ops (not own-cloud; the live store IS
+    # the DR target), exactly as `skipped-local-backend` is for the snapshot.
+    ok = verdict in ("ok", "skipped-local-backend", "skipped-live-is-dr")
+    return {"verdict": verdict, "ok": ok, "detail": detail,
+            "copied": out.get("copied"), "copied_gib": out.get("copied_gib")}
+
+
 def do_run(args) -> int:
-    """Execute the snapshot and record its verdict in the shared marker."""
+    """Execute the snapshot AND the transcripts DR copy, recording both verdicts
+    in the shared marker."""
     from _runtime_bash import bash_cmd
     script_path = (SCRIPT_DIR / "cold-snapshot.sh").as_posix()
     started = _now_utc().isoformat(timespec="seconds")
@@ -407,6 +471,8 @@ def do_run(args) -> int:
     # that is not `ok` means the archive may not have landed.
     ok = verdict in ("ok", "skipped-local-backend")
 
+    tr = _transcripts_leg()
+
     backend = _backend()
     if backend is not None:
         try:
@@ -420,15 +486,29 @@ def do_run(args) -> int:
                 "receipt_key": result_json.get("receipt_key"),
                 "file_count": result_json.get("files"),
                 "archive_bytes": result_json.get("archive_bytes"),
+                "transcripts_verdict": tr["verdict"],
+                "transcripts_copied": tr.get("copied"),
+                "transcripts_gib": tr.get("copied_gib"),
             })
         except Exception as exc:
             print(f"[cold-snapshot-tick] marker write failed: {exc}", file=sys.stderr)
 
-    if not ok:
-        _file_investigate(f"verdict={verdict}", detail or "no detail captured")
+    # ONE Investigate covering whichever legs failed. Filing per-leg would be
+    # worse than it looks: `_file_investigate` dedups on ORIGIN_SIGNAL, so a
+    # failing snapshot would swallow a failing transcripts copy and the second
+    # failure would be invisible for DEDUP_HOURS.
+    failed_legs = ([] if ok else [f"snapshot verdict={verdict}"]) + \
+                  ([] if tr["ok"] else [f"transcripts verdict={tr['verdict']}"])
+    if failed_legs:
+        _file_investigate(
+            "; ".join(failed_legs),
+            "\n".join(x for x in (detail, tr.get("detail")) if x)
+            or "no detail captured")
     print(json.dumps({"op": "cold-snapshot-run", "verdict": verdict,
                       "archive_key": result_json.get("archive_key"),
-                      "file_count": result_json.get("files")}))
+                      "file_count": result_json.get("files"),
+                      "transcripts_verdict": tr["verdict"],
+                      "transcripts_copied": tr.get("copied")}))
     return 0
 
 
