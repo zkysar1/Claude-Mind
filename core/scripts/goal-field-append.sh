@@ -52,6 +52,9 @@ MARKER="${ARGV_POS[2]-}"
 if [ -z "$GOAL_ID" ] || [ -z "$FIELD" ] || [ -z "$MARKER" ]; then
     echo "Usage: goal-field-append.sh [--source world|agent] <goal-id> <field> <marker> [<text>]" >&2
     echo "       (or supply the text via --value-file <path> / --value-stdin)" >&2
+    echo "       <marker> is a BARE token — this script wraps it as [appended:<marker>]." >&2
+    echo "                Passing the wrapped form is REFUSED (exit 2): it would write a" >&2
+    echo "                doubled sentinel and break the idempotency key." >&2
     exit 2
 fi
 

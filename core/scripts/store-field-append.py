@@ -100,6 +100,9 @@ sentinel_for = _gfa.sentinel_for
 compose = _gfa.compose
 verify_post = _gfa.verify_post
 cas_conflict = _gfa.cas_conflict
+# Imported, not re-typed, for the same reason as the four above: the marker
+# convention and its refusal must not fork between the two sides (g-001-847).
+wrapped_marker_refusal = _gfa.wrapped_marker_refusal
 
 RC_OK = 0
 RC_USAGE = 2
@@ -125,6 +128,59 @@ STORES = {
         "write": "reasoning-bank-update-field.sh",
         "rows_keys": ("reasoning_bank", "entries", "results"),
         "canaries": ("content", "when_to_use", "failure_lesson", "utilization"),
+    },
+    # pipeline joined 2026-09-15 (g-001-828) — the third store, and the first
+    # whose shape was MEASURED against this contract instead of assumed to match
+    # the other two. Three findings, each of which would have been a silent
+    # defect had it gone the other way:
+    #
+    #   1. rows_keys is EMPTY ON PURPOSE. pipeline-read.sh wraps rows in no key
+    #      at ALL: `--id` returns a BARE record object (caught by extract_row's
+    #      `"id" in parsed` branch) and `--stage`/`--unreflected`/
+    #      `--replay-candidates`/`--narrative` return BARE LISTS; `--counts` and
+    #      `--meta` return dicts of scalars with zero list-valued keys. Measured
+    #      across all six modes. Listing a speculative ("pipeline", "results")
+    #      here would be a name no producer emits — the failure class where a
+    #      reader filters on tags nothing writes and reports a confident zero.
+    #      An empty tuple is honest and costs nothing: a dict with no "id" still
+    #      falls through to [] and is refused RC_READ_UNSAFE, which is correct.
+    #   2. The canaries are the LARGE FREE-TEXT fields, and the set is measured,
+    #      not guessed: position 81/81, rationale 81/81, claim 81/81,
+    #      adversarial_pre_mortem 12/81 over the whole 81-record store — and
+    #      ZERO records carry none of them, so the projection guard cannot
+    #      false-refuse a real read. title/stage/type would be useless canaries
+    #      because any projection produces them.
+    #   3. THE WRITE ENDPOINT COERCES AND THE OTHER TWO DO NOT. guardrails and
+    #      reasoning-bank write through /v1/store/set-field; pipeline writes
+    #      through /v1/pipeline/update-field, which runs `_parse_value` on the
+    #      string — "true"/"false"/"null" become bools/None, a leading { or [
+    #      is tried as JSON, and a numeric string becomes int/float. A composed
+    #      append can never hit any of those arms, because compose() always ends
+    #      the value with "\n[appended:<marker>]": that sentinel is not JSON,
+    #      not numeric, and not a literal keyword. The sentinel that exists for
+    #      idempotence is therefore also what keeps a pipeline text field typed
+    #      as text. Do NOT "simplify" compose to drop it.
+    #   4. AND A FIFTH DIMENSION THIS MAP DOES NOT MODEL AT ALL (fresh-eyes F1,
+    #      found reviewing the change above rather than while writing it): the
+    #      pipeline write has SIDE EFFECTS ON OTHER FIELDS. update_field does
+    #      `rec[field] = value` and THEN `apply_derived_surprise(rec)`, so an
+    #      append aimed at a DERIVATION INPUT does two silent things at once.
+    #      `outcome` is the live case: it is a plain str, so the isinstance(pre,
+    #      str) gate passes, the composed value is not coerced, and the result is
+    #      a controlled-vocabulary field turned into
+    #      "CORRECTED\n\nnote\n[appended:m]" PLUS a `surprise` silently nulled
+    #      (derive_surprise returns None for a non-CONFIRMED/CORRECTED outcome).
+    #      guardrails and reasoning-bank write through /v1/store/set-field and
+    #      have no such coupling. APPEND ONLY TO NARRATIVE FIELDS on this store —
+    #      position, rationale, claim, outcome_detail, resolution_method,
+    #      measurement_channel — never to outcome/stage/type/confidence.
+    #      No denylist is wired: one call site is not an abstraction, and a wrong
+    #      field here is a caller error, not a class the map can close.
+    "pipeline": {
+        "read": "pipeline-read.sh",
+        "write": "pipeline-update-field.sh",
+        "rows_keys": (),
+        "canaries": ("position", "rationale", "claim", "adversarial_pre_mortem"),
     },
 }
 
@@ -217,6 +273,10 @@ def main(argv=None) -> int:
                     help="refuse unless this text is present in the CURRENT value "
                          "(drift guard; omit for a first note onto an empty field)")
     args = ap.parse_args(argv)
+
+    refusal = wrapped_marker_refusal(args.marker)
+    if refusal:
+        _die(RC_USAGE, refusal)
 
     sources = [s for s in (args.text is not None, args.value_file, args.value_stdin) if s]
     if len(sources) != 1:
