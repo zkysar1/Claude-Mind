@@ -101,7 +101,7 @@ compose = _gfa.compose
 verify_post = _gfa.verify_post
 cas_conflict = _gfa.cas_conflict
 # Imported, not re-typed, for the same reason as the four above: the marker
-# convention and its refusal must not fork between the two sides (g-001-847).
+# convention and its refusal must not fork between the two sides ().
 wrapped_marker_refusal = _gfa.wrapped_marker_refusal
 
 RC_OK = 0
@@ -129,7 +129,7 @@ STORES = {
         "rows_keys": ("reasoning_bank", "entries", "results"),
         "canaries": ("content", "when_to_use", "failure_lesson", "utilization"),
     },
-    # pipeline joined 2026-09-15 (g-001-828) — the third store, and the first
+    # pipeline joined 2026-09-15 () — the third store, and the first
     # whose shape was MEASURED against this contract instead of assumed to match
     # the other two. Three findings, each of which would have been a silent
     # defect had it gone the other way:

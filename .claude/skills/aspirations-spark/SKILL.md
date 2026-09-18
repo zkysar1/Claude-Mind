@@ -214,9 +214,9 @@ looks too big to drain, the exact condition it is wrong for. Measured
 (g-115-10001): the 50-item cap is **INERT**, not merely unenforced (~100% of
 entries are eviction-EXEMPT via `load_bearing`), and a verified archive-then-clear
 of 3,187 entries was **undone inside the hour** by `merge_wm`'s union from a Body's
-stale baseline. Whether a bounded subtract survives that merge is UNMEASURED —
-assume it does not: a non-decreasing `kept` across two passes is the restore
-signal, so stop draining and fix the baseline. **Residue**: entries with
+stale baseline. A bounded subtract SURVIVES that merge (measured).
+The restore signal is the drained goal_ids REAPPEARING —
+NOT a non-decreasing `kept`, which arrivals produce (guard-2997). **Residue**: entries with
 `goal_id: null` cannot appear in the drain's goal-id set and are excluded from the
 batch deliberately, so progress stays monotonic and the residue stays countable.
 

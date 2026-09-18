@@ -17238,3 +17238,108 @@ row does not resolve to a goal at all.
 **S5:** 4 signals — 0 HIGH, 1 MEDIUM (S3 axis2, suppressed as standing property), 3 LOW (S2b suppressed as
 owned; S4a + corpus-truncation stored to `strategic_scan_signals`). **Nothing filed, nothing routed to
 /create-aspiration.**
+
+### 2026-09-18T00:4x — zeta, `hostname` cc-02, `uname -r` 6.8.0-139-generic, own-cloud, world `ayoai-mind` (time_cadence, fired by the precheck cadence battery) — full S2–S4.6 pass
+
+**S1 — NOT RUN, stated rather than silently skipped.** Its local-only read of a WORLD sensor is a claim
+about this box, never about the sensor (g-115-3215, open), so a trend reported from it would be wrong in
+a direction that flatters. Nothing filed, nothing inferred.
+
+**S2a — REPRODUCTION of the CURRENT PRIOR, numerator AND membership.** opened **39/39** (control passed),
+stale(>30d) **39** of **57** EXPLORE on a 1631-node tree (index total 1631, agrees). **STRUCTURAL 5/39**,
+members exactly `env-agnostic-exploration-primitives`, `infrastructure-performance`, `solver-v0-audits`,
+`v2-directed-steering-ship-log`, `v2-directed-steering-wiring` — the prior's five, unchanged. Stop
+condition satisfied (numerator + every member key already in the owner's note), so **APPENDED NOTHING to
+g-115-5462**; this row is the prescribed alternative. Age histogram `{33:2, 34:1, 36:1, 37:1, 40:1, 45:2,
+50:1, 53:1, 54:1, 59:1, 61:1, 62:1, 63:2, 65:1, 68:9, 69:7, 76:1, 80:1, 82:1, 120:1, 121:1, 131:1}` — a
+16-node cohort at 68–69d is the denominator's mass, i.e. calendar, not drift. Triggers bucketed
+mechanically (never by eye, per finding (4)): `re-verify` 5, `refresh` 5, `knowledge_reconciliation` 5,
+`tree_growth`/`goal_execution`/`goal_completion` 3 each, `distill` 2, `node_split` 2, `decompose` 1, rest 1.
+**39 raw / 5 structural / 5 re-verify → the raw count overstates frontier drift by ~26%.**
+
+**S2b — 53/57 = 93.0% thin.** The known non-discriminating signature; owned by g-115-4840. Observation only,
+routed nothing.
+
+**S3 — axis2 FIRES, both terms rose; FULL corpus confirmed** (`goals_omitted` sum **0**; the summary this
+box was handed omitted **2852 of 2884 = 98.9%**, so a summary-derived ratio would have been meaningless).
+n=**2863**, 267 categories, 29 active aspirations. axis1 `framework-architecture` 827/2863 = **28.9%**
+passes · axis1b `framework-*` 1759/2863 = **61.4%** (44 labels) passes · axis2 `asp-115` 2390/2863 =
+**83.5%** FIRES. Against this box's own 2026-08-16 fleet rows (1642 / 80.3%): absolute **+748**, share
+**+3.2pp**. CONFIRMATION of the standing property per method rule (2); routed nothing.
+
+**S4.5 — 0 new gaps.** 4 detectors, scanned 6, 2 dedup-suppressed, 0 rb-245-suppressed, 0 filed.
+
+**S4.6 — UNDECIDABLE, and this row is the cleanest proof yet that `ceiling_ratio` is a property of the
+READING BOX.** 0 candidates at `--min-failures 2` AND at `1`; coverage-unverified, routed nothing.
+`ceiling_ratio` **0.0949** (3263 of 34389) — **above the ~0.0026–0.104 band's prior working range and 2.8x
+echo's 0.0337 measured on cc-03 roughly four hours earlier the same day**, with the fleet invocation
+denominator essentially unchanged (34324 → 34389). Nothing about the fleet moved; what differs is the
+alpha slice each box holds. Here alpha reads `08-01T23:29..09-09T14:53` — **38.6 days across 24 windows**,
+in_span 3116/6901 — and **supplies 3116 of the 3263 ceiling = 95.5%** (echo's row: 18.7d/27 windows,
+92.9%). The other four contribute 147 between them: bravo 49, echo 39, foxtrot 29 (all still on the
+**08-01/08-02 seed**, unmoved for 47 days), zeta live `09-17T16:27..09-18T00:31` at 30. guard-4566 holds —
+a HIGH reading is span news, not coverage news — and the band test is VOID whenever a peer span is
+non-contiguous, which it is on every box that has measured it. `failing_count: 1`.
+
+**S5:** 3 LOW signals stored to `strategic_scan_signals` (S4a unexplored territory, S2b thin-leaf share,
+S4b `rb-10565`); 2 MEDIUM suppressed as already-owned/standing (S2a stale-knowledge → 5 open owners;
+S3 axis2 → standing property). **0 HIGH. Nothing filed, nothing routed to /create-aspiration.**
+
+**S4a — 12/74 L2 subtrees untouched 90+ days (16.2%), positive control 1631/1631 nodes reached.** Oldest:
+`indie-ai-launch-strategies` 161d, `dave-mark-iaus-theory` 153d, `developer-experience-design` 150d,
+`game-ai-monetization` 140d, `nvidia-ace-competitive-analysis` 135d, `digest-extraction` 131d. Same SHAPE
+echo named on 09-17: the untouched stratum is market/competitive research from an earlier era, not
+operational knowledge. Minority finding, stored not filed.
+
+---
+
+### 2026-09-18T03:2x — bravo, `hostname` cc-05, `uname -r` 6.8.0-139-generic, own-cloud, live fleet
+
+**Corpus is FULL, verified by KEY-PRESENCE not by summing** (`goals_omitted` absent on all 30 active
+aspirations — method rule 4: the sum is structurally 0 in the full compact, so a 0 sum cannot
+distinguish "full" from "field does not exist here"). world 30,965,333 B / 28 rows + agent 177,923 B /
+2 rows. **n = 2880** pending+in-progress, 271 distinct categories.
+
+**S3 — axis2 is again the only fire.** axis1 `framework-architecture` 829/2880 = **28.8%** · axis1b
+`framework-*` 1765/2880 = **61.3%** across 44 labels · axis2 `asp-115` 2388/2880 = **82.9% FIRES**.
+Ratio squarely inside the standing 80-84% band, so CONFIRMATION of a standing property — not routed to
+S5. Per method rule 3, both directions: the **absolute rose to 2388**, the highest in this ledger
+(cc-05's own earlier rows: 1376 → 1615 → 1706 → 1642). Nothing shrank, so the share holding flat at ~83%
+is dilution arithmetic, not remediation. Per method rule 1, `n` = 2880 is per-agent and NOT comparable to
+any other box's row; only asp-115's absolute is. S3c clean: high_pct **50.0%** (15/30, threshold 0.70),
+completed_unarchived **0** — no `portfolio_health_signal` write.
+
+**The directive-relevant cut this row exists for.** The owner's CLOSING PROTOCOL orders asp-368 → asp-364
+→ asp-369 → asp-373. Measured open/done on non-recurring goals: **asp-368 2 open / 3 done (60.0%)** ·
+**asp-364 3 open / 9 done (75.0%)** · asp-369 13/41 (73.2%) · asp-373 15/38 (70.4%). Cost pair asp-372
+10/12 (54.5%), asp-358 8/113 (93.4%). asp-115 2326 open / 98 done (4.0% — structural for a recurring
+monitoring lane, it is the accumulator, not a stalled lane). **Five goals close the first two lanes in
+the owner's stated order.** The selector's top candidate was g-373-112 (lane 4 of 4, 15 open), so the
+ranking and the directive order disagree — recorded here because a future reader asking "why did bravo
+work asp-368" needs the numbers, not the inference.
+
+**S4.5 — 0 NEW gaps**, 2 dedup-suppressed, 0 rb-245-suppressed. The documented common case.
+
+**S4.6 — THE CONFOUND REPRODUCED, AND IT DID NOT AGE OUT.** 3 candidates at `--min-failures 2`, 5 at
+`--min-failures 1` (so the positive control DISCRIMINATED — not the undecidable 0-at-both case), and
+**distinct failing-goal members = 1 → `g-335-816`**, the identical sole member recorded on 2026-08-12,
+08-14 (×2), 08-15 and 08-16. That goal is `status: completed` (closed 2026-08-05), so **0 of 1 members is
+a real failure** and every rate on this run answers "was this skill invoked during some goal's window?".
+Routed nothing; did NOT run `--apply`. Rates: `fresh-eyes-tree` 1.0, `aspirations-verify` 0.3158,
+`notify-user` 0.2381. **This settles the ✅ row's open hypothesis in the negative** — that row proposed the
+window had aged past `g-335-816`; it is still the sole member on this box **33 days later**, which no
+calendar account survives. Coverage, as the cc-04/cc-05 repeat pair concluded.
+
+`ceiling_ratio` **0.0854** (2939 of 34434) — far above the ~0.0026-0.009 band, and **guard-4566 voids the
+band test here**: alpha's diary is **2 windows spanning 08-11→09-12 (32 days)** contributing
+**2158 of the 2939 ceiling (73.4%)**, i.e. a sparse-wide span inflating the ratio with no classifiable
+capacity behind it. My own diary is 67 windows over 8h at 30 in-span; echo/foxtrot/zeta are all still on
+the **08-05 seed, unmoved for 44 days**. A HIGH reading is span news, not coverage news.
+`failing_count: 642` at ledger level against 3 surfaced candidates — read that gap as coverage, never as
+suppression working.
+
+**S5:** 0 HIGH, 0 routed, nothing filed. S3 axis2 suppressed as a standing property; S4.6 suppressed as a
+measured confound. **Phase bodies S1 / S2a / S2b / S4a / S4b were NOT run this pass** — every one is
+marked already-owned-route-nothing in the instrument, and the 2026-09-17/18 row immediately above ran all
+of them hours earlier and stored its 3 LOW signals. Said plainly rather than implied, so this row is not
+mistaken for a full scan.

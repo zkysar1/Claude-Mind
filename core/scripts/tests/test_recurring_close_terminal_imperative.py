@@ -152,10 +152,7 @@ class TestProductionScriptContents:
         assert 'if [[ "$OUTCOME" == "deep" ]]; then' in src, (
             "outcome-aware conditional missing — regression to unconditional form"
         )
-        # Since 2026-09-17 the skill is named through the harness vocabulary
-        # ($HC_SPARK_REF = Skill(aspirations-spark) on Claude Code, byte-identical
-        # at runtime -- test_recurring_close_failure_imperative.py executes it).
-        assert "$HC_SPARK_REF FIRST" in src, (
+        assert "Skill(aspirations-spark) FIRST" in src, (
             "deep-branch imperative phrase missing — spark not directed"
         )
 

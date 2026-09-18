@@ -180,8 +180,52 @@ def _die(code: int, msg: str):
 # the weak-predicate shape (guard-2460's "rc=0 and a printed record prove
 # nothing"). Two call sites today — main() and test_goal_field_append.py.
 
+#: ONE literal, shared by `sentinel_for` and the refusal below — the same
+#: single-source idiom the .sh wrapper uses for its store list, and for the same
+#: reason: two strings that must agree were asserted to be one and were not.
+SENTINEL_PREFIX = "[appended:"
+
+
 def sentinel_for(marker: str) -> str:
-    return f"[appended:{marker}]"
+    return f"{SENTINEL_PREFIX}{marker}]"
+
+
+def wrapped_marker_refusal(marker: str) -> "str | None":
+    """Refusal text when the caller passed an ALREADY-WRAPPED marker, else None.
+
+    This script OWNS the wrapping — `sentinel_for` turns `m` into `[appended:m]`
+    — but the only place that convention is ever VISIBLE is inside a record,
+    where it appears already wrapped. An author who has read a record therefore
+    has every reason to pass the wrapped form, and the usage line (`<marker>`)
+    says nothing to stop them. Doing so writes `[appended:[appended:m]]` at rc=0
+    with `"changed": true`.
+
+    That is worse than an ugly string, because THE MARKER IS THE IDEMPOTENCY KEY.
+    After a double-wrap the record answers to a sentinel that no correct retry
+    will ever test for: a retry with the bare form finds its own sentinel present
+    (from the caller's prose) and correctly refuses, while a retry with the
+    malformed form tests for the doubled one and APPENDS AGAIN. The failure is
+    silent at write time and visible only by reading the field back and counting.
+    Measured 2026-09-15 on guard-1067: pre_len 483 -> 2360, repaired to 2312, the
+    48-byte delta being exactly the doubled sentinel (g-001-847).
+
+    REFUSE, DO NOT UNWRAP. Silently accepting both spellings recreates the same
+    ambiguity one layer down — the caller still cannot tell which key their
+    record carries — and quietly widens a matcher over a live corpus. rb-233
+    (fail-closed by type-distinctness): make the wrong shape a DISTINCT, refused
+    input rather than a silently-accepted one. guard-1338: refuse it BY NAME
+    rather than letting it reach code that produces a confusing result.
+    """
+    if not marker.startswith(SENTINEL_PREFIX):
+        return None
+    bare = marker[len(SENTINEL_PREFIX):]
+    if bare.endswith("]"):
+        bare = bare[:-1]
+    return (
+        f"refusing an already-wrapped marker {marker!r} — this script wraps the "
+        f"marker for you, so passing the wrapped form writes a doubled sentinel "
+        f"and breaks the idempotency key. Pass the BARE token: {bare!r}"
+    )
 
 
 def is_read_projected(row: dict) -> bool:
@@ -259,6 +303,10 @@ def main(argv=None) -> int:
     ap.add_argument("marker", help="idempotency token; a re-run with the same marker is a no-op")
     ap.add_argument("text", help="the text to append")
     args = ap.parse_args(argv)
+
+    refusal = wrapped_marker_refusal(args.marker)
+    if refusal:
+        _die(RC_USAGE, refusal)
 
     sentinel = sentinel_for(args.marker)
     text = args.text.strip("\n")

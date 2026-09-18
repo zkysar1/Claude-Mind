@@ -988,24 +988,14 @@ def test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit():
             f"Foreign pre-staged file should remain staged for the partner. still_staged={still_staged!r}"
 
 
-if __name__ == "__main__":
-    test_concurrent_partner_edit_at_neutral_path_is_filtered()
-    test_concurrent_partner_no_partner_in_flight_file_included()
-    test_concurrent_partner_own_agent_dir_not_filtered()
-    test_concurrent_partner_include_untracked_disables_filter()
-    test_concurrent_partner_modified_tracked_file_filtered()
-    test_concurrent_partner_predate_partner_claim_not_filtered_by_concurrent()
-    test_concurrent_partner_5s_tolerance_at_boundary()
-    test_g115828_committer_own_log_exempts_and_genuine_partner_still_drops()
-    test_g115828_no_own_log_failsafe_drops_as_before()
-    test_g115828_own_log_does_not_exempt_unrelated_path()
-    test_g1151413_absolute_own_log_entry_still_exempts()
-    test_g115697_partner_uncommitted_log_filters_after_in_flight_cleared()
-    test_g1151620_partner_log_exempts_own_authored_double_recorded_path()
-    test_g1151426_over_inclusion_audit_flags_unattributed_not_attributed()
-    test_g1151426_audit_silent_when_all_neutral_attributed()
-    test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit()
-    print("All 16 concurrent-partner tests passed (7 g-115-692 + 3 g-115-828 + 1 g-115-1413 + 1 g-115-697/914 + 1 g-115-1620 + 2 g-115-1426 + 1 g-115-1498).")
+# NOTE (): the __main__ registry lives at the END of this file, not
+# here. It used to sit at this point, ABOVE the last test definition, so a test
+# appended after it could not be registered at all — adding its call here raises
+# NameError because the function is not yet defined when this block executes.
+# test_g11510015_new_untracked_directory_is_exempted_by_member_file_authorship
+# was appended below and was therefore invisible to the direct-run path (pytest
+# still collected it), and the tally read 16 against 17 tests in the file.
+# Keep the registry LAST so every test in this file can be registered.
 
 
 def test_g11510015_new_untracked_directory_is_exempted_by_member_file_authorship():
@@ -1052,3 +1042,146 @@ def test_g11510015_new_untracked_directory_is_exempted_by_member_file_authorship
         assert "filtered (concurrent-partner): core/scripts/g10015-newdir" not in combined, \
             ("A new untracked directory whose member file the committer authored was "
              f"DROPPED from its own commit. combined={combined!r}")
+
+
+def test_g11510015_partner_log_own_log_check_is_dir_shape_aware():
+    """ outcome 3 — the SECOND consumer of committer_authored_paths.
+
+    The g-115-697 partner-log filter already expanded a trailing-slash candidate
+    to a prefix scan on the PARTNER side, but the g-115-1620 own-log check nested
+    inside it stayed an EXACT key lookup. So for a NEW DIRECTORY whose member file
+    was double-recorded (the g-115-695 between-claim overlap), the partner side
+    matched by prefix while the committer side missed by shape, and the directory
+    was dropped from the committer's own commit — the g-115-1620 defect re-opened
+    for directory shapes, in the one filter that had been explicitly repaired for
+    it.
+
+    Directory-shaped twin of
+    test_g1151620_partner_log_exempts_own_authored_double_recorded_path. A
+    file-shaped fixture passes against the unfixed code, which is why the fixture
+    here is a DIRECTORY."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        # zeta's in_flight is CLEARED, so the concurrent-partner filter (the
+        # consumer already fixed for dir shapes) cannot fire and this test is
+        # exercising the partner-log filter specifically.
+        shim = _shim_iteration_commit_multi(tmp, {
+            "alpha": "2026-05-13T09:00:00",
+            "zeta": None,
+        })
+        edit_epoch = _iso_to_epoch("2026-05-13T09:15:00")
+
+        newdir = repo / "core" / "scripts" / "g10015-dir-1620"
+        newdir.mkdir(parents=True, exist_ok=True)
+        member = newdir / "MEMBER.md"
+        member.write_text("# double-recorded member of a NEW directory (g-115-10015)\n")
+        os.utime(member, (edit_epoch, edit_epoch))
+        os.utime(newdir, (edit_epoch, edit_epoch))
+
+        rel_member = "core/scripts/g10015-dir-1620/MEMBER.md"
+        # Double-recording: BOTH logs record the member FILE, while git porcelain
+        # will report only the DIRECTORY.
+        _seed_partner_uncommitted_log(repo, "zeta", [rel_member])
+        _seed_own_uncommitted_log(repo, "alpha", [rel_member])
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-10015-02", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+
+        assert "filtered (partner-uncommitted-log): core/scripts/g10015-dir-1620" not in combined, \
+            ("The partner-log filter's own-log check missed a NEW DIRECTORY whose member "
+             "file the committer had recorded, so the committer's own new directory was "
+             f"dropped. combined={combined!r}")
+
+
+def test_g11510015_over_inclusion_audit_does_not_flag_attributed_new_directory():
+    """ outcome 2 — the THIRD consumer of committer_authored_paths,
+    with INVERTED polarity: the g-115-1426 over-inclusion audit flags a staged
+    neutral path when the own-log lookup MISSES.
+
+    One path-shape mismatch misfired two attribution layers in OPPOSITE
+    directions: the filters dropped the first-person-authored new directory, and
+    when it was recovered by hand the audit then reported it as staged 'WITHOUT
+    committer own-log attribution' (observed on recovery commit 697e511ca0). A
+    fix to the filters alone leaves this false AUDIT line in place, which is why
+    it is a separate outcome and a separate test.
+
+    The inverse case — a new directory with NO own-logged member — must STILL be
+    flagged, so the genuine over-inclusion signal survives; that is asserted in
+    the same run below."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit_multi(tmp, {
+            "alpha": "2026-05-13T09:00:00",
+            "zeta": None,
+        })
+        edit_epoch = _iso_to_epoch("2026-05-13T09:15:00")
+
+        # (1) ATTRIBUTED new directory — member recorded in alpha's own log.
+        attributed = repo / "core" / "scripts" / "g10015-audit-mine"
+        attributed.mkdir(parents=True, exist_ok=True)
+        (attributed / "MEMBER.md").write_text("# alpha authored this new dir\n")
+        os.utime(attributed / "MEMBER.md", (edit_epoch, edit_epoch))
+        os.utime(attributed, (edit_epoch, edit_epoch))
+
+        # (2) UNATTRIBUTED new directory — nothing in any log. Control.
+        orphan = repo / "core" / "scripts" / "g10015-audit-orphan"
+        orphan.mkdir(parents=True, exist_ok=True)
+        (orphan / "MEMBER.md").write_text("# nobody's log records this\n")
+        os.utime(orphan / "MEMBER.md", (edit_epoch, edit_epoch))
+        os.utime(orphan, (edit_epoch, edit_epoch))
+
+        _seed_own_uncommitted_log(
+            repo, "alpha", ["core/scripts/g10015-audit-mine/MEMBER.md"]
+        )
+
+        result = _run_bash(
+            [str(shim), "--goal-id", "g-test-10015-03", "--title", "Apply: test",
+             "--outcome", "deep", "--repo", str(repo), "--dry-run"],
+            env={"MIND_AGENT": "alpha"},
+        )
+        combined = result.stderr + result.stdout
+
+        assert "unattributed (over-inclusion-risk): core/scripts/g10015-audit-mine" not in combined, \
+            ("The over-inclusion audit flagged a new directory whose member file IS "
+             "recorded in the committer's own log — the false AUDIT line g-115-10015 "
+             f"outcome 2 names. combined={combined!r}")
+        # Positive control: the audit must still fire for the genuinely
+        # unattributed directory, or this test would pass against an audit that
+        # had simply been disabled.
+        assert "unattributed (over-inclusion-risk): core/scripts/g10015-audit-orphan" in combined, \
+            ("The over-inclusion audit did NOT flag an unattributed new directory, so the "
+             "assertion above proves nothing — the audit may be inert rather than correct. "
+             f"combined={combined!r}")
+
+
+if __name__ == "__main__":
+    test_concurrent_partner_edit_at_neutral_path_is_filtered()
+    test_concurrent_partner_no_partner_in_flight_file_included()
+    test_concurrent_partner_own_agent_dir_not_filtered()
+    test_concurrent_partner_include_untracked_disables_filter()
+    test_concurrent_partner_modified_tracked_file_filtered()
+    test_concurrent_partner_predate_partner_claim_not_filtered_by_concurrent()
+    test_concurrent_partner_5s_tolerance_at_boundary()
+    test_g115828_committer_own_log_exempts_and_genuine_partner_still_drops()
+    test_g115828_no_own_log_failsafe_drops_as_before()
+    test_g115828_own_log_does_not_exempt_unrelated_path()
+    test_g1151413_absolute_own_log_entry_still_exempts()
+    test_g115697_partner_uncommitted_log_filters_after_in_flight_cleared()
+    test_g1151620_partner_log_exempts_own_authored_double_recorded_path()
+    test_g1151426_over_inclusion_audit_flags_unattributed_not_attributed()
+    test_g1151426_audit_silent_when_all_neutral_attributed()
+    test_g1151498_prestaged_foreign_not_swept_by_pathspec_commit()
+    test_g11510015_new_untracked_directory_is_exempted_by_member_file_authorship()
+    test_g11510015_partner_log_own_log_check_is_dir_shape_aware()
+    test_g11510015_over_inclusion_audit_does_not_flag_attributed_new_directory()
+    print("All 19 concurrent-partner tests passed (7 g-115-692 + 3 g-115-828 "
+          "+ 1 g-115-1413 + 1 g-115-697/914 + 1 g-115-1620 + 2 g-115-1426 "
+          "+ 1 g-115-1498 + 3 g-115-10015).")

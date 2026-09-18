@@ -28,7 +28,6 @@ ITER_CLOSE = CORE_SCRIPTS / "iteration-close.sh"
 RECUR_CLOSE = CORE_SCRIPTS / "recurring-close.sh"
 AUDIT = CORE_SCRIPTS / "deadman-arm-audit.py"
 SENTINEL = "<<autonomous-loop-dynamic>>"
-VOCAB_SH = CORE_SCRIPTS / "_harness_vocab.sh"
 
 
 @pytest.mark.parametrize("script", [ITER_CLOSE, RECUR_CLOSE], ids=["iteration-close", "recurring-close"])
@@ -53,21 +52,10 @@ def test_close_script_gates_on_optout_flag(script):
 @pytest.mark.parametrize("script", [ITER_CLOSE, RECUR_CLOSE], ids=["iteration-close", "recurring-close"])
 def test_close_script_retains_resurrection_arm(script):
     """The pair imperative (sentinel + ScheduleWakeup) must survive the
-    flip — default-ON is meaningless if the arm text was dropped.
-
-    Since 2026-09-17 the arm is spelled by the harness vocabulary: the close
-    scripts source _harness_vocab.sh and interpolate $HC_DEADMAN_ARM, whose
-    Claude Code spelling (and fail-open default) carries the sentinel and
-    ScheduleWakeup. Follow that ONE indirection -- a script that dropped the
-    interpolation, or a helper that dropped the sentinel, still fails here.
-    The EXECUTED line is pinned in test_harness_caps.py and
-    test_recurring_close_failure_imperative.py."""
+    flip — default-ON is meaningless if the arm text was dropped."""
     text = script.read_text(encoding="utf-8")
-    assert "_harness_vocab.sh" in text and "$HC_DEADMAN_ARM" in text, (
-        f"{script.name} lost the resurrection-arm interpolation")
-    vocab = VOCAB_SH.read_text(encoding="utf-8")
-    assert SENTINEL in vocab, "_harness_vocab.sh lost the resurrection sentinel"
-    assert "ScheduleWakeup" in vocab, "_harness_vocab.sh lost the ScheduleWakeup arm"
+    assert SENTINEL in text, f"{script.name} lost the resurrection sentinel"
+    assert "ScheduleWakeup" in text, f"{script.name} lost the ScheduleWakeup arm"
 
 
 def _load_audit():

@@ -549,6 +549,234 @@ def _inbound_pass(goals: list, self_agent: str, escalate_hours: float,
     }
 
 
+# ---- lane-legality limb () --------------------------------------
+# WHY: this sweep's predicate was TIME ONLY. A handoff addressed to an agent a
+# standing lane pin FORBIDS from claiming it ages FOREVER -- the sweep re-reports
+# it on cooldown indefinitely and no escalation it emits can ever resolve it.
+# MEASURED 2026-09-15 (alpha, cc-04): 12 aged handoffs, ALL handoff_to=foxtrot,
+# ages 97.67 / 113.89 (x8) / 520.02 / 525.31 / 526.36 hours -- three waiting ~22
+# DAYS -- and roughly half were CODE work that capability-routing.md pin-001
+# (user directive 2026-08-06) puts out of foxtrot's lane. Foxtrot was alive the
+# whole time; gates/lane_pin.py REFUSES those claims at the daemon endpoint, so
+# the assignee could not have taken them even by trying.
+#
+# This is the RULE axis of .claude/rules/reclaim-routed-work.md: the premise
+# ("foxtrot owns that surface") was retired by a directive while the routing
+# FIELD kept pointing there, and every sweep since tested AGE and never whether
+# the reason was still a valid reason. Per that rule's #7 the reclaim predicate
+# was narrower than the population it had to drain, so the sweep reported
+# "on cooldown" forever and read as working.
+#
+# The verdict is NOT re-derived here (guard-4883 / guard-2676): it comes from
+# gates/lane_pin.py::evaluate -- the same function the claim endpoint runs --
+# called with the REAL goal, so this sweep agrees with the gate that would
+# actually refuse the claim rather than approximating it.
+
+_LANE_UNKNOWN = "unknown"
+
+
+def _world_dir():
+    """Resolved WORLD path, or None. Never raises."""
+    try:
+        if str(SCRIPT_DIR) not in sys.path:
+            sys.path.insert(0, str(SCRIPT_DIR))
+        from _paths import WORLD_DIR
+        return WORLD_DIR
+    except Exception:
+        return None
+
+
+def _registry_text(world_dir):
+    """The lane-pin registry markdown, or None if unreadable.
+
+    READ ONCE PER RUN and threaded into every evaluate() call. The cheap reason
+    is N file reads. The LOAD-BEARING reason is g-115-5226: handed neither
+    registry_text nor a world_dir, evaluate() returns verdict="no-pin" --
+    BYTE-IDENTICAL to "this agent has no pin" -- so a wiring mistake reads as a
+    clean, confident, structurally-inert PASS with nothing to notice. Resolving
+    the registry here, once, is what lets this sweep tell "no pin for this
+    agent" from "I could not read the registry at all" and report UNKNOWN for
+    the latter instead of silently declaring every aged handoff legitimate.
+    """
+    if world_dir is None:
+        return None
+    try:
+        from gates import lane_pin as _lane_pin
+        text = Path(world_dir).joinpath(
+            _lane_pin.REGISTRY_RELPATH).read_text(encoding="utf-8")
+    except Exception:
+        return None
+    # AN EMPTY READ IS A DEGRADED READ, NOT AN EMPTY REGISTRY (
+    # fresh-eyes, 2026-09-18). The try/except above catches an unreadable
+    # registry, but a file that reads as "" sails through it -- and "" handed
+    # to evaluate() yields verdict="no-pin", byte-identical to "this agent has
+    # no pin", with registry_readable reported TRUE. That is precisely the
+    #  failure this function exists to prevent, one step in: a
+    # confident, structurally-inert PASS declaring every aged handoff
+    # legitimate. Not hypothetical on this fleet -- rb-2970 measures reads
+    # transiently returning EMPTY on the S3-backed own-cloud mount while a
+    # file settles. Degrade to the unknown path instead (rb-3099, rb-5242).
+    if not text.strip():
+        return None
+    return text
+
+
+def _lane_verdict(goal, handoff_to, registry_text, world_dir) -> dict:
+    """Can `handoff_to` LEGALLY claim this goal?
+
+    Returns {"verdict", "confident", "pin_id", "evidence", "reason"}. `verdict`
+    is one of lane_pin's own words -- in-lane / out-of-lane / ambiguous / no-pin
+    -- plus "unknown" when the registry was unreadable or the gate could not run.
+
+    `confident` is deliberately NARROW: True only when lane_pin would BLOCK
+    (would_block=True AND verdict=="out-of-lane"). That is the exact condition
+    the daemon claim endpoint refuses on, so a confident mis-route is a handoff
+    whose claim provably cannot succeed. EVERY other state -- ambiguous (both
+    lane columns matched), in-lane, no-pin, unknown, or any exception -- is not
+    confident and is left alone. The asymmetry is the whole posture: a false
+    re-route steals a partner's legitimate work, while a false leave-alone is
+    merely the status quo this sweep already produces.
+    """
+    base = {"verdict": _LANE_UNKNOWN, "confident": False, "pin_id": None,
+            "evidence": [], "reason": ""}
+    if registry_text is None:
+        base["reason"] = "lane-pin registry unreadable — no verdict attempted"
+        return base
+    try:
+        from gates.lane_pin import evaluate as _pin_evaluate
+    except Exception as exc:
+        base["reason"] = "lane_pin import failed: %s" % exc.__class__.__name__
+        return base
+    try:
+        res = _pin_evaluate(handoff_to, goal, registry_text=registry_text,
+                            world_dir=world_dir)
+    except Exception as exc:
+        base["reason"] = "lane_pin raised: %s" % exc.__class__.__name__
+        return base
+    if not isinstance(res, dict):
+        base["reason"] = "lane_pin returned %s, expected dict" % type(res).__name__
+        return base
+    verdict = res.get("verdict") or _LANE_UNKNOWN
+    evidence = list(res.get("evidence") or [])[:4]
+    # SPLIT "in-lane" FROM "unmatched", and do not let the gate's own word stand
+    # (measured on the live population, 2026-09-18). lane_pin is calibrated for
+    # the CLAIM decision, where allow-on-doubt is correct: a pin exists but
+    # NEITHER column matched the goal, so it returns verdict="in-lane" with
+    # reason "in-lane-or-unmatched" and an EMPTY evidence list. Reusing that
+    # word verbatim for a ROUTING decision silently converts "the pin does not
+    # settle this goal" into "this handoff is legitimate" -- the same
+    # empty-evidence blindness  added evidence-naming to expose.
+    # Measured: 5 of 12 aged handoffs land here, including three "Wire <X>
+    # action ..." goals that ARE the client Lua pin-001 forbids -- the pin names
+    # ARTIFACTS ("client lua", "analyzers") while the goals name OUTCOMES, so a
+    # token join between them cannot fire in either direction. Keyed on the
+    # empty evidence rather than the reason STRING, which is the SSOT's own
+    # signal and does not break if the wording changes.
+    if verdict == "in-lane" and not evidence:
+        verdict = "unmatched"
+    return {"verdict": verdict,
+            "confident": bool(res.get("would_block")) and verdict == "out-of-lane",
+            "pin_id": res.get("pin_id"),
+            "evidence": evidence,
+            "reason": res.get("reason") or ""}
+
+
+def _reroute(goal: dict, lane: dict, no_write: bool) -> tuple:
+    """Clear `handoff_to` so a confidently mis-routed goal returns to the pool.
+
+    Returns (ok, detail). `handoff_to` is optional and additive in the goal
+    schema -- "goals without handoff_to are unchanged" -- so clearing it drops
+    both the other-agent selector penalty and this sweep's aging escalation,
+    which IS "route it back to the fleet". `handoff_from` and
+    `handoff_created_at` are deliberately LEFT INTACT: they record who routed it
+    and when, and that history is what makes the re-route auditable rather than
+    a field silently going missing.
+
+    The clearing form is the literal string "null" (measured: an empty value is
+    refused with "goal_id, field, and value are all required"; "null" writes
+    JSON null).
+    """
+    goal_id = goal.get("id", "") or ""
+    source = goal.get("_source", "world") or "world"
+    if no_write:
+        return True, "no_write"
+    try:
+        proc = subprocess.run(
+            bash_cmd(SCRIPT_DIR / "aspirations-update-goal.sh",
+                     "--source", source, goal_id, "handoff_to", "null"),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60)
+        if proc.returncode != 0:
+            sys.stderr.write(
+                "handoff-aging-check: reroute of %s exit=%d stderr=%s\n"
+                % (goal_id, proc.returncode, (proc.stderr or "").strip()[:300]))
+            return False, "reroute_nonzero:%d" % proc.returncode
+    except Exception as exc:
+        sys.stderr.write("handoff-aging-check: reroute of %s raised (%s)\n"
+                         % (goal_id, exc.__class__.__name__))
+        return False, "reroute_exception:%s" % exc.__class__.__name__
+    # Audit on the goal itself. Best-effort: the clear above already landed, and
+    # a reader who finds handoff_to simply GONE with no reason on the record is
+    # the failure this append exists to prevent.
+    try:
+        note = ("handoff_to cleared by handoff-aging-check lane-legality limb "
+                "(g-115-10020): target %r is forbidden from claiming this goal by "
+                "lane pin %s, so the handoff could never be honoured and was "
+                "ageing indefinitely. lane_pin evidence: %s. handoff_from and "
+                "handoff_created_at left intact as the routing history."
+                % (goal.get("handoff_to"), lane.get("pin_id"),
+                   ", ".join(str(e) for e in (lane.get("evidence") or [])) or "none"))
+        subprocess.run(
+            bash_cmd(SCRIPT_DIR / "goal-field-append.sh",
+                     "--source", source, goal_id, "progress_note",
+                     "lane-misroute-reroute-%s" % goal_id, note),
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60)
+    except Exception:
+        pass
+    # Tell the fleet. The assignee is losing a row from its queue and must not
+    # discover that by noticing an absence; the board is the shared record that
+    # survives whichever box either of us is on (guard-997).
+    try:
+        msg = ("Handoff MIS-ROUTED and cleared: %s [%s] was routed to %s and aged "
+               "%.0fh, but lane pin %s FORBIDS that agent from claiming it, so the "
+               "handoff could never be honoured. handoff_to cleared -> the goal is "
+               "fleet-claimable again; handoff_from/handoff_created_at left intact. "
+               "lane_pin evidence: %s. Verdict came from gates/lane_pin.py::evaluate, "
+               "the same function the claim endpoint runs. Re-route wrongly? Set "
+               "handoff_to back and say so on the goal."
+               % (goal.get("title", "") or "", goal_id, goal.get("handoff_to"),
+                  float(goal.get("_age_hours") or 0.0), lane.get("pin_id"),
+                  ", ".join(str(e) for e in (lane.get("evidence") or [])) or "none"))
+        subprocess.run(
+            bash_cmd(SCRIPT_DIR / "board-post.sh",
+                     "--channel", "coordination", "--type", "status",
+                     "--tags", "handoff-misrouted,%s,%s" % (goal_id, goal.get("handoff_to") or "")),
+            input=msg, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30)
+    except Exception:
+        pass
+    return True, "rerouted"
+
+
+def _lane_split(candidates, registry_text) -> dict:
+    """Per-verdict tally of the aged population, plus the ids in each bucket.
+
+    `registry_readable` is reported explicitly rather than left to be inferred
+    from an all-"unknown" tally: those two states look identical in the counts
+    and mean opposite things (a degraded run vs a fleet with no pins).
+    """
+    buckets = {}
+    for c in candidates:
+        buckets.setdefault(c["lane"]["verdict"], []).append(c["goal_id"])
+    return {
+        "registry_readable": registry_text is not None,
+        "mis_routed": [c["goal_id"] for c in candidates if c["mis_routed"]],
+        "mis_routed_count": sum(1 for c in candidates if c["mis_routed"]),
+        "by_verdict": {k: sorted(v) for k, v in sorted(buckets.items())},
+    }
+
+
 def run(args) -> dict:
     """Main sweep. Returns the JSON-shape result dict (also printed to stdout)."""
     escalate_hours = _load_escalate_hours(args)
@@ -557,6 +785,17 @@ def run(args) -> dict:
     goals = _read_goals("world") + _read_goals("agent")
     board_log_path = Path(args.board_escalation_log) if args.board_escalation_log else None
     recent_escalations = _read_recent_escalations(escalate_hours, now, board_log_path)
+
+    # Lane-legality inputs, resolved ONCE (see _registry_text for why this is
+    # not left to evaluate()'s own lookup — ).
+    world_dir = _world_dir()
+    registry_text = _registry_text(world_dir)
+    if registry_text is None:
+        sys.stderr.write(
+            "handoff-aging-check: lane-pin registry unreadable (world_dir=%r) — "
+            "every candidate reports lane verdict 'unknown' and NOTHING is "
+            "re-routed this run. This is a degraded run, not a clean one.\n"
+            % (str(world_dir) if world_dir else None,))
 
     candidates = []
     for g in goals:
@@ -574,6 +813,7 @@ def run(args) -> dict:
         if age is None or age < escalate_hours:
             continue
         goal_id = g.get("id", "")
+        lane = _lane_verdict(g, ht, registry_text, world_dir)
         candidates.append({
             "goal_id": goal_id,
             "title": g.get("title", ""),
@@ -581,17 +821,39 @@ def run(args) -> dict:
             "age_hours": round(age, 2),
             "blocker_id": "handoff_%s" % goal_id,
             "on_cooldown": goal_id in recent_escalations,
+            "lane": lane,
+            "mis_routed": lane["confident"],
         })
 
     fired = []
     skipped_cooldown = []
     failed = []
+    rerouted = []
     if args.apply:
         for c in candidates:
+            full = next((g for g in goals if g.get("id") == c["goal_id"]), None)
+            # MIS-ROUTED outranks the cooldown. The cooldown exists to stop the
+            # same AGING notice being re-posted; a re-route is a different act
+            # that resolves the row permanently, and suppressing it on cooldown
+            # is exactly how this population sat 98-526h (guard-6571: a verdict
+            # this sweep computes and never applies is a promise of effect).
+            if c["mis_routed"] and not getattr(args, "no_reroute", False):
+                if full is None:
+                    continue
+                full["_age_hours"] = c["age_hours"]
+                ok, detail = _reroute(full, c["lane"], args.no_board)
+                (rerouted if ok else failed).append({
+                    "goal_id": c["goal_id"],
+                    "handoff_to": c["handoff_to"],
+                    "age_hours": c["age_hours"],
+                    "pin_id": c["lane"].get("pin_id"),
+                    "evidence": c["lane"].get("evidence"),
+                    "detail": detail,
+                })
+                continue
             if c["on_cooldown"]:
                 skipped_cooldown.append(c["goal_id"])
                 continue
-            full = next((g for g in goals if g.get("id") == c["goal_id"]), None)
             if full is None:
                 continue
             ok, detail = _post_board(full, c["handoff_to"], c["age_hours"], args.no_board)
@@ -622,6 +884,8 @@ def run(args) -> dict:
         "fired": fired,
         "skipped_cooldown": skipped_cooldown,
         "failed": failed,
+        "rerouted": rerouted,
+        "lane_split": _lane_split(candidates, registry_text),
     }
     # Inbound pass (). ADDITIVE: every key above is unchanged in name,
     # meaning and value, so existing readers of this JSON are unaffected. The
@@ -652,6 +916,9 @@ def main():
     p.add_argument("--inbound-max-report", type=int, default=None,
                    help="Cap on reported NON-HIGH inbound rows (default: config "
                         "handoff_aging.inbound_max_report or 5). HIGH rows are never capped.")
+    p.add_argument("--no-reroute", action="store_true",
+                   help="Compute and report lane verdicts but never clear handoff_to "
+                        "(escape hatch; --apply otherwise re-routes confident mis-routes).")
     p.add_argument("--no-inbound", action="store_true",
                    help="Skip the inbound pass entirely (escape hatch; the outbound "
                         "result keys are unaffected either way).")

@@ -986,6 +986,40 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
                if isinstance(item, str) else "")
             + ".")
 
+    # : `load_bearing` controls EVICTION, so a non-boolean in it is a
+    # destructive silent-success. Every consumer tests it for truthiness
+    # (_is_flagged, capture_fast_lane._flagged, body_capture_carrier), so a
+    # non-empty STRING counts as true and buys eviction-exemption plus a carrier
+    # push — while reading, in the stored record, as an observation someone put in
+    # the wrong key. Measured on agents/alpha/capture-evictions-archive.jsonl:
+    # 24,620 archived rows carry 18 non-boolean values, all in spark_capture, and
+    # they are only 2 DISTINCT strings — the same two entries re-archived 9 times
+    # each. Nothing ever surfaced them, because truthy prose is indistinguishable
+    # from `true` at every reader.
+    #
+    # REFUSED, not normalized, and the split from the sibling
+    # `_normalize_spark_capture_entry` below is deliberate rather than
+    # inconsistent. That helper normalizes because a misplaced OBSERVATION has one
+    # unambiguous repair (promote it into `observation`) and losing it is the
+    # failure it prevents. Here there is no such repair: nothing can infer whether
+    # the writer meant true or false, and the field gates a DESTRUCTIVE operation,
+    # so guessing would silently decide which entry gets evicted. The refusal is
+    # recoverable in-turn — the writer re-appends with a boolean — and the two
+    # measured strings recurring nine times each is what silence bought.
+    if root_slot_for_validation in CAPTURE_SLOTS and isinstance(item, dict):
+        _lb = item.get("load_bearing")
+        if _lb is not None and not isinstance(_lb, bool):
+            return Response.error(
+                400, "validation_failed",
+                f"capture slot {root_slot_for_validation!r}: `load_bearing` must "
+                f"be a JSON boolean (true/false) or be omitted; got "
+                f"{type(_lb).__name__} {str(_lb)[:80]!r}. It is not a free-text "
+                f"field: it gates eviction-exemption and the carrier push, and "
+                f"every reader tests it for truthiness, so a non-empty string "
+                f"silently counts as true. If that text is an observation, put it "
+                f"in `observation` (or another content key) and set "
+                f"`load_bearing` to true or false.")
+
     if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
         try:
             _validate_knowledge_debt_entry(ctx, item)

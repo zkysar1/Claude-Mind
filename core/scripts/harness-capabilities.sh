@@ -5,9 +5,6 @@
 #   harness-capabilities.sh                       # harness=<name> background_job_notify=<true|false>
 #   harness-capabilities.sh --get <capability>    # one value, e.g. --get background_job_notify
 #   harness-capabilities.sh --json
-#   harness-capabilities.sh --skill-call <name> [args]   # the re-entry as THIS harness spells it
-#   harness-capabilities.sh --wakeup-call [prompt [delay_seconds]]
-#   harness-capabilities.sh --loop-vocab-sh              # HC_* assignments; source _harness_vocab.sh instead
 #
 # Consumers: aspirations-all-blocked B7.2 (the yield branch), idle-tick.sh and
 # the cycle-cache directive printers. Logic lives in _harness_caps.py (pure,

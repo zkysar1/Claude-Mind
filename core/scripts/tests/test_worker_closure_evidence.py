@@ -431,8 +431,7 @@ class TestBothOrchestratorsCallIt:
             "reducer's false override reason and the reducer's spark imperative")
         assert "worker Body — HEAD pushed to refs/workers" in body, (
             "worker-specific uncommitted-work override reason missing")
-        # $HC_SPARK_REF = Skill(aspirations-spark) on Claude Code (2026-09-17 vocabulary).
-        assert "do NOT invoke $HC_SPARK_REF" in body, (
+        assert "do NOT invoke Skill(aspirations-spark)" in body, (
             "worker-specific NEXT line missing — the reducer imperative would "
             "tell a worker to run a reducer-only phase")
         assert "Phase 6 spark REQUIRED" in body, (

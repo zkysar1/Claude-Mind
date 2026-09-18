@@ -47,7 +47,7 @@ RC_USAGE = 2
 # CPython, which is exactly RC_LOSS — so a registry import failure, a missing git, or
 # an undecodable store would report "GENUINE LOSS" to anything reading the exit code.
 # For a script whose whole purpose is to gate a post-merge path that is the fail-CLOSED
-# direction the wiring goal (g-001-842) explicitly must not have: iteration-push.sh's
+# direction the wiring goal () explicitly must not have: iteration-push.sh's
 # own comments say a wrongly-refusing gate there "silently freezes framework sync for
 # the box". Internal faults get their OWN code, and main() catches everything.
 RC_INTERNAL = 4
@@ -299,7 +299,7 @@ def _regressions(pre_idx: dict, post_idx: dict) -> list:
             out.append({"id": rid, "kind": "backward_lifecycle",
                         "field": pre_field, "from": pre_st, "to": post_st})
         # A record that has CLOSED since the pre-state is expected to have shed
-        # its defer_reason — closing clears the defer. Measured: g-001-758
+        # its defer_reason — closing clears the defer. Measured: 
         # reported a lost `human_blocked:` defer and was completed 2026-09-15,
         # same title and same created_at, i.e. the same record closing normally.
         # Without this the audit flags every goal that closed after the merge.

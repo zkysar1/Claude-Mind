@@ -72,6 +72,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -83,6 +84,40 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # handoff-aging-check scanned 2,616 records in the measurement run; 120 s leaves
 # headroom without letting one wedged lane hold the loop entry open.
 _LANE_TIMEOUT_S = 120
+
+# PER-LANE OVERRIDE (). One uniform cap is wrong for a lane whose
+# inner work is O(queue): dependency-timeout-check shells out to
+# `goal-selector.sh blocked`, which re-scores the whole queue, and that call
+# carries its OWN bound. A wrapper cap must EXCEED the inner window or it kills
+# a call that is still legally running (guard-918) — and this one did: the
+# uniform 120 s sat BELOW that lane's 180 s inner bound, so on any box slow
+# enough to matter the lane was hard-killed with no payload and reported BLIND,
+# while the honest `blocked_view_measured: false` it is built to emit could
+# never be reached. Measured 2026-09-18 (echo, cc-03, Linux 6.8.0-139-generic):
+# the whole lane runs in 43.1 s here against 740 blocked goals, so this cap does
+# not bind on a healthy box — it exists for the slow one, where the same shared
+# queue cost foxtrot >180 s on 2026-09-13.
+#
+# Keyed off the SAME env knob the lane itself reads, so the two cannot drift
+# into a fresh inversion; the headroom covers the lane's own non-selector work
+# (goal index read, board scan). Lanes without an entry keep _LANE_TIMEOUT_S.
+#
+# A MALFORMED KNOB MUST NOT RAISE HERE — this import IS the loop-entry
+# always-run tier, so a bare int() would let an empty or mistyped tuning value
+# crash the whole battery, not just the one lane it tunes. Mirrors the
+# identical guard at the lane's own read site; both fall back LOUDLY so a
+# silently-ignored knob can never masquerade as an applied one.
+_KNOB = os.environ.get("DEP_BLOCKED_VIEW_TIMEOUT_S")
+try:
+    _BLOCKED_VIEW_TIMEOUT_S = int(_KNOB) if _KNOB and _KNOB.strip() else 300
+except ValueError:
+    sys.stderr.write(
+        "precheck-always-run-battery: DEP_BLOCKED_VIEW_TIMEOUT_S=%r is not an "
+        "integer — falling back to 300s\n" % _KNOB)
+    _BLOCKED_VIEW_TIMEOUT_S = 300
+_LANE_TIMEOUT_OVERRIDE_S = {
+    "dependency-timeout-check": _BLOCKED_VIEW_TIMEOUT_S + 60,
+}
 _METER = "aspirations-precheck-budget-meter.sh"
 
 
@@ -380,7 +415,8 @@ def run(as_json=False, apply=False, lane_runner=None) -> int:
         if apply and lane["apply_flag"]:
             argv.append("--apply")
 
-        rc, out, err = runner(argv, _LANE_TIMEOUT_S)
+        rc, out, err = runner(
+            argv, _LANE_TIMEOUT_OVERRIDE_S.get(lane["name"], _LANE_TIMEOUT_S))
         if err is not None:
             report["blind"].append(
                 {"name": lane["name"], "phase": lane["phase"], "reason": err}

@@ -50,31 +50,17 @@ reconfigure_stdio()
 # (0.01-0.02s, same as `import os,sys`), so the hot-path budget is unaffected.
 from _paths import AGENTS_PARENT_DIR  # noqa: E402
 
-# Vessel vocabulary (2026-09-17): the re-entry tools as THIS harness names them
-# (_harness_caps.py, the one owner). Claude Code: Skill(aspirations) with
-# args='loop' / ScheduleWakeup(...) -- every reminder below is byte-identical to
-# before. zakcode: use_skill(name='aspirations', args='loop') /
-# schedule_wakeup(...), the names in the vessel model's own tool list. This
-# reminder OUTRANKS the close script's stdout in model priority, so it must
-# speak the same vocabulary as the ITERATION COMPLETE line it restates.
-import _harness_caps as _hc  # noqa: E402
-
-_LOOP_CALL = _hc.skill_call("aspirations", "loop")
-_LOOP_REF = _hc.skill_ref("aspirations")
-_SPARK_REF = _hc.skill_ref("aspirations-spark")
-_DEADMAN_ARM = _hc.wakeup_call(quote='"')
-
 
 REMINDER_TEXT_GENERIC = (
     "<system-reminder>\n"
     "An iteration just closed (iteration-close.sh --phase productivity-check OR "
     "recurring-close.sh completed). Your VERY NEXT tool call MUST be "
-    f"{_LOOP_CALL}. Do NOT emit a text summary, do NOT "
+    "Skill(aspirations) with args='loop'. Do NOT emit a text summary, do NOT "
     "end with a Bash echo, do NOT write any other tool call first. A terminal "
     "text paragraph or Bash echo here ends the turn without re-entering the "
     "loop and kills the autonomous session. See .claude/rules/return-protocol.md "
     "for the two-case terminal-action rule (sub-skill = Bash; orchestrator at "
-    f"iteration close = {_LOOP_REF}).\n"
+    "iteration close = Skill(aspirations)).\n"
     "</system-reminder>"
 )
 
@@ -89,10 +75,10 @@ REMINDER_TEXT_GENERIC = (
 REMINDER_TEXT_DEEP_RECURRING = (
     "<system-reminder>\n"
     "A deep recurring close just completed (recurring-close.sh OUTCOME=deep). "
-    f"Your VERY NEXT tool call MUST be {_SPARK_REF} — Phase 6 spark "
+    "Your VERY NEXT tool call MUST be Skill(aspirations-spark) — Phase 6 spark "
     "fires on deep closes and is NOT wrapped by recurring-close.sh. AFTER "
-    f"Phase 6 completes, call {_LOOP_CALL} to re-enter "
-    f"the loop. Do NOT emit text or a Bash echo before {_SPARK_REF}. "
+    "Phase 6 completes, call Skill(aspirations) with args='loop' to re-enter "
+    "the loop. Do NOT emit text or a Bash echo before Skill(aspirations-spark). "
     "See .claude/skills/aspirations/SKILL.md \"Recurring-goal shortcut\" section "
     "and .claude/rules/return-protocol.md.\n"
     "</system-reminder>"
@@ -111,14 +97,14 @@ REMINDER_TEXT_GENERIC_DEADMAN = (
     "recurring-close.sh OUTCOME=routine completed). The deadman-switch is ON "
     "(default), so your terminal response MUST be EXACTLY these TWO batched tool "
     "calls, IN THIS ORDER, in this ONE response:\n"
-    f"  (1) {_DEADMAN_ARM} "
+    "  (1) ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", delaySeconds=600) "
     "— the self-resurrection net; MANDATORY, do NOT omit it; THEN\n"
-    f"  (2) {_LOOP_CALL} — the primary re-entry and the "
+    "  (2) Skill(aspirations) with args='loop' — the primary re-entry and the "
     "LAST call, which continues the loop NOW.\n"
     "Emit BOTH in this single response with NO text before or between them. Do "
     "NOT emit a text summary and do NOT end with a Bash echo — a terminal text "
     "paragraph ends the turn without re-entering the loop and kills the session. "
-    f"{_LOOP_REF} ALONE keeps THIS iteration alive but leaves the NEXT one "
+    "Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one "
     "unprotected against a silent text-death, so arm the net EVERY iteration. "
     "See .claude/rules/return-protocol.md (deadman terminal-pair) and "
     "schedule-wakeup-correctness.md.\n"
@@ -128,12 +114,12 @@ REMINDER_TEXT_GENERIC_DEADMAN = (
 REMINDER_TEXT_DEEP_RECURRING_DEADMAN = (
     "<system-reminder>\n"
     "A deep recurring close just completed (recurring-close.sh OUTCOME=deep, "
-    f"deadman-switch ON). Your VERY NEXT tool call MUST be {_SPARK_REF} "
+    "deadman-switch ON). Your VERY NEXT tool call MUST be Skill(aspirations-spark) "
     "— Phase 6 spark fires on deep closes and is NOT wrapped by recurring-close.sh. "
     "AFTER Phase 6 completes, re-enter the loop with the deadman PAIR, in this "
-    f"order and in one response: {_DEADMAN_ARM} "
-    f"THEN {_LOOP_CALL}. Do NOT emit text "
-    f"or a Bash echo before {_SPARK_REF}. See "
+    "order and in one response: ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", "
+    "delaySeconds=600) THEN Skill(aspirations) with args='loop'. Do NOT emit text "
+    "or a Bash echo before Skill(aspirations-spark). See "
     ".claude/skills/aspirations/SKILL.md \"Recurring-goal shortcut\" section and "
     ".claude/rules/return-protocol.md.\n"
     "</system-reminder>"

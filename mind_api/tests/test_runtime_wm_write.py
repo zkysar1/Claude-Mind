@@ -261,6 +261,94 @@ def test_append_knowledge_debt_invalid_400(running_daemon):
         raise AssertionError("expected 400 for unresolvable knowledge_debt node_key")
 
 
+# . The two strings below are VERBATIM from
+# agents/alpha/capture-evictions-archive.jsonl — the only two non-boolean
+# `load_bearing` values in 24,620 archived rows, each re-archived 9 times. Both
+# are observations a writer put in the wrong key, and both are non-empty, so
+# every consumer (_is_flagged, capture_fast_lane._flagged, body_capture_carrier)
+# counted them as TRUE and granted eviction-exemption plus a carrier push. They
+# are fixtures rather than invented strings on purpose: a synthetic "not a bool"
+# would prove the type check compiles, while these prove it catches the shape
+# that actually reached the store.
+_PROSE_LOAD_BEARING = [
+    "Both sides' records are self-consistent, so neither Body can detect it "
+    "locally -- only a Body that re-reads after a pull sees the change. The "
+    "evidence is a two-store comparison: team-state in_flight_bodies holds the "
+    "first claim time, aspirations holds the surviving one.",
+    "The guard's deny message already contained the safe form. The refusal was "
+    "not a knowledge gap, it was a not-reading-the-offer gap.",
+]
+
+
+@pytest.mark.parametrize("prose", _PROSE_LOAD_BEARING)
+def test_append_refuses_prose_in_load_bearing(running_daemon, prose):
+    """A non-boolean load_bearing is refused 400 rather than stored truthy."""
+    _, port = running_daemon
+    try:
+        _post(port, "/v1/wm/append", {"slot": "spark_capture"},
+              json.dumps({"goal_id": "g-999-03", "category": "test",
+                          "observation": "x" * 50, "load_bearing": prose}))
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        payload = json.loads(e.read())
+        assert payload["error"] == "validation_failed", payload
+        # The message must name the FIELD and the received TYPE — a bare
+        # "validation_failed" would leave the writer guessing which key is wrong.
+        assert "load_bearing" in payload["detail"], payload
+        assert "str" in payload["detail"], payload
+    else:
+        raise AssertionError(
+            "expected 400 for prose in load_bearing; storing it truthy is the "
+            "defect g-115-10021 measured")
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_append_accepts_boolean_load_bearing(running_daemon, value):
+    """POSITIVE CONTROL for the refusal above.
+
+    Without this, a check that refused EVERY load_bearing — or an endpoint that
+    happened to be 400ing for an unrelated reason — would pass the test above
+    while breaking the flag entirely. Both booleans are exercised because `false`
+    is the value the refusal path must not swallow: it is falsy, and a truthiness
+    test written where a `is None` test belongs would reject it.
+    """
+    project_root, port = running_daemon
+    # Distinct id per parameter: both cases share the lane, so one id would make
+    # the lookup below ambiguous about which append it found.
+    gid = "g-999-04-%s" % str(value).lower()
+    status, body = _post(port, "/v1/wm/append", {"slot": "spark_capture"},
+                         json.dumps({"goal_id": gid, "category": "test",
+                                     "observation": "y" * 50,
+                                     "load_bearing": value}))
+    assert status == 200, body
+    # Capture slots live under `slots:`, never at the top level — a top-level
+    # read returns a clean, wrong answer (the wm-append wrapper warns about
+    # exactly this shape).
+    entries = _read_wm(project_root / "agents" / "alpha")["slots"]["spark_capture"]
+    # Look the entry up by goal_id rather than taking entries[-1]: the lane is
+    # SORTED by _eviction_sort_key (flagged last), so append order is not read
+    # order and `[-1]` silently reads a different entry once anything flagged is
+    # present. Found by mutation — disabling the refusal let two prose entries
+    # into the lane and this assertion started failing on an unrelated row.
+    mine = [e for e in entries if e.get("goal_id") == gid]
+    assert mine, entries
+    assert mine[-1]["load_bearing"] is value, mine[-1]
+
+
+def test_append_accepts_omitted_load_bearing(running_daemon):
+    """The field is OPTIONAL — most entries carry none, and the refusal must not
+    turn an absent flag into a required one."""
+    project_root, port = running_daemon
+    status, body = _post(port, "/v1/wm/append", {"slot": "spark_capture"},
+                         json.dumps({"goal_id": "g-999-05", "category": "test",
+                                     "observation": "z" * 50}))
+    assert status == 200, body
+    entries = _read_wm(project_root / "agents" / "alpha")["slots"]["spark_capture"]
+    mine = [e for e in entries if e.get("goal_id") == "g-999-05"]
+    assert mine, entries
+    assert "load_bearing" not in mine[-1], mine[-1]
+
+
 def test_append_heals_int_in_goals_completed_list_slot(running_daemon):
     """2026-08-16 worker-loop Phase 4b outage: the TOP-LEVEL
     goals_completed_this_session (a LIST of hand-off rows) had been collapsed

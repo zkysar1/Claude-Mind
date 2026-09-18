@@ -87,11 +87,7 @@ def _build_fake_project(tmp_path: Path, agent: str, sid: str) -> Path:
     return proj
 
 
-_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
-
-
-def _invoke_hook(payload: dict, project_root: Path,
-                 harness: dict | None = None) -> tuple[int, str, str]:
+def _invoke_hook(payload: dict, project_root: Path) -> tuple[int, str, str]:
     """Run iteration-close-reminder.py as a PostToolUse hook with the given
     payload as stdin JSON. Returns (rc, stdout, stderr).
 
@@ -109,13 +105,6 @@ def _invoke_hook(payload: dict, project_root: Path,
     # itself lives in the real repo, so its dirname IS core/scripts (the
     # path we point sys.executable at).
     env["PYTHONPATH"] = str(CORE_SCRIPTS)
-    # Harness pin (2026-09-17): the imperative is spelled in the hosting
-    # harness's tool names, read from the CLAUDECODE / ZAKCODE_* markers. Pin
-    # Claude Code so the Skill(...) pins in this family hold on a box that runs
-    # the suite under a vessel; a test names another harness via `harness`.
-    for k in _HARNESS_MARKERS:
-        env.pop(k, None)
-    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
 
     result = subprocess.run(
         [sys.executable, str(HOOK_PY)],
@@ -232,45 +221,6 @@ def test_routine_recurring_close_emits_generic_reminder(tmp_path):
         f"routine recurring close should emit generic Skill(aspirations) reminder; "
         f"got: {ctx[:400]}"
     )
-
-
-# ── Case 2.5: a zakcode VESSEL → the same reminders in the vessel's tool names
-
-
-def test_vessel_harness_reminders_name_the_vessels_tools(tmp_path):
-    """2026-09-17: on a zakcode vessel the reminder speaks that model's own tool
-    names -- use_skill / schedule_wakeup -- in BOTH the generic (deadman) and
-    the deep-recurring shapes, with no Claude Code name left: this reminder
-    outranks the close script's stdout, so the two must agree. Positive
-    control: the Claude Code run of the same payload differs."""
-    proj = _build_fake_project(tmp_path, AGENT, SID)
-    vessel = {"ZAKCODE_SESSION": "x"}
-    generic = _make_payload(
-        COMMAND_ITERATION_CLOSE,
-        {"stdout": "[iteration-close] ═══ ITERATION COMPLETE ═══\n", "stderr": "", "interrupted": False},
-    )
-    rc, stdout, stderr = _invoke_hook(generic, proj, harness=vessel)
-    assert rc == 0, f"hook exit non-zero: rc={rc}, stderr={stderr[-300:]}"
-    ctx = _additional_context(stdout)
-    assert "use_skill(name='aspirations', args='loop')" in ctx, ctx[:400]
-    assert 'schedule_wakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)' in ctx, ctx[:400]
-    assert "Skill(" not in ctx.replace("use_skill(", "") and "ScheduleWakeup" not in ctx
-    assert ctx != _additional_context(_invoke_hook(generic, proj)[1])
-
-    deep = _make_payload(
-        COMMAND_RECURRING,
-        {"stdout": ("[recurring-close] ═══ ITERATION COMPLETE ═══\n"
-                    "[recurring-close] OUTCOME=deep — NEXT ACTION REQUIRED: Call "
-                    "use_skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped "
-                    "by recurring-close.sh), THEN use_skill(name='aspirations', args='loop')."),
-         "stderr": "", "interrupted": False},
-    )
-    rc, stdout, stderr = _invoke_hook(deep, proj, harness=vessel)
-    assert rc == 0, f"hook exit non-zero: rc={rc}, stderr={stderr[-300:]}"
-    ctx = _additional_context(stdout)
-    assert "VERY NEXT tool call MUST be use_skill(aspirations-spark)" in ctx, ctx[:400]
-    assert "use_skill(name='aspirations', args='loop')" in ctx
-    assert "Skill(" not in ctx.replace("use_skill(", "") and "ScheduleWakeup" not in ctx
 
 
 # ── Case 3: iteration-close productivity-check (non-recurring) → GENERIC

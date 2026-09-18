@@ -66,3 +66,42 @@ followed by the reading's own interpretation.
   same-day objection (which is about a window NARROWER than the field's resolution); here the
   window is wide but its START lands mid-day, so the floor leaks at the near edge. Any row whose
   window does not begin at midnight carries this, and none of the earlier rows say so.
+
+- **2026-09-17, zeta, cc-02 (Linux 6.8.0-139-generic), 15.74h window — 100.0%, denominator 5.**
+  Store split at that instant: **74 resolved / 1758 archived** (bytes beside records: resolved
+  607,813 B, archived 9,493,563 B, active 462,609 B → 118). In-window records 7, of which
+  5 SCOREABLE (5 CONFIRMED / 0 CORRECTED) against 1 EXPIRED + 1 UNRESOLVABLE — scored over
+  SCOREABLE only, comparable to the rest of the series (an all-records count would have read
+  71.4% and entered a different quantity). FOURTEENTH 100% of the run and SATURATED on coverage,
+  so it tests nothing there: the resolved backlog GREW 68 → 74 and the within-window backlog
+  model (HOLDING per #26) already predicts UP. Doubly discounted — the window is SAME-DAY, so
+  guard-2303 applies in full, and n=5 is near the series floor.
+
+  **The row's contribution is that the second-count method CLOSES the mid-day-start leak the
+  row above declares unclosable by any filter.** That row is right that a date-only
+  `outcome_date` cannot exclude records resolved earlier on the opening calendar day, so the
+  date-floored denominator is an UPPER BOUND — and this window opens at 06:52:35, squarely
+  mid-day. All four of #27/#28's re-use clauses hold: same agent (zeta), same box (cc-02),
+  prior reading taken at the window's open, and — #28's added clause — that report ACTUALLY
+  PRINTS the triple: `agents/zeta/COMPLETION-REPORT.md` at commit `cf381d04`, "Generated:
+  2026-09-17T06:55", line 39, `632 confirmed / 473 corrected = 57.2% of 1,105 scoreable`.
+  This run reads 1,110 / 637 / 473 at the window's close. Delta **+5 / +5 / +0**, arithmetic
+  closing independently (5 + 0 = 5).
+
+  Delta and date-floored ceiling COINCIDE for the third consecutive qualifying row (5=5, 5=5,
+  0=0; after #29 echo/cc-03 and #30 zeta/cc-02) — but here the coincidence carries information
+  the earlier two did not. #29 and #30 read theirs as "a property of THIS window: the opening
+  calendar day happened to be empty", ASSUMED from the timing. Here it is PROVEN: any scoreable
+  record resolved between 00:00 and 06:52 on 09-17 would sit inside the prior report's 1,105
+  AND inside this run's date-floored 5, so it would drive delta BELOW ceiling. Delta equals
+  ceiling, therefore that segment held zero scoreable records. The method does not merely
+  survive a mid-day start — it MEASURES the leak the filter cannot reach, and reports it empty.
+  Keep publishing both figures and saying which is which; a future window's opening segment will
+  not necessarily be empty, and the point is that this method can now tell you.
+
+  One residual, named because no earlier row does: the prior triple was read at 06:55, ~145s
+  AFTER this window opens at 06:52:35, so the bracket OVERLAPS rather than abutting (#30's was
+  71s and abutting). A record resolving inside that 145s gap would be double-counted and would
+  likewise push delta below ceiling; delta equals ceiling, so none did. The overlap is bounded
+  and measured, not assumed — but a bracket taken AFTER the window opens is strictly weaker than
+  one taken at or before it, and the next run should prefer the latter.

@@ -165,11 +165,7 @@ def _build_runner_root(tmp: Path, world: Path, meta: Path, state: str) -> Path:
     return root
 
 
-_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
-
-
-def _run_hook_as_runner(root: Path, extra_env: dict | None = None,
-                        harness: dict | None = None) -> subprocess.CompletedProcess:
+def _run_hook_as_runner(root: Path, extra_env: dict | None = None) -> subprocess.CompletedProcess:
     """Fire the hook in the environment a Stop event actually provides.
 
     See the module docstring: MIND_SID / MIND_AGENT are scrubbed because
@@ -181,13 +177,6 @@ def _run_hook_as_runner(root: Path, extra_env: dict | None = None,
     env.pop("MIND_SID", None)
     env.pop("MIND_AGENT", None)
     env["STORAGE_BACKEND"] = "local"
-    # Harness pin (2026-09-17): the imperative is spelled in the hosting
-    # harness's tool names, read from the CLAUDECODE / ZAKCODE_* markers. Pin
-    # Claude Code so the Skill(...) pins in this family hold on a box that runs
-    # the suite under a vessel; a test names another harness via `harness`.
-    for k in _HARNESS_MARKERS:
-        env.pop(k, None)
-    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
     # RUNNER_PROC_ID is the SAME seam the shell suite uses at three sites
     # (test-runner-identity-check.sh:248/274/329), not a new one invented here
     # (guard-1885). It is REQUIRED, not a convenience: _resolve_owner_proc walks
@@ -641,3 +630,175 @@ def test_mutation_dropping_the_agent_argument_kills_the_gate(tmp_path):
     finally:
         other.kill(); other.wait()
     assert _blocked(proc), "an agent-less call must fail closed"
+
+
+# ───────────────── Gate 0-pre: the recovery-yank reversal () ─────────────────
+# The TENTH gate outcome, and the one the module docstring's nine could not name
+# because it never executed anywhere. recovery-gate.sh's demotion runs
+# session-manifest-clear.sh, which DELETES running-session-id — so the demoted
+# session reached Gate 0 with no runner file, was ALLOWed, and exited before the
+# reversal (then at Gate 1-pre) could run. The reversal was unreachable in
+# production for the exact state it exists to repair: measured zeta/cc-02
+# 2026-09-16, and bravo/cc-05 sid a2ac1676 with EIGHT `gate=no-runner` exits over
+# 4h50m after a demotion whose own recorded cause was "heartbeat=FRESH" — the
+# false-demotion-of-a-live-loop case the reversal was built for.
+#
+# These are EXECUTION tests. test_recovery_yank.py pins the ORDERING structurally;
+# rb-5146 is exactly why that is not enough — source text proves wiring exists,
+# never that it runs. The mutation proof restores the pre-fix placement inside the
+# sandbox and reproduces the production defect end to end, which is the only
+# evidence these tests are capable of failing.
+
+from datetime import datetime, timedelta  # noqa: E402
+
+GATE0_PRE_HEAD = "# --- Gate 0-pre:"
+GATE0_HEAD = "# --- Gate 0: Session identity"
+GATE0_PRE_CALL = 'recovery-yank-reverse.sh" --agent "$HOOK_AGENT" --sid "$HOOK_SID"'
+
+
+def _code_lines(text: str) -> str:
+    """Comment-only lines removed before any ordering comparison — the Gate 0-pre
+    block QUOTES the gate names it is about, so a raw index finds the prose."""
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _demote_below_gate0(src: str) -> str:
+    """The sabotage: put the reversal back where it lived before .
+
+    guard-1655 — author the mutation by RESTORING THE ORIGINAL CODE rather than by
+    breaking something adjacent, so the test proves the FIX is load-bearing and not
+    merely that the file can be corrupted.
+    """
+    start, end = src.index(GATE0_PRE_HEAD), src.index(GATE0_HEAD)
+    block = src[start:end]
+    without = src[:start] + src[end:]
+    anchor = without.index('echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=not-running')
+    return without[:anchor] + block + without[anchor:]
+
+
+def _drive_demoted(tmp_path, *, yank_sid=RUNNER_SID, mode="autonomous",
+                   worker_body=False, minutes_ago=20, mutate=None):
+    """Reproduce the state recovery-gate.sh path C leaves behind.
+
+    agent-state IDLE + running-session-id DELETED (the manifest clear) + a
+    recovery-log row naming the demoted sid. Deleting the runner file is the whole
+    point: with it present the hook never reaches the failing path at all.
+    """
+    world = tmp_path / "world"
+    world.mkdir()
+    meta = tmp_path / "meta_gate"
+    meta.mkdir()
+    root = _build_runner_root(tmp_path, world, meta, "IDLE")
+    adir = root / "agents" / AGENT
+    sess = adir / "session"
+
+    (sess / "running-session-id").unlink()          # session-manifest-clear.sh
+    (sess / "runner-token").unlink(missing_ok=True)
+    # agent-mode is a SEPARATE precondition input from binding.yaml's mode, and
+    # _build_runner_root does not write it (its own gates never read it). Without
+    # it preconditions refuse with "agent-mode is 'absent', not autonomous" — which
+    # would have made the mutation proof below pass VACUOUSLY, for the same reason
+    # as the real thing rather than because of the mutation. Both are written, and
+    # the observer case varies both together.
+    (sess / "agent-mode").write_text(mode, encoding="utf-8")
+
+    now = datetime.utcnow()
+    yank_ts = (now - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%dT%H:%M:%S")
+    started = (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    # started_at must PRE-date the yank or preconditions refuse: a session that
+    # began after the demotion is a new session, not the demoted one.
+    (adir / "sessions" / RUNNER_SID / "binding.yaml").write_text(
+        f"session_id: {RUNNER_SID}\nagent: {AGENT}\nmode: {mode}\n"
+        f"started_at: '{started}'\nstarted_by: claude-code\n", encoding="utf-8")
+    (sess / "recovery-log.jsonl").write_text(json.dumps({
+        "ts": yank_ts, "agent": AGENT, "path": "C",
+        "cause": "hung autocompact: compact-in-flight mtime >60min, heartbeat=stale",
+        "sid_recorded": yank_sid, "acting_sid": yank_sid,
+        "source": "resume", "action": "recover",
+    }) + "\n", encoding="utf-8")
+
+    if worker_body:
+        # A forked worker Body owns a per-session WM; a reducer never does. Same
+        # throwaway-sandbox fixture shape as
+        # test_stop_hook_in_flight_integration.py:221 — a tmp PROJECT_ROOT, never
+        # a live store (guard-996 is about the live store, not fixtures).
+        (adir / "sessions" / RUNNER_SID / "working-memory.yaml").write_text(
+            "active_context: null\n", encoding="utf-8")
+
+    if mutate is not None:
+        hook = root / "core" / "scripts" / "stop-hook.sh"
+        hook.write_text(mutate(hook.read_text(encoding="utf-8")), encoding="utf-8")
+
+    proc = _run_hook_as_runner(root)
+    return root, proc, (sess / "agent-state").read_text(encoding="utf-8").strip()
+
+
+def test_gate_0_pre_reverses_a_demoted_live_reducer(tmp_path):
+    """Outcome 0: the real hook, driven in the real post-demotion state, must log
+    YANK-REVERSED and leave agent-state RUNNING."""
+    root, proc, state = _drive_demoted(tmp_path)
+    log = _hook_log(root)
+    assert "YANK-REVERSED" in log, (
+        "the demoted-but-alive reducer was not offered the reversal; log=" + log)
+    assert state == "RUNNING", f"agent-state is {state!r}, so the live loop still dies"
+    assert "ALLOW gate=no-runner" not in log, (
+        "Gate 0 still preempted the reversal — the restore rewrites "
+        "running-session-id, so no-runner must no longer fire")
+
+
+def test_gate_0_pre_no_op_for_a_foreign_sid(tmp_path):
+    """Outcome 1a: a recovery-log row naming a DIFFERENT sid is not this session's
+    demotion. Restoring on it would hand the runner role to the wrong session."""
+    root, proc, state = _drive_demoted(tmp_path, yank_sid="some-other-sid-0000")
+    log = _hook_log(root)
+    assert "YANK-REVERSED" not in log
+    assert state == "IDLE"
+    assert "ALLOW gate=no-runner" in log, "a genuine non-runner must still be allowed to stop"
+
+
+def test_gate_0_pre_no_op_for_an_observer_session(tmp_path):
+    """Outcome 1b: an observer (mode != autonomous) was never the autonomous runner,
+    so there is no demotion of it to reverse."""
+    root, proc, state = _drive_demoted(tmp_path, mode="assistant")
+    assert "YANK-REVERSED" not in _hook_log(root)
+    assert state == "IDLE"
+
+
+def test_gate_0_pre_no_op_for_a_worker_body(tmp_path):
+    """Outcome 1c: a worker Body reaches the per-Body branch ABOVE this gate and must
+    not be promoted to reducer by a reversal."""
+    root, proc, state = _drive_demoted(tmp_path, worker_body=True)
+    assert "YANK-REVERSED" not in _hook_log(root)
+    assert state == "IDLE"
+
+
+def test_gate_0_pre_no_op_once_the_reversal_window_has_closed(tmp_path):
+    """A stale demotion is a real stop, not a false one. 360min is the default
+    window; 20 hours is unambiguously outside it."""
+    root, proc, state = _drive_demoted(tmp_path, minutes_ago=20 * 60)
+    assert "YANK-REVERSED" not in _hook_log(root)
+    assert state == "IDLE"
+
+
+def test_mutation_moving_the_reversal_back_below_gate_0_reproduces_the_defect(tmp_path):
+    """THE PROOF. Same fixture as the positive test, with ONLY the placement
+    restored to its pre-fix position. Green here plus green above is what shows the
+    hoist is what makes the reversal reachable — the entire claim of g-115-10067."""
+    root, proc, state = _drive_demoted(tmp_path, mutate=_demote_below_gate0)
+    log = _hook_log(root)
+    assert "YANK-REVERSED" not in log, (
+        "with the reversal below Gate 0 it must be unreachable — if it fired here, "
+        "the mutation did not restore the pre-fix placement")
+    assert "ALLOW gate=no-runner" in log, "the pre-fix path exits at Gate 0"
+    assert state == "IDLE", "the pre-fix defect: a live demoted reducer stays demoted"
+
+
+def test_gate_0_pre_mutation_helper_actually_moves_the_call():
+    """Guards the guard: if _demote_below_gate0 silently stopped relocating the call
+    (a renamed comment header), the mutation proof above would pass for the wrong
+    reason and pin nothing."""
+    src = (SCRIPTS / "stop-hook.sh").read_text(encoding="utf-8")
+    mutated = _demote_below_gate0(src)
+    assert src.count(GATE0_PRE_CALL) == mutated.count(GATE0_PRE_CALL) == 1
+    assert _code_lines(src).index(GATE0_PRE_CALL) < _code_lines(src).index("ALLOW gate=no-runner")
+    assert _code_lines(mutated).index(GATE0_PRE_CALL) > _code_lines(mutated).index("ALLOW gate=no-runner")

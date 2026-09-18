@@ -500,6 +500,60 @@ PYEOF
   fi
 fi
 
+# --- Committer own-log membership test () -------------------------
+# ONE predicate shared by all THREE committer_authored_paths consumers (the
+#  concurrent-partner filter, the  own-log check inside the
+#  partner-log filter, and the  over-inclusion audit).
+#
+# Git porcelain reports a NEW UNTRACKED DIRECTORY as the directory (`?? a/b/`)
+# and never as its members, while uncommitted-edits.jsonl records FILES
+# (`a/b/SKILL.md`). So an exact associative-array lookup can NEVER match a
+# newly-created directory, however well attributed the edit was. Measured
+# 2026-09-15 (echo, cc-03): commit 045635be3e dropped a first-person-authored
+# new skill dir, and the SAME mismatch then flagged it on the recovery commit as
+# 'WITHOUT committer own-log attribution' — one path-shape mismatch misfiring two
+# independent attribution layers in OPPOSITE directions (drop-when-it-should-
+# retain, then flag-as-unattributed-when-it-is-attributed).
+#
+# Sets _CAP_HIT to `exact` or `dir-prefix` and returns 0 on a hit; returns 1 with
+# _CAP_HIT cleared on a miss. Only a TRAILING-SLASH candidate takes the prefix
+# branch, so every FILE lookup keeps exact-key semantics byte-for-byte unchanged.
+# Always call it as an `if` condition — `set -e` is active and a miss returns 1.
+#
+# The narrowing lives HERE, at the lookup, NOT at the map build above
+# (guard-2314: apply a predicate change at the decision site, never at the
+# scan/input site that feeds every other branch). Synthesizing directory keys
+# into committer_authored_paths would silently reach consumers this goal never
+# measured. Consumers ask only for a boolean; the single site that reports which
+# way it matched reads _CAP_HIT (guard-4300: the shared artifact's shape is
+# decided by what the consumers ask).
+#
+# KNOWN TRADE-OFF, disclosed because the prefix branch newly ARMS a path that
+# could not fire before (guard-3699): a MIXED-AUTHORSHIP new directory — one
+# member in the committer's own log, another genuinely a partner's — matches as
+# dir-prefix and is retained/attributed AS A WHOLE. Porcelain collapses such a
+# directory into one status entry, so no consumer here can split it. This is
+# strictly better than the prior behaviour, which dropped the committer's own
+# work outright, and it is the same trade-off the concurrent-partner filter
+# already makes for the all-own-files case.
+_committer_authored_hit() {
+  local _cap_candidate="$1" _cap_recorded
+  _CAP_HIT=""
+  if [[ -n "${committer_authored_paths["$_cap_candidate"]:-}" ]]; then
+    _CAP_HIT="exact"
+    return 0
+  fi
+  if [[ "$_cap_candidate" == */ ]]; then
+    for _cap_recorded in "${!committer_authored_paths[@]}"; do
+      if [[ "$_cap_recorded" == "$_cap_candidate"* ]]; then
+        _CAP_HIT="dir-prefix"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
 # --- Empty status skip -------------------------------------------------------
 # Filter our own lock dir from status output so its presence never influences
 # the empty-status decision or downstream parse (). .gitignore handles
@@ -892,22 +946,15 @@ PYEOF
             # deliverable). `$path` comes from git porcelain, which reports a
             # NEW UNTRACKED DIRECTORY as the DIRECTORY (`?? a/b/c/`) and never
             # as its members; uncommitted-edits.jsonl records FILES
-            # (`a/b/c/SKILL.md`). So the exact associative-array lookup below
-            # CANNOT match a newly-created directory, and a first-person
-            # authored new skill dir was dropped from the committer's own
-            # commit while the mtime-coincident partner signal stood.
-            # Fall back to a prefix match ONLY for a trailing-slash path, so
-            # every file lookup keeps its exact-key semantics unchanged.
+            # (`a/b/c/SKILL.md`). So an exact associative-array lookup CANNOT
+            # match a newly-created directory, and a first-person authored new
+            # skill dir was dropped from the committer's own commit while the
+            # mtime-coincident partner signal stood. _committer_authored_hit
+            # owns that exact-then-trailing-slash-prefix test for all three
+            # consumers of this map, so they cannot drift ().
             authored_hit=""
-            if [[ -n "${committer_authored_paths["$path"]:-}" ]]; then
-              authored_hit="exact"
-            elif [[ "$path" == */ ]]; then
-              for _authored_p in "${!committer_authored_paths[@]}"; do
-                if [[ "$_authored_p" == "$path"* ]]; then
-                  authored_hit="dir-prefix"
-                  break
-                fi
-              done
+            if _committer_authored_hit "$path"; then
+              authored_hit="$_CAP_HIT"
             fi
             if [[ -n "$authored_hit" ]]; then
               # : the committer's OWN uncommitted-edits.jsonl
@@ -966,7 +1013,15 @@ PYEOF
     esac
   fi
   if [[ -n "$pl_match_owner" ]]; then
-    if [[ -n "${committer_authored_paths["$path"]:-}" ]]; then
+    # : shared membership test, so this own-log check handles a
+    # trailing-slash directory candidate exactly as the concurrent-partner
+    # filter above does. The PARTNER-log lookup immediately above was already
+    # prefix-aware while this OWN-log lookup was exact-only, so a new directory
+    # whose member file was double-recorded (the  between-claim
+    # overlap) matched on the partner side, missed on the committer side, and
+    # was dropped from the committer's own commit — the  defect
+    # re-opened for directory shapes.
+    if _committer_authored_hit "$path"; then
       # : the committer's OWN uncommitted-edits.jsonl ALSO recorded
       # this path — first-person authorship proof overrides the partner-log
       # signal, mirroring the  own-log check in the concurrent-partner
@@ -1150,7 +1205,17 @@ if [[ "$OUTCOME" == "deep" && ${#staged_files[@]} -gt 0 && -n "${MIND_AGENT:-}" 
     done
     [[ $_oi_is_agent -eq 1 ]] && continue   # agent-dir paths handled by namespace filter
     # neutral path: flag if NOT positively attributed via the committer own-log.
-    if [[ -z "${committer_authored_paths["$sf"]:-}" ]]; then
+    # : shared membership test (INVERTED polarity here — a MISS is
+    # what flags). Without it, a new untracked directory that the filters above
+    # correctly RETAIN is then reported as 'WITHOUT committer own-log
+    # attribution', because porcelain hands this loop the directory while the
+    # own-log holds its member files. That false AUDIT line was observed on
+    # recovery commit 697e511ca0. Prefix-awareness is the right reading here
+    # too, not merely the consistent one (guard-2601 — this consumer has a wider
+    # scope than the filters): a directory with a member in the own log IS
+    # committer-attributed, while a directory with NO own-logged member still
+    # misses and is still flagged, preserving the genuine over-inclusion signal.
+    if ! _committer_authored_hit "$sf"; then
       unattributed_neutral+=("$sf")
     fi
   done

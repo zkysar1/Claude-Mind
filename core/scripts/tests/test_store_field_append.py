@@ -57,7 +57,8 @@ def test_helpers_are_the_ssot_objects_not_copies():
     discriminates — a pasted copy would report store-field-append.py and pass
     every behavioural assertion on the day it was pasted.
     """
-    for fn in (sfa.compose, sfa.verify_post, sfa.sentinel_for, sfa.cas_conflict):
+    for fn in (sfa.compose, sfa.verify_post, sfa.sentinel_for, sfa.cas_conflict,
+               sfa.wrapped_marker_refusal):
         assert Path(fn.__code__.co_filename).name == "goal-field-append.py", (
             f"{fn.__name__} is defined in {fn.__code__.co_filename} — the contract has been "
             "forked out of its SSOT")
@@ -69,6 +70,10 @@ def test_helpers_are_the_ssot_objects_not_copies():
     assert sfa.sentinel_for("m") == ssot.sentinel_for("m")
     assert sfa.cas_conflict("A", "A") == ssot.cas_conflict("A", "A")
     assert sfa.cas_conflict("A", "A\n\nB") == ssot.cas_conflict("A", "A\n\nB")
+    # The marker convention and its refusal must agree across BOTH sides, or one
+    # script accepts the paste the other rejects ().
+    assert sfa.wrapped_marker_refusal("[appended:m]") == ssot.wrapped_marker_refusal("[appended:m]")
+    assert sfa.wrapped_marker_refusal("plain") is None
 
 
 def test_missing_ssot_fails_loud_rather_than_degrading():
@@ -160,6 +165,36 @@ def _run_main(monkeypatch, pre, argv, write_calls=None):
 
     monkeypatch.setattr(sfa, "_run", _fake_run)
     return sfa.main(argv)
+
+
+def test_a_wrapped_marker_is_refused_at_exit_2_and_never_reaches_a_write(monkeypatch):
+    """The SSOT pins the predicate; this pins that the STORE side is WIRED to it.
+
+    A helper that is imported but never called is indistinguishable from an
+    absent one at the only layer a caller sees (guard-1943: a green suite
+    certifies the FUNCTION, never the WIRING). The write-capture is the load-
+    bearing half — a refusal that still wrote would be the original defect.
+    """
+    writes = []
+    with pytest.raises(SystemExit) as exc:
+        _run_main(monkeypatch, "some existing note",
+                  ["--store", "guardrails", "guard-1", "action_hint",
+                   "[appended:g-001-847-double-wrap]", "new text"], writes)
+    assert exc.value.code == sfa.RC_USAGE
+    assert writes == [], "a refused marker must not reach the write"
+
+
+def test_a_bare_marker_still_proceeds(monkeypatch):
+    """Anti-vacuity for the test above: the new refusal must not refuse everything."""
+    writes = []
+    # It must get PAST the marker check. Whatever it does afterwards is other
+    # tests' business, so assert only that it did not die at RC_USAGE.
+    try:
+        _run_main(monkeypatch, "some existing note",
+                  ["--store", "guardrails", "guard-1", "action_hint",
+                   "g-001-847-double-wrap", "new text"], writes)
+    except SystemExit as exc:
+        assert exc.code != sfa.RC_USAGE, "a BARE marker must not be refused as malformed"
 
 
 def test_anchor_absent_is_refused_with_its_own_exit_code(monkeypatch):
@@ -260,3 +295,165 @@ def test_exit_codes_are_distinguishable():
              sfa.RC_ANCHOR_ABSENT]
     assert len(set(codes)) == len(codes), "exit codes collide"
     assert sfa.RC_ANCHOR_ABSENT not in (sfa.RC_USAGE, sfa.RC_WRITE_FAILED)
+
+
+# ── 7. the pipeline store () ─────────────────────────────────────
+#
+# The third store, and the first whose shape was measured against this contract
+# rather than assumed to match. These tests pin the three things the
+# measurement found, because each one is a property of the CURRENT daemon and
+# reader build — exactly the reason the projection guard was kept in the first
+# place.
+
+import re as _re
+
+
+def _pipeline_record(position: str) -> dict:
+    """The shape `pipeline-read.sh --id` actually returns: a BARE record object,
+    no wrapper key, carrying the large free-text fields."""
+    return {
+        "id": "2026-09-15_some-hypothesis",
+        "title": "A hypothesis",
+        "stage": "active",
+        "type": "calibration",
+        "confidence": 0.55,
+        "claim": "the claim",
+        "rationale": "the rationale",
+        "position": position,
+    }
+
+
+def _stub_run(store_state, writes):
+    """Stand in for `_run`, dispatching on WHICH wrapper is being invoked.
+
+    Stubbing `_run` rather than `read_record` is the point: it leaves the real
+    `read_record` — and therefore this store's `rows_keys` and `canaries` — in
+    the code path under test. A test that stubs `read_record` would pass
+    identically with the pipeline entry deleted from STORES.
+    """
+    def _run(cmd):
+        joined = " ".join(str(c) for c in cmd)
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        if "pipeline-read.sh" in joined:
+            import json as _json
+            R.stdout = _json.dumps(_pipeline_record(store_state["position"]))
+        elif "pipeline-update-field.sh" in joined:
+            writes.append(cmd)
+            # Pin the argv SHAPE before indexing it (fresh-eyes F2, guard-920).
+            # `bash_cmd` returns [BASH, script, *args] and the call is
+            # _bash(write, record_id, field, new), so the composed value is cmd[-1]
+            # TODAY. A future trailing flag would make the stub capture the flag,
+            # and the byte-identity assertion below would then compare flag to flag
+            # and PASS — a silently weakened test. This assert turns that into a red.
+            assert len(cmd) == 5 and cmd[3] == "position", f"write argv shape changed: {cmd}"
+            store_state["position"] = cmd[-1]   # the composed value
+        return R
+    return _run
+
+
+def test_pipeline_bare_object_read_is_accepted(monkeypatch):
+    """rows_keys is empty for pipeline; extract_row's bare-object branch carries it."""
+    writes = []
+    state = {"position": "an existing position paragraph"}
+    monkeypatch.setattr(sfa, "_run", _stub_run(state, writes))
+    row = sfa.read_record("pipeline", "2026-09-15_some-hypothesis")
+    assert row["position"] == "an existing position paragraph"
+
+
+def test_pipeline_projected_read_is_refused(monkeypatch):
+    """Anti-vacuity for the test above: the canary set must still refuse a read
+    that dropped the free-text fields, or it is not guarding anything."""
+    def _run(cmd):
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = '{"id": "2026-09-15_some-hypothesis", "title": "t", "stage": "active"}'
+        return R
+    monkeypatch.setattr(sfa, "_run", _run)
+    with pytest.raises(SystemExit) as exc:
+        sfa.read_record("pipeline", "2026-09-15_some-hypothesis")
+    assert exc.value.code == sfa.RC_READ_UNSAFE
+
+
+def test_pipeline_second_append_with_same_marker_does_not_grow_the_field(monkeypatch):
+    """The property the whole marker exists for, measured on the field LENGTH.
+
+    Asserting only `rc == RC_OK` twice would pass against a helper that appended
+    twice, and asserting only the write count would pass against one that wrote
+    a truncated value. Growth-once is the claim; length is how it is checked.
+    """
+    writes = []
+    state = {"position": "an existing position paragraph"}
+    monkeypatch.setattr(sfa, "_run", _stub_run(state, writes))
+    argv = ["--store", "pipeline", "2026-09-15_some-hypothesis", "position",
+            "m-828", "a measured note"]
+
+    assert sfa.main(list(argv)) == sfa.RC_OK
+    after_first = state["position"]
+    assert len(writes) == 1
+    assert "a measured note" in after_first
+
+    assert sfa.main(list(argv)) == sfa.RC_OK
+    assert state["position"] == after_first, "the retry rewrote the field"
+    assert len(writes) == 1, "the retry reached the write"
+    assert after_first.count("a measured note") == 1
+
+
+def test_pipeline_anchor_staleness_is_refused(monkeypatch):
+    """--anchor must guard the pipeline store too, not only the first two."""
+    writes = []
+    state = {"position": "an existing position paragraph"}
+    monkeypatch.setattr(sfa, "_run", _stub_run(state, writes))
+    with pytest.raises(SystemExit) as exc:
+        sfa.main(["--store", "pipeline", "--anchor", "TEXT THAT IS GONE",
+                  "2026-09-15_some-hypothesis", "position", "m-828", "a note"])
+    assert exc.value.code == sfa.RC_ANCHOR_ABSENT
+    assert writes == [], "a refused anchor must not reach the write"
+
+
+def test_shell_wrapper_store_list_matches_the_map():
+    """The .sh validates --store itself, so its list is a SECOND source of truth.
+
+    A store added to STORES but not to the wrapper is accepted by the .py and
+    refused by the .sh at exit 2 — which reads as "unsupported store", not as a
+    wiring bug. Nothing tested this until pipeline became the third store.
+    """
+    sh = (SCRIPTS / "store-field-append.sh").read_text(encoding="utf-8")
+    m = _re.search(r'^_STORES="([^"]+)"', sh, _re.M)
+    assert m, "store-field-append.sh no longer declares a single _STORES literal"
+    assert set(m.group(1).split("|")) == set(sfa.STORES), (
+        "the shell wrapper's --store list has drifted from STORES")
+
+
+def test_compose_sentinel_defeats_the_pipeline_endpoints_value_coercion():
+    """The pipeline write endpoint COERCES; the other two stores' does not.
+
+    /v1/pipeline/update-field runs `_parse_value` on the string: "true"/"false"/
+    "null" become bools/None, a leading { or [ is tried as JSON, and a numeric
+    string becomes int/float. A composed append cannot reach any of those arms
+    because compose() always ends the value with "\\n[appended:<marker>]" — so
+    the sentinel that exists for IDEMPOTENCE is also what keeps a pipeline text
+    field typed as text. Nothing else says so, and dropping the sentinel would
+    silently retype the field rather than fail.
+
+    The control half is load-bearing: without it a `_parse_value` that had been
+    neutered into `return value_str` would pass every assertion above it.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(SCRIPTS.parent.parent))
+    from mind_api.src.world import pipeline_write as _pw
+
+    for pre, text in [("", "a measured note"), ("", "true"), ("", "42"),
+                      ("", '{"a": 1}'), ("", "[1, 2]"), ("old position", "note")]:
+        composed = sfa.compose(pre, text, "m-828")
+        assert _pw._parse_value(composed) == composed, (
+            f"a composed append was coerced away from str: {text!r}")
+
+    assert _pw._parse_value("true") is True
+    assert isinstance(_pw._parse_value("42"), int)
+    assert isinstance(_pw._parse_value('{"a": 1}'), dict)

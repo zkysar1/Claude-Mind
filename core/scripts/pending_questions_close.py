@@ -121,6 +121,7 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None,
             res.update(action="not_found")
             return res, 3
         cur = str(q.get("status", "pending")).lower()
+        expect_hist_len = None  # set by the amend branch; read by the verify below
         if cur in TERMINAL and not amend:
             res.update(action="already_terminal", status=cur)
             return res, 0  # idempotent
@@ -150,6 +151,7 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None,
                 hist = []
             hist.append(prior)
             q["superseded_answers"] = hist
+            expect_hist_len = len(hist)
             res["amended"] = True
             res["superseded"] = prior
         # archive-before-overwrite: capture the pre-image of the record we touch
@@ -157,7 +159,16 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None,
                             ("id", "status", "question", "text", "default_action")
                             if k in q}
         now = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")  # naive UTC (TZ=UTC)
-        q["status"] = "answered"
+        # An amend corrects the recorded ANSWER, not the DISPOSITION. Forcing
+        # "answered" here would promote an amended `retired` question into
+        # DISCHARGES_A_BLOCKER (CLOSED_STATUSES - {"retired"}, whose exclusion is
+        # load-bearing) — a side effect --amend never advertised. Measured
+        # 2026-09-17 across all five agents: 179 resolved / 17 answered /
+        # 13 pending / 1 retired, so this is a live single-record exposure, not a
+        # theoretical one. The CLOSE path still writes "answered"; only an amend
+        # preserves the terminal status it found.
+        new_status = cur if res.get("amended") else "answered"
+        q["status"] = new_status
         q["answered_by"] = answered_by
         q["resolved_at"] = now
         if rationale:
@@ -173,16 +184,37 @@ def close_question(agent, qid, answered_by, rationale, dry_run, pq_path=None,
         if dry_run:
             res.update(action=("would_amend" if res.get("amended")
                                else "would_close"),
-                       status="answered", dry_run=True)
+                       status=new_status, dry_run=True)
             return res, 0
         be.write_text(path, new_content)
         # verify from the authoritative store (re-read under the same lock)
         vdoc = yaml.safe_load(be.read_text(path))
         _, vqs = _split(vdoc)
         _, vq = _find(vqs if isinstance(vqs, list) else [], qid)
-        ok = vq is not None and str(vq.get("status", "")).lower() == "answered"
+        ok = (vq is not None
+              and str(vq.get("status", "")).lower() == new_status.lower())
+        # An AMEND targets an ALREADY-TERMINAL question, and `answered` is itself
+        # a terminal status — so for the common amend the predicate above was
+        # TRUE BEFORE the write and proves nothing. MEASURED 2026-09-17 (zeta,
+        # cc-02): with write_text suppressed, this returned rc=0 / verified=true
+        # / action=amended while the stored answer was unchanged — the exact
+        # "an rc=0 is not evidence an amendment was recorded" hole the --amend
+        # branch was added to close, reappearing one level down.
+        # Verify instead on evidence that can only exist POST-write: the
+        # preservation field must have grown to its expected length (guard-6693 —
+        # read a pre-change field BACK rather than trusting it was written), and
+        # the stored answer must be the one just supplied.
+        # This makes amend's verification exactly as strong as close's already
+        # is and no stronger: the close path carries the same own-cloud
+        # stale-read exposure today (guard-6433), so no new false-negative class
+        # is introduced here.
+        if ok and res.get("amended"):
+            vh = vq.get("superseded_answers")
+            ok = isinstance(vh, list) and len(vh) == expect_hist_len
+            if ok and rationale:
+                ok = str(vq.get("answer", "")) == str(rationale)
         res.update(action=("amended" if res.get("amended") else "closed"),
-                   status="answered", verified=bool(ok))
+                   status=new_status, verified=bool(ok))
         return res, (0 if ok else 5)
 
     # LocalBackend.conflict_error is () (empty tuple) → the except below matches

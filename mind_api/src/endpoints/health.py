@@ -102,9 +102,29 @@ def health(ctx) -> "Response":  # type: ignore[name-defined]
             storage_endpoint = None
     except Exception:  # never 500 the health probe over a diagnostic field
         storage_backend = storage_endpoint = None
+    # Whether THIS process's WRITE path is wedged (). Measured:
+    # /health answered 200 in 0.2ms right through a total box-wide WM-write
+    # freeze, so "responsive" was never evidence of "can write" and
+    # mind-api-start.sh's idempotent fast path repaired nothing.
+    #
+    # This does NOT violate the store-independence rule above: it reads
+    # file_locks' in-process hold registry — process memory, no filesystem,
+    # no store round trip — so cold start under a degraded store is unaffected
+    # and rt_ensure_running still makes one store-free request.
+    #
+    # write_path_wedged is duplicated out to the TOP LEVEL on purpose: the
+    # wrapper's consumer is bash and greps for it, and a flat boolean cannot
+    # be confused with a same-named key nested under some other object.
+    try:
+        from .. import file_locks
+        write_path = file_locks.write_path_status()
+    except Exception:  # never 500 the health probe over a diagnostic field
+        write_path = None
     return Response.json(
         {
             "ok": True,
+            "write_path_wedged": None if write_path is None else write_path["wedged"],
+            "write_path": write_path,
             "version": __version__,
             "uptime_s": uptime_s,
             "pid": ctx.pid,

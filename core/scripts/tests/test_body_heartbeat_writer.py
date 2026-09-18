@@ -411,3 +411,57 @@ def test_carrier_is_valid_json_with_an_absent_manifest():
         doc = json.loads(c.read_text(encoding="utf-8"))  # must still parse
         assert doc["body_state"] == ""
         assert doc["sid"] == SID
+
+
+# --- 7. the IDLE refusal is NOT stop-scoped () -------------------
+def test_idle_refusal_is_not_stop_scoped():
+    """A stop in progress must NOT buy an exemption from the IDLE gate.
+
+    g-115-10040 measured a real defect: graceful-stop D1 sets IDLE, this
+    script then refuses to tick, and a D4 running past the 3900 s lease
+    threshold loses the runner claim — a stop that produced NO handoff.
+    Three remedies were on the table and the SHIPPED one is D3.5, a
+    standalone `runner-claim.sh heartbeat` in the stop sequence, which is
+    state-blind and token-conditional. Candidate (a) — teach THIS gate to
+    stand down while a stop-checkpoint is present — was REJECTED, because it
+    trades a narrow stop-time gap for the fleet-wide desync hole guard-543
+    exists to hold shut.
+
+    WHY TEST 5 ABOVE CANNOT CATCH THAT REGRESSION. Test 5 stages no
+    stop-checkpoint, so a gate rewritten as "refuse unless a stop is in
+    progress" still refuses there and test 5 stays GREEN. This case stages
+    the checkpoint, so it is the only thing in the repo that goes red if
+    candidate (a) is ever implemented — which is exactly how a rejected
+    remedy gets re-introduced later and reads as a tidy-up.
+
+    heartbeat-tick.sh does not read stop-checkpoint.json today, and that is
+    the property being pinned: the file's PRESENCE changes nothing.
+    """
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True,
+                                 state="IDLE")
+        # The exact artifact a graceful stop leaves on disk between D1 and D7.
+        (adir / "session" / "stop-checkpoint.json").write_text(
+            '{"stop_started_at": "2026-09-15T17:07:35", "phase": "D4"}',
+            encoding="utf-8")
+        runner = adir / "session" / "runner-heartbeat"
+        runner.write_text("", encoding="utf-8")
+        old = time.time() - 3600
+        os.utime(runner, (old, old))
+
+        r = _tick(root, adir, sid=SID)
+
+        assert r.returncode == 2, (
+            "the IDLE desync gate must STILL refuse (exit 2) while a stop is "
+            "in progress — the shipped remedy is graceful-stop D3.5 "
+            "(runner-claim.sh heartbeat, state-blind and token-conditional), "
+            "NOT a stop-scoped bypass here. "
+            f"rc={r.returncode} stderr={r.stderr[-400:]}")
+        assert "REFUSED" in r.stderr and "agent-state=IDLE" in r.stderr, (
+            "the refusal must still announce itself with the desync-class "
+            "signature; a silent exit 2 is indistinguishable from an "
+            f"unrelated failure. stderr={r.stderr[-400:]}")
+        assert runner.stat().st_mtime == old, (
+            "the agent-WIDE runner-heartbeat must not be advanced under IDLE "
+            "even mid-stop — that is the heartbeat_without_running desync "
+            "(guard-543), and a stop is not an exemption from it")

@@ -833,9 +833,54 @@ FOR EACH record WHERE horizon == "micro":
     Exclude it from the Step 2 loop.
 ```
 
+### Step 1.6: Ownership Gate (MANDATORY — g-115-10004)
+
+This Mode reflected every unreflected record while guard-5623 forbade touching
+any record a LIVE other agent resolved. Following this file literally RACED a
+conflicting ABC chain onto another agent's record, and the loser is silent by
+construction — measured 2026-09-15: of 19 records reflected fleet-wide in one
+day, **7 were reflected by a non-owner**, by three different agents, all on one
+live agent's records. Apply the shared predicate BEFORE the Step 2 loop.
+
+```
+Bash: py -3 core/scripts/reflection-ownership-split.py
+split = parsed JSON
+
+# The split buckets every REFLECTABLE record (the outcome filter still applies
+# first — this composes with it, it does not replace it):
+#   mine        — resolved_by is me. Reflect.
+#   unowned     — no resolved_by. Nobody can be racing it. Reflect.
+#   reclaimable — owner dormant/retired, OR alive but past STRANDED_HOURS (72h)
+#                 since resolved_at. Reflect AND announce the reclaim.
+#   held        — another agent owns it and is alive (or liveness is unknown).
+#                 ABSTAIN — guard-5623.
+
+Step 2 iterates ONLY split.mine + split.unowned + split.reclaimable.
+
+IF split.reclaimable is non-empty:
+    Announce BEFORE reflecting, so the owner can object while it still matters:
+    echo "Reclaiming {N} stranded reflectable record(s) past {STRANDED_HOURS}h
+    since resolved_at: {ids} (owners: {owners})" | \
+      Bash: board-post.sh --channel coordination --type status --tags "reflection-reclaim,{AGENT_NAME}"
+
+IF split.held is non-empty:
+    REPORT each abstention with its two deciding fields — do NOT summarize to a
+    count. Per record: id, resolved_by, and the liveness verdict from
+    split.liveness[resolved_by]. The verdict is the evidence for the
+    abstention; an unreported abstention is indistinguishable from not having
+    looked (the failure this gate exists to make visible).
+
+# WHY THE ABSTAIN LIST IS REPORTED AND NOT SILENTLY DROPPED: a pure filter makes
+# a live owner's backlog invisible to everyone else at once, and the only signal
+# that the queue is not draining would disappear with it. Reporting keeps the
+# owner nameable — which is what lets a human or a later sweep notice that one
+# agent's queue is growing.
+```
+
 ### Step 2: Reflect on Each Hypothesis
 
-For each unreflected hypothesis:
+For each unreflected hypothesis **that Step 1.6 classified as actionable**
+(`mine` / `unowned` / `reclaimable` — never `held`):
 
 ```
 1. Bash: pipeline-read.sh --id {id}  (loads the full resolved record)

@@ -5377,6 +5377,14 @@ def complete_by(ctx):
                     goal["completed_by_sid"] = _cbs
                 goal.pop("claimed_by_sid", None)  # : see release()
 
+            # : both branches above pop the claim triple, so both owe
+            # the recency stamp — see the claim() write site for why an
+            # unstamped claim-triple mutation is invisible to
+            # coordination_merge._merge_goal. Placed after the branch join
+            # rather than inside each arm so a future third branch cannot miss
+            # it; still inside the same lock and the same mutation.
+            goal["last_modified"] = datetime.now().isoformat(timespec="seconds")
+
             _recompute_progress(asp)
             items[asp_idx] = asp
             _clear_stale_blockers_inline(items, {goal_id})
@@ -5700,6 +5708,13 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
             # later collision LESS diagnosable than before slice 1 added the
             # field. The stamp must not survive the claim it describes.
             goal.pop("claimed_by_sid", None)
+            # : advance the recency clock in the SAME mutation as the
+            # pop, for the reason given at the claim() write site. A cleared
+            # claim that does not move last_modified is as invisible to
+            # coordination_merge._merge_goal as an unstamped claim was — a peer
+            # snapshot still carrying the claim wins LWW and RESURRECTS it,
+            # which is the reverted-release failure this goal was filed for.
+            goal["last_modified"] = datetime.now().isoformat(timespec="seconds")
 
             # : CAPTURE THE RELEASE REASON. Optional and additive —
             # with no `reason` query param this block is a no-op and release()
@@ -7792,6 +7807,19 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
 
             goal["claimed_by"] = agent_name
             goal["claimed_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # : stamp the recency clock in the SAME mutation as the
+            # claim triple. coordination_merge._merge_goal picks its LWW base by
+            # last_modified and moves claimed_by/claimed_by_sid/claimed_at as a
+            # UNIT, so a claim that does not advance this field is INVISIBLE to
+            # the merge: a peer snapshot carrying the pre-claim state wins and
+            # overwrites it, and the later release REVERTS (measured twice on
+            # , 2026-09-13). guard-2872 states the general rule and
+            # update_goal already honours it at its cascade; this path did not.
+            # Reuse claimed_at rather than taking a second clock reading -- the
+            # invariant consumers check is last_modified >= claimed_at, and two
+            # reads can straddle a second boundary and produce the very skew
+            # this line exists to remove.
+            goal["last_modified"] = goal["claimed_at"]
             #  slice 1: stamp the claiming session so a same-agent
             # cross-session collision is visible after the fact. Only written
             # when the caller supplied one — never clobber a prior SID with a
@@ -8374,6 +8402,14 @@ def clear_stale_claims(ctx) -> "Response":  # type: ignore[name-defined]
                             goal.pop("claimed_by", None)
                             goal.pop("claimed_at", None)
                             goal.pop("claimed_by_sid", None)
+                            # : the recency stamp travels with the
+                            # claim triple — see the claim() write site. A
+                            # swept-clean orphan that does not move
+                            # last_modified loses LWW to any peer snapshot
+                            # still carrying the stale claim, so the sweep
+                            # silently un-sweeps itself.
+                            goal["last_modified"] = (
+                                datetime.now().isoformat(timespec="seconds"))
 
             if cleared and not dry_run:
                 history.snapshot(live_path, base_dir, agent,
