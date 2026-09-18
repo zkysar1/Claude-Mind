@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import sys
 
 # Capability table. Add a row when a new harness is measured -- never guess.
@@ -55,31 +54,10 @@ import sys
 #                nothing else; NOT chunking one that did means the tool kills
 #                the sleep mid-call. Same fail-safe direction as this row's
 #                background_job_notify: False.
-#
-# skill_tool / wakeup_tool (2026-09-17, the vessel-vocabulary fix): how the harness
-# SPELLS the loop's two re-entry tools. Every terminal imperative the framework
-# prints -- the stop hook's BLOCK reason, ITERATION COMPLETE, the recurring
-# close, the state-mismatch landing, the PostToolUse reminder -- was written in
-# Claude Code's vocabulary: Skill(aspirations) with args='loop' and
-# ScheduleWakeup(prompt=..., delaySeconds=600). Promoted unchanged to a Mind
-# whose vessel is zakcode, those lines name tools the model's tool list does not
-# show (its tools are use_skill(name, args) and schedule_wakeup(prompt,
-# delaySeconds)). Measured 2026-09-17 on a downstream vessel running a small
-# model: it answered the imperative in PROSE ("Verdict: ... loop resurrected"),
-# the stop hook BLOCKed in the same foreign names, and the two spun for hours.
-# zakcode aliases Skill->use_skill for a model that DOES call the foreign name
-# and its turn-end seam delivers a hook-named skill itself (Zak-Code ADR-0187);
-# the TEXT is the remaining layer, because a model acts on the name it can see
-# in its own tool list. unknown keeps Claude Code's spelling: never guess a
-# vessel. Consumers: skill_call/skill_ref/wakeup_call/hook_wakeup below and the
-# shell reach _harness_vocab.sh (eval of --loop-vocab-sh).
 KNOWN = {
-    "claude-code": {"background_job_notify": True, "max_foreground_sleep_seconds": None,
-                    "skill_tool": "Skill", "wakeup_tool": "ScheduleWakeup"},
-    "zakcode": {"background_job_notify": False, "max_foreground_sleep_seconds": 600,
-                "skill_tool": "use_skill", "wakeup_tool": "schedule_wakeup"},
-    "unknown": {"background_job_notify": False, "max_foreground_sleep_seconds": 600,
-                "skill_tool": "Skill", "wakeup_tool": "ScheduleWakeup"},
+    "claude-code": {"background_job_notify": True, "max_foreground_sleep_seconds": None},
+    "zakcode": {"background_job_notify": False, "max_foreground_sleep_seconds": 600},
+    "unknown": {"background_job_notify": False, "max_foreground_sleep_seconds": 600},
 }
 
 OVERRIDE_ENV = "MIND_HARNESS_BG_NOTIFY"
@@ -125,87 +103,6 @@ def capabilities(env=None) -> dict:
 
 def background_job_notify(env=None) -> bool:
     return bool(capabilities(env)["background_job_notify"])
-
-
-# -- Tool vocabulary (see the KNOWN table comment) ----------------------------
-
-LOOP_SENTINEL = "<<autonomous-loop-dynamic>>"
-DEADMAN_DELAY_S = 600
-
-
-def skill_tool(env=None) -> str:
-    """The harness's skill tool: Skill on Claude Code, use_skill on zakcode."""
-    return str(capabilities(env)["skill_tool"])
-
-
-def wakeup_tool(env=None) -> str:
-    """The harness's wake-up tool: ScheduleWakeup on Claude Code, schedule_wakeup
-    on zakcode."""
-    return str(capabilities(env)["wakeup_tool"])
-
-
-def skill_ref(name, env=None) -> str:
-    """A MENTION of a skill re-entry, the way prose names it: Skill(aspirations)
-    on Claude Code, use_skill(aspirations) on zakcode."""
-    return f"{skill_tool(env)}({name})"
-
-
-def skill_call(name, args="", env=None, quoted=False) -> str:
-    """The re-entry CALL as the harness spells it, ready to copy into a tool call.
-
-    Claude Code (and unknown): Skill(aspirations) with args='loop'; quoted=True
-    gives the stop hook's Skill('aspirations') spelling. Both predate this helper
-    and their bytes are pinned, so both stay; zakcode's re-entry parser reads
-    either. zakcode: use_skill(name='aspirations', args='loop') -- the tool's own
-    schema (name required, args optional)."""
-    tool = skill_tool(env)
-    if tool == "use_skill":
-        return f"use_skill(name='{name}', args='{args}')" if args else f"use_skill(name='{name}')"
-    head = f"{tool}('{name}')" if quoted else f"{tool}({name})"
-    return f"{head} with args='{args}'" if args else head
-
-
-def wakeup_call(prompt=LOOP_SENTINEL, delay=DEADMAN_DELAY_S, env=None, quote="'") -> str:
-    """The wake-up arm as the harness spells it. Only the tool name differs:
-    zakcode's schedule_wakeup takes Claude Code's parameter names (prompt,
-    delaySeconds) by design, so every delaySeconds= reader stays valid."""
-    return f"{wakeup_tool(env)}(prompt={quote}{prompt}{quote}, delaySeconds={int(delay)})"
-
-
-def hook_wakeup(env=None) -> dict:
-    """The `wakeup` key a turn-end hook adds to its BLOCK payload on a harness
-    that honours it, so the deadman net is armed BY THE HOOK instead of asked of
-    the model. zakcode applies it before it reads the veto (Zak-Code ADR-0102:
-    replace-slot, clamped, persisted on the session). Empty on Claude Code --
-    it would ignore the key, and the payload stays byte-identical -- and on
-    unknown, which is never guessed."""
-    if detect_harness(env) != "zakcode":
-        return {}
-    return {"wakeup": {"prompt": LOOP_SENTINEL, "delay_seconds": DEADMAN_DELAY_S}}
-
-
-def loop_vocab(env=None) -> dict:
-    """Every spelling the shell imperatives interpolate, keyed by the HC_* name
-    _harness_vocab.sh exports -- one table, so no printing site carries a
-    vocabulary of its own. The _Q entries exist only because two pre-existing
-    Claude Code lines quote the skill name and their bytes are pinned."""
-    return {
-        "HC_HARNESS": detect_harness(env),
-        "HC_SKILL_TOOL": skill_tool(env),
-        "HC_WAKEUP_TOOL": wakeup_tool(env),
-        "HC_LOOP_CALL": skill_call("aspirations", "loop", env),
-        "HC_LOOP_REF": skill_ref("aspirations", env),
-        "HC_LOOP_REF_Q": skill_call("aspirations", env=env, quoted=True),
-        "HC_SPARK_REF": skill_ref("aspirations-spark", env),
-        "HC_WORKER_REF": skill_ref("worker-loop", env),
-        "HC_WORKER_CALL_Q": skill_call("worker-loop", env=env, quoted=True),
-        "HC_DEADMAN_ARM": wakeup_call(env=env),
-    }
-
-
-def loop_vocab_sh(env=None) -> str:
-    """loop_vocab as shell assignments (shlex-quoted) for _harness_vocab.sh to eval."""
-    return "".join(f"{k}={shlex.quote(v)}\n" for k, v in loop_vocab(env).items())
 
 
 def wake_delay_seconds(sleep_seconds, margin=WAKE_MARGIN_S, clamp=WAKE_CLAMP_S) -> int:
@@ -275,8 +172,8 @@ def _wake_arm_phrase(sleep_seconds, env=None) -> str:
     opposite branches (backgrounded launch vs foreground chunk)."""
     delay = wake_delay_seconds(sleep_seconds)
     return (
-        f"arm {wakeup_call(LOOP_SENTINEL, delay, env, quote='\"')} as the "
-        f"TERMINAL call and END THE TURN -- no {skill_ref('aspirations', env)}. The wake IS the re-entry "
+        f"arm ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", delaySeconds={delay}) as the "
+        "TERMINAL call and END THE TURN -- no Skill(aspirations). The wake IS the re-entry "
         "here (g-357-89, rb-9668)."
     )
 
@@ -349,7 +246,7 @@ def sleep_directive(sleep_seconds, agent, env_prefix, env=None) -> str:
         return (
             "Emit exactly ONE tool call:\n"
             f"  Bash(\"{cmd} {total}\", run_in_background=true)\n"
-            f"When the harness notifies you of its exit, call {skill_call('aspirations', 'loop', env, quoted=True)}.\n"
+            "When the harness notifies you of its exit, call Skill('aspirations') with args='loop'.\n"
             + no_notify_hint(total, env)
         )
     chunk, n = plan
@@ -408,35 +305,9 @@ def main(argv=None) -> int:
             return 2
         sys.stdout.write(sleep_directive(argv[1], argv[2], argv[3]))
         return 0
-    if argv[:1] == ["--skill-call"]:
-        # The loop re-entry as THIS harness spells it: --skill-call <name> [args]
-        if len(argv) not in (2, 3):
-            print("usage: harness-capabilities.sh --skill-call <name> [args]", file=sys.stderr)
-            return 2
-        print(skill_call(argv[1], argv[2] if len(argv) == 3 else ""))
-        return 0
-    if argv[:1] == ["--wakeup-call"]:
-        # The wake-up arm as THIS harness spells it: --wakeup-call [prompt [delay_seconds]]
-        usage = "usage: harness-capabilities.sh --wakeup-call [prompt [delay_seconds]]"
-        if len(argv) > 3:
-            print(usage, file=sys.stderr)
-            return 2
-        try:
-            print(wakeup_call(argv[1] if len(argv) > 1 else LOOP_SENTINEL,
-                              int(argv[2]) if len(argv) > 2 else DEADMAN_DELAY_S))
-        except ValueError:
-            print(usage, file=sys.stderr)
-            return 2
-        return 0
-    if argv == ["--loop-vocab-sh"]:
-        # Shell assignments for _harness_vocab.sh to eval (shlex-quoted here).
-        sys.stdout.write(loop_vocab_sh())
-        return 0
     if argv:
         print("usage: harness-capabilities.sh [--get <capability> | --json | "
-              "--hint <sleep_seconds> | --sleep-directive <sleep_seconds> <agent> <env_prefix> | "
-              "--skill-call <name> [args] | --wakeup-call [prompt [delay_seconds]] | "
-              "--loop-vocab-sh]",
+              "--hint <sleep_seconds> | --sleep-directive <sleep_seconds> <agent> <env_prefix>]",
               file=sys.stderr)
         return 2
     print(" ".join(f"{k}={_fmt(v)}" for k, v in caps.items()))

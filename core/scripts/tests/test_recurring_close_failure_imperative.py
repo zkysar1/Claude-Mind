@@ -87,26 +87,9 @@ def _extract_run_phase() -> str:
 TERMINAL_BLOCK = _extract_terminal_block()
 RUN_PHASE_BLOCK = _extract_run_phase()
 
-# The block interpolates $HC_* from core/scripts/_harness_vocab.sh, sourced just
-# ABOVE the extracted region in production (2026-09-17: the imperative speaks
-# the hosting harness's tool names). _run_terminal sources that same helper --
-# the real one, never a copy -- with the harness PINNED: the helper reads the
-# CLAUDECODE / ZAKCODE_* markers, so a suite inheriting a vessel's env would see
-# use_skill(...) where the byte-identity pins below say Skill(...).
-VOCAB_SH = CORE_SCRIPTS / "_harness_vocab.sh"
-_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
-VESSEL = {"ZAKCODE_SESSION": "x"}
-
-
-def _harness_env(harness=None):
-    env = {k: v for k, v in os.environ.items() if k not in _HARNESS_MARKERS}
-    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
-    return env
-
 
 def _run_terminal(max_rc, outcome, deadman_disabled,
-                  failed_phases="", failed_retry_cmds="", phase_results="",
-                  harness=None):
+                  failed_phases="", failed_retry_cmds="", phase_results=""):
     """Execute the EXTRACTED terminal block with controlled inputs."""
     with tempfile.TemporaryDirectory() as td:
         agent_dir = Path(td) / "agent"
@@ -131,7 +114,6 @@ def _run_terminal(max_rc, outcome, deadman_disabled,
             return f"{name}=$'{esc}'\n"
 
         script = (
-            f'source {VOCAB_SH.as_posix()!r}\n'
             f'AGENT_DIR={agent_dir.as_posix()!r}\n'
             f'MAX_RC={max_rc}\nOUTCOME={outcome!r}\n'
             f'FAILED_PHASES={failed_phases!r}\n'
@@ -139,8 +121,7 @@ def _run_terminal(max_rc, outcome, deadman_disabled,
             + _assign("FAILED_RETRY_CMDS", failed_retry_cmds)
             + TERMINAL_BLOCK
         )
-        r = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
-                           env=_harness_env(harness))
+        r = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
         assert r.returncode == 0, r.stderr
         return r.stdout
 
@@ -261,33 +242,6 @@ def test_failure_still_tells_the_loop_how_to_continue():
     out = _run_terminal(1, "routine", False, **FAILED_ARGS)
     assert "3. ONLY once the retry succeeds" in out
     assert "Skill(aspirations)" in out
-
-
-# ── D. VESSEL VOCABULARY (2026-09-17) ───────────────────────────────────────
-#
-# The same extracted block under a zakcode env must spell the re-entry in that
-# model's own tool names -- use_skill(...) / schedule_wakeup(...) -- because a
-# small model on a vessel answered the Claude Code names in prose for hours.
-
-@pytest.mark.parametrize("outcome,deadman_disabled", list(CLEAN_EXPECTED))
-def test_clean_close_on_a_zakcode_vessel_names_the_vessels_tools(outcome, deadman_disabled):
-    out = _run_terminal(0, outcome, deadman_disabled, harness=VESSEL)
-    assert "use_skill(name='aspirations', args='loop')" in out
-    if outcome == "deep":
-        assert "Call use_skill(aspirations-spark) FIRST" in out
-    if not deadman_disabled:
-        assert "schedule_wakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600)" in out
-        assert "use_skill ALONE keeps THIS iteration alive" in out
-    assert "Skill(" not in out.replace("use_skill(", "")
-    assert "ScheduleWakeup" not in out
-    # Positive control for the byte-identity pins in B: the two envs differ.
-    assert out != _run_terminal(0, outcome, deadman_disabled)
-
-
-def test_failure_path_on_a_zakcode_vessel_still_states_the_re_entry():
-    out = _run_terminal(1, "routine", False, harness=VESSEL, **FAILED_ARGS)
-    assert "3. ONLY once the retry succeeds" in out
-    assert "use_skill(name='aspirations', args='loop')" in out
 
 
 # ── C. ARG CAPTURE ──────────────────────────────────────────────────────────

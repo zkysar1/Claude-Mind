@@ -511,16 +511,73 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         else
             echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK gate=worker-net sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
             unset _BODY_WM _CLOSE_SENTINEL
-            # The re-entry names come from the harness vocabulary (_harness_vocab.sh,
-            # 2026-09-17): a zakcode vessel reads use_skill(name='worker-loop'); Claude
-            # Code reads the byte-identical Skill('worker-loop') line it always did.
-            # Sourced HERE, on the BLOCK branch only, so the ALLOW paths pay nothing.
-            source "$CORE_ROOT/scripts/_harness_vocab.sh"
-            printf '{"decision": "block", "reason": "Worker Body turn ended without a %s re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: %s — NOT %s, which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. If this Body genuinely has no more work, write the body-closing sentinel in your per-session dir and end the turn — that is the sanctioned close path and this net will stand down."}\n' "$HC_WORKER_REF" "$HC_WORKER_CALL_Q" "$HC_LOOP_REF_Q"
+            printf '%s\n' '{"decision": "block", "reason": "Worker Body turn ended without a Skill(worker-loop) re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: Skill('"'"'worker-loop'"'"') — NOT Skill('"'"'aspirations'"'"'), which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. If this Body genuinely has no more work, write the body-closing sentinel in your per-session dir and end the turn — that is the sanctioned close path and this net will stand down."}'
             exit 0
         fi
     fi
     unset _BODY_WM _CLOSE_SENTINEL
+fi
+
+# --- Gate 0-pre: reverse a FALSE recovery demotion BEFORE any not-the-runner exit
+# (; completes  part 3) ---
+# THE DEFECT THIS CLOSES. This reversal used to sit at Gate 1-pre, BELOW Gate 0. But
+# recovery-gate.sh's demotion runs session-manifest-clear.sh, which rm -f's
+# running-session-id — so the demoted session arrives here with NO runner file, Gate 0
+# ALLOWs and `exit 0`s, and Gate 1-pre is never reached. The reversal was therefore
+# UNREACHABLE IN PRODUCTION for the exact state it exists to repair.
+# Measured twice, two boxes: zeta/cc-02 2026-09-16 (demote 11:16:28 -> preconditions
+# ok=true 11:19:29 -> `ALLOW gate=no-runner` 11:19:46); bravo/cc-05 sid a2ac1676,
+# demoted 2026-08-07T08:27:03 with cause "heartbeat=FRESH" — the false-demotion-of-a-
+# live-loop case this reversal exists for — then EIGHT `gate=no-runner` exits across
+# 4h50m and a ninth three days later. `grep -c YANK-REVERSED` = 0 over a log carrying
+# seven OTHER ALLOW gate kinds with real counts, so the zero is a real zero.
+#
+# WHY HERE, NOT INSIDE GATE 0 (guard-1536: fix the INSTRUCTION, not the one observed
+# path). Gate 0 is the exit we measured, not the invariant. The invariant is that
+# EVERY gate below concludes "not the runner" or "not running" from state the
+# demotion itself destroyed: Gate 0 reads the deleted runner file, Gate 0's mismatch
+# arm and Gate 0b read the wiped RUNNER_SID, Gate 1 reads the yanked agent-state.
+# Special-casing Gate 0 would rebuild the identical trap one gate down.
+#
+# THIS IS rb-662(1) IN BASH — the same remedy the per-Body branch above applies, for
+# the same reason: a SINGLE-SIGNAL trigger (a recovery-log row naming THIS sid) was
+# wired inside an AGGREGATE gate (runner-file-present AND state-IDLE), which silently
+# drops the single-signal-only path. Hoist above the aggregate gate, keep a
+# signal-level guard. Claim-once is already owned by recovery_yank.py preconditions
+# ("not already reversed"), so a re-fire is a no-op.
+#
+# COST. The signal-level guard is the recovery-log file test, so a box that has never
+# been demoted pays ONE bash file test and spawns nothing. session-state-get.sh is
+# called INSIDE the guard deliberately — hoisting it unguarded would put a subprocess
+# on the hot path that `gate=no-runner` takes 18 times on this box alone.
+#
+# NEWLY REACHABLE (guard-3699). This change is what ARMS recovery-yank-reverse.sh in
+# production for the first time — its success path has never executed anywhere
+# (YANK-REVERSED = 0 fleet-wide), so the restore below is live but unexercised. Every
+# precondition is re-derived inside recovery_yank.py (this sid IS the demoted runner,
+# bound autonomous before the yank, inside the window, no user-stop artifact after it,
+# no peer holding the claim) and any miss returns rc=1 having written nothing, so an
+# observer session, a worker Body, or a foreign sid that now reaches this line is a
+# no-op rather than a restore.
+#
+# MIND_AGENT is NOT exported yet at this point (that happens below, before Gate 1),
+# so both state reads carry an explicit env-assignment prefix. A literal
+# `VAR=value bash ...` prefix is valid; the file-header warning is about using a
+# VARIABLE as the prefix (`$_A bash ...`), which bash does not treat as one.
+if [ -f "$HOOK_AGENT_DIR/session/recovery-log.jsonl" ] \
+   && [ -f "$CORE_ROOT/scripts/recovery-yank-reverse.sh" ]; then
+    _RY_STATE=$(MIND_AGENT="$HOOK_AGENT" bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
+    if [ "$_RY_STATE" = "IDLE" ] \
+       && bash "$CORE_ROOT/scripts/recovery-yank-reverse.sh" --agent "$HOOK_AGENT" --sid "$HOOK_SID" >>"$LOG" 2>&1; then
+        # The restore re-wrote running-session-id. RUNNER_SID was read at L242 from
+        # the file the demotion had already deleted, so re-read it here or every gate
+        # below judges the RESTORED runner on wiped state.
+        RUNNER_SID=""
+        [ -f "$RUNNER_FILE" ] && RUNNER_SID=$(cat "$RUNNER_FILE" 2>/dev/null | tr -d '\r\n' || echo "")
+        _RY_STATE=$(MIND_AGENT="$HOOK_AGENT" bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
+        echo "$(date +%Y-%m-%dT%H:%M:%S) YANK-REVERSED sid=$HOOK_SID agent=$HOOK_AGENT state=$_RY_STATE" >> "$LOG" 2>/dev/null || true
+    fi
+    unset _RY_STATE
 fi
 
 # --- Gate 0: Session identity — only block the runner session ---
@@ -599,12 +656,13 @@ STATE=$(bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNIN
 # autonomous, the demotion is recent, no user-stop artifact post-dates it) and
 # restores RUNNING; every other input returns non-zero and the status quo
 # stands. The script is the whole mechanism — the hook only re-reads state.
-if [ "$STATE" = "IDLE" ] && [ -f "$CORE_ROOT/scripts/recovery-yank-reverse.sh" ] \
-   && [ -f "$HOOK_AGENT_DIR/session/recovery-log.jsonl" ] \
-   && bash "$CORE_ROOT/scripts/recovery-yank-reverse.sh" --agent "$HOOK_AGENT" --sid "$HOOK_SID" >>"$LOG" 2>&1; then
-    STATE=$(bash "$CORE_ROOT/scripts/session-state-get.sh" 2>/dev/null || echo "UNINITIALIZED")
-    echo "$(date +%Y-%m-%dT%H:%M:%S) YANK-REVERSED sid=$HOOK_SID agent=$HOOK_AGENT state=$STATE" >> "$LOG" 2>/dev/null || true
-fi
+# MOVED UP to Gate 0-pre (). It ran HERE, below Gate 0, which made it
+# unreachable for the only state it repairs: the demotion deletes running-session-id,
+# so Gate 0 ALLOWed and exited first. There is deliberately ONE call site now — the
+# guards were identical apart from the STATE test, so the hoisted block covers exactly
+# the same set and a second call here would only re-probe preconditions that
+# recovery_yank.py has already marked reversed. STATE is read fresh below, so a
+# successful reversal is picked up by Gate 1 without any further work here.
 if [ "$STATE" != "RUNNING" ]; then
     # SG-c (-c): the runner session is ending. A graceful /stop sets
     # IDLE at D1 BEFORE stop-loop at D2, so THIS not-RUNNING gate — not Gate 2 —
@@ -870,35 +928,11 @@ HOOK_AGENT_DIR="$HOOK_AGENT_DIR" HOOK_AGENT="$HOOK_AGENT" \
 TTD_MARKER="$TTD_MARKER" TTD_SEVERITY="$TTD_SEVERITY" \
 HOOK_LOG="$LOG" HOOK_SID="$HOOK_SID" STALL_THRESHOLD="${STALL_THRESHOLD:-3}" \
 EXHAUSTION_MSG="$EXHAUSTION_MSG" CTX_MSG="$CTX_MSG" \
-HOOK_SCRIPTS_DIR="$CORE_ROOT/scripts" \
 $PY - <<'PYEOF'
-import datetime, json, os, pathlib, sys
+import datetime, json, os, pathlib
 
 agent_dir = pathlib.Path(os.environ["HOOK_AGENT_DIR"])
 agent     = os.environ["HOOK_AGENT"]
-
-# Vessel vocabulary (2026-09-17). The re-entry this reason demands is spelled the
-# way THIS harness names its tools -- Skill('aspirations') with args='loop' on
-# Claude Code (byte-identical to what this hook always said), use_skill(name=
-# 'aspirations', args='loop') on a zakcode vessel, whose model never sees the
-# name "Skill" in its tool list and answered the old line in prose for hours.
-# On zakcode the payload also carries the deadman `wakeup` (hook_wakeup): the
-# harness arms the net itself before it reads the veto (Zak-Code ADR-0102), so
-# resurrection no longer depends on the model re-arming. ONE owner for the
-# spelling: _harness_caps.py, imported in-process (no extra spawn on this
-# latency-budgeted path). FAIL-OPEN: an unreachable module leaves Claude Code's
-# spelling and no wakeup key -- the pre-change payload, byte for byte; the
-# fallback tuple is pinned to the module's claude-code output by test.
-try:
-    sys.path.insert(0, os.environ.get("HOOK_SCRIPTS_DIR") or ".")
-    import _harness_caps as _hc
-    _loop_ref = _hc.skill_ref("aspirations")
-    _loop_call = _hc.skill_call("aspirations", "loop", quoted=True)
-    _skill_tool = _hc.skill_tool()
-    _wakeup = _hc.hook_wakeup()
-except Exception:
-    _loop_ref, _loop_call, _skill_tool, _wakeup = (
-        "Skill(aspirations)", "Skill('aspirations') with args='loop'", "Skill", {})
 
 # Checkpoint context — just the raw goal_id + phase_completed. Let the LLM
 # interpret; do not add per-phase narrative. Fail-open on corrupt checkpoint.
@@ -1016,10 +1050,10 @@ _cm = (os.environ.get("CTX_MSG") or "").strip()
 ctx_msg = (" " + _cm) if _cm else ""
 
 reason = (
-    f"Turn ended without a {_loop_ref} re-entry (autocompact OR a text "
-    f"summary terminated the turn). Your FIRST action MUST be: {_loop_call}. "
-    "Do NOT manually select goals. Do NOT run Bash commands "
-    f"first. Call the {_skill_tool} tool IMMEDIATELY."
+    "Turn ended without a Skill(aspirations) re-entry (autocompact OR a text "
+    "summary terminated the turn). Your FIRST action MUST be: Skill('aspirations') "
+    "with args='loop'. Do NOT manually select goals. Do NOT run Bash commands "
+    "first. Call the Skill tool IMMEDIATELY."
     + cp_context
     + f" Agent: {agent}. Prefix all Bash with MIND_AGENT={agent}."
     + compact_msg
@@ -1029,7 +1063,17 @@ reason = (
     + ctx_msg
 )
 
-print(json.dumps({"decision": "block", "reason": reason, **_wakeup}))
+# The deadman net, armed by the harness itself where the hook contract has a wake-up slot
+# (Zak-Code ADR-0102 `wakeup`; ADR-0187 composes the sentinel from the skill this reason
+# names). Emitted UNCONDITIONALLY, exactly like the parked/closed lines above: Claude Code
+# ignores keys it does not define (visible only under --debug as "unrecognized keys"), so
+# this payload is ONE document on every harness and the hook never asks which one fired it.
+# An extension in a framework payload is ADDITIVE and never load-bearing (2026-09-18).
+print(json.dumps({
+    "decision": "block",
+    "reason": reason,
+    "wakeup": {"prompt": "<<autonomous-loop-dynamic>>", "delay_seconds": 600},
+}))
 PYEOF
 
 # --- Emit timing record (, fail-open) ---

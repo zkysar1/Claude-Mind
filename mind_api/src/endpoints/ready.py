@@ -130,6 +130,36 @@ def _probe_store(backend) -> tuple[str, str]:
 def ready(ctx) -> "Response":  # type: ignore[name-defined]
     from ..server import Response  # local import — avoids cycle at module load
 
+    # Write-path wedge check, BEFORE the store probe (g-115-10019). A daemon
+    # whose in-process write lock is wedged cannot serve store ops no matter
+    # how healthy its credentials are, so checking creds first would return a
+    # confident 200 for a daemon that writes nothing — the exact silent
+    # degradation the /health-vs-/ready split exists to surface, arriving
+    # through the other door. Ordered first because it is free (process
+    # memory, no round trip) and because its answer outranks the store's:
+    # working creds on a frozen writer is still not-ready.
+    try:
+        from .. import file_locks
+        write_path = file_locks.write_path_status()
+    except Exception:  # noqa: BLE001 — a diagnostic must never fail the probe
+        write_path = None
+    if write_path is not None and write_path["wedged"]:
+        return Response.json(
+            {
+                "ready": False,
+                "backend": os.environ.get("STORAGE_BACKEND", "local"),
+                "store_check": "skipped-write-path-wedged",
+                "error": (
+                    f"write path wedged: lock on {write_path['longest_hold_path']} "
+                    f"held {write_path['longest_hold_s']}s "
+                    f"(threshold {write_path['wedge_threshold_s']}s), "
+                    f"{write_path['blocked_writers']} writer(s) blocked"
+                ),
+                "write_path": write_path,
+            },
+            status=503,
+        )
+
     backend_name = os.environ.get("STORAGE_BACKEND", "local").strip().lower()
     if backend_name in ("", "local", "local-files"):
         # Local store == local files; daemon liveness IS store availability. No

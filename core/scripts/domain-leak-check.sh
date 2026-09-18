@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 # domain-leak-check.sh — Scan core framework files for domain-specific terms.
-# Usage: bash core/scripts/domain-leak-check.sh [--verbose] [--core-only]
+# Usage: bash core/scripts/domain-leak-check.sh [--verbose] [--core-only] [--ignore-case]
 #
-# Reads terms from core/config/domain-term-blocklist.txt (case-sensitive).
+# Reads terms from core/config/domain-term-blocklist.txt (case-sensitive by
+# default; --ignore-case matches case-insensitively).
+#
+# --ignore-case is REPORT SCOPE and is deliberately NOT the default (guard-1426,
+# g-115-10049). The measured lowercase gap is large -- 'roblox' alone appears in
+# 41 files that the capitalised blocklist term never matched -- so flipping the
+# default would turn a 238-file backlog into an instant hard failure for every
+# caller including the pre-commit hook. A new case rule enters reporting first;
+# blocking applies to ADDED lines only, after the backlog is filed with counts.
+# Short acronym terms (S3, EFS, NPC, jose) match more loosely under -i, which is
+# the guard-2610 class -- another reason this stays opt-in until the backlog is
+# triaged per term.
 # Excludes forged skills: world/forged-skills.yaml --exclude-dir, PLUS a
 # `forged: true` front-matter fallback for forged skills absent from that list
 # (g-115-2109). Scans all if the registry is unavailable.
@@ -16,6 +27,7 @@ BLOCKLIST="$PROJECT_ROOT/core/config/domain-term-blocklist.txt"
 VERBOSE=false
 CORE_ONLY=false
 STAGED=false
+IGNORE_CASE=false
 
 for arg in "$@"; do
   case "$arg" in
@@ -27,6 +39,8 @@ for arg in "$@"; do
     # capped at 30s as a stopgap in g-001-312). Full-tree scan (no --staged)
     # stays the mode for /verify-learning + manual/CI audits.
     --staged) STAGED=true ;;
+    # --ignore-case (g-115-10049): report-scope case-insensitive matching.
+    --ignore-case) IGNORE_CASE=true ;;
   esac
 done
 
@@ -113,6 +127,13 @@ fi
 
 FOUND=0
 
+# Case flag for the two greps below (g-115-10049). An EMPTY array is the
+# historical case-sensitive behaviour, so the default path stays byte-identical.
+GREP_CASE=()
+# NOT `[[ ... ]] && GREP_CASE=(-i)`: under `set -e` a false condition makes the
+# && list return 1 and the script exits -- on the DEFAULT path, for every caller.
+if [[ "$IGNORE_CASE" == true ]]; then GREP_CASE=(-i); fi
+
 while IFS= read -r term; do
   # Skip comments and blank lines
   [[ -z "$term" || "$term" == \#* ]] && continue
@@ -134,9 +155,9 @@ while IFS= read -r term; do
       # downstream filter below (self-ref, test-fixture, marker-honor all key on
       # the path in each hit line). Recursive -rnw always prefixes; -H makes the
       # staged single-file output shape identical. (g-001-314)
-      hits=$(grep -Hnw "$term" "${dir_targets[@]}" 2>/dev/null || true)
+      hits=$(grep -Hnw "${GREP_CASE[@]}" "$term" "${dir_targets[@]}" 2>/dev/null || true)
     else
-      hits=$(grep -rnw "${EXCLUDE_ARGS[@]}" --include="*.md" --include="*.yaml" --include="*.yml" --include="*.sh" --include="*.py" --include="*.txt" "$term" "$dir" 2>/dev/null || true)
+      hits=$(grep -rnw "${GREP_CASE[@]}" "${EXCLUDE_ARGS[@]}" --include="*.md" --include="*.yaml" --include="*.yml" --include="*.sh" --include="*.py" --include="*.txt" "$term" "$dir" 2>/dev/null || true)
     fi
 
     if [[ -n "$hits" ]]; then

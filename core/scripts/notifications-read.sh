@@ -6,7 +6,7 @@
 # a second place for the store's shape to live, which is the whole defect this
 # file exists to close.
 #
-# WHY IT EXISTS WHEN THE READER ALREADY DID (g-001-846). The reader was never
+# WHY IT EXISTS WHEN THE READER ALREADY DID (). The reader was never
 # missing — `notification_outreach.py list --since-hours N --json` has always
 # read `ts` from one place and taken a time window. What was missing is the
 # SURFACE an agent reaches for. Every other governed store answers to

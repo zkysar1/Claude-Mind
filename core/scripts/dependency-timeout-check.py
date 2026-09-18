@@ -207,6 +207,55 @@ def _read_goal_index() -> dict:
 
 UNMEASURED_KEY = "_unmeasured_reason"
 
+# Bound for the inner `goal-selector.sh blocked` call. ONE KNOB, read here AND
+# by precheck-always-run-battery.py, which sizes THIS lane's outer cap as this
+# value plus headroom ().
+#
+# WHY IT IS DERIVED AND NOT THE OLD HARDCODED 180 (guard-918): a wrapper cap
+# must exceed the inner call's own window, or the wrapper kills a call that is
+# still legally running. That invariant was VIOLATED here in the opposite
+# direction and the inversion is the real defect: the battery applied a uniform
+# _LANE_TIMEOUT_S = 120 to every lane while this call was allowed 180, so
+# through the production caller the inner bound was UNREACHABLE — the lane was
+# hard-killed at 120 s with no payload at all, which renders as BLIND rather
+# than as the honest `blocked_view_measured: false` this module goes to real
+# trouble to emit (). Raising only the inner bound, which is what
+# this goal's title prescribes, could not have changed battery behaviour.
+#
+# COST IS O(QUEUE) AND BOX-DEPENDENT, so this is a knob rather than a new magic
+# number (guard-3704: a script that times out on one box and is instant on
+# another is usually O(caller state) — measure before rewriting). Measured
+# 2026-09-18: `goal-selector.sh blocked` = 42.3 s on cc-03 (echo, Linux
+# 6.8.0-139-generic) against 740 blocked goals / 2,115 candidates; the same call
+# exceeded 180 s on LAPTOP-3IOFCNEO (foxtrot, 2026-09-13) on the SAME shared
+# queue. Unlike guard-3704's canonical case the population is NOT a per-caller
+# backlog — the queue is shared world state, identical from every box — so the
+# spread is box speed, and no bound that is right for one box is right for all.
+# 300 s gives the slowest observed box ~2x headroom; raise the env knob rather
+# than editing this line.
+#
+# NOT switchable to stdout=DEVNULL to make the timeout reliable on Windows
+# (guard-4375): that remedy is for callers which do not read the child's output,
+# and this one parses its stdout as JSON. The guardrail says so explicitly.
+#
+# A MALFORMED KNOB MUST NOT RAISE HERE. This is a module-TOP-LEVEL read, and
+# the same variable is read the same way at the top of
+# precheck-always-run-battery.py — whose import IS the loop-entry always-run
+# tier. A bare int() turns an empty or mistyped tuning value into an
+# import-time crash of that tier, which is the exact shape this goal fixed:
+# an infrastructure fault rendering as something worse than the honest
+# degraded reading. So fall back to the default — but LOUDLY, because a
+# silent fallback means someone sets 900, gets 300, and has no signal
+# (guard-2298: an except-branch must never convert a fault into a clean value).
+_KNOB = os.environ.get("DEP_BLOCKED_VIEW_TIMEOUT_S")
+try:
+    BLOCKED_VIEW_TIMEOUT_S = int(_KNOB) if _KNOB and _KNOB.strip() else 300
+except ValueError:
+    sys.stderr.write(
+        "dependency-timeout-check: DEP_BLOCKED_VIEW_TIMEOUT_S=%r is not an "
+        "integer — falling back to 300s\n" % _KNOB)
+    BLOCKED_VIEW_TIMEOUT_S = 300
+
 
 def _read_blocked() -> dict:
     """goal-selector blocked view. Returns {} on any failure (fail-open).
@@ -244,7 +293,7 @@ def _read_blocked() -> dict:
     try:
         proc = subprocess.run(
             bash_cmd(SCRIPT_DIR / "goal-selector.sh", "blocked"),
-            capture_output=True, text=True, timeout=180)
+            capture_output=True, text=True, timeout=BLOCKED_VIEW_TIMEOUT_S)
         if proc.returncode != 0:
             reason = "goal-selector blocked rc=%s" % proc.returncode
             sys.stderr.write(

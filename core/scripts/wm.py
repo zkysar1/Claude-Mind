@@ -16,7 +16,9 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -848,14 +850,57 @@ def read_yaml(path):
     return data if data is not None else {}
 
 def write_yaml(path, data):
-    """Atomically write data as YAML (fsync before rename — )."""
+    """Atomically write data as YAML (fsync before rename — ).
+
+    The temp name is PER-WRITER, never derived from the target (g-115-9983 D3).
+    It used to be ``path.with_suffix('.yaml.tmp')`` — deterministic and shared —
+    so two writers opened the SAME file with mode 'w', each truncating and then
+    writing at its own offset; a short document's bytes and a long document's
+    tail coexisted in one inode and whichever ``replace()`` won published the
+    splice. That is how alpha's 13.9 MB working memory became unparseable
+    (ScannerError at line 192228, one mid-line resume point — the signature this
+    mechanism predicts).
+
+    Note precisely what was NOT wrong: ``replace()`` is atomic and the
+    fsync-before-rename is correct. The shared NAME defeated both before the
+    rename was ever reached, which is why an audit of this function for
+    atomicity found it correct and stopped.
+
+    Nor is this redundant with the advisory lock. Measured 2026-09-18 by AST
+    over this module, all 8 write call sites are lock-protected (6 lexically
+    under ``wm_lock()``, ``_do_prune`` via its caller ``cmd_prune``), so the
+    caller-holds-the-lock contract that ``_fileops._atomic_write_with_fallback``
+    states IS met here — and the corruption happened anyway, with the suite log
+    carrying a ``FileExistsError`` from the lock itself. An advisory lock with a
+    staleness break can fail to exclude; a per-writer temp name cannot.
+
+    Mode is copied from the existing target (or defaulted through the umask)
+    because ``mkstemp`` creates 0600, which would otherwise silently make the
+    file unreadable to a cross-uid reader (rb-4790).
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".yaml.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True,
+                      sort_keys=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except BaseException:
+        # Never leak a per-writer temp: unlike the old shared name, a leaked
+        # one is not reused and would accumulate one orphan per failed write.
+        tmp.unlink(missing_ok=True)
+        raise
 
 def read_wm():
     """Read working memory file."""
@@ -1277,6 +1322,28 @@ def cmd_append(args):
               f"goal_id, so it is never counted and no consumer reads it. Pass "
               f"one object per append{hint}.", file=sys.stderr)
         sys.exit(1)
+
+    # : `load_bearing` gates a DESTRUCTIVE operation (eviction
+    # exemption) plus the carrier push, and every reader tests it for truthiness,
+    # so a non-empty string silently counts as true while reading as prose in the
+    # stored record. Measured: 18 non-boolean rows in the 24,620-row eviction
+    # archive, all spark_capture, only 2 distinct strings re-archived 9x each.
+    # REFUSED rather than normalized — full rationale in the daemon copy
+    # (wm_write.py, the LIVE path per guard-742/547); the short version is that
+    # nothing can infer whether the writer meant true or false, and guessing on a
+    # destructive control is worse than a refusal the writer can fix in-turn.
+    if root_slot_for_validation in CAPTURE_SLOTS and isinstance(item, dict):
+        _lb = item.get("load_bearing")
+        if _lb is not None and not isinstance(_lb, bool):
+            print(f"Error: capture slot {root_slot_for_validation!r}: "
+                  f"`load_bearing` must be a JSON boolean (true/false) or be "
+                  f"omitted; got {type(_lb).__name__} {str(_lb)[:80]!r}. It is "
+                  f"not a free-text field: it gates eviction-exemption and the "
+                  f"carrier push, and every reader tests it for truthiness, so a "
+                  f"non-empty string silently counts as true. If that text is an "
+                  f"observation, put it in `observation` (or another content key) "
+                  f"and set `load_bearing` to true or false.", file=sys.stderr)
+            sys.exit(1)
 
     if root_slot_for_validation == "knowledge_debt" and isinstance(item, dict):
         _validate_knowledge_debt_entry(item)

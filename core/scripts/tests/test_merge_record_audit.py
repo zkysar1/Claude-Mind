@@ -1,4 +1,4 @@
-"""test_merge_record_audit.py — gap-042 / g-001-789.
+"""test_merge_record_audit.py — gap-042 / .
 
 ANTI-VACUITY IS THE POINT OF THIS MODULE. The audit acquired EIGHT filters during
 its forge, each one removing a class of false alarm that a real replay produced:

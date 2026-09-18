@@ -2063,9 +2063,6 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
         # non-recurring close rather than only when the caller remembered the
         # flag. do_state_update's sentinel remains the backstop for the case this
         # stdout line is emitted but not acted on.
-        # $HC_SPARK_REF: the spark skill as THIS harness names it (_harness_vocab.sh,
-        # 2026-09-17) -- Skill(aspirations-spark) on Claude Code, byte-identical.
-        source "$SCRIPT_DIR/_harness_vocab.sh"
         if [[ "${BODY_ROLE:-}" == "worker" ]]; then
             # A WORKER Body reaches this close via worker-loop Phase 4a and
             # its spark obligation is Phase 3.5 spark_capture (replayed by
@@ -2074,9 +2071,9 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
             # imperative here would contradict worker-loop Phase 4c and
             # invite a worker to run a phase it must skip (2026-08-16,
             # g-115-6337 review). Say what the worker's next step IS.
-            echo "[iteration-close] NEXT (worker Body): spark for $GOAL_ID was captured in worker-loop Phase 3.5 (spark_capture; the reducer replays it) — do NOT invoke $HC_SPARK_REF. Continue to worker-loop Phase 4b (hand-off row) then Phase 5 (re-enter for the next unit)."
+            echo "[iteration-close] NEXT (worker Body): spark for $GOAL_ID was captured in worker-loop Phase 3.5 (spark_capture; the reducer replays it) — do NOT invoke Skill(aspirations-spark). Continue to worker-loop Phase 4b (hand-off row) then Phase 5 (re-enter for the next unit)."
         else
-            echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke $HC_SPARK_REF BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
+            echo "[iteration-close] NEXT: Phase 6 spark REQUIRED for $GOAL_ID (outcome=deep, non-recurring) — invoke Skill(aspirations-spark) BEFORE the state-update phase. In-turn spark is recorded by spark-fire-dedup; the sentinel self-clears either way."
         fi
     fi
     # ── End Phase-6 spark imperative ──────────────────────────────────────────
@@ -3952,19 +3949,23 @@ except Exception: print("false")' 2>/dev/null || echo false)"
     # here fired this nudge on every close forever. Count via the shared
     # _reflectable filter (outcome CONFIRMED/CORRECTED) so a firing means
     # "reflection work actually exists".
-    local unreflected
-    unreflected="$(bash "$SCRIPT_DIR/pipeline-read.sh" --unreflected | SCRIPTS_DIR="$SCRIPT_DIR" python3 -c "
-import json, os, sys
-sys.path.insert(0, os.environ['SCRIPTS_DIR'])
-try:
-    import _reflectable
-    d = json.load(sys.stdin)
-    print(_reflectable.count_reflectable(d) if isinstance(d, list) else 0)
-except Exception:
-    print(0)
-" || { echo "[iteration-close] WARN: pipeline-read --unreflected failed — defaulting to 0 (LLM may miss unreflected hypothesis count)" >&2; echo "0"; })"
-    if [[ "$unreflected" -gt 0 ]]; then
-        echo "[iteration-close] LLM-ACTION: $unreflected reflectable unreflected hypothesis/es — digest § LEARNING-GATE item 3" >&2
+    # g-115-10004: the count is OWNER-SPLIT, not a bare total. An ownerless
+    # count fired this nudge on records guard-5623 forbids the agent from
+    # touching (a LIVE other agent's), so every close asked for work that was
+    # illegal to do. The reverse half is the one that was actually costing
+    # learning: an un-split total reads as "someone else's" and nothing ever
+    # contradicts it — measured (echo, cc-03, 2026-09-15) a "13, all bravo's"
+    # reading held for two iterations while the reading agent owned THREE
+    # unreflected CORRECTED records inside that same queue. So the line now
+    # names the agent's OWN ids and reports the abstain count separately.
+    # The script labels its own line LLM-ACTION (work exists for me) vs INFO
+    # (only other agents' work exists) because it is the only place that holds
+    # the split; a caller re-deriving that from the count would drift.
+    local reflect_nudge
+    reflect_nudge="$(python3 "$CORE_ROOT/scripts/reflection-ownership-split.py" --nudge 2>/dev/null)" \
+        || { echo "[iteration-close] WARN: reflection ownership split failed — reflection nudge suppressed this close (LLM may miss reflectable hypotheses)" >&2; reflect_nudge=""; }
+    if [[ -n "$reflect_nudge" ]]; then
+        echo "[iteration-close] $reflect_nudge — digest § LEARNING-GATE item 3" >&2
     fi
 
     # Tree growth check — report candidate count if any
@@ -4675,17 +4676,10 @@ do_productivity_check() {
     # (deadman-arm-audit ARMED-OK); fail-safe worst case is a slow loop, never a
     # dead one. See aspirations/SKILL.md Return Protocol +
     # core/config/rationale/deadman-switch.md.
-    # The tool names in the imperative come from the harness vocabulary
-    # (_harness_vocab.sh, 2026-09-17): a zakcode vessel reads use_skill(name=
-    # 'aspirations', args='loop') and schedule_wakeup(...), the names in ITS tool
-    # list; Claude Code reads the byte-identical lines it always did. Measured
-    # 2026-09-17: a small model on a vessel answered the Claude Code names in
-    # prose for hours while the stop hook BLOCKed in the same foreign names.
-    source "$SCRIPT_DIR/_harness_vocab.sh"
     if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
-        echo "[iteration-close] NEXT ACTION REQUIRED: Call $HC_LOOP_CALL as your VERY NEXT tool call."
+        echo "[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
     else
-        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) $HC_DEADMAN_ARM — the self-resurrection net; this call is MANDATORY, do NOT omit it; THEN (2) $HC_LOOP_CALL — the primary re-entry and the LAST call, which continues the loop NOW. Emitting $HC_LOOP_REF ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
+        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600) — the self-resurrection net; this call is MANDATORY, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' — the primary re-entry and the LAST call, which continues the loop NOW. Emitting Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
     fi
     echo "[iteration-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 

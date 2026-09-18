@@ -471,21 +471,11 @@ def test_state_mismatch_landing_is_wired_before_both_iteration_complete_imperati
         assert call < imperative, name
 
 
-_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
-
-
-def _run_landing(root: Path, sid=SID, body_role=None, harness=None):
+def _run_landing(root: Path, sid=SID, body_role=None):
     env = dict(os.environ)
     env.update({"MIND_AGENT": AGENT, "STORAGE_BACKEND": "local", "RT_NO_AUTOSPAWN": "1",
                 "RUNTIME_DIR": str(root / "rt")})
     env.pop("MIND_SID", None)
-    # Harness pin (2026-09-17): the imperative is spelled in the hosting
-    # harness's tool names, read from the CLAUDECODE / ZAKCODE_* markers. Pin
-    # Claude Code so the Skill(...) pins in this family hold on a box that runs
-    # the suite under a vessel; a test names another harness via `harness`.
-    for k in _HARNESS_MARKERS:
-        env.pop(k, None)
-    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
     # BODY_ROLE decides whether the landing may fire at all (), and the
     # PreToolUse bash hook injects it into every Bash call — so on a WORKER box
     # dict(os.environ) silently carries BODY_ROLE=worker and every landing test
@@ -515,16 +505,6 @@ def test_landing_prints_the_consolidate_directive_when_the_yank_cannot_be_revers
     assert "STATE MISMATCH" in r.stdout and "aspirations-consolidate" in r.stdout
     assert "do NOT call Skill(aspirations)" in r.stdout
     assert "ITERATION COMPLETE" not in r.stdout
-
-
-def test_landing_on_a_zakcode_vessel_names_the_vessels_loop_tool(tmp_path):
-    """2026-09-17: the landing's do-NOT-call line names the loop skill in the
-    hosting harness's vocabulary; a vessel model reads use_skill(aspirations)."""
-    root, _ = _sandbox(tmp_path, entries=[_recent_yank()])
-    r = _run_landing(root, sid=OTHER_SID, harness={"ZAKCODE_SESSION": "x"})
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert "do NOT call use_skill(aspirations)" in r.stdout
-    assert "Skill(aspirations)" not in r.stdout.replace("use_skill(aspirations)", "")
 
 
 def test_landing_is_silent_on_a_worker_body_whose_idle_state_is_by_design(tmp_path):
@@ -562,3 +542,127 @@ def test_landing_reverses_a_true_yank_and_continues(tmp_path):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "REVERSED" in r.stderr
     assert (adir / "session" / "agent-state").read_text(encoding="utf-8").strip() == "RUNNING"
+
+
+# ─────────── 5b. structural: the reversal precedes EVERY post-demotion exit ───────────
+# . The pin above (test_stop_hook_hands_a_demoted_sid_to_the_reversal_
+# before_its_running_gate) checks ONE gate — `[ "$STATE" != "RUNNING" ]` — and passed
+# green for the entire window in which the reversal was unreachable in production.
+# recovery-gate.sh's demotion runs session-manifest-clear.sh, which deletes
+# running-session-id AND runner-token as well as setting agent-state IDLE, so EVERY
+# gate below reads state the demotion itself destroyed and each is an independent
+# way for a falsely-demoted live loop to die silently. Pinning one of four is how the
+# defect hid: measured zeta/cc-02 2026-09-16 and bravo/cc-05 sid a2ac1676 (eight
+# `gate=no-runner` exits over 4h50m), with `grep -c YANK-REVERSED` = 0 fleet-wide.
+
+_REVERSAL_CALL = 'recovery-yank-reverse.sh" --agent "$HOOK_AGENT" --sid "$HOOK_SID"'
+_GATE0_PRE_HEAD = "# --- Gate 0-pre:"
+_GATE0_HEAD = "# --- Gate 0: Session identity"
+
+# (name, the literal ALLOW line whose `exit 0` fires in the post-demotion state)
+_POST_DEMOTION_EXITS = (
+    ("gate=no-runner", "ALLOW gate=no-runner"),
+    ("gate=sid-mismatch", "ALLOW gate=sid-mismatch"),
+    ("gate=same-sid-not-owner", "ALLOW gate=same-sid-not-owner"),
+    ("gate=not-running", "ALLOW gate=not-running"),
+)
+
+
+def _hook_src() -> str:
+    return (SCRIPTS / "stop-hook.sh").read_text(encoding="utf-8")
+
+
+def _code_only(text: str) -> str:
+    """Drop comment-only lines before any ordering comparison.
+
+    Not cosmetic. The block documenting this fix QUOTES the gate names it is
+    about ("`ALLOW gate=no-runner` 11:19:46"), and those comment lines sit ABOVE
+    the reversal, so a raw `str.index` on a gate marker returns the prose and the
+    ordering assertions silently compare the wrong offsets. Caught by running
+    these tests: both ordering pins failed against a file that is correctly
+    ordered. A pin that reads its own rationale as code is worse than no pin.
+    """
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def _assert_reversal_precedes_every_exit(raw: str) -> None:
+    """Raises AssertionError if any post-demotion exit can preempt the reversal."""
+    src = _code_only(raw)
+    call = src.index(_REVERSAL_CALL)
+    for name, marker in _POST_DEMOTION_EXITS:
+        assert call < src.index(marker), (
+            f"the reversal must run BEFORE the {name} exit — that exit fires in the "
+            "post-demotion state (running-session-id/runner-token deleted, state IDLE), "
+            "so a falsely-demoted LIVE loop dies silently there"
+        )
+
+
+def test_reversal_precedes_every_post_demotion_exit():
+    _assert_reversal_precedes_every_exit(_hook_src())
+
+
+def test_the_ordering_pin_is_red_when_the_reversal_is_moved_back_below_gate_0():
+    """Mutation proof (guard-1655): author the sabotage by restoring the ORIGINAL
+    placement — the reversal below Gate 0 — and assert the pin above turns red.
+    Without this, a pin that asserts a property the file already has cannot be
+    distinguished from a pin that asserts nothing."""
+    src = _hook_src()
+    start = src.index(_GATE0_PRE_HEAD)
+    end = src.index(_GATE0_HEAD)
+    block = src[start:end]
+    assert _REVERSAL_CALL in block, "the sabotage must actually relocate the call site"
+    # Put it back where it lived before this fix: after the not-RUNNING gate.
+    without = src[:start] + src[end:]
+    anchor = without.index("ALLOW gate=not-running")
+    mutated = without[:anchor] + block + without[anchor:]
+    with pytest.raises(AssertionError):
+        _assert_reversal_precedes_every_exit(mutated)
+
+
+def test_reversal_has_exactly_one_call_site():
+    """Two call sites would make the ordering pin unfalsifiable: the hoisted one
+    could be deleted while the pin still found the lower one and stayed green."""
+    assert _hook_src().count(_REVERSAL_CALL) == 1
+
+
+def test_reversal_is_gated_on_the_recovery_log_signal():
+    """rb-662(1): hoisting above the aggregate gate is only safe with a signal-level
+    guard. The recovery-log test is also the cost guarantee — a box that has never
+    been demoted must spawn NOTHING here, on a path `gate=no-runner` takes routinely."""
+    src = _hook_src()
+    block = _code_only(src[src.index(_GATE0_PRE_HEAD):src.index(_GATE0_HEAD)])
+    guard = block.index('session/recovery-log.jsonl"')
+    assert guard < block.index("session-state-get.sh"), (
+        "session-state-get.sh must be called INSIDE the recovery-log guard, or every "
+        "no-runner turn-end on every dormant box pays a subprocess it never needed"
+    )
+    assert guard < block.index(_REVERSAL_CALL)
+
+
+def test_hoisted_state_reads_name_the_agent_explicitly():
+    """The hoist moved these reads ABOVE `export MIND_AGENT="$HOOK_AGENT"`. Without
+    an explicit env-assignment prefix they resolve whatever agent the ambient
+    environment names — silently answering a different question than the hook asked."""
+    src = _hook_src()
+    block = src[src.index(_GATE0_PRE_HEAD):src.index(_GATE0_HEAD)]
+    assert "export MIND_AGENT" not in block, "the hoisted block must not move the export"
+    assert src.index(_GATE0_PRE_HEAD) < src.index('export MIND_AGENT="$HOOK_AGENT"'), (
+        "this test only has a subject while the block sits above the export"
+    )
+    for line in block.splitlines():
+        if "session-state-get.sh" in line and not line.lstrip().startswith("#"):
+            assert 'MIND_AGENT="$HOOK_AGENT" bash' in line, (
+                f"state read above the export must name the agent: {line.strip()}"
+            )
+
+
+def test_runner_sid_is_reread_after_a_successful_reversal():
+    """RUNNER_SID is read once at L242, from the file the demotion already deleted.
+    The reversal re-writes it, so without a re-read every gate below judges the
+    RESTORED runner on wiped state."""
+    src = _hook_src()
+    block = src[src.index(_GATE0_PRE_HEAD):src.index(_GATE0_HEAD)]
+    after_call = block[block.index(_REVERSAL_CALL):]
+    assert 'RUNNER_SID=$(cat "$RUNNER_FILE"' in after_call, (
+        "the hook must re-read RUNNER_SID after a reversal restores running-session-id"
+    )

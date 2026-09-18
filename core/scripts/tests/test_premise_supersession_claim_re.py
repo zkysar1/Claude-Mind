@@ -1,4 +1,4 @@
-"""Regression tests for premise_supersession_check.CLAIM_RE (g-001-862).
+"""Regression tests for premise_supersession_check.CLAIM_RE ().
 
 CLAIM_RE had NO test coverage before this file, and it had no TIME UNITS — so
 the check was structurally blind on the class of goal whose premises decay
@@ -39,7 +39,7 @@ def _claims(text: str) -> list[str]:
 
 
 def test_duration_claims_in_hours_are_enumerated():
-    """The g-001-845 case: hour premises were invisible and are the whole argument."""
+    """The  case: hour premises were invisible and are the whole argument."""
     text = "interval is 0.45h, next contraction 0.3h, below the floor of 0.33h (0.33x original 1.0h)"
     found = {c.lower() for c in _claims(text)}
     for expected in ("0.45h", "0.3h", "0.33h", "1.0h"):
@@ -63,7 +63,7 @@ def test_preexisting_claim_shapes_still_match():
 
 
 def test_uuid_segment_is_not_read_as_a_duration():
-    """ADVERSARIAL CONTROL, from the live corpus (g-025-176), not invented.
+    """ADVERSARIAL CONTROL, from the live corpus (), not invented.
 
     Bare `d` would match '456d' here. It is a hex segment of an SES messageId.
     """
@@ -73,7 +73,7 @@ def test_uuid_segment_is_not_read_as_a_duration():
 
 
 def test_git_short_sha_is_not_read_as_a_duration():
-    """ADVERSARIAL CONTROL, from the live corpus (g-029-47), not invented.
+    """ADVERSARIAL CONTROL, from the live corpus (), not invented.
 
     Bare `d` would match '658385d', a git short sha, as 658,385 days.
     """

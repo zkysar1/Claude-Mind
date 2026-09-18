@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.76",
+    "previous_version": "2.12.75",
+    "date": "2026-09-18",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "reconcile the 11 ZDS-ahead framework files staging carries (g-001-917 back-port) into dev instead of clobbering them at the plant: experience-pipe, merge-record-audit, notifications-read, user-leg-scope-verdict-split rationale, the wrapped-marker refusal on both append helpers (g-001-847), pipeline as a store-field-append store (g-001-828), CLAIM_RE time units (g-001-862), cross-deployment-channel third-cause-of-silence section, plus their tests",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.75",
+    "previous_version": "2.12.74",
+    "date": "2026-09-18",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "loop-terminal-protocol one-harness contract (deadman net armed from the BLOCK payload unconditionally); recovery-yank reversal hoisted above stop-hook Gate 0; graceful-stop D3.5 renews the runner lease; daemon wedged-writer class detectable + recoverable; wm.write_yaml per-writer temp path; iteration-commit keeps a new untracked directory; fresh-eyes timeout-knob + dependency-timeout-check hardening; reflection queue split by resolved_by; domain-leak-check --ignore-case; test coverage",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.74",
     "previous_version": "2.12.73",
     "date": "2026-09-17",

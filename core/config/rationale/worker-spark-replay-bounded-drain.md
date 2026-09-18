@@ -114,8 +114,21 @@ and could restore nothing, so the restoring Body's fork predates the clear.
 hazard is a property of `merge_wm`, not of the removal's size, so it must be
 assumed to apply to the drain too. What the bound buys is OBSERVABILITY: at k
 goals per round a restore shows as `removed` and `kept` that do not move across
-consecutive closes, surfacing within one iteration instead of a month. A
-non-decreasing `kept` across two passes is the restore signal — stop draining and
+consecutive closes, surfacing within one iteration instead of a month. MEASURED 2026-09-17 (alpha, hostname cc-04, uname -r 6.8.0-139-generic,
+own-cloud): a bounded subtract SURVIVES the merge, and the count-based signal
+stated here is WRONG ON AN ARRIVING LANE. That run drained one goal from
+`spark_capture` — pre-drain 3,200, `removed` 3, `kept` 3,197 — and ten minutes
+later the slot read 3,202, i.e. non-decreasing, while `g-306-300` stayed ABSENT
+and the oldest cohort correctly advanced to `g-326-288`. Distinct goal_ids were
+unchanged at 1,246, so the +5 were ARRIVALS against goals already present, not
+restores. Read literally, the sentence below would have halted the only mechanism
+draining a 3,202-entry backlog, permanently, because arrivals (~30/h) exceed the
+bounded drain rate. The discriminator is IDENTITY, not level — guard-2997's
+"measure it by MEMBER TURNOVER, not by level" applied to this lane: the signal is
+whether the SPECIFIC drained goal_ids REAPPEAR. The fuller sentence two lines up
+("`removed` and `kept` that do not move") already says this correctly; only the
+compressed restatement drifted, and it is the compressed one the hot-path
+SKILL.md quoted. On a genuine restore — the drained ids back — stop draining and
 fix the baseline, which is what `merge_wm`'s baseline argument exists to express
 (a 3-way merge against a POST-clear baseline subtracts the slot where a 2-way
 union cannot).

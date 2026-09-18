@@ -253,24 +253,13 @@ def _seed_world(world: Path, claimed_by_sid: str) -> Path:
     return shard
 
 
-_HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION", "MIND_HARNESS_BG_NOTIFY")
-
-
 def _run_hook(root: Path, runtime_dir: Path,
-              scrub_env: bool = False,
-              harness: dict | None = None) -> subprocess.CompletedProcess:
+              scrub_env: bool = False) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["RT_DIR"] = str(runtime_dir)
     env["MIND_SID"] = BODY_SID
     env["MIND_AGENT"] = AGENT
     env["STORAGE_BACKEND"] = "local"
-    # Harness pin (2026-09-17): the imperative is spelled in the hosting
-    # harness's tool names, read from the CLAUDECODE / ZAKCODE_* markers. Pin
-    # Claude Code so the Skill(...) pins in this family hold on a box that runs
-    # the suite under a vessel; a test names another harness via `harness`.
-    for k in _HARNESS_MARKERS:
-        env.pop(k, None)
-    env.update(harness if harness is not None else {"CLAUDECODE": "1"})
     if scrub_env:
         # PRODUCTION SHAPE. A real Stop event provides NEITHER var -- Gate 0
         # runs before stop-hook.sh exports MIND_AGENT -- so a branch that
@@ -305,8 +294,7 @@ def _in_flight(shard: Path):
 def _drive(tmp_path, claimed_by_sid=BODY_SID, mutate=None, closing=True,
            scrub_env=False, stop_requested=False, runner_file=True,
            body_wm=True, body_state="active",
-           session_stop_requested=False, foreign_session_stop=False,
-           harness=None):
+           session_stop_requested=False, foreign_session_stop=False):
     """Run the whole chain once. `mutate` edits stop-hook.sh before the run.
 
     `session_stop_requested` writes the SESSION-SCOPED sessions/<BODY_SID>/
@@ -345,7 +333,7 @@ def _drive(tmp_path, claimed_by_sid=BODY_SID, mutate=None, closing=True,
         hook.write_text(mutate(hook.read_text(encoding="utf-8")),
                         encoding="utf-8")
     with DaemonFixture(world) as df:
-        proc = _run_hook(root, df.runtime_dir, scrub_env=scrub_env, harness=harness)
+        proc = _run_hook(root, df.runtime_dir, scrub_env=scrub_env)
     return proc, shard, root
 
 

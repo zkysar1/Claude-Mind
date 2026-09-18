@@ -474,6 +474,19 @@ def utilization_of(rec, counters=None):
     live. Preferring the embedded copy would silently pin every converted
     consumer to stale counts while looking entirely correct.
 
+    THAT IS TRUE OF EVERY COUNTER EXCEPT `times_active`, WHICH HAS A SECOND
+    WRITER ON THE OTHER SURFACE (g-115-10078). `guardrail-check.py::_check_store`
+    increments `times_active` directly in the CONTENT record and never spools,
+    so after a record's first spool touch the two sides become INDEPENDENT
+    ACCUMULATORS over a shared, unrecorded seed. Measured 2026-09-18 on the live
+    corpus: guardrails embedded>sidecar 5758, equal 473, sidecar>embedded 215;
+    reasoning-bank 1534 / 5357 / 4. So BOTH surfaces understate the truth, the
+    disagreement runs in BOTH directions, and no read-side choice here — not a
+    flip, not a per-key merge, not `max()` — can recover the real count. Do NOT
+    special-case this counter in this function; the repair is at the writer.
+    Read `core/config/rationale/times-active-two-surface-split.md` first, and
+    treat any `times_active` you read from either side as a FLOOR.
+
     Returns {} rather than None when neither side has counters, so callers can
     `.get("times_helpful", 0)` without a None check — matching how the embedded
     field is read at the existing call sites.
@@ -482,7 +495,12 @@ def utilization_of(rec, counters=None):
     before "fixing" it. A sidecar entry carrying only the counter that was
     incremented would make every OTHER counter for that record read as zero,
     and `endpoints/utilization.py::_is_candidate` turns a false zero into a
-    RETIREMENT PROPOSAL (`_evidence(util) > 0` is what keeps a record). That
+    RETIREMENT PROPOSAL (`_attested_evidence(util) > 0` is what keeps a record —
+    corrected 2026-09-18, g-115-10078: this line read `_evidence` and that is a
+    DIFFERENT predicate. `_evidence` is the composite and includes
+    `times_active`; `_attested_evidence` is the retirement numerator and
+    deliberately excludes it, because it is a bulk text match with no agent
+    decision in the path. A goal was filed on the stale citation). That
     hazard is real, and it is answered at the WRITER, not here:
     `utilization-flush.py::_seed_from_content` seeds a first-touch entry from
     the record's embedded counters, and `apply_deltas` materialises every

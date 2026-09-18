@@ -153,3 +153,89 @@ def test_conflict_persists_returns_exit_6_no_clobber(tmp_path, monkeypatch):
     assert fake.writes == 2      # initial + one retry, then give up (bounded)
     # file untouched — no clobber, safety intact
     assert yaml.safe_load(p.read_text())[0]["status"] == "pending"
+
+
+class _NoWriteBackend:
+    """Delegates to a real backend but DISCARDS write_text — simulates a write
+    that is attempted and never reaches the store."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.writes = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def write_text(self, *a, **k):
+        self.writes += 1
+        return None
+
+
+def test_amend_records_supersession(tmp_path):
+    """--amend rewrites a terminal answer and PRESERVES the prior one."""
+    p = tmp_path / "pq.yaml"
+    _write(p, [{"id": "q1", "status": "answered", "answer": "OLD",
+                "answered_by": "prior", "resolved_at": "2026-09-01T00:00:00"}])
+    res, code = pqc.close_question("x", "q1", "zeta", "NEW", False, str(p),
+                                   amend=True)
+    assert code == 0
+    assert res["action"] == "amended"
+    assert res["verified"] is True
+    got = yaml.safe_load(p.read_text())[0]
+    assert got["answer"] == "NEW"
+    assert got["superseded_answers"][0]["answer"] == "OLD"  # never destroyed
+
+
+def test_amend_requires_rationale(tmp_path):
+    """--amend without a rationale is an input error that writes NOTHING."""
+    p = tmp_path / "pq.yaml"
+    _write(p, [{"id": "q1", "status": "answered", "answer": "OLD"}])
+    res, code = pqc.close_question("x", "q1", "zeta", "", False, str(p),
+                                   amend=True)
+    assert code == 2
+    assert res["action"] == "amend_needs_rationale"
+    assert yaml.safe_load(p.read_text())[0]["answer"] == "OLD"
+
+
+def test_amend_verify_rejects_unlanded_write(tmp_path, monkeypatch):
+    """REGRESSION (2026-09-17, zeta/cc-02): the amend verify must not be
+    satisfied by the status it INHERITED. `answered` is itself a TERMINAL
+    status, so on an amend the old predicate (`status == "answered"`) was
+    already true BEFORE the write — measured returning rc=0 / verified=True /
+    action=amended over a write that never landed, which is the very
+    "rc=0 is not evidence an amendment was recorded" hole --amend was added to
+    close. Verification now rests on post-write evidence (guard-6693: read a
+    pre-change field BACK rather than trusting it was written)."""
+    p = tmp_path / "pq.yaml"
+    _write(p, [{"id": "q1", "status": "answered", "answer": "OLD"}])
+    fake = _NoWriteBackend(pqc.get_backend())
+    monkeypatch.setattr(pqc, "get_backend", lambda: fake)
+    res, code = pqc.close_question("x", "q1", "zeta", "NEW", False, str(p),
+                                   amend=True)
+    assert fake.writes == 1            # the write WAS attempted
+    assert code == 5                   # wrote-but-verify-failed
+    assert res["verified"] is False
+    assert yaml.safe_load(p.read_text())[0]["answer"] == "OLD"  # never landed
+
+
+def test_amend_preserves_a_retired_disposition(tmp_path):
+    """An amend corrects the ANSWER, not the DISPOSITION.
+
+    `retired` is deliberately excluded from DISCHARGES_A_BLOCKER, so forcing
+    `answered` on amend would silently promote a retired question into the
+    blocker-discharging set — a side effect --amend never advertised. Found by
+    echo's fresh-eyes-code pass (msg-20260917-235252-echo-5713); measured live
+    2026-09-17 at 1 of 210 fleet records, so the exposure is real.
+    """
+    p = tmp_path / "pq.yaml"
+    _write(p, [{"id": "q1", "status": "retired", "answer": "OLD"}])
+    res, code = pqc.close_question("x", "q1", "zeta", "NEW", False, str(p),
+                                   amend=True)
+    assert code == 0
+    assert res["action"] == "amended"
+    assert res["status"] == "retired"     # reported disposition is unchanged
+    assert res["verified"] is True
+    got = yaml.safe_load(p.read_text())[0]
+    assert got["status"] == "retired"     # stored disposition is unchanged
+    assert got["answer"] == "NEW"         # the answer IS corrected
+    assert got["superseded_answers"][0]["status"] == "retired"

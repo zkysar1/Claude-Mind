@@ -101,6 +101,50 @@ _health_probe() {
     [ -n "$code" ] && [ "$code" != "000" ]
 }
 
+# _healthy_and_writable PORT — liveness AND write-path check in ONE request.
+#
+# Used at EVERY "the daemon is already running, exit 0" decision in this
+# script — the pre-lock fast path, the came-up-during-lock-wait re-probe, and
+# the in-lock recycle decision. All three are doors to the same verdict, and a
+# gate is only as broad as its entry points (guard-3448): fixing one would
+# leave a wedged daemon declared alive by the other two.
+#
+# : _health_probe above answers "did the daemon respond?" — and
+# that answered 200 in 0.2ms right through a total box-wide WM-write freeze.
+# A daemon can be perfectly responsive and structurally unable to write, and
+# the fast path below exits 0 on exactly that daemon, so the wedge class had
+# no recovery path at all: every caller was told "already running" and left.
+#
+# This reads the write-path verdict the daemon now reports FROM THE SAME
+# SINGLE REQUEST the fast path already made — no extra round trip, and the
+# verdict is process-memory only, so no store access is added either.
+#
+# Deliberately NOT folded into _health_probe: that one is also the
+# _kill_escalate wait loop's probe, where discarding the body and failing
+# fast is the correct behaviour. Liveness and readiness stay separate
+# questions with separate probes.
+#
+# FAIL-SAFE DIRECTION IS DELIBERATE: an ABSENT write_path_wedged field (a
+# daemon predating this change, or one whose diagnostic errored to null)
+# reads as NOT wedged, so behaviour is unchanged rather than restart-happy.
+# A wrong restart kills a daemon serving every agent on the box; a missed
+# wedge only leaves today's behaviour in place.
+_healthy_and_writable() {
+    local port="$1"
+    local body code
+    body="$(curl -s -w '\n%{http_code}' --max-time 2 \
+        "http://127.0.0.1:${port}/v1/admin/health" 2>/dev/null)"
+    code="${body##*$'\n'}"
+    [ -n "$code" ] && [ "$code" != "000" ] || return 1
+    if printf '%s' "$body" \
+        | grep -qE '"write_path_wedged"[[:space:]]*:[[:space:]]*true'; then
+        _log "daemon on port $port is RESPONSIVE BUT ITS WRITE PATH IS WEDGED — declining the already-running verdict so the recycle path can recover it (g-115-10019)"
+        _log "  verdict: $(printf '%s' "$body" | grep -oE '"write_path":[^}]*}' | head -1)"
+        return 1
+    fi
+    return 0
+}
+
 _read_pid() {
     [ -f "$PID_FILE" ] || return 1
     local pid
@@ -432,7 +476,7 @@ mkdir -p "$RT_DIR"
 existing_pid="$(_read_pid || echo "")"
 existing_port="$(_read_port || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
-   _health_probe "$existing_port" && \
+   _healthy_and_writable "$existing_port" && \
    [ "$FORCE_RESTART" != "1" ]; then
     _log "daemon already running (fast-path PID=$existing_pid, port=$existing_port)"
     exit 0
@@ -525,7 +569,7 @@ trap '_release_spawn_lock' EXIT
 existing_pid="$(_read_pid || echo "")"
 existing_port="$(_read_port || echo "")"
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ] && \
-   _health_probe "$existing_port" && \
+   _healthy_and_writable "$existing_port" && \
    [ "$FORCE_RESTART" != "1" ]; then
     _log "daemon came up during lock wait (PID=$existing_pid, port=$existing_port)"
     exit 0
@@ -545,7 +589,7 @@ existing_parent_pid="$(_read_parent_pid || echo "")"
 # false-negatives).
 need_recycle=0
 if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
-    if _health_probe "$existing_port"; then
+    if _healthy_and_writable "$existing_port"; then
         # Daemon is alive and responsive — verified by health probe,
         # regardless of what kill -0 says about the PID.
         if [ "$FORCE_RESTART" != "1" ]; then

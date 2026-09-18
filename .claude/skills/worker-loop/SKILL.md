@@ -816,10 +816,10 @@ FOR EACH tree-worthy domain fact this unit established (usually 0):
 #      spark_capture was handed. Second instance of the g-306-289 measurement
 #      (215 on cc-07), so this is the rule, not an outlier.
 #
-# DO NOT FLAG EVERYTHING. The cap holds when every entry is flagged (a cap a
-# writer can defeat is not a cap), so blanket-flagging preserves nothing: it
-# restores FIFO among the flagged and destroys the triage signal. ~1 of 6 is
-# healthy. The flag is honor-system; a mis-flag costs priority, nothing else.
+# DO NOT FLAG EVERYTHING. A cap a writer can defeat is not a cap: blanket-
+# flagging restores FIFO among the flagged and kills the triage signal. No
+# density target exists — a capped lane pins at 80% (the unflagged floor)
+# whatever writers do (g-115-10021). A mis-flag costs priority, nothing else.
 #
 # KNOWN COST, ACCEPTED (g-306-361): at saturation an honest UNFLAGGED append
 # destroys an unrecoverable peer, a flagged one a carried duplicate. Flag
@@ -1073,13 +1073,14 @@ sentence.
 | Case | Example | Ruling |
 |---|---|---|
 | **A. Preserves sanctioned scope** — a successor carrying the unfinished remainder of the goal you are closing | g-335-901 | **FILE.** Filing nothing DROPS work already discovered under work the reducer already approved. That is not a new agenda; it is the same one, unfinished. |
-| **B. New scope, observable by any Body** — a framework defect, a mislabelled field, a stale predicate | the agent-queue claim defect (g-306-238) | **DO NOT FILE. Relay** via `wm-append.sh spark_capture` **with `sq_trigger: "sq-013"`** and a filing-shaped observation (Phase 3.5), and post to the findings board if it is time-sensitive. The reducer's Worker Spark Replay runs the sq-013 handler over sq-013 relays and files the goal at its next iteration (2026-08-16); a relay WITHOUT that trigger reaches only the lesson handlers and never becomes work. Since the reducer's replay is the consumer, the relay costs time (measured 12.5h on g-306-238) — not the work. |
+| **B. New scope, observable by any Body** — a framework defect, a mislabelled field, a stale predicate | the agent-queue claim defect (g-306-238) | **DO NOT FILE. Relay** via `wm-append.sh spark_capture` **with `sq_trigger: "sq-013"`** and a filing-shaped observation (Phase 3.5), and post to the findings board if it is time-sensitive. The reducer's Worker Spark Replay runs the sq-013 handler over sq-013 relays and files the goal at its next iteration (2026-08-16); a relay WITHOUT that trigger reaches only the lesson handlers and never becomes work. The relay can cost the WORK, not just time (below). |
 | **C. New scope, MACHINE-LOCAL** — only observable from this box: its store, filesystem, process table, installed binaries, local git state | the `.history` wiring fix (g-115-644); `unzip` absent on this box (g-335-869) | **FILE.** No reducer and no partner can EVER observe a worker box's local state, so the relay is the ONLY channel and its loss is unrecoverable — nobody can rediscover what only this box can see. |
 
-Case B's cost is real but bounded and was measured: g-306-238 sat from 09:55 to
-22:26 (12.5h) waiting on a reducer. Case C's cost is unbounded — a dropped
-machine-local finding is not late, it is gone. That asymmetry is what splits B
-from C, and it is why "new scope" alone is the wrong discriminator.
+Case B's 12.5h bound (g-306-238) is FALSIFIED: re-measured 2026-09-18, the
+lane's last filing was g-115-9648 on 09-10 — 7d8h and zero filings, with six
+would-be owners pending (g-115-9921). A stalled replay costs the WORK. B/C
+splits on RECOVERABILITY, not delay: any Body can see a B finding again; a
+dropped machine-local one is not late, it is gone.
 
 Three obligations on any goal a worker files:
 

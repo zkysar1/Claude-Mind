@@ -141,3 +141,159 @@ def annotate_fixture_suspects(records):
         if isinstance(r, dict):
             r["fixture_suspect"] = fixture_suspect_reasons(r, dupes)
     return records
+
+
+# ── Ownership split () ────────────────────────────────────────────
+# WHY THIS LIVES BESIDE is_reflectable AND NOT IN EITHER CALLER. Three consumers
+# gate on "is there reflection work for ME": review-hypotheses Mode 2 (which
+# reflects), the iteration-close nudge (which asks), and 's string
+# precondition (which selects). They disagreed with guard-5623, which says the
+# owner is `resolved_by` and a live owner's records must be left alone: the
+# instrument counted every reflectable record, so the nudge fired on records the
+# agent had to abstain from, on every close, forever. That is the guard-1984
+# shape -- a guardrail cannot outvote the instrument it guards -- so the split
+# belongs in the instrument, beside the split it already owns.
+#
+# THE FILTER POINTS BOTH WAYS, AND THE SECOND HALF IS THE ONE THAT PRODUCES
+# WORK. Measured (echo, cc-03, 2026-09-15): an un-split count of 13 was read as
+# "all bravo's -> bravo is alive -> abstain" across at least two iterations
+# while echo itself owned THREE CORRECTED records in that same queue. The
+# cheapest reading of an un-split number is "someone else's", and nothing ever
+# contradicts it. So callers get `mine` BY ID, never just a total to subtract
+# from. A filter that only subtracts would have left the real debt untouched.
+#
+# SCOPE IS AN EXPLICIT REQUIRED PARAMETER (guard-2601). `self_agent` and
+# `liveness` are passed in; this module resolves neither. A predicate that read
+# MIND_AGENT itself would answer a different question than the caller asked the
+# moment any caller ran on behalf of another agent, and a silent always-"held"
+# is indistinguishable from a legitimate abstention. Required, never
+# optional-with-default -- a default is what lets a future caller re-open the
+# hole while still compiling.
+#
+# LIVENESS IS INJECTED, NOT PROBED. `liveness` maps agent-name -> verdict string
+# as `liveness-check.sh --agent X --json` reports it. Keeping the subprocess out
+# is what makes the four cases below unit-testable without a live fleet, and it
+# lets a caller probe N distinct owners once each instead of once per record
+# (the queue is dominated by a single owner, so that is ~1 probe, not ~13).
+#
+# UNKNOWN LIVENESS ABSTAINS. guard-5623 permits proceeding on
+# "dormant/retired/unknown-with-corroboration"; this module cannot see
+# corroboration, so an absent or unrecognised verdict classifies `held`. The
+# conservative direction is the one where the cost is a delayed reflection
+# rather than two conflicting ABC chains on one record, where the loser is
+# silent by construction.
+#
+# SELF IS DECIDED BEFORE ANY LIVENESS LOOKUP (guard-6259: never judge your own
+# liveness). `mine` short-circuits, so a self-probe is never even constructed.
+#
+# THE STRANDED-OWNER RULE, AND WHY IT IS AN AGE RULE RATHER THAN A DEADLOCK
+# BREAKER. The original framing argued a pure ownership filter hides a live
+# owner's records from everyone else FOREVER and therefore needs a deadlock
+# breaker. That absolute is FALSIFIED (alpha, cc-04, 2026-09-15): over the
+# resolved stage, 19 records were reflected in one day and the dominant owner
+# reflected TWO OF ITS OWN inside that window, so records are not frozen. What
+# the same measurement does show is a RATE problem -- n=2/day against a 13-deep
+# queue that owner created in 15h. So the breaker keys on AGE SINCE resolved_at,
+# not on a deadlock that does not exist.
+#
+# 72h is derived, not picked: the owner's own learn cadence () runs on a
+# 60h interval, so 72h is one full owner-cadence interval plus a 12h margin. A
+# record still unreflected at 72h has survived at least one firing of the
+# cadence that exists to drain it, which is the earliest point at which "the
+# owner is not getting to this" is evidence rather than impatience. Reclaiming
+# is announced (the caller posts), never silent -- guard-1072's mark-in-place
+# discipline applied to work rather than to records.
+
+OWNERSHIP_ACTIONABLE = frozenset({"mine", "unowned", "reclaimable"})
+RECLAIMABLE_VERDICTS = frozenset({"dormant", "retired"})
+STRANDED_HOURS = 72
+
+
+def ownership_of(rec, self_agent, liveness, now=None,
+                 stranded_hours=STRANDED_HOURS):
+    """Classify one resolved record's reflection ownership.
+
+    `self_agent` (str) and `liveness` (dict agent -> verdict) are REQUIRED --
+    see guard-2601 in the block above. `now` is injectable for tests.
+
+    Returns exactly one of:
+      "mine"        -- resolved_by is self_agent. Reflect it; it is your debt.
+      "unowned"     -- no resolved_by at all. Nobody can be racing a record
+                       nobody resolved, so it is actionable by whoever finds it.
+      "reclaimable" -- the owner is dormant or retired, OR is alive but the
+                       record has sat past `stranded_hours` since resolved_at.
+                       Reflect it AND announce the reclaim on the board.
+      "held"        -- another agent owns it and is alive (or its liveness is
+                       unknown/unrecognised). ABSTAIN -- guard-5623.
+    """
+    if not isinstance(rec, dict):
+        return "held"
+    owner = str(rec.get("resolved_by") or "").strip()
+    if not owner:
+        return "unowned"
+    if owner == str(self_agent or "").strip():
+        return "mine"
+    verdict = str((liveness or {}).get(owner) or "").strip().lower()
+    if verdict in RECLAIMABLE_VERDICTS:
+        return "reclaimable"
+    # Owner is alive, or its liveness is unknown. Only the age rule can free it.
+    if verdict == "alive":
+        import os
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _dt import parse_naive_iso
+        from datetime import datetime
+        resolved_at = parse_naive_iso(rec.get("resolved_at"))
+        if resolved_at is not None:
+            ref = now or datetime.now()
+            if (ref - resolved_at).total_seconds() >= stranded_hours * 3600:
+                return "reclaimable"
+    return "held"
+
+
+def split_by_owner(records, self_agent, liveness, now=None,
+                   stranded_hours=STRANDED_HOURS):
+    """Bucket REFLECTABLE records by ownership. Non-reflectable ones are dropped.
+
+    Returns a dict with per-bucket id lists, an `actionable` count (mine +
+    unowned + reclaimable), and `held_by` -- the per-owner tally of what was
+    abstained from, so a caller can report WHO it is waiting on rather than
+    just how many. Callers must report the abstain count separately from the
+    actionable one; an un-split total is the defect this module exists to fix.
+    """
+    out = {"mine": [], "unowned": [], "reclaimable": [], "held": [],
+           "held_by": {}, "actionable": 0, "reflectable_total": 0}
+    if not isinstance(records, list):
+        return out
+    for r in records:
+        if not is_reflectable(r):
+            continue
+        out["reflectable_total"] += 1
+        bucket = ownership_of(r, self_agent, liveness, now=now,
+                              stranded_hours=stranded_hours)
+        rid = (r or {}).get("id")
+        out[bucket].append(rid)
+        if bucket == "held":
+            owner = str((r or {}).get("resolved_by") or "").strip() or "?"
+            out["held_by"][owner] = out["held_by"].get(owner, 0) + 1
+    out["actionable"] = sum(len(out[b]) for b in ("mine", "unowned",
+                                                  "reclaimable"))
+    return out
+
+
+def owners_of(records):
+    """Distinct non-empty resolved_by values among REFLECTABLE records.
+
+    The caller probes liveness for exactly these, once each, and passes the
+    result back in as `liveness` -- N distinct owners, not N records.
+    """
+    if not isinstance(records, list):
+        return []
+    seen = []
+    for r in records:
+        if not is_reflectable(r):
+            continue
+        owner = str((r or {}).get("resolved_by") or "").strip()
+        if owner and owner not in seen:
+            seen.append(owner)
+    return seen

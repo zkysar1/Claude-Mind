@@ -267,6 +267,17 @@ Bash: MIND_AGENT=<agent> bash core/scripts/session-state-set.sh IDLE
 Bash: MIND_AGENT=<agent> bash core/scripts/session-signal-set.sh stop-loop
 # D3: Clear stop-requested
 Bash: MIND_AGENT=<agent> bash core/scripts/session-signal-clear.sh stop-requested
+# D3.5: Renew the runner lease BEFORE the long D4 (g-115-10040). D1 set IDLE and
+# heartbeat-tick.sh refuses to tick in IDLE, so nothing renews the lease from D1
+# on; a D4 past 3900 s loses it and every fenced agents/<agent>/** write then
+# fails no_claim (measured: a stop that produced NO handoff). runner-claim.sh
+# heartbeat is NOT heartbeat-tick.sh --bypass-state: not state-gated, and
+# token-conditional, so it can never steal a peer's claim. Its OWN call, no
+# precondition chained (guard-6424/409). FAIL-OPEN — never abort the stop.
+# Rationale (WHY this primitive, the measurement, the residual):
+#   core/config/rationale/graceful-stop-lease-renewal.md
+Bash: MIND_AGENT=<agent> bash core/scripts/runner-claim.sh heartbeat --agent <agent>
+IF rc != 0: Output: "[runner-claim] WARN: stop-time lease renewal failed (rc=<rc>) — D4's agent-dir writes may be fenced no_claim; re-run this exact renewal if so."
 # D4: Consolidation
 Bash: MIND_AGENT=<agent> bash core/scripts/consolidation-precheck.sh
 IF verdict == "FULL": invoke /aspirations-consolidate with: stop_mode = true

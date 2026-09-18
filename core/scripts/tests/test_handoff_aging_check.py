@@ -89,6 +89,8 @@ def _make_args(**overrides):
         # getattr defaults, so a caller omitting them still works.
         inbound_max_report=None,
         no_inbound=False,
+        #  lane-legality limb.
+        no_reroute=False,
     )
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -613,3 +615,199 @@ if __name__ == "__main__":
         _fn()
         print("PASS %s" % _fn.__name__)
     print("OK: 24/24 passed")
+
+
+# ---------------------------------------------------------------------------
+# Lane-legality limb ()
+# ---------------------------------------------------------------------------
+# The sweep's predicate was TIME ONLY, so a handoff addressed to an agent a
+# standing lane pin FORBIDS from claiming it aged forever. These cases pin the
+# verdict split and, above all, the ASYMMETRIC POSTURE: only a handoff the claim
+# gate would actually BLOCK is re-routed; ambiguous / unmatched / unknown are
+# left alone, because a false re-route steals a partner's legitimate work while
+# a false leave-alone is merely the status quo.
+#
+# guard-2903 governs how these are written. "The goal is LEFT ALONE" is an
+# INVARIANCE assertion and is green by default when broken: a blind comparator,
+# an intervention that silently no-opped, and a genuinely-untouched goal all
+# produce the same pass. So every leave-alone case below is paired with (a) a
+# SENSITIVITY control drawn from the SAME population (a confident out-of-lane
+# goal in the same run, which MUST be re-routed — if it is not, the limb no-opped
+# and the leave-alone proves nothing), (b) a DETERMINISM control (the same run
+# twice, identical), and (c) a POSITIVE assertion that the limb actually RAN
+# (registry_readable True and a real verdict per candidate), never inferred from
+# the absence of a re-route.
+
+_FIXTURE_REGISTRY = """
+## Standing Lane Pins
+
+| id | agent | pinned lane (what the agent DOES) | out of lane (what the agent must NOT select/claim) | granted | source | expires | review_by |
+|----|-------|-----------------------------------|---------------------------------------------------|---------|--------|---------|-----------|
+| pin-test | foxtrot | RUN ROBLOX WORLDS: no-player sessions, in-session verification, bridge relay fixes | ALL CODE work: client lua, server lua, framework scripts | 2026-08-06 | user directive | user directive only | 2026-11-04 |
+"""
+
+
+def _install_registry(mod, text=_FIXTURE_REGISTRY, world_dir="/fixture/world"):
+    """Feed the limb a known registry without touching the real world dir."""
+    mod._world_dir = lambda: world_dir
+    mod._registry_text = lambda wd: text
+
+
+def _lane_goal(goal_id, title, hours_ago=200.0, handoff_to="foxtrot"):
+    g = _make_handoff(goal_id, hours_ago=hours_ago, handoff_to=handoff_to)
+    g["title"] = title
+    g["description"] = title
+    g["category"] = ""
+    return g
+
+
+# The three population members, by how pin-test sees them.
+_OUT = ("g-lane-out", "Fix the client lua handler that drops NPC input")
+_BOTH = ("g-lane-both", "Repair the bridge relay and the client lua that calls it")
+_NEITHER = ("g-lane-neither", "Wire Emote action to emotional state so NPCs express feelings")
+
+
+def _run_lane(apply_=True, **overrides):
+    mod = _import_module()
+    _install_registry(mod, **{k: v for k, v in overrides.items()
+                              if k in ("text", "world_dir")})
+    _install_mock_goals(mod, [_lane_goal(*_OUT), _lane_goal(*_BOTH),
+                              _lane_goal(*_NEITHER)])
+    args = _make_args(apply=apply_, agent="alpha", no_board=True,
+                      **{k: v for k, v in overrides.items()
+                         if k not in ("text", "world_dir")})
+    return mod.run(args)
+
+
+def test_lane_limb_actually_ran_and_classified_every_candidate():
+    """Control (c): the intervention TOOK EFFECT, asserted on its own terms.
+
+    Without this, every leave-alone case below is satisfied by a limb that never
+    ran at all — the g-115-5226 shape, where a lane verdict of no-pin from an
+    unwired call is byte-identical to a real one.
+    """
+    r = _run_lane()
+    split = r["lane_split"]
+    assert split["registry_readable"] is True, (
+        "the limb did not read a registry, so every verdict below is vacuous: %r" % split)
+    assert r["candidate_count"] == 3, r["candidates"]
+    for c in r["candidates"]:
+        assert c["lane"]["verdict"] != "unknown", (
+            "candidate %s got no verdict — the limb degraded silently: %r"
+            % (c["goal_id"], c["lane"]))
+
+
+def test_confident_out_of_lane_is_rerouted():
+    """SENSITIVITY control for every leave-alone case: the comparator DOES fire."""
+    r = _run_lane()
+    ids = [x["goal_id"] for x in r["rerouted"]]
+    assert ids == [_OUT[0]], (
+        "the one handoff the claim gate would BLOCK must be re-routed; got %r "
+        "(if this is empty the limb no-opped and the leave-alone tests below "
+        "prove nothing — guard-2903)" % r["rerouted"])
+    assert r["lane_split"]["mis_routed"] == [_OUT[0]]
+    entry = r["rerouted"][0]
+    assert entry["pin_id"] == "pin-test"
+    assert entry["evidence"], "a confident block must name its out-of-lane evidence"
+
+
+def test_ambiguous_and_unmatched_are_left_alone():
+    """The asymmetric posture: matched BOTH columns, or NEITHER → do not re-route."""
+    r = _run_lane()
+    by = {c["goal_id"]: c for c in r["candidates"]}
+    assert by[_BOTH[0]]["lane"]["verdict"] == "ambiguous", by[_BOTH[0]]["lane"]
+    assert by[_NEITHER[0]]["lane"]["verdict"] == "unmatched", by[_NEITHER[0]]["lane"]
+    for gid in (_BOTH[0], _NEITHER[0]):
+        assert by[gid]["mis_routed"] is False
+        assert gid not in [x["goal_id"] for x in r["rerouted"]], (
+            "%s was re-routed on a non-confident verdict — a false re-route "
+            "steals a partner's legitimate work" % gid)
+
+
+def test_unmatched_is_not_reported_as_in_lane():
+    """`in-lane` with EMPTY evidence means the pin did not settle the goal.
+
+    lane_pin says "in-lane" there because allow-on-doubt is right at CLAIM time.
+    Carrying that word into a ROUTING report would convert "unknown" into
+    "legitimate" and hide exactly the population this goal exists to drain.
+    """
+    r = _run_lane()
+    by_verdict = r["lane_split"]["by_verdict"]
+    assert _NEITHER[0] in by_verdict.get("unmatched", []), by_verdict
+    assert _NEITHER[0] not in by_verdict.get("in-lane", []), (
+        "an unmatched goal was reported as in-lane — the silent-pass defect")
+
+
+def test_unreadable_registry_reroutes_nothing_and_says_so():
+    """A degraded run must be visibly degraded, never a clean all-clear."""
+    r = _run_lane(text=None)
+    assert r["lane_split"]["registry_readable"] is False
+    assert r["rerouted"] == [], "nothing may be re-routed without a registry"
+    for c in r["candidates"]:
+        assert c["lane"]["verdict"] == "unknown", c["lane"]
+        assert c["mis_routed"] is False
+
+
+def test_no_reroute_flag_suppresses_the_write_but_keeps_the_verdict():
+    """guard-6571: the escape hatch must not also blind the report."""
+    r = _run_lane(no_reroute=True)
+    assert r["rerouted"] == []
+    assert r["lane_split"]["mis_routed"] == [_OUT[0]], (
+        "--no-reroute must still COMPUTE and report the verdict; suppressing "
+        "the verdict too would hide the population")
+
+
+def test_lane_verdicts_are_deterministic():
+    """DETERMINISM control (guard-2903 (b)): same input twice, same verdicts.
+
+    Without it a green run is noise-luck and any future red is unattributable.
+    """
+    a = _run_lane(apply_=False)
+    b = _run_lane(apply_=False)
+    va = {c["goal_id"]: c["lane"]["verdict"] for c in a["candidates"]}
+    vb = {c["goal_id"]: c["lane"]["verdict"] for c in b["candidates"]}
+    assert va == vb, (va, vb)
+    assert len(set(va.values())) > 1, (
+        "all three fixtures resolved to ONE verdict, so the comparator is blind "
+        "and the determinism pass is meaningless: %r" % va)
+
+
+# --------------------------------------------------- empty-registry degrade --
+
+def _write_registry(tmp_path, body):
+    """Materialise a world dir whose lane-pin registry holds `body`."""
+    from gates import lane_pin as _lp
+    p = tmp_path / _lp.REGISTRY_RELPATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def test_empty_registry_degrades_to_unreadable(tmp_path):
+    """An EMPTY read is a DEGRADED read, not a registry with no pins.
+
+    The try/except in _registry_text catches an unreadable file, but a file
+    that reads as "" sails through it. Handed "" instead of None, lane_pin
+    returns verdict="no-pin" -- byte-identical to "this agent has no pin" --
+    while _lane_split reports registry_readable TRUE, so a truncated registry
+    becomes a confident all-clear declaring every aged handoff legitimate.
+    That is the g-115-5226 silent-pass defect one step in. Measured on this
+    fleet, not hypothetical: rb-2970 records reads transiently returning
+    EMPTY on the S3-backed own-cloud mount while a file settles.
+    """
+    mod = _import_module()
+    for body in ("", "   \n\t\n  "):
+        got = mod._registry_text(_write_registry(tmp_path, body))
+        assert got is None, "empty registry %r read as readable: %r" % (body, got)
+
+
+def test_nonempty_registry_still_reads(tmp_path):
+    """POSITIVE CONTROL for the guard above.
+
+    A guard that returned None unconditionally would satisfy the test above
+    and silently blind the whole limb -- every verdict "unknown", nothing ever
+    re-routed, and the sweep reporting itself permanently degraded.
+    """
+    mod = _import_module()
+    body = "# capability-routing\n\npin-001 | foxtrot | out-of-lane: client Lua\n"
+    assert mod._registry_text(_write_registry(tmp_path, body)) == body

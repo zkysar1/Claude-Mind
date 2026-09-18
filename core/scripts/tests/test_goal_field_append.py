@@ -104,6 +104,55 @@ def test_compose_sentinel_is_marker_specific():
     assert GFA.sentinel_for("marker-b") not in out, "a different marker must not read as already-appended"
 
 
+# ── 1b. wrapped_marker_refusal — the double-wrap guard () ──────────
+#
+# The script owns the wrapping, but the convention is only ever VISIBLE in its
+# wrapped form (inside a record), so callers reasonably pass the wrapped form
+# back. That wrote `[appended:[appended:m]]` at rc=0 and broke the idempotency
+# key: a retry with the BARE form finds its own sentinel and refuses, while a
+# retry with the malformed form appends again.
+
+def test_an_already_wrapped_marker_is_refused():
+    msg = GFA.wrapped_marker_refusal("[appended:g-001-739-residual-bucket]")
+    assert msg is not None, "the wrapped form must be refused, not silently double-wrapped"
+    assert "g-001-739-residual-bucket" in msg, "the refusal must name the BARE token to use"
+
+
+def test_a_wrapped_marker_missing_its_closing_bracket_is_still_refused():
+    # The prefix is what identifies the shape; a truncated paste is still a paste.
+    msg = GFA.wrapped_marker_refusal("[appended:half")
+    assert msg is not None
+    assert "'half'" in msg
+
+
+def test_an_ordinary_marker_is_not_refused():
+    """ANTI-VACUITY for the two above: the guard must not refuse everything."""
+    assert GFA.wrapped_marker_refusal("g-001-847-double-wrap") is None
+
+
+def test_a_marker_that_merely_CONTAINS_appended_is_not_refused():
+    """The must-not-refuse case (guard-1106: test what an exclusion NEWLY excludes).
+
+    A new refusal is only safe if it is narrower than it looks. These markers all
+    carry the word — one even carries the full sentinel — but not as the PREFIX,
+    so none of them is the paste this guard exists to catch.
+    """
+    for ok in (
+        "appended-note",                     # starts with the word, not the sentinel
+        "g-001-847-appended-twice",          # contains it mid-token
+        "note-[appended:inner]",             # contains the sentinel, but not at position 0
+        "[appendedx:m]",                     # near-miss prefix
+    ):
+        assert GFA.wrapped_marker_refusal(ok) is None, f"{ok!r} must NOT be refused"
+
+
+def test_the_refusal_prefix_is_the_one_sentinel_for_uses():
+    """The two must not drift: a refusal keyed on a different literal than the
+    wrapper writes would refuse the wrong shape and miss the real one."""
+    assert GFA.sentinel_for("m").startswith(GFA.SENTINEL_PREFIX)
+    assert GFA.wrapped_marker_refusal(GFA.sentinel_for("m")) is not None
+
+
 # ── 2. verify_post — the sig-40 property ────────────────────────────────────
 
 def test_verify_post_clean_write_has_no_problems():

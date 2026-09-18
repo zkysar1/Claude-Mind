@@ -25,7 +25,24 @@ CLAIM_RE = re.compile(
     r'(?P<claim>'
     r'\b\d[\d,]*\s*(?:of|/|out of)\s*\d[\d,]*\b'      # N of M
     r'|\b\d[\d,]*(?:\.\d+)?\s*%'                       # percentages
-    r'|\b\d[\d,]*(?:\.\d+)?\s*(?:B|KB|MB|bytes|tokens|records|goals|files|scripts|lines|rows|entries)\b'
+    r'|\b\d[\d,]*(?:\.\d+)?\s*'
+    r'(?:B|KB|MB|bytes|tokens|records|goals|files|scripts|lines|rows|entries'
+    # TIME UNITS (). Their absence made this check structurally blind on the
+    # class whose premises decay fastest: both cargo-cult-detector escalation templates
+    # state their premises in HOURS, as does every recurring-starvation Unblock. Measured
+    # over 154 non-terminal goals: +449 claims, and 90 of 154 (58.4%) gain at least one.
+    # All 273 newly-admitted distinct strings were read, not just shape-checked; none is
+    # a non-duration.
+    # BARE `d` IS DELIBERATELY EXCLUDED and must not be added back. It is a HEX DIGIT, so
+    # `\d+d` matches inside UUIDs and short shas, and the corpus carries live instances:
+    # `456d` from an SES messageId (...-68cc-456d-9cc7-...) and `658385d` from a git sha
+    # (`Lodestar-Web-App @ 658385d`). Both are duration-SHAPED, so a shape check reports
+    # them clean — only reading their context separates them. `h` is not a hex character
+    # and cannot occur in either id form, which is why the hour units are safe by
+    # construction rather than merely by measurement. Bare `m`/`min` stay out too: a bare
+    # `\d+\s*m` matches ordinary prose.
+    r'|h|hr|hrs|hour|hours|day|days|week|weeks'
+    r')\b'
     r')', re.I)
 # A file path the goal names, so git can be asked whether it moved since filing.
 PATH_RE = re.compile(r'\b(?:core|world|meta|agents|mind_api|\.claude)/[\w./-]+\.\w{1,5}\b')
