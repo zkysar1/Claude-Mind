@@ -1037,3 +1037,108 @@ def test_detector_section_is_not_gated_on_a_populated_batch(tmp_path):
     # which is how the first draft of this test failed against good code.
     assert "\n    _section = _compose_detector_section" in compose, \
         "the section must be composed unconditionally, not gated on batch"
+
+
+# ── : every rendered ask is complete, or says what was withheld ──
+
+
+def test_human_blocked_defer_is_rendered_as_the_needs_line(tmp_path):
+    """The second-leg population's ask lives in defer_reason — render it.
+
+    Since g-115-9894 this digest also lists goals whose ONLY human marker is a
+    live `human_blocked:` defer. Those carry no `user_leg_scope`, so every one
+    of them rendered "NEEDS FROM YOU: not recorded on this goal" — measured
+    2026-09-15, 9 of 26 scanned goals. That sentence is FALSE for this
+    population: the ask IS recorded, one field away, and this script referenced
+    `defer_reason` nowhere.
+
+    Asserting on the ASK TEXT reaching the body, not on the label: the label is
+    wording and may be reworded, while "the owner can read what he is needed
+    for" is the property (guard-355).
+    """
+    mod = _load_module()
+    goal = _goal("g-hb", 100)
+    goal.pop("user_leg_scope", None)
+    goal["defer_reason"] = ("human_blocked: the prod API key VALUE must be "
+                            "supplied by the account owner")
+    body = mod._compose_digest_body(
+        [({"aspiration_id": "asp-1"}, goal, 100.0, "blocked_since")], 48.0)
+
+    assert "the prod API key VALUE must be supplied" in body, \
+        "the human_blocked ask never reached the body"
+    assert "not recorded on this goal" not in body, \
+        "rendered the ask AND still claimed nothing was recorded"
+
+
+def test_recorded_user_leg_scope_still_wins_over_the_defer_text(tmp_path):
+    """The defer fallback must not displace the field that already answered.
+
+    `user_leg_scope` is the purpose-built answer and is short by construction;
+    the defer text is prose. A goal carrying both must keep rendering the
+    field, or this fix would regress the population it was not about.
+    """
+    mod = _load_module()
+    goal = _goal("g-both", 100)
+    goal["user_leg_scope"] = "credential-grant"
+    goal["defer_reason"] = "human_blocked: some much longer prose ask"
+    body = mod._compose_digest_body(
+        [({"aspiration_id": "asp-1"}, goal, 100.0, "blocked_since")], 48.0)
+
+    assert "NEEDS FROM YOU: credential-grant" in body
+    assert "some much longer prose ask" not in body, \
+        "the defer fallback fired even though user_leg_scope was recorded"
+
+
+def test_digest_ships_when_the_human_blocked_defer_carries_a_marker(tmp_path):
+    """A defer whose own prose has a universal marker must not wedge the lane.
+
+    Same failure mode as the description case (g-115-4594) through a new door:
+    defer text is agent-written prose, delivery is ONE digest per batch, and no
+    cooldown is recorded on failure — so a single marker would refuse the only
+    agent-to-human escalation path for EVERY eligible goal, identically, every
+    sweep. Pinned END-TO-END against the REAL gate rather than by asserting the
+    `> ` character, because a refactor can keep the prefix and still break the
+    exemption (guard-355).
+    """
+    mod = _load_module()
+    goal = _goal("g-hb-marked", 100)
+    goal.pop("user_leg_scope", None)
+    goal["defer_reason"] = ("human_blocked: this approval is permanently "
+                            "required and always blocks every downstream run")
+    body = mod._compose_digest_body(
+        [({"aspiration_id": "asp-1"}, goal, 100.0, "blocked_since")], 48.0)
+
+    gate = SCRIPT_DIR / "finding-disproof-gate.py"
+    run = subprocess.run([sys.executable, str(gate), "--claim", body,
+                          "--fenced-quotes", "--json"],
+                         capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, (
+        "the real disproof gate refused a digest quoting a human_blocked defer "
+        "— this wedges the whole escalation lane:\n%s%s"
+        % (run.stdout, run.stderr))
+
+
+def test_withheld_text_notice_names_a_retrieval_the_reader_can_perform(tmp_path):
+    """A clip notice must offer the email reader a way back to the full ask.
+
+    The notice used to read "read the full goal by id above" — an instruction
+    to query a JSONL store the owner has no access to and no reason to learn.
+    For its actual reader that reported a loss and offered no way to undo it.
+    The footer's reply-to-close contract already makes this email the
+    interface, so the recoverable route is the one the reader is holding.
+
+    This does NOT assert the budget — outcome 4 of g-115-9895 forbids raising
+    it as the remedy, and a test that pinned a number would invite exactly
+    that edit.
+    """
+    mod = _load_module()
+    goal = _goal("g-long", 100)
+    goal["description"] = "x" * 5000
+    body = mod._compose_digest_body(
+        [({"aspiration_id": "asp-1"}, goal, 100.0, "blocked_since")], 48.0)
+
+    assert "characters withheld" in body, "no withheld-text notice rendered"
+    assert "Reply asking for the full text of g-long" in body, \
+        "the notice does not name a retrieval the email's reader can perform"
+    assert "read the full goal by id" not in body, \
+        "still instructing the owner to query the goal store"

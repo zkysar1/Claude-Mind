@@ -1929,6 +1929,63 @@ def locked_append_jsonl(path, item):
         release_lock(lock_path)
 
 
+def locked_append_jsonl_many(path, items):
+    """Append N records under ONE lock, ONE backend write, ONE changelog entry.
+
+    THE SIBLING TO READ FIRST IS guard-5469: locked_append_jsonl takes ONE
+    record and does NOT validate, so passing it a list serialises the whole
+    list as a single JSON array on a single line — valid JSON, wrong shape, no
+    error, and every per-record consumer then mis-handles it (the measured case
+    crashed the FLEET MERGE, not just the writer). This function exists so that
+    "append N records" has a correct route that cannot be confused with that
+    one: it hands the LIST to the backend's append_jsonl_records, which writes
+    N newline-terminated lines.
+
+    WHY IT IS WORTH A PRIMITIVE RATHER THAN A LOOP. Under a whole-object-PUT
+    backend (own-cloud/S3) the singular append re-PUTs the ENTIRE object per
+    record, so N appends cost N full PUTs of a growing file — O(N^2) bytes
+    (guard-6134, guard-6904). Looping the singular form is exactly the defect.
+    Batching divides the PUT COUNT by N and leaves the PUT SIZE growing with
+    the file, so it is a discount, not a bound (guard-6904): what caps the
+    OBJECT is a separate question this primitive does not answer.
+
+    ALL-OR-NOTHING BY CONSTRUCTION: one backend call either lands or raises, so
+    there is no partial-append state for a caller to unwind. Callers that must
+    keep their rows on failure (archive-before-delete) get that for free.
+
+    No tmp+rename dance is hand-written here (guard-472) — like its singular
+    sibling this delegates the write to the active backend, which owns the
+    atomic-write policy. Empty `items` is a no-op: no lock churn, no changelog.
+    """
+    if path is None:
+        raise RuntimeError(
+            "locked_append_jsonl_many: path is None — likely WORLD_DIR/META_DIR "
+            "unresolved (no MIND_WORLD/MIND_META env, no conf entry).")
+    items = list(items)
+    if not items:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base_dir = resolve_base_dir(path)
+    lock_path = path.with_suffix(".lock")
+    # : validate BEFORE acquiring the lock — every item, not just the
+    # first, or one bad row poisons the batch after the lock is held.
+    for it in items:
+        _validate_no_surrogates(it, path)
+    acquire_lock(lock_path)
+    try:
+        agent = _agent_name()
+        if base_dir:
+            save_history(path, base_dir, agent)
+        _rmw_with_conflict_retry(
+            path, lambda: get_backend().append_jsonl_records(path, items))
+        if base_dir:
+            append_changelog(base_dir, agent, path, "edit",
+                             lines_changed=len(items))
+    finally:
+        release_lock(lock_path)
+
+
 # ---------------------------------------------------------------------------
 # Atomic Read-Modify-Write for JSONL (g-280-* concurrency hardening)
 # ---------------------------------------------------------------------------

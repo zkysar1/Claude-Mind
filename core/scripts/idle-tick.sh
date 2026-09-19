@@ -87,15 +87,12 @@ fi
 # Mandatory: interruptible-sleep.sh (not plain `sleep`). The 1s-granularity
 # stop-signal check lets /stop respond within seconds instead of waiting for
 # a 30-minute plain sleep to exit.
-# Harness branch ( +  leg c): "the harness notifies you" is a
-# Claude Code fact, and so is "one backgrounded call at the FULL duration". Both
-# were hardcoded below with the hint appended, which CONTRADICTED them on every
-# capped harness (zakcode and unknown are both capped AND no-notify). The whole
-# yield block is now keyed on the harness by its one owner,
-# _harness_caps.sleep_directive, reached from shell through the same wrapper the
-# --hint call used. Uncapped+notifying output is byte-identical to before.
-SLEEP_DIRECTIVE="$(bash "$CORE_ROOT/scripts/harness-capabilities.sh" \
-  --sleep-directive "$SLEEP_DURATION" "$AGENT_NAME" QUIESCENCE_SLEEP=1 2>/dev/null)"
+# The yield block has ONE owner (_sleep_directive.py, guard-2485) and ONE text on
+# every harness: each harness the loop runs on reports a background job's exit
+# (Claude Code natively; Zak Code since ADR-0191), so the block is never keyed on
+# which harness fired this tick (loop-terminal-protocol.md §4.2).
+SLEEP_DIRECTIVE="$(bash "$CORE_ROOT/scripts/sleep-directive.sh" \
+  "$SLEEP_DURATION" "$AGENT_NAME" QUIESCENCE_SLEEP=1 2>/dev/null)"
 cat <<EOF
 === IDLE TICK ===
 Blocked-sleep timer active: ${REMAINING}s remaining (wake at ${VAL}).

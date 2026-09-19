@@ -31,6 +31,8 @@
 # Modes:
 #   (default)     Scan STAGED content. This is Gate 8 of the pre-commit chain.
 #   --scan-head   Scan COMMITTED content at HEAD. Audit mode, not a gate.
+#   --scan-untracked  Scan the GITIGNORED surface (agents/*/temp/) by name/size
+#                 SHAPE only — never content. Audit mode, not a gate.
 #
 # WHY --scan-head EXISTS (g-306-105, 2026-08-01). The default mode is
 # DIFF-SCOPED: it reads the staged index and never inspects what is already
@@ -71,15 +73,106 @@ cd "$REPO"
 # and must not be able to short-circuit the audit mode (see header).
 MODE="staged"
 case "${1:-}" in
-    --scan-head) MODE="head" ;;
+    --scan-head)      MODE="head" ;;
+    --scan-untracked) MODE="untracked" ;;
     -h|--help)
         sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
         exit 0 ;;
     "") : ;;
     *)
-        echo "[secret-scanner] unknown argument: $1 (expected --scan-head or no argument)" >&2
+        echo "[secret-scanner] unknown argument: $1 (expected --scan-head, --scan-untracked, or no argument)" >&2
         exit 2 ;;
 esac
+
+# ─── --scan-untracked: the GITIGNORED surface (g-115-9947) ────────────────
+# SELF-CONTAINED AND EXITS HERE, DELIBERATELY. Everything below this block
+# reads file CONTENT (git grep over blobs). This mode MUST NOT, and keeping it
+# above the patterns/override/report machinery is what makes that checkable by
+# reading rather than by trusting: the branch runs `find -printf` and nothing
+# else, so there is no code path from here to a byte of any scanned file.
+#
+# WHY IT EXISTS. `--scan-head` and the staged gate both scan the GIT-TRACKED
+# surface. `agents/*/temp/` is gitignored in its entirety (.gitignore
+# `agents/*/temp/*`, guard-872), so both are STRUCTURALLY BLIND to it and report
+# clean forever regardless of what sits there. Independently,
+# temp-drain-purge.sh Lane 0 EXEMPTS dotfiles from purge — correctly, since the
+# exemption protects the tracked .gitkeep and the live cadence sentinels. Two
+# correct mechanisms, and nothing in between looks at untracked
+# credential-shaped residue (the guard-1802 narrow-predicate shape, at fleet
+# scale).
+#
+# WHY NAME-SHAPE AND NOT SIZE. Measured (echo, cc-03, 2026-09-18): the two
+# instances on the record are 342 B (.tok, bearer-token shape) and 20 B (.ea-pw,
+# password shape) — and 20 B is ALSO the exact width of six benign ISO-8601
+# cadence stamps on that same box. Any detector keyed on size alone must either
+# miss .ea-pw or flag every cadence stamp on every box. The NAME is what
+# separated them in a live population.
+#
+# WHY NOT A PURGE. The live dotfile population is working cadence state that
+# running machinery reads; deleting it breaks cadence, and draining it writes
+# scratch into the tree. This mode REPORTS. Disposition stays a human-or-agent
+# decision per file.
+#
+# Exit 0 = no credential-shaped residue. Exit 1 = hits (audit mode, like
+# --scan-head — never a commit gate). ALLOW_SECRETS_IN_COMMIT does not apply.
+if [[ "$MODE" == "untracked" ]]; then
+    # Name shapes that indicate a credential. Anchored on word-ish boundaries so
+    # `.last-selector-path` does not match on "sel" and `.fe-ts` does not match
+    # on "ts". Extend this list rather than loosening it: a loose pattern here
+    # flags every cadence sentinel and the report stops being read.
+    cred_name='(^|[.._-])(tok|tok2|token|pw|passwd|password|secret|secrets|cred|creds|credential|key|apikey|api_key|auth|bearer|session|cookie|jwt|pem|p12|pfx)([._-]|$)'
+    hits=0
+    scanned=0
+    report=""
+    while IFS='|' read -r path size mode mtime; do
+        [[ -z "$path" ]] && continue
+        scanned=$((scanned + 1))
+        base="${path##*/}"
+        # .gitkeep is TRACKED and is the Lane 0 exemption's own reason to exist.
+        [[ "$base" == ".gitkeep" ]] && continue
+        if printf '%s' "$base" | grep -qiE "$cred_name"; then
+            if [[ "$size" -eq 0 ]]; then
+                verdict="EMPTY-CRED-NAME"
+                reason="credential-shaped NAME but ZERO bytes — holds nothing; safe to remove, and removing it stops it generating this finding forever"
+            else
+                verdict="CRED-SHAPED"
+                reason="credential-shaped name at ${size}B — route through the secrets path (core/config/conventions/secrets.md); do NOT read, echo, or copy the value"
+            fi
+            hits=$((hits + 1))
+            report+="  ${verdict} ${path}|${size}B|mode ${mode}|mtime ${mtime}"$'
+'
+            report+="      ${reason}"$'
+'
+        fi
+    done < <(find agents/*/temp -maxdepth 1 -name '.*' -type f                   -printf '%p|%s|%m|%TY-%Tm-%Td
+' 2>/dev/null | sort)
+
+    # ANTI-VACUITY. "no credential-shaped residue" is satisfied perfectly by a
+    # scan that enumerated NOTHING — a moved temp root, a renamed agents dir, or
+    # a find that errored all produce the identical clean exit. A population of
+    # zero is a BROKEN SCAN here, not a clean one (guard-2298).
+    if [[ "$scanned" -eq 0 ]]; then
+        echo "[secret-scanner] --scan-untracked FOUND NO FILES AT ALL under agents/*/temp/." >&2
+        echo "  That is a broken scan, not a clean one: every agent dir carries a tracked" >&2
+        echo "  .gitkeep, so a live tree always enumerates at least one file. Check the" >&2
+        echo "  temp root and AGENTS_PARENT_DIR before reading this as an all-clear." >&2
+        exit 2
+    fi
+
+    if [[ "$hits" -eq 0 ]]; then
+        echo "[secret-scanner] --scan-untracked CLEAN: ${scanned} dotfile(s) under agents/*/temp/, none credential-shaped by name."
+        exit 0
+    fi
+
+    echo "[secret-scanner] --scan-untracked: ${hits} credential-shaped of ${scanned} dotfile(s) under agents/*/temp/"
+    printf '%s' "$report"
+    echo "  NOTE: metadata only — this mode reads no file content, by construction."
+    echo "  NOTE: this box's view only. agents/<agent>/temp/ is nominally fleet-synced"
+    echo "        (guard-3422) but the synced view is NOT uniform per box (measured"
+    echo "        g-115-9947): a file present here can be absent on a peer and vice"
+    echo "        versa, so a clean run HERE does not clear the fleet."
+    exit 1
+fi
 
 # ─── Override path (audited) ──────────────────────────────────────────────
 if [[ -n "${ALLOW_SECRETS_IN_COMMIT:-}" && "$MODE" == "staged" ]]; then

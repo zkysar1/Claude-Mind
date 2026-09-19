@@ -35,10 +35,41 @@ So the discrimination moved into `classify_close_path()` and the prose shrank.
 | 5 | **Interrupted recurring close** whose RECORD LIES | a LONE `complete-by` with nothing after it | FINDING (guard-3511) |
 | 6 | **Hypothesis-resolution close** | `complete-by` then `outcome_class` seconds apart; NO claim row in the goal's entire lifetime | **CREDIT** — work happened, so the absent bump is a real accounting gap |
 | 7 | **Finding-disposition close at iteration open** — a precheck finding whose correct disposition IS closing the subject goal (premise cleared / moot) | **identical to (3)**: a lone `update-goal <id> status`, no `complete-by` | **EXCLUDE** in principle — the closer executed no iteration — but see below: it is NOT separable, so it reports as (3) |
+| 8 | **Lock-contention retry out of band** — the close's status flip failed on a peer `aspirations.lock`, and the retry went through a bare `aspirations-complete-by.sh` instead of back through `iteration-close.sh --phase verify` | `outcome_class` **BEFORE** `complete-by` (reversed vs 1/4/6), same-agent claim present | FINDING — genuine skip; repair per g-115-8289 |
 
 Causes 4 and 6 produce a **byte-identical** fingerprint, which is why the
 classifier keys on `sanctioned path that executed no iteration` and then splits
 EXCLUDE from CREDIT on the claim history — never on drain-ness.
+
+## guard-2523's REPAIR defeats guard-2523's DETECT
+
+Cause 8 is the one shape that **erases its own evidence**, and the eraser is a
+guardrail's own prescribed remedy — so it is worth stating separately from the row.
+
+guard-2523 DETECTs a skipped verify as *null `outcome_class` on a completed
+non-recurring goal*, and REPAIRs it with a hand-written
+`aspirations-update-goal.sh <g> outcome_class <deep|routine>`. Once that repair has
+been applied, the goal presents as a **healthy close** to that same detector: the
+field it keys on is now populated, by hand, and nothing on the record says by whom.
+The repair is correct and still worth doing — but it buys the field at the cost of
+the signal, so after it there is no record-derived way to tell a repaired skip from
+a close that never skipped.
+
+Only the changelog ORDER survives it. A close that ran writes `complete-by` first
+and `outcome_class` seconds later (rows 1/4/6); a repaired skip can write
+`outcome_class` **first**. Measured: `g-115-10132` (bravo, cc-05, 2026-09-18) —
+`outcome_class` 12:00:24, `complete-by` 12:01:45, 81s apart, same-agent claim
+throughout, `--phase state-update` never run. Two `complete-by` attempts had already
+failed on a peer lock (`write_failed: Could not acquire lock`), and the retry was
+issued as a bare `complete-by` rather than re-entering `iteration-close.sh --phase
+verify` — which is precisely what guard-2523 forbids, committed by an agent that
+had the guardrail's own repair recipe in hand.
+
+**Practical consequence for a triager:** do not read a populated `outcome_class` as
+proof the close sequence ran. It is proof only that *something* wrote the field.
+And for a closer: when a status flip fails on lock contention, retry through
+`iteration-close.sh --phase verify`, never through the bare script — the lock is
+transient, the dropped state-update leg is not.
 
 Cause 7 is the harder one, and it is listed to be *recognised by a reader*, not
 classified: it shares cause 3's fingerprint exactly. A bare-status close is a

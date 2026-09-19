@@ -120,7 +120,20 @@ def collect(world, meta):
                     n_rec += 1
                     rid = rec.get("id")
                     if isinstance(rid, str):
-                        occ.setdefault(rid, _snippet(rec))
+                        snip = _snippet(rec)
+                        # Only a record carrying TEXT can describe what an id
+                        # now MEANS. A text-less row must not win the slot: a
+                        # `*-utilization` sidecar sorts BEFORE its content
+                        # store ("-" < "."), so first-wins locked in "" and
+                        # every displaced id owning a utilization row scored
+                        # _sim()==0.0 -> UNRELATED. Measured 2026-09-19: 70 of
+                        # 76 ids and 4633 of 4669 reported stale citations
+                        # were phantom (). An id with no textful
+                        # record anywhere now reads DANGLING, which is what it
+                        # is. The positive control below does NOT cover this:
+                        # it validates the citation regex, not occupancy.
+                        if snip:
+                            occ.setdefault(rid, snip)
                     df = rec.get("displaced_from")
                     if isinstance(df, str) and df and isinstance(rid, str):
                         pairs.append({"old": df, "new": rid,

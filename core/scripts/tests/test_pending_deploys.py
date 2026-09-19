@@ -131,7 +131,12 @@ def _setup_mind_repo(tmp: Path, agent="zeta") -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (repo / ".claude").mkdir()
-    for fname in ("deploy-detect-hook.sh", "pending-deploys.py", "_paths.sh"):
+    # _repo_slug.sh is a REAL dependency of deploy-detect-hook.sh ().
+    # Omitting it does not fail loudly: the hook sources it `|| exit 0` by its
+    # fail-open contract (guard-141), so the whole fixture just silently stops
+    # registering obligations and every assertion reads "no obligation" (guard-4420).
+    for fname in ("deploy-detect-hook.sh", "pending-deploys.py", "_paths.sh",
+                  "_repo_slug.sh"):
         dst = core_scripts / fname
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)

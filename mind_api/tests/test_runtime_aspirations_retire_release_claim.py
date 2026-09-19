@@ -1000,7 +1000,15 @@ def _seed_colliding_agent_copy(project_root: Path, goal_id="g-001-01"):
 
 
 def test_claim_collision_returns_409(running_daemon):
-    """Same id in both queues, claimed as source=world -> 409 goal_id_collision."""
+    """Same id in both queues, claimed with NO queue named -> 409 goal_id_collision.
+
+    Until 2026-09-18 this test posted an explicit source=world and expected the
+    409. That pinned the defect rather than the contract: "world" is also the
+    endpoint's DEFAULT, so the refusal could not tell a caller who named the
+    world queue from one who named nothing, and the body's own advice
+    ("&source=world claims the world copy") was a call the endpoint refused.
+    The 409 belongs to the UNNAMED call only; the named calls are pinned below.
+    """
     project_root, port = running_daemon
     world = project_root / "world"
     _seed_aspiration(world, _make_asp_with_unclaimed_goal())
@@ -1008,7 +1016,7 @@ def test_claim_collision_returns_409(running_daemon):
 
     status, body = _post(port, "/v1/aspirations/claim",
                          {"id": "g-001-01", "agent": "alpha",
-                          "sid": CLAIMER_SID, "source": "world"})
+                          "sid": CLAIMER_SID})
     assert status == 409, f"expected 409, got {status}: {body}"
     assert json.loads(body)["error"] == "goal_id_collision"
 
@@ -1032,7 +1040,7 @@ def test_claim_collision_body_does_not_advise_skipping_the_claim(running_daemon)
 
     status, body = _post(port, "/v1/aspirations/claim",
                          {"id": "g-001-01", "agent": "alpha",
-                          "sid": CLAIMER_SID, "source": "world"})
+                          "sid": CLAIMER_SID})
     assert status == 409
     detail = json.loads(body).get("detail", "")
 
@@ -1047,3 +1055,77 @@ def test_claim_collision_body_does_not_advise_skipping_the_claim(running_daemon)
     # next step is why the stale advice was followed in the first place.
     assert "source=agent" in lowered, (
         "the 409 body must name the queue-explicit re-issue; got %r" % detail)
+
+
+def _agent_queue_goal(project_root: Path):
+    queue = project_root / "agents" / "alpha" / "aspirations.jsonl"
+    return _read_jsonl(queue)[0]["goals"][0]
+
+
+def test_claim_collision_named_world_source_claims_the_world_copy(running_daemon):
+    """A caller who NAMES source=world on a colliding id claims the world copy.
+
+    Measured 2026-09-18 on a freshly initialized world: the two initial queue
+    templates both ship a goal with the same id, the loop's claim step passes
+    the queue the selector printed, and the named call was refused with the 409
+    whose advice is that same call. A literal-minded caller re-issued it four
+    ways and never claimed its first goal.
+
+    Asserted on the STORED records, not only the status: a 200 that stamped the
+    wrong queue's copy would be a worse defect than the refusal it replaces.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _seed_aspiration(world, _make_asp_with_unclaimed_goal())
+    _seed_colliding_agent_copy(project_root)
+
+    status, body = _post(port, "/v1/aspirations/claim",
+                         {"id": "g-001-01", "agent": "alpha",
+                          "sid": CLAIMER_SID, "source": "world"})
+    assert status == 200, f"expected 200, got {status}: {body}"
+    assert json.loads(body)["goal"]["title"] == "Claimable goal"
+
+    world_goal = _read_jsonl(world / "aspirations.jsonl")[0]["goals"][0]
+    assert world_goal["claimed_by"] == "alpha", world_goal
+    agent_goal = _agent_queue_goal(project_root)
+    assert agent_goal["title"] == "Colliding agent copy"
+    assert agent_goal.get("claimed_by") is None, (
+        "naming the world queue must leave the agent copy untouched: %r"
+        % agent_goal)
+
+
+@pytest.mark.parametrize("named", ["world", "agent"])
+def test_claim_collision_advice_can_be_followed(running_daemon, named):
+    """Every re-issue the 409 body recommends must succeed when it is made.
+
+    The contract this pins is between the refusal's TEXT and the endpoint's
+    BEHAVIOUR: a body that names a next step the same endpoint then refuses is
+    a dead end, and no status-code assertion on the refusal alone can see it.
+    Read the advice out of the live body, follow it, and require a claim on the
+    copy that was named and no stamp on the other one.
+    """
+    project_root, port = running_daemon
+    world = project_root / "world"
+    _seed_aspiration(world, _make_asp_with_unclaimed_goal())
+    _seed_colliding_agent_copy(project_root)
+    base = {"id": "g-001-01", "agent": "alpha", "sid": CLAIMER_SID}
+
+    status, body = _post(port, "/v1/aspirations/claim", dict(base))
+    assert status == 409, f"expected 409, got {status}: {body}"
+    detail = json.loads(body).get("detail", "")
+    assert f"source={named}" in detail, (
+        "the 409 body no longer recommends source=%s; this test follows the "
+        "advice the body gives, so update it with the text: %r" % (named, detail))
+
+    status, body = _post(port, "/v1/aspirations/claim",
+                         dict(base, source=named))
+    assert status == 200, (
+        "the 409 recommends &source=%s and the endpoint then refuses it: "
+        "%s %s" % (named, status, body))
+
+    world_goal = _read_jsonl(world / "aspirations.jsonl")[0]["goals"][0]
+    agent_goal = _agent_queue_goal(project_root)
+    claimed, other = ((world_goal, agent_goal) if named == "world"
+                      else (agent_goal, world_goal))
+    assert claimed["claimed_by"] == "alpha", claimed
+    assert other.get("claimed_by") is None, other

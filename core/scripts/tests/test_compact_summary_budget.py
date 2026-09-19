@@ -257,3 +257,136 @@ def test_empty_corpus_is_safe():
     summary, stats = build_summary([])
     assert summary == []
     assert stats['goals_total'] == 0
+
+
+# --- the census id sets () ------------------------------------
+#
+# WHY THESE ARE SEPARATE FROM make_corpus. The seeded corpus above carries NO
+# archived_census at all, which is exactly why this whole file stayed green for
+# months while the LIVE projection dropped 110 tier-0 rows and every pending-HIGH
+# row. A synthetic seed only pins the defects it happens to model; the live-corpus
+# detector is check 62 in core/config/verification-checklist.md. These tests add
+# the missing model so the two agree.
+
+TIER_ZERO_LABEL = 'always (recurring/in-progress/blocked)'
+
+
+def make_census(asp_id, n_ids, statuses=('completed', 'skipped'), baseline=5):
+    """An archived_census whose evicted_ids alone can exceed the whole budget.
+
+    `by_status` carries a nonzero LEGACY baseline so the count-preservation test
+    below proves the projection keeps `baseline + len(ids)`, not merely `len(ids)`.
+    """
+    per = max(1, n_ids // len(statuses))
+    return {
+        'by_status': {s: baseline for s in statuses},
+        'census_note': 'seeded census for the budget pin',
+        'evicted_ids': {
+            s: ['g-%s-%05d' % (asp_id, i) for i in range(per)]
+            for s in statuses
+        },
+    }
+
+
+def make_census_corpus(n_asp=8, per_asp=60, n_ids=1400):
+    corpus = make_corpus(n_asp, per_asp)
+    for asp in corpus:
+        asp['archived_census'] = make_census(asp['id'], n_ids)
+    return corpus
+
+
+def test_census_id_sets_cannot_crowd_out_tier_zero_rows():
+    """The census rides in the SHELL, which is budgeted first and
+    unconditionally. Unprojected, an eviction-heavy store starves the very rows
+    the projection exists to carry."""
+    corpus = make_census_corpus()
+
+    # POSITIVE CONTROL: the seeded census must genuinely exceed the budget,
+    # otherwise a pass here proves nothing about crowding.
+    census_bytes = len(encoded([a['archived_census'] for a in corpus]))
+    assert census_bytes > DEFAULT_BUDGET, (
+        'seeded census is only %d B and must exceed the %d B budget for this '
+        'test to discriminate' % (census_bytes, DEFAULT_BUDGET))
+
+    summary, stats = build_summary(corpus)
+    assert TIER_ZERO_LABEL not in stats['dropped_by_tier'], (
+        'tier-0 rows were dropped for budget: %r' % (stats['dropped_by_tier'],))
+
+    # Assert the rows are actually PRESENT, not merely absent from the drop
+    # tally -- a counter and a projection can disagree.
+    kept = {g['id'] for asp in summary for g in asp['goals']}
+    expected = {g['id'] for asp in corpus for g in asp['goals']
+                if goal_tier(g) == 0}
+    assert expected, 'corpus must contain tier-0 rows'
+    assert expected <= kept, 'missing tier-0 rows: %r' % sorted(expected - kept)
+    assert len(encoded(summary)) <= DEFAULT_BUDGET
+
+
+def test_pre_fix_shell_projection_drops_tier_zero(monkeypatch):
+    """THE DISCRIMINATOR. Restores the pre-fix shell projection on the live
+    module and asserts it FAILS the pin above on the same corpus. If this ever
+    stops failing, the test above has stopped discriminating."""
+    import _compact_summary as mod
+
+    corpus = make_census_corpus()
+    monkeypatch.setattr(
+        mod, 'project_shell',
+        lambda asp: {k: v for k, v in asp.items() if k != 'goals'})
+    _, stats = mod.build_summary(corpus)
+    assert TIER_ZERO_LABEL in stats['dropped_by_tier'], (
+        'the pre-fix projection must drop tier-0 rows on this corpus, else the '
+        'pin proves nothing (dropped: %r)' % (stats['dropped_by_tier'],))
+
+
+def test_census_projection_preserves_counts():
+    """`census_by_status` is the SSOT every census consumer reads through, and
+    it returns the legacy baseline PLUS len(evicted_ids[status]). Writing its
+    result back as `by_status` makes the projection count-preserving, so
+    `census_completed` and the cadence checks read the same number from the
+    summary as from the full compact."""
+    from _goal_census import census_by_status, census_completed
+
+    corpus = make_census_corpus()
+    summary, _ = build_summary(corpus)
+    by_id = {a['id']: a for a in summary}
+    for asp in corpus:
+        projected = by_id[asp['id']]
+        assert census_by_status(projected) == census_by_status(asp)
+        assert census_completed(projected) == census_completed(asp)
+
+
+def test_census_projection_does_not_mutate_the_full_compact():
+    """The ids are eviction TOMBSTONES: coordination_merge._merge_goals uses
+    them to stop a cross-box merge resurrecting evicted goals, and the goal-id
+    mint sites read all_evicted_ids so a fresh id never collides. Collapsing
+    them in place would destroy both from under the full store."""
+    from _goal_census import all_evicted_ids
+
+    corpus = make_census_corpus()
+    before = {a['id']: all_evicted_ids(a) for a in corpus}
+    assert any(before.values()), 'corpus must carry evicted ids'
+    build_summary(corpus)
+    assert {a['id']: all_evicted_ids(a) for a in corpus} == before
+
+
+def test_summary_carries_no_evicted_id_list():
+    corpus = make_census_corpus()
+    summary, _ = build_summary(corpus)
+    for asp in summary:
+        census = asp.get('archived_census')
+        assert isinstance(census, dict)
+        assert 'evicted_ids' not in census
+        assert isinstance(census.get('by_status'), dict)
+
+
+def test_census_projection_is_inert_without_a_census():
+    """An aspiration with no census, a non-dict census, or a census carrying no
+    evicted_ids must pass through byte-identically."""
+    from _compact_summary import project_shell
+
+    for census in (None, 'not-a-dict', {}, {'by_status': {'completed': 3}}):
+        asp = {'id': 'asp-999', 'status': 'active', 'goals': []}
+        if census is not None:
+            asp['archived_census'] = census
+        shell = project_shell(asp)
+        assert shell == {k: v for k, v in asp.items() if k != 'goals'}

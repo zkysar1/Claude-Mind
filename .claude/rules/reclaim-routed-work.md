@@ -90,8 +90,8 @@ defer-routing`).
    The obligation runs in BOTH directions: a routing that never declares WHY
    the user is attached (`user_leg_scope`) cannot be re-derived by anything,
    and a grant whose scope head avoids the shared vocabulary can never be
-   applied. Goal side 20/28 (07-29) -> 8/36 -> 0/10 (08-29): DONE.
-   Grant side is now the gap: 7 of 10 unkeyable (guard-5518).
+   applied. Goal side: DONE (08-29). Grant side is the gap: re-derive the
+   count, never cite one (guard-5518, guard-6262).
 
 5. **Escalate what genuinely remains.** Items that survive both axes are the
    real human-only residue. Batch them into a digest for the next user

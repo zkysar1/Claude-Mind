@@ -117,7 +117,9 @@ fi
 # Consequence chain of the tab form: _dir receives the goal-id, so the `-n "$_dir"`
 # branch below calls `resolve --dir g-335-328` against a nonexistent directory,
 # which returns rc=2 UNVERIFIED, so the entry is KEPT and re-probed at EVERY close,
-# forever, while flagging not_clean=1 (SG-c then holds graceful stop). An entry with
+# forever, while flagging not_clean=1 (SG-c does NOT hold the stop — this copy of
+# that claim survived the g-335-1313 correction applied at the not_clean branch
+# below, which cites stop-hook.sh's roll-then-ALLOW; corrected g-115-10133). An entry with
 # an empty dir could therefore NEVER be verified. The `(goal=${_gid:-?})` rendering
 # in every message below was the visible symptom, and it reads as an ORPHANED entry
 # — which is how it was first diagnosed, wrongly. Same defect and same US remedy as

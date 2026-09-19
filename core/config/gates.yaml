@@ -1276,3 +1276,4 @@ pending_audit:
   # commit-message trailer, which pre-commit runs too early to see.
   - hot-path-size-gate.py               # Gate M1 — hot-path prose may not grow past HEAD (g-115-6470); overrides -> world/override-bypass-ledger.jsonl
   - goal-claim-commit-gate.py           # Gate M2 — commit names a goal another SESSION holds live (g-115-6689 follow-through); backstop for chat work that never calls claim(); overrides -> world/override-bypass-ledger.jsonl
+  - domain-leak-commit-gate.py          # Gate M3 — commit ADDS a blocklisted domain term on a new line (g-115-10048); BLOCKING half of the border wall, added-lines only per guard-1426 so the pre-existing backlog never blocks; Gate 6 above stays the report-only audit; overrides -> world/override-bypass-ledger.jsonl

@@ -87,9 +87,17 @@ fi
 #    resolution time). Guarded single git calls. ──
 sha=$(git -C "$gitdir" rev-parse HEAD 2>/dev/null || echo "")
 [ -n "$sha" ] || exit 0   # not a git repo / cannot read HEAD -> nothing trackable
-url=$(git -C "$gitdir" remote get-url origin 2>/dev/null || echo "")
-repo=$(printf '%s' "$url" | sed -E 's#^(git@|https://)([^/:]+)[:/]##; s#\.git$##' 2>/dev/null || echo "")
-[ -n "$repo" ] || exit 0  # no origin remote -> nothing to deploy-verify
+# : derive ONLY a GitHub owner/name, via the shared helper. The old
+# inline sed here stripped a git@host:/https://host/ prefix and returned whatever
+# was left, so a rack origin registered "rack:/srv/bulk/<name>" — a value
+# `gh api repos/<value>` can never resolve, so the obligation could never clear
+# (measured: 90 live, 0 cleared, not_clean on every framework-push close).
+# EMPTY means this clone has no GitHub remote, i.e. nothing gh could verify, so
+# register NOTHING rather than something unresolvable.
+# shellcheck source=core/scripts/_repo_slug.sh
+. "$SCRIPT_DIR/_repo_slug.sh" 2>/dev/null || exit 0
+repo=$(gh_slug_for_dir "$gitdir")
+[ -n "$repo" ] || exit 0  # no GitHub remote -> nothing deploy-verify could resolve
 
 # ── Resolve the in-flight goal_id from the execution diary (last phase-4-execute
 #    phase_start). Empty is acceptable — the stop-hook gate (SG-c) still catches

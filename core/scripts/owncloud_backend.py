@@ -2271,6 +2271,26 @@ class OwnCloudBackend:
         items.append(record)
         return self.write_jsonl(path, items)
 
+    def append_jsonl_records(self, path: PathLike,
+                             records: List[dict]) -> WriteResult:
+        """Append N records in ONE read-modify-write, i.e. ONE whole-object PUT.
+
+        THIS IS THE POINT OF THE METHOD. There is no native append in S3, so the
+        singular append_jsonl_record above re-PUTs the ENTIRE object per record:
+        N rows cost N full PUTs of a growing file (guard-6134/guard-6904 — one
+        appended row re-PUTs the whole object). Measured on
+        capture-evictions-archive.jsonl: 4,829 versions / 231.3 GiB in one UTC
+        day, mean PUT 51,425,047 B against a 49,857,387 B object. Batching
+        divides the PUT COUNT by N; it does NOT bound the PUT SIZE, which keeps
+        growing with the file — a discount, not a bound (guard-6904).
+        force_fresh so the If-Match fence token is the CURRENT remote ETag.
+        Caller holds the lock."""
+        if not records:
+            return self.write_jsonl(path, self._read_jsonl_fresh(path))
+        items = self._read_jsonl_fresh(path)
+        items.extend(records)
+        return self.write_jsonl(path, items)
+
     def modify_jsonl(self, path: PathLike,
                      modifier_fn: Callable[[List[dict]], Optional[List[dict]]],
                      *, initial: Optional[List[dict]] = None) -> List[dict]:

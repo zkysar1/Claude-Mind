@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -181,6 +182,12 @@ def _clear(path, repo, sha):
     return len(entries) - len(kept), len(kept)
 
 
+# Exactly "owner/name" using the character set GitHub permits in a login and in
+# a repository name. Deliberately NOT a "contains a slash" test ():
+# "rack:/srv/bulk/widget-service" and "ssh://git@github.com/o/n" both contain one.
+_OWNER_NAME_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9._-]+$")
+
+
 def _repo_is_qualified(repo):
     """True when `repo` is an owner/name path that `gh api repos/<repo>` can resolve.
 
@@ -200,8 +207,21 @@ def _repo_is_qualified(repo):
     (False, "") and _landed_on_default("zkysar1/Ayoai-Operator", "1aa65b9") ->
     (True, "ancestor:main"). Same guard-3970 shape from the write side: a
     fail-safe default that cannot be told apart from a measured absence.
+
+    TIGHTENED g-115-10133 (2026-09-18). This tested `"/" in repo`, which is a
+    NEGATIVE contract — it only excluded a bare name. The bare-name case was the
+    one measured in g-335-1313, so the check matched its incident exactly and
+    admitted every OTHER malformation. A clone whose origin is a non-GitHub URL
+    derived "rack:/srv/bulk/<name>", which has three slashes and sailed through;
+    the comment at the sole automatic caller asserted that caller "always yields
+    owner/name", and that was false for the rack: and ssh:// forms. Now the
+    contract is POSITIVE: exactly two non-empty segments of characters GitHub
+    actually allows in an owner or a repo name. The derivation side is fixed
+    too (core/scripts/_repo_slug.sh), so this is the write-time backstop rather
+    than the only defence -- a malformed value is now refused loudly at the
+    boundary instead of stored and re-probed forever.
     """
-    return bool(repo) and "/" in repo.strip("/")
+    return bool(_OWNER_NAME_RX.match((repo or "").strip("/")))
 
 
 def _landed_on_default(repo, sha, timeout=30):

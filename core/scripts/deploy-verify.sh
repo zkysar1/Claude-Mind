@@ -117,8 +117,13 @@ GH="${GH_BIN-gh}"
 # environment where it failed was the only environment where it actually runs.
 # Pinned by test_hook_found_without_world_dir_in_env, which deliberately unsets
 # WORLD_DIR to replicate the production shape (guard-920).
+# _dv_dir is this script's OWN directory, so it is unconditional by nature. It
+# used to be assigned only inside the branch below, which meant every caller
+# that sets WORLD_DIR (all the unit rigs, and any caller that already sourced
+# _paths.sh) skipped the assignment entirely -- harmless while nothing outside
+# the branch read it, fatal the moment something did.
+_dv_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ -z "${WORLD_DIR:-}" ] && [ -z "${DEPLOY_VERIFY_PLATFORM_HOOK:-}" ]; then
-    _dv_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     # shellcheck source=/dev/null
     [ -f "$_dv_dir/_paths.sh" ] && . "$_dv_dir/_paths.sh" 2>/dev/null || true
     # _paths.sh exports WORLD_PATH; WORLD_DIR is its alias in older callers.
@@ -273,9 +278,21 @@ print(json.dumps(d))'
 }
 
 if [ -z "$REPO" ]; then
-    url=$(git -C "$DIR" remote get-url origin 2>/dev/null) || url=""
-    REPO=$(printf '%s' "$url" | sed -E 's#^(git@|https://)([^/:]+)[:/]##; s#\.git$##')
-    [ -z "$REPO" ] && { echo '{"status":"unverified","detail":"cannot infer repo from --dir (no origin remote)"}'; exit 2; }
+    # : GitHub owner/name only, via the shared helper — the same
+    # derivation deploy-detect-hook.sh registers with, so a repo that clears the
+    # hook is a repo this can resolve. The old inline sed here returned
+    # "rack:/srv/bulk/<name>" for a rack origin and every probe then failed
+    # "workflow list API error" forever. A failed source leaves gh_slug_for_dir
+    # undefined; the `|| REPO=""` below then empties REPO and the clean
+    # unverified exit fires. _dv_dir is hoisted to the top level precisely so
+    # this line cannot die `_dv_dir: unbound variable` under `set -u` instead:
+    # measured 2026-09-18, it was assigned only under `[ -z "$WORLD_DIR" ]`, so
+    # every WORLD_DIR-setting caller exited rc=1 here -- 14 tests red across
+    # test_deploy_verify_platform_hook.py and test_deploy_verify_stale_subject.py.
+    # shellcheck source=core/scripts/_repo_slug.sh
+    . "$_dv_dir/_repo_slug.sh" 2>/dev/null || true
+    REPO=$(gh_slug_for_dir "$DIR" 2>/dev/null) || REPO=""
+    [ -z "$REPO" ] && { echo '{"status":"unverified","detail":"cannot infer a GitHub owner/name from --dir (no GitHub remote) -- pass --repo owner/name"}'; exit 2; }
 fi
 if [ -z "$SHA" ]; then
     SHA=$(git -C "$DIR" rev-parse HEAD 2>/dev/null) || SHA=""

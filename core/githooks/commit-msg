@@ -56,4 +56,17 @@ _gate hot-path-size-gate $PY "$REPO/core/scripts/hot-path-size-gate.py" --commit
 # Bypass = trailer:  goal-claim-override: <why>  -> world/override-bypass-ledger.jsonl
 _gate goal-claim-commit-gate $PY "$REPO/core/scripts/goal-claim-commit-gate.py" --commit-msg-file "$MSG_FILE"
 
+# Gate M3: domain border wall, BLOCKING half (g-115-10048, 2026-09-18). Refuses
+# a commit that ADDS a blocklisted domain term on a new line of an in-scope,
+# non-exempt framework file. Added lines only (guard-1426) — the tree carries a
+# large pre-existing backlog, and a whole-file check would fail every commit for
+# every agent; domain-leak-check.sh keeps that backlog as a report-only audit
+# and pre-commit's Gate 6 stays advisory. It lives HERE rather than in
+# pre-commit because the sanctioned bypass is a message trailer, which
+# pre-commit structurally cannot see:
+#   domain-leak-override: <why this term must live in a framework file>
+# audited to world/override-bypass-ledger.jsonl. Merge commits are skipped
+# inside the gate (MERGE_HEAD). Terms: core/config/domain-term-blocklist.txt.
+_gate domain-leak-commit-gate $PY "$REPO/core/scripts/domain-leak-commit-gate.py" --commit-msg-file "$MSG_FILE"
+
 exit 0

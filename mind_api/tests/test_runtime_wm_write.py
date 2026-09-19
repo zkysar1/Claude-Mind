@@ -862,3 +862,73 @@ def test_wrapper_stays_silent_on_an_ordinary_append(running_daemon):
     assert "evicted to make room" not in proc.stderr, proc.stderr
     assert any(e.get("id") == "quiet-probe"
                for e in _read_wm(agent_dir)["slots"]["known_blockers"])
+
+
+# ---------------------------------------------------------------------------
+#  outcome 3 — a concurrent prune is REFUSED, not queued.
+# ---------------------------------------------------------------------------
+
+
+def test_a_concurrent_prune_is_REFUSED_409_and_does_not_run_the_body(
+        monkeypatch, tmp_path):
+    """A second prune must fail fast rather than wait out the first.
+
+    THE DEFECT: file_locks.locked() acquires its threading.Lock with NO timeout
+    (its `timeout` governs only the file lock beneath), so a second prune
+    blocked indefinitely. The client cannot tell a timeout from a dead daemon —
+    rt_curl maps curl's exit 28 and a connection failure to the same rc=3 — so
+    it re-POSTs, and the retries pile up. Measured cc-04 2026-09-15: five calls
+    at 481/396/311/226/109 s ending within 20 s of each other, the queued ones
+    returning pruned_items: [] because the first had already drained the lane.
+
+    The load-bearing assertion is the LAST one: a 409 that still ran the body
+    would have fixed nothing.
+    """
+    from mind_api.src.endpoints import wm_write
+
+    wm_file = tmp_path / "working-memory.yaml"
+    ran = []
+    monkeypatch.setattr(wm_write, "_require_agent_header", lambda ctx: None)
+    monkeypatch.setattr(wm_write, "_wm_path", lambda ctx: wm_file)
+    monkeypatch.setattr(wm_write, "_prune_locked",
+                        lambda ctx: ran.append("body") or "RAN")
+
+    # POSITIVE CONTROL FIRST. Without it a green 409 test is equally consistent
+    # with a prune that never runs at all, or a gate that is permanently held.
+    assert wm_write.prune(object()) == "RAN"
+    assert ran == ["body"], "an uncontended prune must actually run"
+
+    gate = wm_write._prune_gate(wm_file)
+    assert gate.acquire(blocking=False), (
+        "the gate must be RELEASED after a completed prune — a gate that leaks "
+        "would 409 this working memory forever")
+    try:
+        resp = wm_write.prune(object())
+    finally:
+        gate.release()
+
+    assert resp.status == 409, f"expected 409, got {resp.status}"
+    assert b"prune_in_progress" in resp.body
+    assert ran == ["body"], (
+        "the REFUSED prune must not have run the body — queueing and then "
+        "running a redundant full prune is the whole defect (g-115-9962)")
+
+
+def test_the_prune_gate_is_per_working_memory_not_global(tmp_path):
+    """Two agents on one box must never refuse each other's prune."""
+    from mind_api.src.endpoints import wm_write
+
+    a = tmp_path / "alpha" / "working-memory.yaml"
+    b = tmp_path / "bravo" / "working-memory.yaml"
+    gate_a, gate_b = wm_write._prune_gate(a), wm_write._prune_gate(b)
+
+    assert gate_a is not gate_b, "distinct working memories must not share a gate"
+    assert gate_a is wm_write._prune_gate(a), (
+        "the SAME working memory must get the SAME gate, or the guard is a no-op")
+    assert gate_a.acquire(blocking=False)
+    try:
+        assert gate_b.acquire(blocking=False), (
+            "holding alpha's gate must not block bravo's prune")
+        gate_b.release()
+    finally:
+        gate_a.release()

@@ -143,7 +143,16 @@ def rig(tmp_path):
         env.update({"GH_BIN": str(gh), "WORLD_DIR": str(world),
                     "STORAGE_BACKEND": "local"})
         proc = subprocess.run(
+            # --repo is supplied because this rig's origin is a LOCAL BARE repo
+            # (the stale-subject gate needs a genuinely fetchable remote, and a
+            # GitHub URL is not fetchable from a test). Since ,
+            # deploy-verify.sh derives a repo ONLY from a GitHub remote and
+            # answers `unverified` otherwise, so a file:// origin correctly
+            # yields no slug. That is the rule these tests must not depend on
+            # either way -- they are about the stale-SUBJECT refusal, so the
+            # subject's repo is stated outright rather than inferred.
             [BASH, SCRIPT.as_posix(), "--dir", repo.as_posix(),
+             "--repo", "acme/widget-service",
              "--timeout-mins", "1", "--poll-secs", "1", "--grace-secs", "1",
              *extra],
             capture_output=True, text=True, env=env, timeout=180,

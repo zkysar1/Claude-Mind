@@ -250,7 +250,24 @@ Bash: load-aspirations-compact.sh
 IF path returned: Read it
 Extract for each active aspiration:
   - id, title, priority, source (created_by)
-  - goals: (completed / total), category
+  - completion: `progress.completed_goals` / `progress.total_goals` — the
+    ASPIRATION-LEVEL fields, NEVER a tally of the record's `goals[]` array
+    (guard-3410, and guard-2046's unverified-pairing shape: this step names a
+    command AND a capture list, and nothing checks the command can produce the
+    list). `goals[]` is an ACTIVITY projection, not the population, so tallying
+    it understates the ratio ~50pp and ALWAYS in the direction that forces
+    `act_later` at Phase 5.5.
+    ⚠ THE LOADER OFTEN HANDS YOU THE *SUMMARY*, WHERE THE PROJECTION IS EMPTIER
+    STILL. Measured 2026-09-18 (bravo, cc-05): `load-aspirations-compact.sh`
+    returned `aspirations-compact-summary.json` (196,418 B), whose records carry
+    a `goals_omitted` flag — the array is elided, so a tally found "1 active
+    aspiration with goals" and yielded `completion_health = 0.000` against a true
+    **0.741** sitting one field away in `progress`. That is a 74pp understatement
+    against guard-3410's 55.3pp for the full `aspirations-compact.json`
+    (1,533,985 B), and 0.000 is not an implausible number for the helper to see.
+    Do NOT discriminate on which file you got: read `progress` either way — it is
+    present in BOTH and is projection-agnostic, which is the whole point.
+  - category
 Compute:
   - category_distribution (fraction of active goals per category)
   - aspiration_source_distribution (how many created by each agent vs user)
