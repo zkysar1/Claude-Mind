@@ -229,16 +229,30 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
             if d:
                 cluster = [d]
 
-    # recurring firings (agent queues) in window
+    # recurring firings (WORLD + agent queues) in window.
+    # THE WORLD QUEUE WAS MISSING UNTIL 2026-09-18 ( occ103, zeta/cc-02).
+    # This loop iterated agent_files ONLY, so every world-level sensor was invisible
+    # and the digest published an AGENT-PRIVATE count as a claim about the FLEET --
+    # exactly guard-3156. The localisation was clean and is worth keeping: applying
+    # this loop's OWN predicate to each store separately over a 22.03h window gave
+    # 10 firings in the agent queues -- EXACTLY what the digest printed, so the
+    # predicate and the timestamp logic were never at fault -- against 26 in the
+    # world queue, where 101 of the fleet's 109 recurring sensors live. True total
+    # 36 against a printed 10: a 72% understatement of the fleet's own monitoring
+    # work, in the one number the user reads.
+    # `asps` is the world queue, already loaded at the top of gather(), so covering
+    # it costs no extra read. If this ever regresses, do NOT repair it by attaching
+    # a "lower bound" caveat -- that trains every later reader to discount the
+    # number instead of fixing the scan (guard-3103).
     recurring = 0
-    for f in agent_files:
-        for asp in _load_jsonl(f):
-            for g in asp.get("goals") or []:
-                if not g.get("recurring"):
-                    continue
-                la = _ts(g.get("lastAchievedAt") or g.get("last_achieved_at"))
-                if la and (not since or la >= since):
-                    recurring += 1
+    _recurring_scan = list(asps) + [a for f in agent_files for a in _load_jsonl(f)]
+    for asp in _recurring_scan:
+        for g in asp.get("goals") or []:
+            if not g.get("recurring"):
+                continue
+            la = _ts(g.get("lastAchievedAt") or g.get("last_achieved_at"))
+            if la and (not since or la >= since):
+                recurring += 1
 
     # ---- needs you ----------------------------------------------------------
     pred = load_population_predicate()

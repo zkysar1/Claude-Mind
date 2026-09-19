@@ -58,7 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # tests/test_goal_eviction_invariance.py. Adding a third copy here would fork
 # the vocabulary; note in particular that `retired` is NOT terminal in the
 # SSOT, and this module must not invent it as one.
-from _goal_census import TERMINAL_STATUSES
+from _goal_census import TERMINAL_STATUSES, census_by_status
 
 # The Read tool's hard refusal threshold, in bytes. A file at or above this
 # cannot be read by the LLM at all -- which is the failure this module exists
@@ -128,6 +128,45 @@ def project_goal(goal):
     return out
 
 
+def project_shell(asp):
+    """Copy one aspiration's non-goal fields, collapsing the census id sets.
+
+    `archived_census.evicted_ids` is a per-status goal-id SET that grows with
+    every eviction tick and is bounded by nothing. It rides in the SHELL, which
+    build_summary budgets FIRST and unconditionally, so an eviction-heavy store
+    starves the goal rows the projection exists to carry. Measured 2026-09-18
+    (bravo, hostname cc-05, uname -r 6.8.0-139-generic): shells were 186,671 B
+    of the 196,608 B budget and `evicted_ids` alone was 148,553 B of that,
+    leaving 28 of 2,917 eligible rows and dropping 110 TIER-0 rows plus every
+    one of the 135 pending-HIGH rows.
+
+    The ids are replaced by their COUNTS via `census_by_status`, which is the
+    SSOT every other census consumer already reads through. Because that helper
+    returns the legacy `by_status` baseline PLUS `len(evicted_ids[status])`,
+    writing its result back as `by_status` makes the projection
+    COUNT-PRESERVING: `census_by_status(projected) == census_by_status(full)`,
+    so `census_completed` and the cadence checks read the same number from
+    either file. That equality is the invariant to test, not the byte saving.
+
+    NEVER mutates `asp`. `archived_census` is a nested dict shared with the
+    caller's full compact, and the ids are eviction TOMBSTONES:
+    `coordination_merge._merge_goals` uses them to stop evicted goals being
+    resurrected by a cross-box merge, and the goal-id mint sites use
+    `all_evicted_ids` so a fresh id never collides with an evicted one. An
+    in-place collapse here would destroy both from under the full store.
+    """
+    shell = {k: v for k, v in asp.items() if k != 'goals'}
+    census = shell.get('archived_census')
+    if not isinstance(census, dict) or 'evicted_ids' not in census:
+        return shell
+    projected = {k: v for k, v in census.items() if k != 'evicted_ids'}
+    counts = census_by_status(asp)
+    if counts:
+        projected['by_status'] = {s: counts[s] for s in sorted(counts)}
+    shell['archived_census'] = projected
+    return shell
+
+
 def goal_tier(goal):
     """Tier for budget ordering, or None when the goal is excluded outright.
 
@@ -162,7 +201,7 @@ def build_summary(merged, budget_bytes=None):
     shells = []
     rows = []
     for index, asp in enumerate(merged):
-        shells.append({k: v for k, v in asp.items() if k != 'goals'})
+        shells.append(project_shell(asp))
         for goal in asp.get('goals', []):
             tier = goal_tier(goal)
             if tier is None:
@@ -170,8 +209,16 @@ def build_summary(merged, budget_bytes=None):
             rows.append((tier, index, project_goal(goal)))
 
     # Budget the SHELLS first: aspiration-level fields are what
-    # fresh-eyes completion_health and strategic-scan S3/S4a read, and they are
-    # a small fixed cost that must never be crowded out by goal rows.
+    # fresh-eyes completion_health and strategic-scan S3/S4a read, so they must
+    # never be crowded out by goal rows.
+    #
+    # They are a small cost only BECAUSE `project_shell` collapses the census
+    # id sets to counts. Until  this line read "a small fixed cost",
+    # and that premise was false the moment eviction started: the unbounded
+    # `evicted_ids` set rode in on the shell and consumed 94.9% of the budget,
+    # so budgeting it first did not protect the shells, it starved the rows.
+    # Any NEW unbounded aspiration-level field added here inherits the same
+    # defect — project it before it reaches this line.
     spent = _encoded_len([dict(s, goals=[]) for s in shells])
 
     # Reserve for the `goals_omitted` keys BEFORE budgeting rows. Those keys are

@@ -122,22 +122,29 @@ agents/*/journal/**/*.md merge=ayoai-journal-md
 # this block, and demote a file to ayoai-journal-md the moment its deleted-line
 # count leaves zero. The count is also a FLOOR: the documented regex excludes
 # deleted markdown list items.
-# SUPERSEDED BY MEASUREMENT 2026-09-16 (g-115-10127): union is not safe for these
-# ledgers even at zero deleted lines. Its zealous refinement emits a line two
-# appended blocks share ONCE and interleaves the blocks: merge 10069ea4c0 did
-# that here and dropped a ``` fence. Moving these two, and run-full-suite-
-# baselines.md below, to merge=ayoai-append-ledger is owned by g-115-10132.
-core/config/strategic-scan-readings.md merge=union
-core/config/felt-sense-readings.md merge=union
+# SUPERSEDED BY MEASUREMENT 2026-09-16 (g-115-10127), AND ACTED ON 2026-09-18
+# (g-115-10132, bravo/cc-05): union is not safe for these ledgers even at zero
+# deleted lines. Its zealous refinement emits a line two appended blocks share
+# ONCE and interleaves the blocks: merge 10069ea4c0 did that here and dropped a
+# ``` fence. The deleted-lines evidence gate above is therefore NOT sufficient
+# on its own for a multi-writer append ledger — it measures whether history was
+# EDITED, while this defect needs only that two appends SHARE A LINE, which
+# formulaic dated blocks do by construction. All three readings ledgers now
+# route to merge=ayoai-append-ledger (guard-6868).
+core/config/strategic-scan-readings.md merge=ayoai-append-ledger
+core/config/felt-sense-readings.md merge=ayoai-append-ledger
 
-# run-full-suite-baselines.md FAILS that union gate (2 deleted content lines), so
-# it routes like the daily journal above: section-union by '## heading', which
-# still surfaces a REAL conflict when the same heading diverges on both sides, so
-# nothing is silently coalesced. Driver registered per-clone by
+# run-full-suite-baselines.md FAILS that union gate (2 deleted content lines) and
+# ALSO routed badly the other way: it was on ayoai-journal-md, which unions by
+# '## heading' and therefore CONFLICTS on an append that opens no '## ' section —
+# measured 28 of 30 replayed pairs. It is a multi-writer baselines TABLE, so it
+# joins the other two on merge=ayoai-append-ledger (g-115-10132): exact append
+# concatenation, a standard diff3 for any other edit, and a real conflict when
+# both sides rewrite the same text. Driver registered per-clone by
 # install-git-hooks.sh (git driver config is NOT version-controlled) — an entry
 # naming an unregistered driver silently falls back to the default text merge
 # (guard-1290), so verify with check-merge-driver-registered.sh on every box.
-core/config/run-full-suite-baselines.md merge=ayoai-journal-md
+core/config/run-full-suite-baselines.md merge=ayoai-append-ledger
 
 # merge=ayoai-append-ledger for the readings ledgers that had NO routing
 # (g-115-10127). replay-instrument-readings.md wedged cc-05 at behind=37 on

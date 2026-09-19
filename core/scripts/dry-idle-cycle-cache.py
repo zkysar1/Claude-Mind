@@ -84,7 +84,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR  # noqa: E402
-import _harness_caps  # noqa: E402  (: no-notify harness directive lines)
+import _sleep_directive  # noqa: E402  (the one owner of the yield block)
 from _idle_cache_common import (  # noqa: E402
     wake_timer_elapsed,
     authoritative_earliest_wake_at,
@@ -323,9 +323,9 @@ def _emit_hit_directive(cache, current_earliest_wake_at, now, cap):
         "pending wake signal -- skipping the precheck/select/create-aspiration\n"
         "reload for this cycle.\n"
         "DO NOT load Skill(aspirations). DO NOT run selection or execution.\n"
-        # Harness-keyed yield block, one owner ( leg c) — see
-        # _harness_caps.sleep_directive for why the hardcoded pair was a defect.
-        + _harness_caps.sleep_directive(sleep_seconds, agent, "DRY_SLEEP=1") +
+        # The yield block, one owner (guard-2485) and ONE text on every harness
+        # (loop-terminal-protocol.md §4.2) — see _sleep_directive for its history.
+        + _sleep_directive.sleep_directive(sleep_seconds, agent, "DRY_SLEEP=1") +
         f"After {cap} consecutive short-circuits a full cycle is forced for drift detection.\n"
         "================="
     )

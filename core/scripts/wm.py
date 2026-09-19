@@ -333,6 +333,59 @@ def archive_evicted_capture(agent_dir, slot_name, removed, reason):
         # unimagined one through as a successful destroy.
         return False
 
+def archive_evicted_captures(agent_dir, slot_name, removed_list, reason):
+    """Append N evicted capture entries in ONE locked write. True iff ALL landed.
+
+    SAME CONTRACT AS THE SINGULAR FORM, AND STRICTLY STRONGER: False means the
+    caller MUST KEEP every entry. One backend write either lands or raises, so
+    there is no partial-archive state in which some rows are durable and some
+    are not — the per-row loop this replaces could archive k rows and fail on
+    k+1, leaving the caller to reason about a half-archived batch. All-or-
+    nothing removes that state entirely.
+
+    WHY BATCHED AT ALL. Routed through locked_append_jsonl_many, which issues
+    ONE whole-object PUT for the batch. The per-row loop called the singular
+    form once per victim, and under a whole-object-PUT backend each of those
+    re-PUT the ENTIRE archive, so N evictions cost N full PUTs of a growing
+    file — O(N^2) bytes (guard-6134, guard-6904). Measured on this exact sink:
+    4,829 versions / 231.3 GiB in the UTC day 2026-09-17, mean PUT 51,425,047 B
+    against a 49,857,387 B object (ratio 1.031, the correctly-signed
+    whole-object-rewrite shape).
+
+    THIS IS A DISCOUNT, NOT A BOUND (guard-6904). Batching divides the PUT
+    COUNT by N and leaves the PUT SIZE growing with the file (~10 MB/day at the
+    measured rate), so the win decays. Nothing here caps the OBJECT; that needs
+    a companion (date-suffixed segments, or a drain to a cold prefix) and is
+    deliberately not attempted here. Do not read this function as having
+    stopped the growth.
+
+    One `archived_at` for the whole batch, not one per row: they are archived in
+    a single write, so a single timestamp is the accurate record of when.
+    """
+    if not agent_dir:
+        return False
+    rows = list(removed_list)
+    if not rows:
+        return True
+    try:
+        from _fileops import locked_append_jsonl_many
+        _now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        locked_append_jsonl_many(
+            Path(agent_dir) / CAPTURE_EVICTION_ARCHIVE,
+            [{
+                "archived_at": _now,
+                "slot": slot_name,
+                "eviction_reason": reason,
+                "summary": evicted_summary(r),
+                "entry": r,
+            } for r in rows])
+        return True
+    except Exception:
+        # Deliberately broad, for the reason the singular form gives: ANY
+        # failure to archive must read as "do not delete", never as a
+        # successful destroy.
+        return False
+
 
 # ── THE APPEND PATH ARCHIVES TOO — LOCALLY, BESIDE THE BODY WM () ──
 #
@@ -1788,31 +1841,40 @@ def _do_prune(args):
                 # (guard-742/2323) — keep in sync.
                 _n = 0
                 slot_val.sort(key=lambda x: x.get("_item_ts", "0000") if isinstance(x, dict) else "0000")
-                while len(slot_val) > limit:
-                    # ARCHIVE BEFORE DELETE (). PEEK, archive, and only
-                    # then pop: a capture entry leaves the lane only once a
-                    # durable copy of it exists outside this file. A failed
-                    # archive BREAKS rather than dropping the entry — the cap
-                    # stays exceeded, which is recoverable and is reported right
-                    # here, instead of the data being destroyed, which is not.
-                    # break, NOT continue: the loop re-tests the same
-                    # over-limit condition, so continue would spin forever.
-                    if slot_name in CAPTURE_SLOTS and not args.dry_run:
-                        if not archive_evicted_capture(
-                                AGENT_DIR, slot_name, slot_val[0], "array_limit"):
-                            report.setdefault("archive_failures", []).append({
-                                "slot": slot_name,
-                                "kept_over_cap": len(slot_val) - limit,
-                                "reason": "archive_failed_entries_kept",
-                            })
-                            break
-                    removed = slot_val.pop(0)
-                    _n += 1
-                    report["pruned_items"].append({
-                        "slot": slot_name,
-                        "item_summary": evicted_summary(removed),
-                        "reason": "array_limit",
-                    })
+                # ARCHIVE BEFORE DELETE (), BATCHED ().
+                # The victims are the FIFO head: the sort above IS the ordering
+                # guarantee, so slicing [:excess] is exactly the set the old
+                # one-at-a-time loop popped, in the same order.
+                # NOW ALL-OR-NOTHING. The per-row loop could archive k rows and
+                # fail on k+1, leaving a half-archived batch for someone to reason
+                # about; one batched write either lands or raises, so on failure
+                # NOTHING is popped, the cap stays exceeded (recoverable, and
+                # reported right here) and the full excess is what gets reported.
+                # WHY BATCHED: the singular archive re-PUTs the ENTIRE object per
+                # row under a whole-object-PUT backend, so N evictions cost N full
+                # PUTs of a growing file (guard-6134/guard-6904; measured 4,829
+                # versions / 231.3 GiB in one day on this sink). This divides the
+                # PUT COUNT, NOT the PUT SIZE — a discount, not a bound.
+                _victims = slot_val[:len(slot_val) - limit]
+                _archived_ok = True
+                if _victims and slot_name in CAPTURE_SLOTS and not args.dry_run:
+                    _archived_ok = archive_evicted_captures(
+                        AGENT_DIR, slot_name, _victims, "array_limit")
+                    if not _archived_ok:
+                        report.setdefault("archive_failures", []).append({
+                            "slot": slot_name,
+                            "kept_over_cap": len(slot_val) - limit,
+                            "reason": "archive_failed_entries_kept",
+                        })
+                if _archived_ok:
+                    del slot_val[:len(_victims)]
+                    _n = len(_victims)
+                    for removed in _victims:
+                        report["pruned_items"].append({
+                            "slot": slot_name,
+                            "item_summary": evicted_summary(removed),
+                            "reason": "array_limit",
+                        })
                 if not args.dry_run:
                     # Persist the tally — this path recorded evictions only into
                     # the transient `report`, invisible to capture_evictions.

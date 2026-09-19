@@ -2123,3 +2123,67 @@ reopen is this domain's literal fix verb for a closed place. Also quantified fro
 the instrument: `history_recoverability` = recurring_closes_lost **5001/5108
 (97.9%)**, overall_recoverable_pct **6.7%** — guard-2692's `--series` hazard with a
 number on it. The hand-recorded points in this file are the only series there is.
+
+---
+
+### 2026-09-19T08:1x — foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud
+
+Cadence fired at diff **213 / 75 = 2.8x**, as the third of four starved rituals reclaimed on
+the first fresh post-compaction budget (guard-7075).
+
+**⚠ NEW SHAPE ON THE PHASE-2 POPULATION — THE OWNERSHIP GATE IS VACUOUS HERE, AND THE
+FIELD CENSUS IS WHAT SHOWED IT.** `in-progress` returned **0 rows** (2 bytes) and
+`pending+agent --full` returned **2910 rows** with `claimed_by` present on **0/2910**,
+`claimed_by_sid` **0/2910**, `claimed_at` **0/2910**. Against this file's documented priors
+(`claimed_by 9/1980` and `33/33`) that is a different population, so the four-reason tally
+came back **2910 candidates — 0 mutated, 0 foreign sid, 0 absent sid, 0 partner**: every
+branch requires `claimed_by` to be SET, so all 2910 fell through to the
+`claimed_by is null` disjunct and the gate authorized the entire corpus.
+
+**I probed it rather than reporting the zero (rb-245), and it is a POPULATION fact, not a
+projection defect.** `--full` worked — the corpus carries **124 distinct keys**, 17-22 per
+record — and neighbouring claim-adjacent fields ARE present: `executed_by` **366/2910**,
+`executed_by_sid` 366/2910, `started` 377/2910, `defer_reason` 185/2910, `blocked_by`
+126/2910. So the key is absent from every RECORD, and corroborated independently: all five
+agents read `between-phases`/`observation` in team-state at 07:46-07:49, i.e. **no agent
+held a claim fleet-wide at this instant.** Method rule 6 ("a small mutable count is the
+gates working") has an inverse this ledger had not recorded: **a mutable count equal to the
+whole population means the gate is measuring nothing**, and the only surviving discriminator
+is `executed_by` + `outcome_note` — exactly the fields the skill's point (c) names.
+
+Applied that discriminator: 32 pending rows carry `executed_by=foxtrot`, of which **13 are
+recurring (legitimately return to pending, never closable) and 19 non-recurring**. Of the 19,
+**8 carry a defer_reason** (correctly deferred) and **10 carry an EMPTY `outcome_note`** — a
+claim taken and released with nothing recorded, i.e. residue, not delivered work. One
+(`g-326-142`) carries a 973 B note ending "released as `lane_pin_refused`". **0 genuine
+out-of-cycle completions; 0 mutated.** Note `executed_by` SURVIVES a claim release while
+`claimed_by` is cleared — the same which-field-survived asymmetry this file records for the
+name-less-sid rows, one field over.
+
+**Phase 3 — 22 blocked fleet-wide, 8 attributable to foxtrot, 0 unblock candidates.** All 22
+`blocked_by` values are proper **lists** (guard-5479 clean; 0 bare strings), `blocker_ref`
+absent on 21 and one `dict:infrastructure`. Resolved all 8 dependency targets against a
+3,361-goal index: **every one is live** (blocked 3, pending 5), so Gate 2 held before the
+ownership gate was even reached. Tally: **8 candidates — 0 mutated, 0 foreign sid, 0 absent
+sid, 0 partner.**
+
+**THE STRUCTURE OF THOSE 8 IS THE FINDING, AND IT IS A SINGLE ROOT.** The chains are
+`g-326-172 ← g-326-531 ← g-350-108`, `g-326-183 ← g-326-900 ← g-350-108`,
+`g-326-225 ← g-326-871 ← g-326-882`, `g-326-188 ← g-326-945`, `g-350-176 ← g-350-372`. So
+**4 of 8 converge transitively on g-350-108**, whose defer is `human_blocked:` on a prod API
+key the owner explicitly POSTPONED (do-not-re-ask standing, msg-20260902-231119-alpha-599).
+Half this lane is un-actionable by me and correctly so — there is no reclaim move here, which
+is why it is recorded rather than filed.
+
+**Phase 1b — insights backlog 0**, nothing curated. **Phase 5b — 148 skills / 3902 assertions
+/ 5 parse-lines, 0 stale** (`--all-skills`; the parse-line lane's population is non-zero, so
+it genuinely ran). **Phase 6 — no meta drift surfaced.**
+
+**Lane 7 — the recency illusion was REAL and measurement refuted it, which is the whole
+point of the measure-first rule.** The last five iterations were deliberately minimal footer
+work, so the available narrative was "I have drifted onto hygiene". Measured
+`counted_goals_this_session` (48 elements, bare id STRINGS): **asp-326 35, asp-001 5,
+asp-350 4, asp-372 2, asp-115 1, asp-358 1** — i.e. **39 of 48 = 81% inside the pin-001
+Roblox lane against ONE asp-115 close.** No drift claim survives, and the directive
+instrument run an hour earlier agrees (work_class 5/5 above the 33.3% floor). Classified
+**nothing material** → journal only, no Self edit.

@@ -340,7 +340,8 @@ elif [ "${QUIESCENCE_SLEEP:-0}" = "1" ] || [ "${DRY_SLEEP:-0}" = "1" ] || [ "${E
     if [ "$_QS_JOB_TYPE" != "external-wait-sleep" ]; then
       _QS_WAKE=$(( SLEEP_START + SECONDS_TO_SLEEP ))
       echo "$$ $_QS_WAKE $_QS_JOB_ID" > "$_QS_ACTIVE_FILE"
-      # One line for the caller that must size a wake-up (no-notify harness).
+      # One line naming the registered job and its wake time, for the output file
+      # a backgrounded caller reads (loop-terminal-protocol.md §4.2).
       echo "idle-sleep REGISTERED: job $_QS_JOB_ID pid $_QS_PID seconds $SECONDS_TO_SLEEP wake_at $(_qs_iso "$_QS_WAKE")"
     fi
   fi

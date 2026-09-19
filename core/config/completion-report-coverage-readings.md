@@ -105,3 +105,33 @@ followed by the reading's own interpretation.
   likewise push delta below ceiling; delta equals ceiling, so none did. The overlap is bounded
   and measured, not assumed — but a bracket taken AFTER the window opens is strictly weaker than
   one taken at or before it, and the next run should prefer the latter.
+
+- **2026-09-18, zeta, cc-02 (Linux 6.8.0-139-generic), 22.03h window — 100.0%, denominator 6.**
+  Store split at that instant: **17 resolved vs 1,816 archived** (union deduped by id = 1,833).
+  In-window records 8 (6 CONFIRMED, 1 EXPIRED, 1 UNRESOLVABLE); SCOREABLE 6, of which 6 sat in
+  the resolved stage. guard-2303 applies — `outcome_date` is date-only and this window opens at
+  22:41 on 09-17, so the date-floored denominator is an UPPER BOUND on in-window activity.
+
+  **THIS ROW FALSIFIES THE BACKLOG MODEL AS STATED, AND NAMES THE MISSING QUALIFIER.** The
+  series' standing conclusion is "backlog is the driver; width is noise" — within a fixed window
+  coverage tracks the resolved backlog, so a shallow backlog should read LOW. The backlog here is
+  **17, the LOWEST value anywhere in this series** (prior range 22–78, per the 08-24 high of 78
+  and the 08-15 low of 34), and coverage read its CEILING. Under the model as written that is
+  backwards.
+
+  The reconciliation is a qualifier no prior row states: **backlog governs coverage only for
+  windows WIDER than the archival horizon.** The horizon has been measured repeatedly at ~2.3
+  days or less; a 22.03h window sits ENTIRELY inside it, so every record resolved in-window is
+  necessarily still in the resolved stage and coverage is pinned at 100% *whatever* the backlog
+  is. A shallow backlog then means only that few things resolved recently — it does not mean
+  archival ran ahead of resolution. Both quantities are downstream of the same cadence, which is
+  why they looked causally linked while every window stayed narrow.
+
+  This does NOT overturn the wide-window rows (08-24's 78-deep backlog at ~1.7x width, the
+  08-30/08-31 pair at ~100h). Those cross the horizon, so backlog is genuinely their driver.
+  It bounds where the model applies. Practical consequence for the next reader: **a 100% on a
+  sub-day window is not evidence the instrument is healthy and not evidence the backlog is
+  deep — it is the window being narrower than the horizon, and it carries no information about
+  either.** Only a window wider than ~2.3d can measure anything here. Combined with guard-2303's
+  date-floor, that leaves a usable band between roughly 2.3d and whatever width makes the
+  date-floor leak dominate; rows inside it are the only ones worth comparing.

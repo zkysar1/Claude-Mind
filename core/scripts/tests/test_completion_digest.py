@@ -264,3 +264,46 @@ def test_fully_covered_window_does_not_clamp(world):
     assert data2["coverage"]["clamped"] is False, "clamp fired on a fully-covered window"
     md = cd.render(data2, agent="alpha", since=since_covered, now=NOW, notes="", max_items=10)
     assert "DATA COVERS ONLY" not in md
+
+
+def test_recurring_firings_count_the_world_queue_not_only_the_agent_queues(world):
+    """The recurring-sweep count must cover BOTH stores.
+
+    Regression pin for g-001-04 occ103 (2026-09-18): the counter iterated
+    `agent_files` only, so every WORLD-level sensor was invisible. It passed the
+    per-agent scope leg perfectly -- the agent-queue subtotal was exactly right --
+    and still understated the live fleet by 72%, because 101 of 109 recurring
+    sensors lived in the world queue. The digest published an agent-private count
+    as a claim about the fleet, in the one number the user reads.
+
+    Eleven tests passed while that was live and not one of them said the word
+    `recurring`. So this asserts the SUM across both stores: an assertion scoped
+    to the agent side alone is exactly what the defect already satisfied.
+    """
+    fired = (NOW - timedelta(hours=2)).isoformat()
+    stale = (SINCE - timedelta(hours=5)).isoformat()  # before the window -- must not count
+
+    agent_queue = cd.agents_root() / "alpha" / "aspirations.jsonl"
+    agent_queue.write_text(json.dumps({
+        "id": "asp-001", "title": "Agent upkeep", "status": "active", "goals": [
+            _goal("g-001-04", "pending", recurring=True, lastAchievedAt=fired),
+            _goal("g-001-09", "pending", recurring=True, lastAchievedAt=stale),
+        ]}) + "\n")
+
+    _write(world, [{
+        "id": "asp-115", "title": "Recurring infrastructure monitoring", "status": "active", "goals": [
+            _goal("g-115-817", "pending", recurring=True, lastAchievedAt=fired),
+            _goal("g-115-105", "pending", recurring=True, lastAchievedAt=fired),
+            _goal("g-115-999", "pending", recurring=True, lastAchievedAt=stale),
+            _goal("g-115-000", "pending", recurring=False, lastAchievedAt=fired),
+        ]}])
+
+    data = cd.gather(world, "alpha", SINCE, NOW, 10)
+
+    # 2 world + 1 agent. The pre-fix code returns 1 here.
+    assert data["recurring"] == 3, (
+        f"expected 3 firings (2 world + 1 agent), got {data['recurring']} -- "
+        "a result of 1 means the world queue is not being scanned"
+    )
+    md = cd.render(data, agent="alpha", since=SINCE, now=NOW, notes="", max_items=10)
+    assert "+3 recurring sweeps" in md

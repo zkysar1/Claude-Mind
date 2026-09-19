@@ -260,6 +260,8 @@ class StorageBackend(Protocol):
     def read_jsonl(self, path: PathLike) -> List[dict]: ...
     def write_jsonl(self, path: PathLike, items: List[dict]) -> WriteResult: ...
     def append_jsonl_record(self, path: PathLike, record: dict) -> WriteResult: ...
+    def append_jsonl_records(self, path: PathLike,
+                             records: List[dict]) -> WriteResult: ...
     def modify_jsonl(self, path: PathLike,
                      modifier_fn: Callable[[List[dict]], Optional[List[dict]]],
                      *, initial: Optional[List[dict]] = None) -> List[dict]: ...
@@ -601,6 +603,25 @@ class LocalBackend:
             f.write(json.dumps(record, ensure_ascii=True) + "\n")
         st = p.stat()
         return WriteResult(version=str(st.st_mtime_ns), fallback_used=False)
+
+    def append_jsonl_records(self, path: PathLike,
+                             records: List[dict]) -> WriteResult:
+        """Append N records in ONE open(). Byte-identical to N successive
+        append_jsonl_record calls — _jsonl_text is the same serialiser
+        write_jsonl uses, so each record is its own newline-terminated line.
+        That per-line shape is the whole point: guard-5469 measured what
+        happens when a LIST reaches a per-record append path (one JSON array
+        on one line, valid JSON, wrong shape, no error, and the fleet merge
+        crashes on it). Caller holds the lock; no retry loop, same as the
+        singular form. Empty list is a no-op that still reports a version."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if records:
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(self._jsonl_text(records))
+        st = p.stat() if p.exists() else None
+        return WriteResult(version=str(st.st_mtime_ns) if st else "0",
+                           fallback_used=False)
 
     def modify_jsonl(self, path: PathLike,
                      modifier_fn: Callable[[List[dict]], Optional[List[dict]]],

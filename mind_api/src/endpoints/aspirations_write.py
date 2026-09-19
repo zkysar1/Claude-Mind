@@ -7382,6 +7382,12 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
     # — silently halting the entire recurring cadence (.. all
     # live in the agent queue). Order: land this -> commit (post-commit recycles
     # the daemon) -> verify live -> only then drop the digest guard.
+    #
+    # Did the caller NAME a queue, or merely receive the "world" default? The two
+    # are the same string in `source`, and the collision 409 below must tell them
+    # apart: it exists to make a caller name a queue, so a caller who has named
+    # one must not be refused again with advice already followed.
+    source_named = bool((ctx.query.get("source") or "").strip())
     source = (ctx.query.get("source") or "world").strip()
     if source not in ("world", "agent"):
         return Response.error(400, "invalid_source",
@@ -7412,11 +7418,18 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
             # (): a stale comment misleads the next EDITOR exactly as
             # the stale string misled the next CALLER.
             #
-            # Scoped to source=="world" (): this 409 exists to force the
-            # caller to name a queue, so it is exactly redundant once they have.
-            # Leaving it unscoped would make an explicit `&source=agent` claim of
-            # a colliding id refuse with advice the caller has already followed.
-            if found is not None and source == "world":
+            # Scoped to an UNNAMED source: this 409 exists to force the caller to
+            # name a queue, so it is exactly redundant once they have. 
+            # scoped it to source=="world" so an explicit `&source=agent` would
+            # pass -- but "world" is also the DEFAULT, so an explicit
+            # `&source=world` still drew the 409 and the body's own advice
+            # ("&source=world claims the world copy") could never succeed.
+            # Measured 2026-09-18 on a fresh seed world: the loop digest makes
+            # `--source` mandatory, the two initial templates ship  in
+            # BOTH queues, and a model that follows instructions literally
+            # re-issued `--source world` four ways and never claimed its first
+            # goal. `source_named` is the discriminator the string cannot be.
+            if found is not None and source == "world" and not source_named:
                 agent_live = ctx.paths.agent / "aspirations.jsonl"
                 if agent_live.exists():
                     try:

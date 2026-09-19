@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.77",
+    "previous_version": "2.12.76",
+    "date": "2026-09-19",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet fixes since v2.12.76: 18 fixes across claim collision re-issue, compact-summary budget, deploy-repo derivation, reclaim rule 4, displaced-id occupancy and the spend-cap notice; plus the one-harness-contract refactor retiring the harness-capability table",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.76",
     "previous_version": "2.12.75",
     "date": "2026-09-18",

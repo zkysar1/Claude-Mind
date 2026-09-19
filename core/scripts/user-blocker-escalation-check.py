@@ -723,8 +723,45 @@ def _compose_digest_body(batch: list, cadence_hours: float) -> str:
         # dropping out: a missing answer the reader can see is actionable
         # ("nobody recorded why I am on this"), a missing LINE is not.
         scope = (goal.get("user_leg_scope") or "").strip()
+        defer = str(goal.get("defer_reason") or "").strip()
         if scope:
             lines += ["   NEEDS FROM YOU: %s" % scope]
+        elif defer.lower().startswith("human_blocked"):
+            # SECOND-LEG POPULATION ( added it,  renders it).
+            # Since  this digest also lists goals whose ONLY human
+            # marker is a live `human_blocked:` defer. Those carry no
+            # `user_leg_scope`, so the else-branch below rendered "not recorded
+            # on this goal" for every one of them — measured 2026-09-15, 9 of 26
+            # scanned goals. That line is FALSE for this population: the ask IS
+            # recorded, in `defer_reason`, and this script referenced that field
+            # nowhere. Telling the owner nobody wrote down what he is needed for,
+            # while the sentence naming it sits one field away, is worse than
+            # saying nothing — he cannot act, and he cannot tell it is our bug.
+            # Precedent: completion_digest.py already uses this same defer text
+            # as the needs line for exactly this population.
+            #
+            # QUOTED, and that is not cosmetic (). Defer text is
+            # agent-written prose, so a universal/causal marker inside any one
+            # member's text would make finding-disproof-gate refuse the WHOLE
+            # digest; because the caller records no cooldowns on failure, that
+            # wedges this entire lane on every retry. `> ` puts it inside
+            # strip_quoted() exactly as the description below is, so this
+            # population cannot take the lane down.
+            need = defer.split(":", 1)[1].strip() if ":" in defer else defer
+            need = " ".join(need.split())
+            lines += ["   NEEDS FROM YOU — recorded as a human_blocked defer:"]
+            # Clipped like the description, and clipped SEPARATELY: this is the
+            # ask itself, so it gets its own smaller budget rather than
+            # competing with the background prose below for the 1200.
+            needs_budget = 400
+            if len(need) > needs_budget:
+                lines += ["   > %s" % need[:needs_budget],
+                          "   > [...%d more characters withheld to keep this "
+                          "email short. Reply asking for the full text of %s "
+                          "and we will send it.]"
+                          % (len(need) - needs_budget, gid)]
+            else:
+                lines += ["   > %s" % need]
         else:
             lines += ["   NEEDS FROM YOU: not recorded on this goal — if the "
                       "description below does not make it obvious, that is our "
@@ -774,13 +811,26 @@ def _compose_digest_body(batch: list, cadence_hours: float) -> str:
             # digest reproducing full descriptions is not a digest still holds —
             # but the truncation now SAYS how much it dropped instead of a bare
             # ellipsis, so the reader knows whether to open the goal.
+            #
+            # AND THE WITHHELD-TEXT NOTICE NAMES A RETRIEVAL THE READER CAN
+            # ACTUALLY PERFORM (). "read the full goal by id above"
+            # is an instruction to query a JSONL store the owner has no access
+            # to and no reason to learn — so for its actual reader the notice
+            # reported a loss and offered no way to undo it. The reply-to-close
+            # contract in the footer already establishes that this email IS the
+            # interface, so the recoverable route is the one the reader is
+            # already holding: reply and ask. The budget is deliberately NOT
+            # raised (this goal's outcome 4, and the 2026-08-03 "caused anxiety"
+            # feedback that a longer email is itself the complaint) — what
+            # changes is that the clip stops being a dead end.
             budget = 1200
             flat = " ".join(desc.split())
             clipped = flat[:budget]
             if len(flat) > budget:
                 lines += ["   > %s" % clipped,
-                          "   > [...%d more characters — read the full goal by id "
-                          "above]" % (len(flat) - budget)]
+                          "   > [...%d more characters withheld to keep this "
+                          "email short. Reply asking for the full text of %s "
+                          "and we will send it.]" % (len(flat) - budget, gid)]
             else:
                 lines += ["   > %s" % clipped]
     lines += [

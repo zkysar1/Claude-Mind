@@ -64,7 +64,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _paths import AGENT_DIR  # noqa: E402
-import _harness_caps  # noqa: E402  (no-notify harness directive lines)
+import _sleep_directive  # noqa: E402  (the one owner of the yield block)
 import _dry_idle  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402  (guard-580/581: never a bare 'bash' argv[0])
 
@@ -312,9 +312,9 @@ def emit_directive(sleep_seconds, marker, streak):
         "one -- so the all-blocked handler must NOT be reloaded (that is the dry\n"
         f"spin this guard exists to stop). Dry-idle streak is now {streak}.\n"
         "DO NOT load the all-blocked handler. DO NOT run selection or execution.\n"
-        # Harness-keyed yield block, one owner ( leg c) — see
-        # _harness_caps.sleep_directive for why the hardcoded pair was a defect.
-        + _harness_caps.sleep_directive(sleep_seconds, agent, "DRY_SLEEP=1") +
+        # The yield block, one owner (guard-2485) and ONE text on every harness
+        # (loop-terminal-protocol.md §4.2) — see _sleep_directive for its history.
+        + _sleep_directive.sleep_directive(sleep_seconds, agent, "DRY_SLEEP=1") +
         "The sleep is registered as a Tier-A background job by interruptible-sleep.sh,\n"
         "so stop-hook Gate 2.6 ALLOWs this turn-end (guard-967 / guard-1230).\n"
         "======================"

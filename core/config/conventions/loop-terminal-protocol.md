@@ -135,6 +135,34 @@ they are ADDITIVE and never load-bearing: the reducer BLOCK carries
 unconditionally (Zak-Code ADR-0102; precedent g-353-74's parked/closed lines),
 because Claude Code drops keys it does not define without error.
 
+### 4.2 The harness-capability table is gone: every harness reports a background job's exit (2026-09-18)
+
+§4.1's principle had one remaining exception in code. From g-357-89 (2026-09-03) the
+framework carried `_harness_caps.py` — a table saying which harness could notify on a
+background job's exit (`background_job_notify`) and how long a foreground sleep it would
+carry (`max_foreground_sleep_seconds`, g-373-10 leg c) — and four printers plus
+`aspirations-all-blocked` B7.2 branched on it: on a no-notify harness the idle sleep was
+launched with a trailing `&` and a sized `ScheduleWakeup` WAS the re-entry (the
+`schedule-wakeup-correctness.md` carve-out); on a capped one the sleep was chunked in the
+foreground. Those were the framework asking which harness ran it, and they were true
+facts about the vessel: its bash tool had no background run and never notified.
+
+The vessel implemented the contract instead (Zak-Code ADR-0191, PR #535):
+`Bash(run_in_background=true)` returns at once with a task id and an output file, and the
+session is handed Claude Code's `<task-notification>` block at its next idle prompt when
+the command exits — so a backgrounded `interruptible-sleep.sh`, which polls its wake
+signals every second and exits rc=2 the moment one lands, re-enters the loop right then on
+either harness. With that, the table, its `MIND_HARNESS_BG_NOTIFY` override,
+`harness-capabilities.sh`, both branches and their tests were deleted; the yield block has
+ONE owner (`core/scripts/_sleep_directive.py`, reached from shell by `sleep-directive.sh`)
+and ONE text — the one Claude Code always got. **Vessel version floor**: a Mind served by
+a Zak Code older than ADR-0191 gets a foreground sleep that ignores `run_in_background`
+and `unknown tool` for `TaskOutput`; the floor is recorded in the vessel's
+CLAUDE-MIND-COMPAT and is not something the framework detects — one contract, no branch.
+`detect_harness` had no other reader; the provenance readers
+(`_runtime.sh::rt_judge_provenance`, `skill-evaluate.py`, `_confidence_ledger.py`) read
+the env markers themselves and only ever label a record.
+
 ## 5. Origin of the slash-prefix rule (2026-05-18)
 
 Discovered 2026-05-18 from zeta session f1f3066e: four consecutive

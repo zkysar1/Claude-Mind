@@ -984,30 +984,25 @@ Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --g
 # (g-115-2084-c) dry_sleep_env carries DRY_SLEEP=1 — same Tier-A bg-job
 # registration (Gate 2.6 ALLOW, guard-967), NO demotion (partner activity may
 # create claimable work). Legacy arrivals leave both unset (unregistered).
-# HARNESS BRANCH (g-357-89): "the harness re-invokes on completion" is a Claude
-# g-357-88: ONE diary row before the branch, so both yield shapes leave a trace.
+# g-357-88: ONE diary row before the yield, so it leaves a trace.
 # The 2026-09-03 02:10Z incident reported "[x] 23 Step B7.2: Yield ... complete"
 # with ZERO diary rows across the whole 66-min handler; this line is what makes
 # that claim falsifiable, and dry-spin-guard.py reads its absence.
 Bash: echo '{"entry_type":"finding","content":"B7.2: yielding via bg interruptible-sleep {sleep_seconds}s"}' | bash core/scripts/execution-diary.sh append
-# Code fact (run_in_background → task notification). Ask, never assume:
-Bash: bash core/scripts/harness-capabilities.sh --get background_job_notify   # true | false (unknown harness → false: a spare net is harmless, a missing one is a dead loop)
-IF true:
-  Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} (run_in_background=true)
-  RETURN   # yield contract (guard-153): the bg sleep IS the terminal tool call; the harness
-           # re-invokes on completion/wake — no ScheduleWakeup arm, no synchronous Skill
-           # re-entry (that re-entry is the dry spin this branch exists to stop — g-115-2084).
-IF false (no background-job notification — measured on a downstream harness 2026-09-03: five launch attempts, three sleep processes, a 2-minute "quiet window"):
-  Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} &   # ONCE. The tool may time out on this call — the process survives; a repeat launch JOINS the live sleep ("idle-sleep JOINED"), it never spawns another
-  ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=min({sleep_seconds}+60, 3600))   # TERMINAL call: the wake IS the re-entry here (rb-9668; sanctioned carve-out of schedule-wakeup-correctness.md Anti-pattern C). A remainder past 3600s re-sleeps via Phase -0.5e — which is why B7 MUST have written blocked_sleep_until
-  RETURN   # no Skill(aspirations), no further Bash, no prose
+# ONE harness contract (loop-terminal-protocol.md §4.1/§4.2): every harness the loop
+# runs on reports a background job's exit — Claude Code natively, Zak Code since its
+# ADR-0191 — so there is nothing to ask. The g-357-89 no-notify branch (a trailing & plus
+# a sized ScheduleWakeup as the re-entry) was deleted 2026-09-18 with the capability table.
+Bash: {quiescence_sleep_env or dry_sleep_env:-} bash core/scripts/interruptible-sleep.sh {sleep_seconds} (run_in_background=true)
+RETURN   # yield contract (guard-153): the bg sleep IS the terminal tool call; the harness
+         # re-invokes on completion/wake — no ScheduleWakeup arm, no synchronous Skill
+         # re-entry (that re-entry is the dry spin this step exists to stop — g-115-2084).
 ```
 
 > **RETURN-PROTOCOL TRAP — read before you write anything after the Bash call (g-115-770, zeta session 74).**
 >
-> The `interruptible-sleep.sh ... run_in_background=true` Bash call above — or, on
-> a no-notify harness, the sized `ScheduleWakeup` after it — **IS the terminal
-> tool call** for the RETURN path. **NO prose may follow it** —
+> The `interruptible-sleep.sh ... run_in_background=true` Bash call above **IS the
+> terminal tool call** for the RETURN path. **NO prose may follow it** —
 > not a "Summary of this iteration", not "the autonomous loop is now in a
 > self-recovering blocked state", not a ✶ Insight block, not a "going idle"
 > sign-off. The tool call is LAST, period.

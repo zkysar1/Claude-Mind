@@ -545,3 +545,42 @@ outcome was recorded on sig-244.
 Stamped 10, verified 10 (per-id, `replay-stamp-verify.sh`; each `replay_count` = prior +
 1). Step 3.6 eligible: 0 (positive controls on the same read: rc>=3 65, CORRECTED 197).
 Step 3.5 skipped (0 indicators).
+
+## Run 74 — 2026-09-19, zeta, hostname cc-02, uname -r 6.8.0-139-generic (own-cloud)
+
+**The 5/5 "UNRESOLVABLE died at its pre-registered measurement channel" pattern from runs
+72/73 did NOT survive pool re-measurement, and nothing was encoded from it.** Runs 72/73
+observed the shape in a violation-first BATCH, where every rate is upward-biased by
+construction (guard-2129). Re-measured against the POOL: enrichment **+14.3pp at n=63** —
+UNRESOLVABLE **39.7%** vs base **25.4%**, with CORRECTED at **35.7%**, only ~4pp behind.
+That delta sits INSIDE the size-matched floor of roughly 14pp, so it is not distinguishable
+from selection effects, and the CORRECTED arm being nearly as high says the marker is not
+picking out UNRESOLVABLE specifically. Population named on every figure above: the pool, not
+the batch, not the corpus.
+
+**The ~14pp floor is an ESTIMATE, not a computed permutation floor** — unlike the run
+recorded immediately above, which carried median/p95/exceedance from an actual permutation.
+That is the one number here worth tightening: if a computed size-matched null at n=63 comes
+in materially below 14pp, +14.3pp becomes interesting again and this reading should be
+revisited rather than cited as a settled negative.
+
+**Batch composition.** 10 = 6 rule-2 (`surprise >= 5`) + 4 rule-1, STRATIFIED across
+`replay_count` rather than sorted by it. Rule 2 was live for the first time in three runs —
+runs 72/73 read it as empty, and that reading must not be inherited. Stamped 10, verified 10,
+failed 0 (`replay-stamp-verify.sh`, per-id).
+
+**Step 3.6 eligible: 2**, after two consecutive runs of 0 — so its emptiness is not a
+standing property and should be re-checked, never assumed. Both were the same shape (predicted
+negligible magnitude, CORRECTED because actual was substantial): strengthened guard-398 twice,
+nucleated nothing, both marked `encoded_via_chronic` and value-verified.
+
+**Three instrument corrections caught before they became findings.** (1) `while read -r id`
+over a join-produced file (no trailing newline) requested 9 of 10, and the self-check
+"PARSED == requested" PASSED at 9 — parser and loop were ONE traversal sharing the defect, so
+the assertion could not fail. The comparator must be the INTENDED BATCH SIZE, an
+independently-known integer. guard-3915 already named this exact failure and never reached the
+loop; siting diagnosis in rb-11314, remedy filed as g-115-10302. (2) Narrative-chain gap:
+`2026-08-16_client-cap-fix` carries its lesson under `lesson`, an UNCHAINED key `--narrative`
+misses (instance for g-115-10108); `2026-08-03_sanitized-script-error` is genuinely bare.
+(3) **`--replay-candidates` is pre-filtered to due-only, so NO due-RATE is computable from
+it** — do not derive one.

@@ -476,6 +476,19 @@ def test_real_repo_union_scope_is_evidence_gated():
         "core/config/replay-instrument-readings.md": "ayoai-append-ledger",
         "core/config/completion-report-coverage-readings.md": "ayoai-append-ledger",
         "core/config/fresh-eyes-shard-readings.md": "ayoai-append-ledger",
+        # The three ROUTED readings ledgers, moved here 2026-09-18 ().
+        # The first two were merge=union and the third merge=ayoai-journal-md;
+        # both routes are wrong for a multi-writer append ledger. union emits a
+        # line two concurrent appends SHARE exactly once and interleaves the
+        # blocks silently (production: merge 10069ea4c0 on strategic-scan-
+        # readings.md, guard-6868), and the section driver conflicts on any
+        # append that opens no `## ` section (28 of 30 replayed pairs on
+        # run-full-suite-baselines.md). Note union's deleted-lines evidence gate
+        # passed all three — it measures whether history was EDITED, not whether
+        # two appends share a line, which formulaic dated blocks always do.
+        "core/config/strategic-scan-readings.md": "ayoai-append-ledger",
+        "core/config/felt-sense-readings.md": "ayoai-append-ledger",
+        "core/config/run-full-suite-baselines.md": "ayoai-append-ledger",
     }
     r = subprocess.run(
         ["git", "-C", str(PROJECT_ROOT), "check-attr", "merge", "--",

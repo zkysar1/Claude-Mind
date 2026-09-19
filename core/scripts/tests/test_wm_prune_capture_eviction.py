@@ -597,11 +597,114 @@ def test_both_twins_archive_before_deleting_a_capture(path):
     every other test in this file would stay green.
     """
     block, _ = _prune_block(path, "")
-    assert "archive_evicted_capture(" in block, (
-        f"{path.name}: the prune eviction loop must archive before it deletes")
+    # : the call is now the BATCHED plural. The invariant this pins is
+    # unchanged — archive before delete — but the singular name must NOT come
+    # back here: one archive call per evicted row re-PUTs the whole object per
+    # row on a whole-object-PUT backend (guard-6134/guard-6904), which is the
+    # O(N^2) defect that cost 4,829 versions / 231.3 GiB in a single day.
+    assert "archive_evicted_captures(" in block, (
+        f"{path.name}: the prune eviction loop must archive before it deletes, "
+        f"via the BATCHED archive_evicted_captures")
+    assert "archive_evicted_capture(" not in block, (
+        f"{path.name}: the prune loop must not archive ONE ROW AT A TIME — that "
+        f"is one whole-object PUT per row (g-115-9962)")
     assert "evicted_summary(" in block, (
         f"{path.name}: the eviction record must name what was dropped")
     src = path.read_text(encoding="utf-8")
-    assert "def archive_evicted_capture(" in src and "def evicted_summary(" in src, (
+    assert ("def archive_evicted_captures(" in src
+            and "def archive_evicted_capture(" in src
+            and "def evicted_summary(" in src), (
         f"{path.name}: must DEFINE the helpers it calls, not import them from "
         f"its twin — these two files are deliberate copies (guard-742)")
+
+
+# ---------------------------------------------------------------------------
+#  — the BATCHED archive. One prune, one write.
+# ---------------------------------------------------------------------------
+# The defect these pin: the prune loop archived ONE ROW PER CALL, and under a
+# whole-object-PUT backend each call re-PUT the entire archive object, so N
+# evictions cost N full PUTs of a growing file. Measured on the live store,
+# UTC day 2026-09-17: 4,829 versions / 231.3 GiB of a single key, mean PUT
+# 51,425,047 B against a 49,857,387 B object (guard-6134, guard-6904).
+
+
+def test_archive_evicted_captures_is_ONE_write_for_N_rows(tmp_path, monkeypatch):
+    """The whole point of the change: N rows must cost exactly ONE locked write.
+
+    Counting the WRITES is the only assertion that distinguishes the fix from
+    the defect — the archived CONTENT is identical either way, which is why a
+    content-only test stayed green through the O(N^2) behaviour.
+    """
+    import _fileops
+    calls = []
+    monkeypatch.setattr(_fileops, "locked_append_jsonl_many",
+                        lambda path, items: calls.append((path, list(items))))
+    rows = [{"goal_id": f"g-000-{i:02d}", "_item_ts": f"2026-09-18T10:0{i}:00"}
+            for i in range(6)]
+
+    assert wm.archive_evicted_captures(str(tmp_path), LANE, rows,
+                                       "array_limit") is True
+    assert len(calls) == 1, (
+        f"6 evicted rows produced {len(calls)} locked writes — the batched "
+        f"archive must issue exactly ONE (one whole-object PUT), not one per row")
+    assert len(calls[0][1]) == 6, "all six rows must ride in the single write"
+
+
+def test_batched_archive_writes_N_DICT_LINES_not_one_array(tmp_path):
+    """guard-5469, verified BY TYPE rather than by count.
+
+    Passing a list to a per-record append writes one JSON array on one line:
+    valid JSON, wrong shape, no error — and every per-record consumer then
+    mis-handles it (the measured case crashed the FLEET MERGE, not the writer).
+    A line COUNT cannot tell 6 records from one array of 6, so this asserts the
+    parsed TYPE of every line.
+    """
+    import json
+    rows = [{"goal_id": f"g-000-{i:02d}", "_item_ts": f"2026-09-18T10:0{i}:00"}
+            for i in range(6)]
+    assert wm.archive_evicted_captures(str(tmp_path), LANE, rows,
+                                       "array_limit") is True
+
+    archive = tmp_path / wm.CAPTURE_EVICTION_ARCHIVE
+    lines = [ln for ln in archive.read_text(encoding="utf-8").splitlines()
+             if ln.strip()]
+    assert len(lines) == 6, f"expected 6 JSONL rows, got {len(lines)}"
+    for ln in lines:
+        parsed = json.loads(ln)
+        assert isinstance(parsed, dict), (
+            f"a JSONL row parsed as {type(parsed).__name__}, not dict — this is "
+            f"the guard-5469 list-on-one-line shape")
+        assert parsed["slot"] == LANE and parsed["eviction_reason"] == "array_limit"
+    assert [p["entry"]["goal_id"] for p in (json.loads(ln) for ln in lines)] == \
+        [r["goal_id"] for r in rows], "FIFO order must survive the batch"
+
+
+def test_a_failed_batch_archive_keeps_EVERY_row(tmp_path, monkeypatch):
+    """Outcome 2 at the contract level: False means KEEP, and it is all-or-nothing.
+
+    The per-row loop could archive k rows and fail on k+1, leaving a batch half
+    durable. One write cannot do that — so the caller never has to reason about
+    a partial archive.
+    """
+    import _fileops
+
+    def _boom(path, items):
+        raise OSError("sink unavailable")
+
+    monkeypatch.setattr(_fileops, "locked_append_jsonl_many", _boom)
+    rows = [{"goal_id": f"g-000-{i:02d}"} for i in range(4)]
+
+    assert wm.archive_evicted_captures(str(tmp_path), LANE, rows,
+                                       "array_limit") is False, (
+        "a failed archive MUST report False so the caller keeps the rows — "
+        "fail-open here is a silent destroy")
+    assert not (tmp_path / wm.CAPTURE_EVICTION_ARCHIVE).exists(), (
+        "nothing may have been written by a failed batch")
+
+
+def test_empty_victim_list_is_a_noop_that_still_reports_success(tmp_path):
+    """No rows to archive is SUCCESS, not failure — returning False here would
+    make the caller keep a lane it never needed to keep."""
+    assert wm.archive_evicted_captures(str(tmp_path), LANE, [],
+                                       "array_limit") is True
+    assert not (tmp_path / wm.CAPTURE_EVICTION_ARCHIVE).exists()
