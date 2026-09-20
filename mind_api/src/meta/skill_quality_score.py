@@ -267,25 +267,42 @@ def score(ctx) -> "Response":  # type: ignore[name-defined]
     # standard .lock). Threading lock + explicit .yaml.lock file lock.
     quality_path = ctx.paths.meta / "skill-quality.yaml"
     lock_path = quality_path.with_suffix(".yaml.lock")
-    thread_lock = file_locks.manager().get(quality_path)
-    thread_lock.acquire()
     try:
-        try:
-            file_locks.acquire_lock(lock_path, timeout=15, stale_seconds=60)
-        except TimeoutError:
-            return Response.error(503, "lock_timeout",
-                                  "skill-quality.yaml lock busy; try again")
-        try:
-            # Judge provenance is forwarded from the caller's body; the writer
-            # must not read it from this long-lived process's environment
-            # (guard-2480, ).
-            scored_line = skill_evaluate._score_write(
-                ctx, skill, goal, grades,
-                body.get("judge_model"), body.get("harness"))
-        finally:
-            file_locks.release_lock(lock_path)
-    finally:
-        thread_lock.release()
+        # BOUNDED + REGISTERED thread-lock acquire (). This replaces
+        # a bare `thread_lock.acquire()` that was unbounded — one holder parked
+        # in I/O blocked every later scorer forever, the defect 
+        # fixed inside file_locks.locked() — AND unregistered: it wrote no
+        # _HOLDS entry, so file_locks.write_path_status(), the surface
+        # /v1/admin/health reports, could not see a wedge on this path at all.
+        # A reader checking /health got a clean verdict over a wedged write
+        # path. This site cannot simply call locked(): it needs the custom
+        # `.yaml.lock` file-lock path above, which locked() hardcodes.
+        #
+        # WHY THE OUTER `except` IS REQUIRED AND NOT REDUNDANT: WritePathWedged
+        # subclasses TimeoutError so that callers mapping a lock timeout to a
+        # 503 keep working — but the pre-existing handler just below wraps ONLY
+        # acquire_lock, and the bare thread acquire sat OUTSIDE it. A wedge
+        # raise would therefore have escaped this endpoint as a 500. Catching
+        # the specific class here (rather than widening the inner handler to a
+        # bare TimeoutError around the whole block) leaves _score_write's own
+        # exceptions propagating exactly as before.
+        with file_locks.thread_locked(quality_path):
+            try:
+                file_locks.acquire_lock(lock_path, timeout=15, stale_seconds=60)
+            except TimeoutError:
+                return Response.error(503, "lock_timeout",
+                                      "skill-quality.yaml lock busy; try again")
+            try:
+                # Judge provenance is forwarded from the caller's body; the writer
+                # must not read it from this long-lived process's environment
+                # (guard-2480, ).
+                scored_line = skill_evaluate._score_write(
+                    ctx, skill, goal, grades,
+                    body.get("judge_model"), body.get("harness"))
+            finally:
+                file_locks.release_lock(lock_path)
+    except file_locks.WritePathWedged as exc:
+        return Response.error(503, "lock_timeout", str(exc))
 
     trailer = json.dumps({
         "derived": dict(derived),

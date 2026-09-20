@@ -46,7 +46,9 @@ import contextvars
 import json
 import os
 import random
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable, List, Optional, Protocol, Union, runtime_checkable
@@ -464,14 +466,37 @@ class LocalBackend:
                       binary: bool = False, encoding: str = "utf-8",
                       max_retries: int = 10) -> WriteResult:
         target = Path(target)
-        # Deterministic tmp name — single-writer is guaranteed by the caller's
-        # lock, so two writers cannot collide here.
-        tmp = Path(str(target) + ".tmp")
+        # PER-WRITER tmp name (, porting  D3).
+        #
+        # This was `Path(str(target) + ".tmp")`, justified as "single-writer is
+        # guaranteed by the caller's lock, so two writers cannot collide here."
+        # That proposition now has a MEASURED counterexample: all 8 wm.py write
+        # call sites were lock-protected and a 13.9 MB file was spliced anyway,
+        # the suite log carrying a FileExistsError from the lock itself. The
+        # locks here are ADVISORY with a staleness break, so they can fail to
+        # exclude; a per-writer name cannot. Every governed store — aspirations,
+        # team-state, guardrails, reasoning-bank, changelog, pipeline,
+        # experience — funnels through this function, and those are written by
+        # several agents at once as the normal case.
+        #
+        # Mode is copied from the existing target (or defaulted through the
+        # umask) because mkstemp creates 0600, which would otherwise silently
+        # make a cross-agent store unreadable to a cross-uid reader (rb-4790).
+        try:
+            file_mode = stat.S_IMODE(target.stat().st_mode)
+        except (FileNotFoundError, OSError):
+            umask = os.umask(0)
+            os.umask(umask)
+            file_mode = 0o666 & ~umask
         mode = "wb" if binary else "w"
         open_kw = {} if binary else {"encoding": encoding}
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=target.name + ".", suffix=".tmp")
+        tmp = Path(tmp_name)
         try:
-            with open(tmp, mode, **open_kw) as f:
+            with os.fdopen(fd, mode, **open_kw) as f:
                 write_to_handle(f)
+            os.chmod(tmp, file_mode)
         except Exception:
             try:
                 tmp.unlink()

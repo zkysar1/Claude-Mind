@@ -932,3 +932,39 @@ def test_the_prune_gate_is_per_working_memory_not_global(tmp_path):
         gate_b.release()
     finally:
         gate_a.release()
+
+
+def test_daemon_archive_evicted_captures_is_ONE_write_for_N_rows(tmp_path, monkeypatch):
+    """guard-742/2323 twin parity for the batched archive — the LIVE path.
+
+    core/scripts/tests/test_wm_prune_capture_eviction.py pins this invariant on
+    the CLI twin (wm.archive_evicted_captures). THIS is the twin the daemon
+    actually executes, and the measured incident — 4,829 versions / 231.3 GiB
+    of one key in a single UTC day — happened on the DAEMON path, not the CLI
+    one. Until now only the un-run twin was pinned, so a regression reintroduced
+    here would ship with the suite green (g-115-9962).
+
+    Counting the WRITES is the only assertion that separates the fix from the
+    defect: the archived CONTENT is identical whether N rows go out in one
+    locked write or N of them.
+    """
+    from mind_api.src.endpoints import wm_write
+    import _fileops
+
+    calls = []
+    monkeypatch.setattr(_fileops, "locked_append_jsonl_many",
+                        lambda path, items: calls.append((path, list(items))))
+
+    rows = [{"goal_id": f"g-000-{i:02d}", "_item_ts": f"2026-09-20T10:0{i}:00"}
+            for i in range(6)]
+    assert wm_write.archive_evicted_captures(
+        str(tmp_path), "spark_capture", rows, "array_limit") is True
+
+    assert len(calls) == 1, (
+        f"6 evicted rows produced {len(calls)} locked writes — the batched "
+        f"archive must issue exactly ONE (one whole-object PUT), not one per "
+        f"row. One-per-row is the O(N^2) defect (guard-6134, guard-6904).")
+    assert len(calls[0][1]) == 6, "all six rows must ride in the single write"
+    assert [r["entry"] for r in calls[0][1]] == rows, (
+        "every evicted row must reach the archive, in eviction order — "
+        "archive-before-delete is only honoured if the batch is complete")

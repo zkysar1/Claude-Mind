@@ -240,6 +240,19 @@ GOAL_KNOWN_FIELDS = frozenset({
     'verify_verdict',                    # 0 (new)
     'windowStreak',                      # 81
     'work_class',                        # 2758
+    # g-115-10225: the artifact surface(s) this goal's work touches, as tags
+    # drawn from the vocabulary the lane-pin registry already uses
+    # ("client-lua", "framework-scripts", "in-session-verification"). READ by
+    # gates/lane_pin.py::_surface_hits, which joins it EXACTLY against a pin's
+    # harvested columns. It exists because the pin names ARTIFACTS while goals
+    # are titled in OUTCOMES, so the prose join misses by default (guard-6963)
+    # and 5 of 12 aged handoffs reached NO verdict. 0 at introduction BY
+    # CONSTRUCTION — it is a going-forward declaration, and an ABSENT value
+    # means "not declared", never "no surface": the gate treats an unstamped
+    # goal byte-identically to today, which is what keeps the widening delta
+    # measurable (guard-2201). Shipped with its writer in this same change
+    # (the four measured aged handoffs), per this module's extension rule.
+    'work_surface',                      # 0 (new)
 })
 
 # Fields observed on live records that are NOT legitimate. Kept as data rather

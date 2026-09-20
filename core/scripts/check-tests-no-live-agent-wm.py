@@ -47,8 +47,97 @@ from _runtime_bash import bash_cmd  # noqa: E402  (guard-580)
 PROJECT_ROOT = Path(__file__).resolve().parents[1].parent
 TESTS_DIR = PROJECT_ROOT / "core" / "scripts" / "tests"
 
+# --- Every DECLARED testpath, not one ( outcome 4) ----------------
+# TESTS_DIR above was the whole scan surface: 1,356 files, while the 145 under
+# mind_api/tests and the 21 under core/tests/gates were structurally invisible —
+# 166 of 1,522 test files (11%) that this check reported PASS over without ever
+# opening. That is the same single-testpath assumption that cost the suite
+# runner 1,448 unrun tests in , and it composed with the missing
+# daemon route below: the files most likely to write working memory through the
+# daemon are exactly the ones under mind_api/tests.
+#
+# DERIVED AT CHECK TIME, NEVER HARDCODED — the third member of this module's
+# derive-don't-pin family, alongside the roster (guard-1699) and the wm.py write
+# vocabulary. A pinned list goes stale the moment pytest.ini grows a testpath,
+# and would then report PASS over a directory nobody is scanning: the vacuous
+# green this module exists to prevent, reproduced one axis over.
+PYTEST_INI = PROJECT_ROOT / "pytest.ini"
+
+
+def declared_testpaths() -> list[Path]:
+    """The testpaths pytest itself collects, read from pytest.ini.
+
+    Raises so main() can fail LOUD (exit 2) rather than silently narrowing to
+    one directory. A check that cannot see its own scan surface has no opinion
+    about what is in the directories it did not open.
+    """
+    try:
+        raw = PYTEST_INI.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise RuntimeError(f"could not read {PYTEST_INI}: {exc}") from exc
+
+    paths: list[Path] = []
+    in_block = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("testpaths"):
+            in_block = True
+            # `testpaths = a b` on one line is legal INI too.
+            _, _, inline = stripped.partition("=")
+            for tok in inline.split():
+                paths.append(PROJECT_ROOT / tok)
+            continue
+        if in_block:
+            # The block ends at the first line that is not an indented value:
+            # a new key, a section header, or a blank/comment at column 0.
+            if not line[:1].isspace() or not stripped:
+                in_block = False
+                continue
+            if stripped.startswith("#"):
+                continue
+            paths.append(PROJECT_ROOT / stripped)
+
+    existing = [p for p in paths if p.is_dir()]
+    if not existing:
+        raise RuntimeError(
+            f"{PYTEST_INI} declared no existing testpaths — the scan surface is "
+            "underivable, so every unscanned directory would read as clean"
+        )
+    return existing
+
+
 WM_WRITER_NAMES = {"WM_SET_SH", "WM_APPEND_SH"}
 WM_WRITER_PATHS = ("wm-set.sh", "wm-append.sh")
+
+# --- The DAEMON HTTP route ( outcome 5) ---------------------------
+# wm-set.sh / wm-append.sh are daemon-only: they are `rt_call POST /v1/wm/set`
+# with no Python CLI fallback. So the production write route is an HTTP call,
+# and a test that makes that call directly wrote working memory while both
+# halves of this check's vocabulary — the two wrapper basenames and the wm.py
+# subprocess shape — saw nothing. 8 real test files use it.
+WM_HTTP_ROUTE_PREFIX = "/v1/wm/"
+
+# --- The redirect that makes a live-roster binding SAFE ----------------------
+# MIND_AGENT_DIR points the writer at a throwaway agent dir, so a test may bind
+# a live-roster name and still be harmless — mind_api/tests/test_runtime_wm_write.py
+# does exactly that (MIND_AGENT="alpha" at :676 beside MIND_AGENT_DIR at :677).
+# Before this, the check contained ZERO occurrences of MIND_AGENT_DIR, so that
+# file's safety was INCIDENTAL to the check rather than verified by it — and
+# widening the scan to mind_api/tests without this predicate would have turned
+# the check red on arrival against a correct test, which is precisely the
+# "fails from the day it lands" failure this module's header warns about.
+#
+# Exemptions are COUNTED and REPORTED, never silent: a suppression nobody can
+# see is indistinguishable from a population that was never there (guard-2352).
+AGENT_DIR_REDIRECT_ENV = "MIND_AGENT_DIR"
+
+# The second isolation mechanism: the suite's in-process daemon over a TMP
+# project root. It is how the HTTP route above is exercised hermetically, so
+# recognising the route without recognising this flags correct tests — measured
+# on arrival against test_wm_lock_spans_read_write_g115_8667.py and
+# test_wm_lost_update_no_stall_g115_8536.py, both of which document their own
+# hermeticity ("never [touches] the live world") and were right.
+DAEMON_FIXTURE_NAME = "DaemonFixture"
 
 # --- The wm.py DIRECT route () -------------------------------------
 # The two wrappers above were the whole writer vocabulary, so a test that spawns
@@ -256,7 +345,84 @@ def analyze(path: Path, roster: set[str], write_subcommands: set[str]) -> list[s
                     and isinstance(default, ast.Constant) and isinstance(default.value, str)):
                 bound.add(default.value)
 
-    return sorted(bound & roster) if writes_wm else []
+    # The DAEMON HTTP route (outcome 5). Any string naming /v1/wm/<write-verb>
+    # is a production working-memory write — the route wm-set.sh itself uses.
+    # Derived from the same wm.py vocabulary as the subprocess route, so a new
+    # subcommand is recognised on both at once rather than on one of them.
+    if not writes_wm:
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docs
+                    and WM_HTTP_ROUTE_PREFIX in node.value):
+                verb = node.value.split(WM_HTTP_ROUTE_PREFIX, 1)[1].split("?", 1)[0]
+                verb = verb.strip("/").split("/", 1)[0]
+                if verb in write_subcommands:
+                    writes_wm = True
+                    break
+
+    if not writes_wm:
+        return [], False
+
+    offenders = sorted(bound & roster)
+    if offenders:
+        isolation = _isolation_reason(tree, docs)
+        if isolation:
+            # Bound live, but the write cannot reach the live agent — and now
+            # VERIFIED so rather than incidentally so.
+            return [], isolation
+    return offenders, None
+
+
+def _isolation_reason(tree: ast.AST, docs: set[int]) -> str | None:
+    """Name the mechanism that keeps this file's WM writes off the live agent.
+
+    Returns a short reason, or None when nothing isolates the write. A NAME
+    rather than a bool because the exemption is reported: a suppression nobody
+    can see is indistinguishable from a population that was never there
+    (guard-2352), and "1 file exempted" invites the next reader to ask which
+    mechanism — which is the question that catches a wrong exemption.
+
+    TWO mechanisms, because there are two in the tree and recognising only the
+    first made this check RED ON ARRIVAL against two correct tests
+    (measured 2026-09-20 while landing outcome 5):
+
+      * MIND_AGENT_DIR — points the writer at a throwaway agent dir.
+        mind_api/tests/test_runtime_wm_write.py binds "alpha" at :676 beside
+        this at :677.
+      * DaemonFixture   — an in-process daemon over a TMP project root, which
+        is how the HTTP route is exercised hermetically.
+        test_wm_lock_spans_read_write_g115_8667.py and
+        test_wm_lost_update_no_stall_g115_8536.py both do
+        `DaemonFixture(world, agent=AGENT)` against a tmp world; the first also
+        repoints `_paths.WORLD_DIR` at tmp_path.
+
+    PRESENCE is the predicate, not the value. The value is a fixture path
+    (`str(agent_dir)`, a tmp world) that no static read can resolve, so
+    requiring a resolvable literal would make the exemption unreachable for
+    every real caller — the over-narrow-predicate failure of guard-1802, where
+    a live candidate set of zero stood against 28 real goals.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            for k in node.keys:
+                if isinstance(k, ast.Constant) and k.value == AGENT_DIR_REDIRECT_ENV:
+                    return AGENT_DIR_REDIRECT_ENV
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if (isinstance(tgt, ast.Subscript) and isinstance(tgt.slice, ast.Constant)
+                        and tgt.slice.value == AGENT_DIR_REDIRECT_ENV):
+                    return AGENT_DIR_REDIRECT_ENV
+        elif (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and id(node) not in docs and node.value == AGENT_DIR_REDIRECT_ENV):
+            # monkeypatch.setenv("MIND_AGENT_DIR", ...) and friends.
+            return AGENT_DIR_REDIRECT_ENV
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == DAEMON_FIXTURE_NAME:
+            return DAEMON_FIXTURE_NAME
+        if isinstance(node, ast.Attribute) and node.attr == DAEMON_FIXTURE_NAME:
+            return DAEMON_FIXTURE_NAME
+    return None
 
 
 def _shell_code_lines(text: str) -> list[str]:
@@ -302,9 +468,7 @@ def analyze_shell(path: Path) -> bool:
 
 
 def main(argv: list[str]) -> int:
-    scan_dir = TESTS_DIR
-    if len(argv) > 1:
-        scan_dir = Path(argv[1])
+    explicit_dir = Path(argv[1]) if len(argv) > 1 else None
     try:
         roster = live_roster()
     except Exception as exc:
@@ -322,36 +486,79 @@ def main(argv: list[str]) -> int:
         print("  An unrecognised write route must not read as 'no write happened'.")
         return 2
 
+    # Same fail-loud contract, one axis further out (outcome 4): the roster says
+    # WHO a write could reach, the vocabulary what a write LOOKS like, and this
+    # says WHERE we are entitled to look. A PASS from a check that silently
+    # scanned one of three declared testpaths is vacuous over the other two.
+    if explicit_dir is not None:
+        scan_dirs = [explicit_dir]
+    else:
+        try:
+            scan_dirs = declared_testpaths()
+        except Exception as exc:
+            print(f"FAIL: could not derive the declared testpaths — {exc}")
+            print("  A directory nobody scanned must not read as a directory with nothing in it.")
+            return 2
+
     offenders = []
     scanned = 0
-    for p in sorted(scan_dir.glob("*.py")):
-        scanned += 1
-        bad = analyze(p, roster, write_subcommands)
-        if bad:
-            offenders.append((p, bad))
+    per_dir: list[tuple[Path, int]] = []
+    redirect_exempted = 0
+    exempt_reasons: dict[str, int] = {}
+    for scan_dir in scan_dirs:
+        dir_scanned = 0
+        for p in sorted(scan_dir.glob("*.py")):
+            scanned += 1
+            dir_scanned += 1
+            bad, isolation = analyze(p, roster, write_subcommands)
+            if isolation:
+                redirect_exempted += 1
+                exempt_reasons[isolation] = exempt_reasons.get(isolation, 0) + 1
+            if bad:
+                offenders.append((p, bad))
+        per_dir.append((scan_dir, dir_scanned))
+
+    # What widening the scan surface newly bought, stated as a number rather
+    # than asserted (guard-1562: count what newly changes).
+    legacy_scanned = next((n for d, n in per_dir if d == TESTS_DIR), 0)
+    newly_scanned = scanned - legacy_scanned
 
     # Shell surface (). Counted separately: folding it into `scanned`
     # would silently change what that number has always meant.
     shell_scanned = 0
     shell_exempted = 0
     shell_offenders: list[Path] = []
-    for p in sorted(scan_dir.glob("*.sh")):
-        shell_scanned += 1
-        if analyze_shell(p):
-            if p.name in SHELL_ALLOWLIST:
-                shell_exempted += 1   # what this check is CURRENTLY suppressing
-            else:
-                shell_offenders.append(p)
+    for scan_dir in scan_dirs:
+        for p in sorted(scan_dir.glob("*.sh")):
+            shell_scanned += 1
+            if analyze_shell(p):
+                if p.name in SHELL_ALLOWLIST:
+                    shell_exempted += 1   # what this check is CURRENTLY suppressing
+                else:
+                    shell_offenders.append(p)
 
     # A stale allowlist entry is itself a failure: the fix landed and the
     # exemption is now suppressing nothing while still reading as coverage.
     stale_allowlist = [
         (name, goal) for name, goal in sorted(SHELL_ALLOWLIST.items())
-        if (scan_dir / name).exists() and not analyze_shell(scan_dir / name)
+        for d in scan_dirs
+        if (d / name).exists() and not analyze_shell(d / name)
     ]
 
     print(f"roster ({len(roster)}, derived at check time): {sorted(roster)}")
-    print(f"scanned: {scanned} file(s) under {scan_dir}")
+    print(f"scanned: {scanned} python file(s) across {len(scan_dirs)} declared testpath(s): "
+          + ", ".join(
+              f"{d.relative_to(PROJECT_ROOT) if PROJECT_ROOT in d.parents or d == PROJECT_ROOT else d}={n}"
+              for d, n in per_dir))
+    if explicit_dir is None:
+        print(f"newly-scanned vs the former single-testpath scope "
+              f"({TESTS_DIR.relative_to(PROJECT_ROOT)}): {newly_scanned} file(s)")
+    if exempt_reasons:
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(exempt_reasons.items()))
+    else:
+        detail = "none"
+    print(f"isolation-exempted: {redirect_exempted} file(s) bind a live-roster agent "
+          f"and write WM, but the write cannot reach it ({detail})")
     print(f"shell-scanned: {shell_scanned} file(s), "
           f"{shell_exempted} matching but allowlisted to an owning goal")
     # Every failing class is REPORTED, then one verdict. An early return per

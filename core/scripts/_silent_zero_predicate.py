@@ -195,8 +195,50 @@ _CONSUMES_STDIN = re.compile(
     r"(?:for\s+\w+\s+in\s+sys\.stdin|sys\.stdin\b|stdin\.read)"
 )
 
-# Explicit escape hatch. Present anywhere in the command -> the gate approves.
+# Explicit escape hatch: the CONSTRUCT `SILENT_ZERO_GATE_OVERRIDE="<reason>"`
+# (quoted, non-empty) at a shell-word boundary -> the gate approves. NOT a bare
+# token anywhere in the command: that read a MENTION as an invocation
+# ().
 OVERRIDE_TOKEN = "SILENT_ZERO_GATE_OVERRIDE"
+
+# : an override must be a CONSTRUCT the author had to build, never a
+# NAME they could type in passing. `OVERRIDE_TOKEN in command` matched a trailing
+# comment, a quoted string, or a heredoc of documentation, so the artifact most
+# likely to name the bypass -- the runbook explaining it -- silently disarmed the
+# gate. Shape adopted from the sibling that already does it right
+# (marker-placement-gate.py:92): token + `=` + a NON-EMPTY quoted justification,
+# which is also what makes the override auditable.
+#
+# The prefix is a shell-word boundary, NOT `^` and NOT a line anchor. rb-9764
+# measured the cost of anchoring a command predicate at a command START: the
+# fleet's dominant shape is `cd ... && VAR=v bash core/scripts/x.sh`, so a
+# start-anchored test silently refuses every real invocation -- trading a silent
+# bypass for a silently-unusable escape hatch, which is harder to notice because
+# the gate then looks MORE protective than it is. `re.M` is likewise absent on
+# purpose (guard-5706): with re.M, `^` matches EVERY line start, including lines
+# inside a documentation heredoc, which would re-open the exact hole.
+# The boundary also stops `FOO_SILENT_ZERO_GATE_OVERRIDE="x"` from matching, which the sibling
+# (reading FILE content, not a command line) does not need.
+_OVERRIDE_RE = re.compile(
+    r'(?:^|[\s;&|(])' + re.escape(OVERRIDE_TOKEN) + r'=(["\'])([^"\']+)\1'
+)
+
+
+def override_invoked(command) -> bool:
+    """True only when the command INVOKES the override, not when it names it.
+
+    Requires `SILENT_ZERO_GATE_OVERRIDE="<non-empty reason>"` (single or double quotes) preceded by
+    a shell-word boundary. A mention -- `# do not reach for SILENT_ZERO_GATE_OVERRIDE here` -- has
+    no `=` and is correctly refused. Measured residual, recorded rather than
+    papered over: a line that writes the whole construct as an EXAMPLE
+    (`# use SILENT_ZERO_GATE_OVERRIDE="reason" to bypass`) still suppresses. Narrowing that
+    further needs comment-state parsing of an arbitrary shell command, which is
+    more fragile than the hole it would close.
+    """
+    if not isinstance(command, str):
+        return False
+    return bool(_OVERRIDE_RE.search(command))
+
 
 
 def has_scoring_consumer(command) -> bool:
@@ -250,11 +292,12 @@ def silent_zero_violations(command) -> list:
 
     Empty list when the command is not a framework-wrapper invocation, derives
     no quantity from it, reads the exit status, carries no coercion idiom, or
-    contains the override token. Fail-open at the type boundary.
+    INVOKES the override as `SILENT_ZERO_GATE_OVERRIDE="<reason>"` (a bare mention
+    does NOT suppress -- g-115-10247). Fail-open at the type boundary.
     """
     if not isinstance(command, str):
         return []
-    if OVERRIDE_TOKEN in command:
+    if override_invoked(command):
         return []
     if not invokes_framework_wrapper(command):
         return []
@@ -276,12 +319,13 @@ def shape_selective_suppressions(command) -> list:
 
     Empty list when the command is not a framework-wrapper invocation, does not
     consume stdin in a python one-liner, carries no shape test, SURFACES the
-    non-conforming line instead of dropping it, reads the exit status, or contains
-    the override token. Fail-open at the type boundary.
+    non-conforming line instead of dropping it, reads the exit status, or INVOKES
+    the override as `SILENT_ZERO_GATE_OVERRIDE="<reason>"` (a bare mention does
+    NOT suppress -- g-115-10247). Fail-open at the type boundary.
     """
     if not isinstance(command, str):
         return []
-    if OVERRIDE_TOKEN in command:
+    if override_invoked(command):
         return []
     if not invokes_framework_wrapper(command):
         return []

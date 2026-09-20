@@ -311,3 +311,119 @@ def test_cli_json_shape(tmp_path):
 def test_missing_guardrails_file_is_not_a_crash(tmp_path):
     """Fail-open: an absent store yields an empty index, not a traceback."""
     assert gpcc.load_guardrails(tmp_path / "nope") == []
+
+
+# --------------------------------------------------------------------------
+# prescribed_signatures: the REMEDY-INDEXED-AS-PROHIBITED discriminator
+# (). A guardrail whose remedy is itself a command puts the
+# prohibition and its sanctioned alternative in ONE sentence, so
+# constrained_signatures indexes the REMEDY. COMPLIANCE_RE cannot rescue
+# those rows: it keys on NARRATION, and a line that simply DOES the
+# prescribed thing narrates nothing.
+# --------------------------------------------------------------------------
+
+def test_prescribed_refuse_case_colon_use_is_the_remedy(tmp_path):
+    """The guard-6732 shape: the command after "do not X: use Y" is the REMEDY.
+
+    Measured on the live corpus 2026-09-20: this one signature supplied 28 of
+    137 actionable rows (20%), every one of them a call site OBEYING the rule.
+    Mutation: drop `:\\s*use\\b` from PRESCRIPTION_RE -> RED.
+    """
+    rule = ("If it prints 0, do not line-grep: use tree-find-node.sh --text "
+            "for tree lookups.")
+    sig = ("tree-find-node.sh", ("--text",))
+    assert sig in gpcc.constrained_signatures(rule), "precondition: still indexed"
+    assert sig in gpcc.prescribed_signatures(rule)
+
+
+def test_prescribed_allow_case_bare_use_after_never_is_a_prohibition():
+    """"NEVER use foo.sh --bar" must NOT read as a prescription.
+
+    A bare `use` sits between the prohibition marker and the invocation in the
+    commonest prohibition idiom in the store, so admitting it would silently
+    reclassify genuine prohibitions as remedies -- the exact false-negative
+    this discriminator must not create. Every PRESCRIPTION_RE member is a
+    CONTRASTIVE connective for that reason.
+    Mutation: add a bare `\\buse\\b` alternative to PRESCRIPTION_RE -> RED.
+    """
+    rule = "NEVER use stranded-claim-sweep.py --apply."
+    sig = ("stranded-claim-sweep.py", ("--apply",))
+    assert sig in gpcc.constrained_signatures(rule), "precondition: still indexed"
+    assert gpcc.prescribed_signatures(rule) == set()
+
+
+def test_prescribed_allow_case_needs_a_governing_prohibition():
+    """A prescription with no prohibition before it was never indexed.
+
+    prescribed_signatures is deliberately a SUBSET of constrained_signatures:
+    rescuing a signature nothing indexed would be a no-op that invites a
+    future reader to widen it. Mutation: drop the `if not marker: continue`
+    guard -> RED.
+    """
+    rule = "Instead of guessing, prefer retrieve.sh --category for lookups."
+    assert gpcc.prescribed_signatures(rule) == set()
+
+
+def test_scan_prescribed_row_is_compliance_and_still_reported(tmp_path):
+    """A call site that OBEYS a remedy rule narrates nothing -- and must not
+    be reported as violating the rule it is following.
+
+    The row stays in `hits` (ranked last) so a genuine violation citing its
+    own guardrail is never silently dropped -- the invariant the whole check
+    exists to protect. Mutation: drop `or all_owners_prescribe` from scan()
+    -> RED on likely_compliance.
+    """
+    world, root = _corpus(
+        tmp_path,
+        [{"id": "guard-p", "status": "active",
+          "rule": "Do not line-grep the tree: use finder.sh --text."}],
+        ["Bash: `bash core/scripts/finder.sh --text widget`"],
+    )
+    hits = gpcc.scan(root, gpcc.build_index(gpcc.load_guardrails(world)))
+    assert len(hits) == 1, "prescribed row must be REPORTED, not dropped"
+    assert hits[0]["likely_compliance"] is True
+    assert hits[0]["compliance_reason"] == "prescribed"
+    assert hits[0]["prescribed_by"] == ["guard-p"]
+
+
+def test_scan_one_prohibiting_owner_keeps_the_row_actionable(tmp_path):
+    """Prescribed by one owner, forbidden by another -> still a conflict.
+
+    Two rules disagreeing about the same signature is precisely the condition
+    this detector exists to surface, so the rescue requires ALL owners to
+    prescribe it. Mutation: relax the check to `any` / non-empty
+    prescribed_by -> RED.
+    """
+    world, root = _corpus(
+        tmp_path,
+        [{"id": "guard-p", "status": "active",
+          "rule": "Do not line-grep the tree: use finder.sh --text."},
+         {"id": "guard-q", "status": "active",
+          "rule": "Never run finder.sh --text."}],
+        ["Bash: `bash core/scripts/finder.sh --text widget`"],
+    )
+    hits = gpcc.scan(root, gpcc.build_index(gpcc.load_guardrails(world)))
+    assert len(hits) == 1
+    assert sorted(hits[0]["guardrails"]) == ["guard-p", "guard-q"]
+    assert hits[0]["prescribed_by"] == ["guard-p"]
+    assert hits[0]["likely_compliance"] is False, "disagreement is a real conflict"
+
+
+def test_scan_narration_still_classifies_without_a_prescription(tmp_path):
+    """The narration heuristic is PRESERVED, not replaced.
+
+    The two reasons are independent: a prohibition with no remedy clause must
+    still be rescued by narration alone. Mutation: replace the
+    COMPLIANCE_RE disjunct with `all_owners_prescribe` alone -> RED.
+    """
+    world, root = _corpus(
+        tmp_path,
+        [{"id": "guard-n", "status": "active",
+          "rule": "Never run 'sweep.py --apply' before checking."}],
+        ["# no explicit `sweep.py --apply` call needed here."],
+    )
+    hits = gpcc.scan(root, gpcc.build_index(gpcc.load_guardrails(world)))
+    assert len(hits) == 1
+    assert hits[0]["likely_compliance"] is True
+    assert hits[0]["compliance_reason"] == "narrated"
+    assert hits[0]["prescribed_by"] == []

@@ -41,6 +41,22 @@ WHAT ACTUALLY DISCRIMINATES, and why each part earns its place:
      a genuine violation that happens to cite its own guardrail, so they are
      reported last with `likely_compliance: true`. A filter that silently drops the
      true case is the failure mode this whole check exists to prevent.
+  4. A REMEDY the rule prescribes is compliance too, and narration cannot see it.
+     Point 3 keys on what the call site SAYS; a line that simply DOES the
+     prescribed thing says nothing, so narration can never rescue it. When a
+     guardrail's prohibition and its sanctioned alternative share one sentence
+     ("do not line-grep: use tree-find-node.sh --text"), point 1 indexes the
+     REMEDY as though it were the forbidden thing and every obedient call site is
+     reported as violating the rule it is following. `prescribed_signatures`
+     re-reads such a signature as compliance, but ONLY when EVERY owner prescribes
+     it -- one owner prescribing while another forbids is a real conflict and the
+     row stays actionable. Rows carry `compliance_reason` (narrated|prescribed).
+     Measured on the live corpus 2026-09-20 (echo, cc-03, g-115-7411), one run,
+     two scans over the same corpus: hits 150 -> 150 (nothing dropped),
+     actionable 137 -> 109; guard-6732 supplied 28 of those 137 and goes to 0.
+     guard-3572's 35 rows are UNCHANGED and are a DIFFERENT defect -- its
+     signature truncates at an uppercase placeholder (`--channel X`) and then
+     matches every board-read call site. Do not conflate the two.
 
 Read-only. Exit 0 always unless --exit-on-hits is passed (then 1 when unreviewed
 conflicts remain), so it is safe to wire into an advisory sweep.
@@ -77,6 +93,37 @@ SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?])\s+|\n")
 COMPLIANCE_RE = re.compile(
     r"(no\s+explicit|not\s+needed|no\s+longer|do\s+NOT\s+add|never\s+use|"
     r"guard-\d+|auto-fires|is\s+NOT\s+needed|MUST\s+NOT)",
+    re.I,
+)
+
+# A guardrail whose REMEDY is itself a command. The prohibition and its
+# sanctioned alternative routinely share one sentence ("do not line-grep: use
+# tree-find-node.sh --text"), so constrained_signatures indexes the REMEDY as
+# though it were the forbidden thing, and every call site that obeys the rule
+# is then reported as violating it. COMPLIANCE_RE cannot rescue those rows: it
+# keys on NARRATION, and a line that simply DOES the prescribed thing narrates
+# nothing. Scale: guard-6732 alone owned 28 actionable rows -- 21% of the 133
+# zeta parsed across three cycles / three agents / three boxes (
+# progress_note), and 20% of the 137 measured here 2026-09-20 (echo, cc-03).
+# Two counts of the same defect at two moments, not a disagreement; the
+# docstring's point 4 carries today's before/after.
+#
+# The marker must appear BETWEEN the prohibition marker and the invocation, or
+# "NEVER use foo.sh --bar" would read as a prescription — which is why a bare
+# `use` is NOT a member. Every member here is a CONTRASTIVE connective: it can
+# only introduce an alternative to something already forbidden.
+#
+# Every token is \b-anchored (guard-3845). Unanchored, `sanctioned\s+alternative`
+# also matches "UNsanctioned alternative", which means the opposite -- and this
+# regex's false-positive direction is the SILENT one: a wrongly-matched
+# prescription reclassifies a genuine conflict as compliance. Deliberately NOT
+# inflected (`prefer`, not `prefer(s|red)`): under-matching leaves a row
+# actionable, which is the recoverable error, and widening the prescription set
+# is the direction that needs its own corpus delta (guard-2201, guard-3351).
+PRESCRIPTION_RE = re.compile(
+    r"(\binstead\b|\brather\s+than\b|\bin\s+place\s+of\b|\bprefer\b|"
+    r"\bsanctioned\s+alternative\b|\bthe\s+remedy\s+is\b|:\s*use\b|"
+    r"\buse\s+(?:the\s+)?\S+\s+instead\b)",
     re.I,
 )
 
@@ -182,8 +229,37 @@ def constrained_signatures(rule: str) -> set[tuple[str, tuple[str, ...]]]:
     return found
 
 
+def prescribed_signatures(rule: str) -> set[tuple[str, tuple[str, ...]]]:
+    """Command signatures this rule PRESCRIBES as the remedy, not forbids.
+
+    Same sentence scope as constrained_signatures, and deliberately a SUBSET of
+    it: only a signature that is already "governed" (after a prohibition marker)
+    can be re-read as the remedy, because that is the shape that mis-indexes.
+    The discriminator is a CONTRASTIVE connective sitting between the
+    prohibition marker and the invocation -- "do not line-grep: use
+    tree-find-node.sh --text". A signature with no prohibition marker before it
+    was never indexed, so it needs no rescue here.
+    """
+    found: set[tuple[str, tuple[str, ...]]] = set()
+    for sentence in SENTENCE_SPLIT_RE.split(rule or ""):
+        marker = PROHIBITION_RE.search(sentence)
+        if not marker:
+            continue
+        for match in INVOCATION_RE.finditer(sentence):
+            if match.start() < marker.start():
+                continue
+            gap = sentence[marker.end():match.start()]
+            if not PRESCRIPTION_RE.search(gap):
+                continue  # no contrastive connective -- the command is forbidden
+            args = normalise_args(match.group(2))
+            if not any(a.startswith("--") for a in args):
+                continue
+            found.add((match.group(1), args))
+    return found
+
+
 def build_index(guardrails: list[dict]) -> dict:
-    """(script, args) -> {"owners": [...], "reconciled": {gid: reason}}"""
+    """(script, args) -> {"owners": [...], "reconciled": {...}, "prescribed_by": [...]}"""
     index: dict = {}
     for g in guardrails:
         if (g.get("status") or "active") != "active":
@@ -191,11 +267,16 @@ def build_index(guardrails: list[dict]) -> dict:
         rule = g.get("rule") or ""
         gid = g.get("id")
         rec = RECONCILED_RE.search(rule)
+        prescribed = prescribed_signatures(rule)
         for sig in constrained_signatures(rule):
-            entry = index.setdefault(sig, {"owners": [], "reconciled": {}})
+            entry = index.setdefault(
+                sig, {"owners": [], "reconciled": {}, "prescribed_by": []}
+            )
             entry["owners"].append(gid)
             if rec:
                 entry["reconciled"][gid] = rec.group(1)[:200]
+            if sig in prescribed:
+                entry["prescribed_by"].append(gid)
     return index
 
 
@@ -232,6 +313,22 @@ def scan(root: Path, index: dict) -> list[dict]:
             for (script, args), entry in index.items():
                 if not line_matches(line, script, args):
                     continue
+                # Two independent reasons a row is compliance, not conflict.
+                # NARRATED: the call site says so in prose (the original
+                # heuristic -- keep it, it catches cases the index cannot see).
+                # PRESCRIBED: every guardrail that governs this signature names
+                # it as the REMEDY, so obeying the rule IS running the command
+                # and there is nothing for the call site to narrate. Require
+                # ALL owners: if one rule prescribes the signature while
+                # another forbids it, the row is a genuine conflict and must
+                # stay actionable.
+                # Evaluate each reason ONCE. Two calls to COMPLIANCE_RE -- one
+                # for the flag, one for the reason -- would let the two fields
+                # disagree the moment either call is edited alone.
+                owners = entry["owners"]
+                prescribed_by = entry.get("prescribed_by", [])
+                narrated = bool(COMPLIANCE_RE.search(window))
+                all_owners_prescribe = bool(owners) and set(prescribed_by) == set(owners)
                 hits.append(
                     {
                         "skill": skill_md.parent.name,
@@ -239,9 +336,15 @@ def scan(root: Path, index: dict) -> list[dict]:
                         "line": lineno,
                         "script": script,
                         "args": list(args),
-                        "guardrails": entry["owners"],
+                        "guardrails": owners,
                         "reconciled": entry["reconciled"],
-                        "likely_compliance": bool(COMPLIANCE_RE.search(window)),
+                        "prescribed_by": prescribed_by,
+                        "likely_compliance": narrated or all_owners_prescribe,
+                        "compliance_reason": (
+                            "narrated" if narrated
+                            else "prescribed" if all_owners_prescribe
+                            else None
+                        ),
                         "text": line.strip()[:200],
                     }
                 )

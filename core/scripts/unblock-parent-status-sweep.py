@@ -601,19 +601,57 @@ def _build_completed_ts_index(all_aspirations):
     return idx
 
 
-def _build_outcome_note_index(all_aspirations):
-    """Return {goal_id: outcome_note-or-""} across queues.
+def _build_parent_narrative_index(all_aspirations):
+    """Return {goal_id: outcome_note + progress_note} across queues.
 
     Third companion index beside _build_status_index / _build_completed_ts_index,
     kept separate for the same reason: their contracts and tests stay untouched.
     Feeds _diagnostic_parent_guard below.
+
+    BOTH NARRATIVE FIELDS, NOT JUST `outcome_note` (g-373-26, 2026-09-20). This
+    was `_build_outcome_note_index` and read `outcome_note` alone, which is the
+    field a parent is LEAST likely to record a non-discharge in: `guard-5228`
+    makes `aspirations-update-goal.sh outcome_note` a REPLACE, so the framework
+    steers every append-only narrative into `progress_note` via
+    `goal-field-append.sh`. The guard below was therefore reading the one field
+    the convention discourages writing to.
+
+    MEASURED INSTANCE. g-373-26 closed `completed` while its own note said
+    "End-to-end delivery into a live vessel's ReportApi is NOT proven by any of
+    the above" — at offset 56,342 of its 70,091-char `progress_note`, with its
+    8,311-char `outcome_note` containing no such statement at all. Its child
+    g-373-109 (HIGH, asp-373, a BOOSTED closing lane) was auto-skipped 2026-09-20
+    05:00:51 with "parent resolved without action needed", 28 minutes after a
+    reclaim append to that child had recorded the non-delivery in writing.
+
+    NEITHER HALF OF THE FIX WORKS ALONE, which is why they landed together:
+    widening the field scope with the old marker list still matches only 2 of
+    311 terminal goals and misses this one, and the new marker lives in the very
+    field the old scope did not read. Measured before/after: 1 -> 3 of 311.
+
+    This is the guard-1978 / guard-1242 class named in reclaim-routed-work.md
+    rule 7 — "which store does the creating gate write DURABLY, and is that the
+    store I am reading? Widen the READ; do not assume the WRITE widens with it."
     """
     idx = {}
     for asp, _src in all_aspirations:
         for g in (asp.get("goals") or []):
             gid = g.get("id")
             if gid:
-                idx[gid] = g.get("outcome_note") or ""
+                # str() on both halves: this index is built ONCE for the whole
+                # corpus, so a single record with a non-string narrative would
+                # raise at build time and take the ENTIRE sweep down — against
+                # its stated fail-quiet/always-exit-0 contract. Pre-fix the same
+                # bad record only broke its own parent lookup, so concatenating
+                # here WIDENS the blast radius unless it is coerced. Found by
+                # the fresh-eyes pass on this very change.
+                #
+                # The "\n" separator is load-bearing, not cosmetic: it stops a
+                # marker from matching ACROSS the seam (an outcome_note ending
+                # "...is not" plus a progress_note opening "proven..." must not
+                # read as "is not proven"). Verified both directions.
+                idx[gid] = (str(g.get("outcome_note") or "") + "\n"
+                            + str(g.get("progress_note") or ""))
     return idx
 
 
@@ -635,10 +673,19 @@ _PERSISTS_MARKERS = (
     "not unblocked",
     "condition persists",
     "still dark",
+    #  (2026-09-20). The declarative "<the thing> is not proven" form.
+    # Deliberately "is not proven" and NOT the bare "not proven": the same
+    # parent also wrote "I have NOT proven what else holds it" about an
+    # unrelated side question, and a first-person aside is not a statement
+    # about the dependent. Measured on the live corpus (311 terminal goals
+    # carrying a narrative): "is not proven" = 3, bare "unproven" = 7,
+    # "still not" = 22. The tightest form that catches the instance wins
+    # (guard-2201 — bound what a widened matcher admits).
+    "is not proven",
 )
 
 
-def _diagnostic_parent_guard(parent_id, outcome_note_idx):
+def _diagnostic_parent_guard(parent_id, narrative_idx):
     """: a DIAGNOSTIC parent completes by CONFIRMING the problem.
 
     The sweep's core predicate — parent reached a terminal state, therefore the
@@ -664,15 +711,16 @@ def _diagnostic_parent_guard(parent_id, outcome_note_idx):
     17:05 the same day, which had to be REFILED as g-326-795 because it would not
     stay reopened. Two is not a rate; the population remains unmeasured.
     """
-    note = (outcome_note_idx.get(parent_id) or "").lower()
-    if not note:
+    note = (narrative_idx.get(parent_id) or "").lower()
+    if not note.strip():
         return None
     for marker in _PERSISTS_MARKERS:
         if marker in note:
-            return (f"parent {parent_id} states in its own outcome_note that the "
-                    f"blocking condition persists ({marker!r}) — a diagnostic parent "
-                    f"completes by CONFIRMING the problem, so its completion is not "
-                    f"evidence the child Unblock is moot (g-115-8586)")
+            return (f"parent {parent_id} states in its own close notes "
+                    f"(outcome_note or progress_note) that the blocking condition "
+                    f"persists ({marker!r}) — a diagnostic parent completes by "
+                    f"CONFIRMING the problem, so its completion is not evidence "
+                    f"the child Unblock is moot (g-115-8586, field scope g-373-26)")
     return None
 
 
@@ -1194,7 +1242,7 @@ def main():
     status_idx = _build_status_index(all_aspirations)
     recurrence_idx = _build_recurrence_index(all_aspirations)
     completed_ts_idx = _build_completed_ts_index(all_aspirations)
-    outcome_note_idx = _build_outcome_note_index(all_aspirations)
+    narrative_idx = _build_parent_narrative_index(all_aspirations)
 
     # guard-1890: resolve parent ids against the ARCHIVE too. Without this a
     # COMPLETED-then-ARCHIVED parent is indistinguishable from one that never
@@ -1420,7 +1468,28 @@ def main():
                     "reason": succ_reason,
                 })
                 continue
-            diag_reason = _diagnostic_parent_guard(parent_id, outcome_note_idx)
+            # NOT FOR A RECURRING PARENT ( follow-up, measured). The
+            # diagnostic guard's premise is about a parent's CLOSE note — "a
+            # diagnostic parent COMPLETES by confirming the problem". A
+            # recurring parent never closes: it cycles, and its progress_note
+            # is a rolling multi-run log, so substring-matching a close-note
+            # predicate against it is a category error. Recurring parents reach
+            # this line only via the cadence-resumed fall-through above, and
+            # that population is the sweep's LARGEST legitimate workload
+            # (starvation Unblocks — 13 of the 15 live rule-4 links).
+            #
+            # MEASURED FALSE POSITIVE, found by retro-scanning the fix's own
+            # blast radius rather than declaring it done:  and
+            #  are starvation Unblocks for , a 6h-interval
+            # recurring parent that had fired 8h earlier. Widening the index to
+            # progress_note made 'stays blocked' (@81613) and 'still blocked'
+            # (@82166) match — both incidental prose about an unrelated gated
+            # Groq-key retirement, inside a 49,858-char rolling log. The guard
+            # would have declined to sweep two correctly-resolvable Unblocks.
+            # Restrict the population, never retune the constant (guard-4946);
+            # membership in recurrence_idx IS the recurring test.
+            diag_reason = (None if parent_id in recurrence_idx
+                           else _diagnostic_parent_guard(parent_id, narrative_idx))
             if diag_reason:
                 details.append({
                     "goal_id": g.get("id"),

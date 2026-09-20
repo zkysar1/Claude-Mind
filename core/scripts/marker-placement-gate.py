@@ -76,7 +76,13 @@ ALLOWLIST = {
     "core/config/conventions/domain-recipe-seed-purity.md",  # documents the marker in invariant 2 (D1 seed-purity convention)
 }
 
-MARKER_TOKEN = "domain-leak-exempt:"
+# Anchored marker predicate, imported from the single source of truth
+# (). MARKER_TOKEN stayed a bare substring here until 2026-09-20, so
+# this gate refused an edit to any file that merely MENTIONED the marker in
+# prose — and, symmetrically, a proposed body that only discussed it read as
+# though it were claiming the exemption. The token must OPEN A COMMENT.
+from _domain_leak_marker import MARKER_TOKEN, claims_exemption  # noqa: E402
+
 OVERRIDE_TOKEN = "MARKER_PLACEMENT_OVERRIDE="
 
 
@@ -140,7 +146,10 @@ def main():
         if not proposed:
             approve_no_mutation()
 
-        if MARKER_TOKEN not in proposed:
+        # ANCHORED (): only a token that OPENS A COMMENT claims the
+        # exemption, so prose that merely names the marker no longer trips this
+        # gate. MARKER_TOKEN remains imported for the diagnostic text below.
+        if not claims_exemption(proposed):
             approve_no_mutation()
 
         # Override path — approve, but surface the justification on stderr

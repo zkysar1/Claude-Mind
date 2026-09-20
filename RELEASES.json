@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.78",
+    "previous_version": "2.12.77",
+    "date": "2026-09-20",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Fleet fixes since v2.12.77: 34 fixes across loop entry (a never-initialized world names itself and its remedy, and iteration-open carries the selector's stderr), requires_capability enforcement at write time, the user_signal_boost refresher, strategic-focus floor ordering, two self-disabling PreToolUse gates and atomic-write tmp names; 42 long-red tests fixed at their source (sandbox module-cache leak, test_promote fixture .gitignore); plus branch-hygiene prune and the registry-derived domain-term ratchet",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.77",
     "previous_version": "2.12.76",
     "date": "2026-09-19",

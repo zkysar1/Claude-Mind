@@ -62,11 +62,15 @@ SENTINELS: list[dict] = [
         "phase": "0-pre2",
         "skill_section": (
             "aspirations-precheck Phase 0-pre2 (Experience Archival Gate; compose + experience-add.sh"
-            " — FIRST run `bash core/scripts/experience-read.sh --goal <goal-id>`: if it returns any"
-            " record, this goal already has one, so the bare `exp-<goal-id>` id AND"
-            " `agents/<agent>/experience/exp-<goal-id>.md` path are BOTH taken and Write will"
-            " silently overwrite the existing file while reporting success. Use a unique slug."
-            " See guard-2939)"
+            " — FIRST run `bash core/scripts/experience-read.sh --id exp-<goal-id>`. Use --id,"
+            " NOT --goal: --id reads LIVE THEN ARCHIVE while --goal is live-only, and"
+            " experience-add.sh validates uniqueness across BOTH — so on an ARCHIVED record a"
+            " --goal check returns [] and the write is then refused duplicate_id (measured"
+            " 2026-09-19, zeta/cc-02, g-115-1655: archive 1 / live 0). If --id returns a record,"
+            " the bare `exp-<goal-id>` id AND `agents/<agent>/experience/exp-<goal-id>.md` path"
+            " are BOTH taken and ANY overwrite-mode write (Write OR `cat >`) silently destroys"
+            " it. Use a CONTENT slug, not a date — a recurring goal can close twice in one day."
+            " See guard-2939, guard-5686, guard-4080)"
         ),
         "fired_key": False,
         "dispatch_slot": None,

@@ -34,7 +34,7 @@
 #   P2 the DR family is present: COLD_SNAPSHOT_S3_BUCKET + both COLD_SNAPSHOT_AWS_*
 #      keys — without it the first weekly DR tick after the flip REFUSES
 #      (refused-colocated), by design (g-372-16).
-#   P3 `cold-snapshot.sh --dry-run` prints a [target] line — proves the
+#   P3 `cold-snapshot.sh --print-target` prints a [target] line — proves the
 #      guard-bearing cold_snapshot.py is on this box. A stale checkout loses it
 #      SILENTLY (cc-14, 2026-09-11: 294 commits behind, Aug-5 file, no guard).
 #   P4 this checkout's daemon loader carries the endpoint key
@@ -47,7 +47,7 @@
 # (guard-1976; /proc/<pid>/environ is not evidence, guard-4274):
 #   V1 /v1/admin/health reports storage_backend=OwnCloudBackend and
 #      storage_endpoint == the target ("" after --revert).
-#   V2 cold-snapshot dry-run [target] reads mode=pinned cold_endpoint=aws-regional
+#   V2 cold-snapshot --print-target [target] reads mode=pinned cold_endpoint=aws-regional
 #      and live_endpoint=<target> (aws-regional after --revert).
 #   V3 the probe again, with the environment exactly as .env.local now reads.
 #
@@ -127,9 +127,15 @@ print(s(d.get("pid")) + "|" + s(d.get("storage_backend")) + "|" + s(d.get("stora
 }
 
 cold_target() {
-    # The guard-5551 [target] line, printed on stderr by the dry run before any
-    # enumeration; the dry run also hashes the working set (~10-25 s per box).
-    ( bash core/scripts/cold-snapshot.sh --dry-run 2>&1 >/dev/null ) | grep -m1 '^\[target\]' || true
+    # The guard-5551 [target] line, resolved and printed on stderr WITHOUT any
+    # enumeration or hashing (--print-target, g-372-35). This used to call
+    # --dry-run, which prints the same line and THEN hashes the whole working
+    # set: budgeted 10-25s, measured >630s and still running on a large box, so
+    # --status (the advertised SAFE READ-ONLY query) did not return at all.
+    # `grep -m1` does not bound it -- command substitution waits for the whole
+    # pipeline, and a producer busy hashing never writes again, so it never
+    # takes the SIGPIPE that would end it. Measured after: 56ms.
+    ( bash core/scripts/cold-snapshot.sh --print-target 2>&1 >/dev/null ) | grep -m1 '^\[target\]' || true
 }
 
 probe() {
@@ -198,7 +204,7 @@ for k in COLD_SNAPSHOT_S3_BUCKET COLD_SNAPSHOT_AWS_ACCESS_KEY_ID COLD_SNAPSHOT_A
     [ -n "$(_get "$k")" ] || fail P2 "$k missing from .env.local — provision the DR family first (cold-snapshot-target-provision.sh)"
 done
 ct="$(cold_target)"
-[ -n "$ct" ] || fail P3 "cold-snapshot.sh --dry-run printed no [target] line — this checkout lacks the colocation guard (stale? git pull first)"
+[ -n "$ct" ] || fail P3 "cold-snapshot.sh --print-target printed no [target] line — this checkout lacks the colocation guard, or predates --print-target (stale? git pull first)"
 grep -q "\"$KEY\"" "$ROOT/mind_api/src/__main__.py" || fail P4 "this checkout's daemon loader (_N3_ALLOWED_EXACT) does not carry $KEY — pull the 2026-09-11 fix first"
 
 # ── flip ──────────────────────────────────────────────────────────────────────

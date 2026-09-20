@@ -148,6 +148,20 @@ warranted when the available backlog is thin.
    token in `primary`; fail-open to the brief's whole lane table when the
    field is absent. A boosted lane with available < brief.lane_floor is
    STARVED, whatever the aggregate reads.
+   ⚠ `primary` ALONE IS CORRECT HERE — DO NOT "fix" it to `primary` +
+   `secondary` to match goal-selector.py:4391 / directive_mix_check.py:112.
+   Those two are the only sites of `secondary` in the whole codebase and BOTH
+   are readers: `strategic_focus.secondary` has ZERO writers (measured
+   2026-09-20, bravo/cc-05: 0 hits across core/scripts + core/config +
+   .claude + mind_api, against a positive control of 21 for
+   `strategic_focus.primary`), and the schema at
+   `core/config/conventions/coordination.md:855-860` does not declare it.
+   It is a portability shim for deployments that set it — goal-selector says
+   so in its own comment — so widening this reader would propagate a shim as
+   schema. A reader-count majority (2 of 3) makes the schema-correct reader
+   look deviant; that inversion is exactly guard-7160. One insight trigger
+   and one posted reply had already committed to the widening before the
+   writer census reversed it.
 3. IF no boosted lane is starved AND total available ≥ brief.high_water_mark:
    → Post a one-line board tick ("supply healthy: N available ≥ M; per-lane
    asp-…=k …; no lane under floor F") to the coordination channel, type

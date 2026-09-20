@@ -179,6 +179,62 @@ def test_ratchet_is_carried_forward_on_every_recorded_run(monkeypatch, tmp_path)
     assert h.run({OTHER: 8.0})["fired"] is False, "mark survived truncation"
 
 
+def test_improve_then_degrade_refires(monkeypatch, tmp_path):
+    """The improve-then-degrade leg — the one lifecycle leg the other 6 miss.
+
+    guard-6508 asks a detector to demonstrate that it can go quiet AND come back.
+    `test_alarm_clears_and_can_fire_again` covers coming back via the CLEAR path
+    (the store falls fully under threshold, losing its mark). This covers the
+    other way a store can improve: it gets better while STAYING over threshold,
+    so the clear path never fires and the mark is carried instead. Before
+    g-358-123 the carry was verbatim, which made the mark a HIGH-WATER latch —
+    the store could degrade back to its worst-ever level, and beyond it, and the
+    alarm stayed silent forever because the fire line never came down with it.
+
+    This test is the forced-failure control required by guard-3534: run against
+    the pre-fix verbatim carry it FAILS at the `== 3.0` assertion (the mark reads
+    8.0), and the re-fire assertion below fails with it. Measured red on
+    2026-09-20 before the one-line change, green after.
+    """
+    h = _Harness(monkeypatch, tmp_path)
+    h.run({OTHER: 8.0})
+    first = h.run({OTHER: 8.0})
+    assert first["fired"] is True and OTHER in first["surfaced"]
+
+    # Improve to 3.0. Still over threshold (1.25), so the CLEAR path cannot run
+    # and the mark is carried — it must be carried DOWN, not copied.
+    h.run({OTHER: 3.0})
+    assert h.records()[-1]["ratchet"].get(OTHER) == 3.0, (
+        "the mark must follow the store down while it stays over threshold; a "
+        "verbatim carry leaves it at 8.0 and the alarm can never come back")
+
+    # Degrade back to 8.0 — 2.67x the improved level, well past
+    # OVERCAP_REGRESS_FACTOR off the 3.0 mark.
+    again = h.run({OTHER: 8.0})
+    assert again["fired"] is True, "improve-then-degrade must re-fire"
+    assert OTHER in again["regressed"]
+
+
+def test_mark_never_tracks_upward_on_a_carried_store(monkeypatch, tmp_path):
+    """Tracking down must not become tracking up — the other half of min().
+
+    A store that drifts UPWARD but stays inside OVERCAP_REGRESS_FACTOR is carried
+    quietly, and its mark must stay at the level it surfaced at. If the carry
+    followed the store up instead, the fire line would climb with the drift and
+    the detector would chase its own tail, never firing on slow growth. The
+    measured per-run band on this box is 1.041-1.142x (N=20, g-358-123), i.e.
+    exactly this shape, so it is the common case rather than an edge one.
+    """
+    h = _Harness(monkeypatch, tmp_path)
+    h.run({OTHER: 4.0})
+    h.run({OTHER: 4.0})                       # surfaces, mark 4.0
+    h.run({OTHER: 4.4})                       # 1.10x drift — inside 1.5x
+    assert h.records()[-1]["ratchet"].get(OTHER) == 4.0, "mark must not climb"
+    assert h.run({OTHER: 4.4})["fired"] is False
+    # And the mark it held is what makes the real regression fire.
+    assert h.run({OTHER: 6.0})["fired"] is True   # 1.5x of 4.0
+
+
 def test_watchdog_probe_is_registered_and_reducer_only():
     """OUTCOME 1: the detector has a production call site on a loop clock.
 

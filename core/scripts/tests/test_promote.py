@@ -301,7 +301,22 @@ def _setup_promote_source(tmp_path: Path, version: str = "1.0.0", frontier: bool
         (src / "RELEASES.json").write_text(json.dumps(
             [L.build_entry(version, None, "2026-06-05", False, False, "s", None, None, None)]),
             encoding="utf-8")
-    (src / ".gitignore").write_text("core/scripts/.python-shim/\ncore/.pycache/\n", encoding="utf-8")
+    # The fixture copies the REAL _paths.sh, and that script drops runtime
+    # artifacts beside itself. promote's clean-tree check is `git status
+    # --porcelain`, which counts UNTRACKED files, so every artifact the fixture's
+    # .gitignore does not name makes a clean fixture read as dirty.
+    #
+    # This was a hand-written two-line list (.python-shim/, .pycache/). When
+    # fe4df6c6fe (2026-09-06) taught _paths.sh to write .platform-memo.sh, the
+    # REAL .gitignore gained the line and this list did not: 22 tests here went
+    # red on "working tree is dirty", solo and in-suite, for two weeks -- while
+    # the real promote, judged by the real .gitignore, was fine ().
+    #
+    # So the expected value is READ FROM THE OTHER COMPONENT (guard-1220), not
+    # copied by hand. It also makes the failure mean something: if a new runtime
+    # artifact ever ships WITHOUT its .gitignore line, the real promote breaks,
+    # and now so does this file.
+    shutil.copy(PROJECT_ROOT / ".gitignore", src / ".gitignore")
     _git(src, "init", "-q")
     _gitcfg(src)
     _git(src, "add", "-A")

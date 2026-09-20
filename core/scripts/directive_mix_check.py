@@ -74,11 +74,50 @@ def focus_aspirations(team_state):
     the two disagreed about which aspirations the directive names, this
     surface would report on a different set than the boost acts on, which is
     worse than no surface at all.
+
+    THE FIELDS ARE PART OF "THE SAME APPROACH" (g-115-10389). Matching the
+    regex is not enough -- the INPUT has to match too. This scanned
+    `json.dumps(sf)`, i.e. the whole dict including `rationale`, while
+    load_strategic_focus (goal-selector.py:4386-4389) joins ONLY
+    `primary` + `secondary`. A directive's rationale necessarily NAMES the
+    lanes it moved work out of, so the surface counted them as in-lane.
+    MEASURED 2026-09-20 (bravo, cc-05, Linux 6.8.0-139-generic) through
+    build() over 3287 live goals, changing only the scanned field:
+    whole-dict scan -> 10 lanes, 251/335 closes on-directive (74.9%),
+    focus_eligible 2514; primary+secondary -> 6 lanes, 114/335 (34.0%),
+    focus_eligible 13. The 4 phantom lanes were asp-115/353/363/374 --
+    exactly the ones the prose names as NOT boosted -- and asp-115 is the
+    FRAMEWORK lane, so 128 framework closes scored as compliance with a
+    PRODUCT-focus directive: the very inversion this module's WHY exists to
+    detect. Scope the INPUT, never widen the regex (guard-5706).
+
+    Residual, deliberately not handled here: a token inside a verbatim user
+    quote in `primary` is boosted and counted by BOTH readers and cannot be
+    cleaned out (guard-4325). That is a property of the directive text, not a
+    disagreement between the two consumers -- which is all this function owes.
     """
     sf = (team_state or {}).get("strategic_focus")
     if not sf:
         return [], ""
-    text = sf if isinstance(sf, str) else json.dumps(sf)
+    if isinstance(sf, str):
+        # KNOWN, DELIBERATE DIVERGENCE (see test_plain_string_directive...).
+        # load_strategic_focus handles ONLY `isinstance(sf, dict)`, so a
+        # string-valued strategic_focus boosts NOTHING there while this returns
+        # its lanes. Not silently "fixed" here: flipping it would blank this
+        # surface on any deployment using the string form, and no such
+        # deployment is measurable from this box. Reported instead.
+        text = sf
+    elif isinstance(sf, dict):
+        text = " ".join(
+            str(sf.get(k) or "") for k in ("primary", "secondary")).strip()
+    else:
+        # Anything else (a list, a number) names no lane -- matching
+        # load_strategic_focus, whose `isinstance(sf, dict)` guard leaves its
+        # aspiration set empty for these. The pre- json.dumps(sf)
+        # accepted them; a bare sf.get() would now raise AttributeError on an
+        # ALWAYS-RUN precheck lane, which is strictly worse than reporting no
+        # directive.
+        text = ""
     return sorted({"asp-" + m for m in ASP_RE.findall(text)}), text
 
 

@@ -88,6 +88,38 @@ import _rt  # canonical Python -> daemon client (post-cutover)
 from _runtime_bash import bash_cmd  # : Windows-safe bash resolution
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
+# The owner-decided park exemption () — imported, never re-derived.
+# This lane is the THIRD path that can put a human-gated goal in front of the
+# owner; `user-blocker-escalation-check.py` and `completion_digest.py` are the
+# two that already import it. 's own outcome sentence scoped the wiring
+# to "both owner digests", and this sweep is neither, so it inherited none of it:
+# measured 2026-09-18 it routed notify_user on , a declared park whose
+# decision ref says verbatim "Do not re-ask, re-file or re-email". A known,
+# documented, already-fixed instance is not evidence the CLASS is handled
+# (guard-4132); the predicate was correct and merely installed in a strict subset
+# of the paths that reach the owner. ()
+#
+# GUARDED, and the fallback DIRECTION is deliberate. This sweep is fail-open
+# throughout (see the module docstring), and the predicate module's own contract
+# is that every failure returns "not a park" so the goal IS surfaced. A bare
+# module-level import that raised would kill the whole lane — fail-CLOSED on
+# delivery, strictly worse than the over-notification this exemption removes. So
+# the fallback suppresses NOTHING, and `owner_decided_predicate_loaded` makes a
+# degraded sweep visible instead of silent — the same shape the sibling digest
+# uses for its own two predicates.
+try:
+    from gates.owner_decided_park import owner_decided_ref
+    _OWNER_DECIDED_LOADED = True
+except Exception as _exc:  # noqa: BLE001
+    sys.stderr.write(
+        "dependency-timeout: could not import gates.owner_decided_park (%s) — "
+        "fail-open, owner-decided parks will be ESCALATED this sweep\n" % (_exc,))
+
+    def owner_decided_ref(goal):  # type: ignore[misc]
+        return None
+
+    _OWNER_DECIDED_LOADED = False
+
 DEFAULT_DEPENDENCY_TIMEOUT_HOURS = 48.0
 ESCALATE_AT_FRACTION = 0.75  # notify at 75% of the timeout (36h of 48h)
 BOARD_TAG = "dependency-aged"
@@ -632,7 +664,10 @@ def _human_gated(goal) -> bool:
 # added latency. `human_blocked:` is deliberately NOT probed: it is the one
 # STRUCTURED_DEFER_PREFIXES member that never auto-clears
 # (probe-before-defer.md), and credential-defer-recheck.py owns that lane under
-# its own rules.
+# its own rules. NOT in tension with the owner-decided-park check in run()
+# (): that reads a DECLARED marker off the defer text and spawns
+# nothing. "Never re-probed" and "never inspected" are different claims, and
+# only the first one is made here.
 PROBEABLE_DEFER_PREFIXES = ("credentials-required",)
 
 
@@ -839,6 +874,7 @@ def run(args) -> dict:
     candidates, escalated, boosted, needs_notify = [], [], [], []
     stale_dependency = []
     reprobe_suppressed = []
+    owner_decided_skipped = []
     skipped_cooldown, skipped_young, skipped_no_ts, failed = [], [], [], []
 
     # WIRE THE UNMEASURED VERDICT TO THE PRODUCTION CONSUMER (,
@@ -934,7 +970,40 @@ def run(args) -> dict:
         # would never have been boosted. Caught by the  dry run.
         route = "log_only"
         agent_resolvable = bool(rparts) and any(p != "user" for p in rparts)
-        if root is not None and (("user" in rparts) or _human_gated(root)):
+        # Hand the predicate the DURABLE GOAL RECORD `root` (out of
+        # `_read_goal_index()`), never the candidate dict `c` assembled below
+        # (guard-6866): an exemption branch that reads a leg-built dict is
+        # defeated by any leg that hardcodes the field it tests, which is
+        # exactly how 4 of 10 parks were emailed every cadence in the sibling
+        # sweep. There is one collection leg here today; reading the record
+        # keeps that from mattering if a second is ever added.
+        # The guarded IMPORT above covers an import-time failure; this covers a
+        # RUNTIME raise, which is a different failure and was not covered by it
+        # (caught by this change's own test, not by review). The predicate is
+        # documented never to raise — that is a contract on a module this one
+        # does not own, and an uncaught raise here would abort the whole sweep
+        # mid-population: fail-CLOSED on delivery, the one direction the import
+        # comment above promises cannot happen. Degrade to "not a park" (the
+        # module's own fail-safe direction, i.e. the goal IS surfaced) and
+        # record it in `failed`, the one bucket the always-run battery reads
+        # universally — so a degraded run reports as degraded, never as clean.
+        try:
+            owner_decided = owner_decided_ref(root)
+        except Exception as exc:  # noqa: BLE001
+            owner_decided = None
+            failed.append({
+                "goal_id": gid,
+                "detail": ("owner-decided-park predicate raised on root %s (%s) "
+                           "— escalating rather than suppressing" % (root_id, exc)),
+            })
+        if owner_decided is not None:
+            # STRICTLY NARROWS notify_user and can displace nothing else: the
+            # marker is honoured only on a `human_blocked:` defer, which is a
+            # HUMAN_GATED_DEFER_PREFIXES member, so every goal reaching this
+            # branch would otherwise have matched the notify_user test below.
+            # Tested first so that precedence is stated rather than inferred.
+            route = "skip_owner_decided"
+        elif root is not None and (("user" in rparts) or _human_gated(root)):
             route = "notify_user"
         elif (root is not None and agent_resolvable
               and root.get("status") == "pending"
@@ -945,10 +1014,31 @@ def run(args) -> dict:
              "age_hours": round(age, 1), "root_id": root_id,
              "root_title": (root.get("title") if root else None),
              "root_participants": rparts, "route": route,
+             "owner_decided_ref": owner_decided,
              "source": goal.get("_source", "world")}
         candidates.append(c)
 
         if not args.apply:
+            continue
+
+        if route == "skip_owner_decided":
+            # NO BOARD POST, deliberately — unlike the re-probe suppression
+            # below, which posts because a FALSIFIED verdict is news. This one
+            # is the steady state: a `human_blocked:` root never auto-clears
+            # (probe-before-defer.md), so its population never drains and a post
+            # here would recur every cooldown window forever. 's own
+            # record calls enrolling it in a recurring digest "the precise thing
+            # that was refused". Posting nothing also burns no cooldown slot, so
+            # the next sweep re-derives the same suppression in memory — cheap,
+            # and idempotent. The JSON bucket is the durable record.
+            owner_decided_skipped.append({
+                "goal_id": gid, "root_id": root_id,
+                "age_hours": round(age, 1),
+                "owner_decided_ref": owner_decided,
+                "detail": ("root %s is a declared owner-decided park "
+                           "(decision %s) — not routed to the owner"
+                           % (root_id, owner_decided)),
+            })
             continue
 
         # : RE-PROBE BEFORE THE BOARD POST, not after the route
@@ -1035,6 +1125,14 @@ def run(args) -> dict:
         "boosted": boosted,
         "needs_user_notification": needs_notify,
         "reprobe_suppressed": reprobe_suppressed,
+        # . Declared owner-decided parks that were NOT routed to the
+        # owner. Deliberately NOT one of the always-run battery's `finds` keys:
+        # a suppressed park is the mechanism working, not a finding. The flag
+        # below carries the measured-vs-clean distinction `blocked_view_measured`
+        # draws above — False means the predicate could not be imported, so this
+        # list is a NON-MEASUREMENT and parks were escalated, not suppressed.
+        "owner_decided_skipped": owner_decided_skipped,
+        "owner_decided_predicate_loaded": _OWNER_DECIDED_LOADED,
         "skipped_cooldown": skipped_cooldown,
         "skipped_below_threshold": skipped_young,
         "skipped_no_blocked_since": skipped_no_ts,

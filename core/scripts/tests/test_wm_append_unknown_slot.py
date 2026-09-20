@@ -131,6 +131,43 @@ _APPEND_CALL = re.compile(
 _SCAN_ROOTS = ("core", ".claude", "mind_api", "world", ".mind-data/world")
 
 
+def _strip_py_prose(txt: str) -> str:
+    """Drop `#` comments and docstrings from Python source before scanning.
+
+    guard-7000 / guard-3682: a call-site census over source counts the very
+    comments and docstrings that DOCUMENT the call, and those cluster in the
+    files most likely to explain it. Two live shapes minted a slot named after
+    the next word -- a comment reading `wm-set.sh / wm-append.sh are
+    daemon-only` (slot `are`) and a docstring's example `| bash .../wm-append.sh
+    slot` (slot `slot`). Rewording the prose is a treadmill that re-fires on
+    every correction it causes (guard-2096); stripping it is the fix.
+
+    Only `.py` is stripped: measured 2026-09-20, all 11 TRUE positives live in
+    `.md` pseudocode blocks (SKILL.md and conventions), where the prose IS the
+    call site, and both false positives were in `.py`. True-positive count is
+    unchanged at 11 -- the two counts are measured apart (guard-3086).
+
+    Falls back to the raw text on any tokenize error: a file this cannot parse
+    must stay scanned, never silently skipped.
+    """
+    import io
+    import tokenize
+
+    kept = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(txt).readline):
+            if tok.type == tokenize.COMMENT:
+                continue
+            if tok.type == tokenize.STRING:
+                body = tok.string.lstrip("rbuRBUf")
+                if len(body) >= 6 and body[:3] == body[0] * 3:
+                    continue
+            kept.append(tok.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return txt
+    return "\n".join(kept)
+
+
 def _scan_append_call_sites() -> dict:
     found: dict[str, set] = {}
     scanned = 0
@@ -146,6 +183,8 @@ def _scan_append_call_sites() -> dict:
                 txt = f.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            if f.suffix == ".py":
+                txt = _strip_py_prose(txt)
             for m in _APPEND_CALL.finditer(txt):
                 found.setdefault(m.group(1), set()).add(str(f.relative_to(PROJECT_ROOT)))
     return {"slots": found, "scanned": scanned}

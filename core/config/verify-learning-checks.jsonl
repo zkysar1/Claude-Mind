@@ -7580,7 +7580,7 @@
 {"k": "why", "raw": "   #      neutral), not appended as neutral-path edits.\n", "s": 0, "x": "SQH"}
 {"k": "why", "raw": "   #   2. Windows absolute-path normalization — entries should land as repo-\n", "s": 0, "x": "SQH"}
 {"k": "why", "raw": "   #      relative paths (\"core/scripts/foo.py\"), not absolute Windows form\n", "s": 0, "x": "SQH"}
-{"k": "why", "raw": "   #      (\"C:/ZakNoCloud/GitHub/Ayoai-Mind/core/scripts/foo.py\").\n", "s": 0, "x": "SQH"}
+{"k": "why", "raw": "   #      (\"<PROJECT_ROOT>/core/scripts/foo.py\").\n", "s": 0, "x": "SQH"}
 {"k": "why", "raw": "   # A regression in either is silent — the log keeps appending, but\n", "s": 0, "x": "SQH"}
 {"k": "why", "raw": "   # iteration-commit's cross-agent attribution filter misclassifies entries\n", "s": 0, "x": "SQH"}
 {"k": "why", "raw": "   # and the wrong agent's signature lands on the resulting commit. That\n", "s": 0, "x": "SQH"}
@@ -9527,7 +9527,7 @@
 {"k": "why", "raw": "   # An earlier iteration of this check read only the pseudocode text, which passed for the\n", "s": 1, "x": "CLE"}
 {"k": "why", "raw": "   # digest phrase \"update wm.last_strategic_scan\" even though no wm-set.sh call existed\n", "s": 1, "x": "CLE"}
 {"k": "why", "raw": "   # anywhere in the repo — the time_cadence trigger silently never fired. See rb for F3 in the\n", "s": 1, "x": "CLE"}
-{"k": "why", "raw": "   # 2026-04-19 verification plan at C:\\Users\\Zachary\\.claude\\plans\\temporal-hopping-otter.md.\n", "s": 1, "x": "CLE"}
+{"k": "why", "raw": "   # 2026-04-19 verification plan at <USER_HOME>\\.claude\\plans\\temporal-hopping-otter.md.\n", "s": 1, "x": "CLE"}
 {"k": "bash_bare", "raw": "   Bash: grep -rn \"verified-wm-set.sh last_strategic_scan\" .claude/skills core/scripts → expect >= 1 (verified writer exists; g-115-1416 routed the S5 stamp through verified-wm-set.sh for read-back+retry)\n", "s": 1, "x": "CLE"}
 {"k": "bash_bare", "raw": "   Bash: grep -c \"verified-wm-set.sh last_strategic_scan\" .claude/skills/aspirations-strategic-scan/SKILL.md → expect exactly 1 (single-writer rule, routed through the verified wrapper)\n", "s": 1, "x": "CLE"}
 {"k": "why", "raw": "   # core/scripts/verified-wm-set.sh exists (the generalized write -> read-back -> assert -> retry-once wrapper)\n", "s": 1, "x": "CLE"}
@@ -10234,7 +10234,7 @@
 {"k": "why", "raw": "   # S55.3: .as_posix() discipline on subprocess script paths — state-update-audit.py\n", "s": 1, "x": "CG"}
 {"k": "why", "raw": "   # and precheck-eval.py both spawn helper .sh scripts via subprocess. On Windows,\n", "s": 1, "x": "CG"}
 {"k": "why", "raw": "   # str(WindowsPath(...)) produces backslash paths that Git Bash/MSYS interpret as\n", "s": 1, "x": "CG"}
-{"k": "why", "raw": "   # escape sequences (C:\\ZakNoCloud\\... becomes C:ZakNoCloud...) and every helper\n", "s": 1, "x": "CG"}
+{"k": "why", "raw": "   # escape sequences (C:\\<WORKSPACE>\\... becomes C:<WORKSPACE>...) and every helper\n", "s": 1, "x": "CG"}
 {"k": "why", "raw": "   # call fails \"No such file or directory\". The .as_posix() fix (Bug 2) must stay\n", "s": 1, "x": "CG"}
 {"k": "why", "raw": "   # — if a Windows maintainer strips it for aesthetics, the scripted paths die\n", "s": 1, "x": "CG"}
 {"k": "why", "raw": "   # silently on Windows again.\n", "s": 1, "x": "CG"}

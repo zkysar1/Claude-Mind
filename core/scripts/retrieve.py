@@ -82,20 +82,20 @@ except ImportError:
 
 from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CONFIG_DIR
 from _rb_helpers import is_universal_rb, sort_universal_rbs
-from trigger_firings import record_firing  # g-304-07 telemetry — fail-open inside
+from trigger_firings import record_firing  #  telemetry — fail-open inside
 # s4 (lodestar own-cloud): route store-file reads through the active backend so
 # own-cloud materializes the current S3 object into the local cache before the
 # raw read. On the default LocalBackend, ensure_local() is identity and refresh()
 # is a no-op (zero added I/O) — the local read path is byte-for-byte unchanged.
 from storage_backend import get_backend
-# g-358-05: the reader seam for the segmented content stores. Top-level import is
+# : the reader seam for the segmented content stores. Top-level import is
 # safe HERE (unlike in mind_api/src/world/reasoning_bank.py, where it had to be
 # lazy) because this module already imports `_paths` at :80, so the WORLD_DIR
 # resolution it triggers is already paid. `_store_paths` below never lets its
 # module-level WORLD_DIR reach a read — see that docstring.
 from _utilization_store import store_paths as _seg_store_paths
 from _utilization_store import dedup_by_id as _dedup_by_id
-# g-358-05 reader seam for the reasoning-bank/guardrails counter split. Reader-only
+#  reader seam for the reasoning-bank/guardrails counter split. Reader-only
 # and a no-op until the writer lands (see _utilization_store's module docstring).
 # PER-STORE (`load_counters`), not merged: every _sort_by_utility call site is
 # single-kind. A concurrent implementation imported `load_all_counters` here for a
@@ -111,7 +111,7 @@ UNIVERSAL_RB_CAP = 5
 
 # Collective domain stores (world/). None-guarded like EXP_PATH/EI_PATH below:
 # WORLD_DIR is None on a pre-init deployment (the _paths.py hard-cut), and the
-# daemon imports this module at load_all() before any world exists (g-367-03).
+# daemon imports this module at load_all() before any world exists ().
 # None is correct, not a placeholder — the daemon endpoint rebinds every one of
 # these per-request from ctx paths (mind_api/src/endpoints/retrieve.py, the
 # _swap_lock block), and CLI consumers None-guard (`if R.TREE_PATH else {}`).
@@ -124,7 +124,7 @@ BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml" if WORLD_DIR else None
 # Per-agent stores (agent directory)
 #
 # EXP_PATH is LIVE-ONLY, and that is an UNINTENDED reachability gap — NOT
-# deliberate active forgetting (g-115-4617, measured 2026-08-04, echo, hostname
+# deliberate active forgetting (, measured 2026-08-04, echo, hostname
 # cc-03, uname -r 6.8.0-136-generic). 1,722 records sit in experience-archive.jsonl
 # that retrieve cannot surface. Recorded here so the next reader does not
 # re-derive it; the evidence, in the order it settles the question:
@@ -137,9 +137,9 @@ BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml" if WORLD_DIR else None
 #     any dotted field name at L665, and the recompute at L687 fires only on a
 #     dotted field name. So rule (2) degenerates to a PURE 90-DAY AGE CAP and the
 #     protection guard is structurally unreachable — 0 of 4,175 records qualify,
-#     and 174 archived records had rc>=5 (max 34). Tracked by g-115-4969; the
+#     and 174 archived records had rc>=5 (max 34). Tracked by ; the
 #     class is guard-893's under-recorded-utilization trap.
-#   - Its stated purpose is performance, not curation: g-001-06, the recurring goal
+#   - Its stated purpose is performance, not curation: , the recurring goal
 #     that drives it, reads "Keeps live JSONL files small and fast."
 #   - No consumer compensates — experiential-index.yaml holds 8 entries fleet-wide.
 #   - The archive is a ONE-WAY DOOR: retrieval_count is bumped only on live
@@ -150,7 +150,7 @@ BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml" if WORLD_DIR else None
 # per request, so a one-sided change fixes nothing (guard-130).
 #
 # COST NOW MEASURED, and BOTH halves of the prior "not free" claim were wrong
-# (g-115-4970, 2026-08-12, zeta, hostname cc-02, uname -r 6.8.0-137-generic;
+# (, 2026-08-12, zeta, hostname cc-02, uname -r 6.8.0-137-generic;
 # counts are a mutable-data snapshot — re-measure before relying on them,
 # guard-1876):
 #   - SCAN: EXP_PATH is per-AGENT, so the fleet-wide "+70%" is the wrong
@@ -183,7 +183,7 @@ BELIEFS_PATH = WORLD_DIR / "knowledge" / "beliefs.yaml" if WORLD_DIR else None
 # re-binds _r.EXP_PATH per request and calls this module's function, so a
 # derived path follows the re-bind for free and cannot drift (guard-130);
 # a second constant would need its own re-bind. Both comments move together
-# (guard-2323). Tracked by g-115-6084.
+# (guard-2323). Tracked by .
 EXP_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
 EI_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
 
@@ -194,7 +194,7 @@ EI_PATH = AGENT_DIR / "experiential-index.yaml" if AGENT_DIR else None
 # feedback: 94% of rb and 100% of guardrails stayed at times_helpful=0.
 # Tighter limits on shallow/medium force the scorer to surface only the best
 # matches; deep stays wide for full-context exploration (reflection, research).
-# See g-242-05/06 diagnostics + 2026-04-23 joint feedback-pipeline diagnosis.
+# See /06 diagnostics + 2026-04-23 joint feedback-pipeline diagnosis.
 DEPTH_LIMITS = {"shallow": 15, "medium": 30, "deep": 50}
 EXP_LIMITS = {"shallow": 10, "medium": 15, "deep": 25}
 
@@ -291,7 +291,7 @@ def _body_role():
         CLI and the daemon path.
       * SIGNATURE. `body_role()` defaults its sid from `os.environ["MIND_SID"]`
         and the daemon process env holds the DAEMON's sid, not the caller's.
-        The endpoint now swaps MIND_SID from the `x-ayoai-sid` header exactly
+        The endpoint now swaps MIND_SID from the `x-mind-sid` header exactly
         as Decision #58 already swaps MIND_AGENT for this very function; that
         swap is what makes the env read correct here.
 
@@ -337,7 +337,7 @@ def _infer_in_flight_goal_id():
     # backend (_fileops.locked_modify_yaml), so this read must match. Identity
     # on LocalBackend; best-effort — a genuinely missing file still returns None.
     ts_path = Path(get_backend().ensure_local(ts_path))
-    # g-328-27 sharding: the agent's live status is its ROW file
+    #  sharding: the agent's live status is its ROW file
     # (world/team-state/agents/<agent>.yaml); the core file only carries a
     # pre-migration residual. Materialize the row via the backend too, then
     # read row-first with core fallback (newest-wins).
@@ -346,7 +346,7 @@ def _infer_in_flight_goal_id():
         get_backend().ensure_local(_ts_row_path(WORLD_DIR, agent))
     except Exception as e:
         # best-effort — a missing row falls back to the core residual
-        try:  # report, never raise — see note_swallowed_backend_error (g-306-218)
+        try:  # report, never raise — see note_swallowed_backend_error ()
             from storage_backend import note_swallowed_backend_error
             # Recomputed rather than hoisted: _ts_row_path() is currently INSIDE
             # the guarded block, so lifting it out would let it raise. The nested
@@ -362,20 +362,20 @@ def _infer_in_flight_goal_id():
     gid = inflight.get("goal_id")
     if not (isinstance(gid, str) and gid):
         return None
-    # g-115-5887: a non-empty-string check ALONE was the defect. Falling through
+    # : a non-empty-string check ALONE was the defect. Falling through
     # to None here routes the caller to the existing no-goal path (manifest not
     # goal-stamped) rather than to a WRONG goal, which is the strictly safer of
     # the two failure modes: an unstamped manifest loses attribution, a
     # mis-stamped one makes consumers act on another goal's identity.
     if _goal_id_is_terminal(gid):
         return None
-    # g-115-6748: the in_flight row is AGENT-keyed with NO sid — worker-loop
+    # : the in_flight row is AGENT-keyed with NO sid — worker-loop
     # Phase 4a states the sharing outright ("a worker and its reducer share one
     # row") — so on a WORKER Body this row names the REDUCER's goal, running on
     # another box. Measured 2026-08-19 (alpha worker, cc-07, SID d1aec55b): a
-    # worker executing g-115-6653 stamped its manifest with g-363-20, the
+    # worker executing  stamped its manifest with , the
     # reducer's goal on cc-04. That is MISATTRIBUTION, strictly worse than the
-    # missing attribution the g-115-5887 note above prefers, and it was harmless
+    # missing attribution the  note above prefers, and it was harmless
     # only while the consumers were blind — fixing their path is what arms it.
     #
     # Gating on a sid comparison CANNOT work and is the tempting wrong fix: the
@@ -386,7 +386,7 @@ def _infer_in_flight_goal_id():
     #
     # Returning None routes the caller to the no-goal path — the same fail-safe
     # the terminal-goal check above already chose. Downstream that also trips
-    # the g-304-01 auto-read-only gate, so a --goal-less retrieval on a worker
+    # the  auto-read-only gate, so a --goal-less retrieval on a worker
     # stops bumping utilization counters as well as not stamping the manifest.
     # That is the intended trade and worth stating: a lost count beats a count
     # attributed to another Body's goal.
@@ -394,7 +394,7 @@ def _infer_in_flight_goal_id():
     # FAIL OPEN. Only "worker" suppresses. "unknown" (no MIND_SID, no AGENT_DIR,
     # OSError) falls through WITH "reducer" to the current behaviour, because
     # unknown fires whenever MIND_SID is unset — folding it into the worker
-    # branch would disable goal-stamping fleet-wide and regress g-115-137, the
+    # branch would disable goal-stamping fleet-wide and regress , the
     # fix this inference exists to serve.
     if _body_role() == "worker":
         return None
@@ -421,7 +421,7 @@ def read_jsonl(path):
     return items
 
 def _store_paths(path, kind):
-    """Ordered content-store paths for a legacy store file, oldest-first (g-358-05).
+    """Ordered content-store paths for a legacy store file, oldest-first ().
 
     `path` is the LEGACY store path (RB_PATH / GUARD_PATH) and the enumeration
     base is derived from ITS parent — never from the module-level WORLD_DIR.
@@ -452,7 +452,7 @@ def _store_paths(path, kind):
     return paths
 
 def _read_store(path, kind):
-    """Read a content store as its ordered segment set (g-358-05), with ids
+    """Read a content store as its ordered segment set (), with ids
     appearing in more than one segment collapsed NEWEST-WINS.
 
     Byte-identical to `read_jsonl(path)` until a writer emits segments, since
@@ -491,7 +491,7 @@ def read_yaml(path):
         data = yaml.load(f, Loader=_yaml_loader())
     return data if isinstance(data, dict) else {}
 
-# g-115-8750. Skips recorded by THIS request's loaders, drained by the daemon
+# . Skips recorded by THIS request's loaders, drained by the daemon
 # retrieve endpoint into the retrieval-session manifest as `telemetry_skipped`.
 # A LIST, not a bool, because the reader needs to know WHICH store and WHY —
 # "the retrieval ran and one counter write could not land" and "no retrieval
@@ -560,10 +560,10 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
     if not p.exists():
         return []
 
-    # g-358-22: spool-route the retrieval bump for sidecar-covered kinds. The
+    # : spool-route the retrieval bump for sidecar-covered kinds. The
     # legacy path below is a per-call full-store RMW — history snapshot + fenced
     # whole-object PUT + changelog row — repeated once per store per retrieval
-    # call, which survived the g-358-05 flip as its dominant residual churn
+    # call, which survived the  flip as its dominant residual churn
     # (measured 2026-08-20: an 83-PUT burst of ~3.7MB objects in 10 minutes
     # where the only diff was utilization.retrieval_count/last_retrieved).
     # Same flag, spool, and fallback idiom as the store endpoint's increment
@@ -606,7 +606,7 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
     acquire_lock(lock_path)
     try:
         # Stash of the most recent in-cycle read, for the degraded return path
-        # below (g-115-2301): index 0 holds the last records list _cycle read.
+        # below (): index 0 holds the last records list _cycle read.
         last_read = [[]]
 
         def _cycle():
@@ -615,7 +615,7 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
             # (fix #2) and records the If-Match fence etag for the atomic_write
             # below. No-op on LocalBackend. Mirrors _fileops.locked_modify_jsonl.
             # Re-runs on every conflict retry so each attempt re-fences on the
-            # latest remote state (g-115-2301).
+            # latest remote state ().
             get_backend().refresh(p)
             # Read inside the lock — captures the post-writer state, not
             # whatever was on disk before another agent's locked append landed.
@@ -647,7 +647,7 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
             if not modified:
                 return records
 
-            # g-276-03 mirror: validate post-modify, pre-write. The walk is cheap
+            #  mirror: validate post-modify, pre-write. The walk is cheap
             # and short-circuits on the kill-switch. Aligns retrieve.py writes
             # with the surrogate-gate discipline the rest of _fileops uses.
             for item in records:
@@ -668,7 +668,7 @@ def _locked_bump_jsonl(path, should_bump_fn, counter_path=("utilization", "retri
                                  lines_changed=len(records))
             return records
 
-        # g-115-2301: the bump was a SINGLE-SHOT fenced write — on own-cloud,
+        # : the bump was a SINGLE-SHOT fenced write — on own-cloud,
         # hot shared stores (world/reasoning-bank.jsonl etc., written by every
         # agent's spark/increment paths) advance the fence between refresh and
         # PUT often enough that whole retrievals 409'd on a telemetry write
@@ -698,9 +698,9 @@ def now_str():
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 # ---------------------------------------------------------------------------
-# Bi-temporal reader (g-306-36, BRD Gap 5 — consumes the g-306-35 writer fields)
+# Bi-temporal reader (, BRD Gap 5 — consumes the  writer fields)
 #
-# The writer path (g-306-35) stamps valid_from / valid_to on RB, guardrails,
+# The writer path () stamps valid_from / valid_to on RB, guardrails,
 # beliefs, and tree records. Falsification is close-old (set valid_to=now) +
 # insert-new (valid_from=now), so a logically-evolving record accumulates a
 # version history of half-open [valid_from, valid_to) intervals. This reader
@@ -708,7 +708,7 @@ def now_str():
 # rb-335 mandates (without it the writer fields are dead weight).
 #
 # Lower-bound precedence: valid_from is the canonical bi-temporal field, but
-# records that predate g-306-35 carry no valid_from. `created` (RB/guardrails)
+# records that predate  carry no valid_from. `created` (RB/guardrails)
 # and `last_observed` (beliefs) are transaction-time proxies that give every
 # legacy record a real temporal floor — without the fallback, a legacy record
 # would read as "-inf lower bound" and wrongly surface in an as-of query for a
@@ -730,7 +730,7 @@ def _parse_iso(value):
 
 
 def _valid_at(record, as_of_dt):
-    """Bi-temporal validity predicate (g-306-36): is `record` the version that
+    """Bi-temporal validity predicate (): is `record` the version that
     was valid at instant `as_of_dt`? Half-open interval [lower, upper):
 
       lower = first parseable of valid_from / created / last_observed
@@ -792,14 +792,14 @@ def load_tree_nodes(categories, depth, read_only=False):
     if not nodes:
         return [], set()
 
-    # g-358-173 READ-MERGE — the half that makes the spool safe rather than a
+    #  READ-MERGE — the half that makes the spool safe rather than a
     # counter-losing optimisation. Between a spooled bump and the next
     # structural write that drains it, the on-disk index under-reports
     # `retrieval_count`; a node that has genuinely been retrieved can read back
     # its pre-spool value, and if that value is 0 the reader is handed a FALSE
     # ZERO on live work. guard-731 forbids retiring a node on
     # `retrieval_count == 0` alone, so the false zero is exactly the input that
-    # must never reach a retirement decision (the g-115-5859 clobber class).
+    # must never reach a retirement decision (the  clobber class).
     # Folding here — into the in-memory copy only, never back to disk — is the
     # tree-shaped equivalent of `utilization_of` merging the sidecar for the
     # JSONL kinds. Fail-open: no helper or no pending deltas leaves `nodes`
@@ -818,7 +818,7 @@ def load_tree_nodes(categories, depth, read_only=False):
     # Build concept index once (shared across multi-category). WORLD_DIR is
     # this module's global: import-bound in a CLI process, SWAPPED per request
     # by the daemon endpoint — pass it so node bodies resolve against the
-    # world being served, never _paths' import-time value (g-367-08).
+    # world being served, never _paths' import-time value ().
     concept_index = build_concept_index(nodes, world_root=WORLD_DIR)
     entity_index = tree.get("entity_index", {})
 
@@ -843,7 +843,7 @@ def load_tree_nodes(categories, depth, read_only=False):
                 if new > existing:
                     all_channels[key] = cat_channels[key]
 
-    # g-306-83: flag-gated tree embedding channel — semantic eligibility.
+    # : flag-gated tree embedding channel — semantic eligibility.
     # Nodes whose query-cosine clears the tree-lane floor join the matched
     # set on the 'embedding' channel even when all four token strategies
     # missed them. Runs BEFORE sibling/parent inclusion so semantic matches
@@ -852,7 +852,7 @@ def load_tree_nodes(categories, depth, read_only=False):
     # cosine bonus with true embedding cosine for this request.
     tree_emb = _tree_embedding_scores(categories, nodes)
     if tree_emb:
-        # g-306-92: tree-lane-specific floor. embedding_min_cosine is SHARED
+        # : tree-lane-specific floor. embedding_min_cosine is SHARED
         # with the supplementary rb/guardrail lane and was tuned on that lane's
         # evidence, never on tree-lane data; lowering it would silently change
         # reasoning-bank behaviour. embedding_tree_min_cosine overrides it for
@@ -957,12 +957,12 @@ def load_tree_nodes(categories, depth, read_only=False):
     if matched_keys_to_bump:
         today = today_str()
 
-        # g-358-173 WRITE-SIDE SWITCH. The legacy path below is a whole-object
+        #  WRITE-SIDE SWITCH. The legacy path below is a whole-object
         # PUT of the entire index on an own-cloud box — measured 804 versions /
         # 1,479,642,382 summed PUT bytes in 24h, average PUT 1,840,351 B against
         # a 1,854,264 B file, with 92.5% of changelog rows carrying
         # `lines_changed=0` because they only rewrite integers in place. That is
-        # the exact cost g-358-22 already removed for the sidecar-covered JSONL
+        # the exact cost  already removed for the sidecar-covered JSONL
         # kinds (~L577-600 above); this is the tree-shaped twin.
         #
         # Narrowing, not skipping, on failure: `record_bump` never raises and
@@ -1126,7 +1126,7 @@ def _entry_matches_text(entry, categories):
 # Named because _relevance_floor must sit STRICTLY ABOVE it — a floor that fired
 # at the admission threshold would reserve slots for bare-minimum accidental
 # matches, which on the live corpus are 370 of 431 candidates (measured
-# g-115-7318).
+# ).
 _TEXT_FALLBACK_MIN_OVERLAP = 2
 
 
@@ -1232,7 +1232,7 @@ def _entry_matches(entry, categories):
     return _entry_matches_text(entry, categories)
 
 def _embedding_blend(matched, active, categories, exclude=None):
-    """g-306-77 part b2 — flag-gated embedding-cosine hybrid for the
+    """ part b2 — flag-gated embedding-cosine hybrid for the
     supplementary stores (reasoning bank + guardrails; the two corpora
     embedding-index-build.py persists).
 
@@ -1287,7 +1287,7 @@ def _embedding_blend(matched, active, categories, exclude=None):
         # Flag ON but nothing scored: absent/corrupt index, unloadable
         # encoder, or an empty query. Distinguish index-absent — it is the
         # one state a box can FIX (build the index) and the one that hid
-        # for 25 days (g-115-6860).
+        # for 25 days ().
         status = "no_scores"
         try:
             from _embedding_retrieval import index_available
@@ -1325,7 +1325,7 @@ def _embedding_blend(matched, active, categories, exclude=None):
     widened.sort(key=lambda r: -scores.get(r.get("id"), min_cos))
     return widened
 
-# g-115-4039 — per-request carrier for the universal pull-slot outcome.
+#  — per-request carrier for the universal pull-slot outcome.
 #
 # The producer (_universal_relevance_split, inside load_reasoning_bank) and the
 # consumer (_log_retrieval_trace) sit in different call frames with no shared
@@ -1341,25 +1341,25 @@ def _embedding_blend(matched, active, categories, exclude=None):
 # impossible rather than merely unlikely.
 _UNIVERSAL_SPLIT_STATS: "dict" = {}
 
-# g-115-6860 — per-request carrier for the SUPPLEMENTARY (domain-RB +
+#  — per-request carrier for the SUPPLEMENTARY (domain-RB +
 # guardrail) blend outcome. Same channel + pop semantics as
-# _UNIVERSAL_SPLIT_STATS above (g-115-4039): producer _embedding_blend,
+# _UNIVERSAL_SPLIT_STATS above (): producer _embedding_blend,
 # consumer _log_retrieval_trace, cleared unconditionally in the loaders.
 # Motivating incident: embedding_blend_enabled=true fleet-wide since 07-25
 # while this box had NO index — cosine_scores returned {} and the blend's
 # degraded branch is byte-identical to "no semantic hits", so 25 days of
 # queries served the token-overlap baseline (the 13%-hit@3 arm of the
-# g-306-77 A/B) with zero telemetry. g-115-4039 gave the UNIVERSAL lane a
+#  A/B) with zero telemetry.  gave the UNIVERSAL lane a
 # status field; this is the same visibility for the domain/guardrail lane.
 # Values: "off" | "served" | "no_scores" | "no_scores:index_absent".
 _BLEND_STATS: "dict" = {}
 # One-time-per-process stderr warning flag for the degraded case (mirrors the
-# g-115-3387 encoder-fallback diagnostic: soft must not mean SILENT).
+#  encoder-fallback diagnostic: soft must not mean SILENT).
 _BLEND_DEGRADED_WARNED = False
 
 
 def _universal_relevance_split(universal_sorted, categories, stats=None):
-    """g-306-86 — split the universal-RB cap between the utilization push
+    """ — split the universal-RB cap between the utilization push
     floor and query-relevance pulls, flag-gated by `embedding_blend_enabled`.
 
     Motivating finding (g-306-77 b2 acceptance A/B, 2026-07-10): the
@@ -1538,7 +1538,7 @@ def framework_doc_text(entry):
 
 
 def _framework_embedding_scores(categories, entries):
-    """g-306-340 — flag-gated framework-lane cosine scores, keyed by the
+    """ — flag-gated framework-lane cosine scores, keyed by the
     caller's PATH namespace.
 
     Returns {path: cosine} for every framework doc present in the persisted
@@ -1571,7 +1571,7 @@ def _framework_embedding_scores(categories, entries):
 
 
 def _tree_embedding_scores(categories, nodes):
-    """g-306-83 — flag-gated tree-lane cosine scores, joined back to the
+    """ — flag-gated tree-lane cosine scores, joined back to the
     caller's BASENAME namespace.
 
     Returns {basename_key: cosine} for every node present in the persisted
@@ -1671,7 +1671,7 @@ def _sort_by_utility(entries, counters=None):
     def _key(r):
         # No `or {}` guard: utilization_of documents that it returns {} rather
         # than None precisely so callers can .get() directly (see its docstring).
-        # safe_num (g-357-49): a non-numeric utilization_score was `str * float`
+        # safe_num (): a non-numeric utilization_score was `str * float`
         # under the blend (and a mixed-type sort tuple without it) — one
         # malformed record crashed the whole query's sort.
         util = safe_num(
@@ -1683,7 +1683,7 @@ def _sort_by_utility(entries, counters=None):
         # large util*pf==0 mass within equal provenance.
         # str() on created: a non-string value would make this sort key a
         # mixed-type tuple against sibling records and crash the sort (same
-        # g-357-49 class — the record must cost itself, not the query).
+        #  class — the record must cost itself, not the query).
         if blend:
             pf = _poignancy_weight(r, cfg)
             return (util * pf, _prov_w(r), pf, str(r.get("created", "") or ""))
@@ -1852,13 +1852,13 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
     as_of_dt = _as_of_dt_or_raise(as_of)
     records = _read_store(RB_PATH, "reasoning-bank")
-    # g-306-36: as_of set => point-in-time validity filter (versions valid at T,
+    # : as_of set => point-in-time validity filter (versions valid at T,
     # status-agnostic). as_of None => current-active view (byte-identical path).
     if as_of_dt is None:
         active = [r for r in records if r.get("status") == "active"]
     else:
         active = [r for r in records if _valid_at(r, as_of_dt)]
-    # g-306-11: optional entry_type filter (e.g. "procedure"). Applied here,
+    # : optional entry_type filter (e.g. "procedure"). Applied here,
     # before partition/sort/cap/bump, so both partitions and the bump-set are
     # restricted consistently. None => no-op (default).
     if entry_type is not None:
@@ -1866,21 +1866,21 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     universal = [r for r in active if is_universal_rb(r)]
     domain = [r for r in active if not is_universal_rb(r)
               and _entry_matches(r, categories)]
-    # Sidecar counters loaded ONCE and shared by BOTH sorts below (g-358-05):
+    # Sidecar counters loaded ONCE and shared by BOTH sorts below ():
     # this lane ranks twice — domain here, universal at sort_universal_rbs —
     # and they are the same store, so a second read would be pure waste.
     # Free today (absent sidecar returns {} immediately); measured cost once
     # the writer lands is ~25 ms against this lane's ~100 ms store read.
     _rb_counters = _load_counters("reasoning-bank")
     _sort_by_utility(domain, _rb_counters)
-    # g-306-77 b2: flag-gated embedding hybrid (widen + cosine re-rank) BEFORE
+    #  b2: flag-gated embedding hybrid (widen + cosine re-rank) BEFORE
     # the cap, so semantic matches compete for slots by relevance. Skipped on
     # as_of reads — blending a historical view against the current-corpus
     # index would rank yesterday's records by today's semantics.
     if as_of_dt is None:
         domain = _embedding_blend(domain, active, categories,
                                   exclude=is_universal_rb)
-    # g-115-7318: reserve a bounded number of cap slots for the strongest
+    # : reserve a bounded number of cap slots for the strongest
     # token-overlap matches. OUTSIDE the as_of guard above on purpose — it reads
     # only the query and the entry's own text, so it is valid at any T (see
     # _relevance_floor). AFTER the blend so the blend's re-rank cannot undo it,
@@ -1888,7 +1888,7 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     domain = _relevance_floor(domain, categories, cap)
     domain = domain[:cap]
     sort_universal_rbs(universal, _rb_counters)
-    # g-306-86: flag-gated relevance split of the universal cap. as_of reads
+    # : flag-gated relevance split of the universal cap. as_of reads
     # keep the pure utilization slice — same historical-view reasoning as the
     # domain-lane blend above.
     # Clear UNCONDITIONALLY, before the as_of branch. This must not sit inside
@@ -1904,14 +1904,14 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     # Every request that can reach the trace write passes through here
     # (endpoints/retrieve.py:339 is unconditional), so clearing here closes the
     # window entirely. Pop-on-read protects the request AFTER the consumer;
-    # this protects the request after a FAILED one. (g-115-4039 fresh-eyes;
+    # this protects the request after a FAILED one. ( fresh-eyes;
     # guard-1663 — never let a process-global carry across owners.)
     _UNIVERSAL_SPLIT_STATS.clear()
-    # g-115-6860: same unconditional-clear reasoning for the supplementary
+    # : same unconditional-clear reasoning for the supplementary
     # blend-status carrier (written by _embedding_blend on both the RB and
     # guardrail calls; load_guardrails clears too for guardrail-only paths).
     _BLEND_STATS.clear()
-    # g-306-86 (cont.): as_of reads never run the blend, so there is no pull-slot
+    #  (cont.): as_of reads never run the blend, so there is no pull-slot
     # outcome to report. Leaving the carrier empty (rather than writing zeros)
     # keeps "the lane did not run" distinct from "the lane ran and picked none" —
     # the same conflation the four-valued status exists to prevent.
@@ -1921,7 +1921,7 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     else:
         universal = universal[:UNIVERSAL_RB_CAP]
 
-    # g-306-36: never bump on a point-in-time (as_of) read — it is observational
+    # : never bump on a point-in-time (as_of) read — it is observational
     # history, not current usage, and would inflate the counters that rank
     # current records (and could touch retired/closed versions).
     if not read_only and as_of_dt is None:
@@ -1954,7 +1954,7 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
     """
     cap = SUPPLEMENTARY_CAPS.get(depth, SUPPLEMENTARY_CAPS["medium"])
     as_of_dt = _as_of_dt_or_raise(as_of)
-    # g-115-6860: unconditional carrier clear for guardrail-only request
+    # : unconditional carrier clear for guardrail-only request
     # paths (load_reasoning_bank has the mirror clear) — as_of requests
     # skip the blend, so the carrier must be empty rather than stale.
     _BLEND_STATS.clear()
@@ -1965,10 +1965,10 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
         active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
     _sort_by_utility(filtered, _load_counters("guardrails"))
-    # g-306-77 b2: flag-gated embedding hybrid — see load_reasoning_bank.
+    #  b2: flag-gated embedding hybrid — see load_reasoning_bank.
     if as_of_dt is None:
         filtered = _embedding_blend(filtered, active, categories)
-    # g-115-7318 — see the sibling comment in load_reasoning_bank. Unconditional
+    #  — see the sibling comment in load_reasoning_bank. Unconditional
     # by design; the bump below still keys off the post-cap list.
     filtered = _relevance_floor(filtered, categories, cap)
     filtered = filtered[:cap]
@@ -2010,12 +2010,12 @@ def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=N
     else:
         active = [r for r in records if _valid_at(r, as_of_dt)]
     filtered = [r for r in active if _entry_matches(r, categories)]
-    # No counters arg (g-358-05): pattern-signatures has NO sidecar —
+    # No counters arg (): pattern-signatures has NO sidecar —
     # _utilization_store.KINDS is ('reasoning-bank', 'guardrails') and
     # _check_kind would raise. This lane keeps reading the embedded field, which
     # is correct rather than a gap: nothing splits these counters out.
     _sort_by_utility(filtered)
-    # g-115-7318 — same floor as the two sibling lanes. A strict no-op here
+    #  — same floor as the two sibling lanes. A strict no-op here
     # today: this corpus is far below the cap, and the floor returns unchanged
     # whenever nothing is being cut.
     filtered = _relevance_floor(filtered, categories, cap)
@@ -2055,7 +2055,7 @@ def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=N
 FRAMEWORK_RULES_DIR = PROJECT_ROOT / ".claude" / "rules"
 FRAMEWORK_CORE_CONVENTIONS_DIR = CONFIG_DIR / "conventions"
 # WORLD_DIR is None on a pre-init deployment (the _paths.py hard-cut retired
-# the old always-a-Path fallback chain — g-367-03), so guard the join; the
+# the old always-a-Path fallback chain — ), so guard the join; the
 # check in `_framework_file_sources` skips both the None case and fresh worlds
 # where the conventions subdir is absent. The daemon endpoint rebinds this
 # per-request from ctx paths, same as the store paths above.
@@ -2209,7 +2209,7 @@ def load_framework_rules(categories):
     emb = _framework_embedding_scores(categories, entries)
     if emb:
         # Lane-specific floor falling back to the shared value, mirroring
-        # g-306-92's reasoning for the tree lane: embedding_min_cosine was
+        # 's reasoning for the tree lane: embedding_min_cosine was
         # tuned on the supplementary rb/guardrail lane's evidence, so
         # retuning it here would silently move THAT lane. Deleting the
         # override key restores the shared behaviour exactly.
@@ -2241,22 +2241,22 @@ def load_framework_rules(categories):
     return matches[:FRAMEWORK_RULES_CAP]
 
 # ---------------------------------------------------------------------------
-# Forged skills (g-115-8226 — implementation of the decision g-115-3267
+# Forged skills ( — implementation of the decision 
 # measured its way to).
 #
 # The problem: a goal's execution can reinvent work a forged skill already
-# does. g-115-3267 measured 24 of 632 completed goals (3.8%) carrying a
+# does.  measured 24 of 632 completed goals (3.8%) carrying a
 # forged trigger phrase LITERALLY, and established that 3.8% is a FLOOR, not
 # an estimate — triggers are INTENT-phrased ("land a stranded PR") while
 # goals are PROBLEM-phrased ("commit is stranded on an unmerged branch").
-# The measurement proves its own undercount: g-115-8176/8177 matched on
-# "stranded commit" while g-115-8173 — same family, same defect, hand-executed
+# The measurement proves its own undercount: /8177 matched on
+# "stranded commit" while  — same family, same defect, hand-executed
 # the same session — did not, on wording alone.
 #
 # Why this lane and not an execute-preamble grep: a grep can only ever catch
 # the literal 3.8% and is blind to exactly the intent-vs-problem gap that
 # dominates. This surfaces at goal-execution retrieval, already upstream of
-# Phase 6.5, so it satisfies g-115-3267 outcome 3 without a new call site.
+# Phase 6.5, so it satisfies  outcome 3 without a new call site.
 #
 # THE BINDING IS LOAD-BEARING AND IS *NOT* THE RB/GUARDRAIL ONE. Forged
 # skills carry NO category field, so the combined `_entry_matches` predicate
@@ -2379,7 +2379,7 @@ def load_experiences(categories, depth, read_only=False):
     # record) and no text fallback at all.
     #
     # That omission is why `retrieval_stats.times_useful` had no live writer
-    # (g-115-6908). The g-115-5725 wire-in (2026-08-11, 08e87d67a) correctly
+    # (). The  wire-in (2026-08-11, 08e87d67a) correctly
     # taught retrieve.py to emit {"type":"experience"} into
     # supplementary_items and utilization-feedback.py to route that type to
     # _increment_experience_stat — but it fed those on a list this filter
@@ -2399,7 +2399,7 @@ def load_experiences(categories, depth, read_only=False):
             matching.append(r)
 
     # Sort by retrieval_count descending (most-proven first). safe_num
-    # (g-357-49): a non-numeric count would make a mixed-type sort key and
+    # (): a non-numeric count would make a mixed-type sort key and
     # crash the whole query's sort.
     matching.sort(
         key=lambda r: safe_num(
@@ -2422,7 +2422,7 @@ def load_experiences(categories, depth, read_only=False):
         # caller's contract — keeping it stable preserves the existing
         # "top-N most-proven" semantic the LLM relies on.
         #
-        # g-115-8750: this bump is the ONE utilization write that lands inside
+        # : this bump is the ONE utilization write that lands inside
         # an AGENT DIR, and on a box that does not hold that agent's runner
         # claim it is structurally un-landable — so before this guard it took
         # the whole retrieval down with it (measured cc-07 2026-09-03:
@@ -2430,7 +2430,7 @@ def load_experiences(categories, depth, read_only=False):
         # without --goal returned a byte-identical payload rc=0). Experience is
         # the unique case: `kind=None` here means the legacy full-store RMW
         # (see _locked_bump_jsonl's docstring), and unlike reasoning-bank /
-        # guardrails — whose g-358-22 sidecars live in world/ — and unlike
+        # guardrails — whose  sidecars live in world/ — and unlike
         # pattern-signatures, whose store is also in world/, EXP_PATH is under
         # agents/<agent>/. A telemetry counter must never fail the read that
         # produced it.
@@ -2528,7 +2528,7 @@ _DEFAULT_RETRIEVAL_CFG = {
     "utility_weight_min": 0.5,
     "utility_weight_max": 1.5,
     "utility_weight_neutral_below_retrievals": 5,
-    # Cosine slot reservation (g-306-93). The semantic cosine bonus is ADDITIVE
+    # Cosine slot reservation (). The semantic cosine bonus is ADDITIVE
     # (at most COSINE_BONUS_WEIGHT=2.0 of a ~4.5-5.4 base, ~25%) while
     # utility_weight and the MMR path-similarity penalty act on the WHOLE base,
     # so a node can hold the highest cosine of any node for a query and still
@@ -2539,32 +2539,32 @@ _DEFAULT_RETRIEVAL_CFG = {
     # path-redundant with higher-ranked sibling server/session nodes).
     # Reserving the top-N floor-clearing nodes by cosine guarantees the
     # strongest semantic matches survive, without touching how the other
-    # (limit - N) slots are ranked. 0 disables (byte-identical to pre-g-306-93).
+    # (limit - N) slots are ranked. 0 disables (byte-identical to pre-).
     # Only active on the real-embedding path; the TF-IDF fallback is untouched.
     "cosine_reserved_slots": 3,
     # Embedding-cosine bonus weight on the real-embedding path (2026-09-03).
     # Derivation + the measured sweep: _score_weight_limit. Mirrors tree.yaml.
     "embedding_cosine_bonus_weight": 12.0,
-    # Supplementary-store relevance floor (g-115-7318). The supplementary lane's
+    # Supplementary-store relevance floor (). The supplementary lane's
     # analogue of cosine_reserved_slots above, using the token-overlap count the
     # admission predicate already computes instead of a cosine — so it needs no
     # embedding index and ships DEFAULT ON. Reserve the top-N cap slots for the
     # strongest QUERY-TOKEN matches that the utility cut would drop; the other
     # (cap - N) slots keep the pure utility order. 0 disables (byte-identical to
-    # pre-g-115-7318). See _relevance_floor for the measurements.
+    # pre-). See _relevance_floor for the measurements.
     "relevance_reserved_slots": 3,
     # Minimum distinct length->=5 query-token overlap for a floor slot. Clamped
     # in-code to strictly above _TEXT_FALLBACK_MIN_OVERLAP (2) — at the
     # admission threshold the floor would fire on bare-minimum accidental
     # matches, which are 370 of 431 candidates on the live corpus.
     "relevance_floor_min_overlap": 3,
-    # Poignancy blend (g-306-08, BRD Gap 1a). DEFAULT OFF — mirrors
+    # Poignancy blend (, BRD Gap 1a). DEFAULT OFF — mirrors
     # core/config/tree.yaml retrieval:. When false, _poignancy_weight() returns
-    # 1.0 for every record and ranking is identical to pre-g-306-08.
+    # 1.0 for every record and ranking is identical to pre-.
     "poignancy_blend_enabled": False,
     "poignancy_weight_min": 1.0,
     "poignancy_weight_max": 1.5,
-    # Poignancy assumed for a null/unparseable rating (g-115-6387). In RAW
+    # Poignancy assumed for a null/unparseable rating (). In RAW
     # poignancy units (1-10) so it feeds the same linear map as a real rating —
     # mirroring utility_weight_center, which is likewise expressed in the input's
     # own units. DEFAULT 1.0 IS DELIBERATELY THE PRE-FIX BEHAVIOUR, not the
@@ -2573,10 +2573,10 @@ _DEFAULT_RETRIEVAL_CFG = {
     # measured value ships in core/config/tree.yaml, where the re-derivation
     # instruction lives next to it.
     "poignancy_weight_center": 1.0,
-    # PPR blend (g-306-44, BRD Gap 1b+1c; HippoRAG 2405.14831). DEFAULT OFF —
+    # PPR blend (, BRD Gap 1b+1c; HippoRAG 2405.14831). DEFAULT OFF —
     # mirrors the poignancy blend above. When false, _ppr_weight() returns 1.0
     # for every node AND _score_weight_limit skips the PPR pass entirely, so
-    # ranking is byte-identical to pre-g-306-44. When true, seeds Personalized
+    # ranking is byte-identical to pre-. When true, seeds Personalized
     # PageRank from the top-N baseline (token-overlap) matches over the Mind
     # knowledge-graph and applies a boost-only graph-proximity factor, surfacing
     # multi-hop-relevant records a pure-lexical match misses.
@@ -2584,32 +2584,32 @@ _DEFAULT_RETRIEVAL_CFG = {
     "ppr_weight_min": 1.0,
     "ppr_weight_max": 1.5,
     # Normalized PPR score assumed for a candidate absent from the knowledge
-    # graph (g-115-6387). Same defect shape as poignancy_weight_center, but NO
+    # graph (). Same defect shape as poignancy_weight_center, but NO
     # measured value ships: a PPR score is normalized per-query, so its mean is
     # not a static corpus property the way poignancy's is. 0.0 reproduces the
     # pre-fix factor (== ppr_weight_min) exactly. See _ppr_weight's docstring for
     # why the per-query median is the likely right answer if the blend is enabled.
     "ppr_weight_center": 0.0,
     "ppr_seed_top_n": 5,
-    # Embedding-cosine hybrid for the supplementary stores (g-306-77 part b2;
+    # Embedding-cosine hybrid for the supplementary stores ( part b2;
     # index built by embedding-index-build.py, queried via _embedding_retrieval).
     # DEFAULT OFF — mirrors the two blends above: when false, _embedding_blend
     # returns its input unchanged and ranking is byte-identical to pre-b2.
     "embedding_blend_enabled": False,
     "embedding_min_cosine": 0.35,
-    # g-306-86: universal-RB cap slots reassigned from utilization order to
+    # : universal-RB cap slots reassigned from utilization order to
     # query-cosine order when the blend is ON. 0 disables the split even
     # with the blend enabled; clamped to [0, UNIVERSAL_RB_CAP].
     "universal_relevance_slots": 2,
-    # g-306-82: builder-side model choice (embedding-index-build.py). Query
+    # : builder-side model choice (embedding-index-build.py). Query
     # side follows the built index's meta.json, never this key.
     "embedding_model_name": "all-MiniLM-L6-v2",
-    # g-306-83: tree-lane embedding channel (semantic eligibility in
+    # : tree-lane embedding channel (semantic eligibility in
     # load_tree_nodes + embedding cosine replacing the TF-IDF bonus in
     # _score_weight_limit). Separate flag from the supplementary blend so
     # each lane enables on its own A/B evidence.
     "embedding_tree_channel_enabled": False,
-    # g-306-340: framework-lane embedding channel (semantic eligibility in
+    # : framework-lane embedding channel (semantic eligibility in
     # load_framework_rules over .claude/rules + core/config/conventions +
     # world/conventions). Its OWN flag for the same reason the tree lane has
     # one — each lane enables on its own A/B evidence.
@@ -2769,7 +2769,7 @@ def _utility_weight(node, cfg=None):
                   rid=node.get("key", ""), field="retrieval_count")
     if rc < cfg["utility_weight_neutral_below_retrievals"]:
         return 1.0
-    # Path-c no-feedback-signal exemption (origin/design g-115-1284, guard-393).
+    # Path-c no-feedback-signal exemption (origin/design , guard-393).
     # A node with zero feedback of ANY kind is UNMEASURED, not unhelpful:
     # times_inferred_helpful is starved (no realistic auto-increment path) while
     # times_noise auto-accrues, so without this guard _utility_weight penalizes the
@@ -3071,14 +3071,14 @@ def _score_weight_limit(matched, channels, limit,
             d_vm = idf_index["vectors"].get(key, ({}, 0.0))
             base += COSINE_BONUS_WEIGHT * cosine(q_vm, d_vm)
         w = _utility_weight(node, cfg)
-        # Poignancy blend (g-306-08): third multiplicative factor, 1.0 (no-op)
+        # Poignancy blend (): third multiplicative factor, 1.0 (no-op)
         # when the blend flag is off or the node carries no poignancy.
         p = _poignancy_weight(node, cfg)
         effective = base * w * p
         scored.append((key, node, effective, channel, base, w))
     scored.sort(key=lambda x: -x[2])
 
-    # PPR blend (g-306-44): seed Personalized PageRank from the top-N baseline
+    # PPR blend (): seed Personalized PageRank from the top-N baseline
     # (token-overlap) matches and apply a boost-only graph-proximity factor, so
     # records reachable in 1-2 hops from the recognized query entities surface
     # above lexically-unrelated ones (HippoRAG 2405.14831). Skipped entirely when
@@ -3089,7 +3089,7 @@ def _score_weight_limit(matched, channels, limit,
         # Seed from the top-N baseline matches, mapping each to its knowledge-graph
         # node id (path-derived via _graph_node_key_candidates) rather than the
         # naive "node:"+basename, which matched NOTHING in the graph -- the blend
-        # was inert on real data until g-306-45 (graph keys are node:<relpath>).
+        # was inert on real data until  (graph keys are node:<relpath>).
         seed_keys = []
         for entry in scored[:top_n]:
             seed_keys.extend(_graph_node_key_candidates(entry[0], entry[1]))
@@ -3106,7 +3106,7 @@ def _score_weight_limit(matched, channels, limit,
             scored = rescored
 
     if all_nodes and len(scored) > limit:
-        # Cosine slot reservation (g-306-93). Pull the top-N floor-clearing
+        # Cosine slot reservation (). Pull the top-N floor-clearing
         # nodes by SEMANTIC cosine out of the pool, fill the remaining slots
         # with the unchanged MMR pass, then re-sort the union by effective
         # score. Reserved nodes are GUARANTEED a slot but are NOT promoted —
@@ -3148,7 +3148,7 @@ _UTIL_STOPWORDS = frozenset([
 
 _MAX_DISTINCTIVE_TOKENS = 40  # cap per item to keep session file small
 
-# Identifier-preserving tokenizer (g-115-3144). The previous `[a-z0-9]+` SPLIT
+# Identifier-preserving tokenizer (). The previous `[a-z0-9]+` SPLIT
 # on `-` and `_`, so `movement-navigation` became {movement, navigation} and no
 # token could ever carry structural shape — which made rb-1729's "token SHAPE
 # ([-_0-9]-bearing identifier) is the discriminator, not generic prose vocab"
@@ -3387,7 +3387,7 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
             "supplementary_only": bool(supplementary_only),
             "include_framework": bool(include_framework),
         }
-        # Dropped-key detection (g-115-3416). The n_* keys above are a FIXED
+        # Dropped-key detection (). The n_* keys above are a FIXED
         # allowlist over items_returned, so a store lane added to items_returned
         # without a matching n_<store> here vanishes from the trace with no
         # error — and this trace is what the retrieval audits count. The source
@@ -3411,7 +3411,7 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
                 "should be audited." % (len(_dropped), ", ".join(_dropped)),
                 file=sys.stderr,
             )
-        # g-115-4039 — universal pull-slot outcome, POPPED (not read) so a
+        #  — universal pull-slot outcome, POPPED (not read) so a
         # request that never reached the split cannot inherit the previous
         # request's numbers. Absent keys mean "the blend lane did not run on
         # this request", which is deliberately DIFFERENT from status="ran" with
@@ -3421,7 +3421,7 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
         if _UNIVERSAL_SPLIT_STATS:
             record.update(_UNIVERSAL_SPLIT_STATS)
             _UNIVERSAL_SPLIT_STATS.clear()
-        # g-115-6860 — supplementary blend outcome, same pop semantics.
+        #  — supplementary blend outcome, same pop semantics.
         # Absent key = the blend lane did not run on this request (as_of /
         # early return); "no_scores:index_absent" = flag ON but this box has
         # no built index — the degraded state that hid for 25 days.

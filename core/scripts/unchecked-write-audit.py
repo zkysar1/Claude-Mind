@@ -49,13 +49,24 @@ INVOKE_SHAPES = (
     # wm-append idiom. An earlier version anchored this to line start and missed
     # every piped write, a systematic false negative concentrated in exactly the
     # store whose writes are most often one-liners.
-    re.compile(r"Bash\s*(?:\([^)]*\))?\s*[:(].*%(name)s"),
-    re.compile(r"\bbash\s+\S*%(name)s"),          # "bash core/scripts/x.sh"
-    re.compile(r"\bpy\s+-3\s+\S*%(name)s"),       # "py -3 core/scripts/x.py"
-    re.compile(r"\bpython3?\s+\S*%(name)s"),      # "python3 core/scripts/x.py"
-    re.compile(r"\|\s*(?:bash\s+\S*)?%(name)s"),  # "... | wm-set.sh slot"
-    re.compile(r"\$\(\s*(?:bash\s+\S*)?%(name)s"),  # "$(x.sh ...)"
-    re.compile(r"^\s*%(name)s\s"),                # bare leading invocation
+    # The (?<![A-Za-z0-9_.-]) lookbehind on every %(name)s is LOAD-BEARING, not
+    # tidiness (). The \S* and (?:bash\s+\S*)? prefixes below are greedy
+    # and unanchored on the LEFT, so without it `bash core/scripts/verified-wm-set.sh`
+    # matches name="wm-set.sh" and every wrapper whose name merely ENDS with another
+    # script's name is counted as an unchecked call to the wrapped one. Measured over
+    # the full 460-site population: 13 sites (2.8%) are this false positive, and
+    # wm-set.sh alone is 11 of 49 (22.4%). Two-direction corpus measurement before
+    # shipping (guard-6850): 774 files, 120 lines naming wm-set.sh, current detects
+    # 81 / lookbehind detects 70, 11 flipped, and ZERO of the 11 are true
+    # regressions — every one is a verified-wm-set.sh call. Line 7 ("^\s*") already
+    # pins its own left edge and deliberately does NOT carry the lookbehind.
+    re.compile(r"Bash\s*(?:\([^)]*\))?\s*[:(].*(?<![A-Za-z0-9_.-])%(name)s"),
+    re.compile(r"\bbash\s+\S*(?<![A-Za-z0-9_.-])%(name)s"),          # "bash core/scripts/x.sh"
+    re.compile(r"\bpy\s+-3\s+\S*(?<![A-Za-z0-9_.-])%(name)s"),       # "py -3 core/scripts/x.py"
+    re.compile(r"\bpython3?\s+\S*(?<![A-Za-z0-9_.-])%(name)s"),      # "python3 core/scripts/x.py"
+    re.compile(r"\|\s*(?:bash\s+\S*)?(?<![A-Za-z0-9_.-])%(name)s"),  # "... | wm-set.sh slot"
+    re.compile(r"\$\(\s*(?:bash\s+\S*)?(?<![A-Za-z0-9_.-])%(name)s"),  # "$(x.sh ...)"
+    re.compile(r"^\s*%(name)s\s"),                # bare leading invocation (left edge already pinned)
 )
 
 # Evidence that the pseudocode checked the write. Deliberately GENEROUS: this

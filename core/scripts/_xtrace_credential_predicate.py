@@ -136,9 +136,50 @@ CREDENTIAL_FILES = (".env.local", ".env.secret")
 # entry must go, and the 63% becomes the price of correctness.
 PATH_CONFIG_EXCEPTIONS = ("_paths.sh",)
 
-# Explicit escape hatch, following the gradle-tests precedent: a single token
-# anywhere in the command. Deliberate and auditable, never a silent fail-open.
+# Explicit escape hatch: the CONSTRUCT `XTRACE_CREDENTIAL_GATE_OVERRIDE="<reason>"`
+# (quoted, non-empty) at a shell-word boundary. NOT a bare token anywhere in the
+# command -- that read a MENTION as an invocation and disarmed the gate
+# (). Deliberate and auditable, never a silent fail-open.
 OVERRIDE_TOKEN = "XTRACE_CREDENTIAL_GATE_OVERRIDE"
+
+# : an override must be a CONSTRUCT the author had to build, never a
+# NAME they could type in passing. `OVERRIDE_TOKEN in command` matched a trailing
+# comment, a quoted string, or a heredoc of documentation, so the artifact most
+# likely to name the bypass -- the runbook explaining it -- silently disarmed the
+# gate. Shape adopted from the sibling that already does it right
+# (marker-placement-gate.py:92): token + `=` + a NON-EMPTY quoted justification,
+# which is also what makes the override auditable.
+#
+# The prefix is a shell-word boundary, NOT `^` and NOT a line anchor. rb-9764
+# measured the cost of anchoring a command predicate at a command START: the
+# fleet's dominant shape is `cd ... && VAR=v bash core/scripts/x.sh`, so a
+# start-anchored test silently refuses every real invocation -- trading a silent
+# bypass for a silently-unusable escape hatch, which is harder to notice because
+# the gate then looks MORE protective than it is. `re.M` is likewise absent on
+# purpose (guard-5706): with re.M, `^` matches EVERY line start, including lines
+# inside a documentation heredoc, which would re-open the exact hole.
+# The boundary also stops `FOO_XTRACE_CREDENTIAL_GATE_OVERRIDE="x"` from matching, which the sibling
+# (reading FILE content, not a command line) does not need.
+_OVERRIDE_RE = re.compile(
+    r'(?:^|[\s;&|(])' + re.escape(OVERRIDE_TOKEN) + r'=(["\'])([^"\']+)\1'
+)
+
+
+def override_invoked(command) -> bool:
+    """True only when the command INVOKES the override, not when it names it.
+
+    Requires `XTRACE_CREDENTIAL_GATE_OVERRIDE="<non-empty reason>"` (single or double quotes) preceded by
+    a shell-word boundary. A mention -- `# do not reach for XTRACE_CREDENTIAL_GATE_OVERRIDE here` -- has
+    no `=` and is correctly refused. Measured residual, recorded rather than
+    papered over: a line that writes the whole construct as an EXAMPLE
+    (`# use XTRACE_CREDENTIAL_GATE_OVERRIDE="reason" to bypass`) still suppresses. Narrowing that
+    further needs comment-state parsing of an arbitrary shell command, which is
+    more fragile than the hole it would close.
+    """
+    if not isinstance(command, str):
+        return False
+    return bool(_OVERRIDE_RE.search(command))
+
 
 # A `source`/`.` line that names a loader ANYWHERE on it. See the module
 # docstring: matching the name rather than parsing the path is load-bearing.
@@ -308,14 +349,22 @@ def offending(command, project_root=".", search_dirs=()):
 
     Returns the list of credential-reaching scripts this command would trace --
     empty when the command is safe, when tracing is absent, or when the override
-    token is present. Both conditions are required: xtrace alone is fine, and
+    is INVOKED as `XTRACE_CREDENTIAL_GATE_OVERRIDE="<reason>"` (a bare mention of
+    the token does NOT suppress -- g-115-10247). Both conditions are required: xtrace alone is fine, and
     running a credential script without tracing is the normal case.
     """
     if not command or not isinstance(command, str):
         return []
-    if OVERRIDE_TOKEN in command:
-        return []
+    # Strip heredoc BODIES before the override test, not after (fresh-eyes,
+    # ). A heredoc body is DATA the command writes, not command text:
+    # a runbook documenting the correct invocation form would otherwise disarm
+    # the gate for the very command that writes it -- the self-inflicted-by-
+    # documentation shape this goal was filed on, narrowed by the construct
+    # requirement but not closed by it. Measured: `cat > runbook.md <<'EOF' ...
+    # TOKEN="reason" ... EOF` + a real traced credential script returned [].
     scanned = strip_heredoc_bodies(command)
+    if override_invoked(scanned):
+        return []
     if not has_xtrace(scanned):
         return []
     return credential_scripts_in(scanned, project_root, search_dirs)

@@ -24,7 +24,10 @@ SAFETY: fail open on ANY error. Never exits non-zero. Never emits malformed
 JSON. Empty stdout + exit 0 = "approve with no mutation" per Claude Code's
 PreToolUse hook contract.
 
-Escape hatch: the XTRACE_CREDENTIAL_GATE_OVERRIDE token anywhere in the command.
+Escape hatch: `XTRACE_CREDENTIAL_GATE_OVERRIDE="<reason>"` in the command, at a
+shell-word boundary, with a non-empty quoted reason. Naming the token without
+that construct does NOT suppress the gate (g-115-10247: the old `token anywhere`
+contract meant a runbook explaining the bypass silently disarmed it).
 Deliberate and auditable, following the gradle-tests precedent -- never a silent
 fail-open.
 """
@@ -90,8 +93,10 @@ def build_reason(scripts):
         "  3. Read the script. A silent failure is usually a guard clause or an "
         "early return, and reading is faster than tracing.\n\n"
         "If you genuinely need the trace and accept that secrets will be "
-        "written to this transcript, put {} anywhere in the command to bypass. "
-        "The bypass is recorded.\n"
+        "written to this transcript, prefix the command with an assignment "
+        "carrying your reason -- {}=\"why you need it\" -- which is an "
+        "INVOCATION. Merely naming the token in a comment does NOT bypass "
+        "(g-115-10247). The bypass is recorded.\n"
         "See guard-2846."
     ).format(names, OVERRIDE_TOKEN)
 

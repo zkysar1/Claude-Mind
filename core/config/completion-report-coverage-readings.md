@@ -135,3 +135,31 @@ followed by the reading's own interpretation.
   either.** Only a window wider than ~2.3d can measure anything here. Combined with guard-2303's
   date-floor, that leaves a usable band between roughly 2.3d and whatever width makes the
   date-floor leak dominate; rows inside it are the only ones worth comparing.
+
+- **2026-09-20, zeta, cc-02 (Linux 6.8.0-139-generic), 30.42h window — 100.0%, denominator 3.**
+  Store split at that instant: **19 resolved vs 1,819 archived** (union deduped by id = 1,838 —
+  the two stores are disjoint). In-window records 6 (2 CONFIRMED, 1 CORRECTED, 3 UNRESOLVABLE);
+  SCOREABLE 3, of which 3 sat in the resolved stage. Scored over SCOREABLE only — an
+  all-records count here would have reported 50.0% and entered a different quantity into the
+  series.
+
+  **THIS ROW IS THE 09-18 QUALIFIER'S FIRST PREDICTION-THEN-CONFIRMATION, which is the only
+  thing it adds.** The prior row derived that backlog governs coverage only for windows WIDER
+  than the ~2.3d archival horizon, and that a sub-horizon window is pinned at 100% whatever the
+  backlog is. This window is 30.42h = 1.27d — still inside the horizon — and it moved BOTH free
+  variables in the direction that would break a naive backlog model: width UP (22.03h → 30.42h)
+  and backlog UP (17 → 19). Coverage stayed at its ceiling, as predicted. A row that merely
+  repeated 100% at the same width would have been worth nothing; the value is that the
+  prediction was stated before the measurement and the measurement could have falsified it.
+
+  Two cautions for whoever reads this next. First, the denominator is **3** — the smallest in
+  this series — so the row is confirmatory, not strong: three records cannot distinguish a
+  ceiling from a coincidence on their own, and it is the AGREEMENT with the 09-18 row's stated
+  mechanism that carries it, not the percentage. Second, this reading was independently
+  corroborated in the same run: `completion-digest.sh`, which walks the stores by a different
+  path, reported the identical 2 confirmed / 1 corrected for the identical window. Two
+  instruments, one answer — that is what makes the 3 trustworthy as far as it goes.
+
+  Standing instruction unchanged and now twice-demonstrated: **a 100% on a sub-day window is not
+  evidence about the instrument, the backlog, or the fleet.** Only a window wider than ~2.3d
+  measures anything here. Do not quote this row; measure your own.

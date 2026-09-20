@@ -556,6 +556,119 @@ def _branch_tree_identical_upstream(repo, branch, default_branch):
     return (False if compared else None), "", br_tree
 
 
+def prune_merged_local_branches(repo, default_branch, apply=False):
+    """Local branches whose remote ref is GONE and whose content is upstream.
+
+    WHY THIS CANNOT LIVE AT THE MERGE STEP, which is where every reader looks
+    first. `gh pr merge --delete-branch` (product-pr-land.sh step 7) and the
+    repo-level `deleteBranchOnMerge` setting both remove the REMOTE ref.
+    Neither touches a LOCAL branch, and the box that performed the merge is
+    rarely the only box holding one -- a peer never learns the merge happened.
+    So every box accumulates one dead local ref per merged PR, permanently,
+    and NO merge-time hook can fix it for the boxes that were not there.
+    Measured cc-08 2026-09-20: 176 local branches / 23 repos, 152 already
+    merged, oldest 2 months.
+
+    TWO INDEPENDENT SIGNALS, because this is the only classifier in this file
+    whose verdict DESTROYS rather than mislabels. `_patches_absent_upstream`
+    records a 50% false-positive rate on its first live run; that same error
+    here is deleted work, so one signal is not enough (verify-before-assuming
+    rule 1):
+
+      1. TOPOLOGY -- `branch -vv` marks the upstream `gone`: the branch was
+         published and the remote ref has since been removed. A fact about the
+         remote, not an inference about content. It also excludes never-pushed
+         local WIP, which has NO upstream rather than a gone one.
+      2. CONTAINMENT -- every commit reachable from `origin/<default>`, or the
+         branch tree identical to it. A PROOF that deletion is lossless, not a
+         heuristic; the tree arm catches squash-merge, which breaks sha
+         reachability by construction (g-115-6355).
+
+    `gone` ALONE IS NOT SUFFICIENT, and not hypothetically: closing a PR with
+    --delete-branch also removes the remote ref, and 19 branches on cc-08 were
+    closed-UNMERGED that way. Containment is the only thing separating them.
+
+    REPORTS BY DEFAULT. `--pull` itself shipped report-first and was actuated
+    later by a deliberate goal (g-115-6937); deletion earns at least that much
+    caution, so `apply` stays opt-in behind `--prune-branches`.
+
+    Returns {"prunable","kept","deleted","error"}. A branch whose signals are
+    missing or UNMEASURABLE lands in `kept` with its reason -- never silently
+    dropped, for the same reason `_patches_absent_upstream` degrades to the
+    raw count rather than to 0.
+    """
+    out = {"prunable": [], "kept": [], "deleted": [], "error": None}
+    if not default_branch:
+        out["error"] = "default branch unknown -- nothing considered"
+        return out
+    # `for-each-ref` rather than `branch -vv`: the latter is COLUMN-formatted
+    # and `_git` strips its output, so the first line loses its marker column
+    # while every later line keeps it — a fixed offset then silently eats two
+    # characters of the first branch's name (observed: feat/done -> at/done,
+    # which then reads as "containment unmeasurable" rather than as a parse
+    # bug). `%(upstream:track)` reports gone-ness as DATA, and the format is
+    # stable across git versions.
+    rc, listing, err = _git(
+        repo, "for-each-ref", "--format=%(refname:short)\t%(upstream:short)"
+        "\t%(upstream:track)", "refs/heads")
+    if rc != 0:
+        out["error"] = "for-each-ref failed: %s" % (err or "rc=%s" % rc)[:120]
+        return out
+    rc_h, head, _ = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    current = head.strip() if rc_h == 0 else ""
+
+    # A branch checked out by ANY worktree cannot be deleted and must not be
+    # advertised as prunable.
+    held = set()
+    rc_w, wt, _ = _git(repo, "worktree", "list", "--porcelain")
+    if rc_w == 0:
+        for wl in wt.splitlines():
+            if wl.startswith("branch "):
+                ref = wl.split(" ", 1)[1].strip()
+                held.add(ref[11:] if ref.startswith("refs/heads/") else ref)
+
+    for ln in listing.splitlines():
+        parts = ln.split("\t")
+        if len(parts) < 3:
+            continue
+        name, upstream, track = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if not name or name == default_branch or name in ("dev", "main", "master"):
+            continue
+        if name == current or name in held:
+            out["kept"].append((name, "checked out"))
+            continue
+        # NEVER-PUSHED (no upstream) is not GONE. Only an upstream that once
+        # existed and has been removed qualifies.
+        if not upstream or "gone" not in track:
+            continue
+        anc, _, _ = _git(repo, "merge-base", "--is-ancestor", name,
+                         "origin/%s" % default_branch)
+        if anc == 0:
+            reason = "every commit reachable from origin/%s" % default_branch
+        else:
+            same, up, _ = _branch_tree_identical_upstream(repo, name,
+                                                          default_branch)
+            if same is True:
+                reason = "tree identical to %s" % up
+            elif same is None:
+                out["kept"].append((name, "containment UNMEASURABLE -- kept"))
+                continue
+            else:
+                out["kept"].append(
+                    (name, "upstream gone but content NOT upstream -- kept"))
+                continue
+        if apply:
+            rc_d, _, derr = _git(repo, "branch", "-D", name)
+            if rc_d == 0:
+                out["deleted"].append(name)
+            else:
+                out["kept"].append((name, "delete failed: %s"
+                                    % (derr or "rc=%s" % rc_d)[:60]))
+                continue
+        out["prunable"].append((name, reason))
+    return out
+
+
 def sweep_status(repo):
     """Unpushed-on-any-branch + stale-dirty for ONE repo. Never raises.
 
@@ -847,7 +960,7 @@ def pull_status(repo, interval_min=PULL_INTERVAL_MIN, do_fetch=True):
         age_min = (time.time() - fetch_head.stat().st_mtime) / 60.0
         fresh = age_min < interval_min
     if do_fetch and not fresh:
-        frc, _, ferr = _git(repo, "fetch", "--quiet", "origin",
+        frc, _, ferr = _git(repo, "fetch", "--quiet", "--prune", "origin",
                             timeout=FETCH_TIMEOUT_S)
         rec["fetched"] = (frc == 0)
         if frc != 0:
@@ -926,6 +1039,33 @@ def render_pull(records):
             out.append("  %s:" % label)
             for r in rows:
                 out.append("    %-42s %s" % (r["name"], r["detail"]))
+    # The prune line SPEAKS ONLY WHEN THERE IS SOMETHING TO SAY, unlike the
+    # banner above it: a per-repo "0 prunable" across 60 repos is the noise
+    # that trains a reader to skip the section (the same argument the
+    # off-default block makes one function up).
+    pruned, prunable, kept_live, errs = [], [], 0, []
+    for r in records:
+        bp = r.get("branch_prune") or {}
+        if bp.get("error"):
+            errs.append("%s: %s" % (r.get("repo", "?"), bp["error"]))
+        for nm in bp.get("deleted", []):
+            pruned.append("%s %s" % (r.get("repo", "?"), nm))
+        for nm, why in bp.get("prunable", []):
+            prunable.append("%s %s (%s)" % (r.get("repo", "?"), nm, why))
+        kept_live += sum(1 for _n, w in bp.get("kept", [])
+                         if "NOT upstream" in w or "UNMEASURABLE" in w)
+    if pruned:
+        out.append("  pruned %d dead local branch(es): %s"
+                   % (len(pruned), ", ".join(pruned[:6])))
+    if prunable:
+        out.append("  %d local branch(es) prunable (upstream gone + content "
+                   "contained upstream) — rerun with --prune-branches to "
+                   "delete: %s" % (len(prunable), ", ".join(prunable[:6])))
+    if kept_live:
+        out.append("  %d branch(es) have a gone upstream but were KEPT — "
+                   "content not provably upstream, or unmeasurable" % kept_live)
+    for e in errs[:4]:
+        out.append("  branch-prune probe failed — %s" % e)
     return "\n".join(out)
 
 
@@ -1314,6 +1454,12 @@ def main(argv=None):
                          "of a repo no goal named. Skips dirty, ahead, and "
                          "off-default trees and reports them instead. Never "
                          "blocks; always exits 0.")
+    ap.add_argument("--prune-branches", action="store_true",
+                    help="ACTUATE the local gone-branch prune that --pull "
+                         "otherwise only reports. Deletes a local branch ONLY "
+                         "when its upstream is gone AND its content is "
+                         "provably contained upstream; see "
+                         "prune_merged_local_branches.")
     ap.add_argument("--pull-interval-min", type=int, default=PULL_INTERVAL_MIN,
                     help="throttle the NETWORK fetch per repo (default %d min; "
                          "0 = always fetch). The local ff-only advance is NOT "
@@ -1355,6 +1501,13 @@ def main(argv=None):
         targets = [Path(r) for r in args.repo if _is_repo(r)] if args.repo else enumerated
         records = [pull_status(r, args.pull_interval_min, not args.no_fetch)
                    for r in targets]
+        # The gone-branch prune rides the pull because the pull has just
+        # fetched with --prune, which is what makes an upstream read `gone`
+        # at all. Reported always, actuated only under --prune-branches.
+        for _r, _rec in zip(targets, records):
+            _rec["branch_prune"] = prune_merged_local_branches(
+                _r, _rec.get("default_branch") or _default_branch(_r),
+                apply=args.prune_branches)
         if args.json:
             cannot, why = vacuity(len(enumerated), len(targets))
             print(json.dumps({"mode": "pull", "scanned": len(targets),

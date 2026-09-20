@@ -1385,11 +1385,37 @@ _selfheal_cross_agent_churn_remerge() {
         _heal_msg="chore($self): pre-merge churn + ${#mergeable_shared[@]} git-commutative shared ledger(s) (iteration-push self-heal, g-115-9744)"
       fi
     fi
-    if ! git -C "$REPO" commit -q -m "$_heal_msg" \
-         -- "${_heal_spec[@]}" 2>/dev/null; then
+    # : CAPTURE this commit's output instead of discarding it. `-q`
+    # plus `2>/dev/null` threw away the only text that says WHY the commit
+    # failed, and the caller's very next line names the dirty CROSS-AGENT paths
+    # git listed — so two adjacent log lines read as one causal statement.
+    # Measured end to end 2026-09-18 on cc-03: the real refusal came from a
+    # pre-commit hook rejecting ONE line of THIS agent's own untracked
+    # experience record, while all three named partner files were provably
+    # mergeable (the self-heal says so one line earlier). Integrate deferred
+    # 21:04→21:26, behind 4→19, and a HIGH escalation goal was filed against an
+    # innocent partner's queue. The misattribution points AWAY from the acting
+    # agent — the direction least likely to be checked, and the one whose stated
+    # remedy (clear the named path) is destructive on a partner's unpushed work.
+    #
+    # DECLARE THEN ASSIGN, deliberately: `local _x="$(cmd)"` would set $? from
+    # `local`, not from the commit, so the rc this branch keys on would always
+    # be 0 and the capture would silently never fire.
+    local _heal_out _heal_rc
+    _heal_out="$(git -C "$REPO" commit -q -m "$_heal_msg" \
+         -- "${_heal_spec[@]}" 2>&1)"
+    _heal_rc=$?
+    if [ "$_heal_rc" -ne 0 ]; then
       # Unstage what we staged so a failed heal leaves the index as found.
       git -C "$REPO" reset -q -- "${_heal_spec[@]}" 2>/dev/null || true
-      log "self-heal: pathspec-limited commit of self-namespace churn failed — defer"
+      log "self-heal: pathspec-limited commit of self-namespace churn failed (rc=${_heal_rc}) — defer. THE FOLLOWING 'merge DEFERRED … git blocked on' LINE IS A SEPARATE STATEMENT: it lists what git called DIRTY, not why THIS commit failed. The reason is quoted immediately below (g-115-10300)."
+      if [ -n "$_heal_out" ]; then
+        printf '%s\n' "$_heal_out" | while IFS= read -r _hl; do
+          log "self-heal:   | ${_hl}"
+        done
+      else
+        log "self-heal:   | (no output at rc=${_heal_rc} — a SILENT non-zero. The refuser printed NOTHING, so this line is the whole evidence: it does NOT establish that a hook was uninvolved (a hook may exit non-zero without printing), and it does NOT license reading the next line as the cause. g-115-10300)"
+      fi
       return 1
     fi
   fi

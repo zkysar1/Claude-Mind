@@ -61,6 +61,47 @@ because echo's own N=73 row names N=74 in its body. guard-2653's `handoff to N=`
 filter does not catch that phrasing and cannot be widened to (the forms are
 unbounded prose) — position is the reliable discriminator, not wording.
 
+## Why branch 3 is an `awk match()` and NEVER a `^[^N]*` sed prefix (g-115-10215)
+
+Branch 3 read `sed -nE 's/^[^N]*(N=[0-9]+).*/\1/p'` until 2026-09-20. The
+`^[^N]*` prefix is the defect: it stops at the FIRST capital N in the row, and
+if that N is not followed by `=` the substitution never matches, so `-n` prints
+NOTHING and the row is silently skipped. Any row whose prose carries a capital-N
+word — NOT, NEW, NOTE, NEVER, UNCHANGED — ahead of its own index is dropped from
+the max. The failure rate RISES with how eventful the series is, because those
+are exactly the words a lane-definition-change row needs.
+
+MEASURED on the live authoritative zeta shard (echo, `hostname` cc-03, `uname
+-r` 6.8.0-139-generic, 2026-09-20, 531,824 B via `backend-cat.sh`):
+rows containing an index token **93**; the sed form extracted **90** (dropped
+N=116 "NEW 4-id lane", N=135 "UNCHANGED from", N=164 "NOT comparable");
+the awk form extracts **93 of 93**.
+
+The drop is only VISIBLE when an eaten row holds the max, and then it is a
+COLLISION, not a gap. Reproduced by truncating the shard at its 2026-09-17 state
+(newest row = N=164): sed composite **163**, awk composite **164**. At 163 the
+next pass mints N=164 on top of a live row — and the g-115-8055 write-time
+re-probe cannot catch it, because both probes run the same branch, so the value
+never "moves" and every drift and integrity check reports `[match]` over a
+duplicate index (guard-5322, guard-1876).
+
+The fix keeps first-`N=`-per-row semantics and drops the negated class
+entirely, anchoring on the token instead of on what precedes it:
+`awk 'match($0, /N=[0-9]+/) { print substr($0, RSTART, RLENGTH) }'`. POSIX
+`match()` is leftmost, so it is the same rule the section above requires — and
+it is NOT the rejected within-row max: on that same shard the whole-file token
+max is **174** (a cross-reference inside the N=160 row's prose) while the awk
+form returns **168**, the true newest row. Zero regressions across all five
+shards, same run, old vs new composite: alpha 174/174 · bravo 169/169 · echo
+159/159 · foxtrot 118/118 · zeta 168/168.
+
+Two adjacent hazards were MEASURED and are not applicable to these shards
+today, recorded so the next reader does not re-derive them: CRLF (guard-987) —
+0 carriage returns in all five, against a positive control returning 1; and
+fenced code blocks (guard-526, the `prose-filter-pattern` node) — 0
+triple-backtick lines in all five, against a positive control returning 2. Both
+become live the day a shard gains a fence.
+
 ## Why a wrong diagnosis kept this unfixable for a day
 
 The prior note here read "zeta has 0 table rows, so its shape is a third one

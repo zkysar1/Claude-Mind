@@ -44,6 +44,22 @@ KNOWN_CAPABILITIES = frozenset({
     "gpu",              # a usable GPU (VRAM reclaim, local inference)
     "git-push",         # this runner can push commits (not a read-only clone)
     "studio-session",   # a live product Studio session -- see note in _probe_default_capabilities
+    "win32",            # a Windows runner (g-115-8826) -- platform-probed, never hand-declared
+})
+
+# Tokens that ARE in KNOWN_CAPABILITIES but that NO probe ever asserts, so a box
+# provides them ONLY by hand-declaring `runner_capabilities.provides`. Validating
+# a token against KNOWN_CAPABILITIES is therefore NECESSARY AND NOT SUFFICIENT
+# (zeta, 2026-09-06, on this goal): a known-but-never-provided token is filtered
+# out on EVERY runner exactly like an unknown one, and it passes any membership
+# check. Kept as a separate set rather than dropped from KNOWN_CAPABILITIES
+# because the token is legitimate -- it routes correctly the moment one box
+# declares it -- so refusing it at write time would be wrong. Naming it lets the
+# block_detail below tell a reader WHICH of the two invisibility modes they are
+# looking at. guard-2937: two individually-correct mechanisms (a closed vocab and
+# a deliberately-unprobed token) compose into a silent fleet-wide mute.
+NEVER_AUTO_PROVIDED = frozenset({
+    "studio-session",
 })
 
 
@@ -100,6 +116,20 @@ def _probe_default_capabilities():
             for part in awp.split(";")
         ):
             caps.add("product-runtime")
+    except Exception:
+        pass
+    # win32: this runner is a Windows box (g-115-8826). PLATFORM-PROBED, never
+    # hand-declared per box -- that is the whole point. The originating incident
+    # was a goal declaring `win32` while the token was not in KNOWN_CAPABILITIES
+    # and no probe asserted it, so it was filtered out on every runner in the
+    # fleet for 5 days while an idle Windows box with the target repo sat next to
+    # it. os.name is the cheap, side-effect-free discriminator ("nt" on CPython
+    # for Windows including MSYS/Git-Bash-launched interpreters); sys.platform is
+    # checked too so a non-CPython runtime reporting "win32" is still caught.
+    try:
+        import sys as _sys
+        if os.name == "nt" or str(_sys.platform).startswith("win"):
+            caps.add("win32")
     except Exception:
         pass
     # git-push: default-PRESENT. A wrongly-claimed git-push only affects goals
@@ -241,6 +271,68 @@ def goal_required_capabilities(goal):
     if not isinstance(req, (list, tuple, set)):
         return set()
     return {str(c).strip() for c in req if str(c).strip()}
+
+
+def unknown_capability_tokens(tokens):
+    """The subset of `tokens` that is OUTSIDE KNOWN_CAPABILITIES.
+
+    A token here can never be satisfied by ANY runner: `goal_is_locally_executable`
+    is a plain subset test against what a box provides, and nothing anywhere adds
+    an off-contract token to a runner's set except a hand-written
+    `runner_capabilities.provides` in a per-box, sync-excluded file. So a goal
+    carrying one is filtered out of the ranked pool on every box in the fleet,
+    permanently, with no error anywhere -- the failure this module's own
+    docstring calls asymmetrically dangerous (rb-1028: a wrongly-hidden goal is
+    invisible, un-actioned and un-learned-from).
+
+    Accepts a goal dict or any token iterable, so the write-time validator and
+    the selector's block_detail can share one predicate rather than drifting.
+    """
+    if isinstance(tokens, dict):
+        tokens = goal_required_capabilities(tokens)
+    elif isinstance(tokens, str):
+        tokens = [tokens]
+    try:
+        toks = {str(t).strip() for t in (tokens or []) if str(t).strip()}
+    except TypeError:
+        return set()
+    return toks - set(KNOWN_CAPABILITIES)
+
+
+def capability_block_detail(missing, runner_caps):
+    """Human-readable not_my_lane detail that says WHICH kind of block this is.
+
+    The original message -- "Requires capability not on this runner: X (runner
+    has: ...)" -- reads as "wrong box, some other runner will take it" in all
+    three cases below, and only one of them is true. That wording is what let a
+    revenue-bearing goal (27.6% of active customers unbillable) sit unread behind
+    a well-formed-looking block: a wrong-locus POSITIVE reads as corroboration
+    and never prompts a second look (guard-7132).
+
+    Three cases, in decreasing severity:
+      * UNKNOWN token  -> no runner can EVER provide it. Terminal without an edit.
+      * NEVER_AUTO_PROVIDED -> only a box that hand-declares it provides it, so
+        it is invisible fleet-wide until one does.
+      * otherwise -> an ordinary per-box gap; another runner genuinely may take it.
+    """
+    missing = sorted({str(m).strip() for m in (missing or []) if str(m).strip()})
+    have = ",".join(sorted(runner_caps or [])) or "none"
+    if not missing:
+        return "Requires capability not on this runner: (none) (runner has: {r})".format(r=have)
+    unknown = sorted(unknown_capability_tokens(missing))
+    unprovided = sorted(set(missing) & set(NEVER_AUTO_PROVIDED))
+    base = "Requires capability not on this runner: {m} (runner has: {r})".format(
+        m=",".join(missing), r=have)
+    if unknown:
+        return (base + " -- NO RUNNER CAN EVER PROVIDE {u}: not in KNOWN_CAPABILITIES"
+                " ({k}). This goal is hidden fleet-wide, not routed elsewhere;"
+                " fix the token or register it.").format(
+                    u=",".join(unknown), k=",".join(sorted(KNOWN_CAPABILITIES)))
+    if unprovided:
+        return (base + " -- {p} is never auto-probed, so only a box that declares"
+                " runner_capabilities.provides supplies it; if none does, this goal"
+                " is hidden fleet-wide.").format(p=",".join(unprovided))
+    return base
 
 
 def goal_is_locally_executable(goal, runner_caps):

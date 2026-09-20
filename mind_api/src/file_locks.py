@@ -125,6 +125,100 @@ _WAITING: Dict[str, int] = {}     # lock key → threads blocked on acquire
 # instead of sleeping past it.
 WEDGE_SECONDS = float(os.environ.get("MIND_WRITE_PATH_WEDGE_S", "60") or 60)
 
+# ─── Bounded acquire () ───────────────────────────────────────────
+#  made the wedge OBSERVABLE (the two dicts above) and deliberately
+# left the acquire unbounded — the comment there still says so. Observability
+# was the right first step and it is not the fix: on cc-04 a wm-prune request
+# timed out client-side at RT_CURL_TIMEOUT=90 and from that moment EVERY WM
+# write hung forever while reads returned in 1s through the same daemon
+# (guard-6895). THE CLIENT GIVING UP DOES NOT RELEASE A SERVER-SIDE LOCK, and
+# an unbounded acquire turns one stuck holder into a permanent box-wide write
+# death that only `mind-api-start.sh --restart` clears.
+#
+# WHY A GIVE-UP AND NOT A SHORTER HOLD: the holder is parked in I/O (a
+# multi-megabyte own-cloud PUT). Nothing in this process can shorten or
+# interrupt it. What this bound fixes is the PILE-UP behind it — waiters stop
+# accumulating in an indefinite futex wait and start failing with a diagnosis
+# that names the holder, so the box is debuggable instead of silently dead.
+#
+# WHY 240s AND NOT WEDGE_SECONDS (60): these two thresholds answer different
+# questions and the asymmetry is deliberate. Reporting `wedged: true` on
+# /health is advisory and cheap to get wrong. REFUSING A WRITE is not, and a
+# legitimate hold here is a whole-file rewrite whose duration is set by object
+# size and network, not by this module — alpha's measured bounds on the real
+# incident were 75s and 240s, which establish "longer than 240s", never "no
+# legitimate write takes 60s". So the give-up sits well past every bound that
+# incident tried. Raising WEDGE_SECONDS must NOT silently raise this.
+#
+# THE SAFETY PROPERTY THAT MAKES THIS SHIPPABLE ON A 111-CALL-SITE WRITE PATH:
+# we give up ONLY when the CURRENT holder has itself already held for longer
+# than the give-up threshold. In every case where behaviour changes, the
+# pre-existing behaviour was an unbounded hang. A young holder — however slow —
+# is waited on exactly as before.
+ACQUIRE_GIVEUP_SECONDS = float(
+    os.environ.get("MIND_WRITE_PATH_GIVEUP_S", "240") or 240)
+# How often a blocked waiter re-checks the holder's age. Not a timeout: a
+# failed poll loops. Small enough to react promptly, large enough that a
+# hot lock does not spin.
+ACQUIRE_POLL_SECONDS = float(
+    os.environ.get("MIND_WRITE_PATH_POLL_S", "5") or 5)
+
+
+class WritePathWedged(TimeoutError):
+    """A writer gave up because the CURRENT holder is wedged.
+
+    Subclasses TimeoutError ON PURPOSE: callers that already map a lock
+    TimeoutError to a 503 "lock busy; try again" (see
+    meta/skill_quality_score.py) then degrade to that same accurate answer
+    instead of a 500, with no edit at the call site. A new exception type
+    hanging off Exception would have turned 111 call sites into 500s.
+    """
+
+
+def _holder_age(key: str) -> Optional[float]:
+    """Seconds the current hold on `key` has been held, or None if unheld.
+
+    None is the honest answer for "nobody holds it": the holder released
+    between our failed acquire and this read, which means the next poll will
+    take the lock. Callers MUST treat None as "keep waiting", never as
+    "wedged" — the fail-safe direction is to wait, because refusing a write
+    that could have succeeded is the expensive error here.
+    """
+    with _TELEMETRY_LOCK:
+        started = _HOLDS.get(key)
+    return None if started is None else time.monotonic() - started
+
+
+def acquire_or_wedge(thread_lock: threading.Lock, key: str, *,
+                     giveup_seconds: Optional[float] = None,
+                     poll_seconds: Optional[float] = None) -> None:
+    """Acquire `thread_lock`, giving up only if the holder is itself wedged.
+
+    Blocks like a bare `acquire()` for any holder younger than the give-up
+    threshold. Raises `WritePathWedged` — never returns False — so a caller
+    that forgets to check a boolean cannot proceed unlocked.
+    """
+    giveup_seconds = (ACQUIRE_GIVEUP_SECONDS if giveup_seconds is None
+                      else giveup_seconds)
+    poll_seconds = (ACQUIRE_POLL_SECONDS if poll_seconds is None
+                    else poll_seconds)
+    while True:
+        if thread_lock.acquire(timeout=poll_seconds):
+            return
+        age = _holder_age(key)
+        if age is not None and age > giveup_seconds:
+            with _TELEMETRY_LOCK:
+                blocked = _WAITING.get(key, 0)
+            raise WritePathWedged(
+                f"write path wedged: {key} has been held for {age:.0f}s "
+                f"(give-up {giveup_seconds:.0f}s), {blocked} writer(s) "
+                f"blocked. The holder is parked in I/O and cannot be "
+                f"interrupted from here; this request is refused rather "
+                f"than parked behind it. Recover with "
+                f"`mind-api-start.sh --restart` (guard-6895) — note it is "
+                f"--restart, not --recycle. GET /v1/admin/health reports "
+                f"the live verdict under write_path.")
+
 
 def write_path_status(wedge_seconds: Optional[float] = None) -> dict:
     """Verdict on whether THIS process's write path is wedged.
@@ -158,6 +252,72 @@ def write_path_status(wedge_seconds: Optional[float] = None) -> dict:
 
 
 @contextlib.contextmanager
+def thread_locked(path: Path, *, key: Optional[str] = None,
+                  giveup_seconds: Optional[float] = None,
+                  poll_seconds: Optional[float] = None):
+    """Hold ONLY the per-path threading lock — bounded and instrumented.
+
+    This is the Layer-1 half of `locked()` with the Layer-2 file lock left
+    out, for the one caller that needs a NON-STANDARD file-lock path and so
+    cannot use `locked()` at all (meta/skill_quality_score.py takes
+    `skill-quality.yaml.lock`, not the `.lock` convention `locked()` hardcodes).
+
+    WHY THIS EXISTS AS A SHARED HELPER RATHER THAN A SECOND INLINE COPY
+    (g-115-10378): that caller previously did a bare `thread_lock.acquire()`,
+    which was unbounded (the defect g-115-10161 fixed in `locked()`) AND
+    unregistered — it wrote no `_HOLDS` entry, so `write_path_status()` could
+    not see a wedge on that path at all and /health would report a clean
+    verdict over a wedged write path. The bounding and the registration are
+    the same few lines, and splitting them across two copies is what let the
+    second site miss both. `locked()` below now calls this rather than keeping
+    its own copy, so there is exactly one implementation to harden (guard-2015)
+    and this is not a single-use abstraction (guard-4591).
+
+    Yields the telemetry key, which is what a caller would need to correlate
+    with `write_path_status()`.
+    """
+    # Defaults to the manager's OWN key derivation — verified identical to
+    # FileLockManager.get's `str(Path(path).resolve())`, so a caller that
+    # previously did a bare `manager().get(path)` keeps acquiring the SAME
+    # Lock object. Handing the resolved key in also saves the second resolve
+    # syscall on the `locked()` path (see FileLockManager.get's docstring).
+    key = str(Path(path).resolve()) if key is None else key
+    thread_lock = _GLOBAL_MANAGER.get(path, key=key)
+
+    with _TELEMETRY_LOCK:
+        _WAITING[key] = _WAITING.get(key, 0) + 1
+    try:
+        # Bounded by the holder's age, not by a fixed deadline ().
+        # Raises WritePathWedged ONLY when the current holder has already
+        # outlived ACQUIRE_GIVEUP_SECONDS; for every younger holder this
+        # blocks exactly as the bare acquire() did. On the raise this
+        # contextmanager never yields, so no caller can run its body unlocked.
+        acquire_or_wedge(thread_lock, key, giveup_seconds=giveup_seconds,
+                         poll_seconds=poll_seconds)
+    finally:
+        # Runs on BOTH paths (acquired, gave up wedged, or interrupted while
+        # blocked) — a waiter count that only decremented on success would
+        # drift upward forever and eventually report a wedge that is not there.
+        with _TELEMETRY_LOCK:
+            remaining = _WAITING.get(key, 1) - 1
+            if remaining > 0:
+                _WAITING[key] = remaining
+            else:
+                _WAITING.pop(key, None)
+    with _TELEMETRY_LOCK:
+        _HOLDS[key] = time.monotonic()
+    try:
+        yield key
+    finally:
+        # Cleared BEFORE the lock is released: the window where the hold is
+        # recorded must never outlast the window where it is actually held,
+        # or an idle daemon reports a phantom hold that ages into a wedge.
+        with _TELEMETRY_LOCK:
+            _HOLDS.pop(key, None)
+        thread_lock.release()
+
+
+@contextlib.contextmanager
 def locked(path: Path, *, timeout: int = 10, stale_seconds: int = 30):
     """Acquire both the threading lock AND the file lock for `path`.
 
@@ -185,37 +345,20 @@ def locked(path: Path, *, timeout: int = 10, stale_seconds: int = 30):
     # and the manager keys on the identical string, so instrumenting the lock
     # costs no additional syscall.
     key = str(Path(path).resolve())
-    thread_lock = _GLOBAL_MANAGER.get(path, key=key)
-
-    with _TELEMETRY_LOCK:
-        _WAITING[key] = _WAITING.get(key, 0) + 1
-    try:
-        thread_lock.acquire()
-    finally:
-        # Runs on BOTH paths (acquired, or interrupted while blocked) — a
-        # waiter count that only decremented on success would drift upward
-        # forever and eventually report a wedge that is not there.
-        with _TELEMETRY_LOCK:
-            remaining = _WAITING.get(key, 1) - 1
-            if remaining > 0:
-                _WAITING[key] = remaining
-            else:
-                _WAITING.pop(key, None)
-    with _TELEMETRY_LOCK:
-        _HOLDS[key] = time.monotonic()
-    try:
+    # Layer 1 — the bounded, instrumented thread-lock acquire — lives in
+    # thread_locked() above. EXTRACTED, NOT COPIED: a left-behind copy here
+    # would stop receiving that helper's later hardening and rot silently
+    # (guard-2015), and the second caller missing exactly these lines is the
+    # defect  fixed. This function adds Layer 2 (the file lock) on
+    # top. Ordering is unchanged from the inline version: thread acquire →
+    # record hold → file lock → yield → release file lock → clear hold →
+    # thread release.
+    with thread_locked(path, key=key):
         acquire_lock(lock_path, timeout=timeout, stale_seconds=stale_seconds)
         try:
             yield
         finally:
             release_lock(lock_path)
-    finally:
-        # Cleared BEFORE the lock is released: the window where the hold is
-        # recorded must never outlast the window where it is actually held,
-        # or an idle daemon reports a phantom hold that ages into a wedge.
-        with _TELEMETRY_LOCK:
-            _HOLDS.pop(key, None)
-        thread_lock.release()
 
 
 def locked_rmw(path: Path, cycle_fn, *, timeout: int = 10,

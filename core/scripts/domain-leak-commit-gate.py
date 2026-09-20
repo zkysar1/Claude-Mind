@@ -92,7 +92,11 @@ SELF_REF = (
     ".claude/skills/verify-learning/SKILL.md",
 )
 TEST_FILE_RX = re.compile(r"(^|/)test[-_][A-Za-z0-9_-]+\.(sh|py)$")
-MARKER_ANCHORED_RX = re.compile(r"^[ \t]*(#|<!--|//|--|\*)[ \t]*domain-leak-exempt:")
+# The anchored predicate this gate pioneered now lives in one place and every
+# consumer reads it from there () — the convergence the divergence
+# note at the top of this file asked for. Imported, not re-declared: a second
+# copy is exactly the drift that note was written to bound.
+from _domain_leak_marker import MARKER_ANCHORED_RX, claims_exemption  # noqa: E402
 FORGED_FM_RX = re.compile(r"^forged:[ \t]*true[ \t]*$", re.M)
 
 
@@ -167,7 +171,7 @@ def is_exempt(repo: Path, rel: str, forged: set) -> bool:
         return False
     if FORGED_FM_RX.search(txt):
         return True
-    return any(MARKER_ANCHORED_RX.match(l) for l in txt.splitlines())
+    return claims_exemption(txt)
 
 
 def added_lines(repo: Path):

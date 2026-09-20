@@ -6,17 +6,17 @@
 # default; --ignore-case matches case-insensitively).
 #
 # --ignore-case is REPORT SCOPE and is deliberately NOT the default (guard-1426,
-# g-115-10049). The measured lowercase gap is large -- 'roblox' alone appears in
+# ). The measured lowercase gap is large -- 'roblox' alone appears in
 # 41 files that the capitalised blocklist term never matched -- so flipping the
 # default would turn a 238-file backlog into an instant hard failure for every
 # caller including the pre-commit hook. A new case rule enters reporting first;
 # blocking applies to ADDED lines only, after the backlog is filed with counts.
-# Short acronym terms (S3, EFS, NPC, jose) match more loosely under -i, which is
+# Short acronym terms (S3, , NPC, jose) match more loosely under -i, which is
 # the guard-2610 class -- another reason this stays opt-in until the backlog is
 # triaged per term.
 # Excludes forged skills: world/forged-skills.yaml --exclude-dir, PLUS a
 # `forged: true` front-matter fallback for forged skills absent from that list
-# (g-115-2109). Scans all if the registry is unavailable.
+# (). Scans all if the registry is unavailable.
 # Exit code: 0 = clean, 1 = leaks found.
 
 set -euo pipefail
@@ -33,19 +33,41 @@ for arg in "$@"; do
   case "$arg" in
     --verbose) VERBOSE=true ;;
     --core-only) CORE_ONLY=true ;;
-    # --staged (g-001-314): scan ONLY git-staged files (git diff --cached)
+    # --staged (): scan ONLY git-staged files (git diff --cached)
     # instead of the whole tree. Wired into core/githooks/pre-commit so the
     # advisory domain-leak check runs in ~seconds (the full-tree scan was >2min,
-    # capped at 30s as a stopgap in g-001-312). Full-tree scan (no --staged)
+    # capped at 30s as a stopgap in ). Full-tree scan (no --staged)
     # stays the mode for /verify-learning + manual/CI audits.
     --staged) STAGED=true ;;
-    # --ignore-case (g-115-10049): report-scope case-insensitive matching.
+    # --ignore-case (): report-scope case-insensitive matching.
     --ignore-case) IGNORE_CASE=true ;;
   esac
 done
 
 if [[ ! -f "$BLOCKLIST" ]]; then
   echo "ERROR: Blocklist not found: $BLOCKLIST" >&2
+  exit 2
+fi
+
+# --- Exemption-marker predicate (, guard-6989) ---
+# Resolved ONCE per run from the single source of truth, then reused with
+# `grep -qE "$MARKER_RX"` at every marker test below. Never per file: one
+# interpreter spawn per run, not one per candidate.
+#
+# The marker must OPEN A COMMENT to claim the exemption. The old test here was
+# `grep -q "domain-leak-exempt:"` -- an UNANCHORED SUBSTRING -- so any file that
+# merely DISCUSSED the marker in prose exempted itself from every blocklist term,
+# silently and unauditably. Found 2026-09-18 by a planted positive control that
+# refused to go red.
+#
+# FAIL LOUD, NEVER FALL BACK. An empty $MARKER_RX would make `grep -qE ""` match
+# EVERY file, exempting the entire tree -- the worst possible direction for this
+# particular failure -- so an unresolvable predicate is a hard error, not a
+# degraded mode (communication-clarity.md rule 5).
+MARKER_RX="$(py -3 "$SCRIPT_DIR/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
+if [[ -z "$MARKER_RX" ]]; then
+  echo "ERROR: cannot resolve the exemption-marker predicate from $SCRIPT_DIR/_domain_leak_marker.py" >&2
+  echo "       Refusing to scan: an empty pattern would exempt every file." >&2
   exit 2
 fi
 
@@ -63,7 +85,7 @@ if [[ -f "$SCRIPT_DIR/_paths.sh" ]]; then
   FORGED="${WORLD_DIR:-}/forged-skills.yaml"
   if [[ -f "$FORGED" ]]; then
     # Skills are YAML keys at 2-space indent under 'skills:' (e.g., "  access-efs-data:")
-    # CRLF-tolerant (g-115-1934, restoring the never-committed g-115-1929 fix): world/
+    # CRLF-tolerant (, restoring the never-committed  fix): world/
     # forged-skills.yaml is synced through own-cloud from Windows boxes and carries CRLF
     # terminators. `s/\r$//` MUST run BEFORE the trailing-colon anchor `s/: *$//`, else the
     # `\r` sits between the colon and end-of-line so `: *$` never matches — every skill name
@@ -91,7 +113,7 @@ if [[ "$CORE_ONLY" == false ]]; then
   [[ -d "$PROJECT_ROOT/mind_api/tests" ]] && SCAN_DIRS+=("$PROJECT_ROOT/mind_api/tests")
 fi
 
-# --- Staged-files mode (g-001-314) ---
+# --- Staged-files mode () ---
 # Build the absolute-path list of git-staged files that fall within SCAN_DIRS
 # scope, have a scannable extension, and are NOT under a forged-skill dir. The
 # per-term loop below greps THIS list (per dir) instead of recursing the whole
@@ -115,7 +137,7 @@ if [[ "$STAGED" == true ]]; then
 
   if [[ ${#STAGED_FILES[@]} -eq 0 ]]; then
     echo "CLEAN: No in-scope staged files to check (--staged mode)."
-    # No noop firing here (g-115-2404): on own-cloud boxes one gate-firings
+    # No noop firing here (): on own-cloud boxes one gate-firings
     # append is a whole-object S3 read-modify-write (measured 4.7-10s at 38MB /
     # 117k records) — 50x the cost of the check itself, paid on EVERY loop
     # commit (agent-state commits stage no in-scope files). The invocation
@@ -127,7 +149,7 @@ fi
 
 FOUND=0
 
-# Case flag for the two greps below (g-115-10049). An EMPTY array is the
+# Case flag for the two greps below (). An EMPTY array is the
 # historical case-sensitive behaviour, so the default path stays byte-identical.
 GREP_CASE=()
 # NOT `[[ ... ]] && GREP_CASE=(-i)`: under `set -e` a false condition makes the
@@ -154,7 +176,7 @@ while IFS= read -r term; do
       # grep omits the path when given exactly one file, which breaks EVERY
       # downstream filter below (self-ref, test-fixture, marker-honor all key on
       # the path in each hit line). Recursive -rnw always prefixes; -H makes the
-      # staged single-file output shape identical. (g-001-314)
+      # staged single-file output shape identical. ()
       hits=$(grep -Hnw "${GREP_CASE[@]}" "$term" "${dir_targets[@]}" 2>/dev/null || true)
     else
       hits=$(grep -rnw "${GREP_CASE[@]}" "${EXCLUDE_ARGS[@]}" --include="*.md" --include="*.yaml" --include="*.yml" --include="*.sh" --include="*.py" --include="*.txt" "$term" "$dir" 2>/dev/null || true)
@@ -164,7 +186,7 @@ while IFS= read -r term; do
       # Filter out self-referential hits (blocklist, this script, the rule file)
       hits=$(echo "$hits" | grep -v "domain-term-blocklist.txt" | grep -v "domain-leak-check.sh" | grep -v "domain-free-examples.md" || true)
       # Test fixtures deliberately use domain tokens to exercise pattern-matching
-      # (test-capability-gate.sh uses "cannot access EFS" to lock in rb-389).
+      # (test-capability-gate.sh uses "cannot access " to lock in rb-389).
       # Skip any file whose basename starts with `test-` or `test_` — covers both
       # the test-*.sh shell convention and the Python test_*.py convention.
       hits=$(echo "$hits" | grep -vE '/test[-_][A-Za-z0-9_-]+\.(sh|py)(:|$)' || true)
@@ -174,7 +196,7 @@ while IFS= read -r term; do
       hits=$(echo "$hits" | grep -v "verify-learning/SKILL.md" || true)
       # Per-file opt-in: any file containing the marker `domain-leak-exempt:`
       # on any line is skipped entirely. Used by rule files that teach by
-      # example (probe-before-defer.md citing EFS/Roblox) and algorithm-
+      # example (probe-before-defer.md citing /Roblox) and algorithm-
       # comment docs where literal test strings are part of the reasoning
       # (capability-gate.py explaining rb-389 means-vs-ends). Adding the
       # marker is a review gesture — future editors see the rationale inline.
@@ -189,8 +211,11 @@ while IFS= read -r term; do
           # skill tagged `forged: true` by seed-preflight yet absent from that
           # list (e.g. build-operator-job, tagged by 90a2961c) slips through.
           # The column-0 anchor on `^forged: true$` matches the YAML
-          # front-matter key without over-suppressing prose mentions. (g-115-2109)
-          if grep -q "domain-leak-exempt:" "$f" || grep -qE '^forged:[[:space:]]*true[[:space:]]*$' "$f"; then
+          # front-matter key without over-suppressing prose mentions. ()
+          # $MARKER_RX applies that same discipline to the exemption marker: the
+          # token must OPEN A COMMENT, so a prose mention no longer suppresses
+          # this file for every blocklist term (, guard-6989).
+          if grep -qE "$MARKER_RX" "$f" || grep -qE '^forged:[[:space:]]*true[[:space:]]*$' "$f"; then
             continue
           fi
           echo "$line"
@@ -214,7 +239,7 @@ while IFS= read -r term; do
         rel_dir="${dir#"$PROJECT_ROOT/"}"
         echo "LEAK: '$term' — $count hit(s) in $rel_dir/"
       fi
-      # Telemetry: per-violation block firing (g-248-80). One log per
+      # Telemetry: per-violation block firing (). One log per
       # (term, dir) pair so retirement-evaluator sees exactly which
       # blocklist entries are actually catching leaks vs which are dead
       # weight.
@@ -269,9 +294,14 @@ scan_misplaced_markers() {
   # under set -e. Temporarily disable set -e for the capture so a no-match
   # scan returns empty rather than killing the script.
   set +e
+  # Same anchored predicate as the marker-honor site (). This scan
+  # reports a marker placed where markers do not belong, so its population must
+  # be files that ACTUALLY CARRY one: a file that only mentions the token in
+  # prose is not a misplaced marker, and reporting it as one sends a reader to
+  # look for a marker that was never there.
   hits=$(find "$scan_root" -type f -name "$pattern_glob" 2>/dev/null | while IFS= read -r f; do
     [[ -f "$f" ]] || continue
-    if grep -q "domain-leak-exempt:" "$f" 2>/dev/null; then
+    if grep -qE "$MARKER_RX" "$f" 2>/dev/null; then
       echo "$f"
     fi
   done)
@@ -319,8 +349,8 @@ fi
 
 if [[ $FOUND -eq 0 ]]; then
   echo "CLEAN: No domain terms found in framework files."
-  # Telemetry: clean-pass noop firing (g-248-80) — FULL-TREE runs only
-  # (g-115-2404). In --staged mode this fired on every clean framework
+  # Telemetry: clean-pass noop firing () — FULL-TREE runs only
+  # (). In --staged mode this fired on every clean framework
   # commit, and on own-cloud boxes one gate-firings append is a whole-object
   # S3 read-modify-write (measured 4.7-10s at 38MB) — it dominated the entire
   # pre-commit suite's latency. Staged-mode denominator = git commit count;
