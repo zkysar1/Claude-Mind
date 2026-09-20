@@ -102,20 +102,126 @@ def _age_str(h) -> str:
     return f"{int(h // 24)}d"
 
 
-def _load_jsonl(path: Path) -> list:
+def _load_jsonl_checked(path: Path, *, count_lines: bool = True) -> tuple[list, bool]:
+    """Return (rows, read_ok). `read_ok` is False when the file is MISSING or when
+    any line failed to parse -- so a caller can announce the degradation instead of
+    rendering the resulting [] as an affirmative zero (guard-160: do not synthesize
+    a default for a read the contract says must succeed).
+
+    The distinction rb-2073 requires is between FAILED-TO-READ and legitimately
+    empty, NOT between empty and non-empty: a file that exists and parses cleanly is
+    `ok` even when it yields zero rows. That is deliberate -- a genuinely empty world
+    must still be able to render its all-clear. It also means the one case this flag
+    CANNOT catch is a present-but-transiently-empty read on the synced mount
+    (rb-2970); nothing readable from the file alone separates that from a new world.
+    """
     if not path.exists():
-        return []
+        return [], False
     try:
         from _fileops import read_jsonl_with_recovery  # noqa: WPS433
-        return list(read_jsonl_with_recovery(path) or [])
+
+        # COUNT FIRST, READ SECOND. The ORDER is the fix (), and it is
+        # the whole fix -- no lock, no slack, no new machinery.
+        #
+        # `ok` compares two observations of a file NOTHING here locks (grep for
+        # with_lock|locked_|flock|fcntl over this function, and over
+        # read_jsonl_with_recovery in _fileops.py: zero hits in both), and five
+        # agents append to world/aspirations.jsonl continuously. So the two
+        # observations can legitimately disagree, and the only thing this code gets
+        # to choose is WHICH WAY the disagreement leans (guard-2537: when two views
+        # of one thing arrive by different paths, the tolerance must be DIRECTIONAL).
+        #
+        # Read-then-count leaned the wrong way. One peer append between the two made
+        # `rows` the OLD short list and `n_lines` the NEW long count, so 100 >= 101
+        # was False and the digest told the owner "the aspirations store READ FAILED"
+        # about a store that read perfectly -- on ordinary fleet activity, i.e. the
+        # one thing guaranteed to keep happening.
+        #
+        # Count-then-read leans safe on BOTH concurrent mutations:
+        #   append between -> n_lines old+small, rows new+big  -> passes. Correct:
+        #                     growth is healthy, and it is the common case.
+        #   shrink between -> n_lines old+big, rows new+small  -> alarms. Correct,
+        #                     and read-then-count was SILENT here -- so this reorder
+        #                     also closes a false PASS; it does not trade one error
+        #                     for another. (guard-2496: do not assume a long file is
+        #                     append-only in every region.)
+        # The detection the flag exists for is untouched: a recovery read that DROPS
+        # lines still yields len(rows) < n_lines and still alarms.
+        #
+        # The count keeps its OWN try (): it is a second open() of a file
+        # on the synced mount that rb-2970 records as transiently misbehaving, and a
+        # failed measurement is not a measurement (guard-1091) -- degrade the FLAG,
+        # never the DATA. `>=` not `==`: a recovery from a history snapshot
+        # legitimately returns MORE rows than the file has lines, which is the same
+        # direction growth moves, so one comparison covers both.
+        #
+        # `n_lines is None` is the single UNVERIFIED channel -- the caller opted out
+        # (`count_lines=False`, the flag-discarding `_load_jsonl` wrapper below), or
+        # the measurement failed. It never means "corrupt" (guard-7131).
+        n_lines = None
+        if count_lines:
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    n_lines = sum(1 for ln in fh if ln.strip())
+            except Exception:
+                n_lines = None
+
+        # The recovery reader does NOT raise on corruption -- it WARNs to stderr and
+        # returns the parseable SUBSET -- so the except-branch below is never reached
+        # for a corrupt store and `ok` cannot be inferred from control flow. Deriving
+        # it by count is the only signal available. Streaming above, so a multi-MB
+        # store costs one pass and no second copy in memory.
+        rows = list(read_jsonl_with_recovery(path) or [])
+        if n_lines is None:
+            return rows, False
+        return rows, len(rows) >= n_lines
     except Exception:
-        out = []
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        # This branch re-parses the SAME path with a plain json.loads per line. It
+        # buys PARSER independence, never PATH independence (guard-6944: a defence
+        # that re-runs the same reader cannot detect what it exists to prevent). So
+        # when the exception that landed here was caused by the PATH rather than by
+        # the parse, this read fails too -- and until  it failed by
+        # RAISING, because the read sat outside any try. Neither caller guards it
+        # (`gather()` and `main()` both call straight through), so a store that
+        # vanished or rotated mid-read killed the whole digest. That is strictly
+        # worse than the thing `ok` exists for: the owner got a traceback instead of
+        # a digest saying the store read FAILED. Degrade the FLAG, never the DATA.
+        #
+        # `OSError` only -- the documented class for a path that cannot be opened
+        # (missing, rotated, a directory, permission-denied). NOT a blanket
+        # `except Exception` (guard-2441/guard-373): a bug in the loop below must
+        # stay visible instead of reading as a bad file. UnicodeDecodeError is a
+        # ValueError and is deliberately absent because `errors="replace"` makes it
+        # unreachable HERE -- measured: read_jsonl_with_recovery does raise it on
+        # undecodable bytes, and this fallback is what rescues that case.
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            # Say WHY. `not path.exists()` above returns this same tuple for a
+            # different reason, and two causes behind one silent value make the
+            # step undiagnosable from its own output (guard-2586: a fallback path
+            # and a failure path must never be indistinguishable). stderr is the
+            # channel read_jsonl_with_recovery already WARNs on for this class.
+            print(f"[completion-digest] fallback read of {path.name} failed: "
+                  f"{type(exc).__name__} -- reporting the store as unread",
+                  file=sys.stderr)
+            return [], False
+        out, ok = [], True
+        for line in text.splitlines():
+            if not line.strip():
+                continue
             try:
                 out.append(json.loads(line))
             except Exception:
-                continue
-        return out
+                ok = False
+        return out, ok
+
+
+def _load_jsonl(path: Path) -> list:
+    # Flag-free caller: skip the count pass it would only discard. Measured
+    # 840,626 B of redundant reads per digest run across the five agent queues,
+    # and those files only grow.
+    return _load_jsonl_checked(path, count_lines=False)[0]
 
 
 def _bash(script: str, *args: str, timeout: int = 60):
@@ -151,7 +257,12 @@ def load_population_predicate():
 
 def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_items: int) -> dict:
     asp_path = world / "aspirations.jsonl"
-    asps = _load_jsonl(asp_path)
+    # This one read feeds the aspiration table, the blocked tally AND the needs-you
+    # list, so its silent fail-to-[] rendered as "Blocked: 0" + "Nothing is waiting
+    # on you right now." -- an affirmative all-clear the read cannot support
+    # ().  flagged the four reads that SHELL OUT and left this
+    # file read, the largest consumer of the three, unflagged.
+    asps, asps_read_ok = _load_jsonl_checked(asp_path)
     agent_files = sorted(Path(p) for p in glob.glob(str(agents_root() / "*" / "aspirations.jsonl")))
 
     # ---- completed in window (world queue) --------------------------------
@@ -162,8 +273,56 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
         total = len(goals)
         n_done = sum(1 for g in goals if g.get("status") == "completed")
         if asp.get("status") in ("active", None):
-            active_asps.append({"id": asp.get("id"), "title": asp.get("title") or "", "done": n_done, "total": total,
-                                "window_done": 0})
+            # LIFETIME fraction: read the authoritative `progress` counter, NOT the
+            # `goals` array (, zeta F1 msg-20260920-040010). That array is
+            # retention-pruned -- completed goals are archived out on a lag -- so a
+            # fraction computed from it understates the lane, and PLAUSIBLY, which is
+            # why nobody checks it. Measured 2026-09-20:  rendered 107/2607 (4%)
+            # against an authoritative 6727/10333 (65%), and  rendered 0/13 (0%)
+            # against 117/131 (89%). It inverts the consolidate-before-expand signal at
+            # the exact surface the owner reads: the lane with the MOST completed work
+            # reports as the LEAST progressed. The same pruning is already bounded ~30
+            # lines below for the WINDOW denominator (the  coverage floor) --
+            # this is the second call site that never got the treatment, not a new
+            # hazard. Three guardrails say the same thing about this array: guard-3410,
+            # guard-4963, guard-3833.
+            #
+            # NOT a blind swap. The counter has two documented failure modes of its own,
+            # and the pre-apply consult is what surfaced them:
+            #   guard-5368 -- its denominator counts every TERMINAL-BUT-NOT-COMPLETE
+            #     goal (skipped/expired/superseded) while its numerator excludes them,
+            #     so it is an honest-but-pessimistic "of all goals ever filed here, how
+            #     many reached completed". render() labels the column with that meaning
+            #     rather than silently presenting it as a completion rate.
+            #   guard-3602 -- the counter CAN read 0/0 while the goals array holds real
+            #     goals. Swapping blind would send those rows to total=0, and render()'s
+            #     `if a["total"]` filter would then DROP them from the owner's table
+            #     entirely -- a disappearance, not a wrong number. So the array is kept
+            #     as a fallback for exactly that case, and the row is LABELLED rather
+            #     than mixing two populations invisibly in one column (guard-5689's
+            #     two-writers-one-ratio shape, which is self-consistent and therefore
+            #     invisible).
+            _pr = asp.get("progress") if isinstance(asp.get("progress"), dict) else {}
+            _ctr_total, _ctr_done = _pr.get("total_goals"), _pr.get("completed_goals")
+            if isinstance(_ctr_total, int) and _ctr_total > 0 and isinstance(_ctr_done, int):
+                _total, _done, _src = _ctr_total, _ctr_done, "counter"
+            else:
+                _total, _done, _src = total, n_done, "array"
+            # THE ONE PLACE total==0 LANES ARE FILTERED (guard-4392: when a
+            # population feeds two consumers, a filter applied to one reads as
+            # applied to both). Until  the markdown renderer filtered
+            # `if a["total"]` and the HTML twin did not, so a lane whose counter is
+            # 0/0 AND whose goals array is empty rendered in the owner's EMAIL as
+            # "0/0 (0%)" -- an affirmative "no progress" -- while the markdown
+            # deliberately suppressed it. Filtering here, at construction, is what
+            # makes the two twins consume one population; do NOT re-add a
+            # per-renderer filter, which is the defect class, not the remedy.
+            # A dropped row cannot lose window_done: _total==0 only via the array
+            # branch (the counter branch requires _ctr_total > 0), and an empty
+            # goals array contributes nothing to `done`.
+            if _total:
+                active_asps.append({"id": asp.get("id"), "title": asp.get("title") or "", "done": _done,
+                                    "total": _total, "source": _src, "window_done": 0})
         for g in goals:
             if g.get("status") != "completed":
                 continue
@@ -310,7 +469,20 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
     needs.sort(key=lambda x: -(x["age_h"] or 0))
 
     # pending questions (fleet)
+    # ANNOUNCED degradation, not a silent zero (, zeta F2
+    # msg-20260920-040028). `pqs` falls to [] on three indistinguishable failures --
+    # _bash returned None (import error / spawn failure / 90s timeout), a non-zero
+    # returncode, or a JSON parse raise -- and the renderer then states
+    # "0 open question(s)" and "Nothing is waiting on you right now." to the OWNER,
+    # by email. A degraded read must never render as an affirmative all-clear;
+    # verify-before-assuming.md rule 4: a try/except around a parse is ZERO signals,
+    # not one. The module already demonstrates the right treatment exactly once
+    # (`_OWNER_DECIDED_LOADED`); these four reads are the ones that never got it, and
+    # that asymmetry is what made it hard to see. Same laundering the sibling
+    # agent-completion-report already forbids at its step 10 (720 real board messages
+    # reported as 0).
     pqs = []
+    pqs_read_ok = False
     r = _bash(str(HERE / "pending-questions-read.sh"), "--all-agents", timeout=90)
     if r and r.returncode == 0 and r.stdout.strip():
         try:
@@ -321,8 +493,12 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
                 d = _ts(q.get("date") or q.get("created"))
                 pqs.append({"id": q.get("id"), "agent": q.get("agent") or "", "age_h": _hours(d, now),
                             "question": q.get("question") or "", "default_action": q.get("default_action") or ""})
+            pqs_read_ok = True
         except Exception:
             pqs = []
+    elif r and r.returncode == 0:
+        # Ran clean and returned nothing: a genuinely empty queue, not a failure.
+        pqs_read_ok = True
     pqs.sort(key=lambda x: (x["agent"] != agent, -(x["age_h"] or 0)))
 
     # ---- blocked ----------------------------------------------------------------
@@ -371,11 +547,13 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
 
     # ---- hypotheses ------------------------------------------------------------
     hyp = {}
+    hyp_read_ok = False
     r = _bash(str(HERE / "pipeline-read.sh"), "--accuracy", timeout=60)
     if r and r.returncode == 0:
         try:
             a = json.loads(r.stdout)
             hyp = {"lifetime_pct": a.get("accuracy_pct"), "resolved": a.get("total_resolved")}
+            hyp_read_ok = True
         except Exception:
             hyp = {}
     win_conf = win_corr = 0
@@ -401,6 +579,7 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
 
     # ---- fleet pulse -----------------------------------------------------------
     pulse = []
+    pulse_read_ok = False
     r = _bash(str(HERE / "team-state-read.sh"), "--json", timeout=60)
     if r and r.returncode == 0:
         try:
@@ -410,16 +589,19 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
                 inf = row.get("in_flight") if isinstance(row.get("in_flight"), dict) else {}
                 pulse.append({"agent": name, "age_h": _hours(la, now),
                               "in_flight": inf.get("goal_id"), "in_flight_title": inf.get("title") or ""})
+            pulse_read_ok = True
         except Exception:
             pulse = []
 
     # ---- outcome signals -------------------------------------------------------
     outcome = {}
     om = world / "outcome-metrics.yaml"
+    outcome_read_ok = not om.exists()  # absent by design is not a degraded read
     if om.exists():
         try:
             import yaml  # noqa: WPS433
             outcome = yaml.safe_load(om.read_text(encoding="utf-8")) or {}
+            outcome_read_ok = True
         except Exception:
             outcome = {}
 
@@ -431,7 +613,17 @@ def gather(world: Path, agent: str, since: datetime | None, now: datetime, max_i
             "pulse": pulse, "outcome": outcome, "cost": cost, "coverage": coverage,
             # Degraded-mode visibility, not a renderer input: presence in the
             # structured output is what makes a dead exemption auditable.
-            "owner_decided_predicate_loaded": _OWNER_DECIDED_LOADED}
+            "owner_decided_predicate_loaded": _OWNER_DECIDED_LOADED,
+            # ...and the four fail-to-empty reads that had no flag until .
+            # `pqs_read_ok` IS a renderer input (it gates the affirmative all-clear);
+            # the other three are auditability, same as the predicate flag above.
+            "pqs_read_ok": pqs_read_ok, "pulse_read_ok": pulse_read_ok,
+            "hyp_read_ok": hyp_read_ok, "outcome_read_ok": outcome_read_ok,
+            # ...and the FILE read that feeds the aspiration table, the blocked
+            # tally and the needs-you list. Like pqs_read_ok this one IS a renderer
+            # input in BOTH twins (guard-5392: a flag is unmet while it lives
+            # somewhere the reader does not look), not just auditability.
+            "asps_read_ok": asps_read_ok}
 
 
 COST_SLOT = "scripts/digest-cost.sh"
@@ -500,8 +692,25 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     L.append(line)
     if n_batch:
         L.append(f"- Also **{n_batch}** batch-closed: " + "; ".join(f"{b['n']} by {b['by']} on {b['at'][:10]} {b['at'][11:16]}–{b['until']}" for b in data["batches"]) + " (work done earlier, formally closed in one sweep — not today's throughput)")
-    L.append(f"- Needs you: **{len(needs)}** goal(s) + **{len(pqs)}** open question(s) — listed below")
-    L.append(f"- Blocked: **{data['blocked_total']}** goal(s)" + (" (" + ", ".join(f"{v} {k}" for k, v in sorted(data['by_cause'].items(), key=lambda x: -x[1])) + ")" if data["by_cause"] else ""))
+    # A degraded pending-questions read must not render as "0" (zeta F2). Say the
+    # number is UNKNOWN rather than asserting an all-clear the read cannot support.
+    _pq_ok = bool(data.get("pqs_read_ok"))
+    _pq_txt = f"**{len(pqs)}** open question(s)" if _pq_ok else "**an unknown number of** open question(s) (READ FAILED — see below)"
+    L.append(f"- Needs you: **{len(needs)}** goal(s) + {_pq_txt} — listed below")
+    # Same treatment for the aspirations-store read (): a store that
+    # could not be read makes this tally 0, and "Blocked: 0" is the sentence the
+    # owner acts on. NO DEFAULT -- an absent key reads False, exactly like the
+    # `pqs_read_ok` sibling six lines up. gather() writes this key unconditionally
+    # (assigned at the top, returned in the one return dict), so no live path
+    # reaches the default today; the point is that a fail-OPEN default on a flag
+    # whose only job is to suppress an unsupportable all-clear poisons every
+    # assertion of its own value (guard-1718), and the next hand-built `data`
+    # would inherit the reassuring answer silently.
+    _asps_ok = bool(data.get("asps_read_ok"))
+    if _asps_ok:
+        L.append(f"- Blocked: **{data['blocked_total']}** goal(s)" + (" (" + ", ".join(f"{v} {k}" for k, v in sorted(data['by_cause'].items(), key=lambda x: -x[1])) + ")" if data["by_cause"] else ""))
+    else:
+        L.append("- Blocked: **an unknown number of** goal(s) — the aspirations store READ FAILED (see below)")
     h = data["hyp"]
     if h:
         L.append(f"- Learning: {h.get('window_confirmed', 0)} hypotheses confirmed / {h.get('window_corrected', 0)} corrected this window; lifetime accuracy {h.get('lifetime_pct', '?')}% over {h.get('resolved', '?')}")
@@ -513,8 +722,16 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     L.append("")
 
     # ---- needs you
-    L.append(f"## Needs you ({len(needs)} goals, {len(pqs)} questions)")
-    if not needs and not pqs:
+    L.append(f"## Needs you ({len(needs)} goals, {len(pqs) if _pq_ok else '?'} questions)")
+    if not _asps_ok:
+        L.append("⚠ The aspirations store could not be read (missing, or lines that would not "
+                 "parse). The goal count above is NOT zero — it is UNKNOWN, and so is the "
+                 "blocked tally. Do not read this digest as an all-clear.")
+    if not _pq_ok:
+        L.append("⚠ The fleet pending-questions read FAILED (subprocess error, non-zero exit, or "
+                 "unparseable output). The question count above is NOT zero — it is UNKNOWN. "
+                 "Do not read this digest as an all-clear.")
+    elif not needs and not pqs and _asps_ok:
         L.append("Nothing is waiting on you right now.")
     for i, n in enumerate(needs[:max_items], 1):
         tag = "human-gated" if n["kind"] == "human-gated" else ("deliberately parked with you" if n["deliberate"] else "assigned to you")
@@ -539,8 +756,11 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     L.append("")
 
     # ---- blocked
-    L.append(f"## Blocked ({data['blocked_total']})")
-    if not blocked:
+    L.append(f"## Blocked ({data['blocked_total'] if _asps_ok else '?'})")
+    if not _asps_ok:
+        L.append("⚠ Unknown — the aspirations store could not be read. This is NOT "
+                 "\"nothing blocked\".")
+    elif not blocked:
         L.append("Nothing blocked.")
     for b in blocked[:max_items]:
         holds = f" → holds up {b['downstream']} goal(s)" if b["downstream"] else ""
@@ -568,12 +788,26 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     L.append("")
 
     # ---- in progress
-    act = [a for a in data["active_asps"] if a["total"]]
+    # No per-renderer filter here: gather() already filtered total==0 lanes out of
+    # active_asps, once, for both twins (guard-4392, ). Re-adding
+    # `if a["total"]` would restore the two-copies shape that let the twins diverge.
+    act = list(data["active_asps"])
     act.sort(key=lambda a: (-a["window_done"], -(a["done"] / a["total"])))
     L.append("## In progress")
+    # Say what the fraction MEANS (guard-5368): the authoritative counter's
+    # denominator includes goals that ended skipped/expired/superseded while its
+    # numerator counts only `completed`, so this is "of all goals ever filed in this
+    # lane, how many reached completed" -- honest, and deliberately pessimistic. It is
+    # NOT "how much of the remaining work is done".
+    L.append("_Goals that reached `completed`, over all goals ever filed in the lane "
+             "(so goals that ended skipped/expired/superseded sit in the denominator)._")
     for a in act[:8]:
         pct = int(100 * a["done"] / a["total"]) if a["total"] else 0
-        L.append(f"- {a['id']} {_clip(a['title'], 60)}: {a['done']}/{a['total']} ({pct}%)" + (f", +{a['window_done']} this window" if a["window_done"] else ""))
+        # Label the fallback rather than mixing two populations in one column
+        # (guard-3602): a lane whose counter reads 0/0 falls back to the pruned goals
+        # array, which UNDERSTATES. Unlabelled, the two are indistinguishable.
+        src = " — from the live queue only (lane counter unset); UNDERSTATED" if a.get("source") == "array" else ""
+        L.append(f"- {a['id']} {_clip(a['title'], 60)}: {a['done']}/{a['total']} ({pct}%)" + (f", +{a['window_done']} this window" if a["window_done"] else "") + src)
     L.append("")
 
     # ---- learning: what we got wrong
@@ -718,10 +952,21 @@ def render_html(data: dict, *, agent: str, since: datetime | None, now: datetime
     tiles = []
     rate = f"~{round(len(organic) / (win_h / 24), 1)}/day" if win_h else ""
     tiles.append(_tile("Done", str(len(organic)), f"{sum(1 for d in organic if d['deep'])} deep · {rate}", "#28a745"))
-    tiles.append(_tile("Needs you", str(len(needs)), f"+{len(pqs)} open questions" + (f" · {n_new} new" if n_new else ""),
-                       "#fd7e14" if needs else "#28a745"))
-    tiles.append(_tile("Blocked", str(data["blocked_total"]),
-                       ", ".join(f"{v} {k}" for k, v in sorted(data["by_cause"].items(), key=lambda x: -x[1])[:3]), "#dc3545" if data["blocked_total"] else "#28a745"))
+    # Same degraded-read gate as the markdown renderer (zeta F2): never render an
+    # unknown question count as a green "+0 open questions" tile.
+    _pq_ok = bool(data.get("pqs_read_ok"))
+    tiles.append(_tile("Needs you", str(len(needs)),
+                       (f"+{len(pqs)} open questions" if _pq_ok else "open questions: READ FAILED")
+                       + (f" · {n_new} new" if n_new else ""),
+                       "#fd7e14" if (needs or not _pq_ok) else "#28a745"))
+    # Same aspirations-store gate as the markdown twin (, guard-5392):
+    # a green "0" tile is the most affirmative surface in the whole email. NO
+    # DEFAULT, for the same reason as the twin -- see the comment there.
+    _asps_ok = bool(data.get("asps_read_ok"))
+    tiles.append(_tile("Blocked", str(data["blocked_total"]) if _asps_ok else "?",
+                       (", ".join(f"{v} {k}" for k, v in sorted(data["by_cause"].items(), key=lambda x: -x[1])[:3]) if _asps_ok
+                        else "aspirations store: READ FAILED"),
+                       "#dc3545" if (data["blocked_total"] or not _asps_ok) else "#28a745"))
     if h:
         acc = h.get("lifetime_pct")
         tiles.append(_tile("Learning", f"{h.get('window_confirmed', 0)}✓ {h.get('window_corrected', 0)}✗",
@@ -743,7 +988,15 @@ def render_html(data: dict, *, agent: str, since: datetime | None, now: datetime
     out.append(_card("TL;DR", tl))
 
     # ---- Needs you
-    if not needs and not pqs:
+    if not _asps_ok and not needs:
+        inner = ('<p style="margin:0;color:#b26a00">⚠ The aspirations store could not be read '
+                 '(missing, or lines that would not parse). The goal count is <b>UNKNOWN</b>, not '
+                 'zero, and so is the blocked tally — do not read this digest as an all-clear.</p>')
+    elif not _pq_ok and not needs:
+        inner = ('<p style="margin:0;color:#b26a00">⚠ The fleet pending-questions read FAILED '
+                 '(subprocess error, non-zero exit, or unparseable output). The question count is '
+                 '<b>UNKNOWN</b>, not zero — do not read this digest as an all-clear.</p>')
+    elif not needs and not pqs and _asps_ok:
         inner = '<p style="margin:0;color:#28a745">Nothing is waiting on you right now.</p>'
     else:
         rows = []
@@ -776,10 +1029,19 @@ def render_html(data: dict, *, agent: str, since: datetime | None, now: datetime
                           + "</li>")
             inner += (f'<h3 style="margin:14px 0 6px;font-size:14px;color:#444">Open questions ({len(pqs)}) — each already acted on with the stated default; override if you disagree</h3>'
                       f'<ul style="margin:0;padding-left:18px;font-size:13px">{"".join(qs)}</ul>')
-    out.append(_card(f"Needs you ({len(needs)} goals, {len(pqs)} questions)", inner, "#fd7e14", "#fffaf5"))
+    if not _pq_ok and needs:
+        # There ARE goals to show, so the degraded branch above did not fire — but the
+        # question half is still unknown and must say so beside them.
+        inner += ('<p style="margin:14px 0 0;font-size:13px;color:#b26a00">⚠ The fleet '
+                  'pending-questions read FAILED; any open questions are NOT listed above and '
+                  'their count is <b>UNKNOWN</b>, not zero.</p>')
+    out.append(_card(f"Needs you ({len(needs)} goals, {len(pqs) if _pq_ok else '?'} questions)", inner, "#fd7e14", "#fffaf5"))
 
     # ---- Blocked
-    if not blocked:
+    if not _asps_ok:
+        inner = ('<p style="margin:0;color:#b26a00">⚠ Unknown — the aspirations store could not be '
+                 'read. This is <b>not</b> "nothing blocked".</p>')
+    elif not blocked:
         inner = '<p style="margin:0;color:#28a745">Nothing blocked.</p>'
     else:
         rows = []
@@ -792,7 +1054,7 @@ def render_html(data: dict, *, agent: str, since: datetime | None, now: datetime
                  f'<tr><th {TH}>Goal</th><th {TH}>Why</th><th {TH}>Owner</th></tr>' + "".join(rows) + "</table>")
         if len(blocked) > max_items:
             inner += f'<p style="margin:6px 0 0;font-size:12px;color:#888">… +{len(blocked) - max_items} more (sorted by how much each holds up)</p>'
-    out.append(_card(f"Blocked ({data['blocked_total']})", inner, "#dc3545", "#fff8f8"))
+    out.append(_card(f"Blocked ({data['blocked_total'] if _asps_ok else '?'})", inner, "#dc3545", "#fff8f8"))
 
     # ---- Done
     if not done:
@@ -827,7 +1089,9 @@ def render_html(data: dict, *, agent: str, since: datetime | None, now: datetime
             rows.append(f'<tr><td style="padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top;font-size:13px;line-height:1.4;padding:6px 8px;border-bottom:1px solid #eee;font-size:13px"><b>{_e(a["id"])}</b> {_e(_clip(a["title"], 60))}</td>'
                         f'<td style="padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top;font-size:13px;line-height:1.4;padding:6px 8px;border-bottom:1px solid #eee;width:34%">{bar}</td>'
                         f'<td style="padding:6px 8px;border-bottom:1px solid #eee;vertical-align:top;font-size:13px;line-height:1.4;padding:6px 8px;border-bottom:1px solid #eee;white-space:nowrap;font-size:12px;color:#555">{a["done"]}/{a["total"]} ({pct}%)'
-                        + (f'<br><span style="color:#28a745">+{a["window_done"]} this window</span>' if a["window_done"] else "") + "</td></tr>")
+                        + (f'<br><span style="color:#28a745">+{a["window_done"]} this window</span>' if a["window_done"] else "")
+                        + ('<br><span style="color:#b26a00">live queue only — understated</span>' if a.get("source") == "array" else "")
+                        + "</td></tr>")
         out.append(_card("In progress", '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%">' + "".join(rows) + "</table>"))
 
     # ---- learning + right now

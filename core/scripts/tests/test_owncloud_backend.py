@@ -395,6 +395,59 @@ def test_append_jsonl_record(cloud):
     assert b.read_jsonl(p) == [{"a": 1}, {"a": 2}]
 
 
+def test_append_jsonl_records_adds_exactly_ONE_object_version_for_N_records(cloud):
+    """ outcome 1, made machine-checkable and locus-free.
+
+    The goal's live acceptance criterion is an `mc ls --versions` delta of 1
+    across a prune evicting >1,000 rows, which needs a box carrying that
+    backlog (cc-04). The MECHANISM that criterion measures is THIS method, and
+    a versioned bucket reproduces the count exactly: N records must cost ONE
+    new object version, not N.
+
+    COUNTING VERSIONS IS THE ONLY ASSERTION THAT SEPARATES THE FIX FROM THE
+    DEFECT. The resulting file CONTENT is byte-identical either way, which is
+    why every content test stayed green straight through the O(N^2) behaviour
+    that put 4,829 versions / 231.3 GiB of a single key into the live store in
+    one UTC day (guard-6134, guard-6904).
+
+    This pins the layer BELOW the existing coverage. The CLI-side test
+    (test_wm_prune_capture_eviction.py) monkeypatches locked_append_jsonl_many
+    and counts calls to it, so it proves the caller batches -- it never reaches
+    a backend and would stay green if this method were re-implemented as a loop
+    over append_jsonl_record, which is precisely the defect being prevented.
+    """
+    cloud["s3"].put_bucket_versioning(
+        Bucket=BUCKET, VersioningConfiguration={"Status": "Enabled"})
+    b = _backend(cloud)
+    p = cloud["root"] / "world" / "capture-evictions-archive.jsonl"
+    b.write_jsonl(p, [{"seed": 0}])
+    key = b._s3_key(p)
+
+    def _versions():
+        resp = cloud["s3"].list_object_versions(Bucket=BUCKET, Prefix=key)
+        return sum(1 for v in resp.get("Versions", []) if v["Key"] == key)
+
+    before = _versions()
+    # POSITIVE CONTROL (guard-2298): without this, a bucket where versioning
+    # silently failed to enable would report a delta of 0 and the assertion
+    # below would read as an even better result than the one we want.
+    assert before >= 1, (
+        f"positive control failed: the seed write produced {before} versions, "
+        f"so version counting is not measuring anything here and a delta of 0 "
+        f"or 1 below would prove nothing")
+
+    rows = [{"n": i} for i in range(25)]
+    b.append_jsonl_records(p, rows)
+
+    delta = _versions() - before
+    assert delta == 1, (
+        f"25 records added {delta} object versions -- the batched append must "
+        f"cost exactly ONE whole-object PUT. One version per ROW is the O(N^2) "
+        f"defect this method replaced (g-115-9962).")
+    assert b.read_jsonl(p) == [{"seed": 0}] + rows, (
+        "the batch must still append every record, in order, as its own line")
+
+
 # --- DDB locking (fix #1) ---------------------------------------------------
 def test_acquire_lock_when_absent(cloud):
     b = _backend(cloud)

@@ -561,6 +561,23 @@ gates:
       not by the streak length.
     retirement_eligible: false
 
+  - id: capability-vocab
+    script: core/scripts/gates/capability_vocab.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "goal add validation" }
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "aspiration add validation" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "Author corrects the token or registers a real capability in _runner_capabilities.KNOWN_CAPABILITIES alongside a probe (~1 min). Absent/null/unreadable-shape values and an unimportable vocabulary all fail-open, so no existing filing is refused on absent evidence."
+    fn_description: "An off-contract requires_capability token is a HARD fence on every box, not a misleading value: goal_is_locally_executable is a plain subset test and no runner ever adds an unknown token, so the goal is filtered out of the ranked pool fleet-wide, permanently, with no error. Measured three times: g-369-61 (win32) hidden 5 days beside an idle Windows box; g-115-9215 absent from a 1615-candidate pool (count moved 1615->1616 when the field was nulled); g-369-404, a revenue goal, hidden while 27.6% of active customers could not be billed. Every routing audit answers YES on these rows."
+    rb_evidence: ["g-115-8826", "rb-1028"]
+
   - id: intended-agent-vocab
     script: core/scripts/gates/intended_agent_vocab.py
     embedded: false
@@ -1108,6 +1125,39 @@ gates:
     rb_evidence: []
     tuning_notes: "Threshold chosen by measuring who NEWLY gets refused, not by fitting the incident (guard-1562). description: 63 update pairs, 45 with old >= 2000 -> exactly ONE refused at 0.50/0.40/0.25 (the incident itself, ratio 0.09); every other description update GREW. outcome_note: 40 pairs, 8 with old >= 2000 -> ZERO refused below 0.50, closest legitimate shrink 0.55 (g-115-2571, 7784->4250). Chose ratio < 0.25 with a 2000-char floor: 2.2x below the closest legitimate shrink, 2.8x above the incident. Expect a noop-dominated log — that is the gate working, not idling. RETIREMENT CRITERION (recorded at birth, guard-769): retire when EITHER the wholesale-replace mechanism is gone (aspirations-update-goal.sh grows a real append mode AND unknown flags become a hard error) OR override/(block+override) > 0.5 over 20+ firings."
 
+  - id: goal-count-census
+    script: core/scripts/gates/goal_count_census.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "update_goal post-read (in-lock, immediately after _read_jsonl); expectation persisted post-write" }
+    dominant_risk: FP
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: null
+    fp_cost: low
+    fn_cost: high
+    fp_description: "REPORT ONLY at this stage — the gate cannot refuse, so a wrong verdict costs one stderr line and one firing record, never a blocked write. The expected FP source is a legitimate cross-endpoint removal (archival, retirement, supersession) that has not yet refreshed the persisted count; measuring that population IS this stage's purpose."
+    fn_description: "A wrong silence lets a SHORT BUT WELL-FORMED read rewrite the whole store from fewer goals than exist. Measured: a single-field update-goal write removed 29 goal records at once while 102 comparable terminal goals survived it (ZDS g-022-78, 2026-09-17, pinned by bisecting the .history snapshot series on size_bytes). Invisible to every existing instrument — changelog `lines_changed` counts ASPIRATION records, and on cc-02 it took exactly three distinct values (27/26/28 over 866 rows) against ~2,300 goals, so 29 goals lost from inside one record move it by ZERO."
+    tuning_notes: >
+      Cross-call BY NECESSITY, and that is the whole design. The control the
+      originating goal proposed — conserve the count across ONE call — cannot
+      catch this defect: a short read conserves perfectly, because `before` is
+      computed from the same short `items` the write uses. Proven by
+      test_the_filed_in_call_control_would_have_passed. TOLERANCE is 0, which
+      is the ABSENCE of a measured threshold rather than a chosen one: unlike
+      field-shrink-guard (whose 0.25 was measured against the live corpus
+      first), nobody has yet measured how large legitimate cross-endpoint
+      removal batches are, and inventing a number to quiet the log would be
+      the widen-blindly move guard-1562 forbids. PROMOTION CRITERION (recorded
+      at birth, guard-769): promote to a refusal only when BOTH (a) telemetry
+      over 20+ decrease-anomalous firings separates genuine loss from
+      legitimate removal, giving a tolerance with measured headroom below 29,
+      and (b) the refusal carries an override header mirroring
+      X-Mind-Override-Shrink whose invited rationale is reachable in every
+      branch that can reach it (guard-5593). Blast radius is why this ordering
+      is not optional: update_goal is the fleet's hot write path on a live
+      daemon, and a gate that refuses wrongly wedges every agent at once.
   - id: bare-bash-authoring-gate
     script: core/scripts/bare-bash-authoring-gate.py
     embedded: false
@@ -1208,7 +1258,7 @@ gates:
     dominant_risk: FN
     asymmetry_magnitude: extreme
     keyword_bias: strict
-    override_flag: "XTRACE_CREDENTIAL_GATE_OVERRIDE (token in the command, not a flag)"
+    override_flag: "XTRACE_CREDENTIAL_GATE_OVERRIDE=\"<reason>\" in the command (an assignment with a non-empty quoted reason, not a flag and not a bare mention)"
     fp_cost: low
     fn_cost: extreme
     fp_description: "A command is refused and the author reaches for the override token or a heredoc. Measured blast radius 36/930 scripts (3.9%) reach the credential loader, so the refusable population is small. Two false-positive classes were found by running the gate and are now closed: an unanchored env-assignment pattern matched inside any quoted string, and heredoc bodies written out to a file were read as commands."

@@ -126,6 +126,10 @@ from gates.scaffolded_exploration import evaluate as _scaff_eval  # noqa: E402
 from gates.deadline_date import evaluate as _deadline_date_eval  # noqa: E402
 from gates.capability_route import evaluate as _cap_route_eval, ACTIVE_AGENTS as _ACTIVE_AGENTS  # noqa: E402
 from gates.field_shrink import evaluate as _field_shrink_eval  # noqa: E402
+from gates.goal_count_census import (  # noqa: E402
+    count_goals as _census_count_goals,
+    evaluate as _census_eval,
+)
 from gates.lane_pin import evaluate as _lane_pin_eval  # noqa: E402
 from gates.reallocation_exempt import (  # noqa: E402  ( SSOT)
     evaluate as _realloc_exempt_eval,
@@ -135,6 +139,7 @@ from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E
 from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
 from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E402
 from gates.intended_agent_vocab import evaluate as _intended_agent_vocab_eval  # noqa: E402
+from gates.capability_vocab import evaluate as _capability_vocab_eval  # noqa: E402  # 
 from gates.approval_reference import evaluate as _approval_ref_eval  # noqa: E402
 from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
 from gates.verification_outcomes import evaluate as _verification_outcomes_eval  # noqa: E402
@@ -379,6 +384,73 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 
     _atomic_write_with_fallback(
         path, _write, fallback_counter_key="daemon_aspirations_write")
+
+
+# ── cross-call goal-count census () ──────────────────────────────
+# The expectation lives in aspirations-meta.json beside the store, under
+# `goal_count`, written by _census_persist after every successful update_goal
+# write. It is deliberately NOT a new file: meta_update already owns this path,
+# so the count travels with the store's own metadata and needs no new sync
+# tier. Both helpers are fail-open by contract — a census that cannot read its
+# expectation must never abort the fleet's hot write path (the gate module
+# itself has no try/except, per guard-3803; the fail-open surface belongs
+# HERE, at the call site, where it cannot cover the verdict's construction).
+
+def _census_meta_path(base_dir: Path) -> Path:
+    return base_dir / "aspirations-meta.json"
+
+
+def _census_expected(base_dir: Path):
+    """Goal count persisted by the previous successful write, or None."""
+    try:
+        path = _census_meta_path(base_dir)
+        if not path.exists():
+            return None
+        with path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict):
+            return None
+        value = meta.get("goal_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return None
+    except Exception:
+        return None
+
+
+def _census_persist(base_dir: Path, count: int) -> None:
+    """Record the post-write goal count as the next call's expectation.
+
+    Ordering is load-bearing: this runs AFTER the store write succeeds, so a
+    crash between the two leaves the expectation STALE-LOW. That is the safe
+    direction — a low expectation makes the next comparison read as an
+    INCREASE, which never reports. A stale-HIGH expectation would manufacture
+    a false anomaly on the next healthy read.
+    """
+    try:
+        path = _census_meta_path(base_dir)
+        meta = {}
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                meta = loaded
+        if meta.get("goal_count") == count:
+            return
+        meta["goal_count"] = count
+        tmp = path.with_suffix(path.suffix + ".census-tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=True)
+            f.write("\n")
+        # Path.replace, NOT os.replace: this module has NO module-level
+        # `import os` (only two function-local ones, lines ~1050/~6016), so
+        # os.replace here raises NameError — which the fail-open `except`
+        # below would swallow, leaving the expectation never written and the
+        # census permanently blind while every branch looked healthy. Caught
+        # pre-ship by exercising the write instead of only compiling it.
+        tmp.replace(path)
+    except Exception:
+        return
 
 
 def _verify_goal_persisted(live_path: Path, asp_id: str, goal_id: str) -> bool:
@@ -829,6 +901,34 @@ def _assert_intended_agent_vocab(goal: Dict[str, Any], *, ctx=None) -> None:
     and wedging their status changes is worse than the drift.
     """
     verdict = _intended_agent_vocab_eval(
+        goal,
+        meta_dir=(ctx.paths.meta if ctx is not None else None),
+        agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
+    )
+    if verdict["would_block"]:
+        raise ValueError(verdict["message"])
+
+
+def _assert_capability_vocab(goal: Dict[str, Any], *, ctx=None) -> None:
+    """Raise ValueError on an off-contract requires_capability token ().
+
+    FIFTH SIBLING of the four gates above, and the most consequential failure of
+    the four: the other fields MISLEAD a reader when they go off-vocabulary, this
+    one makes the goal INVISIBLE to every runner in the fleet, permanently, with
+    no error anywhere. KNOWN_CAPABILITIES documents itself as a cross-file
+    contract and had exactly three references fleet-wide — the definition, one
+    test, and a prose comment — so nothing enforced it.
+
+    Unlike its siblings the read side does NOT fall through to a safe default:
+    `goal_is_locally_executable` is a plain subset test, so an unknown token is a
+    hard fence on every box rather than a value that merely reads wrong.
+
+    ADD SITES ONLY — same _validate_goal blast-radius reasoning as the four
+    siblings, and load-bearing here: the three measured live carriers
+    (g-369-61, g-115-9215, g-369-404) are exactly the rows a reader must still be
+    able to EDIT to unstick them.
+    """
+    verdict = _capability_vocab_eval(
         goal,
         meta_dir=(ctx.paths.meta if ctx is not None else None),
         agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
@@ -2615,6 +2715,7 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 # ("any"/"reducer"/a typo) names nobody, misleads readers,
                 # and routes nondeterministically per box.
                 _assert_intended_agent_vocab(goal, ctx=ctx)
+                _assert_capability_vocab(goal, ctx=ctx)  # 
             except ValueError as e:
                 return Response.error(400, "validation_failed", str(e))
 
@@ -3107,6 +3208,51 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     try:
         with file_locks.locked(live_path):
             items = _read_jsonl(live_path)
+
+            # Cross-call goal-count census (). REPORT ONLY — this
+            # block can never refuse the write, and the whole call is wrapped
+            # fail-open because a census must not abort the fleet's hot write
+            # path. It compares THIS read against the count persisted by the
+            # previous successful write, which is the only place a SHORT BUT
+            # WELL-FORMED read is visible: an in-call before/after check reads
+            # the same short `items` the write uses and conserves perfectly.
+            # Logged only on the anomalous branch, mirroring field-shrink-guard
+            # — a noop-heavy spool would cost every agent on every write.
+            _census_observed = None
+            # This module has NO module-level `import sys` — it imports sys
+            # PER FUNCTION by convention (10 local imports). update_goal's own
+            # two sit inside conditionals, so `sys` is unbound here on any path
+            # where those branches did not fire. Binding it OUTSIDE the try is
+            # deliberate: the except handler below also writes to sys.stderr,
+            # so an unbound name would raise INSIDE the fail-open handler and
+            # propagate out of this block — aborting the write this census
+            # exists to observe. Caught pre-ship by checking the import scope
+            # rather than trusting that a neighbouring line's `sys.stderr`
+            # proves the name is in scope at mine.
+            import sys  # local-import convention (see _assert_no_prose_drift)
+            try:
+                _census_observed = _census_count_goals(items)
+                _census = _census_eval(_census_observed,
+                                       _census_expected(base_dir))
+                if _census["anomalous"]:
+                    _gate_log.log(
+                        "goal-count-census",
+                        "pass",          # report-only stage: evaluated, allowed
+                        caller="daemon:update_goal",
+                        trigger_matched=_census["decision_path"],
+                        payload=goal_id,
+                        extra={"observed": _census["observed"],
+                               "expected": _census["expected"],
+                               "delta": _census["delta"],
+                               "field": field},
+                        meta_dir=ctx.paths.meta,
+                        agent_name=ctx.paths.agent_name,
+                    )
+                    print(f"[daemon] {_census['message']}", file=sys.stderr)
+            except Exception as _census_err:      # noqa: BLE001 - fail-open
+                print(f"[daemon] goal_count_census skipped: {_census_err}",
+                      file=sys.stderr)
+
             found = _find_goal(items, goal_id)
             if found is None:
                 return Response.error(404, "goal_not_found",
@@ -3974,6 +4120,15 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             changelog.append(base_dir, agent, live_path, "edit",
                              summary=_write_summary,
                              lines_changed=len(items))
+            # Record the post-write goal count as the NEXT call's expectation
+            # (). AFTER the store write, never before: a crash
+            # between the two leaves the expectation stale-LOW, which reads as
+            # an increase and never reports — the safe direction. `items` is
+            # unchanged in count by update_goal (it mutates one goal in place),
+            # so the observed count computed above is still correct here;
+            # recomputing would only re-walk the same list.
+            if _census_observed is not None:
+                _census_persist(base_dir, _census_observed)
             # Invalidate while the lock is held — same rationale as add_goal:
             # close the eventual-consistency window on the write-then-cache-
             # flip sequence. See jsonl-read-modify-write-race.
@@ -8507,6 +8662,7 @@ def _validate_aspiration(asp: Dict[str, Any], *, auto_id: bool = False) -> None:
         _assert_no_invalid_checks(goal)  # , same ADD-path parity
         _assert_depends_on_consistency(goal)  # , same ADD-path parity
         _assert_intended_agent_vocab(goal)  # selection-stack review 2026-08-21, same ADD-path parity
+        _assert_capability_vocab(goal)  # , same ADD-path parity
 
 
 # ---------------------------------------------------------------------------

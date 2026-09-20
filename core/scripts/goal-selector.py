@@ -113,7 +113,8 @@ from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augment
 from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
 from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter)
     derive_runner_capabilities, box_config_from_conf, merge_capability_config,
-    goal_is_locally_executable, goal_required_capabilities)
+    goal_is_locally_executable, goal_required_capabilities,
+    capability_block_detail)
 from _drain_title import is_drain_action_title  # noqa: E402  ( owner-scope drain SSOT)
 import reducer_selection_policy  # noqa: E402  ( reducer selection policy)
 from _dependency_graph import supersession_satisfied_ids  # noqa: E402  ( SSOT, guard-547)
@@ -867,6 +868,65 @@ KNOWN_CRITERIA = frozenset({
 })
 
 
+# Exit code for "the meta tier cannot serve selection". Distinct from python
+# tracebacks (1), argparse (2), daemon-unreachable (3), goal-selector.sh's own
+# 7/8/9 and timeout kills (124), so a caller's rc log alone names the state.
+EXIT_META_NOT_READY = 10
+
+
+class MetaNotReadyError(FileNotFoundError):
+    """meta/goal-selection-strategy.yaml is absent, so selection cannot run.
+
+    A FileNotFoundError SUBCLASS on purpose: this replaces a bare open() that
+    raised exactly that, so every existing `except FileNotFoundError` / `except
+    OSError` / `except Exception` around an import of this module keeps catching
+    it. The guard changes the MESSAGE of a run that was already going to fail and
+    nothing else — it cannot turn a working selection red.
+    """
+
+
+def _meta_not_ready_message(path):
+    """WHICH state, and the remedy — the two things the bare traceback withheld.
+
+    Measured 2026-09-19: a served loop reached the selector in a world whose
+    boot Phase -2 never ran. It failed 9 of 9 the same way, and every failure
+    was a raw traceback that named the missing file and never what to do about
+    it, so the model probed the filesystem, reported "selection is blocked"
+    accurately, and closed three iterations with no goal.
+
+    Two states share one remedy and are told apart by the init marker, because a
+    reader deciding whether this is a fresh world or a damaged one needs to know
+    which (the second means something removed a seed from a live meta tier).
+    There is deliberately NO default-weights fallback: weights have one source
+    (rb-215), and a selector that silently scored on built-in numbers would hide
+    exactly the uninitialized world this message exists to surface.
+
+    "ON THIS BOX", never "in this world": the marker and the strategy file are
+    LOCAL reads. Under a synced backend the tier can exist in the store and
+    simply not be materialized here yet, and a message that called that world
+    "never initialized" would misdiagnose it. The remedy is the same either way
+    — init-meta.sh pulls the store's copy in FRONT of its marker gate and refuses
+    on a partial pull — so the message says so rather than guessing which.
+    """
+    if (META_DIR / ".initialized").exists():
+        state = ("initialized, but this seed file is MISSING (seed drift or a "
+                 "deletion — init's backfill pass restores it)")
+    else:
+        state = ("NEVER INITIALIZED ON THIS BOX (meta/.initialized is absent here — "
+                 "boot Phase -2 has not run on this box)")
+    return (
+        f"[goal-selector] FATAL (rc={EXIT_META_NOT_READY}): meta tier NOT READY — {state}.\n"
+        f"  missing: {path}\n"
+        f"  This is a property of THIS BOX'S WORLD STATE, not a selector defect: "
+        f"selection weights have ONE source and no built-in default.\n"
+        f"  REMEDY: run boot Phase -2 — `bash core/scripts/init-mind.sh "
+        f"{os.environ.get('MIND_AGENT') or '<agent>'}`. It is idempotent and "
+        f"additive-only (seeds what is missing, never overwrites an existing "
+        f"file; on a synced backend it pulls the store's copy first). Then "
+        f"re-run the selector."
+    )
+
+
 def load_weights():
     """Load goal selection weights from meta/goal-selection-strategy.yaml.
 
@@ -877,7 +937,33 @@ def load_weights():
     replaces selector code while the external meta/ file keeps a weight the
     new code never computes). No value fallback in the other direction —
     a criterion missing from meta simply opts out of scoring (rb-215).
+
+    An ABSENT file raises MetaNotReadyError, whose message names the state and
+    the remedy (see _meta_not_ready_message). Only absence is handled: it is the
+    one state measured in the field. A present-but-malformed file still raises
+    its native error, which already points at the offending key.
+
+    Run as the CLI, the message IS the output and the process exits
+    EXIT_META_NOT_READY: a traceback above it buries the remedy under eight
+    frames of this file. IMPORTED (tests, quiescence-gate, iaus-ab-compare) the
+    exception propagates unchanged so the importer's own handling decides — a
+    module must never sys.exit() out from under its caller.
+
+    That branch lives HERE, not in a try/except around the module-level call
+    below, and the placement is load-bearing: test_backpressure_null_prior_skip
+    slices this file from this function's def line to the module-level
+    assignment of its result, by FIRST text match, and exec()s the slice.
+    Wrapping the assignment left a dangling `try:` at the end of that slice, and
+    quoting either anchor string in this docstring moved the match INTO the
+    docstring — both measured, both an error in a test about something else.
+    So neither anchor is spelled out anywhere in this file but at its real site.
     """
+    if not META_GOAL_SELECTION.exists():
+        not_ready = MetaNotReadyError(_meta_not_ready_message(META_GOAL_SELECTION))
+        if __name__ == "__main__":
+            print(str(not_ready), file=sys.stderr)
+            sys.exit(EXIT_META_NOT_READY)
+        raise not_ready
     with open(META_GOAL_SELECTION, encoding="utf-8") as f:
         meta = yaml.safe_load(f)
     raw = meta["weights"]
@@ -3857,9 +3943,10 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             if runner_caps and not goal_is_locally_executable(goal, runner_caps):
                 missing = sorted(goal_required_capabilities(goal) - set(runner_caps))
                 entry["block_reason"] = "not_my_lane"
-                entry["block_detail"] = (
-                    "Requires capability not on this runner: {m} (runner has: {r})".format(
-                        m=",".join(missing), r=",".join(sorted(runner_caps)) or "none"))
+                # : the flat wording read as "wrong box, someone else
+                # will take it" for all three block kinds, including the two where
+                # NO box can take it. capability_block_detail is the shared SSOT.
+                entry["block_detail"] = capability_block_detail(missing, runner_caps)
                 entry["missing_capabilities"] = missing
                 if not isinstance(entry.get("blocker_ref"), dict):
                     _nml_now = datetime.now()
@@ -4502,6 +4589,46 @@ def lane_nominee_exclusion(s):
     return None
 
 
+def lane_nominee_rank(s):
+    """Sort key for choosing AMONG directive nominees: (priority, score).
+
+    WHY PRIORITY LEADS, and why this is an ORDERING and never an exclusion
+    (g-115-10092). Both nominee sites below used to take the first row of a
+    SCORE-sorted list, and priority is only one of ~20 scoring terms (raw
+    1=LOW / 2=MEDIUM / 3=HIGH), so a LOW lane row routinely out-scores MEDIUM
+    ones and takes the directive's single slot. Measured across two boxes:
+    g-358-86 (LOW, score 14.08) was hoisted to rank 0 on four separate passes
+    over MEDIUM lane rows at 13.57 and 12.77, each pass costing a
+    claim/read/release cycle to decline a goal that had been deliberately
+    downgraded and released in one step precisely so it would not re-arm
+    (the g-115-5177 remedy, which works against score-ordered ranking and
+    does not survive a floor that never reads priority).
+
+    ORDERING, NOT EXCLUSION, is the load-bearing choice. A `priority <= LOW`
+    exclusion was the first candidate and was rejected on measurement: it
+    removes rows from contention, and rb-8344 already records lane work
+    starving under this directive, so an exclusion can make the floor inert
+    for a lane whose only claimable rows are LOW. Ordering changes WHICH
+    nominee wins and never WHETHER one does, so it cannot starve anything.
+
+    An ABSENT priority sorts as the MEDIUM default rather than as zero: the
+    term lives in `raw` (the scoring breakdown), which is present on 100% of
+    production rows but absent on hand-built ones, and defaulting to MEDIUM
+    makes every same-priority set fall back to pure score order — the exact
+    pre-g-115-10092 behavior. Fail-open like its siblings: never raises.
+    """
+    try:
+        v = (s.get("raw") or {}).get("priority")
+        prio = float(v) if v is not None else 2.0
+    except Exception:  # pragma: no cover - fail-open guard
+        prio = 2.0
+    try:
+        score = float(s.get("score") or 0.0)
+    except (TypeError, ValueError):  # pragma: no cover - fail-open guard
+        score = 0.0
+    return (prio, score)
+
+
 def emit_strategic_focus_banner(scored, agent_name):
     """Emit a LOUD stderr STRATEGIC-FOCUS banner when a routine sweep outranks the
     standing directive's own lane (g-115-3251).
@@ -4581,10 +4708,16 @@ def emit_strategic_focus_banner(scored, agent_name):
     # unfiltered, an agent that complied literally would file a meta-tiebreaker
     # deviation for work the directive excludes -- and, at the floor site, would
     # not even need a deviation code.
-    lane = next((s for s in mine
-                 if s.get("aspiration_id") in lanes
-                 and not lane_nominee_exclusion(s)),
-                None)
+    _lane_nominees = [s for s in mine
+                      if s.get("aspiration_id") in lanes
+                      and not lane_nominee_exclusion(s)]
+    # Highest PRIORITY first, score breaking ties () -- the same key
+    # apply_strategic_focus_floor uses, so the goal this banner tells the agent
+    # to prefer is always the goal the floor would actually hoist. Picking the
+    # first score-sorted row here while the floor ordered by priority would make
+    # the two name DIFFERENT goals, which is the disagreement the shared
+    # lane_nominee_exclusion above exists to prevent.
+    lane = max(_lane_nominees, key=lane_nominee_rank, default=None)
     if lane is None:
         return []  # every lane candidate is excluded by lane_nominee_exclusion
     try:
@@ -6564,7 +6697,13 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     if mine and mine[0].get("aspiration_id") in lanes:
         return None, status
 
-    picked = nominees[0]  # `scored` is already sorted, so this is the best one
+    # Highest PRIORITY nominee, score breaking ties (). This was
+    # `nominees[0]` -- the best-SCORED nominee -- which spent the directive's
+    # single slot on a lane's LOW rows whenever they out-scored its MEDIUM ones.
+    # max() returns the FIRST maximal element and `nominees` preserves the
+    # score-sorted order of `scored`, so an all-same-priority set still picks
+    # exactly the row `nominees[0]` would have.
+    picked = max(nominees, key=lane_nominee_rank)
     if scored[0] is not picked:
         scored.remove(picked)
         scored.insert(0, picked)

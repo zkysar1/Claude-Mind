@@ -357,3 +357,174 @@ def test_delete_is_part_of_the_protocol_surface():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ---------------------------------------------------------------------------
+#  outcome 2 — LocalBackend._atomic_write must use a PER-WRITER tmp
+#
+# The comment above the old `tmp = Path(str(target) + ".tmp")` justified the
+# deterministic name as "single-writer is guaranteed by the caller's lock, so
+# two writers cannot collide here". That proposition is the one 
+# falsified with a measured counterexample: all 8 wm.py write call sites WERE
+# lock-protected and a 13.9 MB file was spliced anyway, the suite log carrying a
+# FileExistsError from the lock itself. An ADVISORY lock with a staleness break
+# can fail to exclude; a per-writer temp name cannot.
+#
+# The blast radius here is larger than working memory. _atomic_write is what
+# atomic_write / write_text / write_bytes / write_jsonl all funnel through, and
+# _fileops._atomic_write_with_fallback routes every governed store to it —
+# aspirations, team-state, guardrails, reasoning-bank, changelog, pipeline,
+# experience. Those are MULTI-AGENT shared files where concurrent cross-agent
+# writers are the normal case, not the exception.
+#
+# The fleet already pinned this property one layer up:
+# test_history_store.py::atomic_write_uses_unique_tmp_suffix. The backend
+# beneath it was unpinned until now.
+# ---------------------------------------------------------------------------
+
+def _observed_backend_tmp_names(target, n, backend):
+    """Run n concurrent _atomic_write calls, returning the tmp path each used.
+
+    Instruments the PUBLISH step (os.replace), not the open — the pre-fix code
+    opens with builtins.open and the fixed code with os.fdopen(mkstemp()), but
+    both publish through os.replace(tmp, target). Patching open would measure
+    only the old implementation and report zero temps for the new one, which
+    reads exactly like the test failing to reproduce.
+    """
+    import threading
+
+    real_replace = os.replace
+    seen = []
+    seen_lock = threading.Lock()
+    barrier = threading.Barrier(n, timeout=20)
+
+    def tracking_replace(src, dst):
+        if str(dst) == str(target):
+            with seen_lock:
+                seen.append(Path(src))
+            # Every writer has written its tmp and none has published. A shared
+            # name is ONE inode at this instant.
+            barrier.wait()
+        return real_replace(src, dst)
+
+    errors = []
+
+    def writer(i):
+        try:
+            backend._atomic_write(target, lambda h, i=i: h.write("x" * (i + 1)))
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    monkey = pytest.MonkeyPatch()
+    try:
+        monkey.setattr(os, "replace", tracking_replace)
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        monkey.undo()
+
+    assert len(seen) == n, (
+        f"expected {n} publish attempts, observed {len(seen)} — the instrument "
+        "did not see _atomic_write's rename, so this run measured nothing"
+    )
+    return seen, errors
+
+
+def test_atomic_write_uses_a_per_writer_tmp_name(tmp_path):
+    """n concurrent writers of one target must use n DISTINCT tmp paths."""
+    backend = LocalBackend()
+    target = tmp_path / "governed-store.jsonl"
+    seen, errors = _observed_backend_tmp_names(target, 3, backend)
+
+    assert len(set(seen)) == len(seen), (
+        "LocalBackend._atomic_write derived a SHARED tmp path for concurrent "
+        f"writers: {[p.name for p in seen]}. Every governed store "
+        "(aspirations, team-state, guardrails, reasoning-bank, changelog) "
+        "funnels through here and is written by multiple agents at once. "
+        f"Corroborating writer errors: {errors!r}"
+    )
+    assert not errors, f"_atomic_write raised under concurrency: {errors!r}"
+
+
+def test_atomic_write_tmp_is_not_the_deterministic_sibling(tmp_path):
+    """The specific `<target>.tmp` name must not be the one chosen."""
+    backend = LocalBackend()
+    target = tmp_path / "governed-store.jsonl"
+    seen, _errors = _observed_backend_tmp_names(target, 2, backend)
+    deterministic = Path(str(target) + ".tmp")
+
+    assert deterministic not in seen, (
+        f"_atomic_write still uses the deterministic sibling {deterministic.name}; "
+        "it is shared by every writer of this target."
+    )
+
+
+def test_atomic_write_new_file_is_group_and_other_readable(tmp_path):
+    """mkstemp creates 0600; a governed store must not become private.
+
+    rb-4790: governed stores are read cross-agent and sometimes cross-uid. A
+    publish that inherits mkstemp's private mode silently removes that access,
+    and the failure surfaces far from this function.
+    """
+    import stat as stat_mod
+
+    backend = LocalBackend()
+    target = tmp_path / "governed-store.jsonl"
+    backend._atomic_write(target, lambda h: h.write("a"))
+    mode = stat_mod.S_IMODE(target.stat().st_mode)
+    assert mode & stat_mod.S_IRGRP and mode & stat_mod.S_IROTH, (
+        f"published store is mode {oct(mode)} — mkstemp's 0600 leaked through "
+        "instead of the umask default (rb-4790)"
+    )
+
+
+def test_atomic_write_preserves_an_existing_targets_mode(tmp_path):
+    """A rewrite must not silently widen or narrow an existing store's mode."""
+    import stat as stat_mod
+
+    backend = LocalBackend()
+    target = tmp_path / "governed-store.jsonl"
+    backend._atomic_write(target, lambda h: h.write("a"))
+    target.chmod(0o640)
+    backend._atomic_write(target, lambda h: h.write("b"))
+    mode = stat_mod.S_IMODE(target.stat().st_mode)
+    assert mode == 0o640, (
+        f"_atomic_write changed an existing store's mode to {oct(mode)}; it must "
+        "copy the mode it found (0o640)"
+    )
+
+
+def test_atomic_write_binary_mode_still_round_trips(tmp_path):
+    """The per-writer tmp must work on the binary branch too."""
+    backend = LocalBackend()
+    target = tmp_path / "blob.bin"
+    backend._atomic_write(target, lambda h: h.write(b"\x00\x01\x02"), binary=True)
+    assert target.read_bytes() == b"\x00\x01\x02"
+
+
+def test_atomic_write_leaves_no_tmp_orphan(tmp_path):
+    """A per-writer tmp is never reused, so a leak accumulates one per write."""
+    backend = LocalBackend()
+    target = tmp_path / "governed-store.jsonl"
+    backend._atomic_write(target, lambda h: h.write("a"))
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != target.name]
+    assert not leftovers, f"_atomic_write left tmp orphan(s) behind: {leftovers}"
+
+
+def test_atomic_write_cleans_up_tmp_when_the_serializer_raises(tmp_path):
+    """A failed write must not leave a per-writer tmp behind either."""
+    backend = LocalBackend()
+    target = tmp_path / "governed-store.jsonl"
+
+    def boom(h):
+        raise ValueError("serializer failed")
+
+    with pytest.raises(ValueError):
+        backend._atomic_write(target, boom)
+
+    leftovers = [p.name for p in tmp_path.iterdir()]
+    assert not leftovers, f"failed _atomic_write left tmp orphan(s): {leftovers}"

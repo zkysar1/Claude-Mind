@@ -287,7 +287,7 @@ ELSE:
 # that must survive summarization; the output re-derives the full entry
 # protocol (actionable dispatches + the always-run footer in protocol order).
 Bash: `bash core/scripts/orchestrator-entry-battery.sh`
-IF output says "all 4 entry checks clean — no dispatches":
+IF output says "entry checks clean — no dispatches":
     The presence-gated phases below (-0.5a, -0.5c, -0.5c.2, -0.5e Branch B)
     have nothing to do — SKIP their preamble checks. STILL run the always-run
     calls the footer lists, each ONCE, at its own phase (-0.5c.1 stranded

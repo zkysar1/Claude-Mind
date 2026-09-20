@@ -47,11 +47,54 @@ def _recent(days_ago):
     return (dt.datetime.now() - dt.timedelta(days=days_ago)).strftime("%Y-%m-%d")
 
 
+def _restore_modules(before):
+    """Put sys.modules back the way the sandbox window found it ().
+
+    Restoring the env vars is only half of leaving no trace. Every framework
+    module imported while they pointed at the sandbox bound the sandbox's dirs
+    AT IMPORT TIME: `_paths` computes WORLD_DIR / META_DIR / AGENT_DIR as
+    module-level constants, and its importers copy them by value. Left cached,
+    those modules hand every LATER test in the process three directories this
+    decorator has already deleted.
+
+    Measured 2026-09-20: after ONE sandboxed test returned, `_paths`,
+    `_fileops`, `_gate_log`, `aspirations` and `wm` each still held a `cbcs_*`
+    path that no longer existed, and this file as a predecessor turned 20 green
+    tests in three other files red -- green solo, red only in suite order, which
+    is the symptom guard-1435 says reads as flake rather than as a leak.
+
+    Two moves, because the window changes the cache in two ways:
+      1. A module cached BEFORE the window and replaced inside it (the families
+         the entry pop below forces to re-import) comes back as the SAME OBJECT
+         the rest of the session already holds. For `_paths` that is the
+         instance conftest pre-imports to lock AGENT_DIR for the whole session.
+      2. A framework module FIRST imported inside the window is evicted, so its
+         next importer re-executes it under the restored env.
+
+    The set is COMPUTED from a snapshot, never enumerated. A hand-written list
+    covers the imports that existed the day it was written and silently stops
+    covering the next one somebody adds -- popping only the three families named
+    in the entry pop would have missed three of the five modules measured above.
+    Eviction stops at core/scripts: only modules there can import `_paths`, and
+    re-executing a stdlib or C-extension module is not harmless.
+    """
+    for name in list(sys.modules):
+        if name in before:
+            continue
+        origin = getattr(sys.modules[name], "__file__", None) or ""
+        if origin.startswith(str(SCRIPT_DIR)):
+            sys.modules.pop(name, None)
+    for name, mod in before.items():
+        if sys.modules.get(name) is not mod:
+            sys.modules[name] = mod
+
+
 def with_sandbox(test_fn):
     """Decorator: spin up tmp WORLD_DIR + AGENT_DIR sandboxes via env vars.
 
     Uses MIND_WORLD / MIND_META / MIND_AGENT / MIND_AGENT_DIR so _paths.py
     picks up sandbox locations at module-load time. Force-reloads goal_selector.
+    Leaves the process as it found it: env AND module cache (_restore_modules).
     """
     def wrapped():
         sandbox_world = Path(tempfile.mkdtemp(prefix="cbcs_world_"))
@@ -69,6 +112,8 @@ def with_sandbox(test_fn):
         prior_world = os.environ.get("MIND_WORLD")
         prior_meta = os.environ.get("MIND_META")
         prior_body_wm = os.environ.get("BODY_WM_PATH")
+        # Taken BEFORE the entry pop below, so the modules it evicts are in it.
+        modules_before = dict(sys.modules)
         try:
             os.environ["MIND_AGENT"] = "alpha"
             os.environ["MIND_AGENT_DIR"] = str(sandbox_agent)
@@ -97,6 +142,7 @@ def with_sandbox(test_fn):
                     os.environ.pop(var, None)
                 else:
                     os.environ[var] = prior
+            _restore_modules(modules_before)
             shutil.rmtree(sandbox_world, ignore_errors=True)
             shutil.rmtree(sandbox_meta, ignore_errors=True)
             shutil.rmtree(sandbox_agent, ignore_errors=True)
@@ -329,6 +375,62 @@ def test_empty_agent_name_falls_back_fleet_wide(world_dir, agent_dir):
     print("  test_empty_agent_name_falls_back_fleet_wide PASSED")
 
 
+# ---------------------------------------------------------------------------
+# Test 7: the sandbox leaves no cached module bound to its deleted dirs
+# ()
+# ---------------------------------------------------------------------------
+
+def _modules_holding(*needles):
+    """Names of cached modules with a top-level str/Path value containing a needle."""
+    hits = []
+    for name, mod in list(sys.modules.items()):
+        try:
+            values = list(vars(mod).values())
+        except TypeError:       # a None placeholder or a non-module entry
+            continue
+        if any(isinstance(v, (str, Path)) and any(n in str(v) for n in needles)
+               for v in values):
+            hits.append(name)
+    return sorted(hits)
+
+
+def test_sandbox_leaves_no_module_bound_to_its_deleted_dirs():
+    """Every test above passes whether or not this file poisons the process.
+
+    That is what made the leak invisible here: the damage lands in whichever
+    file runs NEXT, as failures that are green solo. This pins the property at
+    its source instead of in its victims.
+    """
+    seen = {}
+
+    @with_sandbox
+    def window(world_dir, agent_dir):
+        _import_helper()    # drags `_paths` and its importers in under the sandbox env
+        seen["dirs"] = (str(world_dir), str(agent_dir), os.environ["MIND_META"])
+        seen["inside"] = _modules_holding(*seen["dirs"])
+
+    window()
+
+    # POSITIVE CONTROL (guard-4166). The outcome asserted below is an ABSENCE, so
+    # first prove the scanner can see a bound module at all: INSIDE the window
+    # `_paths` must hold the sandbox dirs -- that is the decorator doing its job.
+    # Without this, a scanner that matches nothing passes forever.
+    assert "_paths" in seen["inside"], (
+        "the scanner found no sandbox-bound `_paths` INSIDE the window "
+        f"(saw {seen['inside']}); it cannot see a leak, so its silence below "
+        "would prove nothing"
+    )
+
+    leaked = _modules_holding(*seen["dirs"])
+    assert leaked == [], (
+        f"{len(leaked)} cached module(s) still point into this test's DELETED "
+        f"sandbox after it returned: {leaked}. Every later test in this process "
+        "that reaches one of them reads or writes a directory that no longer "
+        "exists (g-115-10155: 20 in-suite-only reds in three other files)."
+    )
+    print("  test_sandbox_leaves_no_module_bound_to_its_deleted_dirs PASSED")
+
+
 def main():
     tests = [
         ("test_last_n_tail", test_last_n_tail),
@@ -338,6 +440,8 @@ def main():
         ("test_chronological_order", test_chronological_order),
         ("test_empty_agent_name_falls_back_fleet_wide",
          test_empty_agent_name_falls_back_fleet_wide),
+        ("test_sandbox_leaves_no_module_bound_to_its_deleted_dirs",
+         test_sandbox_leaves_no_module_bound_to_its_deleted_dirs),
     ]
     failures = []
     for name, fn in tests:

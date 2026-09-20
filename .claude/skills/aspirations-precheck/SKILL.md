@@ -174,6 +174,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5k.18 | displaced-id-audit | deferrable | `py -3 core/scripts/displaced-id-audit.py` (~13s) |
 | 0.5k.19 | repo-hygiene-sweep | deferrable | `bash core/scripts/repo-hygiene-sweep.sh` (~77s — needs >=120s bound; g-115-8361) |
 | 0.5k.20 | stalled-goal-ratchet | deferrable | `bash core/scripts/stalled-goal-ratchet.sh` (~60s — needs >=120s bound). The only lane bounding TOTAL non-executable time, not one block class. `--dry-run --json` for rows (summary on stderr) |
+| 0.5k.21 | domain-term-ratchet | deferrable | `bash core/scripts/domain-term-ratchet.sh` (.sh REQUIRED; ~90s). Registry-derived peer ids present in core but NOT blocklisted. Scoped to `environments/id` ON PURPOSE — the whole-census figure (~1358) is ~89% conventions-heading prose and must never be ratcheted. A census yielding ZERO registry ids reports `skipped` and leaves the baseline alone (g-115-10049) |
 
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
@@ -1902,9 +1903,9 @@ not sufficient):
     1. READ THE RECORD, authoritatively — not the slate line — through the
        slate's COMPACT reader, never the raw record:
        Bash: bash core/scripts/completed-not-closed-slate.sh --show <goal-id>
-       It prints status/holder/verification/description-head and the FIRST 3500
-       chars of `outcome_note`; page a long note with `--note-from 3500` (then
-       7000 …) only as far as a verdict needs. Do NOT use
+       It prints status/holder/verification/description-head + `outcome_note`,
+       which `--note-from` pages. It CANNOT page `progress_note` (re-reads
+       its head, guard-6952); use goal-note-tail.sh. Do NOT use
        `aspirations-query.sh --goal-field id … --full` here: that is 10k+ chars
        per goal, three per iteration, twice each, and a triage agent following
        exactly that instruction died of autocompact thrash on 2026-08-16.

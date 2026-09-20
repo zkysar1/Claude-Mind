@@ -227,8 +227,25 @@ def test_explicit_rc_capture_is_approved():
     )
 
 
-def test_override_token_is_approved():
-    assert_approved(FOUNDING + f"  # {OVERRIDE_TOKEN}: wrapper prints nothing on success")
+def test_override_construct_is_approved():
+    assert_approved(f'{OVERRIDE_TOKEN}="wrapper prints nothing on success" ' + FOUNDING)
+
+
+def test_merely_naming_the_override_is_still_denied():
+    """REGRESSION (). Arm B is the goal's measured fixture verbatim:
+    `  # SILENT_ZERO_GATE_OVERRIDE is the documented escape hatch`. FOUNDING is
+    arm A and is asserted denied by test_founding_incident_shape_is_denied, so
+    this arm cannot pass vacuously."""
+    assert_denied(FOUNDING + f"  # {OVERRIDE_TOKEN} is the documented escape hatch")
+
+
+def test_override_requires_a_non_empty_quoted_reason_and_is_not_start_anchored():
+    """Empty reason is not an override; a glued prefix cannot borrow the token;
+    and a mid-command assignment (rb-9764's dominant `cd ... && VAR=v` shape)
+    must still work."""
+    assert_denied(f'{OVERRIDE_TOKEN}="" ' + FOUNDING)
+    assert_denied(f'FOO_{OVERRIDE_TOKEN}="why" ' + FOUNDING)
+    assert_approved(f"cd /opt/ayoai-mind && {OVERRIDE_TOKEN}='mid-command' " + FOUNDING)
 
 
 def test_non_framework_command_is_approved():
@@ -345,7 +362,14 @@ def test_shape_filter_with_pipestatus_is_approved():
 
 
 def test_shape_filter_override_is_approved():
-    assert_approved(SHAPE_FOUNDING + f"  # {OVERRIDE_TOKEN}: wrapper interleaves banners")
+    assert_approved(f'{OVERRIDE_TOKEN}="wrapper interleaves banners" ' + SHAPE_FOUNDING)
+
+
+def test_shape_filter_mention_is_still_denied():
+    """REGRESSION () on the SECOND suppression site in this module.
+    shape_selective_suppressions is a deliberate PEER of silent_zero_violations
+    (guard-2601), so it carries its own override test and needed its own fix."""
+    assert_denied(SHAPE_FOUNDING + f"  # {OVERRIDE_TOKEN} is the documented escape hatch")
 
 
 def test_shape_filter_on_non_framework_producer_is_approved():

@@ -72,6 +72,29 @@ short name, not the identifier. Measured over 2,697 non-terminal goals: taking
 EVERY component turned 13 refusals into allows, mostly unrelated work sharing a
 generic name component; the corroborated component turned 3.
 
+DECLARED SURFACES (g-115-10225)
+-------------------------------
+Both evidence kinds above are a PROSE join, and the two sides of it were
+written by different authors for different purposes: the registry column
+names ARTIFACTS ("client scripts", "analyzers", "framework scripts") while
+goals are titled in OUTCOMES ("Wire <feature> to <state> so <the effect a user
+sees>"). A token join across that gap misses BY DEFAULT,
+not by accident (guard-6963) — measured 2026-09-18 on the live aged-handoff
+population, 5 of 12 rows matched NEITHER column.
+
+The third evidence kind closes it at the goal end: an optional `work_surface`
+field naming the artifact surface(s) the goal's work touches, matched EXACTLY
+(hyphen/space-equivalent) against the vocabulary the registry already carries.
+No term is added to either column, so the pin's wording — a USER DIRECTIVE —
+is untouched.
+
+Deliberately NOT the alternative of growing the out-of-lane column with
+outcome words: that is unbounded (guard-2228) and it over-matches in the one
+direction that hurts, because an over-matching out-of-lane column REFUSES
+claims the assignee may legally make. A declared tag cannot do that to a goal
+that does not carry one, which also makes the corpus delta exactly measurable
+(guard-2201) rather than estimated.
+
 Public API:
     parse_pins(text) -> list[dict]
     evaluate(agent, goal, *, registry_text=None, world_dir=None,
@@ -496,6 +519,77 @@ def _hits(phrase_text: str, token_text: str, phrases, tokens):
     return found
 
 
+_SURFACE_FIELD = "work_surface"
+
+
+def _surfaces(goal) -> list:
+    """The artifact surfaces a goal DECLARES, normalised. `[]` when absent.
+
+    Accepts a list or a COMMA/semicolon-separated string, so the field is
+    writable through `aspirations-update-goal.sh <goal> work_surface
+    "client-lua"` as well as through a structured filer.
+
+    Separator is punctuation, never whitespace: a registry term can be several
+    words ("client lua", "framework scripts"), and splitting on spaces shreds
+    exactly those into single tokens that then match the wrong column entry.
+    Caught by test_hyphen_and_space_are_equivalent_across_the_join, which read
+    evidence ['client', 'scripts'] for the tag "client scripts" — the right
+    verdict reached through two wrong matches.
+    """
+    if not isinstance(goal, dict):
+        return []
+    raw = goal.get(_SURFACE_FIELD)
+    if isinstance(raw, str):
+        items = re.split(r"[,;]+", raw)
+    elif isinstance(raw, (list, tuple)):
+        items = [str(x) for x in raw]
+    else:
+        return []
+    out = []
+    for item in items:
+        s = _norm(item)
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def _surface_hits(surfaces, phrases, tokens):
+    """Structured evidence: a DECLARED surface equal to a column's own term.
+
+    WHY A DECLARED TAG RATHER THAN MORE VOCABULARY (g-115-10225). The registry
+    column and the goal corpus are written by different authors for different
+    purposes — the column names ARTIFACTS ("client scripts", "analyzers")
+    while goals are titled in OUTCOMES ("Wire <feature> to <state>")
+    — so a token join between them misses by default rather than by accident
+    (guard-6963). Growing the column with outcome words is unbounded and, worse,
+    over-matches in the one direction that hurts: an over-matching out-of-lane
+    column REFUSES claims the assignee may legally make. A tag the goal carries
+    itself joins the two vocabularies at the goal end, where the author knows
+    the answer, and it is the mechanism-identifier shape guard-2228 prescribes.
+
+    EXACT match, never substring: the point of a declared tag is that it does
+    NOT inherit the prose matcher's false-positive surface. Hyphens and spaces
+    are equivalent, so the tag `client-lua` matches the registry's prose phrase
+    "client lua" with no vocabulary added anywhere.
+
+    A goal that declares nothing contributes nothing, so an UNSTAMPED corpus is
+    byte-identically unaffected by this path — which is what makes the widening
+    delta measurable exactly (guard-2201) instead of estimated.
+    """
+    if not surfaces:
+        return []
+    vocab = {}
+    for phrase in phrases:
+        vocab.setdefault(phrase.replace("-", " "), phrase)
+    for tok in tokens:
+        vocab.setdefault(tok.replace("-", " "), tok)
+    found = []
+    for surface in surfaces:
+        if surface.replace("-", " ") in vocab:
+            found.append("%s:%s" % (_SURFACE_FIELD, surface))
+    return found
+
+
 def _block_message(pin, evidence) -> str:
     ev = ", ".join(repr(e) for e in evidence[:4])
     return (
@@ -586,16 +680,21 @@ def evaluate(agent, goal, *, registry_text=None, world_dir=None,
 
         haystack = _goal_text(goal)      # phrases match here
         headline = _goal_headline(goal)  # single tokens match here only
-        if not haystack:
+        surfaces = _surfaces(goal)       # structured tags match either column
+        if not haystack and not surfaces:
             return allow  # nothing to classify -> fail open
 
         for pin in pins:
-            out_hits = _hits(haystack, headline,
-                             pin["out_phrases"], pin["out_tokens"])
+            out_hits = (_hits(haystack, headline,
+                              pin["out_phrases"], pin["out_tokens"])
+                        + _surface_hits(surfaces, pin["out_phrases"],
+                                        pin["out_tokens"]))
             if not out_hits:
                 continue  # no out-of-lane evidence from this pin
-            in_hits = _hits(haystack, headline,
-                            pin["in_phrases"], pin["in_tokens"])
+            in_hits = (_hits(haystack, headline,
+                             pin["in_phrases"], pin["in_tokens"])
+                       + _surface_hits(surfaces, pin["in_phrases"],
+                                       pin["in_tokens"]))
             if in_hits:
                 # Both columns match — the pin does not settle this goal.
                 # ALLOW: a false refusal wedges a claim, a false allow only
@@ -635,7 +734,10 @@ def evaluate(agent, goal, *, registry_text=None, world_dir=None,
         # empty evidence list, a lane item that never matches anything looked
         # exactly like one that works.
         for pin in pins:
-            in_hits = _hits(haystack, headline, pin["in_phrases"], pin["in_tokens"])
+            in_hits = (_hits(haystack, headline,
+                             pin["in_phrases"], pin["in_tokens"])
+                       + _surface_hits(surfaces, pin["in_phrases"],
+                                       pin["in_tokens"]))
             if in_hits:
                 return {"would_block": False, "fired": True, "reason": "in-lane",
                         "pin_id": pin["id"], "verdict": "in-lane",

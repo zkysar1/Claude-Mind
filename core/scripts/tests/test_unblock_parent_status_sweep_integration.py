@@ -564,3 +564,84 @@ def test_timestamped_unblock_leaves_the_counter_at_zero_and_stderr_quiet():
                 f"uncomputable; got {result.get('skipped_age_uncomputable')}")
             assert "no parseable" not in err, (
                 f"stderr must stay quiet at zero; got {err!r}")
+
+
+def test_diagnostic_guard_does_not_veto_a_recurring_parent():
+    """ follow-up: the diagnostic guard is EXCLUDED for recurring parents.
+
+    THE SPECIFICITY TWIN of test_diagnostic_parent_guard_fires_through_main
+    above, and it binds at the same CALL-SITE layer, because the exclusion IS
+    a call-site conditional -- the helper is unchanged and every unit test in
+    test_unblock_parent_diagnostic_guard.py stays green if the exclusion is
+    deleted (guard-1648 / guard-1451: match the test's binding layer to the
+    defect's layer).
+
+    WHY THE EXCLUSION EXISTS, MEASURED. Widening the guard's index from
+    `outcome_note` to `outcome_note + progress_note` (so a parent that records
+    its non-discharge in the append-only field is visible) also exposed every
+    RECURRING parent's rolling multi-run log to a predicate written for a
+    one-shot CLOSE note. Retro-scanned on the live corpus: g-326-942 and
+    g-326-957 -- starvation Unblocks for g-326-609, a 6h-interval recurring
+    parent that had fired 8h earlier -- matched 'stays blocked' (@81613) and
+    'still blocked' (@82166), both incidental prose about an unrelated gated
+    Groq-key retirement inside a 49,858-char log. Without this exclusion the
+    guard vetoes two correctly-resolvable Unblocks, and starvation Unblocks
+    are the sweep's LARGEST legitimate population (13 of 15 live rule-4 links)
+    -- i.e. the widening would have quietly neutered the sweep's main job,
+    which is the exact bound _successor_marker_guard's docstring warns about
+    ("a marker matching everything would silently reduce the sweep to a
+    no-op").
+
+    Fixture: parent is RECURRING with a FRESH lastAchievedAt, so the cadence
+    branch resolves "resumed" and FALLS THROUGH to the guard chain -- that
+    fall-through is precisely how a recurring parent reaches the diagnostic
+    guard at all. Its progress_note carries a _PERSISTS_MARKERS member. The
+    child is a starvation Unblock (origin_signal prefix
+    'unblock:recurring-starved-'), or the cadence branch would short-circuit
+    on the guard-5708 undecidable path and the test would pass vacuously.
+    """
+    import datetime as _dt
+    fresh = (_dt.datetime.now() - _dt.timedelta(minutes=5)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+    with tempfile.TemporaryDirectory() as tmpd:
+        world, agent_dir = _make_world_with_pair(
+            Path(tmpd),
+            parent_status="pending",
+            parent_extra={
+                "recurring": True,
+                "interval_hours": 6,
+                "lastAchievedAt": fresh,
+                # Incidental prose in a rolling log — NOT a close-note
+                # statement about this child's condition.
+                "progress_note": (
+                    "Run 41: registry matched, no drift. Aside on the "
+                    "unrelated key retirement: the record cannot expire while "
+                    "the key is load-bearing, so that cleanup stays blocked "
+                    "until the sidecar stops needing it."),
+            },
+            unblock_extra={
+                "origin_signal": "unblock:recurring-starved-g-700-69-20260919",
+                "title": ("Unblock: recurring goal g-700-69 has stopped firing "
+                          "(18.1h = 3.01x its expected cadence)"),
+            })
+        with DaemonFixture(world):
+            rc, out, err = _run_sweep(world, agent_dir, apply=True)
+            assert rc == 0, f"sweep rc={rc}; stderr={err!r}; stdout={out!r}"
+            result = json.loads(out)
+
+            vetoed = [d for d in result.get("details", [])
+                      if d.get("goal_id") == "g-700-73"
+                      and "g-115-8586" in (d.get("reason") or "")]
+            assert not vetoed, (
+                f"the diagnostic guard must NOT veto a RECURRING parent — its "
+                f"premise is about a one-shot CLOSE note, and a rolling "
+                f"multi-run log is not one; got {vetoed!r}")
+
+            assert result["applied"] == 1, (
+                f"a starvation Unblock whose recurring parent resumed firing "
+                f"must still be swept; got applied={result['applied']}, "
+                f"details={result.get('details')}")
+            unblock = _read_goal(world, "g-700-73")
+            assert unblock is not None and unblock["status"] == "skipped", (
+                f"swept Unblock must land skipped on disk; got "
+                f"{unblock and unblock.get('status')!r}")

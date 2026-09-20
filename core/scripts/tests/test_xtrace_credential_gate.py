@@ -158,11 +158,75 @@ def test_path_config_exception_and_its_dependents_stay_clear():
         assert not _off(f"bash -x {d}/pathconf_user.sh", d)
 
 
-def test_override_token_allows_the_offending_command():
+def test_override_construct_allows_the_offending_command():
+    """An INVOCATION suppresses: token + `=` + a non-empty quoted reason."""
     with tempfile.TemporaryDirectory() as t:
         d = _tree(Path(t))
         assert _off(f"bash -x {d}/wrapper.sh s3 ls", d), "control: offending without the token"
-        assert not _off(f"bash -x {d}/wrapper.sh s3 ls  # {pred.OVERRIDE_TOKEN}", d)
+        assert not _off(
+            f'{pred.OVERRIDE_TOKEN}="tracing the gate itself" bash -x {d}/wrapper.sh s3 ls', d)
+
+
+def test_merely_naming_the_override_does_NOT_suppress():         # noqa: N802 - 
+    """REGRESSION (). `OVERRIDE_TOKEN in command` read a MENTION as an
+    invocation, so a trailing comment -- or a runbook explaining the bypass --
+    silently disarmed a credential-facing gate.
+
+    Arm B's suffix is the goal's measured fixture verbatim:
+        `  # do not reach for XTRACE_CREDENTIAL_GATE_OVERRIDE here`
+    The command it decorates is this suite's hermetic tree rather than the goal's
+    live `bash -x core/scripts/liveness-check.sh --agent alpha --json`, because
+    this file's contract is that no test may go green or red on what a deployment
+    happens to have installed. The non-vacuousness arm A was chosen for is
+    preserved by asserting arm A in the same test, which is stronger: it cannot
+    go vacuous as the live tree changes.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        d = _tree(Path(t))
+        bare = f"bash -x {d}/wrapper.sh s3 ls"
+        assert _off(bare, d), "arm A control: must fire, or arm B proves nothing"
+        mention = bare + f"  # do not reach for {pred.OVERRIDE_TOKEN} here"
+        assert _off(mention, d), "arm B: a MENTION must not suppress a credential gate"
+
+
+def test_override_requires_a_non_empty_quoted_reason():
+    """The justification is what makes the bypass auditable, so an empty one is
+    not an override. Also pins that a glued prefix cannot borrow the token."""
+    with tempfile.TemporaryDirectory() as t:
+        d = _tree(Path(t))
+        bare = f"bash -x {d}/wrapper.sh s3 ls"
+        assert _off(f'{pred.OVERRIDE_TOKEN}="" ' + bare, d), "empty reason is not an override"
+        assert _off(f'FOO_{pred.OVERRIDE_TOKEN}="why" ' + bare, d), "glued prefix must not match"
+        assert not _off(f"{pred.OVERRIDE_TOKEN}='why' " + bare, d), "single quotes are valid"
+
+
+def test_a_documented_construct_inside_a_heredoc_does_not_suppress():
+    """FRESH-EYES REGRESSION (). The construct requirement stops a
+    bare MENTION, but a runbook that writes the CORRECT invocation form into a
+    heredoc is still data, not an invocation -- and it disarmed the gate for the
+    command that writes it until the override test moved behind
+    strip_heredoc_bodies. Same self-inflicted-by-documentation shape the goal
+    was filed on, one narrowing further in."""
+    with tempfile.TemporaryDirectory() as t:
+        d = _tree(Path(t))
+        bare = f"bash -x {d}/wrapper.sh s3 ls"
+        assert _off(bare, d), "arm A control: must fire, or this proves nothing"
+        doc = (
+            "cat > runbook.md <<'EOF'\n"
+            f'To bypass, run {pred.OVERRIDE_TOKEN}="your reason" before the command.\n'
+            "EOF\n" + bare
+        )
+        assert _off(doc, d), "a heredoc-documented construct must NOT suppress"
+
+
+def test_override_is_not_start_anchored():
+    """rb-9764: the fleet's dominant shape is `cd ... && VAR=v bash ...`. A
+    start-anchored test would refuse every real invocation -- trading a silent
+    bypass for a silently-unusable escape hatch."""
+    with tempfile.TemporaryDirectory() as t:
+        d = _tree(Path(t))
+        cmd = f'cd /tmp && {pred.OVERRIDE_TOKEN}="mid-command invocation" bash -x {d}/wrapper.sh s3 ls'
+        assert not _off(cmd, d)
 
 
 # ---- the env-assignment anchor (regression, found in production) ---------
@@ -255,9 +319,24 @@ def test_gate_denies_the_real_leak_shape():
 def test_gate_allows_with_override_token():
     with tempfile.TemporaryDirectory() as t:
         d = _tree(Path(t))
-        proc = _run_gate(f"bash -x {d}/wrapper.sh s3 ls # {pred.OVERRIDE_TOKEN}")
+        proc = _run_gate(
+            f'{pred.OVERRIDE_TOKEN}="tracing the gate itself" bash -x {d}/wrapper.sh s3 ls')
         assert proc.returncode == 0
         assert proc.stdout.strip() == "", "override must approve with no mutation"
+
+
+def test_gate_denies_when_the_override_is_only_mentioned():
+    """REGRESSION (), through the REAL hook entry point: a mention
+    must still be refused. The predicate test above is the unit; this is the
+    wiring, because a green predicate over a short-circuiting wrapper is exactly
+    how a gate looks enabled while being off."""
+    with tempfile.TemporaryDirectory() as t:
+        d = _tree(Path(t))
+        proc = _run_gate(
+            f"bash -x {d}/wrapper.sh s3 ls  # do not reach for {pred.OVERRIDE_TOKEN} here")
+        assert proc.returncode == 0
+        assert proc.stdout.strip(), "a mention must NOT approve"
+        assert json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_gate_fails_open_on_garbage_stdin():
@@ -349,7 +428,7 @@ def test_the_override_bypass_is_logged(monkeypatch):
     """THE regression. Allowed is only half the contract; recorded is the other."""
     with tempfile.TemporaryDirectory() as t:
         d = _tree(Path(t))
-        cmd = f"bash -x {d}/wrapper.sh # {pred.OVERRIDE_TOKEN}"
+        cmd = f'{pred.OVERRIDE_TOKEN}="auditing the bypass path" bash -x {d}/wrapper.sh'
         calls = _drive_gate(monkeypatch, cmd, d.parent)
         overrides = [(a, k) for a, k in calls if a[1] == "override"]
         assert overrides, f"bypass went unrecorded; decisions={[a[1] for a, _ in calls]}"

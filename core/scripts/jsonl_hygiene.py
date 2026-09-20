@@ -520,12 +520,43 @@ def hygiene_one(path: Path, *, mode: str, by: str, max_lines=None,
     def _append_new_tail(arch):
         arch = arch or []
         window = min(len(oldest_keys), len(arch))
-        tail_keys = [json.dumps(r, sort_keys=True) for r in arch[-window:]] if window else []
         overlap = 0
-        for k in range(window, 0, -1):
-            if tail_keys[window - k:] == oldest_keys[:k]:
-                overlap = k
-                break
+        # TWO-TIER, not a descending scan over every k ( occurrence 52,
+        # zeta, hostname cc-02, uname -r 6.8.0-139-generic, 2026-09-19). The old
+        # `for k in range(window, 0, -1)` slice-compared at every k, so it was
+        # O(window**2) with the COMMON case -- overlap 0 -- as its WORST case,
+        # because nothing breaks early. Measured here: world/changelog.jsonl at
+        # 387,652 lines against its 20,000 cap gave window=367,652 and ~6.8e10
+        # comparisons; the sweep burned 35 min at 99% CPU / 1.48 GB RSS inside ONE
+        # locked_modify_jsonl cycle. MEASURED: three py-spy dumps 30 s apart all
+        # landed on the slice-compare line, and the sweep had to be SIGTERMed
+        # (rc=143) having produced zero output. NOT measured, but structural: that
+        # cycle's lock TTL is 30 s (acquire_lock stale_seconds), so a 35-min cycle
+        # is certainly holding a stale-broken lock well before it writes, which
+        # exposes it to a lost If-Match fence and a full _rmw_with_conflict_retry
+        # re-run of the whole quadratic pass. No retry was observed here -- the
+        # exposure is the hazard, the quadratic is the defect. Either way the shape
+        # is a ratchet: the deeper a store drifts past its cap the larger n_drop,
+        # so the sweep that would drain it is the one least able to finish.
+        # Semantics are UNCHANGED: the same maximal overlap is returned
+        # (pinned by test_failed_phase2_then_clean_rerun_archives_each_record_once,
+        # archive_skipped 6 then 0); only provably-impossible k values are skipped.
+        if window:
+            # Tier 1 -- an overlap of k ends AT the archive's last record, so
+            # arch[-1] must equal one of oldest[:window]. One serialization plus a
+            # set membership test settles overlap==0 without serializing the
+            # archive tail at all.
+            last_key = json.dumps(arch[-1], sort_keys=True)
+            if last_key in set(oldest_keys[:window]):
+                # Tier 2 -- only offsets where the tail record equals oldest[0] can
+                # begin an overlap. i ascending IS k descending (k = window - i), so
+                # the first confirmed match is still the MAXIMAL one.
+                tail_keys = [json.dumps(r, sort_keys=True) for r in arch[-window:]]
+                first = oldest_keys[0]
+                for i, t in enumerate(tail_keys):
+                    if t == first and tail_keys[i:] == oldest_keys[:window - i]:
+                        overlap = window - i
+                        break
         archive_skipped[0] = overlap
         return arch + oldest[overlap:]
 
@@ -875,7 +906,25 @@ def detect_overcap(threshold: float = OVERCAP_THRESHOLD, record: bool = True) ->
     ratchet_cleared = sorted(p for p in prev_ratchet if p not in over_now)
     next_ratchet = {p: over_now[p]["ratio"] for p in surfaced}
     for path in carried:
-        next_ratchet[path] = prev_ratchet[path]
+        # Track the mark DOWN as well as up (). A verbatim carry made
+        # this a HIGH-WATER latch: a store that improved while staying over
+        # threshold kept its worst-ever fire line, so it could degrade back to
+        # that level -- and past it -- in silence. The CLEAR path below only
+        # rescues a store that falls fully under threshold, which the four
+        # permanently-over-cap machine-local stores never do.
+        #
+        # min() is safe here because the oscillation was MEASURED, not assumed:
+        # N=20 recorded runs (2026-09-18T21:25 .. 2026-09-20T17:01) give a
+        # per-store band of 1.041-1.142x with a worst single-run step of 1.011x,
+        # across all seven over-cap stores. OVERCAP_REGRESS_FACTOR is 1.5, so an
+        # upswing off the trough cannot reach the fire line on ordinary jitter.
+        #
+        # This is NOT the guard-6519 shape. That guardrail's precondition is a
+        # baseline FLEET-MERGED BY MIN, and this log has no merge handler at all:
+        # merge_handler_for("world/store-hygiene-overcap-log.jsonl") is None,
+        # with meta/audit-baselines.yaml -> merge_audit_baselines as the positive
+        # control in the same lookup. The mark is per-box state in a per-box log.
+        next_ratchet[path] = min(prev_ratchet[path], over_now[path]["ratio"])
 
     out = {
         "threshold": threshold,

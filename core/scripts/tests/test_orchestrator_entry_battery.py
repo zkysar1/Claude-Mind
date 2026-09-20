@@ -31,7 +31,26 @@ def _run(capsys, agent=None, wm_path=None, as_json=True):
 
 
 @pytest.fixture()
-def fake_state_dir(tmp_path, monkeypatch):
+def init_markers(tmp_path, monkeypatch):
+    """Three PRESENT `.initialized` markers, wired into the battery's one seam.
+
+    An INITIALIZED world is the default: the init-markers check (2026-09-20)
+    reads three real paths, and without this every "clean run" test below would
+    dispatch init against whatever this box happens to hold for "testagent".
+    Returns the {tier: Path} dict so a test can remove one.
+    """
+    markers = {}
+    for tier in ("world", "agent", "meta"):
+        d = tmp_path / "markers" / tier
+        d.mkdir(parents=True)
+        (d / ".initialized").touch()
+        markers[tier] = d / ".initialized"
+    monkeypatch.setattr(oeb, "_init_marker_paths", lambda agent: dict(markers))
+    return markers
+
+
+@pytest.fixture()
+def fake_state_dir(tmp_path, monkeypatch, init_markers):
     state = tmp_path / "agents" / "testagent" / "session"
     state.mkdir(parents=True)
     import _paths
@@ -48,7 +67,7 @@ def _empty_wm(tmp_path):
 
 def test_clean_run_no_actionable(fake_state_dir, tmp_path, capsys):
     rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
-    assert rep["checks"] == 4
+    assert rep["checks"] == len(oeb.ENTRY_CHECKS) == 5
     assert rep["actionable"] == []
     assert "error" not in rep
 
@@ -94,7 +113,7 @@ def test_no_agent_binding_fails_open(tmp_path, capsys, monkeypatch):
 
 def test_human_output_footer(fake_state_dir, tmp_path, capsys):
     out = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path), as_json=False)
-    assert "all 4 entry checks clean" in out
+    assert "all 5 entry checks clean" in out
     assert "always-run entry calls" in out
     assert "idle-tick.sh (-0.5e)" in out
 
@@ -194,3 +213,67 @@ def test_fail_open_reports_blind_rather_than_clean(tmp_path, capsys, monkeypatch
     assert itopen._findings_from("entry-checks", report) == [], (
         "and it must not manufacture findings it never computed"
     )
+
+
+# --- a world that was never initialized (2026-09-20) --------------------------
+#
+# State RUNNING is set by /start, which then chains into boot, whose Phase -2 runs
+# the init scripts. Measured 2026-09-19 on a served loop: the model loaded boot,
+# answered with text, and every later turn ran THIS loop in a world with no meta
+# tier. The battery ran each turn and said nothing; the selector failed 9 of 9.
+
+
+def test_an_initialized_world_dispatches_nothing(fake_state_dir, tmp_path, capsys):
+    """The fleet-wide false-positive guard: this battery runs on every live agent
+    every iteration, so a healthy world MUST stay silent."""
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    assert [e["name"] for e in rep["actionable"]] == []
+    assert rep["blind"] == []
+
+
+def test_a_missing_marker_dispatches_init_and_names_the_tier(
+        fake_state_dir, init_markers, tmp_path, capsys):
+    """POSITIVE CONTROL (guard-5501: a diagnostic's silence proves nothing until
+    it is shown to FIRE). The sample-4 shape: agent planted, world+meta never run."""
+    init_markers["world"].unlink()
+    init_markers["meta"].unlink()
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    hit = [e for e in rep["actionable"] if e["name"] == "world_not_initialized"]
+    assert len(hit) == 1
+    assert hit[0]["payload"] == {"missing": ["meta", "world"], "present": ["agent"]}
+    assert "init-mind.sh" in hit[0]["dispatch"], "the dispatch must carry the command"
+    assert rep["actionable"][0]["name"] == "world_not_initialized", (
+        "it is FIRST: nothing after it means anything in an uninitialized world")
+
+
+def test_the_dispatch_reaches_the_composed_caller(
+        fake_state_dir, init_markers, tmp_path, capsys):
+    """iteration-open lifts payload['findings'] BY NAME; an actionable the composed
+    path cannot see is the g-115-6618 defect all over again."""
+    init_markers["meta"].unlink()
+    report = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    lifted = _load_iteration_open()._findings_from("entry-checks", report)
+    assert any(f["name"] == "world_not_initialized" for f in lifted), lifted
+
+
+def test_an_unresolvable_root_is_blind_never_a_false_dispatch(
+        fake_state_dir, tmp_path, capsys, monkeypatch):
+    """"I cannot tell" is not "it is missing". Dispatching init on a box whose
+    world root does not resolve would send every agent there to run init."""
+    monkeypatch.setattr(oeb, "_init_marker_paths",
+                        lambda agent: {"world": None, "agent": None, "meta": None})
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    assert not [e for e in rep["actionable"] if e["name"] == "world_not_initialized"]
+    blind = [b for b in rep["blind"] if b["name"] == "world_not_initialized"]
+    assert len(blind) == 1 and "unresolved" in blind[0]["reason"]
+
+
+def test_human_line_carries_the_runnable_command(
+        fake_state_dir, init_markers, tmp_path, capsys):
+    """The model reads the HUMAN line. The command must be on it verbatim, so the
+    cue lands on an action the model already takes (run what the battery names)."""
+    init_markers["meta"].unlink()
+    out = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path), as_json=False)
+    line = next(l for l in out.splitlines() if "world_not_initialized" in l)
+    assert "bash core/scripts/init-mind.sh $MIND_AGENT" in line
+    assert '"missing": ["meta"]' in line

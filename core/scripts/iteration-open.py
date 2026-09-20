@@ -308,10 +308,23 @@ def parse_tier_table(md_path=None):
 
 
 def _run_bash(argv, timeout):
-    """Run a core/scripts bash script. Return (rc, stdout, elapsed_ms, err_or_None).
+    """Run a core/scripts bash script.
+    Return (rc, stdout, elapsed_ms, err_or_None, stage_stderr).
 
     err set == the stage could not be RUN at all (timeout / spawn failure). That is
     a BLIND stage, not a clean one -- the caller must never fold it into a zero.
+
+    The 5th slot is the STAGE's OWN stderr, the same fix in the same shape as
+    precheck-medium-battery._run_bash (guard-2586). This runner captured stderr
+    and then discarded it, so a selector that RAN and FAILED reached the model as
+    "unparseable selector output: Expecting value: line 1 column 1 (char 0)" -- a
+    string that names the JSON parser and never the cause. Measured 2026-09-19 on
+    a served loop in a never-initialized world: the selector failed 9 of 9 and its
+    reason never crossed this boundary.
+
+    Injected runners (tests, runner=) still return the historical 4 slots; every
+    caller unpacks defensively, so this stays backward-compatible. Never index
+    [4] unconditionally.
     """
     from _runtime_bash import bash_cmd  # guard-580 + guard-581
 
@@ -322,13 +335,13 @@ def _run_bash(argv, timeout):
             full, cwd=str(PROJECT_ROOT),
             capture_output=True, text=True, timeout=timeout,
         )
-        return r.returncode, r.stdout, int((time.time() - t0) * 1000), None
+        return r.returncode, r.stdout, int((time.time() - t0) * 1000), None, r.stderr
     except subprocess.TimeoutExpired:
         # rc=124 is the shell's timeout convention; printing it in the table is
         # the goal's explicit requirement that a lane rc != 0 is never swallowed.
-        return 124, "", int((time.time() - t0) * 1000), f"{argv[0]}: timeout after {timeout}s"
+        return 124, "", int((time.time() - t0) * 1000), f"{argv[0]}: timeout after {timeout}s", ""
     except Exception as exc:
-        return None, "", int((time.time() - t0) * 1000), f"{argv[0]}: {exc}"
+        return None, "", int((time.time() - t0) * 1000), f"{argv[0]}: {exc}", ""
 
 
 def _is_worker_body(env=None):
@@ -366,7 +379,7 @@ def _meter(action, runner, sweep=None):
     if _is_worker_body():
         return "skipped-worker-body"
     argv = [_METER, action] + ([sweep] if sweep else [])
-    rc, out, _ms, err = runner(argv, 30)
+    rc, out, _ms, err = runner(argv, 30)[:4]  # 5th slot (stderr) unused here
     return None if err is not None else (out or "").strip() or None
 
 
@@ -671,9 +684,25 @@ def _selection(runner):
     """goal-selector.sh candidates. Its wrapper already fails LOUD on the
     g-115-6146 silent-empty signature, so an empty stdout here is its error, not
     a legitimate 'no candidates' -- do not paper over it."""
-    rc, out, _ms, err = runner(["goal-selector.sh"], _STAGE_TIMEOUT_S)
+    # Defensive unpack: _run_bash yields 5 slots (the 5th is the selector's own
+    # stderr, see its docstring), injected runners in tests the historical 4.
+    _res = runner(["goal-selector.sh"], _STAGE_TIMEOUT_S)
+    rc, out, _ms, err = _res[:4]
+    sel_stderr = _res[4] if len(_res) > 4 else ""
     if err is not None:
         return {"count": None, "top": None, "error": err}
+    # RAN AND FAILED is its own case, checked BEFORE the parse. A non-zero selector
+    # prints nothing on stdout, so falling through to json.loads reported every
+    # failure as "unparseable selector output" -- true of the bytes, silent on the
+    # cause. The selector's stderr carries the cause and, for a world that was
+    # never initialized (rc=10), the remedy; 800 chars keeps both its state line
+    # and its remedy line, where the sibling battery's 300 would keep only one.
+    if rc not in (0, None):
+        tail = (sel_stderr or "").strip()[-800:]
+        reason = f"goal-selector.sh exited rc={rc}"
+        if tail:
+            reason += f" | selector stderr: {tail}"
+        return {"count": None, "top": None, "error": reason}
     try:
         d = json.loads(out)
     except Exception as exc:
@@ -747,7 +776,7 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
             argv.append("--apply")
         _crumb(f"-> {stage['key']}")
         _mark_in_flight(stage["key"])
-        rc, out, ms, err = runner(argv, _STAGE_TIMEOUT_S)
+        rc, out, ms, err = runner(argv, _STAGE_TIMEOUT_S)[:4]  # 5th slot unused here
         _crumb(f"   {stage['key']} done rc={rc} {ms}ms")
         _mark_in_flight("")
         row = {"key": stage["key"], "rc": rc, "elapsed_ms": ms, "note": stage["note"]}

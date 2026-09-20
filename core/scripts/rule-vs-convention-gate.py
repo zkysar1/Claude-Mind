@@ -72,7 +72,16 @@ def _load_blocklist() -> list[str]:
 
 
 def _has_exempt_marker(content: str) -> bool:
-    return "domain-leak-exempt:" in content
+    """True when the content CLAIMS the exemption (token opens a comment).
+
+    Anchored via the shared predicate since g-115-10246. The bare substring
+    test this replaced meant any rule or convention that merely DISCUSSED the
+    marker exempted itself from this gate as well — silently, and with nothing
+    to review.
+    """
+    from _domain_leak_marker import claims_exemption
+
+    return claims_exemption(content)
 
 
 def _scan_content(content: str, blocklist: list[str]) -> list[str]:

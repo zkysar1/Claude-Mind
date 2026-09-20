@@ -1,4 +1,4 @@
-"""Tests for core/scripts/domain-leak-commit-gate.py + core/githooks/commit-msg Gate M3 (g-115-10048).
+"""Tests for core/scripts/domain-leak-commit-gate.py + core/githooks/commit-msg Gate M3 ().
 
 The gate's whole value is SCOPE: it must refuse a domain term on a line the
 commit ADDS while never refusing one that was already there. The tree carries a

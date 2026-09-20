@@ -563,3 +563,147 @@ def test_fifth_state_warning_never_blocks_the_claim(capsys):
     result, _ = _evaluate_capturing_stderr(capsys)
     assert result["would_block"] is False
     assert result["reason"] == "no-pin"
+
+
+# ── Declared surfaces: the structured third evidence kind () ────
+#
+# The prose join above matches a registry column written in ARTIFACT nouns
+# against goals titled in OUTCOME language. Measured on the live aged-handoff
+# population 2026-09-18, 5 of 12 rows matched NEITHER column and fell through
+# to the empty-evidence fallback -- a verdict word with nothing behind it.
+# `work_surface` lets the goal declare its own artifact surface in the
+# vocabulary the registry already uses.
+#
+# `_OUT_SURFACE_TITLE` deliberately shares NO word with either column: it is
+# the regression pin for "the prose join cannot reach this goal", so if a
+# future edit makes the title itself matchable these tests stop testing the
+# structured path and one of them fails loudly (the unstamped control below).
+
+_OUT_SURFACE_TITLE = "Wire the greeting flourish to mood so folk read each other"
+
+
+def _surfaced(title, surface, **kw):
+    g = _goal(title, **kw)
+    g["work_surface"] = surface
+    return g
+
+
+def test_a_goal_the_prose_join_cannot_reach_has_no_evidence_without_a_tag(tmp_path):
+    """The control the other tests in this block are measured against.
+
+    This is the state the live population was in: a pin EXISTS, the goal
+    matched neither column, and the gate still answered with a lane word.
+    """
+    res = _evaluate(PIN_AGENT, _goal(_OUT_SURFACE_TITLE), tmp_path)
+    assert res["evidence"] == []
+    assert res["would_block"] is False
+
+
+def test_a_declared_out_of_lane_surface_reaches_a_confident_refusal(tmp_path):
+    res = _evaluate(PIN_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE, "client-scripts"), tmp_path)
+    assert res["would_block"] is True
+    assert res["verdict"] == "out-of-lane"
+    assert "work_surface:client-scripts" in res["evidence"]
+
+
+def test_a_declared_in_lane_surface_reaches_a_confident_allow_with_evidence(tmp_path):
+    """outcome 1's other half: in-lane counts, provided the evidence is real."""
+    res = _evaluate(PIN_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE, "in-session-verification"),
+                    tmp_path)
+    assert res["would_block"] is False
+    assert res["verdict"] == "in-lane"
+    assert res["evidence"] == ["work_surface:in-session-verification"]
+
+
+def test_an_unstamped_goal_is_byte_identical_to_before_the_change(tmp_path):
+    """The over-match control (outcome 3), and the reason the corpus delta is
+    exactly measurable: the structured path contributes NOTHING to a goal that
+    declares nothing, whatever the pin says."""
+    for title in (_OUT_SURFACE_TITLE,
+                  "Refactor the gadget scripts",          # prose out-of-lane
+                  "Run widget sessions for an hour",      # prose in-lane
+                  "Trace capture to storage and analyzers"):  # both columns
+        bare = _evaluate(PIN_AGENT, _goal(title), tmp_path)
+        tagged = _evaluate(PIN_AGENT, _surfaced(title, ""), tmp_path)
+        assert bare == tagged, title
+
+
+def test_a_goal_the_pinned_agent_may_legally_claim_stays_claimable(tmp_path):
+    """outcome 3 stated positively: adding the mechanism must not refuse work
+    the pin GRANTS. An in-lane goal is unaffected whether or not it declares a
+    surface, and declaring an in-lane surface never blocks."""
+    legal = _goal("Run widget sessions and verify a clean boot")
+    assert _evaluate(PIN_AGENT, legal, tmp_path)["would_block"] is False
+    tagged = _surfaced("Run widget sessions and verify a clean boot",
+                       "in-session-verification")
+    assert _evaluate(PIN_AGENT, tagged, tmp_path)["would_block"] is False
+
+
+def test_a_declared_surface_matches_EXACTLY_not_by_substring(tmp_path):
+    """The tag must not inherit the prose matcher's false-positive surface.
+    'client' is a genuine out-of-lane TOKEN, so a substring join would fire on
+    'client-onboarding' -- which is not the artifact the pin names."""
+    res = _evaluate(PIN_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE, "client-onboarding"), tmp_path)
+    assert res["evidence"] == []
+    assert res["would_block"] is False
+
+
+def test_hyphen_and_space_are_equivalent_across_the_join(tmp_path):
+    """The registry writes prose ('client scripts'); a tag is written as one
+    token ('client-scripts'). Neither side changes for the other."""
+    res = _evaluate(PIN_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE, "client scripts"), tmp_path)
+    assert res["would_block"] is True
+    assert "work_surface:client scripts" in res["evidence"]
+
+
+def test_a_composite_goal_declaring_both_surfaces_is_ambiguous_and_allowed(tmp_path):
+    """A goal whose BUILD leg is out of lane and whose VALIDATION leg is in
+    lane is genuinely both. The pin does not settle it, and the existing
+    ambiguous posture -- allow -- is correct: a false refusal wedges a claim."""
+    res = _evaluate(PIN_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE,
+                              "client-scripts, in-session-verification"),
+                    tmp_path)
+    assert res["would_block"] is False
+    assert res["verdict"] == "ambiguous"
+    assert "work_surface:client-scripts" in res["evidence"]
+    assert "work_surface:in-session-verification" in res["evidence"]
+
+
+def test_a_surface_absent_from_the_registry_contributes_nothing(tmp_path):
+    res = _evaluate(PIN_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE, "quantum-widgetry"), tmp_path)
+    assert res["evidence"] == []
+    assert res["would_block"] is False
+
+
+@pytest.mark.parametrize("junk", [123, {"a": 1}, [], [None], "", "   ", None,
+                                  ["client-scripts"]])
+def test_a_junk_or_list_valued_surface_never_raises(tmp_path, junk):
+    """Fail-open posture (requirement 3): a malformed tag must never wedge a
+    claim. The list form is included because it is a legitimate shape, not
+    junk -- it must still produce the refusal."""
+    g = _goal(_OUT_SURFACE_TITLE)
+    g["work_surface"] = junk
+    res = _evaluate(PIN_AGENT, g, tmp_path)
+    assert res["would_block"] is (junk == ["client-scripts"])
+
+
+def test_a_declared_surface_alone_classifies_a_goal_with_no_text(tmp_path):
+    """The early `not haystack` bail used to discard a goal with no title.
+    A declared surface IS classifiable material, so the bail now needs both
+    to be empty."""
+    res = _evaluate(PIN_AGENT, _surfaced("", "client-scripts"), tmp_path)
+    assert res["would_block"] is True
+    assert res["evidence"] == ["work_surface:client-scripts"]
+
+
+def test_the_declared_surface_path_is_inert_for_an_unpinned_agent(tmp_path):
+    res = _evaluate(OTHER_AGENT,
+                    _surfaced(_OUT_SURFACE_TITLE, "client-scripts"), tmp_path)
+    assert res["would_block"] is False
+    assert res["verdict"] == "no-pin"

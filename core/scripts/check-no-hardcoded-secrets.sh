@@ -147,6 +147,36 @@ if [[ "$MODE" == "untracked" ]]; then
     done < <(find agents/*/temp -maxdepth 1 -name '.*' -type f                   -printf '%p|%s|%m|%TY-%Tm-%Td
 ' 2>/dev/null | sort)
 
+    # PER-DIR COVERAGE (g-115-9947, zeta/cc-02 leg 2026-09-20). The verdict below
+    # is a PER-BOX reading of a READ-THROUGH-CACHED surface, and without this it
+    # does not say so: `agents/*/temp/` materialises lazily under own-cloud, so a
+    # box that has never pulled a peer's temp globs an absent or bare directory
+    # and folds it into one fleet-shaped "CLEAN" sentence. Measured on cc-02:
+    # foxtrot/temp ABSENT entirely, alpha+bravo+echo at exactly 1 entry (their
+    # tracked .gitkeep), zeta at 79 — so 16 of 17 scanned files were one agent's,
+    # and neither named instance on this goal's record was disposable from here.
+    # That is the SAME composition defect this mode was built to close, one level
+    # up: a confident clean over a population the instrument never had. Emitting
+    # presence + count per dir makes "peer is clean" and "peer is not here"
+    # distinguishable, which is what lets a fleet claim be the union of box runs.
+    # Present dirs get a row each; absent ones are named together on one line.
+    # Every dir is still NAMED — summarising is not hiding, and an unnamed
+    # absence is the thing this block exists to prevent.
+    coverage=""
+    _absent=""
+    for _agent_dir in agents/*/; do
+        _a="$(basename "$_agent_dir")"
+        if [[ -d "${_agent_dir}temp" ]]; then
+            _n=$(find "${_agent_dir}temp" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
+            coverage+="    ${_a}: present, ${_n} entr$([[ "$_n" -eq 1 ]] && echo y || echo ies)"$'\n'
+        else
+            _absent+="${_absent:+, }${_a}"
+        fi
+    done
+    if [[ -n "$_absent" ]]; then
+        coverage+="    NOT SCANNED HERE (no temp dir on this box — says NOTHING about their residue): ${_absent}"$'\n'
+    fi
+
     # ANTI-VACUITY. "no credential-shaped residue" is satisfied perfectly by a
     # scan that enumerated NOTHING — a moved temp root, a renamed agents dir, or
     # a find that errored all produce the identical clean exit. A population of
@@ -160,11 +190,15 @@ if [[ "$MODE" == "untracked" ]]; then
     fi
 
     if [[ "$hits" -eq 0 ]]; then
-        echo "[secret-scanner] --scan-untracked CLEAN: ${scanned} dotfile(s) under agents/*/temp/, none credential-shaped by name."
+        echo "[secret-scanner] --scan-untracked CLEAN on THIS BOX: ${scanned} dotfile(s) under agents/*/temp/, none credential-shaped by name."
+        echo "  Coverage (a fleet claim is the union of per-box runs, never one of them):"
+        printf '%s' "$coverage"
         exit 0
     fi
 
-    echo "[secret-scanner] --scan-untracked: ${hits} credential-shaped of ${scanned} dotfile(s) under agents/*/temp/"
+    echo "[secret-scanner] --scan-untracked: ${hits} credential-shaped of ${scanned} dotfile(s) under agents/*/temp/ ON THIS BOX"
+    echo "  Coverage (a fleet claim is the union of per-box runs, never one of them):"
+    printf '%s' "$coverage"
     printf '%s' "$report"
     echo "  NOTE: metadata only — this mode reads no file content, by construction."
     echo "  NOTE: this box's view only. agents/<agent>/temp/ is nominally fleet-synced"

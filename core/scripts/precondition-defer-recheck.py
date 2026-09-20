@@ -28,6 +28,20 @@ When the pre-filtered list is non-empty, evaluate via predicate.evaluate_all
 in-process (not a subprocess). In-process avoids the CLI-exit-code-0-on-empty
 collision.
 
+UNCOVERED-GATE GUARD (g-115-10231). Passing every structured predicate is
+necessary but NOT sufficient to clear. This sweep SELECTS on the defer TEXT
+and TESTS `verification.preconditions`, and those are two different things:
+when the structured preconditions were satisfied long ago and a LATER defer
+cites a gate never added to that list, "all pass" answers a question nobody
+asked and the clear destroys a live protection. So before clearing, every
+goal-id token in the defer text must be mentioned somewhere in the structured
+predicates; any that is not makes the goal a SKIP with
+`action: "skipped"`, an explicit reason, and `uncovered_gate_refs`. A detail
+row carrying BOTH `all_passed: true` and a non-empty `uncovered_gate_refs`
+is precisely a defer the pre-fix sweep would have wrongly cleared, so the
+sweep now measures its own former error rate on every run. Fails CLOSED: an
+unrecognised reference means do not clear.
+
 Dry-run by default; --apply clears via the typed daemon client
 (_rt.aspirations_update_goal), which is the live write path.
 
@@ -46,6 +60,9 @@ Exit: always 0 (reporting tool). JSON output:
     "eligible": N,            # defer_reason set + precondition_unmet: prefix + age >= threshold
     "evaluated": N,           # had structured preconditions to evaluate
     "skipped_free_form": N,   # had no structured preconditions (free-form defer)
+    "skipped_uncovered_gate": N,  # all predicates passed, but the defer text
+                                  # named a gate none of them mentions
+                                  # () — the pre-fix wrong-clear count
     "cleared": N,             # actually cleared (apply only)
     "would_clear": [goal_ids],# dry-run list
     "details": [...],         # per-goal reasoning
@@ -60,6 +77,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 # import subprocess  # removed with _run/_py ()
 import sys
 from pathlib import Path
@@ -77,6 +95,88 @@ import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 from _paths import WORLD_DIR  # noqa: E402
 from _fileops import locked_append_jsonl  # noqa: E402
 from predicate import evaluate_all  # noqa: E402
+
+
+# --- Uncovered-gate guard () ------------------------------------
+#
+# DELIBERATELY BROADER THAN defer-recheck._extract_dep_ids, AND NOT SHARED WITH
+# IT. That extractor answers "which goal-ids is this defer DEPENDENT on?" and is
+# tuned to EXCLUDE incidental mentions (a parenthetical "( sibling
+# pattern)" is correctly dropped from a dependency list). Here the question is
+# the opposite polarity — "is there anything in this defer text that the
+# structured predicates might not cover?" — and it gates a DESTRUCTIVE write
+# (clearing a defer destroys a protection; nothing restores it). guard-2486: do
+# not reuse one predicate across a reversible read and a destructive
+# invalidation. Inheriting the extractor's exclusions here would mean the ids it
+# deliberately drops are exactly the ids that slip through to the clear path,
+# which is the defect this guard exists to stop. So: match ANY goal-id token,
+# accept over-matching, and pay for it only in extra SKIPS — never in extra
+# clears.
+#
+# The suffix group is `[a-z]+`, not `[a-z]`: a single letter TRUNCATES an
+# id like `-fixture` to `-f`, which both mangles the id shown
+# to the operator in `uncovered_gate_refs` and makes the token disagree with
+# the same id read off a predicate.
+_DEFER_GID_RE = re.compile(r"g-\d+-\d+(?:-[a-z]+)?", re.IGNORECASE)
+
+
+def _gid_tokens(text):
+    """The set of goal-id tokens in `text`, lowercased. One tokenizer, used on
+    BOTH sides of every comparison in this module (rb-11386)."""
+    return {m.group(0).lower() for m in _DEFER_GID_RE.finditer(text or "")}
+
+
+def _uncovered_gate_refs(reason, struct_pcs, self_id):
+    """Goal-ids named in the defer TEXT that no structured precondition mentions.
+
+    Coverage is tested against the JSON serialisation of the structured
+    predicates, so it catches the id wherever it lives on a predicate
+    (`goal_id`, `after_ref`, `id`, a nested arg) without this function having
+    to know the predicate schema — which would be a second place to keep in
+    sync with predicate.py.
+
+    BOTH SIDES ARE TOKENIZED, AND THE COVERED SIDE IS A SET, NOT A STRING
+    (g-115-10365 — fresh-eyes finding on g-115-10231's own fix). A raw
+    `id in json_blob` substring test has no trailing-digit boundary, so a defer
+    naming a SHORT id reads as covered whenever the predicates happen to
+    mention any LONGER id it prefixes — measured: defer names `g-115-1`,
+    predicates carry only the unrelated `g-115-1364`, result `[]`, clear
+    proceeds. That is guard-4516's boundary defect and guard-2362's
+    container-type defect at once, and it fails OPEN in a DESTRUCTIVE write
+    path — the exact polarity rb-11386 warns about, on the coverage side of
+    the same comparison whose defer side rb-11386 came from. Membership in a
+    token SET has the boundary built in.
+
+    The goal's OWN id is never uncovered: a defer that names the goal it sits
+    on is describing itself, not a gate.
+    """
+    try:
+        covered_blob = json.dumps(struct_pcs, sort_keys=True, default=str)
+    except Exception:  # noqa: BLE001 — unserialisable predicate: assume nothing covered
+        covered_blob = ""
+    covered = _gid_tokens(covered_blob)
+    # Normalise the OWN id through the SAME tokenizer used on the defer text.
+    # Comparing a raw id string against an extracted token is an asymmetric
+    # match and it fails open in the dangerous direction: any id the regex
+    # matches only a PREFIX of (an unexpected suffix form) never equals the raw
+    # string, so the goal's own id reads as a foreign gate. Caught by this
+    # change's own test — one tokenizer on both sides is the invariant
+    # (the filter-predicate-divergence class, rb-301).
+    _own_m = _DEFER_GID_RE.search(self_id or "")
+    own = (_own_m.group(0) if _own_m else (self_id or "")).lower()
+    # NOTE: the fallback keeps an unparseable id comparable AS ITSELF rather
+    # than collapsing to "" — an empty own-id matches no token and would
+    # silently re-open the self-reference hole.
+    out, seen = [], set()
+    for m in _DEFER_GID_RE.finditer(reason or ""):
+        gid = m.group(0)
+        low = gid.lower()
+        if low == own or low in seen:
+            continue
+        seen.add(low)
+        if low not in covered:
+            out.append(gid)
+    return out
 
 
 # --- Metrics logging (mirrors defer-recheck.py — rb-468 family) -------------
@@ -238,6 +338,7 @@ def main():
     eligible = 0
     evaluated = 0
     skipped_free_form = 0
+    skipped_uncovered_gate = 0
     cleared = 0
     would_clear = []
     details = []
@@ -311,7 +412,62 @@ def main():
             })
             continue
 
-        # All structured predicates pass — clearable.
+        # All structured predicates pass — but that is not yet a licence to
+        # clear. THE SELECTION KEY AND THE TESTED PREDICATE ARE TWO DIFFERENT
+        # THINGS (): this sweep selects on the defer TEXT's
+        # `precondition_unmet:` prefix and then tests `verification.
+        # preconditions`. When a goal's structured preconditions were satisfied
+        # long ago and a LATER defer cites a NEW gate that was never added to
+        # that list, "all pass" is true of a question nobody asked, and the
+        # clear destroys a live protection while leaving its gate untouched.
+        # Measured on  (, a boosted closing lane): its one
+        # structured precondition was discharged 2026-09-16, a 2026-09-17 defer
+        # named  (still pending), and by 2026-09-18 the defer was gone.
+        # That goal's remaining outcome needs a BILLED live vessel against a
+        # channel that is still wrong on main, so the wrongly-cleared defer
+        # converts a protected gate into a paid run with a guaranteed-misleading
+        # result.
+        #
+        # THIS IS DELIBERATELY A SKIP, NOT A NARROWER CLEAR (guard-3628 — "the
+        # sweep decided not to act" must be distinguishable from "the sweep
+        # failed to catch it", so it is reported with its own action, reason and
+        # the offending refs). The REJECTED alternative was remedy (b): require
+        # the defer text to name a precondition ID carried by the structured
+        # list, treating an unfindable name as free-form. Rejected because it
+        # silently re-classifies every defer written before that convention
+        # existed — which is all of them — turning a targeted safety skip into a
+        # blanket one, and because it makes the SAFE behaviour depend on authors
+        # adopting a new id-citation habit, i.e. it fails open on exactly the
+        # inattention that produced the defect. This remedy fails CLOSED instead:
+        # an unrecognised reference means do not clear. Do not re-litigate.
+        #
+        # The entry below is also the standing measurement for how often the old
+        # predicate would have been wrong: a detail row carrying BOTH
+        # all_passed=true AND a non-empty uncovered_gate_refs is, exactly, a
+        # defer the pre-fix sweep would have cleared.
+        uncovered = _uncovered_gate_refs(reason, struct_pcs, g.get("id"))
+        if uncovered:
+            skipped_uncovered_gate += 1
+            details.append({
+                "goal_id": g["id"],
+                "source": g["_source"],
+                "age_hours": round(age_h, 1),
+                "action": "skipped",
+                "reason": ("all %d structured predicate(s) pass, but the defer "
+                           "text names %s which no structured precondition "
+                           "mentions — the tested gate is not the named gate, "
+                           "so clearing would destroy an untested protection "
+                           "(g-115-10231)"
+                           % (len(struct_pcs), ", ".join(uncovered))),
+                "struct_pc_count": len(struct_pcs),
+                "all_passed": True,
+                "uncovered_gate_refs": uncovered,
+                "would_have_cleared_pre_fix": True,
+            })
+            continue
+
+        # All structured predicates pass AND the defer names no gate outside
+        # them — clearable.
         entry = {
             "goal_id": g["id"],
             "source": g["_source"],
@@ -356,6 +512,7 @@ def main():
         "eligible": eligible,
         "evaluated": evaluated,
         "skipped_free_form": skipped_free_form,
+        "skipped_uncovered_gate": skipped_uncovered_gate,
         "would_clear_count": len(would_clear),
         "cleared": cleared,
         "apply": args.apply,
@@ -368,6 +525,7 @@ def main():
         "eligible": eligible,
         "evaluated": evaluated,
         "skipped_free_form": skipped_free_form,
+        "skipped_uncovered_gate": skipped_uncovered_gate,
         "cleared": cleared,
         "would_clear": would_clear,
         "details": details,
@@ -378,6 +536,7 @@ def main():
     if args.output == "human":
         print(f"scanned={scanned} eligible={eligible} evaluated={evaluated} "
               f"skipped_free_form={skipped_free_form} "
+              f"skipped_uncovered_gate={skipped_uncovered_gate} "
               f"would_clear={len(would_clear)} cleared={cleared}")
         for d in details:
             print(f"  {d['goal_id']}: {d['action']} ({d.get('reason','')})")

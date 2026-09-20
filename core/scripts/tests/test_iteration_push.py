@@ -2181,3 +2181,76 @@ def test_a_foreign_lock_never_reaches_the_self_held_branch(tmp_path):
         assert expect in out, (flags, out)
         assert "held by THIS session" not in out, (flags, out)
         assert _tip(a) == before, (flags, out)
+
+
+# --- the refusal text reaches the reader () -----------------------
+
+def _refusing_pre_commit_hook(repo, text):
+    """Install a pre-commit hook that REFUSES, printing `text` on stderr.
+
+    A real hook refusal is the case that motivated this: the framework's own
+    check-no-hardcoded-secrets.sh rejected ONE line of the acting agent's
+    untracked experience record, and nothing it said ever reached a human.
+    """
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text(f'#!/bin/sh\necho "{text}" >&2\nexit 1\n',
+                    encoding="utf-8", newline="\n")
+    hook.chmod(0o755)
+    return hook
+
+
+def test_selfheal_commit_refusal_text_reaches_the_log_and_is_not_read_as_the_dirty_defer(tmp_path):
+    """. The self-heal's pathspec-limited commit ran `-q ... 2>/dev/null`,
+    so a pre-commit HOOK refusal produced two adjacent lines that read as one
+    causal statement:
+
+        self-heal: pathspec-limited commit of self-namespace churn failed - defer
+        merge DEFERRED (rc=1) - git blocked on: <dirty CROSS-AGENT paths>
+
+    The second names what git called dirty; the first names a commit that failed
+    for an unrelated reason. Measured 2026-09-18 on cc-03: integrate deferred
+    21:04->21:26 (behind 4->19) and a HIGH escalation goal was filed against a
+    partner's queue whose three files were all provably mergeable. The
+    misattribution points AWAY from the acting agent -- least likely to be
+    checked, and its stated remedy (clear the named path) is destructive on a
+    partner's unpushed work.
+    """
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, ".gitattributes",
+                 "agents/*/health/*.jsonl merge=union\n", "attrs")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+    _seed_and_sync(a, b, {"agents/alpha/health/day.jsonl": "base\n"})
+    _commit_file(b, "agents/alpha/health/day.jsonl", "base\nfrom-b\n",
+                 "advance alpha ledger")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "core/scripts/qux.sh", "echo\n", "A: framework work")
+    (a / "agents/alpha/health/day.jsonl").write_text(
+        "base\nlocal-append\n", encoding="utf-8", newline="\n")
+
+    needle = "REFUSED-BY-HOOK-secret-on-line-12"
+    hook = _refusing_pre_commit_hook(a, needle)
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, f"a refused self-heal commit must still defer: {out}"
+    assert needle in out, (
+        "the hook's own refusal text is the ONLY thing that says why the commit "
+        f"failed, and it must reach the reader: {out}"
+    )
+    assert "pathspec-limited commit of self-namespace churn failed" in out, out
+    assert "SEPARATE STATEMENT" in out, (
+        "the defer line must say it is not the dirty-path block reported after "
+        f"it — that adjacency is what caused the misattribution: {out}"
+    )
+
+    # NEGATIVE CONTROL (guard-3534). Everything above passes just as happily if
+    # the needle leaked from somewhere else, or if this shape never reaches the
+    # self-heal commit at all. Remove ONLY the hook and the same run must heal.
+    hook.unlink()
+    r2 = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, f"control failed — the shape must heal without the hook: {out2}"
+    assert needle not in out2, "control failed — the needle came from somewhere other than the hook"
+    assert "committing 1 SELF-namespace file(s) pre-merge" in out2, out2

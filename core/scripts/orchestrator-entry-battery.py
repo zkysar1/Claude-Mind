@@ -65,8 +65,40 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 # Registry: file-presence checks + WM-slot checks, in orchestrator entry order.
-# kind: "file" (path relative to agent_state_dir) or "wm_slot" (non-null = actionable).
+# kind: "file" (path relative to agent_state_dir), "wm_slot" (non-null =
+# actionable), or "init_markers" (any tier's .initialized ABSENT = actionable).
 ENTRY_CHECKS = [
+    # FIRST, because nothing below it means anything in a world that was never
+    # initialized. State RUNNING is set by /start, which then CHAINS into boot,
+    # whose Phase -2 runs the init scripts -- so "RUNNING" and "initialized" are
+    # two facts joined only by a model following that chain. Measured 2026-09-19
+    # on a served loop: the model loaded boot, answered with text, and the Stop
+    # hook's uniform re-entry sent every later turn into THIS loop in a world
+    # with no meta tier. This battery ran each turn and said nothing; the selector
+    # then failed 9 of 9. The markers are the right discriminator because the
+    # init scripts WRITE them (guard-6982: never infer "it started" from
+    # scaffolding -- the vessel recipe pre-creates the empty directories).
+    #
+    # WHY THE DISPATCH IS ONE SCRIPT AND NOT Skill(boot). Boot was already loaded
+    # once in the measured run, so a second invocation meets the skill-dedup door
+    # on either harness, and re-walking its full status report is the path that
+    # had just failed. The one call below is boot's own Phase -2 body, verbatim.
+    # guard-1867 applied honestly: running a skill's step inline skips whatever
+    # else that skill writes. Boot's OTHER unconditional write is Phase -1
+    # (persona) and this row does NOT reproduce it -- same run: 0 persona writes.
+    # That is a different fact with a different sensor, owned by , not
+    # folded in here on a marker predicate that does not measure it.
+    {
+        "name": "world_not_initialized",
+        "kind": "init_markers",
+        "phase": "boot -2",
+        "skill_section": (
+            "boot/SKILL.md Phase -2 (State Initialization): run "
+            "`bash core/scripts/init-mind.sh $MIND_AGENT` NOW, before the precheck "
+            "and the selector — idempotent and additive-only (seeds what is missing, "
+            "never overwrites). The selector cannot run without the meta tier it creates"
+        ),
+    },
     {
         "name": "pending_agents",
         "kind": "file",
@@ -134,6 +166,26 @@ PROTOCOL_FOOTER = (
 
 def _now_iso() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _init_marker_paths(agent: str) -> dict:
+    """{tier: Path | None} for the three `.initialized` markers.
+
+    These are the SAME local files init-world.sh / init-agent.sh / init-meta.sh
+    gate on, so this check and the remedy it dispatches can never disagree about
+    what "initialized" means (guard-5647). None means the tier's root did not
+    RESOLVE -- a different fact from "the marker is missing", kept apart so an
+    unconfigured box reads as BLIND and never as a false dispatch.
+
+    A module-level function so tests patch ONE seam instead of three imports.
+    """
+    from _paths import META_DIR, WORLD_DIR, agent_dir  # type: ignore
+
+    return {
+        "world": (Path(WORLD_DIR) / ".initialized") if WORLD_DIR else None,
+        "agent": (Path(agent_dir(agent)) / ".initialized") if agent else None,
+        "meta": (Path(META_DIR) / ".initialized") if META_DIR else None,
+    }
 
 
 def _payload_str(payload) -> str:
@@ -290,7 +342,22 @@ def run(agent_override: str | None, wm_path_override: str | None, as_json: bool)
 
     for spec in ENTRY_CHECKS:
         try:
-            if spec["kind"] == "file":
+            if spec["kind"] == "init_markers":
+                markers = _init_marker_paths(agent)
+                unresolved = sorted(t for t, p in markers.items() if p is None)
+                if unresolved:
+                    # Cannot evaluate != clean (guard-4093). Dispatching init on a
+                    # box whose roots do not resolve would be a false positive.
+                    report["blind"].append({
+                        "name": spec["name"], "phase": spec["phase"],
+                        "reason": f"tier root unresolved: {', '.join(unresolved)}"})
+                    continue
+                missing = sorted(t for t, p in markers.items() if not p.exists())
+                if not missing:
+                    continue
+                payload = {"missing": missing,
+                           "present": sorted(t for t in markers if t not in missing)}
+            elif spec["kind"] == "file":
                 p = state_dir / spec["rel"]
                 if p.exists():
                     payload = {"path": str(p), "mtime": _dt.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")}

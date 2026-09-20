@@ -495,8 +495,17 @@ def _has_domain_leak_exempt_marker(content: str) -> bool:
     This mirrors the convention used by core/scripts/domain-leak-check.sh
     (PostToolUse leak scanner) so a single marker exempts a file from BOTH
     the leak scanner AND the seed transformation chain.
+
+    That mirror is why this call site is ANCHORED too (g-115-10246). The
+    scanner's predicate now requires the token to OPEN A COMMENT; leaving this
+    one an unanchored substring would silently break the stated equivalence in
+    the direction that matters most here — a file whose prose merely names the
+    marker would keep skipping every sweeping transform while the scanner had
+    already stopped exempting it.
     """
-    return "domain-leak-exempt:" in content
+    from _domain_leak_marker import claims_exemption
+
+    return claims_exemption(content)
 
 
 def transform_file(

@@ -97,8 +97,8 @@ re-reading.
   #     `core/config/fresh-eyes-shard-readings.md` — APPEND THERE, never here (this
   #     file is over its injection ceiling; g-115-6690).
   #     ⚠ THE PROBE'S THREE BRANCHES ARE LOAD-BEARING AND MUST STAY BYTE-IDENTICAL.
-  #     Do NOT "simplify" them into a single union regex, do NOT drop the `-vi`, and do
-  #     NOT take the max WITHIN a row (branch 3 takes the FIRST `N=` per row). Each of
+  #     Do NOT union the branches, drop `-vi`, take the max WITHIN a row (branch 3's awk
+  #     takes the FIRST `N=`), or re-anchor branch 3 on `^[^N]*` (g-115-10215). Each of
   #     those returns a wrong-but-WELL-FORMED N, which reads as plausible rather than as
   #     an error. Every one is measured, with the numbers and the shards it broke, in
   #     `core/config/rationale/fresh-eyes-series-index-probe.md` — read it BEFORE
@@ -115,7 +115,7 @@ re-reading.
   #     ⚠ FAIL LOUD, NEVER FALL BACK TO THE MIRROR. A failed authoritative read means N
   #     is unallocatable this pass; silently re-reading $WORLD_PATH restores the SOURCE
   #     defect at precisely the moment it is most likely to bite.
-  Bash: source core/scripts/_paths.sh && P="world/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; S="$(mktemp)"; bash core/scripts/backend-cat.sh cat "$P" > "$S" 2>/dev/null || { echo "FATAL: authoritative read of $P failed — N is UNALLOCATABLE this pass. Do NOT fall back to \$WORLD_PATH (g-115-8055)."; rm -f "$S"; exit 1; }; test -s "$S" || { echo "FATAL: authoritative read returned 0 bytes — refusing to allocate N from an empty file."; rm -f "$S"; exit 1; }; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | grep -E '^\|' | sed -nE 's/^[^N]*(N=[0-9]+).*/\1/p'; } | grep -oE '[0-9]+' | sort -n | tail -1; rm -f "$S"
+  Bash: source core/scripts/_paths.sh && P="world/knowledge/tree/system/directive-lane-compliance/directive-lane-series-$MIND_AGENT.md"; S="$(mktemp)"; bash core/scripts/backend-cat.sh cat "$P" > "$S" 2>/dev/null || { echo "FATAL: authoritative read of $P failed — N is UNALLOCATABLE this pass. Do NOT fall back to \$WORLD_PATH (g-115-8055)."; rm -f "$S"; exit 1; }; test -s "$S" || { echo "FATAL: authoritative read returned 0 bytes — refusing to allocate N from an empty file."; rm -f "$S"; exit 1; }; { grep -E '^#{1,4} ' "$S" | grep -viE 'handoff to N=' | grep -oE 'N=[0-9]+'; grep -oE '^\| \*\*N=[0-9]+' "$S"; grep -viE 'handoff to N=' "$S" | grep -E '^\|' | awk 'match($0, /N=[0-9]+/) { print substr($0, RSTART, RLENGTH) }'; } | grep -oE '[0-9]+' | sort -n | tail -1; rm -f "$S"
   #     ⚠ POSITIVE-CONTROL WHATEVER THIS PROBE RETURNS (guard-2421) against a shard
   #     whose N you have confirmed FROM THE ROWS — and NOT against the shard-index
   #     table, a hand-maintained prose cell with no writer and no check that produced a

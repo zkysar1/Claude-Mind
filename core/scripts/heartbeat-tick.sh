@@ -455,6 +455,26 @@ bash "$(dirname "$0")/team-state-update.sh" \
     --field "agent_status.$MIND_AGENT.last_active" \
     --value "\"$(date +%Y-%m-%dT%H:%M:%S)\"" || true
 
+# ── Host identity (). `box` had NO PRODUCER fleet-wide: measured null
+# on every agent row while `last_active` on the SAME row was fresh, so the store
+# was healthy and this one field simply had nothing writing it. A null box reads
+# as "no constraint" to every consumer, so locus-bound goals look routable right
+# up until an agent claims one it cannot run — silent and one-directional.
+# SHORT hostname, VERBATIM CASE: locus-sweep's box_profile does
+# host.split(".")[0] and lowercases BOTH sides at compare time
+# (locus-sweep.py:252/257), so an FQDN written here would miss every `box:`
+# token and report a confident zero — the one answer nobody re-checks.
+# COST, stated rather than hidden: team-state-update.sh takes ONE --field per
+# call, so this is a second daemon round trip per tick. Written every tick
+# rather than once per session deliberately: the value is static per process,
+# but re-writing is what makes it self-healing when an agent moves boxes, and a
+# conditional write would need a read first, which is not cheaper.
+_box_host="${HOSTNAME:-$(hostname 2>/dev/null)}"
+_box_host="${_box_host%%.*}"
+bash "$(dirname "$0")/team-state-update.sh" \
+    --field "agent_status.$MIND_AGENT.box" \
+    --value "\"${_box_host:-unknown}\"" || true
+
 # Live_phase mirror from execution-diary tail. The `|| true` below is the
 # SINGLE fail-open boundary for this signal — DO NOT add internal fallbacks
 # inside live-phase-emit.sh. Failures there must crash loudly so stderr

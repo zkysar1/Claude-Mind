@@ -406,6 +406,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--dry-run", action="store_true",
                     help="enumerate + size the archive, upload nothing")
+    ap.add_argument("--print-target", action="store_true",
+                    help="resolve and print the [target] line, then exit — no "
+                         "enumeration, no hashing (the read-only probe)")
     ap.add_argument("--prefix", default="cold-snapshots",
                     help="key prefix under the env root (default: cold-snapshots)")
     ap.add_argument("--include-archives", action="store_true",
@@ -431,6 +434,26 @@ def main() -> int:
                   "files": 0, "unreadable": 0, "source_bytes": 0}
         _emit(result, args.output, [])
         return 2
+
+    if args.print_target:
+        # STOP HERE. The [target] line is already on stderr above, resolved by
+        # the pure resolve_cold_target() -- no read, no request, no hash. Every
+        # caller that only wants to know WHERE the archive would go (a status
+        # probe, a provisioning verification) belongs on this path.
+        #
+        # WHY THIS FLAG EXISTS (, measured by foxtrot on LAPTOP-3IOFCNEO):
+        # callers used `--dry-run` for exactly that and paid build_manifest()
+        # below, whose own comment budgets 10-25s per box. It measured >630s and
+        # was still running when killed -- 25-60x over budget, scaling with the
+        # working set, so it degrades worst on the boxes holding the most data.
+        # `grep -m1` does NOT bound it: command substitution waits for the whole
+        # pipeline, and a producer spending ten minutes hashing never writes
+        # again, so it never takes the SIGPIPE that would end it.
+        # That made `owncloud-endpoint-flip.sh --status` -- advertised as the
+        # SAFE READ-ONLY query, and prescribed by  as the way to verify
+        # a flip -- unrunnable on a large box, leaving an operator who flips with
+        # no working readback.
+        return 0
 
     if args.dry_run:
         # Enumerate only -- no archive is produced, so there is nothing for the

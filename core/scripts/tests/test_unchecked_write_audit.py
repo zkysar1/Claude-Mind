@@ -218,3 +218,36 @@ def test_live_run_reports_a_margin(uwa):
     assert "generous_band" in d
     assert d["population"]["call_sites"] > 0
     assert d["verdict"] in ("CONFIRMED", "CORRECTED")
+
+
+def test_longer_wrapper_name_is_not_a_shorter_one(uwa):
+    """REGRESSION: `verified-wm-set.sh` is NOT a `wm-set.sh` call site ().
+
+    Six of the seven INVOKE_PATTERNS carry greedy, left-UNANCHORED prefixes
+    (`\\S*`, `(?:bash\\s+\\S*)?`), so before the `(?<![A-Za-z0-9_.-])` lookbehind
+    a wrapper name that was merely the SUFFIX of a longer name matched. Measured
+    over the live corpus: 12 false sites, 11 of them `verified-wm-set.sh` scored
+    as `wm-set.sh` -- which pinned a fleet-shared ratchet at REGRESSED against a
+    baseline it could never reach, and the correction was mistaken for real drift
+    for days. The seventh pattern (`^\\s*%(name)s\\s`) deliberately has no
+    lookbehind because `^\\s*` already pins its left edge.
+
+    The positive control at the end is load-bearing, not decoration: without it
+    this test passes just as happily against an `invokes` that never matches
+    anything, which is the failure direction a purely-negative assertion cannot
+    see.
+    """
+    for line, shorter in (
+        ("Bash: bash core/scripts/verified-wm-set.sh force_tree_maintain", "wm-set.sh"),
+        ("echo 'null' | Bash: verified-wm-set.sh force_evolution_finalize", "wm-set.sh"),
+        ("Bash: `echo 'null' | verified-wm-set.sh pending_phase_6_spark`", "wm-set.sh"),
+        ("echo '{}' | Bash: agent-aspirations-add-goal.sh asp-001",
+         "aspirations-add-goal.sh"),
+    ):
+        assert not uwa.invokes(line, shorter), f"prefix-extension matched: {line}"
+
+    # Positive control -- the genuine invocations must STILL be call sites.
+    assert uwa.invokes("Bash: bash core/scripts/wm-set.sh loop_state", "wm-set.sh")
+    assert uwa.invokes("echo 'null' | Bash: wm-set.sh loop_state", "wm-set.sh")
+    assert uwa.invokes("echo '{}' | Bash: aspirations-add-goal.sh asp-001",
+                       "aspirations-add-goal.sh")

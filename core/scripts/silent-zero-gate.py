@@ -43,8 +43,10 @@ permission system, and the Bash matcher carries sibling DENY gates
 uncommitted) whose refusals protect real invariants. Handing out an allow here
 could suppress theirs. Denying keeps this gate's message reaching the model
 without touching any sibling's verdict. The measured cost is small: the
-predicate fires on 98 of 102,856 calls (0.10%), and `SILENT_ZERO_GATE_OVERRIDE`
-clears any genuine false positive in one token.
+predicate fires on 98 of 102,856 calls (0.10%), and
+`SILENT_ZERO_GATE_OVERRIDE="<reason>"` clears any genuine false positive in one
+assignment. The quoted reason is required (g-115-10247): a bare mention of the
+token used to suppress, so documenting the hatch disarmed the gate.
 
 Fail-open contract (CRITICAL -- do not change without revisiting the trade):
 any parse/IO/logic error -> approve. A broken gate is recoverable; a
@@ -94,7 +96,8 @@ def build_reason(idioms) -> str:
         "first commit and still produced this incident class. Moving the "
         "message does not help; reading the status does.\n"
         "If the default is genuinely intended (the wrapper prints nothing on "
-        "success), put {} anywhere in the command to bypass.\n"
+        "success), prefix the command with {}=\"your reason\" to bypass. A bare "
+        "mention of the token in a comment does NOT bypass (g-115-10247).\n"
         "See g-318-80 and .claude/rules/verify-before-assuming.md."
     ).format(OVERRIDE_TOKEN)
     return head + body + tail
@@ -135,7 +138,8 @@ def build_shape_reason(idioms) -> str:
         "refused.\n"
         "If the wrapper genuinely interleaves non-JSON on success, put "
         + OVERRIDE_TOKEN
-        + " anywhere in the command to bypass.\n"
+        + '="your reason" prefixed to the command to bypass. A bare mention of'
+        + " the token in a comment does NOT bypass (g-115-10247).\n"
         "See g-115-5343, guard-3052, and .claude/rules/verify-before-assuming.md."
     )
     return head + body + tail

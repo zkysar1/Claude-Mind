@@ -38,6 +38,12 @@ FAMILY = [
     ("eviction-conservation-ratchet", ["--json"]),
     ("verification-check-validity-ratchet", ["--json"]),
     ("skillmd-flag-audit", ["--output", "json", "--ratchet"]),
+    # NOT domain-term-ratchet: its measurement (domain-term-census.py) requires
+    # a FULL world -- forged-skills.yaml, program.md, conventions/ -- and voids
+    # itself on any missing class-A registry (guard-2081). Satisfying that here
+    # would bloat this deliberately-minimal fixture for one member's benefit.
+    # Its persist-failure path is pinned in test_domain_term_ratchet.py, which
+    # stubs the census instead of running it.
 ]
 
 SITECUSTOMIZE = '''

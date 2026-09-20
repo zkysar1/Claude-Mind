@@ -33,7 +33,16 @@ _SELF="$(cd "$(dirname "$0")" && pwd)"
 source "$_SELF/_paths.sh" 2>/dev/null || true
 
 _DRY=0
-for _a in "$@"; do [ "$_a" = "--dry-run" ] && _DRY=1; done
+_JSON=0
+for _a in "$@"; do
+    [ "$_a" = "--dry-run" ] && _DRY=1
+    # : --json emits ONE machine-parsed object on stdout, so the
+    # human-facing report-path line below must not be appended to it. The
+    # pre-existing wrapper_failed / SILENT RUN echoes have the same hazard but
+    # fire only on failure; the report-path line fires on EVERY success, so
+    # without this it would corrupt every --json run.
+    [ "$_a" = "--json" ] && _JSON=1
+done
 
 # ⛔ ROOT CAUSE ESTABLISHED 2026-08-23 — READ THIS BEFORE THE NARRATIVE BELOW.
 # The narrative that follows says "Root cause is NOT established". That was true
@@ -87,11 +96,51 @@ for _a in "$@"; do [ "$_a" = "--dry-run" ] && _DRY=1; done
 _MARK="$(mktemp 2>/dev/null)" || _MARK=""
 export ITERATION_OPEN_STAGE_MARKER="$_MARK"
 _OUT="$(mktemp 2>/dev/null)" || _OUT=""
+# : WHERE THE REPORT SURVIVES. The capture below already lands
+# outside the synced tree (mktemp -> /tmp), but it was deleted at the end of the
+# run, so the only copy an agent ever read was the one flowing through the
+# CALLER's redirect. When that redirect points into agents/<agent>/temp/, world/
+# or meta/ on an own-cloud box, the sync layer swaps the inode mid-run and the
+# TAIL is lost -- COVERAGE, FINDINGS, SELECTION and the terminal imperative are
+# all printed last (guard-3789 / guard-4045 / guard-4200). Measured with a
+# one-variable control on two boxes: cc-04 cut at 40-50s, cc-03 at 54s, and the
+# /tmp twin of the same command completed both times. Keeping a copy at a stable
+# non-synced path makes the report readable whatever the caller redirected to.
+# MIND_AGENT is injected into every Bash call by the PreToolUse hook, so the
+# fallback here is a filename of last resort, not a semantic default (guard-3970).
+# ITERATION_OPEN_REPORT_PATH overrides the destination. It exists so a TEST can
+# point this somewhere private: the default path is keyed only by agent name, so
+# a test run under a live agent's name would otherwise clobber that agent's real
+# report -- a test that destroys the artifact it is checking.
+_REPORT="${ITERATION_OPEN_REPORT_PATH:-/tmp/iteration-open-report-${MIND_AGENT:-unknown}.log}"
+_SAVED=0
 if [ -n "$_OUT" ]; then
     python3 "$_SELF/iteration-open.py" "$@" > "$_OUT"
     _rc=$?
     cat "$_OUT"
     _bytes="$(wc -c < "$_OUT" 2>/dev/null || echo -1)"
+    # Copy BEFORE the delete, and from _OUT rather than from the caller's
+    # stream: _OUT is what the program actually wrote, upstream of any
+    # truncation the caller's redirect may suffer.
+    #  defect 2: --dry-run's lane table is NOT "the report". Writing it
+    # here silently REPLACED a report a preceding --apply had written, at the same
+    # path, with nothing on stdout saying so — the dry-run branch returns below
+    # before both the announcement and the completeness check. --dry-run is the
+    # natural next command after a confusing --apply, which put the clobber
+    # directly on the recovery path this persisted copy exists to serve.
+    #  defect 3: write aside and rename. _REPORT is keyed by agent name
+    # only, and this file's own header documents the overlap case: at the 120s Bash
+    # bound the harness BACKGROUNDS the run and the stated remedy is to re-run at a
+    # higher bound, i.e. two same-agent runs by design. Measured: 8 trials of two
+    # concurrent `cp -f` of two distinguishable 2,040,000 B sources to one
+    # destination produced 1 INTERLEAVED file. The temp sits in the SAME directory
+    # as _REPORT whatever ITERATION_OPEN_REPORT_PATH points at, so the rename stays
+    # within one filesystem and is atomic. A failed copy leaves no ".$$" residue.
+    if [ "$_DRY" != "1" ]; then
+        cp -f "$_OUT" "$_REPORT.$$" 2>/dev/null \
+            && mv -f "$_REPORT.$$" "$_REPORT" 2>/dev/null && _SAVED=1
+        [ "$_SAVED" = "1" ] || rm -f "$_REPORT.$$" 2>/dev/null
+    fi
     rm -f "$_OUT"
 else
     # mktemp unavailable — run unchanged and DO NOT claim anything about the
@@ -131,6 +180,37 @@ if [ "$_DRY" = "1" ]; then
 fi
 [ "$_rc" -ne 0 ] && echo "[iteration-open] wrapper_failed — fall back to the batteries directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
 [ "$_bytes" = "0" ] && echo "[iteration-open] SILENT RUN — ZERO bytes of output at rc=$_rc. This is NOT an all-clear: iteration-open.py always prints a STAGE table, so no output means the report was never emitted. Treat the always-run stage as BLIND and run the fallbacks directly: orchestrator-entry-battery.sh, precheck-sentinel-battery.sh, precheck-always-run-battery.sh --apply, then goal-selector.sh"
+# : WIDEN THE COMPLETENESS CHECK PAST ZERO BYTES. The guard above
+# fires only at exactly 0, so a report that stopped PART-WAY sails through: a
+# non-empty prefix at rc=0 is byte-indistinguishable from a short clean run.
+# iteration-open.py ends every non-dry-run report with the NEXT ACTION
+# imperative (pinned by test_terminal_line_is_the_next_action_imperative), so
+# its ABSENCE from what the program actually wrote means the report was cut off.
+#
+# SCOPE, stated so the next reader does not over-trust this line: it inspects
+# _REPORT, a copy of what the PROGRAM wrote. It therefore CANNOT detect the
+# guard-3789 truncation of the CALLER's redirect -- that happens downstream of
+# this process, after it has exited, and nothing inside this script can observe
+# it. The _REPORT copy above REMOVES that exposure rather than detecting it,
+# which is why outcome 3 is answered by a narrower check plus this note, not by
+# a predicate that would quietly claim coverage it does not have.
+# _JSON is excluded because --json emits a JSON OBJECT, which by design carries
+# no terminal imperative -- without this the check would fire on every single
+# --json run. A detector whose false-positive rate on a whole mode is 100% gets
+# ignored, taking its true positives with it.
+if [ "$_SAVED" = "1" ] && [ "$_JSON" = "0" ] \
+   && [ "$_bytes" != "0" ] && [ "$_bytes" != "-1" ] \
+   && ! grep -q 'NEXT ACTION REQUIRED' "$_REPORT" 2>/dev/null; then
+    echo "[iteration-open] REPORT INCOMPLETE — $_bytes bytes at rc=$_rc, but the terminal 'NEXT ACTION REQUIRED' imperative is ABSENT, so iteration-open.py stopped before finishing its report. This is NOT an all-clear: the FINDINGS list above is PARTIAL. Read precheck-budget-state.json and skip every lane recording decision=executed before re-running anything — a stage that dies mid-run can leave lanes that already applied (guard-6634)."
+fi
+# Announce only a report with CONTENT, and never into --json. `cp` of an empty
+# file succeeds, so a bare _SAVED test pointed the reader at a zero-byte copy
+# immediately after SILENT RUN had correctly told them there was nothing to
+# read -- a pointer to an empty artifact is worse than no pointer, because it
+# reads as a recovery path.
+if [ "$_SAVED" = "1" ] && [ "$_JSON" = "0" ] && [ "${_bytes:-0}" -gt 0 ] 2>/dev/null; then
+    echo "[iteration-open] full report also saved to $_REPORT — read THAT copy if your capture looks short: it is written outside the synced tree, so it survives a caller redirect the sync layer truncates (guard-3789/guard-4045, g-115-10295)."
+fi
 if [ -n "$_unfinished" ]; then
     echo "[iteration-open] STAGE UNFINISHED -- '$_unfinished' was dispatched and never returned (python rc=$_rc). '$_unfinished' and every stage after it are BLIND: this run is PARTIAL, not clean. Run the fallbacks from that stage on, skipping any lane precheck-budget-state.json already records as executed -- a stage that dies mid-run can leave lanes that already applied (guard-6634). Exiting 4."
     exit 4

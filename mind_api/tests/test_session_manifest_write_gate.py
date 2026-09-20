@@ -1,4 +1,4 @@
-"""Unit + CLI tests for session-manifest-write-gate.py — g-115-840 + g-115-6405.
+"""Unit + CLI tests for session-manifest-write-gate.py —  + .
 
 Asserts the gate honors `type: dir` manifest entries end-to-end (g-115-840) AND
 `glob: true` fnmatch-pattern entries (g-115-6405). Closes two half-
@@ -127,7 +127,7 @@ def gate_fixture(tmp_path: Path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_load_manifest_entries_splits_by_type(gate_fixture):
-    """g-115-840 + g-115-6405: file / dir / glob entries split into separate
+    """ + : file / dir / glob entries split into separate
     collections, and the distinct sync_tiers are returned sorted. The legacy
     `_load_manifest_basenames` collapsed file/dir; before g-115-6405 the glob
     pattern leaked into file_names as a literal string that never matched.
@@ -154,7 +154,7 @@ def test_load_manifest_entries_fail_open_on_missing(gate_fixture, monkeypatch):
 
 
 def test_path_under_registered_dir_matches_any_depth():
-    """g-115-840 helper: matches at any path depth, exact-segment match."""
+    """ helper: matches at any path depth, exact-segment match."""
     mod = _import_gate()
     # Direct child
     assert mod._path_under_registered_dir(("scratch",), {"scratch"}) is True
@@ -173,7 +173,7 @@ def test_path_under_registered_dir_matches_any_depth():
 
 
 def test_find_owning_agent_returns_ancestor_dirs(gate_fixture):
-    """g-115-840: the resolver must surface intermediate segments so the
+    """: the resolver must surface intermediate segments so the
     dir-match check has data to compare against."""
     mod, repo = gate_fixture
 
@@ -294,7 +294,7 @@ def test_registered_file_still_allowed(gate_fixture, capsys):
 
 
 # ---------------------------------------------------------------------------
-# g-115-6405 — glob: true fnmatch entries + enriched message + mode dispatch
+#  — glob: true fnmatch entries + enriched message + mode dispatch
 # ---------------------------------------------------------------------------
 
 def test_glob_registered_file_passes(gate_fixture, capsys):

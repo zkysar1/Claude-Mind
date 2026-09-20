@@ -139,7 +139,20 @@ def compute_silent(entries, now=None, silence_hours=SILENCE_HOURS) -> tuple:
         if str(e.get("status", "")).strip().lower() != "pending":
             continue
         diag["pending"] += 1
-        d = _parse_date(e.get("date"))
+        # Field-name normalisation (rb-533 loader-normalisation pattern): this
+        # store is HETEROGENEOUS. Measured 2026-09-20 over alpha's 72 records,
+        # `created` is carried by 68 and `date` by 3 -- and by 0 of the 3 PENDING
+        # ones, so reading `date` alone made this path return [] unconditionally,
+        # and `user_signal_boost` (weight x1.2) therefore scored 0.0 on ALL 2425
+        # candidates. The diagnostics had been saying so all along: bad_date 3 of
+        # pending 3. Widen the READ; never rename the emitted field, which would
+        # corrupt the other producers (guard-5345). `date` keeps precedence, so
+        # the 3 records that do carry it are unaffected.
+        d = None
+        for _field in ("date", "created", "created_at", "asked_at", "updated"):
+            d = _parse_date(e.get(_field))
+            if d is not None:
+                break
         if d is None:
             diag["bad_date"] += 1
             continue

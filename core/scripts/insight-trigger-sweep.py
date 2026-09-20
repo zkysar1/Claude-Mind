@@ -1028,6 +1028,54 @@ def load_converted_ids():
 # Goal filing
 # ---------------------------------------------------------------------------
 
+# Longest subject this sweep will splice into a goal title. Titles here already
+# carry a verb plus a msg-id, so the subject is what makes the line readable in
+# the selector's ranked output rather than what fills it.
+TITLE_SUBJECT_MAX = 100
+
+
+def _title_subject(text, limit=TITLE_SUBJECT_MAX):
+    """First meaningful line of the board post, trimmed for a goal title.
+
+    `trigger['action']` is the bare `action_type:<verb>` tag, so a generic verb
+    ("implement", "investigate", "fix") produced a title naming NO OBJECT at all.
+    guard-6141 is the governing rule — every consumer validates the RECORD, none
+    validates the TASK, so the selector ranks a non-action as high as real work.
+    Measured 2026-09-20 (zeta, cc-02) over the 317 goals this sweep has filed:
+    34 read `Apply: <verb> (from <author> insight_trigger <msg-id>)`, ALL 34
+    still pending, oldest g-115-913 from 2026-05-18. By fleet convention the
+    post's first line IS the finding's headline, so it supplies the object.
+
+    Returns "" when nothing usable is found, so the caller falls back to the
+    previous title shape rather than emitting a fragment. No ellipsis is
+    appended on a trim: guard-6141 counts a trailing ellipsis as a fragment
+    tell, so an over-long headline is cut on a word boundary instead.
+
+    Dedup is unaffected by this — the sweep keys on `origin_signal`
+    (`load_converted_ids`), never on the generated title, which is exactly the
+    machine key guard-3751 prescribes. Checked before changing the template.
+    """
+    for line in (text or "").splitlines():
+        # `-` is decoration at the END of a banner but MEANING at the start of a
+        # line. Measured 2026-09-20 (zeta, cc-02, fresh-eyes probe on this very
+        # helper): a symmetric strip turned the headline "-40% latency after the
+        # fix" into "40% latency after the fix", INVERTING a measurement in the
+        # one field the selector renders. So a leading `-` run is removed ONLY
+        # when the line is a symmetric banner ("--- X ---"), never from a line
+        # that merely opens with a minus or a CLI flag. `=#*` carry no leading
+        # meaning and stay symmetric.
+        line = line.strip()
+        if line.startswith("-") and line.endswith("-"):
+            line = line.strip("-")
+        line = line.lstrip("=#* ").rstrip("=#*- ").strip()
+        if len(line) < 12:
+            continue
+        if len(line) <= limit:
+            return line
+        cut = line[:limit].rsplit(" ", 1)[0].rstrip(" ,;:—-")
+        return cut or line[:limit]
+    return ""
+
 
 def _build_goal_payload(trigger):
     """Build the JSON payload passed via stdin to aspirations.py add-goal.
@@ -1052,7 +1100,15 @@ def _build_goal_payload(trigger):
         if promoted != priority:
             inherited_from = target_record.get("id")
             priority = promoted
-    title = f"Apply: {trigger['action']} (from {trigger['author']} insight_trigger {trigger['msg_id']})"
+    # . Splice the finding's headline in so the title names an OBJECT
+    # (guard-6141); fall back to the bare verb form when the post has no usable
+    # first line, so behaviour is never worse than before.
+    _provenance = f"(from {trigger['author']} insight_trigger {trigger['msg_id']})"
+    _subject = _title_subject(trigger.get("text", ""))
+    if _subject:
+        title = f"Apply: {trigger['action']} — {_subject} {_provenance}"
+    else:
+        title = f"Apply: {trigger['action']} {_provenance}"
     # intended_agent vocabulary normalization (selection-stack review
     # 2026-08-21). resolve_addressing() settles WHICH DEPLOYMENT a target
     # belongs to but never checks roster MEMBERSHIP, so loose board tags

@@ -19,7 +19,9 @@ The runner is injected everywhere, so no test shells out: these are contract pin
 on the aggregation, not an integration test of the composed batteries (each of
 those owns its own suite).
 """
+import ast          # : the self-audit pin at the end of this file
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -358,10 +360,18 @@ def test_wrapper_preserves_dry_run_rc_but_fails_open_in_run_mode(tmp_path):
     bad = tmp_path / "nope.md"
     # .as_posix() throughout, never str(Path) — bash silently strips the
     # backslashes of a str(WindowsPath) (guard-581).
+    # : the report path MUST be redirected here too. The wrapper's
+    # persisted copy runs BEFORE the --dry-run branch returns, so this site was
+    # truncating the live /tmp/iteration-open-report-<agent>.log of whatever agent
+    # the suite ran under. Re-deriving the invocation list by grep (this goal's
+    # outcome 1) is what surfaced this site: the filing description named only
+    # three, and this is the fourth.
     dry = subprocess.run(
         [BASH, (SCRIPTS / "iteration-open.sh").as_posix(), "--dry-run",
          "--tier-table", bad.as_posix()],
         capture_output=True, text=True, timeout=120,
+        env=dict(os.environ,
+                 ITERATION_OPEN_REPORT_PATH=(tmp_path / "report.log").as_posix()),
     )
     assert dry.returncode == 1, "an unreadable registry must FAIL the dry-run check"
     assert "unreadable" in (dry.stderr or "")
@@ -391,9 +401,12 @@ def test_wrapper_calls_a_silent_run_blind_instead_of_passing_it_off_as_clean(tmp
     stub = tmp_path / "iteration-open.py"
 
     stub.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    # : redirect the report path — see _stub_wrapper's docstring below.
+    _env = dict(os.environ,
+                ITERATION_OPEN_REPORT_PATH=(tmp_path / "report.log").as_posix())
     silent = subprocess.run(
         [BASH, wrapper.as_posix(), "--apply"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=_env,
     )
     assert silent.returncode == 0, "run mode must stay fail-open"
     assert "SILENT RUN" in silent.stdout
@@ -405,10 +418,244 @@ def test_wrapper_calls_a_silent_run_blind_instead_of_passing_it_off_as_clean(tmp
     stub.write_text('print("STAGE  rc  elapsed  note")\n', encoding="utf-8")
     noisy = subprocess.run(
         [BASH, wrapper.as_posix(), "--apply"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=120, env=_env,
     )
     assert noisy.returncode == 0
     assert "SILENT RUN" not in noisy.stdout, "output present must never be called silent"
+
+
+def _stub_wrapper(tmp_path):
+    """Wrapper copied beside a stub .py, plus a private report path.
+
+    The report path MUST be redirected: its default is keyed only by agent
+    name, so a test running under a live agent's name would overwrite that
+    agent's real iteration-open report.
+    """
+    from _bash_helpers import BASH  # guard-580: never a bare "bash" argv[0]
+
+    wrapper = tmp_path / "iteration-open.sh"
+    wrapper.write_bytes((SCRIPTS / "iteration-open.sh").read_bytes())
+    report = tmp_path / "report.log"
+    env = dict(os.environ, ITERATION_OPEN_REPORT_PATH=report.as_posix())
+    return BASH, wrapper, tmp_path / "iteration-open.py", report, env
+
+
+def test_truncated_but_nonempty_report_is_not_an_all_clear(tmp_path):
+    """The zero-byte guard fires only at exactly 0, so a report that stopped
+    part-way sails past it: a non-empty prefix at rc=0 is byte-indistinguishable
+    from a short clean run, and run mode forces exit 0. g-115-10295 measured the
+    consequence -- two consecutive iterations on cc-04 ran a healthy precheck and
+    read a 213-byte stub as clean, twice, because 213 != 0.
+
+    iteration-open.py ends every non-dry-run report with the NEXT ACTION
+    imperative (pinned by test_terminal_line_is_the_next_action_imperative just
+    above), so its ABSENCE is the discriminator the byte count cannot provide.
+    """
+    BASH, wrapper, stub, _report, env = _stub_wrapper(tmp_path)
+
+    # A plausible-looking PREFIX: real stage lines, no terminal imperative.
+    stub.write_text(
+        'print("STAGE  rc  elapsed  note")\n'
+        'print("entry-checks  0  132ms  read-only by contract")\n',
+        encoding="utf-8",
+    )
+    cut = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                         capture_output=True, text=True, timeout=120, env=env)
+    assert cut.returncode == 0, "run mode must stay fail-open"
+    assert "SILENT RUN" not in cut.stdout, "non-empty output is not silence"
+    assert "REPORT INCOMPLETE" in cut.stdout, (
+        "a report missing its terminal imperative must be called PARTIAL — "
+        "this is the exact 213-byte shape that read as clean twice on cc-04"
+    )
+
+    # NEGATIVE CONTROL (guard-3534): a detector that fires on every run is one
+    # that can never be wrong, and therefore never useful. The ONLY difference
+    # here is the terminal imperative.
+    stub.write_text(
+        'print("STAGE  rc  elapsed  note")\n'
+        'print("entry-checks  0  132ms  read-only by contract")\n'
+        'print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings")\n',
+        encoding="utf-8",
+    )
+    whole = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                           capture_output=True, text=True, timeout=120, env=env)
+    assert whole.returncode == 0
+    assert "REPORT INCOMPLETE" not in whole.stdout, (
+        "a report that reached its terminal imperative is complete"
+    )
+
+
+def test_report_is_persisted_off_the_synced_tree_for_the_caller_to_read(tmp_path):
+    """outcome 2 of . The wrapper already captured stdout to a
+    non-synced mktemp file and then DELETED it, so the only copy any agent ever
+    read was the one flowing through the CALLER's redirect -- and that redirect
+    is what the own-cloud sync layer truncates (guard-3789/guard-4045).
+
+    Measured with a one-variable control on two boxes: the same busy 130s
+    command cut at t=54s into agents/<agent>/temp/ on cc-03 (40-50s on cc-04)
+    while its /tmp twin completed. Keeping the copy makes the report readable
+    whatever the caller redirected to, which REMOVES the exposure rather than
+    detecting it -- nothing inside this process can observe a truncation that
+    happens downstream of it, after it exits.
+    """
+    BASH, wrapper, stub, report, env = _stub_wrapper(tmp_path)
+    stub.write_text(
+        'print("STAGE  rc  elapsed  note")\n'
+        'print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings")\n',
+        encoding="utf-8",
+    )
+    run = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                         capture_output=True, text=True, timeout=120, env=env)
+    assert run.returncode == 0
+    assert report.exists(), "the report must survive the run, not be deleted with the tempfile"
+    saved = report.read_text(encoding="utf-8")
+    assert "NEXT ACTION REQUIRED" in saved, "the persisted copy must carry the TAIL — the part that goes missing"
+    assert "STAGE" in saved
+    assert report.as_posix() in run.stdout, "the caller must be told where the surviving copy is"
+
+
+def test_report_pointer_and_completeness_check_stay_off_the_failure_and_json_paths(tmp_path):
+    """Two false positives the first cut of  actually shipped, both
+    found by re-reading rather than by a failing test — which is why they are
+    pinned here.
+
+    1. `cp` of an EMPTY file succeeds, so a bare "did the copy work" test
+       announced a saved report of zero bytes immediately after SILENT RUN had
+       correctly said there was nothing to read. A pointer to an empty artifact
+       is worse than no pointer: it reads as a recovery path.
+    2. --json emits ONE machine-parsed object, and a JSON object legitimately
+       contains no terminal imperative — so the completeness check fired on
+       EVERY --json run and the pointer line corrupted the object. A detector
+       whose false-positive rate on a whole mode is 100% gets ignored, taking
+       its true positives with it.
+    """
+    BASH, wrapper, stub, _report, env = _stub_wrapper(tmp_path)
+
+    # (1) zero-byte run: SILENT RUN is right, the pointer is not.
+    stub.write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
+    empty = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                           capture_output=True, text=True, timeout=120, env=env)
+    assert "SILENT RUN" in empty.stdout, "zero bytes must still be called silent"
+    assert "full report also saved" not in empty.stdout, (
+        "never point the reader at a zero-byte report — cp of an empty file succeeds"
+    )
+    assert "REPORT INCOMPLETE" not in empty.stdout, (
+        "zero bytes is SILENT RUN's case; two warnings for one fault is noise"
+    )
+
+    # (2) --json must stay machine-parseable, and must not be called incomplete.
+    stub.write_text('import json\nprint(json.dumps({"ok": True}))\n', encoding="utf-8")
+    js = subprocess.run([BASH, wrapper.as_posix(), "--json"],
+                        capture_output=True, text=True, timeout=120, env=env)
+    assert js.returncode == 0
+    assert "REPORT INCOMPLETE" not in js.stdout, (
+        "a JSON object carries no terminal imperative BY DESIGN — flagging it "
+        "makes the check fire on 100% of --json runs"
+    )
+    assert "full report also saved" not in js.stdout, "the pointer must not be appended to JSON"
+    json.loads(js.stdout)  # raises if anything was appended to the object
+
+
+def test_dry_run_does_not_replace_the_report_a_preceding_apply_wrote(tmp_path):
+    """outcome 3 of . The persisted copy is written ABOVE the
+    `if [ "$_DRY" = "1" ]` return, so --dry-run reached it too and overwrote the
+    report at the SAME agent-keyed path with its lane table -- silently, because
+    the dry-run branch returns before both the pointer line and the completeness
+    check, so nothing on stdout said the report had been replaced.
+
+    The cost is not the lost bytes, it is WHERE the clobber sits: --dry-run is
+    the natural next command after a confusing --apply, so the one action a
+    reader takes to recover destroyed the artifact the persisted copy exists to
+    give them (g-115-10295 outcome 2).
+    """
+    BASH, wrapper, stub, report, env = _stub_wrapper(tmp_path)
+
+    def _stub_printing(marker):
+        stub.write_text(
+            'print("STAGE  rc  elapsed  note")\n'
+            f'print("entry-checks  0  132ms  {marker}")\n'
+            'print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings")\n',
+            encoding="utf-8",
+        )
+
+    _stub_printing("APPLY-PAYLOAD")
+    applied = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                             capture_output=True, text=True, timeout=120, env=env)
+    assert applied.returncode == 0
+    assert report.exists(), "the --apply run must persist its report"
+    before = report.read_text(encoding="utf-8")
+    assert "APPLY-PAYLOAD" in before
+
+    # The recovery command. Distinguishable payload so a clobber is visible
+    # rather than merely suspected.
+    _stub_printing("DRY-RUN-PAYLOAD")
+    dry = subprocess.run([BASH, wrapper.as_posix(), "--dry-run"],
+                         capture_output=True, text=True, timeout=120, env=env)
+    assert dry.returncode == 0
+    after = report.read_text(encoding="utf-8")
+    assert after == before, "--dry-run must not touch the report an --apply wrote"
+    assert "DRY-RUN-PAYLOAD" not in after, (
+        "the dry-run lane table is NOT the report — writing it here destroys the "
+        "artifact the reader ran --dry-run to go and read"
+    )
+
+    # NEGATIVE CONTROL (guard-3534). Everything above holds just as happily if
+    # persistence were broken outright, or if this test were watching a path
+    # nothing writes. Same wrapper, same report path, same payload — only the
+    # MODE differs — and now the report MUST change.
+    live = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                          capture_output=True, text=True, timeout=120, env=env)
+    assert live.returncode == 0
+    replaced = report.read_text(encoding="utf-8")
+    assert "DRY-RUN-PAYLOAD" in replaced, (
+        "control failed: --apply did not rewrite the report, so the invariance "
+        "above proved nothing about the --dry-run gate"
+    )
+    assert "APPLY-PAYLOAD" not in replaced
+
+
+def test_report_persist_writes_aside_and_renames_leaving_no_residue(tmp_path):
+    """outcome 4 of . _REPORT is keyed by agent name ALONE, and this
+    script's own header documents the overlap case: at the 120s Bash bound the
+    harness backgrounds the run and the stated remedy is to re-run at a higher
+    bound, i.e. two same-agent runs by design. Measured: 8 trials of two
+    concurrent `cp -f` of two distinguishable 2,040,000 B sources to one
+    destination produced 1 INTERLEAVED file — a report that is neither run's.
+
+    Writing aside and renaming makes the reader see one whole report or the
+    previous one, never a splice. What is observable from outside the process is
+    the contract pinned here: the temp never survives the run, and a persist that
+    FAILS announces nothing and still exits 0 (a broken report copy must never
+    fail loop entry).
+    """
+    BASH, wrapper, stub, report, env = _stub_wrapper(tmp_path)
+    stub.write_text(
+        'print("STAGE  rc  elapsed  note")\n'
+        'print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings")\n',
+        encoding="utf-8",
+    )
+    ok = subprocess.run([BASH, wrapper.as_posix(), "--apply"],
+                        capture_output=True, text=True, timeout=120, env=env)
+    assert ok.returncode == 0
+    assert report.exists()
+    residue = sorted(p.name for p in report.parent.iterdir()
+                     if p.name.startswith(report.name) and p.name != report.name)
+    assert residue == [], f"the write-aside temp must not survive the run: {residue}"
+
+    # A persist that cannot succeed: the destination directory does not exist,
+    # so the copy fails before the rename. Nothing may be announced, nothing may
+    # be left behind, and loop entry must still be fail-open.
+    missing = tmp_path / "no-such-dir"
+    failed = subprocess.run(
+        [BASH, wrapper.as_posix(), "--apply"],
+        capture_output=True, text=True, timeout=120,
+        env=dict(env, ITERATION_OPEN_REPORT_PATH=(missing / "report.log").as_posix()),
+    )
+    assert failed.returncode == 0, "a failed report copy must never fail loop entry"
+    assert "full report also saved" not in failed.stdout, (
+        "never point the reader at a report the copy did not make"
+    )
+    assert not missing.exists(), "a failed persist must leave no residue behind"
 
 
 
@@ -447,6 +694,9 @@ def test_wrapper_exits_4_naming_a_stage_that_was_dispatched_and_never_returned(t
         return subprocess.run(
             [BASH, wrapper.as_posix(), "--apply"],
             capture_output=True, text=True, timeout=120,
+            # : redirect the report path — see _stub_wrapper's docstring.
+            env=dict(os.environ,
+                     ITERATION_OPEN_REPORT_PATH=(tmp_path / "report.log").as_posix()),
         )
 
     # os._exit: an abrupt death with no cleanup, as a kill would leave it.
@@ -924,3 +1174,155 @@ def test_a_measured_zero_still_prints_its_count(table, capsys):
     d = json.loads(capsys.readouterr().out)
     assert d["completeness"] == "complete"
     assert not any(b["stage"] == "selection" for b in d["blind"])
+
+
+# --- a selector that RAN AND FAILED must say why (2026-09-20) -----------------
+#
+# _run_bash captured stderr and threw it away, and _selection never looked at rc.
+# So a selector that exited non-zero -- stdout empty by the wrapper's contract --
+# fell through to json.loads and reached the model as "unparseable selector
+# output: Expecting value: line 1 column 1 (char 0)": true of the bytes, silent on
+# the cause. Measured 2026-09-19 on a served loop in a never-initialized world:
+# the selector failed 9 of 9 and its reason never crossed this boundary. Same
+# defect, same fix shape as precheck-medium-battery._run_bash (guard-2586).
+
+_META_NOT_READY = (
+    "[goal-selector] FATAL (rc=10): meta tier NOT READY -- NEVER INITIALIZED.\n"
+    "  REMEDY: run boot Phase -2 -- `bash core/scripts/init-mind.sh testagent`."
+)
+
+
+def test_a_failed_selector_reports_its_rc_and_its_own_reason(table, capsys):
+    def runner(argv, timeout):
+        if argv[0] == "goal-selector.sh":
+            return 10, "", 5, None, _META_NOT_READY      # the 5-slot production shape
+        return 0, json.dumps({"findings": [], "blind": []}), 5, None, ""
+
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    d = json.loads(capsys.readouterr().out)
+    err = d["candidates"]["error"]
+    assert d["candidates"]["count"] is None, "a failed read is not a measured zero"
+    assert "rc=10" in err
+    assert "NEVER INITIALIZED" in err and "init-mind.sh" in err, (
+        "the selector's state AND its remedy must both cross the boundary")
+    assert "unparseable" not in err, (
+        "naming the JSON parser instead of the cause is the defect being fixed")
+
+
+def test_a_historical_4_slot_runner_still_works_when_the_selector_fails(table, capsys):
+    """Every injected runner in this file returns 4 slots. The 5th must be
+    OPTIONAL or the fix breaks the doubles it shares a contract with."""
+    runner = make_runner({"goal-selector.sh": (3, "", None)})   # ran, failed, no stderr slot
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    d = json.loads(capsys.readouterr().out)
+    assert "rc=3" in d["candidates"]["error"]
+    assert d["candidates"]["count"] is None
+
+
+def test_a_selector_that_succeeds_is_untouched_by_the_rc_branch(table, capsys):
+    """POSITIVE CONTROL (guard-4166): the new branch keys on rc != 0 only. A
+    ranking on rc=0 must still be read as a ranking."""
+    rows = [{"goal_id": "g-001-01", "score": 4.2, "title": "t"}]
+
+    def runner(argv, timeout):
+        if argv[0] == "goal-selector.sh":
+            return 0, json.dumps(rows), 5, None, "a banner on stderr is not a failure"
+        return 0, json.dumps({"findings": [], "blind": []}), 5, None, ""
+
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    d = json.loads(capsys.readouterr().out)
+    assert d["candidates"]["count"] == 1
+    assert "error" not in d["candidates"] or not d["candidates"]["error"]
+
+
+def test_the_real_runner_carries_the_real_selectors_remedy(tmp_path, monkeypatch):
+    """THE SEAM ITSELF, no doubles: the real _run_bash, the real wrapper, the real
+    selector, pointed at a meta dir that was never initialized. This is the path
+    that was measured broken, so it is the one worth pinning end to end."""
+    meta = tmp_path / "meta"
+    meta.mkdir()
+    monkeypatch.setenv("MIND_META", str(meta))
+    monkeypatch.setenv("MIND_AGENT", "testagent")
+    monkeypatch.setenv("STORAGE_BACKEND", "local")   # guard-955
+
+    res = io_mod._run_bash(["goal-selector.sh"], 120)
+    assert len(res) == 5, "the runner contract is 5 slots; the 5th is stage stderr"
+    assert res[0] == 10 and res[3] is None, res[:4]
+    assert "REMEDY" in res[4]
+
+    sel = io_mod._selection(io_mod._run_bash)
+    assert "rc=10" in sel["error"] and "init-mind.sh testagent" in sel["error"]
+
+
+# --- the gap cannot silently reopen () ----------------------------
+
+# Names whose value is a dict BUILT with the override, forwarded as `env=<name>`.
+# Keep this list SHORT: every entry is a promise the pin stops verifying and
+# starts trusting, so add one only when the builder itself is pinned elsewhere.
+# `env` is _stub_wrapper's return (its body sets ITERATION_OPEN_REPORT_PATH, and
+# test_report_is_persisted_off_the_synced_tree_for_the_caller_to_read fails if it
+# ever stops); `_env` is the local built inline two tests above.
+_ENV_HELPERS = {"env", "_env"}
+
+
+def test_every_wrapper_invocation_in_this_file_redirects_the_report_path():
+    """THE PIN. Fixing the four unguarded call sites fixed the instances; this
+    fixes the CLASS, for this file.
+
+    `_stub_wrapper` already existed when the defect shipped, and its docstring
+    already stated the hazard verbatim — it had simply been applied to the five
+    tests written beside it and to none of the four older ones. A helper that
+    documents a hazard reads as coverage, so the next author to add a
+    `subprocess.run` here will copy whichever neighbour they happen to see and
+    the file silently regresses (rb-11398). A helper cannot enforce its own use;
+    an assertion over the file can.
+
+    Measured pre-fix: a run of this file took the live
+    /tmp/iteration-open-report-<agent>.log from 3,271 B to 0 B, at pytest exit 0
+    with every test PASSING, because the tests assert on stdout and never on the
+    report file.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    def invokes_the_wrapper(call):
+        """First positional arg is an argv list whose argv[0] is BASH."""
+        if not call.args or not isinstance(call.args[0], (ast.List, ast.Tuple)):
+            return False
+        head = call.args[0].elts[0] if call.args[0].elts else None
+        return isinstance(head, ast.Name) and head.id == "BASH"
+
+    checked, offenders = [], []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name not in ("run", "Popen", "check_output", "check_call"):
+            continue
+        if not invokes_the_wrapper(node):
+            continue          # in-process io_mod.run() never reaches the shell copy
+        checked.append(node.lineno)
+        # The KEYWORD is not the contract — the OVERRIDE is. `env=os.environ`
+        # satisfies "passes env=" and still destroys the live report, so assert
+        # the variable name appears in the argument that is actually passed
+        # (directly, or via a helper-built dict the call forwards by name).
+        env_src = " ".join(ast.unparse(kw.value) for kw in node.keywords
+                           if kw.arg == "env")
+        if "ITERATION_OPEN_REPORT_PATH" not in env_src and env_src.strip() not in _ENV_HELPERS:
+            offenders.append(node.lineno)
+
+    # POSITIVE CONTROL (guard-3130/guard-3534): a predicate that matches NOTHING
+    # passes this test forever while covering nothing. State the population.
+    assert len(checked) >= 10, (
+        f"the predicate found only {len(checked)} wrapper invocation(s) — it has "
+        "drifted away from the call shape it is supposed to audit, so its silence "
+        "proves nothing"
+    )
+    assert offenders == [], (
+        f"{len(offenders)} of {len(checked)} wrapper invocations pass no env= at "
+        f"lines {offenders}. Every one MUST set ITERATION_OPEN_REPORT_PATH: the "
+        "wrapper's default is keyed by agent name alone, so an unredirected call "
+        "destroys the live report of whatever agent runs this suite. Route through "
+        "_stub_wrapper, or pass env=dict(os.environ, "
+        "ITERATION_OPEN_REPORT_PATH=(tmp_path / 'report.log').as_posix())."
+    )

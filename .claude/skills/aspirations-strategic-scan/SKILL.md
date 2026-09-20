@@ -329,16 +329,17 @@ IF opened < len(stale_nodes):
 # "N of M" cannot separate those, and reading 3-of-18 against 2-of-8 as drift
 # would send the next pass re-reading a parser that is right.
 #
-# CURRENT PRIOR — **numerator 5; the DENOMINATOR is not part of the prior. WHEN
+# CURRENT PRIOR — **numerator 6; the DENOMINATOR is not part of the prior. WHEN
 # THIS PARAGRAPH AND THE OWNER GOAL'S NOTE DISAGREE, THE NOTE WINS** — it tracks
 # the tree, this tracks the skill, so a stale prior sends you to APPEND a
 # duplicate (near-miss 2026-09-11 cc-04: all 5 already in g-115-5462). Grep the
 # stop condition FIRST. Members `env-agnostic-exploration-primitives`,
-# `infrastructure-performance`, `solver-v0-audits`,
-# `v2-directed-steering-ship-log`, `v2-directed-steering-wiring`.
+# `infrastructure-performance`, `solver-v0-audits`, `v2-directed-steering-wiring`,
+# `v2-directed-steering-ship-log`, `adoption-strategy-patterns` (RE-ENTERED 09-20
+# after 08-20's stamp-bump exit: a bump defers a window, never fixes).
 # Roster (all opened N/N, so the control passed in every row):
 #   ROSTER ROWS 2026-08-11 .. 2026-08-18T01:4x (22 rows, 20,110 B) moved VERBATIM to core/config/strategic-scan-readings.md (hot-path budget g-115-7444) — the roster is WHOLLY in that ledger now, together with the two rows named below. Prose further down cites these rows by date ("zeta's 08-13 buckets", "18 -> 26 in ~24h"); those resolve THERE, one hop. ADD YOUR BOX AS ONE ROSTER ROW IN THE LEDGER, NEVER HERE.
-#   READINGS 2026-08-19T15:2x (3 of 32) AND 2026-08-20T12:4x (**2 of 31**) moved VERBATIM to core/config/strategic-scan-readings.md (hot-path budget g-115-6470) — APPEND ALL FUTURE S2a READINGS THERE, NEVER HERE. Operational prior from the 08-20 reading: THE NUMERATOR FELL 3->2 for the first time in this roster, via a STAMP-BUMP EXIT (adoption-strategy-patterns auto-bumped by tree-front-matter-sync.py Layer A on a metadata-only edit; content_verified null, content still ~104d stale) — a fall is work OR a stamp artifact, indistinguishable in the count; discriminator = the exited member's front matter (last_updated_before_* / content_age_note / null content_verified), one read. Prior: see CURRENT PRIOR above (numerator 5). Re-verify cohort 8 — fifteenth consecutive day; total 1447, EXPLORE 55.
+#   READINGS 2026-08-19T15:2x (3 of 32) AND 2026-08-20T12:4x (**2 of 31**) moved VERBATIM to core/config/strategic-scan-readings.md (hot-path budget g-115-6470) — APPEND ALL FUTURE S2a READINGS THERE, NEVER HERE. Operational prior from the 08-20 reading: THE NUMERATOR FELL 3->2 for the first time in this roster, via a STAMP-BUMP EXIT (adoption-strategy-patterns auto-bumped by tree-front-matter-sync.py Layer A on a metadata-only edit; content_verified null, content still ~104d stale) — a fall is work OR a stamp artifact, indistinguishable in the count; discriminator = the exited member's front matter (last_updated_before_* / content_age_note / null content_verified), one read.
 # A DENOMINATOR CAN GROW BY A NODE THAT WAS ALREADY PAST THRESHOLD — a FOURTH
 # mechanism, and the paragraph below does not cover it. My histogram is zeta's
 # 08-13 buckets +1 on every bucket PLUS an extra {41:1}. Aging cannot produce

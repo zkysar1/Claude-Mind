@@ -23,6 +23,18 @@ if [ -z "$DEST" ] || [ ! -d "$DEST" ]; then
 fi
 DEST="$(cd "$DEST" && pwd)"
 
+# Exemption-marker predicate, resolved ONCE per run from the single source of
+# truth (g-115-10246). Reused with `grep -qE "$MARKER_RX"` below — never one
+# interpreter spawn per candidate file. Fail loud rather than fall back: an
+# empty pattern would make `grep -qE ""` match every file and drop the entire
+# candidate set, reporting a clean seed over an unscanned tree.
+MARKER_RX="$(py -3 "$SCRIPT_DIR/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
+if [ -z "$MARKER_RX" ]; then
+    echo "ERROR: cannot resolve the exemption-marker predicate from $SCRIPT_DIR/_domain_leak_marker.py" >&2
+    echo "       Refusing to scan: an empty pattern would drop every candidate." >&2
+    exit 2
+fi
+
 # Patterns that should NOT survive into a clean seed at destination
 PATTERNS=(
     "Ayoai-Mind"
@@ -58,12 +70,16 @@ for pat in "${PATTERNS[@]}"; do
             | grep -v "/\.env\.local" \
             | grep -v "/active-agent-" \
             || true)"
-        # Further filter: drop files that carry the domain-leak-exempt marker
+        # Further filter: drop files that CLAIM the exemption. Anchored via the
+        # shared predicate resolved once above (g-115-10246) — the bare
+        # substring test this replaced dropped any file that merely mentioned
+        # the marker in prose, which here means a real path self-reference leak
+        # could hide behind one sentence about the marker.
         if [ -n "$FILTERED" ]; then
             FINAL=""
             while IFS= read -r f; do
                 if [ -n "$f" ] && [ -f "$f" ]; then
-                    if grep -q "domain-leak-exempt:" "$f" 2>/dev/null; then
+                    if grep -qE "$MARKER_RX" "$f" 2>/dev/null; then
                         continue
                     fi
                     FINAL="${FINAL}${f}

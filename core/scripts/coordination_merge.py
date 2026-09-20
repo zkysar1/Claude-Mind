@@ -1028,15 +1028,30 @@ def merge_team_state_shard(local: bytes, remote: bytes) -> bytes:
     return _dump_yaml(_commutative_key_order(a, b, dict(win)))
 
 
-# --- aspirations.jsonl : union aspirations by id, union goals by id ----------
+# --- aspirations.jsonl : union aspirations by id, goals by CONTENT IDENTITY ---
 # The hot ~8MB multipart goal queue written by ALL agents every iteration. With
 # NO registered handler it froze on the both-diverged 412 — the  route
 # (_put's 412 handler -> _merge_reconcile_put) fires ONLY for a registered store,
 # so aspirations.jsonl fell through to the doomed RMW retry -> fleet-wide
 # write-freeze / silent revert (confirmed 2026-07-03: complete-by returns 200 but
-# lastAchievedAt never advances; recurring closes re-select forever). Union is
-# the correct reconcile: two agents almost always touch DIFFERENT goals, so a
-# goal-id union loses nothing; the rare same-goal clash reconciles per-field.
+# lastAchievedAt never advances; recurring closes re-select forever).
+#
+# GOALS ARE NOT UNIONED BY GOAL ID — this header and paragraph said they were
+# until 2026-09-20, describing the pre-2026-07-19 implementation that
+# `_merge_goals` replaced. `merge_aspirations` delegates to `_merge_goals` (via
+# `_merge_aspiration_record`), which keys every goal on `_goal_identity`:
+# `alloc_nonce`, else `(created_at, title)`, else id, else content. So two
+# DISTINCT goals colliding on one id are BOTH kept (one re-idded), and one goal
+# re-idded or retitled under a racing peer still collapses to one record. Read
+# `_goal_identity`'s docstring for why each fallback exists — symbols, not line
+# numbers, because a bare file:LINE citation decays at the next edit (guard-2310).
+#
+# WHY A STALE COMMENT MATTERED HERE: it sits ~320 lines above the code it
+# describes, so nothing puts the two side by side and this header is what a
+# reader hits first. On 2026-09-17 it produced a HIGH "CONFIRMED DATA LOSS"
+# finding on another deployment, retracted by its own filer after the
+# discriminating read (). The cost of the drift is a false
+# data-loss alarm, not a wrong merge.
 
 # Truly-monotonic goal totals — only ever grow -> MAX never loses a bump. NOTE:
 # currentStreak / windowStreak / consecutive_routine / consecutive_deep are

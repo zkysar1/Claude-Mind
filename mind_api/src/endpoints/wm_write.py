@@ -8,10 +8,17 @@ PER-AGENT: ctx.paths.agent / session / working-memory.yaml.
 BYTE-COMPATIBILITY: wm.py does NOT use _fileops.locked_modify_yaml — it has
 its own write path (wm.py write_yaml): plain `yaml.dump(data, f,
 default_flow_style=False, allow_unicode=True, sort_keys=False)` with the
-DEFAULT Dumper (NOT CSafeDumper), atomic tmp(.yaml.tmp)+replace, and NO
+DEFAULT Dumper (NOT CSafeDumper), atomic PER-WRITER-tmp+replace, and NO
 history/changelog. _write_wm below replicates that EXACTLY. Using CSafeDumper
 here would be a silent divergence — wm.py uses the default Dumper, so we must
 too.
+
+The temp name was `tmp(.yaml.tmp)` — deterministic and shared — until
+g-115-10223 ported wm.py's `mkstemp` here. Read that as a standing warning
+about THIS docstring: it asserted byte-compatibility with wm.py while wm.py had
+already moved (g-115-9983), so the sentence that was supposed to keep the two
+in step is exactly what made the divergence look intentional. When you change
+either writer, change this paragraph in the same edit (guard-2323).
 
 LOCKING: file_locks.locked(WM_PATH, stale_seconds=10) acquires
 WM_PATH.with_suffix('.lock') — the SAME lock file wm.py's wm_lock() uses
@@ -28,7 +35,9 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -361,7 +370,8 @@ def archive_evicted_capture_local(archive_file, slot_name, removed, reason):
             "entry": removed,
         }, ensure_ascii=False, default=str) + "\n"
         start = path.stat().st_size if path.is_file() else 0
-        with open(path, "a", encoding="utf-8") as fh:
+        # See the module comment above EVICTION_ARCHIVE_CEILING for why this is raw.
+        with open(path, "a", encoding="utf-8") as fh:  # raw-append-guard-exempt: per-Body sessions/ path, _EXCLUDE_DIRS-pruned + _machine_local
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
@@ -542,7 +552,38 @@ def _read_yaml(path: Path) -> dict:
 
 
 def _write_wm(path: Path, data: dict) -> None:
-    """Verbatim wm.py write_yaml: default Dumper, atomic tmp+replace.
+    """Port of wm.py write_yaml: default Dumper, PER-WRITER tmp + replace.
+
+    THIS is the production working-memory writer. wm-set.sh / wm-append.sh are
+    daemon-only (no Python CLI fallback), so every production WM write lands
+    here, not in wm.py. Keep the two in step — guard-2323.
+
+    The temp name is PER-WRITER, never derived from the target (g-115-9983 D3,
+    ported here by g-115-10223). It used to be ``path.with_suffix('.yaml.tmp')``
+    — deterministic and shared — so two writers opened the SAME file with mode
+    'w', each truncating and then writing at its own offset; a short document's
+    bytes and a long document's tail coexisted in one inode and whichever
+    ``replace()`` won published the splice. That is how alpha's 13.9 MB working
+    memory became unparseable (ScannerError at line 192228, one mid-line resume
+    point — the signature this mechanism predicts).
+
+    Note precisely what was NOT wrong: ``replace()`` is atomic and the
+    fsync-before-rename is correct. The shared NAME defeated both before the
+    rename was ever reached, which is why an audit of this function for
+    atomicity finds it correct and stops.
+
+    Nor is this redundant with ``_wm_lock``. That lock is
+    ``file_locks.locked(_wm_path(ctx), stale_seconds=10)`` — ADVISORY, with a
+    ten-second staleness break, so a 13.9 MB ``yaml.dump`` that outruns the
+    window lets a second writer in legitimately. In the originating incident all
+    8 wm.py write call sites WERE lock-protected and the corruption happened
+    anyway, the suite log carrying a ``FileExistsError`` from the lock itself.
+    An advisory lock with a staleness break can fail to exclude; a per-writer
+    temp name cannot.
+
+    Mode is copied from the existing target (or defaulted through the umask)
+    because ``mkstemp`` creates 0600, which would otherwise silently make the
+    file unreadable to a cross-uid reader (rb-4790).
 
     DELIBERATELY a raw local write — do NOT route this through the backend
     (_atomic_write_with_fallback / get_backend().atomic_write), even though
@@ -568,15 +609,30 @@ def _write_wm(path: Path, data: dict) -> None:
     change to reconsider — not a one-line write-path swap."""
     assert_not_cruft(path.parent, "mkdir (wm_write)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".yaml.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
-        # : fsync before rename — a bare tmp.replace survives a crash
-        # in metadata only (NTFS all-0x00 signature). Local durability concern;
-        # the raw-local-write rationale above is unaffected.
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            # : fsync before rename — a bare tmp.replace survives a crash
+            # in metadata only (NTFS all-0x00 signature). Local durability concern;
+            # the raw-local-write rationale above is unaffected.
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except BaseException:
+        # Never leak a per-writer temp: unlike the old shared name, a leaked one
+        # is not reused and would accumulate one orphan per failed write.
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _read_config(ctx) -> dict:

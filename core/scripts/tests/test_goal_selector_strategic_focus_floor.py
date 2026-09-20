@@ -57,12 +57,19 @@ def _pin_lanes(monkeypatch, lanes=LANES, weight=1.0):
 
 
 def _row(gid, asp, score, *, recurring=False, ia="either", routed=False,
-         title=None):
-    return {
+         title=None, priority=None):
+    row = {
         "goal_id": gid, "aspiration_id": asp, "score": score,
         "recurring": recurring, "intended_agent": ia, "routed_to_me": routed,
         "title": title if title is not None else f"title for {gid}",
     }
+    # `priority` lives in the scoring breakdown, NOT at the top level -- it is
+    # absent on 100% of hand-built rows and present on 100% of production ones
+    # (1=LOW / 2=MEDIUM / 3=HIGH). Rows built without it carry no `raw` key at
+    # all, which is exactly the shape every pre- test asserts against.
+    if priority is not None:
+        row["raw"] = {"priority": priority}
+    return row
 
 
 # --------------------------------------------------------------------------
@@ -346,3 +353,69 @@ def test_floor_still_hoists_a_clean_lane_goal_ranked_below_an_excluded_one(
     assert status["pool_lane_rows"] == 3
     assert scored[0] is clean
     assert clean["strategic_focus_pick"] is True
+
+
+# --------------------------------------------------------------------------
+# Priority outranks score among nominees ()
+# --------------------------------------------------------------------------
+
+def test_floor_prefers_higher_priority_lane_row_over_higher_scoring_low_one(
+        monkeypatch):
+    """THE MEASURED DEFECT, with the real numbers.  (LOW, 14.08) was
+    hoisted to rank 0 on four separate passes across two boxes, over MEDIUM lane
+    rows at 13.57 -- because the nominee pick read a SCORE-sorted list and
+    priority is only one of ~20 scoring terms. Each pass cost a
+    claim/read/release cycle to decline a goal that had been deliberately
+    downgraded and released in one step so it would NOT re-arm."""
+    _pin_lanes(monkeypatch)
+    low = _row("g-358-86", "asp-368", 14.08, priority=1)
+    medium = _row("g-373-87", "asp-369", 13.57, priority=2)
+    scored = [_row("g-115-1", "asp-115", 18.13), low, medium]
+    picked, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert picked is medium, "the LOW row out-scores the MEDIUM one and must still lose"
+    assert scored[0] is medium
+    assert status["picked"] == "g-373-87"
+    assert "strategic_focus_pick" not in low
+
+
+def test_floor_breaks_a_priority_tie_by_score(monkeypatch):
+    """Ordering is (priority, score) -- within one priority the best-scored row
+    still wins, which is the whole pre-existing behavior."""
+    _pin_lanes(monkeypatch)
+    scored = [
+        _row("g-115-1", "asp-115", 11.6),
+        _row("g-369-5", "asp-369", 7.9, priority=2),
+        _row("g-368-9", "asp-368", 6.27, priority=2),
+    ]
+    picked, _ = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert picked["goal_id"] == "g-369-5"
+
+
+def test_floor_treats_an_absent_priority_as_medium(monkeypatch):
+    """`raw` is absent on hand-built rows and present on 100% of production
+    ones, so an unknown priority must sort as the MEDIUM default -- a row with
+    no `raw` must neither outrank a real HIGH nor lose to a real LOW."""
+    _pin_lanes(monkeypatch)
+    bare = _row("g-369-5", "asp-369", 7.9)              # no `raw` key at all
+    low = _row("g-368-9", "asp-368", 9.9, priority=1)   # out-scores `bare`
+    picked, _ = gs.apply_strategic_focus_floor([_row("g-115-1", "asp-115", 11.6),
+                                                low, bare], "alpha")
+    assert picked is bare, "absent priority must beat an explicit LOW"
+
+    _pin_lanes(monkeypatch)
+    bare2 = _row("g-369-5", "asp-369", 9.9)             # out-scores the HIGH
+    high = _row("g-368-9", "asp-368", 7.0, priority=3)
+    picked2, _ = gs.apply_strategic_focus_floor([_row("g-115-1", "asp-115", 11.6),
+                                                 bare2, high], "alpha")
+    assert picked2 is high, "absent priority must lose to an explicit HIGH"
+
+
+def test_lane_nominee_rank_is_total_and_fail_open():
+    """The shared key both nominee sites use. Malformed rows must not raise --
+    a floor bug must never suppress the ranked output every agent depends on."""
+    assert gs.lane_nominee_rank({"raw": {"priority": 3}, "score": 1.0}) > \
+           gs.lane_nominee_rank({"raw": {"priority": 2}, "score": 99.0})
+    assert gs.lane_nominee_rank({"score": 5.0}) == (2.0, 5.0)
+    assert gs.lane_nominee_rank({"raw": None, "score": None}) == (2.0, 0.0)
+    assert gs.lane_nominee_rank({"raw": {"priority": "nope"}, "score": "x"}) == (2.0, 0.0)
+    assert gs.lane_nominee_rank({}) == (2.0, 0.0)

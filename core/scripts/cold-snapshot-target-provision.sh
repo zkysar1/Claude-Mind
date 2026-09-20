@@ -36,7 +36,7 @@
 # alone; a different value is REFUSED unless --replace (a rotation is a
 # deliberate act). Appends preserve mode 600 (umask 077, temp file + mv).
 # NO SECRET VALUE IS EVER PRINTED — the summary carries key NAMES and verdicts.
-# Verification runs `cold-snapshot.sh --dry-run` and requires its [target] line
+# Verification runs `cold-snapshot.sh --print-target` and requires its [target] line
 # to read mode=pinned cold_endpoint=aws-regional; anything else exits 1.
 #
 # EXIT: 0 provisioned+verified (or dry-run); 1 refusal/verification failure; 2 usage.
@@ -153,9 +153,11 @@ done
 
 verdict="not-verified"
 if [ "$VERIFY" -eq 1 ]; then
-    # The dry run prints the guard-5551 [target] line on stderr before any
-    # enumeration; that line is the whole verification.
-    target_line="$( (cd "$ROOT" && bash core/scripts/cold-snapshot.sh --dry-run 2>&1 >/dev/null) | grep -m1 '^\[target\]' || true)"
+    # --print-target prints the guard-5551 [target] line on stderr and stops;
+    # that line is the whole verification, so the working-set hash a --dry-run
+    # would run after it is pure cost here (g-372-35 — it measured >630s on a
+    # large box and made the sibling caller in owncloud-endpoint-flip.sh hang).
+    target_line="$( (cd "$ROOT" && bash core/scripts/cold-snapshot.sh --print-target 2>&1 >/dev/null) | grep -m1 '^\[target\]' || true)"
     log "${target_line:-[target] line not found}"
     case "$target_line" in
         *"mode=pinned"*"cold_endpoint=aws-regional"*"cold_bucket=${BUCKET}"*) verdict="pinned" ;;

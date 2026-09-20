@@ -76,3 +76,117 @@ class TestPassesThrough:
         # Substring hazard in the other direction: "unblocked" must not trip
         # the "not unblocked" marker.
         assert _guard("Dependent goal was unblocked by this change.") is None
+
+
+# ---------------------------------------------------------------------------
+#  /  (2026-09-20): the guard read the WRONG FIELD.
+#
+# `guard-5228` makes `aspirations-update-goal.sh outcome_note` a REPLACE, so
+# the framework steers every append-only narrative into `progress_note` via
+# `goal-field-append.sh`. This guard indexed `outcome_note` alone — the one
+# field the convention discourages writing to — so a parent that recorded its
+# non-discharge in the sanctioned place was invisible to it.
+#
+# NEITHER HALF OF THE FIX WORKS ALONE. Widening the field scope with the old
+# marker list still matched only 2 of 311 terminal goals and missed this one;
+# the new marker "is not proven" lives in the very field the old scope did not
+# read. Both tested below, and the pairing is tested too.
+# ---------------------------------------------------------------------------
+
+_MEASURED_PROGRESS_SENTENCE = (
+    "Still true and unchanged: nobody should launch to re-prove a static "
+    "fact. End-to-end delivery into a live vessel's ReportApi is NOT proven "
+    "by any of the above and closes inside this goal's own run."
+)
+# Same parent, unrelated side question — a first-person aside, NOT a statement
+# about the dependent. It must not fire, which is why the marker is the
+# declarative "is not proven" and not the bare "not proven".
+_MEASURED_INCIDENTAL_ASIDE = (
+    'So I have PROVEN "no EC2 instance is in the group" and I have NOT proven '
+    "what else holds it — presumably the ALB's own ENIs."
+)
+
+
+def _index(outcome_note=None, progress_note=None):
+    """Build the real index from one synthetic parent goal."""
+    asp = {"id": "asp-000", "goals": [{"id": "g-000-01",
+                                       "outcome_note": outcome_note,
+                                       "progress_note": progress_note}]}
+    return ups._build_parent_narrative_index([(asp, "world")])
+
+
+class TestFieldScope:
+    def test_statement_in_progress_note_fires(self):
+        # SENSITIVITY: the measured instance's shape — the non-discharge is
+        # recorded in progress_note while outcome_note says nothing about it.
+        idx = _index(outcome_note="STAGE 2 IS MEASURED. p50 21.233s, n=20.",
+                     progress_note=_MEASURED_PROGRESS_SENTENCE)
+        r = ups._diagnostic_parent_guard("g-000-01", idx)
+        assert r is not None
+        assert "is not proven" in r
+
+    def test_statement_in_outcome_note_still_fires(self):
+        # SPECIFICITY TWIN: widening the scope must not cost the original path.
+        idx = _index(outcome_note="The dependent goal stays blocked.",
+                     progress_note="Routine progress.")
+        assert ups._diagnostic_parent_guard("g-000-01", idx) is not None
+
+    def test_outcome_note_alone_would_have_missed_it(self):
+        # MUTATION PROOF (guard-385): reconstruct the PRE-FIX index — the old
+        # builder's exact body — and assert it does NOT fire on the same goal.
+        # Without this the two tests above would still pass if someone quietly
+        # reverted the scope, because the marker alone looks sufficient.
+        pre_fix_idx = {"g-000-01": "STAGE 2 IS MEASURED. p50 21.233s, n=20."}
+        assert ups._diagnostic_parent_guard("g-000-01", pre_fix_idx) is None
+        post_fix_idx = _index(
+            outcome_note="STAGE 2 IS MEASURED. p50 21.233s, n=20.",
+            progress_note=_MEASURED_PROGRESS_SENTENCE)
+        assert ups._diagnostic_parent_guard("g-000-01", post_fix_idx) is not None
+
+    def test_non_string_narrative_does_not_take_the_whole_sweep_down(self):
+        # The index is built ONCE for the whole corpus, so an unhandled type
+        # here aborts EVERY goal's evaluation, not just this record's — against
+        # the module's fail-quiet/always-exit-0 contract. Pre-fix the same bad
+        # record only broke its own parent lookup, so concatenating the two
+        # fields WIDENS the blast radius unless both halves are coerced.
+        for bad in (123, ["a"], {"k": "v"}):
+            idx = _index(outcome_note=bad, progress_note=None)
+            assert isinstance(idx["g-000-01"], str), bad
+            assert ups._diagnostic_parent_guard("g-000-01", idx) is None, bad
+
+    def test_marker_does_not_match_across_the_field_seam(self):
+        # The "\n" join is load-bearing: a marker split across the two fields
+        # exists in NEITHER of them and must not be synthesised by the join.
+        idx = _index(outcome_note="... the result is not",
+                     progress_note="proven by the run.")
+        assert ups._diagnostic_parent_guard("g-000-01", idx) is None
+        # Control: the same marker wholly inside one field still fires.
+        whole = _index(outcome_note=None,
+                       progress_note="the delivery is not proven by any of it")
+        assert ups._diagnostic_parent_guard("g-000-01", whole) is not None
+
+    def test_empty_narrative_through_the_builder_passes_through(self):
+        # The builder joins the two fields with "\n", so a goal carrying
+        # NEITHER note yields "\n" — truthy. The guard's emptiness test must
+        # be on the STRIPPED value or every note-less parent would be read as
+        # having said something.
+        idx = _index(outcome_note=None, progress_note=None)
+        assert idx["g-000-01"].strip() == ""
+        assert ups._diagnostic_parent_guard("g-000-01", idx) is None
+
+
+class TestIsNotProvenMarker:
+    def test_declarative_form_fires(self):
+        assert _guard(_MEASURED_PROGRESS_SENTENCE) is not None
+
+    def test_first_person_aside_does_not_fire(self):
+        # SPECIFICITY TWIN, and the reason the marker is not the bare
+        # "not proven": this sentence is from the SAME parent note.
+        assert _guard(_MEASURED_INCIDENTAL_ASIDE) is None
+
+    def test_bare_not_proven_is_deliberately_not_a_marker(self):
+        # Pins the CHOICE, not just the behaviour. If someone later adds
+        # "not proven", the aside above starts firing and this fails loudly
+        # rather than the discrimination silently eroding.
+        assert "not proven" not in ups._PERSISTS_MARKERS
+        assert "is not proven" in ups._PERSISTS_MARKERS

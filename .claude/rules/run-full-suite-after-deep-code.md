@@ -521,9 +521,19 @@ before you kill a run or file a false "suite hangs" blocker:
    auto-backgrounds >2min commands but keeps them bound to the turn).
 
 4. **Sanctioned pacing for an in-turn wait: `EXTERNAL_WAIT=1` (g-115-2678).**
-   ON A REDUCER: background the suite (`run_in_background`), END the turn;
-   harness notifies (guard-1230). **A WORKER MUST NOT — it VOIDS the run;
-   use item 3's in-turn route** (`rationale/suite-run-voided-by-loop-merge.md`).
+   NEVER launch the suite with `run_in_background` — the Bash `timeout` caps at
+   600000ms and kills the whole tree mid-chunk, leaving a log with no VERDICT
+   that is byte-identical to one still running (guard-6148, measured 2026-09-06;
+   it retired the prior "reducer backgrounds it, harness notifies" instruction
+   here). Detach instead: `nohup env MIND_AGENT=.. MIND_SID=.. STORAGE_BACKEND=local
+   bash core/scripts/run-full-suite.sh > LOG 2>&1 < /dev/null &`. That shape
+   commits you to two things: the `< /dev/null`, or an inherited never-EOF stdin
+   degrades the run into zero-shaped output (guard-5140); and POLLING via
+   ScheduleWakeup, because detaching forfeits the completion notification — that
+   is schedule-wakeup-correctness Anti-pattern D (an untracked external wait),
+   NOT the Anti-pattern A prohibition, which covers only harness-TRACKED jobs.
+   Never combine the two shapes (guard-3892). **A WORKER MUST NOT — it VOIDS the
+   run; use item 3's in-turn route** (`rationale/suite-run-voided-by-loop-merge.md`).
    To pace an in-turn sleep, use the flag: `EXTERNAL_WAIT=1 bash
    core/scripts/interruptible-sleep.sh <seconds>`. A BARE interruptible-sleep
    registers no background job, so `background-jobs.sh has-pending` returns rc=1,
