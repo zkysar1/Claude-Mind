@@ -353,6 +353,31 @@ def test_sweep_pushes_health_ledger(tmp_path, monkeypatch):
     assert str(ledger) in set(be.puts), "health ledger MUST sync to S3 (durable signal state)"
 
 
+# --- .history-derived siblings are pruned like .history itself () ---
+@pytest.mark.parametrize("name,excluded", [
+    (".history", True), (".history.pre-move", True), (".history-bak", True),
+    ("history", False), ("health", False), ("conventions", False),
+])
+def test_is_excluded_dir_prefix(name, excluded):
+    assert _mod._is_excluded_dir(name) is excluded
+
+
+def test_sweep_does_not_push_history_tombstone(tmp_path, monkeypatch):
+    # The measured incident shape: a renamed world/.history tombstone was ordinary
+    # world content and one forced flush pushed 21,910 objects fleet-wide.
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path / "rt"))
+    world = tmp_path / "world"
+    tomb = world / ".history.pre-move" / "snapshots" / "x.json"
+    keep = world / "conventions" / "a.md"
+    for p in (tomb, keep):
+        p.parent.mkdir(parents=True)
+        p.write_bytes(b"{}\n")
+    be = FakeBackend([(world, "world")])
+    _mod.sweep(be, only_root="world", dry_run=False, use_manifest=False, full=True)
+    assert str(keep) in set(be.puts), "positive control: ordinary world content must still push"
+    assert str(tomb) not in set(be.puts), ".history-derived tombstone must be walk-pruned"
+
+
 # --- _etag_matches ---------------------------------------------------------
 def test_etag_matches_quoted():
     m = _md5(b"hello")

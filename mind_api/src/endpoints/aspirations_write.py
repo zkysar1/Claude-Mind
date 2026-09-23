@@ -115,6 +115,7 @@ from gates.aspiration_supply import (  # noqa: E402
 )
 from gates.operator_offload import evaluate as _operator_offload_eval  # noqa: E402
 from gates.uncommitted_work import evaluate as _uncommitted_work_eval  # noqa: E402
+from gates.uncommitted_work import refusal_body as _uncommitted_work_refusal  # noqa: E402
 from gates.capability import evaluate as _capability_eval  # noqa: E402
 from gates.completion_artifact import evaluate as _completion_artifact_eval  # noqa: E402
 from gates.residual_work import (  # noqa: E402
@@ -2313,11 +2314,18 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
             body_role=(ctx.headers.get("x-mind-body-role") or "").strip() or None,
         )
         if unc_result.get("would_block"):
-            return Response.json({
-                "error": "uncommitted_work_blocked",
-                "gate": "uncommitted-work-gate",
-                "gate_output": unc_result,
-            }, status=400), None, None
+            # : the caller reads a summary, not the full census. It is
+            # built AFTER the decision, and a failure while building it falls
+            # back to the raw payload, still a 400 -- never an approval
+            # (guard-3803).
+            try:
+                body = _uncommitted_work_refusal(goal_id, unc_result)
+            except Exception as exc:  # noqa: BLE001
+                body = {"error": "uncommitted_work_blocked",
+                        "gate": "uncommitted-work-gate",
+                        "gate_output": unc_result,
+                        "summary_error": f"{type(exc).__name__}: {exc}"[:200]}
+            return Response.json(body, status=400), None, None
 
     # Layer 0: routing-target validation (). Fires on the FIELD, and
     # runs BEFORE the narrative branch below precisely because that branch is
@@ -3569,7 +3577,23 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                                      and _held_sid != _req_sid)
                 _sid_unprovable = bool(_held_sid and not _req_sid)
                 _agent_conflict = bool(_held_by and _held_by != _caller)
-                _lane_conflict = _routes_away_from(_intended, _caller)
+                # The LANE axis does not vote on the claim's own HOLDER
+                # (). A holder got there through claim(), whose lane
+                # check can GRANT (the reallocation exemption, , and
+                # the audited cross_lane override), and this axis can express
+                # neither, so it re-refused a lane decision claim() had already
+                # made. Measured 2026-09-23: bravo claimed  with
+                # cross_lane at 05:05:54, this axis refused the Phase 4
+                # in-progress write, and a SECOND ledger row for the same
+                # decision landed at 05:08:22. On an exempt claim the same
+                # refusal forces the first ledger row a routine rescue must
+                # never write (guard-4817). "Holds" is proven through the sid
+                # axis, so omitting the sid can never reach this abstention.
+                _holds_claim = bool(_held_by and _held_by == _caller
+                                    and not _sid_conflict
+                                    and not _sid_unprovable)
+                _lane_conflict = (not _holds_claim
+                                  and _routes_away_from(_intended, _caller))
 
                 if (_sid_conflict or _sid_unprovable
                         or _agent_conflict or _lane_conflict):

@@ -17,6 +17,37 @@ Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `reflected_by`, `v
 
 ID format: `YYYY-MM-DD_slug` (regex: `^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$`)
 
+Writer-stamped (do not supply): `resolved_at`, `resolved_by`. `_stamp_resolution_provenance`
+(`mind_api/src/world/pipeline_write.py:599-615`) sets them once at resolution and never
+overwrites them.
+
+## Resolution Timestamps: Key Windows on `resolved_at`
+
+A resolved record carries TWO resolution dates, and they are not interchangeable:
+- `outcome_date` is DATE-ONLY and CALLER-supplied, in the resolve merge JSON.
+- `resolved_at` is stamped by the WRITER, to the second.
+
+Count resolutions inside a window [since, now) on `resolved_at`. Fall back to `outcome_date` only
+when `resolved_at` is absent, and report the records carrying NEITHER field beside the count
+(guard-6828). The fallback is itself a date-only key: a record whose `outcome_date` is `since`'s
+own date cannot be placed. Report it as UNPLACEABLE beside the count; never include it (date floor)
+or exclude it (midnight parse) silently.
+
+A date key at a mid-day boundary errs in a direction set by how it is compared:
+- a date floor RE-COUNTS the part of the boundary day before `since`;
+- a midnight parse DROPS the part after it.
+
+Measured 2026-09-23 (g-001-04, window since 2026-09-22T11:16:58):
+- a date floor gave 5 CONFIRMED / 5 CORRECTED;
+- `resolved_at` gave 3 / 1, which is exactly the `--accuracy` numerator's delta over the same
+  interval (rb-11681).
+
+Coverage: `resolved_at` is present on 167 of 168 scoreable records with `outcome_date` >=
+2026-09-01. The one without it carries `resolved_by` but no `resolved_at`, so it was resolved on a
+path that did not run the stamp. It falls on the measured window's boundary day: a date-floor
+fallback would have counted it and printed 4 CONFIRMED against the +3 delta. The digest builder's
+window key is tracked by g-115-10706.
+
 ## Formation-Quality Gate (move to a non-discovered stage)
 
 `pipeline-add.sh` accepts a skeletal record (only the base Required fields

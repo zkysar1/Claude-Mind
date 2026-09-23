@@ -159,7 +159,7 @@ IF outcome_class == "routine":
               category: goal's category
               content: the operational insight
               applies_to: <any|framework|domain|specific>  # REQUIRED. routine ops insights about external services → domain; framework-internal → framework; cross-cutting → any
-              when_to_use: when this insight applies
+              when_to_use: {conditions: [<trigger>]}
               source_goal: goal.id
               tags: ["routine-operational-insight"]
             Log: "ROUTINE OPERATIONAL INSIGHT: {title} from {goal.id}"

@@ -503,6 +503,24 @@ else:
         # (Layer-D auto-Unblock filing for capability_blocked is now inline
         # per PR 7j). Print the body to stderr and exit 1. No fallback.
         printf '%s\n' "$COMBINED" >&2
+        # : END on a verdict. Callers read long refusals through
+        # `2>&1 | tail -N`, which also swaps this exit 1 for tail's 0; a worker
+        # Body read one as "The update succeeded (exit code 0)".
+        printf '%s' "$COMBINED" | $(rt_python_launcher) -c '
+import json, sys
+goal, field = sys.argv[1], sys.argv[2]
+src = sys.stdin.read()
+try:
+    err = json.JSONDecoder().raw_decode(src[src.index("{"):])[0].get("error")
+except Exception:
+    err = None
+if err == "internal_error":
+    print(f"FAILED (internal_error): {goal} {field} may or may not have been written. Re-read the goal before retrying.", file=sys.stderr)
+elif err:
+    print(f"REFUSED ({err}): {goal} {field} was NOT changed. Exit code 1.", file=sys.stderr)
+else:
+    print(f"NOT CONFIRMED: {goal} {field}: the reply was not a refusal body. Re-read the goal before retrying.", file=sys.stderr)
+' "$GOAL_ID" "$FIELD" || true
         exit 1;;
     3)
         # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.

@@ -2,8 +2,14 @@
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
 cd "$PROJECT_ROOT"
-CMD="${1:-select}"
-shift 2>/dev/null || true
+# A leading flag belongs to `select` (): `goal-selector.sh --top 8` is
+# the call agents write -- refused in 4 recorded incidents (3 agents) before
+# --top existed. -h/--help still reach the top-level parser.
+case "${1:-}" in
+  ""|-h|--help) CMD="${1:-select}"; shift 2>/dev/null || true ;;
+  -*) CMD=select ;;
+  *) CMD="$1"; shift ;;
+esac
 source "$CORE_ROOT/scripts/_platform.sh"
 
 # --field <name>: wrapper-level field extraction ().
@@ -16,8 +22,8 @@ source "$CORE_ROOT/scripts/_platform.sh"
 #      empty stdin, caller yields EMPTY, pipeline rc=0.
 # Both produce precisely the "no candidates" misreading the guard exists to
 # prevent, on the MANDATORY selection path. Measured 103x across 8 live sessions.
-# ROOT CAUSE of the piping: `select`/`blocked` take ZERO options (goal-selector.py
-# :6391-6392 register both subparsers with no add_argument), so a caller wanting
+# ROOT CAUSE of the piping: `select`/`blocked` took ZERO options then (goal-selector.py
+# :6391-6392; `select --top N` came later, ), so a caller wanting
 # one field HAS to hand-roll a parser. This flag removes the NEED to parse, which
 # removes the class -- rather than changing the stdout contract, which would risk
 # turning a loud JSONDecodeError into a silent wrong answer for the two live

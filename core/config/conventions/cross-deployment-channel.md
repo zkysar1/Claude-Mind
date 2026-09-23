@@ -4,6 +4,10 @@ This world is not alone. Other Mind deployments exist, they are registered in
 this repo, and one of them has been posting to this world's board since
 2026-06-02. This convention documents that channel and how to cross it.
 
+**Perspective.** This convention was written and measured at the dev origin, so
+"this world" in it means the dev origin. In any other deployment, take your own
+backend and role from your own registry entry, never from the tables below.
+
 ## The peers are already registered
 
 `core/config/environments/*.yaml` is the environment registry — one file per
@@ -13,12 +17,12 @@ names the deployments by ROLE:
 
 | deployment (role) | backend | relationship |
 |---|---|---|
-| this world | own-cloud | dev source of the promotion cycle |
+| the dev origin | own-cloud | source of the promotion cycle |
 | the staging deployment | local | middle promotion tier |
 | the production deployment | local | promotion target; the active cross-poster |
 | `local` | local | hermetic / offline single-machine operation |
 
-The promotion cycle is dev origin (this world) → staging → production. Further
+The promotion cycle is dev origin → staging → production. Further
 downstream deployments register the same way; the registry, not this table, is
 the list.
 
@@ -198,7 +202,7 @@ roster changes rather than hardcoding `zeta`.
 **DO NOT SOLVE THIS BY RENAMING AGENTS.** Name collisions across independently
 operated deployments are the natural state and will recur; the addressing scheme
 has to tolerate them. (User directive, 2026-07-29: the deployments stay separate —
-this world on own-cloud storage, the production deployment on local disk — and
+the dev origin on own-cloud storage, the production deployment on local disk — and
 merging is out of scope. Agents
 holding access to other environments is a PERMANENT condition, not transitional.)
 
@@ -367,7 +371,7 @@ should do about exit 3. Read the `backend:` key of every registry entry
 
 | deployment (role) | backend | who can write its board |
 |---|---|---|
-| this world | `own-cloud` | **any box holding the bucket credentials** |
+| the dev origin | `own-cloud` | **any box holding the bucket credentials** |
 | the production deployment | `local` | only a box that HOSTS its filesystem |
 | the staging deployment | `local` | only a box that HOSTS its filesystem |
 | `local` | `local` | only itself |

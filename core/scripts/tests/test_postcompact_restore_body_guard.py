@@ -191,7 +191,35 @@ def test_body_admitted_even_when_no_runner_is_active(fake_repo):
     assert MARKER in r.stdout, r.stderr
 
 
+def _remove_running_session_id(root: Path) -> None:
+    (root / _paths.AGENTS_PARENT_DIR / AGENT / "session" / "running-session-id").unlink()
+
+
+def test_body_admitted_when_running_session_id_is_absent(fake_repo):
+    """The production shape on a worker box (guard-920): the file is ABSENT,
+    not empty. A worker box never writes one (body-manifest.sh), and under
+    `set -euo pipefail` the cat of an absent file aborted the script at the
+    RUNNING_SID assignment, before the admission above could run (guard-568).
+    Measured 2026-09-23 on zc-01/zc-02: 12 of 19 worker compactions got no
+    restore (g-375-04). The test above writes an EMPTY file, which cat reads
+    fine, so it could not see this."""
+    _remove_running_session_id(fake_repo)
+    _fork_body_wm(fake_repo, BODY_SID)
+    r = _run(fake_repo, BODY_SID)
+    assert MARKER in r.stdout, (r.returncode, r.stderr)
+
+
 # ------------------------------------------------------- axis 2: REFUSE
+
+
+def test_observer_refusal_stays_clean_when_running_session_id_is_absent(fake_repo):
+    """A refusal is a clean skip on a box with no runner file at all, too.
+    Before g-375-04 this path exited 1 at the same assignment."""
+    _remove_running_session_id(fake_repo)
+    _bind(fake_repo, OBSERVER_SID)  # bound, NO working-memory.yaml
+    r = _run(fake_repo, OBSERVER_SID)
+    assert MARKER not in r.stdout, r.stdout
+    assert r.returncode == 0, (r.returncode, r.stderr)
 
 
 def test_observer_is_still_refused(fake_repo):

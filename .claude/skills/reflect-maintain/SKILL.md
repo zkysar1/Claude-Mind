@@ -413,6 +413,22 @@ For each aspiration:
     # 1a: Stuck goals — started but never completed
     IF goal.started is set AND (goal.achievedCount is unset OR achievedCount == 0):
       candidate = true, reason = "started but never completed"
+    # ⚠ 1a AS WRITTEN MEANS "EVER CLAIMED", NOT "STUCK". achievedCount is a
+    # recurring-cycle counter, and recurring goals are skipped above, so its clause
+    # is always true here. Measured 2026-09-23 (echo, cc-03, 6.8.0-139-generic):
+    # 3063 non-recurring pending/blocked goals, 280 with `started`, 0 of those 280
+    # with achievedCount > 0. By last touch, 87 were touched <=3d ago and 82 in
+    # 3-14d; most of those carry a re-probed defer_reason and a `progress` release.
+    # 0 of 29 in the focus lanes were groomable. TRIAGE WITH THIS EXACT PREDICATE
+    # (guard-5111: reuse it, do not re-derive it):
+    #   last_touch = max(last_modified, defer_reason_set_at, started,
+    #                    release_negatives[].at | released_at)
+    #   stale = (now - last_touch) > 14d AND defer_reason is null AND claimed_by is null
+    # That left 91 of 280. Evaluate the oldest first. That pass SKIPPED 1 of the 5
+    # oldest (g-115-913, a symptom that no longer reproduced) and KEPT 4.
+    # Step 1's load needs `aspirations-query.sh --goal-status pending,blocked --full`.
+    # The compact loader returns aspirations-compact-summary.json, which omits
+    # goals, and the default query projection omits the fields named above.
 
     # 1b: Stale blockers — all dependencies resolved but blocked_by not cleared
     IF goal.blocked_by is non-empty:

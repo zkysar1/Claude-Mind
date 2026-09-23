@@ -106,7 +106,6 @@ from aspirations import (TERMINAL_GOAL_STATUSES, STRUCTURED_DEFER_PREFIXES,  # n
 from gates.reallocation_exempt import (  # noqa: E402  ( SSOT)
     is_owner_scoped_goal as _realloc_is_owner_scoped,
     recurring_cadence_stranded as _realloc_cadence_stranded,
-    evaluate as _realloc_exempt_eval,
     idle_agents as _realloc_idle_agents,
     confirms_dormant as _realloc_confirms_dormant)
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
@@ -4768,12 +4767,9 @@ def emit_strategic_focus_banner(scored, agent_name):
     if not lanes:
         return []  # no standing directive, or its prose names no asp-NNN
 
-    def _eligible(s):
-        # A goal with no intended_agent is open to anyone; "either" likewise.
-        ia = s.get("intended_agent")
-        return bool(s.get("routed_to_me")) or ia in (None, "", "either", agent_name)
-
-    mine = [s for s in scored if _eligible(s)]
+    # The floor's predicate, not a copy of it (): a hand-kept twin
+    # here drifted with it once already.
+    mine = [s for s in scored if _strategic_focus_claimable(s, agent_name)]
     if not mine:
         return []
     top = mine[0]
@@ -6720,21 +6716,28 @@ def emit_drain_lane_banner(picked, eligible_count, since, k):
         # leave it for the owner is strictly worse than not surfacing it — it
         # consumes the one lane slot AND produces no rescue.
         #
-        # The deviation code is still NOT waived, and the claim still needs
-        # --cross-lane: aspirations.py's claim path computes _lane_conflict from
-        # routes_away_from alone and never consults gates.reallocation_exempt
-        # (imported HERE as _realloc_exempt_eval and never called — the gate
-        # built for exactly this case has zero production callers). So name the
-        # ceremony instead of forbidding the claim.
+        # CORRECTED AGAIN 2026-09-23 (, echo/cc-03): the claim is
+        # CLEAN, so the waiver holds and no --cross-lane ceremony applies. The
+        # daemon claim endpoint, the path aspirations-claim.sh takes, has called
+        # gates.reallocation_exempt since 2026-09-05 (b2900bcc69, ):
+        # 37 of 55 decisions logged 09-05..09-23 were passes (13 via the cadence
+        # door), none needing an override. The "zero production callers"
+        # reading searched aspirations.py (the update-goal CLI mirror) and this
+        # file, never mind_api/src. What DID refuse a rescue was the update-goal
+        # takeover guard on the Phase 4 in-progress write; its lane axis now
+        # abstains for the claim's holder. And --cross-lane was worse than
+        # unneeded: it is an audited BYPASS of the claim-time re-check, the one
+        # check that notices an escape that closed after selection.
         closing = (
-            "This IS the sanctioned lane pick and it IS yours to claim, but it "
-            "declares intended_agent='{ia}': it reached your pool ONLY because "
-            "its reallocation escape opened (owner idle, or recurring and "
-            "cadence-stranded on a busy owner), so it was surfaced here to be "
-            "rescued — do NOT abstain and do NOT leave it for the owner, who "
-            "structurally cannot rank it. The deviation code is not waived: "
-            "claim it with --cross-lane \"reallocation-exempt: intended_agent "
-            "'{ia}' unreachable, goal unclaimed and not owner-scoped\"."
+            "This IS the sanctioned lane pick and it IS yours to claim — claim "
+            "it without a deviation code and WITHOUT --cross-lane. It declares "
+            "intended_agent='{ia}' and reached your pool ONLY because its "
+            "reallocation escape opened (owner idle, or recurring and "
+            "cadence-stranded on a busy owner); the claim re-checks that escape "
+            "(gates.reallocation_exempt) and grants it with no override. If the "
+            "claim is refused (cross_lane_refused), the escape closed after "
+            "selection: take the next candidate, do not force it. Do NOT abstain "
+            "for the owner, who structurally cannot rank it."
             .format(ia=picked.get("intended_agent"))
         )
     else:
@@ -6754,11 +6757,28 @@ def emit_drain_lane_banner(picked, eligible_count, since, k):
 
 
 def _strategic_focus_claimable(s, agent_name):
-    """Rows this agent may actually claim. Same predicate as
-    emit_strategic_focus_banner._eligible — kept identical on purpose so the
-    banner and the floor can never disagree about what "available" means."""
-    ia = s.get("intended_agent")
-    return bool(s.get("routed_to_me")) or ia in (None, "", "either", agent_name)
+    """Rows this agent may claim with no lane ceremony, which the directive
+    floor may spend its one slot on. The ONE predicate behind the floor,
+    emit_strategic_focus_banner and the drain banner's routed-away clause.
+
+    The lane test is routes_away_from, the claim path's own test, not a
+    vocabulary tuple (g-115-10593). The tuple `(None, "", "either", agent_name)`
+    was strictly narrower: an intended_agent OUTSIDE the live vocabulary (a
+    retired agent, the cycle-detector's "any") routes nowhere, so the claim
+    path accepts it outright (g-115-3482), yet the tuple called it routed away
+    and the drain banner prescribed a lane ceremony the claim does not need.
+
+    Reallocation rescues (routed away, in the pool only because their escape
+    opened) stay OUT, deliberately. The claim path grants them
+    (gates.reallocation_exempt, g-115-3492), but that predicate cannot see
+    HOST-pinned work (is_owner_scoped_goal's SCOPE NOTE, g-115-5978), and a
+    floor hoist passes the claim chokepoint with no deviation code. Measured:
+    g-326-188 was idle-door rescued 2026-09-21 and released the same day
+    because it needs its owner's GUI-tool host. A rescue reaches index 0
+    through the drain lane or its own score, never through the floor.
+    """
+    return (bool(s.get("routed_to_me"))
+            or not routes_away_from(s.get("intended_agent"), agent_name))
 
 
 def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
@@ -7275,6 +7295,67 @@ def write_scorer_verdict_banners(banners, agent_dir):
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
 
+# `select --top N` (): the bounded view a context-limited Body reads.
+# Measured 2026-09-23 on DESKTOP-O91DLK2: the full ranking was 2,578 rows /
+# 6,923,586 bytes (~2.2 KB per row, mostly breakdown/raw). zakcode keeps 64 KB
+# of a tool result and Claude Code keeps 30,000 chars, so a Body read only the
+# first few rows anyway, at ~16-20k tokens per selection.
+_BRIEF_TITLE_CHARS = 160
+_BRIEF_WHY_TERMS = 3
+
+
+def _brief_rows(scored, n):
+    """Project the first N ranked rows to what a Body needs to choose one.
+
+    Slices and NEVER re-sorts (guard-5135): index 0 is the scorer's chosen pick,
+    which a hoist can place above a higher-scoring row. `why` names the hoist
+    that placed the row, if any, then its largest breakdown terms.
+    """
+    brief = []
+    for row in scored[:n]:
+        hoists = sorted(k[:-len("_pick")] for k, v in row.items()
+                        if k.endswith("_pick") and v is True)
+        terms = sorted(((k, v) for k, v in (row.get("breakdown") or {}).items()
+                        if isinstance(v, (int, float)) and v),
+                       key=lambda kv: -abs(kv[1]))[:_BRIEF_WHY_TERMS]
+        why = ", ".join(f"{k} {v:+g}" for k, v in terms)
+        if hoists:
+            why = f"hoisted by {'+'.join(hoists)}; {why}"
+        title = row.get("title") or ""
+        if len(title) > _BRIEF_TITLE_CHARS:
+            title = title[:_BRIEF_TITLE_CHARS - 3] + "..."
+        brief.append({
+            "goal_id": row.get("goal_id"),
+            "source": row.get("source"),
+            "title": title,
+            "score": row.get("score"),
+            "skill": row.get("skill"),
+            "executable_by_role": row.get("executable_by_role"),
+            "recurring": row.get("recurring"),
+            "routed_to_me": row.get("routed_to_me"),
+            "why": why,
+        })
+    return brief
+
+
+def _emit_select(scored, top=None):
+    """Print the ranking: every full row, or with `top` the brief first-N view.
+
+    The brief is one compact row per line, and it is still a JSON list with the
+    pick at index 0, so `goal-selector.sh --field` and any d[0] reader work
+    unchanged. The stderr line says it is a slice; a truncated view that does
+    not say so reads as the whole queue (guard-3211).
+    """
+    if top is None:
+        print(json.dumps(scored, indent=2, ensure_ascii=False))
+        return
+    rows = _brief_rows(scored, top)
+    print("[\n" + ",\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n]")
+    print(f"[goal-selector] --top {top}: showing {len(rows)} of {len(scored)} ranked "
+          f"candidates in the scorer's order (index 0 is the pick). Omit --top for "
+          f"every row with its full breakdown.", file=sys.stderr)
+
+
 def cmd_select(args):
     """Score and rank all unblocked goals from both world and agent queues.
 
@@ -7728,7 +7809,7 @@ def cmd_select(args):
     # (). Fail-open; never reached by cmd_blocked (guard-2545).
     write_scorer_verdict_banners(banners, AGENT_DIR)
 
-    print(json.dumps(scored, indent=2, ensure_ascii=False))
+    _emit_select(scored, getattr(args, "top", None))
 
 
 def cmd_blocked(args):
@@ -7995,7 +8076,13 @@ def cmd_blocked(args):
 def main():
     parser = argparse.ArgumentParser(description="Goal scoring with exploration noise")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("select", help="Score and rank all unblocked goals")
+    p_select = sub.add_parser("select", help="Score and rank all unblocked goals")
+    p_select.add_argument(
+        "--top", type=int, metavar="N",
+        help="Print only the first N rows, compact (goal_id, source, title, score, "
+             "skill, executable_by_role, recurring, routed_to_me, why), in the "
+             "scorer's order. For a context-limited reader such as a worker Body "
+             "(g-375-06). Omit for every row with its full breakdown.")
     p_blocked = sub.add_parser("blocked", help="List all blocked goals with reasons")
     # The help text is %-formatted AGAIN by argparse's HelpFormatter, so every
     # literal percent must survive as `%%` in the FINAL string — hence an
@@ -8011,6 +8098,8 @@ def main():
               f"only_reasons / suppressed_reasons / summary.partial_view. "
               f"Omit for the full, unchanged view."))
     args = parser.parse_args()
+    if getattr(args, "top", None) is not None and args.top < 1:
+        parser.error("--top must be at least 1")
     {"select": cmd_select, "blocked": cmd_blocked}[args.command](args)
 
 

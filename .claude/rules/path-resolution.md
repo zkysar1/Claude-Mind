@@ -85,8 +85,8 @@ location invents a plausible-looking new top-level directory instead
   (the sanctioned scratch home — a never-bound SID is still refused); shell
   `mkdir`/`cp`/`touch` (bypass the hooks); writes inside `PROJECT_ROOT` outside
   the bound agent's dir; writes inside `AGENT_WRITE_PATH`.
-- Cross-agent writes are not covered by design — route through `world/board/`
-  or `world/team-state.yaml` per `coordination.md`.
+- Cross-agent writes: advisory only (g-375-04) — route via
+  `world/board/` or `world/team-state.yaml` per `coordination.md`.
 
 **There is no agent-side override flag.** To add a top-level entry
 legitimately: ask the user (they create it or approve a path under an existing

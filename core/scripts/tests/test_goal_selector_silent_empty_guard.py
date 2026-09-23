@@ -169,6 +169,18 @@ def test_bare_invocation_forwards_select(tmp_path):
     )
 
 
+def test_leading_flag_forwards_select_but_help_stays_top_level(tmp_path):
+    """: `goal-selector.sh --top 8` is the call agents write (4 recorded
+    incidents refused it before --top existed), so a leading flag means select.
+    --help must still reach the top-level parser, which lists the subcommands."""
+    binddir = _stub_python(tmp_path, '    printf "ARGV:%s,%s,%s" "$2" "$3" "$4"; exit 0')
+    r = _run(binddir, args=("--top", "8"))
+    assert r.returncode == 0, (r.returncode, r.stderr[-500:])
+    assert r.stdout == "ARGV:select,--top,8"
+    r = _run(binddir, args=("--help",))
+    assert r.stdout == "ARGV:--help,,", r.stdout
+
+
 # ---------------------------------------------------------------------------
 # --field extraction ().
 #

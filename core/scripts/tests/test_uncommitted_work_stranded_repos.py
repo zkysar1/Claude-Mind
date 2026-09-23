@@ -505,3 +505,190 @@ def test_dirty_tracked_still_blocks_under_an_identical_tree(tmp_path, framework_
                    repo_path=framework_repo, world_dir=world)
     assert res["stranded_would_block"] is True, res["stranded_repos"]
     assert res["stranded_repos"][0]["dirty_tracked"], res["stranded_repos"]
+
+
+# ── : squash/rebase phantoms are released by CONTENT ──────────────
+# A squash or rebase merge lands a feature commit's content under a NEW sha, so
+# the original stays unreachable from the delivery ref and read as stranded.
+# Each fixture asserts its commit is local-only (so the UNFIXED gate blocks on
+# it), and each release test also proves the block with the discriminator
+# disabled, so none of them can pass vacuously.
+
+
+def _land_on_origin(tmp_path: Path, clone: Path, tag: str,
+                    files: dict, msg: str) -> None:
+    """Commit `files` to origin's master from a second clone, the way a
+    squash or rebase merge lands content under a sha the first clone lacks."""
+    other = tmp_path / f"lander-{tag}"
+    subprocess.run(["git", "clone", "-q", _git(clone, "remote", "get-url", "origin"),
+                    str(other)], capture_output=True, check=True)
+    _git(other, "config", "user.email", "t@t"); _git(other, "config", "user.name", "t")
+    for name, text in files.items():
+        (other / name).write_text(text)
+    _git(other, "add", "-A"); _git(other, "commit", "-m", msg)
+    _git(other, "push", "-q", "origin", "master")
+
+
+def _assert_local_only(clone: Path, sha: str) -> None:
+    assert _git(clone, "branch", "-r", "--contains", sha) == "", (
+        f"setup failed: {sha[:8]} is on a remote ref, so it would never block "
+        f"and the test would pass against the unfixed gate")
+
+
+def _blocks_with_discriminator_disabled(monkeypatch, world, framework_repo, goal_id):
+    """The same fixture with _landed_by_content disabled must BLOCK. That is
+    the proof the release test measures the new discriminator, not a fixture
+    that never blocked in the first place."""
+    import gates.uncommitted_work as uw
+    monkeypatch.setattr(uw, "_landed_by_content", lambda *a, **k: {})
+    res = uw.evaluate(goal_id=goal_id, override=None,
+                      repo_path=framework_repo, world_dir=world)
+    monkeypatch.undo()
+    return res["stranded_would_block"]
+
+
+def test_single_commit_squash_phantom_is_released_as_patch_equivalent(
+        tmp_path, framework_repo, monkeypatch, capsys):
+    """The zc-02 / da232134 shape. A one-commit branch whose content landed
+    under a new sha, AFTER WHICH the ref changed the same file again. Only
+    patch-id equivalence can see this: the file on the ref no longer matches
+    the branch, so a content comparison alone would keep blocking."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-7029a): work")
+    phantom = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "-q", "master")
+
+    _land_on_origin(tmp_path, clone, "squash", {"app.py": "v2\n"}, "work (#1)")
+    _land_on_origin(tmp_path, clone, "later", {"app.py": "v3 later\n"}, "later")
+    _git(clone, "fetch", "-q", "origin")
+    _assert_local_only(clone, phantom)
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    assert _blocks_with_discriminator_disabled(
+        monkeypatch, world, framework_repo, "g-test-7029a") is True
+
+    capsys.readouterr()  # drop the disabled-discriminator run's output
+    res = evaluate(goal_id="g-test-7029a", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    finding = res["stranded_repos"][0]
+    assert finding["landed_stranded_commits"] == [phantom], finding
+    assert finding["landed_via"] == {phantom: "patch-equivalent"}, finding
+    # Released, never silent (guard-1760): the operator-facing NOTE must name it.
+    err = capsys.readouterr().err
+    assert "whose CONTENT is already on it (patch-equivalent)" in err, err
+
+
+def _multi_commit_squash(tmp_path: Path) -> tuple:
+    """A two-commit branch squashed into ONE commit on origin, after which the
+    ref moves on with unrelated work, so whole trees differ. The union patch
+    matches neither original's patch-id (guard-4009)."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-7029b): part 1")
+    (clone / "lib.py").write_text("helper\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-7029b): part 2")
+    shas = _git(clone, "rev-list", "HEAD", "--not", "master").split()
+    _git(clone, "checkout", "-q", "master")
+
+    _land_on_origin(tmp_path, clone, "squash",
+                    {"app.py": "v2\n", "lib.py": "helper\n"}, "part 1+2 (#2)")
+    _land_on_origin(tmp_path, clone, "unrelated", {"other.py": "x\n"}, "unrelated")
+    _git(clone, "fetch", "-q", "origin")
+    for sha in shas:
+        _assert_local_only(clone, sha)
+    assert _git(clone, "rev-parse", "feature^{tree}") != \
+        _git(clone, "rev-parse", "origin/master^{tree}"), \
+        "setup failed: whole trees are equal, so this is not the N>1 case"
+    return clone, shas
+
+
+def test_multi_commit_squash_phantom_is_released_by_content_on_ref(
+        tmp_path, framework_repo, monkeypatch):
+    """The case patch-id cannot see. Both originals are released through the
+    branch tip's content comparison, which releases the tip's whole off-ref
+    ancestry at once."""
+    clone, shas = _multi_commit_squash(tmp_path)
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    assert _blocks_with_discriminator_disabled(
+        monkeypatch, world, framework_repo, "g-test-7029b") is True
+
+    res = evaluate(goal_id="g-test-7029b", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    finding = res["stranded_repos"][0]
+    assert sorted(finding["landed_stranded_commits"]) == sorted(shas), finding
+    assert set(finding["landed_via"].values()) == {"content-on-ref"}, finding
+    assert not finding["unattributed_unmerged"], finding
+
+
+def test_unpushed_commit_on_top_of_a_squashed_branch_still_blocks(
+        tmp_path, framework_repo):
+    """POSITIVE CONTROL (outcome 2). The squashed branch gains one more commit
+    that exists nowhere upstream. That commit must block, while the two
+    squashed commits under it are still released: the verdict is per commit,
+    never per branch."""
+    clone, shas = _multi_commit_squash(tmp_path)
+    _git(clone, "checkout", "-q", "feature")
+    (clone / "app.py").write_text("v4 genuinely unpushed\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-7029b): new work")
+    unpushed = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "-q", "master")
+    _assert_local_only(clone, unpushed)
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-7029b", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+    finding = res["stranded_repos"][0]
+    assert finding["stranded_commits"] == [unpushed], finding
+    assert sorted(finding["landed_stranded_commits"]) == sorted(shas), finding
+
+
+def test_sibling_branch_that_merged_the_squash_cannot_veto_the_original(tmp_path):
+    """The measured false negative (0868ad4). A sibling branch contains the
+    original commit AND, after merging the ref, its squash. Its patch walk
+    therefore omits the squash from the left side and marks the original `>`.
+    That mark is relative to the sibling's walk, not a verdict on the
+    original, so the original must still be released by its own walk."""
+    from gates.uncommitted_work import _landed_by_content
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "fix")
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-7029c): a")
+    original = _git(clone, "rev-parse", "HEAD")
+    _land_on_origin(tmp_path, clone, "squash", {"app.py": "v2\n"}, "a (#3)")
+    _git(clone, "fetch", "-q", "origin")
+
+    _git(clone, "checkout", "-q", "-b", "sibling")
+    _git(clone, "merge", "--no-edit", "-q", "origin/master")
+    (clone / "new.py").write_text("sibling work\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-7029c): new")
+    tip = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "-q", "master")
+
+    ref = "refs/remotes/origin/master"
+    walk = _git(clone, "log", "--cherry-mark", "--right-only", "--no-merges",
+                "--format=%m %H", f"{ref}...{tip}")
+    assert f"> {original}" in walk.splitlines(), (
+        "setup failed: the sibling walk does not mis-mark the original, so the "
+        f"test would pass against the defect. walk: {walk!r}")
+
+    # The sibling's walk must run FIRST, as it did in the incident. Same-second
+    # fixture commits leave rev-list's order to ref iteration, so fix it here.
+    landed = _landed_by_content(clone, ref, [tip, original])
+    assert landed.get(original) == "patch-equivalent", landed
+    assert tip not in landed, landed
+
+
+def test_landed_probe_fails_closed_on_an_unreadable_ref(tmp_path):
+    """Tri-state (guard-4009 rule 2): when the comparison cannot run, the
+    commit is NOT proven landed, so it stays out of the result and keeps
+    blocking."""
+    from gates.uncommitted_work import _landed_by_content
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    sha = _git(clone, "rev-parse", "HEAD")
+    assert _landed_by_content(clone, "refs/remotes/origin/no-such-ref", [sha]) == {}

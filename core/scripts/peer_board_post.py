@@ -11,7 +11,7 @@ The supported path and the safe path contradicted each other, which is the
 likely mechanical cause of the 140-in / 1-out asymmetry.
 
 THE HAZARD THIS EXISTS TO PREVENT (guard-955 / rb-2983 class). Peers can run
-DIFFERENT storage backends -- this deployment is ``own-cloud`` while a peer's
+DIFFERENT storage backends -- the dev origin is ``own-cloud`` while a peer's
 registry entry can declare ``local`` (each peer's backend is recorded in
 ``core/config/environments/<env-id>.yaml``). ``storage_backend._apply_registry_defaults`` derives storage wiring
 from the CALLER's ``ENVIRONMENT_ID``. So importing ``_fileops`` from an

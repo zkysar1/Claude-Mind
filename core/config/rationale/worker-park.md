@@ -191,6 +191,49 @@ the demoted runner, bound autonomous, the demotion is recent and no user-stop
 artifact post-dates it, no peer holds the claim) it restores the runner
 triple-write + heartbeat + RUNNING and logs `action: yank_reversed`.
 
+## Context pressure is not a close condition — the Phase 1 text, measured
+
+Moved verbatim from worker-loop Phase 1 (the no-goal branch) on 2026-09-23
+(g-115-8214), when the skill was dieted under the 65,536 B injection ceiling.
+The branch's instructions stayed in the skill; this is the evidence and history
+it carried inline.
+
+IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
+  NOT a close (g-353-73). Exhaustion is TRANSIENT on a multi-Body fleet: measured
+  2026-08-29 (8 Bodies), four workers read 0 candidates minutes apart while
+  siblings held an aspiration's tail; 25 min later SELECT ranked 18 — all four had
+  closed durably and sat dead until a human relaunched them. A worker with no
+  work is WAITING, not finished.
+
+  THE CLOSE CONDITION IS EXHAUSTIVE — THERE IS EXACTLY ONE, and it is the only
+  place in this file that writes the sentinel: an EXPIRED park, reached from
+  either trigger (reducer gone, Phase 0.5; supply gone, here). A user stop is the
+  other path and is not yours to initiate. Anything else is an INVENTED stop
+  condition (guard-3479). NARROWED TWICE, never widened: g-306-291 made rc=1
+  park instead of close; g-353-73 made SELECT-exhausted park instead of close.
+  The invented-close conservatism is untouched, and parking must never acquire
+  a soft edge for anything else.
+  ** CONTEXT PRESSURE IS NEITHER A CLOSE NOR A PARK CONDITION. ** Not "context is
+  filling up", "the session has run long", "I have done N units", "the next goal
+  will not fit". Autocompact makes a long session survivable and this loop runs
+  indefinitely: nearly-out-of-context is a reason to enter the next unit
+  (stop-hook-compliance.md rules 3-4). Measured 2026-08-11: a Body closed itself
+  after 12 units with ~930 candidates and a live reducer, then wrote a persuasive
+  board post explaining why — the post is the SIGNATURE of the defect.
+  IF A SPECIFIC GOAL WILL NOT FIT, RELEASE THE CLAIM UNSTARTED and keep looping —
+  `aspirations-release.sh <goal-id> --source <world|agent>`, then VERIFY by
+  re-reading that the record shows status=pending / claimed_by=None (the release
+  echo is not proof). Never close or park the Body for it.
+  WHY A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM
+  snapshot, Phase -0's closure gate REFUSES every further unit on this SID, and
+  `body_state: closed-pending-merge` is DURABLE — only a user `/start` of a NEW
+  session reopens work. A wrong close STRANDS the queue on a human who does not
+  know they are needed; a wrong park costs one hourly poll.
+  (The reducer generates work, not the worker. A worker does not INVENT an agenda —
+   but "never files a goal" is too strong and was ruled on: see "May a worker file a
+   goal?" below. Do NOT file here regardless; SELECT finding nothing is the park
+   edge, not a moment to manufacture work.)
+
 ## Cross-references
 
 - g-357-51 — absent-heartbeat inertness, the pre-kill re-check, the yank

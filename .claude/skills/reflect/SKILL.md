@@ -876,7 +876,15 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # backlog stays visible without being transcribed.
      stale = [(k, n) for k, n in nodes.items() if n.retrieval_count > 10 and days_since(n.last_updated) > 14]
      Log: "▸ Tree lint: {len(stale)} stale high-retrieval nodes (of {len(hi)} with rc>10) — flagging top 5"
-     FOR EACH node in sorted(stale, by retrieval_count desc)[:5]:
+     # CHECK THE CAP FIRST (echo, cc-03, 2026-09-23, g-001-01 i520). knowledge_debt is
+     # capped at core/config/memory-pipeline.yaml array_limits.knowledge_debt, and a
+     # wm-append into a FULL slot silently evicts the oldest unflagged entry, whatever
+     # its priority. Measured: 5 appends into a 15/15 slot evicted a HIGH debt and a
+     # hand-written framework contradiction, to make room for 5 lint flags that this
+     # step regenerates on every fire (guard-7307). Append only into FREE slots. The
+     # Log line above already reports the full backlog, so nothing is lost by skipping.
+     free = cap - len(wm-read.sh knowledge_debt --json)
+     FOR EACH node in sorted(stale, by retrieval_count desc)[:min(5, max(0, free))]:
          echo '{"node_key": "<key>", "reason": "stale-high-retrieval", "retrieval_count": <N>, "days_since_update": <M>, "total_stale_at_scan": <len(stale)>, "priority": "MEDIUM"}' | wm-append.sh knowledge_debt
          IF exit 0: Log: "▸ Tree lint: {node.key} flagged stale (retrieved {retrieval_count}x, last updated {days_ago}d ago)"
      

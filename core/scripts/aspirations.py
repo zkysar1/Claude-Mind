@@ -1948,7 +1948,8 @@ def cmd_update_goal(args):
         # defer_reason / lastAchievedAt. A blanket cross-lane refusal breaks
         # every one of them (the  over-fix trap). Verified 2026-07-14:
         # the only writer of status->in-progress is aspirations-execute Phase 4
-        # (on an already-claimed goal, so already past claim()'s same check),
+        # (on an already-claimed goal, so already past claim()'s lane check —
+        # which is why the lane axis below abstains for the holder),
         # and nothing writes claimed_by through update-goal at all.
         if ((field == "status" and value == "in-progress")
                 or field == "claimed_by"):
@@ -1986,7 +1987,17 @@ def cmd_update_goal(args):
                                  and _held_sid != _req_sid)
             _sid_unprovable = bool(_held_sid and not _req_sid)
             _agent_conflict = bool(_held_by and _held_by != _caller)
-            _lane_conflict = routes_away_from(_intended, _caller)
+            # The LANE axis does not vote on the claim's own HOLDER
+            # () — mirror of the daemon side; the measured incident
+            # and the ledger reasoning are recorded there. claim() adjudicated
+            # the lane (reallocation exemption or audited cross_lane) and this
+            # axis cannot express either. "Holds" is proven through the sid
+            # axis, so omitting the sid can never reach this abstention.
+            _holds_claim = bool(_held_by and _held_by == _caller
+                                and not _sid_conflict
+                                and not _sid_unprovable)
+            _lane_conflict = (not _holds_claim
+                              and routes_away_from(_intended, _caller))
 
             if (_sid_conflict or _sid_unprovable
                     or _agent_conflict or _lane_conflict):

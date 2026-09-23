@@ -1095,7 +1095,8 @@ def _entry_matches_text(entry, categories):
     """Token-overlap fallback for supplementary stores when category match fails.
 
     Matches free-text queries against entry title, content/rule/summary, tags,
-    and when_to_use fields. Symmetry counterpart to the tree-node
+    and when_to_use fields (the {"conditions": [...]} shape or a legacy bare
+    string, g-115-10666). Symmetry counterpart to the tree-node
     Substring/Word-prefix/Concept channels — without this, supplementary
     stores were invisible to free-text queries that did not match an exact
     category key (see core/config/conventions/retrieval-triggers.md G9).
@@ -1112,7 +1113,10 @@ def _entry_matches_text(entry, categories):
     topical relevance. Two distinct length-≥5 tokens is the threshold
     where noise drops to manageable levels while canonical entries
     (rb-774, guard-165, guard-346, guard-147) still surface for their
-    motivating queries. See 2026-05-12 fresh-eyes review.
+    motivating queries. See 2026-05-12 fresh-eyes review. guard-346 was
+    retired 2026-09-20 for guard-5004, which holds its whole rule; re-measured
+    2026-09-23 (g-115-10666), guard-165, guard-147 and guard-5004 each rank 1
+    or 2 on rule-phrased queries, and rb-774 is universal, never token-matched.
 
     Added 2026-05-12 for retrieval-triggers.md G9 / R3. The
     `_entry_matches_category` strict-only matcher remains the primary
@@ -1180,6 +1184,14 @@ def _entry_token_corpus_uncached(entry):
             parts.extend(s for s in cond if isinstance(s, str))
         elif isinstance(cond, str):
             parts.append(cond)
+    elif isinstance(when, str):
+        # The canonical shape is {"conditions": [...]}, the store default; a bare string is
+        # the legacy one, and 4,901 of 11,056 active reasoning-bank entries and 135 of 6,900
+        # guardrails still carry it (). Skipping it hid each of those entries from
+        # the situation its when_to_use names: queried by its own when_to_use, a string-shaped
+        # guardrail reached the top 20 for 40 of 135 before this branch and 134 after.
+        # embedding-index-build.py's match_text, which embeds this same surface, reads it too.
+        parts.append(when)
     if not parts:
         return set()
     corpus = " ".join(parts).lower()

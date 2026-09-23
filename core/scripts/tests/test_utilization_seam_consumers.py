@@ -207,10 +207,30 @@ def test_sort_handles_records_of_a_kind_with_no_sidecar():
 
 # ------------------------------------------------------------- merged load --
 
-def test_load_all_counters_is_empty_while_no_sidecar_exists():
-    """Today's state on every box, and the precondition every other consumer
-    test relies on."""
-    assert load_all_counters() == {}
+def test_load_all_counters_is_empty_while_no_sidecar_exists(tmp_path):
+    """A world holding no sidecar reads as {}.
+
+    Pinned to a tmp world (g-115-10079). This used to read the LIVE world, which
+    has held sidecars since the writer landed, so it was red on every box that
+    had one. The assertion is on a count so a failure stays one readable line:
+    the old whole-dict compare printed a diff of every leaked id (~147K lines),
+    which buried the scoped runner's own summary."""
+    leaked = sorted(load_all_counters(tmp_path))
+    n = len(leaked)
+    assert n == 0, "%d ids read from a world with no sidecar, e.g. %s" % (n, leaked[:5])
+
+
+def test_load_all_counters_reads_the_world_it_is_given(tmp_path):
+    """The positive control for the test above (guard-4166). A loader that
+    returned {} unconditionally, or ignored `world_dir`, would pass that test;
+    it fails this one. Kept separate so each mutation shows which one fired."""
+    (tmp_path / "guardrails-utilization.jsonl").write_text(
+        '{"id": "guard-g10079", "utilization": {"retrieval_count": 3}}\n',
+        encoding="utf-8")
+    got = load_all_counters(tmp_path)
+    planted = got.get("guard-g10079")
+    assert planted == {"retrieval_count": 3}, (
+        "%d ids read back, planted id -> %r" % (len(got), planted))
 
 
 def test_utilization_of_prefers_sidecar_then_embedded_then_empty():

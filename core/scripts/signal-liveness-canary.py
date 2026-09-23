@@ -67,8 +67,10 @@ import datetime as _dt
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -225,19 +227,32 @@ _MARKER_TOKEN = "domain-leak" + "-exempt:"
 _CANARY_PROBE_NODE = "zzz-signal-liveness-canary-probe.md"
 
 
-def _probe(argv: list[str], stdin_text: str | None = None) -> tuple[int, str, str]:
+def _probe(argv: list[str], stdin_text: str | None = None,
+           drop_env: tuple[str, ...] = (),
+           extra_env: "dict[str, str] | None" = None) -> tuple[int, str, str]:
     """Run an instrument and return (rc, stdout, stderr). Raises if it cannot run.
 
     `stdin_text` exists for the PreToolUse-hook gates, which take their whole
     input as JSON on stdin rather than in argv. Default None keeps every
     pre-existing call byte-identical.
 
+    `drop_env` names variables the CHILD must not inherit — for a row whose probe
+    writes, so a regression cannot aim the write at live state (see
+    _pending_obligation_assertion). Default () keeps every other call byte-identical.
+
+    `extra_env` sets variables in the CHILD only — for a row that points its probe at a
+    throwaway world through the gate's own override seams (_domain_suite_gate_assertion).
+    Default None keeps every other call byte-identical.
+
     Every probe carries LIVENESS_PROBE_ENV so the probed gate does not log its
     must-trip refusal as a production firing (g-318-168, _gate_log docstring).
+    extra_env cannot unset it: the marker is applied last.
     """
+    env = {k: v for k, v in os.environ.items() if k not in drop_env}
+    env.update(extra_env or {})
     r = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
                        timeout=PROBE_TIMEOUT_S,
-                       env={**os.environ, LIVENESS_PROBE_ENV: "signal-liveness-canary"})
+                       env={**env, LIVENESS_PROBE_ENV: "signal-liveness-canary"})
     return r.returncode, (r.stdout or ""), (r.stderr or "")
 
 
@@ -371,7 +386,7 @@ def _trigger_fixture_still_trips(script_name: str, args: tuple[str, ...]) -> "st
 
 def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hint: str,
                             fixture_check=None, stdin_text: "str | None" = None,
-                            refusal_check=None):
+                            refusal_check=None, crash_is_dead: bool = False):
     """ONE shape, four rows (V-1..V-4): a Q1/Q2 gate whose rc=0 means BOTH 'evidence
     sufficient' AND 'no trigger matched'.
 
@@ -383,6 +398,13 @@ def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hin
     SOME check refused (guard-1082: assert the specific refusal, never the coarse rc).
     It reads the refusal stdout and returns None when the watched check is the one
     refusing, else the (verdict, detail) to report. Default None keeps rc=1 sufficient.
+
+    `crash_is_dead` is for a gate whose refusal IS silence (notification_routing_gate:
+    rc=1 = SUPPRESS = the caller skips its send, g-318-168 unit 5). The rc=1 branch below
+    calls a crash unevaluatable because a crashed gate's callers start refusing everything
+    and so announce it. For a gate like that, refusing everything means nobody is told
+    anything, so the crash is the loudest death the row can see and it is DEAD
+    (guard-7231). Default False keeps every other row as it was.
 
     Measured on alpha/cc-08 2026-09-13, each gate driven both ways in the same pass:
       must-trip input     -> rc=1, JSON carries a non-null trigger_matched (~35 ms each)
@@ -447,6 +469,13 @@ def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hin
             # --quiet, and that is acceptable ONLY because this failure announces itself
             # through the gate's own callers (everything they gate starts refusing),
             # unlike the V-6 empty-corpus case, which was silent everywhere.
+            if not out.strip() and crash_is_dead:
+                return True, (
+                    f"{script_name} CRASHED: rc=1 with EMPTY stdout, so it emitted no "
+                    f"verdict, and its callers read rc=1 as a refusal. For this gate a "
+                    f"refusal is silence, so everything it gates is being dropped and "
+                    f"nothing says so. stderr={(err or '').strip()[:200]}"
+                )
             if not out.strip():
                 return None, (
                     f"{script_name} exited rc=1 with EMPTY stdout, so it did not refuse "
@@ -562,6 +591,133 @@ def _named_check_refused(check_name: str):
                       f"PASSED an input engineered to trip it, so it has stopped refusing "
                       f"and a sibling check is carrying rc=1 (guard-1082)")
     return _check
+
+
+# The pending-deploys row's must-trip obligation ( unit 3). Every identifier is a
+# non-numeric probe-only form no allocator can mint (guard-1094: a probe that WRITES uses a
+# synthetic id, and a high round number is a guess about absence, not a guarantee). `repo`
+# must still be owner/name or the gate's own writer refuses it — which is exactly how this
+# row notices that its fixture has rotted.
+PENDING_DEPLOYS_PROBE_ENTRY: dict = {
+    "repo": "probe-only-owner/probe-only-signal-liveness-canary",
+    "sha": "cafe" * 10,
+    "goal_id": "probe-only-signal-liveness-canary",
+}
+
+# Stripped from BOTH probe children. With --store given the tracker never reads them; they
+# go so that a regression which stops honouring --store resolves no agent and writes
+# nowhere (measured: `add` with no --store and no agent env -> rc=0, nothing written),
+# instead of landing the probe obligation in the LIVE store, where the closure gate would
+# re-probe a repo that does not exist at every close (guard-1006). MIND_SID goes too:
+# today only MIND_AGENT names the store, but a fallback chain is an enumeration claim
+# (guard-3970), and a session-binding fallback would need nothing but the SID.
+_AGENT_IDENTITY_ENV = ("MIND_AGENT", "MIND_SID")
+
+
+def _pending_obligation_assertion(entry: dict, check_fixture: bool = True):
+    """The pending-deploys row ( unit 3): can the closure gate still SEE a
+    recorded deploy obligation?
+
+    WHY THIS GATE. pending-deploys-gate.sh refuses clean-success closure while a push to a
+    CI repo is unverified, and its first move is a fast exit:
+        if ! python3 "$PD" --agent "$AGENT" has-pending --goal-id "$GOAL" >/dev/null 2>&1
+    so EVERY non-zero rc reads as "nothing pending" and the goal closes clean. The tracker
+    is fail-open by design (a read error is []), so a store it can no longer read, a module
+    that no longer loads, and a refused call shape all look exactly like the healthy common
+    case. That is the always-CLEAR shape on the gate that stands between a failed deploy
+    and paying users, and nothing announces it: the caller discards both streams.
+
+    THE CONTRACT IS INVERTED FROM THE rc-SHAPED FAMILY, which is why this is not a
+    _gate_trigger_assertion row: there rc=1 is the trip, here rc=0 is. Measured by zeta
+    on cc-02, 2026-09-23 (g-318-168), against the real tracker with an isolated store
+    and the agent env stripped:
+        add (owner/name repo)          -> rc=0, 0 B stderr, 190 B store       (39 ms)
+        has-pending on that store      -> rc=0, 0 B stderr                    (39 ms)
+        has-pending on an empty store  -> rc=1, 0 B stderr
+        add with a bare repo           -> rc=2, 266 B stderr (REFUSED), no store
+        a copy with a syntax error     -> rc=1, 123 B stderr, NO 'Traceback' header
+        a copy with a bad import       -> rc=1, 210 B stderr (its add: rc=1, no store)
+        an unknown subcommand          -> rc=2, 327 B stderr
+    So stderr, not a Traceback header, is what separates a crash from an honest empty
+    read — and both are DEAD, because the gate cannot tell them apart either and closes
+    clean on both.
+
+    A CRASH IS DEAD HERE — the deliberate opposite of the rc-shaped family's rule for rc=1
+    with empty stdout. That rule rests on a crashed gate announcing itself through its
+    callers (everything they gate starts refusing). This one announces nothing: its caller
+    throws both streams away and PASSES every closure. Unevaluatable is silent under
+    --quiet (guard-7231), so calling a crash unevaluatable here would make it silent
+    everywhere.
+
+    THE MUST-TRIP INPUT IS WRITTEN BY THE GATE'S OWN WRITER each run (`add`), never dumped
+    from here. A hand-written store would be a second copy of the store format; when the
+    format moved, the reader would honestly read [] and this row would accuse a healthy
+    gate. It also makes the gate the judge of whether the fixture is still a legal
+    obligation: if `add` refuses it or registers nothing, the entry has rotted and a
+    non-trip says nothing about has-pending — UNEVALUATABLE, not DEAD (g-115-10364). The one
+    exception is rc=1 from `add`. The tracker never returns 1 from add (argparse is 2, a
+    refusal is 2, main() turns any exception in a subcommand into 0), so rc=1 means the
+    module itself could not run — it failed to load, or its parser raised — which kills
+    has-pending too; the reader leg is left to report it.
+    `check_fixture=False` exists only for the test proving this check is what prevents the
+    false accusation.
+
+    WHAT THIS ROW DOES NOT WATCH (g-318-168), named so a green is not over-read:
+      - the agent-branch store resolution (_store_path -> _agent_dir). --store bypasses
+        it. The writer and reader share it, so a mis-resolution cannot split them, but a
+        resolution to None silences both at once and this row cannot see that.
+      - the interpreter. The gate runs `python3` after sourcing _paths.sh; this row runs
+        sys.executable, as every other row does. A python3 without PyYAML would read the
+        store as [] in production while this row stays green.
+      - the capture layer (deploy-detect-hook.sh), and the all-sweep call that passes no
+        --goal-id. A writer that silently registers nothing reads UNEVALUATABLE here.
+    """
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / "pending-deploys.py"
+        if not path.is_file():
+            # ABSENT is unevaluatable, never DEAD — same reasoning as every sibling row.
+            return None, f"pending-deploys.py absent at {path}"
+        tmp = tempfile.mkdtemp(prefix="signal-liveness-canary-pd-")
+        try:
+            store = Path(tmp) / "pending-deploys.yaml"
+            base = [sys.executable, path.as_posix(), "--store", store.as_posix()]
+            try:
+                arc, _aout, aerr = _probe(
+                    [*base, "add", "--repo", entry["repo"], "--sha", entry["sha"],
+                     "--goal-id", entry["goal_id"]], drop_env=_AGENT_IDENTITY_ENV)
+                written = store.is_file() and store.stat().st_size > 0
+                if check_fixture and not written and arc != 1:
+                    return None, (
+                        f"pending-deploys.py probe fixture is stale: the gate's own `add` "
+                        f"did not register {entry['repo']}@{entry['sha'][:7]} (rc={arc}), so "
+                        f"there is no obligation for has-pending to see and a non-trip would "
+                        f"say nothing about it. Fix PENDING_DEPLOYS_PROBE_ENTRY, not the gate. "
+                        f"stderr={aerr.strip()[:200]}")
+                rc, _out, err = _probe([*base, "has-pending", "--goal-id", entry["goal_id"]],
+                                       drop_env=_AGENT_IDENTITY_ENV)
+            except Exception as exc:
+                return None, f"pending-deploys.py could not run: {exc}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if rc == 0:
+            return False, "pending-deploys.py has-pending still sees a recorded obligation (rc=0)"
+        if rc in (1, 2):
+            if rc == 2:
+                how = "refused the call shape pending-deploys-gate.sh uses (has-pending --goal-id)"
+            elif err.strip():
+                how = "CRASHED"
+            else:
+                how = "read the recorded obligation as nothing pending"
+            store_note = ("a store its own `add` had just written" if written
+                          else f"the probe store (its own `add` wrote nothing, rc={arc})")
+            return True, (
+                f"pending-deploys.py has-pending {how} (rc={rc}) on {store_note}. "
+                f"pending-deploys-gate.sh reads every non-zero rc as 'nothing pending' and "
+                f"discards both streams, so every closure now passes with its deploy "
+                f"unverified, silently. stderr={err.strip()[:200]}")
+        return None, (f"pending-deploys.py has-pending returned unexpected rc={rc}: "
+                      f"{err.strip()[:200]}")
+    return _assert
 
 
 def _hook_gate_deny_assertion(script_name: str, payload: dict, what_permitted: str,
@@ -844,6 +1000,381 @@ def _capability_fixture_vocabulary_present(script_name: str,
             "row's probe reason, not the gate")
 
 
+# The findings-gate row's must-trip insight ( unit 4). ONE literal: the fixture
+# check and the probe both read this constant, so there is no second copy to drift. It is
+# prose a real close could carry, a root-cause clause with no resolution verb. The ids are
+# the non-numeric probe-only forms of guard-1094, though --dry-run files nothing anyway.
+FINDINGS_GATE_PROBE_INSIGHT = (
+    "The liveness canary probe stalls because of a stale lock held by an earlier writer."
+)
+_FINDINGS_PROBE_ARGS = (
+    "--goal", "probe-only-signal-liveness-canary",
+    "--aspiration", "probe-only-signal-liveness-canary",
+    "--category", "liveness-probe",
+    "--dry-run",
+)
+
+
+def _findings_fixture_check(insight: str):
+    """Fixture check for the findings-gate row: None while `insight` still hits one of the
+    gate's OWN SIGNAL_PATTERNS match_re with no resolution_re in the match.
+
+    That is the TABLE half of the gate's predicate, deliberately narrower than
+    scan_signals itself (its negation, window and degenerate filters stay on the watched
+    side). A table that moved under the literal makes a non-trip CORRECT, so it is a stale
+    fixture. scan_signals rejecting a literal its own table still matches is the gate
+    dying, so that stays DEAD.
+
+    THE TABLE LIVES IN THE GATE FILE ITSELF, unlike blocker-create-gate's, so an import
+    failure here is NOT a stale fixture (guard-7231). A gate file that cannot import cannot
+    scan either, and calling that "stale" would file the crash as UNEVALUATABLE, which is
+    silent under --quiet. It returns None so the probe runs and reports DEAD. An EMPTY
+    table also returns None, for the reason _stat_neg_fixture_check gives.
+    """
+    def _check(script_name: str, args: tuple[str, ...]) -> "str | None":
+        path = SCRIPT_DIR / script_name
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_canary_probe_findings_gate", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception:
+            return None
+        table = getattr(module, "SIGNAL_PATTERNS", None)
+        if table is None:
+            return (f"{script_name} no longer exposes SIGNAL_PATTERNS, so the fixture is "
+                    "uncheckable")
+        if not table:
+            return None
+        for _name, match_re, resolution_re in table:
+            for m in match_re.finditer(insight):
+                if not resolution_re.search(m.group(0)):
+                    return None
+        return (f"the probe insight {insight!r} no longer hits any {script_name} "
+                "SIGNAL_PATTERNS match_re without its resolution_re, so a non-trip is "
+                "CORRECT and this row cannot say anything about the scan. The table moved "
+                "under the fixture: fix FINDINGS_GATE_PROBE_INSIGHT, not the gate")
+    return _check
+
+
+def _findings_gate_assertion(insight: str):
+    """The findings-gate row ( unit 4): can the Step 8.5 scan still turn a close's
+    unresolved finding into a follow-up?
+
+    rc CARRIES NOTHING HERE. findings-gate.py exits 0 on a clean scan AND on a scan that
+    found something; the verdict is the stdout line `findings_count=N`. Measured on
+    bravo/cc-05 2026-09-23 against the real gate with agent identity stripped:
+      must-trip insight -> rc=0, `findings_count=1 created=1`, 0 stderr bytes
+      clean prose       -> rc=0, `findings_count=0 created=0`
+    So N>=1 is alive, and N==0 on an insight its own table still matches is DEAD.
+
+    A CRASH IS DEAD FOR THIS ROW, the reverse of the rc-shaped family. Those gates refuse
+    everything when they crash. This one files nothing, and its callers (iteration-close.sh
+    do_state_update, worker_retrospective) read "no findings" as a clean close. So a
+    missing findings_count line at any rc is DEAD, not unevaluatable.
+
+    SIDE-EFFECT FREE BY CONSTRUCTION: --dry-run creates no goals, _probe marks the child as
+    a liveness probe so _gate_log records nothing, and stripping _AGENT_IDENTITY_ENV leaves
+    AGENT_DIR unresolved, so load_dedup_titles returns [] before it would regenerate the
+    live compact file (measured the same run: that file's mtime did not move).
+    """
+    script_name = "findings-gate.py"
+    fixture_check = _findings_fixture_check(insight)
+
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            return None, f"{script_name} absent at {path}"
+        try:
+            stale = fixture_check(script_name, _FINDINGS_PROBE_ARGS)
+        except Exception as exc:
+            stale = f"the fixture check itself failed ({exc})"
+        if stale:
+            return None, f"{script_name} probe fixture is stale: {stale}"
+        tmp = tempfile.mkdtemp(prefix="canary-findings-")
+        try:
+            insight_file = Path(tmp) / "insight.md"
+            insight_file.write_text(insight, encoding="utf-8")
+            argv = [sys.executable, path.as_posix(), *_FINDINGS_PROBE_ARGS,
+                    "--insight-file", insight_file.as_posix()]
+            rc, out, err = _probe(argv, drop_env=_AGENT_IDENTITY_ENV)
+        except Exception as exc:
+            return None, f"{script_name} could not run: {exc}"
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        count = None
+        for line in out.splitlines():
+            if line.startswith("findings_count="):
+                head = line.split()[0].split("=", 1)[1]
+                if head.isdigit():
+                    count = int(head)
+        if count is None:
+            last = err.strip().splitlines()[-1][:160] if err.strip() else ""
+            return True, (f"{script_name} CRASHED or changed its output: rc={rc}, no "
+                          f"findings_count line (stdout {len(out)} B, stderr {len(err)} B"
+                          f"{': ' + last if last else ''}). Its callers read that as a "
+                          "clean close, so every finding in every close is dropped")
+        if count >= 1:
+            return False, f"findings_count={count} on the must-trip insight (rc={rc})"
+        return True, ("findings_count=0 on an insight its own SIGNAL_PATTERNS still match: "
+                      "scan_signals stopped reporting what the table says it should")
+    return _assert
+
+
+# The notification-routing-gate row's must-suppress input ( unit 5): a
+# fleet-handleable category, and text that matches no HUMAN_ONLY_PATTERNS class. Measured
+# against the real gate (bravo/cc-05 2026-09-23): rc=1, a 131-byte "SUPPRESS: ..." stdout,
+# empty stderr. The fixture check reads the category and text out of THIS tuple.
+ROUTING_GATE_PROBE_ARGS: tuple = (
+    "--category", "info",
+    "--subject", "signal-liveness canary probe: routine status report",
+    "--body", "probe-only fixture, never sent",
+)
+
+
+def _routing_fixture_check(script_name: str, args: tuple[str, ...]) -> "str | None":
+    """None while the gate's OWN tables still say to SUPPRESS this row's report.
+
+    It reads the category and the text out of `args`, for the reason
+    `_trigger_fixture_still_trips` gives. Rot means a table moved under the fixture: the
+    category became always-send, it left the fleet-handleable set, or the text now
+    matches a human-only class. A SEND is then correct and the row cannot judge the gate.
+
+    TWO CASES RETURN None ON PURPOSE (guard-7231). Each IS a death this row watches, so
+    the probe must run and report DEAD:
+      - the module does not import. The probe then crashes, and the shell lane reads
+        that rc=1 as SUPPRESS, so every notification it gates is dropped in silence.
+      - FLEET_HANDLEABLE_CATEGORIES is empty. The gate then suppresses nothing, and every
+        status report goes to the owner's inbox.
+    """
+    def _arg(flag: str) -> str:
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 < len(args):
+                return args[i + 1]
+        return ""
+    category = _arg("--category").strip().lower()
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_canary_probe_notification_routing_gate", SCRIPT_DIR / script_name)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    always = getattr(module, "ALWAYS_SEND_CATEGORIES", None)
+    fleet = getattr(module, "FLEET_HANDLEABLE_CATEGORIES", None)
+    human_only = getattr(module, "_human_only_match", None)
+    if always is None or fleet is None or human_only is None:
+        return (f"{script_name} no longer exposes ALWAYS_SEND_CATEGORIES, "
+                f"FLEET_HANDLEABLE_CATEGORIES and _human_only_match, so the fixture is "
+                f"uncheckable")
+    if not fleet:
+        return None
+    if category in always:
+        return (f"category {category!r} is now in ALWAYS_SEND_CATEGORIES, so a SEND is "
+                f"CORRECT. Fix ROUTING_GATE_PROBE_ARGS, not the gate")
+    if category not in fleet:
+        return (f"category {category!r} left FLEET_HANDLEABLE_CATEGORIES, and an unknown "
+                f"category SENDs by design, so a SEND is CORRECT. Fix "
+                f"ROUTING_GATE_PROBE_ARGS, not the gate")
+    matched = human_only(f"{_arg('--subject')}\n{_arg('--body')}")
+    if matched:
+        return (f"the probe text now matches the human-only class {matched!r}, so a SEND "
+                f"is CORRECT. Fix ROUTING_GATE_PROBE_ARGS, not the gate")
+    return None
+
+
+def _routing_suppress_line(out: str):
+    """refusal_check for the routing gate: None when stdout carries the SUPPRESS line.
+
+    rc=1 with some other stdout is a gate that printed and then died. Its callers still
+    read rc=1 as SUPPRESS, so this is the crash case and it is DEAD too.
+    """
+    if any(line.startswith("SUPPRESS:") for line in out.splitlines()):
+        return None
+    first = (out.strip().splitlines() or [""])[0][:120]
+    return True, (f"exited rc=1 with no 'SUPPRESS:' verdict line (stdout {len(out)} B, "
+                  f"first line {first!r}): it died after printing, and its callers read "
+                  f"rc=1 as SUPPRESS")
+
+
+# The domain-suite-gate row's must-refuse fixture ( unit 6): a throwaway world
+# whose only test module imports a module that does not exist, so its suite cannot
+# COLLECT. Measured against the real gate (bravo/cc-05 2026-09-23): rc=1 in 0.3s, one
+# stdout JSON line with decision "block" and reason "domain suite could not COLLECT (rc=2:
+# ...)", and the retained log landed in the probe's own DOMAIN_SUITE_LOG_DIR.
+DOMAIN_SUITE_UNCOLLECTABLE_MODULE = "zzz_canary_uncollectable_module"
+DOMAIN_SUITE_FIXTURE_TEST = "test_zzz_canary_uncollectable.py"
+# --since skips the goal-record lookup, and --timeout 20 stays under PROBE_TIMEOUT_S, so
+# the gate's own timeout (a fail-open "exceeded" error) fires before this process kills it.
+DOMAIN_SUITE_PROBE_ARGS: tuple = (
+    "--goal", "probe-only-signal-liveness-canary",
+    "--source", "world",
+    "--since", "2000-01-01T00:00:00",
+    "--timeout", "20",
+)
+
+
+def _domain_suite_fixture_check(scripts_dir: Path, since: "_dt.datetime") -> "str | None":
+    """None while the gate's OWN helpers still call the fixture a touched domain suite, and
+    the module the fixture imports still does not exist.
+
+    Rot means a helper moved under the fixture (a noop is then CORRECT), or the missing
+    module now exists (the suite then collects, and a pass is CORRECT). Either way the row
+    cannot judge the gate.
+
+    AN IMPORT FAILURE RETURNS None. The probe then crashes the same way, and its rc=1 with
+    no verdict line reports that crash in full (see _domain_suite_gate_assertion).
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_canary_probe_domain_suite_gate", SCRIPT_DIR / "domain-suite-gate.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    has_tests = getattr(module, "has_domain_tests", None)
+    touched = getattr(module, "touched_since", None)
+    if has_tests is None or touched is None:
+        return ("domain-suite-gate.py no longer exposes has_domain_tests and touched_since, "
+                "so the fixture is uncheckable")
+    if not has_tests(scripts_dir):
+        return ("the gate's own has_domain_tests() no longer counts the fixture as a domain "
+                "suite, so a noop is CORRECT. Fix the fixture layout, not the gate")
+    if not touched(scripts_dir, since):
+        return ("the gate's own touched_since() finds no fixture file newer than --since, so "
+                "a noop is CORRECT. Fix DOMAIN_SUITE_PROBE_ARGS, not the gate")
+    if importlib.util.find_spec(DOMAIN_SUITE_UNCOLLECTABLE_MODULE) is not None:
+        return (f"a module named {DOMAIN_SUITE_UNCOLLECTABLE_MODULE!r} now exists, so the "
+                "fixture suite collects and a pass is CORRECT. Rename "
+                "DOMAIN_SUITE_UNCOLLECTABLE_MODULE")
+    return None
+
+
+def _domain_suite_verdict(out: str) -> "dict | None":
+    """The gate's one stdout JSON line (the last one if a future version prints more)."""
+    doc = None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(line)
+        except ValueError:
+            continue
+        if isinstance(parsed, dict) and parsed.get("gate") == "domain-suite-gate":
+            doc = parsed
+    return doc
+
+
+def _domain_suite_gate_assertion(check_fixture: bool = True):
+    """The domain-suite-gate row ( unit 6): does the close-phase gate still REFUSE
+    a close whose world domain suite cannot collect?
+
+    iteration-close.sh do_verify refuses the close ONLY on rc=1, and fails open with a WARN
+    on any other nonzero rc. So the trip is rc=1 plus a "block" verdict line. The probe
+    builds a throwaway world and points the gate at it through the gate's own seams:
+    MIND_WORLD for the world, DOMAIN_SUITE_LOG_DIR for the retained log. Both are removed
+    afterwards.
+
+    A CRASH IS UNEVALUATABLE FOR THIS ROW, the reverse of the notification-routing row. A
+    gate that dies before main() exits 1 with no verdict line, and do_verify reads that as
+    REFUSED. Every close is then refused, loudly, with a traceback: that is not silent, so
+    it is out of this row's scope. The silent deaths are the ones that let a close through:
+      - "pass" on a suite that cannot collect: the gate no longer sees collection errors
+      - "noop" on a fixture its own helpers call a touched domain suite (checked in-process
+        first): the gate no longer runs the suite at all
+      - "error" from main()'s exception handler: evaluate() raises, and every close passes
+        unverified
+      - "block" with an rc other than 1: do_verify does not read that as a refusal
+    "pass" and "block" count only when the verdict's touched list names the fixture's test
+    file. Otherwise the gate measured some other world, and the row says so.
+
+    WHAT THIS ROW DOES NOT WATCH: the goal-record claimed_at lookup (--since bypasses it),
+    the world's run-domain-tests.sh hook (the fixture has none, so the default pytest runner
+    runs), the baseline ratchet for ordinary reds, and override logging. A timeout or a
+    pytest internal/usage error is the gate's fail-open fault branch, which says nothing
+    about a close, so it is UNEVALUATABLE. So is a "block" from the credential tripwire:
+    another writer moved a credential-shaped file during the window.
+
+    SIDE-EFFECT FREE BY CONSTRUCTION: every gate write follows the two seams into the
+    probe's temp dir, _probe marks the child as a liveness probe so _gate_log records
+    nothing, and the probe passes no --override, so no override ledger row is written.
+    """
+    script_name = "domain-suite-gate.py"
+
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            return None, f"{script_name} absent at {path}"
+        root = Path(tempfile.mkdtemp(prefix="canary-domain-suite-"))
+        try:
+            scripts = root / "world" / "scripts"
+            (scripts / "tests").mkdir(parents=True)
+            (root / "logs").mkdir()
+            (scripts / "tests" / DOMAIN_SUITE_FIXTURE_TEST).write_text(
+                f"import {DOMAIN_SUITE_UNCOLLECTABLE_MODULE}  # noqa: F401\n\n\n"
+                "def test_never_runs():\n    assert True\n", encoding="utf-8")
+            if check_fixture:
+                since = _dt.datetime.fromisoformat(
+                    DOMAIN_SUITE_PROBE_ARGS[DOMAIN_SUITE_PROBE_ARGS.index("--since") + 1])
+                try:
+                    stale = _domain_suite_fixture_check(scripts, since)
+                except Exception as exc:
+                    stale = f"the fixture check itself failed ({exc})"
+                if stale:
+                    return None, f"{script_name} probe fixture is stale: {stale}"
+            argv = [sys.executable, path.as_posix(), *DOMAIN_SUITE_PROBE_ARGS]
+            try:
+                rc, out, err = _probe(argv, extra_env={
+                    "MIND_WORLD": (root / "world").as_posix(),
+                    "DOMAIN_SUITE_LOG_DIR": (root / "logs").as_posix(),
+                    "STORAGE_BACKEND": "local",
+                })
+            except Exception as exc:
+                return None, f"{script_name} could not run: {exc}"
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        doc = _domain_suite_verdict(out)
+        if doc is None:
+            last = err.strip().splitlines()[-1][:160] if err.strip() else ""
+            return None, (f"{script_name} exited rc={rc} with no verdict line (stdout "
+                          f"{len(out)} B{': ' + last if last else ''}). At rc=1 that is a "
+                          "crash, which do_verify reads as REFUSED: every close fails "
+                          "closed and loud, which is not the silent death this row watches")
+        decision = doc.get("decision")
+        reason = str(doc.get("reason") or "")[:200]
+        measured_fixture = any(
+            isinstance(t, (list, tuple)) and t and Path(str(t[0])).name == DOMAIN_SUITE_FIXTURE_TEST
+            for t in (doc.get("touched") or []))
+        if decision == "error":
+            if reason.startswith("gate error"):
+                return True, (f"evaluate() raised and main() failed open: {reason}. Every "
+                              "close now passes with its domain suite unverified")
+            return None, (f"the gate's fail-open fault branch fired ({reason}), which is "
+                          "not a verdict on the fixture")
+        if decision == "noop":
+            return True, (f"noop on a fixture the gate's own helpers call a touched domain "
+                          f"suite: {reason}. Every close now skips the suite")
+        if not measured_fixture:
+            return None, (f"decision {decision!r}, but its touched list does not name "
+                          f"{DOMAIN_SUITE_FIXTURE_TEST}: the gate measured some other world, "
+                          "so the MIND_WORLD seam may not have held")
+        if decision == "block":
+            if "credential-shaped" in reason:
+                return None, ("the credential tripwire refused, not the suite check: another "
+                              f"writer moved a credential-shaped file during the probe ({reason})")
+            if rc != 1:
+                return True, (f"printed 'block' but exited rc={rc}, and do_verify refuses "
+                              "only on rc=1, so the close goes through")
+            return False, f"refused the uncollectable fixture (rc=1): {reason}"
+        if decision == "pass":
+            return True, (f"passed a close whose domain suite cannot collect: {reason}. The "
+                          "gate no longer sees a collection error")
+        return None, f"unrecognised decision {decision!r} (rc={rc}): {reason}"
+    return _assert
+
+
 SIGNALS: list[dict] = [
     {
         "name": "agent-watchdog-tick",
@@ -1086,6 +1617,100 @@ SIGNALS: list[dict] = [
             "schema_probe_evidence. Check gates/blocker_create._STAT_NEG_PATTERNS first: an "
             "EMPTY table reports DEAD here on purpose. The row reads schema_probe's own "
             "entry, so a sibling check failing on this payload cannot hide a dead check 3."
+        ),
+    },
+    {
+        "name": "pending-deploys-has-pending",
+        "what": (
+            "pending-deploys.py has-pending, the fast exit of the closure gate that refuses "
+            "clean success while a CI deploy is unverified (pending-deploys-gate.sh, guard-119)"
+        ),
+        "evidence": "has-pending rc on an isolated store the tracker's own `add` has just written",
+        # The second PRODUCT-PATH row of , and the one nearest paying users: if
+        # this dies, a goal that pushed a failing deploy closes clean and the failure
+        # waits for a human to notice. rc=0 is the trip here, the reverse of the
+        # rc-shaped family, so it has its own assertion (see its docstring).
+        "assertion": _pending_obligation_assertion(PENDING_DEPLOYS_PROBE_ENTRY),
+        "remedy": (
+            "Run `python3 core/scripts/pending-deploys.py --store <tmp> add ...` then "
+            "`has-pending --goal-id <id>` by hand, WITHOUT discarding stderr. Non-empty stderr "
+            "at rc=1 means the module no longer loads; empty stderr means _load() read the "
+            "writer's own store as [] — check that _save and _load still agree on the format "
+            "and that the goal-id filter still matches what add stores. The gate discards "
+            "both streams, so nothing else in the fleet will say this."
+        ),
+    },
+    {
+        "name": "findings-gate-signal-scan",
+        "what": (
+            "findings-gate.py, the Step 8.5 scan that turns a close's unresolved finding "
+            "into a follow-up goal (iteration-close.sh do_state_update, worker_retrospective)"
+        ),
+        "evidence": "the stdout findings_count line for a must-trip insight under --dry-run",
+        # The third PRODUCT-PATH row of : if this scan dies, every close that names
+        # a defect it did not fix closes clean and the follow-up is never filed. rc is 0
+        # either way, so the row reads the count line (see its docstring).
+        "assertion": _findings_gate_assertion(FINDINGS_GATE_PROBE_INSIGHT),
+        "remedy": (
+            "Run `python3 core/scripts/findings-gate.py --goal probe-only-x --aspiration "
+            "probe-only-x --category probe --dry-run --insight-file <file>` by hand with "
+            "FINDINGS_GATE_PROBE_INSIGHT in the file, WITHOUT discarding stderr. No "
+            "findings_count line means the script dies before it reports; findings_count=0 "
+            "means scan_signals rejected an insight its own SIGNAL_PATTERNS still match, so "
+            "read its negation, window and degenerate filters first."
+        ),
+    },
+    {
+        "name": "notification-routing-gate-suppress",
+        "what": (
+            "notification_routing_gate.py, the owner-inbox guard that SUPPRESSes a "
+            "fleet-handleable status report (the notify path's routing step, and the shell "
+            "lane via notification-routing-gate.sh)"
+        ),
+        "evidence": "rc=1 plus the stdout 'SUPPRESS:' line for a must-suppress 'info' report",
+        # The fourth PRODUCT-PATH row of . Both deaths are silent. If the gate
+        # stops suppressing, every status report reaches the owner's inbox. If it crashes,
+        # the shell lane reads the crash's rc=1 as SUPPRESS and drops everything, even
+        # decision-needed mail. So a crash is DEAD here, not unevaluatable.
+        "assertion": _gate_trigger_assertion(
+            "notification_routing_gate.py",
+            ROUTING_GATE_PROBE_ARGS,
+            "a fleet-handleable status report",
+            fixture_check=_routing_fixture_check,
+            refusal_check=_routing_suppress_line,
+            crash_is_dead=True,
+        ),
+        "remedy": (
+            "rc=0 means the gate now SENDs a report it exists to suppress; read the 'SEND:' "
+            "reason in the detail. 'routing gate raised' there means decide() threw and "
+            "decide_and_log's fail-safe sent. Otherwise check FLEET_HANDLEABLE_CATEGORIES "
+            "and HUMAN_ONLY_PATTERNS for an edit that now matches everything. CRASHED means "
+            "the module no longer runs: run `python3 core/scripts/notification_routing_gate.py "
+            "--category info --subject x` by hand WITHOUT discarding stderr. Until that is "
+            "fixed, notification-routing-gate.sh passes the crash's rc=1 through as "
+            "SUPPRESS, so shell-lane notifications are dropped, decision-needed included."
+        ),
+    },
+    {
+        "name": "domain-suite-gate-collect-refusal",
+        "what": (
+            "domain-suite-gate.py, the close-phase gate that refuses status=completed while "
+            "the world's domain test suite cannot collect or is newly red "
+            "(iteration-close.sh do_verify)"
+        ),
+        "evidence": "rc=1 plus a 'block' verdict line for a throwaway world whose suite cannot collect",
+        # The fifth PRODUCT-PATH row of . do_verify refuses only on rc=1 and fails
+        # open on everything else, so each silent death lets a close through with a broken
+        # domain suite. A crash fails closed and loud there, so it is UNEVALUATABLE here.
+        "assertion": _domain_suite_gate_assertion(),
+        "remedy": (
+            "Build a scratch world whose scripts/tests/ holds one test importing a missing "
+            "module, then run `MIND_WORLD=<scratch>/world DOMAIN_SUITE_LOG_DIR=<scratch>/logs "
+            "STORAGE_BACKEND=local python3 core/scripts/domain-suite-gate.py --goal probe-x "
+            "--since 2000-01-01T00:00:00 --timeout 20` by hand, WITHOUT discarding stderr. "
+            "'pass' means run_suite or the rc==2 branch in evaluate() no longer sees a "
+            "collection error. 'noop' means evaluate() stopped using has_domain_tests or "
+            "touched_since. 'gate error, fail-open' names the exception evaluate() raises."
         ),
     },
 ]

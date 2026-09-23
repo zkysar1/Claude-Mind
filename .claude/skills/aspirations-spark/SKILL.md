@@ -275,7 +275,7 @@ doubt between framework and domain, pick domain.
           content: per the type-matched prompt above — a validated strategy to repeat
                    (success) OR a counterfactual pitfall + its correction (failure)
           applies_to: <any|framework|domain|specific>  # REQUIRED. any=cross-cutting methodology; framework=this framework's skills/scripts/gates; domain=this agent's deployment domain (the specific services, products, workflows the agent is deployed into); specific=single-incident
-          when_to_use: when this insight applies
+          when_to_use: {conditions: [<trigger>]}
           source_goal: goal.id
           source_reflection_id: "ref-{goal.id}-{timestamp}"  # MR-Search: enables reflection quality tracking
           poignancy: <1-10>   # g-306-26 producer (BRD Gap 1a / Generative Agents 2304.03442):

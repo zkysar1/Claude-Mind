@@ -232,6 +232,63 @@ def test_uncommitted_work_blocks_completed_when_dirty(running_daemon,
     assert err["gate_output"] == fake
 
 
+def test_uncommitted_work_refusal_leads_with_verdict_and_counts_the_census(
+        running_daemon, aspirations_write_module, monkeypatch):
+    """: the caller reads a summary, not evaluate()'s census. Each
+    blocking commit once, the stale lists as counts, and the verdict first."""
+    _, port = running_daemon
+    _seed_goal(port)
+    sha = "a434fa57de3c09e1b2f4d5a6b7c8d9e0f1a2b3c4"
+    stale = [f"{i:040x}" for i in range(40)]
+    fake = {"would_block": True, "dirty_framework_files": [],
+            "repo_path": "/x", "goal_id": "g-001-50", "override_applied": None,
+            "stranded_would_block": True,
+            "stranded_repos": [{"repo": f"/nonexistent/r{i}",
+                                "default_ref": "origin/dev", "dirty_tracked": [],
+                                "stranded_commits": [sha],
+                                "stale_stranded_commits": stale[i * 20:i * 20 + 20]}
+                               for i in range(2)]}
+    monkeypatch.setattr(aspirations_write_module, "_uncommitted_work_eval",
+                        lambda **kw: fake)
+
+    code, body = _update_goal(port, "g-001-50", "status", "completed")
+    assert code == 400, body
+    err = json.loads(body)
+    assert list(err)[:3] == ["error", "gate", "verdict"]
+    assert err["verdict"].startswith("REFUSED: g-001-50 status was NOT changed.")
+    assert body.count(sha[:10]) == 1
+    assert not any(s in body for s in stale)
+    assert err["not_blocking"]["stale_stranded_commits"] == 40
+    assert "stranded_repos" not in err["gate_output"]
+
+
+def test_uncommitted_work_refusal_that_fails_to_build_still_refuses(
+        running_daemon, aspirations_write_module, monkeypatch):
+    """guard-3803: a failure while COMPOSING the deny must not become an
+    approval. The mutation raises inside the builder; the close stays refused
+    and the raw payload is returned instead."""
+    _, port = running_daemon
+    _seed_goal(port)
+    fake = {"would_block": True,
+            "dirty_framework_files": ["core/scripts/foo.py"],
+            "repo_path": "/x", "goal_id": "g-001-50",
+            "override_applied": None}
+    monkeypatch.setattr(aspirations_write_module, "_uncommitted_work_eval",
+                        lambda **kw: fake)
+
+    def _boom(goal_id, result):
+        raise RuntimeError("summary builder broke")
+
+    monkeypatch.setattr(aspirations_write_module, "_uncommitted_work_refusal", _boom)
+
+    code, body = _update_goal(port, "g-001-50", "status", "completed")
+    assert code == 400, f"a broken summary turned the refusal into {code}: {body}"
+    err = json.loads(body)
+    assert err["error"] == "uncommitted_work_blocked"
+    assert err["gate_output"] == fake
+    assert err["summary_error"] == "RuntimeError: summary builder broke"
+
+
 def test_uncommitted_work_override_header_forwarded(running_daemon,
                                                    aspirations_write_module,
                                                    monkeypatch):

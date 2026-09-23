@@ -31,6 +31,8 @@ import sys
 from contextlib import redirect_stderr
 from pathlib import Path
 
+import pytest
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
@@ -54,6 +56,16 @@ def _pin_lanes(monkeypatch, lanes=LANES, weight=1.0):
     monkeypatch.setattr(
         gs, "load_strategic_focus",
         lambda: {"aspirations": set(lanes), "weight": weight})
+
+
+@pytest.fixture(autouse=True)
+def _pinned_roster(monkeypatch):
+    """The claimability predicate keys on routes_away_from (), which
+    reads the LIVE roster on every call. Pin it, or a box whose team-state lacks
+    a name answers these routing assertions differently."""
+    import aspirations
+    monkeypatch.setattr(aspirations, "_get_active_agents",
+                        lambda: ["alpha", "bravo", "echo", "foxtrot", "zeta"])
 
 
 def _row(gid, asp, score, *, recurring=False, ia="either", routed=False,
@@ -190,6 +202,23 @@ def test_floor_nominates_a_goal_routed_to_me(monkeypatch):
     ]
     picked, _ = gs.apply_strategic_focus_floor(scored, "alpha")
     assert picked is not None and picked["goal_id"] == "g-368-7"
+
+
+def test_floor_nominates_an_out_of_vocabulary_row(monkeypatch):
+    """THE DISCRIMINATING CASE (). An intended_agent outside the live
+    vocabulary (the cycle-detector's "any", a retired agent) routes nowhere:
+    the claim path accepts it with no lane ceremony (g-115-3482), so the floor
+    may spend its slot on it. The old `(None, "", "either", agent)` tuple
+    excluded it. RED before the fix; the routed-to-foxtrot test above is its
+    control (same shape, in-vocabulary, still excluded)."""
+    _pin_lanes(monkeypatch)
+    scored = [
+        _row("g-115-1", "asp-115", 11.6),
+        _row("g-368-8", "asp-368", 9.0, ia="any"),
+    ]
+    picked, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert status["claimable"] == 1, status
+    assert picked is not None and picked["goal_id"] == "g-368-8"
 
 
 def test_floor_noop_without_a_directive(monkeypatch):

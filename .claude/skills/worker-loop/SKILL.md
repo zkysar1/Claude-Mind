@@ -38,17 +38,10 @@ Those are **reducer-only**: the one Body holding `running-session-id`
 encode/reflect per-worker would create N reducers — the defect the convergence
 forbids.
 
-<!-- POST_RECOVERY_EDIT_OVERRIDE="user-directed fresh-eyes doc fix from a live assistant session; on-disk mode file wrongly reads autonomous (anomaly filed as world goal), no loop is running" -->
-**Activation status (updated 2026-08-05, fresh-eyes review):** ACTIVATION IS
-LANDED — g-306-119-a (/start worker auto-join branch), g-306-119-b (close-body
-staging+push), g-306-119-c (baseline-aware merge consume) and g-306-125
-(safety rails) are all completed, and a live worker executed a real goal via
-this loop (g-315-518 soak, DESKTOP-O91DLK2). The prior "until Phase 2C wires
-fork-activation" wording predated those landings. Still OPEN before trusting
-multi-body at scale: g-306-120 (cross-box activation dry-run), g-306-126
-(live two-box soak), g-306-128 (kill-tests), and g-306-131 (three fail-safe
-inversions in the reducer-liveness poll this loop runs every cycle). Design
-SSOT: the `mind-engine-identity-bridge` tree node (Phase 2).
+**Activation status:** ACTIVATION IS LANDED (a live worker executed a real goal
+via this loop). Dated history, and the multi-body items still open as of
+2026-08-05: core/config/rationale/worker-loop-contract.md. Design SSOT: the
+`mind-engine-identity-bridge` tree node (Phase 2).
 
 ## The phase split (authoritative: `worker_execute.py`)
 
@@ -72,13 +65,10 @@ Rationale: core/config/rationale/worker-verify-own-unit.md
 
 ## The lifecycle split + the no-transcription rule (g-306-212)
 
-The phase split above answers "which PHASES does a worker run". It does not
-answer "what does a worker do at each session LIFECYCLE stage", and for a long
-time nothing did — so every lifecycle asymmetry was discovered by surprise, one
-at a time: prime never runs for workers (g-306-211), the per-body heartbeat
-cannot write on an IDLE worker box (g-306-208), compact restore rejected
-body-keyed checkpoints (g-306-174). Same defect class each time: a reducer
-lifecycle stage with **no declared worker disposition**.
+The phase split above answers "which PHASES does a worker run"; this answers
+"what does a worker do at each session LIFECYCLE stage". The defect class it
+prevents is a reducer lifecycle stage with **no declared worker disposition**,
+found one surprise at a time (history: core/config/rationale/worker-loop-contract.md).
 
 `worker_execute.py` now owns `LIFECYCLE_DISPOSITIONS` — every session stage
 mapped to exactly one of `shared-component` / `scoped-call` / `worker-only` /
@@ -149,26 +139,18 @@ IF the value is 'parked': this Body is RESUMABLE and did NOT close (g-306-291).
   toward polling): skip the closure exit, continue through the preamble: Phase
   0.5 re-polls the reducer and SELECT decides — a claim RESUMES (Phase 2), no
   goal re-parks (Phase 1). This gate never re-derives that.
-  TEST THE CLOSED SET, NEVER 'not active'. The old predicate here was
-  "anything other than active", correct while every non-active state was
-  terminal — so introducing `parked` would have made this gate refuse every
-  unit of a Body that is deliberately alive, which is byte-for-byte the durable
-  close g-306-291 exists to remove. Same latent trap sat in the resurrection
-  prompt (fixed, pinned) and in the stop-hook worker-net (fixed, 5th valve).
-  Any state this gate does not recognise resolves toward RUNNING, because a
-  wrong close is the unrecoverable direction and a wrong continue is not.
+  TEST THE CLOSED SET, NEVER 'not active': `parked` is non-active and alive
+  (why: core/config/rationale/worker-cycle-preamble.md). Any state this gate
+  does not recognise resolves toward RUNNING, because a wrong close is the
+  unrecoverable direction and a wrong continue is not.
 IF the manifest is MISSING while the fork WM exists: treat as OPEN (never
   invent a close from an absent record) and continue.
 
 # Phase -0.5 — LIGHT PRIME (g-306-211). TWO TIERS, and the split is the point:
 # the IDENTITY half runs once per worker session, the RECENCY half runs on EVERY
-# re-entry. The worker path never primed at all: /start's W-steps jump
-# fork->Skill(worker-loop), and /prime runs only for reducer/reader/assistant. The
-# worker is NOT context-blind — the execute protocol retrieves per-goal at 4
-# points — but per-goal CATEGORY retrieval structurally misses cross-cutting
-# MECHANISM-indexed guardrails (the measured two-query dilution class,
-# retrieval-triggers.md "Why TWO queries"), and Self's Decision Authority never
-# loads at all. This phase closes exactly that gap and nothing more.
+# re-entry. /prime never runs for a worker, and per-goal CATEGORY retrieval
+# structurally misses cross-cutting MECHANISM-indexed guardrails and Self's
+# Decision Authority. This phase closes exactly that gap and nothing more.
 #
 # Scoped CALLs to the SAME surfaces /prime reads (no-transcription contract,
 # guard-2676): Read + world-cat.sh + guardrails-read.sh + reasoning-bank-read.sh.
@@ -176,24 +158,10 @@ IF the manifest is MISSING while the fork WM exists: treat as OPEN (never
 # peer-surface, and category loading are deliberately SKIPPED (per-goal retrieval
 # covers that terrain); the worker stays thin.
 #
-# WHY THE RECENCY HALF IS UNCONDITIONAL (g-306-298, landing the 2026-08-13 USER
-# DIRECTIVE addendum on g-306-211, quoted): "scope now includes PER-UNIT refresh,
-# not only once-per-session prime ... workers must not run multi-hour sessions on
-# entry-time rails." This phase used to sit ENTIRELY behind the sentinel, so every
-# unit after the first ran on rails loaded at session entry. Measured on cc-07
-# 2026-08-16: a light-prime-done sentinel dated 2026-08-15 17:59 with the session
-# still executing units at 12:xx the next day — ~18.5h on entry-time rails,
-# against a directive whose stated rationale is measured unit gaps of 15-92 min.
-#
-# THE COST IS WHY IT CAN BE UNCONDITIONAL RATHER THAN CADENCED. Measured on cc-02
-# (zeta, uname -r 6.8.0-137-generic): reasoning-bank-read.sh --recent 0.059s,
-# guardrails-read.sh --summary 0.093s — ~0.15s per unit, against a Phase -0.3 that
-# runs a real `git fetch` + `git merge`. That is "cost-proportional to the pull",
-# which is the bound the directive itself sets. Note guardrails-read.sh has NO
-# --since/delta flag (verified before naming it, guard-359: the arg loop accepts
-# --id / --category / --active / --summary only), so the "guardrail-index delta"
-# the directive names is served by re-reading the whole-corpus one-line index —
-# which is exactly what --summary already is.
+# THE RECENCY HALF IS UNCONDITIONAL (g-306-298, a USER DIRECTIVE: no multi-hour
+# sessions on entry-time rails, against measured unit gaps of 15-92 min), and it
+# costs ~0.15s per unit.
+# Rationale (WHY, measured): core/config/rationale/worker-cycle-preamble.md
 #
 # ORDERING IS LOAD-BEARING: the recency slice runs BEFORE the sentinel test, not
 # inside its else-branch. Phase 5 re-invokes this skill after every work unit and
@@ -230,15 +198,9 @@ ELSE (first pass this session):
 # WHY IT EXISTS: heartbeat-tick.sh writes BOTH the same-box
 # sessions/<SID>/body-heartbeat AND the syncable session/body-heartbeat-<SID>.json
 # carrier — the only signals that let the reducer's stranded-claim sweep tell
-# "worker alive, mid-unit" from "claim abandoned". This loop never called it, so a
-# cross-box worker had NO liveness signal of any kind, and any claim it held past
-# stranded-claim-sweep's 120-minute foreign-SID grace was popped mid-execution.
-# Measured 2026-08-05 on cc-07 (both files absent 17 min into an active unit);
-# retro-cause of the g-315-518 pop on 2026-08-04, which was closed against the
-# writer. g-306-208 HAD already fixed the writer's ordering so the body write
-# precedes the agent-state=IDLE refusal — correct, and inert, because nothing
-# called it. Its own tests stayed green through the whole defect (guard-1943:
-# pinning the writer says nothing about the wiring).
+# "worker alive, mid-unit" from "claim abandoned". Without them a claim held past
+# the sweep's 120-minute foreign-SID grace is popped mid-execution.
+# Rationale (WHY, measured): core/config/rationale/worker-cycle-preamble.md
 Bash: bash core/scripts/heartbeat-tick.sh
 # EXPECT rc=2 ON A WORKER AND DO NOT TREAT IT AS FAILURE: a worker box is IDLE by
 # design, and the tick refuses the agent-wide RUNNING-only work with exit 2 —
@@ -249,24 +211,10 @@ Bash: bash core/scripts/heartbeat-tick.sh
 # component the reducer uses, in its pull-only mode — never a hand-rolled
 # git sequence (no-transcription contract, guard-2676 / g-306-212).
 #
-# WHY IT EXISTS: a WORKER never pulled, at all, ever. iteration-push.sh is the
-# only thing in the framework that does a `git fetch` + `git merge --no-edit`,
-# and when this phase was written its ONLY caller was iteration-close.sh's
-# do_productivity_check — which this loop deliberately skips. So a reducer stays
-# current every iteration while a worker runs whatever
-# code it had when someone last pulled BY HAND. Measured 2026-08-06: cc-07 was
-# 112 commits behind, then 30 four hours later, then 51 — while cc-04 never
-# exceeded 2. Every framework fix shipped during a worker's life never reached
-# it, INCLUDING the two liveness fixes written that same day to protect workers.
-#
-# CORRECTED g-115-3262 (2026-08-10): it is no longer the only caller, and the
-# line number this comment used to cite had already drifted — hence the function
-# name above instead. Five call sites now: this phase, worker-loop's
-# --push-worker-ref, aspirations-graceful-stop, aspirations-execute Phase 4
-# entry, and do_productivity_check. The reasoning above is unchanged: the
-# execute-phase call was added BECAUSE close-only left the REDUCER's own tree a
-# median of 7 commits behind mid-iteration (n=333, .git/iteration-push.log),
-# which is the same defect this phase fixes for a worker.
+# WHY IT EXISTS: before this phase a WORKER never pulled at all (iteration-push.sh
+# ran only from reducer paths this loop skips), so no framework fix shipped
+# during a worker's life ever reached it.
+# Rationale (WHY, measured): core/config/rationale/worker-cycle-preamble.md
 #
 # Placed at the TOP of the cycle, between units and before any claim, so a merge
 # can never land under a goal that is mid-execution.
@@ -276,11 +224,8 @@ Bash: bash core/scripts/heartbeat-tick.sh
 # is never behind; pushing the shared tree stays the reducer's job, so two Bodies
 # of one agent never contend on the same store files.
 #
-# No commit step is needed first, though a worker tree is normally dirty with its
-# own store appends: iteration-push.sh self-heals a dirty tree in-run by
-# COMMITTING agents/<self>/* churn pathspec-limited (g-115-2249) and retrying the
-# merge once. Its fetch is independently throttled (FETCH_INTERVAL_MIN, stateless
-# via FETCH_HEAD mtime), so calling it every cycle costs nothing on most cycles.
+# No commit step is needed first: iteration-push.sh self-heals a dirty tree
+# (g-115-2249) and throttles its own fetch, so calling it every cycle is cheap.
 # THIS MOVES HEAD, so it VOIDS any full-suite run still executing (tree-moved
 # outranks every verdict; the detector is HEAD-MOVEMENT, not merge — Phase 3.8's
 # own COMMIT FIRST voids it too, g-115-7943). A SUITE MUST FINISH INSIDE THE UNIT
@@ -292,13 +237,9 @@ Bash: bash core/scripts/iteration-push.sh --no-push
 # and is logged LOUDLY rather than stopping the cycle. Never branch on this rc.
 # BRANCH ON ITS STDOUT for the ESCALATION directives. TWO shapes reach here and
 # retrying can NEVER clear either, so "resume on local code" becomes PERMANENT
-# staleness: a repeating content CONFLICT (g-306-315; cc-08 ran 85 commits
-# behind retrying one conflict every cycle while the blocked merge concealed
-# the peer fix g-306-308) and a repeating integrate DEFER on a dirty shared
-# file (g-115-6934; cc-08 39 behind while origin already carried the fix).
-# Fail-soft retry is right for transient shapes and wrong for these. Detection
-# is bash-owned (guard-399) in iteration-push.sh's shape-aware defer-streak
-# file, printing ONCE per streak; this branch owns the RESPONSE, same for both.
+# staleness: a repeating content CONFLICT (g-306-315) and a repeating integrate
+# DEFER on a dirty shared file (g-115-6934). Detection is bash-owned (guard-399)
+# and prints ONCE per streak; this branch owns the RESPONSE, same for both.
 IF stdout contains "— ESCALATION REQUIRED (g-":
     # Do BOTH, then CONTINUE the cycle — the escalation IS the fix path; local
     # code stays runnable, and hand-resolving a shared-store wedge mid-goal is
@@ -323,17 +264,10 @@ IF stdout contains "— ESCALATION REQUIRED (g-":
 # contract, guard-2676). That convention step is NOT removed; this is a SECOND
 # entry point, because a gate is only as broad as its entry points (guard-3448).
 #
-# WHY IT EXISTS: the capability shipped 2026-08-20 and was wired ONLY into that
-# convention — reachable from this loop solely by a five-link prose chain
-# (Phase 3 -> load-execute-protocol.sh -> digest Phase 3.9 -> load-conventions
-# -> the pull step), executed by a READER rather than a runner. This loop's own
-# -0.5/-0.4/-0.3/-0.2 phases are literal Bash calls and run every unit; that
-# chain did not. MEASURED 2026-08-26: a live worker session reached this point
-# with 23 of 61 product checkouts behind origin, one by 13 commits — a repo the
-# same session had ALREADY read source from. Earlier the same defect left a
-# checkout 3 commits/3 days stale, returned pre-fix source to a grep, and nearly
-# shipped a redundant change into an auto-deploying repo. Same shape as
-# g-306-233 (a worker never pulled the FRAMEWORK), one surface over.
+# WHY IT EXISTS: a prose chain through the execute protocol is READ, not run; a
+# literal Bash call here runs every unit. Stale checkouts have returned pre-fix
+# source to a grep.
+# Rationale (WHY, measured): core/config/rationale/worker-cycle-preamble.md
 Bash: py -3 core/scripts/product-repo-freshness.py --pull
 # Fail-open, and never branch on this rc. The network fetch is throttled per
 # repo (stateless via FETCH_HEAD mtime), so the steady state is a rev-list per
@@ -350,26 +284,8 @@ Bash: py -3 core/scripts/product-repo-freshness.py --pull
 # the reducer uses, in its role-filtered mode — never a worker-local detector
 # (no-transcription contract, guard-2676 / g-306-212).
 #
-# THERE WAS BRIEFLY A SECOND COPY OF THIS PHASE, at -0.35, and how it got here is
-# worth one paragraph because the mechanism is invisible by construction. Two
-# agents implemented g-306-240 concurrently on different boxes: one wrote the
-# worker-side probe FILTER, the other wrote the peer-side WorkerStallProbe. In
-# core/scripts/agent-watchdog.py the two edits landed in the same region, so git
-# raised a CONFLICT and it was resolved deliberately. In THIS file they landed in different
-# regions, so git auto-merged both cleanly — producing two phases that ran the
-# same command twice and disagreed about what it covered (the -0.35 copy claimed
-# "6 OF 10 PROBES" including BackgroundJobProbe, which the filter excludes). The
-# conflict was the LUCKY case: it announced itself. The clean auto-merge is the
-# dangerous one. When resolving a duplicate-implementation collision, grep the
-# whole tree for the other file(s) the same pair of commits touched — the ones
-# that merged WITHOUT complaint are where the damage hides.
-#
-# WHY IT EXISTS: agent-watchdog.py --tick had exactly ONE caller in the tree,
-# iteration-close.sh:2554, and this loop deliberately skips iteration-close. So
-# NO watchdog probe had EVER run on a worker box — not DaemonHealthProbe, not
-# MirrorWedgeProbe, none. Same structural fact as g-306-233 (workers never
-# pulled) and g-306-235; fourth instance of reducer protections not reaching the
-# second orchestrator.
+# WHY IT EXISTS: agent-watchdog.py --tick ran only from iteration-close.sh, which
+# this loop skips, so no watchdog probe had ever run on a worker box.
 #
 # WHAT IT COVERS, stated plainly because partial coverage read as total is the
 # failure this goal was filed about. The tick runs the six BOX-LEVEL probes in
@@ -377,31 +293,17 @@ Bash: py -3 core/scripts/product-repo-freshness.py --pull
 # mirror-wedge, freshness, clock-skew, memory-headroom, git-drift.
 #
 # WHAT IT DOES NOT COVER — do not let this line be mistaken for stall detection:
-#   - The five reducer-shaped probes are FILTERED OUT, not merely inert. A worker
-#     is agent-state=IDLE + agent-mode=autonomous BY DESIGN and writes no
-#     runner-heartbeat and no running-session-id, so classify_stalled returns
-#     None at its first guard and HeartbeatProbe false-fires `heartbeat_missing`
-#     (both measured on cc-08). Enabling them would install five probes that
-#     cannot fire, which reads as coverage.
-#   - THIS WORKER'S OWN STALL. The tick runs at the top of a cycle — between work
-#     units — when the loop is alive and progressing by construction. A tick
-#     inside the loop dies with the loop, so it cannot observe the auth-loss /
-#     process-death class (the cc-08 2026-08-06 incident, ~92 min, found by a
-#     human sweep). That needs an out-of-process or peer-side observer reading
-#     the syncable session/body-heartbeat-<SID>.json carrier.
-#     THAT OBSERVER NOW EXISTS: WorkerStallProbe, which runs on the REDUCER and
-#     is deliberately excluded from WORKER_SAFE_PROBES (a worker running it would
-#     be watching itself with a detector whose whole premise is out-of-process
-#     observation). It reads this Body's carrier from the store of record and
-#     alerts when it goes stale WHILE this Body still holds a claim. Which makes
-#     the Phase -0.4 heartbeat tick above not merely a liveness courtesy: it is
-#     the signal that detector consumes, and skipping it makes this Body
-#     invisible to the only thing watching it.
-#   - Nor can a diary-staleness threshold be added here to fix that: on a worker
-#     the execution-diary records ONE entry per GOAL at claim time, so diary
-#     staleness and unit duration are the SAME quantity. Measured consecutive
-#     gaps on cc-08 were 34/56/92/28/15 min, where the 92 was a real stall and
-#     the rest were healthy work — no threshold separates them.
+#   - The five reducer-shaped probes are FILTERED OUT: on an IDLE-by-design
+#     worker they cannot fire or they false-fire, and an inert probe reads as
+#     coverage.
+#   - THIS WORKER'S OWN STALL: a tick inside the loop dies with the loop. The
+#     observer is WorkerStallProbe on the REDUCER, which reads this Body's
+#     Phase -0.4 heartbeat carrier. Skip that tick and this Body is invisible
+#     to the only thing watching it.
+#   - Do NOT add a diary-staleness threshold here: on a worker, diary staleness
+#     and unit duration are the same quantity, so no threshold separates a
+#     stall from healthy work.
+# Rationale (WHY, measured, and the duplicate-phase collision): core/config/rationale/worker-cycle-preamble.md
 Bash: py -3 core/scripts/agent-watchdog.py --tick
 # Fail-open: advisory only. It announces the role filter on stderr every run so a
 # filtered tick is never mistaken for a full one. Never branch on this rc.
@@ -409,9 +311,7 @@ Bash: py -3 core/scripts/agent-watchdog.py --tick
 # Phase -0.15 — GATE-FIRINGS SPOOL FLUSH (g-306-432). A scoped CALL to the SAME
 # flusher the reducer uses (guard-2676). Its ONLY caller was iteration-close's
 # reducer-only do_productivity_check, so under own-cloud EVERY worker gate firing
-# stayed stranded in the machine-local spool and invisible fleet-wide (measured
-# 522 records / 17h on cc-09; 194 / 6h on cc-08). Fourth instance of the
-# workers-never-inherit class (g-306-233 pull, -227 heartbeat, -370 product pull).
+# stayed stranded in the machine-local spool and invisible fleet-wide.
 # Self-throttling BY CONTRACT (--min-interval-seconds 300, --burst-records 200),
 # so call it EVERY cycle and never hand-roll a cadence — a caller-side interval
 # check would be a second, drifting copy of a bound the script already owns.
@@ -485,15 +385,13 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 # down — transients accumulate to `error_threshold` (3); any LIVE poll resets.
 # Takeover detection: machine_id + claim token fingerprint (g-306-224).
 
-# Phase 1 — SELECT (reuse the existing scorer; a worker selects like the reducer)
-Bash: goal-selector.sh
-Pick the top eligible unclaimed goal; drop any in a partner's in_flight OR
-in_flight_bodies — a WORKER partner is in the LATTER ONLY (g-306-276).
+# Phase 1 — SELECT (reducer's scorer, g-375-06)
+Bash: goal-selector.sh select --top 10
+Pick the top eligible unclaimed goal (none? --top 40); drop any in a partner's
+in_flight OR in_flight_bodies — a WORKER is in the LATTER ONLY (g-306-276).
 #
 # ROLE + SKILL ELIGIBILITY (g-115-5664, g-306-440). "Eligible" includes the
-# goal's ROLE and its SKILL, and the scorer knows neither. Four measured
-# incidents where a worker was offered — and once affirmatively INSTRUCTED by
-# the drain-lane banner — to claim reducer-only work.
+# goal's ROLE and its SKILL, and the scorer knows neither.
 # Rationale (WHY role-first, why `undetermined` is a WORD not an rc, why the
 # flag ORDER is load-bearing, why the banner branch keeps the selector
 # role-blind): core/config/rationale/worker-role-gate.md
@@ -533,11 +431,9 @@ Bash: bash core/scripts/aspirations-query.sh --goal-field id <goal-id> --full
 # vs goal-directed artifact creation from content supplied in the goal
 # (`/tree` is pinned for that reason).
 IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
-  NOT a close (g-353-73). Exhaustion is TRANSIENT on a multi-Body fleet: measured
-  2026-08-29 (8 Bodies), four workers read 0 candidates minutes apart while
-  siblings held an aspiration's tail; 25 min later SELECT ranked 18 — all four had
-  closed durably and sat dead until a human relaunched them. A worker with no
-  work is WAITING, not finished.
+  NOT a close (g-353-73). Exhaustion is TRANSIENT on a multi-Body fleet
+  (measured: core/config/rationale/worker-park.md). A worker with no work is
+  WAITING, not finished.
     Bash: py -3 core/scripts/body-manifest.py park-expired --sid "$MIND_SID" --agent "$MIND_AGENT"
   rc=0 (parked past the cap) -> GENUINE close. Record it, write the body-closing
   sentinel so the stop-hook (Phase-2B producer) marks this Body
@@ -556,30 +452,24 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   place in this file that writes the sentinel: an EXPIRED park, reached from
   either trigger (reducer gone, Phase 0.5; supply gone, here). A user stop is the
   other path and is not yours to initiate. Anything else is an INVENTED stop
-  condition (guard-3479). NARROWED TWICE, never widened: g-306-291 made rc=1
-  park instead of close; g-353-73 made SELECT-exhausted park instead of close.
-  The invented-close conservatism is untouched, and parking must never acquire
-  a soft edge for anything else.
+  condition (guard-3479), and parking must never acquire a soft edge for
+  anything else.
   ** CONTEXT PRESSURE IS NEITHER A CLOSE NOR A PARK CONDITION. ** Not "context is
   filling up", "the session has run long", "I have done N units", "the next goal
   will not fit". Autocompact makes a long session survivable and this loop runs
   indefinitely: nearly-out-of-context is a reason to enter the next unit
-  (stop-hook-compliance.md rules 3-4). Measured 2026-08-11: a Body closed itself
-  after 12 units with ~930 candidates and a live reducer, then wrote a persuasive
-  board post explaining why — the post is the SIGNATURE of the defect.
+  (stop-hook-compliance.md rules 3-4). A persuasive board post explaining why
+  this Body closed itself is the SIGNATURE of the defect (measured: worker-park.md).
   IF A SPECIFIC GOAL WILL NOT FIT, RELEASE THE CLAIM UNSTARTED and keep looping —
   `aspirations-release.sh <goal-id> --source <world|agent>`, then VERIFY by
   re-reading that the record shows status=pending / claimed_by=None (the release
   echo is not proof). Never close or park the Body for it.
-  WHY A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM
-  snapshot, Phase -0's closure gate REFUSES every further unit on this SID, and
-  `body_state: closed-pending-merge` is DURABLE — only a user `/start` of a NEW
-  session reopens work. A wrong close STRANDS the queue on a human who does not
-  know they are needed; a wrong park costs one hourly poll.
-  (The reducer generates work, not the worker. A worker does not INVENT an agenda —
-   but "never files a goal" is too strong and was ruled on: see "May a worker file a
-   goal?" below. Do NOT file here regardless; SELECT finding nothing is the park
-   edge, not a moment to manufacture work.)
+  A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM, Phase -0
+  then refuses every unit on this SID, and only a user `/start` of a NEW session
+  reopens work. A wrong park costs one hourly poll.
+  (The reducer generates work, not the worker. Do NOT file here: SELECT finding
+   nothing is the park edge, not a moment to manufacture work — see "May a
+   worker file a goal?" below.)
 
 # Phase 2 — CLAIM (claimed_by = the agent name; <source> = the queue SELECT printed)
 Bash: aspirations-claim.sh <goal-id> <agent> --source <source>
@@ -633,14 +523,10 @@ Bash: load-execute-protocol.sh -> Read -> follow Phase 3.9 .. 4.5 ONLY.
 # is the matching CLI resolver. Do NOT touch the agent-wide WM.
 
 # Phase 3.5 — SPARK CAPTURE (g-306-176). The one learning act a worker performs.
-# Skipping the reducer-only phases means skipping aspirations-spark Phase 6.5 and
-# aspirations-state-update Step 8, which is where rb entries, guardrails, gotchas,
-# forge-gaps, pattern outcomes and experience files are created. Those handlers
-# need the EXECUTING session's in-context experience, which the reducer never
-# had — so on the worker path they are not merely deferred, they are structurally
-# unreachable (specimen g-315-518: worker executed, hypothesis resolved, commit
-# pushed, ZERO learning artifacts). This step is the hand-off: the worker RECORDS
-# the observation; the reducer RUNS the handlers over it at generalize-down.
+# The reducer's learning handlers need the EXECUTING session's experience, which
+# the reducer never had. This step is the hand-off: the worker RECORDS the
+# observation; the reducer RUNS the handlers over it at generalize-down.
+# Rationale (WHY four capture lanes, measured): core/config/rationale/worker-capture-lanes.md
 #
 # Apply the SAME judgment aspirations-spark Phase 6.5 applies — a reusable
 # reasoning pattern, a safety lesson, an operational gotcha, a capability gap.
@@ -652,57 +538,40 @@ Bash: load-execute-protocol.sh -> Read -> follow Phase 3.9 .. 4.5 ONLY.
 FOR EACH spark-worthy observation from this work unit (usually 0 or 1, rarely >2):
     Bash: echo '{"goal_id":"<goal-id>","category":"<goal.category>","observation":"<what was learned, in enough detail for the reducer to encode from without this session>","sq_trigger":"<sq-NNN or null>"}' | bash core/scripts/wm-append.sh spark_capture
 # sq_trigger is the ROUTING KEY on the reducer side, not decoration. Two values
-# matter most (2026-08-16, goal-completion audit D1):
+# matter most:
 #   "sq-013" — this observation is WORK someone must own (a defect, a follow-up,
 #              a capability gap, a dependency): the Case-B relay of the filing
 #              ruling below. The reducer's Worker Spark Replay runs the sq-013
 #              work-discovery handler over sq-013 relays and FILES the goal
 #              (dedup first). Shape the observation as a filing, not a musing:
 #              what is wrong / needed, where (path:line, script, store), the
-#              evidence you measured, and a one-line suggested title. Before
-#              this date the relay reached only the lesson handlers (rb /
-#              guardrail / gotcha) and NEVER became a goal — the ruling's
-#              "loses nothing but time" was false; it lost the work.
+#              evidence you measured, and a one-line suggested title.
 #   null / another sq — a lesson (how to work, a gotcha, a pattern): the
 #              learning handlers encode it; no goal is filed from it.
 # A finding that is BOTH a lesson and work gets TWO entries with the two
 # triggers; the reducer routes each. One entry cannot carry both.
-# goal_id is REQUIRED, and not only for attribution: body-merge unions array
-# slots by CONTENT HASH, so two workers whose observations happen to read
-# identically would collapse into one entry and the second goal's learning would
-# vanish silently. The goal_id makes the hashes differ.
-# The write routes to the Body WM via BODY_WM_PATH like every other wm-*.sh call
-# here — no special-casing, and no agent-wide WM write.
+# goal_id is REQUIRED: body-merge unions array slots by CONTENT HASH, so two
+# identical observations would collapse into one and the second goal's learning
+# would vanish. The write routes to the Body WM via BODY_WM_PATH, never agent-wide.
 
-# Phase 3.6 — EXPERIENCE CAPTURE (g-306-199). Sibling of 3.5, and the reason it
-# is SEPARATE rather than another field on the spark entry: a spark is a reusable
-# LESSON the reducer encodes into rb/guardrail/tree, while this is the execution
-# NARRATIVE it encodes an experience .md from. Merging them would force one
-# consumer to re-derive a classification the writer already knew.
+# Phase 3.6 — EXPERIENCE CAPTURE (g-306-199). Sibling of 3.5: a spark is a
+# reusable LESSON; this is the execution NARRATIVE the reducer encodes an
+# experience .md from.
 #
-# UNLIKE 3.5, THIS IS NOT CONDITIONAL. A spark is written only when the unit
-# produced a reusable insight (often zero); an exp_capture entry is written for
-# EVERY executed goal, including routine ones — the experience archive is a
-# record of what happened, and "nothing surprising happened" is a legitimate and
-# useful narrative. Capturing only interesting units would bias the archive
-# toward drama and silently lose the baseline it is measured against.
+# UNLIKE 3.5, THIS IS NOT CONDITIONAL: write an exp_capture entry for EVERY
+# executed goal, routine ones included. Capturing only interesting units would
+# bias the archive toward drama and lose the baseline it is measured against.
 #
 # You MAY also write the experience .md for THIS goal: experience-add.sh takes
 # a worker write SCOPED to a goal this Body holds, rc=3 otherwise (g-306-418;
 # partition in digest 4.25). Tree/rb/guardrail/journal stay reducer-only. OFF
 # the claim-holding box it returns no_claim: relay, never retry.
 Bash: echo '{"goal_id":"<goal-id>","category":"<goal.category>","execution_summary":"<2-3 sentences: what was done and what it produced>","outcome_class":"<deep|routine>","key_decisions":["<decision + why, one per entry>"],"surprise_level":<0-10>,"verbatim_anchors":["<exact error codes / paths / hashes / commit shas — the strings a future reader would grep for>"]}' | bash core/scripts/wm-append.sh exp_capture
-# verbatim_anchors is the field that makes this worth more than reconstructing
-# from the goal record: exact strings die with the session that saw them, and a
-# reducer writing the .md later cannot recover an error code it never observed.
-# goal_id is REQUIRED for the same content-hash reason as 3.5 — two routine units
-# whose summaries read identically would otherwise collapse into one entry and
-# silently lose the second goal's experience.
+# verbatim_anchors matters most: exact strings die with the session that saw
+# them. goal_id is REQUIRED for the same content-hash reason as 3.5.
 
 # Phase 3.65 — HYPOTHESIS-EVIDENCE CAPTURE (g-306-200). Third capture lane, and
-# the one with the narrowest trigger. Numbered 3.65 rather than appended after 3.8
-# because it belongs with its siblings: 3.5/3.6/3.65 all WRITE to the Body WM,
-# while 3.7/3.8 are about getting outputs OFF this box.
+# the one with the narrowest trigger.
 #
 # CONDITIONAL, like 3.5 and unlike 3.6. Write an entry ONLY when execution
 # surfaced evidence bearing on a hypothesis that ALREADY EXISTS in
@@ -711,32 +580,18 @@ Bash: echo '{"goal_id":"<goal-id>","category":"<goal.category>","execution_summa
 # unit that touched no hypothesis, and inventing one to fill the slot is worse
 # than silence because it manufactures evidence the reducer will act on.
 #
-# WHY IT IS A SEPARATE SLOT rather than a field on the 3.6 entry: an exp_capture
-# entry is a narrative the reducer encodes an experience FROM, whereas this is
-# EVIDENCE INPUT to the EXISTING /review-hypotheses resolution protocol, keyed to
-# a specific hypothesis_id. Merging them would force that protocol to re-derive a
-# classification the writer already knew.
-#
-# THE WORKER DOES NOT RESOLVE, AND THAT IS THE WHOLE DESIGN. Resolution runs the
-# full protocol on the reducer (pipeline-move.sh / pipeline-update-field.sh); a
-# worker resolving from its own unmerged state is the Nth-reducer defect. Supplying
-# evidence and resolving are different acts, and only the first is yours — which is
-# also what makes the no-double-resolution guard expressible: the reducer can see
-# that evidence was already supplied for a hypothesis before it resolves
-# independently.
+# This is EVIDENCE INPUT to the reducer's /review-hypotheses protocol, keyed to a
+# hypothesis_id. THE WORKER DOES NOT RESOLVE, AND THAT IS THE WHOLE DESIGN:
+# supplying evidence and resolving are different acts, and only the first is
+# yours (a worker resolving from its own unmerged state is the Nth-reducer defect).
 #
 # hypothesis_id MUST name a real pipeline.jsonl record — check before writing.
-# An id that matches nothing is worse than no entry: it survives the merge, reaches
-# the reducer, and cannot be joined to anything, so it reads as a broken protocol
-# rather than as a worker mistake.
+# An id that matches nothing survives the merge and reads as a broken protocol.
 Bash: echo '{"goal_id":"<goal-id>","hypothesis_id":"<YYYY-MM-DD_slug from world/pipeline.jsonl>","evidence_summary":"<what execution actually showed, in enough detail for the reducer to resolve from without this session>","surprise_level":<0-10>,"confirms_or_contradicts":"<confirms|contradicts|partial>","suggested_resolution":"<your read, explicitly NON-binding — the reducer runs the full protocol>"}' | bash core/scripts/wm-append.sh hyp_capture
-# goal_id is REQUIRED for the same content-hash reason as 3.5/3.6, and it does more
-# work here: two units supplying evidence on the SAME hypothesis_id would otherwise
-# be at risk of collapsing into one entry, which is exactly the case where losing
-# the second observation most distorts the resolution.
-# suggested_resolution is a READ, not a verdict. The reducer may disagree with it
-# on the same evidence; if this field ever starts being applied as-is, the lane has
-# become a second resolver and the guard above has failed.
+# goal_id is REQUIRED for the same content-hash reason as 3.5/3.6 (two units on
+# the SAME hypothesis_id would otherwise collapse into one entry).
+# suggested_resolution is a READ, not a verdict: if it is ever applied as-is, this
+# lane has become a second resolver.
 
 # Phase 3.66 — ENCODING CAPTURE (g-306-202). Fourth and last capture lane, and
 # the hardest to tell apart from 3.5 — so lead with the discriminator rather than
@@ -747,98 +602,47 @@ Bash: echo '{"goal_id":"<goal-id>","hypothesis_id":"<YYYY-MM-DD_slug from world/
 # counts one bucket, so agentInboxCount under-reports by 41" is an encoding. The
 # same work unit routinely yields one, both, or neither.
 #
-# CONDITIONAL, like 3.5 and 3.65 — but do NOT expect it to be usually empty. That
-# expectation was written into this comment when the lane shipped, on a RETROSPECTIVE
-# count (alpha, cc-08, 2026-08-11: 0 of 6 spark observations from the units BEFORE
-# this lane existed were tree-worthy), and the author's own next three units
-# falsified it: 4 encoding_captures in 3 units, on the same box, the same day.
-# The retrospective count was biased by construction — those observations were
-# WRITTEN as sparks, by an agent with nowhere else to put them, so counting how
-# many "were really facts" measures the old lane's framing, not this lane's yield.
-# Beware re-deriving an expectation from data collected before the thing existed.
+# CONDITIONAL, like 3.5 and 3.65 — but do NOT expect it to be usually empty.
+# (Its measured yield, and when this lane should be RETIRED instead of defended:
+# core/config/rationale/worker-capture-lanes.md.)
 #
-# The retirement condition still stands, unchanged and worth keeping (it is what
-# stops this lane being defended out of sunk cost): if a later audit finds it
-# genuinely empty across many sessions while tree nodes keep being encoded from
-# goal records, then goal records are the real bridge and this lane should be
-# RETIRED, not defended (learning-philosophy.md rule 5). What changed is only the
-# prior — current evidence points the other way, so an empty lane is a signal to
-# look at, not the expected default.
-#
-# Do NOT write the tree node here, and do not reach for /tree. Tree encoding is
-# aspirations-state-update Step 8, reducer-only-by-design; a worker that encodes
-# from its own unmerged state is the Nth-reducer defect. Note /tree IS pinned
-# worker-eligible in SKILL_ELIGIBLE_DESPITE_ENCODING — that pin is for
-# goal-directed artifact creation from content supplied IN THE GOAL, and using it
-# to encode your own session's findings is exactly the misread it warns about.
+# Do NOT write the tree node here, and do not reach for /tree: tree encoding is
+# reducer-only-by-design. /tree's worker-eligible pin (SKILL_ELIGIBLE_DESPITE_ENCODING)
+# covers goal-directed artifact creation from content supplied IN THE GOAL, never
+# encoding your own session's findings.
 FOR EACH tree-worthy domain fact this unit established (usually 0):
     Bash: echo '{"goal_id":"<goal-id>","category":"<goal.category>","fact":"<what is now known to be TRUE about the world, stated so a reader who was not here can act on it>","evidence":"<the measurement that establishes it — command, output, count, or path>","suggested_node":"<tree path if you know one, else null — NON-binding, the reducer decides placement>","supersedes":"<node/claim this corrects, or null>"}' | bash core/scripts/wm-append.sh encoding_capture
 # goal_id is REQUIRED for the same content-hash reason as 3.5/3.6/3.65.
-# `evidence` is what makes this worth more than an assertion: the reducer writes
-# the node later and cannot re-measure what it never observed, and a tree node
-# asserting a fact with no traceable measurement is the drift these captures exist
-# to prevent.
-# `supersedes` is the field that earns this lane its keep. A fact that CORRECTS an
-# encoded belief is the highest-value thing a worker can hand up, and it is
-# precisely what a free-text spark buries — the reducer would have to notice the
-# contradiction on its own, which is the re-derivation this split exists to avoid.
-# REGISTRATION IS LOAD-BEARING, AND IT IS TWO FILES, NOT ONE: encoding_capture is
-# in ARRAY_SLOTS in BOTH core/scripts/wm.py AND mind_api/src/endpoints/wm_write.py.
-# An unregistered slot is NOT refused (wm-append accepts any string as a slot name,
-# rc=0, no validation) — it is silently NULLED by cmd_maintain's scalar eviction at
-# 120 min while the Body waits for consolidation, so the loss lands exactly where
-# nobody is watching.
-# The DAEMON copy is the LIVE one (guard-742/547): wrappers are daemon-only, so
-# wm-append routes to wm_write.py and the eviction predicate that decides survival
-# is read from THERE. Editing wm.py alone changes NOTHING at runtime while looking
-# entirely correct in the diff — measured while adding this lane, and caught only
-# because test_wm_reset_cadence.py::test_shared_wm_constants_parity_with_daemon
-# failed. Adding a fifth lane means editing BOTH sets; that parity test is what
-# makes forgetting loud, so never skip it when touching this.
+# `evidence` makes this worth more than an assertion: the reducer cannot
+# re-measure what it never observed. `supersedes` earns this lane its keep: a
+# fact that CORRECTS an encoded belief is the highest-value thing a worker can
+# hand up.
+# ADDING A LANE? Register it in ARRAY_SLOTS in BOTH core/scripts/wm.py AND
+# mind_api/src/endpoints/wm_write.py (the daemon copy is the live one). An
+# unregistered slot is silently NULLED, not refused.
+# Rationale (WHY): core/config/rationale/worker-capture-lanes.md
 
 # ---- `load_bearing` — the ONE optional field all four capture lanes share ----
 # (g-306-293.) Add `"load_bearing": true` to ANY capture entry in 3.5/3.6/3.65/3.66
 # when it SUPERSEDES or CONTRADICTS an existing encoded conclusion, or unblocks a
 # queued decision. Omit it otherwise — the default is false and most entries are.
 #
-# It buys two things, and the second is why the field exists at all:
-#   1. PRIORITY MERGE. core/scripts/capture_fast_lane.py runs on the reducer once
-#      per iteration (iteration-close --phase productivity-check) and copies
-#      flagged entries into the reducer WM WITHOUT waiting for consolidation. It
-#      reads ACTIVE Bodies too, which the full generalize_down cannot: that pass
-#      enumerates only closed-pending-merge Bodies, so an active worker's captures
-#      are invisible to the reducer however often consolidation runs.
-#   2. EVICTION EXEMPTION. At cap, wm append FIFO-drops the OLDEST entry — exactly
-#      the one that has waited longest, i.e. the one a priority lane exists to
-#      rescue. Flagged entries sort last and are popped last. Measured on ONE
-#      active Body (alpha, cc-08, 2026-08-15, 21 units): 237 entries destroyed
-#      (spark 144, exp 74, hyp 19) against caps of 50/20/10 — ~74% of everything
-#      spark_capture was handed. Second instance of the g-306-289 measurement
-#      (215 on cc-07), so this is the rule, not an outlier.
+# It buys two things: a PRIORITY MERGE (capture_fast_lane.py copies flagged
+# entries into the reducer WM every iteration, from ACTIVE Bodies too) and an
+# EVICTION EXEMPTION (at cap, wm append FIFO-drops the oldest entry, and flagged
+# entries are popped last). Unflagged captures are routinely destroyed at cap.
 #
 # DO NOT FLAG EVERYTHING. A cap a writer can defeat is not a cap: blanket-
 # flagging restores FIFO among the flagged and kills the triage signal. No
 # density target exists — a capped lane pins at 80% (the unflagged floor)
 # whatever writers do (g-115-10021). A mis-flag costs priority, nothing else.
-#
-# KNOWN COST, ACCEPTED (g-306-361): at saturation an honest UNFLAGGED append
-# destroys an unrecoverable peer, a flagged one a carried duplicate. Flag
-# honestly anyway. Measured: re-ordering the victim moves ~10% of losses; the
-# lever is that a Body lane never DRAINS (the carrier copies, never clears).
+# Flag honestly even at saturation (a known, accepted cost: g-306-361).
+# Rationale (WHY, measured): core/config/rationale/worker-capture-lanes.md
 
-# Phase 3.7 — CARRIER CHECK (g-306-263). Numbered 3.7, NOT 3.9: Phase 3 above
-# delegates to the EXECUTE PROTOCOL's "Phase 3.9 .. 4.5", so a worker-loop phase
-# also called 3.9 would put two different Phase 3.9s in one file, thirty lines
-# apart, naming different documents. Sits between 3.5 (spark capture) and 4 (end
-# of work unit) in this loop's own numbering.
-#
-# The hand-off named in Phase 4 below is
-# NOT universal: it carries the worker's WM and its goal record, and it carries
-# NOTHING ELSE. A framework file edit made on a worker box reaches the reducer
-# via no channel at all — measured on g-115-5147, whose finished fix sat on
-# cc-07 and was 0% present on cc-04, reported COMPLETE the whole time. Nothing
-# was broken; there was simply no carrier, and no moment at which that was said
-# out loud. This is that moment.
+# Phase 3.7 — CARRIER CHECK (g-306-263). The Phase 4 hand-off carries the
+# worker's WM and its goal record and NOTHING ELSE: a framework edit made on a
+# worker box reaches the reducer via no channel unless a carrier exists.
+# Rationale (WHY, measured): core/config/rationale/worker-carrier-and-closure-evidence.md
 #
 # Name the output classes this work unit actually produced and ask the table.
 # `worker_execute.py carriers` lists the classes; do NOT guess a name — an
@@ -878,42 +682,25 @@ Bash: bash core/scripts/tree-lock.sh check --project-root "$(git rev-parse --sho
 # OUTPUT_CLASS_CARRIERS rather than being folded into framework-file-edit.
 Bash: bash core/scripts/iteration-push.sh --push-worker-ref
 # Pushes HEAD to refs/workers/<agent>/<sid>, then STOPS — it never touches the
-# shared branch. This does NOT contradict Phase -0.3's --no-push: that flag's
-# rationale is contention on shared store files, and a ref whose path contains
-# this Body's sid has exactly ONE writer by construction, so the rationale does
-# not reach it. Fail-soft like every other iteration-push call — never branch on
-# the rc, and never let a failed push stop the cycle.
-#
-# The REDUCER side is `bash core/scripts/worker-ref-consume.sh` (fetch + report;
-# --merge <ref> to take one). A worker does NOT run the consumer: merging another
-# Body's framework edits into the shared tree is a reducer act, and report-only
-# is deliberate — a framework change that applies to drifted context is worse
-# than one that is lost.
+# shared branch (a per-sid ref has ONE writer, so Phase -0.3's --no-push
+# rationale does not reach it). Fail-soft like every other iteration-push call —
+# never branch on the rc, and never let a failed push stop the cycle.
+# A worker does NOT run the consumer (worker-ref-consume.sh): merging another
+# Body's framework edits into the shared tree is a reducer act.
 
 # Phase 3.9 — CLOSURE EVIDENCE (g-115-5158). A scoped CALL to the SAME producer
 # the reducer uses — never a worker-local write (no-transcription contract,
 # guard-2676 / g-306-212).
 #
-# WHY IT EXISTS: closure evidence is the `outcome_note` field, and exactly one
-# thing produced it on the close path — iteration-close do_verify Step 3, which
-# a worker skipped entirely until 2026-08-16 (Phase 4a below calls do_verify
-# with a ONE-LINE --summary; it passes --no-supersede on the worker path, so
-# THIS phase stays the rich-narrative producer and 4a only backfills when
-# this phase did not run — g-115-6633). Before that a worker had
-# NO producer at all. Its notes were written by hand or not at all, which means
-# the rate was DISPOSITIONAL, not mechanical. Measured 2026-08-09 on asp-115: the
-# live worker sat at 48/48 and every other SID at 24/26, so no asymmetry was
-# visible — and that is exactly the trap. One disciplined agent's 100% says
-# nothing about the next Body, and arming any enforcement gate on outcome_note
-# would have refused 100% of worker closures while passing reducer ones,
-# MANUFACTURING the disparity it was meant to remove. Fifth instance of the
-# inheritance gap (workers never pulled, skill-dedup, deadman, watchdog --tick).
+# WHY IT EXISTS: closure evidence is the `outcome_note` field. THIS phase is the
+# rich-narrative producer: Phase 4a calls do_verify with a ONE-LINE --summary and
+# passes --no-supersede on the worker path, so 4a only backfills when this phase
+# did not run (g-115-6633).
+# Rationale (WHY, measured): core/config/rationale/worker-carrier-and-closure-evidence.md
 #
 # RUNS AFTER 3.7/3.8 ON PURPOSE. Phase 3.7's STRANDED branch also writes
 # outcome_note, and this helper is write-if-absent/never-clobber — so placing
 # this before 3.7 would silently prevent a stranding from ever being recorded.
-# Ordered this way, a stranding note wins and this call declines, which is the
-# correct precedence: a stranded output is the more urgent artifact.
 Bash: bash core/scripts/closure-evidence-write.sh --goal <goal-id> --source world \
         --summary-file <path to the narrative you already wrote> \
         --prefix "[worker-loop] close:"
@@ -943,15 +730,16 @@ Bash: bash core/scripts/closure-evidence-write.sh --goal <goal-id> --source worl
 #     REPORTED only, since closing the parent stays reducer-side.
 Skill(aspirations-verify) with: goal, result, scope="own-unit"
 #     THEN the mechanical status write, through the SHARED close writer, as its
-#     own separate call (guard-470). do_verify in iteration-close.sh is the ONLY
-#     writer of that transition and of everything hanging off it — recurring
-#     routing, completed_date + outcome_class, the "Completed:" board post,
-#     and the --if-goal in_flight clear (guard-2523). WHY these are two calls
-#     rather than one, and the 360-of-361 measurement behind the write half:
-#     core/config/rationale/worker-verify-own-unit.md
+#     own separate call (guard-470): do_verify is the ONLY writer of that
+#     transition and of all that hangs off it (guard-2523).
+#     Rationale (WHY two calls): core/config/rationale/worker-verify-own-unit.md
 Bash: bash core/scripts/iteration-close.sh --phase verify --goal <goal-id> \
         --status <completed|blocked|skipped> --source <world|agent> \
         --outcome <deep|routine> --summary "<one line: what this unit did>"
+#     LONG CALL (g-375-02): up to 15 min when its domain-suite gate fires (it
+#     says so first). Give it your Bash tool's longest timeout; if the harness
+#     moves it to the background, wait as the result says; if it kills it,
+#     re-run ONCE with run_in_background and wait. Never write the status.
 #     --status is YOUR judgement of the unit you just executed — the same
 #     caller-declared contract the reducer honours (do_verify refuses to infer it
 #     from disk). Pick by what happened, and note that two of the three are
@@ -977,8 +765,7 @@ Bash: bash core/scripts/iteration-close.sh --phase verify --goal <goal-id> \
 #     metadata:
 #       Bash: bash core/scripts/aspirations-update-goal.sh --source <world|agent> <goal-id> defer_reason "precondition_unmet: <the gate, short>"
 #     THE PREFIX IS NOT THE STRUCTURE, and reading it as such is why this lane
-#     is starved: that prose is SKIPPED by the only sweep that clears this class
-#     (measured 81 of 84 eligible, cc-13 2026-09-04; 101 of 104, cc-04 08-26).
+#     is starved: that prose is SKIPPED by the only sweep that clears this class.
 #     So ALSO write a machine-evaluable predicate into verification.preconditions
 #     — the ONLY field precondition-defer-recheck reads (predicate.py owns the
 #     types; after_time for an elapsed window) — and make it evaluable on ANY
@@ -1002,14 +789,12 @@ Bash: bash core/scripts/iteration-close.sh --phase verify --goal <goal-id> \
 #     your env for that call; still do not run the spark phase (4c below).
 #
 # 4b. HAND-OFF ROW. Append the completion row body-merge.py reads
-#     (`_completed_goal_ids` -> `merged_goal_ids` -> worker_retrospective.py).
-#     Without it merged_goal_ids is ALWAYS empty and the consolidate Step -0.9
-#     retrospective (team-state / journal / findings / experience / imp@k lanes)
-#     has nothing to run over — this file carried 0 references to the slot
-#     before 2026-08-16, so that lane had never fired once. Same row shape as
-#     aspirations-state-update Step 3 (goal-selector reads these keys — do not
-#     rename); omit work_class when the goal record has none. Only for
-#     status=completed. Routes to the Body WM (BODY_WM_PATH), never agent-wide.
+#     (`_completed_goal_ids` -> `merged_goal_ids` -> worker_retrospective.py);
+#     without it the consolidate Step -0.9 retrospective has nothing to run over.
+#     Same row shape as aspirations-state-update Step 3 (goal-selector reads
+#     these keys — do not rename); omit work_class when the goal record has none.
+#     Only for status=completed. Routes to the Body WM (BODY_WM_PATH), never
+#     agent-wide.
 Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring":<true|false>[,"work_class":"<class>"]}' | bash core/scripts/wm-append.sh goals_completed_this_session
 #
 # 4c. Do NOT run spark / state-update / learning-gate / productivity-check. The
@@ -1017,37 +802,29 @@ Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring"
 #     reducer merges the WM at generalize-down and runs the encode/reflect/
 #     consolidate phases over the merged result.
 #
-# team-state in_flight: 4a's --if-goal clear is the ONLY clear you perform, and
-# it fires only when the shared row names this goal. Do NOT add an unconditional
-# clear (g-306-132-d): Phase 2's claim WRITES in_flight, and in_flight is
-# AGENT-keyed with no sid, so a worker and its reducer share one row — an
-# unconditional clear would blank a live reducer's row, worse than the stale row
-# it fixes. The stop-hook additionally calls worker_close_in_flight_clear.py after
-# a genuine close (result marked/marked-push-failed); it clears ONLY when the goal
-# named by the live in_flight row carries THIS Body's claimed_by_sid, and a second
-# hand-rolled clear on this path would defeat that ownership test.
+# team-state in_flight: 4a's --if-goal clear is the ONLY clear you perform. Do
+# NOT add an unconditional clear (g-306-132-d): in_flight is AGENT-keyed with no
+# sid, so a worker and its reducer share one row and an unconditional clear would
+# blank a live reducer's row. (The stop-hook's worker_close_in_flight_clear.py
+# clears after a genuine close ONLY when the row's goal carries THIS Body's
+# claimed_by_sid; a hand-rolled clear here would defeat that ownership test.)
 # Do NOT write the body-closing sentinel here — finishing ONE work-unit is NOT a
-# genuine close; Phase 5 re-enters this loop for the next unit, and a sentinel
-# left here would make a turn-end between units mark the Body closed
-# prematurely, losing later divergence (g-306-70). The sentinel is written ONLY
-# when SELECT finds no work (Phase 1) — the unambiguous genuine close. A worker
-# that ends abruptly without reaching Phase 1 (crash, terminal closed) leaves no
-# sentinel; cleanup-stale-bindings then stages its WM via the stale-binding path,
-# so no divergence is lost either way.
+# genuine close (g-306-70). The sentinel is written ONLY by Phase 1's
+# expired-park close. A worker that ends abruptly leaves no sentinel;
+# cleanup-stale-bindings then stages its WM, so no divergence is lost.
+# Rationale (WHY): core/config/rationale/worker-carrier-and-closure-evidence.md
 
-# Phase 5 — CONTINUE (the loop edge; added 2026-08-03 after the gap fired live).
-# v1 said "the driver may re-invoke this loop" — but no driver exists; the worker
-# one-shotted after its first goal (g-315-518 soak, DESKTOP-O91DLK2). The loop
-# re-invokes ITSELF: the terminal tool call of a completed work unit is
-# Skill(worker-loop), which re-enters at Phase -0 (re-verifying worker identity —
-# guard-517/guard-463 class: role-gated re-entry) and runs the Phase 0.5
-# reducer-liveness poll before any new claim. NEVER Skill(aspirations) — that is
-# the reducer's full-loop re-entry. Every CLOSE path (an EXPIRED park — the one
-# sentinel writer — or a user stop) still ends the turn with a Bash call after
-# its sentinel work, exactly as before — self-continuation never overrides a
-# close edge. A PARK (Phase 0.5 rc=1, or Phase 1 no eligible goal) is not a
-# close and takes the third shape: it ends on
+# Phase 5 — CONTINUE (the loop edge). No driver exists: the loop re-invokes
+# ITSELF. The terminal tool call of a completed work unit is Skill(worker-loop),
+# which re-enters at Phase -0 (re-verifying worker identity — guard-517/guard-463
+# class: role-gated re-entry) and runs the Phase 0.5 reducer-liveness poll before
+# any new claim. NEVER Skill(aspirations) — that is the reducer's full-loop
+# re-entry. Every CLOSE path (an EXPIRED park — the one sentinel writer — or a
+# user stop) ends the turn with a Bash call after its sentinel work —
+# self-continuation never overrides a close edge. A PARK (Phase 0.5 rc=1, or
+# Phase 1 no eligible goal) is not a close and takes the third shape: it ends on
 # `ScheduleWakeup(<park-resume prompt>, 3600)` and nothing after it.
+# Rationale (WHY): core/config/rationale/worker-deadman-net.md
 ```
 
 ## What a worker MUST NOT do
@@ -1061,10 +838,8 @@ Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring"
 
 ## May a worker file a goal? (RULED 2026-08-06, g-306-250)
 
-The prior contract was one sentence — "a worker never fabricates goals" — and it did
-not settle the live cases. Four instances accumulated where a worker measured
-something real and had no sanctioned move, and three separate agents recorded "this
-deserves its own goal" without filing one. This is the ruling; do not re-derive it.
+This is the ruling; do not re-derive it (its history:
+core/config/rationale/worker-loop-contract.md).
 
 **The rule's purpose is to stop a worker inventing an AGENDA the reducer never
 approved.** Every case below is decided against that purpose, not against the
@@ -1076,11 +851,10 @@ sentence.
 | **B. New scope, observable by any Body** — a framework defect, a mislabelled field, a stale predicate | the agent-queue claim defect (g-306-238) | **DO NOT FILE. Relay** via `wm-append.sh spark_capture` **with `sq_trigger: "sq-013"`** and a filing-shaped observation (Phase 3.5), and post to the findings board if it is time-sensitive. The reducer's Worker Spark Replay runs the sq-013 handler over sq-013 relays and files the goal at its next iteration (2026-08-16); a relay WITHOUT that trigger reaches only the lesson handlers and never becomes work. The relay can cost the WORK, not just time (below). |
 | **C. New scope, MACHINE-LOCAL** — only observable from this box: its store, filesystem, process table, installed binaries, local git state | the `.history` wiring fix (g-115-644); `unzip` absent on this box (g-335-869) | **FILE.** No reducer and no partner can EVER observe a worker box's local state, so the relay is the ONLY channel and its loss is unrecoverable — nobody can rediscover what only this box can see. |
 
-Case B's 12.5h bound (g-306-238) is FALSIFIED: re-measured 2026-09-18, the
-lane's last filing was g-115-9648 on 09-10 — 7d8h and zero filings, with six
-would-be owners pending (g-115-9921). A stalled replay costs the WORK. B/C
-splits on RECOVERABILITY, not delay: any Body can see a B finding again; a
-dropped machine-local one is not late, it is gone.
+A stalled replay costs the WORK, not just time (measured:
+core/config/rationale/worker-loop-contract.md). B/C splits on RECOVERABILITY,
+not delay: any Body can see a B finding again; a dropped machine-local one is
+not late, it is gone.
 
 Three obligations on any goal a worker files:
 
@@ -1105,77 +879,31 @@ See `.claude/rules/return-protocol.md` — the last action of any turn MUST be a
 tool call, not a text summary. This skill is the WORKER's orchestrator, so it
 re-enters ITSELF. Three terminal shapes, selected by what just happened:
 
-**A worker has its own deadman net (g-306-239, 2026-08-06).** Until then it had
-none: this file contained zero mentions of ScheduleWakeup, and the terminal-pair
-in `.claude/rules/return-protocol.md` was written for the REDUCER alone. So a
-worker turn ending on trailing TEXT — the exact failure the rule above exists to
-prevent, and one the Stop hook cannot reliably catch (rb-629/guard-454: Claude
-Code does not fire Stop on a text-only turn-end) — was dead PERMANENTLY, with
-nothing to re-invoke it. The signature would be **a dead LOOP inside a live
-PROCESS**, which no process-liveness check sees.
-
-**WITNESSED 2026-08-18 — this paragraph said the opposite until then, and the
-correction is the point.** From g-306-239's filing (2026-08-06) until now the
-gap rested on the grep alone (this file had 0 mentions of ScheduleWakeup) and
-this line read "**no worker text-death has ever been observed**". That is now
-FALSE. An alpha WORKER Body on cc-07 (SID d1aec55b, goal g-250-351) died on a
-trailing-text turn-end and was resurrected by its own net — so the failure mode
-is real, the net WORKS, and neither half was known before. The net's LATENCY is
-the residual defect: armed at `delaySeconds=600`, it delivered **6h49m** later.
-That latency finding is owned by **g-115-6629** — do not re-file it. What this
-file owes a reader is only the corrected fact: cite THIS incident, not cc-08.
-
-The cc-08 retraction below still stands and is still load-bearing — a witnessed
-text-death does not retroactively make an auth-loss stall into one, and the
-`CTX: 0%/0% [fresh]` tell is how you tell them apart. g-306-239 was originally
-filed citing a cc-08/foxtrot outage as the measured instance; that attribution
-was **retracted
-before any work began** — cc-08 had lost its Claude Code LOGIN and sat at an idle
-prompt because it could not authenticate. The tell is `CTX: 0%/0% [fresh]`: a
-text-death PRESERVES context, so a fresh context means a session restart, not a
-return-protocol violation. Re-login resumed the loop immediately, which a
-text-death would not do.
-
-So: do NOT use cc-08 as the regression scenario, and do NOT expect this net to
-prevent an auth-loss stall — ScheduleWakeup cannot fire a turn when the CLI has
-no valid login. The sibling DETECTION gap (worker stalls are invisible to the
-watchdog, whose `--tick` has exactly one caller in `iteration-close.sh`, which
-workers skip) covers all stall causes including auth loss.
+**A worker has its own deadman net (g-306-239).** Without it, a worker turn that
+ends on trailing TEXT is dead permanently — the Stop hook cannot reliably catch
+a text-only turn-end (rb-629/guard-454) — and **a dead LOOP inside a live
+PROCESS** is invisible to every process-liveness check. The net has been
+witnessed resurrecting a worker; its delivery latency is owned by g-115-6629.
+It does NOT cover an auth-loss stall: ScheduleWakeup cannot fire a turn when the
+CLI has no valid login.
 
 Do NOT reach for the reducer's `<<autonomous-loop-dynamic>>` sentinel — it is
 both forbidden and inert here. It resolves to the AUTONOMOUS loop instructions
-(guard-517/guard-463 forbid a worker entering those), and the aspirations loop
-requires agent-state RUNNING while a worker box is IDLE by design, so a
-resurrected turn would refuse at Phase -1.5 rather than resume. The worker arms a
-NATURAL-LANGUAGE prompt instead — sanctioned by
-`.claude/rules/schedule-wakeup-correctness.md`, and it clears
-`schedule-wakeup-gate.py`, whose predicate refuses only prompts STARTING with
-"/" whose first token is not "/loop" (verified: the emitted prompt returns
-`is_bad_slash_prefix == False`, against a `/aspirations loop` control returning
-`True`).
+(guard-517/guard-463 forbid a worker entering those), and a worker box is IDLE
+by design, so a resurrected turn would refuse at Phase -1.5 rather than resume.
+The worker arms a NATURAL-LANGUAGE prompt instead, sanctioned by
+`.claude/rules/schedule-wakeup-correctness.md`.
 
-The directive text is NOT written out here on purpose. guard-2676 (the
-no-transcription contract) requires a scoped CALL to a shared component —
-`core/scripts/deadman-directive.sh` — so the delay, the opt-out flag, and the
-closure-check-then-arm ordering live in exactly one place for this loop and
-cannot drift from it the way a transcription would.
-
-That component serves the WORKER only. It shipped with a `--role reducer` branch
-that had zero callers, and g-306-241 RETIRED it rather than wiring the three
-reducer emitters to it: `iteration-close.sh` carries the rb-4345 single-shot-net
-lesson in full where the shared branch carried one terse sentence, and
-`iteration-close-reminder.py` keys its deep-recurring branch on
-`recurring-close.sh`'s literal emitted text, which this component never produced
-— so wiring would have downgraded the live imperative AND silently broken that
-detector. `--role reducer` now refuses at rc=2 with an explanation. Read this as
-the scope of the guarantee above, not as a gap: guard-2676 governs how a WORKER
-capability is built, and this call site IS that capability. The three conditions
-that would make a shared reducer directive worth extracting are recorded in the
-script's own header.
+The directive text is NOT written out here on purpose: guard-2676 requires a
+scoped CALL to `core/scripts/deadman-directive.sh`, so the delay, the opt-out
+flag, and the closure-check-then-arm ordering live in exactly one place. That
+component serves the WORKER only (its `--role reducer` branch is retired).
+History, the witnessed resurrection, and the auth-loss retraction:
+core/config/rationale/worker-deadman-net.md
 
 | Just finished | Terminal tool call |
 |---|---|
-| A work unit (Phase 4 done, no close condition) | **The deadman PAIR** — run `bash core/scripts/deadman-directive.sh --role worker` and emit exactly the two batched calls it prints: `ScheduleWakeup(<natural-language resurrection prompt>, 600)` THEN `Skill(worker-loop)` as the LAST call. `Skill(worker-loop)` is still the primary re-entry (NEVER `Skill(aspirations)` — reducer-only, guard-517/guard-463; and never a bare Bash echo — the pre-2026-08-03 text said "hand control back to its driver", naming a driver that does not exist, and the Body silently one-shotted after its first goal, g-315-518 soak). The ScheduleWakeup is a NET behind it, not a substitute. |
-| A **PARK** — Phase 0.5 rc=1 (reducer gone, g-306-291) or Phase 1 no eligible goal (supply gone, g-353-73), park not expired | **`ScheduleWakeup(<park-resume prompt>, 3600)` ALONE, as the last call, with NO `Skill(worker-loop)` after it.** This is the one terminal shape that is neither the pair nor a bare echo, and the asymmetry is deliberate in both directions. No Skill: re-entering now would re-run the poll that just said "no reducer" and spin. No 600s net either — **the platform keeps ONE pending wakeup (replace-slot), so the park poll IS the net**; arming both would leave whichever came second, and a 600s worker-net firing on a parked Body is the wedge the resurrection prompt now branches for explicitly. A park turn that forgets to arm is indistinguishable from a close and needs exactly the human `/start` this change exists to remove — and in THAT case only, the previous unit's 600s net is still in the slot (unreplaced, precisely because this turn never armed over it) and becomes a real backstop rather than a nuisance: `deadman-directive.sh` teaches it to read `parked` as RESUMABLE and re-arm at 3600 (pinned by `test_worker_prompt_treats_parked_as_resumable_not_closed`). On a park that DOES arm correctly there is no 600s net left to worry about — the 3600s poll replaced it. The stop-hook worker-net stands down on the parked manifest (`gate=worker-net-body-parked`), so this turn-end is ALLOWed rather than BLOCKed into a sentinel ceremony that would durably close the Body. |
-| A close path — an EXPIRED park (the Phase 1 sentinel just touched) or a user stop | Bash echo stating the close reason. **Do NOT arm the net here** — the turn genuinely ends; stop-hook Phase 2B consumes the sentinel and stages the WM. A net armed by the PREVIOUS work unit is still pending and will fire ~600s later; that firing is benign because THREE layers read the DURABLE closure record, `sessions/<SID>/body-manifest.yaml` `body_state`: the resurrection prompt checks it FIRST and declines to resume (and does not re-arm) when it is in the CLOSED SET — `closed-pending-merge` / `merged` / `closed-stale`, NOT merely "not `active`", since `parked` is non-active and resumable; Phase -0's closure gate refuses a work unit on the same read; and the stop-hook worker-net stands down on it (`gate=worker-net-body-closed`). The `body-closing` SENTINEL cannot serve this purpose — close-body-on-genuine CONSUMES it on every genuine-close branch, so after a completed close its absence is indistinguishable from "no close ever happened". (The pre-2026-08-09 prompt read exactly that as "resume", and the worker-net BLOCKed every post-close turn-end into a second sentinel ceremony — measured cc-08 04:39→04:49.) This is the worker's equivalent of the reducer's safe landing (whose resurrected turn self-aborts at Phase -1.5 on `agent-state != RUNNING`). |
+| A work unit (Phase 4 done, no close condition) | **The deadman PAIR** — run `bash core/scripts/deadman-directive.sh --role worker` and emit exactly the two batched calls it prints: `ScheduleWakeup(<natural-language resurrection prompt>, 600)` THEN `Skill(worker-loop)` as the LAST call. `Skill(worker-loop)` is still the primary re-entry (NEVER `Skill(aspirations)` — reducer-only, guard-517/guard-463; and never a bare Bash echo — no driver exists to re-invoke you). The ScheduleWakeup is a NET behind it, not a substitute. |
+| A **PARK** — Phase 0.5 rc=1 (reducer gone, g-306-291) or Phase 1 no eligible goal (supply gone, g-353-73), park not expired | **`ScheduleWakeup(<park-resume prompt>, 3600)` ALONE, as the last call, with NO `Skill(worker-loop)` after it.** No Skill: re-entering now would re-run the poll that just said "no reducer" and spin. No 600s net either — **the platform keeps ONE pending wakeup (replace-slot), so the park poll IS the net**. A park turn that forgets to arm is indistinguishable from a close. The stop-hook worker-net stands down on the parked manifest (`gate=worker-net-body-parked`), so this turn-end is ALLOWed rather than BLOCKed into a sentinel ceremony that would durably close the Body. |
+| A close path — an EXPIRED park (the Phase 1 sentinel just touched) or a user stop | Bash echo stating the close reason. **Do NOT arm the net here** — the turn genuinely ends; stop-hook Phase 2B consumes the sentinel and stages the WM. A net armed by the PREVIOUS work unit is still pending and will fire ~600s later; that firing is benign because THREE layers read the DURABLE closure record, `sessions/<SID>/body-manifest.yaml` `body_state` in the CLOSED SET (`closed-pending-merge` / `merged` / `closed-stale`): the resurrection prompt declines to resume, Phase -0's closure gate refuses a work unit, and the stop-hook worker-net stands down (`gate=worker-net-body-closed`). The `body-closing` SENTINEL cannot serve this purpose — it is CONSUMED at every genuine close. |
 | Consulted for the phase split only (no work unit ran) | The `worker_execute.py` Bash call whose output answered the question. |

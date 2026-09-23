@@ -22,6 +22,7 @@ make this canary an instance of the class it detects.
 """
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -589,11 +590,23 @@ HOOK_GATE_ROWS = (
     "schedule-wakeup-gate-deny-channel",
 )
 
-# Rows with their own named tests above rather than a tuple-driven family.
+# Rows with their own named tests rather than a tuple-driven family.
 SELF_TESTED_ROWS = (
     "agent-watchdog-tick",
     "aspirations-query-read-channel",
     "aspirations-query-refusal-channel",
+    #  unit 3. rc=0 is its trip — the inverse of GATE_ROWS — and its probe is
+    # two calls, so neither family's stubs fit. Tests: the pending-deploys section below.
+    "pending-deploys-has-pending",
+    #  unit 4. rc is 0 whether or not it finds anything, so the verdict is the
+    # stdout count line and a crash is DEAD. Tests: the findings-gate section below.
+    "findings-gate-signal-scan",
+    #  unit 5. rc=1 is its trip, as in GATE_ROWS, but a crash is DEAD here: the
+    # reverse of that family's empty-stdout test. Tests: the routing-gate section below.
+    "notification-routing-gate-suppress",
+    #  unit 6. The probe builds its own throwaway world, and a crash is
+    # UNEVALUATABLE: do_verify reads it as a refusal. Tests: the domain-suite section below.
+    "domain-suite-gate-collect-refusal",
 )
 
 _DENY_JSON = '{"hookSpecificOutput": {"hookEventName": "PreToolUse", ' \
@@ -722,6 +735,604 @@ def test_probe_marks_its_child_as_a_liveness_probe(monkeypatch):
     assert rc == 0
     assert out == "signal-liveness-canary"
     assert canary.LIVENESS_PROBE_ENV not in os.environ
+
+
+def test_probe_drop_env_removes_a_var_from_the_child_only(monkeypatch):
+    """The safety half of the pending-deploys row rests on this: a dropped var must be
+    absent in the CHILD, still present here, and a call without drop_env unchanged."""
+    monkeypatch.setenv("MIND_AGENT", "pytest-agent")
+    show = [sys.executable, "-c",
+            "import os, sys; sys.stdout.write(os.environ.get('MIND_AGENT', '<absent>'))"]
+    assert canary._probe(show, drop_env=("MIND_AGENT",))[1] == "<absent>"
+    assert canary._probe(show)[1] == "pytest-agent"
+    assert os.environ["MIND_AGENT"] == "pytest-agent"
+
+
+# ---- pending-deploys row ( unit 3): rc=0 is the trip, `add` builds the fixture --
+
+PD_ROW = "pending-deploys-has-pending"
+
+
+def _inject_pd(monkeypatch, add=(0, "", ""), has_pending=(0, "", ""), write=True, calls=None):
+    """Stub both legs. `write` makes the add leg leave bytes in the store it was pointed
+    at, as the real `add` does — the assertion reads the FILE, not add's rc."""
+    def _stub(argv, stdin_text=None, drop_env=()):
+        if calls is not None:
+            calls.append((list(argv), tuple(drop_env)))
+        if "add" in argv:
+            if write:
+                Path(argv[argv.index("--store") + 1]).write_text("- {repo: a/b}\n")
+            return add
+        return has_pending
+    monkeypatch.setattr(canary, "_probe", _stub, raising=True)
+
+
+def test_pd_row_is_alive_against_the_real_tracker():
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is False, detail
+    assert "still sees a recorded obligation" in detail
+
+
+def test_pd_rotted_fixture_is_unevaluatable_not_dead():
+    """Driven both ways against the real tracker. A bare repo is refused by the gate's
+    own `add` (rc=2), so the store is empty and has-pending honestly says rc=1. Without
+    the fixture check that reads DEAD — the false accusation. With it: UNEVALUATABLE."""
+    rotted = dict(canary.PENDING_DEPLOYS_PROBE_ENTRY, repo="probe-only-signal-liveness-canary")
+    assert canary._pending_obligation_assertion(rotted, check_fixture=False)()[0] is True
+    dead, detail = canary._pending_obligation_assertion(rotted)()
+    assert dead is None and "fixture is stale" in detail and "rc=2" in detail, detail
+
+
+@pytest.mark.parametrize("breakage", [
+    # No 'Traceback' header at all — why the row keys on stderr, not on that header.
+    ("syntax", lambda src: src + "\ndef broken(:\n"),
+    # add exits 1 and writes NOTHING, so this also pins the arc != 1 fall-through: a
+    # fixture check that bailed here would call a dead module unevaluatable.
+    ("import", lambda src: src.replace("import argparse\n",
+                                       "import argparse\nimport zzz_canary_missing\n", 1)),
+])
+def test_pd_crash_of_the_real_module_is_dead_not_unevaluatable(tmp_path, monkeypatch, breakage):
+    """A crash is DEAD for this row: the gate discards stderr and reads rc=1 as nothing
+    pending, so a module that cannot load closes every deploy clean, silently."""
+    _name, mutate = breakage
+    src = (SCRIPTS / "pending-deploys.py").read_text(encoding="utf-8")
+    (tmp_path / "pending-deploys.py").write_text(mutate(src), encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is True, detail
+    assert "CRASHED" in detail, detail
+
+
+def test_pd_empty_read_of_a_written_store_is_dead(monkeypatch):
+    _inject_pd(monkeypatch, has_pending=(1, "", ""))
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is True, detail
+    assert "read the recorded obligation as nothing pending" in detail
+    assert "had just written" in detail
+
+
+def test_pd_refused_call_shape_is_dead(monkeypatch):
+    """rc=2 after `add` accepted --store means argparse refused has-pending --goal-id,
+    which is the gate's own call — and the gate reads rc=2 as nothing pending too."""
+    _inject_pd(monkeypatch, has_pending=(2, "", "usage: pending-deploys.py ..."))
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is True and "refused the call shape" in detail, detail
+
+
+def test_pd_unexpected_rc_is_unevaluatable(monkeypatch):
+    _inject_pd(monkeypatch, has_pending=(3, "", ""))
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is None and "unexpected rc=3" in detail, detail
+
+
+def test_pd_writer_that_registers_nothing_is_unevaluatable_and_skips_the_reader(monkeypatch):
+    calls = []
+    _inject_pd(monkeypatch, add=(0, "", ""), write=False, calls=calls)
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is None and "fixture is stale" in detail, detail
+    assert len(calls) == 1, "the reader must not run when there is nothing for it to see"
+
+
+def test_pd_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is None and "absent at" in detail, detail
+
+
+def test_pd_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=()):
+        raise OSError("interpreter vanished")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_pd_both_legs_use_an_isolated_store_and_strip_agent_identity(monkeypatch):
+    """guard-1006: this probe WRITES. Both legs must name --store, and neither child may
+    inherit an agent identity — so a tracker that stopped honouring --store would resolve
+    no agent and write nowhere, instead of into the live store."""
+    calls = []
+    _inject_pd(monkeypatch, calls=calls)
+    _row(PD_ROW)["assertion"]()
+    assert [argv[argv.index("--store") + 2] for argv, _ in calls] == ["add", "has-pending"]
+    for argv, dropped in calls:
+        assert {"MIND_AGENT", "MIND_SID"} <= set(dropped), dropped
+    reader = calls[1][0]
+    assert reader[reader.index("--goal-id") + 1] == canary.PENDING_DEPLOYS_PROBE_ENTRY["goal_id"]
+
+
+def test_pd_probe_removes_its_temp_store(monkeypatch):
+    made = []
+    real_mkdtemp = canary.tempfile.mkdtemp
+
+    def _record(*a, **k):
+        made.append(real_mkdtemp(*a, **k))
+        return made[-1]
+    monkeypatch.setattr(canary.tempfile, "mkdtemp", _record, raising=True)
+    dead, detail = _row(PD_ROW)["assertion"]()
+    assert dead is False, detail
+    assert made and not Path(made[0]).exists()
+
+
+def test_pd_fixture_ids_are_probe_only_not_allocatable():
+    """guard-1094: a writing probe's ids must be ones no allocator can mint."""
+    import re
+    entry = canary.PENDING_DEPLOYS_PROBE_ENTRY
+    assert "probe-only" in entry["repo"] and "probe-only" in entry["goal_id"]
+    assert not re.fullmatch(r"g-\d+-\d+", entry["goal_id"])
+
+
+# ---- findings-gate row ( unit 4): rc carries nothing, the count line is the verdict
+
+FG_ROW = "findings-gate-signal-scan"
+_ROTTED_INSIGHT = "A calm sentence with nothing in it."
+
+
+def _inject_fg(monkeypatch, rc, out, err="", calls=None):
+    """Stub the probe. `calls` records argv, the dropped env, and the insight file's text
+    as the child would have read it (the file only exists during the call)."""
+    def _stub(argv, stdin_text=None, drop_env=()):
+        if calls is not None:
+            insight = Path(argv[argv.index("--insight-file") + 1]).read_text(encoding="utf-8")
+            calls.append((list(argv), tuple(drop_env), insight))
+        return rc, out, err
+    monkeypatch.setattr(canary, "_probe", _stub, raising=True)
+
+
+def _copy_gate(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate a (possibly mutated) copy of the real gate. PYTHONPATH carries the real
+    helpers to the child, since the copy's own dir holds nothing but the gate."""
+    src = (SCRIPTS / "findings-gate.py").read_text(encoding="utf-8")
+    (tmp_path / "findings-gate.py").write_text(mutate(src), encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    monkeypatch.setenv("PYTHONPATH", str(SCRIPTS))
+
+
+def test_fg_row_is_alive_against_the_real_gate():
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is False, detail
+    assert "findings_count=1" in detail, detail
+
+
+def test_fg_rotted_fixture_is_unevaluatable_not_dead(monkeypatch):
+    """Driven both ways against the real gate. An insight the table no longer matches
+    makes the gate honestly print findings_count=0. With the fixture check that is
+    UNEVALUATABLE. With the check stubbed out it reads DEAD, which is the false
+    accusation the check exists to prevent."""
+    dead, detail = canary._findings_gate_assertion(_ROTTED_INSIGHT)()
+    assert dead is None and "fixture is stale" in detail, detail
+    monkeypatch.setattr(canary, "_findings_fixture_check",
+                        lambda insight: (lambda script_name, args: None), raising=True)
+    dead, detail = canary._findings_gate_assertion(_ROTTED_INSIGHT)()
+    assert dead is True and "findings_count=0" in detail, detail
+
+
+def test_fg_literal_the_table_matches_but_the_scan_rejects_reads_dead():
+    """By design: the fixture check reads only the TABLE, because scan_signals' own
+    filters are part of what this row watches. So wording the table matches but the scan
+    rejects reads DEAD, never stale, which is the loud direction (guard-7231). Measured
+    against the real gate: this sentence reads findings_count=0 while the table still
+    matches it. Keep FINDINGS_GATE_PROBE_INSIGHT a plain, un-negated clause."""
+    wording = "A calm sentence that names no defect at all."
+    assert canary._findings_fixture_check(wording)("findings-gate.py", ()) is None
+    dead, detail = canary._findings_gate_assertion(wording)()
+    assert dead is True and "findings_count=0" in detail, detail
+
+
+def test_fg_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    """The positive control for the two crash tests below: the copy and its PYTHONPATH
+    work, so a DEAD there comes from the mutation and not from the relocation."""
+    _copy_gate(tmp_path, monkeypatch)
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+@pytest.mark.parametrize("breakage", [
+    ("syntax", lambda src: src + "\ndef broken(:\n"),
+    ("import", lambda src: src.replace("import sys\n", "import sys\nimport zzz_canary_missing\n", 1)),
+])
+def test_fg_crash_of_the_real_gate_is_dead_not_unevaluatable(tmp_path, monkeypatch, breakage):
+    """guard-7231: the pattern table lives IN the gate file, so a gate that cannot import
+    must not be excused as a stale fixture. Its callers read a missing count as a clean
+    close, so this is DEAD."""
+    _name, mutate = breakage
+    _copy_gate(tmp_path, monkeypatch, mutate)
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is True, detail
+    assert "CRASHED" in detail, detail
+
+
+def test_fg_scan_that_stops_reporting_is_dead(tmp_path, monkeypatch):
+    """The table still matches the literal and the process exits 0, but scan_signals
+    returns nothing. This is exactly the failure rc cannot show."""
+    head = "def scan_signals(insight_text, allowed_types=None):"
+    _copy_gate(tmp_path, monkeypatch, lambda src: src.replace(
+        head, head + "\n    return []\n\n\ndef _canary_unused_scan_signals(insight_text, allowed_types=None):", 1))
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is True, detail
+    assert "findings_count=0" in detail and "scan_signals" in detail, detail
+
+
+def test_fg_missing_count_line_is_dead_even_at_rc_zero(monkeypatch):
+    _inject_fg(monkeypatch, 0, "", "")
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is True and "no findings_count line" in detail, detail
+
+
+def test_fg_zero_count_is_dead(monkeypatch):
+    _inject_fg(monkeypatch, 0, "findings_count=0 created=0\n")
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is True and "findings_count=0" in detail, detail
+
+
+def test_fg_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is None and "absent at" in detail, detail
+
+
+def test_fg_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=()):
+        raise OSError("interpreter vanished")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_fg_probe_is_dry_run_strips_identity_and_sends_the_one_literal(monkeypatch):
+    """Side-effect free by construction: --dry-run files no goals, and with no agent
+    identity the gate resolves no agent dir, so it never regenerates a live compact file.
+    The insight the child reads is the SAME constant the fixture check vets."""
+    calls = []
+    _inject_fg(monkeypatch, 0, "findings_count=1 created=1\n", calls=calls)
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is False, detail
+    (argv, dropped, insight), = calls
+    assert "--dry-run" in argv
+    assert {"MIND_AGENT", "MIND_SID"} <= set(dropped), dropped
+    assert argv[argv.index("--goal") + 1].startswith("probe-only")
+    assert insight == canary.FINDINGS_GATE_PROBE_INSIGHT
+
+
+def test_fg_probe_removes_its_temp_dir(monkeypatch):
+    made = []
+    real_mkdtemp = canary.tempfile.mkdtemp
+
+    def _record(*a, **k):
+        made.append(real_mkdtemp(*a, **k))
+        return made[-1]
+    monkeypatch.setattr(canary.tempfile, "mkdtemp", _record, raising=True)
+    dead, detail = _row(FG_ROW)["assertion"]()
+    assert dead is False, detail
+    assert made and not Path(made[0]).exists()
+
+# ---- notification-routing-gate-suppress ( unit 5) -------------------
+
+NRG_ROW = "notification-routing-gate-suppress"
+_NRG_FLEET_LINE = 'FLEET_HANDLEABLE_CATEGORIES = frozenset({"info", "update", "completion", "blocker"})'
+_NRG_DECIDE_LINE = '    cat = (category or "").strip().lower()\n'
+
+
+def _inject_nrg(monkeypatch, rc, out, err="", calls=None):
+    def _stub(argv, stdin_text=None, drop_env=()):
+        if calls is not None:
+            calls.append(list(argv))
+        return rc, out, err
+    monkeypatch.setattr(canary, "_probe", _stub, raising=True)
+
+
+def _copy_nrg(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate a (possibly mutated) copy of the real gate, as _copy_gate does. Returns
+    whether the mutation changed anything, so no test can pass on a no-op mutation.
+
+    sys.path is restored after the test: the fixture check imports the copy, the copy
+    prepends its own dir, and a later `import notification_routing_gate` in this process
+    would otherwise load the mutated copy."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    src = (SCRIPTS / "notification_routing_gate.py").read_text(encoding="utf-8")
+    mutated = mutate(src)
+    (tmp_path / "notification_routing_gate.py").write_text(mutated, encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    monkeypatch.setenv("PYTHONPATH", str(SCRIPTS))
+    return mutated != src
+
+
+def _nrg_assertion(args, fixture_check=None):
+    return canary._gate_trigger_assertion(
+        "notification_routing_gate.py", args, "a fleet-handleable status report",
+        fixture_check=fixture_check, refusal_check=canary._routing_suppress_line,
+        crash_is_dead=True)
+
+
+def test_nrg_row_is_alive_against_the_real_gate():
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+@pytest.mark.parametrize("rotted", [
+    ("--category", "decision-needed", "--subject", "x", "--body", "y"),
+    ("--category", "zzz-unknown-category", "--subject", "x", "--body", "y"),
+])
+def test_nrg_rotted_fixture_is_unevaluatable_not_dead(rotted):
+    """Driven both ways against the real gate. A category the tables now send makes the
+    gate honestly SEND. With the fixture check that is UNEVALUATABLE. Without the check it
+    reads DEAD, which is the false accusation the check exists to prevent."""
+    dead, detail = _nrg_assertion(rotted, canary._routing_fixture_check)()
+    assert dead is None and "fixture is stale" in detail, detail
+    dead, detail = _nrg_assertion(rotted)()
+    assert dead is True and "rc=0" in detail, detail
+
+
+def test_nrg_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    """The positive control for the mutation tests below: the relocation itself works, so
+    a DEAD there comes from the mutation."""
+    assert _copy_nrg(tmp_path, monkeypatch) is False
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+@pytest.mark.parametrize("breakage", [
+    ("syntax", lambda src: src + "\ndef broken(:\n"),
+    ("import", lambda src: src.replace("import re\n", "import re\nimport zzz_canary_missing\n", 1)),
+])
+def test_nrg_crash_of_the_real_gate_is_dead_not_unevaluatable(tmp_path, monkeypatch, breakage):
+    """guard-7231, measured (bravo/cc-05 2026-09-23): the shell wrapper passes a crash's
+    rc=1 through as SUPPRESS, so an import-time crash turned a decision-needed
+    notification into a skipped send. A crash therefore drops every shell-lane
+    notification in silence, and the row must not file it as unevaluatable."""
+    _name, mutate = breakage
+    assert _copy_nrg(tmp_path, monkeypatch, mutate) is True
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is True, detail
+    assert "CRASHED" in detail, detail
+
+
+def test_nrg_gate_that_stops_suppressing_is_dead(tmp_path, monkeypatch):
+    """An EMPTY fleet-handleable set suppresses nothing, which floods the owner's inbox.
+    The fixture check must let that through to DEAD, not call it a stale fixture."""
+    assert _copy_nrg(tmp_path, monkeypatch, lambda src: src.replace(
+        _NRG_FLEET_LINE, "FLEET_HANDLEABLE_CATEGORIES = frozenset()", 1)) is True
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is True and "SEND" in detail, detail
+
+
+def test_nrg_decide_that_raises_is_dead(tmp_path, monkeypatch):
+    """decide_and_log SENDs when decide() raises, so rc=0 and the reason names the raise."""
+    assert _copy_nrg(tmp_path, monkeypatch, lambda src: src.replace(
+        _NRG_DECIDE_LINE,
+        '    raise RuntimeError("canary mutation")\n' + _NRG_DECIDE_LINE, 1)) is True
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is True and "routing gate raised" in detail, detail
+
+
+def test_nrg_rc_one_with_empty_stdout_is_dead(monkeypatch):
+    _inject_nrg(monkeypatch, 1, "", "Traceback (most recent call last):\nImportError: x\n")
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is True and "CRASHED" in detail, detail
+
+
+def test_nrg_rc_one_without_a_suppress_line_is_dead(monkeypatch):
+    _inject_nrg(monkeypatch, 1, "warning: printed before dying\n", "Traceback ...\n")
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is True and "no 'SUPPRESS:' verdict line" in detail, detail
+
+
+def test_nrg_rc_one_with_the_suppress_line_is_alive(monkeypatch):
+    _inject_nrg(monkeypatch, 1, "SUPPRESS: category 'info' is a status report\n  route to: x\n")
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+def test_nrg_rc_zero_is_dead(monkeypatch):
+    _inject_nrg(monkeypatch, 0, "SEND: unknown category\n")
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is True and "rc=0" in detail, detail
+
+
+def test_nrg_unexpected_rc_is_unevaluatable(monkeypatch):
+    _inject_nrg(monkeypatch, 2, "", "usage: error\n")
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is None, detail
+
+
+def test_nrg_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is None and "absent" in detail, detail
+
+
+def test_nrg_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=()):
+        raise OSError("cannot spawn")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(NRG_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_nrg_probe_sends_the_fixture_and_no_side_effect_flag(monkeypatch):
+    """--breadcrumb would post to the live findings board, and --quiet would remove the
+    SUPPRESS line this row reads. The probe must pass neither."""
+    calls = []
+    _inject_nrg(monkeypatch, 1, "SUPPRESS: x\n", calls=calls)
+    _row(NRG_ROW)["assertion"]()
+    assert len(calls) == 1
+    argv = calls[0]
+    assert "--breadcrumb" not in argv and "--quiet" not in argv
+    n = len(canary.ROUTING_GATE_PROBE_ARGS)
+    assert tuple(argv[-n:]) == canary.ROUTING_GATE_PROBE_ARGS
+
+
+# ---- domain-suite-gate-collect-refusal ( unit 6) --------------------
+
+DSG_ROW = "domain-suite-gate-collect-refusal"
+_DSG_EVALUATE_LINE = "    scripts_dir = _scripts_dir(world_dir)\n"
+_DSG_PASS_LINE = "    if rc in (0, 5):\n"
+
+
+def _dsg_out(decision, reason, fixture=True):
+    """One gate verdict line. fixture=False names a file the probe's fixture does not have."""
+    name = canary.DOMAIN_SUITE_FIXTURE_TEST if fixture else "test_live_world.py"
+    return json.dumps({"gate": "domain-suite-gate", "decision": decision,
+                       "goal_id": "probe-only-signal-liveness-canary", "reason": reason,
+                       "touched": [[f"tests/{name}", "2026-09-23T20:00:00"]]}) + "\n"
+
+
+def _inject_dsg(monkeypatch, rc, out, err="", calls=None):
+    def _stub(argv, stdin_text=None, drop_env=(), extra_env=None):
+        if calls is not None:
+            calls.append((list(argv), dict(extra_env or {})))
+        return rc, out, err
+    monkeypatch.setattr(canary, "_probe", _stub, raising=True)
+
+
+def _copy_dsg(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate a (possibly mutated) copy of the real gate, as _copy_nrg does, and return
+    whether the mutation changed anything. sys.path is restored for the same reason."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    src = (SCRIPTS / "domain-suite-gate.py").read_text(encoding="utf-8")
+    mutated = mutate(src)
+    (tmp_path / "domain-suite-gate.py").write_text(mutated, encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    monkeypatch.setenv("PYTHONPATH", str(SCRIPTS))
+    return mutated != src
+
+
+def test_dsg_row_is_alive_against_the_real_gate_and_leaves_nothing_behind(monkeypatch):
+    """The positive control, measured through a spy on the real _probe: the gate's
+    retained log went into the probe's own dir, and that dir is gone afterwards."""
+    real, seen = canary._probe, []
+
+    def _spy(argv, stdin_text=None, drop_env=(), extra_env=None):
+        rc, out, err = real(argv, stdin_text, drop_env, extra_env)
+        seen.append((dict(extra_env or {}), out))
+        return rc, out, err
+    monkeypatch.setattr(canary, "_probe", _spy, raising=True)
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is False and "could not COLLECT" in detail, detail
+    (env, out), = seen
+    log = canary._domain_suite_verdict(out).get("log")
+    assert log and Path(log).parent == Path(env["DOMAIN_SUITE_LOG_DIR"]), log
+    assert not Path(env["MIND_WORLD"]).parent.exists()
+
+
+def test_dsg_rotted_fixture_is_unevaluatable_not_dead(monkeypatch):
+    """Driven both ways against the real gate. If the 'missing' module exists, the fixture
+    suite collects and the gate honestly passes. With the fixture check that is
+    UNEVALUATABLE. Without it the row reads DEAD, the false accusation the check prevents."""
+    monkeypatch.setattr(canary, "DOMAIN_SUITE_UNCOLLECTABLE_MODULE", "json", raising=True)
+    dead, detail = canary._domain_suite_gate_assertion()()
+    assert dead is None and "fixture is stale" in detail, detail
+    dead, detail = canary._domain_suite_gate_assertion(check_fixture=False)()
+    assert dead is True and "passed a close" in detail, detail
+
+
+def test_dsg_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    """The positive control for the mutation tests below."""
+    assert _copy_dsg(tmp_path, monkeypatch) is False
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+def test_dsg_crash_of_the_real_gate_is_unevaluatable_not_dead(tmp_path, monkeypatch):
+    """A gate that cannot start exits rc=1 with no verdict line, and do_verify reads rc=1
+    as REFUSED: every close fails closed with a traceback, which is loud, not silent."""
+    assert _copy_dsg(tmp_path, monkeypatch, lambda src: src + "\ndef broken(:\n") is True
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is None and "no verdict line" in detail, detail
+
+
+def test_dsg_evaluate_that_raises_is_dead(tmp_path, monkeypatch):
+    """main() catches it and fails open, so every close passes with the suite unverified."""
+    assert _copy_dsg(tmp_path, monkeypatch, lambda src: src.replace(
+        _DSG_EVALUATE_LINE,
+        '    raise RuntimeError("canary mutation")\n' + _DSG_EVALUATE_LINE, 1)) is True
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is True and "canary mutation" in detail, detail
+
+
+def test_dsg_gate_that_passes_a_collection_error_is_dead(tmp_path, monkeypatch):
+    assert _copy_dsg(tmp_path, monkeypatch, lambda src: src.replace(
+        _DSG_PASS_LINE, "    if rc in (0, 2, 5):\n", 1)) is True
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is True and "passed a close" in detail, detail
+
+
+@pytest.mark.parametrize("rc, out, verdict, needle", [
+    (1, _dsg_out("block", "domain suite could not COLLECT (rc=2: x)"), False, "COLLECT"),
+    (0, _dsg_out("block", "domain suite could not COLLECT (rc=2: x)"), True, "exited rc=0"),
+    (0, _dsg_out("pass", "domain suite green"), True, "passed a close"),
+    (0, _dsg_out("noop", "no domain test suite under world scripts"), True, "noop"),
+    (0, _dsg_out("error", "gate error, fail-open: KeyError: x"), True, "failed open"),
+    (0, _dsg_out("error", "domain suite exceeded 20s — not a verdict"), None, "fault branch"),
+    (1, _dsg_out("block", "1 credential-shaped file(s) ... CHANGED CONTENT"), None, "tripwire"),
+    (1, _dsg_out("block", "domain suite could not COLLECT", fixture=False), None, "other world"),
+    (0, _dsg_out("pass", "domain suite green", fixture=False), None, "other world"),
+    (1, "", None, "no verdict line"),
+    (0, _dsg_out("zzz", "x"), None, "unrecognised"),
+])
+def test_dsg_verdict_table(monkeypatch, rc, out, verdict, needle):
+    _inject_dsg(monkeypatch, rc, out, "Traceback ...\n")
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is verdict and needle in detail, detail
+
+
+def test_dsg_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is None and "absent" in detail, detail
+
+
+def test_dsg_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=(), extra_env=None):
+        raise OSError("cannot spawn")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(DSG_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_dsg_probe_points_the_gate_at_its_own_throwaway_world(monkeypatch):
+    """No --override (that would write the override ledger), the fixture args last, and
+    both seams inside one temp root that is removed after the call."""
+    calls = []
+    _inject_dsg(monkeypatch, 1, _dsg_out("block", "domain suite could not COLLECT"), calls=calls)
+    _row(DSG_ROW)["assertion"]()
+    (argv, env), = calls
+    assert "--override" not in argv
+    n = len(canary.DOMAIN_SUITE_PROBE_ARGS)
+    assert tuple(argv[-n:]) == canary.DOMAIN_SUITE_PROBE_ARGS
+    world, logs = Path(env["MIND_WORLD"]), Path(env["DOMAIN_SUITE_LOG_DIR"])
+    assert world.name == "world" and logs.parent == world.parent
+    assert env["STORAGE_BACKEND"] == "local"
+    assert not world.parent.exists()
+
+
+def test_probe_extra_env_reaches_the_child_but_cannot_unset_the_liveness_marker():
+    rc, out, _err = canary._probe(
+        [sys.executable, "-c",
+         f"import os; print(os.environ.get('ZZZ_CANARY_X'), os.environ.get('{canary.LIVENESS_PROBE_ENV}'))"],
+        extra_env={"ZZZ_CANARY_X": "1", canary.LIVENESS_PROBE_ENV: "overridden"})
+    assert rc == 0 and out.split() == ["1", "signal-liveness-canary"], out
+
 
 # ---- the two inventory members deliberately NOT registered -------------------
 

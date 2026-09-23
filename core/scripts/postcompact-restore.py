@@ -7,6 +7,9 @@ to stdout. Claude Code injects this stdout into the agent's fresh context.
 
 Full-fidelity restore: includes all WM slots, loop state, execution diary,
 and reasoning snapshot. No aggressive truncation — fresh context has full budget.
+
+That banner is the reducer's. A worker Body gets its own shorter one: its
+binding, the goal it holds, and the worker-loop re-entry (g-375-04).
 """
 import json
 import sys
@@ -18,18 +21,18 @@ if hasattr(sys.stderr, "reconfigure"):
 
 import yaml
 
-from _paths import AGENT_DIR, WORLD_DIR, assert_agent_dir, body_state_path
+from _paths import AGENT_DIR, WORLD_DIR, agent_state_dir, assert_agent_dir, body_state_path
 
 # : fail loud at import time if MIND_AGENT unset; replaces the
 # opaque `None / "session"` TypeError class the next line would otherwise raise.
 assert_agent_dir("postcompact-restore")
 
-# Body-keyed for symmetry with the writers (). This is a NO-OP today:
-# postcompact-restore.sh carries a runner-identity guard (SID must equal
-# running-session-id), so this process only ever runs as the reducer, which is
-# never bodied and always takes the agent-wide fallback. Routed through the same
-# resolver anyway so the reader cannot silently diverge from the writers if that
-# guard is ever relaxed.
+# Body-keyed through the same resolver as the writers (). Live since
+# : postcompact-restore.sh admits a worker Body as well as the runner,
+# so a worker resolves its own sessions/<SID>/ files here (and gets the worker
+# banner, see BODY_DIR below) while the runner takes the agent-wide fallback.
+# This comment called the routing a no-op until 2026-09-23, from before
+#  relaxed the runner-only guard it described.
 CHECKPOINT_PATH = body_state_path(AGENT_DIR.name, "compact-checkpoint.yaml")
 DIARY_PATH = AGENT_DIR / "session" / "execution-diary.jsonl"
 SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
@@ -40,6 +43,14 @@ SNAPSHOT_PATH = AGENT_DIR / "session" / "reasoning-snapshot.yaml"
 # reconstructing a different one from the compact summary (bug traced
 # 2026-04-22 alpha session-56).
 ITERATION_CKPT_PATH = body_state_path(AGENT_DIR.name, "iteration-checkpoint.json")
+
+# This session's per-Body dir when it is a worker Body, else None ().
+# Read off body_state_path()'s own answer rather than re-deriving its predicate:
+# it routes to sessions/<SID>/ exactly when this session forked a per-Body
+# working-memory.yaml, the rail postcompact-restore.sh admitted it on. Only a
+# worker forks one; the reducer and observers never do.
+_STATE_DIR = body_state_path(AGENT_DIR.name, "binding.yaml").parent
+BODY_DIR = None if _STATE_DIR == agent_state_dir(AGENT_DIR.name) else _STATE_DIR
 
 # Slots to skip in the "additional slots" section (already shown in dedicated sections)
 #  / zeta allowlist audit 8d: DEDICATED_SECTION_SLOTS + SCALAR_SLOTS_FULL
@@ -240,8 +251,14 @@ def _goal_live_status(goal_id, source):
     return result
 
 
-def _format_iteration_ckpt_block(iter_ckpt):
-    """Format the in-flight goal block for the restore output."""
+def _format_iteration_ckpt_block(iter_ckpt, reselect="/aspirations precheck + select"):
+    """Format the in-flight goal block for the restore output.
+
+    `reselect` names what picks fresh work when the anchor is stale. It is the
+    reducer's loop by default; a worker Body's is worker-loop's SELECT
+    (g-375-04), and sending a worker to /aspirations is the reducer-only
+    re-entry guard-517/guard-463 forbid.
+    """
     goal_id = iter_ckpt.get("goal_id", "?")
     phase = iter_ckpt.get("phase", "?")
     selected_at = iter_ckpt.get("selected_at", "?")
@@ -319,7 +336,7 @@ def _format_iteration_ckpt_block(iter_ckpt):
             "(guard-2666), and loop-state-save performs no status validation at "
             "write time.",
             "ACTION: ignore the goal named above, and re-run "
-            "/aspirations precheck + select to pick fresh work. Do NOT execute "
+            f"{reselect} to pick fresh work. Do NOT execute "
             f"{goal_id} and do NOT write an outcome_note onto that record.",
         ])
     elif stale_reason:
@@ -336,7 +353,7 @@ def _format_iteration_ckpt_block(iter_ckpt):
             "`loop-state-save.sh clear --if-goal`, so an anchor still standing "
             "here came from a path that does not route through release — the "
             "skip path is the known one.",
-            "ACTION: re-run /aspirations precheck + select to pick fresh work. "
+            f"ACTION: re-run {reselect} to pick fresh work. "
             f"Do NOT resume {goal_id} from this anchor. If the selector offers "
             "it again on its own merits, that is a normal selection and fine — "
             "what is not fine is treating this anchor as evidence it was "
@@ -349,7 +366,7 @@ def _format_iteration_ckpt_block(iter_ckpt):
             "Resume execution on THIS goal. Do NOT re-run goal-selector.sh to",
             "pick a different one. Do NOT substitute a different goal based on",
             "narrative context from the compact summary. If this checkpoint",
-            "looks wrong, /aspirations precheck + select will surface the mismatch.",
+            f"looks wrong, {reselect} will surface the mismatch.",
         ])
         if not live["checked"]:
             # Say that the check did not run rather than letting the imperative
@@ -384,11 +401,87 @@ def _format_iteration_ckpt_block(iter_ckpt):
     return out
 
 
+#: What picks fresh work for a worker Body when its anchor is stale ().
+WORKER_RESELECT = "worker-loop's Phase 1 SELECT"
+
+
+def _worker_banner(iter_ckpt):
+    """The post-compaction banner for a worker Body (). Returns its lines.
+
+    The banner in main() is the reducer's, line for line: its deadman sentinel,
+    which a worker must never arm (worker-loop arms its own net through
+    deadman-directive.sh --role worker); the Phase -0.5c/-0.5d steps and the
+    /aspirations re-entry of the reducer's loop; and the agent-wide execution
+    diary and reasoning snapshot, which belong to the reducer or to another
+    session on the box. Measured 2026-09-23 on zc-01: seven compactions of a
+    worker Body got that banner, its first call after six of them was the
+    sentinel re-arm, and after a stale-anchor one it called Skill(aspirations).
+
+    What a compaction removes is the context that said who the Body is and
+    what it holds, so that is what this gives back. Its working memory is on
+    disk and survives, and worker-loop re-reads what it needs. The binding
+    comes from this session's own files, never the summary. The same Body
+    drifted onto other agents twice that morning, each time some minutes after
+    a compaction: it light-primed on bravo's self.md, and wrote its closure
+    evidence under charlie's session dir. That link is inferred, not verified;
+    the binding is a cheap guard either way. The banner does not lean on
+    compact-checkpoint.yaml, which precompact-checkpoint.sh fails to refresh
+    when it overruns its hook timeout (g-375-03).
+    """
+    agent = AGENT_DIR.name  # the hook resolved it from this SID's binding.yaml
+    sid = BODY_DIR.name  # a per-session dir is named by its SID
+    try:
+        manifest = yaml.safe_load(
+            (BODY_DIR / "body-manifest.yaml").read_text(encoding="utf-8")) or {}
+    except Exception as e:
+        log(f"body-manifest.yaml read failed: {e}")
+        manifest = {}
+    state = ", ".join(f"{key} {manifest[key]}"
+                      for key in ("body_state", "env_id", "reducer_sid")
+                      if manifest.get(key))
+    role = str(manifest.get("role") or "?") + (f" ({state})" if state else "")
+    lines = [
+        "=== CONTEXT RESTORED (post-compaction, worker Body) ===",
+        "",
+        "BINDING: who you are, read from this session's own binding and body",
+        "manifest, not from the summary above. If the summary says otherwise,",
+        "this is right.",
+        f"  agent:          {agent}",
+        f"  session:        {sid}",
+        f"  role:           {role}",
+        f"  session dir:    {BODY_DIR.as_posix()}/",
+        f"  working memory: {(BODY_DIR / 'working-memory.yaml').as_posix()}",
+        f"  your Self:      {(AGENT_DIR / 'self.md').as_posix()}",
+        f"You are agent '{agent}'. Your own Self, working memory, scratch and",
+        f"evidence are under {AGENT_DIR.as_posix()}/. Never take another agent's",
+        "self.md as yours, and never put your notes or evidence in another agent's",
+        "directory.",
+        "",
+    ]
+    if iter_ckpt is not None:
+        lines.extend(_format_iteration_ckpt_block(iter_ckpt, reselect=WORKER_RESELECT))
+    lines.extend([
+        "ACTION: continue the worker loop. If worker-loop's instructions are no",
+        "longer in your context, load them with Skill(worker-loop). Never",
+        "Skill(aspirations): that is the reducer's loop (guard-517/guard-463). Do",
+        "not re-arm the reducer's deadman net either; a worker's net is armed by",
+        "worker-loop's own terminal pair.",
+        "===========================================",
+    ])
+    return lines
+
+
 def main():
     # Read iteration-checkpoint FIRST — surface in-flight goal anchor even
     # when compact-checkpoint.yaml is missing (PreCompact hook failed, or
     # first-iteration session). Separate code path from the full restore.
     iter_ckpt = _read_iteration_checkpoint()
+
+    if BODY_DIR is not None:
+        # Ahead of the checkpoint test: a worker's banner does not need one.
+        log(f"worker Body restore for session {BODY_DIR.name}")
+        print("\n".join(_worker_banner(iter_ckpt)))
+        return
 
     if not CHECKPOINT_PATH.exists():
         log("no compact-checkpoint.yaml -- degraded restore")

@@ -21,7 +21,15 @@ reconfigure_stdio()
 import yaml
 
 from _paths import AGENT_DIR, assert_agent_dir, body_state_path
-from wm import read_wm, WM_PATH  # noqa: E402
+from wm import read_wm, read_yaml, WM_PATH  # noqa: E402
+
+# libyaml's C dumper when this PyYAML ships it (). The checkpoint holds a
+# full working-memory copy, and measured on zc-01 2026-09-23 (12.5 MB) the
+# pure-Python dump took ~4.5 s of a hook whose PreCompact budget is 10 s; with
+# the two pure-Python reads the hook ran 12.9-13.5 s and was killed every time.
+# Every value here came from a safe load or is a plain scalar, so the safe
+# dumper represents all of it.
+_SAFE_DUMPER = getattr(yaml, "CSafeDumper", yaml.SafeDumper)
 
 
 def _box_identity():
@@ -89,10 +97,9 @@ def main():
     wm = read_wm()
     slots = wm.get("slots") or {}
 
-    # Read existing checkpoint if precompact fired multiple times this session
-    existing = {}
-    if CHECKPOINT_PATH.exists():
-        existing = yaml.safe_load(CHECKPOINT_PATH.read_text(encoding="utf-8")) or {}
+    # Read existing checkpoint if precompact fired multiple times this session.
+    # wm.read_yaml: {} when absent, libyaml when available ().
+    existing = read_yaml(CHECKPOINT_PATH)
 
     compact_count = existing.get("compact_count", 0) + 1
 
@@ -151,7 +158,8 @@ def main():
     # Atomic write (tmp + rename)
     tmp = CHECKPOINT_PATH.with_suffix(".tmp")
     tmp.write_text(
-        yaml.dump(checkpoint, default_flow_style=False, allow_unicode=True, sort_keys=False),
+        yaml.dump(checkpoint, Dumper=_SAFE_DUMPER, default_flow_style=False,
+                  allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
     os.replace(str(tmp), str(CHECKPOINT_PATH))

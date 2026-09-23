@@ -463,15 +463,21 @@ Bash: MIND_AGENT=<agent> bash -c '
 # (heredoc + stop-verified block) silently disappears, regressing the very
 # user-visible-summary fix this verification block was added for. Mirror of
 # the pattern used in recovery-gate.sh's three state-get probes.
-Bash: MIND_AGENT=<agent> bash core/scripts/session-mode-set.sh "{target_mode}" && rm -f agents/<agent>/session/stop-target-mode && _STATE=$(MIND_AGENT=<agent> bash core/scripts/session-state-get.sh 2>/dev/null || echo "?") && _MODE=$(MIND_AGENT=<agent> bash core/scripts/session-mode-get.sh 2>/dev/null || echo "?") && _RESID=$(ls agents/<agent>/session/running-session-id agents/<agent>/session/aspirations-compact.json agents/<agent>/session/iteration-checkpoint.json agents/<agent>/session/loop-active 2>/dev/null | wc -l | tr -d ' ') && if [ "{target_mode}" = "assistant" ]; then cat <<'EOF'
-Agent stopped. Session consolidated — encoding, journal, and handoff saved.
+#
+# D7.0 (g-373-128): stop-handoff-check.sh leads the chain, BEFORE the mode flip.
+# It refuses (rc 1, prints digest Step 9 verbatim) unless THIS stop wrote
+# handoff.yaml; only its pass line claims a handoff, never the text below.
+# On a refusal: write the handoff, re-run D7 unchanged, do NOT run D7.1.
+# Escape hatch (logged): --proceed-without-handoff "<why>". WHY: the .py docstring.
+Bash: MIND_AGENT=<agent> bash core/scripts/stop-handoff-check.sh && MIND_AGENT=<agent> bash core/scripts/session-mode-set.sh "{target_mode}" && rm -f agents/<agent>/session/stop-target-mode && _STATE=$(MIND_AGENT=<agent> bash core/scripts/session-state-get.sh 2>/dev/null || echo "?") && _MODE=$(MIND_AGENT=<agent> bash core/scripts/session-mode-get.sh 2>/dev/null || echo "?") && _RESID=$(ls agents/<agent>/session/running-session-id agents/<agent>/session/aspirations-compact.json agents/<agent>/session/iteration-checkpoint.json agents/<agent>/session/loop-active 2>/dev/null | wc -l | tr -d ' ') && if [ "{target_mode}" = "assistant" ]; then cat <<'EOF'
+Agent stopped. Session consolidated — encoding and journal saved.
 Mode set to assistant (reconciliation-ready). You can mark goals complete, edit tree
 nodes, or add guardrails without a mode-switch ceremony. Full access to accumulated
 knowledge — ask me anything.
 Type `/start <agent-name>` to resume autonomous mode; `/stop <agent-name> --reader` for walk-away safety next time.
 EOF
 else cat <<'EOF'
-Agent stopped. Session consolidated — encoding, journal, and handoff saved.
+Agent stopped. Session consolidated — encoding and journal saved.
 Mode set to reader (read-only). Chat and query knowledge freely — no writes allowed.
 Type `/start --mode assistant` for user-directed edits, or `/start` to resume autonomous.
 EOF

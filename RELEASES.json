@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.81",
+    "previous_version": "2.12.80",
+    "date": "2026-09-23",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "g-369-417: mind_api's unreferenced-daemon start guard is scoped to its own project root (by /proc/<pid>/cwd), so per-character mind-api@ units start beside the env daemon on sidecar vessels (ce8e633131)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.80",
     "previous_version": "2.12.79",
     "date": "2026-09-23",
