@@ -34,6 +34,7 @@ import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -149,39 +150,96 @@ def _normalize_phase(phase: str, schema: dict | None = None) -> str:
 
 
 def _normalize_condition(condition: str) -> str:
-    """Strip a trailing parenthetical from a claimed condition.
+    """Strip a trailing explanation from a claimed condition.
 
     The journal line is `OBLIGATION ABBREVIATED: <phase> — <condition>`, and an agent
-    that also records WHAT it did inline writes the canonical token followed by a
-    parenthetical: `context_budget.zone == tight (tree node updated; findings routed)`.
-    `condition not in allowed` is exact membership, so the more informative claim was
-    scored invalid while a bare token passed. Only a trailing parenthetical is removed —
-    the canonical tokens carry no parentheses of their own — so a claim naming a
-    genuinely different condition still fails.
+    that also records WHAT it did inline writes the canonical token followed by the
+    explanation. That explanation arrives in TWO punctuations, not one: parenthesised
+    (`context_budget.zone == tight (tree node updated; findings routed)`) or as a
+    FOLLOWING SENTENCE (`context_budget.zone == tight. Steps 8, 8.5 and 8.55 ran in
+    full.`). `condition not in allowed` is exact membership, so the more informative
+    claim scored invalid while a bare token passed.
+
+    Until 2026-09-21 only the parenthesised form was stripped, and the SENTENCE form
+    was the live shape. Measured that day over the whole fleet corpus (14 records,
+    5 agents, read out of the remote store because this log is push-only telemetry):
+    of 13 false verdicts, 2 were caused by nothing but this punctuation — `state` and
+    `learn` claims at zone tight whose own `claim_banner_zone` corroborated the
+    condition was TRUE. Widening admitted exactly those 2 and nothing else (guard-1828:
+    sweep a matcher over the real corpus before claiming it is narrow).
+
+    Cutting at ". " (period + SPACE) is safe: no canonical token contains that pair —
+    `context_budget.zone` has a period with no space after it — so a claim naming a
+    genuinely different condition still fails. Keep this body identical to its twin in
+    `abbreviated-obligation-audit.py`; `test_obligation_audit_phase_vocabulary.py` pins
+    the two together (tree node `two-parsers-one-invariant`).
     """
     cond = (condition or "").strip()
-    head, sep, _rest = cond.partition(" (")
-    return head.strip() if sep else cond
+    cut = len(cond)
+    for sep in (" (", ". "):
+        i = cond.find(sep)
+        if i != -1:
+            cut = min(cut, i)
+    return cond[:cut].strip()
 
 
-def _validate(phase: str, condition: str, budget_zone: str, outcome_class: str | None, schema: dict) -> bool:
+def _validate_claim(phase: str, condition: str, budget_zone: str,
+                    outcome_class: str | None, schema: dict) -> tuple[bool, str | None]:
+    """Returns (valid, failure_reason) — reason vocabulary shared with the twin.
+
+    WHY A REASON AND NOT JUST A BOOLEAN (g-115-10407, measured 2026-09-21). A bare
+    `False` collapses three different things into one word, and the goal this module
+    FILES then reports all three as "conditions were not true at iteration time".
+    Measured over the whole fleet corpus that day (14 records, 5 agents): 5 of the 13
+    false verdicts were `unknown obligation phase` — the agent named a phase this
+    schema does not govern at all, so no condition was ever evaluated — and 2 more were
+    TRUE conditions rejected on punctuation. NOT ONE was an obligation abbreviated
+    while its condition was false. A reader who takes the filed goal's wording at face
+    value investigates a defect that is not there; the reason is what makes the count
+    decomposable. `abbreviated-obligation-audit.py::_validate_claim` already returned
+    one — this module, the one that files the goal, did not.
+    """
     obligations = (schema or {}).get("obligations") or {}
     phase = _normalize_phase(phase, schema)
     condition = _normalize_condition(condition)
     spec = obligations.get(phase)
     if not spec:
-        return False
+        return False, "unknown obligation phase"
     allowed = spec.get("abbreviated_allowed_when") or []
     if condition not in allowed:
-        return False
+        return False, "schema disallows this condition"
     # Verify the two conditions we know how to validate against runtime state.
     if condition == "outcome_class == routine":
-        return outcome_class == "routine"
+        if outcome_class == "routine":
+            return True, None
+        return False, f"claim says routine but checkpoint says {outcome_class}"
     if condition == "context_budget.zone == tight":
-        return budget_zone == "tight"
+        # SOURCE-NEUTRAL WORDING IS LOAD-BEARING, not a style choice (fresh-eyes
+        # 2026-09-21, zeta/cc-02). This module tallies `failure_reason` into ONE
+        # Counter and renders it as the `BY REASON:` breakdown of the goal it
+        # files, so the reason is a CATEGORY KEY. The twin reads its zone from the
+        # claim banner and this one from the runtime budget; wording the key by
+        # source ("banner says…" vs "runtime zone=…") split one category in two
+        # and would fragment any cross-auditor tally. Provenance belongs in the
+        # record's own `claim_banner_zone` / zone fields, never in the key.
+        if budget_zone is None:
+            # Absent zone is NOT a mismatch. Without this the f-string below
+            # rendered the Python literal `None` into a filed goal's description
+            # and blamed a zone disagreement for what is a missing citation.
+            return False, "zone citation absent"
+        if budget_zone != "tight":
+            return False, f"observed zone={budget_zone} but claim says tight"
+        return True, None
     # Schema allows it but we have no runtime check for it — mark invalid so it
     # surfaces rather than rubber-stamping unknown conditions.
-    return False
+    return False, "schema allows it but no verifier"
+
+
+def _validate(phase: str, condition: str, budget_zone: str, outcome_class: str | None, schema: dict) -> bool:
+    """Boolean face of :func:`_validate_claim` — kept so existing callers and the
+    cross-auditor parity test keep a single comparable verdict."""
+    valid, _reason = _validate_claim(phase, condition, budget_zone, outcome_class, schema)
+    return valid
 
 
 def _append_jsonl(path: Path, record: dict) -> None:
@@ -217,7 +275,9 @@ def _existing_investigate_goal() -> bool:
         return False
 
 
-def _file_investigate_goal(session_false_claims: int, audit_log_path: Path) -> None:
+def _file_investigate_goal(session_false_claims: int, audit_log_path: Path,
+                           reasons: "Counter[str] | None" = None,
+                           phases: "Counter[str] | None" = None) -> None:
     # Find a target aspiration (first active framework-maintenance, else first active).
     try:
         # : read the compact from the AGENT-SESSION path, not $WORLD_DIR.
@@ -262,13 +322,37 @@ def _file_investigate_goal(session_false_claims: int, audit_log_path: Path) -> N
             _warn("no target aspiration found — investigate goal not filed")
             return
 
+        reason_line = ", ".join(
+            f"{n} {r}" for r, n in sorted((reasons or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+        ) or "not recorded (log predates failure_reason)"
+        phase_line = ", ".join(
+            f"{p or '(blank)'} x{n}" for p, n in sorted((phases or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+        ) or "not recorded"
         goal = {
             "title": "Investigate: false-abbreviation-claims",
             "description": (
-                f"Phase 9.5d logged {session_false_claims} abbreviation claim(s) "
-                f"whose conditions were not true at iteration time. Investigate: "
-                f"which obligations are being abbreviated incorrectly, and why "
-                f"the claimed condition didn't hold. Consult {audit_log_path} for per-claim detail."
+                f"Phase 9.5d scored {session_false_claims} abbreviation claim(s) INVALID "
+                f"this session. READ THE BREAKDOWN BEFORE ASSUMING AN OBLIGATION WAS "
+                f"ABBREVIATED IMPROPERLY — 'invalid' covers three different things and "
+                f"only one of them is that (g-115-10407, measured 2026-09-21 over the "
+                f"whole fleet corpus: of 13 false verdicts, 5 were phases the schema does "
+                f"not govern at all, 2 were TRUE conditions rejected on punctuation, and "
+                f"ZERO were an obligation abbreviated while its condition was false).\n\n"
+                f"BY REASON: {reason_line}.\n"
+                f"BY PHASE (schema-normalized): {phase_line}.\n\n"
+                f"'unknown obligation phase' means the agent named a phase outside "
+                f"obligation-schema.yaml's `obligations:` keys, so no condition was ever "
+                f"evaluated — the fix is vocabulary (either the claim or the schema), not "
+                f"discipline. 'schema disallows this condition' means the phase is governed "
+                f"but the condition text did not match an `abbreviated_allowed_when` token. "
+                f"Only a reason naming the runtime state ('runtime zone=...', 'claim says "
+                f"routine but checkpoint says ...') is an obligation abbreviated on a "
+                f"condition that did not hold.\n\n"
+                f"Per-claim detail: {audit_log_path}. That log is push-only telemetry "
+                f"(session-manifest sync_tier: ephemeral, never pulled, recovery_action "
+                f"clear), so on any box but the filer's it does not exist locally and a "
+                f"missing file is NOT evidence of a missing record — read it out of the "
+                f"store with `backend-cat.sh cat` against that same relative path."
             ),
             "priority": "HIGH",
             "participants": ["agent"],
@@ -329,6 +413,12 @@ def main(argv: list[str] | None = None) -> int:
     # double-file the investigate goal. One audit log lives for the whole
     # session; this audit is scoped to the current iteration only.
     session_false_claims = 0
+    # Tally WHY, not just how many — the breakdown is what the filed goal carries
+    # so a reader on another box can act without the log (). Records
+    # written before failure_reason existed tally as "unrecorded" rather than
+    # silently as zero.
+    false_reasons: Counter[str] = Counter()
+    false_phases: Counter[str] = Counter()
     if audit_log.exists():
         try:
             for ln in audit_log.read_text(encoding="utf-8").splitlines():
@@ -338,12 +428,17 @@ def main(argv: list[str] | None = None) -> int:
                 rec = json.loads(ln)
                 if rec.get("valid") is False:
                     session_false_claims += 1
+                    false_reasons[rec.get("failure_reason") or "unrecorded"] += 1
+                    false_phases[_normalize_phase(rec.get("phase") or "", schema)] += 1
         except Exception as e:
             _warn(f"audit log re-read failed: {e}")
 
     new_false_this_iter = 0
     for phase, cond in claims:
-        valid = _validate(phase, cond, budget_zone, outcome_class, schema)
+        valid, failure_reason = _validate_claim(phase, cond, budget_zone, outcome_class, schema)
+        if not valid:
+            false_reasons[failure_reason or "unrecorded"] += 1
+            false_phases[_normalize_phase(phase, schema)] += 1
         record = {
             "timestamp": now_iso,
             "goal_id": goal_id,
@@ -352,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
             "runtime_zone": budget_zone,
             "runtime_outcome_class": outcome_class,
             "valid": valid,
+            "failure_reason": failure_reason,
         }
         _append_jsonl(audit_log, record)
         if not valid:
@@ -372,7 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if new_false_this_iter > 0 and session_false_claims >= threshold:
         if not _existing_investigate_goal():
-            _file_investigate_goal(session_false_claims, audit_log)
+            _file_investigate_goal(session_false_claims, audit_log,
+                                   false_reasons, false_phases)
 
     if new_false_this_iter:
         print(f"[obligation-audit] iter: {new_false_this_iter} false / {len(claims)} claim(s); "

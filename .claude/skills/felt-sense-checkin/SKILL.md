@@ -743,15 +743,19 @@ checks whose targets moved).
 ### Phase 5a: Missing Checks (gaps)
 
 Did recent framework changes (new skills, new scripts, new conventions)
-create test gaps in `core/config/verification-checklist.md`?
+add a contract no /verify-learning check enforces? For each one, author a
+check in the REGISTRY /verify-learning runs — never
+`core/config/verification-checklist.md`, which its SKILL.md calls "a
+reference, not an evaluation source — this skill does not run it" (a check
+appended there is committed, greppable and never executed: guard-4767; the
+file's unmirrored backlog is g-115-8702). Run the check's command once
+against its live target first (guard-355); pick `<CODE>` from `sections`:
 
 ```
-Read: core/config/verification-checklist.md
+Bash: bash core/scripts/verify-check-registry.sh add --section <CODE> --check '<text>' --why '<why>' --dry-run
+Bash: bash core/scripts/verify-check-registry.sh add --section <CODE> --check '<text>' --why '<why>'
+Bash: bash core/scripts/verify-check-registry.sh verify
 ```
-
-For each change in the window that added a framework contract without a
-corresponding check, append a check. Use the existing format:
-`N. **Runtime**: <check> ... Verified by <goal-id>.`
 
 ### Phase 5b: Stale Checks (staleness scanner — C2)
 
@@ -1041,7 +1045,7 @@ check as one atomic pass.
   `aspirations-add-goal.sh`, `reasoning-bank-add.sh`,
   `guardrails-add.sh`, `/tree add`, `experience-add.sh`, `meta-set.sh`,
   `/notify-user` (via canonical phrasing), `journal-add.sh`, `wm-set.sh`
-- **Reads**: `agents/<agent>/self.md`, `core/config/verification-checklist.md`,
+- **Reads**: `agents/<agent>/self.md`, `core/config/verify-learning-checks.jsonl`,
   meta strategy files, `agents/<agent>/session/working-memory.yaml`,
   world aspirations
 - **Modifies**: `world/knowledge/tree/` (new/edited nodes),
@@ -1056,8 +1060,9 @@ check as one atomic pass.
   written to the 6 stores during the sweep; never enters the drain queue),
   `agents/<agent>/journal.jsonl` (append),
   `agents/<agent>/session/working-memory.yaml` (last_felt_sense_checkin slot),
-  `meta/*.yaml` (tuning edits), `core/config/verification-checklist.md`
-  (new checks), email outbound (only on material Self change)
+  `meta/*.yaml` (tuning edits), `core/config/verify-learning-checks.jsonl`
+  (new checks, via `verify-check-registry.sh add`), email outbound (only on
+  material Self change)
 - **Does NOT modify**: aspiration priorities (that's /priority-review)
 
 ## Return Protocol

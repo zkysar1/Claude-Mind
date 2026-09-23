@@ -173,6 +173,40 @@ def require_runner_sid():
         sys.exit(1)
 
 
+def require_autonomous_mode():
+    """RUNNING implies agent-mode == autonomous (CLAUDE.md's mode table, script-enforced).
+
+    /start writes the mode (IDLE Step 2, first-boot C8) BEFORE the RUNNING flip, and no
+    other ceremony script writes it. A /start carried out by a small model can drop that
+    one step with no error anywhere. Measured 2026-09-21 (a served small-model /start on a
+    throwaway world): the step block that binds the session and records the mode named 2 of
+    its 6 scripts, the next block ran whole, all three runner checks above passed, and the
+    agent was RUNNING for 34 minutes with no agent-mode file. Absence reads as `reader`, so
+    every consumer that asks for autonomous mode stayed quiet for the whole session (the
+    one measured: iteration-close-reminder.py's mode gate, silent at 5 of 5 completed
+    closes) and nothing said so. binding.yaml said `mode: autonomous` throughout; the
+    consumers read THIS file, not the binding.
+
+    Checked LAST, after the runner checks. The mode setter depends on none of them, so this
+    refusal's remedy can always succeed, and the refusals above keep naming their own
+    missing step first. Every production caller already satisfies it: both /start paths
+    write the mode before the flip, and recovery-yank-reverse.sh only reaches the flip when
+    recovery_yank.py's preconditions found agent-mode == autonomous.
+    """
+    mode = read_file(SESSION_DIR / "agent-mode")
+    if mode != "autonomous":
+        found = f"'{mode}'" if mode else "absent, which reads as reader"
+        print(
+            "REJECTED: state RUNNING requires agent-mode 'autonomous' "
+            f"({SESSION_DIR / 'agent-mode'} is {found}). Run /start's mode step first "
+            "(session-mode-set.sh autonomous), then set RUNNING — a RUNNING agent under any "
+            "other mode leaves every autonomous-gated hook silent for the whole session. "
+            "Do NOT write agent-mode by hand.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def cmd_state_set(args):
     """Write agent-state after validation."""
     require_agent()
@@ -182,6 +216,7 @@ def cmd_state_set(args):
         sys.exit(1)
     if value == "RUNNING":
         require_runner_sid()
+        require_autonomous_mode()
     write_file(SESSION_DIR / "agent-state", value)
 
 

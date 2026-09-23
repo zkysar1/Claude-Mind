@@ -664,3 +664,93 @@ def test_key_widening_is_proven_not_assumed():
     res = sq.batch_decide(records, [SKIPPED_OWNER], NOW, SESSION_START)
     assert res["population"]["records_scored"] == 4, res["population"]
     assert res["population"]["records_unreadable"] == 0, res["population"]
+
+
+# ─── proposed_work is APPENDED, not shadowed by the envelope () ───
+#
+# MEASURED, not invented (guard-645): over the live 2,082-record capture corpus
+# on 2026-09-21, `observation` is present on 2,074 records and `proposed_work`
+# on exactly THREE — one list[dict] with title/detail/priority, two plain str.
+# Because `observation` came FIRST in OBSERVATION_KEYS and extract_subject
+# returned on first match, any record carrying both scored on `observation`
+# alone. The fixture below is the SHAPE of the real guard-7119 record: a
+# contentless envelope sentence over a list-shaped proposed_work.
+
+ENVELOPE = ("Two NEW defects found while resolving outcome 3. Worker Body "
+            "cannot file (Case B, observable by any Body) -- relaying for "
+            "the reducer to file.")
+
+
+def test_envelope_observation_no_longer_shadows_proposed_work():
+    """THE DEFECT, pinned. The old form scored 156 chars of envelope, matched
+    nothing, and returned FILE with an empty candidate list — which is
+    indistinguishable from honest novelty (guard-7119)."""
+    rec = {"observation": ENVELOPE,
+           "proposed_work": [{"title": "Unblock: " + UNOWNED[:40],
+                              "detail": UNOWNED, "priority": "HIGH"}]}
+    subject, key = sq.extract_subject(rec)
+    assert key == "observation+proposed_work", key
+    assert ENVELOPE in subject, "the envelope must be kept, not replaced"
+    assert UNOWNED in subject, "the ITEM content is what was missing"
+    # the discriminator: the old first-match-wins form saw only the envelope
+    assert len(subject) > len(ENVELOPE)
+
+
+def test_contentless_envelope_over_an_owned_item_returns_DECLINE():
+    """The goal's own check. Scoring the envelope alone returns FILE; scoring
+    the ITEM finds the owner. Both directions are asserted, because only the
+    pair shows the fix did something."""
+    owned_detail = COMPLETED_OWNER["title"]
+    envelope_only = {"observation": ENVELOPE}
+    with_items = {"observation": ENVELOPE,
+                  "proposed_work": [{"title": owned_detail,
+                                     "detail": owned_detail}]}
+    before = sq.batch_decide([envelope_only], [COMPLETED_OWNER], NOW, SESSION_START)
+    after = sq.batch_decide([with_items], [COMPLETED_OWNER], NOW, SESSION_START)
+    assert before["rows"][0]["verdict"] == "FILE", before["rows"][0]
+    assert after["rows"][0]["verdict"] == "DECLINE", after["rows"][0]
+
+
+def test_subject_keys_used_still_enumerates_every_key_consumed():
+    """Outcome 3. `subject_keys_used` is the field that made this diagnosable —
+    it reported {'observation': 44, 'text': 1} and no proposed_work key at all.
+    The composite must appear there, or the next reader loses the same tell."""
+    rec = {"observation": ENVELOPE, "proposed_work": UNOWNED}
+    res = sq.batch_decide([rec], [SKIPPED_OWNER], NOW, SESSION_START)
+    assert res["population"]["subject_keys_used"] == {"observation+proposed_work": 1}, \
+        res["population"]
+
+
+def test_flatten_proposed_work_handles_every_measured_and_malformed_shape():
+    """`priority` is excluded deliberately: it is routing metadata, and folding
+    it in would inject the corpus-common token HIGH into every subject, which a
+    token-overlap scorer reads as signal. Malformed shapes render empty rather
+    than raising — one bad record must not abort the walk (guard-1512).
+
+    A plain loop, not @pytest.mark.parametrize: this module imports no pytest
+    (it is run both by pytest and directly), and adding the import here to gain
+    a decorator would be a new dependency for cosmetics."""
+    cases = [
+        ("a plain string", "a plain string"),
+        ([{"title": "T", "detail": "D"}], "T D"),
+        ([{"title": "T", "detail": "D", "priority": "HIGH"}], "T D"),  # priority NOT rendered
+        (["one", "two"], "one two"),
+        ([], ""),
+        (None, ""),
+        (42, ""),                                   # malformed: empty, never raises
+        ([{"priority": "HIGH"}], ""),
+    ]
+    for pw, expected in cases:
+        assert sq.flatten_proposed_work(pw) == expected, pw
+
+
+def test_the_2079_records_without_proposed_work_are_byte_identical():
+    """THE BLAST-RADIUS CONTROL, and the reason this fix is APPEND rather than
+    PROMOTE. A change to what a scoring analyzer observes changes the metric's
+    semantics (rb-4988), so the 99.6% of records carrying no proposed_work must
+    score on exactly the bytes they scored on before."""
+    for rec in ({"observation": UNOWNED}, {"content": UNOWNED},
+                {"finding": UNOWNED}, {"text": UNOWNED}):
+        subject, key = sq.extract_subject(rec)
+        assert subject == UNOWNED, (key, subject)
+        assert "+" not in key, "no composite key when proposed_work is absent"

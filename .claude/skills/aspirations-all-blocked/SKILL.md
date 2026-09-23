@@ -89,7 +89,7 @@ See coordination convention for full scan protocol.
 Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
 FOR EACH directive in new_directives: ack as select 2.07 (skip moot targets; else
     echo "Acknowledged directive {directive.id}" | board-post.sh --channel coordination --type status --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}")
-active_directives = selection_context.active_directives or board-read.sh --channel coordination --type directive --since 24h --json
+active_directives = selection_context.active_directives or board-read.sh --channel coordination --type directive --since 96h --json
 active_directives = [d for d in active_directives if not past(d.tags expires:) and "directive_type:veto" not in d.tags]
 Bash: board-read.sh --channel coordination --type escalation --since 12h --json
 FOR EACH escalation_msg NOT from this agent:

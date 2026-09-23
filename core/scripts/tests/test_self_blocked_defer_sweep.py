@@ -164,7 +164,7 @@ def test_band_attribution_is_order_dependent(mod):
     a predicate that fires on its own documentation is the guard-2421 shape.
     """
     # NOTE the id shape: `\\bg-\\d{3}-\\d{2,4}\\b` needs >=2 trailing digits, so
-    # "g-115-1" does NOT match other-goal and would make this fixture inert.
+    # "" does NOT match other-goal and would make this fixture inert.
     # An earlier draft used it and the test passed for the wrong reason — it
     # was asserting locus against a string only locus ever matched.
     both = "precondition_unmet: cc-04 must run g-115-11 before this can proceed"

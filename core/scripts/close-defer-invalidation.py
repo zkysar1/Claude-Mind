@@ -87,7 +87,7 @@ def main():
         reason = str(g.get("defer_reason") or "")
         matched = None
         # Word-boundary id match: a bare substring check false-flags when the
-        # closed id is a PREFIX of a longer id in the defer text (g-115-2
+        # closed id is a PREFIX of a longer id in the defer text (
         # inside ) — confirmed by the fresh-eyes probe 2026-07-18.
         if closed_id and re.search(re.escape(closed_id) + r"(?![0-9-])", reason):
             matched = f"names closed id {closed_id}"

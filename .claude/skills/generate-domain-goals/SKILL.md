@@ -149,7 +149,11 @@ warranted when the available backlog is thin.
    field is absent. A boosted lane with available < brief.lane_floor is
    STARVED, whatever the aggregate reads.
    ⚠ `primary` ALONE IS CORRECT HERE — DO NOT "fix" it to `primary` +
-   `secondary` to match goal-selector.py:4391 / directive_mix_check.py:112.
+   `secondary` to match the joins in goal-selector.py `load_strategic_focus`
+   and directive_mix_check.py `focus_aspirations` (cited by SYMBOL, not line —
+   guard-4398/guard-2310: the original `:4391` was EXACT at 7a48ce42fa and had
+   moved to `:4558` within a day as the file grew 7,678 -> 7,986 lines, so a
+   reader checking the number finds nothing and reads this block as stale).
    Those two are the only sites of `secondary` in the whole codebase and BOTH
    are readers: `strategic_focus.secondary` has ZERO writers (measured
    2026-09-20, bravo/cc-05: 0 hits across core/scripts + core/config +

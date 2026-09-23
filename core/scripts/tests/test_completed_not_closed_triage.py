@@ -315,7 +315,7 @@ def test_fleet_population_counts_holders_products_and_threshold(monkeypatch):
     assert pop["product"] == 3                  # asp-335 is a product prefix
     assert pop["by_holder"] == {"alpha": 2, "echo": 1}
     # `scanned` is the whole non-terminal population, not the noted subset:
-    # 5 of the 6 fixture goals (g-335-4 is completed). A terminal goal is never
+    # 5 of the 6 fixture goals ( is completed). A terminal goal is never
     # counted, however long its note.
     assert pop["non_terminal_scanned"] == 5
     # The 'short' note is BELOW the sweep's keep threshold but still carries

@@ -435,10 +435,10 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > **7. WHEN THE VERDICT IS NOT CLEAN, RUN `--triage`.** It re-reads the chunk
 > logs the run already wrote (it does not re-run the suite) and chains
 > position-bucket → solo re-run → **ownership**, reporting only genuine-AND-
-> unowned as FILE THESE. It queries the failing file's stem both with and without
-> the `test_` prefix, because `--title-contains` matches titles and titles drop
-> that prefix. Read its `SCOPE` block: `NOT RECORDED` for a half is a statement
-> of ignorance, never a pass.
+> unowned as FILE THESE. It scores each red on the failing TEST's node id
+> over four narrative fields; a file-only hit lands in VERIFY (open it), never
+> in FILE THESE. Read its `SCOPE` block: `NOT RECORDED` for a half is a
+> statement of ignorance, never a pass.
 >
 > **8. NEVER PIPE THE RUNNER — not even a finished run.** A trailing pipe
 > replaces the exit code with the pipe's (guard-1150), destroying the exit-2

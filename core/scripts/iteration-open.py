@@ -262,8 +262,45 @@ STAGES = (
             "defer-recheck",
             "precondition-defer-recheck",
             "recurring-starvation-check",
+            # FIFTH occurrence of the drift the four comments above narrate, and
+            # the FIRST in the medium battery -- so it is not an always-run-battery
+            # quirk, it is a property of registering a lane anywhere ().
+            # Registered in precheck-medium-battery.LANES by  and absent
+            # here, so the lane RAN while COVERAGE reported it unwired. Caught by
+            # test_iteration_open_stage_registry_parity during an UNRELATED scoped
+            # suite run on 2026-09-21 (zeta, cc-02), which is the cost worth naming:
+            # this red sits in the scoped selection for broad changes, so every
+            # agent closing deep code reads VERDICT: FAIL and must hand-attribute
+            # it before claiming anything.
+            #
+            # IT IS ALSO ABSENT FROM THE TIER TABLE, which parse_tier_table calls
+            # the lane SSOT -- so this drift is THREE edits, not the two the
+            # comments above describe, and the third has been silently missing for
+            # this lane since it was wired. Consequence: the COVERAGE denominator
+            # counts tier-table rows, so a lane that RUNS is not in the total at
+            # all and every "N of 72 dispatched / 52 unwired" figure quoted from
+            # this script is off by one.
+            #
+            # CLOSED 2026-09-22 (echo, cc-03, ). The third edit was made:
+            # the row now exists in the tier table, under an audited
+            # `size-budget-override` trailer, alongside the row for the lane below
+            # -- one override for both, because paying the audited cost twice for
+            # two rows of the same table is the reason the half-fix looked
+            # rational. The COVERAGE denominator is correct again.
+            "defer-citation-parity-check",
+            # The consumer of precondition-defer-recheck's OTHER skipped
+            # population (`skipped_free_form`). Built 2026-08-09 under 
+            # and wired 2026-09-22 under  -- it had zero call sites for
+            # the whole interval, which is the same "built and never elected"
+            # class the strangler note above describes, one layer down.
+            "defer-scope-coverage",
         ),
-        "note": "the 7 medium-tier lanes",
+        # NO SPELLED-OUT COUNT: this said "the 8 medium-tier lanes" and went
+        # stale the moment a 9th was registered -- the identical defect the
+        # always-run battery's docstring records seven times over, and which
+        # precheck-medium-battery._NOT_COVERED explicitly refuses to repeat.
+        # `iteration-open.sh --dry-run` prints the live number.
+        "note": "the medium-tier lanes",
     },
 )
 
@@ -735,10 +772,23 @@ def _selection(runner):
         # all_blocked is not a shape either producer branch emits.
         return {"count": None, "top": None, "error": f"expected a list, got {type(d).__name__}"}
     top = d[0] if d else None
+    # Index 0 may be a deliberate HOIST rather than the argmax: three lanes in
+    # goal-selector.py promote one goal to the head, each stamping its own marker
+    # key on it (guard-5135; core/config/rationale/selector-index-0-is-a-hoist.md).
+    # Rendering only goal_id/score made a hoist and a true argmax BYTE-IDENTICAL on
+    # this line, so a reader who noticed the divergence could only tell them apart
+    # by sampling across iterations -- and the drain lane is rate-limited by a
+    # counter that EVERY goal-selector.sh invocation mutates (guard-2331,
+    # invocations_since_pick vs k in drain-lane-state.json), so that sampling
+    # perturbs the very thing it measures. The marker answers it in ONE draw; an
+    # absent marker is equally a reading (index 0 IS the argmax). .
+    hoist = next((m for m in ("drain_lane_pick", "strategic_focus_pick",
+                              "reducer_only_pick") if top and top.get(m)), None)
     return {
         "count": len(d),
-        "top": ("%s (%.2f) %s" % (top.get("goal_id"), top.get("score", 0.0),
-                                  str(top.get("title", ""))[:70])) if top else None,
+        "top": ("%s (%.2f)%s %s" % (top.get("goal_id"), top.get("score", 0.0),
+                                    (" [HOIST: %s]" % hoist) if hoist else "",
+                                    str(top.get("title", ""))[:70])) if top else None,
     }
 
 

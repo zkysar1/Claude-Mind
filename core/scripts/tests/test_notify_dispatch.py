@@ -304,3 +304,48 @@ def test_reply_is_info_shaped_and_deliberately_NOT_step_1_5_exempt():
     assert "reply" not in set(re.findall(r'"([a-z-]+)"', gate.group(1))), (
         "`reply` was added to Step 1.5's exempt tuple — that converts an "
         "ALWAYS_SEND category into the re-send door guard-4722 forbids")
+
+
+# --------------------------------------------------------------------------- #
+# The board re-route is WITHHELD under pytest ()
+# --------------------------------------------------------------------------- #
+# board-post.sh writes through the SHARED daemon, which resolves its own world,
+# so no env a test sets can move that post off the LIVE findings board — the
+# refusal has to live in the emitter (guard-1041). Both tests call the real
+# function, set PYTEST_CURRENT_TEST explicitly instead of trusting the ambient
+# value (guard-4425), and stub subprocess.run, so neither can post even if the
+# refusal regresses (guard-1006).
+
+def _recorded_runs(monkeypatch):
+    calls = []
+
+    class _Done:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(argv, *a, **k):
+        calls.append((list(argv), k.get("input") or ""))
+        return _Done()
+    monkeypatch.setattr(nd.subprocess, "run", fake_run)
+    return calls
+
+
+def test_board_reroute_is_withheld_under_pytest_and_says_so(monkeypatch, capsys):
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "core/scripts/tests/test_x.py::test_y (call)")
+    calls = _recorded_runs(monkeypatch)
+    assert nd.reroute_to_board("Widget service down", "Unreachable since 03:00.", "blocker", "fleet-handleable") is True
+    assert calls == [], "board-post.sh ran under pytest — that post lands on the LIVE findings board"
+    assert "WITHHELD" in capsys.readouterr().err, "a withheld side effect must say so, or it reads as a silent drop"
+
+
+def test_board_reroute_still_posts_to_findings_outside_pytest(monkeypatch):
+    """The control: without it, the test above passes just as happily if the
+    re-route were deleted outright."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    calls = _recorded_runs(monkeypatch)
+    assert nd.reroute_to_board("Widget service down", "Unreachable since 03:00.", "blocker", "fleet-handleable") is True
+    assert len(calls) == 1
+    argv, text = calls[0]
+    assert any(a.endswith("board-post.sh") for a in argv), argv
+    assert argv[argv.index("--channel") + 1] == "findings"
+    assert "suppressed-notification,blocker" in argv
+    assert text.startswith("Widget service down")

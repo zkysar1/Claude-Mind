@@ -12,9 +12,9 @@ does read this world's coordination board and cites our ids back (two measured
 round-trips), so an explicitly ADDRESSED ``Completed:`` post is the delivery
 path that already works. To address it, do_verify needs the origin as ONE
 shape. Measured on the 313-goal in-progress snapshot the origin appears as
-``omni@zds-mind`` (canonical), ``zds-mind/omni`` (slash), ``zds-mind``
+``<agent>@<peer-env>`` (canonical), ``<peer-env>/<agent>`` (slash), ``<peer-env>``
 (env-only) and, for peer-FILED goals, no cross_world_origin at all — only
-``filed_by_agent: omni``. This module folds all four into one answer.
+``filed_by_agent: <agent>``. This module folds all four into one answer.
 
 RESOLUTION ORDER (first hit wins), goal record then its aspiration:
   1. ``cross_world_origin`` / ``injected_by`` on the GOAL

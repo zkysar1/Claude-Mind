@@ -186,9 +186,22 @@ if not pr:
           file=sys.stderr)
 else:
     try:
+        # timeout: guard-918 — never hardcode a short fixed cap on a write whose
+        # backend may be own-cloud; derive it from the knob the inner layer honors
+        # and leave headroom. The prior hardcoded timeout=5 was BELOW this box's
+        # actual wm-set latency, so the sentinel write raised TimeoutExpired on
+        # EVERY invocation while the write itself was healthy. Measured 2026-09-21
+        # (alpha, cc-04): the same `wm-set.sh force_evolution_finalize` completes
+        # rc=0 in ~8.3s, and a scratch-slot positive control takes ~8.4s — so this
+        # was never slot-specific and never a broken write, only a cap set under
+        # the floor. Consequence while it stood: force_evolution_finalize could
+        # never arm here, so Phase 0-pre2.5 never fired and MATERIAL self.md /
+        # program.md edits fell through to the 24h expiry unnotified — precisely
+        # the guard-380 notify-after lapse this gate exists to prevent.
         r = subprocess.run(
             [sys.executable, pr + "/core/scripts/wm.py", "set", "force_evolution_finalize"],
-            input=payload, text=True, capture_output=True, timeout=5, cwd=pr,
+            input=payload, text=True, capture_output=True,
+            timeout=int(os.environ.get("RT_CURL_TIMEOUT", "150")) + 30, cwd=pr,
         )
         ok = r.returncode == 0
         if not ok:

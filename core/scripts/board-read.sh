@@ -70,8 +70,13 @@ else
     [ "$AS_JSON" = "1" ]     && QUERY+="&json=1"
     [ "$MARK_READ" = "1" ]   && QUERY+="&mark_read=1"
     [ "$UNREAD_ONLY" = "1" ] && QUERY+="&unread_only=1"
+    # : mark_read=1 makes this GET a WRITE (the daemon appends read
+    # receipts), so rt_call must never send it twice — with --unread-only the
+    # second reply is EMPTY, because the first one consumed the unread set.
+    MUTATES=""
+    [ "$MARK_READ" = "1" ] && MUTATES="--mutates"
     rc=0
-    rt_call GET /v1/board/read --query "$QUERY" || rc=$?
+    rt_call GET /v1/board/read --query "$QUERY" ${MUTATES:+"$MUTATES"} || rc=$?
 fi
 
 case $rc in
@@ -81,7 +86,7 @@ case $rc in
         # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
             rc=0
-            rt_call GET /v1/board/read --query "$QUERY" || rc=$?
+            rt_call GET /v1/board/read --query "$QUERY" ${MUTATES:+"$MUTATES"} || rc=$?
             if [ "$rc" = "0" ]; then exit 0; fi
         fi
         rt_no_daemon_error "board-read.sh";;

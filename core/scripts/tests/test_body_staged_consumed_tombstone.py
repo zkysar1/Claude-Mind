@@ -538,3 +538,103 @@ def test_the_tombstone_still_precedes_the_delete_after_the_reorder(
     assert all(be.tombstone_present_at_delete), (
         "every delete on the merged path must find the tombstone already "
         "written; a False here is a regression to delete-first")
+
+
+# ------------------------------------------- the CONSUMER half, THROUGH THE CLI
+#
+# The three tests above drive `_consume_staged` DIRECTLY. That proves the
+# function is correct and says nothing about whether the production entry point
+# still reaches it — the guard-1943 / guard-6374 split ("a predicate is not
+# wired until the real call path reads it, and neither a green suite nor a
+# mutation proof can tell you that") which THIS FILE'S OWN DOCSTRING raises for
+# the PRODUCER half and answers there with `main(["push-staged", ...])`. The
+# consumer had no equivalent arm; 's progress_note named that as the
+# honest residual outstanding against outcome 2. This is it.
+#
+# Production path, verbatim: main(["generalize-down", ...]) -> generalize_down()
+# -> _consume_staged(). With no sessions/ dir and no unit dirs in the store,
+# generalize_down takes its early branch (body-merge.py:1110) — drain staged
+# orphans, stamp, return — which is the SHORTEST real path from the CLI to the
+# consumer and exercises no sessions-pass machinery this pin does not own.
+
+
+def _drive_generalize_down_cli(monkeypatch, tmp_path, agent, ws, *,
+                               persist_raises: bool, backend=None):
+    """Stage one world unit and wire the CLI to run against tmp_path."""
+    be = backend if backend is not None else _ReadableRecordingBackend()
+    monkeypatch.setattr(bmerge, "_get_backend", lambda: be)
+    # main() calls generalize_down(args.agent) with no project_root, so the root
+    # is resolved, not passed. This is the seam that makes a CLI-level arm
+    # possible at all.
+    monkeypatch.setattr(bmerge, "_project_root", lambda: tmp_path)
+
+    # generalize_down DERIVES the reducer WM path from bm._WM_FILENAME instead of
+    # taking it as a parameter, so the production basename cannot be side-stepped
+    # the way _drive_consume side-steps it. Repoint the constant: the framework's
+    # direct-store-write gate stays satisfied and the whole tree is under
+    # tmp_path, so the live store is untouched either way.
+    monkeypatch.setattr(bm, "_WM_FILENAME", "reducer-wm-fixture.yaml", raising=False)
+    (agent / "reducer-wm-fixture.yaml").write_text("counter: 10\n", encoding="utf-8")
+
+    import contextlib
+    monkeypatch.setattr(bmerge.wm, "wm_lock_for",
+                        lambda p: contextlib.nullcontext(), raising=False)
+
+    if persist_raises:
+        def _boom(path, data):
+            raise RuntimeError("simulated non-persisting reducer (cc-07 shape)")
+        monkeypatch.setattr(bmerge, "_write_yaml_atomic", _boom)
+
+    _stage_world(ws, UNIT)
+    return be
+
+
+def test_CLI_generalize_down_actually_reaches_the_consumer(
+        tmp_path, agent, ws, monkeypatch, capsys):
+    """WIRING. This is the arm that fails if someone unhooks _consume_staged
+    from generalize_down, or moves the staged drain behind a branch the early
+    return never takes — a change every direct-call test above stays green
+    through."""
+    _drive_generalize_down_cli(monkeypatch, tmp_path, agent, ws,
+                               persist_raises=False)
+
+    rc = bmerge.main(["generalize-down", "--agent", "alpha"])
+    assert rc == 0
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["staged_merged"] == [UNIT], (
+        "precondition AND the point of this test: the unit must have taken the "
+        "MERGED branch having been driven from the CLI. An empty staged_merged "
+        "here with the direct-call tests still green is exactly the wiring "
+        "regression this arm exists to catch")
+    assert (ws / f"{UNIT}-wm.consumed").is_file(), (
+        "a durably-merged unit MUST be tombstoned through the production entry "
+        "point too, not only when _consume_staged is called by hand")
+    assert not (ws / f"{UNIT}-wm.yaml").exists()
+
+
+def test_CLI_generalize_down_writes_NO_tombstone_when_the_persist_fails(
+        tmp_path, agent, ws, monkeypatch):
+    """THE LOAD-BEARING DIRECTION, through the CLI: no delivery, no ACK.
+
+    Non-vacuity is carried by `match=` rather than by a summary assertion: the
+    RuntimeError is raised INSIDE the persist, so it propagating out of main()
+    is itself proof that execution reached the persist inside _consume_staged.
+    A run that never reached the consumer would leave the same clean tree and
+    raise nothing — which is precisely the indistinguishability this arm closes.
+    """
+    _drive_generalize_down_cli(monkeypatch, tmp_path, agent, ws,
+                               persist_raises=True)
+
+    with pytest.raises(RuntimeError, match="simulated non-persisting reducer"):
+        bmerge.main(["generalize-down", "--agent", "alpha"])
+
+    assert not (ws / f"{UNIT}-wm.consumed").exists(), (
+        "a persist that never landed must not tell the origin box the unit was "
+        "consumed — the g-115-9876 defect, now pinned at the production entry "
+        "point and not only at the function")
+    assert (ws / f"{UNIT}-wm.yaml").is_file(), (
+        "and the triple must survive, so a later drain from a box that CAN "
+        "persist still delivers it")
+    assert (ws / f"{UNIT}-wm.hash").is_file()
+    assert (ws / f"{UNIT}-wm-baseline.yaml").is_file()

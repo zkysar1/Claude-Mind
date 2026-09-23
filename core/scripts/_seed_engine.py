@@ -8,7 +8,7 @@ CLI sub-commands (consumed by core/scripts/seed-*.sh wrappers):
   clean-cruft       — remove cruft_patterns at destination
   verify-completeness  — assert manifest includes exist at destination
   diff              — source-vs-destination diff (post-transform aware)
-  list-includes     — list resolved include file set (debug helper)
+  list-includes     — list resolved include file set (also domain-leak-check.sh's scope)
 
 The engine NEVER touches source content. It reads source, transforms in memory
 or via staging, then writes destination.
@@ -35,6 +35,7 @@ import _seed_transforms as xform  # noqa: E402
 from _exec_bits import (  # noqa: E402  (; index-level carry + verify )
     carry_exec_bit, carry_index_exec_bits, index_exec_map, verify_index_exec_bits,
 )
+from _peer_registry import is_deployment_registry_entry  # noqa: E402  ()
 
 try:
     import yaml
@@ -206,6 +207,16 @@ def walk_include_entry(entry: dict, source_root: Path) -> list:
             except ValueError:
                 continue
             rel_str = _norm(str(rel))
+            # : a registry entry naming a specific deployment never
+            # ships. The core/ entry carried the whole registry dir, so every
+            # downstream clone received entries for deployments it has no
+            # relationship with. Derived from the registry dir at walk time,
+            # like the forged-skill auto-derive above (), so no
+            # deployment name is typed anywhere; only the generic entry ships,
+            # and the registry loader treats fewer entries as "no peers". The
+            # destination's own copies are kept by _is_preserved_at_dest.
+            if is_deployment_registry_entry(rel_str):
+                continue
             # Pattern-based exclude (globs like scripts/tests/_tmp_*/)
             if _matches_any(rel_str, other_patterns):
                 continue
@@ -810,6 +821,16 @@ def _is_preserved_at_dest(rel: str, extra_tops=frozenset()) -> bool:
     if rel.split("/", 1)[0] in extra_tops:
         return True
     if rel in _DEPLOYMENT_LOCAL_FILES:
+        return True
+    # : every deployment registry entry already AT the destination is
+    # destination-owned. The seed no longer carries these (walk_include_entry),
+    # so without this line the orphan sweep would delete them all. Keeping only
+    # the destination's own entry is not enough: production derives its storage
+    # wiring from its own entry, and the upstream lane (framework_origin plus
+    # cross-world goal injection) resolves through the destination's copy of
+    # its ORIGIN's entry. A git-fed downstream would then merge any deletion
+    # made here.
+    if is_deployment_registry_entry(rel):
         return True
     # .seed-backup-<timestamp>/ from prior plants
     first = rel.split("/", 1)[0]
@@ -2084,6 +2105,9 @@ def _parse_args():
     sp = sub.add_parser("list-includes")
     sp.add_argument("--manifest", required=True)
     sp.add_argument("--source", default=str(PROJECT_ROOT))
+    sp.add_argument("--lines", action="store_true",
+                    help="One repo-relative path per line instead of JSON "
+                         "(domain-leak-check.sh reads its scope this way)")
 
     sp = sub.add_parser("plan")
     sp.add_argument("--manifest", required=True)
@@ -2167,7 +2191,10 @@ def main():
         print(json.dumps(result, indent=2))
     elif args.cmd == "list-includes":
         files = resolve_include_set(manifest, source_root)
-        print(json.dumps({"count": len(files), "files": files}, indent=2))
+        if args.lines:
+            print("\n".join(files))
+        else:
+            print(json.dumps({"count": len(files), "files": files}, indent=2))
     elif args.cmd == "plan":
         plan = do_plan(source_root, dest_root, manifest,
                        living_prod=getattr(args, "living_prod", False))

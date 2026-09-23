@@ -32,6 +32,18 @@ records — g-248-101 discovery). Tests that POSITIVELY assert on firing records
 destination redirected to a tmp meta dir. The env guard covers in-process
 imports and subprocess children (both inherit pytest's environment); hermetic
 daemon fixtures are covered separately by their tmp project-root isolation.
+
+Liveness-probe suppression (g-318-168): log() is also a silent no-op when
+LIVENESS_PROBE_ENV is set. signal-liveness-canary.py sets it on the env of every
+probe subprocess it runs, and nothing else should. The canary drives registered
+gates with a MUST-TRIP input once per reducer iteration, so before this guard
+every probe landed here as a real `block`. Measured 2026-09-23 (bravo, cc-05,
+6.8.0-139-generic): exhaustive-search-gate logged 1502 block of 1515 firings in
+two days, all on the canary fixture's trigger ("is not built"), and one canary
+run appended exactly 5 synthetic blocks to the spool, one per rc-shaped row. That
+is the retirement evaluator's input, and it made five gates look busy on traffic
+they never saw. The canary reads its verdict from the gate's rc and stdout, never
+from this log, so suppressing the write costs it nothing.
 """
 
 import datetime as _dt
@@ -49,6 +61,9 @@ from _fileops import locked_append_jsonl
 
 _SCHEMA_VERSION = 1
 _VALID_DECISIONS = ("noop", "pass", "block", "override", "fail_open")
+
+# Set by signal-liveness-canary.py on its probe subprocesses (see the docstring).
+LIVENESS_PROBE_ENV = "GATE_LOG_LIVENESS_PROBE"
 
 # Own-cloud spool lane (). Under STORAGE_BACKEND=own-cloud a direct
 # locked_append_jsonl on gate-firings.jsonl is a whole-object S3
@@ -274,6 +289,10 @@ def log(
         # the try so the never-raises contract stays airtight.
         if (_os.environ.get("PYTEST_CURRENT_TEST")
                 and not _os.environ.get("GATE_LOG_ALLOW_PYTEST")):
+            return
+        # Liveness-probe suppression (): a canary's must-trip probe is
+        # not a production firing — see module docstring.
+        if _os.environ.get(LIVENESS_PROBE_ENV):
             return
 
         if decision not in _VALID_DECISIONS:

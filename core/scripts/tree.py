@@ -41,7 +41,7 @@ def _tree_path() -> str:
     the daemon imports this module via endpoints load_all() BEFORE /start can
     configure anything — the prior eager module-level `WORLD_DIR / ...` killed
     the daemon at import on a bare clone (g-367-03, measured 2026-08-21 on a
-    pristine coach-mind clone; same class as the 2026-06-14 empty-conf incident
+    pristine downstream clone; same class as the 2026-06-14 empty-conf incident
     in _paths.py). Failing here at USE time with a clear message preserves the
     _paths.py hard-cut defense (loud, no silent PROJECT_ROOT/world fallback)
     without taking the daemon down before /health exists.

@@ -202,7 +202,7 @@ DISPOSITION_KINDS = frozenset({
 # accepted as a valid goal id. \Z anchors at true end-of-string. Probed on both
 # tables that share this regex, so a stray newline from a captured command
 # substitution can no longer enter either as a well-formed id.
-_GOAL_ID_RE = re.compile(r"^g-\d{1,4}-\d{2,5}[a-z]?(-[a-z])?\Z")
+_GOAL_ID_RE = re.compile(r"^g-\d{1,4}-\d+[a-z]?(-[a-z])?\Z")  # seq open-ended: guard-1161
 
 
 # DELIBERATELY namedtuple, NOT @dataclass. This module is loaded by

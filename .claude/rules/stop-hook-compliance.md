@@ -95,7 +95,7 @@ a signal to stop.
    structurally distinguishable from "feels done" and rule 5 is intact. It
    deliberately does NOT decide on `context-budget-status.py`'s zone: that
    sensor read `fresh` with 479998 headroom right through the measured
-   exhaustion (its repair is g-115-8310). Two rungs: `pause` at 4 BLOCKs writes
+   exhaustion (repaired 2026-09-04). Two rungs: `pause` at 4 BLOCKs writes
    NOTHING and only directs the turn to end on a REGISTERED external-wait
    sleep; `stop` at 10 writes the signal. Every unreadable input HOLDS —
    stopping a healthy loop is worse than the disease (guard-1562).

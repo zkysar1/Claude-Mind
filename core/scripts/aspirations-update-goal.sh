@@ -72,7 +72,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --override-narrative-replace --outcome-note --outcome-note-file"
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --override-narrative-replace --outcome-note --outcome-note-file --expect-sha256"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
@@ -89,6 +89,7 @@ CROSS_LANE=""
 VALUE_STDIN=""
 OUTCOME_NOTE=""
 OUTCOME_NOTE_FILE=""
+EXPECT_SHA256=""
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
 declare -a POSITIONALS=()
@@ -157,6 +158,21 @@ while [[ $# -gt 0 ]]; do
             # file — the safe transport for multi-KB notes (argv caps:
             # guard-5634 CreateProcess ~32k / guard-1187 MAX_ARG_STRLEN).
             OUTCOME_NOTE_FILE="${2-}"
+            shift $(( $# >= 2 ? 2 : 1 ));;
+        --expect-sha256)
+            # : compare-and-swap precondition. The daemon refuses the
+            # write (409 field_precondition_failed, nothing written) unless the
+            # field's CURRENT text hashes to this value, compared inside its
+            # write lock. A 200 that ran the compare echoes it on stderr as
+            # `[update-goal] precondition_checked field-sha256=<hex>`; a caller
+            # must require that line, because a daemon predating the header
+            # ignores it and still answers 200 (guard-5505). An empty value is
+            # refused: it would silently send no precondition at all.
+            EXPECT_SHA256="${2-}"
+            if [ -z "$EXPECT_SHA256" ]; then
+                echo "Error: --expect-sha256 needs a value (the sha256 hex of the field's current text); an empty one would skip the precondition silently." >&2
+                exit 2
+            fi
             shift $(( $# >= 2 ? 2 : 1 ));;
         --blocker-ref)
             BLOCKER_REF="${2-}"
@@ -441,6 +457,7 @@ declare -a HEADER_ARGS=()
 [ -n "$OVERRIDE_BLOCKER_GATE" ] && HEADER_ARGS+=(--header "X-Mind-Override-Blocker-Gate: $OVERRIDE_BLOCKER_GATE")
 [ -n "$ALLOW_NEW_FIELD" ] && HEADER_ARGS+=(--header "X-Mind-Allow-New-Field: $ALLOW_NEW_FIELD")
 [ -n "$CROSS_LANE" ] && HEADER_ARGS+=(--header "X-Mind-Cross-Lane: $CROSS_LANE")
+[ -n "$EXPECT_SHA256" ] && HEADER_ARGS+=(--header "X-Mind-Expect-Field-Sha256: $EXPECT_SHA256")
 
 rc=0
 COMBINED="$(rt_call POST /v1/aspirations/update-goal \
@@ -468,6 +485,12 @@ if _residual:
     print(_residual, file=sys.stderr)
 for w in resp.get('warnings') or []:
     print(w, file=sys.stderr)
+# : say that the --expect-sha256 compare RAN. Only a daemon that
+# checked it returns a precondition block, and callers require this line
+# (guard-5505: an older daemon ignores the header and still answers 200).
+_pc = resp.get('precondition') or {}
+if _pc.get('checked'):
+    print('[update-goal] precondition_checked field-sha256=' + str(_pc.get('sha256')), file=sys.stderr)
 goal = resp.get('goal')
 if goal is None:
     print(json.dumps(resp, indent=2, ensure_ascii=False))
@@ -503,6 +526,12 @@ if _residual:
     print(_residual, file=sys.stderr)
 for w in resp.get('warnings') or []:
     print(w, file=sys.stderr)
+# : say that the --expect-sha256 compare RAN. Only a daemon that
+# checked it returns a precondition block, and callers require this line
+# (guard-5505: an older daemon ignores the header and still answers 200).
+_pc = resp.get('precondition') or {}
+if _pc.get('checked'):
+    print('[update-goal] precondition_checked field-sha256=' + str(_pc.get('sha256')), file=sys.stderr)
 goal = resp.get('goal')
 if goal is None:
     print(json.dumps(resp, indent=2, ensure_ascii=False))

@@ -211,10 +211,10 @@ drains it, and a skipped drain re-replays the same batch every close.
 
 ⚠ **Do NOT restore the blanket `wm-clear.sh` here** — above all not when the slot
 looks too big to drain, the exact condition it is wrong for. Measured
-(g-115-10001): the 50-item cap is **INERT**, not merely unenforced (~100% of
-entries are eviction-EXEMPT via `load_bearing`), and a verified archive-then-clear
-of 3,187 entries was **undone inside the hour** by `merge_wm`'s union from a Body's
-stale baseline. A bounded subtract SURVIVES that merge (measured).
+(g-115-10001): a verified archive-then-clear of 3,187 entries was **undone inside the
+hour** by `merge_wm`'s union from a Body's stale baseline. **The 50-item cap is NOT
+inert** — claimed inert here until 2026-09-22, when `wm-prune.sh` cut 3,060
+to 50 in one call, all `load_bearing` (merge restored 2,631).
 The restore signal is the drained goal_ids REAPPEARING —
 NOT a non-decreasing `kept`, which arrivals produce (guard-2997). **Residue**: entries with
 `goal_id: null` cannot appear in the drain's goal-id set and are excluded from the
@@ -241,6 +241,11 @@ doubt between framework and domain, pick domain.
         # empty, not that the lesson is novel. A zero-BYTE reply is a malfunction,
         # not a result (guard-3707); the add-time near-dup advisory does NOT block
         # (guard-4090) -- read its text, never its rc. Applies to all 5 sites below.
+        # ONE QUERY IS NOT THE CHECK EITHER (guard-6927): run a SECOND retrieve phrased
+        # as the MECHANISM (structural shape, surface it lives on, how it fails) -- a
+        # subject query misses mechanism-indexed entries and the tell is a FULL set of
+        # near-misses, not an empty one. Read the top hit's FULL rule; a [:N] is UNREAD
+        # (guard-1421). Strengthening is the expected outcome, credited equally.
         existing_rb = Bash: reasoning-bank-read.sh --category {goal.category}
                 THEN Bash: retrieve.sh --category "<the lesson, one line>" --depth shallow   # THIS is the check (guard-2255)
         IF proposed entry semantically overlaps with an existing entry:

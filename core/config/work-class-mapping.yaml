@@ -59,6 +59,13 @@ mapping:
   aspirations: framework
   coordination: framework
   cross-agent-coordination: framework
+  fleet-management: framework  # g-353-132 (bravo, cc-05, 2026-09-21): was unmapped -> 'unclassified'
+                               # -> role_affinity 0.30 vs 1.00 for classified peers. Surfaced by
+                               #  (the closing-lanes fleet-manager check-in, HIGH,
+                               # user_directive, 36h cadence) having NEVER fired since 2026-09-17:
+                               # present in the candidate pool at noise-free rank 80/2325, not
+                               # blocked, not deferred, not routed — purely out-ranked by the
+                               # missing-field penalty. Same class as `coordination` above.
   session-identity-contract: framework
   signal-taxonomy-and-schema: framework
   failure-to-aspiration-pipeline: framework

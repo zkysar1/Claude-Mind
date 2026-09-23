@@ -845,10 +845,12 @@ rt_ensure_running() {
 # reported as a 90s timeout, and the rt_base_url branch below returns 3 without
 # issuing a request at all.
 #
-# The elapsed cannot be handed over in a variable. rt_call does
-# `out=$(rt_curl "$@")` — a SUBSHELL — so anything rt_curl assigns is discarded
-# at that boundary. It must cross via a file, written ONLY on the rc=3 paths so
-# the success path pays nothing.
+# The elapsed cannot be handed over in a variable. Wrappers call rt_call inside
+# `$(...)` — a SUBSHELL — and read the elapsed in rt_no_daemon_error from their
+# own shell, so anything assigned during the call is discarded at that boundary.
+# It must cross via a file, written ONLY on the rc=3 paths so the success path
+# pays nothing. (_RT_ELAPSED_MS carries the same number INSIDE the call, for
+# rt_call's own diagnostic — .)
 #
 # The record carries the writer's PID because one RT_DIR is shared by every
 # concurrent wrapper. Inside a command substitution `$$` is the PARENT shell's
@@ -870,8 +872,9 @@ _rt_record_elapsed() {
     local t0="$1"
     [ -n "$t0" ] && [ -n "${EPOCHREALTIME:-}" ] || return 0
     local t1="${EPOCHREALTIME/[.,]/}"
+    _RT_ELAPSED_MS=$(( (t1 - t0) / 1000 ))
     mkdir -p "$RT_DIR" 2>/dev/null || return 0
-    printf '%s %s\n' "$$" "$(( (t1 - t0) / 1000 ))" > "$RT_ELAPSED_FILE" 2>/dev/null || true
+    printf '%s %s\n' "$$" "$_RT_ELAPSED_MS" > "$RT_ELAPSED_FILE" 2>/dev/null || true
     return 0
 }
 
@@ -924,7 +927,17 @@ _rt_api_token() {
     printf '%s' "${_RT_ENV_TOKEN:-}"
 }
 
-rt_curl() {
+# _rt_curl_capture — rt_curl's engine (). Same request, same return
+# codes, but the reply is left in globals instead of printed, so rt_call can
+# judge whether a second send is safe BEFORE anything reaches the caller:
+#   _RT_BODY     response body ("" when none arrived)
+#   _RT_STATUS   HTTP status ("" when no reply arrived)
+#   _RT_CURL_RC  curl's own exit code ("" when curl never ran)
+#   _RT_MUTATES  1 when the caller passed --mutates: this request writes even
+#                though its method reads as a read (see _rt_resend_safe)
+# It prints only its own diagnostics, to stderr. rt_curl below is the printer.
+_rt_curl_capture() {
+    _RT_BODY="" _RT_STATUS="" _RT_CURL_RC="" _RT_ELAPSED_MS="" _RT_MUTATES=""
     local method="$1" path="$2"; shift 2
     local _rt_t0="${EPOCHREALTIME/[.,]/}"
     local query="" body_string="" agent="${MIND_AGENT:-}"
@@ -935,6 +948,7 @@ rt_curl() {
             --body-string) body_string="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
             --agent) agent="$2"; shift $(( $# >= 2 ? 2 : 1 ));;
             --header) extra_headers+=( -H "$2" ); shift $(( $# >= 2 ? 2 : 1 ));;
+            --mutates) _RT_MUTATES=1; shift;;
             *) echo "rt_curl: unknown flag: $1" >&2; return 2;;
         esac
     done
@@ -1016,6 +1030,7 @@ rt_curl() {
             -w "${RT_MARKER}%{http_code}" "$url" 2>/dev/null) || curl_rc=$?
         curl_rc=${curl_rc:-0}
     fi
+    _RT_CURL_RC="$curl_rc"
 
     # No marker means curl failed before writing anything (connection refused,
     # DNS failure, timeout). $() strips trailing newlines, so the marker is
@@ -1044,15 +1059,14 @@ rt_curl() {
     local status_code body
     status_code="${result##*${RT_MARKER}}"
     body="${result%${RT_MARKER}*}"
+    _RT_STATUS="$status_code"
+    _RT_BODY="$body"
 
     if [ -z "$status_code" ] || [ "$status_code" = "000" ]; then
         return 3
     fi
 
-    # Use printf %s rather than echo to avoid backslash interpretation in
-    # response bodies that happen to contain escape sequences.
     if [ "$status_code" -ge 200 ] && [ "$status_code" -lt 300 ]; then
-        printf '%s' "$body"
         return 0
     fi
     #  Change 2: routing-layer 404 ("no route for {method} {path}",
@@ -1066,30 +1080,111 @@ rt_curl() {
     case "$body" in
         *"no route for "*) return 3;;
     esac
-    printf '%s' "$body" >&2
     return 2
 }
 
-# rt_call <method> <path> [--query "..."] [--body-string "..."] [--agent NAME]
+rt_curl() {
+    local rc=0
+    _rt_curl_capture "$@" || rc=$?
+    # Use printf %s rather than echo to avoid backslash interpretation in
+    # response bodies that happen to contain escape sequences.
+    case "$rc" in
+        0) printf '%s' "$_RT_BODY" ;;
+        2) printf '%s' "$_RT_BODY" >&2 ;;
+    esac
+    return "$rc"
+}
+
+# _rt_resend_safe <method> — may rt_call send this request AGAIN? ()
+# Judges the outcome the last _rt_curl_capture left behind. Yes only when the
+# first send provably did not apply it:
+#   - a GET/HEAD/OPTIONS the caller did not mark --mutates. A GET CAN write:
+#     board-read.sh --mark-read appends read receipts, and with --unread-only
+#     a second send returns an EMPTY set because the lost first reply consumed
+#     it — so that wrapper passes --mutates. Every other GET a core/scripts
+#     wrapper sends is a read (routes and query flags checked 2026-09-23), so
+#     a second send only re-reads;
+#   - a 4xx refusal, including the routing-404 of a route a stale daemon lacks:
+#     the daemon decides those before it writes anything;
+#   - no reply because it never reached a daemon: no port file (curl never
+#     ran), DNS failure (curl 6), connection refused (curl 7).
+# No for everything else: a 2xx is applied, a 5xx can follow the write (a
+# serialize failure does), and a timeout, reset or empty reply means only that
+# the CLIENT gave up — the daemon may still apply the write.
+_rt_resend_safe() {
+    if [ -z "${_RT_MUTATES:-}" ]; then
+        case "${1:-}" in
+            GET|HEAD|OPTIONS|get|head|options) return 0 ;;
+        esac
+    fi
+    case "${_RT_STATUS:-}" in
+        4[0-9][0-9]) return 0 ;;
+        '') ;;
+        *) return 1 ;;
+    esac
+    case "${_RT_CURL_RC:-}" in
+        ''|6|7) return 0 ;;
+    esac
+    return 1
+}
+
+# _rt_write_unknown <method> <path> — say plainly that a write got no reply,
+# may already be applied, and was not sent again ().
+_rt_write_unknown() {
+    local how="no reply"
+    case "${_RT_CURL_RC:-}" in
+        28) how="no reply within RT_CURL_TIMEOUT=${RT_CURL_TIMEOUT}s" ;;
+        52) how="an empty reply (connection closed)" ;;
+        56) how="a reset connection" ;;
+    esac
+    echo "[runtime] WRITE OUTCOME UNKNOWN: $1 $2 got $how (curl exit ${_RT_CURL_RC:-?}${_RT_ELAPSED_MS:+, ${_RT_ELAPSED_MS}ms})." >&2
+    echo "  The daemon may already have applied it, so it was NOT sent again (g-115-8129)." >&2
+    echo "  Read the store back before retrying: a blind re-run can write it twice." >&2
+    echo "  If the daemon is slow, retry with RT_CURL_TIMEOUT=600." >&2
+}
+
+# _rt_reply <method> <path> <rc> — hand the last captured reply to the caller
+# exactly as rt_curl would, except that NO reply to a request that may already
+# be applied comes back as 2, not 3. Every wrapper answers 3 with
+# rt_try_autospawn and a SECOND rt_call; 2 is the code none of them retries.
+_rt_reply() {
+    case "$3" in
+        0) printf '%s' "$_RT_BODY"; return 0 ;;
+        2) printf '%s' "$_RT_BODY" >&2; return 2 ;;
+        3) if _rt_resend_safe "$1"; then return 3; fi
+           _rt_write_unknown "$1" "$2"
+           return 2 ;;
+    esac
+    return "$3"
+}
+
+# rt_call <method> <path> [--query "..."] [--body-string "..."] [--agent NAME] [--mutates]
 #
 # Convenience wrapper: tries the daemon; auto-starts if down; returns the
 # same exit codes as rt_curl. Wrappers usually call THIS and branch on
 # exit 3 to invoke their own fallback.
 #
+# A WRITE IS NEVER SENT TWICE (). rt_call sends a request again
+# only when _rt_resend_safe says the first send provably did not apply it.
+# A GET that writes must say so with --mutates.
+# Before, both retry paths below re-sent unconditionally, and with the
+# wrapper's own rc=3 retry ONE add-goal call wrote three goals (alpha,
+# 2026-09-23) and another four, one RT_CURL_TIMEOUT apart (guard-7167).
+#
 # IMPORTANT: callers source this file under `set -euo pipefail`. A bare
 # function call that returns nonzero would trip `set -e`. We guard the
 # inner rt_curl calls with `|| true` so we can read $? without exiting.
 rt_call() {
-    local rc=0 out
-    # Buffer the first response instead of streaming it: the staleness branch
-    # below may retry rt_curl after a recycle, and a streamed first body would
-    # CONCATENATE with the retry body on the caller's $() capture (rt_curl
-    # emits no trailing newline) — observed 2026-07-18 as a doubled goal-id
-    # ("") that made claim-liveness-check INDETERMINATE
-    # and fail-opened the guard-1151 restart gate. rt_curl prints nothing to
-    # stdout on rc 2/3, so buffering + printf '%s' is byte-identical for every
-    # non-retry path.
-    out=$(rt_curl "$@") || rc=$?
+    local rc=0 out_rc=0 method="${1:-}" path="${2:-}"
+    # Capture the first reply instead of streaming it; _rt_reply emits the
+    # FINAL one. A streamed first body used to CONCATENATE with the retry
+    # body on the caller's $() capture — observed 2026-07-18 as a doubled
+    # goal-id ("") that made claim-liveness-check
+    # INDETERMINATE and fail-opened the guard-1151 restart gate. And a first
+    # ERROR body, which rt_curl prints to stderr, escaped before the retry
+    # replaced it, so a 2>&1 caller read the stale verdict while rc said 0
+    # (, zeta 2026-09-23).
+    _rt_curl_capture "$@" || rc=$?
     if [ "$rc" -ne 3 ]; then
         # Daemon answered. If it's running stale code, rt_check_staleness
         # warns AND arms the auto-restart sentinel ( Change 1).
@@ -1112,26 +1207,42 @@ rt_call() {
            [ "${RT_STALENESS_RESTARTED:-0}" != "1" ] && \
            [ "${RT_NO_AUTOSPAWN:-0}" != "1" ]; then
             if rt_ensure_running; then
-                rc=0
-                # REPLACE the stale first body — never emit both (doubled-id bug).
-                out=$(rt_curl "$@") || rc=$?
+                if _rt_resend_safe "$method"; then
+                    # REPLACE the stale reply, body and error body alike.
+                    rc=0
+                    _rt_curl_capture "$@" || rc=$?
+                else
+                    # The stale daemon already answered this write (2xx:
+                    # applied; 5xx: unknown). The recycle above makes the NEXT
+                    # call fresh; a second send here would write it twice.
+                    echo "[runtime] $method $path was answered by the stale daemon (HTTP ${_RT_STATUS:-?}); daemon recycled, request NOT sent again (g-115-8129)" >&2
+                fi
             fi
         fi
-        printf '%s' "$out"
-        return "$rc"
+        _rt_reply "$method" "$path" "$rc" || out_rc=$?
+        return "$out_rc"
     fi
-    # rc==3: connection refused, no port, OR a routing-layer 404 escalated by
-    # Change 2 (endpoint missing because the route post-dates the daemon).
+    # rc==3: connection refused, no port, a routing-layer 404 escalated by
+    # Change 2 (endpoint missing because the route post-dates the daemon), OR
+    # a request that got no reply at all (timeout, reset, empty reply).
     # Run rt_check_staleness FIRST so the Mode-1 case (daemon up but stale,
     # missing the new route) arms RT_STALENESS_RESTART_PENDING — otherwise
     # rt_ensure_running would no-op on the still-up stale daemon and the
     # retry below would re-hit the same 404. ( Change 1 glue.)
     rt_check_staleness
+    # : a write that may have landed after the client gave up is
+    # not sent again, and comes back as 2 so the wrapper does not send it
+    # either.
+    if ! _rt_resend_safe "$method"; then
+        _rt_reply "$method" "$path" 3 || out_rc=$?
+        return "$out_rc"
+    fi
     # Try to spawn / recycle and retry once.
     if rt_ensure_running; then
         rc=0
-        rt_curl "$@" || rc=$?
-        return "$rc"
+        _rt_curl_capture "$@" || rc=$?
+        _rt_reply "$method" "$path" "$rc" || out_rc=$?
+        return "$out_rc"
     fi
     rt_warn "daemon unreachable and auto-start failed"
     return 3

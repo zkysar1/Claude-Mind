@@ -427,7 +427,7 @@ threshold, was then blocked by the capability gate, and delivered no skill.
      board, do not report the forge done. Write the body at
      `.claude/skills/{new-skill-name}/SKILL.md` and re-run. rc=2 → you passed no
      skill name; a usage error is NOT approval.
-     WHY: measured on coach-mind 2026-09-05 11:55Z — `mkdir -p` succeeded, the
+     WHY: measured on a downstream clone 2026-09-05 11:55Z (rb-10227) — `mkdir -p` succeeded, the
      `Write` of SKILL.md was refused by the L1 hook, and registration proceeded
      anyway: registry row written, skill dir EMPTY, a test goal filed to
      exercise a skill with no body, two "forge-skill,complete" board posts, and

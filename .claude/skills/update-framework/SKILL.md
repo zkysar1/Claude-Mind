@@ -90,7 +90,8 @@ State the shape and the evidence (the tag, or its absence) before proceeding.
 1. Bash: `bash core/scripts/framework-pull.sh` — the PLAN (default; copies
    nothing). If it prints `No source repo resolved`, this box has no local
    clone of staging: clone the staging repo (C6 names it) beside this repo as
-   `../claude-mind`, or set `FRAMEWORK_SOURCE_REPO=<path>` in
+   `../<staging-clone>`, under the directory name `framework_pull.py`'s
+   sibling-clone default resolves, or set `FRAMEWORK_SOURCE_REPO=<path>` in
    `agents/<agent>/local-paths.conf`, then re-run. Do not web-search for it.
 2. Read the plan.
    - rc=0 (clear) → Bash: `bash core/scripts/framework-pull.sh --adopt`. It

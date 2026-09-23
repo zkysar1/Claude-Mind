@@ -474,8 +474,8 @@ def _cross_world_ref(rid):
     away from `dangling` rather than merely softening the wording.
 
     TWO SPELLINGS, both in use, both must route here:
-      '<world>:<goal-id>'   'zds-mind:g-115-4173'  -- handled since g-115-3659
-      '<goal-id>@<env-id>'  'g-115-4173@zds-mind'  -- the form the board's own
+      '<world>:<goal-id>'   'acme-mind:g-115-4173'  -- handled since g-115-3659
+      '<goal-id>@<env-id>'  'g-115-4173@acme-mind'  -- the form the board's own
           `<agent>@<env-id>` addressing convention produces. Unhandled until
           g-115-8913: it carries no colon, so it fell through to the `g-`
           branch below and was hard-labelled "dangling".

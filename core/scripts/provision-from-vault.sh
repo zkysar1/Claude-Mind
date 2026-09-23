@@ -234,11 +234,32 @@ _vault_read() {
             "cat '$VAULT_REMOTE_PATH'"
         return $?
     fi
-    if [ -n "${VAULT_REMOTE_SHELL:-}" ] && [ -x "${VAULT_REMOTE_SHELL}" ]; then
+    if [ -n "${VAULT_REMOTE_SHELL:-}" ] && [ -f "${VAULT_REMOTE_SHELL}" ] \
+       && [ -r "${VAULT_REMOTE_SHELL}" ]; then
         # Canonical wrapper: it owns the transport and does not tell callers what
         # it is, which is the whole point -- when SSM moves to something else this
         # script needs no edit.
-        "$VAULT_REMOTE_SHELL" "cat '$VAULT_REMOTE_PATH'"
+        #
+        # READABLE, not executable, is the bar (g-335-1594, measured 2026-09-22 on
+        # cc-03). This gated on `-x` alone and therefore could not engage ANYWHERE
+        # on an own-cloud deployment: world/ is a mounted store that carries no
+        # exec bits, so every world/scripts/*.sh is mode 600 and every candidate
+        # wrapper failed the test. The fall-through printed "NO USABLE VAULT
+        # TRANSPORT ... COLD-NODE GAP: no surviving transport at all" -- a
+        # structural, unfixable-sounding diagnosis on a WARM box where SSM was
+        # working the whole time. A reader that cannot see must not report the
+        # most pessimistic verdict (guard-1753). chmod is NOT the fix: the mount
+        # does not keep the bit (rb-3034 -- exec bits propagate through git, and
+        # external stores stay machine-local).
+        # `-f` before `-r`, never `-r` alone: this path is caller-supplied and
+        # `[ -r dir ]` is TRUE for a directory (guard-2122). Dispatching a
+        # non-executable sibling through `bash` is the prescribed shape
+        # (guard-2271).
+        if [ -x "${VAULT_REMOTE_SHELL}" ]; then
+            "$VAULT_REMOTE_SHELL" "cat '$VAULT_REMOTE_PATH'"
+        else
+            bash "$VAULT_REMOTE_SHELL" "cat '$VAULT_REMOTE_PATH'"
+        fi
         return $?
     fi
     return 127

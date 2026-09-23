@@ -4269,6 +4269,23 @@ do_productivity_check() {
     # whole-file .history snapshot (810 MB of PUT bytes / 672 versions per 24h).
     python3 "$(_winpath "$SCRIPT_DIR/trigger-firings-flush.py")" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Whole-segment age-cap for the gate-firings store (g-358-10). The flush
+    # above WRITES today's date segment; nothing bounded the segments, because
+    # store-hygiene G5 keys on the legacy basename and jsonl_hygiene is
+    # record-level in every mode (cap|rotate|compact) — so a glob there would
+    # rewrite each expired segment to zero records and leave an empty file, not
+    # remove it. Placed here so the writer and its age-cap sit in one tick.
+    #
+    # REPORT ONLY, deliberately: no --apply, no --archive-dir. This lane
+    # DELETES, and the archive that archive-before-delete requires needs a cold
+    # home nobody has chosen yet (.history is blacklisted for this store —
+    # guard-3095 — so there is no recovery layer to fall back on). Until that
+    # choice is made this prints what WOULD expire, which is a true no-op today:
+    # measured on cc-04 2026-09-21, 36 segments present, oldest 2026-08-17,
+    # cutoff 2026-08-12, expired 0. The first segment expires 2026-09-26, and
+    # from then the log line is the signal that supply has arrived.
+    python3 "$(_winpath "$SCRIPT_DIR/gate-firings-segments-expire.py")" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # Citation-credit sweep (g-115-6948): converts commit-message rb-/guard-
     # citations (measured 84/day fleet-wide vs 1-7 explicit helpful events/day)
     # into times_inferred_helpful increments — the mechanical consultation-

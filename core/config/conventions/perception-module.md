@@ -1,7 +1,7 @@
 # Perception Module Convention
 
 Defines the unified perception interface for the portable cognition core. Every
-system in the product family (ayoai, claude-mind, zak-code) implements a
+system in the product family (the product runtime, the Mind framework, the vessel) implements a
 structurally identical pattern: an autonomous background process that (a) monitors
 external state, (b) normalizes the observation into a structured payload, and (c)
 delivers that payload to a cognition layer that never knows or cares where the
@@ -90,9 +90,9 @@ runtime's native notification mechanism.
 - **Delivery**: The bus receives the percept only when an event fires.
 - **Portability primitive**: `listen-signal(pattern) -> observation`
 - **Typical cadence**: `EVENT_DRIVEN`
-- **Examples**: file-touch signals in claude-mind, Vert.x event-bus consumers
+- **Examples**: file-touch signals in the Mind framework, Vert.x event-bus consumers
   triggered by external messages (e.g., `CommunicationPerceptionVerticle`
-  reacting to chat messages), lifecycle hooks in zak-code that fire on session
+  reacting to chat messages), lifecycle hooks in the vessel that fire on session
   events.
 
 ### 2.2 exec-script (active)
@@ -105,9 +105,9 @@ timer, a tick counter, or a throttle gate.
   nothing changed -- null percepts are NOT delivered to the bus).
 - **Portability primitive**: `exec-script(path, args) -> {stdout, exit_code}`
 - **Typical cadence**: `CONTINUOUS` (with per-module throttle)
-- **Examples**: ayoai verticles that run on the 3 Hz character-driver tick
+- **Examples**: product-runtime verticles that run on the 3 Hz character-driver tick
   (`SpatialPerceptionVerticle`, `BodyPerceptionVerticle`,
-  `EnvironmentPerceptionVerticle`), claude-mind's blocker-recheck script run at
+  `EnvironmentPerceptionVerticle`), the Mind framework's blocker-recheck script run at
   precheck cadence, any periodic health probe.
 
 ### 2.3 read-file (active)
@@ -122,8 +122,8 @@ the observation IS the file's contents, not the result of processing them.
 - **Portability primitive**: `read-file(path) -> content`
 - **Typical cadence**: `REQUEST_SCOPED` or `EVENT_DRIVEN` (triggered by a
   file-change signal)
-- **Examples**: zak-code's `PRE_LLM_CALL` hook reading SKILL.md or knowledge
-  files to inject as context, claude-mind's aspirations loop reading
+- **Examples**: the vessel's `PRE_LLM_CALL` hook reading SKILL.md or knowledge
+  files to inject as context, the Mind framework's aspirations loop reading
   `handoff.yaml` or `working-memory.yaml` at session start, any module that
   consumes state by reading a file.
 
@@ -172,8 +172,9 @@ the reference implementation for burst management.
 
 ### 3.3 REQUEST_SCOPED
 
-The module fires **once per cognition cycle** (once per LLM call in zak-code,
-once per iteration in claude-mind, once per think-step in ayoai). The cognition
+The module fires **once per cognition cycle** (once per LLM call in the vessel,
+once per iteration in the Mind framework, once per think-step in the product
+runtime). The cognition
 layer requests the observation; the module does not self-initiate.
 
 **When to use**: The observation is context for a decision the cognition layer
@@ -184,17 +185,17 @@ fires before every model completion, gathers context from hooks, and injects it
 as an ephemeral tail message.
 
 **Runtime cost**: Once per cognition cycle. The cost scales with cognition
-frequency, not world-state frequency. In ayoai (3 Hz think cycle), this is 3
-calls/second. In claude-mind (one iteration per minute to several minutes), this
-is effectively negligible. In zak-code (one LLM call per turn iteration), this
-matches the model-call rate.
+frequency, not world-state frequency. In the product runtime (3 Hz think cycle),
+this is 3 calls/second. In the Mind framework (one iteration per minute to several
+minutes), this is effectively negligible. In the vessel (one LLM call per turn
+iteration), this matches the model-call rate.
 
 ### 3.4 Design Rationale: Why Three Cadences, Not One
 
 A single cadence would force every system to adopt a rhythm foreign to its
 runtime.
 
-- Forcing `CONTINUOUS` on claude-mind would mean polling the agent's session
+- Forcing `CONTINUOUS` on the Mind framework would mean polling the agent's session
   directory at 3 Hz -- wasteful when the agent's cognition cycle is measured in
   minutes, and the file-touch + poll-loop mechanism already provides efficient
   event-driven wake.
@@ -434,9 +435,9 @@ New packs (e.g., `arc-agi-2d` for ARC-AGI-3 grid-based perception, a
 ## 8. Success-Rate Tracking (Per-Module Health)
 
 Each perception module tracks its own operational health, mirroring the
-per-skill success-rate pattern that independently converged in both ayoai
-(`IntelligenceModule.java` lines 14-15: `execution_history` with
-`success_rate` and `reconsolidation_trigger`) and claude-mind
+per-skill success-rate pattern that independently converged in both the product
+runtime (`IntelligenceModule.java` lines 14-15: `execution_history` with
+`success_rate` and `reconsolidation_trigger`) and the Mind framework
 (`aspirations/SKILL.md` front matter: `execution_history`).
 
 ```

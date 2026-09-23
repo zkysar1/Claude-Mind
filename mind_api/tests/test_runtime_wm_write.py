@@ -490,6 +490,47 @@ def test_drain_goals_removes_only_matching(running_daemon):
     assert [e["goal_id"] for e in survivors] == ["g-2-02"], survivors
 
 
+def test_drain_goals_accepts_goal_as_an_alias_for_goal_id(running_daemon):
+    """REACHABLE RED (). The slot has no schema and two writer shapes
+    reached it. Before this, a `goal`-keyed entry could never be subtracted.
+
+    This is a WEDGE, not a leak: measured on the live lane 2026-09-21 (alpha,
+    cc-04) the 26 alias-only goals occupied oldest-first ranks 0-13 — the whole
+    HEAD — so the bounded drain re-selected them every pass and removed nothing.
+    At k=3 and k=10 it removed ZERO and the head never advanced."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "spark_capture", [
+        {"goal": "g-9-01", "note": "alias-keyed — unsubtractable before the fix"},
+        {"goal_id": "g-9-01", "note": "canonical key, same goal"},
+        {"goal": "g-8-02", "note": "alias-keyed, NOT in the drained set"},
+    ])
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "spark_capture"},
+                         json.dumps(["g-9-01"]))
+    assert status == 200, body
+    verdict = json.loads(body)
+    # BOTH shapes of g-9-01 go; the unrelated alias entry stays.
+    assert (verdict["removed"], verdict["kept"]) == (2, 1), verdict
+    survivors = _read_wm(agent_dir)["slots"]["spark_capture"]
+    assert [e.get("goal") for e in survivors] == ["g-8-02"], survivors
+
+
+def test_drain_goals_prefers_goal_id_when_an_entry_carries_both(running_daemon):
+    """The alias must not become a second, looser matcher. When both keys are
+    present, `goal_id` decides — so widening the read cannot make the drain
+    remove an entry its canonical key says to keep."""
+    project_root, port = running_daemon
+    agent_dir = project_root / "agents" / "alpha"
+    _seed(port, "spark_capture", [
+        {"goal_id": "g-keep-01", "goal": "g-drain-02", "note": "conflicting keys"},
+    ])
+    status, body = _post(port, "/v1/wm/drain-goals", {"slot": "spark_capture"},
+                         json.dumps(["g-drain-02"]))
+    assert status == 200, body
+    assert json.loads(body)["removed"] == 0, "goal_id must outrank the alias"
+    assert len(_read_wm(agent_dir)["slots"]["spark_capture"]) == 1
+
+
 def test_drain_goals_keeps_entries_it_cannot_classify(running_daemon):
     """An entry the classifier cannot classify must not be destroyed by it."""
     project_root, port = running_daemon

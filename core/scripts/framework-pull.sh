@@ -6,9 +6,9 @@
 #
 #   bash core/scripts/framework-pull.sh                       # plan (default); source repo
 #                                                             # resolved from FRAMEWORK_SOURCE_REPO
-#                                                             # or the sibling ../claude-mind
-#   bash core/scripts/framework-pull.sh --source-repo ../claude-mind --json
-#   bash core/scripts/framework-pull.sh --source-repo ../claude-mind --adopt
+#                                                             # or the sibling ../<staging-clone>
+#   bash core/scripts/framework-pull.sh --source-repo ../<staging-clone> --json
+#   bash core/scripts/framework-pull.sh --source-repo ../<staging-clone> --adopt
 #   bash core/scripts/framework-pull.sh --record-installed v2.12.62 [--verified]
 #                                                             # git-fed shape (addendum h): record
 #                                                             # the tag merged in place; no source repo

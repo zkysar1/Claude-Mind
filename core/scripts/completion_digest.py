@@ -792,7 +792,21 @@ def render(data: dict, *, agent: str, since: datetime | None, now: datetime, not
     # active_asps, once, for both twins (guard-4392, ). Re-adding
     # `if a["total"]` would restore the two-copies shape that let the twins diverge.
     act = list(data["active_asps"])
-    act.sort(key=lambda a: (-a["window_done"], -(a["done"] / a["total"])))
+    # ZERO-GUARD THE DENOMINATOR ( fresh-eyes, 2026-09-22). gather()'s
+    # `if _total:` filter does hold today — measured, 25/25 live rows came from the
+    # counter branch, which requires _ctr_total > 0 — so this is LATENT, not live.
+    # It is guarded anyway because this is the file's own recently-fixed failure
+    # class:  hardened a read that RAISED and killed the whole digest,
+    # and an unguarded division here kills it the same way. Measured asymmetry that
+    # found it: inject one {total: 0} row into real gathered data and render()
+    # raises ZeroDivisionError while render_html() returns fine — the HTML twin
+    # guards at both its sort (`-a["done"]`, no division) and its bar
+    # (`if a["total"] else 0`), and so does the markdown line ~10 below. This sort
+    # was the only unguarded division in either renderer, and the comment above it
+    # reasons about the FILTER being shared while the SORT was never compared.
+    # Tuple ORDER is unchanged on purpose (guard-5471): window_done stays first, so
+    # the guard is a tie-break default, never a reordering of the ranking.
+    act.sort(key=lambda a: (-a["window_done"], -(a["done"] / a["total"]) if a["total"] else 0.0))
     L.append("## In progress")
     # Say what the fraction MEANS (guard-5368): the authoritative counter's
     # denominator includes goals that ended skipped/expired/superseded while its

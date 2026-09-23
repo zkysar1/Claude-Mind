@@ -157,6 +157,58 @@ def _load_probe_aliases():
     return aliases if isinstance(aliases, dict) else {}
 
 
+def _load_monitor_probe_stems():
+    """Return the script stems registered as MONITOR probes (excluded from discovery).
+
+    Two incompatible probe contracts shared one filename namespace with no
+    arbitration between them:
+
+      infra-health (this file, see _run_probe_script): a probe must exit 0 AND
+        print parseable JSON on stdout, else the component records status=failed.
+      monitor-probes (core/config/monitor-probes.yaml, verbatim): "a script that
+        exits 0 when clean and NON-ZERO when it trips; its combined stdout+stderr
+        is captured as the trip evidence" — free text BY DESIGN, because the text
+        IS the evidence a human reads.
+
+    So a monitor probe obeying its OWN contract prints prose on a clean run, and
+    this file parsed that prose as invalid JSON. Enrollment was by FILENAME
+    through a bare glob with no opt-out, so such a probe was force-enrolled and
+    recorded FAILED on every healthy run: last_success could never leave null --
+    not a flake but a structural impossibility -- while the streak walked toward
+    the consecutive_failures=3 owner alert about a component that was working.
+    Measured 2026-09-21: the stored failure reason contained the probe's own
+    word "CLEAN".
+
+    REGISTRATION IS THE DISCRIMINATOR, NOT THE FILENAME. A script listed in the
+    registry's `probes:` block has declared which contract it obeys, so excluding
+    exactly that set fixes the CLASS: no future monitor probe can be
+    force-enrolled whatever it is named, and no naming taboo has to be remembered
+    by the next author. The rejected alternative was renaming the probe out of
+    the `probe-*.sh` namespace, which repairs one instance and leaves the trap
+    armed.
+
+    Returns an empty set when the registry is missing or malformed, so discovery
+    is unchanged wherever no monitor probe is registered. (g-249-48.)
+    """
+    registry = PROJECT_ROOT / "core" / "config" / "monitor-probes.yaml"
+    try:
+        import yaml
+        with open(registry, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception:
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    stems = set()
+    for entry in data.get("probes") or []:
+        if not isinstance(entry, dict):
+            continue
+        script = entry.get("script")
+        if isinstance(script, str) and script.strip():
+            stems.add(Path(script.strip()).stem)
+    return stems
+
+
 def _discover_probe_components():
     """Glob world/scripts/probe-*.sh and return the set of component names.
 
@@ -171,14 +223,27 @@ def _discover_probe_components():
     components exist; YAML-registration becomes a reflection of reality
     rather than a drift-prone manual list. The alias keeps discovery agreeing
     with the name a probe script records under, so no shadow component is derived.
+
+    SCOPED (g-249-48): the SSOT is the existence of an INFRA-HEALTH probe, not of
+    any file matching the glob. A script registered in core/config/monitor-probes.yaml
+    obeys the incompatible monitor-probe contract and is skipped here — see
+    _load_monitor_probe_stems for why enrollment by filename recorded healthy
+    components as failed.
     """
     probe_dir = WORLD_DIR / "scripts"
     if not probe_dir.is_dir():
         return set()
     aliases = _load_probe_aliases()
+    monitor_stems = _load_monitor_probe_stems()
     discovered = set()
     for script in probe_dir.glob("probe-*.sh"):
         stem = script.stem
+        if stem in monitor_stems:
+            # Registered MONITOR probe: exits non-zero to TRIP and reports its
+            # evidence as prose, so this file's exit-0-plus-JSON contract would
+            # record every CLEAN run as failed (g-249-48, see
+            # _load_monitor_probe_stems).
+            continue
         if stem.startswith("probe-"):
             name = stem[len("probe-"):]
             if name:

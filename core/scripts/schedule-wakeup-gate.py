@@ -31,6 +31,18 @@ FIRST (see .claude/rules/stop-hook-compliance.md), so that signal is the
 discriminator -- present means a genuine stop is in flight and the cancel is
 approved.
 
+THIRD FAILURE THIS GATE COVERS (2026-09-21, sera) -- arming the net with no
+loop under it. The net OUTLIVES the loop it was armed for: after a /stop the
+agent is IDLE, and a leftover sentinel still fires. The turn that receives it
+re-arms FIRST by rule (rb-4345 -- restore the net before any loop-entry work
+that could fail), and only THEN reaches the Phase -1.5 state gate, which
+refuses because the agent is not RUNNING. So the turn re-arms the very net
+whose firing it could not use, and 600s later does it again: a loop with no
+exit, made of two steps that are each correct on a live loop. The re-arm
+ordering is right and stays; what was missing is that an IDLE agent has
+nothing to resurrect. State is the discriminator here exactly as
+`stop-requested` is above.
+
 Fail-open contract (CRITICAL — do not change without revisiting the trade):
 this gate exists to catch a known LLM mistake, not to be a critical-path
 dependency. Any parse/IO/logic error -> approve. A broken gate is recoverable
@@ -93,6 +105,32 @@ STOP_DENY_REASON = (
 )
 
 
+ARM_DENY_REASON = (
+    "ScheduleWakeup re-arm rejected: this is the autonomous-loop deadman "
+    "sentinel, and agent-state is not RUNNING -- there is no loop under the "
+    "net to resurrect.\n\n"
+    "A net outlives the loop it was armed for. After a /stop the agent is "
+    "IDLE, but a sentinel armed before it still fires; the turn that receives "
+    "it re-arms first by rule and only then reads the state gate, which "
+    "refuses. Arming again from there re-enters the same turn forever "
+    "(measured 2026-09-21).\n\n"
+    "What to do instead:\n"
+    "  - Nothing. You are IDLE: the loop is stopped, the net protects nothing, "
+    "and this turn ends normally. In assistant or reader mode, answer the user "
+    "and stop -- there is no loop to keep alive.\n"
+    "  - Waiting on something EXTERNAL (a CI run, a deploy)? That is a "
+    "legitimate wakeup, but give it its own natural-language prompt; the "
+    "sentinel means loop-continuation and nothing else.\n"
+    "  - Meant to resume autonomous work? That is the USER's /start, which "
+    "sets agent-state to RUNNING; this gate approves the sentinel from there.\n\n"
+    "See .claude/rules/schedule-wakeup-correctness.md (Re-arm FIRST on "
+    "resurrection)."
+)
+
+
+LOOP_SENTINEL = "<<autonomous-loop-dynamic>>"
+
+
 def _session_dir(session_id):
     """The bound agent's session/ dir, or None.
 
@@ -149,6 +187,49 @@ def _cancel_would_strand_loop(tool_input, session_id):
         return False                                    # outcome 2 (fail-open)
 
 
+def _arm_would_resurrect_nothing(tool_input, session_id):
+    """True when the deadman sentinel is being armed on an agent with no loop.
+
+    The mirror image of `_cancel_would_strand_loop`: that one refuses a CANCEL
+    while the loop is live, this one refuses an ARM while it is not. They read
+    the same one file, and between them the net exists exactly when a loop does.
+
+    Every outcome of this test is enumerated (guard-3328):
+      1. `stop` truthy -> False. This call is a CANCEL, not an arm: the tool's
+         own contract is that when `stop` is true "all other fields are
+         ignored", so a sentinel sitting in `prompt` there is vestigial --
+         usually the model re-sending its previous args. Reading it as an arm
+         DENIES a legitimate cancel, and cancelling a leftover net from IDLE is
+         exactly the manual remedy for the bug this guard exists to prevent.
+         `_cancel_would_strand_loop` owns every stop-bearing call.
+      2. prompt is not the sentinel -> False (a /loop continuation or an
+         external-wait wakeup is the user's or the world's business, never the
+         loop's net; only the sentinel claims to resurrect the loop)
+      3. agent unresolvable / agent-state unreadable -> False (fail-open).
+         Absence of the file is UNINITIALIZED and lands here, so the last
+         outcome really is IDLE: `session.py` VALID_STATES is {RUNNING, IDLE}.
+      4. agent-state == RUNNING -> False (a live loop -- this is the rb-4345
+         re-arm the deadman design REQUIRES, and blocking it would wedge the
+         very remedy the other deny message hands out)
+      5. agent-state is anything else -> True (DENY -- IDLE has no loop, so the
+         net would fire into a Phase -1.5 refusal that re-arms it again)
+    """
+    if not isinstance(tool_input, dict) or tool_input.get("stop"):
+        return False                                    # outcome 1
+    if tool_input.get("prompt") != LOOP_SENTINEL:
+        return False                                    # outcome 2
+    try:
+        session = _session_dir(session_id)
+        if session is None:
+            return False                                # outcome 3
+        state_file = session / "agent-state"
+        if not state_file.is_file():
+            return False                                # outcome 3
+        return state_file.read_text(encoding="utf-8").strip() != "RUNNING"
+    except Exception:
+        return False                                    # outcome 3 (fail-open)
+
+
 def main():
     payload = stdin_json_or_approve()
     if not isinstance(payload, dict):
@@ -162,6 +243,9 @@ def main():
 
     if _cancel_would_strand_loop(tool_input, payload.get("session_id", "")):
         emit_deny(STOP_DENY_REASON)
+
+    if _arm_would_resurrect_nothing(tool_input, payload.get("session_id", "")):
+        emit_deny(ARM_DENY_REASON)
 
     if is_bad_slash_prefix(prompt):
         emit_deny(DENY_REASON)

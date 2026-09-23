@@ -131,6 +131,50 @@ When forming a negative conclusion about capabilities, features, or possibilitie
    `--contains "fixture-leak"` query was read as corroboration; it only ever searched
    titles. Caught by the goal-duplication gate, not by the agent.
 
+7. **Search the TEST TREE — a DEMONSTRATION lives where tests live, not where
+   features live** (added 2026-09-22, alpha). Steps 1-6 search the stores that hold
+   what the system *is*: tree nodes, adjacent stores, code, the goal queue. A goal
+   whose outcome asks for a **demonstration** — "shown by a two-sided control",
+   "prove the regression cannot recur", "pin this invariant" — is asking for
+   something whose only natural home is `core/scripts/tests/`, `mind_api/tests/` or
+   `core/tests/gates/`. None of steps 1-6 reaches there, so "the control does not
+   exist yet, I must write it" is a structurally guaranteed false negative for every
+   demonstration-shaped outcome.
+
+   It is worse than an ordinary blind spot, because a test is routinely authored
+   under whatever goal was open when the defect was found — **not** the goal whose
+   outcome it satisfies. So the test carries a SIBLING goal's id in its docstring
+   while asserting THIS goal's defect in its assertion messages, and every id-keyed
+   read (`--title-contains`, `gh pr list --search <goal-id>`, the store's terminal
+   fields) misses it by construction.
+
+   Before writing any demonstration, control, or regression guard:
+   ```bash
+   # grep the DEFECT'S OWN VOCABULARY, never the goal id — the id is the thing
+   # that will be wrong. Nouns from the outcome text, not your paraphrase of it.
+   grep -rln "<defect-noun>\|<mechanism-noun>" core/scripts/tests/ mind_api/tests/ core/tests/gates/
+   # then READ the hits' docstrings AND assertion messages, and RUN the file —
+   # a test that exists is not a test that passes (verify-before-assuming).
+   ```
+   Grep assertion messages, not only names: a test file named for one goal states
+   the defect it actually pins in the `assert ... , "..."` strings.
+
+   Canonical incident (2026-09-22, alpha, g-115-9876). Outcome 2 asked for "a
+   two-sided control (the failing condition reproduced, then shown to no longer
+   produce a tombstone)". `core/scripts/tests/test_body_staged_consumed_tombstone.py`
+   already held all three arms — the failure injection, the guard-4166 positive
+   control, and an ordering witness — passing 11/11, with its failure literally
+   labelled `"simulated non-persisting reducer (cc-07 shape)"` after the exact
+   incident the goal was filed about, and one assertion reading `"THAT IS THE
+   g-115-9876 DEFECT"`. Its module docstring names **g-115-9750 outcome 3**, so it
+   was never credited to g-115-9876, which then sat HIGH and open for 208 hours with
+   its cheapest outcome already satisfied. One grep for `tombstone` in the test tree
+   found it in seconds.
+
+   Same series as the read-set additions rb-8966 (sixth surface: the convention
+   store) and guard-4551 (`world/conventions/` must be in the search set). This is
+   the seventh, and it is the one that fires on *outcomes*, not on features.
+
 ## Trigger Phrases
 
 Apply this protocol whenever the agent is about to output or act on:
@@ -149,6 +193,13 @@ Apply this protocol whenever the agent is about to output or act on:
   description and nowhere else. Every phrase above is a negation about a DECISION
   rather than a CAPABILITY, which is why the capability-shaped phrases in this list
   do not fire on it.)
+- "No control/test/demonstration exists for this yet" / "I need to write a test to
+  prove this" / "this invariant is unpinned" / "nothing reproduces the failing case"
+  (→ rule 7 above: grep the TEST TREE for the defect's own vocabulary, never the
+  goal id. This is a negation about EVIDENCE rather than a capability or a decision,
+  so neither set of phrases above fires on it — and the artifact that falsifies it
+  is routinely filed under a sibling goal's id, which is precisely what makes every
+  id-keyed read miss it.)
 
 ## Scope the search to the REPOS you actually searched, and name them
 

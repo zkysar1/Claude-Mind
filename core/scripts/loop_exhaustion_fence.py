@@ -23,7 +23,7 @@ THE PREDICATE IS BEHAVIOURAL, NOT A BUDGET READ, AND THAT IS THE DESIGN.
 The obvious sensor -- context-budget-status.py's zone/headroom -- is exactly
 what failed in the incident: it read `fresh` with `headroom_tokens: 479998`
 right up to hard exhaustion because it was computing off a dead half of the
-record.  Making that sensor trustworthy is the SIBLING goal (g-115-8310) and is
+record.  Making that sensor trustworthy was the SIBLING goal (closed 2026-09-04) and is
 deliberately out of scope here.  So this fence keys on an observable the sensor
 cannot lie about: N consecutive stop-hook BLOCKs for one sid with the execution
 diary's mtime frozen throughout.  A loop that is advancing writes its diary

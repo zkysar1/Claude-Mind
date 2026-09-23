@@ -584,3 +584,274 @@ loop; siting diagnosis in rb-11314, remedy filed as g-115-10302. (2) Narrative-c
 misses (instance for g-115-10108); `2026-08-03_sanitized-script-error` is genuinely bare.
 (3) **`--replay-candidates` is pre-filtered to due-only, so NO due-RATE is computable from
 it** — do not derive one.
+
+## Run 76 — 2026-09-21, zeta, hostname cc-02, `uname -r` 6.8.0-139-generic (own-cloud)
+
+Logged from the `force_metric_encoding_pending` gate (2 distinct numeric findings in the
+close note with no tree edit since `selected_at`) — the readings belong HERE, in the
+instrument ledger the SKILL.md cites, not in a tree node.
+
+**Pool 850 → batch 10.** Stratified: 5 band-2 + 5 band-1, ordered by the PRIORITY RULES
+with `replay_count` used only to break ties WITHIN a band, and stratified across rc rather
+than sorted by it. Band 2 was again under N — **a POOL fact, never a corpus fact**
+(guard-6131): high-surprise records are replayed, encoded and drained OUT of the pool,
+which is what creates the ceiling.
+
+**Field control re-run, and the alias trap still holds.** `surprise` present on 784 records;
+`surprise_level` on 2. Keying on the alias would have zeroed rules 1 and 2 and fallen
+through to rule 5 — a batch of routine CONFIRMED fillers that looks like a normal replay.
+No error, no empty result.
+
+**0 of 10 bare narratives — AND THAT IS THE UNREMARKABLE READING, NOT A WIN.** The SKILL.md's
+own caveat prescribes comparing a violation-first batch against the **CORRECTED row (15.0%
+empty)**, not the pool row (20.9%) or the resolved+archived row (29.2%). At 15.0% over 10
+records the expectation is ~1.5 bare, so 0/10 is within ordinary variation and is NOT
+evidence the resolution-evidence gate improved. The caveat correctly predicted its own
+reading; this run CONFIRMS it rather than adding anything. Do not cite 0/10 as a gate
+improvement.
+
+**5 of 7 non-CONFIRMED records failed in the claim's OWN terms**, not against the world —
+a direct corroboration of guard-2857 ("most of my CORRECTED hypotheses are corrected by
+their own specification, not by the world"). Strengthened (`times_helpful`), not re-filed.
+
+**Step 3.5 UNROUTABLE for the second consecutive run.** Declined on existing owners
+g-115-7897 and g-115-5449 rather than filing — per the run-75 note, if the formation-shape
+observation recurs a THIRD time, check whether those two have closed instead of filing.
+
+**Step 3.6 eligibility genuinely 0** — re-checked this run rather than inheriting either
+prior reading, which the run-75 next-run list specifically required.
+
+**Step 4: zero pattern outcomes.**
+
+**Step 4.5 stamp: 10 stamped, 10 verified, 0 failed, `next_review` 2026-09-28**, via
+`replay-stamp-verify.sh` with per-id verification. **guard-1755 reproduced again**: the
+`--replay-candidates` read-back reports M=0 on a fully successful stamp — the records have
+left the due-only candidate set by construction. Verify per-id with
+`pipeline-read.sh --id`, never off the candidate endpoint.
+
+### Cycle 91 — 2026-09-21 (foxtrot, hostname LAPTOP-3IOFCNEO, uname -r 6.18.33.2-microsoft-standard-WSL2, --sharp-wave)
+
+Pool 840 (5,759,691 B) / scoreable 774 / eligible after filters 774 / replayed 10 / stamped 10 / **verified 10** (per-id `pipeline-read.sh --id`, VALUES compared per rb-1502 — not `--replay-candidates`, which is guaranteed to report 0 on a successful stamp, guard-1755).
+
+**HEADLINE: NO TITLE-DERIVED MARKER SURVIVED THE FLOOR, AND BOTH CONTROLS WERE CLEAN. Second consecutive cycle whose batch marker is refuted — that is guard-2129 working, not a barren cycle.** All markers derived from `title` only (never the resolution narrative: that text is written after and about the outcome, so mining it is circular and de-circularization does NOT catch it, guard-4758). De-circularized by excluding all 10 batch rows from both arms (1117 -> 1107). Exceedance = fraction of 4,000 permutations at the marker's OWN group size with |perm_delta| >= |delta|.
+
+| marker | n | rate vs rest | delta | exceedance | median abs delta | verdict |
+|---|---|---|---|---|---|---|
+| scope-generalization (beyond/across/fleet/everywhere/all-/-wide) | 87 | 43.7% vs 42.1% | +1.6pp | **82.3%** | 4.1pp | NOTHING — and BELOW the median, i.e. not close |
+| negation (not/without/no-/never/dont/doesnt) | 50 | 36.0% vs 42.5% | −6.5pp | 38.9% | 4.4pp | NOTHING |
+| conjunction (`-and-`) | 1 | — | — | — | — | too small; pure selection artifact if pursued |
+| CONTROL id[11:] checksum (date-FREE) | 227 | — | −3.7pp | 32.5% | — | ok, no leak |
+| CONTROL id[:10] date-only (>=2026-08-01) | 478 | — | −4.3pp | 15.6% | — | ok, date is not carrying it this cycle |
+
+READ THE SCOPE ROW CAREFULLY — IT DOES NOT FALSIFY guard-6629. Cycle 90 nucleated guard-6629 for the SCOPE axis from the *chronic* path (4 records each CORRECTED 3-4x). This row asks a different question: does scope LANGUAGE IN THE TITLE predict CORRECTED across 1,107 corpus records? It does not (+1.6pp, exceedance 82.3%). Both can be true, and the operational consequence is specific: **guard-6629's population is not reachable by title mining and must keep coming from Step 3.6's chronic sweep.** Do not "improve" the scope marker next cycle; it is measuring a different thing.
+
+**NEW NUMBER — THE POOL/CORPUS BASE-RATE DIVERGENCE IS NOW MEASURED, NOT JUST ASSERTED. 16.3pp.** Step 3's header states that the pool is unrepresentative of the corpus because it excludes `encoded_via_chronic` (a 100%-CORRECTED population); it has never carried the size of that gap. This cycle, same run, same instant:
+- POOL CORRECTED rate = **26.2%** (200 CORRECTED / 762 CONFIRMED+CORRECTED, of 840 records; the pool also carries EXPIRED 8 and UNRESOLVABLE 62, which is part of why)
+- CORPUS CORRECTED rate = **42.5%** (475/1117 scoreable, of the 1,844-record deduped resolved+archived union)
+So a batch finding re-measured against the POOL is still being compared against a base rate 16.3pp too LOW, which INFLATES any apparent enrichment a second time. Layer 2 of guard-2144 has a number now. Name the population on every rate (the corpus is `--stage resolved` UNION `--stage archived`, deduped: resolved alone was 79,343 B against archived's 10,098,873 B, i.e. a few percent — the survivorship filter that header warns about, quantified).
+Batch vs corpus this cycle: 80.0% vs 42.5% = **+37.5pp**, expected BY CONSTRUCTION and not a finding.
+
+TWO POOL FACTS, both matching what the instrument predicts:
+- **`surprise >= 7` is ZERO in the pool** (`>=5` is 226 of 774). Band 1 was empty and the entire batch came from band 2. This is a POOL fact, never a corpus one (guard-6131): high-surprise records get replayed, encoded, and drained OUT. Do not read it as a calm corpus.
+- **Step 3.6 chronic queue is EMPTY** — 0 records at rc>=3 CORRECTED not yet `encoded_via_chronic`, against cycle 90's FOUR. Also 0 at the rc>=5 archive cap. Cycle 90 predicted the stratum would REFILL between cycles because records age into rc>=3 while carrying CORRECTED; it has not refilled yet. That prediction is NOT yet falsified — one empty reading is a moment, not a property (rb-10209), and cycle 89 already made exactly this mistake by writing a moment down as a forecast. Recording it as a data point, not a trend.
+
+STRATIFICATION WORKED AS PRESCRIBED: band 2 (226 members) was stratified across `replay_count` rather than sorted by it, giving batch rc spread {0:4, 1:3, 2:3}. Sorting rc-first would have discarded the enrichment entirely (the never-replayed stratum is surprise-poor by construction).
+
+NARRATIVE QUALITY: **0 of 10 bare** (10/10 parsed, count asserted against ids requested before any conclusion was drawn). Expected ~1.5 for a CORRECTED-heavy batch against the CORRECTED row's 15.0%, so 0/10 is unremarkable and is NOT evidence the resolution-evidence gate improved.
+
+## Run 77 — 2026-09-22, zeta, hostname cc-02, `uname -r` 6.8.0-139-generic (own-cloud)
+
+Pool 846 (archived 829, resolved 17), 5,793,205 B, rc=0. Record keys printed before any
+field read. Pipeline counts reproduced first (guard-1835 step 1): discovered 11 / active
+138 / measurement-pending 9 / resolved 17 / archived 1834 = 2009.
+
+**RULE 2 IS EMPTY AGAIN — 0, not run 76's 5, and this is a POOL FACT, NOT A CORPUS FACT
+(guard-6131).** Pool surprise ceiling is 6: s=6 132 · s=5 98 · s=4 394 · s=3 78 · s=2 70 ·
+s=1 4 · s=0 4, null 66. Rule 2 has now read empty(72) → empty(73) → 6(74) → 5(76) → 0(77),
+so neither "moot" nor "live" is inheritable in either direction — check it first, every run.
+The whole batch was therefore band 1 (s>=5, n=230), stratified across `replay_count` x
+`surprise` with oldest `formed_date` within stratum: rc coverage {0:4, 1:2, 2:2, 3:1, 4:1}.
+Outcome mix REPORTED not selected on: CORRECTED 6 / CONFIRMED 4.
+
+**TWO POOL RECORDS WERE EXCLUDED FROM SELECTION DELIBERATELY, AND THE EXCLUSION IS THE
+FIRST FINDING.** `2026-07-29_census-a` and `2026-07-29_census-b` are TEST FIXTURES
+(`category: test-cat`, title "Test hypothesis for surprise derivation on write", author /
+source_goal / resolved_by all null) carrying `surprise: 6` — so they sit in BAND 1, the
+scarce enriched band, every cycle. census-a is at rc=4 and was the oldest member of the
+rc=4 s=6 stratum, i.e. it would have won a slot on the stated rule and burned its FINAL
+replay on a fixture. The surprise of 6 is not an accident: the fixture exists to test
+surprise DERIVATION ON WRITE, and the deriver gave it a 6. Separately, 8 pool records carry
+`outcome: null` at stage=archived (6 of them `arc-solver`, 2026-07-12/13) — archived without
+ever resolving, so there is no outcome to replay. 10 of 846 = 1.2% of the pool cannot pay.
+
+**THE rc>=5 CAP WORKS AT THE SOURCE, AND STEP 1's LLM-SIDE REMEDY IS DEAD CODE FOR 98% OF
+THE POOL.** Run 74 handed forward "ARCHIVE 2026-06-25_delta-g00103 — it is at rc=5". It is
+gone from the pool and max rc is now 4 (16 records sit at rc=4). Reading the endpoint rather
+than inferring: `mind_api/src/world/pipeline.py` `replay_candidates` carries a source-level
+`int(replay_count) >= 5: continue` added by **g-115-2509**, whose comment states the reason
+verbatim — "For already-archived records the LLM-side remedy (pipeline-move to archived) is
+a no-op". The pool is 829/846 = 98.0% already `stage: archived`, so Step 1's
+`pipeline-move.sh {id} archived` is defense-in-depth only. CONSEQUENCE WORTH CARRYING: a
+record at rc=4 is on its LAST replay — the source filter retires it permanently at 5. Weigh
+that before spending a slot on one.
+
+**THE RUN'S MAIN RESULT: THE "rationale WINNER ⇒ CHECK THE UNCHAINED KEYS ⇒ BARE" RULE
+PRODUCES FALSE BARES, AND THE UNCHAINED-KEY CHECK CANNOT CATCH THEM.** Both of this batch's
+two `rationale` winners came back with NO unchained key holding content — the skill's
+prescribed probe says BARE for both. Both are wrong. `2026-07-27_guardrail-retire-rate-
+stays-near-zero` carries its full resolution narrative APPENDED INTO `rationale` under a
+`=== RESOLVED CORRECTED 2026-08-26 ===` marker; `2026-07-17_ls20-episode-varying-conversion`
+carries its resolution as plain prose with NO marker at all ("SECONDARY 0.816 <= run-4's
+0.901 -> CORRECTED, variety family exhausted", plus an OFF-invariance control and an
+evidence commit). The lesson is INSIDE the field the rule tells you to distrust.
+Measured pool-wide: 73 records resolve to `rationale`. A marker regex
+(`=== RESOLVED` / `RESOLVED <OUTCOME>`) finds **3** of them — and misses the 07-17 record,
+so the marker is one writing convention among several and cannot be the detector. Widened to
+"the rationale text contains the record's OWN outcome token": **26 of 73 = 35.6%**, against a
+BASE-RATE CONTROL of 110 of 607 = 18.1% on records whose chain winner IS a real outcome key
+(a formation rationale may legitimately name a possible outcome). Enrichment +17.5pp, so the
+defensible claim is **~13 net (26 gross) of 73 rationale-winners are NOT bare** — against a
+rule that calls all 73 bare. The pool's "genuinely bare" rate is therefore OVERSTATED by the
+current read-side discipline, and that rate is the number the whole Step 2 comment block is
+about. Concrete instance for **g-115-10108**, which owns the helper fix.
+
+**FALSIFIED BEFORE IT REACHED ANY STORE — `reasoning` MUST NOT JOIN NARRATIVE_CHAIN.** The
+07-27 record carries a non-empty `reasoning` key absent from both the chain and this skill's
+unchained list, which reads as an obvious eleventh link. Printing its CONTENT first: it opens
+"PREMORTEM. Strongest reason wrong: ..." — a FORMATION-time field, the exact hazard
+guard-2615 / guard-3980 name for `rationale`. Adding it would manufacture documented-looking
+bares. Corpus incidence is negligible anyway: 15 of 846 carry `reasoning`, only 2 of those
+are chain-rationale/NULL. This is run 71's named error class (reading a field off a surface
+whose semantics were assumed) presenting for the fourth consecutive run, and run 71's own
+remedy — probe the shape before reading — is what caught it.
+
+**STEP 3.6 ELIGIBILITY = 1** (not run 76's 0, not run 75's 2 — re-checked, inherited neither):
+`2026-07-30_split-without-reduce-recurs`, rc=3, s=6, system-behavior, CORRECTED. Positive
+control on the near-zero: rc>=3 total 69, of those CORRECTED 1, of those already
+`encoded_via_chronic` 0 — so eligibility is bounded by the CORRECTED-within-chronic rate, not
+by an encoding backlog. OVERLAP branch taken, nucleated nothing: **guard-886** is the exact
+twin ("predictions that a known framework error/bug will PERSIST ... have been CORRECTED
+repeatedly"), surfaced by the MECHANISM query, not the SUBJECT one (the subject query
+returned tree/retrieval guardrails and nothing about prediction shape). guard-1105 is its
+mirror for durability claims, and rb-11119 already covers the batch's arc/ls20 member.
+
+**AND THE STEP 3 PATTERN IS guard-886 QUANTIFIED — WHICH SHOWS guard-886 IS OVER-STRONG.**
+Four of the six CORRECTED records share one FORMATION-time shape: each predicted an
+observed-bad condition would PERSIST while naming, in its own claim, a remediation already in
+flight (g-115-3571, g-115-3553, the sq-009 gate). Non-circular by construction — the
+condition is readable before the outcome. Re-measured against the pool per guard-2129 (the
+batch is band-1 and CORRECTED-enriched by +39.8pp, so no batch-scoped rate may stand):
+detector = persistence language in title+claim+position+rationale+resolution_criteria AND a
+`g-NNN-NN` id in the same text. Over 767 scoreable records, base CORRECTED 25.9%:
+
+| group (persistence, names-goal-id) | n | CORRECTED |
+|---|---|---|
+| (True, True)   | 287 | **30.3%** |
+| (False, True)  | 320 | 24.1% |
+| (False, False) | 101 | 23.8% |
+| (True, False)  |  59 | **18.6%** |
+
+Delta +4.4pp; size-matched permutation floor (4000 draws) median +0.2pp, p95 +3.3pp,
+exceedance **p=0.019**; presence control 287/287. It CLEARS the floor — and it is still too
+weak to act on: a +4.4pp shift on a group covering 37% of the corpus is a nudge, not a veto,
+and guard-886's own text says "refuse confidence > 0.5". That over-statement is independently
+corroborated by the guardrail's own telemetry: **times_noise 42 vs times_helpful 1**. Two
+unrelated instruments agreeing that a rule is over-strong is the useful result here.
+Note the interaction: persistence language ALONE is ANTI-predictive (18.6%, BELOW base) — the
+lift lives entirely in the CONJUNCTION with a named in-flight fix.
+**ENCODED NOTHING NEW** (the detector was chosen after seeing the batch, so it is selected on
+its own discovery set; and 6 of 10 batch members fall inside a group that large by default).
+guard-886's `rule` is `immutable_field` at the store — the store refused the calibration
+write, correctly — so the magnitude lives HERE and `utilization.times_active` was incremented.
+
+NARRATIVE QUALITY: 10/10 parsed, flattened count asserted against the INTENDED batch size of
+10 (run 74's correction — never against the loop that built the request). The wrapper emits a
+LIST per call, so the accumulate step needs a raw_decode loop AND a flatten; parsing without
+the flatten raised `'list' object has no attribute 'get'` and the assertion caught it.
+Keys: outcome_detail 7, outcome_note 1, rationale 2. Zero NULL, zero verdict-only.
+
+NEXT RUN (78):
+  1. Rule 2 read 0 here after run 76's 5. Check it FIRST and inherit nothing — five runs, five
+     different readings.
+  2. Exclude `category: test-cat` and `outcome: null` records from selection. They are in the
+     pool (2 fixtures + 8 outcome-less) and one fixture sits in band 1 at rc=4.
+  3. Do NOT re-derive the rc>=5 cap question — it is answered above (g-115-2509, source-level).
+  4. Do NOT re-run the persistence-marker permutation test; it is recorded above and ENCODED
+     NOTHING. The open, non-circular successor is still run 74's: does `measurement_channel`
+     (a FORMATION-time field) predict UNRESOLVABLE? Needs de-contamination first.
+  5. When a narrative resolves to `rationale`, READ THE TEXT before calling it bare — the
+     unchained-key probe cannot see an appended resolution. 26 of 73 carry one.
+
+## Occurrence 137 — 2026-09-22, bravo, hostname cc-05, `uname -r` 6.8.0-139-generic (own-cloud), g-001-05
+
+**POOL** `pipeline-read.sh --replay-candidates` = **894**. Field check FIRST: `surprise` present
+on **828**, `surprise_level` on **2** — canonical key confirmed, so a zero in rules 1-2 would have
+been a real zero rather than the silent alias-key fall-through. surprise>=5: **274**; >=7: **10**;
+CORRECTED **244**; `replay_count>=5`: **0** (no archive-cap firings this run).
+
+**HEADLINE — STEP 3.6's ELIGIBLE POPULATION IS NOT STRUCTURALLY ZERO. Measured 41.**
+
+This CONTRADICTS `2026-08-07_step36-resumes-after-three-month-dormancy` (CORRECTED, surprise 7,
+resolved zeta/cc-02 2026-09-05), which is the fleet's standing answer on why Step 3.6 never fires.
+Its replacement mechanism reads, verbatim: *"All 32 un-encoded eligible records are stage=archived
+... and NONE is in the replay pool — the pool draws from non-archived stages only"*, therefore
+*"it cannot resume from this predicate without either reading archived records or stamping the
+step before archival."*
+
+Measured here from **that exact predicate** (rc>=3 AND CORRECTED AND not `encoded_via_chronic`):
+
+| | reading |
+|---|---|
+| eligible | **41** (was 32 on 2026-09-05 — +9 in 17 days) |
+| stage | **41/41 archived** — the archival half HOLDS |
+| reflected | 41/41 True |
+| replay_count | {3: 37, 4: 4} |
+| reached FROM `--replay-candidates` | **yes — all 41** — the unreachability half does NOT hold |
+| verified by direct per-id read | 3 (not from my own parse) |
+
+So the step CAN resume from this predicate on this box, and did. **NOT CLAIMED: why the reading
+differs.** Endpoint behaviour, box difference (cc-02 vs cc-05) and archival timing are all live
+candidates and I measured NONE of them. Read this as *"the predicate reaches archived records on
+cc-05 on 2026-09-22"*, never as *"the endpoint was changed"*. The original record's CORRECTED
+verdict stands — what is corrected is its replacement MODEL. A dated correction was appended to
+its `outcome_detail` (2642 → 4374 chars, original preserved byte-identical, read back and
+verified) and posted as `severity:invalidates` (`msg-20260922-194309-bravo-3625`).
+
+**BATCH** 10, STRATIFIED across `replay_count` {0:2, 1:5, 2:1, 3:2} and `surprise` {3:2, 4:1, 6:4,
+7:3}; 4/10 CORRECTED. Stratified rather than sorted because the rc-vs-CORRECTED gradient sign is
+not stable across measurements — any FIXED sort direction is a coin flip on an unknown sign.
+
+**STEP 3 — NO MARKER PURSUED, AND THAT IS THE MEASUREMENT.** At n=10 the size-matched permutation
+floor is ~30pp; no delta this batch could produce would clear it. Declining is the result, not a
+skipped step. Qualitative finding instead, and it ENCODED NOTHING NEW: **3 of the 4 CORRECTED were
+corrected BY THEIR OWN SPECIFICATION rather than by the world** — a threshold missed while
+direction held (+7.1pp), a literal criterion scored on a raw count the record itself calls the
+wrong number, and a literal-criterion window. That REPLICATES guard-2857's own measured 4-of-5, so
+the existing guardrail predicted the batch; `times_active` incremented, zero created.
+
+**NARRATIVE QUALITY** 10/10 parsed. Bare-or-verdict-only **0/10** — expected ~1.5 against the
+CORRECTED row (15.0% empty) that a violation-first batch is drawn from, so this is unremarkable and
+is NOT evidence the resolution-evidence gate improved. Compared against the CORRECTED row, never
+the pool row.
+
+**THE ASSERTION EARNED ITS KEEP.** The flatten asserted parsed-count == ids-REQUESTED and fired at
+**9 vs 10**. Cause was mine, not the corpus: the id file was written with `"\n".join(...)` and no
+trailing newline, so `while read` silently dropped the last id. Without the assertion this would
+have read as a finding about bare records — the exact misattribution this file's run-74 note warns
+about. Assert against the INTENDED batch size, never against the loop that built the request.
+
+**STEP 3.6** 7 chronic records encoded (`encoded_via_chronic=true`), **marked 7, VERIFIED 7,
+unverified 0**. Per guard-5492 these are NOT prevention evidence — that counter rises with a
+guardrail's own FAILURE to prevent the error. The value is DRAINING records that had each burned
+3-4 replay slots. **34 remain** for the next occurrence.
+
+**STEP 4.5** stamped 10/10, verified 10/10, per-id (guard-1755 — never `--replay-candidates`, which
+excludes future `next_review_date` and reports zero on success).
+
+**NEXT OCCURRENCE:**
+  1. The 34 remaining chronic records are drainable FROM the standard predicate on this box — do
+     not re-derive reachability from the contradicted record, read the correction on it.
+  2. Re-measure the eligible count before draining. It moved 32 → 41 in 17 days, so it is not a
+     fixed residue; a count that keeps RISING while runs drain it is the finding.
+  3. If another box reports Step 3.6 eligible = 0 from the same predicate, THAT is the
+     discriminator this run deliberately did not chase — record both readings, attribute neither.

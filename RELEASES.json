@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.80",
+    "previous_version": "2.12.79",
+    "date": "2026-09-23",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "The seed ships no deployment registry entry, every registry entry already at a destination survives the plant, and the leak gate counts only files the seed ships (g-373-124). Peer env-ids are genericized across the conventions and code (g-373-123). rt_call never sends a write twice (g-115-8129). The deadman net cannot be armed over a loop that is not running.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.79",
+    "previous_version": "2.12.78",
+    "date": "2026-09-22",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "stop-signal-relay delivers a pending stop-requested to a mid-goal model within one tool call (g-373-94); drains 741 commits accumulated since v2.12.78",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.78",
     "previous_version": "2.12.77",
     "date": "2026-09-20",

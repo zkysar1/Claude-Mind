@@ -92,9 +92,18 @@ from ..peer_queue_read import (
 )
 
 
+# ⚠ DO NOT INLINE. Must match core/scripts/aspirations.py::VALID_GOAL_STATUSES
+# (the SSOT) and endpoints/aspirations_write.py::_VALID_GOAL_STATUSES exactly
+# (guard-130). This copy is a REFUSAL GATE on the READ path: a value the SSOT
+# accepts but this set omits makes `--goal-status <value>` return
+# invalid_goal_status, which is how grooming's read path would have been blind
+# to its own queue. Parity pinned by
+# tests/test_valid_goal_statuses_mirror_parity.py.
 VALID_GOAL_STATUSES = {
     "pending", "in-progress", "completed", "blocked",
     "skipped", "expired", "decomposed", "superseded",
+    # `candidate` — intake state, NOT terminal ( / goal-intake-management §2).
+    "candidate",
 }
 
 def _parse_goal_status(raw: str):

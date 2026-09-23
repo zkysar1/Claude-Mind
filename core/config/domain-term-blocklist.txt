@@ -48,3 +48,23 @@ seedgettervert
 BTEvents
 Roblox-Integration
 Environment-Processor
+
+# Peer-world deployment identifiers (g-115-10049 outcome 4, 2026-09-20).
+# class-B deployment identities from core/config/environments/*.yaml, the
+# registry domain-term-classes.md calls authoritative. Lowercase ONLY: the
+# blocklist is case-sensitive and the Title-Case variants match ZERO files
+# (Zds-Mind = 0), so lowercase entries are both safe and sufficient.
+# Each term was positive-controlled under the REAL matcher before being added
+# (grep -rnw, case-sensitive, same --include set as domain-leak-check.sh:139)
+# because a term matching nothing reads identically to a clean one (guard-6233):
+#   zds-mind 189 hits/35 files · claude-mind 75/32 · coach-mind 26/11 · serene-mind 11/4
+# DELIBERATELY EXCLUDED, by measurement, NOT by omission:
+#   `local`       — environment_id in environments/local.yaml, 685 unmarked files;
+#                   collides with ordinary English and with local-path prose.
+#   `ayoai-mind`  — THIS deployment's own directory name, so it rides in every
+#                   absolute path on the box. The Title-Case `Ayoai-Mind` above
+#                   is the correct, non-colliding form and is already listed.
+zds-mind
+claude-mind
+coach-mind
+serene-mind

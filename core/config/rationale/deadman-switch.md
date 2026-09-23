@@ -324,6 +324,41 @@ absence — so "worst case a SLOW loop, never a dead one" holds only for a
 text-death *inside a live session*, which is a strictly narrower claim than the
 one § Why 600s makes.
 
+**A SECOND MECHANISM REACHES THE SAME DEAD END WITH NOTHING GONE: the session,
+process and container are all ALIVE and the re-invocation is REFUSED.** Account
+quota / entitlement exhaustion (rate-limit tier exhausted, overage rejected,
+out of credits) does not remove the thing to re-invoke — it makes every
+invocation fail at the API. Read the sentence above literally and this case is
+NOT in its class, because nothing is "gone"; read it by its consequence and it
+is the same failure, because delivery again waits on an unbounded external
+event. Name it here so the "gone" criterion stops reading as the class's
+boundary.
+
+MEASURED (a peer deployment, msg-20260921-114220-omni-3317 §B3; **not reproduced on
+this box**): a 24.04h loop silence, reconstructed from the session transcript
+(167,941 records, 0 non-JSON). A quiescence sleep of 1,643s was approved at
+2026-09-19T17:01:05 and completed exit 0 at 17:29:55; its task-notification was
+ENQUEUED and never dequeued while the account sat at rate-limit tier seven_day
+with overage rejected. The daily cron dequeued it 2026-09-20T17:32:23 and it
+arrived HTTP 429. Recovery took a human credential action on a different
+account plus a typed `continue`.
+
+**Do not file this as a new delivery-latency maximum.** An approved 1,643s sleep
+delivering 88,369s later (53.8x) presents exactly like the clamp-vs-delivery gap
+whose recorded max is 17.1h, so it reads as a new record. It is not one: this
+section's own method splits gaps by WHAT BROKE THE SILENCE, and this silence was
+broken by a human credential action — the `human-typed` class above, which is
+excluded precisely because no deadman performs those rescues. Folding it into
+the deadman-eligible tail would corrupt the statistic this section exists to
+report.
+
+**UNVERIFIED, AND DELIBERATELY LEFT OPEN:** whether the external detector named
+below (`ayoai-fleet-sweep.timer`) also misses this case. It pages for
+autonomous-mode agents in a STOPPED state, and a quota-exhausted agent is not
+stopped — but that classifier runs on `zakbox1`, outside every container, and is
+not readable from a container box, so nothing here has measured it. Do not
+repeat the blind-spot claim as established; measure it on `zakbox1` first.
+
 **Do NOT respond by tuning `delaySeconds`.** The clamp floor is 60s and the
 observed misses are 5.7–17.1h; no rung reaches them, because the delay is not
 where the time goes.
@@ -368,6 +403,61 @@ so density wrongly excluded the real incident when first tried. Catches drift if
 the re-arm-first rule is missed; complements trailing-text-detector.py (non-storm
 text-deaths).
 
+## The net outlives its loop: the IDLE re-arm cycle (2026-09-21, sera)
+
+The re-arm-first rule above and the Phase -1.5 state gate are each correct on a
+live loop, and together they make a turn with no exit on a dead one.
+
+A net is armed while RUNNING and survives a `/stop`: nothing in the stop
+sequence cancels it, and by design nothing should — a cancel is the one thing
+`schedule-wakeup-correctness.md` Anti-pattern E exists to prevent. So an agent
+that is IDLE in assistant mode still has a sentinel pending. When it fires:
+
+1. The turn begins. Per the re-arm-first rule it re-arms the net FIRST,
+   *before* any loop-entry work that could fail. The gate approved it.
+2. It reaches Phase -1.5, the Agent State Gate Check, which refuses because the
+   state is not RUNNING. There is no IDLE branch, and there should not be one —
+   an IDLE agent genuinely has no loop to enter.
+3. The turn ends. 600s of idle later the net it just re-armed fires again, and
+   the agent repeats steps 1-3 forever.
+
+Step 1 restores a net for a loop that step 2 then proves does not exist. Neither
+step is wrong; the ORDER is only right while a loop is running, and nothing read
+the state before restoring the net. The user's report was of an agent that
+"start[s] doing weird looping and repeating itself" after answering a question,
+which is what this looks like from outside.
+
+**`## Why 600s` below already contains the tell.** Its no-false-fire argument is
+explicitly RUNNING-scoped: *"In RUNNING mode the Stop hook also prevents
+intentional idle, so there is no legitimate 600s idle window — only a true death
+produces one."* Outside RUNNING that argument does not hold at all — an IDLE
+assistant session is idle by design, between a person's messages, so 600s of
+idle is the NORMAL state rather than the signature of a death. The sizing was
+derived for one mode and the firing was never scoped to it.
+
+### The fix: state is the discriminator, in the gate
+
+`schedule-wakeup-gate.py` now refuses the sentinel when agent-state is readable
+and not RUNNING (`_arm_would_resurrect_nothing`), the exact mirror of
+`_cancel_would_strand_loop`, which refuses a CANCEL while it IS running. One
+file read, two directions: between them the net exists exactly when a loop does.
+
+It is enforced in the GATE and not by prose because prose here would be an
+"LLM must check X before doing Y" instruction, which drifts (guard-399); the
+gate's deny message carries the instruction instead, delivered at the one moment
+it is needed. The re-arm-first ORDER therefore stays exactly as written — a live
+loop still restores its net before anything that can fail, and a dead one is
+told, once, that it has nothing to resurrect and should answer and stop.
+
+Fail-open is unchanged: an unresolvable agent or an unreadable `agent-state`
+approves. A gate that guessed here would stall live loops, which is strictly
+worse than the cycle it prevents.
+
+Covered by `core/scripts/tests/test_schedule_wakeup_gate.py` class C — every
+outcome of the new predicate, plus a mirror test asserting that neither state
+leaves both doors open. Measured: unwiring the branch turns exactly three of
+those tests red and leaves every other test in the file green.
+
 ## Why 600s
 
 The wakeup fires only after `delaySeconds` of CONTINUOUS session idle. On a
@@ -391,4 +481,5 @@ spec; raise it for more false-fire margin, lower it for faster resurrection.
 - `core/scripts/iteration-close.sh` / `core/scripts/recurring-close.sh` — the
   flag-gated ITERATION COMPLETE imperatives
 - `core/scripts/schedule-wakeup-gate.py` / `_swakeup_predicate.py` — the gate
-  that passes the `<<autonomous-loop-dynamic>>` sentinel unconditionally
+  that passes the `<<autonomous-loop-dynamic>>` sentinel while RUNNING, and
+  refuses it otherwise (see the IDLE re-arm cycle above)

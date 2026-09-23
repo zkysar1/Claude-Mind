@@ -1828,8 +1828,8 @@ def cmd_peer_thread_relay(args, config, compact):
         oldest = max((r.get("age_days") or 0) for r in und)
         # The routing tag is `requires_action_by:`, NOT `forward-to:` ().
         # This string used to prescribe forward-to, which board.py:143-157 warns
-        # "routes to NOBODY" because `forward-to:omni@zds-mind` parses to agent
-        # `forward-to:omni` and matches nothing. Following the instruction exactly
+        # "routes to NOBODY" because `forward-to:<agent>@<peer-env>` parses to agent
+        # `forward-to:<agent>` and matches nothing. Following the instruction exactly
         # therefore produced a relay that CLEARED this flag (_peer_thread_relay
         # accepts forward-to, and even a bare `relay` tag) while notifying no one.
         # Measured 2026-08-15 over a 5382-message 720h coordination scan: 14 relay

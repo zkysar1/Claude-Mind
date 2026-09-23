@@ -117,7 +117,7 @@ SUBJECT_JACCARD = 0.6
 BODY_JACCARD = 0.7
 BODY_FP_CHARS = 400
 
-_ID_RE = re.compile(r"\b(?:g-\d{1,3}-\d{1,5}|asp-\d+|guard-\d+|rb-\d+|pq-[a-z0-9-]+|sq-\d+|hyp-[a-z0-9-]+)\b", re.I)
+_ID_RE = re.compile(r"\b(?:g-\d{1,3}-\d+|asp-\d+|guard-\d+|rb-\d+|pq-[a-z0-9-]+|sq-\d+|hyp-[a-z0-9-]+)\b", re.I)  # goal seq open-ended: guard-1161
 _STOP = {
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "or", "is", "are",
     "was", "were", "be", "it", "this", "that", "with", "from", "by", "at", "as",
@@ -227,6 +227,67 @@ def _parse_ts(s: str):
 
 def ledger_path(world: Path | None = None) -> Path:
     return Path(world or WORLD_DIR) / LEDGER_NAME
+
+
+def refresh_ledger(world: Path | None = None) -> str:
+    """Pull the STORE copy of the ledger before a dedup decision, and SAY whether
+    that worked. Returns the freshness basis, never raises (g-115-7297).
+
+    WHY. `find_prior`'s ledger leg was a raw local read, and under own-cloud the
+    local tree is a read-through cache (guard-980) whose daemon path is TTL-warm
+    by default (guard-6364: `ensure_local()` is `_refresh(force_fresh=False)`,
+    OWNCLOUD_CACHE_TTL default 120s). A peer box's row written seconds ago is
+    therefore INVISIBLE here, so the gate answered "no prior -- ok to send" on a
+    population it could not see. Measured 2026-09-21 on the live ledger: two
+    "Fleet: <agent> looks STALLED" episodes reached the owner 8 and 9 times, with
+    byte-identical `subject_norm`, every row rc=0; the tightest cross-agent gap
+    was 16 SECONDS (bravo 09:51:07 -> alpha 09:51:23), well inside that TTL. The
+    predicate was never wrong -- re-run today it matches all four priors with
+    `why="same subject"` -- and the unit test was green throughout, because in a
+    one-world fixture both writes land in the same file and there is no race to
+    lose. The one category that dedups correctly in production is `user-digest`,
+    which matches on CATEGORY alone and so does not need a fresh row to arrive.
+
+    BASIS VALUES, which the caller is expected to ACT on, not just log:
+      "fetched"                -- refresh() returned; the read is current. On the
+                                  local backend that call is a documented no-op
+                                  reading nothing (storage_backend.py:432), which
+                                  is correct: the local file IS the store there.
+      "skipped-would-clobber"  -- per-machine store, a refresh would destroy the
+                                  only good copy (guard-881); NOT current
+      "unavailable: <e>" / "failed: <e>" -- could not materialize; NOT current
+    Any basis but "fetched" means the decision population is UNKNOWN, and
+    guard-6364 is explicit that an authorising gate must then fail CLOSED: a
+    permissive verdict here sends mail, which cannot be unsent.
+
+    NO BACKEND SNIFFING. An earlier draft short-circuited to a "local-backend"
+    basis when the class name did not contain "owncloud", which is fail-DANGEROUS
+    in exactly guard-6364's direction: any remote backend whose class is named
+    something else would report a fresh basis having pulled nothing, and the gate
+    would clear a send on a population it never read. Calling refresh()
+    unconditionally costs nothing on the local path and cannot mis-classify a
+    backend it does not recognise."""
+    path = ledger_path(world)
+    try:
+        from storage_backend import get_backend  # noqa: WPS433
+        be = get_backend()
+    except Exception as exc:  # noqa: BLE001 - never raise into a send decision
+        return f"unavailable: {exc}"
+    try:
+        import owncloud_sync  # noqa: WPS433
+        if owncloud_sync.refresh_would_clobber(be, path):
+            return "skipped-would-clobber"
+        be.refresh(path)
+        return "fetched"
+    except Exception as exc:  # noqa: BLE001
+        print(f"[notification-outreach] WARN ledger refresh failed ({exc}); "
+              f"prior outreach from other boxes may not be visible", file=sys.stderr)
+        return f"failed: {exc}"
+
+
+#: The ONLY basis under which the ledger read is known-current. Anything else
+#: means the population is unknown -- see `refresh_ledger` and guard-6364.
+FRESH_BASES = frozenset({"fetched"})
 
 
 def _read_jsonl(path: Path) -> list:
@@ -399,8 +460,15 @@ def match_reason(cand: dict, subject_norm: str, subj_tokens: set, ids: set, body
 
 
 def find_prior(subject: str, body: str, category: str, *, world: Path | None = None,
-               now: datetime | None = None, exclude_suppressed: bool = True) -> list:
+               now: datetime | None = None, exclude_suppressed: bool = True,
+               freshness: str | None = None) -> list:
     world = Path(world or WORLD_DIR)
+    # Pull the store copy before deciding (). A caller that already
+    # refreshed passes its basis through so the fetch happens ONCE per decision;
+    # everyone else gets the refresh here, because a prior this read cannot see
+    # is a duplicate the owner receives.
+    if freshness is None:
+        freshness = refresh_ledger(world)
     now = now or _now()
     since = now - window_for(category)
     subject_norm = normalize_subject(subject)
@@ -576,10 +644,30 @@ def main(argv=None) -> int:
 
     body = _read_body(args)
     if args.cmd == "check":
-        hits = find_prior(args.subject, body, args.category, world=world)
+        # Refresh ONCE here and pass the basis down, so the verdict can say what
+        # population it saw (guard-6364: a CLEAR with no freshness basis is an
+        # ABSENCE, not a clean bill of health).
+        freshness = refresh_ledger(world)
+        hits = find_prior(args.subject, body, args.category, world=world, freshness=freshness)
+        # FAIL CLOSED on an unknown population. This gate's PERMISSIVE verdict
+        # authorises mail to the owner, which cannot be unsent, so guard-6364's
+        # fail-closed direction applies rather than guard-142's fail-open (that
+        # one governs gates whose REFUSAL blocks work). The escape hatch is the
+        # same one a genuine duplicate uses: EMAIL_SEND_ALLOW_DUPLICATE.
+        stale = freshness not in FRESH_BASES
         if args.json:
-            print(json.dumps({"duplicate": bool(hits), "prior": hits, "window_hours": window_for(args.category).total_seconds() / 3600}, indent=1))
-        elif hits:
+            print(json.dumps({"duplicate": bool(hits) or stale, "prior": hits,
+                              "freshness": freshness,
+                              "window_hours": window_for(args.category).total_seconds() / 3600}, indent=1))
+            return 1 if (hits or stale) else 0
+        if not hits and stale:
+            print(f"[notification-outreach] REFUSING: could not read the fleet ledger "
+                  f"authoritatively (freshness={freshness}), so a peer's prior outreach on "
+                  f"this topic would be invisible. Not sending is the safe direction here. "
+                  f"If this message must go now, resend with "
+                  f"EMAIL_SEND_ALLOW_DUPLICATE='<what is new>'.")
+            return 1
+        if hits:
             print(f"[notification-outreach] DUPLICATE: {len(hits)} prior outreach on this topic within "
                   f"{int(window_for(args.category).total_seconds() // 3600)}h:")
             for h in hits[:8]:

@@ -379,7 +379,7 @@ policy — it does not drain to 0, and chasing it is wasted work.** Measured
 `out_of_window_unconverted=6`, which splits — disjointly, by construction —
 into `out_of_window_already_routed=4` and `out_of_window_digest_refused=2`.
 The two refused posts (`msg-20260820-071603-alpha-5961`,
-`msg-20260820-071902-alpha-5965`) are addressed to `omni@zds-mind`, an agent
+`msg-20260820-071902-alpha-5965`) are addressed to an `<agent>@<env-id>` agent
 of a PEER DEPLOYMENT, so they are not convertible into *this* deployment's
 queue and will never clear from the count. They are the same two ids the
 2026-08-25 run refused. The refusal is deliberate — it is what stops a digest

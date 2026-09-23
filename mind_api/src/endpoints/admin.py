@@ -439,8 +439,8 @@ def runner_acquire(ctx) -> "Response":  # type: ignore[name-defined]
     except _StoreUnwritable as e:
         # The claim store could not be WRITTEN — no credential for the remote,
         # an unreachable host, a server-side refusal — which is a plumbing
-        # failure, NOT a held claim. Before this clause (2026-08-27, coach-mind
-        # on zc-03) the store reported a failed push as a lost CAS race, this
+        # failure, NOT a held claim. Before this clause (2026-08-27, a downstream
+        # deployment on zc-03) the store reported a failed push as a lost CAS race, this
         # endpoint answered {"held": true}, and runner-claim.sh told the operator
         # "another machine owns a live claim for this agent" while the claim
         # namespace was empty. Answer with the remote's own words instead; the
@@ -666,7 +666,7 @@ def runner_claims(ctx) -> "Response":  # type: ignore[name-defined]
         # Git-ref arm only: the stderr of the most recent FAILED fetch of the
         # claim namespace, else None. When set, `claims` is the LAST-KNOWN LOCAL
         # state, not the remote's — an empty list here must never be read as
-        # "no holder" (2026-08-27 coach-mind: `[]` beside failing acquires).
+        # "no holder" (2026-08-27, a downstream deployment: `[]` beside failing acquires).
         "store_error": getattr(be, "last_fetch_error", None),
         "claims": [
             {"agent": c.agent, "machine_id": c.machine_id,

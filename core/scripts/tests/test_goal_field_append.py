@@ -504,3 +504,237 @@ def test_genuine_loss_dies_without_prescribing_a_whole_store_restore(monkeypatch
     err = capsys.readouterr().err
     assert "history.py restore" in err and "DO NOT run history.py restore" in err
     assert "Recover the PRE value from" not in err
+
+
+# ── 7. The rotation is announced to the CALLER, not only to the field ────────
+#
+# rotate_oversize REBINDS `pre`, so every length reported below it is measured
+# against the REDUCED value. Reporting that as a bare `pre_len` is honest about
+# a base the caller never saw, and it has twice sent an agent hunting for data
+# loss that never happened: a 77 KB "discrepancy" chased against a hand pre-read
+# (bravo, cc-05) and a full window spent building a recovery directory for
+# 287 KB never at risk (alpha, cc-04), both 2026-09-22. The notice written INTO
+# the value serves whoever reads the goal later; this key serves whoever just
+# wrote it and is reconciling lengths right now.
+
+import _paths as _paths_for_sink
+
+
+def _no_rotation(goal_id, field, source, pre):
+    return pre
+
+
+def test_a_rotation_is_reported_to_the_caller(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(_paths_for_sink, "WORLD_DIR", str(tmp_path))
+    pre = ("orig block that the rotation will cut\n" + GFA.sentinel_for("m0"))
+    reduced = "kept tail\n" + GFA.sentinel_for("m0")
+    marker, text = "m1", "the appended text"
+    composed = GFA.compose(reduced, text, marker)
+    state = {"stored": pre, "composed": composed}
+
+    def fake_rotate(g, f, s, p):
+        # The real rotate_oversize is ITS OWN STORE WRITE ("ROTATION IS ITS OWN
+        # WRITE, DELIBERATELY NOT PART OF THE APPEND", goal-field-append.py:259).
+        # The stub must land the reduced value too, or the CAS guard below
+        # correctly refuses the append against a base that never changed.
+        state["stored"] = reduced
+        return reduced
+
+    monkeypatch.setattr(GFA, "rotate_oversize", fake_rotate)
+
+    def run(argv, input=None, **kw):
+        joined = " ".join(str(a) for a in argv)
+        if "aspirations-query.sh" in joined:
+            return _Res(stdout=json.dumps([{"goal_id": "g-1", "priority": "MEDIUM",
+                                            "outcome_note": state["stored"]}]))
+        if "aspirations-update-goal.sh" in joined:
+            state["stored"] = state["composed"]
+            return _Res(stdout=json.dumps({"goal_id": "g-1",
+                                           "outcome_note": state["composed"]}))
+        raise AssertionError("unexpected call: %s" % joined)
+
+    monkeypatch.setattr(GFA, "_run", run)
+    assert GFA.main(["g-1", "outcome_note", marker, text]) == GFA.RC_OK
+    out = json.loads(capsys.readouterr().out)
+    assert "rotated" in out, (
+        "a rotation cut %d bytes and the caller was told nothing — this is the "
+        "exact shape that cost two agents a window" % (len(pre) - len(reduced)))
+    r = out["rotated"]
+    assert r["pre_len_before_rotation"] == len(pre)
+    assert r["moved_bytes"] == len(pre) - len(reduced)
+    assert r["archive"].endswith("g-1.outcome_note.md")
+    # and pre_len itself still describes the base the append actually ran on
+    assert out["pre_len"] == len(reduced)
+
+
+def test_no_rotation_means_no_rotated_key(monkeypatch, capsys, tmp_path):
+    """Absence must stay meaningful — a key present on every write says nothing."""
+    monkeypatch.setattr(_paths_for_sink, "WORLD_DIR", str(tmp_path))
+    monkeypatch.setattr(GFA, "rotate_oversize", _no_rotation)
+    pre = "orig\n" + GFA.sentinel_for("m0")
+    marker, text = "m1", "the appended text"
+    composed = GFA.compose(pre, text, marker)
+    state = {"stored": pre, "composed": composed}
+    monkeypatch.setattr(GFA, "_run", _stateful_run(
+        state, json.dumps({"goal_id": "g-1", "outcome_note": composed})))
+    assert GFA.main(["g-1", "outcome_note", marker, text]) == GFA.RC_OK
+    out = json.loads(capsys.readouterr().out)
+    assert "rotated" not in out
+
+
+# ── 8. The rotation's own read->write window () ───────────────────
+#
+# rotate_oversize re-reads the field (its CAS) and then replaces it through a
+# SEPARATE subprocess. A peer append committed between that re-read and the
+# store write is overwritten by the reduced value -- and NO post-write check can
+# see it, because the clobbered store holds EXACTLY the value the rotation meant
+# to write: the notice is present, the newest block is present, the block count
+# equals len(kept). That is why the goal's preferred remedy (compare the landed
+# block count) cannot catch this race; only a compare evaluated INSIDE the
+# store's own lock can refuse the write. The fake below models the daemon's
+# X-Mind-Expect-Field-Sha256 precondition: a sent hash that no longer matches
+# the stored value is refused (409, nothing written), and a matched one is
+# confirmed on stderr the way aspirations-update-goal.sh re-emits it.
+
+import hashlib
+
+
+def _sha(text):
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _blocks(n, size=90):
+    """n sentinel-terminated blocks, oldest first, joined the way compose() joins."""
+    return "\n\n".join(("block-%d " % i) + ("x" * size) + "\n" + GFA.sentinel_for("m%d" % i)
+                       for i in range(n))
+
+
+def _small_rotation_bounds(monkeypatch, tmp_path):
+    monkeypatch.setattr(_paths_for_sink, "WORLD_DIR", str(tmp_path))
+    monkeypatch.setattr(GFA, "ROTATE_DISABLED", False)
+    monkeypatch.setattr(GFA, "ROTATE_AT_BYTES", 200)
+    monkeypatch.setattr(GFA, "ROTATE_KEEP_BYTES", 150)
+
+
+def _rotation_store(monkeypatch, *, pre, peer_block, confirm=True, resent=False):
+    """Fake store + daemon for rotate_oversize called directly.
+
+    Query #1 is the rotation's CAS re-read; the peer's append is committed to the
+    store IMMEDIATELY AFTER that snapshot is handed back -- the window this goal
+    names. `peer_block=None` gives the uncontended control; `confirm=False`
+    models a daemon that predates the precondition header and ignores it.
+    `resent=True` models the transport re-sending the request (rt_call does so
+    after a stale-daemon recycle or a timeout, keeping only the LAST reply): the
+    first copy lands, and the reply is the second copy's refusal.
+    """
+    store = {"value": pre}
+    state = {"queries": 0, "writes": [], "refused": 0, "expect_sent": []}
+
+    def fake_run(argv, input=None, **kw):
+        args = [str(a) for a in argv]
+        joined = " ".join(args)
+        if "aspirations-query.sh" in joined:
+            state["queries"] += 1
+            snapshot = json.dumps([{"goal_id": "g-1", "priority": "MEDIUM",
+                                    "outcome_note": store["value"]}])
+            if state["queries"] == 1 and peer_block is not None:
+                store["value"] = store["value"] + "\n\n" + peer_block
+            return _Res(stdout=snapshot)
+        if "aspirations-update-goal.sh" in joined:
+            expect = args[args.index("--expect-sha256") + 1] if "--expect-sha256" in args else None
+            state["expect_sent"].append(expect)
+            if resent:
+                state["writes"].append(input)
+                store["value"] = input
+                state["refused"] += 1
+                return _Res(returncode=1, stderr=json.dumps(
+                    {"error": "field_precondition_failed", "message": "NOTHING WAS WRITTEN"}))
+            if confirm and expect is not None and expect != _sha(store["value"]):
+                state["refused"] += 1
+                return _Res(returncode=1, stderr=json.dumps(
+                    {"error": "field_precondition_failed", "message": "NOTHING WAS WRITTEN"}))
+            state["writes"].append(input)
+            store["value"] = input
+            echo = ("[update-goal] precondition_checked field-sha256=%s\n" % expect
+                    if (confirm and expect is not None) else "")
+            return _Res(stdout=json.dumps({"goal_id": "g-1", "outcome_note": input}),
+                        stderr=echo)
+        raise AssertionError("unexpected call: %s" % joined)
+
+    monkeypatch.setattr(GFA, "_run", fake_run)
+    return store, state
+
+
+def test_rotation_does_not_clobber_a_peer_append_in_its_write_window(monkeypatch, tmp_path):
+    """THE regression. Asserts data CONSERVATION: the peer's block survives.
+
+    Fails against the pre-fix rotation, which wrote the reduced value
+    unconditionally over the peer's commit and then returned it as success.
+    """
+    _small_rotation_bounds(monkeypatch, tmp_path)
+    pre = _blocks(6)
+    peer = "PEER-BLOCK-B\n" + GFA.sentinel_for("peer")
+    store, state = _rotation_store(monkeypatch, pre=pre, peer_block=peer)
+    out = GFA.rotate_oversize("g-1", "outcome_note", "world", pre)
+    assert "PEER-BLOCK-B" in store["value"], (
+        "the peer's append landed inside the rotation's read->write window and was "
+        "silently replaced by the reduced value -- the g-115-10535 lost update")
+    assert out == pre, "a refused rotation must hand back the ORIGINAL value, whole"
+    assert state["writes"] == [], "a refused conditional write must write NOTHING"
+
+
+def test_rotation_sends_the_hash_of_the_value_it_composed_from(monkeypatch, tmp_path):
+    """The precondition is only as good as its operand: it must be sha256(pre),
+    the exact text `reduced` was built from -- not the reduced value, and not a
+    later re-read."""
+    _small_rotation_bounds(monkeypatch, tmp_path)
+    pre = _blocks(6)
+    _, state = _rotation_store(monkeypatch, pre=pre, peer_block=None)
+    GFA.rotate_oversize("g-1", "outcome_note", "world", pre)
+    assert state["expect_sent"] == [_sha(pre)]
+
+
+def test_uncontended_rotation_still_rotates(monkeypatch, tmp_path):
+    """No false positive: with no peer, the conditional write lands and the
+    rotation returns the reduced value, exactly as before the fix."""
+    _small_rotation_bounds(monkeypatch, tmp_path)
+    pre = _blocks(6)
+    store, state = _rotation_store(monkeypatch, pre=pre, peer_block=None)
+    out = GFA.rotate_oversize("g-1", "outcome_note", "world", pre)
+    assert len(state["writes"]) == 1 and state["refused"] == 0
+    assert out == store["value"] and out != pre
+    assert out.startswith(GFA.ROTATE_NOTICE_HEAD)
+    assert "block-5 " in out and "block-0 " not in out
+
+
+def test_unconfirmed_precondition_is_announced_not_trusted(monkeypatch, tmp_path, capsys):
+    """A daemon that predates the header accepts the write and IGNORES the
+    precondition at rc=0 (guard-5505). The rotation must not treat that write as
+    protected: it keeps the landed value (refusing it would false-alarm every
+    rotation during a rollout) and says loudly that the window was unguarded."""
+    _small_rotation_bounds(monkeypatch, tmp_path)
+    pre = _blocks(6)
+    store, state = _rotation_store(monkeypatch, pre=pre, peer_block=None, confirm=False)
+    out = GFA.rotate_oversize("g-1", "outcome_note", "world", pre)
+    assert out == store["value"] and out != pre
+    err = capsys.readouterr().err
+    assert "precondition" in err and "NOT confirmed" in err, err
+
+
+def test_rotation_that_landed_behind_a_refused_resend_is_kept(monkeypatch, tmp_path, capsys):
+    """The precondition made the write non-idempotent. A re-sent copy of a
+    rotation that already LANDED meets its own write, is refused 409, and the
+    wrapper exits 1 -- measured on the fixture daemon: first send 200, identical
+    re-send 409 "NOTHING WAS WRITTEN" over a store holding exactly that value.
+    Handing back `pre` then sent main()'s CAS to report a rewrite nobody made
+    (RC 9, "NOTHING WAS WRITTEN") over a rotation that stands. A refusal is not
+    proof that nothing landed (guard-7050): confirm against the store."""
+    _small_rotation_bounds(monkeypatch, tmp_path)
+    pre = _blocks(6)
+    store, state = _rotation_store(monkeypatch, pre=pre, peer_block=None, resent=True)
+    out = GFA.rotate_oversize("g-1", "outcome_note", "world", pre)
+    assert len(state["writes"]) == 1 and state["refused"] == 1
+    assert out == store["value"] and out != pre, (
+        "the rotation landed; handing back the original reports it undone")
+    err = capsys.readouterr().err
+    assert "re-sent" in err, err

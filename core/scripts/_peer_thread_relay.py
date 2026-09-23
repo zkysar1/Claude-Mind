@@ -26,7 +26,7 @@ it must cover reports clean forever. The regression test pins that zero.
 DELIVERY is therefore evidenced OUTSIDE the goal record: a coordination-board
 post tagged `relay` (or `forward-to:<agent>@<env>`) that carries the goal id as
 a tag. That is what alpha's real relays look like — msg-20260811-121940-alpha-5716
-carries tags `relay`, `forward-to:omni@zds-mind`, `g-115-5774`, `g-115-5777`,
+carries tags `relay`, `forward-to:<agent>@<peer-env>`, `g-115-5774`, `g-115-5777`,
 `g-115-5807` — so the signal is structured and already in production use, not
 invented here.
 
@@ -43,9 +43,10 @@ it is the half that was missing (measured 2026-08-17, alpha, cc-13, with the
 owner present). The `sweep()` docstring below says peer receipt "lives on the
 PEER's board, which a box without peer reachability cannot read". That premise
 is FALSIFIED by the peer's own behaviour: because the reverse route is closed,
-omni@zds-mind posts its receipts and per-id dispositions on THIS board — verbatim
-2026-08-16 (msg-20260816-063324-omni-5713): "Posting from inside this container
-because peer-board-post.sh to zds-mind is exit 3 from every ayoai-mind box".
+the peer's agent posts its receipts and per-id dispositions on THIS board — it
+said why on 2026-08-16 (msg-20260816-063324-omni-5713): it was posting from
+inside its own container because peer-board-post.sh to that peer exits 3 from
+every box of this deployment.
 Those posts cite goal ids explicitly and ask for the closes: 2026-08-12
 (msg-20260812-200239-omni-5555): "SIX OF THE EIGHT ARE ALREADY DONE ON THIS SIDE.
 They are a RELAY-LEDGER artifact, not undone work — ayoai-mind holds them
@@ -120,8 +121,8 @@ def routed_agents(tags, known_agents):
     RELAYED AND ROUTED ARE DIFFERENT CLAIMS, and conflating them is the defect
     this answers: a post can satisfy the relay predicate below while notifying
     nobody. `requires_action_by:` is the ONLY recognised routing prefix
-    (board.py's own warning, verbatim: `forward-to:omni@zds-mind` parses to
-    agent `forward-to:omni` and matches nothing), and a bare agent name also
+    (board.py's own warning, verbatim: `forward-to:<agent>@<peer-env>` parses to
+    agent `forward-to:<agent>` and matches nothing), and a bare agent name also
     routes.
 
     THE DEFINITION IS BORROWED, NOT RE-STATED (guard-3935: the instrument's
@@ -202,13 +203,13 @@ def build_peer_ack_index(board_rows, registry, self_env, roster):
 
     Author acceptance is borrowed from the SSOT classifier, not re-stated: the
     author must classify `peer` — declared by a peer's known_agents and NOT in
-    the local roster. `ambiguous` (e.g. `zeta`, both local and zds-mind's) is
+    the local roster. `ambiguous` (e.g. `zeta`, both local and a peer's) is
     REFUSED: a local zeta post citing a goal id is a local agent talking, and
     reading it as a peer receipt would launder a handoff into an all-clear.
-    Both live author forms are accepted — bare `omni` (40 of 42 peer posts in
-    the last 30d) and qualified `omni@zds-mind` (2 of 42) — and when the
+    Both live author forms are accepted — bare `<agent>` (40 of 42 peer posts in
+    the last 30d) and qualified `<agent>@<peer-env>` (2 of 42) — and when the
     qualified form names an env it must be the env the classifier resolved,
-    so `omni@ayoai-mind` (nonsense) matches nothing.
+    so `<peer-agent>@<this-env>` (nonsense) matches nothing.
 
     Citation is text OR tags, over the FULL body (guard-3712). A peer post
     that mentions a goal id in passing is still an ack of that id's receipt:
@@ -262,7 +263,7 @@ def sweep(goals, board_rows, registry, self_env, roster, now=None):
     READ `relayed` PRECISELY: it evidences that a RELAY WAS ISSUED, **not** that
     the peer received anything. The distinction is not pedantic — it is the
     parent incident's own mechanism. Real production relays are HANDOFFS: alpha's
-    msg-20260811-121940-alpha-5716 carries `forward-to:omni@zds-mind` AND
+    msg-20260811-121940-alpha-5716 carries `forward-to:<agent>@<peer-env>` AND
     `requires_action_by:zeta@ayoai-mind`, because peer-board-post.sh refused from
     that box and a local agent with the route had to carry it. A relay tag alone
     cannot prove the peer read anything, and a bucket named `delivered` keyed on
@@ -311,7 +312,7 @@ def sweep(goals, board_rows, registry, self_env, roster, now=None):
     from _peer_registry import classify_agent_name
 
     # Every agent name this world can name: the local roster plus every peer's
-    # declared roster. Union rather than local-only — a relay to `omni@zds-mind`
+    # declared roster. Union rather than local-only — a relay to `<agent>@<peer-env>`
     # routes perfectly well and must not read as unrouted.
     known_agents = set(roster or ())
     for env_cfg in (registry or {}).values():
@@ -359,7 +360,7 @@ def sweep(goals, board_rows, registry, self_env, roster, now=None):
             # Advise the CANONICAL lowercase name, not the subject line's display
             # form. routing_tag_targets_agent compares component-wise against the
             # agent name (deliberately not a prefix/glob, guard-2860), so a
-            # poster who copied `Zeta@zds-mind` from this advice would emit a tag
+            # poster who copied `Zeta@<peer-env>` from this advice would emit a tag
             # that matches nothing. Same display-case-vs-canonical-name defect as
             # the classification call above, resurfacing in the human-facing half
             # — which is why the test asserts on the advice string too.
@@ -371,8 +372,8 @@ def sweep(goals, board_rows, registry, self_env, roster, now=None):
             out["ambiguous"].append(rec)
             continue
         # Peer ack — the ack must come from the SAME peer env the thread names.
-        # An omni@zds-mind post cannot ack a goal whose bracket token resolved to
-        # some other peer deployment.
+        # A post from one peer's agent cannot ack a goal whose bracket token
+        # resolved to some other peer deployment.
         acked = [a for a in (acks.get(gid) or []) if a.get("peer_env") == peer_env]
         if acked:
             rec["peer_acked_via"] = [a["msg_id"] for a in acked]

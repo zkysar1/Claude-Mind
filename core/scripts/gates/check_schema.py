@@ -99,6 +99,26 @@ WORK_STATE_REASONS = (
     "PR ",                                  # "PR {key} still {state} (not merged)"
     "has no completion timestamp",          # the goal exists; it is not done yet
     "not found in live or archive",
+    "has no record in any queue",           # : the referent resolves to
+                                            # NOTHING — no record, no eviction-census
+                                            # tombstone. Judged WORK-STATE, not
+                                            # schema, for the same reason as the
+                                            # `since_goal_last_achieved goal` entry
+                                            # below: the CHECK is well formed and a
+                                            # forward reference to a goal not yet
+                                            # filed is legitimate at filing time.
+                                            # predicate.py marks it evaluable=False
+                                            # so goal-selector files it PERMANENT at
+                                            # SELECTION time; this gate answers the
+                                            # different question of whether the
+                                            # check's SHAPE is sound, and must keep
+                                            # answering yes (the load-bearing `ok`).
+    "is evicted-completed",                 # : passes on disposition, so
+                                            # the vacuous branch intercepts it first
+                                            # and it never reaches either list —
+                                            # listed anyway so the coverage test sees
+                                            # it JUDGED rather than merely unmatched.
+    "reached terminal status",              # evicted but NOT completed: a decided no
     "has no lastAchievedAt",
     "since_goal_last_achieved goal",        # ...{id} not found -- a MISSING ANCHOR
                                             # GOAL, not a missing field

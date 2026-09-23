@@ -74,7 +74,9 @@ IF parsed_output is a JSON object with "all_blocked": true:
     Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
     FOR EACH directive in new_directives: ack per Phase 2.07 (skip moot targets; else
         echo "Acknowledged directive {directive.id}" | board-post.sh --channel coordination --type status --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}")
-    Bash: parsed_output.active_directives = board-read.sh --channel coordination --type directive --since 24h --json
+    Bash: parsed_output.active_directives = board-read.sh --channel coordination --type directive --since 96h --json
+        # 96h not 24h (g-115-10429): a directive declares its own `expires:` (seen to 72h). The
+        # all-blocked handler ALREADY drops past-expiry ones, so only the WINDOW was wrong here.
     RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)
 
 ranked_goals = parsed_output  # JSON array of scored candidates
@@ -145,14 +147,18 @@ Directives influence scoring (handled mechanically by `goal-selector.py` `direct
 criterion). The LLM handles acknowledgment and insight trigger processing.
 
 ```
-# Directive acknowledgment + HONOR (g-115-2797 / guard-1310). TWO reads with DIFFERENT scopes
-# (g-115-2990): the ACK read must DEDUP — --unread-only returns only directives THIS agent has
-# not seen and --mark-read records the receipt so the next iteration filters them out (the old
-# single read had --mark-read without --unread-only: receipts written, never consumed, every
-# directive re-acked every iteration, 5x-spam) — while the HONOR read needs ALL active
-# directives (no --unread-only, no --mark-read) so a directive acked yesterday whose target is
-# in TODAY's ranked_goals is still honored.
-Bash: all_directives = board-read.sh --channel coordination --type directive --since 24h --json
+# Directive ack + HONOR (g-115-2797 / guard-1310). TWO reads, DIFFERENT scopes AND DIFFERENT
+# WINDOWS (g-115-2990, g-115-10429). ACK dedups (--unread-only returns only directives THIS
+# agent has not seen; --mark-read records the receipt) and STAYS at 24h — it asks "have I seen
+# this?", and widening it re-acks old directives (the 5x-spam g-115-2990 fixed). HONOR asks
+# "is this still binding?", which the WRITER declares via `expires:` (observed up to 72h), so a
+# 24h honor read went blind for most of each directive's life. Read 96h, then drop ONLY those
+# whose own `expires:` is already past — no `expires:` tag means ADMITTED. That is
+# parse_directive_admission's predicate verbatim: do not re-derive it, and NEVER widen without
+# the filter (96h alone re-admitted 6 EXPIRED directives when measured). 96h must exceed the
+# longest `expires:` in use. Rationale: core/config/rationale/directive-honor-read-window.md
+Bash: all_directives = board-read.sh --channel coordination --type directive --since 96h --json
+        THEN drop any whose tags carry an `expires:<ISO>` earlier than now.
 Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
 directive_targeted_goals = {}   # goal_id -> directive_id, ONLY for directives directed at THIS agent
 FOR EACH directive in new_directives:   # ONLY unseen directives — dedup by construction

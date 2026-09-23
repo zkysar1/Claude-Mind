@@ -18,10 +18,27 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 SCRIPT = SCRIPTS / "reflection-ownership-split.py"
+
+# RELATIVE, never absolute (guard-566 / guard-4364). `ownership_of` frees a LIVE
+# owner's record once resolved_at is STRANDED_HOURS (72h) old, so a fixed
+# "2026-09-17T10:00:00" here was a live-owner fixture only until 2026-09-20T10:00;
+# after that the identity test's held record silently became `reclaimable` and
+# this file read as a CLI identity regression (, measured 2026-09-22:
+# liveness {"bravo": "alive"}, reclaimable ["h-1"], held []). Mirrors FRESH in
+# test_reflection_ownership.py.
+FRESH = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+
+# An owner that is NOT a fleet agent (guard-1699): a real agent name standing in
+# for "some other agent" changes what the test tests whenever that agent's
+# liveness verdict moves (alive -> held, dormant/retired -> reclaimable). An
+# off-roster owner probes as `unknown`, which abstains regardless of age, so the
+# identity assertion depends on the caller-supplied --agent and nothing else.
+OFFROSTER_OWNER = "offroster-owner-zz9"
 
 
 def _run(records, agent, extra=()):
@@ -32,8 +49,8 @@ def _run(records, agent, extra=()):
     return proc.stdout.strip()
 
 
-def _rec(rid, owner, outcome="CONFIRMED"):
-    r = {"id": rid, "outcome": outcome, "resolved_at": "2026-09-17T10:00:00"}
+def _rec(rid, owner, outcome="CONFIRMED", resolved_at=FRESH):
+    r = {"id": rid, "outcome": outcome, "resolved_at": resolved_at}
     if owner is not None:
         r["resolved_by"] = owner
     return r
@@ -92,10 +109,10 @@ def test_identity_is_taken_from_the_caller_not_guessed():
     differently for two different agents. If this ever returns the same answer
     for both, the script has started resolving identity for itself and the
     predicate is answering a question nobody asked."""
-    recs = [_rec("h-1", "bravo")]
-    as_bravo = json.loads(_run(recs, "bravo"))
-    assert as_bravo["mine"] == ["h-1"] and as_bravo["actionable"] == 1
-    # As zeta the same record is another live/unknown agent's -> abstain.
+    recs = [_rec("h-1", OFFROSTER_OWNER)]
+    as_owner = json.loads(_run(recs, OFFROSTER_OWNER))
+    assert as_owner["mine"] == ["h-1"] and as_owner["actionable"] == 1
+    # As zeta the same record is another (unknown-liveness) agent's -> abstain.
     as_zeta = json.loads(_run(recs, "zeta"))
     assert as_zeta["mine"] == [] and as_zeta["held"] == ["h-1"]
 

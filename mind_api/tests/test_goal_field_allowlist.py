@@ -230,3 +230,27 @@ def test_allowlist_and_stray_set_are_disjoint():
         "the allowlist collapsed — a generator bug once produced a 1-element set "
         "by concatenating adjacent string literals, which refused every field"
     )
+
+
+def test_every_goal_template_field_passes_the_allowlist_gate():
+    """: a field the goal TEMPLATE tells authors to write must be writable.
+
+    core/config/aspirations.yaml goal_templates._common_fields is where a new
+    goal's fields are copied from. review_requested and review_completed sat there
+    (and in goal-schemas.md) while GOAL_KNOWN_FIELDS lacked both, so from the
+    allowlist's introduction (2026-08-18) until 2026-09-23 the async Review Gate's
+    documented write was refused on every goal and its reader never fired. The
+    census that derived the allowlist could not see them: no goal carried a field
+    nothing could write. Reading the template here, rather than hand-typing its
+    names, is what catches the next template field that ships unregistered.
+    """
+    import yaml
+    cfg = yaml.safe_load((_PROJECT_ROOT / "core" / "config" / "aspirations.yaml")
+                         .read_text(encoding="utf-8"))
+    names = list(cfg["goal_templates"]["_common_fields"])
+    assert "review_requested" in names, "the template moved; re-point this test"
+    refused = [
+        name for name in names
+        if "unknown_goal_field" in str(getattr(update_goal(_StubCtx(name)), "body", ""))
+    ]
+    assert not refused, f"goal-template fields the allowlist refuses: {refused}"

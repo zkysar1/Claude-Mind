@@ -142,6 +142,7 @@ remembering to check a table:
 | `mind_api/src/endpoints/utilization.py` (~L280) | `*/local-paths.conf` enumeration | ✓ routed (`ctx.paths.agents_root`, fixed 2026-07-11 — was the table's last ⚠ LATENT `project_root / "agents"` hardcode, surfaced by the g-115-1405 audit). |
 | `core/scripts/gates/goal_duplication.py` (`_check_pending_queue`) | `*/aspirations.jsonl` per-agent pending-queue scan | ✓ routed (`_agents_root()`, fixed 2026-07-17 g-115-2461 — was a `project_root / "agents"` hardcode). `MIND_AGENTS_ROOT` env override exists for TEST hermeticity only (before it, tmp-world gate tests silently depended on live agent queues for their IDF corpus — every structural case scored 0.0 once hermetic). Regression-guarded by `test_goal_duplication_gate_pending_queue.py` P16 (two-root proof). |
 | `core/scripts/pending-questions-read.sh` (`--all-agents`) | `*/session/pending-questions.yaml` fleet read | ✓ routed (bash `agents_root()` from `_paths.sh`, passed to the python heredoc as `AGENTS_ROOT`; added 2026-07-25 g-115-3074). Fleet mode is the READ half of the /open-questions fleet-visibility fix — a depth-1 regression here would silently return only the bound agent, which is exactly the pre-fix defect (21 of 31 fleet questions invisible to the user). |
+| `core/scripts/pending-questions-sweep.py` (`--all-agents`) | `*/session/pending-questions.yaml` fleet sweep | ✓ routed (`root = Path(agents_root())`; the `--all-agents` fleet form, g-115-9715 — the single-file default under-reported the fleet corpus by N-1 agents while reporting a clean zero). This record sat inside the generated block below until `--write` erased it; it lives here because that block keeps only the file SET. |
 | `core/scripts/owncloud-pull.sh` (`--all-agents`, `_fleet_roster` fallback) | agent-dir enumeration under `agents_root()` | ✓ routed (bash `agents_root()`; added 2026-07-25 g-115-3074). PRIMARY roster is team-state `agent_status` (the live fleet roster) — the glob is only the fallback. Deliberately NOT `*/local-paths.conf`: on any given box only the RESIDENT agent has a conf (cc-04 has one for alpha alone), so conf-enumeration would silently degrade fleet mode to single-agent — the very defect being fixed. |
 | `core/scripts/experience-orphan-ratchet.py` | agent-dir enumeration + per-agent `experience/*.md` vs `experience.jsonl` / `experience-archive.jsonl` join | ✓ routed (`agents_root()`; added 2026-07-29 g-115-3796). A depth-1 redrift makes `_compute_orphans` scan ZERO agents, which the script reports as verdict `skipped` — deliberately NOT a 0-orphan PASS, because a vacuous zero here would read as "no drift" forever (rb-245). Joins on `content_path` BASENAME, so it is correct across BOTH layout eras: 845 of 3621 live rows still carry the pre-relocation shape (agent name as the FIRST path segment, with no `agents/` parent), and any future audit of `content_path` SHAPE must handle both or it will misreport those 845 as cross-agent (measured 2026-07-29 — an audit probe did exactly that before being corrected). Note this row deliberately describes that legacy shape in prose rather than writing it literally: the bare form trips the Phase-2.6 `BARE_AGENT_PREFIX_REGRESSION` pre-commit gate, whose documented `legacy:`-backtick escape hatch is not yet implemented (g-115-3880). |
 | `core/scripts/learning-routing-audit.py` (`load_all_experiences`) + `core/scripts/learning-routing-repair.py` (`_resolve_store_path`) | `*/experience.jsonl` + `*/experience-archive.jsonl` corpus load / record→file resolution | ✓ routed (`agents_root()`; fixed 2026-08-10 g-115-5646 — BOTH were depth-1 and loaded/matched ZERO records). **The highest-consequence row in this table: the reader feeds a WRITER that fires automatically.** `tree.py::_post_remove_sweep_dangling` runs the repair with `--apply` after every tree-node removal and it NULLS whatever the audit calls dangling, so a depth-1 redrift here is not an under-report, it is data loss — **the pair is why this row is one row.** Measured: the depth-1 form returned **0** records, so every ref pointing INTO the experience store dangled by construction; the corpus went 0 → 4,873 on the fix and pipeline-source dangling went 319 → 13 (**305 of 319, 95.6%, were false positives**). Over 13 days **17,466** fields were nulled, **16,541 (94.7%) of them valid** — old values recoverable from `world/.history/learning-routing-repair-YYYY-MM-DD.jsonl`. The live read was archive-blind too (36.2% of the corpus has aged into `experience-archive.jsonl`), so both files are globbed. **The audit's TOTAL rose 319 → 779 on the fix, and that number must NOT be acted on.** Loading the corpus exposed a previously-unreadable SOURCE axis (766 refs *from* experience records), ~645 of them false positives from two audit defects this fix did NOT touch: (a) `tree_nodes_related` refs are slash-PATHS while `load_tree_node_keys` returns bare LEAF names — re-measured 2026-08-10, **495 of 577** resolve by leaf once a `.md` suffix is stripped (456 without the strip), and leaf names are unique across all 1364 nodes so the rewrite is deterministic — a key-format mismatch (rb-245 class); (b) `load_pipeline` reads only `pipeline.jsonl` while `pipeline-archive.jsonl` (986 records) exists — **191 of 195** `hypothesis_id` refs resolve there, the SAME archive-blindness fixed here for experience, still live on the pipeline axis. Genuine residue is ~86, not 779. `learning-routing-ratchet.py` prints `REGRESSED` and recommends `learning-routing-repair.sh --apply`, which would null all 779; do not re-baseline to 779 either, since that blesses the false positives as acceptable. THREE structural defenses now stand behind the routing, because routing alone is the fragile half: (a) `world_owns_agent_corpus()` — `agents_root()` is PROJECT_ROOT-based so NO world override moves it, and against a fixture world the real corpus is foreign; an EMPTY fixture produced **2,739** dangling across **12 real agent files**, all valid, bounded only by a 30s timeout expiring mid-READ; (b) an unloadable corpus makes refs INTO the experience store **unevaluable and SKIPPED**, never dangling — the general fix, since what turned 0 records into 17,466 nulls was an empty id-set silently licensing mass invalidation; (c) **g-115-5659** — `repair_file` resolves `merge_handler_for(path)` per PATH at the write and REFUSES any write-class-(b) store (no merge handler), which is every per-agent experience file. That closes the direction the other two cannot: when the audit IS wrong, a class-(a) store self-heals (8 runs each nulled ~315 `pipeline.experience_ref` and the count never moved, because the handler restored them — the destruction was invisible *because* the repair worked) while a class-(b) store does not, and the first live run after the glob fix nulled 772 experience fields of which 686 were never dangling. Regression-guarded by `test_learning_routing_glob_routing.py` (pins a NONZERO corpus — a zero is the silent-failure signature that let this ship), `test_learning_routing_world_scope.py` (3 cases, all proven to fail pre-fix; asserts on resolved PATHS, not the dangling count), and `test_learning_routing_write_class_gate.py` (11 pins, each verified RED by mutation). |
@@ -168,9 +169,9 @@ per-session paths use `agent_session_dir(name, sid)`.
      hand-maintained; this block carries only the file SET, which
      is what silently drifted (19 consumers missing, 2026-09-06). -->
 
-Derived cross-agent glob consumers (36 sites, 28 files):
+Derived cross-agent glob consumers (38 sites, 30 files):
 
-- `core/scripts/_frontier.py:183` — `root.glob('*/sessions/*/body-manifest.yaml')`
+- `core/scripts/_frontier.py:190` — `root.glob('*/sessions/*/body-manifest.yaml')`
 - `core/scripts/_paths.py:56` — `agents_root().glob('*/local-paths.conf')`
 - `core/scripts/_paths.py:354` — `agents_root().glob('*/local-paths.conf')`
 - `core/scripts/_seed_engine.py:879` — `agents_dir.glob('*/local-paths.conf')`
@@ -183,24 +184,25 @@ Derived cross-agent glob consumers (36 sites, 28 files):
 - `core/scripts/durability-property-check.py:203` — `root.glob('*/temp')`
 - `core/scripts/gates/defer_target_existence.py:104` — `r.glob('*/aspirations.jsonl')`
 - `core/scripts/gates/defer_target_existence.py:105` — `r.glob('*/aspirations-archive.jsonl')`
-- `core/scripts/housekeeping-tick.py:304` — `Path(ar()).glob('*/experience.jsonl')`
-- `core/scripts/human-blocked-defer-join.py:140` — `agents_root().glob('*/session/pending-questions.yaml')`
+- `core/scripts/housekeeping-tick.py:356` — `Path(ar()).glob('*/experience.jsonl')`
+- `core/scripts/human-blocked-defer-join.py:168` — `agents_root().glob('*/session/pending-questions.yaml')`
 - `core/scripts/inbound-reference-census.py:218` — `agents_root().glob('*/local-paths.conf')`
-- `core/scripts/learning-routing-repair.py:82` — `agents_root().glob('*/experience.jsonl')`
-- `core/scripts/learning-routing-repair.py:83` — `agents_root().glob('*/experience-archive.jsonl')`
-- `core/scripts/pending-questions-sweep.py:828` — `root.glob('*/session/pending-questions.yaml')` (`root = Path(agents_root())`; the `--all-agents` fleet form, g-115-9715 — the single-file default under-reported the fleet corpus by N-1 agents while reporting a clean zero)
+- `core/scripts/learning-routing-repair.py:125` — `agents_root().glob('*/experience.jsonl')`
+- `core/scripts/learning-routing-repair.py:126` — `agents_root().glob('*/experience-archive.jsonl')`
+- `core/scripts/pending-questions-sweep.py:828` — `root.glob('*/session/pending-questions.yaml')`
+- `core/scripts/predicate.py:384` — `_agents_root().glob('*/aspirations.jsonl')`
 - `core/scripts/repo-hygiene-sweep.py:204` — `Path(agents_root()).glob('*/aspirations.jsonl')`
-- `core/scripts/skill-analytics.py:349` — `agents_root().glob('*/skill-invocations.jsonl')`
-- `core/scripts/skill-coinvocation-discovery.py:129` — `base.glob('*/skill-invocations.jsonl')`
-- `core/scripts/skill-discovery.py:224` — `agents_root().glob('*/skill-invocations.jsonl')`
-- `core/scripts/skill-discovery.py:271` — `agents_root().glob('*/journal.jsonl')`
-- `core/scripts/skill-freshness-report.py:148` — `base.glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-analytics.py:350` — `agents_root().glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-coinvocation-discovery.py:130` — `base.glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-discovery.py:225` — `agents_root().glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-discovery.py:275` — `agents_root().glob('*/journal.jsonl')`
+- `core/scripts/skill-freshness-report.py:149` — `base.glob('*/skill-invocations.jsonl')`
 - `core/scripts/skill-latency-report.py:111` — `root.glob('*/local-paths.conf')`
-- `core/scripts/skill-retire-candidates.py:153` — `agents_root().glob('*/skill-invocations.jsonl')`
+- `core/scripts/skill-retire-candidates.py:158` — `agents_root().glob('*/skill-invocations.jsonl')`
 - `core/scripts/team-contribution-report.py:241` — `Path(agents_root).glob('*/aspirations.jsonl')`
 - `core/scripts/utilization-stats.py:485` — `_agents_root().glob('*/local-paths.conf')`
-- `core/scripts/worker_stall.py:662` — `agents_root.glob('*/session')`
-- `mind_api/src/__main__.py:383` — `resolver._agents_root().glob('*/local-paths.conf')`
+- `core/scripts/worker_stall.py:761` — `agents_root.glob('*/session')`
+- `mind_api/src/__main__.py:462` — `resolver._agents_root().glob('*/local-paths.conf')`
 - `mind_api/src/agent_paths.py:286` — `self._agents_root().glob('*/local-paths.conf')`
 - `mind_api/src/agent_paths.py:311` — `self._agents_root().glob('*/local-paths.conf')`
 - `mind_api/src/endpoints/skill_analytics.py:398` — `agents_root.glob('*/skill-invocations.jsonl')`
@@ -209,3 +211,4 @@ Derived cross-agent glob consumers (36 sites, 28 files):
 - `mind_api/src/endpoints/utilization.py:375` — `agents_root.glob('*/local-paths.conf')`
 
 <!-- END GENERATED cross-agent-glob-consumers -->
+

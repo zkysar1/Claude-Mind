@@ -11,6 +11,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from _bash_helpers import BASH  # portable bash argv[0] (guard-580: bare "bash" -> WSL hang on win32)
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -74,53 +76,55 @@ def test_settings_json_wires_hook_exactly_once_on_exit_plan_mode():
     assert any("plan-completion-reminder.sh" in c for c in cmds), cmds
 
 
-# ── task-network harness (plan tool on the wire as TodoWrite, rendered `output`) ──
+# ── a plan TOOL's results are not this hook's business (branch retired 2026-09-21) ──
+#
+# Until 2026-09-21 the hook also matched a task-network plan tool and parsed its rendered
+# result for "every step done". The harness changed what that tool returns five days after
+# the branch shipped, and the branch went dead with every test here still green, because the
+# fixtures carried the OLD render (guard-920: a fixture must carry the production shape). The
+# branch is gone: the harness owns the moment its own plan completes (the why, with the
+# measurements, is in the hook's docstring). What is pinned now is BEHAVIOUR (guard-6333):
+# whatever a plan tool's result says, under either tool name, the hook is silent.
 
-def _plan_tool_payload(output: str) -> str:
-    # The wire shape a task-network harness hands a PostToolUse shell hook: the Claude Code
-    # contract (tool_name = the Claude Code counterpart, tool_input) plus the tool's rendered
-    # `output`. No `tool_response`/`data` — completion must be read from the render.
+def _plan_tool_payload(tool_name: str, output: str) -> str:
+    # Key for key what a task-network harness hands a PostToolUse shell hook (captured from
+    # Zak-Code's own wire builder, 2026-09-21): the Claude Code contract plus its native keys.
     return json.dumps({
-        "event": "PostToolUse", "tool_name": "TodoWrite", "session_id": "s1", "cwd": "/ws",
-        "tool_input": {"tasks": [{"title": "a"}, {"title": "b"}, {"title": "c"}]},
-        "output": output, "is_error": False,
+        "event": "PostToolUse", "hook_event_name": "PostToolUse", "tool_name": tool_name,
+        "tool_input": {"tasks": [{"title": "a", "status": "done"}]},
+        "session_id": "s1", "cwd": "/ws", "transcript_path": "",
+        "output": output, "tool_response": output, "is_error": None,
     })
 
 
-def test_plan_tool_completion_emits_verdict_obligations_without_a_clear():
-    r = _run(_plan_tool_payload(
-        "Current plan (3/3 steps done):\n  [x] t1 a\n  [x] t2 b\n  [-] t3 c — dropped"))
-    assert r.returncode == 0
-    ac = _emitted_context(r)
-    for must in ("Plan COMPLETE", "do not call update_plan", "ORIGINAL request",
-                 "plan finished", "plan-completion-verdict.md"):
-        assert must in ac, must
-    # The harness retires a complete plan itself (Zak-Code ADR-0108); asking the model to
-    # clear it would only spend a tool call on a no-op.
-    assert "tasks: []" not in ac
+_PLAN_TOOL_RESULTS = [
+    "Plan updated: 3/3 steps done — complete.",       # a finished plan's receipt, as sent today
+    "Plan updated: 1/3 steps done · current: t2 b",   # a plan in progress, as sent today
+    "Plan unchanged: 3/3 steps done. Nothing was updated.",
+    "Plan cleared.",
+    # The full render the harness returned until 2026-09-10: the shape the retired branch fired on.
+    "Current plan (3/3 steps done):\n  [x] t1 a\n  [x] t2 b\n  [-] t3 c — dropped",
+]
 
 
-def test_plan_tool_in_progress_is_silent():
-    r = _run(_plan_tool_payload(
-        "Current plan (1/3 steps done):\n  [x] t1 a\n  [~] t2 b  <- current\n  [ ] t3 c"))
+@pytest.mark.parametrize("tool_name", ["TodoWrite", "update_plan"])
+@pytest.mark.parametrize("output", _PLAN_TOOL_RESULTS)
+def test_a_plan_tools_result_is_silent_whatever_it_says(tool_name, output):
+    r = _run(_plan_tool_payload(tool_name, output))
     assert r.returncode == 0
     assert r.stdout.strip() == ""
 
 
-def test_plan_tool_cleared_is_silent_so_the_asked_for_clear_cannot_refire():
-    r = _run(_plan_tool_payload("Plan cleared."))
+def test_the_silence_check_can_see_an_emission():
+    # The control for the tests above: the SAME payload under the one tool this hook serves
+    # does emit, so an empty stdout up there is the hook's decision and not a dead harness.
+    r = _run(_plan_tool_payload("ExitPlanMode", _PLAN_TOOL_RESULTS[0]))
     assert r.returncode == 0
-    assert r.stdout.strip() == ""
-
-
-def test_plan_tool_zero_steps_is_silent():
-    r = _run(_plan_tool_payload("Current plan (0/0 steps done):"))
-    assert r.returncode == 0
-    assert r.stdout.strip() == ""
+    assert "Plan APPROVED" in _emitted_context(r)
 
 
 def test_todowrite_without_rendered_output_is_silent():
-    # A Claude Code TodoWrite payload carries tool_response, never `output` — silent by construction.
+    # A Claude Code TodoWrite payload carries tool_response and no `output` at all.
     r = _run(json.dumps({"tool_name": "TodoWrite",
                          "tool_input": {"todos": [{"content": "x", "status": "completed"}]},
                          "tool_response": {"oldTodos": [], "newTodos": []}}))
@@ -128,12 +132,16 @@ def test_todowrite_without_rendered_output_is_silent():
     assert r.stdout.strip() == ""
 
 
-def test_settings_json_routes_the_plan_tool_matcher_to_the_same_script():
+def test_settings_json_routes_no_other_tool_to_this_script():
+    # Reads the SHIPPED settings: re-adding a plan-tool matcher for this script turns this red.
     s = json.loads(SETTINGS.read_text())
-    hits = [e for e in s["hooks"]["PostToolUse"] if e.get("matcher") == "update_plan"]
-    assert len(hits) == 1, f"expected exactly one update_plan PostToolUse entry, got {len(hits)}"
-    cmds = [h["command"] for h in hits[0]["hooks"]]
-    assert any("plan-completion-reminder.sh" in c for c in cmds), cmds
+    matchers = [
+        e.get("matcher")
+        for entries in s["hooks"].values()
+        for e in entries
+        if any("plan-completion-reminder.sh" in h.get("command", "") for h in e.get("hooks", []))
+    ]
+    assert matchers == ["ExitPlanMode"], matchers
 
 
 def test_rule_file_carries_anchor_clear_and_answer_clauses():

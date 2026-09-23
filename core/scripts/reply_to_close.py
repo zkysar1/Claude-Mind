@@ -27,8 +27,10 @@ returns `noop` with a reason the caller can put in that ack.
 import re
 from typing import Dict, List, Optional
 
-# g-NNN-NN through g-NNN-NNNN (CLAUDE.md ID Formats; widened 2026-05-19).
-GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{2,5}\b", re.IGNORECASE)
+# g-NNN-NN with an OPEN-ENDED sequence (guard-1161): the sequence is a growing
+# counter, and both prior bounds expired ( 2026-05-19, 
+# 2026-09-15). The aspiration half stays bounded — different axis.
+GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d+\b", re.IGNORECASE)
 
 ACTION_COMPLETE = "complete"
 ACTION_DROP_USER_LEG = "drop_user_leg"

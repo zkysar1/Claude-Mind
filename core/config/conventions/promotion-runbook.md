@@ -329,6 +329,31 @@ Run every item; each is a one-liner and each has caught a real defect:
     FAIL). This item stays as the independent read: `py -3
     core/scripts/_seed_engine.py verify-exec-bits --source <worktree> --dest
     <dest>` prints `stripped: []` on a clean hop.
+11. Transform-only diffs — files that changed at the dest although their SOURCE
+    copy is byte-identical between the previous tag and this one. Nobody at the
+    frontier reviewed those diffs, because at the frontier there was no diff:
+    they come from a change to the plant-time TRANSFORM (or to what exempts a
+    file from it), which acts on every file whether or not the file moved.
+
+    ```bash
+    git -C <dest-clone> diff --name-only <prev-merge-sha> <merge-sha> | while read -r f; do
+      git -C <source> cat-file -e "vX.Y.Z:$f" 2>/dev/null \
+        && git -C <source> diff --quiet vPREV vX.Y.Z -- "$f" && echo "TRANSFORM-ONLY: $f"
+    done; echo "examined: $(git -C <dest-clone> diff --name-only <prev-merge-sha> <merge-sha> | wc -l)"
+    ```
+
+    Expected output is the `examined:` line alone. Read that denominator: a zero
+    there means the two shas are wrong, not that the hop is clean (an emptiness
+    check is green by default when it is broken). For each file listed, read
+    the dest diff and answer one question — did only comments, docstrings and
+    prose change? — then compile or parse the planted copy. Name the files in
+    the PR body either way, so a reviewer who sees them is not left guessing.
+    Measured v2.12.78 (2026-09-20): 4 of 102, all comment/docstring-only, after
+    the exemption-marker test was anchored and files that merely MENTIONED the
+    marker in prose stopped self-exempting from the transforms. The same change
+    grew seed-verify's self-reference warning by one entry — so when check 7's
+    list differs from the previous hop's, diff the two lists before calling the
+    warning "pre-existing".
 
 ## Phase 6 — Handoff
 

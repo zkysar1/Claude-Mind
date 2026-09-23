@@ -99,7 +99,7 @@ per-deployment, survives a pull, and is never overwritten by an adoption):
 ```yaml
 installed_tag: v2.12.3
 adopted_at: 2026-08-24T04:00:00
-adopted_from: claude-mind
+adopted_from: <upstream env-id>   # MIND_UPSTREAM; default: the staging deployment
 source_sha: <sha the tag pointed at>
 verified: true          # set only after C4 passes
 ```
@@ -293,8 +293,9 @@ on the staging repo** — the pull side never pushes upstream, so a write scope 
 an unnecessary blast radius.
 
 The staging repo is `https://github.com/zkysar1/Claude-Mind` (locator, per
-`encode-stable-facts.md`; measured 2026-09-05 as coach-mind's `origin` fetch
-URL, and the repo serene-mind was hand-pointed at). A checkout whose `origin`
+`encode-stable-facts.md`; measured 2026-09-05 as a git-fed downstream
+deployment's `origin` fetch URL, and the repo a second downstream deployment was
+hand-pointed at). A checkout whose `origin`
 fetch URL is this repo is the GIT-FED shape of §h.
 
 Failure behaviour is FAIL-CLOSED and non-escalating: if the fetch cannot
@@ -305,8 +306,8 @@ its installed tag, which is a correct and safe state, and files an Unblock.
 ## C7 — Announcements MAY happen; the pull MUST NOT depend on them
 
 `core/scripts/peer-board-post.sh` plus the peer registry in
-`core/config/environments/*.yaml` (6 registered: ayoai-mind, claude-mind,
-coach-mind, local, serene-mind, zds-mind) MAY announce a release.
+`core/config/environments/*.yaml` (every registered deployment; the registry
+is the list) MAY announce a release.
 
 **The pull is a POLL, never a subscription.** An adopting Mind discovers a new
 tag by listing tags at its own cadence; it must adopt correctly with every peer
@@ -432,7 +433,7 @@ Measured against the real registry, 2026-08-25:
 | `ENVIRONMENT_ID` | verdict |
 |---|---|
 | `ayoai-mind` (this box; live read rc=0) | SKIP — dev origin |
-| `claude-mind`, `coach-mind`, `local`, `serene-mind`, `zds-mind` | RUN |
+| every other registered id (staging, production, the other downstream deployments, `local`) | RUN |
 | unregistered (no `environments/<id>.yaml`) | SKIP — fail-closed |
 | empty / unreadable | SKIP — fail-closed |
 
@@ -462,7 +463,7 @@ which is why the gate fails closed AND the wording names the subcommand.
    read "no executor exists yet (measured 2026-08-25 across four surfaces)"
    until 2026-08-27, one day after the executor had landed — the measurement
    was correct on 08-25 and stale by the time it was written down; the
-   2026-08-27 coach-mind adoption ran the protocol by hand because the operator
+   2026-08-27 adoption on a downstream deployment ran the protocol by hand because the operator
    trusted this paragraph over `ls core/scripts`. An adopting Mind (and the
    g-002-02 cadence) should invoke the executor, not re-derive the steps.
    **The entry point is `Skill(update-framework)`**
@@ -470,7 +471,7 @@ which is why the gate fails closed AND the wording names the subcommand.
    convention, refuses at the dev origin, detects the deployment shape (§h) and
    calls the executor — or merges the tag in place where the executor does not
    apply. Never web-search for the framework: measured 2026-09-05 on
-   serene-mind, an agent asked to "pull fresh" guessed the executor, hit its
+   a downstream deployment, an agent asked to "pull fresh" guessed the executor, hit its
    then-mandatory `--source-repo`, and fell through to a web search and then to
    asking the user. The seed record for g-002-02 said "no executor or skill
    exists" until the same day; a stale negative in a recurring goal's own text
@@ -499,8 +500,8 @@ noticing an exit-2 mid-task is work that gets discarded under time pressure.
 queue. Measured 2026-08-28 (zeta, cc-02): fully built, with a non-hand caller
 already in the tree (`unblock-parent-status-sweep.py`). Siblings present and
 working: `peer-board-post.sh`, `peer-retrieve.sh`, `cross-world-post.sh`,
-`peer-surface.sh`. The environment registry carries six worlds including
-`zds-mind.yaml`. Nothing needs writing; the lane needs *wiring*.
+`peer-surface.sh`. The environment registry already carries every sibling world,
+the production deployment included. Nothing needs writing; the lane needs *wiring*.
 
 Its five cross-world guardrails are enforced in the script itself, with no
 caller opt-in: G1 default-Vault (`--shared`), G2 sandboxing (stamps
@@ -553,7 +554,8 @@ the drifted files, never one goal per file.
 
 The chain says a downstream Mind does not develop the framework — "Omni refuses
 dev work" — and until 2026-08-30 that sentence was the whole enforcement. It
-does not survive a small model. Measured that day on coach-mind (zc-03): a Body
+does not survive a small model. Measured that day on the small-model test-bed
+deployment (zc-03): a Body
 executing `/curriculum-gates` used its edit tool three times on
 `.claude/skills/curriculum-gates/SKILL.md` to write its step RESULTS under the
 step headings ("Gates evaluated: configured=false, all_passed=false, gates=[]
@@ -593,8 +595,8 @@ print:
 `seed-transplant.sh` sets `FRAMEWORK_WRITE_OVERRIDE` on its own commit (logged as
 an `override` gate firing, never silent). `git merge` of an upstream tag runs no
 pre-commit hook, so C3's pull is unaffected. Which deployments opt in is a
-deployment decision, not a framework default: coach-mind (small-model test bed)
-does; the production Mind, whose self-evolution has produced real target-ahead
+deployment decision, not a framework default: the small-model test-bed
+deployment does; the production Mind, whose self-evolution has produced real target-ahead
 improvements that § f carries up, is left to its operator.
 
 ## h — Two deployment shapes, one skill (normative, 2026-09-05)
@@ -605,7 +607,7 @@ staging INTO a deployment whose own repo carries no framework history — the
 empty because "the plant carries no tags", C3). A deployment whose checkout IS
 a clone fed by the staging repo — `origin` fetch URL = the staging repo (C6),
 framework `v*` tags reachable in the repo itself — is the **GIT-FED** shape
-(measured 2026-09-05: coach-mind, `origin` → Claude-Mind, tags through
+(measured 2026-09-05 on a downstream deployment: `origin` → the staging repo, tags through
 v2.12.62, HEAD detached on a domain commit above v2.12.56). For git-fed the
 executor is the wrong tool, and its "no source repo" guidance now says so. The
 update is `git fetch origin --tags` then `git merge --no-edit <newest-tag>` in

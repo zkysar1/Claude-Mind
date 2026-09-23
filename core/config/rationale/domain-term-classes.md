@@ -56,9 +56,14 @@ carve-out for "it is just the name of a deployment". The registry directory is
 the single sanctioned home; being the registry does not license repeating an
 identity in a rule, a script, a skill, a convention, or the root project guide.
 
-The registry is itself domain DATA that rides the promotion seed. That is a
-separate problem with a separate owner (g-115-10047, ledger relocation and seed
-exclusion) — it is not an exemption granted here.
+The registry is itself domain DATA, and that is not an exemption granted here.
+Since g-373-124 (5a32cc76d7) it no longer rides the promotion seed: the seed
+ships only the generic entry, every destination keeps the entries it already
+holds, and `domain-leak-check.sh` counts hits only in files the seed ships. All
+three decide from one predicate, `_peer_registry.is_deployment_registry_entry`.
+One hop still carries the registry: the customer tarball, which the staging
+deployment builds with `git archive` (g-374-88). The six readings ledgers stay
+with g-115-10047.
 
 ### Class C — infrastructure and operator identities
 

@@ -316,7 +316,7 @@ def _session_has_closed_goals():
     to it. That is the one direction this proxy is wrong in. It is used anyway
     because the available context sensor is not trustworthy — it read `fresh`
     with 479,998 tokens of headroom straight through a measured exhaustion
-    (g-115-8310) — and a suppressor keyed on a lying sensor is worse than one
+    (2026-09-04) — and a suppressor keyed on a lying sensor is worse than one
     keyed on an honest proxy whose gap is documented.
 
     Fail-open on an unreadable working memory (treated as a fresh session, so
@@ -3490,11 +3490,35 @@ def collect_cross_agent_candidates(project_root, agent_dir, agent_name,
 # BLOCKED GOAL DIAGNOSTICS
 # ---------------------------------------------------------------------------
 
+# Reasons collect_blocked can only emit AT OR BELOW its structured-precondition
+# branch (branch 6) — the one branch in the cascade that costs anything. A
+# caller that consumes NONE of these can have branch 6 skipped outright; see
+# the `only_reasons` kwarg below and the COST SKIP comment at the branch.
+BLOCKED_TAIL_REASONS = frozenset({
+    "precondition_unmet", "routed_to_agent", "not_my_lane",
+})
+
+
+def blocked_skips_tail(only_reasons):
+    """True when `only_reasons` makes collect_blocked's branch 6 dead work.
+
+    SINGLE SOURCE, and the reason it is a function rather than an inlined
+    expression: collect_blocked consults it to decide whether to SKIP, and
+    cmd_blocked to decide what to DECLARE suppressed. Two copies could drift
+    apart, and the failure would be one-directional and silent — a view
+    narrowed without saying so is exactly what `suppressed_reasons` exists to
+    prevent, so the marker must be derived from the same predicate as the skip.
+    """
+    return (only_reasons is not None
+            and not (BLOCKED_TAIL_REASONS & frozenset(only_reasons)))
+
+
 def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                     defer_reason_timeout_hours=None,
                     dependency_timeout_hours=None,
                     reallocation_hours=None,
-                    global_live_ids=None):
+                    global_live_ids=None,
+                    only_reasons=None):
     """Return blocked goals with reasons (inverse of collect_candidates).
 
     Checks blocking conditions in priority order (first match = primary reason):
@@ -3519,9 +3543,22 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
 
     Excludes: recurring cooldown (not a real block), user-only goals,
     completed/skipped/expired/decomposed/in-progress goals.
+
+    only_reasons (optional set/iterable of block_reason strings) narrows the
+    view to callers that consume just some reasons. It is a COST control, not
+    a filter: the ONLY thing it changes is that branch 6's structured-
+    precondition evaluation — the sole expensive step in the whole cascade —
+    is skipped when the caller wants no reason from `BLOCKED_TAIL_REASONS`.
+    Rows for the cheap branches above it are unaffected and still complete, so
+    a narrowed view is PARTIAL rather than filtered, and cmd_blocked marks it
+    as such (`only_reasons` / `suppressed_reasons` / `summary.partial_view`).
+    Default None = today's behaviour exactly (guard-3328).
     """
     today = date.today()
     blocked = []
+    # only_reasons is resolved to a single boolean ONCE — the branch-6 test it
+    # gates runs per goal, and the queue is ~2k goals.
+    _skip_tail = blocked_skips_tail(only_reasons)
     # Per-runner capability set ( Slice 2) — derived once, cached
     # module-wide (same accessor as collect_candidates) so the not_my_lane
     # classification below is the exact inverse of the candidate skip.
@@ -3607,7 +3644,25 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             # 1. Explicit "blocked" status
             if status == "blocked":
                 entry["block_reason"] = "explicit_status"
-                entry["block_detail"] = goal.get("block_reason", "No reason given")
+                # : `block_reason` is NOT a goal field — jsonl-field-probe
+                # returns field_present:false over COMPLETE samples of both stores, so
+                # this default fired on 100% of explicit_status rows (21 of 21, measured
+                # 2026-09-21 cc-13) and manufactured a phantom "reason-less block" class
+                # that no re-probe can ever clear, because there is nothing to re-derive.
+                # The durable reason lives in defer_reason and/or blocked_by. Check 1
+                # PREEMPTS the dependency and deferred renderers below, so an explicitly
+                # blocked goal never reaches them and this branch must render both
+                # itself. Keep the literal for a genuinely bare goal: that class is real,
+                # it is merely empty today, and folding it away would hide the first one.
+                _blk_reason = str(goal.get("defer_reason") or "").strip()
+                _blk_deps = [d for d in (goal.get("blocked_by") or []) if d]
+                if _blk_reason:
+                    entry["block_detail"] = _blk_reason
+                elif _blk_deps:
+                    entry["block_detail"] = "Waiting on: {deps}".format(
+                        deps=", ".join(str(d) for d in _blk_deps))
+                else:
+                    entry["block_detail"] = "No reason given"
                 # C2 coverage (): an explicitly-blocked goal with no defer
                 # fields keeps blocker_ref=None (the L1817 synth found nothing) ->
                 # quiescence C2 fails -> B7 churn. Synth a type=resource ref keyed on
@@ -3797,6 +3852,33 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 entry["block_reason"] = "hypothesis_gate"
                 entry["block_detail"] = "Not before {date}".format(date=rne)
                 blocked.append(entry)
+                continue
+
+            # 6-COST-SKIP (). Branch 6 is the ONLY expensive step in
+            # this cascade: evaluate_all runs one subprocess per command_succeeds
+            # predicate. Profiled 2026-09-20 on cc-03 (Linux 6.8.0-139-generic) —
+            # `goal-selector.sh blocked` took 41.0 s, of which predicate.
+            # evaluate_all took 34.7 s (85%) across 46 serial spawns averaging
+            # 0.738 s. The production consumer (dependency-timeout-check.py, the
+            # only programmatic reader of this view) discards 100% of it: it reads
+            # `block_reason == "dependency"` and nothing else.
+            #
+            # SOUNDNESS — why dropping the goal here cannot change a dependency
+            # row: a goal reaching branch 6 has already failed branches 1-5, and
+            # dependency IS branch 3, which `continue`s on match. So nothing that
+            # reaches this line can ever be classified `dependency`, whatever the
+            # predicates say. The skip is refused whenever ANY reason from
+            # BLOCKED_TAIL_REASONS is wanted, because branches 7 and 8 are
+            # reachable only by passing THROUGH this evaluation.
+            #
+            # NO SENSOR DIES WITH THE SKIPPED RUN (guard-6299): the only write
+            # anywhere under predicate.evaluate_all is _pr_cache_store ->
+            # agents/<agent>/session/pr-merge-state-cache.json, an explicitly
+            # labelled optimization memo whose only readers are predicate.py and
+            # its own test (grep-measured across core/ and .claude/ 2026-09-21) —
+            # and collect_candidates evaluates the identical predicate set on
+            # every ordinary selector run, so even that memo keeps refreshing.
+            if _skip_tail:
                 continue
 
             # 6. Structured preconditions unmet (SYMMETRY with collect_candidates).
@@ -6585,14 +6667,80 @@ def emit_drain_lane_banner(picked, eligible_count, since, k):
     # worker as "not mine". The routing decision stays with the reader, which is
     # exactly where the fence puts it.
     reducer_only = reducer_selection_policy.is_reducer_only_row(picked)
-    closing = (
-        "This IS the sanctioned lane pick, but it declares "
-        "executable_by_role='reducer': the deviation code is NOT waived for a "
-        "Body whose role does not match, and a WORKER Body must NOT claim it — "
-        "leave it for the reducer and take the next candidate."
-        if reducer_only else
-        "This IS the sanctioned top pick — claim it without a deviation code."
-    )
+    # : the SAME waiver hazard on the ROUTING field. The clause above
+    # is conditional on the goal's role declaration; it was UNCONDITIONAL on
+    # intended_agent, so this banner printed "claim it without a deviation code"
+    # over a row routed to a LIVE peer. Measured 2026-09-21 (zeta, cc-02, Linux
+    # 6.8.0-139-generic): in one 2418-candidate pool, 106 rows were routed away
+    # and exactly ONE carried drain_lane_pick — and it was the only one anything
+    # told the reader to claim. The other 105 sat inert as ordinary candidates
+    # the reader abstains from, which is the DESIGNED posture: the selector
+    # surfaces sibling-routed rows on purpose and leaves the fence to the
+    # reader. This lane is the only path that turns such a row into a
+    # claim-permit, so the fence must be restated HERE or it is silently waived
+    # — and guard-2256 ("CLAIM the goal the sidecar names ... do NOT reach for a
+    # deviation code") reads this sentence as its premise.
+    #
+    # WORDING, NOT EXCLUSION — deliberately the  shape rather than the
+    #  one. Dropping the row from lane ELIGIBILITY would also drop the
+    # idle-reallocation case (a goal re-surfaced because its target went idle),
+    # whose entire rescue IS the hoist: such a row scores low, so without the
+    # slot it never resurfaces. Rewording costs that case nothing and still
+    # removes the wrong instruction. Whether the hoist should ALSO be withheld
+    # is a starvation-policy question, not a correctness one; it is tracked on
+    #  with the tradeoff named.
+    routed_away = not _strategic_focus_claimable(picked, AGENT_NAME)
+    if reducer_only:
+        closing = (
+            "This IS the sanctioned lane pick, but it declares "
+            "executable_by_role='reducer': the deviation code is NOT waived for a "
+            "Body whose role does not match, and a WORKER Body must NOT claim it — "
+            "leave it for the reducer and take the next candidate."
+        )
+    elif routed_away:
+        # CORRECTED 2026-09-22 (, zeta/cc-02). The clause this
+        # replaces said "you must NOT claim it — abstain (locus-gated)". That
+        # was WRONG, and it inverted the mechanism it meant to protect.
+        #
+        # A routed-away row cannot reach `scored` by accident. collect_candidates
+        # drops every goal whose intended_agent routes away (line ~3242) UNLESS
+        # the reallocation escape opens — owner idle, or () the goal is
+        # a RECURRING one stranded past realloc_overdue_ratio on a live-but-busy
+        # owner — and unclaimed, and not owner-scoped. collect_blocked mirrors
+        # the identical conjuncts (line ~3973, kept in sync by guard-4622), so a
+        # routed-away goal is in exactly one of the two lists. THEREFORE: if this
+        # row is in the pool at all, its escape opened, and it is here precisely
+        # so a running Body can rescue it.
+        #
+        # Telling that Body to abstain restores the starvation  was
+        # built to end: a cadence-stranded goal's owner can NEVER rank it (its
+        # recurring_urgency is already pinned at the urgency_max clamp, so no
+        # further waiting raises it), which is why "the remedy had to be manual".
+        # Surfacing the goal at rank #1 and then instructing every reader to
+        # leave it for the owner is strictly worse than not surfacing it — it
+        # consumes the one lane slot AND produces no rescue.
+        #
+        # The deviation code is still NOT waived, and the claim still needs
+        # --cross-lane: aspirations.py's claim path computes _lane_conflict from
+        # routes_away_from alone and never consults gates.reallocation_exempt
+        # (imported HERE as _realloc_exempt_eval and never called — the gate
+        # built for exactly this case has zero production callers). So name the
+        # ceremony instead of forbidding the claim.
+        closing = (
+            "This IS the sanctioned lane pick and it IS yours to claim, but it "
+            "declares intended_agent='{ia}': it reached your pool ONLY because "
+            "its reallocation escape opened (owner idle, or recurring and "
+            "cadence-stranded on a busy owner), so it was surfaced here to be "
+            "rescued — do NOT abstain and do NOT leave it for the owner, who "
+            "structurally cannot rank it. The deviation code is not waived: "
+            "claim it with --cross-lane \"reallocation-exempt: intended_agent "
+            "'{ia}' unreachable, goal unclaimed and not owner-scoped\"."
+            .format(ia=picked.get("intended_agent"))
+        )
+    else:
+        closing = (
+            "This IS the sanctioned top pick — claim it without a deviation code."
+        )
     print(
         "[goal-selector] DRAIN-LANE: promoted {gid} to top — recurring goal "
         "{r:.2f}x overdue on the SELECTOR scale ((age-interval)/interval), past the "
@@ -6983,7 +7131,10 @@ def emit_strategic_focus_inert_banner(status):
         "claimed is absent from it for the best possible reason. `blocked`'s row "
         "projection carries no claimed_by, so it cannot answer this — read the "
         "lane's own records (aspirations-query.sh --goal-field id <id> --full) or "
-        "the bottlenecks[] block of this same output, whose cause=READY rows name "
+        "the bottlenecks[] block of THAT `blocked` output — NOT of this one: the "
+        "bare selector's stdout is a JSON LIST with no bottlenecks key at all "
+        "(both emissions live in cmd_blocked; verified 2026-09-22, g-374-64) — "
+        "whose cause=READY rows name "
         "the enablers. An enabler that is READY but missing from your pool is "
         "being worked by someone else; that is the directive being SERVED, not "
         "ignored (guard-1007: never mutate it). Do NOT infer a scoring defect, a "
@@ -7464,11 +7615,16 @@ def cmd_select(args):
     # errored. Pre-binding makes an error here mean "no hoist", which is true.
     _sf_pick = None
     _sf_floor_status = {}
+    # Pre-bound for the same reason as the two above, plus one of its own: the
+    # INERT banner is the ONLY strategic-focus emission a `scorer-verdict.json`
+    # reader can see, and it is captured HERE rather than re-called at the
+    # banners dict below because calling the emitter twice would print it twice.
+    _sf_inert_warnings = []
     try:
         _sf_pick, _sf_floor_status = apply_strategic_focus_floor(
             scored, AGENT_NAME, drain_lane_fired=(_lane_pick is not None))
         emit_strategic_focus_floor_banner(_sf_pick, _sf_floor_status)
-        emit_strategic_focus_inert_banner(_sf_floor_status)
+        _sf_inert_warnings = emit_strategic_focus_inert_banner(_sf_floor_status) or []
     except Exception as e:  # pragma: no cover - defensive; floor must never block
         print(f"[goal-selector] strategic-focus floor error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
@@ -7549,6 +7705,23 @@ def cmd_select(args):
         print(f"[goal-selector] strategic-focus banner error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
+    # The INERT banner belongs in this sidecar too, and it was the one emission
+    # missing from it ( built it; nothing wired it here). Measured
+    # 2026-09-22 (echo, cc-03) on ONE run: stderr carried the full INERT banner
+    # while THIS file's banners.strategic_focus read `[]`. That `[]` is exactly
+    # the conflation the block comment above says the sidecar exists to prevent
+    # -- it cannot distinguish "the pairwise banner had nothing to say" from
+    # "the directive is INERT and a separate emitter said so loudly", and
+    # guard-1753 is the general form: a fail-open reader must return a verdict
+    # that DISTINGUISHES those. It bites here specifically because guard-5135
+    # tells every agent to trust THIS FILE over the banner, so the canonical
+    # read was the one surface that dropped it. Appended, never assigned: the
+    # two emitters are independent and both can legitimately have something to
+    # say in the same run. The value is captured at the floor call site above
+    # (a second call would print the banner twice).
+    if _sf_inert_warnings:
+        banners["strategic_focus"] = list(banners["strategic_focus"]) + _sf_inert_warnings
+
     # Second, ADDITIVE sidecar write (). It must stay AFTER both
     # emitters — that ordering is the entire reason it is a separate writer from
     # write_scorer_verdict above, whose placement BEFORE them is itself pinned
@@ -7617,12 +7790,26 @@ def cmd_blocked(args):
     # path uses, so `blocked` diagnostics never disagree with selection.
     global_done_ids = expand_done_ids_via_supersession(aspirations, global_done_ids)
 
+    # --only-reason (): comma- or repeat-separated block_reasons the
+    # caller actually consumes. Absent -> None -> the full view, unchanged.
+    only_reasons = None
+    raw_only = getattr(args, "only_reason", None)
+    if raw_only:
+        only_reasons = frozenset(
+            r.strip() for part in raw_only for r in str(part).split(",") if r.strip())
+        if not only_reasons:
+            only_reasons = None
+
     blocked = collect_blocked(aspirations, known_blockers=known_blockers,
                               global_done_ids=global_done_ids,
                               defer_reason_timeout_hours=defer_reason_timeout_hours,
                               dependency_timeout_hours=dependency_timeout_hours,
                               reallocation_hours=reallocation_hours,
-                              global_live_ids=global_live_ids)
+                              global_live_ids=global_live_ids,
+                              only_reasons=only_reasons)
+    # Which reasons this run could no longer have observed. Empty unless the
+    # cost skip actually fired, so the marker below never overstates.
+    suppressed = sorted(BLOCKED_TAIL_REASONS) if blocked_skips_tail(only_reasons) else []
 
     # Count total non-terminal goals across active aspirations
     total_active = 0
@@ -7639,6 +7826,13 @@ def cmd_blocked(args):
     # the 2026-08-21 drift this closes.
     by_reason = {}
     for reason in _blocked_reason_counts(blocked):
+        # A suppressed reason is OMITTED, never emitted as a zero. _blocked_
+        # reason_counts always seeds the preset keys at 0 so consumers can
+        # iterate them — correct for a full view, a lie for a narrowed one,
+        # because "0 precondition_unmet" and "not looked at" would render
+        # identically to every reader. Absence is the honest encoding.
+        if reason in suppressed:
+            continue
         matches = [e for e in blocked if e["block_reason"] == reason]
         entry = {"count": len(matches), "goal_ids": [e["goal_id"] for e in matches]}
         if reason == "dependency":
@@ -7687,18 +7881,58 @@ def cmd_blocked(args):
                 gid, goal_map, all_done_ids, blocker_by_skill, blocker_by_category)
             entry["root_bottleneck"] = {"goal_id": root_id, "cause": cause}
         else:
-            # Non-dependency blocks: root is self, cause from block_detail
-            cause_map = {
-                "infrastructure": entry.get("block_detail", "INFRA"),
-                "deferred": "DEFERRED until {t}".format(
-                    t=entry.get("deferred_until", "?")),
-                "hypothesis_gate": entry.get("block_detail", "hypothesis gate"),
-                "explicit_status": entry.get("block_detail", "explicit block"),
-            }
-            entry["root_bottleneck"] = {
-                "goal_id": gid,
-                "cause": cause_map.get(entry["block_reason"], entry["block_reason"]),
-            }
+            # : an explicitly-blocked goal carrying an unmet blocked_by
+            # edge roots to that DEPENDENCY, not to itself. collect_blocked check 1
+            # fires on status alone and `continue`s BEFORE the pending-only filter,
+            # so such a goal can never reach the dependency branch by construction
+            # (the L624 blocker_ref comment records the same preemption from the
+            # other side). Rooting it to self made root_bottleneck unable to answer
+            # the one question it exists for: measured cc-13 2026-09-21, 581 of 592
+            # blocked rows rooted to themselves and only 9 roots gated anything,
+            # while 20 of 21 explicit_status rows carried a live unmet edge.
+            #
+            # Trace from the DEPENDENCY, never from gid: trace_root_bottleneck
+            # terminates immediately on status == "blocked", so starting at gid
+            # re-derives the very self-root this replaces. Seed visited with gid so
+            # a chain looping back terminates as CYCLE instead of recursing.
+            #
+            # Scope is explicit_status ONLY, deliberately. infrastructure preempting
+            # dependency is the documented intent of the check order in
+            # collect_blocked ("higher-level blocks must precede lower-level"), and
+            # deferred/hypothesis_gate are clock gates whose root genuinely is the
+            # goal itself. Narrowing/widening applied at THIS decision site rather
+            # than at the classification scan that feeds every other branch
+            # (guard-2314).
+            #
+            # INHERITED CAVEAT (rb-10548): the cause LABEL on a newly-traced row
+            # comes from trace_root_bottleneck's pending-root tail, which reads only
+            # deferred_until / skill-infra / participants and falls through to READY
+            # — measured wrong on ~60% of READY-labelled rows. This change fixes the
+            # root ID, not that label. Read the root's own block_reason before
+            # trusting a READY. Not fixed here: different defect, its own evidence.
+            _self_unmet = [
+                b for b in _ensure_list(goal_map.get(gid, {}).get("blocked_by"))
+                if b and b not in all_done_ids
+            ]
+            if entry["block_reason"] == "explicit_status" and _self_unmet:
+                root_id, cause = trace_root_bottleneck(
+                    _self_unmet[0], goal_map, all_done_ids,
+                    blocker_by_skill, blocker_by_category, {gid})
+                entry["root_bottleneck"] = {"goal_id": root_id, "cause": cause}
+            else:
+                # Non-dependency blocks: root is self, cause from block_detail
+                cause_map = {
+                    "infrastructure": entry.get("block_detail", "INFRA"),
+                    "deferred": "DEFERRED until {t}".format(
+                        t=entry.get("deferred_until", "?")),
+                    "hypothesis_gate": entry.get("block_detail", "hypothesis gate"),
+                    "explicit_status": entry.get("block_detail", "explicit block"),
+                }
+                entry["root_bottleneck"] = {
+                    "goal_id": gid,
+                    "cause": cause_map.get(entry["block_reason"],
+                                           entry["block_reason"]),
+                }
 
     # Group by root bottleneck → build bottlenecks array
     root_groups = {}
@@ -7743,6 +7977,14 @@ def cmd_blocked(args):
             "bottleneck_count": len(bottlenecks),
         },
     }
+    # Every --only-reason field appears together or not at all (guard-527), so
+    # payload shape with the flag OFF is byte-identical to before. With it ON,
+    # a reader cannot mistake the narrowed view for a census: total_blocked is
+    # an undercount by exactly the suppressed classes, and it says so.
+    if only_reasons is not None:
+        result["only_reasons"] = sorted(only_reasons)
+        result["suppressed_reasons"] = suppressed
+        result["summary"]["partial_view"] = bool(suppressed)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
@@ -7754,7 +7996,20 @@ def main():
     parser = argparse.ArgumentParser(description="Goal scoring with exploration noise")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("select", help="Score and rank all unblocked goals")
-    sub.add_parser("blocked", help="List all blocked goals with reasons")
+    p_blocked = sub.add_parser("blocked", help="List all blocked goals with reasons")
+    # The help text is %-formatted AGAIN by argparse's HelpFormatter, so every
+    # literal percent must survive as `%%` in the FINAL string — hence an
+    # f-string for the interpolation and `85%%` written out. Building it with a
+    # `%` operator instead consumed the escape and argparse died on `%o`.
+    p_blocked.add_argument(
+        "--only-reason", action="append", metavar="REASON",
+        help=(f"Only this block_reason is consumed (repeatable, or comma-separated). "
+              f"A COST control: when no reason from {','.join(sorted(BLOCKED_TAIL_REASONS))} "
+              f"is requested, the structured-precondition branch — 85%% of this "
+              f"command's runtime — is skipped and those classes are omitted from "
+              f"by_reason rather than reported as zero. The reply then carries "
+              f"only_reasons / suppressed_reasons / summary.partial_view. "
+              f"Omit for the full, unchanged view."))
     args = parser.parse_args()
     {"select": cmd_select, "blocked": cmd_blocked}[args.command](args)
 

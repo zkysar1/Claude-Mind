@@ -11,7 +11,7 @@ narrated B6.5/B7/B7.2 as done without running them -- is indistinguishable at
 loop entry from a productive cycle, and the loop reloads the full ~75-minute
 all-blocked handler back to back.
 
-MEASURED on coach (claude-mind, zc-03) 2026-09-03 02:10Z, recorded in g-357-88's
+MEASURED on coach (the staging deployment, zc-03) 2026-09-03 02:10Z, recorded in g-357-88's
 own description (sibling g-357-89 covers the no-notify half): the pane reported
 "Step B7.2 yield complete -- ScheduleWakeup armed for 600s" while
 signals.consecutive_blocked_sleeps=0, blocked_sleep_until unset,

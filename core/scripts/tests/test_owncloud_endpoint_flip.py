@@ -50,7 +50,14 @@ def _run(root: Path, *args: str) -> tuple[int, dict]:
     return r.returncode, out
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="building a foreign-owned .env.local needs root")
+# hasattr FIRST, and the short-circuit is load-bearing: a skipif predicate is
+# evaluated at MODULE SCOPE, and os.geteuid does not exist on Windows -- the
+# bare call raised AttributeError during COLLECTION, which pytest reports as
+# rc=2 for the whole chunk, so one unportable decorator voided a 4-chunk full
+# suite with 772 files never run (2026-09-22,  session). Same idiom
+# as test_abandoned_sessions.py::test_session_dir_owned_by_another_user_holds.
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() != 0,
+                    reason="building a foreign-owned .env.local needs root")
 def test_wrong_user_is_refused_at_p0_before_any_probe(tmp_path):
     root = _fake_root(tmp_path, "STORAGE_BACKEND=own-cloud\n")
     os.chown(root / ".env.local", 65534, 65534)

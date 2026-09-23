@@ -6,7 +6,7 @@
 # Usage:
 #   bash core/scripts/box_capability_probe.sh --self-check
 #   bash core/scripts/box_capability_probe.sh --secret MIND_STRIPE_SECRET_KEY
-#   bash core/scripts/box_capability_probe.sh --peer zds-mind --path /opt/GitHub/X
+#   bash core/scripts/box_capability_probe.sh --peer <env-id> --path /opt/GitHub/X
 #
 # Exit 0 = every probed capability PRESENT, 1 = any ABSENT, 2 = any UNKNOWN
 # (the probe could not run — which is NOT absence).

@@ -241,6 +241,9 @@ GATE_ROWS = (
     # capability-gate.py is rc-shaped: measured rc=1 with a populated `matches` on a
     # must-block reason, rc=0 with `matches: []` on a genuinely-human one.
     "capability-gate-trigger",
+    #  unit 2: rc-shaped like the rows above, but its must-trip input is a
+    # blocker JSON on stdin, so the stubs in this family accept stdin_text.
+    "blocker-create-gate-schema-probe",
 )
 
 
@@ -252,7 +255,8 @@ def _row(name):
 
 
 def _inject(monkeypatch, rc, out, err):
-    monkeypatch.setattr(canary, "_probe", lambda argv: (rc, out, err), raising=True)
+    monkeypatch.setattr(canary, "_probe", lambda argv, stdin_text=None: (rc, out, err),
+                        raising=True)
 
 
 # ---- S-3 read channel: the discriminator is BYTES, not ROWS -------------------
@@ -368,6 +372,44 @@ def test_gate_row_dead_when_a_must_trip_input_returns_rc_zero(monkeypatch):
         assert "evidence sufficient" in detail
 
 
+def test_gate_row_rc_one_with_empty_stdout_is_unevaluatable_not_alive(monkeypatch):
+    """A gate that CRASHES exits 1 too, and rc alone cannot tell it from a refusal.
+
+    guard-5430 in this row's own shape: "a block code of 1 is byte-identical to a
+    crash, an ImportError, or a missing gate file". Before this branch existed the
+    factory answered `dead is False` — "still refuses its must-trip input" — for a
+    gate that died before argparse, which is the exact silent-dead-detector defect
+    this canary exists to catch, living inside the canary.
+
+    Measured (echo/cc-03 2026-09-21): one bad import into a real gate -> rc=1 with
+    ZERO stdout and 252 stderr bytes; the same gate intact -> rc=1 with 720 bytes of
+    its JSON. The empty-stdout half is the only one that moves.
+    """
+    _inject(monkeypatch, 1, "", "ModuleNotFoundError: No module named '_no_such_zz9'")
+    for name in GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is None, f"{name}: {detail}"
+        assert "EMPTY stdout" in detail and "guard-5430" in detail, f"{name}: {detail}"
+        assert "ModuleNotFoundError" in detail, f"{name}: stderr must reach the reader"
+
+
+def test_gate_row_rc_one_with_a_payload_is_still_alive(monkeypatch):
+    """THE OTHER HALF OF THE SPLIT, in the same pass as its twin above.
+
+    The narrowing must not convert a live row into a permanent unevaluatable — that
+    would delete the detector rather than fix it. rc=1 CARRYING the gate's verdict is
+    a refusal and stays alive.
+    """
+    # checks[] is for the blocker row, which reads its own check's entry (guard-1082);
+    # the argv rows ignore the key.
+    _inject(monkeypatch, 1, '{"trigger_matched": "is not built", '
+                            '"checks": [{"name": "schema_probe", "passed": false}]}', "")
+    for name in GATE_ROWS:
+        dead, detail = _row(name)["assertion"]()
+        assert dead is False, f"{name}: {detail}"
+        assert "still refuses" in detail
+
+
 def test_gate_row_unexpected_rc_is_unevaluatable_not_dead(monkeypatch):
     """rc=2 is usage, not a verdict. A broken invocation must never manufacture a
     stuck count — that would make this canary the always-ALARM defect."""
@@ -389,12 +431,144 @@ def test_gate_row_absent_script_is_unevaluatable_not_dead(tmp_path, monkeypatch)
 
 
 def test_gate_row_unevaluatable_when_the_probe_raises(monkeypatch):
-    def _boom(argv):
+    def _boom(argv, stdin_text=None):
         raise OSError("interpreter vanished")
     monkeypatch.setattr(canary, "_probe", _boom, raising=True)
     for name in GATE_ROWS:
         dead, detail = _row(name)["assertion"]()
         assert dead is None and "could not run" in detail
+        assert "interpreter vanished" in detail, detail
+
+
+# ---- blocker-create-gate row ( unit 2): stdin input, check-3 fixture ----
+
+def test_argv_rows_keep_their_one_argument_probe_call(monkeypatch):
+    """stdin_text defaults to None, and then the factory calls _probe(argv) exactly as
+    before. A one-argument stub would raise TypeError on any added keyword."""
+    monkeypatch.setattr(canary, "_probe", lambda argv: (1, '{"trigger_matched": "x"}', ""),
+                        raising=True)
+    dead, detail = _row("zero-count-gate-trigger")["assertion"]()
+    assert dead is False, detail
+
+
+def test_blocker_row_sends_its_payload_on_stdin(monkeypatch):
+    seen = {}
+
+    def _capture(argv, stdin_text=None):
+        seen["stdin"] = stdin_text
+        return 1, '{"checks": [{"name": "schema_probe", "passed": false}]}', ""
+    monkeypatch.setattr(canary, "_probe", _capture, raising=True)
+    dead, detail = _row("blocker-create-gate-schema-probe")["assertion"]()
+    assert dead is False, detail
+    assert canary.json.loads(seen["stdin"]) == canary.BLOCKER_STAT_NEG_PAYLOAD
+
+
+def test_blocker_payload_fails_exactly_check_3_on_the_real_gate():
+    """The row reads rc=1 as check 3 refusing. That holds only while NO sibling check
+    also fails on this payload, so pin it against the real gate."""
+    import json
+    import subprocess
+    r = subprocess.run([sys.executable, str(SCRIPTS / "blocker-create-gate.py")],
+                       input=json.dumps(canary.BLOCKER_STAT_NEG_PAYLOAD),
+                       capture_output=True, text=True, timeout=60,
+                       env={**os.environ, canary.LIVENESS_PROBE_ENV: "pytest"})
+    assert r.returncode == 1, (r.returncode, r.stderr[:300])
+    out = json.loads(r.stdout)
+    failing = [c["name"] for c in out["checks"] if not c["passed"]]
+    assert failing == ["schema_probe"], failing
+
+
+def test_blocker_row_is_alive_against_the_real_gate():
+    dead, detail = _row("blocker-create-gate-schema-probe")["assertion"]()
+    assert dead is False, detail
+
+
+def test_blocker_rotted_fixture_is_unevaluatable_not_dead():
+    """Driven both ways against the real gate. The rotted reason with no fixture check
+    reads DEAD (the false accusation). The fixture check turns it UNEVALUATABLE."""
+    import json
+    rotted = dict(canary.BLOCKER_STAT_NEG_PAYLOAD,
+                  failure_reason="the utilization field is rarely populated")
+    bare = canary._gate_trigger_assertion("blocker-create-gate.py", (), "x",
+                                          stdin_text=json.dumps(rotted))
+    assert bare()[0] is True
+    checked = canary._gate_trigger_assertion(
+        "blocker-create-gate.py", (), "x",
+        fixture_check=canary._stat_neg_fixture_check(rotted),
+        stdin_text=json.dumps(rotted))
+    dead, detail = checked()
+    assert dead is None and "fixture is stale" in detail, detail
+
+
+def _blocker_verdict(**passed):
+    import json
+    return json.dumps({"checks": [{"name": n, "passed": p} for n, p in passed.items()]})
+
+
+def test_blocker_row_dead_when_only_a_sibling_check_refuses(monkeypatch):
+    """guard-1082: rc=1 carried by multi_signal while schema_probe PASSED its must-trip
+    input is a dead check 3. The coarse rc read it alive."""
+    _inject(monkeypatch, 1, _blocker_verdict(multi_signal=False, schema_probe=True), "")
+    dead, detail = _row("blocker-create-gate-schema-probe")["assertion"]()
+    assert dead is True, detail
+    assert "schema_probe PASSED" in detail and "guard-1082" in detail, detail
+
+
+def test_blocker_row_alive_when_check_3_refuses_beside_a_sibling(monkeypatch):
+    _inject(monkeypatch, 1, _blocker_verdict(multi_signal=False, schema_probe=False), "")
+    dead, detail = _row("blocker-create-gate-schema-probe")["assertion"]()
+    assert dead is False, detail
+
+
+def test_blocker_row_unreadable_verdict_is_unevaluatable_not_alive(monkeypatch):
+    _inject(monkeypatch, 1, "blocked, see log", "")
+    dead, detail = _row("blocker-create-gate-schema-probe")["assertion"]()
+    assert dead is None and "which check refused is unknown" in detail, detail
+
+
+def test_blocker_row_renamed_check_is_unevaluatable_not_dead(monkeypatch):
+    _inject(monkeypatch, 1, _blocker_verdict(stat_neg_probe=False), "")
+    dead, detail = _row("blocker-create-gate-schema-probe")["assertion"]()
+    assert dead is None and "no check named 'schema_probe'" in detail, detail
+
+
+def test_refusal_check_that_raises_is_unevaluatable(monkeypatch):
+    def _broken_reader(out):
+        raise RuntimeError("reader broke")
+    _inject(monkeypatch, 1, _blocker_verdict(schema_probe=False), "")
+    assertion = canary._gate_trigger_assertion("blocker-create-gate.py", (), "x",
+                                               refusal_check=_broken_reader)
+    dead, detail = assertion()
+    assert dead is None and "refusal check itself failed (reader broke)" in detail, detail
+
+
+def test_sibling_only_refusal_both_ways_against_the_real_gate():
+    """Against the real gate: one evidence entry (multi_signal fails) and a
+    non-statistical reason (schema_probe passes), so rc=1 comes from a sibling. The
+    coarse assertion reads that as alive; the refusal check reads it as DEAD."""
+    import json
+    sibling_only = dict(canary.BLOCKER_STAT_NEG_PAYLOAD,
+                        failure_reason="the service returned an error",
+                        evidence=canary.BLOCKER_STAT_NEG_PAYLOAD["evidence"][:1])
+    coarse = canary._gate_trigger_assertion("blocker-create-gate.py", (), "x",
+                                            stdin_text=json.dumps(sibling_only))
+    assert coarse()[0] is False
+    strict = canary._gate_trigger_assertion(
+        "blocker-create-gate.py", (), "x", stdin_text=json.dumps(sibling_only),
+        refusal_check=canary._named_check_refused("schema_probe"))
+    dead, detail = strict()
+    assert dead is True and "['multi_signal']" in detail, detail
+
+
+def test_empty_stat_neg_table_stays_loud_not_stale(tmp_path, monkeypatch):
+    """guard-7231: an EMPTY pattern table must not be filed as a stale fixture, or a
+    dead check 3 would read unevaluatable (silent under --quiet)."""
+    gates = tmp_path / "gates"
+    gates.mkdir()
+    (gates / "blocker_create.py").write_text("_STAT_NEG_PATTERNS = []\n")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    check = canary._stat_neg_fixture_check(canary.BLOCKER_STAT_NEG_PAYLOAD)
+    assert check("blocker-create-gate.py", ()) is None
 
 
 # ---- V-5 + V-7: the hook-shaped pair, and the factory they share --------------
@@ -532,6 +706,22 @@ def test_hook_gate_row_unevaluatable_when_the_probe_raises(monkeypatch):
     for name in HOOK_GATE_ROWS:
         dead, detail = _row(name)["assertion"]()
         assert dead is None and "could not run" in detail
+
+
+def test_probe_marks_its_child_as_a_liveness_probe(monkeypatch):
+    """: every probed gate logs its decision through _gate_log, so an
+    unmarked must-trip probe lands in the retirement evaluator's input as a real
+    `block` (measured: 1502 of 1515 exhaustive-search-gate firings in two days).
+    The marker must reach the CHILD, where the gate's log() call runs — and it
+    must not leak into this process's own environment."""
+    monkeypatch.delenv(canary.LIVENESS_PROBE_ENV, raising=False)
+    rc, out, _err = canary._probe([
+        sys.executable, "-c",
+        f"import os, sys; sys.stdout.write(os.environ.get({canary.LIVENESS_PROBE_ENV!r}, ''))",
+    ])
+    assert rc == 0
+    assert out == "signal-liveness-canary"
+    assert canary.LIVENESS_PROBE_ENV not in os.environ
 
 # ---- the two inventory members deliberately NOT registered -------------------
 

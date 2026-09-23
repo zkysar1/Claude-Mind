@@ -278,6 +278,24 @@ _SNAPSHOT_BLACKLIST = {
         # so they carry real restore value. Segmentation ALSO fixes their churn
         # on its own — a write touches one small day-file instead of the 20.7MB
         # whole store — so there is nothing left for a blacklist entry to buy.
+        # : the zakpod1 hardware monitor's event log, added WITH the
+        # cutover of its writer off bare open(...,"a") onto
+        # locked_append_jsonl_many — the guard-2415 pair-decision taken at the
+        # same time rather than after it. The monitor appends on every state
+        # change from a 2-minute systemd timer on cc-07, so unblacklisted it
+        # would snapshot the whole file on each problem/level/cleared/email row.
+        # Restore value is nil: append-only telemetry, the file IS the history,
+        # and the changelog still records every write. No .history subtree to
+        # delete alongside this addition — the prior writer was a bare append, so
+        # one was never created (verified 2026-09-22).
+        #
+        # The FULL relative path, not a basename: _is_snapshot_blacklisted matches
+        # against the path relative to the world root and this store lives under
+        # telemetry/. A bare "telemetry/" prefix would cover it in one line and is
+        # deliberately NOT used — nine other stores live there whose writers this
+        # change does not touch, and silently altering their snapshot behaviour is
+        # a wider blast radius than the defect being fixed.
+        "telemetry/zakpod1-health-events.jsonl",
     ),
     "meta": (
         "gate-firings.jsonl",   # append-only gate-decision audit log (file IS the history)

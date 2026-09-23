@@ -16,6 +16,8 @@ Contract pinned here:
   (c) Outside pytest (PYTEST_CURRENT_TEST absent), log() writes — the
       production path is unchanged.
   (d) The never-raises contract survives the guard.
+  (e) LIVENESS_PROBE_ENV (set by signal-liveness-canary.py on its probes) is a
+      second suppression, independent of pytest (g-318-168).
 
 All cases pass meta_dir=tmp_path so no case can touch the production store.
 """
@@ -79,6 +81,26 @@ def test_writes_outside_pytest(tmp_path, monkeypatch):
     recs = _records(tmp_path)
     assert len(recs) == 1
     assert recs[0]["decision"] == "noop"
+
+
+def test_liveness_probe_env_suppresses_and_its_absence_writes(tmp_path, monkeypatch):
+    """(e) : a canary's must-trip probe is not a production firing.
+    Both arms in one process, the pytest guard held open by the opt-out: with
+    LIVENESS_PROBE_ENV set nothing lands; with it removed the same call writes."""
+    monkeypatch.setenv("GATE_LOG_ALLOW_PYTEST", "1")
+    monkeypatch.setenv(gl_mod.LIVENESS_PROBE_ENV, "signal-liveness-canary")
+    gl_mod.log("suppression-test-gate", "block",
+               caller="test_gate_log_pytest_suppression",
+               trigger_matched="synthetic", meta_dir=tmp_path)
+    assert _records(tmp_path) == []
+
+    monkeypatch.delenv(gl_mod.LIVENESS_PROBE_ENV)
+    gl_mod.log("suppression-test-gate", "block",
+               caller="test_gate_log_pytest_suppression",
+               trigger_matched="synthetic", meta_dir=tmp_path)
+    recs = _records(tmp_path)
+    assert len(recs) == 1
+    assert recs[0]["decision"] == "block"
 
 
 def test_never_raises_with_bad_payload(tmp_path, monkeypatch):

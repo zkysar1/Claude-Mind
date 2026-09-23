@@ -198,7 +198,7 @@ def test_aspirations_store_is_not_a_reference(tmp_path):
 # --- id boundary -----------------------------------------------------------
 
 def test_prefix_of_a_longer_id_does_not_match(tmp_path):
-    """g-777-4 must not match  (or every short id blocks forever)."""
+    """ must not match  (or every short id blocks forever)."""
     _write(tmp_path, "core/scripts/real.py", "# refers to g-777-421 only\n")
     r = _run(tmp_path, "g-777-42")
     assert r.returncode == 0, r.stderr

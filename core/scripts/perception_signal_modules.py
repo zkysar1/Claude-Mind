@@ -9,8 +9,8 @@ file implements that table rather than inventing a shape for it.
 
 WHY THIS IS A SEPARATE FILE FROM perception_bus.py, where FileTouchModule and
 ScriptPollModule live. The bus is stdlib-only on purpose: the convention calls
-it "the portable cognition core" built against by three runtimes (ayoai,
-claude-mind, zak-code), and FileTouchModule takes an explicit path precisely so
+it "the portable cognition core" built against by three runtimes (the product
+runtime, the Mind framework, the vessel), and FileTouchModule takes an explicit path precisely so
 the bus never learns an agent layout. These modules MUST resolve
 `agents/<agent>/session/<signal>`, so importing `_paths` into the bus would
 trade that portability for two classes. The pack boundary is the natural seam.

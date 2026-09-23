@@ -8,6 +8,11 @@ A. SLASH-PREFIX prompts (2026-05-18) -- the gate's original purpose. This half
 B. `stop: true` cancelling the deadman net on a LIVE loop (2026-08-25). The
    deadman is a SINGLE replace-slot wakeup, so cancelling it while the agent is
    RUNNING converts a recoverable pause into a hard stop that needs a human.
+C. Arming the sentinel with NO loop under it (2026-09-21). A net outlives the
+   loop it was armed for, and the turn that receives its firing re-arms BEFORE
+   it reads the state gate that refuses -- so an IDLE agent re-enters the same
+   turn forever. Exact mirror of B: B refuses a cancel while RUNNING, C refuses
+   an arm while not.
 
 The gate is invoked exactly as production invokes it -- a subprocess reading the
 PreToolUse payload from stdin (probe-with-canonical-code-path: canonical BINARY
@@ -138,6 +143,103 @@ def test_other_tools_are_untouched(agent):
     set_state(agent, "RUNNING")
     rc, decision, _ = run_gate({"stop": True}, agent_dir=agent, tool_name="Bash")
     assert (rc, decision) == (0, None)
+
+
+# ---------------------------------------------------------------- class C ---
+# Outcome table from _arm_would_resurrect_nothing's docstring (guard-3328):
+# every branch gets a case, not just the deny. Class B's twin, read together.
+
+def test_arming_the_net_with_no_loop_under_it_is_denied(agent):
+    """POSITIVE CONTROL. This is the exact call that looped sera.
+
+    Measured, not asserted: unwiring `_arm_would_resurrect_nothing` from main()
+    turns exactly THREE tests red -- this one, the message test below, and the
+    mirror test at the end of the class. Every other test in this file stays
+    green, class A and B included. So the guard's whole footprint is those
+    three, and the five allow-cases here hold whether it exists or not, which
+    is what makes them controls rather than restatements of it.
+    """
+    set_state(agent, "IDLE")
+    rc, decision, out = run_gate(
+        {"prompt": "<<autonomous-loop-dynamic>>"}, agent_dir=agent)
+    assert (rc, decision) == (0, "deny")
+
+
+def test_the_arm_denial_says_an_idle_agent_should_simply_stop(agent):
+    """A deny that does not name the correct action sends the model looking."""
+    set_state(agent, "IDLE")
+    _, _, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>"}, agent_dir=agent)
+    assert "no loop under the net" in out
+    assert "answer the user and stop" in out.replace("\\n", " ").replace("  ", " ")
+
+
+def test_a_cancel_from_idle_is_not_an_arm_however_its_prompt_reads(agent):
+    """Outcome 1, and a fresh-eyes regression (2026-09-22).
+
+    ScheduleWakeup's contract: when `stop` is true "all other fields are
+    ignored". So a sentinel left in `prompt` on a cancel is vestigial -- the
+    model re-sending its previous args -- and reading it as an arm DENIES a
+    legitimate cancel. That matters more than it sounds: cancelling a leftover
+    net from IDLE is the manual remedy for the very cycle the arm guard exists
+    to prevent, so the guard would have blocked its own fallback.
+    """
+    set_state(agent, "IDLE")
+    rc, decision, _ = run_gate(
+        {"stop": True, "prompt": "<<autonomous-loop-dynamic>>"}, agent_dir=agent)
+    assert (rc, decision) == (0, None)
+
+
+def test_a_wakeup_that_waits_on_the_world_is_not_the_loops_net(agent):
+    """Outcome 1: only the sentinel claims to resurrect the loop. An external
+    wait is legitimate from IDLE -- that is what assistant mode does all day."""
+    set_state(agent, "IDLE")
+    rc, decision, _ = run_gate(
+        {"prompt": "check GitHub PR #142 CI run status"}, agent_dir=agent)
+    assert (rc, decision) == (0, None)
+
+
+def test_a_user_loop_continuation_is_not_the_loops_net(agent):
+    """Outcome 1: /loop is the user's, and it may well be armed from IDLE."""
+    set_state(agent, "IDLE")
+    rc, decision, _ = run_gate(
+        {"prompt": "/loop investigate flaky test"}, agent_dir=agent)
+    assert (rc, decision) == (0, None)
+
+
+def test_arming_is_allowed_when_agent_state_is_unreadable(agent):
+    """Outcome 2: fail-open. A gate that guessed here would stall live loops."""
+    rc, decision, _ = run_gate(
+        {"prompt": "<<autonomous-loop-dynamic>>"}, agent_dir=agent)
+    assert (rc, decision) == (0, None)
+
+
+def test_arming_is_allowed_when_no_agent_is_bound(agent):
+    """Outcome 2: no sid and no override -> nothing to read -> approve."""
+    rc, decision, _ = run_gate({"prompt": "<<autonomous-loop-dynamic>>"})
+    assert (rc, decision) == (0, None)
+
+
+def test_a_stop_in_flight_still_keeps_its_net(agent):
+    """Outcome 3 at its hardest: /stop writes `stop-requested` and LEAVES the
+    state RUNNING until Phase -1.4. The loop is still finishing its in-flight
+    obligations there, so the net must stay armable right through the stop."""
+    set_state(agent, "RUNNING")
+    (agent / "session" / "stop-requested").write_text("1", encoding="utf-8")
+    rc, decision, _ = run_gate(
+        {"prompt": "<<autonomous-loop-dynamic>>"}, agent_dir=agent)
+    assert (rc, decision) == (0, None)
+
+
+def test_the_two_guards_are_mirrors_of_one_another(agent):
+    """The pair's whole claim: the net exists exactly when a loop does. One
+    state file, two directions, and neither state leaves both doors open."""
+    sentinel = {"prompt": "<<autonomous-loop-dynamic>>"}
+    set_state(agent, "RUNNING")
+    assert run_gate(sentinel, agent_dir=agent)[1] is None, "RUNNING may arm"
+    assert run_gate({"stop": True}, agent_dir=agent)[1] == "deny", "RUNNING may not cancel"
+    set_state(agent, "IDLE")
+    assert run_gate(sentinel, agent_dir=agent)[1] == "deny", "IDLE may not arm"
+    assert run_gate({"stop": True}, agent_dir=agent)[1] is None, "IDLE may cancel"
 
 
 # ---------------------------------------------------------------- class A ---

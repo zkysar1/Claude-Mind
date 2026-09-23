@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# domain-leak-exempt: the upstream repo name is a LIVE DEFAULT in this file, not an
+# example. `os.environ.get("MIND_UPSTREAM", <upstream>)` and the sibling-clone
+# fallback `project_root.parent / <upstream>` ARE the resolution chain
+# pull-promotion.md specifies, and the docstring + operator-facing error string that
+# name the same path must stay byte-consistent with them — a diagnostic that names a
+# placeholder instead of the path actually resolved is worse than the leak. Literal
+# path operand: the functional case domain-free-examples.md § Marker Restriction
+# reserves the marker for.
+#
+# SCOPE CAVEAT (g-115-10050 — 116 marked files, the marker is an over-used route):
+# this marker suppresses EVERY blocklist term in this file, not just the upstream id.
+# Keep unrelated domain content out of this file; it would now pass the gate silently.
+# (g-373-123)
 """Framework-pull executor: the ADOPTING side of the promotion chain.
 
 Implements `core/config/conventions/pull-promotion.md` (C1-C7 + addenda a-d)
@@ -939,7 +952,7 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
     failure = None
     try:
         # CHECKPOINT the dirty TRACKED files before anything touches the tree
-        # (). The plan's disjointness step REPORTS them and proceeds --
+        # (g-360-17). The plan's disjointness step REPORTS them and proceeds --
         # correctly, since disjoint work cannot be clobbered by the copy -- but
         # "not clobbered by the copy" is not "safe": a red or voided verdict
         # sends the tree through rollback(), and until this commit exists that

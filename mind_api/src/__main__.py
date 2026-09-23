@@ -855,8 +855,67 @@ def main(argv=None) -> int:
         with _spawn_lock(project_root):
             if lifecycle.is_daemon_alive(project_root):
                 port = lifecycle.read_port(project_root)
+                # : record the refusal in daemon.log, not only stderr.
+                # stderr goes to the SPAWN log; an auditor reading daemon.log saw
+                # `started` events with unexplained gaps between them because every
+                # decision NOT to start was invisible in this file.
+                lifecycle.log_event(
+                    project_root, "start-refused", __version__,
+                    reason="already-running", port=port,
+                    pid=lifecycle.read_pid(project_root),
+                )
                 print(f"[runtime] daemon already running on port {port}; refusing to start",
                       file=sys.stderr)
+                return 2
+
+            # : `is_daemon_alive` above is PIDFILE-scoped -- it reads
+            # daemon.pid. When that file is missing, stale or unparsable BESIDE a
+            # genuinely live daemon it returns False and we fall through here, where
+            # `clear_runtime_files()` is itself the orphaning act: it erases the only
+            # pointer to a process that keeps listening and keeps burning CPU.
+            # Measured signatures: a 17.8h orphan at 24% CPU (4h17m46s CPU time); a
+            # 3.7 GB-RSS orphan that drove the box into memory pressure and got a
+            # close OOM-killed MID-VERIFY, which then re-ran and inflated
+            # loop_state.goals_completed 65 -> 67 for ONE real completion; and
+            # guard-6980's ten orphans over 18h holding ~4.25 GB.
+            #
+            # REFUSE, DO NOT REAP. outcome 2 of  allows either, and
+            # refusing is the branch the guardrails require: guard-7162 (killing a
+            # live process is destructive, unrevertable, and destroys the evidence
+            # that would have settled whether it needed killing) and guard-1144
+            # (never kill the live daemon while a suite is running on the box). The
+            # deliberate reap already exists and is the documented recovery in both
+            # guard-6154 and guard-6980: `daemon-orphan-sweep.sh` (report) then
+            # `--clean`. It builds its keep-set from every sibling deployment's
+            # published pair, so it will not kill a sibling world's live daemon --
+            # which is exactly the judgement a blind in-process kill here could not
+            # make. This branch's job is to stop MAKING orphans and to say so on the
+            # record; reaping stays a deliberate, consulted act.
+            # NO ENV OVERRIDE HERE, DELIBERATELY. An escape valve was written and
+            # REMOVED: `test_every_owncloud_env_key_the_daemon_reads_is_loadable`
+            # refused it -- "a read-but-unsettable knob is a control that fails
+            # silently open" -- and the honest fixes were to either make an
+            # always-orphan flag permanently settable in .env.local (a worse hazard
+            # than the leak it guards) or to drop it. The valve was speculative:
+            # rt_daemon_kill waits for actual exit (bounded ~2s) then force-kills,
+            # so a healthy recycle finds no live predecessor here, and the recovery
+            # for a genuinely unreapable process already exists and is documented in
+            # guard-6154 / guard-6980 -- `daemon-orphan-sweep.sh` then `--clean`.
+            unreferenced = lifecycle.find_unreferenced_daemon_pids(project_root)
+            if unreferenced:
+                lifecycle.log_event(
+                    project_root, "start-refused", __version__,
+                    reason="unreferenced-daemon-alive", pids=unreferenced,
+                    recovery="core/scripts/daemon-orphan-sweep.sh --clean",
+                )
+                print(
+                    "[runtime] refusing to start: "
+                    f"{len(unreferenced)} live mind_api.src process(es) {unreferenced} "
+                    "are not named by daemon.pid/daemon.parent.pid. Starting now would "
+                    "clear the runtime files and orphan them. Recover with "
+                    "`bash core/scripts/daemon-orphan-sweep.sh` (report) then `--clean`.",
+                    file=sys.stderr,
+                )
                 return 2
 
             lifecycle.clear_runtime_files(project_root)

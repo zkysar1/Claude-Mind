@@ -17,8 +17,14 @@
 # bucket name is reused on the basement store, the lock tables stay on the
 # incumbent cloud (g-372-01: the override is S3-only) and the credential pair is
 # the same (same-pair policy, g-372-07 / g-372-16), so nothing else changes.
-# REVERT is the mirror: delete the line, restart. The incumbent bucket is kept
-# read-only for 30 days for exactly this reason (§14.2 row B7).
+# REVERT is the mirror: PUT BACK WHAT WAS THERE, restart. --to parks the pre-flip
+# value in mind_api/state/owncloud-endpoint-preflip and --revert restores it,
+# falling back to deleting the line only when the capture is empty (there was no
+# line before the flip) or absent (nothing captured — an older build, or a
+# hand-edit). Before g-372-39 --revert always DELETED, so on a box carrying an
+# explicit endpoint a flip/revert cycle silently moved the box off its configured
+# route onto the regional default and still reported ok:true. The incumbent bucket
+# is kept read-only for 30 days for exactly this reason (§14.2 row B7).
 #
 # PRECONDITIONS (each refused loudly; none is skippable). P0 gates EVERY action;
 # P1-P5 gate --to and --revert:
@@ -46,9 +52,11 @@
 # VERIFICATION after the restart — the daemon must say it about ITSELF
 # (guard-1976; /proc/<pid>/environ is not evidence, guard-4274):
 #   V1 /v1/admin/health reports storage_backend=OwnCloudBackend and
-#      storage_endpoint == the target ("" after --revert).
+#      storage_endpoint == the target (after --revert: the captured pre-flip
+#      value, or "" when the capture was empty or absent).
 #   V2 cold-snapshot --print-target [target] reads mode=pinned cold_endpoint=aws-regional
-#      and live_endpoint=<target> (aws-regional after --revert).
+#      and live_endpoint=<target> (after --revert: the restored value, or
+#      aws-regional when there was nothing to restore).
 #   V3 the probe again, with the environment exactly as .env.local now reads.
 #
 # NO SECRET VALUE IS EVER PRINTED — the URL is not a secret; keys appear by NAME.
@@ -80,6 +88,13 @@ ENV_FILE="$ROOT/.env.local"
 [ -f "$ENV_FILE" ] || { echo "owncloud-endpoint-flip: $ENV_FILE not found" >&2; exit 1; }
 KEY=STORAGE_S3_ENDPOINT_URL
 HOST="$(hostname)"
+# Where --to parks the PRE-FLIP value so --revert can put it back (g-372-39).
+# Machine-local daemon state, NOT beside .env.local: a sidecar at the repo root
+# is a NEW top-level entry, which check-repo-root-entries correctly refuses at
+# commit time, and that refusal strands the box's push lane behind a staged index.
+# An EMPTY file is meaningful — it records "there was no line before the flip",
+# which is what makes the delete path a restore rather than a default.
+PREFLIP_FILE="$ROOT/mind_api/state/owncloud-endpoint-preflip"
 
 log()  { printf '[owncloud-endpoint-flip] %s\n' "$*" >&2; }
 fail() { printf '{"ok": false, "host": "%s", "action": "%s", "stage": "%s", "detail": "%s"}\n' "$HOST" "$ACTION" "$1" "${2//\"/\'}"; exit 1; }
@@ -222,6 +237,19 @@ if [ "$ACTION" = flip ]; then
         log "DRY-RUN: would write $KEY=$URL to $ENV_FILE (currently '${current:-<unset>}'), restart the daemon, verify V1-V3"
         printf '{"ok": true, "dry_run": true, "host": "%s", "action": "flip", "endpoint": "%s", "current": "%s", "cold_target": "%s"}\n' "$HOST" "$URL" "$current" "${ct//\"/\'}"; exit 0
     fi
+    # Park the PRE-FLIP value so --revert can restore it (g-372-39). Written
+    # only on the path that actually changes the file — the already-true exit
+    # above and the dry-run exit both return before here, so neither records a
+    # capture for a flip that never happened.
+    # ONLY WHEN ABSENT, so a flip -> flip -> revert chain returns to the state
+    # the FIRST flip found, not to an intermediate one. "Put it back" means the
+    # state the caller started from.
+    if [ ! -e "$PREFLIP_FILE" ]; then
+        mkdir -p "$(dirname "$PREFLIP_FILE")" 2>/dev/null || true
+        printf '%s' "$current" > "$PREFLIP_FILE" 2>/dev/null \
+            && log "captured pre-flip $KEY='${current:-<unset>}' for --revert ($PREFLIP_FILE)" \
+            || log "WARNING: could not write $PREFLIP_FILE — --revert will fall back to deleting the line"
+    fi
     write_env set "$URL"
     [ "$(_get "$KEY")" = "$URL" ] || fail write "read-back of $KEY did not match"
     log "wrote $KEY=$URL (mode 600, owner preserved)"
@@ -229,21 +257,63 @@ if [ "$ACTION" = flip ]; then
     want_live="$URL"
 else
     # ── revert ────────────────────────────────────────────────────────────────
-    if [ -z "$current" ]; then
+    # A capture is present => restore it; absent-but-present-and-empty => the box
+    # genuinely had no line before the flip, so deleting IS the restore; no file
+    # at all => nothing was captured (flipped by an older build, or by hand), so
+    # keep the historical delete behaviour rather than guessing.
+    # An UNREADABLE capture is not an empty one. `|| true` would collapse both to
+    # restore='' and send a real recorded endpoint down the delete path, logging
+    # "there was no line before the flip" — reinstating, through the error path,
+    # exactly the silent state loss this flag was written to end (guard-542: an
+    # OR-fallback clobbers the value it was meant to default; guard-2455: a read
+    # that fails does not make its consumer fail with it).
+    restore=""; have_capture=0; capture_read_ok=0
+    if [ -e "$PREFLIP_FILE" ]; then
+        have_capture=1
+        if restore="$(tr -d '\r\n' < "$PREFLIP_FILE" 2>/dev/null)"; then
+            capture_read_ok=1
+        else
+            restore=""
+        fi
+    fi
+    # Fail CLOSED: a capture we cannot read might hold anything, and the only
+    # irreversible move available here is deleting the line. Refuse instead.
+    if [ "$have_capture" -eq 1 ] && [ "$capture_read_ok" -eq 0 ]; then
+        fail read "pre-flip capture $PREFLIP_FILE exists but could not be read — refusing to revert, because the fallback would DELETE the $KEY line and silently discard whatever it recorded. Repair the file's readability and re-run; or, if you have established the box genuinely had no $KEY line before the flip, remove the file and re-run."
+    fi
+    # "already" is only true when there is nothing to put back. With a non-empty
+    # capture there IS something to restore, so this early exit must not fire —
+    # otherwise the flip/revert cycle reports success having restored nothing.
+    if [ -z "$current" ] && [ -z "$restore" ]; then
         h="$(daemon_health)"; rest="${h#*|}"; dendpoint="${rest#*|}"
         if [ "$dendpoint" = "" ] || [ "$dendpoint" = "-" ]; then
+            rm -f "$PREFLIP_FILE" 2>/dev/null || true
             printf '{"ok": true, "host": "%s", "action": "revert", "already": true, "cold_target": "%s"}\n' "$HOST" "${ct//\"/\'}"; exit 0
         fi
     fi
     if [ "$DRY_RUN" -eq 1 ]; then
-        log "DRY-RUN: would delete the $KEY line from $ENV_FILE (currently '${current:-<unset>}'), restart the daemon, verify V1-V3 against the incumbent"
-        printf '{"ok": true, "dry_run": true, "host": "%s", "action": "revert", "current": "%s"}\n' "$HOST" "$current"; exit 0
+        if [ -n "$restore" ]; then
+            log "DRY-RUN: would RESTORE $KEY=$restore from $PREFLIP_FILE (currently '${current:-<unset>}'), restart the daemon, verify V1-V3"
+        else
+            log "DRY-RUN: would delete the $KEY line from $ENV_FILE (currently '${current:-<unset>}'), restart the daemon, verify V1-V3 against the incumbent (capture: $([ "$have_capture" -eq 1 ] && echo 'empty — there was no line before the flip' || echo 'none recorded'))"
+        fi
+        printf '{"ok": true, "dry_run": true, "host": "%s", "action": "revert", "current": "%s", "restore": "%s", "captured": %s}\n' "$HOST" "$current" "$restore" "$([ "$have_capture" -eq 1 ] && echo true || echo false)"; exit 0
     fi
-    write_env delete
-    [ -z "$(_get "$KEY")" ] || fail write "$KEY line still present after the delete"
-    log "deleted the $KEY line (mode 600, owner preserved)"
+    if [ -n "$restore" ]; then
+        write_env set "$restore"
+        [ "$(_get "$KEY")" = "$restore" ] || fail write "read-back of the restored $KEY did not match"
+        log "restored $KEY=$restore from the pre-flip capture (mode 600, owner preserved)"
+        want_live="$restore"
+    else
+        write_env delete
+        [ -z "$(_get "$KEY")" ] || fail write "$KEY line still present after the delete"
+        log "deleted the $KEY line (mode 600, owner preserved)$([ "$have_capture" -eq 1 ] && echo ' — the capture records that there was no line before the flip' || echo ' — no pre-flip capture was recorded')"
+        want_live=""
+    fi
+    # Consume the capture only after the write succeeded: a failed restore leaves
+    # it in place so a re-run can still put the box back.
+    rm -f "$PREFLIP_FILE" 2>/dev/null || true
     restart_daemon
-    want_live=""
 fi
 
 # ── verification V1-V3 ────────────────────────────────────────────────────────

@@ -127,7 +127,7 @@ CLEARERS = (
               # which then fell through to `other-goal` — see the band-counts
               # note in the module docstring.
               r"|\b(?:windows|linux)\s+(?:\w+\s+)?box\b"),
-    ("other-goal", r"\bg-\d{3}-\d{2,5}\b|\bblocked_on_dependency\b|\bdepends on\b"
+    ("other-goal", r"\bg-\d{3}-\d+\b|\bblocked_on_dependency\b|\bdepends on\b"
                    r"|\bPR\b|\b#\d+\b|\bmerged\b|\breview\b"),
     ("date-or-window", r"\b20\d\d-\d\d-\d\d\b|\bdate gate\b|\bdays?\b|\bweeks?\b"
                        r"|\bhours?\b|\bresolves_by\b|\bearliest_wake\w*\b|\bwindow\b"

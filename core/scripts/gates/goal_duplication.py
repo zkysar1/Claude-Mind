@@ -2981,7 +2981,7 @@ _STRONG_STRATEGIES = frozenset({
     "target_state", "structural_overlap", "title_exact",
     "origin_signal", "origin_signal_completed",
 })
-_GOAL_ID_HIT_RE = re.compile(r"\bg-\d{2,4}-\d{1,5}\b")
+_GOAL_ID_HIT_RE = re.compile(r"\bg-\d{2,4}-\d+\b")  # seq is open-ended: guard-1161
 
 # The one caveat no signal can settle, so it is stated on every shape.
 _VERIFICATION_PATH_CAVEAT = (

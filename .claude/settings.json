@@ -546,18 +546,13 @@
         ]
       },
       {
-        "matcher": "update_plan",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/plan-completion-reminder.sh",
-            "timeout": 30
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/stop-signal-relay.sh",
+            "timeout": 5
+          },
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/presence-tick.sh",

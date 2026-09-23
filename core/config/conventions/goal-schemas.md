@@ -1346,7 +1346,7 @@ suppress forever). The property that actually matters is REMAINING CONTEXT, not
 goals closed — so a long session that has closed nothing is still context-spent
 and will still be offered a marked goal. That gap is documented rather than
 papered over: the available context sensor is not trustworthy (it read `fresh`
-with 479,998 tokens of headroom through a measured exhaustion, g-115-8310), and
+with 479,998 tokens of headroom through a measured exhaustion, 2026-09-04), and
 a suppressor keyed on a lying sensor is worse than one keyed on an honest proxy
 whose limits are written down.
 

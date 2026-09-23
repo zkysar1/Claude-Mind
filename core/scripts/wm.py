@@ -1112,6 +1112,14 @@ def get_pruning_config(config):
 # content-key name by construction, which a fallback list is not.
 _SPARK_CAPTURE_META_KEYS = frozenset({
     "goal_id", "category", "load_bearing", "sq_trigger", "_item_ts",
+    # : `goal` is an improvised ROUTING key, not content. Measured
+    # 2026-09-19/20 (zeta cc-02, alpha cc-04): 35 live entries carried `goal`
+    # in place of `goal_id`, 4 of them with no `observation` at all — with
+    # `goal` outside this set, a `goal` value >= _SPARK_CAPTURE_MIN_CONTENT on
+    # such an entry would have been promoted INTO `observation` as content.
+    # Listing it here closes that hazard; the alias step in the normalizer
+    # below closes the routing gap (goal_id-keyed drain + batch selector).
+    "goal",
 })
 _SPARK_CAPTURE_MIN_CONTENT = 40
 
@@ -1124,9 +1132,24 @@ def _normalize_spark_capture_entry(item):
     rejected append, and losing the observation is the exact failure this
     exists to prevent. The provenance is recorded on the entry so a reader can
     see the promotion happened.
+
+    Also aliases the improvised routing key (g-115-10421): a `goal` value with
+    no `goal_id` beside it is a goal id written under the wrong name. The
+    Phase 6.5 worker spark replay batches k GOALS per pass and
+    wm-drain-goals.sh subtracts by `goal_id`, so an entry with no `goal_id`
+    belongs to no batch: undrainable AND unreplayable. The alias is copied,
+    never moved — the writer's key is kept, in the normalize-don't-refuse
+    spirit of guard-4044 (never drop at write time) — and its provenance is
+    recorded the same way. The return value stays the CONTENT key so callers'
+    logging is unchanged.
     """
     if not isinstance(item, dict):
         return None
+    _goal = item.get("goal")
+    if (not str(item.get("goal_id") or "").strip()
+            and isinstance(_goal, str) and _goal.strip()):
+        item["goal_id"] = _goal.strip()
+        item["goal_id_normalized_from"] = "goal"
     if str(item.get("observation") or "").strip():
         return None  # canonical shape — nothing to do
     best_key, best_val = None, ""

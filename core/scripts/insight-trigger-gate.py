@@ -311,7 +311,7 @@ def _collect_triggers(findings, self_agent):
         # fails the equality clause, not the None clause).
         # Behaviour-preserving on the live corpus, measured 2026-08-06 over
         # 9110 board records: 353 bare tags and 7 qualified, all 7 targeting
-        # `omni@zds-mind` — a PEER deployment, correctly skipped both before
+        # a single peer agent (`<agent>@<peer-env>`) — a PEER deployment, correctly skipped both before
         # and after. The newly-admitted set on today's data is EMPTY; this only
         # changes what happens the first time someone writes the qualified form
         # for a LOCAL agent (guard-1562 — name what the change newly admits).
