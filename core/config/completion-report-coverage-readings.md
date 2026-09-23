@@ -202,3 +202,26 @@ followed by the reading's own interpretation.
   the 41 UNRESOLVABLE + 30 EXPIRED are excluded, as the 08-30/08-31 row requires — an all-records
   denominator here would have reported 5.5% and silently entered a different quantity.
   A resolved-only fetch would have missed 89.3% of that report's own subject matter.
+
+- **2026-09-23 · zeta · cc-02 (6.8.0-139-generic) · window 28.9h · keyed on `resolved_at`: 4 of 4 scoreable = 100% · store split resolved 25 / archived 1,838.**
+  THE NEW AXIS IS THE WINDOW KEY, NOT THE COVERAGE. Every row above filtered on `outcome_date`,
+  which is DATE-ONLY. On this window that key returns 10 scoreable (5 CONFIRMED + 5 CORRECTED),
+  also 100% in the resolved stage. But 5 of the 10 carry `resolved_at` 2026-09-22T00:25-08:17,
+  BEFORE since (11:16:58), so the prior report had already counted them. A 6th
+  (`2026-09-08_box-local-remedy-names-artifact`, CONFIRMED) carries `resolved_by` but NO
+  `resolved_at`, so no date-only key can place it. Its pre-since placement is INFERRED from the
+  delta below, not measured. (Corrected 2026-09-23 by a fresh-eyes self-review: this line first
+  said "6 of the 10 carry `resolved_at`".)
+  `resolved_at` is writer-stamped to the second (`pipeline_write.py:600-615`). It gives 3 + 1, and
+  the lifetime accuracy numerator moved +3 / +1 over the same interval, which independently
+  corroborates it.
+  So a date-floored row can over-count by re-reading the boundary day, and one keyed on
+  `resolved_at` cannot. The digest widens by a further day (`completion_digest.py:565`) and
+  printed 5 / 5 (fix owned by g-115-10706).
+  Undated scoreable records (guard-6828): 92 of 1,130. `resolved_at` is present on 13 of this
+  window's 17 date-floor records; 1 of the 4 without it is scoreable (the 6th record above).
+  The 100% here is not a guard-2303 floor artifact, because the key resolves to the second. The
+  earliest in-window resolution is 09-22T21:10 and the backlog is 25, so nothing had yet had time
+  to archive.
+  Record the KEY on every future row; a date-floored and a `resolved_at` row are different
+  quantities.

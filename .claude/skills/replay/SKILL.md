@@ -529,6 +529,12 @@ Step 4 uses for experience `retrieval_stats`.
 # the source on subsequent cycles (defense-in-depth with Step 1's L72 skip).
 # SCHEMA: replay_count is stored as a string on some records — coerce to int
 # before the >= 3 comparison (int(replay_metadata.replay_count)).
+# ⚠ UNTIL g-115-10679 LANDS, MOST "ELIGIBLE" RECORDS HERE ARE NOT NEW. The pipeline
+# merge takes replay_metadata whole from the copy whose JSON text sorts higher, so
+# the flag loses to any flagless copy: 35 of 37 eligible on 2026-09-23 had been
+# encoded before. For a record listed in g-115-10679 or cited by a guardrail
+# `source: replay:<id>`, RESTORE the flag (per-id read, then the write below) and
+# do NOT strengthen or nucleate again. Delete this note when g-115-10679 lands.
 FOR EACH candidate hypothesis in the FULL Step 1 replay-candidate pool
                               WHERE int(replay_metadata.replay_count) >= 3
                               AND outcome == "CORRECTED"
@@ -546,10 +552,15 @@ FOR EACH candidate hypothesis in the FULL Step 1 replay-candidate pool
         # Nucleate a new guardrail. The rule names the prediction shape (from
         # hypothesis.title/question/rationale) and the corrected reality (from
         # the replay OUTCOME lesson). Stdin JSON; id/created auto-set.
+        # {replay_count} counts REVIEWS of ONE record, never corrections — a record
+        # has one outcome. The old wording ("CORRECTED {replay_count}x across
+        # replays") stated it as a frequency on 19 rules that are now immutable
+        # (guard-929 is one; g-001-05, 2026-09-23). Name the source record instead.
         echo '<json>' | Bash: guardrails-add.sh
           rule: "Predictions claiming {claim-pattern from hypothesis} in
-                 {hypothesis.category} have been CORRECTED {replay_count}x across
-                 replays. Apply skepticism — refuse confidence > 0.5 for this
+                 {hypothesis.category} were CORRECTED ({hypothesis.id}), and the
+                 record kept resurfacing — replayed {replay_count}x with no strategy
+                 to revise. Apply skepticism — refuse confidence > 0.5 for this
                  prediction shape until a confirming run reverses the pattern."
           category: {hypothesis.category}
           trigger_condition: "{category-specific signal preceding the wrong prediction}"

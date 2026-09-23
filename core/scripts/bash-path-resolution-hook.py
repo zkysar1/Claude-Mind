@@ -67,6 +67,8 @@ from hook_helpers import (  # noqa: E402
 # — verified semantically identical before consolidating.
 from _path_roots import (  # noqa: E402
     compute_allowed_roots,
+    cross_agent_advisory,
+    cross_agent_owner,
     is_harness_scratchpad,
     is_new_toplevel,
     is_under,
@@ -558,13 +560,20 @@ def main():
     # Skips: a box whose conf legitimately points WORLD/META at the repo-root
     # dir (compared against the configured root), and conf-absent sessions
     # (cannot know the configured root — stay silent, fail-open).
+    #
+    # COLLECTED, not emitted here: emitting exits the hook, and until 2026-09-23
+    # it did, so a stray dir switched off every deny below for every Bash call.
+    # Measured on zc-03: coach-mind has carried a stray world/ and meta/ since
+    # 2026-09-04, and coach got this advisory 38 times today while no Bash deny
+    # could fire. _finish() emits what was collected; a deny still wins.
+    advisories = []
     if conf_present:
         try:
             for _label, _sub in (("WORLD_PATH", "world"), ("META_PATH", "meta")):
                 _stray = os.path.join(project_root, _sub)
                 _configured = norm_path(paths.get(_label) or "")
                 if os.path.isdir(_stray) and norm_path(_stray) != _configured:
-                    emit_advisory(
+                    advisories.append(
                         f"[stray-root-advisory] A literal '{_sub}/' directory "
                         f"exists at the repo root:\n  {_stray}\n"
                         f"It is NOT the {_label} — the configured root is:\n"
@@ -579,10 +588,16 @@ def main():
                         f"read_authoritative_bytes, then remove the stray "
                         f"directory. This advisory repeats until it is gone."
                     )
-        except SystemExit:
-            raise
         except Exception:
             pass
+
+    def _finish():
+        """Approve, carrying any collected advisories. Every approve exit below
+        the stray check goes through here, so the stray advisory still fires on
+        every write-shaped call, as it did when it exited early."""
+        if advisories:
+            emit_advisory("\n\n".join(advisories))
+        approve_no_mutation()
 
     # Allowed roots — the SAME list path-resolution-hook.py builds, from the
     # SAME helper, so the two tool surfaces cannot answer "is this path in
@@ -603,14 +618,16 @@ def main():
     if mp_norm:
         governed.append(("META_PATH", mp_norm))
     if not governed:
-        approve_no_mutation()
+        _finish()
 
     # Extract candidate targets
     targets = extract_targets(cmd)
     if not targets:
-        approve_no_mutation()
+        _finish()
 
-    # Check each target
+    # Check each target. A cross-agent write (g-375-04) is only RECORDED here and
+    # advised after the loop, so a deny for any target in the same command wins.
+    cross_hit = None
     for verb, raw_path in targets:
         # Resolve to absolute candidate path.
         # The Windows drive-prefix test REQUIRES an alphabetic first character.
@@ -642,6 +659,12 @@ def main():
         target_norm = norm_path(abs_path)
         if not target_norm:
             continue
+
+        # Same predicate and wording as the Write/Edit hook (_path_roots.py).
+        if cross_hit is None and AGENTS_PARENT_DIR and agent_dir_norm:
+            other = cross_agent_owner(target_norm, agent_dir_norm)
+            if other:
+                cross_hit = (verb, raw_path, other)
 
         for label, root in governed:
             if is_under(target_norm, root) and is_new_toplevel(target_norm, root):
@@ -742,7 +765,11 @@ def main():
         )
         emit_deny(reason)
 
-    approve_no_mutation()
+    if cross_hit:
+        verb, raw_path, other = cross_hit
+        advisories.append(cross_agent_advisory(
+            f"Bash ({verb})", raw_path, agent, other, sid, agent_dir_norm))
+    _finish()
 
 
 try:

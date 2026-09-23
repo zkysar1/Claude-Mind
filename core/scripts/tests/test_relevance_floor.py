@@ -111,6 +111,7 @@ def _rec(rid, rule, util=0.0, category="framework-retrieval", **extra):
     ({"tags": "guardrail retrieval"}, False),                     # tags not a list
     ({"when_to_use": {"conditions": ["guardrail", "utility"]}}, True),
     ({"when_to_use": {"conditions": "guardrail utility"}}, True),  # conditions str
+    ({"when_to_use": "guardrail utility"}, True),                 # legacy bare string
     ({"summary": "encoded invisible"}, True),
     ({"content": "the a of it"}, False),                          # all tokens < 5
 ])
@@ -136,6 +137,21 @@ def test_query_overlap_counts_distinct_tokens_only():
 
 def test_entry_token_corpus_empty_for_fieldless_entry():
     assert _retrieve._entry_token_corpus({"id": "x"}) == set()
+
+
+def test_string_when_to_use_reaches_the_corpus_like_the_dict_shape():
+    """: a bare-string when_to_use (4,901 active rb entries and 135 guardrails
+    on 2026-09-23) was skipped, so the words naming when to use an entry never reached its
+    corpus. The dict shape is the control: it always did, and the two must now agree."""
+    trigger = "reviewing harnesses before claiming"
+    body = {"id": "x", "title": "iteration stdout"}
+    as_string = dict(body, when_to_use=trigger)
+    as_dict = dict(body, when_to_use={"conditions": [trigger], "category": ""})
+    wanted = {"reviewing", "harnesses", "claiming"}
+    assert wanted <= _retrieve._entry_token_corpus_uncached(as_dict)
+    assert _retrieve._entry_token_corpus_uncached(as_string) == \
+        _retrieve._entry_token_corpus_uncached(as_dict)
+    assert not wanted & _retrieve._entry_token_corpus_uncached(body)
 
 
 # ── 2/3. No-op paths ─────────────────────────────────────────────────────────

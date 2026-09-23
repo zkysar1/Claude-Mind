@@ -1212,6 +1212,24 @@ gates:
     tuning_notes: "Instrumented from day one (g-353-75). Fires only when a code file (.py .sh .yaml .toml .cfg .ini) under $WORLD_PATH/scripts is newer than the goal's claimed_at (aspirations-read.sh; fallback 6h); a world with no run-domain-tests.sh hook AND no test_*.py is noop. Runner: the world hook when present, else python -m pytest -q with cwd=scripts, STORAGE_BACKEND=local pinned, 900s bound (timeout and pytest rc 3/4 fail OPEN as decision=error). Verdict is a RATCHET, not green-or-block: the dev world measured 651s with 2 real reds nobody had seen, so demanding green would have refused every fleet close on day one. world/domain-suite-baseline.json (per box) holds the previous run's failing set; the first run seeds it and passes; a later run blocks only on a red NOT in it or on a collection error (rc=2, never baseline-able); a subset run passes and shrinks the baseline. Read the FP ratio against world/domain-suite-overrides.jsonl reasons: an override citing a tracked goal is the designed shared-tree FP; an override on a COLLECTION error is a Body laundering a broken import and is the signal to tighten, not retire."
     retirement_eligible: false
 
+  - id: stop-handoff-check
+    script: core/scripts/stop_handoff_check.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/aspirations-graceful-stop/SKILL.md", phase: "D7, first command of the mode-flip && chain (before session-mode-set.sh)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: strict
+    override_flag: "--proceed-without-handoff"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A stop is held at D7 although a handoff was written this stop: the handoff's file mtime predates the reference (a clock step, or a handoff restored with its old mtime preserved), or GS-0 never stamped and stop-target-mode was deleted mid-stop (unverifiable). Cost: one handoff re-write, or a logged override."
+    fn_description: "A stop flips agent-mode with no handoff.yaml written while its final message says the handoff was saved. Measured on a live vessel run (g-373-94): the fast digest's only handoff writer sits past line 200 and the mind read 200 lines; 3/3 vessel graceful endings had no handoff.yaml, so the next session boots without continuity."
+    rb_evidence: ["guard-399"]
+    tuning_notes: "Instrumented from day one (g-373-128). The reference for 'this stop' is stop-checkpoint.json stop_started_at (preserved across --resume), else stop-target-mode's mtime (the measured vessel run skipped GS-0's checkpoint write), else refuse as unverifiable. The handoff is dated by file mtime, never its embedded timestamp, which the model hand-writes on the fast path. An empty or non-mapping handoff does not count. An unresolvable agent fails OPEN (decision=fail_open). Read overrides for their reasons: a vessel whose grace was about to expire is the designed FP; overrides with no reason worth reading mean the printed Step 9 is not landing."
+    retirement_eligible: false
+
   - id: close-review-gate
     script: core/scripts/close-review-gate.py
     embedded: false

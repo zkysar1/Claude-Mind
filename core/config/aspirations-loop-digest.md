@@ -386,10 +386,11 @@ re-introduces the clobber class g-115-1561 fixed.
   Phase 5.    Bash: iteration-close.sh --phase verify --goal {goal.id}
               --status {completed|blocked|skipped|...} --source {world|agent}
               --outcome {deep|routine} [--summary "..."]
-              # --outcome is REQUIRED so do_verify persists outcome_class to
-              # the goal record (g-248-72). Recurring-close.sh already passes
-              # it; LLM-driven non-recurring verify calls MUST too — without
-              # it, outcome_class never lands and portfolio analysis stays blind.
+              # --outcome is REQUIRED (g-248-72): without it outcome_class
+              # never lands on the goal record.
+              # Up to 15 min when the domain-suite gate fires (g-375-02): if
+              # moved to background, wait as told; if killed, re-run ONCE with
+              # run_in_background.
               Checkpoint: phase_completed=verify, started_at preserved.
   Phase 5.3.  Attribution — IF completed: aspirations-complete-by.sh --source {source}
               ELIF non-terminal: aspirations-release.sh --source {source}

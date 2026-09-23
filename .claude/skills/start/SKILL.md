@@ -731,47 +731,38 @@ DONE.
      > Cannot start agent `<agent-name>`: the framework-owned runner-token could not be generated (Python unavailable). Check that `py -3` or `python3` works; the runner-token is required for SID-collision detection.
 
 # Rationale: core/config/rationale/start-runner-claim-and-body-fork.md — - DDB runner-claim acquire (single-runner lifecycl
-     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; echo "ACQUIRE_RC=$?"`
+     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh acquire --agent <agent-name>; RC=$?; echo "ACQUIRE_RC=$RC"; bash core/scripts/runner-claim-acquire-verdict.sh "$RC"` (add ` --reducer-only` if Step 0.5 set `reducer_only`)
 
-     **ACQUIRE_RC=4 + `reducer_only` → HALT and display the refusal.**
-     **ACQUIRE_RC!=4 → PROCEED (fail-open). ACQUIRE_RC=4 otherwise →
+     **Act on the verdict word, not the integer:**
+     - **`proceed`** (acquired, or any non-refusal rc: fail-open) → skip CW-pre..CW3; continue at `current_focus` below.
+     - **`join-as-worker`** (live reducer elsewhere) → run CW-pre..CW3: this box joins as a SECOND BODY. It is NOT a refusal; do not stop to offer options.
+     - **`refuse`** (only with `--reducer-only`) → HALT; get the holder from `runner-claim.sh status --agent <agent-name>` and display:
+
+     > Cannot start `<agent-name>` in autonomous mode — another machine holds a live
+     > runner claim (DDB session-lock).
+     > Holder: <machine_id>, heartbeat <age>s old (threshold <stale_after>s).
+     > `--recover --force` will NOT help from this box: `agent-state` is
+     > machine-local, so it reads IDLE here and recovery finds nothing to recover.
+     > The three real options:
+     >   /start <agent-name> — a bare re-issue auto-joins as a SECOND body from this
+     >   box (it executes goals; the reducer keeps encode/reflect/consolidate)
+     >   /stop <agent-name> on <machine_id> — then re-issue /start here to move the
+     >   reducer to this box
+     >   wait out OWNERSHIP_STALE_SECONDS (~65 min) and re-issue /start, which then
+     >   reclaims the stale claim via the acquire's §5 stale-lock-break.
+
+     **CW-pre — delete ALL THREE reducer-shaped files FIRST, before anything else.**
+     Bash: `AGENT_STATE_DIR="agents/<agent-name>/session"; rm -f "$AGENT_STATE_DIR/running-session-id" "$AGENT_STATE_DIR/latest-session-id" "$AGENT_STATE_DIR/runner-token"; echo "CW_PRE_CLEARED"`
+
+     **CW0 — announce the join** (rc=4 already proved liveness):
+     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh status --agent <agent-name>`
+     Tell the user:
 
      > Reducer for `<agent-name>` is alive on `<machine_id>` (heartbeat <age>s) —
      > joining as a SECOND BODY from this box. This worker executes goals; the
      > reducer keeps encode/reflect/consolidate. To move the reducer here
      > instead: /stop <agent-name> on <machine_id>, then /start here. To refuse
      > the auto-join next time: /start <agent-name> --reducer-only.
-
-     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh status --agent <agent-name>`
-
-     > Cannot start `<agent-name>` in autonomous mode — another machine holds a live
-     > runner claim (DDB session-lock).
-     > Holder: <machine_id>, heartbeat <age>s old (threshold <stale_after>s).
-     > `--recover --force` will NOT help from this box: Step 0.7 precondition 1
-     > requires the LOCAL `agent-state` to read RUNNING, and `agent-state` is
-     > `sync_tier: machine_local`, so on THIS box it reads IDLE and recovery exits
-     > "Nothing to recover". The RUNNING-observer branch is unreachable cross-box for
-     > the same reason — it reads local state that the owning box's RUNNING never
-     > reaches.
-     > The three real options:
-     >   /start <agent-name>                 — bare re-issue auto-joins as a SECOND
-     >                                          body from this box (executes goals;
-     >                                          the reducer keeps
-     >                                          encode/reflect/consolidate)
-     >   /stop <agent-name> on <machine_id>  — then re-issue /start here to move the
-     >                                          reducer to this box
-     >   wait out OWNERSHIP_STALE_SECONDS (~65 min) and re-issue /start, which then
-     >   reclaims the stale claim via the acquire's §5 stale-lock-break.
-
-
-
-
-     **CW-pre — delete ALL THREE reducer-shaped files FIRST, before anything else.**
-     Bash: `AGENT_STATE_DIR="agents/<agent-name>/session"; rm -f "$AGENT_STATE_DIR/running-session-id" "$AGENT_STATE_DIR/latest-session-id" "$AGENT_STATE_DIR/runner-token"; echo "CW_PRE_CLEARED"`
-
-     **CW0 — display holder identity** (informational; rc=4 already proved liveness):
-     Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh status --agent <agent-name>`
-     Show the user which box holds the reducer they are joining.
 
      **CW0.5 — bind the session.** Same as the reducer path's W0:
      Bash: `bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent <agent-name> --mode autonomous --retire-legacy`

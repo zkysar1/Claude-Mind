@@ -200,3 +200,89 @@ def test_server_log_lifecycle_delegates_to_lifecycle_log_event():
     body = src.split("def _log_lifecycle", 1)[1].split("\n    def ", 1)[0]
     assert "lifecycle.log_event(" in body, "server.py must not re-implement the shape"
     assert "json.dumps" not in body, "a second record shape has reappeared"
+
+
+# ─────────────────────── the root scope () ──────────────────────────
+#
+# The census is box-wide but the keep-set names only THIS root's pair. On a sidecar
+# box (one daemon per workspace) the second daemon to start counted the first as
+# unreferenced and refused forever. Both directions are pinned: a sibling
+# workspace's daemon is dropped, and the  signature (a SAME-root live
+# daemon whose daemon.pid is missing) is still returned, so it is still refused.
+
+
+def _scope(pids, root, cwds):
+    return lifecycle.scope_pids_to_root(pids, root, cwds.get)
+
+
+def test_scope_keeps_a_same_root_daemon_whose_pid_file_is_missing():
+    """The  signature must still be refused after the scope."""
+    with tempfile.TemporaryDirectory() as td:
+        assert _scope([100], Path(td), {100: os.path.realpath(td)}) == [100]
+
+
+def test_scope_drops_a_sibling_workspace_daemon():
+    """The  signature: the env's daemon beside a per-character root."""
+    with tempfile.TemporaryDirectory() as env_ws, tempfile.TemporaryDirectory() as char_ws:
+        cwds = {100: os.path.realpath(env_ws), 200: os.path.realpath(char_ws)}
+        assert _scope([100, 200], Path(char_ws), cwds) == [200]
+        assert _scope([100, 200], Path(env_ws), cwds) == [100]
+
+
+def test_scope_does_not_count_an_unreadable_cwd():
+    """None (no /proc, process exited, permission) must never refuse a start."""
+    with tempfile.TemporaryDirectory() as td:
+        assert _scope([100], Path(td), {100: None}) == []
+        assert _scope([100], Path(td), {}) == []
+
+
+def test_scope_does_not_count_a_deleted_cwd():
+    """A '<root> (deleted)' cwd belongs to the orphan sweep, not to this start."""
+    with tempfile.TemporaryDirectory() as td:
+        assert _scope([100], Path(td), {100: os.path.realpath(td) + " (deleted)"}) == []
+
+
+def test_scope_compares_resolved_paths():
+    """A root reached through a symlink still matches the kernel's real cwd."""
+    with tempfile.TemporaryDirectory() as td:
+        real = Path(td) / "real"
+        real.mkdir()
+        link = Path(td) / "link"
+        try:
+            link.symlink_to(real, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable")
+        assert _scope([100], link, {100: os.path.realpath(real)}) == [100]
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="needs /proc")
+def test_pid_cwd_reads_a_live_process_cwd():
+    """The seam against a REAL process: its cwd reads back as the resolved root, so
+    the real scope keeps it for that root and drops it for any other root."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as other:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=root)
+        try:
+            assert lifecycle.pid_cwd(child.pid) == os.path.realpath(root)
+            assert lifecycle.scope_pids_to_root([child.pid], Path(root), lifecycle.pid_cwd) == [child.pid]
+            assert lifecycle.scope_pids_to_root([child.pid], Path(other), lifecycle.pid_cwd) == []
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+
+
+def test_pid_cwd_is_none_for_a_pid_that_does_not_exist():
+    assert lifecycle.pid_cwd(2 ** 22 + 12345) is None  # above the Linux pid_max ceiling
+
+
+def test_find_unreferenced_applies_the_root_scope(monkeypatch):
+    """guard-1943: pin the WIRING -- the census must pass its candidates through the scope."""
+    import subprocess
+
+    class _Ps:
+        stdout = " 100 python3 -m mind_api.src\n 200 python3 -m mind_api.src\n"
+
+    with tempfile.TemporaryDirectory() as td:
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: _Ps())
+        monkeypatch.setattr(lifecycle, "pid_cwd", {100: os.path.realpath(td), 200: "/elsewhere"}.get)
+        assert lifecycle.find_unreferenced_daemon_pids(Path(td)) == [100]

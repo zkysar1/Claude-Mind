@@ -203,6 +203,16 @@ The postcompact restore (`postcompact-restore.py`) prints to stdout:
 - **Pending agents**, **blocked-sleep** warnings
 - **Identity reminder** + **action directive**
 
+That list is the reducer's banner. A **worker Body** (a session that forked
+`sessions/<SID>/working-memory.yaml`) gets a shorter one instead (g-375-04):
+its binding (agent, SID, role and state from `body-manifest.yaml`, session
+dir, working-memory path, the agent's own `self.md`), the in-flight goal from
+its own iteration checkpoint, and the worker-loop re-entry. It carries none of
+the reducer's sections: not the `<<autonomous-loop-dynamic>>` re-arm, which a
+worker must never arm; not the `/aspirations` re-entry; and not the agent-wide
+execution diary or reasoning snapshot, which belong to the reducer or another
+session on the box. It does not need `compact-checkpoint.yaml`.
+
 ---
 
 ## Execution Diary Integration

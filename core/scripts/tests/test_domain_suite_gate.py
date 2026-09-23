@@ -94,6 +94,36 @@ def test_a_green_touched_suite_passes(tmp_path):
     assert doc["runner"].startswith("python -m pytest")
 
 
+def _announced(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if ln.startswith("[domain-suite-gate] running")]
+
+
+def test_it_says_it_is_running_the_suite_before_it_starts(tmp_path):
+    # : worker Bodies that were not told the close runs the suite killed it
+    # and wrote the status by hand. The line names the gate, what fired it and how
+    # long to expect; from the second run it carries the last run's length here.
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST})
+    rc, _doc, err = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0
+    (line,) = _announced(err)
+    assert "domain script(s) changed since the claim" in line and "tests/test_green.py" in line
+    assert "Expect up to 15 min." in line  # no earlier run to go by
+    assert isinstance(_baseline(world)["seconds"], int)
+
+    rc, _doc, err = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0
+    (line,) = _announced(err)
+    assert "Expect up to 15 min; the last run on this box took under a minute." in line
+
+
+def test_a_noop_announces_no_suite(tmp_path):
+    # The control: nothing changed since the claim, so no suite runs and no line says one does.
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST})
+    rc, doc, err = _run(tmp_path, world, "--since", FUTURE)
+    assert rc == 0 and doc["decision"] == "noop"
+    assert _announced(err) == []
+
+
 def _baseline(world: Path) -> dict:
     return json.loads((world / "domain-suite-baseline.json").read_text(encoding="utf-8"))
 

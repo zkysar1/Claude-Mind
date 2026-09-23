@@ -270,7 +270,7 @@ For each diagnostic insight, heuristic, or causal pattern that emerged:
       category: <topic-category>
       content: the insight
       applies_to: <any|framework|domain|specific>  # REQUIRED. any=cross-cutting methodology; framework=this framework's skills/scripts/gates; domain=this agent's deployment domain (its specific services, products, integrations); specific=single-incident
-      when_to_use: when this insight applies
+      when_to_use: {conditions: ["when this insight applies"], category: ""}  # this shape, never a bare string
       source_goal: <id of the Lane 2 Maintain goal that bundled this session, e.g. g-NNN-NN>
       tags: ["chat-derived"]
     Print: ENCODED rb:<id from stdout> — "<title>"

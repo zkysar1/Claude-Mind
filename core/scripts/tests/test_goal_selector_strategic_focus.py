@@ -67,6 +67,16 @@ def _reset_caches():
     gs._TEAM_STATE_CACHE = None
 
 
+@pytest.fixture(autouse=True)
+def _pinned_roster(monkeypatch):
+    """The banner's eligibility is the floor's predicate, which keys on
+    routes_away_from (g-115-10593) and so reads the LIVE roster on every call.
+    Pin it, or a box whose team-state lacks a name answers differently."""
+    import aspirations
+    monkeypatch.setattr(aspirations, "_get_active_agents",
+                        lambda: ["alpha", "bravo", "echo", "foxtrot", "zeta"])
+
+
 @pytest.fixture
 def focus(monkeypatch):
     """set(team_state_dict) -> installs it as the cached team-state read."""

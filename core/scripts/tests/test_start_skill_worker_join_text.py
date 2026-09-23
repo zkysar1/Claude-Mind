@@ -10,11 +10,20 @@ turn. A 27B model refused the worker join 2 of 3 times on the same input; the on
 success guessed the missing continuation. The intent (bare `/start <agent>` while a
 reducer runs = join as worker, commits 14acd1663 / 548b65661) was never in the text.
 
-Two checks, both on the file as shipped:
+The CROSS-box branch had the same cut (2026-09-23, alpha-next on zc-01): the acquire
+step read "ACQUIRE_RC=4 otherwise ->" and then nothing, followed by the join message AND
+the `--reducer-only` refusal with its options. A 35B met rc=4 on a bare `/start alpha`,
+printed the refusal and ended the turn: 34 iterations, 76 minutes, no worker. The
+verdict script that maps the rc (runner-claim-acquire-verdict.sh, 2026-09-10) existed
+and had no call site.
+
+Checks, all on the file as shipped:
   1. STRUCTURAL -- the `fresh` paragraph names the Worker Body and tells the reader to
-     proceed to the activation sequence BEFORE the alternatives are listed.
-  2. FRAGMENTS -- no prose line ends in a dangling function word right before a blank
-     line (outside fences, tables, headings). Measured across all 78 skills the same
+     proceed to the activation sequence BEFORE the alternatives are listed; the
+     cross-box acquire step acts on the verdict script's word, sends `join-as-worker`
+     to the CW sequence, and keeps the refusal under `refuse`.
+  2. FRAGMENTS -- no prose line ends in a dangling function word or arrow right before
+     a blank line (outside fences, tables, headings). Measured across all 78 skills the same
      day: this heuristic hit exactly the nine trimmed fragments plus two legitimate
      lines in OTHER skills, so it is scoped to this file, where the ceiling pressure
      that produced the cuts is highest.
@@ -23,13 +32,17 @@ Two checks, both on the file as shipped:
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parents[3] / ".claude" / "skills" / "start" / "SKILL.md"
+sys.path.insert(0, str(SKILL.parents[3] / "core" / "scripts"))
+
+import runner_claim_acquire as rca  # noqa: E402
 
 _DANGLING = re.compile(
     r"[ (](the|of|is|a|an|and|or|to|for|with|second|live|either|write|mode|half|this|"
-    r"that|in|on|at|by|from|which|when|before|after|not|be|has|have|are|was)$"
+    r"that|in|on|at|by|from|which|when|before|after|not|be|has|have|are|was|→)$"
 )
 
 
@@ -45,6 +58,24 @@ def test_fresh_branch_tells_the_second_terminal_to_join_as_a_worker() -> None:
     assert "Proceed to the **Worker Body Activation" in para
     assert "do NOT print a refusal" in para
     assert "DO NOT auto-recover" in para
+
+
+def _acquire_step(text: str) -> str:
+    start = text.index("runner-claim.sh acquire --agent <agent-name>")
+    return text[start : text.index("**CW-pre", start)]
+
+
+def test_cross_box_acquire_joins_as_a_worker_and_refuses_only_under_reducer_only() -> None:
+    step = _acquire_step(SKILL.read_text(encoding="utf-8"))
+    assert "runner-claim-acquire-verdict.sh" in step, "the rc is read by hand again"
+    # The words the skill branches on are the ones the script prints.
+    for verdict in (rca.PROCEED, rca.JOIN_AS_WORKER, rca.REFUSE):
+        assert f"`{verdict}`" in step, f"no branch for the verdict {verdict!r}"
+    join = step.index(f"`{rca.JOIN_AS_WORKER}`")
+    refuse = step.index(f"`{rca.REFUSE}`")
+    assert "run CW-pre..CW3" in step[join:refuse]
+    assert "NOT a refusal" in step[join:refuse]
+    assert refuse < step.index("Cannot start"), "the refusal must sit under `refuse`"
 
 
 def test_no_sentence_is_cut_mid_clause() -> None:

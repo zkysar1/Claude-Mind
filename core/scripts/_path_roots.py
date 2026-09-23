@@ -269,3 +269,50 @@ def is_write_exempt_sink(target):
         if target == prefix or target.startswith(prefix + "/"):
             return True
     return False
+
+
+# --- Cross-agent write advisory (g-375-04) ----------------------------------
+# A bound session writing into ANOTHER agent's directory gets context naming its
+# binding, never a deny. Measured 2026-09-23 on zc-01: a worker Body bound to
+# alpha lost its identity across a compaction and wrote its evidence under
+# agents/charlie/sessions/<own SID>/scratch/, then cited that file as closure
+# evidence. Both L1 hooks approved it, because every agent-dir check keys on the
+# BOUND agent's dir. Advisory only: a deliberate cross-agent repair is still
+# possible, and the model sees its binding at the moment it matters.
+
+
+def cross_agent_owner(target, agent_dir):
+    """The OTHER agent whose directory holds `target`, or None.
+
+    `target` and `agent_dir` (the bound agent's dir) are norm_path'd. The agents
+    root is `agent_dir`'s parent, so a caller MUST only ask when the layout has
+    an agents parent dir (AGENTS_PARENT_DIR non-empty): under the legacy layout
+    that parent is PROJECT_ROOT and every top-level entry would read as an agent.
+
+    None for a target in the bound dir, outside the agents root, or a loose file
+    directly in the agents root (that is not inside any agent's dir).
+    """
+    if not target or not agent_dir or "/" not in agent_dir:
+        return None
+    agents_root = agent_dir.rsplit("/", 1)[0]
+    if not agents_root or is_under(target, agent_dir) or not is_under(target, agents_root):
+        return None
+    owner, sep, _ = target[len(agents_root) + 1:].partition("/")
+    return owner if (sep and owner) else None
+
+
+def cross_agent_advisory(surface, path, agent, other, sid, agent_dir):
+    """The advisory text for a cross-agent write, shared by both L1 hooks, so the
+    wording is the same whichever door the write came through."""
+    bound = f"'{agent}' (SID {sid})" if sid else f"'{agent}'"
+    return (
+        f"[cross-agent-write] ADVISORY (g-375-04): this session is bound to agent "
+        f"{bound}, and this {surface} writes into another agent's directory, "
+        f"'{other}':\n"
+        f"  {path}\n"
+        f"If '{other}' came from a summary or from something you read, your identity "
+        f"has drifted: re-read your binding and write under your own directory, "
+        f"{agent_dir} (session scratch: its sessions/<SID>/scratch/). Reach another "
+        f"agent through the board or team-state, never through its files.\n"
+        f"ADVISORY ONLY: the write is not blocked."
+    )

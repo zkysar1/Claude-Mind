@@ -34,7 +34,10 @@ WHAT IT DOES, in order (each step is cheap until the last):
      domain-hooks.md — core names the slot, the world fills it), else
      `python3 -m pytest -q` with cwd=scripts so `from <pkg> import ...`
      resolves the way the rule's own command runs it. STORAGE_BACKEND=local is
-     pinned (guard-955). Bounded at 900 s.
+     pinned (guard-955). Bounded at 900 s. One stderr line goes out BEFORE it
+     starts, naming the gate, the changed files and how long to expect: the
+     bound, and the last run's length on this box, kept in the baseline file
+     (g-375-02 — Bodies that were not told killed it and wrote status by hand).
   3b. Credential tripwire (g-353-79): the credential-NAMED files directly under
      the world, its parent and the project root (.env* / *token* / *secret* /
      *credential* / *.pem / *.key / *.p12 / id_*) are snapshotted by size+mtime
@@ -80,6 +83,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -559,10 +563,13 @@ def load_baseline(world_dir: Path) -> dict | None:
     return doc if isinstance(doc, dict) and isinstance(doc.get("failing"), list) else None
 
 
-def save_baseline(world_dir: Path, failing: set[str], rc: int, runner: str) -> None:
+def save_baseline(world_dir: Path, failing: set[str], rc: int, runner: str,
+                  seconds: int | None = None) -> None:
     payload = {"recorded_at": datetime.now().isoformat(timespec="seconds"),
                "agent": os.environ.get("MIND_AGENT", "unknown"),
                "runner": runner, "rc": rc, "failing": sorted(failing)}
+    if seconds is not None:
+        payload["seconds"] = seconds  # the run's length, for the next run's announcement
     try:
         _baseline_path(world_dir).write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
     except OSError as e:
@@ -620,7 +627,23 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     _, runner_label = runner_command(scripts_dir)
     roots = private_roots(world_dir)
     before = private_files(roots)
+    # SAY SO BEFORE THE SUITE STARTS (). Measured 2026-09-23 on two worker
+    # Bodies: this run took 12-15 min, their shell tool allowed 10 at most, and with
+    # nothing saying the close was running a suite they killed it 8 times, then wrote
+    # the goal status by hand. stderr reaches the caller's output (do_verify does not
+    # redirect it), so the line is there for any reader of the call's output so far.
+    last = (load_baseline(world_dir) or {}).get("seconds")
+    names = ", ".join(t[0] for t in touched[:3]) + (" ..." if len(touched) > 3 else "")
+    expect = f"up to {timeout // 60} min"
+    if isinstance(last, int) and not isinstance(last, bool):
+        took = "under a minute" if last < 60 else f"{round(last / 60)} min"
+        expect += f"; the last run on this box took {took}"
+    print(f"[domain-suite-gate] running the world's domain suite before this close, because "
+          f"{len(touched)} domain script(s) changed since the claim ({names}). Expect {expect}. "
+          "It is not hung: let it finish.", file=sys.stderr, flush=True)
+    started = time.monotonic()
     rc, tail, failing, log = run_suite(scripts_dir, timeout, goal_id)
+    seconds = round(time.monotonic() - started)
     changes = classify_private_changes(before, private_files(roots))
     clobbered = changes["content_changed"]
     if clobbered:
@@ -662,7 +685,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
               "window, not a cause.", file=sys.stderr)
     if rc in (0, 5):
         note = "" if rc == 0 else " (pytest collected no tests)"
-        save_baseline(world_dir, set(), rc, runner_label)
+        save_baseline(world_dir, set(), rc, runner_label, seconds)
         _emit("pass", goal_id, override, reason="domain suite green" + note, runner=runner_label,
               rc=rc, touched=touched)
         return 0
@@ -707,7 +730,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         own = sorted(f for f in failing
                      if f.split("::")[0] in touched_files or Path(f.split("::")[0]).name in touched_names)
         if not own:
-            save_baseline(world_dir, failing, rc, runner_label)
+            save_baseline(world_dir, failing, rc, runner_label, seconds)
             _emit("pass", goal_id, override, reason=f"seeded baseline: {len(failing)} pre-existing red(s) recorded, "
                   "later closes block only on NEW reds", runner=runner_label, rc=rc, touched=touched,
                   failing=sorted(failing))
@@ -719,7 +742,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     else:
         new_reds = sorted(failing - set(baseline["failing"]))
         if not new_reds:
-            save_baseline(world_dir, failing, rc, runner_label)  # ratchet: only what still fails
+            save_baseline(world_dir, failing, rc, runner_label, seconds)  # ratchet: only what still fails
             _emit("pass", goal_id, override, reason=f"{len(failing)} pre-existing red(s), none new since "
                   f"{baseline.get('recorded_at', '?')} (baseline ratcheted)", runner=runner_label, rc=rc,
                   touched=touched, failing=sorted(failing))

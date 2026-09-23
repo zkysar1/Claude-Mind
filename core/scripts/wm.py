@@ -884,6 +884,13 @@ def now_iso():
     """Local ISO timestamp."""
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
+#: libyaml's C loader when this PyYAML ships it, else the pure-Python one ().
+#: Same SafeConstructor, so the same data; only the scanner differs. Measured on
+#: zc-01 2026-09-23: a 12.5 MB worker working memory took 4.7 s to read through
+#: the pure-Python loader, and the PreCompact checkpoint reads one twice.
+_SAFE_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
 def read_yaml(path):
     """Read a YAML file, return parsed dict. Returns {} if missing.
 
@@ -899,7 +906,7 @@ def read_yaml(path):
               f"post-crash corruption signature (g-001-44); treating as empty. "
               f"Rebuild via wm-init.sh if slots are expected.", file=sys.stderr)
         return {}
-    data = yaml.safe_load(raw.decode("utf-8", errors="replace"))
+    data = yaml.load(raw.decode("utf-8", errors="replace"), Loader=_SAFE_LOADER)
     return data if data is not None else {}
 
 def write_yaml(path, data):

@@ -73,8 +73,9 @@ to look for).
      by ~40%. guard-2189: enumerate by querying the source, never from memory;
      re-run the tool before quoting any of them again.
      Useful and low-noise on LEAF
-     wrappers (board-post.sh: 5 flags + STDIN:YES; goal-selector.sh: 0 flags +
-     2 subcommands; aspirations-query.sh: 6 flags), noisy above roughly a dozen
+     wrappers (board-post.sh: 5 flags + STDIN:YES; goal-selector.sh: 3 flags +
+     2 subcommands, re-measured 2026-09-23 after g-375-06 added --top;
+     aspirations-query.sh: 6 flags), noisy above roughly a dozen
      delegates. Use it on leaves; on an orchestrator, read its own case block.
      aspirations-query.sh read 4 until 2026-08-09 and was re-measured, not
      re-derived, per the guard-2189 line just above: adopting the `_argv_strict`

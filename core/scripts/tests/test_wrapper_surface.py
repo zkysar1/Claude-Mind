@@ -40,17 +40,21 @@ ws = _load()
 
 # --- the 9 pre-registered misses ------------------------------------------
 
-def test_miss1_goal_selector_rejects_top_flag():
-    """`goal-selector.sh --top 8` -> the subcommand parser ate --top."""
+def test_miss1_goal_selector_top_flag_now_exists():
+    """`goal-selector.sh --top 8` -> the subcommand parser ate --top.
+
+    Valid since g-375-06 (2026-09-23): `select --top N` exists and a leading flag
+    means `select`. The tool must now REPORT --top -- calling it absent would be
+    the false answer this file exists to prevent."""
     d = ws.describe("goal-selector.sh")
-    assert "--top" not in (d["flags"] or []), "tool must not claim --top exists"
+    assert "--top" in d["flags"], "tool must report the --top that now exists"
     assert "select" in d["subcommands"] and "blocked" in d["subcommands"]
 
 
-def test_miss2_goal_selector_select_takes_no_flags():
+def test_miss2_goal_selector_select_now_takes_top():
     d = ws.describe("goal-selector.sh")
-    assert d["flags"] == [] or d["flags"] is not None
-    assert "--top" not in (d["flags"] or [])
+    assert d["flags_unparseable"] is False
+    assert "--top" in d["flags"]
 
 
 def test_miss3_aspirations_query_has_no_goal_id_flag():

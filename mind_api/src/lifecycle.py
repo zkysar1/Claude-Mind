@@ -284,7 +284,14 @@ def log_event(project_root: Path, event: str, version: str, **extra: object) -> 
 
 
 def find_unreferenced_daemon_pids(project_root: Path) -> list:
-    """Live `mind_api.src` processes that the published daemon pair does NOT name.
+    """Live `mind_api.src` processes serving THIS project root that the published
+    daemon pair does NOT name.
+
+    The census is box-wide but the keep-set names only this root's pair, so the
+    candidates are scoped to daemons whose working directory IS this root
+    (`scope_pids_to_root`, g-369-417). Without that scope, on a box that runs one
+    daemon per workspace (a sidecar: one for the env, one per character) whichever
+    daemon starts second counted the first as unreferenced and refused to start.
 
     `is_daemon_alive` answers "is the REGISTERED daemon alive?" -- it reads
     daemon.pid. It cannot answer "is ANY daemon alive?", so whenever daemon.pid is
@@ -328,7 +335,35 @@ def find_unreferenced_daemon_pids(project_root: Path) -> list:
     except Exception:  # noqa: BLE001 -- no ps (Windows), timeout, permissions
         return []
 
-    return parse_ps_for_daemon_pids(out, keep)
+    return scope_pids_to_root(parse_ps_for_daemon_pids(out, keep), project_root, pid_cwd)
+
+
+def scope_pids_to_root(pids, project_root: Path, cwd_of) -> list:
+    """Keep only the candidates whose working directory IS `project_root` ().
+
+    Both spawners `cd` into the project root before `-m mind_api.src`, and the
+    sidecar unit sets WorkingDirectory to its workspace, so a daemon's cwd names
+    the root it serves. A same-root daemon whose daemon.pid is missing or stale
+    (the g-115-10336 signature) is still kept, so the start is still refused.
+
+    `cwd_of(pid)` returns the kernel's cwd path, or None when it cannot be read.
+    An unreadable cwd is NOT counted: over-matching here refuses a start, which is
+    an outage; under-matching is the orphan leak the guard already tolerated. So
+    on a platform with no /proc this census finds nothing (fail-open), as it
+    already did where `ps` is missing. A cwd reading '<path> (deleted)' never
+    equals a live root, so a removed-worktree orphan is left to the orphan sweep.
+    """
+    root = os.path.realpath(str(project_root))
+    return [pid for pid in pids if cwd_of(pid) == root]
+
+
+def pid_cwd(pid: int) -> Optional[str]:
+    """The working directory of `pid` as the kernel reports it, or None when it is
+    unreadable (no /proc on this platform, the process exited, or permission)."""
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return None
 
 
 def parse_ps_for_daemon_pids(ps_output: str, keep) -> list:

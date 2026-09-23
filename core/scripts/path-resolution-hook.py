@@ -34,6 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hook_helpers import (  # noqa: E402
     approve_no_mutation,
+    emit_advisory,
     emit_deny,
     extract_file_path,
     is_absolute_path,
@@ -48,6 +49,8 @@ from hook_helpers import (  # noqa: E402
 # semantically identical first).
 from _path_roots import (  # noqa: E402
     compute_allowed_roots,
+    cross_agent_advisory,
+    cross_agent_owner,
     is_harness_scratchpad,
     is_new_toplevel,
     is_under,
@@ -725,6 +728,15 @@ def main():
                     f"this Write/Edit gate by design."
                 )
                 emit_deny(agent_cruft_reason)
+            # Cross-agent write advisory (). Every agent-dir check above
+            # keys on the BOUND agent's dir, so a write under another agent's dir
+            # reached the approve below in silence. Context, not a deny: see
+            # cross_agent_owner in _path_roots.py for the measured slip.
+            if label == "PROJECT_ROOT" and AGENTS_PARENT_DIR:
+                other = cross_agent_owner(target, agent_dir_norm)
+                if other:
+                    emit_advisory(cross_agent_advisory(
+                        tool_name, file_path, agent, other, sid, agent_dir_norm))
             approve_no_mutation()
 
     # --- Block: target is absolute AND outside all configured roots ---

@@ -46,7 +46,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # _fileops lives at core/scripts/_fileops.py — our parent dir. The CLI
 # wrapper has sys.path set up to find it; daemon callers do too via
@@ -344,6 +344,118 @@ def _refspec_covers_all_heads(repo: Path) -> bool:
     return any("refs/heads/*" in ln for ln in r.stdout.splitlines())
 
 
+# Bound on patch walks, and separately on content probes, per repo per run.
+# Each costs a few cheap git calls; the bound only bites on a pathological
+# branch, and an unprobed commit simply keeps blocking -- the safe direction.
+_LANDED_PROBE_CAP = 40
+
+
+def _landed_by_content(repo: Path, ref: str,
+                       candidates: List[str]) -> Dict[str, str]:
+    """Which of `candidates` (commits off `ref`) already have their CONTENT
+    on `ref`, merged there under a DIFFERENT sha (g-115-7029).
+
+    WHY. The blocking lane decides "stranded" by SHA REACHABILITY. A squash or
+    rebase merge rewrites the sha, so the original commit is unreachable from
+    the delivery ref forever while every line of it is there -- and it blocks
+    the next innocent close until it ages out of the freshness window. Measured
+    repeatedly in the field (guard-6939, guard-6462, the g-115-7029 notes); the
+    refused closes were pushed through --override-uncommitted, which teaches
+    the override reflex.
+
+    TWO DISCRIMINATORS, in this order (guard-4009 ordering rule 1: a
+    single-commit squash satisfies both, so the patch test must run first or
+    its cases are re-bucketed under the content test):
+
+    1. `patch-equivalent` -- `git log --cherry-mark` finds a commit on `ref`
+       with the same patch-id. This is git-native and binary-safe. It catches
+       a single-commit squash or a rebase merge even after `ref` has since
+       changed the same files. It CANNOT see an N>1 squash: the union patch
+       matches none of the N originals (guard-4009).
+    2. `content-on-ref` -- every path the branch changed between
+       merge-base(ref, X) and X has the SAME content on `ref` as on X, so
+       applying the branch to `ref` would be a no-op. That catches an N>1
+       squash, and it releases X's whole off-ref ancestry at once. It is
+       scoped to the branch's own paths because `ref` keeps moving with
+       other work, so a whole-tree comparison would never match.
+
+    FALSE POSITIVES. A released commit carries no content that `ref` lacks, so
+    no WORK can be lost by releasing it. Only history is lost -- the same
+    trade the tree-identity release above already makes. Released commits are
+    REPORTED, never dropped (guard-1760).
+
+    FALSE NEGATIVES, in the safe direction. An N>1 squash whose paths also
+    carry OTHER work on `ref` (landed before or after it -- a branch cut from a
+    stale base is enough), or a squash that folded in review fixups, still
+    blocks. So does anything past _LANDED_PROBE_CAP.
+
+    TRI-STATE, fail-closed (guard-4009 rule 2): any git error, timeout, missing
+    merge-base or empty branch diff leaves the commit OUT of the result, so it
+    keeps blocking. An error never proves a commit landed.
+
+    Returns {sha: "patch-equivalent" | "content-on-ref"}.
+    """
+    def _git(*args: str) -> Optional[str]:
+        try:
+            r = subprocess.run(["git", "-C", str(repo), *args],
+                               capture_output=True, text=True, timeout=15)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    wanted = set(candidates)
+    landed: Dict[str, str] = {}
+    # `%m` prints `=` for a commit patch-equivalent to one on the left (`ref`)
+    # side, else `>`. Merges are excluded: they carry no patch of their own and
+    # fall to test 2. ONLY `=` may be carried across walks. `>` is relative to
+    # THIS walk's left side, which omits every ref commit the tip already
+    # contains, so a sibling branch that merged the ref after the squash reads
+    # the original as `>`. Measured: 0868ad4 in a product repo, released by its
+    # own walk and left blocking by a sibling's, which is why each candidate
+    # not yet landed pays for a walk of its own.
+    walks = 0
+    for sha in candidates:
+        if sha in landed:
+            continue
+        if walks >= _LANDED_PROBE_CAP:
+            break
+        walks += 1
+        out = _git("log", "--cherry-mark", "--right-only", "--no-merges",
+                   "--format=%m %H", f"{ref}...{sha}")
+        if out is None:
+            continue
+        for ln in out.splitlines():
+            mark, _, c = ln.strip().partition(" ")
+            if mark == "=" and c in wanted:
+                landed[c] = "patch-equivalent"
+
+    probes = 0
+    for sha in candidates:
+        if sha in landed:
+            continue
+        if probes >= _LANDED_PROBE_CAP:
+            break
+        probes += 1
+        base = _git("merge-base", ref, sha)
+        if base is None or not base.strip():
+            continue
+        changed = _git("diff", "--name-only", "--no-renames",
+                       base.strip(), sha, "--")
+        differ = _git("diff", "--name-only", "--no-renames", ref, sha, "--")
+        if changed is None or differ is None:
+            continue
+        changed_paths = set(changed.splitlines())
+        if not changed_paths or changed_paths & set(differ.splitlines()):
+            continue
+        covered = _git("rev-list", sha, "--not", ref)
+        if covered is None:
+            continue
+        for c in covered.split():
+            if c in wanted and c not in landed:
+                landed[c] = "content-on-ref"
+    return landed
+
+
 def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
                        goal_id: str = "") -> List[dict]:
     """The 'built but never connected' probe ( /  class).
@@ -428,7 +540,8 @@ def get_stranded_repos(roots: List[Path], fresh_hours: int = 48,
                                         or finding["stranded_commits"]
                                         or finding["stale_stranded_commits"]
                                         or finding["unattributed_unmerged"]
-                                        or finding["content_free_stranded_commits"]):
+                                        or finding["content_free_stranded_commits"]
+                                        or finding["landed_stranded_commits"]):
                 findings.append(finding)
         except (subprocess.TimeoutExpired, OSError) as exc:
             print(f"[uncommitted-gate] delivery-repo probe failed for "
@@ -546,8 +659,20 @@ def _check_one_repo(repo: Path, fresh_hours: int,
             content_free = [c for c in blocking if c in from_head]
             blocking = [c for c in blocking if c not in from_head]
 
+    # CONTENT LANDED UNDER A NEW SHA (). The release above needs
+    # HEAD's whole tree to equal the ref, so it never reaches a squash- or
+    # rebase-merged FEATURE-branch commit, the commonest phantom. The
+    # discriminators, their order, and their FP/FN behaviour are documented in
+    # _landed_by_content. Released commits are reported, never dropped.
+    landed: Dict[str, str] = {}
+    if blocking:
+        landed = _landed_by_content(repo, default_ref, blocking)
+        blocking = [c for c in blocking if c not in landed]
+    landed_commits = [c for c in fresh_off_default if c in landed]
+
     unattributed = [c for c in fresh_off_default
-                    if c not in set(blocking) and c not in set(content_free)]
+                    if c not in set(blocking) and c not in set(content_free)
+                    and c not in landed]
     stale = [c for c in _rev_list(off_default) if c not in set(fresh_off_default)]
     return {
         "repo": str(repo),
@@ -557,6 +682,8 @@ def _check_one_repo(repo: Path, fresh_hours: int,
         "stale_stranded_commits": stale[:20],
         "unattributed_unmerged": unattributed[:20],
         "content_free_stranded_commits": content_free[:20],
+        "landed_stranded_commits": landed_commits[:20],
+        "landed_via": {c: landed[c] for c in landed_commits[:20]},
         "refspec_complete": refspec_complete,
     }
 
@@ -685,6 +812,15 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
                   f"History divergence only (e.g. merges resolved to upstream's "
                   f"exact bytes); clear it with a fast-forward or leave it.",
                   file=sys.stderr)
+        # . Released by content, and reported every run for the same
+        # reason: a stranding that stops blocking must never do so silently.
+        if f["landed_stranded_commits"]:
+            via = sorted(set(f["landed_via"].values()))
+            print(f"[uncommitted-gate] NOTE: {f['repo']} carries "
+                  f"{len(f['landed_stranded_commits'])} commit(s) off "
+                  f"{f['default_ref']} whose CONTENT is already on it "
+                  f"({', '.join(via)}) -- squash- or rebase-merged under a new "
+                  f"sha, so reporting, not blocking.", file=sys.stderr)
 
     would_block = (bool(dirty) or delivery_blocks or stranded_blocks) \
         and effective_override is None
@@ -712,4 +848,156 @@ def evaluate(*, goal_id: str, override: Optional[str], repo_path: Path,
         "body_role": role,
         "stranded_repos": stranded,
         "stranded_would_block": stranded_blocks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The refusal a caller READS ()
+# ---------------------------------------------------------------------------
+# evaluate() returns the whole census, and the daemon used to hand all of it
+# back as the refusal. Measured 2026-09-23 on a worker Body: 55,900 bytes around
+# ONE blocking commit, listed 12 times (its repo plus 11 worktrees sharing the
+# object store) among 629 non-blocking stale SHAs, with no remedy line. The Body
+# read that wall as grounds to override. So the refusal leads with a verdict,
+# lists each blocking item ONCE with the remedy for its kind, and reduces what
+# did not block to counts. Nothing that DECIDES is cut (guard-3416), and the
+# full census stays one command away.
+
+def describe_commit(repo: str, sha: str) -> dict:
+    """Subject, and the remote and local branches holding one commit.
+    Fail-soft: a git error leaves a field empty and never raises."""
+    info: dict = {"subject": "", "remote_branches": [], "local_branches": []}
+    for key, args in (("subject", ["log", "-1", "--format=%s", sha]),
+                      ("remote_branches", ["branch", "-r", "--contains", sha]),
+                      ("local_branches", ["branch", "--contains", sha])):
+        try:
+            # UTF-8 explicitly: a subject is free text, and the locale codec
+            # (cp1252 on a Windows daemon outside UTF-8 mode) raised on U+201D.
+            r = subprocess.run(["git", "-C", repo, *args],
+                               capture_output=True, text=True, timeout=10,
+                               encoding="utf-8", errors="replace")
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if r.returncode != 0:
+            continue
+        if key == "subject":
+            info[key] = r.stdout.strip()[:100]
+        else:
+            # `branch` marks the current branch `*` and one checked out in
+            # another worktree `+`; `origin/HEAD -> origin/main` is an alias.
+            info[key] = sorted({ln.strip().lstrip("*+ ")
+                                for ln in r.stdout.splitlines()
+                                if ln.strip() and "->" not in ln})[:3]
+    return info
+
+
+def _main_checkout(repo: str) -> str:
+    """The checkout owning `repo`'s objects: `repo` itself unless it is a
+    linked worktree. Fail-soft to `repo`."""
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse",
+                            "--path-format=absolute", "--git-common-dir"],
+                           capture_output=True, text=True, timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return repo
+    common = Path(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    return str(common.parent) if common is not None and common.name == ".git" else repo
+
+
+def refusal_body(goal_id: str, result: dict, describe=describe_commit,
+                 main_checkout=_main_checkout) -> dict:
+    """The 400 body for a blocked close. It builds and never decides: call it
+    only after evaluate() returned would_block. A failure in here must never
+    become an approval (guard-3803), so the endpoint falls back to the raw
+    payload on any exception."""
+    repos = result.get("stranded_repos") or []
+    dirty = result.get("dirty_framework_files") or []
+    delivery_blocks = bool(result.get("delivery_would_block"))
+    undelivered = result.get("undelivered_framework_files") or []
+
+    holders: Dict[str, List[dict]] = {}
+    for f in repos:
+        for sha in f.get("stranded_commits") or []:
+            holders.setdefault(sha, []).append(f)
+    commits = []
+    for sha, fs in holders.items():
+        info = describe(fs[0]["repo"], sha)
+        remote = info.get("remote_branches") or []
+        commits.append({
+            "sha": sha[:10],
+            "repo": main_checkout(fs[0]["repo"]),
+            "checkouts_holding_it": len(fs),
+            "subject": info.get("subject") or "",
+            "branch": (remote or info.get("local_branches") or ["?"])[0],
+            "pushed": bool(remote),
+            "must_reach": fs[0].get("default_ref") or "the default branch",
+        })
+    tracked = {f["repo"]: f["dirty_tracked"] for f in repos if f.get("dirty_tracked")}
+    local = [c for c in commits if not c["pushed"]]
+    pushed = [c for c in commits if c["pushed"]]
+
+    def _refs(cs):
+        return ", ".join(sorted({c["must_reach"] for c in cs}))
+
+    # One line per blocking KIND, and an override is offered only where the
+    # gate's design says it is legitimate (guard-5593): another goal's dirty
+    # files, or a PR deliberately left open. A local-only commit has no PR that
+    # could be open, so it gets no override line.
+    blocking: dict = {}
+    kinds, remedy = [], []
+    if dirty:
+        blocking["dirty_framework_files"] = dirty
+        kinds.append(f"{len(dirty)} uncommitted framework file(s)")
+        remedy.append("Commit the uncommitted framework files if they are this "
+                      "goal's work, then retry. If another goal or a partner owns "
+                      "them, retry with --override-uncommitted \"<whose they are>\" "
+                      "(audited).")
+    if delivery_blocks and undelivered:
+        blocking["undelivered_framework_files"] = undelivered
+        kinds.append(f"{len(undelivered)} committed but unpushed framework file(s)")
+        remedy.append("Push the committed framework files, then retry.")
+    if commits:
+        blocking["commits"] = commits
+        kinds.append(f"{len(commits)} commit(s) not on the branch they must reach")
+    if local:
+        remedy.append(f"Push the branch holding each LOCAL-only commit, open its PR "
+                      f"into {_refs(local)}, merge it, then retry.")
+    if pushed:
+        remedy.append(f"Merge the PR of each pushed commit's branch into "
+                      f"{_refs(pushed)}, then retry. A branch with no PR needs one "
+                      "opened first. Only if the PR is meant to stay open: retry "
+                      "with --override-uncommitted \"PR #<n> open\" (audited).")
+    if tracked:
+        blocking["dirty_tracked"] = tracked
+        kinds.append(f"modified tracked files in {len(tracked)} checkout(s)")
+        remedy.append("Commit and deliver the modified tracked files, or revert "
+                      "them, then retry.")
+    if dirty or pushed:
+        remedy.append("An override needs a justification VALUE: a bare "
+                      "--override-uncommitted is ignored and the close stays refused.")
+
+    not_blocking: dict = {}
+    for k in ("stale_stranded_commits", "unattributed_unmerged",
+              "content_free_stranded_commits", "landed_stranded_commits"):
+        n = sum(len(f.get(k) or []) for f in repos)
+        if n:
+            not_blocking[k] = n
+    if undelivered and not delivery_blocks:
+        not_blocking["unpushed_framework_files"] = len(undelivered)
+    if repos:
+        not_blocking["checkouts_with_findings"] = len(repos)
+    omit = {"stranded_repos"} | ({"undelivered_framework_files"}
+                                 if not delivery_blocks else set())
+    return {
+        "error": "uncommitted_work_blocked",
+        "gate": "uncommitted-work-gate",
+        "verdict": (f"REFUSED: {goal_id} status was NOT changed. Blocking: "
+                    f"{'; '.join(kinds) or 'see gate_output'}. Each is listed "
+                    "once under `blocking`; `remedy` says what clears it."),
+        "blocking": blocking,
+        "remedy": remedy,
+        "not_blocking": not_blocking,
+        "full_output": ("python3 core/scripts/uncommitted-work-gate.py "
+                        f"--goal-id {goal_id}"),
+        "gate_output": {k: v for k, v in result.items() if k not in omit},
     }

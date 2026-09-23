@@ -139,6 +139,24 @@ _EXCLUDE_DIRS = {
     "sessions", ".history", "presence",
     "__pycache__", ".git", "node_modules", ".locks", ".pytest_cache",
 }
+# Directory-name PREFIXES pruned exactly like _EXCLUDE_DIRS (g-372-44). An
+# exact-basename set cannot see an INVENTED sibling of an excluded dir: renaming
+# a box's world/.history to a `.history.pre-move` tombstone made it ordinary
+# world content, and one forced flush pushed 21,910 objects that every box then
+# pulled. The prefix applies to DIRECTORY segments only and stays separate from
+# _EXCLUDE_NAMES / the glob sets, which answer a different question (guard-3018).
+# The behavioral half is guard-7367; this is the structural net for host-side
+# operations that no agent hook sees.
+_EXCLUDE_DIR_PREFIXES = (".history",)
+
+
+def _is_excluded_dir(name: str) -> bool:
+    """True when a directory segment is walk-pruned (exact name or prefix).
+
+    Accepts a Path as well as a basename: list_dir's contract is List[str], but
+    test doubles hand back full Paths, and a Path has no startswith()."""
+    name = getattr(name, "name", name)
+    return name in _EXCLUDE_DIRS or name.startswith(_EXCLUDE_DIR_PREFIXES)
 # Exact basenames never synced (per-machine config / runtime / append logs).
 _EXCLUDE_NAMES = {
     "changelog.jsonl",
@@ -386,7 +404,7 @@ def refresh_would_clobber(be, target) -> bool:
             continue
         # Directory-level exclusion (walk-pruned dirs are never pushed). Check
         # only the directory segments, never the basename.
-        if any(seg in _EXCLUDE_DIRS for seg in rel.parts[:-1]):
+        if any(_is_excluded_dir(seg) for seg in rel.parts[:-1]):
             return True
         return _is_machine_local(target.name, prefix, full_path=target,
                                  root_path=Path(root_path))
@@ -2019,7 +2037,7 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
             _sync_print(f"[sync] root absent (skipped): {root_path}", file=sys.stderr)
             continue
         for dirpath, dirnames, filenames in os.walk(root_path):
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDE_DIRS]
+            dirnames[:] = [d for d in dirnames if not _is_excluded_dir(d)]
             # H4a: at the agents-root level, prune agent dirs this machine does
             # NOT own — the local copy of a peer's dir is a stale cache of THEIR
             # machine's S3 writes, and pushing it would clobber the peer.
@@ -3014,7 +3032,7 @@ def _materialize_tree(be, root_path: Path, cur: Path, prefix: str, *,
         print(f"[materialize] WARN: list_dir failed for {cur}: {e}", file=sys.stderr)
         return
     for name in sorted(children):
-        if name in _EXCLUDE_DIRS:
+        if _is_excluded_dir(name):
             continue
         child = cur / name
         try:
@@ -3252,7 +3270,7 @@ def pull_sweep(be, *, only_root=None, dry_run=False):
             stats["pulled_roots"].append(prefix)
             for rel, etag, _size in objs:
                 parts = rel.split("/")
-                if any(seg in _EXCLUDE_DIRS for seg in parts[:-1]):
+                if any(_is_excluded_dir(seg) for seg in parts[:-1]):
                     stats["skipped_machine_local"] += 1
                     continue
                 full = root_path.joinpath(*parts)

@@ -34,7 +34,19 @@ AGENT=$(python3 "$CORE_ROOT/scripts/_resolve_agent_from_sid.py" "$SID" 2>/dev/nu
 # — the discriminator depends on session-save-id.sh having run first.
 # Missing/empty running-session-id (no autonomous runner active) → skip;
 # nothing to resume.
-RUNNING_SID=$(cat "$(agent_dir "$AGENT")/session/running-session-id" 2>/dev/null | tr -d '\r\n')
+#
+# The `|| RUNNING_SID=""` is load-bearing (guard-568). Under `set -euo pipefail`
+# an ABSENT file fails the cat, pipefail carries that through the pipe, and a
+# failed command substitution in a plain assignment aborts the script with rc=1
+# right here, before the worker-Body admission below can run. A cross-box
+# worker box never writes running-session-id (body-manifest.sh), so until
+# 2026-09-23 () this line silently skipped the compaction restore on
+# exactly the boxes that admission exists for. Measured on zc-01/zc-02 that
+# day: 12 of 19 worker compactions got no restore at all; the other 7 got
+# through only while the file existed, the one way past this line (what wrote
+# it then is not recorded). The test that pinned the admission wrote an EMPTY
+# file, which cat reads fine.
+RUNNING_SID=$(cat "$(agent_dir "$AGENT")/session/running-session-id" 2>/dev/null | tr -d '\r\n') || RUNNING_SID=""
 if [ -z "$RUNNING_SID" ] || [ "$SID" != "$RUNNING_SID" ]; then
     # ...EXCEPT a worker Body, which is not an observer ().
     # precompact-checkpoint.sh has NO runner guard, so it fires for a worker

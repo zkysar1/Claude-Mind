@@ -162,6 +162,20 @@ def test_guard_is_not_reachable_only_via_claim():
     )
 
 
+def test_lane_axis_abstains_for_the_holder_on_both_sides():
+    """ parity (guard-742). The holder abstention must live on BOTH
+    entry points and must gate the lane axis itself; a copy on one side only is
+    the half-applied shape the module docstring opens with."""
+    for path, pattern in ((DAEMON_PATH, r"^(async )?def update_goal\("),
+                          (CLI_PATH, r"^def cmd_update_goal\(")):
+        body = _func_span(path, pattern)
+        assert "_holds_claim" in body, f"{path.name}: no holder abstention"
+        lane = re.search(r"_lane_conflict = \(not _holds_claim\s+and "
+                         r"_?routes_away_from\(_intended, _caller\)\)", body)
+        assert lane, (f"{path.name}: the lane axis is not gated on "
+                      f"_holds_claim -- a holder's in-progress write is refused")
+
+
 def test_scope_stays_narrow():
     """The  over-fix trap: a blanket cross-lane refusal breaks every
     rb-428 sweep. Both sides must gate on the takeover branch specifically."""
@@ -227,6 +241,12 @@ def world(tmp_path):
             _goal("g-999-06"),                              # unclaimed
             _goal("g-999-07", claimed_by="bravo", claimed_by_sid=OTHER_SID,
                   intended_agent="bravo"),                  # rb-428 sweep target
+            # : alpha HOLDS a goal routed to bravo -- the state an
+            # exempt (reallocation) or audited cross_lane claim leaves behind.
+            _goal("g-999-08", claimed_by="alpha", claimed_by_sid=MY_SID,
+                  intended_agent="bravo"),
+            _goal("g-999-09", claimed_by="alpha",           # ...legacy: no sid
+                  intended_agent="bravo"),
         ],
     }
     (wd / "aspirations.jsonl").write_text(
@@ -272,6 +292,15 @@ def _refused(res):
     # Lane routing, unchanged from .
     ("g-999-05", "alpha", MY_SID, True, "routed to bravo"),
     ("g-999-06", "alpha", MY_SID, False, "unclaimed goal"),
+    # : the lane axis does not vote on the claim's own HOLDER --
+    # claim() already adjudicated the lane. RED before the fix: refused as
+    # "routed to 'bravo'" although alpha held the claim in this very session.
+    ("g-999-08", "alpha", MY_SID, False, "holder of a routed-away claim"),
+    ("g-999-09", "alpha", MY_SID, False, "legacy holder, no stored sid"),
+    # ...and the abstention is reachable ONLY through a proven hold.
+    ("g-999-08", "alpha", OTHER_SID, True, "routed-away claim, other session"),
+    ("g-999-08", "alpha", None, True, "routed-away claim, caller omits sid"),
+    ("g-999-08", "zeta", MY_SID, True, "routed-away claim held by another agent"),
 ])
 def test_takeover_matrix(world, goal_id, agent, sid, should_refuse, why):
     res = _update(world, goal_id, "status", "in-progress", agent=agent, sid=sid)
@@ -370,12 +399,13 @@ from _daemon_fixture import DaemonFixture  # noqa: E402
 UPDATE_WRAPPER = CORE_SCRIPTS / "aspirations-update-goal.sh"
 
 
-def _wrapper_world(root: Path) -> Path:
-    """A tmp world holding one goal claimed by ANOTHER agent.
+def _wrapper_world(root: Path, goals=None) -> Path:
+    """A tmp world holding one goal claimed by ANOTHER agent (default).
 
     bravo holds it, the caller is alpha, so `_agent_conflict` trips and the
     takeover guard refuses unless the override reaches the daemon. The archive
-    file is seeded because the endpoints expect it to exist.
+    file is seeded because the endpoints expect it to exist. `goals` replaces
+    the default fixture for tests that need a different shape.
     """
     world = root / "world"
     world.mkdir(parents=True, exist_ok=True)
@@ -387,8 +417,8 @@ def _wrapper_world(root: Path) -> Path:
         "priority": "MEDIUM",
         "status": "active",
         "created": "2026-08-06T00:00:00",
-        "goals": [_goal("g-998-01", claimed_by="bravo",
-                        claimed_by_sid=OTHER_SID)],
+        "goals": goals or [_goal("g-998-01", claimed_by="bravo",
+                                 claimed_by_sid=OTHER_SID)],
     }
     (world / "aspirations.jsonl").write_text(
         json.dumps(asp, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -483,3 +513,43 @@ def test_wrapper_cross_lane_flag_reaches_the_daemon():
                     ledger.read_text(encoding="utf-8").splitlines() if x.strip()]
             assert any("g-998-01" in json.dumps(r) for r in rows), (
                 "override-bypass-ledger has no row naming the overridden goal")
+
+
+def test_wrapper_lets_the_holder_of_a_routed_away_claim_mark_in_progress():
+    """ on the TRAVELLED path (guard-920).
+
+    claim() grants a routed-away goal through the reallocation exemption with
+    no override and no ledger row (g-115-3492). The Phase 4 in-progress write
+    that follows must land the same way. RED before the fix: takeover_refused
+    ("routed to 'bravo'"), whose own remedy text sends the rescuer to a
+    cross_lane override, i.e. a ledger row for a routine rescue (guard-4817).
+
+    The unclaimed sibling is the NEGATIVE CONTROL: it proves the lane axis is
+    live in this fixture, so the holder's pass cannot be a roster that failed
+    to load (routes_away_from is conservative on an unreadable roster).
+    """
+    goals = [
+        _goal("g-998-02", claimed_by="alpha", claimed_by_sid=MY_SID,
+              intended_agent="bravo"),
+        _goal("g-998-03", intended_agent="bravo"),
+    ]
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _wrapper_world(Path(tmpd), goals=goals)
+        with DaemonFixture(world, agent="alpha") as df:
+            ctl = _wrapper_update(df, world, "g-998-03", "status", "in-progress")
+            assert ctl.returncode != 0, (
+                "negative control: an unclaimed goal routed to bravo must still "
+                f"be refused for alpha; rc={ctl.returncode} "
+                f"stdout={ctl.stdout!r}")
+            res = _wrapper_update(df, world, "g-998-02", "status", "in-progress")
+            assert res.returncode == 0, (
+                "the holder of a routed-away claim was refused its own "
+                f"in-progress write; rc={res.returncode} stderr={res.stderr!r}")
+            g = _goal_in(world, "g-998-02")
+            assert g is not None and g.get("status") == "in-progress", g
+            ledger = world / "override-bypass-ledger.jsonl"
+            rows = ([json.loads(x) for x in
+                     ledger.read_text(encoding="utf-8").splitlines()
+                     if x.strip()] if ledger.exists() else [])
+            assert not any("g-998-02" in json.dumps(r) for r in rows), (
+                "no override was needed, so none may be logged: " + repr(rows))

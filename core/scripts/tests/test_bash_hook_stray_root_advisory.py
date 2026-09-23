@@ -109,6 +109,17 @@ class StrayRootAdvisory(unittest.TestCase):
             res.get("hookSpecificOutput", {}).get("permissionDecision"), "deny"
         )
 
+    def test_a_stray_does_not_switch_off_the_denies(self):
+        # Until 2026-09-23 the advisory exited the hook before any deny ran, so
+        # while a stray existed (zc-03 coach-mind, from 2026-09-04) no Bash write
+        # was ever refused. The out-of-root write here must still be denied.
+        root = make_root(world_conf=None, with_stray_world=True)
+        res = run_hook(root, "echo y > /nonexistent-root-stray/f.txt")
+        self.assertIsNotNone(res)
+        self.assertEqual(
+            res.get("hookSpecificOutput", {}).get("permissionDecision"), "deny"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

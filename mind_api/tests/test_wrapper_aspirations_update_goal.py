@@ -434,6 +434,23 @@ def test_wrapper_dotted_field_returns_400(running_daemon):
     assert "verification.outcomes" not in on_disk
 
 
+def test_wrapper_refusal_ends_on_a_verdict_line(running_daemon):
+    """: callers read long refusals through `2>&1 | tail -N`, which
+    also swaps the wrapper's exit 1 for tail's 0. A worker Body read one as
+    "The update succeeded (exit code 0)". So the LAST stderr line says the
+    write was refused and nothing changed, whatever sits above it."""
+    project_root, port = running_daemon
+    goal_id = _seed_goal(project_root, port)
+
+    rc, _out, err = _run([goal_id, "verification.outcomes", '["ok"]'],
+                         project_root=project_root)
+
+    assert rc == 1, err
+    last = err.strip().splitlines()[-1]
+    assert last == (f"REFUSED (dotted_field_rejected): {goal_id} "
+                    "verification.outcomes was NOT changed. Exit code 1."), last
+
+
 def test_wrapper_missing_positional_error(running_daemon):
     """Missing positional args → wrapper exits non-zero."""
     project_root, _ = running_daemon

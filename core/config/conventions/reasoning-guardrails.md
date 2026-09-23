@@ -7,8 +7,13 @@ Reasoning bank entries use JSONL (one JSON object per line) with script-based ac
 
 ## Record Schema
 Required: `id`, `title`, `type`, `category`, `content`, `applies_to`, `created`
-Defaults: `status` ("active"), `when_to_use` (""), `utilization` (zeros)
+Defaults: `status` ("active"), `when_to_use` ({"conditions": [], "category": ""}), `utilization` (zeros)
 Optional: `source_goal`, `source_hypothesis`, `tags`, `related_entries`, `experience_ref`, `preventive_guardrail`, `entry_type`, `poignancy`
+
+`when_to_use` has ONE shape to write: `{"conditions": ["<the situation that should
+surface this entry>", ...], "category": ""}`, the default `store_registry.py` fills in for
+this store and for guardrails. A bare string is the legacy shape: 4,901 of 11,056 active
+entries carried one on 2026-09-23. Retrieval reads both (g-115-10666); add no more strings.
 
 `applies_to` (one of `any`, `framework`, `domain`, `specific`) scopes the
 lesson: `any` = cross-cutting methodology, `framework` = this framework's
@@ -119,6 +124,7 @@ Guardrails use JSONL (one JSON object per line) with script-based access:
 Required: `id`, `rule`, `category`, `trigger_condition`, `source`, `created`
 Defaults: `status` ("active"), `utilization` ({`times_active`: 0, `times_skipped`: 0, `times_helpful`: 0, `times_noise`: 0, `retrieval_count`: 0, `utilization_score`: 0.0}). Authoritative field list: `core/scripts/reasoning-bank.py` `UTILIZATION_COUNTERS`. No top-level `times_triggered` — that field belongs to `pattern-signatures.jsonl`, not guardrails.
 Optional: `tags`, `title`, `when_to_use`, `severity`, `action_hint`, `phases`, `context_triggers`, `trigger_pattern`, `experience_ref`, `source_reflection_id`, `auto_flagged_for_review`, `next_review_eligible_at`, `valid_from`, `valid_to`, `retirement_date`, `retirement_reason`
+`when_to_use` takes the reasoning bank's one shape, `{"conditions": [...], "category": ""}` (see its Record Schema above).
 
 `related_patterns` and `violation_history` are **NOT** guardrail fields — `guardrails-add.sh` rejects both with `validation_failed: Unknown field(s)`. They were documented here in error. The authoritative allowlist is `GUARD_KNOWN_FIELDS` in `mind_api/src/store_registry.py` (~L301; its L487 raises the error), mirrored CLI-side in `core/scripts/reasoning-bank.py` (~L195) — extend BOTH in sync or not at all.
 

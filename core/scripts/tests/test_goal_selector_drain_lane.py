@@ -28,6 +28,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
@@ -538,6 +540,17 @@ def _agent_name(name):
         gs.AGENT_NAME = saved
 
 
+@pytest.fixture(autouse=True)
+def _pinned_roster(monkeypatch):
+    """The routed-away clause keys on routes_away_from (), which reads
+    the LIVE roster on every call: an off-roster name routes nowhere. Unpinned,
+    these assertions would answer differently on a box whose team-state lacks a
+    name — the env axis again. Pin it."""
+    import aspirations
+    monkeypatch.setattr(aspirations, "_get_active_agents",
+                        lambda: ["alpha", "bravo", "echo", "foxtrot", "zeta"])
+
+
 def _routed(gid, score, ratio=10.63, to="bravo", **kw):
     r = row(gid, score, ratio=ratio, **kw)
     r["intended_agent"] = to
@@ -559,9 +572,17 @@ def test_banner_waives_for_an_ordinary_pick(capsys):
     assert _WAIVER in err, err
 
 
-def test_banner_sends_a_routed_away_pick_to_cross_lane_not_to_abstention(capsys):
-    """'s exact shape, with the CORRECTED verdict (,
-    2026-09-22).
+def test_banner_sends_a_rescued_pick_to_a_clean_claim_not_to_abstention(capsys):
+    """'s exact shape, with the verdict corrected TWICE.
+
+    SECOND CORRECTION (g-115-10593, 2026-09-23): the claim is clean. The daemon
+    claim endpoint has consulted gates.reallocation_exempt since 2026-09-05
+    (g-115-3492) and granted 37 of 55 logged decisions with no override, so the
+    waiver holds and --cross-lane is named only to forbid it: as an audited
+    bypass it would skip the claim-time re-check of the escape. The history
+    below is kept because the ABSTENTION half of it still binds.
+
+    FIRST CORRECTION (g-115-10480, 2026-09-22).
 
     The first cut of this test asserted `"must NOT claim it" in err`. That
     pinned a real defect in place. A routed-away row cannot reach `scored` by
@@ -574,27 +595,44 @@ def test_banner_sends_a_routed_away_pick_to_cross_lane_not_to_abstention(capsys)
     goal's owner can never rank it, its recurring_urgency being pinned at the
     urgency_max clamp.
 
-    Two things must both hold, and conflating them is what produced the bad
-    clause: the WAIVER stays withheld (the claim really does need --cross-lane,
-    because aspirations.py computes _lane_conflict from routes_away_from alone
-    and never consults gates.reallocation_exempt), while the ABSTENTION
-    instruction must be gone.
+    That correction's other half (withhold the waiver, prescribe --cross-lane)
+    rested on "the claim path never consults gates.reallocation_exempt", which
+    was measured on aspirations.py, not on the daemon claim endpoint the
+    wrapper takes. See the second correction above.
     """
     with _agent_name("zeta"):
         gs.emit_drain_lane_banner(_routed("g-353-03", 10.52, ratio=5.271), 7, 0, 5)
     err = capsys.readouterr().err
     assert "DRAIN-LANE" in err, "banner must still print — the row is still the lane pick"
-    assert _WAIVER not in err, (
-        "the claim is not ceremony-free: --cross-lane is still required: " + err)
-    assert "intended_agent='bravo'" in err, err
-    # The correction, pinned in both directions.
-    assert "--cross-lane" in err, (
-        "the reader was not told how to claim a rescued row: " + err)
+    assert "intended_agent='bravo'" in err, (
+        "the rescue clause did not fire — the row was not read as routed away: " + err)
+    assert _WAIVER in err, "a rescued row's claim is clean; the waiver holds: " + err
+    assert "WITHOUT --cross-lane" in err, err
     assert "yours to claim" in err, err
-    for forbidden in ("must NOT claim it", "abstain (locus-gated"):
+    for forbidden in ("must NOT claim it", "abstain (locus-gated",
+                      "claim it with --cross-lane"):
         assert forbidden not in err, (
-            f"the banner still tells the rescuer to walk away ({forbidden!r}); "
-            f"that re-strands the goal on an owner who cannot rank it: " + err)
+            f"the banner still prescribes {forbidden!r}: walking away re-strands "
+            f"the goal on an owner who cannot rank it, and --cross-lane bypasses "
+            f"the claim-time re-check: " + err)
+
+
+def test_banner_waives_for_an_out_of_vocabulary_row(capsys):
+    """THE DISCRIMINATING CASE between the two predicates (; the gap
+    zeta named: every routing test used in-vocabulary values).
+
+    An intended_agent outside the live vocabulary (the cycle-detector's "any",
+    a retired agent) routes NOWHERE: routes_away_from returns False, so
+    collect_candidates admits the row with no escape at all and the claim path
+    accepts it outright. The old tuple predicate still read it as routed away
+    and printed the rescue clause — asserting a reallocation that never
+    happened. RED before the fix."""
+    with _agent_name("zeta"):
+        gs.emit_drain_lane_banner(_routed("g-any", 11.0, to="any"), 2, 0, 5)
+    err = capsys.readouterr().err
+    assert _WAIVER in err, err
+    assert "reallocation escape" not in err, (
+        "an off-vocabulary row was described as a reallocation rescue: " + err)
 
 
 def test_banner_waives_for_a_row_routed_to_me(capsys):
@@ -624,9 +662,9 @@ def test_banner_waives_for_either_and_for_cross_agent_pulled_rows(capsys):
 def test_reducer_only_clause_still_wins_over_the_routing_clause(capsys):
     """Precedence is not arbitrary: a reducer-only row handed to a non-matching
     Body is the older, narrower fence (g-306-440) and its wording names the
-    remedy (leave it for the reducer). Both clauses withhold the waiver, so the
-    only thing at stake is which remedy the reader is told — and the role one
-    must not be masked by the routing one."""
+    remedy (leave it for the reducer). Since g-115-10593 the routing clause
+    GRANTS the waiver, so precedence now decides whether a worker is told to
+    claim a reducer-only row at all — the role clause must win."""
     r = _routed("g-both", 9.0)
     r["executable_by_role"] = "reducer"
     with _agent_name("zeta"):
