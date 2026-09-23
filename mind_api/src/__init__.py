@@ -12,11 +12,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-# Frontier-lead invariant: core(ayoai-mind) >= core(claude-mind) >= core(zds-mind).
+# Frontier-lead invariant: core(dev origin) >= core(staging) >= core(production).
 # ayoai-mind is the dev frontier — it develops core and promotes upstream, so its
 # version always leads. Bumped 0.1.0 -> 0.2.0 (2026-06-04) to encode the lead ahead
 # of the naming-overhaul release (the first breaking change to ship through the rails).
-__version__ = "2.12.78"
+__version__ = "2.12.80"
 
 
 def read_git_head_sha(project_root: Path) -> Optional[str]:

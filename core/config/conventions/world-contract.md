@@ -32,13 +32,14 @@ though it is TRUE and load-bearing for another. Two senses must stay apart:
   environment never owns a knowledge base by itself -- it is a substrate
   that agents perceive and act in.
 
-**In the current Mind-fleet deployments (ayoai-mind, claude-mind, zds-mind),
-these two senses collapse onto each other by construction**: one
+**In the current Mind-fleet deployments (the dev origin, the staging Mind and
+the production Mind), these two senses collapse onto each other by
+construction**: one
 `ENVIRONMENT_ID` names one deployment, that deployment has exactly one
 `WORLD_PATH`/knowledge tree, and every agent the deployment hosts
-(`agents/<name>/`) shares that one world-as-knowledge-base. Six agents on one
-box (alpha, bravo, echo, foxtrot, omni, zeta) point at one `WORLD_PATH`, and
-zds-mind registers two agents against one world. **This shape is real,
+(`agents/<name>/`) shares that one world-as-knowledge-base. Several agents on
+one box point at one `WORLD_PATH`, and the production deployment registers two
+agents against one world. **This shape is real,
 current, and remains fully valid and supported below -- nothing in this
 section deprecates it.**
 
@@ -61,7 +62,7 @@ world-as-knowledge-base instance" unless a clause says otherwise.
 
 ## The Seven Elements
 
-| Element | What it is | Framework realization (claude-mind) |
+| Element | What it is | Framework realization (the Mind framework) |
 |---------|-----------|-------------------------------------|
 | **Agents** | Entities that perceive, decide, and act within the world | `agents/<name>/` directory (self.md, aspirations.jsonl, experience.jsonl, journal.jsonl, session/) |
 | **Tasks** | Units of work agents select, execute, and verify | `world/aspirations.jsonl` (world-level) + `agents/<name>/aspirations.jsonl` (agent-level) + goals within aspirations |
@@ -88,7 +89,7 @@ available).
 Every world instance has a stable identifier: `ENVIRONMENT_ID`.
 
 ```
-ENVIRONMENT_ID=zds-mind
+ENVIRONMENT_ID=acme-mind
 ```
 
 > **Naming alignment (2026-06-07, principal directive).** This var was
@@ -105,7 +106,7 @@ ENVIRONMENT_ID=zds-mind
 > shipped `lodestar-commons` package: it still reads `MIND_COMMONS_POLICY` with
 > the pre-convergence `nothing|shared|open` vocabulary, and `policyToTier()`
 > branches on those literals. So "one name and one vocabulary everywhere" is
-> true across ayoai-mind/zds-mind and FALSE at the Mind->product boundary, which
+> true across the Mind deployments and FALSE at the Mind->product boundary, which
 > is precisely the boundary the commons dial exists to govern. Nothing performs
 > the documented `shared=selective` mapping; it exists only in this paragraph.
 
@@ -119,8 +120,8 @@ ENVIRONMENT_ID=zds-mind
   is the `originWorldId` in provenance metadata -- it traces where a piece of
   knowledge came from.
 - **Human-readable stable name**: unlike UUIDs, `ENVIRONMENT_ID` values are
-  short, readable, and stable (e.g., `zds-mind`, `ayoai-mind`,
-  `vinheim-demo-01`).
+  short, readable, and stable (e.g., `acme-mind`, `widget-mind`,
+  `acme-demo-01`).
 
 ### Current status (honest)
 
@@ -337,7 +338,7 @@ vars" section. They are loaded at runtime via `env-read.sh` (see
 
 ```bash
 # World contract vars
-ENVIRONMENT_ID=zds-mind                # this world's stable id
+ENVIRONMENT_ID=acme-mind               # this world's stable id
 COMMONS_POLICY=private         # commons crossing policy: private|selective|public
 ```
 

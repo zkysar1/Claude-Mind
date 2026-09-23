@@ -66,7 +66,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 SCRIPTS = os.path.join(REPO, "core", "scripts")
 TIMEOUT = 120
 
-GOAL_ID_RE = re.compile(r"\bg-\d{1,3}-\d{1,5}\b")
+GOAL_ID_RE = re.compile(r"\bg-\d{1,3}-\d+\b")  # seq is open-ended: guard-1161
 
 # Message-scratch filename shapes (). These files' DURABLE artifact is
 # a sent message -- a submitted PR, a row in world/board/*.jsonl, an outbound
@@ -86,7 +86,7 @@ _MESSAGE_SCRATCH_RE = re.compile(
 # by echo/cc-03 (2026-08-21, ): every first-token id named a goal the
 # file was merely referencing, and all 4 files had in fact landed. So prefer the
 # FILENAME, then front-matter `goal_id:`, and treat a body-only id as weak.
-_FM_GOAL_ID_RE = re.compile(r"^goal_id:[ \t]*[\"']?(g-\d{1,3}-\d{1,5})", re.M)
+_FM_GOAL_ID_RE = re.compile(r"^goal_id:[ \t]*[\"']?(g-\d{1,3}-\d+)", re.M)  # seq open-ended: guard-1161
 
 
 def _front_matter(body):

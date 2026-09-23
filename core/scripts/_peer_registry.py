@@ -44,11 +44,37 @@ unresolvable ENVIRONMENT_ID — the same trap peer_surface.routing_tag_targets_a
 already documents ("Different action, different fail-safe direction. Do NOT
 'align' the two by copying the sweep's posture."). Share I/O; never share policy
 between consumers whose wrong answers cost different things.
+
+SECOND EXPORT, same store: is_deployment_registry_entry() says which registry
+FILES name a specific deployment. The seed engine uses it twice (g-373-124) —
+to keep those files out of every seed, and to keep a destination's existing
+copies out of the orphan sweep — and the two uses must never disagree, so the
+predicate lives here once rather than in each caller (guard-2064).
 """
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-ENV_REGISTRY_DIR = PROJECT_ROOT / "core" / "config" / "environments"
+ENV_REGISTRY_REL = "core/config/environments"
+ENV_REGISTRY_DIR = PROJECT_ROOT / ENV_REGISTRY_REL
+# The one entry that names no deployment: a fresh world runs on it immediately
+# (ENVIRONMENT_ID=local), so it is the only entry a seed carries.
+GENERIC_ENV_ENTRY = "local.yaml"
+
+
+def is_deployment_registry_entry(rel_path) -> bool:
+    """True for a repo-relative path that is a registry entry naming a specific
+    deployment: any `core/config/environments/*.yaml` except GENERIC_ENV_ENTRY.
+
+    Same file set load_env_registry reads (`*.yaml` directly in the dir), minus
+    the generic entry. Decided from the path alone and derived from the registry
+    dir itself, so no deployment name is ever typed into a scanned file.
+    """
+    rel = str(rel_path or "").replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    parent, sep, name = rel.rpartition("/")
+    return (sep == "/" and parent == ENV_REGISTRY_REL
+            and name.endswith(".yaml") and name != GENERIC_ENV_ENTRY)
 
 
 def load_env_registry(registry_dir=None):
@@ -139,7 +165,7 @@ def classify_agent_name(agent_name, registry, self_env, roster):
                   alone cannot say which deployment is meant. Callers MUST NOT
                   auto-route these; surface them for a human/qualified form
                   (`<agent>@<env-id>`) instead. Live example: `zeta` is both a
-                  local agent here and in zds-mind's known_agents.
+                  local agent here and in a peer's known_agents.
       local     — in the local roster only.
       unknown   — neither. Not evidence of a peer; a bracket token in a subject
                   line is free text and most tokens are not agent names at all.

@@ -266,6 +266,28 @@ UNMEASURED_KEY = "_unmeasured_reason"
 # 300 s gives the slowest observed box ~2x headroom; raise the env knob rather
 # than editing this line.
 #
+# THE CALL ITSELF GOT ~14x CHEAPER (, 2026-09-21) AND THE KNOB IS
+# DELIBERATELY UNCHANGED. The sizing above rests on a CENSORED datum — "exceeded
+# 180 s" is a timeout, which bounds the cost from below and says nothing about
+# its magnitude, so no multiple of it was ever headroom over anything. Rather
+# than re-guess the bound, the call was made to stop doing the work this module
+# discards: `_read_blocked` now passes `--only-reason dependency`, so the
+# selector skips its structured-precondition branch. Profiled on cc-03 (echo,
+# Linux 6.8.0-139-generic, 2026-09-20): of a 41.0 s run, predicate.evaluate_all
+# was 34.7 s (85%) across 46 serial subprocess spawns at 0.738 s each, all of it
+# feeding classes this module never reads. Measured end-to-end through the
+# canonical wrapper 2026-09-21 on the same box, same queue, minutes apart:
+#   full view      43,243 ms   1,058,456 B   667 blocked rows
+#   --only-reason   2,969 ms     278,191 B   119 rows, 12 of them dependency
+#   -> 93.1% faster; the 12 dependency rows are IDENTICAL between the two
+#      (positive control: equal after dropping blocker_ref.created_at /
+#      expires_at, which are run-time stamps that drift the same way between
+#      two runs of the SAME path 3 s apart).
+# So the knob stays 300 s: it is now ~100x the measured cost on this box rather
+# than ~7x, which is slack, not a claim. It is still NOT evidence about
+# LAPTOP-3IOFCNEO — nobody has measured the narrowed call there. What changed is
+# that the bound no longer has to cover work the caller throws away.
+#
 # NOT switchable to stdout=DEVNULL to make the timeout reliable on Windows
 # (guard-4375): that remedy is for callers which do not read the child's output,
 # and this one parses its stdout as JSON. The guardrail says so explicitly.
@@ -323,8 +345,16 @@ def _read_blocked() -> dict:
     as a clean measurement.
     """
     try:
+        # --only-reason dependency (): this module reads exactly one
+        # class out of this view (`block_reason == "dependency"`, run() below)
+        # and nothing else — not by_reason, not the totals, not chain_position.
+        # The flag tells the selector so, which lets it skip the structured-
+        # precondition branch that was 85% of the call's cost. The returned
+        # dependency rows are unchanged; the view is marked `partial_view` and
+        # omits the three classes it no longer looked at.
         proc = subprocess.run(
-            bash_cmd(SCRIPT_DIR / "goal-selector.sh", "blocked"),
+            bash_cmd(SCRIPT_DIR / "goal-selector.sh", "blocked",
+                     "--only-reason", "dependency"),
             capture_output=True, text=True, timeout=BLOCKED_VIEW_TIMEOUT_S)
         if proc.returncode != 0:
             reason = "goal-selector blocked rc=%s" % proc.returncode

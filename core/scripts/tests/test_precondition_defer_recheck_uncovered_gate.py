@@ -334,7 +334,7 @@ def test_uncovered_gate_refs_helper_contract():
 # --------------------------------------------------------------------------
 
 def test_short_id_is_not_covered_by_a_longer_unrelated_id():
-    """SENSITIVITY: defer names g-115-1; predicates mention only ."""
+    """SENSITIVITY: defer names ; predicates mention only ."""
     pcs = [{"type": "goal_status", "id": "pc-a", "goal_id": "g-115-1364"}]
     assert M._uncovered_gate_refs(
         "precondition_unmet: waiting on g-115-1 to complete",

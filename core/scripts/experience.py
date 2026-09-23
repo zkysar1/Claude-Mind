@@ -299,7 +299,11 @@ def validate_record(rec):
 # exactly what happened to the  `xw-` widening, lost for months until
 #  found the two had diverged under a comment claiming they were
 # "lifted VERBATIM". A green core-side test proves nothing about the write path.
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,5}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
+# goal SEQUENCE is open-ended (guard-1161). Keep this comment on its OWN line:
+# mind_api/tests/test_experience_read_goal_derivation.py pins the two copies as
+# byte-identical with a `$`-anchored source-literal match, so a TRAILING comment
+# here silently unmatches the line and reads as "the copies diverged again".
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d+|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
 
 
 def derive_goal_id_from_id(rec_id):

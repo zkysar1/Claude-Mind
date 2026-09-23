@@ -160,9 +160,11 @@ def find_cycles(edges):
 
 # --- supersession-aware dependency resolution ------------------------------
 
-# A goal id: g-NNN-NN, widened to 2-4 digits on both halves (CLAUDE.md ID
-# Formats —  hit  on 2026-05-19).
-_GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,5}\b")
+# A goal id: g-NNN-NN. The SEQUENCE half is open-ended (guard-1161) — it is a
+# growing counter and every bound on it has expired twice already (
+# 2026-05-19,  2026-09-15). The aspiration half stays bounded: it is
+# a different axis and nowhere near a ceiling.
+_GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d+\b")
 
 # The migration fallback's marker. Rows closed BEFORE `superseded_by` existed
 # (the ..80 shape) carry their supersession only as prose in

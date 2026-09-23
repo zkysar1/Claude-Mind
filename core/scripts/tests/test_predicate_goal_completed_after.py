@@ -6,7 +6,8 @@ midnight, spuriously FAILING an intra-day same-day cutoff (predicate.py:268/273)
 FIX 1 extends a date-only value to end-of-day (23:59:59) before the >= comparison
 — the goal provably completed by that day's end.
 
-_lookup_goal_record is monkeypatched; after_ref uses the real iso: resolver.
+_resolve_goal_referent is monkeypatched (it was `_lookup_goal_record` until
+g-353-108 gave the lookup a disposition); after_ref uses the real iso: resolver.
 """
 import sys
 from pathlib import Path
@@ -18,7 +19,8 @@ import predicate  # noqa: E402
 
 
 def _goal(monkeypatch, record):
-    monkeypatch.setattr(predicate, "_lookup_goal_record", lambda gid: record)
+    monkeypatch.setattr(predicate, "_resolve_goal_referent",
+                        lambda gid: (record, "live", (record or {}).get("status")))
 
 
 def test_date_only_completed_passes_same_day_intra_day_cutoff(monkeypatch):

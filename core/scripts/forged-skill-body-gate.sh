@@ -2,7 +2,7 @@
 # Forged-skill BODY gate ( item 3) — refuse to register a forged skill
 # whose body is not present and loadable at the path the runtime will load.
 #
-# THE DEFECT THIS CATCHES (measured 2026-09-05 11:55Z on coach-mind, zc-03):
+# THE DEFECT THIS CATCHES (measured 2026-09-05 11:55Z on a downstream clone):
 # /forge-skill wrote the registry row into world/forged-skills.yaml, the skill
 # DIRECTORY was empty, a test goal was filed to exercise a skill with no body,
 # two "forge-skill,complete" board posts went out, and THE MODEL DECLARED

@@ -40,7 +40,8 @@ if hasattr(sys.stderr, "reconfigure"):
 # resolve_file_path is REQUIRED for the world/ and meta/ virtual-prefix convention.
 # Never substitute `PROJECT_ROOT / path` — world/ and meta/ are external directories
 # configured in <agent>/local-paths.conf. See .claude/rules/path-resolution.md.
-from _paths import PROJECT_ROOT, WORLD_DIR, resolve_file_path, agent_dir as _agent_dir
+from _paths import (PROJECT_ROOT, WORLD_DIR, resolve_file_path,
+                    agent_dir as _agent_dir, agents_root as _agents_root)
 
 
 CLOCK_SKEW_GRACE_SECONDS = 60
@@ -366,24 +367,68 @@ def resolve_after_ref(after_ref: str) -> Optional[datetime]:
 # Goal lookup (shared by goal_completed_after and vcs_commits_since)
 # ---------------------------------------------------------------------------
 
-def _lookup_goal_record(goal_id: str) -> Optional[dict]:
-    """Find a goal record by ID across world live, world archive, and the
-    bound agent's queue (in that order). Returns None if not found anywhere.
-    Shared by _eval_goal_completed_after and _eval_vcs_commits_since."""
+def _goal_queue_paths() -> List[Path]:
+    """World live, world archive, then EVERY agent queue (sorted by agent name).
+
+    NOT just the bound agent's (g-353-108, defect 2). Appending only
+    `MIND_AGENT`'s queue made referent resolution depend on which agent
+    happened to be bound and which box ran the check: the same predicate
+    returned different answers in different sessions, silently. Resolution of
+    a shared referent must not vary by observer, so every queue is searched.
+    Routed through `agents_root()` per CLAUDE.md "Agent-dir Resolution" — never
+    a `PROJECT_ROOT / name` join — so a layout move does not blind this scan."""
     import aspirations as asp_mod
 
-    def scan(path: Path) -> Optional[dict]:
-        if not path.exists():
-            return None
-        items = asp_mod.read_jsonl(path)
-        res = asp_mod.find_goal_in_aspirations(items, goal_id)
-        return res[2]["goals"][res[1]] if res else None
+    paths = [Path(asp_mod.LIVE_PATH), Path(asp_mod.ARCHIVE_PATH)]
+    try:
+        paths.extend(sorted(_agents_root().glob("*/aspirations.jsonl")))
+    except OSError:
+        # An unreadable agents root must not break world-lane resolution.
+        pass
+    return paths
 
-    search_paths = [asp_mod.LIVE_PATH, asp_mod.ARCHIVE_PATH]
-    agent = os.environ.get("MIND_AGENT", "").strip()
-    if agent:
-        search_paths.append(_agent_dir(agent) / "aspirations.jsonl")
-    return next((g for g in (scan(p) for p in search_paths) if g is not None), None)
+
+def _resolve_goal_referent(goal_id: str):
+    """-> (record | None, disposition, status). Never raises on a missing store.
+
+    disposition is one of:
+      "live" | "archived" | "agent" — a real record was found; `status` is its
+          own status field and the caller may read its timestamps.
+      "evicted"  — no record survives, but an aspiration's `archived_census`
+          records the id as terminal. `status` is the census status
+          ("completed", "skipped", ...). THERE IS NO TIMESTAMP in this case.
+      "unknown"  — no record and no census entry. Genuinely unresolvable here.
+
+    Replaces the old `_lookup_goal_record`, whose live+archive+bound-agent scan
+    could not see the eviction census and so reported an evicted-COMPLETED goal
+    as simply absent (g-353-108, guard-6762). Callers MUST branch on the
+    disposition: "unknown" is unevaluable, "evicted" is a decided terminal
+    disposition with no instant attached."""
+    import aspirations as asp_mod
+    from _goal_census import evicted_status_in
+
+    census_sources: List[list] = []
+    paths = _goal_queue_paths()
+    for idx, path in enumerate(paths):
+        if not path.exists():
+            continue
+        items = asp_mod.read_jsonl(path)
+        if idx < 2:
+            # Only the world stores carry an archived_census; keep the parsed
+            # items so the census pass below re-reads nothing (guard-6972).
+            census_sources.append(items)
+        res = asp_mod.find_goal_in_aspirations(items, goal_id)
+        if res:
+            rec = res[2]["goals"][res[1]]
+            disp = ("live", "archived")[idx] if idx < 2 else "agent"
+            return rec, disp, rec.get("status")
+
+    for items in census_sources:
+        status = evicted_status_in(items, goal_id)
+        if status:
+            return None, "evicted", status
+
+    return None, "unknown", None
 
 
 # ---------------------------------------------------------------------------
@@ -508,10 +553,51 @@ def _eval_goal_completed_after(p: dict) -> PredicateResult:
         return _unevaluable("goal_completed_after", pid,
                                reason=f"unresolvable after_ref: {after_ref}")
 
-    goal = _lookup_goal_record(goal_id)
+    goal, disposition, disp_status = _resolve_goal_referent(goal_id)
+    if goal is None and disposition == "evicted":
+        # The referent COMPLETED and was then evicted from its aspiration
+        # ( / guard-6762). The census is an id set with no instant
+        # attached, so the >= cutoff comparison below cannot be made — and the
+        # old behaviour (report "not found", passed=False) froze the dependent
+        # goal FOREVER while reporting an ordinary not-yet. A prerequisite that
+        # is done is done: PASS on the disposition, and say in the reason that
+        # the instant is unavailable so no reader mistakes this for a measured
+        # comparison. Any other terminal status is a decided NO, not a wait.
+        if disp_status == "completed":
+            return PredicateResult(
+                True, "goal_completed_after", pid,
+                observed_value={"disposition": "evicted", "status": disp_status,
+                                "completed_at": None, "cutoff": cutoff.isoformat()},
+                reason=(f"goal {goal_id} is evicted-completed (eviction census); "
+                        "completion instant not recoverable from the census, so the "
+                        "cutoff comparison was NOT made — passed on disposition"))
+        return PredicateResult(
+            False, "goal_completed_after", pid,
+            observed_value={"disposition": "evicted", "status": disp_status},
+            reason=(f"goal {goal_id} reached terminal status '{disp_status}' "
+                    "(eviction census), not 'completed'"))
     if goal is None:
-        return PredicateResult(False, "goal_completed_after", pid,
-                               reason=f"goal {goal_id} not found in live or archive")
+        # disposition == "unknown": no record in any queue and no census
+        # tombstone. Nothing that happens in the world will make this resolve,
+        # so it is UNEVALUABLE, not unmet — goal-selector then files it in its
+        # PERMANENT class ("fix the predicate") instead of re-probing it every
+        # 2h forever ( item 3; sibling branches above already do this).
+        # WORDING IS A CONTRACT HERE, not prose (). gates/check_schema.py
+        # classifies a check by SUBSTRING-matching this reason against its
+        # SCHEMA_REASONS / WORK_STATE_REASONS lists, and "unresolvable" is a
+        # SCHEMA reason — so an earlier draft saying "referent is unresolvable"
+        # made the FILING-TIME gate refuse any precondition naming a goal not yet
+        # filed, which is a legitimate forward reference and the load-bearing
+        # `ok` case of test_check_schema_gate. The two consumers ask different
+        # questions and both answers must stay right: filing-time = well-formed,
+        # ALLOW; selection-time = evaluable=False, PERMANENT class. Keep this
+        # string clear of every SCHEMA_REASONS substring, and judge any rewording
+        # in check_schema.py's lists (test_check_schema_reason_coverage pins it).
+        return _unevaluable("goal_completed_after", pid,
+                            observed_value={"disposition": "unknown"},
+                            reason=(f"goal {goal_id} has no record in any queue and "
+                                    "no eviction-census entry — the referent cannot "
+                                    "be resolved here"))
 
     # Non-recurring: completed_date. Recurring: lastAchievedAt. Check both.
     completed_ts_str = goal.get("completed_date") or goal.get("lastAchievedAt")
@@ -719,10 +805,20 @@ def _eval_vcs_commits_since(p: dict) -> PredicateResult:
     since_goal = p.get("since_goal_last_achieved")
     after_ref = p.get("after_ref")
     if since_goal:
-        rec = _lookup_goal_record(str(since_goal))
+        rec, disposition, _disp_status = _resolve_goal_referent(str(since_goal))
         if rec is None:
-            return PredicateResult(False, "vcs_commits_since", pid,
-                                   reason=f"since_goal_last_achieved goal {since_goal} not found")
+            # This branch needs the referent's TIMESTAMP as its cutoff, and an
+            # evicted goal has none to give (the census is an id set). So both
+            # "evicted" and "unknown" are unevaluable HERE, even though the
+            # sibling above can decide "evicted" on disposition alone — the two
+            # branches differ because one compares against an instant and the
+            # other only asks whether the prerequisite is done ().
+            return _unevaluable(
+                "vcs_commits_since", pid,
+                observed_value={"disposition": disposition},
+                reason=(f"since_goal_last_achieved goal {since_goal} is "
+                        f"{disposition} — no lastAchievedAt/completed_date is "
+                        "recoverable, so no cutoff can be computed"))
         ts_str = rec.get("lastAchievedAt") or rec.get("completed_date")
         if not ts_str:
             return PredicateResult(False, "vcs_commits_since", pid,
@@ -1024,12 +1120,13 @@ def _cli_goal(goal_id: str, types_filter: str = "structured") -> int:
         ambiguity. See `core/scripts/precondition-defer-recheck.py`
         for the canonical pre-filter + evaluate_all + clear pattern.
     """
-    import aspirations as asp_mod
+    import aspirations as asp_mod  # noqa: F401  (read_jsonl / find_goal below)
 
-    search_paths = [asp_mod.LIVE_PATH]
-    agent = os.environ.get("MIND_AGENT", "").strip()
-    if agent:
-        search_paths.append(_agent_dir(agent) / "aspirations.jsonl")
+    # Same observer-independence fix as _goal_queue_paths' own docstring
+    # describes (, defect 2): this CLI is what outcome 2 of that goal
+    # says to demonstrate the fix WITH, so it must not itself be blind to a
+    # goal that lives in another agent's queue or in the archive.
+    search_paths = _goal_queue_paths()
 
     for path in search_paths:
         if not Path(path).exists():

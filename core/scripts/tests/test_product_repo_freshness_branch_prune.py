@@ -189,3 +189,22 @@ def test_default_branch_itself_is_never_considered(tmp_path):
     res = prf.prune_merged_local_branches(clone, "main", apply=True)
     assert res["deleted"] == [], res
     assert "main" in _git(clone, "branch", "--list", "main").stdout
+
+
+def test_a_deleted_branch_is_not_also_reported_as_still_prunable(tmp_path):
+    """`deleted` and `prunable` are disjoint — the banner must not contradict.
+
+    Regression: the first live actuating run printed "pruned 1 dead local
+    branch" and, on the next line, "1 local branch(es) prunable — rerun with
+    --prune-branches to delete", naming the SAME branch it had just removed.
+    The unit tests missed it because they asserted `deleted` and never
+    asserted `prunable` was empty.
+    """
+    _o, clone = _estate(tmp_path)
+    _make_gone_branch(clone, "feat/done", [("b.txt", "two\n")],
+                      merge_into_main=True)
+    res = prf.prune_merged_local_branches(clone, "main", apply=True)
+    assert res["deleted"] == ["feat/done"], res
+    assert res["prunable"] == [], (
+        "a branch that was deleted is still advertised as prunable: %r" % res)
+    assert not (set(res["deleted"]) & {n for n, _ in res["prunable"]})

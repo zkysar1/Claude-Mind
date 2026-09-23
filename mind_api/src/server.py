@@ -658,16 +658,9 @@ class Server:
     # --- logging ---
 
     def _log_lifecycle(self, event: str, **extra: Any) -> None:
-        line = json.dumps({
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-            "event": event,
-            "version": __version__,
-            **extra,
-        }, ensure_ascii=False)
-        try:
-            with lifecycle.daemon_log(self.project_root).open("a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except OSError:
-            pass
+        # Delegates the record SHAPE + the append to lifecycle.log_event so this
+        # file and __main__.py's spawn-refusal records cannot drift apart
+        # ( added the second writer; one shape, one function).
+        line = lifecycle.log_event(self.project_root, event, __version__, **extra)
         # Echo to stderr so a foreground `python -m mind_api.src` shows progress.
         print(f"[runtime] {line}", file=sys.stderr)

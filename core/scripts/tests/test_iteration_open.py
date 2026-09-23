@@ -1326,3 +1326,46 @@ def test_every_wrapper_invocation_in_this_file_redirects_the_report_path():
         "_stub_wrapper, or pass env=dict(os.environ, "
         "ITERATION_OPEN_REPORT_PATH=(tmp_path / 'report.log').as_posix())."
     )
+
+
+def test_selection_line_labels_a_hoist_and_leaves_a_true_argmax_unmarked():
+    """index 0 may be a deliberate HOIST, and the SELECTION line must say so.
+
+    goal-selector.py promotes ONE goal to index 0 from three lanes, each stamping its
+    own marker key (guard-5135; rationale/selector-index-0-is-a-hoist.md). This line
+    rendered only goal_id/score, so a hoist and a true argmax came out BYTE-IDENTICAL
+    -- and the only apparent way to tell them apart was to run the selector repeatedly,
+    which is invalid: goal-selector.sh is NOT a pure read (guard-2331), so each sample
+    mutates the very drain-lane counter (invocations_since_pick vs k) that rate-limits
+    the hoist. Measured 2026-09-21 (zeta, cc-02): six iterations of sampling produced
+    two confident false signals -- a strict alternation and a caller correlation --
+    before the marker, present on the FIRST draw all along, settled it (g-115-10466).
+
+    BOTH directions are asserted on purpose. A renderer that appended the label
+    unconditionally would satisfy the hoist case alone, so the unmarked case is what
+    gives this test discriminating power (rb-5828).
+    """
+    def runner_for(cands):
+        return lambda argv, timeout: (0, json.dumps(cands), 5, None, "")
+
+    hoisted = io_mod._selection(runner_for([
+        {"goal_id": "g-001-10", "score": 9.56, "title": "Generate hypotheses",
+         "drain_lane_pick": True},
+        {"goal_id": "g-326-188", "score": 19.38, "title": "Load test"},
+    ]))["top"]
+    assert "[HOIST: drain_lane_pick]" in hoisted, hoisted
+    assert hoisted.startswith("g-001-10 (9.56)"), hoisted
+
+    argmax = io_mod._selection(runner_for([
+        {"goal_id": "g-326-188", "score": 20.03, "title": "Load test"},
+        {"goal_id": "g-115-817", "score": 18.88, "title": "Sweep inbox"},
+    ]))["top"]
+    assert "HOIST" not in argmax, argmax
+    assert argmax == "g-326-188 (20.03) Load test", argmax
+
+    for marker in ("strategic_focus_pick", "reducer_only_pick"):
+        line = io_mod._selection(runner_for([
+            {"goal_id": "g-373-45", "score": 15.31, "title": "x", marker: True},
+            {"goal_id": "g-326-899", "score": 17.15, "title": "y"},
+        ]))["top"]
+        assert "[HOIST: %s]" % marker in line, (marker, line)

@@ -204,7 +204,7 @@ _ISO_DATE_RE = re.compile(r"^\s*(\d{4}-\d{2}-\d{2})")
 # --- Referent classification --------------------------------------------------
 
 _ASP_RE = re.compile(r"^asp-\d{3,}$")
-_GOAL_RE = re.compile(r"^g-\d{3,}-\d{2,5}$")
+_GOAL_RE = re.compile(r"^g-\d{3,}-\d+$")  # seq is open-ended: guard-1161
 _MSG_RE = re.compile(r"^msg-\d{8}-\d{6}-[a-z0-9-]+$")
 _RB_RE = re.compile(r"^rb-\d+$")
 _GUARD_RE = re.compile(r"^guard-\d+$")

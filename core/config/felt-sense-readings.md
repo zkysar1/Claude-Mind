@@ -2187,3 +2187,58 @@ asp-350 4, asp-372 2, asp-115 1, asp-358 1** — i.e. **39 of 48 = 81% inside th
 Roblox lane against ONE asp-115 close.** No drift claim survives, and the directive
 instrument run an hour earlier agrees (work_class 5/5 above the 33.3% floor). Classified
 **nothing material** → journal only, no Self edit.
+
+---
+
+## foxtrot — 2026-09-22T15:42 (fire at 15014, prior 14934, diff 80)
+
+`hostname` LAPTOP-3IOFCNEO · `uname -r` 6.18.33.2-microsoft-standard-WSL2 · own-cloud ·
+sid 8acb6dba · zone normal.
+
+**Phase 2 — the in-progress population is EMPTY fleet-wide, and that is a positive-controlled
+reading rather than a blind probe.** `--goal-status in-progress --full` returned `[]` (2 bytes).
+Positive control on the SAME query shape, same call: pending **3068 rows / 24,953,614 B**,
+blocked **21**. So the query sees plenty; in-progress really is 0.
+
+**The ownership tally is all-clear for a reason that is NOT "the gate approved 3044 goals".**
+`3044 candidates — 0 mutated, 0 skipped (foreign sid), 0 skipped (absent sid), 0 skipped
+(partner)`; `fields: claimed_by 0/3044, claimed_by_sid 0/3044, name-less-sid 0`. Per rule 6 a
+small mutable count is usually the gates working — here it is something else again: the
+population carries **no claims at all**, so every branch of the Multi-Agent Safety Rule is
+vacuous and the thing actually protecting those goals is VERIFICATION, not ownership. Do not
+read this tally as the ownership gate having been exercised; it was not.
+Schema probe across STATUSES (the discipline this file's own Phase-2 note says is easy to get
+backwards): `claimed_by` present **0/3068 pending** but **4/21 blocked** — the projection can
+emit the field, so the pending zero is a property of the population. `executed_by` **359/3068**
+pending is the released-but-executed population the cnc slate keys on.
+
+**Phase 3 — `21 candidates — 0 mutated, 0 (foreign sid), 0 (absent sid), 3 skipped (partner)`;
+`claimed_by 4/21, claimed_by_sid 4/21, name-less-sid 0`.** Zero unblock candidates: every one
+of the 20 goals with edges has at least one dependency still pending or blocked. Independently
+cross-checked by `blocked-signal-resolution-check` in the same iteration —
+`blocked_with_signal: 20, naive_would_unblock: [], dangling_ref: [], undecidable: []` — a
+different code path reaching the same verdict. **`blocked_by` polymorphism fired twice**
+(guard-5479): `g-358-202` → `'g-358-183'` and `g-358-203` → `'g-374-81'`, both BARE STRINGS;
+the isinstance normalizer caught them. Both are echo's, so partner-skip anyway.
+
+**The one goal I hold a claim on is `g-326-900`, claimed_by foxtrot with MY sid** — a live
+claim, not a stale one, on a goal blocked behind `g-350-108` (the owner-postponed prod key).
+`abandoned-claim-check` agrees independently: `claimed_open=0 abandoned=0 releasable=0`.
+
+**Lane 7 — the delta is the finding, and it runs AGAINST me, so it is stated plainly.**
+Cumulative `counted_goals_this_session` is 62 (bare id STRINGS): asp-326 38, asp-001 7,
+asp-115 7, asp-350 5, asp-372 3, asp-358 1, asp-307 1 — 61% in the pin-001 lane. But the prior
+reading (48 closes, asp-326 35 = 81%) makes the TRAILING STRETCH computable: **+14 closes since,
+of which only 3 were asp-326 = 21.4% in-lane**, with asp-115 +6 dominating. The cumulative 61%
+is the flattering number and the 21.4% is the real one for this window. It is within policy —
+the stretch was directive discharge (bravo-6111, bravo-6101, echo-5456, echo-5728) plus precheck
+and hygiene, all sanctioned between due cycles, and g-326-85 is not due until 19:23 — so
+classified **not material**, no Self edit. **PRE-REGISTERED TEST for the next sweep: recompute
+the delta-stretch share. If it is again below ~40%, that is a second consecutive reading and
+should be treated as a trend, not a window.** Recording the prediction now so the next reader
+cannot re-derive a kinder one.
+
+**Phase 1b** insights backlog 0. **Phase 5b** 148 skills / 3903 assertions / 5 parse-lines,
+**0 stale** (`--all-skills`). **Phase 6** no meta drift. **Phase 1** wrote rb-11580 (carried
+debt-count drifts downward against the instrument that measures it) and strengthened
+guard-7075, which had fired correctly and was honored this iteration.

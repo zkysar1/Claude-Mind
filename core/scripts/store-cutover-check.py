@@ -333,9 +333,23 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
         return {"proven": False, "reason": "iteration_commit_stale",
                 "commit": commit[:9], "age_days": round(age_days, 1)}
     anc = _git("merge-base", "--is-ancestor", seam_commit, commit)
-    if anc.returncode != 0:
+    # rc==1 is the only nonzero that ANSWERS the question (git's documented
+    # contract: 0/1 carry the verdict, anything else is an error). A bare
+    # `!= 0` collapses "not an ancestor" into "the seam object does not exist
+    # here", and the two carry OPPOSITE instructions: rc=1 says pull, rc=128
+    # says there is nothing to pull, ever. Branch on rc==1 rather than
+    # rc==128 so an unexpected error code still routes to the error branch —
+    # exit codes vary by git version (rb-3541), and failing toward "error" is
+    # the fail-closed direction. Both branches still refuse: this makes the
+    # REASON honest, it does not make SAFE reachable ().
+    if anc.returncode == 1:
         return {"proven": False, "reason": "seam_not_ancestor",
                 "commit": commit[:9]}
+    if anc.returncode != 0:
+        return {"proven": False, "reason": "seam_object_absent",
+                "commit": commit[:9], "seam": seam_commit[:9],
+                "git_rc": anc.returncode,
+                "git_error": anc.stderr.strip()[:160]}
     # Rationale (WHY two tiers, and what tier 2 gives up):
     # core/config/rationale/store-cutover-attestation-predicate.md
     # Byte-identity is a TRANSPORT for a narrower property ("the consumers route
@@ -870,8 +884,17 @@ def _local_report(seam_commit: str, consumers: list[str],
     """
     try:
         anc = _git("merge-base", "--is-ancestor", seam_commit, "HEAD")
-        if anc.returncode != 0:
+        # Same two-code discrimination as _prove_commit (). The local
+        # lane needs it for the SAME reason: on a downstream repo the hardcoded
+        # seam sha is simply absent, and reporting that as "not an ancestor of
+        # HEAD" tells the operator standing on that box to pull a commit their
+        # repository can never contain.
+        if anc.returncode == 1:
             return {"seam_present": False, "reason": "seam_not_ancestor_of_HEAD"}
+        if anc.returncode != 0:
+            return {"seam_present": False, "reason": "seam_object_absent",
+                    "seam": seam_commit[:9], "git_rc": anc.returncode,
+                    "git_error": anc.stderr.strip()[:160]}
         diff = _git("diff", "--name-only", "origin/main", "--", *consumers)
         if diff.returncode != 0:
             return {"seam_present": False, "reason": "diff_failed"}

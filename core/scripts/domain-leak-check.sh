@@ -147,6 +147,36 @@ if [[ "$STAGED" == true ]]; then
   fi
 fi
 
+# --- Scope: what the seed ships () ---
+# This gate keeps the PUBLISHED seed domain-free, so it asks the seed engine
+# what ships instead of re-deriving it: `list-includes` is the same
+# resolve_include_set every plant step uses. A hit in a file the seed does not
+# ship (deployment registry entries, the migrate-* one-offs, test scratch) is
+# not counted, and it IS reported below on every run (guard-2529, guard-3097):
+# a filter that drops rows silently reads exactly like a clean tree.
+# An unresolvable include-set scopes NOTHING -- the scan runs unscoped and says
+# so. Over-reporting is this gate's safe direction; a wrong scope hides a leak.
+SEED_MANIFEST="$PROJECT_ROOT/core/config/seed-manifest.yaml"
+SHIP_FILE="$(mktemp)"
+SCOPED_OUT_FILE="$(mktemp)"
+trap 'rm -f "$SHIP_FILE" "$SCOPED_OUT_FILE"' EXIT
+SCOPED=false
+# Two blind modes, both measured by the fresh-eyes review of . A
+# Windows `py -3` writes CRLF (guard-5779), so every whole-line match below
+# missed and EVERY hit was scoped out; hence the `tr`. And an EMPTY include set
+# still prints one newline byte, which passed a bare non-empty test; hence a
+# positive control instead: this gate ships with the seed, so a list that lacks
+# it is not this repo's include-set.
+if [[ -f "$SEED_MANIFEST" ]] \
+   && { py -3 "$SCRIPT_DIR/_seed_engine.py" list-includes --lines \
+          --manifest "$SEED_MANIFEST" --source "$PROJECT_ROOT" | tr -d '\r' > "$SHIP_FILE"
+        [[ "${PIPESTATUS[0]}" -eq 0 && "${PIPESTATUS[1]}" -eq 0 ]]; } \
+   && grep -Fxq -- "core/scripts/domain-leak-check.sh" "$SHIP_FILE"; then
+  SCOPED=true
+else
+  echo "WARN: could not resolve the seed include-set; scanning UNSCOPED (files the seed does not ship count too)." >&2
+fi
+
 FOUND=0
 
 # Case flag for the two greps below (). An EMPTY array is the
@@ -216,6 +246,12 @@ while IFS= read -r term; do
           # token must OPEN A COMMENT, so a prose mention no longer suppresses
           # this file for every blocklist term (, guard-6989).
           if grep -qE "$MARKER_RX" "$f" || grep -qE '^forged:[[:space:]]*true[[:space:]]*$' "$f"; then
+            continue
+          fi
+          # Last filter, so only hits that WOULD have counted are scoped out
+          # and reported (): the file is not in the seed.
+          if [[ "$SCOPED" == true ]] && ! grep -Fxq -- "${f#"$PROJECT_ROOT/"}" "$SHIP_FILE"; then
+            echo "$line" >> "$SCOPED_OUT_FILE"
             continue
           fi
           echo "$line"
@@ -345,6 +381,22 @@ if [[ $MISPLACEMENT_FOUND -eq 1 ]]; then
   echo "See .claude/rules/domain-free-examples.md § 'Marker Restriction'."
   echo "Allowlist additions live in core/scripts/marker-placement-gate.py ALLOWLIST."
   FOUND=1
+fi
+
+# Scope report (): the denominator and what the scope excluded, on
+# every run, clean and dirty alike. Printed before the verdict line so the
+# CLEAN line stays last.
+if [[ "$SCOPED" == true ]]; then
+  n_ship=$(wc -l < "$SHIP_FILE" | tr -d ' ')
+  if [[ -s "$SCOPED_OUT_FILE" ]]; then
+    n_out=$(wc -l < "$SCOPED_OUT_FILE" | tr -d ' ')
+    echo "SCOPE: the seed ships $n_ship files; $n_out hit(s) in files it does not ship were not counted:"
+    cut -d: -f1 "$SCOPED_OUT_FILE" | sort | uniq -c | while read -r n f; do
+      echo "  not shipped: ${f#"$PROJECT_ROOT/"} ($n hit(s))"
+    done
+  else
+    echo "SCOPE: the seed ships $n_ship files; no hit fell outside it."
+  fi
 fi
 
 if [[ $FOUND -eq 0 ]]; then

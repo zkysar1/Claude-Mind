@@ -74,7 +74,15 @@
 #                (). Sub-second over ~800 files, zero false-positive class.
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval, blocker-recheck, defer-recheck,
+#                defer-citation-parity-check, defer-scope-coverage,
 #                precondition-defer-recheck, recurring-starvation-check
+#                (defer-scope-coverage is medium rather than deferrable
+#                because it is the ONLY consumer of the population
+#                precondition-defer-recheck skips — ~76% of that lane's
+#                eligible rows — and the deferrable tier is not dispatched
+#                by anything, which is how its .py sat call-site-less from
+#                2026-08-09 to 2026-09-22; . It is also the cheapest
+#                lane in the battery: 0.14s over three runs)
 #                (recurring-starvation-check is deliberately NOT deferrable
 #                despite sitting among the deferrable sweeps: it exists because
 #                a 5-day recurring-lane blind spot went unnoticed, so it must
@@ -147,7 +155,7 @@ sweep_tier() {
     case "$1" in
         tree-debt-gate|experience-archival-gate|evolution-finalize-gate|fresh-eyes-code-gate|dependency-timeout-check|inbox-alert-age-check|handoff-aging-check|user-blocker-escalation-check|directive-mix-check|completed-not-closed-drain|world-script-crlf-check|close-phase-skip-check|inbound-drain)
             echo "always-run" ;;
-        aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|precondition-defer-recheck|recurring-starvation-check)
+        aspirations-recover-recurring|monitor-stale-check|precheck-eval|blocker-recheck|defer-recheck|defer-citation-parity-check|defer-scope-coverage|precondition-defer-recheck|recurring-starvation-check)
             echo "medium" ;;
         pending-questions-sweep|recurring-precondition-sweep|parent-supersession-sweep|unblock-parent-status-sweep|routing-audit-target-status-sweep|credential-defer-recheck|defer-drift-check|reason-less-blocked-check|blocked-signal-resolution-check|dependency-cycle-check|hypothesis-terminal-goal-check|locus-sweep|reclaim-defer-audit|reclaim-user-participant-audit|human-blocked-defer-join|self-blocked-defer-sweep|phantom-goal-audit|hardcoded-scope-audit|closed-against-own-note-check|fresh-eyes-cadence|fresh-eyes-program-cadence|fresh-eyes-tree-cadence|strategic-scan-cadence|felt-sense-cadence|l1-skew-cadence|scar-tissue-cadence|completed-not-closed-cadence|health-regression-cadence|curriculum-cadence|evolution-cadence|stalled-goal-ratchet|abandoned-claim-check|check-stderr-json-merge|check-uncommitted-edits-log-freshness|role-multiplier-coverage-audit|verify-rb-type-parity|hand-command-audit|check-agents-parent-dir-sync|fromisoformat-idiom-guard|hook-slot-contract-check|narrative-clobber-audit|guardrail-pair-audit|dropped-field-audit|unchecked-write-ratchet|tree-last-updated-drift-check|goal-field-census-ratchet|check-tests-no-live-agent-wm|embedded-python-audit|tree-adjudication-scan|displaced-id-audit|repo-hygiene-sweep|domain-term-ratchet)
             echo "deferrable" ;;

@@ -162,7 +162,7 @@ def _resolve_world_team_state(project_root: Path) -> Path | None:
     # and this function is reached at daemon IMPORT time via the
     # capability_route ACTIVE_AGENTS shim — iterdir() on the missing dir
     # raised FileNotFoundError and killed the daemon before /health existed
-    # (measured 2026-08-21 on a pristine coach-mind clone). Absent root ==
+    # (measured 2026-08-21 on a pristine downstream clone). Absent root ==
     # team-state absent == None, exactly this function's documented contract.
     try:
         children = sorted(_agents_root(project_root).iterdir())

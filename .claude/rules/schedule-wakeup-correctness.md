@@ -74,10 +74,8 @@ to continue iterating; the Skill call queues the next turn synchronously.
 The prohibition is on SUBSTITUTION (using ScheduleWakeup *instead of* the
 Skill call to advance the loop). It is NOT a prohibition on the deadman's
 re-arm below, where ScheduleWakeup is a NET *behind* an unchanged Skill
-re-entry. No harness makes the idle sleep's wakeup the re-entry: every
-harness reports a background job's exit (Zak Code since its ADR-0191), so
-`aspirations-all-blocked` B7.2 backgrounds the sleep and the notification
-re-enters — never a synchronous Skill re-entry after it.
+re-entry. Nor is the idle sleep's wakeup ever the re-entry — every harness
+reports a background job's exit (loop-terminal-protocol.md §4.2).
 
 ## Sanctioned Exception: the deadman's-switch terminal-pair
 
@@ -103,7 +101,7 @@ re-entry — the LAST call, continuing the loop synchronously. The wakeup is a
 single replace-slot net (each iteration's re-arm REPLACES the prior) that never
 fires on a healthy loop, only when the Skill chain breaks — the legitimate
 "signal the harness cannot track" use, not state-machine advancement. The gate
-passes the sentinel unconditionally; guard-511 carries the carve-out. Platform
+passes the sentinel while RUNNING; guard-511 carries the carve-out. Platform
 facts and the fail-safe property (worst case a SLOW loop, never a dead one):
 `core/config/conventions/loop-terminal-protocol.md` §4; design rationale:
 `core/config/rationale/deadman-switch.md`.
@@ -124,9 +122,9 @@ MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600
 re-arm — restoring the net BEFORE any loop-entry work that could fail — THEN
 proceed to Phase -1.5. This is a one-shot net-restoration at the START of the
 turn, NOT the "arm early" mechanic F2 rejected; the close's terminal-pair re-arm
-simply REPLACES it (double-arm is harmless). The gate always approves the
-sentinel. Rationale + full incident traces:
-`core/config/rationale/deadman-switch.md`.
+simply REPLACES it (double-arm is harmless). The gate approves it only while
+RUNNING: a net OUTLIVES its loop, so an IDLE agent re-arming one is a turn with
+no exit (2026-09-21). See `core/config/rationale/deadman-switch.md`.
 
 ### D. Using ScheduleWakeup for EXTERNAL polling the harness already tracks
 
@@ -150,7 +148,7 @@ signal, not a flag, is what tells the gate a cancel is legitimate.
 
 | Layer | Mechanism | What it catches |
 |-------|-----------|-----------------|
-| **A** — gate | `core/scripts/schedule-wakeup-gate.{py,sh}` (PreToolUse[ScheduleWakeup]) refuses (i) slash-prefix prompts other than `/loop`, (ii) `stop: true` while agent-state is RUNNING with no `stop-requested`. Fail-open by contract. Tests: `tests/test_schedule_wakeup_gate.py`. | Both the wrong prompt (A-D) and the net-cancel (E), at write time. Denies name the correct re-arm. |
+| **A** — gate | `core/scripts/schedule-wakeup-gate.{py,sh}` (PreToolUse[ScheduleWakeup]) refuses (i) slash-prefix prompts other than `/loop`, (ii) `stop: true` while agent-state is RUNNING with no `stop-requested`, (iii) the sentinel while agent-state is NOT RUNNING. Fail-open by contract. Tests: `tests/test_schedule_wakeup_gate.py`. | The wrong prompt (A-D), the net-cancel (E), and a net over no loop, at write time. Denies name the correct action. |
 | **B** — rule (this file) | Behavioral guidance read on demand | Documents the correct patterns for human and LLM authors. |
 | **C** — detective | `core/scripts/aspirations-rejection-audit.py` scans recent transcripts for the rejection message + the originating ScheduleWakeup call. Predicate is shared with the gate via `core/scripts/_swakeup_predicate.py` (single source of truth). | Catches drift if the gate is bypassed (hook timeout, fail-open path). Reports only; `--exit-on-hits` makes it file Investigate goals. |
 

@@ -36,7 +36,7 @@ aspirations, board), and its `meta/` (improvement strategies) — onto a second
 machine, with the agent able to RESUME as itself rather than re-initialize.
 
 This is the opposite of `/seed`. A **seed** is domain-free; planting it grows a
-NEW, empty environment (`claude-mind`) with no agents and no learned state. A
+NEW, empty environment (a fresh deployment) with no agents and no learned state. A
 **transplant** keeps everything and relocates it. If the user wants a fresh
 empty framework, that is `/seed plant` — not this skill.
 

@@ -79,8 +79,12 @@ if str(SCRIPT_DIR) not in sys.path:
 # datetime) is untouched by a `from _dt import ...` form.
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
 
-# Matches the framework's goal-id format (2-4 digit tail per CLAUDE.md "ID Formats").
-GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d{2,5}\b")
+# Matches the framework's goal-id format. The SEQUENCE tail is OPEN-ENDED
+# (guard-1161): it is a growing counter and every bound on it has expired.
+# The old `\d{2,5}` floor-and-cap was a transcription of CLAUDE.md prose, not a
+# false-positive filter — measured 2026-09-21 over 5,775 live goal ids, ZERO
+# carry a 1-digit sequence, because all three allocators mint `{seq:02d}`.
+GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d+\b")
 SILENCE_HOURS = 48
 
 

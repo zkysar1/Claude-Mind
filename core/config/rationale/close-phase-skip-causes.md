@@ -36,10 +36,66 @@ So the discrimination moved into `classify_close_path()` and the prose shrank.
 | 6 | **Hypothesis-resolution close** | `complete-by` then `outcome_class` seconds apart; NO claim row in the goal's entire lifetime | **CREDIT** — work happened, so the absent bump is a real accounting gap |
 | 7 | **Finding-disposition close at iteration open** — a precheck finding whose correct disposition IS closing the subject goal (premise cleared / moot) | **identical to (3)**: a lone `update-goal <id> status`, no `complete-by` | **EXCLUDE** in principle — the closer executed no iteration — but see below: it is NOT separable, so it reports as (3) |
 | 8 | **Lock-contention retry out of band** — the close's status flip failed on a peer `aspirations.lock`, and the retry went through a bare `aspirations-complete-by.sh` instead of back through `iteration-close.sh --phase verify` | `outcome_class` **BEFORE** `complete-by` (reversed vs 1/4/6), same-agent claim present | FINDING — genuine skip; repair per g-115-8289 |
+| 9 | **Claimed-and-executed bare-status close** — the goal WAS claimed and worked, but the close was typed as `aspirations-update-goal.sh <id> status completed` instead of `complete-by` / `iteration-close.sh --phase verify` | shares (3)/(7)'s fingerprint — no `complete-by` **anywhere in the goal's lifetime** — but a **same-agent `claim` row precedes the status flip**, and the record carries a substantive `outcome_note` | **CREDIT** — work happened, so the absent bump/journal/tree-drift reset is a real accounting gap. The repair is still FORBIDDEN (guard-1235) |
 
 Causes 4 and 6 produce a **byte-identical** fingerprint, which is why the
 classifier keys on `sanctioned path that executed no iteration` and then splits
 EXCLUDE from CREDIT on the claim history — never on drain-ness.
+
+Causes 3, 7 and 9 are the **no-`complete-by` family**, and the classifier cannot
+enter the split above for any of them: `classify_close_path` returns
+`PATH_UNCLASSIFIED` the moment `complete_by is None`, before it ever reads the
+claim history. So all three report identically, and the family spans all three
+verdicts — FINDING (3), EXCLUDE (7), CREDIT (9). Do not read a member of this
+family as cause 3 because cause 3 is the row that names a verdict.
+
+### The no-`complete-by` family is EVERY non-recurring goal, not an exceptional shape (measured 2026-09-20, g-369-404, echo/cc-03)
+
+Causes 3, 7 and 9 each describe the missing `complete-by` row as evidence that
+the closer took an irregular path — a bare `update-goal status` typed instead of
+`complete-by` / `iteration-close.sh --phase verify`. **On a non-recurring goal
+that inference does not hold, because the correct path emits no `complete-by`
+row either.** `iteration-close.sh` calls `aspirations-complete-by.sh` only inside
+its recurring branch (`iteration-close.sh:1366-1404`, whose own comment reads
+"CRITICAL — recurring goals MUST go through aspirations-complete-by.sh"), since
+what `cmd_complete_by` exists to do — bump `lastAchievedAt`, `achievedCount`,
+the streak pair — is meaningless for a goal that closes once. Its absence is
+therefore a property of RECURRENCE, not of how the close was typed.
+
+Measured on `g-369-404` (echo, cc-03, 2026-09-20): a fully conventional close —
+`claim` 21:09:54, `update-goal status` (in-progress) 21:10:02, three
+`progress_note` appends, then `iteration-close.sh --phase verify` at 21:18:54
+emitting `update-goal status+outcome_note` and `outcome_class` three seconds
+later. No `complete-by` row anywhere in the goal's lifetime. Every element of
+cause 9's fingerprint is present — same-agent claim, no `complete-by`,
+substantive `outcome_note` — yet nothing was mistyped: `--phase verify` ran, and
+the ONLY phase actually skipped was `--phase state-update`, which the operator
+omitted while hand-sequencing verify → spark → learning-gate →
+productivity-check.
+
+CONSEQUENCE FOR A READER OF THIS CHECK: on a non-recurring goal, `complete_by is
+None` carries no information about the close path, so `PATH_UNCLASSIFIED` is the
+expected verdict rather than a signal. Discriminate on what remains — a
+same-agent `claim` row plus a substantive `outcome_note` means work happened
+(CREDIT), and the question worth asking is not "was the status flip typed
+correctly" but "which of the five phases did not run". The repair stays
+FORBIDDEN either way (guard-1235); the accounting gap on `g-369-404` was left
+unrepaired for exactly that reason — counter stuck at 160, the goal absent from
+`counted_goals_this_session`, no journal row, and `goals_since_last_tree_update`
+not reset despite a tree write in that iteration.
+
+Sibling shape: `guard-4957` — a detector's detection output must not resemble
+its own failure signature. Here the FINDING fingerprint is byte-identical to the
+correct path's, for the whole non-recurring population. `guard-5782` is the
+other half of the same split (a RECURRING goal closed through `--phase verify`
+is the error this one is not).
+
+Measured instance of 9: `g-115-10311` (bravo, cc-05, 2026-09-20) — `claim`
+14:43:13, `update-goal status` 14:54:43, `outcome_class` 14:54:46,
+`outcome_note` 14:54:49, and no `complete-by` row in the goal's entire lifetime
+(positive control: 24,511 goal-id-bearing rows in the 24.1 MB changelog read).
+Its `outcome_note` is a 1,575-char detector diagnosis, which is what settles
+CREDIT over EXCLUDE — see the claim-row caveat below.
 
 ## guard-2523's REPAIR defeats guard-2523's DETECT
 
@@ -81,6 +137,18 @@ orchestrator's own hand. So do not add a discriminator for it: by the section
 below, a content-derived one will fail, and there is no changelog-derived one to
 find. Confirm the shape from the goal's `outcome_note`, which on this lane states
 the disposition verbatim, and move on.
+
+One qualification, added with cause 9 (2026-09-20) so the sentence above is not
+read as stronger than it is: the **claim row is a changelog-derived separator in
+ONE direction only.** Its ABSENCE is decisive — a closer that never held the goal
+executed no iteration, which rules cause 9 out and leaves 3/7. Its PRESENCE
+decides nothing, because a same-agent claim cannot separate "executed and typed
+the wrong close" (9) from "claimed, found the premise moot, disposed it" (7) —
+the identical asymmetry `classify_close_path` already documents on its sanctioned
+branch. So the claim row narrows the family; it never closes it, and the
+`outcome_note` read prescribed above remains the deciding one. What that note
+settles is not the shape but the VERDICT: a disposition note states a premise
+cleared, an execution note carries the work.
 
 **Do not "repair" a cause-7 row with `--phase state-update`** — that is the
 g-115-8289 remedy for a genuine skip, and applying it to a close that executed no

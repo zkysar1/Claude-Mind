@@ -114,12 +114,13 @@ def test_all_default_prefixes_match(prefix):
 # ---------------------------------------------------------------------------
 
 def test_apply_product_without_discovered_by_blocks():
+    category = _sample_product_category()
     out = evaluate({
         "title": "Apply: implement skill",
-        "category": "ayoai-feature",
+        "category": category,
     })
     assert out["would_block"] is True
-    assert out["matched_category_prefix"] == "ayoai-"
+    assert out["matched_category_prefix"] == tuple(DEFAULT_PRODUCT_PREFIXES)[0]
     assert "Investigate precursor" in out["reason"]
     assert "world/conventions/scaffolded-exploration.md" in out["reason"]
     assert out["override_applied"] is None
@@ -127,10 +128,11 @@ def test_apply_product_without_discovered_by_blocks():
 
 def test_empty_discovered_by_blocks():
     """discovered_by=None and discovered_by='' both treat as 'no precursor'."""
+    category = _sample_product_category()
     for empty_val in (None, "", 0, False):
         out = evaluate({
             "title": "Apply: foo",
-            "category": "processor-bar",
+            "category": category,
             "discovered_by": empty_val,
         })
         assert out["would_block"] is True, f"discovered_by={empty_val!r} should block"
@@ -141,13 +143,14 @@ def test_empty_discovered_by_blocks():
 # ---------------------------------------------------------------------------
 
 def test_override_when_blocking():
+    category = _sample_product_category()
     out = evaluate(
-        {"title": "Apply: something", "category": "intelligence-foo"},
+        {"title": "Apply: something", "category": category},
         override_no_investigate="emergency scaffolding for hotfix",
     )
     assert out["would_block"] is False
     assert out["override_applied"] == "emergency scaffolding for hotfix"
-    assert out["matched_category_prefix"] == "intelligence-"
+    assert out["matched_category_prefix"] == tuple(DEFAULT_PRODUCT_PREFIXES)[0]
 
 
 def test_override_when_not_blocking_unused():

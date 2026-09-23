@@ -381,7 +381,15 @@ signal_liveness:
 #                not a sweep, so it is never dropped.
 #   medium:      aspirations-recover-recurring, monitor-stale-check,
 #                precheck-eval (run-all), blocker-recheck (Phase 0.5b.0.5),
-#                defer-recheck (Phase 0.5b.4).
+#                defer-recheck (Phase 0.5b.4),
+#                precondition-defer-recheck (0.5b.3),
+#                defer-citation-parity-check (0.5b.4a),
+#                defer-scope-coverage (0.5b.4b),
+#                recurring-starvation-check (0.5c.1).
+#                (This block is a REFLECTION — sweep_tier() in
+#                aspirations-precheck-budget-meter.sh is the SSOT. It had
+#                drifted three lanes short before  added the fourth;
+#                re-derive from the case arm rather than trusting this list.)
 #   deferrable:  pending-questions-sweep (0.5b.5), recurring-precondition-sweep
 #                (0.5c), fresh-eyes-cadence (0.5e), fresh-eyes-program-cadence
 #                (0.5e.5), strategic-scan-cadence (0.5e.9),
@@ -2976,8 +2984,8 @@ history_vacuum:
   # core/config/environments/ayoai-mind.yaml -> bucket: zds-own-cloud-data).
   # It is NOT "lodestar-data" — that bucket never existed (-c
   # HeadBucket 404 + full `aws s3 ls`); the topology is per-env buckets
-  # (claude-mind-own-cloud-data, zds-own-cloud-data, vinheim-data), not a
-  # shared "lodestar-data". The graveyard rides a lifecycle-SAFE prefix in this
+  # (one own-cloud data bucket per deployment, named in its registry entry),
+  # not a shared "lodestar-data". The graveyard rides a lifecycle-SAFE prefix in this
   # bucket: the only lifecycle rule that could expire data is
   # NoncurrentVersionExpiration(14d; was 90d until 2026-07-31), which touches ONLY overwritten
   # (noncurrent) versions — graveyard objects are write-once with unique

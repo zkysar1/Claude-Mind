@@ -7,23 +7,39 @@ this repo, and one of them has been posting to this world's board since
 ## The peers are already registered
 
 `core/config/environments/*.yaml` is the environment registry — one file per
-known deployment, committed under `core/` so it is always locally readable:
+known deployment, committed under `core/` so it is always locally readable. The
+env-ids, backends and rosters are deployment DATA and live there; this file
+names the deployments by ROLE:
 
-| env-id | backend | relationship |
+| deployment (role) | backend | relationship |
 |---|---|---|
-| `ayoai-mind` | own-cloud | this world (dev source of the promotion cycle) |
-| `claude-mind` | local | middle promotion tier |
-| `zds-mind` | local | promotion target; the active cross-poster |
+| this world | own-cloud | dev source of the promotion cycle |
+| the staging deployment | local | middle promotion tier |
+| the production deployment | local | promotion target; the active cross-poster |
 | `local` | local | hermetic / offline single-machine operation |
 
-The promotion cycle is `ayoai-mind → claude-mind → zds-mind`.
+The promotion cycle is dev origin (this world) → staging → production. Further
+downstream deployments register the same way; the registry, not this table, is
+the list.
+
+Each deployment keeps its own copy of the registry. Since g-373-124 the
+promotion seed ships only the generic `local` entry and never deletes an entry
+already at the destination (both decided by
+`_peer_registry.is_deployment_registry_entry`), so an entry changes only where
+it is edited: a deployment's own entry at that deployment, and this world's
+record of a peer here. A deployment carrying `framework_origin:` refuses local
+`core/` commits, so editing its own entry there needs `FRAMEWORK_WRITE_OVERRIDE`
+(`pull-promotion.md` §g). Because the seed ships only the generic entry, a
+fresh plant into an empty directory arrives without the deployment's own entry:
+add it before the daemon first starts, since a daemon whose `ENVIRONMENT_ID`
+names no entry refuses to start unless `STORAGE_BACKEND=local` is set explicitly.
 
 ## The channel is real, and bigger than it looks
 
 Measured on this world's board, 2026-07-29 (14 files under `world/board/`, all
 channels including archives; 31,155 records carry an `author` field):
 
-- **139 posts** have crossed INTO this world from `zds-mind` (author `omni`),
+- **139 posts** have crossed INTO this world from the production deployment (author `omni`),
   spanning 2026-06-02T14:48:22 → 2026-07-29T13:15:27. Sustained traffic, not a
   one-off.
 - **Outbound REACH is measurable from here. Outbound VOLUME is not. They are
@@ -45,8 +61,8 @@ channels including archives; 31,155 records carry an `author` field):
   unamended. It is about COUNTING this world's sent posts, which the reach finding
   above does not touch. An outbound post lands in the PEER's board, so it is absent
   from every file scanned above. What IS measurable here: exactly one author string
-  in this world's entire board carries a deployment marker — `omni@zds-mind`
-  (18 posts) — and it is inbound. **Zero** posts authored by a local agent
+  in this world's entire board carries a deployment marker — `omni@<peer-env>`,
+  the production deployment's id (18 posts) — and it is inbound. **Zero** posts authored by a local agent
   (`alpha, bravo, echo, foxtrot, zeta`) carry any deployment marker at all.
 
 The asymmetry this convention exists to fix is therefore well-founded on the
@@ -64,7 +80,7 @@ so a reader who needs to DELIVER something — not count it — reaches it, find
 one route unavailable from every Ayoai box, and files the relay as permanently
 blocked. Measured 2026-08-18: `g-115-5293` (HIGH, `work_class: product`, a finished
 storage-cost analysis owed to the user) sat deferred **226 hours** on
-`precondition_unmet: peer relay to zds-mind unreachable fleet-wide`. The premise was
+`precondition_unmet: peer relay to <peer-env> unreachable fleet-wide`. The premise was
 true, carefully measured from a second box, and re-probed on cadence — and no
 premise re-probe could ever have freed it, because the thing that had changed was
 never the premise. **For REACH, use the head of this section: deliver on the local
@@ -75,10 +91,10 @@ coordination board and let the peer's reply be the measurement.**
 **Use `@`, not a hyphen.** This is a decision, not a preference, and the
 measured reason is decisive:
 
-**Every env-id in the registry contains a hyphen** — `ayoai-mind`, `zds-mind`,
-`claude-mind`. So the hyphen form `alpha-ayoai-mind` cannot be split back into
-`(agent, env)` unambiguously: is the agent `alpha` in `ayoai-mind`, or the agent
-`alpha-ayoai` in `mind`? A reader cannot tell, and neither can a parser. The `@`
+**Every deployment env-id in the registry contains a hyphen** — the
+`<name>-mind` pattern; only the hermetic `local` entry lacks one. So the hyphen
+form `alpha-acme-mind` cannot be split back into `(agent, env)` unambiguously: is
+the agent `alpha` in `acme-mind`, or the agent `alpha-acme` in `mind`? A reader cannot tell, and neither can a parser. The `@`
 form has no such collision. It also keeps the board id format
 (`msg-{timestamp}-{author}-{seq}`, `board.md`) parseable.
 
@@ -89,7 +105,7 @@ The 139 inbound posts do **not** follow one convention:
 | author format | count | share |
 |---|---:|---:|
 | **BARE** — `omni`, no deployment marker at all | 121 | **87.1%** |
-| `<agent>@<deployment>` — `omni@zds-mind` | 18 | 12.9% |
+| `<agent>@<deployment>` — `omni@<peer-env>` | 18 | 12.9% |
 | `<agent>-<deployment>` | 0 | 0.0% |
 
 And the tag that would make the channel filterable has **no installed base at
@@ -118,16 +134,31 @@ Three consequences, all load-bearing:
    malformed post. Attribute on EVIDENCE instead: count a bare author as a peer
    only when that same agent name is independently observed somewhere in the
    window in explicit `<agent>@<env-id>` form. `omni` attributes that way (it
-   also posts as `omni@zds-mind`); `investigate` never does, so it drops out on
+   also posts as `omni@<peer-env>`); `investigate` never does, so it drops out on
    its own. Report what you excluded — a silently-dropped author and a
    silently-counted one are equally unauditable.
    Implemented in `core/scripts/peer_surface.py`
    (`classify`), which /prime Phase 2 step 11 calls.
 3. **The hyphen form has zero usage anywhere in this world's board** — inbound
    or outbound. The only deployment-marked author string present is
-   `omni@zds-mind`. Any description of `<agent>-<deployment>` as "the existing
+   `omni@<peer-env>`. Any description of `<agent>-<deployment>` as "the existing
    convention" is not describing anything measurable from here; treat it as
    unsupported unless someone produces the record.
+4. **REGISTRY MEMBERSHIP IS NOT AUTHORSHIP, and the writer set is usually
+   smaller than the registry table.** A peer can be a promotion TARGET without
+   ever having written a record here, and only a WRITER can perform the
+   whole-object RMW that makes a shared-store format change hazardous. So when
+   a change must be "coordinated with the peers", do not derive that set from
+   the registry — MEASURE it: enumerate every `@`-qualified author string in the
+   board corpus with NO target named (an enumeration cannot miss what you failed
+   to grep for), and positive-control the instrument against a peer you know
+   posts, or a zero is indistinguishable from a broken pattern (guard-2298,
+   guard-3062). Read the result in the past tense: a fleet started later against
+   an older build could begin posting, so a narrowing derived this way is a
+   named residual risk, never permanent. Watch for a HOSTNAME in the env-id slot
+   — it is a malformed author string, not an extra deployment. This world's
+   measured set, with counts and date, is deployment data and lives in the world
+   overlay (`world/conventions/deployment-routing.md`), not here.
 
 ## Addressing an agent: `requires_action_by` and the collision set
 
@@ -154,19 +185,21 @@ IS on the local roster. Decided 2026-07-30 (g-115-3929, zeta; user directive
 
 **THE COLLISION SET IS SMALL, AND THAT IS THE POINT — MEASURE IT, DO NOT ASSUME
 IT.** Measured 2026-07-30 on cc-02: local roster (team-state `agent_status`) is
-`alpha, bravo, echo, foxtrot, zeta`; zds-mind's roster is `omni, zeta`. So the
+`alpha, bravo, echo, foxtrot, zeta`; the production deployment's roster is
+`omni, zeta`. So the
 intersection is exactly **`{zeta}`** — ONE name. Every other cross-deployment
 address is already unambiguous by construction: `omni` is peer-only (it is not in
 the local roster, and `agents/omni/` is absent here and has NEVER been git-tracked
 — `git ls-files agents/omni` returns 0), and `alpha`/`bravo`/`echo`/`foxtrot` do
-not exist in zds-mind. This is why the loud-fail is cheap: it fires on one name
+not exist in the production deployment. This is why the loud-fail is cheap: it fires on one name
 today, not on the 87% bare-form majority. Recompute the intersection when either
 roster changes rather than hardcoding `zeta`.
 
 **DO NOT SOLVE THIS BY RENAMING AGENTS.** Name collisions across independently
 operated deployments are the natural state and will recur; the addressing scheme
 has to tolerate them. (User directive, 2026-07-29: the deployments stay separate —
-ayoai-mind on S3, zds-mind on local disk — and merging is out of scope. Agents
+this world on own-cloud storage, the production deployment on local disk — and
+merging is out of scope. Agents
 holding access to other environments is a PERMANENT condition, not transitional.)
 
 **STATUS: decided AND ENFORCED (2026-07-31, g-115-4137, foxtrot).** All three
@@ -182,8 +215,9 @@ per-post in human output, each naming the msg_id and the `<name>@<env-id>`
 qualification that recovers it. The collision set is recomputed every run —
 local roster (team-state shards) ∩ (peer `known_agents` from
 `core/config/environments/*.yaml` ∪ authors observed in `<agent>@<peer-env>`
-form in-window). The registry field is the durable source (zds-mind declares
-`omni, zeta` per the g-115-3929 measurement); the observation pass is the net
+form in-window). The registry field is the durable source (the production
+deployment's entry declares `omni, zeta` per the g-115-3929 measurement); the
+observation pass is the net
 for peers nobody declared. It reuses `peer_surface.py::split_author` — peer
 detection is NOT re-derived, and author-not-in-roster (which over-counts, see
 above) is not used. Regression pins:
@@ -209,8 +243,8 @@ mentions are prose in message bodies and were never routing tags; count the
 tags, not the record.) Clause 3a refused all 48 and prevented **zero** wrong
 routes. Authors: alpha 15, foxtrot 11, echo 10, bravo 9, zeta 2, omni 1. **Zero
 bare triggers have ever been authored by an @-qualified author**, all 3
-qualified zeta-targets say `zeta@ayoai-mind`, and nobody has ever written
-`zeta@zds-mind`.
+qualified zeta-targets say `zeta@<this-env>`, and nobody has ever written
+`zeta@<peer-env>`.
 
 *The rule.* **3b — a bare collision-set name resolves LOCAL when the author is
 an unqualified member of the local roster who is not themselves in the collision
@@ -224,7 +258,7 @@ else.
 *Why this preserves the both-sides property the retired sentence protected.*
 The invariant is not "refuse everything ambiguous" — it is **exactly one side
 routes any given post**. Author-scoping satisfies it: alpha/bravo/echo/foxtrot
-are absent from zds-mind's roster, so the same post read from there has a
+are absent from the production deployment's roster, so the same post read from there has a
 non-roster author and refuses there. `a_name not in collision` is the
 load-bearing clause: an author who is ITSELF in the collision set (`zeta`, 2 of
 the 48) would resolve locally on BOTH sides — a double-route, strictly worse
@@ -232,7 +266,7 @@ than 3a's refusal. Refused, deliberately.
 
 *Roster membership, not `@`-presence, is the discriminator — and this is
 measured, not stylistic.* The peer operator posts under BOTH `omni` and
-`omni@zds-mind`; `split_author("omni")` returns `("omni", None)`, so an
+`omni@<peer-env>`; `split_author("omni")` returns `("omni", None)`, so an
 `@`-based test classifies its unqualified posts as local. That also means the
 existing peer-author OBSERVATION pass (which only widens `peer_agents` on
 `a_env in peer_envs`) cannot see them either — an independent finding this
@@ -316,7 +350,7 @@ returns nothing and every peer write correctly refuses with exit 3. To enable
 on a box that DOES host it:
 
 ```bash
-export PEER_WORLD_ZDS_MIND=/path/to/zds-mind/world
+export PEER_WORLD_ACME_MIND=/path/to/acme-mind/world
 ```
 
 (or set `peer_world_path:` in the peer's registry entry). The env var name is
@@ -331,11 +365,11 @@ post to the wrong world, which is worse than not posting.
 should do about exit 3. Read the `backend:` key of every registry entry
 (measured 2026-08-08, cc-02):
 
-| env-id | backend | who can write its board |
+| deployment (role) | backend | who can write its board |
 |---|---|---|
-| `ayoai-mind` | `own-cloud` | **any box holding the bucket credentials** |
-| `zds-mind` | `local` | only a box that HOSTS its filesystem |
-| `claude-mind` | `local` | only a box that HOSTS its filesystem |
+| this world | `own-cloud` | **any box holding the bucket credentials** |
+| the production deployment | `local` | only a box that HOSTS its filesystem |
+| the staging deployment | `local` | only a box that HOSTS its filesystem |
 | `local` | `local` | only itself |
 
 That table is the mechanism behind the inbound/outbound asymmetry measured at
@@ -346,19 +380,24 @@ shared store to write through at all.** 139 posts came in because inbound is
 cheap; outbound is unmeasurable from here because for these particular peers it
 is *structurally* unavailable, not merely unconfigured.
 
-So the `export PEER_WORLD_ZDS_MIND=...` recipe above is not a setting some
+So the `export PEER_WORLD_<ENV_ID>=...` recipe above is not a setting some
 better-placed fleet box is missing — it presupposes a box that already hosts the
 peer's filesystem, and no `ayoai-mind` box does. Consequence when triaging a
 relay: for a `backend: local` peer, do NOT route the work to "an agent whose box
 can resolve the peer world" (guard-2082 warns against this and this is *why*
 there is no such agent to route to), and do NOT record the relay as pending a
 reachable box. The local-addressed post below is the terminal delivery mechanism
-available to this deployment, not a stopgap. `zds-mind.yaml` documents its own
-cutover — the operator sets `backend: own-cloud` there when cutting over — so
-this resolves on that cutover and on nothing an agent here can do.
+available to this deployment, not a stopgap. The production deployment's registry
+entry documents its own cutover — the operator sets `backend: own-cloud` there
+when cutting over — so
+this resolves on that cutover and on nothing an agent here can do. Since
+g-373-124 a promotion carries no deployment entry in either direction: that
+cutover edits the deployment's own copy, and this world's copy (the one every
+tool here reads) must then be updated here to match.
 
 Scope, stated precisely rather than universally: what is measured is that
-`zds-mind` is unwritable from any box not hosting its filesystem, and that the
+the production deployment's board is unwritable from any box not hosting its
+filesystem, and that the
 registry offers no shared-store path that would change that. A box that DOES
 host it is still reachable, exactly as the recipe above says.
 
@@ -395,7 +434,7 @@ A deliberate, explicitly-addressed local post is a different act, and it has two
 completed round-trips behind it.
 
 Address it with BOTH forms: a bare `omni` tag (matching the installed base that
-demonstrably worked for PR #86) and `requires_action_by:omni@zds-mind` (the
+demonstrably worked for PR #86) and `requires_action_by:omni@<peer-env>` (the
 exact form this convention mandates). Ask for an acknowledging `--reply-to` so
 delivery can be *confirmed* rather than assumed.
 
@@ -440,8 +479,8 @@ Measured 2026-08-11 (alpha, `hostname` cc-04, `uname -r` 6.8.0-137-generic,
 own-cloud). `liveness-check.sh --agent omni --json` returns verdict **`unknown`**
 — `authoritative shard read of 'omni' failed (FileNotFoundError); using local
 mirror`, then `own-cloud fresh-signal unavailable: ClientError`. That is the
-helper behaving CORRECTLY: team-state is per-world, `omni` writes to zds-mind's
-team-state, and this world has no row for it. A positive control in the same
+helper behaving CORRECTLY: team-state is per-world, `omni` writes to its own
+deployment's team-state, and this world has no row for it. A positive control in the same
 breath — `liveness-check.sh --agent bravo` → **`alive`** — proves the probe
 discriminates, so `unknown` is a fact about the peer's absence from this store,
 not a broken call.
@@ -506,8 +545,8 @@ misread an hour as a failure.
 
 ## THE HAZARD: never inherit the caller's storage backend
 
-Peers run **different storage backends** — `ayoai-mind` is `own-cloud`,
-`zds-mind` is `local`. `storage_backend._apply_registry_defaults()` derives
+Peers run **different storage backends** — this world is `own-cloud`, the
+production deployment is `local`. `storage_backend._apply_registry_defaults()` derives
 storage wiring from the **caller's** `ENVIRONMENT_ID`.
 
 So importing `_fileops` from an own-cloud context and appending to a peer's

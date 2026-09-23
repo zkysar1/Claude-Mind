@@ -78,6 +78,8 @@ verbatim, and that the length GREW.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import hashlib
 import json
 import os
 import subprocess
@@ -242,6 +244,206 @@ def is_read_projected(row: dict) -> bool:
     return not any(k in row for k in UNPROJECTED_CANARIES)
 
 
+# ── Field-size bound at the WRITE site () ─────────────────────────
+# A recurring goal never closes, so its note is an unbounded accumulator: every
+# cycle appends a block and nothing ever removes one. Measured on 
+# (2026-09-21, alpha/cc-04): progress_note 206,540 B across 45 blocks written by
+# five agents on five boxes, a read surface 5.19x over the 62,500 B cap, so the
+# claim gate correctly refused to let the goal be read whole and it drifted
+# toward unexecutable. Detection already existed downstream (the claim gate,
+# goal-note-tail's read_surface_vs_cap); nothing governed the WRITE. This does.
+#
+# KEYED ON BYTES, NEVER ON BLOCK OR MARKER COUNT (guard-6707): the [appended:]
+# marker count is not the block count and the gap is silent, so a count-keyed
+# bound is wrong in a way nothing reports. Bytes are what the read cap measures.
+#
+# ROTATION IS ITS OWN WRITE, DELIBERATELY NOT PART OF THE APPEND. verify_post()
+# asserts `pre in post` AND `len(post) > len(pre)` — both are FALSE for a
+# rotation, which shrinks the field and drops old text on purpose. Smuggling the
+# cut through the append's verification would have required weakening the exact
+# assertions that catch a real clobber. So rotation runs BEFORE compose, as a
+# separate CAS-protected write, and the append then proceeds normally against the
+# reduced value with its verification fully intact.
+#
+# FAIL-OPEN: any rotation failure leaves the field untouched and the append
+# proceeds. A note write must never be lost because its bound could not run.
+ROTATE_AT_BYTES = int(os.environ.get("GOAL_NOTE_ROTATE_BYTES", "32768"))
+ROTATE_KEEP_BYTES = int(os.environ.get("GOAL_NOTE_KEEP_BYTES", "16384"))
+ROTATE_DISABLED = os.environ.get("GOAL_NOTE_ROTATE", "").lower() in ("0", "off", "no")
+# Must not begin with '{' or '[' — the update wrapper JSON-decodes a value that
+# does (aspirations-update-goal.sh parse_value), storing an object instead of
+# text. That is why this reads "NOTE HISTORY ROTATED" and not "[ROTATED ...]".
+ROTATE_NOTICE_HEAD = "NOTE HISTORY ROTATED"
+
+
+def split_blocks(value: str) -> "list[str]":
+    """Split an append-ordered field into blocks, oldest first.
+
+    compose() builds each block as `<text>\n[appended:<marker>]`, blocks joined
+    by a blank line, so a block ENDS at its sentinel line. Text before the first
+    sentinel is legacy pre-sentinel content and is returned as the first element
+    so it is never silently dropped.
+    """
+    if not value:
+        return []
+    out, buf = [], []
+    for line in value.split("\n"):
+        buf.append(line)
+        if line.startswith(SENTINEL_PREFIX) and line.rstrip().endswith("]"):
+            out.append("\n".join(buf).strip("\n"))
+            buf = []
+    tail = "\n".join(buf).strip("\n")
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _sink_path(goal_id: str, field: str):
+    """Append-only archive sink, fleet-visible beside the other world records.
+
+    Under an EXISTING world/ top-level dir on purpose: the L1 path-resolution
+    hook refuses a NEW top-level entry under a governed root, and inventing one
+    is the documented cruft failure (.claude/rules/path-resolution.md).
+    """
+    from _paths import WORLD_DIR  # resolved per-agent; never derived by hand
+    d = Path(WORLD_DIR) / "audit-reports" / "goal-note-archive"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{goal_id}.{field}.md"
+
+
+def rotate_oversize(goal_id: str, field: str, source: str, pre: str) -> str:
+    """Bound `pre` by moving the OLDEST blocks to an archive sink.
+
+    Returns the reduced field value, or `pre` unchanged when rotation does not
+    apply or could not be completed safely. Never raises.
+
+    ORDER IS ARCHIVE-BEFORE-DELETE and is not negotiable: the sink is written
+    and READ BACK before a single byte leaves the record, so a failure at any
+    point leaves the live field whole.
+    """
+    if ROTATE_DISABLED or len(pre.encode("utf-8")) <= ROTATE_AT_BYTES:
+        return pre
+    try:
+        blocks = split_blocks(pre)
+        if len(blocks) < 2:
+            return pre  # one block cannot be split; nothing safe to cut
+        # Keep the NEWEST blocks that fit, always at least one.
+        kept, total = [], 0
+        for b in reversed(blocks):
+            n = len(b.encode("utf-8"))
+            if kept and total + n > ROTATE_KEEP_BYTES:
+                break
+            kept.append(b)
+            total += n
+        kept.reverse()
+        cut = blocks[:len(blocks) - len(kept)]
+        if not cut:
+            return pre
+        stamp = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        sink = _sink_path(goal_id, field)
+        header = (f"\n\n<!-- rotated {stamp} from {goal_id}.{field}: "
+                  f"{len(cut)} block(s), {sum(len(b.encode('utf-8')) for b in cut)} bytes -->\n")
+        payload = header + "\n\n".join(cut) + "\n"
+        before = sink.stat().st_size if sink.exists() else 0
+        existing = sink.read_text(encoding="utf-8") if sink.exists() else ""
+        # IDEMPOTENT ON RETRY. This function can legitimately bail AFTER the
+        # archive and BEFORE the cut — measured 2026-09-21, the field-shrink
+        # guard refused the reduction (6% of original, floor 25%) and fail-open
+        # correctly returned the field whole. The blocks were then archived AND
+        # still live, so the next attempt re-archived them: 2 rotation headers,
+        # 84 chunks, every one redundant. Re-archiving is not a data risk, but an
+        # append-only sink that doubles on every retry stops being readable.
+        already = bool(existing) and cut[0][:200] in existing and cut[-1][:200] in existing
+        if not already:
+            with sink.open("a", encoding="utf-8") as fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+        # VERIFY THE ARCHIVE BEFORE CUTTING — a write that returned is not a
+        # write that landed. Confirm by an independent read, on content, not size.
+        back = sink.read_text(encoding="utf-8")
+        if (not already and sink.stat().st_size <= before) or cut[-1][:200] not in back:
+            return pre  # archive unverified -> cut nothing
+        # PROVENANCE IN THE SAME EDIT AS THE CUT (guard-6105): a reader of the
+        # reduced field must be able to find what was removed without knowing
+        # this code exists.
+        notice = (f"{ROTATE_NOTICE_HEAD} {stamp}: the {len(cut)} oldest block(s) "
+                  f"({sum(len(b.encode('utf-8')) for b in cut)} bytes) were moved to "
+                  f"{sink} to keep this field readable. Nothing was deleted — read them "
+                  f"there. This rotation is automatic at {ROTATE_AT_BYTES} bytes "
+                  f"(GOAL_NOTE_ROTATE_BYTES); set GOAL_NOTE_ROTATE=off to disable.")
+        reduced = notice + "\n\n" + "\n\n".join(kept)
+        if reduced[:1] in ("{", "["):
+            return pre
+        # CAS: a peer may have appended since our read. Rotating from a stale
+        # value would drop their block, which is the one thing worse than an
+        # oversize field.
+        fresh = read_goal(goal_id, source).get(field)
+        if not isinstance(fresh, str) or fresh != pre:
+            return pre
+        # The re-read above narrows the window; it cannot close it. The write is
+        # a separate process, so a peer append landing between that read and the
+        # write would be overwritten, and no read taken afterwards could see it:
+        # the clobbered store is byte-identical to `reduced` (). Only
+        # a compare INSIDE the daemon's write lock is atomic with the write, so
+        # the hash of the value we composed from rides along, and a mismatch is
+        # refused with nothing written (rc!=0 -> `return pre` below, unless the
+        # store shows this rotation landed anyway -> main()'s CAS reports the
+        # concurrent modification and a re-run rotates cleanly).
+        expect = hashlib.sha256(pre.encode("utf-8")).hexdigest()
+        res = _run(bash_cmd(
+            SCRIPTS / "aspirations-update-goal.sh",
+            "--source", source, "--value-stdin",
+            "--override-narrative-replace",
+            f"note-history rotation to {sink.name} (g-115-10349); "
+            "archive written and read-back-verified before the cut",
+            # A rotation is a DELIBERATE large shrink, which is the case the
+            # field-shrink guard explicitly carves out. Measured without it:
+            # rc=1 field_shrink_blocked at 6% of original against a 25% floor,
+            # so the bound could never reach the records that most need it. The
+            # guard stays fully armed for every other writer.
+            "--override-shrink",
+            f"note-history rotation (g-115-10349): the removed blocks are in {sink.name}, "
+            "written and read-back-verified BEFORE this cut, and the newest blocks are kept",
+            "--expect-sha256", expect,
+            goal_id, field,
+        ), input=reduced)
+        if res.returncode != 0:
+            # A refusal is not proof that nothing landed (guard-7050). rt_call
+            # re-sends the identical request after a stale-daemon recycle or a
+            # timeout and keeps only the LAST reply, and the re-sent copy of a
+            # write that already landed meets that write and is refused 409. So
+            # confirm against the store, keyed on this rotation's own notice.
+            try:
+                landed = read_goal(goal_id, source).get(field)
+            except SystemExit:
+                landed = None
+            if not (isinstance(landed, str) and notice in landed):
+                return pre
+            print(f"WARNING: note-history rotation of {goal_id}.{field} landed although "
+                  f"the update wrapper exited {res.returncode} (e.g. a refused re-sent copy: "
+                  "the transport re-sends after a timeout or a stale-daemon recycle), so "
+                  "whether the send that landed was precondition-checked cannot be "
+                  "confirmed from here.", file=sys.stderr)
+            return landed
+        # A daemon predating the precondition ignores the header and still
+        # answers 200 (guard-5505). That write is no worse than before the fix,
+        # so it stands, but it must not pass silently as a checked one.
+        if f"precondition_checked field-sha256={expect}" not in (res.stderr or ""):
+            print(f"WARNING: note-history rotation of {goal_id}.{field} was written, but "
+                  "its concurrent-append precondition was NOT confirmed by the daemon (a "
+                  "build predating g-115-10535 ignores the check and still answers 200; "
+                  "restart it: bash core/scripts/mind-api-start.sh --restart). A peer "
+                  "append landing in the write window would not have been refused.",
+                  file=sys.stderr)
+        after = read_goal(goal_id, source).get(field)
+        if not isinstance(after, str) or ROTATE_NOTICE_HEAD not in after or kept[-1][:200] not in after:
+            return pre  # could not confirm; caller continues against the original
+        return after
+    except Exception:  # noqa: BLE001
+        return pre  # fail-open, always
+
+
 def compose(pre: str, text: str, marker: str) -> str:
     """PRE + blank line + text + sentinel. Empty PRE yields no leading blank."""
     return (pre + "\n\n" if pre else "") + text + "\n" + sentinel_for(marker)
@@ -332,6 +534,20 @@ def main(argv=None) -> int:
         print(json.dumps(out, indent=2))
         return RC_OK
 
+    # Bound the field BEFORE composing, so the append below runs against the
+    # reduced value and verify_post's pre-survival assertions stay exact.
+    #
+    # KEEP THE PRE-ROTATION LENGTH: this call REBINDS `pre`, so every length the
+    # caller is shown below is measured against the REDUCED value. Reporting that
+    # as a bare `pre_len` is honest about a base the caller never saw, and it has
+    # twice sent an agent hunting for data loss that never happened — a 77 KB
+    # "discrepancy" chased against a hand pre-read (bravo, cc-05), and a full
+    # window spent building a recovery directory for 287 KB that was never at
+    # risk (alpha, cc-04, 2026-09-22). Both readers were doing the right thing:
+    # the number really did not add up, and nothing in this output explained it.
+    pre_unrotated_len = len(pre)
+    pre = rotate_oversize(args.goal_id, args.field, args.source, pre)
+
     new = compose(pre, text, args.marker)
 
     # The wrapper's parse_value JSON-decodes any value that starts with { or [
@@ -359,9 +575,10 @@ def main(argv=None) -> int:
     # taken INSIDE the daemon. This script never opens the store; it shells out
     # to daemon-routed wrappers. No daemon-side lock can span two round-trips
     # this process issues, so remedy (2) is not implementable from here. Closing
-    # the span properly needs a compare-and-swap ENDPOINT (an If-Match on the
-    # field), which is a daemon protocol change and is filed separately rather
-    # than faked with a lock that cannot reach.
+    # the span properly needs a compare-and-swap on the field INSIDE the daemon's
+    # write lock. That now exists -- aspirations-update-goal.sh --expect-sha256
+    # (, used by rotate_oversize above); adopting it for THIS write
+    # is 's, and until then this re-read only narrows the window.
     #
     # AND class (a) does NOT rescue this. Every target store is merge-protected
     # (core/config/conventions/governed-store-write-classes.md), but a merge
@@ -506,6 +723,19 @@ def main(argv=None) -> int:
         "pre_len": len(pre), "post_len": len(post), "delta": len(post) - len(pre),
         "store": store_file, "confirm_read": confirm,
     }
+    # Announce the rotation to the CALLER, not only to the field. The notice
+    # written into the value is for whoever READS the goal later; this key is for
+    # whoever just WROTE it and is about to reconcile lengths. Present only when a
+    # rotation actually cut something, so its absence stays meaningful.
+    if pre_unrotated_len != len(pre):
+        out["rotated"] = {
+            "pre_len_before_rotation": pre_unrotated_len,
+            "moved_bytes": pre_unrotated_len - len(pre),
+            "archive": str(_sink_path(args.goal_id, args.field)),
+            "note": ("pre_len above is measured AFTER this rotation. Nothing was "
+                     "deleted — the moved blocks are in `archive`. A large drop "
+                     "here is expected, not data loss."),
+        }
     print(json.dumps(out, indent=2))
     return RC_OK
 

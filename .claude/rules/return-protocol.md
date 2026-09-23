@@ -6,9 +6,14 @@ alwaysApply: true
 # Return Protocol
 
 Text-only output as the last action in a turn kills the autonomous session —
-the turn ends, and the loop dies. Every skill must terminate with a tool call,
-not a text paragraph. The *kind* of tool call depends on whether the skill is
-a sub-skill returning control up, or the orchestrator closing an iteration.
+the turn ends, and the loop dies. **Inside the loop** every skill must terminate
+with a tool call, not a text paragraph. Outside it — assistant or reader mode,
+IDLE, answering a person — there is no loop to keep alive and the answer IS the
+terminal: a trailing `echo` there buys one more round trip, which the model
+fills by restating what it just said (2026-09-21, sera). `assistant.md` has it
+right: report what was done and wait. The *kind* of tool call depends on whether
+the skill is a sub-skill returning control up, or the orchestrator closing an
+iteration.
 
 The incident behind the two-case split, the verification wiring, and the layered
 defense against the Explanatory output style live in
@@ -39,20 +44,13 @@ schedule-wakeup-correctness.md Anti-pattern C). Opt-out per agent: when
 `agents/<agent>/session/deadman-disabled` is present → terminal is
 `Skill(aspirations)` alone. Rationale: `core/config/rationale/deadman-switch.md`.
 
-**Re-arm FIRST on resurrection AND on an autocompact resume (rb-4345 /
-g-115-2771 / g-115-5834).** The deadman is a SINGLE replace-slot wakeup — firing
-CONSUMES it, so a resurrected turn starts with NO net; and a
-`SessionStart:compact` resume that re-enters the loop MID-iteration emits no
-terminal pair at all, so it runs the whole iteration on whatever net existed —
-none, if the compaction landed before any close. Both have produced multi-hour
-silent deaths (7h 2026-07-19; 7h47m 2026-08-11 — a pending net is NOT
-excluded: clamp≠delivery, 17.1h max, g-115-6629). **RULE: on a
-`<<autonomous-loop-dynamic>>` firing or an autocompact resume that re-enters the
-loop mid-iteration, the FIRST tool call of that turn is a
-`ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)`
-re-arm** — restore the net BEFORE any work that might fail, then proceed with
-the normal loop entry (Phase -1.5 onward). The iteration's later terminal-pair
-re-arm is harmless (replace-slot semantics make a double-arm a no-op).
+**Re-arm FIRST on resurrection AND on an autocompact resume.** Firing CONSUMES
+the net, and a mid-iteration compact resume emits no terminal pair at all, so
+such a turn's FIRST tool call is the sentinel re-arm. That rule, its two
+multi-hour incidents, and the RUNNING-only condition the gate now enforces are
+stated ONCE, in `.claude/rules/schedule-wakeup-correctness.md` § "Re-arm FIRST"
+— this file carried a second verbatim copy until 2026-09-21, which is one copy
+too many to keep correct.
 
 ## Required SKILL.md section
 

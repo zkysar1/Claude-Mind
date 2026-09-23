@@ -11,8 +11,9 @@ The supported path and the safe path contradicted each other, which is the
 likely mechanical cause of the 140-in / 1-out asymmetry.
 
 THE HAZARD THIS EXISTS TO PREVENT (guard-955 / rb-2983 class). Peers can run
-DIFFERENT storage backends -- ayoai-mind is ``own-cloud``, zds-mind is
-``local``. ``storage_backend._apply_registry_defaults`` derives storage wiring
+DIFFERENT storage backends -- this deployment is ``own-cloud`` while a peer's
+registry entry can declare ``local`` (each peer's backend is recorded in
+``core/config/environments/<env-id>.yaml``). ``storage_backend._apply_registry_defaults`` derives storage wiring
 from the CALLER's ``ENVIRONMENT_ID``. So importing ``_fileops`` from an
 own-cloud context and appending to a peer's local store derives an S3 key from
 ``customer_prefix + env_id + relpath`` and can write to the WRONG STORE
@@ -178,7 +179,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="peer-board-post",
         description="Post a board message to a PEER deployment's board.")
-    ap.add_argument("--peer", required=True, help="peer environment_id (e.g. zds-mind)")
+    ap.add_argument("--peer", required=True,
+                    help="peer environment_id (the name of a core/config/environments/<env-id>.yaml entry)")
     ap.add_argument("--channel", required=True, help="board channel (coordination, findings, ...)")
     ap.add_argument("--type", dest="msg_type", default="status")
     ap.add_argument("--tags", default="")
@@ -215,10 +217,10 @@ def main(argv=None) -> int:
         _die(EXIT_REFUSED,
              f"--peer {args.peer!r} is THIS world -- use board-post.sh for local posts.")
 
-    # Author namespacing. `@` is deliberate, not cosmetic: EVERY env-id in the
-    # registry contains a hyphen (ayoai-mind, zds-mind, claude-mind), so the
-    # hyphen form `alpha-ayoai-mind` cannot be split back into (agent, env)
-    # unambiguously. See cross-deployment-channel.md for the measured rationale.
+    # Author namespacing. `@` is deliberate, not cosmetic: every deployment
+    # env-id in the registry contains a hyphen (this one's own `ayoai-mind`
+    # among them), so the hyphen form `alpha-ayoai-mind` cannot be split back
+    # into (agent, env) unambiguously. See cross-deployment-channel.md for the measured rationale.
     agent = os.environ.get("MIND_AGENT", "").strip() or "unknown"
     author = args.author.strip() or f"{agent}@{self_env or 'unknown-env'}"
 

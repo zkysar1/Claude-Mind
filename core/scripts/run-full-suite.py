@@ -756,6 +756,34 @@ def failing_files(text):
                    for ln in text.splitlines() if ln.startswith("FAILED")})
 
 
+def failing_tests(text):
+    """``{file: sorted failing test NAMES}`` from the FAILED lines.
+
+    `failing_files` keeps only the path. The ownership bar guard-1801 sets --
+    and the one `_owning_goals` scores on since g-115-10242 -- is whether a
+    goal names the failing TEST, so the node id's second half has to survive
+    the parse. pytest prints ``FAILED <path>::[<Class>::]<name>[<param>] -
+    <assertion>``: the class qualifier and the parametrize id are dropped (a
+    goal cites the function), and so is the assertion tail. A FAILED line with
+    no ``::`` still contributes its path, with no names, so the caller can fall
+    back to the file forms.
+    """
+    out = {}
+    for ln in text.splitlines():
+        if not ln.startswith("FAILED"):
+            continue
+        rest = ln[len("FAILED"):].strip().split(" - ", 1)[0].strip()
+        path, _, node = rest.partition("::")
+        path = path.strip()
+        if not path:
+            continue
+        names = out.setdefault(path, set())
+        name = node.split("::")[-1].split("[", 1)[0].strip()
+        if name:
+            names.add(name)
+    return {p: sorted(v) for p, v in out.items()}
+
+
 def _stem_forms(path):
     """Query strings to look this failing file up by. BOTH forms are required.
 
@@ -786,8 +814,8 @@ def _stem_forms(path):
 OPEN_STATUSES = ("pending", "in-progress")
 
 
-def _owning_goals(path, root):
-    """Open goals in EITHER queue that name this test, in TITLE **or DESCRIPTION**.
+def _owning_goals(path, root, tests=()):
+    """Open goals in EITHER queue that name this test, in ANY narrative field.
 
     SEARCHING TITLES ALONE IS NOT ENOUGH, and this cost a near-duplicate filing
     on this feature's first live use (2026-07-31, echo, cc-03). Two genuine reds
@@ -833,30 +861,62 @@ def _owning_goals(path, root):
     open goals, of which exactly one (g-115-3803) owns the failing tests -- the
     rest merely discuss the subsystem. Over-match is the silent direction, since
     a spurious owner suppresses ALL filing and exits 0 printing "every genuine
-    red already has an owning goal". So the full `test_<stem>` form wins
-    outright when it matches anything, and the stripped form is consulted ONLY
-    when the full form finds nothing -- those hits are labelled `weak` and the
+    red already has an owning goal". So the stripped form is consulted ONLY when
+    nothing names the file or the test -- those hits are labelled `weak` and the
     caller prints them as needing verification rather than as settled ownership.
+
+    THREE STRENGTHS SINCE g-115-10242 (measured 2026-09-18, zeta, cc-02, on the
+    59 GENUINE reds of a 4-chunk run), because the two-field title+description
+    scan produced BOTH error directions through one predicate:
+
+      DIRECTION A, false negative: ownership recorded in progress_note or
+      outcome_note was structurally uncitable. g-115-7335 carried three
+      confirmed failures of test_capability_gate_table_token_noise.py::
+      test_table_defer_does_not_falsely_block in its progress_note and never
+      printed; g-306-294 named test_reducer_promotion.py::
+      test_shipped_config_is_default_off only in its outcome_note (the
+      2026-09-11 cc-13 run had to add it BY HAND). A reader following guard-1801
+      then files a duplicate of a goal that has tracked the red for weeks.
+
+      DIRECTION B, false positive: a goal that DISCLAIMS a red quotes the file by
+      its full test_ stem in the very act of disowning it ("... files with NO
+      moto reference (... test_raw_append_ensure_local_sweep.py 1) and so were
+      already red on this box before anything I did", g-115-10069), so the old
+      full-form rule scored it `exact` and it suppressed filing across several
+      runs while the defect underneath was real (later g-115-10241).
+
+    Widening the field alone fixes A and worsens B -- triage notes are exactly
+    where disclaimers live -- so the bar moved to the one guard-1801 actually
+    sets: does the record name the failing TEST? `tests` carries the failing
+    test names for this file (`failing_tests`), and:
+
+      ``exact``   -- names a failing test AND the file (the pytest node-id shape,
+                     separators flexible) in ANY of title / description /
+                     progress_note / outcome_note(s), outside a not-mine
+                     sentence. The only strength that is settled ownership.
+      ``partial`` -- names the file OR a failing test but not both, or names the
+                     node id only inside a not-mine sentence. A candidate the
+                     reader must open; it never suppresses filing.
+      ``weak``    -- the stripped stem (subsystem name) in title/description
+                     only, unchanged from before, consulted only when nothing
+                     stronger matched.
+
+    Exact wins outright over partial, partial over weak (a supplement would
+    re-create the over-match). The not-mine phrase list is a DEMOTION aid on
+    top of the node-id bar, never the predicate: a phrase proxy measures the
+    phrasing, not the norm (guard-6033), so a disclaimer it does not recognise
+    still reads as `exact` -- which is exactly what every citation read as
+    before this change, so the aid can only remove false owners, never add them.
+    A goal that cites a node id as EVIDENCE (a fixture, a measurement of another
+    goal's red) still reads as its owner: token scanning cannot see intent, and
+    the reader-side rule guard-6985 stays in force.
     """
     from _runtime_bash import bash_cmd  # guard-580 (never bare "bash") + guard-581 (.as_posix())
-    # Boundary-aware, NOT a bare substring. The stripped form of a short name is
-    # a common English fragment: `test_thing.py` yields "thing", which
-    # substring-matches "nothing", "something", "anything". That direction of
-    # error is the silent one -- spurious owners suppress ALL filing, and a
-    # suppressed filing leaves no trace to notice. Caught by this feature's own
-    # test on the stripped-form case.
-    #
-    # The left class excludes letters/digits but DELIBERATELY allows `_`: the
-    # stripped form is normally preceded by exactly that, in `test_<form>`.
-    # Excluding `_` on the left would break the very match this form exists for.
-    def _pat(form):
-        return re.compile(r"(?<![A-Za-z0-9])" + re.escape(form.lower())
-                          + r"(?![A-Za-z0-9_])")
-
     forms = _stem_forms(path)
-    full_pat = _pat(forms[0])                       # test_<stem> -- exact
-    weak_pats = [_pat(f) for f in forms[1:]]        # <stem> -- subsystem-wide
-    seen, strong, weak = set(), [], []
+    full_pat = _form_pattern(forms[0])                       # test_<stem>
+    weak_pats = [_form_pattern(f) for f in forms[1:]]        # <stem> -- subsystem-wide
+    test_pats = [_form_pattern(t) for t in (tests or ()) if t]
+    seen, exact, partial, weak = set(), [], [], []
     rows_scanned = 0
     for status in OPEN_STATUSES:
         try:
@@ -880,18 +940,106 @@ def _owning_goals(path, root):
             gid = g.get("goal_id") or g.get("id")
             if not gid or gid in seen:
                 continue
-            hay = ((g.get("title") or "") + " " + (g.get("description") or "")).lower()
+            head = ((g.get("title") or "") + " " + (g.get("description") or "")).lower()
+            hay = _narrative_hay(g)
             row = (gid, g.get("status") or "?", (g.get("title") or "")[:64])
-            if full_pat.search(hay):
+            names_file = bool(full_pat.search(hay))
+            names_test = [m for p in test_pats for m in p.finditer(hay)]
+            if names_file and names_test:
                 seen.add(gid)
-                strong.append(row)
-            elif any(p.search(hay) for p in weak_pats):
+                if _all_disclaimed(hay, names_test):
+                    partial.append(row)
+                else:
+                    exact.append(row)
+            elif names_file or names_test:
+                seen.add(gid)
+                partial.append(row)
+            elif any(p.search(head) for p in weak_pats):
                 seen.add(gid)
                 weak.append(row)
-    # The full form wins outright when it matches ANYTHING; the stripped form is
-    # a fallback, never a supplement (guard-1801 -- a shared name is not ownership).
-    hits, strength = (strong, "exact") if strong else (weak, "weak")
+    # Exact wins outright when it matches ANYTHING; each lower strength is a
+    # fallback, never a supplement (guard-1801 -- a shared name is not ownership).
+    if exact:
+        hits, strength = exact, "exact"
+    elif partial:
+        hits, strength = partial, "partial"
+    else:
+        hits, strength = weak, "weak"
     return [(gid, st, ti, strength) for gid, st, ti in hits], rows_scanned
+
+
+def _form_pattern(form):
+    """Boundary-aware pattern for one stem form or test name, separators FLEXIBLE.
+
+    Boundary-aware, NOT a bare substring. The stripped form of a short name is
+    a common English fragment: `test_thing.py` yields "thing", which
+    substring-matches "nothing", "something", "anything". That direction of
+    error is the silent one -- spurious owners suppress ALL filing, and a
+    suppressed filing leaves no trace to notice. Caught by this feature's own
+    test on the stripped-form case.
+
+    The left class excludes letters/digits but DELIBERATELY allows `_`: the
+    stripped form is normally preceded by exactly that, in `test_<form>`.
+    Excluding `_` on the left would break the very match this form exists for.
+
+    SEPARATORS: the file stem spells its words with underscores and a goal
+    title spells the same words with spaces. Measured 2026-09-03 (g-357-47,
+    cc-09): triage printed FILE THESE for test_reducer_selection_policy.py while
+    g-306-419 "Reducer selection policy: ..." was pending and owned it --
+    `--title-contains 'reducer_selection_policy'` 0, `'reducer selection
+    policy'` 1. So every `_` in the form matches any run of `_`, `-` or
+    whitespace. Third variant of one defect: `_stem_forms` fixed the query
+    STRING, `_owning_goals` the searched FIELD, this the SEPARATOR.
+    """
+    words = [re.escape(w) for w in form.lower().split("_") if w]
+    if not words:
+        words = [re.escape(form.lower())]
+    return re.compile(r"(?<![A-Za-z0-9])" + r"[\s_\-]+".join(words)
+                      + r"(?![A-Za-z0-9_])")
+
+
+# What a goal writes when it names a red it does NOT own. Read against
+# guard-6033: this measures the phrasing, not the norm, so it is a demotion aid
+# applied only to node-id citations, and a miss leaves the pre-change verdict.
+_NOT_MINE_PHRASES = (
+    "not mine", "neither is mine", "not yours", "not ours", "already red",
+    "pre-existing", "preexisting", "passed solo", "passes solo", "green solo",
+    "not caused by", "before anything i did", "attributed to other",
+    "owned by g-", "owner: g-", "tracked by g-", "unrelated to this",
+)
+_NOT_MINE_WINDOW = 220
+
+
+def _narrative_hay(g):
+    """Lower-cased join of every narrative field a goal can carry.
+
+    title + description were the whole hay until g-115-10242; progress_note and
+    outcome_note are where triage evidence actually lands (a note appended
+    weeks after filing, guard-2803), and `outcome_notes` (plural) exists on some
+    records (guard-3512). Non-string values (a list of notes) are flattened.
+    """
+    parts = []
+    for field in ("title", "description", "progress_note", "outcome_note",
+                  "outcome_notes"):
+        v = g.get(field)
+        if not v:
+            continue
+        if isinstance(v, str):
+            parts.append(v)
+        elif isinstance(v, (list, tuple)):
+            parts.extend(x if isinstance(x, str) else json.dumps(x) for x in v)
+        else:
+            parts.append(json.dumps(v))
+    return " ".join(parts).lower()
+
+
+def _all_disclaimed(hay, matches):
+    """True when EVERY citation of a failing test sits in a not-mine sentence."""
+    for m in matches:
+        window = hay[max(0, m.start() - _NOT_MINE_WINDOW):m.end() + _NOT_MINE_WINDOW]
+        if not any(ph in window for ph in _NOT_MINE_PHRASES):
+            return False
+    return bool(matches)
 
 
 def _recent_commits(path, root, days=7):
@@ -947,7 +1095,7 @@ def _solo(path, root, env):
     return p, f + e, None
 
 
-def _print_ownership(path, root, indent="      "):
+def _print_ownership(path, root, indent="      ", tests=()):
     """Step 5. Print who owns this failing file, or say plainly that nobody does.
 
     Deliberately prints on BOTH branches. A silent "no owner" is
@@ -959,8 +1107,13 @@ def _print_ownership(path, root, indent="      "):
     answer** -- which is a third outcome, not a flavour of "no owner". The
     caller must not fold None into the unowned bucket: unowned means file it,
     unknown means the instrument is broken and nothing has been established.
+
+    Only an ``exact`` row prints as ``owner:``; ``partial`` and ``weak`` rows
+    print as ``candidate:`` with the reason they are not ownership, so a reader
+    scanning for "owner:" cannot mistake a file mention for a tracked red
+    (g-115-10242). The triage caller keys its buckets on the same strength.
     """
-    owners, rows_scanned = _owning_goals(path, root)
+    owners, rows_scanned = _owning_goals(path, root, tests=tests)
     commits = _recent_commits(path, root)
     if rows_scanned == 0:
         # Not "nobody owns this" -- "nobody was asked". Both failure paths in
@@ -971,17 +1124,26 @@ def _print_ownership(path, root, indent="      "):
         owners = None
     elif owners:
         for gid, status, title, strength in owners:
-            note = "" if strength == "exact" else \
-                "  <- WEAK match on the subsystem name, not the test file; verify"
-            print("%sowner: %s [%s] %s%s" % (indent, gid, status, title, note))
+            if strength == "exact":
+                print("%sowner: %s [%s] %s" % (indent, gid, status, title))
+            elif strength == "partial":
+                print("%scandidate: %s [%s] %s  <- names the FILE or a test, "
+                      "not the failing node id; verify, not ownership"
+                      % (indent, gid, status, title))
+            else:
+                print("%scandidate: %s [%s] %s  <- WEAK match on the subsystem "
+                      "name, not the test file; verify" % (indent, gid, status, title))
     else:
         # SAY WHAT WAS SEARCHED, NOT WHAT WAS CONCLUDED (, guard-4432).
         # This used to read "no goal in either queue names this test (N open
         # goal(s) scanned)". Two problems, and N is what made them invisible:
         # it counts goals SCANNED, not fields or statuses SEARCHED, so a
         # four-digit N reads as exhaustive coverage and the reader stops.
-        # (a) The scan is title+description, which is broad but not everything
-        #     -- a goal citing the test only in an outcome_note is not found.
+        # (a) The scan covers the four narrative fields (title, description,
+        #     progress_note, outcome_note -- widened from title+description by
+        #     ) and the failing test names, but a literal-token scan
+        #     is still not everything: a goal that describes the defect in
+        #     other words is not found.
         # (b) OPEN statuses ONLY, deliberately (a completed goal naming this
         #     test means a REGRESSION, which is a thing to file, not to
         #     suppress). But an unqualified "no goal in either queue" reads as
@@ -990,9 +1152,12 @@ def _print_ownership(path, root, indent="      "):
         # guard-4432 is the general form: a literal-token scan that finds zero
         # may report "not found"; it may not assert the positive conclusion,
         # and above all may not attach an action instruction to it.
-        print("%sowner: NONE -- no %s goal matched '%s' in title or description "
-              "(%d goal(s) scanned; outcome_note and completed goals NOT searched)"
-              % (indent, "/".join(OPEN_STATUSES), Path(path).stem, rows_scanned))
+        print("%sowner: NONE -- no %s goal matched '%s'%s in title, description, "
+              "progress_note or outcome_note (%d goal(s) scanned; completed goals "
+              "NOT searched)"
+              % (indent, "/".join(OPEN_STATUSES), Path(path).stem,
+                 (" or its failing test(s) %s" % ", ".join(tests)) if tests else "",
+                 rows_scanned))
     if commits:
         print("%srecent commits (7d): %s" % (indent, commits[0]))
     else:
@@ -1061,7 +1226,8 @@ def triage(out, root, env):
 
     print("\nStep 2-3: solo re-run + ownership, per candidate")
     genuine_unowned, genuine_owned, environmental, errored = [], [], [], []
-    ownership_unknown = []
+    ownership_unknown, genuine_verify = [], []
+    tests_by_file = failing_tests(blob)
     for path in candidates:
         n = blob.count("FAILED " + path)
         print("\n  %s (%d failure line(s) in the run)" % (path, n))
@@ -1075,17 +1241,28 @@ def triage(out, root, env):
             environmental.append(path)
             continue
         print("      solo: %d passed, %d failed -> GENUINE" % (p, f))
-        owners = _print_ownership(path, root)
+        owners = _print_ownership(path, root, tests=tests_by_file.get(path, ()))
         if owners is None:
             # Instrument failure. NOT unowned -- nothing was established, so this
             # candidate is unclassified and must keep the exit code non-zero.
             ownership_unknown.append(path)
+        elif any(o[3] == "exact" for o in owners):
+            genuine_owned.append(path)
+        elif owners:
+            # A file mention or a subsystem name is not ownership (guard-1801).
+            # Before  these rows suppressed filing exactly like an
+            # owner -- 79 WEAK hits counted as ownership on the 2026-09-10 cc-13
+            # run while five fixture reds sat unfiled -- so they get their own
+            # bucket: neither filed on the instrument's say-so nor suppressed.
+            genuine_verify.append((path, [o[0] for o in owners]))
         else:
-            (genuine_owned if owners else genuine_unowned).append(path)
+            genuine_unowned.append(path)
 
     print("\n" + "=" * 66)
-    print("TRIAGE RESULT: %d environmental | %d genuine-owned | %d genuine-UNOWNED"
-          % (len(environmental), len(genuine_owned), len(genuine_unowned)))
+    print("TRIAGE RESULT: %d environmental | %d genuine-owned | %d genuine-VERIFY "
+          "| %d genuine-UNOWNED"
+          % (len(environmental), len(genuine_owned), len(genuine_verify),
+             len(genuine_unowned)))
     if errored:
         print("  %d candidate(s) could not be re-run -- unclassified: %s"
               % (len(errored), ", ".join(errored)))
@@ -1093,11 +1270,18 @@ def triage(out, root, env):
         print("  %d genuine red(s) with an UNANSWERED ownership query -- "
               "unclassified, do NOT read as unowned: %s"
               % (len(ownership_unknown), ", ".join(ownership_unknown)))
+    if genuine_verify:
+        print("\nVERIFY OWNERSHIP -- genuine, reproduce solo, and a goal names the "
+              "FILE or the subsystem but not the failing test (guard-1801: a "
+              "shared name is not ownership). Open the candidate(s) before "
+              "filing or dismissing:")
+        for path, gids in genuine_verify:
+            print("  %s  <- %s" % (path, ", ".join(gids)))
     if genuine_unowned:
         print("\nFILE THESE -- genuine, reproduce solo, and no goal names them:")
         for path in genuine_unowned:
             print("  %s" % path)
-    elif not errored and not ownership_unknown:
+    elif not errored and not ownership_unknown and not genuine_verify:
         # These two are NOT the same finding and must not share a sentence.
         # "every genuine red is owned" says reds exist and are tracked; "none
         # reproduced" says the run's failures were not real. Collapsing them
@@ -1117,7 +1301,7 @@ def triage(out, root, env):
               "(see SCOPE above). This triage did not examine %s."
               % (", ".join(failed_halves), " or ".join(failed_halves)))
     print("=" * 66)
-    return 1 if (genuine_unowned or errored or ownership_unknown
+    return 1 if (genuine_unowned or genuine_verify or errored or ownership_unknown
                  or failed_halves) else 0
 
 
@@ -2434,6 +2618,7 @@ def main(argv=None):
 
     if verdict == "genuine":
         print("VERDICT: GENUINE failures -- trustworthy, act on them")
+        tests_by_file = failing_tests(blob)
         for f in files_failing:
             print("  %s (%d)" % (f, blob.count("FAILED " + f)))
             # Step 5 inline, because it is cheap (two queries + a git log) and
@@ -2443,7 +2628,7 @@ def main(argv=None):
             # while a GENUINE failure was unowned and every reader was told it
             # was handled. Solo discrimination is NOT run here -- that costs a
             # pytest invocation per file; use --triage for the full chain.
-            _print_ownership(f, PROJECT_ROOT)
+            _print_ownership(f, PROJECT_ROOT, tests=tests_by_file.get(f, ()))
         print("\nRun `run-full-suite.sh --triage` to solo-discriminate these "
               "before filing (green solo => environmental, not a regression).")
         print("=" * 66)

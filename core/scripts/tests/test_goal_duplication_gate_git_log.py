@@ -234,7 +234,7 @@ def main() -> int:
                 "H: expected PASS on origin_signal-embedded parent id; got "
                 f"passed={rh.get('passed')} reason={rh.get('reason')!r}")
 
-        # I: PREFIX guard — discovered_by g-888-7 must NOT exempt the
+        # I: PREFIX guard — discovered_by  must NOT exempt the
         #  tag (shorter-id-inside-longer-id class, fresh-eyes F1 of
         # ); the block must hold.
         ri = goal_duplication._check_git_log(

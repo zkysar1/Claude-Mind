@@ -205,8 +205,8 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
                     pass
             # : WARN (do NOT block) on a tag that LOOKS like an address
             # but routes to nobody. Board tags are free-form, so a poster who
-            # writes `forward-to:omni@zds-mind` (parses to agent
-            # `forward-to:omni`) currently gets NO feedback at all — the post
+            # writes `forward-to:<agent>@<peer-env>` (parses to agent
+            # `forward-to:<agent>`) currently gets NO feedback at all — the post
             # looks addressed and reaches no one. Measured: six such posts over
             # ten days by four different agents, including two time-critical
             # user relays to a peer deployment; `requires_action_by:` is the

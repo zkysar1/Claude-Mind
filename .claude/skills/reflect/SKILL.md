@@ -481,6 +481,15 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
    # here permanently and the count grows monotonically — a drain/marking problem
    # with no correctness impact on learning.
    #
+   # ⚠ THE SENTENCE ABOVE IS DEPLOYMENT-SCOPED, NOT UNIVERSAL — it describes the
+   # lane measured on echo/cc-03, and it is MEASURED FALSE on at least one peer.
+   # A PEER DEPLOYMENT (msg-20260921-114220-omni-3317 §B7) reports 197 of 197
+   # terminal-outcome records carrying `reflected` there, with --unreflected a
+   # genuine []. Not reproduced here; the figures above stay correct for the box
+   # they name. The point is the READING: a clean --unreflected lane on some
+   # deployment is the healthy state, not a broken reader, so do not open an
+   # investigation into "why is the count not growing".
+   #
    # ROUTE NOTHING. Owned FIVE times over: g-115-4335, g-115-4558, g-115-6338,
    # g-115-6543, g-001-08. Attach a fresh measurement to the newest rather than
    # filing #6 (their counts are stale by construction — rb-5818).

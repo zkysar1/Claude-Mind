@@ -41,7 +41,7 @@ SCHEMA = {
     # : the xw branch (g-xw-<ts>-NN / asp-xw-<ts> cross-world ids) was
     # widened in canonical () but never mirrored here — so loop-state-save
     # init/update rejected every cross-world goal's checkpoint. This re-syncs both.
-    "goal_id":          {"required": True,  "type": str, "pattern": r"^g-(\d{3}-\d{2,5}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$"},
+    "goal_id":          {"required": True,  "type": str, "pattern": r"^g-(\d{3}-\d+(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$"},  # seq open-ended: guard-1161
     "aspiration_id":    {"required": True,  "type": str, "pattern": r"^asp-(\d{3}|xw-\d{8}T\d{6})$"},
     # WORLD_AGENT_ONLY: cross-agent goals reach here already translated to
     # source='agent' + cross_agent_owner (see that field's comment below).
@@ -175,7 +175,7 @@ def _infer_aspiration_id(goal_id: str):
     key and lets the normal SCHEMA check report it, rather than inventing an
     aspiration that does not exist."""
     import re
-    m = re.match(r"^g-(\d{3})-\d{2,5}(?:-[a-z])?$", goal_id)
+    m = re.match(r"^g-(\d{3})-\d+(?:-[a-z])?$", goal_id)  # seq open-ended: guard-1161
     if m:
         return "asp-" + m.group(1)
     m = re.match(r"^g-(xw-\d{8}T\d{6})-\d{2}$", goal_id)

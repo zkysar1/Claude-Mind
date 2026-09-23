@@ -47,6 +47,48 @@ def test_stale_when_released_to_pending():
     assert kind == "STALE"
 
 
+# ── : `pending` + OUR OWN claim is LIVE, not STALE ────────────────
+# aspirations-claim.sh writes claimed_by/claimed_at/started/executed_by and
+# leaves status at 'pending', so this is the shape the framework's own claim
+# script PRODUCES. The pre-fix chain returned STALE for it, which made
+# mind-api-start.sh --restart exit 3 and the post-commit recycle silently
+# refuse — a committed daemon-code fix never reached the live daemon
+# (guard-7213). The pair below is the discriminator: identical status, the
+# ONLY difference is whether the claim is ours.
+def test_live_when_pending_but_claim_is_ours():
+    kind, reason = verdict(_asp([_goal(status="pending", claimed_by="alpha")]),
+                           "alpha", "g-115-1")
+    assert kind == "LIVE"
+    assert "pending" in reason
+
+
+def test_pending_arm_requires_our_own_claim():
+    # Same status as above; a FOREIGN claim must still be STALE, which is what
+    # keeps the new arm from widening the gate (release() pops claimed_by, so
+    # a released claim lands on the claimed_by=None case pinned just above).
+    kind, _ = verdict(_asp([_goal(status="pending", claimed_by="bravo")]),
+                      "alpha", "g-115-1")
+    assert kind == "STALE"
+
+
+def test_pending_arm_does_not_admit_terminal_statuses():
+    # The arm is keyed on 'pending' exactly — every terminal status must keep
+    # falling through to STALE even when the claim is still stamped as ours.
+    for st in ("completed", "skipped", "expired", "superseded", "decomposed",
+               "blocked"):
+        kind, _ = verdict(_asp([_goal(status=st, claimed_by="alpha")]),
+                          "alpha", "g-115-1")
+        assert kind == "STALE", f"status={st!r} must remain STALE"
+
+
+def test_pending_arm_sits_below_the_read_quality_guards():
+    # guard-6943: the new branch must not outrank the INDETERMINATE guards —
+    # an absent record must stay fail-open even though the id and agent match.
+    kind, _ = verdict(_asp([_goal(status="pending", claimed_by="alpha")]),
+                      "alpha", "g-115-NOT-PRESENT")
+    assert kind == "INDETERMINATE"
+
+
 def test_stale_when_taken_over():
     # status stays in-progress but another agent owns the claim now.
     kind, reason = verdict(_asp([_goal(claimed_by="bravo")]), "alpha", "g-115-1")

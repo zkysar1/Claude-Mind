@@ -445,22 +445,84 @@ def decide(subject, goals, now, session_start=None,
     }
 
 
+def flatten_proposed_work(val):
+    """Pure. Render a `proposed_work` value as scorable text, or "" if it has none.
+
+    MEASURED SHAPES, not assumed ones (guard-645). Over the live 2,082-record
+    capture corpus on 2026-09-21, `proposed_work` occurs in exactly THREE
+    records: one `list[dict]` carrying title/detail/priority per item, and two
+    plain `str`. Both are handled; anything else renders empty rather than
+    raising, because one malformed record must never abort the walk
+    (guard-1512).
+
+    `priority` is deliberately NOT rendered. It is routing metadata, not
+    content, and folding it in would inject the corpus-common token "HIGH" into
+    every subject — which a token-overlap scorer reads as signal.
+    """
+    if isinstance(val, str):
+        return val.strip()
+    if not isinstance(val, list):
+        return ""
+    parts = []
+    for item in val:
+        if isinstance(item, str):
+            if item.strip():
+                parts.append(item.strip())
+        elif isinstance(item, dict):
+            for field in ("title", "detail"):
+                sub = item.get(field)
+                if isinstance(sub, str) and sub.strip():
+                    parts.append(sub.strip())
+    return " ".join(parts)
+
+
 def extract_subject(record):
     """Pure. Return (text, key_used) for one capture record, or (None, None).
 
     Tries OBSERVATION_KEYS in order rather than reading `observation` literally
     (guard-4044). A record that is a bare string is its own subject — the slot
     has no schema, so that shape occurs.
+
+    `proposed_work` is then APPENDED rather than competing in that order, and
+    the two halves of that sentence are each load-bearing (g-115-10347):
+
+    APPENDED, because first-match-wins made the key unreachable in practice.
+    `observation` is FIRST in OBSERVATION_KEYS and present on 2,074 of 2,082
+    live records, so any record carrying both scored on `observation` alone.
+    When that observation is a contentless envelope ("relaying for reducer to
+    file"), the probe scored the envelope, matched nothing, and returned FILE
+    with an empty candidate list — which reads exactly like honest novelty
+    (guard-7119). The measured instance would have duplicated two HIGH
+    money-path goals.
+
+    NOT PROMOTED above `observation`, because that would change the scored
+    subject for records where both carry real content, and a change to what a
+    scoring analyzer OBSERVES changes the metric's semantics (rb-4988). Appending
+    is additive: for the 2,079 records with no `proposed_work` the subject is
+    byte-identical to what it was before.
+
+    The key is reported as a COMPOSITE ("observation+proposed_work") so
+    `subject_keys_used` still enumerates every key actually consumed — the field
+    that made this diagnosable in the first place, and an outcome of the goal.
     """
     if isinstance(record, str):
         return (record.strip() or None), ("<bare-string>" if record.strip() else None)
     if not isinstance(record, dict):
         return None, None
+    base, base_key = None, None
     for key in OBSERVATION_KEYS:
+        if key == "proposed_work":
+            continue  # appended below, never the first-match winner
         val = record.get(key)
         if isinstance(val, str) and val.strip():
-            return val.strip(), key
-    return None, None
+            base, base_key = val.strip(), key
+            break
+    extra = flatten_proposed_work(record.get("proposed_work"))
+    if extra and base:
+        return (base + " " + extra), (base_key + "+proposed_work")
+    if extra:
+        return extra, "proposed_work"
+    return base, base_key
 
 
 def batch_decide(records, goals, now, session_start=None,

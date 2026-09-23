@@ -53,8 +53,10 @@ writes (i.e. every wrapper write) do NOT get them:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -140,6 +142,7 @@ from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
 from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E402
 from gates.intended_agent_vocab import evaluate as _intended_agent_vocab_eval  # noqa: E402
 from gates.capability_vocab import evaluate as _capability_vocab_eval  # noqa: E402  # 
+from gates.capability_vocab import LOCUS_ROUTING_HINT as _CAP_LOCUS_HINT  # noqa: E402  # 
 from gates.approval_reference import evaluate as _approval_ref_eval  # noqa: E402
 from gates.prose_verification import evaluate as _prose_verification_eval  # noqa: E402
 from gates.verification_outcomes import evaluate as _verification_outcomes_eval  # noqa: E402
@@ -271,10 +274,17 @@ RELEASE_REASON_KINDS = frozenset({
 
 
 # Duplicated from aspirations.py — see DECISIONS.md #3 for the rationale.
-# Mirror upstream when these change; a parity test could enforce.
+# ⚠ DO NOT INLINE. Must match core/scripts/aspirations.py::VALID_GOAL_STATUSES
+# (the SSOT) and endpoints/aspirations_query.py::VALID_GOAL_STATUSES exactly
+# (guard-130). This copy is a REFUSAL GATE, so a value the SSOT accepts but this
+# set omits makes the daemon reject the write outright. Parity is no longer only
+# aspirational — tests/test_valid_goal_statuses_mirror_parity.py enforces all
+# three ("a parity test could enforce" stood here unbuilt until ).
 _VALID_GOAL_STATUSES = {
     "pending", "in-progress", "completed", "blocked",
     "skipped", "expired", "decomposed", "superseded",
+    # `candidate` — intake state, NOT terminal ( / goal-intake-management §2).
+    "candidate",
 }
 # Mirror of aspirations.py::TERMINAL_GOAL_STATUSES (line 44). Drives the
 # terminal-status cascade (completed_at stamp, _clear_stale_blockers,
@@ -293,7 +303,7 @@ _VALID_GOAL_STATUSES = {
 # never named this file — which is precisely why the literal drifted unowned.
 _TERMINAL_GOAL_STATUSES = _CENSUS_TERMINAL_STATUSES
 _ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (mirrors aspirations.py::ASP_ID_RE; companion to _GOAL_ID_RE xw branch below)
-_GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,5}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 5-digit: asp-115 hit  (2026-09-15), 4-digit:  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+_GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d+(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # SEQUENCE IS OPEN-ENDED (guard-1161) — mirrors aspirations.py::GOAL_ID_RE. It is a growing counter and every bound on it expired in production:  (2026-05-19),  (2026-09-15), each a fleet-wide filing outage. Do NOT re-bound it. The ASPIRATION half stays \d{3} (different axis); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 
 
 def _goals_field_problem(value) -> "str | None":
@@ -1530,6 +1540,51 @@ def _credential_enum_guard(ctx, goal_id: str, raw_ref: Any,
     }, status=400)
 
 
+# The width at and above which a sequence crossing is worth announcing. Below
+# it, crossings are routine (every aspiration passes 2->3 and 3->4 digits) and a
+# warning would be pure noise. At 5+ it is the real frontier: asp-115 crossed
+# 4->5 at  and the NEXT crossing (5->6) is the first one that can
+# break a bounded sibling living OUTSIDE this tree.
+_SEQ_WIDTH_WARN_AT = 5
+
+
+def _warn_on_seq_width_growth(asp_id: str, max_seq: int, new_seq: int) -> None:
+    """Emit a degraded-band signal when a goal-id sequence GAINS A DIGIT.
+
+    F-002 of g-115-10003, and the half that decides whether there is a fourth
+    outage. Under an open-ended ``\\d+`` this allocator has no ceiling of its
+    own, so a "headroom to the limit" check has nothing to measure. What is
+    still worth watching is the GROWTH CURVE: the remaining hazard is a bounded
+    SIBLING somewhere this tree does not reach — world/scripts (not git-carried,
+    read ``\\d{1,5}`` as of 2026-09-15), a downstream seed, a peer deployment
+    not yet widened. A width crossing is the earliest moment any of those can
+    break, and it is precisely the signal both prior outages lacked: g-115-999
+    (2026-05-19) and g-115-9999 (2026-09-15) each arrived with NO degraded band,
+    so the first symptom was a fleet-wide filing refusal.
+
+    Warns on the CROSSING only, never on every mint at a width, so asp-115 --
+    already past 10,000 -- stays silent until g-115-100000.
+
+    Stderr only, and never raises: a mint must not fail because a warning could
+    not be written (guard-1562 -- stopping a healthy path on a plumbing fault is
+    worse than the disease).
+    """
+    try:
+        old_w, new_w = len(str(max_seq)), len(str(new_seq))
+        if new_w > old_w and new_w >= _SEQ_WIDTH_WARN_AT:
+            print(
+                f"[goal-id-width] {asp_id}: sequence crossed into {new_w} digits "
+                f"(previous max {max_seq}, minting {new_seq}). Goal-id SEQUENCE "
+                f"regexes must be open-ended \\d+ (guard-1161). Re-run "
+                f"core/scripts/tests/test_goal_id_five_digit_seq.py and sweep for "
+                f"bounded siblings outside the framework tree (world/scripts, "
+                f"downstream seeds, peer deployments).",
+                file=sys.stderr,
+            )
+    except Exception:  # noqa: BLE001 - a warning must never break allocation
+        pass
+
+
 def _allocate_goal_id(asp: Dict[str, Any]) -> str:
     """Allocate next g-NNN-NN id for the aspiration. Mirrors aspirations.py's
     max-seq-plus-one logic; uses two-digit zero-padding (NN). Evicted ids count
@@ -1543,9 +1598,13 @@ def _allocate_goal_id(asp: Dict[str, Any]) -> str:
     max_seq = 0
     live_ids = [g.get("id", "") for g in asp.get("goals", [])]
     for gid in live_ids + _all_evicted_ids(asp):
-        m = re.match(r"^g-\d{3}-(\d{2,5})", gid)
+        m = re.match(r"^g-\d{3}-(\d+)", gid)  # OPEN-ENDED, and load-bearing (guard-2414):
+        # a capped capture on a LONGER id does not fail, it reads the leading digits as a
+        # smaller number — `(\d{2,5})` on  returns 10000, so max+1 re-mints a
+        # live id onto the shared store. Must never be narrower than _GOAL_ID_RE.
         if m:
             max_seq = max(max_seq, int(m.group(1)))
+    _warn_on_seq_width_growth(asp_id, max_seq, max_seq + 1)
     return f"g-{asp_num}-{max_seq + 1:02d}"
 
 
@@ -2113,6 +2172,67 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
                 ),
                 "received_type": type(value).__name__,
                 "received_preview": repr(value)[:200],
+            }, status=400), None, None
+
+    # requires_capability VOCABULARY REFUSAL on the UPDATE path ().
+    #
+    #  built gates/capability_vocab.py for exactly this class and wired
+    # it at the ADD sites ONLY. Its docstring says why, and that reasoning is
+    # correct and preserved here: update_goal validates its in-lock candidate
+    # through _validate_goal, so a check THERE would wedge status changes on any
+    # legacy carrier that arrived by merge from another box -- and those carriers
+    # are precisely the rows a reader must still be able to EDIT to unstick them.
+    # The consequence, unstated at the time, is that the UPDATE path was ungated,
+    # so a value written onto an EXISTING goal fenced it fleet-wide. The gate was
+    # not failing; it was never on this road.
+    #
+    # THIS CHECK IS FIELD-SCOPED, NOT RECORD-SCOPED, and that distinction is the
+    # whole design: it evaluates the INCOMING VALUE as a synthetic one-field goal,
+    # never the stored record. A legacy carrier's `status` write does not reach
+    # this branch at all, so the blast radius _validate_goal would have had does
+    # not exist here. Same shape as the blocker_ref and user_leg_scope refusals
+    # around it, and the same reason (guard-330: "Add-path validation alone is
+    # insufficient, update-field paths are backdoors"; guard-2218: the ADD path
+    # runs content-based gates and the UPDATE path runs none).
+    #
+    # MEASURED, alpha/cc-04 2026-09-21, one variable at a time. Census over 3035
+    # non-terminal goals: 32 carried the field, 5 distinct VALID tokens were in
+    # live use (the positive control that the reader was not returning empty for
+    # everything), and exactly TWO carried an unknown token -- both HIGH, both
+    # multi-paragraph PROSE, both written by UPDATE days after the goal was filed:
+    #  (885 chars, in a directive-boosted lane) and  (1317
+    # chars). Flipping ONLY that field to null moved goal_is_locally_executable
+    # False -> True on each. ZERO of 2558 ranked candidates came from the owner's
+    # six boosted lanes while those two were hidden.
+    #
+    # NO OVERRIDE FLAG, matching the gate module's own deliberate choice: the
+    # sanctioned fix is to correct the token or register a real one in
+    # KNOWN_CAPABILITIES (an agent-editable framework file), so there is no
+    # invariant here the author lacks the authority to resolve.
+    #
+    # Clearing stays open (None / "" / []) -- that is exactly how the two live
+    # carriers were legitimately retired, and refusing it would wedge the unstick
+    # path this gate exists to protect.
+    #
+    # LIVE HALF. The framework is daemon-only, so every real invocation arrives
+    # HERE; the CLI twin in core/scripts/aspirations.py::cmd_update_goal carries
+    # the same refusal in this same change (guard-2323/guard-742), and both read
+    # the one SSOT hint rather than a hand-typed copy.
+    if field == "requires_capability" and value not in (None, "", []):
+        try:
+            _cap_verdict = _capability_vocab_eval(
+                {"id": goal_id, "requires_capability": value},
+                meta_dir=(ctx.paths.meta if ctx is not None else None),
+                agent_name=((ctx.paths.agent_name or None) if ctx is not None else None),
+            )
+        except Exception:
+            _cap_verdict = None  # fail OPEN — a gate that cannot run must not block
+        if _cap_verdict and _cap_verdict.get("would_block"):
+            return Response.json({
+                "error": "unknown_capability_token",
+                "gate": "capability-vocab",
+                "detail": (_cap_verdict.get("message") or "") + _CAP_LOCUS_HINT,
+                "received_preview": repr(value)[:300],
             }, status=400), None, None
 
     # user_leg_scope MEMBERSHIP REFUSAL ( / guard-6104). The field is
@@ -2915,6 +3035,24 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
         companion_note = _cn
         value = value["value"]
 
+    # FIELD PRECONDITION (). A caller that composes the new value
+    # from its own earlier read of the field (read -> transform -> replace)
+    # cannot close the window between that read and this write from its side:
+    # a peer write landing there is overwritten, and no read the caller takes
+    # afterwards can see the loss, because the clobbered store is byte-identical
+    # to the value it meant to write. X-Mind-Expect-Field-Sha256 carries the
+    # sha256 of the text the caller composed from; the compare runs INSIDE the
+    # write lock below, the only place it is atomic with the write. Validated
+    # here so a malformed hash costs no gate, no path resolution and no lock.
+    expect_sha = _header_override(ctx, "X-Mind-Expect-Field-Sha256")
+    if expect_sha is not None:
+        expect_sha = expect_sha.lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expect_sha):
+            return Response.error(
+                400, "invalid_expect_sha256",
+                "X-Mind-Expect-Field-Sha256 must be 64 hex chars (the sha256 "
+                f"of the field's UTF-8 text), got {expect_sha[:80]!r}")
+
     live_path, base_dir = _resolve_paths(ctx, source)
     agent = _agent_name(ctx)
 
@@ -3258,6 +3396,29 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 return Response.error(404, "goal_not_found",
                                       f"Goal {goal_id} not found in any aspiration ({source})")
             asp_idx, goal_idx, asp = found
+
+            # Field precondition (; header validated pre-lock).
+            # Compared against THIS locked read, before any validation or
+            # cascade, so a refusal writes nothing at all. An absent field
+            # hashes as the empty string, matching a caller that read None.
+            if expect_sha is not None:
+                _cur = asp["goals"][goal_idx].get(field)
+                if _cur is not None and not isinstance(_cur, str):
+                    return Response.error(
+                        409, "field_precondition_failed",
+                        f"{field} on {goal_id} holds a non-text value "
+                        f"({type(_cur).__name__}); a field-sha256 precondition "
+                        "applies only to text fields. NOTHING WAS WRITTEN.")
+                _cur_sha = hashlib.sha256(
+                    (_cur or "").encode("utf-8")).hexdigest()
+                if _cur_sha != expect_sha:
+                    return Response.error(
+                        409, "field_precondition_failed",
+                        f"refusing to write {field} on {goal_id}: it changed "
+                        f"since the caller read it (expected sha256 "
+                        f"{expect_sha[:12]}..., stored {_cur_sha[:12]}..., "
+                        f"stored length {len(_cur or '')}). NOTHING WAS "
+                        "WRITTEN - re-read the field and recompose.")
 
             # Validate against a candidate state BEFORE mutating the canonical
             # record. _read_jsonl currently returns a fresh list, so a mutate-
@@ -4189,6 +4350,12 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # the legacy CLI experience. Same shape as add_goal's response.
     if warnings:
         response_body["warnings"] = warnings
+    # Echo the checked precondition so a caller can tell a daemon that ran the
+    # compare from one that predates it: an older daemon ignores the unknown
+    # header and still answers 200 (guard-5505).
+    if expect_sha is not None:
+        response_body["precondition"] = {
+            "checked": True, "field": field, "sha256": expect_sha}
     return Response.json(response_body)
 
 

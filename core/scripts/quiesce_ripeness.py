@@ -101,7 +101,7 @@ def is_quiesce_frozen_defer(defer_reason: Optional[str]) -> bool:
     return any(t in (defer_reason or "").lower() for t in QUIESCE_DEFER_TOKENS)
 
 
-_GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d{1,5}\b")
+_GOAL_ID_RE = re.compile(r"\bg-\d{1,4}-\d+\b")  # seq is open-ended: guard-1161
 _ROW_RE = re.compile(r"^\|\s*(Q\d+)\s*\|(.*)$")
 # Ranges use an EN DASH in this file ("~70–90 min"), not a hyphen. Matching only
 # ASCII '-' silently reads "70–90" as the single number 70 with trailing junk;

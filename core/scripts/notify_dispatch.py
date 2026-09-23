@@ -140,7 +140,20 @@ def gate_log(gate: str, outcome: str, category: str, subject: str) -> None:
 
 
 def reroute_to_board(subject: str, body: str, category: str, reason: str) -> bool:
-    """Best-effort re-route of a routing-suppressed message to the findings board."""
+    """Best-effort re-route of a routing-suppressed message to the findings board.
+
+    WITHHELD under pytest (g-115-6721). board-post.sh writes through the shared
+    daemon, which resolves its OWN world, so neither a test's MIND_WORLD nor
+    STORAGE_BACKEND=local can redirect the post: a fixture that walked a
+    suppressed notification through here landed on the LIVE findings board every
+    time the suite ran. Emitter-side per guard-1041 (a test-side stub covers only
+    the tests that exist today); same chokepoint as the daemon-spawn refusal
+    (g-115-3329). Returns True -- withholding is the intended outcome, and False
+    would print the "board post FAILED -- file a goal" alarm for nothing."""
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        _log("board re-route WITHHELD under pytest (PYTEST_CURRENT_TEST set): the post would "
+             "land on the LIVE findings board, not the test's world (g-115-6721)")
+        return True
     script = HERE / "board-post.sh"
     if not script.exists():
         return False

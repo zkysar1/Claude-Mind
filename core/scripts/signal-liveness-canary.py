@@ -64,7 +64,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -77,6 +79,7 @@ try:
     import yaml
     from _paths import AGENT_DIR, CORE_ROOT, WORLD_DIR
     from _fileops import acquire_lock, release_lock
+    from _gate_log import LIVENESS_PROBE_ENV
     from _runtime_bash import bash_cmd  # Windows-safe bash resolution ()
 except Exception:
     sys.exit(0)
@@ -228,9 +231,13 @@ def _probe(argv: list[str], stdin_text: str | None = None) -> tuple[int, str, st
     `stdin_text` exists for the PreToolUse-hook gates, which take their whole
     input as JSON on stdin rather than in argv. Default None keeps every
     pre-existing call byte-identical.
+
+    Every probe carries LIVENESS_PROBE_ENV so the probed gate does not log its
+    must-trip refusal as a production firing (g-318-168, _gate_log docstring).
     """
     r = subprocess.run(argv, input=stdin_text, capture_output=True, text=True,
-                       timeout=PROBE_TIMEOUT_S)
+                       timeout=PROBE_TIMEOUT_S,
+                       env={**os.environ, LIVENESS_PROBE_ENV: "signal-liveness-canary"})
     return r.returncode, (r.stdout or ""), (r.stderr or "")
 
 
@@ -307,9 +314,75 @@ def _assert_query_refusal_channel() -> tuple[bool | None, str]:
     return False, f"refusal channel live: rc={rc} with {len(err)} byte(s) on stderr"
 
 
-def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hint: str):
+def _trigger_fixture_still_trips(script_name: str, args: tuple[str, ...]) -> "str | None":
+    """None when this row's claim text still trips the gate's CURRENT trigger table.
+
+    The rc-shaped sibling of `_marker_fixture_still_must_deny`, and it exists for the
+    same measured reason (g-115-10364): when the watched predicate tightens and the
+    fixture does not, a non-trip is CORRECT and reading it as DEAD indicts a healthy
+    gate forever. V-5 got that defence because it actually rotted; these four rows are
+    the identical shape and had none, which is scar tissue only where the wound was.
+
+    PROVEN, not argued (echo/cc-03 2026-09-21, g-318-156): the real factory was driven
+    twice in one process against the SAME gates — live fixture -> alive (rc=1), a
+    fixture rotted only in wording -> DEAD, 2 of 2. Gate health was held constant by
+    the first arm, so the false accusation is attributable to the fixture alone.
+
+    THE CLAIM TEXT IS READ OUT OF `args`, never passed in beside it. A second copy
+    would be a second source of truth, and drift between the two would silently check
+    a string the gate is no longer being sent — the very defect this guards.
+
+    All four gates expose `_detect_trigger(claim_text)`, verified per gate rather than
+    inherited (this file's standing instruction): live text returns the matched pattern,
+    rotted text returns None, uniform across V-1..V-4. V-6 (capability-gate) matches on
+    a different contract and deliberately supplies no check rather than a guessed one.
+    """
+    claim = None
+    for flag in ("--claim-text", "--claim"):
+        if flag in args:
+            i = args.index(flag)
+            if i + 1 < len(args):
+                claim = args[i + 1]
+            break
+    if claim is None:
+        return (f"{script_name}'s probe args carry no --claim-text/--claim, so this row's "
+                f"fixture cannot be checked against the gate's trigger table")
+    path = SCRIPT_DIR / script_name
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_canary_probe_" + script_name.replace("-", "_")[:-3], path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        return f"{script_name}'s trigger SSOT could not be imported ({exc})"
+    detect = getattr(module, "_detect_trigger", None)
+    if detect is None:
+        return f"{script_name} no longer exposes _detect_trigger, so the fixture is uncheckable"
+    try:
+        if detect(claim):
+            return None
+    except Exception as exc:
+        return f"{script_name}._detect_trigger raised on the probe claim ({exc})"
+    return (f"the probe claim {claim!r} no longer matches {script_name}'s trigger table "
+            f"(_detect_trigger returned no match), so a non-trip is CORRECT and this row "
+            f"cannot say anything about the gate. The trigger table moved under the "
+            f"fixture — fix this row's args, not the gate")
+
+
+def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hint: str,
+                            fixture_check=None, stdin_text: "str | None" = None,
+                            refusal_check=None):
     """ONE shape, four rows (V-1..V-4): a Q1/Q2 gate whose rc=0 means BOTH 'evidence
     sufficient' AND 'no trigger matched'.
+
+    `stdin_text` is for a gate that takes its input as JSON on stdin rather than in
+    argv (blocker-create-gate.py, g-318-168). Default None keeps every argv-shaped row
+    byte-identical.
+
+    `refusal_check` is for a gate that runs SEVERAL checks, where rc=1 says only that
+    SOME check refused (guard-1082: assert the specific refusal, never the coarse rc).
+    It reads the refusal stdout and returns None when the watched check is the one
+    refusing, else the (verdict, detail) to report. Default None keeps rc=1 sufficient.
 
     Measured on alpha/cc-08 2026-09-13, each gate driven both ways in the same pass:
       must-trip input     -> rc=1, JSON carries a non-null trigger_matched (~35 ms each)
@@ -335,11 +408,60 @@ def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hin
             # a recently-added script, and alarming there would report a tree problem as a
             # dead detector.
             return None, f"{script_name} absent at {path}"
+        # A ROTTED FIXTURE IS UNEVALUATABLE, NEVER DEAD (, generalised to this
+        # factory by ). Same placement and same fail direction as the hook-gate
+        # sibling: a row whose fixture cannot rot supplies no check and behaves as before.
+        if fixture_check is not None:
+            try:
+                stale = fixture_check(script_name, args)
+            except Exception as exc:
+                stale = f"the fixture check itself failed ({exc})"
+            if stale:
+                return None, f"{script_name} probe fixture is stale: {stale}"
         try:
-            rc, out, err = _probe([sys.executable, path.as_posix(), *args])
+            argv = [sys.executable, path.as_posix(), *args]
+            # Pass stdin_text only when a row sets it, so an argv-shaped row keeps its
+            # exact call (and a one-argument _probe stub keeps working for it).
+            rc, out, err = (_probe(argv) if stdin_text is None
+                            else _probe(argv, stdin_text=stdin_text))
         except Exception as exc:
             return None, f"{script_name} could not run: {exc}"
         if rc == 1:
+            # rc=1 IS NOT PROOF OF LIFE — Python exits 1 on an uncaught exception too,
+            # so a gate that cannot even IMPORT is byte-identical here to one that
+            # refused (guard-5430, which this row was violating: "a block code of 1 is
+            # byte-identical to a crash, an ImportError, or a missing gate file").
+            # The discriminator is the PAYLOAD, and this file already knows that — see
+            # _assert_query_read_channel, whose whole docstring is "THE DISCRIMINATOR IS
+            # THE BYTE COUNT". Measured here the same way (echo/cc-03 2026-09-21,
+            # fresh-eyes on 's commits): all five rc-shaped gates refusing
+            # their real must-trip input -> rc=1 with 720/796/861/721/6903 stdout bytes
+            # and ZERO stderr; the same gate with one bad import -> rc=1 with ZERO
+            # stdout and 252 stderr bytes. Non-empty stdout is therefore safe on every
+            # live row and impossible for a gate that died before argparse.
+            # UNEVALUATABLE, NOT DEAD, and the fail direction is the argued half: a
+            # crashed gate exits 1 at every caller, so it refuses EVERYTHING — the
+            # opposite of "passes every claim it was built to refuse", and DEAD's remedy
+            # would send the reader to the wrong file. It is also the guard-7231
+            # audibility question answered, not skipped: unevaluatable is silent under
+            # --quiet, and that is acceptable ONLY because this failure announces itself
+            # through the gate's own callers (everything they gate starts refusing),
+            # unlike the V-6 empty-corpus case, which was silent everywhere.
+            if not out.strip():
+                return None, (
+                    f"{script_name} exited rc=1 with EMPTY stdout, so it did not refuse "
+                    f"anything — it died before emitting its verdict (a live refusal on "
+                    f"this input carries the gate's JSON). rc=1 cannot tell 'blocked' "
+                    f"from 'could not run' (guard-5430), so this row is unevaluatable, "
+                    f"not alive. stderr={(err or '').strip()[:200]}"
+                )
+            if refusal_check is not None:
+                try:
+                    verdict = refusal_check(out)
+                except Exception as exc:
+                    verdict = (None, f"refusal check itself failed ({exc})")
+                if verdict is not None:
+                    return verdict[0], f"{script_name} {verdict[1]}"
             return False, f"{script_name} still refuses its must-trip input (rc=1)"
         if rc == 0:
             return True, (
@@ -351,7 +473,99 @@ def _gate_trigger_assertion(script_name: str, args: tuple[str, ...], trigger_hin
     return _assert
 
 
-def _hook_gate_deny_assertion(script_name: str, payload: dict, what_permitted: str):
+# The blocker-create-gate row's must-trip input ( unit 2). It fails ONLY check 3
+# (schema_probe): a statistical-negation failure_reason with no schema_probe_evidence.
+# Two distinct non-silent evidence entries pass check 2; type "resource" skips checks
+# 4-6; no affected_skills leaves check 1 nothing to check. Measured against the real
+# gate (echo/cc-03 2026-09-23): rc=1, failing_count 1, the failing check schema_probe.
+# The same payload with a non-statistical reason returned rc=0.
+BLOCKER_STAT_NEG_PAYLOAD: dict = {
+    "type": "resource",
+    "failure_reason": "0 records have field utilization across all entries",
+    "evidence": [
+        {"tool": "jsonl-field-probe.py", "endpoint": "canary-fixture-store",
+         "evidence_type": "schema-read",
+         "command": "py -3 core/scripts/jsonl-field-probe.py canary-fixture-store utilization"},
+        {"tool": "grep", "endpoint": "canary-fixture-store", "evidence_type": "count",
+         "command": "grep -c utilization canary-fixture-store"},
+    ],
+}
+
+
+def _stat_neg_fixture_check(payload: dict):
+    """Fixture check for a stdin-fed gate: None while the payload's failure_reason still
+    matches gates/blocker_create._STAT_NEG_PATTERNS.
+
+    The stdin-shaped sibling of `_trigger_fixture_still_trips`. The reason is read from
+    the SAME dict the row serialises to stdin, never from a second copy beside it, for
+    the reason that function's docstring gives.
+
+    AN EMPTY PATTERN TABLE RETURNS None, NOT "stale fixture" (guard-7231). With no
+    patterns the gate can refuse no statistical negation, so the probe must run and
+    report DEAD. Calling it a stale fixture would file a dead check 3 as unevaluatable,
+    which is silent under --quiet.
+    """
+    def _check(script_name: str, args: tuple[str, ...]) -> "str | None":
+        reason = str(payload.get("failure_reason") or "")
+        path = SCRIPT_DIR / "gates" / "blocker_create.py"
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "_canary_probe_gates_blocker_create", path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:
+            return (f"gates/blocker_create.py, the trigger SSOT for {script_name}, could "
+                    f"not be imported ({exc})")
+        patterns = getattr(module, "_STAT_NEG_PATTERNS", None)
+        if patterns is None:
+            return ("gates/blocker_create.py no longer exposes _STAT_NEG_PATTERNS, so the "
+                    "fixture is uncheckable")
+        if not patterns:
+            return None
+        if any(p.search(reason) for p in patterns):
+            return None
+        return (f"the probe failure_reason {reason!r} no longer matches any "
+                f"gates/blocker_create._STAT_NEG_PATTERNS entry, so a non-trip is CORRECT "
+                f"and this row cannot say anything about check 3. The pattern table moved "
+                f"under the fixture — fix BLOCKER_STAT_NEG_PAYLOAD, not the gate")
+    return _check
+
+
+def _named_check_refused(check_name: str):
+    """Refusal check for a gate that reports every check in `checks[]` (guard-1082).
+
+    blocker-create-gate runs all six checks and exits 1 if ANY fails, so rc=1 cannot
+    say which one refused. Measured against the real gate (echo/cc-03 2026-09-23): a
+    payload that fails only a SIBLING check (one evidence entry, non-statistical reason)
+    returned rc=1 with non-empty stdout, which the coarse row read as check 3 alive.
+
+    A watched check that PASSED while a sibling refused is DEAD: the fixture check has
+    already confirmed the input still trips it. A watched check with no entry at all is
+    UNEVALUATABLE, because a renamed check and a deleted one read the same here, and a
+    deleted check with no sibling failing still shows DEAD through rc=0.
+    """
+    def _check(out: str):
+        try:
+            checks = json.loads(out)["checks"]
+            names = [c.get("name") for c in checks]
+            failing = [c.get("name") for c in checks if not c.get("passed")]
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            return None, (f"refused (rc=1) but its stdout is not the checks[] verdict this "
+                          f"row reads ({exc!r}), so which check refused is unknown")
+        if check_name in failing:
+            return None
+        if check_name not in names:
+            return None, (f"reports no check named {check_name!r} (checks: {names}), so "
+                          f"this row cannot find what it watches. Fix the row's check "
+                          f"name, not the gate")
+        return True, (f"refused its must-trip input only via {failing}; {check_name} "
+                      f"PASSED an input engineered to trip it, so it has stopped refusing "
+                      f"and a sibling check is carrying rc=1 (guard-1082)")
+    return _check
+
+
+def _hook_gate_deny_assertion(script_name: str, payload: dict, what_permitted: str,
+                              fixture_check=None):
     """ONE shape, two rows (V-5, V-7): a PreToolUse hook gate whose rc is 0 whether it
     DENIES or APPROVES, so only the STDOUT DECISION can tell the two apart.
 
@@ -393,6 +607,18 @@ def _hook_gate_deny_assertion(script_name: str, payload: dict, what_permitted: s
             # lacks a recently-added script, and alarming there would report a tree
             # problem as a dead detector.
             return None, f"{script_name} absent at {path}"
+        # A ROTTED FIXTURE IS UNEVALUATABLE, NEVER DEAD (). This row's
+        # whole verdict rests on the payload still being one the gate MUST refuse.
+        # When the refusal predicate moves and the fixture does not, an approve is
+        # CORRECT and reading it as DEAD indicts a healthy gate forever. Optional:
+        # a row whose payload cannot rot supplies no check and behaves as before.
+        if fixture_check is not None:
+            try:
+                stale = fixture_check(payload)
+            except Exception as exc:
+                stale = f"the fixture check itself failed ({exc})"
+            if stale:
+                return None, f"{script_name} probe fixture is stale: {stale}"
         try:
             rc, out, err = _probe([sys.executable, path.as_posix()],
                                   stdin_text=json.dumps(payload))
@@ -438,6 +664,20 @@ def _marker_placement_probe_payload() -> dict:
 
     The payload names a file that does not exist and is never written: a PreToolUse
     hook only inspects the PROPOSED write.
+
+    THE TOKEN MUST OPEN A COMMENT, AND THIS FIXTURE ONCE DID NOT (g-115-10364).
+    Until 2026-09-21 the content put the bare token on a plain line, which WAS a
+    must-deny payload while every consumer tested the marker as an unanchored
+    substring. `57a655f3b7` (g-115-10246) converged all seven consumers onto the
+    anchored predicate in `_domain_leak_marker.claims_exemption` — the token must
+    OPEN a comment — and touched no fixture that DRIVES one. So this payload
+    quietly stopped being must-deny, the gate correctly approved it, and V-5 read
+    DEAD for three consecutive runs against a gate that was healthy the whole time:
+    driven both ways 2026-09-21 (echo, cc-03), a `<!--`-opening token denies at
+    1243 stdout bytes and a `#`-opening one denies identically, while the override
+    and out-of-scope paths still approve. A false DEAD on the instrument that hunts
+    always-reports-clear detectors is the same defect one level up, so the factory
+    now takes `fixture_check` and this row supplies one.
     """
     probe_file = SCRIPT_DIR.parent / "config" / "conventions" / _CANARY_PROBE_NODE
     return {
@@ -447,9 +687,161 @@ def _marker_placement_probe_payload() -> dict:
             # Split so this canary's own source never carries the literal token it
             # probes for — otherwise the gate would refuse edits to THIS file and the
             # instrument would block its own maintenance.
-            "content": "# signal-liveness canary probe\n\n" + _MARKER_TOKEN + " probe\n",
+            "content": "# signal-liveness canary probe\n\n<!-- " + _MARKER_TOKEN + " probe -->\n",
         },
     }
+
+
+def _marker_fixture_still_must_deny(payload: dict) -> "str | None":
+    """None when V-5's payload still claims the exemption; else WHY it no longer does.
+
+    Asks the predicate's SSOT rather than re-implementing it, so a future move of
+    `claims_exemption` reports itself HERE — as unevaluatable, naming the fixture —
+    instead of arriving as a DEAD verdict against a healthy gate. That is the exact
+    substitution g-115-10364 cost three runs and a HIGH goal.
+    """
+    try:
+        from _domain_leak_marker import claims_exemption
+    except Exception as exc:
+        return f"the marker predicate SSOT could not be imported ({exc})"
+    content = (payload.get("tool_input") or {}).get("content", "")
+    if claims_exemption(content):
+        return None
+    return ("the V-5 probe payload no longer claims the exemption under "
+            "_domain_leak_marker.claims_exemption, so it is no longer a must-deny "
+            "payload and this row cannot say anything about the gate. The predicate "
+            "moved under the fixture — fix _marker_placement_probe_payload, not the gate")
+
+
+def _swakeup_fixture_still_must_deny(payload: dict) -> "str | None":
+    """None when V-7's prompt is still one `_swakeup_predicate` says must be refused.
+
+    Asks the SSOT the row's own remedy text already tells a human to check FIRST —
+    `_swakeup_predicate.is_bad_slash_prefix`, shared with the Layer-C detective
+    `aspirations-rejection-audit.py`, "so one predicate drift kills BOTH layers at
+    once and neither says so". Wiring it here turns that instruction into an
+    assertion: the drift now reports itself as unevaluatable NAMING the fixture,
+    instead of arriving as a DEAD verdict against a healthy gate.
+
+    WHY THIS PREDICATE SEPARATES THE TWO WORLDS AND `gates.capability.evaluate`
+    WOULD NOT (the reason V-6 is deliberately still unchecked — g-318-167).
+    A fixture check is only worth anything if it can distinguish "the gate died"
+    from "the fixture rotted". `is_bad_slash_prefix` is a pure string property of
+    the PROMPT — it stays True while the gate is broken in its payload-key read,
+    its emit path, or its stop:true branch, so the two worlds come apart. V-6's
+    importable `evaluate()` is the gate's WHOLE decision function: a check built
+    on it returns exactly what the subprocess drive returns, so every genuine
+    death would be reported as UNEVALUATABLE and MASKED. An importable predicate
+    is necessary but not sufficient — it must also be NARROWER than the decision.
+
+    Confirmed both ways (echo/cc-03 2026-09-21): '/aspirations loop' -> True;
+    '/loop investigate x', '<<autonomous-loop-dynamic>>', a natural-language
+    prompt and a non-string all -> False.
+    """
+    try:
+        from _swakeup_predicate import is_bad_slash_prefix
+    except Exception as exc:
+        return f"the ScheduleWakeup predicate SSOT could not be imported ({exc})"
+    prompt = (payload.get("tool_input") or {}).get("prompt")
+    if is_bad_slash_prefix(prompt):
+        return None
+    return (f"the V-7 probe prompt {prompt!r} is no longer one "
+            "_swakeup_predicate.is_bad_slash_prefix refuses, so it is not a must-deny "
+            "payload and this row cannot say anything about the gate. The predicate "
+            "moved under the fixture — fix this row's payload, not the gate")
+
+
+# V-6's fixture depends on ONE fact about the capability corpus: that
+# commit-and-push is still catalogued as agent-provisionable. Pinned as literal
+# constants rather than derived from the probe args, deliberately — a derivation
+# would have to re-implement or import the gate's keyword extractor, and that
+# extractor is one of the failure modes this row exists to catch (the row's own
+# remedy tells a reader to distinguish "empty matches beside populated keywords"
+# = corpus, from an extractor fault). A constant cannot drift silently either,
+# because the check below asserts the probe reason still contains the phrase.
+_V6_FIXTURE_PHRASE = "commit and push"
+_V6_FIXTURE_TOKENS = ("commit", "push")
+
+
+def _capability_fixture_vocabulary_present(script_name: str,
+                                           args: "tuple[str, ...]") -> "str | None":
+    """None when V-6's fixture still has vocabulary in the loaded capability corpus.
+
+    THE THIRD FIXTURE GUARD, AND THE ONE g-318-167 REFUSED TO SHIP FIRST TIME.
+    The obvious wiring was `gates.capability.evaluate()` — importable, documented as
+    extracted for other callers, and WRONG: it is the gate's whole decision, so a
+    check built on it returns exactly what the subprocess drive returns, every genuine
+    death is relabelled unevaluatable, and the row goes silent forever (guard-7228).
+    This predicate is strictly narrower — it reads only the SOURCES the decision loads
+    its match terms from, never the matcher, the extractor, or the verdict.
+
+    Name a way the gate can be broken while this returns None, which is the test that
+    separates a check from a mask: the keyword extractor breaks, `--failure-reason` is
+    renamed, the rc convention flips, `_find_matches` breaks, the noise-phrase list
+    swallows the reason, or the corpus fails to load. EVERY one of those still reaches
+    a DEAD verdict, because none of them changes whether commit-and-push is CATALOGUED.
+    And the converse: someone rewords the capability-routing row out from under the
+    fixture while the gate is perfectly healthy — only that returns a complaint.
+
+    AN EMPTY CORPUS RETURNS None ON PURPOSE, and this is the load-bearing branch.
+    A world-path misresolution empties the corpus silently, the gate then approves a
+    routing it exists to refuse, and this row's remedy names that as the FIRST thing to
+    check. Under `--quiet` (the production invocation from iteration-close.sh) an
+    unevaluatable row resets its stuck counter to 0 and prints NOTHING, so calling an
+    empty corpus a rotted fixture would convert the loudest real failure this row can
+    detect into total silence. Unevaluatable is the right answer for a rotted fixture
+    and the wrong answer for a dead corpus; the emptiness test is what tells them apart.
+    """
+    try:
+        from gates.capability import (
+            _DEFAULT_SKILLS_DIR,
+            _load_capability_routing,
+            _load_forged_skills,
+            _load_skill_md_triggers,
+        )
+    except Exception as exc:
+        return f"the capability corpus loaders could not be imported ({exc})"
+
+    reason = None
+    if "--failure-reason" in args:
+        i = args.index("--failure-reason")
+        if i + 1 < len(args):
+            reason = args[i + 1]
+    if reason is None:
+        return (f"{script_name}'s probe args carry no --failure-reason, so this row's "
+                "fixture cannot be checked against the capability corpus")
+    if _V6_FIXTURE_PHRASE not in reason.lower():
+        return (f"this row's probe reason {reason!r} no longer contains "
+                f"{_V6_FIXTURE_PHRASE!r}, which is the one corpus fact the fixture "
+                "guard pins — the probe was edited without updating "
+                "_V6_FIXTURE_PHRASE/_V6_FIXTURE_TOKENS beside it")
+
+    world = Path(WORLD_DIR) if WORLD_DIR else None
+    try:
+        entries = (_load_forged_skills(world)
+                   + _load_skill_md_triggers(_DEFAULT_SKILLS_DIR)
+                   + _load_capability_routing(world))
+    except Exception as exc:
+        return f"the capability corpus could not be loaded ({exc})"
+    if not entries:
+        # NOT a fixture problem — see the docstring. Say nothing and let the row
+        # reach its DEAD verdict, which is the alarm a human needs here.
+        return None
+
+    blob = " ".join(
+        " ".join(str(v) for v in e.values() if isinstance(v, str))
+        + " " + " ".join(str(t) for t in (e.get("triggers") or []))
+        + " " + " ".join(str(s) for s in (e.get("scripts") or []))
+        for e in entries if isinstance(e, dict)
+    ).lower()
+    missing = [t for t in _V6_FIXTURE_TOKENS if t not in blob]
+    if not missing:
+        return None
+    return (f"the capability corpus loaded {len(entries)} entr(ies) but none mentions "
+            f"{missing} — {_V6_FIXTURE_PHRASE!r} is no longer catalogued as "
+            "agent-provisionable, so a non-trip here is the CORRECT answer and says "
+            "nothing about the gate. The corpus moved under the fixture: fix this "
+            "row's probe reason, not the gate")
 
 
 SIGNALS: list[dict] = [
@@ -498,6 +890,7 @@ SIGNALS: list[dict] = [
             ("--claim-text", "this capability is not built and does not exist anywhere",
              "--tiers-used", "tree", "--queries-count", "1"),
             "is not built",
+            fixture_check=_trigger_fixture_still_trips,
         ),
         "remedy": (
             "Read trigger_matched in the emitted JSON. Null on this input means the trigger "
@@ -515,6 +908,7 @@ SIGNALS: list[dict] = [
             ("--claim-text", "the operator service is down and not responding",
              "--signals-count", "1"),
             "is down",
+            fixture_check=_trigger_fixture_still_trips,
         ),
         "remedy": (
             "Read trigger_matched in the emitted JSON. Null means 'is down' stopped matching. "
@@ -531,6 +925,7 @@ SIGNALS: list[dict] = [
              "--file-probed", "core/config/aspirations.yaml",
              "--field-probed", "utilization", "--probe-result", "missing"),
             "0 records have",
+            fixture_check=_trigger_fixture_still_trips,
         ),
         "remedy": (
             "Read trigger_matched. This is the one gate of the four that DOES have a test "
@@ -548,6 +943,7 @@ SIGNALS: list[dict] = [
             "positive-state-gate.py",
             ("--claim", "handoff.yaml reflects session 50", "--evidence", ""),
             "handoff.yaml reflects",
+            fixture_check=_trigger_fixture_still_trips,
         ),
         "remedy": (
             "Read trigger_matched and paths_extracted in the emitted JSON. rc=0 with EMPTY "
@@ -580,6 +976,7 @@ SIGNALS: list[dict] = [
             "marker-placement-gate.py",
             _marker_placement_probe_payload(),
             "every marker placement it exists to refuse",
+            fixture_check=_marker_fixture_still_must_deny,
         ),
         "remedy": (
             "An empty stdout means the gate approved a placement it exists to refuse. Check "
@@ -608,6 +1005,7 @@ SIGNALS: list[dict] = [
             ("--failure-reason", "blocked on user to commit and push the change",
              "--intended-participants", "user", "--output", "json"),
             "commit and push",
+            fixture_check=_capability_fixture_vocabulary_present,
         ),
         "remedy": (
             "rc=0 here means the gate APPROVED a routing it exists to refuse, so every "
@@ -650,6 +1048,7 @@ SIGNALS: list[dict] = [
             {"tool_name": "ScheduleWakeup",
              "tool_input": {"prompt": "/aspirations loop", "delaySeconds": 600}},
             "every slash-prefix prompt it exists to refuse",
+            fixture_check=_swakeup_fixture_still_must_deny,
         ),
         "remedy": (
             "An empty stdout means the gate would now APPROVE a slash-prefix prompt it "
@@ -660,6 +1059,33 @@ SIGNALS: list[dict] = [
             "drift kills BOTH layers at once and neither says so. Then check whether the "
             "payload keys this gate reads (tool_name / tool_input.prompt) still match what "
             "the harness sends. Do NOT read rc: this hook exits 0 on deny AND on approve."
+        ),
+    },
+    {
+        "name": "blocker-create-gate-schema-probe",
+        "what": (
+            "blocker-create-gate.py check 3, the CREATE_BLOCKER Step 2.55 refusal of a "
+            "statistical negation filed without schema_probe_evidence (rb-245)"
+        ),
+        "evidence": "schema_probe's own passed flag in checks[], for a must-trip blocker JSON on stdin",
+        # The first PRODUCT-PATH row of : if this refusal dies, a blocker built
+        # on an unverified "0 records have X" is filed, and the goals it blocks stop for
+        # a reason nothing ever checked. rc=1 alone would also be carried by a sibling
+        # check, so the row reads schema_probe's own entry (guard-1082).
+        "assertion": _gate_trigger_assertion(
+            "blocker-create-gate.py",
+            (),
+            "a statistical negation without schema_probe_evidence",
+            fixture_check=_stat_neg_fixture_check(BLOCKER_STAT_NEG_PAYLOAD),
+            stdin_text=json.dumps(BLOCKER_STAT_NEG_PAYLOAD),
+            refusal_check=_named_check_refused("schema_probe"),
+        ),
+        "remedy": (
+            "Read checks[] in the emitted JSON. schema_probe passed:true on this payload "
+            "means _check_schema_probe no longer refuses a statistical negation without "
+            "schema_probe_evidence. Check gates/blocker_create._STAT_NEG_PATTERNS first: an "
+            "EMPTY table reports DEAD here on purpose. The row reads schema_probe's own "
+            "entry, so a sibling check failing on this payload cannot hide a dead check 3."
         ),
     },
 ]

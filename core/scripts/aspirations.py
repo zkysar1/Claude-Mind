@@ -36,7 +36,26 @@ EVOLUTION_PATH = META_DIR / "evolution-log.jsonl"
 
 
 VALID_ASP_STATUSES = {"active", "paused", "completed", "retired"}
-VALID_GOAL_STATUSES = {"pending", "in-progress", "completed", "blocked", "skipped", "expired", "decomposed", "superseded"}
+
+# ⚠ DO NOT INLINE. This set is MIRRORED in two daemon modules, and both are
+# REFUSAL GATES — a value missing there makes the daemon reject the write or the
+# query even though this SSOT accepts it (guard-130):
+#   - mind_api/src/endpoints/aspirations_write.py :: _VALID_GOAL_STATUSES
+#   - mind_api/src/endpoints/aspirations_query.py :: VALID_GOAL_STATUSES
+# Before editing this line, grep both. Parity is pinned by
+# tests/test_valid_goal_statuses_mirror_parity.py.
+#
+# `candidate` (, B1 per world/conventions/goal-intake-management.md §2,
+# BINDING) is an INTAKE state: filed but not yet groomed into the executable
+# queue. It is NOT terminal — deliberately absent from TERMINAL_GOAL_STATUSES
+# below, so a candidate counts as REMAINING work in every non-terminal tally.
+# It ships DARK: no writer emits it yet (routing is B2, default OFF). The enum
+# must land first because these three mirrors REFUSE the value, so B2 cannot be
+# built or tested against a store that rejects its writes (guard-334's writer-
+# first rule is satisfied in order, not waived — the writer is blocked on this).
+# Backfill sweep at landing: 0 goals carried `candidate` in the world store and
+# 0 in the agent store — a MEASURED zero, not an unrun sweep (guard-334).
+VALID_GOAL_STATUSES = {"pending", "in-progress", "completed", "blocked", "skipped", "expired", "decomposed", "superseded", "candidate"}
 
 # Terminal goal statuses — goals in these states are considered resolved for archival purposes.
 # `superseded` means the goal was mooted by aspiration-level intent satisfaction (see cmd_complete --intent-satisfied).
@@ -300,8 +319,53 @@ def _emit_description_length_warning(goal, source):
 
 VALID_SCOPES = {"sprint", "project", "initiative"}
 ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (companion to GOAL_ID_RE xw branch below)
-GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d{2,5}(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # 5-digit:  hit  (2026-09-15), 4-digit:  (2026-05-19); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d+(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # SEQUENCE IS OPEN-ENDED (guard-1161) — it is a growing counter and every bound on it expired in production:  (2026-05-19),  (2026-09-15), each a fleet-wide filing outage. Do NOT re-bound it. The ASPIRATION half stays \d{3} (different axis, nowhere near a ceiling); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# The width at and above which a sequence crossing is worth announcing. Below
+# it, crossings are routine (every aspiration passes 2->3 and 3->4 digits) and a
+# warning would be pure noise. At 5+ it is the real frontier:  crossed
+# 4->5 at  and the NEXT crossing (5->6) is the first one that can
+# break a bounded sibling living OUTSIDE this tree.
+_SEQ_WIDTH_WARN_AT = 5
+
+
+def _warn_on_seq_width_growth(asp_id: str, max_seq: int, new_seq: int) -> None:
+    """Emit a degraded-band signal when a goal-id sequence GAINS A DIGIT.
+
+    F-002 of g-115-10003, and the half that decides whether there is a fourth
+    outage. Under an open-ended ``\\d+`` this allocator has no ceiling of its
+    own, so a "headroom to the limit" check has nothing to measure. What is
+    still worth watching is the GROWTH CURVE: the remaining hazard is a bounded
+    SIBLING somewhere this tree does not reach — world/scripts (not git-carried,
+    read ``\\d{1,5}`` as of 2026-09-15), a downstream seed, a peer deployment
+    not yet widened. A width crossing is the earliest moment any of those can
+    break, and it is precisely the signal both prior outages lacked: g-115-999
+    (2026-05-19) and g-115-9999 (2026-09-15) each arrived with NO degraded band,
+    so the first symptom was a fleet-wide filing refusal.
+
+    Warns on the CROSSING only, never on every mint at a width, so asp-115 --
+    already past 10,000 -- stays silent until g-115-100000.
+
+    Stderr only, and never raises: a mint must not fail because a warning could
+    not be written (guard-1562 -- stopping a healthy path on a plumbing fault is
+    worse than the disease). Mirror of the daemon twin in
+    mind_api/src/endpoints/aspirations_write.py (guard-742: port both together).
+    """
+    try:
+        old_w, new_w = len(str(max_seq)), len(str(new_seq))
+        if new_w > old_w and new_w >= _SEQ_WIDTH_WARN_AT:
+            print(
+                f"[goal-id-width] {asp_id}: sequence crossed into {new_w} digits "
+                f"(previous max {max_seq}, minting {new_seq}). Goal-id SEQUENCE "
+                f"regexes must be open-ended \\d+ (guard-1161). Re-run "
+                f"core/scripts/tests/test_goal_id_five_digit_seq.py and sweep for "
+                f"bounded siblings outside the framework tree (world/scripts, "
+                f"downstream seeds, peer deployments).",
+                file=sys.stderr,
+            )
+    except Exception:  # noqa: BLE001 - a warning must never break allocation
+        pass
 
 # Single source of truth for the `add` (aspiration) and `add-goal` schemas —
 
@@ -1509,9 +1573,14 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
     # any goal carrying an evicted id.
     live_ids = [g.get("id", "") for g in target_asp.get("goals", [])]
     for gid in live_ids + _all_evicted_ids(target_asp):
-        match = re.match(r"^g-\d{3}-(\d{2,5})", gid)
+        match = re.match(r"^g-\d{3}-(\d+)", gid)  # OPEN-ENDED, and load-bearing (guard-2414):
+        # a capped capture on a LONGER id does not fail, it reads the leading digits as a
+        # smaller number — `(\d{2,5})` on  returns 10000, so max+1 re-mints a
+        # live id onto the shared store. The bound here must never be narrower than
+        # GOAL_ID_RE's; test_goal_id_five_digit_seq pins that coupling.
         if match:
             max_seq = max(max_seq, int(match.group(1)))
+    _warn_on_seq_width_growth(target_asp_id, max_seq, max_seq + 1)
     new_goal_id = f"g-{asp_num}-{max_seq + 1:02d}"
 
     unblock_goal = {
@@ -2118,10 +2187,15 @@ def cmd_update_goal(args):
                         _rw_live_ids = [g.get("id", "")
                                         for g in _rw_target.get("goals", [])]
                         for gid in _rw_live_ids + _all_evicted_ids(_rw_target):
-                            m = re.match(r"^g-\d{3}-(\d{2,5})", gid)
+                            # OPEN-ENDED (guard-1161/guard-2414): a capped capture
+                            # on a longer id silently re-mints a live id.
+                            m = re.match(r"^g-\d{3}-(\d+)", gid)
                             if m:
                                 _rw_max_seq = max(_rw_max_seq,
                                                   int(m.group(1)))
+                        _warn_on_seq_width_growth(
+                            _rw_target.get("id", ""), _rw_max_seq,
+                            _rw_max_seq + 1)
                         _rw_new_id = f"g-{_rw_asp_num}-{_rw_max_seq + 1:02d}"
                         _rw_goal = _rw_build_successor(
                             goal_id, rw_result, _rw_new_id)
@@ -2234,6 +2308,31 @@ def cmd_update_goal(args):
                   f"resurface it when the dependency lands (guard-1690).",
                   file=sys.stderr)
             sys.exit(1)
+
+        # requires_capability VOCABULARY REFUSAL on the UPDATE path ().
+        # CLI half of a twin (guard-2323/guard-742); the LIVE half is
+        # aspirations_write.py::_run_update_goal_gates, which carries the full
+        # rationale and the measurements. Both must stay in sync, and both read
+        # the one SSOT hint from the gate module rather than a hand-typed copy.
+        #
+        # FIELD-SCOPED, NOT RECORD-SCOPED: it evaluates the INCOMING VALUE as a
+        # synthetic one-field goal, never the stored record, so a legacy carrier's
+        # status write never reaches this branch. That is what makes it safe to
+        # add here while the gate module's "ADD SITES ONLY, never inside
+        # _validate_goal" constraint stays intact and honoured.
+        #
+        # Clearing (None / "" / []) stays open — it is the unstick path.
+        # No override flag, matching the gate module's deliberate choice.
+        if field == "requires_capability" and value not in (None, "", []):
+            try:
+                from gates.capability_vocab import (
+                    evaluate as _cap_vocab_eval, LOCUS_ROUTING_HINT as _cap_hint)
+                _cv = _cap_vocab_eval({"id": goal_id, "requires_capability": value})
+            except Exception:
+                _cv = None  # fail OPEN — a gate that cannot run must not block
+            if _cv and _cv.get("would_block"):
+                print((_cv.get("message") or "") + _cap_hint, file=sys.stderr)
+                sys.exit(1)
 
         # Routing-target validation () — Layer 0, FIELD-triggered.
         # CLI half of a twin (guard-2323); the LIVE half is

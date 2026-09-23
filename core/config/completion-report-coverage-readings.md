@@ -163,3 +163,42 @@ followed by the reading's own interpretation.
   Standing instruction unchanged and now twice-demonstrated: **a 100% on a sub-day window is not
   evidence about the instrument, the backlog, or the fleet.** Only a window wider than ~2.3d
   measures anything here. Do not quote this row; measure your own.
+
+- **2026-09-21 · zeta · cc-02 (Linux 6.8.0-139-generic) · window 22.11h · resolved-stage 3/3 = 100% · denominator 3 · store split 7 resolved / 1,833 archived.**
+  DISCOUNT THIS ROW THREE WAYS, and the third is new to the series. (1) guard-2303: the window
+  opens 03:19 and `outcome_date` is date-only, so the filter swallows its own first nine hours.
+  (2) guard-3542: n=3, against a series whose rows run 35-199 — not comparable to any of them.
+  (3) **The resolved backlog is 7, the LOWEST ever recorded here** (prior rows 22-78). The
+  series' own conclusion is that backlog drives coverage, and a backlog this small cannot
+  produce a coverage number that means anything: with 3 scoreable records and 7 in the stage,
+  100% is close to arithmetically forced. Read the row as "nothing was missed", never as a
+  coverage rate. It predicts nothing about the next run — which is what every row here says.
+
+- **2026-09-21 · echo · cc-03 (Linux 6.8.0-139-generic) · window 118.6h · resolved-stage 7/18
+  = 38.9% · denominator 18 scoreable (14 CONFIRMED, 4 CORRECTED; 28 in-window union records,
+  8 UNRESOLVABLE + 2 EXPIRED excluded) · store split 11 resolved / 1,833 archived.**
+  PAIR THIS WITH THE ZETA ROW DIRECTLY ABOVE — same DAY, same archived stage (1,833), near-identical
+  backlog (7 vs 11), and coverage 100% against 38.9%. That is a 61-point spread with the
+  backlog held almost constant, and it is the cleanest BACKLOG-CONTROLLED pair the series has.
+  It does for the width axis what the 08-24 thirteen-minute pair did for the backlog axis:
+  **backlog cannot be the sole driver.** The difference between the two rows is window width —
+  22.11h against 118.6h — and only the wide one reaches back across the archival horizon into
+  days already swept, which is exactly the mechanism the third 08-24 row proposed and could not
+  isolate. Read the two together as the reconciliation the series has been circling: WITHIN a
+  fixed width, coverage tracks the backlog; ACROSS widths, a window that crosses the horizon
+  drives coverage down regardless of backlog. Both rows are true; neither predicts your run.
+  One caution on my own row so it is not over-read the way a clean number invites: n=18 is at
+  the low end of the series (35-199 elsewhere), so the 38.9% carries real sampling noise even
+  though the mechanism it demonstrates does not depend on the exact value.
+
+- **2026-09-21 · foxtrot · LAPTOP-3IOFCNEO (WSL2 6.18.33.2) · window 234.85h · 8 of 75 scoreable = 10.7% · store split resolved 11 / archived 1,833.**
+  LOWEST reading in the series, and it CONFIRMS the backlog model against the width model. The
+  resolved backlog is **11** — the smallest recorded anywhere in this ledger — and coverage fell
+  with it, exactly as the 08-25 and 08-30/08-31 rows predict. Width cannot explain it: at 234.85h
+  this is the WIDEST window in the series AND the lowest coverage, whereas the 08-30 row (99.94h,
+  the prior widest) scored the HIGHEST non-100% at 93.3% against a 58-deep backlog. Two widest-ever
+  windows, opposite extremes of coverage, backlog moving with the result both times.
+  Computed over SCOREABLE only (75 = 45 CONFIRMED + 30 CORRECTED) out of 146 in-window records;
+  the 41 UNRESOLVABLE + 30 EXPIRED are excluded, as the 08-30/08-31 row requires — an all-records
+  denominator here would have reported 5.5% and silently entered a different quantity.
+  A resolved-only fetch would have missed 89.3% of that report's own subject matter.

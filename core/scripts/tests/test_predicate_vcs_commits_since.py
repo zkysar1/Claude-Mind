@@ -154,27 +154,39 @@ def test_since_goal_last_achieved_uses_goal_timestamp(tmp_path, monkeypatch):
     _commit(repo, "a.py", "1", "2026-06-01T12:00:00")
 
     # Goal last ran BEFORE the commit → there is a new commit → pass.
-    monkeypatch.setattr(predicate, "_lookup_goal_record",
-                        lambda gid: {"lastAchievedAt": "2026-05-01T00:00:00"})
+    monkeypatch.setattr(predicate, "_resolve_goal_referent",
+                        lambda gid: ({"lastAchievedAt": "2026-05-01T00:00:00"},
+                                     "live", "completed"))
     r1 = _eval({"type": "vcs_commits_since", "id": "pc", "repo": str(repo),
                 "since_goal_last_achieved": "g-test-12"})
     assert r1.passed is True
 
     # Goal last ran AFTER the commit → no new commit → fail (the post-run state).
-    monkeypatch.setattr(predicate, "_lookup_goal_record",
-                        lambda gid: {"lastAchievedAt": "2026-07-01T00:00:00"})
+    monkeypatch.setattr(predicate, "_resolve_goal_referent",
+                        lambda gid: ({"lastAchievedAt": "2026-07-01T00:00:00"},
+                                     "live", "completed"))
     r2 = _eval({"type": "vcs_commits_since", "id": "pc", "repo": str(repo),
                 "since_goal_last_achieved": "g-test-12"})
     assert r2.passed is False
 
 
-def test_since_goal_not_found_fail(tmp_path, monkeypatch):
+def test_since_goal_not_found_is_unevaluable(tmp_path, monkeypatch):
+    """: an unresolvable cutoff referent is UNEVALUABLE, not unmet.
+
+    This branch needs the referent's TIMESTAMP as its cutoff, so neither an
+    `unknown` referent nor an `evicted` one (the census is an id set with no
+    instant) can ever be decided — re-probing it every 2h forever is the
+    defect. `evaluable=False` routes it to goal-selector's PERMANENT class.
+    Pre-fix this returned passed=False / evaluable=True ("not found")."""
     repo = _init_repo(tmp_path / "r")
-    monkeypatch.setattr(predicate, "_lookup_goal_record", lambda gid: None)
-    r = _eval({"type": "vcs_commits_since", "id": "pc", "repo": str(repo),
-               "since_goal_last_achieved": "g-missing"})
-    assert r.passed is False
-    assert "not found" in r.reason
+    for disposition in ("unknown", "evicted"):
+        monkeypatch.setattr(predicate, "_resolve_goal_referent",
+                            lambda gid, d=disposition: (None, d, None))
+        r = _eval({"type": "vcs_commits_since", "id": "pc", "repo": str(repo),
+                   "since_goal_last_achieved": "g-missing"})
+        assert r.passed is False
+        assert r.evaluable is False, (disposition, r.reason)
+        assert disposition in r.reason
 
 
 if __name__ == "__main__":

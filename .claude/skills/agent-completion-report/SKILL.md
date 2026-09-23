@@ -364,7 +364,7 @@ All data comes from framework scripts — no direct JSONL reads.
             # window is defined by `last-report-timestamp`; the baseline it diffs
             # against is this file. NOTHING guarantees they correspond, and when
             # they do not the report states a delta over the WRONG interval while
-            # looking completely normal. Two independent ways they decorrelate:
+            # looking completely normal. THREE independent ways they decorrelate:
             #   (1) a prior run wrote the timestamp and skipped this snapshot —
             #       Phase 4 step 3's `|| true` makes a skip, a failed cp and a
             #       success byte-identical after the fact;
@@ -373,6 +373,23 @@ All data comes from framework scripts — no direct JSONL reads.
             #       `machine_local` (does not) — session-manifest.yaml:397/896.
             #       A multi-box agent reporting from box B diffs against box B's
             #       last LOCAL snapshot, not against its own last report.
+            #   (3) THE INVERSE OF (1): a prior run wrote the report and skipped
+            #       the TIMESTAMP (Phase 5 step 1 — an LLM-hand-executed write,
+            #       while `lastAchievedAt`, the report mtime and the report
+            #       commit are all script-advanced; guard-399 is the author-side
+            #       rule this violates, and no gate exists). THE ASSERTION BELOW
+            #       IS STRUCTURALLY BLIND TO IT: a stale `since` is EARLIER, so
+            #       `snapshot_mtime < since` becomes LESS likely and the gate
+            #       passes harder the worse the defect is. The file is matched by
+            #       .gitignore `**/session/`, so there is no history either — the
+            #       ONLY detector is the Phase-1 step 1b confirmation against the
+            #       report file's mtime + git log, which is why that step exists.
+            #       MEASURED 2026-09-22 (echo, cc-03, g-001-04): marker
+            #       2026-09-21T12:40:31 against report mtime 2026-09-22T00:01:33,
+            #       commit 67dab07ff4 at 00:03:20 and lastAchievedAt 00:03:10 —
+            #       three clocks within two minutes, the marker 11.3h behind.
+            #       Reporting from it would have re-counted the prior report's own
+            #       11.6h of deltas as new. ALWAYS run step 1b's confirmation.
             # MEASURED 2026-08-24 (foxtrot, LAPTOP-3IOFCNEO): baseline
             # updated_at 2026-08-21T03:16:14 / mtime Aug 21 03:53 against a
             # last-report-timestamp of 2026-08-22T16:53:06 — a 3-DAY baseline

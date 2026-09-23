@@ -197,6 +197,15 @@ GOAL_KNOWN_FIELDS = frozenset({
     'resolves_by',                       # 196
     'resolves_no_earlier_than',          # 194
     'revenue_link',                      # 29
+    # g-115-6721 (zeta, 2026-09-23): the async Review Gate's two fields,
+    # documented in goal-schemas.md 'Review Gate Fields' (rule (b) above) and
+    # READ by aspirations-all-blocked Step B0 ('goal has review_requested but
+    # NOT review_completed'). They were never registered, so the Phase 5.7
+    # write was refused and B0 skipped every review-request post: 0 of 3,407
+    # live world goals carried either field while 8 review-requests were
+    # posted in 14 days. As with member_writable, the zero is the finding.
+    'review_completed',                  # 0 (unwritable until registered)
+    'review_requested',                  # 0 (unwritable until registered)
     'sandbox',                           # 17
     'sessions_active',                   # 1
     'skill',                             # 378

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PostToolUse hook — plan-completion verdict reminder (two harness shapes).
+"""PostToolUse hook — plan-completion verdict reminder (plan-mode approval).
 
 Plants the completion obligation in the model's recent context mechanically,
 so delivering the verdict does not depend on the model remembering a rule
@@ -7,36 +7,47 @@ under context pressure (2026-09-05 observation: agents end plan execution on
 "plan finished", leave the plan in place, and never answer the question the
 user originally asked). The always-loaded rule is
 .claude/rules/plan-completion-verdict.md; this hook is its mechanical booster
-at the structural moments each harness exposes:
+at the one structural moment a harness exposes to a hook:
 
-* ExitPlanMode (Claude Code plan mode) — the APPROVAL gate. Nothing marks
+* ExitPlanMode — the APPROVAL gate. Nothing on the hook surface marks
   execution's END, so the reminder is planted at its START.
-* A task-network plan tool (settings.json matcher `update_plan`; on the wire
-  the tool is named by its Claude Code counterpart, `TodoWrite`, and the
-  payload carries the tool's rendered `output`). Its rendered header is
-  `Current plan (F/T steps done):`, and F == T is exactly the network's
-  completion predicate (terminal leaves over all leaves), so the reminder
-  fires at the moment the plan COMPLETES — once. "Plan cleared." renders no
-  header, so an explicit clear cannot re-trigger it. The reminder does NOT ask
-  for that clear: since Zak-Code ADR-0108 (2026-09-05) the harness itself
-  retires a complete plan (one-line reminder to the model, collapsed row in
-  every UI), so the model's only remaining obligation is the verdict. A payload
-  without `output` (a Claude Code TodoWrite, should anyone route it here) is
-  silent by construction.
+
+WHY THERE IS NO PLAN-TOOL BRANCH (retired 2026-09-21). From 2026-09-05 this
+hook also matched a task-network plan tool (settings.json matcher
+`update_plan`, wire name `TodoWrite`) and fired when the tool's result showed
+every step done. It found that moment by parsing the harness's PROSE: a header
+line shaped "Current plan (F/T steps done):". Five days later the harness
+stopped echoing the plan and returned a one-line receipt instead (Zak-Code
+ADR-0124, 2026-09-10), and the branch never fired again. Nothing went red,
+because this hook's own tests fed it the old render, which no harness was
+sending any more (guard-920: a fixture must carry the production shape).
+Measured 2026-09-21: the harness's real wire payload for a finished plan left
+the hook silent while the old render still fired it, and 0 of 284 plan-tool
+results across four served runs carried the reminder.
+
+Retired rather than repaired, because the HARNESS owns that moment. A harness
+that keeps a plan knows when it completes without parsing anything, and
+Zak-Code already speaks at that moment itself: its ADR-0108 closing line
+carries the original request, never enters the persisted history, and is
+withheld while a turn-end hook governs the turn. That last part is measured:
+a line asking for the closing answer inside such a turn made a small model
+stop a second time in 18 of 116 rollouts, against 0 of 116 without it
+(Zak-Code bench/results/veto-door-preregistration.log, ADR-0205). A repaired
+branch would have written that same ask into the PERSISTED tool result on
+every finished plan of an autonomous loop. Do not re-add a branch that reads a
+harness's rendered text: a reminder a harness needs at its own plan's end
+belongs in the harness, keyed on its own state. A plan tool's payload now
+falls through the different-tool guard below and is silent.
 
 Output contract: hookSpecificOutput.additionalContext per Claude Code's
 PostToolUse format. Empty stdout + exit 0 = nothing injected.
 
 SAFETY: fail open on ANY error. Never exits non-zero. Never emits malformed
-JSON. The settings.json matchers are the real gate; the tool_name checks
-below are defensive no-op guards.
+JSON. The settings.json matcher is the real gate; the tool_name check
+below is a defensive no-op guard.
 """
 import json
-import re
 import sys
-
-PLAN_TOOL_NAMES = ("TodoWrite", "update_plan")
-_PLAN_HEADER_RE = re.compile(r"^Current plan \((\d+)/(\d+) steps done\):", re.M)
 
 REMINDER = (
     "<system-reminder>\n"
@@ -54,34 +65,6 @@ REMINDER = (
     "Rule: .claude/rules/plan-completion-verdict.md\n"
     "</system-reminder>"
 )
-
-COMPLETE_REMINDER = (
-    "<system-reminder>\n"
-    "[plan-completion-verdict] Plan COMPLETE — every step is terminal. The plan\n"
-    "was a MEANS, not the deliverable. Before you end this turn:\n"
-    "  1. Do NOT restate the plan or its steps, and do not call update_plan\n"
-    "     again — the harness has retired the finished checklist.\n"
-    "  2. RE-READ the user's ORIGINAL request — the message that started this\n"
-    "     task, not the last step's title.\n"
-    "  3. ANSWER that original request with a conclusion/verdict, leading with\n"
-    "     the answer. The steps are supporting detail, not the headline.\n"
-    "NEVER end on \"plan finished\" / \"all steps complete\" / \"no further action\n"
-    "needed\" — that hands the user a finished checklist and an unanswered question.\n"
-    "Rule: .claude/rules/plan-completion-verdict.md\n"
-    "</system-reminder>"
-)
-
-
-def _plan_just_completed(payload: dict) -> bool:
-    """True iff a task-network plan tool's rendered output shows F/T with F == T > 0."""
-    output = payload.get("output")
-    if not isinstance(output, str):
-        return False
-    m = _PLAN_HEADER_RE.search(output)
-    if not m:
-        return False
-    finished, total = int(m.group(1)), int(m.group(2))
-    return total > 0 and finished == total
 
 
 def _emit(text: str) -> None:
@@ -101,8 +84,8 @@ def main() -> int:
         raw = sys.stdin.read()
     except Exception:
         raw = ""
-    # Defensive: the settings.json matchers are the real gate. Only no-op when the
-    # payload positively names a DIFFERENT tool.
+    # Defensive: the settings.json matcher is the real gate. Only no-op when the
+    # payload positively names a DIFFERENT tool (a plan tool's included).
     payload: dict = {}
     try:
         parsed = json.loads(raw) if raw.strip() else None
@@ -110,10 +93,6 @@ def main() -> int:
     except Exception:
         payload = {}
     tool_name = payload.get("tool_name")
-    if tool_name in PLAN_TOOL_NAMES:
-        if _plan_just_completed(payload):
-            _emit(COMPLETE_REMINDER)
-        return 0
     if tool_name and tool_name != "ExitPlanMode":
         return 0
     _emit(REMINDER)

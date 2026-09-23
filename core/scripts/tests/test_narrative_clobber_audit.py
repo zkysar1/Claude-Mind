@@ -43,10 +43,14 @@ warns about, so `test_marker_constants_match_the_bash_twin` is a drift tripwire:
 if either side re-spells the token, this fails rather than one side silently
 exempting things the other does not.
 """
+import gc
 import importlib.util
+import json
 import pathlib
 import re
 import sys
+import types
+import weakref
 
 import pytest
 
@@ -278,5 +282,245 @@ def test_exit_code_and_footer_key_on_clobbered_only():
     assert "return 1 if clob else 0" in src
 
 
+# ------------------------------------------------------------------ memory
+
+class _Snapshot:
+    """A restored snapshot the test can COUNT. A str cannot be weak-referenced, so
+    the fake restore hands main() this instead: load() passes non-bytes through
+    unchanged, and the audit only ever calls .splitlines() on what it loaded."""
+    live = weakref.WeakSet()
+
+    def __init__(self, text):
+        self.text = text
+        _Snapshot.live.add(self)
+
+    def splitlines(self):
+        return self.text.splitlines()
+
+
+# Oldest -> newest writes: (goal, the progress_note the write leaves behind).
+_WRITES = [
+    ("g-1-1", "alpha"),                 # new
+    ("g-1-2", "one"),                   # new
+    ("g-1-1", "alpha beta"),            # preserved
+    ("g-1-2", "two"),                   # CLOBBERED
+    ("g-1-1", "gamma"),                 # CLOBBERED
+    ("g-1-1", "alpha beta, restored"),  # restored: re-inserts an older value
+    ("g-1-2", "two three"),             # preserved
+    ("g-1-1", "zeta"),                  # newest: its post-state is the live file, never examined
+]
+
+
+def _run_audit(monkeypatch, capsys, cache_size):
+    """main() over a synthetic .history. Returns (report, how many snapshots
+    were already resident each time a new one was restored)."""
+    state = {"g-1-1": "", "g-1-2": ""}
+    pre = []  # (snapshot name, manifest summary, PRE-write content), oldest first
+    for n, (gid, note) in enumerate(_WRITES):
+        goals = [{"id": g, "progress_note": v} for g, v in state.items()]
+        pre.append(("2026-09-22T00-00-%02d_alpha" % n,
+                    "update-goal %s progress_note" % gid,
+                    json.dumps({"id": "asp-1", "goals": goals})))
+        state[gid] = note
+    snaps = [types.SimpleNamespace(name=name) for name, _, _ in reversed(pre)]
+    summaries = {name: summary for name, summary, _ in pre}
+    contents = {name: content for name, _, content in pre}
+    resident = []
+
+    def restore(target, name, base):
+        resident.append(len(_Snapshot.live))
+        return _Snapshot(contents[name])
+
+    monkeypatch.setattr(nca, "SNAPSHOT_CACHE", cache_size)
+    monkeypatch.setattr(nca._history_store, "restore", restore)
+    monkeypatch.setattr(nca, "_summary", lambda p: summaries[p.name])
+    monkeypatch.setattr(nca.H, "resolve_target", lambda f: "target")
+    monkeypatch.setattr(nca.H, "resolve_base_dir", lambda t: "base")
+    monkeypatch.setattr(nca.H, "_find_history_snapshots", lambda t: snaps)
+    monkeypatch.setattr(nca.H, "parse_snapshot_name", lambda n: (n[:19], "alpha"))
+    monkeypatch.setattr(sys, "argv", ["narrative-clobber-audit.py", "--examine", "100", "--json"])
+    gc.collect()
+    assert not _Snapshot.live, "an earlier run left restored snapshots alive"
+    nca.main()
+    return json.loads(capsys.readouterr().out), resident
+
+
+def test_resident_snapshots_are_bounded_and_verdicts_unchanged(monkeypatch, capsys):
+    """The cache used to keep one whole-store copy for every snapshot it ever
+    loaded, and one copy of the goal store is 29 MB on disk: `--examine 400`
+    reached 4.9 GB and then 7.4 GB on cc-13 (2026-09-22) and was OOM-killed both
+    times. Bounded, at most SNAPSHOT_CACHE copies may be resident, and the report
+    must match the unbounded cache's exactly — including the restored row, whose
+    lookback loads a THIRD snapshot in the middle of a row."""
+    bound = nca.SNAPSHOT_CACHE  # read before _run_audit monkeypatches it
+    bounded, seen = _run_audit(monkeypatch, capsys, bound)
+    unbounded, seen_all = _run_audit(monkeypatch, capsys, 10 ** 9)
+    assert [r["verdict"] for r in bounded["rows"]] == [
+        "preserved", "restored", "CLOBBERED", "CLOBBERED", "preserved", "new", "new"]
+    assert bounded == unbounded, "bounding the cache changed the report"
+    assert max(seen) + 1 <= bound, seen
+    # Positive control: unbounded, the counter DOES see copies pile up, so the
+    # bound asserted above is a measurement and not a vacuous pass.
+    assert max(seen_all) + 1 > bound, seen_all
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+# ------------------------------------------------ the rotation exemption ( lane)
+#
+# THE THIRD SANCTIONED WRITE. goal-field-append.py bounds an oversize note by
+# moving its OLDEST blocks to an archive sink and PREPENDING a notice, so the
+# pre-write text stops being a substring and the row read as total loss.
+# guard-6715 records this same false positive for the hand-executed FOLD and
+# patches the READER; these pin the DETECTOR for the AUTOMATIC rotation, which
+# recurs on every note crossing GOAL_NOTE_ROTATE_BYTES, fleet-wide.
+#
+# Same asymmetry as the marker tests above: this is an EXEMPTER, so the tests
+# that matter most are the ones asserting it does NOT fire.
+
+import _paths as _paths_mod
+
+
+def _sink(tmp_path, gid, field):
+    d = tmp_path / "audit-reports" / "goal-note-archive"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / ("%s.%s.md" % (gid, field))
+
+
+def _rotated_pair(sink_path):
+    """(pre, post) for a rotation: pre fails containment, post opens with the notice."""
+    pre = "OLDEST BLOCK\n\n[appended:a]\n\nNEWEST BLOCK\n\n[appended:b]"
+    post = ("%s 2026-09-22T12:49:10: the 1 oldest block(s) (99 bytes) were moved to "
+            "%s to keep this field readable. Nothing was deleted — read them there."
+            "\n\nNEWEST BLOCK\n\n[appended:b]" % (nca.ROTATE_NOTICE_HEAD, sink_path))
+    return pre, post
+
+
+def test_rotation_notice_constant_matches_the_producer():
+    """Drift tripwire, mirroring test_marker_constants_match_the_bash_twin.
+
+    Two consumers of one literal: if goal-field-append.py re-spells the notice,
+    this fails loudly rather than the audit silently re-flagging every rotation.
+    """
+    src = (_SCRIPTS / "goal-field-append.py").read_text(encoding="utf-8")
+    assert 'ROTATE_NOTICE_HEAD = "%s"' % nca.ROTATE_NOTICE_HEAD in src, (
+        "the audit and goal-field-append.py disagree on the rotation notice head; "
+        "every rotation would be re-reported as a clobber")
+
+
+def test_verified_rotation_is_reclassified(tmp_path, monkeypatch):
+    """Positive control. Without this, every negative below is vacuous."""
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    s = _sink(tmp_path, "g-1-1", "progress_note")
+    s.write_text("archived blocks", encoding="utf-8")
+    pre, post = _rotated_pair(s)
+    v, why = nca._classify(pre, post, {}, gid="g-1-1", field="progress_note")
+    assert v == "rotated", why
+    assert "archive verified" in why
+
+
+def test_rotation_with_missing_archive_stays_clobbered(tmp_path, monkeypatch):
+    """THE one that must never go green by accident.
+
+    A notice ASSERTING an archive is a claim, not evidence (guard-6715,
+    archive-before-delete.md step 4). No file on disk => real potential loss.
+    """
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    s = _sink(tmp_path, "g-1-1", "progress_note")      # path derived, file NOT written
+    pre, post = _rotated_pair(s)
+    v, why = nca._classify(pre, post, {}, gid="g-1-1", field="progress_note")
+    assert v == "CLOBBERED"
+    assert "MISSING archive" in why
+
+
+def test_rotation_header_quoted_in_prose_does_not_exempt(tmp_path, monkeypatch):
+    """guard-4015 anchoring: a note EXPLAINING rotation must not exempt itself.
+
+    This is not hypothetical — the goal note that motivated this branch quotes
+    the header verbatim while describing the mechanism.
+    """
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    s = _sink(tmp_path, "g-1-1", "progress_note")
+    s.write_text("archived blocks", encoding="utf-8")
+    post = ("I am explaining the mechanism: goal-field-append.py prepends "
+            "%s <ts>: ... were moved to %s ... when a note gets too large."
+            % (nca.ROTATE_NOTICE_HEAD, s))
+    v, _ = nca._classify("OLDEST BLOCK\n\n[appended:a]", post, {},
+                         gid="g-1-1", field="progress_note")
+    assert v == "CLOBBERED"
+
+
+def test_rotation_naming_another_goals_archive_does_not_exempt(tmp_path, monkeypatch):
+    """Conjunct 3: a header copied from another goal's note must not borrow
+    that goal's archive to exempt THIS row."""
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    other = _sink(tmp_path, "g-9-9", "progress_note")
+    other.write_text("someone else's archive", encoding="utf-8")
+    pre, post = _rotated_pair(other)
+    v, why = nca._classify(pre, post, {}, gid="g-1-1", field="progress_note")
+    assert v == "CLOBBERED"
+    assert "does not name this goal" in why
+
+
+def test_rotation_without_gid_or_field_stays_clobbered(tmp_path, monkeypatch):
+    """The default-argument path: an unidentified row cannot be verified, so it
+    must fail to the loud side rather than exempt on the header alone."""
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    s = _sink(tmp_path, "g-1-1", "progress_note")
+    s.write_text("archived blocks", encoding="utf-8")
+    pre, post = _rotated_pair(s)
+    v, why = nca._classify(pre, post, {})          # no gid/field
+    assert v == "CLOBBERED"
+    assert "cannot verify" in why
+
+
+# -- the persistence trap: THE notice survives every later write (alpha cc-04 06:30) --
+#
+# rotate_oversize PREPENDS its notice, so a field that rotated once carries the
+# marker forever. "Does post carry the marker?" answers "has this field EVER
+# rotated?", never "was THIS write the rotation". Keying on presence alone is a
+# FALSE GREEN — it clears a GENUINE clobber of a previously-rotated field, the
+# one direction an exempter must never fail in. The discriminator is the STAMP
+# DELTA: a rotation writes a NEW notice.
+
+OLD_STAMP = "2026-09-01T00:00:00"
+NEW_STAMP = "2026-09-22T12:49:10"
+
+
+def _notice(stamp, sink_path):
+    return ("%s %s: the 9 oldest block(s) (99999 bytes) were moved to %s to keep "
+            "this field readable. Nothing was deleted — read them there."
+            % (nca.ROTATE_NOTICE_HEAD, stamp, sink_path))
+
+
+def test_genuine_clobber_of_a_previously_rotated_field_is_not_exempted(tmp_path, monkeypatch):
+    """THE false-green regression. Reproduced adversarially before the fix.
+
+    Field rotated long ago (notice persists at position 0, archive on disk),
+    then suffers a real read-and-concatenate clobber from a stale copy. Every
+    presence-based conjunct passes; only the stamp delta catches it.
+    """
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    s = _sink(tmp_path, "g-1-1", "progress_note")
+    s.write_text("blocks archived by the PAST rotation", encoding="utf-8")
+    head = _notice(OLD_STAMP, s)
+    pre = head + "\n\nblock A\n\n[appended:a]\n\nblock B\n\n[appended:b]"
+    post = head + "\n\nTOTALLY DIFFERENT TEXT that destroyed A and B"
+    v, why = nca._classify(pre, post, {}, gid="g-1-1", field="progress_note")
+    assert v == "CLOBBERED", "exempted a real clobber: %s" % why
+    assert "INHERITED" in why
+
+
+def test_a_second_rotation_advances_the_stamp_and_is_still_exempted(tmp_path, monkeypatch):
+    """Guard against over-correcting: a field CAN legitimately rotate twice, and
+    the later rotation must still be reclassified."""
+    monkeypatch.setattr(_paths_mod, "WORLD_DIR", str(tmp_path))
+    s = _sink(tmp_path, "g-1-1", "progress_note")
+    s.write_text("append-only sink, two rotations deep", encoding="utf-8")
+    pre = _notice(OLD_STAMP, s) + "\n\nblock A\n\n[appended:a]\n\nblock B\n\n[appended:b]"
+    post = _notice(NEW_STAMP, s) + "\n\nblock B\n\n[appended:b]"
+    v, why = nca._classify(pre, post, {}, gid="g-1-1", field="progress_note")
+    assert v == "rotated", why
+    assert NEW_STAMP in why

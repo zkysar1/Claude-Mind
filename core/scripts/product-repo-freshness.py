@@ -660,11 +660,17 @@ def prune_merged_local_branches(repo, default_branch, apply=False):
         if apply:
             rc_d, _, derr = _git(repo, "branch", "-D", name)
             if rc_d == 0:
+                # DELETED is terminal: it must NOT also land in `prunable`.
+                # `prunable` means "would be pruned -- rerun to delete", so a
+                # branch in both makes the banner contradict itself ("pruned 1"
+                # beside "1 prunable, rerun with --prune-branches"). Caught by
+                # the first live actuating run, not by the unit tests, which
+                # asserted `deleted` and never asserted `prunable` was empty.
                 out["deleted"].append(name)
             else:
                 out["kept"].append((name, "delete failed: %s"
                                     % (derr or "rc=%s" % rc_d)[:60]))
-                continue
+            continue
         out["prunable"].append((name, reason))
     return out
 

@@ -339,6 +339,51 @@ def test_missing_consumer_file_is_unreadable_not_silently_ok(tmp_path, monkeypat
     assert {u["consumer"] for u in r["unreadable"]} == set(cfg["consumers"])
 
 
+def _local_ancestry_git(rc):
+    """Stub _git so ONLY `merge-base --is-ancestor` carries the code under test.
+
+    The local lane needs the same two-code discrimination as `_prove_commit`
+    (g-358-190): an operator standing on a downstream box whose repository
+    lacks this world's hardcoded seam sha was told the seam was 'not an
+    ancestor of HEAD' — i.e. to pull something that does not exist.
+    """
+    def fake(*args, **kw):
+        if args[0] == "merge-base":
+            return _Proc(rc, "",
+                         "" if rc in (0, 1)
+                         else f"fatal: Not a valid commit name {args[2]}")
+        return _Proc(0, "")
+    return fake
+
+
+def test_local_lane_rc1_keeps_the_original_HEAD_reason(tmp_path, monkeypatch):
+    """POSITIVE CONTROL. A genuine 'not an ancestor of HEAD' is actionable
+    (pull) and its reason must be unchanged by the discrimination."""
+    cfg = scc.STORES[GF]
+    monkeypatch.setattr(scc, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(scc, "_git", _local_ancestry_git(1))
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
+    assert r["seam_present"] is False
+    assert r["reason"] == "seam_not_ancestor_of_HEAD"
+    assert "git_rc" not in r
+
+
+def test_local_lane_rc128_reports_the_seam_object_as_absent(tmp_path, monkeypatch):
+    """The downstream case. Same defect as _prove_commit's, same file — fixing
+    only the remote lane would leave the identical misreport on the box the
+    operator is actually standing on (guard-3080: fix the property, not the
+    instance)."""
+    cfg = scc.STORES[GF]
+    monkeypatch.setattr(scc, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(scc, "_git", _local_ancestry_git(128))
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
+    assert r["seam_present"] is False
+    assert r["reason"] == "seam_object_absent"
+    assert r["git_rc"] == 128
+    assert r["seam"] == cfg["seam_commit"][:9]
+    assert "Not a valid commit name" in r["git_error"]
+
+
 def test_a_store_without_seam_symbols_is_unaffected(tmp_path, monkeypatch):
     """The predicate is OPT-IN: a store declaring no seam_symbols keeps
     byte-identity as its SOLE predicate and must not start being gated by the
@@ -980,16 +1025,24 @@ T2_CISO = "2026-08-17T09:00:00"
 T2_CONSUMERS = ["core/scripts/a.py", "core/scripts/b.py"]
 
 
-def _t2_git(changed, blobs, ancestor_ok=True):
+def _t2_git(changed, blobs, ancestor_rc=0):
     """Drive _prove_commit's three git calls without a real repo.
 
     `blobs` maps a consumer path to its source AT THE PROOF COMMIT; a path
     absent from the map is unreadable there (`git show` rc!=0), which is the
     guard-487 branch.
+
+    `ancestor_rc` is the SPECIFIC exit code of `merge-base --is-ancestor`, not
+    a boolean (g-358-190, guard-2066): 0 = is an ancestor, 1 = genuinely is
+    not, 128 = the seam object does not resolve in this repository at all. A
+    bool could only express the first two, which is the very collapse the
+    branch under test exists to undo.
     """
     def fake(*args, **kw):
         if args[0] == "merge-base":
-            return _Proc(0 if ancestor_ok else 1, "")
+            return _Proc(ancestor_rc, "",
+                         "" if ancestor_rc in (0, 1)
+                         else f"fatal: Not a valid commit name {args[2]}")
         if args[0] == "diff":
             return _Proc(0, "\n".join(changed))
         if args[0] == "show":
@@ -1001,8 +1054,8 @@ def _t2_git(changed, blobs, ancestor_ok=True):
     return fake
 
 
-def _prove(monkeypatch, changed, blobs, seam_symbols, ancestor_ok=True):
-    monkeypatch.setattr(scc, "_git", _t2_git(changed, blobs, ancestor_ok))
+def _prove(monkeypatch, changed, blobs, seam_symbols, ancestor_rc=0):
+    monkeypatch.setattr(scc, "_git", _t2_git(changed, blobs, ancestor_rc))
     return scc._prove_commit(T2_COMMIT, T2_CISO, T2_SEAM, T2_CONSUMERS, NOW,
                              seam_symbols)
 
@@ -1084,9 +1137,69 @@ def test_tier2_is_never_reached_when_ancestry_fails(monkeypatch):
     the seam commit cannot be rescued by routing evidence."""
     r = _prove(monkeypatch, ["core/scripts/a.py"],
                {"core/scripts/a.py": "load_counters(META)\n"},
-               ["load_counters"], ancestor_ok=False)
+               ["load_counters"], ancestor_rc=1)
     assert r["proven"] is False
     assert r["reason"] == "seam_not_ancestor"
+
+
+# --- the two ancestry exit codes carry OPPOSITE instructions () ---
+#
+# `git merge-base --is-ancestor` returns 1 for "A is not an ancestor of B" and
+# 128 when an argument does not resolve to an object. A bare `!= 0` reported
+# both as `seam_not_ancestor`, which reads as the first — so every downstream
+# deployment, whose repository legitimately lacks this world's hardcoded seam
+# sha, was told to pull a commit it can never contain.
+#
+# These two tests assert the SPECIFIC codes separately (guard-2066): a single
+# `assert rc != 0` would pass on either branch and pin neither. The POSITIVE
+# CONTROL is the pair — rc=1 must still produce the unchanged reason, or a
+# "fix" that renamed every refusal would also go green.
+
+
+def test_rc1_genuinely_not_an_ancestor_keeps_the_original_reason(monkeypatch):
+    """POSITIVE CONTROL for the discrimination. The real rc=1 case is the one
+    where `pull` IS the right instruction, and it must be untouched."""
+    r = _prove(monkeypatch, [], {}, ["load_counters"], ancestor_rc=1)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_not_ancestor"
+    assert "git_rc" not in r          # no error decoration on a real answer
+    assert "git_error" not in r
+
+
+def test_rc128_absent_seam_object_reports_its_own_reason(monkeypatch):
+    """The defect. A repository that does not contain the seam object at all
+    must never be told it is merely 'not an ancestor' — there is nothing to
+    pull, ever. Measured downstream on ZDS-Mind (omni, cc-06): all three
+    STORES seam shas return `fatal: could not get object info`."""
+    r = _prove(monkeypatch, [], {}, ["load_counters"], ancestor_rc=128)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_object_absent"
+    assert r["git_rc"] == 128
+    assert "Not a valid commit name" in r["git_error"]
+    assert r["seam"] == T2_SEAM[:9]
+
+
+def test_an_unexpected_ancestry_error_code_fails_toward_absent_not_answered(monkeypatch):
+    """Robustness direction. Exit codes vary by git version (rb-3541), so the
+    branch keys on rc==1 — the documented ANSWER code — rather than rc==128.
+    Any other nonzero is an ERROR and must route to the error branch, never be
+    mistaken for a verdict of 'not an ancestor'."""
+    r = _prove(monkeypatch, [], {}, ["load_counters"], ancestor_rc=129)
+    assert r["reason"] == "seam_object_absent"
+    assert r["git_rc"] == 129
+
+
+def test_all_three_stores_carry_a_hardcoded_sha_so_the_class_is_all_three(monkeypatch):
+    """SCOPE IS THE CLASS, NOT THE gzip INSTANCE (guard-3080). The verdict is
+    produced by one shared `_prove_commit`, so the registry pin is what proves
+    the fix reaches all three: each entry declares a 40-char literal sha, which
+    is exactly the property that makes it unresolvable in a foreign repo."""
+    assert set(scc.STORES) >= {"gzip", "gate_firings", "utilization"}
+    for name in ("gzip", "gate_firings", "utilization"):
+        seam = scc.STORES[name]["seam_commit"]
+        assert len(seam) == 40 and all(c in "0123456789abcdef" for c in seam), name
+        r = _prove(monkeypatch, [], {}, None, ancestor_rc=128)
+        assert r["reason"] == "seam_object_absent", name
 
 
 def test_tier2_matches_a_bare_CONSTANT_via_kind_name(monkeypatch):

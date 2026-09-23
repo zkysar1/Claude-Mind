@@ -42,7 +42,7 @@ Every parent turn is a single `task` call ending in a **concrete word** (`spawne
 from on-disk state, so the parent conversation never accumulates cognitive content → **the loop
 scales**, and compaction is rarely even needed.
 
-## The boundary (claude-code ↔ claude-mind)
+## The boundary (claude-code ↔ the Mind framework)
 
 - **Substrate (the harness):** emits the hook/tool/lifecycle **contracts** (the seams). It records and
   exposes; it does not orchestrate or decide. The driver runs *on* these seams.
@@ -50,7 +50,7 @@ scales**, and compaction is rarely even needed.
   encoding. Uses only the standard Claude-Code contract, so it runs unchanged on Claude Code.
 
 ### Priming (the determinism thesis, one level down)
-A bare sub-agent is not a Mind agent. The driver assembles each sub-agent's claude-mind context —
+A bare sub-agent is not a Mind agent. The driver assembles each sub-agent's Mind context —
 identity + program/mission (from `world/program.md`) + research stance — **deterministically** from
 world/agent state (NOT the accumulated conversation), so each isolated worker acts AS the Mind agent
 for one bounded step.

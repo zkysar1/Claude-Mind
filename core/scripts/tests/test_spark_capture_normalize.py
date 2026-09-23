@@ -184,6 +184,70 @@ def test_non_dict_item_is_ignored(normalize):
         assert normalize(junk) is None
 
 
+# --- ROUTING KEY: `goal` is metadata, and it aliases into `goal_id` ---------
+# . Measured 2026-09-19/20 (zeta cc-02, alpha cc-04): 35 live
+# spark_capture entries carried `goal` in place of `goal_id`, 4 of them with no
+# `observation`. Two defects, one edit: (1) with `goal` outside
+# _SPARK_CAPTURE_META_KEYS a long `goal` value on an observation-less entry was
+# promoted INTO `observation` as content; (2) the goal_id-keyed drain and the
+# Phase 6.5 batch selector never saw those entries at all.
+
+GOAL_LIKE_LONG = "g-115-10421 a goal TITLE written under the routing key by mistake"
+assert len(GOAL_LIKE_LONG) >= wm._SPARK_CAPTURE_MIN_CONTENT  # the hazard shape
+
+
+def _goal_keyed(**extra) -> dict:
+    """Production shape of the 35 measured entries: `goal`, no `goal_id`."""
+    item = _entry()
+    del item["goal_id"]
+    item["goal"] = "g-306-777"
+    item.update(extra)
+    return item
+
+
+@IMPLS
+def test_goal_key_is_never_promoted_into_observation(normalize):
+    """The mis-promotion hazard, literally: observation absent, `goal` long."""
+    item = _goal_keyed(goal=GOAL_LIKE_LONG)
+    assert normalize(item) is None
+    assert "observation" not in item, "routing key promoted as CONTENT"
+    assert "observation_normalized_from" not in item
+
+
+@IMPLS
+def test_goal_key_aliases_into_goal_id(normalize):
+    item = _goal_keyed(observation=LONG)
+    assert normalize(item) is None  # observation present: no content promotion
+    assert item["goal_id"] == "g-306-777"
+    assert item["goal_id_normalized_from"] == "goal"
+    assert item["goal"] == "g-306-777", "a writer's key must be copied, not dropped"
+
+
+@IMPLS
+def test_goal_id_wins_when_both_keys_are_present(normalize):
+    item = _entry(goal="g-306-777", observation=LONG)  # goal_id  too
+    before = copy.deepcopy(item)
+    assert normalize(item) is None
+    assert item == before, "an entry that already carries goal_id must not be touched"
+
+
+@IMPLS
+def test_goal_alias_and_content_promotion_compose(normalize):
+    item = _goal_keyed(lesson=LONG)
+    assert normalize(item) == "lesson"
+    assert item["observation"] == LONG
+    assert item["goal_id"] == "g-306-777"
+    assert item["goal_id_normalized_from"] == "goal"
+
+
+@IMPLS
+def test_blank_goal_key_is_not_aliased(normalize):
+    item = _goal_keyed(goal="   ", observation=LONG)
+    assert normalize(item) is None
+    assert "goal_id" not in item
+    assert "goal_id_normalized_from" not in item
+
+
 # --- Anti-vacuity: the fixtures must actually discriminate ------------------
 
 @IMPLS
@@ -204,6 +268,10 @@ def test_twins_agree_on_every_fixture():
         _entry(observation=LONG), _entry(lesson=LONG), _entry(takeaway=LONG),
         _entry(), _entry(lesson="short"), _entry(category="x" * 200),
         _entry(observation="  ", insight=LONG),
+        #  routing-key cases
+        _goal_keyed(observation=LONG), _goal_keyed(lesson=LONG),
+        _goal_keyed(goal=GOAL_LIKE_LONG), _goal_keyed(goal="   ", observation=LONG),
+        _entry(goal="g-306-777", observation=LONG),
     ]
     for case in cases:
         a, b = copy.deepcopy(case), copy.deepcopy(case)
@@ -315,6 +383,32 @@ def test_normalization_is_scoped_to_the_spark_capture_slot(monkeypatch):
                 "normalization leaked outside spark_capture -- the cmd_append "
                 "gate is no longer slot-scoped"
             )
+        finally:
+            if original is None:
+                os.environ.pop("BODY_WM_PATH", None)
+            else:
+                os.environ["BODY_WM_PATH"] = original
+
+
+def test_append_path_aliases_goal_into_goal_id(monkeypatch):
+    """ through the real path: the STORED entry carries goal_id.
+
+    Same shape as the deviant-content case above: assert the stored entry, so
+    this fails if the cmd_append gate stops reaching the normalizer.
+    """
+    original = os.environ.get("BODY_WM_PATH")
+    with tempfile.TemporaryDirectory() as tmpd:
+        try:
+            _init_tmp_wm(Path(tmpd))
+            _cli_append("spark_capture", _goal_keyed(observation=LONG), monkeypatch)
+            stored = _slot("spark_capture")
+            assert len(stored) == 1
+            assert stored[0]["goal_id"] == "g-306-777", (
+                "the append path did not alias `goal` -- the normalizer is "
+                "correct in isolation but is not being REACHED from cmd_append"
+            )
+            assert stored[0]["goal_id_normalized_from"] == "goal"
+            assert stored[0]["goal"] == "g-306-777"
         finally:
             if original is None:
                 os.environ.pop("BODY_WM_PATH", None)

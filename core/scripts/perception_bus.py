@@ -570,7 +570,7 @@ class PerceptionBus:
 class FileTouchModule(PerceptionModule):
     """EVENT_DRIVEN: reports that a watched file changed. Convention S2.1.
 
-    The canonical listen-signal example the convention cites for claude-mind.
+    The canonical listen-signal example the convention cites for the Mind framework.
     The external poller decides WHEN to look (S3.2 lists "file-touch detection
     via poll loop" as a legitimate event source); this module decides whether
     anything actually happened, returning None when the mtime is unmoved --

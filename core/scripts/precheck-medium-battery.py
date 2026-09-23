@@ -213,6 +213,67 @@ LANES = (
         "finds": {"counts": ("cleared",), "lists": ("would_clear",), "false": ()},
     },
     {
+        # Sits beside defer-recheck deliberately: it reports the population
+        # that lane SKIPS. defer-recheck clears a defer when the goal ids it
+        # extracts have completed and records "no recognized dependency
+        # pattern" otherwise — a bucket holding both "names no dependency"
+        # (fine) and "names one the regex cannot see" (frozen until the
+        # fail-open TTL, then re-derived by a Body, forever). Report-only;
+        # guard-7217. Measured at wiring: 12 candidates over 3,035 goals.
+        "name": "defer-citation-parity-check",
+        "phase": "0.5b.4a",
+        "meter_name": "defer-citation-parity-check",
+        "script": "defer-citation-parity-check.sh",
+        "apply_flag": False,   # report-only BY DESIGN — none may be added
+        "finds": {"counts": ("flagged",), "lists": (), "false": ()},
+    },
+    {
+        # The OTHER population precondition-defer-recheck skips, and the one
+        # its own lane comment above calls out: `skipped_free_form`. The
+        # consumer for it has existed since 2026-08-09 () —
+        # defer-scope-coverage.py, with a shared vocabulary SSOT in
+        # gates/defer_scope.py, a test file, and prose in defer-routing.md —
+        # and until now it had ZERO call sites, in any battery, tier-table row
+        # or skill. Its own docstring opens "Four recheck sweeps each PRINT an
+        # exclusion count and nothing reads it"; that sentence described
+        # itself. Wiring it is , which had asked for a reader to be
+        # BUILT; one grep for the output class found the built one first.
+        #
+        # `--output json` is REQUIRED — this lane's default is human text,
+        # which json.loads would classify BLIND (same trap, same fix, as
+        # recurring-starvation-check below).
+        #
+        # total_keyable, NOT total_unkeyable, is the finding: keyable means
+        # "the shared vocabulary recognizes this defer TODAY, so a scope could
+        # be backfilled and the lane's own sweep would then reach it" — i.e.
+        # reclaimable work. total_unkeyable is the floor and would fire every
+        # iteration forever (the guard-4093 lesson blocker-recheck records
+        # above: pick the key that means work, never the key that means scope).
+        #
+        # MEASURED AT WIRING (echo, cc-03, 2026-09-22, 0.14s over three runs —
+        # it is the cheapest lane in this battery): 134 excluded defers across
+        # 5 lanes; precondition 100/13 keyable/87 unkeyable, credential
+        # 20/13/7, unrouted 14/0/14, grant reports UNEXAMINED rather than a
+        # misleading 0, user-leg measured empty.
+        #
+        # ONE DIVERGENCE, RECORDED NOT FIXED (out of this goal's scope): its
+        # sibling precondition-defer-recheck.py reads the queue through the
+        # daemon (_rt), while this consumer reads Path(WORLD_DIR)/
+        # aspirations.jsonl off the filesystem — under STORAGE_BACKEND=
+        # own-cloud that is the local read-through mirror (guard-980 /
+        # guard-3864 / rb-7918). The wrapper was verified to produce output
+        # byte-identical to a bare `py -3` run on this box, so nothing is
+        # broken here today; the two lanes simply do not draw from the same
+        # source, and a standing finding deserves the stronger one.
+        "name": "defer-scope-coverage",
+        "phase": "0.5b.4b",
+        "meter_name": "defer-scope-coverage",
+        "script": "defer-scope-coverage.sh",
+        "extra_args": ("--output", "json"),
+        "apply_flag": False,   # report-only BY DESIGN — none may be added
+        "finds": {"counts": ("total_keyable",), "lists": (), "false": ()},
+    },
+    {
         "name": "recurring-starvation-check",
         "phase": "0.5c.1",
         "meter_name": "recurring-starvation-check",

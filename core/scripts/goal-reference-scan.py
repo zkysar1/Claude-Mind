@@ -203,7 +203,7 @@ def _iter_targets(extra_roots, project_root=None):
 
 def scan(goal_id: str, extra_roots=(), project_root=None):
     """Return a list of (path, root_relative_path, line_no, line_text)."""
-    # Word-ish boundary so g-115-3 does not match . Goal ids end at
+    # Word-ish boundary so  does not match . Goal ids end at
     # a non [A-Za-z0-9-] char, so require the next char not continue the id.
     pat = re.compile(re.escape(goal_id) + r"(?![0-9A-Za-z-])")
     hits = []

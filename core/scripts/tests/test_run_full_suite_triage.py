@@ -119,7 +119,7 @@ def test_green_solo_is_environmental_and_files_nothing(tmp_path, monkeypatch, ca
     """Green solo falsifies contention in one measurement -> do not file."""
     _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (32, 0, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 915))
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r, tests=(): ([], 915))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 0
@@ -133,7 +133,7 @@ def test_all_environmental_does_not_claim_reds_are_owned(tmp_path, monkeypatch, 
     and collapsing them reports a non-regression as a managed regression."""
     _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (32, 0, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 915))
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r, tests=(): ([], 915))
     RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert "no candidate reproduced solo" in out
@@ -144,7 +144,7 @@ def test_red_solo_unowned_is_filed(tmp_path, monkeypatch, capsys):
     """Reproduces solo AND no goal names it -> the one actionable bucket."""
     target = _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 915))
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r, tests=(): ([], 915))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 1
@@ -163,13 +163,54 @@ def test_red_solo_owned_is_not_filed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
     monkeypatch.setattr(
         RFS, "_owning_goals",
-        lambda p, r: ([("g-115-3803", "pending", "Investigate: fleet_config_parity",
-                        "exact")], 915))
+        lambda p, r, tests=(): ([("g-115-3803", "pending",
+                                  "Investigate: fleet_config_parity", "exact")], 915))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 0
     assert "FILE THESE" not in out
     assert "g-115-3803" in out
+
+
+def test_partial_owner_routes_to_verify_not_owned_and_not_filed(
+        tmp_path, monkeypatch, capsys):
+    """: a goal that names the FILE (or the subsystem) but not the
+    failing test is a CANDIDATE, not an owner. Before this pin any non-empty
+    owner list suppressed filing exactly like an exact owner -- the 2026-09-10
+    cc-13 run counted 79 WEAK hits as ownership of test_release.py while five
+    fixture-defect reds sat unfiled. The candidate gets its own bucket: not
+    filed on the instrument's say-so, not suppressed either, and the exit code
+    stays non-zero so nobody reads the run as settled.
+    """
+    target = _log_with_failure(tmp_path)
+    monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
+    monkeypatch.setattr(
+        RFS, "_owning_goals",
+        lambda p, r, tests=(): ([("g-115-10069", "pending",
+                                  "Investigate: cc-03 had NO moto", "partial")], 915))
+    rc = RFS.triage(tmp_path, tmp_path, {})
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "VERIFY OWNERSHIP" in out and target in out and "g-115-10069" in out
+    assert "genuine-VERIFY" in out
+    assert "FILE THESE" not in out, "a candidate is not authority to file"
+    assert "already has an owning goal" not in out, "a candidate is not ownership"
+    assert "owner: g-115-10069" not in out and "candidate: g-115-10069" in out
+
+
+def test_triage_passes_the_failing_test_names_to_the_ownership_join(
+        tmp_path, monkeypatch):
+    """The node-id bar needs the NAMES, so triage must hand them over."""
+    _log_with_failure(tmp_path)
+    seen = {}
+    monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
+
+    def _capture(p, r, tests=()):
+        seen[p] = tuple(tests)
+        return ([], 915)
+    monkeypatch.setattr(RFS, "_owning_goals", _capture)
+    RFS.triage(tmp_path, tmp_path, {})
+    assert seen == {"core/scripts/tests/test_thing.py": ("test_x",)}
 
 
 def test_solo_that_cannot_run_is_unclassified_not_clean(tmp_path, monkeypatch, capsys):
@@ -411,7 +452,7 @@ def test_unanswered_ownership_keeps_the_exit_code_nonzero(
     """
     _log_with_failure(tmp_path)
     monkeypatch.setattr(RFS, "_solo", lambda p, r, e: (10, 2, None))
-    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r: ([], 0))
+    monkeypatch.setattr(RFS, "_owning_goals", lambda p, r, tests=(): ([], 0))
     rc = RFS.triage(tmp_path, tmp_path, {})
     out = capsys.readouterr().out
     assert rc == 1
@@ -464,10 +505,12 @@ def test_unowned_message_declares_what_it_searched(monkeypatch, capsys):
     RFS._print_ownership("core/scripts/tests/test_thing.py", ".")
     out = capsys.readouterr().out
 
-    assert "title or description" in out, (
-        "must name the FIELDS searched -- otherwise the reader cannot tell a "
-        "title-only scan from a title+description one")
-    assert "outcome_note" in out and "NOT searched" in out, (
+    for field in ("title", "description", "progress_note", "outcome_note"):
+        assert field in out, (
+            "must name the FIELDS searched (%s) -- otherwise the reader cannot "
+            "tell a title-only scan from the four-field one (g-115-10242 "
+            "widened the scan from title+description)" % field)
+    assert "completed goals NOT searched" in out, (
         "must name what it did NOT search; an unqualified NONE reads as total")
     for status in RFS.OPEN_STATUSES:
         assert status in out, (
@@ -498,7 +541,8 @@ def test_exact_test_file_match_wins_over_subsystem_name_matches(monkeypatch):
     _stub_query(monkeypatch, [
         {"goal_id": "g-115-3803", "status": "pending",
          "title": "Investigate: fleet_config_parity CLI-lane collector exits 1",
-         "description": "the failing pins live in test_fleet_config_parity.py"},
+         "description": ("the failing pins live in test_fleet_config_parity.py::"
+                         "test_env_key_set_parity")},
         {"goal_id": "g-115-3221", "status": "pending",
          "title": "Investigate: which config values resolve through >1 lane",
          "description": "context: fleet_config_parity covers the env key set"},
@@ -506,10 +550,27 @@ def test_exact_test_file_match_wins_over_subsystem_name_matches(monkeypatch):
          "title": "Idea: fleet_config_parity checks KEY SET but not VALUE SHAPE",
          "description": "no test file named here"},
     ])
-    owners, scanned = RFS._owning_goals(_PARITY, ".")
+    owners, scanned = RFS._owning_goals(_PARITY, ".", tests=["test_env_key_set_parity"])
     assert [o[0] for o in owners] == ["g-115-3803"]
     assert {o[3] for o in owners} == {"exact"}
     assert scanned > 0
+
+
+def test_a_file_only_citation_is_partial_and_names_no_owner(monkeypatch, capsys):
+    """ shape (c): the bar guard-1801 sets is the failing TEST, so a
+    goal that names only the file is a candidate to open, never settled
+    ownership. Before this pin the full test_<stem> form scored `exact`.
+    """
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-115-3803", "status": "pending",
+         "title": "Investigate: fleet_config_parity CLI-lane collector exits 1",
+         "description": "the failing pins live in test_fleet_config_parity.py"},
+    ])
+    owners, _ = RFS._owning_goals(_PARITY, ".", tests=["test_env_key_set_parity"])
+    assert [(o[0], o[3]) for o in owners] == [("g-115-3803", "partial")]
+    RFS._print_ownership(_PARITY, ".", tests=["test_env_key_set_parity"])
+    out = capsys.readouterr().out
+    assert "candidate: g-115-3803" in out and "owner: g-115-3803" not in out
 
 
 def test_stripped_form_is_a_fallback_and_is_labelled_weak(monkeypatch, capsys):
@@ -528,6 +589,175 @@ def test_stripped_form_is_a_fallback_and_is_labelled_weak(monkeypatch, capsys):
 
     RFS._print_ownership(_PARITY, ".")
     assert "WEAK match" in capsys.readouterr().out
+
+
+# ── : the join scores the failing TEST, in every narrative field ──
+#
+# Measured 2026-09-18 (zeta, cc-02) on the 59 GENUINE reds of a 4-chunk run,
+# and re-measured 2026-09-22 (alpha worker Body, cc-07) against a 3,067-goal
+# open-queue snapshot with the OLD and NEW predicates side by side. Each pin
+# below is one live shape from those measurements; the goal ids are the real
+# records, the text is the minimal replica of what they carry.
+
+_NOISE = "core/scripts/tests/test_capability_gate_table_token_noise.py"
+_NOISE_TEST = "test_table_defer_does_not_falsely_block"
+
+
+def test_failing_tests_keeps_the_node_id_half_of_each_failed_line():
+    """The names are what the ownership bar scores on; the parse must keep them
+    and drop everything pytest adds around them."""
+    blob = "\n".join([
+        "FAILED a/test_one.py::test_alpha - AssertionError: x",
+        "FAILED a/test_one.py::TestKlass::test_beta[param-1] - boom",
+        "FAILED b/test_two.py::test_gamma",
+        "FAILED c/test_three.py",
+        "not a failed line :: FAILED nope",
+    ])
+    assert RFS.failing_tests(blob) == {
+        "a/test_one.py": ["test_alpha", "test_beta"],
+        "b/test_two.py": ["test_gamma"],
+        "c/test_three.py": [],
+    }
+    # and it agrees with failing_files on the file set
+    assert set(RFS.failing_tests(blob)) == set(RFS.failing_files(blob))
+
+
+def test_owner_that_names_the_node_id_only_in_its_progress_note_is_exact(monkeypatch):
+    """DIRECTION A.  carried three confirmed failures of the node id in
+    its progress_note and nothing in title/description; it never printed, and a
+    reader following guard-1801 would have filed a duplicate of a goal that had
+    tracked the red for weeks.
+    """
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-115-7335", "status": "pending",
+         "title": "Investigate: capability-gate matches the bare token 'land'",
+         "description": "g-115-3656's disqualifier covers skill-NAME tokens only",
+         "progress_note": ("NEW TOKEN: 'ledger'. " + _NOISE.split("/")[-1] + "::"
+                           + _NOISE_TEST + " FAILED. Gate payload: matches=[...]")},
+    ])
+    owners, _ = RFS._owning_goals(_NOISE, ".", tests=[_NOISE_TEST])
+    assert [(o[0], o[3]) for o in owners] == [("g-115-7335", "exact")]
+
+
+def test_owner_that_names_the_node_id_only_in_its_outcome_note_is_exact(monkeypatch):
+    """ named test_reducer_promotion.py::test_shipped_config_is_default_off
+    only in its outcome_note; the 2026-09-11 cc-13 run had to add it BY HAND
+    ("the probe missed it because that goal never names the test file").
+    """
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-306-294", "status": "pending",
+         "title": "Kill-test lane for reducer self-promotion",
+         "description": "GATE G2 of reducer_promotion refuses every input",
+         "outcome_note": ("4. test_shipped_config_is_default_off updated DONE "
+                          "(66/66 green in test_reducer_promotion.py)")},
+    ])
+    owners, _ = RFS._owning_goals(
+        "core/scripts/tests/test_reducer_promotion.py", ".",
+        tests=["test_shipped_config_is_default_off"])
+    assert [(o[0], o[3]) for o in owners] == [("g-306-294", "exact")]
+
+
+def test_disclaimer_that_quotes_the_file_is_partial_and_loses_to_a_real_owner(monkeypatch):
+    """DIRECTION B, with its positive control (guard-4166).
+
+    g-115-10069 quoted test_raw_append_ensure_local_sweep.py in the act of
+    disowning it ("... already red on this box before anything I did"). The
+    old full-form rule scored it `exact` and it suppressed filing across several
+    runs while the defect underneath was real (g-115-10241, which names the
+    node id). Two runs: alone, the disclaimer is `partial`; beside the real
+    owner, the real owner is the only row.
+    """
+    sweep = "core/scripts/tests/test_raw_append_ensure_local_sweep.py"
+    test = "test_no_unguarded_raw_append_in_daemon_source"
+    disclaimer = {
+        "goal_id": "g-115-10069", "status": "pending",
+        "title": "Investigate: cc-03 had NO moto, so ~113 own-cloud tests were dark",
+        "description": ("22 of the 28 sit in files with NO moto reference (... "
+                        "core/scripts/tests/test_raw_append_ensure_local_sweep.py 1) "
+                        "and so were already red on this box before the moto install"),
+    }
+    owner = {
+        "goal_id": "g-115-10241", "status": "pending",
+        "title": "Fix: wm_write.py archive_evicted_capture_local() raw-appends",
+        "description": ("THE RED: " + sweep + "::" + test + " FAILS on exactly ONE "
+                        "offender: mind_api/src/endpoints/wm_write.py:310"),
+    }
+    _stub_query(monkeypatch, [disclaimer])
+    owners, _ = RFS._owning_goals(sweep, ".", tests=[test])
+    assert [(o[0], o[3]) for o in owners] == [("g-115-10069", "partial")]
+
+    _stub_query(monkeypatch, [disclaimer, owner])
+    owners, _ = RFS._owning_goals(sweep, ".", tests=[test])
+    assert [(o[0], o[3]) for o in owners] == [("g-115-10241", "exact")]
+
+
+def test_node_id_cited_in_a_not_mine_sentence_is_demoted_with_positive_control(monkeypatch):
+    """The demotion aid, and the control that proves it is the phrase that
+    demotes (guard-4166 / guard-2903: an absence needs a control that flips).
+    Same node id, same goal, one sentence differs.
+    """
+    node = _NOISE.split("/")[-1] + "::" + _NOISE_TEST
+    demoted = {"goal_id": "g-115-4434", "status": "pending", "title": "Fix: x",
+               "description": node + " FAILED here too, but it is not mine -- "
+                                     "already red before this change"}
+    owning = {"goal_id": "g-115-4434", "status": "pending", "title": "Fix: x",
+              "description": node + " FAILED here; root cause is in this goal"}
+    _stub_query(monkeypatch, [demoted])
+    owners, _ = RFS._owning_goals(_NOISE, ".", tests=[_NOISE_TEST])
+    assert [(o[0], o[3]) for o in owners] == [("g-115-4434", "partial")]
+    _stub_query(monkeypatch, [owning])
+    owners, _ = RFS._owning_goals(_NOISE, ".", tests=[_NOISE_TEST])
+    assert [(o[0], o[3]) for o in owners] == [("g-115-4434", "exact")]
+
+
+def test_a_test_name_without_its_file_is_partial_not_exact(monkeypatch):
+    """The bar is the node id, not either half of it: a bare function name is an
+    ambiguous citation (which file's test_roundtrip?), so it is a candidate."""
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-1-1", "status": "pending", "title": "Fix: something",
+         "description": _NOISE_TEST + " fails since yesterday"},
+    ])
+    owners, _ = RFS._owning_goals(_NOISE, ".", tests=[_NOISE_TEST])
+    assert [(o[0], o[3]) for o in owners] == [("g-1-1", "partial")]
+
+
+def test_separator_normalization_finds_a_title_that_spells_the_stem_with_spaces(monkeypatch):
+    """THIRD VARIANT (, cc-09, 2026-09-03): triage printed FILE THESE for
+    test_reducer_selection_policy.py while g-306-419 "Reducer selection policy:
+    ..." was pending and owned it -- the stem spells its words with underscores,
+    the title with spaces. Surfaced as a subsystem candidate (weak), which is
+    the honest strength for a title match.
+    """
+    _stub_query(monkeypatch, [
+        {"goal_id": "g-306-419", "status": "pending",
+         "title": ("Reducer selection policy: with three or more live worker "
+                   "Bodies the reducer stops competing for ordinary goals"),
+         "description": "spec only, no test file named here"},
+    ])
+    owners, _ = RFS._owning_goals(
+        "core/scripts/tests/test_reducer_selection_policy.py", ".",
+        tests=["test_worker_is_decided_by_BODY_ROLE_alone_and_first"])
+    assert [(o[0], o[3]) for o in owners] == [("g-306-419", "weak")]
+
+
+def test_form_pattern_is_still_boundary_guarded_after_separator_flex():
+    """Flexible separators must not re-open the substring hole the boundary
+    guard closed: `thing` still must not match `nothing`, and a spaced form
+    must not match across an unrelated word."""
+    p = RFS._form_pattern("thing")
+    assert not p.search("nothing to do with it") and p.search("the thing broke")
+    p = RFS._form_pattern("reducer_selection_policy")
+    assert p.search("reducer selection policy:") and p.search("test_reducer_selection_policy.py")
+    assert not p.search("reducer selection policyx") and not p.search("reducer selectionpolicy")
+
+
+def test_narrative_hay_flattens_every_field_shape():
+    """outcome_notes (plural) exists on some records and may be a list."""
+    hay = RFS._narrative_hay({"title": "T", "description": None,
+                              "progress_note": "P", "outcome_note": "O",
+                              "outcome_notes": ["N1", {"k": "N2"}]})
+    for tok in ("t", "p", "o", "n1", "n2"):
+        assert tok in hay
 
 
 # ── F4: never hand bash a str(WindowsPath) — repo-wide (guard-581) ──────────

@@ -206,7 +206,7 @@ class GitRefClaimStore:
         #: stderr tail of the most recent FAILED claim-namespace fetch, or None
         #: when the last fetch succeeded. Surfaced by the daemon's claims
         #: listing so an empty ``claims`` after a failed fetch is never read as
-        #: "no holder" (2026-08-27 coach-mind: the listing said ``[]`` while
+        #: "no holder" (2026-08-27, a downstream deployment: the listing said ``[]`` while
         #: every acquire failed, and the operator's agent chased phantom refs).
         self.last_fetch_error: Optional[str] = None
 
@@ -219,7 +219,7 @@ class GitRefClaimStore:
 
         The ``claims`` convention exists because ``origin`` is the WRONG arbiter
         for a self-contained single-box deployment whose origin is a repo it can
-        only read: coach-mind's origin is the staging repo over anonymous HTTPS,
+        only read: one downstream deployment's origin is the staging repo over anonymous HTTPS,
         so every push — and therefore every acquire — fails (measured
         2026-08-27, zc-03). A bare repo on the box, added as ``git remote add
         claims /path/to/claims.git``, gives the store a writable CAS arbiter
@@ -362,8 +362,8 @@ class GitRefClaimStore:
         # Anything else — no credentials for the remote, an unreachable host, a
         # remote that is not a repository, a server-side hook refusal — is NOT a
         # lost race, and reporting it as one turns an auth failure into
-        # "another machine owns a live claim" (measured 2026-08-27, coach-mind
-        # on zc-03: anonymous-read origin, no push credential, every acquire
+        # "another machine owns a live claim" (measured 2026-08-27, a downstream
+        # deployment on zc-03: anonymous-read origin, no push credential, every acquire
         # answered HELD while the claim store was empty; the operator's agent
         # spent 103 minutes and destroyed the repo's object store chasing a
         # phantom holder). Fail LOUD with the remote's own words instead.

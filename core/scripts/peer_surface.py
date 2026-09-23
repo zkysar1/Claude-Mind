@@ -31,7 +31,7 @@ THREE measured traps this file exists to encode (g-115-3927, 2026-07-30):
    ("Claiming g-115-3007: Investigate: ..."). They are not peers. Rather than
    denylisting them, this module attributes a bare author to a deployment only
    when that same agent name is independently observed in `<agent>@<env-id>`
-   form. `omni` attributes (it also posts as `omni@zds-mind`); `investigate`
+   form. A peer agent attributes (it also posts as `<agent>@<peer-env>`); `investigate`
    does not, so it is reported separately as unattributed rather than silently
    counted or silently dropped.
 """
@@ -146,7 +146,7 @@ def suspected_routing_tags(tags):
 
     THE DEFECT THIS NAMES (measured 2026-08-11, six posts over ten days by four
     different agents): `requires_action_by:` is the ONLY prefix parse_routing_tag
-    strips, so `forward-to:omni@zds-mind` parses to agent `forward-to:omni` and
+    strips, so `forward-to:<agent>@<peer-env>` parses to agent `forward-to:<agent>` and
     matches nothing. Board tags are free-form, so the poster gets NO feedback at
     all — the message looks addressed and reaches no one.
 
@@ -177,7 +177,7 @@ def suspected_routing_tags(tags):
 
     THE SUPPRESSION CLAUSE IS LOAD-BEARING, and without it this helper would
     cry wolf on correctly-addressed posts. Consumers test tags with `any()`, so
-    ONE routing tag is enough: a post carrying both `omni` and `to:omni@zds-mind`
+    ONE routing tag is enough: a post carrying both `<agent>` and `to:<agent>@<peer-env>`
     routes fine and must NOT warn. Measured on a live post
     (msg-20260814-163801-bravo-5214, answering a peer's urgent question) which
     carries exactly that pair — reading the broken tag alone would have raised a
@@ -237,7 +237,7 @@ def routing_tag_targets_agent(tag, agent_name, self_env):
 
     NOT A PATTERN MATCH (guard-2860). The comparison is component-wise equality
     on a parsed (agent, env) pair -- never a prefix, glob, or startswith. A
-    `split("@")[0] == agent_name` shortcut would admit `zeta@zds-mind`, i.e. a
+    `split("@")[0] == agent_name` shortcut would admit `zeta@<peer-env>`, i.e. a
     PEER DEPLOYMENT's same-named agent, as if it were the local one. The
     cardinality of what this newly admits is therefore a property of the CODE
     (exactly the self-env-qualified form) and not of whatever is on disk.

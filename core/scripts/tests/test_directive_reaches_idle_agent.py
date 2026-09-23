@@ -19,7 +19,12 @@ ALL_BLOCKED = REPO / ".claude/skills/aspirations-all-blocked/SKILL.md"
 COORD = REPO / "core/config/conventions/coordination.md"
 
 ACK_READ = "--type directive --since 24h --unread-only --mark-read --json"
-HONOR_READ = "board-read.sh --channel coordination --type directive --since 24h --json"
+# 96h, NOT 24h (). A directive declares its own lifetime in an `expires:` tag
+# (observed to 72h), so an honor read bounded at 24h goes blind for most of that life while
+# reporting a clean empty set. The ACK read above stays at 24h on purpose — it asks "have I
+# seen this?", and widening it re-acks old directives (the 5x-spam  fixed). The
+# asymmetry is the contract; test_honor_and_ack_windows_stay_asymmetric pins it.
+HONOR_READ = "board-read.sh --channel coordination --type directive --since 96h --json"
 ALL_BLOCKED_RETURN = 'RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)'
 
 
@@ -39,6 +44,35 @@ def test_phase_2_07_still_carries_both_reads_with_different_scopes():
     assert "all_directives = " + HONOR_READ in p207          # HONOR: no --unread-only, no --mark-read
     assert "new_directives = board-read.sh --channel coordination " + ACK_READ in p207  # ACK: dedup
     assert "g-115-2990" in p207
+
+
+def test_honor_and_ack_windows_stay_asymmetric():
+    """The HONOR read must outlive 24h; the ACK read must not ().
+
+    Both reads sat at --since 24h, so the honor set went empty for most of each
+    directive's declared ~72h life while the ack read was correct at 24h. Widening
+    BOTH re-introduces the 5x re-ack spam; widening the honor read WITHOUT the
+    expiry filter re-admits stale directives (measured 2026-09-21: of 10 directives
+    visible only at 96h, SIX had already expired). So this pins three things
+    together — they are one change and must not drift apart.
+    """
+    for path in (SELECT, ALL_BLOCKED):
+        text = path.read_text(encoding="utf-8")
+        assert "--type directive --since 24h --json" not in text, (
+            f"{path.name}: an honor/active directive read is still bounded at 24h — "
+            "it cannot see a directive its writer declared live for longer"
+        )
+        # The ACK read keeps its 24h bound; widening it is the regression  fixed.
+        assert ACK_READ in text, f"{path.name}: the ACK read must stay at --since 24h"
+    # The window is only half the fix: something must drop the already-expired.
+    all_blocked = ALL_BLOCKED.read_text(encoding="utf-8")
+    assert "not past(d.tags expires:)" in all_blocked, \
+        "the all-blocked handler must still drop past-expiry directives"
+    select = SELECT.read_text(encoding="utf-8")
+    assert "expires:" in select[select.index("### Phase 2.07"):], \
+        "the Phase 2.07 honor read must state the expiry filter alongside its wider window"
+    assert "directive-honor-read-window" in select, \
+        "Phase 2.07 must cite the rationale explaining why the two windows differ"
 
 
 def test_all_blocked_handler_reads_directives_as_generation_scope():

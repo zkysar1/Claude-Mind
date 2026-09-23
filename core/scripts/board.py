@@ -146,8 +146,8 @@ def cmd_post(args):
                 pass
         # : WARN (do NOT block) on a tag that LOOKS like an address but
         # routes to nobody — `requires_action_by:` is the only recognised
-        # prefix, so `forward-to:omni@zds-mind` parses to agent
-        # `forward-to:omni` and matches nothing. Free-form tags mean the poster
+        # prefix, so `forward-to:<agent>@<peer-env>` parses to agent
+        # `forward-to:<agent>` and matches nothing. Free-form tags mean the poster
         # otherwise gets no feedback at all. Suppressed when another tag on the
         # same post already routes to that agent. Fail-open. Twin:
         # board_write.py daemon post handler.

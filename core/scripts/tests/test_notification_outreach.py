@@ -252,3 +252,100 @@ def test_the_alarm_window_is_not_the_default(world):
     # different category with a different argument, and widening this change to cover it
     # would be scope the goal did not ask for.
     assert no.window_for("reply") == no.window_for("_no_such_category_")
+
+
+# ------------------------------------------- authoritative read ()
+#
+# The predicate was never the defect. Measured on the live ledger 2026-09-21:
+# two stall episodes reached the owner 8 and 9 times with byte-identical
+# `subject_norm`, every row rc=0, tightest cross-agent gap 16 SECONDS -- while
+# `find_prior` re-run that day matched all four priors correctly and every test
+# in this file was green. The gap is that the ledger leg read the LOCAL file,
+# and under own-cloud that is a read-through cache (guard-980) whose daemon
+# path is TTL-warm by default (guard-6364). A peer box's row seconds old is
+# invisible, so the gate cleared a population it could not see.
+#
+# A one-world fixture CANNOT reproduce that race -- both writes land in the
+# same file -- which is exactly why the suite stayed green through 17 duplicate
+# owner emails. So these tests pin the two properties that DO survive into a
+# fixture: the refresh is attempted before the decision, and an unreadable
+# store fails CLOSED instead of clearing the send.
+
+
+def test_find_prior_refreshes_the_ledger_before_deciding(world, monkeypatch):
+    """The decision read must be preceded by a store pull, every time."""
+    calls = []
+    monkeypatch.setattr(no, "refresh_ledger", lambda w=None: calls.append(w) or "fetched")
+    no.find_prior("Anything at all", "", "decision-needed", world=world, now=NOW)
+    assert len(calls) == 1, "find_prior decided without pulling the store copy"
+
+
+def test_find_prior_does_not_refresh_twice_when_the_caller_already_did(world, monkeypatch):
+    """The CLI refreshes once and passes the basis down; one decision, one fetch.
+
+    Pinned because the obvious way to write the fix -- refresh unconditionally
+    inside find_prior AND in the caller -- doubles a remote round trip on every
+    outreach without changing any verdict.
+    """
+    calls = []
+    monkeypatch.setattr(no, "refresh_ledger", lambda w=None: calls.append(w) or "fetched")
+    no.find_prior("Anything at all", "", "decision-needed", world=world, now=NOW,
+                  freshness="fetched")
+    assert calls == []
+
+
+def test_refresh_ledger_reports_fetched_without_sniffing_the_backend(world):
+    """Basis vocabulary is contract, not prose -- FRESH_BASES is read by the gate.
+
+    "fetched" on the local backend is CORRECT, not a white lie: refresh() there is
+    a documented no-op reading nothing, because the local file IS the store. The
+    point of asserting it is that this function must never branch on the backend's
+    CLASS NAME -- an unrecognised REMOTE backend would then report a fresh basis
+    having pulled nothing, which is guard-6364's fail-dangerous direction exactly.
+    """
+    basis = no.refresh_ledger(world)
+    assert basis == "fetched"
+    assert basis in no.FRESH_BASES
+
+
+def test_check_fails_closed_when_the_ledger_cannot_be_read_authoritatively(world, monkeypatch, capsys):
+    """An UNKNOWN population must not authorise mail (guard-6364).
+
+    The ledger here is EMPTY, so there is no prior to find: the refusal comes
+    from the freshness basis alone. That is the whole point -- before this, an
+    unreadable store and a genuinely-quiet topic were the same verdict.
+    """
+    monkeypatch.setattr(no, "refresh_ledger", lambda w=None: "failed: boom")
+    rc = no.main(["check", "--category", "decision-needed", "--subject",
+                  "Fleet: echo looks STALLED since 2026-09-19T05:17 UTC",
+                  "--world", str(world)])
+    out = capsys.readouterr().out
+    assert rc == 1, "a gate that cannot see the fleet ledger must not clear a send"
+    assert "REFUSING" in out
+    assert "EMAIL_SEND_ALLOW_DUPLICATE" in out, "a refusal must name its escape hatch"
+
+
+def test_check_still_permits_a_genuinely_new_topic_on_a_fresh_basis(world, monkeypatch, capsys):
+    """POSITIVE CONTROL for the test above -- same empty ledger, same subject.
+
+    Without this, fail-closed could be implemented as refuse-everything and the
+    previous test would still pass. The ONLY difference here is the basis.
+    """
+    monkeypatch.setattr(no, "refresh_ledger", lambda w=None: "fetched")
+    rc = no.main(["check", "--category", "decision-needed", "--subject",
+                  "Fleet: echo looks STALLED since 2026-09-19T05:17 UTC",
+                  "--world", str(world)])
+    out = capsys.readouterr().out
+    assert rc == 0, "a fresh read of a quiet topic must still send"
+    assert "ok to send" in out
+
+
+def test_json_verdict_carries_its_freshness_basis(world, monkeypatch, capsys):
+    """guard-6364: a CLEAR with no basis is an ABSENCE, not a clean bill of health."""
+    monkeypatch.setattr(no, "refresh_ledger", lambda w=None: "skipped-would-clobber")
+    rc = no.main(["check", "--category", "decision-needed", "--subject",
+                  "Some entirely new question", "--world", str(world), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["freshness"] == "skipped-would-clobber"
+    assert payload["duplicate"] is True and rc == 1, "a non-fresh basis is not a clear"
+    assert payload["prior"] == [], "the refusal is from the basis, not from a prior"

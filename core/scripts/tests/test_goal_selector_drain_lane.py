@@ -511,3 +511,126 @@ def test_excluded_counter_counts_kept_out_not_merely_present(tmp_path):
     assert state["role_excluded_reducer_only"] == 1, (
         f"only the lane-admissible reducer-only row was actually kept out; "
         f"got {state['role_excluded_reducer_only']}")
+
+
+# ── : the banner must not waive the deviation code for a row routed
+# to another agent ────────────────────────────────────────────────────────────
+# Measured 2026-09-21 (zeta, cc-02, Linux 6.8.0-139-generic, own-cloud): a live
+# selector run over 2418 candidates hoisted  (intended_agent='bravo',
+# executable_by_role=None, so the  role gate never fires) to rank #1
+# and printed "This IS the sanctioned top pick — claim it without a deviation
+# code." 106 rows in that pool were routed away and exactly ONE carried
+# drain_lane_pick — this lane is the only path that turns a routed-away row into
+# a claim-permit, and guard-2256 reads that sentence as its premise.
+#
+# AGENT_NAME is pinned per-test rather than inherited: the module resolves it at
+# import from the ambient MIND_AGENT, so an env-dependent assertion here would
+# pass on the author's box and mean nothing in CI (the env axis of
+# run-full-suite-after-deep-code.md).
+
+@contextlib.contextmanager
+def _agent_name(name):
+    saved = gs.AGENT_NAME
+    gs.AGENT_NAME = name
+    try:
+        yield
+    finally:
+        gs.AGENT_NAME = saved
+
+
+def _routed(gid, score, ratio=10.63, to="bravo", **kw):
+    r = row(gid, score, ratio=ratio, **kw)
+    r["intended_agent"] = to
+    r["routed_to_me"] = False
+    return r
+
+
+_WAIVER = "claim it without a deviation code"
+
+
+def test_banner_waives_for_an_ordinary_pick(capsys):
+    """POSITIVE CONTROL. Without this, the absence assertions below would pass
+    even if the waiver sentence had been deleted outright, or if the banner had
+    stopped printing at all — and the regression would be invisible."""
+    with _agent_name("zeta"):
+        gs.emit_drain_lane_banner(row("g-own", 12.0, ratio=6.0), 3, 0, 5)
+    err = capsys.readouterr().err
+    assert "DRAIN-LANE" in err, "banner did not print at all; later absence checks would be vacuous"
+    assert _WAIVER in err, err
+
+
+def test_banner_sends_a_routed_away_pick_to_cross_lane_not_to_abstention(capsys):
+    """'s exact shape, with the CORRECTED verdict (,
+    2026-09-22).
+
+    The first cut of this test asserted `"must NOT claim it" in err`. That
+    pinned a real defect in place. A routed-away row cannot reach `scored` by
+    accident: collect_candidates drops it unless the reallocation escape opens
+    (owner idle, or g-115-8700's cadence door — recurring and stranded past
+    realloc_overdue_ratio on a live-but-busy owner), and collect_blocked mirrors
+    the same conjuncts under guard-4622. So its presence in the pool IS the
+    evidence that it was surfaced to be rescued, and telling the reader to
+    abstain restores exactly the starvation g-115-8700 ended: a cadence-stranded
+    goal's owner can never rank it, its recurring_urgency being pinned at the
+    urgency_max clamp.
+
+    Two things must both hold, and conflating them is what produced the bad
+    clause: the WAIVER stays withheld (the claim really does need --cross-lane,
+    because aspirations.py computes _lane_conflict from routes_away_from alone
+    and never consults gates.reallocation_exempt), while the ABSTENTION
+    instruction must be gone.
+    """
+    with _agent_name("zeta"):
+        gs.emit_drain_lane_banner(_routed("g-353-03", 10.52, ratio=5.271), 7, 0, 5)
+    err = capsys.readouterr().err
+    assert "DRAIN-LANE" in err, "banner must still print — the row is still the lane pick"
+    assert _WAIVER not in err, (
+        "the claim is not ceremony-free: --cross-lane is still required: " + err)
+    assert "intended_agent='bravo'" in err, err
+    # The correction, pinned in both directions.
+    assert "--cross-lane" in err, (
+        "the reader was not told how to claim a rescued row: " + err)
+    assert "yours to claim" in err, err
+    for forbidden in ("must NOT claim it", "abstain (locus-gated"):
+        assert forbidden not in err, (
+            f"the banner still tells the rescuer to walk away ({forbidden!r}); "
+            f"that re-strands the goal on an owner who cannot rank it: " + err)
+
+
+def test_banner_waives_for_a_row_routed_to_me(capsys):
+    """intended_agent naming THIS agent is not routed away — the fence must not
+    over-match, or the lane stops waiving on the agent's own routed work."""
+    with _agent_name("zeta"):
+        gs.emit_drain_lane_banner(_routed("g-mine", 11.0, to="zeta"), 2, 0, 5)
+    err = capsys.readouterr().err
+    assert _WAIVER in err, err
+
+
+def test_banner_waives_for_either_and_for_cross_agent_pulled_rows(capsys):
+    """'either' is open to anyone; routed_to_me marks a row pulled BY this agent
+    from a sibling queue (collect_cross_agent_candidates' strict-match), so both
+    remain claimable and must keep the waiver."""
+    with _agent_name("zeta"):
+        gs.emit_drain_lane_banner(_routed("g-either", 11.0, to="either"), 2, 0, 5)
+        first = capsys.readouterr().err
+        pulled = _routed("g-pulled", 11.0, to="bravo")
+        pulled["routed_to_me"] = True
+        gs.emit_drain_lane_banner(pulled, 2, 0, 5)
+        second = capsys.readouterr().err
+    assert _WAIVER in first, first
+    assert _WAIVER in second, second
+
+
+def test_reducer_only_clause_still_wins_over_the_routing_clause(capsys):
+    """Precedence is not arbitrary: a reducer-only row handed to a non-matching
+    Body is the older, narrower fence (g-306-440) and its wording names the
+    remedy (leave it for the reducer). Both clauses withhold the waiver, so the
+    only thing at stake is which remedy the reader is told — and the role one
+    must not be masked by the routing one."""
+    r = _routed("g-both", 9.0)
+    r["executable_by_role"] = "reducer"
+    with _agent_name("zeta"):
+        gs.emit_drain_lane_banner(r, 4, 0, 5)
+    err = capsys.readouterr().err
+    assert _WAIVER not in err, err
+    assert "executable_by_role='reducer'" in err, err

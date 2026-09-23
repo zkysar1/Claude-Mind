@@ -919,12 +919,73 @@ Assertion points that actually discriminate:
   does not work: a read hoisted out of the cycle still writes under the lock, so
   a write-time assertion passes the very revert it is meant to catch.
 
+### Decision: `world/audit-reports/operator-verdict-seen.json` — class (b), fence NOT handler (g-115-10526, 2026-09-21, zeta, hostname cc-02, `uname -r` 6.8.0-139-generic, own-cloud)
+
+Recorded per guard-1816 step 4, at the REGISTRATION moment rather than at a
+later audit — the store was created 2026-09-21T14:47 by `operator-verdict-pull.sh`
+(g-370-58) and is still single-writer, which is the cheap moment to choose.
+
+**The store.** `{"created": iso, "seen": {"<task>|<recipe>|<verdict>": "<firstSeen iso>"}, "updated": iso}`
+— the dedup ledger that stops the operator-verdict pull re-posting a standing
+verdict every cadence. Dedup is on the VERDICT IDENTITY, not the audit record,
+because the operator re-publishes its full verdict set every run by design.
+
+**Why not a merge handler, despite the obvious appeal of a key-union.** A union
+on `seen` looks perfectly commutative and is the first thing a reader reaches
+for. It is disqualified by guard-1816 step 2: `save_ledger`
+(`world/scripts/operator_verdict_pull.py:114`) evicts oldest-first past
+`MAX_LEDGER_ENTRIES = 500`, so the store HAS a removal path and emits a strict
+subset of what it read. A union handler would silently resurrect every key the
+evicting writer just dropped, at conflict time, on the box that lost the race —
+and because eviction is oldest-first, the resurrected keys are precisely the
+ones the cap exists to shed.
+
+**Why the risk is not academic.** The sibling file in the same directory,
+`world/audit-reports/alert-sweep-seen-backlog.json`, sat both-diverged for 10+
+consecutive sweeps on this box (board `msg-20260920-232526-owncloud-sync-3176`)
+and did not self-heal. `merge_handler_for` returns None for BOTH `.json`
+ledgers: branch 9 covers `world/audit-reports/*.jsonl`, and neither `.json` is
+in `_HANDLERS`. The wedge class fires here on real files.
+
+**The suppression direction is the one that matters.** g-370-58's own contract
+says "a PROD-VERIFIED recipe that later turns FAILED re-announces, which is the
+transition that must never be suppressed." A lost race that leaves this box
+holding a peer's superset marks verdicts seen that this box never posted. The
+noisy direction (duplicate posts) is survivable; that one is not.
+
+**Class, honestly stated.** Class (b) is the DECISION, not yet a measured
+finding: guard-7204 is explicit that a None from `merge_handler_for` does not
+establish class (b) — the tell is the sweep's own verdict for the path
+(`diverged_skipped` / `merge_na_unregistered` = (b); an error line naming
+`union-merge-push` / `ConflictError` = (a)). No live wedge existed on this path
+at decision time (local and authoritative md5 matched), so no sweep verdict was
+available to read. Re-read one when a wedge next appears rather than inheriting
+this line.
+
+**The cure, and what is NOT yet measured.** The prescribed cure is
+`locked_rmw` + an in-cycle `force_fresh` read, so a retry re-applies the stamp
+on top of the peer's landed version instead of unioning it away. The writer
+currently reads at `main()` and writes ~65 lines later with no fence and no
+re-read. Per guard-1719 the DIAGNOSIS above is measured and this REMEDY half is
+not: the conversion is a real change across the CLI/daemon boundary
+(`mind_api/src/file_locks.locked_rmw` is daemon-side; `core/scripts/_fileops.py`
+exposes `acquire_lock` and `_rmw_with_conflict_retry` but no public
+`locked_rmw`), and it needs the stub-backend mutation proofs the "Testing a
+class-(b) writer" section above requires. Filed as its own goal rather than
+inlined.
+
 ## Cross-references
 
 - `core/scripts/coordination_merge.py` — `merge_handler_for` + `_HANDLERS`, the
   authoritative registry; adding a store to class (a) is a commutative handler
   plus one line here
-- `core/scripts/_fileops.py` — `locked_rmw` / `_rmw_with_conflict_retry`
+- `core/scripts/_fileops.py` — `acquire_lock` + `_rmw_with_conflict_retry`.
+  **There is no public `locked_rmw` here** (this line named one until
+  2026-09-21, g-115-10526): the composed `locked_rmw` lives in
+  `mind_api/src/file_locks.py`, daemon-side. A CLI under `core/scripts/` or
+  `world/scripts/` must compose the two `_fileops` primitives itself or import
+  the daemon module deliberately — check which you have before citing it as
+  drop-in
 - `core/scripts/tests/test_meta_yaml_conflict_retry.py` — the reference suite
 - `rb-2639` — per-object stale-IfMatch deadlock (why class (b) wedges)
 - `rb-3636` — own-cloud write_conflict triage: retry-less / silent-loss /

@@ -61,8 +61,8 @@ agent dirs at `PROJECT_ROOT/agents/` (`AGENTS_PARENT_DIR`); only the M4
 ```bash
 # Paths to external world and meta directories
 # Written by /start — edit manually to change locations
-WORLD_PATH=C:/Users/Shared/claude-mind/world
-META_PATH=C:/Users/Shared/claude-mind/meta
+WORLD_PATH=C:/Users/Shared/my-mind/world
+META_PATH=C:/Users/Shared/my-mind/meta
 ```
 
 - Location: inside each agent's directory (gitignored via `**/local-paths.conf`)
@@ -170,7 +170,7 @@ project-root/
 ## Shared Location Structure
 
 ```
-/shared/claude-mind/
+/shared/my-mind/
   world/              — Collective domain knowledge
     knowledge/tree/   — Browseable by office workers
     board/            — Message board channels
@@ -191,8 +191,8 @@ Forged skills in `.claude/skills/` are shared — check `world/forged-skills.yam
 ## Path Format
 
 Use **forward slashes** on all platforms:
-- Good: `C:/Users/Shared/claude-mind/world`
-- Bad: `C:\Users\Shared\claude-mind\world` (backslashes are escape sequences when bash sources the file)
+- Good: `C:/Users/Shared/my-mind/world`
+- Bad: `C:\Users\Shared\my-mind\world` (backslashes are escape sequences when bash sources the file)
 
 Python handles both slash styles, but bash does not. Forward slashes work everywhere.
 

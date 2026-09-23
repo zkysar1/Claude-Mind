@@ -204,7 +204,11 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 # the one that actually runs at write time; the core-side copy only fires on
 # core-side touches. Keep the two literally identical; see the experience.py
 # comment for the 220-record measurement and the guard-2353 discriminating row.
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d{2,5}|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
+# goal SEQUENCE is open-ended (guard-1161). Keep this comment on its OWN line:
+# test_experience_read_goal_derivation.py pins this line and its core twin as
+# byte-identical with a `$`-anchored source-literal match, so a TRAILING comment
+# here silently unmatches the line and reads as "the copies diverged again".
+GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d+|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
 
 
 def _derive_goal_id_from_id(rec_id):

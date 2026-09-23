@@ -19,7 +19,7 @@ to all_blocked and then wrote **nothing** is, at loop entry, byte-for-byte
 indistinguishable from a productive cycle — so the loop does the only thing left
 and reloads the full ~75-minute all-blocked handler.
 
-That is not hypothetical. Measured on coach (claude-mind, zc-03) 2026-09-03
+That is not hypothetical. Measured on coach (the staging deployment, zc-03) 2026-09-03
 02:10Z, the third all-blocked cycle of the night: the pane reported *"Step B7.2
 yield complete — ScheduleWakeup armed for 600s"* and `[x] 23 Step B7.2`, while
 the state read one minute later showed `consecutive_blocked_sleeps=0`,

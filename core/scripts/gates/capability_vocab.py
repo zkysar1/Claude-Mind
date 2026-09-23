@@ -83,6 +83,39 @@ from typing import Any, Dict, List, Optional
 # gate_id MUST match core/config/gates.yaml id.
 GATE_ID = "capability-vocab"
 
+# Appended by the UPDATE-path callers (). SSOT so the live daemon
+# half and its CLI twin cannot drift — the same reason the sibling user_leg_scope
+# refusal reads one shared set rather than a hand-typed copy.
+#
+# WHY A GATE THAT REFUSES MUST ALSO ROUTE. Both measured update-path carriers
+# wrote multi-paragraph PROSE here, and both were solving a REAL problem: a LOCUS
+# constraint ("this needs a live env-server", "this needs cc-04's own-cloud
+# mirror") that is otherwise recoverable only from tens of KB of progress_note,
+# re-derived by every arriving agent.  says so in the field itself.
+# A refusal that only lists the seven valid tokens answers none of that and sends
+# the next author to the next ungated field — which is precisely how this one was
+# reached. So name the homes.
+LOCUS_ROUTING_HINT = (
+    "\n\nIF WHAT YOU ARE RECORDING IS A LOCUS (a box, host, platform, live "
+    "session, or device that the work needs), requires_capability is the wrong "
+    "home even when the sentence is true. Three sanctioned homes, in order of "
+    "preference:\n"
+    "  (1) A STRUCTURED PRECONDITION on the goal's verification.preconditions — "
+    "a dict, machine-evaluated by predicate.evaluate_all, so the selector "
+    "re-tests it every cycle instead of hiding the goal.\n"
+    "  (2) A DECLARATIVE DEFER TOKEN HEAD, prefix:snake_token (guard-4310), e.g. "
+    "precondition_unmet:live_env_server_required — machine-findable, and it "
+    "re-probes rather than freezing.\n"
+    "  (3) SELECTABLE ROUTING — intended_agent plus the routing field — and note "
+    "this is the half authors skip: naming the box makes the goal FINDABLE but "
+    "does not un-hide it, because a defer still suppresses it on every box "
+    "INCLUDING the one that satisfies the locus (guard-4310). If exactly one box "
+    "or agent can do the work, route it there; do not fence it away from "
+    "everyone.\n"
+    "Prose describing the locus belongs in description or progress_note, which "
+    "no selector reads as a fence."
+)
+
 
 def evaluate(goal: Dict[str, Any], *, meta_dir=None,
              agent_name: Optional[str] = None) -> Dict[str, Any]:

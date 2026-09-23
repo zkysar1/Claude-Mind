@@ -736,6 +736,9 @@ def _get_pruning_config(config):
 # in the wm.py copy — read it there before changing either.
 _SPARK_CAPTURE_META_KEYS = frozenset({
     "goal_id", "category", "load_bearing", "sq_trigger", "_item_ts",
+    # : `goal` is an improvised ROUTING key, never content — see
+    # the wm.py twin for the measurement. Kept in lock-step with it.
+    "goal",
 })
 _SPARK_CAPTURE_MIN_CONTENT = 40
 
@@ -744,9 +747,15 @@ def _normalize_spark_capture_entry(item):
     """Promote an improvised content key into `observation`; return that key
     or None. Normalizes rather than raising — a worker mid-close cannot
     recover from a rejected append, and losing the observation is the exact
-    failure this prevents."""
+    failure this prevents. Also aliases a bare `goal` routing key into
+    `goal_id` (g-115-10421) — copied, never dropped; provenance recorded."""
     if not isinstance(item, dict):
         return None
+    _goal = item.get("goal")
+    if (not str(item.get("goal_id") or "").strip()
+            and isinstance(_goal, str) and _goal.strip()):
+        item["goal_id"] = _goal.strip()
+        item["goal_id_normalized_from"] = "goal"
     if str(item.get("observation") or "").strip():
         return None
     best_key, best_val = None, ""
@@ -1619,10 +1628,31 @@ def drain_goals(ctx) -> "Response":  # type: ignore[name-defined]
                 return Response.error(
                     400, "slot_not_a_list",
                     f"slot '{slot}' holds {type(current).__name__}, not a list")
-            # Non-dict entries, and entries carrying no goal_id, are KEPT: an
+            # Non-dict entries, and entries carrying NEITHER key, are KEPT: an
             # entry the classifier cannot classify must not be destroyed by it.
+            #
+            # `goal` IS AN ACCEPTED ALIAS FOR `goal_id` (). The slot
+            # has no schema, and two writer shapes reached it: measured on the
+            # live lane 2026-09-21 (alpha, cc-04) — 1901 entries keyed `goal_id`,
+            # 35 keyed `goal` only, 128 carrying neither. A goal_id-only match
+            # cannot subtract those 35, and they are not scattered: their 26
+            # goals occupy oldest-first ranks 0-13, i.e. the whole HEAD of the
+            # queue. So the drain re-selected them every pass, re-ran their
+            # handlers, and removed nothing — at k=3 (tight) and k=10 (normal)
+            # it removed ZERO and the head never advanced. That is a WEDGE, not
+            # a leak, and it is self-concealing: {"removed":N} still reads as
+            # honest progress and a flat `kept` is pre-explained by arrivals.
+            # guard-1802 — a drain predicate narrower than the population it
+            # models reports clean forever.
+            #
+            # Widening the READ is the whole fix and needs no writer change; do
+            # NOT assume the WRITE widens with it. Entries keyed `goal` are
+            # subtractable from here on, while new records should still be
+            # written with `goal_id`.
+            def _entry_goal(e):
+                return e.get("goal_id") or e.get("goal")
             keep = [e for e in current
-                    if not (isinstance(e, dict) and e.get("goal_id") in ids)]
+                    if not (isinstance(e, dict) and _entry_goal(e) in ids)]
             removed = len(current) - len(keep)
             if not removed:
                 return Response.json({"ok": True, "slot": slot,

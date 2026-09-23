@@ -34,7 +34,7 @@ sys.path.insert(0, str(CORE_SCRIPTS))
 
 from _daemon_fixture import DaemonFixture  # noqa: E402
 
-_GID_RE = re.compile(r"^g-100-\d{2,5}$")
+_GID_RE = re.compile(r"^g-100-\d+$")  # seq is open-ended: guard-1161, 
 
 
 def _make_world(tmp: Path) -> tuple[Path, Path]:

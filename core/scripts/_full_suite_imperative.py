@@ -65,8 +65,23 @@ _PYTHON_HEAD_RE = re.compile(r"^(?:[\w./\\-]*[/\\])?(?:python3?(?:\.exe)?|py)$")
 _GRADLE_HEAD_RE = re.compile(r"^(?:[\w./\\-]*[/\\])?gradlew(?:\.bat)?$")
 
 FRAMEWORK_IMPERATIVE = """\
-run-full-suite / pytest is about to run. Six things decide whether its output
-means anything (.claude/rules/run-full-suite-after-deep-code.md):
+run-full-suite / pytest is about to run.
+
+COST, BEFORE ANYTHING ELSE: the full suite is HOURS, not minutes, and it can
+still end in VERDICT: INVALID. Measured 2026-09-22, 8-core Windows box, 1545
+files in 4 SEQUENTIAL chunks: chunk 00 41 min, chunk 01 63 min -- the chunked
+half alone projects ~3.5-4 h, before the invisible + shell + domain halves,
+and you may not commit for that whole window (point 6). So, first:
+  - Is a TARGETED run enough? Only a deep-code CLOSURE claim needs the full
+    suite; anything else is served by the files and dirs you touched.
+  - If a human is present, SAY you are starting it and roughly how long. They
+    are the one waiting, and they cannot see this block.
+  - `--parallel N` exists (pytest-xdist `--dist load`; default OFF; measured
+    2.19x on one 501-test dir). Read its two caveats in run-full-suite.py --
+    it weakens the contention verdict further -- before reaching for it.
+
+Six things decide whether its output means anything
+(.claude/rules/run-full-suite-after-deep-code.md):
 
 1. READ THE `VERDICT:` LINE FIRST, before any number above it. A run reporting
    `TOTAL: N passed, 0 failed, 0 errors` with every per-chunk line reading

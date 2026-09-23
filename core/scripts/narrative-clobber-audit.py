@@ -63,7 +63,7 @@ that examined everything). To cover the fleet, run this on each box.
 
 Read-only. Never writes, never mutates the store.
 """
-import argparse, json, re, sys, pathlib
+import argparse, collections, json, re, sys, pathlib
 
 _HERE = pathlib.Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
@@ -91,6 +91,21 @@ CE_AUTO_MARK = "[closure-evidence:auto]"
 CE_DEFER_MARK = "[closure-evidence:deferred]"
 CE_AUTO_SHAPE = " by closure-evidence-write.sh (achievedCount="
 CE_SUPERSEDE_MARK = "[closure-evidence] SUPERSEDES a prior-occurrence note"
+
+# ANCHORED, LITERAL MARKER MATCH — mirrors goal-field-append.py::ROTATE_NOTICE_HEAD.
+# Keep the two in lockstep; tests/test_narrative_clobber_audit.py pins them together.
+#
+# THE THIRD SANCTIONED WRITE that fails containment, after the two closure-evidence
+# shapes above. goal-field-append.py bounds an oversize note by moving its OLDEST
+# blocks to an archive sink and PREPENDING this notice, so the pre-write text stops
+# being a substring and the row reads as total loss. guard-6715 already records this
+# exact false positive for the hand-executed FOLD and patches the READER; this branch
+# fixes the DETECTOR for the AUTOMATIC rotation, which is a different producer (no
+# RECEIPT.* is written, so guard-6715's action_hint mis-routes it) and which recurs on
+# every note crossing GOAL_NOTE_ROTATE_BYTES, fleet-wide, forever. Leaving it unfixed
+# realises guard-6715's own stated cost: "permanent false alarms sitting in the lane's
+# output dilute it, so a REAL clobber beside them is less likely to be acted on."
+ROTATE_NOTICE_HEAD = "NOTE HISTORY ROTATED"
 
 
 def _provenance_stamp(text):
@@ -149,20 +164,114 @@ def _note(content, gid, field):
     return None if g is None else (g.get(field) or "")
 
 
-def _classify(pre, post, goal, restore_lookup=None):
+ROTATE_STAMP_RE = re.compile(
+    re.escape(ROTATE_NOTICE_HEAD) + r"\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})")
+
+
+def _rotation_stamp(value):
+    """The ISO stamp of a rotation notice STARTING `value`, else None.
+
+    Anchored at position 0 on purpose: a note that merely QUOTES the header
+    mid-text must not read as a rotation (guard-4015 — the same shape the CE
+    markers defend against; diagnostic notes about this very mechanism quote it
+    verbatim, including the one that motivated this branch).
+    """
+    if not value or not value.startswith(ROTATE_NOTICE_HEAD):
+        return None
+    m = ROTATE_STAMP_RE.match(value)
+    return m.group(1) if m else None
+
+
+def _rotation_check(pre, post, gid, field):
+    """Did THIS write rotate? -> (is_rotation, why).
+
+    This is an EXEMPTER, so it must fail toward CLOBBERED (guard-4015): an
+    exempter that over-matches is a SILENT false miss that disables the
+    protection, unlike a detector that over-matches and announces itself.
+
+    THE NOTICE IS PERSISTENT — this is the whole difficulty, and the naive
+    reading of it is a FALSE GREEN. rotate_oversize PREPENDS the notice, so it
+    survives every later append and a field that rotated once carries it
+    forever. "Does post carry the marker?" therefore answers "has this field
+    EVER rotated?", never "was THIS write the rotation" — and it would clear a
+    GENUINE clobber of a previously-rotated field, which is the one direction an
+    exempter must never fail in. Measured by alpha on cc-04 2026-09-22T06:30
+    (a `preserved` row that GREW, 7567 -> 16117, carried the marker too) and
+    reproduced adversarially here before this branch was rewritten.
+
+    THE DISCRIMINATOR IS THE STAMP DELTA. A rotation writes a NEW notice with
+    its own timestamp, so:
+
+        post's notice stamp must be STRICTLY NEWER than pre's (or pre has none).
+
+    That is exact, needs no wall-clock tolerance and no KEEP_BYTES arithmetic —
+    the latter would be wrong anyway, because the trim lands on a BLOCK boundary
+    rather than on the constant (measured by zeta on cc-02, same day). Both
+    values are already in hand, so it costs nothing.
+
+    Then two conjuncts for RECOVERABILITY, because a rotation's promise is that
+    the removed blocks are still readable:
+      * the notice NAMES this goal's own sink (a header copied from another
+        goal's note cannot borrow that goal's archive);
+      * that sink EXISTS — a note ASSERTING an archive is a claim, not evidence
+        (guard-6715; archive-before-delete.md step 4). The path is DERIVED the
+        way the producer derives it, never parsed out of a sentence that may be
+        reworded.
+    """
+    post_stamp = _rotation_stamp(post)
+    if post_stamp is None:
+        return False, ""                      # not a rotation — caller falls through
+    pre_stamp = _rotation_stamp(pre)
+    if pre_stamp is not None and post_stamp <= pre_stamp:
+        # Inherited notice, unchanged by this write. ISO-8601 in a fixed shape
+        # sorts lexicographically, so string compare IS chronological compare.
+        return False, ("rotation notice is INHERITED (unchanged stamp %s) — this "
+                       "write did not rotate" % post_stamp)
+    if not gid or not field:
+        return False, "rotation notice present but goal/field unknown — cannot verify"
+    try:
+        from _paths import WORLD_DIR          # resolved per-agent; never hand-derived
+        sink = pathlib.Path(WORLD_DIR) / "audit-reports" / "goal-note-archive" \
+            / ("%s.%s.md" % (gid, field))
+    except Exception as e:                    # pragma: no cover - env-dependent
+        return False, "rotation notice present but WORLD_DIR unresolvable (%s)" % e
+    if str(sink) not in post[:4000]:
+        return False, "rotation notice does not name this goal's archive sink"
+    if not sink.exists():
+        return False, "rotation notice names a MISSING archive: %s" % sink
+    return True, "rotated at %s; archive verified: %s (%d B)" % (
+        post_stamp, sink.name, sink.stat().st_size)
+
+
+def _classify(pre, post, goal, restore_lookup=None, gid=None, field=None):
     """Verdict for one narrative write, as (verdict, why).
 
     `goal` is the POST-write goal record (may be None). `restore_lookup` is a
     zero-arg callable returning the older snapshot name whose value `post`
     re-inserts, or None — a callable rather than a value so the expensive
     lookback runs ONLY for rows that would otherwise be reported as loss.
+    `gid`/`field` identify the row so the rotation exemption can VERIFY the
+    archive; both default to None, and without them a rotation stays CLOBBERED.
     """
     if not pre:
         return "new", ""
     if pre.strip() in post:
         return "preserved", ""
-    # Containment failed. Necessary, not sufficient: two SANCTIONED writes also
-    # fail it. Reclassify those two narrowly; everything else stays CLOBBERED.
+    # Containment failed. Necessary, not sufficient: THREE SANCTIONED writes also
+    # fail it. Reclassify those three narrowly; everything else stays CLOBBERED.
+    #
+    # guard-3328: enumerate where EVERY outcome of a new test routes. This one
+    # has four, and only the first is new-quiet —
+    #   notice absent                      -> why == "", fall through UNCHANGED
+    #   notice INHERITED (stamp unchanged) -> CLOBBERED, and say so  <- the false-green case
+    #   notice NEW + archive verified      -> "rotated"  (exempt)
+    #   notice NEW + archive MISSING       -> CLOBBERED, and say so (the alarming case)
+    #   notice NEW + unnamed/unresolvable  -> CLOBBERED, and say so
+    is_rot, rot_why = _rotation_check(pre, post, gid, field)
+    if is_rot:
+        return "rotated", rot_why
+    if rot_why:
+        return "CLOBBERED", rot_why
     stamp = _provenance_stamp(pre)
     if (goal or {}).get("recurring") and stamp:
         # closure-evidence-write.sh deliberately replaces occurrence N-1's note
@@ -197,6 +306,14 @@ def _classify(pre, post, goal, restore_lookup=None):
 # The bound is REPORTED when it bites (never a silent cap): a truncated lookback
 # can only UNDER-detect restores, which fails toward CLOBBERED — the loud side.
 RESTORE_LOOKBACK = 8
+
+# How many whole-store snapshots load() keeps in memory at once. Each one is the
+# ENTIRE target file (the goal store by default: 29 MB on disk, more once
+# decoded) and a row only ever compares two. Unbounded until 2026-09-22:
+# `--examine 400` grew to 4.9 GB and then 7.4 GB on cc-13 and was OOM-killed
+# both times. The bound changes memory only, never a verdict: load() returns
+# the same content either way, and an evicted snapshot is reconstructed again.
+SNAPSHOT_CACHE = 2
 
 
 def _restored_from(post, gid, field, i, hits, load, stats=None):
@@ -257,12 +374,16 @@ def main():
               % len(snaps), file=sys.stderr)
         return 2
 
-    cache = {}
+    cache = collections.OrderedDict()  # least recently used first
 
     def load(p):
-        if p.name not in cache:
-            c = _history_store.restore(target, p.name, base)
-            cache[p.name] = c.decode("utf-8") if isinstance(c, bytes) else c
+        if p.name in cache:
+            cache.move_to_end(p.name)
+            return cache[p.name]
+        while cache and len(cache) >= SNAPSHOT_CACHE:
+            cache.popitem(last=False)  # evict BEFORE restoring, so the peak stays bounded
+        c = _history_store.restore(target, p.name, base)
+        cache[p.name] = c.decode("utf-8") if isinstance(c, bytes) else c
         return cache[p.name]
 
     rows = []
@@ -275,7 +396,8 @@ def main():
             continue
         verdict, note = _classify(
             pre, post, _goal(load(snaps[i - 1]), gid),
-            lambda: _restored_from(post, gid, field, i, hits, load, stats))
+            lambda: _restored_from(post, gid, field, i, hits, load, stats),
+            gid=gid, field=field)
         rows.append({"snapshot": p.name[:19], "agent": agent, "goal": gid,
                      "field": field, "pre_chars": len(pre), "post_chars": len(post),
                      "verdict": verdict, "note": note})
@@ -283,6 +405,7 @@ def main():
     clob = [r for r in rows if r["verdict"] == "CLOBBERED"]
     sup = [r for r in rows if r["verdict"] == "superseded"]
     res = [r for r in rows if r["verdict"] == "restored"]
+    rot = [r for r in rows if r["verdict"] == "rotated"]
     by_agent = {}
     for r in clob:
         by_agent[r["agent"]] = by_agent.get(r["agent"], 0) + 1
@@ -291,6 +414,7 @@ def main():
         print(json.dumps({"scanned": len(snaps), "narrative_writes_found": len(hits),
                           "examined": len(rows), "clobbered": len(clob),
                           "superseded": len(sup), "restored": len(res),
+                          "rotated": len(rot),
                           "restore_lookback_truncated": stats["restore_lookback_truncated"],
                           "by_agent": by_agent, "rows": rows}, indent=1))
     else:
@@ -310,7 +434,7 @@ def main():
         # exemption unauditable, which is how an exempter's silent false miss
         # (guard-4015) survives review.
         print("reclassified (NOT data loss, and NOT hidden — rows above): "
-              "superseded=%d restored=%d" % (len(sup), len(res)))
+              "superseded=%d restored=%d rotated=%d" % (len(sup), len(res), len(rot)))
         if stats["restore_lookback_truncated"]:
             print("NOTE: restore lookback hit its %d-write bound on %d row(s) — those "
                   "may be restores reported as CLOBBERED. Truncation can only "

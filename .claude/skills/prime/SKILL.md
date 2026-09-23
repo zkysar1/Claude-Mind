@@ -357,8 +357,8 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
 
 11. Bash: peer-surface.sh
     → THIS WORLD IS NOT ALONE. Peer deployments are registered in
-      `core/config/environments/*.yaml`, and one of them (`zds-mind`) has been
-      posting to this world's board continuously since 2026-06-02. Every other
+      `core/config/environments/*.yaml`, and a peer can post to this world's
+      board continuously (one has since 2026-06-02). Every other
       store /prime loads describes this world only, so without this read the
       PRIMED summary is a complete-looking picture of a world the agent has no
       reason to believe has neighbours — and an agent that primes into a
@@ -440,8 +440,8 @@ Partner ({partner-name}): {if in_flight: "in_flight {goal_id} '{title[:40]}' pha
  this block exists to close. Sits directly under Partner by design: Partner is
  the local fleet, Peers is the same question asked across deployments.
  Typical shape:
-   "Peers: 3 registered (claude-mind:local, local:local, zds-mind:local) | self=ayoai-mind:own-cloud"
-   "Inbound (7d): 34 posts from zds-mind [coordination 17, findings 17]"
+   "Peers: 3 registered (acme-mind:local, local:local, widget-mind:local) | self=my-mind:own-cloud"
+   "Inbound (7d): 34 posts from acme-mind [coordination 17, findings 17]"
    "Cross via core/scripts/peer-board-post.sh (convention: core/config/conventions/cross-deployment-channel.md)"}
 {Pending encodings (cross-agent) — OMIT entire block when pending_encodings is empty.
  Otherwise render:

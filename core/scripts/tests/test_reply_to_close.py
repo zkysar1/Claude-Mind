@@ -166,9 +166,17 @@ def test_attribution_line_is_ignored():
 
 
 def test_goal_id_width_range():
-    ids = find_goal_ids("g-1-01 g-115-6477 g-326-99 g-9999-9999 gx-1-01 g-1-1")
+    ids = find_goal_ids("g-1-01 g-115-6477 g-326-99 g-9999-9999 gx-1-01 g-1-1 g-115-100000")
     assert "g-115-6477" in ids and "g-326-99" in ids and "g-1-01" in ids
-    assert "g-1-1" not in ids, "suffix is 2-4 digits"
+    assert "gx-1-01" not in ids, "the prefix must still be exactly g-"
+    # The SUFFIX floor was dropped 2026-09-21 (): the sequence is a
+    # growing counter, so guard-1161 forbids a bound at EITHER end. `g-1-1` now
+    # matches and that is deliberate -- nothing mints a 1-digit sequence (all
+    # three allocators emit `{seq:02d}`; 0 of 5,775 live ids carry one), and a
+    # spurious match costs a lookup miss where a spurious REFUSAL costs a
+    # fleet-wide filing outage. This assertion read `"g-1-1" not in ids` before.
+    assert "g-1-1" in ids, "the suffix is open-ended: guard-1161"
+    assert "g-115-100000" in ids, "a 6-digit sequence must come back WHOLE"
 
 
 def test_find_verbs_reads_only_whole_lines():

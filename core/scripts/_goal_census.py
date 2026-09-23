@@ -81,6 +81,41 @@ def all_evicted_ids(asp):
     return sorted(out)
 
 
+def evicted_status_in(items, goal_id):
+    """Terminal status of `goal_id` if ANY aspiration in `items` records it as
+    evicted, else None. `items` is an ALREADY-LOADED list of aspiration dicts —
+    this helper never opens a store (guard-6972: a shared helper takes the
+    resolved base, it does not re-derive one), so a caller that has already
+    read live/archive pays nothing extra to consult the tombstone census.
+
+    WHY IT EXISTS (g-353-108). A terminal goal is EVICTED from its aspiration's
+    `goals[]` after `aspirations_eviction.age_days` and survives ONLY as a bare
+    id here. Every hand-rolled "scan live, then archive" lookup therefore
+    returns None for a goal that provably COMPLETED, and an empty goal-id
+    lookup is not an absence (guard-5278, guard-4748). This is the third
+    consumer of that one blind spot; `retrieve.py::_is_goal_terminal` and
+    `goal-resolve.py` are the first two.
+
+    NOT ADOPTED BY (guard-4622 — a shared helper does not make its non-adopters
+    consistent, and a docstring that lists only adopters hides the rest):
+    `dependency-cycle-check.py` dangling_edges still hand-rolls its own scan.
+    That call site is g-115-9191's; this docstring is wrong the moment it
+    adopts, so correct it then rather than leaving the omission to be inferred.
+
+    THERE IS NO TIMESTAMP HERE. The census is an id SET per status — it can say
+    THAT a goal completed, never WHEN. A caller needing the completion instant
+    must treat evicted as timestamp-unavailable and decide explicitly; only
+    `goal-resolve.py --recover` can recover one, by walking `.history` blobs,
+    which is far too expensive for a predicate evaluated per candidate."""
+    for asp in items or ():
+        if not isinstance(asp, dict):
+            continue
+        for status, ids in census_evicted_ids(asp).items():
+            if goal_id in ids:
+                return status
+    return None
+
+
 def census_by_status(asp):
     """Return {status: count} of evicted goals for an aspiration (possibly empty).
 

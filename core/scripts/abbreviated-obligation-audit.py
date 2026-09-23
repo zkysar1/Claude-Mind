@@ -143,16 +143,29 @@ def _normalize_phase(phase, schema):
 
 
 def _normalize_condition(condition):
-    """Strip a TRAILING parenthetical from a claimed condition.
+    """Strip a TRAILING explanation from a claimed condition.
 
     `condition not in allowed` is exact membership, so a claim naming the canonical token
     AND recording what was done inline — the more informative claim — failed where a bare
-    token passed. The canonical tokens carry no parentheses of their own, so a claim
-    naming a genuinely different condition still fails.
+    token passed. The explanation arrives in TWO punctuations: parenthesised, and as a
+    following SENTENCE (`context_budget.zone == tight. Steps 8 and 8.5 ran in full.`).
+    Only the first was stripped until 2026-09-21, and the sentence form was the live
+    shape — measured over the 14-record fleet corpus that day it was the sole cause of
+    2 of 13 false verdicts, both on claims whose condition was TRUE.
+
+    Cutting at ". " (period + SPACE) is safe: no canonical token contains that pair
+    (`context_budget.zone` has a period with no space after it), so a claim naming a
+    genuinely different condition still fails. Keep this body identical to its twin in
+    `obligation-audit.py` — which carries the full measurement —
+    `test_obligation_audit_phase_vocabulary.py` pins the two together.
     """
     cond = (condition or "").strip()
-    head, sep, _rest = cond.partition(" (")
-    return head.strip() if sep else cond
+    cut = len(cond)
+    for sep in (" (", ". "):
+        i = cond.find(sep)
+        if i != -1:
+            cut = min(cut, i)
+    return cond[:cut].strip()
 
 
 def _validate_claim(phase, condition, schema, iter_outcome_class, claim_zone):
@@ -161,7 +174,11 @@ def _validate_claim(phase, condition, schema, iter_outcome_class, claim_zone):
     phase = _normalize_phase(phase, schema)
     condition = _normalize_condition(condition)
     spec = obligations.get(phase)
-    if spec is None:
+    # `not spec`, NOT `is None` — the twin uses the falsy test and a phase key
+    # carrying an empty body governs nothing, so the two disagreed on a real
+    # input: OA said "unknown obligation phase" where this one fell through to
+    # "schema disallows this condition" (measured 2026-09-21).
+    if not spec:
         return False, "unknown obligation phase"
     allowed = spec.get("abbreviated_allowed_when") or []
     if condition not in allowed:
@@ -171,10 +188,14 @@ def _validate_claim(phase, condition, schema, iter_outcome_class, claim_zone):
             return True, None
         return False, f"claim says routine but checkpoint says {iter_outcome_class}"
     if condition == "context_budget.zone == tight":
+        # Wording kept SOURCE-NEUTRAL and identical to the twin's — see the long
+        # comment on `obligation-audit.py::_validate_claim`. The reason is a
+        # category key that the twin tallies into a filed goal, so "banner says…"
+        # here vs "runtime zone=…" there split one category in two.
         if claim_zone is None:
-            return False, "banner line missing — citation absent"
+            return False, "zone citation absent"
         if claim_zone != "tight":
-            return False, f"banner says zone={claim_zone} but claim says tight"
+            return False, f"observed zone={claim_zone} but claim says tight"
         return True, None
     return False, "schema allows it but no verifier"
 

@@ -13,7 +13,9 @@ resolves it via aspirations-read.sh; aspirations-query.sh projects only 6
 fields and drops claimed_by), takes --agent and --goal-id args, prints ONE
 verdict line:
 
-    LIVE: <reason>            claim intact (status=in-progress, claimed_by=agent)
+    LIVE: <reason>            claim intact (claimed_by=agent AND status is
+                              in-progress, OR 'pending' — the shape
+                              aspirations-claim.sh leaves behind; g-115-10473)
     STALE: <reason>           claim superseded / released / taken over
     INDETERMINATE: <reason>   record unreadable or goal not found (fail-open)
 
@@ -69,6 +71,44 @@ def verdict(payload_text: str, agent: str, goal_id: str) -> tuple[str, str]:
 
     status = rec.get("status")
     claimed_by = rec.get("claimed_by")
+
+    # : `pending` + OUR OWN claim is a LIVE claim that has not been
+    # advanced yet — it is the shape aspirations-claim.sh PRODUCES (it writes
+    # claimed_by/claimed_at/started/executed_by and deliberately leaves status
+    # at 'pending'). Without this branch the broader branch below hands that
+    # normal claim output a DEFINITE "STALE", citing three causes — completed,
+    # superseded, released — none of which happened (guard-3616: a classifier's
+    # fall-through must not assign a definite verdict to a case it has no
+    # information about; this file already states the house rule by carrying
+    # INDETERMINATE).
+    #
+    # THE SLOT IS LOAD-BEARING (guard-6943): BELOW the two read-quality
+    # INDETERMINATE guards above — an unreadable or absent record must never
+    # reach a definite verdict — and ABOVE the weaker `status != in-progress`
+    # branch, which fires on a broader predicate and would otherwise swallow
+    # the case this teaches the chain to recognise.
+    #
+    # `claimed_by == agent` is what makes admitting 'pending' safe: release()
+    # pops claimed_by/claimed_at/claimed_by_sid together (aspirations_write.py
+    # release), so a RELEASED claim cannot reach here —
+    # test_stale_when_released_to_pending pins exactly that pairing
+    # (pending + claimed_by=None -> STALE) and is unaffected. Every terminal
+    # status (completed/skipped/expired/superseded/decomposed) still falls
+    # through to STALE below. This adds no looseness the in-progress arm did
+    # not already have: both are agent-NAME scoped, and the caller resolves the
+    # goal id from its OWN Body-scoped in_flight row.
+    #
+    # MEASURED cc-03 2026-09-22 (Linux 6.8.0-139-generic): a live claim made
+    # seconds earlier by aspirations-claim.sh read STALE, and this box's own
+    # mind_api/state/spawn.log carries two REFUSED --restart lines
+    # ( 07:27,  06:22, both 2026-09-20) — a second-box
+    # replication of the cc-04 incident that filed this goal (guard-7213).
+    if status == "pending" and claimed_by == agent:
+        return ("LIVE",
+                f"status='pending' claimed_by={agent} — claimed but not yet "
+                f"advanced (aspirations-claim.sh leaves status at 'pending'; "
+                f"g-115-10473)")
+
     if status != "in-progress":
         return ("STALE",
                 f"status={status!r} (expected in-progress) — claim was "

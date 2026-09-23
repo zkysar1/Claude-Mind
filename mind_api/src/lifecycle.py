@@ -255,6 +255,127 @@ def is_daemon_alive(project_root: Path) -> bool:
     return is_pid_alive(pid)
 
 
+def log_event(project_root: Path, event: str, version: str, **extra: object) -> str:
+    """Append one JSON lifecycle record to daemon.log and return the line.
+
+    Single writer for the daemon.log record SHAPE. `server.py::_log_lifecycle`
+    delegates here for started/stopped; `__main__.py` uses it for the spawn-time
+    REFUSAL records, which until g-115-10336 went to stderr only -- i.e. into the
+    spawn log, not daemon.log. That asymmetry is why a reader auditing daemon.log
+    saw started events with no matching decision record explaining the gaps.
+
+    Never raises: a lifecycle record must not be able to kill a daemon start.
+    """
+    import json as _json
+    import time as _time
+
+    line = _json.dumps({
+        "ts": _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime()),
+        "event": event,
+        "version": version,
+        **extra,
+    }, ensure_ascii=False)
+    try:
+        with daemon_log(project_root).open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    return line
+
+
+def find_unreferenced_daemon_pids(project_root: Path) -> list:
+    """Live `mind_api.src` processes that the published daemon pair does NOT name.
+
+    `is_daemon_alive` answers "is the REGISTERED daemon alive?" -- it reads
+    daemon.pid. It cannot answer "is ANY daemon alive?", so whenever daemon.pid is
+    missing, stale or unparsable beside a genuinely live daemon it returns False,
+    the caller proceeds to `clear_runtime_files()`, and that live daemon becomes
+    UNREFERENCED: still listening, still burning CPU, reachable by nothing. That
+    is the measured g-115-10336 signature (a 17.8h orphan at 24% CPU / 4h17m CPU
+    time; a later one at 3.7 GB RSS that OOM-killed a close mid-verify) and the
+    guard-6980 one (ten orphans over 18h holding ~4.25 GB).
+
+    Census via `ps -eo pid=,args=` with the match done in PYTHON, deliberately NOT
+    via `pgrep -f`:
+      * guard-1238 direction 1 (PHANTOM-ALIVE): a `pgrep -f mind_api.src` self-
+        matches whenever the pattern is in the probing command line. Here the
+        matching happens in-process and `os.getpid()` is dropped explicitly.
+      * guard-1238 direction 2 (PHANTOM-DEAD): omitting `-f` matches comm only
+        (`python3`), so a module-path pattern returns a confident zero. `args=`
+        is the full argv surface, so the pattern and the surface agree by
+        construction.
+      * The shipped sweeps key on `pgrep -f 'python.* -m mind_api\\.src'`, which
+        requires the argv to begin with `python`; a `py -3 -m mind_api.src` launch
+        does not match it. Matching on the module token alone has no such gap.
+
+    Returns a sorted list of ints. Empty on any probe failure -- the caller must
+    not refuse a start because `ps` was unavailable (fail-open; guard-1562).
+    """
+    import subprocess  # local: keeps the import off the module-load hot path
+
+    keep = {os.getpid()}
+    for reader in (read_pid, read_parent_pid):
+        with contextlib.suppress(Exception):
+            v = reader(project_root)
+            if v:
+                keep.add(int(v))
+
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:  # noqa: BLE001 -- no ps (Windows), timeout, permissions
+        return []
+
+    return parse_ps_for_daemon_pids(out, keep)
+
+
+def parse_ps_for_daemon_pids(ps_output: str, keep) -> list:
+    """Pure parse half of `find_unreferenced_daemon_pids` -- the matching rule.
+
+    Split out so the rule can be pinned against FIXED `ps` text: the live call
+    above can only ever assert against whatever happens to be running on the box,
+    and an always-empty matcher passes that assertion identically to a working one
+    (the guard-1715 / rb-245 shape -- a zero from an empty population reads the
+    same as a clean scan). The regression test drives this function with a fixture
+    containing a self-match line, a `py -3` launch and a bare mention, none of
+    which can be produced on demand from a live process table.
+    """
+    keep = set(keep or ())
+    found = []
+    for raw in ps_output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        head, _, args = line.partition(" ")
+        # Only an actual module launch counts. A `grep mind_api.src`, an editor
+        # holding the file open, or the census command itself all NAME the module
+        # without being a daemon -- matching those is guard-1238's PHANTOM-ALIVE
+        # direction, and here it would refuse every legitimate start.
+        # The token must END the argument -- end-of-string or a following space.
+        # A bare substring test matches `-m mind_api.srcfoo` too (measured: it
+        # returned that pid), and because this census REFUSES a start, one
+        # false positive refuses EVERY start on the box. Severity is inverted
+        # from the usual matcher: over-matching here is an outage, under-matching
+        # is the orphan leak we already had.
+        marker = " -m mind_api.src"
+        idx = args.find(marker)
+        if idx < 0:
+            continue
+        tail = args[idx + len(marker):]
+        if tail and not tail[0].isspace():
+            continue
+        try:
+            pid = int(head)
+        except ValueError:
+            continue
+        if pid in keep:
+            continue
+        found.append(pid)
+    return sorted(found)
+
+
 def read_port(project_root: Path) -> Optional[int]:
     """Read the port file. Returns None if missing or unparsable."""
     p = port_file(project_root)
