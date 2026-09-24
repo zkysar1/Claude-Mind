@@ -482,8 +482,10 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
             # ALLOW anyway for a worker SID and could never be reached with a
             # second JSON document on stdout without turning this into a
             # fail-open parse. The prompt is a natural-language line, never a
-            # slash command (schedule-wakeup-correctness.md).
-            printf '%s\n' '{"wakeup": {"prompt": "Parked worker Body: re-enter /worker-loop at Phase -0 (the manifest reads parked = RESUMABLE), re-run the Phase 0.5 reducer poll and SELECT; a claim resumes this Body, no eligible goal re-parks it.", "delay_seconds": 3600}}'
+            # slash command (schedule-wakeup-correctness.md). SELECT is
+            # conditional on the poll (): "poll and SELECT" read as
+            # unconditional, and a reviewer flagged a correct rc-1 re-park.
+            printf '%s\n' '{"wakeup": {"prompt": "Parked worker Body: re-enter /worker-loop at Phase -0 (the manifest reads parked = RESUMABLE) and re-run the Phase 0.5 reducer poll. SELECT only on rc 0 (a claim resumes this Body, no eligible goal re-parks it); rc 1 re-parks it without SELECT.", "delay_seconds": 3600}}'
             exit 0
         elif grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale|closed-graceful)'?[[:space:]]*$" \
                 "$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-manifest.yaml" 2>/dev/null; then
@@ -578,6 +580,59 @@ if [ -f "$HOOK_AGENT_DIR/session/recovery-log.jsonl" ] \
         echo "$(date +%Y-%m-%dT%H:%M:%S) YANK-REVERSED sid=$HOOK_SID agent=$HOOK_AGENT state=$_RY_STATE" >> "$LOG" 2>/dev/null || true
     fi
     unset _RY_STATE
+fi
+
+# --- Gate 0-stop: an UNFINISHED graceful stop holds its own session's turn open
+# () ---
+# THE DEFECT. Graceful-stop D1 sets IDLE long before D7 finishes the stop, and Gate 1
+# below ALLOWs every non-RUNNING turn-end (its own comment names it the allow-path a
+# graceful stop takes), so nothing held the turn open between D1 and D7. Measured
+# 2026-09-24 on a DEV vessel: the mind ended its turn mid-D4 -- the wake-up gate's IDLE
+# refusal had told it "this turn ends normally" -- and Step 9's handoff and D4.5-D7
+# never ran.
+#
+# WHY HERE, ABOVE GATE 0. The stopping session must be held both before D6 (runner file
+# present and SID matching, where Gate 1 would ALLOW) and after it (D6 deletes
+# running-session-id, where Gate 0 would ALLOW gate=no-runner). Only a gate above both
+# reaches the two windows. It sits below Gate 0-pre so a reversed false demotion reads
+# RUNNING and is never held here.
+#
+# THE PREDICATE is stop_in_progress.py's, shared with schedule-wakeup-gate.py (whose
+# IDLE refusal now names the same continuation): not RUNNING + stop-target-mode present
+# + stop-requested consumed (D3) + agent-mode still autonomous + THIS sid is the runner's
+# (running-session-id, else latest-session-id once D6 has run). Only the runner writes
+# those two files, so observers and worker Bodies are never held.
+#
+# BOUNDED (rb-11273): a veto checked ahead of every other gate needs its own bound,
+# because none behind it can fire. At most stop_in_progress.MAX_BLOCKS BLOCKs per stop,
+# counted in this log since stop-target-mode was written. After that the turn-end falls
+# through to the gates below, which ALLOW exactly as before, and a STOP-UNFINISHED-CAP
+# line records that the stop was left unfinished -- a stop that cannot complete never
+# wedges a turn.
+#
+# COST: two bash file tests when no stop is pending. $PY runs only while stop-target-mode
+# exists AND stop-requested is already consumed, i.e. inside D3..D7. FAIL-OPEN: a fault
+# prints `pass error:...` or nothing, and every gate below runs unchanged.
+if [ -f "$HOOK_AGENT_DIR/session/stop-target-mode" ] \
+   && [ ! -f "$HOOK_AGENT_DIR/session/stop-requested" ] && [ -n "$PY" ]; then
+    _SU_OUT=$($PY "$CORE_ROOT/scripts/stop_in_progress.py" --session-dir "$HOOK_AGENT_DIR/session" \
+        --sid "$HOOK_SID" --log "$LOG" 2>/dev/null || echo "")
+    _SU_VERDICT="${_SU_OUT%%$'\n'*}"
+    _SU_PAYLOAD=""
+    case "$_SU_OUT" in *$'\n'*) _SU_PAYLOAD="${_SU_OUT#*$'\n'}" ;; esac
+    case "$_SU_VERDICT" in
+        "block "*)
+            if [ "${_SU_PAYLOAD:0:1}" = "{" ]; then
+                echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK gate=stop-unfinished sid=$HOOK_SID agent=$HOOK_AGENT ${_SU_VERDICT#block }" >> "$LOG" 2>/dev/null || true
+                printf '%s\n' "$_SU_PAYLOAD"
+                exit 0
+            fi
+            ;;
+        "cap "*)
+            echo "$(date +%Y-%m-%dT%H:%M:%S) STOP-UNFINISHED-CAP sid=$HOOK_SID agent=$HOOK_AGENT ${_SU_VERDICT#cap } -- turn-end allowed below; the graceful stop is left unfinished" >> "$LOG" 2>/dev/null || true
+            ;;
+    esac
+    unset _SU_OUT _SU_VERDICT _SU_PAYLOAD
 fi
 
 # --- Gate 0: Session identity — only block the runner session ---

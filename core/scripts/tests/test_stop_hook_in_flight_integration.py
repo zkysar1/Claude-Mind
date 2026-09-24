@@ -963,4 +963,9 @@ def test_the_parked_valve_arms_the_re_poll_and_the_closed_valve_cancels_it(tmp_p
     assert not arm["prompt"].lstrip().startswith("/"), (
         "a slash-prefixed wake-up prompt is rejected as user input at fire time")
     assert "worker-loop" in arm["prompt"] and "parked" in arm["prompt"]
+    # : SELECT follows the poll only on rc 0; rc 1 re-parks without it.
+    # "re-run the poll and SELECT" read as unconditional, and a Body's reviewer
+    # flagged its correct rc-1 re-park as "SELECT not re-run" (15 iterations).
+    assert "only on rc 0" in arm["prompt"] and "without SELECT" in arm["prompt"]
+    assert "poll and SELECT" not in arm["prompt"]
     assert closed["wakeup"] == {"cancel": True}

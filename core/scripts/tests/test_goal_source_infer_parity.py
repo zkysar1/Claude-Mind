@@ -56,6 +56,8 @@ INFER_RECOGNIZED_SIGNALS = [
     "skill-discovery-audit:some-forged-skill:silently_undertriggering",
     "blocker_pattern:efs-unreachable",
     "s3-churn:example-world/hot-object",
+    "detector:rb-undiagnosed-cluster",
+    "detector:widget-drift:2026-09-01T00:00:00",
     # -> agent-self
     "idle_fallback",
     "decomposition:parent-1",

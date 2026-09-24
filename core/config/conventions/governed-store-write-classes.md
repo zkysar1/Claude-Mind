@@ -934,11 +934,15 @@ because the operator re-publishes its full verdict set every run by design.
 on `seen` looks perfectly commutative and is the first thing a reader reaches
 for. It is disqualified by guard-1816 step 2: `save_ledger`
 (`world/scripts/operator_verdict_pull.py:114`) evicts oldest-first past
-`MAX_LEDGER_ENTRIES = 500`, so the store HAS a removal path and emits a strict
+`MAX_LEDGER_ENTRIES = 500` [2026-09-24, g-115-10526: FIRST-in-dict-order, which
+after the writer's `sort_keys` round-trip is alphabetical, not oldest; see Built
+below. The removal path, and so this disqualification, stand either way], so
+the store HAS a removal path and emits a strict
 subset of what it read. A union handler would silently resurrect every key the
 evicting writer just dropped, at conflict time, on the box that lost the race —
-and because eviction is oldest-first, the resurrected keys are precisely the
-ones the cap exists to shed.
+and because eviction is oldest-first [2026-09-24, g-115-10526: first-in-dict-order,
+per the bracket above; the conclusion holds for any order], the resurrected keys are
+precisely the ones the cap exists to shed.
 
 **Why the risk is not academic.** The sibling file in the same directory,
 `world/audit-reports/alert-sweep-seen-backlog.json`, sat both-diverged for 10+
@@ -970,22 +974,101 @@ re-read. Per guard-1719 the DIAGNOSIS above is measured and this REMEDY half is
 not: the conversion is a real change across the CLI/daemon boundary
 (`mind_api/src/file_locks.locked_rmw` is daemon-side; `core/scripts/_fileops.py`
 exposes `acquire_lock` and `_rmw_with_conflict_retry` but no public
-`locked_rmw`), and it needs the stub-backend mutation proofs the "Testing a
-class-(b) writer" section above requires. Filed as its own goal rather than
-inlined.
+`locked_rmw` [2026-09-24: true of the NAME only; `_fileops.locked_modify_json`
+is that composition, already public; see Built below]), and it needs the
+stub-backend mutation proofs the "Testing a class-(b) writer" section above
+requires. Filed as its own goal rather than inlined.
+
+#### Built (g-115-10526, 2026-09-24, alpha worker Body, hostname cc-08, `uname -r` 6.8.0-139-generic, own-cloud)
+
+**Route: NEITHER of the two named above.** `_fileops.locked_modify_json` (added
+by g-357-41 for the close-review verdict ledger) already IS the composition: it
+takes `<path>.lock` through `acquire_lock`, runs refresh -> read -> modifier ->
+write as ONE cycle, and hands that cycle to `_rmw_with_conflict_retry`. On
+own-cloud the refresh records the ETag that `_put` then sends as `If-Match`, so
+all three invariants hold without a second hand-rolled copy of them. Importing
+the daemon `file_locks.locked_rmw` would add a per-process thread lock and its
+hold telemetry, neither of which a single-threaded CLI uses, on top of the same
+`acquire_lock`.
+
+**What changed in the writer.**
+- `save_ledger(path, stamps)` takes a DELTA (the verdicts THIS run posted
+  successfully) and applies it with `setdefault` to the ledger as read INSIDE
+  the cycle; eviction runs inside the same cycle. The snapshot `main()` reads for
+  its dedup decision is never written back. Writing it was both the lost update
+  and the resurrection.
+- The board posts stay outside the cycle (guard-1965): a conflict re-runs the
+  cycle, and a post is not idempotent.
+- A failed post is simply never stamped, so the ledger only ever holds verdicts
+  that reached the board, which is the direction that must not fail.
+- An unparseable ledger: the primitive parses before the modifier runs, so the
+  pre-fix heal (rebuild from this run's posts) is kept explicitly through
+  `locked_write_json`, which snapshots the bad bytes to `.history` first and
+  writes under the same fence.
+- No `_SNAPSHOT_BLACKLIST` entry, decided rather than defaulted (guard-2415): the
+  file is ~670 B, written once per g-370-58 cadence (`interval_hours` 4) plus any
+  manual `--apply` run, snapshots are capped at 500, and they are the recovery
+  layer the heal relies on.
+
+**Mutation-proven** on copies only (guard-6701), with a stub backend that models
+the own-cloud fence: `refresh` records the ETag, `atomic_write` 412s when the
+remote moved, and a scripted peer PUT lands right after the writer's FIRST read.
+Suite: `world/scripts/tests/test_operator_verdict_ledger_fence.py`, 9/9 green on
+the fix. `P` rows revert one line of a COPY of `_fileops.locked_modify_json`,
+loaded as `sys.modules["_fileops"]` ahead of pytest; `W` rows revert a copy of
+the writer; `M1` registers a handler for this basename in a COPY of
+`coordination_merge`, loaded the same way.
+
+| Mutant | Reverts | Result |
+|---|---|---|
+| W0 | the literal pre-fix writer file | 8/9 red |
+| W1, P1 | force-fresh | 6 red: the same 412 repeats until the retries exhaust |
+| W2, P2 | the conflict retry | 5 red: the first 412 escapes |
+| W3, P3 | the read inside the cycle | 6 red: read-time lock assertion `[False, ...]`, the peer's stamp erased, 499 stale keys resurrected |
+| W4 | eviction | 2 red: 501 keys |
+| W5 | stamping only successful posts | 1 red: a FAILED verdict stamped without its post |
+| W6 | the unparseable heal | 1 red |
+| M1 | the absence of a merge handler | 1 red: a handler is registered for the basename |
+
+W3/P3 is the row to remember: **no conflict fires at all** (one PUT attempt).
+The stale view was read before the fence was taken, so the fence certifies it.
+Only the read-time assertion and the behavioural assertions see that revert,
+which is why invariant 3 is asserted at READ time.
+
+**Live, on the real backend.** An in-process `save_ledger(path, {})` (stamps
+empty, so no board post) moved the store-of-record version d67edff0... ->
+5ccc96f7..., `backend-cat.sh head --exit-on-drift` returned rc=0 `[match]`, and a
+`.history` snapshot of the 669 B pre-write version appeared: the snapshot the raw
+write never took.
+
+**NOT fixed, stated so nobody infers otherwise.**
+- Duplicate posts remain possible. The dedup decision still reads outside the
+  lock, and a fence proves no lost update, never uniqueness (guard-5322). That is
+  the survivable direction.
+- Eviction order. `list(seen)[:n]` evicts the FIRST keys in dict order; the file
+  is written `sort_keys=True`, so after a round-trip that is alphabetical by
+  `<task>|<recipe>|<verdict>`, not oldest-first as the pre-fix comment claimed.
+  Kept as-is (the goal said preserve). It has never run: 7 of 500 entries on
+  2026-09-24 (guard-4294).
+- The fence cures a wedge only on a box that WRITES this file (guard-6190), which
+  means every box that runs the pull with `--apply`.
 
 ## Cross-references
 
 - `core/scripts/coordination_merge.py` — `merge_handler_for` + `_HANDLERS`, the
   authoritative registry; adding a store to class (a) is a commutative handler
   plus one line here
-- `core/scripts/_fileops.py` — `acquire_lock` + `_rmw_with_conflict_retry`.
-  **There is no public `locked_rmw` here** (this line named one until
-  2026-09-21, g-115-10526): the composed `locked_rmw` lives in
-  `mind_api/src/file_locks.py`, daemon-side. A CLI under `core/scripts/` or
-  `world/scripts/` must compose the two `_fileops` primitives itself or import
-  the daemon module deliberately — check which you have before citing it as
-  drop-in
+- `core/scripts/_fileops.py` — `acquire_lock` + `_rmw_with_conflict_retry`,
+  AND their composition for the CLI lane: `locked_modify_json` /
+  `locked_modify_yaml` / `locked_modify_jsonl` each take the lock, refresh and
+  read INSIDE the cycle, and retry the cycle on a conflict (read 2026-09-24).
+  That is the class-(b) pattern, drop-in; it is mutation-proven through a writer
+  for `locked_modify_json` only (g-115-10526). No function here is NAMED
+  `locked_rmw`: that name is the daemon's (`mind_api/src/file_locks.py`), which
+  adds a per-process thread lock on top of the same `acquire_lock`. Until
+  2026-09-24 this line said a CLI "must compose the two primitives itself or
+  import the daemon module". That was true of the name, and it hid the composed
+  primitives from the goal it was written for
 - `core/scripts/tests/test_meta_yaml_conflict_retry.py` — the reference suite
 - `rb-2639` — per-object stale-IfMatch deadlock (why class (b) wedges)
 - `rb-3636` — own-cloud write_conflict triage: retry-less / silent-loss /

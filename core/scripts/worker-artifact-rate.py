@@ -22,6 +22,42 @@ guessed. Everything below therefore reports the unstamped group as
 regression in reducer artifact rate" cannot be measured from this field alone;
 the comparison printed here is a floor, not that metric.
 
+THE SOURCE IS THE WORLD QUEUE'S FULL RECORD HISTORY, LIVE + ARCHIVE (guard-676).
+`_completed_goals` reads `aspirations.jsonl` AND `aspirations-archive.jsonl`
+under WORLD_DIR. Reading only the live file was measured to make the soak gate
+unsatisfiable: per `core/config/conventions/aspirations.md` §Archival Rules the
+live file "stays small (only active aspirations)" — a completed goal leaves it
+when its parent aspiration is archived, so the measured population is a ROLLING
+window whose width is set by archival, and elapsed wall-clock ROLLS it rather
+than WIDENING it (zeta, 2026-09-16: N fell 228 -> 30 over eleven days while the
+span stayed 2-4 days; the 14-day window could never be computed from the source).
+guard-676: a time dimension counted toward a threshold MUST come from the full
+record history, never a bounded window. Two readings pinned the fix:
+
+    2026-09-16 (zeta, cc-02):  archive 3 worker-stamped non-routine closes
+                               (2x 2026-08-24, 1x 2026-09-03); live span 2 days.
+                               Union span 22 days -> the guard could already
+                               clear; zeta's "no 14-day worker span" conclusion
+                               was refuted by her own numbers.
+    2026-09-24 (alpha, zc-02): archive 3 (same rows); live N=23 span 2 days
+                               (2026-09-22..24). Union N=26, span 31 days
+                               (2026-08-24..2026-09-24).
+
+Caveats that are part of the contract, not footnotes:
+
+  - THE UNION IS A SINGLE-BOX READING. The local tree is a read-through cache
+    (guard-980): worker-stamped closes of 2026-09-05..2026-09-21 (where the
+    cc-10 population of 228 would sit) are present in NEITHER store as read
+    from cc-02/zc-02. That is an absence of visibility, not an absence of
+    closes — treat the union as a floor on the true fleet population.
+  - PER-AGENT QUEUES ARE OUT OF SCOPE BY MEASUREMENT. Worker-stamped non-routine
+    completes live in the world queue (25/25 live + 3/3 archive as of
+    2026-09-24; the agent queue carried 0 of its completed goals stamped).
+    If that population grows, re-scope this check deliberately.
+  - DEDUP: a goal counted in BOTH files is counted once, with the live record
+    winning (archival is a move; a goal in both is a mid-move race or a
+    duplicate write, and the live file is the current authority).
+
 WHY THERE IS AN INSUFFICIENT-DATA STATE. The stamp is going-forward, so the
 population is 0 the day it ships and grows only as workers close goals on boxes
 whose daemon has restarted (the allowlist is imported at daemon start). A rate
@@ -143,12 +179,36 @@ def _window_days(days) -> "int | None":
 
 
 def _completed_goals(world: Path):
-    """(goal_id, completed_by_role, outcome_class, completed_day) per closed goal."""
+    """(goal_id, completed_by_role, outcome_class, completed_day) per closed goal.
+
+    LIVE + ARCHIVE, deduped on goal id with the LIVE record winning — see the
+    SOURCE contract in the module docstring (guard-676: the time dimension of
+    a gate must come from the full record history, not the rolling live file).
+    The archive file is OPTIONAL: a fresh world has no archive yet, and a goal
+    with no readable id (empty under either name) is never deduped — it
+    cannot join anything, so double-counting it is invisible to every figure
+    that matters and refusing it would be a new failure with no buyer.
+    """
+    live_ids = set()
     for rec in _load_jsonl(world / "aspirations.jsonl"):
         for goal in rec.get("goals", []) or []:
             if goal.get("status") != "completed":
                 continue
-            yield (_goal_id(goal),
+            gid = _goal_id(goal)
+            if gid:
+                live_ids.add(gid)
+            yield (gid,
+                   str(goal.get("completed_by_role") or ""),
+                   str(goal.get("outcome_class") or ""),
+                   _completed_day(goal))
+    for rec in _load_jsonl(world / "aspirations-archive.jsonl"):
+        for goal in rec.get("goals", []) or []:
+            if goal.get("status") != "completed":
+                continue
+            gid = _goal_id(goal)
+            if gid and gid in live_ids:
+                continue                    # live record wins (module docstring)
+            yield (gid,
                    str(goal.get("completed_by_role") or ""),
                    str(goal.get("outcome_class") or ""),
                    _completed_day(goal))

@@ -18,6 +18,12 @@
 # where the pre-push M2 tag gate must still run.
 core/githooks/* text eol=lf
 
+# The domain-term blocklist is read line-by-line by shell (domain-leak-check.sh
+# `while read`), and a CRLF checkout left a CR on every term: "term\r" matched
+# nothing and the scan printed CLEAN on every autocrlf=true Windows box. The
+# reader now strips the CR as well (guard-987); this pin keeps the checkout LF.
+core/config/domain-term-blocklist.txt text eol=lf
+
 # Cross-machine merge self-resolution for APPEND-ONLY agent ledgers (2026-07-03,
 # user-directed GitHub-sync bolstering). When the same agent identity commits
 # from two machines (e.g. container alpha + desktop alpha), both sides append

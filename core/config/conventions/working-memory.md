@@ -266,7 +266,14 @@ prior session are available during boot.
   created: "YYYY-MM-DD"
   sessions_deferred: 0
   _item_ts: "YYYY-MM-DDTHH:MM:SS"   # Auto-added by wm-append.sh
+  resolved: true                    # set ONLY when paid; wm-prune retires it past the slot age
+  resolution: "what paid it, where" # optional
 ```
+
+**Paying a debt**: append the SAME `node_key` with `resolved: true` (wm-append upserts by
+`node_key`, so it replaces the open entry). wm-prune keys on `resolved` alone — a `status: PAID`
+or `ROUTED` marker is invisible to it, and the entry holds a slot forever (measured 2026-09-24:
+5 of 15 slots, echo). A `node_key: null` entry is not upserted; pay it by rewriting the slot.
 
 **Schema gate** (wm-append.sh, rb-248 + g-115-59): entries are validated at write time.
 One of three forms is required — anything else is rejected:

@@ -43,6 +43,12 @@ ordering is right and stays; what was missing is that an IDLE agent has
 nothing to resurrect. State is the discriminator here exactly as
 `stop-requested` is above.
 
+That refusal's TEXT must not assume IDLE means stopped (g-373-138). A graceful
+stop sets IDLE at D1 and still owes D4-D7; told "this turn ends normally" there,
+a vessel mind ended its turn mid-consolidation with no handoff. When
+`stop_in_progress` attributes an unfinished stop to THIS session, the same deny
+names the continuation instead.
+
 Fail-open contract (CRITICAL — do not change without revisiting the trade):
 this gate exists to catch a known LLM mistake, not to be a critical-path
 dependency. Any parse/IO/logic error -> approve. A broken gate is recoverable
@@ -230,6 +236,28 @@ def _arm_would_resurrect_nothing(tool_input, session_id):
         return False                                    # outcome 3 (fail-open)
 
 
+def _arm_deny_reason(session_id):
+    """ARM_DENY_REASON -- unless THIS session is mid-way through a graceful stop.
+
+    D1 sets IDLE long before D7 finishes the stop, so "you are IDLE, this turn
+    ends normally" is false in that window, and a model that believed it ended
+    the turn mid-D4 with no handoff (measured 2026-09-24, g-373-138). The deny
+    stands either way -- arming is still wrong -- only the text changes, and
+    only when stop_in_progress positively attributes an unfinished stop to this
+    session. Any fault falls back to the unchanged text.
+    """
+    try:
+        session = _session_dir(session_id)
+        if session is not None:
+            from stop_in_progress import arm_refusal_for
+            text = arm_refusal_for(session, session_id)
+            if text:
+                return text
+    except Exception:
+        pass
+    return ARM_DENY_REASON
+
+
 def main():
     payload = stdin_json_or_approve()
     if not isinstance(payload, dict):
@@ -245,7 +273,7 @@ def main():
         emit_deny(STOP_DENY_REASON)
 
     if _arm_would_resurrect_nothing(tool_input, payload.get("session_id", "")):
-        emit_deny(ARM_DENY_REASON)
+        emit_deny(_arm_deny_reason(payload.get("session_id", "")))
 
     if is_bad_slash_prefix(prompt):
         emit_deny(DENY_REASON)

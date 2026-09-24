@@ -12,8 +12,9 @@
 # That is deliberate, not timidity: this repo runs an autonomous loop, and a
 # fail-closed per-edit gate that false-positives wedges it (the same reasoning
 # aspirations-precheck Phase 0-pre6 states for its own gate). The value here is
-# the stderr banner plus the durable JSONL ledger -- a silent loss becomes a
-# loud one, which is the whole defect.
+# the banner -- delivered to the model as a hook payload, with a stderr copy
+# for a human -- plus the durable JSONL ledger: a silent loss becomes a loud
+# one, which is the whole defect.
 #
 # Scope is decided in ONE place (tree_write_fence.in_scope): .md bodies under
 # knowledge/tree/. _tree.yaml is excluded -- the index already writes through
@@ -70,10 +71,19 @@ if [ -z "$AGENT_NAME" ] && [ -n "$session_id" ]; then
 fi
 [ -z "$AGENT_NAME" ] && exit 0   # genuinely no agent bound -> nothing to fence against
 
-# The python entry point owns scope, hashing, the ledger and the banner. Its
-# stdout is a JSON verdict we deliberately DISCARD: a PreToolUse hook's stdout
-# is interpreted by Claude Code as a decision payload, and this gate never
-# decides. The banner it prints goes to stderr, which is what surfaces.
+# The python entry point owns scope, hashing, the ledger and the banners. With
+# --hook its stdout is EMPTY unless a banner fires, and then exactly one
+# structured payload (hookSpecificOutput.additionalContext + systemMessage;
+# check's PreToolUse payload also carries permissionDecision "allow"). That is
+# the only channel that reaches the MODEL, which is why stdout is no longer sent
+# to /dev/null. It also means nothing else may be printed there, because Claude
+# Code reads PreToolUse stdout as a decision payload. The same banner goes to
+# stderr, which reaches the human terminal ONLY: an exit-0 hook's stderr is
+# stored as a hook_success transcript record and never enters context
+# (guard-1680, guard-6752). Until  this comment said stderr "is what
+# surfaces" while stdout went to /dev/null, so no CONFLICT or OVER-CAP could
+# reach the model. The  closure records a fresh-session probe of
+# delivery for both events.
 # `env VAR=... cmd` is required, not decorative: tree_write_fence._default_paths
 # resolves its baseline + ledger locations through _paths.AGENT_DIR, which reads
 # MIND_AGENT from the ENVIRONMENT -- passing the name any other way leaves the
@@ -86,6 +96,6 @@ fi
 # captured-output caller, which is every hook invocation and every test. The
 # banner this comment block describes could not have surfaced. Use `>&2` if a
 # future edit needs an explicit stderr redirect; never a /dev/stderr path.
-env MIND_AGENT="$AGENT_NAME" python3 "$CORE_ROOT/scripts/tree_write_fence.py" "$op" "$file_path" >/dev/null || exit 0
+env MIND_AGENT="$AGENT_NAME" python3 "$CORE_ROOT/scripts/tree_write_fence.py" "$op" "$file_path" --hook || exit 0
 
 exit 0

@@ -124,7 +124,14 @@ if [ -n "$MERGE_REF" ]; then
   if git -C "$REPO" merge --no-edit "$MERGE_REF"; then
     log "merged $MERGE_REF"; exit 0
   fi
-  log "MERGE CONFLICT on $MERGE_REF — resolve by hand; the ref is unchanged and can be re-merged" >&2
+  # A merge git REFUSED to start (dirty tree it would overwrite) leaves no
+  # MERGE_HEAD and nothing to resolve; calling it a conflict invites a reader to
+  # "resolve" by discarding the dirty file, which is usually live session state.
+  if git -C "$REPO" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+    log "MERGE CONFLICT on $MERGE_REF — resolve by hand; the ref is unchanged and can be re-merged" >&2
+  else
+    log "MERGE REFUSED on $MERGE_REF — git aborted before merging (no MERGE_HEAD), so there is no conflict to resolve. Usually local changes would be overwritten (git's message above names the paths): commit your OWN churn with explicit pathspecs, never discard it, and re-run --merge in the SAME shell call (a live session's hooks re-dirty those files between calls). The ref is unchanged" >&2
+  fi
   exit 1
 fi
 

@@ -738,3 +738,252 @@ def test_rotation_that_landed_behind_a_refused_resend_is_kept(monkeypatch, tmp_p
         "the rotation landed; handing back the original reports it undone")
     err = capsys.readouterr().err
     assert "re-sent" in err, err
+
+
+# ── 9. Description retention polarity () ─────────────────────────
+#
+# The measured incident (2026-09-22T01:39:29, , guard-7281): an
+# ordinary description append ran keep-newest rotation and archived the 30
+# OLDEST blocks — evicting the unit-lease STEP 0 (which carried a
+# [hoisted:...] pin marker the rotation ignored), the PULL-FIRST step, and the
+# alert ROUTING TABLE, leaving only the later lesson blocks that commented on
+# them. The archive was intact; the loss was the READ SURFACE of the executable
+# head, which no integrity check can see.
+#
+# The policy these tests pin: for field == "description" only, a block the
+# author pinned (a [hoisted:...] or [pin:...] marker) is non-evictable, the
+# rest rotates keep-newest, and when no block is pinned the OLDEST block is
+# pinned by default. Pinning is on the MARKER the author writes, not on an
+# ordinal — the executable head is a RUN of blocks and its length is not
+# knowable from position alone. When the pinned head alone exceeds the keep
+# bound, rotation fails open: the statement surviving beats the field bounded.
+# Every test below asserts a property that FAILS against the pre-fix
+# keep-newest rotation — a test that passes on both is not a regression pin.
+
+def _bounds(monkeypatch, tmp_path, at, keep):
+    monkeypatch.setattr(_paths_for_sink, "WORLD_DIR", str(tmp_path))
+    monkeypatch.setattr(GFA, "ROTATE_DISABLED", False)
+    monkeypatch.setattr(GFA, "ROTATE_AT_BYTES", at)
+    monkeypatch.setattr(GFA, "ROTATE_KEEP_BYTES", keep)
+
+
+def _description_rotation_store(monkeypatch, *, pre):
+    """Fake store + daemon for rotate_oversize on a DESCRIPTION field.
+
+    Mirrors section 8's _rotation_store, but the field is `description` — the
+    key the g-115-10533 retention branch is gated on. The precondition is
+    enforced the way the daemon enforces it (hash mismatch -> 409, nothing
+    written); no peer interleaving here, because section 8 already pins the
+    window and the description path shares that CAS code.
+    """
+    store = {"value": pre}
+    state = {"queries": 0, "writes": [], "refused": 0}
+
+    def fake_run(argv, input=None, **kw):
+        args = [str(a) for a in argv]
+        joined = " ".join(args)
+        if "aspirations-query.sh" in joined:
+            state["queries"] += 1
+            # Echo the value under BOTH text-field keys: rotate_oversize
+            # re-reads the field it is rotating (the CAS fresh-read) and a
+            # description-keyed-only fake would fail that read for a
+            # progress_note rotation and return pre unchanged.
+            return _Res(stdout=json.dumps([{"goal_id": "g-1", "priority": "MEDIUM",
+                                            "description": store["value"],
+                                            "progress_note": store["value"]}]))
+        if "aspirations-update-goal.sh" in joined:
+            expect = args[args.index("--expect-sha256") + 1] if "--expect-sha256" in args else None
+            if expect is not None and expect != _sha(store["value"]):
+                state["refused"] += 1
+                return _Res(returncode=1, stderr=json.dumps(
+                    {"error": "field_precondition_failed", "message": "NOTHING WAS WRITTEN"}))
+            state["writes"].append(input)
+            store["value"] = input
+            return _Res(stdout=json.dumps({"goal_id": "g-1", "description": input}),
+                        stderr="[update-goal] precondition_checked field-sha256=%s\n" % expect)
+        raise AssertionError("unexpected call: %s" % joined)
+
+    monkeypatch.setattr(GFA, "_run", fake_run)
+    return store, state
+
+
+def _desc_block(body, marker=None, pin=None):
+    """One compose()-shaped block: body, optional pin-marker line, sentinel."""
+    text = body
+    if pin:
+        text += "\n" + pin
+    return text + "\n" + GFA.sentinel_for(marker)
+
+
+def test_pinned_head_run_survives_a_description_rotation(monkeypatch, tmp_path):
+    """THE regression. The author-pinned blocks (a RUN, not one) are never the
+    blocks that get archived; the oldest UNPINNED blocks are what rotation
+    moves. Fails against the pre-fix rotation, which kept the newest blocks and
+    cut exactly the pinned head (the measured g-115-817 incident)."""
+    step0 = _desc_block(
+        "STEP 0 — TAKE THE UNIT LEASE FIRST, BEFORE STEP 1 AND BEFORE READING "
+        "THE CURSOR: bash core/scripts/unit-claim.sh acquire g-115-817 run-X",
+        marker="g817-run464-step0", pin="[hoisted:g817-run464-step0-unit-lease]")
+    pull_first = _desc_block(
+        "STEP 1 — PULL-FIRST: bash world/scripts/inbox-watch-pull.sh check "
+        "--json --lane alerts; if verdict=NEW run the full sweep",
+        marker="g817-run464-step1", pin="[pin:g817-run464-step1-pull-first]")
+    # SEVEN lessons, not three: with only three, the cut (2 x 135 B = 270 B)
+    # is smaller than the rotation NOTICE itself (~480 B, it embeds the full
+    # sink path), so `out` came out LARGER than `pre` — the fix cut, but the
+    # field grew. The fixture must cut more than the notice costs; that is
+    # what the size assertion below is really checking.
+    lessons = [_desc_block("LESSON (%s) — a run note appended to the "
+                           "description, %s" % (c, "x" * 60), marker="lesson-%s" % c)
+               for c in "UVWXYAB"]
+    pre = "\n\n".join([step0, pull_first] + lessons)
+    _bounds(monkeypatch, tmp_path, at=500, keep=450)
+    store, state = _description_rotation_store(monkeypatch, pre=pre)
+    out = GFA.rotate_oversize("g-1", "description", "world", pre)
+    assert len(state["writes"]) == 1 and state["refused"] == 0, \
+        "the description is oversize and nothing is pinned against rotation; it must rotate"
+    assert out == store["value"] and out != pre
+    assert out.startswith(GFA.ROTATE_NOTICE_HEAD)
+    # (a) the executable head survives — BOTH pinned blocks, not just the first:
+    # a first-block pin saved STEP 0 in the incident and still lost Step 1.
+    assert "TAKE THE UNIT LEASE FIRST" in out, \
+        "STEP 0 (the pinned task statement) was archived — the g-115-817 incident"
+    assert "PULL-FIRST" in out, \
+        "the second pinned block (a run of blocks, not one) was archived"
+    assert "[hoisted:g817-run464-step0-unit-lease]" in out
+    # (b) the field is still bounded: the oldest UNPINNED lessons went to the sink.
+    sink = tmp_path / "audit-reports" / "goal-note-archive" / "g-1.description.md"
+    assert sink.exists()
+    archived = sink.read_text(encoding="utf-8")
+    assert "LESSON (U)" in archived, "rotation must still cut something — a bare exemption is not the fix"
+    assert "LESSON (U)" not in out
+    assert len(out.encode("utf-8")) < len(pre.encode("utf-8"))
+
+
+def test_unmarked_description_never_archives_its_first_block(monkeypatch, tmp_path):
+    """The goal's literal check: a description carrying NO pin markers still
+    keeps its first block (the original goal statement) — keep-newest alone
+    would have cut it. The default floor is strictly safer than the old
+    polarity, never worse."""
+    blocks = [_desc_block("BLOCK-%d %s" % (i, "y" * 90), marker="m%d" % i) for i in range(4)]
+    pre = "\n\n".join(blocks)
+    _bounds(monkeypatch, tmp_path, at=400, keep=300)
+    store, state = _description_rotation_store(monkeypatch, pre=pre)
+    out = GFA.rotate_oversize("g-1", "description", "world", pre)
+    assert out != pre and out.startswith(GFA.ROTATE_NOTICE_HEAD), "must rotate when oversize"
+    assert "BLOCK-0 " in out, \
+        "the FIRST block of an unmarked description (the task statement) was archived"
+    assert "BLOCK-1 " not in out, "with the head pinned, rotation cuts from the REST"
+    assert "BLOCK-3 " in out, "the newest block is still kept (keep-newest over the rest)"
+
+
+def test_first_block_never_archived_even_when_only_a_later_block_is_marked(
+        monkeypatch, tmp_path):
+    """The goal's check, in the shape the measured  record actually
+    took: an UNMARKED first block, a MARKED block further down. A
+    marker-OR-default implementation (pin the marked set, else block 0) would
+    pin only the marked block and let keep-newest archive block 0 — the
+    original statement — which is exactly what this test exists to forbid."""
+    first = _desc_block("ORIGINAL STATEMENT: what this goal is for, " + "s" * 70, marker="orig")
+    marked = _desc_block("PROTOCOL " + "p" * 70, marker="proto", pin="[pin:proto]")
+    lessons = [_desc_block("LESSON-%d " % i + "l" * 70, marker="m%d" % i) for i in range(4)]
+    pre = "\n\n".join([first, marked] + lessons)
+    _bounds(monkeypatch, tmp_path, at=400, keep=350)
+    store, state = _description_rotation_store(monkeypatch, pre=pre)
+    out = GFA.rotate_oversize("g-1", "description", "world", pre)
+    assert out != pre and out.startswith(GFA.ROTATE_NOTICE_HEAD), \
+        "the description is oversize; a rotation must actually fire (no vacuous pass)"
+    assert "ORIGINAL STATEMENT: what this goal is for" in out, \
+        "the FIRST block was archived although no block was marked with a pin"
+    assert "[pin:proto]" in out, "the marked block is pinned too — the run, not one block"
+    # and rotation still cut something: the oldest UNPINNED lessons went to the sink
+    sink = tmp_path / "audit-reports" / "goal-note-archive" / "g-1.description.md"
+    assert sink.exists()
+    archived = sink.read_text(encoding="utf-8")
+    assert "LESSON-0" in archived and "LESSON-0" not in out
+
+
+def test_pinned_head_oversizing_the_bound_fails_open(monkeypatch, tmp_path):
+    """When the pinned head ALONE exceeds the keep bound, no bound can shrink
+    the field without cutting the statement: rotation must cut nothing (the
+    fail-open the module docstring names). (a) the statement survives beats
+    (b) the field is bounded; the field is then a curation job, not a reason
+    to lose the task definition."""
+    pinned = _desc_block("STEP 0 " + "z" * 380, marker="step0",
+                         pin="[hoisted:step0]")
+    rest = _desc_block("a lesson " + "q" * 100, marker="lesson")
+    pre = pinned + "\n\n" + rest
+    _bounds(monkeypatch, tmp_path, at=300, keep=200)
+    store, state = _description_rotation_store(monkeypatch, pre=pre)
+    out = GFA.rotate_oversize("g-1", "description", "world", pre)
+    assert out == pre, "the pinned head alone exceeds the bound; the field must be returned whole"
+    assert state["writes"] == [] and state["refused"] == 0
+    assert not (tmp_path / "audit-reports" / "goal-note-archive" / "g-1.description.md").exists(), \
+        "fail-open happens before any archive write — the sink must not be created"
+
+
+def test_pin_markers_do_not_apply_outside_description(monkeypatch, tmp_path):
+    """ANTI-VACUITY: the retention branch is field-SPECIFIC. A [hoisted:...]
+    marker in a progress_note does not make its block non-evictable — the
+    note's keep-newest polarity is right there, and a blanket 'markers are
+    always pinned' implementation would fail this test and stop the notes
+    aging out."""
+    marked_old = _desc_block("OLD NOTE " + "n" * 60, marker="old",
+                             pin="[hoisted:old-note]")
+    new_a = _desc_block("note A " + "a" * 90, marker="new-a")
+    new_b = _desc_block("note B " + "b" * 90, marker="new-b")
+    pre = "\n\n".join([marked_old, new_a, new_b])
+    _bounds(monkeypatch, tmp_path, at=250, keep=200)
+    store, state = _description_rotation_store(monkeypatch, pre=pre)
+    out = GFA.rotate_oversize("g-1", "progress_note", "world", pre)
+    assert out != pre and out.startswith(GFA.ROTATE_NOTICE_HEAD), "the note must still rotate"
+    assert "OLD NOTE " not in out, \
+        "the marker is description policy, not note policy — the oldest note still ages out"
+    assert "note B " in out, "the newest note is kept (keep-newest is unchanged)"
+    assert "note A " not in out, \
+        "keep-newest keeps only as much as the bound allows — the note still ages out"
+
+
+def test_description_rotation_notice_names_the_kept_head(monkeypatch, tmp_path):
+    """guard-6105 provenance: a reader of the reduced field must be able to
+    tell what happened without knowing this code exists. A description
+    rotation keeps the pinned head, not just the newest blocks, so the notice
+    must say 'oldest non-pinned' and 'pinned head was kept' — claiming it cut
+    'the oldest block(s)' would be false once a pinned head was deliberately
+    left in place."""
+    step0 = _desc_block("STEP 0 " + "s" * 90, marker="step0", pin="[pin:step0]")
+    lessons = [_desc_block("LESSON-%d " % i + "l" * 80, marker="m%d" % i) for i in range(4)]
+    pre = "\n\n".join([step0] + lessons)
+    _bounds(monkeypatch, tmp_path, at=400, keep=350)
+    store, state = _description_rotation_store(monkeypatch, pre=pre)
+    out = GFA.rotate_oversize("g-1", "description", "world", pre)
+    assert out != pre
+    assert "oldest non-pinned block(s)" in out, \
+        "the notice must not claim it cut the oldest blocks when a pinned head was kept"
+    assert "pinned (non-evictable) head was kept" in out
+    # and the progress_note wording is unchanged (the branch is description-only)
+    assert "oldest block(s)" not in out or "non-pinned" in out
+
+
+def test_pinned_description_indices_marker_set_plus_unconditional_block0_floor():
+    """The pure helper: pinning is the UNION of the author-marked set and an
+    unconditional block-0 floor. The marker pins the executable head wherever
+    it sits (a run, not one block); block 0 is pinned on top of it — the
+    goal's absolute check — so a later marked block can never re-arm
+    keep-newest over an unmarked original statement. When block 0 is itself
+    marked it is pinned once, not twice; empty input pins nothing."""
+    marked = [_desc_block("a " + "1" * 50, marker="a"),
+              _desc_block("b " + "2" * 50, marker="b", pin="[pin:b]"),
+              _desc_block("c " + "3" * 50, marker="c", pin="[hoisted:c]")]
+    assert GFA.pinned_description_indices(marked) == [0, 1, 2], \
+        "the block-0 floor must ride on top of the marked set, not replace it"
+    unmarked = [_desc_block("x", marker="x"), _desc_block("y", marker="y")]
+    assert GFA.pinned_description_indices(unmarked) == [0]
+    assert GFA.pinned_description_indices([]) == []
+    # block 0 marked: the floor and the marker coincide — one pin, not two
+    first_marked = [_desc_block("a " + "1" * 50, marker="a", pin="[pin:a]"),
+                    _desc_block("b " + "2" * 50, marker="b", pin="[pin:b]")]
+    assert GFA.pinned_description_indices(first_marked) == [0, 1]
+    # the marker must be the PIN marker: an ordinary [appended:] sentinel is not one
+    plain = [_desc_block("body with the word hoisted mid-text", marker="m")]
+    assert GFA.pinned_description_indices(plain) == [0]

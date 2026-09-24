@@ -14,7 +14,53 @@ source "$CORE_ROOT/scripts/_platform.sh"
 # SessionStart hooks inherit no env vars, so MIND_AGENT is unset here.
 # Without binding resolution, _paths.py would set AGENT_DIR=None and
 # postcompact-restore.py would crash at `AGENT_DIR / "session" / ...`.
-SID=$(python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
+#
+# The stdin read is BOUNDED (: the guard-664 /  daemon
+# thread + join pattern; rb-1568 carries it to hooks). The production caller,
+# sessionstart-orchestrator.sh, always pipes a finite payload, so the bound
+# never fires there. A hand-run is different: under the Bash tool stdin can be
+# the harness's never-EOF socket, and the old unbounded json.load blocked
+# forever (cc-02, 2026-09-22: three processes alive 46h, a 0-byte log, and a
+# restore that never ran). A timeout exits 3 and says so; it must never look
+# like the empty-payload exit below.
+SID_RC=0
+SID=$(python3 -c '
+import json, os, sys, threading
+try:
+    t_s = float(os.environ.get("POSTCOMPACT_RESTORE_STDIN_TIMEOUT_S", "10"))
+except Exception:
+    t_s = 10.0
+box = {}
+def _reader():
+    try:
+        box["data"] = sys.stdin.read()
+    except Exception:
+        box["data"] = ""
+t = threading.Thread(target=_reader, daemon=True)
+t.start()
+t.join(t_s)
+if "data" not in box:
+    sys.stderr.write("[postcompact-restore] ERROR: stdin did not reach EOF within %gs"
+                     " -- no payload was piped in, so NOTHING WAS RESTORED. Pipe the"
+                     " SessionStart payload (a JSON object carrying session_id) into"
+                     " this script, or redirect stdin from /dev/null. (g-115-10615)\n" % t_s)
+    sys.exit(3)
+try:
+    print(json.loads(box["data"]).get("session_id", ""))
+except Exception:
+    print("")
+') || SID_RC=$?
+if [ "$SID_RC" -eq 3 ]; then
+    exit 3
+fi
+
+# No session_id -> nothing to key a restore on. Say so on stderr (stdout is the
+# context-injection channel). Before  this exit wrote 0 bytes, the
+# same log a read that never returns leaves, so the two could not be told apart.
+if [ -z "$SID" ]; then
+    echo "[postcompact-restore] no session_id on stdin (empty or non-JSON payload) -- nothing to restore" >&2
+    exit 0
+fi
 AGENT=$(python3 "$CORE_ROOT/scripts/_resolve_agent_from_sid.py" "$SID" 2>/dev/null || echo "")
 
 # No agent bound to this SID -> nothing to restore. Exit clean; the user

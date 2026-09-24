@@ -166,6 +166,7 @@ OVERRIDE_RESIDUAL=""
 OVERRIDE_DOMAIN_SUITE=""
 OVERRIDE_CLOSE_REVIEW=""
 OVERRIDE_NOTE_MARKER=""
+OVERRIDE_CLOSURE_EVIDENCE=""
 OUTCOME_NOTE_FILE=""
 
 # g-284-04: Recovery instructions on non-zero exit. The trap below reads
@@ -663,6 +664,8 @@ _print_recovery_instructions() {
             [[ -n "$OVERRIDE_UNCOMMITTED" ]] && cmd+=" --override-uncommitted \"$OVERRIDE_UNCOMMITTED\""
             [[ -n "$OVERRIDE_MISSING_ARTIFACT" ]] && cmd+=" --override-missing-artifact \"$OVERRIDE_MISSING_ARTIFACT\""
             [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && cmd+=" --override-domain-suite \"$OVERRIDE_DOMAIN_SUITE\""
+            [[ -n "$OVERRIDE_CLOSURE_EVIDENCE" ]] && cmd+=" --override-closure-evidence \"$OVERRIDE_CLOSURE_EVIDENCE\""
+            [[ -n "$OUTCOME_NOTE_FILE" ]] && cmd+=" --outcome-note-file \"$OUTCOME_NOTE_FILE\""
             echo "  Retry: $cmd" >&2
             # The revert line is now CONDITIONAL. Offering it when the record is
             # already closed is a destructive remedy for a state that does not
@@ -810,6 +813,10 @@ while [[ $# -gt 0 ]]; do
         # the standard close path. Logged to world/close-review-overrides.jsonl.
         --override-close-review) OVERRIDE_CLOSE_REVIEW="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         --override-note-marker) OVERRIDE_NOTE_MARKER="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        # g-375-05: forwarded to closure-evidence-gate.py inside do_verify, parsed
+        # here for the same guard-1532 reason. Logged to
+        # world/closure-evidence-overrides.jsonl.
+        --override-closure-evidence) OVERRIDE_CLOSURE_EVIDENCE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         # g-358-36: outcome_note rides the status write as a companion in ONE
         # locked RMW (one S3 PUT) instead of the separate note-then-status
         # pair. File transport only here — do_verify passes it straight to
@@ -1347,6 +1354,33 @@ do_verify() {
             return 1
         elif [[ $_crg_rc -ne 0 ]]; then
             echo "[iteration-close] WARN close-review-gate rc=$_crg_rc (gate fault, fail-open) — close review was NOT checked for $GOAL_ID" >&2
+        fi
+    fi
+
+    # ── Closure-evidence gate (g-375-05) ─────────────────────────────────────
+    # A completed close must show a measured value for each verification
+    # outcome: one "OUTCOME <n>: MET — <value>. Source: ..." row per outcome,
+    # whose paths resolve, whose store claims the store backs, and whose
+    # intervals cite two timestamps. Format and the measured incident live in
+    # gates/closure_evidence.py. Same place as the two gates above: before the
+    # status write, for both roles. Unlike them it refuses on rc 3, not 1: Python
+    # exits 1 on any uncaught exception, so a crashed or unimportable gate would
+    # refuse every close (guard-5430). Any other non-zero rc fails open with the
+    # WARN below. It reads the note that will LAND: --outcome-note-file, else
+    # the record's, else the summary, which goes on stdin so no argv quoting can
+    # mangle it.
+    if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/closure-evidence-gate.py" ]]; then
+        _ceg_args=(--goal "$GOAL_ID" --source "$SOURCE" --summary-stdin)
+        [[ -n "$OUTCOME_NOTE_FILE" ]] && _ceg_args+=(--outcome-note-file "$(_winpath "$OUTCOME_NOTE_FILE")")
+        [[ -n "$OVERRIDE_CLOSURE_EVIDENCE" ]] && _ceg_args+=(--override "$OVERRIDE_CLOSURE_EVIDENCE")
+        _ceg_rc=0
+        printf '%s' "$SUMMARY" | python3 "$(_winpath "$SCRIPT_DIR/closure-evidence-gate.py")" "${_ceg_args[@]}" \
+            >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _ceg_rc=$?
+        if [[ $_ceg_rc -eq 3 ]]; then
+            echo "[iteration-close] ✖ REFUSED — CLOSURE EVIDENCE (g-375-05): goal $GOAL_ID stays open. Fix the rows named above, then re-run this close." >&2
+            return 1
+        elif [[ $_ceg_rc -ne 0 ]]; then
+            echo "[iteration-close] WARN closure-evidence-gate rc=$_ceg_rc (gate fault, fail-open) — closure evidence was NOT checked for $GOAL_ID" >&2
         fi
     fi
 

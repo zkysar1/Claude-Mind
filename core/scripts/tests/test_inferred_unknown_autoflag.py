@@ -12,6 +12,7 @@ Self-contained: tmpdir world + agent + memory-pipeline.yaml override.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -30,6 +31,23 @@ sys.path.insert(0, str(CORE_SCRIPTS))
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 from _daemon_fixture import DaemonFixture  # noqa: E402
+from _utilization_store import SPOOLED_ENV as SPOOL_FLAG  # noqa: E402
+
+
+@contextlib.contextmanager
+def _spool_off():
+    """Pin the  counter spool OFF: for the in-process fixture daemon,
+    which reads this environment at request time, and for the children that
+    inherit it. Restored afterwards so a box's real posture leaks nowhere."""
+    prior = os.environ.get(SPOOL_FLAG)
+    os.environ[SPOOL_FLAG] = "0"
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop(SPOOL_FLAG, None)
+        else:
+            os.environ[SPOOL_FLAG] = prior
 
 
 def _seed_guard(world, gid):
@@ -90,7 +108,20 @@ def test_all_unknown_increments_inferred_unknown_and_autoflags_at_threshold():
         (world / "reasoning-bank.jsonl").write_text("", encoding="utf-8")
         (world / "aspirations.jsonl").write_text("", encoding="utf-8")
 
-        with DaemonFixture(world, agent_dir=agent) as df:
+        # This test asserts the LEGACY in-record increment. Since  a box
+        # whose environment carries UTILIZATION_COUNTERS_SPOOLED=1 -- every fleet
+        # box, from .claude/settings.json env, so every run from inside a Claude
+        # session -- routes the increment to the counter SPOOL instead: the daemon
+        # answers 200 {"spooled": true}, the embedded field stays 0, and this
+        # test read "expected 5, got 0" on every box since the cutover while
+        # passing in a bare shell (). The fixture daemon runs
+        # IN-PROCESS and reads this process's environment at request time, so
+        # the flag is pinned off for both it and the children below. The
+        # embedded-block read further down is right ONLY on this legacy path:
+        # on a cut-over box that block is a frozen pre-split snapshot (guard-4956)
+        # and a spooled increment is invisible to an immediate read-back by
+        # design (guard-4631) -- the spooled path needs its own test.
+        with _spool_off(), DaemonFixture(world, agent_dir=agent) as df:
             env = {
                 **os.environ,
                 "MIND_WORLD": str(world),

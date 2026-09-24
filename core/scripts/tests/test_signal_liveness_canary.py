@@ -607,6 +607,21 @@ SELF_TESTED_ROWS = (
     #  unit 6. The probe builds its own throwaway world, and a crash is
     # UNEVALUATABLE: do_verify reads it as a refusal. Tests: the domain-suite section below.
     "domain-suite-gate-collect-refusal",
+    #  unit 7. Two probes (the engine's CLI, then its consumer confirms_dormant),
+    # and a crash is DEAD: the consumer swallows it as "not idle". Tests: the
+    # liveness-check section at the end of this file.
+    "liveness-check-dormant-verdict",
+    #  unit 8. The probe builds its own git fixture and reads two channels (the
+    # --json record, then the text banner); a crash is DEAD because __main__ turns it into
+    # rc=0. Tests: the product-repo-freshness section at the end of this file.
+    "product-repo-freshness-behind",
+    #  unit 9. rc=1 naming the file is alive; a crash is UNEVALUATABLE (the hook
+    # blocks on it); rc 0 is DEAD in three shapes. Tests: the hot-path section at the end.
+    "hot-path-size-gate-growth-refusal",
+    #  unit 10. A child imports the selector and prints marker lines; a swallowed
+    # exception is DEAD, an import failure UNEVALUATABLE. Tests: the strategic-focus section
+    # at the end.
+    "goal-selector-strategic-focus-inert",
 )
 
 _DENY_JSON = '{"hookSpecificOutput": {"hookEventName": "PreToolUse", ' \
@@ -1347,3 +1362,584 @@ def test_the_unregistered_inventory_members_stay_unregistered():
     names = {s["name"] for s in canary.SIGNALS}
     for forbidden in ("s3-list-objects-denied", "q4-provenance-sample-rc"):
         assert forbidden not in names
+
+
+# ---- liveness-check-dormant-verdict ( unit 7) -----------------------
+
+LCK_ROW = "liveness-check-dormant-verdict"
+_LCK_DORMANT_RETURN = '        return {"verdict": "dormant", "signal": None,\n'
+_LCK_SIGNATURE = "threshold_hours=DEFAULT_THRESHOLD_HOURS, now=None,"
+
+
+def _lck_cli(verdict, reason="r"):
+    return json.dumps({"verdict": verdict, "reason": reason,
+                       "agent": canary.LIVENESS_PROBE_AGENT}) + "\n"
+
+
+def _inject_lck(monkeypatch, results, calls=None):
+    """Stub _probe with one (rc, out, err) per call, in call order."""
+    queue = list(results)
+
+    def _stub(argv, stdin_text=None, drop_env=(), extra_env=None):
+        if calls is not None:
+            calls.append((list(argv), dict(extra_env or {})))
+        return queue.pop(0)
+    monkeypatch.setattr(canary, "_probe", _stub, raising=True)
+
+
+def _copy_lck(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate a (possibly mutated) copy of the real engine, as _copy_dsg does. The
+    consumer child puts SCRIPT_DIR first on sys.path, so confirms_dormant imports the COPY,
+    while gates/ and _team_state still resolve through PYTHONPATH."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    src = (SCRIPTS / "liveness_check.py").read_text(encoding="utf-8")
+    mutated = mutate(src)
+    (tmp_path / "liveness_check.py").write_text(mutated, encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    monkeypatch.setenv("PYTHONPATH", str(SCRIPTS))
+    return mutated != src
+
+
+def test_lck_row_is_alive_against_the_real_engine_and_leaves_nothing_behind(monkeypatch):
+    """The positive control, through a spy on the real _probe: two children (the CLI, then
+    the consumer), both pinned to the local backend, both reading the same throwaway world
+    while its fixture shard exists, and that world is gone afterwards."""
+    real, seen = canary._probe, []
+
+    def _spy(argv, stdin_text=None, drop_env=(), extra_env=None):
+        world = argv[argv.index("--world-dir") + 1] if "--world-dir" in argv else argv[-1]
+        shard = Path(world) / "team-state" / "agents" / f"{canary.LIVENESS_PROBE_AGENT}.yaml"
+        seen.append((list(argv), dict(extra_env or {}), world, shard.is_file()))
+        return real(argv, stdin_text, drop_env, extra_env)
+    monkeypatch.setattr(canary, "_probe", _spy, raising=True)
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is False and "confirms_dormant agreed" in detail, detail
+    assert len(seen) == 2, seen
+    (cli_argv, cli_env, cli_world, cli_fixture), (con_argv, con_env, con_world, con_fixture) = seen
+    assert cli_argv[1].endswith("liveness_check.py") and "--json" in cli_argv
+    assert con_argv[1] == "-c" and "confirms_dormant" in con_argv[2]
+    assert cli_env == con_env == {"STORAGE_BACKEND": "local"}
+    assert cli_world == con_world and cli_fixture and con_fixture
+    assert not Path(cli_world).exists()
+
+
+def test_lck_rotted_fixture_is_unevaluatable_not_dead(monkeypatch):
+    """Driven both ways against the real engine. A fixture stamped an hour ago is honestly
+    NOT dormant. With the fixture check that is UNEVALUATABLE; without it the row reads
+    DEAD, the false accusation the check exists to prevent."""
+    import datetime as _dt
+    recent = (_dt.datetime.now() - _dt.timedelta(hours=1)).isoformat(timespec="seconds")
+    monkeypatch.setattr(canary, "LIVENESS_PROBE_STALE", recent, raising=True)
+    dead, detail = canary._liveness_dormant_assertion()()
+    assert dead is None and "fixture is stale" in detail, detail
+    dead, detail = canary._liveness_dormant_assertion(check_fixture=False)()
+    assert dead is True and "can no longer conclude dormant" in detail, detail
+
+
+def test_lck_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    """The positive control for the mutation tests below."""
+    assert _copy_lck(tmp_path, monkeypatch) is False
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda src: src + "\ndef broken(:\n",
+    lambda src: "import zzz_canary_missing_module  # noqa: F401\n" + src,
+])
+def test_lck_crash_of_the_real_engine_is_dead_not_unevaluatable(tmp_path, monkeypatch, mutate):
+    """confirms_dormant swallows the same crash as 'not idle', so a crash is silent where it
+    decides anything: DEAD here (guard-7231)."""
+    assert _copy_lck(tmp_path, monkeypatch, mutate) is True
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is True and "CRASHED" in detail, detail
+
+
+def test_lck_engine_that_stops_concluding_dormant_is_dead(tmp_path, monkeypatch):
+    assert _copy_lck(tmp_path, monkeypatch, lambda src: src.replace(
+        _LCK_DORMANT_RETURN, _LCK_DORMANT_RETURN.replace('"dormant"', '"unknown"'), 1)) is True
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is True and "'unknown'" in detail, detail
+
+
+def test_lck_consumer_that_swallows_an_error_is_dead_while_the_cli_stays_dormant(tmp_path, monkeypatch):
+    """The silent death this row exists for. decide_liveness's threshold becomes
+    positional-only: main() passes it positionally and keeps saying dormant, while
+    confirms_dormant passes threshold_hours= by keyword, raises TypeError inside its own
+    try, and returns False for every agent from then on."""
+    assert _copy_lck(tmp_path, monkeypatch, lambda src: src.replace(
+        _LCK_SIGNATURE, "threshold_hours=DEFAULT_THRESHOLD_HOURS, /, now=None,", 1)) is True
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is True and "swallowing an error" in detail, detail
+
+
+@pytest.mark.parametrize("results,verdict,needle", [
+    ([(1, "", "Traceback\nNameError: x\n")], True, "CRASHED"),
+    ([(0, "not json\n", "")], True, "CRASHED"),
+    ([(0, _lck_cli("unknown"), "")], True, "'unknown'"),
+    ([(0, _lck_cli("alive"), "")], True, "'alive'"),
+    ([(0, _lck_cli("dormant"), ""), (1, "", "ModuleNotFoundError: gates\n")], True, "could not run"),
+    ([(0, _lck_cli("dormant"), ""), (0, "", "")], True, "could not run"),
+    ([(0, _lck_cli("dormant"), ""), (0, "CONFIRMS_DORMANT=False\n", "")], True, "swallowing an error"),
+    ([(0, _lck_cli("dormant"), ""), (0, "CONFIRMS_DORMANT=True\n", "")], False, "agreed"),
+])
+def test_lck_verdict_table(monkeypatch, results, verdict, needle):
+    _inject_lck(monkeypatch, results)
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is verdict and needle in detail, detail
+
+
+def test_lck_consumer_runs_only_after_the_cli_concludes_dormant(monkeypatch):
+    calls = []
+    _inject_lck(monkeypatch, [(0, _lck_cli("unknown"), "")], calls)
+    _row(LCK_ROW)["assertion"]()
+    assert len(calls) == 1 and calls[0][0][1].endswith("liveness_check.py"), calls
+
+
+def test_lck_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is None and "absent" in detail, detail
+
+
+def test_lck_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=(), extra_env=None):
+        raise OSError("canary spawn failure")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(LCK_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_lck_fixture_check_does_not_call_an_unimportable_engine_rot(tmp_path, monkeypatch):
+    """An engine that cannot import cannot judge liveness either, so the check returns None
+    and lets the probe report the crash as DEAD (guard-7231)."""
+    import datetime as _dt
+    (tmp_path / "liveness_check.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    assert canary._liveness_fixture_check(tmp_path, _dt.datetime.now()) is None
+
+
+# ---- product-repo-freshness-behind ( unit 8) ------------------------
+
+PRF_ROW = "product-repo-freshness-behind"
+_PRF_REC = {"name": canary.FRESHNESS_PROBE_REPO, "behind": canary.FRESHNESS_PROBE_BEHIND,
+            "ahead": 0, "verdict": "behind", "detail": ""}
+_PRF_BANNER = ("[product-repo-freshness] 1 of 1 repo(s) need attention BEFORE you read or "
+               f"edit them:\n  BEHIND  {canary.FRESHNESS_PROBE_REPO} by 2 commit(s) on main\n")
+# The four source anchors the mutants below rewrite, each unique in the gate.
+_PRF_MAIN_RECORDS = "    records = [freshness(r, do_fetch=not args.no_fetch) for r in selected]\n"
+_PRF_RANGE = '"%s...HEAD" % upstream'
+_PRF_COUNTS = "behind, ahead = (int(x) for x in counts.split())"
+_PRF_CLEAN = 'CLEAN_VERDICTS = ("in-sync", "ahead-topological")'
+
+
+def _prf_json(behind=canary.FRESHNESS_PROBE_BEHIND, cannot_check=False, records=None, reason=None):
+    if records is None:
+        records = [dict(_PRF_REC, behind=behind, verdict="behind" if behind else "in-sync")]
+    return json.dumps({"enumerated_count": 0 if cannot_check else 1,
+                       "selected_count": len(records), "goal_lookup_ok": True,
+                       "cannot_check": cannot_check, "cannot_check_reason": reason,
+                       "records": records}, indent=2) + "\n"
+
+
+def _copy_prf(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate a (possibly mutated) copy of the real gate. Its own sys.path insert puts the
+    copy's directory first, so _path_roots and _paths resolve through PYTHONPATH; the fixture
+    check's in-process import makes the same insert, hence the sys.path snapshot."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    src = (SCRIPTS / "product-repo-freshness.py").read_text(encoding="utf-8")
+    mutated = mutate(src)
+    (tmp_path / "product-repo-freshness.py").write_text(mutated, encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    monkeypatch.setenv("PYTHONPATH", str(SCRIPTS))
+    return mutated != src
+
+
+def test_prf_row_is_alive_against_the_real_gate_and_leaves_nothing_behind(monkeypatch):
+    """The positive control, through a spy on the real _probe: two children in the production
+    call shape (the --json record, then the text banner), neither pinned nor stripped of any
+    variable, both reading the same fixture while it exists, and the fixture is gone after."""
+    real, seen = canary._probe, []
+
+    def _spy(argv, stdin_text=None, drop_env=(), extra_env=None):
+        repo = Path(argv[argv.index("--repo") + 1])
+        seen.append((list(argv), dict(extra_env or {}), tuple(drop_env), repo,
+                     (repo / ".git").is_dir()))
+        return real(argv, stdin_text, drop_env, extra_env)
+    monkeypatch.setattr(canary, "_probe", _spy, raising=True)
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is False and "named it on the text banner" in detail, detail
+    assert len(seen) == 2, seen
+    (j_argv, j_env, j_drop, j_repo, j_fix), (t_argv, t_env, t_drop, t_repo, t_fix) = seen
+    assert j_argv[1].endswith("product-repo-freshness.py") and j_argv[-1] == "--json"
+    assert "--json" not in t_argv and "--no-fetch" not in j_argv + t_argv
+    assert j_env == t_env == {} and j_drop == t_drop == ()
+    assert j_repo == t_repo and j_repo.name == canary.FRESHNESS_PROBE_REPO and j_fix and t_fix
+    assert not j_repo.parent.exists()
+
+
+def test_prf_rotted_fixture_is_unevaluatable_not_dead():
+    """Driven both ways against the real gate. A fixture built in sync is honestly NOT behind.
+    With the fixture check that is UNEVALUATABLE; without it the row reads DEAD, the false
+    accusation the check exists to prevent."""
+    dead, detail = canary._freshness_behind_assertion(build_behind=0)()
+    assert dead is None and "fixture is stale" in detail, detail
+    dead, detail = canary._freshness_behind_assertion(check_fixture=False, build_behind=0)()
+    assert dead is True and "behind=0" in detail, detail
+
+
+def test_prf_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    """The positive control for the mutation tests below."""
+    assert _copy_prf(tmp_path, monkeypatch) is False
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda src: src + "\ndef broken(:\n",
+    lambda src: src.replace(_PRF_MAIN_RECORDS,
+                            '    raise RuntimeError("canary mutant")\n', 1),
+])
+def test_prf_crash_of_the_real_gate_is_dead_not_unevaluatable(tmp_path, monkeypatch, mutate):
+    """The second mutant is the silent one: __main__ catches the exception, prints one
+    advisory line to stderr and exits 0, so the text channel reads 'every repo in sync'."""
+    assert _copy_prf(tmp_path, monkeypatch, mutate) is True
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is True and "CRASHED" in detail, detail
+
+
+def test_prf_reversed_rev_list_range_is_dead(tmp_path, monkeypatch):
+    assert _copy_prf(tmp_path, monkeypatch, lambda src: src.replace(
+        _PRF_RANGE, '"HEAD...%s" % upstream', 1)) is True
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is True and "behind=0" in detail, detail
+
+
+def test_prf_boolean_count_is_dead(tmp_path, monkeypatch):
+    """Why FRESHNESS_PROBE_BEHIND is 2: a count collapsed to a boolean reads 1 and must fail."""
+    assert _copy_prf(tmp_path, monkeypatch, lambda src: src.replace(
+        _PRF_COUNTS, "behind, ahead = (int(bool(int(x))) for x in counts.split())", 1)) is True
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is True and "behind=1" in detail, detail
+
+
+def test_prf_silent_banner_is_dead_while_the_json_record_stays_right(tmp_path, monkeypatch):
+    """The text channel's own death: render() starts counting 'behind' as clean, so the
+    banner goes silent on a stale checkout while the --json record still says behind 2."""
+    assert _copy_prf(tmp_path, monkeypatch, lambda src: src.replace(
+        _PRF_CLEAN, 'CLEAN_VERDICTS = ("in-sync", "ahead-topological", "behind")', 1)) is True
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is True and "text banner" in detail and "does not name it" in detail, detail
+
+
+@pytest.mark.parametrize("results,verdict,needle", [
+    ([(1, "", "Traceback\nSyntaxError: x\n")], True, "CRASHED"),
+    ([(0, "", "[product-repo-freshness] advisory probe failed (non-fatal): RuntimeError: x\n")],
+     True, "CRASHED"),
+    ([(0, _prf_json(records=[]), "")], True, "examined nothing"),
+    ([(0, _prf_json(records=[], cannot_check=True, reason="no repos were enumerated"), "")],
+     None, "said so"),
+    ([(0, _prf_json(behind=0), "")], True, "behind=0"),
+    ([(0, _prf_json(behind=0, cannot_check=True, reason="r"), "")], True, "behind=0"),
+    ([(0, _prf_json(behind=1), "")], True, "behind=1"),
+    ([(0, _prf_json(records=[_PRF_REC, _PRF_REC]), "")], True, "2 records"),
+    ([(0, _prf_json(), ""), (0, "", "")], True, "does not name it"),
+    ([(0, _prf_json(), ""), (0, _PRF_BANNER, "")], False, "named it"),
+    ([(0, _prf_json(cannot_check=True, reason="r"), ""), (0, _PRF_BANNER, "")],
+     False, "cannot_check was true"),
+])
+def test_prf_verdict_table(monkeypatch, results, verdict, needle):
+    _inject_lck(monkeypatch, results)
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is verdict and needle in detail, detail
+
+
+def test_prf_banner_probe_runs_only_after_the_json_record_is_right(monkeypatch):
+    calls = []
+    _inject_lck(monkeypatch, [(0, _prf_json(behind=0), "")], calls)
+    _row(PRF_ROW)["assertion"]()
+    assert len(calls) == 1 and calls[0][0][-1] == "--json", calls
+
+
+def test_prf_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is None and "absent" in detail, detail
+
+
+def test_prf_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=(), extra_env=None):
+        raise OSError("canary spawn failure")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_prf_unbuildable_fixture_is_unevaluatable(monkeypatch):
+    """No git on the box, or a git too old for `init -b`: nothing is known about the gate."""
+    def _no_git(root, env, behind):
+        raise RuntimeError("git: not found")
+    monkeypatch.setattr(canary, "_freshness_fixture_build", _no_git, raising=True)
+    dead, detail = _row(PRF_ROW)["assertion"]()
+    assert dead is None and "could not be built" in detail, detail
+
+
+def test_prf_fixture_check_does_not_call_an_unimportable_gate_rot(tmp_path, monkeypatch):
+    """A gate that cannot import cannot judge freshness either, so the check returns None and
+    lets the probe report the crash as DEAD."""
+    (tmp_path / "product-repo-freshness.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    assert canary._freshness_fixture_check(tmp_path, {}, 2) is None
+
+
+def test_prf_check_read_cannot_reach_a_temp_fixture(tmp_path):
+    """THE NAMED NON-REGISTRATION'S PREMISE, pinned. --check-read judges only paths inside a
+    member of the bound agent's AGENT_WRITE_PATH enumeration, so on a temp fixture it
+    answers safe / not-a-product-repo and can never reach its READ-HAZARD branch. If this
+    starts failing, --check-read can see a hermetic fixture after all: register a row for it
+    and delete this test, with the reason, in the same change."""
+    env = canary._freshness_fixture_env(tmp_path)
+    repo = canary._freshness_fixture_build(tmp_path, env, canary.FRESHNESS_PROBE_BEHIND)
+    rc, out, _err = canary._probe([sys.executable, (SCRIPTS / "product-repo-freshness.py").as_posix(),
+                                   "--check-read", (repo / "probe.txt").as_posix(), "--json"])
+    doc = json.loads(out)
+    assert rc == 0 and doc["safe"] is True and doc["verdict"] == "not-a-product-repo", doc
+
+
+# ---- hot-path-size-gate-growth-refusal ( unit 9) --------------------
+
+HPS_ROW = "hot-path-size-gate-growth-refusal"
+_HPS_REFUSAL = (f"[hot-path-size-gate] REFUSED — hot-path files may not grow (g-115-6470):\n"
+                f"  {canary.HOTPATH_PROBE_PATH}  2 → 4 B (+2; cap = size at HEAD)\n")
+# Mutation anchors, each unique in the gate (checked 2026-09-24).
+_HPS_DECIDE = 'return ("grew" if staged_size > head_size else "ok", head_size)'
+_HPS_LOADER = "    import yaml  # local: keep the hook's happy path import-light\n"
+_HPS_TRAILER_RX = 'rx = re.compile(r"^\\s*" + re.escape(trailer) + r"\\s*(.*?)\\s*$", re.IGNORECASE)'
+
+
+def _copy_hps(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate a (possibly mutated) copy of the real gate; _paths/_fileops resolve through
+    PYTHONPATH. sys.path is snapshotted because the fixture check imports the copy."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    src = (SCRIPTS / "hot-path-size-gate.py").read_text(encoding="utf-8")
+    mutated = mutate(src)
+    (tmp_path / "hot-path-size-gate.py").write_text(mutated, encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    monkeypatch.setenv("PYTHONPATH", str(SCRIPTS))
+    return mutated != src
+
+
+def test_hps_row_is_alive_against_the_real_gate_and_pins_its_writes(monkeypatch):
+    """The positive control through a spy: ONE child, in the hook's --commit-msg-file shape,
+    with MIND_WORLD at a temp world and the local backend pinned, so an override-branch
+    regression can only write there. The fixture existed during the call and is gone after."""
+    real, seen = canary._probe, []
+
+    def _spy(argv, stdin_text=None, drop_env=(), extra_env=None):
+        repo = Path(argv[argv.index("--repo") + 1])
+        seen.append((list(argv), dict(extra_env or {}), repo,
+                     (repo / canary.HOTPATH_PROBE_PATH).is_file()))
+        return real(argv, stdin_text, drop_env, extra_env)
+    monkeypatch.setattr(canary, "_probe", _spy, raising=True)
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is False and "named probe/hot.md" in detail, detail
+    assert len(seen) == 1, seen
+    argv, env, repo, existed = seen[0]
+    assert argv[1].endswith("hot-path-size-gate.py") and "--commit-msg-file" in argv
+    assert env["STORAGE_BACKEND"] == "local" and Path(env["MIND_WORLD"]).parent == repo.parent
+    assert existed and not repo.exists()
+
+
+def test_hps_rotted_fixture_is_unevaluatable_not_dead():
+    """Driven both ways against the real gate: a fixture that did not grow honestly passes."""
+    dead, detail = canary._hotpath_growth_assertion(grow=False)()
+    assert dead is None and "fixture is stale" in detail, detail
+    dead, detail = canary._hotpath_growth_assertion(check_fixture=False, grow=False)()
+    assert dead is True and "no longer sees" in detail, detail
+
+
+def test_hps_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    assert _copy_hps(tmp_path, monkeypatch) is False
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is False, detail
+
+
+@pytest.mark.parametrize("mutate,needle", [
+    (lambda src: src.replace(_HPS_DECIDE, _HPS_DECIDE.replace(">", "<"), 1), "no longer sees"),
+    (lambda src: src.replace(_HPS_LOADER, '    raise ValueError("canary mutant")\n', 1),
+     "FAILS OPEN"),
+    (lambda src: src.replace(_HPS_TRAILER_RX, 'rx = re.compile(r"^(.{12,})$")', 1), "override"),
+])
+def test_hps_silent_deaths_of_the_real_gate_are_dead(tmp_path, monkeypatch, mutate, needle):
+    """A flipped comparison (the fixture check sees the flip and steps aside), a loader that
+    raises (the live-registry control steps aside, the gate fails open), and an override
+    parser that matches any line. Each passes the growth at rc 0."""
+    assert _copy_hps(tmp_path, monkeypatch, mutate) is True
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is True and needle in detail, detail
+
+
+def test_hps_crash_is_unevaluatable_because_the_hook_blocks_on_it(tmp_path, monkeypatch):
+    assert _copy_hps(tmp_path, monkeypatch, lambda src: src + "\ndef broken(:\n") is True
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is None and "blocks every commit" in detail, detail
+
+
+@pytest.mark.parametrize("results,verdict,needle", [
+    ([(1, _HPS_REFUSAL, "")], False, "named probe/hot.md"),
+    ([(1, "", "Traceback\nNameError: x\n")], None, "blocks every commit"),
+    ([(2, "", "usage: hot-path-size-gate.py\n")], None, "blocks every commit"),
+    ([(0, "[hot-path-size-gate] WARN: budget unreadable (x) — allowing commit; fix the registry\n",
+       "")], True, "FAILS OPEN"),
+    ([(0, "[hot-path-size-gate] OVERRIDE accepted — probe/hot.md +2 B\n", "")], True, "override"),
+    ([(0, "", "")], True, "no longer sees"),
+])
+def test_hps_verdict_table(monkeypatch, results, verdict, needle):
+    _inject_lck(monkeypatch, results)
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is verdict and needle in detail, detail
+
+
+def test_hps_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is None and "absent" in detail, detail
+
+
+def test_hps_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=(), extra_env=None):
+        raise OSError("canary spawn failure")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is None and "could not run" in detail, detail
+
+
+def test_hps_unbuildable_fixture_is_unevaluatable(monkeypatch):
+    def _no_git(root, env, grow=True):
+        raise RuntimeError("git: not found")
+    monkeypatch.setattr(canary, "_hotpath_fixture_build", _no_git, raising=True)
+    dead, detail = _row(HPS_ROW)["assertion"]()
+    assert dead is None and "could not be built" in detail, detail
+
+
+def test_hps_fixture_check_does_not_call_an_unimportable_gate_rot(tmp_path, monkeypatch):
+    (tmp_path / "hot-path-size-gate.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    assert canary._hotpath_fixture_check(tmp_path, {}) is None
+
+
+# ─── goal-selector STRATEGIC-FOCUS INERT banner ( unit 10) ─────────
+
+SFI_ROW = "goal-selector-strategic-focus-inert"
+# A synthetic two-lane directive, so no test depends on the live one.
+_SFI_DIRECTIVE = {"strategic_focus": {"primary": "close asp-901, then asp-902"}}
+# Source anchors in goal-selector.py: the banner's own predicate, the floor's lane count
+# and the banner's first body line. Each mutant asserts its substitution landed, so a
+# drifted source fails loudly instead of testing an unmutated copy.
+_SFI_BANNER_TEST = 'if not lanes or status.get("pool_lane_rows"):'
+_SFI_LANE_ROWS = 'lane_rows = [s for s in scored if s.get("aspiration_id") in lanes]'
+_SFI_BANNER_BODY = 'Returns the emitted warnings for tests. Never raises."""'
+
+
+def _sfi(check_fixture=True, team_state=_SFI_DIRECTIVE):
+    return canary._strategic_focus_inert_assertion(
+        check_fixture=check_fixture, team_state=team_state)()
+
+
+def _copy_sfi(tmp_path, monkeypatch, mutate=lambda src: src):
+    """Relocate goal-selector.py into tmp_path, mutated. Returns whether it changed."""
+    src = (canary.SCRIPT_DIR / "goal-selector.py").read_text(encoding="utf-8")
+    out = mutate(src)
+    (tmp_path / "goal-selector.py").write_text(out, encoding="utf-8")
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    return out != src
+
+
+def test_sfi_row_is_registered_with_its_assertion():
+    row = _row(SFI_ROW)
+    assert callable(row["assertion"]) and row["remedy"] and row["evidence"]
+
+
+def test_sfi_real_selector_with_a_synthetic_directive_is_alive():
+    dead, detail = _sfi()
+    assert dead is False and "2 directive lane(s)" in detail, detail
+
+
+def test_sfi_wording_that_names_no_lane_is_unevaluatable_and_dead_without_the_check():
+    """Outcome 2, both ways in one process: prose that stops naming asp-NNN leaves the
+    selector no lanes, so silence is CORRECT and the row says UNEVALUATABLE. The same
+    wording with the fixture check off reads DEAD, which is the false accusation the check
+    exists to prevent."""
+    rotted = {"strategic_focus": {"primary": "close asp 901, then asp 902"}}
+    dead, detail = _sfi(team_state=rotted)
+    assert dead is None and "fixture is stale" in detail, detail
+    dead, detail = _sfi(check_fixture=False, team_state=rotted)
+    assert dead is True and "stayed silent" in detail, detail
+
+
+def test_sfi_no_directive_is_unevaluatable():
+    dead, detail = _sfi(team_state={})
+    assert dead is None and "no asp-NNN lane" in detail, detail
+
+
+def test_sfi_probe_row_inside_a_lane_is_unevaluatable():
+    dead, detail = _sfi(team_state={"strategic_focus": {"primary": canary.INERT_PROBE_ASP}})
+    assert dead is None and "INERT_PROBE_ASP" in detail, detail
+
+
+def test_sfi_relocated_unmutated_copy_is_alive(tmp_path, monkeypatch):
+    """The positive control for the mutation tests below."""
+    assert _copy_sfi(tmp_path, monkeypatch) is False
+    dead, detail = _sfi()
+    assert dead is False, detail
+
+
+def test_sfi_silenced_banner_is_dead(tmp_path, monkeypatch):
+    assert _copy_sfi(tmp_path, monkeypatch,
+                     lambda src: src.replace(_SFI_BANNER_TEST, "if True:", 1)) is True
+    dead, detail = _sfi()
+    assert dead is True and "stayed silent" in detail, detail
+
+
+def test_sfi_banner_that_ignores_the_pool_is_dead(tmp_path, monkeypatch):
+    assert _copy_sfi(tmp_path, monkeypatch,
+                     lambda src: src.replace(_SFI_BANNER_TEST, "if not lanes:", 1)) is True
+    dead, detail = _sfi()
+    assert dead is True and "no longer tells" in detail, detail
+
+
+def test_sfi_floor_that_counts_every_row_as_a_lane_row_is_dead(tmp_path, monkeypatch):
+    assert _copy_sfi(tmp_path, monkeypatch, lambda src: src.replace(
+        _SFI_LANE_ROWS, "lane_rows = list(scored)", 1)) is True
+    dead, detail = _sfi()
+    assert dead is True and "held 1 lane row(s)" in detail, detail
+
+
+def test_sfi_banner_that_raises_is_dead_not_unevaluatable(tmp_path, monkeypatch):
+    """The selector's own try/except swallows this, so it is silent in production."""
+    assert _copy_sfi(tmp_path, monkeypatch, lambda src: src.replace(
+        _SFI_BANNER_BODY, _SFI_BANNER_BODY + '\n    raise RuntimeError("canary mutant")',
+        1)) is True
+    dead, detail = _sfi()
+    assert dead is True and "RuntimeError" in detail, detail
+
+
+def test_sfi_unimportable_selector_is_unevaluatable(tmp_path, monkeypatch):
+    """Selection itself stops on this, which is loud (rb-11742)."""
+    assert _copy_sfi(tmp_path, monkeypatch, lambda src: src + "\ndef broken(:\n") is True
+    dead, detail = _sfi()
+    assert dead is None and "could not be imported" in detail, detail
+
+
+def test_sfi_absent_script_is_unevaluatable(tmp_path, monkeypatch):
+    monkeypatch.setattr(canary, "SCRIPT_DIR", tmp_path, raising=True)
+    dead, detail = _sfi()
+    assert dead is None and "absent" in detail, detail
+
+
+def test_sfi_probe_that_raises_is_unevaluatable(monkeypatch):
+    def _boom(argv, stdin_text=None, drop_env=(), extra_env=None):
+        raise OSError("canary spawn failure")
+    monkeypatch.setattr(canary, "_probe", _boom, raising=True)
+    dead, detail = _sfi()
+    assert dead is None and "could not run" in detail, detail

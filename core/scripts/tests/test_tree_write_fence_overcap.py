@@ -20,8 +20,10 @@ Three test families:
      asserted on the REPORTED artifact (the verdict field / stderr banner),
      not on a helper. A mutant that classifies everything (or nothing) as
      over-cap must fail these.
-  3. CHANNEL — the banner goes to stderr and the stdout JSON verdict stays
-     parseable (the wrapper discards stdout; stderr is what surfaces).
+  3. CHANNEL — without --hook (the CLI contract) the banner goes to stderr and
+     the JSON verdict to stdout. stderr never reaches the model (guard-1680);
+     the payload the wrapper hands Claude Code is pinned in
+     test_tree_write_fence_layer_a.py (g-306-488).
 """
 import json
 import os

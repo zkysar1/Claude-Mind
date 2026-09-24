@@ -25,6 +25,13 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
+# Windows-form paths for the python3 open() below (; guard-115,
+# guard-2251). OBS_LOG reaches python only as an env var, and MSYS stops
+# translating /c/... values for native programs once a caller has exported
+# MSYS_NO_PATHCONV=1 -- iteration-close.sh has, so the audit line was lost on
+# every Windows close. normalize_msys_path on the python side would not do: it
+# converts only paths that already exist, and the first write creates this file.
+source "$SCRIPT_DIR/_platform.sh"
 
 GOAL_ID="${1:-unknown}"
 OUTCOME_CLASS="${2:-unknown}"

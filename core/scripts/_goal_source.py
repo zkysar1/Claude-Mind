@@ -71,7 +71,12 @@ def infer(origin_signal):
                        # fourth reconciliation () - s3_churn_alarm.py
                        # per-hot-key breach auto-file; the DOMAIN suite pins this
                        # pair, check-origin-signal-drift.py cannot (markdown-only)
-                       "s3-churn:")):
+                       "s3-churn:",
+                       # fifth reconciliation () - the generic lane
+                       # prefix for automated detectors, `monitor:`-shaped:
+                       # detector:<name>[:<discriminator>] (rb_undiagnosed_cluster.py
+                       # and a domain reconcile script); locked with ALLOWED_PREFIXES
+                       "detector:")):
         return "cycle-detector"
     if sig == "idle_fallback" or sig.startswith((
             "decomposition:", "parent_aspiration:", "unblock:",

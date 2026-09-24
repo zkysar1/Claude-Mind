@@ -106,6 +106,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 TESTS = Path(__file__).resolve().parent
@@ -518,6 +519,17 @@ def _proc_id(pid: int) -> str:
     return f"{pid}:{_starttime(pid)}"
 
 
+# The five tests that stamp a LIVE foreign owner build its identity from
+# /proc/<pid>/stat above. Windows python has no procfs -- the MSYS /proc the
+# hook's bash reads is visible only to the MSYS runtime -- so they cannot build
+# their input there. A capability check rather than os.name, so any box without
+# procfs skips them for the reason that actually applies ().
+_NEEDS_PROCFS = pytest.mark.skipif(
+    not Path("/proc/self/stat").is_file(),
+    reason="needs Linux procfs (/proc/<pid>/stat) to stamp a live foreign owner; "
+           "Windows python cannot read the MSYS /proc the hook sees (g-115-10783)")
+
+
 def _live_other():
     """A real, live, DIFFERENT process -- never a synthesized id.
 
@@ -537,6 +549,7 @@ def test_gate_0b_wiring_is_pinned_to_the_real_hook():
     assert hook.count('source "$CORE_ROOT/scripts/_runner_proc.sh"') == 1
 
 
+@_NEEDS_PROCFS
 def test_gate_0b_ejected_duplicate_is_allowed_to_end_its_turn(tmp_path):
     """THE FIX: a live foreign owner means this process is the ejected one."""
     other = _live_other()
@@ -567,6 +580,7 @@ def test_gate_0b_the_real_runner_is_not_allowed_to_die(tmp_path):
     assert "gate=same-sid-not-owner" not in _hook_log(root)
 
 
+@_NEEDS_PROCFS
 def test_gate_0b_dead_stamped_owner_still_blocks(tmp_path):
     """A dead owner is a TAKEOVER, not an ejection.
 
@@ -581,6 +595,7 @@ def test_gate_0b_dead_stamped_owner_still_blocks(tmp_path):
     assert "gate=same-sid-not-owner" not in _hook_log(root)
 
 
+@_NEEDS_PROCFS
 def test_gate_0b_empty_running_session_id_blocks(tmp_path):
     """An EMPTY pointer must NOT allow -- runner-identity-check fail-opens there.
 
@@ -597,6 +612,7 @@ def test_gate_0b_empty_running_session_id_blocks(tmp_path):
     assert _blocked(proc), "an empty pointer has no matching eject -- must not allow"
 
 
+@_NEEDS_PROCFS
 def test_mutation_dropping_the_sid_precondition_allows_an_empty_pointer(tmp_path):
     """Proves the guard-4315 scar is load-bearing, not decorative.
 
@@ -614,6 +630,7 @@ def test_mutation_dropping_the_sid_precondition_allows_an_empty_pointer(tmp_path
     assert "gate=same-sid-not-owner" in _hook_log(root)
 
 
+@_NEEDS_PROCFS
 def test_mutation_dropping_the_agent_argument_kills_the_gate(tmp_path):
     """guard-2601: <agent> is a REQUIRED positional, and the caller must pass it.
 

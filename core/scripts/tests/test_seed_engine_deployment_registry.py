@@ -286,3 +286,15 @@ def test_gate_scope_survives_crlf_from_py(project, tmp_path):
     assert rc == 1, out + err
     assert f"LEAK: '{TERM}'" in out
     assert f"not shipped: {REG}/{OWN}.yaml (1 hit(s))" in out
+
+
+def test_gate_reads_a_crlf_blocklist(project):
+    """A CRLF checkout (core.autocrlf=true) leaves a CR on every blocklist line;
+    `read` kept it, "Widgetron\r" matched nothing, and the scan printed CLEAN on
+    every Windows box (guard-987). Bytes, so the case is pinned on every OS."""
+    (project / "core" / "config" / "domain-term-blocklist.txt").write_bytes(
+        f"# synthetic\r\n{TERM}\r\n".encode("utf-8"))
+    _write(project, "core/config/shipped-note.md", f"mentions {TERM}\n")
+    rc, out, err = _gate(project)
+    assert rc == 1, out + err
+    assert f"LEAK: '{TERM}'" in out, out

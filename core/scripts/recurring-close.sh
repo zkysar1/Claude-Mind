@@ -1297,6 +1297,26 @@ echo "[recurring-close] ═══ ITERATION COMPLETE ═══"
 # copy of the proceed line is how the two would silently diverge, and this
 # block's whole defect () was that a reader could not tell the two
 # situations apart from the text.
+#
+# WORKER Body branch (): a worker Body closes recurring goals through
+# this script too, and the reducer re-entry the else-branch prescribes below is
+# FORBIDDEN to a worker — aspirations-spark is reducer-only (worker_execute.py
+# returns skip), the autonomous-loop net is the reducer's, and the reducer loop
+# skill is refused by guard-517/guard-463. A worker that obeys it either dies or
+# re-enters as a reducer. Key on the SAME BODY_ROLE predicate bash-agent-inject.py
+# exports and iteration-close.sh already branches on (never a second copy of the
+# role test), and emit the CANONICAL worker terminal via the shared
+# deadman-directive emitter (guard-2676: a scoped CALL, not a transcription of its
+# incident-earned resurrection text; it also self-handles this agent's
+# deadman-disabled opt-out).
+if [[ "${BODY_ROLE:-}" == "worker" ]]; then
+    if [[ $MAX_RC -ne 0 ]]; then
+        echo "[recurring-close] ⚠ PHASE FAILURE — MAX_RC=$MAX_RC — failed: ${FAILED_PHASES% } — phases: ${PHASE_RESULTS% }"
+        echo "[recurring-close] This close did NOT fully apply. Re-run the failed phase(s) — a stale lastAchievedAt re-ranks the goal MAXIMALLY overdue (g-115-5187) — then re-enter your worker loop via the terminal below."
+    fi
+    echo "[recurring-close] OUTCOME=$OUTCOME (worker Body) — NEXT ACTION REQUIRED: the reducer re-entry (spark, the autonomous-loop net, the reducer loop skill) is FORBIDDEN to a worker; your terminal is the worker net + Skill(worker-loop):"
+    bash "$SCRIPT_DIR/deadman-directive.sh" --role worker
+else
 if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
     _dm_tag=""
     if [[ "$OUTCOME" == "deep" ]]; then
@@ -1339,6 +1359,7 @@ if [[ $MAX_RC -ne 0 ]]; then
     echo "[recurring-close]   If the retry keeps failing, file it rather than looping — a repeat here is a real blocker, not contention."
 else
     echo "[recurring-close] OUTCOME=$OUTCOME$_dm_tag — NEXT ACTION REQUIRED: $_next_action"
+fi
 fi
 echo "[recurring-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 

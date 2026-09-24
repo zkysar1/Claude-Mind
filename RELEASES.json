@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.83",
+    "previous_version": "2.12.82",
+    "date": "2026-09-24",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Demand-pull cut (g-373-128 / g-373-94 vessel verification), supersedes v2.12.82 for promotion: v2.12.82 plus the restored execute bit on core/scripts/goal-field-append.py (574153b2d3), which the v2.12.82 promotion preflight flagged as a MODE STRIP (g-360-07). Carries g-373-138 (7aa4ea8b4c, dc8400aa12) and graceful-stop D7.05 (857837b982)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.82",
+    "previous_version": "2.12.81",
+    "date": "2026-09-24",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Demand-pull cut (g-373-128 / g-373-94 vessel verification): g-373-138 an unfinished graceful stop holds its own turn open (7aa4ea8b4c, dc8400aa12); graceful-stop D7.05 stands the deadman net down after a completed /stop (857837b982); plus 135 more fixes since v2.12.81",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.81",
     "previous_version": "2.12.80",
     "date": "2026-09-23",

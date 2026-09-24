@@ -269,3 +269,136 @@ def test_window_fields_are_measured_not_assumed(tmp_path):
     assert m["worker_window_days"] == 15, m
     assert m["worker_window_first"] == "2026-08-20", m
     assert m["worker_window_last"] == "2026-09-04", m
+
+
+# ── LIVE + ARCHIVE source ( unit unit-6-source-history, guard-676) ─
+#
+# The live file "stays small (only active aspirations)" (aspirations.md
+# §Archival Rules): a completed goal leaves it when its parent is archived, so
+# a live-only reader measures a ROLLING window and the 14-day soak gate can
+# never be computed from it (zeta 2026-09-16: N 228 -> 30, span stuck at 2-4
+# days). The fix reads live + archive; these cases pin that reading and its
+# dedup, each paired with a control proving the archive file is what changed
+# the answer (guard-2903).
+
+
+def _add_archive(w: Path, archive_goals) -> Path:
+    """Append an aspirations-archive.jsonl to an existing world dir."""
+    (w / "aspirations-archive.jsonl").write_text(
+        json.dumps({
+            "id": "asp-arch",
+            "goals": [
+                dict({k: gid, "status": "completed",
+                      "completed_by_role": role, "outcome_class": outcome},
+                     **({"completed_at": g[4] + "T00:00:00"} if len(g) > 4 else {}))
+                for g in archive_goals
+                for (k, gid, role, outcome) in [g[:4]]
+            ],
+        }) + "\n",
+        encoding="utf-8",
+    )
+    return w
+
+
+def test_archive_rows_extend_the_population_and_the_window(
+        tmp_path, capsys, monkeypatch):
+    """guard-676 case: the span only exists across both files.
+
+    One live close (2026-09-15) + ten archive closes spanning
+    2026-09-01..2026-09-10: live-only that population is a ONE-day span, which
+    the window guard must withhold; live+archive it is 14 days, and a verdict
+    is issued. 4 of 11 have artifacts -> 36.4% < 60% -> FAIL, and the FAIL is
+    the point: a live-only reader would have reported INSUFFICIENT DATA forever,
+    which is the vacuous non-verdict the check exists to end.
+    """
+    goals = [("id", "g-10-01", "worker", "deep", "2026-09-15")]
+    archive = [("id", f"g-10-1{i}", "worker", "deep", d)
+               for i, d in enumerate(
+                   ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04",
+                    "2026-09-05", "2026-09-06", "2026-09-07", "2026-09-08",
+                    "2026-09-09", "2026-09-10"])]
+    w = _add_archive(_world(tmp_path, goals=goals,
+                            rb=["g-10-01", "g-10-10", "g-10-11", "g-10-12"]),
+                     archive)
+    m = war.measure(w)
+    assert m["worker_population"] == 11, m
+    assert m["worker_window_days"] == 14, m
+    assert m["worker_window_first"] == "2026-09-01", m
+    assert m["worker_window_last"] == "2026-09-15", m
+
+    rc = _run(war, w, monkeypatch,
+              ["--min-sample", "10", "--min-window-days", "14"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL"), out
+    assert "4/11" in out, out
+
+
+def test_archive_dedup_the_live_record_wins(tmp_path):
+    """A goal in BOTH files is counted once, with the live fields winning.
+
+    g-11-01: archive says worker/deep (countable), live says unstamped/deep.
+    If the archive row counted, worker_population would be 1; live wins, so it
+    is unstamped. The control (archive-only world) returns 1 — proving the
+    live row is what suppressed it, not a broken reader.
+    """
+    live = [("id", "g-11-01", "", "deep", "2026-09-10")]
+    arch = [("id", "g-11-01", "worker", "deep", "2026-09-10")]
+    w = _add_archive(_world(tmp_path, goals=live, rb=["g-11-01"]), arch)
+    m = war.measure(w)
+    assert m["worker_population"] == 0, m
+    assert m["unstamped_population"] == 1, m
+    assert m["total_completed_goals"] == 1, m      # not double-counted
+
+    # Nested under tmp_path/"control" because _world mkdirs tmp_path/"world"
+    # and the first world above already occupies it (parents=True, same as the
+    # id-shape test above).
+    control = _add_archive(
+        _world(tmp_path / "control", goals=[], rb=["g-11-01"]), arch)
+    mc = war.measure(control)
+    assert mc["worker_population"] == 1, mc
+
+
+def test_archive_file_is_optional(tmp_path):
+    """A fresh world has no archive yet; the live-only path still works."""
+    goals = [("id", "g-12-01", "worker", "deep", "2026-09-10")]
+    w = _world(tmp_path, goals=goals, rb=["g-12-01"])
+    m = war.measure(w)
+    assert m["worker_population"] == 1, m
+    assert m["worker_with_artifact"] == 1, m
+
+
+def test_CONTROL_archive_removal_collapses_to_window_withhold(
+        tmp_path, capsys, monkeypatch):
+    """guard-2903: prove the archive read — not anything else — widened it.
+
+    Live holds 10 closes over a 2-day span (09-13..09-15); the archive holds
+    10 more over 08-24..08-31. With the archive, the union span is 22 days,
+    the guard clears, and a verdict is issued. Delete ONLY the archive file
+    and the same population must collapse back to INSUFFICIENT DATA (window):
+    if it did not, the extending case above was green for an unrelated reason
+    and would keep passing after the fix was removed.
+    """
+    live = ([("id", f"g-13-0{i}", "worker", "deep", "2026-09-13")
+             for i in range(1, 5)]
+            + [("id", f"g-13-1{i}", "worker", "deep", "2026-09-14")
+               for i in range(1, 4)]
+            + [("id", f"g-13-2{i}", "worker", "deep", "2026-09-15")
+               for i in range(1, 4)])
+    archive = [("id", f"g-13-3{i}", "worker", "deep",
+                f"2026-08-{24 + i:02d}") for i in range(10)]
+    w = _add_archive(_world(tmp_path, goals=live, rb=[]), archive)
+
+    rc = _run(war, w, monkeypatch,
+              ["--min-sample", "10", "--min-window-days", "14"])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert out.startswith("FAIL"), out       # verdict: the union window cleared
+
+    (w / "aspirations-archive.jsonl").unlink()
+    rc = _run(war, w, monkeypatch,
+              ["--min-sample", "10", "--min-window-days", "14"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert "INSUFFICIENT DATA (window)" in out, out
+    assert "2 day(s)" in out, out

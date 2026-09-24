@@ -30,6 +30,16 @@
 # write-if-absent note; ). state-update / learning-gate / spark /
 # productivity-check remain reducer-only and this script touches none of them.
 #
+# WHAT THE NARRATIVE MUST CARRY (). On a completed goal the note opens
+# with the per-outcome evidence table, one row per verification outcome:
+#   OUTCOME <n>: MET — <measured value>. Source: <command + output | path | store key | sha | two timestamps>
+#   OUTCOME <n>: NOT MET — <what is missing>; deferred to <goal-id>
+# This script writes whatever it is given. The CHECK is closure-evidence-gate.py,
+# which do_verify runs before the status write. Because this script never
+# clobbers, a note it writes without the table stays on the record, and the
+# close must then be re-run with --outcome-note-file. Spec:
+# core/config/conventions/goal-schemas.md § Closure Evidence Table.
+#
 # CONTRACT
 #   closure-evidence-write.sh --goal <id> --source <world|agent> \
 #       (--summary <text> | --summary-file <path>) [--prefix <label>]

@@ -659,3 +659,122 @@ def test_trace_pops_blend_status_and_does_not_inherit(monkeypatch, tmp_path):
     row2 = json.loads(rows[1])
     assert "supplementary_blend_status" not in row2, \
         "absent key means 'lane did not run' — inheritance breaks that"
+
+
+# ── 5d. Universal token-overlap pulls when cosine cannot score () ──
+#
+# With no per-box index (or under the model-drift freeze) the universal lane
+# used to return the same top-5 by utilization for EVERY query, so a new
+# universal entry (utilization 0.0) was unreachable by any query. These pin the
+# fallback: token overlap fills the pull slots, the utilization floor is
+# untouched, and the cosine telemetry keeps describing the cosine channel.
+
+TOKEN_QUERY = ["sentinel lifecycle clears through verified readback"]
+
+
+def _uni8_with_tail_hit(hit_title="sentinel lifecycle clears through verified readback"):
+    """u0..u7 by utilization; u7 (the lowest) is the only strong token match."""
+    uni = [_uni(f"rb-u{i}", util=1.0 - i * 0.1) for i in range(7)]
+    uni.append(_uni("rb-u7", util=0.0, title=hit_title))
+    return uni
+
+
+def test_token_pulls_fill_a_slot_when_the_index_returns_nothing(monkeypatch):
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    stats = {}
+    out = _retrieve._universal_relevance_split(_uni8_with_tail_hit(), TOKEN_QUERY, stats=stats)
+    # floor (top-3 by utilization) untouched; the token hit takes the displaced
+    # incumbent's slot (u4); the other pull slot keeps u3.
+    assert [r["id"] for r in out] == ["rb-u0", "rb-u1", "rb-u2", "rb-u7", "rb-u3"]
+    assert stats["universal_cosine_status"] == "no_scores"
+    assert stats["n_universal_backfilled"] == 0
+    assert stats["n_universal_token_picked"] == 1
+
+
+def test_token_pulls_return_the_exact_slice_when_nothing_clears_the_floor(monkeypatch):
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    uni = _uni8()   # "framework lesson" titles share no >=5-char token with the query
+    stats = {}
+    out = _retrieve._universal_relevance_split(uni, TOKEN_QUERY, stats=stats)
+    assert out == uni[:_retrieve.UNIVERSAL_RB_CAP]
+    assert stats["n_universal_token_picked"] == 0
+
+
+def test_token_pulls_require_a_strict_gain_over_the_displaced_entry(monkeypatch):
+    """An incumbent that matches as well as the candidate keeps its slot."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    title = "sentinel lifecycle clears through verified readback"
+    uni = [_uni(f"rb-u{i}", util=1.0 - i * 0.1) for i in range(4)]
+    uni.append(_uni("rb-u4", util=0.5, title=title))   # displaced incumbent, same overlap
+    uni += [_uni(f"rb-u{i}", util=0.4 - i * 0.01) for i in range(5, 7)]
+    uni.append(_uni("rb-u7", util=0.0, title=title))
+    stats = {}
+    out = _retrieve._universal_relevance_split(uni, TOKEN_QUERY, stats=stats)
+    assert "rb-u7" not in [r["id"] for r in out]
+    assert stats["n_universal_token_picked"] == 0
+
+
+def test_token_pulls_run_under_the_model_drift_freeze(monkeypatch):
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(_retrieve, "_freeze_on_model_drift", lambda: True)
+    monkeypatch.setattr(er, "cosine_scores",
+                        lambda q, **k: (_ for _ in ()).throw(
+                            AssertionError("a frozen lane must not score")))
+    stats = {}
+    out = _retrieve._universal_relevance_split(_uni8_with_tail_hit(), TOKEN_QUERY, stats=stats)
+    assert "rb-u7" in [r["id"] for r in out]
+    assert stats["universal_cosine_status"] == "model_drift"
+    assert stats["n_universal_token_picked"] == 1
+
+
+def test_token_pulls_do_not_run_when_the_flag_is_off(monkeypatch):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(False)
+    uni = _uni8_with_tail_hit()
+    stats = {}
+    out = _retrieve._universal_relevance_split(uni, TOKEN_QUERY, stats=stats)
+    assert out == uni[:_retrieve.UNIVERSAL_RB_CAP]
+    assert "n_universal_token_picked" not in stats
+
+
+def test_token_pulls_do_not_run_when_cosine_ran(monkeypatch):
+    """Cosine abstaining is NOT the no-index case: utilization backfills as before,
+    so the abstention-rate contract keeps measuring the cosine channel."""
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {"rb-u5": 0.10})
+    stats = {}
+    out = _retrieve._universal_relevance_split(_uni8_with_tail_hit(), TOKEN_QUERY, stats=stats)
+    assert [r["id"] for r in out] == ["rb-u0", "rb-u1", "rb-u2", "rb-u3", "rb-u4"]
+    assert stats["n_universal_backfilled"] == 2
+    assert "n_universal_token_picked" not in stats
+
+
+def test_new_universal_entry_is_retrievable_by_its_own_title_without_an_index(
+        monkeypatch, stores):
+    """The acceptance shape: a utilization-0 universal entry surfaces as a
+    meta_lesson for a query built from its own title, and a domain entry still
+    returns for its own query."""
+    rb_p, _ = stores
+    cfg = _cfg(True)
+    cfg["universal_relevance_slots"] = 2
+    _retrieve._RETRIEVAL_CFG_CACHE = cfg
+    monkeypatch.setattr(er, "cosine_scores", lambda q, **k: {})
+    domain_rec = _rb("rb-dom", "fleet-rollout", "container rollout pinning order")
+    _write_jsonl(rb_p, _uni8_with_tail_hit() + [domain_rec])
+    _, universal = _retrieve.load_reasoning_bank(TOKEN_QUERY, "medium", read_only=True)
+    assert "rb-u7" in [r["id"] for r in universal]
+    domain, _ = _retrieve.load_reasoning_bank(
+        ["container rollout pinning order"], "medium", read_only=True)
+    assert [r["id"] for r in domain] == ["rb-dom"]

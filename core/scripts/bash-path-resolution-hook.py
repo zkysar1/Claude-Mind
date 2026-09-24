@@ -32,6 +32,17 @@ were open; it was restored only after a full-corpus replay measured BOTH
 directions (see the comment at the branch itself, and
 core/scripts/bash-hook-corpus-replay.py).
 
+Container-exec argv — DECISION (g-115-10588): APPROVED AS REMOTE. The argv
+after `lxc exec` or `docker exec`, up to the end of that simple command, is
+the container's command line. It runs in the container's own mount namespace,
+so its paths are not this machine's paths; that is the same position as a
+quoted `ssh` argument. What stays local inside such a command is what this
+machine's shell does itself: redirects, and any `$( )`, backtick or process
+substitution. Accepted false negative: a bind mount can alias a host
+directory into the container, the same trade `ssh localhost` already makes.
+Mechanics, and why the prefix is matched anywhere outside quotes rather than
+only at command position, are in container_exec_regions().
+
 OUT of scope (intentional — too false-positive-prone):
 
   - `cd /other-path && mkdir foo` — cwd changes that move the relative
@@ -40,6 +51,9 @@ OUT of scope (intentional — too false-positive-prone):
     `meta/...` prefix shape.
   - Process substitution (`>(...)`) and `<(...)` constructs.
   - Path components inside variable expansions (`$DIR/foo`).
+  - String-executing commands other than a bash/sh/zsh/dash `-c` (`eval`,
+    `su -c`, `watch`): their quoted argument is data like any other quoted
+    argument, and so is a `bash -c` nested inside it (g-115-10588).
 
 SAFETY: fail open on ANY error. Empty stdout + exit 0 = approve. Same
 contract as path-resolution-hook.py.
@@ -325,6 +339,84 @@ def _in_span(pos, spans):
     return any(s <= pos < e for s, e in spans)
 
 
+def _span_context(pos, cmd, spans):
+    """How THIS machine's shell treats the text at `pos` (g-115-10588).
+
+    None when `pos` is unquoted. "data" inside a quoted argument, which the
+    shell hands to a program without running it: always inside single quotes,
+    and inside double quotes too, except "substitution" inside a `$( )` or
+    backtick opened within them, which the shell runs before the program
+    starts. That exception is the `"$(bash -c '...')"` idiom; the local-exec
+    loop in extract_targets says why it matters.
+    """
+    for s, e in spans:
+        if s <= pos < e:
+            if cmd[s] == "'":
+                return "data"
+            opened, backtick, i = [], False, s + 1
+            while i < pos:
+                ch = cmd[i]
+                if ch == "`":
+                    backtick = not backtick
+                elif ch == "$" and cmd[i + 1:i + 2] == "(":
+                    opened.append("$")
+                    i += 1
+                elif ch == "(":
+                    opened.append("(")
+                elif ch == ")" and opened:
+                    opened.pop()
+                i += 1
+            return "substitution" if backtick or "$" in opened else "data"
+    return None
+
+
+# CLIs whose argv runs INSIDE a container (g-115-10588). Matched anywhere
+# outside quotes, not only at command position. guard-6850 asks for command
+# position so that a DETECTOR does not miss wrapped invocations; this predicate
+# can only SUPPRESS matches, so its failure directions are reversed. A missed
+# prefix leaves the old deny. A spurious one can hide only words that follow it
+# in the same simple command, and those are arguments to whatever runs there.
+# Add a CLI (incus, podman, kubectl) only when a real call appears, and measure
+# it: the corpus this was built against held no unquoted container exec at all.
+_CONTAINER_EXEC_RE = re.compile(r"(?<![\w.\-])(?:lxc|docker)\s+exec(?=\s)")
+
+
+def container_exec_regions(cmd, spans):
+    """[(start, end)] of the argv each `lxc exec` / `docker exec` hands to its
+    container, from the end of the prefix to the end of that simple command.
+
+    The end is the first unquoted `;`, `&`, `|`, `)`, backtick or unescaped
+    newline, or the start of a `$(`, `<(` or `>(` substitution, whose text
+    this machine's shell runs itself. An `&` or `|` inside a redirect operator
+    (`2>&1`, `&>`, `>|`) does not end it, a backslash-newline is a line
+    continuation, and quoted spans are stepped over whole. A prefix inside a
+    quoted span opens no region: at this depth that text is data, and a local
+    shell's quoted argument gets its own regions when it is rescanned.
+    """
+    span_end = dict(spans)
+    regions = []
+    for m in _CONTAINER_EXEC_RE.finditer(cmd):
+        if _in_span(m.start(), spans):
+            continue
+        i, n = m.end(), len(cmd)
+        while i < n:
+            if i in span_end:
+                i = span_end[i]
+                continue
+            ch, prev = cmd[i], cmd[i - 1]
+            nxt = cmd[i + 1] if i + 1 < n else ""
+            if ((ch == "\n" and prev != "\\") or ch in ";)`"
+                    or (ch == "|" and prev != ">")
+                    or (ch == "&" and prev not in "<>" and nxt != ">")):
+                break
+            if ch == "(" and prev in "$<>":
+                i -= 1
+                break
+            i += 1
+        regions.append((m.end(), i))
+    return regions
+
+
 # `sed -i` target extraction (g-115-3345). Deliberately NOT a regex. The target
 # is a positional arg that FOLLOWS an expression which routinely contains
 # slashes, spaces, quotes and even `;`, so every regex candidate measured
@@ -417,16 +509,38 @@ def extract_targets(cmd, _depth=0):
     RESCANNED. A remote-exec denylist was rejected by measurement — it cannot
     reach the prose class at all, since neither iteration-close.sh nor git is
     an exec wrapper.
+
+    Two bounds in the other direction (g-115-10588): the allowlist rescans
+    only a shell that THIS machine's shell will start (_span_context), and
+    the argv after `lxc exec` / `docker exec` is the container's command line
+    (container_exec_regions).
     """
     cmd = strip_payload_spans(strip_heredoc_bodies(cmd))
     targets = []
     spans = quoted_spans(cmd)
+    # A container's own command line (see container_exec_regions). No verb in
+    # it writes on this machine. A redirect in it still does, because this
+    # machine's shell performs the redirect, so redirects are the one match
+    # still honoured there.
+    remote = container_exec_regions(cmd, spans)
 
     # Local-exec allowlist: rescan the quoted argument as command text. Bounded
     # recursion — a nested `bash -c "bash -c ..."` is legitimate but must not
     # loop; depth 2 covers observed shapes and terminates unconditionally.
+    # Only a shell this machine's shell will start is rescanned (g-115-10588).
+    # Inside a quoted argument it is data for another program: in
+    # `ssh host 'bash -lc "cp /a /b"'` the cp runs on the far host, and
+    # rescanning it anyway turned the remote payload into a local write. The
+    # exception is a `$( )` or backtick inside double quotes, which this
+    # machine's shell runs first. That is the `"$(bash -c 'source ...')"`
+    # idiom: 14 of the 16 in-span matches in one box's corpus (cc-09, 50,128
+    # calls, 2026-09-24), each of which a bare in-span check would have
+    # silently stopped rescanning.
     if _depth < 2:
         for m in _LOCAL_EXEC_RE.finditer(cmd):
+            ctx = _span_context(m.start(), cmd, spans)
+            if ctx == "data" or (ctx is None and _in_span(m.start(), remote)):
+                continue
             inner = m.group(1)[1:-1]
             if inner.strip():
                 targets.extend(extract_targets(inner, _depth + 1))
@@ -434,7 +548,7 @@ def extract_targets(cmd, _depth=0):
     # Multi-arg verbs (mkdir / touch / tee): scan every positional token after the flags.
     for verb in MULTI_ARG_VERBS:
         for m in _MULTI_ARG_TAIL_RE[verb].finditer(cmd):
-            if _in_span(m.start(), spans):
+            if _in_span(m.start(), spans) or _in_span(m.start(), remote):
                 continue
             tail = m.group(1)
             for tok in tail.split():
@@ -452,6 +566,9 @@ def extract_targets(cmd, _depth=0):
             # `--summary "...>>/tee..."` does not (the `>>` is inside one).
             if _in_span(m.start(), spans):
                 continue
+            # In a container's command line only the redirect is local.
+            if _in_span(m.start(), remote) and not m.group(0).startswith(">"):
+                continue
             verb_match = re.search(r'\b(cp|mv|install|dd)\b', m.group(0))
             verb = verb_match.group(1) if verb_match else "redirect"
             path = m.group(target_group)
@@ -459,7 +576,13 @@ def extract_targets(cmd, _depth=0):
                 targets.append((verb, path))
 
     # sed -i writes — a tokenizer walk, not a pattern; see _sed_inplace_targets.
-    targets.extend(_sed_inplace_targets(cmd, spans))
+    # It has no offsets, so a container's command line is blanked first. The
+    # length is kept, so the span offsets still line up.
+    sed_view = cmd
+    if remote:
+        sed_view = "".join(" " if _in_span(i, remote) else ch
+                           for i, ch in enumerate(cmd))
+    targets.extend(_sed_inplace_targets(sed_view, spans))
     return targets
 
 

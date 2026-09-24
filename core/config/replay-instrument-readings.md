@@ -968,3 +968,341 @@ ABBREVIATED (context zone normal, rising); used the selection-time retrieval onl
      printed beside it. Here the pooled delta sat within 1.4pp of the date-only control.
   4. alpha's per-id re-read of the 37 g-115-10679 ids is still owed. Pool arithmetic is
      consistent with zero loss, which is not the same as measuring it.
+
+## Cycle 92 — 2026-09-23, foxtrot, hostname LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2 (own-cloud), g-001-05
+
+**POOL** `--replay-candidates` = **853** at 22:50Z (5,900,384 B; archived 833, resolved 20).
+CONFIRMED 569 · CORRECTED 203 · UNRESOLVABLE 65 · EXPIRED 8 · outcome-null 8. `surprise`
+is present on 787 records and `surprise_level` on 2. rc {0: 429, 1: 261, 2: 98, 3: 50, 4: 15}.
+**Rule 2 first:** surprise>=7 eligible = **1**. The series reads empty, empty, 6, 5, 0, 1, 1.
+Pool base CORRECTED is **26.23%** (202 of 770 scoreable, test-cat dropped, PRE-stamp).
+
+**Owed item discharged (alpha item 2, Run 78 item 4).** I re-read the 40 restored ids per
+id with `pipeline-read.sh --id`: the 37 in g-115-10679's list plus the 3 restored at 10:25.
+At 23:03:45Z, **40 of 40 carry `encoded_via_chronic`** (asserted against the intended 40,
+not against the loop count). The corpus-wide flag count is **216 = 176 + 40**, which exactly
+matches alpha's 176 surviving flags plus the 40 restored. So there was zero loss in the ~14h
+since the restores. This is an interim reading for
+`2026-09-23_chronic-flag-wipe-does-not-recur-within-a-week` (due 09-29), not a resolution.
+
+**BATCH** 10 = rule 2's single record + 9 from band 2 (218 eligible). Selection
+round-robin stratified on rc, sha1(id) order inside each stratum: rc {0:4, 1:3, 2:3}.
+5 CORRECTED · 4 CONFIRMED · 1 UNRESOLVABLE (5 of 9 scoreable = 55.6%, +12.9pp over
+the corpus, upward-biased by construction). **Test-fixture exclusion is `category ==
+"test-cat"` exactly.** A `startswith("test")` predicate also drops 7 `test-coverage` and
+1 `testing` records, which are real hypotheses.
+
+**STEP 2 — ONE NULL WINNER, AND ITS LESSON SITS UNDER TWO MORE UNCHAINED KEYS.**
+`2026-08-14_retrieve-brokenpipe-splits-by-per-file-rtt` returns `narrative_key: null`, yet
+it carries a full resolution under `evidence` ("PROBE INVALID ...") and under `abc_chain`
+(A/B/C, with C naming the outcome). Neither key is in NARRATIVE_CHAIN or in the skill's
+unchained list. Corpus census (1136 scoreable): winners are outcome_detail 869, rationale
+94, NULL 26, and 147 on other keys. On the 123 weak winners (NULL, rationale or chars<40),
+`evidence` is present on **30**, and **9** carry their own outcome token. On the 1013
+real-key winners, `evidence` is present on 45, and 2 carry the token. `abc_chain` is
+present on 1 record, this one. **`evidence` is a MIXED-PHASE field.** The April records hold
+formation grounds as lists, and the token-bearing ones are resolution text. So it must NOT
+join the chain wholesale (the `reasoning` precedent above). Read its text and apply the
+own-token test. That is roughly 9 more false bares, the instance for g-115-10108.
+
+**STEP 3 — NOTHING ENCODED; one prospective candidate.** CORPUS = 1878-record deduped
+resolved ∪ archived union, 1136 scoreable. Removed from BOTH arms: 9 batch, 14 verdict-token
+titles, 4 test-cat. **P = 1109**, base 42.56%. Title-only markers, stratified by month from
+the start with the date-only control beside them (Run 78 item 3). Pooled exceedance is
+4000 size-matched permutations; within-month exceedance permutes labels inside each month.
+
+| marker | n | Δ pooled | exceedance | date-only ctl | Δ month-MH | within-month exceedance |
+|---|---|---|---|---|---|---|
+| SCOPE (fleet-wide/all/every/…) | 67 | +2.36 | 0.795 | +3.95 | +2.51 | 0.619 |
+| NEG (not/no/never/…) | 459 | +1.73 | 0.597 | −3.11 | +3.75 | 0.228 |
+| CONJ (and/both) | 64 | −7.03 | 0.297 | +4.58 | −6.16 | 0.364 |
+| **CONTRAST `\bnot\b`** (batch-derived: 6 of 10 titles) | 340 | +6.06 | 0.065 | +1.82 | **+8.50** | **0.0143** |
+
+CONTRAST is not a date proxy (the control is +1.82). But it misses the 4-marker Bonferroni
+cut (0.0125) and the 10pp reporting threshold. It is also heterogeneous: July reads +15.5
+(n=103/264) while August, the largest month, reads **+0.1** (n=188/231). **Do not re-test
+it on this corpus.** If it is pursued, pre-register it on records formed after 2026-09-23,
+stratified by month. Controls: id[11:] parity −1.82pp, continuing a series of
+−0.71/−1.00/−1.40/−2.04/−1.41. id[:10] ≥ 08-01 reads −3.45pp. **Gap (store − pool)
+16.37pp**, the tenth reading, inside [13.0, 17.5]. The 57.2% "pool base" in the populations
+node's SEVENTH-occurrence table is the rule-1 BAND rate, as occ136 found. Cycle 92
+re-derived that from scratch because the correction lived only in front matter. It now
+sits beside the number.
+
+**STEP 3.5:** Two CORRECTED records (#1 rb-exclusion, #7 brokenpipe) share one condition:
+the probe read ONE partition of a partitioned surface, either a response key or a live log
+without its rotated sibling, and so manufactured the absence the claim needed. That is
+already encoded (rb-11714 + guard-4749; guard-3542), so there is no convention proposal.
+**STEP 3.6:** eligible 0.
+**STEP 4:** guard-2857 is REINFORCED, batch-scoped with no rate: 4 of 5 CORRECTED records
+were corrected by their own specification or instrument (a positive-control conjunct, an
+invalid probe, a count threshold of >=2 against 1 observed, and a count-only miss). No
+signature outcomes, because the matches are retrospective (sig-235 on #7). **guard-6084
+action_hint set:** the exact-title query returns rb-10256 at `meta_lessons[3]` of 5, so
+"near-guaranteed NOT retrievable" is false for a near-verbatim title query. The capacity
+question stays with g-374-99. **Self-correction:** this session's own ad-hoc retrieval
+parsers used the two-key shape that guard-4749 forbids. rb-11714 sat in `meta_lessons`,
+unread, until the third parse.
+**STEP 4.5:** stamped 10, verified 10 per id, next_review 2026-09-30.
+**STEP 1.5:** all 8 categories retrieved at medium depth, rc=0 each. No drift beyond
+rb-11714.
+
+**NEXT RUN (93):**
+  1. Check rule 2 first and inherit nothing (it read 1 here).
+  2. Exclude `category == "test-cat"` and outcome-null. Do not use a `test*` prefix.
+  3. CONTRAST: prospective test only (step 3). Do not retrospect on this corpus again.
+  4. Re-read the 40 restored ids per id once more before 09-29.
+  5. Display EVERY non-empty retrieve key (guard-4749). Universal lessons live only in
+     `meta_lessons`.
+
+## Run 79 — 2026-09-24, zeta, hostname cc-02, `uname -r` 6.8.0-139-generic (own-cloud), g-001-05
+
+**POOL** `--replay-candidates` = **872** at 03:45Z (6,055,940 B; archived 854, resolved 18).
+CONFIRMED 579 · CORRECTED 213 · UNRESOLVABLE 64 · EXPIRED 8 · outcome-null 8. `surprise` on
+806, `surprise_level` on 2. rc {0: 427, 1: 268, 2: 104, 3: 57, 4: 16}. Excluded test-cat 2 and
+outcome-null 8. Pool base CORRECTED **26.84%** (212 of 790 scoreable, PRE-stamp).
+
+**THE POOL MOVES WITH THE DUE CALENDAR. Read this before explaining any jump.** The endpoint
+excludes every record whose `next_review_date` is in the future. So pool size, rule 2 and
+Step 3.6 eligibility all JUMP on the day a stamped cohort comes due, and DROP when a batch is
+stamped. Today 27 pool records carry `next_review_date` 2026-09-24, and all 27 were last
+replayed on 09-17. The arithmetic: Cycle 92 read 853 at 22:50Z, foxtrot then stamped 10, and
+27 came due at midnight. 853 − 10 + 27 = 870, within 2 of the 872 observed; the 2 are
+unattributed. That one cohort supplied BOTH rule-2 records and ALL FIVE Step 3.6 eligibles.
+So the rule-2 series (empty, empty, 6, 5, 0, 1, 1, **2**) is a calendar reading, not a
+supply trend. **Prior art, found after this was written:** tree node
+`performance/agent-performance/replay-instrument-populations` already records this cooldown
+exclusion (cycles 69/70; occ136: "state which side of the stamp a pool number was taken on").
+New here: only the reconciliation arithmetic and the forward schedule below (rb-11746).
+
+**RESTING SCHEDULE, a prediction for run 80 onward.** These are live-first counts, taken
+PRE-stamp, of records whose `next_review_date` is after today, grouped by due date as
+[records, rule-2 eligible, Step 3.6 eligible]:
+
+- 09-25 [7, 0, 1] · 09-26 [14, 3, 1] · 09-27 [18, 3, 2] · 09-28 [19, 7, 3]
+- 09-29 [18, 3, 2] · 09-30 [29, 5, 4]
+- 2027-07-13 [2, 0, 0]: both are rc 5, so they are inert.
+- This run's stamps add 10-01 [10, 2, 2].
+
+A run before a given day cannot select that day's records, because they are not in the pool
+yet. So a day's figures change only through three routes: a flag; new resolutions; or a
+prune revert (below), which moves a record's due date EARLIER. Corpus-wide, with no due
+filter, 24 records are rule-2 eligible and 18 are Step 3.6 eligible.
+
+**RULE 2 FIRST:** eligible **2**, and both come from the due cohort:
+`2026-08-15_first-real-key-mint-after-button-live` (CONFIRMED) and
+`2026-08-08_starvation-unblock-completes-without-restarting-cadence` (CORRECTED).
+
+**STEP 3.6:** eligible **5**, all newly chronic. Each reached rc 3 at its 09-17 stamp and
+came due today. All 5 were flagged and verified per id:
+- `2026-08-02_freshness-threshold-has-no-ssot-across-paths`,
+  `2026-08-02_store-dupe-warn-malformed-arrival-rate-fleet` and
+  `2026-08-06_recurring-cadence-insufficient-for-commons-pipe` strengthen guard-2857
+  (times_active +3). Each is corrected by its own specification:
+  - a conjunction with one leg false;
+  - an exact-zero predicate, refuted by 3 of 1961;
+  - an observable that other actors can move (the mechanism itself survived).
+- `2026-08-05_instances-update-permits…` strengthens guard-2716: its probe shapes were
+  chosen by guess.
+- `2026-07-31_vacuity-scan-finds-more-sites` is a thin record with no recorded lesson. It was
+  flagged to stop it cycling; no guardrail was touched.
+
+**FLAG RE-READ (Cycle 92 item 4):** at 03:47:40Z all 40 restored ids still carry
+`encoded_via_chronic` when read per id. The corpus count is **216** on BOTH the archive-copy
+view and the live-first union. This is the second interim zero-loss reading for
+`2026-09-23_chronic-flag-wipe-does-not-recur-within-a-week` (due 09-29).
+
+**GAP (store − pool): 15.79pp** measured live-first (store 42.63%, pool 26.84%). This is the
+eleventh reading, inside [13.0, 17.5]. The stale union gives 15.84pp (42.68%, n=1134), so
+rb-7099's stale-copy effect on this particular rate is 0.05pp.
+
+**BATCH:** 10 records. That is rule 2's 2, plus 6 from rule 1 (5<=s<7) chosen round-robin
+across rc strata (seed "g-001-05-run79"), plus 2 routine. Outcomes: 3 CORRECTED · 7 CONFIRMED.
+All 10 narratives parsed (count asserted). Nine are under `outcome_detail` (425–5,019 chars)
+and one is under `evidence_for`; none is NULL and none is `rationale`.
+
+| # | record | outcome | s | rc |
+|---|---|---|---|---|
+| 1 | 2026-08-15_first-real-key-mint… | CONFIRMED | 7 | 2→3 |
+| 2 | 2026-08-08_starvation-unblock… | CORRECTED | 7 | 2→3 |
+| 3 | 2026-08-03_low-band-is-honest… | CONFIRMED | 5 | 0→1 |
+| 4 | 2026-08-18_late-resolution-marker… | CORRECTED | 6 | 1→2 |
+| 5 | 2026-08-04_live-stores-flat… | CORRECTED | 5 | 2→3 |
+| 6 | 2026-06-28_selfmd-trigger-cap-holds | CONFIRMED | 5 | 3→4 |
+| 7 | 2026-05-04_render-stepped-wait… | CONFIRMED | 5 | 4→**5** |
+| 8 | 2026-08-09_keyable-is-not-cleared | CONFIRMED | 5 | 0→1 |
+| 9 | 2026-07-31_sq018-route-step… | CONFIRMED | 4 | 0→1 |
+| 10 | 2026-07-19_multibody-server-resident… | CONFIRMED | 2 | 0→1 |
+
+**#7 has the thinnest narrative in the batch:** 93 chars under `evidence_for`. Its middle
+clause ("Server receive print also missing") is ambiguous. It fits the hypothesized hang
+(nothing reached the server) as well as an incomplete fix, so the narrative alone cannot
+adjudicate the verdict. An earlier reading in this run called the clause contrary to the
+verdict; that overstated it and is withdrawn. This stamp takes #7 to rc 5, so it leaves replay
+and no future batch will read it again.
+
+**STEP 4.5:** stamped 10, verified 10 per id, next_review 2026-10-01. **Two of the ten
+landed only on a live tombstone** (next paragraph).
+
+**NEW LOSS PATH: THE PRUNE LANE REVERTS POST-ARCHIVAL WRITES (filed as g-115-10778).**
+Two independent signals establish it.
+- **The code:** writes go to the LIVE copy first. Moving a record to `archived` leaves a
+  live tombstone (stage=archived) and appends a frozen archive copy once. `archive_sweep`
+  then deletes tombstones at least 14 days old (`PRUNE_GRACE_DAYS`) and writes nothing back.
+- **The control:** before writing, I predicted that exactly the 2 batch records archived on
+  09-13 (#4, #8) would take their stamps live-only. After the writes, 13 of the 15 showed up
+  both in `--stage archived` and in a per-id read. The 2 that did not were the 2 predicted.
+
+28 records are now at risk: the 26 found in a live-first union, plus those 2. Every one of
+them carries a replay stamp that will revert. One of them, `2026-08-11_memcont-floored…`,
+will also revert its outcome from UNRESOLVABLE back to CORRECTED. Records become prune-eligible
+from these dates: 09-24 ×1, 09-25 ×4, 09-26 ×1, 09-27 ×4, 10-01 ×3, 10-02 ×11, 10-04 ×3,
+10-06 ×1. No flags are at risk.
+
+The class, and a repair for it, were already documented in tree node
+`system/jsonl-archival-sweep-overlap-exposure`: on 09-08 it recorded six records rolled back
+and repaired by hand. The sweep is called by g-001-06, a recurring goal every agent carries;
+zeta's copy now has the repair procedure to run before and after each sweep.
+
+**What this means for this ledger:** after a prune, a record's `replay_count` reads too low.
+That delays both the rc>=5 cap and Step 3.6's rc>=3 predicate. So treat rc-based readings as
+lower bounds for any record archived within 14 days of a sweep.
+
+**NOT DONE, stated so it is not read as clean:**
+- **Step 1.5:** the per-category retrieval was not run; only selection-time retrieval was used.
+- **Step 2:** the experiences were not dereferenced; the narratives were enough.
+- **Step 3:** no new marker test. CONTRAST is prospective only (Cycle 92), and
+  `measurement_channel` was answered in Run 78.
+- **Step 3.5:** nothing to propose, because the 3 CORRECTED records share no procedural
+  condition.
+- **Step 4:** no signature outcomes, because the matches are retrospective.
+
+**NEXT RUN (80):**
+  1. Check rule 2 first and inherit nothing (it read 2 here).
+  2. Exclude `category == "test-cat"` and outcome-null.
+  3. If pool size, rule 2 or Step 3.6 jumps, check the resting schedule above first. Do not
+     re-derive the due-window effect.
+  4. Build any corpus LIVE-first: pool copies plus per-id reads. Never union
+     `--stage resolved` with `--stage archived` (rb-7099).
+  5. After any archival sweep, re-read the 28 at-risk ids per id; they are listed in
+     g-115-10778. The first revert expected is `2026-08-31_suite-run-overtaken-by-peer-pushes`,
+     rc 2→1.
+  6. Re-read the 40 restored flags per id before 09-29.
+
+## Run 80 — 2026-09-24, zeta, hostname cc-02, `uname -r` 6.8.0-139-generic (own-cloud), g-001-05
+
+**POOL** `--replay-candidates` = **861** at 12:54Z PRE-stamp (5,940,576 B). Excluded test-cat 2,
+outcome-null 8. Re-read after the main batch's stamps: **851** (5,887,133 B), exactly −10; all
+10 batch ids absent per id-set diff. Base CORRECTED rate not recomputed this run.
+
+**READ THIS FIRST — THE STORED `surprise` IS STALE ON A THIRD OF THE POOL, AND IT HID ALL OF
+RULE 2.** Step 1 selects on the STORED field. `core/scripts/_surprise.py` moved to
+round-half-up on 2026-09-07, and `apply_derived_surprise` runs only on WRITE, so no record
+written before then carries the new value. Over the 851 in-scope pool records (779
+derivable = CONFIRMED|CORRECTED with a numeric confidence), **268 (34.4%) disagree with
+`derive_surprise(r)`**:
+- CONFIRMED@0.55 4→5 ×110; CORRECTED@0.45 4→5 ×47; CONFIRMED@0.75 2→3 ×14;
+- CONFIRMED@0.6 2→4 ×12; NULL→value ×26; plus a tail.
+- Two sources are mixed and NOT split here: the 09-07 rounding change (the .x5 rows) and the
+  pre-07-29 caller-supplied residue g-115-6183 measured. For example, CONFIRMED@0.6 stored 2
+  is not a rounding case.
+
+Band moves: rest→r1 190, none→r1 10, r1→r2 4, none→r2 1, r1→rest 1.
+**Rule 2 is 0 stored and 5 derived. Rule 1 is 236 stored and 417 derived.** The 5 hidden
+rule-2 records are all CORRECTED at conf 0.65 or 0.75. Three of them have an August outcome_date (08-03, 08-10,
+08-29), so g-115-6183's line "outcome_date 2026-08 is 0 of 187 wrong" no longer holds after
+09-07:
+- `2026-07-17_dev-stage1-loop-survival-post-fixes` (5→7)
+- `2026-07-18_g115-16-cargo-cult-gpu-skip` (NULL→8)
+- `2026-08-02_privatenotes-increment-stays-below-median` (6→7)
+- `2026-08-03_vinheim-stale-hostname-no-client-self-heal` (6→7)
+- `2026-08-12_directive-boost-pins-cap-above-recurring-band` (6→7)
+
+**POSITIVE CONTROL:** stamping those 5 re-derived every one on write. The stored values
+5/NULL/6/6/6 read back per id as 7/8/7/7/7. Every replay stamp therefore repairs its own
+records, and the stale population shrinks only as fast as records get written. The first
+signal was one record: `2026-04-10_envperception…` read 4 in the pool and 5 per id. Its only
+changelog write was this run's own stamp, 12:57:40.
+
+**Rule 2 first, as corrected.** The stored count of 0 matched run 79's resting schedule: the
+due cohort's 2 rule-2 records were stamped at run 79. The derived count is 5, found after the
+main batch was stamped. They were replayed as a SUPPLEMENT, which takes the run to 15
+against N=10. That overrun is stated rather than hidden.
+
+**THIS RUN'S SELECTOR HAD AN OFF-BY-ONE IN THE 7-DAY SKIP (measured).**
+- The filter `last_replayed >= today−7` dropped exactly the 17 due-today records
+  (last_replayed 09-17, next_review_date 09-24). The endpoint had already admitted them.
+- 0 of the 17 are rule 2 and 0 are Step 3.6, so both zeros stand. 14 are rule 1.
+- A rerun with a strict `>` changes 2 of 10 slots. The rc=3 band-1 stratum gains its ONLY
+  member, `2026-08-05_cross-surface-entity-divergence-is-wider-than-one-token` (s6), which
+  displaces `2026-07-13_stale-layout…`. The seeded random draw also moves.
+- "Within the last 7 days" is strict. A `>=` filter removes the due-today cohort, and in
+  run 79 that cohort carried ALL of rule 2 and ALL of Step 3.6.
+
+**STEP 3.6:** 0 eligible in the pool. Run 79's 5 are flagged and excluded. The supplement's
+stamps take `privatenotes…` and `vinheim…` to rc 3, CORRECTED and unflagged, so both become
+eligible when they come due on 10-01.
+
+**A FLAG LOST OUTSIDE THE MONITORED 40.** `2026-07-30_split-without-reduce-recurs` was flagged
+by run 77 (line 729 above; rc 3). The two writes landed straight on the archive copy at 09-22
+05:59:15 and 05:59:34; there were 0 live copies, so no tombstone was involved and this is not
+g-115-10778.
+- At 12:54 it sat in the pool FLAGLESS at rc 2 with last_replayed 08-27. That is at least two
+  writes back: the stamp that made it rc 3, and run 77's flag.
+- No logged write to the id appears in cc-02's changelog between 09-22 05:59:34 and this
+  run's restore. That gap makes g-115-10679's merge mechanism the plausible cause; it is
+  inferred, not verified.
+- Restored flag-only at 12:57:14 and read back per id. rc stays at the reverted 2; it is inert
+  while the flag excludes the record.
+- This does not bear on `2026-09-23_chronic-flag-wipe-does-not-recur-within-a-week`, whose
+  population is the 40 restored ids. The id is NOT among them.
+
+**BATCH.** 10 main records: 8 band-1 stratified over rc 0/1/2 (oldest formed first), plus 2
+seeded routine. Add the 5 supplement records.
+- Main outcomes: CORRECTED 3 (ohs-binding, postfix-readiness, a2-deploy), CONFIRMED 5,
+  UNRESOLVABLE 1 (placeable, a retired duplicate). The 10th is split-without-reduce, which
+  was restored, not replayed. The supplement is 5 CORRECTED.
+- Narratives: main 9 of 9 parsed, and the supplement 5 of 5.
+- **`2026-04-10_envperception…` is BARE by Step 2's definition.** The chain winner is its
+  formation `rationale` (295 chars). None of the six unchained keys is present, and `evidence`
+  (not in the chain) holds only 4 formation-time bullets. This stamp took it to **rc 5**, so
+  it leaves replay with no recorded lesson.
+
+**STEP 3 — NO MARKER TESTED. These are qualitative readings only.**
+- 7 of the 8 CORRECTED records read this run share one FORMATION shape: the claim's scope
+  outran its evidence.
+  - A conjunction with a failed leg: ohs-binding; vinheim, whose own method note cites rb-2572.
+  - "Eliminated", refuted by one instance: a2-deploy.
+  - An n=1 snapshot extrapolated to a steady-state rate: directive-boost.
+  - A 3-run window standing in for "continues to": privatenotes.
+  - Targeted-fix coverage read as total coverage: dev-stage1.
+  - Right direction, wrong mechanism: g115-16.
+- The 8th, postfix-readiness, is a contrarian "fix won't work" claim, corrected by a clean
+  0/40.
+- 3 of the 9 main narratives (sidecar, postfix, a2-deploy) record a first-pass false ZERO
+  caught by a schema or vocabulary probe (rb-245).
+- Both readings come from narratives, so under method rule 1 they are linguistic proxies for
+  the outcome. They reinforce guard-2857's "corrected by its own specification" family (run
+  79) and find nothing new.
+
+**NOT DONE, stated so it is not read as clean:**
+- Step 1.5: no per-category retrieval.
+- Step 2: no experience dereference.
+- Step 3.5: nothing proposed.
+- Step 4: no signature outcomes, because every match is retrospective (4c). No strategy
+  confidence was moved.
+
+**STEP 4.5:** main batch stamped 9, verified 9. Supplement stamped 5, verified 5. Next review
+for all 14 is 2026-10-01. That adds to run 79's 10-01 cohort: 14 records, 5 of them rule-2 (now
+stored ≥7) and 2 of them Step 3.6.
+
+**NEXT RUN (81):**
+1. Until g-115-6183 back-fills, select on `derive_surprise(r)` (import it from
+   `core/scripts/_surprise.py`), not on the stored field. Print stored and derived rule-2
+   counts side by side.
+2. Make the 7-day skip strict: `last_replayed > today−7`.
+3. Re-read `2026-07-30_split-without-reduce-recurs`'s flag per id. Under g-115-10679 a flag
+   loses every merge against a flagless copy, so this restore is not durable while any box
+   holds a stale copy.
+4. Carry run 79's items 5 and 6: re-read the 28 at-risk ids after any sweep, and re-read the
+   40 restored flags before 09-29.

@@ -2242,3 +2242,22 @@ cannot re-derive a kinder one.
 **0 stale** (`--all-skills`). **Phase 6** no meta drift. **Phase 1** wrote rb-11580 (carried
 debt-count drifts downward against the instrument that measures it) and strengthened
 guard-7075, which had fired correctly and was honored this iteration.
+
+## alpha — 2026-09-24T04:36 (fire at 15424, gate read a SEED 15344, diff 80; hostname cc-07, uname -r 6.8.0-139-generic, own-cloud, reducer)
+
+**Phase 2**, both queries with `--full` at about 04:34:
+- in-progress: **6 candidates, 0 mutated, 4 skipped (foreign sid), 0 skipped (absent sid), 2 skipped (partner)**. Fields: claimed_by 6/6, claimed_by_sid 6/6, name-less-sid 0. Claimants: alpha 4 (this agent's worker Bodies, other sids), bravo 1, foxtrot 1. outcome_note is non-empty on 3 of 6.
+- pending+agent: **3189 candidates, 0 mutated, 2 skipped (foreign sid), 0 skipped (absent sid), 0 skipped (partner)**. There are 3187 null-claim rows, and none was known done out of cycle. Fields: claimed_by 2/3189, claimed_by_sid 2/3189, name-less-sid 0. The two counts reconcile.
+
+**Phase 3**: 18 blocked, 0 mutated, 1 skipped (partner).
+- The 16 `blocked_by` edges all point at non-terminal dependencies: 17 distinct dependencies, 10 pending and 7 blocked.
+- One row is a `precondition_unmet:` window defer.
+- `blocker_ref` is None on all 18. On the rule axis, grant-009…020 retire none of the 4 defer texts.
+
+**The gate's operand was a stagger SEED** written during a daemon fault (g-115-10780). alpha's previous REAL sweep was 2026-09-05T15:02, 19 days earlier. Over those 19 days the meter log shows only 4 tight-zone drops and 1 fail-open run for this lane. A starvation-by-re-seeding hypothesis is attached to g-115-10780; it is inferred and untested.
+
+**Phase 5b**: 148 skills / 3906 assertions / 5 parse-lines, **0 stale**.
+
+**Phase 1** cleared knowledge_debt 4 of 4: 2 were already paid, 1 was paid now, and 2 were routed to g-115-9567 and the new g-115-10781.
+
+**Lane 7**: a transcript audit (guard-6730 method) found **1 real re-arm-first miss in 22 compactions**, while the in-context narrative claimed about 13. The inflation came from summaries each carrying the previous count forward plus one. Not material.

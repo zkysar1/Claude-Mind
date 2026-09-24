@@ -74,6 +74,42 @@ The post-write assertion compares against the PRE value, never against the
 string this script constructed — comparing to your own construction only proves
 the write echoed. It asserts the sentinel is present, that PRE survived
 verbatim, and that the length GREW.
+
+RETENTION POLICY IS FIELD-SPECIFIC (g-115-10533)
+``rotate_oversize`` moves the OLDEST blocks to the archive and keeps the newest
+that fit. For a progress_note that polarity is right: recent history is what a
+reader needs. For a description it is WRONG: the oldest blocks are the ORIGINAL
+GOAL STATEMENT — the executable task definition — and a keep-newest rotation
+there archives the task and keeps the amendments. Measured, not inferred:
+2026-09-22T01:39:29 an ordinary description append on g-115-817 rotated the 30
+oldest blocks out — evicting the unit-lease STEP 0, the PULL-FIRST step, and the
+alert ROUTING TABLE, and leaving fourteen later lesson blocks that commented on
+all three (guard-7281; the mechanism wrote a correct, readable archive and lost
+exactly nothing, which is what makes the loss invisible to every integrity
+check).
+
+The two properties a description bound owes are (a) the executable task
+statement SURVIVES every eviction and (b) the field STAYS under the read cap.
+Keep-newest satisfies (b) and fails (a); a bare exemption from rotation
+satisfies (a) and fails (b) — it restores unbounded growth on the one field
+that already reached 111 KB once, and its failure mode is SILENT TRUNCATION
+(guard-1478): the reader gets a prefix and cannot tell (bravo, cc-13).
+
+The policy that satisfies both: a pin marker the AUTHOR writes makes a block
+non-evictable. ``[hoisted:...]`` is the measured in-corpus spelling (the evicted
+STEP 0 carried it); ``[pin:...]`` is the named form new blocks should use.
+Pinning is on the MARKER, not on position — the executable head is a RUN of
+blocks (statement + protocol + routing table) and its length is not knowable
+from position alone; a first-block pin saved STEP 0 while a measured rotation
+still cut the Step-1 and routing-table blocks that made it runnable. Every
+pinned block is written to the archive sink on rotation (provenance) but never
+cut from the live field; the REST rotates keep-newest as before. ON TOP of the
+marked set, block 0 is pinned UNCONDITIONALLY: the goal's check is absolute —
+the FIRST block is never the block that gets archived — and a later marked
+block must not re-arm keep-newest over an unmarked original statement. When
+the pinned head ALONE exceeds the keep bound, rotation fails open (returns the
+field untouched): (a) beats (b), and a field that no bound can shrink is a
+curation job for a human, not a reason to cut the statement.
 """
 from __future__ import annotations
 
@@ -275,6 +311,17 @@ ROTATE_DISABLED = os.environ.get("GOAL_NOTE_ROTATE", "").lower() in ("0", "off",
 # text. That is why this reads "NOTE HISTORY ROTATED" and not "[ROTATED ...]".
 ROTATE_NOTICE_HEAD = "NOTE HISTORY ROTATED"
 
+# Pin markers for a goal DESCRIPTION's non-evictable head ().
+# "[hoisted:..." is the measured in-corpus spelling — the STEP 0 that the
+# 2026-09-22 rotation evicted from  carried it — and "[pin:..." is the
+# named form new blocks should use. The marker is the AUTHOR's declaration that
+# a block is executable head; no rotation may cut a block carrying one. Pinning
+# is on the marker, never on position: the executable head is a RUN of blocks
+# (statement + protocol + routing table) and its length is not knowable from
+# position alone — a first-block pin saved STEP 0 while the measured rotation
+# still cut the Step-1 and routing-table blocks that made it runnable.
+PIN_MARKERS = ("[hoisted:", "[pin:")
+
 
 def split_blocks(value: str) -> "list[str]":
     """Split an append-ordered field into blocks, oldest first.
@@ -296,6 +343,33 @@ def split_blocks(value: str) -> "list[str]":
     if tail:
         out.append(tail)
     return out
+
+
+def pinned_description_indices(blocks: "list[str]") -> "list[int]":
+    """Indices of the non-evictable blocks of a description ().
+
+    A block the AUTHOR pinned — it carries a ``[pin:...]`` or ``[hoisted:...]``
+    marker — is executable head and no rotation may cut it. The marker is the
+    pin, never the position: the executable head is a run of blocks (statement
+    + protocol + routing table) and its length is not knowable from position
+    alone, so pinning "block 0" by ordinal saved STEP 0 while the measured
+    2026-09-22 rotation still cut the Step-1 and routing-table blocks that made
+    it runnable.
+
+    BLOCK 0 IS PINNED UNCONDITIONALLY, on top of the marked set. The goal's
+    check is absolute — the FIRST block is never the block that gets archived,
+    marker or no marker — and a later marked block must not quietly re-arm
+    keep-newest over an unmarked original statement: the measured g-115-817
+    record reached exactly that state (12 live blocks, block 0 a rotation
+    notice, the author-marked STEP 0 already in the sink).
+    """
+    marked = [i for i, b in enumerate(blocks)
+              if any(m in b for m in PIN_MARKERS)]
+    if not blocks:
+        return []
+    if 0 in marked:
+        return marked
+    return [0] + marked
 
 
 def _sink_path(goal_id: str, field: str):
@@ -327,16 +401,48 @@ def rotate_oversize(goal_id: str, field: str, source: str, pre: str) -> str:
         blocks = split_blocks(pre)
         if len(blocks) < 2:
             return pre  # one block cannot be split; nothing safe to cut
-        # Keep the NEWEST blocks that fit, always at least one.
-        kept, total = [], 0
-        for b in reversed(blocks):
-            n = len(b.encode("utf-8"))
-            if kept and total + n > ROTATE_KEEP_BYTES:
+
+        # RETENTION POLICY IS FIELD-SPECIFIC (). For a progress_note
+        # the keep-newest polarity is right. For a description it is WRONG: the
+        # oldest blocks are the executable task statement, and a keep-newest
+        # rotation cuts exactly the part that makes the goal runnable (guard-7281).
+        # So a description's author-pinned blocks are non-evictable and the
+        # block 0 floor is pinned unconditionally (the goal's absolute check:
+        # the FIRST block is never archived), and the rest rotates keep-newest.
+        # When the pinned head ALONE exceeds the keep bound, fail open:
+        # shrinking is impossible without cutting the statement, and (a) the
+        # statement survives beats (b) the field is bounded.
+        pinned = set(pinned_description_indices(blocks)) if field == "description" else set()
+        pinned_bytes = sum(len(blocks[i].encode("utf-8")) for i in pinned)
+
+        # Keep the pinned blocks whole, then add the NEWEST non-pinned blocks
+        # under the SAME absolute bound the original loop used: kept (pinned
+        # head + newest rest) fits in ROTATE_KEEP_BYTES. The break's guard
+        # counts only NON-PINNED blocks already kept, so the first non-pinned
+        # block is always admitted, exactly as the original loop always kept
+        # its first (newest) block — the bound starts biting from the second
+        # non-pinned block on. That guard is what keeps this from a worse
+        # failure than the one it replaces: with a pinned head that alone
+        # approaches the bound, counting pinned blocks in the guard would
+        # refuse even the newest block, cut everything non-pinned, and leave
+        # notice + pinned — which is LARGER than `pre` (measured: 852 B out of
+        # 806 B in). The field's floor is the pinned head; rotation shrinks
+        # toward it, never past it, and a field that IS its pinned head
+        # (nothing cut) is returned whole by the `if not cut` guard below.
+        keep = set(pinned)
+        total = pinned_bytes
+        nonpinned_kept = 0
+        for i in range(len(blocks) - 1, -1, -1):  # newest -> oldest
+            if i in keep:
+                continue
+            n = len(blocks[i].encode("utf-8"))
+            if nonpinned_kept and total + n > ROTATE_KEEP_BYTES:
                 break
-            kept.append(b)
+            keep.add(i)
             total += n
-        kept.reverse()
-        cut = blocks[:len(blocks) - len(kept)]
+            nonpinned_kept += 1
+        kept = [blocks[i] for i in sorted(keep)]
+        cut = [blocks[i] for i in range(len(blocks)) if i not in keep]
         if not cut:
             return pre
         stamp = _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -366,12 +472,23 @@ def rotate_oversize(goal_id: str, field: str, source: str, pre: str) -> str:
             return pre  # archive unverified -> cut nothing
         # PROVENANCE IN THE SAME EDIT AS THE CUT (guard-6105): a reader of the
         # reduced field must be able to find what was removed without knowing
-        # this code exists.
-        notice = (f"{ROTATE_NOTICE_HEAD} {stamp}: the {len(cut)} oldest block(s) "
-                  f"({sum(len(b.encode('utf-8')) for b in cut)} bytes) were moved to "
-                  f"{sink} to keep this field readable. Nothing was deleted — read them "
-                  f"there. This rotation is automatic at {ROTATE_AT_BYTES} bytes "
-                  f"(GOAL_NOTE_ROTATE_BYTES); set GOAL_NOTE_ROTATE=off to disable.")
+        # this code exists. For a description the cut is the oldest NON-PINNED
+        # blocks (the pinned head stays), so the notice must not claim it cut
+        # "the oldest" when a pinned head was deliberately kept.
+        if field == "description" and pinned:
+            cut_phrase = (f"the {len(cut)} oldest non-pinned block(s) "
+                          f"({sum(len(b.encode('utf-8')) for b in cut)} bytes)")
+            keep_phrase = (" the pinned (non-evictable) head was kept, "
+                           "not just the newest blocks.")
+        else:
+            cut_phrase = (f"the {len(cut)} oldest block(s) "
+                          f"({sum(len(b.encode('utf-8')) for b in cut)} bytes)")
+            keep_phrase = " the newest blocks were kept."
+        notice = (f"{ROTATE_NOTICE_HEAD} {stamp}: {cut_phrase} were moved to "
+                  f"{sink} to keep this field readable.{keep_phrase} Nothing was "
+                  f"deleted — read them there. This rotation is automatic at "
+                  f"{ROTATE_AT_BYTES} bytes (GOAL_NOTE_ROTATE_BYTES); set "
+                  f"GOAL_NOTE_ROTATE=off to disable.")
         reduced = notice + "\n\n" + "\n\n".join(kept)
         if reduced[:1] in ("{", "["):
             return pre

@@ -132,10 +132,12 @@ def close_enough(old, new, tol=0.01):
     return old == new
 
 
-def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3):
+def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3, persist_bindings=True):
     """Resolve each category → node and build the update plan.
     Returns (plan, summary). Plan is a list of {node_key, mutations}
     tuples where mutations is {field: new_value}.
+    persist_bindings=False (the --dry-run path) leaves the shared bindings
+    cache untouched: a preview must not pin a fuzzy match it only proposed.
     """
     nodes = tree.get("nodes", {})
     entity_index = tree.get("entity_index", {})
@@ -172,7 +174,11 @@ def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3):
         agg["categories"].append(category)
 
     # Persist bindings so the next run skips find_nodes for known categories.
-    save_bindings(bindings)
+    # Never on --dry-run (, 2026-09-24): a dry-run pinned
+    # hypothesis-pipeline -> `pip`, an unrelated product-spec node, in the shared
+    # cache, so the next real run would have written accuracy onto it.
+    if persist_bindings:
+        save_bindings(bindings)
 
     summary["nodes_resolved"] = len(node_data)
 
@@ -281,6 +287,7 @@ def main():
         tree,
         min_sample_size=args.min_sample,
         apply_confidence_min=args.confidence_min_sample,
+        persist_bindings=not args.dry_run,
     )
 
     if plan:

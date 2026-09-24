@@ -181,7 +181,7 @@ def test_directive_lane_goal_outranks_the_balancer_favored_goal(focus):
     )
 
 
-def test_without_the_waiver_the_directive_lane_would_have_lost(focus):
+def test_without_the_waiver_the_directive_lane_would_have_lost(focus, monkeypatch):
     """Reconstructs the pre-fix total from the recorded telemetry.
 
     Proves the clamps are LOAD-BEARING rather than incidental: re-applying BOTH
@@ -189,7 +189,20 @@ def test_without_the_waiver_the_directive_lane_would_have_lost(focus):
     13b-ii — the reconstruction must undo the whole fix, not half of it) flips
     the ordering back. If this stops flipping, the fixture has drifted away
     from the measured defect and the test above is no longer guarding it.
+
+    REPLAYED AT THE WEIGHT THE DEFECT WAS MEASURED UNDER. The foxtrot telemetry
+    in the module docstring was taken with WEIGHTS["directive_boost"] = 1.5. The
+    live strategy has carried 3.0 since 2026-08-28 (three owner-directed raises;
+    g-115-8149 made the field owner-mandated), and at 3.0 this fixture's product
+    goal clears the balancer's whole 2.4 swing with no waiver at all (pre-fix
+    9.93 against 9.12), so the reconstruction stopped flipping and this file read
+    as "no longer reproducing the defect" on every box (g-115-10245). The weight
+    is pinned for the reason CLASS_BALANCE_CONFIG is explicit above: a retuned
+    live config must not silently turn a replay vacuous. Whether the LIVE weights
+    still give the waiver a subject is a different question, asked of the live
+    values by test_the_live_config_still_gives_this_mechanism_a_subject.
     """
+    monkeypatch.setitem(gs.WEIGHTS, "directive_boost", 1.5)
     focus(DIRECTIVE)
     product = _score("g-335-1", "asp-335", "product")
     framework = _score("g-115-1", "asp-115", "framework", category="framework")

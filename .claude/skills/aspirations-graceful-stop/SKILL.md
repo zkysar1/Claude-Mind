@@ -450,19 +450,13 @@ Bash: MIND_AGENT=<agent> bash -c '
 # the text-ending-turn problem that return-protocol.md forbids.
 # {target_mode} is exactly "assistant" or "reader" — /stop's flag parser
 # (stop/SKILL.md Step 0.5) produces only these two values, and GS-0's default
-# is "assistant". The binary if/else below is safe by that invariant: else is
-# unambiguously "reader". Do not trust session-mode-set.sh as a second line of
-# defense — it also accepts "autonomous", so any new caller that could write
-# "autonomous" via target_mode would print the reader message while setting
-# autonomous mode (silent mismatch). Add a third branch if the set of valid
-# targets ever expands.
+# is "assistant". The binary if/else below is safe by that invariant (else is
+# "reader"); session-mode-set.sh is no second check — it also accepts
+# "autonomous" — so add a third branch if the target set ever grows.
 #
-# CRITICAL — `_STATE=$(cmd || echo "?")` and `_MODE=$(...)`: the `|| echo "?"`
-# is REQUIRED. Without it, if session-state-get.sh exits non-zero the subshell
-# inherits that exit code, breaking the && chain — the entire farewell message
-# (heredoc + stop-verified block) silently disappears, regressing the very
-# user-visible-summary fix this verification block was added for. Mirror of
-# the pattern used in recovery-gate.sh's three state-get probes.
+# CRITICAL — the `|| echo "?"` on `_STATE=$(...)` and `_MODE=$(...)` is REQUIRED:
+# without it a non-zero session-state-get.sh breaks the && chain and the whole
+# farewell message silently disappears (mirrors recovery-gate.sh's probes).
 #
 # D7.0 (g-373-128): stop-handoff-check.sh leads the chain, BEFORE the mode flip.
 # It refuses (rc 1, prints digest Step 9 verbatim) unless THIS stop wrote
@@ -482,6 +476,11 @@ Mode set to reader (read-only). Chat and query knowledge freely — no writes al
 Type `/start --mode assistant` for user-directed edits, or `/start` to resume autonomous.
 EOF
 fi && echo "" && echo "═══ Stop verified ═══════════════════════════════" && echo "  state=$_STATE  |  mode=$_MODE  |  residual session files=$_RESID" && if [ "$_RESID" -gt 0 ]; then echo "  (residuals from D6 deny — /start's defensive sweep cleans on next session entry)"; fi && echo "═══════════════════════════════════════════════════"
+# D7.05: stand the deadman net down. The loop's sentinel wake-up outlives the
+# stop and fires "re-enter the loop" into the IDLE agent otherwise (coach,
+# 2026-09-24 06:38Z: armed 17:45Z, /stop typed 21:23Z, prompt 06:38Z). The gate
+# allows the cancel here because D1 set IDLE. Why: rationale/deadman-switch.md.
+ScheduleWakeup(stop: true)
 # D7.1: Final housekeeping — clear the stop-checkpoint sentinel (the "stop
 # complete" marker, FW-11 / g-317-09) AND delete the SID binding. Must run
 # AFTER D7 so the PreToolUse hook can resolve MIND_AGENT for D7's mode-set call
