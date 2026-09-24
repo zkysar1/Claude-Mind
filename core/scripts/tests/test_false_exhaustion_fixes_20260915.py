@@ -34,9 +34,11 @@ import datetime
 import json
 import os
 import pathlib
+import re
 import subprocess
 import time
 
+from test_loop_exhaustion_fence import _decision_payload_source  # noqa: E402
 from test_stop_hook_block_streak import _reason  # noqa: E402
 from test_stop_hook_gate_integration import (  # noqa: E402
     AGENT,
@@ -159,7 +161,54 @@ def test_the_banner_wiring_is_additive_only():
     assert 'ctx_msg = (" " + _cm) if _cm else ""' in text
     assert text.count("ctx_msg") == 2, text.count("ctx_msg")
     assert 'CTX_MSG="$CTX_MSG"' in text, "banner not exported into the payload"
-    assert 'print(json.dumps({"decision": "block"' in text
+    # The literal decision, pinned on the dict pair rather than on the print()
+    # call's layout -- see the fence's twin for the 2026-09-18 re-wrap that
+    # turned the layout pin red on every box ().
+    assert re.search(r'"decision":\s*"block"', _decision_payload_source(text))
+
+
+def _payload(proc) -> dict:
+    """The whole decision payload out of the hook's stdout (the `_reason`
+    helper's scan, keeping every key)."""
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if "decision" in payload:
+            return payload
+    raise AssertionError(f"no decision payload in stdout: {proc.stdout!r}")
+
+
+def test_a_fired_fence_never_changes_the_decision(tmp_path):
+    """The runtime half of the two additive-only pins: with the fence's pause
+    rung FIRED inside the real hook, the decision is still BLOCK, the payload
+    carries the same keys as a holding run, and the verdict rides in the reason.
+    Pinned on the emitted payload, which no re-wrap of the print() can move."""
+    held, root = _drive(tmp_path)
+    assert _blocked(held)
+    # The wrapper's own firing shape (_fire_fence below): a diary frozen an hour
+    # ago and five turn-ends for this sid logged after it -- then the whole hook.
+    sdir = _agent_dir(root) / "session"
+    diary = sdir / DIARY_STORE_NAME
+    diary.write_text("{}\n", encoding="utf-8")
+    old = time.time() - 3600
+    os.utime(diary, (old, old))
+    now = datetime.datetime.now().replace(microsecond=0).isoformat()
+    log = root / "core" / "logs" / "stop-hook.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("".join(
+        f"{now} BLOCK sid={RUNNER_SID} agent={AGENT}\n" for _ in range(5)),
+        encoding="utf-8")
+    fired = _run_hook_as_runner(root)
+    assert _blocked(fired), "a fired fence flipped the decision"
+    reason = _reason(fired)
+    assert "LOOP-STALL PAUSE:" in reason, reason[-400:]
+    assert set(_payload(held)) == set(_payload(fired)), (
+        "the fence changed the payload's shape, not only its reason")
 
 
 # ---------------------------------------------------------------- (3) fence

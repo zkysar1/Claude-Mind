@@ -78,6 +78,77 @@ Phase 5 Verification Escalation handles empty-checks goals structurally.
 
 ---
 
+# Closure Evidence Table (g-375-05)
+
+A goal closed `completed` carries, in its `outcome_note`, one row per verification
+outcome. A row states either a MEASURED value and where it came from, or that the
+outcome was not met and which goal carries it:
+
+```
+OUTCOME 1: MET — <measured value>. Source: <command + output excerpt | path | store key | sha | the two timestamps>
+OUTCOME 2: NOT MET — <what is missing>; deferred to <goal-id>
+```
+
+- `<n>` is the 1-based index into `verification.outcomes`. For a collaborative
+  goal's agent-leg close (the note says `agent-leg-complete`), it indexes
+  `outcomes_agent_leg` instead.
+- A separator (`:`, an em/en dash, or a spaced hyphen) must follow the number or
+  its optional `(restatement)`. The status comes first after it, and it is exactly
+  `MET` or `NOT MET` (`UNMET` is read as `NOT MET`). PASS, DONE and similar words
+  are refused, not ignored.
+- A row runs until the next `OUTCOME` line or the first blank line. Keep a row's
+  evidence directly under it.
+- Narrative, tests and "not this goal" sections may follow the table. The gate
+  reads only the rows.
+
+**The gate.** `core/scripts/closure-evidence-gate.py`, logic in
+`core/scripts/gates/closure_evidence.py`. It runs in `iteration-close.sh` do_verify
+before the status write, the one place both the worker (Phase 4a) and the reducer
+(Phase 5) close through. aspirations-verify Q1 runs the same command earlier. On a
+MET row it refuses:
+
+- a row with no concrete token (no digit, path or backticked command);
+- a path this box can resolve that does not exist where a reader looks: the STORE
+  for a governed path (`world/`, `meta/`, `agents/`), local disk for a framework
+  path, a directory, or a machine-local path;
+- a store claim (own-cloud, S3, "the store", backend-cat) that the store does not
+  back. A machine-local path (session scratch, `temp/`, `.history`) can never back
+  one;
+- a row answering an outcome that carries a time bound (`within 30s`), or stating
+  an approximate interval (`~5s`), that cites fewer than two timestamps (clock,
+  ISO or epoch).
+
+It never refuses over a path it cannot resolve (a product repo, another host, an
+endpoint), nor over a governed path when it cannot open the store and the file is
+not on this box: that is unknown, not absent, so it warns. It exempts a row that
+asserts absence (removed, deleted, `exists: false`) from the path check. A NOT MET row must say
+`deferred to <goal-id>`, a residual-work marker, so `gates/residual_work.py`
+then requires that goal to be live. Recurring goals, and goals with no outcomes,
+are not checked.
+
+**Which note it reads** is the one that lands: `--outcome-note-file` if given (it
+replaces the record's note), else the record's `outcome_note` (a close never
+overwrites it), else the close's `--summary`. So once a note is on the record,
+fix it by re-running the close with `--outcome-note-file <file>`. That file
+REPLACES the note, and a replacement far shorter than a long note is refused
+(`field_shrink.py`), so put the rows first and keep the note's current text below
+them. A new `--summary` is never written. For a false refusal, pass
+`--override-closure-evidence "<why>"` to iteration-close.sh. It is logged to
+`world/closure-evidence-overrides.jsonl`.
+
+**Exit codes.** The gate exits 3 to refuse and 0 otherwise (pass, nothing to
+check, override, or a gate error it caught). do_verify refuses the close only on
+3. Any other non-zero rc means the gate did not run: 1 is a Python crash or an
+unimportable module, 2 an argument error. do_verify prints a WARN and closes past
+it, so a broken gate cannot refuse every close (guard-5430).
+
+**Why.** Measured on g-373-125 (a worker Body, 2026-09-23). The note said
+"landed within ~5s" against a 30-second bound, but the first check ran about 115 s
+after the POST. It also called a session-scratch file "owncloud push OK", and the
+store could never have held that file. The own-unit verify passed both.
+
+---
+
 # Origin Signal (MANDATORY)
 
 Every goal MUST carry an `origin_signal` field citing the upstream cause that
@@ -187,7 +258,7 @@ by both the CLI path and the daemon writer endpoint):
 |------------------------|------------------------|
 | `user_directive`, `user-directed:*`, `user_directed:*`, `pending_question:*`, `chat-goal:*` | `user` |
 | `recurring_cadence:*`, `recurring:*` | `recurring-cycle` |
-| `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*`, `skill-discovery-audit:*`, `blocker_pattern:*`, `unit-economics-move:*`, `s3-churn:*` | `cycle-detector` |
+| `failing_test:*`, `resolved_hypothesis:*`, `low_confidence_node:*`, `drift_detected:*`, `monitor:*`, `alert-email:*`, `routing-mismatch:*`, `routing-either-resolve:*`, `insight_trigger:*`, `skill-discovery-audit:*`, `blocker_pattern:*`, `unit-economics-move:*`, `s3-churn:*`, `detector:*` | `cycle-detector` |
 | `decomposition:*`, `parent_aspiration:*`, `unblock:*`, `investigate:*`, `investigation:*`, `idea:*`, `maintain:*`, `apply:*`, `brief:*`, `board_post:*`, `program-change-proposal:*`, `successor:*`, `idle_fallback` | `agent-self` |
 
 Variant prefixes (`investigation:` vs canonical `investigate:`, `user-directed:`

@@ -470,6 +470,38 @@ resurrection latency (versus the 1.5–4h observed), a 9–24× improvement.
 Tunable: it is a literal in the two close-script imperatives and the SKILL.md
 spec; raise it for more false-fire margin, lower it for faster resurrection.
 
+## The net outlives a completed /stop: the D7.05 cancel (2026-09-24, coach on Zak-Code)
+
+The IDLE re-arm cycle above is the Claude Code shape. The Zak-Code shape is
+worse, because that harness fires an overdue wake-up "at the first idle prompt
+after" it was due, and a loop session's first idle prompt is the one its /stop
+produces. Measured on coach (zc-03, zakcode 17b3de8, Qwen3.8-27B):
+
+- 17:45:43Z the loop re-armed the sentinel net after a compaction (600 s). It was
+  never consumed: the session never reached a prompt again while RUNNING.
+- 21:23Z `/stop coach` typed; the stop ran 8 h 43 m (four compactions inside it).
+- 06:38:40Z the stop hook ALLOWed (gate=not-running, state IDLE, mode assistant)
+  and the turn ended. At that instant the harness fired the 13-hour-old net:
+  `[harness] the wake-up armed as the autonomous-loop sentinel fired: ... Re-arm a
+  wake-up first, then re-enter the loop ... Do not stop to wait for instructions.`
+- The Body did the right thing at 06:43:41Z, `ScheduleWakeup(stop: true, reason:
+  "Stale pre-stop deadman sentinel fired ...")`, batched with a Bash call. The
+  harness's plan-first gate withheld the whole batch ("lay out a plan with
+  update_plan before making changes"), so the cancel never ran and the Body spent
+  the next half hour planning a loop re-entry it must not perform. An operator
+  note ended the turn.
+
+Two things follow. (1) The stop itself must stand the net down: D7.05 of
+`aspirations-graceful-stop` calls `ScheduleWakeup(stop: true)` after D7 sets the
+target mode. The gate passes it there — D1 set IDLE, and rule (ii) refuses a
+cancel only while RUNNING without `stop-requested` — and under Claude Code the
+same call ends the dynamic loop, which closes the IDLE re-arm cycle at its root
+as well. (2) The stop hook's not-running ALLOW path is deliberately NOT given a
+`{"wakeup": {"cancel": true}}` line: that path fires at every assistant-mode
+turn end too, and a cancel there would silently kill a natural-language wake-up
+an assistant-mode session legitimately armed. The skill knows it is the stop;
+the hook only knows the state.
+
 ## Cross-references
 
 - `guard-511` — the guardrail carrying the sanctioned-exception carve-out

@@ -19,6 +19,7 @@ both engines are re-pinned by construction.
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -75,9 +76,15 @@ def _grep_says_exempt(ere: str, line: str, tmp_path: Path) -> bool:
     # wrapping another implementation, which is not exported to children, so a
     # hand-run check can disagree with what every script actually executes
     # (guard-7056).
+    # The ERE travels in the environment, not argv: a native-Windows parent's
+    # argv is re-parsed by the MSYS runtime, which drops the backslash of `\*`
+    # (measured: sent `|--|\*)`, bash received `|--|*)`), so every True case
+    # failed on Windows. The file path is POSIX-form for the same reason
+    # (guard-581).
     r = subprocess.run(
-        [BASH, "-c", 'grep -qE "$1" "$2"', "_", ere, str(f)],
+        [BASH, "-c", 'grep -qE "$ERE" "$1"', "_", f.as_posix()],
         capture_output=True,
+        env={**os.environ, "ERE": ere},
     )
     return r.returncode == 0
 

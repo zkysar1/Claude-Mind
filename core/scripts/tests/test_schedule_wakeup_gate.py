@@ -31,7 +31,8 @@ import pytest
 GATE = Path(__file__).resolve().parents[1] / "schedule-wakeup-gate.py"
 
 
-def run_gate(tool_input, agent_dir=None, tool_name="ScheduleWakeup"):
+def run_gate(tool_input, agent_dir=None, tool_name="ScheduleWakeup",
+             session_id=None):
     """Invoke the gate as production does. Returns (rc, decision_or_None)."""
     env = dict(os.environ)
     env.pop("MIND_AGENT", None)
@@ -39,9 +40,12 @@ def run_gate(tool_input, agent_dir=None, tool_name="ScheduleWakeup"):
         env["MIND_AGENT_DIR"] = str(agent_dir)
     else:
         env.pop("MIND_AGENT_DIR", None)
+    payload = {"tool_name": tool_name, "tool_input": tool_input}
+    if session_id is not None:
+        payload["session_id"] = session_id
     proc = subprocess.run(
         [sys.executable, str(GATE)],
-        input=json.dumps({"tool_name": tool_name, "tool_input": tool_input}),
+        input=json.dumps(payload),
         capture_output=True, text=True, env=env, timeout=30,
     )
     decision = None
@@ -240,6 +244,51 @@ def test_the_two_guards_are_mirrors_of_one_another(agent):
     set_state(agent, "IDLE")
     assert run_gate(sentinel, agent_dir=agent)[1] == "deny", "IDLE may not arm"
     assert run_gate({"stop": True}, agent_dir=agent)[1] is None, "IDLE may cancel"
+
+
+# ---------------------------------------------------------------- class D ---
+# The IDLE refusal's TEXT mid-stop (). D1 sets IDLE long before D7
+# finishes the stop, and "this turn ends normally" ended a vessel's turn mid-D4.
+# Real SID resolution and the three call shapes are executed in
+# test_stop_in_progress.py; these pin the text contract at the gate's own level.
+
+def _stop_midway(agent, sid="sid-stop"):
+    s = agent / "session"
+    set_state(agent, "IDLE")
+    for name, value in (("agent-mode", "autonomous"), ("stop-target-mode", "assistant"),
+                        ("running-session-id", sid), ("latest-session-id", sid)):
+        (s / name).write_text(value, encoding="utf-8")
+
+
+def test_mid_stop_the_refusal_names_the_continuation(agent):
+    _stop_midway(agent)
+    rc, decision, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>"},
+                                 agent_dir=agent, session_id="sid-stop")
+    assert (rc, decision) == (0, "deny"), "arming is still refused mid-stop"
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "graceful stop is NOT finished" in reason
+    assert "aspirations-graceful-stop" in reason
+    assert "ends normally" not in reason
+
+
+def test_without_a_stop_in_progress_the_refusal_is_byte_identical(agent):
+    """The same bound session, IDLE, but the stop finished (D7 deleted the target)."""
+    _stop_midway(agent)
+    (agent / "session" / "stop-target-mode").unlink()
+    _, decision, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>"},
+                                agent_dir=agent, session_id="sid-stop")
+    assert decision == "deny"
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason == _load_gate_module().ARM_DENY_REASON
+
+
+def test_mid_stop_text_is_scoped_to_the_stopping_session(agent):
+    _stop_midway(agent)
+    _, decision, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>"},
+                                agent_dir=agent, session_id="sid-observer")
+    assert decision == "deny"
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason == _load_gate_module().ARM_DENY_REASON
 
 
 # ---------------------------------------------------------------- class A ---

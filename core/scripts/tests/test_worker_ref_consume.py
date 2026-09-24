@@ -1611,3 +1611,33 @@ def test_conflict_disclosure_survives_a_reworded_conflict_line(conflict_repo):
     assert '[ "$_mtrc" -ne 0 ] && [ "$mt_conf" = 0 ] && mt_conf=1' in src, (
         "a non-zero rc with no parsed CONFLICT line is still a conflict; "
         "trust the status over the parse")
+
+
+def _has_merge_head(work):
+    return _run(["git", "-C", str(work), "rev-parse", "-q", "--verify",
+                 "MERGE_HEAD"]).returncode == 0
+
+
+def test_merge_refused_by_dirty_tree_is_not_called_a_conflict(repo):
+    """ (2026-09-24, cc-07): git refused the merge because the live
+    session had re-dirtied a store file the merge would overwrite, and --merge
+    printed "MERGE CONFLICT — resolve by hand". Nothing was in conflict: there
+    was no MERGE_HEAD, and the only "resolution" a reader could find was to
+    discard the dirty file, which was live session state."""
+    work = repo["work"]
+    (work / "a.txt").write_text("local\n")  # untracked; ref sid-aaaa adds a.txt
+    r = _consume(work, "--merge", "refs/workers/alpha/sid-aaaa")
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "MERGE REFUSED" in r.stderr and "MERGE CONFLICT" not in r.stderr, r.stderr
+    assert not _has_merge_head(work), "a refused merge starts no merge"
+    assert (work / "a.txt").read_text() == "local\n", "the dirty file is untouched"
+
+
+def test_real_merge_conflict_is_still_called_a_conflict(conflict_repo):
+    """Positive control for the test above (guard-4166): the refused-merge
+    branch must not swallow a genuine conflict, which DOES leave a MERGE_HEAD."""
+    work = conflict_repo["work"]
+    r = _consume(work, "--merge", "refs/workers/alpha/sid-conflict")
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert "MERGE CONFLICT" in r.stderr and "MERGE REFUSED" not in r.stderr, r.stderr
+    assert _has_merge_head(work), "a real conflict leaves the merge in progress"

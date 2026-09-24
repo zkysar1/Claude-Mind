@@ -149,9 +149,9 @@ ELSE:
         the artifact must be attributed to the goal that PRODUCED the
         observation, not to whatever the reducer happens to be closing. Cite
         entry.sq_trigger when present. The PLACEMENT CHECK below applies to
-        these artifacts too — a worker's observation about domain
-        infrastructure still belongs in a domain-scoped entry, and this block
-        sits ABOVE that paragraph only because it must run before the SKIP.
+        these too (domain observations -> domain-scoped entries).
+        DEDUP BY PROVENANCE FIRST (guard-7379): if an entry sourced from
+        entry.goal_id already states the lesson, do not strengthen or re-add.
         # WORK-DISCOVERY RELAYS FILE GOALS HERE (2026-08-16, audit D1).
         # Rationale (WHY relays file goals + WHY the dedup spans terminal
         # statuses): core/config/rationale/sq013-work-discovery-relay.md

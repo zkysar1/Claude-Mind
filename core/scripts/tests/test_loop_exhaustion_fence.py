@@ -318,10 +318,21 @@ def test_absent_diary_is_the_one_absence_that_does_not_hold(tmp_path):
     (unreadable / "x").touch()
     # a directory stats fine (mtime) -- that is a readable anchor, not an absence;
     # the genuinely unreadable case is a path whose stat raises something other
-    # than FileNotFoundError, e.g. a component that is a file, not a directory
-    not_a_dir = tmp_path / "file-as-dir"
-    not_a_dir.write_text("x", encoding="utf-8")
-    streak, stalled = fence.compute_streak(log, "S1", not_a_dir / "diary.jsonl")
+    # than FileNotFoundError. On POSIX that is a component that is a file, not a
+    # directory (ENOTDIR). Windows reports that same shape as FileNotFoundError
+    # (winerror 3) -- an ABSENCE -- so there the unreadable input is a name the
+    # filesystem rejects outright (OSError, winerror 123) ().
+    if os.name == "nt":
+        unreadable_diary = tmp_path / "bad<name>.jsonl"
+    else:
+        not_a_dir = tmp_path / "file-as-dir"
+        not_a_dir.write_text("x", encoding="utf-8")
+        unreadable_diary = not_a_dir / "diary.jsonl"
+    # the fixture must never decay into an absence, or this asserts the wrong branch
+    with pytest.raises(OSError) as raised:
+        unreadable_diary.stat()
+    assert not isinstance(raised.value, FileNotFoundError)
+    streak, stalled = fence.compute_streak(log, "S1", unreadable_diary)
     assert (streak, stalled) == (None, None)
 
 
@@ -446,6 +457,15 @@ def test_fence_wrapper_is_idempotent_when_a_stop_is_already_in_progress():
     assert i_guard < i_write
 
 
+def _decision_payload_source(src: str) -> str:
+    """The python heredoc that prints the BLOCK payload, cut out of the hook's
+    source. Two files pin properties of this block (this one and
+    test_false_exhaustion_fixes_20260915); one helper so they cut it alike."""
+    m = re.search(r"<<'PYEOF'\n(.*?)\nPYEOF\n", src, re.S)
+    assert m, "the payload heredoc anchor drifted from the hook"
+    return m.group(1)
+
+
 def test_the_hook_wiring_is_additive_only():
     """One-variable control, run 2026-09-04 on cc-10: with the fence HOLDING the
     BLOCK payload is byte-identical to the pre-change form, and with it FIRED
@@ -460,5 +480,16 @@ def test_the_hook_wiring_is_additive_only():
     assert src.count("exhaustion_msg") == 2, (
         "verdict leaked somewhere other than the reason string (%d mentions)"
         % src.count("exhaustion_msg"))
-    assert 'print(json.dumps({"decision": "block"' in src, (
+    # `decision` is a LITERAL in the payload dict, never a name the verdict
+    # could reach. Pinned on the key/value pair, not on the print() call's
+    # layout: a9f4f1926d (2026-09-18) re-wrapped that call over several lines
+    # to add the harness `wakeup` slot, and the old single-line literal pin
+    # was red for six days on every box while the property it guards was
+    # intact (). The runtime half -- a FIRED fence still BLOCKs --
+    # is test_a_fired_fence_never_changes_the_decision in
+    # test_false_exhaustion_fixes_20260915.py.
+    block = _decision_payload_source(src)
+    assert re.search(r'"decision":\s*"block"', block), (
         "decision must stay unconditional -- this hook BLOCKs at every streak length")
+    assert len(re.findall(r'"decision":', block)) == 1, (
+        "a second decision key appeared in the payload")

@@ -122,8 +122,13 @@ run_py_detector() {
         return 0
     fi
     local prc=0
+    # $helper is MSYS /c/... form (SCRIPT_DIR is cd+pwd). MSYS rewrites it for
+    # py -3 -- unless the caller sourced _platform.sh and exported
+    # MSYS_NO_PATHCONV=1, which every loop commit's hooks inherit. Python then
+    # opened C:\c\... and the .py surface went unchecked on every such commit.
+    # Hand py a Windows path (, guard-161).
     case "$(uname -s)" in
-        MINGW*|MSYS*|CYGWIN*) py -3 "$helper" "$@" || prc=$? ;;
+        MINGW*|MSYS*|CYGWIN*) py -3 "$(cygpath -m "$helper")" "$@" || prc=$? ;;
         *) python3 "$helper" "$@" || prc=$? ;;
     esac
     case "$prc" in

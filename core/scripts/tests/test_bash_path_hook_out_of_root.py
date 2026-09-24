@@ -226,6 +226,76 @@ class TestOutOfRootRefusal(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(bash_verdict(cmd), "approve")
 
+    # --- : command text for ANOTHER machine -------------------
+    # Both classes were measured denied (2026-09-22) and one was hit live on
+    # a container-fleet repoint, which then had to be routed through staged
+    # scripts. The two tests after them pin the other direction (rb-401).
+    def test_shell_inside_a_quoted_remote_argument_is_approved(self):
+        """The local-exec loop rescanned EVERY `bash -c` match, span or no
+        span, so a shell inside a quoted ssh argument, which runs on the far
+        host, read as a local write. The deny text itself called that a bug."""
+        for cmd in (
+            "ssh host-a 'bash -lc \"cp /etc/a /etc/b\"'",
+            "ssh host-a \"bash -c 'mkdir -p /opt/x/y'\"",
+            "ssh host-b 'lxc exec c1 -- bash -lc "
+            "\"cp /etc/app/.env /etc/app/.env.bak-x\"'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(bash_verdict(cmd), "approve")
+
+    def test_container_exec_argv_is_approved_as_remote(self):
+        """DECISION, recorded in the hook docstring: the argv after
+        `lxc exec` / `docker exec` is the container's command line, so its
+        paths are not this machine's. Nothing marked it remote before."""
+        for cmd in (
+            "lxc exec c1 -- cp /etc/a /etc/b",
+            "docker exec c1 cp /etc/a /etc/b",
+            'lxc exec c1 -- bash -lc "cp /etc/a /etc/b"',
+            "docker exec -u root c1 sh -c 'mkdir -p /opt/x && touch /opt/x/y'",
+            "sudo lxc exec c1 -- sed -i s/a/b/ /etc/app.conf",
+            "lxc exec c1 -- \\\n  cp /etc/a /etc/b",
+            "docker exec c1 cp /etc/a /etc/b 2>&1",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(bash_verdict(cmd), "approve")
+
+    def test_container_exec_does_not_hide_a_local_write(self):
+        """This machine's shell still performs the redirect, runs every
+        substitution, and runs whatever follows the container command. All of
+        these were denied before the change and must stay denied."""
+        for cmd in (
+            f"lxc exec c1 -- cat /etc/a > {OUT_OF_ROOT}",
+            f"docker exec c1 cat /etc/a >> {OUT_OF_ROOT}",
+            f"docker exec c1 cat /etc/a | tee {OUT_OF_ROOT}",
+            "lxc exec c1 -- true; "
+            "mkdir -p /opt/definitely-not-a-configured-root/e",
+            f"lxc exec c1 -- true && cp /etc/a {OUT_OF_ROOT}",
+            f"lxc exec c1 -- true\ntouch {OUT_OF_ROOT}",
+            "docker exec c1 ls "
+            "$(mkdir -p /opt/definitely-not-a-configured-root/e )",
+            f"docker exec c1 ls \"$(bash -c 'touch {OUT_OF_ROOT}')\"",
+            f"(lxc exec c1 -- true) && sed -i s/a/b/ {OUT_OF_ROOT}",
+        ):
+            with self.subTest(cmd=cmd.split("\n")[0]):
+                self.assertEqual(bash_verdict(cmd), "deny")
+
+    def test_shell_this_machine_starts_is_still_rescanned(self):
+        """The in-span skip must not become "never look inside quotes". A
+        nested local shell is still reached, because each rescan recomputes
+        quoting on its own text. A `$( )` inside double quotes is run by this
+        machine's shell. That idiom (`"$(bash -c 'source ...')"`) was most of
+        the in-span population in the corpus the change was measured on."""
+        for cmd in (
+            "bash -c 'bash -c \"mkdir -p "
+            "/opt/definitely-not-a-configured-root/n\"'",
+            'sudo bash -c "touch /opt/definitely-not-a-configured-root/n2"',
+            "timeout 5 sh -c "
+            "'echo x > /opt/definitely-not-a-configured-root/n3'",
+            'X="$(bash -c \'mkdir -p /opt/definitely-not-a-configured-root/n4\')"',
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(bash_verdict(cmd), "deny")
+
     # --- false-positive floor -----------------------------------------
     def test_reads_outside_roots_are_approved(self):
         """Shell commands are mostly READS. A refusal keyed on the presence of

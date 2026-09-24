@@ -185,6 +185,21 @@ ALLOWED_PREFIXES = (
     "chat-goal:",               # infer -> user
     "recurring:",               # infer -> recurring-cycle (sibling of recurring_cadence:)
     "monitor:",                 # infer -> cycle-detector (monitor proc-NNN goals)
+    # FIFTH reconciliation (, 2026-09-24). Surfaced by
+    # test_every_origin_signal_literal_carries_a_registered_prefix, red on
+    # every box since 2026-09-18, against two CODE producers the markdown-only
+    # drift detector cannot see (the fourth reconciliation's blind spot):
+    # core/scripts/rb_undiagnosed_cluster.py stamps a constant
+    # `detector:rb-undiagnosed-cluster` (its dedup discriminator is the
+    # [rb-cluster:<id>] token in the TITLE), and a domain reconcile script
+    # stamped `<domain-metric>-drift:{since}` under a name of its own. Both
+    # titles open "Investigate:", so Layer-D auto-derive REWROTE the signal to
+    # `investigate:<slug>` and the goals filed MISATTRIBUTED to agent-self --
+    # the exact failure the third reconciliation documents. One generic lane
+    # prefix, the `monitor:` shape: `detector:<detector-name>[:<discriminator>]`.
+    # The domain script now stamps `detector:<its-name>:{since}`, so core stays
+    # domain-free and its window discriminator survives the write.
+    "detector:",                # infer -> cycle-detector (automated detectors, detector:<name>[:<key>])
     "investigation:",           # infer -> agent-self (sibling of investigate:)
     "apply:",                   # infer -> agent-self (Apply decomposition goals)
     "brief:",                   # infer -> agent-self (analyst briefs)

@@ -196,8 +196,31 @@ def _assert_watchdog_prev_state() -> tuple[bool | None, str]:
 # whose predicate was never driven both ways is itself an always-reports-clear
 # instrument — exactly what this canary exists to catch.
 #
-# TWO INVENTORY MEMBERS ARE DELIBERATELY NOT REGISTERED HERE, and saying so is part
-# of the row set rather than an omission:
+# THE INVENTORY MEMBERS BELOW ARE DELIBERATELY NOT REGISTERED HERE, and saying so is part
+# of the row set rather than an omission. Together with the rows, this block IS the
+# written inventory  outcome 1 asks for: every instrument that goal verdicted is
+# either a row in SIGNALS or an entry here with its verdict, how it was checked, and why
+# it has no row. Each verdict's full evidence is in the goal's rotated note,
+# world/audit-reports/goal-note-archive/.progress_note.md, under the
+# [appended:<marker>] the entry names. No member count is written here on purpose: a
+# count restated beside its list goes stale silently. Count the entries.
+#   heartbeat-tick.sh's agent-state=IDLE refusal (exit 2). It is the last of the ten
+#        product-path gates  named, and the only one left unrowed. Measured
+#        2026-09-24 (bravo, cc-05) from the script:
+#        - The refusal runs only AFTER two daemon-routed team-state publishes,
+#          core_hooks_path and retrieval_index. Each fires whenever the agent dir
+#          lacks a fresh, equal stamp.
+#        - The daemon writes the LIVE world whatever env the probe runs in.
+#        - AGENTS_PARENT_DIR is hard-coded (_paths.sh), so no agent root can be
+#          redirected.
+#        So a contained probe needs a throwaway agent dir under the LIVE agents/
+#        parent with pre-seeded stamps. Any pre-gate write added later would then
+#        turn this canary silently into a live-state polluter.
+#        The side-effect-free refusal (MIND_AGENT empty) guards hook injection, a
+#        different contract. A row on it would read alive while the IDLE gate was
+#        dead. The mechanism needed is a probe seam in heartbeat-tick that evaluates
+#        the SAME gate code before any write, which is a product change, not a
+#        cadence probe.
 #   S-4  `aws s3api list-objects-v2` under a denied s3:ListBucket. Same shape, but
 #        its assertion needs a network call and live credentials on every reducer
 #        iteration, and a canary that flakes on a VPN blip manufactures the
@@ -210,6 +233,91 @@ def _assert_watchdog_prev_state() -> tuple[bool | None, str]:
 #        dead; this instrument was never alive in that channel. The mechanism it
 #        needs is a caller-side check that no call site branches on its rc without
 #        reading the verdict line.
+#   V-8  `closure-evidence-write.sh`. CANNOT via its exit code, by CONTRACT: it always
+#        exits 0 and its header tells callers not to branch on rc. CAN via stdout, where
+#        its never-clobber decline is announced (observed live, alpha cc-10, marker
+#        alpha-unit5-cc10-verify-close-instrument-chain-20260912T2310). The same case as
+#        S-5/V-5: a stable design property, not something that can go dead.
+#   V-7  `dependent-unblock.sh`. CANNOT: when the audit-trail stamp (unblocked_by,
+#        unblocked_summary) fails, `skipped[]` stays empty, and the only trace is
+#        stamp_ok=false inside a success row. Measured twice (same marker as V-8). This is
+#        a write-side defect, not a liveness question: follow-up .
+#   F9   The worker deep-close delivery pair. Alpha measured both halves on cc-07
+#        (marker g318156-close-gates-verdict-uncommitted-residual-alpha-cc07-20260913):
+#        - gates/uncommitted_work.py, called from the daemon's _uncommitted_work_eval in
+#          aspirations_write.py. CAN: UW-1..UW-6 were driven both ways. But
+#          iteration-close.sh do_verify auto-sets the uncommitted override on every
+#          completed deep close by a WORKER Body, so the refusal never reaches that path.
+#        - worker_execute.py git_ref_delivery. It compares the remote ref to HEAD only,
+#          so it CAN report an unpushed commit (stranded) and CANNOT report an
+#          uncommitted edit (verified).
+#        Both were re-read at HEAD on 2026-09-24, unchanged. The blindness is structural,
+#        not a degradation. The relay is msg-20260914-035310-alpha-6867. It has no goal
+#        of its own and is held in aged-trigger triage .
+#   V-10 `wm-read.sh` called with a flag it does not accept. CANNOT on 2026-09-12: the
+#        call returned a clean empty. REPAIRED since, by . Re-probed 2026-09-24
+#        (bravo, cc-05):
+#          `--slot <name>` -> rc=2, 0 B stdout, 318 B stderr
+#          positional      -> rc=0 and the value
+#        A caller that drops stderr AND ignores rc still reads empty. That is the
+#        stderr-only-refusal family; the aspirations-query-refusal-channel row watches
+#        the same shape in a sibling script.
+#   HEALTHY, each verdicted by a two-direction positive control. None is rowed: a row
+#   watches a death that would otherwise be silent, and for each of these either no
+#   such death has been measured or no decision reads its output.
+#     gates/deadline_date.py (DD-1..6), which shows live block and pass traffic.
+#     gates/prose_verification.py (PV-1..7). Its 10-day run of zeros is explained by
+#       its population, shown by a 52-goal census.
+#     gates/residual_work.py (RW-1..5). It has no auto-override path, so its refusal
+#       still reaches deep closes.
+#       Alpha, cc-07; markers g318156-seven-gate-verdicts-alpha-cc07-20260914 and F9's.
+#     `verify-check-eval.sh` (V-6). The reference shape: `all_passed: null` is its own
+#       third value for "nothing was verified". Caveat: string checks read as
+#       checks_total 0, and `has_string_checks` is what tells them apart.
+#     worker_reducer_liveness.py. Its pure decide() was driven across 7 branches
+#       (marker alpha-unit1-cc07-preamble-instrument-chain-20260912T1105), and
+#       test_reducer_self_fence.py pins it against its mirror module.
+#     `email-read.sh check-alerts` (S-1). It announces its own clipping as a lower
+#       bound, so the risk is on the reader's side (marker
+#       unit-signal-inventory-6-rows-stderr-only-refusal-class-alpha-cc08-20260912).
+#     gates/defer_scope.py. A total classifier and NOT A GATE: no decision reads it,
+#       so its death would change nothing.
+#     The open exposure these share is the gate-decision-collapse family: when a gate's
+#     non-clear decisions stop entirely, nothing reacts. That relay is
+#     msg-20260914-035309-alpha-6866, also held in triage .
+#   WATCHED THROUGH ANOTHER ROW, listed only so a census keyed on names does not count it
+#   as unwatched: gates/blocker_create.py, via blocker-create-gate-schema-probe.
+#   blocker-create-gate.py is a thin wrapper over gates.blocker_create.evaluate, and the
+#   row's fixture check reads the module's _STAT_NEG_PATTERNS. Its one UNKNOWN is WIRING,
+#   not liveness: CREATE_BLOCKER reaches the gate by honor system only.
+#   core/config/execute-protocol-digest.md names just the bare add-goal command at Phase
+#   4.0 and 4.1e (re-read 2026-09-24).
+#   WRITER-WITHOUT-READER family, swept 2026-09-24 (bravo, cc-05; marker
+#   bravo-g318156-writer-without-reader-family-cc05-20260924). A store whose writer is
+#   live but that NO DECISION reads is this canary's class seen from the other side. Its
+#   non-clear answers are written and reach nobody, so the fleet always reads it as clear.
+#   A liveness row would watch the writer, and the writer is not the defect.
+#     meta/missing-verification-criteria.jsonl, the Q1.5 uncovered-gap log. CANNOT, as a
+#       fleet signal. The writer is live: 379 records, 281 of them this month, read from
+#       the store of record. Its only references are the writer, the writer's wrapper, the
+#       verify call site, a digest line and the merge handler. None of them decides
+#       anything. The 2026-08-21 WIRE-IT verdict only ever existed as prose. Follow-up:
+#       . Its positive control is broken separately, owned by .
+#     meta/step-attribution.yaml. Attribution, not detection, so NOT a signal. Verdict:
+#       REDUCE (2026-08-21). The writer is discretionary: digest Step 8.11 writes only "if
+#       a score is particularly high/low". So a dark writer and a quiet one look the same,
+#       and nothing decides on either. Measured: dark since 2026-08-09, and its per-step
+#       map was never populated.
+#     Census SCREEN of 217 top-level world+meta store files: 100 have at most one
+#       non-plumbing reference. Positive control: the census found evolution-log's
+#       decision reader. This is a screen, not verdicts, for two reasons:
+#       - A basename grep cannot tell a writer from a reader.
+#       - A store whose name is BUILT at runtime reads zero references. That covers the
+#         date shards and at least four logs written in the last two days.
+#       So "zero references" is not "no reader". Detector-shaped hits for the next unit:
+#       goal-selector-anomalies, defer-drift-metrics, precheck-eval-log,
+#       post-state-update-suppressions. Members that already have owner goals:
+#       , , , .
 
 # A title no goal can carry. Used to prove the READ channel still emits an answer;
 # the point is a legitimately-EMPTY result, so this must never match. Only titles are
@@ -1375,6 +1483,745 @@ def _domain_suite_gate_assertion(check_fixture: bool = True):
     return _assert
 
 
+LIVENESS_PROBE_AGENT = "zzz-signal-liveness-canary-dormant-fixture"
+# The fixture shard's last_active VALUE and its file mtime, both. How stale counts as
+# dormant is NOT decided here: the fixture check reads the engine's own threshold.
+LIVENESS_PROBE_STALE = "2000-01-01T00:00:00"
+# The consumer probe: confirms_dormant as the selector and the daemon claim gate call it.
+# It prints one marker line, so a crash (no line) cannot pass for a False.
+_LIVENESS_CONSUMER_PROBE = (
+    "import sys; sys.path.insert(0, sys.argv[1]); "
+    "from gates.reallocation_exempt import confirms_dormant; "
+    "import liveness_check; "
+    "print('CONFIRMS_DORMANT=' + repr(confirms_dormant(sys.argv[2], sys.argv[3], "
+    "threshold_hours=liveness_check.DEFAULT_THRESHOLD_HOURS, world_dir=sys.argv[4])))"
+)
+
+
+def _liveness_fixture_check(world_dir: Path, now: "_dt.datetime") -> "str | None":
+    """None while the engine's OWN local reader still finds the fixture shard, and both
+    stale signals are older than the engine's OWN DEFAULT_THRESHOLD_HOURS.
+
+    Rot means the shard layout moved (the engine then reads no fixture, and "unknown" is
+    CORRECT), or the threshold grew past the fixture's age (a non-dormant verdict is then
+    CORRECT). Either way the row cannot judge the engine.
+
+    Only the pure-local reader runs in THIS process. The authoritative read dispatches on
+    STORAGE_BACKEND, and this process may run own-cloud, where a temp path maps onto a
+    production key (guard-955). The children pin the local backend instead.
+
+    AN IMPORT FAILURE RETURNS None. The probe then crashes the same way, and the row reports
+    that crash as DEAD (see _liveness_dormant_assertion).
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_canary_probe_liveness_check", SCRIPT_DIR / "liveness_check.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    threshold = getattr(module, "DEFAULT_THRESHOLD_HOURS", None)
+    read_mtime = getattr(module, "fetch_local_shard_mtime", None)
+    if threshold is None or read_mtime is None:
+        return ("liveness_check.py no longer exposes DEFAULT_THRESHOLD_HOURS and "
+                "fetch_local_shard_mtime, so the fixture is uncheckable")
+    horizon = now - _dt.timedelta(hours=float(threshold))
+    mtime = read_mtime(LIVENESS_PROBE_AGENT, str(world_dir))
+    if not mtime:
+        return ("the engine's own fetch_local_shard_mtime() no longer finds the fixture "
+                "shard, so 'unknown' is CORRECT. Fix the fixture layout, not the engine")
+    if _dt.datetime.fromisoformat(mtime) > horizon:
+        return (f"the fixture shard's mtime ({mtime}) is inside the engine's {threshold:g}h "
+                "threshold, so a non-dormant verdict is CORRECT")
+    if _dt.datetime.fromisoformat(LIVENESS_PROBE_STALE) > horizon:
+        return (f"LIVENESS_PROBE_STALE ({LIVENESS_PROBE_STALE}) is inside the engine's "
+                f"{threshold:g}h threshold, so a non-dormant verdict is CORRECT")
+    return None
+
+
+def _liveness_dormant_assertion(check_fixture: bool = True):
+    """The liveness-check row ( unit 7): does the liveness engine still CONCLUDE
+    DORMANT for an agent whose every signal is decades stale, and does the consumer that
+    acts on that verdict still receive it?
+
+    DORMANT is the only verdict anything acts on. gates.reallocation_exempt.confirms_dormant
+    (the selector's idle-reallocation and the daemon claim gate) hands a dead agent's routed
+    goals to the running fleet only on it, and it catches EVERY exception and returns False.
+    So a broken engine is not loud there: it strands every goal routed to a dead agent, and
+    nothing reports it. A crash is therefore DEAD for this row, never unevaluatable
+    (guard-7231).
+
+    TWO PROBES, one fixture: a throwaway world holding one shard whose last_active VALUE and
+    file mtime are both LIVENESS_PROBE_STALE, read with STORAGE_BACKEND=local.
+      1. The engine's CLI, liveness_check.py --json, which liveness-check.sh execs. It names
+         a verdict, so the detail says WHICH way the engine broke.
+      2. confirms_dormant itself, in a child. The CLI can stay dormant while the consumer
+         breaks, e.g. a decide_liveness signature change that main() absorbs raises inside
+         the consumer's try and reads as "not idle" forever.
+    Measured 2026-09-24 (bravo, cc-05) before this row existed: the fixture gives dormant /
+    True. Each near-miss falls off it: a fresh shard mtime gives unknown / False, a fresh
+    value gives alive / False, and no shard gives unknown / False.
+
+    WHAT THIS ROW DOES NOT WATCH: liveness-check.sh's daemon-routed last_active read and its
+    .env load (the probe passes --last-active and pins the local backend); the own-cloud
+    fresh signal (an S3 HEAD every iteration, the S-4 exclusion's reason); the
+    retirement-tombstone and cross-stamp branches (the fixture carries neither); and the
+    selector's age nomination (reallocation_hours), which runs before confirms_dormant is
+    ever asked.
+
+    SIDE-EFFECT FREE: the engine only reads, both children read the temp world, and the
+    temp dir is removed afterwards.
+    """
+    script_name = "liveness_check.py"
+
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            return None, f"{script_name} absent at {path}"
+        root = Path(tempfile.mkdtemp(prefix="canary-liveness-"))
+        env = {"STORAGE_BACKEND": "local"}
+        consumer = None
+        try:
+            shard = root / "team-state" / "agents" / f"{LIVENESS_PROBE_AGENT}.yaml"
+            shard.parent.mkdir(parents=True)
+            shard.write_text(f'last_active: "{LIVENESS_PROBE_STALE}"\n', encoding="utf-8")
+            stale_epoch = _dt.datetime.fromisoformat(LIVENESS_PROBE_STALE).timestamp()
+            os.utime(shard, (stale_epoch, stale_epoch))
+            if check_fixture:
+                try:
+                    stale = _liveness_fixture_check(root, _dt.datetime.now())
+                except Exception as exc:
+                    stale = f"the fixture check itself failed ({exc})"
+                if stale:
+                    return None, f"{script_name} probe fixture is stale: {stale}"
+            try:
+                rc, out, err = _probe([sys.executable, path.as_posix(),
+                                       "--agent", LIVENESS_PROBE_AGENT,
+                                       "--last-active", LIVENESS_PROBE_STALE,
+                                       "--world-dir", root.as_posix(),
+                                       "--backend", "local", "--json"], extra_env=env)
+                doc = None
+                if out.strip().startswith("{"):
+                    try:
+                        doc, _ = json.JSONDecoder().raw_decode(out.strip())
+                    except ValueError:
+                        doc = None
+                if rc == 0 and isinstance(doc, dict) and doc.get("verdict") == "dormant":
+                    consumer = _probe([sys.executable, "-c", _LIVENESS_CONSUMER_PROBE,
+                                       SCRIPT_DIR.as_posix(), LIVENESS_PROBE_AGENT,
+                                       LIVENESS_PROBE_STALE, root.as_posix()], extra_env=env)
+            except Exception as exc:
+                return None, f"{script_name} could not run: {exc}"
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        if rc != 0 or not isinstance(doc, dict):
+            last = err.strip().splitlines()[-1][:160] if err.strip() else ""
+            return True, (f"{script_name} CRASHED: rc={rc}, stdout {len(out)} B, no verdict "
+                          f"JSON{': ' + last if last else ''}. confirms_dormant swallows the "
+                          "same failure as 'not idle', so goals routed to a dead agent are "
+                          "never reallocated")
+        if doc.get("verdict") != "dormant":
+            return True, (f"the engine returned {doc.get('verdict')!r} for an agent whose "
+                          f"last_active value and shard mtime are both {LIVENESS_PROBE_STALE}: "
+                          f"{str(doc.get('reason') or '')[:200]}. It can no longer conclude "
+                          "dormant, so no dead agent's routed goals are ever reallocated")
+        crc, cout, cerr = consumer
+        line = next((ln.strip() for ln in cout.splitlines()
+                     if ln.strip().startswith("CONFIRMS_DORMANT=")), None)
+        if crc != 0 or line is None:
+            last = cerr.strip().splitlines()[-1][:160] if cerr.strip() else ""
+            return True, (f"confirms_dormant could not run (rc={crc}"
+                          f"{': ' + last if last else ''}) while the engine's CLI still "
+                          "concludes dormant")
+        if line.split("=", 1)[1] != "True":
+            return True, ("the engine's CLI concludes dormant, but gates.reallocation_exempt."
+                          "confirms_dormant returned " + line.split("=", 1)[1] + " for the same "
+                          "fixture: its try/except is swallowing an error, so goals routed to "
+                          "a dead agent are never reallocated")
+        return False, (f"concluded dormant for a shard stale since {LIVENESS_PROBE_STALE}, "
+                       "and confirms_dormant agreed")
+    return _assert
+
+
+# ─── product-repo-freshness ( unit 8) ─────────────────────────────
+
+# The fixture checkout's directory name. The gate reports it as the record's `name`, and
+# the text channel is judged by whether its banner names this repo at all.
+FRESHNESS_PROBE_REPO = "zzz-signal-liveness-canary-freshness-fixture"
+# Commits the fixture's upstream holds that its checkout lacks. freshness() trips on ANY
+# behind > 0 with ahead == 0 (its `elif behind:` branch; it has no threshold constant to
+# read, verified 2026-09-24). 2, not 1, so a gate reporting a boolean as its count
+# (True == 1) cannot pass.
+FRESHNESS_PROBE_BEHIND = 2
+
+
+def _freshness_git(cwd: Path, env: dict, *args: str) -> str:
+    """git for the FIXTURE only (the gate runs its own). Raises on any non-zero rc."""
+    r = subprocess.run(["git", *args], cwd=str(cwd), env=env, capture_output=True,
+                       text=True, timeout=PROBE_TIMEOUT_S)
+    if r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} rc={r.returncode}: "
+                           f"{(r.stderr or '').strip()[:200]}")
+    return (r.stdout or "").strip()
+
+
+def _freshness_fixture_env(root: Path) -> dict:
+    """The fixture builder's git environment, and nobody else's.
+
+    No global or system config: a box-level commit.gpgsign or core.hooksPath would fail or
+    redirect the fixture's commits (guard-4761). A fixed identity, no prompt, and a ceiling
+    at the temp root, so a failed init can never walk UP into an enclosing repo and commit
+    there (guard-1276). The GATE is probed with the inherited environment, as production
+    runs it.
+    """
+    cfg = root / "empty-gitconfig"
+    cfg.write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env.update({"GIT_CONFIG_GLOBAL": str(cfg), "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "signal-liveness-canary",
+                "GIT_AUTHOR_EMAIL": "canary@invalid",
+                "GIT_COMMITTER_NAME": "signal-liveness-canary",
+                "GIT_COMMITTER_EMAIL": "canary@invalid",
+                "GIT_TERMINAL_PROMPT": "0", "GIT_CEILING_DIRECTORIES": str(root)})
+    return env
+
+
+def _freshness_fixture_build(root: Path, env: dict, behind: int) -> Path:
+    """A checkout `behind` commits behind its tracked upstream and 0 ahead of it.
+
+    The upstream is a BARE REPO ON LOCAL DISK, so the gate's own fetch in the production
+    call shape stays network-free: no host, no credential, nothing for a VPN blip to flake.
+    The S-4 exclusion's reason therefore does not apply to this gate.
+    """
+    origin, seed = root / "origin.git", root / "seed"
+    repo = root / FRESHNESS_PROBE_REPO
+    _freshness_git(root, env, "init", "--quiet", "--bare", "-b", "main", origin.as_posix())
+    _freshness_git(root, env, "init", "--quiet", "-b", "main", seed.as_posix())
+    (seed / "probe.txt").write_text("0\n", encoding="utf-8")
+    _freshness_git(seed, env, "add", "probe.txt")
+    _freshness_git(seed, env, "commit", "--quiet", "-m", "c0")
+    _freshness_git(seed, env, "push", "--quiet", origin.as_posix(), "main")
+    _freshness_git(root, env, "clone", "--quiet", origin.as_posix(), repo.as_posix())
+    for i in range(1, behind + 1):
+        (seed / "probe.txt").write_text(f"{i}\n", encoding="utf-8")
+        _freshness_git(seed, env, "commit", "--quiet", "-am", f"c{i}")
+    if behind:
+        _freshness_git(seed, env, "push", "--quiet", origin.as_posix(), "main")
+        _freshness_git(repo, env, "fetch", "--quiet", "origin")
+    return repo
+
+
+def _freshness_fixture_check(repo: Path, env: dict, behind: int) -> "str | None":
+    """None while the gate's OWN selection predicate still admits the fixture, and plain git
+    still measures it `behind` commits behind a tracked upstream and 0 ahead.
+
+    THE COUNTS ARE DELIBERATELY NOT READ THROUGH THE GATE. This row asks whether freshness()
+    still reports a stale checkout, so the fixture's state is measured by something that is
+    not freshness(). Reading it back through the gate's own rev-list would let a gate that
+    miscounts certify its own fixture. What IS read from the gate is its selection SSOT,
+    _is_repo(): if that stops admitting the fixture, examining nothing is CORRECT and says
+    nothing about the verdict path.
+
+    Rot therefore means the fixture did not come out as built (a git whose clone sets no
+    upstream, a changed builder), or the gate's selection moved under it. Either way a
+    non-trip is CORRECT and the row cannot judge the gate.
+
+    AN IMPORT FAILURE RETURNS None. The probe then crashes the same way, and the row reports
+    that crash as DEAD (see _freshness_behind_assertion).
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_canary_probe_product_repo_freshness", SCRIPT_DIR / "product-repo-freshness.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    is_repo = getattr(module, "_is_repo", None)
+    if is_repo is None:
+        return "product-repo-freshness.py no longer exposes _is_repo, so the fixture is uncheckable"
+    if not is_repo(repo):
+        return ("the gate's own _is_repo() no longer admits the fixture, so examining nothing "
+                "is CORRECT. Fix the fixture layout, not the gate")
+    try:
+        top = _freshness_git(repo, env, "rev-parse", "--show-toplevel")
+        _freshness_git(repo, env, "rev-parse", "--abbrev-ref", "@{upstream}")
+        lag = int(_freshness_git(repo, env, "rev-list", "--count", "HEAD..@{upstream}"))
+        lead = int(_freshness_git(repo, env, "rev-list", "--count", "@{upstream}..HEAD"))
+    except Exception as exc:
+        return (f"plain git cannot read the fixture's upstream ({exc}), so a no-upstream or "
+                "unknown answer from the gate is CORRECT")
+    if Path(top).resolve() != repo.resolve():
+        return f"git resolves the fixture to {top}, not to itself (guard-1276)"
+    if (lag, lead) != (behind, 0):
+        return (f"plain git measures the fixture {lag} behind / {lead} ahead, not {behind} / 0, "
+                "so the gate's answer describes another state. Fix the fixture builder, not "
+                "the gate")
+    return None
+
+
+def _freshness_doc(out: str) -> "dict | None":
+    """The gate's one --json document (pretty-printed, so it spans lines)."""
+    text = out.strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        doc, _ = json.JSONDecoder().raw_decode(text[start:])
+    except ValueError:
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _rmtree_git(root: Path) -> None:
+    """rmtree that also removes git's READ-ONLY object files. On Windows an unlink of a
+    read-only file fails, so a bare rmtree(ignore_errors=True) would leave one fixture in
+    the temp dir on EVERY canary run."""
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                os.chmod(os.path.join(dirpath, name), 0o600)
+            except OSError:
+                pass
+    shutil.rmtree(root, ignore_errors=True)
+
+
+def _freshness_behind_assertion(check_fixture: bool = True, build_behind: "int | None" = None):
+    """The product-repo-freshness row ( unit 8): does the gate still REPORT a
+    checkout that is behind its upstream, on both channels its consumers read?
+
+    The gate is advisory and never blocks. It always exits 0, and its __main__ turns every
+    exception into rc=0 plus one stderr line. So it dies not as a refusal that stops firing
+    but as a stale tree that reads as current: the confident-wrong-finding class it was
+    built to stop (g-115-4041). A crash is therefore DEAD here, as in unit 7.
+
+    ONE FIXTURE, TWO PROBES, both in a production call shape:
+      1. `--repo <fixture> --json`, the generate-domain-goals shape. That consumer pulls
+         every record with behind > 0, so the record must say behind ==
+         FRESHNESS_PROBE_BEHIND.
+      2. `--repo <fixture>` on the text channel. render() is the same banner the
+         pre-execution `--goal-id` call prints, and it is SILENT on a clean repo, so a banner
+         that does not name the fixture reads as "in sync". It runs only after the JSON
+         record is right, so the detail names the first channel that broke.
+    Measured 2026-09-24 (bravo, cc-05, Linux 6.8.0-139-generic, git 2.43.0) before this row
+    existed: the fixture gives cannot_check false and behind 2, with and without --no-fetch,
+    in ~0.05s. Each near-miss falls off it: in-sync gives behind 0, a checkout with no
+    upstream gives behind None, and MIND_AGENT unset gives cannot_check TRUE with the same
+    behind-2 record (vacuity() keys on the enumeration, not on --repo).
+
+    THE VERDICT DOES NOT DEPEND ON cannot_check. freshness() and render() never read the
+    enumeration, so the fixture's record and banner are the same whether or not this agent's
+    AGENT_WRITE_PATH enumerates anything. cannot_check only decides whether the JSON consumer
+    reads the records at all, and it is loud when true. So a wrong record is DEAD even under
+    cannot_check true (the text channel renders it regardless), while a MISSING record is
+    DEAD only under cannot_check false (it says it examined, and examined nothing). Under
+    cannot_check true the gate has declined out loud.
+
+    DELIBERATELY NOT REGISTERED: `--check-read`, the read-hazard gate (exit 1 = READ
+    HAZARD). Its _repo_for_path() judges only paths inside a MEMBER of the bound agent's
+    AGENT_WRITE_PATH enumeration, and that enumeration is the agent's local-paths.conf under
+    the real PROJECT_ROOT, with no environment seam. A temp fixture is not a member:
+    measured, --check-read on it answers safe / not-a-product-repo at rc 0. A row would need
+    a fixture inside a live product root or a fake agent directory, and neither is
+    side-effect free. That contract differs from --repo's, so it is named here rather than
+    guessed (test_prf_check_read_cannot_reach_a_temp_fixture pins the premise).
+
+    WHAT THIS ROW DOES NOT WATCH: goal-text selection (goal_text and select_repos, the
+    --goal-id path, which picks repos by directory name); the enumeration and vacuity()
+    themselves (an empty enumeration is loud by design); a fetch from a real remote (the
+    fixture's upstream is local, so the network-failure branch is never taken); and the
+    --pull, --sweep and --list modes.
+
+    SIDE-EFFECT FREE: the fixture lives in a temp dir, the gate's one write (its own fetch)
+    lands inside it, and the temp dir is removed afterwards.
+    """
+    script_name = "product-repo-freshness.py"
+
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            return None, f"{script_name} absent at {path}"
+        want = FRESHNESS_PROBE_BEHIND
+        root = Path(tempfile.mkdtemp(prefix="canary-freshness-"))
+        text = None
+        try:
+            try:
+                env = _freshness_fixture_env(root)
+                repo = _freshness_fixture_build(
+                    root, env, want if build_behind is None else build_behind)
+            except Exception as exc:
+                return None, (f"{script_name} probe fixture could not be built ({exc}); that "
+                              "says nothing about the gate")
+            if check_fixture:
+                try:
+                    stale = _freshness_fixture_check(repo, env, want)
+                except Exception as exc:
+                    stale = f"the fixture check itself failed ({exc})"
+                if stale:
+                    return None, f"{script_name} probe fixture is stale: {stale}"
+            argv = [sys.executable, path.as_posix(), "--repo", repo.as_posix()]
+            try:
+                rc, out, err = _probe(argv + ["--json"])
+                doc = _freshness_doc(out)
+                recs = doc.get("records") if isinstance(doc, dict) else None
+                rec = recs[0] if isinstance(recs, list) and len(recs) == 1 else None
+                if rc == 0 and isinstance(rec, dict) and rec.get("behind") == want:
+                    text = _probe(argv)
+            except Exception as exc:
+                return None, f"{script_name} could not run: {exc}"
+        finally:
+            _rmtree_git(root)
+        if rc != 0 or doc is None:
+            last = err.strip().splitlines()[-1][:160] if err.strip() else ""
+            return True, (f"{script_name} CRASHED: rc={rc}, stdout {len(out)} B, no JSON "
+                          f"document{': ' + last if last else ''}. Its __main__ turns an "
+                          "exception into rc=0 and one advisory line, so on the text channel a "
+                          "crash reads as 'every repo in sync'")
+        if not isinstance(recs, list) or not recs:
+            if doc.get("cannot_check"):
+                return None, (f"{script_name} examined nothing and said so (cannot_check: "
+                              f"{doc.get('cannot_check_reason')}). Its consumer reads that as NOT "
+                              "an all-clear, so this is not a silent pass")
+            return True, (f"{script_name} reported cannot_check false and no record for the one "
+                          "--repo it was given: it says it examined, and examined nothing")
+        if rec is None:
+            return True, (f"{script_name} returned {len(recs)} records for one --repo fixture, "
+                          "so the fixture's own answer cannot be told apart")
+        if rec.get("behind") != want:
+            return True, (f"{script_name} reported behind={rec.get('behind')!r} (verdict "
+                          f"{rec.get('verdict')!r}: {str(rec.get('detail') or '')[:160]}) for a "
+                          f"checkout {want} commit(s) behind its upstream. Its consumers pull "
+                          "only when behind > 0, so a stale tree is read as current")
+        trc, tout, _terr = text
+        if FRESHNESS_PROBE_REPO not in tout:
+            return True, (f"{script_name}'s JSON record says the checkout is {want} behind, but "
+                          f"its text banner (rc={trc}, {len(tout)} B) does not name it. render() "
+                          "is silent on a clean repo, so the pre-execution --goal-id call reads "
+                          "this stale checkout as in sync")
+        note = (" (cannot_check was true: this agent enumerates no repo, and the verdict path "
+                "does not read the enumeration)") if doc.get("cannot_check") else ""
+        return False, (f"reported the fixture {want} commit(s) behind on the JSON record and "
+                       f"named it on the text banner{note}")
+    return _assert
+
+
+# ─── hot-path-size-gate ( unit 9) ─────────────────────────────────
+
+# The one budgeted path in the fixture repo, and the fixture's own budget registry. A
+# ratchet set (no ceiling), so the cap IS the size at HEAD and any growth must refuse.
+HOTPATH_PROBE_PATH = "probe/hot.md"
+HOTPATH_PROBE_BUDGET = ("sets:\n  - name: signal-liveness-canary-probe\n"
+                        f"    paths: [\"{HOTPATH_PROBE_PATH}\"]\n    new_file_cap: 64\n")
+
+
+def _hotpath_fixture_build(root: Path, env: dict, grow: bool = True) -> tuple[Path, Path]:
+    """A repo whose HEAD holds the budget and a 2-byte HOTPATH_PROBE_PATH, with that file
+    STAGED at 4 bytes (unchanged when grow is False), plus a commit message with no trailer.
+    Shares the unit-8 hermetic git env and teardown."""
+    repo = root / "repo"
+    _freshness_git(root, env, "init", "--quiet", "-b", "main", repo.as_posix())
+    hot = repo / HOTPATH_PROBE_PATH
+    hot.parent.mkdir(parents=True)
+    hot.write_text("a\n", encoding="utf-8")
+    budget = repo / "core" / "config" / "hot-path-budget.yaml"
+    budget.parent.mkdir(parents=True)
+    budget.write_text(HOTPATH_PROBE_BUDGET, encoding="utf-8")
+    _freshness_git(repo, env, "add", "-A")
+    _freshness_git(repo, env, "commit", "--quiet", "-m", "base")
+    if grow:
+        hot.write_text("a\nb\n", encoding="utf-8")
+        _freshness_git(repo, env, "add", HOTPATH_PROBE_PATH)
+    msg = root / "commit-msg.txt"
+    msg.write_text("signal-liveness-canary probe\n", encoding="utf-8")
+    return repo, msg
+
+
+def _hotpath_fixture_check(repo: Path, env: dict) -> "str | None":
+    """None while the gate's OWN loader, set lookup and decide() still call the fixture's
+    staged growth a violation.
+
+    TWO CONTROLS keep a broken gate from reading as a rotted fixture:
+      - the gate's load_budget() must still load the LIVE registry. If it rejects that too,
+        the loader is broken for every commit, so return None and let the probe's
+        fail-open WARN report it DEAD;
+      - decide() is asked about the fixture's growth AND its mirror (a shrink). Growth
+        passing while the shrink is refused is a FLIPPED comparison, a gate bug, so again
+        None. Growth passing with the shrink also passing is a changed ratchet rule: rot.
+    Sizes are measured with plain git, never through the gate's blob_size().
+
+    AN IMPORT FAILURE RETURNS None: the probe then crashes, which blocks every commit
+    through the hook (see _hotpath_growth_assertion).
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_canary_probe_hot_path_size_gate", SCRIPT_DIR / "hot-path-size-gate.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:
+        return None
+    load, set_for, decide = (getattr(module, n, None) for n in ("load_budget", "set_for", "decide"))
+    if load is None or set_for is None or decide is None:
+        return ("hot-path-size-gate.py no longer exposes load_budget, set_for and decide, so the "
+                "fixture is uncheckable")
+    try:
+        load(Path(__file__).resolve().parents[2])
+    except Exception:
+        return None
+    try:
+        budget = load(repo)
+    except Exception as exc:
+        return (f"the gate's own load_budget() still loads the live registry but rejects the "
+                f"fixture's ({exc}): the schema moved under HOTPATH_PROBE_BUDGET")
+    s = set_for(HOTPATH_PROBE_PATH, budget)
+    if s is None or s.get("ceiling") is not None:
+        return (f"the gate's own set_for() no longer puts {HOTPATH_PROBE_PATH} in a ratchet set, "
+                "so a pass is CORRECT. Fix HOTPATH_PROBE_BUDGET, not the gate")
+    try:
+        staged = int(_freshness_git(repo, env, "cat-file", "-s", f":{HOTPATH_PROBE_PATH}"))
+        head = int(_freshness_git(repo, env, "cat-file", "-s", f"HEAD:{HOTPATH_PROBE_PATH}"))
+    except Exception as exc:
+        return f"plain git cannot size the fixture ({exc})"
+    if decide(staged, head, s["new_file_cap"], None)[0] != "ok":
+        return None
+    if decide(head, staged, s["new_file_cap"], None)[0] != "ok":
+        return None
+    return (f"the gate's own decide() allows the fixture's {head} -> {staged} B growth (and the "
+            "mirror shrink): the ratchet rule changed, so a pass is CORRECT")
+
+
+def _hotpath_growth_assertion(check_fixture: bool = True, grow: bool = True):
+    """The hot-path-size-gate row ( unit 9): does the commit-msg gate still REFUSE a
+    staged hot-path file that grew?
+
+    Production runs it from core/githooks/commit-msg through `_gate`, which blocks the commit
+    on ANY non-zero rc. So a crash is fail-closed and loud: UNEVALUATABLE here, like the
+    domain-suite row. The silent death is rc 0 on growth, in three shapes this row tells
+    apart: the fail-open WARN (budget unreadable, evaluation raised), an OVERRIDE accepted
+    from a message with no trailer, and plain silence (the comparison no longer sees it).
+
+    THE FIXTURE is a throwaway repo carrying its own core/config/hot-path-budget.yaml, with a
+    2-byte HOTPATH_PROBE_PATH at HEAD staged at 4 bytes and a trailer-free message. Measured
+    2026-09-24 (bravo, cc-05) before this row existed, ~0.04s each: grown gives rc 1 naming
+    the file; not grown gives rc 0 silent; no budget file gives rc 0 plus WARN; a trailer
+    gives rc 0 plus OVERRIDE with the ledger row landing in the probe's temp world.
+
+    WRITES ARE PINNED: the override branch appends to _paths.WORLD_DIR's ledger, so the probe
+    runs with MIND_WORLD at a temp world and STORAGE_BACKEND=local (guard-955). A regression
+    that reaches that branch writes there, never to the live ledger (measured: live ledger
+    line count unchanged across the trailer case).
+
+    WHAT THIS ROW DOES NOT WATCH: the hook's cwd-based repo resolution and GIT_INDEX_FILE
+    (the probe passes --repo and uses the normal index); merge-commit exemption; the
+    ceiling tier and the new-file cap; and `--check`, the corpus-total ratchet.
+    """
+    script_name = "hot-path-size-gate.py"
+
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            return None, f"{script_name} absent at {path}"
+        root = Path(tempfile.mkdtemp(prefix="canary-hotpath-"))
+        try:
+            try:
+                env = _freshness_fixture_env(root)
+                repo, msg = _hotpath_fixture_build(root, env, grow)
+            except Exception as exc:
+                return None, (f"{script_name} probe fixture could not be built ({exc}); that "
+                              "says nothing about the gate")
+            if check_fixture:
+                try:
+                    stale = _hotpath_fixture_check(repo, env)
+                except Exception as exc:
+                    stale = f"the fixture check itself failed ({exc})"
+                if stale:
+                    return None, f"{script_name} probe fixture is stale: {stale}"
+            world = root / "world"
+            world.mkdir()
+            try:
+                rc, out, err = _probe([sys.executable, path.as_posix(), "--repo", repo.as_posix(),
+                                       "--commit-msg-file", msg.as_posix()],
+                                      extra_env={"MIND_WORLD": world.as_posix(),
+                                                 "STORAGE_BACKEND": "local"})
+            except Exception as exc:
+                return None, f"{script_name} could not run: {exc}"
+        finally:
+            _rmtree_git(root)
+        if rc == 1 and HOTPATH_PROBE_PATH in out:
+            return False, f"refused the fixture's staged growth (rc=1) and named {HOTPATH_PROBE_PATH}"
+        if rc != 0:
+            last = (err.strip() or out.strip()).splitlines()[-1][:160] if (err.strip() or out.strip()) else ""
+            return None, (f"{script_name} exited {rc} without naming the grown file"
+                          f"{': ' + last if last else ''}. The hook's _gate blocks every commit on "
+                          "that, so it is loud, not a silent pass")
+        if "allowing commit" in out:
+            return True, (f"{script_name} FAILS OPEN on a grown hot-path file: "
+                          f"{out.strip().splitlines()[0][:200]}")
+        if "OVERRIDE" in out:
+            return True, (f"{script_name} accepted an override from a commit message with no "
+                          "trailer, so every commit bypasses the budget")
+        return True, (f"{script_name} passed a staged {HOTPATH_PROBE_PATH} that grew 2 -> 4 B "
+                      "(rc=0, silent): it no longer sees hot-path growth")
+    return _assert
+
+
+# ─── goal-selector STRATEGIC-FOCUS INERT banner ( unit 10) ────────
+
+# The aspiration of the probe's one non-lane pool row. The fixture check confirms at run
+# time that no live directive lane names it, so that pool really is lane-free.
+INERT_PROBE_ASP = "asp-0"
+# A truthy agent name, which the floor requires. It routes nothing and claims nothing.
+INERT_PROBE_AGENT = "zzz-signal-liveness-canary-inert-fixture"
+# Sibling imports resolve here and never through SCRIPT_DIR, so a relocated copy of the
+# selector (the mutation tests) still imports the real _paths, wm and the rest.
+_INERT_IMPORT_DIR = Path(__file__).resolve().parent
+# The child probe. It imports the selector, reads the directive's lanes with the selector's
+# OWN loader, then asks the floor and the banner about two one-row pools: one outside every
+# lane (the banner must fire) and one inside a lane (it must stay quiet). Each step prints
+# one marker line, so the parent can tell an import failure from a swallowed exception from
+# a silent banner. argv: import dir, selector path, agent, aspiration, team-state JSON or "".
+_INERT_BANNER_PROBE = (
+    "import importlib.util, json, sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "spec = importlib.util.spec_from_file_location('_canary_probe_goal_selector', sys.argv[2])\n"
+    "m = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(m)\n"
+    "print('IMPORTED=1', flush=True)\n"
+    "if sys.argv[5]:\n"
+    "    m._TEAM_STATE_CACHE = json.load(open(sys.argv[5], encoding='utf-8'))\n"
+    "agent, asp = sys.argv[3], sys.argv[4]\n"
+    "try:\n"
+    "    lanes = sorted(m.load_strategic_focus()['aspirations'])\n"
+    "    print('LANES=' + json.dumps(lanes))\n"
+    "    print('FIXTURE_ASP_IN_LANES=' + str(asp in lanes))\n"
+    "    row = {'goal_id': 'g-0-0', 'aspiration_id': asp, 'score': 1.0,\n"
+    "           'title': 'signal-liveness canary non-lane row'}\n"
+    "    _, trip = m.apply_strategic_focus_floor([row], agent)\n"
+    "    warned = m.emit_strategic_focus_inert_banner(trip) or []\n"
+    "    print('TRIP=' + json.dumps({'lanes': trip.get('lanes'),\n"
+    "                               'pool_lane_rows': trip.get('pool_lane_rows'),\n"
+    "                               'warnings': len(warned)}))\n"
+    "    if lanes:\n"
+    "        lane_row = dict(row, goal_id='g-0-1', aspiration_id=lanes[0])\n"
+    "        _, hold = m.apply_strategic_focus_floor([lane_row], agent)\n"
+    "        quiet = m.emit_strategic_focus_inert_banner(hold) or []\n"
+    "        print('HOLD=' + json.dumps({'pool_lane_rows': hold.get('pool_lane_rows'),\n"
+    "                                   'warnings': len(quiet)}))\n"
+    "except Exception as exc:\n"
+    "    print('PROBE_ERROR=' + type(exc).__name__ + ': ' + str(exc)[:200])\n"
+)
+
+
+def _strategic_focus_inert_assertion(check_fixture: bool = True,
+                                     team_state: "dict | None" = None):
+    """The goal-selector row ( unit 10): does the selector still SAY when the
+    standing directive has gone inert?
+
+    WHY THIS SIGNAL. g-318-156's inventory verdicted `goal-selector.sh select` on one
+    non-clear output: the STRATEGIC-FOCUS INERT banner. It fires when the directive names
+    lanes and not one of their goals reached the ranked pool, the state in which both the
+    directive boost and the floor are provably inert. Before the banner existed that state
+    was silent, and six diagnoses read DRAINED as OUTRANKED. If the banner goes quiet
+    again, the owner's directive can stop steering selection with nothing saying so.
+
+    WHICH WAY A CRASH READS. The selector wraps the floor and the banner in one try/except
+    that prints a single stderr line and carries on, so an exception there is a SILENT
+    death: DEAD (guard-7231). An import failure stops selection outright, which every loop
+    notices at once, so it is loud: UNEVALUATABLE (rb-11742).
+
+    THE FIXTURE is read from the selector's own predicate at run time (outcome 3). The
+    lanes come from its own load_strategic_focus(), and the one pool row sits in
+    INERT_PROBE_ASP, which the fixture check confirms no lane names. Rot means the directive
+    names no lane (no directive, or its wording no longer carries an asp-NNN). Silence is
+    then CORRECT, so the row reports UNEVALUATABLE rather than DEAD.
+
+    THE MIRROR. The same child adds one row inside a lane and requires the banner to stay
+    quiet. A banner that fires regardless (its pool_lane_rows test gone) no longer tells an
+    inert directive from an honored one: DEAD.
+
+    Measured 2026-09-24 (bravo, cc-05) before this row existed: the live directive's seven
+    lanes gave one INERT warning for the lane-free pool and none once a lane row was added
+    (pool_lane_rows 0 then 1, nothing picked). A team-state with no directive, and one whose
+    prose names no asp-NNN, both gave lanes [] and silence. Import 1.1s, probe 1.3s.
+
+    WHAT THIS ROW DOES NOT WATCH: goal-selector.sh's own environment setup (the child runs
+    the .py); the call site that feeds the banner the REAL post-filter pool (the probe hands
+    the floor a synthetic one); the warning's copy into scorer-verdict.json; the directive
+    boost's scoring; and the floor's hoist with its FLOOR banner.
+
+    SIDE-EFFECT FREE: the loader and both calls only read, and the floor's pick only
+    reorders the list it is given. Measured: the working tree's status did not change
+    across a live run. The probe runs in a child so the selector's imports never enter
+    this module's sys.modules (guard-1435). `team_state` is the test seam: it replaces the
+    selector's cached team-state read. Production never passes it.
+    """
+    script_name = "goal-selector.py"
+
+    def _assert() -> tuple[bool | None, str]:
+        path = SCRIPT_DIR / script_name
+        if not path.is_file():
+            return None, f"{script_name} absent at {path}"
+        root = None
+        try:
+            ts_arg = ""
+            if team_state is not None:
+                root = Path(tempfile.mkdtemp(prefix="canary-inert-"))
+                ts_file = root / "team-state.json"
+                ts_file.write_text(json.dumps(team_state), encoding="utf-8")
+                ts_arg = ts_file.as_posix()
+            rc, out, err = _probe([sys.executable, "-c", _INERT_BANNER_PROBE,
+                                   _INERT_IMPORT_DIR.as_posix(), path.as_posix(),
+                                   INERT_PROBE_AGENT, INERT_PROBE_ASP, ts_arg])
+        except Exception as exc:
+            return None, f"{script_name} could not run: {exc}"
+        finally:
+            if root is not None:
+                shutil.rmtree(root, ignore_errors=True)
+        marks: dict[str, str] = {}
+        for ln in out.splitlines():
+            key, sep, val = ln.strip().partition("=")
+            if sep and key.isupper() and key not in marks:
+                marks[key] = val
+        last = err.strip().splitlines()[-1][:160] if err.strip() else ""
+        if "IMPORTED" not in marks:
+            return None, (f"{script_name} could not be imported (rc={rc}"
+                          f"{': ' + last if last else ''}). Selection itself stops then, "
+                          "which is loud, so this row cannot judge the banner")
+        if "PROBE_ERROR" in marks:
+            return True, (f"the strategic-focus floor or banner raised "
+                          f"{marks['PROBE_ERROR'][:200]}. The selector's own try/except turns "
+                          "that into one stderr line, so the directive can go inert with no "
+                          "banner")
+        try:
+            lanes = json.loads(marks["LANES"])
+            trip = json.loads(marks["TRIP"])
+            hold = json.loads(marks["HOLD"]) if "HOLD" in marks else None
+        except (KeyError, ValueError):
+            return None, (f"{script_name}'s probe died after import without an exception the "
+                          f"selector would swallow (rc={rc}{': ' + last if last else ''}), so "
+                          "production would fail loudly too")
+        if check_fixture:
+            if not lanes:
+                return None, ("probe fixture is stale: the selector's own "
+                              "load_strategic_focus() finds no asp-NNN lane in team-state "
+                              "strategic_focus (no directive, or its wording names none), so "
+                              "there is nothing to be inert about and silence is CORRECT")
+            if marks.get("FIXTURE_ASP_IN_LANES") == "True":
+                return None, (f"probe fixture is stale: the non-lane row's {INERT_PROBE_ASP} "
+                              "is itself a directive lane, so the pool is not lane-free. "
+                              "Change INERT_PROBE_ASP, not the selector")
+        if not trip.get("warnings"):
+            return True, (f"the directive names {len(lanes)} lane(s) and the pool held "
+                          f"{trip.get('pool_lane_rows')} lane row(s) (the floor saw lanes "
+                          f"{trip.get('lanes')}), yet emit_strategic_focus_inert_banner stayed "
+                          "silent. The directive can now go inert with nothing saying so")
+        if hold is not None and hold.get("warnings"):
+            return True, (f"the INERT banner also fired for a pool holding a lane row "
+                          f"(pool_lane_rows={hold.get('pool_lane_rows')}), so it no longer "
+                          "tells an inert directive from an honored one")
+        return False, (f"fired for a pool outside all {len(lanes)} directive lane(s) and stayed "
+                       "quiet once a lane row was added")
+    return _assert
+
+
 SIGNALS: list[dict] = [
     {
         "name": "agent-watchdog-tick",
@@ -1711,6 +2558,93 @@ SIGNALS: list[dict] = [
             "'pass' means run_suite or the rc==2 branch in evaluate() no longer sees a "
             "collection error. 'noop' means evaluate() stopped using has_domain_tests or "
             "touched_since. 'gate error, fail-open' names the exception evaluate() raises."
+        ),
+    },
+    {
+        "name": "liveness-check-dormant-verdict",
+        "what": (
+            "liveness_check.py, the engine liveness-check.sh execs, and the consumer that acts "
+            "on its one actionable verdict: gates.reallocation_exempt.confirms_dormant (the "
+            "selector's idle-reallocation and the daemon claim gate)"
+        ),
+        "evidence": "verdict 'dormant' from the CLI and True from confirms_dormant for a throwaway shard stale since 2000",
+        # The sixth PRODUCT-PATH row of . DORMANT is the only verdict anything acts
+        # on, and the consumer that acts on it swallows every exception as "not idle", so
+        # each death strands goals routed to a dead agent without a sound. A crash is DEAD.
+        "assertion": _liveness_dormant_assertion(),
+        "remedy": (
+            "Build a scratch world holding team-state/agents/<a>.yaml with last_active "
+            "\"2000-01-01T00:00:00\" and a 2000-01-01 mtime, then run `STORAGE_BACKEND=local "
+            "python3 core/scripts/liveness_check.py --agent <a> --last-active "
+            "2000-01-01T00:00:00 --world-dir <scratch> --backend local --json` by hand, WITHOUT "
+            "discarding stderr. A verdict other than dormant names its decide_liveness branch "
+            "in 'reason'. If the CLI says dormant but confirms_dormant returned False, call "
+            "gates.reallocation_exempt.confirms_dormant with the same inputs with its "
+            "try/except removed in a local copy: the exception it was swallowing is the defect."
+        ),
+    },
+    {
+        "name": "product-repo-freshness-behind",
+        "what": (
+            "product-repo-freshness.py, the advisory that tells a goal its product checkout is "
+            "behind its upstream before the goal reads or edits it (the --repo --json record "
+            "and the text banner)"
+        ),
+        "evidence": "a behind-2 record and a banner naming a throwaway checkout 2 commits behind its local bare upstream",
+        # The seventh PRODUCT-PATH row of . The gate never blocks and turns every
+        # exception into rc=0, so each death reads as "in sync" and a stale tree is read as
+        # current. A crash is DEAD. --check-read is deliberately NOT registered: see
+        # _freshness_behind_assertion's docstring.
+        "assertion": _freshness_behind_assertion(),
+        "remedy": (
+            "Build a scratch clone 2 commits behind a local bare repo (git init --bare; clone; "
+            "commit twice in a second clone and push; fetch in the first), then run `python3 "
+            "core/scripts/product-repo-freshness.py --repo <clone> --json` and the same without "
+            "--json by hand, WITHOUT discarding stderr. behind 0 with ahead 2 means the "
+            "rev-list range in freshness() is reversed. No JSON on stdout plus an 'advisory "
+            "probe failed' line names the exception __main__ swallowed. A right record with a "
+            "banner that omits the repo means render() now counts 'behind' as clean."
+        ),
+    },
+    {
+        "name": "hot-path-size-gate-growth-refusal",
+        "what": (
+            "hot-path-size-gate.py, the commit-msg gate that refuses a commit leaving an "
+            "always-loaded prose file larger than at HEAD"
+        ),
+        "evidence": "rc=1 naming the file for a throwaway repo whose budgeted file is staged 2 -> 4 B with no override trailer",
+        # The eighth PRODUCT-PATH row of . The hook blocks on any non-zero rc, so a
+        # crash is loud: UNEVALUATABLE. rc 0 on growth is the silent death, in three shapes.
+        "assertion": _hotpath_growth_assertion(),
+        "remedy": (
+            "Build a scratch repo with core/config/hot-path-budget.yaml naming one file, commit "
+            "it small, stage it larger, and run `MIND_WORLD=<scratch>/world STORAGE_BACKEND=local "
+            "python3 core/scripts/hot-path-size-gate.py --repo <scratch> --commit-msg-file <msg>` "
+            "by hand. A WARN line names the exception load_budget or evaluate raised. OVERRIDE "
+            "means parse_override matched a line with no trailer. Silence means decide() or "
+            "staged_changes() no longer sees the growth."
+        ),
+    },
+    {
+        "name": "goal-selector-strategic-focus-inert",
+        "what": (
+            "goal-selector.py's STRATEGIC-FOCUS INERT banner, the one line that says the "
+            "standing directive names lanes none of whose goals reached the ranked pool"
+        ),
+        "evidence": "one INERT warning for a one-row pool outside every live directive lane, and none once a lane row is added",
+        # The ninth PRODUCT-PATH row of . The selector wraps the floor and the
+        # banner in a try/except that prints one stderr line, so an exception there is DEAD.
+        # An import failure stops selection outright, so it is loud: UNEVALUATABLE.
+        "assertion": _strategic_focus_inert_assertion(),
+        "remedy": (
+            "Import core/scripts/goal-selector.py with importlib in a python3 shell, then call "
+            "apply_strategic_focus_floor([{'goal_id': 'g-0-0', 'aspiration_id': 'asp-0', "
+            "'score': 1.0}], 'x') and pass its status to emit_strategic_focus_inert_banner by "
+            "hand. Empty status lanes mean load_strategic_focus() no longer parses team-state "
+            "strategic_focus. pool_lane_rows above 0 means the floor counts non-lane rows as "
+            "lane rows. An empty return with lanes and 0 pool rows means the banner's own "
+            "predicate changed. A banner that also fires once a lane row is in the pool has "
+            "lost its pool_lane_rows test."
         ),
     },
 ]

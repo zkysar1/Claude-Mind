@@ -37,9 +37,18 @@ Experiences are governed by `EXP_LIMITS = {shallow:10, medium:15, deep:25}`
 beliefs are tiny and experiential_index is already category-keyed at the
 file level.
 
-Universal RBs (framework-* category OR `applies_to: any`) are surfaced as
-`meta_lessons` and capped separately at `UNIVERSAL_RB_CAP=5`; the
-SUPPLEMENTARY_CAPS depth cap does not apply to them.
+Universal RBs (framework-* category OR `applies_to` in {`any`, `framework`},
+per `_rb_helpers.UNIVERSAL_APPLIES_TO_VALUES`; `applies_to: specific` opts out)
+are surfaced ONLY as `meta_lessons`, capped separately at `UNIVERSAL_RB_CAP=5`.
+Three of those slots are filled by utilization and are the same for every query;
+the other `universal_relevance_slots=2` are filled by cosine. The
+SUPPLEMENTARY_CAPS depth cap does not apply to them, so `--depth` never widens
+this lane. **An id absent from `reasoning_bank` is not absent from the response;
+an absence probe must read `meta_lessons` too.** Measured 2026-09-23: 9,394 of
+11,094 active RB entries (84.7%) are universal. The "unreachable entries"
+lineage (g-115-4899, from 2026-08-04) parsed `reasoning_bank` only, and all 22
+records it called unreachable or reachable split exactly on this predicate
+(rb-11714; the capacity question is g-374-99).
 
 **Default is metadata-only (2026-04-23).** Long-form body fields in the
 supplementary stores — reasoning bank `content`, meta lesson `content`,
@@ -68,8 +77,11 @@ guardrails, pattern signatures, experiences, beliefs, and experiential index. Us
 the intelligent retrieval protocol in Phase 4, where the LLM reads `_tree.yaml` directly
 and selects tree nodes via the Read tool.
 
-Returns JSON with sections: `tree_nodes`, `reasoning_bank`, `guardrails`,
-`pattern_signatures`, `experiences`, `beliefs`, `experiential_index`.
+Returns JSON with sections: `tree_nodes`, `reasoning_bank`, `meta_lessons`,
+`guardrails`, `pattern_signatures`, `experiences`, `beliefs`,
+`experiential_index`, `forged_skills`, plus `meta` (and `framework_rules` only
+under `--include-framework`). `reasoning_bank` holds DOMAIN entries only;
+universal entries arrive under `meta_lessons` (see above).
 
 Each tree node entry includes `match_channel` (how it was matched) and `match_score`
 (relevance score). Response `meta` includes `retrieval_channels` (list of channels used).

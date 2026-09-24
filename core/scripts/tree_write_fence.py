@@ -42,10 +42,15 @@ So this fences by DETECTION: it is loud, durable, and cannot wedge the loop.
 The goal's own acceptance is an OR -- "either prevents a concurrent overwrite or
 detects and reports one loudly".
 
-Loud here means BOTH channels, deliberately: a stderr banner AND an appended
-JSONL ledger record. stderr alone is not enough -- guard-772 measured that a
-warning written only to stderr is invisible when the command runs inside a
-backgrounded subprocess, which is exactly how much of this loop executes.
+Loud here means THREE channels, one per reader. Under `--hook`, a structured
+hook payload on stdout (hookSpecificOutput.additionalContext + systemMessage)
+is the only one that reaches the MODEL: an exit-0 hook's stderr is stored as a
+hook_success transcript record and never enters context (guard-1680,
+guard-6752). The stderr banner is for a human at the terminal. The appended
+JSONL ledger record is the durable one -- guard-772 measured that stderr alone
+vanishes inside a backgrounded subprocess. Until g-306-488 only the last two
+existed (the wrapper sent stdout to /dev/null), so neither CONFLICT nor
+OVER-CAP could reach the model.
 
 CONTRACT
 --------
@@ -61,6 +66,7 @@ Fail-open everywhere. A fence that breaks must never be the outage.
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 from datetime import datetime
@@ -122,21 +128,94 @@ def in_scope(path):
     return p.endswith(".md") and (_TREE_MARKER.replace("\\", "/") in p)
 
 
-def file_hash(path):
-    """sha256 of the file bytes, or None when unreadable/absent.
+# --- What the hash leaves out: Layer A's lines () --------------------
+# tree-sync-check.sh (Layer A, via tree-front-matter-sync.py) and this fence's
+# `record` fire on the SAME PostToolUse[Edit|Write|MultiEdit] event, and one
+# event's hooks run concurrently (), so settings.json order guarantees
+# nothing. `record` hashes in ~0.1 s; Layer A rewrites the node's mechanical
+# front matter seconds later. A raw-bytes baseline therefore went stale on the
+# session's OWN write, and its next edit was told "Another writer landed in
+# between" -- with a DIVERGED ledger row -- when there was none ().
+#
+# The fence asks whether an edit computed from an old view can drop someone's
+# WORK. Layer A regenerates its lines on every write, so they are never work
+# another writer can lose, and the hash leaves them out: root `last_updated:`,
+# and the `session:` / `source:` children of a block-form
+# `last_update_trigger:` (plus that parent line when nothing else is left under
+# it, since Layer A inserts the whole block when it is absent). The body, the
+# topic, the trigger type and every other key still diverge.
+#
+# Read the way Layer A reads (its _read_file_lf): LF-normalized, so a mixed-
+# ending node Layer A rewrites to all-CRLF does not diverge, while the ending
+# STYLE stays in the hash, so another writer's LF<->CRLF rewrite still does.
+# Blank front-matter lines are ignored (Layer A's end-of-block insert consumes
+# a trailing blank), and a node with no front matter hashes from its first
+# non-blank line (Layer A's first write prepends a block). Each shape is live:
+# census of 1,844 nodes on 2026-09-24 -- 119 trailing-blank, 91 without front
+# matter, 2 mixed-ending. This is a second copy of Layer A's field list, so
+# test_tree_write_fence_layer_a.py runs the REAL tree-front-matter-sync.py over
+# each shape and fails if the hash moves.
+_FRONT_MATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---", re.DOTALL)  # == Layer A's
+_TRIGGER_BLOCK_RE = re.compile(r"last_update_trigger:[ \t]*$")
+_TRIGGER_CHILD_RE = re.compile(r"[ \t]+(?:session|source):")
+# Stored with every baseline. A baseline without it hashed raw bytes and is not
+# comparable, so check() treats it as never observed rather than DIVERGED.
+HASH_SCHEME = "layer-a-masked-v1"
 
-    Bytes, never text: tree nodes are LF-normalized on disk and a text-mode
-    read would fold CRLF on Windows and produce a phantom divergence
-    (tree-front-matter-sync.py carries the same warning for the same reason).
+
+def _mask_layer_a(lf_text):
+    """The node text minus every line Layer A may write (see the note above)."""
+    m = _FRONT_MATTER_RE.match(lf_text)
+    if not m:
+        return lf_text.lstrip("\n")
+    kept = []
+    parent = None          # index in `kept` of an open last_update_trigger: block
+    has_child = False
+    for line in m.group(1).split("\n"):
+        if not line.strip():
+            continue
+        if line[0] not in " \t":           # column 0 closes any open block
+            if parent is not None and not has_child:
+                del kept[parent]
+            parent = None
+            if line.startswith("last_updated:"):
+                continue
+            if _TRIGGER_BLOCK_RE.match(line):
+                parent, has_child = len(kept), False
+        elif parent is not None:
+            if _TRIGGER_CHILD_RE.match(line):
+                continue
+            has_child = True
+        kept.append(line)
+    if parent is not None and not has_child:
+        del kept[parent]
+    body = lf_text[m.end():]
+    if not kept:
+        return body.lstrip("\n")
+    return "\n".join(kept) + "\n---" + body
+
+
+def fence_hash(path):
+    """sha256 of what the fence compares, or None when unreadable/absent.
+
+    Read in bytes and LF-normalized by hand, never in text mode: a text-mode
+    read folds CRLF on Windows (tree-front-matter-sync.py carries the same
+    warning), and the ending style must stay in the hash.
     """
     try:
-        h = hashlib.sha256()
         with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
+            raw = f.read()
     except Exception:
         return None
+    h = hashlib.sha256()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        h.update(raw)      # Layer A cannot decode it either, so never rewrites it
+        return h.hexdigest()
+    h.update(b"crlf\n" if "\r\n" in text else b"lf\n")
+    h.update(_mask_layer_a(text.replace("\r\n", "\n")).encode("utf-8"))
+    return h.hexdigest()
 
 
 def _key(path):
@@ -225,12 +304,12 @@ def record(path, store_path):
     """Snapshot the current hash as this session's baseline for `path`."""
     if not in_scope(path):
         return {"op": "record", "scoped": False, "path": str(path)}
-    h = file_hash(path)
+    h = fence_hash(path)
     if h is None:
         return {"op": "record", "scoped": True, "recorded": False,
                 "reason": "unreadable", "path": str(path)}
     k = _key(path)
-    rec = {"key": k, "sha256": h, "at": _now()}
+    rec = {"key": k, "sha256": h, "scheme": HASH_SCHEME, "at": _now()}
     out = {"op": "record", "scoped": True,
            "recorded": save_baseline(store_path, k, rec),
            "sha256": h[:12], "path": str(path)}
@@ -238,7 +317,7 @@ def record(path, store_path):
     # Edit/Write of a node, and both moments are action-relevant — a Read of an
     # over-cap node came back TRUNCATED (rb-2077), and a write to one grew a
     # file no future Read returns whole. The banner rides the same verdict so
-    # main() can print it to stderr (this function stays pure/testable).
+    # main() can emit it (this function stays pure/testable).
     et = est_tokens(path)
     if et > READ_CAP_TOKENS:
         out["over_cap"] = {"est_tokens": et, "cap": READ_CAP_TOKENS}
@@ -250,7 +329,8 @@ def check(path, store_path):
 
     Verdicts:
       not_scoped  -- not a tree node body
-      no_baseline -- never observed this session (nothing to compare; allow)
+      no_baseline -- never observed this session, or observed under an older
+                     HASH_SCHEME (nothing comparable; allow)
       unreadable  -- cannot hash right now (allow)
       clean       -- unchanged since last observation
       DIVERGED    -- changed underneath us; an edit from the old view may drop work
@@ -258,9 +338,9 @@ def check(path, store_path):
     if not in_scope(path):
         return {"op": "check", "verdict": "not_scoped", "path": str(path)}
     rec = read_baseline(store_path, _key(path))
-    if not rec:
+    if not rec or rec.get("scheme") != HASH_SCHEME:
         return {"op": "check", "verdict": "no_baseline", "path": str(path)}
-    live = file_hash(path)
+    live = fence_hash(path)
     if live is None:
         return {"op": "check", "verdict": "unreadable", "path": str(path)}
     if live == rec.get("sha256"):
@@ -304,54 +384,82 @@ def _default_paths():
         return None, None
 
 
+# --- The model-facing payload () -------------------------------------
+# From a non-blocking hook, only a structured payload on stdout reaches the
+# model (guard-1680). `record` is wired to PostToolUse and `check` to PreToolUse
+# (tree-write-fence.sh), and each payload names its own event. The PreToolUse
+# shape is the four-field one measured to arrive (; the same payload
+# as trailing-echo-exit-gate.py and pre-edit-context-gate.sh). Do not narrow it
+# here -- that question is . It carries permissionDecision "allow"
+# because PreToolUse stdout is read as a decision. The edit is never blocked,
+# though allow also skips any permission prompt for that one Edit (the same
+# trade pre-edit-context-gate makes), and the scope (knowledge/tree .md) never
+# holds the constitutional anchor.
+_HOOK_EVENT = {"record": "PostToolUse", "check": "PreToolUse"}
+
+
+def hook_payload(op, message):
+    """The hook output that carries `message` into the model's context."""
+    spec = {"hookEventName": _HOOK_EVENT[op], "additionalContext": message}
+    if op == "check":
+        spec["permissionDecision"] = "allow"
+        spec["permissionDecisionReason"] = message
+    return {"hookSpecificOutput": spec, "systemMessage": message}
+
+
 def main(argv):
     if len(argv) < 3:
-        print("usage: tree_write_fence.py {record|check} <path>", file=sys.stderr)
+        print("usage: tree_write_fence.py {record|check} <path> [--hook]",
+              file=sys.stderr)
         return 0
     op, path = argv[1], argv[2]
+    # --hook (the wrapper always passes it): stdout carries ONLY the hook
+    # payload, and only when a banner fires. Without it (CLI, tests): the JSON
+    # verdict, as before.
+    hook = "--hook" in argv[3:]
+    if op not in _HOOK_EVENT:
+        return 0
     store, ledger = _default_paths()
     if store is None:
         return 0  # no agent bound -> nothing to fence against
 
+    banner = None
     if op == "record":
-        rec_out = record(path, store)
-        oc = rec_out.get("over_cap")
+        out = record(path, store)
+        oc = out.get("over_cap")
         if oc:
-            # Same channel discipline as the DIVERGED banner: stderr only (the
-            # wrapper discards stdout by design). No ledger — the node stays
-            # durably visible in tree-read.sh --distill-candidates until folded.
-            print(
+            # No ledger — the node stays durably visible in
+            # tree-read.sh --distill-candidates until folded.
+            banner = (
                 "[tree-write-fence] ⚠ OVER-CAP: %s is ~%s est_tokens (Read cap "
                 "~%s). Reads of this node come back TRUNCATED and appends deepen "
                 "a file no one can read whole. You touched it — fold it: apply "
                 "the archive+keep-newest rollup (tree-read.sh --distill-candidates "
                 "lists it tier-0), or claim its fold goal before adding content."
-                % (rec_out["path"], "{:,}".format(oc["est_tokens"]),
-                   "{:,}".format(oc["cap"])),
-                file=sys.stderr,
-            )
-        print(json.dumps(rec_out))
-        return 0
-
-    if op == "check":
-        verdict = check(path, store)
-        if verdict.get("verdict") == "DIVERGED":
-            verdict["agent"] = os.environ.get("MIND_AGENT", "unknown")
-            verdict["ts"] = _now()
-            append_ledger(ledger, verdict)
-            print(
+                % (out["path"], "{:,}".format(oc["est_tokens"]),
+                   "{:,}".format(oc["cap"])))
+    else:
+        out = check(path, store)
+        if out.get("verdict") == "DIVERGED":
+            out["agent"] = os.environ.get("MIND_AGENT", "unknown")
+            out["ts"] = _now()
+            append_ledger(ledger, out)
+            banner = (
                 "[tree-write-fence] ⚠ CONFLICT: %s changed on disk since this "
                 "session read it (baseline %s @ %s -> live %s). Another writer "
                 "landed in between. An edit computed from the old view can "
                 "SILENTLY drop their work -- re-Read the file and re-apply your "
                 "change before writing. Logged to %s"
-                % (verdict["path"], verdict["baseline_sha256"],
-                   verdict.get("observed_at"), verdict["live_sha256"], ledger),
-                file=sys.stderr,
-            )
-        print(json.dumps(verdict))
-        return 0
+                % (out["path"], out["baseline_sha256"],
+                   out.get("observed_at"), out["live_sha256"], ledger))
 
+    if hook:
+        if banner:
+            print(json.dumps(hook_payload(op, banner)))
+    else:
+        print(json.dumps(out))
+    if banner:
+        print(banner, file=sys.stderr)  # the human at the terminal, never the model
     return 0
 
 

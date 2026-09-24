@@ -231,6 +231,12 @@ this goal succeeded?" Must reference a checkable artifact.
 - Else: if references concrete artifact → attempt to verify (Read file, check existence).
   - If artifact verification fails: `all_passed = false`, status → pending.
   - If no concrete reference: `all_passed = false`.
+- **Closure-evidence table** (g-375-05, every scope): the closure note carries one
+  `OUTCOME <n>: MET — <measured value>. Source: <...>` row per verification outcome
+  (spec: goal-schemas.md § Closure Evidence Table). Check it before the close does:
+  `py core/scripts/closure-evidence-gate.py --goal <id> --source <s> [--summary-file <note file>]`.
+  Exit 3 = Q1 FAIL (`all_passed = false`); fix the rows it names. do_verify runs the
+  same gate before the status write, so skipping this only moves the refusal later.
 - **On Q1 PASS** (artifact verified):
   ```bash
   bash core/scripts/loop-state-save.sh update --set "phase_progress.q1_passed=true" --set "phase_progress.q1_artifact=<artifact-path>"

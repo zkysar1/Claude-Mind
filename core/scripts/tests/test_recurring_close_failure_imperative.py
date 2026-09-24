@@ -114,6 +114,12 @@ def _run_terminal(max_rc, outcome, deadman_disabled,
             return f"{name}=$'{esc}'\n"
 
         script = (
+            # : the extracted terminal block now branches on BODY_ROLE.
+            # A worker box exports BODY_ROLE=worker into this process, which would
+            # flip every reducer-path assertion below. These tests pin the REDUCER
+            # path, so neutralise the inherited value. (The worker path is pinned in
+            # test_recurring_close_worker_terminal.py.)
+            'unset BODY_ROLE\n'
             f'AGENT_DIR={agent_dir.as_posix()!r}\n'
             f'MAX_RC={max_rc}\nOUTCOME={outcome!r}\n'
             f'FAILED_PHASES={failed_phases!r}\n'

@@ -23,6 +23,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Paths handed to NATIVE Windows programs (py -3, git -C) use NATIVE_ROOT
+# (; guard-161, guard-5509). SCRIPT_DIR and PROJECT_ROOT are MSYS
+# /c/... form, which MSYS rewrites in argv -- unless the caller sourced
+# _platform.sh and exported MSYS_NO_PATHCONV=1, which every loop commit's hooks
+# inherit. Then Windows python opens /c/x as C:\c\x (the marker predicate never
+# resolves) and `git -C /c/x` is "not a git repository", which --staged would
+# read as nothing staged: a silent CLEAN. PROJECT_ROOT itself stays in MSYS form
+# on purpose -- every grep hit below is parsed as path:line:text, and a
+# drive-letter colon would split it at the C.
+NATIVE_ROOT="$PROJECT_ROOT"
+if [[ -n "${MSYSTEM:-}" ]] && command -v cygpath >/dev/null 2>&1; then
+  NATIVE_ROOT="$(cygpath -m "$PROJECT_ROOT")"
+fi
+
 BLOCKLIST="$PROJECT_ROOT/core/config/domain-term-blocklist.txt"
 VERBOSE=false
 CORE_ONLY=false
@@ -64,7 +78,7 @@ fi
 # EVERY file, exempting the entire tree -- the worst possible direction for this
 # particular failure -- so an unresolvable predicate is a hard error, not a
 # degraded mode (communication-clarity.md rule 5).
-MARKER_RX="$(py -3 "$SCRIPT_DIR/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
+MARKER_RX="$(py -3 "$NATIVE_ROOT/core/scripts/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
 if [[ -z "$MARKER_RX" ]]; then
   echo "ERROR: cannot resolve the exemption-marker predicate from $SCRIPT_DIR/_domain_leak_marker.py" >&2
   echo "       Refusing to scan: an empty pattern would exempt every file." >&2
@@ -133,7 +147,7 @@ if [[ "$STAGED" == true ]]; then
     for fn in "${FORGED_NAMES[@]}"; do [[ "$f" == *".claude/skills/$fn/"* ]] && { skip=true; break; }; done
     [[ "$skip" == true ]] && continue
     STAGED_FILES+=("$abs")
-  done < <(git -C "$PROJECT_ROOT" diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+  done < <(git -C "$NATIVE_ROOT" diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
 
   if [[ ${#STAGED_FILES[@]} -eq 0 ]]; then
     echo "CLEAN: No in-scope staged files to check (--staged mode)."
@@ -156,7 +170,7 @@ fi
 # a filter that drops rows silently reads exactly like a clean tree.
 # An unresolvable include-set scopes NOTHING -- the scan runs unscoped and says
 # so. Over-reporting is this gate's safe direction; a wrong scope hides a leak.
-SEED_MANIFEST="$PROJECT_ROOT/core/config/seed-manifest.yaml"
+SEED_MANIFEST="$NATIVE_ROOT/core/config/seed-manifest.yaml"
 SHIP_FILE="$(mktemp)"
 SCOPED_OUT_FILE="$(mktemp)"
 trap 'rm -f "$SHIP_FILE" "$SCOPED_OUT_FILE"' EXIT
@@ -168,8 +182,8 @@ SCOPED=false
 # positive control instead: this gate ships with the seed, so a list that lacks
 # it is not this repo's include-set.
 if [[ -f "$SEED_MANIFEST" ]] \
-   && { py -3 "$SCRIPT_DIR/_seed_engine.py" list-includes --lines \
-          --manifest "$SEED_MANIFEST" --source "$PROJECT_ROOT" | tr -d '\r' > "$SHIP_FILE"
+   && { py -3 "$NATIVE_ROOT/core/scripts/_seed_engine.py" list-includes --lines \
+          --manifest "$SEED_MANIFEST" --source "$NATIVE_ROOT" | tr -d '\r' > "$SHIP_FILE"
         [[ "${PIPESTATUS[0]}" -eq 0 && "${PIPESTATUS[1]}" -eq 0 ]]; } \
    && grep -Fxq -- "core/scripts/domain-leak-check.sh" "$SHIP_FILE"; then
   SCOPED=true
@@ -187,6 +201,10 @@ GREP_CASE=()
 if [[ "$IGNORE_CASE" == true ]]; then GREP_CASE=(-i); fi
 
 while IFS= read -r term; do
+  # A CRLF checkout (core.autocrlf=true on Windows) leaves a CR on every line;
+  # `read` keeps it, so "term\r" matched nothing and the scan printed CLEAN
+  # (guard-987; measured 2026-09-24, 70 CRs in the working-tree blocklist).
+  term="${term%$'\r'}"
   # Skip comments and blank lines
   [[ -z "$term" || "$term" == \#* ]] && continue
 

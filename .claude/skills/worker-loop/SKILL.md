@@ -365,8 +365,8 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #     block on notification failure.) Then `--mark-escalated`. rc=1 (user-stop)
 #     / rc=2 (none): park quietly.
 #   Tool (not Bash): ScheduleWakeup(prompt="Parked worker Body: re-enter
-#     /worker-loop at Phase -0 (manifest reads parked = RESUMABLE), re-run the
-#     Phase 0.5 poll and SELECT; a claim resumes, no goal re-parks.",
+#     /worker-loop at Phase -0 (manifest: parked = RESUMABLE), re-run the
+#     Phase 0.5 poll; SELECT on rc 0 (a claim resumes); rc 1 re-parks.",
 #     delaySeconds=3600)
 # and NOTHING after it — that wakeup IS the auto-resume; a park turn that forgets
 # to arm is indistinguishable from a close. DO NOT STAGE THE WM (`park` never
@@ -701,6 +701,14 @@ Bash: bash core/scripts/iteration-push.sh --push-worker-ref
 # RUNS AFTER 3.7/3.8 ON PURPOSE. Phase 3.7's STRANDED branch also writes
 # outcome_note, and this helper is write-if-absent/never-clobber — so placing
 # this before 3.7 would silently prevent a stranding from ever being recorded.
+#
+# THE NARRATIVE OPENS WITH THE EVIDENCE TABLE (g-375-05): one row per
+# verification outcome, and a blank line ends a row. Write what you MEASURED:
+#   OUTCOME <n>: MET — <measured value>. Source: <command + output | path | sha | the two timestamps>
+#   OUTCOME <n>: NOT MET — <what is missing>; deferred to <goal-id>
+# Phase 4a's close refuses a MET row whose path or store key does not exist, or
+# whose interval ("~5s") cites fewer than two timestamps.
+# Spec: core/config/conventions/goal-schemas.md § Closure Evidence Table.
 Bash: bash core/scripts/closure-evidence-write.sh --goal <goal-id> --source world \
         --summary-file <path to the narrative you already wrote> \
         --prefix "[worker-loop] close:"

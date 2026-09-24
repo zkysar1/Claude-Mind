@@ -1385,8 +1385,11 @@ def _universal_relevance_split(universal_sorted, categories, stats=None):
     Contract:
       - Input is the FULL universal list already ordered by
         sort_universal_rbs (utilization desc) — the caller's pre-cap list.
-      - Flag off / no scores / no qualifying picks → EXACTLY
+      - Flag off / no qualifying picks → EXACTLY
         universal_sorted[:UNIVERSAL_RB_CAP], today's behavior.
+      - No scores (no per-box index) or a model-drift freeze → the pull
+        slots go to TOKEN OVERLAP instead (`_universal_token_pulls`,
+        g-115-10616); nothing clearing its floor → the same exact slice.
       - Flag on: the top (CAP - universal_relevance_slots) by utilization
         are ALWAYS returned first (the push floor — the "always surface
         meta-lessons" guarantee, narrowed but never removed). The remaining
@@ -1446,7 +1449,7 @@ def _universal_relevance_split(universal_sorted, categories, stats=None):
         return universal_sorted[:UNIVERSAL_RB_CAP]
     if _freeze_on_model_drift():
         _rec("model_drift", slots_n=slots)
-        return universal_sorted[:UNIVERSAL_RB_CAP]
+        return _universal_token_pulls(universal_sorted, categories, slots, stats)
     try:
         from _embedding_retrieval import cosine_scores
         query = " ".join(c for c in categories
@@ -1456,7 +1459,7 @@ def _universal_relevance_split(universal_sorted, categories, stats=None):
         scores = {}
     if not scores:
         _rec("no_scores", slots_n=slots)
-        return universal_sorted[:UNIVERSAL_RB_CAP]
+        return _universal_token_pulls(universal_sorted, categories, slots, stats)
     try:
         min_cos = float(cfg.get("embedding_min_cosine", 0.35))
     except (TypeError, ValueError):
@@ -1484,6 +1487,68 @@ def _universal_relevance_split(universal_sorted, categories, stats=None):
     _rec("ran", picked=cosine_picked,
          backfilled=len(out) - before_backfill, slots_n=slots)
     return out
+
+
+def _universal_token_pulls(universal_sorted, categories, slots, stats=None):
+    """ — fill the universal-RB pull slots by QUERY-TOKEN OVERLAP
+    when the cosine channel cannot score: no per-box embedding index
+    (`no_scores`) or the model-drift freeze (`model_drift`).
+
+    THE DEFECT. Without scores the universal lane returned the same top-5 by
+    utilization for every query, and universal entries are never admitted to
+    the token-matched domain lane — so on an index-less box ~85% of the
+    reasoning bank (9,324 of 11,007 active, measured 2026-09-23) was
+    unreachable by ANY query, and a new entry (utilization 0.0) could never
+    surface to earn utilization (guard-6084's bootstrap deadlock).
+
+    THE SHAPE IS `_relevance_floor`'s, reused on purpose: the same
+    `relevance_floor_min_overlap` knob (clamped strictly above the admission
+    threshold), and a pick is promoted only on a STRICT overlap gain over the
+    utilization-order entry it displaces. The floor of
+    (CAP - slots) utilization entries is untouched, exactly as in the cosine
+    branch. `universal_cosine_status` keeps describing the COSINE channel, so
+    the abstention-rate contract (status == "ran" rows only) is unchanged; the
+    token path reports separately as `n_universal_token_picked`, and an absent
+    key means this path did not run.
+
+    MEASURED ON THIS FUNCTION (cc-05, index present, 120 recent goal titles,
+    9,418 universal entries): fired on 119, 236 picks, pick overlap median 6
+    against 1 for the entries they displaced. By the cosine channel's own bar
+    (>= embedding_min_cosine), 89 of 236 picks (37.7%) qualified against 13 of
+    236 displaced entries (5.5%); agreement rises with overlap (3: 3/24,
+    6: 20/34, 8+: 27/56), so low-overlap picks are the noisy tail. With no
+    index, 299 of a seeded 300 universal entries return for their own title;
+    before, 10 of 9,418 were reachable by any query.
+
+    COST, paid only on an index-less or drift-frozen box: the first call after
+    a store reload tokenizes every universal entry into the shared per-record
+    memo — 0.77 s and +74 MB RSS on cc-05 — and a warm call is ~41 ms.
+    """
+    floor_n = UNIVERSAL_RB_CAP - slots
+    rest = universal_sorted[floor_n:]
+    cfg = _load_retrieval_config()
+    try:
+        min_ov = int(cfg.get("relevance_floor_min_overlap", 3))
+    except (TypeError, ValueError):
+        min_ov = 3
+    if min_ov <= _TEXT_FALLBACK_MIN_OVERLAP:
+        min_ov = _TEXT_FALLBACK_MIN_OVERLAP + 1
+    overlaps = [_query_overlap(r, categories) for r in rest]
+    pool = sorted((i for i in range(slots, len(rest)) if overlaps[i] >= min_ov),
+                  key=lambda i: (-overlaps[i], i))
+    promo = []
+    for cand in pool[:slots]:
+        displaced = slots - 1 - len(promo)
+        if displaced < 0 or overlaps[cand] <= overlaps[displaced]:
+            break
+        promo.append(cand)
+    if stats is not None:
+        stats["n_universal_token_picked"] = len(promo)
+    if not promo:
+        return universal_sorted[:UNIVERSAL_RB_CAP]
+    keep = slots - len(promo)
+    return (list(universal_sorted[:floor_n]) + [rest[i] for i in promo]
+            + list(rest[:keep]))
 
 def _tree_doc_id_for(node):
     """This node's embedding-index doc id: 'tree:' + tree-root-relative path
@@ -1762,7 +1827,8 @@ def _relevance_floor(ranked, categories, cap):
     slots by token overlap. The first two need the embedding index and are gated
     behind `embedding_blend_enabled` (off), so on a box with no index they are
     inert — which is precisely the hole this one fills, and why it must never be
-    folded into either.
+    folded into either. (The universal split alone then falls back to its own
+    token-overlap pulls, `_universal_token_pulls` — g-115-10616.)
     """
     if cap <= 0 or len(ranked) <= cap:
         return ranked

@@ -185,7 +185,7 @@ def test_concurrent_records_do_not_lose_baselines(tmp_path):
 def test_never_raises_on_hostile_inputs(tmp_path):
     store = tmp_path / "nested" / "deep" / "baselines"
     assert F.check(tmp_path / "knowledge/tree/absent.md", store)["verdict"] == "no_baseline"
-    assert F.file_hash(tmp_path / "does-not-exist.md") is None
+    assert F.fence_hash(tmp_path / "does-not-exist.md") is None
     assert F.load_baselines(tmp_path / "nope") == {}      # absent store dir
     # one corrupt entry must not blind the whole store
     good = tmp_path / "knowledge" / "tree" / "ok.md"
@@ -200,18 +200,20 @@ def test_never_raises_on_hostile_inputs(tmp_path):
     assert F.check("core/scripts/x.py", store)["verdict"] == "not_scoped"
 
 
-def test_hash_is_byte_exact_not_text_normalized(tmp_path):
+def test_line_ending_style_stays_in_the_hash(tmp_path):
     """CRLF vs LF must be a real difference, not folded away by text mode.
 
     A text-mode read on Windows folds CRLF->LF, so a writer that rewrote line
-    endings would hash identical and the fence would miss a real rewrite.
+    endings would hash identical and the fence would miss a real rewrite. The
+    hash LF-normalizes to mask Layer A's lines (g-306-488), so the ending style
+    is hashed explicitly -- test_tree_write_fence_layer_a.py pins the mask.
     """
     p = tmp_path / "knowledge" / "tree" / "n.md"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(b"# x\nline\n")
-    lf = F.file_hash(p)
+    lf = F.fence_hash(p)
     p.write_bytes(b"# x\r\nline\r\n")
-    assert F.file_hash(p) != lf
+    assert F.fence_hash(p) != lf
 
 
 # ------------------------------------------------- shell-wrapper wiring ()
