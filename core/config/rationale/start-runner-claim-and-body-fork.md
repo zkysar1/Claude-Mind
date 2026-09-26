@@ -6,52 +6,49 @@ its last 27% never reached the model at all. Every block below is VERBATIM — t
 a relocation, not a rewrite. The skill retains ALL procedure: its YAML front matter,
 every `Bash:` line, every HALT/refusal branch, every `>` user-facing display line,
 every bold directive, and every test-pinned literal. Only explanation moved here.
+(That claim was false for IDLE 0-pre, whose branch bodies had moved here; g-115-10839
+put them back, and the 0-pre section below is a WHY summary, not a verbatim block.)
 
-## The explicit AYOAIAGENT= prefix is REQUIRED — the Phase 2
+## Why IDLE step 0-pre (the interrupted-stop check) looks the way it does
 
-*(was `start/SKILL.md` L631-633)*
+*(the step is `start/SKILL.md` IDLE 0-pre. g-115-7706 relocated its branch bodies
+here, where `/start` never read them; g-115-10839 put them back in the skill. Only
+the WHY stays here — every branch command lives in the skill.)*
 
-   The explicit `MIND_AGENT=` prefix is REQUIRED — the Phase 2.6 binding is not
-   written until Step 0 below, so the PreToolUse[Bash] auto-inject hook cannot
-   resolve the agent yet; `stop_checkpoint.py` reads the agent from `MIND_AGENT`.
+**Why it exists.** It is the explicit-resume twin of the Session Start Protocol
+IDLE-branch check (CLAUDE.md, g-317-09): the passive session-start path probes the
+same sentinel, but a user who re-engages via `/start` instead of a chat message
+would otherwise skip straight to the IDLE→RUNNING flip and strand the
+half-finished stop's learning. A `/stop` is interrupted most often during the
+long D4 consolidate. Source: core/scripts/stop_checkpoint.py module docstring
+(FW-11, lines 4-11).
 
-## - Exit 0 (a stop-checkpoint.json is present — a prior /sto
+**Why the explicit `MIND_AGENT=` prefix is REQUIRED.** The Phase 2.6 binding is
+not written until Step 0, so the PreToolUse[Bash] auto-inject hook cannot resolve
+the agent yet, and `stop_checkpoint.py` takes the agent from `MIND_AGENT` alone —
+unset, it exits. Source: core/scripts/stop_checkpoint.py `_agent_name()`
+(lines 72-78); .claude/skills/start/SKILL.md IDLE Step 0 (the binding write).
 
-*(was `start/SKILL.md` L635-636)*
+**Why the on-disk mode picks resume or clear.** Graceful-stop D7 is the step that
+sets the post-stop mode, and D4 consolidate runs before it. A still-`autonomous`
+mode therefore means the stop never reached D7 and its consolidation/handoff may be
+incomplete, which `/aspirations-graceful-stop --resume` completes idempotently
+(consolidate, handoff, set target mode, clear the checkpoint). Inside D7's single
+Bash call the checkpoint clear rides the mode flip's `&&` as
+`{ stop-checkpoint.sh clear || true; }`, and D7.1 clears it again. An
+`assistant`/`reader` mode beside a surviving sentinel therefore means D4 already
+landed and only that clear was lost; retiring the sentinel is all that is left,
+and a sentinel left in place keeps `resume-needed` answering 0 for a stop that
+already finished. Source: .claude/skills/aspirations-graceful-stop/SKILL.md D7
+(line 475, SIGN-OFF note lines 472-474) and D7.1; core/scripts/stop_checkpoint.py
+docstring lines 17-18.
 
-   - **Exit 0** (a `stop-checkpoint.json` is present — a prior `/stop` was
-     interrupted mid-sequence, most often during the long D4 consolidate):
-
-## AYOAIAGENT=<agent-name bash core/scripts/session-mode-get
-
-*(was `start/SKILL.md` L638-646)*
-
-       `MIND_AGENT=<agent-name> bash core/scripts/session-mode-get.sh`
-     - **If current mode == `autonomous`** (the interrupted stop never reached
-       D7 — D7 is what sets the post-stop mode, and D4 consolidate runs before
-       D7, so a still-`autonomous` mode means the consolidation/handoff may be
-       incomplete): invoke `/aspirations-graceful-stop --resume`. That handler
-       idempotently completes the remaining stop obligations (consolidate,
-       handoff, set target mode, clear the checkpoint), emits its own
-       stop-complete message, and ends the turn. DONE — do NOT proceed to Step 0.
-       After it completes, display:
-
-## - Else (current mode is already assistant/reader — the int
-
-*(was `start/SKILL.md` L650-651)*
-
-     - **Else** (current mode is already `assistant`/`reader` — the interrupted
-       stop substantially completed; D7 ran, so D4 consolidate already landed,
-
-## AYOAIAGENT=<agent-name bash core/scripts/stop-checkpoint.s
-
-*(was `start/SKILL.md` L653-657)*
-
-       `MIND_AGENT=<agent-name> bash core/scripts/stop-checkpoint.sh clear`
-       to retire the stale sentinel, then continue to Step 0 normally.
-   - **Exit 1** (the common case — no interrupted stop, or the resume-count
-     breaker has tripped per `stop_checkpoint.py` MAX_RESUME_ATTEMPTS): continue
-     to Step 0 normally.
+**Why exit 1 and exit 2 both continue.** Exit 1 covers both "no interrupted stop"
+and the resume-count breaker (MAX_RESUME_ATTEMPTS = 3), which exists to stop
+auto-resuming a persistently failing stop. Exit 2 is the script's error code: a
+sentinel the script cannot read cannot be resumed from either, and a branch table
+with no row for the value the agent meets is the guard-6447 shape. Source:
+core/scripts/stop_checkpoint.py lines 37-38 and 65.
 
 ## initial status=active record for THIS session so it is vis
 
@@ -370,3 +367,71 @@ C1.9-C11 first-boot sequence for all three modes.
 - Calls: /boot (autonomous mode), /prime (all modes during init; reader/assistant resume)
 - Called by: User only. NEVER by Claude.
 
+
+## Why the first heartbeat waits for the DDB acquire
+
+*(was `start/SKILL.md` L719-726; moved verbatim by g-115-10839 to bring the skill under the 65,536 B injection ceiling)*
+
+   - (DDB-heartbeat ordering, g-328-31: the first `heartbeat-tick.sh` — which
+     under own-cloud ALSO fires the DDB `runner-claim.sh heartbeat` — is
+     deliberately DEFERRED to AFTER the DDB acquire below (and before the RUNNING
+     flip). A DDB heartbeat run BEFORE the acquire, using a leftover runner-token
+     from a prior session whose release did not confirm, refreshes a STALE claim's
+     `heartbeat_at` and defeats the acquire's §5 stale-lock-break — pinning this
+     /start at rc=4 on its own stale claim. See the heartbeat-tick step just
+     before `session-state-set.sh RUNNING` below.)
+
+## Why the runner claim is a triple-write with a framework-owned token
+
+*(was `start/SKILL.md` L728-728; moved verbatim by g-115-10839 to bring the skill under the 65,536 B injection ceiling)*
+
+     (Canonical runner-claim: writes THREE files atomically — `running-session-id`, `latest-session-id`, and `runner-token` — into `agents/<agent-name>/session/`. The Phase 2.5.D `agents/` parent prefix MUST be in the heredoc path; without it, the writes land at `agents/<agent-name>/session/` at PROJECT_ROOT (the 2026-05-19 bravo/ cruft incident — the L1 hook only gates Write/Edit, not Bash heredoc writes, so a missing `agents/` prefix silently creates a directory at the wrong root). The first two files hold the Claude Code SID (routing identity used by stop-hook). The third is a FRAMEWORK-OWNED UUID4 (uniqueness identity) — protects against Claude Code reusing a session_id across windows via `claude --continue` / `--resume`. With the token, every BLOCK and watchdog event records the runner-instance identity, so a SID-collision shows up as "same SID, different runner-token" in `core/logs/stop-hook.log` and watchdog events instead of silent corruption. The 2026-05-12 cross-binding incident was invisible to forensics without this signal. DO NOT split these writes into separate Bash commands — the triple-write is the atomic unit. DO NOT remove the `RUNNER_TOKEN_GEN_FAILED` halt; without a token, the loop runs with no uniqueness anchor. Per rb-323/guard-403, observer-paired signals MUST be seeded BEFORE the state-set RUNNING below — same race rb-323 identified for heartbeat-tick. If RUNNER_TOKEN_GEN_FAILED here, state stays IDLE (clean retry); if state-set ran first, state would be RUNNING with no SID files and Path B would have to recover.)
+
+## Why current_focus is cleared, and why below the acquire
+
+*(was `start/SKILL.md` L806-818; moved verbatim by g-115-10839 to bring the skill under the 65,536 B injection ceiling)*
+
+     (Clear stale current_focus from the previous session's shutdown — without this,
+     a partner reading team-state.yaml sees the prior session's "session ended" or
+     stale focus value indefinitely. Convention coordination.md:275 is retrospective
+     ("set on completion"), so we can't write a prospective "starting" — clearing to
+     "" is the convention-aligned signal of "no completion yet this session". The
+     first aspirations-state-update or aspirations-consolidate write populates
+     current_focus with the first real completion. Fail-open with `|| true` so a
+     team-state write failure never blocks the RUNNING transition — stderr is NOT
+     suppressed, so write errors surface. ORDERING (g-115-4653): this is the FIRST
+     shared/synced write in the sequence and MUST stay below the DDB acquire above.
+     It was previously the first write of the whole autonomous branch, so an rc=4
+     refusal blanked the LIVE owning box's focus before ever discovering it had lost
+     the claim.)
+
+## Why the first heartbeat sits between the acquire and the RUNNING flip
+
+*(was `start/SKILL.md` L866-885; moved verbatim by g-115-10839 to bring the skill under the 65,536 B injection ceiling)*
+
+     (FIRST heartbeat — seeds `runner-heartbeat` mtime AND stamps team-state
+     `last_active` NOW, and under own-cloud ALSO fires the DDB
+     `runner-claim.sh heartbeat`. MOVED here from before the triple-write
+     (g-328-31) so it runs AFTER the DDB acquire above and BEFORE the RUNNING
+     flip below. Ordering rationale: the DDB heartbeat MUST NOT precede the
+     acquire — a heartbeat carrying a leftover token from a prior session
+     refreshes a STALE claim's `heartbeat_at`, defeating the acquire's §5
+     stale-lock-break and pinning the next /start at rc=4 (stale-self-claim).
+     Acquiring first lets §5 reclaim the genuinely-stale claim; THIS heartbeat
+     then refreshes the just-acquired claim with the fresh token from the
+     triple-write. Still precedes the RUNNING transition to close the
+     observer-probe race (state=RUNNING with a stale heartbeat/last_active) per
+     rb-323/guard-403 — both observer-paired signals (heartbeat here, triple-write
+     above) are seeded before the flip. `--bypass-state` is REQUIRED because state
+     is still IDLE here; the gate in `heartbeat-tick.sh` refuses bare ticks against
+     IDLE (the `heartbeat_without_running` desync class, alpha 2026-05-13
+     cbb27ab3). DO NOT add a separate `team-state-update.sh ... last_active` line;
+     it duplicates the write heartbeat-tick just performed. On an acquire HALT
+     (rc=4) above, this heartbeat never runs — a failed acquire leaves no
+     heartbeat side-effect, which is the point.)
+
+## (State flip — observable to /stop, recovery-gate, partner agents.
+
+*(was `start/SKILL.md` L896 — relocated 2026-09-25, same reason as above)*
+
+     (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment. Script-enforced since 2026-08-29 (rb-9643): `session.py` REFUSES `RUNNING` — exit 1, `REJECTED: … running-session-id` — when `running-session-id` is missing/empty or names another session than `$MIND_SID`; a refusal means the triple-write above was skipped, so go back and run it, never write `agent-state` by hand.)

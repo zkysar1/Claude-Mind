@@ -532,3 +532,131 @@ def test_ratio_prints_on_the_zero_merged_branch(tmp_path):
     line = cfl.format_line(s)
     assert "0 load-bearing captures to merge" in line, line
     assert "spark_capture 1/2=50%" in line, line
+
+
+# --------------------------------------------------------------------------
+#  — a DRAINED entry must not come back while a Body still offers it
+# --------------------------------------------------------------------------
+
+def _drain(root: Path, slot: str, goal_ids: set, agent: str = "testagent") -> None:
+    """What POST /v1/wm/drain-goals does to the reducer WM: subtract by goal_id."""
+    p = root / "agents" / agent / "session" / "working-memory.yaml"
+    wm = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    wm["slots"][slot] = [e for e in wm["slots"].get(slot) or []
+                         if e.get("goal_id") not in goal_ids]
+    p.write_text(yaml.safe_dump(wm), encoding="utf-8")
+
+
+def _filler(n: int) -> list:
+    """n ring hashes no Body offers, standing for earlier merges."""
+    return [f"{i:040x}" for i in range(n)]
+
+
+def _merged_ids(root: Path, before: list, slot: str = "spark_capture") -> list:
+    return [e["goal_id"] for e in _reducer_slots(root)[slot][len(before):]]
+
+
+def test_drained_entry_is_not_remerged_when_its_hash_was_the_ring_oldest(tmp_path):
+    """The measured mechanism: the ring was FULL at CAP, so every new merge
+    evicted the OLDEST hash. That hash belonged to an entry the Body still
+    offered, so once the replay drained it, the next pass merged it again.
+
+    Positive control (guard-4166): an entry no pass has ever seen must still
+    merge. Under the pre-fix FIFO that control stays green while the drained
+    entry comes back, and that difference is the evidence."""
+    root = _mk_root(tmp_path)
+    x = _entry("g-drained", load_bearing=True, fact="consumed once")
+    new = [_entry(f"g-new-{i}", load_bearing=True, fact=f"new {i}") for i in range(3)]
+    ring = [bmg._content_hash(x)] + _filler(cfl.CONSUMED_HASHES_CAP - 1)
+    _write_reducer_wm(root, "testagent", {
+        "spark_capture": [x],
+        cfl.CONSUMED_HASHES_SLOT: {"spark_capture": ring}})
+    _write_body(root, "testagent", "u1", {"spark_capture": [x] + new})
+
+    first = cfl.fast_lane("testagent", project_root=root)
+    assert first["merged"] == 3, first
+    _drain(root, "spark_capture", {"g-drained"})
+    y = _entry("g-control", load_bearing=True, fact="never seen before")
+    _write_body(root, "testagent", "u1", {"spark_capture": [x] + new + [y]})
+    before = _reducer_slots(root)["spark_capture"]
+
+    second = cfl.fast_lane("testagent", project_root=root)
+
+    assert _merged_ids(root, before) == ["g-control"], second
+    assert bmg._content_hash(x) in _reducer_slots(root)[cfl.CONSUMED_HASHES_SLOT]["spark_capture"]
+
+
+def test_drained_entry_delivered_by_another_path_is_recorded_while_live(tmp_path):
+    """The second way in: an entry that reached the slot through generalize_down
+    (merge_wm) never had a ring hash, so the drain left nothing to stop its
+    carrier re-offering it. A pass that sees it LIVE and offered records it."""
+    root = _mk_root(tmp_path)
+    x = _entry("g-via-merge-wm", load_bearing=True, fact="arrived by merge_wm")
+    _write_reducer_wm(root, "testagent", {
+        "spark_capture": [x],
+        cfl.CONSUMED_HASHES_SLOT: {"spark_capture": _filler(cfl.CONSUMED_HASHES_CAP)}})
+    _write_body(root, "testagent", "u1", {"spark_capture": [x]})
+
+    first = cfl.fast_lane("testagent", project_root=root)
+    assert first["merged"] == 0, first
+    assert first["consumed_ring"]["spark_capture"]["held_recorded"] == 1, first
+    _drain(root, "spark_capture", {"g-via-merge-wm"})
+    before = _reducer_slots(root)["spark_capture"]
+
+    second = cfl.fast_lane("testagent", project_root=root)
+
+    assert _merged_ids(root, before) == [], second
+
+
+def test_hashes_no_source_offers_are_trimmed_to_cap(tmp_path):
+    """CAP still bounds the insurance half: a hash nothing offers cannot come
+    back, so the oldest of those are the ones dropped."""
+    root = _mk_root(tmp_path)
+    x = _entry("g-offered", load_bearing=True)
+    ring = _filler(cfl.CONSUMED_HASHES_CAP + 5) + [bmg._content_hash(x)]
+    _write_reducer_wm(root, "testagent", {
+        "spark_capture": [x], cfl.CONSUMED_HASHES_SLOT: {"spark_capture": ring}})
+    _write_body(root, "testagent", "u1", {"spark_capture": [x]})
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    got = _reducer_slots(root)[cfl.CONSUMED_HASHES_SLOT]["spark_capture"]
+    assert s["consumed_ring"]["spark_capture"]["trimmed"] == 5, s
+    assert got == _filler(cfl.CONSUMED_HASHES_CAP + 5)[5:] + [bmg._content_hash(x)]
+
+
+def test_an_unreadable_carrier_blocks_the_trim(tmp_path, monkeypatch):
+    """An unread carrier and an empty one return the same dict. Trimming on the
+    unread one would forget hashes it still offers, and it would re-deliver
+    them next pass, so nothing below the ceiling is evicted."""
+    root = _mk_root(tmp_path)
+    ring = _filler(cfl.CONSUMED_HASHES_CAP + 5)
+    _write_reducer_wm(root, "testagent", {
+        cfl.CONSUMED_HASHES_SLOT: {"spark_capture": list(ring)}})
+
+    def _unreadable(state_dir, backend, world_dir=None, skipped=None):
+        skipped.append("u9-fastlane.jsonl")
+        return {}
+    monkeypatch.setattr(cfl.bcc, "read_carriers", _unreadable)
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    assert s["sources_unreadable"] == 1, s
+    assert s["consumed_ring"]["spark_capture"]["trimmed"] == 0, s
+    assert _reducer_slots(root)[cfl.CONSUMED_HASHES_SLOT]["spark_capture"] == ring
+
+
+def test_ceiling_overflow_is_reported_not_silent(tmp_path, monkeypatch):
+    """Past the ceiling offered hashes ARE evicted and re-delivery resumes, so
+    the close line has to say so on the 0-merged branch too."""
+    monkeypatch.setattr(cfl, "CONSUMED_HASHES_CEILING", 2)
+    root = _mk_root(tmp_path)
+    entries = [_entry(f"g-{i}", load_bearing=True, fact=str(i)) for i in range(3)]
+    _write_reducer_wm(root, "testagent", {"spark_capture": list(entries)})
+    _write_body(root, "testagent", "u1", {"spark_capture": list(entries)})
+
+    s = cfl.fast_lane("testagent", project_root=root)
+
+    assert s["merged"] == 0, s
+    assert s["consumed_ring"]["spark_capture"]["overflow"] == 1, s
+    assert "consumed-ring OVERFLOW" in cfl.format_line(s)

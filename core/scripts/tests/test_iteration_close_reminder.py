@@ -468,6 +468,63 @@ def test_tag_and_phrase_on_separate_lines_do_not_pair(tmp_path):
     )
 
 
+# ── INTERVAL MOVED review (): PREFIX the reminder, never replace it ──
+# recurring-close.sh prints an INTERVAL MOVED review when this close's own tuner
+# moved the goal's interval_hours. The reminder outranks that stdout, so when the
+# review printed the reminder must lead with it; otherwise the reminder is
+# byte-identical to before. The same contract is pinned against the producer's
+# REAL bytes in test_recurring_close_interval_review.py section D.
+
+REVIEW_HEADLINE = (
+    "[recurring-close] ⚠ INTERVAL MOVED — g-115-817 interval_hours 4.0h -> 2.67h "
+    "across this close's auto-contract step (consecutive_deep=3, "
+    "original_interval_hours=4.0)."
+)
+PREFIX_HEAD = "<system-reminder>\nFIRST settle the INTERVAL MOVED review"
+
+
+def _ctx_for(tmp_path, stdout_text):
+    proj = _build_fake_project(tmp_path, AGENT, SID)
+    payload = _make_payload(
+        COMMAND_RECURRING, {"stdout": stdout_text, "stderr": "", "interrupted": False}
+    )
+    rc, stdout, stderr = _invoke_hook(payload, proj)
+    assert rc == 0, f"hook exit non-zero: rc={rc}, stderr={stderr[-300:]}"
+    return _additional_context(stdout)
+
+
+@pytest.mark.parametrize("close_lines,marker", [
+    ("[recurring-close] ═══ ITERATION COMPLETE ═══\n"
+     "[recurring-close] OUTCOME=routine — NEXT ACTION REQUIRED (settle the "
+     "INTERVAL MOVED review above first): Call Skill(aspirations) with args='loop'.",
+     GENERIC_MARKER),
+    ("[recurring-close] ═══ ITERATION COMPLETE ═══\n"
+     "[recurring-close] OUTCOME=deep — NEXT ACTION REQUIRED (settle the "
+     "INTERVAL MOVED review above first): Call Skill(aspirations-spark) FIRST.",
+     DEEP_MARKER),
+])
+def test_interval_review_prefixes_the_reminder(tmp_path, close_lines, marker):
+    plain = _ctx_for(tmp_path, close_lines)
+    reviewed = _ctx_for(tmp_path, "\n" + REVIEW_HEADLINE + "\n" + close_lines)
+    assert marker in plain and "INTERVAL MOVED" not in plain, plain[:400]
+    assert reviewed.startswith(PREFIX_HEAD), reviewed[:400]
+    prefix = reviewed[len("<system-reminder>\n"):reviewed.index("THEN:\n") + len("THEN:\n")]
+    # Prefixed once, and everything after the prefix is the unchanged reminder.
+    assert reviewed.replace(prefix, "", 1) == plain, (reviewed, plain)
+    assert reviewed.count("INTERVAL MOVED") == 1, reviewed
+
+
+@pytest.mark.parametrize("stdout_text", [
+    # the phrase after WORD characters is not the headline
+    "[recurring-close] OUTCOME=routine said INTERVAL MOVED\n",
+    # the tag and the phrase on separate lines must not pair
+    "[recurring-close]\n⚠ INTERVAL MOVED\n",
+])
+def test_only_the_review_headline_prefixes(tmp_path, stdout_text):
+    ctx = _ctx_for(tmp_path, stdout_text + "[recurring-close] ═══ ITERATION COMPLETE ═══\n")
+    assert GENERIC_MARKER in ctx and not ctx.startswith(PREFIX_HEAD), ctx[:400]
+
+
 # ── Orphaned-stdin regression (): hook must NOT hang forever ──
 # Before the guard-664 daemon-thread+join(timeout) fix, json.load(sys.stdin)
 # blocked INDEFINITELY when the stdin pipe's write-end was held open by an

@@ -103,7 +103,8 @@ def test_unparseable_ts_fail_open():
 
 def test_all_enum_codes_allow_on_divergence():
     """Every code in the closed enum is accepted on a divergence."""
-    assert len(svg.VALID_DEVIATION_CODES) == 10
+    assert len(svg.VALID_DEVIATION_CODES) == 11
+    assert "always-run-lane" in svg.VALID_DEVIATION_CODES  # 
     for code in svg.VALID_DEVIATION_CODES:
         rc, _, ev = svg.evaluate(_verdict("g-1"), "g-2", code, NOW)
         assert rc == 0, code

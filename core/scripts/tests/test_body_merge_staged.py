@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import shutil
 import subprocess
 import sys
@@ -623,6 +624,38 @@ def test_world_staged_orphan_merged_and_consumed(tmp_path):
     assert red["slots"].get("body_only_slot") == {"from": "world"}
     assert red["slots"].get("active_context") == {"a": 1}
     assert not staged_file.exists(), "world-staged file must be consumed exactly once"
+
+
+def test_tombstoned_triple_is_neither_merged_nor_deleted_through_main(
+        tmp_path, monkeypatch, capsys):
+    """: a unit carrying a -wm.consumed tombstone is left in place.
+
+    Run through the production entry point, main(["generalize-down", ...]),
+    with a POSITIVE CONTROL in the same run: an untombstoned triple beside it
+    must still merge and be deleted, so a drain that simply stopped working
+    cannot pass. Asserted on a COUNTER: the reducer's 10 would become
+    10 + (15-10) = 15 if the tombstoned unit were re-merged.
+    """
+    kept = "66666666-6666-4666-8666-666666666666"
+    pr = _mk_agent(tmp_path, reducer_wm={"slots": {"goals": 10}})
+    staged = merge.bm.world_staged_dir(pr / "agents" / "alpha")
+    kept_file = _stage_world(pr, kept, {"slots": {"goals": 15, "from_kept": 1}},
+                             baseline={"slots": {"goals": 10}})
+    tombstone = staged / f"{kept}-wm.consumed"
+    tombstone.write_text(json.dumps({"unit_key": kept}) + "\n", encoding="utf-8")
+    live_file = _stage_world(pr, SID, {"slots": {"from_live": 1}})
+    monkeypatch.setattr(merge, "_project_root", lambda: pr)
+
+    assert merge.main(["generalize-down", "--agent", "alpha"]) == 0
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary["staged_tombstoned_retained"] == [kept]
+    assert summary["staged_merged"] == [SID]
+    red = _read_reducer(pr)["slots"]
+    assert red.get("from_live") == 1, "positive control: the live unit merges"
+    assert "from_kept" not in red and red.get("goals") == 10
+    assert kept_file.exists() and (staged / f"{kept}-wm-baseline.yaml").exists()
+    assert tombstone.exists()
+    assert not live_file.exists(), "positive control: the live unit is consumed"
 
 
 def test_both_lanes_drain_in_one_pass(tmp_path):

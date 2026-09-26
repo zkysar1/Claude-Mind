@@ -239,10 +239,54 @@ EXPERIENCE_STAT_FOR_FIELD = {
 }
 
 
+EXP_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
+
+
 def _increment_experience_stat(item_id, field):
+    """Spool one `retrieval_stats` counter delta for an experience record.
+
+    g-358-216: the daemon read-modify-write below rewrote the whole experience
+    store once per item per counter, which is the 1-second PUT burst measured on
+    every agent. The delta now goes to the machine-local spool and main() drains
+    it once per pass, at most once per interval (_experience_stats_spool).
+    Unmapped counters still write nothing; a record without a
+    `retrieval_stats` block is still skipped, now at drain time. A failed spool
+    append falls back to the daemon write, so no counter is lost.
+    """
+    stat = EXPERIENCE_STAT_FOR_FIELD.get(field)
+    if stat is None:
+        return  # counter has no experience-side equivalent; nothing to write
+    try:
+        import _experience_stats_spool as _es
+        if _es.record(EXP_PATH, item_id, stat):
+            return
+    except Exception:
+        pass
+    _increment_experience_stat_via_daemon(item_id, field)
+
+
+def _flush_experience_spool():
+    """Drain this pass's spooled experience deltas (rate-limited, never raises)."""
+    if EXP_PATH is None:
+        return
+    try:
+        import _experience_stats_spool as _es
+        result = _es.flush(EXP_PATH)
+    except Exception as e:
+        print(f"[utilization-feedback] Warning: experience spool flush failed: "
+              f"{e}", file=sys.stderr)
+        return
+    if result.get("status") == "flushed" and result.get("records"):
+        print(f"[utilization-feedback] experience counters: "
+              f"{result['increments']} increment(s) folded into "
+              f"{result['records']} record(s) in one write", file=sys.stderr)
+
+
+def _increment_experience_stat_via_daemon(item_id, field):
     """Increment one `retrieval_stats` counter on an experience record.
 
-    Read-modify-write against the daemon (GET /v1/experience/read then POST
+    The fallback for a failed spool append. Read-modify-write against the
+    daemon (GET /v1/experience/read then POST
     /v1/experience/update-field) because the store exposes no increment verb —
     see the shape note above. Uses _rt directly rather than the .sh wrapper for
     the same reason increment_supplementary does: a Python child cannot reach
@@ -1080,6 +1124,7 @@ def main():
     for item in supp_noise:
         increment_supplementary(item["id"], item["type"], "times_noise")
         supp_n += 1
+    _flush_experience_spool()
 
     # C.3: bump times_inferred_unknown for supplementary items still in the
     # unknown bucket (or all of them on --all-unknown). After bump, check if

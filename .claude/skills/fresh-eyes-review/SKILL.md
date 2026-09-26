@@ -202,7 +202,9 @@ Bash: team-state-read.sh --field strategic_focus --json
   → Phase 3 MUST weigh the mix against this directive BEFORE any internal
     gate, and MUST state the comparison explicitly — including when the mix
     complies. "The internal gate passed" is NOT a verdict on its own.
-  → MEASURING the mix: count one-off closes by `completed_date`, but count
+  → MEASURING the mix: count one-off closes by `completed_at`, NOT
+    `completed_date` (date-only on most records, so a timestamp filter drops
+    them; guard-3690). Count
     RECURRING closes by `lastAchievedAt` (companions: `achievedCount`,
     `currentStreak`). A recurring goal returns to `status: pending` on close,
     so it NEVER carries `status: completed` and a completed_date-only scan
@@ -218,10 +220,8 @@ Bash: team-state-read.sh --field strategic_focus --json
     the `aspirations-compact.json` that Phase 2.2 above tells you to load. The
     compact omits `completed_date` and `completed_by` entirely, so the count is
     structurally ZERO for any agent, any lane, any window — while the
-    aspiration-level completion
-    ratios Phase 2.2 wants from the same file are perfectly correct, which is
-    what makes the file look like the right source. (bravo 2026-07-29: returned
-    0 closes in a session where the reviewer had personally closed ten goals.)
+    aspiration-level completion ratios Phase 2.2 wants from the same file are
+    perfectly correct, which is what makes the file look like the right source.
   → THE REASON IS STRONGER THAN A MISSING FIELD, and the earlier wording here
     got it wrong in a way that invites the wrong fix (corrected g-115-3622,
     alpha, cc-07, 2026-08-11 — measured on a live 544-goal compact). Two

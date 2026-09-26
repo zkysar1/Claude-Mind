@@ -110,6 +110,9 @@ GOAL_KNOWN_FIELDS = frozenset({
     'discovered_by',                     # 1080
     'discovery_type',                    # 1082
     'displaced_from',                    # 14
+    'dispatch_lane',                     # 0 -- g-353-137 always-run lane opt-in
+                                         # ("always-run" or "always-run:<agent>");
+                                         # reader: always-run-lane.py
     'estimated_depth',                   # 38
     'estimated_seconds',                 # 34
     'evidence_note',                     # 12
@@ -131,6 +134,8 @@ GOAL_KNOWN_FIELDS = frozenset({
     'injected_by',                       # 17
     'intended_agent',                    # 2753
     'interval_hours',                    # 86
+    'interval_pinned_by',                # 0 (new, g-115-6612): directive id that
+                                         # pins interval_hours against auto-tuning
     'key_finding',                       # 275
     'lastAchievedAt',                    # 81
     'last_completed',                    # 6

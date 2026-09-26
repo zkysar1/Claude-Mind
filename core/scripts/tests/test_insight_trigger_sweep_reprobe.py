@@ -118,7 +118,8 @@ def sandbox(monkeypatch, tmp_path: Path):
 
     note_calls = []
 
-    def fake_note(trigger, target_status):
+    def fake_note(trigger, target_status, already_noticed=frozenset()):
+        # already_noticed:  author-notice dedup kwarg main() now passes.
         note_calls.append({"trigger": trigger, "target_status": target_status})
         return {"posted": True, "msg_id": f"fake-note-{trigger['msg_id']}"}
 

@@ -67,7 +67,7 @@ def _empty_wm(tmp_path):
 
 def test_clean_run_no_actionable(fake_state_dir, tmp_path, capsys):
     rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
-    assert rep["checks"] == len(oeb.ENTRY_CHECKS) == 5
+    assert rep["checks"] == len(oeb.ENTRY_CHECKS) == 6
     assert rep["actionable"] == []
     assert "error" not in rep
 
@@ -113,7 +113,7 @@ def test_no_agent_binding_fails_open(tmp_path, capsys, monkeypatch):
 
 def test_human_output_footer(fake_state_dir, tmp_path, capsys):
     out = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path), as_json=False)
-    assert "all 5 entry checks clean" in out
+    assert "all 6 entry checks clean" in out
     assert "always-run entry calls" in out
     assert "idle-tick.sh (-0.5e)" in out
 
@@ -277,3 +277,88 @@ def test_human_line_carries_the_runnable_command(
     line = next(l for l in out.splitlines() if "world_not_initialized" in l)
     assert "bash core/scripts/init-mind.sh $MIND_AGENT" in line
     assert '"missing": ["meta"]' in line
+
+
+# --- a RUNNING autonomous loop whose persona write was skipped () --
+#
+# Boot Phase -1 is the only persona write on the autonomous path. Measured 3 of 3
+# examined (two served runs, one live vessel): RUNNING + autonomous with
+# persona-active "false" -- the provisioner's pre-/start reset -- for the whole
+# run, which a vessel folds as NOT ready.
+
+
+def _session(state_dir, state="RUNNING", mode="autonomous", persona="false"):
+    for name, value in (("agent-state", state), ("agent-mode", mode),
+                        ("persona-active", persona)):
+        p = state_dir / name
+        if value is None:
+            if p.exists():
+                p.unlink()
+        else:
+            p.write_text(value + "\n", encoding="utf-8")
+
+
+def _persona_hits(rep):
+    return [e for e in rep["actionable"] if e["name"] == "persona_not_active"]
+
+
+def test_running_autonomous_with_persona_false_dispatches_the_boot_step(
+        fake_state_dir, tmp_path, capsys):
+    """POSITIVE CONTROL (the goal's check, guard-5501): a world constructed to
+    hold the measured state -- RUNNING, autonomous, persona-active "false" --
+    is reported, so the silence of a healthy fleet means something."""
+    _session(fake_state_dir)
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    hit = _persona_hits(rep)
+    assert len(hit) == 1
+    assert hit[0]["payload"] == {"agent_state": "RUNNING", "agent_mode": "autonomous",
+                                 "persona_active": "false"}
+    assert hit[0]["phase"] == "boot -1"
+
+
+def test_an_unset_persona_is_also_reported(fake_state_dir, tmp_path, capsys):
+    """Unset is ON to the framework but NOT ready to a vessel; after boot
+    Phase -1 it is never unset, so absence under a RUNNING loop is the same skip."""
+    _session(fake_state_dir, persona=None)
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    hit = _persona_hits(rep)
+    assert len(hit) == 1 and hit[0]["payload"]["persona_active"] == "unset"
+
+
+@pytest.mark.parametrize("state,mode,persona", [
+    ("RUNNING", "autonomous", "true"),   # booted: the healthy fleet case
+    ("RUNNING", "autonomous", "TRUE"),   # case-insensitive, as the vessel reads it
+    ("IDLE", "autonomous", "false"),     # before /start flips RUNNING
+    ("RUNNING", "assistant", "false"),   # not the autonomous path
+    (None, None, None),                  # an uninitialized agent
+])
+def test_no_dispatch_outside_the_skipped_write_state(
+        fake_state_dir, tmp_path, capsys, state, mode, persona):
+    """The fleet-wide false-positive guard: this runs every iteration on every
+    live agent, so everything but the defect state must stay silent."""
+    _session(fake_state_dir, state=state, mode=mode, persona=persona)
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    assert _persona_hits(rep) == []
+
+
+@pytest.mark.parametrize("signal", ["stop-requested", "stop-loop", "stop-checkpoint.json"])
+def test_a_stop_in_flight_suppresses_the_dispatch(
+        fake_state_dir, tmp_path, capsys, signal):
+    """A stop owns the session files until it lands; the dispatch must never race it."""
+    _session(fake_state_dir)
+    (fake_state_dir / signal).write_text("", encoding="utf-8")
+    rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    assert _persona_hits(rep) == []
+
+
+def test_persona_dispatch_carries_the_command_and_reaches_the_composed_caller(
+        fake_state_dir, tmp_path, capsys):
+    """The model reads the HUMAN line, and iteration-open lifts findings BY NAME;
+    the dispatch must survive both hops."""
+    _session(fake_state_dir)
+    out = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path), as_json=False)
+    line = next(l for l in out.splitlines() if "persona_not_active" in l)
+    assert "bash core/scripts/session-persona-set.sh true" in line
+    report = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
+    lifted = _load_iteration_open()._findings_from("entry-checks", report)
+    assert any(f["name"] == "persona_not_active" for f in lifted), lifted

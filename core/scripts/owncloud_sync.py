@@ -217,6 +217,15 @@ _EXCLUDE_NAMES = {
     "guardrails-utilization.spool.jsonl",
     "guardrails-utilization.spool.flushing.jsonl",
     "guardrails-utilization.spool.last-flush",
+    # experience counter spool lane (g-358-216): per-agent, beside
+    # agents/<agent>/experience.jsonl, drained back INTO that store by
+    # _experience_stats_spool.flush. Same severity as the utilization lane
+    # above: a synced counter spool would be drained by every box and inflate
+    # the counters. Names are _experience_stats_spool.SYNC_EXCLUDED_NAMES;
+    # test_experience_stats_spool.py asserts every one is present here.
+    "experience-stats.spool.jsonl",
+    "experience-stats.spool.flushing.jsonl",
+    "experience-stats.spool.last-flush",
     # citation-credit sweep throttle (g-115-7384). FOURTH per-box .last-*
     # stamp to need a literal entry, and the third added after the fact --
     # `.last-sweep` matches no glob above, exactly as the gate-firings comment

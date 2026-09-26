@@ -15,7 +15,7 @@ clears it) survives the most common interruption window (D4), so a dedicated
 persistent sentinel is required. This module manages that sentinel
 (agents/<agent>/session/stop-checkpoint.json): written at graceful-stop entry
 (GS-0), preserved across resume re-entries, deleted only at clean completion
-(D7.1). Its mere PRESENCE means "a graceful stop is in progress / was
+(D7, in the call that sets the post-stop mode; D7.1 re-clears). Its mere PRESENCE means "a graceful stop is in progress / was
 interrupted" — the unambiguous detection signal for --resume (guard-348
 natural-gate: presence IS the signal, no enabled: boolean).
 
@@ -32,7 +32,7 @@ Subcommands:
   read                                        print checkpoint JSON or null
   resume-needed                               print JSON; exit 0 if a stop is
                                               in progress (resume needed), 1 if not
-  clear                                       delete the checkpoint (D7.1)
+  clear                                       delete the checkpoint (D7)
 
 Output: JSON to stdout on EVERY exit path (guard-614). Exit codes:
   resume-needed: 0 = resume needed, 1 = not needed / breaker tripped, 2 = error

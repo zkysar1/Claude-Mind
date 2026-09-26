@@ -298,6 +298,47 @@ argv_strict_help() {
     exit 0
 }
 
+# argv_strict_refuse_multiline_value <script-name> <flag> <value>
+#
+# WHY A FIFTH ENTRY POINT ()
+# The refusals above guard WHICH token lands in which slot. This one guards what
+# a value may CONTAIN when the wrapper ships it as an HTTP HEADER — which is how
+# every --override-* style justification on the goal and aspiration writers
+# travels. A header cannot carry a line break, so a multi-line value malforms the
+# request and the daemon answers with an EMPTY-BODY error that blames stdin:
+#     aspirations-add-goal.sh --override-duplication $'a\nb'  < valid.json
+#       -> {"error": "invalid_body", "detail": "body must be JSON goal object: empty body"}
+#     the same value on one line -> aspiration_not_found (the body arrived)
+# (echo, cc-03, 2026-09-26; first hit 2026-09-22 with a 3596-byte justification,
+# guard-7278). It is worst for the CAREFUL caller: a long, structured
+# justification is exactly where the line breaks come from.
+#
+# REFUSE, DO NOT STRIP. The value is an audited justification; rewriting it
+# silently is worse than refusing it, and the collapse is one idiom the caller
+# applies knowingly. CR counts too — `tr '\n' ' '` alone leaves a CRLF file's CRs.
+#
+# Call it in every arm whose value becomes a header, passing "$1" so the message
+# names the flag exactly as typed. test_unknown_flag_refusal.py derives those
+# arms from each wrapper's source and fails on one that lacks the call.
+# Exit 2, same contract as the helpers above.
+argv_strict_refuse_multiline_value() {
+    local script="$1" flag="$2" value="${3-}"
+    case "$value" in
+        *$'\n'*|*$'\r'*) ;;
+        *) return 0;;
+    esac
+    local idiom=$'"$(tr \'\\r\\n\' \'  \' < reason.txt | tr -s \' \')"'
+    {
+        printf "%s: the value given to %s contains a line break — refusing.\n" "$script" "$flag"
+        printf '  %s is sent to the daemon as an HTTP header, which cannot carry a line\n' "$flag"
+        printf '  break: the request arrives malformed and the daemon reports an EMPTY BODY,\n'
+        printf '  blaming stdin rather than this argument (g-115-10545, guard-7278).\n'
+        printf '  Collapse the value to one line and re-run:\n'
+        printf '    %s %s\n' "$flag" "$idiom"
+    } >&2
+    exit 2
+}
+
 # argv_strict_resolve_value <script-name> <positional-value-or-empty>
 # Echoes the resolved value on stdout. Refuses (exit 2) if more than one source
 # was supplied, or if --value-file names a path that does not exist.

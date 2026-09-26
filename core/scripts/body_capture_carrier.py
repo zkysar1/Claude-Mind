@@ -428,7 +428,7 @@ def _iter_carrier_names(cdir: Path, backend) -> list:
     return sorted(names)
 
 
-def read_carriers(state_dir, backend, world_dir=None) -> dict:
+def read_carriers(state_dir, backend, world_dir=None, skipped=None) -> dict:
     """{unit_key: {slot: [entry, ...]}} across every Body's carrier.
 
     Reads authoritative-first per file (`body-merge._read_staged_bytes`), so a
@@ -438,6 +438,11 @@ def read_carriers(state_dir, backend, world_dir=None) -> dict:
 
     A malformed line is SKIPPED rather than failing the file: one bad append
     must not strand every other flagged entry from that Body.
+
+    `skipped`, when a list, receives the name of every carrier file that could
+    not be read. An unread carrier and an empty one return the same dict, and
+    capture_fast_lane must tell them apart before it forgets any consumed hash
+    that carrier may still offer (g-115-10776).
     """
     out: dict = {}
     try:
@@ -514,6 +519,8 @@ def read_carriers(state_dir, backend, world_dir=None) -> dict:
             # Skipping is correct — an empty read here would look like
             # "this Body has nothing flagged", which is the false-negative
             # this whole file is about.
+            if transient and isinstance(skipped, list):
+                skipped.append(name)
             continue
         try:
             text = raw.decode("utf-8", errors="replace")

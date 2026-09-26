@@ -4,6 +4,10 @@ description: "No destructive store op before an integrity-verified archive exist
 
 # Archive Before Delete (MANDATORY)
 
+The incidents and measured cases behind steps 2, 3(c) and 6 and the
+adjacent-backup anti-pattern live in `core/config/rationale/archive-before-delete.md`.
+This file keeps the imperatives.
+
 ## Principle
 
 No destructive operation on a data store proceeds until an independent,
@@ -35,20 +39,13 @@ its owner, tmp files this session created, or append-only writes.
 2. **Verify recovery layers BEFORE the destructive step — read the config,
    don't assume.** Soft-delete, versioning, and trash folders are NOT
    archives until the retention configuration says so: READ the storage
-   layer's lifecycle/retention/expiry rules. Canonical incident (2026-07-07,
-   rb-2859): a purge of 2,461 retired-agent objects from the remote store
-   relied on "the store is versioned"; the store's retention policy would
-   have permanently expired every noncurrent version in 90 days. "Versioned"
-   meant "delayed permanent deletion", not "archived".
+   layer's lifecycle/retention/expiry rules. "Versioned" can mean "delayed
+   permanent deletion", not "archived" (canonical incident: rb-2859).
    **When the identity cannot READ the recovery config, the layer is
-   UNVERIFIABLE — treat it as ABSENT (g-115-2692).** A least-privilege storage
-   identity is often granted object read/write but DENIED some bucket-level
-   read that verifies a recovery layer. WHICH one varies by bucket AND by
-   principal — both directions measured in one account (g-115-2692: flag
-   readable, rules denied; g-115-4624: the inverse, no principal reading the
-   flag) — so never predict the split. Probe it, and name the principal that
-   produced the reading (guard-1787). The layer is UNVERIFIABLE either way:
-   the rb-2859 trap ("versioned" ≠ "archived") made STRUCTURAL by permission.
+   UNVERIFIABLE — treat it as ABSENT (g-115-2692).** Which bucket-level read a
+   least-privilege identity is denied varies by bucket AND by principal, so
+   never predict the split. Probe it, and name the principal that produced the
+   reading (guard-1787).
    When the specific config reads
    step 2 requires return access-denied, do NOT treat versioning/soft-delete as
    a recovery layer at all — proceed as if it does not exist: the independent
@@ -73,8 +70,6 @@ its owner, tmp files this session created, or append-only writes.
    FIRST: `_has_archive_receipt` preserves a dir carrying `.archive-marker` or
    a top-level `RECEIPT` / `RECEIPT.*` (any extension, any case). Staging is
    never archiving — step 4 still applies to the copy that survives.
-   (ZDS g-001-349: two live instances 2026-08-03, one of them IAM-policy
-   rollback material 10h into a deletion window.)
 4. **Verify the archive against the enumeration**: object count, total
    bytes, and per-object checksums must ALL match. A sampled spot-check is
    not verification.
@@ -89,12 +84,8 @@ its owner, tmp files this session created, or append-only writes.
    in a durable retrievable store (knowledge tree node + reasoning bank).
 
    **Name it `RECEIPT.*` at the archive's TOP LEVEL, and if you write a READER
-   for it, match extension- and case-insensitively.** Until 2026-08-08
-   (g-115-3397) this step named no filename, so writers and readers disagreed:
-   producers write `RECEIPT.json` (`_seed_engine.py`) and lowercase
-   `receipt.json` (`history_vacuum_archive.py`), while the one reader
-   (`temp-drain-purge.sh`) required `RECEIPT.md` **exactly** — a name zero
-   producers write, so the protection fired only on hand-named receipts.
+   for it, match extension- and case-insensitively.** Producers write
+   `RECEIPT.json` and lowercase `receipt.json` (g-115-3397).
 
    The asymmetry is what makes this a rule rather than a preference: a missed
    sentinel DESTROYS a recovery layer, while an over-match merely retains a
@@ -104,9 +95,7 @@ its owner, tmp files this session created, or append-only writes.
    receipt-ish notes and makes the guard unfalsifiable (guard-2860).
 
    **A receipt never lives INSIDE the store or directory it describes.** A
-   comment line in a JSONL store breaks every parser that reads it: measured
-   2026-09-02, a downstream Body wrote `# RECEIPT: …` as line 1 of a board
-   channel file and every post to that channel returned `internal_error`.
+   comment line in a JSONL store breaks every parser that reads it.
 7. **Blast-radius check before the delete fires**: enumerate what READS this
    data. Read-through/restore-on-miss sync layers, session-binding caches,
    and registry rows can re-materialize or depend on "deleted" data (the
@@ -127,17 +116,9 @@ its owner, tmp files this session created, or append-only writes.
 - Verifying by sample instead of full count+bytes+checksum
 - No receipt: an archive nobody can find or restore from is not an archive
 - Treating an ADJACENT backup routine as coverage without intersecting its
-  SET with the deletion's set. Measured (g-115-4471): `seed-transplant`'s
-  orphan sweep deleted destination files with a bare `unlink()` while a
-  working `do_backup()` sat in the same script — but that backup archives the
-  manifest INCLUDE-set (files about to be OVERWRITTEN), and the orphan set is
-  the files about to be DELETED. The two are disjoint BY DEFINITION, so the
-  recoverable operation had a backup and the unrecoverable one had none. The
-  backup is what made the gap invisible: a reader asking "is this script
-  careful about data?" finds a real archive routine and stops. Ask instead
-  "does the backup's set intersect the set this step destroys?" — where the
-  intersection is empty, coverage is zero no matter how good the backup is.
-  (rb-6344; twin defect from the classification side: rb-4267.)
+  SET with the deletion's set. Ask "does the backup's set intersect the set
+  this step destroys?" — where the intersection is empty, coverage is zero no
+  matter how good the backup is (g-115-4471, rb-6344; twin: rb-4267).
 
 ## Cross-references
 
@@ -148,9 +129,5 @@ its owner, tmp files this session created, or append-only writes.
   config, not assuming it
 - `core/config/conventions/coordination.md` — multi-agent claim/registry
   surfaces that must be purged (not orphaned) at agent retirement
-- g-115-2692 — the scoped-identity case: a least-privilege storage identity
-  denied version-enumeration + lifecycle-config reads (while the versioning
-  on/off read stays allowed) makes the versioning recovery layer unverifiable,
-  so the current-version-copy archive (step 3) becomes mandatory. Verdict:
-  deliberate least-privilege, not an accidental gap. Deployment-specific IAM
-  action + identity details are in the reasoning-bank entry.
+- g-115-2692 — the scoped-identity case behind step 2's UNVERIFIABLE-is-ABSENT
+  clause; detail in `core/config/rationale/archive-before-delete.md`

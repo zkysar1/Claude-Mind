@@ -2097,6 +2097,39 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     return None, warnings, bulk_audit
 
 
+def _superseded_direct_set_message(goal_id: str) -> str:
+    """SSOT for the superseded direct-set refusal text (, B1c).
+
+    TWO daemon sites share it: the pre-lock fail-fast in
+    _run_update_goal_gates and the AUTHORITATIVE in-lock recheck in
+    update_goal (a peer transition landing between the pre-lock read and
+    the write lock can only be caught by the in-lock form). The CLI twin in
+    core/scripts/aspirations.py cmd_update_goal carries its own copy —
+    guard-984: the two message texts must be changed TOGETHER (the daemon
+    does not reload its modules; a green suite is not evidence the caller-
+    visible text changed).
+    """
+    return (
+        f"Cannot set status=superseded directly on {goal_id}. Pick the "
+        f"route that matches what is true: (1) THE WHOLE ASPIRATION's "
+        f"intent is satisfied -- aspirations-complete-intent.sh <asp-id> "
+        f"with intent_satisfaction JSON listing this goal in "
+        f"superseded_goal_ids; note its evidence gate requires every "
+        f"non-recurring goal in the aspiration to be terminal after the "
+        f"supersession, so this route is unavailable for ONE goal in a "
+        f"live aspiration. (2) THIS GOAL ALONE is moot because a sibling "
+        f"shipped its scope -- write the supersession evidence (the "
+        f"sibling's goal id + what it delivered) to outcome_note FIRST, "
+        f"then set status=skipped; that is the order and the status "
+        f"unblock-parent-status-sweep.py::_mark_skipped already uses for "
+        f"the structurally identical case. (3) The work is still WANTED "
+        f"and merely waiting on another goal -- use status=blocked, NOT "
+        f"skipped: skipped is invisible to the blocked-signal sweeps "
+        f"(precheck 0.5b.11/0.5b.12 scan status=blocked), so nothing will "
+        f"resurface it when the dependency lands (guard-1690)."
+    )
+
+
 def _run_update_goal_gates(ctx, goal_id: str, field: str, value
                            ) -> Tuple[Optional["Response"], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:  # type: ignore[name-defined]
     """Run pre-lock gates: uncommitted-work (status→completed), capability
@@ -2359,6 +2392,36 @@ def _run_update_goal_gates(ctx, goal_id: str, field: str, value
                 "error": "defer_routing_target_invalid",
                 "gate": "defer-routing-target",
                 "gate_output": _rt,
+            }, status=400), None, None
+
+    # Layer 0b: self-artifact (). Every other defer gate asks whether
+    # work is handed to a HUMAN; a defer that waits on the goal's OWN unlanded
+    # artifact (its branch, its PR, its commit) hands it to NOBODY and passes
+    # them all —  froze behind its own clean, unmerged PR. Same trigger
+    # (the FIELD) and the same single override as Layer 0. The goal record is
+    # read from the cache: lane 2 needs the goal's own notes to know that
+    # "PR #528" is its artifact, and a read failure only skips that lane.
+    if field == "defer_reason" and value not in (None, ""):
+        try:
+            from gates.defer_self_artifact import evaluate as _self_eval
+            _own = None
+            try:
+                _src = (ctx.query.get("source") or "world").lower()
+                _found = _find_goal(
+                    _jsonl_cache().get(_resolve_paths(ctx, _src)[0]), goal_id)
+                if _found is not None:
+                    _own = _found[2]["goals"][_found[1]]
+            except Exception:
+                _own = None
+            _sa = _self_eval(goal_id, value, goal_record=_own)
+        except Exception:
+            _sa = None  # fail OPEN — a gate that cannot run must not block
+        if _sa and _sa.get("refuse") and not _header_override(
+                ctx, "X-Mind-Force-Defer"):
+            return Response.json({
+                "error": "defer_self_artifact",
+                "gate": "defer-self-artifact",
+                "gate_output": _sa,
             }, status=400), None, None
 
     # Capability gate fires ONLY on NARRATIVE defer_reason writes. Structured
@@ -3174,27 +3237,31 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # grep the `value == "superseded"` guard in cmd_update_goal instead.
     # superseded transitions go through the intent-satisfaction evidence gate
     # in aspirations-complete-intent.sh — never via direct update-goal.
+    #
+    # CANDIDATE CARVE-OUT (, B1c): §2's transition table (BINDING,
+    # goal-intake-management.md) has a `candidate -> superseded` row (grooming
+    # MERGE), so the table gate is the authoritative check for candidate
+    # prev-status and this blanket refusal applies to every OTHER prev-status
+    # only. The prev read is pre-lock, but this is a REFUSAL gate whose
+    # fail-safe is the in-lock table guard (below, PR 7i in-lock section): a
+    # peer transition that this stale read would misread can only make the
+    # in-lock guard run a DIFFERENT (also table-checked) row, never an
+    # ungated write. See the in-lock guard for the authoritative form.
+    _prev_status_for_superseded_guard: Optional[str] = None
     if field == "status" and value == "superseded":
-        return Response.error(
-            400, "invalid_status_transition",
-            f"Cannot set status=superseded directly on {goal_id}. Pick the "
-            f"route that matches what is true: (1) THE WHOLE ASPIRATION's "
-            f"intent is satisfied -- aspirations-complete-intent.sh <asp-id> "
-            f"with intent_satisfaction JSON listing this goal in "
-            f"superseded_goal_ids; note its evidence gate requires every "
-            f"non-recurring goal in the aspiration to be terminal after the "
-            f"supersession, so this route is unavailable for ONE goal in a "
-            f"live aspiration. (2) THIS GOAL ALONE is moot because a sibling "
-            f"shipped its scope -- write the supersession evidence (the "
-            f"sibling's goal id + what it delivered) to outcome_note FIRST, "
-            f"then set status=skipped; that is the order and the status "
-            f"unblock-parent-status-sweep.py::_mark_skipped already uses for "
-            f"the structurally identical case. (3) The work is still WANTED "
-            f"and merely waiting on another goal -- use status=blocked, NOT "
-            f"skipped: skipped is invisible to the blocked-signal sweeps "
-            f"(precheck 0.5b.11/0.5b.12 scan status=blocked), so nothing will "
-            f"resurface it when the dependency lands (guard-1690).",
-        )
+        try:
+            _prev_items = _read_jsonl(live_path)
+            _prev_found = _find_goal(_prev_items, goal_id)
+            if _prev_found is not None:
+                _prev_status_for_superseded_guard = (
+                    _prev_found[2]["goals"][_prev_found[1]].get("status"))
+        except Exception:                       # noqa: BLE001
+            _prev_status_for_superseded_guard = None  # conservative: refuse
+        if _prev_status_for_superseded_guard != "candidate":
+            return Response.error(
+                400, "invalid_status_transition",
+                _superseded_direct_set_message(goal_id),
+            )
 
     # X-Mind-Blocker-Ref parsing for status=blocked writes. The header is
     # request-level (not goal-state), so we parse + validate it pre-lock and
@@ -3294,6 +3361,18 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             from gates.defer_routing_target import evaluate as _routing_eval2
             _rt2 = _routing_eval2(goal_id, value, world_dir=ctx.paths.world)
             for _adv in (_rt2.get("advisories") or []):
+                warnings.append(_adv)
+        except Exception:
+            pass  # advisory must never break a durable write
+
+    # Self-artifact advisory ( outcome 4): a defer naming a
+    # standing-grant action with no probe cited is asked WHY NOT NOW. Same
+    # recompute-here architecture as the routing-target advisories above; the
+    # refusal already ran in Layer 0b, so this call only ever advises.
+    if field == "defer_reason" and value not in (None, ""):
+        try:
+            from gates.defer_self_artifact import evaluate as _self_eval2
+            for _adv in (_self_eval2(goal_id, value).get("advisories") or []):
                 warnings.append(_adv)
         except Exception:
             pass  # advisory must never break a durable write
@@ -3507,6 +3586,65 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # Guards that need goal state run AFTER the goal load and BEFORE
             # any mutation. Order mirrors cmd_update_goal: cross-lane TAKEOVER
             # first, recurring-completed second, blocker-ref requirement third.
+
+            # === candidate transition table (, B1c) ===
+            # AUTHORITATIVE form of the §2 transition table (goal-intake-
+            # management.md, BINDING) for this path. MIRROR of the in-lock
+            # guard in core/scripts/aspirations.py cmd_update_goal
+            # (guard-742/2323); both call the same gates.candidate_transition
+            # module — a second CALL SITE, never a second copy of the policy.
+            #
+            # INSIDE the lock against the locked goal read: the table is
+            # keyed on the STORED prev status, and a pre-lock read would race
+            # a peer write. Fail-closed by construction: if the table cannot
+            # be evaluated, the write is refused rather than silently passing
+            # an ungated candidate (the hole  was filed to close).
+            # Invalid statuses never reach here — the candidate-state
+            # _validate_goal above already refused them.
+            #
+            # _ct_row_due defers the §5 ledger append to the commit site
+            # below: a row is written ONLY for a transition whose store write
+            # actually committed (a refusal or a failed write leaves no row).
+            # The pre-lock superseded carve-out (above) defers to this guard
+            # for the candidate row; this is the check it names.
+            _ct_row_due = None
+            if field == "status":
+                from gates.candidate_transition import (
+                    evaluate as _ct_eval, append_ledger as _ct_ledger)
+                _ct = _ct_eval(goal.get("status"), value)
+                if not _ct["allowed"]:
+                    return Response.error(
+                        400, "candidate_transition_forbidden", _ct["message"])
+                if _ct["ledger"]:
+                    _eff_note = (companion_note if companion_note is not None
+                                 else goal.get("outcome_note"))
+                    _ct_row_due = {
+                        "verdict": _ct["verdict"],
+                        "new_status": value,
+                        "agent": agent or "unknown",
+                        "evidence": {"outcome_note": _eff_note},
+                        "ledger": _ct_ledger,
+                    }
+
+            # AUTHORITATIVE superseded direct-set recheck (, B1c).
+            # The pre-lock form above is a fail-fast copy keyed on a PRE-LOCK
+            # prev-status read; a peer write landing between that read and
+            # this lock (e.g. a grooming promote: candidate -> pending) would
+            # otherwise let a pending -> superseded write pass BOTH checks,
+            # because the table gate only applies to candidate prev-status.
+            # The original blanket guard was state-independent and therefore
+            # race-free — this recheck restores that property against the
+            # LOCKED read, scoped to the candidate carve-out: candidate prev
+            # is owned by the table gate above (the §2 merge row), every
+            # other prev-status keeps the blanket refusal. The message text
+            # is shared with the pre-lock form via
+            # _superseded_direct_set_message (one copy, not two).
+            if (field == "status" and value == "superseded"
+                    and goal.get("status") != "candidate"):
+                return Response.error(
+                    400, "invalid_status_transition",
+                    _superseded_direct_set_message(goal_id),
+                )
 
             # Cross-lane / cross-BODY TAKEOVER guard (). MIRROR of
             # cmd_update_goal in core/scripts/aspirations.py (the guard sitting
@@ -4305,6 +4443,20 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             changelog.append(base_dir, agent, live_path, "edit",
                              summary=_write_summary,
                              lines_changed=len(items))
+            # §5 ledger (): append the candidate-transition row ONLY
+            # after the store write committed — a refusal or a failed write
+            # leaves no row. Fail-open: append_ledger logs the error to
+            # stderr, never raises (the audit row is best-effort; the
+            # transition itself is done). Mirror of the CLI commit-site append
+            # in cmd_update_goal (guard-742/2323).
+            if _ct_row_due is not None:
+                _ct_row_due["ledger"](
+                    base_dir, goal_id=goal_id,
+                    new_status=_ct_row_due["new_status"],
+                    agent=_ct_row_due["agent"],
+                    verdict=_ct_row_due["verdict"],
+                    evidence=_ct_row_due["evidence"],
+                )
             # Record the post-write goal count as the NEXT call's expectation
             # (). AFTER the store write, never before: a crash
             # between the two leaves the expectation stale-LOW, which reads as

@@ -134,10 +134,15 @@ def _run_terminal(max_rc, outcome, deadman_disabled,
 
 # ── B. CLEAN PATH: the four literals, byte-identical ────────────────────────
 
+# : the reducer _dm_pair now names the harness-required ScheduleWakeup
+# fields (noop, reason) — an arm that omits noop is REFUSED on Claude Code 2.1.280,
+# leaving NO net. This golden literal tracks recurring-close.sh:1329 byte-for-byte.
 CLEAN_DEADMAN_PAIR = (
     "emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) "
-    "— (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600), "
-    "the self-resurrection net, do NOT omit it; THEN (2) Skill(aspirations) with "
+    "— (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600, "
+    "noop=false, reason='deadman resurrection net'), the self-resurrection net "
+    "(noop and reason REQUIRED unless stop:true or the harness refuses the arm and "
+    "NO net is set — g-115-10755), do NOT omit it; THEN (2) Skill(aspirations) with "
     "args='loop' (the LAST call). Skill ALONE keeps THIS iteration alive but leaves "
     "the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
 )

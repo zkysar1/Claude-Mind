@@ -551,3 +551,26 @@ def test_the_forgery_guarantee_is_scoped_where_it_is_claimed():
     body = conv.read_text(encoding="utf-8").lower()
     assert "sub-agent" in body, "perception-module.md 9.3 does not list sub-agent writes"
     assert "plain text" in body and "forge" in body, "perception-module.md 9.3 leaves the guarantee unscoped"
+
+
+def test_the_envelope_join_key_is_parsed_when_present():
+    """: a reaction line may cite the envelope it answers."""
+    [d] = pr.find_decisions(
+        "perception-reaction: unit=door envelope=env-1a2b3c4d5e6f changed=opened "
+        "decision=fold reason=the door is the goal in hand")
+    assert d["envelope"] == "env-1a2b3c4d5e6f"
+    assert (d["unit"], d["changed"], d["decision"]) == ("door", "opened", "fold")
+
+
+def test_a_legacy_line_without_an_envelope_still_counts():
+    """guard-3274: the field is accepted, never required."""
+    [d] = pr.find_decisions(
+        "perception-reaction: unit=door changed=opened decision=ignore reason=not mine")
+    assert d["envelope"] == "" and d["decision"] == "ignore"
+
+
+def test_an_envelope_mentioned_in_the_reason_is_not_the_join_key():
+    [d] = pr.find_decisions(
+        "perception-reaction: unit=door changed=none decision=ignore "
+        "reason=same as envelope=env-000000000000 before")
+    assert d["envelope"] == ""

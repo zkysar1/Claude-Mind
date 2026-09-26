@@ -6759,7 +6759,8 @@ def emit_drain_lane_banner(picked, eligible_count, since, k):
 def _strategic_focus_claimable(s, agent_name):
     """Rows this agent may claim with no lane ceremony, which the directive
     floor may spend its one slot on. The ONE predicate behind the floor,
-    emit_strategic_focus_banner and the drain banner's routed-away clause.
+    emit_strategic_focus_banner, the drain banner's routed-away clause and the
+    reducer-only floor's nominee filter (g-115-10686).
 
     The lane test is routes_away_from, the claim path's own test, not a
     vocabulary tuple (g-115-10593). The tuple `(None, "", "either", agent_name)`
@@ -6967,7 +6968,8 @@ def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False,
     docstring, not the test (g-306-484).
     """
     status = {"role": None, "branch": None, "live_workers": 0, "detail": {},
-              "reducer_only_rows": 0, "picked": None, "yielded": False}
+              "reducer_only_rows": 0, "reducer_only_rows_unclaimable": 0,
+              "unclaimable": [], "picked": None, "yielded": False}
 
     try:
         body_role, sid, running_sid = _reducer_policy_inputs(agent_dir)
@@ -7022,11 +7024,32 @@ def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False,
         # mechanism ahead of its data is the same shape as the close-review gate
         # (), and it is strictly better than making a tested architectural
         # fence go green by deleting it (guard-4618).
-        nominees = [r for r in scored
-                    if reducer_selection_policy.is_reducer_only_row(r)]
-        status["reducer_only_rows"] = len(nominees)
+        reducer_only = [r for r in scored
+                        if reducer_selection_policy.is_reducer_only_row(r)]
+        status["reducer_only_rows"] = len(reducer_only)
+        # CLAIMABLE ROWS ONLY (). The count above spans the whole pool,
+        # and a routed-away row can be IN it -- the idle-owner and cadence rescue
+        # doors in collect_candidates let one through. The claim can then be
+        # refused, and release returns the row to pending, so an unfiltered floor
+        # hoisted the SAME refused row every iteration. Measured 2026-09-23 (zeta,
+        # cc-02): , intended_agent=alpha, claim -> takeover_refused ->
+        # release, while alpha alone held the >= threshold live Bodies. Same
+        # predicate as the strategic-focus floor, and so the same rule for
+        # rescues: they compete on score, never through a floor. The name is
+        # resolved from agent_dir the way AGENT_NAME is; the excluded rows are
+        # recorded on EVERY call, zero included (guard-3211), so the diary row
+        # shows the filter working.
+        agent_name = agent_dir.name if agent_dir else ""
+        nominees, skipped = [], []
+        for r in reducer_only:
+            (nominees if _strategic_focus_claimable(r, agent_name)
+             else skipped).append(r)
+        status["reducer_only_rows_unclaimable"] = len(skipped)
+        status["unclaimable"] = [
+            {"goal_id": r.get("goal_id"), "intended_agent": r.get("intended_agent")}
+            for r in skipped[:10]]
         if not nominees:
-            return None, status  # nothing reducer-only in the pool -- the inert case
+            return None, status  # nothing reducer-only and claimable -- the inert case
         if prior_hoist_fired:
             status["yielded"] = True
             return None, status
@@ -7059,7 +7082,8 @@ def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False,
                 "content": (f"reducer_selection_policy: {status['branch']} "
                             f"({status.get('reason')}) "
                             f"picked={status['picked']} "
-                            f"yielded={status['yielded']}"),
+                            f"yielded={status['yielded']} "
+                            f"unclaimable={status['reducer_only_rows_unclaimable']}"),
                 "reducer_selection_policy": {
                     "branch": status["branch"],
                     "live_workers": status["live_workers"],
@@ -7067,6 +7091,9 @@ def apply_reducer_only_floor(scored, agent_dir, prior_hoist_fired=False,
                     "stale_rows_ignored": status["detail"].get("stale"),
                     "undated_rows_ignored": status["detail"].get("undated"),
                     "reducer_only_rows": status["reducer_only_rows"],
+                    "reducer_only_rows_unclaimable":
+                        status["reducer_only_rows_unclaimable"],
+                    "unclaimable": status["unclaimable"],
                     "picked": status["picked"],
                     "yielded": status["yielded"],
                 },
@@ -7085,11 +7112,13 @@ def emit_reducer_only_floor_banner(picked, status):
         "[goal-selector] REDUCER-ONLY FLOOR: promoted {gid} to top — {n} live "
         "worker Bod(ies) >= threshold {t}, so the reducer steps back from "
         "ordinary goals and takes reducer-only work while the workers keep the "
-        "rest claimable. {r} reducer-only row(s) were in the pool. Scores are "
+        "rest claimable. {r} reducer-only row(s) were in the pool, {u} of them "
+        "routed to another agent and skipped. Scores are "
         "UNCHANGED; only ordering moved, for this one slot. This IS the "
         "sanctioned top pick — claim it without a deviation code.".format(
             gid=picked.get("goal_id"), n=status.get("live_workers", 0),
-            t=status.get("threshold", "?"), r=status.get("reducer_only_rows", 0)),
+            t=status.get("threshold", "?"), r=status.get("reducer_only_rows", 0),
+            u=status.get("reducer_only_rows_unclaimable", 0)),
         file=sys.stderr,
     )
 

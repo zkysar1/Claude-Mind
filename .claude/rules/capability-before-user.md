@@ -143,10 +143,9 @@ resolve the underlying issue.
 
 ## Sibling Rule: Probe Before Defer
 
-`participants: [user]` is not the only way an agent routes work to the user.
-Writing `defer_reason: "blocked on user-initiated X"` on a goal has the same
-effect — the goal freezes, work doesn't happen, the user is implicitly on the
-hook — but without going through `capability-gate.py`. See
-`.claude/rules/probe-before-defer.md` for the defer-time chokepoint, enforced
-by `capability-gate.py` invoked from `core/scripts/aspirations.py cmd_update_goal`
-when `field == defer_reason` and value is non-null.
+`defer_reason: "blocked on user-initiated X"` freezes a goal exactly as
+`participants: [user]` does; `.claude/rules/probe-before-defer.md` is its
+chokepoint (`capability-gate.py` on the `defer_reason` field write).
+A FIFTH surface routes work to NOBODY: a defer waiting on the goal's OWN
+unlanded artifact passes every human-routing gate (g-373-12 froze behind its
+own open PR). `gates/defer_self_artifact.py` refuses it at that same write.

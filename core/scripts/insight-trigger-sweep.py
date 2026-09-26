@@ -164,6 +164,16 @@ AUDIT_WINDOW_HOURS = 168.0
 # dependency-timeout-check, whose durable half is likewise a board post.
 OOW_TAG_PREFIX = "insight-trigger-out-of-window:"
 
+#  dedup key for the AUTHOR notice — a SEPARATE post from the digest's
+# OOW note, so it needs its own once-only key (guard-2177: an ADDRESSED post
+# re-fired every cadence trains the author to filter it). The digest path already
+# inherits once-only from oow_routed_ids, but the audit-stale path has NO dedup of
+# its own — its status note re-encounters a terminal-goal trigger and re-posts
+# every run — so its author notice would re-fire without this. Each notice carries
+# one `author-notice:<msg_id>` tag per covered trigger; load_author_noticed_ids()
+# harvests them (from ANY age, like routed_ids) to suppress a re-post.
+AUTHOR_NOTICE_TAG_PREFIX = "author-notice:"
+
 SEVERITY_PRIORITY = {
     "invalidates": "HIGH",
     "constrains": "MEDIUM",
@@ -174,6 +184,9 @@ SEVERITY_PRIORITY = {
 REQ_ACTION_RE = re.compile(r"^requires_action_by:(.+)$")
 ACTION_TYPE_RE = re.compile(r"^action_type:(.+)$")
 SEVERITY_RE = re.compile(r"^severity:(.+)$")
+# The action_type an out-of-window digest carries. load_out_of_window_triggers
+# skips it so a digest is never digested again ().
+DIGEST_ACTION = "triage-aged-triggers"
 AFFECTS_RE = re.compile(r"^affects:(g-\d+-\d+)$")
 
 #  (MODE 2). A board post carrying `requires_action_by:` but NO
@@ -522,12 +535,36 @@ def load_out_of_window_triggers():
             rec = _parse_trigger_msg(msg, channel, now, ts)
             if rec is None:
                 continue
+            # A digest this sweep posted is itself both-tagged, so once it ages
+            # out it would be digested again, and that digest would age out in
+            # turn: a chain with no end (; 30 of 142 live out-of-window
+            # triggers were digests on 2026-09-25). A digest only reports aged
+            # triggers, so it is never an aged trigger itself.
+            if rec["action"] == DIGEST_ACTION:
+                continue
             if ts < audit_cutoff:
                 truncated += 1
                 continue
             out.append(rec)
     out.sort(key=lambda r: r["age_h"])
     return out, routed_ids, truncated
+
+
+def load_author_noticed_ids():
+    """msg_ids that already have an author notice on the board ().
+
+    Harvested from ANY age across every channel, exactly like the out-of-window
+    routed_ids: a notice posted days ago must still suppress a re-post today. The
+    audit-stale emitter re-encounters a terminal-goal trigger every cadence, so
+    without this its author notice would re-fire every run (guard-2177); this set
+    makes it once-only, matching the digest path's oow_routed_ids guarantee."""
+    ids = set()
+    for channel_path in board_channels():
+        for msg in _channel_records(channel_path.stem):
+            for tag in (msg.get("tags") or []):
+                if tag.startswith(AUTHOR_NOTICE_TAG_PREFIX):
+                    ids.add(tag[len(AUTHOR_NOTICE_TAG_PREFIX):])
+    return ids
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +842,99 @@ def inherit_priority(own, target):
     return own if _PRIORITY_RANK[own] >= _PRIORITY_RANK[target] else target
 
 
-def _emit_audit_stale_note(trigger, target_status):
+def _emit_author_notice(author, rows, situation, already_noticed=frozenset()):
+    """Notify the ORIGINAL AUTHOR of aged/skipped insight_trigger(s) ().
+
+    The out-of-window digest and the audit-stale note reach the NAMED AGENT. If
+    that address was WRONG, the escalation is wrong in exactly the same way and
+    nobody notices -- a post addressing zeta but tagged for foxtrot sat 6.5h
+    with foxtrot (rightly) ignoring someone else's work and zeta never told. The
+    author is the one party who can recognise a misroute on sight, so notify
+    them IN ADDITION to the named agent. This is the observability half only; it
+    does not re-route the work or touch multi-body addressing.
+
+    NON-CONVERTING BY CONSTRUCTION (guard-2019): the note carries
+    requires_action_by:<author> but deliberately NO action_type: and no
+    correction-intent tag, so the shared _parse_trigger_msg returns None for it
+    (the requires_action_by-without-action_type branch, ~:439). It is therefore
+    addressed to the author (surfaced in their board 'for me' scan) yet files
+    ZERO goals; and because BOTH the conversion scan and the audit scan use that
+    one parse, it is never itself converted and never re-digested. Pinned by
+    test_insight_trigger_sweep_author_notice.py.
+
+    Does NOT weaken the OOW dedup (guard-3944): this is a SEPARATE post carrying
+    no OOW_TAG_PREFIX tag, so oow_routed_ids is unchanged and the named-agent
+    digest's once-only property is untouched -- the address is the variable being
+    fixed, not the dedup. ONCE-ONLY on its OWN key (outcome 4): each notice tags
+    every covered trigger `author-notice:<msg_id>`, and `already_noticed` (the
+    load_author_noticed_ids harvest) drops rows already noticed on a prior cadence
+    and skips the post entirely when none remain. This is what makes the
+    AUDIT-STALE caller once-only -- its status note re-encounters a terminal-goal
+    trigger and re-posts every cadence, so without the key its author notice would
+    re-fire. The digest caller is additionally gated upstream by oow_routed_ids.
+
+    Addressing mirrors the digest's req_target (932-933): an already-qualified
+    author keeps its own env; a bare LOCAL author is qualified with this env; env
+    unresolvable -> bare fallback (never <author>@None, which rule 1 would refuse
+    as unknown_env). Normalised through split_author so a qualified author is
+    never double-qualified.
+
+    Fail-open like its two sibling emitters -- a post failure is logged to BOTH
+    stderr and the returned dict (guard-772) and never aborts the sweep.
+    """
+    import subprocess
+    a_bare, a_env = split_author(author)
+    if a_env:
+        req_author = f"{a_bare}@{a_env}"
+    else:
+        _env = _self_env()
+        req_author = f"{a_bare}@{_env}" if _env else a_bare
+    #  once-only (guard-2177 / outcome 4): drop triggers already
+    # noticed on a prior cadence, then skip the post entirely if none remain.
+    rows = [r for r in rows if r.get("msg_id") not in already_noticed]
+    if not rows:
+        return {"posted": False, "skipped": "already-noticed",
+                "author": req_author, "count": 0}
+    lines = [
+        f"{a_bare}, {len(rows)} insight_trigger(s) you authored {situation}. They "
+        f"were addressed to the named agent, not to you -- so if that address was "
+        f"wrong, you are the one who can see it. Re-file corrected, or disregard. "
+        f"This note is informational and files no goal.",
+        "",
+    ]
+    for r in sorted(rows, key=lambda x: x.get("msg_id") or ""):
+        lines.append(
+            f"  {r.get('msg_id', '?')}  addressed to {r.get('target', '?')}  "
+            f"action={r.get('action', '?')}  on #{r.get('channel', '?')}"
+        )
+    text = "\n".join(lines)
+    tags = ",".join(
+        ["insight-trigger-author-notice", f"requires_action_by:{req_author}"]
+        + [f"{AUTHOR_NOTICE_TAG_PREFIX}{r.get('msg_id')}" for r in rows]
+    )
+    try:
+        # sys.executable + board.py, never `bash` -- rb-225/rb-247/guard-580.
+        proc = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "core" / "scripts" / "board.py"),
+             "post", "--channel", "coordination", "--type", "status", "--tags", tags],
+            input=text, capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode != 0:
+            _err = (proc.stderr or "").strip() or f"rc={proc.returncode}, no stderr"
+            print(f"[insight-trigger-sweep] WARN: author notice for {req_author} "
+                  f"failed (rc={proc.returncode}): {_err}", file=sys.stderr)
+            return {"posted": False, "msg_id": None, "author": req_author,
+                    "count": len(rows), "error": _err}
+        return {"posted": True, "msg_id": proc.stdout.strip(),
+                "author": req_author, "count": len(rows)}
+    except Exception as e:
+        print(f"[insight-trigger-sweep] WARN: author notice for {req_author} failed: {e}",
+              file=sys.stderr)
+        return {"posted": False, "msg_id": None, "author": req_author,
+                "count": len(rows), "error": str(e)}
+
+
+def _emit_audit_stale_note(trigger, target_status, already_noticed=frozenset()):
     """Post a coordination-board status note for a skipped Apply.
 
     One short post per audit-stale finding. The text matches the
@@ -856,14 +985,25 @@ def _emit_audit_stale_note(trigger, target_status):
             # subprocess, so the reason must also ride the returned dict.
             print(f"[insight-trigger-sweep] WARN: audit-stale board-post failed "
                   f"(rc={proc.returncode}): {_err}", file=sys.stderr)
-            return {"posted": False, "msg_id": None, "error": _err}
-        return {"posted": True, "msg_id": proc.stdout.strip()}
+            result = {"posted": False, "msg_id": None, "error": _err}
+        else:
+            result = {"posted": True, "msg_id": proc.stdout.strip()}
     except Exception as e:
         print(f"[insight-trigger-sweep] WARN: audit-stale board-post failed: {e}", file=sys.stderr)
-        return {"posted": False, "msg_id": None, "error": str(e)}
+        result = {"posted": False, "msg_id": None, "error": str(e)}
+    # : notify the ORIGINAL AUTHOR too (guard-6670 covers BOTH
+    # emitters). Independent of the audit-stale post's own success -- the author
+    # deserves the notice whether or not the named-agent note landed.
+    result["author_notice"] = _emit_author_notice(
+        trigger["author"], [trigger],
+        f"targeted {trigger['affects_goal']} which is already {target_status}; "
+        "the Apply was skipped",
+        already_noticed=already_noticed,
+    )
+    return result
 
 
-def _emit_out_of_window_digest(target, triggers):
+def _emit_out_of_window_digest(target, triggers, already_noticed=frozenset()):
     """Route a target agent's aged-out triggers as ONE digest ( outcome 3).
 
     Outcome 3 asks that an aged-out unconverted trigger reach its target agent
@@ -960,7 +1100,7 @@ def _emit_out_of_window_digest(target, triggers):
     text = "\n".join(lines)
     tags = ",".join(
         ["insight-trigger-out-of-window", f"requires_action_by:{req_target}",
-         "action_type:triage-aged-triggers"]
+         f"action_type:{DIGEST_ACTION}"]
         + [f"{OOW_TAG_PREFIX}{t['msg_id']}" for t in triggers]
     )
     try:
@@ -977,15 +1117,34 @@ def _emit_out_of_window_digest(target, triggers):
             _err = (proc.stderr or "").strip() or f"rc={proc.returncode}, no stderr"
             print(f"[insight-trigger-sweep] WARN: out-of-window digest for {target} "
                   f"failed (rc={proc.returncode}): {_err}", file=sys.stderr)
-            return {"posted": False, "msg_id": None,
-                    "count": len(triggers), "error": _err}
-        return {"posted": True,
-                "msg_id": proc.stdout.strip(),
-                "count": len(triggers)}
+            result = {"posted": False, "msg_id": None,
+                      "count": len(triggers), "error": _err}
+        else:
+            result = {"posted": True,
+                      "msg_id": proc.stdout.strip(),
+                      "count": len(triggers)}
     except Exception as e:
         print(f"[insight-trigger-sweep] WARN: out-of-window digest for {target} failed: {e}",
               file=sys.stderr)
-        return {"posted": False, "msg_id": None, "count": len(triggers), "error": str(e)}
+        result = {"posted": False, "msg_id": None, "count": len(triggers), "error": str(e)}
+    # : notify each distinct ORIGINAL AUTHOR that their trigger(s)
+    # aged out, IN ADDITION to the named agent above (guard-6670 covers BOTH
+    # emitters). Grouped by author so one author with several aged triggers gets
+    # ONE notice, not one per trigger. Once-only rides the digest's own dedup:
+    # main() gates each trigger by oow_routed_ids, so a trigger reaches here
+    # exactly once. Does NOT touch req_target or the OOW tags above (guard-3944).
+    by_author = {}
+    for t in triggers:
+        by_author.setdefault(t["author"], []).append(t)
+    result["author_notices"] = [
+        _emit_author_notice(
+            a, arows,
+            f"aged out of the {WINDOW_HOURS:g}h conversion window with no "
+            "converting goal in any queue",
+            already_noticed=already_noticed)
+        for a, arows in sorted(by_author.items())
+    ]
+    return result
 
 
 
@@ -1244,6 +1403,10 @@ def main():
     # it is reported as a count + sample, never as an error.
     untyped_dropped = []
     raw_triggers = load_triggers(dropped=untyped_dropped)
+    # : harvest existing author notices ONCE so both emitters suppress
+    # a re-notify for the same message (outcome 4). Read-only; only the live run
+    # emits, so a dry run skips the scan.
+    author_noticed_ids = load_author_noticed_ids() if not dry_run else frozenset()
     # : addressing resolution BEFORE dedup/filing — a refused target
     # must never reach the filing loop, and refusal-first beats dedup (the
     # safety verdict outranks the bookkeeping one).
@@ -1326,7 +1489,8 @@ def main():
                 if target_status in TERMINAL_GOAL_STATES:
                     note_result = {"posted": False, "msg_id": None}
                     if not dry_run:
-                        note_result = _emit_audit_stale_note(t, target_status)
+                        note_result = _emit_audit_stale_note(
+                            t, target_status, already_noticed=author_noticed_ids)
                     audit_stale.append({
                         "msg_id": t["msg_id"],
                         "author": t["author"],
@@ -1467,7 +1631,7 @@ def main():
         if dry_run:
             res = {"posted": False, "msg_id": None, "count": len(batch), "reason": "dry_run"}
         else:
-            res = _emit_out_of_window_digest(target, batch)
+            res = _emit_out_of_window_digest(target, batch, already_noticed=author_noticed_ids)
         oow_digests.append({
             "target": target,
             "count": len(batch),

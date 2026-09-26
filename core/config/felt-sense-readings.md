@@ -2261,3 +2261,18 @@ guard-7075, which had fired correctly and was honored this iteration.
 **Phase 1** cleared knowledge_debt 4 of 4: 2 were already paid, 1 was paid now, and 2 were routed to g-115-9567 and the new g-115-10781.
 
 **Lane 7**: a transcript audit (guard-6730 method) found **1 real re-arm-first miss in 22 compactions**, while the in-context narrative claimed about 13. The inflation came from summaries each carrying the previous count forward plus one. Not material.
+
+## echo — 2026-09-24T23:51 (gate: current 15206, last 15126, diff 80; tick stamped 15208; hostname cc-03, uname -r 6.8.0-139-generic, own-cloud, reducer)
+
+**Phase 2**, both queries with `--full` at about 23:45:
+- in-progress: **5 candidates, 0 mutated, 0 skipped (foreign sid), 0 skipped (absent sid), 5 skipped (partner)**. Fields: claimed_by 5/5, claimed_by_sid 5/5, name-less-sid 0. Every claimant is alpha (5 distinct sids). outcome_note is non-empty on 3 of 5.
+- pending+agent: **3274 candidates, 0 mutated by the gate tally, 0 skipped (foreign sid), 0 skipped (absent sid), 2 skipped (partner, alpha)**. Fields: claimed_by 2/3274, claimed_by_sid 2/3274, name-less-sid 0; the counts reconcile.
+- Of the 3272 null-claim rows, 22 non-recurring ones carry `executed_by`/`completed_by` echo. None of the 22 is done out of cycle: each note names a remaining outcome or says NOT DONE.
+- **One out-of-cycle close, found through the handoff carry rather than the executed_by filter.** g-115-10772 is the auto-filed Directive for the owner's 2026-09-24 approval. It was acted on that morning (asp-376, grant-020, msg-20260924-024819-echo-5126), but the goal itself was never closed. It was closed via `aspirations-complete-by.sh` at 23:46:57, after a live status re-probe and an empty changelog check.
+- The executed_by filter could NOT have found it: executed_by, claimed_by, started and last_modified were all null for its whole life.
+
+**Phase 3**: 16 blocked, 0 mutated. The tally reads 0/0/0 because none is claimed; 6 are routed to foxtrot, so gate 5 applies. 14 rest on `blocked_by` edges to live, non-terminal dependencies (pending or blocked). 2 carry a `precondition_unmet:` premise defer. `blocker_ref` is absent on all 16. On the rule axis, no grant retires any of the stated reasons.
+
+**Phase 5a**: +1 check in the 4T section, pinning the fresh-eyes Phase 2.2b `completed_at` counting fix. The grep was run live first, and the registry `verify` fixed point is OK (2,302 checks). **Phase 5b**: 148 skills / 3912 assertions / 5 parse-lines, **0 stale**. **Phase 1b**: insights backlog 0.
+
+**Lane 7: the re-arm-first miss I was about to report did not happen.** My own continuation summary (written at the 23:44 compaction) said the 23:27 resume "re-armed second, after a Bash summary". The transcript says ScheduleWakeup was the first post-boundary tool_use (23:27:13, wakeup set for 23:38:00). Over all 389 compaction resumes in session 9b6bbe9c since 2026-09-14, **25 (6.4%)** had a first post-boundary tool other than ScheduleWakeup. Today that was 1 of 46 (04:39:18), and the last 9 were all clean. This is guard-6730's pattern from a third agent: a summary produced a self-critical count that the transcript does not support.

@@ -33,6 +33,7 @@ every tmp-repo invocation in this file is structurally incapable of writing.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -398,16 +399,44 @@ def test_retire_fails_closed_when_ref_agent_absent_from_team_state(repo, tmp_pat
     assert "sid-aaaa" in _git(work, "ls-remote", "origin", "refs/workers/*")
 
 
-def test_retire_fails_closed_when_in_flight_bodies_key_gone_fleet_wide(repo, tmp_path):
-    """The in_flight_bodies key renamed: every agent row exists, none carries the
-    key. Indistinguishable from a fleet with zero live bodies, so this refuses in
-    BOTH cases — the safe direction, with --force-retire-live as the escape."""
+def test_retire_proceeds_when_no_agent_has_a_body_forked(repo, tmp_path):
+    """: every agent row exists and none carries in_flight_bodies. That
+    is the composer's DESIGNED state for a fleet with no worker Body forked
+    (make_clear_body_row_modifier pops the emptied key), so the retire proceeds.
+    This used to refuse as "renamed, or fleet fully idle", which made the
+    sanctioned retire unreachable on a reducer-only fleet (measured 2026-09-18
+    and again 2026-09-20). The rename branch is pinned where it is observable:
+    test_body_row_key_is_one_name_across_writer_reader_and_clear."""
     work = _merge_and_push_a(repo)
     r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
                  env={"WORKER_REF_TEAM_STATE_READER": _stub_reader(
                      tmp_path, "null", status_payload='{"alpha": {}, "bravo": {}}')})
-    assert r.returncode == 1, "fleet-wide missing key must REFUSE"
-    assert "sid-aaaa" in _git(work, "ls-remote", "origin", "refs/workers/*")
+    assert r.returncode == 0, (r.stderr + r.stdout)
+    assert "DRIFTED" not in r.stderr
+    assert "sid-aaaa" not in _git(work, "ls-remote", "origin", "refs/workers/*")
+
+
+def test_body_row_key_is_one_name_across_writer_reader_and_clear():
+    """The rename pin that lets the retire gate trust a fleet-wide ABSENT key.
+
+    Absence cannot distinguish "no Body forked" from "the key was renamed"
+    (guard-3951), but the SOURCES can: a rename leaves the writer, this reader
+    and the clear op naming different keys. The file set is explicit, not a
+    glob (guard-5971): the body-row WRITER (team-state-in-flight.sh), both
+    worker-ref-consume.sh READ sites, and the CLEAR op in _team_state.py. Each
+    extraction must match at least once, or the pin is vacuous."""
+    root = Path(__file__).resolve().parents[1]
+    writer = re.findall(r'agent_status\.\$\{AGENT\}\.([A-Za-z_]+)\.\$\{MIND_SID\}',
+                        (root / "team-state-in-flight.sh").read_text(encoding="utf-8"))
+    readers = re.findall(r'agent_status\.\$\{ref_agent\}\.([A-Za-z_]+)\.\$\{ref_sid\}',
+                         (root / "worker-ref-consume.sh").read_text(encoding="utf-8"))
+    ts = (root / "_team_state.py").read_text(encoding="utf-8")
+    clear_src = ts[ts.index("def make_clear_body_row_modifier"):]
+    clear_src = clear_src[:clear_src.index("\ndef ", 1)]
+    clears = re.findall(r'row\.(?:get|pop)\("([A-Za-z_]+)"\)', clear_src)
+    assert writer and len(readers) >= 2 and clears, (writer, readers, clears)
+    assert set(writer) | set(readers) | set(clears) == {"in_flight_bodies"}, (
+        writer, readers, clears)
 
 
 def test_retire_proceeds_for_an_agent_that_simply_has_no_live_bodies(repo, tmp_path):

@@ -106,7 +106,20 @@ TELEMETRY_FILENAME = "capture-fast-lane.jsonl"
 # see the second time (guard-2552 — when adding a new WM slot, do not stop at
 # making the write work; audit the cleanup predicates).
 CONSUMED_HASHES_SLOT = "capture_consumed_hashes"
+#  — the ring is bounded by WHAT IS STILL OFFERED, not by a count.
+# It was a 2000-hash FIFO, sized as "~12x" the live slot, while the Bodies'
+# carriers re-offer every flagged entry they ever captured and never retire one:
+# measured 2026-09-25 (alpha reducer, cc-07) 3,655 offered spark hashes against a
+# full 2000-hash ring. Every hash the FIFO evicted was re-offered, and a DRAINED
+# entry came back at the next close (13 of 13, 17 of 54, 15 of 15 measured on
+# 2026-09-24). A hash a source still offers is now never evicted below the
+# ceiling; CAP bounds only the hashes NO readable source offers any more, which
+# can never be re-delivered and are kept purely as insurance.
 CONSUMED_HASHES_CAP = 2000
+# Hard bound on one lane's whole ring, offered or not. Reaching it means the
+# offered population outgrew it and re-delivery resumes; the pass reports it as
+# `overflow` in `consumed_ring` rather than evicting silently.
+CONSUMED_HASHES_CEILING = 20000
 
 
 def _now() -> datetime:
@@ -183,6 +196,26 @@ def _lane_total(entries) -> int:
     cannot measure (the same reasoning `_age_minutes` gives for returning None).
     """
     return len(entries) if isinstance(entries, list) else 0
+
+
+def _bound_consumed(ring: list, offered) -> tuple:
+    """Bound one lane's consumed ring; returns (ring, trimmed, overflow).
+
+    `offered` is the set of hashes some source offered THIS pass, or None when a
+    source was unreadable. With None nothing below the ceiling is evicted: an
+    unread carrier's hashes would otherwise look un-offered and be trimmed, and
+    that carrier would re-deliver them on the next pass.
+    """
+    kept = list(ring)
+    trimmed = 0
+    if offered is not None:
+        spare = [h for h in kept if h not in offered]
+        if len(spare) > CONSUMED_HASHES_CAP:
+            drop = set(spare[:len(spare) - CONSUMED_HASHES_CAP])
+            kept = [h for h in kept if h not in drop]
+            trimmed = len(drop)
+    overflow = max(0, len(kept) - CONSUMED_HASHES_CEILING)
+    return kept[overflow:], trimmed, overflow
 
 
 def _age_minutes(entry, now: datetime):
@@ -290,6 +323,8 @@ def fast_lane(agent: str, project_root: Path | None = None,
     latencies: list = []
     changed = False
     seen_bodies: set = set()
+    offered: dict = {}       # {slot: hashes of every flagged entry offered this pass}
+    unreadable = 0           # sources whose flagged entries this pass could not see
 
     def _merge_flagged(slot_pairs) -> int:
         """Merge one Body's flagged entries; returns how many were NEW.
@@ -330,6 +365,8 @@ def fast_lane(agent: str, project_root: Path | None = None,
             if not flagged:
                 continue
             summary["flagged_seen"] += len(flagged)
+            offered.setdefault(slot_name, set()).update(
+                bmg._content_hash(e) for e in flagged)
             existing = slots.get(slot_name)
             if not isinstance(existing, list):
                 existing = []
@@ -354,13 +391,12 @@ def fast_lane(agent: str, project_root: Path | None = None,
             merged_list = bmg._dedup_append(existing, flagged, extra_seen=prior)
             added = len(merged_list) - before
             if added:
-                # Bounded: keep the most recent CONSUMED_HASHES_CAP hashes per
-                # slot. The bound must exceed the largest plausible re-offer —
-                # 162 entries measured 2026-08-15 (guard-3897) — because eviction
-                # here is oldest-first and an evicted hash re-opens this bug for
-                # that entry. 2000 is ~12x the observed worst case.
+                # Unbounded HERE on purpose: the bound is applied once, after
+                # both passes, when the whole offered set is known ().
+                # The old per-merge `[-CONSUMED_HASHES_CAP:]` could evict a hash
+                # mid-pass that a LATER Body in the same pass then re-offered.
                 fresh = [bmg._content_hash(e) for e in merged_list[before:]]
-                wm_all[slot_name] = (prior + fresh)[-CONSUMED_HASHES_CAP:]
+                wm_all[slot_name] = prior + fresh
                 slots[CONSUMED_HASHES_SLOT] = wm_all
             if added:
                 slots[slot_name] = merged_list
@@ -386,13 +422,18 @@ def fast_lane(agent: str, project_root: Path | None = None,
         seen_bodies.add(unit_key)
         body_wm_bytes, transient = bmg._read_staged_bytes(
             backend, sessions_root / unit_key / bm._WM_FILENAME)
-        if transient or body_wm_bytes is None:
+        if transient:
+            unreadable += 1
+            continue
+        if body_wm_bytes is None:
             continue
         try:
             body_wm = yaml.safe_load(body_wm_bytes) or {}
         except yaml.YAMLError:
+            unreadable += 1
             continue
         if not isinstance(body_wm, dict):
+            unreadable += 1
             continue
         body_slots = body_wm.get("slots")
         if not isinstance(body_slots, dict):
@@ -420,7 +461,10 @@ def fast_lane(agent: str, project_root: Path | None = None,
     # content-hash pass is a no-op there rather than a competing source. The
     # ordering is an optimisation, not a correctness requirement — dedup is by
     # content hash, so either order converges to the same set.
-    for unit_key, by_slot in sorted(bcc.read_carriers(state_dir, backend).items()):
+    carrier_skips: list = []
+    carriers = bcc.read_carriers(state_dir, backend, skipped=carrier_skips)
+    unreadable += len(carrier_skips)
+    for unit_key, by_slot in sorted(carriers.items()):
         if unit_key not in seen_bodies:
             summary["bodies_scanned"] += 1
             seen_bodies.add(unit_key)
@@ -452,6 +496,49 @@ def fast_lane(agent: str, project_root: Path | None = None,
         else:
             row["added"] += contributed
             row["via"] = "sessions+carrier"
+
+    #  — RECONCILE THE CONSUMED RINGS WITH WHAT IS STILL OFFERED.
+    # Two moves per lane, both needing the whole pass's offered set:
+    #  1. Record every LIVE entry a source offers. The ring used to learn only
+    #     what THIS lane merged, so an entry delivered by generalize_down's
+    #     merge_wm had no hash at all, and once drained its carrier re-offered it.
+    #     While it sits in the slot the live dedup covers it; recording it now is
+    #     what keeps it covered after the drain removes it.
+    #  2. Bound the ring by `_bound_consumed`: offered hashes survive, and only
+    #     hashes no source offers are trimmed to CAP.
+    # Residual, by construction: an entry that enters and leaves the slot
+    # between two passes is never seen here, and comes back once.
+    summary["sources_unreadable"] = unreadable
+    ring_rows = {}
+    wm_all = slots.get(CONSUMED_HASHES_SLOT)
+    if not isinstance(wm_all, dict):
+        wm_all = {}
+    for slot_name in CAPTURE_SLOTS:
+        ring = wm_all.get(slot_name)
+        if not isinstance(ring, list):
+            ring = []
+        off = offered.get(slot_name, set())
+        in_ring = set(ring)
+        held = []
+        live = slots.get(slot_name)
+        for e in (live if isinstance(live, list) else []):
+            if not isinstance(e, dict):
+                continue
+            h = bmg._content_hash(e)
+            if h in off and h not in in_ring:
+                held.append(h)
+                in_ring.add(h)
+        if not ring and not held:
+            continue
+        new_ring, trimmed, overflow = _bound_consumed(
+            ring + held, off if not unreadable else None)
+        ring_rows[slot_name] = {"size": len(new_ring), "held_recorded": len(held),
+                                "trimmed": trimmed, "overflow": overflow}
+        if new_ring != ring:
+            wm_all[slot_name] = new_ring
+            slots[CONSUMED_HASHES_SLOT] = wm_all
+            changed = True
+    summary["consumed_ring"] = ring_rows
 
     if latencies:
         summary["latency_minutes_median"] = round(statistics.median(latencies), 1)
@@ -523,6 +610,20 @@ def _ratio_fragment(summary: dict) -> str:
     return frag
 
 
+def _ring_fragment(summary: dict) -> str:
+    """Names any lane whose consumed ring hit CONSUMED_HASHES_CEILING ().
+
+    An overflow evicts hashes a source still offers, so drained entries start
+    coming back again. That must print on the 0-merged branch too.
+    """
+    over = {s: r.get("overflow") for s, r in (summary.get("consumed_ring") or {}).items()
+            if isinstance(r, dict) and r.get("overflow")}
+    if not over:
+        return ""
+    return (" | consumed-ring OVERFLOW (drained captures will be re-delivered): "
+            + ", ".join(f"{s}={n}" for s, n in sorted(over.items())))
+
+
 def format_line(summary: dict) -> str:
     """The one-line form for the reducer's existing iteration-close output."""
     if summary.get("role_refused"):
@@ -537,7 +638,7 @@ def format_line(summary: dict) -> str:
         return (warn + "[capture-fast-lane] 0 load-bearing captures to merge "
                 f"({summary.get('bodies_scanned', 0)} Bodies scanned, "
                 f"{summary.get('already_present', 0)} already merged)"
-                + _ratio_fragment(summary))
+                + _ratio_fragment(summary) + _ring_fragment(summary))
     med = summary.get("latency_minutes_median")
     med_s = f"{med}m" if med is not None else "n/a"
     unmeas = summary.get("latency_unmeasurable") or 0
@@ -557,7 +658,7 @@ def format_line(summary: dict) -> str:
             f"— median flag-to-merge {med_s}, max "
             f"{summary.get('latency_minutes_max')}m{tail} "
             f"[{', '.join(f'{k}={v}' for k, v in sorted(summary['by_slot'].items()))}]"
-            + _ratio_fragment(summary))
+            + _ratio_fragment(summary) + _ring_fragment(summary))
 
 
 def main(argv=None) -> int:

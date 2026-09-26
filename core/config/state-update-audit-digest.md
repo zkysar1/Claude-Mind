@@ -52,6 +52,12 @@ IF outcome_class != "routine":
     #   velocity:impk_snapshot_failed  → meta-impk.sh unreachable; investigate stderr
     #   backpressure:rollbacks_applied → one or more meta-strategy fields
     #                                    auto-reverted — note in output
+    #   backpressure:rollback_failed   → a revert did NOT land (meta-set refused it, or
+    #                                    the dict/list read-back differed). rc=1; see
+    #                                    rollbacks_failed[].error. rollback_history
+    #                                    still claims it (g-115-10697)
+    #   backpressure:rollback_skipped  → null prior on a non-numeric field (an add, not
+    #                                    an edit): deliberately NOT reverted
     #   backpressure:check_failed      → meta-backpressure.sh unreachable; investigate stderr
 ```
 

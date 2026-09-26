@@ -63,11 +63,13 @@ while [[ $# -gt 0 ]]; do
         --override-supply-close)
             # Audited bypass of the closure gate () — ledgered to
             # world/aspiration-supply-overrides.jsonl (kind: close).
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             HEADERS+=(--header "X-Mind-Override-Supply-Close: ${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-all)
             # Bulk header; the daemon fans it into the closure slot when unset
             # and audits it to world/override-bypass-ledger.jsonl.
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             HEADERS+=(--header "X-Mind-Override-All: ${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         -h|--help)

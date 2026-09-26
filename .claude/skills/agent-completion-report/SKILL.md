@@ -214,7 +214,12 @@ All data comes from framework scripts — no direct JSONL reads.
    # populations — and correct this comment in passing when it has moved again.
    Bash: bash core/scripts/pipeline-read.sh --stage resolved
    Bash: bash core/scripts/pipeline-read.sh --stage archived
-   → Filter the UNION where outcome_date >= since date
+   → Filter the UNION where resolved_at >= since (full timestamp). Fall back to the
+     date-only outcome_date only for records with no resolved_at, and count those
+     placements separately (guard-4673: a filter on a field with a fallback chain
+     must use the chain). A date-only filter on a window that opens mid-day pulls in
+     pre-window records: measured 2026-09-25 (echo, cc-03), 34 scoreable by
+     outcome_date against 29 by resolved_at on one window (ledger row 270).
    → Count confirmed vs corrected
 
 5. Overall pipeline accuracy

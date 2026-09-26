@@ -470,7 +470,7 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
             echo "$(date +%Y-%m-%dT%H:%M:%S) ALLOW gate=worker-net-body-parked sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
             # ARM THE PARK RE-POLL FROM HERE (, Zak-Code ADR-0102). The
             # park turn is supposed to end on the Body's own
-            # ScheduleWakeup(<park-resume prompt>, 3600) — and measured across 26
+            # ScheduleWakeup(<park-resume prompt>, 3600, noop=false, reason="park re-poll") — and measured across 26
             # zc-03 sessions on 2026-08-29 the model armed a wake-up ONCE, so a
             # parked Body sat at its prompt exactly like a closed one. This hook
             # is the one process that positively knows the Body is parked, at
@@ -771,7 +771,16 @@ fi
 # background-jobs.py that does not know the flag exits 2 on the unknown
 # argument, which this fail-open shape reads as "no pending jobs" — so a
 # partial deploy in either order lands on BLOCK-proceeds, never on a wrong ALLOW.
-if bash "$CORE_ROOT/scripts/background-jobs.sh" has-pending --body-sid "$HOOK_SID" 2>/dev/null; then
+# --types external-wait-sleep (2026-09-25): an ALLOW here is only safe for a
+# job whose exit RE-INVOKES the model — the registered external-wait sleep,
+# launched run_in_background from the model's own turn. A detached processor
+# row (live PID + monitor goal, owned by the runner's own sid) satisfied the
+# old gate at every turn-end for ~8h on a reducer: the hook exited 0 with no
+# payload and nothing ever woke the loop. Other types still register, list and
+# suppress zombie recovery (recovery-gate's agent-wide call passes no --types);
+# they just cannot buy a silent turn-end. Same partial-deploy safety as
+# --body-sid: an older background-jobs.py exits 2 on the unknown flag.
+if bash "$CORE_ROOT/scripts/background-jobs.sh" has-pending --body-sid "$HOOK_SID" --types external-wait-sleep 2>/dev/null; then
     # Consult the loop-exhaustion fence BEFORE exiting (). This ALLOW
     # exits 137 lines before the fence's other call site on the BLOCK path, so
     # until now a session pacing indefinitely on registered sleeps was never

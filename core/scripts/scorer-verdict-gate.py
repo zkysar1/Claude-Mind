@@ -48,6 +48,7 @@ VALID_DEVIATION_CODES = (
     "cross-agent",        # deliberately claiming a cross-lane / foreign-world goal
     "no-goals-rebound",   # verdict names goals since gone; rebound to a live candidate
     "force-override",     # explicit force escape hatch — audited, last resort
+    "always-run-lane",    # always-run-lane.sh pinned an opted-in, due, candidate goal ()
 )
 
 FRESHNESS_MINUTES = 10

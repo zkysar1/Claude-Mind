@@ -508,22 +508,31 @@ DONE.
 0-pre. **Interrupted-stop check (FW-11, g-317-09 / g-317-14)**
 
    Before any binding or resume work, detect an autocompact-interrupted graceful
-   stop so its consolidation/handoff is not lost when the user re-engages via
-   `/start` instead of a chat message. This is the explicit-resume twin of the
-   Session Start Protocol IDLE-branch check (CLAUDE.md, g-317-09): the passive
-   session-start path probes the same sentinel, but a user who runs `/start`
-   would otherwise skip straight to the IDLE→RUNNING flip below and strand the
-   half-finished stop's learning.
+   stop, so the IDLE→RUNNING flip below cannot strand its consolidation/handoff
+   (the explicit-`/start` twin of the CLAUDE.md Session Start Protocol check).
 
    Bash: `MIND_AGENT=<agent-name> bash core/scripts/stop-checkpoint.sh resume-needed`
 
-# Rationale: core/config/rationale/start-runner-claim-and-body-fork.md — The explicit AYOAIAGENT= prefix is REQUIRED — the
+   # Rationale (WHY the MIND_AGENT= prefix and the mode test): core/config/rationale/start-runner-claim-and-body-fork.md
 
+   - **Exit 0** (a `stop-checkpoint.json` is present — a prior `/stop` was
+     interrupted mid-sequence):
      - Read the current on-disk mode: Bash:
+       `MIND_AGENT=<agent-name> bash core/scripts/session-mode-get.sh`
+     - **If current mode == `autonomous`** (the stop never reached D7, so its
+       consolidation/handoff may be incomplete): invoke
+       `/aspirations-graceful-stop --resume`. It idempotently completes the
+       remaining stop obligations, clears the checkpoint and ends the turn.
+       DONE — do NOT proceed to Step 0. After it completes, display:
        > Detected an autocompact-interrupted graceful stop and completed its
        > consolidation/handoff first so no learning is lost. Re-run
        > `/start <agent-name> [--mode <mode>]` to resume.
-       and only the D7.1 checkpoint-clear was missed): Bash:
+     - **Else** (mode is already `assistant`/`reader` — D7 ran, so D4 consolidate
+       landed and only D7's own checkpoint-clear was missed): Bash:
+       `MIND_AGENT=<agent-name> bash core/scripts/stop-checkpoint.sh clear`
+       to retire the stale sentinel, then continue to Step 0 normally.
+   - **Exit 1** (the common case — no interrupted stop, or the resume-count
+     breaker tripped) **or 2** (error — say so, fail open): continue to Step 0.
 
 0-pre2. **Ex-Worker Same-Terminal Guard (msg-20260804-220643-alpha-5346)**
 
@@ -716,16 +725,12 @@ DONE.
      - On exit 3 (override accepted): proceed; the gate logged an audit entry
        to `world/output-style-overrides.jsonl`.
      - On exit 0: proceed normally.
-   - (DDB-heartbeat ordering, g-328-31: the first `heartbeat-tick.sh` — which
-     under own-cloud ALSO fires the DDB `runner-claim.sh heartbeat` — is
-     deliberately DEFERRED to AFTER the DDB acquire below (and before the RUNNING
-     flip). A DDB heartbeat run BEFORE the acquire, using a leftover runner-token
-     from a prior session whose release did not confirm, refreshes a STALE claim's
-     `heartbeat_at` and defeats the acquire's §5 stale-lock-break — pinning this
-     /start at rc=4 on its own stale claim. See the heartbeat-tick step just
-     before `session-state-set.sh RUNNING` below.)
+   - (The first `heartbeat-tick.sh` is deliberately DEFERRED to after the DDB
+     acquire below — g-328-31.)
+     # Rationale (WHY the first heartbeat waits for the acquire): core/config/rationale/start-runner-claim-and-body-fork.md
    - Bash: `if [ -z "$MIND_SID" ]; then echo "ERROR:EMPTY_MIND_SID"; exit 1; fi; RUNNER_TOKEN=$(py -3 -c "import uuid;print(uuid.uuid4())" 2>/dev/null || python3 -c "import uuid;print(uuid.uuid4())" 2>/dev/null); [ -n "$RUNNER_TOKEN" ] || { echo "ERROR:RUNNER_TOKEN_GEN_FAILED"; exit 3; }; AGENT_STATE_DIR="agents/<agent-name>/session"; mkdir -p "$AGENT_STATE_DIR" && echo "$MIND_SID" > "$AGENT_STATE_DIR/running-session-id.tmp" && mv "$AGENT_STATE_DIR/running-session-id.tmp" "$AGENT_STATE_DIR/running-session-id" && echo "$MIND_SID" > "$AGENT_STATE_DIR/latest-session-id.tmp" && mv "$AGENT_STATE_DIR/latest-session-id.tmp" "$AGENT_STATE_DIR/latest-session-id" && echo "$RUNNER_TOKEN" > "$AGENT_STATE_DIR/runner-token.tmp" && mv "$AGENT_STATE_DIR/runner-token.tmp" "$AGENT_STATE_DIR/runner-token" && echo "RUNNER_TOKEN=$RUNNER_TOKEN"`
-     (Canonical runner-claim: writes THREE files atomically — `running-session-id`, `latest-session-id`, and `runner-token` — into `agents/<agent-name>/session/`. The Phase 2.5.D `agents/` parent prefix MUST be in the heredoc path; without it, the writes land at `agents/<agent-name>/session/` at PROJECT_ROOT (the 2026-05-19 bravo/ cruft incident — the L1 hook only gates Write/Edit, not Bash heredoc writes, so a missing `agents/` prefix silently creates a directory at the wrong root). The first two files hold the Claude Code SID (routing identity used by stop-hook). The third is a FRAMEWORK-OWNED UUID4 (uniqueness identity) — protects against Claude Code reusing a session_id across windows via `claude --continue` / `--resume`. With the token, every BLOCK and watchdog event records the runner-instance identity, so a SID-collision shows up as "same SID, different runner-token" in `core/logs/stop-hook.log` and watchdog events instead of silent corruption. The 2026-05-12 cross-binding incident was invisible to forensics without this signal. DO NOT split these writes into separate Bash commands — the triple-write is the atomic unit. DO NOT remove the `RUNNER_TOKEN_GEN_FAILED` halt; without a token, the loop runs with no uniqueness anchor. Per rb-323/guard-403, observer-paired signals MUST be seeded BEFORE the state-set RUNNING below — same race rb-323 identified for heartbeat-tick. If RUNNER_TOKEN_GEN_FAILED here, state stays IDLE (clean retry); if state-set ran first, state would be RUNNING with no SID files and Path B would have to recover.)
+     (Canonical runner-claim: writes THREE files atomically — `running-session-id`, `latest-session-id`, and a framework-owned `runner-token` UUID4 — into `agents/<agent-name>/session/`; the `agents/` prefix MUST stay in the path. DO NOT split these writes into separate Bash commands — the triple-write is the atomic unit. DO NOT remove the `RUNNER_TOKEN_GEN_FAILED` halt. Per rb-323/guard-403 it MUST precede the state-set RUNNING below.)
+     # Rationale (WHY three files, the token and the ordering): core/config/rationale/start-runner-claim-and-body-fork.md
 
      **HALT ON RUNNER_TOKEN_GEN_FAILED** — if output contains `ERROR:RUNNER_TOKEN_GEN_FAILED`, STOP. Both `py -3` and `python3` failed to generate a UUID. Display to the user:
      > Cannot start agent `<agent-name>`: the framework-owned runner-token could not be generated (Python unavailable). Check that `py -3` or `python3` works; the runner-token is required for SID-collision detection.
@@ -803,19 +808,11 @@ DONE.
      run `/boot`. State after CW3: `agent-state` IDLE, no reducer-shaped files here.
 
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/team-state-update.sh --field "agent_status.<agent-name>.current_focus" --value "\"\"" || true`
-     (Clear stale current_focus from the previous session's shutdown — without this,
-     a partner reading team-state.yaml sees the prior session's "session ended" or
-     stale focus value indefinitely. Convention coordination.md:275 is retrospective
-     ("set on completion"), so we can't write a prospective "starting" — clearing to
-     "" is the convention-aligned signal of "no completion yet this session". The
-     first aspirations-state-update or aspirations-consolidate write populates
-     current_focus with the first real completion. Fail-open with `|| true` so a
-     team-state write failure never blocks the RUNNING transition — stderr is NOT
-     suppressed, so write errors surface. ORDERING (g-115-4653): this is the FIRST
-     shared/synced write in the sequence and MUST stay below the DDB acquire above.
-     It was previously the first write of the whole autonomous branch, so an rc=4
-     refusal blanked the LIVE owning box's focus before ever discovering it had lost
-     the claim.)
+     (Clear the previous session's stale current_focus; `""` is the convention-aligned
+     "no completion yet this session". Fail-open with `|| true`; stderr is NOT
+     suppressed. ORDERING (g-115-4653): this is the FIRST shared/synced write in the
+     sequence and MUST stay below the DDB acquire above.)
+     # Rationale (WHY clear it, and WHY below the acquire): core/config/rationale/start-runner-claim-and-body-fork.md
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/team-state-update.sh --field "agent_status.<agent-name>.session_ended" --value "false" || true`
      (Clear stale session_ended from the previous /stop — g-240-72. Without this,
      a partner reading team-state.yaml sees session_ended=true for a live agent
@@ -863,28 +860,13 @@ DONE.
      via `wm-clear-identity.sh` in graceful-stop D4.5 — the ONE authorized
      clear site.)
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/heartbeat-tick.sh --bypass-state`
-     (FIRST heartbeat — seeds `runner-heartbeat` mtime AND stamps team-state
-     `last_active` NOW, and under own-cloud ALSO fires the DDB
-     `runner-claim.sh heartbeat`. MOVED here from before the triple-write
-     (g-328-31) so it runs AFTER the DDB acquire above and BEFORE the RUNNING
-     flip below. Ordering rationale: the DDB heartbeat MUST NOT precede the
-     acquire — a heartbeat carrying a leftover token from a prior session
-     refreshes a STALE claim's `heartbeat_at`, defeating the acquire's §5
-     stale-lock-break and pinning the next /start at rc=4 (stale-self-claim).
-     Acquiring first lets §5 reclaim the genuinely-stale claim; THIS heartbeat
-     then refreshes the just-acquired claim with the fresh token from the
-     triple-write. Still precedes the RUNNING transition to close the
-     observer-probe race (state=RUNNING with a stale heartbeat/last_active) per
-     rb-323/guard-403 — both observer-paired signals (heartbeat here, triple-write
-     above) are seeded before the flip. `--bypass-state` is REQUIRED because state
-     is still IDLE here; the gate in `heartbeat-tick.sh` refuses bare ticks against
-     IDLE (the `heartbeat_without_running` desync class, alpha 2026-05-13
-     cbb27ab3). DO NOT add a separate `team-state-update.sh ... last_active` line;
-     it duplicates the write heartbeat-tick just performed. On an acquire HALT
-     (rc=4) above, this heartbeat never runs — a failed acquire leaves no
-     heartbeat side-effect, which is the point.)
+     (FIRST heartbeat — runs AFTER the DDB acquire above and BEFORE the RUNNING
+     flip below. `--bypass-state` is REQUIRED because state is still IDLE here.
+     DO NOT add a separate `team-state-update.sh ... last_active` line; it
+     duplicates the write heartbeat-tick just performed.)
+     # Rationale (WHY this position, between the acquire and the flip): core/config/rationale/start-runner-claim-and-body-fork.md
    - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-state-set.sh RUNNING`
-     (State flip — observable to /stop, recovery-gate, partner agents. Per rb-323/guard-403, this MUST be the last write in the RUNNING-claim sequence: every observer-paired signal — heartbeat above, triple-write directly above — is seeded first, so the invariant "state=RUNNING implies fresh heartbeat AND non-empty SID files" holds from the transition moment. Script-enforced since 2026-08-29 (rb-9643): `session.py` REFUSES `RUNNING` — exit 1, `REJECTED: … running-session-id` — when `running-session-id` is missing/empty or names another session than `$MIND_SID`; a refusal means the triple-write above was skipped, so go back and run it, never write `agent-state` by hand.)
+     (State flip. MUST be the last write in the RUNNING-claim sequence (rb-323/guard-403). `session.py` REFUSES `RUNNING` (`REJECTED: … running-session-id`, rb-9643) when `running-session-id` is missing or names another session: go back and run the triple-write, never hand-write `agent-state`. Rationale: core/config/rationale/start-runner-claim-and-body-fork.md)
 
      **HALT ON NON-ZERO EXIT (F1, 2026-05-20)** — if the script exits non-zero
      (write permission error, _paths.sh resolution failure, daemon endpoint
@@ -895,6 +877,11 @@ DONE.
      > exited non-zero). The agent stays IDLE; investigate stderr above and
      > retry `/start <agent-name>`. Without this halt, `/boot` would read
      > state=IDLE and abort with "Agent is stopped" — confusing failure mode.
+   - Bash: `printf '%s' '{"entry_type":"state_update","content":"loop start: /start flipped IDLE->RUNNING (loop-exhaustion-fence streak baseline)","phase":"start"}' | MIND_AGENT=<agent-name> bash core/scripts/execution-diary.sh append || echo "WARN: diary baseline append failed (non-fatal)"`
+     (Fence streak baseline: `/stop`+`/start` in one terminal keep the SID, so
+     without this entry a restart inherits the pre-stop turn-end streak. After
+     the halt; non-fatal. Rationale (WHY a diary entry at /start):
+     core/config/rationale/start-diary-baseline.md)
    - (Watchdog setup is no longer needed at /start. The agent-watchdog runs
      as a periodic probe from `iteration-close.sh` productivity-check phase —
      `agent-watchdog.py --tick`. State persists across iterations via

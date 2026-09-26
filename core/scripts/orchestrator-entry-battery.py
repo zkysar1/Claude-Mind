@@ -66,7 +66,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 # Registry: file-presence checks + WM-slot checks, in orchestrator entry order.
 # kind: "file" (path relative to agent_state_dir), "wm_slot" (non-null =
-# actionable), or "init_markers" (any tier's .initialized ABSENT = actionable).
+# actionable), "init_markers" (any tier's .initialized ABSENT = actionable), or
+# "persona" (RUNNING + autonomous + persona-active not "true", no stop in flight).
 ENTRY_CHECKS = [
     # FIRST, because nothing below it means anything in a world that was never
     # initialized. State RUNNING is set by /start, which then CHAINS into boot,
@@ -86,8 +87,8 @@ ENTRY_CHECKS = [
     # guard-1867 applied honestly: running a skill's step inline skips whatever
     # else that skill writes. Boot's OTHER unconditional write is Phase -1
     # (persona) and this row does NOT reproduce it -- same run: 0 persona writes.
-    # That is a different fact with a different sensor, owned by , not
-    # folded in here on a marker predicate that does not measure it.
+    # That is a different fact with a different sensor: the next row, not folded
+    # in here on a marker predicate that does not measure it.
     {
         "name": "world_not_initialized",
         "kind": "init_markers",
@@ -97,6 +98,37 @@ ENTRY_CHECKS = [
             "`bash core/scripts/init-mind.sh $MIND_AGENT` NOW, before the precheck "
             "and the selector — idempotent and additive-only (seeds what is missing, "
             "never overwrites). The selector cannot run without the meta tier it creates"
+        ),
+    },
+    # Boot's OTHER unconditional write (). Phase -1 is the only persona
+    # write on the autonomous path -- /start sets persona in its reader and
+    # assistant branches, never its autonomous one -- so "RUNNING + autonomous"
+    # and "persona true" are joined only by a model that follows /start into
+    # /boot. Measured 3 of 3 examined: served runs 2026-09-19 (tool ledger) and
+    # 2026-09-21 (sampled live), and a live vessel 2026-09-25 (build b66348ca)
+    # all sat RUNNING+autonomous with persona-active "false" -- the
+    # provisioner's pre-/start reset -- while the loop executed goals. The loop
+    # never reads persona; the vessel does: /sidecar/mind folded the agent row
+    # ready=false for the whole run, and the sidecar's ceremony watchdog never
+    # latched done (3 attempts, then stalled + disarmed).
+    #
+    # "not true", NOT "== false" (unlike session_desync_check's
+    # running_without_persona, which asks a different question): unset is ON to
+    # the framework (session.py) but NOT ready to the vessel, and after boot
+    # Phase -1 it is never unset, so either value here means the write was
+    # skipped. A stop in flight is excluded so this can never race the stop's own
+    # mode writes. Still READ-ONLY: the dispatch is boot's own Phase -1 Step 1,
+    # verbatim, and the loop runs it (the caller list in user-interaction.md
+    # names this dispatch).
+    {
+        "name": "persona_not_active",
+        "kind": "persona",
+        "phase": "boot -1",
+        "skill_section": (
+            "boot/SKILL.md Phase -1 (Persona Activation): run "
+            "`bash core/scripts/session-persona-set.sh true` NOW — the step was "
+            "skipped on this RUNNING autonomous loop; the loop runs without it, "
+            "but a vessel reads persona for readiness and never reports ready"
         ),
     },
     {
@@ -166,6 +198,22 @@ PROTOCOL_FOOTER = (
 
 def _now_iso() -> str:
     return _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# A stop in flight owns agent-mode/persona until it lands (graceful-stop D-phases,
+# the FW-11 checkpoint); the persona row must never race it.
+STOP_IN_FLIGHT = ("stop-requested", "stop-loop", "stop-checkpoint.json")
+
+
+def _read_signal(state_dir: Path, name: str) -> str | None:
+    """A session control file's stripped text, or None when absent -- the same
+    read session.py's read_file does, kept local because this battery resolves
+    its own state_dir (the --agent override) rather than session.py's import-time
+    SESSION_DIR."""
+    p = state_dir / name
+    if not p.exists():
+        return None
+    return p.read_text(encoding="utf-8").strip()
 
 
 def _init_marker_paths(agent: str) -> dict:
@@ -357,6 +405,18 @@ def run(agent_override: str | None, wm_path_override: str | None, as_json: bool)
                     continue
                 payload = {"missing": missing,
                            "present": sorted(t for t in markers if t not in missing)}
+            elif spec["kind"] == "persona":
+                state = _read_signal(state_dir, "agent-state")
+                mode = _read_signal(state_dir, "agent-mode")
+                persona = _read_signal(state_dir, "persona-active")
+                if state != "RUNNING" or mode != "autonomous":
+                    continue
+                if persona is not None and persona.lower() == "true":
+                    continue
+                if any((state_dir / f).exists() for f in STOP_IN_FLIGHT):
+                    continue
+                payload = {"agent_state": state, "agent_mode": mode,
+                           "persona_active": "unset" if persona is None else persona}
             elif spec["kind"] == "file":
                 p = state_dir / spec["rel"]
                 if p.exists():

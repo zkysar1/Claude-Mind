@@ -24,7 +24,8 @@ runner — it manufactures confidence. So:
     PASS         a NON-EMPTY selection ran and every test passed
     FAIL         any test failed or errored
     INCONCLUSIVE the selection was empty, or some changed file mapped to
-                 nothing — the run proved nothing about those files
+                 nothing, or a selected test file is main()-style (pytest
+                 runs 0 tests from it) — the run proved nothing about those files
 
 INCONCLUSIVE names the unmapped files, because "this file has no test that
 references it" is the most useful thing this tool can tell you. It is a coverage
@@ -241,8 +242,11 @@ def main() -> int:
         prog="run-scoped-suite",
         description="Impact-scoped verification tier. Tri-state: "
                     "0 PASS | 1 FAIL | 2 INCONCLUSIVE | 3 setup.")
-    ap.add_argument("--changed", nargs="+", metavar="FILE",
-                    help="Explicit changed-file list (repo-relative). "
+    # action='extend': a REPEATED --changed accumulates. nargs='+' alone kept only
+    # the last repeat, so a mappable last path read PASS over 1 of N ().
+    ap.add_argument("--changed", nargs="+", action="extend", metavar="FILE",
+                    help="Explicit changed-file list (repo-relative); may be "
+                         "repeated, values accumulate. "
                          "Default: the uncommitted working set.")
     ap.add_argument("--since", metavar="REF",
                     help="Derive the changed set from `git diff REF...HEAD`.")
@@ -296,6 +300,9 @@ def main() -> int:
         "corpus_count": len(idx),          # population control beside every count
         "selected_share_pct": round(100.0 * len(selected) / len(idx), 2) if idx else 0.0,
         "selected": sorted(str(p.relative_to(PROJECT_ROOT)) for p in selected),
+        # pytest collects 0 tests from these (main()-style), so a green run says
+        # nothing about them (, guard-1653).
+        "zero_test_files": _zero_test_files(selected),
         "testpaths": [str(r.relative_to(PROJECT_ROOT)) for r in roots],
         "log": None,
         "elapsed_s": None,
@@ -349,12 +356,20 @@ def main() -> int:
         return 2
     if rc == 0:
         # Non-empty selection ran green. This is the ONLY path that returns PASS,
-        # and `unmapped` still qualifies it.
-        if unmapped:
+        # and `unmapped` and `zero_test_files` still qualify it.
+        zero = result["zero_test_files"]
+        if unmapped or zero:
+            gaps = []
+            if unmapped:
+                gaps.append(f"these changed files are referenced by NO test: "
+                            f"{', '.join(unmapped)}")
+            if zero:
+                gaps.append(f"these selected test files are main()-style, so pytest "
+                            f"collected ZERO tests from them and did not run them: "
+                            f"{', '.join(zero)}")
             result["verdict"] = "PASS_WITH_GAPS"
-            result["reason"] = ("selected tests passed, but these changed files are "
-                                f"referenced by NO test: {', '.join(unmapped)}. They "
-                                "were not verified by this run.")
+            result["reason"] = ("selected tests passed, but " + "; and ".join(gaps)
+                                + ". They were not verified by this run.")
             _emit(result, args.json, tail)
             return 2      # a gap is not a pass — INCONCLUSIVE for the gate's purposes
         result["verdict"] = "PASS"
@@ -365,6 +380,31 @@ def main() -> int:
     result["reason"] = f"pytest exited {rc}"
     _emit(result, args.json, tail)
     return 1
+
+
+_TOP_LEVEL_TEST = re.compile(
+    r"^(?:async\s+)?def test_|^class Test|^class \w+\([^)]*TestCase", re.MULTILINE)
+
+
+def _zero_test_files(paths) -> list:
+    """Selected files pytest collects nothing from: no top-level `def test_`,
+    no `class Test*`, and no unittest.TestCase subclass (collected whatever its
+    name). Checked 2026-09-25 against `pytest --collect-only` over all 1573
+    test files: 0 false positives. It does not flag module-level
+    `importorskip` files; pytest reports those as skipped rather than hiding
+    them."""
+    zero = []
+    for p in paths:
+        try:
+            text = Path(p).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not _TOP_LEVEL_TEST.search(text):
+            try:
+                zero.append(str(Path(p).relative_to(PROJECT_ROOT)))
+            except ValueError:
+                zero.append(str(p))
+    return sorted(zero)
 
 
 def _emit(result: dict, as_json: bool, tail: str = "") -> None:

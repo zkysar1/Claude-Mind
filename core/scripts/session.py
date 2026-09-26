@@ -262,6 +262,43 @@ def cmd_mode_get(args):
         print(val)
 
 
+# Files whose presence means a sanctioned stop is in flight (). /stop writes
+# stop-target-mode FIRST and stop-requested second (guard-158), the script stop gates
+# write the same pair, and graceful-stop writes stop-checkpoint.json at entry.
+STOP_IN_FLIGHT_MARKERS = ("stop-requested", "stop-target-mode", "stop-checkpoint.json")
+
+
+def refuse_demotion_while_running(value):
+    """Refuse reader|assistant while agent-state is RUNNING and no stop is in flight.
+
+    agent-mode is agent-wide, so a write from ANY session re-modes the live runner.
+    Measured twice (g-115-8154): an observer session on a peer deployment (2026-08-28)
+    and a hosted conversation session against an autonomous resident (2026-09-25,
+    g-335-1459) each ran the IDLE-branch assistant block and flipped agent-mode under a
+    RUNNING runner, which then stopped claiming work. start/SKILL.md's RUNNING branch already forbids this write;
+    that is prose, and the model improvised past it both times.
+
+    Every legitimate demotion still passes: /stop's and /start's IDLE branches run at
+    IDLE, and graceful-stop's D7 runs after it has set IDLE, with stop-checkpoint.json
+    still present as a second exemption. autonomous is never refused — /start's
+    IDLE->RUNNING flip needs it first (require_autonomous_mode).
+    """
+    if value == "autonomous" or read_file(SESSION_DIR / "agent-state") != "RUNNING":
+        return
+    if any((SESSION_DIR / m).exists() for m in STOP_IN_FLIGHT_MARKERS):
+        return
+    print(
+        f"REJECTED: agent-mode '{value}' while agent-state is RUNNING and no stop is in "
+        f"flight (none of {', '.join(STOP_IN_FLIGHT_MARKERS)} exists). agent-mode is "
+        "agent-wide: writing it demotes the live autonomous runner. A session started "
+        "against a RUNNING agent is an OBSERVER and must not write agent-mode, "
+        "persona-active or agent-state (start/SKILL.md RUNNING branch). To change the "
+        "agent's mode, /stop <agent> first.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def cmd_mode_set(args):
     """Write agent-mode after validation."""
     require_agent()
@@ -269,6 +306,7 @@ def cmd_mode_set(args):
     if value not in VALID_MODES:
         print(f"ERROR: Invalid mode '{value}'. Must be one of: {', '.join(sorted(VALID_MODES))}", file=sys.stderr)
         sys.exit(1)
+    refuse_demotion_while_running(value)
     write_file(SESSION_DIR / "agent-mode", value)
 
 

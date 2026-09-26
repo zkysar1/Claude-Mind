@@ -45,6 +45,14 @@ def ufb():
     return _load_ufb()
 
 
+@pytest.fixture(autouse=True)
+def _tmp_exp_path(ufb, monkeypatch, tmp_path):
+    """EXP_PATH resolves from the bound agent at import, i.e. the LIVE agent dir
+    under the Bash hook. The writer now SPOOLS beside that store (g-358-216), so
+    every test gets a tmp store — no test may append to a live agent's spool."""
+    monkeypatch.setattr(ufb, "EXP_PATH", tmp_path / "experience.jsonl")
+
+
 # --------------------------------------------------------------------------
 # The counter-name mapping
 # --------------------------------------------------------------------------
@@ -131,8 +139,50 @@ def test_pattern_signature_still_noops(ufb, monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# The writer itself
+# The writer: SPOOL first (), the daemon RMW only as the fallback
 # --------------------------------------------------------------------------
+
+def test_writer_spools_and_never_calls_the_daemon(ufb, monkeypatch, tmp_path):
+    """Each bump used to be a whole-object rewrite of the agent's experience
+    store (~4 GiB/day of live-store PUTs fleet-wide). The writer now appends one
+    delta line beside the store; the flush folds deltas in one write."""
+    def rt_call(*a, **k):
+        raise AssertionError("a spooled bump must not touch the daemon")
+    monkeypatch.setattr(ufb._rt, "rt_call", rt_call)
+
+    ufb._increment_experience_stat("exp-x", "times_helpful")
+
+    lines = (tmp_path / "experience-stats.spool.jsonl").read_text(
+        encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert (rec["id"], rec["counter"], rec["delta"]) == ("exp-x", "times_useful", 1)
+
+
+def test_writer_falls_back_to_the_daemon_when_the_spool_append_fails(
+        ufb, monkeypatch):
+    """A lost spool append must not become a lost increment."""
+    import _experience_stats_spool as es
+    monkeypatch.setattr(es, "record", lambda *a, **k: False)
+    writes = []
+    _fake_rt(ufb, monkeypatch,
+             {"id": "exp-x", "retrieval_stats": {"retrieval_count": 2,
+                                                 "times_useful": 0}},
+             writes)
+
+    ufb._increment_experience_stat("exp-x", "times_helpful")
+
+    assert len(writes) == 1
+    assert json.loads(writes[0]["value"])["times_useful"] == 1
+
+
+def test_unmapped_field_neither_spools_nor_writes(ufb, monkeypatch, tmp_path):
+    def rt_call(*a, **k):
+        raise AssertionError("unmapped field must not write")
+    monkeypatch.setattr(ufb._rt, "rt_call", rt_call)
+    ufb._increment_experience_stat("exp-x", "times_active")
+    assert not (tmp_path / "experience-stats.spool.jsonl").exists()
+
 
 def _fake_rt(ufb, monkeypatch, record, writes):
     """Stub _rt.rt_call for the read-modify-write pair."""
@@ -161,7 +211,7 @@ def test_writer_uses_the_whole_object_shape(ufb, monkeypatch):
                  "utility_ratio": 0.0, "last_retrieved": None}},
              writes)
 
-    ufb._increment_experience_stat("exp-x", "times_helpful")
+    ufb._increment_experience_stat_via_daemon("exp-x", "times_helpful")
 
     assert len(writes) == 1
     assert writes[0]["field"] == "retrieval_stats", \
@@ -179,7 +229,7 @@ def test_writer_reads_before_writing(ufb, monkeypatch):
                  "utility_ratio": 0.33, "last_retrieved": "2026-08-01"}},
              writes)
 
-    ufb._increment_experience_stat("exp-x", "times_helpful")
+    ufb._increment_experience_stat_via_daemon("exp-x", "times_helpful")
 
     blob = json.loads(writes[0]["value"])
     assert blob["times_useful"] == 4
@@ -194,7 +244,7 @@ def test_writer_skips_record_without_stats_block(ufb, monkeypatch):
     retrieval produced — so the writer declines rather than invents."""
     writes = []
     _fake_rt(ufb, monkeypatch, {"id": "exp-x"}, writes)
-    ufb._increment_experience_stat("exp-x", "times_helpful")
+    ufb._increment_experience_stat_via_daemon("exp-x", "times_helpful")
     assert writes == []
 
 
@@ -204,7 +254,7 @@ def test_writer_noops_on_unmapped_field(ufb, monkeypatch):
              {"id": "exp-x", "retrieval_stats": {"retrieval_count": 1,
                                                  "times_useful": 0}},
              writes)
-    ufb._increment_experience_stat("exp-x", "times_active")
+    ufb._increment_experience_stat_via_daemon("exp-x", "times_active")
     assert writes == []
 
 
@@ -216,7 +266,7 @@ def test_writer_is_fail_soft_on_daemon_error(ufb, monkeypatch, capsys):
         raise ufb._rt.RtError("daemon down")
     monkeypatch.setattr(ufb._rt, "rt_call", boom)
 
-    ufb._increment_experience_stat("exp-x", "times_helpful")  # must not raise
+    ufb._increment_experience_stat_via_daemon("exp-x", "times_helpful")  # must not raise
 
     assert "exp-x" in capsys.readouterr().err
 

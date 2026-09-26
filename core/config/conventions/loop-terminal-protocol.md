@@ -96,9 +96,12 @@ session):
 - A scheduled wakeup DOES fire after a text-only turn-end and re-invokes
   the agent (the resurrection primitive — proven end-to-end).
 
-The gate (`schedule-wakeup-gate.py`) already passes the `<<autonomous-loop-dynamic>>`
-sentinel (`is_bad_slash_prefix` returns False), so the deadman call is
-approved unconditionally. guard-511 carries the matching carve-out.
+The gate (`schedule-wakeup-gate.py`) passes the `<<autonomous-loop-dynamic>>`
+sentinel (`is_bad_slash_prefix` returns False) while agent-state is RUNNING and
+the call carries `noop`, so the deadman call as documented is approved. It is
+NOT approved unconditionally: a sentinel arm while NOT RUNNING, or any arm
+without `noop` (g-115-10755), is denied with a reason naming the fix.
+guard-511 carries the matching carve-out.
 
 Fail-safe property: if the live Q5 re-validation shows `Skill(aspirations)`
 does NOT re-enter after ScheduleWakeup, the worst case is a SLOW loop
@@ -112,7 +115,7 @@ The framework targets exactly ONE harness contract: Claude Code's. Every termina
 imperative (the stop hook's BLOCK reason, `═══ ITERATION COMPLETE ═══`, the
 recurring-close proceed text, the PostToolUse reminder) says `Skill(aspirations)
 with args='loop'` and `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
-delaySeconds=600)` — the same bytes on every box. A vessel that hosts a Mind
+delaySeconds=600, noop=false, reason="deadman resurrection net")` — the same bytes on every box. A vessel that hosts a Mind
 implements that contract rather than being detected: Zak-Code names the tool on
 the hook wire the way Claude Code does (ADR-0071), delivers a skill a turn-end
 veto names and parses both spellings (ADR-0187), and exposes Claude Code's tool

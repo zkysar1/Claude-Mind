@@ -306,7 +306,10 @@ def test_broken_store_fails_open(tmp_path, monkeypatch):
     assert "WARN" in buf.getvalue()
 
 
-def test_unreadable_message_fails_open(tmp_path):
+def test_unreadable_message_fails_open(tmp_path, monkeypatch):
+    # Pinned like every other run_gate caller here: REPO_ROOT is the live repo,
+    # and a real mid-merge there short-circuits run_gate with no WARN.
+    monkeypatch.setattr(gate, "in_replay", lambda repo: False)
     import io
     buf = io.StringIO()
     assert gate.run_gate(REPO_ROOT, tmp_path / "does-not-exist", out=buf) == 0

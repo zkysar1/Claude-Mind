@@ -677,12 +677,12 @@ def _mark_consumed(backend, world_staged: Path, unit_key: str) -> None:
     legacy copy survives, so its next `push-staged` would relocate and re-push
     the same triple and this reducer would merge the same divergence twice.
 
-    IT GATES THE PRODUCER, NEVER THE CONSUMER. That asymmetry makes it safe to
-    write before the DELETE — a tombstone whose triple still exists is
-    re-globbed and re-merged normally by the next drain, so a crash between
-    this write and the delete costs nothing, while writing it AFTER the delete
-    would leave the real gap: triple gone, no tombstone, origin free to
-    resurrect it. So: always tombstone, then delete.
+    IT GATES THE PRODUCER, AND (since g-115-10744) THE CONSUMER: the next drain
+    leaves a tombstoned triple exactly where it is (`_consume_staged` Guard 0).
+    So a crash between this write and the delete leaves inert residue — until
+    g-115-10744 that residue was re-merged, applying its counter delta twice —
+    while writing it AFTER the delete would leave the real gap: triple gone,
+    no tombstone, origin free to resurrect it. So: always tombstone, then delete.
 
     IT DOES NOT MAKE IT SAFE TO WRITE BEFORE THE PERSIST, and this docstring
     said the opposite until g-115-9876 (2026-09-13). The asymmetry argument
@@ -770,8 +770,17 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
     (independent of sessions/), so this runs whether or not a sessions/ dir
     exists.
 
-    Three guards before merging a staged orphan (g-306-70 hardening over the
+    Guards before merging a staged orphan (g-306-70 hardening over the
     earlier "merge unconditionally" behavior):
+      0. TOMBSTONED (g-115-10744) — a <unitKey>-wm.consumed tombstone means an
+         earlier drain already merged this unit: durably, for every tombstone
+         written since g-115-9876, or as a pre-g-115-9876 false ACK that
+         g-115-9876 then kept ON PURPOSE (the ten Class-A units consumed on
+         2026-09-14 — a retained copy with no other recovery layer). Either way
+         the unit is left exactly where it is, NEITHER merged NOR deleted:
+         re-merging applies its counter delta a second time and re-adds capture
+         entries drained since, and deleting destroys the retained copy
+         (archive-before-delete.md). Listed in summary["staged_tombstoned_retained"].
       1. DEDUP — if this unitKey was ALREADY merged in the sessions-pass this
          run (`already`), the cleanup raced generalize-down (the staged copy AND
          the sessions/<unitKey>/ dir were both visible): consume the staged copy
@@ -837,7 +846,7 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
     world_staged = bm.world_staged_dir(state_dir.parent)
     backend = _get_backend()
 
-    def _staged_names_in(d: Path) -> set:
+    def _staged_names_in(d: Path, suffix: str = "-wm.yaml") -> set:
         """Local glob UNION the authoritative listing, never replace: a
         local-only staging (cleanup-stale-bindings on THIS box, never pushed)
         must still drain when the store errors or lags. `.resolve()` is
@@ -849,12 +858,12 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
         """
         found: set = set()
         if d.is_dir():
-            found.update(p.name for p in d.glob("*-wm.yaml"))
+            found.update(p.name for p in d.glob(f"*{suffix}"))
         if backend is not None:
             try:
                 found.update(
                     n for n in backend.list_dir(d.resolve())
-                    if n.endswith("-wm.yaml"))
+                    if n.endswith(suffix))
             except Exception:  # noqa: BLE001 — store listing is additive, never fatal
                 pass
         return found
@@ -864,6 +873,11 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
     staged_names: set = world_names | legacy_names
     if not staged_names:
         return
+    # Guard 0's input (). Tombstones are only ever written beside the
+    # WORLD copy (_mark_consumed), so one listing covers both lanes.
+    tombstoned = {
+        n[: -len(_STAGED_CONSUMED_SUFFIX)]
+        for n in _staged_names_in(world_staged, _STAGED_CONSUMED_SUFFIX)}
     pending_merges: list = []  # (body_wm, baseline_wm) -- applied under the lock
     # (unit_key, paths) — the TOMBSTONE and the authoritative delete are both
     # deferred past the WM write (); unit_key rides along so the
@@ -883,6 +897,10 @@ def _consume_staged(state_dir: Path, reducer_wm_path: Path, summary: dict,
         staged_path = staged_dir / name
         unit_key = name[: -len("-wm.yaml")]
         summary["scanned"] += 1
+        # Guard 0: a tombstoned unit is left exactly where it is (docstring).
+        if unit_key in tombstoned:
+            summary.setdefault("staged_tombstoned_retained", []).append(unit_key)
+            continue
         hash_path = staged_dir / f"{unit_key}{_STAGED_HASH_SUFFIX}"
         baseline_path = staged_dir / f"{unit_key}{_STAGED_BASELINE_SUFFIX}"
         shadowed_triple = None

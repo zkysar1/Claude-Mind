@@ -146,6 +146,25 @@ sides, so `source-fidelity` passes a claim that is exactly backwards — same en
 set, same citation, reversed relation. A record carrying only one of the two is
 incomplete.
 
+**A citation-only miss is ATTESTED; a target miss is a REJECT** (g-375-26). A
+source often CITES ids it leans on — a prior goal, a guardrail, a precedent —
+that the artifact was never asked to carry, and `source-fidelity` reports those
+as `missing` exactly like a dropped deliverable. Attest each such id, with its
+role, on the verdict call:
+
+```bash
+  --citation guard-NNN="the rule the fix follows" \
+  --citation g-NNN-NN="precedent cited, not a deliverable"
+```
+
+Attested ids leave the veto, are recorded under `fidelity.citations_attested`,
+and are stated in the findings. Attest only an id you verified is a citation: an
+id the work had to PRODUCE is a target, and its absence is a REJECT however the
+reason is worded. Attestation is REFUSED when the diff carries the substitution
+signature, where a "missing" id may be a replaced identity. Short shas need no
+attestation — a 7+ character hex prefix of a full sha on the other side is one
+identity, resolved by the diff itself (`fidelity.sha_identity`).
+
 ### 3. Criteria adequacy — judgment
 Construct one plausible **WRONG** artifact that would still pass the goal's
 stated criteria, then test the real artifact for exactly that flaw. If you
@@ -188,7 +207,7 @@ py -3 core/scripts/close-review-verdict.py \
 Exit codes: `0` an APPROVAL written (`APPROVE` or `APPROVE_WITH_NOTES`), `3`
 REJECT written, `1` refused (a failing fidelity diff under either approving
 flag, self-review of an APPROVAL, or `--approve-with-notes` carrying no
-`--finding`), `2` no verdict asserted.
+`--finding`), `2` no verdict asserted or a malformed `--citation` (usage error).
 
 Every written verdict carries `reviewed_at` (naive ISO-8601, UTC wall time).
 Artifacts written before 2026-09-03 do not have it and were deliberately NOT
@@ -202,11 +221,13 @@ APPROVE, it ROUTES its findings to the goal record. Before it existed the
 binary forced a reviewer with a minor observation either to block sound work or
 to drop the observation, because a plain APPROVE routes nothing.
 
-Three refusals are deliberate and must not be worked around:
+Four refusals are deliberate and must not be worked around:
 
 - **`--approve` is REFUSED when the fidelity diff is non-empty.** The machine
   may VETO an approval on its own evidence and may never GRANT one, so the
   label never asserts more than the predicate supports (guard-2564).
+- **`--citation` is REFUSED under the substitution signature** (check 2 above):
+  attesting a replaced identity as a "citation" would launder the founding defect.
 - **Self-review is REFUSED** when `--closer` equals `--reviewer`. Producing the
   artifact anyway would only add a record the gate will reject.
 - **No verdict is invented.** Without `--approve` or `--reject` nothing is

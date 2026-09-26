@@ -39,7 +39,7 @@ flips agent-state to IDLE early, the aspirations loop then bails at its Phase
 (which D3 also clears), so the half-finished stop strands: consolidation/handoff
 incomplete, agent-mode stuck at autonomous, `loop_state` lingering. To make this
 recoverable, GS-0 writes a persistent `stop-checkpoint.json` sentinel that is
-cleared ONLY at clean completion (D7.1). Its presence is the detection signal:
+cleared ONLY at clean completion (D7, after the mode flip). Its presence is the detection signal:
 the Session Start Protocol (CLAUDE.md, IDLE branch) probes
 `stop-checkpoint.sh resume-needed` and, on a hit, invokes
 `/aspirations-graceful-stop --resume`. The `--resume` path is identical to the
@@ -125,7 +125,7 @@ IF invoked with --resume:
 Output: "▸ GRACEFUL STOP: target_mode = {target_mode} (cached for D7)"
 
 # Persist the stop-checkpoint sentinel (FW-11 / g-317-09). Its PRESENCE = "a
-# graceful stop is in progress / was interrupted"; it is cleared ONLY at D7.1
+# graceful stop is in progress / was interrupted"; it is cleared ONLY by D7
 # (clean completion). Fresh stop -> resume_count 0; --resume re-entry -> ++ (the
 # breaker input). Stdout (the confirmation JSON) is noise here so it is dropped;
 # stderr is preserved so a real write failure stays visible. Fire-and-forget —
@@ -285,6 +285,10 @@ ELIF verdict == "FAST":
     Bash: MIND_AGENT=<agent> bash core/scripts/load-consolidation-housekeeping.sh → IF path returned: Read it
     # Follow housekeeping steps with stop_mode = true
 ELSE: invoke /aspirations-consolidate with: stop_mode = true
+# D4.1 (g-373-141): the D7.0 check, run early. A handoff first written at D7.0's refusal
+# misses D6.62's commit and D6.7's flush. On rc 1: write the printed Step 9, re-run this
+# line, continue. D7.0 stays the gate. WHY: the .py docstring.
+Bash: MIND_AGENT=<agent> bash core/scripts/stop-handoff-check.sh --step D4.1
 # D4.5: Clear session-identity fields (session_id, session_start).
 # wm-reset inside consolidate preserves these across the autocompact boundary
 # because the session continues there. /stop is the ONE place the session
@@ -461,9 +465,14 @@ Bash: MIND_AGENT=<agent> bash -c '
 # D7.0 (g-373-128): stop-handoff-check.sh leads the chain, BEFORE the mode flip.
 # It refuses (rc 1, prints digest Step 9 verbatim) unless THIS stop wrote
 # handoff.yaml; only its pass line claims a handoff, never the text below.
-# On a refusal: write the handoff, re-run D7 unchanged, do NOT run D7.1.
+# On a refusal: write the handoff and re-run D7 unchanged; D7.05 and D7.1
+# follow the re-run that passes.
 # Escape hatch (logged): --proceed-without-handoff "<why>". WHY: the .py docstring.
-Bash: MIND_AGENT=<agent> bash core/scripts/stop-handoff-check.sh && MIND_AGENT=<agent> bash core/scripts/session-mode-set.sh "{target_mode}" && rm -f agents/<agent>/session/stop-target-mode && _STATE=$(MIND_AGENT=<agent> bash core/scripts/session-state-get.sh 2>/dev/null || echo "?") && _MODE=$(MIND_AGENT=<agent> bash core/scripts/session-mode-get.sh 2>/dev/null || echo "?") && _RESID=$(ls agents/<agent>/session/running-session-id agents/<agent>/session/aspirations-compact.json agents/<agent>/session/iteration-checkpoint.json agents/<agent>/session/loop-active 2>/dev/null | wc -l | tr -d ' ') && if [ "{target_mode}" = "assistant" ]; then cat <<'EOF'
+#
+# SIGN-OFF (g-373-140): the checkpoint clear rides the flip's &&, so D7 alone
+# signs the stop off for a waiting vessel sidecar while any earlier exit keeps
+# it for --resume; `|| true` only keeps the verdict printing.
+Bash: MIND_AGENT=<agent> bash core/scripts/stop-handoff-check.sh && MIND_AGENT=<agent> bash core/scripts/session-mode-set.sh "{target_mode}" && rm -f agents/<agent>/session/stop-target-mode && { MIND_AGENT=<agent> bash core/scripts/stop-checkpoint.sh clear >/dev/null || true; } && _STATE=$(MIND_AGENT=<agent> bash core/scripts/session-state-get.sh 2>/dev/null || echo "?") && _MODE=$(MIND_AGENT=<agent> bash core/scripts/session-mode-get.sh 2>/dev/null || echo "?") && _RESID=$(ls agents/<agent>/session/running-session-id agents/<agent>/session/aspirations-compact.json agents/<agent>/session/iteration-checkpoint.json agents/<agent>/session/loop-active 2>/dev/null | wc -l | tr -d ' ') && if [ "{target_mode}" = "assistant" ]; then cat <<'EOF'
 Agent stopped. Session consolidated — encoding and journal saved.
 Mode set to assistant (reconciliation-ready). You can mark goals complete, edit tree
 nodes, or add guardrails without a mode-switch ceremony. Full access to accumulated
@@ -481,24 +490,19 @@ fi && echo "" && echo "═══ Stop verified ═══════════
 # 2026-09-24 06:38Z: armed 17:45Z, /stop typed 21:23Z, prompt 06:38Z). The gate
 # allows the cancel here because D1 set IDLE. Why: rationale/deadman-switch.md.
 ScheduleWakeup(stop: true)
-# D7.1: Final housekeeping — clear the stop-checkpoint sentinel (the "stop
-# complete" marker, FW-11 / g-317-09) AND delete the SID binding. Must run
-# AFTER D7 so the PreToolUse hook can resolve MIND_AGENT for D7's mode-set call
-# in the event that a future edit drops the explicit prefix (defense in depth
-# against prefix-forgetting regressions). Clearing the checkpoint LAST (only
-# after D7 has set the target mode) is load-bearing: it is the single signal
-# that the stop ran to completion. If autocompact interrupts before this line,
-# the checkpoint persists and the Session Start Protocol re-invokes
-# /aspirations-graceful-stop --resume to finish. This is the terminal Bash of
-# the skill. No text output may follow — return-protocol.md.
+# D7.1: Final housekeeping — delete the SID binding, and re-clear the
+# stop-checkpoint (idempotent: D7 already cleared it). Runs AFTER D7 so the
+# PreToolUse hook can still resolve MIND_AGENT for D7's mode-set call should a
+# future edit drop its explicit prefix. This is the terminal Bash of the skill.
+# No text output may follow — return-protocol.md.
 Bash: SID=$(cat agents/<agent>/session/latest-session-id 2>/dev/null | tr -d '\r\n'); [ -n "$SID" ] && rm -f ".active-agent-$SID"; MIND_AGENT=<agent> bash core/scripts/stop-checkpoint.sh clear >/dev/null || true
 ```
 
 ## Return Protocol
 
 Does NOT return control to the orchestrator. Control flow ends with D7.1 — a
-final single-line Bash command that clears the stop-checkpoint sentinel (marking
-the stop complete) and deletes the SID binding file. D7 emits
+final single-line Bash command that deletes the SID binding file (and re-clears
+the stop-checkpoint sentinel D7 already cleared). D7 emits
 the user-facing stop-complete message via heredoc; D7.1 is the trailing
 binding-cleanup that exists purely as the terminal tool call after D7's
 heredoc ends (which is itself a Bash tool call). The harness exits the session
@@ -514,6 +518,6 @@ which produces no user-visible output when the file exists).
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator Phase -1.4 (fresh stop, when `stop-requested` exists); `/start`'s hand-off; the stop-pending Bash hook; the Session Start Protocol IDLE branch with `--resume` (FW-11, when a `stop-checkpoint.json` is detected after an autocompact-interrupted stop)
-- **Calls**: `aspirations-verify`, `aspirations-state-update` (for in-flight obligation completion); `aspirations-consolidate` OR `load-consolidation-housekeeping.sh` (D4); `stop-checkpoint.sh` (write at GS-0 / clear at D7.1); many scripts for D1-D7
+- **Calls**: `aspirations-verify`, `aspirations-state-update` (for in-flight obligation completion); `aspirations-consolidate` OR `load-consolidation-housekeeping.sh` (D4); `stop-checkpoint.sh` (write at GS-0 / clear at D7, re-clear at D7.1); many scripts for D1-D7
 - **Reads**: iteration-checkpoint.json, stop-checkpoint.json, stop-target-mode, handoff context
 - **Writes**: agent-state (IDLE), agent-mode (target), stop-checkpoint.json (write/clear), various session signals

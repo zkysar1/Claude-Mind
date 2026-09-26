@@ -398,3 +398,43 @@ again on the ceiling premise; there is no ceiling.**
   writing N=165 evicts exactly ONE (N=161) into `-pre-n165.md`. Measure the row count on
   disk anyway. And if you trim through the hook rather than through `mirror_put`, expect
   the refusal above and verify the sweep landed it — do not re-push blind.
+
+## Phase 2.2b mix-measurement readings — moved out of SKILL.md 2026-09-25 (echo, g-001-02)
+
+The skill is over its 65,536 B injection ceiling, so it may shrink but not grow.
+`hot-path-size-gate` refused a +288 B edit to Phase 2.2b. The rule stayed in the
+skill; these two dated readings moved here, verbatim in substance:
+
+- **guard-3690 reading (echo N=165, 2026-09-24, cc-03).** A
+  `completed_date >= <timestamp>` filter counted 0 of echo's 3 one-off closes
+  since the prior fire. `completed_at` was present on 287 of 287 completed
+  one-offs. `completed_date` is date-only on most records, so any timestamp
+  filter against it silently drops them.
+- **Compact-source reading (bravo, 2026-07-29).** Counting closes from
+  `aspirations-compact.json` returned 0 closes in a session where the reviewer
+  had personally closed ten goals.
+
+## 2026-09-25 (alpha N=185, `hostname` cc-07, `uname -r` 6.8.0-139-generic, own-cloud, REDUCER) — branch 3 read a FORWARD reference as the max
+
+The index probe returned **185** at the Phase-2 read AND at the write-time
+re-probe, while alpha's newest entry was **184**. Branch 1 (headings) and branch 2
+(`| **N=` entry rows) both returned 184, so only branch 3 was wrong. It fired on the N=184
+row's `completion_health` VALUE row, whose first `N=` token was the forward pointer
+"for N=185's same-id Δ". The rationale's branch-3 premise ("a row's own index
+appears FIRST") holds for entry-per-row tables (echo, zeta). It does NOT hold for
+alpha's `field | value` tables, because a value row has no index of its own. The
+first-`N=`-per-row rule therefore takes whatever prose the cell happens to open
+with, and a forward pointer raises the max.
+
+**Direction:** allocating max+1 would have numbered the pass 186 and silently
+skipped 185. That is the same failure the whole-file max produced, and the reason
+the probe was narrowed in the first place.
+
+**Caught by:** the guard-2421 positive control against the headings. **Write-side
+mitigation, applied in the N=185 row:** no `|` row names a later index; forward
+pointers live only in the `Handoff to N=` list, which every branch excludes.
+
+**Self-clearing, then re-armable:** once the N=185 row landed, 185 is real and the
+probe is correct again. Any forward `N=` written inside a value row re-arms the
+defect. The probe itself was NOT changed: the SKILL.md requires byte-identical
+branches, and a fix needs the rationale read first.

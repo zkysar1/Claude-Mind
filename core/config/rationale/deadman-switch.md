@@ -235,7 +235,7 @@ statistically LIKELY to die the same way — and by then the net is already gone
 **Fix (g-115-2771): re-arm FIRST on resurrection.** On a
 `<<autonomous-loop-dynamic>>` wakeup firing, the resurrected turn's FIRST tool
 call MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
-delaySeconds=600)` re-arm — restoring the net BEFORE any loop-entry work that
+delaySeconds=600, noop=false, reason="deadman resurrection net")` re-arm — restoring the net BEFORE any loop-entry work that
 could fail — THEN proceeding to Phase -1.5. This converts "death during
 resurrection" from a terminal silent death into at most one more 600s
 resurrection cycle: each resurrection re-establishes the net that protects the

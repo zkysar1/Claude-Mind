@@ -256,3 +256,71 @@ def test_latency_budget_is_bounded_in_source():
     assert m, "the latency budget must be a named constant, not an inline literal"
     assert 2 <= int(m.group(1)) <= 8, "budget outside the measured-safe band"
     assert "timeout=RETRIEVE_TIMEOUT_S" in src, "the constant must be the one in force"
+
+
+# --- fire log () ---------------------------------------------------
+
+def _fire_records(tmp_path):
+    p = tmp_path / "core" / "logs" / "prompt-retrieval-fires.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(ln) for ln in p.read_text(encoding="utf-8").splitlines()
+            if ln.strip()]
+
+
+def test_fire_log_records_each_injection(tmp_path):
+    """Outcome 1: one record per firing, carrying timestamp, agent, mode, query
+    length and bytes injected -- the fire rate is countable from one file."""
+    env = _assistant_tree(tmp_path, "fire-sid-0001")
+    ctx = _ctx(_run_env("fire-sid-0001", env))
+    recs = _fire_records(tmp_path)
+    assert len(recs) == 1
+    r = recs[0]
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", r["ts"])
+    assert (r["agent"], r["mode"], r["outcome"]) == ("tau", "assistant", "index")
+    assert r["sid"] == "fire-sid-0001" and r["query_len"] > 0
+    assert r["bytes_injected"] == len(ctx.encode("utf-8"))
+    # a second, all-repeat firing is its own record, not a silent no-op
+    _run_env("fire-sid-0001", env)
+    assert [x["outcome"] for x in _fire_records(tmp_path)] == ["index", "all-repeat"]
+
+
+def test_fire_log_records_autonomous_skip_with_both_mode_readings(tmp_path):
+    """The stale-binding miss (binding autonomous, agent-wide file assistant
+    after a /stop) must be countable, so the skip carries BOTH readings. The
+    DRYRUN seam is set, so an empty stdout proves the gate, not a crash."""
+    env = _binding_tree(tmp_path, "fire-sid-0002", "autonomous", "assistant")
+    assert _run_env("fire-sid-0002", env).stdout.strip() == ""
+    (r,) = _fire_records(tmp_path)
+    assert r["outcome"] == "skip-autonomous"
+    assert (r["binding_mode"], r["agent_file_mode"]) == ("autonomous", "assistant")
+
+
+def test_fire_log_is_bounded_at_write_time(tmp_path):
+    """guard-583/guard-586: an append-only hook log needs a rotation policy in
+    place before its first write. Seed past the cap; the append trims first."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    cap = int(re.search(r"^_FIRE_LOG_ROTATE_BYTES\s*=\s*([\d_]+)", src, re.M)
+              .group(1).replace("_", ""))
+    keep = int(re.search(r"^_FIRE_LOG_KEEP_LINES\s*=\s*(\d+)", src, re.M).group(1))
+    p = tmp_path / "core" / "logs" / "prompt-retrieval-fires.jsonl"
+    p.parent.mkdir(parents=True)
+    line = json.dumps({"ts": "2026-01-01T00:00:00", "pad": "x" * 200})
+    n = cap // len(line) + keep + 10
+    p.write_text((line + "\n") * n, encoding="utf-8")
+    assert p.stat().st_size > cap        # positive control: the seed is over the cap
+    _run_env("fire-sid-0003", _assistant_tree(tmp_path, "fire-sid-0003"))
+    lines = p.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == keep + 1
+    assert json.loads(lines[-1])["sid"] == "fire-sid-0003"
+
+
+def test_fire_log_fault_never_changes_the_injection(tmp_path):
+    """Fail-open: with core/logs unusable (a FILE where the dir belongs) the
+    hook still injects exactly as before and never exits 2."""
+    env = _assistant_tree(tmp_path, "fire-sid-0004")
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "logs").write_text("not a dir", encoding="utf-8")
+    r = _run_env("fire-sid-0004", env)
+    assert r.returncode == 0
+    assert "system/alpha" in _ctx(r)

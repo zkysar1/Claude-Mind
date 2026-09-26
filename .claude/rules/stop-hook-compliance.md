@@ -47,26 +47,23 @@ a signal to stop.
    **Exception**: `core/scripts/reducer-self-fence.sh` (invoked only by
    `heartbeat-tick.sh`, on every tick, whatever the backend — g-115-8200)
    is authorized to set `stop-requested` when the cross-machine runner lease says
-   this box is no longer the reducer. The runner claim is a LEASE, and a lease
-   needs `T_stepdown < T_takeover`: the holder must stop acting as leader before a
-   peer may legally seize the claim, or both act as reducer at once. `T_stepdown`
-   was effectively INFINITY until this gate existed — measured 2026-08-05, cc-04
-   lost its claim at 14:38 and kept executing goals as reducer for 2.5+ hours
-   while two other bodies acquired it.
+   this box is no longer the reducer. A lease needs `T_stepdown < T_takeover`: the
+   holder must stop acting as leader before a peer may legally seize the claim.
    Like productivity-stop-gate, the script MUST write
    `agents/<agent>/session/stop-target-mode` ("assistant") BEFORE setting the
    signal, preserving the /stop invariant that Phase -1.4 reads the target mode
    without a fallback. The LLM MUST NOT invoke it directly — only
    `heartbeat-tick.sh` may.
    The decision is script-gated in `core/scripts/reducer_self_fence.py::decide`
-   (pure, fully branch-tested) and fires on exactly TWO triggers, both of which
-   must be read against the signal asymmetry that governs this whole gate: a
-   FAILED RENEWAL is ambiguous (a broken writer and a dead agent look identical
-   from here), while a claim held by a DIFFERENT MACHINE is unambiguous.
+   (pure, fully branch-tested; its docstring carries the lease argument, the
+   2026-08-05 incident and the signal asymmetry) and stands down on exactly THREE
+   triggers:
    - `different-holder` — the live claim names another machine. Decisive alone.
+   - `superseded-token` — the live claim's runner-token fingerprint is not this
+     box's (a same-box reducer restart the machine id cannot show). Decisive
+     alone; inert when either fingerprint is unreadable.
    - `sustained-renewal-gap` — renewal has failed CONTINUOUSLY for
-     `runner_heartbeat.stepdown_seconds` (1950s = half of T_takeover, deliberately
-     equal to the escalation threshold heartbeat-tick.sh already warns at).
+     `runner_heartbeat.stepdown_seconds` (1950s = half of T_takeover).
    Every other signal HOLDS, and that is the load-bearing half: a transient
    daemon blip, an unreadable holder id, an unrecognised rc, and `rc=4`
    (ABSENT | NOT-RUNNING | STALE | REFUSE) all keep the loop running. Stopping a
@@ -79,40 +76,33 @@ a signal to stop.
    <!-- exception added 2026-09-04 for loop-exhaustion-fence (g-115-8939) -->
    **Exception**: `core/scripts/loop-exhaustion-fence.sh` (invoked only by
    `stop-hook.sh`, immediately before it builds the BLOCK payload) is authorized
-   to set `stop-requested` when the loop CANNOT EXECUTE. A loop out of context
-   had no legal move but to iterate emptily — measured 2026-09-04 on cc-05:
-   ~35 null iterations over 2h21m, execution-diary mtime frozen throughout,
-   one full model turn per ~40s, because rules 3-4 of this file, the
-   never-self-stop invariant and the unconditional BLOCK are each correct and
-   together leave nothing else legal (USER DIRECTIVE: "the loop needs a branch
-   for 'no context to execute' that isn't 'iterate emptily'").
+   to set `stop-requested` when the loop CANNOT EXECUTE: rules 3-4 of this file,
+   the never-self-stop invariant and the unconditional BLOCK otherwise leave a
+   loop out of context no legal move but to iterate emptily.
    Like its two siblings it MUST write `stop-target-mode` ("assistant") BEFORE
    setting the signal. The LLM MUST NOT invoke it directly.
    The decision is script-gated in `core/scripts/loop_exhaustion_fence.py::decide`
-   (pure, fully branch-tested) and keys on a BEHAVIOURAL predicate the model
+   (pure, fully branch-tested; its docstring carries the 2026-09-04 incident and
+   the user directive) and keys on a BEHAVIOURAL predicate the model
    supplies no input to — N consecutive stop-hook BLOCKs for one sid with the
    execution diary's mtime frozen throughout — so "out of context" is
    structurally distinguishable from "feels done" and rule 5 is intact. It
-   deliberately does NOT decide on `context-budget-status.py`'s zone: that
-   sensor read `fresh` with 479998 headroom right through the measured
-   exhaustion (repaired 2026-09-04). Two rungs: `pause` at 4 BLOCKs writes
-   NOTHING and only directs the turn to end on a REGISTERED external-wait
-   sleep; `stop` at 10 writes the signal. Every unreadable input HOLDS —
-   stopping a healthy loop is worse than the disease (guard-1562).
+   deliberately does NOT decide on `context-budget-status.py`'s zone. Two rungs:
+   `pause` at 4 BLOCKs writes NOTHING and only directs the turn to end on a
+   REGISTERED external-wait sleep; `stop` at 10 writes the signal. Every
+   unreadable input HOLDS — stopping a healthy loop is worse than the disease
+   (guard-1562).
 
    <!-- exception added 2026-09-12 for the vessel sidecar (g-373-16) -->
    **Exception**: the **vessel sidecar** (`zakcode`, Zak-Code repo — the first
    authorized caller that is NOT a framework script) is authorized to write
    `stop-target-mode` then set `stop-requested` when a SERVED run ends: the
    human's `/run/stop`, or the run's own duration cap. Vinheim decides WHEN a run
-   ends; the MIND decides what its ending IS — and before this it could not. The
-   conductor severed the in-flight turn and spent the reserve on an injected recap
-   prompt, so consolidation and handoff never ran at all (guard-1807, user's
-   ruling: never WHAT the agent does; no injected prompts). Same two-write shape,
+   ends; the MIND decides what its ending IS. Same two-write shape,
    same order, same revert-on-failure as its three siblings above
    (`zakcode.session.framework_stop`), and ADDRESSED rather than discretionary: no
    `run_stop_agent` configured = no signal, so a non-seed workspace is untouched.
-   The LLM MUST NOT invoke it. Rationale + grace sizing:
+   The LLM MUST NOT invoke it. Rationale, the ruling it enacts, and grace sizing:
    `core/config/rationale/vessel-sidecar-stop-caller.md`.
 
    <!-- exception added 2026-04-19 for recovery-gate (cross-agent visibility plan) -->

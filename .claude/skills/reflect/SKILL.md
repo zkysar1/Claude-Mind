@@ -691,7 +691,12 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      # (g-115-2002 upstream variant used a baseline.rollback_count slice; the
      # timestamp filter below is self-contained — entries carry timestamps, no
      # baseline dependency — and was kept at the g-115-2022 merge.)
-     FOR EACH rollback in result.rollback_history WHERE rollback timestamp within last 14d:
+     # THE TIMESTAMP KEY IS `rolled_back_at`. There is NO `timestamp` key on a
+     # rollback row, so a filter on `timestamp` matches nothing and reports a
+     # confident "0 within 14d". Measured 2026-09-25 (echo, cc-03): 0 by
+     # `timestamp`, 3 by `rolled_back_at` (mc-1220, mc-1287, mc-1359), on 50/50
+     # rows carrying the key (guard-3459).
+     FOR EACH rollback in result.rollback_history WHERE rollback.rolled_back_at within last 14d:
          signals.append({source: "backpressure_rollback", id: rollback.meta_change_id, detail: rollback})
 
      # Synthesize weaknesses from signals

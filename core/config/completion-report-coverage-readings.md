@@ -225,3 +225,49 @@ followed by the reading's own interpretation.
   to archive.
   Record the KEY on every future row; a date-floored and a `resolved_at` row are different
   quantities.
+
+- **2026-09-25 · foxtrot · LAPTOP-3IOFCNEO (6.18.33.2-microsoft-standard-WSL2) · window 75.9h · keyed on `resolved_at` plus 1 date-only placement: 29 of 29 scoreable = 100% · store split resolved 41 / archived 1,852.**
+  PRIOR POINT RE-DERIVED FIRST (guard-1835). I re-ran the 09-23 row with this row's predicate
+  (`resolved_at` in [09-22T11:16:58, +28.9h]). It returns 4 scoreable, 3 CONFIRMED + 1 CORRECTED,
+  all 4 in the resolved stage. That is the same fraction and population as recorded, with the same
+  earliest resolution (09-22T21:10), so the predicate is stable. That row's END is inferred from
+  since + width, and two CORRECTED records resolved 44 min past it (09-23T16:54-16:55), so its
+  boundary is only good to about an hour.
+  THE KEY MOVES THE COUNT, AS THE 09-23 ROW PREDICTED. The date-floored `outcome_date` key returns
+  32 (19 CONFIRMED + 13 CORRECTED), also 100% in the resolved stage. Three of those 32 were
+  resolved on the boundary day, 04:26-05:10, before since (20:03:16):
+  `2026-06-22_signal-gated-cadence-routine-collapse` and
+  `2026-09-06_floor-promoted-recurring-goals-invert-the-interval-ratio` (CONFIRMED), and
+  `2026-09-07_third-inert-reader-in-the-env-server-node-key-census` (CORRECTED).
+  `resolved_at` gives 28 (16 + 12). The 29th is `2026-09-08_box-local-remedy-names-artifact`,
+  the record with no `resolved_at` that the 09-23 row names. Its `outcome_date` (09-22) is a day
+  past this window's boundary day, so the date key places it here unambiguously. Its ambiguity is
+  specific to windows whose boundary falls ON 09-22.
+  Independent corroboration: the lifetime accuracy counter moved 1,118 / 643 / 475 (prior report,
+  09-21T19:58) → 1,147 / 660 / 487. That is +29 resolved = 17 CONFIRMED + 12 CORRECTED, exactly the
+  `resolved_at` count, and it refutes the date floor's 32.
+  THE 100% IS NOT A FLOOR ARTIFACT. The window spans four calendar days, so guard-2303 does not
+  apply. The earliest in-window `resolved_at` (09-22T00:00:49) was 72h old at gather time and still
+  in the resolved stage.
+  Archival is also NOT waiting on reflection, which is the natural hypothesis and is falsified:
+  all 33 scoreable resolved-stage records carry `reflected: true`, as do all 1,114 scoreable
+  archived ones. What does trigger archival of a scoreable record was not measured.
+  In the same window, 14 NON-scoreable records (8 EXPIRED, 6 UNRESOLVABLE, date key) had already
+  reached the archive and no scoreable one had.
+
+- **2026-09-24 · zeta · cc-02 (6.8.0-139-generic) · window 29.1h · keyed on `resolved_at`: 17 of 17 scoreable = 100% · store split resolved 41 / archived 1,852.**
+  THE KEY CORROBORATES EXACTLY FOR THE SECOND ROW RUNNING. `resolved_at` gives 10 CONFIRMED + 7
+  CORRECTED, and the lifetime accuracy numerator moved 650/480 -> 660/487 over the same interval,
+  i.e. +10 / +7. A date floor on the same window returns 12 + 8 (36 records), which the digest
+  printed (fix still owned by g-115-10706, pending).
+  The backlog is 41 (25 at the prior row) and the earliest in-window resolution is 09-23T16:54,
+  so 100% is what the backlog model predicts. It is not a floor artifact.
+  STAMP COVERAGE BY OUTCOME, measured over `outcome_date` >= 2026-09-01: scoreable 184 of 185 carry
+  `resolved_at`, EXPIRED 1 of 54, UNRESOLVABLE 35 of 72. So a `resolved_at` key places scoreable
+  records reliably, while EXPIRED/UNRESOLVABLE tallies stay floored by the close paths that skip
+  the stamp. 7 records this window carry only since's own date and no `resolved_at`; all 7 are
+  non-scoreable, so this row's scoreable denominator is exact.
+- **2026-09-25 · echo · cc-03 (6.8.0-139-generic) · window 82.9h · keyed on `resolved_at` plus 1 date-only placement: 27 of 29 scoreable = 93.1% · store split resolved 37 / archived 1,871.**
+  Same window keyed on the date-only `outcome_date` read 27 of 34 = 79.4%. The 5 extra are archived-stage records whose date is 2026-09-22 but whose `resolved_at` falls before the window opened at 11:02:52. So on a window that opens mid-day, the date floor (guard-2303) DEFLATES coverage by pulling in pre-window archived records; it does not only inflate same-day windows. Key on `resolved_at` when it is present.
+- **2026-09-26 · zeta · cc-02 (6.8.0-139-generic) · window 10.3h · keyed on `resolved_at`: 6 of 6 scoreable = 100% · store split resolved 27 / archived 1,888.**
+  All 9 records stamped inside the window sit in the resolved stage (3 CONFIRMED, 3 CORRECTED, 3 UNRESOLVABLE). 6 archived-stage records carry only a date-only `outcome_date` and no `resolved_at`: 2 UNRESOLVABLE and 2 EXPIRED dated 09-25, which may predate the 17:59 start, and 2 EXPIRED dated 09-26. All 6 are non-scoreable, so the scoreable denominator is exact. The backlog is 27 (37 at the prior row) and the earliest in-window resolution is 09-25T17:59:54, so for a 10h window 100% is what the backlog model predicts. For the same window the fleet digest printed 6 confirmed / 4 corrected, because it counts on the widened date floor (g-115-10706, pending).

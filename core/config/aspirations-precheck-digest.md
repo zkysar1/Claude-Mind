@@ -58,10 +58,9 @@ Rationale (WHY unblock-parent-status sweep): `core/config/rationale/precheck-gat
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check unblock-parent-status-sweep)
 Bash: bash core/scripts/unblock-parent-status-sweep.sh --apply
 # (engine: core/scripts/unblock-parent-status-sweep.py behind the wrapper)
-# Iterates world + agent queues. For each pending "Unblock:" with a
-# parseable parent goal-id whose parent.status is terminal, marks the
-# Unblock status=skipped with outcome_note
-# "parent resolved without action needed (parent_id=<X>, parent.status=<Y>)".
+# Iterates world + agent queues. Each open "Unblock:" with a terminal parent
+# is marked skipped: "parent resolved without action needed", or "parent
+# resolved; this Unblock was worked" when it has execution history (g-306-510).
 # Single-writer, idempotent (outcome_note prefix check), fail-quiet —
 # same rb-428 pattern as defer-recheck.sh / pending-questions-sweep.sh /
 # parent-supersession-sweep.sh.

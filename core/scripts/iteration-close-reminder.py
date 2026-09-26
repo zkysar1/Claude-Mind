@@ -97,8 +97,9 @@ REMINDER_TEXT_GENERIC_DEADMAN = (
     "recurring-close.sh OUTCOME=routine completed). The deadman-switch is ON "
     "(default), so your terminal response MUST be EXACTLY these TWO batched tool "
     "calls, IN THIS ORDER, in this ONE response:\n"
-    "  (1) ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", delaySeconds=600) "
-    "— the self-resurrection net; MANDATORY, do NOT omit it; THEN\n"
+    "  (1) ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", delaySeconds=600, noop=false, reason=\"deadman resurrection net\") "
+    "— the self-resurrection net (noop and reason are REQUIRED unless stop:true, "
+    "or the harness refuses the arm and NO net is set — g-115-10755); MANDATORY, do NOT omit it; THEN\n"
     "  (2) Skill(aspirations) with args='loop' — the primary re-entry and the "
     "LAST call, which continues the loop NOW.\n"
     "Emit BOTH in this single response with NO text before or between them. Do "
@@ -118,7 +119,7 @@ REMINDER_TEXT_DEEP_RECURRING_DEADMAN = (
     "— Phase 6 spark fires on deep closes and is NOT wrapped by recurring-close.sh. "
     "AFTER Phase 6 completes, re-enter the loop with the deadman PAIR, in this "
     "order and in one response: ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\", "
-    "delaySeconds=600) THEN Skill(aspirations) with args='loop'. Do NOT emit text "
+    "delaySeconds=600, noop=false, reason=\"deadman resurrection net\") THEN Skill(aspirations) with args='loop'. Do NOT emit text "
     "or a Bash echo before Skill(aspirations-spark). See "
     ".claude/skills/aspirations/SKILL.md \"Recurring-goal shortcut\" section and "
     ".claude/rules/return-protocol.md.\n"
@@ -155,6 +156,27 @@ def _is_deep_recurring_close(tool_response) -> bool:
     if not isinstance(stdout, str):
         return False
     return _DEEP_RECURRING_RE.search(stdout) is not None
+
+
+# : recurring-close.sh prints an INTERVAL MOVED review when this close's
+# own tuner (auto-extend / auto-contract) moved the goal's persisted
+# interval_hours, and points its NEXT ACTION line at it. Every reminder above
+# outranks that stdout and says "VERY NEXT tool call MUST be ...", which would
+# forbid the review's restore call on the one path this hook fires on, so the
+# reminder is PREFIXED, never replaced, when the review printed. Anchored like the
+# markers here: the producer tag, then only a non-word run (the warning sign)
+# before the phrase, so the review's Q1/Q2/Restore lines never match, only its
+# headline.
+_INTERVAL_REVIEW_RE = re.compile(r"\[recurring-close\][^\w\n]*INTERVAL MOVED")
+
+INTERVAL_REVIEW_PREFIX = (
+    "FIRST settle the INTERVAL MOVED review in the close output above: an "
+    "automated tuner just moved this goal's interval_hours. Answer its questions. "
+    "If it says restore, run the restore command it prints (and set "
+    "interval_pinned_by if its Q1 says so); those are the ONLY calls allowed "
+    "ahead of the directive below, and its 'VERY NEXT' means next after them. If "
+    "the tuner was right, change nothing. THEN:\n"
+)
 
 
 # Success marker — the TERMINAL line BOTH closers emit, and the only evidence
@@ -426,6 +448,11 @@ def main():
     else:
         reminder_text = (REMINDER_TEXT_GENERIC_DEADMAN if deadman_on
                          else REMINDER_TEXT_GENERIC)
+    # The outcome gate above already proved tool_response is a dict whose stdout
+    # is a str, so this read cannot raise.
+    if _INTERVAL_REVIEW_RE.search(tool_response["stdout"]):
+        reminder_text = reminder_text.replace(
+            "<system-reminder>\n", "<system-reminder>\n" + INTERVAL_REVIEW_PREFIX, 1)
 
     # Inject the imperative as additionalContext. The model sees this in its
     # next turn's context window alongside the tool output, so ignoring it

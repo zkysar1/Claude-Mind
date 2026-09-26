@@ -560,3 +560,132 @@ def test_a_record_is_written_even_when_the_body_RAISES(monkeypatch):
     assert rsp["live_workers"] == 0
     assert rsp["stale_rows_ignored"] is None
     assert rsp["undated_rows_ignored"] is None
+    assert rsp["reducer_only_rows_unclaimable"] == 0
+    assert rsp["unclaimable"] == []
+
+
+# ─── the claimable filter () ──────────────────────────────────────
+#
+# The floor's nominees used to be every reducer-only row in the pool. A routed-
+# away row can be IN the pool (collect_candidates' idle-owner and cadence rescue
+# doors), and measured 2026-09-23 (zeta, cc-02) the floor hoisted  --
+# intended_agent=alpha -- into zeta's top slot while alpha alone held the live
+# Bodies: claim -> takeover_refused -> release -> the same row next iteration.
+# The filter reuses _strategic_focus_claimable, so these pin ROUTING OUTCOMES in
+# both directions, not a second predicate.
+
+ROSTER = ["alpha", "bravo", "echo", "foxtrot", "zeta"]
+
+
+@pytest.fixture
+def _pinned_roster(monkeypatch):
+    """routes_away_from reads the LIVE roster on every call. Pin it, or a box
+    whose team-state lacks a name answers these routing assertions differently."""
+    import aspirations
+    monkeypatch.setattr(aspirations, "_get_active_agents", lambda: list(ROSTER))
+
+
+def _routed(*specs):
+    """specs: (goal_id, executable_by_role, intended_agent)."""
+    return [{"goal_id": g, "skill": None, "executable_by_role": r,
+             "intended_agent": ia, "routed_to_me": False, "score": 10.0 - i}
+            for i, (g, r, ia) in enumerate(specs)]
+
+
+def _floor_as(monkeypatch, agent, rows, prior_hoist=False):
+    """The floor as `agent`'s reducer with five live alpha Bodies. agent_dir is
+    read only for its NAME: _reducer_policy_inputs is stubbed, so nothing on disk
+    is touched."""
+    monkeypatch.setattr(gs, "_reducer_policy_inputs",
+                        lambda agent_dir: (None, SID, SID))
+    monkeypatch.setattr(gs, "_load_team_state_cached", lambda: _team_state(
+        *[("alpha", f"s{i}", 1) for i in range(5)]))
+    monkeypatch.setattr(gs, "REDUCER_SELECTION_CONFIG", dict(R.DEFAULTS))
+    return gs.apply_reducer_only_floor(
+        rows, Path("/nonexistent/agents") / agent,
+        prior_hoist_fired=prior_hoist, now=NOW)
+
+
+def test_a_row_routed_to_another_agent_is_skipped_for_the_next_claimable_one(
+        monkeypatch, _pinned_roster):
+    """The measured case: zeta's reducer, alpha's carrier row ranked first."""
+    rows = _routed(("g-1-1", None, None),
+                   ("g-306-284", "reducer", "alpha"),
+                   ("g-2-2", "reducer", "either"))
+    picked, status = _floor_as(monkeypatch, "zeta", rows)
+    assert picked is not None and picked["goal_id"] == "g-2-2"
+    assert rows[0]["goal_id"] == "g-2-2"
+    routed_away = next(r for r in rows if r["goal_id"] == "g-306-284")
+    assert "reducer_only_pick" not in routed_away
+    assert status["reducer_only_rows"] == 2
+    assert status["reducer_only_rows_unclaimable"] == 1
+    assert status["unclaimable"] == [
+        {"goal_id": "g-306-284", "intended_agent": "alpha"}]
+
+
+def test_when_every_reducer_only_row_is_routed_away_the_floor_is_inert(
+        monkeypatch, _pinned_roster):
+    """No claimable nominee returns the inert None and leaves the order alone.
+    Before the fix the floor hoisted the refused row here."""
+    rows = _routed(("g-1-1", None, None), ("g-306-284", "reducer", "alpha"))
+    before = [dict(r) for r in rows]
+    picked, status = _floor_as(monkeypatch, "zeta", rows)
+    assert picked is None and status["picked"] is None
+    assert rows == before
+    assert status["reducer_only_rows"] == 1
+    assert status["reducer_only_rows_unclaimable"] == 1
+
+
+@pytest.mark.parametrize("ia", [None, "", "either", "zeta", "delta"])
+def test_self_either_unset_and_off_roster_rows_are_still_nominated(
+        monkeypatch, _pinned_roster, ia):
+    """The other direction (guard-6106): the permissive values stay AVAILABLE.
+    'delta' is off the pinned roster, and a value naming nobody routes nowhere
+    (g-115-3482), so it is claimable like 'either'."""
+    rows = _routed(("g-1-1", None, None), ("g-2-2", "reducer", ia))
+    picked, status = _floor_as(monkeypatch, "zeta", rows)
+    assert picked is not None and picked["goal_id"] == "g-2-2"
+    assert status["reducer_only_rows_unclaimable"] == 0
+    assert status["unclaimable"] == []
+
+
+def test_the_same_row_is_still_nominated_for_the_agent_it_is_routed_to(
+        monkeypatch, _pinned_roster):
+    """The filter keys on WHO is selecting:  stays alpha's floor pick."""
+    rows = _routed(("g-1-1", None, None), ("g-306-284", "reducer", "alpha"))
+    picked, status = _floor_as(monkeypatch, "alpha", rows)
+    assert picked is not None and picked["goal_id"] == "g-306-284"
+    assert status["reducer_only_rows_unclaimable"] == 0
+
+
+def test_the_emitted_row_carries_the_routing_the_filter_reads(
+        monkeypatch, _pinned_roster):
+    """guard-920 / guard-5921: drive the REAL emitter. Hand-built rows prove the
+    predicate, never that score_goal hands the floor intended_agent."""
+    gs._ACTIVE_DIRECTIVES = []
+    rows = []
+    for gid, ia in (("g-306-284", "alpha"), ("g-2-2", "either")):
+        goal = {"id": gid, "title": "t", "priority": "HIGH",
+                "executable_by_role": "reducer", "intended_agent": ia}
+        rows.append(gs.score_goal(
+            {"goal": goal, "aspiration": {"id": "asp-x"}, "source": "world"},
+            {}, [], []))
+    assert rows[0]["intended_agent"] == "alpha"
+    picked, status = _floor_as(monkeypatch, "zeta", rows)
+    assert picked is not None and picked["goal_id"] == "g-2-2"
+    assert status["reducer_only_rows_unclaimable"] == 1
+
+
+def test_the_diary_row_carries_the_exclusion_on_every_reducer_call(
+        monkeypatch, _pinned_roster):
+    """guard-3211: the excluded count is recorded when it is ZERO too, so a
+    filter that excluded nothing and a missing filter read differently."""
+    seen = _record_sink(monkeypatch)
+    _floor_as(monkeypatch, "zeta", _routed(("g-2-2", "reducer", "either")))
+    _floor_as(monkeypatch, "zeta", _routed(("g-306-284", "reducer", "alpha")))
+    assert [e["reducer_selection_policy"]["reducer_only_rows_unclaimable"]
+            for e in seen] == [0, 1]
+    assert seen[1]["reducer_selection_policy"]["unclaimable"] == [
+        {"goal_id": "g-306-284", "intended_agent": "alpha"}]
+    assert seen[1]["reducer_selection_policy"]["picked"] is None
+    assert "unclaimable=1" in seen[1]["content"]

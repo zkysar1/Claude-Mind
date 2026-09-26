@@ -187,7 +187,8 @@ rt_is_up() {
     [ -n "$base" ] || return 1
     # --max-time 1: don't hang the wrapper if the daemon is wedged.
     # --fail: nonzero on HTTP 4xx/5xx, so a bad daemon counts as down.
-    curl -s -f --max-time 1 "$base/v1/admin/health" >/dev/null 2>&1
+    _rt_health_auth
+    curl -s -f --max-time 1 ${_RT_HEALTH_AUTH[@]+"${_RT_HEALTH_AUTH[@]}"} "$base/v1/admin/health" >/dev/null 2>&1
 }
 
 # rt_check_staleness — warn ONCE per shell when the running daemon's git SHA
@@ -214,7 +215,8 @@ rt_check_staleness() {
     on_disk="$(rt_on_disk_sha)" || return 0
     [ -n "$on_disk" ] || return 0
     local response
-    response=$(curl -s -f --max-time 1 "$base/v1/admin/health" 2>/dev/null) || return 0
+    _rt_health_auth
+    response=$(curl -s -f --max-time 1 ${_RT_HEALTH_AUTH[@]+"${_RT_HEALTH_AUTH[@]}"} "$base/v1/admin/health" 2>/dev/null) || return 0
     # Field-presence check FIRST. Without it, the pure-bash extract below
     # silently turns a missing field into garbage (running_sha = "{ok:true")
     # and false-warns. Bash `${var#pattern}` returns var unchanged when
@@ -303,7 +305,8 @@ rt_daemon_is_fresh() {
     base="$(rt_base_url)"; [ -n "$base" ] || return 1
     on_disk="$(rt_on_disk_sha)" || return 1
     [ -n "$on_disk" ] || return 1
-    response=$(curl -s -f --max-time 1 "$base/v1/admin/health" 2>/dev/null) || return 1
+    _rt_health_auth
+    response=$(curl -s -f --max-time 1 ${_RT_HEALTH_AUTH[@]+"${_RT_HEALTH_AUTH[@]}"} "$base/v1/admin/health" 2>/dev/null) || return 1
     case "$response" in *'"git_head_sha"'*) ;; *) return 1;; esac
     running_sha="${response#*\"git_head_sha\":}"
     running_sha="${running_sha%%,*}"
@@ -736,7 +739,8 @@ rt_daemon_kill() {
     local max_iters=5
     while [ "$waited" -lt "$max_iters" ]; do
         if [ -n "$port" ]; then
-            if ! curl -s -f --max-time 0.3 "http://127.0.0.1:${port}/v1/admin/health" >/dev/null 2>&1; then
+            _rt_health_auth
+            if ! curl -s -f --max-time 0.3 ${_RT_HEALTH_AUTH[@]+"${_RT_HEALTH_AUTH[@]}"} "http://127.0.0.1:${port}/v1/admin/health" >/dev/null 2>&1; then
                 break
             fi
         else
@@ -925,6 +929,22 @@ _rt_api_token() {
         fi
     fi
     printf '%s' "${_RT_ENV_TOKEN:-}"
+}
+
+# _rt_health_auth — curl args carrying the FR-4 bearer for the bare
+# /v1/admin/health probes in this file (). Once MIND_API_TOKEN is set
+# the daemon answers every request without a matching bearer with 401, health
+# included, so a bare probe read a live daemon as down: agent-watchdog --tick
+# respawned it on every iteration close (cc-03: 2,196 in a row). Sets the array
+# _RT_HEALTH_AUTH, empty on a token-less box so those probes send exactly what
+# they sent before. Callers expand it with the ${arr[@]+...} form, which is safe
+# under set -u.
+_rt_health_auth() {
+    _RT_HEALTH_AUTH=()
+    local _rt_htok
+    _rt_htok="$(_rt_api_token)"
+    [ -n "$_rt_htok" ] && _RT_HEALTH_AUTH=( -H "Authorization: Bearer ${_rt_htok}" )
+    return 0
 }
 
 # _rt_curl_capture — rt_curl's engine (). Same request, same return
@@ -1391,5 +1411,6 @@ rt_curl_silent_health() {
     local port
     port="$(rt_port)"
     [ -z "$port" ] && return 1
-    curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/v1/admin/health" 2>/dev/null | grep -qE '^(200|400|404)$'
+    _rt_health_auth
+    curl -s --max-time 2 -o /dev/null -w '%{http_code}' ${_RT_HEALTH_AUTH[@]+"${_RT_HEALTH_AUTH[@]}"} "http://127.0.0.1:${port}/v1/admin/health" 2>/dev/null | grep -qE '^(200|400|404)$'
 }

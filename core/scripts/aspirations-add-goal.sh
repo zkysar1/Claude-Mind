@@ -139,29 +139,36 @@ while [[ $# -gt 0 ]]; do
             SCHEMA=1
             PASSTHROUGH+=("$1"); shift;;
         --override-signal)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_SIGNAL="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-duplication)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_DUPLICATION="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-no-investigate)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_NO_INVESTIGATE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-deadline)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_DEADLINE="${2-}"
             shift 2;;
         --override-offload)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_OFFLOAD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-all)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_ALL="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --allow-new-field)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             ALLOW_NEW_FIELD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;

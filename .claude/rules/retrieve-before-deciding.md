@@ -59,18 +59,14 @@ or has to be undone. In particular:
    ownership check before filing, a duplicate scan, a "does this exist yet"
    grep, a suppression gate's lookup. A probe whose zero authorizes a write
    has already made the decision. Retrieve against the PROBE ITSELF — the
-   tool, its flags, its failure modes — not only the subject (guard-3362:
-   an unsupported flag refused twice, piped into a parser as a clean empty,
-   two duplicate goals filed).
+   tool, its flags, its failure modes — not only the subject (guard-3362).
 13. **Computing a census or aggregate over a store** — any count, tally,
    distribution or "N of M" you intend to report or act on. Retrieve on the
    MECHANISM ("counting records in a JSONL store by tallying one field",
    "producing a zero from a filter I wrote this turn"), not only on the
-   subject — the count-hazard guardrails (positive control before believing
-   a zero, unfiltered population beside the filtered count, never a zero from
-   truncated output) are indexed on the operation; measured, subject queries
-   missed 15–20 of 20 across four censuses. SSOT for the two-query
-   mechanism: `core/config/conventions/retrieval-triggers.md` § "Why TWO queries".
+   subject — the count-hazard guardrails are indexed on the operation, so
+   subject queries miss them. SSOT for the two-query mechanism:
+   `core/config/conventions/retrieval-triggers.md` § "Why TWO queries".
 
 If you find yourself making one of these decisions without having
 retrieved in the same turn, STOP and retrieve first.
@@ -84,8 +80,8 @@ right shape (footnotes on the fallback fields and flags: retrieval-triggers.md
 | Decision shape | Invocation |
 |----------------|------------|
 | Goal/topic is clearly categorized | `retrieve.sh --category <cat> --depth medium` |
-| Free-text query (no exact category) | `retrieve.sh --category "<free text>" --depth shallow` (token-overlap; supplementary stores fall back to `rule` / `summary` / `tags` / `when_to_use.conditions` — `rule` is the field guardrails actually carry) |
-| Pre-apply consultation for framework-file fix | `retrieve.sh --category "<one-line fix description>" --depth shallow --include-framework` (the flag is REQUIRED — without it there is no `framework_rules` key at all; g-115-3777) |
+| Free-text query (no exact category) | `retrieve.sh --category "<free text>" --depth shallow` (token-overlap) |
+| Pre-apply consultation for framework-file fix | `retrieve.sh --category "<one-line fix description>" --depth shallow --include-framework` (the flag is REQUIRED; g-115-3777) |
 | Reader mode / observer session (side-effect-free) | `retrieve.sh --category <q> --read-only` |
 | Need full-body content of supplementary entries | `retrieve.sh --category <cat> --full-content` (opt-in; default is metadata-only) |
 | Goal-execution retrieval (writes retrieval-session.json) | `retrieve.sh --category <cat> --goal <goal-id> --tree-nodes "<comma-keys>"` |
@@ -145,13 +141,8 @@ knowledge.
   during goal execution; forces retroactive retrieval when Phase 4 skipped it
 - `exhaustive-search-before-negation.md` — gates "doesn't exist" claims
 - Advisory PreToolUse[Edit] gate `core/scripts/pre-edit-context-gate.sh` —
-  advisory only, fires for the manifest's trackable subset; silent elsewhere,
-  where Rules 1-3 of `read-before-edit.md` are the only safeguard
+  partial by design; `read-before-edit.md` Rules 1-3 are the real safeguard
   (retrieval-triggers.md G14 and § Enforcement note)
-
-The catalog in `core/config/conventions/retrieval-triggers.md` lists the
-additional decision points where retrieval should fire but currently doesn't
-(stable Gxx identifiers).
 
 ## Cross-references
 

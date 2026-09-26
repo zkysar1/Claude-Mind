@@ -13,6 +13,15 @@ C. Arming the sentinel with NO loop under it (2026-09-21). A net outlives the
    it reads the state gate that refuses -- so an IDLE agent re-enters the same
    turn forever. Exact mirror of B: B refuses a cancel while RUNNING, C refuses
    an arm while not.
+E. An arm WITHOUT `noop` (2026-09-24, g-115-10755) or WITHOUT `reason`
+   (2026-09-25, g-115-10936). Claude Code 2.1.280 refuses either and sets no
+   wakeup, while the batched Skill re-entry makes the loop look healthy. Every
+   other class sends both fields (see run_gate).
+   The check is that harness's rule and applies only under it (2026-09-25): a
+   Zak-Code Body's ScheduleWakeup arms without the field, and denying it there
+   wedged a worker Body on nine identical retries in one turn. run_gate pins the
+   harness explicitly, so the verdicts never depend on which harness runs the
+   suite (a worker Body runs it too).
 
 The gate is invoked exactly as production invokes it -- a subprocess reading the
 PreToolUse payload from stdin (probe-with-canonical-code-path: canonical BINARY
@@ -31,10 +40,43 @@ import pytest
 GATE = Path(__file__).resolve().parents[1] / "schedule-wakeup-gate.py"
 
 
+HARNESS_MARKERS = ("CLAUDECODE", "ZAKCODE_SESSION", "ZAKCODE_MODEL")
+
+
 def run_gate(tool_input, agent_dir=None, tool_name="ScheduleWakeup",
-             session_id=None):
-    """Invoke the gate as production does. Returns (rc, decision_or_None)."""
+             session_id=None, complete_noop=True, harness="claude-code",
+             complete_reason=True):
+    """Invoke the gate as production does. Returns (rc, decision_or_None).
+
+    complete_noop: an ARM (no truthy `stop`) that omits `noop` gets noop=false,
+    because the harness refuses an arm without it (class E). Without this, a
+    class A or C positive control would still pass with its own guard unwired,
+    denied by the noop check instead. Class E opts out to test that check.
+
+    complete_reason: the same for `reason`, the harness's second required arm
+    field (g-115-10936). Class E's reason tests opt out to test that check.
+
+    harness: which harness's marker the gate sees -- "claude-code" (CLAUDECODE=1,
+    the default: the rule class E mirrors is Claude Code's), "zakcode"
+    (ZAKCODE_SESSION set, as Agent.__init__ exports it to every hook) or
+    "unknown" (no marker). Pinned here, never inherited, so a class E verdict is
+    the same whichever harness runs this suite.
+    """
+    if (complete_noop and isinstance(tool_input, dict)
+            and not tool_input.get("stop") and "noop" not in tool_input):
+        tool_input = {**tool_input, "noop": False}
+    if (complete_reason and isinstance(tool_input, dict)
+            and not tool_input.get("stop") and "reason" not in tool_input):
+        tool_input = {**tool_input, "reason": "test arm"}
     env = dict(os.environ)
+    for name in HARNESS_MARKERS:
+        env.pop(name, None)
+    if harness == "claude-code":
+        env["CLAUDECODE"] = "1"
+    elif harness == "zakcode":
+        env["ZAKCODE_SESSION"] = "0123456789abcdef0123456789abcdef"
+    elif harness != "unknown":
+        raise ValueError(f"unknown harness pin {harness!r}")
     env.pop("MIND_AGENT", None)
     if agent_dir is not None:
         env["MIND_AGENT_DIR"] = str(agent_dir)
@@ -312,6 +354,206 @@ def test_sanctioned_prompts_allowed(prompt, agent):
     set_state(agent, "RUNNING")
     rc, decision, _ = run_gate({"prompt": prompt}, agent_dir=agent)
     assert (rc, decision) == (0, None)
+
+
+# ---------------------------------------------------------------- class E ---
+# Outcome table from _arm_lacks_noop's docstring (guard-3328). Class B's
+# stop:true cases also pin outcome 2: run_gate never completes a stop-bearing
+# call, so they send neither field and still pass.
+
+@pytest.mark.parametrize("prompt", [
+    "<<autonomous-loop-dynamic>>",           # the deadman net
+    "check GitHub PR #142 CI run status",    # an external wait or a park re-arm
+    "/loop investigate flaky test",          # a user /loop continuation
+])
+def test_an_arm_without_noop_is_denied(prompt, agent):
+    """POSITIVE CONTROL: the call CC 2.1.280 refuses while the batched Skill
+    re-entry runs on. Every arm needs the field, not only the sentinel."""
+    set_state(agent, "RUNNING")
+    rc, decision, _ = run_gate({"prompt": prompt}, agent_dir=agent,
+                               complete_noop=False)
+    assert (rc, decision) == (0, "deny")
+
+
+def test_the_noop_denial_names_the_field_and_the_fix(agent):
+    """A deny the model cannot act on is a deny it will retry (guard-1680)."""
+    set_state(agent, "RUNNING")
+    _, _, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>"},
+                         agent_dir=agent, complete_noop=False)
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "`noop` is missing" in reason
+    assert "noop=false" in reason
+    assert reason == _load_gate_module().NOOP_DENY_REASON
+
+
+def test_a_null_noop_is_a_missing_noop(agent):
+    """Outcome 4: null is not a boolean, and the harness requires one."""
+    set_state(agent, "RUNNING")
+    _, decision, _ = run_gate({"prompt": "<<autonomous-loop-dynamic>>", "noop": None},
+                              agent_dir=agent, complete_noop=False)
+    assert decision == "deny"
+
+
+@pytest.mark.parametrize("noop", [False, True])
+def test_either_noop_value_satisfies_the_check(noop, agent):
+    """Outcome 3: the gate demands the FIELD, not a value."""
+    set_state(agent, "RUNNING")
+    rc, decision, _ = run_gate({"prompt": "<<autonomous-loop-dynamic>>", "noop": noop},
+                               agent_dir=agent, complete_noop=False)
+    assert (rc, decision) == (0, None)
+
+
+# Outcome table from _harness_requires_arm_fields's docstring (guard-3328). The
+# Claude Code outcome is every class E test above; these pin the other two,
+# each beside the same call under Claude Code so the deny is shown to exist
+# before its absence is read as the carve-out (guard-4166).
+
+@pytest.mark.parametrize("prompt", [
+    "<<autonomous-loop-dynamic>>",           # the deadman net
+    "check GitHub PR #142 CI run status",    # a park re-arm / external wait
+])
+def test_under_zakcode_an_arm_without_noop_is_allowed(prompt, agent):
+    """Outcome 2: the Zak-Code slot arms with noop=None, so the field is not the
+    harness's rule there -- the deny only wedged the Body on identical retries."""
+    set_state(agent, "RUNNING")
+    call = {"prompt": prompt}
+    _, under_claude_code, _ = run_gate(call, agent_dir=agent, complete_noop=False)
+    assert under_claude_code == "deny"                       # positive control
+    rc, decision, _ = run_gate(call, agent_dir=agent, complete_noop=False,
+                               harness="zakcode")
+    assert (rc, decision) == (0, None)
+
+
+def test_an_unknown_harness_keeps_the_strict_rule(agent):
+    """Outcome 3: no marker at all reads as Claude Code, the harness whose
+    refusal is silent -- one actionable deny beats a net that never arms."""
+    set_state(agent, "RUNNING")
+    _, decision, _ = run_gate({"prompt": "<<autonomous-loop-dynamic>>"}, agent_dir=agent,
+                              complete_noop=False, harness="unknown")
+    assert decision == "deny"
+
+
+def test_the_zakcode_carve_out_reaches_no_other_check(agent):
+    """Only class E is Claude Code's rule; classes A and B hold under Zak-Code."""
+    set_state(agent, "RUNNING")
+    _, slash, _ = run_gate({"prompt": "/aspirations loop", "noop": False},
+                           agent_dir=agent, harness="zakcode")
+    assert slash == "deny"
+    _, cancel, _ = run_gate({"stop": True}, agent_dir=agent, harness="zakcode")
+    assert cancel == "deny"
+
+
+def test_a_cancel_needs_neither_noop_nor_reason(agent):
+    """Outcome 2 of both field checks: the harness requires them only when
+    `stop` is not true, and the cancel a real /stop makes must keep passing."""
+    set_state(agent, "RUNNING")
+    (agent / "session" / "stop-requested").write_text("1", encoding="utf-8")
+    rc, decision, _ = run_gate({"stop": True}, agent_dir=agent, complete_noop=False,
+                               complete_reason=False)
+    assert (rc, decision) == (0, None)
+
+
+@pytest.mark.parametrize("call", [
+    {"prompt": "<<autonomous-loop-dynamic>>"},                  # neither field
+    {"prompt": "<<autonomous-loop-dynamic>>", "noop": False},   # no reason
+])
+def test_a_more_fundamental_refusal_keeps_its_own_reason(call, agent):
+    """The field checks run LAST: an IDLE arm missing a field is told there is
+    no loop to resurrect (class C), not to add a field and arm anyway."""
+    set_state(agent, "IDLE")
+    _, decision, out = run_gate(call, agent_dir=agent, complete_noop=False,
+                                complete_reason=False)
+    assert decision == "deny"
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    gate = _load_gate_module()
+    assert reason not in (gate.NOOP_DENY_REASON, gate.REASON_DENY_REASON)
+    assert "no loop under the net" in reason
+
+
+# Class E's second field (): the same harness refuses an arm without
+# `reason`. Outcome table from _arm_lacks_reason's docstring (guard-3328); each
+# call sends noop=False, so only the reason check can fire.
+
+@pytest.mark.parametrize("prompt", [
+    "<<autonomous-loop-dynamic>>",           # the deadman net
+    "check GitHub PR #142 CI run status",    # an external wait or a park re-arm
+    "/loop investigate flaky test",          # a user /loop continuation
+])
+def test_an_arm_without_reason_is_denied(prompt, agent):
+    """POSITIVE CONTROL: "`delaySeconds` and `reason` are required when `stop`
+    is not true." (measured on cc-02, g-115-10936) -- the harness sets no
+    wakeup, and the Skill re-entry runs on."""
+    set_state(agent, "RUNNING")
+    rc, decision, _ = run_gate({"prompt": prompt, "noop": False}, agent_dir=agent,
+                               complete_reason=False)
+    assert (rc, decision) == (0, "deny")
+
+
+def test_the_reason_denial_names_the_field_and_the_fix(agent):
+    """A deny the model cannot act on is a deny it will retry (guard-1680)."""
+    set_state(agent, "RUNNING")
+    _, _, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>", "noop": False},
+                         agent_dir=agent, complete_reason=False)
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "`reason` is missing" in reason
+    assert "reason='deadman resurrection net'" in reason
+    assert reason == _load_gate_module().REASON_DENY_REASON
+
+
+def test_a_null_reason_is_a_missing_reason(agent):
+    """Outcome 4: null is no reason at all."""
+    set_state(agent, "RUNNING")
+    _, decision, _ = run_gate(
+        {"prompt": "<<autonomous-loop-dynamic>>", "noop": False, "reason": None},
+        agent_dir=agent, complete_reason=False)
+    assert decision == "deny"
+
+
+@pytest.mark.parametrize("why", ["deadman resurrection net", "park re-poll"])
+def test_any_reason_satisfies_the_check(why, agent):
+    """Outcome 3: the gate demands the FIELD, not a wording."""
+    set_state(agent, "RUNNING")
+    rc, decision, _ = run_gate(
+        {"prompt": "<<autonomous-loop-dynamic>>", "noop": False, "reason": why},
+        agent_dir=agent, complete_reason=False)
+    assert (rc, decision) == (0, None)
+
+
+@pytest.mark.parametrize("prompt", [
+    "<<autonomous-loop-dynamic>>",           # the deadman net
+    "check GitHub PR #142 CI run status",    # a park re-arm / external wait
+])
+def test_under_zakcode_an_arm_without_reason_is_allowed(prompt, agent):
+    """Zak-Code's ScheduleWakeup schema declares `reason` optional, so the
+    harness carve-out covers this field exactly as it covers noop."""
+    set_state(agent, "RUNNING")
+    call = {"prompt": prompt, "noop": False}
+    _, under_claude_code, _ = run_gate(call, agent_dir=agent, complete_reason=False)
+    assert under_claude_code == "deny"                       # positive control
+    rc, decision, _ = run_gate(call, agent_dir=agent, complete_reason=False,
+                               harness="zakcode")
+    assert (rc, decision) == (0, None)
+
+
+def test_an_unknown_harness_requires_a_reason_too(agent):
+    """No marker reads as Claude Code for this field as for noop."""
+    set_state(agent, "RUNNING")
+    _, decision, _ = run_gate({"prompt": "<<autonomous-loop-dynamic>>", "noop": False},
+                              agent_dir=agent, complete_reason=False, harness="unknown")
+    assert decision == "deny"
+
+
+def test_an_arm_missing_both_fields_gets_one_deny_that_fixes_both(agent):
+    """The noop check runs first and its example carries `reason`, so one retry
+    of the example clears both checks instead of one refusal per turn."""
+    set_state(agent, "RUNNING")
+    _, decision, out = run_gate({"prompt": "<<autonomous-loop-dynamic>>"},
+                                agent_dir=agent, complete_noop=False,
+                                complete_reason=False)
+    assert decision == "deny"
+    reason = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"]
+    assert reason == _load_gate_module().NOOP_DENY_REASON
+    assert "noop=false, reason='deadman resurrection net'" in reason
 
 
 # ------------------------------------------------- resolution mechanism ---

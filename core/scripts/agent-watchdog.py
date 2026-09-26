@@ -146,6 +146,7 @@ def project_root() -> Path:
 # a sync-drift landmine (fresh-eyes-code F2, 2026-05-19).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import agent_dir as _paths_agent_dir  # noqa: E402
+from _rt import _api_token as _rt_api_token  # noqa: E402
 
 # : never hardcode the escalation aspiration —  is the UPSTREAM
 # deployment's queue and does not exist elsewhere, so a literal files nothing.
@@ -1369,6 +1370,20 @@ def _rt_port_file(root: Path) -> Path:
     return base / "daemon.port"
 
 
+def _health_request(url: str):
+    """The /v1/admin/health request, carrying the FR-4 bearer when one is
+    configured (g-115-10650). Once MIND_API_TOKEN is set, the daemon answers
+    every request without a matching bearer with 401, health included, so a bare
+    probe read a live daemon as down and every tick respawned it (cc-03: 2,196
+    daemon_unreachable rows in a row). The token comes from _rt._api_token, the
+    twin of _runtime.sh's _rt_api_token. With no token this returns the bare URL,
+    so a token-less box sends exactly what it sent before."""
+    tok = _rt_api_token()
+    if not tok:
+        return url
+    return urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+
+
 def daemon_health_probe(root: Path, timeout: float = 1.0) -> bool:
     """Pure-Python faithful replica of _runtime.sh rt_is_up: read the port
     file, GET http://127.0.0.1:<port>/v1/admin/health, return True iff HTTP
@@ -1380,8 +1395,9 @@ def daemon_health_probe(root: Path, timeout: float = 1.0) -> bool:
     spurious respawn against a live daemon (the exact guard-597 failure).
     This is the FREQUENT path (every watchdog tick), so it must be
     lottery-free and stays in-process. The coupling to _runtime.sh is only
-    three things — port-file path (env-mirrored above), endpoint, and
-    timeout — pinned by this comment. Monkeypatched in tests to simulate
+    four things — port-file path (env-mirrored above), endpoint, timeout,
+    and the FR-4 bearer (_health_request) — pinned by this comment.
+    Monkeypatched in tests to simulate
     up/down without a real daemon."""
     try:
         port = _rt_port_file(root).read_text(encoding="utf-8").strip()
@@ -1392,7 +1408,7 @@ def daemon_health_probe(root: Path, timeout: float = 1.0) -> bool:
         return False
     url = f"http://127.0.0.1:{port}/v1/admin/health"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(_health_request(url), timeout=timeout) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
             return 200 <= int(status) < 300
     except (urllib.error.URLError, OSError, ValueError):
@@ -2085,7 +2101,7 @@ def daemon_health_json(root: Path, timeout: float = 1.0) -> Optional[dict]:
         return None
     url = f"http://127.0.0.1:{port}/v1/admin/health"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with urllib.request.urlopen(_health_request(url), timeout=timeout) as resp:
             status = getattr(resp, "status", None) or resp.getcode()
             if not (200 <= int(status) < 300):
                 return None

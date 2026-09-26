@@ -911,7 +911,9 @@ agent_status:
         belief: "one-line observed claim about the partner's focus/behavior/state"
         confidence: 0.0         # 0.0-1.0, calibrated: single observation -> ~0.5,
                                 # repeated-consistent -> higher, contradicted -> lower
-        last_observed: "ISO 8601 timestamp"  # when the supporting observation occurred
+        last_observed: "ISO 8601 timestamp"  # when the supporting observation occurred:
+                                # the last AFFIRMATION of this content (g-306-491) --
+                                # a confidence-decay revision does NOT move it
 
 critical_blockers:  # updated by consolidation, read by boot
   - goal_id: "g-NNN-NN"
@@ -987,7 +989,19 @@ partner who has drifted or is on a cross-domain stretch.
   just less sure), or `mode=supersede` flips the domain to the observed reality at
   a calibrated 0.5. Both stamp `prior_domain`/`prior_confidence`/`revised_at` onto
   the belief (that annotation IS the recorded surprise) and append an
-  `evolution-log` entry. The N-consecutive gate is what guarantees NO false-trigger
+  `evolution-log` entry. **Timestamps after a revision (g-306-491):**
+  `last_observed` is the last AFFIRMATION of the belief's content, because that
+  is how every reader scores it (fresh-eyes-review Phase 2.6b's STALE and
+  ANSWERED disjuncts) and no reader wants "last compared". So `mode=lower`, which
+  keeps the text un-affirmed, leaves `last_observed` and `valid_from` untouched,
+  and `revised_at` alone records the decay. `mode=supersede` rewrites the text
+  FROM the observation, which makes it a new belief version, so it moves
+  `last_observed` AND `valid_from` to the revision instant. Neither stamp is a
+  merge key: the shard LWW orders whole rows by `max(last_active, row_updated)`
+  (`_team_state._entry_ts`), and every belief write stamps `row_updated`. Records
+  revised BEFORE this change still carry `last_observed == revised_at` over
+  unchanged text. Score those at `valid_from` (guard-6779@ayoai-mind) until
+  their holder re-writes them. The N-consecutive gate is what guarantees NO false-trigger
   on a FIRST or one-off divergence (count 1 < N): a `match` or `skip`, or an
   observed-domain CHANGE, resets the streak, so only a SUSTAINED contradiction on
   the same observed domain accumulates to the threshold. Fail-open: the check runs

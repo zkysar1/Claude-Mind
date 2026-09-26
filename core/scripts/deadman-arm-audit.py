@@ -17,11 +17,31 @@ transcript and classifies every deadman arm by RESPONSE FORM:
              only concerning form (the net is still armed, so a real death
              would still resurrect, but the loop did not visibly re-enter
              in-window — worth investigating).
+  rearm    : the FIRST tool call after a compaction boundary or a wakeup
+             firing, i.e. the sanctioned re-arm-first call
+             (.claude/rules/schedule-wakeup-correctness.md § Re-arm FIRST). It
+             restores the net at the START of a resumed turn, so no Skill
+             follows it until that iteration closes, and before this class it
+             read as `orphan`: an agent that compacted inside the window could
+             never report ARMED-OK (zeta, 2026-09-25: 2 of its 3 arms). A real
+             armed net, counted in arms_total, but NOT evidence that closes
+             arm, so a window whose only arms are re-arms falls back to
+             QUIET / NOT-ARMING instead of ARMED-OK.
+  refused  : the arm's ScheduleWakeup tool_use is present but its tool_result
+             carries is_error (e.g. `noop` is required when `stop` is not true —
+             the CC 2.1.280 required-field refusal, g-115-10755). The call was
+             EMITTED but NO net was set. This is the true silent-death form the
+             batched/followed/orphan trio structurally miss: all three assume the
+             600s net armed. `refused` is EXCLUDED from arms_total (it is not a
+             real arm) and is counted separately.
 
-Safety note: the deadman's protection is the ARMED 600s wakeup, present in all
-three forms. `batched` vs `followed` is a QUALITY distinction (atomic vs split),
-not a safety one. Only `orphan` and `NOT-ARMING` (flagged agent, no arm in
-window) are flagged as non-compliant by --exit-on-noncompliance.
+Safety note: the deadman's protection is the ARMED 600s wakeup, present in the
+batched/followed/orphan forms but NOT in `refused`. `batched` vs `followed` is a
+QUALITY distinction (atomic vs split), not a safety one. `orphan`, `NOT-ARMING`
+(flagged agent, no arm in window), `QUIET`, and `refused` are flagged as
+non-compliant by --exit-on-noncompliance; a REFUSED verdict dominates the others
+because a co-occurring healthy arm does not undo the window in which no net
+existed.
 
 Why this exists: the rollout must MEASURE arm behavior, not ship-and-assume. A
 single good sample (one batched pair) is NOT evidence the arm fires correctly
@@ -36,8 +56,8 @@ Run modes:
   --since-hours <N>           # window (default 24)
   --json                      # machine-readable JSON
   --transcripts-dir <p>       # override default Claude Code projects dir
-  --exit-on-noncompliance     # exit 1 if any FLAGGED agent is ORPHANS or
-                              #   NOT-ARMING in window (recurring/cron shape)
+  --exit-on-noncompliance     # exit 1 if any FLAGGED agent is REFUSED, ORPHANS,
+                              #   NOT-ARMING or QUIET in window (recurring/cron shape)
 """
 
 import argparse
@@ -74,6 +94,10 @@ DEADMAN_DELAY = 600
 # toward the observed-gap ceiling: a single outlier (the 188s arm) was
 # false-flagged as orphan at 180s though the loop had plainly re-entered.
 FOLLOW_WINDOW_S = 300
+# System-entry subtypes after which the next tool call must be the re-arm:
+# a compaction resume and a wakeup firing. Read in FILE order, never by
+# timestamp: the compaction summary is stamped BEFORE its own boundary.
+BOUNDARY_SUBTYPES = ("compact_boundary", "scheduled_task_fire")
 
 
 def _parse_args():
@@ -144,13 +168,25 @@ def _session_to_agent(project_root: Path) -> dict:
 def _collect_events(path: Path, cutoff: datetime):
     """One pass: return (arm_events, skill_msgids, skill_events).
 
-    arm_events   : list of {ts_dt, ts_str, msg_id} for ScheduleWakeup(600,sentinel)
+    arm_events   : list of {ts_dt, ts_str, msg_id, tool_use_id, after_boundary,
+                   refused} for ScheduleWakeup(600,sentinel). `refused` is True
+                   iff the arm's tool_result carries is_error (the net was NOT
+                   set) — g-115-10755. `after_boundary` is True iff the arm is
+                   the first tool_use after a BOUNDARY_SUBTYPES entry.
     skill_msgids : set of message.id that contain a Skill(aspirations) tool_use
     skill_events : list of (ts_dt, msg_id) for Skill(aspirations) tool_uses
+
+    The tool_result correlation is the outcome-2 fix: without it, a refused arm's
+    tool_use alone counts as an arm, so a window with NO net reports SAFE. is_error
+    is the harness's own authoritative flag; keying on it (rather than the specific
+    refusal message text) catches ANY refusal, which is the correct breadth for a
+    net-failure audit — narrowing to the noop message would miss other refusals.
     """
     arm_events = []
     skill_msgids = set()
     skill_events = []
+    tool_results = {}   # tool_use_id -> bool(is_error); success is_error is None/absent -> False
+    after_boundary = False  # set by a BOUNDARY_SUBTYPES entry, consumed by the next tool_use
     try:
         with open(path, "rb") as f:
             for line in f:
@@ -161,6 +197,9 @@ def _collect_events(path: Path, cutoff: datetime):
                 ts_dt = _parse_ts(e.get("timestamp", ""))
                 if ts_dt is None or ts_dt < cutoff:
                     continue
+                if e.get("type") == "system" and e.get("subtype") in BOUNDARY_SUBTYPES:
+                    after_boundary = True
+                    continue
                 msg = e.get("message") or {}
                 if not isinstance(msg, dict):
                     continue
@@ -169,8 +208,22 @@ def _collect_events(path: Path, cutoff: datetime):
                 if not isinstance(content, list):
                     continue
                 for item in content:
-                    if not isinstance(item, dict) or item.get("type") != "tool_use":
+                    if not isinstance(item, dict):
                         continue
+                    itype = item.get("type")
+                    if itype == "tool_result":
+                        # A ScheduleWakeup refusal lands as a tool_result with
+                        # is_error truthy (measured: is_error True, content
+                        # "`noop` is required when `stop` is not true."); a
+                        # success has is_error None/absent + "Next wakeup
+                        # scheduled for ...". bool() maps None/False/absent->False.
+                        tid = item.get("tool_use_id")
+                        if tid is not None:
+                            tool_results[tid] = bool(item.get("is_error"))
+                        continue
+                    if itype != "tool_use":
+                        continue
+                    first_after_boundary, after_boundary = after_boundary, False
                     name = item.get("name")
                     inp = item.get("input") or {}
                     if name == "ScheduleWakeup":
@@ -179,7 +232,9 @@ def _collect_events(path: Path, cutoff: datetime):
                         if (ds == DEADMAN_DELAY or ds == str(DEADMAN_DELAY)) and pr == SENTINEL:
                             arm_events.append({"ts_dt": ts_dt,
                                                "ts_str": e.get("timestamp", ""),
-                                               "msg_id": mid})
+                                               "msg_id": mid,
+                                               "tool_use_id": item.get("id"),
+                                               "after_boundary": first_after_boundary})
                     elif name == "Skill":
                         # exact "aspirations" (the loop re-entry) — NOT
                         # "aspirations-spark", which precedes the pair on deep
@@ -190,12 +245,21 @@ def _collect_events(path: Path, cutoff: datetime):
                             skill_events.append((ts_dt, mid))
     except OSError:
         pass
+    # Correlate each arm with its result. A missing result (id absent from the
+    # map — e.g. a truncated transcript) stays refused=False: never false-flag a
+    # healthy arm as refused on absent evidence (verify-before-assuming); the
+    # existing orphan/reentry logic still covers the "did the loop re-enter" axis.
+    for a in arm_events:
+        a["refused"] = tool_results.get(a.get("tool_use_id"), False)
     skill_events.sort(key=lambda x: x[0])
     return arm_events, skill_msgids, skill_events
 
 
 def _classify_arms(arm_events, skill_msgids, skill_events) -> list:
-    """Classify each arm: batched | followed | orphan.
+    """Classify each arm: batched | followed | rearm | orphan.
+
+    `rearm` is checked only after `followed`: a re-arm the loop happened to
+    close within the window is simply followed.
 
     A non-batched arm is `followed` iff a later Skill(aspirations) re-enters
     its iteration within FOLLOW_WINDOW_S. Each Skill is assigned to the MOST
@@ -227,7 +291,12 @@ def _classify_arms(arm_events, skill_msgids, skill_events) -> list:
             followed.add(best)
     out = []
     for idx, a in enumerate(arms):
-        k = klass[idx] if idx in klass else ("followed" if idx in followed else "orphan")
+        if idx in klass:
+            k = klass[idx]
+        elif idx in followed:
+            k = "followed"
+        else:
+            k = "rearm" if a.get("after_boundary") else "orphan"
         out.append({"ts": a["ts_str"], "klass": k})
     return out
 
@@ -247,10 +316,23 @@ def _age_str(iso_utc: str) -> str:
     return f"{secs / 86400:.1f}d ago"
 
 
-def _verdict(flagged: bool, total: int, orphan: int, reentries: int = 0) -> str:
+def _verdict(flagged: bool, total: int, orphan: int, reentries: int = 0,
+             refused: int = 0, rearm: int = 0) -> str:
     if not flagged:
         return "off"
-    if total == 0:
+    if refused > 0:
+        # A deadman arm's ScheduleWakeup was REFUSED (tool_result is_error): the
+        # tool_use is present but NO net was set — the exact silent-death failure
+        # this audit exists to catch (). Dominates every other verdict
+        # because a co-occurring healthy arm does not undo the window in which the
+        # net was absent (rb-9668: ScheduleWakeup is the loop's resurrection
+        # primitive). Placed BEFORE the total==0 block: refused arms are excluded
+        # from arms_total, so an all-refused window has total==0 and would
+        # otherwise be masked as NOT-ARMING/QUIET.
+        return "REFUSED"
+    # A re-arm restores the net at a resume; it says nothing about whether
+    # CLOSES arm, so a window of re-arms alone is judged as having no close arm.
+    if total - rearm == 0:
         # No deadman arm in the window. Split the two arms=0 shapes using the
         # loop-re-entry signal (Skill(aspirations) calls) — a hard transcript
         # fact needing no calibration:
@@ -281,8 +363,9 @@ def _build_report(transcripts_dir: Path, project_root: Path, since_hours: int) -
     per_agent = {}
     def _blank(fl):
         return {"flagged": fl, "sids": [], "arms_total": 0,
-                "batched": 0, "followed": 0, "orphan": 0, "reentries": 0,
-                "last_activity_utc": None, "last_arm_utc": None}
+                "batched": 0, "followed": 0, "orphan": 0, "rearm": 0, "reentries": 0,
+                "refused": 0, "last_activity_utc": None, "last_arm_utc": None,
+                "last_refused_utc": None}
     for agent in flagged:
         per_agent[agent] = _blank(flagged[agent])
     try:
@@ -312,7 +395,17 @@ def _build_report(transcripts_dir: Path, project_root: Path, since_hours: int) -
         if not arm_events:
             continue
         bucket["sids"].append(path.stem)
-        arms = _classify_arms(arm_events, skill_msgids, skill_events)
+        # Refused arms (net NOT set) are NOT real arms: count them separately and
+        # keep them out of the batched/followed/orphan classification, which all
+        # assume the 600s net armed ().
+        refused_arms = [a for a in arm_events if a.get("refused")]
+        real_arms = [a for a in arm_events if not a.get("refused")]
+        for a in refused_arms:
+            bucket["refused"] += 1
+            ts = a.get("ts_str", "")
+            if ts and (bucket["last_refused_utc"] is None or ts > bucket["last_refused_utc"]):
+                bucket["last_refused_utc"] = ts
+        arms = _classify_arms(real_arms, skill_msgids, skill_events)
         for a in arms:
             bucket["arms_total"] += 1
             bucket[a["klass"]] += 1
@@ -322,11 +415,13 @@ def _build_report(transcripts_dir: Path, project_root: Path, since_hours: int) -
         b["batched_rate"] = (round(b["batched"] / b["arms_total"], 3)
                              if b["arms_total"] else None)
         b["verdict"] = _verdict(b["flagged"], b["arms_total"], b["orphan"],
-                                b.get("reentries", 0))
+                                b.get("reentries", 0), b.get("refused", 0),
+                                b.get("rearm", 0))
     # QUIET stays in noncompliant (conservative — a possible silent death must
     # never be suppressed; the human disambiguates via the last_activity column).
+    # REFUSED is the strongest non-compliant signal (a net was actively refused).
     bad = [a for a, b in per_agent.items()
-           if b["verdict"] in ("ORPHANS", "NOT-ARMING", "QUIET")]
+           if b["verdict"] in ("REFUSED", "ORPHANS", "NOT-ARMING", "QUIET")]
     totals = {
         "since_hours": since_hours,
         "cutoff_utc": cutoff.isoformat(),
@@ -351,15 +446,20 @@ def _print_human(report: dict) -> None:
         line = (f"  {agent:8} flag={'ON ' if b['flagged'] else 'off'} "
                 f"verdict={b['verdict']:11} arms={b['arms_total']} "
                 f"batched={b['batched']} followed={b['followed']} orphan={b['orphan']} "
+                f"rearm={b.get('rearm', 0)} refused={b.get('refused', 0)} "
                 f"batched_rate={rate} last_arm={last}")
-        # For anything not cleanly ARMED-OK, append the two disambiguation
-        # signals the reader otherwise has to probe for by hand: loop re-entries
-        # (separates iterating-not-arming from no-closes) and last transcript
-        # activity age (separates a live long-iteration from a real death).
+        # For anything not cleanly ARMED-OK, append the disambiguation signals the
+        # reader otherwise has to probe for by hand: loop re-entries (separates
+        # iterating-not-arming from no-closes), last transcript activity age
+        # (separates a live long-iteration from a real death), and — on a REFUSED
+        # verdict — when the last net was refused.
         if b["verdict"] not in ("ARMED-OK", "off"):
             la = b.get("last_activity_utc")
             line += (f"  | reentries={b.get('reentries', 0)} "
                      f"last_activity={_age_str(la) if la else 'n/a'}")
+            if b.get("refused", 0) > 0:
+                lr = b.get("last_refused_utc")
+                line += f" last_refused={_age_str(lr) if lr else 'n/a'}"
         print(line)
 
 

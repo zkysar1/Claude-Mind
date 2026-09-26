@@ -499,7 +499,7 @@ def main():
             # — the same ordering defect the full path carried, found here only
             # because the pin covers both emit paths (guard-4392).
             minimal.append("MANDATORY FIRST CALL: emit ScheduleWakeup(prompt=\"<<autonomous-loop-dynamic>>\",")
-            minimal.append("  delaySeconds=600) BEFORE any other tool call — a compaction resume reaches no")
+            minimal.append("  delaySeconds=600, noop=false, reason=\"deadman resurrection net\") BEFORE any other tool call — a compaction resume reaches no")
             minimal.append("  terminal pair, so the deadman net must be restored first (rb-4345/g-115-5834).")
             minimal.append("")
             minimal.extend(_format_iteration_ckpt_block(iter_ckpt))
@@ -540,7 +540,7 @@ def main():
     # reader can act on" is — so it goes above the goal anchor too, which is the
     # first line in this banner a resuming model can reach for.
     lines.append("MANDATORY FIRST CALL: before ANY other tool call this turn, emit")
-    lines.append('  ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)')
+    lines.append('  ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600, noop=false, reason="deadman resurrection net")')
     lines.append("  — the deadman net. A compaction resume re-enters the loop MID-iteration and")
     lines.append("  reaches no terminal pair, so the whole iteration runs on whatever net already")
     lines.append("  existed — none, if the compaction landed before a close. Re-arm FIRST, then")

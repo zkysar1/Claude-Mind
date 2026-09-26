@@ -79,6 +79,10 @@ BLOCKING_BUCKETS = (
     "orphan_risk_core", "orphan_risk_skills",
     "target_ahead_core", "target_ahead_skills",
     "ambiguous_core", "ambiguous_skills",
+    # g-115-10758: source-ahead files still carrying target-only lines (a dict,
+    # keyed by path). Absent here, they drifted the preflight yet never needed
+    # a registered decision, so an adopt overwrote them silently.
+    "line_level_prod_ahead",
 )
 
 SEED_FILE = "core/config/world-aspirations-initial.jsonl"

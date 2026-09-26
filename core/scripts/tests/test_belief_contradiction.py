@@ -212,6 +212,31 @@ def test_revise_supersede_flips_domain_to_observed():
     assert "superseded" in e["belief"]
 
 
+def test_revise_lower_leaves_affirmation_stamps_unchanged():
+    # : a decay is not a re-affirmation. last_observed (and valid_from)
+    # keep the last affirmation; revised_at alone carries the decay time.
+    b = dict(_belief("partner-a", "framework-architecture", conf=0.6,
+                     last="2026-06-10T00:00:00"), valid_from="2026-06-10T00:00:00")
+    e = BC.revise([b], "partner-a", "client-runtime", "2026-06-18T05:00:00",
+                  mode="lower", factor=0.5)[0]
+    assert e["last_observed"] == "2026-06-10T00:00:00"
+    assert e["valid_from"] == "2026-06-10T00:00:00"
+    assert e["revised_at"] == "2026-06-18T05:00:00"
+    assert e["prior_confidence"] == pytest.approx(0.6)
+
+
+def test_revise_supersede_stamps_a_new_belief_version():
+    # : supersede rewrites the text FROM the observation, so the new
+    # version is affirmed now -- last_observed and valid_from move together.
+    b = dict(_belief("partner-a", "framework-architecture", conf=0.7,
+                     last="2026-06-10T00:00:00"), valid_from="2026-06-10T00:00:00")
+    e = BC.revise([b], "partner-a", "client-runtime", "2026-06-18T05:00:00",
+                  mode="supersede")[0]
+    assert e["last_observed"] == "2026-06-18T05:00:00"
+    assert e["valid_from"] == "2026-06-18T05:00:00"
+    assert e["revised_at"] == "2026-06-18T05:00:00"
+
+
 def test_revise_preserves_other_partners():
     beliefs = [_belief("partner-a", "framework-architecture"),
                _belief("partner-b", "client-runtime")]

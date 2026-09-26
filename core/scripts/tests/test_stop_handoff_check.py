@@ -21,6 +21,15 @@ Lanes:
  11. vessel call shape: MIND_AGENT prefix, MIND_AGENT unset, cwd = repo root
  12. D7 wiring: the check leads the mode flip on the same && chain, and the
      fixed D7 text no longer claims "handoff saved"
+ 13. leftover checkpoint (g-373-141): an earlier stop missed D7.1, so the new
+     stop's GS-0 kept the old stamp; the fresh stop-target-mode is the
+     reference and the earlier stop's handoff is refused
+ 14. resume with stop-target-mode present: the request predates GS-0, so the
+     checkpoint stamp still wins and a pre-interruption handoff passes
+ 15. a non-UTF-8 handoff is refused as invalid, not failed open
+ 16. --step D4.1: pre-flush wording (no D7 / D7.1 text) and telemetry caller
+ 17. D4.1 wiring: the early check sits after D4, before D6.62's commit and
+     D6.7's flush
 """
 from __future__ import annotations
 
@@ -239,3 +248,82 @@ def test_d7_runs_the_check_before_the_mode_flip():
     assert line.index("stop-handoff-check.sh") < line.index("session-mode-set.sh")
     assert "stop-handoff-check.sh && " in line
     assert "handoff saved" not in skill
+
+
+def _leftover_then_new_stop(session: Path) -> None:
+    """An earlier stop stamped GS-0 an hour ago and wrote its handoff, then ran
+    D7 (which deletes stop-target-mode) but missed D7.1, so its checkpoint
+    stayed. A new stop is requested and runs the production GS-0 write."""
+    _stamp_stop(session, seconds_ago=3600)
+    h = session / "handoff.yaml"
+    h.write_text(HANDOFF, encoding="utf-8")
+    old = time.time() - 3000
+    os.utime(h, (old, old))
+    tm = session / "stop-target-mode"
+    tm.write_text("assistant\n", encoding="utf-8")
+    requested = time.time() - 60
+    os.utime(tm, (requested, requested))
+    rec = sc.write_checkpoint(session, "assistant")  # the new stop's GS-0
+    assert rec["resume_count"] == 1  # indistinguishable from a --resume here
+
+
+def test_leftover_checkpoint_refuses_the_previous_stops_handoff(tmp_path, capsys):
+    _leftover_then_new_stop(tmp_path)
+    rc, out = _run(tmp_path, capsys=capsys)
+    assert rc == 1, out
+    assert "BEFORE this stop began" in out and "(stop-target-mode)" in out
+    (tmp_path / "handoff.yaml").write_text(HANDOFF, encoding="utf-8")  # this stop's own
+    rc, out = _run(tmp_path, capsys=capsys)
+    assert rc == 0 and out.startswith("Handoff saved"), out
+
+
+def test_resume_with_stop_target_mode_still_passes(tmp_path, capsys):
+    tm = tmp_path / "stop-target-mode"
+    tm.write_text("assistant\n", encoding="utf-8")
+    requested = time.time() - 900  # the request predates GS-0
+    os.utime(tm, (requested, requested))
+    _stamp_stop(tmp_path, seconds_ago=600)
+    h = tmp_path / "handoff.yaml"
+    h.write_text(HANDOFF, encoding="utf-8")
+    written = time.time() - 300  # handoff landed before the interruption
+    os.utime(h, (written, written))
+    assert sc.write_checkpoint(tmp_path, "assistant")["resume_count"] == 1
+    rc, out = _run(tmp_path, capsys=capsys)
+    assert rc == 0 and "(stop-checkpoint)" in out, out
+
+
+def test_non_utf8_handoff_is_refused_not_failed_open(tmp_path, capsys):
+    _stamp_stop(tmp_path)
+    (tmp_path / "handoff.yaml").write_bytes(b"session_number: 7\nnext_focus: \xff\xfe\n")
+    rc, out = _run(tmp_path, capsys=capsys)
+    assert rc == 1, out
+    assert "empty or not a YAML mapping" in out
+    assert "NOT VERIFIED" not in out
+
+
+def test_pre_flush_step_wording_and_caller(tmp_path, capsys, monkeypatch):
+    import _gate_log
+    callers = []
+    monkeypatch.setattr(_gate_log, "log", lambda *a, **k: callers.append(k["caller"]))
+    _stamp_stop(tmp_path)
+    rc, out = _run(tmp_path, "--step", "D4.1", capsys=capsys)
+    assert rc == 1
+    assert "NO HANDOFF YET" in out and "Re-run the D4.1 command unchanged." in out
+    assert "D7.1" not in out and "D7 refused" not in out
+    assert "## Step 9: Continuation Handoff" in out
+    (tmp_path / "handoff.yaml").write_text(HANDOFF, encoding="utf-8")
+    rc, out = _run(tmp_path, "--step", "D4.1", capsys=capsys)
+    assert rc == 0 and out.startswith("Handoff saved")
+    assert callers == ["aspirations-graceful-stop D4.1"] * 2
+
+
+def test_d41_runs_the_check_before_the_commit_and_flush():
+    skill = (REPO / ".claude/skills/aspirations-graceful-stop/SKILL.md").read_text(
+        encoding="utf-8")
+    d41 = [ln for ln in skill.splitlines()
+           if ln.startswith("Bash:") and "stop-handoff-check.sh --step D4.1" in ln]
+    assert len(d41) == 1, d41
+    pos = skill.index(d41[0])
+    assert skill.index("# D4: Consolidation") < pos < skill.index("# D4.5:")
+    assert pos < skill.index("iteration-commit.sh --goal-id graceful-stop")
+    assert pos < skill.index("bash core/scripts/owncloud-flush.sh")

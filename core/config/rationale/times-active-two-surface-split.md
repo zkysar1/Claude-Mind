@@ -192,8 +192,9 @@ rather than a reported one, and it is one line away from the fix in item 3.
   `.claude/skills/aspirations-precheck/SKILL.md:1119` runs `guardrail-check.sh
   --context any --phase pre-selection --type both` every iteration, while
   `core/config/execute-protocol-digest.md:315` (Phase 4.1) runs
-  `guardrail-check.sh --context infrastructure --outcome {flag} --phase
-  post-execution` — passing NO `--type`, so taking the parser default
+  `guardrail-check.sh --context infrastructure --outcome <succeeded|failed|any> --phase
+  post-execution` (succeeded = the goal's primary action worked; failed = it did
+  not; any = match both) — passing NO `--type`, so taking the parser default
   `guardrail` (`core/scripts/guardrail-check.py`, `--type
   {guardrail,reasoning-bank,both}`) — and only when the goal resolves as
   infrastructure or testing (`.claude/skills/aspirations-execute/SKILL.md`

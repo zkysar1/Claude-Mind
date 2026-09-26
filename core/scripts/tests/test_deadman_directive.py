@@ -351,3 +351,80 @@ def test_worker_loop_never_instructs_arming_the_reducer_sentinel():
             pytest.fail(
                 f"worker-loop line {idx} arms the REDUCER sentinel: {line.strip()[:120]}"
             )
+
+
+# --- : the harness-required-field set on the arm CALL --------------
+# Claude Code 2.1.280 REFUSES any ScheduleWakeup whose `stop` is not true and
+# which omits `noop` ("`noop` is required when `stop` is not true."), and the
+# tool schema marks `reason` required on the same condition. A refused arm leaves
+# NO net, so the whole deadman mechanism is silently absent fleet-wide until
+# every PRODUCER emits the required-field set. These pin the producers.
+
+def _arms_missing_noop(text):
+    """Reducer-sentinel ScheduleWakeup arms, normalised across line breaks, that
+    omit `noop`. Empty list = every arm in `text` is correct. Whitespace is
+    collapsed first so a call split across adjacent Python string literals
+    (iteration-close-reminder.py) reads as one segment."""
+    import re
+    flat = re.sub(r"\s+", " ", text)
+    bad = []
+    for seg in flat.split("ScheduleWakeup(")[1:]:
+        head = seg[:220]
+        if "autonomous-loop-dynamic" in head and "noop=false" not in head:
+            bad.append(head[:120])
+    return bad
+
+
+def test_worker_pair_arms_with_the_harness_required_fields():
+    """The worker producer's emitted CALL must carry noop and reason.
+
+    Asserts on the CALL args, NOT the prompt: the prompt's re-arm instructions
+    now mention noop too, so a naive `"noop=false" in out` would pass even if the
+    real call dropped it. The `reason=` key discriminates — only the actual call
+    carries it (the prompt says "with a short reason", not "reason=").
+    """
+    out = run("worker").stdout
+    assert "delaySeconds=600, noop=false, reason=" in out, (
+        "the (1) ScheduleWakeup call must arm with noop and reason or the harness "
+        "refuses it and no net is set (g-115-10755)")
+    # noop value is the documented decision: the net FIRING means the loop died,
+    # so noop=false is the honest reading at fire time — never noop=true.
+    assert "noop=true" not in out
+
+
+def test_worker_producer_arm_has_noop_via_normaliser():
+    """Positive control + self-consistency for the cross-producer normaliser:
+    the worker producer's own arm passes `_arms_missing_noop` (the worker prompt
+    is natural-language, not the sentinel, so only the CALL is a sentinel-free
+    arm — the helper keys on the sentinel and must find the reducer-shaped arms
+    elsewhere, never here). This guards against the normaliser silently matching
+    nothing."""
+    # The normaliser finds sentinel arms; the worker directive emits none
+    # (natural-language prompt), so its own output has no sentinel arm to flag.
+    assert _arms_missing_noop(run("worker").stdout) == []
+
+
+def test_all_reducer_pair_producers_arm_with_noop():
+    """ scope-completion: the reducer's pair is emitted by THREE
+    scripts the goal's original site list missed (verified 2026-09-25 by grep).
+    Each `<<autonomous-loop-dynamic>>` arm must carry noop, or the reducer's net
+    is refused fleet-wide exactly as the worker's was. Non-hot-path producers, so
+    this is the reducer analogue of the worker deadman-directive.sh fix.
+    """
+    for rel in ("iteration-close.sh", "recurring-close.sh",
+                "iteration-close-reminder.py"):
+        src = (SCRIPTS / rel).read_text(encoding="utf-8")
+        bad = _arms_missing_noop(src)
+        assert not bad, (
+            f"{rel} arms the reducer sentinel without noop — the harness refuses "
+            f"it and no net is set (g-115-10755): {bad}")
+
+
+def test_normaliser_actually_flags_a_missing_noop():
+    """Positive control for `_arms_missing_noop` (guard against a normaliser that
+    silently returns [] for everything — the failure this whole family exists to
+    catch)."""
+    good = "ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600, noop=false, reason='x')"
+    bad = "ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600)"
+    assert _arms_missing_noop(good) == []
+    assert _arms_missing_noop(bad) != []

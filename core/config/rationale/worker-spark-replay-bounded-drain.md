@@ -178,9 +178,13 @@ why bravo's Bodies contributed nothing to the lane at all.
 - guard-6289 — `wm-set` does not stamp `_item_ts`; a drain that re-writes the
   remainder itself strips stamps off the rows it preserves
 - guard-2496 — two append regions in opposite orders; the ordering trap's twin
-- guard-6824 / guard-6321 — the consumed-hash watermark saturates at
+- guard-6824 / guard-6321 — the consumed-hash watermark saturated at
   `CONSUMED_HASHES_CAP = 2000`, so once `slot_len > 2000` the never-consumed
-  difference is an UPPER BOUND on un-replayed learning, not a count
+  difference was an UPPER BOUND on un-replayed learning, not a count. Since
+  g-115-10776 a hash some source still offers is kept up to
+  `CONSUMED_HASHES_CEILING`, and every offered LIVE entry is recorded each pass.
+  So a live entry with no hash is now one no source offers, such as the
+  reducer's own captures. It is still not an arrival count.
 - guard-2567 — a changing measurement in a goal TITLE makes the goal undedupable;
   three HIGH Unblocks were filed for this one defect
 - `.claude/rules/archive-before-delete.md` rule 7 — blast radius / donor

@@ -143,7 +143,9 @@ Apply spaced repetition filter:
   replacement reason is the stronger one: because the sign flips between
   measurements, any FIXED sort direction is a coin flip on an unknown sign, and
   stratifying is the only choice that does not bet on it. FIX: when the top band
-  is larger than N, STRATIFY across replay_count rather than sorting by it, and
+  is larger than N, STRATIFY across replay_count rather than sorting by it —
+  PROPORTIONAL allocation, never equal/round-robin, which weights strata by COUNT
+  and so places the same bet (2026-09-25 reading) — and
   stratify on the TIEBREAK axis — never on `outcome`, which is the variable every
   rate below is computed over (selecting on it makes the reported rate circular).
   Both readings: `core/config/replay-instrument-readings.md`.
@@ -299,6 +301,9 @@ Example (violation):
    # Dereference experience content for full-fidelity replay
    For each replay candidate that has an experience_ref (pipeline record) or is itself an experience:
        Bash: experience-read.sh --id {experience_id}
+         # BOUND agent's store only: a ref another agent wrote -> not_found, rc=1
+         # (most pool refs: readings file, Occurrence 138). Read the owner's
+         # with MIND_AGENT=<owner>; never write retrieval_stats cross-agent.
        Read the content .md file at content_path
        Use verbatim_anchors for precise CONDITION/ACTION/OUTCOME replay:
        - Anchors provide exact text rather than compressed summaries
@@ -529,12 +534,6 @@ Step 4 uses for experience `retrieval_stats`.
 # the source on subsequent cycles (defense-in-depth with Step 1's L72 skip).
 # SCHEMA: replay_count is stored as a string on some records — coerce to int
 # before the >= 3 comparison (int(replay_metadata.replay_count)).
-# ⚠ UNTIL g-115-10679 LANDS, MOST "ELIGIBLE" RECORDS HERE ARE NOT NEW. The pipeline
-# merge takes replay_metadata whole from the copy whose JSON text sorts higher, so
-# the flag loses to any flagless copy: 35 of 37 eligible on 2026-09-23 had been
-# encoded before. For a record listed in g-115-10679 or cited by a guardrail
-# `source: replay:<id>`, RESTORE the flag (per-id read, then the write below) and
-# do NOT strengthen or nucleate again. Delete this note when g-115-10679 lands.
 FOR EACH candidate hypothesis in the FULL Step 1 replay-candidate pool
                               WHERE int(replay_metadata.replay_count) >= 3
                               AND outcome == "CORRECTED"

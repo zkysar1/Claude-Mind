@@ -17,7 +17,7 @@ after it does. So this check runs FIRST in D7's command, chained with `&&`
 ahead of session-mode-set.sh.
 
 WHAT "THIS STOP" MEANS. handoff.yaml must be newer than the start of the
-current stop. The reference, in order:
+current stop. Two markers, and when both exist the LATER one is the reference:
   1. stop-checkpoint.json `stop_started_at` — the GS-0 stamp. The field, not
      the file mtime: GS-0 re-writes the checkpoint on --resume but preserves
      `stop_started_at`, so a handoff written before an interruption still
@@ -28,6 +28,21 @@ current stop. The reference, in order:
   3. neither exists -> "unverifiable": refused, with a remedy that can be
      satisfied (re-stamp, write, re-run). Passing it would let a handoff left
      by an EARLIER session back the "handoff saved" claim.
+Why the later one (g-373-141): each marker is a lower bound on when this stop
+began, but write_checkpoint also preserves `stop_started_at` from a checkpoint
+that an EARLIER stop left behind without signing off (it never reached the
+clear: D7.1 before g-373-140, D7's mode-flip call since). Trusting the checkpoint
+first then passed a 50-minute-old handoff from the previous stop. The fresh
+stop-target-mode is newer and wins. On a genuine --resume, stop-target-mode
+was written before GS-0, so the checkpoint stamp still wins.
+
+TWO CALL SITES. D4.1 runs this check with `--step D4.1`, right after D4
+writes the handoff. D7.0 runs it again as the gate on the mode flip. D4.1 is
+there because a handoff first written at a D7.0 refusal comes after D6.62's
+commit and D6.7's own-cloud flush. The periodic sweep skips an agent dir once
+its claim is no longer RUNNING, so on own-cloud that handoff stayed local-only
+(g-373-141). `--step` changes only the refusal wording and the telemetry
+caller. The verdict logic is the same at both steps.
 The handoff is dated by its file mtime, never by its embedded `timestamp`:
 the model writes that field by hand on the fast path, and a wrong clock in it
 would refuse a real handoff. An mtime cannot be typed.
@@ -78,21 +93,25 @@ def _iso(epoch: float) -> str:
 
 
 def resolve_reference(session_dir: Path) -> Optional[Dict[str, Any]]:
-    """When did THIS stop begin? None when nothing marks it."""
+    """When did THIS stop begin? The later of the two markers (see the module
+    docstring); None when nothing marks it."""
+    marks = []
     cp = session_dir / CHECKPOINT_NAME
     try:
         started = json.loads(cp.read_text(encoding="utf-8")).get("stop_started_at")
         if started:
-            epoch = dt.datetime.fromisoformat(str(started)).timestamp()
-            return {"kind": "stop-checkpoint", "epoch": epoch, "iso": _iso(epoch)}
+            marks.append(("stop-checkpoint",
+                          dt.datetime.fromisoformat(str(started)).timestamp()))
     except (OSError, ValueError, AttributeError, TypeError):
-        pass  # absent or unreadable checkpoint -> next reference
-    tm = session_dir / TARGET_MODE_NAME
+        pass  # absent or unreadable checkpoint -> the other marker alone
     try:
-        epoch = tm.stat().st_mtime
-        return {"kind": "stop-target-mode", "epoch": epoch, "iso": _iso(epoch)}
+        marks.append(("stop-target-mode", (session_dir / TARGET_MODE_NAME).stat().st_mtime))
     except OSError:
+        pass
+    if not marks:
         return None
+    kind, epoch = max(marks, key=lambda m: m[1])
+    return {"kind": kind, "epoch": epoch, "iso": _iso(epoch)}
 
 
 def inspect_handoff(session_dir: Path) -> Optional[Dict[str, Any]]:
@@ -101,6 +120,10 @@ def inspect_handoff(session_dir: Path) -> Optional[Dict[str, Any]]:
     try:
         mtime = path.stat().st_mtime
         text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Not UTF-8 text, so not a YAML handoff. Left uncaught it reached
+        # main()'s crash handler, which fails OPEN ().
+        return {"mtime": mtime, "iso": _iso(mtime), "valid": False}
     except OSError:
         return None
     try:
@@ -165,21 +188,33 @@ def _detail(verdict: str, handoff_rel: str, handoff, ref) -> str:
             f"{TARGET_MODE_NAME}), so {handoff_rel} ({handoff['iso']}) cannot be dated")
 
 
-def _refusal(verdict: str, detail: str, agent: str, digest: Path) -> str:
+def _refusal(verdict: str, detail: str, agent: str, digest: Path,
+             step: str = "D7") -> str:
     steps = []
     if verdict == "unverifiable":
         steps.append(f"Re-stamp the stop start: MIND_AGENT={agent} bash core/scripts/"
                      "stop-checkpoint.sh write --target-mode <the target_mode cached at GS-0>")
     steps.append("Write the continuation handoff exactly as the section below says.")
-    steps.append("Re-run the D7 command unchanged.")
+    steps.append(f"Re-run the {step} command unchanged.")
+    if step == "D7":
+        steps.append("Once that re-run passes, run D7.05 and D7.1 — they finish the stop.")
     numbered = "\n".join(f"  {i}. {s}" for i, s in enumerate(steps, 1))
     step9 = extract_step9(digest)
     body = step9 if step9 else (f"(Step 9 was not found in {digest} — open it and "
                                 "follow its Continuation Handoff step.)")
+    if step != "D7":
+        # Pre-flush site: nothing is refused yet, so no D7/D7.1 wording here.
+        return (
+            f"⛔ NO HANDOFF YET — none was written during this stop: {detail}.\n"
+            f"Write it now, at {step}, so D6.62's commit and D6.7's flush carry it.\n\n"
+            f"Do this now:\n{numbered}\n"
+            "Then continue the stop. If a handoff genuinely cannot be written, continue "
+            "anyway: D7 checks again and carries the --proceed-without-handoff escape hatch.\n\n"
+            f"──── Step 9, verbatim from {digest.name} ────\n{body}\n────"
+        )
     return (
         f"⛔ STOP NOT FINISHED — no handoff was written during this stop: {detail}.\n"
-        "D7 refused to set the post-stop mode. Do NOT run D7.1 — the stop stays "
-        "incomplete until D7 succeeds.\n\n"
+        "D7 refused to set the post-stop mode.\n\n"
         f"Do this now:\n{numbered}\n"
         "If a handoff genuinely cannot be written, re-run D7 with "
         "--proceed-without-handoff \"<why>\" added right after stop-handoff-check.sh.\n"
@@ -189,10 +224,10 @@ def _refusal(verdict: str, detail: str, agent: str, digest: Path) -> str:
 
 
 def _log(decision: str, verdict: str, payload: Dict[str, Any],
-         override: Optional[str]) -> None:
+         override: Optional[str], step: str = "D7") -> None:
     try:
         import _gate_log  # type: ignore
-        _gate_log.log(GATE_ID, decision, caller="aspirations-graceful-stop D7",
+        _gate_log.log(GATE_ID, decision, caller=f"aspirations-graceful-stop {step}",
                       trigger_matched=verdict, payload=payload,
                       override_reason=override if decision == "override" else None)
     except Exception:
@@ -220,6 +255,8 @@ def _main(argv=None) -> int:
     ap.add_argument("--digest", default=str(DIGEST))
     ap.add_argument("--proceed-without-handoff", dest="override", default=None,
                     metavar="WHY")
+    ap.add_argument("--step", choices=("D4.1", "D7"), default="D7",
+                    help="the graceful-stop step running the check (wording + telemetry)")
     args = ap.parse_args(argv)
     override = (args.override or "").strip() or None
 
@@ -234,7 +271,7 @@ def _main(argv=None) -> int:
     else:
         print("Handoff NOT VERIFIED — stop-handoff-check could not resolve the agent "
               "(no --agent, MIND_AGENT or MIND_AGENT); failing open.")
-        _log("fail_open", "no-agent", {}, None)
+        _log("fail_open", "no-agent", {}, None, args.step)
         return 0
 
     handoff = inspect_handoff(session_dir)
@@ -257,8 +294,9 @@ def _main(argv=None) -> int:
             print(f"Handoff NOT saved — {detail}. Proceeding without it: {override} "
                   f"(logged as gate {GATE_ID} decision=override).")
         else:
-            print(_refusal(verdict, detail, agent or "<agent>", Path(args.digest)))
-    _log(result["decision"], verdict, payload, override)
+            print(_refusal(verdict, detail, agent or "<agent>", Path(args.digest),
+                           args.step))
+    _log(result["decision"], verdict, payload, override, args.step)
     return result["rc"]
 
 

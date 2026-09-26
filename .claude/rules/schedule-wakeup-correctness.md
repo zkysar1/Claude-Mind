@@ -58,9 +58,9 @@ WRONG: ScheduleWakeup({prompt: "/respond", delaySeconds: 120})
 These all fire as user input and get rejected at the user-invocable gate.
 
 ```
-RIGHT (autonomous loop): ScheduleWakeup({prompt: "<<autonomous-loop-dynamic>>", delaySeconds: 1200})
-RIGHT (user /loop):      ScheduleWakeup({prompt: "/loop investigate flaky test", delaySeconds: 300})
-RIGHT (external wait):   ScheduleWakeup({prompt: "check GitHub PR #142 CI run status", delaySeconds: 270})
+RIGHT (autonomous loop): ScheduleWakeup({prompt: "<<autonomous-loop-dynamic>>", delaySeconds: 1200, noop: false, reason: "deadman resurrection net"})
+RIGHT (user /loop):      ScheduleWakeup({prompt: "/loop investigate flaky test", delaySeconds: 300, noop: false, reason: "next /loop iteration"})
+RIGHT (external wait):   ScheduleWakeup({prompt: "check GitHub PR #142 CI run status", delaySeconds: 270, noop: false, reason: "waiting on the CI run"})
 ```
 
 ### C. Using ScheduleWakeup AS A SUBSTITUTE for the orchestrator return path
@@ -92,7 +92,7 @@ The mechanism is the **terminal-pair**. By default (Stage 5 onward,
 terminal response emits TWO batched tool calls, in this exact order:
 
 ```
-1. ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)
+1. ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600, noop=false, reason="deadman resurrection net")
 2. Skill(aspirations) with args='loop'
 ```
 
@@ -118,7 +118,7 @@ clamp≠delivery, g-115-6629).
 
 **RULE:** on a `<<autonomous-loop-dynamic>>` wakeup firing, **or on an autocompact
 resume that re-enters the loop body mid-iteration**, that turn's FIRST tool call
-MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)`
+MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600, noop=false, reason="deadman resurrection net")`
 re-arm — restoring the net BEFORE any loop-entry work that could fail — THEN
 proceed to Phase -1.5. This is a one-shot net-restoration at the START of the
 turn, NOT the "arm early" mechanic F2 rejected; the close's terminal-pair re-arm
@@ -148,7 +148,7 @@ signal, not a flag, is what tells the gate a cancel is legitimate.
 
 | Layer | Mechanism | What it catches |
 |-------|-----------|-----------------|
-| **A** — gate | `core/scripts/schedule-wakeup-gate.{py,sh}` (PreToolUse[ScheduleWakeup]) refuses (i) slash-prefix prompts other than `/loop`, (ii) `stop: true` while agent-state is RUNNING with no `stop-requested`, (iii) the sentinel while agent-state is NOT RUNNING. Fail-open by contract. Tests: `tests/test_schedule_wakeup_gate.py`. | The wrong prompt (A-D), the net-cancel (E), and a net over no loop, at write time. Denies name the correct action. |
+| **A** — gate | `core/scripts/schedule-wakeup-gate.{py,sh}` (PreToolUse[ScheduleWakeup]) refuses (i) slash-prefix prompts other than `/loop`, (ii) `stop: true` while agent-state is RUNNING with no `stop-requested`, (iii) the sentinel while agent-state is NOT RUNNING, (iv) an arm without `noop` (g-115-10755). Fail-open by contract. Tests: `tests/test_schedule_wakeup_gate.py`. | The wrong prompt (A-D), the net-cancel (E), a net over no loop, and a harness-refused net, at write time. Denies name the correct action. |
 | **B** — rule (this file) | Behavioral guidance read on demand | Documents the correct patterns for human and LLM authors. |
 | **C** — detective | `core/scripts/aspirations-rejection-audit.py` scans recent transcripts for the rejection message + the originating ScheduleWakeup call. Predicate is shared with the gate via `core/scripts/_swakeup_predicate.py` (single source of truth). | Catches drift if the gate is bypassed (hook timeout, fail-open path). Reports only; `--exit-on-hits` makes it file Investigate goals. |
 

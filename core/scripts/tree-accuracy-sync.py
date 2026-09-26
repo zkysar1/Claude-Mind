@@ -17,6 +17,7 @@
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -64,13 +65,24 @@ def group_by_category(records):
 
 
 def load_bindings():
-    """Load the persisted category→node map; return empty dict if absent."""
+    """Load the persisted category→node map WITH provenance.
+
+    Returns (bindings, status):
+      "absent"     — no cache file yet; an empty map that is safe to persist.
+      "ok"         — read and parsed.
+      "unreadable" — the file EXISTS but could not be read/parsed (corrupt,
+                     truncated, locked). The caller MUST NOT persist over it:
+                     an unreadable-but-present cache read as {} would let a real
+                     run save_bindings() a wholesale replacement, wiping every
+                     pin including hand repairs (bravo fresh-eyes, rb-6775 /
+                     guard-3205, g-115-5883).
+    """
     if not BINDINGS_PATH.exists():
-        return {}
+        return {}, "absent"
     try:
-        return json.loads(BINDINGS_PATH.read_text(encoding="utf-8")) or {}
+        return (json.loads(BINDINGS_PATH.read_text(encoding="utf-8")) or {}), "ok"
     except (json.JSONDecodeError, OSError):
-        return {}
+        return {}, "unreadable"
 
 
 def save_bindings(bindings):
@@ -80,23 +92,87 @@ def save_bindings(bindings):
     tmp.replace(BINDINGS_PATH)
 
 
+# ── match-quality floor for category→node bindings () ──────────────
+# resolve_node_for_category took find_nodes(...)[0] with NO quality bar, so a
+# SHORT node key (< MIN_KEY_TOKEN_LEN chars: `sol`, `pip`, `deb`) matched as a
+# SUBSTRING inside a longer category word (`sol` in con-SOL-idation, `pip` in
+# PIP-eline) became a silent binding that wrote hypothesis accuracy onto an
+# unrelated node. `_is_short_key_substring_collision` refuses exactly and only
+# that class — the zero-false-positive subset of the defect.
+#
+# It is DELIBERATELY narrower than a whole-token floor. Measured 2026-09-25
+# (alpha, cc-10) over the live 164 bindings: a whole-token floor would reject 27,
+# but several are legitimate (arc-agi-3 → grid-perception-decomposition shares no
+# ≥4-char token yet is a real match; arc/arc-agi tokenize to nothing), and it
+# still keeps the semantic collision system-behavior → npc-behavior-* (shared
+# whole token `behavior`). So the SEMANTIC classification is left to the reducer
+# (it needs summary judgment, not token counting); this guard refuses only the
+# short-key substring class, which no legitimate binding relies on.
+MIN_KEY_TOKEN_LEN = 4
+
+
+def _sig_tokens(text):
+    """Whole tokens of `text`, lowercased, split on non-alphanumerics."""
+    return {t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t}
+
+
+def _is_short_key_substring_collision(category, node_key):
+    """True when EVERY token of node_key is shorter than MIN_KEY_TOKEN_LEN AND
+    none is a WHOLE token of the category — i.e. find_nodes could only have
+    matched this node by a short substring inside a longer category word. A
+    legitimate short-key binding (the category actually contains that whole
+    short token) is NOT flagged."""
+    key_toks = _sig_tokens(node_key)
+    if not key_toks or any(len(t) >= MIN_KEY_TOKEN_LEN for t in key_toks):
+        return False  # key carries a real (≥4-char) token — not this class
+    return not (key_toks & _sig_tokens(category))
+
+
+def _has_whole_token_support(category, node_key, summary):
+    """Advisory (NOT a refusal): does the category share a ≥MIN_KEY_TOKEN_LEN
+    whole token with the node key, or does a category token appear as a whole
+    word in the node summary? Absence is REPORTED, never unbound — the census
+    shows some no-support bindings are legitimate summary/semantic matches, so
+    unbinding them would drop real work. The reducer judges them (g-115-5883)."""
+    cat = {t for t in _sig_tokens(category) if len(t) >= MIN_KEY_TOKEN_LEN}
+    if not cat:
+        return True  # nothing ≥4 chars to assert against — do not flag
+    if cat & _sig_tokens(node_key):
+        return True
+    low = (summary or "").lower()
+    return any(re.search(r"\b" + re.escape(t) + r"\b", low) for t in cat)
+
+
 def resolve_node_for_category(category, nodes, entity_index, bindings):
     """Return the node dict for this category.
     Pin via bindings cache so confidence updates don't re-route future
     runs to different nodes. First call does the find + persists; later
-    calls hit the cache. If cached node no longer exists, re-resolve."""
+    calls hit the cache. If cached node no longer exists, re-resolve.
+
+    A short-key substring collision (g-115-5883) is REFUSED here — cached or
+    freshly derived — and the category is left UNRESOLVED so no accuracy is
+    written onto an unrelated node. Refusing on both branches makes an existing
+    bad pin (e.g. memory-consolidation → sol) self-heal without a cache wipe:
+    the TRAP that nulling re-derives the identical collision is defused because
+    the re-derivation is refused too."""
     cached = bindings.get(category)
     if cached and cached in nodes:
-        node = nodes[cached]
-        return {
-            "key": cached,
-            "file": node.get("file", ""),
-            "depth": node.get("depth", 0),
-            "summary": node.get("summary", ""),
-            "node_type": "leaf" if not node.get("children") else "interior",
-        }
+        if _is_short_key_substring_collision(category, cached):
+            bindings.pop(category, None)  # drop the bad pin; fall through
+        else:
+            node = nodes[cached]
+            return {
+                "key": cached,
+                "file": node.get("file", ""),
+                "depth": node.get("depth", 0),
+                "summary": node.get("summary", ""),
+                "node_type": "leaf" if not node.get("children") else "interior",
+            }
     results = find_nodes(category, nodes, entity_index, top=1, leaf_only=True)
     if not results:
+        return None
+    if _is_short_key_substring_collision(category, results[0]["key"]):
+        bindings.pop(category, None)  # never persist a short-key collision
         return None
     bindings[category] = results[0]["key"]
     return results[0]
@@ -141,7 +217,7 @@ def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3, persis
     """
     nodes = tree.get("nodes", {})
     entity_index = tree.get("entity_index", {})
-    bindings = load_bindings()
+    bindings, bindings_status = load_bindings()
     bindings_before = dict(bindings)
 
     summary = {
@@ -153,6 +229,8 @@ def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3, persis
         "updates": [],
         "unresolved_categories": [],
         "new_bindings": [],
+        "short_key_refused": [],
+        "low_quality_bindings": [],
     }
 
     # One node may be the target for multiple categories — aggregate first.
@@ -164,10 +242,20 @@ def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3, persis
         if not node:
             summary["unresolved_categories"].append(category)
             summary["nodes_unresolved"] += 1
+            prev = bindings_before.get(category)
+            if prev and _is_short_key_substring_collision(category, prev):
+                summary["short_key_refused"].append(
+                    {"category": category, "node_key": prev})
             continue
         nk = node["key"]
         if bindings_before.get(category) != nk:
             summary["new_bindings"].append({"category": category, "node_key": nk})
+        # Advisory-only (): a resolved binding with no whole-token
+        # support is surfaced for review, NOT refused — the reducer judges whether
+        # it is a legitimate summary/semantic match or a collision to re-point.
+        if not _has_whole_token_support(category, nk, node.get("summary", "")):
+            summary["low_quality_bindings"].append(
+                {"category": category, "node_key": nk})
         agg = node_data.setdefault(nk, {"confirmed": 0, "total": 0, "categories": []})
         agg["confirmed"] += counts["confirmed"]
         agg["total"] += counts["total"]
@@ -177,8 +265,13 @@ def plan_updates(groups, tree, min_sample_size=1, apply_confidence_min=3, persis
     # Never on --dry-run (, 2026-09-24): a dry-run pinned
     # hypothesis-pipeline -> `pip`, an unrelated product-spec node, in the shared
     # cache, so the next real run would have written accuracy onto it.
-    if persist_bindings:
+    # Never over an UNREADABLE cache (): the map we hold was read as {}
+    # from a present-but-corrupt file, so saving it would wholesale-replace every
+    # pin, hand repairs included (bravo fresh-eyes, rb-6775 / guard-3205).
+    if persist_bindings and bindings_status != "unreadable":
         save_bindings(bindings)
+    elif persist_bindings and bindings_status == "unreadable":
+        summary["bindings_persist_skipped"] = "cache unreadable — not overwriting"
 
     summary["nodes_resolved"] = len(node_data)
 

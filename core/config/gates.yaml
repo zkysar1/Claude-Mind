@@ -1218,6 +1218,7 @@ gates:
     instrumented: true
     sites:
       - { file: ".claude/skills/aspirations-graceful-stop/SKILL.md", phase: "D7, first command of the mode-flip && chain (before session-mode-set.sh)" }
+      - { file: ".claude/skills/aspirations-graceful-stop/SKILL.md", phase: "D4.1 (--step D4.1), right after D4 and before D6.62's commit and D6.7's flush (g-373-141)" }
     dominant_risk: FN
     asymmetry_magnitude: high
     keyword_bias: strict
@@ -1227,7 +1228,7 @@ gates:
     fp_description: "A stop is held at D7 although a handoff was written this stop: the handoff's file mtime predates the reference (a clock step, or a handoff restored with its old mtime preserved), or GS-0 never stamped and stop-target-mode was deleted mid-stop (unverifiable). Cost: one handoff re-write, or a logged override."
     fn_description: "A stop flips agent-mode with no handoff.yaml written while its final message says the handoff was saved. Measured on a live vessel run (g-373-94): the fast digest's only handoff writer sits past line 200 and the mind read 200 lines; 3/3 vessel graceful endings had no handoff.yaml, so the next session boots without continuity."
     rb_evidence: ["guard-399"]
-    tuning_notes: "Instrumented from day one (g-373-128). The reference for 'this stop' is stop-checkpoint.json stop_started_at (preserved across --resume), else stop-target-mode's mtime (the measured vessel run skipped GS-0's checkpoint write), else refuse as unverifiable. The handoff is dated by file mtime, never its embedded timestamp, which the model hand-writes on the fast path. An empty or non-mapping handoff does not count. An unresolvable agent fails OPEN (decision=fail_open). Read overrides for their reasons: a vessel whose grace was about to expire is the designed FP; overrides with no reason worth reading mean the printed Step 9 is not landing."
+    tuning_notes: "Instrumented from day one (g-373-128). The reference for 'this stop' is the LATER of stop-checkpoint.json stop_started_at (preserved across --resume) and stop-target-mode's mtime (the measured vessel run skipped GS-0's checkpoint write), else refuse as unverifiable. The later one wins because a checkpoint left by an earlier stop that never signed off (missed the clear, at D7.1 before g-373-140 and D7 since) keeps its old stop_started_at (g-373-141). The handoff is dated by file mtime, never its embedded timestamp, which the model hand-writes on the fast path. An empty or non-mapping handoff does not count. An unresolvable agent fails OPEN (decision=fail_open). Read overrides for their reasons: a vessel whose grace was about to expire is the designed FP; overrides with no reason worth reading mean the printed Step 9 is not landing."
     retirement_eligible: false
 
   - id: close-review-gate
@@ -1265,6 +1266,24 @@ gates:
     fn_description: "A defer names an owner who is not the owner and the goal freezes behind them. Measured cost of the three instances that motivated this gate: g-369-112 sat undone while two HIGH goals named it as their blocker and took about 25 minutes to execute once attempted; g-369-08 and g-369-03 both routed to an external owner work the fleet identity could already perform in the same AWS account. The residual FN is deliberate: lane A advises rather than refuses, so an out-of-lane agent routing still lands."
     rb_evidence: ["guard-3882", "guard-1470", "guard-3803", "guard-4883", "guard-1802", "rb-10090"]
     tuning_notes: "Three lanes, each population measured against the 130 live deferred goals on 2026-09-04 (cc-08), never reasoned. Lane B (grant cited as a gate) REFUSES: a standing grant is a PERMISSION — every registry row ends never (revoke by deleting this row) — so a grant can retire a gate and can never create one, which makes a grant cited as grounds for waiting decidable without understanding the work. Lane A (agent a live pin excludes) also REFUSES, but ONLY with the pin matched over the ROUTED CLAUSE rather than the whole defer: a defer_reason is a paragraph in which one clause routes work, so whole-text matching let an unrelated sentence decide the verdict and measured 1 firing / 1 false positive (g-350-334, a lone 'server' inside a provenance marker two sentences from a clause pin-001 explicitly permits). Clause scoping takes lane A to 0 firings / 0 false positives across all 130 while a constructed genuine violation still refuses with the pin quoted — the zero is UNEXERCISED, not dead. Lane C ADVISES (owner-phrases are prose; guard-1470). Trigger on the FIELD, never on _is_narrative_defer: that predicate returns False for every STRUCTURED_DEFER_PREFIXES value and the live corpus measured 130 of 130 structured, so gating it the way capability-gate is gated would fire on exactly ZERO of the population while looking correct in review (guard-1802). Role-aware agent extraction is load-bearing: a bare roster word-match fires on 89 of 130 because defers cite agents as PROVENANCE, and requiring the agent to be the target of a routing verb takes that to 4 (guard-4883). Lane A calls gates.lane_pin.evaluate rather than re-deriving lane matching, so the defer gate and the claim gate cannot disagree about what a pin means (guard-2676). Deny messages are built by CONCATENATION, never format(), because they quote registry prose containing braces (guard-3803)."
+    retirement_eligible: false
+
+  - id: defer-self-artifact
+    script: core/scripts/gates/defer_self_artifact.py
+    embedded: false
+    instrumented: false
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "update_goal Layer 0b — field == defer_reason, triggered on the FIELD (never on _is_narrative_defer); advisory half in the post-write warnings block" }
+    dominant_risk: FP
+    asymmetry_magnitude: medium
+    keyword_bias: strict
+    override_flag: "--force-defer"
+    fp_cost: medium
+    fn_cost: high
+    fp_description: "A correct defer that names the goal's own artifact is refused and costs one --force-defer justification. Measured and designed against on the live corpus of 110 deferred goals (2026-09-26, cc-08): the ownership match alone refused 7, all correct defers — 4 were '<goal-id>-<slug>' progress_note MARKERS or verification.preconditions PREDICATE ids, and 3 cited their own already-merged PR as provenance while waiting on something external. Requiring an artifact noun (or a path/commit shape) and an UNLANDED statement in the defer's own clause took that to 0 of 110."
+    fn_description: "A defer waits on the goal's own unlanded work and freezes it with no actor able to clear it. Canonical: g-373-12 (HIGH) sat behind its own open, clean, non-draft PR #528 because the defer called the merge an external signal. Residual FN, deliberate: an own-artifact defer that never says the artifact is unlanded, or whose record never binds the PR to the goal's branch, passes."
+    rb_evidence: ["guard-3882", "guard-3505", "guard-1802", "guard-3803", "guard-142", "guard-6398"]
+    tuning_notes: "Two ownership lanes and one state test, all in the defer's own clause. Lane 1: a token carrying the goal id IN THE DEFER, counted only when an artifact noun governs it (branch/head/worktree/checkout), it is path-shaped (fix/<id>-x), or it is a conventional-commit scope (fix(<id>):). Lane 2: a PR number or sha in the defer that the goal's OWN record binds, within one clause of at most 160 chars, to such a token; the endpoint reads the record from the jsonl cache, and a read failure skips lane 2 only. The UNLANDED test (open, unmerged, not yet merged/deployed/on main, to be merged, awaiting merge, draft) is what separates the deadlock from provenance. No Layer-D filing: the goal already owns the work. No CLI twin: wrappers are daemon-only (guard-742), and the one twin of this family (aspirations.py _run_defer_routing_target_gate) reads decision/message/advisory keys its evaluate() never returns. Outcome-4 decision: the grant-verb check ADVISES only (9 then 11 of 110 at measurement), because refusing on the verb punishes the best-probed defers (guard-3882) and refusing on 'no probe cited' is a prose refusal (guard-1470)."
     retirement_eligible: false
 
   - id: xtrace-credential-gate
