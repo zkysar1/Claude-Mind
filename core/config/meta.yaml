@@ -102,6 +102,18 @@ strategy_schemas:
         - two_pass_review.times_fired
         - two_pass_review.times_caught_bug
         - two_pass_review.last_triggered
+        # reflection_effectiveness_by_type (, alpha, 2026-09-24): a COMPUTED
+        # ROLLUP, guard-4339's RECORD class. reflect/SKILL.md Step 5.8 rebuilds the
+        # whole dict from reflection_quality_log (exempt above) on every run, so the
+        # next recompute overwrites a revert. A revert therefore changes nothing and
+        # only starts a new monitor and adds a dead-end count: de-010 is built from
+        # three such reverts. Step 0.3 reads it as an ADVISORY depth weight, but its
+        # source is already exempt. Until  fixed the applier, meta-set
+        # refusing the dict (type_destruction) was the ONLY thing stopping these reverts.
+        # rollback_history holds 4 dict rollbacks of this field (mc-817/1068/1220/1359).
+        # Read on cc-09 2026-09-24, the live value still equals mc-1359's failed_value
+        # (execution.total 107). zeta's meta-log join found no write row for the others.
+        - reflection_effectiveness_by_type
       "step-attribution.yaml":
         - step_attribution
 

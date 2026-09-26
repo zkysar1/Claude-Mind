@@ -184,14 +184,18 @@ def _cached_read_jsonl(path):
     :876, load_experiences :1071) build NEW lists via comprehensions and route
     every counter bump through _locked_bump_jsonl — a SEPARATE locked file
     read-modify-write that re-reads fresh and discards the in-memory snapshot
-    (see load_experiences' explicit comment). None mutate the cached list or
-    its dicts in place, so sharing the cache copy is safe.
+    (see load_experiences' explicit comment; experience bumps are SPOOLED
+    and drained by one locked_modify_jsonl per interval, which also re-reads
+    fresh — g-358-216). None mutate the cached list or its dicts in place, so
+    sharing the cache copy is safe.
 
     Benefit profile (g-333-01): full on the read-only path (prime, reader mode,
     --read-only) where no bump fires; partial on the non-read-only path, because
     _locked_bump_jsonl rewrites a matched file's counters every call, changing
     its mtime and forcing the next LOAD read to reload. The bump-rewrite cost
-    is out of this goal's scope (filed as a follow-up Idea).
+    is out of this goal's scope (filed as a follow-up Idea); for the
+    experience store it is paid once per spool-flush interval, not per call
+    (g-358-216).
     """
     data = _jsonl_cache().get(Path(path))
     return data if isinstance(data, list) else []

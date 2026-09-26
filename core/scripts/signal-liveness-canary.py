@@ -318,6 +318,180 @@ def _assert_watchdog_prev_state() -> tuple[bool | None, str]:
 #       goal-selector-anomalies, defer-drift-metrics, precheck-eval-log,
 #       post-state-update-suppressions. Members that already have owner goals:
 #       , , , .
+#     THE FOUR DETECTOR-SHAPED HITS, VERDICTED (alpha, cc-10, 2026-09-24; each read from
+#     the STORE OF RECORD via backend-cat, not the local cache). NONE gets a row: per the
+#     family rule above, a liveness row watches the WRITER, and for a writer-without-reader
+#     store the writer is not the defect — the missing DECISION-READER is.
+#       world/goal-selector-anomalies.jsonl. FLEET-SYNCED (coordination_merge
+#         merge_append_only_jsonl), writer-without-reader DETECTOR. Writer goal-selector.py
+#         _log_transient_allblocked_recovery (event=transient_all_blocked_recovered), fires
+#         on a stale/partial snapshot of the synced world aspirations file. Store of record:
+#         1014 records, LAST 2026-08-01T10:06:18 — 37 min BEFORE the pytest-refusal fix
+#         272b92ff26 (, 10:43) that stopped the noise. Per the emitter's own
+#         docstring ALL 1014 were fixture output, so the durable channel has recorded ZERO
+#         genuine anomalies in its life and the 54-day silence is post-fix-EXPECTED, not a
+#         measured death. CAN still report (prod write path reachable; refusal is
+#         pytest-only) but the real-event durable path is UNPROVEN in production and no
+#         decision reads it — the  stale-read-vs-nondeterminism analysis the
+#         records exist to enable runs nowhere. Live signal on a real event is an ephemeral
+#         stderr WARN. Disposition WIRE-IT-or-REDUCE (add the analysis reader + a must-trip
+#         positive control on the write path, or retire the durable store and keep the WARN
+#         + the  dry-spin guard). Relayed for the reducer to file.
+#       world/defer-drift-metrics.jsonl. FLEET-SYNCED, writer-without-reader would-be TREND
+#         DETECTOR. Writer defer-drift-check.py _append_metric, run as a precheck sweep;
+#         1752 records, LAST 2026-09-24T20:20:38 — live and accelerating. The DRIFT signal
+#         itself is NOT silent: defer-drift-check's runtime output (drift_count) is consumed
+#         by the precheck sweep family. The STORE is an unconsumed trend log — exactly the
+#         audit-baselines ratchet shape (a tracked number over time) the goal names as the
+#         cheap wire-in. Disposition WIRE-IT: feed drift_count to audit-baselines rather than
+#         build new machinery. Lower urgency (drift signal live; only the trend is unwatched).
+#         Relayed.
+#       world/precheck-eval-log.jsonl. MACHINE-LOCAL by construction (world/*-log.jsonl is
+#         per-machine, coordination_merge:5135), writer-without-reader. Writer precheck-eval.py
+#         via _fileops.log_script_decision("precheck-eval", {subcommand,summary,flags}) — the
+#         runtime-built <script>-log.jsonl name, which is why no literal grep finds its writer.
+#         385 records on THIS box, LAST 2026-09-07 (a WORKER box; it skips precheck-eval, so
+#         local staleness is expected and backend-cat head drift-rc=3 is the normal
+#         machine-local divergence, not a fault). CANNOT be a fleet signal: machine-local means
+#         no cross-box aggregation, so a box whose precheck-eval writer broke is invisible
+#         fleet-wide; and nothing reads the run-log to decide. The fleet's precheck-health
+#         signal is the sweeps' runtime rc, not this durable per-box log. Disposition REDUCE /
+#         accept as local debug telemetry; no fleet canary is possible.
+#       meta/post-state-update-suppressions.jsonl. FLEET-SYNCED, writer-without-reader
+#         ATTRIBUTOR. Writer _fresh_eyes_coverage_check.py from post-state-update-gate.sh
+#         (, written "to prove the cross-agent layer fires in production"). 510
+#         records, LAST 2026-09-24T07:49:33 — live. It records WHY a fresh-eyes dispatch was
+#         suppressed (own/peer cooldown coverage) — attribution, not detection — and no
+#         decision reads it. Disposition REDUCE: the one-time proof purpose is served
+#         (learning-philosophy: an unconsumed ATTRIBUTOR reduces, unlike an unconsumed
+#         detector which wires). [appended:alpha-g318156-four-detector-verdicts-cc10-20260924]
+#     SCANNERS-NARROWER-THAN-CREATING-GATE family (guard-1802 class), swept 2026-09-24
+#     (alpha, cc-10). The class: a scanner whose predicate EXCLUDES the population its
+#     creating gate produces reports clean forever (a zero-run and a clean queue are
+#     identical output). Audited lane-P's two SIBLING reclaim auditors by POSITIVE CONTROL
+#     (live run, not code reading), asking rule-7's two questions — is the predicate narrower
+#     than the creating gate's, and does it read the store the gate writes DURABLY.
+#       audit-deferred-defers.py (lane B). HEALTHY. Population predicate is WIDE — every goal
+#         with a non-null defer_reason across world + all agents — so it cannot be a strict
+#         subset of the creating gate (capability-gate at defer time), which was the lane-P
+#         bug. Live: 122 deferred goals -> 85 genuine / 37 category-b (reclaimable) / 0
+#         narrative, so it PRODUCES a non-clear answer. The 14d STALE_STRUCTURED_DAYS escape
+#         re-opens structured-prefix defers (measured  at 18.6d -> category-b), so
+#         the authority-end blindness (guard-5518) is bounded, not permanent. Reads the same
+#         store the gate writes -> no wrong-store variant.
+#       pending-questions-sweep.py (lane Q). HEALTHY. Its own prior narrowing bug is already
+#         FIXED (: TERMINAL_STATUSES widened from {resolved,superseded} to include
+#         `retired`, which had kept retired questions eligible for staleness flagging forever).
+#         Live --all-agents: 67 entries -> 21 actionable (16 needs_transition + 2 likely_stale
+#         + 3 flag_for_review), so it PRODUCES a non-clear answer. auto_resolve/needs_transition
+#         are test-exercised, likely_stale/flag_for_review fired live. ONE micro-gap relayed:
+#         the `likely_resolved` verdict (agent_self_answered + 7d) has neither a test nor a
+#         live firing, so per guard-4166 its ability to fire is UNPROVEN — a positive control
+#         (or a test) is owed before its live 0 can be trusted.
+#       PREMISE-recheck siblings already OWNED, not re-verdicted: blocker-recheck.py reads the
+#         WRONG one of the two stores the creating gate writes (guard-1978, deliberately
+#         report-only on the goal half); credential-defer-recheck's env-var-shaped predicate
+#         misses IAM action strings (rb-7289). Both are the wrong-store / classifier-narrowing
+#         variants rule 7 names, and both are documented.
+#       So the reclaim lane-auditor family (P fixed guard-1802, B healthy, Q healthy+fixed) is
+#       NOT the always-reports-clear defect; each produces non-clear answers under a live
+#       positive control. Recorded as measured zeros; the one micro-gap (lane-Q
+#       likely_resolved) is relayed via sq-013.
+#       [appended:alpha-g318156-scanner-narrowing-verdict-cc10-20260924]
+#     RATCHET/AUDIT-BASELINES CADENCE-LIVENESS family (goal-count-keyed, self-acting
+#     cadences), swept 2026-09-24 (alpha, cc-10). GAP FOUND, relayed via sq-013. This is
+#     the family the goal names ("throughput-proportional clocks ... never instrumented"),
+#     but for the LIVENESS question — NOT the latency tradeoff learning-philosophy already
+#     rules on (do not convert these to wall-clock). Verified by FOUR independent signals
+#     that nothing detects ONE ratchet silently breaking (fail-open) while the fleet is BUSY:
+#       (1) the ratchet family is NOT in _cadence_registry (only the 7 skill-DISPATCH
+#           cadences are), so cadence-stale-canary does not watch it — its own docstring
+#           excludes self-acting cadences BY DESIGN (line ~43).
+#       (2) no dedicated ratchet-liveness monitor exists: the "ratchet+stale" grep hits are
+#           the ratchet SCRIPTS themselves, each checking its OWN population, not a peer's life.
+#       (3) signal-liveness-canary has no SIGNALS row for the family.
+#       (4) nothing watches audit-baselines.yaml freshness, and its mtime is an AGGREGATE
+#           (~10 ratchets write it), so one dead ratchet is masked by the others keeping the
+#           file fresh (live: 87k B, mtime today, drift-rc=0 vs store of record).
+#     A fleet-WIDE stall (goals stop completing) IS caught (dry-idle-tick / watchdog); the
+#     UNCOVERED case is one ratchet dying on an otherwise-busy fleet. Disposition WIRE-IT, in
+#     the goal-count metric NOT wall-clock: the cheap form the goal itself names — extend
+#     audit-baselines to flag a baseline whose ratchet has not updated it within N x its
+#     goal_cadence of completed goals. Relayed for the reducer to file. Structural gap (the
+#     class exists), not a measured active failure.
+#     [appended:alpha-g318156-ratchet-cadence-liveness-gap-cc10-20260924]
+#     DETECTORS-WHOSE-CONSUMER-WAS-RETIRED family, swept 2026-09-25 (bravo, cc-05). MEASURED
+#     ZERO for the defect shape: no store has a writer that still runs after its
+#     decision-reader was removed. Each of the five orphan-shaped candidates in the census
+#     screen resolves as follows:
+#       precheck-eval-log and post-state-update-suppressions: their writers are live and
+#         were verdicted above (writer-without-reader). No retired reader is involved.
+#       meta/history-shadow-telemetry.jsonl (735 recs, last record 2026-05-22),
+#       world/auto-fix-evidence-sweep-metrics.jsonl (942 recs; the last is a 2026-06-23
+#         run_summary with eligible 0 and filed 0) and world/checks-backfill-log.jsonl (1 rec,
+#         2026-05-15): the WRITER IS RETIRED TOO. No reference remains in core/scripts,
+#         mind_api/src, .claude, core/config or world/scripts, apart from
+#         coordination_merge.py plumbing for auto-fix. A store that nothing writes cannot read
+#         clear to anyone, so these are dead artifacts, not silent signals. Disposition
+#         (unmeasured): REDUCE under archive-before-delete. The auto-fix merge-handler entry
+#         is subtraction residue.
+#     LIVE-SCAN COMPLETENESS CHECK (guard-1960), because the five candidates came from a
+#       hand-kept list. All 218 top-level world+meta .jsonl/.json/.yaml files were
+#       basename-grepped across core/scripts, mind_api/src, .claude, core/config and
+#       world/scripts in one pass. 59 have zero references. Positive control: 3/3
+#       known-referenced names were found. The 59 break down as:
+#       - runtime-named date shards (gate-firings-<date>, productivity-snapshots-<date>),
+#         which have live writers;
+#       - two more runtime-named `<script>-log.jsonl` debug logs of the precheck-eval-log
+#         class (a machine-local writer-without-reader, so REDUCE and no fleet canary):
+#         world/verify-check-eval-log.jsonl (live, 2d) and world/create-blocker-log.jsonl
+#         (1 rec, 60d);
+#       - two more DEAD artifacts: world/sig-004-state.json (a processor state last written
+#         2026-05-07, whose writer is retired) and meta/rt-store.yaml (11 bytes, "a: b: 42",
+#         test-fixture residue in the real meta dir).
+#       None of them is a live writer with a retired reader.
+#     So the family is covered by a live scan, not a sample: every store either has a live
+#     writer (swept by the writer-without-reader unit above) or a dead one (swept here).
+#     NOT swept: in-code emitters (stderr WARNs, log lines) whose reader was removed, because
+#     a basename grep cannot enumerate them. This block's own mentions now make every
+#     store it names grep as referenced, so re-run the scan with this file excluded. `git log
+#     -S` on the names timed out at 120s each on this repo's history, so WHEN each writer was
+#     removed is not recorded; the last-record dates bound it.
+#     [appended:bravo-g318156-retired-consumer-family-cc05-20260925]
+#   /forge-skill Step-3 "memory tree cross-check" ("Forged skills map to categories at
+#     EXPLOIT+", SKILL.md:546-547). CANNOT produce a non-clear answer — NO INPUT SOURCE.
+#     Measured 2026-09-25 (alpha, cc-10): no field records a forged-skill->tree-category
+#     mapping, so the cross-check enumerates 0 pairs and prints "below EXPLOIT: 0" as a
+#     clean pass regardless of the true state. world/forged-skills.yaml 0/92 carry
+#     `category`; meta/skill-gaps.yaml `gaps` 0/244 carry `category`; two independent
+#     stores agree, and a schema probe confirms `category` is absent from BOTH schemas
+#     (the 0 is a real absence, not a broken reader). No row: Step 3 is SKILL.md
+#     pseudocode (LLM-run at forge time), nothing to fixture, and the fix is a missing
+#     upstream field, not a cadence probe (same disposition class as S-4/V-8). Follow-up
+#     relayed via sq-013 (reducer files): record a `category` at forge time, or drop the
+#     dead sub-check. Confirms + refreshes foxtrot's 2026-09-15 finding #2.
+#     [appended:alpha-g318156-forge-skill-step3-noinput-cc10-20260925]
+#   aspiration-trajectory plateau/velocity detection (evolve Step 1.5,
+#     aspiration-trajectory.py). CANNOT reliably produce a non-clear answer for an
+#     aspiration whose completions were EVICTED. Measured 2026-09-25 (alpha, cc-10):
+#     velocity is computed from completed_goals_count = completed goals still in the
+#     LIVE record, but completed goals evict (guard-4748) while the durable
+#     progress.completed_goals counter survives.  durable completed_goals=346
+#     but the tool sees 3, reads velocity 0.0, plateau_detected=false — a 346-completion
+#     lane reads clean;  durable=16, tool sees 0, velocity 0.0, plateau=false.
+#     Two-direction POSITIVE CONTROL:  durable=130, tool sees 3 but RECENT, reads
+#     velocity 5.0 — same in-record count as , different velocity, so the tool
+#     DOES discriminate when recent completions survive; the 0.0s are eviction-blindness,
+#     not a dead instrument. plateau_threshold 0.2 but velocity 0.0<0.2 still returns
+#     false because the plateau arm needs velocity_window=5 in-record history that
+#     eviction starves. No row: the defect is the evicted input source, a caller-side
+#     fix, not something a cadence probe can watch. Follow-up relayed via sq-013 (reducer
+#     files): read completions from an eviction-surviving source (progress.completed_goals
+#     / eviction census /), qualify the pass on the in-record count,
+#     or emit an explicit "unmeasurable (history evicted)" verdict. Confirms + refreshes
+#     foxtrot 2026-09-15 finding #1 (whose ID list had drifted:  recovered to
+#     velocity 5.0, / gone from the world queue — re-measure, don't re-cite).
+#     [appended:alpha-g318156-trajectory-plateau-blindness-cc10-20260925]
 
 # A title no goal can carry. Used to prove the READ channel still emits an answer;
 # the point is a legitimately-EMPTY result, so this must never match. Only titles are

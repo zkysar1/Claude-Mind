@@ -24,6 +24,15 @@ deliberately asymmetric — the machine may VETO an approval on its own evidence
 and may never GRANT one. A verdict this script emits on its own authority is
 always a REJECT.
 
+A REVIEWER MAY NARROW THE VETO — PER ID, ON THE RECORD, NEVER UNDER THE FOUNDING
+SHAPE (g-375-26). A source that CITES an id it leans on (a prior goal, a
+guardrail) is not asking the artifact to carry it, so a verbatim miss there is
+not the founding defect. `--citation <id>=<role reason>` attests exactly that,
+per id; the attestation is recorded AND stated in the findings, and it is
+refused outright when the diff carries the substitution signature. The machine
+still grants nothing: an attested id leaves the veto on the reviewer's recorded
+word, and the approval remains the reviewer's own assertion.
+
 THE RECORD REPRODUCES ITS OWN VERDICT (guard-3743). The artifact carries the
 source set, the artifact set, and both directions of the diff — not just the
 conclusion. A later reader can recompute REJECT from the record without the
@@ -52,6 +61,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -115,7 +125,47 @@ def _gate():
     return mod
 
 
-def source_fidelity(source_text: str, artifact_text: str) -> dict:
+_HEX_RE = re.compile(r"[0-9a-f]{7,}")
+_HEX_LETTER_RE = re.compile(r"[a-f]")
+
+
+def _sha_related(x: str, y: str) -> bool:
+    """One hex token is a strict prefix of the other, LONGER one.
+
+    The longer must carry a hex letter: ``named_entities`` matches pure digit
+    runs as shas (guard-5481), so without it a date would "abbreviate" a longer
+    number. Only the longer is required to: an all-digit 7-char prefix of a
+    real sha is common (~4%) and must still resolve.
+    """
+    if len(x) == len(y) or not (_HEX_RE.fullmatch(x) and _HEX_RE.fullmatch(y)):
+        return False
+    short, long_ = (x, y) if len(x) < len(y) else (y, x)
+    return long_.startswith(short) and bool(_HEX_LETTER_RE.search(long_))
+
+
+def _sha_partner(token: str, own_side: set, other_side: set):
+    """The token on the other side that ``token`` abbreviates or is abbreviated
+    by — searched over the WHOLE other side, not its set-difference, because a
+    short sha whose full form is also on this side is still present over there.
+
+    Several abbreviations of one sha are all that sha. A pair holds only when
+    its SHORTER token is unambiguous on the LONGER token's side: a prefix of two
+    diverging longer shas identifies neither (git refuses an ambiguous
+    abbreviation too), from either end of the pair.
+    """
+    for cand in sorted(other_side, key=lambda o: (-len(o), o)):
+        if not _sha_related(token, cand):
+            continue
+        short, long_side = (token, other_side) if len(token) < len(cand) else (cand, own_side)
+        longer = [o for o in long_side if len(o) > len(short) and _sha_related(short, o)]
+        widest = max(longer, key=len)
+        if all(widest.startswith(o) for o in longer):
+            return cand
+    return None
+
+
+def source_fidelity(source_text: str, artifact_text: str,
+                    citations: dict | None = None) -> dict:
     """Check 2, mechanised: every entity enumerated in the source, verbatim.
 
     Returns both directions, because they diagnose different faults and a
@@ -132,20 +182,67 @@ def source_fidelity(source_text: str, artifact_text: str) -> dict:
     goal actually shipped with, and recording that it was GREEN beside a failing
     diff is what shows a future reader why a count-based criterion was not
     enough.
+
+    Two narrowings of ``missing`` (g-375-26), and they are not alike:
+
+      ``sha_identity`` — an abbreviated sha on one side and the full sha it
+                     prefixes on the other are ONE identity. Mechanical, so it
+                     always applies. It lives here, in the diff, because
+                     ``named_entities`` is also the tier classifier's regex and
+                     must keep returning both tokens.
+      ``citations`` — the REVIEWER's attestation, per id with a one-line role
+                     reason, that a missing id is a CITATION the source leans on
+                     rather than a TARGET the work had to produce. Attested ids
+                     leave the pass computation and are recorded under
+                     ``citations_attested``; ``missing`` + those keys is the
+                     pre-attestation miss, so the record still reproduces its
+                     verdict (guard-3743). A target miss is never attestable.
+
+    Attestation is REFUSED when the identity-resolved diff carries the
+    substitution signature: there the "missing" ids are replaced identities, and
+    attesting them would launder the founding incident's defect.
     """
     src = named_entities(source_text)
     art = named_entities(artifact_text)
-    missing = sorted(src - art)
-    invented = sorted(art - src)
-    return {
+    # (source_token, artifact_token): a reader recomputes `missing` as the
+    # source-side tokens of src - art not listed here, less citations_attested.
+    sha_pairs, missing, invented = set(), [], []
+    for t in sorted(src - art):
+        p = _sha_partner(t, src, art)
+        if p:
+            sha_pairs.add((t, p))
+        else:
+            missing.append(t)
+    for t in sorted(art - src):
+        p = _sha_partner(t, art, src)
+        if p:
+            sha_pairs.add((p, t))
+        else:
+            invented.append(t)
+    citations = {str(k).strip().lower(): v for k, v in (citations or {}).items()}
+    out = {
         "source_entities": sorted(src),
         "artifact_entities": sorted(art),
         "missing": missing,
         "invented": invented,
         "counts_match": len(src) == len(art),
         "substitution_signature": bool(missing) and len(missing) == len(invented),
-        "passed": not missing,
     }
+    if sha_pairs:
+        out["sha_identity"] = [list(p) for p in sorted(sha_pairs)]
+    if citations:
+        if out["substitution_signature"]:
+            out["citations_refused"] = sorted(citations)
+        else:
+            attested = {i: r for i, r in citations.items() if i in missing}
+            unmatched = sorted(set(citations) - set(attested))
+            if attested:
+                out["citations_attested"] = attested
+                out["missing"] = [m for m in missing if m not in attested]
+            if unmatched:
+                out["citations_unmatched"] = unmatched
+    out["passed"] = not out["missing"]
+    return out
 
 
 def fidelity_findings(fid: dict) -> list:
@@ -172,6 +269,26 @@ def fidelity_findings(fid: dict) -> list:
             f"({len(fid['missing'])}) is the SUBSTITUTION signature — the artifact "
             f"kept the shape and replaced the identities, which a count-based "
             f"criterion reports as green (counts_match={fid['counts_match']}).")
+    # : an attestation narrows a veto on the reviewer's word, so it is
+    # always SAID — never a silent exemption (guard-6989).
+    att = fid.get("citations_attested") or {}
+    if att:
+        out.append(
+            f"{FIDELITY_CHECK}: {len(att)} missing entit"
+            f"{'y' if len(att) == 1 else 'ies'} ATTESTED by the reviewer as "
+            f"citation-only, not a target: "
+            + "; ".join(f"{i} ({r})" for i, r in sorted(att.items())))
+    if fid.get("citations_refused"):
+        out.append(
+            f"{FIDELITY_CHECK}: citation attestation REFUSED for "
+            f"{', '.join(fid['citations_refused'])} — the diff carries the "
+            f"SUBSTITUTION signature, so a missing id may be a replaced identity "
+            f"and attesting it would launder the defect this check exists for.")
+    if fid.get("citations_unmatched"):
+        out.append(
+            f"{FIDELITY_CHECK}: --citation named "
+            f"{', '.join(fid['citations_unmatched'])}, not missing from the "
+            f"artifact — nothing attested for it.")
     return out
 
 
@@ -405,6 +522,12 @@ def main(argv=None) -> int:
                     help="a check you performed, recorded verbatim (repeatable)")
     ap.add_argument("--finding", action="append", default=[],
                     help="an additional finding (repeatable)")
+    ap.add_argument("--citation", action="append", default=[], metavar="ID=REASON",
+                    help="attest that a MISSING id is a citation the source leans "
+                         "on, not a target the artifact had to carry, with a "
+                         "one-line role reason (repeatable, one id each). Refused "
+                         "when the diff carries the substitution signature; a "
+                         "target miss is a REJECT, never an attestation.")
     ap.add_argument("--route-to-goal", choices=("world", "agent"), default=None,
                     help="on a WRITTEN REJECT, append the findings to the goal's "
                          "progress_note via goal-field-append.sh, so the rework "
@@ -412,10 +535,16 @@ def main(argv=None) -> int:
     ap.add_argument("--write", action="store_true",
                     help="write the artifact; without this the verdict is only reported")
     args = ap.parse_args(argv)
+    citations = {}
+    for raw in args.citation:
+        cid, sep, reason = raw.partition("=")
+        if not (sep and cid.strip()) or len(reason.strip().splitlines()) != 1:
+            ap.error(f"--citation {raw!r}: expected <id>=<one-line role reason>")
+        citations[cid.strip()] = reason.strip()
 
     source = _read(args.source_file, args.source_text, "source")
     artifact = _read(args.artifact_file, args.artifact_text, "artifact")
-    fid = source_fidelity(source, artifact)
+    fid = source_fidelity(source, artifact, citations)
     # citations-MATCH (). Computed unconditionally beside the id-diff:
     # the two are complements, and the one that catches a reversed claim is the
     # one the id-diff is blind to.

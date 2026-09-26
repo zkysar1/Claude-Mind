@@ -178,6 +178,12 @@ def revise(beliefs, about, observed_domain, now_iso,
     "records the surprise"). If no contradicted domain-belief is found, the list
     is returned unchanged (defensive — process_all only calls this after a
     `contradiction` verdict, but revise must be safe in isolation).
+
+    `last_observed` is the last AFFIRMATION of the belief's content
+    (coordination.md, g-306-491), which is how every reader scores it. "lower"
+    keeps the text un-affirmed, so it leaves `last_observed` and `valid_from`
+    alone; `revised_at` alone carries the decay time. "supersede" rewrites the
+    text FROM the observation, a new belief version, so both move to `now_iso`.
     """
     if not isinstance(beliefs, list):
         return []
@@ -196,8 +202,9 @@ def revise(beliefs, about, observed_domain, now_iso,
         revised["prior_domain"] = prior_domain
         revised["prior_confidence"] = prior_conf
         revised["revised_at"] = now_iso
-        revised["last_observed"] = now_iso
         if mode == "supersede":
+            revised["last_observed"] = now_iso
+            revised["valid_from"] = now_iso
             revised["domain"] = observed_domain
             revised["confidence"] = max(0.0, min(1.0, float(superseded_confidence)))
             revised["belief"] = (

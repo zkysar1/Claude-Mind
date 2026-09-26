@@ -19,7 +19,9 @@ ID format: `YYYY-MM-DD_slug` (regex: `^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$`)
 
 Writer-stamped (do not supply): `resolved_at`, `resolved_by`. `_stamp_resolution_provenance`
 (`mind_api/src/world/pipeline_write.py:599-615`) sets them once at resolution and never
-overwrites them.
+overwrites them, but ONLY on a move INTO `resolved` (`:782-799`) or an add at stage `resolved`
+(`:887`). A record that reaches `archived` without passing through `resolved` is never stamped
+(see Coverage below).
 
 ## Resolution Timestamps: Key Windows on `resolved_at`
 
@@ -47,6 +49,18 @@ Coverage: `resolved_at` is present on 167 of 168 scoreable records with `outcome
 path that did not run the stamp. It falls on the measured window's boundary day: a date-floor
 fallback would have counted it and printed 4 CONFIRMED against the +3 delta. The digest builder's
 window key is tracked by g-115-10706.
+
+Non-scoreable outcomes are a different population, and a `resolved_at` window drops most of them.
+Re-measured 2026-09-24 (zeta, cc-02, g-001-04; same `outcome_date >= 2026-09-01` scope, resolved and
+archived stages): scoreable 184 of 185 (the same one record); EXPIRED 1 of 54; UNRESOLVABLE 35 of 72.
+- EXPIRED lacks the stamp BY DESIGN. The `archive_sweep` expiry branch (`pipeline_write.py:1550-1590`)
+  writes it straight to `archived` as a non-resolution and calls no stamp. Window EXPIRED on
+  `outcome_date`, which that branch sets to the sweep date.
+- UNRESOLVABLE splits by route: a move through `resolved` is stamped, one straight to `archived` is
+  not. This is inferred from the stamp's `target_stage == "resolved"` condition and was not traced
+  record by record.
+- 55 records carry `resolved_by` WITHOUT `resolved_at` (30 EXPIRED, 25 UNRESOLVABLE), and 35 carry
+  neither. No stamp path writes `resolved_by` alone, so where those values came from is not established.
 
 ## Formation-Quality Gate (move to a non-discovered stage)
 

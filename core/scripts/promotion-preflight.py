@@ -679,6 +679,11 @@ def format_source_freshness_warning(fresh: dict) -> str | None:
     return f"note: {fresh.get('detail', 'source freshness unverifiable')} -- drift figures unverified against a remote"
 
 
+# The transplant commit's subject (seed-transplant.sh:464). Shared by the ts and
+# sha lookups below so both always name the SAME commit.
+_TRANSPLANT_GREP = "--grep=^chore: sync framework"
+
+
 def git_last_transplant_ts(repo_root: Path) -> int | None:
     """Committer-date unix ts of the target's most recent transplant/sync commit.
 
@@ -694,12 +699,26 @@ def git_last_transplant_ts(repo_root: Path) -> int | None:
     """
     try:
         r = subprocess.run(
-            ["git", "log", "-1", "--format=%ct", "--grep=^chore: sync framework"],
+            ["git", "log", "-1", "--format=%ct", _TRANSPLANT_GREP],
             capture_output=True, text=True, cwd=str(repo_root), timeout=10,
         )
         if r.returncode == 0 and r.stdout.strip():
             return int(r.stdout.strip())
     except (subprocess.TimeoutExpired, ValueError, OSError):
+        pass
+    return None
+
+
+def git_last_transplant_sha(repo_root: Path) -> str | None:
+    """Sha of the commit git_last_transplant_ts dates, or None ()."""
+    try:
+        r = subprocess.run(
+            ["git", "log", "-1", "--format=%H", _TRANSPLANT_GREP],
+            capture_output=True, text=True, cwd=str(repo_root), timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
         pass
     return None
 
@@ -828,6 +847,69 @@ def target_only_functional_lines(src_abs: Path, tgt_abs: Path,
             if len(extra) >= cap:
                 return extra
     return extra
+
+
+def target_history_added_lines(repo_root: Path,
+                               since_sha: str) -> dict[str, set[str]] | None:
+    """rel -> stripped lines the TARGET's own commits added after its last
+    transplant (g-115-10758).
+
+    The opcode heuristic above cannot see two classes of prod-ahead, both
+    measured against ZDS: additions inside a region the source ALSO changed
+    (a `replace`, skipped by design) and skill files (never looped). The
+    target's own history names them directly, whatever the opcode shape.
+
+    The range is the GRAPH range since_sha..HEAD, never a date window: --since
+    is a traversal cutoff that silently drops commits (guard-4539). None when
+    git fails, so the caller keeps the opcode heuristic alone.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "log", "-p", "--unified=0", "--no-color", "--no-ext-diff",
+             "--format=", f"{since_sha}..HEAD", "--", *FRAMEWORK_PATHS],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(repo_root), timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    added: dict[str, set[str]] = {}
+    cur, in_header = None, False
+    for ln in r.stdout.splitlines():
+        if ln.startswith("diff --git "):
+            cur, in_header = None, True
+        elif in_header:
+            # "+++ " is a header ONLY before the first hunk: an added content
+            # line that itself begins "++ " renders the same way.
+            if ln.startswith("+++ "):
+                p = ln[4:]
+                cur = p[2:] if p.startswith("b/") else None  # /dev/null = deleted
+            elif ln.startswith("@@"):
+                in_header = False
+        elif cur and ln.startswith("+"):
+            s = ln[1:].strip()
+            if s:
+                added.setdefault(cur, set()).add(s)
+    return added
+
+
+def history_prod_ahead_lines(src_abs: Path, tgt_abs: Path,
+                             added: set[str], cap: int = 5) -> list[str]:
+    """Target-history-added lines still live at the target and absent at the
+    source: authored prod-ahead that a mirror would delete (g-115-10758)."""
+    try:
+        src_set = {ln.strip() for ln in src_abs.read_text(errors="replace").splitlines()}
+        tgt_lines = [ln.strip() for ln in tgt_abs.read_text(errors="replace").splitlines()]
+    except OSError:
+        return []
+    out: list[str] = []
+    for ln in tgt_lines:
+        if ln and ln in added and ln not in src_set and ln not in out:
+            out.append(ln)
+            if len(out) >= cap:
+                break
+    return out
 
 
 def parse_known_criteria(repo_root: Path) -> set[str] | None:
@@ -1157,6 +1239,20 @@ def main() -> int:
         _extra = target_only_functional_lines(S[_k], T[_k], _k)
         if _extra:
             line_level_prod_ahead[_k] = _extra
+    # : the target's OWN history since its last transplant. It ADDS
+    # to the opcode set above and never replaces it: a line re-grafted INTO a
+    # transplant commit has no post-plant history, and only the opcode check
+    # still sees it. Skills get this check ONLY -- the opcode check on a skill
+    # would flag every upstream deletion seen from the target side.
+    history_prod_ahead: dict[str, list[str]] = {}
+    _plant_sha = git_last_transplant_sha(tgt)
+    _hist_added = target_history_added_lines(tgt, _plant_sha) if _plant_sha else None
+    for _k in list(sa_core) + list(am_core) + list(sa_skills) + list(am_skills):
+        if _hist_added and _k in _hist_added:
+            _hist = history_prod_ahead_lines(S[_k], T[_k], _hist_added[_k])
+            if _hist:
+                history_prod_ahead[_k] = _hist
+                line_level_prod_ahead.setdefault(_k, _hist)
     blocking += [k for k in line_level_prod_ahead if k not in blocking]
     # Phase 2 ENFORCEMENT (): excuse PHENOTYPE-parametric files that
     # block ONLY on comment/provenance drift (no value change — the 
@@ -1206,6 +1302,12 @@ def main() -> int:
             # would delete. VERDICT-AFFECTING (joins `blocking`), unlike the
             # report-only zone/divergence keys below.
             "line_level_prod_ahead": {k: v for k, v in sorted(line_level_prod_ahead.items())},
+            # : the subset evidenced by the target's own commits since
+            # history_baseline_sha (skills included). Already inside
+            # line_level_prod_ahead; kept apart so a reader can tell history
+            # evidence from the opcode heuristic.
+            "history_prod_ahead": {k: v for k, v in sorted(history_prod_ahead.items())},
+            "history_baseline_sha": _plant_sha,
             "deployment_local_differing": sorted(set(to_deploy + ta_deploy + sa_deploy + am_deploy)),
             "source_only_core": so_core, "source_only_skills": so_skills,
             "weights_contract": wc,

@@ -226,11 +226,13 @@ def test_unknown_environment_id_fast_exits(tmp_path):
     assert "would push" not in r.stdout
 
 
-# --- : PostToolUse hook-ordering invariant --------------------------
+# --- : PostToolUse wiring invariant ----------------------------------
 # Restores the coverage the  merge dropped when it retired
-# test_sync_governed_write.py — the ONLY prior test of the wiring-order
-# invariant. Distinct from the shim-behavior tests above (which exercise the
-# script at runtime); this reads .claude/settings.json and pins the WIRING.
+# test_sync_governed_write.py. Distinct from the shim-behavior tests above
+# (which exercise the script at runtime); this reads .claude/settings.json and
+# pins the WIRING. It pins PRESENCE, not POSITION:  measured that
+# Claude Code starts every matching hook of one event in parallel, so a chain's
+# order in settings.json sequences nothing.
 # NB: the module-level PROJECT_ROOT above is actually core/ (CORE_SCRIPTS.parent),
 # not the repo root — the shim tests only use it as a subprocess cwd, where the
 # shim re-resolves the real root via _paths.sh. .claude/settings.json lives at
@@ -248,30 +250,35 @@ def _post_tool_use_groups():
     return {g.get("matcher"): g.get("hooks", []) for g in groups}
 
 
-def test_push_on_write_wired_last_in_all_governed_write_chains():
-    """owncloud-push-on-write.sh MUST be the LAST hook in each PostToolUse
-    Write/Edit/MultiEdit chain, so it pushes the FINAL post-hook file state
-    (after every other post-hook — context-reads-invalidate, tree-sync-check,
-    the lint/evolution hooks — has run). If an earlier position let a later
-    post-hook mutate the file AFTER the push, S3 would carry a stale copy and
-    the sweep's no-baseline reconcile could revert the LLM edit (the exact
-    g-115-1807 -> g-115-1923 incident this shim guards). Regression: the
-    g-115-2013 merge retired test_sync_governed_write.py, the only prior
-    coverage of this ordering invariant (g-115-2017 restores it)."""
+def test_push_on_write_wired_in_all_governed_write_chains():
+    """owncloud-push-on-write.sh MUST be wired, exactly once, into each
+    PostToolUse Write/Edit/MultiEdit chain. Without it a tool write under a
+    governed root stays local-only and the sweep's no-baseline reconcile can
+    pull stale S3 back over it (the g-115-1807 -> g-115-1923 incident this
+    shim closes). A second registration adds a concurrent duplicate push and no
+    protection.
+
+    POSITION IS DELIBERATELY NOT ASSERTED (g-306-487). This test used to require
+    the push hook to be LAST so it would push the final post-hook file state.
+    It could never enforce that: Claude Code starts all of an event's matching
+    hooks in parallel. On cc-04 with claude 2.1.280, 8 hooks started within
+    12.5 ms. The last-listed hook read the file about 1 s before the
+    2nd-listed writer wrote it, in 3 of 3 Edits. Across 367 production pushes,
+    the push hook started within 5 ms of the chain's first hook. So
+    tree-sync-check.sh (Layer A) can rewrite a tree node after the push has read
+    it, whatever the order in settings.json. What limits that race lives in the
+    sync layer, not in this file: the baseline stamped at push time lets the
+    next sweep push the later local write. The exception, where _put writes the
+    pushed bytes back over a Layer A write that lands mid-push, is recorded on
+    g-306-487."""
     groups = _post_tool_use_groups()
     for matcher in GOVERNED_WRITE_MATCHERS:
         assert matcher in groups, (
             f"PostToolUse[{matcher}] chain missing from settings.json")
         hooks = groups[matcher]
         assert hooks, f"PostToolUse[{matcher}] has no hooks"
-        last_cmd = hooks[-1].get("command", "")
-        assert PUSH_HOOK_BASENAME in last_cmd, (
-            f"PostToolUse[{matcher}]: {PUSH_HOOK_BASENAME} must be wired LAST; "
-            f"last hook is {last_cmd!r}")
-        # Exactly once — a mid-chain duplicate would push stale state before a
-        # later hook runs, defeating the 'wired LAST' guarantee.
         occurrences = sum(
             1 for h in hooks if PUSH_HOOK_BASENAME in h.get("command", ""))
         assert occurrences == 1, (
-            f"PostToolUse[{matcher}]: {PUSH_HOOK_BASENAME} must appear exactly "
+            f"PostToolUse[{matcher}]: {PUSH_HOOK_BASENAME} must be wired exactly "
             f"once (found {occurrences})")

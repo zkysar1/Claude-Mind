@@ -55,13 +55,11 @@ first will hold work frozen indefinitely**:
 **Both axes must be checked.** An item is genuinely blocked only when the
 premise still holds AND the reason is still a valid reason to stop.
 
-Canonical incident (2026-07-28, measured): a standing grant stated verbatim
-that a named condition "is no longer a valid `defer_reason`"; the condition
-was still true and was re-probed correctly on a cadence, so two goals stayed
-frozen 6 and 8 days past the grant — every sweep tested the premise and
-nothing tested the rule. Full trace and the sweep-tooling map:
-`core/config/conventions/defer-routing.md` §5 (`load-conventions.sh
-defer-routing`).
+Canonical incident (2026-07-28): a standing grant retired a `defer_reason`
+whose condition stayed true, and every sweep tested the premise, not the
+rule. Its trace, the measured cases behind rules 4 and 7, and the
+sweep-tooling map: `core/config/conventions/defer-routing.md` §5
+(`load-conventions.sh defer-routing`).
 
 ## Rules
 
@@ -107,16 +105,12 @@ defer-routing`).
 
 7. **A reclaim predicate must not be narrower than the gate that creates the
    population** — the gate's *correct* operation then fills the blind spot and
-   the sweep reports clean forever (measured: `audit-user-to-agent.py` required
-   `participants == ["user"]` while the creating advisory tested `"user" in
-   participants`; live candidate set zero against 28 invisible goals —
-   guard-1802, rb-5650). Before trusting any reclaim sweep, diff its predicate
-   against the creating gate's, literally, and measure what it EXCLUDES. And
-   the variant a predicate diff cannot catch: **which store does the creating
-   gate write DURABLY, and is that the store I am reading?** —
-   `blocker-recheck.py` read the ephemeral WM slot while the durable
-   `blocker_ref` on six goals went unread, `total_blockers: 0` (guard-1978,
-   guard-1242). Widen the READ; do not assume the WRITE widens with it.
+   the sweep reports clean forever (guard-1802, rb-5650). Before trusting any
+   reclaim sweep, diff its predicate against the creating gate's, literally,
+   and measure what it EXCLUDES. And the variant a predicate diff cannot
+   catch: **which store does the creating gate write DURABLY, and is that the
+   store I am reading?** (guard-1978, guard-1242). Widen the READ; do not
+   assume the WRITE widens with it.
 
 ## Anti-patterns
 
@@ -133,7 +127,7 @@ defer-routing`).
   presence-only verification check ("the script exists") will pass forever
   while it never runs
 - Reading a long-running sweep's empty output as "the queue is clean" without
-  once measuring what its predicate EXCLUDES (rule 4a)
+  once measuring what its predicate EXCLUDES (rule 7)
 - Auto-dropping `user` from participants on a fuzzy or prose match. Adding the
   agent is reversible; removing the human is not. When the evidence is a prose
   cell, match only its declarative head, accept under-matching, and leave the
@@ -145,9 +139,7 @@ defer-routing`).
 
 - `core/config/conventions/defer-routing.md` §5 — incident traces, the
   sweep-tooling map (lane P/B/Q auditors, the PREMISE-axis recheck family,
-  `gates/user_leg_scope.py` + `gates/defer_scope.py` SSOTs,
-  `defer-scope-coverage.py`), rb-5633 / rb-5650 / rb-7289, guard-1783 /
-  guard-1802 / guard-349
+  the scope SSOTs) and the rb/guard entries behind each rule
 - `.claude/rules/capability-before-user.md` — gates the routing decision at
   creation; this rule governs the accumulated backlog it leaves behind
 - `.claude/rules/probe-before-defer.md` — gates the defer at write time; its

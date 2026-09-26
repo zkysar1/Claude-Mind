@@ -133,6 +133,23 @@ IF partner_held_ids is non-empty:
         RETURN (goal = None, selection_reason = "all_blocked", selection_context = {by_reason: {partner_held: 1}, blocked_count: 1})
 ```
 
+### Phase 2.03: Always-Run Lane (g-353-137)
+A recurring goal whose cadence must not depend on winning the scorer draw opts in
+with `dispatch_lane: always-run` or `always-run:<agent>` (guard-1895 corollary:
+remove it from the competition, never tune it to win). The lane replaces the
+SCORE, never a GATE: it pins only a goal the selector already lists.
+```
+Bash: lane = bash core/scripts/always-run-lane.sh   # exit 0 always; one JSON object
+IF lane.pin AND lane.pin in {g.goal_id for g in ranked_goals}:
+    Move that candidate to ranked_goals[0]; always_run_pin = lane.pin
+    Output: "▸ ALWAYS-RUN LANE: {lane.pin} due ({lane.overdue_x}x interval) — dispatched outside the scorer draw"
+    # Phases 2.05/2.07 must NOT re-sort it down. Gates still apply: 2.27, 2.5b and
+    # 2.55 can each reject it, and then selection falls back to the scorer order.
+ELIF lane.pin:
+    Output: "▸ ALWAYS-RUN LANE: {lane.pin} due but not a candidate (gated) — not pinned"
+# lane.error: log it and continue on the scorer path (fail-open).
+```
+
 ### Phase 2.05: Meta-Strategy Adjustment
 ```
 Bash: meta-read.sh goal-selection-strategy.yaml
@@ -669,6 +686,7 @@ ELSE:
     #   cross-agent      — deliberately claiming a cross-lane / foreign-world goal
     #   no-goals-rebound — the scorer top is gone from the live queue; rebounded
     #   force-override   — explicit last-resort escape hatch (audited)
+    #   always-run-lane  — Phase 2.03 pinned a due, opted-in candidate (g-353-137)
     deviation_code = <the enum code matching the sanctioned path that diverged>
     Output: "▸ SCORER-DIVERGENCE: claiming {goal.goal_id} over scorer top {ranked_goals[0].goal_id} — deviation={deviation_code}"
 ```

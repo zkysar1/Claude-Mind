@@ -501,6 +501,24 @@ def cmd_has_pending(args):
     comment both say an error must resolve to "no pending jobs" so the BLOCK
     proceeds and the loop stays alive. Filtering must never turn an unknown
     owner into an ALLOW, because an ALLOW is what removes the text-death net.
+
+    TYPE ALLOWLIST (--types, 2026-09-25). Also OPT-IN, same three-way shape:
+    absent -> every type counts (recovery-gate's agent-wide question is
+    unchanged); an EMPTY value -> nothing counts (exit 1, BLOCK proceeds); a
+    comma-separated list -> a job counts only when its `type` is in it.
+    stop-hook Gate 2.6 passes `--types external-wait-sleep`, because an ALLOW
+    there is only safe for a job whose exit RE-INVOKES the model: the registered
+    external-wait sleep is launched run_in_background from the model's own turn,
+    so the harness reports its exit. A detached processor run is not -- measured
+    2026-09-25 on a reducer: one live `processor` row with a monitor goal
+    satisfied the old gate at every turn-end for ~8h, the hook exited 0 with no
+    payload, nothing ever re-invoked the model, and the loop sat dead while every
+    liveness signal read healthy. A job of any other type still registers, still
+    lists, still suppresses zombie recovery (Cond 4 passes no --types) -- it just
+    cannot buy a silent turn-end. The sanctioned shape for backgrounding real
+    work is launch the work THEN launch a registered wait covering it
+    (guard-3335). A missing or unknown type never matches, so the error
+    direction is BLOCK-proceeds (rb-605), exactly like the body filter.
     """
     data = read_data()
     # THREE-WAY, not two: the flag's ABSENCE and an EMPTY value mean opposite
@@ -516,8 +534,18 @@ def cmd_has_pending(args):
     body_sid = getattr(args, "body_sid", None)
     if body_sid is not None and not body_sid:
         sys.exit(1)
+    # Same three-way shape for the type allowlist: None = no filter, an empty
+    # list after stripping = the caller asked to filter and named nothing.
+    types_raw = getattr(args, "types", None)
+    type_set = None
+    if types_raw is not None:
+        type_set = {t.strip() for t in str(types_raw).split(",") if t.strip()}
+        if not type_set:
+            sys.exit(1)
     for job in data.get("jobs", []):
         if body_sid is not None and (job.get("owner_sid") or "") != body_sid:
+            continue
+        if type_set is not None and (job.get("type") or "") not in type_set:
             continue
         if not pid_alive(job.get("pid")):
             continue
@@ -586,6 +614,12 @@ def build_parser():
                          "Omit entirely for agent-wide (legacy) behaviour; an "
                          "EMPTY value means the caller has no identity and "
                          "nothing counts as pending.")
+    hp.add_argument("--types", default=None,
+                    help="Comma-separated allowlist of job types that may count "
+                         "as pending (stop-hook Gate 2.6 passes "
+                         "external-wait-sleep). Omit entirely to count every "
+                         "type; an EMPTY value means nothing counts as pending. "
+                         "A job with a missing or unlisted type never matches.")
 
     # clear
     sub.add_parser("clear", help="Delete tracking file entirely")

@@ -4730,7 +4730,7 @@ do_productivity_check() {
     if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
         echo "[iteration-close] NEXT ACTION REQUIRED: Call Skill(aspirations) with args='loop' as your VERY NEXT tool call."
     else
-        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600) — the self-resurrection net; this call is MANDATORY, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' — the primary re-entry and the LAST call, which continues the loop NOW. Emitting Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
+        echo "[iteration-close] NEXT ACTION REQUIRED (deadman-switch ON): your terminal response MUST be EXACTLY these TWO batched tool calls, in this order — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600, noop=false, reason='deadman resurrection net') — the self-resurrection net (noop and reason are REQUIRED unless stop:true, else the harness refuses the arm and NO net is set — g-115-10755); this call is MANDATORY, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' — the primary re-entry and the LAST call, which continues the loop NOW. Emitting Skill(aspirations) ALONE keeps THIS iteration alive but leaves the NEXT one unprotected against a silent text-death — so arm the net EVERY iteration. Both calls, every time."
     fi
     echo "[iteration-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."
 

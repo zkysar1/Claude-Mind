@@ -39,6 +39,31 @@ JSON_PAYLOAD="$stdin_payload" SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)" \
     python3 - <<'PY' 2>/dev/null || exit 1
 import json, os, re, subprocess, sys
 
+# FIRE LOG (). One JSON line per firing (index / all-repeat / no-match
+# / retrieval-failed) plus the autonomous mode-gate skip, appended to
+# core/logs/prompt-retrieval-fires.jsonl (gitignored, per box). Before this the
+# fire rate was knowable only by grepping session transcripts ().
+# Bounded at write time like bash-inject-misses.jsonl (guard-583, guard-586).
+# Fail-open: a logging fault must never change what the hook injects.
+_FIRE_LOG_ROTATE_BYTES = 400_000
+_FIRE_LOG_KEEP_LINES = 2000
+
+
+def _fire_log(root, rec):
+    try:
+        import time
+        p = root / 'core' / 'logs' / 'prompt-retrieval-fires.jsonl'
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > _FIRE_LOG_ROTATE_BYTES:
+            kept = p.read_text(encoding='utf-8').splitlines()[-_FIRE_LOG_KEEP_LINES:]
+            p.write_text('\n'.join(kept) + '\n', encoding='utf-8')
+        with p.open('a', encoding='utf-8') as fh:
+            fh.write(json.dumps(dict({'ts': time.strftime('%Y-%m-%dT%H:%M:%S')},
+                                     **rec)) + '\n')
+    except Exception:
+        pass
+
+
 payload = os.environ.get('JSON_PAYLOAD', '')
 try:
     d = json.loads(payload) if payload else {}
@@ -119,6 +144,19 @@ try:
         except Exception:
             mode = ''
     if mode == 'autonomous':
+        # : record the skip with BOTH mode readings, so the
+        # stale-binding miss above (binding still autonomous while the
+        # agent-wide file already reads assistant after a /stop) is countable.
+        try:
+            file_mode = (_agent_dir(root, agent) / SESSION_DIRNAME /
+                         'agent-mode').read_text(encoding='utf-8').strip().lower()
+        except Exception:
+            file_mode = None
+        _fire_log(root, {
+            'sid': sid, 'agent': agent, 'mode': mode, 'outcome': 'skip-autonomous',
+            'binding_mode': (str(b.mode) if b is not None and getattr(b, 'mode', None)
+                             else None),
+            'agent_file_mode': file_mode, 'query_len': len(text[:400])})
         sys.exit(0)
     # Test seam (freshness-tick EMBED_FRESHNESS_DRYRUN pattern): prove the
     # gates passed without a daemon-dependent retrieval. Vacuous-pin defense —
@@ -184,6 +222,9 @@ else:
         out = r.stdout
         data = json.loads(out[out.find('{'):])
     except Exception:
+        _fire_log(root, {'sid': sid, 'agent': agent, 'mode': mode or None,
+                         'outcome': 'retrieval-failed', 'query_len': len(query),
+                         'bytes_injected': 0})
         sys.exit(0)
 
 def _clip(s, n):
@@ -297,8 +338,16 @@ else:
             'escalate: Tier 2 codebase grep → Tier 2.5 peer-retrieve.sh → Tier 3 '
             'web (retrieval-escalation.md).' % ec)
 
+injected = body[:9500]
 print(json.dumps({'hookSpecificOutput': {
     'hookEventName': 'UserPromptSubmit',
-    'additionalContext': body[:9500]}}))
+    'additionalContext': injected}}))
+_fire_log(root, {'sid': sid, 'agent': agent, 'mode': mode or None,
+                 'outcome': ('index' if lines else
+                             'all-repeat' if repeat_ids else 'no-match'),
+                 'query_len': len(query),
+                 'bytes_injected': len(injected.encode('utf-8')),
+                 'fresh': len(fresh_ids), 'repeat': len(repeat_ids),
+                 'embedding_channel': ec})
 PY
 exit 0

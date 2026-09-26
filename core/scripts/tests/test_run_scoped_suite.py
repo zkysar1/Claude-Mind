@@ -295,3 +295,72 @@ def test_unmapped_can_never_contain_a_dropped_path(mod):
     # precisely why main() must record its own drops separately.
     assert unmapped == ["CLAUDE.md"]
     assert per_file["CLAUDE.md"] == set()
+
+
+# ── : a REPEATED --changed must accumulate, not keep the last ──────
+# `--changed` was declared nargs='+' with argparse's default store action, so
+# `--changed A --changed B --changed C` REPLACED the list on every repeat and
+# only C reached selection (measured 2026-09-24: "every one of the 1 supplied
+# path(s)" for three). Had C been a mappable source file the tier would have
+# printed VERDICT PASS over one of three changed files — a false fast-tier
+# closure (guard-7376). action='extend' keeps the one-flag `--changed a b c` form.
+
+def test_repeated_changed_flags_accumulate_every_path():
+    """Both forms must hand select() the SAME paths, and every one must reach it.
+
+    Asserting on the parser alone would not do: a flag the parser accepts is not
+    a flag the script wires (guard-3893). The probe paths are generated names no
+    test references, so the proof that each one REACHED selection is that
+    select() reports it in unmapped_files. The test-file input keeps the
+    kept/dropped reconciliation honest across repeats.
+    """
+    import json
+    import uuid
+    a = f"core/scripts/zz-{uuid.uuid4().hex}.py"
+    b = f"core/scripts/zz-{uuid.uuid4().hex}.py"
+    t = "core/scripts/tests/test_release.py"
+
+    repeated = _run_cli("--changed", a, "--changed", b, "--changed", t,
+                        "--list-only", "--json")
+    single = _run_cli("--changed", a, b, t, "--list-only", "--json")
+    for r in (repeated, single):
+        # unmapped probes => INCONCLUSIVE, never PASS
+        assert r.returncode == 2, r.stdout + r.stderr
+    got, want = json.loads(repeated.stdout), json.loads(single.stdout)
+
+    assert got["changed_files"] == [a, b], got["changed_files"]
+    assert got["dropped_inputs"] == [t]
+    assert got["changed_count"] + got["dropped_count"] == 3
+    assert got["unmapped_files"] == [a, b]
+    # the repeated form must be indistinguishable from the one-flag form
+    for key in ("changed_files", "dropped_inputs", "unmapped_files"):
+        assert got[key] == want[key], key
+
+
+def test_zero_test_files_flags_main_style_only(mod, tmp_path):
+    """: pytest collects nothing from a main()-style file."""
+    main_style = tmp_path / "test_main_style.py"
+    main_style.write_text("def main():\n    assert True\n\nif __name__ == '__main__':\n    main()\n")
+    plain = tmp_path / "test_plain.py"
+    plain.write_text("def test_ok():\n    assert True\n")
+    klass = tmp_path / "test_klass.py"
+    klass.write_text("class TestThing:\n    def test_ok(self):\n        assert True\n")
+    # pytest collects a unittest.TestCase subclass whatever its name.
+    unit = tmp_path / "test_unit.py"
+    unit.write_text("import unittest\n\nclass Advisory(unittest.TestCase):\n"
+                    "    def test_ok(self):\n        self.assertTrue(True)\n")
+    assert mod._zero_test_files([main_style, plain, klass, unit]) == [str(main_style)]
+
+
+def test_green_run_with_a_zero_test_file_is_not_a_bare_pass(mod, monkeypatch, capsys):
+    """: a green run whose selection includes main()-style files
+    (6 of 26 for capability-gate.py) must not report a bare PASS."""
+    import json
+    monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (0, ""))
+    monkeypatch.setattr(sys, "argv", ["run-scoped-suite.py", "--changed",
+                                      "core/scripts/capability-gate.py", "--json"])
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 2 and out["verdict"] == "PASS_WITH_GAPS", out["verdict"]
+    assert "core/scripts/tests/test_layer_d_telemetry.py" in out["zero_test_files"]
+    assert "test_layer_d_telemetry.py" in out["reason"]

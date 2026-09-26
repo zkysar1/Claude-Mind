@@ -876,7 +876,7 @@ DEFAULT (Stage 5 onward — unless the per-agent opt-out flag
 `agents/<agent>/session/deadman-disabled` is present), the iteration's terminal
 response emits TWO batched tool calls in this EXACT order:
 
-1. `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600)` —
+1. `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600, noop=false, reason="deadman resurrection net")` —
    re-arm the deadman net. Single replace-slot (each iteration's re-arm
    replaces the prior); never fires on a healthy loop (the session is never
    idle 600s — the Skill chain re-arms it forward first); fires ONLY if a

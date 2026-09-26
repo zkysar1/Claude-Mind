@@ -11,7 +11,8 @@
 # Verdict is TRI-STATE and an empty selection is NOT a pass:
 #   0 PASS         a non-empty selection ran and every test passed
 #   1 FAIL         a test failed or errored
-#   2 INCONCLUSIVE empty selection / a changed file no test references / timeout
+#   2 INCONCLUSIVE empty selection / a changed file no test references /
+#                  a selected main()-style test file pytest runs 0 tests from / timeout
 #   3 setup error
 #
 # Usage:

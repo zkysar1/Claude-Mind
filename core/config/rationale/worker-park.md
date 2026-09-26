@@ -112,9 +112,9 @@ per worker into the channel a human reads to find out the reducer is gone.
 
 ## The three terminal shapes
 
-A completed work unit ends on the deadman PAIR (`ScheduleWakeup(…, 600)` then
+A completed work unit ends on the deadman PAIR (`ScheduleWakeup(…, 600, noop=false, reason="deadman resurrection net")` then
 `Skill(worker-loop)` last). A PARK ends on `ScheduleWakeup(<park-resume prompt>,
-3600)` and nothing after it — that wakeup IS the auto-resume, and the platform
+3600, noop=false, reason="park re-poll")` and nothing after it — that wakeup IS the auto-resume, and the platform
 keeps ONE pending wakeup (replace-slot), so the park poll is also the net. A
 genuine CLOSE (an expired park, a user stop) ends on a Bash echo and arms
 nothing: nothing should wake a closed Body. A park turn that forgets to arm is

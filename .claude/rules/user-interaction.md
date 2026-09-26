@@ -22,7 +22,7 @@ directly via Bash — they may only be executed as part of user-invoked skills:
 The following are restricted to specific callers:
 
 - `session-persona-set.sh false` — only /stop
-- `session-persona-set.sh true` — /start, /boot
+- `session-persona-set.sh true` — /start, /boot. /boot's Phase -1 also runs late, when the loop's entry battery dispatches it (`persona_not_active`).
 - `session-signal-set.sh stop-loop` — only /stop (existing rule, see stop-hook-compliance.md)
 
 The agent retains full access to all **read-only** session scripts:

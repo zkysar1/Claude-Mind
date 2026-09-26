@@ -2436,10 +2436,12 @@ def load_forged_skills(categories):
 def load_experiences(categories, depth, read_only=False):
     """Load top N experiences matching any category. Increment retrieval counters unless read_only.
 
-    Counter writes route through `_locked_bump_jsonl` (with the
-    `retrieval_stats.*` field path — experiences nest counters there rather
-    than under `utilization`) so concurrent experience-archive writes from
-    aspirations-execute are not clobbered."""
+    Counter writes are SPOOLED and folded back by one locked RMW per interval
+    (g-358-216, `_experience_stats_spool`); an id whose spool append fails
+    routes through `_locked_bump_jsonl` (with the `retrieval_stats.*` field
+    path — experiences nest counters there rather than under `utilization`) so
+    concurrent experience-archive writes from aspirations-execute are not
+    clobbered."""
     if not EXP_PATH:
         return []
     records = read_jsonl(EXP_PATH)
@@ -2491,8 +2493,35 @@ def load_experiences(categories, depth, read_only=False):
     if not read_only and selected:
         selected_ids = {r["id"] for r in selected}
 
+        # : SPOOL the bump and drain it at most once per interval,
+        # instead of one whole-store RMW per retrieval call (measured: ~630
+        # versions/day of a 3.27 MB store, 569 of them same-size counter
+        # edits). The drain folds into these same records, so no reader
+        # changes; see _experience_stats_spool's docstring. Ids whose spool
+        # append fails take the legacy RMW below, narrowed to just those ids
+        # so the spooled majority is never double-counted.
+        unspooled_ids = set(selected_ids)
+        try:
+            import _experience_stats_spool as _es
+            unspooled_ids = {rid for rid in selected_ids
+                             if not _es.record(EXP_PATH, rid, "retrieval_count")}
+            flushed = _es.flush(EXP_PATH)
+            if flushed.get("status") == "no_claim":
+                TELEMETRY_SKIPS.append({
+                    "store": "experience",
+                    "path": str(EXP_PATH),
+                    "reason": "no_claim",
+                    "detail": "spooled increments dropped at flush "
+                              "(g-358-216)",
+                    "increments_dropped": flushed.get("dropped", 0),
+                })
+        except Exception as _exc:  # noqa: BLE001 — telemetry never fails a read
+            print("WARN: experience counter spool unavailable (%s: %s); "
+                  "falling back to the legacy bump"
+                  % (type(_exc).__name__, _exc), file=sys.stderr)
+
         def _should_bump(rec):
-            return rec.get("id") in selected_ids
+            return rec.get("id") in unspooled_ids
 
         # `selected` was computed from the unlocked snapshot; the locked write
         # re-reads, bumps the same IDs (when still present), and persists.
@@ -2521,19 +2550,20 @@ def load_experiences(categories, depth, read_only=False):
         # Phase 9.5b audits on. A silent fail-open would make that audit vacuous
         # on every non-claim box, which is the failure this goal forbids.
         try:
-            _locked_bump_jsonl(
-                EXP_PATH,
-                _should_bump,
-                counter_path=("retrieval_stats", "retrieval_count"),
-                timestamp_path=("retrieval_stats", "last_retrieved"),
-            )
+            if unspooled_ids:
+                _locked_bump_jsonl(
+                    EXP_PATH,
+                    _should_bump,
+                    counter_path=("retrieval_stats", "retrieval_count"),
+                    timestamp_path=("retrieval_stats", "last_retrieved"),
+                )
         except _no_claim_error_types() as _exc:
             TELEMETRY_SKIPS.append({
                 "store": "experience",
                 "path": str(EXP_PATH),
                 "reason": "no_claim",
                 "detail": str(_exc)[:300],
-                "records_not_bumped": len(selected_ids),
+                "records_not_bumped": len(unspooled_ids),
             })
             print("WARN: experience utilization bump skipped (no_claim): this "
                   "box does not hold the claim for %s. The RETRIEVAL SUCCEEDED "

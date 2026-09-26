@@ -45,9 +45,11 @@ while [[ $# -gt 0 ]]; do
         --schema)
             PASSTHROUGH+=("$1"); shift;;
         --override-signal)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             HEADERS+=(--header "X-Mind-Override-Signal: ${2-}")
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --override-duplication)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             HEADERS+=(--header "X-Mind-Override-Duplication: ${2-}")
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --override-supply)
@@ -56,6 +58,7 @@ while [[ $# -gt 0 ]]; do
             # motivation) refused for missing supply_evidence / unverifiable
             # referents / blocker-as-gap / archive overlap / daily cap. Audited
             # to world/aspiration-supply-overrides.jsonl by the gate.
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             HEADERS+=(--header "X-Mind-Override-Supply: ${2-}")
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         --override-all)
@@ -63,6 +66,7 @@ while [[ $# -gt 0 ]]; do
             # unset per-gate slot (X-Mind-Override-Signal, X-Mind-Override-
             # Duplication, X-Mind-Override-Supply) and audits the bulk override
             # to world/override-bypass-ledger.jsonl. Per-gate headers always win.
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             HEADERS+=(--header "X-Mind-Override-All: ${2-}")
             PASSTHROUGH+=("$1" "${2-}"); shift $(( $# >= 2 ? 2 : 1 ));;
         -h|--help)

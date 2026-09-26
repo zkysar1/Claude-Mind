@@ -61,6 +61,15 @@ ZDS led staging on 18 files). Mechanism:
 bash core/scripts/promotion-preflight.sh --source <staging-clone> --target <this-repo>
 ```
 
+**Run the INCOMING release's preflight** (`<staging-clone>/core/scripts/`), not
+this repo's installed copy. The gate is part of the payload, so a Mind that is
+behind holds the OLDEST gate in the chain: measured 2026-09-25 against ZDS on
+v2.12.3, the v2.12.83 gate left 30 of 50 ZDS-authored files unflagged and the
+g-115-10758 gate left 0. `framework_pull.py --adopt` still runs the INSTALLED
+gate (it resolves its repo and its preflight from its own location), so a file
+only the incoming gate flags is not protected by that adopt; a registry row
+cannot reach it, only a back-port (§f) can.
+
 * **exit 0** — target framework is a subset of source. Proceed.
 * **exit 2** — DRIFT. For EVERY flagged file, run
   `bash core/scripts/promotion-plan-triage.sh` and record a decision in the

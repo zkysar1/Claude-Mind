@@ -31,8 +31,10 @@ from _daemon_fixture import DaemonFixture  # noqa: E402
 
 def _make_world(tmp: Path, *, interval_hours: float = 4.0,
                 consecutive_deep: int = 0,
+                consecutive_routine: int = 0,
                 original_interval_hours: float | None = None,
                 calibration_exempt: bool | None = None,
+                interval_pinned_by: str | None = None,
                 extra_goals: list | None = None) -> Path:
     world = tmp / "world"
     world.mkdir()
@@ -44,7 +46,7 @@ def _make_world(tmp: Path, *, interval_hours: float = 4.0,
         "priority": "MEDIUM",
         "recurring": True,
         "interval_hours": interval_hours,
-        "consecutive_routine": 0,
+        "consecutive_routine": consecutive_routine,
         "consecutive_deep": consecutive_deep,
         "achievedCount": consecutive_deep + 1,
         "blocked_by": [],
@@ -56,6 +58,8 @@ def _make_world(tmp: Path, *, interval_hours: float = 4.0,
         goal["original_interval_hours"] = original_interval_hours
     if calibration_exempt is not None:
         goal["calibration_exempt"] = calibration_exempt
+    if interval_pinned_by is not None:
+        goal["interval_pinned_by"] = interval_pinned_by
     goals = [goal]
     if extra_goals:
         goals.extend(extra_goals)
@@ -259,3 +263,84 @@ def test_without_the_flag_the_same_world_still_contracts():
         assert "EXEMPT" not in out, out
         g, _ = _read_goal(world, "g-100-01")
         assert g["interval_hours"] == 2.67, g["interval_hours"]
+
+
+# ---- : interval_pinned_by (human-pinned cadence) -----------------
+# auto-contract lowered a 6h user-directed interval to 4h TWICE; nothing
+# distinguished a loop-tuned cadence from a human-pinned one. interval_pinned_by
+# carries the directive id and BOTH tuners must refuse to cross it. Each e2e
+# decline test is paired with a positive control (same world, unpinned, DOES
+# tune), so an over-broad implementation that declined everything fails here
+# rather than passing silently (guard-4166).
+
+def _run_extend(world: Path, goal_id: str, dry_run: bool = False):
+    """The auto-EXTEND path: main() with no --contract-mode."""
+    env = os.environ.copy()
+    env["MIND_WORLD"] = str(world)
+    env["MIND_AGENT"] = "alpha"
+    args = [sys.executable, str(DETECTOR), goal_id, "--source", "world"]
+    if dry_run:
+        args.append("--dry-run")
+    proc = subprocess.run(args, capture_output=True, text=True,
+                          timeout=15, env=env)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def test_pin_declines_tuning_helper(capsys):
+    """Unit: the single predicate both tuners consult. Pinned -> True + a decline
+    log naming the pin; unpinned (absent OR empty) -> False, no log."""
+    import importlib.util as _u
+    _spec = _u.spec_from_file_location("cargo_cult_detector", DETECTOR)
+    _mod = _u.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    assert _mod._pin_declines_tuning(
+        {"interval_pinned_by": "g-115-5767"}, "g-100-01", 6.0, "[cargo-cult]") is True
+    out = capsys.readouterr().out
+    assert "DECLINED (pinned)" in out and "g-115-5767" in out, out
+    assert _mod._pin_declines_tuning({}, "g-100-01", 6.0, "[cargo-cult]") is False
+    assert _mod._pin_declines_tuning(
+        {"interval_pinned_by": ""}, "g-100-01", 6.0, "[cargo-cult]") is False
+    assert capsys.readouterr().out == "", "no log line when unpinned"
+
+
+def test_pinned_goal_declines_contraction():
+    """auto-contract must not cross the pin. Same world as
+    test_above_floor_contracts_and_records_original plus the pin -> DECLINED,
+    interval unchanged, streak NOT reset (decline is before any side effect)."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), interval_hours=4.0, consecutive_deep=3,
+                            interval_pinned_by="g-115-5767")
+        rc, out, err = _run_contract(world, "g-100-01")
+        assert rc == 0, err
+        assert "DECLINED (pinned)" in out, out
+        assert "auto-contracted" not in out, out
+        g, _ = _read_goal(world, "g-100-01")
+        assert g["interval_hours"] == 4.0, g["interval_hours"]
+        assert g["consecutive_deep"] == 3, g["consecutive_deep"]
+
+
+def test_pinned_goal_declines_extension():
+    """auto-extend must not cross the pin -> DECLINED, interval unchanged."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), interval_hours=4.0, consecutive_routine=3,
+                            interval_pinned_by="g-115-5767")
+        rc, out, err = _run_extend(world, "g-100-01")
+        assert rc == 0, err
+        assert "DECLINED (pinned)" in out, out
+        assert "auto-extended" not in out, out
+        g, _ = _read_goal(world, "g-100-01")
+        assert g["interval_hours"] == 4.0, g["interval_hours"]
+
+
+def test_unpinned_goal_still_extends():
+    """Positive control for the extend decline: identical world, no pin ->
+    auto-extend fires (4.0h -> 6.0h). Proves the pin is what declines, not an
+    unrelated reason the goal became un-extendable (guard-4166)."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), interval_hours=4.0, consecutive_routine=3)
+        rc, out, err = _run_extend(world, "g-100-01")
+        assert rc == 0, err
+        assert "auto-extended" in out, out
+        assert "DECLINED (pinned)" not in out, out
+        g, _ = _read_goal(world, "g-100-01")
+        assert g["interval_hours"] == 6.0, g["interval_hours"]

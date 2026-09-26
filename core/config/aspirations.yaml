@@ -483,6 +483,20 @@ close_review_gate:
   note_marker_enabled: false
   # Env overrides for tests / a deliberate one-run enable:
   #   CLOSE_REVIEW_GATE_ENABLED=1  CLOSE_REVIEW_NOTE_MARKER_ENABLED=1
+  # POST-HOC lane (, 2026-09-24): closures by these CLOSER ROLES are reviewed
+  # AFTER the close by an independent mind through /fresh-eyes-close — the gate above
+  # stays dormant for them. Read by core/scripts/close-review-queue.py (`list` ranks the
+  # unreviewed ones, `stats` gives the pass rate per role); the reviewer is the recurring
+  # world goal that drains the queue. Why after and not blocking: a lesser-model Body
+  # handles a refused close by passing the override (measured 2026-09-23, zc-02 on the
+  # uncommitted-work gate), and a refusal it cannot override stalls it on a branch the
+  # worker loop does not have — reviewing after keeps the Body untouched and still puts a
+  # stronger reader on every closure; a REJECT files a Fix goal (fix-forward).
+  # RELAX RULE (drop a role from this list, or flip it to the blocking gate) only on
+  # evidence from `close-review-queue.py stats`: >= 10 reviewed closures for the role,
+  # approve rate >= 0.8 (APPROVE + APPROVE_WITH_NOTES), and no REJECT among the last 5.
+  # When relaxing, enumerate what depended on the reviews first (guard-3699).
+  review_closer_roles: [worker]
 
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals

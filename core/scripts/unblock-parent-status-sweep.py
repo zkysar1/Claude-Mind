@@ -80,8 +80,13 @@ Action modes:
     --report (default): print JSON, no mutation
     --apply: mark each candidate as status=skipped with outcome_note
         "parent resolved without action needed (parent_id=<X>, parent.status=<Y>)"
-        Idempotent: if outcome_note already starts with "parent resolved
-        without action needed", skip the rewrite.
+        -- or, when the Unblock carries execution history (it was claimed and
+        worked, and that claim has since been released), "parent resolved;
+        this Unblock was worked (...)", which credits that work instead of
+        recording the resolution as needing no action (g-306-510). A goal
+        whose claim is still LIVE is not written at all (g-115-7410).
+        Idempotent: a goal carrying either note AND a terminal status is not
+        rewritten (g-115-5097).
 
 Single-writer / fail-quiet (rb-428 family):
     - One Python pass over active queues per call
@@ -1088,6 +1093,19 @@ def _reread_goal_authoritative(source, goal_id):
     )
 
 
+def _authoritative_verdict(source, goal_id):
+    """``(goal, reason)`` — ONE store-of-record read, and the shared verdict on it.
+
+    `_mark_skipped` needs the RECORD as well as the verdict (g-306-510): which
+    note it may write depends on the goal's execution history, and that has to
+    come from the same authoritative read the write decision was made on. A
+    second read could disagree with the first, and the scan-time record may be
+    a mirror that never saw the claim.
+    """
+    goal, prov = _reread_goal_authoritative(source, goal_id)
+    return goal, _shared_stale_candidate_reason(goal, prov)
+
+
 def _stale_candidate_reason(source, goal_id):
     """``None`` when the write may proceed, else the refusal reason.
 
@@ -1100,8 +1118,17 @@ def _stale_candidate_reason(source, goal_id):
     captured at import), which is what keeps
     `mod._reread_goal_authoritative = ...` working in the tests.
     """
-    goal, prov = _reread_goal_authoritative(source, goal_id)
-    return _shared_stale_candidate_reason(goal, prov)
+    return _authoritative_verdict(source, goal_id)[1]
+
+
+# : the note for an Unblock an agent WORKED. Both this prefix and
+# "parent resolved without action needed" are dedup keys (`_is_already_swept`).
+_WORKED_NOTE_PREFIX = "parent resolved; this Unblock was worked"
+
+# Execution HISTORY, which survives a release (see `_sweep_write_guard`
+# ACTIVE_CLAIM_FIELDS for the measurement) — so it is still on the record when
+# this sweep arrives after the claim is gone.
+_EXECUTION_HISTORY_FIELDS = ("started", "executed_by", "executed_by_sid")
 
 
 def _mark_skipped(source, goal_id, parent_id, parent_status,
@@ -1125,7 +1152,7 @@ def _mark_skipped(source, goal_id, parent_id, parent_status,
     the success path is exactly what makes the goal an eligible candidate while
     it is still in flight. The race is structurally coupled to the good outcome.
     """
-    stale = _stale_candidate_reason(source, goal_id)
+    goal, stale = _authoritative_verdict(source, goal_id)
     if stale is not None:
         print(f"[unblock-parent-status-sweep] REFUSED {goal_id}: {stale}",
               file=sys.stderr)
@@ -1162,6 +1189,34 @@ def _mark_skipped(source, goal_id, parent_id, parent_status,
             f"cannot see whether an agent fix produced it, so do not read this "
             f"as evidence nobody acted — check world/changelog.jsonl around "
             f"this timestamp before recording it as self-resolved]")
+    # : a WORKED Unblock must not get that note at all. Since
+    #  a live claim refuses the write above, so this sweep reaches a
+    # worked goal only after its claim was RELEASED, and then the record itself
+    # says an agent acted on exactly this Unblock. No ordering test against the
+    # parent: in the canonical incident () the fix was an
+    # interval_hours rewrite, which moves no timestamp, and the parent's
+    # lastAchievedAt PREDATED the claim, so ordering would credit nobody.
+    worked = [f"{f}={goal[f]}" for f in _EXECUTION_HISTORY_FIELDS if goal.get(f)]
+    if worked:
+        prior = (goal.get("outcome_note") or "").strip()
+        if prior.startswith(_WORKED_NOTE_PREFIX):
+            # This sweep's own earlier write, whose status write then failed:
+            # already attributed, and already carrying anything it preserved.
+            note = prior
+        else:
+            note = (f"{_WORKED_NOTE_PREFIX} "
+                    f"(parent_id={parent_id}, parent.status={parent_status}; "
+                    f"{', '.join(worked)}) [credited to that work, NOT recorded "
+                    f"as self-resolved: its claim was released before this "
+                    f"sweep arrived, and the sweep reads only the parent's "
+                    f"CURRENT state, so it cannot rule out that this work "
+                    f"produced it]")
+            # The executor's own account IS the attribution evidence, so it is
+            # kept, never bare-replaced (guard-3626, guard-4033). Measured
+            # 2026-09-26: 3 of the 9 worked-and-released open Unblocks had one.
+            if prior and not prior.startswith(
+                    "parent resolved without action needed"):
+                note += f"\n\nPRESERVED prior outcome_note:\n{prior}"
     rc1, _, err1 = _py([str(SCRIPT_DIR / "aspirations.py"),
                         "--source", source, "update-goal",
                         goal_id, "outcome_note", note])
@@ -1214,7 +1269,8 @@ def _is_already_swept(g):
     candidate set, which is the only reason the retry can reach it.
     """
     note = (g.get("outcome_note") or "")
-    if not note.startswith("parent resolved without action needed"):
+    if not note.startswith(("parent resolved without action needed",
+                            _WORKED_NOTE_PREFIX)):
         return False
     return (g.get("status") or "") in TERMINAL_STATES
 

@@ -101,6 +101,18 @@ def _write(board, channel, *rows):
     (board["dir"] / f"{channel}.jsonl").write_text("".join(rows), encoding="utf-8")
 
 
+def _select_digest_post(calls):
+    """The DIGEST post among an emitter's subprocess calls. Since 
+    _emit_out_of_window_digest also posts per-author notices, so a bare
+    'last call' capture now grabs an author notice — select by the digest's own
+    tag instead."""
+    for c in calls:
+        argv = c["argv"]
+        if "insight-trigger-out-of-window" in argv[argv.index("--tags") + 1].split(","):
+            return c
+    raise AssertionError("no out-of-window digest post found among calls")
+
+
 # ---------------------------------------------------------------------------
 # 1 — the defect, stated as behavior
 # ---------------------------------------------------------------------------
@@ -122,6 +134,18 @@ def test_in_window_trigger_never_enters_the_audit_bucket(board):
     assert [t["msg_id"] for t in its.load_triggers()] == ["msg-fresh"]
     oow, _, _ = its.load_out_of_window_triggers()
     assert oow == []
+
+
+def test_aged_out_digest_is_never_digested_again(board):
+    """A digest is itself both-tagged. Once it ages out it must stay out of the
+    audit bucket, or every digest spawns the next one (g-115-5722). The ordinary
+    aged trigger beside it is the positive control."""
+    _write(board, "findings",
+           _msg("msg-digest", target="omni", action=its.DIGEST_ACTION, hours_ago=48.0),
+           _msg("msg-old-1", hours_ago=48.0))
+    oow, _, truncated = its.load_out_of_window_triggers()
+    assert [t["msg_id"] for t in oow] == ["msg-old-1"]
+    assert truncated == 0
 
 
 # ---------------------------------------------------------------------------
@@ -238,15 +262,14 @@ def test_routing_notes_are_harvested_from_ANY_age(board):
 
 def test_digest_groups_by_target_and_tags_every_msg_id(board, monkeypatch):
     """One post per target; every id carried so dedup stays per-trigger."""
-    captured = {}
+    calls = []
 
     class _Proc:
         returncode = 0
         stdout = "msg-digest-1"
 
     def fake_run(argv, **kw):
-        captured["argv"] = argv
-        captured["input"] = kw.get("input", "")
+        calls.append({"argv": argv, "input": kw.get("input", "")})
         return _Proc()
 
     import subprocess
@@ -262,7 +285,10 @@ def test_digest_groups_by_target_and_tags_every_msg_id(board, monkeypatch):
     assert res["posted"] is True
     assert res["count"] == 2
 
-    tags = captured["argv"][captured["argv"].index("--tags") + 1]
+    # : the emitter now ALSO posts per-author notices; select the
+    # DIGEST post (the named-agent route) by its own tag, not the last call.
+    digest = _select_digest_post(calls)
+    tags = digest["argv"][digest["argv"].index("--tags") + 1]
     assert f"{its.OOW_TAG_PREFIX}m1" in tags
     assert f"{its.OOW_TAG_PREFIX}m2" in tags
     # It must be addressed, so the digest itself converts to ONE triage goal.
@@ -270,7 +296,7 @@ def test_digest_groups_by_target_and_tags_every_msg_id(board, monkeypatch):
     assert "action_type:triage-aged-triggers" in tags
     # Every id is NAMED in the body — a count alone tells a reader something was
     # lost without telling them what (guard-1227).
-    assert "m1" in captured["input"] and "m2" in captured["input"]
+    assert "m1" in digest["input"] and "m2" in digest["input"]
 
 
 def test_digest_post_failure_leaves_no_dedup_tag(board, monkeypatch):
@@ -480,24 +506,26 @@ def test_unreadable_env_registry_fails_OPEN_and_still_emits(
 
 
 def _emit_and_capture_tags(monkeypatch, target, batch):
-    """Run the REAL emitter; return (tag_string, body) it actually posted."""
-    captured = {}
+    """Run the REAL emitter; return (tag_string, body) of the DIGEST post it made.
+    The emitter also posts per-author notices (g-115-10628), so select the digest
+    by its own tag rather than taking the last subprocess call."""
+    calls = []
 
     class _Proc:
         returncode = 0
         stdout = "msg-digest-emitted"
 
     def fake_run(argv, **kw):
-        captured["argv"] = argv
-        captured["input"] = kw.get("input", "")
+        calls.append({"argv": argv, "input": kw.get("input", "")})
         return _Proc()
 
     import subprocess
     monkeypatch.setattr(subprocess, "run", fake_run)
     res = its._emit_out_of_window_digest(target, batch)
     assert res["posted"] is True, "emitter did not post — harness is broken"
-    argv = captured["argv"]
-    return argv[argv.index("--tags") + 1], captured["input"]
+    digest = _select_digest_post(calls)
+    argv = digest["argv"]
+    return argv[argv.index("--tags") + 1], digest["input"]
 
 
 def _resolve_as_next_run_would(tag_string, msg_id="msg-digest-emitted",

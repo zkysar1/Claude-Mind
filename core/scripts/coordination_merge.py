@@ -1797,6 +1797,67 @@ _PIPELINE_NEWER_FIELDS = ("last_reviewed", "outcome_date", "reflected_date")
 _PIPELINE_SET_DOMINATES_FIELDS = (
     "outcome", "surprise", "experience_ref", "outcome_detail")
 
+# --- replay_metadata: field-wise, never whole-from-base () --------
+# A pipeline record's replay_metadata is a NESTED dict. _merge_pipeline_record
+# took it WHOLE from the content-tiebreak base, and a copy carrying
+# encoded_via_chronic serializes as '{"encoded_via_chronic": true, ...' which
+# sorts UNDER a flagless copy's '{"last_replayed": ...' ('e' < 'l'), so the
+# flagged copy was never the base and the flag was silently dropped;
+# replay_count could likewise regress when a stale-but-canon-greater copy won.
+# Mirrors _merge_counters: union keys, explicit per-field semantics, nested key
+# order canonicalized on divergence (these dicts serialize inside their parent
+# record, so their insertion order reaches the bytes — guard-1153 / guard-907).
+_REPLAY_META_NEWER_FIELDS = ("last_replayed", "next_review_date")
+
+
+def _replay_count_int(v) -> int:
+    """replay_count is an int on new records and a string ('3') on some
+    historical ones; coerce for a numeric MAX. Missing/garbage sorts oldest
+    (-1) so any real count dominates."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _merge_replay_metadata(a: dict, b: dict) -> dict:
+    """Commutative, idempotent field-wise merge of two replay_metadata dicts
+    (g-115-10679):
+      - replay_count:            numeric MAX (int-coerced; a counter only grows)
+      - last_replayed /
+        next_review_date:        strictly-newer wins
+      - encoded_via_chronic:     True dominates (a set flag is monotonic)
+      - reconsolidation_updates: list union (order kept when identical, else
+                                 canon-sorted so the bytes converge)
+      - every other key:         union; divergent scalars break to canon-greater
+    Symmetric in (a, b); nested key order canonicalized on divergence."""
+    out = dict(a)
+    for k, vb in b.items():
+        if k not in out:
+            out[k] = vb
+            continue
+        va = out[k]
+        if k == "replay_count":
+            ia, ib = _replay_count_int(va), _replay_count_int(vb)
+            out[k] = (va if _canon(va) >= _canon(vb) else vb) if ia == ib \
+                else (va if ia > ib else vb)
+        elif k in _REPLAY_META_NEWER_FIELDS:
+            out[k] = va if (_newer(va, vb) or va == vb) else vb
+        elif k == "encoded_via_chronic":
+            out[k] = bool(va) or bool(vb)
+        elif k == "reconsolidation_updates" \
+                and isinstance(va, list) and isinstance(vb, list):
+            if va == vb:
+                out[k] = va
+            else:
+                seen: Dict[str, object] = {}
+                for item in va + vb:
+                    seen.setdefault(_canon(item), item)
+                out[k] = [seen[c] for c in sorted(seen)]
+        elif va != vb:
+            out[k] = va if _canon(va) >= _canon(vb) else vb
+    return _commutative_key_order(a, b, out)
+
 
 def _merge_pipeline_record(a: dict, b: dict) -> dict:
     """Commutative merge of two records of the SAME hypothesis id, edited on
@@ -1809,6 +1870,10 @@ def _merge_pipeline_record(a: dict, b: dict) -> dict:
       - reflected: True dominates (the reflect flag is monotonic)
       - last_reviewed / outcome_date / reflected_date: strictly-newer wins
       - formed_date: OLDER wins (stable formation timestamp)
+      - replay_metadata: merged FIELD-WISE (_merge_replay_metadata), never
+        taken whole from the content-tiebreak base (g-115-10679) — otherwise a
+        flagless copy that sorts first drops encoded_via_chronic and regresses
+        replay_count
       - key order: canonicalized when the sides' key sequences diverged
         (_commutative_key_order, g-115-2355 — the equal-rank canon tiebreak
         otherwise picks the FIRST ARG between value-identical order-divergent
@@ -1838,6 +1903,16 @@ def _merge_pipeline_record(a: dict, b: dict) -> dict:
     fa, fb = a.get("formed_date"), b.get("formed_date")
     if fa is not None and fb is not None:
         out["formed_date"] = fb if _newer(fa, fb) else fa
+    # : replay_metadata merges field-wise from BOTH sides, overriding
+    # the whole-from-base value set by `out = dict(win)`, so encoded_via_chronic
+    # is never lost and replay_count never regresses. Runs whenever either side
+    # carries the dict (the side-only union above already copied a one-sided one
+    # into out; this re-derives it symmetrically).
+    ma, mb = a.get("replay_metadata"), b.get("replay_metadata")
+    if isinstance(ma, dict) or isinstance(mb, dict):
+        out["replay_metadata"] = _merge_replay_metadata(
+            ma if isinstance(ma, dict) else {},
+            mb if isinstance(mb, dict) else {})
     return _commutative_key_order(a, b, out)
 
 

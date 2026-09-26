@@ -134,7 +134,7 @@ IF the value is 'parked': this Body is RESUMABLE and did NOT close (g-306-291).
   backs off on consecutive parks (g-357-51 part 4):
   Bash: py -3 core/scripts/body-manifest.py park-due --sid "$MIND_SID" --agent "$MIND_AGENT"
   rc=1 (not due; last stdout line = seconds left): re-arm ScheduleWakeup(<the
-  Phase 0.5 park prompt>, delaySeconds=min(remaining,3600)) and END the turn on
+  Phase 0.5 park prompt>, delaySeconds=min(remaining,3600), noop=false, reason="park re-poll") and END the turn on
   a Bash echo — no preamble, no poll, no SELECT. rc=0 (due, or any error — fail
   toward polling): skip the closure exit, continue through the preamble: Phase
   0.5 re-polls the reducer and SELECT decides — a claim RESUMES (Phase 2), no
@@ -367,7 +367,7 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #   Tool (not Bash): ScheduleWakeup(prompt="Parked worker Body: re-enter
 #     /worker-loop at Phase -0 (manifest: parked = RESUMABLE), re-run the
 #     Phase 0.5 poll; SELECT on rc 0 (a claim resumes); rc 1 re-parks.",
-#     delaySeconds=3600)
+#     delaySeconds=3600, noop=false, reason="park re-poll")
 # and NOTHING after it — that wakeup IS the auto-resume; a park turn that forgets
 # to arm is indistinguishable from a close. DO NOT STAGE THE WM (`park` never
 # stages, only a real close does). Say PARKED, not "winding down". Fail-open: a
@@ -831,7 +831,7 @@ Bash: echo '{"goal_id":"<goal-id>","aspiration_id":"<aspiration-id>","recurring"
 # user stop) ends the turn with a Bash call after its sentinel work —
 # self-continuation never overrides a close edge. A PARK (Phase 0.5 rc=1, or
 # Phase 1 no eligible goal) is not a close and takes the third shape: it ends on
-# `ScheduleWakeup(<park-resume prompt>, 3600)` and nothing after it.
+# `ScheduleWakeup(<park-resume prompt>, 3600, noop=false, reason="park re-poll")` and nothing after it.
 # Rationale (WHY): core/config/rationale/worker-deadman-net.md
 ```
 
@@ -911,7 +911,7 @@ core/config/rationale/worker-deadman-net.md
 
 | Just finished | Terminal tool call |
 |---|---|
-| A work unit (Phase 4 done, no close condition) | **The deadman PAIR** — run `bash core/scripts/deadman-directive.sh --role worker` and emit exactly the two batched calls it prints: `ScheduleWakeup(<natural-language resurrection prompt>, 600)` THEN `Skill(worker-loop)` as the LAST call. `Skill(worker-loop)` is still the primary re-entry (NEVER `Skill(aspirations)` — reducer-only, guard-517/guard-463; and never a bare Bash echo — no driver exists to re-invoke you). The ScheduleWakeup is a NET behind it, not a substitute. |
-| A **PARK** — Phase 0.5 rc=1 (reducer gone, g-306-291) or Phase 1 no eligible goal (supply gone, g-353-73), park not expired | **`ScheduleWakeup(<park-resume prompt>, 3600)` ALONE, as the last call, with NO `Skill(worker-loop)` after it.** No Skill: re-entering now would re-run the poll that just said "no reducer" and spin. No 600s net either — **the platform keeps ONE pending wakeup (replace-slot), so the park poll IS the net**. A park turn that forgets to arm is indistinguishable from a close. The stop-hook worker-net stands down on the parked manifest (`gate=worker-net-body-parked`), so this turn-end is ALLOWed rather than BLOCKed into a sentinel ceremony that would durably close the Body. |
+| A work unit (Phase 4 done, no close condition) | **The deadman PAIR** — run `bash core/scripts/deadman-directive.sh --role worker` and emit exactly the two batched calls it prints: `ScheduleWakeup(<natural-language resurrection prompt>, 600, noop=false, reason="deadman resurrection net")` THEN `Skill(worker-loop)` as the LAST call. `Skill(worker-loop)` is still the primary re-entry (NEVER `Skill(aspirations)` — reducer-only, guard-517/guard-463; and never a bare Bash echo — no driver exists to re-invoke you). The ScheduleWakeup is a NET behind it, not a substitute. |
+| A **PARK** — Phase 0.5 rc=1 (reducer gone, g-306-291) or Phase 1 no eligible goal (supply gone, g-353-73), park not expired | **`ScheduleWakeup(<park-resume prompt>, 3600, noop=false, reason="park re-poll")` ALONE, as the last call, with NO `Skill(worker-loop)` after it.** No Skill: re-entering now would re-run the poll that just said "no reducer" and spin. No 600s net either — **the platform keeps ONE pending wakeup (replace-slot), so the park poll IS the net**. A park turn that forgets to arm is indistinguishable from a close. The stop-hook worker-net stands down on the parked manifest (`gate=worker-net-body-parked`), so this turn-end is ALLOWed rather than BLOCKed into a sentinel ceremony that would durably close the Body. |
 | A close path — an EXPIRED park (the Phase 1 sentinel just touched) or a user stop | Bash echo stating the close reason. **Do NOT arm the net here** — the turn genuinely ends; stop-hook Phase 2B consumes the sentinel and stages the WM. A net armed by the PREVIOUS work unit is still pending and will fire ~600s later; that firing is benign because THREE layers read the DURABLE closure record, `sessions/<SID>/body-manifest.yaml` `body_state` in the CLOSED SET (`closed-pending-merge` / `merged` / `closed-stale`): the resurrection prompt declines to resume, Phase -0's closure gate refuses a work unit, and the stop-hook worker-net stands down (`gate=worker-net-body-closed`). The `body-closing` SENTINEL cannot serve this purpose — it is CONSUMED at every genuine close. |
 | Consulted for the phase split only (no work unit ran) | The `worker_execute.py` Bash call whose output answered the question. |

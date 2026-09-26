@@ -312,7 +312,8 @@ If skill returns INFRASTRUCTURE_UNAVAILABLE or RESOURCE_BLOCKED:
 
 ```
 IF involved_infrastructure (skill or category in infra-health.yaml mappings):
-    Bash: guardrail-check.sh --context infrastructure --outcome {flag} --phase post-execution
+    Bash: guardrail-check.sh --context infrastructure --outcome <succeeded|failed|any> --phase post-execution
+    #   succeeded = the goal's primary action worked; failed = it did not; any = match both
     FOR EACH matched guardrail: run action_hint command
     IF issues found: guardrail_found_issues = true
 

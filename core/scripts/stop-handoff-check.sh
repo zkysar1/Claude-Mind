@@ -2,7 +2,7 @@
 # Graceful-stop D7 handoff check () — thin wrapper over stop_handoff_check.py.
 # Refuses D7's mode flip until THIS stop has written agents/<agent>/session/handoff.yaml;
 # on a refusal it prints the consolidation digest's Step 9 verbatim. See the .py docstring.
-# Usage: stop-handoff-check.sh [--agent <name>] [--proceed-without-handoff "<why>"]
+# Usage: stop-handoff-check.sh [--agent <name>] [--step D4.1|D7] [--proceed-without-handoff "<why>"]
 # Exit:  0 = handoff fresh | override | fail-open;  1 = refused (Step 9 printed).
 # The agent comes from --agent, MIND_AGENT, or MIND_AGENT (the vessel's call shape),
 # exported BEFORE _paths.sh so path resolution names the right agent.

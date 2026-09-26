@@ -34,7 +34,7 @@ There are exactly two valid terminal tool calls, selected by role:
 
 By default (Stage 5 onward), the orchestrator's terminal response is the
 **pair** `[ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
-delaySeconds=600), Skill(aspirations) args='loop']`. This does NOT violate the
+delaySeconds=600, noop=false, reason="deadman resurrection net"), Skill(aspirations) args='loop']`. This does NOT violate the
 "terminal must be `Skill(aspirations)`" contract above: `Skill(aspirations)` is
 still the LAST call and the primary re-entry. The `ScheduleWakeup` is armed
 immediately before it as a self-resurrection NET that fires only if a text-death

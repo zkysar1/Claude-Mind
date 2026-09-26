@@ -31,16 +31,9 @@ Claude Code discovery. Metadata is tracked in `world/forged-skills.yaml` (not `_
 
 ## How Claude Code discovers skills (read first)
 
-At Claude Code startup, the harness scans `.claude/skills/*/SKILL.md` and loads
-each skill's `name` + `description` fields from the YAML front matter into the
-system prompt. That list is ALL Claude knows about the skill until it is invoked.
-Everything else — the body, the companion scripts, the conventions — is loaded
-only when the skill is actually used. So the description is the ONLY signal
-Claude uses to decide whether to fire a skill in response to a task.
-
-A poorly worded description means the skill silently undertriggers and the
-capability gap it was forged to fill re-opens. This is the single highest-leverage
-field in the whole file — treat it that way.
+At startup the harness loads each skill's `name`+`description` into the system prompt — ALL
+Claude knows until it fires — so the description is the ONLY signal that decides whether a
+skill fires; a vague one silently undertriggers (see ## Writing Effective Descriptions).
 
 ## Prior art — Anthropic's `skill-creator`
 
@@ -50,18 +43,13 @@ Anthropic publishes a generic skill-authoring skill at
 and a normative best-practices doc at
 https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices.
 
-Use those as the default reference for generic skill-authoring mechanics
-(frontmatter schema, progressive-disclosure patterns, script packaging,
-evaluations). `/forge-skill` layers THIS agent's domain on top:
+`/forge-skill` layers THIS agent's domain on top of that generic reference:
 
 - Gap detection via `meta/skill-gaps.yaml` (encounter counts, value estimates)
 - Curriculum and developmental gates (CALIBRATE+ / EXPLOIT+ thresholds)
 - Companion-script generation for restricted operations (SSH, API scopes)
 - Registration in `world/forged-skills.yaml` + git-commit of the skill body (fleet distribution)
 - Message-board announcement and aspirations-loop validation goal
-
-If you're not sure how to write the body of a skill, read skill-creator first,
-then come back here for the integration requirements.
 
 ## Sub-commands
 
@@ -84,9 +72,7 @@ A user asking for a skill — in chat, in a directive, or in a goal they filed �
 justification the recurring-gap gates below exist to approximate. Do NOT make the user
 wait for `times_encountered` to climb, and NEVER bump an existing gap's counter to clear
 the threshold: a gap's identity is its procedure (guard-3177) and a forced count is a
-false record. Measured 2026-09-05 (field transcript, a small model on Zak-Code): asked for
-a `google-drive-list` skill, the agent incremented an unrelated gap's count to pass the
-threshold, was then blocked by the capability gate, and delivered no skill.
+false record.
 
 1. Bash: `meta-read.sh skill-gaps.yaml` → next id `gap-{max+1}` and `<len>` = current
    number of gaps. Bash: `load-conventions.sh aspirations` if not loaded.
@@ -138,57 +124,13 @@ threshold, was then blocked by the capability gate, and delivered no skill.
   `core/scripts/backfill-tree-node-fields.py` (highest threshold whose value the
   confidence meets or exceeds).**
 
-  Corrected 2026-07-25 (g-250-269): these parentheticals previously read
-  `>= 0.30` and `>= 0.60`. Both were wrong, and both erred LOW — an agent
-  trusting the gloss would forge BELOW the real bar. Caught live: the
-  `npc-intelligence` node reads `confidence 0.7429` / `capability_level
-  CALIBRATE`. The stale `>= 0.60` gloss says PASS for an analytical gap; the
-  real EXPLOIT threshold (0.75) says BLOCK, by 0.0071. There is no automated
-  script for THIS gate — this text IS the enforcement — so a wrong number here
-  silently authorizes under-qualified forges. (Precision, g-115-3131: a
-  DIFFERENT forge gate IS automated — `curriculum-contract-check.sh --action
-  allow_forge_skill`, resolved in `core/scripts/curriculum.py`, called from
-  aspirations-spark's forge-criteria block. The two are independent: the
-  curriculum contract gates whether forging is unlocked AT ALL for the agent's
-  stage; the type/confidence gate here decides whether THIS gap clears its bar.
-  Only the second is text-only.)
+  The `>= 0.30`/`>= 0.60` gloss once here was wrong and erred LOW (g-250-269). Rationale
+  (SSOT, the correction, why this gate is text-only): core/config/rationale/forge-skill-gates.md.
 
   **Typeless default — decided g-115-3131 (2026-07-25, bravo).** A gap with no
   `type` defaults to `utility` (CALIBRATE), not `analytical` (EXPLOIT).
-
-  Evidence at decision time: 22 of 24 registered gaps carried no `type` at all,
-  so the default was not an edge case — it was the operative policy for 92% of
-  the corpus, chosen by omission. Classifying all 22 against the two
-  `gap_types` descriptions in `core/config/skill-gaps.yaml` (utility =
-  "well-defined procedures… retrieval workflows"; analytical = "requiring
-  domain understanding… pattern recognition") gave **20 utility / 2 analytical**
-  (the analytical two: gap-008 derives win-condition semantics from recordings,
-  gap-015 designs pre-registration thresholds). The old default was therefore
-  inverted against ~91% of the population it governed.
-
-  Why it went unnoticed for 24 gaps: it errs STRICT, and strict is the safe
-  direction. 790 of 1246 capability-bearing tree nodes (63%) already sit at
-  EXPLOIT, so the harder bar usually passed anyway — which is also why 9
-  typeless gaps were forged without anyone noticing a gate had been applied by
-  accident. It only bites a utility-shaped gap in a CALIBRATE category, i.e.
-  the narrow 0.50–0.75 band (the live case: `npc-intelligence` at 0.7429).
-
-  Rejected alternatives, with reasons:
-  - *"The default is right and the historical forges were under-gated"* —
-    REFUTED on its premise. Those forges cleared the STRICTER bar because most
-    categories are EXPLOIT; there is no under-gating to backfill away.
-  - *"Retire the gate; category confidence is the wrong proxy"* — a real
-    critique (a category's maturity does not measure whether the agent
-    understands the specific procedure being mechanized), but retiring a gate
-    with no replacement trades a narrow false-block for an open door. Filed
-    separately rather than acted on here.
-
-  Safety of lowering the default: the flip only matters for a gap that is BOTH
-  typeless AND in a CALIBRATE category. All 22 existing gaps were backfilled
-  with an explicit `type` in the same change, and the registration site in
-  `aspirations-spark` now sets `type` at gap-creation, so a typeless gap should
-  be rare going forward. When one does appear, `utility` matches the modal
-  shape and the explicit `type: analytical` opts INTO the higher bar.
+   Rationale (evidence: 20 of 22 typeless gaps classify utility; rejected alternatives;
+   safety of lowering): core/config/rationale/forge-skill-gates.md.
 
 **Forge Process**:
 
@@ -216,14 +158,9 @@ threshold, was then blocked by the capability gate, and delivered no skill.
        operations and MUST say "MUST use companion scripts, never raw [tool]"
      - Script naming: `{resource}-{verb}.sh` (e.g., `data-list.sh`, `data-download.sh`)
      - Placement fork (framework/domain split, g-115-1982): scripts that touch
-       DOMAIN resources (named services, product APIs, SSH targets, branded
-       workflows) go in `world/scripts/` — shared across all agents in the
-       domain. The forge process creates the directory:
-       `mkdir -p "$WORLD_DIR/scripts/"`. Scripts that are pure FRAMEWORK
-       helpers (storage backend, session state, governed-store plumbing —
-       domain-free by the `domain-leak-check.sh` test) go in `core/scripts/`
-       instead: git-tracked, portable, and they ride the repo's commit flow.
-       Precedent: `core/scripts/backend-cat.sh` (probe-governed-store).
+       DOMAIN resources (named services, product APIs, SSH targets) go in `world/scripts/`
+       (`mkdir -p "$WORLD_DIR/scripts/"`, shared across agents); pure FRAMEWORK helpers
+       (domain-free per `domain-leak-check.sh`) go in `core/scripts/`. Precedent: `backend-cat.sh`.
      - PID files live alongside scripts in `world/scripts/` (single-writer, `kill -0` liveness checks)
      - Mark scripts executable: `chmod +x "$WORLD_DIR/scripts/"*.sh`
 
@@ -232,32 +169,21 @@ threshold, was then blocked by the capability gate, and delivered no skill.
    .claude/skills/{new-skill-name}/SKILL.md
    ```
 
-   PLACEMENT CHECK (where domain knowledge goes): If this forged skill's
-   procedure references domain-specific infrastructure (named services,
-   product-specific APIs, branded workflows, account IDs, hostnames), route
-   the domain knowledge into a `world/conventions/*.md` file referenced
-   from the skill's `conventions:` front-matter list — NOT into inline
-   pseudocode and NOT into a `.claude/rules/*.md` file. The SKILL.md body
-   stays domain-agnostic; the domain particulars live in the convention.
-   This keeps the forged skill portable when transplanted, while preserving
-   the domain wiring at the deployment that needs it.
+   PLACEMENT CHECK: if the procedure references domain-specific infrastructure (services,
+   product APIs, account IDs, hostnames), route it into a `world/conventions/*.md` file named
+   in the skill's `conventions:` front matter — not inline, not a rule file. Keeps it portable.
 
    Structure:
    - YAML front matter: name, description, triggers (internal only), parameters, tools_used
    - **`forged: true`** — MANDATORY self-identifying tag. Without this, the skill
-     is indistinguishable in-file from a framework-essential skill, and a packaging
-     pass cannot tell what to keep vs. what to strip. Pair with `forged_by:
-     {agent-name}`, `forged_date: "{YYYY-MM-DD}"`, and `forged_from: {gap-id}` if
-     gap-derived. Pattern matches `.claude/skills/<forged-skill-name>/SKILL.md`.
-     `/verify-learning` Section FST enforces bidirectional consistency with
-     `world/forged-skills.yaml`.
+     is indistinguishable from a framework-essential skill. Pair with `forged_by:{agent}`,
+     `forged_date:"{YYYY-MM-DD}"`, `forged_from:{gap-id}` if gap-derived. `/verify-learning`
+     Section FST enforces consistency with `world/forged-skills.yaml`.
    - `user-invocable: false` (hyphen per Claude Code spec — underscore is NOT recognized)
    - `tools_used: [Bash, WebFetch, ...]` — which Claude Code tools this skill requires
    - `companion_scripts: [world/scripts/xxx.sh, ...]` — if companion scripts exist
    - `description:` — THE most important field. Follow the ## Writing Effective
-     Descriptions section below exactly. A forged skill that rarely fires because
-     its description is too vague is worse than not forging at all — the gap
-     encounter count keeps climbing and nothing resolves it.
+     Descriptions section exactly — a vague description that rarely fires is worse than not forging.
    - If companion scripts exist: add "## Restricted Operations" section mandating
      their use. Example: "MUST use `world/scripts/data-list.sh`, never raw access"
    - Step-by-step procedure extracted from encounters
@@ -271,16 +197,12 @@ threshold, was then blocked by the capability gate, and delivered no skill.
      The terminal action is {describe the last expected tool call for this skill}.
      Never end with a text summary.
      ```
-     This section is non-optional for forged skills — `/verify-learning` enforces it
-     via a dynamic grep. Skipping it will fail verification and kill the autonomous
-     loop if the skill is ever invoked mid-iteration.
+     Non-optional — `/verify-learning` greps for it; skipping it fails verification and kills
+     the loop if the skill runs mid-iteration.
 
 3.1. **Post-write tag check** — IMMEDIATELY after writing the new SKILL.md,
-   verify the `forged: true` tag actually landed in the file. The LLM
-   pseudocode in Step 3 is fallible — context-window pressure or instruction
-   drift can cause the tag to be omitted. Without this check, the gap
-   between forge and detection is unbounded (Section FST only fires when
-   `/verify-learning` runs, which can be days later).
+   verify the `forged: true` tag landed (Step 3 is fallible under context pressure; without
+   this the forge->detection gap is unbounded — Section FST fires only when `/verify-learning` runs).
 
    ```
    Bash: grep -E "^forged:\s*true\b" .claude/skills/{new-skill-name}/SKILL.md \
@@ -293,13 +215,10 @@ threshold, was then blocked by the capability gate, and delivered no skill.
 
 3.5. **Tier-1 skill-quality gate** (earn-the-keep Phase 1, gate `eval-harness-forge-accept`):
    Before registration, the new skill must clear the 5-dimension quality bar.
-   Score the candidate SKILL.md on `skill-evaluate.sh`'s five dims —
-   safety / completeness / executability / maintainability / cost_awareness —
-   judging each `good | average | poor` (the same rubric `skill-evaluate.sh score`
-   uses; map good=1.0, average=0.5, poor=0.0). A brand-new forge has no "before",
-   so it is gated against the human-competent baseline (all dims `average` = 0.5)
-   under `strict_improve` (epsilon=0.0): the candidate must BEAT the baseline on
-   the weighted mean — ties are rejected.
+   Score it on `skill-evaluate.sh`'s five dims (safety / completeness / executability /
+   maintainability / cost_awareness), each good|average|poor -> 1.0|0.5|0.0. A new forge has no
+   'before', so it is gated vs the human-competent baseline (all average=0.5) under
+   `strict_improve` (epsilon=0): it must BEAT the mean — ties rejected.
 
    ```
    Bash: bash core/scripts/skill-edit-gate.sh gate \
@@ -318,19 +237,14 @@ threshold, was then blocked by the capability gate, and delivered no skill.
    # exit 2 = MALFORMED CALL, not a verdict (bad JSON or a judgment outside the
    #          three words); nothing was logged. Fix the call and re-run.
    ```
-   For a refactor/edit of an EXISTING skill (not a new forge), pass
-   `--old-judgments` with the pre-edit scores and `--policy no_regression
-   --epsilon 0.02` instead (the edit must not regress). The gate is registered
-   in `core/config/gates.yaml` (`eval-harness-forge-accept`); every verdict is
-   telemetered to `meta/gate-firings.jsonl` via `_gate_log`.
+   For a refactor of an EXISTING skill pass `--old-judgments` + `--policy no_regression
+   --epsilon 0.02` instead. Every verdict is telemetered to `meta/gate-firings.jsonl`.
 
 3.6. **Companion-script dogfood gate** (correctness-critical forges only; g-115-2665):
-   Step 3.5 scores the SKILL.md TEXT, not whether the companion script produces
-   CORRECT OUTPUT — a script can score `good` on all five dims and still emit the
-   wrong verdict. For a gap whose companion script carries correctness-critical
-   logic — a **verifier** (emits a pass/fail verdict), a **computation** (derives a
-   value other code trusts), or a **state-mutating** op (writes/restores files,
-   moves records) — dogfood the script on synthetic fixtures BEFORE registration:
+   Step 3.5 scores the SKILL.md TEXT, not whether the companion script produces CORRECT
+   OUTPUT. For a gap whose companion script is a verifier (emits pass/fail), a computation
+   (derives a value other code trusts), or a state-mutating op, dogfood it on synthetic
+   fixtures BEFORE registration:
 
    - Build the smallest PASS fixture, FAIL fixture, and (if the script has an edge
      mode) one EDGE fixture that should each drive a distinct verdict.
@@ -343,79 +257,30 @@ threshold, was then blocked by the capability gate, and delivered no skill.
      side-effects verify.
    - **If the suite carries a SUMMARY assertion as its anti-vacuity guard, mutate
      against THAT ASSERTION ALONE — not against the suite as a whole** (guard-1793).
-     A one-line aggregate ("N distinct verdicts across N fixtures", "pass-rate
-     differs", "scores spread") is the tempting cheap guard because it covers every
-     fixture at once. But an aggregate summarises ONE axis, and a defect that
-     corrupts a DIFFERENT axis leaves it untouched — so it reads green through the
-     exact bug it was written to catch. Measured (g-335-439): a
-     `4 distinct floors across 4 fixtures` line stayed green through two deliberate
-     mutations that each reintroduced a real production bug, because both corrupted
-     the at-floor *enumeration* while leaving the *floor* intact; only the
-     per-fixture assertions fired. Test: re-run each mutation and check whether the
-     AGGREGATE moves. If it does not, the aggregate is not a health check — it is a
-     number that happens to be printed, and it must not be the thing you rely on.
-     Distinct from the three failure modes below it: not a self-supplied expectation
-     (guard-1220), not a wrong input shape (guard-920), not an absent layer
-     (guard-1462) — the layer IS covered, just not by the assertion you trusted.
+     Rationale (g-335-439; distinct from guard-1220 self-supplied / guard-920 wrong-shape /
+     guard-1462 absent-layer): core/config/rationale/forge-skill-gates.md.
    - **NAME the layers your fixture seam EXCLUDES** (guard-1462). Wherever the
-     fixture is injected is a silent scope declaration: everything UPSTREAM of the
-     injection point is structurally unfalsifiable by ANY fixture, and a green run
-     announces nothing about where that line fell. State the excluded layers
-     explicitly in the forge log. The common split is a script that both SELECTS
-     records and INTERPRETS them — a seam between the two tests only the
-     interpreter, leaving enumeration, filtering, ordering and the limit/cap
-     with no coverage at all.
+     injection point is a silent scope declaration — everything UPSTREAM is unfalsifiable by any
+     fixture (the SELECT-vs-INTERPRET split). State excluded layers in the forge log. Rationale:
+     core/config/rationale/forge-skill-gates.md.
    - **Run it LIVE at least once before registration** when the script's
-     correctness depends on reading an EXTERNAL SYSTEM (remote filesystem, API,
-     remote store, another host) — one real end-to-end invocation against the
-     real source, not a fixture. This ADDS to the fixture requirement, it does not
-     replace it: fixtures prove the interpreter discriminates, the live run proves
-     the excluded upstream layers work. The thin API-wrapper exemption in SCOPE
-     below applies to this bullet exactly as it does to the fixtures.
-     BUDGET THE LIVE RUN AS A SUCCESS-PATH AUDIT, not a smoke test that the thing
-     runs. For every write the tool performs, read the record back from the store
-     and DIFF the stored fields against what was supplied; for every non-zero exit,
-     read the script's own contract before calling it a failure. A fixture supplies
-     its own expectation, so a call that SUCCEEDS while quietly storing something
-     other than what you passed matches that expectation exactly — which is why
-     this class is structurally unreachable by fixtures and shows up only here.
-     Measured g-115-4466 (2026-08-01): one 3-item live run found three defects,
-     ALL on the success path (a silently-rewritten origin_signal, a read-back keyed
-     on the value that was never stored, and an rc=3 that means success), and none
-     was reachable by any fixture. rb-6343 / guard-2329.
+     correctness depends on an EXTERNAL SYSTEM (remote fs, API, remote store) — one real
+     end-to-end run against the real source. It ADDS to the fixtures (they prove the interpreter
+     discriminates; the live run proves the excluded upstream layers). BUDGET IT AS A
+     SUCCESS-PATH AUDIT: for every write, read the record back and DIFF stored vs supplied; for
+     every non-zero exit, read the contract first — a success that stores the wrong thing is
+     unreachable by fixtures (g-115-4466; rb-6343/guard-2329). Rationale (why not redundant, a
+     THIRD failure mode, g-250-269): core/config/rationale/forge-skill-gates.md.
 
-   Why the live run is not redundant with a green fixture suite (g-250-269, the
-   incident behind guard-1462): a forge followed Step 3.6 exactly — 7/7 fixtures
-   including a VALID two-way vacuity proof whose decisive pair differed in exactly
-   one field — and still shipped a real defect, because the fixture substituted the
-   payload AFTER enumeration. A non-session directory both consumed a `--limit`
-   slot and tripped the guard-1214 positive control, and no fixture could reach
-   that layer. One voluntary live run surfaced it in seconds. This is a THIRD
-   failure mode, distinct from its neighbours: guard-920 is the right layer with
-   the wrong input shape, guard-1220 is the right layer with a self-supplied
-   expectation, and this one is a layer that is not in the suite at all — so
-   satisfying both of those does NOT protect you here.
-
-   For a verifier / state-mutating script the `mutation-proof-regression-test`
-   forged skill (`core/scripts/mutation-proof-test.sh`) IS this harness — invoke it
-   on one of the script's guarded targets; for a pure computation script a
-   3-fixture inline assertion suffices. SCOPE: verification / computation /
-   state-mutating gaps ONLY — a thin API wrapper (shells one documented command,
-   no correctness-critical branch) is EXEMPT; note the exemption in the forge log
-   and proceed to Step 4.
+   For a verifier / state-mutating script the `mutation-proof-regression-test` forged skill
+   (`core/scripts/mutation-proof-test.sh`) IS this harness; a pure computation needs a 3-fixture
+   inline assertion. SCOPE: verification / computation / state-mutating gaps ONLY — a thin API
+   wrapper (one documented command, no correctness-critical branch) is EXEMPT (note it in the log).
 
    JUDGE THE EXEMPTION PER SUBCOMMAND, NEVER PER SCRIPT (g-115-3475, rb-5355).
-   A companion script is a BUNDLE of subcommands with heterogeneous risk, so one
-   whole-artifact verdict launders the riskiest member through the average — and
-   the riskiest member is exactly the one carrying the harness's safety claim.
-   Measured while forging launch-env-server-session: 4 of 8 subcommands were
-   exempted as thin wrappers, and TWO were ineligible by the classes named right
-   above — `verify-terminated` returns exit 1 plus a STILL-BILLING action on a
-   non-terminated instance (a pass/fail verdict, i.e. a VERIFIER), and `teardown`
-   is state-mutating. Both shipped unvalidated through an exemption neither
-   qualified for. Walk the subcommand list and write one verdict per entry;
-   a bundle-level "it's a thin wrapper" is not a verdict. (guard-1220, rb-4004, rb-4124 — done manually for gap-019,
-   now required by the process.)
+   A companion script BUNDLES subcommands of heterogeneous risk; a whole-artifact verdict
+   launders the riskiest through the average. Walk the subcommand list, one verdict per entry
+   (guard-1220, rb-4004, rb-4124). Rationale (launch-env-server-session): core/config/rationale/forge-skill-gates.md.
 
 4. **Register in Forged Skills** (`world/forged-skills.yaml` + git-commit the body):
    - **BODY GATE FIRST — the registry row may not be written until this exits 0**
@@ -427,50 +292,28 @@ threshold, was then blocked by the capability gate, and delivered no skill.
      board, do not report the forge done. Write the body at
      `.claude/skills/{new-skill-name}/SKILL.md` and re-run. rc=2 → you passed no
      skill name; a usage error is NOT approval.
-     WHY: measured on a downstream clone 2026-09-05 11:55Z (rb-10227) — `mkdir -p` succeeded, the
-     `Write` of SKILL.md was refused by the L1 hook, and registration proceeded
-     anyway: registry row written, skill dir EMPTY, a test goal filed to
-     exercise a skill with no body, two "forge-skill,complete" board posts, and
-     the model declared SUCCESS. A row pointing at an absent body is a PHANTOM
-     registration — it advertises a trigger fleet-wide that dispatches to
-     nothing (guard-2242 "a pointer field is not evidence until its REFERENT is
-     confirmed to exist"; rb-10227). The gate checks DISK PRESENCE at the load
-     path, deliberately not catalog listing: a skill forged mid-session cannot
-     appear in its own session's catalog on Claude Code (guard-2335), so a
-     catalog assertion would refuse every correct forge.
+     WHY: a registry row over an absent body is a PHANTOM registration (guard-2242, rb-10227);
+     the gate checks DISK PRESENCE at the load path, not catalog listing (guard-2335). Rationale:
+     core/config/rationale/forge-skill-gates.md.
    - Add entry under `skills:` with `parent`, `type`, `forged_date`, `forged_by: {agent-name}`, `gap_ref`, `triggers`
    - **AMENDING an EXISTING row (adding a trigger, fixing a `companion_scripts`
      path, appending a `note`): you MUST also set `amended_at` to the current
      naive ISO timestamp** (`date +%Y-%m-%dT%H:%M:%S`). This is not bookkeeping —
-     it is what makes the amendment SURVIVE. `merge_forged_skills` resolves a
-     same-name conflict WHOLE-RECORD, and an amendment bumps no `forged_date`
-     and adds no FIELD, so without the stamp it falls to a `_canon` lexicographic
-     tiebreak and can lose DETERMINISTICALLY to an untouched peer copy — every
-     write path reporting success while nothing lands. Measured on cc-05
-     2026-07-28 (g-115-3506 → g-115-3638): a 4-trigger addition lost 10-to-6 via
-     the Edit tool, a plain python write, AND `OwnCloudBackend.write_text`, and
-     was byte-identical with the merge arguments swapped, so retrying could never
-     win. `amended_at` is tier 0 of `_merge_forged_skill` (guard-1153: LWW on a
-     timestamp written BY THE SAME MUTATION that writes the field).
+     it is what makes the amendment SURVIVE: `merge_forged_skills` resolves same-name conflicts
+     WHOLE-RECORD, and an amendment (no new field, no bumped date) can lose to an untouched peer
+     via a `_canon` tiebreak. `amended_at` is tier 0 of `_merge_forged_skill` (guard-1153).
+     Rationale (the cc-05 10-to-6 loss): core/config/rationale/forge-skill-gates.md.
    - **Verify the row landed** — do not assume. `bash core/scripts/backend-cat.sh
      head world/forged-skills.yaml` prints the authoritative size/version plus a
-     `[match]` / `[DRIFT ...]` local-mirror verdict, then re-read the row. Two
-     registry rows have already been lost this way (`probe-governed-store`,
-     `reconcile-fleet-fork` — both carry a `restored:` field recording it), and
-     `mirror-health.sh` reports `healthy` throughout, so nothing warns you.
+     `[match]`/`[DRIFT]` verdict, then re-read the row. Two rows were lost this way while
+     `mirror-health.sh` read `healthy` throughout.
    - **Git-commit the skill body for fleet distribution** (g-115-2373, 2026-07-16):
      `git add .claude/skills/{new-skill-name}/` — the iteration close-commit sweeps
-     it to origin, and every fleet box picks it up on its next `iteration-push`
-     pull. Rationale: the registry syncs fleet-wide through the governed store and
-     advertises triggers on every box, but `.claude/` is NOT an own-cloud governed
-     root — a gitignored body existed ONLY on its birth box, so trigger resolution
-     dispatched to un-invokable skills on 4/5 boxes (found by g-115-2358 validation).
-     Do NOT write a nested `.claude/skills/{name}/.gitignore` and do NOT add a
-     ROOT `.gitignore` line — both ignore forms are retired (the g-115-2272
-     parallel-forge collision was the shared root-.gitignore FILE; disjoint new
-     skill DIRS cannot conflict). Promotion-seed purity is unaffected:
-     `_seed_engine.py` auto-derives seed exclusions from the registry (g-306-88),
-     so a committed forged body still never leaks into the domain-free seed.
+     it to origin; every fleet box pulls it on its next `iteration-push`. `.claude/` is NOT an
+     own-cloud governed root, so a gitignored body strands on its birth box (g-115-2373). Do NOT
+     write a nested `.gitignore` and do NOT add a ROOT `.gitignore` line — both ignore forms are
+     retired; disjoint new skill DIRS cannot conflict (g-115-2272); seed purity is auto-derived
+     (g-306-88). Rationale: core/config/rationale/forge-skill-gates.md.
    - Do NOT touch `_tree.yaml` or `_triggers.yaml` — those are static framework files
 
 5. **Update Skill Gaps** (`meta/skill-gaps.yaml`):
@@ -485,28 +328,14 @@ threshold, was then blocked by the capability gate, and delivered no skill.
    IF board post fails: log warning, do NOT abort — board is non-critical.
 
 7. **Notify the user** about the newly forged skill.
-   (Check world/forged-skills.yaml for a skill whose triggers match
-   "notify the user" and invoke it with:
-     subject: "New Skill Forged: {skill-name}"
-     message: |
-       A new skill has been forged from capability gap {gap-id}.
-
-       Skill: {skill-name}
-       Type: {type}
-       Parent skill: {parent-skill}
-       Location: .claude/skills/{skill-name}/SKILL.md
-       {IF companion_scripts: "Companion scripts: {list of script paths}"}
-
-       A validation goal will be created to test this skill over 3 invocations.
-   If no matching skill is registered, fall back to a `participants: [agent, user]`
-   goal via aspirations-add-goal.sh or a pending-questions entry. Never block
-   skill forging on notification failure.)
+   (Check world/forged-skills.yaml for a skill whose triggers match "notify the user" and
+   invoke it — subject "New Skill Forged: {skill-name}", message naming the skill/type/parent/
+   location + "a validation goal will test it over 3 invocations". If none is registered, fall
+   back to a `participants:[agent,user]` goal via aspirations-add-goal.sh. Never block on notify failure.)
    - IF notification fails: continue (best-effort)
 
 8. **Create Test Goal** — ONE call, the goal JSON on stdin. Never rewrite the whole
-   aspiration to add one goal (the former `aspirations-update.sh` shape asked a small model
-   to round-trip an entire aspiration record; `aspirations-add-goal.sh` is the Return
-   Protocol's named terminal action for this skill).
+   aspiration to add one goal (`aspirations-add-goal.sh` is this skill's terminal action).
    - Find the relevant aspiration: Bash: `load-aspirations-compact.sh` → IF path returned:
      Read it (IDs, titles, categories) and pick the aspiration whose category the skill serves.
    - Bash:
@@ -558,9 +387,8 @@ Run structural integrity checks across all system registries:
 
 ## Writing Effective Descriptions (MANDATORY)
 
-Source of truth: Anthropic's skill-authoring best practices
-(https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices).
-The rules below are the normative excerpts every forged skill MUST satisfy. The
+Normative excerpts from Anthropic's best-practices doc
+(https://platform.claude.com/docs/en/agents-and-tools/agent-skills/best-practices); the
 `pre-forge-description-check` step of Step 3 validates against this list.
 
 ### Hard constraints (from Anthropic spec)
@@ -580,9 +408,6 @@ Every description MUST contain BOTH:
 2. **When to use it** — explicit triggers: user phrases, internal conditions,
    upstream-skill events, file patterns, state transitions.
 
-Both belong in the description field, NOT the body. Claude decides whether to
-fire a skill from this string alone; the body is read only AFTER it fires.
-
 ### Be "pushy" — counter the undertrigger bias
 
 Claude tends to undertrigger skills. Use assertive phrasing so borderline
@@ -591,9 +416,6 @@ cases still fire:
 - "Use whenever the user says ..." (preferred)
 - "Fires when ..." (for event-driven skills)
 - "MUST use this skill — never raw X ..." (for canonical-path requirements)
-
-Avoid passive/tentative phrases like "can be used to", "might help with", "is
-for". They read as optional and the skill silently undertriggers.
 
 ### Good / bad examples
 
@@ -606,29 +428,14 @@ description: "Generates a commit message by analyzing the staged git diff.
   Always prefer this skill over asking the user to write the message by hand."
 ```
 
-Bad (first/second person, vague, no triggers):
-
-```yaml
-description: "I can help you generate commit messages"
-description: "You can use this to work with PDFs"
-description: "Helps with documents"
-description: "Does stuff with files"
-```
-
-Bad (third-person but still no triggers):
-
-```yaml
-description: "Commit message generator for git diffs"
-```
+Bad: `"I can help you generate commit messages"` (1st person), `"Helps with documents"`
+(vague), `"Commit message generator for git diffs"` (3rd person, no triggers).
 
 ### Trigger phrases to include verbatim
 
-When the skill addresses a known user-phrasing pattern, quote the user's
-literal words inside the description. Claude pattern-matches on surface form
-as well as semantics — literal quoted phrases fire more reliably than
-paraphrases. Example from `notify-user`: the description lists "notify the
-user", "reach out to the user", "alert the user", "inform the user", and
-"email the user" because base skills use any of those phrasings.
+When the skill addresses a known user-phrasing pattern, quote the user's literal words in the
+description — Claude matches surface form as well as semantics (e.g. `notify-user` lists
+"notify the user", "alert the user", "email the user").
 
 ### Naming (lightweight)
 
@@ -660,9 +467,7 @@ checklist. If any line is FAIL, rewrite the description before proceeding:
 - [ ] Includes the user's literal phrasing where known (verbatim quotes)
 - [ ] Does NOT list implementation steps (those belong in the body)
 
-When forging from a gap, the gap's `encounter_log` contains the exact user
-phrases that led to the gap being recorded — include those verbatim in the
-description.
+When forging from a gap, include the gap's `encounter_log` user phrases verbatim.
 
 ## Forge Naming Convention
 
@@ -680,27 +485,18 @@ Pattern: `{verb}-{domain}-{noun}` — keeps names scannable and predictable.
 - Never forge a skill that duplicates an existing one. Do the overlap check BY
   HAND. Per guard-4841 and guard-2119, do NOT reach for
   `skill-relations.sh read --similar {candidate_name}` here: it returns `[]` for
-  EVERY input, including names that certainly exist (measured 2026-08-22:
-  `uncrossed-seams` -> `[]`, `reflect` -> `[]`),
-  so its empty answer is ZERO signal, not evidence of no overlap — and this
-  Constraints bullet was the one place it was prescribed, which is the one place
-  that empty answer is most load-bearing. Even a working name-matcher would not
-  suffice: two skills covering overlapping procedures routinely share no name
-  tokens (guard-2119). Instead grep the skills corpus for the PROCEDURE'S OWN
-  vocabulary (the distinctive nouns in the gap's step list) across
-  `.claude/skills/` and `core/scripts/`, grep `forged_from` across
-  `.claude/skills/*/SKILL.md`, and read the front matter of the nearest
-  neighbours before concluding the capability is absent. If a similar skill
-  exists, strengthen that skill or register a compose_with relation instead of
-  forging a new one.
+  EVERY input (guard-4841) — ZERO signal, not evidence of no overlap; even a working matcher
+  wouldn't suffice (overlapping procedures share no name tokens; guard-2119). Instead grep the
+  PROCEDURE'S OWN vocabulary across `.claude/skills/` and `core/scripts/`, grep `forged_from`
+  across `.claude/skills/*/SKILL.md`, read the nearest neighbours' front matter. If a similar
+  skill exists, strengthen it or register a `compose_with` relation. Rationale: core/config/rationale/forge-skill-gates.md.
 - Always create a test aspiration goal after forging
 - Gap registry is append-only (dismissed gaps stay, never deleted)
 
 ## Pre-Forge Checklist (run before committing to a forge)
 
-Before executing the Forge Process above, run through this quality gate. If
-any item is FAIL, iterate on the candidate skill before proceeding. A rushed
-forge becomes a zombie skill that undertriggers forever.
+Before executing the Forge Process, run this quality gate. If any item is FAIL, iterate — a
+rushed forge becomes a zombie skill that undertriggers forever.
 
 ### Extension before forge — DO THIS FIRST (decided g-115-5533, 2026-08-11)
 
@@ -715,18 +511,11 @@ forge becomes a zombie skill that undertriggers forever.
       `satisfied-by-extension`, and do NOT create a SKILL.md.
 
 **Why this is a gate and not a suggestion.** A forge is not free and its cost is
-permanent: Claude Code loads every skill's name and description into the system
-prompt at startup, so each new SKILL.md is standing per-turn weight on every agent
-forever, while extension costs zero. The corpus is a pure additive ratchet — forging
-adds, nothing subtracts — and `max_skills` is ratchet-down-only by construction
-(`modifiable.max_skills` is `{min: 10, max: 100, default: 100}`, so the modifiable
-maximum equals the default and the cap cannot be raised). Measured 2026-08-11: **116
-skill dirs against a cap of 100**, and 16 of 130 gaps had already been resolved as
-`satisfied-by-extension` — the practice was established and load-bearing while this
-file mentioned it **zero** times, so the cheaper path existed and was invisible at
-exactly the moment it was needed. Enforced-by-visibility only: `/verify-learning`
-check `skill-corpus-count-under-cap` counts the directories, and nothing refuses a
-forge (see `## Constraints`).
+permanent: Claude Code loads every description at startup, so each SKILL.md is standing
+per-turn weight forever, while extension costs zero; the corpus is an additive ratchet and
+`max_skills` is ratchet-down-only. Enforced-by-visibility only (`/verify-learning`
+`skill-corpus-count-under-cap` counts dirs; nothing refuses a forge). Rationale (the measured
+116-vs-100 overrun): core/config/rationale/forge-skill-gates.md.
 
 ### Discovery signal
 - [ ] Description passes all items in "Writing Effective Descriptions" → Pre-forge description check
@@ -755,10 +544,8 @@ forge (see `## Constraints`).
 - [ ] Entry added to `world/forged-skills.yaml` with `forged_by`, `gap_ref`, `triggers`
 - [ ] Skill body staged for the fleet: `git add .claude/skills/{new-skill-name}/` ran clean, `git check-ignore .claude/skills/{new-skill-name}/SKILL.md` exits 1, and NO nested `.gitignore` was written (ignore forms retired — bodies are git-distributed; g-115-2373)
 
-If any item is FAIL, the forge is not ready — fix it first or abort and
-re-queue the gap with updated notes. Forging a skill that never fires does not
-clear the gap; it just moves the problem from the skill-gaps registry to the
-skill registry while the actual capability remains missing.
+If any item is FAIL, fix it or abort and re-queue the gap. Forging a skill that never fires
+does not clear the gap; it just moves the problem to the skill registry.
 
 ## Return Protocol
 
@@ -778,8 +565,6 @@ bash core/scripts/forged-skill-body-gate.sh --skill {new-skill-name}
 
 rc≠0 → the forge is NOT done. Say so plainly, leave the validation goal open,
 and do not post a "forge-skill,complete" board message. Note what this can and
-cannot prove: it confirms a loadable body at the path the runtime reads, NOT
-that the skill will trigger — Claude Code loads skill descriptions at STARTUP,
-so trigger behaviour is only testable in a session that started after the forge
-commit (guard-2335). Never revise a description because the new skill did not
-fire in its own session.
+cannot prove: it confirms a loadable body, NOT that the skill will trigger — descriptions load
+at STARTUP, so trigger behaviour is only testable in a session started AFTER the forge commit
+(guard-2335). Never revise a description because the new skill did not fire in its own session.

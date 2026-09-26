@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.84",
+    "previous_version": "2.12.83",
+    "date": "2026-09-26",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Demand-pull cut (g-373-140 / g-373-94 vessel verification): graceful-stop D7 signs the stop off itself - the D7 mode-flip call clears stop-checkpoint.json, so a vessel's sidecar sees framework_stop_complete and ends mind_stopped instead of idling out its grace (164f3895bd); plus 99 more non-chore commits since v2.12.83",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.83",
     "previous_version": "2.12.82",
     "date": "2026-09-24",

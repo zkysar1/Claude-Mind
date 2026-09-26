@@ -24,6 +24,7 @@ Exit codes: 0=clean, 1=flags raised (rollbacks fired), 2=input error.
 """
 
 import argparse
+import datetime
 import json
 import os
 import subprocess
@@ -357,8 +358,13 @@ def cmd_backpressure(args):
         }
 
     rollbacks_applied = []
+    rollbacks_skipped = []
+    rollbacks_failed = []
+    evolution_log_failed = []
     for action in bp.get("rollback_actions", []):
         reason = action.get("reason", "regression detected")
+        strategy_file = action.get("strategy_file", "")
+        field = action.get("field", "")
         # rollback_to is None when the monitored change ADDED the key from an
         # absent state (old_value null). Reverting an add-from-absent = opt the
         # criterion back out — but the applied value MUST stay type-safe.
@@ -379,32 +385,97 @@ def cmd_backpressure(args):
         #     "numeric-floor" arm of zeta's "delete-key/numeric-floor" fix;
         #     delete-key is unavailable (meta-set is daemon-only, no delete op).
         rollback_to = action.get("rollback_to")
+        failed_value = action.get("failed_value")
         # ALSO map the literal strings "None"/"null": monitors created while
         # the bug was live (e.g. mc-082's, old_value "None") already carry the
         # corrupt string and would round-trip it forever.
         if rollback_to is None or rollback_to in ("None", "null"):
+            #  (A): the 0.0 floor is only an opt-out for a NUMERIC
+            # field. Over a dict it ZEROED live encoding-strategy records
+            # (the rollbacks of mc-546/829/1287). A null prior on a non-numeric field means the
+            # change was an ADD, so skip it and say so (rb-4024, guard-4339).
+            if not (isinstance(failed_value, (int, float))
+                    and not isinstance(failed_value, bool)):
+                rollbacks_skipped.append({
+                    "field": field, "strategy_file": strategy_file,
+                    "meta_change_id": action.get("meta_change_id", ""),
+                    "reason": ("null prior on a non-numeric field "
+                               f"({type(failed_value).__name__}): an add, not an edit"),
+                })
+                continue
             rollback_arg = "0.0"
+        elif (isinstance(failed_value, (dict, list))
+              and not isinstance(rollback_to, (dict, list))):
+            #  (A), second shape: a scalar prior over a structured
+            # value is the same zeroing. mc-374/375 rolled roi_history[81]/[82]
+            # back to 0, and a record repaired from 0.0 back to a dict would
+            # re-zero on its next rollback. meta-set allows dict -> number, so
+            # refuse the type change here (guard-4339).
+            rollbacks_skipped.append({
+                "field": field, "strategy_file": strategy_file,
+                "meta_change_id": action.get("meta_change_id", ""),
+                "reason": (f"would replace a {type(failed_value).__name__} "
+                           f"with a {type(rollback_to).__name__}"),
+            })
+            continue
+        elif isinstance(rollback_to, (dict, list, bool)):
+            #  (B): str() of a dict is a Python repr, which meta-set
+            # stores as a STRING, so type_destruction refused it every time.
+            # str(True) is "True", which parses back as a string too. JSON
+            # round-trips all three through meta-set's parse_value.
+            rollback_arg = json.dumps(rollback_to)
         else:
             rollback_arg = str(rollback_to)
-        _out, _err, rc = _run([
-            "meta-set.sh", action.get("strategy_file", ""),
-            action.get("field", ""), rollback_arg,
+        _out, err, rc = _run([
+            "meta-set.sh", strategy_file, field, rollback_arg,
             "--reason", f"BACKPRESSURE ROLLBACK: {reason}",
         ])
-        if rc == 0:
-            rollbacks_applied.append(action.get("field"))
-            # Evolution log append
-            log_payload = json.dumps({
-                "date": "",
-                "event": "backpressure_rollback",
-                "details": (
-                    f"{action.get('meta_change_id','')}: "
-                    f"{action.get('field','')} reverted from "
-                    f"{action.get('failed_value','')} to {action.get('rollback_to','')}"
-                ),
-                "trigger_reason": "regression detected",
+        if rc != 0:
+            #  (B): a refused write used to vanish here while
+            # rollback_history said the field was reverted.
+            rollbacks_failed.append({
+                "field": field, "strategy_file": strategy_file,
+                "meta_change_id": action.get("meta_change_id", ""),
+                "error": f"meta-set rc={rc}: {err.strip()[:500]}",
             })
-            _run(["evolution-log-append.sh"], input_text=log_payload)
+            continue
+        if isinstance(rollback_to, (dict, list)):
+            # A structured value travels as a positional arg, and rc=0 proves
+            # only that the transport parsed. On Windows argv a quoted value can
+            # arrive mangled (guard-5633), so read it back and compare
+            # (guard-3356).
+            rb_out, rb_err, rb_rc = _run([
+                "meta-read.sh", strategy_file, "--field", field, "--json",
+            ])
+            try:
+                landed = json.loads(rb_out) if rb_rc == 0 else None
+            except json.JSONDecodeError:
+                landed = None
+            if rb_rc != 0 or landed != rollback_to:
+                rollbacks_failed.append({
+                    "field": field, "strategy_file": strategy_file,
+                    "meta_change_id": action.get("meta_change_id", ""),
+                    "error": (f"readback does not match rollback_to "
+                              f"(meta-read rc={rb_rc}: "
+                              f"{(rb_out.strip() or rb_err.strip())[:300]})"),
+                })
+                continue
+        rollbacks_applied.append(field)
+        #  (C): the endpoint requires date=YYYY-MM-DD, so the old
+        # "" was refused, and nothing checked, so no applier event ever landed.
+        log_payload = json.dumps({
+            "date": datetime.datetime.now().strftime("%Y-%m-%d"),
+            "event": "backpressure_rollback",
+            "details": (
+                f"{action.get('meta_change_id','')}: "
+                f"{field} reverted from "
+                f"{failed_value} to {rollback_arg}"
+            ),
+            "trigger_reason": "regression detected",
+        })
+        _o, _e, log_rc = _run(["evolution-log-append.sh"], input_text=log_payload)
+        if log_rc != 0:
+            evolution_log_failed.append(field)
 
     dead_ends = []
     for cand in bp.get("dead_end_candidates", []):
@@ -429,6 +500,12 @@ def cmd_backpressure(args):
     flags = []
     if rollbacks_applied:
         flags.append("rollbacks_applied")
+    if rollbacks_failed:
+        flags.append("rollback_failed")
+    if rollbacks_skipped:
+        flags.append("rollback_skipped")
+    if evolution_log_failed:
+        flags.append("evolution_log_failed")
     if dead_ends:
         flags.append("dead_ends_registered")
     if graduated:
@@ -436,6 +513,7 @@ def cmd_backpressure(args):
 
     summary = (
         f"backpressure: {len(rollbacks_applied)} rollback(s), "
+        f"{len(rollbacks_failed)} failed, {len(rollbacks_skipped)} skipped, "
         f"{len(dead_ends)} dead-end(s), {len(graduated)} graduated"
     )
     return {
@@ -443,6 +521,9 @@ def cmd_backpressure(args):
         "summary": summary,
         "flags": flags,
         "rollbacks_applied": rollbacks_applied,
+        "rollbacks_failed": rollbacks_failed,
+        "rollbacks_skipped": rollbacks_skipped,
+        "evolution_log_failed": evolution_log_failed,
         "dead_ends": dead_ends,
         "graduated": graduated,
     }
@@ -735,7 +816,8 @@ DISPATCH = {
 # transient telemetry-write failure: impk_snapshot_failed = a write_conflict that
 # survived the daemon's own RMW retry (meta_impk.locked_rmw, ) — a
 # "safe-to-retry 409" (rb-2639) that records on a later, less-contended close;
-# board_post_failed and impk_snapshot_skipped_no_goal are likewise non-fatal.
+# board_post_failed, evolution_log_failed, rollback_skipped (a visible decision, not
+# a failure) and impk_snapshot_skipped_no_goal are likewise non-fatal.
 # Pre-partition, `exit(1 if flags else 0)` fired a spurious "state-update-audit.sh
 # failed (non-fatal)" WARN inside iteration-close on nearly every deep close — any
 # goal above/below its category mean, or any transient snapshot write_conflict —
@@ -748,6 +830,8 @@ HARD_FAIL_FLAGS = {
     "bad_experience_json",         # temporal-credit could not parse the experience record
     "meta_dir_missing",            # relative-advantage has no meta dir to read
     "velocity_yaml_parse_failed",  # improvement-velocity.yaml is corrupt
+    "rollback_failed",             # a backpressure revert did not land, yet rollback_history
+                                   # already records it as reverted ()
 }
 
 

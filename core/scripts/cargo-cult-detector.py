@@ -580,6 +580,36 @@ def _file_rebase_up_idea(asp: dict, asp_id: str, source: str, goal_id: str,
     return 0
 
 
+def _pin_declines_tuning(goal: dict, goal_id: str, interval_hours,
+                         log_prefix: str) -> bool:
+    """True (and logs a decline line) when the goal's interval is HUMAN-PINNED,
+    so an automated tuner must not change it (g-115-6612).
+
+    The single predicate BOTH auto-contract and auto-extend consult right before
+    writing interval_hours. auto-contract lowered a 6h user-directed interval to
+    4h TWICE (g-326-85, verbatim directive g-115-5767 AMENDMENT 4) because
+    nothing distinguished a loop-tuned cadence from a human-pinned one, and the
+    fleet had no detector for it. `interval_pinned_by` carries the directive id;
+    its mere presence pins the interval. The heuristic itself is sound and stays
+    enabled — this only carves out the pinned goals.
+
+    A pinned goal declines CLEANLY here (log + skip), never via a False return
+    from update_interval_hours: both call sites read that False as a write
+    FAILURE (contract logs a failure and returns 1; extend files a spurious
+    'extend interval' Idea), so the pin must be checked BEFORE the write, not
+    inside it. The log line is REQUIRED by the goal so a pinned goal that keeps
+    tripping the threshold stays visible rather than silently declining."""
+    pin = goal.get("interval_pinned_by")
+    if not pin:
+        return False
+    print(
+        f"{log_prefix} DECLINED (pinned): {goal_id} interval_hours is pinned by "
+        f"{pin} — tuner will not change it from {interval_hours}h "
+        f"(human-pinned cadence, g-115-6612)"
+    )
+    return True
+
+
 def update_interval_hours(goal_id: str, source: str,
                           new_interval: float, original_interval: float,
                           had_original: bool) -> bool:
@@ -1205,6 +1235,13 @@ def cmd_contract_per_goal(args, cfg: dict, contract_cfg: dict) -> int:
                          f"interval_hours; cannot contract\n")
         return 1
 
+    # PIN CHECK (): decline BEFORE any side effect (no streak reset,
+    # no Idea) when the interval is human-pinned. Symmetric with the auto-extend
+    # pin check in main().
+    if _pin_declines_tuning(goal, args.goal_id, interval_hours,
+                            "[cargo-cult-contract]"):
+        return 0
+
     divisor = float(contract_cfg["deep_streak_contract_divisor"])
     floor_ratio = float(contract_cfg["contract_floor_ratio"])
     orig_stored = goal.get("original_interval_hours")
@@ -1519,6 +1556,11 @@ def main() -> int:
     # past the cap, fall through to the Idea path so a human decides whether
     # the goal itself should be retired.
     if interval_hours is not None:
+        # PIN CHECK (): decline cleanly (no Idea) when the interval is
+        # human-pinned. Symmetric with the auto-contract pin check.
+        if _pin_declines_tuning(goal, args.goal_id, interval_hours,
+                                "[cargo-cult]"):
+            return 0
         multiplier = float(cfg.get("multiplier", 1.5))
         cap_ratio = float(cfg.get("cap_ratio", 3.0))
         orig_stored = goal.get("original_interval_hours")

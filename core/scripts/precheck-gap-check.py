@@ -32,7 +32,9 @@ strategic-scan markers).
 VERDICT is one line on stdout, always exit 0 (fail-open: this is a detector
 that must never block a close). gap >= 1 additionally prints a loud banner
 naming the exact next action, because the reader is the loop LLM at the moment
-it decides what to do next.
+it decides what to do next — the full precheck, AND the affordable partial for
+zone tight with everything it still owes (g-353-118 outcome 4; see
+_partial_line).
 
 Call sites (both print this as their LAST lines, where the LLM reads):
   * iteration-close.sh do_productivity_check — just above the ITERATION COMPLETE
@@ -53,6 +55,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+
+PRECHECK_SKILL_MD = SCRIPT_DIR.parent.parent / ".claude" / "skills" / "aspirations-precheck" / "SKILL.md"
 
 
 def _parse_ts(s):
@@ -194,7 +198,40 @@ def render(r, threshold: int) -> str:
             "pre-check, cadences, completed-not-closed drain 0.5g.7, zombie scan). Invoke it BEFORE "
             "goal-selector.sh select in the next iteration; the meter `start` it runs is the stamp this "
             "check reads, so a real precheck clears this line by itself.")
+        lines.append(_partial_line())
     return "\n".join(lines)
+
+
+def _partial_line(skill_md=PRECHECK_SKILL_MD) -> str:
+    """The affordable partial, and what it still owes ( outcome 4).
+
+    The full remedy's SKILL.md is the largest per-iteration load, so at zone
+    tight it can cost more than the window has left. A warning that names only
+    that remedy is skipped exactly when it fires (guard-7134). This detector's
+    predicate is the meter STAMP, and the entry battery also writes that stamp on
+    the reducer, so the partial clears this line. The line must therefore say
+    what the partial leaves undone, because afterwards nothing here will.
+
+    The zone is deliberately NOT read from the sensor file. guard-301 makes the
+    banner the one authority for an abbreviate decision, and at the
+    post-compaction call site the file still holds the pre-compaction reading.
+    """
+    try:
+        size = f"{skill_md.stat().st_size:,} B "
+    except OSError:
+        size = ""
+    return (
+        f"[precheck-gap] AT ZONE TIGHT the full remedy is unaffordable: its {size}SKILL.md alone can "
+        "exceed what is left before compaction (g-353-118 measured 170-200% of a 30,000-token "
+        "remainder). Read the zone with `bash core/scripts/context-budget-banner.sh`. If it says "
+        "tight, run the AFFORDABLE PARTIAL instead: `bash core/scripts/iteration-open.sh --apply`. "
+        "That is the entry battery the precheck's own Step 0-open runs (always-run + medium lanes, "
+        "findings only): a sanctioned executor, not the remembered fragments above. On the reducer it "
+        "writes the same meter stamp, so it clears this line, and after that this line says nothing "
+        "about what it skipped. It still OWES: every deferrable-tier lane (not wired into it; "
+        "`bash core/scripts/iteration-open.sh --dry-run` lists them), every lane it reports as "
+        "`dropped:`, and every finding you leave undisposed. Those run only inside the full "
+        "`Skill(aspirations-precheck)`: invoke it at the first iteration that is not tight.")
 
 
 def main() -> int:

@@ -1624,6 +1624,88 @@ def test_pipeline_empty_inputs():
     assert cm.merge_pipeline(b"", one) == one
 
 
+# --- replay_metadata field-wise merge () --------------------------
+# _merge_pipeline_record used to take the nested replay_metadata dict WHOLE from
+# the content-tiebreak base (`out = dict(win)`), so a flagged copy that sorts
+# UNDER a flagless one at the record level lost encoded_via_chronic AND regressed
+# replay_count. These call the REAL merge_pipeline (bytes -> bytes), so every
+# assertion is at the writer-byte layer (guard-3055), and both argument orders
+# are checked for byte-identity (guard-907).
+def test_pipeline_replay_metadata_flag_survives_lower_canon():
+    # The flagged copy's replay_metadata serializes as '{"encoded_via_chronic":
+    # true,...' which sorts UNDER the flagless copy's '{"last_replayed":...'
+    # ('e' < 'l'), so the flagless copy wins the record-level canon tiebreak.
+    # Pre-fix: flag dropped + replay_count regressed 3 -> 2. Post-fix: both kept.
+    flagged = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                   replay_metadata={"replay_count": 3, "encoded_via_chronic": True,
+                                    "last_replayed": "2026-09-20"})
+    stale = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                 replay_metadata={"replay_count": 2,
+                                  "last_replayed": "2026-09-23"})
+    ab = cm.merge_pipeline(_rb([flagged]), _rb([stale]))
+    ba = cm.merge_pipeline(_rb([stale]), _rb([flagged]))
+    assert ab == ba                                         # byte-identical
+    rm = _recs(ab)[0]["replay_metadata"]
+    assert rm["encoded_via_chronic"] is True                # flag survives
+    assert rm["replay_count"] == 3                          # max, not regressed
+    assert rm["last_replayed"] == "2026-09-23"              # newer wins
+
+
+def test_pipeline_replay_metadata_count_max_from_stale_side_and_idempotent():
+    # replay_count MAX must pick the higher count even when it is on the
+    # flagless side (proves it is a real max, not "prefer the flagged copy").
+    # Also asserts idempotence: re-folding either original changes nothing
+    # (the fenced-PUT fold must not churn — guard-907).
+    flagged = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                   replay_metadata={"replay_count": 3, "encoded_via_chronic": True,
+                                    "last_replayed": "2026-09-20",
+                                    "next_review_date": "2026-10-01"})
+    stale = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                 replay_metadata={"replay_count": 5,
+                                  "last_replayed": "2026-09-23"})
+    merged = cm.merge_pipeline(_rb([flagged]), _rb([stale]))
+    assert cm.merge_pipeline(_rb([stale]), _rb([flagged])) == merged  # commutative
+    assert cm.merge_pipeline(merged, merged) == merged               # idempotent
+    assert cm.merge_pipeline(merged, _rb([flagged])) == merged       # subsumed re-fold
+    assert cm.merge_pipeline(merged, _rb([stale])) == merged
+    rm = _recs(merged)[0]["replay_metadata"]
+    assert rm["replay_count"] == 5                          # max across sides
+    assert rm["encoded_via_chronic"] is True
+    assert rm["next_review_date"] == "2026-10-01"           # side-only kept
+
+
+def test_pipeline_replay_metadata_string_count_numeric_max():
+    # replay_count is a STRING on some historical records (replay SKILL.md SCHEMA
+    # note). The max must be NUMERIC — lexicographically "10" < "9", so a canon
+    # tiebreak would wrongly pick "9". The winning value keeps its stored type.
+    a = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+             replay_metadata={"replay_count": "10", "encoded_via_chronic": True})
+    b = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+             replay_metadata={"replay_count": "9"})
+    ab = cm.merge_pipeline(_rb([a]), _rb([b]))
+    ba = cm.merge_pipeline(_rb([b]), _rb([a]))
+    assert ab == ba
+    rm = _recs(ab)[0]["replay_metadata"]
+    assert rm["replay_count"] == "10"                       # numeric max, type preserved
+    assert rm["encoded_via_chronic"] is True
+
+
+def test_pipeline_replay_metadata_one_sided_preserved():
+    # Only one copy carries replay_metadata; it survives whichever side wins the
+    # record-level tiebreak, and the other side's own fields are still unioned.
+    withmeta = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                    replay_metadata={"replay_count": 4, "encoded_via_chronic": True})
+    without = _hyp("2026-07-01_x", stage="resolved", outcome="CORRECTED",
+                   last_reviewed="2026-09-23")
+    ab = cm.merge_pipeline(_rb([withmeta]), _rb([without]))
+    ba = cm.merge_pipeline(_rb([without]), _rb([withmeta]))
+    assert ab == ba
+    rec = _recs(ab)[0]
+    assert rec["replay_metadata"]["encoded_via_chronic"] is True
+    assert rec["replay_metadata"]["replay_count"] == 4
+    assert rec["last_reviewed"] == "2026-09-23"             # without-side field kept
+
+
 # --- spark-questions (rb-2849 — frozen alongside pipeline.jsonl) -------------
 def _sq(rec_id, text, **kw):
     base = {"id": rec_id, "text": text, "times_asked": 0,

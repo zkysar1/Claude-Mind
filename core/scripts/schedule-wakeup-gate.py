@@ -49,6 +49,35 @@ a vessel mind ended its turn mid-consolidation with no handoff. When
 `stop_in_progress` attributes an unfinished stop to THIS session, the same deny
 names the continuation instead.
 
+FOURTH FAILURE THIS GATE COVERS (2026-09-24, alpha; g-115-10755) -- an arm
+without `noop`. Claude Code 2.1.280 refuses every ScheduleWakeup that omits
+`noop` unless `stop` is true. That refusal is an ordinary error result, and in
+the deadman pair the batched Skill(aspirations) runs regardless, so loops
+looked healthy fleet-wide with NO net armed. This deny says so in the loop's
+own terms. It is reachable: a noop-less call with a slash prompt returned THIS
+gate's slash deny, not the harness's noop error (zeta, cc-02, 2026-09-25), so
+hooks see the call before the harness validates the field. The check mirrors
+the harness's rule and is coupled to it: if a later harness stops requiring
+`noop`, remove this check together with the `noop` in the documented shapes.
+It is Claude Code's rule, and it is applied only there: a Zak-Code Body's
+ScheduleWakeup arms without `noop` (its slot takes noop=None), so this deny under
+that harness refuses an arm the harness would have honoured and manufactures the
+very wedge it describes -- measured 2026-09-25 on a worker Body: nine identical
+denials in one turn (77 min), and on the build whose schema declares `noop` the
+model still omitted it on its first arm. The harness is read from the marker each
+one exports to every hook (`CLAUDECODE` / `ZAKCODE_SESSION`), the same detector
+`_confidence_ledger.py` and `_runtime.sh` use; an unknown harness keeps the
+stricter rule.
+
+The same failure has a second field (2026-09-25, g-115-10936): the same harness
+refuses an arm without `reason` -- "`delaySeconds` and `reason` are required
+when `stop` is not true." (zeta, cc-02) -- with the same silent-disarm result.
+Its deny mirrors the `noop` one: same harness scope, runs right after it, and an
+arm missing both gets the `noop` deny, whose example carries both fields.
+Zak-Code declares `reason` optional in its ScheduleWakeup schema (Zak-Code
+origin/main 6be6925, src/zakcode/tools/builtins/schedule_wakeup.py), so the
+carve-out holds for this field too.
+
 Fail-open contract (CRITICAL — do not change without revisiting the trade):
 this gate exists to catch a known LLM mistake, not to be a critical-path
 dependency. Any parse/IO/logic error -> approve. A broken gate is recoverable
@@ -56,6 +85,7 @@ dependency. Any parse/IO/logic error -> approve. A broken gate is recoverable
 legitimate ScheduleWakeup calls and stall autonomous loops.
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -131,6 +161,34 @@ ARM_DENY_REASON = (
     "sets agent-state to RUNNING; this gate approves the sentinel from there.\n\n"
     "See .claude/rules/schedule-wakeup-correctness.md (Re-arm FIRST on "
     "resurrection)."
+)
+
+
+NOOP_DENY_REASON = (
+    "ScheduleWakeup rejected: `noop` is missing, so this call would schedule "
+    "NOTHING. Claude Code (2.1.280+) refuses every ScheduleWakeup without "
+    "`noop` unless `stop` is true. When this is the deadman net, the batched "
+    "Skill(aspirations) re-entry still runs, so the loop looks healthy with no "
+    "resurrection net armed (measured fleet-wide 2026-09-24, g-115-10755).\n\n"
+    "Re-emit the SAME call with noop=false, the framework's canonical value, "
+    "and a short `reason` (the harness requires that field too), "
+    "e.g. ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', "
+    "delaySeconds=600, noop=false, reason='deadman resurrection net'). See "
+    ".claude/rules/schedule-wakeup-correctness.md."
+)
+
+
+REASON_DENY_REASON = (
+    "ScheduleWakeup rejected: `reason` is missing, so this call would schedule "
+    "NOTHING. Claude Code (2.1.280+) refuses every ScheduleWakeup without "
+    "`reason` unless `stop` is true (\"`delaySeconds` and `reason` are required "
+    "when `stop` is not true.\"). When this is the deadman net, the batched "
+    "Skill re-entry still runs, so the loop looks healthy with no resurrection "
+    "net armed -- the same silent disarm as a missing `noop` (g-115-10936).\n\n"
+    "Re-emit the SAME call with a short one-line reason, e.g. "
+    "ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600, "
+    "noop=false, reason='deadman resurrection net'). See "
+    ".claude/rules/schedule-wakeup-correctness.md."
 )
 
 
@@ -258,6 +316,63 @@ def _arm_deny_reason(session_id):
     return ARM_DENY_REASON
 
 
+def _arm_lacks_noop(tool_input):
+    """True when an ARM omits `noop`, which the harness requires on every arm.
+
+    Every outcome is enumerated (guard-3328):
+      1. payload not a dict -> False (fail-open)
+      2. `stop` truthy -> False. A cancel: the harness requires `noop` only
+         "when `stop` is not true", so demanding it here would block the
+         legitimate /stop cancel that `_cancel_would_strand_loop` approves.
+      3. `noop` present, true OR false -> False
+      4. `noop` absent or null -> True (DENY -- the harness would refuse the
+         call and set no wakeup at all)
+    """
+    if not isinstance(tool_input, dict) or tool_input.get("stop"):
+        return False                                    # outcomes 1, 2
+    return tool_input.get("noop") is None               # outcomes 3, 4
+
+
+def _arm_lacks_reason(tool_input):
+    """True when an ARM omits `reason`, which the harness also requires on every
+    arm -- the exact mirror of `_arm_lacks_noop` (g-115-10936).
+
+    Every outcome is enumerated (guard-3328):
+      1. payload not a dict -> False (fail-open)
+      2. `stop` truthy -> False. A cancel: the harness requires `reason` only
+         "when `stop` is not true".
+      3. `reason` present -> False. The gate demands the FIELD, not a wording.
+      4. `reason` absent or null -> True (DENY -- the harness would refuse the
+         call and set no wakeup at all)
+    """
+    if not isinstance(tool_input, dict) or tool_input.get("stop"):
+        return False                                    # outcomes 1, 2
+    return tool_input.get("reason") is None             # outcomes 3, 4
+
+
+def _harness_requires_arm_fields():
+    """True unless the harness running this hook is one whose ScheduleWakeup arms
+    without `noop` and `reason`.
+
+    Every outcome is enumerated (guard-3328):
+      1. `CLAUDECODE` set -> True. Claude Code (2.1.280+) refuses the arm itself,
+         so the denies above name the fix the harness would otherwise hide.
+      2. else `ZAKCODE_SESSION` or `ZAKCODE_MODEL` set -> False. A Zak-Code agent
+         exports the session id into every hook's environment for exactly this
+         branch, and its slot arms with noop=None and needs no reason (its schema
+         declares `reason` optional): refusing here would only turn a harmless
+         omission into a wedge.
+      3. neither -> True. An unknown harness keeps the stricter rule; the cost of
+         being wrong is one deny the model can act on, not a net that never arms.
+    Same detector as `_confidence_ledger.py` / `_runtime.sh` (Claude Code first).
+    """
+    if (os.environ.get("CLAUDECODE") or "").strip():
+        return True                                     # outcome 1
+    if any((os.environ.get(k) or "").strip() for k in ("ZAKCODE_SESSION", "ZAKCODE_MODEL")):
+        return False                                    # outcome 2
+    return True                                         # outcome 3
+
+
 def main():
     payload = stdin_json_or_approve()
     if not isinstance(payload, dict):
@@ -277,6 +392,16 @@ def main():
 
     if is_bad_slash_prefix(prompt):
         emit_deny(DENY_REASON)
+
+    # Last on purpose: a call that also fails a check above gets THAT check's
+    # reason, which names the more fundamental fix.
+    if _arm_lacks_noop(tool_input) and _harness_requires_arm_fields():
+        emit_deny(NOOP_DENY_REASON)
+
+    # After noop: an arm missing both fields gets the noop deny, whose example
+    # already carries `reason`, so one retry fixes both.
+    if _arm_lacks_reason(tool_input) and _harness_requires_arm_fields():
+        emit_deny(REASON_DENY_REASON)
 
     approve_no_mutation()
 

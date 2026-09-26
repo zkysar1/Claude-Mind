@@ -1025,7 +1025,7 @@ Verifies the agent confronts infrastructure errors instead of retreating to self
 ### AJ1. Phase 4.1 Guardrail Consultation + Error Response Protocol
 
 1. Phase 4.1 consults guardrails after ANY infrastructure goal — success or failure, NOT local/tooling errors
-2. Step 4.1-pre uses `guardrail-check.sh --context infrastructure --outcome {flag} --phase post-execution` for deterministic matching
+2. Step 4.1-pre uses `guardrail-check.sh --context infrastructure --outcome <succeeded|failed|any> --phase post-execution` for deterministic matching (succeeded = the goal's primary action worked; failed = it did not; any = match both)
 3. Step 4.1-pre is generic — specific checks (e.g., domain error scripts) live in guardrails, not hardcoded in the skill
 4. `guardrail_found_issues` initialized BEFORE the `IF involved_infrastructure:` block (not inside it)
 5. Protocol fires when: guardrail found issues OR goal failed + infrastructure

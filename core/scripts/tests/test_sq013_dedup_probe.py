@@ -17,6 +17,8 @@ everything would fail here rather than passing silently — which is the failure
 mode a decline-only test cannot distinguish from a working fix.
 """
 
+import json
+import math
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -754,3 +756,227 @@ def test_the_2079_records_without_proposed_work_are_byte_identical():
         subject, key = sq.extract_subject(rec)
         assert subject == UNOWNED, (key, subject)
         assert "+" not in key, "no composite key when proposed_work is absent"
+
+
+# ── : subject headline cap kills coincidental body collisions ─────
+# A relay observation is a 1-2 KB blob whose cited-evidence tail carries rare
+# identifiers (goal ids, filenames) that let an UNRELATED owner win the rare
+# gate by coincidence -- the silent false-DECLINE direction (guard-5147).
+# decide() now scores only the relay's HEADLINE. These tests pin the MECHANISM
+# at a LIVE-IDF corpus size (reusing _big_corpus's df shape so the rare gate is
+# real). The named pairs from the goal description are pinned on their real
+# relay texts further down (fixtures/sq013_relay_pairs.json).
+
+def test_headline_is_a_noop_for_short_subjects():
+    """Every short subject -- the test corpus, the positive control -- passes
+    through unchanged, which is why every decide() test above still holds."""
+    for s in (RELAY, UNOWNED, COMPLETED_OWNER["title"], "", "one two three"):
+        assert sq._headline(s) == (s or "").strip()
+
+
+def test_headline_caps_a_long_relay_and_drops_the_evidence_tail():
+    head = ("mutation-backup leak: the seed-transplant orphan sweep deletes "
+            "destination files with a bare unlink while a working backup "
+            "routine sits unused in the same script.")
+    tail = (" Evidence spans many goals. The zakpodmonitor liveness alerts "
+            "cited here are coincidental token collisions, not the real owner. "
+            + "padding detail sentence about unrelated matters. " * 8)
+    capped = sq._headline(head + tail)
+    assert len(capped) <= sq.SUBJECT_HEADLINE_MAX_CHARS
+    assert "zakpodmonitor" not in capped.lower()      # the tail identifier is gone
+    assert "mutation-backup" in capped.lower()         # the aboutness survives
+
+
+def test_headline_never_cuts_on_a_dot_inside_a_token():
+    """A filename dot (`x.j2`) or version (`6.06x`) is not a sentence boundary,
+    so a long run-on first line is capped at the char ceiling, not shredded at
+    the first internal dot."""
+    s = "fix aspiration_evolution.j2 rendering and the 6.06x overdue math " * 20
+    h = sq._headline(s)
+    assert len(h) >= sq.SUBJECT_HEADLINE_MIN_CHARS
+    assert h.startswith("fix aspiration_evolution.j2")
+
+
+# An unrelated owner that shares ONLY a rare identifier that appears in a relay's
+# evidence tail. Reuses _big_corpus for a live-IDF df distribution.
+_ALIEN_OWNER = {
+    "id": "g-115-10641",
+    "status": "completed",
+    "completed_date": "2026-08-27T01:30:00",
+    "title": "zakpod1 monitor liveness alerting",
+    "description": ("Monitors the zakpodmonitor process and alerts on "
+                    "staleness in the liveness lane."),
+}
+
+_BIG_RELAY_COINCIDENTAL = (
+    # HEADLINE: a backup-sweep subject nothing in the corpus owns.
+    "mutation-backup leak: the seed-transplant orphan sweep deletes destination "
+    "files with a bare unlink while a working backup routine sits unused in the "
+    "same script."
+    # TAIL: coincidentally names the alien owner's rare identifier.
+    " Evidence spans many goals. The zakpodmonitor liveness alerts cited by the "
+    "scorer here are a coincidental token collision, not the real owner of this "
+    "backup defect. " + "further unrelated detail. " * 8
+)
+
+
+def test_the_collision_is_real_a_short_subject_with_the_tail_token_declines():
+    """Control: the coincidental collision IS real. A SHORT subject (below the
+    cap) carrying the alien owner's rare identifier DECLINEs -- this is what the
+    big relay's tail does when it reaches the scorer uncapped."""
+    corpus = _big_corpus(with_owner=False) + [_ALIEN_OWNER]
+    short_collision = "the zakpodmonitor liveness alerts flagged in this note"
+    assert len(short_collision) <= sq.SUBJECT_HEADLINE_MAX_CHARS   # not capped
+    r = sq.decide(short_collision, corpus, NOW, SESSION_START)
+    assert r["decision"] == "DECLINE", r
+    assert r["cited_goal_id"] == "g-115-10641", r
+
+
+def test_big_relay_files_because_the_cap_removes_the_collision_tail():
+    """THE FIX for . The big relay's HEADLINE is about a backup
+    defect nothing owns; its TAIL coincidentally names the alien owner's rare
+    identifier. Uncapped it would DECLINE (see the short-subject control);
+    decide() caps to the headline, so it FILEs."""
+    corpus = _big_corpus(with_owner=False) + [_ALIEN_OWNER]
+    r = sq.decide(_BIG_RELAY_COINCIDENTAL, corpus, NOW, SESSION_START)
+    assert r["decision"] == "FILE", r
+
+
+def test_genuine_headline_match_still_declines_at_large_subject_scale():
+    """The SAFE-DIRECTION control: the cap must not turn a genuine duplicate
+    into a false FILE. A large relay whose HEADLINE is about the real owner
+    still DECLINEs after capping -- a genuine duplicate names its subject up
+    front, so its shared rare token survives the cap."""
+    big_genuine = (
+        "pickNearbyPlayer returns null without instrumentation so the "
+        "denominator for nearby-player selection is unmeasured and the scorer "
+        "path cannot be verified against real play."
+        + " Supporting evidence follows across many goals and files. " * 8
+    )
+    corpus = _big_corpus(with_owner=True)
+    r = sq.decide(sq._headline(big_genuine), corpus, NOW, SESSION_START)
+    assert r["decision"] == "DECLINE", r
+    assert r["cited_goal_id"] == "g-326-711", r
+
+
+def test_positive_control_still_files_under_the_cap():
+    """The alien subject stays FILE: the cap never manufactures a match."""
+    corpus = _big_corpus(with_owner=False) + [_ALIEN_OWNER]
+    r = sq.decide(UNOWNED, corpus, NOW, SESSION_START)
+    assert r["decision"] == "FILE", r
+
+
+# ──  second half: the coverage floor, pinned on the REAL relays ───
+# fixtures/sq013_relay_pairs.json holds the archived relay texts named in the
+# goal description, the title+description of each cited owner, and the live
+# corpus statistics (n, avgdl, per-token df) measured 2026-09-25. Scoring runs
+# at those live document frequencies, because the incident only exists there:
+# a fixture-sized corpus has no rare tokens to collide on (see _big_corpus).
+# Each pair is scored against a corpus holding ONLY its cited owner plus filler
+# records sized to the live avgdl, so a FILE can only mean "that owner was not
+# cited" and the BM25 length factor is the one the live probe applied.
+
+_FIXTURE = json.loads((SCRIPT_DIR / "fixtures" / "sq013_relay_pairs.json")
+                      .read_text(encoding="utf-8"))
+_PAIRS = {p["label"]: p for p in _FIXTURE["pairs"]}
+_FALSE = [p for p in _FIXTURE["pairs"] if p["kind"] == "false"]
+_GENUINE = [p for p in _FIXTURE["pairs"] if p["kind"] == "genuine"]
+_LIVE_NOW = datetime(2026, 9, 25, 17, 0, 0)
+
+
+def _live_idf(monkeypatch):
+    """Replace the corpus-derived IDF with the measured live one."""
+    n, df = _FIXTURE["n"], _FIXTURE["df"]
+
+    def live(docs, terms):
+        return {t: (df.get(t, 0), max(0.0, math.log(n / (1 + df.get(t, 0)))))
+                for t in terms}, n
+    monkeypatch.setattr(sq, "_compute_idf", live)
+
+
+def _owner_corpus(owner_id, fillers=49):
+    owner = _FIXTURE["owners"][owner_id]
+    dl = len(sq._tokens(owner["title"] + " " + owner["description"]))
+    width = round((_FIXTURE["avgdl"] * (fillers + 1) - dl) / fillers)
+    text = " ".join("fillerqq%04d" % j for j in range(width))
+    return [owner] + [{"id": "g-999-%03d" % i, "status": "completed",
+                       "title": "filler", "description": text}
+                      for i in range(fillers)]
+
+
+def _score(pair):
+    return sq.decide(pair["relay"], _owner_corpus(pair["owner_id"]),
+                     _LIVE_NOW, None, 900.0)
+
+
+def test_fixture_covers_eight_false_pairs_and_three_genuine_relays():
+    assert len(_FALSE) == 8 and len(_GENUINE) == 3, _FIXTURE["pairs"]
+    assert _FIXTURE["n"] >= 20 * sq.MIN_IDF_CORPUS    # a LIVE-sized corpus
+
+
+def test_false_pairs_no_longer_decline_citing_the_unrelated_owner(monkeypatch):
+    """Outcome 1 of : each relay FILEs against its coincidental
+    owner instead of declining on one shared identifier."""
+    _live_idf(monkeypatch)
+    for pair in _FALSE:
+        r = _score(pair)
+        assert r["decision"] == "FILE", (pair["label"], pair["about"], r)
+        assert r["cited_goal_id"] != pair["owner_id"], (pair["label"], r)
+
+
+def test_genuine_pairs_still_decline_citing_their_owner(monkeypatch):
+    """Outcome 2: the coverage floor must not turn a real owner into a FILE."""
+    _live_idf(monkeypatch)
+    for pair in _GENUINE:
+        r = _score(pair)
+        assert r["decision"] == "DECLINE", (pair["label"], r)
+        assert r["cited_goal_id"] == pair["owner_id"], (pair["label"], r)
+        assert r["matches"][0]["coverage"] >= sq.SUBJECT_COVERAGE_MIN, r
+
+
+def test_the_false_pairs_are_the_measured_incident_not_a_green_default(
+        monkeypatch):
+    """With BOTH fixes off, all 8 relays DECLINE citing the named owner (the
+    incident). With only the headline cap on, 5 still do: the cap alone was
+    not the fix, and the coverage floor is what flips them."""
+    _live_idf(monkeypatch)
+    monkeypatch.setattr(sq, "SUBJECT_COVERAGE_MIN", 0.0)
+    monkeypatch.setattr(sq, "SUBJECT_COVERAGE_MIN_MULTI_RARE", 0.0)
+    cap_survivors = {p["label"] for p in _FALSE
+                     if _score(p)["cited_goal_id"] == p["owner_id"]}
+    assert cap_survivors == {"F2", "F4", "F5", "F8", "F9"}, cap_survivors
+    monkeypatch.setattr(sq, "_headline", lambda s: str(s or "").strip())
+    for pair in _FALSE:
+        r = _score(pair)
+        assert r["decision"] == "DECLINE", (pair["label"], r)
+        assert r["cited_goal_id"] == pair["owner_id"], (pair["label"], r)
+
+
+def test_positive_control_files_at_live_idf(monkeypatch):
+    """The alien subject stays FILE against every owner corpus above."""
+    _live_idf(monkeypatch)
+    for pair in _FIXTURE["pairs"]:
+        r = sq.decide(UNOWNED, _owner_corpus(pair["owner_id"]), _LIVE_NOW,
+                      None, 900.0)
+        assert r["decision"] == "FILE", (pair["label"], r)
+
+
+def test_owner_coverage_is_read_from_its_opening_not_its_tail(monkeypatch):
+    """A record that restates the subject only past OWNER_HEAD_CHARS (the
+    accumulated-tail sponge shape) does not own it. The control proves the head
+    cap is what flips it: read whole, the same record is cited."""
+    _live_idf(monkeypatch)
+    pair = _PAIRS["G1"]
+    real = _FIXTURE["owners"][pair["owner_id"]]
+    pad = " ".join("fillerqq%04d" % j
+                   for j in range(sq.OWNER_HEAD_CHARS // 12 + 1))
+    sponge = {"id": "g-999-999", "status": "pending",
+              "title": "Recurring: unrelated maintenance chore",
+              "description": pad + " " + real["description"]}
+    corpus = [sponge] + _owner_corpus(pair["owner_id"])[1:]
+    r = sq.decide(pair["relay"], corpus, _LIVE_NOW, None, 900.0)
+    assert r["decision"] == "FILE", r
+    monkeypatch.setattr(sq, "OWNER_HEAD_CHARS", 10 ** 6)
+    r = sq.decide(pair["relay"], corpus, _LIVE_NOW, None, 900.0)
+    assert r["decision"] == "DECLINE", r
+    assert r["cited_goal_id"] == "g-999-999", r

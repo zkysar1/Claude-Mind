@@ -202,6 +202,14 @@ _SKILL_TOOLS = frozenset({"skill", "use_skill"})
 _ROLES = ("user", "assistant", "system", "tool")
 
 
+#: The OPTIONAL join key (): the envelope id the vessel prints on the
+#: frame's second line. Optional because frames before 2026-09-25 carry none
+#: (guard-3274: accept, never require). Read only from the text BEFORE
+#: ``reason=``, which runs to end of line and may mention an envelope in prose.
+ENVELOPE_RE = re.compile(r"\benvelope=(?P<envelope>\S+)")
+_REASON_SPLIT_RE = re.compile(r"\breason=")
+
+
 def find_frames(text: str) -> list[int]:
     """Start offsets of every perception frame that opens a line of plain text."""
     return [m.start() for m in FRAME_LINE_RE.finditer(text or "")]
@@ -217,11 +225,19 @@ def find_decisions(text: str) -> list[dict]:
             "changed": (m.group("changed") or "").strip(),
             "decision": (m.group("decision") or "").strip().lower(),
             "reason": (m.group("reason") or "").strip(),
+            # "" on a legacy line. Deliberately NOT part of the dedup identity
+            # (_distinct_decisions): one line may answer a run of deliveries.
+            "envelope": _envelope_of(m.group(0)),
             # The matched line, whitespace-folded. Reported for context only --
             # it is NOT the dedup identity; see _distinct_decisions.
             "line": " ".join(m.group(0).split()),
         })
     return out
+
+
+def _envelope_of(line: str) -> str:
+    em = ENVELOPE_RE.search(_REASON_SPLIT_RE.split(line, 1)[0])
+    return em.group("envelope") if em else ""
 
 
 def _distinct_decisions(decisions: list[dict], frames: list[dict]) -> list[dict]:

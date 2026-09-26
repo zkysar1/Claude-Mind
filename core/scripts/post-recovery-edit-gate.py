@@ -303,7 +303,7 @@ def main():
         # REFUSALS; do not read its emptiness as evidence the gate never fired.
         #
         # Predicate: stop-checkpoint.json, written at GS-0 (SKILL.md:134) and
-        # cleared ONLY at D7.1 (SKILL.md:481), so its presence brackets exactly
+        # cleared ONLY by D7's mode-flip call, so its presence brackets exactly
         # the stop sequence and nothing else. Derived LOCALLY per guard-2445
         # rather than shelling out to stop-checkpoint.sh — this is a PreToolUse
         # hot path and stop_checkpoint.py owns the same literal at
@@ -313,7 +313,7 @@ def main():
         # (IDLE, autonomous), non-worker, WITH a checkpoint present. THREE
         # members — member (c) was found by the fresh-eyes pass on this very
         # change, after this comment had already been written claiming two.
-        # (a) a live graceful stop D1..D7.1 — legitimate per the Mode invariant.
+        # (a) a live graceful stop D1..D7 — legitimate per the Mode invariant.
         # (b) an INTERRUPTED stop whose checkpoint outlived it. That is not the
         #     canonical incident's state: a checkpoint exists only because a stop
         #     was deliberately requested, and CLAUDE.md's Session Start Protocol

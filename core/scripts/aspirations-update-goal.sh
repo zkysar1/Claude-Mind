@@ -103,6 +103,7 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH_SOURCE=(--source "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --force-defer)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             FORCE_DEFER="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
@@ -120,22 +121,26 @@ while [[ $# -gt 0 ]]; do
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-uncommitted)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_UNCOMMITTED="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --cross-lane)
             # : bypass the cross-lane TAKEOVER guard
             # (status->in-progress / claimed_by on another agent's goal).
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             CROSS_LANE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-missing-artifact)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_MISSING_ARTIFACT="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --override-residual)
             # : bypass the Layer-B residual-work completion gate
             # (outcome_note names undone work, no live carrier cited).
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_RESIDUAL="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
@@ -143,6 +148,7 @@ while [[ $# -gt 0 ]]; do
             # : bypass the field-shrink guard (a description /
             # outcome_note write dropping to under 25% of its current length,
             # when that length exceeds 2000 chars). Deliberate condense only.
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_SHRINK="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
@@ -168,6 +174,7 @@ while [[ $# -gt 0 ]]; do
             # must require that line, because a daemon predating the header
             # ignores it and still answers 200 (guard-5505). An empty value is
             # refused: it would silently send no precondition at all.
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             EXPECT_SHA256="${2-}"
             if [ -z "$EXPECT_SHA256" ]; then
                 echo "Error: --expect-sha256 needs a value (the sha256 hex of the field's current text); an empty one would skip the precondition silently." >&2
@@ -175,10 +182,12 @@ while [[ $# -gt 0 ]]; do
             fi
             shift $(( $# >= 2 ? 2 : 1 ));;
         --blocker-ref)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             BLOCKER_REF="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
         --force-unstructured-defer)
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             FORCE_UNSTRUCTURED_DEFER="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
@@ -186,6 +195,7 @@ while [[ $# -gt 0 ]]; do
             # : bypass the credential-enumeration check on a
             # credentials-required blocker_ref. Same flag name + same ledger
             # as blocker-create-gate.py's override (Door A).
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             OVERRIDE_BLOCKER_GATE="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
@@ -194,6 +204,7 @@ while [[ $# -gt 0 ]]; do
             # and audited to world/override-bypass-ledger.jsonl by the daemon, so
             # a genuinely new field stays a readable decision rather than a
             # keystroke slip that silently mutates the shared goal schema.
+            argv_strict_refuse_multiline_value "$(basename "$0")" "$1" "${2-}"
             ALLOW_NEW_FIELD="${2-}"
             PASSTHROUGH+=("$1" "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;

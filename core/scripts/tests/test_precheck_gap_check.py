@@ -139,6 +139,37 @@ def test_banner_only_at_threshold_and_wrapper_always_exits_zero(tmp_path):
         assert "[precheck-gap]" in p.stdout
 
 
+def test_banner_names_the_affordable_partial_and_what_it_still_owes(tmp_path):
+    """ outcome 4 / guard-7134: the gap line must never name ONLY a remedy
+    that cannot load where it fires. It keeps the full precheck and the
+    anti-amnesia warning, and ALSO names the sanctioned partial, the zone check
+    that chooses between them, and everything the partial still owes. The partial
+    advances the same stamp, so this line cannot report the remainder afterwards."""
+    m = _load()
+    s = tmp_path / "session"; s.mkdir()
+    _diary(s, [NOW - timedelta(minutes=5)])
+    text = m.render(m.compute(s, now=NOW), 1)
+    assert "Skill(aspirations-precheck)" in text
+    assert "remembered from a compaction summary" in text
+    assert "bash core/scripts/iteration-open.sh --apply" in text
+    assert "bash core/scripts/context-budget-banner.sh" in text
+    owed = text[text.index("still OWES"):]
+    for token in ("deferrable-tier lane", "iteration-open.sh --dry-run", "`dropped:`", "undisposed"):
+        assert token in owed, token
+    # the SKILL.md size is read live, never a stale constant
+    size = (ROOT / ".claude" / "skills" / "aspirations-precheck" / "SKILL.md").stat().st_size
+    assert f"its {size:,} B SKILL.md" in text
+    # no gap, no partial line either
+    _meter_start(s, NOW - timedelta(minutes=1))
+    assert "AFFORDABLE PARTIAL" not in m.render(m.compute(s, now=NOW), 1)
+
+
+def test_partial_line_is_fail_open_when_the_skill_md_is_missing(tmp_path):
+    m = _load()
+    line = m._partial_line(tmp_path / "no-such-SKILL.md")
+    assert "its SKILL.md alone" in line and "iteration-open.sh --apply" in line
+
+
 def test_wired_into_iteration_close_and_compact_restore():
     close = CLOSE.read_text(encoding="utf-8")
     i_gap = close.find("precheck-gap-check.sh")

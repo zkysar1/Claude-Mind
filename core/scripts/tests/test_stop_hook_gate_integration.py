@@ -239,13 +239,15 @@ def _drive(tmp_path, state="RUNNING", jobs=None, deploys=None, mutate=None,
 def _live_job(owner_sid: str) -> dict:
     """A job that cmd_has_pending will actually count.
 
-    All three of its conditions must hold or the gate is silently a no-op:
-    owner_sid matches, the PID is ALIVE, and a completion mechanism is
-    registered (guard-1619 -- a dead pid registers fine, lists fine, and
-    has-pending still returns rc=1). os.getpid() is this pytest process, which
-    is unambiguously alive for the duration of the subprocess call.
+    All FOUR of its conditions must hold or the gate is silently a no-op:
+    owner_sid matches, the PID is ALIVE, a completion mechanism is registered
+    (guard-1619 -- a dead pid registers fine, lists fine, and has-pending still
+    returns rc=1), and since 2026-09-25 the type is on Gate 2.6's allowlist
+    (`--types external-wait-sleep`: the one job shape whose exit re-invokes the
+    model). os.getpid() is this pytest process, which is unambiguously alive
+    for the duration of the subprocess call.
     """
-    return {"job_id": "fixture-job", "pid": os.getpid(),
+    return {"job_id": "fixture-job", "type": "external-wait-sleep", "pid": os.getpid(),
             "owner_sid": owner_sid, "monitor_goal_id": "g-306-173-fixture",
             "started_at": "2026-08-03T22:00:00"}
 
@@ -405,6 +407,30 @@ def test_gate_2_6_sibling_body_job_does_not_allow(tmp_path):
         f"a SIBLING body's job ALLOWed this body's turn-end; log:\n{log}")
     assert _blocked(proc), (
         f"expected BLOCK for a foreign-owned job; stdout:\n{proc.stdout}")
+    assert _compact_pending(root).is_file()
+
+
+def test_gate_2_6_own_body_non_wait_type_does_not_allow(tmp_path):
+    """The 2026-09-25 rail: a live OWN-body job of a non-wait type must BLOCK.
+
+    Before `--types external-wait-sleep`, this exact row -- a detached
+    processor run with a live PID and a monitor goal, owned by the runner's own
+    sid -- satisfied Gate 2.6 at every turn-end for ~8h on a reducer: the hook
+    exited 0 with no payload, nothing re-invoked the model, and the loop sat
+    dead while every liveness signal read healthy. Same-run control:
+    test_gate_2_6_own_body_job_allows_the_turn_end proves the identical row
+    ALLOWs when its type is the registered wait, so the type is the only thing
+    this test varies.
+    """
+    job = dict(_live_job(RUNNER_SID), type="processor")
+    proc, root = _drive(tmp_path, state="RUNNING", jobs=[job])
+    log = _hook_log(root)
+
+    assert proc.returncode == 0
+    assert "gate=background-jobs" not in log, (
+        f"a non-wait-type own-body job ALLOWed the turn-end; log:\n{log}")
+    assert _blocked(proc), (
+        f"expected BLOCK for a processor-type job; stdout:\n{proc.stdout}")
     assert _compact_pending(root).is_file()
 
 

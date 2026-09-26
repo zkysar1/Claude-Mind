@@ -254,13 +254,15 @@ if who not in st:
     print("team-state has no agent_status row for %r" % who); sys.exit(0)
 if not isinstance(st.get(who), dict):
     print("agent_status[%r] is not a container" % who); sys.exit(0)
-if "in_flight_bodies" not in st[who]:
-    # Absent for THIS agent is normal (lazily created). Absent for EVERY agent
-    # means either the key was renamed or the whole fleet is idle -- those two
-    # are indistinguishable from here, so refuse in both.
-    if not any(isinstance(v, dict) and "in_flight_bodies" in v for v in st.values()):
-        print("no agent carries an in_flight_bodies key (renamed, or fleet fully idle)")
-        sys.exit(0)
+# in_flight_bodies absent for THIS agent -- or for EVERY agent -- is NOT drift
+# (). It is the composer`s designed no-bodies-forked state:
+# _team_state.py make_clear_body_row_modifier pops the key once it empties, so
+# a fleet with no worker Body forked carries it nowhere. That was refused here
+# as "renamed, or fleet fully idle" and blocked every retire on a reducer-only
+# fleet. A rename cannot be told apart from that state by reading absence
+# (guard-3951), so it is excluded where the two DO differ -- the writer`s field
+# path, this reader`s and the clear op`s key name -- by
+# test_body_row_key_is_one_name_across_writer_reader_and_clear.
 print("")' 2>/dev/null)"
     if [ -n "$drift" ]; then
       if [ -z "$FORCE_RETIRE_LIVE_JUST" ]; then

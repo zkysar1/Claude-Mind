@@ -275,6 +275,93 @@ def _tokens(text):
             if t.lower() not in _STOPWORDS}
 
 
+# ── Subject headline cap () ──────────────────────────────────────
+# A relay observation is a 1-2 KB blob whose FIRST sentence(s) state the finding;
+# the rest is cited evidence -- dozens of goal ids, guard ids and filenames, each
+# a token the live IDF marks RARE. Scoring the whole blob lets any unrelated
+# owner that coincidentally shares ONE body identifier clear the weight+rare gate
+# and produce a DECLINE -- the silent, permanent false-DECLINE direction this
+# probe's own guard-5147 names. Measured (): 6-of-11 and 3-of-9
+# wrong-subject declines on live batches; false pairs scored idf-weight 26-34 on
+# coincidental body tokens while genuine pairs scored 138-416 on the shared
+# SUBJECT. The headline carries what the relay is ABOUT; a genuine duplicate
+# shares THAT, an accidental collision shares a body identifier. Capping the
+# SCORED subject to its headline removes the evidence tail from the overlap set.
+#
+# Fails SAFE by construction: dropping subject text can only REMOVE overlap, so
+# the worst case is a false FILE (a dedup-able duplicate), never the false
+# DECLINE guard-5147 forbids.
+SUBJECT_HEADLINE_MAX_CHARS = 400   # hard ceiling for a run-on first sentence
+SUBJECT_HEADLINE_MIN_CHARS = 120   # never cut a sentence shorter than this: an
+#   "envelope" observation ("relaying for reducer to file. <proposed_work>") has
+#   a tiny first sentence, so cutting there would drop the proposed_work the
+#    fix appends; the floor keeps envelope + proposed_work head.
+
+
+def _headline(text):
+    """The relay's 'aboutness' for dedup scoring: its opening, bounded.
+
+    No-op for any subject <= SUBJECT_HEADLINE_MAX_CHARS (every short subject,
+    including the test corpus and the positive control). For a longer subject,
+    cut at the first sentence terminator (.;!? FOLLOWED BY whitespace, or a
+    newline) when that lands at or beyond the MIN floor, else at the char cap.
+    A dot inside a token (filename `x.j2`, version `6.06x`) is never followed by
+    whitespace, so it is never a boundary."""
+    s = str(text or "").strip()
+    if len(s) <= SUBJECT_HEADLINE_MAX_CHARS:
+        return s
+    m = re.search(r"[.;!?](?=\s)|\n", s[:SUBJECT_HEADLINE_MAX_CHARS])
+    if m and m.start() + 1 >= SUBJECT_HEADLINE_MIN_CHARS:
+        return s[:m.start() + 1]
+    return s[:SUBJECT_HEADLINE_MAX_CHARS]
+
+
+# ── Subject coverage floor (, second half) ───────────────────────
+# The headline cap removed the evidence TAIL, but a coincidental owner can still
+# share one rare token inside the headline itself: 5 of the goal's 9 named false
+# pairs still cleared the weight+rare gates after the cap (measured 2026-09-25,
+# cc-08, live 3,664-goal corpus). Weight cannot separate them, because it grows
+# with how much text overlaps: false owners scored 14.6-32.6 while a genuine
+# owner ( for relay 42c6c1e1d4) scored 15.6.
+#
+# What does separate them is how much of the relay's aboutness the owner
+# RESTATES: the idf-weighted share of the headline's tokens that the owner also
+# carries. The 8 false pairs whose owner record still exists covered 0.08-0.23
+# of their headline ( is in no queue on this box); the 4 named
+# genuine relays covered 0.52-0.90, and across the 33 archived relays of the
+# goal's source goals no owner confirmed genuine by reading its title covered
+# less than 0.33. A shared rare token is evidence of identity only when the
+# owner also restates the subject around it. Over all 2,078 archived sq-013
+# relays the gate turned 1,096 of 1,817 DECLINEs into FILE and added none; a
+# 16-row random read of those flips found 13 coincidental owners, 3 borderline.
+#
+# Two floors, because one shared rare token is the weaker identity signal: 5 of
+# the 5 false pairs that survived the cap shared exactly one. The floors sit
+# between the measured classes (n=33 relays, not a validated threshold). Fails
+# SAFE like the cap: the floor only removes candidates, so its worst case is a
+# false FILE (a dedup-able duplicate), never the false DECLINE guard-5147 names.
+# Live-IDF branch only; an inert (fixture-sized) corpus has no idf to weight by.
+SUBJECT_COVERAGE_MIN = 0.40              # candidate shares ONE rare token
+SUBJECT_COVERAGE_MIN_MULTI_RARE = 0.30   # candidate shares two or more
+
+# Coverage is read from the OWNER's opening too, for the mirror-image reason the
+# subject is capped: a long record covers any subject's tokens by size alone.
+# Measured on the first cut of this gate (2,078 archived sq-013 relays, live
+# corpus): when it dropped a short coincidental owner, the next survivor was a
+# sponge -- the re-cited owners had median 366 tokens against 94 for the owners
+# they replaced, 62% of them over 2x the corpus average, and the most re-cited
+# was a recurring goal with a 71k-char description. Title plus this many
+# description chars is roughly an average-length record; the genuine owners in
+# the regression fixture restate their relay inside it.
+OWNER_HEAD_CHARS = 2500
+
+
+def _owner_head_tokens(goal):
+    """Tokens of the owner's title plus the opening of its description."""
+    return _tokens("%s %s" % (goal.get("title") or "",
+                              str(goal.get("description") or "")[:OWNER_HEAD_CHARS]))
+
+
 def _parse_ts(value):
     """Naive ISO timestamp -> datetime, or None. Naive by fleet convention
     (CLAUDE.md: UTC wall time on every box, no zone suffix)."""
@@ -327,7 +414,10 @@ def decide(subject, goals, now, session_start=None,
     inside the window, because "someone considered this two months ago and
     closed it" is not the same claim as "this was just done".
     """
-    subj = _tokens(subject)
+    # Score the relay's HEADLINE, not its evidence body (): a long
+    # relay's cited-identifier tail is what lets an unrelated owner win the rare
+    # gate by coincidence. No-op for short subjects (see _headline).
+    subj = _tokens(_headline(subject))
     start = window_start(now, session_start, window_hours)
     matches = []
 
@@ -345,6 +435,7 @@ def decide(subject, goals, now, session_start=None,
     # enforce -- see the all-common waiver at the gate.
     subj_rare = {t for t in subj
                  if not inert and t in idf and idf[t][0] <= rare_ceil}
+    subj_idf_total = 0.0 if inert else sum(idf[t][1] for t in subj)
 
     for g, blob_tokens, cand_title in zip(records, docs, titles):
         status = (g.get("status") or "").strip().lower()
@@ -388,6 +479,18 @@ def decide(subject, goals, now, session_start=None,
                     or not cand_title
                     or not subj.issuperset(cand_title)):
                 continue
+        # Coverage gate: the owner must restate the subject, not merely share
+        # one identifier with it (see SUBJECT_COVERAGE_MIN).
+        if inert:
+            coverage = len(overlap) / float(len(subj))
+        else:
+            head_overlap = overlap & _owner_head_tokens(g)
+            coverage = (sum(idf[t][1] for t in head_overlap) / subj_idf_total
+                        if subj_idf_total else 1.0)
+            floor = (SUBJECT_COVERAGE_MIN_MULTI_RARE if len(rare) >= 2
+                     else SUBJECT_COVERAGE_MIN)
+            if coverage < floor:
+                continue
 
         if status in OPEN_STATUSES:
             when, in_window = _goal_time(g), True
@@ -409,6 +512,7 @@ def decide(subject, goals, now, session_start=None,
             "overlap": sorted(overlap)[:8],
             "overlap_count": len(overlap),
             "weight": round(weight, 2),
+            "coverage": round(coverage, 2),
             "rare_tokens": rare[:5],
             "title": (g.get("title") or "")[:120],
         })

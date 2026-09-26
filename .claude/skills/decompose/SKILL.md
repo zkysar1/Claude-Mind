@@ -51,9 +51,10 @@ Before Step 2's primitiveness test, check whether this goal was decomposed in
 a prior session. Re-decomposing would duplicate work.
 
 ```
-IF goal.status == "decomposed" OR (goal.decomposed_into is a non-empty list):
-    # Verify at least one child is still live.
-    Bash: aspirations-read.sh --active  (locate children by ID)
+IF goal.status == "decomposed":
+    # Verify at least one child is still live. Children are the goals whose
+    # parent_goal == this goal's id (Step 6.4 names them in the parent's progress_note).
+    Bash: aspirations-read.sh --active  (locate children by parent_goal)
     # --active filters to status==active aspirations (g-115-2604 parity fix) —
     # a child parked in a PAUSED aspiration is invisible to this dump. Before
     # concluding a child is gone, fall back to a per-id read of its parent
@@ -163,7 +164,7 @@ function decompose(goal, depth=0):
         sg.achievedCount = 0
         sg.currentStreak = 0
         sg.longestStreak = 0
-        sg.scheduleType = "once"
+        # No scheduleType: the goal-field allowlist refuses it as a known stray.
 
         # Assign appropriate skill
         sg.skill = infer_skill(sg)
@@ -334,11 +335,9 @@ ELIF plan.applicable == true AND plan.solvable == true:
     #     is richer than the skeleton). A primitive with no generated leaf is a
     #     COVERAGE GAP — add a sub-goal covering it so the decomposition is
     #     complete against the validated plan.
-    #   - Annotate the parent goal object (in-context, persisted by Step 6's
-    #     write) with:
-    #       pddl_plan: {shape: plan.shape, plan: plan.plan, valid: plan.valid,
-    #                   plan_length: plan.plan_length,
-    #                   source: "decompose-pddl-plan g-306-54"}
+    #   - Carry the plan (shape, plan steps, valid, plan_length, source
+    #     "decompose-pddl-plan g-306-54") into Step 6.4's progress_note line.
+    #     Not a `pddl_plan` field: the goal-field allowlist refuses it.
     Log: "decompose: PDDL plan ({plan.shape}, {plan.plan_length} steps, valid={plan.valid}) constrains tree leaves"
 
 ELIF plan.applicable == true AND plan.solvable == false:
@@ -390,14 +389,24 @@ If yes, create a companion hypothesis goal alongside the sub-goals:
    override is audit-logged to world/goal-duplication-overrides.jsonl with the
    justification, so a genuinely-duplicate child still surfaces there for review:
    echo '<sub-goal-json>' | bash core/scripts/aspirations-add-goal.sh <aspiration-id> --source {goal.source} --override-duplication "decomposition child of <parent-goal-id> — distinct deliverable that legitimately shares parent+sibling vocabulary; structural_overlap expected (g-115-1446 backstop preserved via this audit-logged override; g-115-2702)"
-2. Mark the parent goal decomposed (goal-level field-merge):
+2. Re-point the parent's dependents FIRST. goal-selector.py counts a
+   `decomposed` goal as done, so any goal with the parent in blocked_by
+   unblocks the moment step 3 lands, before any child has run. Find those
+   goals (blocked_by contains <parent-goal-id>) and set each one's blocked_by
+   to the child that delivers what it waits on, then read it back (guard-4868):
+   Bash: aspirations-update-goal.sh --source {goal.source} <dependent-id> blocked_by '["<child-id>"]'
+3. Mark the parent goal decomposed (goal-level field-merge):
    Bash: aspirations-update-goal.sh <parent-goal-id> status decomposed --source {goal.source}
-3. Record the children on the parent goal:
-   Bash: aspirations-update-goal.sh <parent-goal-id> decomposed_into '[<sub-goal-ids>]' --source {goal.source}
+4. Record the children on the parent's own record. The children already carry
+   parent_goal, and the goal-field allowlist (core/scripts/_goal_fields.py)
+   refuses `decomposed_into`, so append one line naming the child ids (plus the
+   Step 5.6 plan when it applied) to progress_note. The line must not start
+   with `{` or `[`:
+   Bash: printf '%s\n' "Decomposed into <child-ids> ..." | bash core/scripts/goal-field-append.sh --source {goal.source} <parent-goal-id> progress_note DECOMPOSED-<date>-<agent> --value-stdin
    # --source = the parent goal's queue from selector output (Source Routing
    # Protocol rules 1-2: propagate to every call; children go to the parent's queue)
-4. Update _index files if needed
-5. Notify the user about the decomposition.
+5. Update _index files if needed
+6. Notify the user about the decomposition.
    (Check world/forged-skills.yaml for a skill whose triggers match
    "notify the user" and invoke it with:
      subject: "Aspiration Updated: <asp-title>"

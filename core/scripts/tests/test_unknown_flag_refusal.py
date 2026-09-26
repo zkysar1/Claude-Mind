@@ -80,6 +80,7 @@ that shape safe.
 """
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -802,4 +803,163 @@ def test_run_never_hands_the_sh_path_to_the_os(monkeypatch):
     )
     assert argv[2:] == ["--help"], (
         f"trailing args were not passed through verbatim: {argv[2:]!r}"
+    )
+
+
+# ---- : a LINE BREAK in a header-bound value ----------------------
+#
+# Every flag below ships its value to the daemon as an HTTP HEADER
+# (`--header "X-Mind-...: $VALUE"`), and a header cannot carry a line break.
+# MEASURED 2026-09-26 (echo, hostname cc-03, uname -r 6.8.0-139-generic), one
+# variable changed, against ids that do not exist so nothing could be written:
+#   add-goal --override-duplication $'a\nb' asp-998 < valid.json
+#     -> {"error": "invalid_body", "detail": "body must be JSON goal object: empty body"}
+#   the same value on ONE line           -> aspiration_not_found (the body arrived)
+#   update-goal --override-uncommitted $'a\nb'  priority LOW
+#     -> {"error": "invalid_body", "detail": "body must be JSON value: empty body"}
+#   the same value on ONE line           -> goal_not_found
+# The error blames the body, so every cheap recovery reproduces it (guard-7278).
+#
+# THE TRAILING TERMINATOR IS EACH ROW'S SAFETY PROPERTY — do not drop it.
+# `--schema` and `--help` exit 0 before stdin is read and before _runtime.sh is
+# sourced. The refusal fires inside the flag's own case arm, which runs first,
+# so a correct wrapper exits 2 and a REVERTED one falls through to the
+# terminator and exits 0: the mutation control never reaches the daemon, where
+# aspirations-add.sh's single-line row would otherwise CREATE an aspiration.
+# add-goal uses --schema because its --help is a pre-parse scan that skips the
+# loop entirely.
+_TERMINATOR = {
+    "aspirations-add-goal.sh": "--schema",
+    "aspirations-add.sh": "--schema",
+    "aspirations-complete.sh": "--help",
+    "aspirations-update-goal.sh": "--help",
+}
+HEADER_BOUND = [
+    ("aspirations-add-goal.sh", f) for f in (
+        "--override-signal", "--override-duplication", "--override-no-investigate",
+        "--override-offload", "--override-deadline", "--override-all",
+        "--allow-new-field")
+] + [
+    ("aspirations-add.sh", f) for f in (
+        "--override-signal", "--override-duplication", "--override-supply",
+        "--override-all")
+] + [
+    ("aspirations-complete.sh", f) for f in ("--override-supply-close", "--override-all")
+] + [
+    ("aspirations-update-goal.sh", f) for f in (
+        "--force-defer", "--override-uncommitted", "--cross-lane",
+        "--override-missing-artifact", "--override-residual", "--override-shrink",
+        "--expect-sha256", "--blocker-ref", "--force-unstructured-defer",
+        "--override-blocker-gate", "--allow-new-field")
+]
+_HB_IDS = [f"{w[:-3]}{f}" for w, f in HEADER_BOUND]
+
+
+@pytest.mark.parametrize("brk", ["\n", "\r"], ids=["LF", "CR"])
+@pytest.mark.parametrize("wrapper,flag", HEADER_BOUND, ids=_HB_IDS)
+def test_line_break_in_header_value_is_refused_naming_the_argument(wrapper, flag, brk):
+    r = _run(wrapper, [flag, f"first line{brk}second line", _TERMINATOR[wrapper]])
+    assert r.returncode == 2, (
+        f"{wrapper} {flag}: returned {r.returncode}, expected 2. rc=0 is the "
+        f"REVERTED shape — the value was accepted and the terminator ran.\n"
+        f"stdout={r.stdout!r}\nstderr={r.stderr!r}"
+    )
+    first = r.stderr.splitlines()[0] if r.stderr else ""
+    assert flag in first and "line break" in first, (
+        f"the refusal's FIRST line must name the argument, not the body: {first!r}"
+    )
+    assert "tr -s ' '" in r.stderr, "the refusal must name the collapse idiom"
+    assert "g-115-10545" in r.stderr
+    assert r.stdout == "", f"fell through to {_TERMINATOR[wrapper]}: {r.stdout!r}"
+
+
+@pytest.mark.parametrize("wrapper,flag", HEADER_BOUND, ids=_HB_IDS)
+def test_single_line_header_value_is_accepted(wrapper, flag):
+    r = _run(wrapper, [flag, "first line second line", _TERMINATOR[wrapper]])
+    assert r.returncode == 0, (
+        f"{wrapper} {flag}: a single-line value was refused (rc={r.returncode}).\n"
+        f"stderr={r.stderr!r}"
+    )
+    assert "line break" not in r.stderr
+
+
+# Variable names may carry DIGITS (EXPECT_SHA256). The first draft used `[A-Z_]+`,
+# which skipped that header line silently — neither derived nor exempt — and only
+# the set-equality assert below noticed. Keep that assert: it is the control.
+_HDR = re.compile(
+    r'--header "X-Mind-[A-Za-z0-9-]+: (\$\{2-\}|\$\{?([A-Z_][A-Z0-9_]*)(?::-)?\}?)"'
+)
+_ARM = re.compile(r"^\s+(--[a-z0-9-]+)\)\s*$")
+
+
+def _enclosing_arm(lines, idx):
+    for j in range(idx, -1, -1):
+        m = _ARM.match(lines[j])
+        if m:
+            body = []
+            for follow in lines[j + 1 : j + 40]:
+                if follow.strip().startswith("#"):
+                    continue
+                body.append(follow)
+                if ";;" in follow:
+                    break
+            return m.group(1), "\n".join(body)
+    return None, ""
+
+
+@pytest.mark.parametrize("wrapper", sorted(_TERMINATOR))
+def test_every_header_bound_flag_is_refused_and_listed(wrapper):
+    """Derived from the SOURCE, so a new header flag without the refusal goes RED.
+
+    The behavioural rows above pin today's flags only. This walks every
+    `--header "X-Mind-...: <value>"` line back to the case arm that captured the
+    value and requires (a) the arm calls the refusal and (b) the flag has a row in
+    HEADER_BOUND. A header whose value no arm captures comes from the environment
+    (update-goal's BODY_ROLE, injected by the Bash hook), not from a caller, and is
+    the one named exemption.
+    """
+    lines = (SCRIPTS / wrapper).read_text(encoding="utf-8").splitlines()
+    derived, env_only = set(), set()
+    for i, line in enumerate(lines):
+        m = None if line.lstrip().startswith("#") else _HDR.search(line)
+        if not m:
+            continue
+        at = i
+        if m.group(1) != "${2-}":
+            var = m.group(2)
+            at = next((k for k, l in enumerate(lines)
+                       if re.match(rf'^\s+{var}="\$\{{2-\}}"', l)), None)
+            if at is None:
+                env_only.add(var)
+                continue
+        flag, body = _enclosing_arm(lines, at)
+        assert flag, f"{wrapper}:{i + 1}: header value has no enclosing flag arm"
+        derived.add(flag)
+        assert "argv_strict_refuse_multiline_value" in body, (
+            f"{wrapper}: the {flag} arm ships its value as an HTTP header but does "
+            f"not refuse a line break (g-115-10545)."
+        )
+    assert derived == {f for w, f in HEADER_BOUND if w == wrapper}
+    assert env_only <= {"BODY_ROLE"}, (
+        f"{wrapper}: header value(s) {sorted(env_only)} are captured by no argv arm"
+    )
+
+
+def test_no_unlisted_wrapper_ships_a_value_as_a_header():
+    """The four wrappers above must be the WHOLE population.
+
+    The pin above walks only the wrappers it is parametrized over, so a FIFTH
+    wrapper that interpolates a value into `--header "X-Mind-..."` would be
+    invisible to every test in this section. The transport (_runtime.sh's
+    `--header) ... -H "$2"`) does not match: it forwards, it builds nothing.
+    """
+    found = set()
+    for p in SCRIPTS.glob("*.sh"):
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if not line.lstrip().startswith("#") and _HDR.search(line):
+                found.add(p.name)
+                break
+    assert found == set(_TERMINATOR), (
+        f"header-writing wrappers not in the matrix: {sorted(found - set(_TERMINATOR))}; "
+        f"listed but no longer writing headers: {sorted(set(_TERMINATOR) - found)}"
     )

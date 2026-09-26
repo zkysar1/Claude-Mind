@@ -11,39 +11,20 @@ paths:
 ---
 
 <!--
-  Path-scoped (g-115-6469). At 37 KB this was the single largest item in the
-  fixed per-turn preamble — 12% of all rule bytes — paid by every agent on
-  every turn whether or not it would ever run a suite. The globs are this
-  rule's own Scope section: it applies when a deep goal TOUCHED production
-  code, and those are the surfaces.
-
-  SCOPING THIS ONE WOULD HAVE BEEN A REGRESSION ON ITS OWN, and that is the
-  part to understand before touching it. A path-scoped rule loads when a
-  matching file is touched and is NOT re-injected after a compaction. The
-  moment this rule matters most is the CLOSURE — which can land in a turn after
-  an autocompact, with the rule absent and "all tests pass" about to be
-  written. Scoping alone would have removed the rule from exactly the turn it
-  exists to govern.
-
-  So it is scoped only because the imperative now has a second carrier that
-  does not depend on the preamble at all:
-  core/scripts/full-suite-imperative-gate.{sh,py} is a PreToolUse[Bash] hook
-  that fires on the COMMAND (pytest / run-full-suite / gradlew) and delivers
-  the five behavioural heads — VERDICT-first, GENUINE-can-be-false, the ladder
-  is a retry protocol, never pipe the runner, CLEAN scopes to the pytest chunks
-  only — plus the guard-955 STORAGE_BACKEND=local requirement. Verified firing
-  live in-session, not merely unit-tested.
-
-  IF THAT HOOK IS EVER REMOVED OR DISABLED, UNSCOPE THIS RULE IN THE SAME
-  CHANGE. The two are one mechanism. Pinned by
-  test_full_suite_imperative_gate.py, which asserts the hook is registered in
-  .claude/settings.json — a gate nothing calls is indistinguishable from one
-  that always passes (guard-1943).
-
-  See core/config/conventions/rules-loading.md.
+  Path-scoped (g-115-6469) ONLY because core/scripts/full-suite-imperative-gate.{sh,py},
+  a PreToolUse[Bash] hook on pytest / run-full-suite / gradlew, re-delivers this
+  rule's behavioural heads at the moment of use: a path-scoped rule is NOT
+  re-injected after a compaction, which is exactly when a closure can land.
+  IF THAT HOOK IS EVER REMOVED OR DISABLED, UNSCOPE THIS RULE IN THE SAME CHANGE
+  (pinned by test_full_suite_imperative_gate.py). Why: the rationale file below.
 -->
 
 # Run Full Suite After Deep Code Closure
+
+The incidents and measurements behind every section live in
+`core/config/rationale/run-full-suite-after-deep-code.md`, and dated per-run
+records live in `core/config/run-full-suite-baselines.md`. Add evidence there,
+never here.
 
 ## Principle
 
@@ -52,30 +33,15 @@ must mean the FULL test suite for the module/package — not just the targeted
 new tests written for the change. Targeted tests are necessary but not
 sufficient: they confirm the new behavior is right, but they cannot detect
 regressions in adjacent code paths that the change broke as a side effect.
-
-The failure mode (canonical: g-115-744 / g-115-746, 2026-05-14): a deep code
-goal modified production logic (`Math.max(b, raw)` zero-clamp), the targeted
-new test for the change passed, and the closure narrated "All tests pass."
-A separate existing test (`testSymmetry`) was actually broken by the change
-— it would have caught that `Math.max(b, raw)` was too aggressive, and the
-correct fix was a conditional (`if raw < 0: raw = b`). The regression
-shipped because the closure trusted targeted-only test results.
+Canonical failure (g-115-744 / g-115-746): the targeted test passed, an existing
+`testSymmetry` test was broken by the change, and the regression shipped.
 
 ## The second axis: ENVIRONMENT (guard-1515)
 
-Everything below this line is about breadth of TEST SELECTION — "targeted tests
-are necessary but not sufficient, run the whole module." A regression can satisfy
-that axis completely and still ship, because a suite result is a claim about
-**one box's environment**, not about the code.
-
-Measured (g-335-264): a deep change added a pre-dispatch guard reading
-`System.getenv` for two API keys. The FULL Gradle suite ran — 4523 passed, 0
-failed, BUILD SUCCESSFUL — and it pushed (96d8cbf). Two test classes point the
-service at a local stub and need no real credential, but the guard runs before
-dispatch regardless, so with those vars UNSET they fail. The author's box had a
-populated key, so the suite was green; CI does not, so CI would have been red.
-The regression broke 6 tests and was caught minutes later by an unrelated spark
-(83d9c8f), not by the rule.
+Everything below this line is about breadth of TEST SELECTION. A regression can
+satisfy that axis completely and still ship, because a suite result is a claim
+about **one box's environment**, not about the code (g-335-264: a full Gradle
+suite green on a box with a populated API key, red wherever it is unset).
 
 **When a change reads any environment input — env var, credential, locale, TZ,
 `$HOME`, a file outside the repo — a green suite on your box is not evidence
@@ -86,12 +52,10 @@ env -u OPENAI_API_KEY -u GROQ_API_KEY ./gradlew test --no-daemon
 ```
 
 Generalise per input, not per name: `env -u <VAR>` for each var the diff reads.
-The unset case is the one CI runs and the one your box hides, and it is the
-cheap direction to check — a populated value masks the failure, an absent one
-cannot mask a success.
-
-This axis is ORTHOGONAL to test selection: satisfying one says nothing about the
-other, so a closure claiming "all tests pass" on an env-reading change owes both.
+The unset case is the one CI runs and the one your box hides — a populated value
+masks the failure, an absent one cannot mask a success. This axis is ORTHOGONAL
+to test selection: a closure claiming "all tests pass" on an env-reading change
+owes both.
 
 ## Scope
 
@@ -116,21 +80,16 @@ tree node edits without script behavior changes) or routine closures
 ## Which tier satisfies this rule (g-115-9602, 2026-09-10)
 
 This rule says a deep-code closure owes more than its targeted tests. It never
-said the only way to pay is the ~187-minute full run — and that reading is what
-has been stopping agents for hours. USER DIRECTIVE, verbatim: *"We need it much
-smaller, and self serve for each agent. WE cannot have each of our agents
-pausing for 4 hours after each deep goal... I will find 3 or 4 agents all
-running this test and doing nothing while waiting."*
-
-There are two tiers. Choose with the rule below, not by reflex.
+said the only way to pay is the ~187-minute full run (USER DIRECTIVE: smaller and
+self-serve for each agent — verbatim in the rationale). There are two tiers.
+Choose with the rule below, not by reflex.
 
 **FAST — `bash core/scripts/run-scoped-suite.sh`.** Runs only the tests that
 reference what changed. Self-serve: your own box, no quiet window, no tree lock,
 no queue, no peer coordination — safe beside a live daemon and from a worker
 Body (it pins `STORAGE_BACKEND=local` itself and logs outside the synced tree).
 The verdict is TRI-STATE and **an empty selection is NOT a pass**: `0 PASS |
-1 FAIL | 2 INCONCLUSIVE | 3 setup`. Measured on a live box with the fleet
-running: 5 of 1,442 test files in 0.3s, 22 of 1,443 in 8.2s.
+1 FAIL | 2 INCONCLUSIVE | 3 setup`.
 
 **THE FAST TIER SUFFICES when ALL FOUR hold:**
 (a) verdict is PASS — a NON-EMPTY selection ran green;
@@ -153,187 +112,57 @@ precisely the way "all tests pass" from targeted tests alone is.
 
 ## Scope: THREE testpaths, not one (g-115-3748, 2026-07-31)
 
-Every `pytest core/scripts/tests` invocation written below names **one of the
-three testpaths `pytest.ini` declares**. The other two are `mind_api/tests`
-and `core/tests/gates`. Until 2026-07-31 `run-full-suite.sh` collected only
-the first, so an agent could follow this rule perfectly, read `VERDICT: CLEAN`,
-and have executed **zero** gate tests and zero daemon-endpoint tests.
+`pytest.ini` declares THREE testpaths: `core/scripts/tests`, `core/tests/gates`
+and `mind_api/tests`. `bash core/scripts/run-full-suite.sh` resolves its roots
+from that config, so a new test tree joins by being declared there, and it has
+collected all three since 2026-08-20 (g-115-6942). Prefer it over every bare
+`pytest <path>` command below: those are accurate for targeted runs and NOT
+sufficient for a deep-code closure claim. Until 2026-07-31 the runner collected
+only the first path: 1,448 gate and daemon-endpoint tests never ran, and 12 of
+them were red.
 
-Measured that day: 109 files / **1,448 tests** never ran, and **12 of them were
-RED** — 5 in `core/tests/gates` (one for 36 days) and 7 in `mind_api/tests`.
-Being red is the smaller half. These are the GATE and daemon-endpoint suites:
-the layer the framework trusts to refuse bad writes and to keep CLI/daemon
-output in parity. An unverified enforcement layer fails silently and upward.
+Lasting lesson (guard-1760): the runner reports what it RAN, never what it
+declined to look for. When a suite's scope is configurable, check the config
+against the runner before trusting a green. `DEFERRED_TESTPATHS`
+(announced-and-skipped, opt-in `RUN_DEFERRED=1`) stays for future trees; empty
+is its designed end state.
 
-The runner now resolves its roots from `pytest.ini` `testpaths` rather than a
-hardcoded dir, so a future test tree joins the suite by being declared in the
-config — no edit here, and no second source of truth to drift (that drift IS
-this defect: the runner shipped 2026-07-26, five weeks after the config
-already declared three paths). `bash core/scripts/run-full-suite.sh` now covers
-`core/scripts/tests` and `core/tests/gates` — prefer it over every bare
-`pytest <path>` command below, which remain accurate for targeted runs and are
-NOT sufficient for a deep-code closure claim.
-
-**`mind_api/tests` is IN the chunked pool since 2026-08-20 (g-115-6942)** — a
-green `run-full-suite.sh` IS evidence about `mind_api/src`. History, kept
-because its lessons generalize: the tree spent 2026-07-31→08-20 in
-`DEFERRED_TESTPATHS` (announced-and-skipped; opt-in `RUN_DEFERRED=1`) after
-failing en masse at end-of-invocation — 411 reds at rung 16, 271 at rung 20 —
-while passing alone; neither ladder escalation nor an own process fixed it.
-The cause landed as **g-115-5651**: `get_backend()` memoizes `_ACTIVE_BACKEND`
-process-wide while conftest restored only the env VAR, so one own-cloud test
-poisoned every later test in its process. The reset fixture now lives in BOTH
-test-tree conftests (the mind_api mirror closed the mixed-chunk vector), and
-the fold-back was accepted on measurement (cc-10, 6.8.0-137-generic,
-2026-08-20): standalone 1,386/1,386 green; own-process at end-of-invocation
-green; folded acceptance run 16,099 passed / 5 failed with every red pre-owned
-and none in `mind_api/tests`. Four genuine reds the measurement surfaced were
-fixed, not skipped (set_at daemon/CLI parity port, claim-sid harness pin,
-citation lane pin, conftest MIND_SID coverage). The `DEFERRED_TESTPATHS`
-mechanism stays for future trees — empty is its designed end state. Lasting
-lesson (guard-1760): the runner reports what it RAN, never what it declined to
-look for; when a suite's scope is configurable, check the config against the
-runner before trusting a green.
-
-A separate trap discovered on this rule's history is still live: **two
-`run-full-suite.sh` invocations running CONCURRENTLY** (measured 2026-07-31,
-~11 min overlapped — the chunked-half `TOTAL:` line makes a run look finished
-while post-chunk phases are still writing). Before diagnosing anything from a
-suite run, confirm no other run is live:
-
-```bash
-bash core/scripts/proc-match.sh run-full-suite
-```
-
-**Not `pgrep`.** `pgrep -af "[r]un-full-suite"` stood here until 2026-08-31 and
-ran on ONE of three platforms: Windows/MSYS has no pgrep (measured — `pkill` IS
-present, so the gap is invisible at a glance), BSD/macOS lacks `-a`. The obvious
-Windows fallback is worse: MSYS `ps -ef` prints no arguments, so `ps | grep`
-returned **0 while 4 matching processes were live**. `proc-match.sh` branches
-PowerShell/`Win32_Process` vs POSIX `ps -eo pid=,args=` and prints the
-`pgrep -af` shape everywhere.
-
-It also closes three silent lies the bracket could not (guard-3159, guard-1238).
-Without `-f` a live run's process NAME is `bash`, so `pgrep -c` returns **0
-against a run that is executing** — a false NEGATIVE, the premise under which
-someone reads a verdict-less log as dead or launches a second run (2026-08-11,
-bravo, cc-05, 6.8.0-137-generic: `pgrep -c` said 0 while `pgrep -af` showed 2
-live PIDs, log mtime 2s old). The bracket stops the matcher matching its OWN
-argv but never an ENCLOSING wrapper's, so folding the check into the launch
-aborts the launch it protects — a false POSITIVE (2026-08-01, alpha, cc-04,
-6.8.0-136-generic: a clean process table reported one phantom whose only cited
-PID was the guard's own wrapper). And the matcher can match itself: the script
-snapshots before matching and drops its own PID.
-
-Still run it as its OWN command, and corroborate a "finished" reading with the
-log's mtime: a verdict-less tail plus a fresh mtime means STILL RUNNING, never
-died.
-
-**`VERDICT: GENUINE` CAN BE FALSE — and this is the first row in this file that
-says so. Read it before acting on any large failure count.** Every row below
-tells you to trust the VERDICT above the numbers. That advice holds for
-`INVALID`, which is fail-safe. It does NOT hold for `GENUINE`. Measured the
-same day (g-115-3748, `cc-02` / Linux 6.8.0-136-generic, own-cloud, live
-fleet, 16 chunks): `TOTAL: 8828 passed, 261 failed, 10 errors` /
-`VERDICT: GENUINE failures -- trustworthy, act on them`, with **411 of 434
-failures sitting in the last TWO of sixteen chunks** and chunk 15's exact
-47-file list re-running **solo to 5** — the known byte-compat reds. ~233
-failures were positional, and the classifier emitted **no reason at all**.
-
-The mechanism, measured by calling the classifier on its own logs:
-`_positional_profile` buckets by the `[NN%]` in pytest progress lines, but each
-chunk is its own run emitting its own 0→100%, so on an N-chunk concatenation
-the percentage resets N times and the "first third" is sampled from ALL N
-chunks. A cluster confined to the tail chunks is smeared uniformly across every
-bucket — here `early 2.85%` vs `late 5.57%`, a 1.96x ratio under the 5x
-threshold. Chunking (the exhaustion *remedy*) is what blinds the exhaustion
-*detector*, and the blinding scales with the chunk count. Tracked by
-**g-115-4336**; until it lands, apply the guard-1448 discriminators yourself on
-ANY non-zero count — **not merely a large one**: bucket by CHUNK (not by the
-blob), and re-run the worst-hit chunk's file list alone. A tail-loaded
-distribution is contention no matter what the verdict says — and so is a SMALL
-MID-RUN POCKET, which a positional profile misses for the opposite reason: it is
-not positional at all, so there is no skew to detect however the buckets are
-computed. Measured 2026-08-12 (alpha, `hostname` cc-04, `uname -r`
-6.8.0-137-generic, own-cloud, 16 chunks): `TOTAL: 11673 passed, 14 failed` /
-`VERDICT: GENUINE`, with all 14 in chunk 09 and chunks 10–15 clean after it —
-every failure a uniform `rc=4` (daemon-unreachable) across two whole files, and
-**23/23 green solo**. Read a small count as MORE suspicious, not less: 14
-failures look individually plausible enough to triage one by one, which is
-exactly how a reader spends an hour on a daemon blip. Two free tells before
-triaging anything: are the failures confined to one chunk, and is the assertion
-a LOGIC mismatch or a bare process rc?
-
-Four dated per-box reproduction blocks of that signature — 2026-08-15 (cc-03),
-2026-08-16 (cc-08), 2026-08-17 (cc-04), and the g-115-5651 root-cause note —
-were FOLDED into `core/config/run-full-suite-baselines.md` § "Chunk-09
-GENUINE-but-false signature" on 2026-09-10 (g-115-9602). Moved, not deleted:
-the cause is CLOSED and their lasting method is item 2 above, so open the
-ledger only if a FRESH occurrence needs the prior counts to compare against.
+Two traps that bite before any triage are stated once, in the method below: a
+second run live at the same time (item 9) and a `VERDICT: GENUINE` that is false
+(item 2).
 
 ## Live-Daemon Exception (own-cloud, 2026-05-31)
 
 When a **live own-cloud daemon is serving autonomous agents on this repo**
-(`mind_api/state/daemon.port` present + healthy), do NOT run the full
-`pytest core/scripts/tests` suite to satisfy this rule. The daemon-lifecycle
-integration tests (e.g. `test_daemon_orphan_prevention.py`, which spawns
-subprocess daemons against the real `mind_api/state/`) hijack the live
-`daemon.port`, route the running agents onto a transient `LocalBackend`, and
-leave local-only write residue (split-brain). This caused two daemon storms on
-2026-05-31 (the second was an agent running this suite to verify its own deep-code change).
+(`mind_api/state/daemon.port` present + healthy), do NOT run the unrestricted
+`pytest core/scripts/tests` suite. The daemon-lifecycle integration tests (e.g.
+`test_daemon_orphan_prevention.py`, which spawns daemons against the real
+`mind_api/state/`) hijack the live `daemon.port`, route the running agents onto
+a transient `LocalBackend`, and leave local-only write residue (split-brain).
 
-Resolution while a live daemon is present (B16 durable fix, landed 2026-06-01):
-1. Run the daemon-SAFE full suite, **prepending `STORAGE_BACKEND=local`** (see
-   the own-cloud S3-key-collision hazard below — this prefix is MANDATORY, not
-   optional, whenever the box runs `STORAGE_BACKEND=own-cloud`):
+1. Run the daemon-SAFE suite, **prepending `STORAGE_BACKEND=local`**. The prefix
+   is MANDATORY, not optional, whenever the box runs `STORAGE_BACKEND=own-cloud`:
    `STORAGE_BACKEND=local python -m pytest core/scripts/tests -q -m "not daemon_integration"`.
-   The `daemon_integration` marker (registered in `pytest.ini`) tags the tests
-   that spawn REAL subprocess daemons **deliberately** and/or count system-wide
-   `mind_api.src` processes — currently just `test_daemon_orphan_prevention.py`.
-   **The marker does NOT bound the set of tests that CAN spawn one.** Any test
-   invoking a daemon-backed wrapper reaches `rt_ensure_running` → rc=3 →
-   `rt_spawn`, or `mind-api-start.sh` directly; with `RUNTIME_DIR` unset either
-   path claims the SHARED `mind_api/state/daemon.port` and force-kills the live
-   daemon. Observed 2026-07-26: an unmarked, ostensibly-hermetic test
-   (`test_post_state_update_metric_gate_category.py`) recycled the live daemon
-   out from under the running fleet — its tmp `local-paths.conf` did not isolate
-   it, because `.mind-data/` outranks the conf in the resolution chain. Both
-   chokepoints now REFUSE the spawn when `PYTEST_CURRENT_TEST` is set and
-   `RUNTIME_DIR` is not (g-115-3329), so a test needing its own daemon MUST set
-   `RUNTIME_DIR` — the failure is loud instead of a silent fleet-wide repoint.
-   Excluding the marked tests, the rest of the suite is hermetic in its
-   filesystem resolution (the in-process `_daemon_fixture.py` / `running_daemon`
-   fixtures bind a thread-local daemon in a tmp project root and set `RT_DIR`
-   for their subprocesses) and is safe to run with a live daemon present —
-   **but ONLY with `STORAGE_BACKEND=local` prepended (as shown above).** On an
-   own-cloud box (`STORAGE_BACKEND=own-cloud`, this repo's default when a live
-   daemon serves agents) the "hermetic" claim is FALSE: tests that seed a
-   tempfile world and write via a subprocess (e.g.
-   `test_defer_to_unblock_integration.py`) inherit own-cloud (their subprocess
-   spawn does `env = os.environ.copy()`), and `OwnCloudBackend._s3_key` derives
-   the S3 key from `customer_prefix+env_id+`filename — NOT the `MIND_WORLD`
-   tmp-dir override — so the tmp write collides on the PRODUCTION S3 key and
-   truncates the real store. This happened 2026-07-09: `world/aspirations.jsonl`
-   was truncated from 22 aspirations/1366 goals to a lone `asp-555` fixture
-   (recovered from a `.history` snapshot via a fenced re-PUT).
-   `STORAGE_BACKEND=local` forces LocalBackend so every tmp write stays on the
-   tmp filesystem.
-
-   **"Prepend to pytest" is too narrow — pin it for ANY test runner.** The
-   2026-07-09 truncation did NOT come from `pytest core/scripts/tests`:
-   `test_defer_to_unblock_integration.py` is a `main()`-style file with zero
-   `test_` functions, so pytest collects 0 from it and never runs it. The real
-   runner was the bash aggregator `core/scripts/tests/run-asp-257-suite.sh`
-   (suite 6/6 = `python3 …/test_defer_to_unblock_integration.py`), invoked to
-   validate a capability-gate change. So pin `STORAGE_BACKEND=local` for pytest,
-   a bash aggregator, OR a direct `python3 test_*.py`. Bash aggregators that exec
-   `main()`-style world-writing tests MUST pin it themselves
-   (`run-asp-257-suite.sh` now `export`s it at the top) — a conftest autouse
-   fixture (g-115-1875) protects ONLY pytest-collected tests, never
-   `main()`-style files run outside pytest. (~18 pytest-collected world-writers
-   in `core/scripts/tests` do `os.environ.copy()` and are S3-collision-capable
-   under own-cloud; the conftest pin covers those.) See guard-955, rb-2983, and
-   `exp-owncloud-s3-collision-truncation-2026-07-09`.
+   - The `daemon_integration` marker (registered in `pytest.ini`) tags the tests
+     that spawn REAL subprocess daemons deliberately and/or count system-wide
+     `mind_api.src` processes. **It does NOT bound the set of tests that CAN spawn
+     one.** Any daemon-backed wrapper reaches `rt_ensure_running` → rc=3 →
+     `rt_spawn`, or `mind-api-start.sh` directly. With `RUNTIME_DIR` unset, that
+     claims the SHARED `mind_api/state/daemon.port` and force-kills the live
+     daemon. Both chokepoints now REFUSE the spawn when `PYTEST_CURRENT_TEST` is
+     set and `RUNTIME_DIR` is not (g-115-3329), so a test that needs its own daemon
+     MUST set `RUNTIME_DIR`.
+   - Without the pin, the suite is NOT hermetic on an own-cloud box. A test
+     subprocess inherits own-cloud through `env = os.environ.copy()`, and
+     `OwnCloudBackend._s3_key` derives the S3 key from `customer_prefix+env_id+`
+     filename, NOT from the `MIND_WORLD` tmp override. So a tmp fixture write
+     lands on the PRODUCTION key and truncates the real store (2026-07-09).
+     `STORAGE_BACKEND=local` keeps every tmp write on the tmp filesystem.
+   - **Pin it for ANY test runner, not only pytest**: a bash aggregator OR a
+     direct `python3 test_*.py` too. Bash aggregators that exec `main()`-style
+     world-writing tests MUST pin it themselves (`run-asp-257-suite.sh`
+     `export`s it at the top). The conftest autouse pin (g-115-1875) protects
+     ONLY pytest-collected tests. See guard-955 and rb-2983.
 2. Defer ONLY the `daemon_integration` subset to a quiescent window (agents
    stopped) or a separate clone / CI:
    `python -m pytest core/scripts/tests -q -m daemon_integration`.
@@ -341,71 +170,48 @@ Resolution while a live daemon is present (B16 durable fix, landed 2026-06-01):
    suite deferred" (the rest ran).
 
 `RUNTIME_DIR` (honored by `lifecycle.runtime_dir`, `mind-api-start.sh`'s
-`RT_DIR`, and `owncloud_sync.py`) lets a future test spawn an isolated daemon
-whose `daemon.pid/port` live in a tmp dir, so a spawn-and-check-own-files test
-need not hijack the live daemon's `mind_api/state`. It does NOT make the
-system-wide-process-counting orphan test safe (that counts by command line, not
-runtime dir) — hence that one keeps the marker.
-
-This is a scoped exception, not a repeal — the full unrestricted suite still
-runs whenever no live daemon is present. Enforced by `guard-672`.
+`RT_DIR`, and `owncloud_sync.py`) lets a test spawn an isolated daemon whose
+`daemon.pid/port` live in a tmp dir. It does NOT make the system-wide
+process-counting orphan test safe, so that one keeps the marker. This is a scoped
+exception, not a repeal: the full unrestricted suite still runs whenever no live
+daemon is present. Enforced by `guard-672`.
 
 ### Progress-visible invocation (g-115-1496, 2026-06-17)
 
-> **The dated per-run baseline rows that used to live here — every box, kernel,
-> chunk rung and TOTAL, verbatim — moved to
-> `core/config/run-full-suite-baselines.md` on 2026-08-17 (g-115-6469).**
-> Nothing was deleted; 46,595 B of run records were 12.9% of the fixed preamble
-> that loads on EVERY turn of EVERY agent, and almost no turn needs them. Read
-> the ledger when you are triaging a named failure, checking whether a red is
-> stale, or adding a run record. **Add new rows THERE, never here** — this
-> block asked for exactly that while offering nowhere else to put one, which is
-> why eleven more arrived anyway.
->
-> What follows is the METHOD, which is what a reader needs at the moment of use.
-> Each item carries the number of independent confirmations behind it; the
-> individual runs are in the ledger.
+> The METHOD, which is what a reader needs at the moment of use. The
+> confirmations behind each item are in the rationale file; the dated per-run
+> records are in `core/config/run-full-suite-baselines.md`.
 >
 > **1. READ THE `VERDICT` LINE FIRST, AND LET IT DECIDE WHETHER THE NUMBERS
 > ABOVE IT MEAN ANYTHING.** A run can print a fully clean-looking
 > `TOTAL: N passed, 0 failed, 0 errors` over per-chunk lines that ALL read
-> `0 failed`, with no stopped percentage and no failing file anywhere, and still
-> be `VERDICT: INVALID (contended) -- this number means NOTHING`. Six independent
-> confirmations across four boxes. Per-chunk lines cannot be trusted; the verdict
-> can.
+> `0 failed`, and still be
+> `VERDICT: INVALID (contended) -- this number means NOTHING`. Per-chunk lines
+> cannot be trusted; the verdict can.
 >
 > **2. `VERDICT: GENUINE` CAN BE FALSE — and a SMALL count is more suspicious,
 > not less.** The verdict is fail-safe for `INVALID` and NOT for `GENUINE`. The
-> positional profile that classifies exhaustion buckets by pytest's `[NN%]`, but
-> each chunk emits its own 0→100%, so a cluster confined to the tail — or to one
-> chunk — is smeared flat and reported GENUINE with no reason at all
-> (g-115-4336). Apply the guard-1448 discriminators yourself on ANY non-zero
-> count: **bucket by CHUNK, not by position, and re-run the worst-hit chunk's
-> file list SOLO.** Green solo ⇒ environmental. Four boxes have now hit one
-> stable signature — chunk 09, three pipeline/pending files at 15/8/6, all green
-> solo. The tempting chunk-local-collision reading of it was **FALSIFIED**
-> 2026-08-17: chunk 09's exact 59-file list re-ran in the same order, same
-> process, same pin, with 0 failures. Chunk 09 is where those files sort to, not
-> the cause. **The cause is known and FIXED** — the memoized-`_ACTIVE_BACKEND`
-> poisoning above, closed by **g-115-5651** 2026-08-19. A fresh occurrence is a
-> REGRESSION: re-run solo and file a NEW goal.
+> positional profile buckets by pytest's `[NN%]`, but each chunk emits its own
+> 0→100%. So a cluster confined to the tail, or to one chunk, is smeared flat
+> and reported GENUINE with no reason at all (g-115-4336). Apply the guard-1448
+> discriminators yourself on ANY non-zero count: **bucket by CHUNK, not by
+> position, and re-run the worst-hit chunk's file list SOLO.** Green solo ⇒
+> environmental. Check two things before triaging anything: are the failures
+> confined to one chunk, and is each assertion a LOGIC mismatch or a bare
+> process rc? The chunk-09 signature's cause is FIXED (g-115-5651). A fresh
+> occurrence is a REGRESSION: re-run solo and file a NEW goal.
 >
 > **3. `INVALID` HAS TWO CAUSES AND CLIMBING THE LADDER ONLY FIXES ONE.** The
-> other is log corruption. **RESOLVED 2026-08-17 (g-115-6409): the default log
-> dir moved off the fleet-synced tree** to `<tmpdir>/ayoai-suite-run-<agent>`, so
-> there is nothing to pass. `--print-out-dir` is a **`.py`** flag; on the `.sh`
-> it rides into a REAL run that looks hung. Older builds:
-> `--out /tmp/<non-synced-dir>`. Mechanism, measured not inferred: the sync layer
-> REPLACES the log at a new inode while the writer still holds an fd on the old
-> one, so the writer trickles into an orphaned inode. **Duration is the
-> discriminator, not size** — a 13.2 MB fast write survives; a 60-second trickle
-> does not.
+> other is log corruption: the sync layer replaces a log file while the writer
+> still holds the old one, so a long write trickles into an orphaned copy.
+> RESOLVED (g-115-6409): the default log dir moved off the fleet-synced tree to
+> `<tmpdir>/ayoai-suite-run-<agent>`, so you pass nothing. `--print-out-dir` is
+> a **`.py`** flag; on the `.sh` it rides into a REAL run that looks hung. Older
+> builds: `--out /tmp/<non-synced-dir>`.
 >
 > ⚠ **The NUL-byte check is ONE-DIRECTIONAL. Any NULs ⇒ corruption; ZERO NULs is
 > NOT evidence against it.** The common variant has a clean prefix, zero NULs and
-> rc=0 — byte-indistinguishable from a short run. Treating the check as a filter
-> is what lets the silent variant through and sends a reader up the chunk ladder
-> for hours against a cause no rung can fix.
+> rc=0, byte-indistinguishable from a short run.
 >
 > ```bash
 > for f in <logdir>/chunk-*.log; do n=$(tr -dc '\0' < "$f" | wc -c); \
@@ -413,94 +219,65 @@ runs whenever no live daemon is present. Enforced by `guard-672`.
 > ```
 >
 > **4. THE CHUNK LADDER (8 → 12 → 16 → 20 → 24 → 28 → 32 → 36) IS A RETRY
-> PROTOCOL, NOT A SETTING — AND IT IS NEVER INHERITABLE.** Not from another
-> agent, not from another box, and **not from your own earlier run on the same
-> machine**: one box went CLEAN-at-16 → INVALID-at-16 → CLEAN-at-20 inside two
-> hours. It does not track partner count either (16 was INVALID with 4 partners
-> and CLEAN with 5, on different days). Enter the ladder anywhere, read the
-> VERDICT, escalate only when it says to, and do not read a contended run's
-> totals as a regression.
+> PROTOCOL, NOT A SETTING — AND IT IS NEVER INHERITABLE**: not from another
+> agent, another box, or your own earlier run on the same machine, and it does
+> not track partner count. Enter the ladder anywhere, read the VERDICT, and
+> escalate only when it says to. Do not read a contended run's totals as a
+> regression.
 >
 > **5. THE `TOTAL` LINE IS NOT A CROSS-RUN COMPARISON METRIC.** Judge by the
 > FAILING FILE SET. The summary reports only `passed`, so xfail/xpass/skip sit
-> silently outside it and three same-tree runs will not reconcile. `failed` and
-> `errors` are the trustworthy fields; for a population figure use
-> `--collect-only`, which counts one thing the same way every run.
+> silently outside it. `failed` and `errors` are the trustworthy fields; for a
+> population figure use `--collect-only`.
 >
 > **6. `VERDICT: CLEAN` SCOPES TO THE CHUNKED PYTEST HALF ONLY.** It is not a
 > whole-suite all-clear. Also `grep '^FAIL'` for the invisible (`main()`-style
-> and shell) half and the domain half, which the runner reports separately. A
-> genuine red in those halves rides out under a clean verdict otherwise.
+> and shell) half and the domain half, which the runner reports separately.
 >
 > **7. WHEN THE VERDICT IS NOT CLEAN, RUN `--triage`.** It re-reads the chunk
-> logs the run already wrote (it does not re-run the suite) and chains
-> position-bucket → solo re-run → **ownership**, reporting only genuine-AND-
-> unowned as FILE THESE. It scores each red on the failing TEST's node id
-> over four narrative fields; a file-only hit lands in VERIFY (open it), never
-> in FILE THESE. Read its `SCOPE` block: `NOT RECORDED` for a half is a
-> statement of ignorance, never a pass.
+> logs the run already wrote (no re-run) and chains position-bucket → solo
+> re-run → **ownership**. Only reds that are both genuine AND unowned appear
+> under FILE THESE. A red whose file, but not its test, is named by a goal lands
+> in VERIFY: open it. `NOT RECORDED` in the `SCOPE` block is ignorance, never a
+> pass.
 >
 > **8. NEVER PIPE THE RUNNER — not even a finished run.** A trailing pipe
 > replaces the exit code with the pipe's (guard-1150), destroying the exit-2
-> INVALID signal, and a bounded window (`| tail -40`) discards the VERDICT line
-> that items 1-2 tell you is the only thing worth reading. Redirect to a file and
-> Read it. Committed live once: a notification reported exit 0 for a contended
-> run with no verdict anywhere in the captured output.
+> INVALID signal, and `| tail -40` discards the VERDICT line. Redirect to a file
+> and Read it.
 >
 > **9. CHECK FOR A CONCURRENT RUN AS ITS OWN COMMAND:
-> `bash core/scripts/proc-match.sh run-full-suite`.** NOT `pgrep` — it does not
-> exist on Windows/MSYS and lacks `-a` on BSD/macOS, so the old recipe ran on
-> one of three platforms. The script also removes the bracket idiom's two
-> silent failures (a false NEGATIVE without `-f`, since a live run's process
-> NAME is `bash`; a false POSITIVE from an ENCLOSING wrapper's argv, which the
-> bracket cannot defend against). Still run it as its own command, and
-> corroborate a "finished" reading with the log's mtime — a verdict-less tail
-> plus a fresh mtime means STILL RUNNING.
+> `bash core/scripts/proc-match.sh run-full-suite`.** NOT `pgrep`, which is
+> absent on Windows/MSYS and has no `-a` on BSD/macOS. Its bracket idiom also
+> misses a live run and matches an enclosing wrapper. Corroborate a "finished"
+> reading with the log's mtime: a verdict-less tail plus a fresh mtime means
+> STILL RUNNING.
 >
-> **10. RECORD `hostname` AND `uname -r` VERBATIM, NEVER A NICKNAME.** "cc-04"
-> has named at least two different machines (one Linux 6.8.0-136-generic, one
-> WSL2 6.6.87.2), which is how a same-day RED and GREEN for one test on "the same
-> box" turned out to be two boxes. A baseline you cannot attribute is a baseline
-> you cannot trust.
+> **10. RECORD `hostname` AND `uname -r` VERBATIM, NEVER A NICKNAME.** One
+> nickname has named two different machines. A baseline you cannot attribute is
+> a baseline you cannot trust.
 >
 > **11. BEFORE RECORDING A CROSS-BOX RED/GREEN SPLIT AS PORTABILITY, DIFF THE
 > ENV.** Env-dependence reproduces cross-platform; genuine platform-dependence
-> does not — that asymmetry is the whole discriminator, and it is one command. A
-> filed "Windows portability" finding turned out to be a forked fixture missing
-> an `MIND_WORLD` pin, reproduced on the GREEN box by setting that one var.
+> does not. That asymmetry is the whole discriminator, and it is one command.
 >
-> **12. RE-RUN A NAMED RED SOLO BEFORE TRIAGING FROM PROSE.** Reds recorded in
-> prose go stale and nothing re-checks them; on one re-measurement all four files
-> the rows named as red were GREEN. A prose red is a lead, not a finding. Note
-> also that a solo re-run cannot falsify an IN-SUITE claim (test-order pollution
-> is real: one file passes 63/63 solo and fails only in-suite), and that one solo
-> measurement is not a verdict — repeat before labelling anything GENUINE.
+> **12. RE-RUN A NAMED RED SOLO BEFORE TRIAGING FROM PROSE.** A prose red is a
+> lead, not a finding. A solo re-run cannot falsify an IN-SUITE claim, because
+> test-order pollution is real. One solo measurement is not a verdict either:
+> repeat it before labelling anything GENUINE.
 >
-> **13. "PRE-EXISTING" IS NOT "TRACKED".** Establishing that a failure is not
-> yours is the easy half and is where the check usually stops; it still needs an
-> owner. Open the cited goal and confirm it names the failing TESTS — a shared
-> file path is not ownership. One pair sat unowned for a day behind a cited goal
-> that merely mentioned their file.
+> **13. "PRE-EXISTING" IS NOT "TRACKED".** A failure that is not yours still
+> needs an owner. Open the cited goal and confirm it names the failing TESTS; a
+> shared file path is not ownership.
 
-The daemon-safe full suite takes ~32min (measured: 1916s; 2231 passed / 2 failed
-/ 1 skipped over 2234 selected). The runtime concentrates in a handful of
-subprocess/integration tests that shell out to real git/bash/filesystem ops
-under OneDrive contention — NOT primarily the daemon round-trips one might
-assume. The slowest 20 sum ~880s (~46% of total) over <1% of tests: `test_promote`
-seed-preflight/PR dry-runs (139s + 135s), `test_utilization_stats` real-repo
-audit (77s), `test_orphan_root_sweep_mode_d_integration` filesystem scans (~180s
-across 5), `test_post_state_update_gate_committed_files_only` daemon round-trips
-(~60s across 3). Three traps make a healthy-but-slow run look hung — know them
+A long suite run has three traps that make a healthy run look hung. Know them
 before you kill a run or file a false "suite hangs" blocker:
 
-1. **Collection is silent for >50s** before the first result (heavy
-   module-level imports across 265 files). "No output yet" in the first minute
-   is NOT a hang — wait past collection before suspecting trouble.
-2. **Do NOT pipe a live run through `tail`** — `tail -f` (and most pipe
-   buffering) holds output until EOF on Windows, so you see nothing until the
-   run finishes, defeating the point. Instead redirect to a file and Read that
-   file directly (the Read tool shows partial content mid-run), forcing
-   unbuffered flushes so per-test dots land immediately:
+1. **Collection is silent for >50s** before the first result. "No output yet"
+   in the first minute is NOT a hang.
+2. **Do NOT pipe a live run through `tail`.** Pipe buffering can hold output
+   until EOF (notably on Windows). Redirect to a file and Read that file directly,
+   since the Read tool shows partial content mid-run. Use unbuffered flushes:
    ```
    STORAGE_BACKEND=local PYTHONUNBUFFERED=1 python -u -m pytest core/scripts/tests -m "not daemon_integration" \
      > /tmp/suite-$MIND_AGENT.log 2>&1
@@ -508,85 +285,58 @@ before you kill a run or file a false "suite hangs" blocker:
    Then Read `/tmp/suite-$MIND_AGENT.log` — NEVER a synced path (guard-6416).
    `-v` gives one line per test.
 3. **A backgrounded run persists — don't trust a waiter or empty task-stdout to
-   say otherwise.** Under g-115-1496 the suite was backgrounded and ran to
-   completion (1916s) across turns — it was NOT killed. But a bounded waiter
-   loop timed out at ~12.5min ("may be hung") because the suite needs ~32min,
-   and the background task's own stdout looked empty because output went to the
-   redirect file. Both signals falsely read as "dead." Ground truth was the
-   redirect file, which accumulated steady progress the whole time. So: set any
-   waiter bound LONGER than the measured ~32min runtime, and never conclude
-   "hung/killed" from a waiter timeout or empty task-stdout alone — Read the
-   redirect file (`verify-before-assuming.md`: one signal is not enough for a
-   negative conclusion). Foreground-in-one-turn is also fine (the Bash tool
-   auto-backgrounds >2min commands but keeps them bound to the turn).
+   say otherwise.** Set any waiter bound LONGER than the run's measured runtime.
+   Never conclude "hung/killed" from a waiter timeout or empty task-stdout alone:
+   Read the redirect file (`verify-before-assuming.md`). Foreground-in-one-turn is
+   also fine, because the Bash tool auto-backgrounds >2min commands but keeps
+   them bound to the turn.
 
-4. **Sanctioned pacing for an in-turn wait: `EXTERNAL_WAIT=1` (g-115-2678).**
-   NEVER launch the suite with `run_in_background` — the Bash `timeout` caps at
-   600000ms and kills the whole tree mid-chunk, leaving a log with no VERDICT
-   that is byte-identical to one still running (guard-6148, measured 2026-09-06;
-   it retired the prior "reducer backgrounds it, harness notifies" instruction
-   here). Detach instead: `nohup env MIND_AGENT=.. MIND_SID=.. STORAGE_BACKEND=local
-   bash core/scripts/run-full-suite.sh > LOG 2>&1 < /dev/null &`. That shape
-   commits you to two things: the `< /dev/null`, or an inherited never-EOF stdin
-   degrades the run into zero-shaped output (guard-5140); and POLLING via
-   ScheduleWakeup, because detaching forfeits the completion notification — that
-   is schedule-wakeup-correctness Anti-pattern D (an untracked external wait),
-   NOT the Anti-pattern A prohibition, which covers only harness-TRACKED jobs.
-   Never combine the two shapes (guard-3892). **A WORKER MUST NOT — it VOIDS the
-   run; use item 3's in-turn route** (`rationale/suite-run-voided-by-loop-merge.md`).
-   To pace an in-turn sleep, use the flag: `EXTERNAL_WAIT=1 bash
-   core/scripts/interruptible-sleep.sh <seconds>`. A BARE interruptible-sleep
-   registers no background job, so `background-jobs.sh has-pending` returns rc=1,
-   stop-hook Gate 2.6 BLOCKs the turn-end, and the loop busy-spins (~20 turns
-   over a 32min wait — the incident that motivated the flag). `EXTERNAL_WAIT=1`
-   registers a Tier-A `external-wait-sleep` job so Gate 2.6 ALLOWs the turn-end
-   and the sleep paces its full duration. Never pace a mid-goal external wait
-   with a bare sleep.
+**Sanctioned pacing for an in-turn wait: `EXTERNAL_WAIT=1` (g-115-2678).**
+NEVER launch the suite with `run_in_background`. The Bash `timeout` caps at
+600000ms and kills the whole tree mid-chunk, leaving a log with no VERDICT that
+is byte-identical to one still running (guard-6148). Detach instead:
+`nohup env MIND_AGENT=.. MIND_SID=.. STORAGE_BACKEND=local bash
+core/scripts/run-full-suite.sh > LOG 2>&1 < /dev/null &`. That shape commits you
+to two things. First, the `< /dev/null`: an inherited never-EOF stdin degrades
+the run into zero-shaped output (guard-5140). Second, POLLING via ScheduleWakeup,
+because detaching forfeits the completion notification. That polling is
+schedule-wakeup-correctness Anti-pattern D (an untracked external wait), NOT the
+Anti-pattern A prohibition, which covers only harness-TRACKED jobs. Never combine
+the two shapes (guard-3892). **A WORKER MUST NOT DETACH: it VOIDS the run. Use
+trap 3's in-turn route** (`rationale/suite-run-voided-by-loop-merge.md`).
+To pace an in-turn sleep, use `EXTERNAL_WAIT=1 bash
+core/scripts/interruptible-sleep.sh <seconds>`. A BARE interruptible-sleep
+registers no background job, so `background-jobs.sh has-pending` returns rc=1.
+Stop-hook Gate 2.6 then BLOCKs the turn-end and the loop busy-spins.
+`EXTERNAL_WAIT=1` registers a Tier-A `external-wait-sleep` job, so Gate 2.6
+ALLOWs the turn-end and the sleep paces its full duration. Never pace a mid-goal
+external wait with a bare sleep.
 
-The hang itself is now bounded by `faulthandler_timeout = 600` +
-`faulthandler_exit_on_timeout = true` in `pytest.ini` (g-115-1496): any single
-test exceeding 600s (10min — well past the 139.61s slowest legit test) dumps
-all-thread tracebacks and aborts the process, so a true hang fails loud with a
-stack pointing at the stall instead of buffering forever.
+A true hang is bounded by `faulthandler_timeout = 600` +
+`faulthandler_exit_on_timeout = true` in `pytest.ini` (g-115-1496). Any single
+test that runs past 600s dumps all-thread tracebacks and aborts, so it fails loud.
 
 ### Live-Fleet Exception — chunk the run, or the result is garbage (g-115-3085, 2026-07-25)
 
 Sibling to the Live-Daemon Exception above, and independent of it. Running the
-~5,200-test suite in ONE process while the live fleet is running on the same
-Windows box exhausts Windows process/desktop-heap resources partway through.
-Spawns then fail with **rc=3221225794 (`0xC0000142` STATUS_DLL_INIT_FAILED)** —
-even `git init` fails — and the run reports hundreds of bogus failures.
-
-Measured: one contended run reported **564 failed / 4,672 passed**. The same
-tree, re-measured properly, was clean. `test_release.py` alone accounted for 37
-of those failures and passes **88/88 when run by itself**.
+whole suite in ONE process while the live fleet runs on the same Windows box
+exhausts process/desktop-heap resources partway through. Spawns then fail with
+**rc=3221225794 (`0xC0000142` STATUS_DLL_INIT_FAILED)**, even `git init`, and the
+run reports hundreds of bogus failures that look completely real up close.
 
 **Never conclude a regression from a large failure count without running these
-two discriminators first** — the failures look completely real up close:
+two discriminators first:**
 
 1. **Bucket failures by position in the run.** Progressive exhaustion shows
-   ZERO failures early and 20%+ late. Measured distribution of the 564: 0
-   failures across the first 1,368 tests, then 19–27% in the final decile. A
-   genuine regression fails from the START (changed scripts are used
-   throughout), so an all-late profile is near-conclusive evidence of
-   exhaustion, not code.
+   ZERO failures early and 20%+ late. A genuine regression fails from the START,
+   so an all-late profile is near-conclusive evidence of exhaustion, not code.
 2. **Re-run the worst-hit file alone.** Green solo ⇒ the failures were
    environmental.
 
-**Remedy — run the suite as ~4 sequential chunks in FRESH processes**, which
-resets accumulated handles per chunk (a single process cannot recover them):
-
-```bash
-ls core/scripts/tests/test_*.py | sort > /tmp/all-tests.txt
-split -n l/4 -d /tmp/all-tests.txt /tmp/chunk-
-for c in 00 01 02 03; do
-  STORAGE_BACKEND=local python -m pytest $(cat /tmp/chunk-$c | tr '\n' ' ') \
-    -q -m "not daemon_integration" > /tmp/chunk-$c.log 2>&1
-  tail -1 /tmp/chunk-$c.log
-done
-```
-
-Or wait for a quiet window with the fleet stopped. Enforced by `guard-1448`.
+**Remedy: chunks in FRESH processes**, which `run-full-suite.sh` already does
+(a single process cannot recover the handles; the manual recipe is in the
+rationale). Or wait for a quiet window with the fleet stopped. Enforced by
+`guard-1448`.
 
 ## Required Full-Suite Commands (per code area)
 
@@ -594,12 +344,12 @@ Or wait for a quiet window with the fleet stopped. Enforced by `guard-1448`.
 
 | Path touched | Full-suite command | Pass criterion |
 |---|---|---|
-| `core/scripts/*.py` (non-test) | `bash core/scripts/run-full-suite.sh` (covers `core/scripts/tests` + `core/tests/gates` + the invisible and domain halves; NOT `mind_api/tests`). The narrower `python -m pytest core/scripts/tests -q` is fine for a targeted re-run but is NOT sufficient for a closure claim — see § Scope: THREE testpaths. | exit code 0, all collected tests pass |
-| `core/scripts/gates/capability.py`, `capability-gate.py`, or the defer→Unblock path in `aspirations.py` | ALSO run `bash core/scripts/tests/run-asp-257-suite.sh` — 4 of its 6 suites are `main()`-style files pytest collects 0 tests from, so pytest-green says NOTHING about them (they sat red 3 days undetected, masking a real NameError — g-115-2343 / rb-3678) | aggregator prints `6/6 suites passed` |
-| Any change whose test coverage lives in a pytest-INVISIBLE file — a `main()`-style `.py` (no top-level `def test_`) **or any `.sh`, which pytest cannot collect at all**. Measured 2026-07-29 (cc-05): 71 `.py` + 19 shell = 90 files. Do not trust that count; re-derive with `bash core/scripts/tests/run-invisible-suites.sh --list`, which prints the split. | `bash core/scripts/tests/run-invisible-suites.sh` — dynamic population runner; known-reds are quarantined inline with their tracking goal IDs (g-115-2349 baseline sweep found 9 silent reds of 69). **Since g-115-3957 this runner is invoked automatically by `core/scripts/run-full-suite.sh`**, so a full-suite run already covers it; invoke it directly only when you want the invisible half alone. | runner exits 0 (`N/N files passed, M quarantined`) |
-| `mind_api/src/*.py` | `STORAGE_BACKEND=local python -m pytest mind_api/tests -q -m "not daemon_integration"` — ~1,386 tests that test this code directly (the fast targeted arm). Since 2026-08-20 (g-115-6942) `run-full-suite.sh` also collects this tree in its chunked pool, so a green full-suite run IS evidence about `mind_api/src`; before that it was deferred and this command was the whole coverage (g-115-3748 history in § Scope: THREE testpaths). | exit 0 |
+| `core/scripts/*.py` (non-test) | `bash core/scripts/run-full-suite.sh` (covers all three testpaths + the invisible and domain halves). The narrower `python -m pytest core/scripts/tests -q` is fine for a targeted re-run but is NOT sufficient for a closure claim — see § Scope: THREE testpaths. | exit code 0, all collected tests pass |
+| `core/scripts/gates/capability.py`, `capability-gate.py`, or the defer→Unblock path in `aspirations.py` | ALSO run `bash core/scripts/tests/run-asp-257-suite.sh` — 4 of its 6 suites are `main()`-style files pytest collects 0 tests from, so pytest-green says NOTHING about them (g-115-2343 / rb-3678) | aggregator prints `6/6 suites passed` |
+| Any change whose test coverage lives in a pytest-INVISIBLE file — a `main()`-style `.py` (no top-level `def test_`) **or any `.sh`, which pytest cannot collect at all**. List them with `bash core/scripts/tests/run-invisible-suites.sh --list`. | `bash core/scripts/tests/run-invisible-suites.sh` — dynamic population runner; known-reds are quarantined inline with their tracking goal IDs. `run-full-suite.sh` invokes it automatically (g-115-3957); run it directly only when you want the invisible half alone. | runner exits 0 (`N/N files passed, M quarantined`) |
+| `mind_api/src/*.py` | `STORAGE_BACKEND=local python -m pytest mind_api/tests -q -m "not daemon_integration"` — the fast targeted arm. `run-full-suite.sh` also collects this tree (g-115-6942), so a green full-suite run IS evidence about `mind_api/src`. | exit 0 |
 | `core/scripts/*.sh` (production wrapper) | Whatever the wrapper's daemon endpoint suite covers — typically `python -m pytest core/scripts/tests -q -k <endpoint>` | exit 0 |
-| `.claude/skills/*/SKILL.md` | Re-read the edited pseudocode + `bash core/scripts/domain-leak-check.sh`; if the change alters skill BEHAVIOR (not just prose), also `/verify-learning` for cross-skill grep checks. For BULK prose edits (extraction/reflow passes) ALSO run `py -3 core/scripts/line-class-diff-check.py <paths>` — report-only, per-class set-diff vs HEAD. g-115-7706: a bulk pass relocated front matter, 8 blockquotes and 10 bold directives in start/SKILL.md while 94 targeted tests, domain-leak-check AND the pre-completion re-read were all green. (Do NOT use `skill-evaluate.sh` here. A bare `skill-evaluate.sh <skill-name>` errors `unknown subcommand`: it needs a subcommand (read/report/underperforming/score), and `score --skill <s> --goal <g>` rates RUNTIME skill-on-goal performance, not a static SKILL.md edit.) | re-read confirms intent; domain-leak-check clean; verify-learning passes if behavior changed; line-class diff reports no class removals |
+| `.claude/skills/*/SKILL.md` | Re-read the edited pseudocode + `bash core/scripts/domain-leak-check.sh`; if the change alters skill BEHAVIOR (not just prose), also `/verify-learning` for cross-skill grep checks. For BULK prose edits (extraction/reflow passes) ALSO run `py -3 core/scripts/line-class-diff-check.py <paths>` — report-only, per-class set-diff vs HEAD (g-115-7706: a bulk pass relocated front matter, blockquotes and bold directives while targeted tests, domain-leak-check AND the re-read were all green). Do NOT use `skill-evaluate.sh` here: it rates RUNTIME skill-on-goal performance, not a static SKILL.md edit. | re-read confirms intent; domain-leak-check clean; verify-learning passes if behavior changed; line-class diff reports no class removals |
 | `.claude/rules/*.md` | No automated check — re-read the rule and confirm wording matches intent | manual review |
 | `core/config/*.yaml` / `core/config/*.md` | Re-parse via affected consumers — `bash core/scripts/<consumer>.sh --dry-run` if available, otherwise `python -c "import yaml; yaml.safe_load(open('<path>'))"` | parse succeeds, no schema break |
 | **External domain + meta paths** — `world/scripts/**`, `world/conventions/**`, `meta/**`. Neither git-tracked framework nor a sibling product repo. | `STORAGE_BACKEND=local python3 -m pytest "$WORLD_PATH/scripts/tests" -q` (pin mandatory — guard-955), or the world's `run-domain-tests.sh` hook. **ENFORCED at close (g-353-75)**: `domain-suite-gate.py` in `iteration-close.sh do_verify` refuses `status=completed` when a code file under `$WORLD_PATH/scripts` is newer than the goal's claim and that suite is NEWLY red (per-box ratchet) or uncollectable (`--override-domain-suite "<why>"`, logged). **`full-suite-recommender.sh` CANNOT SEE THESE PATHS** (external, gitignored; it detects changes via git): its `no code changes detected` there means "I cannot see", not "nothing changed" — say the recommender was *blind*, not quiet (guard-1947; read-side inverse of rb-1699). | domain pytest exits 0; shell units pass except pre-existing environment-gated quarantines, which must be named |
@@ -626,15 +376,9 @@ fires BEFORE Phase 5 verify, in the window where false claims would land.
 `phase_4_completed_at`). The banner lists detected file changes per
 area and the recommended full-suite commands. The gate is ADVISORY
 ONLY — it exits 0 unconditionally. The LLM is expected to act on the
-banner BEFORE Phase 5.
-
-The advisory posture mirrors the pre-apply consult gate (g-115-826):
-visibility beats fail-loud here, because (a) running a 60-test Python
-suite or a `./gradlew test --no-daemon` is a 30s–5min wall-clock cost
-that should be a deliberate LLM choice, not an automatic forced run on
-every deep closure; (b) some deep closures are documentation-only
-("modified SKILL.md but the change is pure narrative") where the suite
-add no signal.
+banner BEFORE Phase 5. The posture mirrors the pre-apply consult gate
+(g-115-826): a suite run is a deliberate LLM choice, not an automatic forced run
+on every deep closure.
 
 ## Anti-patterns
 
@@ -665,6 +409,8 @@ add no signal.
 - `.claude/rules/verify-before-assuming.md` — "all tests pass" without
   the full-suite run is an unverified positive claim.
 - `core/scripts/full-suite-recommender.sh` / `.py` — the advisory gate.
+- `core/config/rationale/run-full-suite-after-deep-code.md` — the incidents and
+  measurements behind every section (extracted by g-353-118).
 - `core/config/run-full-suite-baselines.md` — the dated per-run ledger
   (box, kernel, chunk rung, VERDICT, TOTAL) extracted from this rule
   2026-08-17. The rule keeps the METHOD; the ledger keeps the EVIDENCE. Add

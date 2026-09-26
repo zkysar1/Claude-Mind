@@ -444,8 +444,15 @@ FAILED_RETRY_CMDS=""   # one exact retry command per failed phase, newline-separ
 #                         (current + 1), so a blind re-run double-counts
 #   PY_RC              -- consumed at the bottom of this file; pre-seeded so an
 #                         early-returning finalize_counters() cannot trip `set -u`
+#   INTERVAL_REVIEW    -- : the review finalize_counters renders when
+#                         this close's own tuner MOVED the goal's persisted
+#                         interval_hours; empty on every close where nothing moved
+#   INTERVAL_REVIEW_PRINTED -- set once the terminal region prints the review, so
+#                         the EXIT trap prints it only when no terminal form did
 COUNTERS_OWED=0
 COUNTERS_FINALIZED=0
+INTERVAL_REVIEW=""
+INTERVAL_REVIEW_PRINTED=0
 PY_RC=0
 
 run_phase() {
@@ -524,6 +531,12 @@ _recurring_close_on_exit() {
             echo "[recurring-close] ABORT-PATH FINALIZE (g-115-8668): the normal path never reached the g-317-02 counter block; the EXIT trap is writing all seven fields now. exit_rc=$_rc" >&2
         fi
         finalize_counters || true
+        # : a run that dies before any terminal form printed the
+        # interval review would drop it. Every terminal form sets
+        # INTERVAL_REVIEW_PRINTED first, so a normal exit never repeats it.
+        if [[ -n "${INTERVAL_REVIEW:-}" && "${INTERVAL_REVIEW_PRINTED:-0}" != "1" ]]; then
+            printf '%s\n' "$INTERVAL_REVIEW" >&2
+        fi
     fi
     [[ -n "$FAILED_PHASE" ]] && echo "[recurring-close] ABORT during: $FAILED_PHASE" >&2
     return $_rc
@@ -633,7 +646,16 @@ else
 fi
 
 NOW="$(date +%Y-%m-%dT%H:%M:%S)"
-GID="$GOAL_ID" SF="$SRC_FILE" OUTCOME="$OUTCOME" OUTCOME_ORIGIN="$OUTCOME_ORIGIN" SRC_FLAG="$SOURCE" SD="$SCRIPT_DIR" NOW="$NOW" python3 - <<'PYEOF'
+# : the heredoc renders an interval-move review into this file; it is
+# read back into INTERVAL_REVIEW below and printed before every terminal form.
+local _irf
+_irf="$(mktemp)" || _irf=""
+# Same MSYS conversion as SCRIPT_DIR above (): _platform.sh exports
+# MSYS_NO_PATHCONV=1, so a raw /tmp/... would reach Windows Python unconverted.
+if [ -n "$_irf" ] && [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
+    _irf="$(cygpath -m "$_irf")"
+fi
+GID="$GOAL_ID" SF="$SRC_FILE" OUTCOME="$OUTCOME" OUTCOME_ORIGIN="$OUTCOME_ORIGIN" SRC_FLAG="$SOURCE" SD="$SCRIPT_DIR" NOW="$NOW" INTERVAL_REVIEW_FILE="$_irf" python3 - <<'PYEOF'
 import json, os, subprocess, sys
 from pathlib import Path
 import yaml
@@ -657,6 +679,7 @@ current_deep = 0
 current_sub_hits = 0
 current_sub_runs = 0
 has_pull_signal = False   # : only CLEAR what is actually set
+interval_before = None    # : captured BEFORE either tuner can write it
 with open(sf, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
@@ -670,6 +693,7 @@ with open(sf, "r", encoding="utf-8") as f:
                 current_sub_hits = int(g.get("substantive_hits", 0))
                 current_sub_runs = int(g.get("substantive_runs", 0))
                 has_pull_signal = g.get("pull_signal") is not None
+                interval_before = g.get("interval_hours")
                 break
 
 new_val = current + 1 if outcome == "routine" else 0
@@ -821,6 +845,7 @@ import _paths
 with open(_paths.CONFIG_DIR / "aspirations.yaml", encoding="utf-8") as cf:
     cfg = yaml.safe_load(cf) or {}
 threshold = int(cfg["recurring"]["cargo_cult_threshold"])
+tuner = None  # : (name, streak) of a tuner below that can write interval_hours
 
 print(f"[recurring-close] {gid}: outcome={outcome} consecutive_routine={new_val} threshold={threshold}")
 
@@ -914,6 +939,7 @@ if outcome == "routine" and new_val >= threshold:
                   f"{det.stderr}", file=sys.stderr)
     else:
         # Legacy per-goal path (batch_audit_dedupe_hours=0 or missing).
+        tuner = ("auto-extend", f"consecutive_routine={new_val}")
         det = subprocess.run(
             [sys.executable, str(sd / "cargo-cult-detector.py"), gid, "--source", src],
             capture_output=True, text=True, encoding="utf-8",
@@ -931,6 +957,7 @@ if outcome == "routine" and new_val >= threshold:
 contract_threshold = int(cfg["recurring"].get(
     "deep_streak_contract_threshold", 3))
 if outcome == "deep" and new_deep >= contract_threshold:
+    tuner = ("auto-contract", f"consecutive_deep={new_deep}")
     det = subprocess.run(
         [sys.executable, str(sd / "cargo-cult-detector.py"), gid,
          "--source", src, "--contract-mode"],
@@ -942,8 +969,90 @@ if outcome == "deep" and new_deep >= contract_threshold:
     else:
         print(f"[recurring-close] cargo-cult-detector --contract-mode "
               f"failed: {det.stderr}", file=sys.stderr)
+
+# ─── : the READER for the two tuners above ───
+# Each tuner prints one line when it moves interval_hours, and nothing consumed
+# it: a directive-set cadence was lowered and restored by hand three times,
+# caught only when an agent happened to read a long close's stdout. So compare
+# the PERSISTED value across the tuner step (never the detector's wording: a
+# write whose line never printed would pass unseen) and hand bash a review that
+# it prints before every terminal form, with the NEXT ACTION line pointing at
+# it. Two questions, because a contraction can be wrong for two independent
+# reasons and the interval_pinned_by pin answers only the first.
+# Fail-open: the review can never break the close it rides on (guard-142).
+if tuner is not None:
+    name, streak = tuner
+    try:
+        found, interval_after, original_after = False, None, None
+        with open(sf, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                for g in json.loads(line).get("goals", []):
+                    if g.get("id") == gid:
+                        found = True
+                        interval_after = g.get("interval_hours")
+                        original_after = g.get("original_interval_hours")
+                        break
+                if found:
+                    break
+    except Exception as e:
+        print(f"[recurring-close] interval review SKIPPED for {gid}: could not "
+              f"re-read the store after {name} ({e})", file=sys.stderr)
+    else:
+        def _num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        b, a = _num(interval_before), _num(interval_after)
+        if not found or b is None or a is None:
+            print(f"[recurring-close] interval review SKIPPED for {gid}: no numeric "
+                  f"interval_hours to compare across {name} (before="
+                  f"{interval_before!r}, after={interval_after!r}, found={found})",
+                  file=sys.stderr)
+        elif a != b:
+            orig = original_after if original_after is not None else "unset"
+            lines = [
+                f"⚠ INTERVAL MOVED — {gid} interval_hours {interval_before}h -> "
+                f"{interval_after}h across this close's {name} step ({streak}, "
+                f"original_interval_hours={orig}). A tuner changed a cadence and "
+                f"nothing else reads this (g-115-6612): answer before you leave "
+                f"this close.",
+                f"  Q1: was {interval_before}h a HUMAN decision (a directive, a user "
+                f"ruling)? YES -> restore it AND pin it: set interval_pinned_by to "
+                f"that directive's id, which both tuners refuse to cross.",
+            ]
+            if name == "auto-contract":
+                lines.append(
+                    "  Q2 (guard-3060): if this goal had been the ONLY thing you did, "
+                    "would its OWN reading have taught you anything new? NO -> the "
+                    "deep streak belonged to the iteration around it, not to this "
+                    "goal (guard-2406): restore.")
+            lines.append(
+                f"  Restore: bash core/scripts/aspirations-update-goal.sh --source "
+                f"{src} {gid} interval_hours {interval_before}")
+            lines.append("  Otherwise the tuner was right: change nothing.")
+            review = "\n".join(f"[recurring-close] {l}" for l in lines)
+            wrote = False
+            review_file = os.environ.get("INTERVAL_REVIEW_FILE", "")
+            if review_file:
+                try:
+                    with open(review_file, "w", encoding="utf-8") as rf:
+                        rf.write(review + "\n")
+                    wrote = True
+                except OSError as e:
+                    print(f"[recurring-close] interval review file unwritable "
+                          f"({e}); printing it here instead", file=sys.stderr)
+            if not wrote:
+                print(review)
 PYEOF
 PY_RC=$?
+if [[ -n "$_irf" ]]; then
+    INTERVAL_REVIEW="$(cat "$_irf")"
+    rm -f "$_irf"
+fi
 }
 
 # Normal path: run it here, exactly where it always ran. The EXIT trap's call is
@@ -1272,6 +1381,20 @@ fi
 # the guard-2104 loss-bearing overwrite of whatever the early write — or a peer
 # close — legitimately put there.
 
+# INTERVAL-MOVE REVIEW (). finalize_counters fills INTERVAL_REVIEW only
+# when this close's own tuner MOVED the goal's persisted interval_hours. It prints
+# ONCE, here, ahead of the landing check and the worker/reducer dispatch below, so
+# every terminal form carries it (rb-11640), and _review_gate folds a pointer to it
+# into each NEXT ACTION line. On every close where nothing moved both are empty,
+# and the output is byte-identical to before.
+_review_gate=""
+if [[ -n "$INTERVAL_REVIEW" ]]; then
+    echo ""
+    printf '%s\n' "$INTERVAL_REVIEW"
+    INTERVAL_REVIEW_PRINTED=1
+    _review_gate=" (settle the INTERVAL MOVED review above first)"
+fi
+
 # STATE-MISMATCH LANDING () — mirror of iteration-close.sh. If agent-state
 # left RUNNING under this loop (recovery-gate yank, or /stop from another window)
 # the landing script tries the yank reversal for THIS sid and, failing that,
@@ -1314,7 +1437,7 @@ if [[ "${BODY_ROLE:-}" == "worker" ]]; then
         echo "[recurring-close] ⚠ PHASE FAILURE — MAX_RC=$MAX_RC — failed: ${FAILED_PHASES% } — phases: ${PHASE_RESULTS% }"
         echo "[recurring-close] This close did NOT fully apply. Re-run the failed phase(s) — a stale lastAchievedAt re-ranks the goal MAXIMALLY overdue (g-115-5187) — then re-enter your worker loop via the terminal below."
     fi
-    echo "[recurring-close] OUTCOME=$OUTCOME (worker Body) — NEXT ACTION REQUIRED: the reducer re-entry (spark, the autonomous-loop net, the reducer loop skill) is FORBIDDEN to a worker; your terminal is the worker net + Skill(worker-loop):"
+    echo "[recurring-close] OUTCOME=$OUTCOME (worker Body) — NEXT ACTION REQUIRED${_review_gate:-}: the reducer re-entry (spark, the autonomous-loop net, the reducer loop skill) is FORBIDDEN to a worker; your terminal is the worker net + Skill(worker-loop):"
     bash "$SCRIPT_DIR/deadman-directive.sh" --role worker
 else
 if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
@@ -1326,7 +1449,7 @@ if [ -f "$AGENT_DIR/session/deadman-disabled" ]; then
     fi
 else
     _dm_tag=" (deadman-switch ON)"
-    _dm_pair="emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600), the self-resurrection net, do NOT omit it; THEN (2) Skill(aspirations) with args='loop' (the LAST call). Skill ALONE keeps THIS iteration alive but leaves the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
+    _dm_pair="emit the deadman pair as the loop re-entry (BOTH calls MANDATORY, in this order) — (1) ScheduleWakeup(prompt='<<autonomous-loop-dynamic>>', delaySeconds=600, noop=false, reason='deadman resurrection net'), the self-resurrection net (noop and reason REQUIRED unless stop:true or the harness refuses the arm and NO net is set — g-115-10755), do NOT omit it; THEN (2) Skill(aspirations) with args='loop' (the LAST call). Skill ALONE keeps THIS iteration alive but leaves the NEXT unprotected against a silent text-death — arm the net EVERY iteration"
     if [[ "$OUTCOME" == "deep" ]]; then
         _next_action="Call Skill(aspirations-spark) FIRST (Phase 6 fires on deep; NOT wrapped by recurring-close.sh), THEN ${_dm_pair}."
     else
@@ -1355,10 +1478,10 @@ if [[ $MAX_RC -ne 0 ]]; then
         [[ -n "$_cmd" ]] && echo "[recurring-close]        $_cmd"
     done
     echo "[recurring-close]   2. Read the goal back and assert lastAchievedAt falls inside THIS iteration. An UNMOVED lastAchievedAt is positive proof the retry cannot double-count, so the retry is safe (guard-1185)."
-    echo "[recurring-close]   3. ONLY once the retry succeeds, re-enter the loop: OUTCOME=$OUTCOME$_dm_tag — $_next_action"
+    echo "[recurring-close]   3. ONLY once the retry succeeds, re-enter the loop${_review_gate:-}: OUTCOME=$OUTCOME$_dm_tag — $_next_action"
     echo "[recurring-close]   If the retry keeps failing, file it rather than looping — a repeat here is a real blocker, not contention."
 else
-    echo "[recurring-close] OUTCOME=$OUTCOME$_dm_tag — NEXT ACTION REQUIRED: $_next_action"
+    echo "[recurring-close] OUTCOME=$OUTCOME$_dm_tag — NEXT ACTION REQUIRED${_review_gate:-}: $_next_action"
 fi
 fi
 echo "[recurring-close] A Bash echo or text summary as the terminal action kills the loop (see .claude/rules/return-protocol.md)."

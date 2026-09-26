@@ -585,3 +585,133 @@ def test_F11_a_pre_existing_single_object_ledger_migrates_without_loss(tmp_path)
     assert trail[0]["reviewer"] == "prior-reviewer", "legacy verdict destroyed by migration"
     assert trail[0]["findings"] == ["kept"]
     assert trail[1]["reviewer"] == "newcomer"
+
+
+# ─── : citation attestation, and short-sha identity ──────────────────
+#
+# A source that CITES an id it leans on is not asking the artifact to carry it,
+# so a verbatim miss there is not the founding defect. The reviewer may attest
+# that, per id with a role reason; the machine refuses the attestation under the
+# substitution signature, where the "missing" ids are replaced identities.
+
+CITING_SOURCE = ("Close g-900-02 and g-900-03, following guard-9001 and the "
+                 "precedent in rb-9001.")
+FULL_SHA = "a5746b9656c0ffee1234567890abcdef12345678"
+
+
+def _crv():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("crv_g37526", PRODUCER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_attested_citations_release_an_approve_that_is_refused_without_them(tmp_path):
+    """The WITH/WITHOUT pair on the canonical entry point (guard-4869): the flag
+    must change the outcome on the surface reviewers actually call."""
+    src = tmp_path / "citing.txt"
+    src.write_text(CITING_SOURCE, encoding="utf-8")
+    base = ["--goal", "g-cite", "--reviewer", "peer", "--closer", "alpha",
+            "--source-file", str(src),
+            "--artifact-file", str(_fixture(tmp_path, ["g-900-02", "g-900-03"])),
+            "--approve"]
+
+    without = _run(tmp_path, *base)
+    assert without.returncode == 1, without.stdout + without.stderr
+    assert "REFUSING to write APPROVE" in without.stderr
+
+    with_ = _run(tmp_path, *base,
+                 "--citation", "guard-9001=the rule the fix follows",
+                 "--citation", "RB-9001=precedent cited, not a deliverable",
+                 "--citation", "g-999-99=not in the diff at all")
+    assert with_.returncode == 0, with_.stdout + with_.stderr
+    payload = json.loads(with_.stdout)
+    fid = payload["fidelity"]
+    assert payload["verdict"] == "APPROVE" and fid["passed"] is True
+    assert fid["missing"] == []
+    assert fid["citations_attested"] == {
+        "guard-9001": "the rule the fix follows",
+        "rb-9001": "precedent cited, not a deliverable"}
+    assert fid["citations_unmatched"] == ["g-999-99"]
+    # guard-3743: missing + attested reproduces the pre-attestation miss.
+    assert sorted(fid["missing"] + list(fid["citations_attested"])) == \
+        sorted(set(fid["source_entities"]) - set(fid["artifact_entities"]))
+    # An attestation is always SAID, never a silent exemption.
+    assert any("ATTESTED" in f and "guard-9001" in f for f in payload["findings"])
+    # Ids are normalised inside source_fidelity, so an in-process caller agrees.
+    assert _crv().source_fidelity(CITING_SOURCE, "g-900-02 g-900-03",
+                                  {"GUARD-9001": "r", "RB-9001": "r"})["passed"] is True
+
+
+def test_attestation_is_REFUSED_under_the_substitution_signature(tmp_path):
+    """The founding shape, 6 missing and 6 invented: attesting every missing id
+    as a 'citation' must still be refused — it cannot launder a substitution."""
+    missing = sorted(set(SOURCE_ENTITIES) - set(ARTIFACT_ENTITIES))
+    cites = [a for m in missing for a in ("--citation", f"{m}=only a citation")]
+    r = _run(tmp_path, "--goal", "g-subst", "--reviewer", "peer", "--closer", "alpha",
+             "--source-file", str(_source(tmp_path)),
+             "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+             "--approve", "--write", *cites)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "REFUSING to write APPROVE" in r.stderr
+    assert "attestation REFUSED" in r.stderr
+    assert not _verdict_file(tmp_path, "g-subst").exists()
+
+    fid = _crv().source_fidelity(COACH_SOURCE, " ".join(ARTIFACT_ENTITIES),
+                                 {m: "only a citation" for m in missing})
+    assert fid["substitution_signature"] is True and fid["passed"] is False
+    assert fid["citations_refused"] == missing
+    assert fid["missing"] == missing and "citations_attested" not in fid
+
+
+def test_a_short_sha_and_the_full_sha_it_prefixes_are_one_identity():
+    """Both directions match, and named_entities itself is UNCHANGED — the
+    identity lives in the diff, because the tier classifier shares the regex."""
+    crv = _crv()
+    short = FULL_SHA[:7]
+    for src, art in ((f"shipped {FULL_SHA}", f"landed {short}"),
+                     (f"shipped {short}", f"landed {FULL_SHA}")):
+        fid = crv.source_fidelity(src, art)
+        assert fid["passed"] is True, fid
+        assert fid["missing"] == [] and fid["invented"] == []
+        assert len(fid["sha_identity"]) == 1
+    assert named_entities(f"{short} {FULL_SHA}") == {short, FULL_SHA}
+
+
+def test_sha_identity_does_not_match_numbers_or_ambiguous_prefixes():
+    crv = _crv()
+    # A 7-digit run "prefixing" a date is not an abbreviation.
+    fid = crv.source_fidelity("on 2026092", "on 20260924")
+    assert fid["missing"] == ["2026092"] and "sha_identity" not in fid
+    # A prefix of two DIVERGING shas identifies neither — from either end, so
+    # the record never pairs a token it also reports missing.
+    a, b = "abcdef1" + "0" * 33, "abcdef1" + "1" * 33
+    fid = crv.source_fidelity("cut abcdef1", f"{a} and {b}")
+    assert fid["missing"] == ["abcdef1"] and fid["passed"] is False
+    assert fid["invented"] == [a, b] and "sha_identity" not in fid
+
+
+def test_sha_identity_resolves_against_the_whole_other_side():
+    """The fresh-eyes shapes (msg-20260926-055210-zeta-3180): a full sha present
+    on BOTH sides, several abbreviations of one sha, and an all-digit prefix.
+    Each is one identity; resolving only against the set-difference, or
+    demanding a unique pair, failed all but the last."""
+    crv = _crv()
+    short, short8 = FULL_SHA[:7], FULL_SHA[:8]
+    for src, art in ((f"see {short} ({FULL_SHA})", f"landed {FULL_SHA}"),
+                     (f"see {short} and {short8}", f"landed {FULL_SHA}"),
+                     (f"see {FULL_SHA}", f"landed {short} and {short8}"),
+                     ("at 1234567", "at 1234567" + "a" * 33)):
+        fid = crv.source_fidelity(src, art)
+        assert fid["passed"] is True and fid["invented"] == [], (src, art, fid)
+
+
+@pytest.mark.parametrize("bad", ["guard-9001", "guard-9001=", "=a reason",
+                                 "guard-9001=two\nlines"])
+def test_a_malformed_citation_is_refused(tmp_path, bad):
+    r = _run(tmp_path, "--goal", "g-bad", "--reviewer", "peer", "--closer", "alpha",
+             "--source-text", CITING_SOURCE, "--artifact-text", "g-900-02 g-900-03",
+             "--approve", "--citation", bad)
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "one-line role reason" in r.stderr   # the usage line alone names --citation

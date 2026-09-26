@@ -2297,9 +2297,50 @@ def cmd_update_goal(args):
                     file=sys.stderr,
                 )
 
+        # === candidate transition table (, B1c) ===
+        # Enforces goal-intake-management.md §2's transition table in the
+        # status-update path. MIRROR of the daemon's in-lock guard in
+        # mind_api/src/endpoints/aspirations_write.py (guard-742/2323); both
+        # import the same gates.candidate_transition module — this is a second
+        # CALL SITE, never a second copy of the policy.
+        #
+        # Runs INSIDE the lock against the locked goal read: the table is
+        # keyed on the STORED prev status, and a pre-lock read would race a
+        # peer write. The gate is fail-closed by construction — if it cannot
+        # run, the write path errors out rather than silently passing an
+        # ungated candidate (the hole  was filed to close).
+        #
+        # _ct_row_due defers the §5 ledger append to the commit site below:
+        # a row is written ONLY for a transition whose store write actually
+        # committed (a refusal or a failed write leaves no row).
+        _ct_row_due = None
+        if field == "status":
+            from gates.candidate_transition import (
+                evaluate as _ct_eval, append_ledger as _ct_ledger)
+            _ct = _ct_eval(goal.get("status"), value)
+            if not _ct["allowed"]:
+                print(_ct["message"], file=sys.stderr)
+                sys.exit(1)
+            if _ct["ledger"]:
+                _ct_row_due = {
+                    "verdict": _ct["verdict"],
+                    "new_status": value,
+                    "agent": AGENT_DIR.name if AGENT_DIR else "unknown",
+                    "evidence": {
+                        "outcome_note": goal.get("outcome_note"),
+                    },
+                    "ledger": _ct_ledger,
+                }
+
         # Guard: superseded can only be set via `complete --intent-satisfied` evidence gate,
-        # never by direct update-goal. This keeps the evidence requirement enforceable.
-        if field == "status" and value == "superseded":
+        # never by direct update-goal — EXCEPT the candidate row, which §2's
+        # transition table (above) owns: candidate -> superseded is the
+        # grooming MERGE verdict and was allowed through the gate above.
+        # For every other prev-status this guard is unchanged.
+        # Keep this guard on ONE line: test_iteration_close_override_forwarding
+        # finds status branches with a line-anchored regex, and a wrapped
+        # `if (field ...` guard is invisible to it (, 2026-09-26).
+        if field == "status" and value == "superseded" and goal.get("status") != "candidate":
             print(f"BLOCKED: Cannot set status=superseded directly on {goal_id}. "
                   f"Pick the route that matches what is true: "
                   f"(1) THE WHOLE ASPIRATION's intent is satisfied -- "
@@ -3050,6 +3091,18 @@ def cmd_update_goal(args):
         recompute_progress(asp)
         items[asp_idx] = asp
         _write_live_under_lock(items, f"update-goal {goal_id} {field}")
+        # §5 ledger (): append the transition row ONLY after the
+        # store write committed — a refusal or a failed write leaves no row.
+        # Fail-open: a ledger error is logged by append_ledger, never raised
+        # (the audit row is best-effort; the transition itself is done).
+        if _ct_row_due is not None:
+            _ct_row_due["ledger"](
+                WORLD_DIR, goal_id=goal_id,
+                new_status=_ct_row_due["new_status"],
+                agent=_ct_row_due["agent"],
+                verdict=_ct_row_due["verdict"],
+                evidence=_ct_row_due["evidence"],
+            )
     finally:
         release_lock(lock_path)
     # E9: goal-skipped/expired encoding. Fires AFTER the lock releases so the

@@ -1306,3 +1306,166 @@ stored ≥7) and 2 of them Step 3.6.
    holds a stale copy.
 4. Carry run 79's items 5 and 6: re-read the 28 at-risk ids after any sweep, and re-read the
    40 restored flags before 09-29.
+
+## Occurrence 138 — 2026-09-25, bravo, hostname cc-05, `uname -r` 6.8.0-139-generic (own-cloud), g-001-05
+
+**POOL** `--replay-candidates` = **856** (5,948,549 B), all eligible: skip<7d 0, encoded 0, rc≥5 0
+(each already excluded at source). Outcomes: CONFIRMED 576, CORRECTED 201, UNRESOLVABLE 63,
+EXPIRED 8, null 8.
+
+**RUN 80 ITEM 1, CARRIED — stored vs derived `surprise`.** stored≠`derive_surprise(r)` on
+**301 of 856 (35.2%)**, which replicates run 80's 34.4%. Rule 2 is **0 stored and 0 derived**, so
+this zero stands: run 80's 5 hidden rule-2 records are resting until 10-01. Rule 1 is 228 stored
+and 425 derived (rest→r1 189, none→r1 9, r1→rest 1). This run SELECTED ON THE STORED FIELD, a
+deviation stated rather than hidden. Its cost was measured afterwards: 9 of 10 batch records have
+stored = derived. The tenth, `2026-08-25_ayoai-bucket-more-inconclusive-than-vinheim`, is
+UNRESOLVABLE and not derivable (None), and it held a rule-1 slot on its caller-supplied 5 alone.
+Run 80's item 2 (the strict 7-day skip) was already met: skip when `days < 7`.
+
+**NEW — "STRATIFY" WITH EQUAL (ROUND-ROBIN) ALLOCATION IS NOT NEUTRAL.** Pool, stored band 5-6,
+n=228, CORRECTED by rc:
+- rc0: 19/59 = 32.2% (25.9% of the band)
+- rc1: 82/131 = 62.6%
+- rc2: 23/37 = 62.2%
+- rc3: 0/1
+
+Round-robin over k=8 gives {rc0 3, rc1 2, rc2 2, rc3 1}. Its expected CORRECTED is **3.46**,
+against **4.35** proportional:
+- the singleton rc3 stratum takes 1/8 of the batch against 0.4% of the band;
+- rc0, the least-enriched stratum, takes 37.5% against 25.9%.
+
+This draw gave 1 of 8 CORRECTED. P(≤1) under round-robin is 5.6% (20,000 sims, median 3).
+Equal allocation weights strata by COUNT, which is the same bet on the rc gradient that Step 1
+forbids for a sort. SKILL.md Step 1 now says PROPORTIONAL. rc0 is lowest here, but that is a POOL
+reading on band 5-6, while the 09-15 reversal was measured on the CORPUS at surprise==6. The two
+populations differ, so neither adjudicates the other.
+
+**NEW — STEP 2's EXPERIENCE DEREFERENCE IS AGENT-SCOPED, WHILE THE POOL IS WORLD-SCOPED.**
+`experience-read.sh --id` reads the bound agent's store. A ref another agent wrote returns
+`{"error":"not_found"}` with rc=1. Method: an id-anchored presence grep over this box's
+`agents/*/experience.jsonl` (a hand-parse of the store is refused by hook).
+- **Batch:** 0 of 9 refs are in bravo's store. 5 are only in another agent's store (alpha 1,
+  echo 1, foxtrot 2, zeta 1). 4 are in no local store.
+- **Pool:** 421 distinct refs. bravo 38 (9.0%); other-agent-only 158 (37.5%); none-local 225
+  (53.4%). That last count means "not on this box", never "not written" (guard-980).
+
+Under `2>/dev/null` the miss renders as a blank, which reads as "no trace recorded". Step 4's
+`retrieval_stats` write would also land cross-agent for the 158. guard-5058 was strengthened as the
+general class, and SKILL.md Step 2 now carries the caveat. The skill does not yet say how to find
+the owner. The presence grep above is one way.
+
+**STEP 3.6 ZERO, POSITIVE-CONTROLLED.** The pool's chronic count (rc≥3, CORRECTED, unencoded) is 0.
+The corpus (archive 1,871 ∪ resolved 31 = 1,902) holds 237 chronic CORRECTED:
+- 219 are encoded_via_chronic;
+- 18 are unencoded: 17 at rc=3 resting to `next_review_date` 09-26..10-01, and 1 at rc=5, past
+  the cap.
+
+Occurrence 137's "34 remain" is now 18. Who encoded the other 16 was not measured.
+
+**The remaining steps:**
+- Step 3: n=10 with 1 CORRECTED, so no marker. The floor at n≤10 is ~30pp.
+- Step 3.5: skipped, because it needs ≥2 CORRECTED sharing a condition.
+- Step 4: 10 of 10 records have a null `strategy`, so nothing was reconsolidated. No signature
+  outcomes were recorded, because every match is retrospective (4c).
+- **Step 4.5:** stamped 10, verified 10, failed 0. Next review is 2026-10-02.
+
+**NEXT RUN:**
+1. Select on `derive_surprise(r)`.
+2. Allocate proportionally within the band.
+3. Resolve an experience ref's owner before dereferencing it, read-only.
+
+**SPARK ADDENDUM (same occurrence).** A mechanism retrieval run after the SKILL.md edits turned up
+guard-399 and guard-6482.
+- The Step 1 and Step 2 text edits correct instructions the model executes. They are interim
+  enrichment and not the fix. Under guard-399's amendment (2), prose and `Bash:` lines are the same
+  enforcement class, so the carrier is the **gap-239** selection wrapper. That gap now has 2
+  encounters. Its spec prescribed "stratified round-robin across rc" and now reads PROPORTIONAL.
+- Run 80's select-on-derived instruction was deliberately NOT written into SKILL.md, because a
+  pointer would not bind a hand-rolled selector either. gap-239 carries it.
+- The Step 2 figure moved out of the skill file and into this ledger (guard-6482).
+- Pattern-outcome recording: 6 signatures were retrieved for g-001-05 and none was applied, so none
+  was recorded.
+- gap-239 now meets the forge threshold on count (2/2, medium value). No forge goal was filed,
+  because the generation brake (strategic_focus rev 2026-09-24b) wants a named product outcome and
+  this one is framework-only.
+- Encoded: rb-11890.
+
+## Run 81 (zeta, `hostname` cc-02, `uname -r` 6.8.0-139-generic, 2026-09-25)
+
+- **Pool.** 846 candidates. 783 carry stored `surprise`. 0 were skipped as recent: the endpoint
+  already excludes future `next_review_date`. 0 were at the rc>=5 cap. 0 were chronic-CORRECTED
+  unencoded (the Step 3.6 sweep of the full pool found nothing).
+- **Selection.** 10 records, all from stored-surprise band 6 (127 records). Allocation across
+  replay_count was PROPORTIONAL: {rc1: 6, rc2: 3, rc0: 1} against strata {83, 32, 12}.
+  Select-on-DERIVED surprise (run 80) was NOT applied. This is gap-239's third encounter
+  with a hand-rolled selector.
+- **Batch.** 6 CORRECTED, 3 CONFIRMED, 1 UNRESOLVABLE. That is 66.7% CORRECTED of the 9
+  scoreable records. BATCH-scoped and upward-biased by construction (guard-2129): not a pool
+  or corpus rate.
+- **Narratives.** 10/10 parsed, and the parsed count was asserted against the ids requested. All
+  10 carry a real outcome lesson: winning keys were outcome_detail ×7, resolution_evidence,
+  reflection_note and resolution_note. 0 were bare.
+- **Qualitative.** The 6 CORRECTED records again share "claim scope outran the measured
+  population or rate". Examples: the mechanism held but the stated rate did not (sidecar docs);
+  the two halves of the criteria disagreed on the same data (suite-run); 0 of 6 consequences
+  were currently false (convention warnings). This is the same reading as run 80, and it is
+  still qualitative: no title marker, no permutation floor, nothing encoded.
+- **Step 4.** No pattern signature is referenced by any batch record, so no outcome was recorded
+  (Step 4b/c: a retrospective match takes no outcome).
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id read-back).
+  next_review 2026-10-02.
+
+## Run 82 (zeta, `hostname` cc-02, `uname -r` 6.8.0-139-generic, 2026-09-26)
+
+- **Pool.** 843 candidates. 780 carry stored `surprise` (2 still carry the `surprise_level`
+  alias). 0 were at the rc>=5 cap. The Step 3.6 sweep of the full pool found 0
+  chronic-CORRECTED unencoded records.
+- **The 7-day skip boundary decided rule 2 this run.** 10 pool records carry
+  `last_replayed` 2026-09-19 and `next_review_date` 2026-09-26, so they were due that day.
+  The endpoint admits them because it excludes only `next_review_date > today`.
+  - A hand-rolled `last_replayed >= today-7d` skip drops all 10, and those 10 include ALL
+    THREE stored-surprise-7 records. Rule 2 reads **0 under `>=` and 3 under the strict
+    `>`.**
+  - Run 80 recorded the same off-by-one, but there the rule-2 zero was robust to it. Here it
+    is not.
+  - My first selector pass used `>=`. It produced a rule-2-empty batch that looked like a
+    normal batch, with no error. The re-run with `>` selected all 3.
+  - Read "replayed within the last 7 days" STRICTLY: `last_replayed > today-7d`. A record
+    whose `next_review_date` is today is due, not recent.
+  - This is the fourth hand-rolled-selector encounter (gap-239).
+- **Selection.**
+  - First, the 3 rule-2 records (s7; rc 2/3/3).
+  - Then 5 from band 6: 114 records in strata rc0 12 / rc1 74 / rc2 27 / rc4 1, allocated
+    PROPORTIONALLY as {rc0: 1, rc1: 3, rc2: 1}.
+  - Then 2 routine (s<5) records, drawn at random with seed 82.
+- **Batch.** 6 CORRECTED, 2 UNRESOLVABLE, 2 CONFIRMED. That is 6/8 = 75% CORRECTED of the
+  scoreable records. It is BATCH-scoped and upward-biased by construction (guard-2129).
+- **Narratives.** 10/10 parsed, and the parsed count was asserted against the ids requested.
+  0 were bare.
+  - Winning keys: outcome_detail x7, rationale x2, outcome_note x1.
+  - Both `rationale` winners open with an outcome verdict and the measurement. They are
+    written lessons, not formation premises (guard-2615).
+- **Qualitative.** The 6 CORRECTED records split four ways:
+  - 2 scope generalizations. One instance was read as "a class", but 0 of 8 siblings had
+    the narrower caller set. An all-quantifier failed on the largest member (15 of 22
+    present).
+  - 2 stability predictions. A ratio that would "hold flat" moved 45 -> 48. A mean that
+    would stay "within 0.020 of 0.580" read 0.5457.
+  - 1 event-order race. The anchor event arrived in a shape the prediction did not
+    anticipate: a merge with 0 reviews.
+  - 1 count threshold. A lane predicted >0 read 0.
+
+  The run-80/81 reading ("claim scope outran the measured population or rate") covers only
+  the first pair this run. The finding is still qualitative: no title marker, no permutation
+  floor, nothing encoded. The two stability CORRECTEDs share sig-244's shape
+  (stasis-assumption-persists-claim), and so does one CONFIRMED (a persistence prediction
+  that held). That is a RETROSPECTIVE match, so no outcome was recorded (Step 4c).
+- **Step 3.5.** The 6 CORRECTED narratives contain 0 procedural-gap indicators, so there is no
+  convention proposal.
+- **Step 4.** No batch record references a pattern signature, so no outcome was recorded.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id
+  read-back). next_review 2026-10-03, confirmed on a record read by id.
+- **NEXT RUN (83).**
+  - Apply the strict boundary before reading rule 2.
+  - The two UNRESOLVABLE rule-2 records are now at rc 4. One more replay each reaches the
+    rc>=5 archive cap, so Step 1 will archive them rather than replay them again.
