@@ -241,6 +241,9 @@ tree-find-node.sh --text "<subsystem>" --top 3), run C2's four checks:
      gotcha/decision rule to that node so future-self fails differently.
      (Node HAD it but wasn't retrieved → that's Lane 4.2's blind-spot lens,
      not a node edit.)
+  After a 1 or 2 body fix, check the node's _tree.yaml summary for the same
+  claim; repair it by dated prepend + load-tree-summary.sh + a retrieve.sh
+  read-back (digest C2 "TWO surfaces", guard-3886, guard-740).
   Print per action: RECONCILED|CORRECTED|ADDENDUM|BOLSTERED tree:<key>
 ```
 

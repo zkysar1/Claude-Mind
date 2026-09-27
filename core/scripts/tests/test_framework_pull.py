@@ -956,3 +956,59 @@ def test_adopt_red_verify_preserves_a_dirty_tracked_non_framework_file(repo_pair
 
     assert result["adopted"] is False and result["rolled_back"] is True
     assert (target / _STORE_REL).read_text() == "DIRTY BEFORE ADOPT\n"
+
+
+# ------------------------------------ main(): target root + world ()
+
+
+def _capture_plan(monkeypatch, source):
+    """Stub build_plan so main()'s root/world resolution is observable without a
+    real preflight; resolve_source_repo returns a fixed source."""
+    seen = {}
+
+    def fake_build_plan(**kw):
+        seen.update(kw)
+        return {"steps": [], "blockers": [], "proceed": False}
+
+    monkeypatch.setattr(fp, "build_plan", fake_build_plan)
+    monkeypatch.setattr(fp, "resolve_source_repo", lambda root, explicit: source)
+    monkeypatch.setattr(fp, "render_plan", lambda report: "")
+    return seen
+
+
+def test_main_project_root_and_world_dir_reach_the_plan(tmp_path, monkeypatch):
+    """The incoming executor plans INTO the named target, with that target's
+    world, while its preflight still comes from the executor's own script dir."""
+    seen = _capture_plan(monkeypatch, tmp_path / "staging")
+    target, world = tmp_path / "downstream", tmp_path / "downstream-world"
+    target.mkdir()
+    world.mkdir()
+    rc = fp.main(["--project-root", str(target), "--world-dir", str(world)])
+    assert rc == fp.EXIT_OK
+    assert seen["project_root"] == target.resolve()
+    assert seen["world_dir"] == world.resolve()
+    assert seen["script_dir"] == SCRIPTS.resolve()
+
+
+def test_main_foreign_project_root_without_world_dir_is_refused(tmp_path, monkeypatch,
+                                                                capsys):
+    """Never fall back to the executor's own world for another deployment: its
+    installed tag and decision registry belong to a different target."""
+    seen = _capture_plan(monkeypatch, tmp_path / "staging")
+    rc = fp.main(["--project-root", str(tmp_path / "downstream")])
+    assert rc == fp.EXIT_BLOCKED
+    assert seen == {}
+    assert "--world-dir" in capsys.readouterr().err
+
+
+def test_main_default_project_root_is_the_executors_own_repo(tmp_path, monkeypatch):
+    seen = _capture_plan(monkeypatch, tmp_path / "staging")
+    assert fp.main([]) == fp.EXIT_OK
+    assert seen["project_root"] == SCRIPTS.resolve().parent.parent
+
+
+def test_main_own_repo_as_project_root_needs_no_world_dir(tmp_path, monkeypatch):
+    seen = _capture_plan(monkeypatch, tmp_path / "staging")
+    own = SCRIPTS.resolve().parent.parent
+    assert fp.main(["--project-root", str(own)]) == fp.EXIT_OK
+    assert seen["project_root"] == own

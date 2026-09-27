@@ -4310,15 +4310,35 @@ do_productivity_check() {
     # rewrite each expired segment to zero records and leave an empty file, not
     # remove it. Placed here so the writer and its age-cap sit in one tick.
     #
-    # REPORT ONLY, deliberately: no --apply, no --archive-dir. This lane
-    # DELETES, and the archive that archive-before-delete requires needs a cold
-    # home nobody has chosen yet (.history is blacklisted for this store —
-    # guard-3095 — so there is no recovery layer to fall back on). Until that
-    # choice is made this prints what WOULD expire, which is a true no-op today:
-    # measured on cc-04 2026-09-21, 36 segments present, oldest 2026-08-17,
-    # cutoff 2026-08-12, expired 0. The first segment expires 2026-09-26, and
-    # from then the log line is the signal that supply has arrived.
-    python3 "$(_winpath "$SCRIPT_DIR/gate-firings-segments-expire.py")" \
+    # DELETES, archive-first (flipped from report-only 2026-09-27, after an
+    # archive -> delete -> restore positive control on the first real expired
+    # segment). There is no recovery layer to fall back on: .history is
+    # blacklisted for this store (guard-3095) and the store's lifecycle config
+    # is AccessDenied to the fleet principal, so versioning cannot be counted.
+    # The archive home is core/logs/graveyard/gate-firings/<day>/ — git-ignored,
+    # outside every governed root, never synced, never reaped: the one cold home
+    # whose lifecycle a box can actually verify. PER DAY on purpose: a same-day
+    # re-expiry (a restored or resurrected segment) trips the script's
+    # FileExistsError and aborts before any delete, so a delete that keeps
+    # failing costs one archive copy per day rather than one per tick.
+    python3 "$(_winpath "$SCRIPT_DIR/gate-firings-segments-expire.py")" --apply \
+        --archive-dir "$(_winpath "$CORE_ROOT/logs/graveyard/gate-firings/$(date +%Y-%m-%d)")" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+    # Board date-segment retention (g-358-221), the board twin of the age-cap
+    # above with the opposite VERB. Once BOARD_SEGMENTED_CHANNELS names a
+    # channel (g-358-183), its posts land in <channel>-YYYY-MM-DD.jsonl segments
+    # that nothing else bounds. This MOVES segments older than RETENTION_DAYS
+    # (10) into <channel>-archive.jsonl, verifies every id there in the store
+    # copy, and only then removes the segment file, so no post is deleted. Weekly
+    # batches (BATCH_DAYS 7) hold it to about one archive PUT per channel per
+    # week. It is a noop until a segment exists.
+    #
+    # MOVES, flipped from report-only 2026-09-27 after a move -> verify ->
+    # restore -> re-move positive control on a synthetic segment of a throwaway
+    # channel on the live store (guard-1301). Cold copies and RECEIPT.md go to
+    # core/logs/graveyard/board-segments/<day>/, per day like the age-cap above.
+    python3 "$(_winpath "$SCRIPT_DIR/board-segments-retain.py")" --apply \
+        --archive-dir "$(_winpath "$CORE_ROOT/logs/graveyard/board-segments/$(date +%Y-%m-%d)")" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
     # Citation-credit sweep (g-115-6948): converts commit-message rb-/guard-
     # citations (measured 84/day fleet-wide vs 1-7 explicit helpful events/day)
@@ -4373,6 +4393,21 @@ do_productivity_check() {
     # stderr (routed to iteration-close-stderr.log) but never aborts the phase.
     # See core/scripts/agent-watchdog.py docstring + --tick mode.
     python3 "$(_winpath "$SCRIPT_DIR/agent-watchdog.py")" --tick \
+        2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
+
+    # Release-train nudge (g-115-11017) — the IN-TURN half of ReleaseTrainProbe,
+    # which the tick above runs. The probe files ONE fleet-wide Investigate goal
+    # when the newest v* tag is >= release_train.stale_hours old with framework
+    # commits past it on origin/main; while that goal is open this prints one
+    # LLM-ACTION naming it, every iteration, so the stalled train reaches the
+    # reducer whether or not the selector ever ranks the goal (guard-3746: a
+    # per-iteration close line is a non-selector path). Silent everywhere else:
+    # not the frontier, not due, or the goal was closed deliberately (the probe
+    # re-files on its re-validation cadence). Placed after the tick so it never
+    # runs ahead of the probe's filing. stdout is DELIBERATELY UNREDIRECTED — the
+    # line exists to be READ IN-TURN, same reasoning as the push above.
+    # Fail-open like every sibling lane.
+    python3 "$(_winpath "$SCRIPT_DIR/release-train-check.py")" --nudge \
         2>>"$CORE_ROOT/logs/iteration-close-stderr.log" || true
 
     # Orphan-carrier repair lane (g-115-9607) — the wired caller for

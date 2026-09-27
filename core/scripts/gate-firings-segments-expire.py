@@ -36,9 +36,13 @@ DELETION DISCIPLINE. Two rails, neither optional:
   * archive-before-delete.md -- ENUMERATE, VERIFY LAYERS, ARCHIVE, VERIFY
     ARCHIVE, DELETE, RECEIPT. The recovery layer here is absent or
     unverifiable: this store is in `_fileops._SNAPSHOT_BLACKLIST` so .history
-    holds nothing for it (guard-3095), and under LocalBackend a delete is
-    final. So the independent current-copy archive is MANDATORY, not
-    preferable -- hence --archive-dir is REQUIRED for --apply.
+    holds nothing for it (guard-3095), under LocalBackend a delete is final,
+    and on own-cloud the bucket's lifecycle config is AccessDenied to the
+    fleet principal (measured 2026-09-27), so object versioning cannot be
+    counted either. So the independent current-copy archive is MANDATORY, not
+    preferable -- hence --archive-dir is REQUIRED for --apply. And because the
+    delete drops BOTH lanes while the archive copies the local one, a segment
+    whose store copy differs from its local copy is refused, not deleted.
 
 The archive destination is the CALLER's choice on purpose. This script will not
 invent a new top-level directory under a governed root (the world, meta or
@@ -47,9 +51,12 @@ archive staged under an agent's temp/ is git-ignored and reaped at 120 minutes
 (archive-before-delete step 3c). Naming it is a deliberate act by whoever turns
 apply on.
 
-DEFAULT IS DRY RUN. The wiring in iteration-close.sh reports; it does not
-delete. Flipping that to --apply is a separate, deliberate change that must
-also choose an archive home.
+DEFAULT IS DRY RUN. The iteration-close.sh wiring passes --apply with a
+per-day archive dir under core/logs/graveyard/gate-firings/ (flipped
+2026-09-27, after an archive -> delete -> restore positive control on the
+first real expired segment). core/logs/ is git-ignored, outside every governed
+root, never synced and never reaped, so the archive has no lifecycle -- and it
+is per box, which is the price: each box keeps its own copy of what it expired.
 """
 from __future__ import annotations
 
@@ -181,7 +188,8 @@ def _write_receipt(archive_dir: Path, records: list, cutoff: _dt.date,
 
     The name and placement are load-bearing: `temp-drain-purge.sh` preserves a
     directory carrying a top-level `RECEIPT` / `RECEIPT.*`, and producers that
-    named it anything else were invisible to it.
+    named it anything else were invisible to it. A second deleting run into the
+    same directory APPENDS: overwriting would erase the first run's enumeration.
     """
     path = archive_dir / "RECEIPT.md"
     stamp = _dt.datetime.now().isoformat(timespec="seconds")
@@ -196,10 +204,13 @@ def _write_receipt(archive_dir: Path, records: list, cutoff: _dt.date,
         "below is dated strictly before that cutoff. Segments dated ON the cutoff are "
         "kept - the window's margin deliberately includes the boundary day.",
         "",
-        "HOW: each file was COPIED here and verified byte-for-byte (size + md5) BEFORE "
-        "any deletion, then removed through `StorageBackend.delete()`, which drops the "
-        "store object and the local mirror and re-verifies BOTH lanes (guard-1493). "
-        "An archive verify failure aborts the run before any delete.",
+        "HOW: the store copy of each file, where one existed, was read back first and "
+        "matched the local md5, so this archive holds both lanes' bytes. Each file was "
+        "then COPIED here "
+        "and verified byte-for-byte (size + md5) BEFORE any deletion, then removed "
+        "through `StorageBackend.delete()`, which drops the store object and the local "
+        "mirror and re-verifies BOTH lanes (guard-1493). An archive verify failure "
+        "aborts the run before any delete.",
         "",
         "ENUMERATION (name / bytes / md5):",
     ]
@@ -207,10 +218,15 @@ def _write_receipt(archive_dir: Path, records: list, cutoff: _dt.date,
         lines.append(f"  - {r['name']}  {r['bytes']}  {r['md5']}")
     lines += [
         "",
-        "RESTORE: copy the segment(s) back to the meta directory named above - NOT to "
-        "the repo root, and not into any other store. Readers enumerate the corpus via "
-        "`_gate_log.firings_paths()`, which picks up any correctly-named segment that "
-        "is present, so a restored file rejoins the store with no further step.",
+        "RESTORE: to READ these rows, read the archived copy in place - no restore is "
+        "needed. To put a segment back (useful only after raising G5's retention_days, "
+        "or the next maintenance tick expires it again): plain-copy it into the meta "
+        "directory named above - NOT the repo root, not any other store - and on an "
+        "own-cloud box push it with `python3 core/scripts/owncloud_sync.py --file "
+        "<absolute path>`, then confirm the store copy reads back with the md5 listed "
+        "here. A local copy alone never reaches the other boxes. Readers enumerate the "
+        "corpus via `_gate_log.firings_paths()`, which picks up any correctly-named "
+        "segment that is present.",
         "",
         "NOTE: these are gate-telemetry rows past their declared retention window. The "
         "four readers (gate-stats, gate-retirement-eval, override-ledger-consume, "
@@ -218,7 +234,8 @@ def _write_receipt(archive_dir: Path, records: list, cutoff: _dt.date,
         "in this archive is inside any reader's window as of the date above.",
         "",
     ]
-    path.write_text("\n".join(lines), encoding="utf-8")
+    prior = path.read_text(encoding="utf-8") + "\n" if path.exists() else ""
+    path.write_text(prior + "\n".join(lines), encoding="utf-8")
     return str(path)
 
 
@@ -288,10 +305,39 @@ def main(argv=None) -> int:
     import storage_backend  # local import: tests may pin STORAGE_BACKEND first
     be = storage_backend.get_backend()
 
+    # LANE AGREEMENT, before anything is archived. The archive copies the LOCAL
+    # bytes, but be.delete() destroys the STORE object too, so a segment whose
+    # store plaintext differs from its local copy would lose bytes that no archive
+    # holds (guard-6946). Such a segment stays on BOTH lanes and is reported; it is
+    # never archived, so the receipt cannot claim it. This runs seconds before the
+    # delete, not from an earlier snapshot (guard-5952). read_authoritative_bytes
+    # gunzips by magic, so a codec-encoded store copy compares as plaintext.
+    agreed = []
+    for d, p in expired:
+        local = _md5(p)
+        try:
+            store = hashlib.md5(
+                be.read_authoritative_bytes(str(p.resolve()))).hexdigest()
+        except FileNotFoundError:
+            store = None  # no store copy: nothing on that lane to lose
+        except Exception as e:  # noqa: BLE001 -- an unreadable lane is never deleted blind
+            rep["errors"].append(f"store read failed for {p.name}: {e}; not deleting")
+            continue
+        if store not in (None, local):
+            rep["errors"].append(
+                f"lanes diverged for {p.name}: store md5 {store} != local {local}; "
+                "not deleting - the store bytes would be in no archive")
+            continue
+        agreed.append((d, p))
+    if not agreed:
+        rep["action"] = "refused-lanes-unverified"
+        print(json.dumps(rep, indent=2))
+        return 1
+
     # ARCHIVE EVERYTHING FIRST, verify each, and only then delete. Interleaving
     # (archive one, delete one) would leave a partial run half-deleted with the
     # rest unarchived; this ordering means a verify failure costs nothing.
-    for _d, p in expired:
+    for _d, p in agreed:
         try:
             rep["archived"].append(_archive_one(p, archive_dir))
         except Exception as e:  # noqa: BLE001 -- abort, do not continue
@@ -303,7 +349,7 @@ def main(argv=None) -> int:
     rep["receipt"] = _write_receipt(archive_dir, rep["archived"], cutoff,
                                     days, meta_dir)
 
-    for _d, p in expired:
+    for _d, p in agreed:
         try:
             be.delete(str(p.resolve()))   # absolute: _s3_key rejects relative
             if p.exists():

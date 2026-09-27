@@ -104,6 +104,7 @@ from _goal_fields import (  # noqa: E402
 # across subsystems. A fresh literal here would make that worse.
 from _goal_census import TERMINAL_STATUSES as _TERMINAL_STATUSES  # noqa: E402
 import _aspirations_resurrection as _resurrection  # noqa: E402  # archive-sweep resurrection predicate SSOT (2026-08-16)
+import _decomposed_dependents  # noqa: E402  #  — shared with the CLI's cmd_update_goal
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
 from gates.aspiration_supply import (  # noqa: E402
@@ -3523,6 +3524,17 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 except ValueError as e:
                     return Response.error(400, "validation_failed", str(e))
 
+            # : plan the re-point of a decomposed parent's live
+            # dependents on the same validate-before-mutate footing, so a
+            # refusal writes nothing. Applied in step 9, ahead of the strip.
+            # Twin of the CLI's cmd_update_goal; both call _decomposed_dependents.
+            _decomp_plan = None
+            if field == "status" and value == "decomposed":
+                _decomp_plan = _decomposed_dependents.plan(items, goal_id)
+                if _decomp_plan["refuse"]:
+                    return Response.error(409, "decomposed_dependents_unrepointable",
+                                          _decomp_plan["message"])
+
             goal = asp["goals"][goal_idx]
 
             # : a session whose claim was taken over used to learn
@@ -4371,6 +4383,9 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             # dependents stay blocked forever); (b) the claim — if any —
             # is cleared per convention Rule 3.
             if field == "status" and value in _TERMINAL_GOAL_STATUSES:
+                if _decomp_plan is not None:
+                    warnings.extend(_decomposed_dependents.apply(
+                        items, _decomp_plan, goal_id))
                 _clear_stale_blockers_inline(items, {goal_id})
                 goal.pop("claimed_by", None)
                 goal.pop("claimed_at", None)

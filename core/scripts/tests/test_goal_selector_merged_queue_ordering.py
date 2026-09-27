@@ -174,10 +174,18 @@ def test_drain_lane_is_the_only_head_perturbation(tmp_path):
     """When the lane fires, index 0 is deliberately NOT the score maximum --
     and everything from index 1 on must remain score-descending. That pairing
     is the whole contract: a lane that perturbed more than the head would be
-    indistinguishable from the merge regression above."""
+    indistinguishable from the merge regression above.
+
+    The starved row is WORLD-sourced ON PURPOSE (g-306-514): an agent-queue row
+    is excluded from the lane for any non-reducer Body by the source gate
+    (source='agent' is unclaimable without the DDB runner claim), so pinning the
+    head-perturbation contract on an 'agent' row made this test role-ambient
+    (pass under a reducer, fail under a worker). Agent-row lane exclusion is
+    pinned where it belongs: test_goal_selector_drain_lane.py, source-gate
+    section."""
     scored = two_queue_fixture()
     # One genuinely-starved recurring row, scoring LAST, eligible for the lane.
-    starved = row("g-001-99", 8.00, "agent", ratio=6.0, interval=24.0, recurring=True)
+    starved = row("g-001-99", 8.00, "world", ratio=6.0, interval=24.0, recurring=True)
     scored.append(starved)
     scored.sort(key=gs.candidate_sort_key)
     assert scored[0]["goal_id"] == "g-335-1329"
@@ -206,7 +214,12 @@ def test_lane_cooldown_restores_index_zero_to_the_maximum(tmp_path):
     gs.write_drain_lane_state(d, {"invocations_since_pick": 0})
     for _ in range(3):
         scored = two_queue_fixture()
-        scored.append(row("g-001-99", 8.00, "agent", ratio=6.0, recurring=True))
+        # WORLD-sourced (), matching the head-perturbation test above:
+        # an 'agent' row is excluded by the source gate for a non-reducer Body,
+        # so this test would pass for the WRONG reason (exclusion rather than
+        # cooldown) whenever it runs under a worker. The point here is that a
+        # LANE-ELIGIBLE row does not re-fire inside K.
+        scored.append(row("g-001-99", 8.00, "world", ratio=6.0, recurring=True))
         scored.sort(key=gs.candidate_sort_key)
         assert gs.apply_drain_lane(scored, dict(CONFIG), d) is None
         assert scored[0]["goal_id"] == "g-335-1329"

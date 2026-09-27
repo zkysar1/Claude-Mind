@@ -43,6 +43,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from _paths import (
     PROJECT_ROOT, WORLD_DIR, AGENT_DIR, CONFIG_DIR, AGENT_NAME, agent_session_dir,
+    read_agent_conf,
 )
 
 SESSION_DIR = AGENT_DIR / "session" if AGENT_DIR else None
@@ -211,7 +212,8 @@ def is_in_scope(normalized):
     This is the NARROW scope — used by the BLOCKING re-read dedup gate
     (cmd_gate). Widening it would start blocking whole-file re-reads of the
     added prefix; see ADVISORY_EXTRA_PREFIXES for why core/scripts must NOT be
-    dedup-blocked. Recorder + advisory use is_in_scope_advisory (wider) instead.
+    dedup-blocked. The advisory uses is_in_scope_advisory (wider) and the
+    recorder is_in_scope_record (widest) instead.
     """
     for tf in TRACKED_FILES:
         if normalized == tf.replace("\\", "/"):
@@ -224,8 +226,9 @@ def is_in_scope(normalized):
 
 
 def is_in_scope_advisory(normalized):
-    """WIDER scope for the RECORDER (cmd_record) + read-before-edit ADVISORY
-    (cmd_check_file) ONLY. Superset of is_in_scope: adds ADVISORY_EXTRA_PREFIXES
+    """WIDER scope for the read-before-edit ADVISORY (cmd_check_file), and the
+    in-repo half of the recorder's scope (cmd_record calls is_in_scope_record, a
+    superset). Superset of is_in_scope: adds ADVISORY_EXTRA_PREFIXES
     (core/scripts) so the advisory fires on framework-CODE edits. The BLOCKING
     dedup gate (cmd_gate) deliberately does NOT call this — see the
     ADVISORY_EXTRA_PREFIXES comment (g-115-2210) for the re-read-block rationale.
@@ -236,6 +239,43 @@ def is_in_scope_advisory(normalized):
         if normalized.startswith(prefix.replace("\\", "/")):
             return True
     return False
+
+
+def is_in_scope_record(normalized):
+    """WIDEST scope, for the RECORDER (cmd_record) ONLY ().
+
+    Adds PRODUCT-REPO reads to is_in_scope_advisory: a file under an
+    AGENT_WRITE_PATH root that lies outside BOTH this repo and the world. The
+    Q4 provenance sampler asks this tracker "did the session fetch the source
+    it cites?", and before this tier a product file opened with the Read tool
+    was never recorded — so an accurate product-repo citation scored
+    `decorative-citation`, the same verdict as a file never opened, and the
+    only move that cleared it was deleting the citation.
+
+    Recorder only. cmd_gate keeps is_in_scope (a product file is never
+    dedup-blocked) and cmd_check_file keeps is_in_scope_advisory (the pre-edit
+    advisory stays silent on product code, which is what
+    pre-edit-context-gate.sh documents).
+
+    PROJECT_ROOT and WORLD_DIR are excluded even when a write root contains
+    them, so the in-repo and world classes are decided by the lists above on
+    every box, whatever its write roots span. q4_provenance_sample's
+    expressible_predicate resolves tokens only under those two roots, where
+    this tier is therefore empty. Widen this tier into either root and that
+    predicate must switch to this function in the same change.
+    """
+    if is_in_scope_advisory(normalized):
+        return True
+    try:
+        from _path_roots import compute_allowed_roots, is_under
+        if any(is_under(normalized, normalize_path(g))
+               for g in (PROJECT_ROOT, WORLD_DIR) if g):
+            return False
+        roots = compute_allowed_roots("", read_agent_conf())
+        return any(is_under(normalized, normalize_path(root))
+                   for label, root in roots if label == "AGENT_WRITE_PATH")
+    except Exception:
+        return False  # today's behaviour: not recorded
 
 
 def _read_raw_lines(session_id=None):
@@ -439,8 +479,8 @@ def cmd_record(args):
     # split-read MUST run before is_in_scope — it clears stale cross-session trackers
     full, partial_set = _read_tracker_split(session_id=args.session_id)
 
-    if not is_in_scope_advisory(normalized):
-        return  # Not tracked (recorder uses the WIDER advisory scope — )
+    if not is_in_scope_record(normalized):
+        return  # Not tracked (recorder scope: advisory + product repos — )
 
     if normalized in full:
         return  # Already at full fidelity; a later ranged peek adds nothing

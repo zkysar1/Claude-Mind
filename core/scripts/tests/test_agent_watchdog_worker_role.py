@@ -121,7 +121,7 @@ ALL_REDUCER_PROBES = {
     "stop-hook-block", "daemon-health", "clock-skew", "freshness",
     "mirror-wedge", "memory-headroom", "claim-heartbeat", "git-drift",
     "infra-component", "dependency-funnel", "retrieval-index",
-    "peer-liveness", "store-overcap",
+    "peer-liveness", "store-overcap", "release-train",
 }
 
 # Excluded from workers because they read REDUCER-SHAPED STATE a worker
@@ -177,7 +177,16 @@ EXCLUDED_DUPLICATE_SUPPRESSED = {"infra-component", "retrieval-index"}
 # iteration-close, which is the only caller of the tick, and files the goals
 # every Body then claims. A worker never reaches this tick at all; registering
 # the probe there would be coverage in appearance only (the  shape).
-EXCLUDED_QUEUE_OWNER = {"dependency-funnel"}
+#
+# release-train () joins because this bucket's reason is TRUE of it,
+# not because the bucket is nearest (guard-6875): it keeps a fleet-wide lease IN
+# THE GOAL QUEUE -- files one investigate:release-train-stalled-past-<tag> goal
+# and retires it when a newer tag lands -- so two Bodies ticking it would race
+# that file/retire lease exactly as they would the funnel's. It reads no
+# reducer-shaped state (not bucket 1), watches the tag train rather than peer
+# Bodies (not bucket 2), and a second runner costs a raced lease, not a
+# duplicated alert (not bucket 3).
+EXCLUDED_QUEUE_OWNER = {"dependency-funnel", "release-train"}
 
 # The FIFTH bucket (), named rather than forced into bucket 4 above.
 # store-overcap shares bucket 4's CLASS — a correctness problem, not a trust one

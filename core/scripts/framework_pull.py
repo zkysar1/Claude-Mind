@@ -1232,17 +1232,39 @@ def main(argv=None) -> int:
                     help="with --record-installed: the C4 suite was green on this box")
     ap.add_argument("--json", action="store_true", help="machine-readable report")
     ap.add_argument("--agent", default=os.environ.get("MIND_AGENT"))
+    ap.add_argument("--project-root", default=None,
+                    help="the deployment to plan/adopt INTO (default: the repo this "
+                         "script lives in). Run the INCOMING release's executor with "
+                         "--project-root <this-repo> so its own preflight gates the "
+                         "adopt (pull-promotion.md C2); needs --world-dir")
+    ap.add_argument("--world-dir", default=None,
+                    help="the TARGET's world dir (installed-release.yaml, "
+                         "promotion-decisions.yaml); required with a --project-root "
+                         "other than this script's own repo")
     ap.add_argument("--skip-quiesce-note", action="store_true",
                     help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
     script_dir = Path(__file__).resolve().parent
-    project_root = script_dir.parent.parent
-    try:
-        from _paths import WORLD_DIR
-        world_dir = Path(WORLD_DIR)
-    except Exception:
-        world_dir = project_root / "world"
+    own_root = script_dir.parent.parent
+    project_root = (Path(args.project_root).expanduser().resolve()
+                    if args.project_root else own_root)
+    if args.world_dir:
+        world_dir = Path(args.world_dir).expanduser().resolve()
+    elif project_root != own_root:
+        # g-115-10903: this script's own world holds ANOTHER deployment's
+        # installed tag and decision registry. A plan built on them gates the
+        # wrong target, and a keep-prod-ahead row the target registered would
+        # never be read -- so refuse rather than guess.
+        print("REFUSED: --project-root names another deployment, so pass "
+              "--world-dir <that deployment's world dir>.", file=sys.stderr)
+        return EXIT_BLOCKED
+    else:
+        try:
+            from _paths import WORLD_DIR
+            world_dir = Path(WORLD_DIR)
+        except Exception:
+            world_dir = project_root / "world"
 
     if args.record_installed:
         result = record_installed(project_root=project_root, world_dir=world_dir,

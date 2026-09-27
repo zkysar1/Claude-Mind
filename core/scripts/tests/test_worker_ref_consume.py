@@ -254,11 +254,19 @@ def test_retire_deletes_merged_ref_and_writes_receipt(repo, tmp_path):
     assert "liveness_override" not in rec, (
         "no override was used — the receipt must not carry the field"
     )
+    # : every line carries an explicit `forced` marker; a non-forced
+    # retire reads false on it — the machine-reader distinguisher that the
+    # attempted line's absent liveness_override only implied.
+    assert rec["forced"] is False, "non-forced attempted line must carry forced:false"
     # The terminal line is what makes the ledger readable without a second
     # source: the receipt alone can only ever say "attempted".
     term = [r for r in lines if r.get("outcome") in ("delete_succeeded", "delete_failed")]
     assert len(term) == 1, f"expected exactly one terminal outcome line, got {term}"
     assert term[0]["outcome"] == "delete_succeeded"
+    assert term[0]["forced"] is False, (
+        "g-306-498: the terminal outcome line — byte-identical forced-vs-not "
+        "before this change — must now carry forced:false too"
+    )
     assert term[0]["ref"] == "refs/workers/alpha/sid-aaaa"
     assert term[0]["tip_sha"] == repo["sha_a"], (
         "the terminal line must carry the tip SHA so it joins to its receipt"
@@ -313,6 +321,10 @@ def test_retire_failed_remote_delete_marks_ledger(repo, tmp_path):
         "retirement did NOT complete, without consulting any other source"
     )
     assert term[0]["ref"] == "refs/workers/alpha/sid-aaaa"
+    assert term[0]["forced"] is False, (
+        "g-306-498: the delete_failed terminal line also carries the forced "
+        "marker; a non-forced retire reads false on it"
+    )
 
 
 def test_retire_refuses_when_live_body_row_names_ref(repo, tmp_path):
@@ -358,11 +370,21 @@ def test_force_retire_live_overrides_and_logs_to_receipt(repo, tmp_path):
     ls = _git(work, "ls-remote", "origin", "refs/workers/*")
     assert "sid-aaaa" not in ls
     receipts = work / "core" / "logs" / "worker-ref-retirements.jsonl"
-    rec = next(r for r in (json.loads(l) for l in
-               receipts.read_text().strip().splitlines())
+    all_lines = [json.loads(l) for l in receipts.read_text().strip().splitlines()]
+    rec = next(r for r in all_lines
                if r.get("outcome") == "attempted")  # : not [-1] any more
     assert rec["liveness_override"] == "body killed manually during incident drill"
     assert rec["body_row"].startswith("LIVE-OVERRIDDEN goal=g-999-9")
+    #  outcome 1: the forced attempted line carries BOTH the explicit
+    # forced marker AND the justification (liveness_override above), so a machine
+    # reader needs neither field's absence to infer the other.
+    assert rec["forced"] is True, "forced attempted line must carry forced:true"
+    # outcome 2: the delete_succeeded terminal line — byte-identical forced-vs-not
+    # before this change — now carries forced:true, so a reader can tell a FORCED
+    # completion from a gate-approved one without re-reading the attempted line.
+    term = [r for r in all_lines if r.get("outcome") in ("delete_succeeded", "delete_failed")]
+    assert len(term) == 1 and term[0]["outcome"] == "delete_succeeded", term
+    assert term[0]["forced"] is True, "forced terminal line must carry forced:true"
 
 
 # --- : "null" means BOTH "no live row" and "that path does not exist" ---
@@ -1670,3 +1692,107 @@ def test_real_merge_conflict_is_still_called_a_conflict(conflict_repo):
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert "MERGE CONFLICT" in r.stderr and "MERGE REFUSED" not in r.stderr, r.stderr
     assert _has_merge_head(work), "a real conflict leaves the merge in progress"
+
+
+# ── : the all-binary carrier, occ192's remaining residue ────────────
+# occ192 added `elif [ "$mt_add" -ge 0 ] && [ "$mt_del" = 0 ]` to name the
+# genuine append-only shape, but `-ge 0` also matches mt_add=0. A carrier whose
+# only changed path is binary (or a pure rename) sums to +0 / -0: `git diff
+# --numstat` emits `-\t-\tpath` and the awk filter at worker-ref-consume.sh:585
+# drops the row, leaving mt_add=mt_del=0 while mt_total>0. That state is
+# UNMEASURED (the direction was never counted), but the arm stamped it
+# "append-only (+0 / -0): safe shape" — the arm's own else-comment already lists
+# the all-binary +0/-0 case as one it must catch. The fix is `-gt 0`.
+
+
+def _binarycarrier_repo(tmp_path):
+    """main with an agent store, plus two SIBLING carrier refs: one that ADDS a
+    BINARY file and one that APPENDS text lines.
+
+    The binary ref is the occ192 residue (g-306-483): a binary path is +0 / -0
+    under numstat with mt_total>0, the state the old `-ge 0` arm mislabelled
+    "safe shape". The append sibling is the positive control the mutation proof
+    needs (guard-4166): the fix must send the binary ref to UNMEASURED WITHOUT
+    flipping a genuine append off "safe shape". Every path is under agents/, so
+    framework_files=0 for both by construction.
+    """
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    r = _run(["git", "init", "--bare", "--initial-branch=main", str(origin)])
+    assert r.returncode == 0, r.stderr
+    r = _run(["git", "clone", str(origin), str(work)])
+    assert r.returncode == 0, r.stderr
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    store = work / "agents" / "alpha"
+    store.mkdir(parents=True)
+    (store / "log.jsonl").write_text("".join(f'{{"n": {i}}}\n' for i in range(1, 6)))
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base: 5-line append-only agent store")
+    _git(work, "push", "origin", "main")
+    base = _git(work, "rev-parse", "HEAD")
+
+    # BINARY carrier: adds a NUL-bearing file HEAD does not touch, so the merge
+    # is a clean add of one binary path -> numstat `-\t-` -> mt_add=0 / mt_del=0
+    # with mt_total=1. git classifies a file with NUL bytes as binary.
+    (store / "blob.bin").write_bytes(b"\x00\x01\x02\x00\xffbinary\x00payload\x00")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "body added a binary blob")
+    sha_bin = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_bin}:refs/workers/alpha/sid-binary")
+    _git(work, "reset", "--hard", base)
+
+    # APPEND carrier: the positive control, an ordinary text append (mt_add=2).
+    (store / "log.jsonl").write_text("".join(f'{{"n": {i}}}\n' for i in range(1, 8)))
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "body appended two records")
+    sha_append = _git(work, "rev-parse", "HEAD")
+    _git(work, "push", "origin", f"{sha_append}:refs/workers/alpha/sid-append")
+    _git(work, "reset", "--hard", base)
+    return {"origin": origin, "work": work}
+
+
+@pytest.fixture()
+def binarycarrier_repo(tmp_path):
+    return _binarycarrier_repo(tmp_path)
+
+
+def test_all_binary_carrier_is_unmeasured_not_safe_shape(binarycarrier_repo):
+    """occ192 residue (): a carrier whose only changed path is BINARY
+    sums to +0 / -0 under numstat, and the old `-ge 0` arm called that "safe
+    shape". mt_total>0 with mt_add=mt_del=0 is the all-binary case (the awk
+    filter dropped every row) — UNMEASURED, never an append.
+    """
+    work = binarycarrier_repo["work"]
+    # Positive control on the FIXTURE itself (guard-2421): confirm the binary ref
+    # actually reaches the 0/0-with-paths state, not the -1 (numstat-unparsed)
+    # branch, or the block assertion below would pass for the wrong reason.
+    by_sid, _ = _refs_by_sid(_consume(work, "--json").stdout)
+    row = by_sid["sid-binary"]
+    assert row["framework_files"] == 0, row
+    assert row["merge_paths_real"] >= 1, (
+        "the binary path must register as a changed path (mt_total>0)", row)
+    assert row["merge_added_real"] == 0, row
+    assert row["merge_deleted_real"] == 0, row
+
+    block = _ref_block(_consume(work, "--check").stdout, "sid-binary")
+    assert block, ("the binary carrier must appear in the report", block)
+    assert "UNMEASURED" in block, (
+        "an all-binary 0/0 delta despite changed paths is UNMEASURED, not "
+        "append-only", block)
+    assert "safe shape" not in block, (
+        "the -ge-0 arm stamped 0/0 'safe shape'; -gt 0 sends it to the "
+        "UNMEASURED else", block)
+
+
+def test_binary_fixture_append_sibling_is_the_positive_control(binarycarrier_repo):
+    """The mutation proof (guard-4166): the fix must make the binary ref
+    UNMEASURED WITHOUT flipping a genuine text append off "safe shape".
+    Reverting `-gt` to `-ge` flips the test above; dropping the shape arm
+    flips this one."""
+    work = binarycarrier_repo["work"]
+    block = _ref_block(_consume(work, "--check").stdout, "sid-append")
+    assert "append-only (+2 / -0): safe shape" in block, block
+    assert "UNMEASURED" not in block, (
+        "a genuine text append must keep its shape verdict", block)

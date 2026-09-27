@@ -26,6 +26,7 @@ from _cadence_anchor import is_deliberate_raise as _is_deliberate_raise
 from _gate_log import log as _gate_log
 from _goal_census import effective_counts as _effective_counts  # B9-deep census-augmented counts
 from _goal_census import all_evicted_ids as _all_evicted_ids  #  mint-site tombstone awareness
+import _decomposed_dependents  #  — shared with the daemon's update_goal
 
 # Default paths point to world/ (collective task queue).
 # Overridden to agent/ at runtime when --source agent is passed.
@@ -1822,6 +1823,17 @@ def cmd_update_goal(args):
         _check_not_archived(asp["id"])
         goal = asp["goals"][goal_idx]
 
+        # : plan the re-point of a decomposed parent's live
+        # dependents BEFORE anything mutates, so a refusal writes nothing. The
+        # plan is applied at the terminal hook below, ahead of the strip.
+        # Twin of the daemon's update_goal; both call _decomposed_dependents.
+        _decomp_plan = None
+        if field == "status" and value == "decomposed":
+            _decomp_plan = _decomposed_dependents.plan(items, goal_id)
+            if _decomp_plan["refuse"]:
+                print(f"REFUSED: {_decomp_plan['message']}", file=sys.stderr)
+                sys.exit(1)
+
         # : apply the companion outcome_note before the primary field
         # write (mirror of the daemon's in-lock apply; same one-RMW property).
         if companion_note is not None:
@@ -3028,6 +3040,9 @@ def cmd_update_goal(args):
         # Claim-clearing invariant (convention Rule 3): terminal transition clears claim.
         # Keyed off TERMINAL_GOAL_STATUSES so any future terminal status auto-enrolls.
         if field == "status" and value in TERMINAL_GOAL_STATUSES:
+            if _decomp_plan is not None:
+                for _line in _decomposed_dependents.apply(items, _decomp_plan, goal_id):
+                    print(_line, file=sys.stderr)
             _clear_stale_blockers(items, {goal_id})
             goal.pop("claimed_by", None)
             goal.pop("claimed_at", None)

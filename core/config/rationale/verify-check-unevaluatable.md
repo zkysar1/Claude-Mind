@@ -81,7 +81,7 @@ most likely to carry entity facts"); the measurement falsifies it, and the
 falsification is recorded here rather than left for the next reader to
 re-derive.
 
-## Q4 — why the sample is scripted, and its two traps
+## Q4 — why the sample is scripted, and its traps
 
 **Why a script picks the claims.** The goal's own wording is "script-gated sample
 selection so the executor cannot cherry-pick". An executor asked to spot-check a
@@ -140,6 +140,26 @@ agreement, which is strictly worse than no reading at all. `unknown` is reported
 in the audit's `q4_states` tally so the ambiguous population stays countable
 while it drains. (g-115-9618; guard-1753 "could not resolve" != "resolved and
 found nothing"; guard-2223 tri-state over a collapsed bool.)
+
+**Trap 4 — a product-repo file (g-115-9674).** Until 2026-09-26 the recorder
+admitted only in-repo and world paths. A product-repo file (under an
+`AGENT_WRITE_PATH` root, outside the repo) was never recorded, however it was
+read. So an accurate citation of it scored `decorative-citation`, the same verdict
+as a file never opened. Re-reading did not help, because the barrier was scope,
+not read method. `context-reads.is_in_scope_record` now records those reads, for
+the recorder ONLY; the dedup gate and the pre-edit advisory keep their own
+scopes. Trap 2's remedy therefore reaches product files too. A decorative finding
+on one means the file was not Read with the Read tool this session, or was read
+before a compaction cleared the manifest (g-115-10759).
+
+Two other dispositions were rejected, with their costs measured on one control
+artifact. Marking an untrackable path not-adjudicable would also have demoted
+the UNREAD product citation. That citation still fails after the fix, and under
+this option it would have become advisory, silencing Q4 on product work (the
+largest work class at the 2026-08-21 census). An audited override would weaken
+the no-override stance defended by guard-6180 and g-115-9664. Still outside
+every scope: tokens that are not files (HTTP routes, parameter names, remote
+paths, git refs; g-115-9121), and Bash reads (g-115-8776).
 
 ## Cross-references
 

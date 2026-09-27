@@ -65,10 +65,25 @@ bash core/scripts/promotion-preflight.sh --source <staging-clone> --target <this
 this repo's installed copy. The gate is part of the payload, so a Mind that is
 behind holds the OLDEST gate in the chain: measured 2026-09-25 against ZDS on
 v2.12.3, the v2.12.83 gate left 30 of 50 ZDS-authored files unflagged and the
-g-115-10758 gate left 0. `framework_pull.py --adopt` still runs the INSTALLED
-gate (it resolves its repo and its preflight from its own location), so a file
-only the incoming gate flags is not protected by that adopt; a registry row
-cannot reach it, only a back-port (§f) can.
+g-115-10758 gate left 0. The executor runs the gate that sits beside it, so a
+Mind's OWN `framework_pull.py` runs its installed gate. Point the INCOMING
+executor at this repo instead (g-115-10903; it needs a release that carries
+`--project-root`, so check the executor's `--help` first):
+
+```bash
+source core/scripts/_paths.sh   # this repo's PROJECT_ROOT and WORLD_DIR
+python3 <staging-clone>/core/scripts/framework_pull.py --plan \
+    --source-repo <staging-clone> --project-root "$PROJECT_ROOT" --world-dir "$WORLD_DIR"
+```
+
+Then re-run it with `--adopt` in place of `--plan`. A foreign `--project-root` without
+`--world-dir` is refused, because the executor's own world holds another
+deployment's installed tag and decision registry. Run it from THIS Mind's
+shell: C4 verify runs this repo's suite with the inherited environment, and an
+inherited `MIND_WORLD` outranks a repo's own world (`_paths.sh`). Measured
+2026-09-26 against a downstream clone 167 framework-path commits past its last transplant:
+this plan flagged all 50 downstream-authored differing files, and the
+downstream's installed gate flagged 12 of the 50.
 
 * **exit 0** — target framework is a subset of source. Proceed.
 * **exit 2** — DRIFT. For EVERY flagged file, run

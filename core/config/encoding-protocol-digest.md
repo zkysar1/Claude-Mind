@@ -167,6 +167,18 @@ For each such node, four checks:
    lens (encode-session Lane 4.2), not a node edit.
 ```
 
+**A corrected claim has TWO surfaces (guard-3886).** Checks 1 and 2 edit
+the node BODY, but retrieval serves the node's `_tree.yaml` summary, and
+nothing regenerates that summary from the body. After any body correction,
+grep the summary for the same figure, count, status or date. If it still
+asserts the old claim, PREPEND a dated correction and keep the original
+text as history (guard-3886 steps 7-8). `tree-update.sh --set` writes
+`_tree.yaml` only, so then run `load-tree-summary.sh` and confirm the new
+text through `retrieve.sh`; `tree-read --node` reads `_tree.yaml` directly
+and hides a stale cache (guard-740). Measured 2026-09-26: an encode pass
+corrected a count in a node body, the summary kept the old count, and only
+a fresh-eyes review the next day caught it.
+
 Every edit follows write step 6 (front matter + T21) and Section D
 coordination. Report counts per pass: claims reconciled / contradictions
 corrected / addenda appended / nodes bolstered.

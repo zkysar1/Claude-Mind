@@ -385,6 +385,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
 
     live = []
     seam_missing = []
+    _seg_stamps = []
     for _lp in live_paths:
         if _lp == ch_path:
             # Hot path unchanged: the base file keeps its mtime-keyed cache.
@@ -398,6 +399,7 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             _recs, _miss = _board_paths.read_paths([_lp])
             live.extend(_recs)
             seam_missing.extend(_miss)
+            _seg_stamps.extend(t for t in (_parse_ts(m.get("timestamp")) for m in _recs) if t)
     messages = live
     archive_note = None
     archive_unverified = False
@@ -418,7 +420,15 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         # all — that is what keeps the common read exactly as cheap as before.
         _live_stamps = [t for t in (_parse_ts(m.get("timestamp")) for m in live) if t]
         _earliest_live = min(_live_stamps) if _live_stamps else None
-        if _earliest_live is None or cutoff < _earliest_live:
+        # ...OR when it predates the earliest SEGMENT record (). Segment
+        # retention moves the oldest segments into the archive, so the moved days
+        # sit AFTER the base file's own posts, which stop growing at the flip and
+        # keep the older earliest stamp. Keyed on the base file alone, a window
+        # reaching a moved day never opens the archive and loses that day. With no
+        # segment on disk this adds nothing, so today's cost guarantee is intact.
+        _earliest_seg = min(_seg_stamps) if _seg_stamps else None
+        if (_earliest_live is None or cutoff < _earliest_live
+                or (_earliest_seg is not None and cutoff < _earliest_seg)):
             arch_path = _archive_path(ctx, channel)
             # REFRESH BEFORE THE TAIL READ (). *-archive.jsonl is excluded
             # from the own-cloud eager pull (), which relies on reads going

@@ -980,3 +980,82 @@ def test_owner_coverage_is_read_from_its_opening_not_its_tail(monkeypatch):
     r = sq.decide(pair["relay"], corpus, _LIVE_NOW, None, 900.0)
     assert r["decision"] == "DECLINE", r
     assert r["cited_goal_id"] == "g-999-999", r
+
+
+# -- : the terminal window anchors on the RELAY's own _item_ts -------
+# A BACKLOG relay is SCORED weeks after it was captured (the reducer spark
+# replay drains the oldest of a large capture slot). Its owner most likely went
+# terminal near the relay's OWN capture time, not near replay-time, so a window
+# anchored on `now` (replay-time) is structurally blind to it and every
+# backlog-age relay reads FILE. MEASURED at the  close (2026-09-26):
+# 25 backlog relays (2-5 weeks old), ALL FILE, including a security relay
+# already fixed upstream. decide() now anchors the terminal window on a
+# per-record reference_time; batch_decide reads it from each record's _item_ts
+# (wm.py stamps that on every capture append) and falls back to `now` when
+# absent, so every test above is unchanged.
+#
+# guard-4166 governs: the fix makes a false FILE STOP APPEARING, so every
+# DECLINE assertion is paired with an alien-token FILE control that must NOT
+# flip, and the mutation proof shows the now-anchored path still FILEs.
+# guard-2613: _item_ts and the owner's completed_date are on the SAME clock
+# (both naive UTC wall time by fleet convention), so _parse_ts on one is
+# comparable to _goal_time on the other.
+
+BACKLOG_NOW = datetime(2026, 9, 26, 12, 0, 0)          # replay-time: weeks later
+# The owner went terminal ~a month before replay-time -- far past the 72h
+# lookback from `now`, so a now-anchored window cannot see it.
+BACKLOG_OWNER = dict(COMPLETED_OWNER, completed_date="2026-08-28T00:00:00")
+# The relay was CAPTURED 6h after that owner closed: within 72h of the owner,
+# ~29 days before replay-time.
+BACKLOG_ITEM_TS = "2026-08-28T06:00:00"
+
+
+def test_backlog_relay_declines_on_its_own_item_ts_while_control_still_files():
+    """THE  REGRESSION. A relay captured near its owner's terminal date
+    but SCORED weeks later must still see that owner. Both rows ride the SAME
+    batch against the SAME corpus and the SAME replay-time `now`, so an
+    implementation that widened the window for everything would fail on the
+    control row. FAILS on the pre-fix probe: there batch_decide anchored on
+    `now`, the owner fell ~29 days outside the 72h window, and this row FILEd."""
+    flagged = {"observation": RELAY, "_item_ts": BACKLOG_ITEM_TS}
+    control = {"observation": UNOWNED, "_item_ts": BACKLOG_ITEM_TS}
+    res = sq.batch_decide([flagged, control], [BACKLOG_OWNER], BACKLOG_NOW)
+    frow, crow = res["rows"]
+    assert frow["verdict"] == "DECLINE", frow
+    assert frow["cited_goal_id"] == BACKLOG_OWNER["id"], frow
+    assert crow["verdict"] == "FILE", crow             # control must NOT flip
+
+
+def test_backlog_decline_is_the_item_ts_anchor_not_a_widened_default():
+    """MUTATION PROOF (guard-4166 / guard-2903). The SAME owner and subject
+    scored at replay-time WITHOUT the relay's _item_ts -- decide()'s now-anchored
+    path, which every non-batch caller still takes -- FILEs. So it is the
+    per-record _item_ts anchor, not a general widening, that produces the
+    DECLINE. Asserts BEHAVIOUR, not source text (guard-6333)."""
+    now_anchored = sq.decide(RELAY, [BACKLOG_OWNER], BACKLOG_NOW)   # reference_time=None
+    assert now_anchored["decision"] == "FILE", now_anchored
+    ts_anchored = sq.decide(RELAY, [BACKLOG_OWNER], BACKLOG_NOW,
+                            reference_time=sq._parse_ts(BACKLOG_ITEM_TS))
+    assert ts_anchored["decision"] == "DECLINE", ts_anchored
+    assert ts_anchored["cited_goal_id"] == BACKLOG_OWNER["id"], ts_anchored
+
+
+def test_recent_relay_with_a_stale_owner_still_files():
+    """DO-NOT-OVERFIRE (guard-5147: a false DECLINE is the silent, permanent
+    failure direction). Per-record anchoring widens the window for OLD relays
+    only. A relay captured RECENTLY does not reach an owner that closed months
+    before it, so the window stays REAL rather than reaching back forever."""
+    stale_owner = dict(COMPLETED_OWNER, completed_date="2026-04-01T00:00:00")
+    recent = {"observation": RELAY, "_item_ts": "2026-09-26T09:00:00"}
+    row = sq.batch_decide([recent], [stale_owner], BACKLOG_NOW)["rows"][0]
+    assert row["verdict"] == "FILE", row
+
+
+def test_backlog_relay_without_item_ts_falls_back_to_now():
+    """BACKWARD COMPAT. A record with no _item_ts is anchored on `now` exactly as
+    before the fix, so every batch test above (whose records carry no _item_ts)
+    is preserved: the same old owner that DECLINEd WITH the anchor FILEs
+    without it."""
+    no_ts = {"observation": RELAY}                       # no _item_ts key
+    row = sq.batch_decide([no_ts], [BACKLOG_OWNER], BACKLOG_NOW)["rows"][0]
+    assert row["verdict"] == "FILE", row

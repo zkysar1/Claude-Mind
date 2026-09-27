@@ -1324,7 +1324,8 @@ def _with_repair_verdict(base: str, repair: str | None) -> str:
 
 def close_body_late(sid: str, agent: str,
                     project_root: Path | None = None, *,
-                    no_wm_state: str = "closed-stale") -> str:
+                    no_wm_state: str = "closed-stale",
+                    accept_parked: bool = False) -> str:
     """Close a Body whose session already ENDED without closing it ().
 
     The close above runs only in the turn-ending session's own stop hook, so a
@@ -1338,7 +1339,16 @@ def close_body_late(sid: str, agent: str,
       'no-manifest' / 'bad-manifest' — nothing to close
       'not-active'  — parked or already closed: untouched. A park is RESUMABLE by
                       contract (g-306-291) and ends only through its own expiry,
-                      so a late close never converts one into a close.
+                      so a late close never converts one into a close — UNLESS
+                      the caller passes accept_parked=True (g-306-520). That
+                      resumability lives in the Body's process: a park whose
+                      process is gone can never re-enter to run its own expiry,
+                      so without this nothing ever closes or stages it. ONLY a
+                      caller that proved the session gone from the harness
+                      registry may pass it (abandoned_sessions.late_close_pass,
+                      whose seven conditions hold a live park as `running`).
+                      The bash reap and graceful stop do not pass it, so they
+                      keep the refusal byte-identically.
       'no-manifest-push-failed' / 'not-active-push-failed' — as the two above,
                       AND the orphan-carrier repair those paths perform was
                       written locally but REFUSED delivery (g-115-9607 unit 28).
@@ -1369,9 +1379,9 @@ def close_body_late(sid: str, agent: str,
         return _with_repair_verdict("no-manifest", repair)
     except ManifestParseError:
         return "bad-manifest"
-    if data.get("body_state") != "active":
-        repair = _reconcile_orphan_carrier(sid, agent, data.get("body_state"),
-                                           project_root)
+    state = data.get("body_state")
+    if state != "active" and not (accept_parked and state == "parked"):
+        repair = _reconcile_orphan_carrier(sid, agent, state, project_root)
         return _with_repair_verdict("not-active", repair)
     if not (session_dir / _WM_FILENAME).is_file():
         # : WHICH closed value this writes is the caller's to say.

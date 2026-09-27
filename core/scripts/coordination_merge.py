@@ -59,6 +59,10 @@ import yaml
 # (). Importing it here keeps the MERGER's answer to "is this a
 # segment, and of what" identical to the reader's and the writer's.
 from _board_paths import live_name, segment_parent
+# Same one-definition discipline for the retrieval-trace segments ():
+# the writer, the readers and this merger all take "is this a segment, and of
+# what" from _retrieval_trace. Stdlib-only, so safe at module level like above.
+from _retrieval_trace import segment_parent as _retrieval_trace_parent
 
 # Ring-buffer ceiling for team-state.recent_completions. Kept in sync with
 # core/scripts/team-state.py MAX_RECENT_COMPLETIONS (not imported — that module
@@ -5646,7 +5650,7 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
     store is not merge-registered (the backend then keeps its safe-freeze
     behavior for that path).
 
-    Dispatch is by basename EXCEPT for TEN path-pattern branches that run
+    Dispatch is by basename EXCEPT for ELEVEN path-pattern branches that run
     BEFORE the _HANDLERS lookup, so a basename grep alone is NOT a complete
     classifier (see each branch's own comment below for why it exists):
       1. per-agent team-state shards  ``.../team-state/agents/<name>.yaml``
@@ -5673,10 +5677,12 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
       10. rotated board stores ``world/board/<registered>.jsonl`` -- a basename
           registered to the plain line-union is SWAPPED for its rotation-aware
           variant, merge_rotated_board_jsonl (g-358-81)
-    Branches 1-4 and 7-9 register stores whose basenames are DYNAMIC and therefore
+      11. retrieval-trace date segments ``retrieval-trace-<YYYY-MM-DD>.jsonl``
+          -- inherit whatever _HANDLERS registers for the legacy file (g-358-220)
+    Branches 1-4, 7-9 and 11 register stores whose basenames are DYNAMIC and therefore
     unenumerable; branch 5 un-registers a path whose basename is AMBIGUOUS. So
     the answer to "is this store merge-protected?" can be YES with no basename
-    entry (1-4, 7, 8) and NO despite one (5) -- always resolve through this function,
+    entry (1-4, 7, 8, 11) and NO despite one (5) -- always resolve through this function,
     never through a grep of the dict. Branch 10 changes WHICH handler, never
     whether one exists, so for it a dict grep names the wrong function.
 
@@ -5900,6 +5906,18 @@ def merge_handler_for(path) -> Optional[Callable[[bytes, bytes], bytes]]:
                 _registered = _HANDLERS.get(live_name(_parent))
         if _registered is merge_append_only_jsonl:
             return merge_rotated_board_jsonl
+    # ELEVENTH path-pattern case (): the retrieval-trace date segments
+    # `retrieval-trace-YYYY-MM-DD.jsonl`. Branch 10's  shape: a segment
+    # INHERITS its parent's registration, looked up in _HANDLERS rather than
+    # hardcoded, so a later change to the legacy file's handler carries the
+    # segments with it. Registered BEFORE any segmented writer exists (guard-1055):
+    # a handler-less segment under concurrent cross-box appends write-freezes.
+    # guard-1816, walked 2026-09-27: one writer (retrieve.py _log_retrieval_trace,
+    # a bare append) and no store-hygiene rotation or age cap, so a segment is
+    # append-only for its whole life and a union cannot resurrect a deletion.
+    _rt_parent = _retrieval_trace_parent(parts[-1])
+    if _rt_parent is not None and _HANDLERS.get(_rt_parent) is not None:
+        return _HANDLERS[_rt_parent]
     # Second PATH-PATTERN case (), for the opposite reason to the
     # shard branch above: that one exists because the basenames are DYNAMIC,
     # this one because a basename can be AMBIGUOUS. A name registered in

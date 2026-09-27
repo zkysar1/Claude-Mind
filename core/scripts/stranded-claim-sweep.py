@@ -1539,6 +1539,7 @@ def _reap_stale_body_rows(
         )
         from worker_stall import (  # noqa: PLC0415
             read_claims_union,
+            read_goal_meta,
             read_known_goal_ids,
             read_terminal_goal_ids,
         )
@@ -1674,6 +1675,38 @@ def _reap_stale_body_rows(
 
     known_ids = _read_known()
 
+    def _read_goal_meta() -> "Optional[Dict[str, dict]]":
+        """Per-goal {recurring, lastAchievedAt, claimed_by_sid} for the
+        OCCURRENCE-OVER reap, or None when unanswered (g-306-509).
+
+        The TWO LIVE queues, like `_read_terminal` and NOT `_read_known` — a
+        recurring goal that is still cycling lives in a live queue with its
+        current `lastAchievedAt`; the archive would only supply a stale one, so
+        it is deliberately excluded (see `read_goal_meta`).
+
+        Returns None on `via == "none"` for parallelism with its siblings, but
+        this is conservatism, not correctness: the reaper reaps on the PRESENCE of
+        a fact here, so a missing/partial census can only ever MISS a reap, never
+        mint one (the exact inverse of `_read_known`, where None is mandatory).
+        """
+        try:
+            meta, via = read_goal_meta(
+                Path(WORLD_DIR) / "aspirations.jsonl",
+                agent_dir(agent) / "aspirations.jsonl",
+            )
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(
+                f"goal-meta-read: {type(exc).__name__}: {exc}")
+            return None
+        out["goal_meta_via"] = via
+        if via == "none":
+            out["errors"].append(
+                "goal-meta-read: no layer answered (provenance=none)")
+            return None
+        return meta
+
+    goal_meta = _read_goal_meta()
+
     def _verdicts(sids) -> Dict[str, Any]:
         got: Dict[str, Any] = {}
         for sid in sids:
@@ -1685,7 +1718,7 @@ def _reap_stale_body_rows(
         return got
 
     decision = _reaper.decide(rows, _verdicts(rows.keys()), claims, self_sid,
-                              terminal_ids, known_ids)
+                              terminal_ids, known_ids, goal_meta)
     out["verdict_counts"] = decision["verdict_counts"]
     out["decisions"] = decision["decisions"]
     out["reap_candidates"] = len(decision["reapable"])
@@ -1737,9 +1770,19 @@ def _reap_stale_body_rows(
         # outside (guard-1943: pinning the decision says nothing about the
         # wiring). Pinned by a test that asserts the reap actually applies.
         fresh_known = _read_known()
+        # The occurrence-over census is the FIFTH half () and gets the
+        # same guard-1943 treatment as `fresh_known` above: re-read here, never
+        # reused from the scan. `goal_meta_by_id` defaults to None, and None means
+        # NOT MEASURED, so a recheck that skipped this read would hand every
+        # occurrence-over candidate `goal_occurrence_over=None` and decline it as
+        # `recheck-declined` forever — the scan would keep reporting candidates and
+        # the apply loop would reap none, the INERT-at-apply defect that looks like
+        # healthy conservatism from outside. Pinned by a test that asserts the reap
+        # actually applies.
+        fresh_goal_meta = _read_goal_meta()
         recheck = _reaper.decide(
             {sid: fresh_rows[sid]}, _verdicts([sid]), fresh_claims[0], self_sid,
-            fresh_terminal, fresh_known
+            fresh_terminal, fresh_known, fresh_goal_meta
         )
         if not recheck["reapable"]:
             cand["apply_result"] = "recheck-declined"

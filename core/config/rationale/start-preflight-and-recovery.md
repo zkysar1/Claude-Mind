@@ -26,16 +26,29 @@ path (user directive 2026-08-03: exactly one way of doing things; the interim
 instead — for the rare case where you intend to MOVE the reducer here and a
 temporary worker would be unwanted noise.
 
-## - --mode <value: mode flag. Valid values: reader, assistan
+## Why each Step 0.5 flag behaves as it does
 
-*(was `start/SKILL.md` L51-56)*
+*(moved from `start/SKILL.md` Step 0.5 by g-115-10958 — the skill keeps the
+compact operative bullets; this keeps the reasons. The flag list had been left
+ONLY here by the g-115-7706 pass, so Step 0.5 parsed nothing.)*
 
-- `--mode <value>`: mode flag. Valid values: `reader`, `assistant`, `autonomous`. If omitted, default to `autonomous`. This default applies uniformly — including the Phase A-0 transplant-resume path, where a bare `/start <agent>` on a freshly-cloned agent resumes it autonomously, exactly like a bare `/start` on any IDLE agent. Pass `--mode reader` (or `assistant`) explicitly for the cautious first-boot-on-a-new-machine case.
-- `--recover`: recovery flag. Set `recover = true` if any argument is the literal string `--recover`. This flag triggers the crashed-runner cleanup in Step 0.7 below. Only meaningful when agent state is RUNNING; fails loud otherwise.
-- `--force`: force flag. Set `force = true` if any argument is the literal string `--force`. Bypasses the heartbeat-staleness precondition on `--recover` (emergency override for the "heartbeat fresh but runner is stuck" case). No effect outside recovery.
-- `--body <anything>`: REMOVED (2026-08-03 — same-day supersede of g-306-119-a's explicit flag; user directive: exactly one way, derivation). Any argument that is the literal `--body` (with or without a value) is a HARD ERROR with this exact explanation: "`--body` was removed — the body role is always DERIVED: a bare `/start <agent>` auto-joins as a worker whenever a live reducer holds the claim elsewhere (rc=4). Use `--reducer-only` to refuse the auto-join." Do NOT silently ignore it — old docs and muscle memory deserve the explanation, not a mystery no-op.
-- `--reducer-only`: set `reducer_only = true` when any argument is the literal string `--reducer-only`. Consumed at exactly ONE place: the ACQUIRE_RC=4 branch of the autonomous IDLE flow below, where it REFUSES the automatic worker-join and displays the holder-naming refusal instead. Use it when the intent is to MOVE the reducer to this box (/stop on the holder, then /start here) and a temporary worker would be unwanted noise.
-- `--override-output-style <justification>`: override flag for the Step 0.6 + C7.7 autonomous+Explanatory gate. When present with a non-empty justification string, Step 0.6 lets the autonomous mode proceed, and C7.7 passes the same value to `output-style-gate.sh --override` for audit logging. The justification is echoed to `world/output-style-overrides.jsonl`.
+- `--mode`: the `autonomous` default applies uniformly — including the Phase
+  A-0 transplant-resume path, where a bare `/start <agent>` on a
+  freshly-cloned agent resumes it autonomously, exactly like a bare `/start`
+  on any IDLE agent. Pass `--mode reader` (or `assistant`) explicitly for the
+  cautious first-boot-on-a-new-machine case.
+- `--force`: the emergency override for the "heartbeat fresh but runner is
+  stuck" case.
+- `--body`: REMOVED 2026-08-03 — same-day supersede of g-306-119-a's explicit
+  flag (user directive: exactly one way, derivation). It is a hard error, not
+  a silent no-op, because old docs and muscle memory deserve the explanation,
+  not a mystery no-op.
+- `--reducer-only`: use it when the intent is to MOVE the reducer to this box
+  (/stop on the holder, then /start here) and a temporary worker would be
+  unwanted noise.
+- `--override-output-style`: C7.7 passes the value to `output-style-gate.sh
+  --override` for audit logging; the justification is echoed to
+  `world/output-style-overrides.jsonl`.
 
 ## The helper checks 6 signals (state == RUNNING, heartbeat s
 
@@ -59,14 +72,6 @@ temporary worker would be unwanted noise.
    - `1` = runner is ALIVE (at least one liveness signal positive)
    - `2` = script error (fail-open conservative — refuse recovery)
 
-## returned script error (rc=2). Investigate the helper and i
-
-*(was `start/SKILL.md` L116-118)*
-
-   returned script error (rc=2). Investigate the helper and its sub-probes
-   (`heartbeat-stale.sh`, `runner-recent-block.sh`, `session-signal-exists.sh`,
-   `background-jobs.sh`) before retrying." and exit without state changes.
-
 ## signals (--force):" followed by the helper's stderr per-co
 
 *(was `start/SKILL.md` L140-143)*
@@ -75,6 +80,38 @@ temporary worker would be unwanted noise.
    Append a JSON audit record to `agents/<agent-name>/session/recovery-force-audit.jsonl`
    using the explicit locked-append helper so the write is race-safe even when
    two terminals attempt `--recover --force` concurrently:
+
+## Why the runner claim is released before the manifest-clear
+
+*(was the prose under Step 0.7's `runner-claim.sh release` bullet; moved by
+g-115-10958 to keep the skill under its injection ceiling)*
+
+  DDB claim release with the crashed session's OLD on-disk runner-token
+  (2026-07-07 bravo dual-runner follow-through). A crashed runner leaves its
+  DDB row RUNNING; local recovery flips only LOCAL state, so without this
+  release the fresh acquire below is held hostage by its OWN stale row for
+  up to OWNERSHIP_STALE_SECONDS (~65 min post-calibration). MUST run BEFORE
+  manifest-clear — `runner-token` is `recovery_action: clear`, so the old
+  token is deleted by the next step. Token-conditional and idempotent: if a
+  peer machine already stale-broke and re-claimed, the old token no longer
+  matches and this is a no-op — it can never steal a peer's claim. Fail-open
+  (`|| true`): a DDB hiccup must never block recovery.
+
+## Why the clear is manifest-driven and runs after state-set IDLE
+
+*(was the prose under Step 0.7's `session-manifest-clear.sh` bullet; moved by
+g-115-10958)*
+
+  Manifest-driven clear of every session file with `recovery_action: clear`.
+  Runs AFTER state-set IDLE succeeded (g-115-683 reorder); the cleanup
+  window now shows state=IDLE + sid present instead of state=RUNNING +
+  sid=missing. SINGLE SOURCE OF TRUTH for the clear operation —
+  `recovery-gate.sh` (SessionStart hook auto-recovery) calls the same
+  script, and both consume `session-snapshot.sh --output json` (the
+  canonical manifest parser, also used by `session-desync-check.sh`). The
+  three signal files (`stop-requested`, `stop-loop`, `loop-active`) are all
+  `recovery_action: clear` in the manifest, so this one call handles them
+  too — no separate `session-signal-clear.sh` calls are required.
 
 ## Manual override: clear the recovery-circuit-breaker counte
 

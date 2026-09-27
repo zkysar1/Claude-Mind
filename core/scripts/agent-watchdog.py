@@ -53,6 +53,10 @@ Active probes:
   - GitDriftProbe — per-box ahead/behind vs origin/main, LIVE-Body carrier-ref
     unconsumed depth, and host disk used% (g-115-6128). Throttled fetch; files
     ONE box-scoped Investigate goal and retires it when the drift clears.
+  - ReleaseTrainProbe — frontier-only: the newest v* tag is >= release_train.
+    stale_hours old with framework commits past it on origin/main (g-115-11017).
+    Files ONE fleet-wide Investigate goal per stalled tag and retires it when a
+    newer tag lands; release-train-check.sh is the read-only re-measure.
 
 LOG FORMATS
 -----------
@@ -3462,6 +3466,299 @@ class GitDriftProbe(Probe):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ReleaseTrainProbe — the release train's time-push trigger ()
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ReleaseTrainProbe(Probe):
+    """The newest v* tag is >= stale_hours old with framework commits past it.
+
+    THE GAP. promotion-runbook.md "Who cuts, and WHEN" (g-373-82) makes this
+    state a FINDING someone must dispose of rather than pass over, and nothing
+    surfaced it: measured 2026-09-26, a 38.8h gap went unflagged until a goal
+    that needed the cut was picked up through a directive, while two worker
+    units before that re-anchored a time floor on a reason the runbook had
+    already retired (g-115-11017). Measurement and verdict are
+    `_release_train` — the same code `release-train-check.sh` prints, so what a
+    reader re-measures is what fired.
+
+    A FLEET-WIDE LEASE KEYED ON THE TAG. The condition lives on origin/main,
+    not on a box, so the signal names the stalled tag and no box: every
+    frontier reducer measures the same refs, the first to see the stall files,
+    and the world-queue dedup keeps the rest from re-filing. The board post
+    goes out only on an actual filing, so the fleet reads one post per stall,
+    not one per reducer. The lease is released (guard-3419) once the finding
+    clears — a newer tag, or nothing framework-relevant past this one — and a
+    lease on an OLDER tag is retired as soon as a newer tag is the one stalled.
+
+    FRONTIER ONLY, REDUCER ONLY. A deployment that is not the frontier does
+    not cut releases, so the probe is inert there. It is registered for the
+    reducer only (not in WORKER_SAFE_PROBES), and the goal carries
+    executable_by_role=reducer, because the cut is made on main and a worker
+    Body commits to its carrier ref.
+
+    ADVISORY BY CONTRACT. It never cuts, tags, pushes or promotes: the runbook
+    is explicit that time-push is "not an automatic cut". The disposal — cut
+    and promote, or close the goal with why not — is a deliberate act. While
+    the goal is open, iteration-close.sh prints its in-turn nudge
+    (`release-train-check.py --nudge`).
+    """
+
+    name = "release-train"
+
+    def __init__(self, ctx: WatchdogContext) -> None:
+        super().__init__(ctx)
+        self.consecutive_breach = 0
+        self.fired = False
+        self.fired_tag: Optional[str] = None
+        # Why the last tick was quiet (not frontier, not due, unmeasured),
+        # persisted so a reader can rule a cause in or out (guard-1955).
+        self.last_reason: Optional[str] = None
+
+    def check(self) -> list[Event]:
+        import _release_train as rt
+        try:
+            from _paths import WORLD_DIR as _world
+        except Exception:  # noqa: BLE001
+            _world = None
+        role = rt.self_role(_world)
+        if role != "frontier":
+            self.last_reason = f"not this deployment's train (self_role={role!r})"
+            return []
+        cfg = rt.config()
+        m = rt.measure(self.ctx.project_root_path, rt.framework_paths())
+        verdict = rt.decide(m, cfg["stale_hours"])
+        self.last_reason = verdict["reason"]
+        if m.get("error"):
+            return []  # unmeasured: file nothing, retire nothing
+        open_goals = rt.open_release_goals(_world, self.ctx.agent_dir)
+        payload = {
+            "agent": self.ctx.agent_name,
+            "newest_tag": m["newest_tag"], "tag_created": m["tag_created"],
+            "tag_age_hours": m["tag_age_hours"], "commits_past": m["commits_past"],
+            "commit_sample": m["commit_sample"],
+            "fetch_age_minutes": m["fetch_age_minutes"],
+            "stale_hours": cfg["stale_hours"], "reason": verdict["reason"],
+            "open_goals": [g.get("id") for g in open_goals],
+        }
+
+        if verdict["due"]:
+            tag = m["newest_tag"]
+            signal = rt.signal_for(tag)
+            if self.fired_tag != tag:
+                # A different tag stalled: a new episode, not a continuation.
+                self.consecutive_breach = 0
+                self.fired = False
+            self.consecutive_breach += 1
+            payload["consecutive_breach"] = self.consecutive_breach
+            older = [g for g in open_goals if g.get("origin_signal") != signal]
+            if older:
+                payload["retired"] = self._retire_release_goals(
+                    older, f"a newer tag, {tag}, has been cut since this goal was filed")
+            # Same fired-latch re-validation as GitDriftProbe: a lease closed
+            # without a cut while the gap persists must be re-fileable, or the
+            # detector has silently stopped detecting (guard-4870).
+            revalidate = cfg.get("ticks_to_revalidate") or 0
+            if self.consecutive_breach >= cfg["ticks_to_file"] and (
+                    not self.fired
+                    or (revalidate and self.consecutive_breach % revalidate == 0)):
+                goal = self._file_release_goal(m, cfg, open_goals)
+                if goal.get("filed") or goal.get("dedup"):
+                    self.fired = True
+                    self.fired_tag = tag
+                payload["goal"] = goal
+                if goal.get("filed"):
+                    payload["board"] = self._post_board_alert(m, verdict, goal)
+                return [Event(
+                    probe=self.name, event="release_train_stalled", severity="critical",
+                    payload=payload,
+                    summary=(f"{self.name}: release train stalled - {verdict['reason']} "
+                             f"({goal.get('goal_id') or goal.get('error')})"),
+                )]
+            return []
+
+        cleared = (self._retire_release_goals(open_goals, verdict["reason"])
+                   if open_goals else {})
+        was_fired = self.fired
+        self.consecutive_breach = 0
+        self.fired = False
+        self.fired_tag = None
+        if was_fired or cleared.get("closed"):
+            payload["closed"] = cleared
+            return [Event(
+                probe=self.name, event="release_train_cleared", severity="info",
+                payload=payload,
+                summary=(f"release train moving again - {verdict['reason']}"
+                         + (f" ({cleared.get('detail')})" if cleared.get("detail") else "")),
+            )]
+        return []
+
+    # ---- escalation ------------------------------------------------------
+
+    def _file_release_goal(self, m: dict, cfg: dict, open_goals: list) -> dict:
+        """File the one fleet-wide Investigate goal for this tag. Fail-open."""
+        import _release_train as rt
+        tag = m["newest_tag"]
+        signal = rt.signal_for(tag)
+        existing = [g.get("id") for g in open_goals if g.get("origin_signal") == signal]
+        if existing:
+            return {"filed": False, "dedup": True, "goal_id": existing[0],
+                    "error": "open goal exists (dedup)"}
+        try:
+            sample = "; ".join(m["commit_sample"]) or "none listed"
+            body = {
+                "title": (f"Investigate: release train stalled - {tag} is "
+                          f"{m['tag_age_hours']}h old with {m['commits_past']} framework "
+                          f"commit(s) past it on origin/main; cut and promote, or record why not"),
+                "priority": "HIGH",
+                "participants": ["agent"],
+                "category": "framework-infrastructure",
+                "origin_signal": signal,
+                "executable_by_role": "reducer",
+                "description": (
+                    f"agent-watchdog ReleaseTrainProbe measured the release train's time-push "
+                    f"trigger at the frontier: the newest v* tag reachable from origin/main is "
+                    f"{tag}, created {m['tag_created']} ({m['tag_age_hours']}h before the "
+                    f"measurement), and {m['commits_past']} non-merge commit(s) touching the "
+                    f"promotion's framework paths have landed on origin/main since (newest "
+                    f"first: {sample}). Basis: local origin/main, fetched "
+                    f"{m['fetch_age_minutes']} min before the measurement. "
+                    f"core/config/conventions/promotion-runbook.md 'Who cuts, and WHEN' "
+                    f"(g-373-82) makes a gap of >= {cfg['stale_hours']}h with commits past the "
+                    f"newest tag a FINDING to dispose of rather than pass over - not an "
+                    f"automatic cut. WHO: any frontier reducer; the runbook retires 'waiting "
+                    f"for the human to cut a tag' as a reason. FIRST re-measure - the "
+                    f"condition may have cleared since this was filed (guard-5308): "
+                    f"`git fetch origin main && bash core/scripts/release-train-check.sh`. "
+                    f"THEN DISPOSE, one of: (a) CUT AND PROMOTE per the runbook - merge "
+                    f"origin/main first (guard-5583), `bash core/scripts/release.sh patch "
+                    f"--summary \"...\"`, push the ONE new tag by name (`git push origin main "
+                    f"vX.Y.Z`, never --tags), then run the runbook's promotion phases; or "
+                    f"(b) if what landed past {tag} should not ship yet, close this goal "
+                    f"`skipped` with the reason - the probe re-files every "
+                    f"{cfg['ticks_to_revalidate']} ticks while the gap persists. This goal is "
+                    f"a SNAPSHOT keyed on {tag}: the probe retires it once a newer tag is cut. "
+                    f"Auto-filed by ReleaseTrainProbe (g-115-11017)."
+                ),
+            }
+            from _runtime_bash import BASH as _bash
+            _override_reason = (
+                "ReleaseTrainProbe owns exact fleet-wide dedup via its origin_signal "
+                "(one per stalled tag) plus a retire path; the goal-dup-gate's keyword "
+                "check false-positives on the release/tag/promotion tokens every "
+                "release-train goal shares (g-115-11017).")
+            proc = subprocess.run(
+                [_bash, "core/scripts/aspirations-add-goal.sh", ESCALATION_ASP,
+                 "--source", ESCALATION_SOURCE,
+                 "--override-duplication", _override_reason],
+                input=json.dumps(body, ensure_ascii=True),
+                capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"filed": False, "goal_id": None,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:200]}
+            try:
+                goal_id = json.loads(proc.stdout).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                goal_id = None
+            return {"filed": True, "goal_id": goal_id, "error": None}
+        except Exception as e:  # noqa: BLE001 — filing must not kill the event
+            return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
+
+    def _post_board_alert(self, m: dict, verdict: dict, goal: dict) -> dict:
+        """One coordination post per stall, from the box that filed. Every
+        reducer reads the coordination channel, and any frontier reducer can
+        dispose of the finding."""
+        try:
+            from _runtime_bash import BASH as _bash
+            text = (f"ReleaseTrainProbe: the release train is stalled - {verdict['reason']} "
+                    f"(promotion-runbook.md time-push). Goal: {goal.get('goal_id')}. Any "
+                    f"frontier reducer can dispose of it: cut and promote, or close the goal "
+                    f"with why not.")
+            proc = subprocess.run(
+                [_bash, "core/scripts/board-post.sh", "--channel", "coordination",
+                 "--type", "finding",
+                 "--tags", f"release-train,{m['newest_tag']},auto-probe"],
+                input=text, capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"posted": False,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:160]}
+            return {"posted": True, "msg_id": (proc.stdout or "").strip()[:64]}
+        except Exception as e:  # noqa: BLE001
+            return {"posted": False, "error": f"{type(e).__name__}: {e}"}
+
+    def _retire_release_goals(self, goals: list, reason: str) -> dict:
+        """Release the leases whose stall is over (guard-3419).
+
+        Pending-and-unclaimed only — work someone has started is never yanked
+        out from under them (guard-1007). Closed as `skipped`, never
+        `completed`: no release work happened FROM the goal, the condition
+        resolved. The note is written BEFORE the status, so a partial failure
+        leaves an open goal carrying a true sentence. Deliberately NOT gated on
+        self.fired, which is box-local and ephemeral: a lease filed by another
+        box or an earlier episode must still be retirable here.
+        """
+        closed, held = [], []
+        try:
+            from _runtime_bash import BASH as _bash
+            for g in goals:
+                gid = g.get("id")
+                if not gid:
+                    continue
+                if g.get("status") != "pending" or g.get("claimed_by"):
+                    held.append(f"{gid}:{g.get('status')}"
+                                f"{'/claimed' if g.get('claimed_by') else ''}")
+                    continue
+                note = (f"agent-watchdog ReleaseTrainProbe re-measured the release train: "
+                        f"{reason}. The stall this goal was filed for is over, so there is "
+                        f"nothing left for it to dispose of. No release work was done FROM "
+                        f"this goal - the condition resolved. The probe is retiring it as "
+                        f"`skipped`; if the status still reads open, that write did not land "
+                        f"and the goal is safe to close by hand (g-115-11017).")
+                ok = True
+                for field, value in (("outcome_note", note), ("status", "skipped")):
+                    proc = subprocess.run(
+                        [_bash, "core/scripts/aspirations-update-goal.sh", gid,
+                         field, value, "--source", g.get("_source", "world")],
+                        capture_output=True, text=True,
+                        cwd=str(self.ctx.project_root_path), timeout=60,
+                    )
+                    if proc.returncode != 0:
+                        held.append(f"{gid}:close-failed")
+                        ok = False
+                        break
+                if ok:
+                    closed.append(gid)
+        except Exception as e:  # noqa: BLE001 — a close failure must not kill the tick
+            return {"attempted": True, "closed": closed, "held": held,
+                    "detail": f"error: {type(e).__name__}: {e}"}
+        parts = []
+        if closed:
+            parts.append("closed " + ",".join(closed))
+        if held:
+            parts.append("held " + ",".join(held))
+        return {"attempted": True, "closed": closed, "held": held,
+                "detail": "; ".join(parts) or None}
+
+    def to_dict(self) -> dict:
+        return {"consecutive_breach": self.consecutive_breach,
+                "fired": self.fired,
+                "fired_tag": self.fired_tag,
+                "last_reason": self.last_reason}
+
+    def from_dict(self, state: dict) -> None:
+        if isinstance(state, dict):
+            self.consecutive_breach = int(state.get("consecutive_breach") or 0)
+            self.fired = bool(state.get("fired"))
+            tag = state.get("fired_tag")
+            self.fired_tag = tag if isinstance(tag, str) and tag else None
+            reason = state.get("last_reason")
+            self.last_reason = reason if isinstance(reason, str) else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DependencyFunnelProbe — the claimable frontier against the fleet
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -4099,7 +4396,8 @@ class WorkerStallProbe(Probe):
 
     def check(self) -> list[Event]:
         try:
-            from worker_stall import scan, is_alerting  # type: ignore
+            from worker_stall import (  # type: ignore
+                scan, is_alerting, V_STALLED_PARKED, PARK_MAX_MINUTES)
             from _paths import WORLD_DIR, agents_root  # type: ignore
         except Exception as e:
             sys.stderr.write(f"agent-watchdog: worker-stall import failed: {e}\n")
@@ -4196,8 +4494,8 @@ class WorkerStallProbe(Probe):
                     payload={**body, "stale_minutes": report.get("stale_minutes"),
                              "degraded_read": report.get("degraded_read")},
                     summary=(
-                        # TWO alerting verdicts since , and they need
-                        # different sentences. This summary used to end "while
+                        # One sentence per alerting verdict (three since
+                        # ). This summary used to end "while
                         # holding {held_goal}" unconditionally -- for a Body
                         # that died BETWEEN units held_goal is None BY
                         # DEFINITION (holding no claim is the whole condition),
@@ -4209,6 +4507,16 @@ class WorkerStallProbe(Probe):
                         f"{body.get('carrier_age_minutes')}m ago while holding "
                         f"{body.get('held_goal')}"
                         if body.get("held_goal") is not None else
+                        # : the third verdict is not "between units" --
+                        # the Body parked, never re-entered, and the store holds
+                        # no staged or consumed WM for it. Say that, and the cap
+                        # it outlived.
+                        f"WORKER STALL (parked past the {PARK_MAX_MINUTES / 60:g}h "
+                        f"cap): {body.get('agent')} body {sid} on "
+                        f"{body.get('host')} last re-entered "
+                        f"{body.get('carrier_age_minutes')}m ago and its WM never "
+                        f"reached the reducer (body_state='parked')"
+                        if verdict == V_STALLED_PARKED else
                         f"WORKER STALL (died between units): {body.get('agent')} "
                         f"body {sid} on {body.get('host')} last ticked "
                         f"{body.get('carrier_age_minutes')}m ago holding no claim, "
@@ -4848,6 +5156,7 @@ def build_probes(ctx: WatchdogContext) -> list[Probe]:
         MirrorWedgeProbe(ctx),
         MemoryHeadroomProbe(ctx),
         GitDriftProbe(ctx),
+        ReleaseTrainProbe(ctx),
         InfraComponentProbe(ctx),
         DependencyFunnelProbe(ctx),
         RetrievalIndexProbe(ctx),

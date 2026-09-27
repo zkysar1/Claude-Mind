@@ -2752,6 +2752,31 @@ git_drift:
   ticks_to_revalidate: 50
 
 # ------------------------------------------------------------------
+# Release-train time-push detection ( — agent-watchdog ReleaseTrainProbe)
+# ------------------------------------------------------------------
+# promotion-runbook.md "Who cuts, and WHEN" () makes a gap of >= 24h
+# since the newest v* tag, with framework commits on origin/main past it, a
+# FINDING someone must dispose of — and until  nothing detected it
+# (measured 2026-09-26: a 38.8h gap went unflagged). ReleaseTrainProbe files
+# ONE fleet-wide Investigate goal per stalled tag at the frontier and retires
+# it when a newer tag lands; release-train-check.sh is the read-only re-measure
+# and iteration-close.sh's in-turn nudge. Both read THESE values through
+# _release_train.config() (guard-308).
+release_train:
+  # The runbook's cutoff, and a JUDGMENT, not a measurement (guard-5202 clause
+  # c): it sits above ~90% of the inter-tag gaps and below every genuine stall
+  # the runbook measured. Change the runbook first, then this.
+  stale_hours: 24
+  # Read from shared refs, and the threshold is itself the hysteresis — the
+  # breach does not flap tick to tick — so file on the first due tick.
+  ticks_to_file: 1
+  # Re-file cadence while the gap persists after the goal was closed WITHOUT a
+  # cut (the fired-latch fix guard-4870 forced on GitDriftProbe). Same value as
+  # git_drift.ticks_to_revalidate so the probes re-file on one cadence. 0
+  # disables re-validation (fire once per stalled tag).
+  ticks_to_revalidate: 50
+
+# ------------------------------------------------------------------
 # Dependency-funnel detection (agent-watchdog DependencyFunnelProbe)
 # ------------------------------------------------------------------
 # A fleet of N Bodies is at most as parallel as its CLAIMABLE FRONTIER is

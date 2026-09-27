@@ -357,12 +357,63 @@ def test_session_dir_owned_by_another_user_holds(tmp_path, pushes):
     assert _state(tmp_path, DEAD) == "active"
 
 
-@pytest.mark.parametrize("state", ["parked", "closed-pending-merge", "merged", "closed-stale"])
-def test_only_active_manifests_are_candidates(tmp_path, pushes, state):
+@pytest.mark.parametrize("state", ["closed-pending-merge", "merged", "closed-stale"])
+def test_closed_manifests_are_never_candidates(tmp_path, pushes, state):
     cfg, proc = _standard(tmp_path, state=state)
     s = _run(tmp_path, cfg, proc)
     assert _state(tmp_path, DEAD) == state
     assert all(c["sid"] != DEAD for c in s["closed"]) and not _held(s, DEAD)
+
+
+# --------------------------------------------------------- parked ()
+# A park is resumable only while its PROCESS lives. The instance: alpha Body
+# b34aa80f parked on cc-10, the box restarted, and nothing ever closed it --
+# this pass skipped `parked` outright, and only the Body's own re-entry can run
+# its 60h expiry. Both halves are pinned in ONE run (guard-4166): the dead park
+# closes, and the live park between orbits is held.
+
+
+def test_dead_park_closes_and_a_live_park_between_orbits_is_untouched(tmp_path, pushes):
+    _body(tmp_path, CUR)
+    _body(tmp_path, LIVE, state="parked")   # between orbits: quiet, process alive
+    _body(tmp_path, DEAD, state="parked")
+    cfg = _config(tmp_path, [_entry(CUR, CUR_PID, start="100"),
+                             _entry(LIVE, LIVE_PID, start="200")])
+    s = _run(tmp_path, cfg, FakeProc({CUR_PID: "100", LIVE_PID: "200"}))
+
+    assert s["closed"] == [{"agent": AGENT, "sid": DEAD, "result": "marked"}]
+    assert _state(tmp_path, DEAD) == "closed-pending-merge"
+    assert _carrier_state(tmp_path, DEAD) == "closed-pending-merge"
+    assert sorted(p.name for p in _staged_dir(tmp_path).iterdir()) == sorted(
+        [f"{DEAD}-wm.yaml", f"{DEAD}-wm-baseline.yaml", f"{DEAD}-wm.hash"])
+    # POSITIVE CONTROL: exactly as quiet as DEAD and differing ONLY in its
+    # registry entry, so `running` -- not recency -- is what held it (guard-5948).
+    assert _held(s, LIVE) == ["running"]
+    assert _state(tmp_path, LIVE) == "parked"
+    assert _carrier_state(tmp_path, LIVE) == "parked"
+
+
+@pytest.mark.parametrize("kw, reason", [
+    ({"mtime": NOW - 60}, "recent-activity"),
+    ({"machine_id": "box-b"}, "foreign-machine"),
+    ({"carrier_host": "box-b"}, "foreign-host"),
+])
+def test_a_dead_park_faces_the_same_conditions_as_an_active_body(tmp_path, pushes,
+                                                                 kw, reason):
+    """One input flipped against the closing control above: each still holds."""
+    cfg, proc = _standard(tmp_path, state="parked", **kw)
+    s = _run(tmp_path, cfg, proc)
+    assert _held(s, DEAD) == [reason]
+    assert _state(tmp_path, DEAD) == "parked"
+
+
+def test_a_park_is_never_closed_on_an_unreadable_registry(tmp_path, pushes):
+    """Every unreadable input resolves to NOT abandoned -- for a park too."""
+    cfg, proc = _standard(tmp_path, state="parked")
+    (cfg / "sessions" / "999.json").write_text("{half a wri", encoding="utf-8")
+    s = _run(tmp_path, cfg, proc)
+    assert _held(s, DEAD) == ["registry-unreadable:1"]
+    assert _state(tmp_path, DEAD) == "parked"
 
 
 def test_session_that_appears_before_the_write_holds(tmp_path, pushes):
@@ -401,6 +452,18 @@ def test_close_body_late_never_closes_a_park(tmp_path, pushes):
     _body(tmp_path, DEAD, state="parked")
     assert bm.close_body_late(DEAD, AGENT, tmp_path) == "not-active"
     assert _state(tmp_path, DEAD) == "parked"
+
+
+def test_close_body_late_ends_a_park_only_for_a_caller_that_opts_in(tmp_path, pushes):
+    """. The refusal above is what the bash reap and graceful stop still
+    get; only the registry-proven pass passes accept_parked."""
+    _body(tmp_path, DEAD, state="parked")
+    assert bm.close_body_late(DEAD, AGENT, tmp_path, accept_parked=True) == "marked"
+    assert _state(tmp_path, DEAD) == "closed-pending-merge"
+    assert _carrier_state(tmp_path, DEAD) == "closed-pending-merge"
+    # Opting in never reopens a Body that is already closed.
+    assert bm.close_body_late(DEAD, AGENT, tmp_path, accept_parked=True) == "not-active"
+    assert _state(tmp_path, DEAD) == "closed-pending-merge"
 
 
 def test_close_body_late_without_a_manifest(tmp_path, pushes):
@@ -492,6 +555,19 @@ def test_hook_spawns_the_pass_when_another_session_reads_active(tmp_path, monkey
     monkeypatch.setattr(ab.subprocess, "Popen", lambda argv, **k: calls.append(argv))
     assert ab._hook(json.dumps({"session_id": CUR})) == 0
     assert len(calls) == 1 and "--run" in calls[0] and CUR in calls[0]
+
+
+def test_hook_spawns_the_pass_when_the_only_other_session_is_parked(tmp_path, monkeypatch):
+    """ REACHABILITY (guard-3448): the b34aa80f box held exactly this --
+    the current session plus one dead park. A hook that spawned only for
+    `active` would never run the pass that can close it."""
+    _body(tmp_path, CUR)
+    _body(tmp_path, DEAD, state="parked")
+    monkeypatch.setattr(ab, "PROJECT_ROOT", tmp_path)
+    calls = []
+    monkeypatch.setattr(ab.subprocess, "Popen", lambda argv, **k: calls.append(argv))
+    assert ab._hook(json.dumps({"session_id": CUR})) == 0
+    assert len(calls) == 1 and "--run" in calls[0]
 
 
 # ---  unit 2 (bravo/cc-05): the CLEAN zero must be distinguishable

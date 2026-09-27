@@ -28,7 +28,7 @@ conventions:
 A **worker Body** is a forked instance of a Mind (keyed by `unitKey` = its
 session SID) that is NOT the reducer. It runs a deliberately thin loop —
 **select -> claim -> execute -> re-enter** — one work unit per pass, parking
-(resumable, hourly re-poll) when work or its reducer is gone, leaving its
+(resumable, park-orbit re-poll, 1h→2h→4h capped) when work or its reducer is gone, leaving its
 divergent working-memory for the single reducer to merge later. It verifies ONLY
 the unit it just executed (Phase 4a, `scope=own-unit`); it does NOT encode,
 reflect, update state, run the learning gate, evolve, or do completion review.
@@ -333,6 +333,7 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 # rc 0 = CONTINUE to SELECT — even when this Body is PARKED. The poll does NOT
 #   resume it; a CLAIM does (Phase 2), so `parked_at` keeps measuring the whole
 #   wait (guard-4184: the cap is a patience cap, and `resume` clears the stamp).
+#   Since g-306-503: a restart seen while parked returns rc 0 on the spot (fp adopted).
 # rc 1 = PARK, which is a WIND-DOWN AND NOT A CLOSE (g-306-291).
 # The JSON on stdout carries {verdict, reason, rc, consecutive_errors} — quote
 # `reason` in the stop message so the wind-down cause is legible.
@@ -346,7 +347,7 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #     `parked` = first park; `already-parked` = idempotent re-park, ORIGINAL
 #     parked_at preserved. POST ON THE FIRST PARK ONLY (`already-parked` is the
 #     tell — an unconditional post buries the signal under ~24 copies a day):
-#   Bash: echo "<reason>, this Body PARKED awaiting reducer (hourly re-poll, auto-resume)" \
+#   Bash: echo "<reason>, this Body PARKED awaiting reducer (re-poll on the park orbit)" \
 #           | bash core/scripts/board-post.sh \
 #           --channel coordination --type finding --tags reducer-stall,body-parked
 #   Bash: python3 core/scripts/stop-reason-record.py --path worker-body-parked \
@@ -445,8 +446,8 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   rc=1 (not parked, or parked under the cap) -> run THE PARK SEQUENCE of Phase
   0.5 with reason "SELECT returned no eligible goal; parked awaiting supply",
   board tags `supply-gap,body-parked` (first park only), and the same 3600s
-  wakeup as the LAST call. The Body re-enters hourly: reducer poll -> SELECT ->
-  a claim resumes it (Phase 2), no goal re-parks it (here).
+  wakeup as the LAST call. The Body re-enters on the park orbit (g-357-51 part 4):
+  reducer poll -> SELECT -> a claim resumes it (Phase 2), no goal re-parks it (here).
 
   THE CLOSE CONDITION IS EXHAUSTIVE — THERE IS EXACTLY ONE, and it is the only
   place in this file that writes the sentinel: an EXPIRED park, reached from
@@ -466,7 +467,7 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   echo is not proof). Never close or park the Body for it.
   A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM, Phase -0
   then refuses every unit on this SID, and only a user `/start` of a NEW session
-  reopens work. A wrong park costs one hourly poll.
+  reopens work. A wrong park costs one re-poll.
   (The reducer generates work, not the worker. Do NOT file here: SELECT finding
    nothing is the park edge, not a moment to manufacture work — see "May a
    worker file a goal?" below.)

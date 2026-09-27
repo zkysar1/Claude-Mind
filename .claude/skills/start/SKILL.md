@@ -36,6 +36,13 @@ On resume (agent already exists):
 
 **Step 0.5: Parse Mode + Recovery Flags** — Extract the following from positional arguments:
 
+- `--mode <reader|assistant|autonomous>`: default `autonomous` when omitted, on every path.
+- `--recover`: set `recover = true` to run Step 0.7's crashed-runner cleanup (RUNNING only; fails loud otherwise).
+- `--force`: set `force = true` to bypass Step 0.7's liveness precondition. No effect outside recovery.
+- `--body` (with or without a value): REMOVED. It is a HARD ERROR, never silently ignored; display exactly: "`--body` was removed — the body role is always DERIVED: a bare `/start <agent>` auto-joins as a worker whenever a live reducer holds the claim elsewhere (rc=4). Use `--reducer-only` to refuse the auto-join."
+- `--reducer-only`: set `reducer_only = true`; read ONLY at the ACQUIRE_RC=4 branch below, which then refuses the worker-join and shows the holder-naming refusal.
+- `--override-output-style <justification>`: a non-empty justification lets Step 0.6 proceed; C7.7 passes it to `output-style-gate.sh --override`.
+# Rationale (WHY each flag): core/config/rationale/start-preflight-and-recovery.md
 
 The flag parser must run flag extraction BEFORE positional extraction so `/start --recover` (no agent name) binds to the current session's agent rather than being misinterpreted as `/start <agent-name=--recover>`.
 
@@ -84,6 +91,9 @@ Preconditions (all must hold, else fail loud — do NOT change any state):
    **IF exit code 0**: proceed to cleanup below.
 
    **IF exit code 2**: print "Refusing to recover: `runner-dead-check.sh`
+   returned script error (rc=2). Investigate the helper and its sub-probes
+   (`heartbeat-stale.sh`, `runner-recent-block.sh`, `session-signal-exists.sh`,
+   `background-jobs.sh`) before retrying." and exit without state changes.
 
    **IF exit code 1 AND `force = false`**: print the stderr text from the
    helper (it lists which liveness signals are still positive), then:
@@ -149,28 +159,14 @@ recovery block picks it up automatically.
    directly before retrying." DONE.
 
 - Bash: `MIND_AGENT=<agent-name> bash core/scripts/runner-claim.sh release --agent <agent-name> || true`
-  DDB claim release with the crashed session's OLD on-disk runner-token
-  (2026-07-07 bravo dual-runner follow-through). A crashed runner leaves its
-  DDB row RUNNING; local recovery flips only LOCAL state, so without this
-  release the fresh acquire below is held hostage by its OWN stale row for
-  up to OWNERSHIP_STALE_SECONDS (~65 min post-calibration). MUST run BEFORE
-  manifest-clear — `runner-token` is `recovery_action: clear`, so the old
-  token is deleted by the next step. Token-conditional and idempotent: if a
-  peer machine already stale-broke and re-claimed, the old token no longer
-  matches and this is a no-op — it can never steal a peer's claim. Fail-open
-  (`|| true`): a DDB hiccup must never block recovery.
+  MUST run BEFORE manifest-clear, which deletes the OLD `runner-token` this
+  release needs. Token-conditional, idempotent and fail-open (`|| true`).
 
 - Bash: `MIND_AGENT=<agent-name> bash core/scripts/session-manifest-clear.sh`
-  Manifest-driven clear of every session file with `recovery_action: clear`.
-  Runs AFTER state-set IDLE succeeded (g-115-683 reorder); the cleanup
-  window now shows state=IDLE + sid present instead of state=RUNNING +
-  sid=missing. SINGLE SOURCE OF TRUTH for the clear operation —
-  `recovery-gate.sh` (SessionStart hook auto-recovery) calls the same
-  script, and both consume `session-snapshot.sh --output json` (the
-  canonical manifest parser, also used by `session-desync-check.sh`). The
-  three signal files (`stop-requested`, `stop-loop`, `loop-active`) are all
-  `recovery_action: clear` in the manifest, so this one call handles them
-  too — no separate `session-signal-clear.sh` calls are required.
+  Clears every `recovery_action: clear` session file, including the three
+  signal files (`stop-requested`, `stop-loop`, `loop-active`) — no separate
+  `session-signal-clear.sh` calls. Runs only AFTER state-set IDLE succeeded.
+# Rationale (WHY release-then-clear): core/config/rationale/start-preflight-and-recovery.md
 
 - Bash: `rm -f "agents/<agent-name>/session/recovery-failure-count" "agents/<agent-name>/session/recovery-failed-permanent" 2>/dev/null || true`
 # Rationale: core/config/rationale/start-preflight-and-recovery.md — Manual override: clear the recovery-circuit-breake

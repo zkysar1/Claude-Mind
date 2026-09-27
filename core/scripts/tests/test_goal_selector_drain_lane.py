@@ -515,6 +515,137 @@ def test_excluded_counter_counts_kept_out_not_merely_present(tmp_path):
         f"got {state['role_excluded_reducer_only']}")
 
 
+# --------------------------------------------------------------------------
+# Source gate (): a field the goal never set is not a field the goal
+# set to the safe value
+#
+# THE DEFECT. The role gate above is FIELD-KEYED: is_reducer_only_row reads
+# executable_by_role off the row. An agent-queue goal (source='agent') carries
+# no such declaration, so the gate lets it through -- yet it is unclaimable by
+# a non-reducer Body BY SOURCE: the agent queue sits behind the DDB runner
+# claim that EVERY worker Body structurally lacks (init-world.sh, ).
+# Measured twice: the 2026-09-07 relay (worker cc-08) saw this lane hoist
+#  (score 10.42, source=agent) to index 0 over a 21.86 scorer pick,
+# the banner waive the deviation code, and aspirations-claim.sh refuse it
+# no_claim; re-measured on a live worker Body 2026-09-26 (alpha, cc-02): the
+# lane state file read last_pick_goal_id=, role=worker,
+# role_excluded_reducer_only=0. Same shape as , one field wider:
+# an affirmative claim-permit over work the claim endpoint refuses on every
+# non-claim-holding box, for every agent-queue goal.
+
+
+def _agent_queue(gid, score, ratio=10.63, **kw):
+    """A lane-admissible agent-queue row: NO executable_by_role (the point),
+    source='agent'. This is the g-001-06 shape."""
+    r = row(gid, score, ratio=ratio, **kw)
+    r["source"] = "agent"
+    return r
+
+
+def test_worker_body_never_gets_a_source_agent_drain_pick(tmp_path):
+    """The defect, pinned. The field gate alone cannot see this row (no
+    executable_by_role), so a regression that deletes the source gate makes
+    this red again while every g-115-8865 test stays green."""
+    d = primed(tmp_path)
+    scored = [row("g-top", 16.0, recurring=False),
+              _agent_queue("g-001-06", 10.42, ratio=10.63)]
+    with _body(role="worker", sid="sid-worker"):
+        picked = gs.apply_drain_lane(scored, cfg(), d)
+    assert picked is None, (
+        "a worker was handed an agent-queue goal by the drain lane -- the "
+        "claim endpoint refuses it no_claim by construction")
+    assert scored[0]["goal_id"] == "g-top", "index 0 must be untouched for a worker"
+
+
+def test_reducer_body_still_gets_its_agent_queue_drain_pick(tmp_path):
+    """The no-regression half. The reducer is the claim-holder: excluding the
+    row for it would strand an agent-queue goal that NO worker can ever claim
+    -- exactly the starvation class g-115-8865's own argument forbids. Both
+    gates must be skipped for a confirmed reducer, not merely the field gate."""
+    d = primed(tmp_path)
+    scored = [row("g-top", 16.0, recurring=False),
+              _agent_queue("g-agent-q", 9.0, ratio=10.63)]
+    with _body(role=None, sid="sid-red", agent_dir=d, running_sid="sid-red"):
+        picked = gs.apply_drain_lane(scored, cfg(), d)
+    assert picked is not None and picked["goal_id"] == "g-agent-q", (
+        "the reducer must keep its agent-queue lane hoist")
+    state = gs.read_drain_lane_state(d)
+    assert state["source_excluded_agent_queue"] == 0, (
+        "no exclusion happened for the reducer; the counter must not report one")
+
+
+def test_world_source_rows_still_promote_for_a_worker(tmp_path):
+    """The gate must exclude ONLY source='agent'. A source=None (or 'world')
+    row is claimable by a worker, so widening the predicate to 'workers get
+    no drain lane' would pass every test above while silently deleting the
+    lane for the role that runs most of the goals -- the same over-widening
+    trap test_gate_is_narrow pins for the field gate."""
+    d = primed(tmp_path)
+    scored = [row("g-top", 16.0, recurring=False),
+              _agent_queue("g-agent-q", 12.0, ratio=20.0),
+              row("g-starved", 9.0, ratio=10.63)]  # source unset -> world
+    with _body(role="worker", sid="sid-worker"):
+        picked = gs.apply_drain_lane(scored, cfg(), d)
+    assert picked is not None, "an ordinary world row must still promote"
+    assert picked["goal_id"] == "g-starved", (
+        "the more-overdue agent-queue row must be skipped, not win")
+    state = gs.read_drain_lane_state(d)
+    assert state["source_excluded_agent_queue"] == 1, state
+
+
+def test_state_file_records_the_source_gate_exclusions(tmp_path):
+    """A silent filter is the failure mode this whole class keeps hitting: the
+    field-gate defect survived two measured incidents partly because nothing
+    named what the lane had considered. The state file must make the SOURCE
+    gate falsifiable without re-running the selector (g-115-8865's own
+    requirement, applied to the new gate)."""
+    d = primed(tmp_path)
+    scored = [_agent_queue("g-a", 9.0, ratio=10.63),
+              _agent_queue("g-b", 8.0, ratio=9.0),
+              row("g-ordinary", 7.0, ratio=0.0)]
+    with _body(role="worker", sid="sid-worker"):
+        gs.apply_drain_lane(scored, cfg(), d)
+    state = gs.read_drain_lane_state(d)
+    assert state["role"] == "worker"
+    assert state["source_excluded_agent_queue"] == 2, state
+    assert state["role_excluded_reducer_only"] == 0, state
+
+
+def test_row_excluded_by_both_gates_counts_under_the_field_gate(tmp_path):
+    """The two counters must PARTITION the exclusions: a row that is BOTH
+    reducer-only AND agent-queue is removed by the field gate, which runs
+    first, so counting it under the source gate too would double-report one
+    kept-out row -- a counter that reports exclusions which did not happen is
+    the guard-1760 shape."""
+    d = primed(tmp_path)
+    both = _agent_queue("g-both", 9.0, ratio=10.63)
+    both["executable_by_role"] = "reducer"
+    scored = [both, _agent_queue("g-source-only", 8.0, ratio=10.0)]
+    with _body(role="worker", sid="sid-worker"):
+        gs.apply_drain_lane(scored, cfg(), d)
+    state = gs.read_drain_lane_state(d)
+    assert state["role_excluded_reducer_only"] == 1, state
+    assert state["source_excluded_agent_queue"] == 1, (
+        "only the SOURCE-only row was kept out by the source gate; the "
+        "both-gate row belongs to the field gate's count")
+
+
+def test_agent_queue_row_not_admissible_counts_no_source_exclusion(tmp_path):
+    """The source gate's counter must mean 'kept out of the lane', not
+    'agent-queue and present' -- the same 'excluded, not merely present'
+    discipline as the field gate's (test_excluded_counter_counts_kept_out_not_
+    merely_present). An agent-queue row that is neither overdue-exempt nor
+    pulled was never lane-eligible, so excluding it changed nothing: counting
+    it would report an exclusion that never happened."""
+    d = primed(tmp_path)
+    scored = [_agent_queue("g-not-overdue", 9.0, ratio=0.0)]
+    with _body(role="worker", sid="sid-worker"):
+        gs.apply_drain_lane(scored, cfg(), d)
+    state = gs.read_drain_lane_state(d)
+    assert state["source_excluded_agent_queue"] == 0, state
+    assert state["eligible_count"] == 0, state
+
+
 # ── : the banner must not waive the deviation code for a row routed
 # to another agent ────────────────────────────────────────────────────────────
 # Measured 2026-09-21 (zeta, cc-02, Linux 6.8.0-139-generic, own-cloud): a live

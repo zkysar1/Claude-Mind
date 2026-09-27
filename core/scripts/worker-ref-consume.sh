@@ -285,7 +285,20 @@ print("")' 2>/dev/null)"
   # the receipt line's parseability.
   safe_just="${FORCE_RETIRE_LIVE_JUST//\"/\'}"
   liveness_override_field=""
-  [ -n "$safe_just" ] && liveness_override_field=",\"liveness_override\":\"$safe_just\""
+  # : an EXPLICIT forced marker so a FORCED retirement (liveness gate
+  # bypassed via --force-retire-live) is machine-distinguishable from a
+  # gate-approved one on EVERY receipt line — not only by the presence of the
+  # liveness_override field on the attempted line, and NOT at all on the
+  # delete_succeeded/delete_failed outcome lines, which used to be byte-identical
+  # forced-vs-not. `forced` is keyed on the SAME non-empty-justification
+  # condition that actually activates the override (the refusal-site gates above
+  # honor the bypass only when FORCE_RETIRE_LIVE_JUST is non-empty), so
+  # forced:true can never disagree with the override the run performed.
+  forced_field=",\"forced\":false"
+  if [ -n "$safe_just" ]; then
+    liveness_override_field=",\"liveness_override\":\"$safe_just\""
+    forced_field=",\"forced\":true"
+  fi
   # : the receipt is written BEFORE the destructive push and stays that
   # way (archive-before-delete.md: a receipt for an undeleted ref is harmless, a
   # deleted ref with no receipt is unrecoverable). So this line can only ever
@@ -295,13 +308,13 @@ print("")' 2>/dev/null)"
   # READING THE LEDGER: a record with NO `outcome` field predates this change
   # (71 such records at the time it landed) and its disposition is UNKNOWN —
   # never read an absent marker as success.
-  printf '{"ref":"%s","tip_sha":"%s","retired_at":"%s","retired_by_agent":"%s","verified_ancestor_of_origin_main":"%s","body_row":"%s"%s,"outcome":"attempted","recreate_with":"git push origin %s:%s"}\n' \
-    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}" "$main_sha" "${body_row_state//\"/\'}" "$liveness_override_field" "$tip_sha" "$RETIRE_REF" \
+  printf '{"ref":"%s","tip_sha":"%s","retired_at":"%s","retired_by_agent":"%s","verified_ancestor_of_origin_main":"%s","body_row":"%s"%s%s,"outcome":"attempted","recreate_with":"git push origin %s:%s"}\n' \
+    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}" "$main_sha" "${body_row_state//\"/\'}" "$liveness_override_field" "$forced_field" "$tip_sha" "$RETIRE_REF" \
     >> "$receipt_dir/worker-ref-retirements.jsonl"
   if git -C "$REPO" push origin ":$RETIRE_REF" >/dev/null 2>&1; then
     git -C "$REPO" update-ref -d "$RETIRE_REF" 2>/dev/null || true
-    printf '{"ref":"%s","tip_sha":"%s","outcome":"delete_succeeded","at":"%s"}\n' \
-      "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" \
+    printf '{"ref":"%s","tip_sha":"%s","outcome":"delete_succeeded","at":"%s"%s}\n' \
+      "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "$forced_field" \
       >> "$receipt_dir/worker-ref-retirements.jsonl"
     log "retired $RETIRE_REF (tip $tip_sha reachable from origin/main $main_sha)"
     log "receipt: core/logs/worker-ref-retirements.jsonl — recreate with: git push origin $tip_sha:$RETIRE_REF"
@@ -312,8 +325,8 @@ print("")' 2>/dev/null)"
   # not theoretical: two agents seeing the same stale carrier both pass the
   # reachability and liveness gates, the first deletes, and this push fails
   # "remote ref does not exist" with a receipt already on disk.
-  printf '{"ref":"%s","tip_sha":"%s","outcome":"delete_failed","at":"%s"}\n' \
-    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" \
+  printf '{"ref":"%s","tip_sha":"%s","outcome":"delete_failed","at":"%s"%s}\n' \
+    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "$forced_field" \
     >> "$receipt_dir/worker-ref-retirements.jsonl"
   log "remote delete FAILED for $RETIRE_REF — receipt written but the ref still exists on origin; retry later" >&2
   exit 1
@@ -768,7 +781,13 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
           echo "      ⚠ DELETION-ONLY: this merge REMOVES $mt_del line(s) and adds none. A carrier is a SNAPSHOT of a moving append-only store, so this is the carrier being STALE, not content to recover. Default disposition = CARRY, do NOT merge; if you merge anyway, name the records being dropped first."
         elif [ "$mt_del" -gt 0 ] 2>/dev/null; then
           echo "      ⚠ MIXED: +$mt_add / -$mt_del. On a one-record-per-line store a paired count is a full-record OVERWRITE, not an append (guard-6539). Diff the paths above before merging."
-        elif [ "$mt_add" -ge 0 ] 2>/dev/null && [ "$mt_del" = 0 ]; then
+        elif [ "$mt_add" -gt 0 ] 2>/dev/null && [ "$mt_del" = 0 ]; then
+          # -gt 0, NOT -ge 0 (occ192 residue, ): a genuine append needs
+          # at least one added line. The all-binary / pure-rename case sums to
+          # +0 / -0 — numstat emits `-\t-` and the awk filter at :585 drops every
+          # row — with mt_total>0, and that is UNMEASURED, not append-only. `-ge 0`
+          # matched mt_add=0 and stamped it "safe shape"; `-gt 0` sends the 0/0
+          # state to the else below, where its own comment already says it belongs.
           echo "      append-only (+$mt_add / -$mt_del): safe shape. Merge only if the content is wanted; the ref's Body may still be pushing."
         else
           # THREE STATES REACHED THIS `else` AND IT ASSERTED SAFETY FOR ALL THREE
