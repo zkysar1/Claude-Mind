@@ -406,19 +406,34 @@ def window_start(now, session_start=None, window_hours=DEFAULT_WINDOW_HOURS):
 
 
 def decide(subject, goals, now, session_start=None,
-           window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2):
+           window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2,
+           reference_time=None):
     """Pure decision. Returns a dict; never raises on odd goal records.
 
     An OPEN owner is disqualifying whenever it overlaps, with no time bound —
     an open goal owns its work however old it is. A TERMINAL owner counts only
     inside the window, because "someone considered this two months ago and
     closed it" is not the same claim as "this was just done".
+
+    `reference_time` anchors that terminal window (g-306-512); it defaults to
+    `now`, so a live relay is scored exactly as before. A BACKLOG relay is
+    scored weeks after capture, and its owner most likely went terminal near
+    the relay's OWN time, not near replay-time — anchoring on `now` there is
+    structurally blind to that owner, so every backlog relay reads FILE (the
+    g-306-284 measurement: 25 backlog relays, all FILE, one already fixed
+    upstream). batch_decide passes each record's `_item_ts` here. Because the
+    floor below is a min() with session_start, a per-record anchor can only move
+    the window EARLIER for an old relay — it widens a false FILE into a DECLINE
+    but never narrows a live relay's window.
     """
     # Score the relay's HEADLINE, not its evidence body (): a long
     # relay's cited-identifier tail is what lets an unrelated owner win the rare
     # gate by coincidence. No-op for short subjects (see _headline).
     subj = _tokens(_headline(subject))
-    start = window_start(now, session_start, window_hours)
+    # Anchor the terminal window on the relay's own capture time when given
+    # (); fall back to replay-time for every pre-existing caller.
+    anchor = reference_time if reference_time is not None else now
+    start = window_start(anchor, session_start, window_hours)
     matches = []
 
     records = [g for g in (goals or []) if isinstance(g, dict)]
@@ -663,9 +678,16 @@ def batch_decide(records, goals, now, session_start=None,
             })
             continue
         key_counts[key] = key_counts.get(key, 0) + 1
+        # Anchor the terminal window on THIS relay's capture time, not
+        # replay-time (). wm.py stamps _item_ts on every capture
+        # append; a backlog relay scored weeks later would otherwise miss the
+        # owner that closed near its OWN time. Absent/unparseable -> None ->
+        # decide() falls back to `now` (every pre- caller and record).
+        ref = (_parse_ts(record.get("_item_ts"))
+               if isinstance(record, dict) else None)
         try:
             res = decide(subject, goals, now, session_start,
-                         window_hours, min_overlap)
+                         window_hours, min_overlap, reference_time=ref)
         except Exception as exc:                       # never fatal (guard-1512)
             unreadable += 1
             rows.append({

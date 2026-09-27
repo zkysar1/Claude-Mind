@@ -91,7 +91,8 @@ V_ALIVE = "alive"                    # carrier fresh -> body is ticking
 V_STALLED_WITH_CLAIM = "stalled_with_claim"   # THE ALERT
 V_STALE_NO_CLAIM = "stale_no_claim"  # carrier says CLOSED -> benign, never alerts
 V_STALLED_NO_CLOSE = "stalled_no_close"  # THE SECOND ALERT ()
-V_STALE_PARKED = "stale_parked"      # deliberately dormant -> benign, never alerts
+V_STALE_PARKED = "stale_parked"      # dormant INSIDE the park cap -> benign
+V_STALLED_PARKED = "stalled_parked"  # THE THIRD ALERT (): parked past the cap
 V_STALE_STATE_UNKNOWN = "stale_state_unknown"  # no state in carrier -> benign, COUNTED
 V_UNREADABLE = "unreadable"          # present but no usable ts
 
@@ -116,7 +117,33 @@ CLOSED_BODY_STATES = frozenset({"closed-pending-merge", "merged", "closed-stale"
 # scan() gives for not voiding on a single unreadable carrier.
 PARKED_BODY_STATE = "parked"
 
-ALERTING_VERDICTS = frozenset({V_STALLED_WITH_CLAIM, V_STALLED_NO_CLOSE})
+# ...but only UP TO the park cap (). A healthy park re-stamps its
+# carrier on every due re-poll (backoff 1h->2h->4h, capped) and at the cap it
+# closes itself (park-expired -> the genuine close). So a carrier still reading
+# `parked` past the cap is EITHER a Body that stopped re-entering (a dead
+# process, or a live one whose wake-up chain broke) OR one that DID close on a
+# box that could not publish it: the close's carrier push is refused `no_claim`
+# on a non-claim box, and the sync exemption covers only a RUNNING session's own
+# carrier (), so a closed Body's carrier keeps its last ticked state.
+# Age cannot separate the two -- measured 2026-09-27, 21 of 22 parked carriers
+# past the cap belonged to Bodies whose WM the reducer had already merged -- so
+# the alert also needs the SECOND signal below. MIRRORED from
+# body-manifest.PARK_MAX_HOURS (not imported, for the CLOSED_BODY_STATES reason
+# above); test_state_partition_matches_body_manifest pins the two.
+PARK_MAX_MINUTES = 60.0 * 60.0
+
+# The second signal: did this Body's WM REACH THE REDUCER? A close stages
+# `<unit>-wm.yaml` into the world-rooted staged dir (world-rooted precisely so a
+# non-claim box can publish it), and the reducer's merge leaves a durable
+# `<unit>-wm.consumed` tombstone (body-merge, ). Either name proves
+# the Body closed, whatever its carrier says. MIRRORED from body-manifest
+# (_WORLD_STAGED_DIRNAME, _STAGED_WM_SUFFIX, _STAGED_CONSUMED_SUFFIX); the drift
+# test pins them.
+STAGED_WM_DIRNAME = "body-staged-wm"
+WM_REACHED_SUFFIXES = ("-wm.yaml", "-wm.consumed")
+
+ALERTING_VERDICTS = frozenset({V_STALLED_WITH_CLAIM, V_STALLED_NO_CLOSE,
+                               V_STALLED_PARKED})
 
 # Distinguishes "present and wrong" from "not in the report at all";
 # None is a legal value for several of these fields, so it cannot serve.
@@ -128,6 +155,7 @@ def classify_body(
     holds_live_claim: bool,
     stale_minutes: float = DEFAULT_STALE_MINUTES,
     body_state: Optional[str] = None,
+    wm_reached_reducer: Optional[bool] = None,
 ) -> str:
     """Pure classifier -- the whole decision, with no I/O.
 
@@ -160,10 +188,23 @@ def classify_body(
     prose (guard-2499: when a classifier is blind, move to the structured field
     the writer already knows at write time -- do not guess harder).
 
-    So a stale claimless body now splits four ways, and only one alerts:
+    So a stale claimless body now splits five ways, and two alert:
       closed-*  -> V_STALE_NO_CLAIM      the Body finished. Benign, and now
                                           EARNED rather than assumed.
-      parked    -> V_STALE_PARKED        deliberately dormant. Benign.
+      parked    -> V_STALE_PARKED        deliberately dormant inside the park
+                                          cap. Benign.
+      parked,   -> V_STALLED_PARKED      THE THIRD ALERT (g-306-520). Past the
+      past cap,                           cap a healthy park has closed itself;
+      WM never                            this one never did, and the store has
+      reached the                         no staged or consumed WM for it, so
+      reducer                             its captures are stranded. The age is
+                                          read BEFORE the benign return (a keep
+                                          that never reads age cannot collect
+                                          its oldest case, guard-4000), but age
+                                          ALONE never condemns: past the cap
+                                          with `wm_reached_reducer` True (closed,
+                                          carrier unpublished) or None (could
+                                          not tell) stays V_STALE_PARKED.
       absent    -> V_STALE_STATE_UNKNOWN a carrier written before this field
                                           existed, or by a box that has not
                                           pulled yet. Benign -- alerting here
@@ -196,6 +237,8 @@ def classify_body(
     if state in CLOSED_BODY_STATES:
         return V_STALE_NO_CLAIM
     if state == PARKED_BODY_STATE:
+        if carrier_age_minutes > PARK_MAX_MINUTES and wm_reached_reducer is False:
+            return V_STALLED_PARKED
         return V_STALE_PARKED
     return V_STALLED_NO_CLOSE
 
@@ -497,6 +540,75 @@ def read_known_goal_ids(*stores: Path) -> "tuple[set, str]":
         lines, prov = _read_queue_lines(store)
         if lines is not None:
             merged |= _known_goal_ids_from_lines(lines)
+        if rank.get(prov, 0) < rank[weakest]:
+            weakest = prov if prov in rank else "none"
+    return merged, weakest
+
+
+def _goal_meta_from_lines(lines) -> "Dict[str, dict]":
+    """Per-goal metadata the OCCURRENCE-OVER reap needs ().
+
+    Sibling of `_terminal_goal_ids_from_lines` / `_known_goal_ids_from_lines`,
+    and like `_known_` it is status-BLIND: a recurring goal spends its life in
+    `pending` between occurrences, so a status filter would drop exactly the
+    goals this census is for. Records only the three fields
+    `body_row_reaper._goal_occurrence_over` reads, so the map stays small:
+      recurring       -- bool; the predicate's first condition
+      lastAchievedAt  -- the occurrence-completion timestamp (naive ISO 8601)
+      claimed_by_sid  -- the goal record's CURRENT claimant, for condition 3
+    LAST WRITE WINS on a duplicate id across queues, matching the union readers;
+    a goal lives in exactly one queue in practice, so the case is academic.
+    """
+    out: Dict[str, dict] = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            asp = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for g in asp.get("goals") or []:
+            gid = g.get("id")
+            if not gid:
+                continue
+            out[str(gid)] = {
+                "recurring": bool(g.get("recurring")),
+                "lastAchievedAt": g.get("lastAchievedAt"),
+                "claimed_by_sid": g.get("claimed_by_sid"),
+            }
+    return out
+
+
+def read_goal_meta(*stores: Path) -> "tuple[Dict[str, dict], str]":
+    """Per-goal metadata for the occurrence-over reap, WEAKEST provenance ().
+
+    The two LIVE queues only (world + this agent's), never the archive -- the
+    exact inverse of `read_known_goal_ids`. A recurring goal that is still
+    cycling lives in a live queue and carries its current `lastAchievedAt`
+    there; an archive copy, if any, carries a STALE timestamp from a past
+    resolution. Censusing the archive could only supply an OLDER completion time
+    for a goal the live queue already describes, so it is deliberately excluded.
+
+    THE SAFETY DIRECTION IS THE INVERSE OF BOTH `read_terminal_goal_ids` AND
+    `read_known_goal_ids`, and that is why a partial census is tolerable here
+    where it is forbidden there. The reaper reaps on the PRESENCE of a fact in
+    this map (recurring + a `lastAchievedAt` later than the row's claim), never
+    on absence, so a goal missing because its store was unreadable simply is not
+    reaped -- a miss, never a wrong delete. Provenance is still the weakest of
+    the layers so the CALLER may decline on `"none"` for parallelism with its
+    siblings; that is conservatism, not correctness -- a missing store here can
+    only ever spare a row.
+    """
+    if not stores:
+        return {}, "none"
+    rank = {"none": 0, "local-mirror": 1, "authoritative": 2}
+    merged: Dict[str, dict] = {}
+    weakest = "authoritative"
+    for store in stores:
+        lines, prov = _read_queue_lines(store)
+        if lines is not None:
+            merged.update(_goal_meta_from_lines(lines))
         if rank.get(prov, 0) < rank[weakest]:
             weakest = prov if prov in rank else "none"
     return merged, weakest
@@ -823,6 +935,34 @@ def enumerate_carriers(agents_root: Path) -> "tuple[List[Dict[str, Any]], Dict[s
     }
 
 
+def read_staged_units(world_root: Path, agent: str) -> "tuple[Optional[set], str]":
+    """Unit keys whose WM reached the reducer for `agent`, read from the STORE.
+
+    Returns `(units, "authoritative")`, or `(None, "unreadable: ...")` when the
+    store could not be listed. There is deliberately NO local-mirror fallback:
+    this read exists only to CONDEMN (a parked Body past the cap alerts only when
+    its unit is ABSENT here), and under own-cloud the local tree is a read-through
+    cache, where a missing file proves nothing (guard-980). Anything short of the
+    store of record returns None, which classify_body renders benign.
+    """
+    try:
+        import sys
+        here = str(Path(__file__).resolve().parent)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        from storage_backend import get_backend  # noqa: PLC0415
+        names = get_backend().list_dir(
+            (world_root / STAGED_WM_DIRNAME / agent).resolve())
+    except Exception as exc:  # noqa: BLE001 -- any failure means "could not tell"
+        return None, f"unreadable: {type(exc).__name__}: {exc}"
+    units = set()
+    for name in names:
+        for suffix in WM_REACHED_SUFFIXES:
+            if name.endswith(suffix):
+                units.add(name[: -len(suffix)])
+    return units, "authoritative"
+
+
 def scan(
     agents_root: Path,
     world_store: Path,
@@ -859,6 +999,11 @@ def scan(
         for a in sorted({r["agent"] for r in rows if r.get("agent")})
     ]
     claims, claims_via = read_claims_union(*claim_stores)
+    # : the second signal for a parked carrier past the cap, read
+    # LAZILY -- once per agent, and only when such a carrier exists, so the
+    # common scan pays no extra store read.
+    staged: Dict[str, "tuple[Optional[set], str]"] = {}
+    parked_past_cap_unjudged = 0
     bodies: List[Dict[str, Any]] = []
     # Per-item resilience is right, but the EVIDENCE must never be discarded
     # (guard-1893). Count what was dropped and keep the first error, so a
@@ -875,7 +1020,19 @@ def scan(
             # not pulled the writer yet -- classify_body renders that as
             # V_STALE_STATE_UNKNOWN rather than guessing either way.
             state = (row.get("doc") or {}).get("body_state")
-            verdict = classify_body(age, goal is not None, stale_minutes, state)
+            reached: Optional[bool] = None
+            if (goal is None and age is not None and age > PARK_MAX_MINUTES
+                    and str(state or "").strip() == PARKED_BODY_STATE):
+                if row["agent"] not in staged:
+                    staged[row["agent"]] = read_staged_units(
+                        world_store.parent, row["agent"])
+                units = staged[row["agent"]][0]
+                if units is None:
+                    parked_past_cap_unjudged += 1
+                else:
+                    reached = row["sid"] in units
+            verdict = classify_body(age, goal is not None, stale_minutes, state,
+                                    wm_reached_reducer=reached)
             bodies.append(
                 {
                     "agent": row["agent"],
@@ -884,6 +1041,7 @@ def scan(
                     "carrier_age_minutes": None if age is None else round(age, 1),
                     "held_goal": goal,
                     "body_state": state,
+                    "wm_reached_reducer": reached,
                     "verdict": verdict,
                     "read_via": row.get("read_via"),
                 }
@@ -930,7 +1088,8 @@ def scan(
         1 for b in bodies if b["verdict"] == V_STALE_STATE_UNKNOWN)
     state_known = sum(
         1 for b in bodies
-        if b["verdict"] in (V_STALE_NO_CLAIM, V_STALE_PARKED, V_STALLED_NO_CLOSE))
+        if b["verdict"] in (V_STALE_NO_CLAIM, V_STALE_PARKED, V_STALLED_PARKED,
+                            V_STALLED_NO_CLOSE))
     return {
         "scanned": len(bodies),
         "stale_minutes": stale_minutes,
@@ -968,6 +1127,11 @@ def scan(
         # row: an unknown-state row that is FRESH is case (b).
         "state_known": state_known,
         "state_unknown": state_unknown,
+        #  coverage (guard-3489): parked carriers past the cap that
+        # could NOT be judged because the staged-WM listing was unreadable.
+        # They render benign, so a stranded park hidden behind a blind read
+        # must stay countable rather than read as an all-clear.
+        "parked_past_cap_unjudged": parked_past_cap_unjudged,
         # Degraded if ANY leg fell back or lost data. The claim half is included
         # because it is the condemning one: a stale claim map is what turns a
         # finished body into a false alert. The enumeration half is included

@@ -16,9 +16,12 @@
 # membership. The advisory therefore fires ONLY for files the context-reads
 # manifest can actually have signal about — editing a still-out-of-scope file
 # (.claude/rules, self.md, product code) stays SILENT rather than crying wolf
-# (a read of those is never recorded, so a "has not been Read" warning there
-# would be a guaranteed false positive that desensitizes the agent to the
-# banner). core/scripts reads ARE recorded (advisory scope) but are never
+# (a read of .claude/rules or self.md is never recorded, so a "has not been
+# Read" warning there would be a guaranteed false positive that desensitizes
+# the agent to the banner). Product-code reads ARE recorded since ,
+# for Q4 provenance only: a Bash read still records nothing (), so an
+# advisory on product code would still cry wolf. core/scripts reads ARE
+# recorded (advisory scope) but are never
 # re-read-BLOCKED — the blocking dedup gate keeps the narrow is_in_scope.
 #
 # check-file prints the target path to STDOUT iff it is in-scope AND not

@@ -6570,6 +6570,29 @@ def apply_drain_lane(scored, config, agent_dir):
     # test_selection_stays_role_blind fence (this file must never name the
     # worker-side eligibility module) is untouched -- see the same note in
     # apply_reducer_only_floor.
+    #
+    # SOURCE GATE (). The gate above is FIELD-KEYED, and a field a goal
+    # never set is not a field a goal set to the safe value: an agent-queue goal
+    # (source='agent') carries NO executable_by_role, so is_reducer_only_row
+    # answers False and the role gate lets it through -- yet it is unclaimable
+    # by a non-reducer Body BY SOURCE, because the agent queue sits behind the
+    # DDB runner claim that EVERY worker Body structurally lacks (init-world.sh,
+    # : "it is every worker Body, always"). Measured twice: the
+    # 2026-09-07 relay (worker cc-08) saw this lane hoist  (score 10.42,
+    # source=agent) to index 0 over a 21.86 scorer pick, the banner waive the
+    # deviation code, and aspirations-claim.sh refuse it no_claim; re-measured
+    # on a live worker Body 2026-09-26 (this session, cc-02): the lane state
+    # file read last_pick_goal_id=, role=worker,
+    # role_excluded_reducer_only=0 -- the field-keyed gate excluded nothing.
+    # Same shape as the reducer-only defect, one field wider: the banner
+    # "claim it without a deviation code" over work the claim endpoint will
+    # refuse on EVERY non-claim-holding box, for EVERY agent-queue goal.
+    # Excluding is the reducer-only gate's own argument applied: a kept-out row
+    # still competes on score and the REDUCER (the only Body that holds the
+    # claim) still gets its lane hoist; including costs a claim that is refused
+    # by construction. Same DATA, not role module: `source` is on the SCORED
+    # ROW (the score_goal emission, -era merged queue), and
+    # test_selection_stays_role_blind stays untouched.
     _role = reducer_selection_policy.role_of(*_reducer_policy_inputs(agent_dir))
     _skip_reducer_only = (_role != reducer_selection_policy.ROLE_REDUCER)
     # COUNTS ROWS ACTUALLY KEPT OUT, NOT ROWS MERELY PRESENT. The first cut
@@ -6578,13 +6601,16 @@ def apply_drain_lane(scored, config, agent_dir):
     # changed nothing. A counter that reports exclusions which did not happen is
     # the guard-1760 shape -- it makes the gate LESS falsifiable, which is the
     # opposite of why this field exists. Computed below, after the eligibility
-    # test it must agree with.
+    # test it must agree with. `_source_excluded` obeys the same discipline for
+    # the source gate (); a row excluded by BOTH gates is counted once,
+    # under the field gate, which is checked first.
     _role_excluded = 0
+    _source_excluded = 0
 
     def _lane_admissible(s):
-        """Everything the lane asks EXCEPT the role gate -- factored so the
-        exclusion counter is computed against the same test, and cannot drift
-        from it."""
+        """Everything the lane asks EXCEPT the role and source gates -- factored
+        so the exclusion counters are computed against the same test, and cannot
+        drift from it. (g-306-514 widened the comment from 'the role gate'.)"""
         return bool(s.get("recurring")) and (
             overdue_exemption_level(
                 float(s.get("recurring_overdue_ratio") or 0.0),
@@ -6596,10 +6622,23 @@ def apply_drain_lane(scored, config, agent_dir):
 
     admissible = [s for s in scored if _lane_admissible(s)]
     if _skip_reducer_only:
-        eligible = [s for s in admissible
-                    if not reducer_selection_policy.is_reducer_only_row(s)]
-        _role_excluded = len(admissible) - len(eligible)
+        # FIELD GATE FIRST (): exclude rows that DECLARE they are
+        # reducer-only. Checked first so a row removed by BOTH gates is counted
+        # here, not under the source gate below.
+        after_role = [s for s in admissible
+                      if not reducer_selection_policy.is_reducer_only_row(s)]
+        _role_excluded = len(admissible) - len(after_role)
+        # SOURCE GATE (): an agent-queue row (source='agent') is
+        # unclaimable by a non-reducer Body BY SOURCE -- the DDB runner claim
+        # every worker Body structurally lacks -- yet it carries NO
+        # executable_by_role, so the field gate above let it through. Same
+        # defect shape, one field wider. Only rows that SURVIVED the field gate
+        # are counted here, so the two counters partition the exclusions.
+        eligible = [s for s in after_role if s.get("source") != "agent"]
+        _source_excluded = len(after_role) - len(eligible)
     else:
+        # A confirmed reducer holds the runner claim, so it can claim
+        # agent-queue rows: BOTH gates are skipped and the lane is unchanged.
         eligible = admissible
 
     picked = None
@@ -6633,6 +6672,11 @@ def apply_drain_lane(scored, config, agent_dir):
         "eligible_count": len(eligible),
         "role": _role,
         "role_excluded_reducer_only": _role_excluded,
+        # : the source gate's own counter, with the same
+        # "excluded, not merely present" discipline as its field-gate sibling --
+        # the state file must make the new gate falsifiable without re-running
+        # the selector, exactly as  required of the first one.
+        "source_excluded_agent_queue": _source_excluded,
         "last_pick_goal_id": (picked or {}).get("goal_id") or state.get("last_pick_goal_id"),
         "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
     })

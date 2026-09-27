@@ -124,8 +124,12 @@ def evaluate(goal: Dict[str, Any]) -> Dict[str, Any]:
             f"verify, the learning gate and pre-completion review all read ONLY the "
             f"structured field (guard-3649), which means criteria written as prose in the "
             f"description do NOT count however good they are (guard-2328). The goal IS "
-            f"filed and rc is 0; this is advisory. Add outcomes with: "
-            f"aspirations-update-goal.sh --source <world|agent> {gid} verification "
-            f"'{{\"outcomes\": [\"...\"], \"checks\": [], \"preconditions\": []}}'"
+            f"filed and rc is 0; this is advisory. Add outcomes by READ-MERGE-WRITE, "
+            f"never by pasting a literal object: update-goal REPLACES the whole "
+            f"verification object (guard-5228), and a later gate in this same add may "
+            f"already have attached preconditions (the forge-curriculum gate does). "
+            f"Read it (aspirations-query.sh --goal-field id {gid} --full), fill in "
+            f"outcomes, and write the WHOLE object back: aspirations-update-goal.sh "
+            f"--source <world|agent> {gid} verification '<that object>'"
         ),
     }

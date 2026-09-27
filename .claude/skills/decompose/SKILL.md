@@ -395,6 +395,10 @@ If yes, create a companion hypothesis goal alongside the sub-goals:
    goals (blocked_by contains <parent-goal-id>) and set each one's blocked_by
    to the child that delivers what it waits on, then read it back (guard-4868):
    Bash: aspirations-update-goal.sh --source {goal.source} <dependent-id> blocked_by '["<child-id>"]'
+   Step 3's write backstops a skipped re-point (g-115-10977): it re-points any
+   remaining same-store dependent at the LAST child(ren), and refuses when such a
+   dependent exists but no child carries parent_goal=<parent-goal-id>. Choosing
+   the precise child is still yours.
 3. Mark the parent goal decomposed (goal-level field-merge):
    Bash: aspirations-update-goal.sh <parent-goal-id> status decomposed --source {goal.source}
 4. Record the children on the parent's own record. The children already carry

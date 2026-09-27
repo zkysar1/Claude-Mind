@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.85",
+    "previous_version": "2.12.84",
+    "date": "2026-09-27",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Time-push cut (g-115-11118, the first stall auto-filed by ReleaseTrainProbe g-115-11017 49a62c9465): v2.12.84 was 24.1h old with 43 framework commits past it. Headline: board date-segment retention MOVES segments older than N days into the channel archive (g-358-221, b88b3a63f1) and archive-first deletion of expired gate-firings segments (g-358-10, 6db5fab2e3); plus 30 more non-chore commits since v2.12.84",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.84",
     "previous_version": "2.12.83",
     "date": "2026-09-26",

@@ -184,9 +184,9 @@ def test_docstring_branch_count_matches_reality():
     worse than no count, so the number and the enumeration are pinned together.
     """
     doc = cm.merge_handler_for.__doc__
-    assert "TEN path-pattern branches" in doc, (
-        "the branch count in merge_handler_for's docstring no longer reads TEN. "
+    assert "ELEVEN path-pattern branches" in doc, (
+        "the branch count in merge_handler_for's docstring no longer reads ELEVEN. "
         "If a branch was added or removed, update BOTH the count and the numbered "
         "list below it — they are the classifier's only index.")
-    for n in range(1, 11):
+    for n in range(1, 12):
         assert f"\n      {n}. " in doc, f"branch {n} missing from the enumeration"

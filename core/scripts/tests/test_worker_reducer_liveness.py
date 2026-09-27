@@ -707,3 +707,143 @@ def test_cli_seam_drives_the_fp_axis():
     legacy = _cli("0", "cc-02", "cc-02", "0")
     assert legacy.returncode == 0
     assert json.loads(legacy.stdout)["expected_token_fp"] is None
+
+
+# ── : a re-mint observed while the Body is ALREADY parked ──────────
+#
+# The remint branch fires once, ADOPTS the new fp, and its own reason says
+# "the next poll rejoins under it". For an ACTIVE Body that is true and
+# sufficient (wind down, stage the unit, park, rejoin on the next due poll).
+# The measured defect (cc-07, 2026-09-11) was a PARKED Body: Phase 0.5 mapped
+# the rc=1 to the PARK SEQUENCE, park_body's already-parked branch advanced
+# the orbit, and the Body sat 2-4h beside the very live reducer it had just
+# adopted. The rejoin must therefore happen ON the remint poll itself when the
+# Body is parked, and the stalled-reducer path (fp unchanged: rc 4 / transients)
+# must keep winding a parked Body down — a gone reducer is exactly what its
+# park exists to wait out.
+
+def test_remint_while_parked_rejoins_on_the_poll_itself():
+    """Check 1, decide() half: fp A -> B, same machine, Body already parked.
+    A parked Body holds no in-flight unit, so the wind-down has nothing to
+    discharge: CONTINUE, fp adopted. Fails when the body_state gate is
+    reverted (the branch returns WIND_DOWN regardless of state)."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_B,
+               expected_token_fp=FP_A, body_state="parked")
+    assert r["verdict"] == VERDICT_CONTINUE
+    assert r["expected_token_fp"] == FP_B, "the fp must still be adopted on the rejoin"
+    assert r["consecutive_errors"] == 0
+
+
+def test_remint_while_active_still_winds_down_and_adopts():
+    """The control (guard-1220): the rejoin must NARROW the branch, not erase
+    it. An ACTIVE Body has an in-flight unit to stage, so it still gets the
+    one-shot wind-down + adoption that ships today — and the one-shot property
+    survives this change (feed the persisted state back in: rejoins)."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_B,
+               expected_token_fp=FP_A, body_state="active")
+    assert r["verdict"] == VERDICT_WIND_DOWN
+    assert "restart" in r["reason"]
+    assert r["expected_token_fp"] == FP_B
+
+    again = decide(0, "cc-02", r["expected_machine"], r["consecutive_errors"],
+                   observed_token_fp=FP_B,
+                   expected_token_fp=r["expected_token_fp"],
+                   body_state="active")
+    assert again["verdict"] == VERDICT_CONTINUE
+
+
+@pytest.mark.parametrize("state", [None, "closed-pending-merge", "merged"])
+def test_remint_with_an_unreadable_or_closed_state_keeps_todays_verdict(state):
+    """The fail-safe direction of the new gate: only a POSITIVE `parked` read
+    changes the verdict. Unreadable (None) and closed states keep the old
+    wind-down, so a manifest read problem can never manufacture a rejoin."""
+    r = decide(0, "cc-02", "cc-02", 0, observed_token_fp=FP_B,
+               expected_token_fp=FP_A, body_state=state)
+    assert r["verdict"] == VERDICT_WIND_DOWN
+
+
+def test_stalled_reducer_still_winds_down_a_parked_body():
+    """Check 2, decide() half: the stalled path never sees the body_state
+    gate — rc 4 is decisive, one transient is not, and the threshold still
+    fires. A parked Body must keep its park on a gone/dying reducer; that is
+    the signal the park waits out, and inverting it would hold the fleet's
+    workers in a cheap-wake orbit forever."""
+    assert decide(4, None, "cc-02", 0, body_state="parked")["verdict"] == VERDICT_WIND_DOWN
+
+    one = decide(1, None, "cc-02", 0, body_state="parked")
+    assert one["verdict"] == VERDICT_CONTINUE and one["consecutive_errors"] == 1
+
+    at_threshold = decide(1, None, "cc-02", DEFAULT_ERROR_THRESHOLD - 1,
+                          body_state="parked")
+    assert at_threshold["verdict"] == VERDICT_WIND_DOWN
+    assert at_threshold["consecutive_errors"] == DEFAULT_ERROR_THRESHOLD
+
+
+def _write_manifest(agent_dir, body_state):
+    """The manifest line this fix reads, in the writer's own quoted shape."""
+    session = agent_dir / "sessions" / "SID1"
+    session.mkdir(parents=True, exist_ok=True)
+    (session / "body-manifest.yaml").write_text(
+        "unitKey: 'SID1'\nmindKey: 'alpha'\nbody_state: '%s'\n" % body_state,
+        encoding="utf-8")
+
+
+def test_poll_rejoins_a_parked_body_on_the_remint_poll(tmp_path):
+    """Check 1, end to end through the state file and the manifest read.
+
+    Two separate poll() calls, the way the fleet runs: the first learns fp A,
+    the reducer restarts (emitter now prints fp B) and the Body's manifest
+    reads parked — the remint poll must return CONTINUE (rejoin) on the spot,
+    not the rc=1 that drove the measured park-orbit defect. A third poll
+    proves the rejoin is durable (nothing latched, nothing to re-fire).
+    """
+    agent_dir = tmp_path / "alpha"
+    live_with = lambda fp: "echo \"%s\"\nexit 0\n" % (LIVE_LINE + ", token-fp " + fp)
+
+    scripts = _claim_stub(tmp_path, live_with(FP_A))
+    first = poll("alpha", agent_dir, "SID1", scripts)
+    assert first["verdict"] == VERDICT_CONTINUE and first["expected_token_fp"] == FP_A
+
+    _write_manifest(agent_dir, "parked")
+    _claim_stub(tmp_path, live_with(FP_B))
+    second = poll("alpha", agent_dir, "SID1", scripts)
+    assert second["verdict"] == VERDICT_CONTINUE, (
+        "a parked Body that observes the re-mint re-parks into an advanced "
+        "orbit beside the live reducer it had just adopted (g-306-503)")
+    assert second["expected_token_fp"] == FP_B
+
+    third = poll("alpha", agent_dir, "SID1", scripts)
+    assert third["verdict"] == VERDICT_CONTINUE
+
+
+def test_poll_still_winds_down_an_active_body_on_the_remint(tmp_path):
+    """Check 1's other half end to end (guard-1220): same bytes, same
+    emitter, manifest reading active — the WIND_DOWN the active Body's
+    staging depends on. A regression that dropped or inverted the gate fails
+    here, not just in the parked test."""
+    agent_dir = tmp_path / "alpha"
+    live_with = lambda fp: "echo \"%s\"\nexit 0\n" % (LIVE_LINE + ", token-fp " + fp)
+
+    scripts = _claim_stub(tmp_path, live_with(FP_A))
+    assert poll("alpha", agent_dir, "SID1", scripts)["verdict"] == VERDICT_CONTINUE
+
+    _write_manifest(agent_dir, "active")
+    _claim_stub(tmp_path, live_with(FP_B))
+    second = poll("alpha", agent_dir, "SID1", scripts)
+    assert second["verdict"] == VERDICT_WIND_DOWN
+    assert "restart" in second["reason"]
+
+
+def test_poll_with_no_manifest_keeps_todays_remint_verdict(tmp_path):
+    """Unreadable manifest = body_state None = the pre-fix verdict. A missing
+    record must never manufacture a rejoin: fail toward the old verdict."""
+    agent_dir = tmp_path / "alpha"
+    live_with = lambda fp: "echo \"%s\"\nexit 0\n" % (LIVE_LINE + ", token-fp " + fp)
+
+    scripts = _claim_stub(tmp_path, live_with(FP_A))
+    assert poll("alpha", agent_dir, "SID1", scripts)["verdict"] == VERDICT_CONTINUE
+
+    _claim_stub(tmp_path, live_with(FP_B))
+    second = poll("alpha", agent_dir, "SID1", scripts)
+    assert second["verdict"] == VERDICT_WIND_DOWN
+    assert second["expected_token_fp"] == FP_B

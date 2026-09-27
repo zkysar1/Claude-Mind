@@ -104,6 +104,18 @@ went unread. Re-probing the tag state can never free work frozen this way.
    `v*` tag, with one or more commits on `main` past it, is a FINDING** — not an
    automatic cut, but a state someone must dispose of rather than pass over.
 
+**Time-push is DETECTED; demand-pull is not (g-115-11017).** At the frontier,
+agent-watchdog `ReleaseTrainProbe` measures the time-push state every reducer
+iteration and files ONE fleet-wide `investigate:release-train-stalled-past-<tag>`
+goal, retired automatically once a newer tag lands. While that goal is open,
+iteration-close prints one in-turn LLM-ACTION naming it
+(`release-train-check.sh --nudge`). Re-measure read-only with
+`bash core/scripts/release-train-check.sh`. "Commits past it" counts only
+non-merge commits touching the promotion copy set (promotion-preflight.py
+`FRAMEWORK_PATHS`), so agent-state churn on `main` never fires it. The threshold
+is `release_train.stale_hours` in `core/config/aspirations.yaml`: change this
+section first, then that value. Demand-pull detection is g-115-11096.
+
 **Why 24h, and what it is NOT.** Over all 71 inter-tag gaps of the v2.12 series
 (v2.12.0 2026-08-23T02:56Z → v2.12.71 2026-09-13T21:09Z, measured 2026-09-15 on
 cc-04): median **0.81h**, p75 3.31h, p90 13.78h, p95 55.54h, max 97.01h. The

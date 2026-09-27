@@ -84,10 +84,15 @@ VALID_PATHS = (
 # the notify split — the same split `user-stop` uses, for the same reason.
 #
 # A parked worker Body is quiet ON PURPOSE and RESUMES ITSELF: its Phase 0.5 poll
-# re-runs hourly and un-parks the moment a reducer returns. So `worker-body-parked`
-# is recorded with `--no-notify`. No human action exists to request — emailing one
-# would be asking for a `/start` that is not needed, against the standing "no
-# emails if you can handle it" directive, and a park IS the agent handling it.
+# re-runs on the park orbit (1h -> 2h -> 4h, capped;  part 4) and the Body
+# resumes as soon as a DUE poll finds the reducer live — including, since ,
+# a reducer RESTART (token re-mint) observed while parked, which rejoins on that same
+# due poll instead of waiting for the next orbit. It is not "the moment a reducer
+# returns": a Body between due polls simply keeps sleeping until its next one. So
+# `worker-body-parked` is recorded with `--no-notify`. No human action exists to
+# request — emailing one would be asking for a `/start` that is not needed, against
+# the standing "no emails if you can handle it" directive, and a park IS the agent
+# handling it.
 #
 # Recording it is NOT optional decoration, and this is the measured part: the
 # sweeper's `classify()` returns EXPECTED_IDLE on this file BEFORE it reaches the

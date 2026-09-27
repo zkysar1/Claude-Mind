@@ -117,6 +117,7 @@ from typing import Any, Dict, List, Optional
 R_REAP = "reap"                               # stale + no live claim -> orphan
 R_REAP_TERMINAL_GOAL = "reap-terminal-goal"   # the row's goal is FINISHED
 R_REAP_VANISHED_GOAL = "reap-vanished-goal"   # the row's goal resolves NOWHERE
+R_REAP_OCCURRENCE_OVER = "reap-occurrence-over"  # recurring goal's occurrence finished AFTER this row claimed it
 K_SELF_SID = "self-sid"                       # this process's own row
 K_NO_CARRIER = "no-carrier"                   # carrier absent -> death unproven
 K_ALIVE = "alive"                             # carrier fresh and ours
@@ -142,7 +143,21 @@ K_NULL_RESIDUE = "null-residue"               # pre- null-valued key
 #: filing goal's proposed shape would have done -- would make the fleet's riskiest
 #: predicate the only one nobody can count, and would hide it inside the token a
 #: reader trusts most. Separate token, separate column in `verdict_counts`.
-REAPING_VERDICTS = frozenset({R_REAP, R_REAP_TERMINAL_GOAL, R_REAP_VANISHED_GOAL})
+#:
+#: `R_REAP_OCCURRENCE_OVER` is the fourth (), the RECURRING twin of
+#: `R_REAP_TERMINAL_GOAL`. A recurring goal never reaches a terminal status -- it
+#: records `lastAchievedAt` and returns to `pending` for the next occurrence -- so
+#: the terminal predicate reads it `False` forever and a carrier-less row that
+#: claimed one occurrence is immortal by construction, the exact phantom class the
+#: terminal branch was built to reach for non-recurring goals. It reaps on the
+#: SAME evidence class as that branch -- a store-asserted fact about the WORK (a
+#: recorded completion timestamp, later than the row's claim), not a liveness
+#: inference about the Body. Kept a distinct token for the guard-2418 reason: a
+#: fleet of these means the recurring-occurrence clear path is missing, a
+#: different follow-up than any of the three above.
+REAPING_VERDICTS = frozenset(
+    {R_REAP, R_REAP_TERMINAL_GOAL, R_REAP_VANISHED_GOAL, R_REAP_OCCURRENCE_OVER}
+)
 
 #: Deliberately LONGER than the sweep's own `--carrier-fresh-minutes`. That
 #: threshold governs whether to HOLD A CLAIM, which is reversible on the next
@@ -178,6 +193,7 @@ def decide_row(
     self_sid: Optional[str] = None,
     goal_is_terminal: Optional[bool] = None,
     goal_vanished: Optional[bool] = None,
+    goal_occurrence_over: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Pure per-row decision — every branch reachable with no daemon and no I/O.
 
@@ -198,7 +214,16 @@ def decide_row(
     Because this is the one predicate that concludes from ABSENCE, `None` is not
     merely the harmless default — it is the mandatory degradation whenever the
     census was incomplete, and the caller owns that judgement because only the
-    caller knows which stores it actually read."""
+    caller knows which stores it actually read.
+
+    `goal_occurrence_over` is tri-state on the same discipline (g-306-509): True =
+    the row's goal is recurring, its `lastAchievedAt` is later than the row's
+    `claimed_at`, and it is not currently claimed by this row's sid; False = a
+    recurring/timestamp/claimant condition failed; None = NOT MEASURED (no meta
+    supplied, no goal_id, or the goal absent from the census). Only True reaps, and
+    the branch AND-gates it with `not holds_live_claim` — unlike the terminal and
+    vanished store predicates this one concludes from a PRESENT fact, so a partial
+    census only ever MISSES a reap, never mints one."""
     ev = carrier_evidence or {}
     out: Dict[str, Any] = {
         "sid": sid,
@@ -216,6 +241,9 @@ def decide_row(
         # even armed for this row, which is the first thing to check when a
         # phantom survives a sweep.
         "goal_vanished": goal_vanished,
+        # : whether the RECURRING-occurrence-over predicate was armed and
+        # what it found (True/False/None). Same tri-state emission reason as above.
+        "goal_occurrence_over": goal_occurrence_over,
     }
 
     # Order matters: the most certain KEEPs come first, so an ambiguous carrier
@@ -328,6 +356,41 @@ def decide_row(
         out["verdict"] = R_REAP_VANISHED_GOAL
         return out
 
+    if goal_occurrence_over is True and not holds_live_claim:
+        # THE OCCURRENCE THIS ROW CLAIMED IS OVER (). The recurring twin
+        # of the terminal branch, and it exists because that branch cannot reach a
+        # recurring goal: such a goal never sits in a terminal status, so
+        # `goal_is_terminal` reads False forever and a carrier-less row that
+        # claimed one occurrence is immortal. `_goal_occurrence_over` returns True
+        # only when the store SAYS the work is done — the goal is recurring and its
+        # `lastAchievedAt` is strictly later than this row's `claimed_at` — and the
+        # occurrence is not the one this sid is currently working (condition 3,
+        # checked in the helper against the goal's claimant). Same POSITIVE-EVIDENCE
+        # class as `R_REAP_TERMINAL_GOAL`: a fact the store asserts, not an mtime
+        # inference.
+        #
+        # ORDERED AFTER `goal_vanished` and BEFORE the carrier branches for the
+        # same reason those two are: the carrier answers "is the BODY alive", and a
+        # Body that is alive and has simply moved to the next occurrence keeps a
+        # phantom row forever (`CV_FRESH_CORRECT` -> K_ALIVE). This reaches the row
+        # the liveness question cannot. Mutually exclusive with the two store
+        # branches above in practice — a recurring goal is present (so not vanished)
+        # and non-terminal (so not terminal) — so the order among them only decides
+        # which name a shared row would carry, never whether it reaps.
+        #
+        # GATED ON `holds_live_claim` like the vanished branch, NOT ungated like the
+        # terminal branch, and the gate is a SECOND layer over the helper's
+        # condition 3, not a substitute for it. `not holds_live_claim` means this
+        # sid claims nothing at all, which already IMPLIES it is not claiming this
+        # goal (condition 3); the belt-and-braces value is the guard-741 case the
+        # per-goal check does not cover — a Body alive and holding a live claim on a
+        # DIFFERENT goal, whose body row (written at claim time, never rewritten)
+        # still names this finished occurrence. Reaping it there would hide a
+        # working Body for the rest of its goal, the unrecoverable direction. The
+        # two checks agree on a keep whenever either would keep.
+        out["verdict"] = R_REAP_OCCURRENCE_OVER
+        return out
+
     # guard-358, both spellings. `fresh-wrong` is the explicit token; a STALE
     # carrier written by a different sid collapses to plain `stale` upstream but
     # still sets `carrier_sid` in the evidence, so check that too or a mismatched
@@ -411,6 +474,68 @@ def _goal_vanished(row: Any, known_goal_ids: Optional[set]):
     return str(gid) not in known_goal_ids
 
 
+def _goal_occurrence_over(
+    sid: str, row: Any, goal_meta_by_id: Optional[Dict[str, dict]]
+):
+    """Tri-state: has this recurring goal's occurrence completed SINCE the claim? ()
+
+    The RECURRING twin of `_goal_terminal`. A recurring goal never reaches a
+    terminal status — it records `lastAchievedAt` and returns to `pending` for the
+    next occurrence — so `_goal_terminal` reads it `False` forever and a
+    carrier-less body row that claimed one occurrence is unreapable by
+    construction. This answers the question the terminal predicate cannot: did the
+    occurrence THIS row claimed already finish?
+
+    `True` only when ALL THREE hold (the filing goal's exact predicate):
+      1. the goal is recurring;
+      2. its `lastAchievedAt` is strictly LATER than the row's `claimed_at`
+         (the occurrence this row claimed has since completed);
+      3. the goal is NOT currently claimed by this row's own sid — a live re-claim
+         of the current occurrence must never be reaped.
+    Reaps on a store-asserted FACT (the recorded completion timestamp), the same
+    POSITIVE-evidence class as `_goal_terminal`, never on a liveness inference.
+
+    `None` whenever the question was not answerable: no meta supplied (a store was
+    unreadable, or a caller predating the parameter), the row is not a dict or
+    carries no `goal_id`, or the goal is absent from the census. `False` for a
+    present goal that fails any of the three conditions. `None` and `False` are
+    kept apart for the guard-2418 reason its siblings state — only one may reach a
+    delete, and a reader triaging a survivor needs to know whether the predicate
+    was even armed.
+
+    Because this concludes from a PRESENT fact rather than absence, a partial
+    census is the SAFE direction (a missing goal reads `None`, never a false
+    `True`) — the exact inverse of `_goal_vanished`, where a hole in the census
+    mints reaps. Timestamps are compared as naive ISO 8601 strings, which the
+    fleet writes at second precision under a single UTC wall clock, so
+    lexicographic order IS chronological order.
+    """
+    if goal_meta_by_id is None:
+        return None
+    if not isinstance(row, dict):
+        return None
+    gid = row.get("goal_id")
+    if not gid:
+        return None
+    meta = goal_meta_by_id.get(str(gid))
+    if not isinstance(meta, dict):
+        return None
+    if not meta.get("recurring"):
+        return False
+    last_achieved = meta.get("lastAchievedAt")
+    claimed_at = row.get("claimed_at")
+    if not last_achieved or not claimed_at:
+        return False
+    if str(last_achieved) <= str(claimed_at):
+        return False
+    # Condition 3: a live re-claim of the CURRENT occurrence by this same sid is
+    # not a phantom. `claimed_by_sid` is the goal record's current claimant; when
+    # it is this row's own sid the Body is working the new occurrence, so keep.
+    if meta.get("claimed_by_sid") == sid:
+        return False
+    return True
+
+
 def decide(
     rows: Dict[str, Any],
     carrier_verdicts: Dict[str, Any],
@@ -418,6 +543,7 @@ def decide(
     self_sid: Optional[str] = None,
     terminal_goal_ids: Optional[set] = None,
     known_goal_ids: Optional[set] = None,
+    goal_meta_by_id: Optional[Dict[str, dict]] = None,
 ) -> Dict[str, Any]:
     """Decide over one agent's whole `in_flight_bodies` map. Pure.
 
@@ -436,6 +562,15 @@ def decide(
     set does not degrade the predicate, it INVERTS it: every goal living only in
     the omitted store becomes "resolves nowhere" and its row becomes reapable.
     That is the g-306-270 hole re-opened one store over, in the delete direction.
+
+    `goal_meta_by_id` (g-306-509) maps goal_id -> {recurring, lastAchievedAt,
+    claimed_by_sid} for the OCCURRENCE-OVER predicate, and its caller obligation is
+    the INVERSE of `known_goal_ids`. Because that predicate reaps on PRESENCE, a
+    partial map is the SAFE direction — a goal missing because its store was
+    unreadable is simply not reaped — so the caller need not degrade the whole map
+    to None on a partial read (it may, for parallelism). `None` still means "not
+    measured", and a goal absent from the map yields `goal_occurrence_over == None`
+    for its row, which declines the reap.
     """
     decisions: List[Dict[str, Any]] = []
     for sid in sorted(rows or {}):
@@ -453,6 +588,8 @@ def decide(
                     (rows or {})[sid], terminal_goal_ids),
                 goal_vanished=_goal_vanished(
                     (rows or {})[sid], known_goal_ids),
+                goal_occurrence_over=_goal_occurrence_over(
+                    sid, (rows or {})[sid], goal_meta_by_id),
             )
         )
     counts: Dict[str, int] = {}

@@ -1469,3 +1469,227 @@ guard-399 and guard-6482.
   - Apply the strict boundary before reading rule 2.
   - The two UNRESOLVABLE rule-2 records are now at rc 4. One more replay each reaches the
     rc>=5 archive cap, so Step 1 will archive them rather than replay them again.
+
+## Run 83 (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, 2026-09-26)
+
+- **Pool.** 834 candidates. `surprise` is on all 834 (63 of them None); 2 still carry the
+  `surprise_level` alias. 0 were at the rc>=5 cap and 0 were encoded-chronic. The Step 3.6
+  sweep of the full pool found 0 chronic-CORRECTED unencoded records.
+  - The stored-surprise ceiling is 6, so rule 2 (>=7) is 0 under stored AND derived
+    surprise. Run 82's three s7 records were replayed and stamped earlier today, so they are
+    no longer in this pool.
+- **Both hand-rolled-selector defects repeated, on the day Run 82 recorded them** (gap-239,
+  fifth encounter).
+  - (a) The 7-day skip used `>=`. It excluded 6 records that were due (all `last_replayed`
+    2026-09-19), 2 of them s6. The proportional allocation {rc0 1, rc1 5, rc2 2} is identical
+    with or without them, so no stratum changed. Both records stay due.
+  - (b) Selection used STORED surprise. `derive_surprise` (`core/scripts/_surprise.py`)
+    disagrees on 298 of 834 pool records and on 3 of 10 batch slots:
+    - the solKey UNRESOLVABLE record derives None;
+    - BOTH "routine" draws derive 6 and 5, so they are band-1 violations under the SSOT.
+    The routine anti-overfitting slot therefore held no routine record.
+  - (a) was a boundary effect. (b) was a composition effect and changed the batch.
+- **Batch.** 8 from band s6, allocated proportionally across rc over 107 records (rc0 11 /
+  rc1 70 / rc2 26), plus 2 routine at seed 20260926.
+  - Outcomes: 5 CONFIRMED, 4 CORRECTED, 1 UNRESOLVABLE. That is 4/9 CORRECTED of the
+    scoreable records, BATCH-scoped (guard-2129).
+- **Narratives.** 10/10 parsed, and the parsed count was asserted.
+  - Winning keys: outcome_detail x7, resolution x1, resolution_note x1,
+    resolution_evidence x1.
+  - 0 were bare. 0 carried a procedural-gap indicator, so Step 3.5 had no candidate.
+- **Step 3: two batch-suggested markers, both REJECTED on the corpus.**
+  - Method: resolved and archived union = 1921 records; 1162 CONFIRMED/CORRECTED; base
+    42.3% CORRECTED. The batch was excluded from both arms. 2000 permutations.
+  - M1: title matches `steady[- ]state|accret|backlog|continuing`. The batch had it 2/2
+    CORRECTED. Corpus: n=17, 35.3% vs 42.4% (-7.1pp), exceedance 0.632, AT the median
+    |perm| of 0.071. The crc(`id[11:]`) control alone reads +22.7pp at n=17, which shows how
+    wide the floor is.
+  - M2: `calibration` with conf <= 0.45. The batch had it 4/4 CONFIRMED, which reads as
+    underconfidence. Corpus: n=87, 43.7% vs 42.2% (+1.5pp), exceedance 0.835, below the
+    median of 0.040. So it is not underconfidence.
+  - Neither was encoded. Do not re-derive either from a batch.
+- **Step 4.**
+  - 0 pattern-signature outcomes: the matches were retrospective.
+  - Tree node `sol` gained ★ MEASURED CHAT CHANNEL (Sol chat 0/17, so C8 and C12 are
+    unmeasurable from organic sessions). The node predated the 2026-09-08 resolution.
+  - Credited guard-2144, guard-6131, guard-4673 and guard-2129.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id).
+  next_review 2026-10-03.
+- **NEXT RUN (84).**
+  - Select on `derive_surprise` with the strict `>` skip until gap-239 is forged.
+  - Two due records are still unstamped:
+    - `2026-07-28_population-filter-defect-recurs-in-skillmd` (rc4, s6). Its next replay
+      reaches the rc>=5 cap.
+    - `2026-09-08_review-acceptance-stays-silent` (rc1, s6, CORRECTED).
+
+## Run 84 (zeta, `hostname` cc-02, `uname -r` 6.8.0-139-generic, 2026-09-26; zeta's g-001-05 occurrence 83)
+
+- **Pool.** 831 candidates. `derive_surprise` disagrees with stored `surprise` on 258 of them.
+  0 were at the rc>=5 cap, 0 were encoded-chronic, and the strict 7-day skip excluded 0 (a
+  `>=` skip would have dropped the 6 records due today). The Step 3.6 sweep of the full pool
+  found 0 chronic-CORRECTED unencoded records.
+- **Selection** used effective surprise (derived, else stored) with the strict `>` skip, as
+  Run 83 prescribed.
+  - Rule 2 = 1: `2026-09-19_changelog-rotation-linearized-holds-at-cap` (s9, rc0, stage
+    resolved; resolved that morning).
+  - Band 6: 117 records in strata rc0 16 / rc1 73 / rc2 25 / rc3 1 / rc4 2, allocated
+    PROPORTIONALLY {rc0 1, rc1 4, rc2 2} by largest remainder, drawn at random within each
+    stratum at seed 84.
+  - 2 routine records (effective s<5, scoreable) at seed 84, from a routine pool of 368.
+  - Neither of Run 83's two flagged due records was drawn. Both remain due (rc4 and rc1, s6).
+- **Batch.** 7 CORRECTED, 3 CONFIRMED. That is 7/10, BATCH-scoped and upward-biased
+  (guard-2129).
+- **Narratives.** 10/10 parsed, and the parsed count was asserted against the ids requested.
+  - Winning keys: outcome_detail x8, evidence_for x1, resolution_evidence x1.
+  - 0 were bare. 0 carried a procedural-gap indicator, so Step 3.5 had no candidate.
+- **Qualitative.**
+  - 3 of the 7 CORRECTED predicted an event of a kind inside a window, and each read zero: a
+    guard fires within 7d; a pre-commit hook catches >=1 real regression (0 over ~1685
+    commits); the next runtime.ts addition reds an untouched test.
+  - 3 were cause attributions refuted at the source: a handshake-chain divergence that both
+    sources did not show; a missing field whose two motivating observations were confounds;
+    a spend residual read as lag that was live burn (one conjunct held).
+  - The s9 record is a conjunction. The cost half held. The steady-state half failed on
+    cadence (drain-lane admission, about 6x the interval) and on scope: the store is
+    machine-local, so a sweep bounds only the box that runs it (guard-2585).
+- **Step 3: the batch-suggested marker was REJECTED on the corpus.**
+  - M1: the title matches an occurrence verb
+    (`fires|firing|catch|caught|finds|found|reds|trips|triggers`). The batch had it 3 of 4
+    CORRECTED.
+  - Corpus: resolved 37 + archived 1888 = union 1925; 1156 scoreable after excluding the
+    batch; base 42.2% CORRECTED. M1 n=68, 36.8% (-5.8pp), exceedance 0.382 over 2000
+    permutations at the group's own size, median |perm| 0.042, p95 0.120.
+  - Controls: crc(`id[11:]`) size-matched -4.2pp; a month-matched date control, mean over
+    200 draws, -0.6pp.
+  - The batch direction REVERSED on the corpus. Not encoded. Do not re-derive it from a batch.
+- **Step 4.**
+  - 0 pattern-signature outcomes: no batch record references a signature, and retrospective
+    matches take none.
+  - Credited guard-2585, guard-2129 and guard-2144.
+  - Live re-measure of the s9 record's scope finding: cc-02's copy of the changelog store
+    returned 67,955 rows at 14:4xZ. It read 66,223 lines at 09:33Z, and was last rotated
+    09-19T14:17. That is 3.4x the cap and still climbing. Appended to g-115-11025 (a
+    box-local sweep wired to a fleet-shared recurring goal) as a second instance of that
+    class.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id
+  read-back). next_review 2026-10-03.
+- **NEXT RUN (85).**
+  - Keep derived surprise and the strict skip until gap-239 is forged.
+  - Run 83's two flagged records are still due and unstamped. The rc4 one reaches the archive
+    cap on its next replay.
+
+## Run 85 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-27; zeta's g-001-05 occurrence 84)
+
+- **Pool.** `--replay-candidates` returned 841 records (5,857,252 B). Excluded outcome-null 8
+  and test-cat 1, leaving 832 eligible.
+  - `derive_surprise` disagrees with stored `surprise` on 254.
+  - 0 were at the rc>=5 cap and 0 were encoded-chronic in the eligible set.
+  - The strict `>` skip excluded 0. A `>=` skip would have dropped the 16 records due today
+    (`last_replayed` 2026-09-20).
+  - rc==0-or-absent across the eligible set is 441.
+  - Effective-surprise histogram: {0:1, 1:4, 2:27, 3:67, 4:286, 5:281, 6:124, 7:4, None:38}.
+- **Selection** used effective surprise (derived, else stored) with the strict skip.
+  - Rule 2 = 4, all s7, at rc 2/2/2/0.
+  - Band 6: 124 records in strata rc0 16 / rc1 72 / rc2 28 / rc3 4 / rc4 4, allocated
+    PROPORTIONALLY {rc0 1, rc1 2, rc2 1} by largest remainder, drawn at seed 85.
+  - 2 routine records (effective s<5) at seed 85, from a routine pool of 385.
+  - Neither of Run 83's flagged records was drawn. Both are eligible s6 band members.
+- **Batch.** 6 CORRECTED, 3 CONFIRMED, 1 UNRESOLVABLE. That is 6/9 scoreable CORRECTED,
+  BATCH-scoped and upward-biased (guard-2129).
+- **Narratives.** 10/10 parsed, and the count was asserted against the intended ids.
+  - Winning keys: outcome_detail x7, resolution_note x2, rationale x1.
+  - The helper reads 1 bare. The fleet holds 0 bare, because two lessons live OFF the record:
+    - `2026-07-30_no-target-preserves-cloudplace-failure-streak` (UNRESOLVABLE). Its
+      outcome_detail is a 323-char relocation stub that says "No outcome_detail was recorded at
+      resolution time", so it passes the chars<40 bare test. The lesson is in echo's experience
+      exp-g-115-4032: the declared measurement channel (infra-health component history) never
+      existed, because 0 of 78 components carry a `history` field.
+    - `2026-09-09_daemon-wrapper-read-stale-majority` (CORRECTED). `--narrative` returned the
+      formation `rationale`, which is the refuted premise. The resolution exists only on the
+      coordination board (msg-20260922-002535-echo-5929): verified-current 8 vs fetched 1 over 9
+      own-cloud readings, and the single `fetched` came at the longest gap (120s). The mechanism
+      is real; only the majority claim failed. Echo also named a sign-known confound: every run
+      force-freshens the mirror, which can only depress `fetched`.
+  - Both were appended to g-115-10108 as instances.
+- **Qualitative.** 4 of the 6 CORRECTED records failed on a conjunct or a mechanism while the
+  practical finding held:
+  - g326384: the direction held; the store-scope mechanism was wrong.
+  - skipped-no-ledger: the zero-owed bottom line held; the zero-usage reason was wrong.
+  - stale-link: leg 1 held; the distinguishing leg failed.
+  - daemon-wrapper: the mechanism was real; the majority claim failed.
+  This is the 2026-08-24 "framing, not substance" marker, which fell below its floor median once
+  de-circularized. It was not re-tested. The batch's other lessons are already encoded:
+  guard-5960 (gossip's pre-merge sibling baseline read as post-directive), guard-4163
+  (stale-link's either/or that did not cover the space), guard-2727 (threshold and mechanism
+  resolving apart) and guard-886 (dev-collect predicted persistence after a revert).
+- **Step 3: two title markers, pre-registered before the corpus read. Both REJECTED.**
+  - Corpus: resolved 43 + archived 1888 = union 1931. 1163 are scoreable with the batch
+    excluded. Base 42.2% CORRECTED. 2000 permutations at each group's own size.
+  - M1, an appended clause (` — ` or ` -- `): the batch had it 2/2 CORRECTED. Corpus n=64,
+    35.9% vs 42.6% (-6.6pp), exceedance 0.308, median |perm| 4.9pp, p95 11.6pp.
+  - M2, ` and `: the batch had it 1/1 CORRECTED. Corpus n=58, 37.9% vs 42.4% (-4.5pp),
+    exceedance 0.611, below the median |perm| of 4.6pp.
+  - Controls:
+    - month-matched date draw (mean of 200): -1.1pp for both markers;
+    - crc(`id[11:]`) size-matched: -3.3pp for M1 and -6.3pp for M2;
+    - the common word "the", size-matched: -11.6pp and -11.8pp. A meaningless title-word split
+      reads LARGER than either marker, which shows how wide the title-word floor is;
+    - title verdict-token contamination: 7/1163 = 0.60%.
+  - Both reversed the batch direction. This is the fourth consecutive batch-suggested title
+    marker to read NEGATIVE on the corpus: -7.1pp (Run 83), -5.8pp (Run 84), then -6.6pp and
+    -4.5pp here. Each sits inside its own floor.
+    - Mechanism, inferred and not measured: a violation-first batch makes any marker it contains
+      look CORRECTED-enriched, so the corpus reading can only regress toward the base.
+    - Consistent sign alone is not a finding. Not encoded.
+    - Spark addendum (post-close, same run). The inferred mechanism above predicts shrinkage
+      toward the base, which is ~0, not a negative sign. One path that CAN reverse the sign
+      exists by construction: `compute_surprise` is a pure function of (outcome, confidence), so
+      a surprise-selected batch conditions on a collider. Any marker that tracks confidence then
+      reads outcome-enriched inside the batch.
+      - Measured over the same 1163 scoreable records, that path is INERT here.
+      - Confidence does predict the outcome. CORRECTED by confidence band: 47.8% below 0.5
+        (n=161), 49.1% at 0.5-0.6 (n=450), 35.7% at 0.6-0.7 (n=437), 35.4% at 0.7-0.8 (n=79),
+        25.0% at 0.8+ (n=36).
+      - Neither marker tracks confidence. Mean confidence, marker on vs off: M1 0.568 vs 0.574,
+        M2 0.587 vs 0.573.
+      - Confidence-stratified lifts barely move: M1 -7.7pp and M2 -4.2pp, against raw lifts of
+        -6.6pp and -4.5pp.
+      - So the negative-sign series stays unexplained. Lesson: rb-12100.
+- **Step 3.6.** The full-pool sweep found 2 eligible (rc3, CORRECTED, unencoded). Both took the
+  OVERLAP branch; nothing was nucleated.
+  - `2026-07-30_widened-sweep-yield-stays-near-zero`: predicted <3 Apply goals and measured 17.
+    Strengthened guard-398 (a magnitude on an aggregate with no contributors enumerated).
+  - `2026-08-01_mind-data-outranks-tmp-conf-in-fixture-subprocess`: the mechanism sat one
+    precedence level off, and the near-confirmation came from a probe that sourced `_paths.sh`,
+    which the wrapper never does. Strengthened guard-2039.
+  - Both were marked `encoded_via_chronic` by whole-object write and VERIFIED by per-id
+    read-back.
+  - Exposure: both are archived, and g-115-10778 (the prune reverts post-archival writes) is
+    still pending. So the read-back proves the write landed, not that it will survive the prune.
+- **Step 4.**
+  - 0 pattern-signature outcomes: no record references a signature, and the matches were
+    retrospective.
+  - Credits. All 9 rows were read back from the local spool
+    `.mind-data/world/guardrails-utilization.spool.jsonl`. Increments spool BY DESIGN (g-358-05)
+    and land in the sidecar at flush. The content record's embedded block is frozen, so
+    re-reading it shows no change, and that is not a lost write (g-115-6850).
+    - times_helpful: guard-2129, guard-2144, guard-4673 (method rails applied this run).
+    - times_active: guard-5960, guard-4163, guard-2727, guard-886 (corroborated by batch
+      records), plus guard-398 and guard-2039 (Step 3.6).
+  - rb-12069 was NOT credited. It was derived from the skipped-no-ledger record this morning
+    (g-001-08 occurrence 189), so replaying its own source is not independent evidence.
+  - Experience retrieval_stats: 6 consulted (echo 2, bravo 2, foxtrot 1, alpha 1) and 0 written,
+    because all six are cross-agent.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id).
+  next_review 2026-10-04.
+- **NEXT RUN (86).**
+  - Keep derived surprise and the strict skip until gap-239 is forged.
+  - RETIRE the Run 83 carry-forward. "Due and unstamped" describes every eligible band-6 record.
+    The flag recorded what Run 83's `>=` defect excluded from its OWN draw, and both records are
+    now ordinary band members.
+  - A `rationale` winner or a relocation stub does not end the search. Read the record's
+    experience_ref (the owner's store, read-only), then search the board for the record id,
+    before calling the record bare.
+  - Beside each marker's raw corpus lift, print its corpus mean-confidence difference (marker
+    on vs off) and a confidence-stratified lift. A non-zero difference means part of the lift
+    is a confidence effect that surprise-based selection carried in (rb-12100).

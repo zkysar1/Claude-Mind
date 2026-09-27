@@ -896,3 +896,221 @@ def test_the_archive_is_among_the_stores_the_sweep_censuses(monkeypatch):
     assert any(p.endswith("/world/aspirations.jsonl")
                or (p.endswith("aspirations.jsonl") and "/bravo/" not in p
                    and "archive" not in p) for p in seen), seen
+
+
+# ── the FIFTH state: a RECURRING goal's occurrence is over () ────────
+#
+# `_goal_terminal` never fires for a recurring goal — such a goal returns to
+# `pending` between occurrences and never sits in a terminal status — so a
+# carrier-less row that claimed one occurrence is immortal by construction. This
+# is the recurring twin of R_REAP_TERMINAL_GOAL: it reaps on a store-asserted
+# FACT (a `lastAchievedAt` later than the row's claim), the same POSITIVE-evidence
+# class, never on a liveness inference.
+#
+# Mutation-tested: `test_each_occurrence_over_condition_is_load_bearing` flips one
+# of the three conditions per row and asserts the reap disappears, so dropping any
+# condition from `_goal_occurrence_over` kills a case; removing the branch's
+# `and not holds_live_claim` kills the gate test; omitting the goal-meta census
+# from the apply-time re-check kills the end-to-end test (cleared == []).
+
+# claimed_at of LIVE_ROW is 2026-08-07T23:58:02 — these bracket it.
+_ACHIEVED_AFTER = "2026-09-01T00:00:00"    # occurrence completed AFTER the claim
+_ACHIEVED_BEFORE = "2026-08-01T00:00:00"   # BEFORE the claim (an earlier run)
+
+
+def _decide_o(meta, holds_claim=False, carrier=None, row=LIVE_ROW,
+              known=None, terminal=None):
+    """One row through the REAL `decide`, so `_goal_occurrence_over` and the branch
+    ordering run together rather than being hand-fed to `decide_row`. `known` and
+    `terminal` default to None so the occurrence-over predicate is the ONLY store
+    predicate that can fire — the discriminating-input discipline `_decide_v` uses
+    with a fresh carrier. `meta` maps goal_id -> {recurring, lastAchievedAt,
+    claimed_by_sid}."""
+    out = R.decide(
+        {SID: row},
+        {SID: (carrier or R.CV_FRESH_CORRECT, {})},
+        {SID: "g-other"} if holds_claim else {},
+        None,
+        terminal,
+        known,
+        meta,
+    )
+    return out["decisions"][0], out
+
+
+def test_occurrence_over_row_is_reaped_even_though_the_body_is_ALIVE():
+    """THE NEW REACH. Carrier is deliberately `fresh-correct`: a Body that is
+    perfectly alive and has simply moved to the next occurrence hits K_ALIVE and
+    keeps its phantom row forever, so a fresh carrier is what makes this test
+    discriminating — nothing but the occurrence-over predicate can reap it."""
+    meta = {"g-999-01": {"recurring": True,
+                         "lastAchievedAt": _ACHIEVED_AFTER,
+                         "claimed_by_sid": OTHER_SID}}
+    d, out = _decide_o(meta)
+    assert d["verdict"] == R.R_REAP_OCCURRENCE_OVER, d
+    assert d["goal_occurrence_over"] is True
+    assert R.is_reaping(d["verdict"]) is True
+    assert len(out["reapable"]) == 1
+
+
+@pytest.mark.parametrize("meta,expect_reap,why", [
+    ({"recurring": True,  "lastAchievedAt": _ACHIEVED_AFTER,  "claimed_by_sid": OTHER_SID},
+     True,  "all three conditions hold"),
+    ({"recurring": False, "lastAchievedAt": _ACHIEVED_AFTER,  "claimed_by_sid": OTHER_SID},
+     False, "condition 1: goal is not recurring"),
+    ({"recurring": True,  "lastAchievedAt": _ACHIEVED_BEFORE, "claimed_by_sid": OTHER_SID},
+     False, "condition 2: occurrence completed BEFORE the claim"),
+    ({"recurring": True,  "lastAchievedAt": "2026-08-07T23:58:02", "claimed_by_sid": OTHER_SID},
+     False, "condition 2 boundary: achieved == claimed_at is not strictly later"),
+    ({"recurring": True,  "lastAchievedAt": _ACHIEVED_AFTER,  "claimed_by_sid": SID},
+     False, "condition 3: goal is currently claimed by THIS row's sid"),
+])
+def test_each_occurrence_over_condition_is_load_bearing(meta, expect_reap, why):
+    """The mutation proof (guard-4166): the positive row reaps and EACH single
+    condition-flip flips it back to a keep, so dropping any of the three from the
+    predicate is a caught regression. A keep must also not be some OTHER reap."""
+    d, out = _decide_o({"g-999-01": meta})
+    if expect_reap:
+        assert d["verdict"] == R.R_REAP_OCCURRENCE_OVER, (why, d)
+        assert out["reapable"], (why, d)
+    else:
+        assert d["verdict"] != R.R_REAP_OCCURRENCE_OVER, (why, d)
+        assert R.is_reaping(d["verdict"]) is False, (why, d)
+        assert d["goal_occurrence_over"] is False, (why, d)
+        assert out["reapable"] == [], (why, d)
+
+
+def test_occurrence_over_with_a_LIVE_CLAIM_is_never_reaped():
+    """The guard-741 belt over condition 3: `holds_live_claim` is per-SID, so a
+    Body alive and holding a claim on a DIFFERENT goal must keep its row even when
+    that row names a finished occurrence. Reaping there would hide a working Body
+    for the rest of its goal, and rows are written at CLAIM time so it never comes
+    back. Stale carrier here so the fall-through lands on a DISTINCT token, proving
+    the gate blocked occurrence-over rather than some other branch keeping it."""
+    meta = {"g-999-01": {"recurring": True,
+                         "lastAchievedAt": _ACHIEVED_AFTER,
+                         "claimed_by_sid": OTHER_SID}}
+    d, out = _decide_o(meta, holds_claim=True, carrier=R.CV_STALE)
+    assert d["goal_occurrence_over"] is True, "the predicate should still SEE it"
+    assert d["verdict"] == R.K_STALLED_WITH_CLAIM, d
+    assert out["reapable"] == []
+
+
+def test_no_carrier_row_on_a_pending_non_recurring_goal_is_K_NO_CARRIER():
+    """The control the filing goal names: occurrence-over must not touch a plain
+    no-carrier row whose goal is not recurring — it keeps its pre-existing
+    verdict, here K_NO_CARRIER."""
+    meta = {"g-999-01": {"recurring": False,
+                         "lastAchievedAt": _ACHIEVED_AFTER,
+                         "claimed_by_sid": OTHER_SID}}
+    d, out = _decide_o(meta, carrier=R.CV_ABSENT)
+    assert d["goal_occurrence_over"] is False
+    assert d["verdict"] == R.K_NO_CARRIER, d
+    assert out["reapable"] == []
+
+
+def test_terminal_evidence_outranks_occurrence_over():
+    """Ordering: a store that SAYS the goal is terminal beats the recurring
+    timestamp inference where both could fire. Mutually exclusive in practice (a
+    recurring goal present is not terminal), but the ordering must be pinned so a
+    future edit cannot let the weaker branch name the row."""
+    meta = {"g-999-01": {"recurring": True,
+                         "lastAchievedAt": _ACHIEVED_AFTER,
+                         "claimed_by_sid": OTHER_SID}}
+    d, _ = _decide_o(meta, terminal={"g-999-01"})
+    assert d["verdict"] == R.R_REAP_TERMINAL_GOAL, d
+    assert R.R_REAP_OCCURRENCE_OVER != R.R_REAP_TERMINAL_GOAL
+    assert R.R_REAP_OCCURRENCE_OVER in R.REAPING_VERDICTS
+
+
+def test_self_sid_still_outranks_the_occurrence_over_branch():
+    """The running session's own row is belt-and-braces protected and the new
+    branch must not slip above it — a self row naming a finished occurrence is a
+    miss in the CLEAN-close path, to be fixed there, not masked here."""
+    d = R.decide_row(sid=SID, row=LIVE_ROW, carrier_verdict=R.CV_FRESH_CORRECT,
+                     self_sid=SID, goal_occurrence_over=True)
+    assert d["verdict"] == R.K_SELF_SID
+
+
+def test_occurrence_over_is_None_when_unmeasured():
+    """`None` = NOT MEASURED and must never read as False. Unlike `_goal_vanished`
+    this predicate reaps on PRESENCE, so a partial/absent census only ever MISSES a
+    reap — but the tri-state is still emitted so a survivor can be triaged."""
+    assert R._goal_occurrence_over(SID, LIVE_ROW, None) is None      # no census
+    assert R._goal_occurrence_over(SID, LIVE_ROW, {}) is None        # goal absent
+    assert R._goal_occurrence_over(
+        SID, LIVE_ROW, {"g-999-01": "not-a-dict"}) is None            # junk meta
+
+
+@pytest.mark.parametrize("row", [
+    pytest.param({"claimed_at": "2026-08-07T23:58:02"}, id="no-goal_id"),
+    pytest.param(None, id="null-residue"),
+])
+def test_occurrence_over_is_None_for_a_row_it_cannot_key_on(row):
+    """guard-1704: a signal added to a predicate over a population must be DEFINED
+    for every member. A row with no id cannot be looked up, so the honest answer
+    is `None`, never a value that could reach a delete."""
+    meta = {"g-999-01": {"recurring": True,
+                         "lastAchievedAt": _ACHIEVED_AFTER,
+                         "claimed_by_sid": OTHER_SID}}
+    assert R._goal_occurrence_over(SID, row, meta) is None
+
+
+# ── the occurrence-over predicate END TO END, through the real sweep ──────────
+
+def test_occurrence_over_row_is_ACTUALLY_REAPED_through_the_apply_path(monkeypatch):
+    """The wiring test, and the one that catches an inert fix (guard-1943).
+
+    `decide` defaults `goal_meta_by_id` to None, so the guard-3020 re-check
+    immediately before the delete re-runs the decision — and if that call omits
+    the goal-meta census, every occurrence-over candidate comes back
+    `goal_occurrence_over=None` and is dropped as `recheck-declined`. The scan
+    would keep listing candidates and the sweep would keep reaping none, which from
+    the outside is indistinguishable from healthy conservatism. Asserting
+    `cleared` / `reaped` — not `reap_candidates` — is the whole point.
+    """
+    sweep = _load_sweep()
+    import worker_stall
+    calls = _wire(monkeypatch, sweep, [{}], carrier=(R.CV_FRESH_CORRECT, {}))
+    # known holds the goal (so NOT vanished) and terminal is empty (so NOT
+    # terminal): the occurrence-over predicate must be the sole reaping path.
+    _wire_ids(monkeypatch, known={"g-999-01"}, terminal=set())
+    monkeypatch.setattr(
+        worker_stall, "read_goal_meta",
+        lambda *s: ({"g-999-01": {"recurring": True,
+                                  "lastAchievedAt": _ACHIEVED_AFTER,
+                                  "claimed_by_sid": OTHER_SID}}, "authoritative"))
+
+    out = sweep._reap_stale_body_rows(
+        agent="bravo", self_sid=None, stale_minutes=180.0, apply_changes=True
+    )
+
+    assert out["reap_candidates"] == 1, out["decisions"]
+    assert calls["cleared"] == [SID], (
+        "identified but never cleared — the apply-time re-check is not passing the "
+        "goal-meta census, so the occurrence-over predicate is inert")
+    assert out["reaped"] == 1, out
+    assert out["decisions"][0]["verdict"] == R.R_REAP_OCCURRENCE_OVER
+
+
+def test_unread_goal_meta_declines_occurrence_over(monkeypatch):
+    """`provenance == "none"` → None → no reap. Here this is conservatism, not a
+    correctness requirement (presence-reap can only ever MISS on a partial
+    census), but the sweep declines for parallelism with its siblings and records
+    the provenance so the decline is observable."""
+    sweep = _load_sweep()
+    import worker_stall
+    calls = _wire(monkeypatch, sweep, [{}], carrier=(R.CV_FRESH_CORRECT, {}))
+    _wire_ids(monkeypatch, known={"g-999-01"}, terminal=set())
+    monkeypatch.setattr(worker_stall, "read_goal_meta",
+                        lambda *s: ({}, "none"))
+
+    out = sweep._reap_stale_body_rows(
+        agent="bravo", self_sid=None, stale_minutes=180.0, apply_changes=True
+    )
+
+    assert out["reap_candidates"] == 0, out["decisions"]
+    assert calls["cleared"] == [], "an unread census must not license a write"
+    assert out["decisions"][0]["goal_occurrence_over"] is None
+    assert any("goal-meta-read" in e and "provenance=none" in e
+               for e in out["errors"]), out["errors"]

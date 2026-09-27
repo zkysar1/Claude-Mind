@@ -322,6 +322,17 @@ def test_route_command_calls_the_shared_writer_with_the_findings():
     assert "blocked until" in cmd[7], "the note must say the close is blocked"
 
 
+def test_routed_note_never_opens_with_a_JSON_opener():
+    """guard-6075 Cause A. On an EMPTY progress_note the composed value's first
+    byte is this note's own, and goal-field-append refuses '{' or '[' with rc=5.
+    A bracketed header failed routing on every goal that had no progress_note
+    (measured on g-115-10935, 2026-09-26: pre_len 0, rc=5, verdict unrouted)."""
+    m = _producer_module()
+    for verdict in ("REJECT", "APPROVE_WITH_NOTES"):
+        text = m.route_command("g-1-1", "world", "peer-bravo", ["x"], verdict)[7]
+        assert text[:1] not in ("{", "["), (verdict, text[:40])
+
+
 def test_the_marker_lets_a_RE_review_through_but_not_a_repeat():
     """Idempotency keyed on the FINDINGS, which is the load-bearing choice.
 

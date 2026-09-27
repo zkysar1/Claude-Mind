@@ -10,13 +10,16 @@ live stall, forever. Measured 2026-09-10: eight such manifests across seven
 containers, two of them 8.2 days old. Measured 2026-09-11 from cc-10: 37 of 77
 carriers in the store graded `stalled_no_close`.
 
-WHAT IT DOES. For each manifest on this box reading `active` whose session is
-provably not running here, it runs the ORDINARY close late, through the
-manifest's sole writer (body-manifest.close_body_late): a forked worker is
+WHAT IT DOES. For each manifest on this box reading `active` or `parked` whose
+session is provably not running here, it runs the ORDINARY close late, through
+the manifest's sole writer (body-manifest.close_body_late): a forked worker is
 staged exactly as a genuine close stages it and marked closed-pending-merge; a
 Body with no forked WM (reducer, observer) has nothing to stage and is marked
-closed-stale. NOTHING IS DELETED — no session dir, no WM, no baseline. A
-`parked` Body is never touched (resumable by contract, g-306-291).
+closed-stale. NOTHING IS DELETED — no session dir, no WM, no baseline. A LIVE
+`parked` Body is never touched: a park is resumable by contract (g-306-291),
+and the registry reads its process `running`. A park whose process is GONE is a
+candidate like any other (g-306-520) — it can never re-enter to run its own
+60h expiry, so without this pass it would never close and its WM never stage.
 
 THE DEFINITION OF ABANDONED, and why it is not a heartbeat age. Every stale
 stamp this framework owns (runner-heartbeat, body-heartbeat, the carrier ts,
@@ -94,6 +97,13 @@ BOOT_MARGIN_SECONDS = 60.0
 AUTHORITY_WAIT_SECONDS = 20.0
 
 LIVE, DEAD, UNKNOWN = "live", "dead", "unknown"
+
+# The body_state values a late close may end. `parked` joined `active` in
+# : a park is resumable only while its PROCESS lives, and one whose
+# session the registry proves gone can never re-enter to run its own expiry, so
+# nothing else would ever close it or stage its WM. It faces the SAME seven
+# conditions -- a live park reads `running` in the registry and is held.
+CANDIDATE_STATES = frozenset({"active", "parked"})
 
 _BODY_STATE_RE = re.compile(r"^body_state:\s*['\"]?([\w-]+)['\"]?\s*$", re.M)
 _MACHINE_ID_RE = re.compile(r"^machine_id:\s*['\"]?([^'\"\n]*)['\"]?\s*$", re.M)
@@ -263,9 +273,10 @@ def newest_mtime(root: Path) -> Optional[float]:
     return newest
 
 
-def active_manifests(project_root: Path) -> List["tuple[str, str, Path, str]"]:
+def candidate_manifests(project_root: Path) -> List["tuple[str, str, Path, str]"]:
     """(agent, sid, session_dir, manifest_text) for every manifest on this box
-    reading `active`. Local-only by construction: sessions/ never syncs."""
+    reading a CANDIDATE_STATES value. Local-only by construction: sessions/
+    never syncs."""
     out = []
     root = _agents_root(project_root)
     try:
@@ -282,7 +293,7 @@ def active_manifests(project_root: Path) -> List["tuple[str, str, Path, str]"]:
             except OSError:
                 continue
             m = _BODY_STATE_RE.search(text)
-            if m and m.group(1) == "active":
+            if m and m.group(1) in CANDIDATE_STATES:
                 out.append((adir.name, mpath.parent.name, mpath.parent, text))
     return out
 
@@ -317,7 +328,7 @@ def late_close_pass(project_root: Optional[Path] = None, current_sid: str = "", 
                     host: Optional[str] = None, machine_ids: Optional[set] = None,
                     uid: Optional[int] = None,
                     authority_wait_seconds: float = 0.0) -> Dict:
-    """One pass over this box's active manifests. Never raises; returns a
+    """One pass over this box's candidate (active or parked) manifests. Never raises; returns a
     summary naming every close and the reason every other candidate was held.
 
     The keyword seams exist for the hermetic tests; production passes none and
@@ -338,10 +349,10 @@ def late_close_pass(project_root: Optional[Path] = None, current_sid: str = "", 
                      "scanned": 0, "authoritative": False, "authority": None,
                      "closed": [], "held": []}
     try:
-        cands = [c for c in active_manifests(pr) if c[1] != current_sid]
+        cands = [c for c in candidate_manifests(pr) if c[1] != current_sid]
         summary["scanned"] = len(cands)
         if not cands:
-            # : an empty enumeration is AMBIGUOUS. active_manifests()
+            # : an empty enumeration is AMBIGUOUS. candidate_manifests()
             # swallows OSError both on the agents root and on each manifest
             # read, so [] means either "this box is clean" or "the scan was
             # blind". Outcome 1 of this goal is verified by re-running this
@@ -353,8 +364,8 @@ def late_close_pass(project_root: Optional[Path] = None, current_sid: str = "", 
             # candidates there is nothing to write.
             # BOUND, deliberately not overclaimed: this re-reads the agents
             # root only. A manifest that is itself unreadable is still skipped
-            # silently by active_manifests(), so this attests "the root was
-            # readable and held no other active manifest", not "every manifest
+            # silently by candidate_manifests(), so this attests "the root was
+            # readable and held no other candidate manifest", not "every manifest
             # on this box was read".
             try:
                 list(_agents_root(pr).iterdir())
@@ -406,7 +417,9 @@ def late_close_pass(project_root: Optional[Path] = None, current_sid: str = "", 
                         {"agent": agent, "sid": sid, "result": "would-close"})
                     continue
                 bm = bm or _load_body_manifest()
-                result = bm.close_body_late(sid, agent, pr)
+                # accept_parked: the seven conditions above are exactly the
+                # proof close_body_late requires before it may end a park.
+                result = bm.close_body_late(sid, agent, pr, accept_parked=True)
                 summary["closed"].append(
                     {"agent": agent, "sid": sid, "result": result})
             except Exception as exc:  # noqa: BLE001 — one bad dir never stops the pass
@@ -463,7 +476,7 @@ def _hook(stdin_text: str) -> int:
     sid = sid.strip() or (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
     if not sid:
         return 0
-    if not [c for c in active_manifests(PROJECT_ROOT) if c[1] != sid]:
+    if not [c for c in candidate_manifests(PROJECT_ROOT) if c[1] != sid]:
         return 0
     log_dir = PROJECT_ROOT / "core" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)

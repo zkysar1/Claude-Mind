@@ -142,7 +142,8 @@ TOKEN_FP_UNKNOWN = "unknown"
 
 def decide(rc, observed_machine, expected_machine, consecutive_errors,
            error_threshold=DEFAULT_ERROR_THRESHOLD,
-           observed_token_fp=None, expected_token_fp=None):
+           observed_token_fp=None, expected_token_fp=None,
+           body_state=None):
     """Pure decision function — no I/O, so tests can drive every branch.
 
     Returns {verdict, reason, consecutive_errors, expected_machine,
@@ -155,6 +156,22 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
     caller that never learned to pass them gets today's machine-only decision
     rather than a new wind-down. That is the required direction for a
     mixed-version fleet — see the module docstring's FAIL-SAFE ASYMMETRY note.
+
+    `body_state` (g-306-503) is the Body's own manifest state, passed by
+    poll() when it can read it and None otherwise. It is consulted on EXACTLY
+    ONE branch: a same-box reducer restart (fp change) observed while the Body
+    is already PARKED. A parked Body holds no in-flight unit, so the wind-down's
+    purpose (stage the unit for the runner now holding the claim) has nothing to
+    discharge — and the rc=1 it returns is what re-parked a live fleet's Bodies
+    into an advanced orbit beside a reducer that had already been adopted
+    (measured 2026-09-11, cc-07). For a parked Body the re-mint
+    therefore rejoins the way the adoption always promised ("the next poll
+    rejoins under it"), immediately, instead of on the next orbit poll. Every
+    other branch ignores `body_state` — a stalled reducer (rc in {4,1,2,3},
+    fp unchanged) still winds a parked Body down exactly as before, because
+    THAT is the signal its park exists to wait out. None = unreadable = today's
+    behaviour on every branch (fail toward the old verdict, never toward a new
+    one the caller has not opted into).
     """
     if rc == 0 and not observed_machine:
         # F5 (): rc==0 ALONE is not proof of life. `runner-claim.sh
@@ -219,13 +236,50 @@ def decide(rc, observed_machine, expected_machine, consecutive_errors,
             # see. The claim row is LIVE on the machine this Body expects, but
             # the runner_token behind it was re-minted, which happens only when
             # the old claim was released or stale-broken and a NEW runner
-            # acquired it. That new runner did not fork this Body, so nobody
-            # will merge its work.
+            # acquired it.
+            #
+            # : the WIND-DOWN this branch returns is a no-op for a Body
+            # that is ALREADY PARKED, and its rc=1 is what re-parked it into an
+            # advanced orbit beside the very reducer it had just adopted. A
+            # parked Body holds no in-flight unit, so the wind-down's purpose
+            # (stage the unit for the runner now holding the claim) has nothing
+            # to discharge; the adoption already did the work the firing was for.
+            # Rejoin NOW, the way the adoption always promised ("the next poll
+            # rejoins under it") — except that the next poll is this one, and the
+            # Body's own orbit no longer decides when it sees the live reducer.
+            #
+            # Scope fence: ONLY the remint branch consults `body_state`. A
+            # stalled reducer (rc in {4,1,2,3}) never reaches this branch — its
+            # fp is unchanged — so a parked Body still winds down and parks on a
+            # stalled reducer exactly as before. That is the signal its park
+            # exists to wait out, and it must keep working.
             #
             # Both operands are digests, never the raw token, so printing them
             # is safe AND is the whole diagnostic value of the axis — a reader
             # can see that the identity moved without ever holding the
             # credential (owncloud_backend.runner_token_fingerprint).
+            if body_state == "parked":
+                # : this Body is BETWEEN units. The wind-down's work
+                # (stage the in-flight unit) is empty for it, so the firing has
+                # nothing to discharge — and returning rc=1 here is exactly what
+                # drove the measured defect: Phase 0.5 mapped the wind-down to
+                # the PARK SEQUENCE, park_body's already-parked branch advanced
+                # the orbit, and the Body sat 2-4h beside a live reducer it had
+                # just adopted. The adoption below already advanced the
+                # baseline, so the rejoin is one poll, not an orbit.
+                return {
+                    "verdict": VERDICT_CONTINUE,
+                    "reason": (f"reducer restart (fp {expected_token_fp} -> "
+                               f"{observed_token_fp}) observed while this Body "
+                               f"is ALREADY PARKED — no in-flight unit to "
+                               f"stage, so the wind-down has nothing to "
+                               f"discharge; the new fp is ADOPTED, so this "
+                               f"poll rejoins under the new runner instead of "
+                               f"re-parking into an advanced orbit (g-306-503)"),
+                    "consecutive_errors": 0,
+                    "expected_machine": expected_machine,
+                    "expected_token_fp": observed_token_fp,
+                }
             return {
                 "verdict": VERDICT_WIND_DOWN,
                 "reason": (f"reducer restart: claim is still LIVE on "
@@ -399,6 +453,28 @@ def _parse_token_fp(stdout):
     return fp
 
 
+def _read_body_state(agent_dir, sid):
+    """The Body's own `body_state` from its manifest, or None.
+
+    Line-scoped parse, never a full yaml load: this module must stay importable
+    without body-manifest.py's import chain (guard-1165 class), and the manifest
+    is hand-rendered one-field-per-line, so the field it asks for is a single
+    line. None means "unreadable" (absent, malformed, closed Body) and decide()
+    treats None as today's behaviour on every branch — the g-306-503 rejoin
+    requires a POSITIVE `body_state: parked` read, never the absence of one.
+    """
+    try:
+        manifest = (Path(agent_dir) / "sessions" / sid /
+                    "body-manifest.yaml").read_text(encoding="utf-8")
+    except Exception:
+        return None
+    for line in manifest.splitlines():
+        if line.startswith("body_state:"):
+            value = line.split(":", 1)[1].strip().strip("'\"")
+            return value or None
+    return None
+
+
 def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRESHOLD):
     """Run the real poll and persist the counter. Returns the decide() dict."""
     # F3 (): this import used to rely on a sys.path.insert that only
@@ -416,6 +492,8 @@ def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRES
     combined = (proc.stdout or "") + (proc.stderr or "")
 
     state = _read_state(_state_path(agent_dir, sid))
+    # : the remint branch's parked-rejoin needs the Body's own state.
+    # Unreadable = None = every branch keeps today's verdict.
     result = decide(
         proc.returncode,
         _parse_machine(combined),
@@ -428,6 +506,7 @@ def poll(agent, agent_dir, sid, scripts_dir, error_threshold=DEFAULT_ERROR_THRES
         # migration, and no wind-down caused by the upgrade itself.
         observed_token_fp=_parse_token_fp(combined),
         expected_token_fp=state.get("expected_token_fp"),
+        body_state=_read_body_state(agent_dir, sid),
     )
     result["rc"] = proc.returncode
     result["poll_output"] = combined.strip()[:400]

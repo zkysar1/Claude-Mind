@@ -65,6 +65,24 @@ def _hygiene(tmp: pathlib.Path, days: int = 40) -> pathlib.Path:
     return p
 
 
+class _FakeBackend:
+    """Store lane scripted per segment name (bytes, or an exception to raise);
+    delete() removes the local file, which is all the script re-checks."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def read_authoritative_bytes(self, path):
+        v = self.store[pathlib.Path(path).name]
+        if isinstance(v, BaseException):
+            raise v
+        return v
+
+    def delete(self, path):
+        pathlib.Path(path).unlink()
+        return True
+
+
 # --- shape: what IS and IS NOT a segment ----------------------------------
 
 @pytest.mark.parametrize("name,expected", [
@@ -244,3 +262,62 @@ def test_apply_with_nothing_expired_is_a_noop(tmp_path, capsys):
     rep = json.loads(capsys.readouterr().out)
     assert rc == 0 and rep["action"] == "noop" and keep.exists()
     assert not (tmp_path / "gy").exists(), "a noop must not create an archive dir"
+
+
+# --- the store lane: the delete destroys it, so the archive must cover it --
+
+@pytest.mark.parametrize("store_lane", [b'{"gate":"peer-ahead"}\n',
+                                        RuntimeError("simulated AccessDenied")],
+                         ids=["diverged", "unreadable"])
+def test_unverified_store_lane_is_neither_archived_nor_deleted(
+        tmp_path, capsys, monkeypatch, store_lane):
+    """The archive holds the LOCAL bytes but be.delete() destroys the STORE
+    object too. A segment whose store copy differs, or cannot be read, must
+    survive on both lanes and stay out of the archive and its receipt, while an
+    agreeing segment in the same run is still expired."""
+    import json
+    import storage_backend
+    meta = tmp_path / "meta"; meta.mkdir()
+    arch = tmp_path / "gy"
+    bad = _seg(meta, "2026-07-01", '{"gate":"a"}\n')
+    good = _seg(meta, "2026-07-02", '{"gate":"b"}\n')
+    fake = _FakeBackend({bad.name: store_lane, good.name: b'{"gate":"b"}\n'})
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: fake)
+    rc = mod.main(["--meta-dir", str(meta), "--hygiene", str(_hygiene(tmp_path)),
+                   "--today", "2026-09-21", "--apply", "--archive-dir", str(arch)])
+    rep = json.loads(capsys.readouterr().out)
+    assert rc == 1 and rep["action"] == "partial"
+    assert bad.exists() and not (arch / bad.name).exists()
+    assert bad.name not in (arch / "RECEIPT.md").read_text(encoding="utf-8")
+    assert rep["deleted"] == [good.name] and not good.exists()
+
+
+def test_absent_store_copy_does_not_block_the_delete(tmp_path, capsys, monkeypatch):
+    """A segment the store never held has nothing on that lane to lose."""
+    import json
+    import storage_backend
+    meta = tmp_path / "meta"; meta.mkdir()
+    old = _seg(meta, "2026-07-01")
+    fake = _FakeBackend({old.name: FileNotFoundError("absent in store")})
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: fake)
+    rc = mod.main(["--meta-dir", str(meta), "--hygiene", str(_hygiene(tmp_path)),
+                   "--today", "2026-09-21", "--apply",
+                   "--archive-dir", str(tmp_path / "gy")])
+    rep = json.loads(capsys.readouterr().out)
+    assert rc == 0 and rep["deleted"] == [old.name] and not old.exists()
+
+
+def test_second_run_into_the_same_archive_dir_appends_to_the_receipt(tmp_path, capsys):
+    """The wiring archives into one directory per DAY, so two deleting runs can
+    share it; the second must not erase the first run's enumeration."""
+    meta = tmp_path / "meta"; meta.mkdir()
+    arch = tmp_path / "gy"
+    first = _seg(meta, "2026-07-01")
+    args = ["--meta-dir", str(meta), "--hygiene", str(_hygiene(tmp_path)),
+            "--today", "2026-09-21", "--apply", "--archive-dir", str(arch)]
+    assert mod.main(args) == 0
+    second = _seg(meta, "2026-07-02")
+    assert mod.main(args) == 0
+    capsys.readouterr()
+    body = (arch / "RECEIPT.md").read_text(encoding="utf-8")
+    assert first.name in body and second.name in body

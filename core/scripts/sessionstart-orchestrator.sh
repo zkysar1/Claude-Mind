@@ -197,7 +197,8 @@ bash "$SCRIPT_DIR/history-vacuum-tick.sh" >/dev/null 2>&1 || true
 # the only one entitled to close it — sessions/ never syncs, so every manifest
 # this scans is this box's own.
 # `--hook` does a cheap local scan and returns; only when another session's
-# manifest still reads `active` does it spawn the pass DETACHED (the Step 2.7
+# manifest still reads `active` or `parked` (: a park whose process
+# died never runs its own expiry) does it spawn the pass DETACHED (the Step 2.7
 # pattern), and that pass waits for THIS session's own harness registry entry
 # before judging anything, so session start never pays for the wait. The pass
 # closes nothing unless the harness registry proves the session gone, and it

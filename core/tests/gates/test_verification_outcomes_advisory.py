@@ -54,6 +54,21 @@ def test_unassigned_id_renders_the_backfill_token():
     assert "<unassigned>" in evaluate({})["message"]
 
 
+def test_remedy_does_not_template_away_existing_preconditions():
+    """The remedy must not hand the reader a literal that CLEARS preconditions.
+
+    update-goal REPLACES the whole verification object (guard-5228), and the
+    forge-curriculum gate attaches pc-curriculum-forge to the same goal AFTER
+    this Phase-A advisory has rendered. A pasted '"preconditions": []' template
+    therefore wiped a gate-attached precondition (seen 2026-09-26 on
+    g-115-11018 / g-115-11019), so the remedy must say read-merge-write.
+    """
+    message = evaluate({"id": "g-15"})["message"]
+    assert '"preconditions": []' not in message
+    assert "read-merge-write" in message.lower()
+    assert message.count("g-15") >= 2  # both the read and the write name the goal
+
+
 # --- silent: outcomes present (the negative control) --------------------------
 
 @pytest.mark.parametrize("goal,label", [

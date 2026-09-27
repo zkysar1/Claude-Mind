@@ -202,7 +202,15 @@ def test_shipped_config_is_default_off():
     assert cfg is not None, "reducer_promotion block missing from aspirations.yaml"
     assert cfg.get("enabled") is not True
     assert not (cfg.get("fence_verified_at") or "")
-    assert mod.eligible_machines_from_config(cfg) == ()
+    #  / guard-4223: the roster is POPULATED (2fe2da761a,  outcome 3),
+    # yet promotion still ships OFF. "Off" is proven by G1 (enabled) + G2 (fence) above
+    # and the HOLD below — NOT by an empty roster. Pin the EXACT shipped list with == so
+    # an unreviewed roster change is caught (guard-2903: this assertion has teeth only
+    # because it fails when the list differs; verified by mutation-proof-test.sh with an
+    # extra machine id and with enabled:true,  close).
+    assert mod.eligible_machines_from_config(cfg) == (
+        "cc-02", "cc-03", "cc-04", "cc-05", "cc-07", "cc-08", "cc-09", "cc-10", "cc-13",
+    )
     r = mod.decide(cfg, "box-a", "wind-down", 4, 9999.0, ALL_TRUE, t_takeover_s=T)
     assert r["verdict"] == mod.VERDICT_HOLD
     assert r["gate_failed"] == "enabled"

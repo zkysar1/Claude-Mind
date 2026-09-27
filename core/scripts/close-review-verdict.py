@@ -386,12 +386,18 @@ def route_command(goal_id: str, source: str, reviewer: str, findings: list,
     # The header must not overstate the verdict. An APPROVE_WITH_NOTES released
     # the close; announcing it as "blocked until reworked" would tell the next
     # Body to stop working on a goal that already passed review.
+    #
+    # The header must not OPEN with '[' or '{' (guard-6075 Cause A). On an empty
+    # progress_note the composed value's first byte is this text's, and
+    # goal-field-append refuses a JSON opener with rc=5. So a bracketed header
+    # failed routing on every goal with no progress_note (, 2026-09-26),
+    # and any field it did seed would be born un-appendable for the next writer.
     if str(verdict).upper() == "APPROVE_WITH_NOTES":
-        text = (f"[close-review APPROVE_WITH_NOTES by {reviewer}] the close was "
+        text = (f"close-review APPROVE_WITH_NOTES by {reviewer}: the close was "
                 f"APPROVED; these are non-blocking observations recorded for "
                 f"whoever picks this up next:\n{body}")
     else:
-        text = (f"[close-review REJECT by {reviewer}] the close is blocked until "
+        text = (f"close-review REJECT by {reviewer}: the close is blocked until "
                 f"these are reworked and re-reviewed:\n{body}")
     return [shutil.which("bash") or "/bin/bash",
             str(SCRIPT_DIR / "goal-field-append.sh"),
@@ -425,12 +431,12 @@ def route_findings(goal_id: str, source: str, reviewer: str, findings: list,
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         print(f"close-review-verdict: ROUTING FAILED ({exc.__class__.__name__}: {exc}) "
-              f"— the REJECT is on disk but the goal record was NOT annotated. "
+              f"— the {verdict} is on disk but the goal record was NOT annotated. "
               f"Append the findings by hand.", file=sys.stderr)
         return False
     if proc.returncode != 0:
         print(f"close-review-verdict: ROUTING FAILED (rc={proc.returncode}) — the "
-              f"REJECT is on disk but the goal record was NOT annotated:\n"
+              f"{verdict} is on disk but the goal record was NOT annotated:\n"
               f"{proc.stderr.strip()}", file=sys.stderr)
         return False
     print(f"close-review-verdict: findings routed into {goal_id} progress_note "

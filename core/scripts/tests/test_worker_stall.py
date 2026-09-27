@@ -100,6 +100,49 @@ def test_parked_body_is_dormant_by_design_not_stalled():
     assert not ws.is_alerting(v)
 
 
+def test_parked_past_the_park_cap_is_the_third_alert_and_inside_it_never_is():
+    """. The parked branch used to return benign WITHOUT reading age
+    (guard-4000), so a Body that parked and never re-entered -- a dead process,
+    or a live one whose wake-up chain broke -- was benign forever.
+
+    POSITIVE CONTROL in the same test (guard-4166): every age a HEALTHY park can
+    show stays silent, the cap itself included, even with the second signal
+    saying nothing was staged. Each exceeds the staleness threshold, so the
+    PARKED branch answers rather than V_ALIVE (guard-5948).
+    """
+    healthy = (ws.DEFAULT_STALE_MINUTES + 0.1,  # just stale: first re-poll late
+               3 * 60.0,                          # between orbits
+               4 * 60.0 + 30.0,                   # backoff cap + wake-up latency
+               617.0,                             # b34aa80f's reading when filed
+               ws.PARK_MAX_MINUTES)               # the cap itself: not yet past
+    for age in healthy:
+        assert age > ws.DEFAULT_STALE_MINUTES, age
+        for reached in (False, True, None):
+            v = ws.classify_body(age, False, body_state=ws.PARKED_BODY_STATE,
+                                 wm_reached_reducer=reached)
+            assert v == ws.V_STALE_PARKED, (age, reached)
+            assert not ws.is_alerting(v), f"a park {age}m quiet must never alert"
+    for age in (ws.PARK_MAX_MINUTES + 0.1, 5_000.0, 100_000.0):
+        v = ws.classify_body(age, False, body_state=ws.PARKED_BODY_STATE,
+                             wm_reached_reducer=False)
+        assert v == ws.V_STALLED_PARKED, age
+        assert ws.is_alerting(v), f"a park {age}m past its last re-entry must alert"
+
+
+def test_age_alone_never_condemns_a_park_past_the_cap():
+    """THE MEASURED FALSE-POSITIVE CLASS (2026-09-27: 21 of 22 parked carriers
+    past the cap). A close on a non-claim box cannot publish its carrier, so a
+    Body the reducer already MERGED keeps reading `parked` forever. Its staged or
+    consumed WM is the evidence it closed (True), and an unreadable listing is
+    no evidence at all (None): neither may alert, however old the carrier."""
+    for reached in (True, None):
+        for age in (ws.PARK_MAX_MINUTES + 0.1, 27_000.0):
+            v = ws.classify_body(age, False, body_state=ws.PARKED_BODY_STATE,
+                                 wm_reached_reducer=reached)
+            assert v == ws.V_STALE_PARKED, (age, reached)
+            assert not ws.is_alerting(v)
+
+
 def test_absent_state_is_unknown_not_an_alert_and_not_a_clean_bill():
     """A carrier written before the field existed, or by a box that has not
     pulled the writer yet. Benign -- alerting would flood for the whole rollout
@@ -148,6 +191,13 @@ def test_state_partition_matches_body_manifest():
         "worker_stall.CLOSED_BODY_STATES has drifted from body-manifest."
         "CLOSED_STATES -- update the mirror in worker_stall.py")
     assert ws.PARKED_BODY_STATE in bm.CLOSEABLE_STATES
+    # : the park-cap alert mirrors the Body's own expiry cap.
+    assert ws.PARK_MAX_MINUTES == bm.PARK_MAX_HOURS * 60.0, (
+        "worker_stall.PARK_MAX_MINUTES has drifted from body-manifest."
+        "PARK_MAX_HOURS -- update the mirror in worker_stall.py")
+    # ...and its second signal reads the names the close and the merge write.
+    assert ws.STAGED_WM_DIRNAME == bm._WORLD_STAGED_DIRNAME
+    assert ws.WM_REACHED_SUFFIXES == (bm._STAGED_WM_SUFFIX, bm._STAGED_CONSUMED_SUFFIX)
     # EXHAUSTIVE, not merely consistent (guard-3948): every declared state must
     # land in exactly one branch of classify_body. A sixth state added to
     # VALID_STATES without a decision here would otherwise silently inherit the
@@ -280,6 +330,109 @@ def test_scan_alerts_on_a_body_that_died_between_units(tmp_path, monkeypatch):
     assert a["body_state"] == "active"
     assert a["host"] == "cc-07"
     assert rep["state_known"] == 1
+
+
+_PARK_NOW = dt.datetime(2026, 9, 29, 8, 0)
+
+
+def _parked_carrier(sid, minutes, host="cc-10"):
+    return {"agent": "alpha", "sid": sid, "read_via": "authoritative",
+            "doc": {"sid": sid, "host": host, "body_state": "parked",
+                    "ts": (_PARK_NOW - dt.timedelta(minutes=minutes)).strftime(
+                        "%Y-%m-%dT%H:%M:%S")}}
+
+
+def test_scan_alerts_only_on_a_park_whose_wm_never_reached_the_reducer(
+        tmp_path, monkeypatch):
+    """THE  CASE, end to end, in ONE scan (guard-4166):
+      0rbit000 -- inside the cap, between orbits: the positive control, silent;
+      c1osed00 -- past the cap, but its WM was merged: a Body that closed on a
+                  box that could not publish its carrier (the measured 21), silent;
+      b34aa80f -- past the cap and nothing staged or consumed: THE ALERT.
+    The staged listing is read once, and only because a carrier is past the cap.
+    """
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
+        _parked_carrier("0rbit000", 3 * 60.0),
+        _parked_carrier("c1osed00", ws.PARK_MAX_MINUTES + 600.0),
+        _parked_carrier("b34aa80f", ws.PARK_MAX_MINUTES + 37.5),
+    ]))
+    reads = []
+
+    def _staged(world_root, agent):
+        reads.append((world_root, agent))
+        return {"c1osed00", "someone-else"}, "authoritative"
+
+    monkeypatch.setattr(ws, "read_staged_units", _staged)
+    store = tmp_path / "a.jsonl"
+    _write_store(store, [{"id": "g-1", "status": "pending"}])
+    rep = ws.scan(tmp_path, store, now=_PARK_NOW)
+    by_sid = {b["sid"]: (b["verdict"], b["wm_reached_reducer"]) for b in rep["bodies"]}
+    assert by_sid == {"0rbit000": (ws.V_STALE_PARKED, None),
+                      "c1osed00": (ws.V_STALE_PARKED, True),
+                      "b34aa80f": (ws.V_STALLED_PARKED, False)}
+    assert [a["sid"] for a in rep["alerts"]] == ["b34aa80f"]
+    assert rep["alerts"][0]["held_goal"] is None
+    assert reads == [(tmp_path, "alpha")], "one read per agent, world-rooted"
+    assert rep["parked_past_cap_unjudged"] == 0
+    assert rep["state_known"] == 3 and rep["state_unknown"] == 0
+
+
+def test_scan_reads_no_staged_listing_when_no_park_is_past_the_cap(tmp_path, monkeypatch):
+    """The second signal costs a store read, so it must stay off the common path."""
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
+        _parked_carrier("0rbit000", 3 * 60.0)]))
+
+    def _must_not_read(*a):
+        raise AssertionError("staged listing read with no park past the cap")
+
+    monkeypatch.setattr(ws, "read_staged_units", _must_not_read)
+    store = tmp_path / "a.jsonl"
+    _write_store(store, [{"id": "g-1", "status": "pending"}])
+    rep = ws.scan(tmp_path, store, now=_PARK_NOW)
+    assert rep["alerts"] == [] and rep["rows_dropped"] == 0
+
+
+def test_scan_never_condemns_a_park_on_an_unreadable_staged_listing(tmp_path, monkeypatch):
+    """A blind read is not evidence of absence: silent, but COUNTED (guard-3489)."""
+    monkeypatch.setattr(ws, "enumerate_carriers", lambda root: _enum([
+        _parked_carrier("b34aa80f", ws.PARK_MAX_MINUTES + 37.5),
+        _parked_carrier("68a6619f", ws.PARK_MAX_MINUTES + 900.0, host="cc-13"),
+    ]))
+    monkeypatch.setattr(ws, "read_staged_units",
+                        lambda world_root, agent: (None, "unreadable: OSError: x"))
+    store = tmp_path / "a.jsonl"
+    _write_store(store, [{"id": "g-1", "status": "pending"}])
+    rep = ws.scan(tmp_path, store, now=_PARK_NOW)
+    assert rep["alerts"] == []
+    assert {b["verdict"] for b in rep["bodies"]} == {ws.V_STALE_PARKED}
+    assert rep["parked_past_cap_unjudged"] == 2
+
+
+def test_read_staged_units_counts_only_a_staged_or_consumed_wm(tmp_path, monkeypatch):
+    """Only `-wm.yaml` (staged) and `-wm.consumed` (merged) prove the WM reached
+    the reducer; a baseline, hash or eviction archive alone does not."""
+    seen = []
+
+    class _Backend:
+        def list_dir(self, path):
+            seen.append(Path(path))
+            return ["aaaa-wm.yaml", "bbbb-wm.consumed", "cccc-wm-baseline.yaml",
+                    "dddd-wm.hash", "eeee-capture-evictions-archive.jsonl"]
+
+    mod = type(sys)("storage_backend")
+    mod.get_backend = lambda: _Backend()
+    monkeypatch.setitem(sys.modules, "storage_backend", mod)
+    units, via = ws.read_staged_units(tmp_path, "alpha")
+    assert units == {"aaaa", "bbbb"} and via == "authoritative"
+    assert seen == [(tmp_path / "body-staged-wm" / "alpha").resolve()]
+
+    class _Broken:
+        def list_dir(self, path):
+            raise OSError("store unreachable")
+
+    mod.get_backend = lambda: _Broken()
+    units, via = ws.read_staged_units(tmp_path, "alpha")
+    assert units is None and via.startswith("unreadable: OSError")
 
 
 def test_scan_counts_bodies_it_could_not_judge(tmp_path, monkeypatch):
@@ -1171,6 +1324,24 @@ def test_with_claim_alert_still_names_the_goal(tmp_path, monkeypatch):
     assert "died between units" not in s, s
 
 
+def test_parked_past_cap_alert_says_parked_not_between_units(tmp_path, monkeypatch):
+    """: the third verdict gets its own sentence. The between-units
+    form would misstate what happened -- this Body parked and never re-entered,
+    so its WM was never staged -- and would bury the cap it outlived."""
+    probe = _probe_with(monkeypatch, tmp_path, {
+        "agent": "alpha", "sid": "b34aa80f", "host": "cc-10",
+        "carrier_age_minutes": 3637.5, "held_goal": None,
+        "body_state": "parked", "verdict": ws.V_STALLED_PARKED,
+        "read_via": "authoritative"})
+    events = [e for e in probe.check() if e.event == "worker_stall"]
+    assert len(events) == 1, [e.event for e in probe.check()]
+    s = events[0].summary
+    assert "parked past the 60h cap" in s, s
+    assert "WM never reached the reducer" in s, s
+    assert "3637.5" in s and "cc-10" in s, s
+    assert "died between units" not in s and "holding None" not in s, s
+
+
 # ── read_known_goal_ids: the census the reaper deletes on ABSENCE () ─
 
 def _queue_file(tmp_path, name, goals):
@@ -1245,6 +1416,61 @@ def test_known_ids_report_the_WEAKEST_provenance(tmp_path):
 def test_known_ids_with_no_stores_is_an_unanswered_census():
     """Empty args is not an empty world."""
     assert ws.read_known_goal_ids() == (set(), "none")
+
+
+# ── read_goal_meta: the per-goal census the OCCURRENCE-OVER reap needs () ─
+
+def test_goal_meta_extracts_the_three_fields_and_is_STATUS_BLIND(tmp_path):
+    """The reader records exactly {recurring, lastAchievedAt, claimed_by_sid} and,
+    like read_known, is STATUS-BLIND: a recurring goal lives in `pending` between
+    occurrences, so a status filter would drop the very goals this census is for.
+    A goal missing the fields reads False/None, never absent — the reaper keys on
+    those defaults."""
+    q = _queue_file(tmp_path, "world-queue.jsonl", [
+        {"id": "g-1-1", "status": "pending", "recurring": True,
+         "lastAchievedAt": "2026-09-01T00:00:00", "claimed_by_sid": "sid-A"},
+        {"id": "g-1-2", "status": "pending"},   # non-recurring, no fields
+    ])
+    meta, via = ws.read_goal_meta(q)
+    assert via == "local-mirror"
+    assert meta["g-1-1"] == {"recurring": True,
+                             "lastAchievedAt": "2026-09-01T00:00:00",
+                             "claimed_by_sid": "sid-A"}
+    assert meta["g-1-2"] == {"recurring": False,
+                             "lastAchievedAt": None,
+                             "claimed_by_sid": None}
+
+
+def test_goal_meta_unions_the_live_queues(tmp_path):
+    """world + this agent's queue, the same two the TERMINAL reader uses and NOT
+    the archive — a still-cycling recurring goal lives in a live queue with its
+    current lastAchievedAt; an archive copy would only supply a stale one."""
+    world = _queue_file(tmp_path, "world-queue.jsonl",
+                        [{"id": "g-1-1", "recurring": True,
+                          "lastAchievedAt": "2026-09-01T00:00:00"}])
+    agent = _queue_file(tmp_path, "agent-queue.jsonl",
+                        [{"id": "g-2-2", "recurring": True,
+                          "lastAchievedAt": "2026-09-02T00:00:00"}])
+    meta, _ = ws.read_goal_meta(world, agent)
+    assert set(meta) == {"g-1-1", "g-2-2"}
+
+
+def test_goal_meta_reports_the_WEAKEST_provenance(tmp_path):
+    """Same provenance discipline as its siblings: an unreadable store degrades
+    the reported provenance even though the readable half still parses. The
+    caller's decline on `none` is conservatism here (this predicate reaps on
+    PRESENCE, so a partial census only ever MISSES), but the reader stays uniform
+    with read_terminal/read_known so the contract is one shape."""
+    world = _queue_file(tmp_path, "world-queue.jsonl",
+                        [{"id": "g-1-1", "recurring": True}])
+    meta, via = ws.read_goal_meta(world, tmp_path / "not-there.jsonl")
+    assert via == "none", via
+    assert "g-1-1" in meta, "the readable half still parses"
+
+
+def test_goal_meta_with_no_stores_is_unanswered():
+    """Empty args is not an empty world."""
+    assert ws.read_goal_meta() == ({}, "none")
 
 
 # --- reading_is_valid: the measurement gate ( unit 35) -------------
