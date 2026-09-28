@@ -176,6 +176,53 @@ def test_real_budget_parses_and_covers_the_hot_path(gate):
         assert gate.set_for(p, budget) is None, p
 
 
+# ─── ALWAYS-LOADED INSTRUCTION CEILING () ──────────────────────────
+
+def test_instruction_chars_counts_like_the_notice(gate):
+    """Calibrated against Claude Code's notice: the body after front matter, in
+    UTF-16 code units, with every newline counted as CRLF."""
+    assert gate.instruction_chars("abc") == 3
+    assert gate.instruction_chars("a\nb\n") == 6                      # 4 chars + 2 newlines as CRLF
+    assert gate.instruction_chars("a\r\nb\r\n") == 6                  # a CRLF blob is not double-counted
+    assert gate.instruction_chars("---\ndescription: \"x\"\n---\nbody") == 4
+    assert gate.instruction_chars("\U0001F600") == 2                  # astral char: 2 UTF-16 units
+    assert gate.instruction_chars("—") == 1                      # em dash: 1 char, not 3 UTF-8 bytes
+    # `paths:` front matter makes a rule on-demand: not always-loaded, not counted
+    assert gate.instruction_chars("---\npaths: [\"src/**\"]\n---\nbody") is None
+    assert gate.instruction_chars("---\ndescription: x\npaths:\n  - src/**\n---\nbody") is None
+    # a `paths:` line in the BODY is prose, not front matter
+    assert gate.instruction_chars("body\npaths: x\n") == 16
+
+
+def _load_raw(gate, root, data):
+    (root / "core" / "config").mkdir(parents=True, exist_ok=True)
+    (root / "core" / "config" / "hot-path-budget.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
+    return gate.load_budget(root)
+
+
+def test_instruction_ceiling_survives_the_loader(gate, tmp_path):
+    # load_budget REBUILDS its structures from explicit keys, so a key it does not
+    # carry is dropped and the whole rule goes silently inert (the `ceiling` trap).
+    b = _load_raw(gate, tmp_path, {**BUDGET, "instruction_ceiling": {"chars": 500, "paths": ["CLAUDE.md"]}})
+    assert b["instruction_ceiling"]["chars"] == 500
+    assert b["instruction_ceiling"]["patterns"][0].match("CLAUDE.md")
+    assert _load_raw(gate, tmp_path, BUDGET)["instruction_ceiling"] is None       # optional
+    for bad in ({"chars": 0, "paths": ["CLAUDE.md"]}, {"chars": 500, "paths": []},
+                {"chars": "150k", "paths": ["CLAUDE.md"]}, ["CLAUDE.md"]):
+        with pytest.raises(ValueError):
+            _load_raw(gate, tmp_path, {**BUDGET, "instruction_ceiling": bad})
+
+
+def test_real_budget_declares_the_instruction_ceiling(gate):
+    ic = gate.load_budget(_ROOT)["instruction_ceiling"]
+    assert ic is not None and ic["chars"] == 150000
+    covers = lambda p: any(rx.match(p) for rx in ic["patterns"])
+    for p in ("CLAUDE.md", ".claude/CLAUDE.md", ".claude/rules/self.md", ".claude/rules/sub/nested.md"):
+        assert covers(p), p
+    for p in (".claude/skills/respond/SKILL.md", "core/config/conventions/board.md", "docs/CLAUDE.md"):
+        assert not covers(p), p
+
+
 def test_hot_skills_keep_the_ratchet_and_on_demand_skills_get_the_ceiling(gate):
     """FIRST-MATCH ORDERING IS THE CONTRACT ().
 
@@ -568,3 +615,161 @@ def test_check_reports_and_ratchets(repo):
     r = check("--no-ratchet", "--json")
     data = json.loads(r.stdout)
     assert data["total_bytes"] == 900 and data["ratchet"] is None
+
+
+# ─── INSTRUCTION CEILING: git I/O on EVERY box (no hook, no symlink) ─────────
+# The hook-driven tests above skip wherever a symlink cannot be made (Windows
+# without Developer Mode), so the corpus arm's git reads are also pinned here,
+# against a plain repo, where nothing can skip them.
+
+_INSTRUCTION_PATHS = ["CLAUDE.md", ".claude/rules/*.md", ".claude/rules/**/*.md"]
+
+
+@pytest.fixture()
+def plain_repo(tmp_path, monkeypatch):
+    for k in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(k)
+    (tmp_path / "gitconfig-empty").write_text("", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig-empty"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    root = tmp_path / "plain"
+    (root / ".claude" / "rules").mkdir(parents=True)
+    for args in (("init", "-q", "-b", "main"), ("config", "user.name", "t"),
+                 ("config", "user.email", "t@t.local"), ("config", "commit.gpgsign", "false")):
+        _git(root, *args)
+    return root
+
+
+def _stage_commit(root, msg="c"):
+    _git(root, "add", "-A")
+    _git(root, "commit", "-q", "--no-verify", "-m", msg)
+
+
+def _corpus_row(gate, root, budget):
+    violations, checked = gate.evaluate(root, budget)
+    rows = [c for c in checked if c["set"] == "instruction-ceiling"]
+    return (rows[0] if rows else None), violations
+
+
+def test_instruction_ceiling_git_io_on_every_box(gate, plain_repo):
+    root = plain_repo
+    (root / "CLAUDE.md").write_bytes(b"a\nb\n")                                   # 6
+    (root / ".claude/rules/r.md").write_bytes(b"---\ndescription: d\n---\nxyz")    # 3
+    scoped = b"---\npaths: [\"src/**\"]\n---\n" + b"z" * 500                       # not counted
+    (root / ".claude/rules/scoped.md").write_bytes(scoped)
+    (root / "notes.md").write_bytes(b"q" * 999)                                  # not an instruction path
+    budget = _load_raw(gate, root, {**BUDGET, "instruction_ceiling":
+                                    {"chars": 10, "paths": _INSTRUCTION_PATHS}})
+    _stage_commit(root)
+    ic = budget["instruction_ceiling"]
+    assert gate.instruction_total(root, "HEAD", ic) == (9, 2)
+
+    # the INDEX is read, never the working tree — that is what a pathspec commit commits
+    (root / ".claude/rules/r.md").write_bytes(b"---\ndescription: d\n---\n" + b"y" * 50)
+    assert gate.instruction_total(root, "", ic) == (9, 2)
+    _git(root, "add", "-A")
+    assert gate.instruction_total(root, "", ic) == (56, 2)
+    row, violations = _corpus_row(gate, root, budget)
+    assert (row["head_bytes"], row["staged_bytes"], row["kind"], row["unit"]) == \
+        (9, 56, "instructions_over_ceiling", "chars")
+    assert row in violations
+    _stage_commit(root, "grow")
+
+    # no instruction path staged: the arm is not consulted at all
+    (root / "notes.md").write_bytes(b"q" * 5)
+    _git(root, "add", "-A")
+    assert _corpus_row(gate, root, budget)[0] is None
+    _stage_commit(root, "unrelated")
+
+    # over the ceiling, a SHRINK is still allowed
+    (root / ".claude/rules/r.md").write_bytes(b"---\ndescription: d\n---\n" + b"y" * 40)
+    _git(root, "add", "-A")
+    row, _ = _corpus_row(gate, root, budget)
+    assert (row["head_bytes"], row["staged_bytes"], row["kind"]) == (56, 46, "ok")
+    _stage_commit(root, "shrink")
+
+    # dropping `paths:` front matter: the FILE shrinks, the always-loaded total grows
+    (root / ".claude/rules/scoped.md").write_bytes(b"z" * 500)
+    _git(root, "add", "-A")
+    row, violations = _corpus_row(gate, root, budget)
+    assert (row["head_bytes"], row["staged_bytes"], row["kind"]) == (46, 546, "instructions_over_ceiling")
+    assert [v["kind"] for v in violations] == ["instructions_over_ceiling"]    # the ratchet saw nothing
+
+
+def test_check_reports_the_instruction_ceiling_as_corpus_state(gate, plain_repo):
+    root = plain_repo
+    (root / ".claude/rules/a.md").write_bytes(b"x" * 1000)
+
+    def set_ceiling(chars):
+        _load_raw(gate, root, {**BUDGET, "instruction_ceiling": {"chars": chars, "paths": _INSTRUCTION_PATHS}})
+        _stage_commit(root, f"ceiling {chars}")
+
+    def check(*extra):
+        return subprocess.run([sys.executable, str(SCRIPT), "--repo", str(root), "--check", "--no-ratchet",
+                               *extra], capture_output=True, text=True)
+    set_ceiling(900)
+    r = check()
+    assert r.returncode == 0 and "FAIL:" in r.stdout, r.stdout + r.stderr
+    assert "always-loaded instructions 1,000 chars in 1 files, OVER the 900-char ceiling" in r.stdout
+    assert check("--hard-gate").returncode == 1
+    assert json.loads(check("--json").stdout)["instructions"] == {
+        "chars": 1000, "files": 1, "ceiling": 900, "over": True}
+    set_ceiling(5000)
+    r = check("--hard-gate")
+    assert r.returncode == 0 and "PASS:" in r.stdout and "within the 5,000-char ceiling" in r.stdout, r.stdout
+
+
+# ─── INSTRUCTION CEILING through the REAL hook (skips without symlinks) ──────
+
+def _set_instruction_ceiling(repo, chars):
+    b = dict(BUDGET)
+    b["instruction_ceiling"] = {"chars": chars, "paths": _INSTRUCTION_PATHS}
+    (repo["root"] / "core" / "config" / "hot-path-budget.yaml").write_text(yaml.safe_dump(b), encoding="utf-8")
+    r = _commit(repo, f"budget: instruction ceiling {chars}")     # the budget is not an instruction file
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_instruction_ceiling_closes_the_new_rule_door(repo):
+    """Every new rule here is under new_file_cap (2,000), so the per-file ratchet
+    passes each one — only the corpus ceiling can refuse. That is the door
+    (a NEW always-loaded rule) this arm exists to close."""
+    _set_instruction_ceiling(repo, 3000)                           # seed: a.md = 1,000 chars
+    _write(repo, ".claude/rules/new-1.md", 1900)                   # total 2,900: under
+    r = _commit(repo, "first new rule")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    _write(repo, ".claude/rules/new-2.md", 1500)                   # total 4,400: over AND grew
+    r = _commit(repo, "second new rule")
+    out = r.stdout + r.stderr
+    assert r.returncode != 0, out
+    assert "always-loaded instructions (3 files)  2,900 → 4,400 chars" in out
+    assert "`paths:` front matter" in out and "size-budget-override:" in out
+
+    scoped = "---\npaths: [\"src/**\"]\n---\n" + "x" * 1500
+    (repo["root"] / ".claude/rules/new-2.md").write_text(scoped, encoding="utf-8")
+    r = _commit(repo, "scoped rule loads on demand")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    _write(repo, ".claude/rules/new-2.md", 1500)                   # unscoped: file shrinks, total grows
+    r = _commit(repo, "unscope it")
+    assert r.returncode != 0 and "2,900 → 4,400 chars" in (r.stdout + r.stderr)
+    (repo["root"] / ".claude/rules/new-2.md").write_text(scoped, encoding="utf-8")
+
+    # rules nest, and `*` in the per-file `rules` set does not cross `/`
+    _write(repo, ".claude/rules/sub/deep.md", 1200)
+    r = _commit(repo, "nested rule")
+    assert r.returncode != 0 and "2,900 → 4,100 chars" in (r.stdout + r.stderr)
+
+
+def test_instruction_ceiling_override_is_ledgered_in_chars(repo):
+    _set_instruction_ceiling(repo, 1500)
+    _write(repo, ".claude/rules/new.md", 700)                      # total 1,700: over and grew
+    r = _commit(repo, "needed now\n\nsize-budget-override: an always-on imperative that must ship today")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "OVERRIDE accepted" in out and "+700 chars" in out
+    rows = [json.loads(l) for l in (repo["world"] / "override-bypass-ledger.jsonl")
+            .read_text(encoding="utf-8").splitlines() if l.strip()]
+    files = rows[-1]["context"]["files"]
+    assert [f["kind"] for f in files] == ["instructions_over_ceiling"] and files[0]["unit"] == "chars"
+    assert rows[-1]["context"]["net_bytes"] == 0                   # chars never leak into the byte total

@@ -177,7 +177,22 @@ RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capt
                          # OBLIGATION, not session bookkeeping. THIS copy is the live
                          # runtime path (POST /v1/wm/reset), so a wm.py-only edit would
                          # leave the pin droppable by the reset that actually runs.
-                         "interrupt_task_open"}
+                         "interrupt_task_open",
+                         # : PENDING micro-hypotheses are live predictions
+                         # whose resolves_when signals routinely arrive AFTER the filing
+                         # session ends. Measured wipes at the consolidation Step-5
+                         # wm-reset boundary: 29 (2026-08-10), 4 (2026-09-14), 5
+                         # (2026-09-26) — three independent agents, three boxes, the
+                         # same boundary, each mitigated by an ad-hoc hand-carry. The
+                         # consumer mechanisms presume carry-forward in their own text
+                         # (reflect-on-outcome Step 1.5 re-checks null signals "next
+                         # batch"; 's derived total re-batches a carried
+                         # pending micro every pass), so a reset that wipes the slot
+                         # destroys the very population they exist to evaluate and
+                         # drops the derived total_all_time by the carried count at
+                         # every session end. THIS copy is the live runtime path:
+                         # the mirror must carry the member or the fix stays dead.
+                         "micro_hypotheses"}
 
 #  — mirror of wm.py. Ordered tuple, deliberately NOT ARRAY_SLOTS: that
 # set contains non-capture members, so it is the wrong thing to iterate when the

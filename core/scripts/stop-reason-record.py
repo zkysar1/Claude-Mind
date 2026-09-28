@@ -78,6 +78,23 @@ VALID_PATHS = (
     "user-stop",
     "worker-body-parked",
     "worker-park-expired",
+    "worker-body-stall-parked",
+)
+
+# `worker-body-stall-parked` () is the SAME park as
+# `worker-body-parked` with the OPPOSITE notify verdict, because its cause is
+# the opposite. The reducer-gone park is the agent handling a missing reducer.
+# This one is written by the worker loop-exhaustion fence when a Body kept
+# ending turns while holding no claim -- 205 worker-net BLOCKs over ~2 days
+# with nobody told, before the fence existed. That is a defect a human should
+# look at, so it notifies. Its email tail is path-specific (STALL_PARK_TAIL):
+# the generic "Restart with /start" is false for a resumable parked Body, and
+# typing it would start another Body rather than fix this one.
+STALL_PARK_TAIL = (
+    "This is a worker Body PARKED by the loop-exhaustion fence, not a closed "
+    "loop: it is resumable and re-polls on the park orbit. It was parked "
+    "because it kept ending turns while holding no claim, so look at that "
+    "session's terminal. No /start is needed.\n"
 )
 
 # THE TWO WORKER-PARK PATHS (), and why they sit on OPPOSITE sides of
@@ -274,13 +291,19 @@ def record(path: str, reason: str, agent: str, *, user_initiated: bool = False,
 
     status = "disabled"
     detail = ""
-    subject = f"{agent} on {platform.node()} went IDLE ({path})"
+    # A stall-park leaves the agent RUNNING (only one Body parks), so "went IDLE"
+    # and "stopped its autonomous loop" would be false for it ().
+    stall_park = path == "worker-body-stall-parked"
+    subject = (f"{agent} worker Body on {platform.node()} PARKED ({path})" if stall_park
+               else f"{agent} on {platform.node()} went IDLE ({path})")
     body = (
-        f"{agent} stopped its autonomous loop at {now.strftime(TS_FMT)}.\n\n"
-        f"Path:   {path}\n"
+        (f"A worker Body of {agent} was parked at {now.strftime(TS_FMT)}.\n\n" if stall_park
+         else f"{agent} stopped its autonomous loop at {now.strftime(TS_FMT)}.\n\n")
+        + f"Path:   {path}\n"
         f"Reason: {reason}\n\n"
-        f"/start is user-only, so this box stays IDLE until someone restarts it.\n"
-        f"Restart with:  /start {agent}\n"
+        + (STALL_PARK_TAIL if stall_park else
+           f"/start is user-only, so this box stays IDLE until someone restarts it.\n"
+           f"Restart with:  /start {agent}\n")
     )
 
     if user_initiated:

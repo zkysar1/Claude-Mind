@@ -203,3 +203,40 @@ def completion_ratio(asp, *, exclude_statuses=frozenset(), include_recurring=Tru
         asp, exclude_statuses=exclude_statuses, include_recurring=include_recurring
     )
     return completed / total if total > 0 else 0.0
+
+
+def derive_progress(asp):
+    """Return the aspiration's DERIVED `progress` dict: a pure function of its
+    goals, archived_census and initial_goal_count. Recurring goals run
+    perpetually and never "complete", so they are excluded from the completion
+    counts and tallied separately under `recurring_goals`.
+
+    The CLI-side body of the dual-mirror invariant (conventions/aspirations.md).
+    aspirations.recompute_progress writes it on every CLI write, and
+    coordination_merge._merge_aspiration_record re-derives it on a merged record
+    (g-306-532). It lives in this leaf because the merge library is pure and
+    cannot import aspirations, which resolves _paths at import. The daemon write
+    path keeps its own mirror, mind_api/src/endpoints/aspirations_write.py
+    ::_recompute_progress. Changing the shape here without it desyncs the paths.
+    """
+    goals = asp.get("goals") or []
+    # isinstance: a merge passes non-record goal fragments through (_merge_goals)
+    # and effective_counts already skips them, so this count must not raise on one.
+    recurring_count = sum(1 for g in goals
+                          if isinstance(g, dict) and g.get("recurring"))
+    # Census-augmented (B9-deep): "non_recurring" = all non-recurring goals
+    # (abandoned included). effective_counts folds every archived status back in,
+    # so eviction leaves total/completed/fan_out_ratio byte-identical.
+    total, completed_goals = effective_counts(asp, include_recurring=False)
+    # fan_out_ratio: growth from the creation-time seed. None when
+    # initial_goal_count is absent (predates the metric — no inferred
+    # backfill) or 0 (ratio from an empty seed is undefined).
+    igc = asp.get("initial_goal_count")
+    fan_out_ratio = (round(total / igc, 2)
+                     if isinstance(igc, int) and igc > 0 else None)
+    return {
+        "completed_goals": completed_goals,
+        "total_goals": total,
+        "recurring_goals": recurring_count,
+        "fan_out_ratio": fan_out_ratio,
+    }

@@ -48,33 +48,11 @@ idle window: `core/config/conventions/pull-promotion.md`.
 
 ## Pre-Overwrite Drift Gate (MANDATORY)
 
-Promotion is a **RECONCILE, not a MIRROR.** Before overwriting ANY downstream
-repo (any framework file-copy between Mind deployments), the target may LEAD
-the source — ZDS self-evolves the framework
-during operation while Claude-Mind lags — so a blind mirror would silently
-DELETE or CLOBBER target-ahead improvements. (Confirmed 2026-06-24: ZDS led
-Claude-Mind on 18 framework files — 8 scripts, 2 architecture conventions, the
-M-4/M-5 memory tests.)
-
-**Required step — run the gate and reconcile before promoting:**
-
-```bash
-bash core/scripts/promotion-preflight.sh --source <incoming_repo> --target <repo_to_overwrite>
-# add --strict to also block on every differing framework file
-```
-
-- **Exit 0** — target framework is a subset of source. Safe to promote.
-- **Exit 2** — DRIFT. The gate lists every **orphan-risk** (target-only) and
-  **target-ahead** (differing) framework file. For EACH: back-port it UP to the
-  source (or explicitly discard with sign-off) **before** the overwrite. Never
-  promote past an exit-2 without resolving it.
-
-The gate compares only framework paths (`core/config`, `core/scripts`,
-`.claude/{skills,rules}`, `CLAUDE.md`, `settings.json`, `mind_api/{src,tests}`);
-it auto-excludes build artifacts (`__pycache__`, `*.pyc`, `.python-shim`,
-`_tmp_*`) and buckets domain forged skills + deployment-local files separately
-so they never count as drift. Read-only; safe anytime. Tests:
-`core/scripts/tests/test_promotion_preflight*.py`.
+Promotion is a **RECONCILE, not a MIRROR.** Run `promotion-preflight.sh
+--source <repo> --target <repo>` before promoting. Exit 0 = safe; exit 2 =
+DRIFT (back-port or discard each target-ahead file first). Never promote
+past exit 2. Detail, the 2026-06-24 measured drift, and the gate's scope/exclusion
+rules: `core/config/rationale/promotion-drift-gate.md`.
 
 ## What "Production" Means Here
 

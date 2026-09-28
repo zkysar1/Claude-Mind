@@ -84,7 +84,8 @@ if hasattr(sys.stderr, "reconfigure"):
 import yaml  # Required — tree.py already depends on PyYAML
 
 from _paths import (WORLD_DIR, AGENT_DIR, META_DIR, CONFIG_DIR, CORE_ROOT,
-                    ENVIRONMENT_ID, agents_root as _agents_root, read_agent_conf)
+                    ENVIRONMENT_ID, agents_root as _agents_root, read_agent_conf,
+                    agent_state_dir)
 from _fileops import locked_modify_yaml  # noqa: E402  ( applications_log)
 from wm import read_wm  # noqa: E402
 # : the pull_signal liveness arithmetic lives in
@@ -108,6 +109,7 @@ from gates.reallocation_exempt import (  # noqa: E402  ( SSOT)
     recurring_cadence_stranded as _realloc_cadence_stranded,
     idle_agents as _realloc_idle_agents,
     confirms_dormant as _realloc_confirms_dormant)
+from gates.body_hold import evaluate as _body_hold_eval  # noqa: E402  ( SSOT)
 from _goal_census import effective_counts  # noqa: E402  (B9-deep census-augmented counts)
 from _iaus_scorer import iaus_score  # noqa: E402  ( flagged utility scorer)
 from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter)
@@ -2768,6 +2770,39 @@ def _get_idle_agents(reallocation_hours):
             name, last_active, reallocation_hours))
 
 
+def _sibling_body_holds(goal_id, sid):
+    """Past the claim timeout, is sibling Body `sid` still working `goal_id`? ()
+
+    The DECISION is gates.body_hold.evaluate, the SSOT the claim endpoint applies to
+    the same goal, and this reads the same two inputs the endpoint reads, both
+    authoritatively (guard-980): the SID-keyed `in_flight_bodies` row and the
+    holder's body-heartbeat carrier. Without it this selector offered a goal a live
+    sibling was still working as soon as its claim passed claim_timeout_hours, and
+    the pick then took the goal over or, once the endpoint learned the long hold,
+    was refused.
+
+    An absent or unreadable input fails its conjunct, so the goal is offered
+    exactly as before.
+    """
+    row = carrier = None
+    try:
+        from _team_state import read_shard_authoritative
+        shard = read_shard_authoritative(WORLD_DIR, AGENT_NAME)
+        bodies = shard.get("in_flight_bodies") if isinstance(shard, dict) else None
+        row = bodies.get(sid) if isinstance(bodies, dict) else None
+        from storage_backend import get_backend
+        # Absolute path: the store-routed read maps an out-of-root path to the
+        # local mirror silently (stranded-claim-sweep.py _body_carrier_verdict).
+        path = (agent_state_dir(AGENT_NAME) / f"body-heartbeat-{sid}.json").resolve()
+        carrier = json.loads(get_backend().read_authoritative_bytes(path).decode("utf-8"))
+    except FileNotFoundError:
+        pass  # no carrier: the holder is not provably alive, so the claim expires
+    except Exception as e:  # noqa: BLE001 — never silently: say what was not read
+        print(f"[goal-selector] WARN: long-hold read for {goal_id}/{str(sid)[:8]} failed "
+              f"({type(e).__name__}: {e}); judging on what was read", file=sys.stderr)
+    return _body_hold_eval(row, carrier, goal_id=goal_id, sid=sid,
+                           now=datetime.now())["holds"]
+
 
 def collect_candidates(aspirations, known_blockers=None, source="world",
                        global_done_ids=None, claim_timeout_hours=None,
@@ -2976,6 +3011,11 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                     claim_age = hours_since(goal.get("claimed_at"))
                     if claim_age is not None and claim_age <= effective_timeout:
                         continue  # Valid claim — skip
+                    # A sibling Body still working the goal keeps it past the timeout
+                    # (); the claim endpoint refuses the take-over on the same
+                    # predicate, so offering the goal would only waste the pick.
+                    if sibling_body and _sibling_body_holds(goal.get("id"), claim_sid):
+                        continue
                     # else: claim expired or no claimed_at — fall through to include
                 else:
                     continue  # No expiry configured — legacy behavior

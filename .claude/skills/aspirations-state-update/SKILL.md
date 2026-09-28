@@ -62,7 +62,7 @@ After EVERY goal execution (Steps 1-8, plus Steps 8.5, 8.55, and 8.75 for deep o
    - Update streak counters via additional update-goal calls
    - If recurring: compute elapsed = hours_since(lastAchievedAt) BEFORE updating.
      Bash: `aspirations-update-goal.sh --source {source} <goal-id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"`
-     If elapsed > 2 * interval_hours: new_streak = 1.
+     If elapsed > streak_mult * interval_hours (SSOT: core/config/aspirations.yaml recurring.streak_mult): new_streak = 1.
      Otherwise: new_streak = currentStreak + 1.
      ALWAYS update both: currentStreak = new_streak, longestStreak = max(new_streak, longestStreak).
 

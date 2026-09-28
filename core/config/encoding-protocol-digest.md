@@ -94,9 +94,20 @@ end with full context.
    item appears in Verified Values (no silent omissions during the
    compose step).
 
-6. TREE write — Edit the node file. Update front matter:
-       last_updated:         <today YYYY-MM-DD>
-       last_update_trigger:  <"phase-8" | "encode-session" | other>
+6. TREE write — Edit the node file. Update front matter, with the trigger in
+   BLOCK form (the key on its own line, `type:` indented under it):
+       last_updated: <today YYYY-MM-DD>
+       last_update_trigger:
+         type: <phase-8 | encode-session | other>
+
+   Never a bare string, never the one-line `{type: ...}` dict. T21 REFUSES a
+   string trigger outright (last_updated then stays stale in the .md AND in
+   _tree.yaml), and it syncs the date on a one-line dict but never stamps it.
+   Only a block-form trigger gets `session: <SID>` written into it, and that
+   stamp is the attribution key tree-edit-since.py reads: an unstamped node is
+   credited to EVERY session that asks (measured on the real T21, 2026-09-28,
+   g-115-8448). If the node already carries a string or one-line trigger,
+   replace it with the block form in the same Edit.
 
    The PostToolUse hook (T21 in encoding-triggers.md, via
    `tree-front-matter-sync.py`) atomically mirrors `.md` last_updated into
@@ -250,7 +261,8 @@ the skill — the exact drift this digest exists to prevent):
    "it got old" is not evidence the gap was filled.
 3. INLINE RESOLUTION when priority==HIGH OR sessions_deferred >= 2: read
    the target, resolve from in-context knowledge or a quick probe
-   (front matter last_update_trigger: {type: "debt-reconciliation"});
+   (front matter: block-form trigger, `type: debt-reconciliation`, as in
+   the TREE write step);
    else sessions_deferred += 1 and carry.
 4. MAX-DEFER CEILING (10): DURABLE DROP FIRST — write the full reason to
    execution-diary BEFORE removing the entry (a dropped entry's only

@@ -289,11 +289,16 @@ def _near_dup_side_effects(ctx, store_key: str, verdict: dict) -> None:
     clean refusal into a 500."""
     try:
         import _gate_log
+        # The caller's agent and meta dir, not the daemon's own env or the module's
+        # import-time META_DIR, which belong to whichever session spawned the daemon
+        # (guard-2480, ).
         _gate_log.log("store-dupe-warn", "block", caller="store.append",
                       payload={"store": store_key},
                       extra={"nearest_id": verdict["nearest_id"],
                              "similarity": verdict["similarity"],
-                             "threshold": verdict["refuse_threshold"]})
+                             "threshold": verdict["refuse_threshold"]},
+                      meta_dir=ctx.paths.meta,
+                      agent_name=ctx.paths.agent_name or None)
     except Exception:
         pass
     try:

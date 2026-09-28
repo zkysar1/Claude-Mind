@@ -67,15 +67,20 @@ constant-definition audit grep below does NOT see them. They work for
 
 When changing `AGENTS_PARENT_DIR`, `SESSIONS_DIRNAME`, or `SESSION_DIRNAME`,
 update ALL 12 constant-named sites AND the 2 literal-string hardcoders above.
-Audit with ALL FOUR greps (the first finds constant-named sites; the second
+Audit with ALL SIX greps (the first finds constant-named sites; the second
 finds literal-`agents/` glob hardcoders — it also surfaces comments/tests/bench
 refs, so eyeball-filter to executable glob/prefix lines; the third finds
 `.parent`-based PROJECT_ROOT re-derivations from an agent-dir variable, which
-the constant-name and `agents/*` greps both miss):
+the constant-name and `agents/*` greps both miss; the fifth and sixth find the
+bare agent-name-relative `$MIND_AGENT/...` path form in shell and python —
+the g-115-9954 shape, which the first four cannot see and which `.claude/skills/`
+and `core/config/` had never been scanned for):
 `grep -rn '^[[:space:]]*\(_APD=\|_SDN=\|_\?AGENTS_PARENT_DIR\|_\?SESSIONS_DIRNAME\|_\?SESSION_DIRNAME\)' core/scripts/ mind_api/`
 `grep -rn 'agents/\*' core/scripts/ mind_api/`
 `grep -rnE '(agent_dir|AGENT_DIR)\.parent' core/scripts/ mind_api/`
 `grep -rnE 'os\.path\.join\([^)]*"agents"' core/scripts/ mind_api/ | grep -v __pycache__ | grep -v /tests/ | grep -v team-state`
+`grep -rnE '(^|[^A-Za-z0-9_/])\$\{?MIND_AGENT\}?/' .claude/skills/ core/config/ core/scripts/ mind_api/src/`
+`grep -rnE "MIND_AGENT'\)+'/" .claude/skills/ core/config/ core/scripts/ mind_api/src/`
 FOURTH GREP (added 2026-08-25, g-115-4290) — the `os.path.join(<root>, "agents", ...)`
 CALL SHAPE. It defines no constant (grep 1 misses), writes no `agents/*` glob (grep 2
 misses) and uses no `.parent` (grep 3 misses), so it passed the whole audit while being

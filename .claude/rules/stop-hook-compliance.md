@@ -23,115 +23,19 @@ a signal to stop.
    The agent MUST NOT create or modify `agents/<agent>/session/stop-loop`, `agents/<agent>/session/stop-requested`,
    or `agents/<agent>/session/agent-state` by any means (touch, Write, echo, python).
 
-   <!-- exception added 2026-04-18 for productivity-stop-gate -->
-   **Exception**: `core/scripts/productivity-stop-gate.sh` (invoked only by
-   `iteration-close.sh --phase productivity-check` at the end of every iteration) is
-   authorized to set `stop-requested` when the composite productivity score falls
-   below the configured floor AND the session has run at least `min_iterations` goals.
-   The gate is script-gated — not LLM-discretionary — so the agent cannot bypass the
-   threshold math. The script MUST write `agents/<agent>/session/stop-target-mode`
-   ("assistant") BEFORE setting the signal, preserving the /stop invariant that
-   Phase -1.4 reads the target mode without a fallback.
-   Parameters: `core/config/aspirations.yaml` → `productivity_gate`
-   (`min_iterations`, `stop_threshold`). This was the ONLY authorized caller of
-   `session-signal-set.sh stop-requested` outside `/stop` until 2026-08-05;
-   `reducer-self-fence.sh` is the second, `loop-exhaustion-fence.sh` the third,
-   and the vessel sidecar (`zakcode`, out-of-repo) the fourth — all below.
-   Whoever adds a fifth must correct this sentence in the
-   same change — an authoritative-sounding count that has silently gone stale
-   is worse than no count at all. Count `stop-requested` WRITERS here: the
-   recovery-gate / recovery-yank pair below move `agent-state` instead and are
-   counted separately in their own entries.
+   **Authorized signal writers** (the LLM MUST NOT invoke any of these directly):
+   - `productivity-stop-gate.sh` — sets `stop-requested` (script-gated, from `iteration-close.sh`)
+   - `reducer-self-fence.sh` — sets `stop-requested` (script-gated, from `heartbeat-tick.sh`)
+   - `loop-exhaustion-fence.sh` — sets `stop-requested` (script-gated, from `stop-hook.sh`)
+   - vessel sidecar (`zakcode`) — sets `stop-requested` (addressed, from served-run end)
+   - `recovery-gate.sh` — sets `agent-state` RUNNING->IDLE (script-gated, from SessionStart hook)
+   - `recovery-yank-reverse.sh` — sets `agent-state` IDLE->RUNNING (script-gated, from `stop-hook.sh` Gate 1-pre)
+   - vessel recipe (`bootstrap.sh` 3.5/3.5b, out-of-repo) — sets `agent-state` UNINITIALIZED->IDLE at landing; heals RUNNING->IDLE each boot, removing `stop-requested`/`stop-loop` (liveness-gated, g-377-37)
 
-   <!-- exception added 2026-08-05 for reducer-self-fence (g-306-225) -->
-   **Exception**: `core/scripts/reducer-self-fence.sh` (invoked only by
-   `heartbeat-tick.sh`, on every tick, whatever the backend — g-115-8200)
-   is authorized to set `stop-requested` when the cross-machine runner lease says
-   this box is no longer the reducer. A lease needs `T_stepdown < T_takeover`: the
-   holder must stop acting as leader before a peer may legally seize the claim.
-   Like productivity-stop-gate, the script MUST write
-   `agents/<agent>/session/stop-target-mode` ("assistant") BEFORE setting the
-   signal, preserving the /stop invariant that Phase -1.4 reads the target mode
-   without a fallback. The LLM MUST NOT invoke it directly — only
-   `heartbeat-tick.sh` may.
-   The decision is script-gated in `core/scripts/reducer_self_fence.py::decide`
-   (pure, fully branch-tested; its docstring carries the lease argument, the
-   2026-08-05 incident and the signal asymmetry) and stands down on exactly THREE
-   triggers:
-   - `different-holder` — the live claim names another machine. Decisive alone.
-   - `superseded-token` — the live claim's runner-token fingerprint is not this
-     box's (a same-box reducer restart the machine id cannot show). Decisive
-     alone; inert when either fingerprint is unreadable.
-   - `sustained-renewal-gap` — renewal has failed CONTINUOUSLY for
-     `runner_heartbeat.stepdown_seconds` (1950s = half of T_takeover).
-   Every other signal HOLDS, and that is the load-bearing half: a transient
-   daemon blip, an unreadable holder id, an unrecognised rc, and `rc=4`
-   (ABSENT | NOT-RUNNING | STALE | REFUSE) all keep the loop running. Stopping a
-   healthy loop on a plumbing fault is worse than the disease (guard-1562). Note
-   `rc=4` is DECISIVE in the sibling `worker_reducer_liveness.py` and INERT here —
-   the two modules are deliberate mirrors with opposite fail-safe directions, and
-   `test_reducer_self_fence.py` pins that divergence against the real worker
-   module so a future fusion of the two fails loudly.
-
-   <!-- exception added 2026-09-04 for loop-exhaustion-fence (g-115-8939) -->
-   **Exception**: `core/scripts/loop-exhaustion-fence.sh` (invoked only by
-   `stop-hook.sh`, immediately before it builds the BLOCK payload) is authorized
-   to set `stop-requested` when the loop CANNOT EXECUTE: rules 3-4 of this file,
-   the never-self-stop invariant and the unconditional BLOCK otherwise leave a
-   loop out of context no legal move but to iterate emptily.
-   Like its two siblings it MUST write `stop-target-mode` ("assistant") BEFORE
-   setting the signal. The LLM MUST NOT invoke it directly.
-   The decision is script-gated in `core/scripts/loop_exhaustion_fence.py::decide`
-   (pure, fully branch-tested; its docstring carries the 2026-09-04 incident and
-   the user directive) and keys on a BEHAVIOURAL predicate the model
-   supplies no input to — N consecutive stop-hook BLOCKs for one sid with the
-   execution diary's mtime frozen throughout — so "out of context" is
-   structurally distinguishable from "feels done" and rule 5 is intact. It
-   deliberately does NOT decide on `context-budget-status.py`'s zone. Two rungs:
-   `pause` at 4 BLOCKs writes NOTHING and only directs the turn to end on a
-   REGISTERED external-wait sleep; `stop` at 10 writes the signal. Every
-   unreadable input HOLDS — stopping a healthy loop is worse than the disease
-   (guard-1562).
-
-   <!-- exception added 2026-09-12 for the vessel sidecar (g-373-16) -->
-   **Exception**: the **vessel sidecar** (`zakcode`, Zak-Code repo — the first
-   authorized caller that is NOT a framework script) is authorized to write
-   `stop-target-mode` then set `stop-requested` when a SERVED run ends: the
-   human's `/run/stop`, or the run's own duration cap. Vinheim decides WHEN a run
-   ends; the MIND decides what its ending IS. Same two-write shape,
-   same order, same revert-on-failure as its three siblings above
-   (`zakcode.session.framework_stop`), and ADDRESSED rather than discretionary: no
-   `run_stop_agent` configured = no signal, so a non-seed workspace is untouched.
-   The LLM MUST NOT invoke it. Rationale, the ruling it enacts, and grace sizing:
-   `core/config/rationale/vessel-sidecar-stop-caller.md`.
-
-   <!-- exception added 2026-04-19 for recovery-gate (cross-agent visibility plan) -->
-   **Exception**: `core/scripts/recovery-gate.sh` (invoked only by the
-   SessionStart hook in `.claude/settings.json`) is authorized to call
-   `session-state-set.sh IDLE` (RUNNING → IDLE only) AND
-   `session-manifest-clear.sh` under a script-gated 6-condition AND-gate.
-   The LLM MUST NOT invoke `recovery-gate.sh` directly — only the
-   SessionStart hook may. The 6-condition spec (state=RUNNING + heartbeat
-   stale + no recent stop-hook BLOCK + execution-diary stale + no
-   stop-requested + no pending background job) is cataloged in the
-   `recovery-gate` convention (see `core/config/conventions/recovery-gate.md`).
-   This is the second authorized caller of `session-state-set.sh` outside
-   `/start` and `/stop` — `productivity-stop-gate.sh` is the first
-   (productivity-stop-gate stays in RUNNING and only sets the stop signal;
-   recovery-gate moves RUNNING → IDLE).
-
-   <!-- exception added 2026-09-01 for recovery-yank-reverse (g-357-51) -->
-   **Exception**: `core/scripts/recovery-yank-reverse.sh` (invoked only by
-   `stop-hook.sh` Gate 1-pre, when the turn-ending session finds agent-state
-   IDLE beside a `session/recovery-log.jsonl`) is authorized to call
-   `session-state-set.sh RUNNING` (IDLE → RUNNING only) for the ONE sid the
-   recovery gate demoted: a process executing its own stop hook is alive by
-   construction, so that demotion was false (the 2026-09-01 rate-limited-alive
-   kill). Script-gated by `recovery_yank.py preconditions` — same sid, bound
-   autonomous BEFORE the yank, inside the reversal window (default 6h), no
-   user-stop artifact after the yank, no peer holding the runner claim — and
-   every miss is a no-op. The LLM MUST NOT invoke it directly. Third authorized
-   caller outside `/start` and `/stop`; the only one that moves IDLE → RUNNING.
+   All `stop-requested` writers MUST write `stop-target-mode` ("assistant")
+   BEFORE setting the signal. Full catalog with invariants, trigger conditions,
+   and incident traces: `core/config/conventions/stop-signal-writers.md`
+   (`load-conventions.sh stop-signal-writers`).
 
 3. **Context compression is normal** — "The session has been running for a long time" is NOT
    a reason to stop. Autocompact compresses context to free space. The loop is designed to

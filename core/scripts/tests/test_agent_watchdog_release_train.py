@@ -15,13 +15,19 @@ state):
   2. POSITIVE CONTROL — due with no open goal: critical event, files, posts.
   3. A lease another box already filed: dedup, fired, NO second board post.
   4. One event per episode; the fired latch re-validates on its cadence.
-  5. A NEWER tag stalling retires the older tag's lease in the same tick.
-  6. Clear path retires every open lease and emits `release_train_cleared`.
+  5. A NEWER tag stalling retires the older tag's lease in the same tick —
+     and ONLY a strictly older one the basis can see: never the measured
+     tag's lease, never an unseen tag's (g-115-11144).
+  6. The clear path retires the superseded leases and emits `release_train_cleared`.
   7. Unmeasured -> files nothing, retires nothing.
-  8. Filing shape — argv + JSON body via a captured subprocess.run.
-  9. Retire shape — pending+unclaimed only, outcome_note BEFORE status.
+  8. Filing shape — argv + JSON body via a captured subprocess.run; the
+     re-measure recipe is tag-bearing.
+  9. Retire shape — pending+unclaimed only, outcome_note BEFORE status, and
+     the note opens with PROBE_RETIRE_MARK.
  10. State round-trips; registered for the reducer only.
  11. iteration-close.sh wires the in-turn nudge AFTER the tick, stdout unredirected.
+ 12. A hand close holds re-filing for skip_hold_hours fleet-wide; after the
+     hold the new lease quotes the closing note (g-115-11144).
 """
 from __future__ import annotations
 
@@ -29,6 +35,7 @@ import importlib.util
 import json
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -50,7 +57,10 @@ def _load_watchdog():
 
 
 WD = _load_watchdog()
-CFG = {"stale_hours": 24, "ticks_to_file": 1, "ticks_to_revalidate": 50}
+CFG = {"stale_hours": 24, "ticks_to_file": 1, "ticks_to_revalidate": 50, "skip_hold_hours": 24}
+# The v* tags merged into origin/main, newest first. A measurement of `tag`
+# sees `tag` and everything below it here, and nothing above it.
+LADDER = ["v2.12.86", "v2.12.85", "v2.12.84", "v2.12.83"]
 
 
 class _Ctx:
@@ -60,10 +70,13 @@ class _Ctx:
         self.agent_dir = root / "agents" / "testagent"
 
 
-def _measure(tag="v2.12.84", age=30.0, n=5, error=None):
+def _measure(tag="v2.12.84", age=30.0, n=5, error=None, merged=None):
+    if merged is None:
+        merged = LADDER[LADDER.index(tag):] if tag in LADDER else [tag]
     return {"newest_tag": tag, "tag_created": "2026-09-26T07:44:25Z",
             "tag_age_hours": age, "commits_past": n,
             "commit_sample": ["abc1234 fix: something"] if n else [],
+            "tags_merged": merged, "tag_basis": "fetched",
             "fetch_age_minutes": 3.0, "basis": "origin/main", "error": error}
 
 
@@ -72,20 +85,35 @@ def _goal(tag, gid="g-115-90001", status="pending", claimed_by=None):
             "origin_signal": rt.signal_for(tag), "_source": "world"}
 
 
+def _utc(hours_ago: float) -> str:
+    """A naive-UTC goal timestamp `hours_ago` before now (the fleet's clock)."""
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _disposal(tag="v2.12.84", hours_ago=1.0, note="not yet: the widget refactor must soak first"):
+    return {"id": "g-hand", "status": "skipped", "origin_signal": rt.signal_for(tag),
+            "completed_at": _utc(hours_ago), "outcome_note": note, "_source": "world"}
+
+
 def _probe(monkeypatch, tmp_path, *, role="frontier", measure=None, goals=None,
-           cfg=None, stub=True):
-    state = {"measure": measure or _measure(), "goals": list(goals or [])}
+           cfg=None, prior=None, stub=True):
+    state = {"measure": measure or _measure(), "goals": list(goals or []),
+             "prior": prior, "disposal_reads": []}
     monkeypatch.setattr(rt, "self_role", lambda world: role)
     monkeypatch.setattr(rt, "config", lambda *a, **k: dict(cfg or CFG))
     monkeypatch.setattr(rt, "framework_paths", lambda: ["core/scripts"])
-    monkeypatch.setattr(rt, "measure", lambda root, paths, **k: state["measure"])
+    monkeypatch.setattr(rt, "measure_with_basis",
+                        lambda root, paths, stale_hours, **k: state["measure"])
     monkeypatch.setattr(rt, "open_release_goals", lambda world, agent_dir=None: state["goals"])
+    monkeypatch.setattr(rt, "last_disposal",
+                        lambda world, agent_dir, signal: (state["disposal_reads"].append(signal)
+                                                          or state["prior"]))
     p = WD.ReleaseTrainProbe(_Ctx(tmp_path))
     p.state = state
     if stub:
         p.calls = {"file": [], "board": [], "retire": []}
 
-        def fake_file(m, c, open_goals):
+        def fake_file(m, c, open_goals, prior=None):
             p.calls["file"].append(m["newest_tag"])
             existing = [g["id"] for g in open_goals
                         if g.get("origin_signal") == rt.signal_for(m["newest_tag"])]
@@ -110,6 +138,7 @@ def _probe(monkeypatch, tmp_path, *, role="frontier", measure=None, goals=None,
 def test_non_frontier_is_inert_and_says_why(monkeypatch, tmp_path):
     p = _probe(monkeypatch, tmp_path, role="downstream")
     called = []
+    monkeypatch.setattr(rt, "measure_with_basis", lambda *a, **k: called.append(1))
     monkeypatch.setattr(rt, "measure", lambda *a, **k: called.append(1))
     assert p.check() == []
     assert called == []
@@ -165,18 +194,39 @@ def test_newer_tag_stalling_retires_the_older_lease(monkeypatch, tmp_path):
     assert len(events) == 1 and p.fired_tag == "v2.12.85"
 
 
+def test_due_branch_never_retires_a_lease_for_a_tag_the_basis_cannot_see(monkeypatch, tmp_path):
+    """: against f6208f77ed a due reading of v2.12.84 retired the
+    v2.12.85 lease as "a newer tag, v2.12.84, has been cut"."""
+    p = _probe(monkeypatch, tmp_path, measure=_measure(tag="v2.12.84"),
+               goals=[_goal("v2.12.85", gid="g-cutter")])
+    events = p.check()
+    assert p.calls["retire"] == []
+    assert p.calls["file"] == ["v2.12.84"] and len(events) == 1
+
+
 # ── 6-7. clearing / unmeasured ───────────────────────────────────────────────
 
-def test_clear_path_retires_every_open_lease(monkeypatch, tmp_path):
+def test_clear_path_retires_only_superseded_leases(monkeypatch, tmp_path):
     p = _probe(monkeypatch, tmp_path, measure=_measure(tag="v2.12.85", age=1.0),
-               goals=[_goal("v2.12.84")])
+               goals=[_goal("v2.12.84", gid="g-old"), _goal("v2.12.85", gid="g-same"),
+                      _goal("v2.12.86", gid="g-unseen")])
     p.fired, p.fired_tag = True, "v2.12.84"
     events = p.check()
     assert len(events) == 1
     assert events[0].event == "release_train_cleared" and events[0].severity == "info"
-    assert p.calls["retire"][0][0] == ["g-115-90001"]
-    assert "v2.12.85 is 1.0h old" in p.calls["retire"][0][1]
+    assert [ids for ids, _ in p.calls["retire"]] == [["g-old"]]
+    reason = p.calls["retire"][0][1]
+    assert "a newer tag, v2.12.85, has been cut" in reason and "v2.12.85 is 1.0h old" in reason
     assert (p.fired, p.fired_tag, p.consecutive_breach) == (False, None, 0)
+
+
+def test_not_due_keeps_the_measured_tags_lease(monkeypatch, tmp_path):
+    """The lease someone filed for the newest tag stays until that tag is
+    superseded or disposed of; a quiet tick is not a disposal."""
+    p = _probe(monkeypatch, tmp_path, measure=_measure(tag="v2.12.85", n=0),
+               goals=[_goal("v2.12.85", gid="g-same")])
+    assert p.check() == []
+    assert p.calls["retire"] == [] and p.calls["file"] == []
 
 
 def test_quiet_when_never_fired_and_nothing_open(monkeypatch, tmp_path):
@@ -230,6 +280,13 @@ def test_filing_shape(monkeypatch, tmp_path):
     assert "promotion-runbook.md" in d and "guard-5583" in d and "never --tags" in d
     assert "bash core/scripts/release.sh patch" in d
     assert "abc1234 fix: something" in d
+    # : the recipe must not prescribe the tagless fetch, and must
+    # say which basis the measurement stood on.
+    assert "git fetch origin main &&" not in d
+    assert "fetches origin/main AND the v* tags" in d
+    assert "Basis: origin/main and the v* tags (fetched; last fetch 3.0 min" in d
+    assert "No reducer re-files v2.12.84 for 24h after that close" in d
+    assert "PRIOR DISPOSAL" not in d
 
 
 def test_filing_dedups_on_the_exact_signal_without_running_anything(monkeypatch, tmp_path):
@@ -286,6 +343,8 @@ def test_retire_pending_unclaimed_only_note_before_status(monkeypatch, tmp_path)
     assert calls[1][4] == "skipped"
     assert calls[0][-2:] == ["--source", "agent"]
     assert "v2.12.85 is 1.0h old" in calls[0][4]
+    # last_disposal() keys on this prefix to tell a retirement from a disposal.
+    assert calls[0][4].startswith(rt.PROBE_RETIRE_MARK + ": ")
 
 
 def test_retire_reports_a_failed_close_as_held(monkeypatch, tmp_path):
@@ -334,3 +393,94 @@ def test_iteration_close_wires_the_nudge_after_the_tick_unredirected():
     assert tick < nudge
     call = src[nudge:src.index("|| true", nudge)]
     assert re.search(r"(?<!2)>>", call) is None, "the nudge's stdout must not be redirected"
+
+
+# ── 12. the skip hold () ──────────────────────────────────────────
+
+def test_a_hand_close_holds_refiling_fleet_wide(monkeypatch, tmp_path):
+    """Against f6208f77ed each reducer's box-local latch re-filed a tag someone
+    had just closed `skipped`, within ticks_to_revalidate ticks."""
+    p = _probe(monkeypatch, tmp_path, prior=_disposal(hours_ago=1.0), stub=False)
+    ran = []
+    monkeypatch.setattr(WD.subprocess, "run", lambda *a, **k: ran.append(a))
+    events = p.check()
+    assert ran == [], "a held tick must neither file nor post"
+    assert p.state["disposal_reads"] == [rt.signal_for("v2.12.84")]
+    assert len(events) == 1
+    e = events[0]
+    assert e.event == "release_train_held" and e.severity == "info"
+    assert e.payload["goal"]["held"] is True and e.payload["goal"]["goal_id"] == "g-hand"
+    assert (p.fired, p.fired_tag) == (True, "v2.12.84")   # latched: no re-ask every tick
+    assert "held: g-hand for v2.12.84 was closed skipped" in p.last_reason
+    assert "skip_hold_hours=24" in p.last_reason
+
+
+def test_after_the_hold_the_new_lease_quotes_the_closing_note(monkeypatch, tmp_path):
+    p = WD.ReleaseTrainProbe(_Ctx(tmp_path))
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"id": "g-115-99998"})
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        captured["body"] = json.loads(kw["input"])
+        return _Proc()
+
+    monkeypatch.setattr(WD.subprocess, "run", fake_run)
+    prior = _disposal(hours_ago=30.0)
+    res = p._file_release_goal(_measure(), CFG, [], prior)
+    assert res["filed"] is True and res["goal_id"] == "g-115-99998"
+    d = captured["body"]["description"]
+    assert (f"PRIOR DISPOSAL of v2.12.84: g-hand was closed skipped at {prior['completed_at']} "
+            f"with: \"not yet: the widget refactor must soak first\" - start from that reason."
+            ) in d
+
+
+def test_a_zero_hold_files_at_once_and_says_so(monkeypatch, tmp_path):
+    p = WD.ReleaseTrainProbe(_Ctx(tmp_path))
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"id": "g-115-99997"})
+        stderr = ""
+
+    monkeypatch.setattr(WD.subprocess, "run",
+                        lambda argv, **kw: captured.update(body=json.loads(kw["input"])) or _Proc())
+    res = p._file_release_goal(_measure(), dict(CFG, skip_hold_hours=0), [],
+                               _disposal(hours_ago=0.5))
+    assert res["filed"] is True
+    d = captured["body"]["description"]
+    assert "The probe may re-file v2.12.84 at its next re-validation" in d
+    assert "No reducer re-files" not in d and "PRIOR DISPOSAL of v2.12.84: g-hand" in d
+
+
+def test_an_unset_latch_holds_inside_the_window_then_refiles_quoting_the_note(
+        monkeypatch, tmp_path):
+    """End to end through check(), with the real _file_release_goal: a reducer
+    whose latch was never set (a fresh box, a restarted watchdog) still holds a
+    hand-skipped tag inside the window, and after it files a lease that quotes
+    the skip's note."""
+    bodies = []
+
+    class _Proc:
+        returncode = 0
+        stdout = json.dumps({"id": "g-115-99996"})
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        if argv[1] == "core/scripts/aspirations-add-goal.sh":
+            bodies.append(json.loads(kw["input"]))
+        return _Proc()
+
+    inside = _probe(monkeypatch, tmp_path, prior=_disposal(hours_ago=1.0), stub=False)
+    monkeypatch.setattr(WD.subprocess, "run", fake_run)
+    assert not inside.fired
+    assert [e.event for e in inside.check()] == ["release_train_held"] and bodies == []
+    after = _probe(monkeypatch, tmp_path, prior=_disposal(hours_ago=30.0), stub=False)
+    assert not after.fired
+    assert [e.event for e in after.check()] == ["release_train_stalled"]
+    assert len(bodies) == 1
+    assert 'with: "not yet: the widget refactor must soak first"' in bodies[0]["description"]

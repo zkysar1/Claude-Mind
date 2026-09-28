@@ -122,10 +122,17 @@ _collect_pair "$RT_DIR"
 
 # 2. Auto-discovered sibling deployments. Default parent = dirname PROJECT_ROOT;
 #    overridable via ORPHAN_SWEEP_DEPLOY_PARENT (test seam + non-default layouts).
-#    Glob both layouts: <repo>/mind_api/state/ and <repo>/.mind-data/mind_api/state/.
+#    Glob both layouts: <repo>/mind_api/state/ and <repo>/.mind-data/mind_api/state/,
+#    at depth 1 AND depth 2 (<org>/<repo>/...). Depth 1 alone missed a production
+#    Mind grouped under an org folder: sweep reported its live daemon ORPH, so
+#    --clean would have killed it (measured 2026-09-28; guard-725 records the same
+#    misread on 2026-07-27). Widening only ever ADDS pids to the keep-set, and a
+#    stale pidfile can spare a process but never condemn one.
 DEPLOY_PARENT="${ORPHAN_SWEEP_DEPLOY_PARENT:-$(dirname "$PROJECT_ROOT")}"
 for _pidf in "$DEPLOY_PARENT"/*/mind_api/state/daemon.pid \
-             "$DEPLOY_PARENT"/*/.mind-data/mind_api/state/daemon.pid; do
+             "$DEPLOY_PARENT"/*/.mind-data/mind_api/state/daemon.pid \
+             "$DEPLOY_PARENT"/*/*/mind_api/state/daemon.pid \
+             "$DEPLOY_PARENT"/*/*/.mind-data/mind_api/state/daemon.pid; do
     [ -f "$_pidf" ] || continue              # unmatched glob expands to literal — skip
     _sdir="$(dirname "$_pidf")"
     [ "$_sdir" = "$RT_DIR" ] && continue      # this repo, already collected

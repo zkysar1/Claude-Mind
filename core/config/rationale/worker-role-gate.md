@@ -147,3 +147,124 @@ branch of that upstream path IS covered live (a real claim response from the
 production wrapper returned `undetermined`); the `reducer` branch is not
 reachable end-to-end from a worker without stamping a goal solely to trip its
 own fence, so it is fixture-covered only.
+
+## Why the SOURCE gate keys on claim-HOLDING, not role (g-306-524)
+
+`goal_eligibility` above is FIELD-keyed (`executable_by_role`) and SKILL-keyed
+(the bridge). An **agent-queue goal** (`source == 'agent'`) carries NEITHER: the
+field is unset and it is usually skill-less. So the bridge answers `undetermined`
+on exactly the population a worker can **structurally never claim from its box**.
+
+The structure, measured 2026-09-11 (relayed by the alpha reducer at spark
+replay, from worker Bodies cc-07/08/09/13 and DESKTOP-O91DLK2, 2026-09-06..11):
+
+| fact | value |
+|---|---|
+| agent-queue goals a worker's box CANNOT claim, in the scored pool | 24 of 2058 candidates |
+| …of those in the **top 50** the scorer hands the worker | 7 |
+| verdict `goal-eligible` returned for each | `undetermined` (a decline, read as a pass) |
+
+Why the refusal is STRUCTURAL, not a transient: an agent-queue goal is claimable
+only on the box holding that agent's DDB runner claim. `owncloud_backend` refuses
+every other box `no_claim`, and its own comment says the refusal means "no retry
+can ever succeed from here". So on a non-claim-holding box the goal is not broken
+and not the reducer's — it is simply unreachable from this machine, and the right
+word is the same one a worker already knows how to act on: `reducer-only` (skip,
+take the next candidate, file nothing, do not burn a select cycle).
+
+**The key is claim-holding, deliberately NOT role.** A worker co-resident on the
+claim box CAN claim the goal (g-001-06 closed `completed_by_role=worker` from
+cc-08, 2026-08-31). Keying the gate on "is the reader a worker?" would fence the
+majority direction — the goal is reachable from exactly the box the worker is
+sitting on — so the predicate is "does THIS box hold the agent's live runner
+claim?", and the role/skill logic runs on the box that holds it.
+
+**The probe reuses the ONE ownership implementation** rather than re-deriving
+(a runner-token scan, a raw claim-table read, a subprocess):
+`owncloud_sync._owned_agents_with_provenance` is the same SSOT the write-side
+`no_claim` gate consults in `owncloud_backend._put`, so the SELECT-time gate and
+the claim endpoint cannot disagree about who may claim. Three copies of the
+ownership predicate would be three things to keep in sync (guard-130), and the
+freshness threshold (`OWNERSHIP_STALE_SECONDS`) is already the value
+`reclaim_if_stale` enforces for the lock-break.
+
+**Provenance is the verdict, not a boolean.**
+
+| provenance | meaning | gate answers |
+|---|---|---|
+| `local-backend` | a single machine, NO claim store exists; the daemon's `no_claim` machinery is absent (`no_claim_error` is the empty tuple off own-cloud) | falls through — every queue is claimable on the box |
+| `live-claims` | a real judgment, both directions | `agent` in the owned set → eligible path; otherwise `reducer-only` |
+| `unknown-machine` / `transient-error` / any exception | the box CANNOT prove what it holds | `undetermined` |
+
+The unreadable-provenance row degrades to `undetermined` on purpose, and this is
+the load-bearing half of the design (g-115-8028's direction, which fires ONLY on
+provenance `live-claims`). A `reducer-only` verdict asserts a STRUCTURAL
+impossibility — "no retry can ever succeed from this box". Making that
+assertion on a claim table the box cannot read is the confident-and-wrong error
+the `no_claim` gate's own comment names: it would fence a legitimate goal behind
+an infrastructure fault. The same three-way fail-open the rest of this module
+uses (guard-1760 — a checker may not report what it declined to look at as a
+pass, and must not assert the opposite on an unreadable signal either).
+
+**Why the claim-holding box answers `eligible`, not `undetermined`.** On the
+box that HOLDS the claim, the can't-judge bridge verdicts (skill-less goal,
+unmapped skill) concern **ownership** — "is this goal reducer-only *work*?" —
+not **claimability**, which the gate has already settled: the claim endpoint
+accepts from here. So the verdict word is `eligible`, and the gate appends its
+caution to the bridge's reason rather than erasing it. This is NOT a loosening of
+any fence: the refusal paths (role `reducer`, a reducer-only skill, the
+worker+refused-skill contradiction) return BEFORE the promotion, so no fence ever
+reads through it as a pass. The promotion exists so that the one case the defect
+named — the skill-less agent-queue goal — resolves to an actionable `eligible` on
+the box that can actually take it, instead of a decline that reads as a pass on
+every box and a structural refusal on the one box that is reachable.
+
+**Scope — what this gate does NOT fence.** `source == 'agent'` fires it. A
+`cross-agent:<owner>` row is the peer-queue variant (g-115-9230, a separate
+goal) and is deliberately NOT fenced here; a `world` row passes through. The
+`--source` / `--agent` flags both precede the skill arg (argparse REMAINDER —
+the same load-bearing ordering as `--role`, one section up). The `--agent` flag
+defaults to this session's agent because an `agent` row in a worker's own pool is
+its own queue; it is named explicitly only when judging a row read elsewhere.
+
+g-306-514 source-gated the **DRAIN LANE** (`goal-selector.py`). This is its
+**SELECT-time twin**: the drain lane moves a goal's ORDER in the pool, this
+settles whether the worker may CLAIM it at all.
+
+## Why the walk judges the WHOLE ranking, and filters BEFORE the cut (g-375-53)
+
+Phase 1 used to cut the ranking to 10 or 40 rows and only then ask
+`goal-eligible` once per row, a loop of up to 40 calls that the Body typed by
+hand. On 2026-09-28 00:09Z a worker Body on a small local model ran
+`select --top 40`, made **0** gate calls, and parked on "SELECT returned no
+eligible goal ... agent-queue-fenced ... reducer-only". Its transcript shows one
+selector run and five record reads, and nothing else. Measured from another
+seat at 00:35Z, 33 of that top 40 passed the gate, and two sibling Bodies
+claimed its rank-1 and rank-2 goals within 30 min. A small model skips a
+40-step loop; it does not skip one command. `worker_execute.py select-walk`
+makes the whole Phase 1 check that one command.
+
+**Why before the cut.** Filtering after a fixed cut lets a run of reducer-only
+rows at the top empty the view while claimable work sits at rank 41. On the
+2026-09-28 queue that could not happen (26 of 2,923 candidates were
+reducer-bound), but the order was wrong, and fixing it costs one pass over rows
+already in memory. The walk keeps the scorer's order (guard-5135): dropping a
+row moves nothing else.
+
+**Why on the worker side, not in goal-selector.** The selector is ONE component
+both roles run, and `LIFECYCLE_DISPOSITIONS["select"]` forbids worker logic
+inside it ("There is no worker-specific selection logic and there must not be
+one"; `test_selection_stays_role_blind`). The first cut of g-375-53 put the
+walk in the selector's `--top` view and that test refused it. So the walk runs
+the unchanged selector once (`--top` wide enough to hold every row) and judges
+its output here, which is the worker loop consulting the contract, mechanized.
+
+**Why a supply park must answer the census.** The walk records what it showed
+(`sessions/<SID>/select-census.json`). `body-manifest.py park --supply-gap`
+refuses, exit 5, until every row in it is claimed or named in
+`--decline <goal-id>=<reason>`, and until the view is fresh and the walk went
+deep enough (`--top 40`, or a shorter view that exhausted the ranking). A Body
+that never asked the gate has no census, so it cannot declare "no work". The
+reducer-gone park (Phase 0.5) and the loop-exhaustion fence pass no flag and
+are unchanged. The declines are the record a later `requires_capability` pass
+can mine for locus-bound goals.

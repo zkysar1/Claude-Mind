@@ -49,63 +49,30 @@ or has to be undone. In particular:
    See `encode-stable-facts.md`.
 10. **Editing or modifying an existing file** — you must have Read the file
    in this session before any Edit/MultiEdit. See `read-before-edit.md`.
-11. **Prescribing a fix to anyone else — in a goal, a note, or a post.**
-   Each splits into a measured DIAGNOSIS and an unmeasured REMEDY, and whoever
-   reads it inherits the remedy as scope. Retrieve against the *remedy* before
-   publishing — the cheaper fix, or the HAZARD in the one you recommend, is
-   often encoded (rb-5669, guard-1719, rb-9087). A note or post is ungated —
-   nothing is filed or edited.
-12. **Running a probe whose EMPTY result will authorize an action** — an
-   ownership check before filing, a duplicate scan, a "does this exist yet"
-   grep, a suppression gate's lookup. A probe whose zero authorizes a write
-   has already made the decision. Retrieve against the PROBE ITSELF — the
-   tool, its flags, its failure modes — not only the subject (guard-3362).
-13. **Computing a census or aggregate over a store** — any count, tally,
-   distribution or "N of M" you intend to report or act on. Retrieve on the
-   MECHANISM ("counting records in a JSONL store by tallying one field",
-   "producing a zero from a filter I wrote this turn"), not only on the
-   subject — the count-hazard guardrails are indexed on the operation, so
-   subject queries miss them. SSOT for the two-query mechanism:
-   `core/config/conventions/retrieval-triggers.md` § "Why TWO queries".
+11. **Prescribing a fix to anyone else** — retrieve against the *remedy*,
+   not just the diagnosis (rb-5669, guard-1719, rb-9087).
+12. **Running a probe whose EMPTY result will authorize an action** — retrieve
+   against the PROBE ITSELF, not only the subject (guard-3362).
+13. **Computing a census or aggregate over a store** — retrieve on the
+   MECHANISM, not only the subject (count-hazard guardrails are indexed on
+   the operation). Detail: `retrieval-triggers.md` § "Why TWO queries".
 
 If you find yourself making one of these decisions without having
 retrieved in the same turn, STOP and retrieve first.
 
-## What counts as a "retrieval"
+## Retrieval entry point
 
-The unified entry point is `core/scripts/retrieve.sh`. Pick the
-right shape (footnotes on the fallback fields and flags: retrieval-triggers.md
-§ Invocation-table footnotes):
-
-| Decision shape | Invocation |
-|----------------|------------|
-| Goal/topic is clearly categorized | `retrieve.sh --category <cat> --depth medium` |
-| Free-text query (no exact category) | `retrieve.sh --category "<free text>" --depth shallow` (token-overlap) |
-| Pre-apply consultation for framework-file fix | `retrieve.sh --category "<one-line fix description>" --depth shallow --include-framework` (the flag is REQUIRED; g-115-3777) |
-| Reader mode / observer session (side-effect-free) | `retrieve.sh --category <q> --read-only` |
-| Need full-body content of supplementary entries | `retrieve.sh --category <cat> --full-content` (opt-in; default is metadata-only) |
-| Goal-execution retrieval (writes retrieval-session.json) | `retrieve.sh --category <cat> --goal <goal-id> --tree-nodes "<comma-keys>"` |
-| Browsing tree structure without scoring | `tree-find-node.sh --text <q>` (substring-only; weaker than retrieve.sh) |
-| Reading framework rules / conventions by name | `load-conventions.sh <name>` (exact key lookup) |
-| Retrieving framework rules / conventions by topic | `retrieve.sh --category "<free text>" --include-framework` (returns under `framework_rules`) |
+`core/scripts/retrieve.sh`. Key shapes: `--category <cat> --depth medium`
+(categorized), `--category "<free text>" --depth shallow` (free-text),
+`--include-framework` (REQUIRED for framework-file fixes; g-115-3777),
+`--read-only` (reader/observer mode). Full invocation table and footnotes:
+`retrieval-triggers.md` § "Invocation table".
 
 ## What counts as "deciding"
 
-Any of the following marks the decision boundary:
-
-- Writing a new goal, aspiration, or hypothesis
-- Calling a skill that mutates state (Edit, Write, `*-update*.sh`,
-  `pipeline-move.sh`, `aspirations-add-goal.sh`, etc.)
-- Filing a blocker via CREATE_BLOCKER
-- Setting `defer_reason` on a goal
-- Posting to the coordination or findings board
-- Sending a notification via the forged notification skill
-- Responding to the user with an answer that goes beyond echoing a
-  fresh read
-
-If retrieval did not fire in the same turn that the decision lands,
-the decision was made from memory or amnesia — not from accumulated
-knowledge.
+Any state-mutating action: writing a goal/aspiration/hypothesis, Edit/Write,
+filing a blocker, setting `defer_reason`, posting to the board, sending a
+notification, or answering the user beyond echoing a fresh read.
 
 ## When retrieval is NOT required
 

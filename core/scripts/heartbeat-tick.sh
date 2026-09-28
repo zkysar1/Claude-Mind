@@ -246,9 +246,25 @@ fi
 # with the shared runner-token — a zombie lease if the reducer died. So the
 # CALLER separates them: bash-agent-inject.py passes this flag for any Body
 # whose SID is not running-session-id. Exit 0 — the per-Body carrier was
-# refreshed, which is the whole job; the box-level publish below is the
-# reducer's tick's to make.
+# refreshed and published, which is the whole job; the box-level publish below
+# is the reducer's tick's to make.
+#
+# PUBLISH IT HERE (). The daemon's periodic sweep publishes only the
+# carrier of the session its daemon was SPAWNED in, so a Body whose session
+# started after its box's daemon was invisible cross-box: the stranded-claim
+# sweep read its carrier `absent` and released its live claim (measured
+# 2026-09-27 on 3 of 10 worker boxes). rt_call sends this Body's MIND_AGENT and
+# MIND_SID as headers, and the endpoint admits exactly that one carrier.
+# Subshell so _runtime.sh's definitions stay out of the tick; stdout (the JSON
+# verdict) is dropped and stderr kept for the hook log (rb-400); `|| true`
+# because a failed publish must never fail the tick. Only this caller, which
+# runs detached from the Bash hook, pays the round-trip.
 if [ "${1:-}" = "--body-only" ]; then
+    if [ -n "${_HB_CARRIER:-}" ] && [ -f "$_HB_CARRIER" ]; then
+        ( source "$(dirname "$0")/_runtime.sh" \
+            && rt_call POST /v1/admin/owncloud-sync-file \
+                --query "path=$(rt_url_encode "$_HB_CARRIER")" >/dev/null ) || true
+    fi
     exit 0
 fi
 

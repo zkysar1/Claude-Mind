@@ -86,8 +86,13 @@ def apply_override_all(args, slot_attrs):
     return token, filled
 
 
+#: audit_bulk_override()'s ``session_id`` default: read this process's own MIND_SID. Right
+#: for a CLI caller, whose process IS the session; a daemon caller passes the request's sid.
+_ENV_SID = object()
+
+
 def audit_bulk_override(token, justification, slots_filled, context, *,
-                        world_dir=None):
+                        world_dir=None, agent_name=None, session_id=_ENV_SID):
     """Append one record to world/override-bypass-ledger.jsonl.
 
     `context` is a dict of free-form labels (caller, goal_id, source, etc.)
@@ -105,6 +110,12 @@ def audit_bulk_override(token, justification, slots_filled, context, *,
     daemon callers whose per-request world path differs from the import-
     time _paths value. CLI callers pass None and rely on the module-level
     constant.
+
+    `agent_name` and `session_id` (keyword-only) set the record's `agent`
+    and `session_id`. CLI callers omit both: their env is their own. A
+    daemon caller passes the request's identity (`ctx.paths.agent_name`,
+    the `x-mind-sid` header; None when absent), because the daemon's env
+    belongs to whichever session spawned it (guard-2480, g-375-41).
     """
     if not token or not slots_filled:
         return
@@ -122,8 +133,9 @@ def audit_bulk_override(token, justification, slots_filled, context, *,
         "justification": (justification or "")[:1000],
         "slots_filled": list(slots_filled),
         "gate_ids": gate_ids,
-        "agent": _os.environ.get("MIND_AGENT", "") or None,
-        "session_id": _os.environ.get("MIND_SID", "") or None,
+        "agent": agent_name or _os.environ.get("MIND_AGENT", "") or None,
+        "session_id": ((_os.environ.get("MIND_SID", "") or None)
+                       if session_id is _ENV_SID else (session_id or None)),
         "context": context or {},
     }
     if gate_ids_unmapped:

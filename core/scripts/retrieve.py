@@ -3466,7 +3466,10 @@ def _log_retrieval_trace(category, depth, read_only, items_returned,
         # module global, exactly like TREE_PATH/RB_PATH in load_tree_nodes.
         if WORLD_DIR is None:
             return
-        trace_path = WORLD_DIR / "retrieval-trace.jsonl"
+        # Basename from the one writer rule (): the legacy file while
+        # RETRIEVAL_TRACE_SEGMENTED is unset, today's date segment once it flips.
+        import _retrieval_trace
+        trace_path = WORLD_DIR / _retrieval_trace.store_name()
         # supplementary_only mode: tier satisfied = any supplementary store
         # returned anything (rb, guardrails, patterns, exp). Otherwise: tree_nodes.
         if supplementary_only:

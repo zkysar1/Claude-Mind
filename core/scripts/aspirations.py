@@ -24,7 +24,7 @@ reconfigure_stdio()
 from _paths import WORLD_DIR, AGENT_DIR, META_DIR, CORE_ROOT, CONFIG_DIR
 from _cadence_anchor import is_deliberate_raise as _is_deliberate_raise
 from _gate_log import log as _gate_log
-from _goal_census import effective_counts as _effective_counts  # B9-deep census-augmented counts
+from _goal_census import derive_progress as _derive_progress  # B9-deep census-augmented progress body, shared with the merge path ()
 from _goal_census import all_evicted_ids as _all_evicted_ids  #  mint-site tombstone awareness
 import _decomposed_dependents  #  — shared with the daemon's update_goal
 
@@ -883,25 +883,12 @@ def recompute_progress(asp):
 
     Recurring goals run perpetually and never "complete", so they must not inflate
     the total or be counted as completed. They are tracked separately.
+
+    The body is _goal_census.derive_progress, so the pure merge library can
+    re-derive the SAME value on a merged record without importing this module
+    (g-306-532). This wrapper keeps the in-place write every CLI path calls.
     """
-    goals = asp.get("goals", [])
-    recurring_count = sum(1 for g in goals if g.get("recurring"))
-    # Census-augmented (B9-deep): "non_recurring" = all non-recurring goals
-    # (abandoned included). effective_counts folds every archived status back in,
-    # so eviction leaves total/completed/fan_out_ratio byte-identical.
-    total, completed_goals = _effective_counts(asp, include_recurring=False)
-    # fan_out_ratio: growth from the creation-time seed. None when
-    # initial_goal_count is absent (predates the metric — no inferred
-    # backfill) or 0 (ratio from an empty seed is undefined).
-    igc = asp.get("initial_goal_count")
-    fan_out_ratio = (round(total / igc, 2)
-                     if isinstance(igc, int) and igc > 0 else None)
-    asp["progress"] = {
-        "completed_goals": completed_goals,
-        "total_goals": total,
-        "recurring_goals": recurring_count,
-        "fan_out_ratio": fan_out_ratio,
-    }
+    asp["progress"] = _derive_progress(asp)
 
 def _validate_blocker_ref(raw):
     """Thin wrapper — delegates to gates.blocker_ref.validate."""

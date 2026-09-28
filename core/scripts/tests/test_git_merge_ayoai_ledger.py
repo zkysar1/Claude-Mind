@@ -619,3 +619,128 @@ def test_unparseable_base_degrades_open():
     theirs = _jsonl({"id": "asp-1"}, {"id": "asp-2"})
     out = drv.merge_bytes(_AGENT_ASP, ours, theirs, b"{not json at all\n")
     assert out == cm.merge_handler_for(_AGENT_ASP)(ours, theirs)
+
+
+# ── retrieval_stats merged per field (, rb-12157) ──────────────────
+# The whole-record arms above pick ONE side, and the both-edited / no-base arm
+# picks by a lexicographic canonical compare that prefers null over any date and
+# "99" over "100". A Body's integrate therefore kept a BEHIND copy of an
+# experience record, and the next carrier drain applied it as a one-sided edit.
+# These pin the per-field rule: grow-only counters max, last_retrieved newest,
+# utility_ratio recomputed (decrement-able, guard-1153), everything else as picked.
+
+_EXP = "agents/x/experience.jsonl"
+
+
+def _exp(rc, lr, tu=0, tn=0, **extra):
+    stats = {"retrieval_count": rc, "times_useful": tu, "times_noise": tn,
+             "utility_ratio": round(tu / max(rc, 1), 4), "last_retrieved": lr}
+    stats.update(extra)
+    return {"id": "exp-A", "type": "goal_execution", "retrieval_stats": stats}
+
+
+def _stats(b):
+    (rec,) = _lines(b)
+    return rec["retrieval_stats"]
+
+
+def test_stale_one_sided_stats_rewrite_does_not_land():
+    """The drain shape: base and HEAD agree, the carrier tip is BEHIND.
+
+    Pre-fix, 'only THEIR side edited it' applied retrieval_count 1 -> 0 and
+    last_retrieved '2026-09-27' -> null with no conflict (rb-12157)."""
+    base = ours = _jsonl(_exp(1, "2026-09-27"))
+    theirs = _jsonl(_exp(0, None))
+    s = _stats(drv.merge_bytes(_EXP, ours, theirs, base))
+    assert (s["retrieval_count"], s["last_retrieved"]) == (1, "2026-09-27")
+
+
+def test_both_added_null_last_retrieved_does_not_win():
+    """The Body-integrate shape that SEEDED the drain regression: no base, both
+    sides added the record, one still at its fresh 0 / null state."""
+    ours = _jsonl(_exp(0, None))
+    theirs = _jsonl(_exp(1, "2026-09-27"))
+    for a, b in ((ours, theirs), (theirs, ours)):
+        s = _stats(drv.merge_bytes(_EXP, a, b, b""))
+        assert (s["retrieval_count"], s["last_retrieved"]) == (1, "2026-09-27")
+
+
+def test_both_edited_counters_take_max_across_a_digit_boundary():
+    """Canonical compare ranks 99 above 100; the counters must not. Equal dates
+    make retrieval_count the first differing key, so the pre-fix pick is 99.
+    Source: the `co > ct` arm of _three_way_id_merge in
+    core/scripts/git-merge-ayoai-ledger.py; the 2026-09-27 mutation proof of
+    ef06450232 measured the pre-fix result as (99, 21, '2026-09-27')."""
+    base = _jsonl(_exp(98, "2026-09-26", tn=20))
+    ours = _jsonl(_exp(99, "2026-09-27", tn=21))
+    theirs = _jsonl(_exp(100, "2026-09-27", tn=22))
+    s = _stats(drv.merge_bytes(_EXP, ours, theirs, base))
+    assert (s["retrieval_count"], s["times_noise"], s["last_retrieved"]) == (100, 22, "2026-09-27")
+
+
+def test_utility_ratio_is_recomputed_never_maxed():
+    """utility_ratio FALLS as retrieval_count grows, so max would keep a stale
+    0.5 beside 20 retrievals. It must be times_useful / max(retrieval_count, 1)
+    over the MERGED counters (guard-1153). Equal dates make the pre-fix pick the
+    BEHIND side ("9" > "20"), whose ratio is also the higher one."""
+    base = _jsonl(_exp(8, "2026-09-26", tu=4))
+    ours = _jsonl(_exp(9, "2026-09-27", tu=4))        # ratio 0.4444
+    theirs = _jsonl(_exp(20, "2026-09-27", tu=5))     # ratio 0.25
+    s = _stats(drv.merge_bytes(_EXP, ours, theirs, base))
+    assert (s["retrieval_count"], s["times_useful"], s["utility_ratio"]) == (20, 5, 0.25)
+
+
+def test_non_counter_stats_fields_ride_the_pick():
+    """Audit snapshots stuffed into retrieval_stats (tree_nodes_loaded, ...) are
+    not counters, so they are NOT max-merged: they follow the picked record.
+    Source: the census note above _STATS_MAX_FIELDS in
+    core/scripts/git-merge-ayoai-ledger.py (8 of 10,169 records carried
+    tree_nodes_loaded at bcc7897930)."""
+    base = theirs = _jsonl(_exp(1, "2026-09-26", tree_nodes_loaded=9))
+    ours = _jsonl(_exp(2, "2026-09-27", tree_nodes_loaded=5))   # only ours edited
+    s = _stats(drv.merge_bytes(_EXP, ours, theirs, base))
+    assert (s["retrieval_count"], s["tree_nodes_loaded"]) == (2, 5)
+
+
+def test_stats_merge_is_byte_identical_commutative():
+    """Both machines must write the same bytes from either vantage (the
+    guard-907 property this driver keeps in the git lane)."""
+    cases = [
+        (_jsonl(_exp(1, "2026-09-27")), _jsonl(_exp(0, None)), _jsonl(_exp(1, "2026-09-27"))),
+        (_jsonl(_exp(99, "2026-09-26", tn=21)), _jsonl(_exp(100, "2026-09-27", tn=22)),
+         _jsonl(_exp(98, "2026-09-26", tn=20))),
+        (_jsonl(_exp(0, None)), _jsonl(_exp(1, "2026-09-27")), b""),
+    ]
+    for ours, theirs, base in cases:
+        assert drv.merge_bytes(_EXP, ours, theirs, base) == drv.merge_bytes(_EXP, theirs, ours, base)
+
+
+_REPO = os.path.dirname(os.path.dirname(_SCRIPTS))
+_REAL_MERGES = (  # (label, base, ours, theirs): the two merges rb-12157 traced
+    ("body integrate e7cea9a844", "3d3acf8aea", "847f4aaed1", "48caab9aee"),
+    ("carrier drain 90faa00f06", "646582dcbb", "915fc49ec1", "0822c3708d"),
+)
+
+
+def _have_commits():
+    shas = {s for m in _REAL_MERGES for s in m[1:]}
+    return all(subprocess.run(["git", "-C", _REPO, "cat-file", "-e", f"{s}^{{commit}}"],
+                              capture_output=True).returncode == 0 for s in shas)
+
+
+@pytest.mark.skipif(not _have_commits(), reason="rb-12157 merge commits not in this clone")
+def test_real_rb12157_merges_keep_the_counter():
+    """Replay the two real merges from this repo's history. Pre-fix both
+    returned retrieval_count 0 / last_retrieved null for this record."""
+    path = "agents/alpha/experience.jsonl"
+    rid = "exp-g-306-284-occ227-board-retention-inert-behind-env-20260927"
+
+    def blob(rev):
+        return subprocess.run(["git", "-C", _REPO, "show", f"{rev}:{path}"],
+                              capture_output=True, check=True).stdout
+
+    for label, base, ours, theirs in _REAL_MERGES:
+        merged = drv.merge_bytes(path, blob(ours), blob(theirs), blob(base))
+        (rec,) = [r for r in _lines(merged) if r.get("id") == rid]
+        s = rec["retrieval_stats"]
+        assert (s["retrieval_count"], s["last_retrieved"]) == (1, "2026-09-27"), label

@@ -76,14 +76,43 @@ def test_OUTCOME_1_sampling_is_deterministic_across_runs():
 def test_OUTCOME_1_the_sample_is_not_rerollable_by_the_executor():
     """An executor cannot shop for a friendlier sample.
 
-    The key is a pure function of (goal, artifact path, cluster text), so the
-    ONLY lever that changes which claims are examined is changing the artifact.
+    The key is a pure function of its three strings, and sample_clusters feeds it
+    (goal, artifact path, cluster ordinal), so the ONLY lever that changes which
+    claims are examined is adding, removing or splitting a claim.
     """
     a = sample_key("g-357-44", "art.md", "Acme Corporation reported X in 2024.")
     b = sample_key("g-357-44", "art.md", "Acme Corporation reported X in 2024.")
     c = sample_key("g-357-44", "art.md", "Acme Corporation reported Y in 2024.")
     assert a == b
     assert a != c
+
+
+def test_OUTCOME_1_a_citation_fix_does_not_reroll_the_sample():
+    """: the remedy a finding asks for must not move the sample.
+
+    A missing-citation finding asks for a source token INSIDE the cluster, which
+    edits the cluster's text. Keyed on text, each fixed cluster drew a new rank
+    and usually left the sample, so the confirming run examined clusters no run
+    had shown, and an executor that fixed exactly what it was told re-ran 3-6
+    times. Rewording a sampled claim must not move it either. The last assertion
+    is the positive control: adding a claim still moves the sample, so holding
+    still here is not a sampler that ignores its input.
+    """
+    lines = [f"Widget Industries {i} employs {i}00 people in 2024." for i in range(20)]
+    first, total = sample_clusters("\n\n".join(lines), "g-357-44", "art.md", 5)
+    assert total == 20 and len(first) == 5
+    assert not any(c.source_tokens for c in first)
+    for c in first:
+        lines[(c.start_line - 1) // 2] += " Source: g-357-44."
+    reworded = (first[0].start_line - 1) // 2
+    lines[reworded] = lines[reworded].replace(" employs ", " has ")
+    second, _ = sample_clusters("\n\n".join(lines), "g-357-44", "art.md", 5)
+    assert [c.start_line for c in second] == [c.start_line for c in first]
+    assert all(c.source_tokens for c in second), "the confirming run sees every fix"
+    added = ["Widget Industries 99 has 9900 people in 2024."] + lines
+    moved, _ = sample_clusters("\n\n".join(added), "g-357-44", "art.md", 5)
+    assert ([c.fact_lines[0].text for c in moved]
+            != [c.fact_lines[0].text for c in second]), "adding a claim moves the sample"
 
 
 def test_OUTCOME_1_reports_total_coverage_not_just_the_sampled_count(tmp_path):

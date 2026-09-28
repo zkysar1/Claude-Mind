@@ -1823,7 +1823,7 @@ def _slot_update_count(wm, slot):
         return 0
 
 
-def durable_write_text(tmp_path, text, encoding="utf-8"):
+def durable_write_text(tmp_path, text, encoding="utf-8", newline=None):
     """Write text to tmp_path and fsync BEFORE the caller's atomic rename.
 
     A bare write_text() + os.replace() survives a crash in metadata only:
@@ -1832,8 +1832,12 @@ def durable_write_text(tmp_path, text, encoding="utf-8"):
     charlie session d600a945 working-memory.yaml, 8140 null bytes after a
     60+ min autocompact hang — g-001-44). flush+fsync pins the data to disk
     before the rename can make it the live file.
+
+    newline is passed to open(). The default (None) translates every "\\n" to
+    os.linesep, so on Windows the whole file lands CRLF. A caller rewriting a
+    synced LF file passes newline="" to keep it LF (guard-7127).
     """
-    with open(tmp_path, "w", encoding=encoding) as f:
+    with open(tmp_path, "w", encoding=encoding, newline=newline) as f:
         f.write(text)
         f.flush()
         os.fsync(f.fileno())

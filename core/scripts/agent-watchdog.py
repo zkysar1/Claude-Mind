@@ -3482,13 +3482,22 @@ class ReleaseTrainProbe(Probe):
     reader re-measures is what fired.
 
     A FLEET-WIDE LEASE KEYED ON THE TAG. The condition lives on origin/main,
-    not on a box, so the signal names the stalled tag and no box: every
-    frontier reducer measures the same refs, the first to see the stall files,
-    and the world-queue dedup keeps the rest from re-filing. The board post
-    goes out only on an actual filing, so the fleet reads one post per stall,
-    not one per reducer. The lease is released (guard-3419) once the finding
-    clears — a newer tag, or nothing framework-relevant past this one — and a
-    lease on an OLDER tag is retired as soon as a newer tag is the one stalled.
+    not on a box, so the signal names the stalled tag and no box. The first
+    reducer to see the stall files, and the world-queue dedup keeps the rest
+    from re-filing. The board post goes out only on an actual filing, so the
+    fleet reads one post per stall, not one per reducer.
+
+    Each reducer reads its OWN refs, and the loop's fetch never brings tags, so
+    a box that did not cut the newest tag reads the previous one as newest.
+    Hence the discipline (g-115-11144):
+      - no DUE verdict counts until the basis is refreshed from origin
+        (_release_train.measure_with_basis);
+      - a lease is released (guard-3419) only once a NEWER tag this basis can
+        see has been cut — never the measured tag's lease, never a lease for a
+        tag the basis cannot see;
+      - a lease someone closed BY HAND holds re-filing of that tag fleet-wide
+        for release_train.skip_hold_hours, read from the goal store rather than
+        this box's latch, and the next lease quotes the closing note.
 
     FRONTIER ONLY, REDUCER ONLY. A deployment that is not the frontier does
     not cut releases, so the probe is inert there. It is registered for the
@@ -3525,18 +3534,21 @@ class ReleaseTrainProbe(Probe):
             self.last_reason = f"not this deployment's train (self_role={role!r})"
             return []
         cfg = rt.config()
-        m = rt.measure(self.ctx.project_root_path, rt.framework_paths())
+        m = rt.measure_with_basis(self.ctx.project_root_path, rt.framework_paths(),
+                                  cfg["stale_hours"])
         verdict = rt.decide(m, cfg["stale_hours"])
         self.last_reason = verdict["reason"]
         if m.get("error"):
-            return []  # unmeasured: file nothing, retire nothing
+            return []  # unmeasured, a failed basis refresh included: file nothing, retire nothing
         open_goals = rt.open_release_goals(_world, self.ctx.agent_dir)
+        superseded = rt.superseded_leases(open_goals, m.get("tags_merged") or [])
+        newer_cut = f"a newer tag, {m['newest_tag']}, has been cut since this goal was filed"
         payload = {
             "agent": self.ctx.agent_name,
             "newest_tag": m["newest_tag"], "tag_created": m["tag_created"],
             "tag_age_hours": m["tag_age_hours"], "commits_past": m["commits_past"],
             "commit_sample": m["commit_sample"],
-            "fetch_age_minutes": m["fetch_age_minutes"],
+            "fetch_age_minutes": m["fetch_age_minutes"], "tag_basis": m.get("tag_basis"),
             "stale_hours": cfg["stale_hours"], "reason": verdict["reason"],
             "open_goals": [g.get("id") for g in open_goals],
         }
@@ -3550,22 +3562,30 @@ class ReleaseTrainProbe(Probe):
                 self.fired = False
             self.consecutive_breach += 1
             payload["consecutive_breach"] = self.consecutive_breach
-            older = [g for g in open_goals if g.get("origin_signal") != signal]
-            if older:
-                payload["retired"] = self._retire_release_goals(
-                    older, f"a newer tag, {tag}, has been cut since this goal was filed")
+            if superseded:
+                payload["retired"] = self._retire_release_goals(superseded, newer_cut)
             # Same fired-latch re-validation as GitDriftProbe: a lease closed
             # without a cut while the gap persists must be re-fileable, or the
-            # detector has silently stopped detecting (guard-4870).
+            # detector has silently stopped detecting (guard-4870). The latch
+            # paces THIS box; the fleet-wide floor after a hand close is the
+            # skip hold, read from the goal store in _file_release_goal.
             revalidate = cfg.get("ticks_to_revalidate") or 0
             if self.consecutive_breach >= cfg["ticks_to_file"] and (
                     not self.fired
                     or (revalidate and self.consecutive_breach % revalidate == 0)):
-                goal = self._file_release_goal(m, cfg, open_goals)
-                if goal.get("filed") or goal.get("dedup"):
+                prior = rt.last_disposal(_world, self.ctx.agent_dir, signal)
+                goal = self._file_release_goal(m, cfg, open_goals, prior)
+                if goal.get("filed") or goal.get("dedup") or goal.get("held"):
                     self.fired = True
                     self.fired_tag = tag
                 payload["goal"] = goal
+                if goal.get("held"):
+                    self.last_reason = f"{verdict['reason']}; {goal['error']}"
+                    return [Event(
+                        probe=self.name, event="release_train_held", severity="info",
+                        payload=payload,
+                        summary=f"{self.name}: release train due but {goal['error']}",
+                    )]
                 if goal.get("filed"):
                     payload["board"] = self._post_board_alert(m, verdict, goal)
                 return [Event(
@@ -3576,8 +3596,8 @@ class ReleaseTrainProbe(Probe):
                 )]
             return []
 
-        cleared = (self._retire_release_goals(open_goals, verdict["reason"])
-                   if open_goals else {})
+        cleared = (self._retire_release_goals(superseded, f"{newer_cut}; {verdict['reason']}")
+                   if superseded else {})
         was_fired = self.fired
         self.consecutive_breach = 0
         self.fired = False
@@ -3594,8 +3614,15 @@ class ReleaseTrainProbe(Probe):
 
     # ---- escalation ------------------------------------------------------
 
-    def _file_release_goal(self, m: dict, cfg: dict, open_goals: list) -> dict:
-        """File the one fleet-wide Investigate goal for this tag. Fail-open."""
+    def _file_release_goal(self, m: dict, cfg: dict, open_goals: list,
+                           prior: Optional[dict] = None) -> dict:
+        """File the one fleet-wide Investigate goal for this tag. Fail-open.
+
+        `prior` is the latest lease for this tag someone closed by hand
+        (_release_train.last_disposal). Inside release_train.skip_hold_hours of
+        that close nothing is filed, whichever box asks. After it, the new lease
+        quotes the closing note so the next disposer starts from it.
+        """
         import _release_train as rt
         tag = m["newest_tag"]
         signal = rt.signal_for(tag)
@@ -3603,8 +3630,22 @@ class ReleaseTrainProbe(Probe):
         if existing:
             return {"filed": False, "dedup": True, "goal_id": existing[0],
                     "error": "open goal exists (dedup)"}
+        hold_hours = cfg.get("skip_hold_hours") or 0
+        until = rt.held_until(prior, hold_hours)
+        if until:
+            return {"filed": False, "held": True, "goal_id": prior.get("id"),
+                    "error": (f"held: {prior.get('id')} for {tag} was closed "
+                              f"{prior.get('status')} at {prior.get('completed_at')}, so no "
+                              f"reducer re-files it before {until} "
+                              f"(release_train.skip_hold_hours={hold_hours})")}
         try:
             sample = "; ".join(m["commit_sample"]) or "none listed"
+            prior_note = ""
+            if prior:
+                note = " ".join(str(prior.get("outcome_note") or "(no outcome_note)").split())
+                prior_note = (f"PRIOR DISPOSAL of {tag}: {prior.get('id')} was closed "
+                              f"{prior.get('status')} at {prior.get('completed_at')} with: "
+                              f"\"{note[:600]}\" - start from that reason. ")
             body = {
                 "title": (f"Investigate: release train stalled - {tag} is "
                           f"{m['tag_age_hours']}h old with {m['commits_past']} framework "
@@ -3620,24 +3661,32 @@ class ReleaseTrainProbe(Probe):
                     f"{tag}, created {m['tag_created']} ({m['tag_age_hours']}h before the "
                     f"measurement), and {m['commits_past']} non-merge commit(s) touching the "
                     f"promotion's framework paths have landed on origin/main since (newest "
-                    f"first: {sample}). Basis: local origin/main, fetched "
-                    f"{m['fetch_age_minutes']} min before the measurement. "
+                    f"first: {sample}). Basis: origin/main and the v* tags "
+                    f"({m.get('tag_basis') or 'local'}; last fetch {m['fetch_age_minutes']} "
+                    f"min before the measurement). {prior_note}"
                     f"core/config/conventions/promotion-runbook.md 'Who cuts, and WHEN' "
                     f"(g-373-82) makes a gap of >= {cfg['stale_hours']}h with commits past the "
                     f"newest tag a FINDING to dispose of rather than pass over - not an "
                     f"automatic cut. WHO: any frontier reducer; the runbook retires 'waiting "
                     f"for the human to cut a tag' as a reason. FIRST re-measure - the "
                     f"condition may have cleared since this was filed (guard-5308): "
-                    f"`git fetch origin main && bash core/scripts/release-train-check.sh`. "
+                    f"`bash core/scripts/release-train-check.sh`, which fetches origin/main AND "
+                    f"the v* tags before it measures. A bare `git fetch origin main` brings no "
+                    f"tags, so on a box that did not cut the newest tag it re-reads the "
+                    f"previous tag as newest (g-115-11144). "
                     f"THEN DISPOSE, one of: (a) CUT AND PROMOTE per the runbook - merge "
                     f"origin/main first (guard-5583), `bash core/scripts/release.sh patch "
                     f"--summary \"...\"`, push the ONE new tag by name (`git push origin main "
                     f"vX.Y.Z`, never --tags), then run the runbook's promotion phases; or "
                     f"(b) if what landed past {tag} should not ship yet, close this goal "
-                    f"`skipped` with the reason - the probe re-files every "
-                    f"{cfg['ticks_to_revalidate']} ticks while the gap persists. This goal is "
-                    f"a SNAPSHOT keyed on {tag}: the probe retires it once a newer tag is cut. "
-                    f"Auto-filed by ReleaseTrainProbe (g-115-11017)."
+                    f"`skipped` with the reason. "
+                    + (f"No reducer re-files {tag} for {hold_hours}h after that close, and "
+                       f"the next lease quotes your reason. " if hold_hours else
+                       f"The probe may re-file {tag} at its next re-validation, quoting your "
+                       f"reason. ")
+                    + f"This goal is a SNAPSHOT keyed on {tag}: the probe retires it once a "
+                    f"newer tag is cut. Auto-filed by ReleaseTrainProbe (g-115-11017; basis "
+                    f"and skip hold g-115-11144)."
                 ),
             }
             from _runtime_bash import BASH as _bash
@@ -3702,6 +3751,7 @@ class ReleaseTrainProbe(Probe):
         """
         closed, held = [], []
         try:
+            import _release_train as rt
             from _runtime_bash import BASH as _bash
             for g in goals:
                 gid = g.get("id")
@@ -3711,7 +3761,9 @@ class ReleaseTrainProbe(Probe):
                     held.append(f"{gid}:{g.get('status')}"
                                 f"{'/claimed' if g.get('claimed_by') else ''}")
                     continue
-                note = (f"agent-watchdog ReleaseTrainProbe re-measured the release train: "
+                # Opens with rt.PROBE_RETIRE_MARK: last_disposal() reads that
+                # prefix to tell this retirement from a hand disposal.
+                note = (f"{rt.PROBE_RETIRE_MARK}: "
                         f"{reason}. The stall this goal was filed for is over, so there is "
                         f"nothing left for it to dispose of. No release work was done FROM "
                         f"this goal - the condition resolved. The probe is retiring it as "
@@ -4811,7 +4863,9 @@ class PeerLivenessProbe(Probe):
         tick state -- MemoryHeadroomProbe's lesson: 1,696 emails in four days
         when the dedup was re-armed by every cross-box tick), keyed by the
         peer's frozen `last_active`, so one episode pages once per box and
-        re-pages only after REALERT_DEFAULT_SECONDS;
+        re-pages only after REALERT_DEFAULT_SECONDS -- and the first page AND
+        every re-page ask the fleet breadcrumb first, so the fleet sends one of
+        each per window, not one per live reducer (g-115-9520);
       - the email body's first 400 chars are deterministic per episode (frozen
         stamps only, detector identity at the END), so notify_dispatch's
         fleet-wide fingerprint gate collapses the same episode seen from several
@@ -4976,15 +5030,26 @@ class PeerLivenessProbe(Probe):
             # reads it within seconds) means only the FIRST reducer mails; the
             # rest record `peer_stall_paged_elsewhere` and arm their own
             # re-alert clock. Fail-open: an unreadable board pages anyway.
-            if new_episode and _peer_stall_breadcrumb_seen(episode):
+            # A RE-ALERT asks the same question, scoped to the window
+            # (): it passes --allow-duplicate below, which bypasses
+            # the only other fleet-level dedup, so without this every reducer
+            # that saw the episode re-paged on its own 6h clock -- 4 owner
+            # pages in 19 minutes for one episode, measured 2026-09-21.
+            if new_episode:
+                paged_elsewhere = _peer_stall_breadcrumb_seen(episode)
+            else:
+                paged_elsewhere = _peer_stall_breadcrumb_seen(episode, newer_than=now_ts - realert)
+            if paged_elsewhere:
+                why = "paged by another box" if new_episode else "re-alerted by another box inside the window"
                 state[agent] = {"since": since, "last_alert_ts": now_ts, "box": _box_id(),
-                                "notified": {"sent": False, "reason": "paged by another box"}}
+                                "notified": {"sent": False, "reason": why}}
                 changed = True
                 events.append(Event(
                     probe=self.name, event="peer_stall_paged_elsewhere", severity="info",
-                    payload={"agent": agent, "since": since, "episode": episode},
-                    summary=(f"peer-liveness: {agent} episode {episode} was already paged by "
-                             f"another box -- not mailing again from {_box_id()}"),
+                    payload={"agent": agent, "since": since, "episode": episode,
+                             "new_episode": new_episode},
+                    summary=(f"peer-liveness: {agent} episode {episode} was already {why} "
+                             f"-- not mailing again from {_box_id()}"),
                 ))
                 continue
             subject, body = _peer_stall_message(peer, report, self.ctx.agent_name)
@@ -4993,7 +5058,10 @@ class PeerLivenessProbe(Probe):
             result = _notify_decision_needed(subject, body, allow_duplicate=allow)
             if result.get("sent"):
                 _peer_stall_breadcrumb_post(agent, episode, subject)
-            state[agent] = {"since": since, "last_alert_ts": now_ts, "box": _box_id(),
+            # Stamped AFTER the post, not at now_ts: this box's own breadcrumb
+            # must predate its own clock, or its next re-alert window would
+            # count that post as another box's page and suppress itself.
+            state[agent] = {"since": since, "last_alert_ts": time.time(), "box": _box_id(),
                             "notified": result}
             changed = True
             events.append(Event(
@@ -5028,7 +5096,7 @@ def _peer_stall_episode_key(agent: str, since: str) -> str:
     return f"peer-stall-{agent}-{stamp}"
 
 
-def _peer_stall_breadcrumb_seen(episode: str) -> bool:
+def _peer_stall_breadcrumb_seen(episode: str, newer_than: Optional[float] = None) -> bool:
     """True when ANY box already posted the breadcrumb for this episode.
 
     Reads the coordination board through board-read.sh (daemon-backed, so a
@@ -5036,6 +5104,11 @@ def _peer_stall_breadcrumb_seen(episode: str) -> bool:
     unless AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST is set, like the mail path.
     FAIL-OPEN TOWARD PAGING: any error reads as "not seen" -- a duplicate mail
     is cheaper than a stalled agent nobody hears about.
+
+    `newer_than` (epoch seconds) is the re-alert question (g-115-9520): only a
+    breadcrumb stamped AFTER that instant counts. Board stamps are naive UTC,
+    the fleet's one wall clock; a line whose stamp does not parse is skipped,
+    which reads as "not seen" -- the same fail-open direction.
     """
     if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get(
             "AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST"):
@@ -5050,7 +5123,24 @@ def _peer_stall_breadcrumb_seen(episode: str) -> bool:
                      "--since", "48h", "--json"),
             capture_output=True, text=True, timeout=60,
         )
-        return proc.returncode == 0 and episode in (proc.stdout or "")
+        if proc.returncode != 0:
+            return False
+        if newer_than is None:
+            return episode in (proc.stdout or "")
+        for line in (proc.stdout or "").splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                post = json.loads(line)
+                stamp = datetime.fromisoformat(str(post.get("timestamp")))
+            except (ValueError, TypeError):
+                continue
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if episode in (post.get("tags") or []) and stamp.timestamp() > newer_than:
+                return True
+        return False
     except Exception:  # noqa: BLE001 -- fail-open toward paging
         return False
 

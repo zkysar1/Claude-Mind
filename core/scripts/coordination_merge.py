@@ -63,6 +63,10 @@ from _board_paths import live_name, segment_parent
 # the writer, the readers and this merger all take "is this a segment, and of
 # what" from _retrieval_trace. Stdlib-only, so safe at module level like above.
 from _retrieval_trace import segment_parent as _retrieval_trace_parent
+# An aspiration's DERIVED progress is re-derived with the writer's own body
+# (), never a third transcription. _goal_census imports nothing at all,
+# so it is safe at module level like the two above.
+from _goal_census import derive_progress as _derive_progress
 
 # Ring-buffer ceiling for team-state.recent_completions. Kept in sync with
 # core/scripts/team-state.py MAX_RECENT_COMPLETIONS (not imported — that module
@@ -1648,6 +1652,10 @@ def _merge_aspiration_record(a: dict, b: dict) -> dict:
       - goals             : union by goal id (_merge_goal on same-id clashes),
         minus both sides' evicted_ids (resurrection tombstone)
       - selection_count / sessions_active : numeric MAX (monotonic)
+      - progress          : DERIVED, so never taken from a side. It is re-derived
+        from the merged record with _goal_census.derive_progress, the body
+        aspirations.recompute_progress writes, and only when a side carried one
+        (g-306-532)
       - key order         : canonicalized when the sides' key sequences
         diverged (_commutative_key_order, g-115-2355 full-tie corner)
     Goals sorted by identity for the byte-identical result commutativity needs."""
@@ -1705,6 +1713,17 @@ def _merge_aspiration_record(a: dict, b: dict) -> dict:
                 if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if nums:
             out[f] = max(nums)
+    # progress is DERIVED: every writer recomputes it from goals + archived_census
+    # + initial_goal_count. The goals above are unioned from BOTH sides, but
+    # progress rode the base pick (newer last_selected, or the content tiebreak
+    # on a tie), so it could describe goals the merged record no longer has.
+    # Replaying fcefb5bed8's inputs, a clean merge landed 's stale 375
+    # beside goals that derive 377. Re-derive it from the merged record (rb-3399:
+    # union by id, then RECOMPUTE, never choose a side). The result is commutative
+    # because every input is already merged commutatively. A merge is not a
+    # writer, so a record with no progress on either side gains none.
+    if "progress" in out:
+        out["progress"] = _derive_progress(out)
     return _commutative_key_order(a, b, out)
 
 

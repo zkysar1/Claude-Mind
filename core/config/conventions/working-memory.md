@@ -255,6 +255,47 @@ prior session are available during boot.
 
 ---
 
+## Cross-Box Fork: Adopting the Store Over a Diverged Mirror (CW1a-adopt, g-306-494)
+
+`/start` CW1a refreshes the agent-wide WM mirror before a cross-box worker forks it.
+Under own-cloud the pull is conflict-guarded: a local copy that differs from its
+manifest baseline is skipped as `local_ahead`, with exit 0 and `pulled=0`, and the
+mirror stays stale. CW1a used to call that "the safer failure" and forked the stale
+copy. Its command now folds `local_ahead>0` into `CW1A_FRESH_RC=3`, which routes here.
+Measured shapes:
+- 2026-09-17 cc-09: local 5.8 MB != baseline != store 13.5 MB, with the store moving under a live reducer.
+- 2026-09-28 cc-08: local 2,023,198 B (md5 8c8e57c1) != baseline 08ae6a83 (the poisoned baseline cc-09 and cc-13 also carry) != store 12,417,711 B (292fecee). The old command printed rc=0 there; the new one prints 3.
+
+`local != baseline` alone does not prove the store is the side to keep (header of
+`owncloud-pull.sh --adopt-store`). So classify first:
+
+```bash
+bash core/scripts/backend-cat.sh head agents/<agent>/session/working-memory.yaml
+py -3 -c "import sys; sys.path.insert(0,'core/scripts'); import owncloud_sync as o; print('baseline_md5=%s' % o._manifest_entry(o._load_manifest().get('agents/<agent>/session/working-memory.yaml'))[1])"
+```
+
+THREE-WAY means BOTH of these hold:
+- local md5 != `baseline_md5`;
+- the store md5 != `baseline_md5`. The store md5 is `version`, or the plaintext md5 `head` names for an encoded object.
+
+ONLY that shape proceeds. Everything else HALTS:
+- Store == baseline: the local writes are genuinely unpushed, and adopting would destroy them.
+- `n/a`, `None`, or a failed call: the shape is unproven.
+
+On THREE-WAY, in order:
+
+1. **Archive first. Copy, never move** (`archive-before-delete.md`).
+   - Make `agents/<agent>/temp/wm-pre-adopt-<YYYY-MM-DD>-<hostname>/`.
+   - Write `RECEIPT.md` in it BEFORE copying. It is the sentinel temp-drain-purge honours; without it the dir is deleted within ~120 min.
+   - `cp -p` the WM in. Verify the copy's md5 AND size equal the original's.
+   - Complete the receipt: both md5s, the size, the store version, `baseline_md5`, and restore steps. Record that it must never be restored into `session/` while a reducer is live.
+2. `bash core/scripts/owncloud-pull.sh --agent <agent> --only working-memory.yaml --adopt-store working-memory.yaml`. Expect `pulled=1`.
+3. Re-run the `backend-cat.sh head` call. It must read `[match]`; anything else HALTS. Then continue to CW1b.
+
+The pull's own `.history` snapshot does not replace step 1: it is fail-open and cap-pruned.
+
+---
+
 ## Array Slot Schemas
 
 ### knowledge_debt items

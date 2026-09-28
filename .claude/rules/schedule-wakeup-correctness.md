@@ -79,52 +79,27 @@ reports a background job's exit (loop-terminal-protocol.md §4.2).
 
 ## Sanctioned Exception: the deadman's-switch terminal-pair
 
-The silent-loop-death failure mode (a turn that ends on trailing TEXT instead
-of the terminal `Skill(aspirations)` call → no Stop event fires → the loop
-dies for hours; 2026-06-21: 5 of 6 agents dead 1.5–4h) cannot be fixed by the
-Stop hook alone — Claude Code does not reliably emit the Stop event on a
-text-only turn-end (rb-629/guard-454). The deadman's-switch closes that gap
-intrinsically: the agent arms its own resurrection.
-
-The mechanism is the **terminal-pair**. By default (Stage 5 onward,
-2026-06-23) — unless the per-agent opt-out flag
-`agents/<agent>/session/deadman-disabled` is present — the iteration's
-terminal response emits TWO batched tool calls, in this exact order:
+By default (Stage 5 onward), the iteration's terminal response emits TWO
+batched tool calls:
 
 ```
 1. ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600, noop=false, reason="deadman resurrection net")
 2. Skill(aspirations) with args='loop'
 ```
 
-Not a violation of Anti-pattern C: `Skill(aspirations)` REMAINS the primary
-re-entry — the LAST call, continuing the loop synchronously. The wakeup is a
-single replace-slot net (each iteration's re-arm REPLACES the prior) that never
-fires on a healthy loop, only when the Skill chain breaks — the legitimate
-"signal the harness cannot track" use, not state-machine advancement. The gate
-passes the sentinel while RUNNING; guard-511 carries the carve-out. Platform
-facts and the fail-safe property (worst case a SLOW loop, never a dead one):
-`core/config/conventions/loop-terminal-protocol.md` §4; design rationale:
+Not Anti-pattern C: `Skill(aspirations)` remains the primary re-entry; the
+wakeup fires only when the Skill chain breaks. Opt-out:
+`agents/<agent>/session/deadman-disabled`. Detail:
 `core/config/rationale/deadman-switch.md`.
 
-### Re-arm FIRST on resurrection — and on autocompact resume (rb-4345 / g-115-2771 / g-115-5834)
-
-FIRING the net consumes it, so a resurrected turn begins with **no net armed**;
-and an autocompact resume that re-enters the loop body MID-iteration reaches no
-terminal pair at all, so it runs under whatever net already existed — none, if
-the compaction landed before any close. The trigger is "no terminal pair has
-been emitted", not "the net fired". Both have killed loops for hours (2026-07-19
-cc-04 ~7h; 2026-08-11 cc-05 7h47m — a pending net is NOT excluded:
-clamp≠delivery, g-115-6629).
+### Re-arm FIRST on resurrection and on autocompact resume
 
 **RULE:** on a `<<autonomous-loop-dynamic>>` wakeup firing, **or on an autocompact
 resume that re-enters the loop body mid-iteration**, that turn's FIRST tool call
-MUST be a `ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>", delaySeconds=600, noop=false, reason="deadman resurrection net")`
-re-arm — restoring the net BEFORE any loop-entry work that could fail — THEN
-proceed to Phase -1.5. This is a one-shot net-restoration at the START of the
-turn, NOT the "arm early" mechanic F2 rejected; the close's terminal-pair re-arm
-simply REPLACES it (double-arm is harmless). The gate approves it only while
-RUNNING: a net OUTLIVES its loop, so an IDLE agent re-arming one is a turn with
-no exit (2026-09-21). See `core/config/rationale/deadman-switch.md`.
+MUST be the sentinel re-arm — restoring the net BEFORE any loop-entry work that
+could fail — THEN proceed to Phase -1.5. The gate approves it only while
+RUNNING. Incident traces (rb-4345 / g-115-2771 / g-115-5834):
+`core/config/rationale/deadman-switch.md`.
 
 ### D. Using ScheduleWakeup for EXTERNAL polling the harness already tracks
 
@@ -135,22 +110,16 @@ C above) NOR to poll background Bash the harness auto-notifies on
 
 ### E. Cancelling the deadman net on a LIVE loop
 
-`ScheduleWakeup(stop: true)` while RUNNING deletes the single replace-slot
-wakeup that is the loop's ONLY resurrection path — converting a recoverable
-text-death into a hard stop that needs a human to notice (measured 2026-08-25:
-four faults compounded, and this was the one that made the other three
-unrecoverable). **Pausing is not stopping.** Low on context, blocked, waiting on
-a background run? RE-ARM the sentinel and end on your normal terminal call. The
-genuine stop is the user's `/stop`, which writes `stop-requested` FIRST — that
-signal, not a flag, is what tells the gate a cancel is legitimate.
+`ScheduleWakeup(stop: true)` while RUNNING deletes the loop's ONLY resurrection
+path. **Pausing is not stopping.** RE-ARM the sentinel and end on your normal
+terminal call. The genuine stop is the user's `/stop`, which writes
+`stop-requested` FIRST — that signal is what tells the gate a cancel is
+legitimate.
 
 ## Enforcement
 
-| Layer | Mechanism | What it catches |
-|-------|-----------|-----------------|
-| **A** — gate | `core/scripts/schedule-wakeup-gate.{py,sh}` (PreToolUse[ScheduleWakeup]) refuses (i) slash-prefix prompts other than `/loop`, (ii) `stop: true` while agent-state is RUNNING with no `stop-requested`, (iii) the sentinel while agent-state is NOT RUNNING, (iv) an arm without `noop` (g-115-10755). Fail-open by contract. Tests: `tests/test_schedule_wakeup_gate.py`. | The wrong prompt (A-D), the net-cancel (E), a net over no loop, and a harness-refused net, at write time. Denies name the correct action. |
-| **B** — rule (this file) | Behavioral guidance read on demand | Documents the correct patterns for human and LLM authors. |
-| **C** — detective | `core/scripts/aspirations-rejection-audit.py` scans recent transcripts for the rejection message + the originating ScheduleWakeup call. Predicate is shared with the gate via `core/scripts/_swakeup_predicate.py` (single source of truth). | Catches drift if the gate is bypassed (hook timeout, fail-open path). Reports only; `--exit-on-hits` makes it file Investigate goals. |
+Three layers (gate, rule, detective). Full table:
+`core/config/conventions/loop-terminal-protocol.md` § "ScheduleWakeup enforcement layers".
 
 ## Cross-references
 

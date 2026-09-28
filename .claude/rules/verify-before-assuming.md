@@ -81,30 +81,17 @@ An Edit/Write "succeeded" is not evidence the content is on disk NOW.
    file's contents. Re-read or re-grep before restating or building on it.
 3. **Summaries are claim snapshots, not filesystem snapshots**: a
    post-autocompact summary describes what the prior session INTENDED to
-   write. Treat every carried-forward "X is at line Y, verified intact" as a
-   hypothesis requiring fresh evidence. (Canonical incident 2026-04-20: a
-   "verified intact" step was absent post-compaction; re-insert, then re-grep.)
+   write. Treat every carried-forward claim as a hypothesis requiring fresh
+   evidence.
 
 ## Causal Attribution Claims
 
-Claims about WHY existing state is the way it is are the third class. **Rule**:
-causal language — "because", "due to", "as a result of", "in response to",
-"compensating for", "caused by" — must rest on directly observed cause→effect
-evidence (git log, telemetry, dated audit trail, the agent's own first-person
-record). If the link is inferred from correlation, use a neutral form instead:
-
-- "observed: X. plausible mechanism: Y (inferred, not verified)"
-- "observed: X (per <audit-trail or commit reference>). therefore: Y"
-- "X exists; how it got that way is not recorded"
-
-Same-turn evidence, or no causal connector, on every surface the convention
-lists (rb-734).
-
-**Place the hedge where it survives, and scope the work to the measured half.**
-Put the uncertainty in a goal's TITLE and in a guardrail `rule`'s FIRST clause: a
-survey shows only that head, so mid-field it reads as certainty (guard-1421 —
-measured, in the convention). Then scope the deliverable to whichever half is
-MEASURED — it must stay correct if the inferred mechanism is falsified.
+**Rule**: causal language ("because", "due to", "caused by") must rest on
+directly observed cause-effect evidence. If inferred from correlation, use
+"observed: X. plausible mechanism: Y (inferred, not verified)". Place the
+hedge in the goal TITLE and guardrail rule's FIRST clause (guard-1421).
+Detail and neutral-form templates: `core/config/conventions/negative-conclusions.md`
+(rb-734).
 
 ## Capability-Absence Claims ("Y Needs To Be Built")
 
@@ -118,29 +105,15 @@ the surface list) — and only when 2+ independent surfaces come back empty is
 
 ## Anti-patterns
 
-- One failed curl = "it's down"; `curl -sf` returns empty = "service not
-  running" (silent 404 ≠ connection refused); SSH refused = "server is down"
-  (could be a stale host key); ping exit 0 / "0% loss" = "host is up" — a
-  third host's "unreachable" reply COUNTS as received (0% loss for a dead
-  box); require `Reply from <TARGET>: bytes=` (guard-4902)
-- "I tried and it didn't work" without trying an alternative approach
-- "98% of records have X=0" without probing whether X is the correct field
-  name (rb-245)
-- "X is the way it is because Y caused it" without checking whether Y
-  actually caused X (rb-734)
-- One tree search = "it's not built" / "we need to build X" — run the
-  Capability-Absence search above
-- Trusting a task notification's exit 0 without reading the log (guard-1431,
-  guard-1341, guard-1150, guard-1096)
+- One failed curl = "it's down"; `curl -sf` empty = "not running" (silent
+  404 ≠ connection refused); ping "0% loss" = "up" (guard-4902 — require
+  `Reply from <TARGET>: bytes=`)
+- "98% of records have X=0" without probing the field name (rb-245)
+- "X because Y" without checking Y actually caused X (rb-734)
+- One tree search = "not built" — run the Capability-Absence search above
+- Trusting exit 0 without reading the log (guard-1431, guard-1096)
 
-**Detail:** `core/config/conventions/negative-conclusions.md` — enforcement
-points, verification tiers, silent-failure catalog, and the moved sections
-above (parser shapes, task exit codes, statistical negations at
-blocker-creation, positive file-state, post-insertion, causal attribution,
-capability-absence).
-
-**Knowledge-specific:** `core/config/conventions/exhaustive-search-before-negation.md`
-for the exhaustive knowledge search protocol before concluding something doesn't exist.
-
-**Statistical-specific:** `core/config/conventions/negative-conclusions.md`
-"Statistical / audit negations" section for the schema-probe-first protocol.
+**Detail:** `core/config/conventions/negative-conclusions.md` — enforcement,
+verification tiers, silent-failure catalog, all moved sections.
+**Knowledge-specific:** `exhaustive-search-before-negation.md`.
+**Statistical-specific:** `negative-conclusions.md` § "Statistical / audit negations".

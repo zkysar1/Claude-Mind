@@ -52,6 +52,8 @@ import argparse
 import importlib.util
 import json
 import os
+import re
+import socket
 import statistics
 import sys
 from datetime import datetime
@@ -170,6 +172,30 @@ def _enumerate_all_bodies(sessions_root: Path, backend) -> list:
                 manifest = {}
         out.append((unit_key, manifest))
     return out
+
+
+def _read_body_slots(backend, sessions_root: Path, unit_key: str) -> tuple:
+    """(slots_dict_or_None, unreadable) for one Body's WM.
+
+    Shared by fast_lane and census so `sources_unreadable` means the same thing
+    in both: a transient read error, a YAML error or a non-dict WM is
+    UNREADABLE; an absent WM, or one without a dict `slots`, offers nothing and
+    is not a failed read.
+    """
+    raw, transient = bmg._read_staged_bytes(
+        backend, sessions_root / unit_key / bm._WM_FILENAME)
+    if transient:
+        return None, True
+    if raw is None:
+        return None, False
+    try:
+        body_wm = yaml.safe_load(raw) or {}
+    except yaml.YAMLError:
+        return None, True
+    if not isinstance(body_wm, dict):
+        return None, True
+    body_slots = body_wm.get("slots")
+    return (body_slots if isinstance(body_slots, dict) else None), False
 
 
 def _flagged(entries) -> list:
@@ -420,23 +446,11 @@ def fast_lane(agent: str, project_root: Path | None = None,
     for unit_key, manifest in _enumerate_all_bodies(sessions_root, backend):
         summary["bodies_scanned"] += 1
         seen_bodies.add(unit_key)
-        body_wm_bytes, transient = bmg._read_staged_bytes(
-            backend, sessions_root / unit_key / bm._WM_FILENAME)
-        if transient:
+        body_slots, bad = _read_body_slots(backend, sessions_root, unit_key)
+        if bad:
             unreadable += 1
             continue
-        if body_wm_bytes is None:
-            continue
-        try:
-            body_wm = yaml.safe_load(body_wm_bytes) or {}
-        except yaml.YAMLError:
-            unreadable += 1
-            continue
-        if not isinstance(body_wm, dict):
-            unreadable += 1
-            continue
-        body_slots = body_wm.get("slots")
-        if not isinstance(body_slots, dict):
+        if body_slots is None:
             continue
 
         # The sessions/ WM is the FULLER record — it holds every entry, flagged
@@ -661,6 +675,376 @@ def format_line(summary: dict) -> str:
             + _ratio_fragment(summary) + _ring_fragment(summary))
 
 
+# --------------------------------------------------------------------------
+# READ-ONLY CENSUS of the consumed rings (, gap-222)
+# --------------------------------------------------------------------------
+# Hand-rolled five times (importlib _content_hash + wm-read dumps + an ad-hoc
+# set join) before it lived here. A SEPARATE path, never fast_lane(dry_run=True):
+# a report flag on a writer skips the writer's guards (guard-3342), and the dry
+# run reports the ring AFTER a hypothetical pass, not the ring that is stored.
+# Nothing below writes.
+#
+# Why not the consumed/never-consumed split alone (guard-7413): since
+#  every live entry a readable source offers is recorded on each
+# pass, so that split measures SOURCE RETENTION, not arrivals or backlog. What
+# can show re-delivery is the ring against the OFFERED population, offered
+# hashes the ring lacks, the two bounds, sources_unreadable — and, because ring
+# membership means delivered ONCE rather than processed (gap-222's 5th
+# encounter), live source goal ids joined against the goals a prior spark
+# replay filed from them.
+#
+# Every input is read STORE-FIRST, the agent-wide WM included. fast_lane reads
+# that WM locally because it runs only on the reducer, whose local file is the
+# write-through copy; the census runs on any box, and off the reducer's box the
+# local file is a stale mirror (guard-980, guard-5930). Measured on cc-09
+# 2026-09-28: local 13,490,143 B written 09-24 against a 12,528,343 B store copy.
+_RELAY_SOURCE_RE = re.compile(r"spark_capture from (g-\d+(?:-\d+)+)")
+
+
+def _last_pass(state_dir: Path, backend):
+    """The newest fast-lane telemetry row, or None. A pass that changed nothing
+    writes no row, so this is the last pass that MOVED something."""
+    raw, _ = bmg._read_staged_bytes(backend, state_dir / TELEMETRY_FILENAME)
+    if raw is None:
+        return None
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            return {k: row.get(k) for k in
+                    ("ts", "merged", "sources_unreadable", "consumed_ring")}
+    return None
+
+
+def _relay_join(relay_goals: list, live: list, slot: str, as_of=None) -> dict:
+    """Join live source goal ids against goals a spark replay filed from them.
+
+    The replay drains EVERY entry of its batch's goal ids after filing, so a
+    live entry of a relayed goal arrived after that drain. One whose
+    `_item_ts` predates the relay was captured before it: re-delivered (the
+    restore signal aspirations-spark names), or a capture that reached the
+    reducer late. `_item_ts` is the capture time, not the arrival, so the
+    count bounds re-delivery from above. Entries stamped after the relay are
+    new captures. The corpus is whatever the caller's query returned; archived
+    goals are not in it (guard-7302), so a source with no relay here is
+    unproven, not clean.
+
+    `as_of` is when the WM was last written. A relay filed after that drained
+    nothing in it, so it is set aside: without this, a stale WM copy reads
+    every later relay's batch as re-delivered (measured on a worker box's local
+    mirror, 3.9 days old).
+    """
+    relays: dict = {}
+    marked = 0
+    later = 0
+    for g in relay_goals:
+        if not isinstance(g, dict):
+            continue
+        sources = set(_RELAY_SOURCE_RE.findall(g.get("description") or ""))
+        if not sources:
+            continue
+        marked += 1
+        created = g.get("created_at")
+        if as_of and isinstance(created, str) and created[:19] >= as_of:
+            later += 1
+            continue
+        for src in sources:
+            relays.setdefault(src, []).append(g)
+    by_source: dict = {}
+    for e in live:
+        if e.get("goal_id"):
+            by_source.setdefault(e["goal_id"], []).append(e.get("_item_ts"))
+    rows = []
+    for gid in sorted(by_source):
+        rel = relays.get(gid)
+        if not rel:
+            continue
+        stamps = sorted(r["created_at"][:19] for r in rel
+                        if isinstance(r.get("created_at"), str))
+        first = stamps[0] if stamps else None
+        tss = by_source[gid]
+        rows.append({
+            "source_goal": gid,
+            "live_entries": len(tss),
+            "predating_relay": sum(1 for t in tss if isinstance(t, str)
+                                   and first and t[:19] < first),
+            "undated": sum(1 for t in tss if not isinstance(t, str)),
+            "first_relay_at": first,
+            "relay_goals": sorted({str(r.get("id") or r.get("goal_id"))
+                                   for r in rel}),
+        })
+    return {
+        "slot": slot,
+        "relay_goals_read": len(relay_goals),
+        "relay_marked": marked,
+        "relays_after_wm": later,
+        "live_sources": len(by_source),
+        "sources_with_relay": len(rows),
+        "live_entries_predating_relay": sum(r["predating_relay"] for r in rows),
+        "rows": rows,
+    }
+
+
+def census(agent: str, project_root: Path | None = None, goal_ids=None,
+           relay_goals=None, relay_slot: str = "spark_capture") -> dict:
+    """Read-only census of the capture lanes against their consumed rings.
+
+    Reads the sources fast_lane reads, store-first, and writes nothing, so it
+    runs on any box. The report names which copy of the agent-wide WM it read
+    and when that copy was written.
+    """
+    pr = project_root or bmg._project_root()
+    adir = bm._agent_dir(pr, agent)  # validates the agent name
+    state_dir = adir / bm._STATE_DIRNAME
+    sessions_root = adir / bm._SESSIONS_DIRNAME
+    reducer_wm_path = state_dir / bm._WM_FILENAME
+    backend = bmg._get_backend()
+
+    raw, wm_source = None, None
+    if backend is not None:
+        try:
+            raw = backend.read_authoritative_bytes(reducer_wm_path.resolve())
+            wm_source = "store"
+        except FileNotFoundError:
+            pass
+        except Exception:  # noqa: BLE001 — store unreadable: read local, say so
+            wm_source = "local mirror (store unreadable)"
+    if raw is None:
+        try:
+            raw = reducer_wm_path.read_bytes()
+            wm_source = wm_source or "local (not in the store)"
+        except OSError:
+            wm_source = None
+    written = None
+    try:
+        if wm_source == "store" and hasattr(backend, "head_last_modified"):
+            written = backend.head_last_modified(reducer_wm_path.resolve())
+        elif raw is not None:  # a local backend's store IS the local file
+            written = reducer_wm_path.stat().st_mtime
+    except Exception:  # noqa: BLE001 — unknown only disables the relay filter
+        written = None
+
+    report = {
+        "agent": agent,
+        "ts": _now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "hostname": socket.gethostname(),
+        "worker_body": is_worker_body(agent, pr),
+        "reducer_wm_present": raw is not None,
+        "wm_source": wm_source,
+        "wm_as_of": (datetime.fromtimestamp(written).strftime("%Y-%m-%dT%H:%M:%S")
+                     if written else None),
+        "cap": CONSUMED_HASHES_CAP,
+        "ceiling": CONSUMED_HASHES_CEILING,
+    }
+    reducer_wm = yaml.safe_load(raw) if raw else None
+    slots = reducer_wm.get("slots") if isinstance(reducer_wm, dict) else None
+    if not isinstance(slots, dict):
+        slots = {}
+    rings = slots.get(CONSUMED_HASHES_SLOT)
+    if not isinstance(rings, dict):
+        rings = {}
+
+    offered = {s: {} for s in CAPTURE_SLOTS}  # {slot: {hash: goal_id}}
+
+    def _offer(by_slot) -> None:
+        for s in CAPTURE_SLOTS:
+            for e in _flagged(by_slot.get(s)):
+                offered[s][bmg._content_hash(e)] = e.get("goal_id")
+
+    unreadable = 0
+    seen: set = set()
+    for unit_key, _manifest in _enumerate_all_bodies(sessions_root, backend):
+        seen.add(unit_key)
+        body_slots, bad = _read_body_slots(backend, sessions_root, unit_key)
+        if bad:
+            unreadable += 1
+        elif body_slots is not None:
+            _offer(body_slots)
+    skips: list = []
+    carriers = bcc.read_carriers(state_dir, backend, skipped=skips)
+    unreadable += len(skips)
+    carrier_only = 0
+    for unit_key, by_slot in carriers.items():
+        if unit_key not in seen:
+            carrier_only += 1
+            seen.add(unit_key)
+        if isinstance(by_slot, dict):
+            _offer(by_slot)
+    report.update(bodies_scanned=len(seen), carrier_only_bodies=carrier_only,
+                  sources_unreadable=unreadable)
+
+    wanted = [g for g in (goal_ids or []) if g]
+    located = {g: {} for g in wanted}
+    lanes = {}
+    live_by_slot = {}
+    for s in CAPTURE_SLOTS:
+        ring = rings.get(s)
+        ring = ring if isinstance(ring, list) else []
+        pos: dict = {}
+        for i, h in enumerate(ring):
+            pos.setdefault(h, i)
+        live = slots.get(s)
+        live = ([e for e in live if isinstance(e, dict)]
+                if isinstance(live, list) else [])
+        live_by_slot[s] = live
+        live_h = [bmg._content_hash(e) for e in live]
+        off = offered[s]
+        for g in wanted:
+            positions = [pos.get(h) for e, h in zip(live, live_h)
+                         if e.get("goal_id") == g]
+            hs = [h for h, og in off.items() if og == g]
+            if positions or hs:
+                located[g][s] = {"live": len(positions),
+                                 "live_ring_positions": positions,
+                                 "offered": len(hs),
+                                 "offered_in_ring": sum(1 for h in hs if h in pos)}
+        if not (ring or live or off):
+            continue
+        live_set = set(live_h)
+        missing = [h for h in off if h not in pos]
+        tail = sum(1 for h in pos if h not in off)
+        saturated = len(ring) >= CONSUMED_HASHES_CEILING
+        tail_at_cap = tail >= CONSUMED_HASHES_CAP
+        # guard-6824: a ring of EXACTLY CAP is the pre- FIFO shape —
+        # a WM written before the fix, or by a box still running pre-fix code
+        at_cap = len(ring) == CONSUMED_HASHES_CAP
+        consumed = sum(1 for h in live_h if h in pos)
+        lanes[s] = {
+            "live": len(live),
+            "ring": len(ring),
+            "offered": len(off),
+            "offered_in_ring": len(off) - len(missing),
+            # offered, unrecorded, still live: the next pass records these
+            "offered_missing_live": sum(1 for h in missing if h in live_set),
+            # offered, unrecorded, NOT live: the next pass MERGES these — new
+            # arrivals, or drained entries coming back
+            "offered_missing_absent": sum(1 for h in missing if h not in live_set),
+            "ring_not_offered": tail,
+            "saturated": saturated,
+            "tail_at_cap": tail_at_cap,
+            "at_cap": at_cap,
+            "live_consumed": consumed,
+            "live_never_consumed": len(live) - consumed,
+            # An evicting ring forgets consumed hashes, so never-consumed
+            # over-counts (guard-6824): at the ceiling offered hashes go, at
+            # CAP the non-offered tail is FIFO-trimmed, and a ring of exactly
+            # CAP is the pre-fix FIFO.
+            "never_consumed_upper_bound": saturated or tail_at_cap or at_cap,
+            # guard-2298: a zero is only evidence beside a proven non-zero
+            "positive_control": next(
+                ({"goal_id": e.get("goal_id"), "hash": h[:12],
+                  "ring_position": pos[h]}
+                 for e, h in zip(live, live_h) if h in pos), None),
+        }
+    report["lanes"] = lanes
+    if wanted:
+        report["goal_ids"] = located
+    if relay_goals is not None:
+        report["relay"] = _relay_join(relay_goals, live_by_slot.get(relay_slot, []),
+                                      relay_slot, report["wm_as_of"])
+    report["last_pass"] = _last_pass(state_dir, backend)
+    return report
+
+
+def format_census(report: dict) -> str:
+    """Multi-line form of census(); every count sits beside its population."""
+    out = []
+    role = "worker Body" if report.get("worker_body") else "not a worker Body"
+    out.append(f"[capture-ring-census] agent={report['agent']} "
+               f"host={report['hostname']} ({role}) at {report['ts']}; "
+               f"agent-wide WM read from {report.get('wm_source')}, written "
+               f"{report.get('wm_as_of')}")
+    if (report.get("wm_source") or "").startswith("local mirror"):
+        out.append("[capture-ring-census] the store copy could not be read, so "
+                   "every count below is from this box's local mirror, which "
+                   "off the reducer's box can be days stale (guard-980)")
+    if not report.get("reducer_wm_present"):
+        out.append("[capture-ring-census] UNMEASURABLE — no agent-wide working "
+                   "memory at the expected path; every ring and live count "
+                   "below is read from an absent file.")
+    unread = report.get("sources_unreadable") or 0
+    out.append(f"sources: {report.get('bodies_scanned', 0)} Body(s) scanned "
+               f"({report.get('carrier_only_bodies', 0)} via carrier only), "
+               f"sources_unreadable={unread}"
+               + (" — a pass with an unreadable source trims no ring below the "
+                  "ceiling" if unread else ""))
+    for s, r in sorted((report.get("lanes") or {}).items()):
+        flags = []
+        if r["saturated"]:
+            flags.append(f"SATURATED at ceiling {report['ceiling']}: offered "
+                         "hashes are evicted, drained captures come back")
+        if r["tail_at_cap"]:
+            flags.append(f"SATURATED tail: non-offered hashes at CAP "
+                         f"{report['cap']}, FIFO-trimming")
+        elif r["at_cap"]:
+            flags.append(f"SATURATED at CAP {report['cap']}: the ring is exactly "
+                         "CAP, the pre-g-115-10776 FIFO shape (guard-6824)")
+        out.append(f"{s}: ring {r['ring']} vs offered {r['offered']} "
+                   f"(ceiling {report['ceiling']}) | offered in ring "
+                   f"{r['offered_in_ring']}, recorded next pass "
+                   f"{r['offered_missing_live']}, NOT in ring and not live "
+                   f"{r['offered_missing_absent']} (the next pass merges these: "
+                   f"new or re-delivered) | ring-not-offered "
+                   f"{r['ring_not_offered']} (cap {report['cap']})"
+                   + (" | " + "; ".join(flags) if flags else ""))
+        nc = r["live_never_consumed"]
+        nc_s = (f"at most {nc} (UPPER BOUND: the ring is evicting)"
+                if r["never_consumed_upper_bound"] else str(nc))
+        out.append(f"  live split: {r['live_consumed']} consumed / {nc_s} "
+                   f"never-consumed of {r['live']} live — source retention, "
+                   "not backlog (guard-7413)")
+        pc = r.get("positive_control")
+        if pc:
+            out.append(f"  positive control: live entry {pc['goal_id']} hash "
+                       f"{pc['hash']} at ring position {pc['ring_position']} "
+                       f"of {r['ring']}")
+        elif r["live"] and r["ring"]:
+            out.append("  positive control: NONE — no live entry hashes into "
+                       "the ring; every live entry is newer than the last "
+                       "pass, or the read or hash path is wrong. Treat the split "
+                       "as unmeasured.")
+    lp = report.get("last_pass")
+    if lp:
+        su = lp.get("sources_unreadable")
+        out.append(f"last fast-lane pass that changed something: {lp.get('ts')} "
+                   f"merged={lp.get('merged')} sources_unreadable="
+                   f"{'not recorded' if su is None else su} consumed_ring="
+                   f"{json.dumps(lp.get('consumed_ring'), sort_keys=True)}")
+    else:
+        out.append("last fast-lane pass: no telemetry row on this box (a pass "
+                   "that changes nothing writes none)")
+    for g, per in sorted((report.get("goal_ids") or {}).items()):
+        if not per:
+            out.append(f"goal {g}: not live and not offered in any capture lane")
+        for s, v in sorted(per.items()):
+            out.append(f"goal {g} {s}: live {v['live']} (ring positions "
+                       f"{v['live_ring_positions'][:10]}), offered "
+                       f"{v['offered']} ({v['offered_in_ring']} in ring)")
+    rj = report.get("relay")
+    if rj:
+        out.append(f"relay join ({rj['slot']}): {rj['relay_marked']} "
+                   f"relay-marked of {rj['relay_goals_read']} goals read, "
+                   f"{rj['relays_after_wm']} filed after the WM was written "
+                   "set aside; "
+                   f"{rj['live_sources']} live source goal(s), "
+                   f"{rj['sources_with_relay']} already relayed, "
+                   f"{rj['live_entries_predating_relay']} live entr(ies) "
+                   "predate their relay: captured before it, present after its "
+                   "drain, so re-delivered or delivered late (at most this "
+                   "many re-delivered: _item_ts is capture time, not arrival) "
+                   "— archived goals are outside the corpus, so no relay here "
+                   "is unproven, not clean (guard-7302)")
+        for row in rj["rows"][:15]:
+            out.append(f"  {row['source_goal']}: {row['live_entries']} live, "
+                       f"{row['predating_relay']} predate its first relay "
+                       f"{row['first_relay_at']} "
+                       f"({', '.join(row['relay_goals'][:3])})")
+    return "\n".join(out)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--agent", default=os.environ.get("MIND_AGENT"))
@@ -669,11 +1053,53 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="emit the summary as JSON")
     ap.add_argument("--allow-worker", action="store_true",
                     help=argparse.SUPPRESS)  # tests only; never in production
+    ap.add_argument("--census", action="store_true",
+                    help="READ-ONLY consumed-ring census (gap-222): ring vs "
+                         "offered, bounds, sources_unreadable, live split with "
+                         "a positive control; writes nothing, runs on any box. "
+                         "rc 3 when there is no agent-wide WM to read")
+    ap.add_argument("--goal-ids", default="",
+                    help="with --census: comma-separated goal ids to locate in "
+                         "the live lanes, the offered sources and the ring")
+    ap.add_argument("--relay-goals-file", default=None,
+                    help="with --census: JSON list of goal records, '-' for "
+                         "stdin, e.g. aspirations-query.sh --description-contains "
+                         "'worker Body (spark_capture from' --goal-status "
+                         "pending,in-progress,completed,skipped --full; joins "
+                         "live source goal ids against relay-marked goals")
+    ap.add_argument("--relay-slot", default="spark_capture",
+                    help="with --relay-goals-file: the lane to join (default "
+                         "spark_capture)")
     args = ap.parse_args(argv)
     if not args.agent:
         print("capture-fast-lane: no agent (set MIND_AGENT or pass --agent)",
               file=sys.stderr)
         return 2
+    if args.census:
+        relay = None
+        if args.relay_goals_file:
+            if args.relay_slot not in CAPTURE_SLOTS:
+                print(f"capture-fast-lane --census: unknown --relay-slot "
+                      f"{args.relay_slot!r}", file=sys.stderr)
+                return 2
+            try:
+                raw = (sys.stdin.read() if args.relay_goals_file == "-" else
+                       Path(args.relay_goals_file).read_text(encoding="utf-8"))
+                relay = json.loads(raw)
+            except (OSError, ValueError) as exc:
+                print(f"capture-fast-lane --census: cannot read relay goals: "
+                      f"{exc}", file=sys.stderr)
+                return 2
+            if not isinstance(relay, list):
+                print("capture-fast-lane --census: relay goals must be a JSON "
+                      "list of goal records", file=sys.stderr)
+                return 2
+        report = census(args.agent,
+                        goal_ids=[g.strip() for g in args.goal_ids.split(",")],
+                        relay_goals=relay, relay_slot=args.relay_slot)
+        print(json.dumps(report, indent=2, sort_keys=True) if args.json
+              else format_census(report))
+        return 0 if report.get("reducer_wm_present") else 3
     summary = fast_lane(args.agent, dry_run=args.dry_run,
                         allow_worker=args.allow_worker)
     if args.json:

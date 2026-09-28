@@ -132,6 +132,8 @@ DEFAULT_ALLOWLIST = (
     "world/guardrails.jsonl",
     "world/guardrails-*.jsonl",
     "world/pipeline.jsonl",
+    "world/retrieval-trace-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].jsonl",  # date segments (g-358-220), EXACT shape —
+        # same store and no-peer-read class as the legacy key below; never a -* glob
     "world/retrieval-trace.jsonl",       # g-358-68: 9.74x measured (13,763,662 -> 1,413,219 B
                                          # at DEFAULT_LEVEL), ~6.1 GB/day on one key. Local
                                          # instrumentation with no peer-read surface, so it

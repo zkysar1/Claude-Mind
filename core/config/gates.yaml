@@ -1058,6 +1058,24 @@ gates:
     tuning_notes: "MEASUREMENT-FIRST, ALL-OUTCOMES telemetry (g-306-328). The predicate's boolean is UNCHANGED — this registration exists to measure the distribution BEFORE deciding whether to change it, because the two remedies point opposite ways and nothing distinguished them. Read `extra.verdict_class`, not `decision`: `live` (block) and `dormant` (pass) are grounded in something the store SAID; `unanswered` (also pass) means the probe never got an answer, and per guard-2223 that third state must not fold into either pole. `extra.reason` splits it further — `no_row_for_sid` is the structural class the writer's fail-open contract produces (coordination.md:1035), and it is NOT evidence of dormancy. `decision` is set by observable control-flow effect per guard-1743, so `fail_open` is reserved for the branch that genuinely RAISED (gate-retirement-eval investigates on fail_open; mislabelling unanswered as fail_open would manufacture HIGH investigations at every cycle). All four outcomes log, not just the refusal — a surface that records only the escape path cannot answer the one question this instrumentation exists for (guard-2293). RETIREMENT CRITERION AT BIRTH (guard-769): retire when the g-306-328 decision lands — either the consumer starts acting on `unanswered` (then this becomes ordinary gate telemetry and needs its own asymmetry row), or a measured decision records that it should not, at which point the distribution has served its purpose and only the block/pass rows are worth keeping."
     retirement_eligible: true
 
+  - id: cross-box-body-long-hold
+    script: mind_api/src/endpoints/aspirations_write.py
+    embedded: true
+    instrumented: true
+    sites:
+      - { file: "mind_api/src/endpoints/aspirations_write.py", phase: "_cross_box_body_long_hold (same-agent claim contest whose holder row is past stale_minutes)" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: medium
+    fn_cost: high
+    fp_description: "A wrong `block` keeps a claim for a Body that stopped working the goal. Bounded: the carrier window (100 min) and the hold cap (24 h) both expire it as before."
+    fn_description: "A wrong `pass` hands a goal a live Body is still working to a sibling: two Bodies build one goal and the displaced Body's hours are lost. The world override-bypass ledger has 76 claim-cross-session-takeover rows from 2026-08-20 to 2026-09-27; a row does not record whether the displaced Body was alive (g-375-42)."
+    rb_evidence: []
+    tuning_notes: "g-375-42. The predicate is core/scripts/gates/body_hold.py, shared with goal-selector.py so the selector never offers a goal this refuses. Logs every stale-row escalation: block = the long hold kept the claim; pass = extra.failed names every failed conjunct."
+    retirement_eligible: true
+
 # ─── Gates discovered in core/scripts/ but not in the Session-56 audit.
 # These need their own asymmetry analysis before tuning. Listed here so the
 # audit dashboard knows they exist and can prompt for the missing data.

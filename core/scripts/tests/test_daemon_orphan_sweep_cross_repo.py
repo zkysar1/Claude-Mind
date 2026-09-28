@@ -93,6 +93,23 @@ def test_mind_data_layout_discovered(tmp_path):
     assert {"5555", "6666"} <= pids, f".mind-data layout not discovered: {pids}"
 
 
+def test_repo_nested_under_org_dir_is_protected(tmp_path):
+    """A deployment one level deeper (<parent>/<org>/<repo>/...) MUST be in the
+    keep-set. Measured 2026-09-28: a production Mind grouped under an org folder
+    was reported ORPH, so --clean would have killed its live daemon."""
+    local = _make_repo(tmp_path, "repo_local", 1111, 2222)
+    _make_repo(tmp_path / "org", "repo_nested", 3131, 4141)
+    _make_repo(tmp_path / "org", "repo_nested_alt", 5151, 6161,
+               layout=".mind-data/mind_api/state")
+    res = _print_keepset(local / "mind_api" / "state", tmp_path)
+    assert res["_rc"] == 0, res
+    pids = _pids(res.get("KEEPSET_PIDS"))
+    assert {"3131", "4141"} <= pids, (
+        f"nested repo NOT protected — --clean would kill it: {pids}"
+    )
+    assert {"5151", "6161"} <= pids, f"nested .mind-data repo NOT protected: {pids}"
+
+
 def test_keep_repo_flag_adds_out_of_tree_repo(tmp_path):
     """--keep-repo protects a deployment outside the auto-discovery parent."""
     local = _make_repo(tmp_path, "repo_local", 1111, 2222)

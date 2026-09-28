@@ -17,10 +17,21 @@ callers (aspirations-verify Q4, close-review Step 3/4):
 WHY THE SAMPLING IS SCRIPTED (the goal's own words: "script-gated sample
 selection so the executor cannot cherry-pick"). An executor asked to "check a
 few claims" checks the few it already knows are cited. Sampling here is a
-sha256 over (goal_id, artifact path, cluster text), sorted ascending — so it is
-DETERMINISTIC (same artifact, same sample, every run and every reviewer),
-REPRODUCIBLE by anyone holding the artifact, and NOT re-rollable: the only way
-to change which claims are sampled is to change the artifact's text.
+sha256 over (goal_id, artifact path, the cluster's ordinal), sorted ascending —
+so it is DETERMINISTIC (same artifact, same sample, every run and every
+reviewer), REPRODUCIBLE by anyone holding the artifact, and NOT re-rollable:
+rewording a claim does not move the sample; only adding, removing or splitting
+a claim does.
+
+WHY THE ORDINAL AND NOT THE CLUSTER'S TEXT (g-375-47). The remedy for a
+missing-citation finding is a source token INSIDE the cluster, and that edits
+the cluster's text. Keyed on text, every fixed cluster drew a new random rank
+and usually left the sample, so the next run examined clusters no earlier run
+had shown: the executor fixed exactly what it was told and got new findings.
+Measured with this module's own functions, fixing only the reported clusters
+took 3-6 runs to reach a clean sample on 8-30 clusters, against 2 when the
+sample holds still. An in-place fix leaves the ordinal alone, so the confirming
+run re-reads the clusters that were fixed.
 
 THE MANIFEST'S SCOPE IS NARROWER THAN THE UNIVERSE OF CITABLE PATHS, so the
 decorative test has a STRUCTURAL blind spot and it fails in the ALARM direction.
@@ -219,7 +230,8 @@ def sample_key(goal_id: str, artifact: str, cluster_text: str) -> str:
 
 
 def sample_clusters(text: str, goal_id: str, artifact: str, n: int = DEFAULT_SAMPLE_N):
-    """Up to ``n`` clusters from ``text``, chosen by ascending sample_key.
+    """Up to ``n`` clusters from ``text``, chosen by ascending sample_key over
+    each cluster's ordinal, never its text (the module docstring says why).
 
     Returns (sampled, total). ``total`` is reported separately and is NOT
     len(sampled): a caller that printed only the sampled count would hide how
@@ -227,8 +239,7 @@ def sample_clusters(text: str, goal_id: str, artifact: str, n: int = DEFAULT_SAM
     carry the coverage it is clean over).
     """
     clusters = list(iter_clusters(text or ""))
-    keyed = [(sample_key(goal_id, artifact, "\n".join(f.text for f in c.fact_lines)), c)
-             for c in clusters]
+    keyed = [(sample_key(goal_id, artifact, f"#{i}"), c) for i, c in enumerate(clusters)]
     keyed.sort(key=lambda kc: kc[0])
     return [c for _k, c in keyed[:max(0, int(n))]], len(clusters)
 

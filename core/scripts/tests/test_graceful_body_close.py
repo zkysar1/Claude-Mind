@@ -23,6 +23,7 @@ import importlib.util
 import json
 import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -244,12 +245,12 @@ def test_a_gracefully_closed_carrier_is_never_re_repaired():
     assert any("not-a-LIVE-body_state" in r for r in excluded[0]["exclusion_reasons"])
 
 
-def test_daemon_claim_probe_is_the_sixth_partition_site(): 
-    """: the daemon's cross-box carrier probe is partition site SIX.
+def test_daemon_claim_probe_is_the_sixth_partition_site(monkeypatch):
+    """: the daemon's cross-box carrier probe was partition site SIX.
 
     g-115-9957 enumerated the five sites under `core/scripts` and shipped
     `closed-graceful` to all of them. It never swept `mind_api/src`, where the
-    daemon's claim path keeps its OWN hand-written closed-set. The consequence
+    daemon's claim path kept its OWN hand-written closed-set. The consequence
     was not cosmetic: that probe returns False (= not live, claim takeable) for
     a closed state, so an unlisted `closed-graceful` fell through to the
     freshness test and reported a gracefully-stopped Body LIVE for the whole
@@ -260,22 +261,47 @@ def test_daemon_claim_probe_is_the_sixth_partition_site():
     the scope lesson attached: the enumeration must be REPO-WIDE, not limited to
     the directory being edited.
 
-    Read as SOURCE, not by import -- importing the daemon endpoint drags in the
-    whole mind_api app. Same technique this file already uses for the stop-hook
-    grep, and it pins the literal that actually ships.
+    g-375-50 folded site six into site seven: the probe calls
+    `gates.body_hold.evaluate_carrier` and keeps no closed set of its own. So this
+    test stopped reading a tuple out of the source and calls the probe instead
+    (rb-9927: once the production shape is callable, pin behaviour, not shape).
+    A fresh carrier of the holder's own, in EVERY closed state body-manifest
+    lists, must read not-live at the daemon. `active` and `parked` at the same
+    age must read live. That half is the control: the probe fails open to
+    not-live on any error, so a dead probe would pass the closed half alone
+    (guard-4166).
     """
-    root = CORE.parent.parent
-    src = (root / "mind_api" / "src" / "endpoints" / "aspirations_write.py").read_text(
-        encoding="utf-8")
-    m = re.search(
-        r'body_state.{0,40}?\)\s*in\s*\(\s*((?:\s*"[a-z-]+",?)+)\s*\)', src, re.S)
-    assert m, ("the daemon claim probe's closed-set tuple was not found -- it "
-               "moved or was renamed; re-find it rather than deleting this test")
-    listed = set(re.findall(r'"([a-z-]+)"', m.group(1)))
-    missing = set(bm.CLOSED_STATES) - listed
-    assert not missing, (
-        f"mind_api claim probe is missing {sorted(missing)} from its closed set. "
-        f"It is the SIXTH declaration of the body_state partition and body-manifest's "
-        f"CLOSED_STATES is the SSOT: every member must appear here or a Body in that "
-        f"state reads LIVE to the daemon and its claims stay un-takeable.")
-    assert GRACEFUL in listed, "closed-graceful specifically must be listed (g-115-10026)"
+    # Imported here, not at module level: only this test needs the daemon endpoint.
+    from mind_api.src.endpoints import aspirations_write as daemon
+
+    stamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    def reads_live(state: str) -> bool:
+        carrier = {"sid": RED, "agent": AGENT, "ts": stamp, "body_state": state}
+        monkeypatch.setattr(daemon, "_read_body_carrier",
+                            lambda ctx, agent, sid: dict(carrier))
+        return daemon._body_carrier_is_fresh(None, AGENT, RED)
+
+    states = sorted(set(bm.CLOSED_STATES) | {GRACEFUL, "active", "parked"})
+    got = {s: reads_live(s) for s in states}
+    want = {s: s not in bm.CLOSED_STATES for s in states}
+    assert got == want, (
+        f"the daemon claim probe read {got}, expected {want}. body-manifest's "
+        f"CLOSED_STATES is the SSOT: a closed state that reads live keeps a finished "
+        f"Body's claims un-takeable, and a live state that reads not-live means the "
+        f"probe is failing open on everything.")
+    assert got[GRACEFUL] is False, "closed-graceful specifically must read closed (g-115-10026)"
+
+
+def test_body_hold_policy_is_the_seventh_partition_site():
+    """: gates/body_hold.py mirrors the closed set too.
+
+    The long-hold policy lets a Body keep its goal past the claim timeout while its
+    carrier is fresh and NOT closed, so a closed state missing here would hold a
+    finished Body's claim for the whole carrier window. It is imported by both the
+    selector and the claim endpoint, so it is pinned by import, exactly equal.
+    """
+    from gates.body_hold import CLOSED_BODY_STATES
+    assert set(CLOSED_BODY_STATES) == set(bm.CLOSED_STATES), (
+        f"gates/body_hold.py CLOSED_BODY_STATES {sorted(CLOSED_BODY_STATES)} must equal "
+        f"body-manifest CLOSED_STATES {sorted(bm.CLOSED_STATES)}, the SSOT.")

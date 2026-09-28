@@ -239,10 +239,12 @@ def test_should_encode_requires_env_and_allowlist_together():
     # NOT on the list — written exactly as before.
     ("world/aspirations-archive.jsonl", False),
     ("world/pipeline-archive.jsonl", False),
-    # retrieval-trace is admitted as an EXACT name, not a glob — so neither a
-    # date segment nor an archive sibling rides in on it ().
-    ("world/retrieval-trace-2026-09-05.jsonl", False),
+    # retrieval-trace: the legacy EXACT name () plus its date segments
+    # by EXACT date shape () — never a `-*` glob, so an archive or spool
+    # sibling still does not ride in on either entry.
+    ("world/retrieval-trace-2026-09-05.jsonl", True),
     ("world/retrieval-trace-archive.jsonl", False),
+    ("world/retrieval-trace-2026-09-05.jsonl.spool", False),
     # DEFERRED (inbound cross-deployment writers, see BOARD_PATTERN_DEFERRED):
     ("world/board/coordination.jsonl", False),
     ("world/board/general.jsonl", False),
@@ -300,9 +302,11 @@ def test_retrieval_trace_admission_is_pinned():
                                env={}) is False
     assert codec.should_encode("world/retrieval-trace.jsonl", "claude-mind",
                                env={"OWNCLOUD_GZIP_STORES": "ayoai-mind"}) is False
-    # Admitted as an exact name, so it must NOT behave like the reasoning-bank
-    # segment glob — a sibling must not ride in on this entry.
-    assert codec.rel_allowlisted("world/retrieval-trace-2026-09-05.jsonl") is False
+    # Its date segments are admitted too ( — without it the segmented
+    # writer PUTs plain at ~10x), by EXACT date shape, NOT the reasoning-bank
+    # `-*` glob: a same-stem sibling must still not ride in.
+    assert codec.rel_allowlisted("world/retrieval-trace-2026-09-05.jsonl") is True
+    assert codec.rel_allowlisted("world/retrieval-trace-archive.jsonl") is False
 
 
 def test_gzip_level_parse_and_bounds():

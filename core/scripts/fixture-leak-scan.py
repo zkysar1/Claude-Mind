@@ -60,7 +60,10 @@ OUT of scope, deliberately:
     fixture cannot collide into one the way an auto-allocated rb-{max+1} can.
     An informative zero, not a vacuous one (rb-245).
   * the ~50 telemetry / metrics / ledger / override JSONL stores (*-metrics,
-    *-log, *-overrides, changelog, retrieval-trace, ...). Append-only
+    *-log, *-overrides, changelog, retrieval-trace and its g-358-220 date
+    segments `retrieval-trace-YYYY-MM-DD.jsonl` — same telemetry class, same
+    out-of-scope ruling; pinned by test_retrieval_trace_segment_starvation.py,
+    ...). Append-only
     instrumentation with no retrieval surface: a leaked row there is never read
     back INTO the agent's reasoning, so it cannot mislead. Scanning them would
     trade the whole point of a curated high-confidence signal for noise.

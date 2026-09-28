@@ -176,3 +176,11 @@ showed zeta was the only agent doing this — alpha, delta, and echo all
 used `<<autonomous-loop-dynamic>>` or natural-language correctly. The
 pattern is easy to drift into once it survives in context, so the gate
 protects against future occurrences in any agent.
+
+## 6. ScheduleWakeup enforcement layers
+
+| Layer | Mechanism | What it catches |
+|-------|-----------|-----------------|
+| **A** — gate | `core/scripts/schedule-wakeup-gate.{py,sh}` (PreToolUse[ScheduleWakeup]) refuses (i) slash-prefix prompts other than `/loop`, (ii) `stop: true` while agent-state is RUNNING with no `stop-requested`, (iii) the sentinel while agent-state is NOT RUNNING, (iv) an arm without `noop` (g-115-10755). Fail-open by contract. Tests: `tests/test_schedule_wakeup_gate.py`. | The wrong prompt (A-D), the net-cancel (E), a net over no loop, and a harness-refused net, at write time. Denies name the correct action. |
+| **B** — rule | `.claude/rules/schedule-wakeup-correctness.md` | Documents the correct patterns for human and LLM authors. |
+| **C** — detective | `core/scripts/aspirations-rejection-audit.py` scans recent transcripts for the rejection message + the originating ScheduleWakeup call. Predicate is shared with the gate via `core/scripts/_swakeup_predicate.py` (single source of truth). | Catches drift if the gate is bypassed (hook timeout, fail-open path). Reports only; `--exit-on-hits` makes it file Investigate goals. |

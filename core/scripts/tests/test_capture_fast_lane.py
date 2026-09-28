@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -660,3 +663,302 @@ def test_ceiling_overflow_is_reported_not_silent(tmp_path, monkeypatch):
     assert s["merged"] == 0, s
     assert s["consumed_ring"]["spark_capture"]["overflow"] == 1, s
     assert "consumed-ring OVERFLOW" in cfl.format_line(s)
+
+
+# --------------------------------------------------------------------------
+# READ-ONLY census (, gap-222)
+# --------------------------------------------------------------------------
+
+def _census_fixture(root: Path) -> dict:
+    """Small enough to count by hand. Ring holds A (drained), B (drained, no
+    longer offered) and C (live). Live holds C, D (offered, unrecorded) and E
+    (not offered). F is offered but neither live nor recorded."""
+    e = {k: _entry(f"g-{k}", load_bearing=True, fact=k) for k in "ABCDEF"}
+    h = {k: bmg._content_hash(v) for k, v in e.items()}
+    _write_reducer_wm(root, "testagent", {
+        "spark_capture": [e["C"], e["D"], e["E"]],
+        cfl.CONSUMED_HASHES_SLOT: {"spark_capture": [h["A"], h["B"], h["C"]]}})
+    _write_body(root, "testagent", "u1",
+                {"spark_capture": [e["A"], e["C"], e["D"], e["F"]]})
+    return h
+
+
+def test_census_reproduces_the_hand_computed_split(tmp_path):
+    root = _mk_root(tmp_path)
+    _census_fixture(root)
+
+    r = cfl.census("testagent", project_root=root)["lanes"]["spark_capture"]
+
+    assert (r["live"], r["ring"], r["offered"]) == (3, 3, 4), r
+    assert r["offered_in_ring"] == 2            # A, C
+    assert r["offered_missing_live"] == 1       # D: the next pass records it
+    assert r["offered_missing_absent"] == 1     # F: the next pass merges it
+    assert r["ring_not_offered"] == 1           # B
+    assert (r["live_consumed"], r["live_never_consumed"]) == (1, 2)  # C | D, E
+    assert r["never_consumed_upper_bound"] is False
+    assert r["positive_control"]["goal_id"] == "g-C"
+    assert r["positive_control"]["ring_position"] == 2
+
+
+def test_census_writes_nothing(tmp_path):
+    """guard-3342: the census is its own path, not the writer's --dry-run. The
+    fixture is one a real pass WOULD change, so an unchanged file is evidence."""
+    root = _mk_root(tmp_path)
+    _census_fixture(root)
+    wm = root / "agents" / "testagent" / "session" / "working-memory.yaml"
+    before = wm.read_bytes()
+
+    cfl.census("testagent", project_root=root)
+
+    assert wm.read_bytes() == before
+    assert not (wm.parent / cfl.TELEMETRY_FILENAME).exists()
+    # positive control: the writer would merge F from this same fixture
+    assert cfl.fast_lane("testagent", project_root=root, dry_run=True)["merged"] == 1
+
+
+def test_census_names_a_ring_at_cap_saturated_and_bounds_the_split(tmp_path, monkeypatch):
+    """guard-6824's shape (a ring of exactly CAP hashes nothing offers) is the
+    insurance tail at CAP post-fix. It FIFO-trims, so a consumed hash can be
+    forgotten and never-consumed is an UPPER BOUND."""
+    monkeypatch.setattr(cfl, "CONSUMED_HASHES_CAP", 3)
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent", {
+        "spark_capture": [_entry("g-live", load_bearing=True)],
+        cfl.CONSUMED_HASHES_SLOT: {"spark_capture": _filler(3)}})
+
+    rep = cfl.census("testagent", project_root=root)
+    r = rep["lanes"]["spark_capture"]
+
+    assert (r["tail_at_cap"], r["saturated"]) == (True, False), r
+    assert r["never_consumed_upper_bound"] is True
+    text = cfl.format_census(rep)
+    assert "SATURATED tail" in text and "at most 1 (UPPER BOUND" in text
+    assert "positive control: NONE" in text   # live and ring share no hash
+
+
+def test_census_names_the_pre_fix_fifo_shape_saturated(tmp_path, monkeypatch):
+    """guard-6824's own rule, which guard-7413 keeps: a ring of EXACTLY CAP is
+    SATURATED even when every hash in it is still offered. That is the pre-fix
+    FIFO, measured live on a box whose WM predates g-115-10776 (spark ring
+    2000 = CAP, 1598 offered hashes missing, tail 0)."""
+    monkeypatch.setattr(cfl, "CONSUMED_HASHES_CAP", 2)
+    root = _mk_root(tmp_path)
+    e = [_entry(f"g-{i}", load_bearing=True, fact=str(i)) for i in range(3)]
+    _write_reducer_wm(root, "testagent", {
+        "spark_capture": [e[2]],
+        cfl.CONSUMED_HASHES_SLOT: {"spark_capture": [
+            bmg._content_hash(e[0]), bmg._content_hash(e[1])]}})
+    _write_body(root, "testagent", "u1", {"spark_capture": list(e)})
+
+    rep = cfl.census("testagent", project_root=root)
+    r = rep["lanes"]["spark_capture"]
+
+    assert (r["at_cap"], r["tail_at_cap"], r["ring_not_offered"]) == (True, False, 0), r
+    assert r["never_consumed_upper_bound"] is True
+    text = cfl.format_census(rep)
+    assert "SATURATED at CAP 2" in text and "at most 1 (UPPER BOUND" in text
+
+
+def test_census_names_a_ring_at_the_ceiling_saturated(tmp_path, monkeypatch):
+    monkeypatch.setattr(cfl, "CONSUMED_HASHES_CEILING", 2)
+    root = _mk_root(tmp_path)
+    entries = [_entry(f"g-{i}", load_bearing=True, fact=str(i)) for i in range(2)]
+    _write_reducer_wm(root, "testagent", {cfl.CONSUMED_HASHES_SLOT: {
+        "spark_capture": [bmg._content_hash(e) for e in entries]}})
+    _write_body(root, "testagent", "u1", {"spark_capture": list(entries)})
+
+    rep = cfl.census("testagent", project_root=root)
+
+    assert rep["lanes"]["spark_capture"]["saturated"] is True, rep
+    assert "SATURATED at ceiling 2" in cfl.format_census(rep)
+
+
+def test_census_counts_unreadable_sources_like_the_fast_lane(tmp_path, monkeypatch):
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent")
+    bad = root / "agents" / "testagent" / "sessions" / "u-bad"
+    bad.mkdir(parents=True)
+    (bad / "working-memory.yaml").write_text("slots: [unclosed", encoding="utf-8")
+
+    def _unreadable(state_dir, backend, world_dir=None, skipped=None):
+        skipped.append("u9-fastlane.jsonl")
+        return {}
+    monkeypatch.setattr(cfl.bcc, "read_carriers", _unreadable)
+
+    rep = cfl.census("testagent", project_root=root)
+
+    assert rep["sources_unreadable"] == 2, rep   # the YAML error + the carrier
+    lane = cfl.fast_lane("testagent", project_root=root, dry_run=True)
+    assert lane["sources_unreadable"] == 2
+
+
+def test_census_offers_a_remote_bodys_carrier(tmp_path):
+    """A Body on another box is visible only through its carrier ()."""
+    import shutil
+    root = _mk_root(tmp_path)
+    x = _entry("g-remote", load_bearing=True)
+    _write_reducer_wm(root, "testagent", {cfl.CONSUMED_HASHES_SLOT: {
+        "spark_capture": [bmg._content_hash(x)]}})
+    remote = _write_body(root, "testagent", "remote-sid", {"spark_capture": [x]})
+    assert cfl.bcc.record_local(remote / "working-memory.yaml", "spark_capture", x)
+    shutil.rmtree(remote)   # the WM stays on its own box; only the carrier syncs
+
+    rep = cfl.census("testagent", project_root=root)
+
+    assert rep["carrier_only_bodies"] == 1, rep
+    assert rep["lanes"]["spark_capture"]["offered_in_ring"] == 1
+
+
+def test_census_locates_named_goal_ids(tmp_path):
+    root = _mk_root(tmp_path)
+    _census_fixture(root)
+
+    rep = cfl.census("testagent", project_root=root,
+                     goal_ids=["g-C", "g-F", "g-nowhere"])
+
+    got = rep["goal_ids"]
+    assert got["g-C"]["spark_capture"]["live_ring_positions"] == [2], got
+    assert got["g-F"]["spark_capture"] == {
+        "live": 0, "live_ring_positions": [], "offered": 1, "offered_in_ring": 0}
+    assert got["g-nowhere"] == {}
+    assert "goal g-nowhere: not live and not offered" in cfl.format_census(rep)
+
+
+def test_census_relay_join_flags_entries_that_predate_their_relay(tmp_path):
+    """gap-222's 5th encounter: ring membership means delivered ONCE. The join
+    that shows re-delivery is live source goal ids against the goals a spark
+    replay filed from them: an entry older than its source's relay was drained
+    with that batch and is back; a newer one is a fresh capture."""
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent", {"spark_capture": [
+        _entry("g-115-1", ts="2026-09-20T10:00:00", fact="old"),
+        _entry("g-115-1", ts="2026-09-26T10:00:00", fact="new"),
+        _entry("g-115-2", ts="2026-09-20T10:00:00")]})
+    wm = root / "agents" / "testagent" / "session" / "working-memory.yaml"
+    as_of = time.mktime(datetime(2026, 9, 25).timetuple())
+    os.utime(wm, (as_of, as_of))
+    relays = [
+        {"id": "g-900-1", "created_at": "2026-09-24T00:00:00",
+         "description": "relayed by alpha worker Body (spark_capture from "
+                        "g-115-1), filed at reducer spark replay"},
+        {"id": "g-900-2", "description": "no marker here"},
+        # filed AFTER the WM was written: it drained nothing in this copy
+        {"id": "g-900-3", "created_at": "2026-09-26T00:00:00",
+         "description": "relayed by alpha worker Body (spark_capture from "
+                        "g-115-2), filed at reducer spark replay"},
+    ]
+
+    rep = cfl.census("testagent", project_root=root, relay_goals=relays)
+    rj = rep["relay"]
+
+    assert (rj["relay_goals_read"], rj["relay_marked"]) == (3, 2), rj
+    assert rj["relays_after_wm"] == 1
+    assert (rj["live_sources"], rj["sources_with_relay"]) == (2, 1)
+    assert rj["live_entries_predating_relay"] == 1
+    assert rj["rows"][0]["relay_goals"] == ["g-900-1"]
+    text = cfl.format_census(rep)
+    assert "written 2026-09-25T00:00:00" in text
+    assert "1 filed after the WM was written set aside" in text
+
+
+def test_census_runs_on_a_worker_body_and_says_so(tmp_path, monkeypatch):
+    """The fast lane's refusal protects a WRITE. The census writes nothing, so
+    it runs, and labels the WM it read as this box's copy."""
+    root = _mk_root(tmp_path)
+    _census_fixture(root)
+    _write_body(root, "testagent", "my-sid", {})
+    monkeypatch.setenv("MIND_SID", "my-sid")
+
+    rep = cfl.census("testagent", project_root=root)
+
+    assert rep["worker_body"] is True and rep["lanes"], rep
+    assert "worker Body" in cfl.format_census(rep)
+    assert cfl.fast_lane("testagent", project_root=root)["role_refused"] is True
+
+
+class _StoreAhead:
+    """Own-cloud read-through state off the reducer's box: the store holds a
+    newer agent-wide WM than the local mirror. `broken` makes every store read
+    a transport error instead."""
+
+    def __init__(self, store: dict, written: float, broken: bool = False):
+        self.store = {str(p.resolve()): b for p, b in store.items()}
+        self.written, self.broken = written, broken
+
+    def read_authoritative_bytes(self, path):
+        if self.broken:
+            raise ConnectionError("store unreachable")
+        try:
+            return self.store[str(path)]
+        except KeyError:
+            raise FileNotFoundError(path) from None
+
+    def head_last_modified(self, path):
+        return self.written if str(path) in self.store else None
+
+    def list_dir(self, path):
+        return []
+
+
+def test_census_reads_the_store_copy_not_the_local_mirror(tmp_path, monkeypatch):
+    """guard-980 / guard-5930: off the reducer's box the local WM is a stale
+    mirror, and a census over it is a claim about the cache. Measured on
+    cc-09: the local copy was written 3.9 days before the store copy."""
+    root = _mk_root(tmp_path)
+    wm = _write_reducer_wm(root, "testagent",
+                           {"spark_capture": [_entry("g-115-1")]})
+    newer = yaml.safe_dump({"slots": {"spark_capture": [
+        _entry("g-115-1"), _entry("g-115-2", fact="b"),
+        _entry("g-115-3", fact="c")]}}).encode()
+    written = time.mktime(datetime(2026, 9, 27, 12).timetuple())
+    monkeypatch.setattr(cfl.bmg, "_get_backend",
+                        lambda: _StoreAhead({wm: newer}, written))
+
+    rep = cfl.census("testagent", project_root=root)
+
+    assert rep["wm_source"] == "store", rep
+    assert rep["wm_as_of"] == "2026-09-27T12:00:00"
+    assert rep["lanes"]["spark_capture"]["live"] == 3
+    assert "read from store, written 2026-09-27T12:00:00" in cfl.format_census(rep)
+
+    monkeypatch.setattr(cfl.bmg, "_get_backend",
+                        lambda: _StoreAhead({wm: newer}, written, broken=True))
+    rep = cfl.census("testagent", project_root=root)
+
+    assert rep["wm_source"] == "local mirror (store unreadable)", rep
+    assert rep["lanes"]["spark_capture"]["live"] == 1
+    assert "(guard-980)" in cfl.format_census(rep)
+
+
+def test_census_reads_the_newest_fast_lane_row(tmp_path):
+    root = _mk_root(tmp_path)
+    _write_reducer_wm(root, "testagent")
+    tel = root / "agents" / "testagent" / "session" / cfl.TELEMETRY_FILENAME
+    tel.write_text(
+        json.dumps({"ts": "2026-09-27T01:00:00", "merged": 4}) + "\n"
+        + json.dumps({"ts": "2026-09-27T02:00:00", "merged": 1,
+                      "sources_unreadable": 0, "consumed_ring": {
+                          "spark_capture": {"size": 9, "overflow": 0}}})
+        + "\n\n", encoding="utf-8")
+
+    lp = cfl.census("testagent", project_root=root)["last_pass"]
+
+    assert (lp["ts"], lp["merged"]) == ("2026-09-27T02:00:00", 1), lp
+    assert lp["consumed_ring"]["spark_capture"]["size"] == 9
+
+
+def test_census_cli_exit_codes(tmp_path, monkeypatch, capsys):
+    root = _mk_root(tmp_path)
+    monkeypatch.setattr(cfl.bmg, "_project_root", lambda: root)
+
+    assert cfl.main(["--agent", "testagent", "--census"]) == 3  # no agent-wide WM
+    assert "UNMEASURABLE" in capsys.readouterr().out
+
+    _census_fixture(root)
+    bad = tmp_path / "relays.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert cfl.main(["--agent", "testagent", "--census",
+                     "--relay-goals-file", str(bad)]) == 2
+    capsys.readouterr()
+    assert cfl.main(["--agent", "testagent", "--census", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["lanes"]["spark_capture"]["ring"] == 3

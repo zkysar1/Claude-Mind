@@ -127,3 +127,57 @@ def test_trace_paths_without_legacy(tmp_path):
 def test_trace_paths_unresolved_world_dir_says_so(capsys):
     assert rt.trace_paths(None) == []
     assert "world_dir unresolved" in capsys.readouterr().err
+
+
+# -- Writer rule (outcome 4): one basename rule, DEFAULT OFF -------------------
+# The flag only chooses the BASENAME; retrieve.py composes it with its own
+# per-request WORLD_DIR. Unset must stay byte-for-byte the pre-change behaviour.
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "no", "off"])
+def test_store_name_is_legacy_while_the_flag_is_off(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv(rt.SEGMENTED_ENV, raising=False)
+    else:
+        monkeypatch.setenv(rt.SEGMENTED_ENV, value)
+    assert rt.store_name(dt.date(2026, 9, 27)) == rt.LEGACY_STORE_NAME
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", " 1 "])
+def test_store_name_is_the_dated_segment_once_flipped(monkeypatch, value):
+    monkeypatch.setenv(rt.SEGMENTED_ENV, value)
+    name = rt.store_name(dt.date(2026, 9, 27))
+    assert name == SEG and rt.is_segment(name)
+    # What the writer emits is what the merger registered (outcome 2 contract).
+    assert cm.merge_handler_for(f"world/{name}") is cm.merge_append_only_jsonl
+
+
+def _write_one_trace_row(monkeypatch, tmp_path):
+    import retrieve as _retrieve
+    monkeypatch.setattr(_retrieve, "WORLD_DIR", tmp_path)
+    _retrieve._log_retrieval_trace(
+        category="q", depth="shallow", read_only=True,
+        items_returned={"tree_nodes": 1}, effective_goal=None,
+        supplementary_only=False, include_framework=False)
+
+
+def test_writer_appends_to_the_legacy_file_by_default(monkeypatch, tmp_path):
+    monkeypatch.delenv(rt.SEGMENTED_ENV, raising=False)
+    _write_one_trace_row(monkeypatch, tmp_path)
+    assert (tmp_path / rt.LEGACY_STORE_NAME).is_file()
+    assert not [p for p in tmp_path.iterdir() if rt.is_segment(p.name)]
+
+
+def test_writer_appends_to_todays_segment_when_flipped(monkeypatch, tmp_path):
+    monkeypatch.setenv(rt.SEGMENTED_ENV, "1")
+    _write_one_trace_row(monkeypatch, tmp_path)
+    seg = tmp_path / rt.segment_name()
+    assert seg.is_file() and not (tmp_path / rt.LEGACY_STORE_NAME).exists()
+    # The reader seam sees exactly what the writer produced.
+    assert rt.trace_paths(tmp_path) == [seg]
+    assert json.loads(seg.read_text().splitlines()[0])["category"] == "q"
+
+
+def test_codec_allowlist_gzips_segments_like_the_legacy_key():
+    import _owncloud_codec as codec
+    assert codec.rel_allowlisted("world/retrieval-trace.jsonl")
+    assert codec.rel_allowlisted(f"world/{SEG}")

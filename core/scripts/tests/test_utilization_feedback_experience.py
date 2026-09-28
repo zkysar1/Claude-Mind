@@ -30,6 +30,8 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+import _experience_stats_spool as es  # noqa: E402
+
 
 def _load_ufb():
     """utilization-feedback.py is hyphenated, so import it by path."""
@@ -152,7 +154,7 @@ def test_writer_spools_and_never_calls_the_daemon(ufb, monkeypatch, tmp_path):
 
     ufb._increment_experience_stat("exp-x", "times_helpful")
 
-    lines = (tmp_path / "experience-stats.spool.jsonl").read_text(
+    lines = (tmp_path / es.SPOOL_DIR_NAME / es.SPOOL_NAME).read_text(
         encoding="utf-8").splitlines()
     assert len(lines) == 1
     rec = json.loads(lines[0])
@@ -181,7 +183,7 @@ def test_unmapped_field_neither_spools_nor_writes(ufb, monkeypatch, tmp_path):
         raise AssertionError("unmapped field must not write")
     monkeypatch.setattr(ufb._rt, "rt_call", rt_call)
     ufb._increment_experience_stat("exp-x", "times_active")
-    assert not (tmp_path / "experience-stats.spool.jsonl").exists()
+    assert not (tmp_path / es.SPOOL_DIR_NAME / es.SPOOL_NAME).exists()
 
 
 def _fake_rt(ufb, monkeypatch, record, writes):

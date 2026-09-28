@@ -49,15 +49,39 @@ canonical wrapper so there is exactly one reader of the queue:
          --goal-status pending,in-progress,completed,skipped --full \
       | py -3 core/scripts/sq013-dedup-probe.py \
             --subject "<the relay observation>" \
+            [--census-file <(bash core/scripts/aspirations-read.sh \
+                              --source world --active-compact)] \
             [--session-start <ISO>] [--window-hours 72]
 
 Exit codes are the decision, so a caller can branch in bash without parsing:
-    0  FILE    — no owner found; proceed with the sq-013 filing
+    0  FILE    — no owner the corpus could SCORE; proceed with the filing
     3  DECLINE — an owner exists; stdout names it (id, status, when)
-    4  MUST-READ (batch mode only) — N records cite a terminal-but-NOT-done
-       owner; each needs reading before ANY disposition. See below.
-    2  usage / unreadable corpus (never a silent FILE — an unusable corpus is
-       not evidence of absence; guard-2298 / verify-before-assuming rule 4)
+    4  MUST-READ — read before ANY disposition: in batch mode a record cites a
+       terminal-but-NOT-done owner (see below); in either mode, with
+       --census-file, the subject cites a goal EVICTED from the corpus; in
+       either mode, every owner found restates the subject only below
+       SUBJECT_COVERAGE_MIN — the same TOPIC, not proven the same defect
+       (g-115-11127, see SUBJECT_COVERAGE_MIN).
+    2  usage / unreadable corpus or census (never a silent FILE — an unusable
+       input is not evidence of absence; guard-2298 / verify-before-assuming
+       rule 4)
+
+THE CORPUS HAS A HORIZON (g-306-522). The live queue EVICTS terminal
+non-recurring goals after aspirations_eviction.age_days (3); they survive only
+as bare ids in their aspiration's census (_goal_census.py). An evicted owner
+cannot be scored, so FILE means "no LIVE owner", never "no owner ever" —
+measured on the g-306-284 occ227 replay (2026-09-27): all 16 aged work relays
+that read FILE had an owner or were moot, and 8 of them needed owner ids only
+the census holds (seven ids: six completed, one skipped). So FILE output states
+the horizon, and --census-file (the caller's aspiration records; repeatable)
+turns a FILE into MUST-READ when the relay CITES an evicted goal id, in its
+subject text or (batch) as its own source goal_id. An uncited
+evicted owner stays invisible: an aged relay is disposed by re-running its
+reproduction against HEAD, not by this probe (guard-7398). This script reads
+one CONFIG value (aspirations_eviction) for the horizon; it still does no store
+I/O. Coverage is exactly what the caller passes: on 2026-09-28 (cc-09)
+`aspirations-read.sh --source world --active-compact` held 11,879 evicted ids,
+`--source world --archive` 957 more and `--source agent --active-compact` 115.
 
 3 rather than 1 for DECLINE is deliberate, mirroring deploy-hold-check.sh:
 collapsing "an owner exists" and "the probe broke" onto one non-zero code makes
@@ -73,7 +97,7 @@ BATCH MODE (g-306-458) — the drain shape, satisfying gap-162 by EXTENSION
          --goal-status pending,in-progress,completed,skipped --full \
       | py -3 core/scripts/sq013-dedup-probe.py \
             --subjects-file <path-to-json-array-of-capture-records> \
-            --positive-control \
+            --positive-control [--census-file <aspiration records>] \
             [--session-start <ISO>] [--window-hours 72]
 
 gap-162 ("durable spark_capture drain") recurs structurally: workers cannot
@@ -123,9 +147,12 @@ tried and the key distribution is reported (guard-4044).
 import argparse
 import json
 import math
+import os
 import re
 import sys
 from datetime import datetime, timedelta
+
+from _goal_census import all_evicted_ids, evicted_status_in
 
 # Terminal statuses a duplicate can hide in. `superseded` and `expired` are
 # included because guard-4938 names them alongside completed/skipped; a goal in
@@ -344,6 +371,35 @@ def _headline(text):
 SUBJECT_COVERAGE_MIN = 0.40              # candidate shares ONE rare token
 SUBJECT_COVERAGE_MIN_MULTI_RARE = 0.30   # candidate shares two or more
 
+# ── The multi-rare band is a READING ASSIGNMENT, not a DECLINE () ──
+# Two shared rare tokens are no stronger identity evidence than one when both
+# NAME THE SAME COMPONENT: a file and its field, a slot and its flag. Any goal
+# about that component carries both, whatever defect it tracks. Measured on the
+#  replays (2026-09-27/28, live 3,989-goal corpus): both false DECLINEs
+# of the occ228 batch -- a mirror-health class-(a) relay cited  (a
+# stale-streak repair goal) on owncloud-conflict-streaks + diverged_skipped at
+# coverage 0.36; an encoding_capture non-dict relay cited  (a
+# staged-WM drain goal) on encoding_capture + load_bearing at 0.34 -- and 4 of
+# the 5 occ238 wrong-owner DECLINEs (0.33-0.39, including 's truly
+# unowned work) sat in [MULTI_RARE, MIN). The batch's 5 correct DECLINEs sat at
+# 0.41-0.89. In the 2026-08-24 capture cohort 10 of 61 DECLINEs fell in the
+# band; reading each owner's title against its relay's headline found 7 wrong
+# owners and 3 plausible ones.
+#
+# So a candidate admitted ONLY by the multi-rare floor is kept and CITED -- it
+# may still be the owner -- but the decision is MUST-READ, never a terminal
+# DECLINE: a false DECLINE is deleted with its relay at drain (guard-5147),
+# while MUST-READ is audible (rc 4). A candidate at or above
+# SUBJECT_COVERAGE_MIN outranks any band candidate, however heavy, so a real
+# owner is never hidden behind a same-topic one. The title-token test the goal
+# proposed was measured and REJECTED: two of the five correct DECLINEs share no
+# title token with their owner (a relay writes `closure-evidence-write`, the
+# owner's title says `closure-evidence`), as do three of the six wrong owners,
+# while another wrong owner's title shares three.
+# Residual, stated so nobody reads this as a class fix: a same-topic owner at
+# coverage >= 0.40 still DECLINEs (occ238's  relay cited 
+# at 0.45), which is why every cited owner's matched span is printed.
+
 # Coverage is read from the OWNER's opening too, for the mirror-image reason the
 # subject is capped: a long record covers any subject's tokens by size alone.
 # Measured on the first cut of this gate (2,078 archived sq-013 relays, live
@@ -405,6 +461,90 @@ def window_start(now, session_start=None, window_hours=DEFAULT_WINDOW_HOURS):
     return min(fixed, session_start)
 
 
+# ── eviction horizon () ─────────────────────────────────────────────
+# Goal ids a relay cites. Word-bounded, so a board id like "msg-2026..." never
+# reads as one.
+_GOAL_ID_RE = re.compile(r"\bg-\d+-\d+\b")
+
+
+def evicted_citations(subject, goals, census, source_id=None):
+    """Pure. Goal ids the relay cites that the corpus cannot score because they
+    were EVICTED: [{"goal_id", "status", "via"}], via the shared census helper
+    (guard-5278). `source_id` is the capture record's own goal_id, checked first
+    (via="source"): the relay's source goal can itself be the owner, as when
+    g-363-177 was filed for work that had shipped under its source g-363-72.
+    Ids in the subject text follow (via="subject"). An id the corpus holds was
+    scored, so it is skipped. None when no census was supplied: NOT CHECKED
+    must never read as "checked, none" (guard-1753)."""
+    if census is None:
+        return None
+    live = {g.get("id") for g in (goals or []) if isinstance(g, dict)}
+    cands = [(source_id, "source")] if isinstance(source_id, str) else []
+    cands += [(gid, "subject")
+              for gid in _GOAL_ID_RE.findall(str(subject or ""))]
+    out, seen = [], set()
+    for gid, via in cands:
+        if not gid or gid in seen or gid in live:
+            continue
+        seen.add(gid)
+        status = evicted_status_in(census, gid)
+        if status:
+            out.append({"goal_id": gid, "status": status, "via": via})
+    return out
+
+
+def _fmt_cites(cites):
+    return ", ".join("%s (%s%s)" % (c["goal_id"], c["status"],
+                                    "; the relay's source goal"
+                                    if c.get("via") == "source" else "")
+                     for c in cites)
+
+
+def _evicted_reason(cites):
+    return ("no owner the corpus could score, but the relay cites terminal "
+            "goal(s) EVICTED from it: %s" % _fmt_cites(cites))
+
+
+def load_eviction_config(path=None):
+    """(block, error): `aspirations_eviction` from core/config/aspirations.yaml,
+    the file aspirations-evict-tick.sh reads. Never raises."""
+    path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                os.pardir, "config", "aspirations.yaml")
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as fh:
+            block = (yaml.safe_load(fh) or {}).get("aspirations_eviction")
+    except Exception as exc:                       # reported, never defaulted
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    if not isinstance(block, dict):
+        return None, "no aspirations_eviction block in %s" % path
+    return block, None
+
+
+def terminal_horizon(now, block, error=None):
+    """Pure. The oldest terminal owner a LIVE-queue corpus can still hold.
+
+    Evicted goals are census-only, so a FILE is "no owner since the horizon",
+    never "no owner ever". An unreadable config is UNKNOWN, never a default: a
+    guessed horizon would state coverage nobody measured (guard-1753)."""
+    try:
+        age = float((block or {})["age_days"])
+    except (KeyError, TypeError, ValueError):
+        return {"state": "unknown", "horizon": None, "age_days": None,
+                "detail": "UNKNOWN (%s)" % (error or "no readable age_days")}
+    if not (block.get("enabled") and block.get("apply")):
+        return {"state": "inactive", "horizon": None, "age_days": age,
+                "detail": ("none: eviction is off (enabled=%s, apply=%s); "
+                           "goals evicted while it ran stay census-only"
+                           % (block.get("enabled"), block.get("apply")))}
+    h = (now - timedelta(days=age)).replace(microsecond=0)
+    return {"state": "active", "horizon": h.isoformat(), "age_days": age,
+            "detail": ("%s (aspirations_eviction.age_days=%g). A terminal "
+                       "owner closed before it may be EVICTED, and this probe "
+                       "cannot score one; for it FILE means only 'no LIVE "
+                       "owner'" % (h.isoformat(), age))}
+
+
 def decide(subject, goals, now, session_start=None,
            window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2,
            reference_time=None):
@@ -418,13 +558,26 @@ def decide(subject, goals, now, session_start=None,
     `reference_time` anchors that terminal window (g-306-512); it defaults to
     `now`, so a live relay is scored exactly as before. A BACKLOG relay is
     scored weeks after capture, and its owner most likely went terminal near
-    the relay's OWN time, not near replay-time — anchoring on `now` there is
-    structurally blind to that owner, so every backlog relay reads FILE (the
-    g-306-284 measurement: 25 backlog relays, all FILE, one already fixed
-    upstream). batch_decide passes each record's `_item_ts` here. Because the
-    floor below is a min() with session_start, a per-record anchor can only move
-    the window EARLIER for an old relay — it widens a false FILE into a DECLINE
-    but never narrows a live relay's window.
+    the relay's OWN time, not near replay-time (the g-306-284 measurement: 25
+    backlog relays, all FILE, one already fixed upstream). batch_decide passes
+    each record's `_item_ts` here. Because the floor below is a min() with
+    session_start, a per-record anchor can only move the window EARLIER.
+
+    THE ANCHOR CANNOT SCORE AN OWNER THE CORPUS NO LONGER HOLDS (g-306-522).
+    Terminal non-recurring goals are evicted after aspirations_eviction.age_days
+    (3), about where the fixed 72h lookback already stops. So for a backlog
+    relay the anchor adds only owners the evictor has not removed yet (about
+    one tick interval past the 72h mark) and goals it cannot date but this
+    probe can. It turns a false FILE into a DECLINE only while the owner is
+    still in the corpus, and for the backlog it was written for it is
+    near-inert. (That last point is inferred from the eviction cadence and the
+    census lookups, not instrumented.) An evicted owner the relay CITES is
+    surfaced by evicted_citations(); an uncited one is not.
+
+    A candidate admitted only by the multi-rare coverage floor is WEAK
+    (g-115-11127): it is still cited, but when every candidate is weak the
+    decision is MUST-READ, not DECLINE, and any candidate at or above
+    SUBJECT_COVERAGE_MIN outranks every weak one (see SUBJECT_COVERAGE_MIN).
     """
     # Score the relay's HEADLINE, not its evidence body (): a long
     # relay's cited-identifier tail is what lets an unrelated owner win the rare
@@ -506,6 +659,9 @@ def decide(subject, goals, now, session_start=None,
                      else SUBJECT_COVERAGE_MIN)
             if coverage < floor:
                 continue
+        # Admitted only by the multi-rare floor: same topic, not proven the
+        # same defect (). Live-IDF only, like the floors themselves.
+        weak = (not inert) and coverage < SUBJECT_COVERAGE_MIN
 
         if status in OPEN_STATUSES:
             when, in_window = _goal_time(g), True
@@ -529,14 +685,37 @@ def decide(subject, goals, now, session_start=None,
             "weight": round(weight, 2),
             "coverage": round(coverage, 2),
             "rare_tokens": rare[:5],
+            # The matched span: which shared tokens the owner's TITLE carries,
+            # so a reader sees a description-only match without opening it.
+            "title_overlap": sorted(overlap & cand_title)[:8],
+            "weak": weak,
             "title": (g.get("title") or "")[:120],
         })
 
-    # Strongest signal first, then most recent, so the cited id is the most
-    # defensible one rather than whichever the corpus happened to list first.
-    # Ranked by LENGTH-NORMALISED weight, not count — see the module header.
-    matches.sort(key=lambda m: (m["weight"], m["when"] or ""), reverse=True)
+    # A candidate that clears the full coverage floor first, then the strongest
+    # signal, then the most recent, so the cited id is the most defensible one
+    # rather than whichever the corpus happened to list first. Ranked by
+    # LENGTH-NORMALISED weight, not count — see the module header.
+    matches.sort(key=lambda m: (not m["weak"], m["weight"], m["when"] or ""),
+                 reverse=True)
 
+    if matches and matches[0]["weak"]:
+        top = matches[0]
+        return {
+            "decision": "MUST-READ",
+            "reason": ("same topic, not proven the same defect: %s (%s) "
+                       "restates %.2f of the relay subject, below the %.2f a "
+                       "DECLINE needs, and was admitted on %d shared rare "
+                       "tokens (%s)"
+                       % (top["goal_id"], top["status"], top["coverage"],
+                          SUBJECT_COVERAGE_MIN, len(top["rare_tokens"]),
+                          ", ".join(top["rare_tokens"]))),
+            "cited_goal_id": top["goal_id"],
+            "cited_status": top["status"],
+            "matches": matches[:10],
+            "window_start": start.isoformat(),
+            "scanned": len(goals or []),
+        }
     if matches:
         top = matches[0]
         return {
@@ -645,7 +824,8 @@ def extract_subject(record):
 
 
 def batch_decide(records, goals, now, session_start=None,
-                 window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2):
+                 window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2,
+                 census=None):
     """Pure. Run `decide` over N records against ONE already-loaded corpus.
 
     This is the whole point of batch mode: the naive shape pipes the full
@@ -680,8 +860,9 @@ def batch_decide(records, goals, now, session_start=None,
         key_counts[key] = key_counts.get(key, 0) + 1
         # Anchor the terminal window on THIS relay's capture time, not
         # replay-time (). wm.py stamps _item_ts on every capture
-        # append; a backlog relay scored weeks later would otherwise miss the
-        # owner that closed near its OWN time. Absent/unparseable -> None ->
+        # append. It reaches an owner that closed near the relay's OWN time
+        # only while that owner is still in the corpus; eviction usually has
+        # removed it (see decide(), ). Absent/unparseable -> None ->
         # decide() falls back to `now` (every pre- caller and record).
         ref = (_parse_ts(record.get("_item_ts"))
                if isinstance(record, dict) else None)
@@ -702,8 +883,19 @@ def batch_decide(records, goals, now, session_start=None,
             continue
         top = (res.get("matches") or [{}])[0] if res.get("matches") else {}
         cited_status = res.get("cited_status")
-        must_read = (res["decision"] == "DECLINE"
-                     and (cited_status or "").lower() in MUST_READ_STATUSES)
+        # decide() itself says MUST-READ when every owner is weak ().
+        weak_owner = res["decision"] == "MUST-READ"
+        must_read = weak_owner or (
+            res["decision"] == "DECLINE"
+            and (cited_status or "").lower() in MUST_READ_STATUSES)
+        reason = res.get("reason")
+        # FILE means "no owner the corpus could SCORE", and an evicted owner
+        # was never scored at all ().
+        evicted = evicted_citations(
+            subject, goals, census,
+            record.get("goal_id") if isinstance(record, dict) else None)
+        if res["decision"] == "FILE" and evicted:
+            must_read, reason = True, _evicted_reason(evicted)
         rows.append({
             "index": idx,
             "goal_id": (record.get("goal_id")
@@ -712,11 +904,14 @@ def batch_decide(records, goals, now, session_start=None,
             # disposition — it is a reading assignment (outcome 3).
             "verdict": "MUST-READ" if must_read else res["decision"],
             "subject_key": key,
-            "reason": res.get("reason"),
+            "reason": reason,
             "cited_goal_id": res.get("cited_goal_id"),
             "cited_status": cited_status,
             "cited_title": top.get("title"),
             "must_read": must_read,
+            "weak_owner": weak_owner,
+            "evicted_citations": evicted,
+            "item_ts": ref.isoformat() if ref else None,
             "subject": subject[:200],
             "matches": res.get("matches") or [],
         })
@@ -728,6 +923,10 @@ def batch_decide(records, goals, now, session_start=None,
             "records_unreadable": unreadable,
             "corpus_goals": len(goals or []),
             "subject_keys_used": key_counts,
+            # None = NOT CHECKED, distinct from a census holding 0 ids.
+            "census_aspirations": None if census is None else len(census),
+            "census_evicted_ids": (None if census is None else
+                                   sum(len(all_evicted_ids(a)) for a in census)),
         },
         "must_read_count": sum(1 for r in rows if r["must_read"]),
         "file_count": sum(1 for r in rows if r["verdict"] == "FILE"),
@@ -746,6 +945,17 @@ def render_batch(result):
     out.append("SUBJECT KEYS USED: %s"
                % (", ".join("%s=%d" % kv for kv in
                             sorted(pop["subject_keys_used"].items())) or "none"))
+    if pop.get("census_aspirations") is None:
+        out.append("EVICTION CENSUS: NOT CHECKED (no --census-file) -- a relay "
+                   "citing an EVICTED owner still reads FILE")
+    else:
+        out.append("EVICTION CENSUS: %d aspiration record(s), %d evicted id(s); "
+                   "cited goal ids resolved against it"
+                   % (pop["census_aspirations"], pop["census_evicted_ids"]))
+    hz = result.get("terminal_horizon") or {}
+    if hz:
+        out.append("TERMINAL-COVERAGE HORIZON: %s" % hz["detail"])
+    horizon = _parse_ts(hz.get("horizon"))
     out.append("")
     for r in result["rows"]:
         out.append("[%d] %-9s %s" % (r["index"], r["verdict"],
@@ -754,13 +964,42 @@ def render_batch(result):
             out.append("      owner: %s  STATUS=%s" % (r["cited_goal_id"],
                                                        r["cited_status"]))
             out.append("      title: %s" % (r["cited_title"] or "(none)"))
-        if r["must_read"]:
+            top = (r.get("matches") or [{}])[0]
+            out.append("      matched on: rare %s; owner TITLE shares %s; "
+                       "restates %s of the relay"
+                       % (", ".join(top.get("rare_tokens") or []) or "none",
+                          ", ".join(top.get("title_overlap") or [])
+                          or "NOTHING (description only)",
+                          top.get("coverage")))
+        if r.get("evicted_citations"):
+            out.append("      cites EVICTED: %s"
+                       % _fmt_cites(r["evicted_citations"]))
+        if r.get("weak_owner"):
+            out.append("      ^^ SAME TOPIC, NOT PROVEN THE SAME DEFECT: the "
+                       "owner restates the relay only below the %.2f floor a "
+                       "DECLINE needs. Read its title against the relay's "
+                       "defect; cite it only if it tracks THAT defect, else "
+                       "re-run the relay's reproduction and file "
+                       "(g-115-11127, guard-5553)." % SUBJECT_COVERAGE_MIN)
+        elif r["must_read"] and r["cited_goal_id"]:
             out.append("      ^^ TERMINAL-BUT-NOT-DONE owner. Read its "
                        "outcome_note before accepting this as a decline: a "
                        "skipped/expired goal can assert the OPPOSITE of the "
                        "observation it suppresses (guard-5147).")
+        elif r["must_read"]:
+            out.append("      ^^ NO SCORED OWNER, NOT NO OWNER: a cited goal was "
+                       "EVICTED, so this probe never scored it. Read it "
+                       "(goal-resolve.py <id> --recover) and re-run the relay's "
+                       "reproduction against HEAD before filing (guard-7398, "
+                       "guard-5278).")
         elif r["verdict"] in ("UNREADABLE", "PROBE-ERROR"):
             out.append("      %s" % r["reason"])
+        elif r["verdict"] == "FILE" and horizon:
+            ts = _parse_ts(r.get("item_ts"))
+            if ts and ts < horizon:
+                out.append("      AGED: captured %s, before the horizon -- this "
+                           "FILE means only 'no LIVE owner' (guard-7398)"
+                           % r["item_ts"])
     out.append("")
     out.append("TOTALS: file=%d decline=%d must-read=%d"
                % (result["file_count"], result["decline_count"],
@@ -781,6 +1020,11 @@ def main(argv=None):
                          "does not return FILE — a probe that declines "
                          "everything is indistinguishable from a working one "
                          "(guard-5889).")
+    ap.add_argument("--census-file", action="append", default=None,
+                    help="JSON aspiration records (e.g. aspirations-read.sh "
+                         "--source world --active-compact); repeatable. Goal "
+                         "ids the subject cites are resolved against their "
+                         "eviction census (g-306-522).")
     ap.add_argument("--session-start", default=None,
                     help="ISO start of the current session (widens the window)")
     ap.add_argument("--window-hours", type=float, default=DEFAULT_WINDOW_HOURS)
@@ -815,8 +1059,31 @@ def main(argv=None):
               "(guard-2298).", file=sys.stderr)
         return 2
 
+    # A census the caller asked for but that cannot be read is refused, never
+    # skipped: a FILE would then pass as census-checked (guard-1753).
+    census = None
+    for path in args.census_file or []:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            print("sq013-dedup-probe: --census-file %s unreadable (%s) — "
+                  "refusing to report anything." % (path, exc), file=sys.stderr)
+            return 2
+        if isinstance(data, dict):
+            data = data.get("aspirations") or []
+        recs = ([a for a in data if isinstance(a, dict)]
+                if isinstance(data, list) else [])
+        if not recs:
+            print("sq013-dedup-probe: --census-file %s parsed to ZERO "
+                  "aspiration records — refusing (guard-2298)." % path,
+                  file=sys.stderr)
+            return 2
+        census = (census or []) + recs
+
     now = _parse_ts(args.now) or datetime.now()
     session_start = _parse_ts(args.session_start)
+    horizon = terminal_horizon(now, *load_eviction_config())
 
     # Positive control (guard-5889). Runs against the SAME loaded corpus, so it
     # proves this run's probe can still say FILE — not merely that it could in
@@ -851,7 +1118,8 @@ def main(argv=None):
                   file=sys.stderr)
             return 2
         result = batch_decide(records, goals, now, session_start,
-                              args.window_hours, args.min_overlap)
+                              args.window_hours, args.min_overlap, census)
+        result["terminal_horizon"] = horizon
         print(render_batch(result))
         print(json.dumps(result, indent=2), file=sys.stderr)
         if control_failed:
@@ -863,9 +1131,16 @@ def main(argv=None):
 
     result = decide(args.subject, goals, now, session_start,
                     args.window_hours, args.min_overlap)
+    result["evicted_citations"] = evicted_citations(args.subject, goals, census)
+    result["terminal_horizon"] = horizon
+    if result["decision"] == "FILE" and result["evicted_citations"]:
+        result["decision"] = "MUST-READ"
+        result["reason"] = _evicted_reason(result["evicted_citations"])
     print(json.dumps(result, indent=2))
     if control_failed:
         return 2
+    if result["decision"] == "MUST-READ":
+        return 4
     return 3 if result["decision"] == "DECLINE" else 0
 
 

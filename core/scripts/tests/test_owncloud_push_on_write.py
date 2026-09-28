@@ -18,7 +18,11 @@ import json
 import os
 import subprocess
 import sys
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+import pytest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
@@ -32,7 +36,7 @@ SHIM = CORE_SCRIPTS / "owncloud-push-on-write.sh"
 
 
 def _run_shim(tmp_path, *, backend, file_path, world=None, meta=None,
-              stdin_text=None, dryrun=True):
+              stdin_text=None, dryrun=True, extra_env=None):
     """Invoke the shim as the hook harness would: JSON on stdin, env-steered."""
     env_local = tmp_path / "env.local"
     env_local.write_text(f"STORAGE_BACKEND={backend}\n", encoding="utf-8")
@@ -41,6 +45,16 @@ def _run_shim(tmp_path, *, backend, file_path, world=None, meta=None,
     env["OWNCLOUD_PUSH_HOOK_ENV_LOCAL"] = str(env_local)
     if dryrun:
         env["OWNCLOUD_PUSH_HOOK_DRYRUN"] = "1"
+    else:
+        # A real run must never reach a real store. If the fake daemon is ever
+        # missed, the CLI fallback runs: strip inherited store config, and keep
+        # the inherited PYTEST_CURRENT_TEST so storage_backend's .env.local
+        # self-heal stays off (guard-955).
+        for k in [k for k in env if k.startswith(("MIND_AWS_", "AWS_", "STORAGE_"))
+                  or k in ("ENVIRONMENT_ID", "ENV_BOOTSTRAP_ALLOW_PYTEST")]:
+            env.pop(k)
+    if extra_env:
+        env.update(extra_env)
     if world is not None:
         env["MIND_WORLD"] = str(world)
     if meta is not None:
@@ -224,6 +238,84 @@ def test_unknown_environment_id_fast_exits(tmp_path):
         file_path=str(target), world=world)
     assert r.returncode == 0
     assert "would push" not in r.stdout
+
+
+# ---  outcome 4: a push that did not land reaches the MODEL ----------
+# An exit-0 hook's stderr never enters the model's context (guard-1680), and
+# ok:true is not pushed (guard-5663): a both-diverged skip answers ok:true,
+# pushed:0, diverged_skipped:1, which this hook used to report as "daemon push
+# ok". A fake daemon on a tmp port file (OWNCLOUD_PUSH_HOOK_PORT_FILE) drives
+# the REAL curl + verdict path, never the live daemon.
+
+def _fake_daemon_run(tmp_path, body):
+    hits = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            hits.append(self.path)
+            data = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    world = tmp_path / "world"
+    (world / "conventions").mkdir(parents=True)
+    target = world / "conventions" / "x.md"
+    target.write_text("x\n", encoding="utf-8")
+    srv = HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    port_file = tmp_path / "daemon.port"
+    port_file.write_text(str(srv.server_address[1]), encoding="utf-8")
+    try:
+        r = _run_shim(tmp_path, backend="own-cloud", file_path=str(target),
+                      world=world, dryrun=False,
+                      extra_env={"OWNCLOUD_PUSH_HOOK_PORT_FILE": str(port_file)})
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert hits, f"fake daemon never called; stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert r.returncode == 0   # fail-open by contract (guard-141)
+    return r
+
+
+def _model_context(r):
+    out = r.stdout.strip()
+    if not out.startswith("{"):
+        return None
+    hso = json.loads(out)["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PostToolUse"
+    return hso["additionalContext"]
+
+
+@pytest.mark.parametrize("body, reaches_model", [
+    ({"ok": True, "pushed": 1, "in_sync": 0, "diverged_skipped": 0, "errors": 0}, False),
+    ({"ok": True, "pushed": 0, "in_sync": 1}, False),
+    ({"ok": True, "pushed": 0, "diverged_merged": 1}, False),
+    ({"ok": True, "pushed": 0, "reason": "machine_local"}, False),
+    ({"ok": True, "pushed": 0, "in_sync": 0, "diverged_skipped": 1, "errors": 0}, True),
+    ({"ok": True, "pushed": 0, "stale_pulled": 1}, True),
+    ({"ok": True, "pushed": 0, "reason": "missing_or_dir"}, True),
+    ({"ok": False, "pushed": 0, "errors": 1,
+      "error_paths": [{"phase": "union-merge-push"}]}, True),
+])
+def test_push_verdict_reaches_the_model_only_when_it_did_not_land(
+        tmp_path, body, reaches_model):
+    r = _fake_daemon_run(tmp_path, body)
+    ctx = _model_context(r)
+    if reaches_model:
+        assert ctx and "x.md" in ctx, (r.stdout, r.stderr)
+        assert "until the next sweep" not in ctx
+        # The terminal keeps its copy. ASCII probe only: stderr is decoded by
+        # locale, and the message carries an em dash.
+        assert "[owncloud-push-on-write]" in r.stderr and "x.md" in r.stderr
+    else:
+        assert ctx is None, ctx
+        assert "daemon push ok" in r.stdout
 
 
 # --- : PostToolUse wiring invariant ----------------------------------

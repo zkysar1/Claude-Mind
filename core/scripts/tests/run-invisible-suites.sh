@@ -3,8 +3,11 @@
 # core/scripts/tests and report per-file pass/fail plus an aggregate verdict.
 #
 # TWO populations are invisible to `pytest core/scripts/tests`:
-#   (1) main()-style .py files — zero top-level `def test_` functions, so
-#       pytest collects nothing from them (detected dynamically below).
+#   (1) main()-style .py files — zero pytest-collected tests: no top-level
+#       `def test_`/`async def test_`, no `class Test*`, and no
+#       unittest.TestCase subclass (pytest collects those whatever their
+#       name). Detected dynamically below with a 1:1 bash-ERE port of
+#       run-scoped-suite.py's _TOP_LEVEL_TEST ().
 #   (2) shell tests — .sh files, which pytest cannot collect AT ALL. Every
 #       shell test here is invisible by construction, so unlike the .py half
 #       there is no shape predicate to apply: the glob IS the population.
@@ -34,9 +37,23 @@
 #   bash core/scripts/tests/run-invisible-suites.sh [--list | --resolve-only]
 #     --list          print the enumerated invisible files (both halves) and exit
 #     --resolve-only  print the bound-agent resolution verdict and exit
+#   bash core/scripts/tests/run-invisible-suites.sh --files FILE [FILE ...]
+#     --files         DELEGATED mode ( outcome 2): run ONLY the given
+#                     files (repo-relative or absolute, .py or .sh) through the
+#                     same dispatch (QUARANTINE, per-file timeout, tally). This
+#                     is how run-scoped-suite.py executes selected zero-test
+#                     files: pytest collects 0 tests from a main()-style file,
+#                     so no pytest invocation can ever run it — this runner is
+#                     the only one that can. Unlike the full-enumeration mode,
+#                     an unbound --files run FAILS (exit 2): the caller asked
+#                     "did these files pass?", and "I didn't run them" is not
+#                     a pass, so it must not read as one (silent-signal class,
+#                     guard-1760). --files does not combine with --list /
+#                     --resolve-only.
 #
-# Exit: 0 when every file passes (or the run SKIPs unbound), 1 when any
-# fails, 0 on --list / --resolve-only.
+# Exit: 0 when every file passes (or the full run SKIPs unbound), 1 when any
+# fails, 0 on --list / --resolve-only, 2 on a --files setup error (no files,
+# unknown path, unbound).
 #
 # NOTE: files run SEQUENTIALLY — several main()-style suites are
 # standalone-required (rb-2078) or spawn tmp-world subprocesses that would
@@ -114,6 +131,49 @@ if [ "${1:-}" = "--resolve-only" ]; then
   exit 0
 fi
 
+# ---- --files mode ( outcome 2) -----------------------------------
+# Delegated run: run ONLY the given files through the same dispatch (QUARANTINE,
+# per-file timeout, tally) below. This is how run-scoped-suite.py executes its
+# selected zero-test files. Resolved to absolute paths here so the dispatch
+# loops (which iterate the arrays) see one form. Parsing happens BEFORE the
+# enumeration block, and the two mode-exclusive flags are rejected, so a
+# delegated run can never print or exit on the enumerated population.
+FILES_MODE=""
+DELEGATED_FILES=()
+if [ "${1:-}" = "--files" ]; then
+  FILES_MODE=1
+  if [ "$#" -lt 2 ]; then
+    echo "ERROR: --files requires at least one FILE" >&2
+    exit 2
+  fi
+  shift
+  for f in "$@"; do
+    case "$f" in
+      --list|--resolve-only)
+        echo "ERROR: --files does not combine with $f" >&2; exit 2;;
+    esac
+    base="${f##*/}"
+    case "$f" in
+      *.py)
+        case "$base" in test_*) ;; *)
+          echo "ERROR: --files accepts test_*.py (got $f)" >&2; exit 2;; esac;;
+      *.sh)
+        case "$base" in test_*|test-*) ;; *)
+          echo "ERROR: --files accepts test_*.sh / test-*.sh (got $f)" >&2; exit 2;; esac;;
+      *)
+        echo "ERROR: --files accepts .py or .sh test files (got $f)" >&2; exit 2;;
+    esac
+    if [ -f "$f" ]; then
+      DELEGATED_FILES+=("$(cd "$(dirname "$f")" && pwd)/${base}")
+    elif [ -f "$PROJECT_ROOT/$f" ]; then
+      DELEGATED_FILES+=("$PROJECT_ROOT/$f")
+    else
+      echo "ERROR: --files path not found: $f" >&2
+      exit 2
+    fi
+  done
+fi
+
 # QUARANTINE — known-red files, each with a triage verdict and an open goal.
 # Quarantined files are SKIPPED (listed loudly, never run) so the aggregate
 # verdict stays meaningful for the healthy population. Remove a file from
@@ -151,14 +211,24 @@ declare -A QUARANTINE=(
   #     from the legacy .history/<file>/ layout to the Stage-2 CAS-delta store.
 )
 
-# Dynamic enumeration: main()-style = zero top-level `def test_` functions.
+# Dynamic enumeration: main()-style = zero pytest-collected tests.
+# The predicate is a 1:1 bash-ERE port of run-scoped-suite.py's
+# _TOP_LEVEL_TEST ( outcome 1): the old `^def test_`-only form
+# missed async defs, `class Test*` and unittest.TestCase subclasses, so it
+# flagged pytest-collectable files as invisible and the old runner passed 10
+# of them VACUOUSLY (rc=0, zero tests executed, measured 2026-09-27 zc-10
+# over the 58 old false positives: 41 executed / 10 vacuous in-scope).
+# ERE == PCRE for this pattern (no backrefs; [[:blank:]] == \s here), so the
+# port is exact: verified 2026-09-27 against the Python predicate over all
+# 1587 test files in the three pytest.ini testpaths — 0 divergences.
 # nullglob: with no test_*.py matches the loop body never runs (default bash
 # would pass the LITERAL pattern through — the pre-fix SCRIPT_DIR clobber
 # produced exactly that "FAIL test_*.py" phantom; guard-1136).
+_INVIS_RE='^(async[[:blank:]]+)?def test_|^class Test|^class [A-Za-z0-9_]+\([^)]*TestCase'
 shopt -s nullglob
 mapfile -t INVISIBLE < <(
   for f in "$TESTS_DIR"/test_*.py; do
-    grep -qE '^def test_' "$f" || echo "$f"
+    grep -qE "$_INVIS_RE" "$f" || echo "$f"
   done
 )
 # Shell half: BOTH separators. This directory uses test_*.sh (14) and
@@ -177,7 +247,7 @@ mapfile -t INVISIBLE_SH < <(
 )
 shopt -u nullglob
 
-if [ ${#INVISIBLE[@]} -eq 0 ] && [ ${#INVISIBLE_SH[@]} -eq 0 ]; then
+if [ -z "${FILES_MODE:-}" ] && [ ${#INVISIBLE[@]} -eq 0 ] && [ ${#INVISIBLE_SH[@]} -eq 0 ]; then
   echo "invisible-suites: 0 pytest-invisible files — population fully pytest-collectable"
   exit 0
 fi
@@ -195,6 +265,17 @@ fi
 # a reader can never mistake it for coverage (rb-5650 looks-like-coverage).
 # (--list above still works unbound: enumeration invokes nothing.)
 if [ -z "${MIND_AGENT:-}" ]; then
+  if [ -n "${FILES_MODE:-}" ]; then
+    # A delegated run is a REFUSAL, not a skip ( outcome 2): the
+    # caller asked "did these files pass?", and the full-enumeration skip
+    # semantics below (loud banner, exit 0) would read as green through
+    # run-scoped-suite.py's delegation contract. Unbound here means
+    # "could not verify" — exit 2, never 0.
+    echo "invisible-suites: --files REFUSED — no resolvable agent binding (g-115-4141)"
+    echo "  MIND_AGENT unset; running-session-id files=${#_rsids[@]}, local-paths.conf files=${#_confs[@]} under $AGENTS_ROOT_DIR"
+    echo "  A delegated run must be bound: 'did not run' must not read as pass."
+    exit 2
+  fi
   echo "════════════════════════════════════════"
   echo "invisible-suites: SKIPPED — no resolvable agent binding (g-115-4141)"
   echo "  MIND_AGENT unset; running-session-id files=${#_rsids[@]}, local-paths.conf files=${#_confs[@]} under $AGENTS_ROOT_DIR"
@@ -207,6 +288,22 @@ fi
 # run are different launch contexts, and the log line is the only place that
 # distinction survives.
 echo "invisible-suites: agent=$MIND_AGENT resolution=$AGENT_RESOLUTION"
+
+# --files mode: the dispatched population is the DELEGATED set, not the
+# enumeration. Split it into the two existing arrays (keeping the .py vs .sh
+# dispatch and the "(shell)" marker) so both loops below run it through the
+# same QUARANTINE + per-file timeout + tally with no second dispatch path.
+if [ -n "${FILES_MODE:-}" ]; then
+  INVISIBLE=()
+  INVISIBLE_SH=()
+  for f in "${DELEGATED_FILES[@]}"; do
+    case "$f" in
+      *.py) INVISIBLE+=("$f");;
+      *)    INVISIBLE_SH+=("$f");;
+    esac
+  done
+  echo "  delegated via --files: ${#INVISIBLE[@]} .py + ${#INVISIBLE_SH[@]} shell"
+fi
 
 PASSES=0
 FAILS=0

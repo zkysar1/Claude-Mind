@@ -36,7 +36,9 @@ verification:
     - "Node has at least 1 source article"
   checks:          # Machine-verifiable conditions (replaces completion_check)
     - type: file_check
-      target: world/knowledge/tree/_tree.yaml
+      path: world/knowledge/tree/_tree.yaml   # `target` is accepted as an alias
+      condition: exists                       # exists | not_exists ONLY — other text is unevaluable
+    - type: not_machine_checkable             # a criterion no predicate can test: LLM-verified in Phase 5
       condition: "Has at least one L2 node registered"
   preconditions:   # What must be true before execution (mixed form — see below)
     - "Root domain node exists (from g-001-00 or bootstrap)"   # string: LLM-evaluated
@@ -50,7 +52,7 @@ desiredEndState: "At least one L2 node exists..."   # → verification.outcomes[
 completion_check:                                    # → verification.checks[0]
   type: file_check
   target: world/knowledge/tree/_tree.yaml
-  condition: "Has at least one L2 node registered"
+  condition: exists
 ```
 
 `verification.outcomes` = what success looks like (for spark checks, aspiration assessment).
@@ -348,7 +350,7 @@ Goals that re-fire on a schedule use these fields:
 - `remind_days`: DEPRECATED — converted to `interval_hours * 24` for backward compatibility. Use `interval_hours` for new goals.
 - `lastAchievedAt`: `YYYY-MM-DDTHH:MM:SS` — full ISO 8601 timestamp of last completion. Legacy `YYYY-MM-DD` format is accepted (assumes start of day).
 - `achievedCount`: integer — total times completed
-- `currentStreak`: integer — consecutive on-time completions. Resets to 1 when `hours_since(lastAchievedAt) > 2 * interval_hours` at completion time (missed interval). First completion always starts at 1.
+- `currentStreak`: integer — consecutive on-time completions. Resets to 1 when `hours_since(lastAchievedAt) > streak_mult * interval_hours` at completion time (missed interval; `streak_mult` is `recurring.streak_mult` in `core/config/aspirations.yaml`). First completion always starts at 1.
 - `longestStreak`: integer — best streak ever
 - `windowStreak`: integer (default 0, schema-additive) — tolerant streak counting cycles within `windowStreakMultiplier × interval_hours`. Distinct from `currentStreak`: tolerates wider gaps for "fire at least once per N intervals" semantics. Origin: LifingPolls plan item 6 (2026-05-08).
 - `longestWindowStreak`: integer (default 0) — best window streak ever.

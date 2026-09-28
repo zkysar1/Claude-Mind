@@ -163,7 +163,9 @@ if len(sys.argv) > 4 and sys.argv[4] == '1':
     else:
         try:
             import _fileops
-            _fileops.durable_write_text(conv, updated)
+            # newline='' keeps the synced file LF: text mode on Windows rewrote
+            # every line as CRLF, a whole-file diff for a one-line stamp (guard-7127).
+            _fileops.durable_write_text(conv, updated, newline='')
         except Exception as e:  # never let a stamp failure change the verdict
             res['stamp'] = 'write failed: %s' % e
         else:

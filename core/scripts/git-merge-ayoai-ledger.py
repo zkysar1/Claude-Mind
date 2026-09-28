@@ -133,6 +133,55 @@ def _dump_jsonl(records: list) -> bytes:
     return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
 
+# retrieval_stats fields every writer only ever RAISES (both callers of
+# _experience_stats_spool.record, retrieve.py and utilization-feedback.py, pass
+# delta=1; a new record starts at 0). A lower value on one side is that side being
+# BEHIND, never an edit -> numeric MAX. Explicit on purpose (guard-1153): the
+# 10,169-record census (14 agents/*/experience*.jsonl blobs at bcc7897930) found
+# one-off audit ints stuffed into retrieval_stats (tree_nodes_loaded, guardrails,
+# ...) that are snapshots, not counters, so they ride the picked record like
+# every other field.
+_STATS_MAX_FIELDS = ("retrieval_count", "times_useful", "times_noise",
+                     "times_inferred_useful")
+
+
+def _merge_retrieval_stats(pick: dict, a: dict, b: dict) -> dict:
+    """Return ``pick`` with its retrieval_stats merged per field from a and b.
+
+    counters in _STATS_MAX_FIELDS -> MAX; last_retrieved -> newest non-null;
+    utility_ratio -> RECOMPUTED as times_useful / max(retrieval_count, 1), the
+    rule the spool and update_field apply. It is derived and goes DOWN as
+    retrieval_count grows, so it is never max-merged (guard-1153). Any other
+    field keeps pick's value. Symmetric in (a, b), so both vantages still write
+    the same bytes. A record without a retrieval_stats dict on both sides is
+    returned unchanged (g-306-525).
+    """
+    sa, sb = a.get("retrieval_stats"), b.get("retrieval_stats")
+    if not isinstance(sa, dict) or not isinstance(sb, dict):
+        return pick
+    picked = pick.get("retrieval_stats")
+    merged = dict(picked) if isinstance(picked, dict) else {}
+    for f in _STATS_MAX_FIELDS:
+        nums = [v for v in (sa.get(f), sb.get(f))
+                if isinstance(v, int) and not isinstance(v, bool)]
+        if nums:
+            merged[f] = max(nums)
+    dates = [v for v in (sa.get("last_retrieved"), sb.get("last_retrieved"))
+             if isinstance(v, str)]
+    if dates:
+        merged["last_retrieved"] = max(dates)
+    rc, tu = merged.get("retrieval_count"), merged.get("times_useful")
+    if (("utility_ratio" in sa or "utility_ratio" in sb)
+            and isinstance(rc, int) and not isinstance(rc, bool)
+            and isinstance(tu, int) and not isinstance(tu, bool)):
+        merged["utility_ratio"] = round(tu / max(rc, 1), 4)
+    if merged == picked:
+        return pick
+    out = dict(pick)
+    out["retrieval_stats"] = merged
+    return out
+
+
 def _three_way_id_merge(ours: list, theirs: list, base: list,
                         key_fields=("id",)) -> list:
     """3-way record merge: union MINUS the records the OTHER side deleted.
@@ -141,6 +190,23 @@ def _three_way_id_merge(ours: list, theirs: list, base: list,
       * on both sides            -> keep (unchanged, or concurrently added)
       * on one side, NOT in base -> that side ADDED it        -> keep
       * on one side, IS in base  -> the other side DELETED it -> DROP
+
+    RETRIEVAL_STATS IS MERGED PER FIELD on every both-sides arm (g-306-525).
+    Each arm picks a WHOLE record, and the both-edited / no-base arm picks by
+    `co > ct`. That is a commutative but semantically blind canonical compare:
+    null sorts above any date, and "99" above "100". Measured over 69 carrier
+    merges (2026-09-24..27): 164 both-edited experience records, every one of
+    them differing ONLY in retrieval_stats; in one of them the pick lost counts
+    (retrieval_count first). Separately, a Body's OWN integrate (e7cea9a844, no
+    base) kept retrieval_count 0 / last_retrieved null over 1 / '2026-09-27', and
+    the next carrier drain read that as a one-sided edit and applied it
+    (rb-12157).
+    _merge_retrieval_stats now decides those fields whichever side is picked:
+      * _STATS_MAX_FIELDS -> max (writers only raise them)
+      * last_retrieved    -> newest non-null
+      * utility_ratio     -> recomputed; it is decrement-able, so never max
+                             (guard-1153)
+    Every other field still follows the arm's pick.
 
     WHY THIS IS NOT A PLAIN UNION (g-115-4357). A union keeps everything present
     on either side, so a record one box REMOVED and a stale peer still holds
@@ -161,7 +227,10 @@ def _three_way_id_merge(ours: list, theirs: list, base: list,
     add/add, where no record can be in the base, so every record takes the
     "not in base" arm and nothing is dropped -- precisely the shape the original
     union was right about. That is what keeps this change ranking-neutral for
-    every merge that does not involve a removal.
+    every merge that does not involve a removal. ONE EXCEPTION (g-306-525): a
+    record on both sides whose retrieval_stats differ gets them merged per field,
+    because the union's pick could keep the side that was BEHIND. So
+    byte-identity to the legacy union holds only where retrieval_stats agree.
 
     COMMUTATIVE AND BYTE-IDENTICAL (guard-907, analogous — scope note below;
     g-115-4357). Every branch is symmetric in the `ours` and `theirs`
@@ -206,11 +275,11 @@ def _three_way_id_merge(ours: list, theirs: list, base: list,
             if co == ct:
                 out.append(o if _raw(o) <= _raw(t) else t)
             elif b_has and cm._canon(base_k[k]) == ct:
-                out.append(o)              # only OUR side edited it
+                out.append(_merge_retrieval_stats(o, o, t))   # only OUR side edited it
             elif b_has and cm._canon(base_k[k]) == co:
-                out.append(t)              # only THEIR side edited it
-            else:
-                out.append(o if co > ct else t)   # both edited, or no base
+                out.append(_merge_retrieval_stats(t, o, t))   # only THEIR side edited it
+            else:   # both edited, or no base
+                out.append(_merge_retrieval_stats(o if co > ct else t, o, t))
         elif b_has:
             continue                       # one side only AND in base -> deleted by the other
         else:

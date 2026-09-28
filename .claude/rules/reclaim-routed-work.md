@@ -35,31 +35,12 @@ Lane P is the one most often skipped, because a goal carrying
 `participants: [agent, user]` still *looks* like agent work and never
 appears in a blocked tally. It is the largest silent accumulator.
 
-## The Two Re-Check Axes (the load-bearing distinction)
-
-A routed-away item can be freed two different ways, and **checking only the
-first will hold work frozen indefinitely**:
-
-1. **The PREMISE axis — is the condition still true?**
-   Re-probe with the canonical code path. "The service is down" → is it
-   still down? This is what every existing recheck sweep does.
-
-2. **The RULE axis — is the reason still a legitimate reason?**
-   A standing grant, a new convention, a forged skill, or a user directive
-   can retire an entire class of excuse *while the underlying condition
-   remains perfectly true*. When that happens the premise probe keeps
-   returning "yes, still true" and correctly keeps the item frozen —
-   forever. No amount of re-probing can free it, because the probe is
-   answering a question that stopped being the deciding one.
+## The Two Re-Check Axes
 
 **Both axes must be checked.** An item is genuinely blocked only when the
-premise still holds AND the reason is still a valid reason to stop.
-
-Canonical incident (2026-07-28): a standing grant retired a `defer_reason`
-whose condition stayed true, and every sweep tested the premise, not the
-rule. Its trace, the measured cases behind rules 4 and 7, and the
-sweep-tooling map: `core/config/conventions/defer-routing.md` §5
-(`load-conventions.sh defer-routing`).
+PREMISE is still true (re-probe it) AND the REASON is still valid (a grant
+or convention can retire an excuse class while the condition stays true).
+Incident traces and sweep-tooling map: `core/config/conventions/defer-routing.md` §5.
 
 ## Rules
 
@@ -79,17 +60,9 @@ sweep-tooling map: `core/config/conventions/defer-routing.md` §5
    likely to be stale, so age selects what to re-check first. It never by
    itself justifies closing something. Close on evidence.
 
-4. **When you record a standing grant or convention that retires a class of
-   excuse, say so in machine-findable terms** — name the specific
-   `defer_reason` text, precondition id, blocker class, or `user_leg_scope`
-   token it invalidates. A grant whose consequence is buried in prose cannot
-   reach the sweep that needs it, which is precisely how the canonical
-   incident happened.
-   The obligation runs in BOTH directions: a routing that never declares WHY
-   the user is attached (`user_leg_scope`) cannot be re-derived by anything,
-   and a grant whose scope head avoids the shared vocabulary can never be
-   applied. Goal side: DONE (08-29). Grant side is the gap: re-derive the
-   count, never cite one (guard-5518, guard-6262).
+4. **Name grants machine-findably**: when recording a standing grant, name the
+   specific `defer_reason` text or `user_leg_scope` token it invalidates
+   (guard-5518, guard-6262).
 
 5. **Escalate what genuinely remains.** Items that survive both axes are the
    real human-only residue. Batch them into a digest for the next user
@@ -103,14 +76,9 @@ sweep-tooling map: `core/config/conventions/defer-routing.md` §5
    have not run in a long while, that is itself the finding: run them, and
    record that they were skipped.
 
-7. **A reclaim predicate must not be narrower than the gate that creates the
-   population** — the gate's *correct* operation then fills the blind spot and
-   the sweep reports clean forever (guard-1802, rb-5650). Before trusting any
-   reclaim sweep, diff its predicate against the creating gate's, literally,
-   and measure what it EXCLUDES. And the variant a predicate diff cannot
-   catch: **which store does the creating gate write DURABLY, and is that the
-   store I am reading?** (guard-1978, guard-1242). Widen the READ; do not
-   assume the WRITE widens with it.
+7. **A reclaim predicate must not be narrower than the creating gate** —
+   diff predicates literally (guard-1802, rb-5650), and check which store
+   the gate writes DURABLY vs which store you read (guard-1978, guard-1242).
 
 ## Anti-patterns
 

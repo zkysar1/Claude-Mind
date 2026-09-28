@@ -82,38 +82,48 @@ if goal.hypothesis_id:
 
 ## Unified Verification Checks
 
+### Mechanical Pre-flight (one call, g-375-48)
+
+Every check below that needs no judgement to RUN is one script and ONE call:
+the structured `checks[]`, Q1's closure-evidence table, artifact probe and
+positive-state audit, and Q4. It makes those steps' checkpoint, diary and
+sensory_buffer writes itself, and prints one verdict listing every finding
+with its remedy:
+
+```
+Bash: bash core/scripts/verify-preflight.sh --goal <goal-id> --source <source> \
+        [--artifact <Q1 file>]... [--source-file <cited source>] \
+        [--claim "<Q1 file-state claim>" --evidence "<in-turn Read/ls output>"] \
+        [--summary-file <closure note, when the record has none>]
+```
+
+rc 0 = nothing failed, 3 = a FAIL, 4 = a check could not run (not a pass).
+Never pipe it (guard-1150). Fix EVERY finding, then re-run it once. SKIPPED
+means the check did not apply and is not evidence. The sections below say
+what each of its lines means. Why: `core/scripts/verify-preflight.py`.
+
 ### Scripted Check Evaluation
 
 Structured `verification.checks[]` entries are evaluated by
-`verify-check-eval.sh` (sister script to `predicate.py`). Empty `checks[]`
+`verify-check-eval.sh --goal <goal-id> --all` (sister script to `predicate.py`),
+which the pre-flight runs; its `checks` line reads the flags. Empty `checks[]`
 falls through to the Q1/Q2/Q3 Empty-Checks Escalation Protocol below — the
 scripted path handles structured checks only; Q1/Q2/Q3 is the LLM-judgment
 path for investigation / novel-research goals that legitimately lack
 structured checks.
 
 ```
-Bash: bash core/scripts/verify-check-eval.sh --goal <goal-id> --all
-Read JSON result:
-  flags = []:                     all_passed → standard-pass path
-  flags = ["checks_empty"]:       fall through to Q1/Q2/Q3 (LLM evidence)
-  flags = ["checks_unevaluatable"]: fall through to Q1/Q2/Q3 — same as checks_empty
-  flags = ["checks_failed"]:      goal fails verification; mark pending; record blocker if warranted
-  flags = ["has_string_checks"]:  structured passed but string checks exist; run Q1/Q2/Q3 too
+checks line:
+  PASS    (flags = []):             all_passed → standard-pass path
+  SKIPPED (checks_empty):           fall through to Q1/Q2/Q3 (LLM evidence)
+  SKIPPED (checks_unevaluatable):   fall through to Q1/Q2/Q3 — same as checks_empty
+  FAIL    (checks_failed):          goal fails verification; mark pending; record blocker if warranted
+  "string check(s) are yours":      string checks exist (has_string_checks); run Q1/Q2/Q3 too
 ```
 
-`checks_unevaluatable` (g-115-4849) means the evaluator COULD NOT RUN one or
-more checks, as opposed to running them and finding the work undone. `all_passed`
-is **null** on that path, exactly as on `checks_empty` — nothing was verified, so
-it must not read `true`; nothing failed, so it must not read `false`. A genuine
-failure OUTRANKS an unevaluatable one: when both are present the flag is
-`checks_failed`, so an unevaluatable check can never launder a real failure into
-a fall-through; the tally survives in the separate `unevaluatable_count` field,
-which you read rather than inferring from flags.
-
-Why the flag exists, the measured size of the unevaluatable population (46.9% of
-145 structured checks, and why a type-name census under-counts it fourfold), and
-how wide this fall-through is (~98.7% of the live queue reaches Q1-Q4):
-`core/config/rationale/verify-check-unevaluatable.md`.
+`checks_unevaluatable` (g-115-4849) means the evaluator COULD NOT RUN a check,
+not that the work is undone, and a genuine failure outranks it. Why, and how
+wide this fall-through is: `core/config/rationale/verify-check-unevaluatable.md`.
 
 ### Sub-Phase Checkpoint Helper (shared by Q1/Q2/Q3 and standard checks)
 
@@ -233,27 +243,23 @@ this goal succeeded?" Must reference a checkable artifact.
   - If no concrete reference: `all_passed = false`.
 - **Closure-evidence table** (g-375-05, every scope): the closure note carries one
   `OUTCOME <n>: MET — <measured value>. Source: <...>` row per verification outcome
-  (spec: goal-schemas.md § Closure Evidence Table). Check it before the close does:
-  `py core/scripts/closure-evidence-gate.py --goal <id> --source <s> [--summary-file <note file>]`.
-  Exit 3 = Q1 FAIL (`all_passed = false`); fix the rows it names. do_verify runs the
-  same gate before the status write, so skipping this only moves the refusal later.
-- **On Q1 PASS** (artifact verified):
-  ```bash
-  bash core/scripts/loop-state-save.sh update --set "phase_progress.q1_passed=true" --set "phase_progress.q1_artifact=<artifact-path>"
-  echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q1 passed: artifact=<artifact-path>"}' | bash core/scripts/execution-diary.sh append
-  ```
+  (spec: goal-schemas.md § Closure Evidence Table). The pre-flight's
+  `closure-evidence` line is `closure-evidence-gate.py`, the gate do_verify runs
+  before the status write. FAIL = Q1 FAIL (`all_passed = false`); fix the rows it names.
+- **On Q1 PASS**: the pre-flight's `q1` line reads PASS when the table passed and
+  no artifact or claim failed, and it writes `phase_progress.q1_passed` and
+  `q1_artifact` with their diary line. OPEN (the table check did not apply):
+  judge Q1 yourself and write that pair per the Checkpoint Helper above.
 - **Positive-state audit on Q1 claim** (verify-before-assuming.md Positive
   File-State Claims): if the Q1 artifact claim references a specific file
   (e.g., "handoff.yaml reflects session N", "config.yaml contains Y"), the
   claim must be backed by an in-turn Read/ls/stat of that file — not narrated
-  from prior-session memory. Run:
-  ```bash
-  py core/scripts/positive-state-gate.py --claim "<Q1 artifact claim>" --evidence "<concatenated in-turn Read/ls outputs referencing the file>"
-  ```
-  Exit 1 = claim unverified → `all_passed = false`, status → pending, and
-  append `verification_gap` to sensory_buffer citing the gate reason. Re-read
-  the file before re-verifying. Known false positive → re-call with
-  `--override "<justification>"`.
+  from prior-session memory. Pass it to the pre-flight as `--claim`, with the
+  in-turn Read/ls outputs as `--evidence`; its `positive-state` line is
+  `positive-state-gate.py`'s verdict. FAIL = claim unverified → `all_passed = false`,
+  status → pending; the pre-flight appends the `verification_gap` to sensory_buffer.
+  Re-read the file before re-verifying. Known false positive → re-run with
+  `--override-positive-state "<justification>"`.
 
 **Q1.5 GENERATED CHECKLIST** (TICKing All the Boxes, 2410.03608 — BRD Gap 15;
 runs only when Q1 passed): decompose "did this goal succeed?" into a concrete,
@@ -349,22 +355,15 @@ APPEARED to succeed but actually failed? Did I check for that?"
 on sources this session actually fetched?" Runs only when Q1 named a concrete
 file artifact; skip otherwise.
 - `IF prior_checks.q4_passed`: log `"Q4 reused (prior checkpoint)"`; proceed.
-- Else run the sampler. You do NOT choose which claims it checks — that is the
-  point. Add `--source-file` when the goal cites a source the artifact must be
-  faithful to:
-  ```bash
-  bash core/scripts/q4-provenance-sample.sh --goal <goal.id> --artifact <Q1 artifact> [--source-file <cited source>]
-  ```
-- Exit `1` = FAIL (a sampled claim is uncited, decoratively cited, or reversed
-  against its source) → `all_passed = false`, status → pending, append each
-  finding to sensory_buffer as a `verification_gap`. Exit `0` is `pass` OR
-  `skipped` — **not the same answer**; never count `skipped` as evidence.
-  No override flag, by design.
-- **On Q4 assessed** (record BOTH keys):
-  ```bash
-  bash core/scripts/loop-state-save.sh update --set "phase_progress.q4_passed=<true|false>" --set "phase_progress.q4_verdict=<pass|fail|skipped>"
-  echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Q4 provenance: <verdict>, <sampled>/<total> cluster(s)"}' | bash core/scripts/execution-diary.sh append
-  ```
+- Else the pre-flight runs the sampler, `q4-provenance-sample.sh`, over each
+  `--artifact`. You do NOT choose which claims it checks — that is the point.
+  Add `--source-file` when the goal cites a source the artifact must be faithful to.
+- `q4` FAIL (a sampled claim is uncited, decoratively cited, or reversed against
+  its source) → `all_passed = false`, status → pending; the pre-flight appends
+  each finding to sensory_buffer as a `verification_gap`. SKIPPED is **not a
+  pass**; never count it as evidence. No override flag, by design.
+- **On Q4 assessed**, the pre-flight records BOTH keys, `phase_progress.q4_passed`
+  and `q4_verdict` (pass | fail | skipped), and the diary line.
   Why the sample is scripted, its three traps (worker `--session-id`, `cat`-read
   files, the bool that cannot hold `skipped`):
   `core/config/rationale/verify-check-unevaluatable.md` § Q4.
@@ -377,11 +376,9 @@ IF len(checks) > 0:
         log "Standard checks skipped (prior checkpoint: <N>/<N>)"
         all_passed = true
     ELSE:
-        all_passed = all(check_passes(c) for c in checks)
-        passed_count = sum(1 for c in checks if check_passes(c))
-        # Record outcome to checkpoint + diary
-        bash core/scripts/loop-state-save.sh update --set "phase_progress.standard_checks_passed=<passed_count>/<len(checks)>"
-        echo '{"entry_type":"finding","goal_id":"<goal.id>","content":"Verify: <passed_count>/<len(checks)> standard checks passed"}' | bash core/scripts/execution-diary.sh append
+        all_passed = (the pre-flight's checks line reads PASS)
+        # It records phase_progress.standard_checks_passed=<passed>/<total>
+        # and the diary line itself.
 ```
 
 ### On Pass
@@ -471,7 +468,7 @@ not the wrong number, is the real cost. Why:
 interval = goal.interval_hours (fallback: remind_days * 24, default: 24)
 elapsed  = hours_since(goal.lastAchievedAt)   # read BEFORE the overwrite
                                               # (this is why a hand-write corrupts it)
-if elapsed is not None and elapsed > 2 * interval:
+if elapsed is not None and elapsed > streak_mult * interval:  # streak_mult: SSOT core/config/aspirations.yaml recurring.streak_mult
     new_streak = 1                 # Missed interval — reset
 else:
     new_streak = currentStreak + 1

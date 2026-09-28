@@ -371,9 +371,13 @@ def test_start_cw1a_prescribed_shape_is_not_refused():
     only that it REFUSES). Without the positive control below, this test would
     still pass if the guard stopped refusing anything at all.
     """
+    # The shape CW1a prescribes since  (local_ahead>0 folded into rc=3).
     prescribed = (
-        "bash core/scripts/owncloud-pull.sh --agent zeta "
-        "--only working-memory.yaml; echo \"CW1A_FRESH_RC=$?\""
+        "CW1A_OUT=\"$(bash core/scripts/owncloud-pull.sh --agent zeta "
+        "--only working-memory.yaml 2>&1)\"; CW1A_FRESH_RC=$?; printf '%s\\n' \"$CW1A_OUT\"; "
+        "case \"$CW1A_OUT\" in *\" local_ahead=0 \"*) ;; *\" local_ahead=\"*) "
+        "[ \"$CW1A_FRESH_RC\" -eq 0 ] && CW1A_FRESH_RC=3 ;; esac; "
+        "echo \"CW1A_FRESH_RC=$CW1A_FRESH_RC\""
     )
     decision, reason = run(prescribed)
     assert decision == "allow", (

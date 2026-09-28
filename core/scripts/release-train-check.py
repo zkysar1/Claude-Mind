@@ -13,13 +13,21 @@ release-train goal exists for the newest tag, and nothing otherwise. It is the
 in-turn half of the probe's goal: the goal is the lease that carries the
 disposal, the line makes the reducer SEE it every iteration whether or not the
 selector ever ranks the goal (guard-3746). Closing the goal deliberately
-therefore silences the line until the probe re-files. Always exits 0.
+therefore silences the line until the probe re-files. When the train is not
+due it returns before the goal store is read. It exits 0; iteration-close.sh
+also runs it with `|| true`.
 
-Reads local refs: run `git fetch origin main` first when the basis matters —
-`fetch_age_minutes` in --json says how old it is.
+THE BASIS IS FETCHED, NOT ASSUMED. The default and --json modes fetch
+origin/main AND the v* tags before measuring; the manual equivalent is
+`git fetch origin main --tags`. A bare `git fetch origin main` brings no tags,
+so on a box that did not cut the newest tag it leaves the previous tag reading
+as newest (g-115-11144). --nudge runs every iteration, so it fetches only when
+the local reading is due. The fetch writes refs only (origin/main and the v*
+tags), never the working tree or the index. `tag_basis` in --json says which
+basis the verdict rests on; RELEASE_TRAIN_NO_FETCH=1 disables the fetch.
 
 Exit (default and --json): 0 not due, or not this deployment's train;
-2 due; 1 unmeasured (a git read failed).
+2 due; 1 unmeasured (a git read or the basis fetch failed).
 """
 from __future__ import annotations
 
@@ -60,14 +68,17 @@ def main(argv=None) -> int:
         return 0
 
     cfg = rt.config()
-    m = rt.measure(repo, rt.framework_paths())
+    m = rt.measure_with_basis(repo, rt.framework_paths(), cfg["stale_hours"],
+                              always=not args.nudge)
     verdict = rt.decide(m, cfg["stale_hours"])
     signal = rt.signal_for(m["newest_tag"]) if m.get("newest_tag") else None
+    if args.nudge and not verdict["due"]:
+        return 0  # nothing to say, so the goal store is never read ()
     goals = rt.open_release_goals(world, agent_dir)
     current = [g.get("id") for g in goals if g.get("origin_signal") == signal]
 
     if args.nudge:
-        if verdict["due"] and current:
+        if current:
             gid = current[0]
             print(f"[release-train] LLM-ACTION: release train stalled - {verdict['reason']}; "
                   f"open goal {gid} holds the disposal: cut and promote per "
@@ -85,6 +96,9 @@ def main(argv=None) -> int:
     else:
         state = "DUE" if verdict["due"] else ("UNMEASURED" if m.get("error") else "ok")
         tail = f" Open goal: {', '.join(current)}." if current else ""
+        basis = m.get("tag_basis")
+        if basis and basis != "fetched" and not m.get("error"):
+            tail += f" [basis: {basis}]"
         print(f"release-train: {state} - {verdict['reason']}.{tail}")
     if m.get("error"):
         return 1

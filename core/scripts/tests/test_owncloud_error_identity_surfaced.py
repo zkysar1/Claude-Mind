@@ -157,13 +157,15 @@ def test_flush_payload_omits_the_key_when_clean(monkeypatch):
 # ------------------------------------------------------------------ harness
 
 class _Ctx:
-    """Minimal ctx: the two endpoints read only .query and .paths.project_root."""
+    """Minimal ctx: the two endpoints read .query, .headers (the sync-file
+    endpoint's caller identity, g-375-40) and .paths.project_root."""
 
     class _P:
         project_root = Path(__file__).resolve().parents[3]
 
     def __init__(self, query=None):
         self.query = query or {}
+        self.headers = {}
         self.paths = self._P()
 
 

@@ -454,3 +454,55 @@ def test_park_paths_are_in_the_closed_enum():
     assert "worker-body-parked" in srr.NO_NOTIFY_PATHS
     assert "worker-park-expired" not in srr.NO_NOTIFY_PATHS, (
         "expiry hands recovery to a human and MUST reach them")
+
+
+# ------------------------------------- worker STALL park path ()
+#
+# The same park, the opposite notify verdict: the loop-exhaustion fence parks a
+# Body that kept ending turns while holding no claim, which is a defect a human
+# should see. Kept out of STOP_PATHS/CALLERS for the reason the park paths are:
+# the parametrized tests there assert a "/start" restart line, which is false
+# for a resumable Body. Its own wiring is asserted here instead.
+
+STALL = "worker-body-stall-parked"
+STALL_CALLER = "loop-exhaustion-fence.sh"
+
+
+def test_stall_park_notifies(agent_home):
+    sender = _Sender()
+    fields = srr.record(STALL, "worker-net BLOCK #10", "testagent", sender=sender)
+    assert len(sender.calls) == 1, "a stall-park must reach a human"
+    assert fields["notified"] == "sent"
+    assert _read(agent_home)["path"] == STALL
+    assert STALL in srr.VALID_PATHS and STALL not in srr.NO_NOTIFY_PATHS
+
+
+def test_stall_park_email_tells_the_truth_about_a_parked_body(agent_home):
+    """The generic tail says '/start is user-only ... Restart with /start', which
+    is false for a resumable Body and would start ANOTHER Body if followed."""
+    sender = _Sender()
+    srr.record(STALL, "worker-net BLOCK #10", "testagent", sender=sender)
+    body = sender.calls[0]["body"]
+    assert srr.STALL_PARK_TAIL in body
+    assert "Restart with" not in body and "/start is user-only" not in body
+    # Only one Body parked; the agent is still RUNNING, so neither the subject nor
+    # the opening line may say it went IDLE or stopped its loop.
+    subject = sender.calls[0]["subject"]
+    assert "PARKED" in subject and "went IDLE" not in subject, subject
+    assert body.startswith("A worker Body of testagent was parked at "), body[:80]
+    assert "stopped its autonomous loop" not in body
+    # Control: every other path keeps the IDLE subject and the restart line.
+    other = _Sender()
+    srr.record("reducer-self-fence", "r", "testagent", sender=other)
+    assert "Restart with:  /start testagent" in other.calls[0]["body"]
+    assert "went IDLE (reducer-self-fence)" in other.calls[0]["subject"]
+    assert other.calls[0]["body"].startswith("testagent stopped its autonomous loop at ")
+
+
+def test_stall_park_path_has_a_shell_caller_that_keeps_stderr():
+    src = (SCRIPTS / STALL_CALLER).read_text(encoding="utf-8")
+    assert f"--path {STALL}" in src, f"{STALL_CALLER} no longer records '{STALL}'"
+    for line in src.splitlines():
+        if "stop-reason-record.py" in line:
+            assert "2>/dev/null" not in line, (
+                f"{STALL_CALLER} discards the recorder's stderr: {line.strip()}")

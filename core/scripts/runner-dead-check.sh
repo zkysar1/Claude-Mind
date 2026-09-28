@@ -54,10 +54,17 @@
 #     the inline must mirror this helper)
 #   - core/scripts/recovery-gate.sh run_gate_for_agent (SessionStart hook;
 #      made it delegate to this helper)
+#   - the out-of-repo vessel recipe's every-boot heal (): a PARTIAL
+#     mirror, not a caller. It runs on a SECOND body over a shared mount, where
+#     conditions 4 and 5 test PIDs against the wrong host's /proc (guard-2601),
+#     so it composes 1, 2, 2.5, 2.7 and an age-bounded 3 from the same probes.
+#     Its 2 is WEAKER: an absent heartbeat is not life there (inert here).
+#     Rationale: core/config/rationale/vessel-recipe-state-writer.md
 #
 # Any change to the 6 conditions or probe scripts MUST update:
 #   - This helper (canonical)
 #   - /start SKILL.md auto-recovery section (inline LLM copy)
+#   - the vessel recipe's heal, for conditions 1-3 (see the rationale above)
 # The other two callers defer to this helper.
 
 set -u

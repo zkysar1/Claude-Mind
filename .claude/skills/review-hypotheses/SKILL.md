@@ -816,8 +816,9 @@ If no unreflected records: return { hypotheses_learned: 0 } and exit
 
 # MICRO-HORIZON RECORDS DO NOT GO TO Step 2 (g-335-664, 2026-08-01).
 # Mode 1 Step 1 filters horizon == "micro" defensively; this Mode did not, and
-# the asymmetry is a PERMANENT flag loop: `--unreflected` is (stage == resolved
-# AND NOT reflected) with no horizon term, so a micro record that reached the
+# the asymmetry is a PERMANENT flag loop: `--unreflected` is (stage in {resolved,
+# archived} AND NOT reflected; g-115-5358 -- this line said "stage == resolved"
+# until 2026-09-27, guard-4011) with no horizon term, so a micro record that reached the
 # pipeline is returned here every time, while Step 2's designated path
 # (/reflect --on-hypothesis -> reflect-on-outcome Step 0.5) opens with
 # `IF horizon == "micro": ERROR ... Abort.` The learning gate then reports

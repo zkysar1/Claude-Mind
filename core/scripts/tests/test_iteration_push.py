@@ -955,6 +955,19 @@ def test_defer_streak_escalates_then_resets(tmp_path):
     health = list((a / "agents" / "testagent" / "health").glob("*.jsonl"))
     assert health, "no health JSONL written at escalation"
     assert "integrate_defer_streak" in health[0].read_text(encoding="utf-8")
+    # BYTE-STABLE (): each line must be a fixed point of the
+    # json.dumps(rec, ensure_ascii=True) every other ledger writer and
+    # re-serializer emits, or the claim box rewrites it and merge=union keeps
+    # both byte forms of one record. Per line, the sensitivity control runs
+    # FIRST (the same comparator says DIFFERS on this record's compact form),
+    # so a red on the pin below is the writer, not a blind comparator.
+    lines = [ln for ln in health[0].read_text(encoding="utf-8").splitlines() if ln]
+    assert lines, "empty health ledger: nothing to check"
+    for ln in lines:
+        rec = json.loads(ln)
+        compact = json.dumps(rec, separators=(",", ":"))
+        assert json.dumps(json.loads(compact), ensure_ascii=True) != compact
+        assert json.dumps(rec, ensure_ascii=True) == ln, ln
     # persisted log carries the defer lines (log() tee half of )
     assert iplog.is_file() and "merge DEFERRED" in iplog.read_text(encoding="utf-8")
     # streak state is invisible to porcelain (the .git/ placement invariant)
@@ -1023,7 +1036,7 @@ def test_selfheal_retry_conflict_reports_conflict_shape_not_dirty_defer(tmp_path
     assert streak.is_file() and streak.read_text().split()[0] == "1"
     health = list((a / "agents" / "testagent" / "health").glob("*.jsonl"))
     assert health, "no health JSONL written at escalation"
-    assert '"shape":"conflict-abort"' in health[0].read_text(encoding="utf-8")
+    assert '"shape": "conflict-abort"' in health[0].read_text(encoding="utf-8")
 
 
 def test_blocking_shared_file_with_union_driver_is_committed_not_deferred(tmp_path):
@@ -2254,3 +2267,174 @@ def test_selfheal_commit_refusal_text_reaches_the_log_and_is_not_read_as_the_dir
     assert r2.returncode == 0, f"control failed — the shape must heal without the hook: {out2}"
     assert needle not in out2, "control failed — the needle came from somewhere other than the hook"
     assert "committing 1 SELF-namespace file(s) pre-merge" in out2, out2
+
+
+# --------------------------------------------------------------------------- #
+# --ff-only: the out-of-loop sync tick ()
+# --------------------------------------------------------------------------- #
+# A root crontab runs this on every Mind clone, so a box with no loop still pulls.
+# Each test pins the half that makes it safe unattended: HEAD moves ONLY on a clean
+# fast-forward, and origin NEVER moves. Every "did not happen" assertion carries a
+# positive control in the same fixture (guard-4166), so it cannot pass on a fixture
+# that could never have merged or pushed in the first place.
+def _origin_tip(origin: Path) -> str:
+    return _must(origin, "rev-parse", "main")
+
+
+def _ff(repo: Path, *extra: str, env_extra: dict = None) -> subprocess.CompletedProcess:
+    """The cron shape: no session, no agent binding, --repo explicit."""
+    env = dict(os.environ)
+    for k in ("MIND_SID", "MIND_AGENT", "BODY_WM_PATH"):
+        env.pop(k, None)
+    env.update(env_extra or {})
+    return subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", str(repo), "--ff-only",
+         "--fetch-interval-min", "0", *extra],
+        capture_output=True, text=True, timeout=120, env=env,
+    )
+
+
+def test_ff_only_is_advertised_in_help_for_the_cron_guard():
+    """The crontab calls the tick only when --help lists the flag: an older copy of the
+    script merely WARNS on an unknown arg and would run a full merge+push from cron."""
+    r = subprocess.run([BASH, str(PUSH_SH), "--help"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "--ff-only" in r.stdout, r.stdout
+
+
+def test_ff_only_fast_forwards_a_clean_behind_clone_and_never_pushes(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "up1.txt", "1\n", "B: up1")
+    _commit_file(b, "up2.txt", "2\n", "B: up2")
+    _must(b, "push", "-q", "origin", "main")
+    origin_before = _origin_tip(origin)
+    r = _ff(a, "--strict")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "ff-only tick: fast-forwarded 2 commit(s)" in out, out
+    assert _tip(a) == origin_before and (a / "up2.txt").exists(), out
+    assert _must(a, "rev-list", "--merges", "--count", "HEAD") == "0", "not a fast-forward"
+    assert _origin_tip(origin) == origin_before, "the tick moved origin"
+    # the census reads the tick's outcome from the persisted log
+    assert "ff-only tick: fast-forwarded" in (a / ".git" / "iteration-push.log").read_text(
+        encoding="utf-8")
+
+
+def test_ff_only_dirty_tree_is_logged_and_left_alone(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("local edit\n", encoding="utf-8", newline="\n")
+    before = _tip(a)
+    r = _ff(a, "--strict")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "ff-only tick: tree dirty (1 tracked path(s): base.txt" in out, out
+    assert _tip(a) == before and not (a / "up.txt").exists(), out
+    assert (a / "base.txt").read_text(encoding="utf-8") == "local edit\n"
+    # CONTROL: git itself would have allowed this merge (the dirty path is not in the
+    # incoming range), so the refusal above is the tick's rule, not git's.
+    assert _git(a, "merge", "--ff-only", "-q", "origin/main").returncode == 0
+
+
+def test_ff_only_non_fast_forward_never_merges_or_pushes(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "local.txt", "l\n", "A: local")
+    before, origin_before = _tip(a), _origin_tip(origin)
+    r = _ff(a, "--strict")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "ff-only tick: NOT a fast-forward (ahead 1, behind 1)" in out, out
+    assert _tip(a) == before and _origin_tip(origin) == origin_before, out
+    # CONTROL: the same tree WITHOUT the flag integrates and pushes.
+    r2 = _run_push(a, *_default_flags("--strict"))
+    assert r2.returncode == 0, r2.stderr
+    assert _origin_tip(origin) != origin_before, f"control never pushed: {r2.stderr}"
+
+
+def test_ff_only_ahead_only_is_up_to_date_and_never_pushes(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "local.txt", "l\n", "A: local")
+    origin_before = _origin_tip(origin)
+    r = _ff(a, "--min-commits", "1", "--strict")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "ff-only tick: up to date with origin/main (ahead 1)" in out, out
+    assert _origin_tip(origin) == origin_before, out
+    # CONTROL: the same tree without the flag pushes.
+    r2 = _run_push(a, *_default_flags("--strict"))
+    assert _origin_tip(origin) != origin_before, f"control never pushed: {r2.stderr}"
+
+
+def test_ff_only_overrides_push_worker_ref_even_under_a_peer_lock(tmp_path):
+    """A held lock publishes --push-worker-ref's carrier ABOVE the ff-only block, so the
+    override has to happen at arg-parse time or a tick under a lock would push."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, "local.txt", "l\n", "A: local")
+    origin_before = _origin_tip(origin)
+    ident = {"MIND_AGENT": "alpha", "MIND_SID": "tick-sid"}
+    assert _lock_as_peer(a).returncode == 0
+    try:
+        r = _ff(a, "--push-worker-ref", env_extra=ident)
+        out = r.stdout + r.stderr
+        assert "DEGRADING" not in out, out
+        assert "tree-lock: a co-resident Body holds this working tree" in out, out
+        assert _must(a, "ls-remote", "origin", "refs/workers/alpha/tick-sid") == "", out
+        assert _origin_tip(origin) == origin_before, out
+        # CONTROL: the same call without --ff-only publishes the carrier ref.
+        r2 = _run_push_as(a, "alpha", "tick-sid", "--push-worker-ref",
+                          "--fetch-interval-min", "0")
+        assert _must(a, "ls-remote", "origin", "refs/workers/alpha/tick-sid") != "", r2.stderr
+    finally:
+        _unlock_as_peer(a)
+
+
+def test_ff_only_respects_a_peer_tree_lock(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    before = _tip(a)
+    assert _lock_as_peer(a).returncode == 0
+    try:
+        r = _ff(a)
+        out = r.stdout + r.stderr
+        assert "tree-lock: a co-resident Body holds this working tree" in out, out
+        assert _tip(a) == before, out
+    finally:
+        _unlock_as_peer(a)
+    # CONTROL: once the lock is released the same tick fast-forwards.
+    r2 = _ff(a, "--strict")
+    assert "ff-only tick: fast-forwarded 1 commit(s)" in (r2.stdout + r2.stderr), r2.stderr
+
+
+def test_ff_only_merge_in_progress_is_left_alone(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    before = _tip(a)
+    merge_head = a / ".git" / "MERGE_HEAD"
+    merge_head.write_text(_tip(b) + "\n", encoding="utf-8")
+    try:
+        r = _ff(a, "--strict")
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, out
+        assert "ff-only tick: a merge is in progress (MERGE_HEAD)" in out, out
+        assert _tip(a) == before, out
+    finally:
+        merge_head.unlink()
+
+
+def test_ff_only_untracked_file_in_the_way_is_refused_not_overwritten(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "incoming.txt", "theirs\n", "B: adds incoming.txt")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "incoming.txt").write_text("mine, untracked\n", encoding="utf-8", newline="\n")
+    before = _tip(a)
+    r = _ff(a, "--strict")
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "ff-only tick: merge --ff-only refused" in out, out
+    assert _tip(a) == before, out
+    assert (a / "incoming.txt").read_text(encoding="utf-8") == "mine, untracked\n"

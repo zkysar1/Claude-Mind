@@ -196,13 +196,24 @@ def annotate_fixture_suspects(records):
 # queue that owner created in 15h. So the breaker keys on AGE SINCE resolved_at,
 # not on a deadlock that does not exist.
 #
-# 72h is derived, not picked: the owner's own learn cadence () runs on a
-# 60h interval, so 72h is one full owner-cadence interval plus a 12h margin. A
-# record still unreflected at 72h has survived at least one firing of the
-# cadence that exists to drain it, which is the earliest point at which "the
-# owner is not getting to this" is evidence rather than impatience. Reclaiming
-# is announced (the caller posts), never silent -- guard-1072's mark-in-place
-# discipline applied to work rather than to records.
+# 72h was sized against ONE owner's learn cadence, bravo's  (60h plus a
+# 12h margin), on the premise that a record unreflected at 72h had survived a
+# firing of its owner's drain cadence. That premise MEASURED FALSE (echo, cc-03,
+# 2026-09-27, ): learn cadences are per-agent (zeta 2h, echo 6.75h,
+# alpha 168h) and bravo's  had not fired for 272h. So reaching 72h is
+# NOT evidence that the owner neglected the record; never read a reclaimable
+# record as a charge against its owner. The 72h bound survives on another
+# reason: the race guard-5623 prevents sits near resolution. Measured 2026-09-27
+# (echo, cc-03) over the resolved+archived union: of 297 records reflected by
+# their own resolver (reflected_date 2026-08-01..09-27), 281 were reflected on
+# the resolution's UTC date, 13 on the next, 1 two dates later and none after
+# (2 more predate their resolved_at: re-resolved). An owner reflecting at 72h
+# is a lag never observed, so by 72h a race is unlikely whatever the owner's
+# cadence. The sample holds only records an owner DID drain; how often an
+# owner never drains is not measured. Non-owners, by contrast, reflected 8
+# records within a day of resolution after this split shipped (09-19..09-23,
+# ). Reclaiming is announced (the caller posts), never silent --
+# guard-1072's mark-in-place discipline applied to work rather than to records.
 
 OWNERSHIP_ACTIONABLE = frozenset({"mine", "unowned", "reclaimable"})
 RECLAIMABLE_VERDICTS = frozenset({"dormant", "retired"})

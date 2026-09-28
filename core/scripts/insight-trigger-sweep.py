@@ -181,6 +181,18 @@ SEVERITY_PRIORITY = {
     "informs": "LOW",
 }
 
+# . Action types that RELAY a claim-fenced store write (the no_claim
+# relay contract). A box that does not hold an agent's runner claim is refused
+# its agent-dir writes with NoClaimError, whose text tells the writer to relay
+# the write to the claim-holder (owncloud_backend.py). A relay is owed work with
+# no other path into the store, not a finding a severity tag rates -- but relay
+# posts carry no severity tag, so they parsed as informs -> LOW and were never
+# selected:  (pq-close) and  (experience-add) sat pending
+# 12h+ with the addressee alive. _build_goal_payload floors these at MEDIUM; a
+# severity tag can raise them, never lower them. The values are the verbs the
+# relayers actually used, not a guessed vocabulary (guard-6006).
+RELAY_ACTION_TYPES = frozenset({"pq-close", "experience-add"})
+
 REQ_ACTION_RE = re.compile(r"^requires_action_by:(.+)$")
 ACTION_TYPE_RE = re.compile(r"^action_type:(.+)$")
 SEVERITY_RE = re.compile(r"^severity:(.+)$")
@@ -1259,6 +1271,13 @@ def _build_goal_payload(trigger):
         if promoted != priority:
             inherited_from = target_record.get("id")
             priority = promoted
+    # . A relayed store write is floored at MEDIUM (RELAY_ACTION_TYPES).
+    # Applied after inheritance, so each description note below names its own raise.
+    floored = False
+    if trigger["action"] in RELAY_ACTION_TYPES:
+        raised = inherit_priority(priority, "MEDIUM")
+        floored = raised != priority
+        priority = raised
     # . Splice the finding's headline in so the title names an OBJECT
     # (guard-6141); fall back to the bare verb form when the post has no usable
     # first line, so behaviour is never worse than before.
@@ -1306,6 +1325,14 @@ def _build_goal_payload(trigger):
             f"which this chore unblocks (g-115-6590 item 2). The board post's "
             f"severity ({trigger['severity']}) would have filed this "
             f"{SEVERITY_PRIORITY.get(trigger['severity'], 'MEDIUM')}.",
+        ]
+    if floored:
+        desc_parts[-1:] = desc_parts[-1:] + [
+            "",
+            f"Priority floor: raised to {priority} because action_type "
+            f"{trigger['action']} relays a claim-fenced store write that has no "
+            f"other path to the store (g-115-11274). The board post's severity "
+            f"({trigger['severity']}) alone would have filed this LOW.",
         ]
     payload = {
         "title": title,

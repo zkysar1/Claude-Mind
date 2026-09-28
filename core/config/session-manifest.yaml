@@ -529,7 +529,7 @@ files:
 
   - file: last-phase-cost.json
     purpose: per-session token/time accounting for the most recent aspirations-loop phase
-    writer: phase-cost-report.sh (invoked from aspirations-consolidate SKILL.md:591)
+    writer: phase-cost-report.sh (invoked from aspirations-consolidate SKILL.md, Step 9 "Write Continuation Handoff")
     recovery_action: clear
     sync_tier: machine_local
     required_when_idle: false

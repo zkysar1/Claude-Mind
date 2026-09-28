@@ -344,8 +344,9 @@ destroyed a finding here; skipping one yields a confident number with no meaning
    the marker has no members outside the batch, it is a pure selection artifact; encode
    nothing.
 3. **Compute the floor by permutation at the marker's OWN group size** — not balanced, and
-   never a single fixed "meaningless" split. A batch-discovered marker is rare by
-   construction, and the floor for a rare group is several times the balanced one.
+   never a single fixed "meaningless" split. A batch-discovered marker is NOT rare by
+   construction: its corpus n has ranged 7 to 902 (readings, Run 86). A rare group's
+   floor is several times the balanced one, so size the floor from the MEASURED n.
 4. **Report the EXCEEDANCE PROBABILITY** — the fraction of permutations with
    `|perm_delta| >= |delta|` — not a p95 comparison, which degenerates at small n where the
    delta is quantized and the test resolves on a tie. Treat anything above ~5% as nothing,
@@ -386,11 +387,21 @@ treat a refusal as the correct verdict rather than something to override (guard-
    Flag: "N of M corrected hypotheses shared condition X"
 
 2. STRATEGY PERFORMANCE by pattern signature:
-   ⚠ "matched in this batch" HAS NO FIELD TO READ. Measured 2026-08-06 (zeta),
-   re-confirmed 2026-08-28 (echo): NO pipeline record carries a pattern-signature
+   ⚠ "matched in this batch" HAS NO FIELD TO READ: no pipeline field records a
+   signature consulted at FORMATION. This step is not usually-empty, it is
+   structurally unreachable from the pipeline store, so a number here is not a
+   small sample — it is no sample.
+   ⚠ SIGNATURE IDS DO SIT ONE LEVEL DOWN, AND BOTH FIELDS READ LIKE THAT LINK
+   (Run 87, 2026-09-28, readings file). `context_consulted.pattern_signatures_checked`
+   (non-empty on 11 of 855 pool records) is written at RESOLVE time
+   (review-hypotheses Mode 1 Step 1.5): 6 of those 11 name a signature CREATED
+   AFTER the record was formed (sig-40 is "checked" on a record formed 8 days
+   before sig-40 existed). `context_gaps_identified[].signature_id` (type
+   `missed_pattern`) is written post-hoc by /reflect. Neither was at risk at
+   formation, so neither is a match (Step 4 item 4c). The 2026-08-06 (zeta) and
+   2026-08-28 (echo) readings, "NO pipeline record carries a pattern-signature
    reference — the only signal-ish keys are origin_signal / resolution_signal /
-   settling_signal. This step is not usually-empty, it is structurally unreachable
-   from the pipeline store, so a number here is not a small sample — it is no sample.
+   settling_signal", are true of TOP-LEVEL keys only; that scan reproduces exactly.
    USE THE JOIN THAT EXISTS rather than inventing one:
      - retrieved-and-applied signatures → aspirations-spark Phase 6.5's
        pattern-outcome block, joined via retrieval-session.json supplementary_detail
@@ -632,6 +643,9 @@ For each strategy referenced during replay:
        c. A signature matched RETROSPECTIVELY over already-resolved records is not a
           tested prediction and takes NO outcome. Replay reads history; the signature
           was not consulted at the time, so nothing about it was put at risk.
+          A signature id inside a record's `context_consulted` or
+          `context_gaps_identified` is NOT evidence of formation-time consultation:
+          both are written at resolve/reflect time (Step 3 item 2).
        d. Skip meta-pattern signatures (guard-575) — those resolve via
           reflect-on-outcome, and recording here double-counts.
      THEN record the verdict:

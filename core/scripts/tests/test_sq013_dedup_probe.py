@@ -845,8 +845,11 @@ def test_big_relay_files_because_the_cap_removes_the_collision_tail():
 def test_genuine_headline_match_still_declines_at_large_subject_scale():
     """The SAFE-DIRECTION control: the cap must not turn a genuine duplicate
     into a false FILE. A large relay whose HEADLINE is about the real owner
-    still DECLINEs after capping -- a genuine duplicate names its subject up
-    front, so its shared rare token survives the cap."""
+    still finds and cites that owner after capping -- a genuine duplicate names
+    its subject up front, so its shared rare token survives the cap. The
+    headline's extra clause dilutes the owner's coverage to the multi-rare band
+    (0.32), so since g-115-11127 the verdict is MUST-READ rather than DECLINE;
+    what this test pins is the cap property: never FILE, same owner cited."""
     big_genuine = (
         "pickNearbyPlayer returns null without instrumentation so the "
         "denominator for nearby-player selection is unmeasured and the scorer "
@@ -855,7 +858,7 @@ def test_genuine_headline_match_still_declines_at_large_subject_scale():
     )
     corpus = _big_corpus(with_owner=True)
     r = sq.decide(sq._headline(big_genuine), corpus, NOW, SESSION_START)
-    assert r["decision"] == "DECLINE", r
+    assert r["decision"] in ("DECLINE", "MUST-READ"), r
     assert r["cited_goal_id"] == "g-326-711", r
 
 
@@ -884,9 +887,9 @@ _GENUINE = [p for p in _FIXTURE["pairs"] if p["kind"] == "genuine"]
 _LIVE_NOW = datetime(2026, 9, 25, 17, 0, 0)
 
 
-def _live_idf(monkeypatch):
+def _live_idf(monkeypatch, fixture=_FIXTURE):
     """Replace the corpus-derived IDF with the measured live one."""
-    n, df = _FIXTURE["n"], _FIXTURE["df"]
+    n, df = fixture["n"], fixture["df"]
 
     def live(docs, terms):
         return {t: (df.get(t, 0), max(0.0, math.log(n / (1 + df.get(t, 0)))))
@@ -894,10 +897,10 @@ def _live_idf(monkeypatch):
     monkeypatch.setattr(sq, "_compute_idf", live)
 
 
-def _owner_corpus(owner_id, fillers=49):
-    owner = _FIXTURE["owners"][owner_id]
+def _owner_corpus(owner_id, fillers=49, fixture=_FIXTURE):
+    owner = fixture["owners"][owner_id]
     dl = len(sq._tokens(owner["title"] + " " + owner["description"]))
-    width = round((_FIXTURE["avgdl"] * (fillers + 1) - dl) / fillers)
+    width = round((fixture["avgdl"] * (fillers + 1) - dl) / fillers)
     text = " ".join("fillerqq%04d" % j for j in range(width))
     return [owner] + [{"id": "g-999-%03d" % i, "status": "completed",
                        "title": "filler", "description": text}
@@ -992,7 +995,9 @@ def test_owner_coverage_is_read_from_its_opening_not_its_tail(monkeypatch):
 # already fixed upstream. decide() now anchors the terminal window on a
 # per-record reference_time; batch_decide reads it from each record's _item_ts
 # (wm.py stamps that on every capture append) and falls back to `now` when
-# absent, so every test above is unchanged.
+# absent, so every test above is unchanged. These fixtures still HOLD the old
+# owner; the live queue usually has evicted it (see the eviction-horizon
+# section below, ).
 #
 # guard-4166 governs: the fix makes a false FILE STOP APPEARING, so every
 # DECLINE assertion is paired with an alien-token FILE control that must NOT
@@ -1059,3 +1064,316 @@ def test_backlog_relay_without_item_ts_falls_back_to_now():
     no_ts = {"observation": RELAY}                       # no _item_ts key
     row = sq.batch_decide([no_ts], [BACKLOG_OWNER], BACKLOG_NOW)["rows"][0]
     assert row["verdict"] == "FILE", row
+
+
+# --- the eviction horizon () ----------------------------------------
+#
+# The anchor tests above run over a corpus that still HOLDS the owner. The live
+# queue does not: it evicts terminal non-recurring goals after
+# aspirations_eviction.age_days (3), leaving only a bare id in the aspiration's
+# census. On the  occ227 replay (2026-09-27) 8 of 16 aged FILE relays
+# needed an owner only the census holds, and two of them CITED it. So a FILE
+# whose subject cites an evicted goal id must be MUST-READ, and FILE output
+# must state the horizon.
+#
+# guard-3292: each census assertion is paired with the SAME input run without
+# the census, where the two paths must disagree. guard-4166: the fix makes a
+# bare FILE stop appearing, so an uncited control rides the same batch and must
+# NOT flip.
+
+EVICTED_ID = "g-363-72"
+CITING_RELAY = UNOWNED + " -- the retry fix from %s never covered it" % EVICTED_ID
+# The live shape: `aspirations-read.sh --source world --active-compact` is a
+# JSON list of aspiration records carrying archived_census.evicted_ids.
+CENSUS = [{"id": "asp-363", "goals": [],
+           "archived_census": {"evicted_ids": {"completed": [EVICTED_ID]}}}]
+
+
+def test_relay_citing_an_evicted_owner_is_must_read_while_control_files():
+    citing, control = {"observation": CITING_RELAY}, {"observation": UNOWNED}
+    res = sq.batch_decide([citing, control], [COMPLETED_OWNER], NOW,
+                          SESSION_START, census=CENSUS)
+    crow, ctl = res["rows"]
+    assert crow["verdict"] == "MUST-READ", crow
+    assert crow["evicted_citations"] == [
+        {"goal_id": EVICTED_ID, "status": "completed", "via": "subject"}], crow
+    assert EVICTED_ID in crow["reason"], crow
+    assert ctl["verdict"] == "FILE", ctl                # control must NOT flip
+    assert ctl["evicted_citations"] == [], ctl          # checked, none
+    assert (res["must_read_count"], res["file_count"]) == (1, 1), res
+    text = sq.render_batch(res)
+    assert "cites EVICTED: %s (completed)" % EVICTED_ID in text, text
+    assert "guard-7398" in text and "guard-5278" in text, text
+    assert "EVICTION CENSUS: 1 aspiration record(s), 1 evicted id(s)" in text
+
+
+def test_relay_whose_own_source_goal_is_evicted_is_must_read():
+    """The  instance (progress_note, cc-10, 2026-09-27): the fix had
+    shipped under the relay's OWN source goal g-363-72, which is
+    evicted-completed, and the subject cites no id at all. A source goal the
+    census does not hold must not flip, and without the census the same
+    record FILEs."""
+    evicted_src = {"goal_id": EVICTED_ID, "observation": UNOWNED}
+    other_src = {"goal_id": COMPLETED_OWNER["id"], "observation": UNOWNED}
+    res = sq.batch_decide([evicted_src, other_src], [COMPLETED_OWNER], NOW,
+                          SESSION_START, census=CENSUS)
+    erow, orow = res["rows"]
+    assert erow["verdict"] == "MUST-READ", erow
+    assert erow["evicted_citations"] == [
+        {"goal_id": EVICTED_ID, "status": "completed", "via": "source"}], erow
+    assert "the relay's source goal" in sq.render_batch(res)
+    assert orow["verdict"] == "FILE", orow              # control must NOT flip
+    bare = sq.batch_decide([evicted_src], [COMPLETED_OWNER], NOW, SESSION_START)
+    assert bare["rows"][0]["verdict"] == "FILE", bare["rows"][0]
+
+
+def test_without_a_census_the_same_relay_files_and_says_not_checked():
+    """The disagreeing path (guard-3292): the pre-fix behaviour, now labelled.
+    None is NOT CHECKED, which must never read as "checked, none"
+    (guard-1753)."""
+    res = sq.batch_decide([{"observation": CITING_RELAY}], [COMPLETED_OWNER],
+                          NOW, SESSION_START)
+    row = res["rows"][0]
+    assert row["verdict"] == "FILE", row
+    assert row["evicted_citations"] is None, row
+    assert res["population"]["census_aspirations"] is None, res["population"]
+    assert "EVICTION CENSUS: NOT CHECKED" in sq.render_batch(res)
+
+
+def test_a_cited_id_the_corpus_holds_was_scored_and_is_not_flagged():
+    """Discriminating probe of the live filter: the cited id sits in BOTH the
+    corpus and the census, so only the filter keeps this row FILE."""
+    cites_live = UNOWNED + " -- see g-326-711"          # COMPLETED_OWNER's id
+    census = [{"id": "asp-326", "goals": [], "archived_census": {
+        "evicted_ids": {"completed": [COMPLETED_OWNER["id"]]}}}]
+    row = sq.batch_decide([{"observation": cites_live}], [COMPLETED_OWNER],
+                          NOW, SESSION_START, census=census)["rows"][0]
+    assert row["verdict"] == "FILE", row
+    assert row["evicted_citations"] == [], row
+
+
+def test_goal_id_citations_skip_board_ids_and_other_prefixes():
+    subj = "see msg-20260928-053714-alpha-173, sig-12-3 and (g-363-72)"
+    assert sq._GOAL_ID_RE.findall(subj) == ["g-363-72"]
+
+
+def test_single_mode_returns_4_with_the_census_and_0_without(monkeypatch,
+                                                             capsys, tmp_path):
+    census = tmp_path / "census.json"
+    census.write_text(json.dumps(CENSUS), encoding="utf-8")
+    corpus = json.dumps([COMPLETED_OWNER])
+    base = ["--subject", CITING_RELAY, "--now", NOW.isoformat(),
+            "--session-start", SESSION_START.isoformat()]
+
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(corpus))
+    assert sq.main(base + ["--census-file", str(census)]) == 4
+    out = json.loads(capsys.readouterr().out)
+    assert out["decision"] == "MUST-READ", out
+    assert out["evicted_citations"][0]["goal_id"] == EVICTED_ID, out
+    assert "terminal_horizon" in out, out
+
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(corpus))
+    assert sq.main(base) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["decision"] == "FILE", out
+    assert out["evicted_citations"] is None, out
+
+
+def test_an_unreadable_or_empty_census_refuses_rather_than_filing(
+        monkeypatch, capsys, tmp_path):
+    """A census the caller asked for but could not read would otherwise let a
+    FILE pass as census-checked. `{"error": ...}` is the measured shape of a
+    failed aspirations-read.sh call."""
+    corpus = json.dumps([COMPLETED_OWNER])
+    for name, body in (("missing.json", None), ("garbage.json", "not json"),
+                       ("empty.json", "[]"),
+                       ("error.json", json.dumps({"error": "missing_flag"}))):
+        path = tmp_path / name
+        if body is not None:
+            path.write_text(body, encoding="utf-8")
+        monkeypatch.setattr(sys, "stdin", _FakeStdin(corpus))
+        assert sq.main(["--subject", CITING_RELAY,
+                        "--census-file", str(path)]) == 2, name
+        capsys.readouterr()
+
+
+def test_file_output_states_the_terminal_coverage_horizon():
+    h = sq.terminal_horizon(NOW, {"enabled": True, "apply": True,
+                                  "age_days": 3})
+    assert (h["state"], h["horizon"]) == ("active", "2026-08-24T02:12:21"), h
+    aged = {"observation": UNOWNED, "_item_ts": "2026-08-20T00:00:00"}
+    res = sq.batch_decide([aged, {"observation": UNOWNED}], [COMPLETED_OWNER],
+                          NOW, SESSION_START)
+    res["terminal_horizon"] = h
+    text = sq.render_batch(res)
+    assert "TERMINAL-COVERAGE HORIZON: 2026-08-24T02:12:21" in text, text
+    assert "AGED: captured 2026-08-20T00:00:00" in text, text
+    assert text.count("AGED:") == 1, text       # the undated row is not aged
+
+
+def test_horizon_is_unknown_never_a_default_and_off_when_eviction_is_off(
+        tmp_path):
+    block, err = sq.load_eviction_config(str(tmp_path / "absent.yaml"))
+    assert block is None and err, (block, err)
+    h = sq.terminal_horizon(NOW, block, err)
+    assert (h["state"], h["horizon"]) == ("unknown", None), h
+    assert h["detail"].startswith("UNKNOWN"), h
+    off = sq.terminal_horizon(NOW, {"enabled": False, "apply": True,
+                                    "age_days": 3})
+    assert (off["state"], off["horizon"]) == ("inactive", None), off
+
+
+def test_the_shipped_config_supplies_the_horizon():
+    """The default path resolves to the file the evictor's tick reads."""
+    block, err = sq.load_eviction_config()
+    assert err is None and "age_days" in block, (block, err)
+
+
+# -- : the multi-rare band is MUST-READ, not a terminal DECLINE ----
+# fixtures/sq013_same_topic_pairs.json holds the relay texts of the 
+# occ228 replay batch (S1, S2, T1-T5) and of the occ238 wrong-owner DECLINEs
+# (S3-S6), each cited owner's title+description, and the live corpus statistics
+# (n, avgdl, per-token df) measured 2026-09-28. kind=false: the replay DECLINED
+# to a same-topic owner tracking a DIFFERENT defect; kind=genuine: a correct
+# DECLINE from the same batch. Scored like the  pairs above: the
+# cited owner alone plus fillers sized to the live avgdl.
+#
+# guard-4166: the fix makes a terminal DECLINE stop appearing, so the genuine
+# pairs must NOT flip and the alien-token control must stay FILE. guard-4315:
+# narrowing a predicate drops cases nobody inventoried, so the survivors are
+# pinned by name, not by a count.
+
+_TOPIC = json.loads((SCRIPT_DIR / "fixtures" / "sq013_same_topic_pairs.json")
+                    .read_text(encoding="utf-8"))
+_TOPIC_PAIRS = {p["label"]: p for p in _TOPIC["pairs"]}
+_TOPIC_FALSE = [p for p in _TOPIC["pairs"] if p["kind"] == "false"]
+_TOPIC_GENUINE = [p for p in _TOPIC["pairs"] if p["kind"] == "genuine"]
+_REPLAY_NOW = datetime(2026, 9, 27, 9, 10, 0)            # the occ228 replay
+
+
+def _topic_score(pair, corpus=None):
+    return sq.decide(pair["relay"],
+                     corpus or _owner_corpus(pair["owner_id"], fixture=_TOPIC),
+                     _REPLAY_NOW, None, 900.0)
+
+
+def test_same_topic_fixture_holds_the_measured_cases():
+    """The two cases the goal names, the five correct DECLINEs it names, and
+    the four occ238 wrong owners, each against the owner the replay cited."""
+    assert {(p["label"], p["owner_id"]) for p in _TOPIC["pairs"]} == {
+        ("S1", "g-115-8349"), ("S2", "g-115-10745"), ("S3", "g-115-10131"),
+        ("S4", "g-115-7235"), ("S5", "g-115-8716"), ("S6", "g-249-50"),
+        ("T1", "g-115-7455"), ("T2", "g-115-7455"), ("T3", "g-374-59"),
+        ("T4", "g-115-7466"), ("T5", "g-115-7976")}
+    assert _TOPIC_PAIRS["S1"]["source_goal"] == "g-115-7319"
+    assert _TOPIC_PAIRS["S2"]["source_goal"] == "g-363-75"
+    assert _TOPIC["n"] >= 20 * sq.MIN_IDF_CORPUS         # a LIVE-sized corpus
+
+
+def test_same_topic_declines_are_the_measured_incident_not_a_green_default(
+        monkeypatch):
+    """With the band routed back to DECLINE, every false pair DECLINEs citing
+    the owner the replay cited, from inside the multi-rare band -- the
+    incident, reproduced at live document frequencies."""
+    band_top = sq.SUBJECT_COVERAGE_MIN
+    _live_idf(monkeypatch, _TOPIC)
+    monkeypatch.setattr(sq, "SUBJECT_COVERAGE_MIN",
+                        sq.SUBJECT_COVERAGE_MIN_MULTI_RARE)
+    for pair in _TOPIC_FALSE:
+        r = _topic_score(pair)
+        assert r["decision"] == "DECLINE", (pair["label"], r)
+        assert r["cited_goal_id"] == pair["owner_id"], (pair["label"], r)
+        top = r["matches"][0]
+        assert sq.SUBJECT_COVERAGE_MIN_MULTI_RARE <= top["coverage"] < band_top
+        assert len(top["rare_tokens"]) >= 2, (pair["label"], top)
+
+
+def test_same_topic_owner_is_must_read_and_still_cited(monkeypatch):
+    """Outcome 1: no terminal DECLINE. The owner stays CITED -- it may still be
+    the owner -- so the reader has one goal to open, not a search to redo."""
+    _live_idf(monkeypatch, _TOPIC)
+    for pair in _TOPIC_FALSE:
+        r = _topic_score(pair)
+        assert r["decision"] == "MUST-READ", (pair["label"], r)
+        assert r["cited_goal_id"] == pair["owner_id"], (pair["label"], r)
+        assert r["matches"][0]["weak"] is True, (pair["label"], r)
+        assert r["reason"].startswith("same topic, not proven"), r
+
+
+def test_the_batch_correct_declines_still_decline(monkeypatch):
+    """Outcome 2: the five correct DECLINEs of the same batch survive."""
+    _live_idf(monkeypatch, _TOPIC)
+    for pair in _TOPIC_GENUINE:
+        r = _topic_score(pair)
+        assert r["decision"] == "DECLINE", (pair["label"], r)
+        assert r["cited_goal_id"] == pair["owner_id"], (pair["label"], r)
+        assert r["matches"][0]["coverage"] >= sq.SUBJECT_COVERAGE_MIN, r
+        assert r["matches"][0]["weak"] is False, r
+
+
+def test_positive_control_files_against_every_same_topic_owner(monkeypatch):
+    _live_idf(monkeypatch, _TOPIC)
+    for pair in _TOPIC["pairs"]:
+        r = sq.decide(UNOWNED, _owner_corpus(pair["owner_id"], fixture=_TOPIC),
+                      _REPLAY_NOW, None, 900.0)
+        assert r["decision"] == "FILE", (pair["label"], r)
+
+
+def test_a_title_token_rule_would_have_broken_two_correct_declines():
+    """The direction the goal proposed, measured and rejected: T1 and T5 are
+    correct DECLINEs whose owner's TITLE shares no token with the relay's
+    scored headline (T1 writes `closure-evidence-write`, the title says
+    `closure-evidence`), so requiring one would turn them into MUST-READ."""
+    for label in ("T1", "T5"):
+        pair = _TOPIC_PAIRS[label]
+        title = _TOPIC["owners"][pair["owner_id"]]["title"]
+        head = sq._tokens(sq._headline(pair["relay"]))
+        assert head & sq._tokens(title) == set(), (label, head & sq._tokens(title))
+
+
+def test_a_full_floor_owner_outranks_a_heavier_same_topic_one(monkeypatch):
+    """A weak candidate must never hide a real owner: an owner restating the
+    relay in its title is cited over S1's same-topic owner although its long
+    record weighs less. Control: without it, the same relay is MUST-READ."""
+    _live_idf(monkeypatch, _TOPIC)
+    pair = _TOPIC_PAIRS["S1"]
+    head = sq._headline(pair["relay"])
+    solid = {"id": "g-999-900", "status": "pending", "title": head[:200],
+             "description": head + " " + " ".join(
+                 "solidpad%04d" % j for j in range(1500))}
+    corpus = [solid] + _owner_corpus(pair["owner_id"], fixture=_TOPIC)
+    r = _topic_score(pair, corpus)
+    assert r["decision"] == "DECLINE", r
+    assert r["cited_goal_id"] == "g-999-900", r
+    weak = [m for m in r["matches"] if m["goal_id"] == pair["owner_id"]]
+    assert weak and weak[0]["weak"], r["matches"]          # listed, not hidden
+    assert weak[0]["weight"] > r["matches"][0]["weight"], r["matches"]
+    assert _topic_score(pair)["decision"] == "MUST-READ"
+
+
+def test_batch_row_names_the_same_topic_reading_and_the_matched_span(
+        monkeypatch):
+    """Batch shape: the S1 row is MUST-READ with its own instruction (not the
+    skipped-owner text) and counts toward rc 4; the T1 row DECLINEs, and every
+    cited owner's row says what the match rested on -- T1's is description
+    only, which is why the band, not the title, decides."""
+    _live_idf(monkeypatch, _TOPIC)
+    s1, t1 = _TOPIC_PAIRS["S1"], _TOPIC_PAIRS["T1"]
+    corpus = (_owner_corpus(s1["owner_id"], fixture=_TOPIC)
+              + [_TOPIC["owners"][t1["owner_id"]]])
+    res = sq.batch_decide([{"goal_id": s1["source_goal"],
+                            "observation": s1["relay"]},
+                           {"goal_id": t1["source_goal"],
+                            "observation": t1["relay"]}],
+                          corpus, _REPLAY_NOW, None, 900.0)
+    srow, trow = res["rows"]
+    assert (srow["verdict"], srow["weak_owner"], srow["must_read"]) == (
+        "MUST-READ", True, True), srow
+    assert srow["cited_goal_id"] == s1["owner_id"], srow
+    assert (trow["verdict"], trow["weak_owner"]) == ("DECLINE", False), trow
+    assert (res["must_read_count"], res["decline_count"]) == (1, 1), res
+    text = sq.render_batch(res)
+    assert text.count("SAME TOPIC, NOT PROVEN THE SAME DEFECT") == 1, text
+    assert "TERMINAL-BUT-NOT-DONE" not in text, text
+    assert text.count("matched on:") == 2, text
+    assert "owner TITLE shares NOTHING (description only)" in text, text

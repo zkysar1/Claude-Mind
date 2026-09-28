@@ -432,10 +432,14 @@ def test_the_background_jobs_allow_path_also_calls_the_fence():
     # reads 3, because a comment further down names the script while explaining
     # who owns the stop-requested write -- anchoring on the `bash "$CORE_ROOT/...`
     # call shape is what makes this a call-site pin rather than a mention pin.
+    # Scoped to the REDUCER region (Gate 0-pre onward): the per-Body worker-net
+    # branch above it makes a third call with FENCE_ROLE=worker and its own
+    # streak semantics (), pinned in test_loop_exhaustion_fence_worker.
     invocation = 'bash "$CORE_ROOT/scripts/loop-exhaustion-fence.sh"'
-    assert src.count(invocation) == 2, (
-        "expected exactly two call sites (ALLOW path + BLOCK path), found %d"
-        % src.count(invocation))
+    reducer_src = src[src.index("--- Gate 0-pre:"):]
+    assert reducer_src.count(invocation) == 2, (
+        "expected exactly two reducer call sites (ALLOW path + BLOCK path), found %d"
+        % reducer_src.count(invocation))
 
 
 def test_fence_wrapper_writes_target_mode_before_the_signal():

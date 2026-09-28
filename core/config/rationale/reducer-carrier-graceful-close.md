@@ -83,7 +83,9 @@ manifest fixture and transitions nothing the stall classifier reads.
 >
 > Site six is now pinned against `CLOSED_STATES` by
 > `core/scripts/tests/test_graceful_body_close.py::test_daemon_claim_probe_is_the_sixth_partition_site`,
-> so it can no longer drift by hand.
+> so it can no longer drift by hand. Since g-375-50 (2026-09-28) the probe keeps
+> no copy at all: it calls `gates.body_hold.evaluate_carrier`, and that test
+> calls the probe once per `CLOSED_STATES` member instead of reading a tuple.
 >
 > A seventh copy exists and is deliberately NOT patched: the worker deadman
 > prompt in `core/scripts/deadman-directive.sh`. It is worker-only while

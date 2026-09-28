@@ -78,6 +78,7 @@ MAX_AGE_MIN="${ITERATION_PUSH_MAX_AGE_MIN:-20}"
 FETCH_INTERVAL_MIN="${ITERATION_PUSH_FETCH_INTERVAL_MIN:-10}"
 NO_FETCH=0
 NO_PUSH=0
+FF_ONLY=0
 PUSH_WORKER_REF=0
 WORKER_REF_AGENT="${MIND_AGENT:-}"
 WORKER_REF_SID="${MIND_SID:-}"
@@ -152,6 +153,15 @@ Options:
                       continuity pull for local-backend deployments: a starting
                       session must become current WITHOUT publishing its state
                       as a side effect of starting (g-115-3871).
+  --ff-only           OUT-OF-LOOP SYNC TICK (g-115-11070), for a root crontab.
+                      Fetch, then FAST-FORWARD ONLY: a clean tree strictly behind
+                      origin advances; a dirty tree, a merge in progress or a
+                      non-fast-forward is LOGGED and left alone. Never commits,
+                      never pushes (overrides --push-worker-ref), exits above
+                      every merge site. A caller running this from cron must
+                      first check that this help text lists the flag: an older
+                      copy of this script only WARNS on an unknown arg and would
+                      run a full merge+push.
   --push-worker-ref   WORKER CARRIER (g-306-264). Fetch + integrate, then push HEAD
                       to refs/workers/<agent>/<sid> and STOP — never the shared
                       branch. Lets a worker Body's framework-file edits and local
@@ -179,6 +189,7 @@ while [ $# -gt 0 ]; do
     --fetch-interval-min) FETCH_INTERVAL_MIN="${2:-10}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --no-fetch)    NO_FETCH=1; shift;;
     --no-push)     NO_PUSH=1; shift;;
+    --ff-only)     FF_ONLY=1; shift;;
     --push-worker-ref) PUSH_WORKER_REF=1; shift;;
     --worker-ref-agent) WORKER_REF_AGENT="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --worker-ref-sid)  WORKER_REF_SID="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
@@ -188,6 +199,9 @@ while [ $# -gt 0 ]; do
     *)             echo "[iteration-push] unknown arg: $1" >&2; shift;;
   esac
 done
+# --ff-only never pushes: the tree-lock gate below would otherwise publish a carrier
+# ref for --push-worker-ref, and NO_PUSH routes the self-held branch to its skip.
+if [ "$FF_ONLY" = 1 ]; then NO_PUSH=1; PUSH_WORKER_REF=0; fi
 
 # log(): stderr for the live transcript AND a fail-open persisted copy at
 # $GITDIR/iteration-push.log (). The 2026-08-01 cc-06 wedge was
@@ -497,6 +511,57 @@ if [ "$NO_FETCH" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   fi
 fi
 
+# --- FF-ONLY SYNC TICK () -----------------------------------------
+# The out-of-loop floor. Syncing was a side effect of the loop, so a box running
+# none (an idle container, an assistant seat) never pulled: measured 2026-09-27
+# (alpha, cc-10, census over ssh rack + lxc exec) 11 of 25 Mind clones sat 137-303
+# commits behind. Everything above -- the index.lock skip, the tree-lock gate, the
+# throttled fetch -- is shared with the loop's own call. This block takes ONLY a
+# fast-forward and exits above every merge site, the self-heal commit and the push.
+# A dirty tree or a non-fast-forward is LOGGED, never resolved: that is the loop
+# integrate's job, which can self-heal what it owns, while a cron cannot know whose
+# work a dirty path is (rb-3399: never naive-union agent-dir stores from a cron).
+# --no-optional-locks: a background status must not take index.lock under a live
+# session's git command.
+if [ "$FF_ONLY" = 1 ]; then
+  if [ -e "$GITDIR/MERGE_HEAD" ]; then
+    log "ff-only tick: a merge is in progress (MERGE_HEAD) — log only"; soft_exit 0
+  fi
+  _FF_DIRTY="$(git -C "$REPO" --no-optional-locks status --porcelain --untracked-files=no 2>&1)"; _FF_ST_RC=$?
+  if [ "$_FF_ST_RC" -ne 0 ]; then
+    log "ff-only tick: git status failed rc=${_FF_ST_RC} — log only: $(printf '%s' "$_FF_DIRTY" | tail -n 1)"; soft_exit 1
+  fi
+  if [ -n "$_FF_DIRTY" ]; then
+    log "ff-only tick: tree dirty ($(printf '%s\n' "$_FF_DIRTY" | wc -l | tr -d ' ') tracked path(s): $(printf '%s\n' "$_FF_DIRTY" | head -5 | cut -c4- | tr '\n' ' ')) — log only, the merge is the loop's"
+    soft_exit 0
+  fi
+  _FF_BEHIND="$(git -C "$REPO" rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo "")"
+  _FF_AHEAD="$(git -C "$REPO" rev-list --count "$UPSTREAM..HEAD" 2>/dev/null || echo "")"
+  for _FF_N in "$_FF_BEHIND" "$_FF_AHEAD"; do
+    case "$_FF_N" in ''|*[!0-9]*) log "ff-only tick: cannot count HEAD against $UPSTREAM — log only"; soft_exit 1;; esac
+  done
+  if [ "$_FF_BEHIND" -eq 0 ]; then
+    log "ff-only tick: up to date with $UPSTREAM (ahead ${_FF_AHEAD})"; soft_exit 0
+  fi
+  if [ "$_FF_AHEAD" -gt 0 ]; then
+    log "ff-only tick: NOT a fast-forward (ahead ${_FF_AHEAD}, behind ${_FF_BEHIND}) — log only, the merge is the loop's"
+    soft_exit 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    log "ff-only tick (dry-run): would fast-forward ${_FF_BEHIND} commit(s) to $UPSTREAM"; soft_exit 0
+  fi
+  _FF_FROM="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  _FF_OUT="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _FF_RC=$?
+  if [ "$_FF_RC" -eq 0 ]; then
+    log "ff-only tick: fast-forwarded ${_FF_BEHIND} commit(s) ${_FF_FROM}..$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    soft_exit 0
+  fi
+  # git refuses rather than overwrite (an untracked file in the way, a race with a
+  # write that landed after the status check), so a refusal leaves the tree as it was.
+  log "ff-only tick: merge --ff-only refused rc=${_FF_RC} — log only: $(printf '%s' "$_FF_OUT" | tail -n 1)"
+  soft_exit 1
+fi
+
 # --- Integrate-defer streak escalation () ---------------------------
 # The stranded-depth alarm below fires on the SYMPTOM (>= BULK_ALARM unpushed
 # commits). Between push-worthy and that cap, a merge that fails every
@@ -711,7 +776,10 @@ _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort), $2 = blo
     log "   staged-set evidence: $(_ip_staged_evidence)"
     if [ -n "${MIND_AGENT:-}" ] && [ -d "$REPO/agents/${MIND_AGENT}" ]; then
       local hd="$REPO/agents/${MIND_AGENT}/health"
-      { mkdir -p "$hd" && printf '{"ts":"%s","source":"iteration-push","event":"integrate_defer_streak","streak":%s,"since":"%s","shape":"%s","behind":"%s","ahead":"%s"}\n' \
+      # json.dumps DEFAULT separators, never compact: every other writer and
+      # re-serializer of this ledger emits that form, so a compact line is
+      # rewritten on the claim box and merge=union keeps both twins ().
+      { mkdir -p "$hd" && printf '{"ts": "%s", "source": "iteration-push", "event": "integrate_defer_streak", "streak": %s, "since": "%s", "shape": "%s", "behind": "%s", "ahead": "%s"}\n' \
           "$(date +%Y-%m-%dT%H:%M:%S)" "$n" "$since" "${1:-unknown}" "$behind" "$ahead" >>"$hd/$(date +%F).jsonl"; } 2>/dev/null || true
     fi
   fi

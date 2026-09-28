@@ -21,6 +21,11 @@
 #
 # FAIL-OPEN EVERYWHERE.  A fence that cannot decide must never stop a healthy
 # loop and must never delay a hook: every failure path exits 0 without writing.
+#
+# WORKER MODE (FENCE_ROLE=worker, ) is the WORKER BLOCK below, called
+# from stop-hook.sh's worker-net branch.  It writes NO stop signal and so adds
+# nothing to the authorized-writer count above: its decisive rung PARKS the Body
+# and alerts.  Decision: loop_exhaustion_fence.py::decide_worker.
 
 set -uo pipefail
 
@@ -60,6 +65,57 @@ if command -v py >/dev/null 2>&1; then
     PYRUN=(py -3)
 else
     PYRUN=(python3)
+fi
+
+# --- WORKER BLOCK () ----------------------------------------------
+# A worker Body must never write the agent-wide stop-requested/stop-target-mode:
+# the reducer on another machine reads them (stop/SKILL.md Step 0.6).  So the
+# decisive rung here is the park worker-loop Phase 1 takes -- resumable, on the
+# park orbit -- plus an alert, because a Body that keeps ending turns while it
+# holds no claim is a defect, not the quiet reducer-gone park.
+# stdout is the BLOCK reason addendum, so every write below sends its own stdout
+# to stderr, which the hook appends to its log (the recorder's notify verdict
+# must not be discarded -- guard-3737).
+if [ "${FENCE_ROLE:-}" = "worker" ]; then
+    [ -z "${HOOK_SID:-}" ] && exit 0
+    W_JSON="$("${PYRUN[@]}" "$SCRIPT_DIR/loop_exhaustion_fence.py" --role worker \
+        --sid "$HOOK_SID" --log "${HOOK_LOG:-}" 2>/dev/null || true)"
+    [ -z "$W_JSON" ] && exit 0
+    W_VERDICT="$(printf '%s' "$W_JSON" | "${PYRUN[@]}" -c \
+        "import sys,json;print(json.load(sys.stdin).get('verdict',''))" 2>/dev/null || true)"
+    W_REASON="$(printf '%s' "$W_JSON" | "${PYRUN[@]}" -c \
+        "import sys,json;print(json.load(sys.stdin).get('reason',''))" 2>/dev/null || true)"
+    case "$W_VERDICT" in
+      pause)
+        # No write: the directive is the whole rung.
+        echo "WORKER-STALL PAUSE: ${W_REASON}. This Body holds NO claim and keeps ending turns; a sleep is not a park, and it is what this fence counts. Your next action is Skill('worker-loop'): CLAIM the top eligible goal at Phase 1 SELECT, or, if none is eligible, take the Phase 1 PARK. If the turn-ends continue with no claim, this fence parks the Body and alerts the user."
+        exit 1
+        ;;
+      park)
+        # Park FIRST: it is the state change that ends the burn, and the alert
+        # below must be true when it is sent (recovery-gate.sh's rule).
+        PARK_RESULT="$("${PYRUN[@]}" "$SCRIPT_DIR/body-manifest.py" park \
+            --sid "$HOOK_SID" --agent "$AGENT" || true)"
+        if [ "$PARK_RESULT" != "parked" ]; then
+            echo "[loop-exhaustion-fence] worker park decided (${W_REASON}) but body-manifest park returned '${PARK_RESULT}'; nothing parked or alerted" >&2
+            exit 0
+        fi
+        # The board first: a fast write the whole fleet reads.  The recorder
+        # second: it notifies, and may wait on a mail transport.
+        printf '%s\n' "${AGENT} worker Body ${HOOK_SID} on $(uname -n 2>/dev/null) PARKED by the worker loop-exhaustion fence (g-115-11083): ${W_REASON}. Resumable: it re-polls on the park orbit and resumes on its next claim. A stall-park is a defect signal -- the Body kept ending turns while holding no claim." \
+            | bash "$SCRIPT_DIR/board-post.sh" --channel coordination --type finding \
+                --tags "worker-stall,body-parked,loop-exhaustion-fence" >&2 \
+            || echo "[loop-exhaustion-fence] WARN: board post failed; the stop-reason record still alerts" >&2
+        "${PYRUN[@]}" "$SCRIPT_DIR/stop-reason-record.py" --path worker-body-stall-parked \
+            --agent "$AGENT" --reason "Body ${HOOK_SID}: ${W_REASON}" >&2 \
+            || echo "[loop-exhaustion-fence] WARN: stop-reason recorder exited non-zero; the park may be unannounced" >&2
+        echo "WORKER-STALL PARK: ${W_REASON}. This fence has PARKED this Body (body_state parked: resumable, never a close) and alerted the user and the coordination board; a script gate decided this, not you. Your next action is Skill('worker-loop'): its Phase -0 reads the parked manifest and takes the park orbit from there. Do NOT answer this with a sleep."
+        exit 3
+        ;;
+      *)
+        exit 0
+        ;;
+    esac
 fi
 
 # Budget zone: RECORDED in the reason, never decisive (module docstring and

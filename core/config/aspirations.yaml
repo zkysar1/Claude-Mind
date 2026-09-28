@@ -2759,8 +2759,9 @@ git_drift:
 # FINDING someone must dispose of — and until  nothing detected it
 # (measured 2026-09-26: a 38.8h gap went unflagged). ReleaseTrainProbe files
 # ONE fleet-wide Investigate goal per stalled tag at the frontier and retires
-# it when a newer tag lands; release-train-check.sh is the read-only re-measure
-# and iteration-close.sh's in-turn nudge. Both read THESE values through
+# it when a newer tag lands; release-train-check.sh is the re-measure (it
+# fetches origin/main and the v* tags first, ) and
+# iteration-close.sh's in-turn nudge. Both read THESE values through
 # _release_train.config() (guard-308).
 release_train:
   # The runbook's cutoff, and a JUDGMENT, not a measurement (guard-5202 clause
@@ -2773,8 +2774,17 @@ release_train:
   # Re-file cadence while the gap persists after the goal was closed WITHOUT a
   # cut (the fired-latch fix guard-4870 forced on GitDriftProbe). Same value as
   # git_drift.ticks_to_revalidate so the probes re-file on one cadence. 0
-  # disables re-validation (fire once per stalled tag).
+  # disables re-validation (fire once per stalled tag). This paces ONE box;
+  # the fleet-wide floor after a hand close is skip_hold_hours below.
   ticks_to_revalidate: 50
+  # After a lease is closed BY HAND (skipped or completed; the probe's own
+  # retirements do not count), no reducer re-files that tag for this long, read
+  # from the goal store, and the next lease quotes the closing note. The
+  # per-box latch alone let any reducer with an unset latch re-file on its next
+  # tick (). MUST stay below aspirations_eviction.age_days x 24: the
+  # closed lease is read from the live store, which evicts terminal goals after
+  # that age (pinned by test_release_train.py). 0 disables the hold.
+  skip_hold_hours: 24
 
 # ------------------------------------------------------------------
 # Dependency-funnel detection (agent-watchdog DependencyFunnelProbe)

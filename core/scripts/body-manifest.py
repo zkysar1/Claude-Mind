@@ -601,8 +601,10 @@ def _push_carrier(carrier: Path) -> bool:
     mirror was the half left to a daemon that may never run again. Cost is
     bounded and small: the three callers (set_state / park / resume) are a
     handful of transitions per Body lifetime, and heartbeat-tick.sh does NOT
-    route through here -- it writes the carrier itself, on a box that is by
-    construction still alive to be swept.
+    route through here -- it writes the carrier itself and, on its --body-only
+    path, publishes it through the owncloud-sync-file endpoint (g-375-40). Being
+    alive to be swept was NOT enough: the sweep publishes only its daemon's
+    spawn-time session, so a later session's carrier never left the box.
 
     Fail-open by contract, like every other step on a close path: a failure here
     degrades to today's behaviour (the sweep remains the backstop whenever the
@@ -751,6 +753,39 @@ def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
     # a carrier left reading `active` goes stale and reads as a stall.
     _mirror_state_to_carrier(sid, agent, "parked", project_root)
     return "parked"
+
+
+def supply_gap_check(sid: str, agent: str, decline_args=(),
+                     project_root: Path | None = None) -> tuple:
+    """(refusals, summary) for a Phase 1 supply-gap park ().
+
+    Reads the census goal-selector's --top view wrote into this session's dir and
+    asks worker_execute whether every row in it was answered: claimed, or named
+    in a `--decline <goal-id>=<reason>`. A Body that never asked the gate has no
+    census, so it cannot park on "no eligible goal". `summary` is the census
+    line the park's board post carries.
+    """
+    import worker_execute  # lazy: only this park needs the eligibility contract
+    declines = {}
+    for arg in decline_args or ():
+        goal_id, sep, reason = str(arg).partition("=")
+        if not sep or not goal_id.strip() or not reason.strip():
+            raise ValueError(f"--decline wants <goal-id>=<reason>, got {arg!r}")
+        declines[goal_id.strip()] = reason.strip()
+    _, session_dir, _ = _agent_paths(agent, sid, project_root)
+    try:
+        census = json.loads((session_dir / worker_execute.SELECT_CENSUS_FILENAME)
+                            .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        census = None
+    refusals = worker_execute.supply_gap_refusals(census, declines)
+    summary = ""
+    if isinstance(census, dict):
+        summary = (f"select census --top {census.get('top')}: eligible "
+                   f"{census.get('eligible')}, undetermined {census.get('undetermined')}, "
+                   f"reducer-only dropped {census.get('reducer_only_skipped')} of "
+                   f"{census.get('walked')} walked; declined {len(declines)}")
+    return refusals, summary
 
 
 def resume_body(sid: str, agent: str, project_root: Path | None = None) -> str:
@@ -1436,6 +1471,14 @@ def main(argv=None):
             sp.add_argument("state", choices=VALID_STATES)
         if name == "park-expired":
             sp.add_argument("--max-hours", type=float, default=PARK_MAX_HOURS)
+        if name == "park":
+            sp.add_argument("--supply-gap", action="store_true",
+                            help="the Phase 1 park (SELECT found nothing to take): "
+                                 "refused until every row of this session's select "
+                                 "census is claimed or declined (g-375-53)")
+            sp.add_argument("--decline", action="append", default=[],
+                            metavar="GOAL=REASON",
+                            help="a census row this Body cannot take, and why")
     args = parser.parse_args(argv)
 
     try:
@@ -1465,7 +1508,23 @@ def main(argv=None):
             _late_kw = {"no_wm_state": "closed-graceful"} if args.graceful else {}
             print(close_body_late(args.sid, args.agent, **_late_kw))
         elif args.cmd == "park":
+            # --supply-gap (): EXIT 5 = refused, and nothing was parked.
+            # stdout says `refused`; stderr names each census row still open.
+            # The reducer-gone park (Phase 0.5) and the exhaustion fence pass no
+            # flag and are unchanged.
+            summary = ""
+            if args.decline and not args.supply_gap:
+                raise ValueError("--decline applies only to a --supply-gap park")
+            if args.supply_gap:
+                refusals, summary = supply_gap_check(args.sid, args.agent, args.decline)
+                if refusals:
+                    print("refused")
+                    for reason in refusals:
+                        print(f"  {reason}", file=sys.stderr)
+                    return 5
             print(park_body(args.sid, args.agent))
+            if summary:
+                print(summary)
         elif args.cmd == "resume":
             print(resume_body(args.sid, args.agent))
         elif args.cmd == "park-expired":

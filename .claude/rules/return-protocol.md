@@ -33,24 +33,15 @@ There are exactly two valid terminal tool calls, selected by role:
 ### Deadman's-switch pair (orchestrator, DEFAULT-ON since 2026-06-23)
 
 By default (Stage 5 onward), the orchestrator's terminal response is the
-**pair** `[ScheduleWakeup(prompt="<<autonomous-loop-dynamic>>",
-delaySeconds=600, noop=false, reason="deadman resurrection net"), Skill(aspirations) args='loop']`. This does NOT violate the
-"terminal must be `Skill(aspirations)`" contract above: `Skill(aspirations)` is
-still the LAST call and the primary re-entry. The `ScheduleWakeup` is armed
-immediately before it as a self-resurrection NET that fires only if a text-death
-breaks the Skill chain (it never fires on a healthy loop). It is NOT a
-substitute for the Skill call (reconciles guard-511 /
-schedule-wakeup-correctness.md Anti-pattern C). Opt-out per agent: when
-`agents/<agent>/session/deadman-disabled` is present → terminal is
-`Skill(aspirations)` alone. Rationale: `core/config/rationale/deadman-switch.md`.
+**pair** `[ScheduleWakeup(sentinel), Skill(aspirations) args='loop']`.
+`Skill(aspirations)` remains the LAST call and the primary re-entry; the
+`ScheduleWakeup` is a self-resurrection NET that fires only if a text-death
+breaks the Skill chain. Not a violation of Anti-pattern C (guard-511).
+Opt-out: `agents/<agent>/session/deadman-disabled`.
 
-**Re-arm FIRST on resurrection AND on an autocompact resume.** Firing CONSUMES
-the net, and a mid-iteration compact resume emits no terminal pair at all, so
-such a turn's FIRST tool call is the sentinel re-arm. That rule, its two
-multi-hour incidents, and the RUNNING-only condition the gate now enforces are
-stated ONCE, in `.claude/rules/schedule-wakeup-correctness.md` § "Re-arm FIRST"
-— this file carried a second verbatim copy until 2026-09-21, which is one copy
-too many to keep correct.
+**Re-arm FIRST on resurrection and on autocompact resume** — the imperative and
+call shape are in `.claude/rules/schedule-wakeup-correctness.md` § "Re-arm
+FIRST". Rationale: `core/config/rationale/deadman-switch.md`.
 
 ## Required SKILL.md section
 
@@ -122,11 +113,8 @@ Before the final tool call of any turn, ask:
 `/verify-learning` enforces the `## Return Protocol` section requirement with a
 dynamic grep over every SKILL.md minus the exempt list above (edit the exempt
 list in `.claude/skills/verify-learning/SKILL.md` if a genuinely new user-only
-skill is added). At runtime `iteration-close.sh` / `recurring-close.sh` print
-the `═══ ITERATION COMPLETE ═══` + `NEXT ACTION REQUIRED: Call Skill(aspirations)
-with args='loop'` imperative as their terminal line, and the Stop hook restates
-the phase-specific next action at BLOCK time. Against the Explanatory-style
-collision (trailing `✶ Insight` blocks — four silent deaths on 2026-04-29,
-rb-629, guard-454) there are four layers (A this rule + tree node, B `/start`
-refuses autonomous+Explanatory, C the trailing-text detector, D a 24h
-transcript audit) — table and wiring in the convention.
+skill is added). At runtime
+`iteration-close.sh` / `recurring-close.sh` print the `═══ ITERATION COMPLETE
+═══` imperative, and the Stop hook restates the next action at BLOCK time.
+Layered defense against the Explanatory-style collision (rb-629, guard-454):
+table and wiring in `core/config/conventions/loop-terminal-protocol.md`.

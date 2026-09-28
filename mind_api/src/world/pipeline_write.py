@@ -29,6 +29,7 @@ from _surprise import apply_derived_surprise  # noqa: E402  # : surprise is DERI
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
 from ..agent_paths import assert_not_cruft  # noqa: E402
 from _pipeline_fields import warn_unknown_fields  # noqa: E402  #  unknown-key WARN arm
+from coordination_merge import _merge_replay_metadata  # noqa: E402  # : the fleet merge's replay_metadata rule, reused by the prune fold
 
 
 # ---------------------------------------------------------------------------
@@ -1443,6 +1444,93 @@ def _is_stale_unactivated(rec: Dict[str, Any], today: date) -> bool:
     return rb < today
 
 
+def _fold_tombstone(archive_rec: Optional[Dict[str, Any]],
+                    tombstone: Dict[str, Any]) -> Dict[str, Any]:
+    """The archive copy a live tombstone must leave behind when it is pruned
+    (g-115-10778).
+
+    The archive copy is frozen at first archival, while update and update_field
+    write the LIVE copy first, so every later write landed on the tombstone.
+    The tombstone therefore wins a conflicting field, and the archive keeps
+    only the fields the tombstone lacks (guard-4066: union, never overwrite).
+    Three rules follow the fleet merge (coordination_merge._merge_pipeline_record)
+    instead, so that a stale copy the union merge resurrected into live
+    (guard-1072) cannot walk the archive back: a null never erases a set value,
+    reflected=True dominates, and replay_metadata merges field-wise
+    (replay_count only grows, the newer date wins).
+    """
+    if archive_rec is None:
+        return dict(tombstone)
+    out = dict(archive_rec)
+    for key, value in tombstone.items():
+        if value is None and out.get(key) is not None:
+            continue
+        out[key] = value
+    if bool(archive_rec.get("reflected")) or bool(tombstone.get("reflected")):
+        out["reflected"] = True
+    ma = archive_rec.get("replay_metadata")
+    mt = tombstone.get("replay_metadata")
+    if isinstance(ma, dict) and isinstance(mt, dict):
+        out["replay_metadata"] = _merge_replay_metadata(ma, mt)
+    return out
+
+
+def _fold_tombstones_into_archive(archive_path: Path, base_dir: Path, agent: str,
+                                  tombstones: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """Write each tombstone about to be pruned into its archive copy, in ONE
+    locked read-modify-write of the archive, BEFORE the prune: archive before
+    delete (g-115-10778).
+
+    Every archive row of a pruned id is replaced by ONE folded row, at the first
+    row's position. The archive carries historical duplicate-id rows, and
+    folding only the first would leave a stale twin for the union merge to pick
+    (guard-2449). A tombstone with NO archive copy is appended, because pruning
+    it would delete the only copy. Nothing is written when every archive copy
+    already equals its fold. Returns (rows folded, tombstones appended).
+    """
+    wanted: Dict[str, Dict[str, Any]] = {}
+    for t in tombstones:
+        rid = t["id"]
+        wanted[rid] = t if rid not in wanted else _fold_tombstone(wanted[rid], t)
+    with file_locks.locked(archive_path):
+        items = _read_jsonl(archive_path)
+        copies: Dict[str, List[Dict[str, Any]]] = {}
+        for rec in items:
+            if rec.get("id") in wanted:
+                copies.setdefault(rec["id"], []).append(rec)
+        folded: Dict[str, Dict[str, Any]] = {}
+        for rid, tombstone in wanted.items():
+            base = None
+            for copy in copies.get(rid, []):
+                base = copy if base is None else _fold_tombstone(base, copy)
+            new = _fold_tombstone(base, tombstone)
+            if copies.get(rid) != [new]:
+                folded[rid] = new
+        if not folded:
+            return 0, 0
+
+        out: List[Dict[str, Any]] = []
+        placed = set()
+        for rec in items:
+            rid = rec.get("id")
+            if rid not in folded:
+                out.append(rec)
+            elif rid not in placed:
+                out.append(folded[rid])
+                placed.add(rid)
+        appended = [rid for rid in folded if rid not in placed]
+        out.extend(folded[rid] for rid in appended)
+
+        summary = (f"pipeline-archive-sweep fold ({len(folded)} records, "
+                   f"{len(appended)} with no archive copy)")
+        history.snapshot(archive_path, base_dir, agent, summary=summary)
+        _atomic_write_jsonl(archive_path, out)
+        changelog.append(base_dir, agent, archive_path, "edit",
+                         summary=summary, lines_changed=len(out))
+        _jsonl_cache().invalidate(archive_path)
+    return len(folded) - len(appended), len(appended)
+
+
 def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/pipeline/archive-sweep
 
@@ -1451,7 +1539,8 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     in live as tombstones — g-115-1986; see PRUNE_GRACE_DAYS), validate, and
     append to pipeline-archive.jsonl (deduped by id). Also maintains existing
     live tombstones: stamps a missing archived_date, prunes tombstones whose
-    archived_date is older than PRUNE_GRACE_DAYS. Recomputes
+    archived_date is older than PRUNE_GRACE_DAYS -- after folding each one's
+    post-archival writes into its archive copy (g-115-10778). Recomputes
     pipeline-meta.json afterwards.
     """
     from ..server import Response
@@ -1463,6 +1552,8 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
 
     archived_count = 0
     pruned_count = 0
+    folded_count = 0
+    archive_missing_count = 0
     # Per-record validation failures are collected here rather than aborting
     # the whole batch (): one corrupt record must not wedge all
     # archival. Invalid records stay in live (un-flipped, visible) and are
@@ -1474,14 +1565,15 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
             items = _read_jsonl(live_path)
             archive_ids = {r.get("id") for r in _read_jsonl(archive_path)}
             to_archive: List[Dict[str, Any]] = []
+            to_prune: List[Dict[str, Any]] = []
             remaining: List[Dict[str, Any]] = []
             stamped_count = 0
 
             for rec in items:
                 if rec.get("stage") == "archived":
                     # Live tombstone maintenance (): stamp a missing
-                    # prune clock, prune aged tombstones (the archive copy
-                    # already holds the record), keep young ones so the stage
+                    # prune clock, prune aged tombstones once the archive copy
+                    # holds everything they carry, keep young ones so the stage
                     # flip has time to converge fleet-wide via the union merge.
                     archived_date = rec.get("archived_date")
                     if not archived_date:
@@ -1495,9 +1587,12 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     except ValueError:
                         remaining.append(rec)  # unparseable clock — keep
                         continue
-                    if age >= PRUNE_GRACE_DAYS:
-                        pruned_count += 1
-                        continue  # physically pruned; archive copy remains
+                    if age >= PRUNE_GRACE_DAYS and rec.get("id"):
+                        # Pruned below, AFTER its post-archival writes are
+                        # folded into the archive copy (). An
+                        # id-less tombstone matches no archive copy: kept.
+                        to_prune.append(rec)
+                        continue
                     remaining.append(rec)
                     continue
                 if rec.get("stage") == "resolved":
@@ -1591,6 +1686,7 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                 remaining.append(rec)
 
             archived_count = len(to_archive)
+            pruned_count = len(to_prune)
 
             if not to_archive and pruned_count == 0 and stamped_count == 0:
                 return Response.json({
@@ -1599,6 +1695,15 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
                     "pruned_count": 0,
                     "skipped_invalid": skipped_invalid,
                 })
+
+            # Archive before delete (): update and update_field
+            # write the live copy first, so a tombstone carries every write
+            # made after its archival while the archive copy stays frozen.
+            # Fold those writes in BEFORE the live write below prunes it; if
+            # the fold raises, the sweep aborts with nothing pruned.
+            if to_prune:
+                folded_count, archive_missing_count = _fold_tombstones_into_archive(
+                    archive_path, base_dir, agent, to_prune)
 
             # Append each newly-flipped record to the archive file — once.
             # Ids already archived (tombstone re-sweeps, resurrection residue)
@@ -1629,6 +1734,8 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
         "ok": True,
         "archived_count": archived_count,
         "pruned_count": pruned_count,
+        "folded_count": folded_count,
+        "archive_missing_count": archive_missing_count,
         "skipped_invalid": skipped_invalid,
     })
 

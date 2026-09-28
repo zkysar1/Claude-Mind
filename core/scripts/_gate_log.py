@@ -46,6 +46,7 @@ they never saw. The canary reads its verdict from the gate's rc and stdout, neve
 from this log, so suppressing the write costs it nothing.
 """
 
+import contextvars as _contextvars
 import datetime as _dt
 import hashlib as _hashlib
 import json as _json
@@ -248,6 +249,32 @@ def _truncate(value, limit):
     return s if len(s) <= limit else s[:limit] + "..."
 
 
+#: log()'s ``session_id`` default: the request's session if a server named one, else this
+#: process's own MIND_SID. The env is right for a CLI or subprocess caller, whose process
+#: IS the session, and wrong in the daemon, whose env belongs to the session that spawned it.
+_ENV_SID = object()
+
+#: The calling session of the request this thread is serving. The mind_api dispatcher sets
+#: it once per request from the `x-mind-sid` header, so a gate evaluated in-process deep
+#: under a handler stamps the caller without threading a parameter through every gate
+#: (guard-2480, ). Unset outside a request; None when the request named no session.
+_request_session = _contextvars.ContextVar("ayoai_gate_log_request_session", default=_ENV_SID)
+
+
+def set_request_session(sid):
+    """Name the calling session for the current request; a blank sid names none.
+
+    Returns a token the caller MUST pass to reset_request_session() in a ``finally``,
+    so the session never outlives its request on a reused thread.
+    """
+    return _request_session.set((sid or "").strip() or None)
+
+
+def reset_request_session(token):
+    """Restore what the context held before the matching set_request_session()."""
+    _request_session.reset(token)
+
+
 def log(
     gate_id,
     decision,
@@ -260,6 +287,7 @@ def log(
     extra=None,
     meta_dir=None,
     agent_name=None,
+    session_id=_ENV_SID,
 ):
     """Append a firing record. Best-effort, NEVER raises.
 
@@ -283,6 +311,14 @@ def log(
       agent_name: optional override for the `agent` field on the record. Same
                   motivation as meta_dir — env-derived value is wrong in the
                   daemon. Omit elsewhere.
+      session_id: the record's `session_id`. When omitted it is the session
+                  set_request_session() named for this request, else MIND_SID.
+                  The daemon's MIND_SID is whichever session SPAWNED it, so a
+                  daemon caller relies on the dispatcher having named the
+                  request's session, or passes the `x-mind-sid` header itself
+                  (guard-2480, g-375-41). CLI / subprocess callers omit it: their
+                  env is their own. None writes no session — an absent sid beats
+                  a wrong one.
     """
     try:
         # Pytest suppression () — see module docstring. Checked inside
@@ -300,13 +336,16 @@ def log(
             extra["_invalid_decision_received"] = str(decision)
             decision = "fail_open"
 
+        if session_id is _ENV_SID:
+            session_id = _request_session.get()
         record = {
             "schema_version": _SCHEMA_VERSION,
             "ts": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "gate_id": gate_id,
             "decision": decision,
             "agent": agent_name or _os.environ.get("MIND_AGENT", "") or None,
-            "session_id": _os.environ.get("MIND_SID", "") or None,
+            "session_id": ((_os.environ.get("MIND_SID", "") or None)
+                           if session_id is _ENV_SID else (session_id or None)),
         }
         if caller is not None:
             record["caller"] = _truncate(caller, 120)

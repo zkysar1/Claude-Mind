@@ -122,6 +122,13 @@ _HISTORICAL_NAMES = {
 _HISTORICAL_DIR_PARTS = {"board", "journal", "health", "experience", "logs",
                          "sessions", "temp", "drained", "presence"}
 
+# EXACT retrieval-trace date-segment shape (): the same literal
+# _retrieval_trace._SEGMENT_RE holds, restated here because this scanner must
+# keep working when the seam module is absent. test_retrieval_trace_segment_
+# starvation.py asserts the two agree.
+_RETRIEVAL_TRACE_SEGMENT_RE = re.compile(
+    r"^retrieval-trace-\d{4}-\d{2}-\d{2}\.jsonl$")
+
 
 def is_historical(p: Path, rel: Path) -> bool:
     """Narration (history / telemetry / archives) vs live referent.
@@ -154,6 +161,19 @@ def is_historical(p: Path, rel: Path) -> bool:
     # 344 goal-id mentions in one day — an unmatched segment re-introduces the
     # always-fires failure mode for every goal a gate has ever fired on.
     if p.name.startswith("gate-firings-") and p.name.endswith(".jsonl"):
+        return True
+    # retrieval-trace date segments (`retrieval-trace-YYYY-MM-DD.jsonl`,
+    #  outcome 4, writer default-OFF) are the SAME append-only
+    # telemetry as the enumerated `retrieval-trace.jsonl` above. Matched by
+    # EXACT date shape, not stem, for the same reason _retrieval_trace
+    # itself refuses a `retrieval-trace-*` prefix: same-stem siblings
+    # (archive, spool, .bak, a per-box shard) must not be swept in. Not
+    # imported from _retrieval_trace: this scanner's own contract is that it
+    # keeps working when the seam module is absent (see the _HISTORICAL_NAMES
+    # comment), so the literal is pinned by test instead —
+    # test_retrieval_trace_segment_starvation.py asserts both the shape and
+    # the classification.
+    if _RETRIEVAL_TRACE_SEGMENT_RE.match(p.name):
         return True
     return any(part in _HISTORICAL_DIR_PARTS for part in rel.parts)
 

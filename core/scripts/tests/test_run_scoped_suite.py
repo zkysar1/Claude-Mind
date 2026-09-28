@@ -352,15 +352,176 @@ def test_zero_test_files_flags_main_style_only(mod, tmp_path):
     assert mod._zero_test_files([main_style, plain, klass, unit]) == [str(main_style)]
 
 
-def test_green_run_with_a_zero_test_file_is_not_a_bare_pass(mod, monkeypatch, capsys):
-    """: a green run whose selection includes main()-style files
-    (6 of 26 for capability-gate.py) must not report a bare PASS."""
+# ──  outcome 2: zero-test files are EXECUTED, not named ────────────
+#  first made this tier NAME the main()-style files a green run
+# could not execute (PASS_WITH_GAPS). Outcome 2 closes the gap properly: the
+# green pytest half is EXTENDED with a delegation to run-invisible-suites.sh
+# --files — the only runner that can execute a zero-test file. The old pin
+# below was rewritten 2026-09-27: it asserted the gap the delegation removes.
+# run_pytest is monkeypatched so these pins never re-enter the real tier
+# (this file names capability-gate.py's selection, so a nested run would
+# select THIS file — the recursion guard the real PASS-path test documents).
+
+def _zero_selection_argv(target="core/scripts/capability-gate.py"):
+    return ["run-scoped-suite.py", "--changed", target, "--json"]
+
+
+def test_zero_test_files_are_delegated_not_left_as_a_gap(mod, monkeypatch, capsys):
+    """A green run whose selection includes main()-style files delegates them
+    to the invisible runner and reports PASS when the delegation is green."""
     import json
     monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (0, ""))
-    monkeypatch.setattr(sys, "argv", ["run-scoped-suite.py", "--changed",
-                                      "core/scripts/capability-gate.py", "--json"])
+    monkeypatch.setattr(mod, "run_invisible_delegation",
+                        lambda zero_files, timeout: (0, "invisible-suites: 6/6 files passed"))
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
     rc = mod.main()
     out = json.loads(capsys.readouterr().out)
-    assert rc == 2 and out["verdict"] == "PASS_WITH_GAPS", out["verdict"]
+    assert rc == 0 and out["verdict"] == "PASS", out["verdict"]
+    assert out["zero_test_delegated"] is True
     assert "core/scripts/tests/test_layer_d_telemetry.py" in out["zero_test_files"]
-    assert "test_layer_d_telemetry.py" in out["reason"]
+    assert "delegated to run-invisible-suites.sh" in out["reason"]
+
+
+def test_zero_test_delegation_failure_fails_the_tier(mod, monkeypatch, capsys):
+    """A RED main()-style file in the selection must not read as pass."""
+    import json
+    monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (0, ""))
+    monkeypatch.setattr(mod, "run_invisible_delegation",
+                        lambda zero_files, timeout: (1, "FAIL(rc=1) test_layer_d_telemetry.py"))
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 1 and out["verdict"] == "FAIL", out["verdict"]
+    assert "invisible delegation FAILED" in out["reason"]
+
+
+def test_zero_test_delegation_refusal_is_inconclusive_not_pass(mod, monkeypatch, capsys):
+    """An unbound / missing-path delegation REFUSES (runner exit 2) — 'did not
+    run' must not read as pass (silent-signal class, guard-1760)."""
+    import json
+    monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (0, ""))
+    monkeypatch.setattr(mod, "run_invisible_delegation",
+                        lambda zero_files, timeout: (2, "invisible-suites: --files REFUSED — no resolvable agent binding"))
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 2 and out["verdict"] == "INCONCLUSIVE", out["verdict"]
+    assert "REFUSED" in out["reason"]
+    assert "did not run" in out["reason"] or "must not read as pass" in out["reason"]
+
+
+def test_zero_test_delegation_timeout_is_inconclusive(mod, monkeypatch, capsys):
+    import json
+    monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (0, ""))
+
+    def _hang(zero_files, timeout):
+        raise subprocess.TimeoutExpired(cmd="delegation", timeout=timeout)
+    monkeypatch.setattr(mod, "run_invisible_delegation", _hang)
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 2 and out["verdict"] == "INCONCLUSIVE", out["verdict"]
+    assert "timed out during invisible delegation" in out["reason"]
+
+
+def test_delegation_receives_exactly_the_zero_test_files(mod, monkeypatch, capsys):
+    """The delegation is handed the zero-test list, not the whole selection —
+    re-running pytest-collectable files through the invisible runner would
+    double-run them (and its .py dispatch is `python3 file`, which imports,
+    not collects)."""
+    import json
+    seen = {}
+    monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (0, ""))
+
+    def _capture(zero_files, timeout):
+        seen["files"] = list(zero_files)
+        return (0, "ok")
+    monkeypatch.setattr(mod, "run_invisible_delegation", _capture)
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    mod.main()
+    capsys.readouterr()
+    per_file, _ = mod.select(["core/scripts/capability-gate.py"],
+                             mod._index_tests(mod._testpaths()))
+    assert seen["files"] == sorted(mod._zero_test_files(
+        [Path(p) for p in per_file["core/scripts/capability-gate.py"]]))
+
+
+# ──  outcome 3: module-level importorskip is a QUALIFICATION ──────
+# Measured on the deciding box (zc-10, 2026-09-27): 12 test files gate on
+# module-level `importorskip` (moto/ absent). pytest rc=0 with skips in a
+# mixed selection, rc=5 when the ENTIRE selection is skipped (pre-fix: FAIL —
+# the wrong direction, nothing failed, nothing ran). The qualification is
+# evidence-based: it reads the run's OWN -rs summary ('could not import'),
+# never the source text (the same file runs normally where the dep exists).
+
+def test_module_skip_files_parses_rs_evidence_only(mod, tmp_path):
+    """The -rs 'could not import' clause is the module-skip discriminator:
+    test-level skips name no import and must NOT qualify a PASS."""
+    selected = [tmp_path / "test_owncloud_backend.py",
+                tmp_path / "test_layer_d_telemetry.py"]
+    log = (
+        "20 passed, 114 skipped in 3.2s\n"
+        "SKIPPED [114] " + str(tmp_path / "test_owncloud_backend.py") +
+        ":29: could not import 'boto3': No module named 'boto3'\n"
+        "SKIPPED [1] " + str(tmp_path / "test_layer_d_telemetry.py") +
+        ":41: linux-only feature\n"
+    )
+    # resolve() puts the tmp file outside PROJECT_ROOT, so the name fallback
+    # applies: the module-skipped file is named, the test-level one is not.
+    assert mod._module_skip_files(selected, log) == ["test_owncloud_backend.py"]
+
+
+def test_module_skip_files_ignores_repo_relative_lines(mod, tmp_path):
+    selected = [Path("core/scripts/tests/test_owncloud_backend.py")]
+    log = ("SKIPPED [114] core/scripts/tests/test_owncloud_backend.py:29: "
+           "could not import 'boto3': No module named 'boto3'\n")
+    assert mod._module_skip_files(selected, log) == [
+        "core/scripts/tests/test_owncloud_backend.py"]
+
+
+def test_green_run_with_module_skip_is_qualified_not_bare_pass(mod, monkeypatch, capsys):
+    """A green run over importorskip-gated files returns 0 but the verdict is
+    PASS_WITH_SKIPS and the files are named — never a bare PASS."""
+    import json
+    monkeypatch.setattr(mod, "run_pytest",
+                        lambda files, log_path, timeout: (0,
+                            "SKIPPED [114] core/scripts/tests/test_owncloud_backend.py:29: "
+                            "could not import 'boto3': No module named 'boto3'\n"
+                            "20 passed, 114 skipped in 3.2s"))
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 0, out
+    assert out["verdict"] == "PASS_WITH_SKIPS", out["verdict"]
+    assert out["skipped_module_files"] == [
+        "core/scripts/tests/test_owncloud_backend.py"]
+    assert "QUALIFIED" in out["reason"]
+
+
+def test_pytest_rc5_all_module_skip_is_inconclusive_not_fail(mod, monkeypatch, capsys):
+    """pytest exit 5 = no tests ran. Pre-fix this fell through to FAIL — the
+    wrong direction: nothing FAILED, nothing RAN (measured zc-10 2026-09-27)."""
+    import json
+    monkeypatch.setattr(mod, "run_pytest",
+                        lambda files, log_path, timeout: (5,
+                            "SKIPPED [114] core/scripts/tests/test_owncloud_backend.py:29: "
+                            "could not import 'boto3': No module named 'boto3'\n"
+                            "1 skipped in 0.1s"))
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 2 and out["verdict"] == "INCONCLUSIVE", out["verdict"]
+    assert "ran 0 tests" in out["reason"]
+    assert "core/scripts/tests/test_owncloud_backend.py" in out["skipped_module_files"]
+
+
+def test_pytest_rc5_without_importorskip_evidence_stays_inconclusive(mod, monkeypatch, capsys):
+    """rc=5 with NO visible module-skip evidence: still 'nothing was verified',
+    and the reason points at the log rather than blaming importorskip."""
+    import json
+    monkeypatch.setattr(mod, "run_pytest", lambda files, log_path, timeout: (5, ""))
+    monkeypatch.setattr(sys, "argv", _zero_selection_argv())
+    rc = mod.main()
+    out = json.loads(capsys.readouterr().out)
+    assert rc == 2 and out["verdict"] == "INCONCLUSIVE", out["verdict"]
+    assert "check the log" in out["reason"]

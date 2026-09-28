@@ -1021,10 +1021,9 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    # Tier 0 phase-cost telemetry (plan: ~/.claude/plans/i-had-one-agent-luminous-reddy.md).
    # TWO-STEP under Windows bash. Previous single-pipeline (`script | py -c ... || echo`)
    # silently fell through to the `||` fallback under autocompact pressure, so alpha's
-   # handoff showed "skipped (no markers)" despite 773 captured markers. The env-var
-   # pattern below matches `iteration-close.sh:114` — robust against MSYS pipe issues.
-   Bash: bash core/scripts/phase-cost-report.sh --write-report > "$MIND_AGENT/session/last-phase-cost.json" 2>/dev/null || echo '{}' > "$MIND_AGENT/session/last-phase-cost.json"
-   Bash: MIND_AGENT="$MIND_AGENT" py -3 -c "import json,os; p=os.environ['MIND_AGENT']+'/session/last-phase-cost.json'; d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p)>2 else {}; print(d.get('written_to') or 'none'); print(d.get('summary') or 'skipped (no markers)')"
+   # handoff showed "skipped (no markers)" despite 773 captured markers. Path via agent_dir() — g-115-9954; WHY: core/config/rationale/phase-cost-handoff-path.md
+   Bash: source core/scripts/_paths.sh && LPC="$(agent_dir "$MIND_AGENT")/session/last-phase-cost.json" && { bash core/scripts/phase-cost-report.sh --write-report > "$LPC" 2>/dev/null || echo '{}' > "$LPC"; }
+   Bash: source core/scripts/_paths.sh && LPC="$(agent_dir "$MIND_AGENT")/session/last-phase-cost.json" py -3 -c "import json,os; p=os.environ['LPC']; d=json.load(open(p)) if os.path.exists(p) and os.path.getsize(p)>2 else {}; print(d.get('written_to') or 'none'); print(d.get('summary') or 'skipped (no markers)')"
    → capture first line as phase_cost_report_path, second line as phase_cost_summary
    Bash: goal-selector.sh → get top-ranked goal for next session
    Read decisions_locked from current session context (if any)

@@ -71,27 +71,19 @@ Phase 0.5b closes it.
    permanently blocked.
 
 5. **Expect two independent refusals at write time, and never launder the
-   evidence to pass them.** `capability-gate.py` keyword-matches the
-   `defer_reason` TEXT and, on an agent-provisionable match, refuses the
-   defer AND files an `Unblock:` goal atomically (Layer D auto-conversion —
-   see the convention). A defer that honours rule 1 CITES its probe output,
-   which is exactly where service/tool/command names live, so the
-   best-probed defers are the ones most likely to trip it (guard-3882). Read
-   the gate's own sub-analysis: when `unblock_suppressed_reason` names a
-   bare-token noun match, `--force-defer "<justification>"` is the sanctioned
-   response — never delete the probe citation to get past the gate. Then
-   expect `blocker_ref_required`, which `--force-defer` does NOT satisfy; only
-   a `STRUCTURED_DEFER_PREFIXES` member bypasses it (`gates/defer_classifier.py`
-   is the SSOT).
+   evidence to pass them.** `capability-gate.py` keyword-matches `defer_reason`
+   and auto-files an `Unblock:` goal on match (Layer D). On a bare-token noun
+   match, `--force-defer "<justification>"` is the sanctioned response — never
+   delete the probe citation. Then expect `blocker_ref_required` (only a
+   `STRUCTURED_DEFER_PREFIXES` member bypasses it). Detail:
+   `core/config/conventions/defer-routing.md` (guard-3882 gradient).
 
-## Enforcement (summary — mechanism in the convention)
+## Enforcement
 
-| Moment | Mechanism |
-|---|---|
-| Defer-time write | `capability-gate.py` from `cmd_update_goal` when `field == defer_reason`; refuses + auto-files the Unblock (Layer D). Override: `--force-defer` |
-| Re-entry sweep | `aspirations-precheck` Phase 0.5b re-probe with the canonical script; clears stale defers |
-| Notification time | `/notify-user` Step 1.5 gate on approval-request patterns |
-| Chat reply (handing the user a command block) | **NONE — honor-system by construction**; a post-hoc transcript detective is the only possible mechanism. See `capability-before-user.md` § "The Fourth Surface". Do not file work to "add the missing gate". |
+Four moments: defer-time write (`capability-gate.py` Layer D), re-entry sweep
+(Phase 0.5b), notification time (`/notify-user` Step 1.5), chat reply
+(honor-system — no gate possible). Full table:
+`core/config/conventions/defer-routing.md`.
 
 ## Anti-patterns
 

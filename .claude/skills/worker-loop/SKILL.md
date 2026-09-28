@@ -386,37 +386,29 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 # down — transients accumulate to `error_threshold` (3); any LIVE poll resets.
 # Takeover detection: machine_id + claim token fingerprint (g-306-224).
 
-# Phase 1 — SELECT (reducer's scorer, g-375-06)
-Bash: goal-selector.sh select --top 10
-Pick the top eligible unclaimed goal (none? --top 40); drop any in a partner's
-in_flight OR in_flight_bodies — a WORKER is in the LATTER ONLY (g-306-276).
+# Phase 1 — SELECT (reducer's scorer, g-375-06; one-call walk, g-375-53)
+Bash: py -3 core/scripts/worker_execute.py select-walk --top 10
+Pick the first unclaimed row you can take (none? --top 40); drop any in a
+partner's in_flight OR in_flight_bodies — a WORKER is in the LATTER ONLY (g-306-276).
 #
 # ROLE + SKILL ELIGIBILITY (g-115-5664, g-306-440). "Eligible" includes the
 # goal's ROLE and its SKILL, and the scorer knows neither.
 # Rationale (WHY role-first, why `undetermined` is a WORD not an rc, why the
-# flag ORDER is load-bearing, why the banner branch keeps the selector
-# role-blind): core/config/rationale/worker-role-gate.md
+# walk filters BEFORE the cut, the source gate's claim-holding rule, why the
+# banner branch keeps the selector role-blind): core/config/rationale/worker-role-gate.md
 #
-# For each candidate IN RANK ORDER, ask the contract before claiming.
-# --role COMES FIRST (the skill arg is argparse REMAINDER, so a TRAILING
-# --role is swallowed as skill text and never read). Omit --role when unset.
-Bash: py -3 core/scripts/worker_execute.py goal-eligible --role <the goal's executable_by_role field> <the goal's skill field, verbatim>
-# THE GOAL-LEVEL executable_by_role IS CONSULTED FIRST and is decisive where
-# present. READ THE STDOUT WORD, not just rc — there are THREE:
-#   reducer-only (rc 1) -> SKIP THIS GOAL, take the NEXT candidate in the same
-#     pass. Say the stderr reason out loud; a silent skip is the half of this
-#     that would rot. Do NOT burn a select cycle per refusal, and do NOT file
-#     anything: the goal is not broken, it is the reducer's, and it stays
-#     visible to the reducer where it belongs.
-#   eligible (rc 0) -> a real judgment was made. Proceed to CLAIM.
-#   undetermined (rc 0) -> THE BRIDGE DECLINED TO JUDGE (skill-less goal, or a
-#     skill the table does not map). The zero is FAIL-OPEN, NOT a pass, and the
-#     call is YOURS (g-115-6523, g-306-440).
-#
-# The check is a scoped CALL into the shared component (guard-2676). The refusal
-# list is NOT duplicated here and must not be: worker_execute derives it from
-# LIFECYCLE_DISPOSITIONS, so a stage whose disposition changes moves its skills
-# with it. `reducer-only-skills` prints the current set if you want to see it.
+# THE WALK HAS ALREADY ASKED THE CONTRACT (g-375-53). select-walk takes the
+# scorer's ranking (goal-selector.sh select, role-blind, unchanged) and runs
+# goal-eligible on every row in rank order, drops reducer-only rows — incl. an
+# 'agent'-source row this box cannot claim (no_claim is STRUCTURAL, g-306-524) —
+# BEFORE the cut, and stamps each kept row's `verdict`; stderr carries the
+# census. The refusal list lives in LIFECYCLE_DISPOSITIONS, never here.
+#   eligible -> a real judgment was made. Proceed to CLAIM.
+#   undetermined -> THE BRIDGE DECLINED TO JUDGE (skill-less goal, or a skill
+#     the table does not map). NOT a pass: the call is YOURS (g-115-6523).
+# To hear one row's reason, re-ask it. ALL FLAGS BEFORE THE SKILL ARG (argparse
+# REMAINDER swallows a trailing flag); omit a flag whose field is unset:
+Bash: py -3 core/scripts/worker_execute.py goal-eligible --role <executable_by_role> --source <source> --agent <agent> <skill, verbatim>
 #
 # A GREEN ANSWER IS NOT A PROOF. On `undetermined` — and whenever a named skill
 # looks like loop-phase encoding over YOUR OWN unmerged experience — read the
@@ -444,9 +436,12 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
             --reason "parked <N>h (no reducer / no supply); cap reached" --agent "$MIND_AGENT"
     Bash: touch "agents/$MIND_AGENT/sessions/$MIND_SID/body-closing"
   rc=1 (not parked, or parked under the cap) -> run THE PARK SEQUENCE of Phase
-  0.5 with reason "SELECT returned no eligible goal; parked awaiting supply",
-  board tags `supply-gap,body-parked` (first park only), and the same 3600s
-  wakeup as the LAST call. The Body re-enters on the park orbit (g-357-51 part 4):
+  0.5, its park call as `park --supply-gap` plus `--decline <goal-id>=<why>`
+  for each row of your latest view you did not claim. EXIT 5 = REFUSED, nothing
+  parked: stderr names every open row — claim one, or decline it with a reason.
+  Reason "SELECT returned no eligible goal; parked awaiting supply" plus the
+  census line park prints, board tags `supply-gap,body-parked` (first park
+  only), and the same 3600s wakeup as the LAST call. The Body re-enters on the park orbit (g-357-51 part 4):
   reducer poll -> SELECT -> a claim resumes it (Phase 2), no goal re-parks it (here).
 
   THE CLOSE CONDITION IS EXHAUSTIVE — THERE IS EXACTLY ONE, and it is the only

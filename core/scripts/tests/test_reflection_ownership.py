@@ -110,10 +110,12 @@ def test_unparseable_resolved_at_stays_held():
     assert v == "held"
 
 
-def test_threshold_is_one_owner_cadence_plus_margin():
-    """72h = the owner's own learn cadence (, 60h) + 12h margin. Pinned
-    so a future change to the number is a deliberate edit with a reason, not a
-    drift."""
+def test_threshold_is_pinned_at_72h():
+    """72h, pinned so a future change to the number is a deliberate edit with a
+    reason, not a drift. It is NOT one owner-cadence interval plus a margin:
+    learn cadences are per-agent (2h to 168h, one measured unfired for 272h), so
+    the premise it was first sized on measured false on 2026-09-27. The reason
+    that survives is in the comment above STRANDED_HOURS in _reflectable.py."""
     assert R.STRANDED_HOURS == 72
 
 

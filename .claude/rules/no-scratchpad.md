@@ -6,14 +6,10 @@ alwaysApply: true
 # No Harness Scratchpad
 
 The Claude Code harness injects a per-session scratchpad directory
-(`<tmp>/claude-<uid>/<project-slug>/<session-id>/scratchpad`) and instructs
-the model to use it for ALL temporary files. This project OVERRIDES that
-instruction, the same way `no-auto-memory.md` overrides platform auto-memory:
-the scratchpad is invisible to every other agent and to the framework's
-citation, drain, receipt, and encoding machinery. Files there are knowledge
-that cannot be found, protected, or folded — measured 2026-08-21 (g-115-3319
-shadow census): 1,854 dead project dirs and 440 aged session dirs on one box,
-none of it reachable by any store.
+(`<tmp>/claude-<uid>/<project-slug>/<session-id>/scratchpad`) and
+instructs the model to use it for ALL temporary files. This project OVERRIDES
+that instruction: the scratchpad is invisible to every other agent and to the
+framework's citation, drain, receipt, and encoding machinery (g-115-3319).
 
 NEVER write files under the harness scratchpad. Route instead:
 

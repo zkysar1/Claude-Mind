@@ -112,7 +112,7 @@ Two script families — world (default) and agent — operate on separate queues
 | `aspirations-query.sh --title-contains <substr>` | Query goals by title substring across both queues — **LIVE only** | — |
 | `aspirations-read.sh --active` | Return active world aspirations as full JSON | — |
 | `aspirations-read.sh --active-compact` | Compact active aspirations (no descriptions/verification) | — |
-| `aspirations-read.sh --id <id>` | Return one world aspiration by ID | — |
+| `aspirations-read.sh --id <id>` | Return one world aspiration by ID: live store first, then silently the ARCHIVE, so a hit shows existence, not location (guard-7484) | — |
 | `aspirations-read.sh --summary` | Compact one-liner per world aspiration | — |
 | `aspirations-read.sh --archive` | Return archived world aspirations | — |
 | `aspirations-read.sh --meta` | Return world aspirations metadata | — |
@@ -141,8 +141,17 @@ Two script families — world (default) and agent — operate on separate queues
 > it into a JSON parser reads a clean "0 hits" and can conclude an owned test red
 > is unowned. Drop the flag; the output is already JSON. Prefer keeping the two results
 > DISTINCT rather than merging them: a goal completed inside an archived
-> aspiration is more finished than a merely-completed live one, and an id in
-> NEITHER store is an anomaly worth reporting rather than skipping.
+> aspiration is more finished than a merely-completed live one.
+> **LIVE + ARCHIVE is still not every store (g-306-522, guard-5278).** A terminal
+> non-recurring goal is EVICTED from its aspiration's `goals` list after
+> `aspirations_eviction.age_days` (3) and survives only as a bare id in
+> `archived_census.evicted_ids`, so BOTH reads return NOT-FOUND for a goal that
+> provably went terminal (measured 2026-09-27: seven owner ids of one replay batch,
+> in neither store, all census-only). The eviction census is the THIRD lookup:
+> `_goal_census.evicted_status_in(items, id)` over the aspiration records already
+> read, or `goal-resolve.py <id>`, which checks every store. The census says THAT
+> a goal went terminal, never WHEN. Only an id in NONE of the three is an anomaly
+> worth reporting rather than skipping.
 > Measured cost of assuming otherwise (g-115-3332): a fleet PR probe built on
 > the live query alone silently dropped 6 of the 11 findings it was written to
 > surface — all owned by one archived aspiration — while reporting its own
@@ -302,6 +311,16 @@ This prevents indefinite blocking when a claiming agent's session crashes or end
 releasing. Based on ["Language Model Teams as Distributed Systems"](https://arxiv.org/abs/2603.12229)
 Finding 5: decentralized teams mitigate stragglers via dynamic work reallocation.
 
+**A worker Body that is still working its goal keeps it past the timeout (g-375-42).** A
+sibling Body's claim does not expire while ALL of these hold: its per-SID
+`in_flight_bodies` row names the goal, that row's `claimed_at` is at most 24 h old, and
+its own body-heartbeat carrier (`session/body-heartbeat-<SID>.json`) is at most 100 min
+old and not in a closed state. The selector skips such a goal and the claim endpoint
+refuses its take-over, on ONE predicate: `core/scripts/gates/body_hold.py`. Any failed
+condition (no row, no carrier, a stale or closed carrier, a hold past 24 h) lets the
+claim expire exactly as above. The expiry is aimed at dead sessions; a live Body on a
+6-17 h goal is not a straggler.
+
 ### Cross-Aspiration Dependency Enforcement
 
 The `blocked_by` field on goals resolves **globally** across all active aspirations (both
@@ -318,7 +337,7 @@ where an agent starts work before its cross-aspiration dependencies are met.
 |--------|---------|-------|
 | `agent-aspirations-read.sh --active` | Return active agent aspirations | — |
 | `agent-aspirations-read.sh --active-compact` | Compact active agent aspirations (no descriptions/verification) | — |
-| `agent-aspirations-read.sh --id <id>` | Return one agent aspiration by ID | — |
+| `agent-aspirations-read.sh --id <id>` | Return one agent aspiration by ID: live store first, then silently the ARCHIVE, so a hit shows existence, not location (guard-7484) | — |
 | `agent-aspirations-read.sh --summary` | Compact one-liner per agent aspiration | — |
 | `agent-aspirations-read.sh --archive` | Return archived agent aspirations | — |
 | `agent-aspirations-read.sh --meta` | Return agent aspirations metadata | — |
@@ -367,7 +386,7 @@ When `goal-selector.sh` selects a goal, its output includes `"source": "world"` 
   - `aspirations-archive.sh` (sweep) auto-recovers such aspirations to `active` status and resets corrupted recurring goals to `pending`.
   - `aspirations-update-goal.sh` **blocks** setting `status=completed` on recurring goals. Use `complete-by` for cycle tracking.
   - `recompute_progress` excludes recurring goals from completion counts. Summary shows `+ N recurring` suffix.
-  - `recompute_progress` also emits `progress.fan_out_ratio` = `total_goals / initial_goal_count` (2 dp), recomputed on every goal add/update. `initial_goal_count` is the non-recurring goal count stamped once at aspiration creation (daemon `add` endpoint in `mind_api/src/endpoints/aspirations_write.py`; idempotent — never overwritten). `fan_out_ratio` is `null` when `initial_goal_count` is absent (aspiration predates the metric — added 2026-05-15; no inferred backfill of legacy aspirations) or `0` (growth ratio from an empty seed is undefined). Interpretation: ≈1.0 = specced upfront; >1.5 = discovery-heavy / fanned-out (Charlie/Zeta-shaped work). **Dual-mirror invariant:** the `progress` dict shape in `recompute_progress` (`core/scripts/aspirations.py`) and `_recompute_progress` (`mind_api/src/endpoints/aspirations_write.py`) MUST stay identical — changing one without the other desyncs the CLI and daemon write paths.
+  - `recompute_progress` also emits `progress.fan_out_ratio` = `total_goals / initial_goal_count` (2 dp), recomputed on every goal add/update. `initial_goal_count` is the non-recurring goal count stamped once at aspiration creation (daemon `add` endpoint in `mind_api/src/endpoints/aspirations_write.py`; idempotent — never overwritten). `fan_out_ratio` is `null` when `initial_goal_count` is absent (aspiration predates the metric — added 2026-05-15; no inferred backfill of legacy aspirations) or `0` (growth ratio from an empty seed is undefined). Interpretation: ≈1.0 = specced upfront; >1.5 = discovery-heavy / fanned-out (Charlie/Zeta-shaped work). **Dual-mirror invariant:** the `progress` dict shape in `recompute_progress` (`core/scripts/aspirations.py`, whose body is `_goal_census.derive_progress`) and `_recompute_progress` (`mind_api/src/endpoints/aspirations_write.py`) MUST stay identical — changing one without the other desyncs the CLI and daemon write paths. The merge path calls the same `derive_progress` (`coordination_merge._merge_aspiration_record` re-derives `progress` on the merged record, never taking a side's — g-306-532), so there is no third copy.
   - These guards prevent LLM drift from killing recurring goals by archiving their parent aspiration.
 - **Premature-archival protection (data layer enforced):**
   - `aspirations-complete.sh` **refuses** aspirations where any non-recurring goal is not in a terminal status (`completed`, `skipped`, `expired`, `decomposed`, `superseded`). Exit 1 with BLOCKED message listing unfinished goals. Use `--force` to override, or `aspirations-complete-intent.sh` for the intent-satisfaction pathway.
@@ -403,7 +422,7 @@ intent_satisfaction:
 
 ### Validation (structural, script-enforced — not LLM-trusted)
 
-1. **Evidence cardinality**: `len(evidence_goal_ids) >= max(scope_min, ceil(0.5 * non_recurring_goal_count))`. Scope floors in `core/config/aspirations.yaml` under `intent_satisfaction.min_evidence_by_scope` (sprint=2, project=3, initiative=5).
+1. **Evidence cardinality**: `len(evidence_goal_ids) >= max(scope_min, min(ceil(0.5 * non_recurring_goal_count), qualifying))`, where `qualifying` counts the non-recurring goals rule 2 can accept (completed, with non-empty `verification.outcomes`). The `min()` cap (g-115-4164) keeps the gate satisfiable when outcome coverage is under half: cite every qualifying goal. When `qualifying < scope_min` the script refuses outright (`cannot be intent-closed`) and more evidence ids cannot help; retire the aspiration or close it normally instead. Scope floors in `core/config/aspirations.yaml` under `intent_satisfaction.min_evidence_by_scope` (sprint=2, project=3, initiative=5).
 2. **Evidence quality**: every evidence goal must exist in this aspiration, be non-recurring, have `status=completed`, and have non-empty `verification.outcomes`.
 3. **Superseded goals**: must exist in this aspiration, be non-recurring, and be currently non-terminal. No goal may appear in both `evidence_goal_ids` and `superseded_goal_ids`.
 4. **Post-supersession closure**: after applying supersession, every non-recurring goal must be in terminal status. If any remain, the command exits non-zero.

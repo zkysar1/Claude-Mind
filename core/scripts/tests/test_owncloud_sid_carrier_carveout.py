@@ -429,3 +429,196 @@ def test_put_unaffected_when_agent_is_owned(env, monkeypatch):
     slf = _put_env(env, monkeypatch, {"alpha"})
     with pytest.raises(_ReachedPut):
         _call_put(slf, p)
+
+
+# ── The REQUEST's identity, not the daemon's env () ──────────────────
+#
+# Every test above sets MIND_SID to the carrier's own sid, which is the shape
+# of a CLI sweep run inside the session. The long-lived daemon is the other
+# shape: its env is the one it was SPAWNED with, so it names an earlier session
+# or none. Measured 2026-09-27 on 10 worker boxes: the 3 whose Body session
+# started after their daemon never published their live carrier, the
+# stranded-claim sweep read it `absent` and released 3 live claims, and a
+# second Body duplicated each goal. Per guard-7059, every test here uses a
+# subject the identity is load-bearing for: an env that does NOT name the
+# carrier's session.
+
+OLD_SID = "5e55e55e-0000-1111-2222-333344445555"  # an EARLIER session's sid
+
+
+def _named(agent, sid):
+    """Context manager: the request names its caller for the block."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        token = ocs.set_carrier_identity(agent, sid)
+        try:
+            yield
+        finally:
+            ocs.reset_carrier_identity(token)
+    return _cm()
+
+
+def test_identity_publishes_the_carrier_a_sessionless_daemon_refuses(env, monkeypatch):
+    """THE FIX. The first half is the defect exactly as measured on a worker
+    box's daemon (reason=peer_agent for its own live carrier)."""
+    p = _carrier(env["agents"], "alpha", MY_SID)
+    monkeypatch.delenv("MIND_SID", raising=False)
+    monkeypatch.setattr(ocs, "_owned_agents", lambda be=None: {"bravo"})
+    before = {}
+    ocs.sync_file(env["be"], p, dry_run=False, stats_out=before)
+    assert before.get("reason") == "peer_agent"
+    assert env["be"].puts == []
+    with _named("alpha", MY_SID):
+        after = {}
+        ocs.sync_file(env["be"], p, dry_run=False, stats_out=after)
+    assert after.get("reason") != "peer_agent"
+    assert env["be"].puts == [str(p.resolve())]
+
+
+def test_identity_admits_one_carrier_not_also_the_envs(env, monkeypatch):
+    """Cardinality ONE (guard-2860). A daemon spawned by an EARLIER session
+    carries that session's sid; naming the caller must replace it, not add to
+    it."""
+    new = _carrier(env["agents"], "alpha", MY_SID)
+    old = _carrier(env["agents"], "alpha", OLD_SID)
+    monkeypatch.setenv("MIND_SID", OLD_SID)
+    monkeypatch.setattr(ocs, "_owned_agents", lambda be=None: {"bravo"})
+    s_new, s_old = {}, {}
+    with _named("alpha", MY_SID):
+        ocs.sync_file(env["be"], new, dry_run=False, stats_out=s_new)
+        ocs.sync_file(env["be"], old, dry_run=False, stats_out=s_old)
+    assert s_old.get("reason") == "peer_agent"
+    assert env["be"].puts == [str(new.resolve())]
+
+
+def test_identity_still_refuses_a_pulled_peer_carrier(env, monkeypatch):
+    """LOAD-BEARING negative, with its positive control under the SAME
+    identity: a peer's carrier sitting here as a read-through cache must never
+    be pushed over the peer's newer write."""
+    mine = _carrier(env["agents"], "alpha", MY_SID)
+    peer = _carrier(env["agents"], "alpha", PEER_SID)
+    monkeypatch.delenv("MIND_SID", raising=False)
+    monkeypatch.setattr(ocs, "_owned_agents", lambda be=None: {"bravo"})
+    s_peer, s_mine = {}, {}
+    with _named("alpha", MY_SID):
+        ocs.sync_file(env["be"], peer, dry_run=False, stats_out=s_peer)
+        ocs.sync_file(env["be"], mine, dry_run=False, stats_out=s_mine)
+    assert s_peer.get("reason") == "peer_agent"
+    assert env["be"].puts == [str(mine.resolve())]
+
+
+def test_identity_reaches_the_put_layer(env, monkeypatch):
+    """guard-2783: an exemption holds only if EVERY refusing layer honours it.
+    _put's ownership consult is the third, and it reads the same SSOT helper."""
+    import owncloud_backend
+    mine = _carrier(env["agents"], "alpha", MY_SID)
+    peer = _carrier(env["agents"], "alpha", PEER_SID)
+    monkeypatch.delenv("MIND_SID", raising=False)
+    slf = _put_env(env, monkeypatch, {"bravo"})
+    with pytest.raises(owncloud_backend.NoClaimError):
+        _call_put(slf, mine)  # the env alone cannot name it
+    with _named("alpha", MY_SID):
+        with pytest.raises(_ReachedPut):
+            _call_put(slf, mine)
+        with pytest.raises(owncloud_backend.NoClaimError):
+            _call_put(slf, peer)
+
+
+def test_reset_restores_the_env_behaviour(env, monkeypatch):
+    _carrier(env["agents"], "alpha", MY_SID)
+    monkeypatch.delenv("MIND_SID", raising=False)
+    with _named("alpha", MY_SID):
+        assert ocs._own_sid_carrier_path(env["be"]) is not None
+    assert ocs._own_sid_carrier_path(env["be"]) is None
+
+
+def test_identity_never_reaches_a_thread_already_running(env, monkeypatch):
+    """The periodic sweep runs on a thread started at daemon boot. A request's
+    identity must stay on the request's own thread."""
+    import threading
+    _carrier(env["agents"], "alpha", MY_SID)
+    monkeypatch.delenv("MIND_SID", raising=False)
+    go, seen = threading.Event(), []
+
+    def _sweep_thread():
+        go.wait(10)
+        seen.append(ocs._own_sid_carrier_path(env["be"]))
+
+    t = threading.Thread(target=_sweep_thread)
+    t.start()
+    with _named("alpha", MY_SID):
+        go.set()
+        t.join(10)
+    assert seen == [None]
+
+
+@pytest.mark.parametrize("bad", ["../../etc", "a/b", "a\\b", ".", ".."])
+def test_identity_traversal_sids_rejected(env, bad):
+    """The identity replaces the env, so it gets the env's defences. The file
+    the bad sid would address is CREATED first, so only the defence, not a
+    missing file, can make this return None."""
+    target = env["agents"] / "alpha" / "session" / f"body-heartbeat-{bad}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b'{"ok":1}')
+    with _named("alpha", bad):
+        assert ocs._own_sid_carrier_path(env["be"]) is None
+
+
+# ── The endpoint names its caller () ─────────────────────────────────
+
+class _Ctx:
+    class _P:
+        project_root = Path(__file__).resolve().parents[3]
+
+    def __init__(self, query, headers):
+        self.query = query
+        self.headers = headers
+        self.paths = self._P()
+
+
+def _endpoint(monkeypatch, seen, *, raise_exc=None):
+    sys.path.insert(0, str(CORE_SCRIPTS.parent.parent))
+    from mind_api.src.endpoints import admin
+    import storage_backend
+
+    def _fake_sync_file(be, target, *, dry_run, stats_out=None):
+        seen.append(ocs._carrier_identity.get())
+        if raise_exc is not None:
+            raise raise_exc
+        return 0
+
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    monkeypatch.setattr(ocs, "sync_file", _fake_sync_file)
+    monkeypatch.setattr(storage_backend, "get_backend", lambda: object())
+    return admin
+
+
+def test_endpoint_names_the_caller_for_the_push_only(monkeypatch):
+    seen = []
+    admin = _endpoint(monkeypatch, seen)
+    admin.owncloud_sync_file(_Ctx(
+        {"path": "/x/agents/alpha/session/c.json"},
+        {"x-mind-agent": "alpha", "x-mind-sid": MY_SID}))
+    assert seen == [("alpha", MY_SID)]
+    # Reset: never carried into the next request served on this thread.
+    assert ocs._carrier_identity.get() is None
+
+
+def test_endpoint_without_a_sid_keeps_the_env_behaviour(monkeypatch):
+    """The PostToolUse shim's bare curl sends no identity headers."""
+    seen = []
+    admin = _endpoint(monkeypatch, seen)
+    admin.owncloud_sync_file(_Ctx({"path": "/x/world/n.md"}, {}))
+    assert seen == [None]
+
+
+def test_endpoint_resets_the_identity_when_the_push_raises(monkeypatch):
+    seen = []
+    admin = _endpoint(monkeypatch, seen, raise_exc=RuntimeError("boom"))
+    admin.owncloud_sync_file(_Ctx(
+        {"path": "/x/agents/alpha/session/c.json"},
+        {"x-mind-agent": "alpha", "x-mind-sid": MY_SID}))
+    assert seen == [("alpha", MY_SID)]
+    assert ocs._carrier_identity.get() is None

@@ -334,7 +334,14 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 _cust_token = set_customer(ctx.tenant)
 
+            _sid_token = None
             try:
+                # Name the calling session for gate telemetry. Gates run in-process under
+                # handlers, and without this every firing is stamped with the session that
+                # spawned this daemon, whose env we inherited (guard-2480, ).
+                # Inside the try, so a failure here still resets the customer.
+                from _gate_log import set_request_session, reset_request_session
+                _sid_token = set_request_session(ctx.headers.get("x-mind-sid"))
                 handler = self.routes.get((method, path))
                 if handler is None:
                     resp = Response.error(404, "not_found", f"no route for {method} {path}")
@@ -344,6 +351,9 @@ class _Handler(BaseHTTPRequestHandler):
                 # Reset within the request so the customer never leaks to the next
                 # request on a reused thread (defensive — ThreadingHTTPServer
                 # spawns per-request threads today, but a future pool must be safe).
+                # The session resets for the same reason.
+                if _sid_token is not None:
+                    reset_request_session(_sid_token)
                 if _cust_token is not None:
                     reset_customer(_cust_token)
 

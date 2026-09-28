@@ -392,8 +392,15 @@ def build_context(categories, role, repo_path, max_tokens):
                     if nk in nodes and (nk, nodes[nk]) not in matched_nodes:
                         matched_nodes.append((nk, nodes[nk]))
 
-    # Sort by confidence descending
-    matched_nodes.sort(key=lambda kn: kn[1].get("confidence", 0), reverse=True)
+    # Sort by confidence descending. A non-numeric confidence sorts as 0:
+    # _tree.yaml holds explicit `confidence: null` and a string ('high'), which
+    # .get(key, 0) passes through (its default fires only on an ABSENT key), and
+    # one such matched node made this sort raise TypeError (guard-1512).
+    matched_nodes.sort(
+        key=lambda kn: kn[1].get("confidence")
+        if isinstance(kn[1].get("confidence"), (int, float)) else 0,
+        reverse=True,
+    )
 
     sections.append(f"\u2500\u2500 KNOWLEDGE ({len(matched_nodes)} nodes) \u2500\u2500")
     for key, node in matched_nodes:
