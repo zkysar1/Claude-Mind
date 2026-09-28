@@ -16,6 +16,8 @@ Output: JSON object with trajectory data including:
     - Inflection points (goals that produced significant learning)
     - Current learning velocity
     - Plateau and diminishing returns detection
+    - Credit-pending classification (g-306-518): a worker-closed goal whose
+      learning has not reached the stores yet is reported, not scored 0
 """
 import json
 import sys
@@ -26,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import WORLD_DIR, AGENT_DIR, CONFIG_DIR, PROJECT_ROOT
 from _long_path import open_long_path
+import worker_retrospective as _retro
 
 def load_jsonl(path):
     """Load a JSONL file, returning list of dicts."""
@@ -122,10 +125,127 @@ def build_tree_attribution_map(tree_dir):
     return attribution
 
 
+# Framework code credited from git history (): the file classes the
+# header scan covered, at ANY depth, so tests/ and gates/ count too.
+FRAMEWORK_CODE_LANES = (
+    ("core/scripts/", (".py", ".sh")),
+    ("core/config/conventions/", (".md",)),
+)
+# A goal id keeps the one-letter suffix a split child carries (-a); a
+# longer tail annotates the parent ("-followup" credits ).
+_GOAL_ID = r"\bg-\d+-\d+(?:-[a-z])?\b"
+
+
+def commit_author_goal_ids(subject, body=""):
+    """Goal ids a commit message names in an AUTHORSHIP position. Pure.
+
+    The subject's head -- the text before the first ": " -- wins:
+    "fix(g-306-519): ...", "g-115-9750 outcome 3: ...", "B1b (g-353-82): ...".
+    Only when the head names no goal does a trailing (...) or [...] group
+    count: "feat(verify): ... (g-375-48)", "... [g-115-1570]",
+    "... (g-373-16 R3)". Only when the subject names none does the body
+    count, through three tags: a first line that OPENS with goal ids
+    ("g-115-3289. Adds ..."), a paragraph that is ONLY goal ids, and a
+    "Goal:" line. The paragraph test matters: a wrapped sentence can leave
+    ids alone on a line ("...pre-existing, owned by / g-115-8170 /
+    g-115-8140."), and those are owners, not authors. A "Refs:" list is not
+    a tag: it mixes the goal with guards and parents. An id anywhere else is
+    a citation ("fix(tests): the g-115-9588
+    guard was vacuous"), and so is a trailing id beside a head id: in all 7
+    such subjects it named a parent or companion goal. Census (2026-09-27,
+    the 4,590 commits touching FRAMEWORK_CODE_LANES code): the subject names
+    the author in 3,814, a body tag in 87 of the other 776.
+    git's own `Revert "..."` / `Reapply "..."` subjects quote the reverted
+    commit, so they credit nobody; a goal's own "revert(g-NNN-NN): ..." is
+    its work.
+
+    goal-pickup-coordination-check.py commit_goal_id() is a single-id,
+    scope-first sibling built for overlap detection: it misses the trailing
+    form and reads a scope-less subject's first id as its goal.
+    """
+    import re
+    if re.match(r'(?:Revert|Reapply) "', subject):
+        return set()
+    head, sep, _ = subject.partition(": ")
+    if sep:
+        ids = set(re.findall(_GOAL_ID, head))
+        if ids:
+            return ids
+    m = re.search(r"[(\[]([^()\[\]]*)[)\]]\s*$", subject)
+    ids = set(re.findall(_GOAL_ID, m.group(1))) if m else set()
+    if ids:
+        return ids
+    raw = body.splitlines()
+    lines = [line.strip() for line in raw if line.strip()]
+    m = re.match(rf"(?:{_GOAL_ID}[\s,/+&]*)+", lines[0]) if lines else None
+    if m:
+        ids.update(re.findall(_GOAL_ID, m.group(0)))
+    for i, line in enumerate(raw):
+        text = line.strip()
+        opens_paragraph = i == 0 or not raw[i - 1].strip()
+        if (opens_paragraph and re.fullmatch(rf"(?:{_GOAL_ID}[\s,/+&.;]*)+", text)) \
+                or text.startswith(("Goal:", "Goals:")):
+            ids.update(re.findall(_GOAL_ID, text))
+    return ids
+
+
+def build_framework_code_attribution(root=PROJECT_ROOT):
+    """{goal_id: distinct FRAMEWORK_CODE_LANES files its commits changed}.
+
+    Walks the non-merge history of HEAD once (~1s over 4.6k commits) and
+    credits each commit's changed code files to the goals
+    commit_author_goal_ids() reads from its message. Crediting what a goal
+    CHANGED, not the ids a file MENTIONS, is what lets a Fix that edits an
+    existing file, or only its tests, score -- and keeps a file that merely
+    cites a goal from crediting it. A goal id is a topic (guard-5399): scoped
+    follow-ups reuse it and credit it. A file whose blob did not change (a
+    mode-only chmod) is not authored content: one normalization commit
+    otherwise credited 434 files. Known limit: an iteration commit that
+    sweeps other work's dirty files credits them to its own goal (1
+    non-recurring such commit among 3,899 credited, 2026-09-27). Returns
+    None, with the reason on stderr, when history is unreadable (no .git on
+    a transplanted deployment, no git binary, a timeout).
+    """
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "-c", "core.quotePath=off", "log",
+             "--no-merges", "--no-renames", "--format=%x1e%s%x1f%b%x1f",
+             "--raw", "--no-abbrev", "--",
+             *(lane for lane, _ in FRAMEWORK_CODE_LANES)],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"aspiration-trajectory: git log failed: {exc}", file=sys.stderr)
+        return None
+    if proc.returncode != 0:
+        print(f"aspiration-trajectory: git log rc={proc.returncode}: "
+              f"{proc.stderr.strip()[:200]}", file=sys.stderr)
+        return None
+    files_by_goal = {}
+    for record in proc.stdout.split("\x1e")[1:]:
+        subject, _, rest = record.partition("\x1f")
+        body, _, raw = rest.partition("\x1f")
+        goals = commit_author_goal_ids(subject.strip(), body)
+        if not goals:
+            continue
+        code = set()
+        for line in raw.splitlines():
+            # ":<old mode> <new mode> <old blob> <new blob> <status>\t<path>"
+            meta, _, path = line.partition("\t")
+            fields = meta.split()
+            if len(fields) == 5 and fields[2] != fields[3] and any(
+                    path.startswith(lane) and path.endswith(sfx)
+                    for lane, sfx in FRAMEWORK_CODE_LANES):
+                code.add(path)
+        for gid in goals:
+            files_by_goal.setdefault(gid, set()).update(code)
+    return {gid: len(files) for gid, files in files_by_goal.items() if files}
+
+
 def build_script_convention_attribution_map():
-    """Scan code artifacts (scripts + conventions) for goal-id mentions
-    in header/docstring regions. Returns {goal_id: count} where each file
-    that mentions a goal-id in its first 4000 chars contributes +1.
+    """{goal_id: count} of code artifacts -- scripts and conventions -- each
+    goal authored.
 
     Closes the gap where development goals whose primary deliverable is
     code or convention text receive zero learning-artifact credit from
@@ -135,30 +255,36 @@ def build_script_convention_attribution_map():
     schema — show velocity=0 and trip precheck-eval cycles detector's
     zero_learning_velocity false-positive (g-115-595 / rb-803 / g-115-596).
 
-    Scan targets (each fail-open on missing dir):
-      - core/scripts/*.py, *.sh         framework scripts
-      - core/config/conventions/*.md    framework conventions
-      - {WORLD_DIR}/scripts/*.sh, *.py  domain scripts
-      - {WORLD_DIR}/conventions/*.md    domain conventions
+    Framework lane (FRAMEWORK_CODE_LANES): +1 per distinct file a goal's
+    commits changed, read from git history by
+    build_framework_code_attribution() (g-306-519). It replaced crediting
+    each goal id in a file's first 4000 chars, which scored every Fix to an
+    existing file, or to its tests, 0 and credited ids a header only cited.
 
-    Attribution rule: each distinct g-NNN-NN matched in the file's first
-    4000 chars yields +1 for that goal-id. Files mentioning multiple
-    goal-ids attribute +1 to each (a single file authored under g-282-01
-    that also cross-references g-282-02 credits both). Multiple files per
-    goal-id accumulate. The 4000-char window targets header/docstring
-    regions where authorship signals concentrate and ignores random mid-
-    body cross-references that are not authorship.
+    World lane ({WORLD_DIR}/scripts/*.sh,*.py, {WORLD_DIR}/conventions/*.md):
+    the world dir is external and gitignored, so it has no history, and a
+    file there still credits each goal id in its first 4000 chars. That is a
+    MENTION, not authorship: a known limitation of this lane alone. When
+    framework history is unreadable, the framework lane falls back to the
+    same scan over its top-level files and says so on stderr.
     """
     import re
     pat = re.compile(r"\bg-\d+-\d+\b")
-    attribution = {}
+    attribution = build_framework_code_attribution()
 
     scan_targets = [
-        (PROJECT_ROOT / "core" / "scripts", ("*.py", "*.sh")),
-        (CONFIG_DIR / "conventions", ("*.md",)),
         (WORLD_DIR / "scripts", ("*.sh", "*.py")),
         (WORLD_DIR / "conventions", ("*.md",)),
     ]
+    if attribution is None:
+        print("aspiration-trajectory: git history unreadable -- framework "
+              "code credited by header mention (the pre-g-306-519 scan)",
+              file=sys.stderr)
+        attribution = {}
+        scan_targets[:0] = [
+            (PROJECT_ROOT / "core" / "scripts", ("*.py", "*.sh")),
+            (CONFIG_DIR / "conventions", ("*.md",)),
+        ]
 
     for root, patterns in scan_targets:
         if not isinstance(root, Path) or not root.is_dir():
@@ -315,6 +441,67 @@ def count_learning_artifacts(goal, reasoning_bank, guardrails, pattern_sigs,
 
     return artifacts
 
+
+# The two capture lanes whose drain lands what count_learning_artifacts counts:
+# spark_capture -> rb / guardrails / pattern signatures (Worker Spark Replay),
+# encoding_capture -> tree nodes (worker_retrospective's encoding lane).
+# exp_capture and hyp_capture feed stores this instrument does not count.
+CREDIT_CAPTURE_SLOTS = ("spark_capture", _retro.ENC_SLOT)
+
+
+def load_pending_capture_goal_ids(root=PROJECT_ROOT):
+    """Goal ids with entries still undrained in a CREDIT_CAPTURE_SLOTS slot.
+
+    Read through worker_retrospective's slot loader (wm-read.sh, never off disk:
+    the slot is daemon-owned and BODY_WM_PATH makes its path role-dependent). On
+    the reducer -- the Body that runs evolve -- that is the merged reducer WM.
+    Returns None when a slot read FAILED (the UNREADABLE sentinel, g-306-348):
+    "drained" and "unseen" are then indistinguishable, and classify_credit
+    resolves that toward pending.
+    """
+    ids = set()
+    for slot in CREDIT_CAPTURE_SLOTS:
+        captures = _retro._load_capture_slot(Path(root), slot)
+        if captures is _retro.UNREADABLE:
+            return None
+        ids.update(captures)
+    return ids
+
+
+def classify_credit(goal, total_artifacts, pending_capture_ids):
+    """None when the goal's learning credit is SETTLED, else why it is pending.
+
+    g-306-518. A worker Body never writes rb, guardrails or the tree: its
+    learning arrives only when the reducer merges the Body's WM, runs the
+    retrospective (which stamps the goal's _retro.MARKER_FIELD) and drains the
+    capture slots -- measured lags run to weeks. Until then the goal counts 0 by
+    construction, and a trailing window of such zeros reads as a plateau that
+    arms evolve Step 1.5's pivot. Only a goal that could be a FALSE zero is ever
+    pending:
+      - not stamped completed_by_role=worker -> settled (reducer-or-unknown
+        closes keep their old treatment, so detection there is unchanged);
+      - any artifact already attributed -> settled (counting it cannot
+        manufacture a false zero);
+      - no retrospective marker -> pending (its Body is unmerged, or the
+        retrospective has not landed for it; either way nothing has arrived);
+      - slots unreadable -> pending (cannot tell drained from unseen);
+      - id still in a capture slot -> pending (merged, not yet drained).
+    A Body that dies without staging its WM leaves its goals pending for good
+    (g-306-520 owns that loss); they are listed, never counted as zeros.
+    """
+    if str(goal.get("completed_by_role") or "").strip().lower() != "worker":
+        return None
+    if total_artifacts > 0:
+        return None
+    if not str(goal.get(_retro.MARKER_FIELD) or "").strip():
+        return "no-retrospective-marker"
+    if pending_capture_ids is None:
+        return "capture-slots-unreadable"
+    if goal.get("id") in pending_capture_ids:
+        return "capture-undrained"
+    return None
+
+
 def compute_learning_velocity(goal_artifacts, window):
     """Compute learning velocity over the last N goals."""
     if len(goal_artifacts) < window:
@@ -408,6 +595,7 @@ def load_shared_data():
         "tree_data": load_yaml(WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"),
         "tree_attribution": build_tree_attribution_map(WORLD_DIR / "knowledge" / "tree"),
         "script_convention_attribution": build_script_convention_attribution_map(),
+        "pending_capture_goal_ids": load_pending_capture_goal_ids(),
         "asp_sources": asp_sources,
     }
 
@@ -435,6 +623,8 @@ def build_trajectory(asp_id, shared=None):
     tree_data = shared["tree_data"]
     tree_attribution = shared.get("tree_attribution", {})
     script_convention_attribution = shared.get("script_convention_attribution", {})
+    # Absent key = no slot data supplied = unreadable (resolves toward pending).
+    pending_capture_ids = shared.get("pending_capture_goal_ids")
 
     # Build per-goal artifact counts
     goal_artifacts = []
@@ -443,20 +633,36 @@ def build_trajectory(asp_id, shared=None):
                                             pattern_sigs, tree_data,
                                             tree_attribution,
                                             script_convention_attribution)
+        total = sum(artifacts.values())
+        pending_reason = classify_credit(g, total, pending_capture_ids)
         goal_artifacts.append({
             "goal_id": g.get("id", "unknown"),
             "title": g.get("title", ""),
             "category": g.get("category", ""),
             "started": g.get("started"),
             "priority": g.get("priority", "MEDIUM"),
+            "completed_by_role": g.get("completed_by_role"),
+            "outcome_class": g.get("outcome_class"),
             "artifacts": artifacts,
-            "total_artifacts": sum(artifacts.values()),
+            "total_artifacts": total,
+            "credit_pending": pending_reason is not None,
+            "credit_pending_reason": pending_reason,
         })
+
+    # Every detector below runs over the SETTLED series (): a
+    # credit-pending goal's 0 means "not arrived yet", not "learned nothing".
+    # The filter keeps completion order, so the window is still the most recent
+    # settled goals; inflection `index` values are positions in this series.
+    settled = [ga for ga in goal_artifacts if not ga["credit_pending"]]
+    pending = [ga for ga in goal_artifacts if ga["credit_pending"]]
 
     # Compute metrics
     velocity_window = config.get("velocity_window", 5)
-    current_velocity = compute_learning_velocity(goal_artifacts, velocity_window)
-    inflection_points = detect_inflection_points(goal_artifacts)
+    # None, not 0.0, when nothing is settled: a 0.0 here is what precheck's
+    # zero_learning_velocity cycle detector fires on.
+    current_velocity = (compute_learning_velocity(settled, velocity_window)
+                        if settled else None)
+    inflection_points = detect_inflection_points(settled)
     # Record-level exemption (): maintenance-scope queues (recurring
     # upkeep aspirations) legitimately run at ~0 learning velocity — that is
     # their normal operating point, not a stalled learning direction. An
@@ -469,8 +675,8 @@ def build_trajectory(asp_id, shared=None):
     # keeps detection ON — fail-safe: malformed values stay visible via the
     # flag rather than silently suppressing detection.
     plateau_exempt = asp.get("plateau_exempt") is True
-    is_plateau = (not plateau_exempt) and detect_plateau(goal_artifacts, config)
-    is_diminishing = (not plateau_exempt) and detect_diminishing_returns(goal_artifacts, config)
+    is_plateau = (not plateau_exempt) and detect_plateau(settled, config)
+    is_diminishing = (not plateau_exempt) and detect_diminishing_returns(settled, config)
 
     # Determine primary category (most common across goals)
     cat_counts = {}
@@ -480,18 +686,42 @@ def build_trajectory(asp_id, shared=None):
             cat_counts[c] = cat_counts.get(c, 0) + 1
     primary_category = max(cat_counts, key=cat_counts.get) if cat_counts else ""
 
-    # Goals since last inflection
+    # Goals since last inflection -- SETTLED goals only, so credit-pending closes
+    # cannot arm evolve Step 1.5's prolonged (pivot) branch.
     if inflection_points:
         last_inflection_idx = inflection_points[-1]["index"]
-        goals_since_inflection = len(goal_artifacts) - last_inflection_idx - 1
+        goals_since_inflection = len(settled) - last_inflection_idx - 1
     else:
-        goals_since_inflection = len(goal_artifacts)
+        goals_since_inflection = len(settled)
+
+    # Every stratum's size (guard-7449). The three role strata partition the
+    # completed population; `routine` cuts across the settled ones.
+    window_goals = settled[-velocity_window:]
+
+    def _strata(series):
+        worker = sum(1 for ga in series
+                     if str(ga["completed_by_role"] or "").strip().lower() == "worker")
+        return {"worker": worker, "unstamped": len(series) - worker,
+                "routine": sum(1 for ga in series if ga["outcome_class"] == "routine")}
+
+    settled_strata = _strata(settled)
+    credit_strata = {
+        "completed": len(goal_artifacts),
+        "credit_pending": len(pending),
+        "settled_worker": settled_strata["worker"],
+        "settled_unstamped": settled_strata["unstamped"],
+        "settled_routine": settled_strata["routine"],
+        "window": dict(size=len(window_goals), **_strata(window_goals)),
+    }
 
     # Build summary
     total_artifacts = sum(ga["total_artifacts"] for ga in goal_artifacts)
+    velocity_text = (f"{current_velocity:.2f}/goal" if current_velocity is not None
+                     else "n/a (no settled goals)")
     summary = (
-        f"{len(completed)} goals completed, {total_artifacts} learning artifacts produced, "
-        f"velocity={current_velocity:.2f}/goal over last {velocity_window}"
+        f"{len(completed)} goals completed ({len(pending)} credit-pending, "
+        f"{len(settled)} settled), {total_artifacts} learning artifacts produced, "
+        f"velocity={velocity_text} over last {len(window_goals)} settled"
     )
 
     return {
@@ -511,6 +741,10 @@ def build_trajectory(asp_id, shared=None):
         "plateau_detected": is_plateau,
         "diminishing_returns": is_diminishing,
         "plateau_exempt": plateau_exempt,
+        "credit_pending_count": len(pending),
+        "credit_pending_goal_ids": [ga["goal_id"] for ga in pending],
+        "capture_slots_readable": pending_capture_ids is not None,
+        "credit_strata": credit_strata,
         "config": config,
     }
 

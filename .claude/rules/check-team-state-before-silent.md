@@ -64,44 +64,13 @@ slower (e.g., a daily-cadence reviewer agent).
    narrative diagnostics all route through the same probe. There is
    no exemption for "I'm just thinking out loud" — the probe is one
    shell call.
-5. **THE SIGNAL IS ASYMMETRIC — this is the load-bearing rule.**
-   A **FRESH** `last_active` (within threshold) IS positive evidence of
-   life. Trust it; stop there — with ONE known false-positive generator
-   (guard-3604): a CROSS-AGENT `in_flight` clear bumps the CLEARED agent's
-   `last_active`, so a freshly-policed DORMANT peer reads `alive` for up
-   to 6h, and the fresh reading short-circuits liveness-check's fast path
-   (`authoritative_last_active_provenance: null` is the tell). When a
-   fresh `last_active` follows a known or suspected cross-agent clear (a
-   board correction names the peer, or the shard's `row_updated_by` is not
-   the row's owner), do NOT stop at the fast path — read a signal with an
-   INDEPENDENT writer from the authoritative store (`execution-diary.jsonl`,
-   `working-memory.yaml`), per rule 6 Branch 2. The bump is deliberate;
-   never fix it by removing the stamp (an unstamped clear loses the LWW
-   shard merge and resurrects the claim).
-   A **STALE** `last_active` is **NOT** evidence of death. It is
-   *ambiguous* — the partner is idle, OR its heartbeat writer is broken
-   while it keeps working — and it has failed that way in production
-   (2026-07-14: two live agents read 59h and 66h stale). Never conclude
-   silence from a stale `last_active` ALONE.
-6. **A stale `last_active` obliges the 2-branch decision tree.** Never
-   conclude silence without walking it:
-   - **Branch 1 — EVERY peer stale at once?** Then `last_active` is telling
-     you about YOUR box (the field reflects your last successful pull of the
-     peer's shard; a local pull-merge wedge freezes it for all peers).
-     Suspect your own pull path; cross-check the coordination board or an
-     authoritative-store HEAD. Stale-for-all is evidence about you.
-   - **Branch 2 — only SOME peer stale** (others fresh, so your pull path is
-     fine)? The stale peer may be alive with a broken heartbeat writer.
-     Corroborate with an independent-writer signal read from the **store of
-     record — never the local cache** (`Path.exists()` on the own-cloud
-     mirror proves nothing; guard-980): execution-diary or working-memory
-     HEAD. Diary fresh + `last_active` stale → **ALIVE, heartbeat broken**:
-     do NOT reassign, take back, or escalate; file the heartbeat bug. Diary
-     stale + `last_active` stale → silence is a **verified** conclusion.
-   `liveness-check.sh` automates the team-state half of this per peer;
-   the code shape for the independent-writer HEAD is in the convention.
-   A `head_object` returns an OBJECT time — it corroborates that the box is
-   active, not that the agent's mind is.
+5. **THE SIGNAL IS ASYMMETRIC.** FRESH `last_active` IS evidence of life —
+   trust it (exception: guard-3604 cross-agent clear). STALE is NOT evidence
+   of death — never conclude silence from stale alone.
+6. **Stale obliges the 2-branch tree:** Branch 1 (every peer stale = suspect
+   your pull path); Branch 2 (some stale = corroborate from the store of
+   record, never the local cache — guard-980). Full protocol:
+   `core/config/conventions/partner-liveness.md`.
 
 ## Anti-patterns
 
@@ -117,7 +86,8 @@ slower (e.g., a daily-cadence reviewer agent).
   heartbeat writer and an idle agent are indistinguishable at that field
   (rule 6)
 - Probing the partner's execution-diary on the LOCAL filesystem — under
-  own-cloud the local tree is a read-through cache (guard-980, and the
+  own-cloud the local tree is a read-through cache (`Path.exists()` on the
+  own-cloud mirror proves nothing; guard-980, and the
   `owncloud-local-cache-staleness` tree node)
 
 ## Cross-references

@@ -343,10 +343,11 @@ B9. **Add permissions for external paths** — Ask for confirmation:
    settings (.claude/settings.local.json). This file is local to your
    machine and not committed to git.
 
-   Permissions to add (recursive subtree, all relevant tools):
-     Read / Edit / Write / MultiEdit  on  {world_path}/**
-     Read / Edit / Write / MultiEdit  on  {meta_path}/**
-     Read / Edit / Write / MultiEdit  on  {project_root}/**
+   Permissions to add (recursive subtree; an Edit rule covers every
+   file-editing tool, so no Write/MultiEdit rule is written):
+     Read / Edit  on  {world_path}/**
+     Read / Edit  on  {meta_path}/**
+     Read / Edit  on  {project_root}/**
 
    If your settings.local.json doesn't exist yet, I'll create it with the
    framework's broad allows (Bash, Read, Glob, Grep, WebSearch, WebFetch)

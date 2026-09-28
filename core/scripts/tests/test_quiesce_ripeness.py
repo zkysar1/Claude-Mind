@@ -318,6 +318,34 @@ def test_stamp_survives_sentinel_as_last_line():
     assert out is not None and "**Last evaluated: A**" in out
 
 
+def test_stamp_write_keeps_the_synced_file_LF(tmp_path):
+    """guard-7127: the checker rewrites a synced world file in place.
+
+    Measured 2026-09-27 on DESKTOP-O91DLK2: one --update-verdict run left
+    fleet-quiesce-window.md with 1,419 CRLF lines, a whole-file diff for a
+    one-line stamp. The default text-mode write is the positive control: it
+    writes os.linesep, which is CRLF on Windows.
+    """
+    import os
+    import _fileops
+
+    kept = tmp_path / "kept.md"
+    _fileops.durable_write_text(kept, "a\nb\n", newline="")
+    assert kept.read_bytes() == b"a\nb\n"
+
+    default = tmp_path / "default.md"
+    _fileops.durable_write_text(default, "a\nb\n")
+    assert default.read_bytes() == ("a" + os.linesep + "b" + os.linesep).encode()
+
+
+def test_the_checker_passes_newline_empty_to_its_stamp_write():
+    # Pin the wiring, not just the helper (guard-1943).
+    src = (Path(__file__).resolve().parents[1] / "quiesce-ripeness-check.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "durable_write_text(conv, updated, newline='')" in src
+
+
 def test_stamp_reports_stale_row_count_so_the_lag_is_visible_without_running_it():
     md = HEADER + row("Q5", "**`g-1-1` — done**", "~45 min", "**YES**")
     res = evaluate(md, {"g-1-1": {"status": "completed"}})

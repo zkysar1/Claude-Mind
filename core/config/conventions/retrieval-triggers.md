@@ -276,6 +276,20 @@ latter is unfollowable. `guard-5231` carries the behavioural rule and the
 distinction from `guard-3665` (whose empty comes from a TIMEOUT and whose
 remedy, re-run it, cannot fix a vocabulary miss).
 
+### Invocation table
+
+| Decision shape | Invocation |
+|----------------|------------|
+| Goal/topic is clearly categorized | `retrieve.sh --category <cat> --depth medium` |
+| Free-text query (no exact category) | `retrieve.sh --category "<free text>" --depth shallow` (token-overlap) |
+| Pre-apply consultation for framework-file fix | `retrieve.sh --category "<one-line fix description>" --depth shallow --include-framework` (the flag is REQUIRED; g-115-3777) |
+| Reader mode / observer session (side-effect-free) | `retrieve.sh --category <q> --read-only` |
+| Need full-body content of supplementary entries | `retrieve.sh --category <cat> --full-content` (opt-in; default is metadata-only) |
+| Goal-execution retrieval (writes retrieval-session.json) | `retrieve.sh --category <cat> --goal <goal-id> --tree-nodes "<comma-keys>"` |
+| Browsing tree structure without scoring | `tree-find-node.sh --text <q>` (substring-only; weaker than retrieve.sh) |
+| Reading framework rules / conventions by name | `load-conventions.sh <name>` (exact key lookup) |
+| Retrieving framework rules / conventions by topic | `retrieve.sh --category "<free text>" --include-framework` (returns under `framework_rules`) |
+
 ### Invocation-table footnotes
 
 - Free-text queries: supplementary stores fall back to matching `title` /

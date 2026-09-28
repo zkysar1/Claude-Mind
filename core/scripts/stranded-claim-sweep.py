@@ -185,6 +185,7 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import _rt  # canonical Python -> daemon client  # noqa: E402
 from _paths import agent_dir  # type: ignore  # noqa: E402
+from gates.body_hold import evaluate_carrier as _body_carrier_eval  # noqa: E402  ()
 
 DEFAULT_STALE_MINUTES = 5
 # Grace window for a claim held by a DIFFERENT session of this same agent
@@ -974,16 +975,18 @@ def _body_carrier_verdict(
 ) -> tuple[str, Dict[str, Any]]:
     """Is the Body holding `sid` demonstrably alive on ANOTHER box?
 
-    Returns (verdict, evidence). FIVE verdicts, not two, and the extra ones are
+    Returns (verdict, evidence). SIX verdicts, not two, and the extra ones are
     the point:
 
-        fresh-correct  carrier present, ts within window, and its embedded sid
-                       MATCHES -> the holder is alive elsewhere. The ONLY
-                       verdict that keeps a claim.
+        fresh-correct  carrier present, ts within window, its embedded sid
+                       MATCHES, and its body_state is not closed -> the holder
+                       is alive elsewhere. The ONLY verdict that keeps a claim.
         fresh-wrong    carrier fresh but written by a DIFFERENT sid. guard-358:
                        "mtime alone cannot distinguish designated writer is
                        alive from wrong writer is touching". A carrier cannot
                        vouch for a body that did not write it.
+        closed         carrier fresh and its own, but its body_state is in the
+                       closed set: the Body ended (g-375-50).
         stale          carrier present, ts older than the window.
         absent         no carrier (never written, or not yet synced).
         unreadable     present but undecodable / no usable ts.
@@ -1050,19 +1053,27 @@ def _body_carrier_verdict(
     except (json.JSONDecodeError, ValueError):
         return "unreadable", ev
 
-    ts = _parse_iso(str(doc.get("ts") or ""))
-    if ts is None:
+    # ONE CARRIER VERDICT (): the judgement is gates.body_hold.evaluate_carrier,
+    # the conjuncts the goal selector and the claim endpoint apply to the same file.
+    # This door never read `body_state`, so a CLOSED Body's fresh carrier kept its claims
+    # here while the other doors released them. That case is now its own verdict,
+    # `closed`, which like every verdict but `fresh-correct` keeps nothing.
+    judged = _body_carrier_eval(doc, sid=sid, now=dt.datetime.now(),
+                                fresh_minutes=fresh_minutes)
+    if judged["age_minutes"] is None:
         return "unreadable", ev
-
-    age_min = (dt.datetime.now() - ts).total_seconds() / 60.0
-    ev["carrier_age_minutes"] = round(age_min, 1)
+    ev["carrier_age_minutes"] = round(judged["age_minutes"], 1)
     ev["carrier_host"] = doc.get("host")
-    fresh = age_min <= fresh_minutes
-
-    if str(doc.get("sid") or "") != sid:
+    if judged["live"]:
+        return "fresh-correct", ev
+    fresh = "carrier_fresh" not in judged["failed"]
+    if "carrier_is_its_own" in judged["failed"]:
         ev["carrier_sid"] = str(doc.get("sid") or "")[:8]
         return ("fresh-wrong" if fresh else "stale"), ev
-    return ("fresh-correct" if fresh else "stale"), ev
+    if fresh:
+        ev["carrier_body_state"] = str(doc.get("body_state") or "")
+        return "closed", ev
+    return "stale", ev
 
 
 def _has_pending_background_work(agent: str) -> bool:

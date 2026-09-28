@@ -14,6 +14,8 @@ Covers:
   - idempotent re-move (no within-archive duplicate)
   - archive_sweep flips in place, prunes aged tombstones, keeps young ones,
     stamps unstamped ones
+  - the prune folds a tombstone's post-archival writes into its archive copy
+    first, and never prunes the only copy (g-115-10778)
   - merge_pipeline convergence: tombstone flip survives a pre-flip remote
     (and the removal-resurrection root cause is pinned as a semantics proof)
   - compute_meta dedup parity (CLI + daemon)
@@ -36,6 +38,7 @@ for _p in (str(CORE_SCRIPTS), str(PROJECT_ROOT)):
 
 import coordination_merge  # noqa: E402
 import pipeline as cli_pipeline  # noqa: E402
+from mind_api.src.world import pipeline as pipeline_read  # noqa: E402
 from mind_api.src.world import pipeline_write  # noqa: E402
 
 # Fleet adoption landed (, 2026-07-16): tombstone-in-live archival
@@ -348,6 +351,120 @@ def test_move_to_resolved_keeps_explicit_outcome_date(tmp_path):
     live = _read_jsonl(world / "pipeline.jsonl")
     assert live[0].get("outcome_date") == explicit, \
         "an explicit caller-set outcome_date wins over the stamp"
+
+
+# ---------------------------------------------------------------------------
+# prune folds the tombstone into its archive copy ()
+# ---------------------------------------------------------------------------
+# update and update_field write the LIVE copy first, so every post-archival
+# write lands on the tombstone while the archive copy stays frozen at first
+# archival. The prune used to drop the tombstone and write nothing back, so
+# those writes reverted: 10 of 28 at-risk records were measured reverted
+# (replay_count down, an outcome edit about to flip back).
+
+def _age_live_tombstone(world: Path, days: int) -> None:
+    live = _read_jsonl(world / "pipeline.jsonl")
+    for r in live:
+        r["archived_date"] = _old(days)
+    _write_jsonl(world / "pipeline.jsonl", live)
+
+
+def test_archive_sweep_prune_keeps_post_archival_writes(tmp_path):
+    rid = "2026-07-01_sweep-post-archival"
+    world = _seed_world(tmp_path, [_rec(rid, "resolved", outcome="CONFIRMED")])
+    resp = pipeline_write.move(FakeCtx(world, {"id": rid, "stage": "archived"}))
+    assert resp.status == 200, getattr(resp, "body", resp)
+
+    replay = {"replay_count": 2, "last_replayed": "2026-07-20",
+              "next_review_date": "2026-08-20"}
+    for field, value in (("replay_metadata", json.dumps(replay)),
+                         ("outcome", "UNRESOLVABLE")):
+        resp = pipeline_write.update_field(
+            FakeCtx(world, {"id": rid, "field": field, "value": value}))
+        assert resp.status == 200, getattr(resp, "body", resp)
+    _age_live_tombstone(world, pipeline_write.PRUNE_GRACE_DAYS + 1)
+
+    resp = pipeline_write.archive_sweep(FakeCtx(world))
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body["pruned_count"] == 1
+    assert body["folded_count"] == 1
+    assert _read_jsonl(world / "pipeline.jsonl") == [], "the tombstone is still pruned"
+
+    got = pipeline_read.read(FakeCtx(world, {"id": rid}))
+    assert got.status == 200
+    rec = json.loads(got.body)
+    assert rec["replay_metadata"] == replay, "post-archival replay stamp survives the prune"
+    assert rec["outcome"] == "UNRESOLVABLE", "post-archival outcome edit survives the prune"
+
+
+def test_archive_sweep_prune_unchanged_tombstone_writes_no_archive(tmp_path):
+    rid = "2026-07-01_sweep-unchanged"
+    aged = _rec(rid, "archived", outcome="CONFIRMED",
+                archived_date=_old(pipeline_write.PRUNE_GRACE_DAYS + 3))
+    world = _seed_world(tmp_path, [aged], archive=[dict(aged)])
+    before = (world / "pipeline-archive.jsonl").read_bytes()
+    body = json.loads(pipeline_write.archive_sweep(FakeCtx(world)).body)
+    assert body["pruned_count"] == 1
+    assert body["folded_count"] == 0
+    assert (world / "pipeline-archive.jsonl").read_bytes() == before, \
+        "a tombstone identical to its archive copy must not rewrite the archive"
+
+
+def test_archive_sweep_never_prunes_the_only_copy(tmp_path):
+    rid = "2026-07-01_sweep-no-archive-copy"
+    aged = _rec(rid, "archived", outcome="CONFIRMED",
+                archived_date=_old(pipeline_write.PRUNE_GRACE_DAYS + 3))
+    world = _seed_world(tmp_path, [aged], archive=[])
+    body = json.loads(pipeline_write.archive_sweep(FakeCtx(world)).body)
+    assert body["pruned_count"] == 1
+    assert body["archive_missing_count"] == 1
+    assert _read_jsonl(world / "pipeline.jsonl") == []
+    assert _read_jsonl(world / "pipeline-archive.jsonl") == [aged], \
+        "a tombstone with no archive copy is archived before it is pruned"
+
+
+def test_archive_sweep_fold_never_walks_the_archive_back(tmp_path):
+    # A stale copy the union merge resurrected into live (guard-1072) must not
+    # regress what the archive already holds: replay_count only grows, newer
+    # dates win, reflected=True dominates, and a null never erases a value.
+    rid = "2026-07-01_sweep-stale-tombstone"
+    archive_copy = _rec(rid, "archived", outcome="CONFIRMED", reflected=True,
+                        reflected_by="foxtrot", reflected_date="2026-07-15",
+                        replay_metadata={"replay_count": 3,
+                                         "last_replayed": "2026-07-25"})
+    stale = _rec(rid, "archived", outcome="CONFIRMED", reflected=False,
+                 reflected_by=None,
+                 replay_metadata={"replay_count": 1,
+                                  "last_replayed": "2026-07-10"},
+                 archived_date=_old(pipeline_write.PRUNE_GRACE_DAYS + 3))
+    world = _seed_world(tmp_path, [stale], archive=[archive_copy])
+    body = json.loads(pipeline_write.archive_sweep(FakeCtx(world)).body)
+    assert body["pruned_count"] == 1
+    [rec] = _read_jsonl(world / "pipeline-archive.jsonl")
+    assert rec["replay_metadata"] == {"replay_count": 3, "last_replayed": "2026-07-25"}
+    assert rec["reflected"] is True
+    assert rec["reflected_by"] == "foxtrot"
+    assert rec["reflected_date"] == "2026-07-15"
+
+
+def test_archive_sweep_fold_collapses_duplicate_archive_rows(tmp_path):
+    # guard-2449: the archive carries historical duplicate-id rows. Folding
+    # only the FIRST would leave a stale twin for the union merge to pick.
+    rid = "2026-07-01_sweep-duplicate-rows"
+    frozen = _rec(rid, "archived", outcome="CONFIRMED")
+    live = _rec(rid, "archived", outcome="CONFIRMED",
+                replay_metadata={"replay_count": 1, "last_replayed": "2026-07-20"},
+                archived_date=_old(pipeline_write.PRUNE_GRACE_DAYS + 3))
+    other = _rec("2026-07-02_sweep-bystander", "archived", outcome="CONFIRMED")
+    world = _seed_world(tmp_path, [live],
+                        archive=[dict(frozen), other, dict(frozen)])
+    body = json.loads(pipeline_write.archive_sweep(FakeCtx(world)).body)
+    assert body["folded_count"] == 1
+    arch = _read_jsonl(world / "pipeline-archive.jsonl")
+    assert [r["id"] for r in arch] == [rid, other["id"]], \
+        "one folded row per id, bystanders untouched and in place"
+    assert arch[0]["replay_metadata"]["replay_count"] == 1
 
 
 # ---------------------------------------------------------------------------

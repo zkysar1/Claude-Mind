@@ -60,6 +60,7 @@ class _Ctx:
 
     def __init__(self, query=None):
         self.query = query or {}
+        self.headers = {}  # the endpoint reads the caller identity ()
         self.paths = self._P()
 
 

@@ -44,11 +44,14 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 # _paths is the SSOT for the agent-dir layout constants. Importing them (rather
@@ -66,6 +69,7 @@ from _paths import (  # noqa: E402
     AGENTS_PARENT_DIR,
     SESSIONS_DIRNAME,
     SESSION_DIRNAME,
+    agent_session_dir,
 )
 
 # --------------------------- phase contract ---------------------------
@@ -832,8 +836,57 @@ def skill_eligibility(skill: "str | None") -> _SkillEligibilityFields:
 EXECUTABLE_BY_ROLE_VALUES = ("worker", "reducer", "any")
 
 
+def _agent_queue_claim_probe(agent: str) -> "tuple":
+    """Does THIS box hold a live runner claim for `agent`? ()
+
+    Returns `(held, provenance)`:
+      held — None  this box CANNOT tell (probe unavailable, transient error,
+                   unknown machine identity, no backend).
+             True  this box holds a fresh RUNNING claim for `agent`.
+             False this box does not (fresh claims exist elsewhere or none).
+
+    The answer comes from `owncloud_sync._owned_agents_with_provenance` — the
+    ONE implementation of the ownership rule (its own docstring), the same
+    SSOT the write-side `no_claim` gate consults in `owncloud_backend._put`.
+    Reusing it instead of re-deriving (a runner-token scan, a raw claim-table
+    read, a subprocess) is deliberate: three copies of the ownership predicate
+    would be three things to keep in sync (guard-130), and the freshness
+    threshold (`OWNERSHIP_STALE_SECONDS` -> backend default) is already the
+    value `reclaim_if_stale` enforces for the lock-break.
+
+    PROVENANCE IS THE VERDICT, not a boolean alone. `local-backend` (owned
+    None) means a single machine with no claim store: every agent queue is
+    claimable on the box, and the daemon's `no_claim` machinery does not
+    exist there (`no_claim_error` is the empty tuple off own-cloud), so the
+    caller falls through to the normal role/skill logic rather than fencing.
+    `live-claims` is a real judgment in both directions. `unknown-machine` /
+    `transient-error` (and any exception, incl. a persistent
+    `OwnCloudPermissionError` on the Scan) mean the box cannot PROVE it holds
+    the claim — and a `reducer-only` verdict asserts a STRUCTURAL impossibility
+    ("no retry can ever succeed from this box"). Making that assertion on an
+    unreadable claim table is the confident-and-wrong error the `no_claim`
+    gate's own comment names (g-115-8028: fires ONLY on provenance
+    "live-claims"). So those degrade to `held=None`: the caller reports
+    `undetermined`, the same honest "I could not run this probe" class as the
+    rest of this module's fail-open declines (guard-1760).
+    """
+    try:
+        import owncloud_sync  # lazy: only the source gate needs the sweep module
+        owned, provenance = owncloud_sync._owned_agents_with_provenance()
+    except Exception as exc:  # noqa: BLE001 — probe unavailable, not a verdict
+        return None, f"probe-error:{type(exc).__name__}"
+    if provenance == "local-backend":
+        return True, provenance
+    if provenance == "live-claims":
+        return (agent in (owned or set())), provenance
+    return None, provenance
+
+
 def goal_eligibility(skill: "str | None",
-                     executable_by_role: "str | None" = None
+                     executable_by_role: "str | None" = None,
+                     source: "str | None" = None,
+                     agent: "str | None" = None,
+                     *, claim_probe=None
                      ) -> _SkillEligibilityFields:
     """Whether a WORKER Body may claim a goal, GOAL-level declaration first.
 
@@ -841,18 +894,101 @@ def goal_eligibility(skill: "str | None",
     to the skill-keyed bridge otherwise. Never raises on a bad value: an
     unrecognised role degrades to the skill bridge and NAMES itself in the
     reason, because a typo must not silently fence a goal in either direction.
+
+    SOURCE GATE (g-306-524). An agent-queue goal (`source == 'agent'`) is
+    claimable ONLY on the box holding that agent's DDB runner claim; the claim
+    endpoint refuses every other box `no_claim` (STRUCTURAL — "no retry can
+    ever succeed from here", owncloud_backend.py). The gate above is FIELD-KEYED
+    (`executable_by_role`) and an agent-queue goal carries NO field, so it
+    answers `undetermined` on exactly the population a worker can never claim
+    from its box (measured 2026-09-11: 24 of 2058 candidates, 7 in the top 50;
+    relayed cc-07/08/09/13). g-306-514 source-gated the DRAIN LANE only; this is
+    the SELECT-time twin. The key is CLAIM-HOLDING, not role, deliberately: a
+    worker co-resident on the claim box CAN claim (g-001-06 closed
+    completed_by_role=worker from cc-08), so keying on role would fence the
+    majority direction the role field exists to express.
+
+    `claim_probe` replaces `_agent_queue_claim_probe` for one caller: the Phase 1
+    walk passes a copy memoized for that walk, so judging many rows scans the
+    claim table once (eligibility_walk, g-375-53).
     """
+    if (source or "").strip().lower() == "agent":
+        # The owner of a source='agent' row in THIS worker's select output is
+        # the worker's own agent (its queue); `agent` names it explicitly so a
+        # caller judging a row read elsewhere can still answer.
+        probe_agent = (agent or os.environ.get("MIND_AGENT") or AGENT_NAME) or ""
+        held, provenance = (claim_probe or _agent_queue_claim_probe)(probe_agent)
+        if held is True:
+            reason = ("source='agent' and this box HOLDS the live runner claim "
+                      f"for '{probe_agent}' (ownership provenance "
+                      f"{provenance!r}) -- the claim is structurally claimable "
+                      "from here; the role/skill logic decides: ")
+        elif held is False:
+            return _SkillEligibilityFields(
+                False, normalize_skill(skill), None, REDUCER_ONLY_BY_DESIGN,
+                f"source='agent' and this box does NOT hold the live runner "
+                f"claim for '{probe_agent}' (ownership provenance "
+                f"{provenance!r}) -- the claim endpoint will refuse it "
+                "no_claim (STRUCTURAL: no retry can ever succeed from this "
+                "box). Leave it for the claim-holding box and take the next "
+                "candidate. (g-306-524)")
+        else:
+            return _SkillEligibilityFields(
+                True, normalize_skill(skill), None, None,
+                f"source='agent' but the claim probe CANNOT tell whether this "
+                f"box holds the live runner claim for '{probe_agent}' "
+                f"(provenance {provenance!r}) -- a no_claim refusal is a "
+                "STRUCTURAL claim, so it is NOT asserted on an unreadable "
+                "claim table (g-115-8028's direction). This is NOT a cleared "
+                "check: judge it yourself -- if the box demonstrably holds "
+                "the claim (e.g. `runner-claim.sh status` naming this machine), "
+                "claim it; otherwise leave it. (g-306-524)",
+                undetermined=True)
+        # held is True: fall through with the claimability reason prefixed.
+    else:
+        reason = None
+
+    # `reason` is the claimability prefix when the source gate ran and this box
+    # HOLDS the claim (), else None. Every fall-through path below
+    # prepends it when set, so the reason reads one continuous sentence: the
+    # claim IS reachable from here, AND here is what decided the rest.
+    prefix = reason or ""
     role = (executable_by_role or "").strip().lower() or None
 
     if role == "reducer":
         return _SkillEligibilityFields(
             False, normalize_skill(skill), None, REDUCER_ONLY_BY_DESIGN,
+            prefix +
             "goal declares executable_by_role='reducer' -- a WORKER must not "
             "claim it. This is a GOAL-level declaration, decisive and "
             "independent of the skill field. Leave it for the reducer and take "
             "the next candidate. (g-115-7372)")
 
     verdict = skill_eligibility(skill)
+
+    if prefix and verdict.eligible and verdict.undetermined:
+        # SOURCE-GATE AFFIRMATIVE (). On the box that HOLDS the runner
+        # claim, the can't-judge verdicts below (skill-less goal, unmapped
+        # skill) concern OWNERSHIP -- "is this goal reducer-only work?" -- not
+        # CLAIMABILITY, which the gate has settled: the claim endpoint accepts
+        # from here. The verdict word must say 'eligible', not 'undetermined',
+        # because the defect this gate fixes is the structural no_claim, and
+        # worker-loop Phase 1 reads the WORD, not the prose. guard-1760's
+        # caution is preserved VERBATIM inside verdict.reason -- this appends
+        # to it, it does not erase it -- and the refusal paths above (role
+        # 'reducer', a reducer-only skill, the worker+refused-skill
+        # contradiction) returned before this point, so no fence ever reads
+        # through the promotion as a pass.
+        verdict = verdict._replace(
+            undetermined=False,
+            reason=verdict.reason +
+            (" SOURCE-GATE AFFIRMATIVE: source='agent' AND this box HOLDS the "
+             "live runner claim, so the claim is structurally claimable from "
+             "here (g-306-524); the 'cannot judge' above concerns OWNERSHIP "
+             "(is this goal reducer-only work?), not claimability. Judge "
+             "ownership BEFORE claiming -- if the outcomes encode, resolve "
+             "hypotheses, drain, push main, or write the agent-wide working "
+             "memory, release it and take the next candidate."))
 
     if role == "worker":
         # A GOAL-level 'worker' declaration must NOT unlock a skill the skill
@@ -875,6 +1011,7 @@ def goal_eligibility(skill: "str | None",
                 + verdict.reason))
         return _SkillEligibilityFields(
             True, normalize_skill(skill), verdict.stage, verdict.disposition,
+            prefix +
             "goal declares executable_by_role='worker' -- worker-eligible, and "
             "positively so: this value also ROUTES a goal that only a Body with "
             "box-local state can satisfy, which is the majority direction of "
@@ -882,22 +1019,24 @@ def goal_eligibility(skill: "str | None",
 
     if role == "any":
         return verdict._replace(
-            reason="goal declares executable_by_role='any' (explicitly not "
-                   "role-fenced), so the SKILL bridge decides: " + verdict.reason)
+            reason=prefix + "goal declares executable_by_role='any' (explicitly "
+                   "not role-fenced), so the SKILL bridge decides: " + verdict.reason)
 
     if role is not None:
         return verdict._replace(
-            reason=(f"goal carries an UNRECOGNISED executable_by_role="
+            reason=(prefix +
+                    f"goal carries an UNRECOGNISED executable_by_role="
                     f"{executable_by_role!r} (expected one of "
                     f"{'/'.join(EXECUTABLE_BY_ROLE_VALUES)}) -- IGNORED, and "
                     f"this is NOT a cleared check. Falling back to the SKILL "
                     f"bridge: ") + verdict.reason)
 
     return verdict._replace(
-        reason="goal carries no executable_by_role declaration (the common "
-               "case -- the field is new, so the existing corpus is unset and "
-               "unset is NOT evidence of anything). Falling back to the SKILL "
-               "bridge: " + verdict.reason)
+        reason=prefix +
+        "goal carries no executable_by_role declaration (the common "
+        "case -- the field is new, so the existing corpus is unset and "
+        "unset is NOT evidence of anything). Falling back to the SKILL "
+        "bridge: " + verdict.reason)
 
 
 # --------------------------- carrier contract () ---------------------------
@@ -1419,6 +1558,144 @@ def _verdict_word(verdict) -> str:
     return "eligible" if verdict.eligible else "reducer-only"
 
 
+# THE PHASE 1 WALK (). worker-loop asked goal-eligible once per
+# candidate, AFTER cutting the ranking to 10 or 40. On 2026-09-28 a worker Body
+# ran the selector, made 0 gate calls, and parked on a "supply gap" with 33
+# claimable goals in its top 40. `select-walk` judges the ranking in one call,
+# in the scorer's order, and drops reducer-only rows BEFORE the cut, so a run of
+# them at the top cannot hide claimable work below. The walk records what it
+# showed (the census); a supply-gap park must answer every row in it
+# (body-manifest.py park --supply-gap).
+# Rationale (WHY the walk filters before the cut): core/config/rationale/worker-role-gate.md
+SELECT_CENSUS_FILENAME = "select-census.json"
+CENSUS_MAX_AGE_S = 1800  # SELECT and park share one pass; a degraded-store SELECT took ~8 min
+SUPPLY_WALK_MIN = 40  # the SKILL's deep walk: a park after --top 10 alone is premature
+
+
+def eligibility_walk(rows, agent=None):
+    """Yield (row, verdict word) for ranked rows, in order, as a WORKER sees them.
+
+    One goal_eligibility call per row. The agent-queue claim probe (a claim-table
+    scan) is memoized for THIS walk only: a long walk scans once, and no global
+    cache can serve a long-lived caller a stale claim.
+    """
+    probe = functools.lru_cache(maxsize=None)(_agent_queue_claim_probe)
+    for row in rows:
+        verdict = goal_eligibility(row.get("skill"), row.get("executable_by_role"),
+                                   source=row.get("source"), agent=agent,
+                                   claim_probe=probe)
+        yield row, _verdict_word(verdict)
+
+
+def supply_gap_refusals(census, declines, now=None) -> "list[str]":
+    """Why a supply-gap park must not happen yet; an empty list allows it.
+
+    `census` is the dict `select-walk` wrote for this session (None
+    when absent or unreadable). `declines` maps goal id -> the reason the Body
+    judged it cannot take that goal. Reducer-only rows never reach the census, so
+    every row in it is eligible or undetermined and needs a claim or a decline.
+    A census with no rows is a genuine gap: the walk found nothing to offer.
+    """
+    if not isinstance(census, dict):
+        return ["no SELECT census for this session: run `py -3 core/scripts/worker_execute.py "
+                f"select-walk --top {SUPPLY_WALK_MIN}` and answer each row before parking"]
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        age = (now - datetime.fromisoformat(str(census.get("ts")))).total_seconds()
+    except ValueError:
+        return [f"the census has no readable ts ({census.get('ts')!r}): run the select again"]
+    if age > CENSUS_MAX_AGE_S:
+        return [f"the census is {int(age // 60)} min old (limit {CENSUS_MAX_AGE_S // 60}): "
+                "run the select again"]
+    rows = [r for r in (census.get("rows") or []) if isinstance(r, dict)]
+    if int(census.get("top") or 0) < SUPPLY_WALK_MIN and len(rows) >= int(census.get("top") or 0):
+        return [f"the walk stopped at --top {census.get('top')} with rows still ranked below: "
+                f"run `py -3 core/scripts/worker_execute.py select-walk --top {SUPPLY_WALK_MIN}` "
+                "before parking"]
+    return [f"{r.get('goal_id')} is {r.get('verdict')}: claim it, or decline it with "
+            f"--decline {r.get('goal_id')}=<why you cannot take it>"
+            for r in rows if r.get("goal_id") not in declines]
+
+
+def worker_view(rows, n, agent=None):
+    """The first N ranked rows a WORKER may take: filter BEFORE the cut ().
+
+    `rows` is the selector's ranking in its own order. Reducer-only rows are
+    dropped before the cut, so a run of them at the top cannot hide claimable
+    work below, and nothing is re-sorted (guard-5135). This lives HERE, not in
+    goal-selector: the selector is one component both roles run, and
+    LIFECYCLE_DISPOSITIONS["select"] forbids worker logic inside it
+    (test_selection_stays_role_blind). Returns (kept rows, each carrying its
+    verdict word; the census).
+    """
+    kept, skipped, walked = [], 0, 0
+    for row, word in eligibility_walk(rows, agent=agent):
+        walked += 1
+        if word == "reducer-only":
+            skipped += 1
+            continue
+        kept.append(dict(row, verdict=word))
+        if len(kept) >= n:
+            break
+    words = [r["verdict"] for r in kept]
+    census = {"top": n, "ranked_total": len(rows), "walked": walked,
+              "eligible": words.count("eligible"),
+              "undetermined": words.count("undetermined"),
+              "reducer_only_skipped": skipped,
+              "rows": [{"goal_id": r.get("goal_id"), "verdict": r["verdict"]} for r in kept]}
+    return kept, census
+
+
+_SELECTOR = Path(__file__).resolve().parent / "goal-selector.sh"
+_SELECT_EVERY_ROW = 1_000_000  # a --top slice wide enough to hold the whole ranking
+
+
+def _ranked_rows():
+    """(the selector's whole ranking as brief rows, its stderr). One selector run,
+    exactly as the Body made before (guard-2331: every run moves drain-lane state).
+    Raises RuntimeError on a failed or unparseable run, so an empty list can only
+    mean an empty queue."""
+    from _runtime_bash import bash_cmd  # guard-580: never a bare "bash" argv
+    proc = subprocess.run(bash_cmd(str(_SELECTOR), "select", "--top", str(_SELECT_EVERY_ROW)),
+                          capture_output=True, text=True, timeout=1800)
+    if proc.returncode != 0:
+        raise RuntimeError(f"goal-selector.sh select exited {proc.returncode}: "
+                           f"{proc.stderr.strip()[-400:]}")
+    try:
+        rows = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f"goal-selector.sh select printed no JSON ({len(proc.stdout)} "
+                           f"bytes): {exc}") from None
+    if not isinstance(rows, list):
+        raise RuntimeError(f"goal-selector.sh select printed a {type(rows).__name__}, not a list")
+    return rows, proc.stderr
+
+
+def write_select_census(census, session_dir) -> None:
+    """Record what select-walk showed, for the supply-gap park check.
+
+    Written only into an EXISTING session dir (a bound Body's); never creates one.
+    Fail-open: a failed write must not cost the selection, and a missing census
+    makes the park refuse, which is the safe direction.
+    """
+    session_dir = Path(session_dir)
+    if not session_dir.is_dir():
+        return
+    stamp = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+    doc = dict(census, ts=stamp, sid=session_dir.name)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(session_dir), prefix=".select-census.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(tmp, session_dir / SELECT_CENSUS_FILENAME)
+    except OSError as exc:
+        if tmp:
+            Path(tmp).unlink(missing_ok=True)
+        print(f"select-walk: census write skipped ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+
+
 def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Worker-body execution contract (Phase 2A, asp-306).")
@@ -1493,14 +1770,28 @@ def _main(argv=None) -> int:
                                  "goal, reading the GOAL-level executable_by_role "
                                  "declaration first and falling back to the "
                                  "skill-keyed bridge (g-115-7372). Answers for the "
-                                 "~98%% of candidates that carry no skill.")
+                                 "~98%% of candidates that carry no skill. With "
+                                 "--source agent, also answers reducer-only on a "
+                                 "box that does not hold the agent's runner claim "
+                                 "(g-306-524).")
     p_goal.add_argument("--role", default=None,
                         help="the goal's executable_by_role field verbatim "
                              "(worker|reducer|any); omit when unset")
+    p_goal.add_argument("--source", default=None,
+                        help="the scored row's source field (world|agent|cross-agent:"
+                             "<owner>); omit when the row was read without it. "
+                             "Only 'agent' fires the claim-holding gate; a "
+                             "cross-agent:<owner> row is NOT this worker's queue, "
+                             "so pass its <owner> via --agent")
+    p_goal.add_argument("--agent", default=None,
+                        help="the agent whose queue the goal belongs to (the "
+                             "row's intended/owning agent). Defaults to this "
+                             "session's agent; name it explicitly when judging "
+                             "a cross-agent:<owner> row (g-306-524)")
     # REMAINDER for the same guard-920 reason as skill-eligible above: the
-    # production arg shape is the skill field verbatim, args and all. --role
-    # must precede it, because REMAINDER swallows everything from the first
-    # positional onward.
+    # production arg shape is the skill field verbatim, args and all. --role /
+    # --source / --agent must all precede it, because REMAINDER swallows
+    # everything from the first positional onward.
     p_goal.add_argument("skill", nargs=argparse.REMAINDER, default=[],
                         help="the goal's skill field, args and all; empty means no skill")
     p_claim = sub.add_parser("claim-role-recheck",
@@ -1537,6 +1828,16 @@ def _main(argv=None) -> int:
     sub.add_parser("reducer-only-skills",
                    help="print every skill a worker must not claim, with the "
                         "lifecycle stage each one IS")
+    p_walk = sub.add_parser("select-walk",
+                            help="worker-loop Phase 1 in one call (g-375-53): the "
+                                 "selector's ranking, every row judged by "
+                                 "goal-eligible in rank order, reducer-only rows "
+                                 "dropped BEFORE the cut to --top N. Prints the "
+                                 "kept rows with their verdict and records the "
+                                 "census a supply-gap park checks")
+    p_walk.add_argument("--top", type=int, required=True)
+    p_walk.add_argument("--agent", default=None,
+                        help="whose queue; defaults to this session's agent")
     args = ap.parse_args(argv)
 
     if args.cmd == "phases":
@@ -1708,7 +2009,8 @@ def _main(argv=None) -> int:
         print(verdict.reason, file=sys.stderr)
         return 0 if verdict.eligible else 1
     if args.cmd == "goal-eligible":
-        verdict = goal_eligibility(" ".join(args.skill), args.role)
+        verdict = goal_eligibility(" ".join(args.skill), args.role,
+                                   source=args.source, agent=args.agent)
         print(_verdict_word(verdict))
         print(verdict.reason, file=sys.stderr)
         return 0 if verdict.eligible else 1
@@ -1748,6 +2050,33 @@ def _main(argv=None) -> int:
             disp = LIFECYCLE_DISPOSITIONS[stage]
             if disp.kind == REDUCER_ONLY_BY_DESIGN:
                 print(f"{skill:<32} {stage:<20} {disp.kind}")
+        return 0
+    if args.cmd == "select-walk":
+        # stdout: the kept rows as a JSON list, index 0 the first row a worker
+        # may take. stderr: the selector's own banners (minus its slice line,
+        # which names a --top this call never asked for), then the census.
+        if args.top < 1:
+            print("select-walk: --top must be at least 1", file=sys.stderr)
+            return 2
+        try:
+            rows, selector_err = _ranked_rows()
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            print(f"select-walk: {exc}", file=sys.stderr)
+            return 3
+        for line in selector_err.splitlines():
+            if not line.startswith("[goal-selector] --top "):
+                print(line, file=sys.stderr)
+        agent = args.agent or os.environ.get("MIND_AGENT") or AGENT_NAME or None
+        kept, census = worker_view(rows, args.top, agent=agent)
+        print("[\n" + ",\n".join(json.dumps(r, ensure_ascii=False) for r in kept) + "\n]")
+        print(f"[select-walk] showing {len(kept)} of {len(rows)} ranked candidates in the "
+              f"scorer's order: eligible {census['eligible']}, undetermined "
+              f"{census['undetermined']} (yours to judge); {census['reducer_only_skipped']} "
+              f"reducer-only row(s) among the first {census['walked']} dropped BEFORE the "
+              f"cut (g-375-53)", file=sys.stderr)
+        sid = os.environ.get("MIND_SID") or ""
+        if sid and agent:
+            write_select_census(census, agent_session_dir(agent, sid))
         return 0
     return 2
 

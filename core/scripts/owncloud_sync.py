@@ -117,6 +117,7 @@ USAGE
 from __future__ import annotations
 
 import argparse
+import contextvars
 import fnmatch
 import hashlib
 import json
@@ -138,6 +139,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 _EXCLUDE_DIRS = {
     "sessions", ".history", "presence",
     "__pycache__", ".git", "node_modules", ".locks", ".pytest_cache",
+    # experience-stats spool dot-dir (g-306-523): the spool relocated out of
+    # the tracked flat paths into agents/<agent>/.experience-stats/. Pruned
+    # HERE, and its file basenames also remain in _EXCLUDE_NAMES below as the
+    # second layer (a flat legacy file re-created by old code is still
+    # machine-local — never push it).
+    ".experience-stats",
 }
 # Directory-name PREFIXES pruned exactly like _EXCLUDE_DIRS (g-372-44). An
 # exact-basename set cannot see an INVENTED sibling of an excluded dir: renaming
@@ -1935,11 +1942,51 @@ def _persist_merge_event(event: dict) -> None:
               file=sys.stderr)
 
 
+# ── Request-scoped carrier identity (g-375-40) ──────────────────────────────
+# `_own_sid_carrier_path` below computes its one exempt path from MIND_AGENT +
+# MIND_SID. That is right for a CLI sweep run inside a session and wrong inside
+# the long-lived daemon, whose environment is the one it was SPAWNED with: it
+# names whichever session spawned it, or no session at all. The claim endpoint
+# already states this doctrine ("NEVER read os.environ['MIND_SID'] here",
+# aspirations_write.py). Measured 2026-09-27 on 10 worker boxes: on the 3 whose
+# Body session started after their daemon, the live carrier never reached the
+# store, the stranded-claim sweep read it `absent`, released 3 live claims past
+# the 120m grace, and a second Body duplicated each goal.
+#
+# A request handler that knows its caller sets this identity for the duration of
+# the request, and the helper computes the one exempt path from it instead of the
+# env. The guard-2860 shape is unchanged: still ONE member per request, computed
+# from identity and admitted by resolved-path equality, never matched from disk.
+# A ContextVar, not an os.environ swap, for the reason storage_backend's
+# set_customer gives: each request thread sees only its own value, so concurrent
+# pushes cannot read each other's sid or restore the wrong one, and the periodic
+# sweep thread never sees it at all (it keeps the env behaviour).
+_carrier_identity: "contextvars.ContextVar[tuple[str, str] | None]" = \
+    contextvars.ContextVar("ayoai_carrier_identity", default=None)
+
+
+def set_carrier_identity(agent: str, sid: str) -> "contextvars.Token":
+    """Name the session whose carrier the current request may publish. Returns
+    a token the caller MUST pass to :func:`reset_carrier_identity` in a
+    ``finally``."""
+    return _carrier_identity.set((str(agent or "").strip(),
+                                  str(sid or "").strip()))
+
+
+def reset_carrier_identity(token: "contextvars.Token") -> None:
+    """Restore the identity the context held before the matching set."""
+    _carrier_identity.reset(token)
+
+
 def _own_sid_carrier_path(be):
     """THIS session's own body-heartbeat carrier, or None. (g-306-235)
 
     Returns `(path, prefix, root_path)` when the carrier exists on disk, else
     None.
+
+    "This session" is the request's caller when a handler has named it with
+    `set_carrier_identity` (g-375-40), else the process env. The env is only
+    right for a process that runs inside the session; see the block above.
 
     The one file the H4a ownership gate gets structurally wrong. The gate's
     premise — "a non-owner's local copy of a peer file is a stale cache, so
@@ -1966,8 +2013,12 @@ def _own_sid_carrier_path(be):
     Manifest: session-manifest.yaml `body-heartbeat-*.json`, sync_tier
     continuity.
     """
-    agent = (os.environ.get("MIND_AGENT") or "").strip()
-    sid = (os.environ.get("MIND_SID") or "").strip()
+    identity = _carrier_identity.get()
+    if identity is not None:
+        agent, sid = identity
+    else:
+        agent = (os.environ.get("MIND_AGENT") or "").strip()
+        sid = (os.environ.get("MIND_SID") or "").strip()
     if not agent or not sid:
         return None
     # Defensive: a sid carrying a path separator would escape the agent dir.

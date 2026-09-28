@@ -15,14 +15,25 @@ production queue, board or ref), then the CLI's three modes:
   5. Open-goal lookup matches the PREFIX and open statuses only.
   6. CLI: non-frontier is silent in --nudge; --nudge speaks only when due
      AND an open goal exists for the newest tag; exit codes 0/2.
+  7. THE BASIS (g-115-11144): after the loop's own refresh (`git fetch origin
+     main`, which brings no tags) a box that did not cut the newest tag reads
+     the previous one as newest. measure_with_basis, the CLI, the nudge and the
+     probe must all see origin's newest tag, and a failed refresh leaves a DUE
+     reading unmeasured.
+  8. Leases: only a strictly older tag the basis can see is superseded; the
+     latest HAND close of a tag holds re-filing for skip_hold_hours.
+  9. --nudge never reads the goal store when the train is not due.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import time
+import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -108,9 +119,19 @@ def test_config_values_come_from_aspirations_yaml():
         declared = (yaml.safe_load(f) or {}).get("release_train") or {}
     assert declared, "aspirations.yaml must declare a release_train block"
     got = rt.config()
-    assert set(got) == {"stale_hours", "ticks_to_file", "ticks_to_revalidate"}
+    assert set(got) == {"stale_hours", "ticks_to_file", "ticks_to_revalidate", "skip_hold_hours"}
     for key, value in declared.items():
         assert got[key] == value, f"{key}: read {got[key]}, config declares {value}"
+
+
+def test_skip_hold_is_shorter_than_eviction_age():
+    """last_disposal() reads the LIVE store, which evicts a terminal goal after
+    aspirations_eviction.age_days. A hold longer than that would end early and
+    silently, the day the closed lease it reads is evicted."""
+    import yaml
+    with (CORE_SCRIPTS.parent / "config" / "aspirations.yaml").open(encoding="utf-8") as f:
+        age_days = (yaml.safe_load(f) or {})["aspirations_eviction"]["age_days"]
+    assert 0 < rt.config()["skip_hold_hours"] < age_days * 24
 
 
 def test_config_floor_on_missing_file(tmp_path):
@@ -292,3 +313,209 @@ def test_cli_not_due_when_tag_is_fresh(tmp_path):
     assert rc == 0 and out.startswith("release-train: ok")
     rc, out, _ = _cli(r.work, world, "--nudge")
     assert out == ""
+
+
+# ── 7. the basis () ───────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _cut_elsewhere(repo: Repo, tmp_path: Path, tag: str) -> None:
+    """Another box commits framework code, cuts `tag` on it NOW, and pushes
+    both. This clone then refreshes the way the loop does (`git fetch origin
+    main`), which brings the commit and not the tag."""
+    other = tmp_path / "cutter"
+    _git(tmp_path, "clone", "--quiet", "--branch", "main", str(repo.origin), str(other))
+    for k, v in (("user.email", "c@example.invalid"), ("user.name", "c"),
+                 ("commit.gpgsign", "false"), ("tag.gpgsign", "false"),
+                 ("core.hooksPath", str(tmp_path / "no-hooks")), ("core.autocrlf", "false")):
+        _git(other, "config", k, v)
+    (other / "core" / "scripts").mkdir(parents=True, exist_ok=True)
+    (other / "core" / "scripts" / "cut.py").write_text(f"{tag}\n", encoding="utf-8")
+    _git(other, "add", "core/scripts/cut.py")
+    _git(other, "commit", "-m", f"framework change released as {tag}")
+    _git(other, "tag", "-a", tag, "-m", tag, date=_now_iso())
+    _git(other, "push", "--quiet", "origin", "main", tag)
+    _git(repo.work, "fetch", "--quiet", "origin", "main")
+    assert _git(repo.work, "tag", "-l", tag) == "", (
+        f"precondition: this git's `git fetch origin main` brought {tag}, so the "
+        f"defect pinned here cannot occur on it (measured absent on git 2.45)")
+
+
+def test_a_tagless_fetch_hides_the_new_tag_and_measure_with_basis_finds_it(repo, tmp_path):
+    _cut_elsewhere(repo, tmp_path, "v1.1.0")
+    local = rt.measure(repo.work, PATHS)
+    assert local["newest_tag"] == "v1.0.0"              # the previous tag, read as newest
+    assert rt.decide(local, 24)["due"] is True          # ... so a FALSE stall
+    m = rt.measure_with_basis(repo.work, PATHS, 24)
+    assert m["error"] is None and m["tag_basis"] == "fetched"
+    assert m["newest_tag"] == "v1.1.0" and m["tags_merged"][:2] == ["v1.1.0", "v1.0.0"]
+    assert rt.decide(m, 24)["due"] is False
+
+
+def test_cli_and_nudge_see_the_true_newest_tag_after_a_tagless_fetch(repo, tmp_path):
+    """Against f6208f77ed the CLI read DUE on v1.0.0, and the nudge printed an
+    LLM-ACTION for the stale v1.0.0 lease."""
+    _cut_elsewhere(repo, tmp_path, "v1.1.0")
+    world = _world(tmp_path, goals=[
+        {"id": "g-115-77777", "status": "pending", "origin_signal": rt.signal_for("v1.0.0")}])
+    rc, out, _ = _cli(repo.work, world)
+    assert rc == 0 and out.startswith("release-train: ok - no framework commits past v1.1.0"), out
+    # That run fetched the tag. Drop it again, so the nudge starts from the
+    # loop's own tagless basis and must fetch for itself.
+    _git(repo.work, "tag", "-d", "v1.1.0")
+    rc, out, _ = _cli(repo.work, world, "--nudge")
+    assert rc == 0 and out == ""
+    assert _git(repo.work, "tag", "-l", "v1.1.0") == "v1.1.0"
+
+
+def _load_watchdog():
+    spec = importlib.util.spec_from_file_location(
+        "agent_watchdog_release_train_basis", CORE_SCRIPTS / "agent-watchdog.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_probe_on_a_box_that_did_not_cut_the_tag_files_and_retires_nothing(
+        repo, tmp_path, monkeypatch):
+    """The fleet-level harm, end to end on real git. Against f6208f77ed this box
+    retired the cutter's open v1.1.0 lease as "a newer tag, v1.0.0, has been
+    cut" and filed a false v1.0.0 lease."""
+    _cut_elsewhere(repo, tmp_path, "v1.1.0")
+    wd = _load_watchdog()
+    lease = {"id": "g-cut", "status": "pending", "claimed_by": None,
+             "origin_signal": rt.signal_for("v1.1.0"), "_source": "world"}
+    monkeypatch.setattr(rt, "self_role", lambda world: "frontier")
+    monkeypatch.setattr(rt, "framework_paths", lambda: PATHS)
+    monkeypatch.setattr(rt, "open_release_goals", lambda world, agent_dir=None: [lease])
+    monkeypatch.setattr(rt, "last_disposal", lambda *a, **k: None, raising=False)
+    ctx = types.SimpleNamespace(agent_name="t", project_root_path=repo.work,
+                                agent_dir=tmp_path / "agent")
+    p = wd.ReleaseTrainProbe(ctx)
+    calls = {"file": [], "retire": []}
+    monkeypatch.setattr(p, "_file_release_goal",
+                        lambda *a, **k: calls["file"].append(a) or {"filed": True, "goal_id": "g-x"})
+    monkeypatch.setattr(p, "_retire_release_goals",
+                        lambda goals, reason: calls["retire"].append(
+                            ([g["id"] for g in goals], reason)) or {"closed": []})
+    monkeypatch.setattr(p, "_post_board_alert", lambda *a, **k: {"posted": True})
+    assert p.check() == []
+    assert calls == {"file": [], "retire": []}, calls
+    assert "v1.1.0" in p.last_reason
+
+
+def test_a_failed_basis_refresh_leaves_a_due_reading_unmeasured(repo, tmp_path, monkeypatch):
+    repo.commit("core/scripts/late.py", "framework change past the old tag")
+    repo.push()                                          # local: v1.0.0 old + 1 commit = due
+    _git(repo.work, "remote", "set-url", "origin", str(tmp_path / "gone.git"))
+    m = rt.measure_with_basis(repo.work, PATHS, 24)
+    assert m["tag_basis"].startswith("local (refresh failed")
+    assert "basis refresh failed" in m["error"] and "v1.0.0" in m["error"]
+    assert rt.decide(m, 24)["reason"].startswith("unmeasured:")
+    # The deliberate opt-out (guard-4582) fails the same safe way.
+    _git(repo.work, "remote", "set-url", "origin", str(repo.origin))
+    monkeypatch.setenv(rt.NO_FETCH_ENV, "1")
+    m = rt.measure_with_basis(repo.work, PATHS, 24)
+    assert rt.NO_FETCH_ENV in m["error"]
+
+
+def test_a_local_not_due_reading_needs_no_fetch(tmp_path):
+    r = Repo(tmp_path)
+    r.commit("core/scripts/a.py", "base")
+    r.tag("v2.0.0", date=_now_iso())
+    r.commit("core/scripts/b.py", "past a fresh tag")
+    r.push()
+    _git(r.work, "remote", "set-url", "origin", str(tmp_path / "gone.git"))  # any fetch fails
+    m = rt.measure_with_basis(r.work, PATHS, 24)
+    assert m["error"] is None and m["tag_basis"] == "local" and m["newest_tag"] == "v2.0.0"
+    forced = rt.measure_with_basis(r.work, PATHS, 24, always=True)   # a reader re-measuring
+    assert forced["error"] is None and forced["tag_basis"].startswith("local (refresh failed")
+
+
+# ── 8. leases ────────────────────────────────────────────────────────────────
+
+def test_superseded_leases_are_strictly_older_and_visible():
+    merged = ["v1.10.0", "v1.9.0", "v1.2.0"]
+    goals = [{"id": "same", "origin_signal": rt.signal_for("v1.10.0")},
+             {"id": "older", "origin_signal": rt.signal_for("v1.9.0")},
+             {"id": "unseen-newer", "origin_signal": rt.signal_for("v1.11.0")},
+             {"id": "unseen-older", "origin_signal": rt.signal_for("v1.3.0")},
+             {"id": "other", "origin_signal": "investigate:git-drift-detected-x"},
+             {"id": "bare"}]
+    assert [g["id"] for g in rt.superseded_leases(goals, merged)] == ["older"]
+    assert rt.superseded_leases(goals, []) == []
+
+
+def test_last_disposal_is_the_latest_hand_close(tmp_path):
+    sig = rt.signal_for("v1.0.0")
+    world = _world(tmp_path, goals=[
+        {"id": "g-open", "status": "pending", "origin_signal": sig},
+        {"id": "g-early", "status": "completed", "origin_signal": sig,
+         "completed_at": "2026-09-20T10:00:00", "outcome_note": "decided: no release needed"},
+        {"id": "g-hand", "status": "skipped", "origin_signal": sig,
+         "completed_at": "2026-09-26T10:00:00",
+         "outcome_note": "not yet: the widget refactor must soak first"},
+        {"id": "g-probe", "status": "skipped", "origin_signal": sig,
+         "completed_at": "2026-09-27T10:00:00",
+         "outcome_note": f"{rt.PROBE_RETIRE_MARK}: a newer tag, v1.1.0, has been cut"},
+        {"id": "g-other-tag", "status": "skipped", "origin_signal": rt.signal_for("v0.9.0"),
+         "completed_at": "2026-09-27T11:00:00", "outcome_note": "another tag"},
+    ])
+    # A line that is not an aspiration object must not raise (the --nudge contract).
+    with (world / "aspirations.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps([sig]) + "\n")
+    got = rt.last_disposal(world, None, sig)
+    assert got["id"] == "g-hand" and got["_source"] == "world"
+    assert [g["id"] for g in rt.open_release_goals(world)] == ["g-open"]
+    assert rt.last_disposal(world, None, rt.signal_for("v9.9.9")) is None
+    assert rt.last_disposal(tmp_path / "absent", None, sig) is None
+
+
+def test_held_until_holds_only_inside_the_window():
+    now = datetime(2026, 9, 27, 12, 0, 0)
+    prior = {"completed_at": "2026-09-27T02:00:00"}
+    assert rt.held_until(prior, 24, now=now) == "2026-09-28T02:00:00"
+    assert rt.held_until({"completed_at": "2026-09-26T11:00:00"}, 24, now=now) is None
+    assert rt.held_until(prior, 0, now=now) is None
+    assert rt.held_until(None, 24, now=now) is None
+    # An undatable close cannot hold the detector quiet.
+    assert rt.held_until({"completed_at": "garbled"}, 24, now=now) is None
+    assert rt.held_until({}, 24, now=now) is None
+    # A zoned stamp is read on the fleet's UTC clock.
+    assert rt.held_until({"completed_at": "2026-09-27T04:00:00+02:00"}, 24,
+                         now=now) == "2026-09-28T02:00:00"
+
+
+# ── 9. --nudge short-circuit ─────────────────────────────────────────────────
+
+def _load_cli():
+    spec = importlib.util.spec_from_file_location("release_train_check_cli", CLI)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _repo_at(root: Path, tag_date: str) -> Repo:
+    root.mkdir()
+    r = Repo(root)
+    r.commit("core/scripts/a.py", "base")
+    r.tag("v2.0.0", date=tag_date)
+    r.commit("core/scripts/b.py", "framework change past the tag")
+    r.push()
+    return r
+
+
+def test_nudge_does_not_read_the_goal_store_when_not_due(tmp_path, monkeypatch):
+    reads = []
+    monkeypatch.setattr(rt, "open_release_goals", lambda *a, **k: reads.append(a) or [])
+    cli = _load_cli()
+    world = _world(tmp_path, goals=[])
+    fresh = _repo_at(tmp_path / "fresh", _now_iso())
+    assert cli.main(["--nudge", "--repo", str(fresh.work), "--world-dir", str(world)]) == 0
+    assert reads == []
+    # Positive control: when due, the store IS read, so the stub can see a read.
+    due = _repo_at(tmp_path / "due", OLD)
+    assert cli.main(["--nudge", "--repo", str(due.work), "--world-dir", str(world)]) == 0
+    assert len(reads) == 1

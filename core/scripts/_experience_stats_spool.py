@@ -51,8 +51,106 @@ STAMP_NAME = "experience-stats.spool.last-flush"
 FLUSH_LOCK_NAME = "experience-stats.spool.flush.lock"
 SYNC_EXCLUDED_NAMES = (SPOOL_NAME, FLUSHING_NAME, STAMP_NAME)
 
+# SPOOL LAYOUT (). The spool now lives in a dot-dir BESIDE the store,
+# `agents/<agent>/.experience-stats/`, git-IGNORED (`.gitignore` names the dir
+# and the legacy flat names) and owncloud-excluded (the dir is pruned in
+# owncloud_sync._EXCLUDE_DIRS; the file basenames above remain in
+# _EXCLUDE_NAMES as the second layer).
+#
+# WHY THE MOVE. The legacy flat paths were git-TRACKED, so every Body's churn
+# commit carried its own box's spool and every worker-tip merge conflicted on
+# it (4 of 6 in  occ228; the --ours recipe lived on the occ219 note).
+# A naive `git rm --cached` + .gitignore on main would, at merge time on every
+# other box, DELETE that box's working-tree spool — destroying its un-flushed
+# increment queue. The rename option ('s description) avoids the
+# delete-of-live-data: the content MOVES into the ignored dir, the old tracked
+# file goes inert, and untracking it is then harmless.
+#
+# MIGRATION. `migrate_legacy(exp_path)` is idempotent and never raises. It is
+# called at the top of `record()` and `flush()`, so the FIRST new-code use of a
+# store relocates any legacy flat spool that still exists beside it: a plain
+# os.replace when the target is absent, an append-merge when the new path is
+# already accumulating (the line format is identical and the fold aggregates
+# all lines, so order is irrelevant), and a max() for the stamp. The FLUSH
+# LOCK is deliberately NOT migrated: `flush()` keeps it at the FLAT legacy
+# path in both layouts, so a same-box old-code drain and a new-code drain are
+# still mutually excluded by ONE lock. After a migration the flat spool is
+# gone, so an old-code drain sees an absent spool and returns "empty" before
+# touching the store — no double-apply either way.
+SPOOL_DIR_NAME = ".experience-stats"
+
 DEFAULT_MIN_INTERVAL_SECONDS = 3600
 DEFAULT_BURST_RECORDS = 500
+
+
+def migrate_legacy(exp_path):
+    """Relocate any legacy flat spool beside `exp_path` into SPOOL_DIR_NAME.
+
+    Idempotent; never raises (a counter must never fail its caller). Returns
+    the spool dir the rest of the module must use — the NEW layout whether or
+    not anything moved. See SPOOL_DIR_NAME for the hazard this exists to defuse.
+    """
+    base = _Path(exp_path).parent
+    new_dir = base / SPOOL_DIR_NAME
+    try:
+        if not base.exists():
+            # The store's own dir is absent, so the store cannot be there. Do
+            # NOT create a stray dot-dir in a nonexistent agent dir: returning
+            # the (nonexistent) dir makes record()'s open() fail and the
+            # caller take its legacy fallback, exactly as before the move.
+            return new_dir
+        # Always ensure the new layout exists when the store's dir is present:
+        # a fresh agent has no legacy file to trigger the mkdir, and record()
+        # appends without mkdir -p.
+        new_dir.mkdir(parents=True, exist_ok=True)
+        if not any((base / n).exists() for n in
+                   (SPOOL_NAME, FLUSHING_NAME, STAMP_NAME)):
+            return new_dir
+        for name in (SPOOL_NAME, FLUSHING_NAME, STAMP_NAME):
+            src = base / name
+            if not src.exists():
+                continue
+            dst = new_dir / name
+            if not dst.exists():
+                _os.replace(src, dst)
+                continue
+            if name == STAMP_NAME:
+                try:
+                    a = float(src.read_text().strip())
+                except (OSError, ValueError):
+                    a = None
+                try:
+                    b = float(dst.read_text().strip())
+                except (OSError, ValueError):
+                    b = None
+                if a is None and b is None:
+                    _os.replace(src, dst)  # both unreadable: new stamp stands
+                else:
+                    dst.write_text(str(max([t for t in (a, b) if t is not None])))
+                src.unlink()
+            else:
+                # BINARY append-merge: dst is opened text-mode (encoding=) but
+                # src is read bytes; mixing them raises TypeError, which the
+                # blanket except below would SWALLOW — aborting the migration
+                # mid-loop with the flat spool left in place and the stamp
+                # untouched. The line format is identical on both sides, so a
+                # byte-level append is order-irrelevant.
+                with open(dst, "ab") as f:
+                    with open(src, "rb") as s:
+                        f.write(s.read())
+                src.unlink()
+    except Exception:
+        pass  # the caller proceeds on the new layout either way
+    return new_dir
+
+
+def spool_dir(exp_path):
+    """The spool dir for `exp_path` (running the legacy migration first).
+
+    Public so tests and one-shot drain scripts pin the SAME layout the module
+    uses, instead of re-typing `store.parent / name` (g-306-523).
+    """
+    return migrate_legacy(exp_path)
 
 
 class _StoreUnavailable(Exception):
@@ -113,7 +211,7 @@ def record(exp_path, rec_id, counter, delta=1):
             "delta": int(delta),
             "ts": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         }, ensure_ascii=True)
-        with open(_Path(exp_path).parent / SPOOL_NAME, "a",
+        with open(spool_dir(exp_path) / SPOOL_NAME, "a",
                   encoding="utf-8") as f:
             f.write(line + "\n")
         return True
@@ -224,7 +322,7 @@ def flush(exp_path, min_interval_seconds=DEFAULT_MIN_INTERVAL_SECONDS,
     """
     try:
         exp_path = _Path(exp_path)
-        base = exp_path.parent
+        base = migrate_legacy(exp_path)
         spool = base / SPOOL_NAME
         flushing = base / FLUSHING_NAME
         stamp = base / STAMP_NAME
@@ -247,7 +345,10 @@ def flush(exp_path, min_interval_seconds=DEFAULT_MIN_INTERVAL_SECONDS,
 
     from storage_backend import LocalBackend
     lock = LocalBackend()
-    lock_path = base / FLUSH_LOCK_NAME
+    # The lock stays at the FLAT legacy path, not the dot-dir: an old-code
+    # drain (pre-migration box) locks the same file, so same-box old/new
+    # drains are still mutually excluded by ONE lock (see SPOOL_DIR_NAME).
+    lock_path = exp_path.parent / FLUSH_LOCK_NAME
     try:
         lock.acquire_lock(lock_path, timeout=1, stale_seconds=120)
     except Exception:

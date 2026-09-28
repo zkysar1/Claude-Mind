@@ -174,7 +174,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5k.16 | embedded-python-audit | deferrable | `py -3 core/scripts/embedded-python-audit.py` |
 | 0.5k.17 | tree-adjudication-scan | deferrable | `py -3 core/scripts/tree-adjudication-scan.py` |
 | 0.5k.18 | displaced-id-audit | deferrable | `py -3 core/scripts/displaced-id-audit.py` (~13s) |
-| 0.5k.19 | repo-hygiene-sweep | deferrable | `bash core/scripts/repo-hygiene-sweep.sh` (~77s — needs >=120s bound; g-115-8361) |
+| 0.5k.19 | repo-hygiene-sweep | deferrable | `bash core/scripts/repo-hygiene-sweep.sh` HOLD until g-115-8556 lands (guard-5885) |
 | 0.5k.20 | stalled-goal-ratchet | deferrable | `bash core/scripts/stalled-goal-ratchet.sh` (~60s — needs >=120s bound). The only lane bounding TOTAL non-executable time, not one block class. `--dry-run --json` for rows (summary on stderr) |
 | 0.5k.21 | domain-term-ratchet | deferrable | `bash core/scripts/domain-term-ratchet.sh` (.sh REQUIRED; ~90s). Registry-derived peer ids present in core but NOT blocklisted. Scoped to `environments/id` ON PURPOSE — the whole-census figure (~1358) is ~89% conventions-heading prose and must never be ratcheted. A census yielding ZERO registry ids reports `skipped` and leaves the baseline alone (g-115-10049) |
 

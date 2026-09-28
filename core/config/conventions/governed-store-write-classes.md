@@ -625,12 +625,14 @@ Note `test_daemon_cli_mirror_parity.py` does not cover this: it asserts
 `EMPTY_STATE` field-sets, not writer behaviour.
 
 **The general test is NOT "does the handler union one-sided keys".** Two cure
-shapes are both valid, and demanding the wrong one produces false findings:
+shapes are both valid, and demanding the wrong one produces false findings. A
+third applies to a DERIVED key, which a union-backfill alone leaves wrong:
 
 | shape | example | conserves because |
 |---|---|---|
 | enumerate every schema key | `merge_team_state` overrides all 5 merge-worthy top-level keys after its LWW base | no named key's fate depends on which side won; only opaque/future keys ride along, deliberately |
 | union-backfill the key set | `_merge_goal` / `_merge_aspiration_record` loop `sorted(set(a) | set(b))` | a key absent from the base is taken from whichever side has it |
+| re-derive a DERIVED key | `_merge_aspiration_record` `progress`, via the writer's own `derive_progress` (g-306-532) | the value is a function of fields merged from BOTH sides, so no single side's copy describes the merged record |
 
 `_merge_strategic_focus` did NEITHER — its 5 schema keys were neither enumerated
 nor unioned — which is the actual defect signature. So the question to ask of any
@@ -1052,6 +1054,25 @@ write never took.
   2026-09-24 (guard-4294).
 - The fence cures a wedge only on a box that WRITES this file (guard-6190), which
   means every box that runs the pull with `--apply`.
+
+#### Transition dedup (g-370-68, 2026-09-28, alpha worker Body, hostname cc-08, `uname -r` 6.8.0-142-generic, own-cloud)
+
+**A second removal path, and a second reason no handler may be registered.** The key
+format is unchanged, but the ledger now holds ONE key per recipe, its LAST-ANNOUNCED
+verdict: a stamp retires the recipe's other verdict key inside the same fenced cycle.
+The membership design it replaced announced each verdict value at most once per
+recipe, so FAILED -> PROD-VERIFIED -> FAILED suppressed the second FAILED, the
+direction "The suppression direction" above says must never fail. A key-union
+handler would now also resurrect the retired key, leaving the recipe with two
+verdicts and re-arming exactly that suppression.
+
+**Stamp order is decided in the cycle** (guard-5322). A stamp older than an
+announcement the ledger already holds for the recipe is dropped, not applied, and an
+applied stamp REPLACES the recipe's key, so its value is the latest announcement (the
+`setdefault` above kept the first). Tests: `world/scripts/tests/test_operator_verdict_transitions.py`,
+mutation-proven on copies: the pre-change writer and one-rule reverts of retirement,
+the stale-stamp drop, the later-stamp read of a two-key legacy recipe, and
+newest-completion-decides each turn at least one test red.
 
 ## Cross-references
 

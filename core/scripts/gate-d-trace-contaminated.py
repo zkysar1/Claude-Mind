@@ -52,6 +52,35 @@ import sys
 
 MIN_OVERLAP = 2  # distinctive shared tokens between retrieval category and tainted entry
 
+# The record reader's one seam (g-358-220 outcome 3): the trace store is the
+# legacy file PLUS date segments, and this is the only path a reader of trace
+# rows takes. Imported at module level (not inside main) so the
+# segment-starvation control can monkeypatch it back to the pre-seam
+# single-file join; _retrieval_trace is stdlib-only, so the import has no
+# daemon/world-resolution cost (Decision #58 is about _paths, not this).
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
+from _retrieval_trace import trace_paths  # noqa: E402
+
+
+def _read_trace_rows(world):
+    """Every retrieval-trace row in `world` — legacy file + date segments,
+    oldest-first, through the shared seam.
+
+    Pre-seam this was a single hardcoded `retrieval-trace.jsonl` join. The
+    moment a segmented writer lands (g-358-220 outcome 4), that join starves
+    this tracer to the legacy window while the new rows live in segments —
+    silently, because no live segment exists to expose it yet (the property
+    board-reader-segment-starvation exists for). Routing through
+    `trace_paths` makes the reader and the writer halves of the contract one
+    definition apart.
+    """
+    rows = []
+    for p in trace_paths(world):
+        rows.extend(_read_jsonl(str(p)))
+    return rows
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOP = {
     "the", "and", "for", "are", "was", "with", "this", "that", "from", "have",
@@ -157,8 +186,7 @@ def main():
     if tainted:
         first_taint_ts = min(ts for _, _, ts in tainted if ts) if any(
             ts for _, _, ts in tainted) else ""
-        trace_path = os.path.join(world, "retrieval-trace.jsonl")
-        traces = _read_jsonl(trace_path)
+        traces = _read_trace_rows(world)
         if traces:
             # 3) category+time-aware match (conservative: categories, not record ids)
             by_pair = {}

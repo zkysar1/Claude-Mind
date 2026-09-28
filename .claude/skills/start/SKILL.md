@@ -774,7 +774,7 @@ DONE.
 
      **CW1a — force-fresh the canonical WM from the shared store.** The fork must
      start from the reducer's LATEST push, not this box's read-through cache:
-     Bash: `bash core/scripts/owncloud-pull.sh --agent <agent-name> --only working-memory.yaml; echo "CW1A_FRESH_RC=$?"`
+     Bash: `CW1A_OUT="$(bash core/scripts/owncloud-pull.sh --agent <agent-name> --only working-memory.yaml 2>&1)"; CW1A_FRESH_RC=$?; printf '%s\n' "$CW1A_OUT"; case "$CW1A_OUT" in *" local_ahead=0 "*) ;; *" local_ahead="*) [ "$CW1A_FRESH_RC" -eq 0 ] && CW1A_FRESH_RC=3 ;; esac; echo "CW1A_FRESH_RC=$CW1A_FRESH_RC"`
      (Same sanctioned path the `/start` IDLE branch already uses, narrowed by `--only`
      (g-115-3074) — no new writer. It REPLACES a redirect-plus-rename shell copy that
      `bash-store-write-guard` correctly refuses (guard-996: a temp-file-then-rename IS
@@ -783,14 +783,12 @@ DONE.
      local tree IS the store. Under own-cloud the local tree is a read-through CACHE
      (guard-980), and forking a stale mirror hands the reducer a merge baseline that
      existed on neither box; `pull_continuity` records the new baseline so the file
-     ends in-sync, not diverged (guard-4681).
-     ⚠ KNOWN LIMIT: the pull is conflict-guarded and will NOT clobber unpushed local
-     writes, so a box left dirty by a prior reducer life can report `pulled=0` and
-     stay stale — the safer failure. **g-306-378** tracks the deeper defect: the
-     both-diverged LOCAL-WINS branch pushes a stale mirror over live reducer state,
-     its single-writer premise being false under a cross-box fork. Read
-     `CW1A_FRESH_RC` and the `pulled=` / `in_sync=` counters; non-zero rc HALTS —
-     proceeding forks from the stale cache.)
+     ends in-sync, not diverged (guard-4681).)
+     Non-zero `CW1A_FRESH_RC` HALTS, except `3` = `local_ahead>0`: the pull skipped a
+     locally-diverged copy and exited 0 unrefreshed, and forking it is g-306-494. On
+     `3` run CW1a-adopt (`load-conventions.sh working-memory`): adopt the store only on
+     a proven three-way divergence, archive-first, ending on `[match]`; else HALT.
+     **g-306-378** tracks the deeper LOCAL-WINS push defect under a cross-box fork.
 
      **CW1b — write the worker body manifest** (forces the fork):
      Bash: `bash core/scripts/body-manifest.sh write --sid "$MIND_SID" --agent <agent-name> --role worker --reducer-sid remote`

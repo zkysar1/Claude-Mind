@@ -83,6 +83,7 @@ import datetime
 import json
 import os
 import pathlib
+import subprocess
 import sys
 
 # Defaults chosen AGAINST the measured incident rather than picked round.
@@ -105,9 +106,13 @@ DEFAULT_MIN_STALLED_SECONDS = 900.0
 VERDICT_HOLD = "hold"
 VERDICT_PAUSE = "pause"
 VERDICT_STOP = "stop"
+#: The WORKER sibling's decisive rung (). decide() never returns it:
+#: a worker Body must never write the agent-wide stop signal, which the reducer
+#: on another machine reads, so its last rung PARKS the Body instead.
+VERDICT_PARK = "park"
 
 # rc mirrors the verdict so a shell caller can branch without parsing JSON.
-RC_BY_VERDICT = {VERDICT_HOLD: 0, VERDICT_PAUSE: 1, VERDICT_STOP: 2}
+RC_BY_VERDICT = {VERDICT_HOLD: 0, VERDICT_PAUSE: 1, VERDICT_STOP: 2, VERDICT_PARK: 3}
 
 #: Every verdict stop-hook.sh writes at a turn-end.  Built from the EMITTER's
 #: format strings, not from prose (guard-4285): the hook writes
@@ -292,6 +297,257 @@ def compute_streak(log_path, sid, diary_path, now=None):
     return (streak, max(0.0, (now - advanced).total_seconds()))
 
 
+# --- The WORKER sibling () ----------------------------------------
+#
+# MEASURED: alpha worker Body on cc-09, SID 1f257cc9, logged 205 worker-net
+# BLOCKs between 2026-09-24T18:51 and 09-26T18:09 while holding no claim, each
+# answered with a sleep, and nothing stepped in -- stop-hook.sh's worker-net
+# branch exits before either call site of decide(), so the user directive
+# behind  never reached a worker. Three things differ for a worker,
+# one per design constraint of the goal:
+#   (a) its decisive rung PARKS the Body (body-manifest.py park: resumable, on
+#       the park orbit, expiring at PARK_MAX_HOURS). It never writes the
+#       agent-wide stop signal, which stops the REDUCER on another machine.
+#   (b) its predicate is "no claim held by this SID", not a frozen diary. A
+#       worker writes the SHARED agent-wide diary (execution-diary.sh has no
+#       per-Body routing), so a live reducer or sibling Body would keep
+#       resetting a diary anchor and the fence would never fire; and while a
+#       claim IS held, diary age equals unit duration. A held claim HOLDS
+#       whatever the count.
+#   (c) the park ALERTS (a notifying stop-reason path plus a board post): a
+#       stall-park is a defect signal, not the quiet reducer-gone park.
+#
+# THE STREAK is worker-net BLOCKs for this sid since the Body last touched a
+# goal record (claim, release, close): the latest ACTIVITY_FIELDS value over
+# the goals whose executed_by_sid is this sid. A Body that keeps claiming work
+# moves the anchor every unit, however often it text-dies between units; a
+# Body that holds nothing and claims nothing does not.
+#
+# ONLY BLOCKs COUNT, deliberately and not as the  lesson forgotten:
+# every remedy this ladder asks for LEAVES the stall -- a claim moves the
+# anchor, a park takes the Body out of the worker-net branch (the park valve
+# ALLOWs above it) -- so adopting a remedy cannot hide a stalled Body's
+# turn-ends as uncounted ALLOWs. If  gives workers an ALLOW that a
+# stalled Body can sit on (tracked background jobs), add it to the match.
+
+WORKER_NET_TURN_END = " BLOCK gate=worker-net "
+
+#: A goal in one of these states is NOT a live claim. Anything else -- including
+#: a status this set does not know -- counts as held, which HOLDS.
+TERMINAL_GOAL_STATUSES = frozenset(
+    {"completed", "skipped", "expired", "decomposed", "superseded"})
+
+#: The record timestamps that mark a Body touching a goal. `started` is left out
+#: on purpose: it is date-only, reads as midnight, and would move the anchor
+#: EARLIER -- the direction that fires the fence sooner.
+ACTIVITY_FIELDS = ("last_modified", "completed_at", "claimed_at")
+
+
+def claim_held(rows, sid):
+    """True when `rows` (a claimed_by_sid query result) holds a live claim.
+
+    None when the answer is unusable -- not a list, a non-dict row, or a row
+    claimed by a DIFFERENT sid (the store answered another question) -- so
+    decide_worker() holds.
+    """
+    if not sid or not isinstance(rows, list):
+        return None
+    held = False
+    for row in rows:
+        if not isinstance(row, dict) or row.get("claimed_by_sid") != sid:
+            return None
+        if str(row.get("status") or "").strip() not in TERMINAL_GOAL_STATUSES:
+            held = True
+    return held
+
+
+def _naive(when):
+    """Naive UTC wall time, the fleet's timestamp convention (CLAUDE.md)."""
+    if when.tzinfo is not None:
+        when = when.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return when
+
+
+def last_activity(rows, sid):
+    """(anchor, readable) from an executed_by_sid query result.
+
+    `anchor` is the latest ACTIVITY_FIELDS timestamp over the rows, or None when
+    this Body never touched a goal -- then every worker-net BLOCK counts, as
+    with the reducer's no-diary rule. `readable` is False when the answer is
+    unusable, so the caller holds.
+    """
+    if not sid or not isinstance(rows, list):
+        return (None, False)
+    anchor = None
+    for row in rows:
+        if not isinstance(row, dict) or row.get("executed_by_sid") != sid:
+            return (None, False)
+        for field in ACTIVITY_FIELDS:
+            raw = row.get(field)
+            if not raw:
+                continue
+            try:
+                when = _naive(datetime.datetime.fromisoformat(str(raw)))
+            except ValueError:
+                continue
+            anchor = when if anchor is None else max(anchor, when)
+    return (anchor, True)
+
+
+def compute_worker_streak(log_path, sid, anchor, now=None):
+    """Worker-net BLOCKs for `sid` at or after `anchor` -> (streak, stalled_seconds).
+
+    The stall is measured from `anchor`, or from the first counted BLOCK when
+    the Body never touched a goal (anchor None). (None, None) when the sid is
+    empty or the log unreadable, so decide_worker() holds.
+    """
+    if not sid:
+        return (None, None)
+    try:
+        text = pathlib.Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError, TypeError):
+        return (None, None)
+
+    needle = "sid=" + sid + " "
+    streak = 0
+    first_block = None
+    for line in text.splitlines():
+        if WORKER_NET_TURN_END not in line or needle not in line:
+            continue
+        try:
+            when = datetime.datetime.fromisoformat(line.split(" ", 1)[0])
+        except ValueError:
+            continue
+        if anchor is not None and when < anchor:
+            continue
+        streak += 1
+        first_block = when if first_block is None else min(first_block, when)
+
+    start = anchor if anchor is not None else first_block
+    if start is None:
+        return (0, 0.0)
+    now = now or datetime.datetime.now()
+    return (streak, max(0.0, (now - start).total_seconds()))
+
+
+_WORKER_CAUSE_NOTE = " [proven: no claim held and no goal activity. cause NOT established]"
+
+
+def decide_worker(
+    held,
+    streak,
+    stalled_seconds,
+    *,
+    pause_threshold=DEFAULT_PAUSE_THRESHOLD,
+    stop_threshold=DEFAULT_STOP_THRESHOLD,
+    min_stalled_seconds=DEFAULT_MIN_STALLED_SECONDS,
+):
+    """The worker ladder: hold / pause / park. Pure; never raises, never writes.
+
+    Same thresholds and wall-clock floor as decide(), gated first on the claim:
+    an unreadable claim store HOLDS, and a held claim HOLDS whatever the count.
+    """
+    result = {
+        "role": "worker",
+        "verdict": VERDICT_HOLD,
+        "reason": "",
+        "claim_held": held,
+        "streak": streak,
+        "stalled_seconds": stalled_seconds,
+        "pause_threshold": pause_threshold,
+        "stop_threshold": stop_threshold,
+    }
+
+    def _out(verdict, reason):
+        result["verdict"] = verdict
+        result["reason"] = reason
+        result["rc"] = RC_BY_VERDICT[verdict]
+        return result
+
+    if held is None:
+        return _out(VERDICT_HOLD, "claim store unreadable; holding (fail-safe)")
+    if held:
+        return _out(VERDICT_HOLD, "this Body holds a live claim; a held claim is never fenced")
+    if streak is None or stalled_seconds is None:
+        return _out(VERDICT_HOLD, "stall signal unreadable; holding (fail-safe)")
+    try:
+        streak = int(streak)
+        stalled_seconds = float(stalled_seconds)
+    except (TypeError, ValueError):
+        return _out(VERDICT_HOLD, "stall signal unparseable; holding (fail-safe)")
+    if stop_threshold <= pause_threshold:
+        return _out(
+            VERDICT_HOLD,
+            "thresholds misconfigured (stop_threshold %s <= pause_threshold %s); holding"
+            % (stop_threshold, pause_threshold),
+        )
+    if streak < pause_threshold:
+        return _out(VERDICT_HOLD, "streak %d < pause_threshold %d" % (streak, pause_threshold))
+    if stalled_seconds < min_stalled_seconds:
+        return _out(
+            VERDICT_HOLD,
+            "streak %d reached but only %.0fs without goal activity "
+            "(< %.0fs floor)" % (streak, stalled_seconds, min_stalled_seconds),
+        )
+    if streak >= stop_threshold:
+        return _out(
+            VERDICT_PARK,
+            "worker-net BLOCK #%d for this Body, holding no claim, %.0fs without "
+            "goal activity (>= stop_threshold %d): the pause rung did not "
+            "restore a claim" % (streak, stalled_seconds, stop_threshold)
+            + _WORKER_CAUSE_NOTE,
+        )
+    return _out(
+        VERDICT_PAUSE,
+        "worker-net BLOCK #%d for this Body, holding no claim, %.0fs without "
+        "goal activity (>= pause_threshold %d; the fence parks this Body at "
+        "#%d)" % (streak, stalled_seconds, pause_threshold, stop_threshold)
+        + _WORKER_CAUSE_NOTE,
+    )
+
+
+def _query_goals(field, value, timeout=20):
+    """Rows from `aspirations-query.sh --goal-field <field> <value> --full`.
+
+    None on any failure (daemon down, non-zero rc, non-JSON output), which
+    reads as unreadable and holds. That includes the daemon's
+    `unknown_goal_field` refusal, which it returns when NO record in the queried
+    queues carries the key. A close REMOVES claimed_by_sid, so a queue where
+    nobody holds a claim cannot answer, and the fence holds until one does.
+    That is deliberate: a renamed field must never read as "no claim held".
+    """
+    script = pathlib.Path(__file__).resolve().parent / "aspirations-query.sh"
+    try:
+        from _runtime_bash import bash_cmd
+        proc = subprocess.run(
+            bash_cmd(script, "--goal-field", field, value, "--full"),
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except Exception:  # noqa: BLE001 -- an unreachable store holds, never raises
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        rows = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def evaluate_worker(sid, log_path, *, query=_query_goals, now=None, **thresholds):
+    """Read both stores and decide. The claim is checked first, so a Body that
+    holds one never pays for the second query or the log read."""
+    held = claim_held(query("claimed_by_sid", sid), sid) if sid else None
+    if held is not False:
+        return decide_worker(held, None, None, **thresholds)
+    anchor, readable = last_activity(query("executed_by_sid", sid), sid)
+    if readable:
+        streak, stalled = compute_worker_streak(log_path, sid, anchor, now=now)
+    else:
+        streak, stalled = None, None
+    return decide_worker(False, streak, stalled, **thresholds)
+
+
 def _int_env(name, default):
     try:
         v = os.environ.get(name)
@@ -310,6 +566,10 @@ def _float_env(name, default):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    # `worker` is the  sibling: decide_worker() over the claim store
+    # and this sid's worker-net BLOCKs. The default keeps the reducer path
+    # byte-identical to what it was before the flag existed.
+    p.add_argument("--role", choices=("reducer", "worker"), default="reducer")
     p.add_argument("--sid", default=os.environ.get("HOOK_SID", ""))
     p.add_argument("--log", default=os.environ.get("HOOK_LOG", ""))
     p.add_argument("--diary", default="")
@@ -331,6 +591,17 @@ def main(argv=None):
         default=_float_env("LOOP_EXHAUSTION_MIN_STALLED_SECONDS", DEFAULT_MIN_STALLED_SECONDS),
     )
     args = p.parse_args(argv)
+
+    if args.role == "worker":
+        out = evaluate_worker(
+            args.sid,
+            args.log,
+            pause_threshold=args.pause_threshold,
+            stop_threshold=args.stop_threshold,
+            min_stalled_seconds=args.min_stalled_seconds,
+        )
+        print(json.dumps(out))
+        return out["rc"]
 
     streak, stalled = compute_streak(args.log, args.sid, args.diary)
     out = decide(

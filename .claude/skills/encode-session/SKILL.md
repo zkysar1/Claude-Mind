@@ -199,16 +199,20 @@ For each domain topic discussed with substantive new content:
   IF a node exists AND content is genuinely new (not already covered):
     Read the node file
     Edit the node — append to "Key Insights" or relevant section
-    Update front matter: last_updated = today,
-                        last_update_trigger = {type: "encode-session"}
-    # last_update_trigger MUST be the dict form {type: "..."}, NOT a bare
-    # string. T21 (tree-front-matter-sync.py) REFUSES to sync a string trigger
-    # and silently leaves _tree.yaml's last_updated stale — the 2026-06-04
-    # drift incident (node windows-maxpath-pathresolution lagged 5 months) was
-    # THIS lane writing the string form. The inline {type: ...} form is fine:
-    # T21 bumps last_updated for both the .md FM and _tree.yaml; it skips the
-    # session/source auto-fill for inline form (Layer B /tree edit fills those).
-    # Matches Lane 1.6's {type: "debt-reconciliation"} form.
+    Update front matter: last_updated = today, and the trigger in BLOCK form:
+                          last_update_trigger:
+                            type: encode-session
+    # BLOCK form: never a bare string, never the one-line {type: ...} dict.
+    # T21 (tree-front-matter-sync.py) REFUSES a string trigger and silently
+    # leaves _tree.yaml's last_updated stale — the 2026-06-04 drift incident
+    # (node windows-maxpath-pathresolution lagged 5 months) was THIS lane
+    # writing the string form. On a one-line dict T21 syncs the date but never
+    # stamps it: only a block-form trigger gets `session: <SID>`, the key
+    # tree-edit-since.py attributes by. This lane's one-line form left every
+    # encode-session edit unstamped, so a concurrent session's stuck edit was
+    # handed to the wrong session's Final.5 read-back (2026-09-27, g-115-8448).
+    # If the node already carries a string or one-line trigger, replace it in
+    # the same Edit. Lane 1.6's debt-reconciliation trigger takes the same form.
     # No explicit tree-update.sh --set last_updated call — the PostToolUse
     # hook (T21) fires on every tree-node Edit and, given the dict trigger,
     # atomically bumps BOTH the .md front matter AND _tree.yaml's
@@ -366,6 +370,44 @@ non-trivial diagnosis) that future readers would benefit from re-reading:
     # Q&A); full type list + schema in the experience convention (loaded via
     # front matter). The .md front matter type is free-form; the JSON is not.
   Print: ENCODED experience:<experience_id>  (only after the grep confirms 1)
+
+  NO_CLAIM BRANCH (g-115-10122): the add returned {"error":"no_claim"}, grep → 0.
+  experience.jsonl is an AGENT-DIR store: on an own-cloud world only the box
+  holding the agent's live runner claim may write it. The refusal is
+  STRUCTURAL ("NO retry or refresh can EVER succeed from here"): NEVER retry
+  the add, never refresh-and-retry. Keep the .md (git-tracked; Phase Final.5
+  pushes it), then deliver in this order:
+    1. ON THE HOLDER, when you can reach its box. Name it fresh with
+       `bash core/scripts/runner-claim.sh status` (the holder MOVES; never
+       reuse a remembered host) and run the SAME add there over this world's
+       documented route to that box (world/conventions/fleet-topology.md).
+       Pipe the JSON over stdin, never inline it in the remote argv, and
+       confirm with the grep -c run THERE → 1. The holder validates
+       content_path on ITS disk, so until it has pulled the Final.5 push the
+       add fails validation_failed: wait for its pull, never copy the file in
+       by hand. Print: ENCODED experience:<experience_id> (on <holder>)
+    2. ELSE RELAY AS A GOAL, never as a board post alone: a board relay is not
+       a delivery lane (five board-relayed deliverables measured undelivered
+       5-21h later, g-115-10122). File a world goal with intended_agent and
+       handoff_to set to <agent>, carrying the FULL add payload inline in its
+       description (guard-3670), the pull-first precondition, the grep -c
+       confirm, and an idempotency note (the store is append-only; a second
+       add duplicates silently). A board post naming the goal is optional
+       visibility, never the delivery.
+       Print: RELAYED experience:<experience_id> as <goal-id>
+  World-store lanes (tree, reasoning bank, guardrails, patterns, world goals,
+  board) are NOT fenced: continue the pass. One refused agent-dir write never
+  aborts encoding.
+  This skill's OTHER agent-dir writes (checked 2026-09-28, g-115-10122):
+    - wm-set / wm-append (1.6 knowledge_debt write-back, 4.3 micro_hypotheses,
+      Return Protocol assistant_turn_count) and 1.6's execution-diary append
+      are raw LOCAL writes: never refused (rc 0), and never pushed from a
+      non-holder box (the sync sweep pushes only agent dirs this box holds).
+      Harmless for the turn counter. For 1.6 it means nothing was resolved FOR
+      THE AGENT, so report that sweep as LOCAL-ONLY, not resolved.
+    - Lane 2 filing with --source agent is fenced exactly like the add: file
+      it --source world with intended_agent set instead.
+    - self.md (Lane 7) and the experience .md travel by git (Phase Final.5).
 ELSE (pure Q&A, trivial chat): SKIP.
 ```
 
@@ -388,7 +430,7 @@ Apply digest Section E's algorithm VERBATIM (HIGH-first, then oldest):
   → null-key goal-routing (the MAJORITY shape; derive asp-<NNN> from the
     goal id; NEVER resolve null-key debt on age)
   → inline resolution when HIGH or sessions_deferred >= 2
-    (last_update_trigger: {type: "debt-reconciliation"})
+    (block-form trigger, `type: debt-reconciliation` — see Lane 1.1)
   → durable-drop at ceiling 10: execution-diary BEFORE removal, and a
     HIGH debt at ceiling ALSO files a MEDIUM Investigate
   → self-filtered write-back via wm-set (wm-prune cannot reach this slot).
@@ -954,11 +996,17 @@ Bash: bash core/scripts/iteration-push.sh
 #    elsewhere). Step 2 pushed the git-tracked half; nothing above proves the
 #    world/ half LANDED. This HEADs every tree node this session attributed
 #    to itself (tree-edit-since.py) against the authoritative object and
-#    re-reads the streak verdict AFTER the flush has had its chance. rc=1
-#    (DRIFT or WEDGED) means an "ENCODED tree:<key>" line printed above was
-#    FALSE — repair now (rb-9443 recipe), re-run until OK, and say so in the
-#    summary. rc=2 (blind) is not clean. Never lets a failure block the
-#    terminal call. Sibling of Phase 1 step 1b (entry) — entry catches a
+#    re-reads the streak verdict AFTER the flush has had its chance. On rc=1
+#    (DRIFT or WEDGED), check WHOSE each named node is before repairing: the
+#    list also carries every UNSTAMPED node edited since session_start (the
+#    no-stamp fail-open, tree-edit-since.py docstring). A node is yours only
+#    if `grep -m1 -E '^\s*session:' <node>` prints this $MIND_SID. Yours → an
+#    "ENCODED tree:<key>" line printed above was FALSE — repair now (rb-9443
+#    recipe), re-run until OK, and say so in the summary. Unstamped or another
+#    SID → someone else's stuck edit, not your failed encoding: file it in the
+#    MirrorWedgeProbe shape (g-115-11189) and say so. rc=2 (blind) is not clean.
+#    Never lets a failure block the terminal call. Sibling of Phase 1 step 1b
+#    (entry) — entry catches a
 #    wedge before Lane 1 builds on it, exit catches one this session caused.
 #    Cost: one remote HEAD per attributed node, ~3-4s each (measured
 #    2026-08-27: 53 nodes in 3m18s) — run it in the foreground, it is the
@@ -977,6 +1025,13 @@ step 1b) are likewise encode-session-ONLY: the loop already runs
 MirrorWedgeProbe from the watchdog tick every iteration. The remaining gap is
 the hook-level gate for chat mode (SessionStart banner / PreToolUse[Edit]
 advisory on a frozen node) — tracked by g-115-8029, not by this skill.
+
+The Lane 1.5 NO_CLAIM BRANCH (g-115-10122) is likewise NOT mirrored into
+`/aspirations-spark`. That skill runs only in the reducer's loop, which holds
+the runner claim by construction, so its experience add is never refused
+`no_claim` and the branch would be unreachable there. A worker Body never runs
+`/aspirations-spark` either: its hand-off is worker-loop Phase 3.6
+`exp_capture`, a write to its own Body WM that needs no claim.
 
 ## Chaining
 

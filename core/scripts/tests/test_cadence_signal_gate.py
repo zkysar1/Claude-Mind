@@ -161,3 +161,133 @@ def test_probe_exception_fails_open(monkeypatch):
 
     monkeypatch.setitem(cadence_signals.SIGNAL_REGISTRY, "t_boom", _boom)
     assert cadence_signals.evaluate_cadence_signal("t_boom", {}) is True
+
+
+# --------------------------------------------------------------------------
+# Pass memory in cadence_signals.py (): a record the goal's last
+# completed pass already saw and HELD does not re-fire the signal until the
+# goal's interval elapses;
+# a record that became eligible after that pass fires it at once.
+# Offsets are whole hours or days with wide margins, so no case straddles a
+# date boundary whatever time of day the suite runs (guard-566).
+# --------------------------------------------------------------------------
+
+def _eval_with(monkeypatch, signal, goal, records):
+    cadence_signals.clear_cache()
+    monkeypatch.setattr(cadence_signals, "_iter_pipeline", lambda: iter(records))
+    return cadence_signals.evaluate_cadence_signal(signal, goal)
+
+
+def _due_rec(due_days_ago, formed_at=None, stage="active"):
+    today = datetime.now().date()
+    return {"id": "h-due", "stage": stage,
+            "resolves_by": (today - timedelta(days=due_days_ago)).isoformat(),
+            "formed_date": (today - timedelta(days=30)).isoformat(),
+            "formed_at": formed_at or _iso(datetime.now() - timedelta(days=30))}
+
+
+def _resolved_rec(resolved_hours_ago, outcome="CONFIRMED"):
+    return {"id": "h-res", "stage": "resolved", "outcome": outcome, "reflected": False,
+            "resolved_at": _iso(datetime.now() - timedelta(hours=resolved_hours_ago))}
+
+
+def _passed(hours_ago, interval, gid):
+    return _rec_goal(gid, interval_hours=interval,
+                     lastAchievedAt=_iso(datetime.now() - timedelta(hours=hours_ago)))
+
+
+RESOLVABLE = "resolvable_hypotheses_present"
+UNREFLECTED = "unreflected_hypotheses_present"
+
+
+def test_resolvable_held_record_seen_by_last_pass_does_not_fire(monkeypatch):
+    # Due 2 days ago, formed 30 days ago; the pass 1h ago already saw it.
+    goal = _passed(1, 60, "g-mem-r1")
+    assert _eval_with(monkeypatch, RESOLVABLE, goal, [_due_rec(2)]) is False
+
+
+def test_resolvable_held_record_refires_once_interval_elapsed(monkeypatch):
+    goal = _passed(61, 60, "g-mem-r2")
+    assert _eval_with(monkeypatch, RESOLVABLE, goal, [_due_rec(3)]) is True
+
+
+def test_resolvable_record_due_after_last_pass_fires(monkeypatch):
+    # The pass ran 49h ago (two or three dates back); the record fell due
+    # yesterday, a date after the pass, so the pass could not have seen it.
+    goal = _passed(49, 60, "g-mem-r3")
+    assert _eval_with(monkeypatch, RESOLVABLE, goal, [_due_rec(1)]) is True
+
+
+def test_resolvable_record_formed_after_last_pass_fires(monkeypatch):
+    goal = _passed(2, 60, "g-mem-r4")
+    fresh = _due_rec(5, formed_at=_iso(datetime.now() - timedelta(minutes=30)))
+    assert _eval_with(monkeypatch, RESOLVABLE, goal, [fresh]) is True
+
+
+def test_resolvable_no_due_record_stays_absent_past_the_floor(monkeypatch):
+    goal = _passed(100, 60, "g-mem-r5")
+    not_due = _due_rec(-3)  # resolves_by three days from now
+    assert _eval_with(monkeypatch, RESOLVABLE, goal, [not_due]) is False
+
+
+def test_no_usable_pass_stamp_behaves_as_before_memory(monkeypatch):
+    # Never passed, or the stamp is the precondition sweep's shelve (not a pass).
+    never = _rec_goal("g-mem-r6")
+    assert _eval_with(monkeypatch, RESOLVABLE, never, [_due_rec(2)]) is True
+    stamp = _iso(datetime.now() - timedelta(hours=1))
+    shelved = _rec_goal("g-mem-r7", interval_hours=60, lastAchievedAt=stamp,
+                        last_shelved_at=stamp)
+    assert _eval_with(monkeypatch, RESOLVABLE, shelved, [_due_rec(2)]) is True
+
+
+def test_unreflected_ignores_outcomes_that_cannot_be_reflected(monkeypatch):
+    # No pass memory and the floor long elapsed: only the outcome filter decides.
+    recs = [_resolved_rec(0.5, "UNRESOLVABLE"), _resolved_rec(0.5, "EXPIRED"),
+            _resolved_rec(0.5, None)]
+    assert _eval_with(monkeypatch, UNREFLECTED, _rec_goal("g-mem-u1"), recs) is False
+
+
+def test_unreflected_held_record_seen_by_last_pass_does_not_fire(monkeypatch):
+    # Resolved 5h ago; the pass 1h ago saw it and abstained (guard-5623).
+    goal = _passed(1, 6.75, "g-mem-u2")
+    assert _eval_with(monkeypatch, UNREFLECTED, goal, [_resolved_rec(5)]) is False
+
+
+def test_unreflected_newly_resolved_reflectable_record_fires(monkeypatch):
+    goal = _passed(1, 6.75, "g-mem-u3")
+    assert _eval_with(monkeypatch, UNREFLECTED, goal,
+                      [_resolved_rec(5), _resolved_rec(0.5, "CORRECTED")]) is True
+
+
+def test_unreflected_held_record_refires_once_interval_elapsed(monkeypatch):
+    goal = _passed(7, 6.75, "g-mem-u4")
+    assert _eval_with(monkeypatch, UNREFLECTED, goal, [_resolved_rec(9)]) is True
+
+
+def test_verdict_is_cached_per_goal_not_per_signal(monkeypatch):
+    records = [_due_rec(2)]
+    cadence_signals.clear_cache()
+    monkeypatch.setattr(cadence_signals, "_iter_pipeline", lambda: iter(records))
+    held = _passed(1, 60, "g-mem-c1")
+    fresh = _rec_goal("g-mem-c2")
+    assert cadence_signals.evaluate_cadence_signal(RESOLVABLE, held) is False
+    assert cadence_signals.evaluate_cadence_signal(RESOLVABLE, fresh) is True
+
+
+def test_pipeline_is_read_once_per_process(monkeypatch):
+    reads = []
+    monkeypatch.setattr(cadence_signals, "_read_pipeline",
+                        lambda: reads.append(1) or [{"id": "h-1"}])
+    cadence_signals.clear_cache()
+    assert [h["id"] for h in cadence_signals._iter_pipeline()] == ["h-1"]
+    assert [h["id"] for h in cadence_signals._iter_pipeline()] == ["h-1"]
+    assert len(reads) == 1
+    cadence_signals.clear_cache()
+    list(cadence_signals._iter_pipeline())
+    assert len(reads) == 2
+
+
+def test_interval_hours_mirrors_goal_selector():
+    for goal in ({"interval_hours": 60}, {"interval_hours": 1.995},
+                 {"remind_days": 2}, {"interval_hours": 6.75, "remind_days": 9}, {}):
+        assert cadence_signals._interval_hours(goal) == float(gs.get_interval_hours(goal))

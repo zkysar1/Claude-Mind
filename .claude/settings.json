@@ -2,7 +2,6 @@
   "permissions": {
     "allow": [
       "Bash(mkdir -p .claude/skills/*)",
-      "Write(**/.claude/skills/**)",
       "Monitor(*)",
       "Edit(**/.claude/skills/**)"
     ],
@@ -49,7 +48,8 @@
     "GATE_FIRINGS_SEGMENTED": "1",
     "PRODUCTIVITY_SNAPSHOTS_SEGMENTED": "1",
     "OWNCLOUD_GZIP_STORES": "ayoai-mind",
-    "UTILIZATION_COUNTERS_SPOOLED": "1"
+    "UTILIZATION_COUNTERS_SPOOLED": "1",
+    "BOARD_SEGMENTED_CHANNELS": "coordination"
   },
   "skillListingBudgetFraction": 0.05,
   "hooks": {

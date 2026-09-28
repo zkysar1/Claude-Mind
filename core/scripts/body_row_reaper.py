@@ -125,6 +125,7 @@ K_STALLED_WITH_CLAIM = "stalled-with-claim"   # WorkerStallProbe's territory
 K_UNREADABLE = "unreadable"                   # carrier present, no usable ts
 K_SID_MISMATCH = "carrier-sid-mismatch"       # guard-358
 K_NULL_RESIDUE = "null-residue"               # pre- null-valued key
+K_CLOSED_BODY = "closed-body"                 # carrier fresh and ours, Body closed ()
 
 #: The verdicts that mutate. THREE, since  -- and they reap on
 #: DIFFERENT evidence, which is why none is folded into another:
@@ -174,6 +175,7 @@ CV_FRESH_WRONG = "fresh-wrong"
 CV_STALE = "stale"
 CV_ABSENT = "absent"
 CV_UNREADABLE = "unreadable"
+CV_CLOSED = "closed"
 
 
 def is_reaping(verdict: str) -> bool:
@@ -413,6 +415,12 @@ def decide_row(
 
     if carrier_verdict == CV_ABSENT:
         out["verdict"] = K_NO_CARRIER
+        return out
+    # A closed Body's fresh carrier read `fresh-correct` until  gave every
+    # carrier door one verdict, and it kept the row as `alive`. It still keeps the
+    # row: whether a closed Body's row should be reaped was never decided here.
+    if carrier_verdict == CV_CLOSED:
+        out["verdict"] = K_CLOSED_BODY
         return out
     if carrier_verdict == CV_FRESH_CORRECT:
         out["verdict"] = K_ALIVE

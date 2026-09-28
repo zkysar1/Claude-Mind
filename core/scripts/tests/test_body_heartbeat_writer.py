@@ -189,7 +189,7 @@ def _stage_root(tmp: Path, *, with_session_dir: bool,
 
 
 def _tick(root: Path, agent_dir: Path, *,
-          sid: str | None) -> subprocess.CompletedProcess:
+          sid: str | None, args: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env["STORAGE_BACKEND"] = "local"
     env["MIND_AGENT"] = AGENT
@@ -219,7 +219,7 @@ def _tick(root: Path, agent_dir: Path, *,
         env.pop("MIND_SID", None)
     else:
         env["MIND_SID"] = sid
-    return subprocess.run(bash_cmd(str(root / "core" / "scripts" / "heartbeat-tick.sh")),
+    return subprocess.run(bash_cmd(str(root / "core" / "scripts" / "heartbeat-tick.sh"), *args),
                           cwd=str(root), env=env,
                           capture_output=True, text=True, timeout=180)
 
@@ -465,3 +465,77 @@ def test_idle_refusal_is_not_stop_scoped():
             "the agent-WIDE runner-heartbeat must not be advanced under IDLE "
             "even mid-stop — that is the heartbeat_without_running desync "
             "(guard-543), and a stop is not an exemption from it")
+
+
+# --- 8. --body-only PUBLISHES the carrier it wrote () ---------------
+def _stub_runtime(root: Path, record: Path) -> None:
+    """A recording _runtime.sh in the staged root.
+
+    The staged root copies only heartbeat-tick.sh and _paths.sh, so in tests
+    1-7 the publish subshell's `source` fails and `|| true` swallows it. This
+    stub records each rt_call argv beside the MIND_SID that rt_call forwards
+    as the X-Mind-Sid header, and reaches no daemon. rt_url_encode is the
+    identity here; the encoding is _runtime.sh's own contract.
+    """
+    (root / "core" / "scripts" / "_runtime.sh").write_text(
+        "rt_url_encode() { printf '%s' \"$1\"; }\n"
+        "rt_call() { printf '%s|%s\\n' \"$*\" \"${MIND_SID:-}\" >> "
+        f"'{record.as_posix()}'; }}\n",
+        encoding="utf-8")
+
+
+def _calls(record: Path) -> list[str]:
+    return record.read_text(encoding="utf-8").splitlines() if record.exists() else []
+
+
+def test_body_only_tick_publishes_its_own_carrier():
+    """THE FIX. The daemon's periodic sweep publishes only the carrier of the
+    session its daemon was SPAWNED in. Measured 2026-09-27: on 3 of 10 worker
+    boxes the live carrier never left the box, the stranded-claim sweep read it
+    `absent` and released 3 live claims, and a second Body duplicated each goal.
+    The --body-only tick, which the Bash hook spawns for every Body that is not
+    the reducer, now publishes the carrier it just wrote, under its own sid."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True, state="IDLE")
+        record = Path(tmpd) / "rt-calls.txt"
+        _stub_runtime(root, record)
+        r = _tick(root, adir, sid=SID, args=("--body-only",))
+        assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr[-400:]}"
+        assert _carrier(adir).exists(), f"no carrier. stderr={r.stderr[-400:]}"
+        calls = _calls(record)
+        assert len(calls) == 1, f"expected ONE publish, got {calls}"
+        argv, sent_sid = calls[0].rsplit("|", 1)
+        assert argv.startswith(
+            "POST /v1/admin/owncloud-sync-file --query path="), argv
+        assert argv.endswith(f"/session/body-heartbeat-{SID}.json"), (
+            f"the publish must name THIS Body's carrier: {argv}")
+        assert sent_sid == SID, (
+            "rt_call forwards MIND_SID as X-Mind-Sid, and that header is the "
+            "identity the endpoint admits; without it the push is refused "
+            f"peer_agent on a worker box. sent={sent_sid!r}")
+
+
+def test_full_tick_does_not_publish():
+    """CONTROL. The reducer's full tick is unchanged: its box holds the agent's
+    claim, so the sweep's own walk already publishes its carrier. The carrier
+    assertion is the positive control that the tick ran at all."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+        record = Path(tmpd) / "rt-calls.txt"
+        _stub_runtime(root, record)
+        r = _tick(root, adir, sid=SID)
+        assert _carrier(adir).exists(), f"no carrier. stderr={r.stderr[-400:]}"
+        assert _calls(record) == []
+
+
+def test_body_only_tick_without_a_bound_session_publishes_nothing():
+    """CONTROL. No bound session dir means no carrier (test 4), so there is
+    nothing of this Body's to publish."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=False, state="IDLE")
+        record = Path(tmpd) / "rt-calls.txt"
+        _stub_runtime(root, record)
+        r = _tick(root, adir, sid=SID, args=("--body-only",))
+        assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr[-400:]}"
+        assert not _carrier(adir).exists()
+        assert _calls(record) == []

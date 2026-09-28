@@ -49,23 +49,11 @@ Applies to:
    requiring fresh evidence — per `verify-before-assuming.md` "Summaries are claim
    snapshots, not filesystem snapshots."
 4. **The automated safety net is PARTIAL — Rules 1-3 are the real guarantee**:
-   `core/scripts/pre-edit-context-gate.sh` is a PreToolUse[Edit|MultiEdit]
-   ADVISORY hook — it never denies and never blocks. It consults the session's
-   context-reads manifest and emits one of two advisories as a structured
-   `permissionDecision: "allow"` payload (the only channel that reaches the
-   model): "has not been Read this session" → Read it; "was Read only in part
-   this session (ranged read)" → Rule 1's "count only if they cover the region
-   being edited" is now yours to evaluate. Seeing either means stop and read.
-   It fires ONLY for the path classes the manifest tracks (`core/config/**`,
-   `.claude/skills/**`, `world/knowledge/tree/**`, `world/conventions/**`,
-   `aspirations-compact.json`, `core/scripts/**` advisory-only); for
-   `.claude/rules/**`, `agents/<agent>/**` and all product/external files it is
-   **silent by design**, so the absence of a warning is NOT evidence you have
-   current context. It was inert for 59 days (2026-05-30 → 07-28) and one more
-   day on Windows, hand-testing green the whole time — a hook's production
-   shape (env, platform, path form) is not your shell's; history, the
-   scope-split (`is_in_scope` vs `is_in_scope_advisory` in `context-reads.py`
-   is the SSOT), the constitutional-anchor exclusion and the cost measurements:
+   `core/scripts/pre-edit-context-gate.sh` is an ADVISORY hook (never denies).
+   It is **silent by design** for `.claude/rules/**`, `agents/<agent>/**` and
+   product/external files — absence of a warning is NOT evidence you have
+   current context. History, scope-split SSOT (`is_in_scope` vs
+   `is_in_scope_advisory` in `context-reads.py`), and cost measurements:
    `core/config/conventions/retrieval-triggers.md` § "The pre-edit context gate".
 
 ## Anti-patterns

@@ -53,6 +53,7 @@ aspirations, call collect_candidates directly.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from datetime import datetime, timedelta
@@ -94,6 +95,36 @@ def _pin_identity(monkeypatch):
     """
     monkeypatch.setattr(gs, "AGENT_NAME", MIND)
     monkeypatch.setattr(gs, "BODY_SID", MY_SID)
+
+
+@pytest.fixture(autouse=True)
+def _hold_dirs(tmp_path, monkeypatch):
+    """: past the timeout a sibling's claim is judged on its SID-keyed row
+    and its carrier. Point both reads at tmp dirs so no case here can see the live
+    world's rows (guard-955); a case that seeds nothing reads no evidence."""
+    world, state = tmp_path / "world", tmp_path / "state"
+    world.mkdir()
+    monkeypatch.setattr(gs, "WORLD_DIR", world)
+    monkeypatch.setattr(gs, "agent_state_dir", lambda name: state)
+    return world, state
+
+
+def _seed_hold(dirs, *, goal_id, claimed_h, carrier_min, body_state="active"):
+    """The sibling's per-SID row and body-heartbeat carrier, as the claim path and
+    heartbeat-tick.sh write them."""
+    world, state = dirs
+    rows = world / "team-state" / "agents"
+    rows.mkdir(parents=True, exist_ok=True)
+    (rows / f"{MIND}.yaml").write_text(
+        "in_flight_bodies:\n"
+        f"  {SIBLING_SID}:\n"
+        f"    goal_id: '{goal_id}'\n"
+        f"    claimed_at: '{_ts(claimed_h)}'\n"
+        "    phase: '4'\n", encoding="utf-8")
+    state.mkdir(parents=True, exist_ok=True)
+    (state / f"body-heartbeat-{SIBLING_SID}.json").write_text(json.dumps({
+        "sid": SIBLING_SID, "agent": MIND, "host": "test-box",
+        "ts": _ts(carrier_min / 60.0), "body_state": body_state}), encoding="utf-8")
 
 
 def _ts(hours_ago):
@@ -150,6 +181,30 @@ def test_sibling_body_expired_claim_falls_through():
     g = _goal("g-sib-old", claimed_by=MIND, claimed_by_sid=SIBLING_SID,
               claim_age_h=CLAIM_TIMEOUT + 2)
     assert "g-sib-old" in _visible([g])
+
+
+# ── : a sibling still WORKING its goal keeps it past the timeout ──────
+# The case above seeds no row and no carrier, so it is this block's control: the
+# same claim age with no evidence of life still expires.
+
+def test_sibling_body_still_working_keeps_its_goal_past_the_timeout(_hold_dirs):
+    age = CLAIM_TIMEOUT + 2
+    g = _goal("g-long", claimed_by=MIND, claimed_by_sid=SIBLING_SID, claim_age_h=age)
+    _seed_hold(_hold_dirs, goal_id="g-long", claimed_h=age, carrier_min=20)
+    assert "g-long" not in _visible([g])
+
+
+def test_long_held_goal_with_a_stale_carrier_expires_as_before(_hold_dirs):
+    age = CLAIM_TIMEOUT + 2
+    g = _goal("g-quiet", claimed_by=MIND, claimed_by_sid=SIBLING_SID, claim_age_h=age)
+    _seed_hold(_hold_dirs, goal_id="g-quiet", claimed_h=age, carrier_min=150)
+    assert "g-quiet" in _visible([g])
+
+
+def test_long_hold_past_the_cap_expires_as_before(_hold_dirs):
+    g = _goal("g-forever", claimed_by=MIND, claimed_by_sid=SIBLING_SID, claim_age_h=25)
+    _seed_hold(_hold_dirs, goal_id="g-forever", claimed_h=25, carrier_min=20)
+    assert "g-forever" in _visible([g])
 
 
 # ── FAIL-OPEN: every ambiguous shape keeps pre-fix behavior ───────────────────

@@ -96,7 +96,7 @@ The LLM NEVER reads or edits pipeline JSONL files directly. All operations go th
 | `pipeline-read.sh --summary` | Compact one-liner per record | — |
 | `pipeline-read.sh --counts` | Stage counts from meta | — |
 | `pipeline-read.sh --accuracy` | Accuracy report from meta | — |
-| `pipeline-read.sh --unreflected` | Resolved + reflected=false | — |
+| `pipeline-read.sh --unreflected` | Stage resolved OR archived + reflected=false (live wins over archive; widened by g-115-5358). NOT the reflectable set: filter outcome in {CONFIRMED, CORRECTED} before acting | — |
 | `pipeline-read.sh --replay-candidates` | Spaced repetition filter | — |
 | `pipeline-read.sh --archive` | Archived records | — |
 | `pipeline-read.sh --meta` | Full metadata | — |

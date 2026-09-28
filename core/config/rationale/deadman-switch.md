@@ -458,6 +458,13 @@ outcome of the new predicate, plus a mirror test asserting that neither state
 leaves both doors open. Measured: unwiring the branch turns exactly three of
 those tests red and leaves every other test in the file green.
 
+## Anti-pattern E measurement (2026-08-25)
+
+Cancelling the deadman net on a LIVE loop (`ScheduleWakeup(stop: true)` while
+RUNNING) was measured 2026-08-25: four faults compounded, and this was the one
+that made the other three unrecoverable. The cancel converted a recoverable
+text-death into a hard stop that needed a human to notice.
+
 ## Why 600s
 
 The wakeup fires only after `delaySeconds` of CONTINUOUS session idle. On a

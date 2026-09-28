@@ -38,6 +38,45 @@ Still deliberately NOT budgeted: `core/config/conventions/**`,
 `core/config/rationale/**`, the tree, the reasoning bank — the on-demand homes
 prose is supposed to move TO. Budgeting them would defeat the migration.
 
+### The always-loaded instruction ceiling (a CORPUS rule, g-353-151)
+
+Claude Code (2.1.281+) flags a session — `‼ N instruction files add up to X chars,
+over the 150.0k-char total limit` — once CLAUDE.md plus every `.claude/rules/*.md`
+WITHOUT `paths:` front matter pass 150,000 chars. The notice is advisory (nothing
+is truncated), but every one of those chars is re-sent on every turn and survives
+every compaction. On 2026-09-27 the set measured 202.3k across 32 files; g-353-151
+cut it the same day to 142,372 (`--check` at HEAD 8190459490, still 32 files).
+
+The ratchet cannot hold this line, because the TOTAL grows through doors where no
+budgeted file grows: a NEW rule (door 2 below), a rule losing its `paths:` front
+matter, a nested `.claude/rules/**` file. So `instruction_ceiling` in the budget
+is judged on the whole set:
+
+- **When**: only for a commit that stages an instruction path. A commit touching
+  none cannot move the total, a deletion only shrinks it, and merges are skipped.
+  So the ceiling holds only on LINEAR history: branches that each pass can MERGE
+  past it, unrefused and unledgered (reproduced 2026-09-27 at a 1,000-char
+  ceiling: two +400 branches off 550 each passed at 950 and merged to 1,350), and
+  the next commit that grows the set is then refused for a breach it did not make.
+  `--check` reports the breach; the commit-time arm cannot.
+- **Rule**: refused if the staged total is over `chars` AND larger than at HEAD —
+  the Tier-2 ceiling rule through the same `decide()`, so a commit that shrinks
+  an over-ceiling set is never blocked.
+- **Counted as the notice counts** (`instruction_chars()`): the body after front
+  matter, in UTF-16 code units, with every newline counted as CRLF. Calibrated
+  2026-09-27 on a Windows checkout: 203,375 against the notice's 202.3k for the
+  same 32 files (CLAUDE.md 45,925 vs 45.9k exactly), about 0.5% high — the safe
+  side. `paths:`-scoped rules are excluded, as the notice excludes them.
+- **Not visible to the gate**: `~/.claude/CLAUDE.md`, `CLAUDE.local.md`
+  (machine-local) and `@`-imports (none today). They count toward the notice on
+  the box that has them, so keep headroom.
+- **Bypass**: the same trailer. The ledger row carries `kind:
+  instructions_over_ceiling` and `unit: chars`, and chars never add into
+  `context.net_bytes`.
+
+`--check` appends the HEAD total to its verdict line and FAILs while it is over
+the ceiling. That is corpus STATE, not a verdict on any one diff (guard-5436).
+
 ## Why a skill needs a CEILING and not a ratchet
 
 The two tiers are paid at different moments, so they have different binding
@@ -89,10 +128,14 @@ still stands on its own terms.
    (a rename keeps the old path's HEAD size as its cap); or
 3. a **Tier-2** file that is **already over its set's `ceiling`** grows further
    (`grew_over_ceiling`). Below the ceiling, growth is unrestricted and HEAD is
-   not consulted at all.
+   not consulted at all; or
+4. the commit stages an instruction path and leaves the **always-loaded total**
+   over `instruction_ceiling.chars` AND larger than at HEAD
+   (`instructions_over_ceiling`, above).
 
 Merge commits are skipped (MERGE_HEAD present): a merge combines commits that
-were each gated where they were made, and gating it would wedge every fleet
+were each gated where they were made (sound for the ratchet; a CEILING can still
+be breached by composition — see the instruction ceiling's **When** above), and gating it would wedge every fleet
 pull the moment any box overrode. Plumbing failures (registry unreadable, sizes
 unreadable, ledger unwritable) WARN and allow — a commit is never wedged on the
 gate's own machinery; `--check` surfaces the breakage.
@@ -205,7 +248,9 @@ line's door list rather than stopping at the ledger:
   exception block added to an existing one, enters the Tier-1 corpus by
   MATCHING A GLOB — nothing registers it and **no ledger row is written**. An
   empty ledger is therefore the EXPECTED reading for door 2, never evidence of
-  a bypass.
+  a bypass. Since g-353-151 the instruction ceiling refuses door 2 at commit
+  time once the always-loaded total is past it; below that line door 2 stays
+  open and traceless.
 
 Confirm door 2 by diffing the run's per-set bytes against the baseline's
 `per_set` map in `meta/audit-baselines.yaml`, then `git log -p` the set that
@@ -254,7 +299,13 @@ tighten-on-shrink, new-file cap, rename, override → ledger, merge skip,
 pathspec-commit index visibility, fail-open, `--check` ratchet; plus the Tier-2
 truth table, the tier-discrimination pin, and an end-to-end ceiling run through
 the real hook). Both ceiling tests were mutation-verified — a `decide()` that
-never refuses over-ceiling growth turns them red.
+never refuses over-ceiling growth turns them red. The instruction ceiling adds
+counting, loader, git-I/O, `--check` and real-hook pins; nine mutants (front
+matter counted, `paths:` not excluded, no CRLF doubling, key dropped by the
+loader, row never added, HEAD ignored, index not read, `--check` never FAILs,
+chars in `net_bytes`) were each killed. The hook-driven tests SKIP wherever
+`os.symlink` is refused (Windows without Developer Mode), so the corpus arm's
+git I/O is also pinned against a plain repo that nothing can skip.
 
 A trap worth knowing before adding a key: `load_budget` rebuilds each set from an
 explicit key list, so a new key in the YAML is **silently dropped** unless it is

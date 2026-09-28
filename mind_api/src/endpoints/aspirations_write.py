@@ -139,6 +139,8 @@ from gates.reallocation_exempt import (  # noqa: E402  ( SSOT)
     evaluate as _realloc_exempt_eval,
     idle_agents as _realloc_idle_agents,
     confirms_dormant as _realloc_confirms_dormant)
+from gates.body_hold import evaluate as _body_hold_eval  # noqa: E402  ( SSOT)
+from gates.body_hold import evaluate_carrier as _body_carrier_eval  # noqa: E402  ()
 from gates.category_suggest import evaluate as _category_suggest_eval  # noqa: E402
 from gates.description_length import evaluate as _desc_len_eval  # noqa: E402
 from gates.depends_on_consistency import evaluate as _depends_on_eval  # noqa: E402
@@ -1724,6 +1726,17 @@ def _header_override(ctx, header_name: str) -> Optional[str]:
     return val or None
 
 
+def _request_sid(ctx) -> Optional[str]:
+    """The calling session's id, from the `x-mind-sid` header rt_call sends; None if absent.
+
+    What this module hands the override ledger as `session_id`. Never the
+    daemon's own MIND_SID, which belongs to whichever session spawned it
+    (guard-2480; `_completed_by_sid` below carries the measured case). Gate
+    firings need no argument: the dispatcher names the session for them.
+    """
+    return _header_override(ctx, "x-mind-sid")
+
+
 def _is_forge_goal(goal: Dict[str, Any]) -> bool:
     """True when a goal will invoke /forge-skill — by explicit skill, the
     canonical 'Forge skill:' title prefix, or the 'idea:forge-ready-' origin
@@ -2973,7 +2986,9 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
                      "goal_id": goal["id"],
                      "asp_id": asp_id,
                      "source": source},
-            world_dir=ctx.paths.world)
+            world_dir=ctx.paths.world,
+            agent_name=ctx.paths.agent_name or None,
+            session_id=_request_sid(ctx))
 
     # Phase D.5 (): Routing-audit after main goal persists.
     # Outside the original lock — the audit reads each agent's Self.md and
@@ -5370,7 +5385,9 @@ def complete(ctx) -> "Response":  # type: ignore[name-defined]
             bulk_token, bulk_override, close_bulk_slots,
             context={"caller": "aspirations_write.py:complete",
                      "asp_id": asp_id, "source": source},
-            world_dir=ctx.paths.world)
+            world_dir=ctx.paths.world,
+            agent_name=ctx.paths.agent_name or None,
+            session_id=_request_sid(ctx))
 
     return Response.json({
         "ok": True,
@@ -6975,8 +6992,29 @@ def _same_box_body_is_live(ctx, holder_sid: str,
 _ABSENT_ROW_REASONS = frozenset({"no_bodies_map", "no_row_for_sid"})
 
 
-def _body_carrier_is_fresh(ctx, agent_name: str, holder_sid: str,
-                           stale_minutes: float) -> bool:
+def _read_body_carrier(ctx, agent_name: str, holder_sid: str):
+    """`holder_sid`'s decoded body-heartbeat carrier, read AUTHORITATIVELY
+    (guard-980). Raises on any failure: each caller owns its own fail-open.
+    Shared by `_body_carrier_is_fresh` and `_cross_box_body_long_hold`, so the
+    two paths that consult the carrier cannot resolve different files."""
+    # Same bound-agent-vs-foreign split as `_same_box_body_is_live`, and for
+    # the same  reason: `ctx.paths.agent` is INJECTED, not derived
+    # from agents_root, so re-deriving it would silently change the bound
+    # caller's resolution wherever a fixture injects a different agent dir.
+    # `SESSION_DIRNAME` (singular, the agent-wide state dir) is the
+    # constant, never a literal "session" segment — CLAUDE.md "Agent-dir
+    # Resolution" names hardcoded copies as a class its audit greps miss.
+    if str(agent_name) == str(ctx.paths.agent_name):
+        state_dir = ctx.paths.state_dir
+    else:
+        state_dir = (ctx.paths.agents_root / str(agent_name)
+                     / SESSION_DIRNAME)
+    carrier = state_dir / f"body-heartbeat-{holder_sid}.json"
+    return json.loads(
+        get_backend().read_authoritative_bytes(carrier).decode("utf-8"))
+
+
+def _body_carrier_is_fresh(ctx, agent_name: str, holder_sid: str) -> bool:
     """Is `holder_sid` emitting a FRESH cross-box body heartbeat? ()
 
     The SECOND, INDEPENDENT-WRITER signal, consulted ONLY where
@@ -7012,11 +7050,21 @@ def _body_carrier_is_fresh(ctx, agent_name: str, holder_sid: str,
     peer's carrier proves nothing. `read_authoritative_bytes` is the backend's
     generic primitive for exactly this and is implemented by BOTH backends.
 
+    ONE CARRIER VERDICT (g-375-50). The judgement is `gates.body_hold.
+    evaluate_carrier`, the conjuncts the selector, the `stale` branch and the
+    stranded-claim sweep apply to the same file: `ts` within CARRIER_FRESH_MINUTES
+    (100), the embedded `sid` the holder's own (guard-358), `body_state` not
+    closed. This door used to take the endpoint's `stale_minutes` (60) and skip
+    the `sid` check, so a live Body whose carrier had gone 61-100 min between
+    refreshes (62.5 min measured, one long goal) read as gone here while the
+    other doors kept it.
+
     POSITIVE CONFIRMATION ONLY — this can never manufacture a refusal on its
     own. It is consulted only where the caller already returned False, so every
     failure path here (missing ids, unreadable carrier, malformed doc, absent or
-    unparseable `ts`, a stale `ts`, a CLOSED `body_state`) returns False and
-    leaves today's take-over behaviour byte-identical. That direction is
+    unparseable `ts`, a stale `ts`, a carrier another session wrote, a CLOSED
+    `body_state`) returns False and leaves today's take-over behaviour
+    byte-identical. That direction is
     deliberate: refusing a claim because a telemetry read failed is the
     `guard-1562` trade and could wedge every claim on a box whose team-state
     writes are broken. This can only NARROW the take-over window, never widen it.
@@ -7031,46 +7079,14 @@ def _body_carrier_is_fresh(ctx, agent_name: str, holder_sid: str,
     try:
         if not agent_name or not holder_sid:
             return False
-        # Same bound-agent-vs-foreign split as `_same_box_body_is_live`, and for
-        # the same  reason: `ctx.paths.agent` is INJECTED, not derived
-        # from agents_root, so re-deriving it would silently change the bound
-        # caller's resolution wherever a fixture injects a different agent dir.
-        # `SESSION_DIRNAME` (singular, the agent-wide state dir) is the
-        # constant, never a literal "session" segment — CLAUDE.md "Agent-dir
-        # Resolution" names hardcoded copies as a class its audit greps miss.
-        if str(agent_name) == str(ctx.paths.agent_name):
-            state_dir = ctx.paths.state_dir
-        else:
-            state_dir = (ctx.paths.agents_root / str(agent_name)
-                         / SESSION_DIRNAME)
-        carrier = state_dir / f"body-heartbeat-{holder_sid}.json"
-        doc = json.loads(
-            get_backend().read_authoritative_bytes(carrier).decode("utf-8"))
-        if not isinstance(doc, dict):
-            return False
-        # CLOSED SET, never "not active" — `parked` is RESUMABLE and a parked
-        # Body is alive (). Testing "not active" here would treat a
-        # live parked Body as takeable.
-        # SIXTH partition site (). `closed-graceful` joined the closed
-        # half in , which enumerated the five sites under core/scripts
-        # and never swept mind_api -- so a gracefully-stopped Body read LIVE here
-        # for the whole freshness window and its claims stayed un-takeable.
-        # Pinned against body-manifest.CLOSED_STATES by
-        # core/scripts/tests/test_graceful_body_close.py so site six stops being
-        # re-derived by hand (guard-1127: enumerate consumers REPO-WIDE).
-        if str(doc.get("body_state") or "") in (
-                "closed-pending-merge", "merged", "closed-stale",
-                "closed-graceful"):
-            return False
-        ts = doc.get("ts")
-        if not ts:
-            return False
-        try:
-            t = datetime.strptime(str(ts).strip()[:19], "%Y-%m-%dT%H:%M:%S")
-        except (ValueError, TypeError):
-            return False  # unparseable -> ambiguous -> never refuse
-        return (datetime.now() - t).total_seconds() <= (
-            float(stale_minutes) * 60.0)
+        doc = _read_body_carrier(ctx, agent_name, holder_sid)
+        # The CLOSED SET, never "not active": `parked` is RESUMABLE and a parked
+        # Body is alive (). This was the SIXTH partition site of that set
+        # (); it now reads body_hold's copy, which
+        # core/scripts/tests/test_graceful_body_close.py pins against
+        # body-manifest.CLOSED_STATES. A non-dict doc or an unparseable `ts` fails
+        # its conjunct, so it permits the claim as before.
+        return _body_carrier_eval(doc, sid=holder_sid, now=datetime.now())["live"]
     except Exception as e:  # noqa: BLE001 — fail-open, but never silently
         print(f"[daemon claim] WARN: cross-box BODY carrier probe for "
               f"{agent_name!r}/{holder_sid!r} failed "
@@ -7116,14 +7132,15 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
     fail-open direction (a wrong False merely permits a claim that is already
     possible today).
 
-    THAT LIMIT STILL STANDS, and g-306-328 did NOT lift it. The
-    continuously-refreshed `session/body-heartbeat-<SID>.json` carrier IS now
-    read (`_body_carrier_is_fresh`), but ONLY where the row is ABSENT. A PRESENT
-    row with a stale `claimed_at` is evidence and keeps permitting the claim, so
-    a Body working one goal past `stale_minutes` still ages out exactly as
-    described above. Lifting that is a separate judgement about how long one
-    Body may hold one goal, not a plumbing gap — do not read the carrier's
-    arrival as having closed it.
+    g-375-42 LIFTED THAT LIMIT, as the separate judgement about how long one
+    Body may hold one goal that this paragraph used to say it was. A `stale`
+    row says only that `claimed_at` is old; it is not evidence the Body left
+    the goal, and goals on the local-inference fleet run 6-17 h per Body. So
+    `stale` escalates to `_cross_box_body_long_hold`, which applies the shared
+    `gates.body_hold` policy: the Body keeps the goal while its row names it
+    within MAX_BODY_HOLD_HOURS and its own carrier is fresh and not closed.
+    The goal selector skips the goal on the same predicate, so it never
+    offers a goal this function refuses.
 
     Returns True ONLY on positive confirmation. Every other path — missing
     ids, unreadable shard, absent/!dict `in_flight_bodies`, no row for this sid,
@@ -7152,8 +7169,9 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
     EVERY OTHER `None` REASON STILL COLLAPSES TO `False`: `shard_unreadable`,
     `no_ids`, `no_claimed_at`, `unparseable_claimed_at` and `probe_error:*` are
     unanswered too, but the original fix deliberately left them permitting the
-    claim and this re-land does not widen past it. `row_other_goal` and `stale`
-    are `False` because they are EVIDENCE, not the absence of it.
+    claim and this re-land does not widen past it. `row_other_goal` is `False`
+    because it is EVIDENCE: the Body's own row names a different goal. `stale`
+    is evidence only of the claim's AGE, so it escalates (g-375-42, above).
     """
     verdict, reason = _cross_box_body_liveness(
         ctx, agent_name, holder_sid, goal_id, stale_minutes)
@@ -7183,10 +7201,16 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
         # `shard_unreadable`, `no_claimed_at`, `unparseable_claimed_at` and
         # `probe_error` keep permitting the claim exactly as before — widening
         # to every `None` would change behaviour the reverted commit
-        # deliberately left alone. `row_other_goal` and `stale` are already
-        # `False`: those are EVIDENCE, not the absence of it, and overriding
-        # real evidence with a liveness ping would refuse take-overs that are
-        # legitimate today.
+        # deliberately left alone. `row_other_goal` is already `False`: the
+        # Body's own row names another goal, which is EVIDENCE, and overriding
+        # it with a liveness ping would refuse take-overs that are legitimate.
+        # `stale` has its own branch below ().
+        #
+        # ONE CARRIER VERDICT (): `_body_carrier_is_fresh` judges the
+        # carrier by `gates.body_hold.evaluate_carrier`, the same conjuncts the
+        # `stale` branch and the stranded-claim sweep apply. Until then this
+        # branch took stale_minutes and skipped the embedded-sid check, and it
+        # read a live Body's 62.5-min-old carrier as gone while they kept it.
         #
         # guard-4390 CHECK, run before trusting this as corroboration: the
         # carrier's writer is `heartbeat-tick.sh` (every cycle), the row's is
@@ -7198,9 +7222,62 @@ def _cross_box_body_is_live(ctx, agent_name: str, holder_sid: str,
         # A stale/absent/unreadable carrier still returns False, so take-over
         # behaviour on no-evidence is unchanged and this can only NARROW the
         # window, never widen it (the `guard-1562` fail-open direction).
-        return _body_carrier_is_fresh(ctx, agent_name, holder_sid,
-                                      stale_minutes)
+        return _body_carrier_is_fresh(ctx, agent_name, holder_sid)
+    if reason == "stale":
+        # A LONG HOLD IS NOT A DEAD HOLD (). `claimed_at` is stamped
+        # once and never refreshed, so every Body that works one goal past
+        # stale_minutes lands here while alive. The shared policy decides.
+        return _cross_box_body_long_hold(ctx, agent_name, holder_sid, goal_id)
     return False
+
+
+def _cross_box_body_long_hold(ctx, agent_name: str, holder_sid: str,
+                              goal_id: str) -> bool:
+    """Does `holder_sid` still hold `goal_id` although its row's `claimed_at`
+    has aged past stale_minutes? (g-375-42)
+
+    The DECISION is `gates.body_hold.evaluate`, the SSOT the goal selector
+    applies too; this wrapper only reads its two inputs, the SID-keyed row and
+    the holder's carrier, both authoritatively (guard-980), and records the
+    outcome under the `cross-box-body-long-hold` gate.
+
+    Returns True ONLY when every conjunct holds. A failed read leaves that
+    input None, the predicate fails its conjunct, and the claim is permitted
+    exactly as before (the guard-1562 fail-open direction).
+    """
+    import sys
+    row = carrier = None
+    try:
+        scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from _team_state import read_shard_authoritative
+        shard = read_shard_authoritative(ctx.paths.world, agent_name)
+        bodies = shard.get("in_flight_bodies") if isinstance(shard, dict) else None
+        row = bodies.get(str(holder_sid)) if isinstance(bodies, dict) else None
+        carrier = _read_body_carrier(ctx, agent_name, holder_sid)
+    except Exception as e:  # noqa: BLE001 — fail-open, but never silently
+        print(f"[daemon claim] WARN: long-hold probe for {agent_name!r}/"
+              f"{holder_sid!r}/{goal_id!r} could not read an input "
+              f"({type(e).__name__}: {e}); judging on what was read",
+              file=sys.stderr)
+    result = _body_hold_eval(row, carrier, goal_id=goal_id, sid=holder_sid,
+                             now=datetime.now())
+    _gate_log.log(
+        "cross-box-body-long-hold",
+        "block" if result["holds"] else "pass",
+        trigger_matched="holds" if result["holds"] else result["failed"][0],
+        payload=goal_id,
+        extra={
+            "failed": result["failed"],
+            "holder_sid": holder_sid,
+            "holder_agent": agent_name,
+            "source": "daemon",
+        },
+        meta_dir=ctx.paths.meta,
+        agent_name=ctx.paths.agent_name or None,
+    )
+    return bool(result["holds"])
 
 
 def _cross_box_body_liveness(ctx, agent_name: str, holder_sid: str,
@@ -8296,16 +8373,63 @@ def claim(ctx) -> "Response":  # type: ignore[name-defined]
                 if (holder_sid and claim_sid and holder_sid != claim_sid
                         and _holder_session_is_live_runner(
                             ctx, agent_name, holder_sid, goal_id)):
+                    # : the detail must name the holder CORRECTLY.
+                    # _holder_session_is_live_runner has returned True for a
+                    # live non-reducer worker Body since -a/,
+                    # but this text still said "this agent's running
+                    # autonomous loop ... stop the other session first" for
+                    # EVERY refusal. The running-loop reading is only true in
+                    # the one case where `running-session-id` is readable on
+                    # THIS box and names the holder; the predicate's docstring
+                    # says that file names only the reducer, and a worker Body
+                    # never writes it (/start W0). A caller that read the old
+                    # text for a worker-holder refusal was told a second
+                    # runner exists (contradicting its own
+                    # runner-identity-check) and invited to STOP a live
+                    # worker Body — which would destroy that Body's in-flight
+                    # work, when the only correct action is to pick a
+                    # different goal. So branch on which case fired:
+                    #   - holder_sid == local running-session-id -> the holder
+                    #     IS the running loop; keep today's wording verbatim.
+                    #   - otherwise (same-box body heartbeat, cross-box
+                    #     in_flight_bodies row, or the absent-rsid branch a
+                    #     worker box always takes) -> the holder is a live
+                    #     non-reducer Body; name it as a worker Body and drop
+                    #     the stop-it advice.
+                    # The 409 CODE same_agent_other_session is unchanged --
+                    # tests and callers key on it (the goal's own instruction),
+                    # so only the human-readable detail differs by case.
+                    import os as _os
+                    _rsid_file = (ctx.paths.agent / "session"
+                                  / "running-session-id")
+                    _running_sid = ""
+                    try:
+                        if _os.path.exists(_rsid_file):
+                            with open(_rsid_file, "r", encoding="utf-8") as _f:
+                                _running_sid = _f.read().strip()
+                    except Exception:  # noqa: BLE001 -- fail to the safe text
+                        _running_sid = ""
+                    if _running_sid == holder_sid:
+                        _holder_clause = (
+                            f"That session is this agent's running autonomous "
+                            f"loop. Two sessions working one goal duplicates "
+                            f"side effects — do NOT proceed. Pick a different "
+                            f"goal, or stop the other session first.")
+                    else:
+                        _holder_clause = (
+                            f"That session is a live worker Body of "
+                            f"{agent_name} (sid={holder_sid}), not the "
+                            f"reducer. Two Bodies working one goal "
+                            f"duplicates side effects — do NOT proceed. "
+                            f"Pick a different goal; the holder's in-flight "
+                            f"work must not be stopped.")
                     return Response.error(
                         409, "same_agent_other_session",
                         f"Goal {goal_id} is already claimed by a DIFFERENT "
                         f"LIVE session of {agent_name} "
                         f"(holding sid={holder_sid}, claimed_at="
                         f"{goal.get('claimed_at')}; your sid={claim_sid}). "
-                        f"That session is this agent's running autonomous "
-                        f"loop. Two sessions working one goal duplicates side "
-                        f"effects — do NOT proceed. Pick a different goal, or "
-                        f"stop the other session first.")
+                        f"{_holder_clause}")
                 if holder_sid and claim_sid and holder_sid != claim_sid:
                     # Fell through the refusal above => the holder is DORMANT.
                     # Outcome 4 requires the takeover be logged, not silent:
@@ -9397,7 +9521,9 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
                      "asp_id": asp.get("id"),
                      "goals_count": len(asp.get("goals", [])),
                      "source": source},
-            world_dir=ctx.paths.world)
+            world_dir=ctx.paths.world,
+            agent_name=ctx.paths.agent_name or None,
+            session_id=_request_sid(ctx))
 
     response_body: Dict[str, Any] = {
         "ok": True,

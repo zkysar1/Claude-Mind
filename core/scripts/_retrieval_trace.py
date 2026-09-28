@@ -28,11 +28,18 @@ Callers therefore pass `world_dir` explicitly.
 """
 
 import datetime as _dt
+import os as _os
 import re as _re
 import sys as _sys
 from pathlib import Path as _Path
 
 LEGACY_STORE_NAME = "retrieval-trace.jsonl"
+
+# The writer flag ( outcome 4). DEFAULT OFF: unset, the writer keeps
+# appending to the legacy file byte-for-byte as before. Flip it only after every
+# box runs the reader seam + merge branch above ( ordering) — the same
+# lane-by-lane cutover GATE_FIRINGS_SEGMENTED took (_gate_log.segmented_enabled).
+SEGMENTED_ENV = "RETRIEVAL_TRACE_SEGMENTED"
 
 # EXACT segment shape, not a `retrieval-trace-*` prefix glob: a future sibling
 # that merely shares the stem (an archive, a spool, a per-box shard) is excluded
@@ -50,6 +57,22 @@ def segment_name(day=None):
     """
     day = day or _dt.datetime.now().date()
     return f"retrieval-trace-{day.isoformat()}.jsonl"
+
+
+def segmented_enabled():
+    """True when this process writes new trace rows to today's date segment."""
+    return _os.environ.get(SEGMENTED_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def store_name(day=None):
+    """The one writer rule: the BASENAME a trace row is appended to.
+
+    Today's segment when the flag is on, the legacy file otherwise. A basename
+    only, so the caller composes it with its own world dir — retrieve.py must use
+    its per-request-swappable `WORLD_DIR` (Decision #58), never a path from here.
+    Readers accept both shapes through `trace_paths`.
+    """
+    return segment_name(day) if segmented_enabled() else LEGACY_STORE_NAME
 
 
 def is_segment(name):

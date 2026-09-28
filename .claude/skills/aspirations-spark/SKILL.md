@@ -152,6 +152,7 @@ ELSE:
         these too (domain observations -> domain-scoped entries).
         DEDUP BY PROVENANCE FIRST (guard-7379): if an entry sourced from
         entry.goal_id already states the lesson, do not strengthen or re-add.
+        Batch it: `py -3 core/scripts/lesson-dedup-probe.py --lessons-file <f>`.
         # WORK-DISCOVERY RELAYS FILE GOALS HERE (2026-08-16, audit D1).
         # Rationale (WHY relays file goals + WHY the dedup spans terminal
         # statuses): core/config/rationale/sq013-work-discovery-relay.md
@@ -166,23 +167,23 @@ ELSE:
             find a differently-worded owner — try two distinct token sets, and
             check the source goal's outcome_note for an id it filed OR a fix it
             SHIPPED (g-306-360), guard-3738. STATUS (guard-5176, guard-4938):
-            an OPEN-ONLY scan is blind to the owner that COMPLETED minutes ago,
-            which is the most expensive duplicate there is. Run ONCE per
-            slot — batch, one corpus read, NOT one per record:
+            an OPEN-ONLY scan misses the owner that COMPLETED minutes ago.
+            Run ONCE per slot (one corpus read):
               bash core/scripts/aspirations-query.sh --goal-status \
                    pending,in-progress,completed,skipped --full \
                 | py -3 core/scripts/sq013-dedup-probe.py --positive-control \
-                     --subjects-file <slot as JSON> --session-start <ISO>
-            rc 0 = FILE, 2 = broke (NEVER file), 3 = owner exists, 4 =
-            MUST-READ: a DECLINE citing a skipped/expired owner is a reading
-            assignment — open it, test its claim (guard-5147). Else file
-            with the sq-013 origin_signal mapping and put
+                     --subjects-file <slot as JSON> --session-start <ISO> \
+                     --census-file <(bash core/scripts/aspirations-read.sh \
+                     --source world --active-compact)
+            rc 2 = broke (NEVER file), 3 = owned, 4 = MUST-READ: open the
+            id each such row names, test it (guard-5147). rc 0 =
+            no LIVE owner only (guard-5278): re-run an AGED relay at HEAD
+            (guard-7398), then file with the sq-013 origin_signal mapping and put
             "relayed by <agent> worker Body (spark_capture from <entry.goal_id>),
             filed at reducer spark replay" in the description so the provenance
-            is on the record, not only in the diary. Do NOT skip this because
-            the observation also produced an rb entry — a lesson and a work item
-            are different artifacts (worker-loop Phase 3.5 vs 3.66 draw the
-            same line).
+            is on the record. Do NOT skip this because the observation also
+            produced an rb entry — a lesson and a work item are different
+            artifacts (worker-loop 3.5 vs 3.66).
     # PROVENANCE RECORD, fire branch (g-306-251). Written BEFORE the drain
     # (crash-safety) and NAMING the source goal_ids — that is what makes the
     # artifact attributable to the replay path rather than to an ordinary close.

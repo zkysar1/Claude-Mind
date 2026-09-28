@@ -342,6 +342,23 @@ logs.log
 # via check-repo-root-entries when it appears (g-350-350 close, 2026-09-07).
 /.platform-memo.sh
 
+# experience-stats counter spool (g-358-216; relocated 2026-09-27, g-306-523).
+# Machine-local per-agent increment queue, drained back into
+# agents/<agent>/experience.jsonl by _experience_stats_spool.flush. The
+# LEGACY FLAT paths were git-tracked, so every Body's churn commit carried its
+# own box's spool and nearly every worker-tip merge conflicted on it (4 of 6 in
+# g-306-284 occ228). The spool now lives in the dot-dir; the flat names stay
+# ignored too — migrate_legacy() leaves them on disk until a box's first
+# new-code use relocates them, and a flat file re-created by old code (or
+# resurrected from git after a delete-by-merge) must not become stageable
+# again by `git add -A` (g-306-523 progress_note, occ230 correction). The
+# .flush.lock rides the *.lock rule above and is deliberately KEPT at the flat
+# path by both code generations (one lock across old/new drains).
+**/.experience-stats/
+**/experience-stats.spool.jsonl
+**/experience-stats.spool.flushing.jsonl
+**/experience-stats.spool.last-flush
+
 # git's own merge temp copies. `git merge` writes `.merge_file_XXXXXX` at the
 # repo root when it materialises a side of a conflict for a large file — here
 # the ~2 MB agents/*/experience.jsonl stores (first record of each is an

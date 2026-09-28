@@ -219,12 +219,39 @@ def _log_dir(agent: str) -> Path:
     return d
 
 
+def run_invisible_delegation(zero_files: list[str], timeout: int) -> tuple[int, str]:
+    """Execute zero-test files through run-invisible-suites.sh --files.
+
+    pytest collects 0 tests from a main()-style file, so no pytest invocation
+    can ever RUN it — naming it in a gap is recording that this tier never
+    executes it (g-115-10962 outcome 2). The invisible runner is the only one
+    that can, and its --files mode delegates exactly the given files through
+    the same QUARANTINE + per-file-timeout + agent-binding contract as the
+    full-enumeration half. bash_cmd per guard-580: never a bare "bash"
+    argv[0] (the Windows WSL-stub class); deferred import because the test
+    loader (spec_from_file_location) has no core/scripts on sys.path — same
+    shape as _shared_tick.py. Returns (rc, output): 0 = every file passed,
+    1 = at least one failed, 2 = setup refusal (unbound, missing path,
+    unsupported type).
+    """
+    from _runtime_bash import bash_cmd  # guard-580
+    script = PROJECT_ROOT / "core" / "scripts" / "tests" / "run-invisible-suites.sh"
+    cmd = bash_cmd(str(script), "--files", *zero_files)
+    proc = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True,
+                          timeout=timeout)
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
 def run_pytest(test_files: list[Path], log_path: Path, timeout: int) -> tuple[int, str]:
     env = dict(os.environ)
     env["STORAGE_BACKEND"] = "local"   # guard-955 — MANDATORY on an own-cloud box
     env["PYTHONUNBUFFERED"] = "1"
     cmd = [sys.executable, "-u", "-m", "pytest", "-q",
            "-m", "not daemon_integration",
+           "-rs",   #  outcome 3: report skip reasons so a module-level
+           # `importorskip` (dep absent on this box) is NAMEABLE in the verdict
+           # instead of reading as green. Measured shape 2026-09-27:
+           #   SKIPPED [1] <file>:<line>: could not import '<dep>': No module named '<dep>'
            *[str(p.relative_to(PROJECT_ROOT)) for p in sorted(test_files)]]
     with log_path.open("w", encoding="utf-8") as fh:
         try:
@@ -354,28 +381,116 @@ def main() -> int:
         result["reason"] = f"timed out after {args.timeout}s — nothing was proven"
         _emit(result, args.json, tail)
         return 2
+    if rc == 5:
+        # pytest exit 5 = "no tests ran" — every selected file was skipped at
+        # module level. Measured 2026-09-27 on the deciding box (zc-10): a
+        # selection consisting only of module-`importorskip`-gated files (12 of
+        # them; the gated dependency absent on this box) exits 5 with a
+        # green-looking "1 skipped" tail. The pre-fix code fell through to FAIL below — the wrong
+        # direction: nothing FAILED, nothing RAN. INCONCLUSIVE, with the
+        # module-skip evidence named ( outcome 3).
+        mod_skip = _module_skip_files(selected, log_text)
+        result["skipped_module_files"] = mod_skip
+        result["verdict"] = "INCONCLUSIVE"
+        if mod_skip:
+            result["reason"] = (
+                f"pytest ran 0 tests: {len(mod_skip)} selected file(s) were skipped "
+                f"at MODULE level by `importorskip` (dependency absent on this box) — "
+                f"{', '.join(mod_skip)}. Nothing ran, so nothing was verified; the "
+                "skips are environmental, not red (g-115-10962 outcome 3).")
+        else:
+            result["reason"] = ("pytest ran 0 tests and no module-level importorskip "
+                                "skip is visible in the run's own -rs summary — "
+                                "nothing was verified (check the log for collection "
+                                "errors).")
+        _emit(result, args.json, tail)
+        return 2
     if rc == 0:
         # Non-empty selection ran green. This is the ONLY path that returns PASS,
-        # and `unmapped` and `zero_test_files` still qualify it.
+        # and `unmapped` still qualifies it; zero-test files are EXECUTED, not
+        # just named ( outcome 2) — see the delegation below.
         zero = result["zero_test_files"]
-        if unmapped or zero:
-            gaps = []
-            if unmapped:
-                gaps.append(f"these changed files are referenced by NO test: "
-                            f"{', '.join(unmapped)}")
-            if zero:
-                gaps.append(f"these selected test files are main()-style, so pytest "
-                            f"collected ZERO tests from them and did not run them: "
-                            f"{', '.join(zero)}")
+        if unmapped:
+            gaps = [f"these changed files are referenced by NO test: "
+                    f"{', '.join(unmapped)}"]
             result["verdict"] = "PASS_WITH_GAPS"
             result["reason"] = ("selected tests passed, but " + "; and ".join(gaps)
                                 + ". They were not verified by this run.")
             _emit(result, args.json, tail)
             return 2      # a gap is not a pass — INCONCLUSIVE for the gate's purposes
-        result["verdict"] = "PASS"
-        result["reason"] = f"{len(selected)} test file(s) selected and green"
-        _emit(result, args.json, tail)
-        return 0
+        if not zero:
+            mod_skip = _module_skip_files(selected, log_text)
+            if mod_skip:
+                #  outcome 3: a green run is NOT a bare pass over
+                # files whose tests were skipped at module level (importorskip,
+                # dep absent on this box). The PASS is qualified and the files
+                # are named, from the run's own -rs evidence only.
+                result["skipped_module_files"] = mod_skip
+                result["verdict"] = "PASS_WITH_SKIPS"
+                result["reason"] = (
+                    f"{len(selected)} test file(s) selected and green, but "
+                    f"{len(mod_skip)} file(s) were SKIPPED at module level by "
+                    f"importorskip (dependency absent on this box) and ran 0 "
+                    f"tests: {', '.join(mod_skip)}. This PASS is QUALIFIED over "
+                    "those files (g-115-10962 outcome 3).")
+                _emit(result, args.json, tail)
+                return 0
+            result["verdict"] = "PASS"
+            result["reason"] = f"{len(selected)} test file(s) selected and green"
+            _emit(result, args.json, tail)
+            return 0
+        # pytest collected 0 tests from these — the ONLY runner that can execute
+        # them is the invisible-suite runner, so the green pytest half is
+        # extended with a delegation rather than left as a gap. The delegation
+        # runs OUTSIDE the pytest log (own per-file tail, printed below).
+        result["zero_test_delegated"] = True
+        try:
+            zrc, zout = run_invisible_delegation(zero, args.timeout)
+        except subprocess.TimeoutExpired:
+            result["verdict"] = "INCONCLUSIVE"
+            result["reason"] = (f"selected tests passed, but the {len(zero)} zero-test "
+                                f"file(s) ({', '.join(zero)}) timed out during invisible "
+                                f"delegation after {args.timeout}s — they were not verified")
+            _emit(result, args.json, tail)
+            return 2
+        result["zero_test_result"] = zout
+        mod_skip = _module_skip_files(selected, log_text)
+        if mod_skip:
+            result["skipped_module_files"] = mod_skip
+        if zrc == 0:
+            if mod_skip:
+                #  outcome 3: the delegated half is green, but some
+                # pytest-collected files' tests never ran (module-level
+                # importorskip, dep absent on this box) — qualified PASS.
+                result["verdict"] = "PASS_WITH_SKIPS"
+                result["reason"] = (f"{len(selected)} test file(s) selected: "
+                                    f"{len(selected) - len(zero) - len(mod_skip)} pytest-collected and green, "
+                                    f"{len(zero)} zero-test file(s) delegated to run-invisible-suites.sh and green, "
+                                    f"but {len(mod_skip)} file(s) were SKIPPED at module level by importorskip "
+                                    f"and ran 0 tests: {', '.join(mod_skip)}. This PASS is QUALIFIED over "
+                                    "those files (g-115-10962 outcome 3).")
+            else:
+                result["verdict"] = "PASS"
+                result["reason"] = (f"{len(selected)} test file(s) selected: {len(selected) - len(zero)} "
+                                    f"pytest-collected and green, {len(zero)} zero-test file(s) "
+                                    f"delegated to run-invisible-suites.sh and green")
+            _emit(result, args.json, tail + "\n" + zout)
+            return 0
+        if zrc == 2:
+            result["verdict"] = "INCONCLUSIVE"
+            result["reason"] = (f"selected tests passed, but invisible delegation REFUSED "
+                                f"({len(zero)} zero-test file(s), runner exit 2) — "
+                                f"{zout.splitlines()[-1] if zout else 'no output'}. "
+                                "Set MIND_AGENT or check the file paths; 'did not run' "
+                                "must not read as pass.")
+            _emit(result, args.json, tail + "\n" + zout)
+            return 2
+        result["verdict"] = "FAIL"
+        result["reason"] = (f"pytest half passed, but invisible delegation FAILED "
+                            f"({len(zero)} zero-test file(s), runner exit 1) — a "
+                            "main()-style file in the selection is red")
+        _emit(result, args.json, tail + "\n" + zout)
+        return 1
     result["verdict"] = "FAIL"
     result["reason"] = f"pytest exited {rc}"
     _emit(result, args.json, tail)
@@ -392,7 +507,7 @@ def _zero_test_files(paths) -> list:
     name). Checked 2026-09-25 against `pytest --collect-only` over all 1573
     test files: 0 false positives. It does not flag module-level
     `importorskip` files; pytest reports those as skipped rather than hiding
-    them."""
+    them (g-115-10962 outcome 3: `_module_skip_files` names them instead)."""
     zero = []
     for p in paths:
         try:
@@ -405,6 +520,45 @@ def _zero_test_files(paths) -> list:
             except ValueError:
                 zero.append(str(p))
     return sorted(zero)
+
+
+# The -rs skip-summary line for a module-level importorskip (measured
+# 2026-09-27, deciding box zc-10; <dep> = the gated dependency):
+#   SKIPPED [1] core/scripts/tests/test_<module>.py:29: could not import '<dep>': No module named '<dep>'
+# A TEST-LEVEL skip (`pytest.skip` / `skipif`) does NOT name an import — the
+# 'could not import' clause is the module-skip discriminator, so a conditional
+# skip in one test never qualifies a PASS that otherwise ran green.
+_MODULE_SKIP_RE = re.compile(
+    r"^SKIPPED \[\d+\] (\S+?)(?::\d+)?: could not import '([^']+)'")
+
+
+def _module_skip_files(selected, log_text: str) -> list:
+    """Selected files whose tests were skipped at MODULE level by
+    `importorskip` (dependency absent on this box), from the run's OWN -rs
+    evidence — not from re-reading source text, which would miss the box
+    dimension (the same file runs normally where the dep exists).
+    Returns sorted repo-relative names; an empty result means 'the green run
+    ran everything it collected'."""
+    hits: set[str] = set()
+    selected_names = {p.name for p in selected}
+    for line in log_text.splitlines():
+        m = _MODULE_SKIP_RE.match(line.strip())
+        if not m:
+            continue
+        raw = m.group(1)
+        # -rs paths are rootdir-relative, and this runner's rootdir is always
+        # PROJECT_ROOT (pytest.ini lives at the root): in-repo files appear
+        # repo-relative, out-of-repo files (tmp_path probes) as ../ hops.
+        # Resolve against PROJECT_ROOT, never CWD — the CWD is not a fact the
+        # runner controls.
+        cand = Path(raw)
+        resolved = cand if cand.is_absolute() else PROJECT_ROOT / cand
+        try:
+            hits.add(str(resolved.resolve().relative_to(PROJECT_ROOT)))
+        except (ValueError, OSError):
+            if cand.name in selected_names:
+                hits.add(cand.name)
+    return sorted(hits)
 
 
 def _emit(result: dict, as_json: bool, tail: str = "") -> None:
@@ -420,6 +574,10 @@ def _emit(result: dict, as_json: bool, tail: str = "") -> None:
               f"{', '.join(result['dropped_inputs'])}")
     if result["unmapped_files"]:
         print(f"  UNMAPPED (no test references these): {', '.join(result['unmapped_files'])}")
+    if result.get("skipped_module_files"):
+        print(f"  SKIPPED AT MODULE LEVEL (importorskip, dep absent on this box — "
+              f"the PASS is qualified over these): "
+              f"{', '.join(result['skipped_module_files'])}")
     if result["elapsed_s"] is not None:
         print(f"  elapsed: {result['elapsed_s']}s   log: {result['log']}")
     if tail:

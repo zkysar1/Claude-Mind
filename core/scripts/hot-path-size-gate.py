@@ -18,6 +18,18 @@ would have to be re-written by the very hook that cannot reliably stage a
 file into a pathspec commit). A file that is NEW at HEAD is capped by its
 set's `new_file_cap`. A rename keeps the OLD path's HEAD size as its cap.
 
+THE ALWAYS-LOADED CEILING (g-353-151) — A CORPUS RULE, NOT A PER-FILE ONE
+-------------------------------------------------------------------------
+Claude Code (2.1.281+) flags a session once CLAUDE.md plus every
+`.claude/rules/*.md` WITHOUT `paths:` front matter pass 150,000 chars. The
+ratchet cannot see that total grow: a NEW rule, or a rule losing its `paths:`
+front matter, adds to it while no existing file grows. So when a commit touches
+an instruction path, `instruction_ceiling` in the budget sums the WHOLE
+always-loaded set in the staged tree and refuses the commit if that total is
+over the ceiling AND larger than at HEAD — the second tier's ceiling rule,
+applied to the corpus through the same decide(), so a commit that shrinks an
+over-ceiling set is never blocked. How chars are counted: instruction_chars().
+
 WHY A commit-msg HOOK AND NOT A pre-commit GATE
 ------------------------------------------------
 The sanctioned bypass is a commit-message TRAILER — `size-budget-override:
@@ -53,14 +65,15 @@ MODES
   (hook)   --commit-msg-file <path>   the commit-msg hook shape; exit 1 = refuse
   --check                              HEAD-based report of every budgeted file
                                        + ratchet `hot_path_total_bytes` in
-                                       meta/audit-baselines.yaml (lower_is_better).
+                                       meta/audit-baselines.yaml (lower_is_better)
+                                       + the always-loaded total vs its ceiling.
                                        Prints one PASS:/FAIL: line. --no-ratchet
                                        reads only; --hard-gate exits 1 on FAIL.
   --explain <path>                     what cap this path would get right now.
 
 Tests: core/scripts/tests/test_hot_path_size_gate.py (refuse-growth,
 tighten-on-shrink, new-file cap, rename, override->ledger, merge skip,
-pathspec-commit index visibility, trailer parsing).
+pathspec-commit index visibility, trailer parsing, the instruction ceiling).
 """
 from __future__ import annotations
 
@@ -86,6 +99,7 @@ RATCHET_KEY = "hot_path_total_bytes"
 # 2026-08-18 split (). Never widen RATCHET_KEY's population instead.
 ONDEMAND_RATCHET_KEY = "on_demand_skill_bytes"
 TAG = "[hot-path-size-gate]"
+INSTRUCTION_KIND = "instructions_over_ceiling"
 
 
 # ─── budget ──────────────────────────────────────────────────────────────────
@@ -160,7 +174,19 @@ def load_budget(repo: Path) -> dict:
         compiled.append({"name": name, "patterns": [glob_to_regex(x) for x in paths],
                          "globs": list(paths), "new_file_cap": cap, "ceiling": ceiling})
     trailer = str(data.get("override_trailer") or DEFAULT_TRAILER)
-    return {"sets": compiled, "trailer": trailer}
+    # Carried through EXPLICITLY for the reason given at `ceiling` above: a key
+    # this loader does not rebuild is silently dropped and its rule is inert.
+    ic = data.get("instruction_ceiling")
+    instruction = None
+    if ic is not None:
+        chars = ic.get("chars") if isinstance(ic, dict) else None
+        ipaths = ic.get("paths") if isinstance(ic, dict) else None
+        if not isinstance(chars, int) or chars <= 0 or not isinstance(ipaths, list) or not ipaths:
+            raise ValueError(f"{BUDGET_REL}: `instruction_ceiling` needs a positive int `chars` "
+                             f"and non-empty `paths`")
+        instruction = {"chars": chars, "patterns": [glob_to_regex(x) for x in ipaths],
+                       "globs": list(ipaths)}
+    return {"sets": compiled, "trailer": trailer, "instruction_ceiling": instruction}
 
 
 def set_for(path: str, budget: dict):
@@ -208,6 +234,34 @@ def decide(staged_size: int, head_size, new_file_cap: int, ceiling=None):
     if head_size is None:
         return ("new_over_cap" if staged_size > new_file_cap else "ok", new_file_cap)
     return ("grew" if staged_size > head_size else "ok", head_size)
+
+
+# Front matter as Claude Code reads it: a leading `---` block. A rule whose front
+# matter declares `paths:` loads only when a matching file is read, so it is not
+# always-loaded and the notice does not count it.
+_FRONT_MATTER = re.compile(r"\A﻿?---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.S)
+_PATHS_KEY = re.compile(r"(?m)^paths[ \t]*:")
+
+
+def instruction_chars(text: str):
+    """Chars one instruction file adds to the always-loaded total, or None when
+    `paths:` front matter scopes it to on-demand loading.
+
+    Counted the way the notice counts, as calibrated 2026-09-27 on a Windows
+    checkout (core.autocrlf=true): the body AFTER the front matter, in UTF-16
+    code units (a JS string length), with every newline counted as CRLF. Over
+    the same 32 files that read 203,375 against the notice's 202.3k (CLAUDE.md
+    45,925 vs its 45.9k exactly), so it errs HIGH by ~0.5% — the safe side for a
+    ceiling. Normalising to LF first and adding one char per newline gives the
+    same number from an LF blob, a CRLF blob and a CRLF worktree, so every box
+    enforces the Windows worst case.
+    """
+    text = text.replace("\r\n", "\n")
+    m = _FRONT_MATTER.match(text)
+    if m and _PATHS_KEY.search(m.group(1)):
+        return None
+    body = text[m.end():] if m else text
+    return len(body.encode("utf-16-le")) // 2 + body.count("\n")
 
 
 # ─── override trailer ────────────────────────────────────────────────────────
@@ -272,10 +326,71 @@ def staged_changes(repo: Path):
     return rows
 
 
+def _cat_blobs(repo: Path, specs):
+    """{spec: text | None} for `<rev>:<path>` specs through ONE `git cat-file
+    --batch` (an empty rev reads the index git hands the hook)."""
+    if not specs:
+        return {}
+    r = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"],
+                       input="".join(s + "\n" for s in specs).encode("utf-8"), capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"git cat-file --batch: {r.stderr.decode('utf-8', 'replace').strip()}")
+    out, i, blobs = r.stdout, 0, {}
+    for spec in specs:
+        nl = out.index(b"\n", i)
+        header = out[i:nl].split()
+        i = nl + 1
+        if header[-1:] == [b"missing"] or len(header) != 3:
+            blobs[spec] = None
+            continue
+        size = int(header[2])
+        blobs[spec] = out[i:i + size].decode("utf-8", "replace") if header[1] == b"blob" else None
+        i += size + 1
+    return blobs
+
+
+def instruction_total(repo: Path, rev: str, ic: dict):
+    """(chars, files) of the always-loaded set in `rev`'s tree — or, when rev is
+    "", in the index git hands the hook, so a pathspec commit is judged exactly
+    as it will be committed."""
+    if rev:
+        listing = _git(repo, "ls-tree", "-r", "-z", "--name-only", rev, check=False)
+    else:
+        listing = _git(repo, "ls-files", "-z", "--cached")
+    paths = [p for p in listing.split("\0") if p and any(rx.match(p) for rx in ic["patterns"])]
+    total = files = 0
+    for text in _cat_blobs(repo, [f"{rev}:{p}" for p in paths]).values():
+        n = None if text is None else instruction_chars(text)
+        if n is not None:
+            total += n
+            files += 1
+    return total, files
+
+
+def evaluate_instructions(repo: Path, budget: dict, changes):
+    """The corpus row for `instruction_ceiling`, or None when it is not configured
+    or the commit touches no instruction path — then the total cannot have grown
+    (a deletion only shrinks it, and merges never reach here). The row keeps the
+    byte-named keys the refusal text and the ledger read; `unit` says they hold
+    chars."""
+    ic = budget.get("instruction_ceiling")
+    if not ic or not any(rx.match(p) for _s, old, new in changes for p in (old, new)
+                         for rx in ic["patterns"]):
+        return None
+    staged, files = instruction_total(repo, "", ic)
+    head, _ = instruction_total(repo, "HEAD", ic)
+    kind, cap = decide(staged, head, ic["chars"], ic["chars"])
+    return {"path": f"always-loaded instructions ({files} files)", "set": "instruction-ceiling",
+            "staged_bytes": staged, "head_bytes": head, "cap_bytes": cap,
+            "kind": "ok" if kind == "ok" else INSTRUCTION_KIND,
+            "delta_bytes": staged - head, "unit": "chars"}
+
+
 def evaluate(repo: Path, budget: dict):
     """Return (violations, checked): each entry a dict with path/set/staged/head/cap/kind."""
     checked, violations = [], []
-    for status, old, new in staged_changes(repo):
+    changes = staged_changes(repo)
+    for status, old, new in changes:
         s = set_for(new, budget)
         if s is None:
             continue
@@ -300,6 +415,11 @@ def evaluate(repo: Path, budget: dict):
         checked.append(row)
         if kind != "ok":
             violations.append(row)
+    row = evaluate_instructions(repo, budget, changes)
+    if row is not None:
+        checked.append(row)
+        if row["kind"] != "ok":
+            violations.append(row)
     return violations, checked
 
 
@@ -311,8 +431,11 @@ def _fmt(n) -> str:
 
 def refusal_text(violations, trailer: str, note: str = "") -> str:
     ceiling_hits = [v for v in violations if v["kind"] == "grew_over_ceiling"]
-    hot_hits = [v for v in violations if v["kind"] != "grew_over_ceiling"]
+    instruction_hits = [v for v in violations if v["kind"] == INSTRUCTION_KIND]
+    hot_hits = [v for v in violations if v["kind"] not in ("grew_over_ceiling", INSTRUCTION_KIND)]
     header = ("REFUSED — hot-path files may not grow (g-115-6470)" if hot_hits
+              else "REFUSED — the always-loaded instructions may not grow past their ceiling (g-353-151)"
+              if instruction_hits
               else "REFUSED — an on-demand skill may not grow past its injection ceiling (g-115-6690)")
     lines = [f"{TAG} {header}:"]
     for v in violations:
@@ -323,6 +446,10 @@ def refusal_text(violations, trailer: str, note: str = "") -> str:
             lines.append(f"  {v['path']}  {_fmt(v['head_bytes'])} → {_fmt(v['staged_bytes'])} B "
                          f"(+{v['delta_bytes']:,}; already over the {_fmt(v['cap_bytes'])} B injection "
                          f"ceiling for set '{v['set']}' — it may shrink, not grow)")
+        elif v["kind"] == INSTRUCTION_KIND:
+            lines.append(f"  {v['path']}  {_fmt(v['head_bytes'])} → {_fmt(v['staged_bytes'])} chars "
+                         f"(+{v['delta_bytes']:,}; over the {_fmt(v['cap_bytes'])}-char ceiling — "
+                         f"the total may shrink, not grow)")
         else:
             lines.append(f"  {v['path']}  NEW at {_fmt(v['staged_bytes'])} B > "
                          f"new_file_cap {_fmt(v['cap_bytes'])} for set '{v['set']}'")
@@ -339,6 +466,16 @@ def refusal_text(violations, trailer: str, note: str = "") -> str:
             "      the shape core/config/gates.yaml and core/config/hot-path-budget.yaml already use",
             "  • per-item WHY narrative              → a registry field, or core/config/rationale/<kebab>.md",
             "  • reference catalogs                  → core/config/conventions/<name>.md, loaded on demand",
+        ]
+    if instruction_hits:
+        lines += [
+            "CLAUDE.md plus every .claude/rules/*.md WITHOUT `paths:` front matter loads on EVERY turn, and",
+            "Claude Code flags the session once they pass its instruction-size limit. This total grows with",
+            "no single file growing (a NEW rule, or a rule losing its `paths:` front matter), so it is judged",
+            "whole. Make room rather than add:",
+            "  • a rule that only matters for some files → `paths:` front matter, so it loads on demand",
+            "  • narrative, incidents, catalogs in an existing rule → core/config/rationale/<kebab>.md or a",
+            "      convention, leaving the imperative and one pointer line",
         ]
     if hot_hits:
         lines += [
@@ -395,9 +532,11 @@ def write_ledger(repo: Path, violations, justification: str, message: str) -> st
                 "head_before": head,
                 "commit_subject": subject[:200],
                 "files": [{k: v[k] for k in ("path", "set", "head_bytes", "staged_bytes",
-                                            "cap_bytes", "kind", "delta_bytes")}
+                                            "cap_bytes", "kind", "delta_bytes", "unit") if k in v}
                           for v in violations],
-                "net_bytes": sum(v["delta_bytes"] for v in violations),
+                # the instruction-ceiling row counts chars, which never add into bytes
+                "net_bytes": sum(v["delta_bytes"] for v in violations
+                                 if v.get("unit", "bytes") == "bytes"),
             },
         }
         locked_append_jsonl(_ledger_path(), record)
@@ -433,8 +572,8 @@ def run_gate(repo: Path, msg_file, out=sys.stdout) -> int:
     justification, note = parse_override(message, budget["trailer"])
     if justification:
         warn = write_ledger(repo, violations, justification, message)
-        grew = ", ".join(f"{v['path']} {'+' if v['delta_bytes'] >= 0 else ''}{v['delta_bytes']:,} B"
-                         for v in violations)
+        grew = ", ".join(f"{v['path']} {'+' if v['delta_bytes'] >= 0 else ''}{v['delta_bytes']:,} "
+                         f"{'chars' if v.get('unit') == 'chars' else 'B'}" for v in violations)
         print(f"{TAG} OVERRIDE accepted — {grew} — recorded to override-bypass-ledger.jsonl"
               f"{'' if not warn else ' (WARN: ' + warn + ')'}", file=out)
         return 0
@@ -512,6 +651,17 @@ def run_check(repo: Path, no_ratchet: bool, hard_gate: bool, as_json: bool, out=
     except Exception as e:
         print(f"FAIL: {TAG} cannot read HEAD: {e}", file=out)
         return 1 if hard_gate else 0
+    # The always-loaded total here is CORPUS STATE at HEAD, never a verdict on
+    # anyone's diff (guard-5436); the commit-time arm is what judges a change.
+    instr = None
+    ic = budget.get("instruction_ceiling")
+    if ic:
+        try:
+            chars, nfiles = instruction_total(repo, "HEAD", ic)
+            instr = {"chars": chars, "files": nfiles, "ceiling": ic["chars"],
+                     "over": chars > ic["chars"]}
+        except Exception as e:
+            instr = {"error": str(e)}
     per_set = {}
     for path, n in sizes.items():
         s = set_for(path, budget)["name"]
@@ -584,6 +734,17 @@ def run_check(repo: Path, no_ratchet: bool, hard_gate: bool, as_json: bool, out=
                        f"(baseline {ratchet.get('baseline'):,} B); "
                        f"{ONDEMAND_RATCHET_KEY} {ondemand_ratchet.get('verdict')} at {ondemand_total:,} B "
                        f"(baseline {ondemand_ratchet.get('baseline'):,} B)")
+    if instr is not None:
+        if "error" in instr:
+            verdict += f"; always-loaded instructions unreadable: {instr['error']}"
+        else:
+            verdict += (f"; always-loaded instructions {instr['chars']:,} chars in {instr['files']} "
+                        f"files, {'OVER' if instr['over'] else 'within'} the {instr['ceiling']:,}-char "
+                        f"ceiling (corpus state at HEAD)")
+            if instr["over"]:
+                if verdict.startswith("PASS:"):
+                    verdict = "FAIL:" + verdict[len("PASS:"):]
+                rc = 1 if hard_gate else 0
 
     if as_json:
         # `total_bytes` keeps its name and its meaning (the whole corpus), but a
@@ -594,12 +755,15 @@ def run_check(repo: Path, no_ratchet: bool, hard_gate: bool, as_json: bool, out=
                           "hot_path_bytes": hot_total, "on_demand_bytes": ondemand_total,
                           "files": len(sizes),
                           "per_set": per_set, "largest": largest, "ratchet": ratchet,
-                          "on_demand_ratchet": ondemand_ratchet,
+                          "on_demand_ratchet": ondemand_ratchet, "instructions": instr,
                           "verdict": verdict}, indent=1), file=out)
         return rc
     print(f"{TAG} hot-path corpus at HEAD {head}: {len(sizes)} files, {total:,} B", file=out)
     for name, v in per_set.items():
         print(f"  {name:<16} {v['files']:>3} files {v['bytes']:>10,} B", file=out)
+    if instr and "chars" in instr:
+        print(f"  {'always-loaded':<16} {instr['files']:>3} files {instr['chars']:>10,} chars "
+              f"(ceiling {instr['ceiling']:,})", file=out)
     print("  largest:", file=out)
     for path, n in largest:
         print(f"    {n:>9,}  {path}", file=out)

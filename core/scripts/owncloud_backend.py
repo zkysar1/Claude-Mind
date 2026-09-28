@@ -295,6 +295,25 @@ class NoClaimError(Exception):
     the claim table."""
 
 
+# g-115-11275. The no_claim refusal text, named so its wording is testable. Two
+# readers bound it: server.py hands the refused writer only str(e)[:600], and
+# other files quote the diagnosis sentences, which therefore stay verbatim. The
+# remedy is the delivery-first order (/encode-session NO_CLAIM BRANCH,
+# g-115-10122); it replaced "relay to the coordination board", because five
+# board relays sat undelivered 5-21h while a routed goal landed in ~3.5h.
+NO_CLAIM_MESSAGE = (
+    "no_claim: this box does not hold the live runner claim "
+    "for agent dir '%s'. The write did NOT land, and NO "
+    "retry or refresh can EVER succeed from here -- this box "
+    "is permanently behind the claim-holder's advancing "
+    "version. STRUCTURAL, not a race: do not retry, do not "
+    "refresh. Deliver it instead: (1) run the same write on the holder's box "
+    "(runner-claim.sh status names it); (2) else file a world goal with the "
+    "payload inline and intended_agent + handoff_to set to that agent. A board "
+    "post alone is not delivery; if you post one, tag it requires_action_by, "
+    "action_type, severity.")
+
+
 class ConflictError(Exception):
     """An ``If-Match`` conditional PUT was rejected (the object changed since the
     in-lock read). The caller MUST re-run the whole read-modify-write; the
@@ -1850,16 +1869,7 @@ class OwnCloudBackend:
                         _own_carrier is not None
                         and Path(path).resolve() == _own_carrier[0].resolve())
                     if not _is_own_carrier:
-                        raise NoClaimError(
-                            "no_claim: this box does not hold the live runner claim "
-                            "for agent dir '%s'. The write did NOT land, and NO "
-                            "retry or refresh can EVER succeed from here -- this box "
-                            "is permanently behind the claim-holder's advancing "
-                            "version. STRUCTURAL, not a race: do not retry, do not "
-                            "refresh. Relay instead -- post the full payload plus "
-                            "registration instructions to the coordination board for "
-                            "the claim-holding instance to execute (worked example: "
-                            "msg-20260827-110602-bravo-6570, g-364-104)." % _agent)
+                        raise NoClaimError(NO_CLAIM_MESSAGE % _agent)
         except NoClaimError:
             raise
         except Exception as _consult_exc:

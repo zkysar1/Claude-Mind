@@ -108,6 +108,24 @@ def main() -> int:
                 "encoding_capture": [
                     {"goal_id": "g-000-01", "fact": "worker tree-worthy fact"},
                 ],
+                # : pending micro-hypotheses cross the Step-5 boundary —
+                # their resolves_when signals arrive after the session ends, so a
+                # reset that wipes the slot destroys the population the
+                # auto-settle mechanism exists to evaluate. Not a capture lane,
+                # but it joins this same by-name exercise: one representative
+                # member is not coverage of a family (), and the
+                # pre-fix wipe was measured three times (29/4/5 micros lost at
+                # /stop consolidations on three boxes).
+                "micro_hypotheses": [
+                    {"claim": "next cycle's ppe build changes per-step logging",
+                     "confidence": 0.6, "horizon": "short",
+                     "resolves_when": "next g-326-85 cycle completes",
+                     "outcome": None},
+                    {"claim": "carried pending micro with an explicit future date gate",
+                     "confidence": 0.5, "horizon": "long",
+                     "resolves_when": "2026-09-07 gate elapses",
+                     "outcome": None},
+                ],
             }
 
             data = wm.read_wm()
@@ -381,17 +399,25 @@ def test_daemon_reset_endpoint_preserves_surviving_slot():
             wm_path = (df.project_root / "agents" / "alpha" / "session"
                        / "working-memory.yaml")
             clusters = [{"label": "asp-1", "summary": "framework cluster"}]
+            # : a pending micro — its resolves_when names a signal that
+            # arrives after this session ends, so it must cross the reset.
+            micros = [{"claim": "next cycle's per-step logging changes",
+                       "confidence": 0.6, "horizon": "short",
+                       "resolves_when": "next g-326-85 cycle completes",
+                       "outcome": None}]
             meta = {"updated_at": "2026-07-12T01:00:00",
                     "accessed_at": "2026-07-12T01:00:00", "update_count": 1}
             seeded = {
                 "session_start": "2026-07-12T00:00:00",
                 "slots": {
                     "journal_cluster_summaries": clusters,
+                    "micro_hypotheses": micros,
                     "last_test_tick": "2026-07-12T01:00:00",
                     "reset_canary": "wipe_me",
                 },
                 "slot_meta": {
                     "journal_cluster_summaries": dict(meta),
+                    "micro_hypotheses": dict(meta),
                     "last_test_tick": dict(meta),
                     "reset_canary": dict(meta),
                 },
@@ -405,7 +431,8 @@ def test_daemon_reset_endpoint_preserves_surviving_slot():
                 body = json.loads(resp.read().decode("utf-8"))
 
             assert body.get("ok") is True, f"reset endpoint failed: {body!r}"
-            assert body.get("preserved_surviving") == ["journal_cluster_summaries"], (
+            assert sorted(body.get("preserved_surviving", [])) == \
+                ["journal_cluster_summaries", "micro_hypotheses"], (
                 f"response missing/wrong preserved_surviving: {body!r}"
             )
 
@@ -414,6 +441,10 @@ def test_daemon_reset_endpoint_preserves_surviving_slot():
                 "surviving slot value lost across daemon reset"
             assert after["slot_meta"]["journal_cluster_summaries"]["update_count"] == 1, \
                 "surviving slot_meta lost across daemon reset"
+            assert after["slots"]["micro_hypotheses"] == micros, \
+                "pending micro_hypotheses lost across daemon reset (g-115-5729)"
+            assert after["slot_meta"]["micro_hypotheses"]["update_count"] == 1, \
+                "micro_hypotheses slot_meta lost across daemon reset (g-115-5729)"
             assert after["slots"]["last_test_tick"] == "2026-07-12T01:00:00", \
                 "cadence tracker lost across daemon reset"
             assert after["slots"].get("reset_canary") is None, \

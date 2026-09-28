@@ -45,7 +45,11 @@ def _read_store(path):
 
 
 def _fresh_stamp(base):
-    (base / es.STAMP_NAME).write_text(str(time.time()))
+    # The stamp lives in the dot-dir (); write it there directly —
+    # a flat stamp here would be RELOCATED by the next record/flush, so the
+    # "fresh" interval gate this helper arms would never fire.
+    (base / es.SPOOL_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    (base / es.SPOOL_DIR_NAME / es.STAMP_NAME).write_text(str(time.time()))
 
 
 @pytest.fixture
@@ -80,10 +84,13 @@ def count_writes(monkeypatch):
 
 def test_spool_names_are_sync_excluded():
     """A synced counter spool would be drained on EVERY box that pulls it,
-    multiplying each increment by the fleet size."""
+    multiplying each increment by the fleet size. The dot-dir is walk-pruned
+    AND every file basename stays excluded flat, so a spool in EITHER layout
+    (new dot-dir, legacy flat re-created by old code) can never sync."""
     import owncloud_sync
     for name in es.SYNC_EXCLUDED_NAMES:
         assert name in owncloud_sync._EXCLUDE_NAMES, name
+    assert es.SPOOL_DIR_NAME in owncloud_sync._EXCLUDE_DIRS
     assert set(es.SYNC_EXCLUDED_NAMES) == {
         es.SPOOL_NAME, es.FLUSHING_NAME, es.STAMP_NAME}
     assert es.FLUSH_LOCK_NAME.endswith(".lock")  # rides the *.lock glob
@@ -93,7 +100,7 @@ def test_spool_names_are_sync_excluded():
 
 def test_record_appends_one_delta_line(store):
     assert es.record(store, "exp-a", "retrieval_count") is True
-    lines = (store.parent / es.SPOOL_NAME).read_text().splitlines()
+    lines = (es.spool_dir(store) / es.SPOOL_NAME).read_text().splitlines()
     assert len(lines) == 1
     rec = json.loads(lines[0])
     assert (rec["id"], rec["counter"], rec["delta"]) == (
@@ -152,9 +159,9 @@ def test_fold_sums_stamps_and_recomputes_in_one_write(store, count_writes):
     assert a["utility_ratio"] == round(2 / 7, 4)
     assert a["last_retrieved"] == time.strftime("%Y-%m-%d")
     assert recs["exp-b"]["retrieval_stats"]["retrieval_count"] == 1
-    assert not (store.parent / es.SPOOL_NAME).exists()
-    assert not (store.parent / es.FLUSHING_NAME).exists()
-    assert (store.parent / es.STAMP_NAME).exists()
+    assert not (es.spool_dir(store) / es.SPOOL_NAME).exists()
+    assert not (es.spool_dir(store) / es.FLUSHING_NAME).exists()
+    assert (es.spool_dir(store) / es.STAMP_NAME).exists()
 
 
 def test_blockless_record_gets_a_block_only_from_a_retrieval(store, count_writes):
@@ -183,7 +190,7 @@ def test_unknown_ids_are_dropped_loudly_without_a_write(store, count_writes,
         "flushed", 0, ["exp-ghost"])
     assert store.read_bytes() == before
     assert "exp-ghost" in capsys.readouterr().err
-    assert not (store.parent / es.FLUSHING_NAME).exists()
+    assert not (es.spool_dir(store) / es.FLUSHING_NAME).exists()
 
 
 # --- batches that cannot land ------------------------------------------------
@@ -194,7 +201,7 @@ def test_absent_store_retains_the_batch(tmp_path):
     exp = tmp_path / "experience.jsonl"
     es.record(exp, "exp-a", "retrieval_count")
     assert es.flush(exp, force=True)["status"] == "retained"
-    assert (tmp_path / es.FLUSHING_NAME).exists()
+    assert (tmp_path / es.SPOOL_DIR_NAME / es.FLUSHING_NAME).exists()
 
     _write_store(exp, [{"id": "exp-a", "retrieval_stats": {
         "retrieval_count": 1, "times_useful": 0}}])
@@ -224,13 +231,13 @@ def test_no_claim_drops_the_batch_and_stamps(store, monkeypatch):
 
     assert out == {"status": "no_claim", "dropped": 2}
     assert store.read_bytes() == before
-    assert not (store.parent / es.SPOOL_NAME).exists()
-    assert not (store.parent / es.FLUSHING_NAME).exists()
-    assert (store.parent / es.STAMP_NAME).exists()
+    assert not (es.spool_dir(store) / es.SPOOL_NAME).exists()
+    assert not (es.spool_dir(store) / es.FLUSHING_NAME).exists()
+    assert (es.spool_dir(store) / es.STAMP_NAME).exists()
 
 
 def test_residue_drains_first_and_torn_lines_are_skipped(store, capsys):
-    (store.parent / es.FLUSHING_NAME).write_text(
+    (es.spool_dir(store) / es.FLUSHING_NAME).write_text(
         json.dumps({"id": "exp-a", "counter": "retrieval_count", "delta": 1,
                     "ts": "2026-09-20T10:00:00"}) + "\n"
         + '{"id": "exp-a", "coun\n', encoding="utf-8")
@@ -282,7 +289,7 @@ def test_load_experiences_spools_instead_of_rewriting(tmp_path, store,
     assert {x["id"] for x in selected} == {"exp-a", "exp-b", "exp-c"}
     assert store.read_bytes() == before, "a retrieval must not rewrite the store"
     spooled = sorted(json.loads(line)["id"] for line in
-                     (store.parent / es.SPOOL_NAME).read_text().splitlines())
+                     (es.spool_dir(store) / es.SPOOL_NAME).read_text().splitlines())
     assert spooled == ["exp-a", "exp-b", "exp-c"]
 
 
@@ -309,3 +316,71 @@ def test_failed_spool_append_falls_back_for_that_id_only(tmp_path, store,
     recs = _read_store(store)
     assert recs["exp-a"]["retrieval_stats"]["retrieval_count"] == 5
     assert recs["exp-b"]["retrieval_stats"]["retrieval_count"] == 1
+
+
+# --- the legacy flat -> dot-dir migration () -------------------------
+
+def _flat_line(rid, counter="retrieval_count"):
+    return json.dumps({"id": rid, "counter": counter, "delta": 1,
+                       "ts": "2026-09-20T10:00:00"}) + "\n"
+
+
+def test_migrate_legacy_moves_flat_files_on_first_use(store):
+    base = store.parent
+    (base / es.SPOOL_NAME).write_text(_flat_line("exp-a"), encoding="utf-8")
+    (base / es.FLUSHING_NAME).write_text(_flat_line("exp-b"), encoding="utf-8")
+    (base / es.STAMP_NAME).write_text("1234.0", encoding="utf-8")
+    # A flat lock may sit beside the spool; it must NOT be migrated, so an
+    # old-code drain on this box is still excluded by the same lock.
+    (base / es.FLUSH_LOCK_NAME).write_text("stale", encoding="utf-8")
+
+    es.record(store, "exp-a", "retrieval_count")  # triggers migrate_legacy
+
+    d = es.spool_dir(store)
+    assert d == base / es.SPOOL_DIR_NAME
+    assert d.name == ".experience-stats"
+    lines = (d / es.SPOOL_NAME).read_text().splitlines()
+    assert [json.loads(l)["id"] for l in lines] == ["exp-a", "exp-a"]
+    assert json.loads((d / es.FLUSHING_NAME).read_text())["id"] == "exp-b"
+    assert (d / es.STAMP_NAME).read_text() == "1234.0"
+    for name in (es.SPOOL_NAME, es.FLUSHING_NAME, es.STAMP_NAME):
+        assert not (base / name).exists(), "flat legacy file must be relocated"
+    assert (base / es.FLUSH_LOCK_NAME).exists(), "the lock stays flat"
+
+
+def test_migrate_legacy_merges_and_takes_stamp_max(store):
+    base = store.parent
+    (base / es.SPOOL_NAME).write_text(_flat_line("exp-a"), encoding="utf-8")
+    (base / es.STAMP_NAME).write_text("9999.0", encoding="utf-8")
+    (base / es.SPOOL_DIR_NAME).mkdir()
+    (base / es.SPOOL_DIR_NAME / es.SPOOL_NAME).write_text(
+        _flat_line("exp-b"), encoding="utf-8")
+    (base / es.SPOOL_DIR_NAME / es.STAMP_NAME).write_text(
+        "5000.0", encoding="utf-8")
+
+    es.record(store, "exp-a", "retrieval_count")
+
+    d = es.spool_dir(store)
+    lines = (d / es.SPOOL_NAME).read_text().splitlines()
+    assert len(lines) == 3  # new line + both sides of the merged spool
+    ids = sorted(json.loads(l)["id"] for l in lines)
+    assert ids == ["exp-a", "exp-a", "exp-b"]
+    assert (d / es.STAMP_NAME).read_text() == "9999.0", "max wins"
+    assert not (base / es.SPOOL_NAME).exists()
+    assert not (base / es.STAMP_NAME).exists()
+
+
+def test_migrate_legacy_is_idempotent_and_never_raises(store):
+    d = es.spool_dir(store)
+    assert d.exists()
+    d2 = es.spool_dir(store)  # second pass: nothing to move
+    assert d2 == d and d2.exists()
+    assert es.migrate_legacy(store) == d
+
+
+def test_migrate_legacy_no_stray_dir_for_absent_store(tmp_path):
+    # No agent dir at all: record must fail over to the caller's fallback
+    # WITHOUT creating a stray dot-dir in a nonexistent path.
+    assert es.record(tmp_path / "absent-dir" / "experience.jsonl",
+                     "exp-a", "retrieval_count") is False
+    assert not (tmp_path / "absent-dir").exists()

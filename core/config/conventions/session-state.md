@@ -22,6 +22,23 @@ with different SIDs (e.g., compact-checkpoint at autocompact resume). Plural
 `sessions/<SID>/` dirs when the 3-signal predicate (mtime > 24h + running-sid
 mismatch + heartbeat stale) fires. Per-session ephemerals go with the dir.
 
+**Binding resolver and writer** (moved verbatim from CLAUDE.md, g-353-151):
+
+Resolver: `core/scripts/_session_binding.py::resolve_binding(sid, root)` —
+tries Phase 2.6 layout first, falls back to legacy. Backward-compatible
+shell wrapper: `bash core/scripts/session-binding-read.sh <SID>` (default
+output: agent name).
+
+Writer: `core/scripts/session-binding-write.{py,sh}` — called by /start at
+each of its 4 binding sites with `--retire-legacy` to delete any stale
+`.active-agent-<SID>` from a prior run AND (g-115-1814) retire any OTHER
+agent's stale `sessions/<SID>/binding.yaml` for the same SID. A re-bound SID
+(`/start A` → `/stop A` → `/start B` in one terminal) otherwise leaves A's
+`binding.yaml` behind, which can shadow B's live one in `resolve_binding`'s
+`iterdir()`-order scan — injecting the wrong agent (observed: alpha SID
+resolving to bravo=IDLE). The retirement guarantees exactly one `binding.yaml`
+per SID, so the resolver's iterdir order is irrelevant.
+
 ## Phase 1B — Body Manifest (Mind/Body convergence, g-306-62)
 
 A **Body** is a forked instance of the Mind keyed by `unitKey` (locally the
@@ -455,6 +472,91 @@ the writer always produces the same name.
 
 ---
 
+# Pre-Landed Birth Contract
+
+A mind reaches its first autonomous boot by one of two routes, and they differ in
+who installs its starting documents (g-377-32).
+
+- **Interview route.** agent-state is absent (UNINITIALIZED) and so is the
+  `.initialized` marker, so `/start` runs the Phase A/B/C interview. Phase C
+  installs the hook slots (C0.5), The Program (C1),
+  curriculum stages (C6) and `self.md` (C7), and it stops for a human at C5. A
+  staged file does not waive that stop (`core/config/start-phase-c.md`).
+- **Pre-landed route.** A provisioner writes the agent's `.initialized` marker,
+  and optionally an `IDLE` agent-state, BEFORE `/start`. With `IDLE`, `/start`
+  takes the IDLE branch into `/boot`. With no agent-state, the marker sends
+  `/start` through Phase A-0, which resumes the agent as an existing one
+  (`core/config/start-uninitialized-ceremony.md`). Neither asks anything. This is
+  the only headless route.
+
+No init script seeds the hook slots or the curriculum stages, so the interview is
+their only installer, and a pre-landed birth must supply every element below
+itself. A mind born without them still runs. With no curriculum stage, the
+curriculum contract check permits every action ("no curriculum configured").
+
+| Check id | Path | Present when | Interview installer | Does NOT count |
+|---|---|---|---|---|
+| `agent-initialized` | `agents/<agent>/.initialized` | the file exists | `init-agent.sh` (C0) | — |
+| `agent-state` | `agents/<agent>/session/agent-state` | the value is `IDLE` or `RUNNING`, or it reads as `UNINITIALIZED` while the marker exists | C8 (IDLE), then C9.9 (RUNNING) | `UNINITIALIZED` with no marker (the interview runs); any other value |
+| `self-md` | `agents/<agent>/self.md` | it has non-whitespace content | C7 | the zero-byte placeholder `init-agent.sh` seeds |
+| `program-md` | `world/program.md` | it has non-whitespace content | C1 | the zero-byte placeholder `init-world.sh` seeds |
+| `curriculum-stage` | `agents/<agent>/curriculum.yaml` | `current_stage` is set and names an entry of `stages` by `id` | C6 | the `initial_state` seed (`current_stage: null`, `stages: []`) |
+| `hook-slot:<slot>` | `world/conventions/<slot>.md` | it has non-whitespace content | C0.5 | an empty file |
+
+The hook slots are the ones with a default template, one per
+`core/config/templates/<slot>-default.md`. That is exactly the set C0.5 copies:
+`pre-execution` and `post-execution` today (`domain-hooks.md` "Canonical Hook
+Slots"). Slots without a default template are on-demand and outside the contract.
+
+The two route elements follow `/start`'s own branching. `session-state-get.sh`
+reads an absent agent-state as `UNINITIALIZED`, which runs the interview only
+when the marker is absent too. The marker is required even beside an `IDLE`
+agent-state. Without it the first boot's `init-agent.sh` treats the agent as new
+and re-seeds `curriculum.yaml`, `profile.yaml` and `developmental-stage.yaml` over
+the provisioned files, so the curriculum then reads as the init seed. At boot both
+route elements always read present, because `init-mind.sh` writes the marker
+before the check and runs the check only when `RUNNING`. They exist for a
+provisioner that runs the check before `/start`.
+
+**The check.** `core/scripts/birth-contract-check.py <agent>` reports each element
+as present or missing, with the reason. Placeholders count as missing. An element
+it cannot read is reported missing with the read error, never skipped. Exit 0 =
+all present, 1 = something missing, 2 = usage error. It reads the world the named
+agent's own processes resolve, whichever agent the caller is bound to (g-377-38).
+An explicit `MIND_WORLD` in its environment overrides that, as it does for every
+path resolver.
+
+`init-mind.sh` runs the check after initializing, but only when agent-state is
+`RUNNING`. That excludes the interview, whose C0 runs `init-mind.sh` before C0.5,
+C1, C6 and C7, and before C9.9 sets RUNNING. A RUNNING loop reaches the check in
+two ways: `/boot` Phase -2, which runs `init-mind.sh` on every `/boot`, and the loop
+entry battery's `world_not_initialized` row, which runs it only while a tier's
+`.initialized` marker is absent. What that covers was measured on the served-run
+corpus (g-377-38, 2026-09-27; sources in that goal's closure note):
+
+- 85 of the 103 served runs that invoked `/aspirations` also invoked `/boot`.
+- The corpus's only boot-less first run still ran `init-mind.sh`, through the
+  battery row. Its provisioner lands only the agent's marker, so the world and
+  meta markers were still absent.
+- Not covered: a run that skips `/boot` on a mind whose three markers already
+  exist, such as a relaunch. One examined relaunch ran its loop and never ran
+  `init-mind.sh`.
+- No served seed carried the check at that measurement (0 of 114), so no served
+  run had printed a `[birth-contract]` line.
+
+The check only warns: it never changes `init-mind.sh`'s exit code and never
+installs anything.
+
+**Where the fix belongs.** A missing element is a defect of the birth path, so
+fix the provisioner, not the booting mind. Do not answer the warning by copying
+the default hook templates into a mind born for other work. The defaults describe
+software work (pull latest, run testing circuits, code review, commit and push).
+An identity check that needs domain knowledge belongs to the domain's
+provisioner, not here. One example is whether `self.md` names the identity the
+provisioner was asked to birth.
+
+---
+
 # Agent Mode
 
 - Mode file: `agents/<agent>/session/agent-mode` (plain text, no YAML)
@@ -871,6 +973,15 @@ Skills use `load-conventions.sh` in Step 0 to batch-check which conventions need
 Partial reads (offset/limit/pages) ARE recorded, behind the `#partial:` marker — visible to the
 read-before-edit advisory, invisible to the blocking dedup gate (g-115-3747). They were dropped
 entirely until then, which is what the superseded "partial reads bypass tracking" line described.
+
+**Known defect: concurrent same-agent sessions (g-115-11179, open).** Every Body without a forked
+WM shares ONE tracker, `session/context-reads.txt`, and `_read_tracker_split` deletes it whenever
+the calling session id differs from the header. So two or more live sessions of one agent (for
+example, several assistant sessions on one box) keep erasing each other's read records. Measured
+2026-09-27 with three alpha sessions on one box: reads made earlier in a session were gone, and the
+file held a `#prov:retrieval` line that the session named in its header never ran. Until
+g-115-11179 lands, a pre-edit "has not been Read" or retrieval-floor "NO recorded consultation"
+advisory in a multi-session setup is a lead to check, not evidence of a miss.
 
 **Scripts**: `core/scripts/context-reads.py`, `core/scripts/context-reads-skill-gate.sh`, `core/scripts/load-conventions.sh`.
 

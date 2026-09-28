@@ -853,7 +853,24 @@ RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capt
                          # OBLIGATION, not session bookkeeping. A consolidation-time reset
                          # dropping it reproduces the exact defect the pin exists to fix
                          # (a directive lost to loop momentum while a person waits).
-                         "interrupt_task_open"}
+                         "interrupt_task_open",
+                         # : PENDING micro-hypotheses are live predictions
+                         # whose resolves_when signals routinely arrive AFTER the filing
+                         # session ends. Measured wipes at the consolidation Step-5
+                         # wm-reset boundary: 29 (2026-08-10), 4 (2026-09-14), 5
+                         # (2026-09-26) — three independent agents, three boxes, the
+                         # same boundary, each mitigated by an ad-hoc hand-carry. The
+                         # consumer mechanisms presume carry-forward in their own text
+                         # (reflect-on-outcome Step 1.5 re-checks null signals "next
+                         # batch"; 's derived total re-batches a carried
+                         # pending micro every pass), so a reset that wipes the slot
+                         # destroys the very population they exist to evaluate and
+                         # drops the derived total_all_time by the carried count at
+                         # every session end. Carry is bounded: only SETTLED micros
+                         # leave the slot (batch-micro writeback) and the
+                         # array_limit (30) caps the population, so a carried pending
+                         # set stays live without growing unbounded.
+                         "micro_hypotheses"}
 
 def _is_cadence_tracker(slot_name):
     """True if slot name matches a cadence-tracker pattern — do not evict.

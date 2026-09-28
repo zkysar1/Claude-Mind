@@ -861,6 +861,14 @@ def _post_rollback_board(ctx, rollback_entry):
     env = os.environ.copy()
     if agent:
         env["MIND_AGENT"] = agent
+    # board.py stamps the post with MIND_SID. The copied env's value is whichever
+    # session spawned this daemon, so hand the child the caller's sid or none at all
+    # (guard-2480, ).
+    req_sid = (ctx.headers.get("x-mind-sid") or "").strip()
+    if req_sid:
+        env["MIND_SID"] = req_sid
+    else:
+        env.pop("MIND_SID", None)
     try:
         result = subprocess.run(
             ["py", "-3", bp_script, "post", "--channel", "decisions",

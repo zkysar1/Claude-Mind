@@ -46,6 +46,21 @@ contradiction resolves by finding the PRECONDITION under which each side is righ
 together. learning-philosophy rule 5: retirement is a judgement the loop must make,
 not delegate.
 
+ADJUDICATION MEMORY (g-115-9438). Ported from guardrail-protocol-conflict-check.py,
+which already ships both halves of the seam. Without it this audit re-reported its
+whole slate every run, and three agents on three days re-derived one pair's verdict.
+  - In-record: a guardrail whose rule or action_hint has a LINE starting
+    `reconciled: guard-NNN <reason>` has been adjudicated against guard-NNN. Write
+    it in action_hint, because rule is immutable (guard-5747). The line must name
+    the partner, so a verdict about one pair cannot quiet the entry's other pairs.
+    It must also start the line and carry a concrete id, so prose that DESCRIBES
+    the marker is not read as one (guard-2096).
+  - --known: comma-separated guardrail ids. A pair counts as known when BOTH of
+    its ids are listed (the donor's "owned entirely by known guardrails" rule).
+An adjudicated or known pair is still REPORTED, tagged, and counted in by_class
+exactly as before; it only leaves `novel`. Nothing is suppressed, and there is
+still no --apply.
+
 Usage:
     py -3 core/scripts/guardrail-pair-audit.py --output json
     py -3 core/scripts/guardrail-pair-audit.py --class contradiction --top 20
@@ -93,6 +108,11 @@ STOPWORDS = {
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # First clause = up to the first strong break. Falls back to the whole rule.
 CLAUSE_BREAK_RE = re.compile(r"[.;:]|\s+--\s+|\s+—\s+")
+# Pair form of guardrail-protocol-conflict-check.py's RECONCILED_RE ():
+# a LINE starting `reconciled: guard-NNN <reason>`. See the module docstring.
+RECONCILED_PAIR_RE = re.compile(
+    r"^[ \t]*reconciled:[ \t]*(guard-\d+)\b[ \t:;,.—–-]*(.*)$", re.I | re.M
+)
 
 
 def _world_path() -> Path:
@@ -138,6 +158,18 @@ def polarity(rule: str) -> str:
     if tk & POS_MARKERS:
         return "pos"
     return "unknown"
+
+
+def reconciled_partners(rec: dict) -> dict:
+    """{partner_id: reason} from `reconciled: guard-NNN <reason>` lines ()."""
+    out = {}
+    for field in ("rule", "action_hint"):
+        text = rec.get(field)
+        if not isinstance(text, str):
+            continue
+        for m in RECONCILED_PAIR_RE.finditer(text):
+            out.setdefault(m.group(1).lower(), m.group(2).strip()[:200])
+    return out
 
 
 def jaccard(a: set, b: set) -> float:
@@ -197,6 +229,7 @@ def load_active_guardrails(world: Path) -> list:
                 "category": rec.get("category") or "",
                 "subject": subject_tokens(rule),
                 "polarity": polarity(rule),
+                "reconciled": reconciled_partners(rec),
             })
     return out
 
@@ -218,7 +251,8 @@ def bucket(records: list, min_token_len: int = 4) -> dict:
     return buckets
 
 
-def audit(records: list, threshold: float, max_bucket: int) -> dict:
+def audit(records: list, threshold: float, max_bucket: int,
+          known: frozenset = frozenset()) -> dict:
     buckets = bucket(records)
     seen_pairs = set()
     findings = []
@@ -251,6 +285,12 @@ def audit(records: list, threshold: float, max_bucket: int) -> dict:
                 cls = "contradiction"
             else:
                 cls = "near-duplicate"
+            # Either side may carry the verdict, keyed by the id that carries it.
+            adjudicated = {}
+            if b["id"] in a.get("reconciled", {}):
+                adjudicated[a["id"]] = a["reconciled"][b["id"]]
+            if a["id"] in b.get("reconciled", {}):
+                adjudicated[b["id"]] = b["reconciled"][a["id"]]
             findings.append({
                 "class": cls,
                 "similarity": round(sim, 3),
@@ -258,6 +298,8 @@ def audit(records: list, threshold: float, max_bucket: int) -> dict:
                 "b_id": b["id"], "b_polarity": pb, "b_rule": b["rule"][:240],
                 "category": a["category"],
                 "shared_token": key[1],
+                "adjudicated": adjudicated,
+                "known": bool(adjudicated) or {a["id"], b["id"]} <= known,
             })
 
     findings.sort(key=lambda f: (-f["similarity"], f["a_id"], f["b_id"]))
@@ -271,6 +313,9 @@ def audit(records: list, threshold: float, max_bucket: int) -> dict:
         "pairs_compared": compared,
         "findings_total": len(findings),
         "by_class": by_class,
+        "novel": sum(1 for f in findings if not f["known"]),
+        "adjudicated": sum(1 for f in findings if f["adjudicated"]),
+        "known_guardrails": sorted(known),
         "findings": findings,
     }
 
@@ -287,7 +332,14 @@ def main(argv=None) -> int:
                     choices=["", "contradiction", "near-duplicate", "unclassified"],
                     help="restrict the printed slate to one class")
     ap.add_argument("--top", type=int, default=15, help="slate cap for human output")
+    ap.add_argument(
+        "--known", default="",
+        help=("comma-separated guardrail ids whose pairs are already triaged. A pair "
+              "with BOTH ids listed is still REPORTED but does not count as novel "
+              "(ported from guardrail-protocol-conflict-check.py, g-115-9438)."),
+    )
     args = ap.parse_args(argv)
+    known = frozenset(k.strip().lower() for k in args.known.split(",") if k.strip())
 
     world = Path(args.world) if args.world else _world_path()
     try:
@@ -298,7 +350,7 @@ def main(argv=None) -> int:
         # possible false all-clear this script can emit.
         print(f"[guardrail-pair-audit] STORE UNREADABLE: {e}", file=sys.stderr)
         return 2
-    result = audit(records, args.threshold, args.max_bucket)
+    result = audit(records, args.threshold, args.max_bucket, known)
 
     rows = result["findings"]
     if args.cls:
@@ -312,7 +364,8 @@ def main(argv=None) -> int:
 
     print(f"[guardrail-pair-audit] active={result['active_guardrails']} "
           f"buckets={result['buckets']} compared={result['pairs_compared']} "
-          f"findings={result['findings_total']} by_class={result['by_class']}")
+          f"findings={result['findings_total']} by_class={result['by_class']} "
+          f"novel={result['novel']} adjudicated={result['adjudicated']}")
     if result["oversized_buckets_skipped"]:
         print(f"  NOTE {result['oversized_buckets_skipped']} hub bucket(s) skipped "
               f"(> --max-bucket {args.max_bucket}) — the slate is bounded, "
@@ -321,10 +374,17 @@ def main(argv=None) -> int:
     print(f"  showing {len(shown)} of {len(rows)} (--top {args.top}) — the cap "
           f"bounds the SLATE, never the scan")
     for r in shown:
-        print(f"\n  [{r['class']}] sim={r['similarity']} "
+        tag = ""
+        if r["adjudicated"]:
+            tag = f" [adjudicated: {' '.join(sorted(r['adjudicated']))}]"
+        elif r["known"]:
+            tag = " [known]"
+        print(f"\n  [{r['class']}]{tag} sim={r['similarity']} "
               f"cat={r['category']} tok={r['shared_token']}")
         print(f"    {r['a_id']} ({r['a_polarity']}): {r['a_rule'][:150]}")
         print(f"    {r['b_id']} ({r['b_polarity']}): {r['b_rule'][:150]}")
+        for gid, why in sorted(r["adjudicated"].items()):
+            print(f"    reconciled ({gid}): {why[:150]}")
     if not rows:
         print("  no pairs above threshold")
     print("\n  PROPOSAL ONLY. guard-3814: resolve a contradiction by finding the "

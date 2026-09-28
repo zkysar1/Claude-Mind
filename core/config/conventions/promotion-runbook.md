@@ -109,8 +109,13 @@ agent-watchdog `ReleaseTrainProbe` measures the time-push state every reducer
 iteration and files ONE fleet-wide `investigate:release-train-stalled-past-<tag>`
 goal, retired automatically once a newer tag lands. While that goal is open,
 iteration-close prints one in-turn LLM-ACTION naming it
-(`release-train-check.sh --nudge`). Re-measure read-only with
-`bash core/scripts/release-train-check.sh`. "Commits past it" counts only
+(`release-train-check.sh --nudge`). Re-measure with
+`bash core/scripts/release-train-check.sh`, which fetches origin/main AND the
+`v*` tags first. A bare `git fetch origin main` brings no tags, so a box that
+did not cut the newest tag would read the previous one as newest (g-115-11144).
+Closing the goal `skipped` holds re-filing of that tag fleet-wide for
+`release_train.skip_hold_hours`, and the next goal quotes the closing note.
+"Commits past it" counts only
 non-merge commits touching the promotion copy set (promotion-preflight.py
 `FRAMEWORK_PATHS`), so agent-state churn on `main` never fires it. The threshold
 is `release_train.stale_hours` in `core/config/aspirations.yaml`: change this

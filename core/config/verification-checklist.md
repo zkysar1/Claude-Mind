@@ -195,7 +195,7 @@ Use this after running a fresh `/start` → `/stop` test cycle. Read the state f
 3. `pipeline-read.sh --counts` returns JSON with 5 stage keys
 4. `pipeline-read.sh --accuracy` returns JSON with `total_resolved`, `confirmed`, `corrected`, `accuracy_pct`
 5. `pipeline-read.sh --id <known-id>` returns complete record (searches live then archive)
-6. `pipeline-read.sh --unreflected` returns only `reflected: false` resolved records
+6. `pipeline-read.sh --unreflected` returns only `reflected: false` records at stage `resolved` or `archived`. Archived rows are EXPECTED and dominate the result: g-115-5358 widened the endpoint on purpose, so do not "fix" a failing check by narrowing it back (guard-3758)
 7. `pipeline-add.sh` rejects missing required fields (exit non-zero)
 8. `pipeline-add.sh` rejects duplicate IDs (exit non-zero)
 9. `echo '{"outcome":"CONFIRMED"}' | pipeline-move.sh <id> resolved` atomically merges + moves
@@ -366,7 +366,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 4. `core/config/knowledge-conventions.md` documents experience archive format (JSONL schema, content files, verbatim anchors, retrieval_stats)
 5. `core/config/memory-pipeline.yaml` has experience archival step, `archived_context` slot type, adaptive weight bounds
 6. `core/config/conventions/experience.md` has Experience Archive section with ID format, script API, file layout
-7. `CLAUDE.md` lists experience files in project structure and Core Systems
+7. `core/config/architecture-reference.md` lists experience files in Project Structure and Core Systems (moved out of `CLAUDE.md` by g-353-151)
 
 ### O2. Experience Script Validation
 8. `experience-add.sh` rejects missing required fields (exit non-zero)
@@ -510,7 +510,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 ### R2. Recurring Goal Lifecycle (Skill)
 6. `aspirations/SKILL.md` Phase 0 recurring check uses `interval_hours` with `remind_days * 24` fallback
 7. `aspirations/SKILL.md` Phase 5 writes full ISO timestamp (`YYYY-MM-DDTHH:MM:SS`) to `lastAchievedAt` on recurring goal completion
-8. `aspirations/SKILL.md` Phase 5 updates `currentStreak` and `longestStreak` on recurring completion — resets streak to 1 when overdue by > 2x interval
+8. `aspirations/SKILL.md` Phase 5 updates `currentStreak` and `longestStreak` on recurring completion — resets streak to 1 when overdue by > `streak_mult` x interval (`recurring.streak_mult` in `core/config/aspirations.yaml`)
 9. `aspirations/SKILL.md` Phase 7 skips "aspiration fully complete" for aspirations where ANY goals are recurring (mixed or all-recurring)
 10. `aspirations/SKILL.md` `complete <goal-id>` documents `--permanent` flag (sets `recurring: false`)
 11. `aspirations/SKILL.md` Goal Selection Algorithm COLLECT references `interval_hours`
@@ -531,7 +531,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 20. `core/config/conventions/goal-schemas.md` has "Recurring Goal Fields" section documenting `interval_hours`, deprecated `remind_days`
 21. `core/config/conventions/goal-schemas.md` documents `lastAchievedAt` uses full ISO 8601 timestamps (`YYYY-MM-DDTHH:MM:SS`)
 22. `boot/SKILL.md` recurring goals table shows interval, last done, next due
-22a. `core/config/conventions/goal-schemas.md` documents streak reset on missed intervals (2x threshold)
+22a. `core/config/conventions/goal-schemas.md` documents streak reset on missed intervals (streak_mult threshold)
 
 ### R6. Runtime
 23. **Runtime**: `goal-selector.sh` correctly gates a recurring goal with `interval_hours: 4` (recently completed goal not in candidates)
@@ -539,7 +539,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 25. **Runtime**: `agent-aspirations-read.sh --active` shows asp-001 with recurring goals
 26. **Runtime**: Setting `recurring: false` via `aspirations-update-goal.sh` permanently stops the goal
 27. **Runtime**: Aspirations with ANY recurring goals skip Phase 7 completion review (not just all-recurring)
-28. **Runtime**: After completing a recurring goal that was overdue by > 2x interval, `currentStreak` is 1 (not incremented)
+28. **Runtime**: After completing a recurring goal that was overdue by > `streak_mult` x interval (`recurring.streak_mult` in `core/config/aspirations.yaml`), `currentStreak` is 1 (not incremented)
 29. **Runtime**: `recurring_urgency` raw score never exceeds 5.0 in goal-selector.sh output
 30. **Runtime**: g-001-01 is skipped on first boot iteration when no non-recurring goals have been executed
 
@@ -611,7 +611,7 @@ No intermediate snapshot file is used — `/prime` and `retrieve.sh` read source
 13. `.env.example` has only section headers, no domain-specific credential entries (agent registers keys via `env.py register`)
 14. `.gitignore` forged skill entries match `world/forged-skills.yaml` (no orphan entries after reset)
 15. `boot/SKILL.md` discovers L1 tree nodes dynamically from `_tree.yaml` (no hardcoded filenames)
-16. `CLAUDE.md` Available Skills table has no domain-specific forged skill entries
+16. `CLAUDE.md` names no domain-specific forged skills (its Available Skills table was removed by g-353-151; the harness lists skills each turn)
 
 ### S3. Domain Convention Content
 _(Domain-specific items live in `world/verification-checklist.md`, seeded from `core/config/verification-checklist-domain-specific.md` on init)_
@@ -716,7 +716,7 @@ _(Domain-specific items live in `world/verification-checklist.md`, seeded from `
 3. `_triggers.yaml` has boot trigger entry that calls prime
 4. Boot SKILL.md has Step 2.7 (full boot: `invoke /prime`) and Step 8.5 (continuation: `invoke /prime --category {goal_category}`)
 5. Boot chaining section lists `/prime`
-6. CLAUDE.md Internal Skills table lists Prime (called by boot)
+6. `.claude/skills/prime/SKILL.md` describes Prime as called by boot (the CLAUDE.md Internal Skills table was removed by g-353-151)
 7. CLAUDE.md has NO "Utility Commands" section — prime is internal-only
 
 ### W2. Invocation
@@ -1014,7 +1014,7 @@ Verifies the aspirations and reflect skills were correctly decomposed into orche
 
 ### AI6. Cross-References Updated
 
-30. `CLAUDE.md` Internal Skills table lists all 11 sub-skills as italicized sub-skill entries
+30. (retired by g-353-151: the `CLAUDE.md` Internal Skills table was removed — the harness lists every skill each turn)
 31. `core/config/architecture-reference.md` chaining map includes sub-skill hierarchy under `/aspirations loop` and `/reflect`
 32. No orphaned "see section below" or "defined below" references in `aspirations/SKILL.md`
 
@@ -1209,7 +1209,7 @@ Verifies the hybrid skill pattern: user-invocable AND agent-callable. Currently 
 2. `CLAUDE.md` Skill Invocation Rules has "Hybrid skills" bullet listing `/agent-completion-report` AND `/backlog-report`
 3. `CLAUDE.md` User Control Commands table includes `/agent-completion-report` and `/backlog-report` with `ANY` valid-from
 4. `CLAUDE.md` Enforcement Rule 1 has explicit exception: both ARE agent-callable
-5. `CLAUDE.md` Available Skills "User Control Commands" section includes both with "*(also agent-callable)*"
+5. `CLAUDE.md` User Control Commands table marks both "*(agent-callable)*" (the "also" wording went with g-353-151)
 6. `.claude/skills/_triggers.yaml` has comment noting `/agent-completion-report` is agent-callable
 7. Neither `/agent-completion-report` nor `/backlog-report` is in the "MUST NOT invoke" enumerated list (enforcement rule 1)
 7b. `/backlog-report` is NOT in the Internal Skills table (it's hybrid, not agent-only)
@@ -1473,8 +1473,8 @@ Verifies that encoding state is preserved across autocompact cycles and processe
 ### AR4. Supporting Integration
 21. `boot/SKILL.md` Phase -1.5 whitelist includes `compact-checkpoint.yaml`
 22. `core/scripts/stop-hook.sh` tier 1-3 message mentions checkpoint existence when file is present
-23. `CLAUDE.md` signal files table includes `compact-checkpoint.yaml` row
-24. `CLAUDE.md` has "Compact Checkpoint Protocol" section
+23. `core/config/conventions/session-state.md` documents `compact-checkpoint.yaml` (the CLAUDE.md signal files table moved out by g-353-151)
+24. `CLAUDE.md` points to `core/config/conventions/session-state.md` for the compact checkpoint (its "Compact Checkpoint Protocol" section moved out by g-353-151)
 25. `core/config/conventions/session-state.md` has "Compact Checkpoint" section
 
 ### AR5. Runtime
@@ -1581,7 +1581,7 @@ persistently and the stop hook allows graceful idle-waiting instead of forced lo
 22. `precompact-checkpoint.py` saves `pending_agents_count` to checkpoint (informational — file persists on disk)
 23. `precompact-checkpoint.py` log summary includes agent count when > 0
 24. `postcompact-restore.py` prints PENDING AGENTS warning when `pending_agents_count > 0`
-25. `CLAUDE.md` signal files table includes `pending-agents.yaml` row
+25. `core/config/conventions/session-state.md` documents `pending-agents.yaml` (the CLAUDE.md signal files table moved out by g-353-151)
 26. `core/config/conventions/session-state.md` has "Pending Background Agents" section
 
 ### ARa5. Runtime
@@ -2140,7 +2140,7 @@ Verifies that Claude Code's built-in auto-memory is disabled. All persistent kno
 ### BA1. Settings
 
 1. `.claude/settings.local.json` has `"autoMemoryEnabled": false` — platform-level kill switch
-2. `.claude/settings.local.json` deny array has `"Write(*/.claude/projects/*/memory/*)"` and `"Edit(*/.claude/projects/*/memory/*)"` — permission-level block
+2. `.claude/settings.local.json` deny array has `"Edit(*/.claude/projects/*/memory/*)"` — permission-level block (an Edit rule covers every file-editing tool; a `Write(...)` twin is dead weight, guard-6856)
 
 ### BA2. Rule File
 
@@ -2209,7 +2209,7 @@ Verifies the aspirations compact cache reduces repeated context loading from `as
 ### BE2. Convention & Documentation
 
 9. `core/config/conventions/aspirations.md` script table includes `load-aspirations-compact.sh` and `--active-compact`
-10. `CLAUDE.md` signal files table includes `aspirations-compact.json`
+10. `core/config/session-manifest.yaml` lists `aspirations-compact.json` (CLAUDE.md's signal list moved out by g-353-151)
 
 ### BE3. Skill File Migration
 
@@ -2559,7 +2559,7 @@ Verifies the dedicated working memory script layer (`wm-*.sh`) with slot_meta ti
 24. `core/scripts/meta-init.py` `FILE_MAP` has `skill_quality_strategy` entry
 25. `core/scripts/init-meta.sh` creates `meta/skill-quality.yaml` with `{last_updated: null, skills: {}}`
 26. CLAUDE.md Convention Index has `skill-quality.md` entry
-27. CLAUDE.md Core Systems table has `Skill quality` row
+27. `core/config/architecture-reference.md` Core Systems table has `Skill quality` row (moved out of CLAUDE.md by g-353-151)
 
 ### BL3. Skill Quality Integration in Aspirations Loop
 

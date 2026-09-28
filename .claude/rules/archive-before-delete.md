@@ -37,22 +37,10 @@ its owner, tmp files this session created, or append-only writes.
    count, total bytes, per-item checksum where available. Persist the
    enumeration — it is the future integrity baseline.
 2. **Verify recovery layers BEFORE the destructive step — read the config,
-   don't assume.** Soft-delete, versioning, and trash folders are NOT
-   archives until the retention configuration says so: READ the storage
-   layer's lifecycle/retention/expiry rules. "Versioned" can mean "delayed
-   permanent deletion", not "archived" (canonical incident: rb-2859).
-   **When the identity cannot READ the recovery config, the layer is
-   UNVERIFIABLE — treat it as ABSENT (g-115-2692).** Which bucket-level read a
-   least-privilege identity is denied varies by bucket AND by principal, so
-   never predict the split. Probe it, and name the principal that produced the
-   reading (guard-1787).
-   When the specific config reads
-   step 2 requires return access-denied, do NOT treat versioning/soft-delete as
-   a recovery layer at all — proceed as if it does not exist: the independent
-   current-version-copy archive in step 3 (retention-immune, needs only
-   object-level read/write) becomes MANDATORY, not optional, and IS the recovery
-   layer. Never let ANY readable sub-part stand in for the unreadable one that
-   governs survival.
+   don't assume.** "Versioned" is not "archived" until the retention config
+   says so (rb-2859). **Unreadable config = UNVERIFIABLE = ABSENT**
+   (g-115-2692, guard-1787): the step 3 archive becomes MANDATORY.
+   Detail: `core/config/rationale/archive-before-delete.md`.
 3. **Archive independently, outside the blast radius.** COPY (never move) to
    a location that (a) the live system does not read, sync, or restore from,
    and (b) no retention clock touches: a cold archive prefix outside the
@@ -62,14 +50,11 @@ its owner, tmp files this session created, or append-only writes.
    retention-immune form.
    **(c) STAGING is part of the choice, and the obvious spot is the worst
    one.** `agents/<agent>/temp/` is git-ignored ENTIRELY (`agents/*/temp/*`,
-   only `.gitkeep` re-included), so nothing staged there is tracked at ANY
-   depth; and `temp-drain-purge.sh` recursively deletes every top-level stray
-   dir older than `--age-min` (default **120 minutes**). An archive staged
-   there is untracked and gone inside two hours while looking like a
-   deliberate durable location. If you stage there anyway, write the sentinel
-   FIRST: `_has_archive_receipt` preserves a dir carrying `.archive-marker` or
-   a top-level `RECEIPT` / `RECEIPT.*` (any extension, any case). Staging is
-   never archiving — step 4 still applies to the copy that survives.
+   only `.gitkeep` re-included) and purged after 120 minutes.
+   If you stage there, write the sentinel FIRST (`_has_archive_receipt`
+   preserves dirs carrying `.archive-marker` or a top-level `RECEIPT`/`RECEIPT.*`).
+   Staging is never archiving — step 4 still applies to the copy that survives.
+   Detail: `core/config/rationale/archive-before-delete.md`.
 4. **Verify the archive against the enumeration**: object count, total
    bytes, and per-object checksums must ALL match. A sampled spot-check is
    not verification.
@@ -83,19 +68,9 @@ its owner, tmp files this session created, or append-only writes.
    paths can re-arm read-through resurrection). Record the receipt location
    in a durable retrievable store (knowledge tree node + reasoning bank).
 
-   **Name it `RECEIPT.*` at the archive's TOP LEVEL, and if you write a READER
-   for it, match extension- and case-insensitively.** Producers write
-   `RECEIPT.json` and lowercase `receipt.json` (g-115-3397).
-
-   The asymmetry is what makes this a rule rather than a preference: a missed
-   sentinel DESTROYS a recovery layer, while an over-match merely retains a
-   directory until someone looks. So readers widen on the PRESERVE side — but
-   anchor the match (`RECEIPT` / `RECEIPT.*`, top level only). A bare
-   `*receipt*` substring or an any-depth match preserves every scratch dir of
-   receipt-ish notes and makes the guard unfalsifiable (guard-2860).
-
-   **A receipt never lives INSIDE the store or directory it describes.** A
-   comment line in a JSONL store breaks every parser that reads it.
+   **Name it `RECEIPT.*` at top level; match case-insensitively in readers
+   (g-115-3397, guard-2860). A receipt never lives INSIDE the store it
+   describes.**
 7. **Blast-radius check before the delete fires**: enumerate what READS this
    data. Read-through/restore-on-miss sync layers, session-binding caches,
    and registry rows can re-materialize or depend on "deleted" data (the

@@ -74,3 +74,30 @@ def test_put_to_unowned_agent_dir_raises_no_claim():
     # verdict, or a tmp-world PUT is masked by a no_claim refusal.
     assert src.index("_assert_not_tempdir_put") < src.index("NoClaimError"), (
         "ownership consult must come AFTER _assert_not_tempdir_put")
+
+
+def test_no_claim_message_names_the_delivery_first_order():
+    """. The refusal told every refused writer to relay on the
+    coordination board, and board relays sat undelivered 5-21h. It must name the
+    delivery-first order -- the holder's box, then a routed world goal -- plus
+    the tags a board relay needs, and all of it must survive server.py's
+    str(e)[:600]."""
+    import inspect
+    assert "NO_CLAIM_MESSAGE" in inspect.getsource(
+        owncloud_backend.OwnCloudBackend._put), "_put must raise THIS text"
+    msg = owncloud_backend.NO_CLAIM_MESSAGE % "a-twelve-chr"
+    assert msg.startswith("no_claim:")
+    assert len(msg) <= 600, len(msg)   # server.py returns str(e)[:600]
+    holder = msg.index("runner-claim.sh status")
+    goal = msg.index("world goal")
+    board = msg.index("board post")
+    assert holder < goal < board, "delivery-first order"
+    for word in ("intended_agent", "handoff_to", "requires_action_by",
+                 "action_type", "severity"):
+        assert word in msg, word
+    assert "Relay instead" not in msg
+    # Other files quote these diagnosis sentences; they stay verbatim.
+    for quoted in ("does not hold the live runner claim",
+                   "permanently behind the claim-holder's advancing version",
+                   "STRUCTURAL, not a race"):
+        assert quoted in msg, quoted

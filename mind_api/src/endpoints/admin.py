@@ -260,6 +260,14 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
              "error": f"import failed: {e}"}, status=500)
     dry_run = (ctx.query.get("dry_run") or "").strip() in ("1", "true", "yes")
     stats: dict = {}
+    # : the carrier exemption must name the CALLER's session, never
+    # this daemon's spawn-time env (see owncloud_sync.set_carrier_identity).
+    # rt_call sends both headers. A caller that sends no sid (the PostToolUse
+    # shim's bare curl) is left on the env behaviour it had before.
+    req_agent = (ctx.headers.get("x-mind-agent") or "").strip()
+    req_sid = (ctx.headers.get("x-mind-sid") or "").strip()
+    identity_token = (owncloud_sync.set_carrier_identity(req_agent, req_sid)
+                      if req_agent and req_sid else None)
     try:
         rc = owncloud_sync.sync_file(
             get_backend(), target, dry_run=dry_run, stats_out=stats)
@@ -267,6 +275,9 @@ def owncloud_sync_file(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.json(
             {"backend": backend, "ok": False, "path": str(target),
              "error": f"sync failed: {e}"}, status=500)
+    finally:
+        if identity_token is not None:
+            owncloud_sync.reset_carrier_identity(identity_token)
     _ALWAYS = ("pushed", "would_push", "in_sync", "conflicts",
                "diverged_skipped", "errors")
     # ANY OTHER non-zero scalar counter _sync_one set, reported generically.

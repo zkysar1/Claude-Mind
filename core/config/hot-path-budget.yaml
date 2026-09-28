@@ -31,6 +31,23 @@
 # never edit the gate script for a new file.
 version: 1
 override_trailer: "size-budget-override:"
+
+# ── ALWAYS-LOADED INSTRUCTION CEILING () ────────────────────────────
+# A CORPUS rule, not a set. Claude Code (2.1.281+) flags a session once
+# CLAUDE.md plus every .claude/rules/*.md WITHOUT `paths:` front matter pass
+# 150,000 chars. The ratchet below cannot see that total grow — a NEW rule, or a
+# rule losing its `paths:` front matter, adds to it with no file growing — so a
+# commit touching any of these paths is judged on the WHOLE set: refused when
+# the staged total is over `chars` AND larger than at HEAD (a shrink is never
+# blocked). `paths:`-scoped rules are excluded, as the notice excludes them.
+# `.claude/CLAUDE.md` and nested rules load like their siblings, so they count.
+# Not visible here: ~/.claude/CLAUDE.md, CLAUDE.local.md (machine-local) and
+# @-imports (none today) — leave headroom for them. Counting method and its
+# calibration against the notice: instruction_chars() in the gate.
+instruction_ceiling:
+  chars: 150000
+  paths: ["CLAUDE.md", ".claude/CLAUDE.md", ".claude/rules/*.md", ".claude/rules/**/*.md"]
+
 sets:
   - name: claude-md
     paths: ["CLAUDE.md"]

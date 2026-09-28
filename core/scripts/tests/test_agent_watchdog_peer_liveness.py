@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -222,13 +223,21 @@ def test_first_box_posts_the_breadcrumb_after_a_real_send(monkeypatch, tmp_path,
     assert len(notify) == 1
 
 
-def test_breadcrumb_is_not_consulted_for_a_realert(monkeypatch, tmp_path, notify):
+def test_realert_consults_the_breadcrumb_for_its_window(monkeypatch, tmp_path, notify):
+    # : this test used to be test_breadcrumb_is_not_consulted_for_a_realert,
+    # which pinned the defect. A re-alert passes --allow-duplicate, so the breadcrumb
+    # is its only fleet dedup; it now asks with a window cutoff.
     monkeypatch.setenv(wd.PeerLivenessProbe.REALERT_ENV, "0")
     calls = []
-    monkeypatch.setattr(wd, "_peer_stall_breadcrumb_seen", lambda episode: calls.append(episode) or False)
+
+    def seen(episode, newer_than=None):
+        calls.append(newer_than)
+        return False
+    monkeypatch.setattr(wd, "_peer_stall_breadcrumb_seen", seen)
     stalled = _report(_peer("foxtrot", "stalled"))
     _drive(monkeypatch, tmp_path, [stalled, stalled])
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert calls[0] is None and isinstance(calls[1], float)
     assert len(notify) == 2
 
 
@@ -237,6 +246,121 @@ def test_breadcrumb_helpers_are_inert_under_pytest(monkeypatch):
     assert wd._peer_stall_breadcrumb_seen("peer-stall-x") is False
     assert wd._peer_stall_breadcrumb_post("x", "peer-stall-x", "s")["posted"] is False
     assert wd._peer_stall_episode_key("foxtrot", "2026-09-04T22:25:11") == "peer-stall-foxtrot-2026-09-04T22-25-11"
+
+
+def test_breadcrumb_newer_than_reads_the_board_stamps(monkeypatch):
+    monkeypatch.setenv("AGENT_WATCHDOG_NOTIFY_ALLOW_PYTEST", "1")
+    ep = "peer-stall-foxtrot-2026-09-26T19-04-13"
+    lines = [
+        json.dumps({"timestamp": "2026-09-27T03:02:34", "tags": ["peer-stall-sent", "foxtrot", ep]}),
+        "not json",
+        json.dumps({"timestamp": "garbled", "tags": [ep]}),
+        json.dumps({"timestamp": "2026-09-27T09:58:05", "tags": ["peer-stall-sent", "foxtrot", ep]}),
+    ]
+
+    class _Proc:
+        returncode = 0
+        stdout = "\n".join(lines) + "\n"
+        stderr = ""
+    monkeypatch.setattr(wd.subprocess, "run", lambda *_a, **_k: _Proc())
+
+    # The cutoffs bracket the 09:58:05 re-alert. Both good stamps replay this episode's live
+    # breadcrumbs, msg-20260927-030234-alpha-5160 and msg-20260927-095805-bravo-5367 ().
+    def at(stamp):
+        return datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc).timestamp()
+    assert wd._peer_stall_breadcrumb_seen(ep) is True
+    assert wd._peer_stall_breadcrumb_seen(ep, newer_than=at("2026-09-27T09:50:00")) is True
+    assert wd._peer_stall_breadcrumb_seen(ep, newer_than=at("2026-09-27T10:00:00")) is False
+    assert wd._peer_stall_breadcrumb_seen("peer-stall-other", newer_than=0.0) is False
+    _Proc.returncode = 1
+    assert wd._peer_stall_breadcrumb_seen(ep, newer_than=0.0) is False
+
+
+# ── two boxes, separate box-local state () ─────────────────────────
+
+class _Clock:
+    """Stands in for the `time` module inside agent-watchdog only."""
+
+    def __init__(self, t):
+        self.t = float(t)
+
+    def time(self):
+        return self.t
+
+    def __getattr__(self, name):
+        import time as _real
+        return getattr(_real, name)
+
+
+def _fleet(monkeypatch, tmp_path, clock):
+    """A shared fake board, and one probe per box with its OWN box-state dir.
+
+    guard-7238: a single shared state file passes on the defective code, because
+    the second box then reads the first box's clock and never re-pages at all.
+    """
+    board = []
+    on_box = {"name": None}
+
+    def seen(episode, newer_than=None):
+        return any(p["episode"] == episode and (newer_than is None or p["ts"] > newer_than)
+                   for p in board)
+
+    def post(agent, episode, subject):
+        clock.t += 5  # the post lands after the mail, as in production
+        board.append({"episode": episode, "ts": float(int(clock.t)), "box": on_box["name"]})
+        return {"posted": True}
+
+    monkeypatch.setattr(wd, "time", clock)
+    monkeypatch.setattr(wd, "_peer_stall_breadcrumb_seen", seen)
+    monkeypatch.setattr(wd, "_peer_stall_breadcrumb_post", post)
+    stalled = _report(_peer("foxtrot", "stalled", last_active="2026-09-08T12:57:15"))
+    monkeypatch.setattr(pl, "scan", lambda *_a, **_k: stalled)
+    probes = {}
+
+    def tick(box, at):
+        if box not in probes:
+            probes[box] = wd.PeerLivenessProbe(_ctx(tmp_path))
+            probes[box].initialize()
+        clock.t = float(at)
+        on_box["name"] = box
+        monkeypatch.setenv(wd.PeerLivenessProbe.BOX_STATE_DIR_ENV, str(tmp_path / f"box-{box}"))
+        return probes[box].check()
+    return board, tick
+
+
+def test_two_boxes_send_one_realert_per_window_not_one_each(monkeypatch, tmp_path, notify):
+    """Replays msg-20260908-220841-bravo-8118 -> msg-20260908-225933-echo-8128:
+    one episode, two boxes, 51 minutes apart, both RE-alerts on their own box's
+    clock. The second box must read the first box's re-alert breadcrumb."""
+    t0 = 1_788_000_000.0
+    window = wd.PeerLivenessProbe.REALERT_DEFAULT_SECONDS
+    board, tick = _fleet(monkeypatch, tmp_path, _Clock(t0))
+    tick("cc-05", t0)                          # first page: mails and posts
+    tick("cc-03", t0 + 51 * 60)                # sees it: paged elsewhere, arms its clock
+    assert len(notify) == 1
+    tick("cc-05", t0 + window + 60)            # nobody else paged inside the window
+    assert len(notify) == 2 and notify[1]["allow_duplicate"]
+    late = tick("cc-03", t0 + 51 * 60 + window + 60)
+    assert len(notify) == 2, "cc-03 re-paged an episode cc-05 re-alerted 51 minutes earlier"
+    assert [e.event for e in late] == ["peer_stall_paged_elsewhere"]
+    assert late[0].payload["new_episode"] is False
+    state = json.loads((tmp_path / "box-cc-03" / wd.PeerLivenessProbe.BOX_STATE_NAME).read_text())
+    assert state["foxtrot"]["notified"]["reason"] == "re-alerted by another box inside the window"
+    assert [p["box"] for p in board] == ["cc-05", "cc-05"]
+
+
+def test_a_lone_box_is_not_silenced_by_its_own_breadcrumb(monkeypatch, tmp_path, notify):
+    """The clock is stamped AFTER the breadcrumb post. Stamped at the start of
+    the tick instead, a tick landing in the few seconds after the threshold
+    reads the box's own post as another box's page, suppresses itself, and
+    re-arms -- a lone reducer then skips a whole re-alert window."""
+    t0 = 1_788_000_000.0
+    window = wd.PeerLivenessProbe.REALERT_DEFAULT_SECONDS
+    _, tick = _fleet(monkeypatch, tmp_path, _Clock(t0))
+    tick("cc-04", t0)
+    tick("cc-04", t0 + window + 1)
+    tick("cc-04", t0 + window + 10)
+    assert len(notify) == 2
 
 
 # ── the mail body ────────────────────────────────────────────────────────────

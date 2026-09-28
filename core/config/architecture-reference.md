@@ -205,3 +205,107 @@ In addition to standard working memory consolidation (see `/aspirations` Session
 - Schema operations: `assimilation` or `accommodation`
 - Developmental stages: `exploring`, `developing`, `applying`, `mastering`
 - Encoding scores: 0.0-1.0 float, threshold 0.40 for long-term encoding
+
+## Timestamp Posture (moved from CLAUDE.md, g-353-151)
+
+- ISO 8601 dates everywhere. Timestamps: naive format (no zone suffix) via `$(date +%Y-%m-%dT%H:%M:%S)`, in **UTC wall time on every box** — enforced by `.claude/settings.json` env `TZ=UTC` (all boxes) plus box TZ=Etc/UTC where the OS allows (Linux). "Local system time" and UTC converged by fiat 2026-07 (g-115-2546): a multi-box fleet comparing naive stamps (board `--since`, `last_active` staleness, LWW merges) needs one shared wall clock, and mixed domains silently corrupt every comparison. Long-lived processes keep the TZ env they started with — after changing TZ posture, restart daemons or stamps stay in the old zone.
+
+## External Knowledge Hubs — why they are registered in CLAUDE.md (moved, g-353-151)
+
+Registered at the dev source of the promotion cycle so the reference stays
+ecosystem-consistent and flows downstream. The registration lives in committed
+files (CLAUDE.md, plus a Self-Evolution pointer each agent adds to its own
+`self.md`) because `world/` and `meta/` are external and gitignored — not
+reachable by a cloud clone.
+
+## Project Structure
+
+```
+core/                # Shareable cognitive framework (copy to any project)
+  config/            # Framework definitions (immutable)
+    conventions/     # On-demand convention reference files
+    environments/    # PEER DEPLOYMENT REGISTRY — one yaml per known Mind world
+                     # (one per deployment, plus `local`) giving each
+                     # one's storage backend. This world is NOT alone: peers
+                     # exist and share a live board channel. See
+                     # conventions/cross-deployment-channel.md.
+  scripts/           # Utility scripts (framework infrastructure)
+meta/                # Agent-editable meta-strategies (independent of domain data)
+  goal-selection-strategy.yaml, reflection-strategy.yaml  # Strategy files
+  evolution-strategy.yaml, aspiration-generation-strategy.yaml
+  encoding-strategy.yaml, improvement-instructions.md
+  improvement-velocity.yaml                               # imp@k metrics
+  meta-log.jsonl                                          # Strategy change audit (script-only)
+  spark-questions.jsonl, skill-quality.yaml, skill-gaps.yaml
+  evolution-log.jsonl, reflection-templates.yaml, strategy-archive.yaml
+  config-overrides.yaml, config-changes.yaml, step-attribution.yaml
+  gate-firings.jsonl, gate-eval-recommendations.jsonl  # Phase 1+5 gate telemetry
+  audit-baselines.yaml                                 # Advisory ratchet baselines (learning-routing drift, etc)
+  meta-knowledge/    # Meta-knowledge index + entries
+  experiments/       # A/B experiment tracking
+  transfer/          # Cross-domain transfer bundles
+world/               # Collective domain state (shared across agents, external path)
+  program.md         # The Program — shared purpose
+  aspirations.jsonl  # Central task list (world-level goals)
+  pipeline.jsonl     # Shared hypothesis registry
+  knowledge/tree/    # Collective knowledge tree
+  reasoning-bank.jsonl, guardrails.jsonl, pattern-signatures.jsonl
+  override-bypass-ledger.jsonl  # Phase 4 bulk-override audit ledger
+  board/             # Message board channels (general, findings, coordination, decisions)
+  .history/          # Self-contained file version history (copy-on-write snapshots)
+  changelog.jsonl    # Auto-appended audit trail of all writes
+  conventions/       # Domain-specific conventions
+  forged-skills.yaml # Forged skills registry (shared across agents)
+  skill-relations.yaml # Skill relationship graph (shared across agents)
+  scripts/           # Domain-specific scripts (shared across agents)
+agents/              # Parent directory holding all agent dirs (configurable, see Agent-dir Resolution)
+  <agent-name>/      # Per-agent private state (e.g., agents/alpha/)
+    self.md          # Agent identity and specialization
+    aspirations.jsonl  # Agent's local work queue
+    experience.jsonl   # Agent's raw interaction traces
+    journal.jsonl      # Agent's activity log
+    session/         # Ephemeral session state (working memory, handoff, signal files)
+    curriculum.yaml  # Agent's progression
+.claude/skills/      # Skill definitions
+.claude/rules/       # Rule definitions
+```
+
+## Core Systems
+
+| System | Key Files |
+|--------|-----------|
+| The Program (shared purpose) | `world/program.md` |
+| Self (agent identity) | `agents/<agent>/self.md`, `.claude/rules/self.md`  |
+| Aspirations engine | `world/aspirations.jsonl`, `agents/<agent>/aspirations.jsonl`, `core/config/aspirations.yaml` |
+| Hypothesis pipeline | `world/pipeline.jsonl` |
+| Experience archive | `agents/<agent>/experience.jsonl`, `agents/<agent>/experience/` |
+| Memory/Knowledge tree | `world/knowledge/tree/_tree.yaml` |
+| Pattern signatures | `world/pattern-signatures.jsonl` |
+| Reasoning bank | `world/reasoning-bank.jsonl` |
+| Guardrails | `world/guardrails.jsonl` |
+| Spark questions | `meta/spark-questions.jsonl` |
+| Journal | `agents/<agent>/journal.jsonl`, `agents/<agent>/journal/` |
+| Working memory | `agents/<agent>/session/working-memory.yaml`, `core/scripts/wm-*.sh` |
+| Session state | `agents/<agent>/session/` |
+| Agent mode | `agents/<agent>/session/agent-mode`, `core/config/modes/` |
+| Secrets store | `.env.example`, `.env.local` |
+| Memory pipeline | `core/config/memory-pipeline.yaml` |
+| Reflection engine | `/reflect` skill |
+| Experiential index | `agents/<agent>/experiential-index.yaml` |
+| Curriculum | `agents/<agent>/curriculum.yaml`, `core/config/curriculum.yaml` |
+| Domain conventions | `world/conventions/*.md` |
+| Gate registry + telemetry | `core/config/gates.yaml`, `meta/gate-firings.jsonl`, `meta/gate-eval-recommendations.jsonl`, `world/override-bypass-ledger.jsonl`, `core/scripts/_gate_log.py`, `core/scripts/_override_helpers.py`, `core/scripts/gate-retirement-eval.sh` (prescriptive evaluator), `core/scripts/gate-stats.sh` (descriptive dashboard) |
+| Meta-strategies | `meta/*.yaml`, `core/config/meta.yaml` |
+| Skill relations | `core/config/skill-relations.yaml`, `world/skill-relations.yaml` |
+| Skill quality | `meta/skill-quality.yaml`, `meta/skill-quality-strategy.yaml` |
+| Message board | `world/board/*.jsonl`, `core/scripts/board.py` |
+| File history | `world/.history/`, `meta/.history/`, `core/scripts/history.py` |
+| Changelog | `world/changelog.jsonl`, `core/scripts/changelog.py` |
+| Background jobs | `agents/<agent>/session/background-jobs.yaml`, `core/scripts/background-jobs.sh` |
+| Agent watchdog | `core/scripts/agent-watchdog.py`, `agents/<agent>/session/watchdog-prev-state.json`, `core/logs/watchdog-<agent>.jsonl` (periodic probe registry — invoked from iteration-close.sh productivity-check via `--tick`; cross-platform, no daemon, no PID file) |
+| External paths | `agents/<agent>/local-paths.conf`, `core/scripts/_paths.sh`, `core/scripts/_paths.py` |
+| File operations | `core/scripts/_fileops.py` (locking, history, changelog) |
+| Team state | `world/team-state.yaml` (shared fields) + `world/team-state/agents/<name>.yaml` (per-agent rows, g-328-27 shard), `core/scripts/team-state.py`, `core/scripts/_team_state.py` (routing/compose SSOT), `team-state-update.sh`, `team-state-read.sh` |
+| Execution diary | `agents/<agent>/session/execution-diary.jsonl`, `core/scripts/execution-diary.sh` |
+| Reasoning snapshot | `agents/<agent>/session/reasoning-snapshot.yaml`, `core/scripts/reasoning-snapshot.sh` |
+| Compact recovery | `agents/<agent>/session/compact-checkpoint.yaml`, `core/scripts/compact-restore-slots.sh` |

@@ -36,19 +36,12 @@ is a literal relative path from cwd, where no `world/` exists — use
 script's daemon wrapper. Only Read/Write/Edit/MultiEdit `file_path` prefixes are
 hook-resolved.
 
-### Standard for daemon endpoints and long-running Python processes
+### Daemon endpoints and long-running Python processes
 
-Every `mind_api/src/` endpoint MUST resolve paths through the per-request
-context (`ctx.paths.world`, `ctx.paths.meta`, `ctx.paths.agent`) — never
-import module-level constants and never re-read `local-paths.conf`
-in-endpoint. `mind_api/src/agent_paths.py` (and `core/scripts/_paths.py` for
-CLI consumers) pass every value through `_absolutize()` so the returned `Path`
-is absolute; a Windows-absolute string parses RELATIVE on POSIX Python and a
-string-joined relative fragment silently mirrors a tree under cwd (g-115-733).
-Endpoints must NEVER call `os.chdir()`, `Path.cwd()`, or `os.getcwd()` to derive
-paths; new endpoint path resolution must extend `agent_paths.py` and route
-through `_absolutize()`, never re-implement the env-var/conf/fallback chain
-inline.
+Endpoints MUST resolve via per-request context (`ctx.paths.*`), never
+module-level constants. MUST NOT call `os.chdir()` / `Path.cwd()` /
+`os.getcwd()`. Full rules: `core/config/conventions/external-paths.md`
+§ "Standard for daemon endpoints".
 
 ## Agent Paths
 
@@ -71,28 +64,14 @@ and `meta/` prefixes only) — agent paths in shell commands fall through unchec
 
 ## L1 Cruft Prevention: New Top-Level Entries Require Approval
 
-The L1 path-resolution hook (`core/scripts/path-resolution-hook.py`) refuses a
-Write/Edit/MultiEdit that would create a NEW top-level entry (file or
-directory) immediately under any governed root: `WORLD_PATH`, `META_PATH`, or
-the bound agent's directory. It exists because an LLM blocked from a desired
-location invents a plausible-looking new top-level directory instead
-(`world/handoffs/`, `bravo/handoffs/`, `alpha/scratch/`).
+`core/scripts/path-resolution-hook.py` refuses Write/Edit/MultiEdit creating a
+NEW top-level entry under `WORLD_PATH`, `META_PATH`, or the bound agent's dir.
+Does NOT fire on writes into existing dirs, edits to existing files, writes
+under `agents/<agent>/sessions/<SID>/` for a bound session, shell mkdir/cp/touch,
+or `AGENT_WRITE_PATH`. Cross-agent writes: advisory only (g-375-04).
 
-- Fires: a new top-level dir or file under a governed root that does not
-  already exist on disk.
-- Does NOT fire: writes into existing top-level dirs; edits to existing files;
-  writes anywhere under `agents/<agent>/sessions/<SID>/` for a BOUND session
-  (the sanctioned scratch home — a never-bound SID is still refused); shell
-  `mkdir`/`cp`/`touch` (bypass the hooks); writes inside `PROJECT_ROOT` outside
-  the bound agent's dir; writes inside `AGENT_WRITE_PATH`.
-- Cross-agent writes: advisory only (g-375-04) — route via
-  `world/board/` or `world/team-state.yaml` per `coordination.md`.
-
-**There is no agent-side override flag.** To add a top-level entry
-legitimately: ask the user (they create it or approve a path under an existing
-top-level dir), or update an `init-*.sh` script; once the directory exists on
-disk, writes pass. The friction is the point — silent invention is the failure
-mode being prevented.
+**No agent-side override.** To add a top-level entry: ask the user, or update
+an `init-*.sh` script; once the directory exists on disk, writes pass.
 
 ## Cross-references
 

@@ -447,3 +447,17 @@ every write-shaped Bash call while a stray `PROJECT_ROOT/world|meta` exists
 verify a world/meta file against the AUTHORITATIVE store before citing its
 path in any artifact other agents will read. Tests:
 `core/scripts/tests/test_bash_hook_stray_root_advisory.py`.
+
+## Standard for daemon endpoints and long-running Python processes
+
+Every `mind_api/src/` endpoint MUST resolve paths through the per-request
+context (`ctx.paths.world`, `ctx.paths.meta`, `ctx.paths.agent`) — never
+import module-level constants and never re-read `local-paths.conf`
+in-endpoint. `mind_api/src/agent_paths.py` (and `core/scripts/_paths.py` for
+CLI consumers) pass every value through `_absolutize()` so the returned `Path`
+is absolute; a Windows-absolute string parses RELATIVE on POSIX Python and a
+string-joined relative fragment silently mirrors a tree under cwd (g-115-733).
+Endpoints must NEVER call `os.chdir()`, `Path.cwd()`, or `os.getcwd()` to derive
+paths; new endpoint path resolution must extend `agent_paths.py` and route
+through `_absolutize()`, never re-implement the env-var/conf/fallback chain
+inline.

@@ -407,6 +407,69 @@ def test_absent_body_row_with_closed_body_state_allows():
     test_absent_body_row_with_closed_body_state_allows,
 
 
+# --- I-L. : a STALE row escalates to the long-hold policy -----------
+# `claimed_at` is stamped once, so every Body that works one goal past
+# stale_minutes reaches the `stale` reason while alive. The shared
+# gates/body_hold.py policy decides: the Body keeps the goal while its row names
+# it within 24 h and its OWN carrier is fresh (100 min) and not closed. Case B
+# above (stale row, no carrier) is this block's no-evidence control.
+def _long_hold_claim(*, claimed_min: float, carrier_ts: str | None,
+                     carrier_sid: str = HOLDER_SID) -> tuple[int, str, dict]:
+    os.environ["STORAGE_BACKEND"] = "local"
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        _seed_shard(world, "alpha", last_active=_now(),
+                    body_sid=HOLDER_SID, body_goal=GOAL_ID,
+                    body_claimed_at=_ago(claimed_min))
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_reducer_session(df.project_root, "alpha",
+                                  running_sid=CLAIMER_SID)
+            if carrier_ts is not None:
+                _seed_carrier(df.project_root, "alpha", HOLDER_SID,
+                              ts=carrier_ts)
+                if carrier_sid != HOLDER_SID:
+                    # The carrier FILE is the holder's, but another Body wrote
+                    # it (guard-358): it cannot vouch for the holder.
+                    path = (df.project_root / "agents" / "alpha" / "session"
+                            / f"body-heartbeat-{HOLDER_SID}.json")
+                    doc = json.loads(path.read_text(encoding="utf-8"))
+                    doc["sid"] = carrier_sid
+                    path.write_text(json.dumps(doc), encoding="utf-8")
+            code, body = _claim(df.port, "alpha", CLAIMER_SID)
+            return code, body, _goal(world) or {}
+
+
+def test_long_hold_with_fresh_own_carrier_is_refused():
+    """The measured shape: a Body 6 h into its goal, its carrier minutes old."""
+    code, body, goal = _long_hold_claim(claimed_min=6 * 60, carrier_ts=_ago(20))
+    assert code == 409, (
+        "a Body still working its goal past stale_minutes must keep it "
+        f"(g-375-42); got {code}: {body}")
+    assert HOLDER_SID in body, body
+    assert goal.get("claimed_by_sid") == HOLDER_SID
+
+
+def test_long_hold_past_the_cap_allows():
+    code, body, goal = _long_hold_claim(claimed_min=25 * 60, carrier_ts=_ago(20))
+    assert code == 200, f"a hold past 24 h expires as before; got {code}: {body}"
+    assert goal.get("claimed_by_sid") == CLAIMER_SID
+
+
+def test_long_hold_with_stale_carrier_allows():
+    code, body, goal = _long_hold_claim(claimed_min=6 * 60, carrier_ts=_ago(150))
+    assert code == 200, (
+        f"a carrier past 100 min is no evidence of life; got {code}: {body}")
+    assert goal.get("claimed_by_sid") == CLAIMER_SID
+
+
+def test_long_hold_with_another_bodys_carrier_allows():
+    code, body, goal = _long_hold_claim(claimed_min=6 * 60, carrier_ts=_ago(20),
+                                        carrier_sid="99999999-aaaa-bbbb-cccc-999999999999")
+    assert code == 200, (
+        f"a carrier another Body wrote cannot vouch for the holder; got {code}: {body}")
+    assert goal.get("claimed_by_sid") == CLAIMER_SID
+
+
 TESTS = [
     test_cross_box_live_body_holder_is_refused,
     test_cross_box_stale_body_row_fails_open,
@@ -417,6 +480,11 @@ TESTS = [
     test_absent_body_row_with_fresh_carrier_is_refused,
     test_absent_body_row_with_stale_carrier_still_allows,
     test_absent_body_row_with_closed_body_state_allows,
+    #  — the stale-row long hold.
+    test_long_hold_with_fresh_own_carrier_is_refused,
+    test_long_hold_past_the_cap_allows,
+    test_long_hold_with_stale_carrier_allows,
+    test_long_hold_with_another_bodys_carrier_allows,
 ]
 
 

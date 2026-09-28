@@ -19,6 +19,14 @@ Behavior:
     deny entries are present (idempotent), preserve everything else
     (env, statusLine, outputStyle, autoMemoryEnabled, user-added allows,
     user-added denies).
+  - Either way, drop every Write(path)/MultiEdit(path) rule whose Edit(path)
+    twin is in the same list — the ONE removal this script makes. Claude Code
+    matches file permission checks on Edit(path) rules only ("Edit rules cover
+    all file-editing tools"), so the twin is dead weight that prints a startup
+    warning; Zak Code maps Edit/Write/MultiEdit onto the same protected-path
+    regex, so neither harness loses coverage (guard-6856, rb-9355). A dead-verb
+    rule with NO Edit twin is kept and reported: converting it would change
+    what an allow grants, so a human decides.
 
 Atomic write: tempfile + replace. The file is never left half-written.
 Refuses to clobber a file that doesn't parse as JSON.
@@ -39,28 +47,26 @@ from pathlib import Path
 # Constitutional baseline — these MUST be in permissions.deny[] to make the
 # constitutional anchor (rb-931) effective. If creating fresh, seed all.
 # If file exists and entries are missing, ADD them. Never remove existing
-# deny entries the user or framework added.
+# deny entries the user or framework added — except a dead-verb twin
+# (drop_dead_verb_twins below). Edit(...) only: an Edit rule covers every
+# file-editing tool.
 BASELINE_DENY = [
     # Auto-memory blocks (the original anti-pattern this defends against —
     # see .claude/rules/no-auto-memory.md)
-    "Write(*/.claude/projects/*/memory/*)",
     "Edit(*/.claude/projects/*/memory/*)",
     # Settings-structural-validator self-protection (rb-931 bootstrap paradox)
     "Edit(*core/scripts/settings-structural-validator.py)",
-    "Write(*core/scripts/settings-structural-validator.py)",
-    "MultiEdit(*core/scripts/settings-structural-validator.py)",
     "Edit(*core/scripts/settings-structural-validator.sh)",
-    "Write(*core/scripts/settings-structural-validator.sh)",
-    "MultiEdit(*core/scripts/settings-structural-validator.sh)",
     # Self-referential anchor — the keystone that makes everything else safe.
     # Mirrors core/config/conventions/constitutional-rings.md Ring 0.
     "Edit(*settings.local.json)",
-    "Write(*settings.local.json)",
-    "MultiEdit(*settings.local.json)",
     "Edit(**/.claude/settings.local.json)",
-    "Write(**/.claude/settings.local.json)",
-    "MultiEdit(**/.claude/settings.local.json)",
 ]
+
+# Verbs whose (path) form Claude Code never matches — it warns at startup
+# instead. The whole-tool forms (bare `Write`, `Write(*)`) are not flagged
+# and are left alone.
+DEAD_PATH_VERBS = ("Write", "MultiEdit")
 
 # Framework broad allows seeded ONLY on fresh-create. These are what the
 # agent needs to function at all — Bash for the scripts, Read/Glob/Grep for
@@ -97,7 +103,8 @@ def path_match_form(path: str) -> str:
 
 def build_path_allows(path: str, existing_allow: "list[str]") -> "list[str]":
     """For a given external path, return the allow patterns the agent needs
-    for Read/Edit/Write/MultiEdit on the path's subtree.
+    to read and edit the path's subtree: Read and Edit only, since an Edit
+    rule covers every file-editing tool (Write, MultiEdit, NotebookEdit).
 
     Skips any pattern whose corresponding tool already has a wildcard allow
     in `existing_allow` — e.g. if `Read(*)` is present, `Read({path}/**)`
@@ -108,11 +115,40 @@ def build_path_allows(path: str, existing_allow: "list[str]") -> "list[str]":
     match = path_match_form(path)
     wildcards = set(existing_allow)
     patterns = []
-    for tool in ("Read", "Edit", "Write", "MultiEdit"):
+    for tool in ("Read", "Edit"):
         if f"{tool}(*)" in wildcards:
             continue
         patterns.append(f"{tool}({match}/**)")
     return patterns
+
+
+def dead_verb_glob(rule: object) -> "str | None":
+    """The path glob of a Write(path)/MultiEdit(path) rule, else None."""
+    if not isinstance(rule, str):
+        return None
+    for verb in DEAD_PATH_VERBS:
+        if rule.startswith(verb + "(") and rule.endswith(")"):
+            glob = rule[len(verb) + 1 : -1]
+            if glob.strip() not in ("", "*", "**"):
+                return glob
+    return None
+
+
+def drop_dead_verb_twins(rules: list) -> "tuple[list, list]":
+    """Remove, in place, each dead-verb path rule whose Edit(path) twin is in
+    the same list. Returns (dropped, untwinned); untwinned rules are kept."""
+    present = {r for r in rules if isinstance(r, str)}
+    kept, dropped, untwinned = [], [], []
+    for rule in rules:
+        glob = dead_verb_glob(rule)
+        if glob is not None and f"Edit({glob})" in present:
+            dropped.append(rule)
+            continue
+        if glob is not None:
+            untwinned.append(rule)
+        kept.append(rule)
+    rules[:] = kept
+    return dropped, untwinned
 
 
 def merge_unique(existing: list, additions: list) -> "tuple[list, list]":
@@ -206,6 +242,14 @@ def main() -> int:
 
     _, allows_added = merge_unique(allow, new_path_allows)
     _, denies_added = merge_unique(deny, BASELINE_DENY)
+    # AFTER the baseline merge, so a legacy Write-only baseline deny first gains
+    # its Edit twin and is then dropped as dead weight.
+    dropped, untwinned = [], []
+    for rules in (allow, deny, perms.get("ask")):
+        if isinstance(rules, list):
+            d, u = drop_dead_verb_twins(rules)
+            dropped += d
+            untwinned += u
 
     tmp = settings_path.with_suffix(".local.json.tmp")
     settings_path.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +268,18 @@ def main() -> int:
         print(f"  Seeded {len(denies_added)} constitutional deny rule(s):")
         for d in denies_added:
             print(f"    + {d}")
-    if not allows_added and not denies_added:
+    if dropped:
+        print(f"  Dropped {len(dropped)} dead-verb rule(s); each Edit(...) twin is kept:")
+        for d in dropped:
+            print(f"    - {d}")
+    if untwinned:
+        print(
+            f"  KEPT {len(untwinned)} dead-verb rule(s) with no Edit(...) twin. Claude Code"
+            " ignores them; rewrite each as Edit(...) by hand if it should take effect:"
+        )
+        for u in untwinned:
+            print(f"    ! {u}")
+    if not allows_added and not denies_added and not dropped:
         print("  (no changes needed — all rules already present)")
 
     return 0

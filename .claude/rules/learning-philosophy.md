@@ -40,15 +40,9 @@ They are valuable, but they are means — not the mission.
    "encode more", so the loop must consciously credit removal. Elegance is subtraction
    (`communication-clarity.md` rule 4); this rule makes the loop *count* it.
 
-   The cadence is `core/scripts/scar-tissue-check.py`, run from aspirations-precheck
-   **Phase 0.5g.5** every `scar_tissue_check.goal_cadence` completed goals. It reports
-   the FILE surface (`core/scripts/complexity_budget.py`, trended in
-   `meta/complexity-ledger.jsonl`) and the STORE corpus (guardrail/reasoning-bank
-   active:retired ratio, never-marked-helpful population, a bounded retirement slate).
-   The slate is a **proposal**, never an action: retiring stays a deliberate
-   `bulk-retire-dead-entries.py --apply` run by an agent that has read it, because
-   *which* defense has stopped earning its keep is the judgment this rule asks the
-   loop to make, not to delegate. (g-115-3222.)
+   Cadence: `scar-tissue-check.py` (Phase 0.5g.5). The slate is a proposal,
+   never an action — retiring stays deliberate. Detail:
+   `core/config/rationale/learning-philosophy.md` (g-115-3222).
 
 ## Recognition (the positive half)
 
@@ -79,19 +73,10 @@ improving explanation of improvement.** This does NOT license stopping failure a
 (knowing quality rises is the argument's precondition). What is deprioritized is
 *explaining* improvements.
 
-- **Classify by consumer, not by name.** An instrument is attribution-side or
-  detection-side according to what ACTS on its output, and the same store is often
-  both: imp@k reads as attribution, but `meta-backpressure.py` uses it to roll back a
-  regressing meta-strategy. Before retiring any instrument under this rule, grep for
-  what consumes it and check whether a DECISION depends on it; a large reference count
-  is not evidence.
-- **An unconsumed DETECTOR is the worse defect.** Writer-without-reader stores do not
-  share one verdict: an unconsumed attributor means REDUCE, an unconsumed detector
-  means WIRE IT, never retire it. Sort such findings by what the data WOULD detect,
-  not by what it currently costs.
-- **Carry the latency asymmetry.** Liveness/stall detectors key on wall-clock or
-  per-iteration cadence and keep firing; data-integrity detectors (the ratchet family,
-  scar-tissue, audit-baselines) key on completed-goal count, so they fire SLOWER
-  exactly as throughput drops. Do not convert them to wall-clock without measuring —
-  goal-count keying keeps them off a quiet box's critical path — but carry the
-  asymmetry when reasoning about how fast a regression would surface.
+- **Classify by consumer, not by name** — grep for what DECIDES on the output before retiring.
+- **An unconsumed DETECTOR is the worse defect** — WIRE IT, never retire it.
+- **Carry the latency asymmetry** — goal-count-keyed detectors fire slower as
+  throughput drops. Do not convert them to wall-clock without measuring —
+  goal-count keying keeps them off a quiet box's critical path.
+
+Measured cases and full argument: `core/config/rationale/learning-philosophy.md`.

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.86",
+    "previous_version": "2.12.85",
+    "date": "2026-09-28",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Time-push cut (g-115-11289, filed by ReleaseTrainProbe g-115-11017): v2.12.85 was 24.7h old with 95 framework commits past it. Headline: worker Bodies now run the loop-exhaustion fence (claimless worker-net BLOCKs pause at 4, park and alert at 10; g-115-11083, cca86cb8b9) and every claim door shares one carrier verdict (g-375-50, f67a19c651)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.85",
     "previous_version": "2.12.84",
     "date": "2026-09-27",

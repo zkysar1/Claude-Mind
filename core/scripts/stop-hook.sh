@@ -450,11 +450,11 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
             # ends the turn deliberately, having written NO body-closing
             # sentinel (it intends to resume, so it must never be queued for
             # merge). Without this valve every one of those turn-ends hits the
-            # BLOCK below, whose instruction is "write the body-closing sentinel
-            # and end the turn" — which would durably CLOSE the Body and defeat
-            # the entire point of parking. This was the open implementation risk
-            # the goal named; the answer is that it lands on the BLOCK, so the
-            # valve is required rather than optional.
+            # BLOCK below, whose instruction WAS (until ) "write the
+            # body-closing sentinel and end the turn" — which would durably CLOSE
+            # the Body and defeat the entire point of parking. This was the open
+            # implementation risk the goal named; the answer is that it lands on
+            # the BLOCK, so the valve is required rather than optional.
             #
             # DELIBERATELY ITS OWN BRANCH, not `parked` bolted into the
             # closed-state alternation below. Both branches produce the same
@@ -513,7 +513,36 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         else
             echo "$(date +%Y-%m-%dT%H:%M:%S) BLOCK gate=worker-net sid=$HOOK_SID agent=$HOOK_AGENT" >> "$LOG" 2>/dev/null || true
             unset _BODY_WM _CLOSE_SENTINEL
-            printf '%s\n' '{"decision": "block", "reason": "Worker Body turn ended without a Skill(worker-loop) re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: Skill('"'"'worker-loop'"'"') — NOT Skill('"'"'aspirations'"'"'), which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. If this Body genuinely has no more work, write the body-closing sentinel in your per-session dir and end the turn — that is the sanctioned close path and this net will stand down."}'
+            # Worker loop-exhaustion fence (). Called AFTER the append
+            # above so the streak counts the turn-end being decided, the order
+            # both reducer call sites keep. FENCE_ROLE=worker writes NO stop
+            # signal: its decisive rung PARKS this Body and alerts, and the park
+            # changes only the NEXT turn-end, through the park valve above -- this
+            # one stays a BLOCK. stderr goes to the log, never /dev/null: the
+            # recorder's notify verdict rides on it (guard-3737). Fail-open: empty
+            # on any error; reason-only, like the sensor line below.
+            _WN_FENCE=""
+            if [ -n "$HOOK_AGENT" ]; then
+                _WN_FENCE="$(MIND_AGENT="$HOOK_AGENT" HOOK_SID="$HOOK_SID" HOOK_LOG="$LOG" FENCE_ROLE=worker \
+                    bash "$CORE_ROOT/scripts/loop-exhaustion-fence.sh" 2>>"$LOG" || true)"
+                _WN_FENCE="$(printf '%s' "$_WN_FENCE" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' || true)"
+            fi
+            # Context sensor line (guard-6380, ): the SAME scoped call as
+            # the reducer's CTX_MSG block below, which this branch exits before --
+            # so a worker never saw the falsifier for a harness marker reading 0
+            # (cc-09 2026-09-25/26: ~145 worker-net BLOCKs answered with sleeps).
+            # Fail-open: empty on any error; reason-only, never the decision.
+            _WN_CTX=""
+            if [ -n "$HOOK_AGENT" ]; then
+                _WN_CTX="$(MIND_AGENT="$HOOK_AGENT" \
+                    bash "$CORE_ROOT/scripts/context-budget-banner.sh" 2>/dev/null || true)"
+                _WN_CTX="$(printf '%s' "$_WN_CTX" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g' || true)"
+            fi
+            printf '{"decision": "block", "reason": "%s%s%s"}\n' \
+                "Worker Body turn ended without a Skill(worker-loop) re-entry (a text summary or autocompact terminated the turn). Your FIRST action MUST be: Skill('worker-loop') — NOT Skill('aspirations'), which is the REDUCER-only re-entry (guard-517/guard-463). Do NOT emit a text summary first. No eligible goal is NOT a close: worker-loop Phase 1 PARKS this Body (resumable). The ONLY close is an EXPIRED park, which Phase 1 takes itself." \
+                "${_WN_FENCE:+ $_WN_FENCE}" \
+                "${_WN_CTX:+ $_WN_CTX}"
+            unset _WN_CTX _WN_FENCE
             exit 0
         fi
     fi
